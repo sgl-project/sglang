@@ -14,12 +14,14 @@ on:
         type: choice
         options:
           - 1-gpu-h100
+          - 1-gpu-h100-h200
           - 1-gpu-5090
           - 2-gpu-h100
           - 4-gpu-h100
           - 4-gpu-a10
           - 4-gpu-b200
           - 8-gpu-h200
+          - 8-gpu-h200-deepep
           - 8-gpu-h20
           - 8-gpu-b200
           - ubuntu-latest
@@ -48,6 +50,8 @@ env:
   SGLANG_IS_IN_CI: true
   SGLANG_CUDA_COREDUMP: "1"
   SGLANG_JIT_DEEPGEMM_FAST_WARMUP: true
+  # TEMP: rebuild deepep against the new torch for torch-211-merge PR only — revert before merging to main.
+  FORCE_REBUILD_DEEPEP: '1'
 
 permissions:
   actions: write
@@ -153,11 +157,9 @@ jobs:
 
       # Needed by setuptools-rust to build the bundled native gRPC extension
       # (rust/sglang-grpc) when installing the main `sglang` wheel from source.
-      - name: Install protoc
-        run: sudo bash scripts/ci/utils/install_protoc.sh
-
-      - name: Install Rust toolchain
-        run: bash scripts/ci/utils/install_rustup.sh
+      - name: Install protoc + Rust toolchain
+        timeout-minutes: 10
+        run: bash scripts/ci/utils/install_rust_protoc.sh
 
       - name: Install dependencies
         timeout-minutes: 20

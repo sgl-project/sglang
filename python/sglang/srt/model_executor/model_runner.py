@@ -233,6 +233,7 @@ MLA_ATTENTION_BACKENDS = [
     "trtllm_mla",
     "ascend",
     "nsa",
+    "intel_xpu",
 ]
 
 CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS = [
@@ -347,6 +348,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.is_draft_worker = is_draft_worker
         self.memory_pool_config = memory_pool_config
         self.is_generation = model_config.is_generation
+        self.device_timer = None
         self.is_multimodal = model_config.is_multimodal
         self.is_multimodal_chunked_prefill_supported = (
             model_config.is_multimodal_chunked_prefill_supported
@@ -361,6 +363,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.is_hybrid_swa_compress = model_config.is_hybrid_swa_compress
         self.use_mla_backend = self.model_config.attention_arch == AttentionArch.MLA
         self.attention_chunk_size = model_config.attention_chunk_size
+        rope_scaling = getattr(
+            model_config.hf_text_config, "rope_parameters", None
+        ) or getattr(model_config.hf_text_config, "rope_scaling", {})
+        self.model_is_mrope = (
+            rope_scaling is not None and "mrope_section" in rope_scaling
+        )
+        self.enable_elastic_ep = server_args.elastic_ep_backend is not None
         self.forward_pass_id = 0
         self.init_new_workspace = False
         self.draft_model_idx = draft_model_idx
@@ -656,6 +665,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.end_layer = getattr(self.model, "end_layer", model_num_layers)
         self.num_effective_layers = self.end_layer - self.start_layer
 
+        self.adjust_hybrid_swa_layers_for_pp()
+
         # For LoopCoder models, each loop has its own layer_id, so we need to multiply by loop_num
         loop_num = getattr(self.model_config.hf_config, "loop_num", 1)
         if loop_num > 1:
@@ -669,23 +680,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 and (self.num_effective_layers == model_num_layers)
             )
         ), "PP is not compatible with MTP models."
-
-        # Consider PP, so use start_layer and end_layer.
-        full_attention_layer_ids = [
-            layer_idx
-            for layer_idx in range(self.start_layer, self.end_layer + 1)
-            if hasattr(self.model_config, "full_attention_layer_ids")
-            and layer_idx in self.model_config.full_attention_layer_ids
-        ]
-        swa_attention_layer_ids = [
-            layer_idx
-            for layer_idx in range(self.start_layer, self.end_layer + 1)
-            if hasattr(self.model_config, "swa_attention_layer_ids")
-            and layer_idx in self.model_config.swa_attention_layer_ids
-        ]
-        # Update back to model_config.
-        self.model_config.swa_attention_layer_ids = swa_attention_layer_ids
-        self.model_config.full_attention_layer_ids = full_attention_layer_ids
 
         # Apply torchao quantization
         torchao_applied = getattr(self.model, "torchao_applied", False)
@@ -782,6 +776,25 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.init_piecewise_cuda_graphs()
 
         self.prealloc_symmetric_memory_pool()
+
+    def adjust_hybrid_swa_layers_for_pp(self):
+        if not self.is_hybrid_swa:
+            return
+
+        full_attention_layer_ids = [
+            layer_idx
+            for layer_idx in range(self.start_layer, self.end_layer + 1)
+            if hasattr(self.model_config, "full_attention_layer_ids")
+            and layer_idx in self.model_config.full_attention_layer_ids
+        ]
+        swa_attention_layer_ids = [
+            layer_idx
+            for layer_idx in range(self.start_layer, self.end_layer + 1)
+            if hasattr(self.model_config, "swa_attention_layer_ids")
+            and layer_idx in self.model_config.swa_attention_layer_ids
+        ]
+        self.model_config.swa_attention_layer_ids = swa_attention_layer_ids
+        self.model_config.full_attention_layer_ids = full_attention_layer_ids
 
     def init_routed_experts_capturer(self):
         if not self.server_args.disable_shared_experts_fusion and hasattr(
@@ -884,7 +897,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             )
 
     def _publish_modelexpress_metadata(self):
-        """Publish TransferEngine metadata to ModelExpress server (seed mode)."""
+        """Publish metadata to ModelExpress server (seed mode).
+
+        Supports two transport backends:
+        - transfer_engine: publishes TransferEngine session_id (Mooncake)
+        - nixl: creates NIXL agent, registers tensors, publishes nixl_metadata
+        """
         try:
             from modelexpress import p2p_pb2
             from modelexpress.client import MxClient
@@ -898,15 +916,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             self.server_args.modelexpress_model_name or self.server_args.model_path
         )
         mx_url = self.server_args.modelexpress_url
-        session_id = self.remote_instance_transfer_engine_session_id
-        weight_info = self.remote_instance_transfer_engine_weight_info
-
-        if not session_id or weight_info is None:
-            logger.warning(
-                "ModelExpress source: skipping publish -- "
-                "TransferEngine not initialized or no weight info"
-            )
-            return
+        transport = self.server_args.modelexpress_transport
 
         # Build SourceIdentity for this instance
         identity = p2p_pb2.SourceIdentity(
@@ -919,23 +929,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             quantization=self.server_args.quantization or "",
         )
 
-        # Build tensor descriptors from weight_info dict
-        tensors = []
-        for name, (addr, numel, element_size) in weight_info.items():
-            tensors.append(
-                p2p_pb2.TensorDescriptor(
-                    name=name,
-                    addr=addr,
-                    size=numel * element_size,
-                    device_id=self.gpu_id,
-                )
-            )
-
-        worker = p2p_pb2.WorkerMetadata(
-            worker_rank=self.tp_rank,
-            transfer_engine_session_id=session_id,
-            tensors=tensors,
-        )
+        if transport == "nixl":
+            worker, tensor_count = self._build_nixl_worker_metadata(p2p_pb2)
+        else:
+            worker, tensor_count = self._build_transfer_engine_worker_metadata(p2p_pb2)
+            if worker is None:
+                return
 
         # Generate a unique worker_id for this running instance
         worker_id = str(uuid.uuid4())
@@ -943,12 +942,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         mx_client = MxClient(server_url=mx_url)
         try:
             logger.info(
-                "ModelExpress source: publishing metadata for model=%s, "
-                "tp_rank=%d, session=%s, %d tensors, worker_id=%s",
+                "ModelExpress source [%s]: publishing metadata for model=%s, "
+                "tp_rank=%d, %d tensors, worker_id=%s",
+                transport,
                 model_name,
                 self.tp_rank,
-                session_id,
-                len(tensors),
+                tensor_count,
                 worker_id,
             )
             mx_source_id = mx_client.publish_metadata(identity, worker, worker_id)
@@ -967,6 +966,84 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             )
         finally:
             mx_client.close()
+
+    def _build_transfer_engine_worker_metadata(self, p2p_pb2):
+        """Build WorkerMetadata using TransferEngine session_id."""
+        session_id = self.remote_instance_transfer_engine_session_id
+        weight_info = self.remote_instance_transfer_engine_weight_info
+
+        if not session_id or weight_info is None:
+            logger.warning(
+                "ModelExpress source: skipping publish -- "
+                "TransferEngine not initialized or no weight info"
+            )
+            return None, 0
+
+        tensors = []
+        for name, (addr, numel, element_size) in weight_info.items():
+            tensors.append(
+                p2p_pb2.TensorDescriptor(
+                    name=name,
+                    addr=addr,
+                    size=numel * element_size,
+                    device_id=self.gpu_id,
+                )
+            )
+
+        worker = p2p_pb2.WorkerMetadata(
+            worker_rank=self.tp_rank,
+            transfer_engine_session_id=session_id,
+            tensors=tensors,
+        )
+        return worker, len(tensors)
+
+    def _build_nixl_worker_metadata(self, p2p_pb2):
+        """Build WorkerMetadata using NIXL agent for RDMA transfers."""
+        from modelexpress.nixl_transfer import NixlTransferManager
+
+        agent_name = f"sglang-seed-rank{self.tp_rank}-{uuid.uuid4().hex[:8]}"
+        nixl_mgr = NixlTransferManager(agent_name, self.gpu_id)
+        nixl_mgr.initialize()
+
+        # Collect model tensors for NIXL registration
+        model_tensors = {}
+        for name, param in self.model.named_parameters():
+            t = param.data
+            if t.is_contiguous():
+                model_tensors[name] = t
+            else:
+                # Non-contiguous tensors: register underlying storage as byte view
+                sv = torch.empty(0, dtype=torch.uint8, device=t.device).set_(
+                    t.untyped_storage()
+                )
+                if sv.data_ptr() not in {v.data_ptr() for v in model_tensors.values()}:
+                    model_tensors[f"{name}.__storage"] = sv
+
+        nixl_metadata = nixl_mgr.register_tensors(model_tensors)
+
+        # Build tensor descriptors from registered tensors
+        tensors = []
+        for td in nixl_mgr.tensor_descriptors:
+            tensors.append(
+                p2p_pb2.TensorDescriptor(
+                    name=td.name,
+                    addr=td.addr,
+                    size=td.size,
+                    device_id=td.device_id,
+                    dtype=td.dtype,
+                )
+            )
+
+        worker = p2p_pb2.WorkerMetadata(
+            worker_rank=self.tp_rank,
+            nixl_metadata=nixl_metadata,
+            tensors=tensors,
+        )
+
+        # Keep reference alive so NIXL agent isn't garbage collected
+        self._nixl_manager = nixl_mgr
+
+        return worker, len(tensors)
 
     def model_specific_adjustment(self):
         server_args = self.server_args
@@ -1261,6 +1338,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             modelexpress_ep_size=self.server_args.ep_size,
             modelexpress_dtype=self.server_args.dtype,
             modelexpress_quantization=self.server_args.quantization or "",
+            modelexpress_transport=self.server_args.modelexpress_transport,
             modelopt_config=modelopt_config,
             rl_quant_profile=self.server_args.rl_quant_profile,
             draft_model_idx=self.draft_model_idx,
@@ -2896,6 +2974,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         skip_attn_backend_init: bool = False,
         pp_proxy_tensors=None,
     ) -> Union[LogitsProcessorOutput, PPProxyTensors]:
+        # Set extra arguments
         if not skip_attn_backend_init:
             if hasattr(self.model, "prepare_forward_batch"):
                 # Prepare model-specific attention metadata before planning,
@@ -2910,12 +2989,20 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         kwargs = {}
         if self.support_pp:
             kwargs["pp_proxy_tensors"] = pp_proxy_tensors
-        return self.model.forward(
-            forward_batch.input_ids,
-            forward_batch.positions,
-            forward_batch,
-            **kwargs,
+
+        # Launch forward
+        ctx = (
+            self.device_timer.wrap(metadata={"category": "decode"})
+            if self.device_timer
+            else contextlib.nullcontext()
         )
+        with ctx:
+            return self.model.forward(
+                forward_batch.input_ids,
+                forward_batch.positions,
+                forward_batch,
+                **kwargs,
+            )
 
     def forward_extend(
         self,
@@ -2925,6 +3012,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
     ) -> Tuple[
         Union[LogitsProcessorOutput, PPProxyTensors, EmbeddingPoolerOutput], bool
     ]:
+        # Setup extra arguments
         kwargs = {}
         if self.support_pp:
             kwargs["pp_proxy_tensors"] = pp_proxy_tensors
@@ -2944,17 +3032,25 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if not self.is_generation:
             kwargs["get_embedding"] = True
 
+        # Check piecewies cuda graph
         can_run_graph = (
             self.piecewise_cuda_graph_runner is not None
             and self.piecewise_cuda_graph_runner.can_run(forward_batch)
         )
-
         if can_run_graph:
-            return (
-                self.piecewise_cuda_graph_runner.replay(forward_batch, **kwargs),
-                can_run_graph,
+            # TODO: device_timer.wrap is too broad here — it also includes
+            # replay_prepare time. Move timing into the piecewise cuda graph
+            # runner to capture only the model.forward part.
+            ctx = (
+                self.device_timer.wrap(metadata={"category": "extend"})
+                if self.device_timer
+                else contextlib.nullcontext()
             )
+            with ctx:
+                ret = self.piecewise_cuda_graph_runner.replay(forward_batch, **kwargs)
+            return (ret, can_run_graph)
 
+        # Launch model forward
         if not skip_attn_backend_init:
             if hasattr(self.model, "prepare_forward_batch"):
                 # Prepare model-specific attention metadata before planning,
@@ -2962,15 +3058,19 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 self.model.prepare_forward_batch(forward_batch)
             self.attn_backend.init_forward_metadata(forward_batch)
 
-        return (
-            self.model.forward(
+        ctx = (
+            self.device_timer.wrap(metadata={"category": "extend"})
+            if self.device_timer
+            else contextlib.nullcontext()
+        )
+        with ctx:
+            ret = self.model.forward(
                 forward_batch.input_ids,
                 forward_batch.positions,
                 forward_batch,
                 **kwargs,
-            ),
-            can_run_graph,
-        )
+            )
+        return (ret, can_run_graph)
 
     def forward_idle(
         self, forward_batch: ForwardBatch, pp_proxy_tensors=None
@@ -2984,12 +3084,18 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         kwargs = {}
         if self.support_pp:
             kwargs["pp_proxy_tensors"] = pp_proxy_tensors
-        return self.model.forward(
-            forward_batch.input_ids,
-            forward_batch.positions,
-            forward_batch,
-            **kwargs,
+        ctx = (
+            self.device_timer.wrap(metadata={"category": "idle"})
+            if self.device_timer
+            else contextlib.nullcontext()
         )
+        with ctx:
+            return self.model.forward(
+                forward_batch.input_ids,
+                forward_batch.positions,
+                forward_batch,
+                **kwargs,
+            )
 
     def forward_split_prefill(
         self,
@@ -3003,12 +3109,18 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             forward_batch.split_index + forward_count,
             self.model_config.num_hidden_layers,
         )
-        ret = self.model.forward_split_prefill(
-            forward_batch.input_ids,
-            forward_batch.positions,
-            forward_batch,
-            (forward_batch.split_index, next_split_index),
+        ctx = (
+            self.device_timer.wrap(metadata={"category": "split_prefill"})
+            if self.device_timer
+            else contextlib.nullcontext()
         )
+        with ctx:
+            ret = self.model.forward_split_prefill(
+                forward_batch.input_ids,
+                forward_batch.positions,
+                forward_batch,
+                (forward_batch.split_index, next_split_index),
+            )
         forward_batch.split_index = next_split_index
         return ret
 
@@ -3022,12 +3134,14 @@ class ModelRunner(ModelRunnerKVCacheMixin):
     ) -> ModelRunnerOutput:
         self.forward_pass_id += 1
 
+        # Try msprob debugger
         if self.msprobe_debugger is not None:
             rank_id = (
                 self.gpu_id if self.dp_size is not None and self.dp_size > 1 else None
             )
             self.msprobe_debugger.start(model=self.model, rank_id=rank_id)
 
+        # Step span
         step_span_ctx = (
             torch.profiler.record_function(_build_step_span_name(forward_batch))
             if torch.autograd._profiler_enabled()
@@ -3047,21 +3161,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 reinit_attn_backend,
                 split_forward_count,
             )
-            elastic_ep_state = ElasticEPStateManager.instance()
-            if (
-                elastic_ep_state is not None
-                and not elastic_ep_state.is_active_equal_last()
-            ):
-                elastic_ep_state.snapshot_active_to_last()
-                elastic_ep_state.sync_active_to_cpu()
-                logging.info("EPLB due to rank faults")
-                gen = self.eplb_manager.rebalance()
-                while True:
-                    try:
-                        next(gen)
-                    except StopIteration:
-                        break
-                output = self._forward_raw(
+            if self.enable_elastic_ep:
+                output = self._maybe_rebalance_after_rank_fault(
+                    output,
                     forward_batch,
                     skip_attn_backend_init,
                     pp_proxy_tensors,
@@ -3101,6 +3203,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         reinit_attn_backend: bool = False,
         split_forward_count: int = 1,
     ) -> ModelRunnerOutput:
+        # Check whether can run cuda graph
         mode_check = (
             forward_batch.forward_mode.is_cpu_graph
             if self.device == "cpu"
@@ -3112,12 +3215,14 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             and self.graph_runner.can_run(forward_batch)
         )
 
+        # Hisparse coordinator
         if (
             self.hisparse_coordinator is not None
             and forward_batch.forward_mode.is_decode()
         ):
             self.hisparse_coordinator.wait_for_pending_backup()
 
+        # Replay cuda graph if applicable
         if can_run_graph:
             ret = self.graph_runner.replay(
                 forward_batch,
@@ -3147,10 +3252,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if forward_batch.out_cache_loc_swa is not None:
             self.token_to_kv_pool.set_swa_loc(forward_batch.out_cache_loc_swa)
 
+        # Hisparse coordinator
         forward_batch.hisparse_coordinator = self.hisparse_coordinator
         if self.hisparse_coordinator is not None:
             self.hisparse_coordinator.num_real_reqs.fill_(forward_batch.batch_size)
 
+        # Forward without cuda graph
         if forward_batch.forward_mode.is_decode():
             ret = self.forward_decode(
                 forward_batch,
@@ -3213,14 +3320,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         Returns:
             A list of next_token_ids
         """
-        # For duplex models with multiple output streams.
-        if isinstance(logits_output, tuple):
-            return torch.stack(
-                [self.sample(values, forward_batch) for values in logits_output],
-                axis=-1,
-            )
-
         self._preprocess_logits(logits_output, forward_batch.sampling_info)
+
         # Sample the next tokens
         next_token_ids = self.sampler(
             logits_output,
@@ -3269,18 +3370,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             forward_batch.top_logprobs_nums,
             forward_batch.token_ids_logprobs,
         )
-
-    @property
-    def model_is_mrope(self) -> bool:
-        """Detect if the model has "mrope" rope_scaling type.
-        mrope requires keep "rope_deltas" between prompt and decoding phases."""
-        rope_scaling = getattr(
-            self.model_config.hf_text_config, "rope_parameters", None
-        ) or getattr(self.model_config.hf_text_config, "rope_scaling", {})
-        if rope_scaling is None:
-            return False
-        is_mrope_enabled = "mrope_section" in rope_scaling
-        return is_mrope_enabled
 
     def save_remote_model(self, url: str):
         from sglang.srt.model_loader.loader import RemoteModelLoader
@@ -3339,6 +3428,35 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     device=self.device,
                 )
 
+    def _maybe_rebalance_after_rank_fault(
+        self,
+        output: ModelRunnerOutput,
+        forward_batch: ForwardBatch,
+        skip_attn_backend_init: bool,
+        pp_proxy_tensors: Optional[PPProxyTensors],
+        reinit_attn_backend: bool,
+        split_forward_count: int,
+    ) -> ModelRunnerOutput:
+        elastic_ep_state = ElasticEPStateManager.instance()
+        if elastic_ep_state is not None and not elastic_ep_state.is_active_equal_last():
+            elastic_ep_state.snapshot_active_to_last()
+            elastic_ep_state.sync_active_to_cpu()
+            logging.info("EPLB due to rank faults")
+            gen = self.eplb_manager.rebalance()
+            while True:
+                try:
+                    next(gen)
+                except StopIteration:
+                    break
+            output = self._forward_raw(
+                forward_batch,
+                skip_attn_backend_init,
+                pp_proxy_tensors,
+                reinit_attn_backend,
+                split_forward_count,
+            )
+        return output
+
 
 def _model_load_weights_direct(model, named_tensors: List[Tuple[str, torch.Tensor]]):
     params_dict = dict(model.named_parameters())
@@ -3353,35 +3471,12 @@ def _unwrap_tensor(tensor, tp_rank, device):
 
 
 def _build_step_span_name(forward_batch: ForwardBatch) -> str:
-    """Build a profile-trace span name for one forward step.
-
-    Format:
-      step[decode bs=N]                   — decode-only batch
-      step[prefill bs=N toks=T]           — extend-only (prefill) batch
-      step[mixed bs=N ext=T dec=D]        — extend+decode mixed batch
-      step[idle]                          — idle/padding step
-      step[<MODE> bs=N]                   — other modes (target-verify, etc.)
-
-    Used by ModelRunner.forward to wrap each step in a torch.profile
-    record_function so Chrome traces show labeled step boundaries.
-    """
+    """Build a profile-trace span name for one forward step."""
     mode = forward_batch.forward_mode
     bs = forward_batch.batch_size
-    if mode.is_idle():
-        return "step[idle]"
-    if mode.is_decode():
-        return f"step[decode bs={bs}]"
-    if mode.is_extend():
+    if mode == ForwardMode.EXTEND:
         ext_toks = forward_batch.extend_num_tokens or 0
-        ext_seqs = (
-            forward_batch.extend_seq_lens.shape[0]
-            if forward_batch.extend_seq_lens is not None
-            else bs
-        )
-        dec_seqs = bs - ext_seqs
-        if dec_seqs > 0:
-            return f"step[mixed bs={bs} ext={ext_toks} dec={dec_seqs}]"
-        return f"step[prefill bs={bs} toks={ext_toks}]"
+        return f"step[EXTEND bs={bs} toks={ext_toks}]"
     return f"step[{mode.name} bs={bs}]"
 
 

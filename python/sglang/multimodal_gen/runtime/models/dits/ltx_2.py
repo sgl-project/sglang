@@ -31,9 +31,9 @@ from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config impor
     QuantizationConfig,
 )
 from sglang.multimodal_gen.runtime.layers.visual_embedding import timestep_embedding
+from sglang.multimodal_gen.runtime.managers.layerwise_offload import OffloadableDiTMixin
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
-from sglang.multimodal_gen.runtime.utils.layerwise_offload import OffloadableDiTMixin
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
@@ -1450,6 +1450,7 @@ class LTX2VideoTransformer3DModel(CachableDiT, OffloadableDiTMixin):
             base_num_frames=cross_attn_pos_embed_max_pos,
             sampling_rate=16000,
             hop_length=160,
+            scale_factors=self.audio_scale_factors,
             theta=float(arch.positional_embedding_theta),
             causal_offset=causal_offset,
             modality="audio",
