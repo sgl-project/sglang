@@ -6433,6 +6433,95 @@ def summarize_relaykv_req_to_token_runtime_inspection_payloads_for_smoke(
     }
 
 
+def run_model_runner_req_to_token_runtime_inspection_hook_for_smoke(
+    model_runner: Any,
+    forward_batch: Any = None,
+) -> dict[str, Any]:
+    """Run a fake model-runner req_to_token metadata inspection hook for smoke."""
+
+    req_to_token_pool = None
+    req_to_token_pool_path = None
+
+    try:
+        req_to_token_pool = getattr(model_runner, "req_to_token_pool", None)
+    except Exception:
+        req_to_token_pool = None
+    else:
+        if req_to_token_pool is not None:
+            req_to_token_pool_path = "model_runner.req_to_token_pool"
+
+    if req_to_token_pool is None:
+        try:
+            allocator = getattr(model_runner, "token_to_kv_pool_allocator", None)
+        except Exception:
+            allocator = None
+        if allocator is not None:
+            try:
+                req_to_token_pool = getattr(allocator, "req_to_token_pool", None)
+            except Exception:
+                req_to_token_pool = None
+            else:
+                if req_to_token_pool is not None:
+                    req_to_token_pool_path = (
+                        "model_runner.token_to_kv_pool_allocator.req_to_token_pool"
+                    )
+
+    if req_to_token_pool is None:
+        try:
+            memory_pool = getattr(model_runner, "memory_pool", None)
+        except Exception:
+            memory_pool = None
+        if memory_pool is not None:
+            try:
+                req_to_token_pool = getattr(memory_pool, "req_to_token_pool", None)
+            except Exception:
+                req_to_token_pool = None
+            else:
+                if req_to_token_pool is not None:
+                    req_to_token_pool_path = (
+                        "model_runner.memory_pool.req_to_token_pool"
+                    )
+
+    if req_to_token_pool is None and forward_batch is not None:
+        try:
+            req_to_token_pool = getattr(forward_batch, "req_to_token_pool", None)
+        except Exception:
+            req_to_token_pool = None
+        else:
+            if req_to_token_pool is not None:
+                req_to_token_pool_path = "forward_batch.req_to_token_pool"
+
+    payloads = build_relaykv_req_to_token_runtime_inspection_payloads_for_smoke(
+        forward_batch_like=forward_batch,
+        req_to_token_pool=req_to_token_pool,
+        inspect_req_to_token=True,
+    )
+    for payload in payloads:
+        payload["hook_path"] = req_to_token_pool_path
+        payload["hook_source"] = "model_runner_req_to_token_runtime_inspection_hook"
+
+    summary = summarize_relaykv_req_to_token_runtime_inspection_payloads_for_smoke(
+        payloads
+    )
+    summary["hook_path_counts"] = {
+        "none": 0,
+        "model_runner.req_to_token_pool": 0,
+        "model_runner.token_to_kv_pool_allocator.req_to_token_pool": 0,
+        "model_runner.memory_pool.req_to_token_pool": 0,
+        "forward_batch.req_to_token_pool": 0,
+    }
+    hook_key = req_to_token_pool_path or "none"
+    if hook_key not in summary["hook_path_counts"]:
+        summary["hook_path_counts"][hook_key] = 0
+    summary["hook_path_counts"][hook_key] += len(payloads)
+
+    return {
+        "payloads": payloads,
+        "summary": summary,
+        "req_to_token_pool_path": req_to_token_pool_path,
+    }
+
+
 def log_policy_summary(
     events: Iterable[RelayKVPlan | Mapping[str, Any]],
     *,
