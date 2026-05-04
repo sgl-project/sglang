@@ -3,6 +3,7 @@
 # Adapted from https://github.com/vllm-project/vllm/blob/main/benchmarks/kernels/benchmark_moe.py
 import argparse
 import json
+import os
 import time
 from contextlib import nullcontext
 from datetime import datetime
@@ -11,15 +12,27 @@ from typing import Any, Dict, List, Tuple
 import ray
 import torch
 import triton
-from common_utils import (
-    BenchmarkConfig,
-    get_config_filename,
-    get_configs_compute_bound,
-    get_default_batch_sizes,
-    get_model_config,
-    save_configs,
-    sort_config,
-)
+
+try:
+    from .common_utils import (
+        BenchmarkConfig,
+        get_config_filename,
+        get_configs_compute_bound,
+        get_default_batch_sizes,
+        get_model_config,
+        save_configs,
+        sort_config,
+    )
+except ImportError:
+    from common_utils import (
+        BenchmarkConfig,
+        get_config_filename,
+        get_configs_compute_bound,
+        get_default_batch_sizes,
+        get_model_config,
+        save_configs,
+        sort_config,
+    )
 from ray.experimental.tqdm_ray import tqdm
 
 from sglang.srt.layers.moe.fused_moe_triton import override_config
@@ -36,10 +49,29 @@ from sglang.srt.server_args import (
     set_global_server_args_for_scheduler,
 )
 from sglang.srt.utils import get_device, is_hip, is_xpu
-from sglang.srt.utils.hf_transformers_utils import get_config
 
 _is_hip = is_hip()
 _is_xpu = is_xpu()
+
+
+def get_dtype_flags(dtype: str) -> Dict[str, bool]:
+    return {
+        "use_fp8_w8a8": dtype == "fp8_w8a8",
+        "use_int8_w8a8": dtype == "int8_w8a8",
+        "use_int8_w8a16": dtype == "int8_w8a16",
+        "use_int4_w4a16": dtype == "int4_w4a16",
+    }
+
+
+def filter_search_space_for_model(
+    search_space: List[BenchmarkConfig],
+    block_shape: List[int],
+) -> List[BenchmarkConfig]:
+    if block_shape is None:
+        return search_space
+
+    block_k = block_shape[1]
+    return [config for config in search_space if block_k % config["BLOCK_SIZE_K"] == 0]
 
 
 def benchmark_config(
@@ -56,6 +88,7 @@ def benchmark_config(
     use_int4_w4a16: bool,
     per_channel_quant: bool,
     block_shape: List[int] = None,
+    is_dsv4: bool = False,
     num_iters: int = 100,
 ) -> float:
     init_dtype = torch.float16 if use_fp8_w8a8 else dtype
@@ -176,9 +209,6 @@ def benchmark_config(
         topk_output.router_logits.copy_(new_topk_output.router_logits)
 
     def run():
-        model_config = get_config(args.model, trust_remote_code=True)
-        architecture = model_config.architectures[0]
-        is_dsv4 = architecture == "DeepseekV4ForCausalLM"
         moe_runner_config = MoeRunnerConfig(
             inplace=True,
             swiglu_limit=10.0 if is_dsv4 else None,
@@ -243,10 +273,13 @@ def benchmark_config(
 
 @ray.remote(num_gpus=1)
 class BenchmarkWorker:
-    def __init__(self, seed: int, server_args: ServerArgs) -> None:
+    def __init__(
+        self, seed: int, server_args: ServerArgs, architecture: str
+    ) -> None:
         torch.set_default_device(get_device())
         torch.get_device_module().manual_seed_all(0)
         self.seed = seed
+        self.is_dsv4 = architecture == "DeepseekV4ForCausalLM"
         # Get the device ID to allocate tensors and kernels
         # on the respective GPU. Ray isolates each worker to a single visible
         # GPU via CUDA_VISIBLE_DEVICES, so the local ordinal is always 0. On
@@ -319,6 +352,7 @@ class BenchmarkWorker:
                 use_int4_w4a16,
                 per_channel_quant,
                 block_shape,
+                self.is_dsv4,
             )
         return config, kernel_time
 
@@ -361,6 +395,7 @@ class BenchmarkWorker:
                         use_int4_w4a16,
                         per_channel_quant,
                         block_shape,
+                        self.is_dsv4,
                         num_iters=10,
                     )
                 except (triton.runtime.autotuner.OutOfResources, RuntimeError):
@@ -376,38 +411,66 @@ class BenchmarkWorker:
         return best_config
 
 
-def main(args: argparse.Namespace):
-    server_args = ServerArgs(
-        model_path=args.model, tp_size=args.tp_size, ep_size=args.ep_size
-    )
-
+def resolve_fused_moe_config(
+    model: str,
+    tp_size: int,
+    ep_size: int = 1,
+    disable_shared_experts_fusion: bool = False,
+) -> Dict[str, Any]:
     model_config = get_model_config(
-        args.model, args.tp_size, args.ep_size, args.disable_shared_experts_fusion
+        model,
+        tp_size,
+        ep_size,
+        disable_shared_experts_fusion,
+    )
+    model_config["tp_size"] = tp_size
+    model_config["ep_size"] = ep_size
+    return model_config
+
+
+def tune_fused_moe_triton(
+    model: str,
+    tp_size: int,
+    ep_size: int = 1,
+    dtype: str = "auto",
+    batch_sizes: List[int] = None,
+    seed: int = 0,
+    per_channel_quant: bool = False,
+    disable_shared_experts_fusion: bool = False,
+    tune: bool = True,
+    search_space: List[BenchmarkConfig] = None,
+    output_file: str = None,
+) -> Dict[str, Any]:
+    server_args = ServerArgs(model_path=model, tp_size=tp_size, ep_size=ep_size)
+
+    model_config = resolve_fused_moe_config(
+        model, tp_size, ep_size, disable_shared_experts_fusion
     )
 
     E = model_config["num_experts"]
     topk = model_config["topk"]
     hidden_size = model_config["hidden_size"]
     shard_intermediate_size = model_config["shard_intermediate_size"]
-    dtype = model_config["dtype"]
+    model_dtype = model_config["dtype"]
     block_shape = model_config["block_shape"]
 
-    use_fp8_w8a8 = args.dtype == "fp8_w8a8"
-    use_int8_w8a8 = args.dtype == "int8_w8a8"
-    use_int8_w8a16 = args.dtype == "int8_w8a16"
-    use_int4_w4a16 = args.dtype == "int4_w4a16"
-    per_channel_quant = args.per_channel_quant
+    dtype_flags = get_dtype_flags(dtype)
+    use_fp8_w8a8 = dtype_flags["use_fp8_w8a8"]
+    use_int8_w8a8 = dtype_flags["use_int8_w8a8"]
+    use_int8_w8a16 = dtype_flags["use_int8_w8a16"]
+    use_int4_w4a16 = dtype_flags["use_int4_w4a16"]
 
-    if args.batch_sizes is not None:
-        batch_sizes = args.batch_sizes
-    elif args.batch_size is not None:
-        batch_sizes = [args.batch_size]
-    else:
+    if batch_sizes is None:
         batch_sizes = get_default_batch_sizes()
 
     ray.init()
-    num_gpus = int(ray.available_resources()["GPU"])
-    workers = [BenchmarkWorker.remote(args.seed, server_args) for _ in range(num_gpus)]
+    num_gpus = int(ray.available_resources().get("GPU", 0))
+    if num_gpus <= 0:
+        raise RuntimeError("fused MoE tuning requires at least one GPU visible to Ray")
+    workers = [
+        BenchmarkWorker.remote(seed, server_args, model_config["architecture"])
+        for _ in range(num_gpus)
+    ]
 
     def _distribute(method: str, inputs: List[Any]) -> List[Any]:
         outputs = []
@@ -420,32 +483,17 @@ def main(args: argparse.Namespace):
             worker_idx = (worker_idx + 1) % num_gpus
         return ray.get(outputs)
 
-    if args.tune:
-        if args.search_space_file:
-            with open(args.search_space_file) as f:
-                search_space = json.load(f)
-            if not isinstance(search_space, list) or not all(
-                isinstance(config, dict) for config in search_space
-            ):
-                raise ValueError(
-                    "--search-space-file must contain a JSON list of configs"
-                )
-        else:
+    if tune:
+        if search_space is None:
             search_space = get_configs_compute_bound()
-        if block_shape is not None:
-            block_k = block_shape[1]
-            search_space = [
-                config
-                for config in search_space
-                if block_k % config["BLOCK_SIZE_K"] == 0
-            ]
+        search_space = filter_search_space_for_model(search_space, block_shape)
 
         filename = get_config_filename(
             E,
             shard_intermediate_size,
             hidden_size,
             topk,
-            dtype,
+            model_dtype,
             use_fp8_w8a8,
             use_int8_w8a8,
             use_int8_w8a16,
@@ -453,8 +501,10 @@ def main(args: argparse.Namespace):
             per_channel_quant,
             block_shape,
         )
+        output_file = output_file or filename
         print(
-            f"Start tuning over {len(search_space)} configurations to create {filename}..."
+            f"Start tuning over {len(search_space)} configurations "
+            f"to create {output_file}..."
         )
 
         start = time.perf_counter()
@@ -467,7 +517,7 @@ def main(args: argparse.Namespace):
                     shard_intermediate_size,
                     hidden_size,
                     topk,
-                    dtype,
+                    model_dtype,
                     use_fp8_w8a8,
                     use_int8_w8a8,
                     use_int8_w8a16,
@@ -482,12 +532,24 @@ def main(args: argparse.Namespace):
         best_configs = {
             M: sort_config(config) for M, config in zip(batch_sizes, configs)
         }
+        output_dir = os.path.dirname(output_file)
+        if output_dir:
+            os.makedirs(output_dir, exist_ok=True)
         save_configs(
             best_configs,
-            filename,
+            output_file,
         )
         end = time.perf_counter()
         print(f"Tuning took {end - start:.2f} seconds")
+        return {
+            "batch_sizes": batch_sizes,
+            "best_configs": best_configs,
+            "elapsed_sec": end - start,
+            "filename": filename,
+            "model_config": model_config,
+            "output_file": output_file,
+            "search_space_size": len(search_space),
+        }
     else:
         outputs = _distribute(
             "benchmark",
@@ -498,7 +560,7 @@ def main(args: argparse.Namespace):
                     shard_intermediate_size,
                     hidden_size,
                     topk,
-                    dtype,
+                    model_dtype,
                     use_fp8_w8a8,
                     use_int8_w8a8,
                     use_int8_w8a16,
@@ -513,6 +575,39 @@ def main(args: argparse.Namespace):
         for batch_size, (config, kernel_time) in zip(batch_sizes, outputs):
             print(f"Batch size: {batch_size}, config: {config}")
             print(f"Kernel time: {kernel_time:.2f} us")
+        return {
+            "batch_sizes": batch_sizes,
+            "model_config": model_config,
+            "outputs": outputs,
+        }
+
+
+def main(args: argparse.Namespace):
+    batch_sizes = args.batch_sizes
+    if batch_sizes is None and args.batch_size is not None:
+        batch_sizes = [args.batch_size]
+
+    search_space = None
+    if args.search_space_file:
+        with open(args.search_space_file, encoding="utf-8") as file:
+            search_space = json.load(file)
+        if not isinstance(search_space, list) or not all(
+            isinstance(config, dict) for config in search_space
+        ):
+            raise ValueError("--search-space-file must contain a JSON list of configs")
+
+    tune_fused_moe_triton(
+        model=args.model,
+        tp_size=args.tp_size,
+        ep_size=args.ep_size,
+        dtype=args.dtype,
+        batch_sizes=batch_sizes,
+        seed=args.seed,
+        per_channel_quant=args.per_channel_quant,
+        disable_shared_experts_fusion=args.disable_shared_experts_fusion,
+        tune=args.tune,
+        search_space=search_space,
+    )
 
 
 if __name__ == "__main__":
