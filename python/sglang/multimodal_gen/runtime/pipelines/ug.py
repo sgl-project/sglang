@@ -116,15 +116,10 @@ def _load_ug_bridge(
             )
         )
     if is_sensenova_u1_ug_model(model_path):
-        if scheduler is not None:
-            raise NotImplementedError(
-                "SenseNova U1 native SRT scheduler wiring is not available yet. "
-                "This roadmap stage only installs the pixel_flow backend shell."
-            )
         return U1SRTBackedUGMiddleBridge(
             _build_srt_owned_ug_runtime(
                 UGModelRunnerAdapter(U1UGModelAdapter()),
-                scheduler=None,
+                scheduler=scheduler,
                 srt_request_executor=srt_request_executor,
                 srt_u_decode_max_new_tokens=srt_u_decode_max_new_tokens,
                 srt_image_tokenization="multimodal",

@@ -101,6 +101,32 @@ class TestU1UGBackendShell(unittest.TestCase):
         self.assertEqual(runtime.get_debug_counters(result.session)["prefill_count"], 1)
         bridge.runtime.close_session(result.session)
 
+    def test_u1_vlm_without_external_backend_uses_srt_decode(self):
+        adapter = U1UGModelAdapter()
+        runtime = UGSessionRuntime(
+            model_runner=UGModelRunnerAdapter(adapter),
+            session_controller=SessionController(FakeTreeCache()),
+            srt_request_executor=FakeSRTDecodeExecutor([910, 911]),
+            tokenizer=FakeTokenizer(),
+        )
+        bridge = _load_u1_bridge(runtime)
+
+        result = bridge.generate_vlm_text(
+            messages=[
+                UGInterleavedMessage(type="image", content="/tmp/u1-input.png"),
+                UGInterleavedMessage(type="text", content="describe"),
+            ],
+            max_new_tokens=2,
+        )
+
+        counters = runtime.get_debug_counters(result.session)
+        self.assertEqual(result.text, "native:910 911")
+        self.assertEqual(result.next_token_ids, (910, 911))
+        self.assertEqual(counters["prefill_count"], 1)
+        self.assertEqual(counters["srt_u_decode_request_count"], 1)
+        self.assertEqual(counters["srt_request_count"], 3)
+        bridge.runtime.close_session(result.session)
+
     def test_u1_text_prepared_input_carries_causal_rows(self):
         adapter = U1UGModelAdapter()
 
@@ -337,6 +363,19 @@ class TestU1UGBackendShell(unittest.TestCase):
         self.assertEqual(contexts.full.session.context_version, 1)
         bridge.release(contexts)
 
+    def test_load_u1_bridge_accepts_scheduler_for_native_srt_decode(self):
+        scheduler = FakeScheduler()
+
+        bridge = _load_ug_bridge(
+            "sensenova/SenseNova-U1-8B-MoT",
+            scheduler=scheduler,
+            srt_u_decode_max_new_tokens=2,
+        )
+
+        self.assertEqual(bridge.g_kind, "pixel_flow")
+        self.assertIs(bridge.runtime.srt_request_executor.scheduler, scheduler)
+        self.assertEqual(bridge.runtime.srt_u_decode_max_new_tokens, 2)
+
 
 class PixelFlowBridge:
     g_kind = "pixel_flow"
@@ -352,6 +391,43 @@ class FakeTreeCache:
 
     def release_session(self, session_id):
         self.released_sessions.append(session_id)
+
+
+class FakeSRTDecodeExecutor:
+    finish_request_after_execute = True
+
+    def __init__(self, output_ids):
+        self.output_ids = list(output_ids)
+        self.requests = []
+
+    def execute_ug_request(self, *, record, req, state):
+        del record, state
+        self.requests.append(req.rid)
+        if req.sampling_params.max_new_tokens > 0:
+            req.output_ids = self.output_ids[: req.sampling_params.max_new_tokens]
+
+
+class FakeTokenizer:
+    bos_token_id = 1
+
+    def decode(self, token_ids):
+        return "native:" + " ".join(str(token_id) for token_id in token_ids)
+
+
+class FakeScheduler:
+    def __init__(self):
+        self.session_controller = SessionController(FakeTreeCache())
+        self.tokenizer = FakeTokenizer()
+        self.model_config = FakeModelConfig()
+        self.model_worker = type(
+            "Worker",
+            (),
+            {"model_runner": type("ModelRunner", (), {})()},
+        )()
+
+
+class FakeModelConfig:
+    vocab_size = 32000
 
 
 class FakeU1VLMBackend:

@@ -232,9 +232,21 @@ class U1UGModelAdapter:
         session: Any,
         max_new_tokens: int,
     ) -> Any:
-        del runtime
         if self.vlm_backend is None:
-            raise _not_wired()
+            if runtime is None:
+                raise _not_wired()
+            decoded = runtime.decode_text(
+                session,
+                max_new_tokens=max_new_tokens,
+                greedy=True,
+            )
+            return UGVLMTextGenerationResult(
+                session=decoded.session,
+                text=decoded.text,
+                token_ids=decoded.input_ids,
+                next_token_ids=decoded.output_ids,
+                position_ids=decoded.position_ids,
+            )
         messages = self._messages_for_session(session)
         result = self.vlm_backend.generate_text(
             messages=messages,
