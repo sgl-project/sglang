@@ -182,7 +182,7 @@ class TestNemotron3Nano30BXPU(CustomTestCase):
             timeout=LAUNCH_TIMEOUT,
             api_key=cls.api_key,
             other_args=list(XPU_SERVER_ARGS),
-            device="cuda",
+            device="xpu",
             env=_server_subprocess_env(),
         )
         cls.base_url += "/v1"
