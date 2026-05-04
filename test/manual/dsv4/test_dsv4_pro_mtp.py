@@ -1,11 +1,11 @@
-"""DSv4-Pro 1.6T MTP performance tests on B200 TP=8.
+"""DSV4-Pro 1.6T MTP performance tests on B200 TP=8.
 
-1. TestDSv4ProMTPSimulatedAcc — `SGLANG_SIMULATE_ACC_LEN=3` pins EAGLE accept
+1. TestDSV4ProMTPSimulatedAcc — `SGLANG_SIMULATE_ACC_LEN=3` pins EAGLE accept
    length so latency comparisons are apples-to-apples. Runs `bench_one_batch_server`
    at bs=1 for isl=4096 and isl=900000 (osl=1024).
 
-2. TestDSv4ProMTPHongloumeng — real EAGLE accept (no SIMULATE) on Chinese
-   long-context input (`hongloumeng.txt`, ~627k DSv4 tokens). Builds a one-line
+2. TestDSV4ProMTPHongloumeng — real EAGLE accept (no SIMULATE) on Chinese
+   long-context input (`hongloumeng.txt`, ~627k DSV4 tokens). Builds a one-line
    custom JSONL dataset on the fly and drives `bench_serving --dataset-name custom`
    with one short slice (30k tokens) and the full long prompt.
 
@@ -83,7 +83,7 @@ def _launch_dsv4_pro_server(extra_env=None):
     )
 
 
-class TestDSv4ProMTPSimulatedAcc(CustomTestCase):
+class TestDSV4ProMTPSimulatedAcc(CustomTestCase):
     """bs=1 latency at isl=4096 / 900000 with `SGLANG_SIMULATE_ACC_LEN=3`.
 
     Reference (B200 Pro TP8):
@@ -147,7 +147,7 @@ class TestDSv4ProMTPSimulatedAcc(CustomTestCase):
 
 
 def _build_hongloumeng_jsonl(num_tokens, tokenizer, out_path):
-    """Slice the first `num_tokens` DSv4 tokens of hongloumeng.txt into a
+    """Slice the first `num_tokens` DSV4 tokens of hongloumeng.txt into a
     one-line CustomDataset JSONL. Pass num_tokens=None to keep the full text.
     """
     with open(HONGLOUMENG_PATH, "r", encoding="utf-8") as f:
@@ -166,7 +166,7 @@ def _build_hongloumeng_jsonl(num_tokens, tokenizer, out_path):
     return out_path
 
 
-class TestDSv4ProMTPHongloumeng(CustomTestCase):
+class TestDSV4ProMTPHongloumeng(CustomTestCase):
     """Real EAGLE accept on Chinese long-context (hongloumeng.txt).
 
     Reference (B200 Pro TP8, no SIMULATE):
@@ -175,7 +175,7 @@ class TestDSv4ProMTPHongloumeng(CustomTestCase):
     """
 
     SHORT_TOKENS = 30_000
-    LONG_TOKENS = None  # full file (~627k DSv4 tokens)
+    LONG_TOKENS = None  # full file (~627k DSV4 tokens)
     OUTPUT_TOKENS = 4096
 
     @classmethod

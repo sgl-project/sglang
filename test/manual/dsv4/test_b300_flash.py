@@ -11,12 +11,12 @@ import sys
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from _common import DEEPEP_LARGE_SMS_CONFIG, Dsv4FlashAime25TestBase
+from _common import DEEPEP_LARGE_SMS_CONFIG, DSV4FlashAime25TestBase
 
 MODEL = "deepseek-ai/DeepSeek-V4-Flash"
 
 
-class TestB300FlashLowLatency(Dsv4FlashAime25TestBase):
+class TestB300FlashLowLatency(DSV4FlashAime25TestBase):
     MODEL = MODEL
     OTHER_ARGS = [
         "--trust-remote-code",
@@ -39,7 +39,7 @@ class TestB300FlashLowLatency(Dsv4FlashAime25TestBase):
     EXTRA_ENV = {}
 
 
-class TestB300FlashBalanced(Dsv4FlashAime25TestBase):
+class TestB300FlashBalanced(DSV4FlashAime25TestBase):
     MODEL = MODEL
     OTHER_ARGS = [
         "--trust-remote-code",
@@ -64,7 +64,7 @@ class TestB300FlashBalanced(Dsv4FlashAime25TestBase):
     EXTRA_ENV = {"SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "1024"}
 
 
-class TestB300FlashMaxThroughput(Dsv4FlashAime25TestBase):
+class TestB300FlashMaxThroughput(DSV4FlashAime25TestBase):
     MODEL = MODEL
     OTHER_ARGS = [
         "--trust-remote-code",
@@ -81,7 +81,7 @@ class TestB300FlashMaxThroughput(Dsv4FlashAime25TestBase):
     EXTRA_ENV = {"SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "1024"}
 
 
-class TestB300FlashCP(Dsv4FlashAime25TestBase):
+class TestB300FlashCP(DSV4FlashAime25TestBase):
     MODEL = MODEL
     OTHER_ARGS = [
         "--trust-remote-code",

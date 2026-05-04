@@ -10,12 +10,12 @@ import sys
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from _common import Dsv4ProAime25TestBase
+from _common import DSV4ProAime25TestBase
 
 MODEL = "deepseek-ai/DeepSeek-V4-Pro"
 
 
-class TestH200Fp4ProLowLatency(Dsv4ProAime25TestBase):
+class TestH200Fp4ProLowLatency(DSV4ProAime25TestBase):
     MODEL = MODEL
     OTHER_ARGS = [
         "--trust-remote-code",
@@ -37,7 +37,7 @@ class TestH200Fp4ProLowLatency(Dsv4ProAime25TestBase):
     EXTRA_ENV = {}
 
 
-class TestH200Fp4ProBalanced(Dsv4ProAime25TestBase):
+class TestH200Fp4ProBalanced(DSV4ProAime25TestBase):
     MODEL = MODEL
     OTHER_ARGS = [
         "--trust-remote-code",
@@ -59,7 +59,7 @@ class TestH200Fp4ProBalanced(Dsv4ProAime25TestBase):
     EXTRA_ENV = {}
 
 
-class TestH200Fp4ProMaxThroughput(Dsv4ProAime25TestBase):
+class TestH200Fp4ProMaxThroughput(DSV4ProAime25TestBase):
     MODEL = MODEL
     OTHER_ARGS = [
         "--trust-remote-code",

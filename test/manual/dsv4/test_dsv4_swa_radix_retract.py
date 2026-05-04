@@ -1,4 +1,4 @@
-"""DSv4 stress test for SWA radix cache + tombstone + retract interaction.
+"""DSV4 stress test for SWA radix cache + tombstone + retract interaction.
 
 Reproduces the assert in `swa_radix_cache.cache_unfinished_req`:
     assert old_prefix_len <= len(new_indices)
@@ -52,7 +52,7 @@ QUESTION_TAILS = [
 ]
 
 
-class TestDSv4FlashSWARadixRetract(CustomTestCase):
+class TestDSV4FlashSWARadixRetract(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         cls.model = DSV4_FLASH_MODEL_PATH

@@ -1,4 +1,4 @@
-"""DSv4-Flash 285B MTP performance tests on H200 TP=8.
+"""DSV4-Flash 285B MTP performance tests on H200 TP=8.
 
 Manual test (8× H200, 285B FP8 weights). Not registered in CI.
 """
@@ -59,7 +59,7 @@ def _launch_dsv4_flash_server(extra_env=None):
     )
 
 
-class TestDSv4FlashMTPSimulatedAcc(CustomTestCase):
+class TestDSV4FlashMTPSimulatedAcc(CustomTestCase):
     """bs=1 latency at isl=4096 / 900000 with `SGLANG_SIMULATE_ACC_LEN=3`.
 
     Reference (H200 Flash TP8):

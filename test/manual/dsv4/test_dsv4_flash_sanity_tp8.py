@@ -1,4 +1,4 @@
-"""DSv4-Flash 8-GPU server sanity (TP8, no spec decoding)."""
+"""DSV4-Flash 8-GPU server sanity (TP8, no spec decoding)."""
 
 import unittest
 
@@ -19,7 +19,7 @@ DSV4_FLASH_ENV = {
 }
 
 
-class TestDSv4FlashTP8NoSpec(ServerSanityMixin, CustomTestCase):
+class TestDSV4FlashTP8NoSpec(ServerSanityMixin, CustomTestCase):
     """TP8, no spec decoding."""
 
     @classmethod

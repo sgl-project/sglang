@@ -777,7 +777,7 @@ class ModelRunnerKVCacheMixin:
             self.full_max_total_num_tokens = config.full_max_total_num_tokens
             self.swa_max_total_num_tokens = config.swa_max_total_num_tokens
 
-        # DSv4 compressed-attention pool sizes. Draft worker reuses target's
+        # DSV4 compressed-attention pool sizes. Draft worker reuses target's
         # full/swa sizes but does NOT own c4/c128/state pools (those live on
         # the target rank only); zero them out regardless of what config holds.
         if self.is_draft_worker:
@@ -791,7 +791,7 @@ class ModelRunnerKVCacheMixin:
             self.c4_state_pool_size = config.c4_state_pool_size
             self.c128_state_pool_size = config.c128_state_pool_size
 
-        # state_dtype is a DSv4 architectural constant (fp32 for c4/c128
+        # state_dtype is a DSV4 architectural constant (fp32 for c4/c128
         # state buffers); set unconditionally so draft workers have it before
         # _init_pools reads it (target path also overwrites this in the
         # configurator's resolve() for parity, harmless here).

@@ -101,7 +101,7 @@ class DeepSeekV4SingleKVPool(KVCache):
         self.bytes_per_page_padded = ceil_div(bytes_per_page_non_padded, 576) * 576
 
         assert bytes_per_token == 448 + 64 * 2 + 8, (
-            "DSv4 KV layout: qk_nope_head_dim FP8 (448) + qk_rope_head_dim BF16 "
+            "DSV4 KV layout: qk_nope_head_dim FP8 (448) + qk_rope_head_dim BF16 "
             "(64*2) + nope FP8 scales + scale_pad = 584 bytes/token"
         )
         assert self.store_dtype == torch.uint8
@@ -484,7 +484,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
 
     def set_swa_loc(self, loc: torch.Tensor) -> None:
         # No-op: SWAKVPool's set_swa_loc precomputes SWA-translated loc once per
-        # forward batch for set_kv_buffer to read via self.swa_loc. DSv4 has its
+        # forward batch for set_kv_buffer to read via self.swa_loc. DSV4 has its
         # own equivalent cache via `_should_cache_swa + cached_loc` (in
         # set_swa_key_buffer_radix_fused), so we ignore main's precomputed loc.
         pass

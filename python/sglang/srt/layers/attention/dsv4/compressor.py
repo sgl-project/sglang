@@ -72,7 +72,7 @@ class CompressorBackendMixin:
         assert compress_ratio in (
             4,
             128,
-        ), f"DSv4 supports CSA(4x) and HCA(128x) only, got {compress_ratio=}"
+        ), f"DSV4 supports CSA(4x) and HCA(128x) only, got {compress_ratio=}"
         if is_paged:
             metadata = self.get_paged_compress_metadata(compress_ratio)
             coff = 2 if is_overlap_compress(compress_ratio) else 1

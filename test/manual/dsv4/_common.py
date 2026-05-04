@@ -44,7 +44,7 @@ Shared knobs:
     DSV4_SGL_EVAL_OUT_DIR         (default /tmp/sgl-eval-out -> --out-dir)
     DSV4_SGL_EVAL_BIN             (default "sgl-eval"; override path to the CLI)
     DSV4_SERVER_LAUNCH_TIMEOUT    (default 3600s; the sglang 600s default is
-                                   too short for DSv4 model load + DeepGEMM
+                                   too short for DSV4 model load + DeepGEMM
                                    warmup. 1800s is also tight for the heavier
                                    recipes (DP-attn + DeepEP); 3600s is the
                                    safe default. Bump again for first-run
@@ -78,7 +78,7 @@ from sglang.test.test_utils import (
 SGL_EVAL_BIN = os.environ.get("DSV4_SGL_EVAL_BIN", "sgl-eval")
 SGL_EVAL_OUT_DIR = os.environ.get("DSV4_SGL_EVAL_OUT_DIR", "/tmp/sgl-eval-out")
 
-# DSv4 server launch needs more than the 600s sglang default: model load alone
+# DSV4 server launch needs more than the 600s sglang default: model load alone
 # can take 5+ min and DeepGEMM warmup another ~5 min. First-run model download
 # adds ~10-30 min on top. 1800s covers steady-state; bump via env for downloads.
 SERVER_LAUNCH_TIMEOUT = int(os.environ.get("DSV4_SERVER_LAUNCH_TIMEOUT", "3600"))
@@ -86,7 +86,7 @@ SERVER_LAUNCH_TIMEOUT = int(os.environ.get("DSV4_SERVER_LAUNCH_TIMEOUT", "3600")
 # Defaults applied to every recipe's EXTRA_ENV. Per-recipe EXTRA_ENV wins on key
 # conflict.
 BASE_ENV: Dict[str, str] = {
-    # Skip the slow exhaustive DeepGEMM warmup grid; covers the shapes DSv4
+    # Skip the slow exhaustive DeepGEMM warmup grid; covers the shapes DSV4
     # actually hits and shaves several minutes off server startup.
     "SGLANG_JIT_DEEPGEMM_FAST_WARMUP": "1",
 }
@@ -138,8 +138,8 @@ def multinode_args(nnodes: int) -> List[str]:
     ]
 
 
-class Dsv4Aime25TestBase(CustomTestCase):
-    """Subclass via ``Dsv4FlashAime25TestBase`` or ``Dsv4ProAime25TestBase``,
+class DSV4Aime25TestBase(CustomTestCase):
+    """Subclass via ``DSV4FlashAime25TestBase`` or ``DSV4ProAime25TestBase``,
     not directly. Per-recipe subclasses set MODEL / OTHER_ARGS / EXTRA_ENV.
 
     SCORE_THRESHOLD is set by the Flash/Pro intermediate base classes:
@@ -298,20 +298,20 @@ class Dsv4Aime25TestBase(CustomTestCase):
         return score
 
 
-class Dsv4FlashAime25TestBase(Dsv4Aime25TestBase):
+class DSV4FlashAime25TestBase(DSV4Aime25TestBase):
     """Base for DeepSeek-V4-Flash recipes: AIME25 threshold 0.93."""
 
     SCORE_THRESHOLD = 0.93
 
 
-class Dsv4ProAime25TestBase(Dsv4Aime25TestBase):
+class DSV4ProAime25TestBase(DSV4Aime25TestBase):
     """Base for DeepSeek-V4-Pro recipes: AIME25 threshold 0.95."""
 
     SCORE_THRESHOLD = 0.95
 
 
-Dsv4Aime25TestBase._BASE_CLASSES = {
-    Dsv4Aime25TestBase,
-    Dsv4FlashAime25TestBase,
-    Dsv4ProAime25TestBase,
+DSV4Aime25TestBase._BASE_CLASSES = {
+    DSV4Aime25TestBase,
+    DSV4FlashAime25TestBase,
+    DSV4ProAime25TestBase,
 }

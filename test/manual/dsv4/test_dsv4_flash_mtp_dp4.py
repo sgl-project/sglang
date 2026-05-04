@@ -1,17 +1,17 @@
-"""DSv4 Flash MTP test using EAGLE speculative algorithm.
+"""DSV4 Flash MTP test using EAGLE speculative algorithm.
 
-DSv4 Flash MTP shares the EAGLE wire path: EAGLE algo + NextN head built
+DSV4 Flash MTP shares the EAGLE wire path: EAGLE algo + NextN head built
 into the target model weights. No separate draft model is needed (sglang
 auto-falls back `--speculative-draft-model-path` to the target model).
 
 Test matrix mirrors test_eagle_infer_b.TestEAGLEServerBasic to maximize
-cuda-graph + buffer-pool coverage on the DSv4 path:
+cuda-graph + buffer-pool coverage on the DSV4 path:
   - test_gsm8k         (accuracy + spec path full forward)
   - test_max_token_one (degenerate spec step, still cuda-graph captured)
   - test_request_abort (cuda-graph buffer pool survives abort+restart)
 
 Server launch matches `run_flash_dp4.sh`: tp=4, dp=4, deepep MoE backend,
-DSv4 FP8 (FP4 experts disabled).
+DSV4 FP8 (FP4 experts disabled).
 """
 
 import random
@@ -52,7 +52,7 @@ PROMPTS = [
 ]
 
 
-class DSv4FlashMTPServerBase(CustomTestCase):
+class DSV4FlashMTPServerBase(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         cls.model = DSV4_FLASH_MODEL_PATH
@@ -123,7 +123,7 @@ class DSv4FlashMTPServerBase(CustomTestCase):
                 pass
 
 
-class TestDSv4FlashMTPBasic(DSv4FlashMTPServerBase):
+class TestDSV4FlashMTPBasic(DSV4FlashMTPServerBase):
     def test_gsm8k(self):
         """Accuracy + spec path full forward."""
         requests.get(self.base_url + "/flush_cache")

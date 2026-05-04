@@ -1,4 +1,4 @@
-"""DSv4-Flash 4-GPU server sanity matrix (TP4 variants)."""
+"""DSV4-Flash 4-GPU server sanity matrix (TP4 variants)."""
 
 import unittest
 
@@ -46,7 +46,7 @@ _EAGLE_SPEC_ARGS = [
 ]
 
 
-class TestDSv4FlashTP4DP4(ServerSanityMixin, CustomTestCase):
+class TestDSV4FlashTP4DP4(ServerSanityMixin, CustomTestCase):
     """TP4 + DP4 + deepep + EAGLE MTP."""
 
     @classmethod
@@ -79,7 +79,7 @@ class TestDSv4FlashTP4DP4(ServerSanityMixin, CustomTestCase):
         kill_process_tree(cls.process.pid)
 
 
-class TestDSv4FlashTP4EP(ServerSanityMixin, CustomTestCase):
+class TestDSV4FlashTP4EP(ServerSanityMixin, CustomTestCase):
     """TP attn + EP MoE (no DP attn) — exercises the DeepEP + TP-attn path."""
 
     @classmethod
@@ -112,7 +112,7 @@ class TestDSv4FlashTP4EP(ServerSanityMixin, CustomTestCase):
         kill_process_tree(cls.process.pid)
 
 
-class TestDSv4FlashTP4DP4ChunkedPrefillLarge(ServerSanityMixin, CustomTestCase):
+class TestDSV4FlashTP4DP4ChunkedPrefillLarge(ServerSanityMixin, CustomTestCase):
     """TP4 + DP4 with --chunked-prefill-size 16384 — large chunked prefill."""
 
     @classmethod

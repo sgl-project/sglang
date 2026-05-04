@@ -1,4 +1,4 @@
-"""DSv4 Flash PD-disagg with NIXL backend. Both sides run dp-attention
+"""DSV4 Flash PD-disagg with NIXL backend. Both sides run dp-attention
 + deepep + EAGLE MTP so attn_tp_size and the V4 state pool layout are
 fully symmetric: same SWA item_len under matching attn_tp, and same
 NSA c4/c128 indexer ring buffer size under matching spec status. nixl
@@ -29,7 +29,7 @@ DSV4_FLASH_ENV = {
 DEEPEP_CONFIG = '{"normal_dispatch":{"num_sms":96},"normal_combine":{"num_sms":96}}'
 
 
-class TestDSv4FlashPDDisaggNIXL(PDDisaggregationServerBase):
+class TestDSV4FlashPDDisaggNIXL(PDDisaggregationServerBase):
     @classmethod
     def setUpClass(cls):
         super().setUpClass()

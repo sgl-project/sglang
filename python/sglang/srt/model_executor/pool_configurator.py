@@ -40,7 +40,7 @@ class MemoryPoolConfig:
     full_max_total_num_tokens: Optional[int] = None
     swa_max_total_num_tokens: Optional[int] = None
 
-    # DSv4 compressed-attention pool sizes (target only; draft workers leave at 0).
+    # DSV4 compressed-attention pool sizes (target only; draft workers leave at 0).
     c4_max_total_num_tokens: int = 0
     c128_max_total_num_tokens: int = 0
     c4_state_pool_size: int = 0
@@ -297,7 +297,7 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
 
 
 @dataclass
-class _DSv4PoolSizes:
+class _DSV4PoolSizes:
     full_max_total_num_tokens: int
     swa_max_total_num_tokens: int
     c4_max_total_num_tokens: int
@@ -306,8 +306,8 @@ class _DSv4PoolSizes:
     c128_state_pool_size: int
 
 
-class DSv4PoolConfigurator(MemoryPoolConfigurator):
-    """Configurator for DSv4 compressed-attention models.
+class DSV4PoolConfigurator(MemoryPoolConfigurator):
+    """Configurator for DSV4 compressed-attention models.
 
     Splits available memory across full / swa / c4 / c128 + c4_state / c128_state
     pools. coeff is bytes_per_full_token (inflated by (T+D)/T when speculative
@@ -360,7 +360,7 @@ class DSv4PoolConfigurator(MemoryPoolConfigurator):
             assert (
                 mr.spec_algorithm.is_none()
             ), "SGLANG_OPT_USE_ONLINE_COMPRESS does not support speculative decode (MTP) yet"
-            logger.info("DSv4 compressed attention: online c128 enabled (ring_size=1)")
+            logger.info("DSV4 compressed attention: online c128 enabled (ring_size=1)")
 
     def _get_bytes_per_full_token(self) -> float:
         kv_bytes = self.qk_nope_head_dim + self.qk_rope_head_dim * 2 + 8
@@ -402,10 +402,10 @@ class DSv4PoolConfigurator(MemoryPoolConfigurator):
             * self.num_layers_ca4
         )
 
-    def _compute_dsv4_sizes(self, full_token: int, page_size: int) -> _DSv4PoolSizes:
+    def _compute_dsv4_sizes(self, full_token: int, page_size: int) -> _DSV4PoolSizes:
         full_token = full_token // page_size * page_size
         swa_tokens = int(full_token * self.swa_ratio) // page_size * page_size
-        return _DSv4PoolSizes(
+        return _DSV4PoolSizes(
             full_max_total_num_tokens=full_token,
             swa_max_total_num_tokens=swa_tokens,
             c4_max_total_num_tokens=full_token // (4 * self.c4_shrink_factor),
@@ -414,11 +414,11 @@ class DSv4PoolConfigurator(MemoryPoolConfigurator):
             c128_state_pool_size=swa_tokens // self.swa_page_size * self.c128_ring_size,
         )
 
-    def _to_config(self, sizes: _DSv4PoolSizes) -> MemoryPoolConfig:
+    def _to_config(self, sizes: _DSV4PoolSizes) -> MemoryPoolConfig:
         full = sizes.full_max_total_num_tokens
         swa = sizes.swa_max_total_num_tokens
         logger.info(
-            f"DSv4 pool sizes: full={full}, swa={swa}, "
+            f"DSV4 pool sizes: full={full}, swa={swa}, "
             f"c4={sizes.c4_max_total_num_tokens}, "
             f"c128={sizes.c128_max_total_num_tokens}, "
             f"c4_state={sizes.c4_state_pool_size}, "
@@ -444,7 +444,7 @@ class DSv4PoolConfigurator(MemoryPoolConfigurator):
         full_token = int(available_bytes / self.bytes_per_full_token)
         sizes = self._compute_dsv4_sizes(full_token, page_size)
         logger.info(
-            f"DSv4 memory calculation: "
+            f"DSV4 memory calculation: "
             f"bytes_per_full_token={self.bytes_per_full_token:.2f}, "
             f"available_bytes={available_bytes / (1 << 30):.2f} GB, "
             f"full_token={sizes.full_max_total_num_tokens}"
@@ -466,7 +466,7 @@ def create_memory_pool_configurator(
 ) -> MemoryPoolConfigurator:
     """Factory: select the right configurator for the model architecture."""
     if is_deepseek_v4(mr.model_config.hf_config) and mr.is_hybrid_swa:
-        return DSv4PoolConfigurator(mr)
+        return DSV4PoolConfigurator(mr)
     if mr.is_hybrid_swa:
         return HybridSWAPoolConfigurator(mr)
     # Future: MambaPoolConfigurator
