@@ -758,9 +758,7 @@ def _run_staged_native_component_accuracy_case(
                 _convert_conv3d_weights_to_channels_last_3d,
             )
 
-            if torch.cuda.is_available() and getattr(
-                envs, "SGLANG_DIFFUSION_VAE_CHANNELS_LAST_3D", False
-            ):
+            if torch.cuda.is_available() and envs.SGLANG_DIFFUSION_VAE_CHANNELS_LAST_3D:
                 _convert_conv3d_weights_to_channels_last_3d(ref)
         ref_call = profile.prepare_reference_call(ref, inputs)
         ref_autocast = (
