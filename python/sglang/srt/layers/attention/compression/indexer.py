@@ -9,7 +9,7 @@ import triton.language as tl
 
 from sglang.jit_kernel.deepseek_v4 import topk_transform_512, topk_transform_512_v2
 from sglang.srt.environ import envs
-from sglang.srt.layers.attention.compressed.metadata import PagedIndexerMetadata
+from sglang.srt.layers.attention.compression.metadata import PagedIndexerMetadata
 from sglang.srt.layers.attention.indexer_topk_capturer import (
     get_global_indexer_capturer,
 )
@@ -17,7 +17,7 @@ from sglang.srt.layers.attention.nsa.triton_kernel import act_quant
 from sglang.srt.utils import is_hip
 
 if TYPE_CHECKING:
-    from sglang.srt.layers.attention.compressed.compressor import CompressorBackend
+    from sglang.srt.layers.attention.compression.compressor import CompressorBackend
     from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
     from sglang.srt.models.deepseek_v4 import C4Indexer
