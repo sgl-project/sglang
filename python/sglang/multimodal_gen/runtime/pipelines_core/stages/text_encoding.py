@@ -41,6 +41,16 @@ class TextEncodingFingerprint:
     max_sequence_length: int | None
 
 
+def stack_tensors(name: str, tensors: list[torch.Tensor]) -> torch.Tensor:
+    base_shape = list(tensors[0].shape)
+    for tensor in tensors[1:]:
+        if list(tensor.shape) != base_shape:
+            raise ValueError(
+                f"Cannot stack {name} with differing shapes: {[list(t.shape) for t in tensors]}"
+            )
+    return torch.stack(tensors, dim=0)
+
+
 class TextEncodingStage(PipelineStage):
     """
     Stage for encoding text prompts into embeddings for diffusion models.
@@ -108,7 +118,13 @@ class TextEncodingStage(PipelineStage):
                 else None
             )
         if cached_negative is None:
-            neg_embeds_list, neg_masks_list, neg_pooler_embeds_list = self.encode_text(
+            (
+                neg_embeds_list,
+                neg_masks_list,
+                neg_pooler_embeds_list,
+                neg_embeds_masks_list,
+                neg_seq_lens_list,
+            ) = self.encode_text(
                 batch.negative_prompt,
                 server_args,
                 encoder_index=all_indices,
@@ -122,10 +138,24 @@ class TextEncodingStage(PipelineStage):
                     tuple(neg_embeds_list),
                     tuple(neg_masks_list),
                     tuple(neg_pooler_embeds_list),
+                    tuple(neg_embeds_masks_list),
+                    tuple(neg_seq_lens_list),
                 )
         else:
-            neg_embeds_list, neg_masks_list, neg_pooler_embeds_list = cached_negative
-        return neg_embeds_list, neg_masks_list, neg_pooler_embeds_list
+            (
+                neg_embeds_list,
+                neg_masks_list,
+                neg_pooler_embeds_list,
+                neg_embeds_masks_list,
+                neg_seq_lens_list,
+            ) = cached_negative
+        return (
+            neg_embeds_list,
+            neg_masks_list,
+            neg_pooler_embeds_list,
+            neg_embeds_masks_list,
+            neg_seq_lens_list,
+        )
 
     @torch.no_grad()
     def forward(
@@ -187,10 +217,8 @@ class TextEncodingStage(PipelineStage):
                 neg_pooler_embeds_list,
                 neg_embeds_masks_list,
                 neg_seq_lens_list,
-            ) = (
-                self.get_or_compute_negative_text_embedding(
-                    batch, server_args, all_indices
-                )
+            ) = self.get_or_compute_negative_text_embedding(
+                batch, server_args, all_indices
             )
 
             assert batch.negative_prompt_embeds is not None
@@ -358,8 +386,8 @@ class TextEncodingStage(PipelineStage):
 
         Returns:
             Depending on return_type and return_attention_mask:
-            - list: List[Tensor] or
-              (embeds, attention_masks, pooled_embeds, embeds_masks, seq_lens)
+            - list: (embeds, pooler_outputs) or
+              (embeds, attention_masks, pooler_outputs, embeds_masks, seq_lens)
             - dict: Dict[str, Tensor] or (Dict[str, Tensor], Dict[str, Tensor])
             - stack: Tensor of shape [num_encoders, ...] or a tuple with stacked
               attention masks
@@ -374,23 +402,20 @@ class TextEncodingStage(PipelineStage):
         )
 
         # Resolve selection into indices
-        encoder_cfgs = server_args.pipeline_config.text_encoder_configs
         if encoder_index is None:
             indices: list[int] = [0]
         elif isinstance(encoder_index, int):
             indices = [encoder_index]
         else:
             indices = list(encoder_index)
-        # validate range
+
+        # Validate indices are within range
         num_encoders = len(self.text_encoders)
         for idx in indices:
             if idx < 0 or idx >= num_encoders:
                 raise IndexError(
                     f"encoder index {idx} out of range [0, {num_encoders - 1}]"
                 )
-
-        # Validate indices are within range
-        num_encoders = len(self.text_encoders)
 
         # Normalize input to list[str]
         assert isinstance(text, str | list)
@@ -584,14 +609,7 @@ class TextEncodingStage(PipelineStage):
             return embeds_dict
 
         # return_type == "stack"
-        # Validate shapes are compatible
-        base_shape = list(embeds_list[0].shape)
-        for t in embeds_list[1:]:
-            if list(t.shape) != base_shape:
-                raise ValueError(
-                    f"Cannot stack embeddings with differing shapes: {[list(t.shape) for t in embeds_list]}"
-                )
-        stacked_embeds = torch.stack(embeds_list, dim=0)
+        stacked_embeds = stack_tensors("embeddings", embeds_list)
         if return_attention_mask:
             stackable_masks = [
                 (
@@ -603,13 +621,7 @@ class TextEncodingStage(PipelineStage):
                 )
                 for embed, mask in zip(embeds_list, attn_masks_list, strict=True)
             ]
-            base_mask_shape = list(stackable_masks[0].shape)
-            for m in stackable_masks[1:]:
-                if list(m.shape) != base_mask_shape:
-                    raise ValueError(
-                        f"Cannot stack attention masks with differing shapes: {[list(m.shape) for m in stackable_masks]}"
-                    )
-            stacked_masks = torch.stack(stackable_masks, dim=0)
+            stacked_masks = stack_tensors("attention masks", stackable_masks)
             return stacked_embeds, stacked_masks
         return stacked_embeds
 
