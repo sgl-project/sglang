@@ -40,11 +40,11 @@ RUN if [ -n "$UBUNTU_MIRROR" ]; then \
 fi
 
 # Python setup (combined with apt update to reduce layers)
+# Ubuntu 24.04 ships Python 3.12 in main, so we no longer need the deadsnakes
+# PPA. Dropping it avoids transient Launchpad 504s in `add-apt-repository`.
 RUN --mount=type=cache,target=/var/cache/apt,id=base-apt \
     apt update && apt install -y --no-install-recommends wget software-properties-common \
-    && add-apt-repository ppa:deadsnakes/ppa -y \
-    && apt install -y --no-install-recommends python3.12-full python3.12-dev python3.10-venv \
-    && update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.10 1 \
+    && apt install -y --no-install-recommends python3.12-full python3.12-dev \
     && update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.12 2 \
     && update-alternatives --set python3 /usr/bin/python3.12 \
     && wget -q https://bootstrap.pypa.io/get-pip.py \
@@ -54,7 +54,7 @@ RUN --mount=type=cache,target=/var/cache/apt,id=base-apt \
     && python3 -m pip config set global.break-system-packages true \
     # Fix for apt-add-repository
     && cd /usr/lib/python3/dist-packages/ \
-    && ln -s apt_pkg.cpython-310-*-linux-gnu.so apt_pkg.so
+    && ln -s apt_pkg.cpython-312-*-linux-gnu.so apt_pkg.so
 
 # Install system dependencies (organized by category for better caching)
 RUN --mount=type=cache,target=/var/cache/apt,id=base-apt \
@@ -683,12 +683,10 @@ ENV PATH="${PATH}:/usr/local/nvidia/bin:/usr/local/cuda/bin:/usr/local/cuda/nvvm
     LD_LIBRARY_PATH="${LD_LIBRARY_PATH}:/usr/local/nvidia/lib:/usr/local/nvidia/lib64"
 
 # Install runtime dependencies (devel base provides gcc/g++/build tools)
+# Python 3.12 ships in Ubuntu 24.04 main, so no deadsnakes PPA needed.
 RUN --mount=type=cache,target=/var/cache/apt,id=runtime-apt \
-    apt-get update && apt-get install -y --no-install-recommends \
+    apt-get update && apt-get install -y --no-install-recommends --allow-change-held-packages \
     # Python runtime
-    software-properties-common \
-    && add-apt-repository ppa:deadsnakes/ppa -y \
-    && apt-get update && apt-get install -y --no-install-recommends --allow-change-held-packages \
     python3.12-full \
     python3.12-dev \
     wget \
