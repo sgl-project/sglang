@@ -3,7 +3,10 @@ import sys
 import unittest
 from unittest.mock import patch
 
-from sglang.multimodal_gen.configs.pipeline_configs.base import PipelineConfig
+from sglang.multimodal_gen.configs.pipeline_configs.base import (
+    ModelTaskType,
+    PipelineConfig,
+)
 from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
     QwenImagePipelineConfig,
 )
@@ -44,6 +47,51 @@ class TestServerArgsPathExpansion(unittest.TestCase):
         self.assertEqual(
             args.component_paths["vae"], os.path.expanduser("~/fake/local/vae")
         )
+
+
+class TestOffloadDefaults(unittest.TestCase):
+    def _from_dict_with_task_type(
+        self,
+        task_type,
+        *,
+        memory_gb=80,
+        kwargs=None,
+    ):
+        pipeline_config = PipelineConfig()
+        pipeline_config.task_type = task_type
+        with (
+            patch.object(PipelineConfig, "from_kwargs", return_value=pipeline_config),
+            patch(
+                "sglang.multimodal_gen.runtime.server_args.current_platform.is_cpu",
+                return_value=False,
+            ),
+            patch(
+                "sglang.multimodal_gen.runtime.server_args.current_platform.get_device_total_memory",
+                return_value=memory_gb * 1024**3,
+            ),
+        ):
+            return ServerArgs.from_dict({"model_path": "/fake", **(kwargs or {})})
+
+    def test_vae_cpu_offload_defaults_false_for_video_generation(self):
+        args = self._from_dict_with_task_type(ModelTaskType.T2V)
+
+        self.assertFalse(args.vae_cpu_offload)
+
+    def test_vae_cpu_offload_defaults_false_on_low_memory_gpu(self):
+        args = self._from_dict_with_task_type(ModelTaskType.T2V, memory_gb=16)
+
+        self.assertFalse(args.vae_cpu_offload)
+        self.assertTrue(args.dit_cpu_offload)
+        self.assertTrue(args.text_encoder_cpu_offload)
+        self.assertTrue(args.image_encoder_cpu_offload)
+
+    def test_explicit_vae_cpu_offload_true_is_preserved(self):
+        args = self._from_dict_with_task_type(
+            ModelTaskType.T2V,
+            kwargs={"vae_cpu_offload": True},
+        )
+
+        self.assertTrue(args.vae_cpu_offload)
 
 
 class TestModelIdResolution(unittest.TestCase):

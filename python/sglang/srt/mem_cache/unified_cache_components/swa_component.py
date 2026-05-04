@@ -14,6 +14,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 from sglang.srt.mem_cache.unified_cache_components.tree_component import (
     BASE_COMPONENT_TYPE,
     ComponentType,
+    EvictLayer,
     TreeComponent,
     next_component_uuid,
 )
@@ -186,10 +187,17 @@ class SWAComponent(TreeComponent):
         )
         child.component_data[self.component_type].metadata.pop("uuid", None)
 
-    def evict_component(self, node: UnifiedTreeNode, is_leaf: bool) -> int:
+    def evict_component(
+        self,
+        node: UnifiedTreeNode,
+        target: EvictLayer = EvictLayer.DEVICE,
+    ) -> tuple[int, int]:
+        if target is EvictLayer.HOST:
+            return 0, 0  # TODO:SWA has no host layer currently
+
         swa_value = node.component_data[self.component_type].value
         if swa_value is None:
-            return 0
+            return 0, 0
         # Direct swa_attn_allocator.free(swa_value) would double-free
         # free_swa(full_value) has the mapping guard to avoid double-free
         # TODO: decoupling full and swa free, need further discussion on mapping necessity
@@ -198,9 +206,9 @@ class SWAComponent(TreeComponent):
         )
         freed = len(swa_value)
         self.cache.component_evictable_size_[self.component_type] -= freed
-        if not is_leaf:
+        if target is EvictLayer.DEVICE:
             node.component_data[self.component_type].value = None
-        return freed
+        return freed, 0
 
     def eviction_priority(self, is_leaf: bool) -> int:
         return 0 if is_leaf else 1
@@ -209,25 +217,26 @@ class SWAComponent(TreeComponent):
         self, params: EvictParams, tracker: dict[ComponentType, int]
     ) -> None:
         request = params.swa_num_tokens
-        lru = self.cache.lru_lists[self.component_type]
+        ct = self.component_type
+        lru = self.cache.lru_lists[ct]
         x = lru.get_lru_no_lock()
-        while (
-            tracker[self.component_type] < request and x is not None and lru.in_list(x)
-        ):
-            assert x.component_data[self.component_type].value is not None
-            if len(x.children) > 0:
+        while tracker[ct] < request and x is not None and lru.in_list(x):
+            assert x.component_data[ct].value is not None
+            if x in self.cache.evictable_device_leaves:
+                # D-leaf: atomic eviction of all components
+                x_next = lru.get_prev_no_lock(x)
+                self.cache._evict_device_leaf(x, tracker)
+                if not lru.in_list(x_next):
+                    x_next = lru.get_lru_no_lock()
+                x = x_next
+            else:
+                # Internal: tombstone SWA + cascade
                 x_next = lru.get_prev_no_lock(x)
                 self.cache._evict_component_and_detach_lru(
-                    x, self, is_leaf=False, tracker=tracker
+                    x, self, target=EvictLayer.DEVICE, tracker=tracker
                 )
                 self.cache._cascade_evict(x, self, tracker)
                 x = x_next
-            else:
-                self.cache._evict_component_and_detach_lru(
-                    x, self, is_leaf=True, tracker=tracker
-                )
-                self.cache._cascade_evict(x, self, tracker)
-                x = lru.get_lru_no_lock()
 
     def acquire_component_lock(
         self, node: UnifiedTreeNode, result: IncLockRefResult
