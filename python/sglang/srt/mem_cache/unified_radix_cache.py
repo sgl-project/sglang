@@ -1329,7 +1329,8 @@ class UnifiedRadixCache(BasePrefixCache):
                         entry = self.ongoing_write_through.pop(ack_id, None)
                         if entry is not None:
                             node, params = entry
-                            self.dec_lock_ref(node, params)
+                            if params is not None:
+                                self.dec_lock_ref(node, params)
                 cc.ack_write_queue.clear()
                 assert len(self.ongoing_write_through) == 0
             return
