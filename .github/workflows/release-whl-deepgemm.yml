@@ -164,3 +164,48 @@ jobs:
         run: |
           pip install twine
           python3 -m twine upload --skip-existing dist-pypi/* -u __token__ -p ${{ secrets.SGL_DEEP_GEMM_PYPI_TOKEN }}
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: deepgemm-wheel-cuda${{ matrix.cuda-version }}-${{ matrix.arch }}
+          path: DeepGEMM/dist/*.whl
+
+  release-cu130:
+    needs: build-cu130-matrix
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist/
+          merge-multiple: true
+          pattern: deepgemm-wheel-cuda13.0-*
+
+      - name: Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ inputs.version }}
+          repository: sgl-project/whl
+          token: ${{ secrets.GH_PAT_FOR_WHL_RELEASE }}
+          files: |
+            dist/*
+
+      - name: Clone wheel index
+        run: git clone https://oauth2:${WHL_TOKEN}@github.com/sgl-project/whl.git sgl-whl
+        env:
+          WHL_TOKEN: ${{ secrets.GH_PAT_FOR_WHL_RELEASE }}
+
+      - name: Update wheel index
+        run: python3 scripts/update_deepgemm_whl_index.py --cuda 130
+
+      - name: Push wheel index
+        run: |
+          cd sgl-whl
+          git config --local user.name "sglang-bot"
+          git config --local user.email "sglangbot@gmail.com"
+          git add -A
+          git commit -m "update sgl-deep-gemm whl index for v${{ inputs.version }}"
+          git push
