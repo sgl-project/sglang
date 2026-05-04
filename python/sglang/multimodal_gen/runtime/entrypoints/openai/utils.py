@@ -10,7 +10,7 @@ from contextlib import contextmanager
 from typing import Any, Generator, List, Optional, Union
 
 import httpx
-from fastapi import UploadFile
+from fastapi import HTTPException, UploadFile
 
 from sglang.multimodal_gen.configs.sample.sampling_params import (
     DataType,
@@ -327,6 +327,12 @@ async def process_generation_batch(
     total_start_time = time.perf_counter()
     with trace_req(batch.trace_ctx), log_generation_timer(logger, batch.prompt):
         result = await scheduler_client.forward([batch])
+
+        if result.status_code is not None:
+            raise HTTPException(
+                status_code=result.status_code,
+                detail=result.error or "Request rejected by scheduler.",
+            )
 
         if result.output is None and result.output_file_paths is None:
             error_msg = result.error or "Unknown error"
