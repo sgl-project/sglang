@@ -31,7 +31,10 @@ if [ "$ARCH" != "x86_64" ] && [ "$ARCH" != "aarch64" ]; then
     exit 1
 fi
 
-if python3 -c "import deep_ep" >/dev/null 2>&1; then
+if [ "${FORCE_REBUILD_DEEPEP:-0}" = "1" ]; then
+    echo "FORCE_REBUILD_DEEPEP=1; uninstalling any cached deep_ep before rebuild."
+    ${PIP_UNINSTALL_CMD:-pip uninstall -y} deep_ep ${PIP_UNINSTALL_SUFFIX:-} || true
+elif python3 -c "import deep_ep" >/dev/null 2>&1; then
     echo "deep_ep is already installed or importable. Skipping installation."
     exit 0
 fi
