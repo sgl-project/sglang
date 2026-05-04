@@ -20,11 +20,12 @@ from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.mem_cache.common import get_last_loc
 from sglang.srt.server_args import ServerArgs, get_global_server_args
-from sglang.srt.utils import is_cuda, is_hip, is_npu, next_power_of_2
+from sglang.srt.utils import is_cuda, is_hip, is_musa, is_npu, next_power_of_2
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
 _is_npu = is_npu()
+_is_musa = is_musa()
 
 if TYPE_CHECKING:
     from sglang.srt.speculative.eagle_info import EagleVerifyInput
@@ -46,7 +47,9 @@ SIMULATE_ACC_LEN = envs.SGLANG_SIMULATE_ACC_LEN.get()  # turn off if < 0
 SIMULATE_ACC_METHOD = envs.SGLANG_SIMULATE_ACC_METHOD.get()
 
 TREE_TRAVERSE_TIME_THRESHOLD = 1  # TODO: set this properly
-TREE_SPEC_KERNEL_AVAILABLE = _is_cuda  # This kernel is only available for CUDA now
+TREE_SPEC_KERNEL_AVAILABLE = (
+    _is_cuda or _is_musa
+)  # This kernel is only available for CUDA and MUSA now
 
 
 def spec_need_hidden_states(server_args: Optional[ServerArgs] = None) -> bool:
@@ -609,14 +612,14 @@ def traverse_tree(
         if accepted:
             if curr != 0:
                 # Accept the current token
-                grammar.accept_token(draft_tokens[curr])
+                grammar.accept_token(int(draft_tokens[curr]))
             if not grammar.is_terminated():
                 # Generate the bitmask for the current token
                 grammar.fill_vocab_mask(allocate_token_bitmask, curr)
                 if retrieve_next_token[curr] != -1:
                     # Visit the child node
                     dfs(
-                        retrieve_next_token[curr],
+                        int(retrieve_next_token[curr]),
                         retrieve_next_token,
                         retrieve_next_sibling,
                         curr,
@@ -629,7 +632,7 @@ def traverse_tree(
         if retrieve_next_sibling[curr] != -1:
             # Visit the sibling node
             dfs(
-                retrieve_next_sibling[curr],
+                int(retrieve_next_sibling[curr]),
                 retrieve_next_token,
                 retrieve_next_sibling,
                 parent_pos,

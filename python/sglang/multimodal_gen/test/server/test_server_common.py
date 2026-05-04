@@ -46,6 +46,7 @@ from sglang.multimodal_gen.test.test_utils import (
     gt_exists,
     image_bytes_to_numpy,
     load_consistency_gt,
+    save_consistency_failure_artifact,
     wait_for_req_perf_record,
 )
 
@@ -561,13 +562,13 @@ Consider updating perf_baselines.json with the snippets below:
 --- MISSING GROUND TRUTH DETECTED ---
 GT image(s) not found for '{case.id}'.
 
-Add the expected file(s) to sglang-ci-data in diffusion-ci/consistency_gt/sglang_generated/ with naming (n=num_gpus).
+Add the expected file(s) to sgl-project/ci-data in diffusion-ci/consistency_gt/sglang_generated/ with naming (n=num_gpus).
   Image: {case.id}_{{n}}gpu.<ext> (ext from output_format: png, jpg, webp)
   Video: {case.id}_{{n}}gpu_frame_0.png, {case.id}_{{n}}gpu_frame_mid.png, {case.id}_{{n}}gpu_frame_last.png
 
 For this case, expected file(s): {names}
 
-Repository: https://github.com/sglang-bot/sglang-ci-data (path: diffusion-ci/consistency_gt/sglang_generated/)
+Repository: https://github.com/sgl-project/ci-data (path: diffusion-ci/consistency_gt/sglang_generated/)
 
 (Optional) Per-case override in consistency_threshold.json:
   "cases": {{
@@ -608,6 +609,22 @@ Repository: https://github.com/sglang-bot/sglang-ci-data (path: diffusion-ci/con
                 is_video=is_video,
                 output_format=output_format,
             )
+            artifact_path = save_consistency_failure_artifact(
+                artifact_dir=os.environ.get("SGLANG_DIFFUSION_ARTIFACT_DIR"),
+                case_id=case.id,
+                num_gpus=num_gpus,
+                output_frames=output_frames,
+                gt_data=gt_data,
+                result=result,
+                is_video=is_video,
+                output_format=output_format,
+                gt_remote_files=gt_remote_files,
+            )
+            if artifact_path is not None:
+                logger.info(
+                    "[Artifact] Saved consistency failure comparison: %s",
+                    artifact_path,
+                )
             gt_remote_info = "\n".join(
                 f"    - {filename}: {url}" for filename, url in gt_remote_files
             )
@@ -706,32 +723,6 @@ Repository: https://github.com/sglang-bot/sglang-ci-data (path: diffusion-ci/con
             output_path = out_dir / filenames[0]
             output_path.write_bytes(content)
             logger.info(f"Saved GT image: {output_path} (format: {detected_format})")
-
-    def _save_diffusion_artifact(
-        self,
-        case: DiffusionTestCase,
-        content: bytes,
-    ) -> None:
-        """Preserve selected generated outputs for CI artifact upload."""
-        artifact_dir = os.environ.get("SGLANG_DIFFUSION_ARTIFACT_DIR")
-        if not artifact_dir or not content or "modelopt" not in case.id.lower():
-            return
-
-        safe_case_id = "".join(c if c.isalnum() or c in "._-" else "_" for c in case.id)
-        is_video = case.server_args.modality == "video"
-        if is_video:
-            filename = f"{safe_case_id}_5s.mp4"
-        else:
-            from sglang.multimodal_gen.test.test_utils import detect_image_format
-
-            suffix = case.sampling_params.output_format or detect_image_format(content)
-            filename = f"{safe_case_id}.{suffix}"
-
-        dst_dir = Path(artifact_dir) / safe_case_id
-        dst_dir.mkdir(parents=True, exist_ok=True)
-        dst = dst_dir / filename
-        dst.write_bytes(content)
-        logger.info("[Artifact] Preserved generated output: %s", dst)
 
     def _test_lora_api_functionality(
         self,
@@ -1112,7 +1103,6 @@ Repository: https://github.com/sglang-bot/sglang-ci-data (path: diffusion-ci/con
             generate_fn,
             collect_perf=not is_gt_gen_mode,
         )
-        self._save_diffusion_artifact(case, content)
 
         if is_gt_gen_mode:
             # GT generation mode: save output and skip all validations/tests
