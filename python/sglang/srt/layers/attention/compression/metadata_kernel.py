@@ -173,7 +173,7 @@ def _init_compressed_attn_metadata_triton(
     )
 
 
-def init_compressed_metadata(
+def init_compression_metadata(
     seq_lens: torch.Tensor,
     positions: torch.Tensor,
     raw_out_loc: torch.Tensor,

@@ -33,7 +33,7 @@ from sglang.srt.layers.attention.compression.metadata import (
     maybe_copy_inplace,
 )
 from sglang.srt.layers.attention.compression.metadata_kernel import (
-    init_compressed_metadata as _init_compressed_metadata_triton,
+    init_compression_metadata as _init_compression_metadata_triton,
 )
 from sglang.srt.layers.attention.nsa.quant_k_cache_v4 import (
     quant_to_nope_fp8_rope_bf16_pack_triton,
@@ -196,7 +196,7 @@ class DSV4AttnMetadata:
             ],
         )
 
-    def init_compressed_metadata(self):
+    def init_compression_metadata(self):
         assert self.page_table.dim() == 2
         assert (
             self.raw_out_loc.shape == self.seq_lens_casual.shape
@@ -211,7 +211,7 @@ class DSV4AttnMetadata:
             _,
             self.c128_topk_lengths_clamp1,
             self.c128_page_indices,
-        ) = _init_compressed_metadata_triton(
+        ) = _init_compression_metadata_triton(
             self.seq_lens_casual,
             self.positions_casual,
             self.raw_out_loc,
@@ -1176,7 +1176,7 @@ class DeepseekV4AttnBackend(AttentionBackend, C4IndexerBackend, CompressorBacken
         )
 
         if need_compress:
-            core_attn_metadata.init_compressed_metadata()
+            core_attn_metadata.init_compression_metadata()
             if is_prefill and is_nsa_prefill_cp_round_robin_split():
                 core_attn_metadata.apply_cp_reindex()
             core_attn_metadata.init_flashmla_related()
