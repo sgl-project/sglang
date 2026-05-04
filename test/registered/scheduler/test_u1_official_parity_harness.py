@@ -254,21 +254,31 @@ def _run_sglang_native_vlm_candidate(
     init_mm_embedding_cache()
 
     generated = []
-    prefix_ids = list(input_ids)
     with torch.no_grad():
-        for step in range(max_new_tokens):
-            token = _run_native_u1_vlm_full_prefill_step(
-                runner=runner,
-                model=model,
-                model_config=model_config,
-                prefix_ids=prefix_ids,
-                pixel_values=pixel_values,
-                grid_hw=grid_hw,
-                image_offsets=image_offsets,
-                step=step,
-            )
-            generated.append(token)
-            prefix_ids.append(token)
+        batch = None
+        try:
+            if max_new_tokens > 0:
+                batch, token = _run_native_u1_vlm_prefill(
+                    runner=runner,
+                    model=model,
+                    model_config=model_config,
+                    input_ids=input_ids,
+                    pixel_values=pixel_values,
+                    grid_hw=grid_hw,
+                    image_offsets=image_offsets,
+                )
+                generated.append(token)
+            for _ in range(1, max_new_tokens):
+                token = _run_native_u1_vlm_decode_step(
+                    runner=runner,
+                    model_config=model_config,
+                    batch=batch,
+                    input_token=generated[-1],
+                )
+                generated.append(token)
+        finally:
+            runner.req_to_token_pool.clear()
+            runner.token_to_kv_pool_allocator.clear()
 
     text = tokenizer.decode(generated, skip_special_tokens=True)
     return UGParityArtifact(
@@ -279,7 +289,7 @@ def _run_sglang_native_vlm_candidate(
         text=text,
         image=summarize_ug_image(image_path),
         metadata={
-            "candidate_backend": "u1_native_srt_vlm_full_prefill",
+            "candidate_backend": "u1_native_srt_vlm_kv_decode",
             "native_srt_model_runner": True,
             "model_cls": type(model).__module__ + "." + type(model).__name__,
             "language_cls": (
@@ -288,7 +298,9 @@ def _run_sglang_native_vlm_candidate(
                 + type(model.language_model).__name__
             ),
             "token_ids": generated,
-            "kv_decode": False,
+            "kv_decode": True,
+            "prefill_forwards": 1 if max_new_tokens > 0 else 0,
+            "decode_forwards": max(0, max_new_tokens - 1),
         },
     )
 
@@ -326,17 +338,16 @@ def _build_u1_vlm_input_ids_and_offsets(
     return input_ids, [(selected[0], selected[-1])]
 
 
-def _run_native_u1_vlm_full_prefill_step(
+def _run_native_u1_vlm_prefill(
     *,
     runner,
     model,
     model_config,
-    prefix_ids: list[int],
+    input_ids: list[int],
     pixel_values: torch.Tensor,
     grid_hw: torch.Tensor,
     image_offsets: list[tuple[int, int]],
-    step: int,
-) -> int:
+):
     from sglang.bench_one_batch import TreeCacheNamespace
     from sglang.srt.managers.schedule_batch import (
         Modality,
@@ -359,9 +370,9 @@ def _run_native_u1_vlm_full_prefill_step(
     )
     item.set_pad_value()
     mm_inputs = MultimodalInputs(mm_items=[item])
-    padded_ids = model.pad_input_ids(list(prefix_ids), mm_inputs)
+    padded_ids = model.pad_input_ids(list(input_ids), mm_inputs)
     req = Req(
-        rid=f"u1-native-vlm-{step}",
+        rid="u1-native-vlm-kv-decode",
         origin_input_text="",
         origin_input_ids=padded_ids,
         sampling_params=SamplingParams(temperature=0.0, max_new_tokens=1),
@@ -388,7 +399,34 @@ def _run_native_u1_vlm_full_prefill_step(
     worker_batch = batch.get_model_worker_batch()
     forward_batch = ForwardBatch.init_new(worker_batch, runner)
     output, _ = runner.forward_extend(forward_batch)
-    return int(torch.argmax(output.next_token_logits[0]).item())
+    return batch, _greedy_next_token(output.next_token_logits)
+
+
+def _run_native_u1_vlm_decode_step(
+    *,
+    runner,
+    model_config,
+    batch,
+    input_token: int,
+) -> int:
+    from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+
+    del model_config
+    batch.output_ids = torch.tensor(
+        [input_token],
+        dtype=torch.int64,
+        device=runner.device,
+    )
+    batch.prepare_for_decode()
+    worker_batch = batch.get_model_worker_batch()
+    forward_batch = ForwardBatch.init_new(worker_batch, runner)
+    output = runner.forward_decode(forward_batch)
+    return _greedy_next_token(output.next_token_logits)
+
+
+def _greedy_next_token(next_token_logits: torch.Tensor) -> int:
+    return int(torch.argmax(next_token_logits[0]).item())
+
 
 
 def _run_sglang_vlm_candidate(

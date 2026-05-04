@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
+from types import SimpleNamespace
 from unittest.mock import patch
 import unittest
 
@@ -45,6 +46,7 @@ from sglang.srt.models.neo_chat import (
     build_u1_vlm_input_info,
     build_u1_vlm_thw_indexes,
     map_u1_language_model_weight_name,
+    _u1_decode_thw_positions_from_mm_inputs,
 )
 from sglang.srt.models.registry import ModelRegistry
 from sglang.srt.ug.adapter import UGModelRunnerAdapter
@@ -190,6 +192,25 @@ class TestU1UGBackendShell(unittest.TestCase):
         self.assertEqual(mm_inputs.mrope_positions[0].tolist(), [0, 1, 1, 2])
         self.assertEqual(mm_inputs.mrope_positions[1].tolist(), [0, 0, 0, 0])
         self.assertEqual(mm_inputs.mrope_positions[2].tolist(), [0, 0, 1, 0])
+
+    def test_u1_decode_positions_continue_from_prompt_thw_index(self):
+        mm_inputs = MultimodalInputs(mm_items=[])
+        mm_inputs.mrope_positions = torch.tensor(
+            [[0, 1, 1, 2], [0, 0, 0, 0], [0, 0, 1, 0]],
+            dtype=torch.long,
+        )
+        forward_batch = SimpleNamespace(
+            forward_mode=SimpleNamespace(is_decode=lambda: True),
+            mm_inputs=[mm_inputs],
+            seq_lens_cpu=torch.tensor([6], dtype=torch.long),
+        )
+
+        positions = _u1_decode_thw_positions_from_mm_inputs(
+            forward_batch=forward_batch,
+            device=torch.device("cpu"),
+        )
+
+        self.assertEqual(positions.tolist(), [[4], [0], [0]])
 
     def test_u1_block_causal_mask_matches_same_t_bidirectional_rows(self):
         mask = build_u1_block_causal_allowed_mask(

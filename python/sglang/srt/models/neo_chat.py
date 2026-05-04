@@ -796,6 +796,21 @@ class NEOChatModel(nn.Module):
         if positions.ndim == 2 and positions.shape[0] == 3:
             return positions.to(dtype=torch.int64, device=input_ids.device)
 
+        if (
+            getattr(forward_batch, "mrope_positions", None) is not None
+            and getattr(forward_batch.forward_mode, "is_decode", lambda: False)()
+        ):
+            return forward_batch.mrope_positions.to(
+                dtype=torch.int64, device=input_ids.device
+            )
+
+        decode_positions = _u1_decode_thw_positions_from_mm_inputs(
+            forward_batch=forward_batch,
+            device=input_ids.device,
+        )
+        if decode_positions is not None:
+            return decode_positions
+
         mm_positions = _u1_thw_positions_from_mm_inputs(
             forward_batch=forward_batch,
             device=input_ids.device,
@@ -905,6 +920,33 @@ def _u1_thw_positions_from_mm_inputs(
         if chunk.numel() == 0:
             return None
         chunks.append(chunk)
+    if not chunks:
+        return None
+    return torch.cat(chunks, dim=1).to(device=device, dtype=torch.int64)
+
+
+def _u1_decode_thw_positions_from_mm_inputs(
+    *,
+    forward_batch: ForwardBatch,
+    device: torch.device,
+) -> torch.Tensor | None:
+    if not getattr(forward_batch.forward_mode, "is_decode", lambda: False)():
+        return None
+    mm_inputs = getattr(forward_batch, "mm_inputs", None)
+    seq_lens_cpu = getattr(forward_batch, "seq_lens_cpu", None)
+    if not mm_inputs or seq_lens_cpu is None:
+        return None
+
+    chunks = []
+    for mm_input, seq_len in zip(mm_inputs, seq_lens_cpu):
+        if mm_input is None or mm_input.mrope_positions is None:
+            return None
+        prompt_len = int(mm_input.mrope_positions.shape[1])
+        if prompt_len <= 0:
+            return None
+        decode_offset = max(0, int(seq_len) - prompt_len)
+        t_pos = int(mm_input.mrope_positions[0, -1]) + decode_offset
+        chunks.append(torch.tensor([[t_pos], [0], [0]], dtype=torch.int64))
     if not chunks:
         return None
     return torch.cat(chunks, dim=1).to(device=device, dtype=torch.int64)

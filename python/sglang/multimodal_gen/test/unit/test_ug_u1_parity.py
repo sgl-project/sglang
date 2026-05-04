@@ -175,9 +175,11 @@ class TestU1OfficialParityHarness(unittest.TestCase):
                     text="native answer",
                     image=summarize_ug_image(image_path),
                     metadata={
-                        "candidate_backend": "u1_native_srt_vlm_full_prefill",
+                        "candidate_backend": "u1_native_srt_vlm_kv_decode",
                         "native_srt_model_runner": True,
-                        "kv_decode": False,
+                        "kv_decode": True,
+                        "prefill_forwards": 1,
+                        "decode_forwards": 3,
                     },
                 )
                 bundle = module.run_u1_official_parity_from_env(
@@ -203,9 +205,11 @@ class TestU1OfficialParityHarness(unittest.TestCase):
             self.assertTrue(candidate["metadata"]["native_srt_model_runner"])
             self.assertEqual(
                 candidate["metadata"]["candidate_backend"],
-                "u1_native_srt_vlm_full_prefill",
+                "u1_native_srt_vlm_kv_decode",
             )
-            self.assertFalse(candidate["metadata"]["kv_decode"])
+            self.assertTrue(candidate["metadata"]["kv_decode"])
+            self.assertEqual(candidate["metadata"]["prefill_forwards"], 1)
+            self.assertEqual(candidate["metadata"]["decode_forwards"], 3)
             self.assertTrue(report["passed"])
 
     def test_runtime_import_firewall_blocks_official_u1_imports(self):
