@@ -46,7 +46,7 @@ class FusedCompressMetadata(NamedTuple):
         self.plan.copy_(other.plan)
 
 
-class CompressorBackend:
+class CompressorBackendMixin:
     def get_paged_compress_metadata(self, compress_ratio: int) -> FusedCompressMetadata:
         attr_name = f"c{compress_ratio}_compress_metadata"
         metadata = getattr(self.forward_metadata, attr_name)

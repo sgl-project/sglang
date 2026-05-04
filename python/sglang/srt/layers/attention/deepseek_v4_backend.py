@@ -23,11 +23,11 @@ import torch.nn.functional as F
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.compression.compressor import (
-    CompressorBackend,
+    CompressorBackendMixin,
     FusedCompressMetadata,
     create_paged_compressor_data,
 )
-from sglang.srt.layers.attention.compression.indexer import C4IndexerBackend
+from sglang.srt.layers.attention.compression.indexer import C4IndexerBackendMixin
 from sglang.srt.layers.attention.compression.metadata import (
     PagedIndexerMetadata,
     maybe_copy_inplace,
@@ -360,7 +360,9 @@ class _GraphBucket(enum.Enum):
         raise NotImplementedError(f"unsupported {forward_mode=}")
 
 
-class DeepseekV4AttnBackend(AttentionBackend, C4IndexerBackend, CompressorBackend):
+class DeepseekV4AttnBackend(
+    AttentionBackend, C4IndexerBackendMixin, CompressorBackendMixin
+):
     def __init__(
         self,
         model_runner: ModelRunner,

@@ -26,7 +26,9 @@ from sglang.srt.models.dbrx import ReplicatedLinear
 from sglang.srt.utils import add_prefix, is_hip
 
 if TYPE_CHECKING:
-    from sglang.srt.layers.attention.compression.compressor import CompressorBackend
+    from sglang.srt.layers.attention.compression.compressor import (
+        CompressorBackendMixin,
+    )
     from sglang.srt.layers.attention.deepseek_v4_backend import DeepseekV4AttnBackend
     from sglang.srt.layers.quantization import QuantizationConfig
     from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
@@ -229,7 +231,7 @@ def fused_scale(
     return out
 
 
-class C4IndexerBackend:
+class C4IndexerBackendMixin:
     def __init__(self):
         super().__init__()
         self.debug_use_external_c4_sparse_indices: bool = False
@@ -246,7 +248,7 @@ class C4IndexerBackend:
         q_lora_ready: Optional[torch.cuda.Event] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         if TYPE_CHECKING:
-            assert isinstance(self, CompressorBackend)
+            assert isinstance(self, CompressorBackendMixin)
 
         assert alt_streams is not None
         assert len(alt_streams) >= 2
@@ -294,7 +296,7 @@ class C4IndexerBackend:
         token_to_kv_pool: DeepSeekV4TokenToKVPool,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         if TYPE_CHECKING:
-            assert isinstance(self, CompressorBackend)
+            assert isinstance(self, CompressorBackendMixin)
 
         q = c4_indexer.compute_q(q_lora, positions=positions)
         q_fp8, q_scale = act_quant(q)
@@ -330,7 +332,7 @@ class C4IndexerBackend:
 
         if TYPE_CHECKING:
             assert isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool)
-            assert isinstance(self, CompressorBackend)
+            assert isinstance(self, CompressorBackendMixin)
 
         metadata = self.forward_metadata
         indexer_metadata = metadata.indexer_metadata
