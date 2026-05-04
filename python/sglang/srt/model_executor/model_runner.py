@@ -278,6 +278,10 @@ def resolve_language_model(model: nn.Module) -> nn.Module:
     model_cls_name = model.__class__.__name__
     if model_cls_name == "Qwen3OmniMoeForConditionalGeneration":
         return model.thinker.model
+    if hasattr(model, "model"):
+        return model.model
+    if hasattr(model, "language_model"):
+        return model.language_model
     return model.model
 
 
@@ -2834,8 +2838,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.model.model = resolve_language_model(self.model)
         language_model = getattr(self.model, "language_model", self.model)
 
-        # Some draft models (e.g. eagle3) don't have a standard 'layers' attribute
-        if not hasattr(language_model.model, "layers"):
+        # Resolve model with layers: handle CausalLM wrapper (.model.layers) and direct TextModel (.layers)
+        if hasattr(language_model, "model") and hasattr(language_model.model, "layers"):
+            layer_model = language_model.model
+        elif hasattr(language_model, "layers"):
+            layer_model = language_model
+        else:
             logger.warning(
                 "Disable piecewise CUDA graph because the model does not have a 'layers' attribute"
             )
@@ -2844,7 +2852,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.attention_layers = []
         self.moe_layers = []
         self.moe_fusions = []
-        for layer in language_model.model.layers:
+        for layer in layer_model.layers:
             attn_layer = None
             if hasattr(layer, "self_attn"):
                 if hasattr(layer.self_attn, "attn"):
