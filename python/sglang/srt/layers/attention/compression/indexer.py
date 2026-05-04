@@ -22,7 +22,7 @@ from sglang.srt.layers.attention.indexer_topk_capturer import (
 )
 from sglang.srt.layers.attention.nsa.nsa_indexer import rotate_activation
 from sglang.srt.layers.attention.nsa.triton_kernel import act_quant
-from sglang.srt.models.dbrx import ReplicatedLinear
+from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.utils import add_prefix, is_hip
 
 if TYPE_CHECKING:
