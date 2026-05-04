@@ -97,9 +97,11 @@ Treat `"$BENCH_PY"` as the source of truth for preset order.
 
 Nightly diffusion comparison is server/API based (`sglang serve` plus requests).
 This skill stays on `sglang generate` for local benchmarking and profiling, but
-the first 9 presets in `bench_diffusion_denoise.py` are aligned to nightly on
-model, prompt, negative prompt, reference image, size, frames, fps, seed, GPU
-count, and any explicitly overridden sampling or parallelism flags.
+the nightly-aligned presets in `bench_diffusion_denoise.py` mirror
+`scripts/ci/utils/diffusion/comparison_configs.json` on model, task, prompt,
+reference image, size, frames, seed, GPU count, serve args, and the request
+defaults used by `run_comparison.py` when a case omits steps or guidance.
+When in doubt, re-check that JSON before trusting this reference.
 
 List the current preset order:
 
@@ -135,6 +137,15 @@ PYTHONPATH=python python3 "$BENCH_PY" \
   --output-dir "${BENCH_DIR}"
 ```
 
+Run the nightly-aligned `LTX-2.3` TI2V two-stage preset:
+
+```bash
+PYTHONPATH=python python3 "$BENCH_PY" \
+  --model ltx23-ti2v-two-stage \
+  --label baseline \
+  --output-dir "${BENCH_DIR}"
+```
+
 Run the `LTX-2.3` two-stage skill preset:
 
 ```bash
@@ -164,10 +175,11 @@ Nightly-aligned presets come first; skill-only presets stay available after them
 | `zimage` | `Tongyi-MAI/Z-Image-Turbo` | Yes: `zimage_turbo_t2i_1024` | Aligned to nightly prompt and guidance 4.0 |
 | `wan-t2v` | `Wan-AI/Wan2.2-T2V-A14B-Diffusers` | Yes: `wan22_t2v_a14b_720p` | Aligned to nightly CFG-parallel 4-GPU launch |
 | `wan-ti2v` | `Wan-AI/Wan2.2-TI2V-5B-Diffusers` | Yes: `wan22_ti2v_5b_720p` | Uses the nightly cat image and motion prompt |
-| `ltx2` | `Lightricks/LTX-2` | Yes: `ltx2_twostage_t2v` | Uses `LTX2TwoStagePipeline`; nightly-aligned prompt, negative prompt, 1536x1024, 121 frames, fps 24, seed 1234 |
+| `ltx2` | `Lightricks/LTX-2` | Yes: `ltx2_twostage_t2v` | Uses `LTX2TwoStagePipeline`; 2 GPUs, CFG parallel, 768x512, 121 frames, seed 42 |
+| `ltx23-ti2v-two-stage` | `Lightricks/LTX-2.3` | Yes: `ltx2.3_twostage_ti2v_2gpus` | Uses the nightly cat image, motion prompt, `LTX2TwoStagePipeline`, 2 GPUs, 768x512, 121 frames, seed 42 |
 | `wan-i2v` | `Wan-AI/Wan2.2-I2V-A14B-Diffusers` | Yes: `wan22_i2v_a14b_720p` | Aligned to nightly CFG-parallel 4-GPU launch |
 | `ltx23-one-stage` | `Lightricks/LTX-2.3` | No | Skill-only extra preset for the native `LTX-2.3` one-stage baseline; 2 GPUs, 768x512, 121 frames, fps 24, 30 steps, guidance 3.0, seed 1234 |
-| `ltx23-two-stage` | `Lightricks/LTX-2.3` | No | Skill-only extra preset for the native `LTX-2.3` two-stage path; uses `LTX2TwoStagePipeline`, 2 GPUs, 1536x1024, 121 frames, fps 24, 30 steps, guidance 3.0, seed 1234 |
+| `ltx23-two-stage` | `Lightricks/LTX-2.3` | No | Skill-only high-resolution stress preset for the native `LTX-2.3` two-stage path; uses `LTX2TwoStagePipeline`, 2 GPUs, 1536x1024, 121 frames, fps 24, 30 steps, guidance 3.0, seed 1234 |
 | `hunyuanvideo` | `hunyuanvideo-community/HunyuanVideo` | No | Skill-only extra preset |
 | `mova-720p` | `OpenMOSS-Team/MOVA-720p` | No | Skill-only extra preset |
 | `helios` | `BestWishYsh/Helios-Base` | No | Skill-only extra preset |
@@ -184,16 +196,33 @@ and **best latency tuning**:
 sglang generate \
   --model-path=Lightricks/LTX-2 \
   --pipeline-class-name=LTX2TwoStagePipeline \
-  --prompt="A beautiful sunset over the ocean" \
-  --negative-prompt="shaky, glitchy, low quality, worst quality, deformed, distorted, disfigured, motion smear, motion artifacts, fused fingers, bad anatomy, weird hand, ugly, transition, static." \
-  --width=1536 --height=1024 \
-  --num-frames=121 --fps=24 \
-  --seed=1234 --num-gpus=1 \
+  --prompt="A cat and a dog baking a cake together in a kitchen." \
+  --width=768 --height=512 \
+  --num-frames=121 \
+  --num-inference-steps=50 --guidance-scale=4.0 \
+  --seed=42 --num-gpus=2 --enable-cfg-parallel \
   --save-output --enable-torch-compile --warmup
 ```
 
 `LTX2TwoStagePipeline` is a native path. The spatial upsampler and distilled
 LoRA are auto-resolved from the same model snapshot unless you override them.
+
+### Manual command example: LTX-2.3 TI2V Two-Stage
+
+```bash
+sglang generate \
+  --model-path=Lightricks/LTX-2.3 \
+  --pipeline-class-name=LTX2TwoStagePipeline \
+  --prompt="The cat starts walking slowly towards the camera." \
+  --image-path="${ASSET_DIR}/cat.png" \
+  --width=768 --height=512 \
+  --num-frames=121 \
+  --num-inference-steps=50 --guidance-scale=4.0 \
+  --seed=42 --num-gpus=2 \
+  --save-output --enable-torch-compile --warmup
+```
+
+This matches the nightly comparison case `ltx2.3_twostage_ti2v_2gpus`.
 
 ### Manual command example: LTX-2.3 One-Stage
 
@@ -212,7 +241,7 @@ sglang generate \
 Use this when you want the native `LTX2Pipeline` baseline for `LTX-2.3` at the
 validated one-stage resolution.
 
-### Manual command example: LTX-2.3 Two-Stage
+### Manual command example: LTX-2.3 Two-Stage High-Resolution Stress
 
 ```bash
 sglang generate \
@@ -227,8 +256,8 @@ sglang generate \
   --save-output --enable-torch-compile --warmup
 ```
 
-This matches the `ltx23-two-stage` skill preset and is a good benchmark target
-for the native `LTX-2.3` two-stage path.
+This matches the skill-only `ltx23-two-stage` preset. Use it as a
+high-resolution stress target, not as a nightly comparison case.
 
 ### Manual command example: Wan2.2-I2V-A14B 720P
 
@@ -295,7 +324,7 @@ By default SGLang profiles the denoising stage. The default sampling window is
 5 profiled timesteps after warmup.
 
 ```bash
-SGLANG_TORCH_PROFILER_DIR="${PROFILE_DIR}/torch" \
+SGLANG_DIFFUSION_TORCH_PROFILER_DIR="${PROFILE_DIR}/torch" \
 sglang generate \
   --model-path=black-forest-labs/FLUX.1-dev \
   --prompt="A futuristic cyberpunk city at night" \
@@ -308,8 +337,9 @@ Use `--profile-all-stages` only when you really need text encoder, VAE, or
 other non-denoise stages too.
 
 The generated trace path is printed in the console and also lands under
-`./logs/` or `SGLANG_TORCH_PROFILER_DIR`. Open it in Perfetto if you want a
-timeline view:
+`SGLANG_DIFFUSION_TORCH_PROFILER_DIR`. The diffusion profiler falls back to
+`SGLANG_TORCH_PROFILER_DIR` and then `./logs` when the diffusion-specific env
+var is unset. Open the trace in Perfetto if you want a timeline view:
 - https://ui.perfetto.dev/
 
 ### 3. Rank the hot CUDA kernels
@@ -323,7 +353,11 @@ import gzip
 import json
 import os
 
-log_dir = os.environ.get("SGLANG_TORCH_PROFILER_DIR", "./logs")
+log_dir = (
+    os.environ.get("SGLANG_DIFFUSION_TORCH_PROFILER_DIR")
+    or os.environ.get("SGLANG_TORCH_PROFILER_DIR")
+    or "./logs"
+)
 trace_path = sorted(
     glob.glob(f"{log_dir}/*.trace.json.gz"),
     key=os.path.getmtime,

@@ -357,12 +357,12 @@ you encounter issues or have any questions, please [open an issue](https://githu
 <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Qwen3-Next-A3B-Instruct</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Atlas 800I A3</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>2</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>1</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>PD Mixed</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>3.5K+1.5K</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>20ms</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>W8A8 INT8</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><a href="#qwen3-next-3_5k-1_5k-20ms-on-a3-2-cards-mixed-mode">Optimal Configuration</a></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><a href="#qwen3-next-3_5k-1_5k-20ms-on-a3-1-cards-mixed-mode">Optimal Configuration</a></td>
     </tr>
 <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Qwen3-14B</td>
@@ -689,7 +689,7 @@ python -m sglang_router.launch_router \
 We tested it based on the `RANDOM` dataset.
 
 ```shell Command
-python -m sglang.bench_serving --dataset-name random --backend sglang --host 127.0.0.1 --port 6688 --max-concurrency 768  --random-input-len 3500 --random-output-len 1500 --num-prompts 3072 --random-range-ratio 1 --request-rate 16
+python -m sglang.bench_serving --dataset-name random --backend sglang --host 127.0.0.1 --port 6688 --max-concurrency 1024 --random-input-len 3584 --random-output-len 1536 --num-prompts 7168 --random-range-ratio 1 --request-rate 40
 ```
 
 ### DeepSeek-R1 2K-2K 50ms on A3 24 Cards Disaggregation Mode
@@ -4163,11 +4163,11 @@ We tested it based on the `RANDOM` dataset.
 python3 -m sglang.bench_serving --dataset-name random --backend sglang --host 127.0.0.1 --port 7239 --max-concurrency 1 --random-output-len 1500 --random-input-len 3500 --num-prompts 4 --random-range-ratio 1
 ```
 
-### Qwen3-Next 3_5K-1_5K 20ms on A3 2 Cards Mixed Mode
+### Qwen3-Next 3_5K-1_5K 20ms on A3 1 Cards Mixed Mode
 
 Model: Qwen3-Next-80B-A3B-Instruct
 
-Hardware: Atlas 800I A3 2Card
+Hardware: Atlas 800I A3 1Card
 
 DeployMode: PD Mixed
 
@@ -4231,7 +4231,7 @@ echo "${LOCAL_HOST2}"
 
 python3 -m sglang.launch_server --model-path ${MODEL_PATH} \
     --page-size 128 \
-    --tp-size 4 --dp-size 2 \
+    --tp-size 2 \
     --trust-remote-code \
     --attention-backend ascend \
     --device npu \
@@ -4240,10 +4240,9 @@ python3 -m sglang.launch_server --model-path ${MODEL_PATH} \
     --host 127.0.0.1 --port 6699 \
     --mem-fraction-static 0.85 \
     --disable-radix-cache --max-prefill-tokens 28672 --context-length 26384 --max-total-tokens 122304 \
-    --enable-dp-attention --enable-dp-lm-head \
     --speculative-algorithm NEXTN --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 --speculative-draft-model-quantization unquant \
-    --chunked-prefill-size -1 --max-running-requests 16 \
-    --cuda-graph-bs 2 4 8 \
+    --chunked-prefill-size -1 --max-running-requests 2 \
+    --cuda-graph-bs 2 \
     --mamba-ssm-dtype bfloat16 \
     --speculative-draft-model-path /path/to/Qwen3-Next-80B-A3B-Instruct
 ```
