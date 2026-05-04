@@ -25,6 +25,8 @@ export SGLANG_HACK_FLASHMLA_BACKEND=tilelang
 export SGLANG_REASONING_EFFORT=max
 export SGLANG_FORCE_TRITON_MOE_FP8=0
 
+export AITER_BF16_FP8_MOE_BOUND=1
+
 python3 -m sglang.launch_server \
     --model-path /dockerx/data/deepseek-ai/DeepSeek-V4-Pro \
     --trust-remote-code \
