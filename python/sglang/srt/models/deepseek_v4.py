@@ -50,7 +50,7 @@ from sglang.srt.layers.utils.cp_utils import (
     prepare_context_parallel_metadata,
 )
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
-from sglang.srt.mem_cache.compress_state import CompressStatePool
+from sglang.srt.mem_cache.deepseek_v4_compress_state import CompressStatePool
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.mem_cache.memory_pool import RadixAttention
 from sglang.srt.model_executor.cuda_graph_runner import (

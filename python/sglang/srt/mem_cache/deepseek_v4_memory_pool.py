@@ -12,7 +12,7 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.attention.nsa import index_buf_accessor, index_buf_accessor_v4
 from sglang.srt.layers.attention.nsa.index_buf_accessor_v4 import NopeFp8RopeBf16Pack
 from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
-from sglang.srt.mem_cache.compress_state import CompressStatePool
+from sglang.srt.mem_cache.deepseek_v4_compress_state import CompressStatePool
 from sglang.srt.mem_cache.memory_pool import KVCache
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import ceil_div
