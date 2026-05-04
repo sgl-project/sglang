@@ -15,6 +15,7 @@ from sglang.srt.utils import (
     get_bool_env_var,
     is_cuda,
     is_hip,
+    is_musa,
     is_npu,
 )
 
@@ -25,6 +26,7 @@ _is_cuda = is_cuda()
 _is_hip = is_hip()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_npu = is_npu()
+_is_musa = is_musa()
 _is_cpu_amx_available = cpu_has_amx_support()
 
 if _is_cuda:
@@ -87,7 +89,7 @@ class RotaryEmbedding(MultiPlatformOp):
 
         self._apply_rotary_emb_wrapped = apply_rotary_emb
 
-        if get_global_server_args().rl_on_policy_target is not None:
+        if get_global_server_args().rl_on_policy_target is not None or _is_musa:
             self._forward_method = self.forward_native
             self._apply_rotary_emb_wrapped = torch.compile(dynamic=True)(
                 apply_rotary_emb
