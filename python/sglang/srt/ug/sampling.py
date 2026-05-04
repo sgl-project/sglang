@@ -10,20 +10,20 @@ import torch
 
 
 @dataclass(frozen=True)
-class UGDenoiseSchedule:
-    """Shifted denoise timesteps and adjacent deltas for UG visual steps."""
+class BAGELDenoiseSchedule:
+    """BAGEL's official shifted denoise timesteps and adjacent deltas."""
 
     timesteps: torch.Tensor
     dts: torch.Tensor
 
 
-def build_ug_denoise_schedule(
+def build_bagel_denoise_schedule(
     *,
     num_inference_steps: int,
     timestep_shift: float,
     device: torch.device | str | None = None,
-) -> UGDenoiseSchedule:
-    """Build a shifted visual denoise schedule."""
+) -> BAGELDenoiseSchedule:
+    """Build the same denoise schedule used by BAGEL's official generate_image."""
 
     num_inference_steps = int(num_inference_steps)
     timestep_shift = float(timestep_shift)
@@ -37,14 +37,14 @@ def build_ug_denoise_schedule(
     timesteps = torch.linspace(1, 0, num_inference_steps, device=device)
     timesteps = timestep_shift * timesteps / (1 + (timestep_shift - 1) * timesteps)
     dts = timesteps[:-1] - timesteps[1:]
-    return UGDenoiseSchedule(timesteps=timesteps[:-1], dts=dts)
+    return BAGELDenoiseSchedule(timesteps=timesteps[:-1], dts=dts)
 
 
-def get_ug_effective_cfg_scales(
+def get_bagel_effective_cfg_scales(
     cfg_source: Any,
     timestep: torch.Tensor,
 ) -> tuple[float, float]:
-    """Resolve timestep-gated text/image CFG scales."""
+    """Resolve BAGEL's timestep-gated text/image CFG scales."""
 
     t = float(timestep.flatten()[0].detach().cpu())
     start, end = _cfg_interval(cfg_source)

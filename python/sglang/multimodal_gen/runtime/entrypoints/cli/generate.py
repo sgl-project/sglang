@@ -80,6 +80,59 @@ def add_multimodal_gen_generate_args(parser: argparse.ArgumentParser):
         required=False,
         help="Convenience alias that sets both --output-path and --output-file-name.",
     )
+    parser.add_argument(
+        "--ug-interleave-input",
+        "--ug-interleaved-input",
+        dest="ug_interleaved_input",
+        type=str,
+        default=None,
+        required=False,
+        help=(
+            "Experimental UG interleave JSON payload or path. "
+            "Accepts {'messages': [...], 'sampling_params': {...}} or "
+            "{'requests': [...]}."
+        ),
+    )
+    parser.add_argument(
+        "--ug-interleave-output",
+        "--ug-interleaved-output",
+        dest="ug_interleaved_output",
+        type=str,
+        default=None,
+        required=False,
+        help="Optional path to write the experimental UG interleave JSON result.",
+    )
+    parser.add_argument(
+        "--ug-vlm-input",
+        type=str,
+        default=None,
+        required=False,
+        help=(
+            "Experimental UG VLM-only JSON payload or path. "
+            "Accepts {'messages': [...], 'max_new_tokens': 8} or {'requests': [...]}."
+        ),
+    )
+    parser.add_argument(
+        "--ug-vlm-output",
+        type=str,
+        default=None,
+        required=False,
+        help="Optional path to write the experimental UG VLM-only JSON result.",
+    )
+    parser.add_argument(
+        "--think",
+        action="store_true",
+        default=None,
+        required=False,
+        help="Enable UG thinking text before image generation when supported.",
+    )
+    parser.add_argument(
+        "--think-max-new-tokens",
+        type=int,
+        default=None,
+        required=False,
+        help="Maximum UG thinking tokens before image generation.",
+    )
 
     parser = ServerArgs.add_cli_args(parser)
     parser = SamplingParams.add_cli_args(parser)
@@ -197,11 +250,83 @@ def generate_cmd(args: argparse.Namespace, unknown_args: list[str] | None = None
     generator = DiffGenerator.from_pretrained(
         model_path=server_args.model_path, server_args=server_args, local_mode=True
     )
+    try:
+        if args.ug_interleaved_input is not None and args.ug_vlm_input is not None:
+            raise ValueError(
+                "Use either --ug-interleaved-input or --ug-vlm-input, not both"
+            )
 
-    results = generator.generate(sampling_params_kwargs=sampling_params_kwargs)
+        if args.ug_vlm_input is not None:
+            payload = _apply_ug_cli_overrides(
+                _load_ug_interleaved_payload(args.ug_vlm_input), args
+            )
+            result = generator.generate_vlm_serializable(payload)
+            payload = json.dumps(result, ensure_ascii=False)
+            if args.ug_vlm_output:
+                with open(args.ug_vlm_output, "w", encoding="utf-8") as f:
+                    f.write(payload)
+                    f.write("\n")
+            else:
+                print(payload)
+            return
 
-    prompt = sampling_params_kwargs.get("prompt")
-    maybe_dump_performance(args, server_args, prompt, results)
+        if args.ug_interleaved_input is not None:
+            payload = _apply_ug_cli_overrides(
+                _load_ug_interleaved_payload(args.ug_interleaved_input), args
+            )
+            result = generator.generate_interleave_serializable(payload)
+            payload = json.dumps(result, ensure_ascii=False)
+            if args.ug_interleaved_output:
+                with open(args.ug_interleaved_output, "w", encoding="utf-8") as f:
+                    f.write(payload)
+                    f.write("\n")
+            else:
+                print(payload)
+            return
+
+        results = generator.generate(sampling_params_kwargs=sampling_params_kwargs)
+
+        prompt = sampling_params_kwargs.get("prompt")
+        maybe_dump_performance(args, server_args, prompt, results)
+    finally:
+        generator.shutdown()
+
+
+def _load_ug_interleaved_payload(value: str):
+    if os.path.exists(value):
+        with open(value, encoding="utf-8") as f:
+            return json.load(f)
+    return json.loads(value)
+
+
+def _apply_ug_cli_overrides(payload, args: argparse.Namespace):
+    updates = {}
+    if getattr(args, "think", None) is not None:
+        updates["think"] = bool(args.think)
+    if getattr(args, "think_max_new_tokens", None) is not None:
+        updates["think_max_new_tokens"] = int(args.think_max_new_tokens)
+    if not updates:
+        return payload
+
+    def apply_one(item):
+        if not isinstance(item, dict):
+            raise TypeError(f"UG CLI payload entries must be dicts, got {item!r}")
+        cloned = dict(item)
+        metadata = dict(cloned.get("metadata") or {})
+        metadata.update(updates)
+        cloned["metadata"] = metadata
+        return cloned
+
+    if isinstance(payload, list):
+        return [apply_one(item) for item in payload]
+    if isinstance(payload, dict) and "requests" in payload:
+        requests = payload["requests"]
+        if not isinstance(requests, list):
+            raise TypeError("UG CLI batch payload requests must be a list")
+        cloned = dict(payload)
+        cloned["requests"] = [apply_one(item) for item in requests]
+        return cloned
+    return apply_one(payload)
 
 
 class GenerateSubcommand(CLISubcommand):

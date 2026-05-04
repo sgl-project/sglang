@@ -19,7 +19,7 @@ from sglang.srt.ug.interleaved import (
     normalize_ug_generation_mode,
 )
 from sglang.srt.ug.runtime import UGInterleavedMessage
-from sglang.srt.ug.sampling import build_ug_denoise_schedule
+from sglang.srt.ug.sampling import build_bagel_denoise_schedule
 
 
 class UGContextStage(PipelineStage):
@@ -160,7 +160,7 @@ class UGDenoiseStage(PipelineStage):
         if num_steps <= 0:
             raise ValueError(f"num_inference_steps must be positive, got {num_steps}")
 
-        schedule = build_ug_denoise_schedule(
+        schedule = build_bagel_denoise_schedule(
             num_inference_steps=num_steps,
             timestep_shift=params.timestep_shift,
             device=x_t.device,

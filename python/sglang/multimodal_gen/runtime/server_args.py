@@ -168,6 +168,14 @@ class ServerArgs(DisaggArgsMixin):
         None  # Override pipeline class from model_index.json
     )
 
+    # Experimental UG native SRT scheduler settings. These are used only for
+    # BAGEL-style UGPipeline entrypoints where SRT owns the U session/KV cache.
+    ug_srt_mem_fraction_static: float = 0.35
+    ug_srt_chunked_prefill_size: int = 256
+    ug_srt_u_decode_max_new_tokens: int = 1
+    ug_srt_attention_backend: str | None = None
+    ug_srt_log_level: str = "error"
+
     # LoRA parameters
     # (Wenxuan) prefer to keep it here instead of in pipeline config to not make it complicated.
     lora_path: str | None = None
@@ -787,6 +795,48 @@ class ServerArgs(DisaggArgsMixin):
                 "Override pipeline class selection from model_index.json. "
                 "Must match a registered pipeline_name."
             ),
+        )
+        parser.add_argument(
+            "--ug-srt-mem-fraction-static",
+            type=float,
+            default=ServerArgs.ug_srt_mem_fraction_static,
+            help=(
+                "Experimental UG/BAGEL native SRT scheduler KV memory fraction. "
+                "Only used by UGPipeline with real BAGEL checkpoints."
+            ),
+        )
+        parser.add_argument(
+            "--ug-srt-chunked-prefill-size",
+            type=int,
+            default=ServerArgs.ug_srt_chunked_prefill_size,
+            help=(
+                "Experimental UG/BAGEL native SRT scheduler chunked prefill size. "
+                "Only used by UGPipeline with real BAGEL checkpoints."
+            ),
+        )
+        parser.add_argument(
+            "--ug-srt-u-decode-max-new-tokens",
+            type=int,
+            default=ServerArgs.ug_srt_u_decode_max_new_tokens,
+            help=(
+                "Experimental UG/BAGEL max_new_tokens used for each SRT U decode "
+                "step. Keep this at 1 for BAGEL official-style greedy decode."
+            ),
+        )
+        parser.add_argument(
+            "--ug-srt-attention-backend",
+            type=str,
+            default=ServerArgs.ug_srt_attention_backend,
+            help=(
+                "Optional attention backend override for the experimental "
+                "UG/BAGEL native SRT scheduler."
+            ),
+        )
+        parser.add_argument(
+            "--ug-srt-log-level",
+            type=str,
+            default=ServerArgs.ug_srt_log_level,
+            help="Log level for the experimental UG/BAGEL native SRT scheduler.",
         )
         # attention
         parser.add_argument(

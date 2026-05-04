@@ -441,8 +441,14 @@ class TritonAttnBackend(AttentionBackend):
             qo_indptr = self.qo_indptr
             qo_indptr[1 : bs + 1] = torch.cumsum(forward_batch.extend_seq_lens, dim=0)
             qo_indptr = qo_indptr[: bs + 1]
-            custom_mask = None
-            mask_indptr = None
+            custom_mask = forward_batch.cross_attention_custom_mask
+            if custom_mask is not None:
+                seq_mask_len = forward_batch.extend_seq_lens * forward_batch.seq_lens
+                mask_indptr = self.mask_indptr
+                mask_indptr[1 : bs + 1] = torch.cumsum(seq_mask_len[:bs], dim=0)
+                mask_indptr = mask_indptr[: bs + 1]
+            else:
+                mask_indptr = None
             attn_logits = None
             attn_lse = None
             max_extend_len = max(forward_batch.extend_seq_lens_cpu)
@@ -916,6 +922,7 @@ class TritonAttnBackend(AttentionBackend):
                 layer.attn_type == AttentionType.DECODER_BIDIRECTIONAL
                 and self.allow_bidirectional_attention_in_extend
             )
+            or getattr(forward_batch, "ug_g_non_causal_query_attention", False)
         ):
             causal = False
 

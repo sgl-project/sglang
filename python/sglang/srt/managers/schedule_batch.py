@@ -109,6 +109,34 @@ MM_PAD_SHIFT_VALUE = 1_000_000
 
 logger = logging.getLogger(__name__)
 
+UG_BATCH_COMPAT_CAUSAL = "causal"
+UG_BATCH_COMPAT_NON_CAUSAL_QUERY = "ug_non_causal_query"
+
+
+def get_ug_batch_compat_key(req: "Req") -> str:
+    if getattr(req, "ug_non_causal_query_attention", False):
+        return UG_BATCH_COMPAT_NON_CAUSAL_QUERY
+    return UG_BATCH_COMPAT_CAUSAL
+
+
+def get_ug_batch_compat_key_for_reqs(reqs: List["Req"]) -> str:
+    batch_compat_keys = {get_ug_batch_compat_key(req) for req in reqs}
+    if len(batch_compat_keys) > 1:
+        raise ValueError(
+            "UG non-causal query attention requests cannot be mixed with "
+            "ordinary causal requests in the same SRT batch"
+        )
+    return next(iter(batch_compat_keys), UG_BATCH_COMPAT_CAUSAL)
+
+
+def is_ug_batch_compatible(req: "Req", batch_compat_key: Optional[str]) -> bool:
+    return batch_compat_key is None or get_ug_batch_compat_key(req) == batch_compat_key
+
+
+def check_ug_non_causal_batch_compat(reqs: List["Req"]) -> bool:
+    batch_compat_key = get_ug_batch_compat_key_for_reqs(reqs)
+    return batch_compat_key == UG_BATCH_COMPAT_NON_CAUSAL_QUERY
+
 
 @lru_cache(maxsize=1)
 def sanity_check_mm_pad_shift_value(vocab_size: int) -> None:
@@ -1380,6 +1408,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # Token replacement embeddings and absolute positions (optional).
     replace_embeds: Optional[torch.Tensor] = None
     replace_positions: Optional[torch.Tensor] = None
+    custom_position_ids: Optional[torch.Tensor] = None
+    ug_non_causal_query_attention: bool = False
+    bagel_mot_text_token_indices: Optional[torch.Tensor] = None
+    bagel_mot_vae_token_indices: Optional[torch.Tensor] = None
     ne_token_table: torch.Tensor = None
     token_type_ids: torch.Tensor = None  # shape: [b], int64
     req_pool_indices: torch.Tensor = None  # shape: [b], int64
@@ -1669,6 +1701,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         orig_seq_lens = [max(len(r.fill_ids), len(r.origin_input_ids)) for r in reqs]
         prefix_lens = [len(r.prefix_indices) for r in reqs]
         extend_lens = [r.extend_input_len for r in reqs]
+        ug_non_causal_query_attention = check_ug_non_causal_batch_compat(reqs)
 
         # For matryoshka embeddings
         if self.model_config.is_matryoshka and any(
@@ -1724,6 +1757,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         all_replace_embeds: List[torch.Tensor] = []
         all_replace_positions: List[int] = []
         has_replace_embeds = False
+        custom_position_ids = []
+        has_custom_position_ids = any(
+            getattr(req, "ug_position_ids", None) is not None for req in reqs
+        )
+        bagel_mot_text_token_indices = []
+        bagel_mot_vae_token_indices = []
         input_id_pointer = 0
         input_id_lens = [len(input_id) for input_id in input_ids]
         extend_input_logprob_token_ids = []
@@ -1769,6 +1808,60 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                         req.positional_embed_overrides.embeds[list(indices)]
                     )
                     all_replace_positions.extend(positions)
+
+            req_ug_replace_embeds = getattr(req, "ug_replace_embeds", None)
+            req_ug_replace_positions = getattr(req, "ug_replace_positions", None)
+            if req_ug_replace_embeds is not None:
+                embeds_to_add = []
+                for embed_idx, pos in enumerate(req_ug_replace_positions or []):
+                    extend_pos = pos - pre_len
+                    if extend_pos < 0 or extend_pos >= req.extend_input_len:
+                        continue
+                    embeds_to_add.append((embed_idx, input_id_pointer + extend_pos))
+                if embeds_to_add:
+                    has_replace_embeds = True
+                    indices, positions = zip(*embeds_to_add)
+                    all_replace_embeds.append(
+                        torch.tensor(req_ug_replace_embeds)[list(indices)]
+                    )
+                    all_replace_positions.extend(positions)
+
+            req_custom_position_ids = getattr(req, "ug_position_ids", None)
+            if req_custom_position_ids is not None:
+                custom_position_ids.extend(
+                    req_custom_position_ids[pre_len : pre_len + req.extend_input_len]
+                )
+            elif has_custom_position_ids:
+                custom_position_ids.extend(
+                    range(pre_len, pre_len + req.extend_input_len)
+                )
+
+            if getattr(req, "ug_non_causal_query_attention", False):
+                ug_non_causal_query_attention = True
+
+            local_bagel_text_indices = []
+            local_bagel_vae_indices = []
+            for index in getattr(req, "ug_bagel_text_token_indices", []) or []:
+                extend_pos = index - pre_len
+                if 0 <= extend_pos < req.extend_input_len:
+                    local_bagel_text_indices.append(extend_pos)
+            for index in getattr(req, "ug_bagel_vae_token_indices", []) or []:
+                extend_pos = index - pre_len
+                if 0 <= extend_pos < req.extend_input_len:
+                    local_bagel_vae_indices.append(extend_pos)
+            if local_bagel_vae_indices:
+                routed = set(local_bagel_text_indices) | set(local_bagel_vae_indices)
+                local_bagel_text_indices.extend(
+                    index
+                    for index in range(req.extend_input_len)
+                    if index not in routed
+                )
+            bagel_mot_text_token_indices.extend(
+                input_id_pointer + index for index in local_bagel_text_indices
+            )
+            bagel_mot_vae_token_indices.extend(
+                input_id_pointer + index for index in local_bagel_vae_indices
+            )
             input_id_pointer += input_id_lens[i]
 
             multimodal_inputs.append(req.multimodal_inputs)
@@ -1890,6 +1983,32 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         )
         self.replace_embeds = replace_embeds_tensor
         self.replace_positions = replace_positions_tensor
+        self.custom_position_ids = (
+            torch.tensor(custom_position_ids, dtype=torch.int64, pin_memory=_pin).to(
+                self.device, non_blocking=True
+            )
+            if has_custom_position_ids
+            else None
+        )
+        self.ug_non_causal_query_attention = ug_non_causal_query_attention
+        self.bagel_mot_text_token_indices = (
+            torch.tensor(
+                bagel_mot_text_token_indices,
+                dtype=torch.int64,
+                device=self.device,
+            )
+            if bagel_mot_text_token_indices
+            else None
+        )
+        self.bagel_mot_vae_token_indices = (
+            torch.tensor(
+                bagel_mot_vae_token_indices,
+                dtype=torch.int64,
+                device=self.device,
+            )
+            if bagel_mot_vae_token_indices
+            else None
+        )
         for mm_input in multimodal_inputs:
             if mm_input is None:
                 continue
@@ -2252,6 +2371,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # Decode embeds the last output token via embed_tokens; clear the stale
         # prefill-time tensor so it doesn't leak into ForwardBatch.
         self.input_embeds = None
+        self.custom_position_ids = None
+        self.ug_non_causal_query_attention = False
+        self.bagel_mot_text_token_indices = None
+        self.bagel_mot_vae_token_indices = None
 
         # Clear context parallel metadata - CP is only for prefill, not decode
         if hasattr(self, "attn_cp_metadata") and self.attn_cp_metadata is not None:
@@ -2551,6 +2674,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             input_embeds=self.input_embeds,
             replace_embeds=self.replace_embeds,
             replace_positions=self.replace_positions,
+            custom_position_ids=self.custom_position_ids,
+            ug_non_causal_query_attention=self.ug_non_causal_query_attention,
+            bagel_mot_text_token_indices=self.bagel_mot_text_token_indices,
+            bagel_mot_vae_token_indices=self.bagel_mot_vae_token_indices,
             ne_token_table=self.ne_token_table,
             token_type_ids=self.token_type_ids,
             spec_algorithm=self.spec_algorithm,
@@ -2575,6 +2702,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             dllm_block_offsets=[req.dllm_block_offset for req in self.reqs],
             dllm_config=self.dllm_config,
             reqs=self.reqs,
+            ug_u_forward_metadata=[
+                getattr(req, "ug_u_forward_metadata", None) for req in self.reqs
+            ],
             has_grammar=self.has_grammar,
             mamba_track_indices=self.mamba_track_indices,
             mamba_track_mask=self.mamba_track_mask,
@@ -2746,6 +2876,10 @@ class ModelWorkerBatch:
     input_embeds: Optional[torch.Tensor] = None
     replace_embeds: Optional[torch.Tensor] = None
     replace_positions: Optional[torch.Tensor] = None
+    custom_position_ids: Optional[torch.Tensor] = None
+    ug_non_causal_query_attention: bool = False
+    bagel_mot_text_token_indices: Optional[torch.Tensor] = None
+    bagel_mot_vae_token_indices: Optional[torch.Tensor] = None
 
     # token table for ngram embedding
     ne_token_table: Optional[torch.Tensor] = None
@@ -2781,6 +2915,7 @@ class ModelWorkerBatch:
     # For constrained decoding
     # FIXME(lsyin): remove this after fully overlap grammar
     reqs: Optional[List[Req]] = None
+    ug_u_forward_metadata: Optional[List[Dict[str, Any]]] = None
     has_grammar: bool = False
 
     # For hidden states before normal

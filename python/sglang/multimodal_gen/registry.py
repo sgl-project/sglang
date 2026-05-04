@@ -617,14 +617,17 @@ def get_model_info(
 
 # Registration of model configs
 def _register_configs():
-    # UG unified generation contract smoke model.
+    # UG / BAGEL-style unified generation models.
     register_configs(
         sampling_param_cls=UGSamplingParams,
         pipeline_config_cls=UGPipelineConfig,
         hf_model_paths=[
+            "ByteDance-Seed/BAGEL-7B-MoT",
+            "sglang-internal/mock-bagel",
             "sglang-internal/fake-ug",
         ],
         model_detectors=[
+            lambda hf_id: "bagel" in hf_id.lower(),
             lambda hf_id: "fake-ug" in hf_id.lower(),
         ],
     )
