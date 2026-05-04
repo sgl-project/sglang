@@ -199,7 +199,8 @@ class TestNemotron3Nano30BXPU(CustomTestCase):
             temperature=0,
             max_tokens=256,
         )
-        _assert_code_reply(response)
+        # Log the raw response BEFORE assertions so the .txt always captures
+        # what the model produced, even when the content assertions fail.
         _append_comparison_log(
             title="OUTPUT FROM --device XPU (NVIDIA-Nemotron-3-Nano-30B-A3B-BF16)",
             device_cli="--device xpu",
@@ -211,6 +212,7 @@ class TestNemotron3Nano30BXPU(CustomTestCase):
             user_prompt=_SIMPLE_CODE_PROMPT,
             response=response,
         )
+        _assert_code_reply(response)
 
 
 if __name__ == "__main__":
