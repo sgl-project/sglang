@@ -82,3 +82,12 @@
 /python/sglang/srt/multimodal/processors/gemma4.py @mickqian @JustinTong0323 @yhyang201 @yuan-luo @kpham-sgl
 /docs_new/cookbook/autoregressive/Google/Gemma4.mdx @wisclmy0611 @zijiexia @Richardczl98 @kpham-sgl
 /docs_new/src/snippets/autoregressive/gemma4-deployment.jsx @wisclmy0611 @zijiexia @Richardczl98 @kpham-sgl
+/python/sglang/srt/speculative/ngram_*.py @Ying1123 @merrymercy @hnyls2002 @Qiaolin-Yu @kpham-sgl
+/python/sglang/srt/speculative/cpp_ngram @Ying1123 @merrymercy @hnyls2002 @Qiaolin-Yu @kpham-sgl
+/python/sglang/jit_kernel/ngram_*.py @DarkSharpness @BBuf @celve @HydraQYH @yuan-luo @kpham-sgl
+/python/sglang/jit_kernel/csrc/ngram_corpus @DarkSharpness @BBuf @celve @HydraQYH @yuan-luo @kpham-sgl
+/python/sglang/jit_kernel/csrc/ngram_embedding.cuh @DarkSharpness @BBuf @celve @HydraQYH @yuan-luo @kpham-sgl
+/sgl-kernel/csrc/speculative/ngram_utils.cu @ispobock @BBuf @yizhang2077 @merrymercy @FlamingoPg @HaiShaw @kpham-sgl
+/sgl-kernel/tests/speculative/test_ngram_utils.py @ispobock @BBuf @yizhang2077 @merrymercy @FlamingoPg @HaiShaw @kpham-sgl
+/test/registered/spec/test_ngram_speculative_decoding.py @kpham-sgl
+/test/registered/unit/spec/test_ngram_corpus.py @kpham-sgl
