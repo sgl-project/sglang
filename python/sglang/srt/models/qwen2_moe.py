@@ -112,9 +112,10 @@ def can_fuse_shared_expert(
     config: PretrainedConfig,
     quant_config: Optional[QuantizationConfig],
 ) -> bool:
-    """Whether the shared expert may be fused as an extra MoE expert (Qwen3.5 + Aiter).
+    """Whether the shared expert may be fused as an extra MoE expert (Qwen MoE + Aiter).
 
     Caller must still gate on ``support_shared_expert_fusion`` and ``_use_aiter``.
+    Optional ``quant_config.can_fuse_shared_expert()`` (e.g. Quark) may forbid fusion.
     """
     if (
         get_global_server_args().disable_shared_experts_fusion is True
@@ -124,11 +125,9 @@ def can_fuse_shared_expert(
     ):
         return False
 
-    # If shared experts have a different quantization spec than routed MoE
-    # experts (e.g. unquantized BF16 vs MXFP4), fusion is not supported.
     if quant_config is not None:
-        can_fuse_shared_expert = getattr(quant_config, "can_fuse_shared_expert", None)
-        if can_fuse_shared_expert is not None and not can_fuse_shared_expert():
+        can_fuse_fn = getattr(quant_config, "can_fuse_shared_expert", None)
+        if can_fuse_fn is not None and not can_fuse_fn():
             return False
 
     return True
