@@ -11,12 +11,13 @@ import triton
 import triton.language as tl
 
 import sglang.srt.models.deepseek_v2 as deepseek_v2
-from sglang.jit_kernel.deepseek_v4 import fused_rope, linear_bf16_fp32, rmsnorm_self
+from sglang.jit_kernel.deepseek_v4 import fused_rope, rmsnorm_self
 from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
 from sglang.srt.distributed import get_pp_group, get_tensor_model_parallel_world_size
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
-from sglang.srt.layers.attention.nsa.nsa_indexer import rotate_activation
+from sglang.srt.layers.attention.compression.compressor import Compressor
+from sglang.srt.layers.attention.compression.indexer import C4Indexer
 from sglang.srt.layers.attention.nsa.utils import (
     can_nsa_cp_split,
     is_nsa_enable_prefill_cp,
@@ -50,8 +51,6 @@ from sglang.srt.layers.utils.cp_utils import (
     prepare_context_parallel_metadata,
 )
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
-from sglang.srt.mem_cache.deepseek_v4_compress_state import CompressStatePool
-from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.mem_cache.memory_pool import RadixAttention
 from sglang.srt.model_executor.cuda_graph_runner import (
     compile_in_capture_mode,
@@ -135,191 +134,6 @@ def rms_normalize_triton(
         HAS_WEIGHT=(weight is not None),
     )
     return x
-
-
-class Compressor(nn.Module):
-    def __init__(
-        self,
-        config: DeepSeekV4Config,
-        layer_id: int,
-        is_in_indexer: bool,
-        freqs_cis: torch.Tensor,
-        compress_ratio: Literal[0, 4, 128],
-        head_dim: int,
-        rotate: bool = False,
-        prefix: str = "",
-    ) -> None:
-        super().__init__()
-        self.layer_id = layer_id
-        self.is_in_indexer = is_in_indexer
-        self.dim = config.hidden_size
-        self.head_dim = head_dim
-        self.rope_head_dim = getattr(config, "qk_rope_head_dim", 64)
-        assert compress_ratio != 0, "compress_ratio should not be 0"
-        self.ratio = compress_ratio
-        self.overlap = self.ratio == 4
-        self.rotate = rotate
-        coff = 1 + self.overlap
-
-        self.ape = nn.Parameter(
-            torch.empty(self.ratio, coff * self.head_dim, dtype=torch.float32)
-        )
-        wkv_gate_dtype = torch.bfloat16
-        self.wkv_gate = ReplicatedLinear(
-            self.dim,
-            2 * coff * self.head_dim,
-            bias=False,
-            quant_config=None,
-            prefix=add_prefix("wkv_gate", prefix),
-            params_dtype=wkv_gate_dtype,
-        )
-        self.norm = RMSNorm(
-            self.head_dim, eps=config.rms_norm_eps, weight_dtype=torch.float32
-        )
-        self.freqs_cis = freqs_cis
-
-        self.ape_converted = False
-
-    def apply_ape_hotfix(self):
-        assert not self.ape_converted
-        self.ape_converted = True
-
-        if self.overlap:
-            ape = torch.chunk(self.ape.data, 2, dim=-1)
-            ape = torch.cat([ape[0], ape[1]], dim=0)
-            self.ape.data.copy_(ape.view(self.ratio, -1))
-
-    def _get_state_pool(self, forward_batch: ForwardBatch) -> CompressStatePool:
-        token_to_kv_pool = forward_batch.token_to_kv_pool
-        assert isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool)
-        if self.is_in_indexer:
-            ret = token_to_kv_pool.get_indexer_compress_states(self.layer_id)
-        else:
-            ret = token_to_kv_pool.get_attention_compress_states(self.layer_id)
-
-        assert isinstance(ret, CompressStatePool)
-
-        return ret
-
-    def forward(self, x: torch.Tensor, forward_batch: ForwardBatch) -> torch.Tensor:
-        if forward_batch.forward_mode.is_idle():
-            assert x.shape[0] == 0
-            return x.new_empty(0, self.head_dim)
-
-        kv_score = linear_bf16_fp32(x, self.wkv_gate.weight)
-        if nsa_use_prefill_cp(forward_batch):
-            kv_score = cp_all_gather_rerange_output(
-                kv_score,
-                get_attention_tp_size(),
-                forward_batch,
-                torch.cuda.current_stream(),
-            )
-
-        backend = forward_batch.attn_backend
-        if TYPE_CHECKING:
-            assert isinstance(backend, DeepseekV4AttnBackend)
-        kv_score_buffer = self._get_state_pool(forward_batch)
-        kv_score_buffer = kv_score_buffer.kv_score_buffer.kv_score
-        return backend.forward_compress(
-            kv_score_buffer=kv_score_buffer,
-            kv_score_input=kv_score,
-            ape=self.ape.view(-1, self.head_dim),
-            head_dim=self.head_dim,
-            norm=self.norm,
-            freqs_cis_cache=self.freqs_cis,
-            rotate=self.rotate,
-            compress_ratio=self.ratio,
-            forward_batch=forward_batch,
-            is_paged=True,
-        )
-
-
-class C4Indexer(nn.Module):
-    def __init__(
-        self,
-        config: DeepSeekV4Config,
-        layer_id: int,
-        freqs_cis: torch.Tensor,
-        quant_config: Optional[QuantizationConfig] = None,
-        prefix: str = "",
-        alt_streams: Optional[List[torch.cuda.Stream]] = None,
-    ):
-        super().__init__()
-        self.layer_id = layer_id
-        self.dim = config.hidden_size
-        self.n_heads = config.index_n_heads
-        self.head_dim = config.index_head_dim
-        self.rope_head_dim = config.qk_rope_head_dim
-        self.q_lora_rank = config.q_lora_rank
-        self.softmax_scale = self.head_dim**-0.5
-        self.n_local_heads = self.n_heads
-        self.wq_b = ReplicatedLinear(
-            self.q_lora_rank,
-            self.n_heads * self.head_dim,
-            bias=False,
-            quant_config=quant_config,
-            params_dtype=torch.bfloat16,
-            prefix=add_prefix("wq_b", prefix),
-        )
-        self.weights_proj = ReplicatedLinear(
-            self.dim,
-            self.n_heads,
-            bias=False,
-            quant_config=None,
-            params_dtype=torch.bfloat16,
-            prefix=add_prefix("weights_proj", prefix),
-        )
-        self.compressor = Compressor(
-            config,
-            self.layer_id,
-            True,
-            freqs_cis,
-            compress_ratio=4,
-            head_dim=self.head_dim,
-            rotate=True,
-            prefix=add_prefix("compressor", prefix),
-        )
-        self.freqs_cis = freqs_cis
-        self.weight_scale: float = self.softmax_scale * self.n_heads**-0.5
-        self.alt_streams = alt_streams
-
-    def compute_q(self, q_lora: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
-        q, _ = self.wq_b(q_lora)
-        q = q.view(-1, self.n_local_heads, self.head_dim)
-        fused_rope(
-            q[..., -self.rope_head_dim :],
-            None,
-            self.freqs_cis,
-            positions=positions,
-        )
-        q = rotate_activation(q)
-        return q
-
-    def compute_weights(self, x: torch.Tensor, skip_scale=False) -> torch.Tensor:
-        out, _ = self.weights_proj(x)
-        if not skip_scale:
-            out = out * self.weight_scale
-        return out
-
-    def forward(
-        self,
-        x: torch.Tensor,
-        q_lora: torch.Tensor,
-        forward_batch: ForwardBatch,
-        enable_multi_stream: bool = False,
-        q_lora_ready: Optional[torch.cuda.Event] = None,
-    ) -> None:
-        if TYPE_CHECKING:
-            assert isinstance(forward_batch.attn_backend, DeepseekV4AttnBackend)
-        return forward_batch.attn_backend.forward_c4_indexer(
-            x=x,
-            q_lora=q_lora,
-            forward_batch=forward_batch,
-            c4_indexer=self,
-            alt_streams=self.alt_streams,
-            enable_multi_stream=enable_multi_stream,
-            q_lora_ready=q_lora_ready,
-        )
 
 
 class MQALayer(nn.Module):

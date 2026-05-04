@@ -3,25 +3,34 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, List, Literal, NamedTuple, Optional, Union
 
 import torch
+import torch.nn as nn
 
 from sglang.jit_kernel.deepseek_v4 import (
     CompressorDecodePlan,
     CompressorPrefillPlan,
     compress_forward,
     compress_fused_norm_rope_inplace,
+    linear_bf16_fp32,
     triton_create_paged_compress_data,
 )
+from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.nsa.quant_k_cache_v4 import (
     quant_to_nope_fp8_rope_bf16_pack_triton,
 )
 from sglang.srt.layers.attention.nsa.triton_kernel import act_quant
+from sglang.srt.layers.attention.nsa.utils import nsa_use_prefill_cp
+from sglang.srt.layers.dp_attention import get_attention_tp_size
+from sglang.srt.layers.layernorm import RMSNorm
+from sglang.srt.layers.utils.cp_utils import cp_all_gather_rerange_output
+from sglang.srt.mem_cache.deepseek_v4_compress_state import CompressStatePool
+from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
+from sglang.srt.models.dbrx import ReplicatedLinear
+from sglang.srt.utils import add_prefix
 
 if TYPE_CHECKING:
-    from sglang.srt.layers.layernorm import RMSNorm
-    from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
+    from sglang.srt.layers.attention.deepseek_v4_backend import DeepseekV4AttnBackend
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-    from sglang.srt.models.deepseek_v4 import Compressor
 
 
 class FusedCompressMetadata(NamedTuple):
@@ -268,3 +277,100 @@ def create_paged_compressor_data(
         plan = CompressorDecodePlan(compress_ratio, seq_lens.to(torch.int32))
 
     return FusedCompressMetadata(write_loc=write_loc, extra_data=extra_data, plan=plan)
+
+
+class Compressor(nn.Module):
+    def __init__(
+        self,
+        config: DeepSeekV4Config,
+        layer_id: int,
+        is_in_indexer: bool,
+        freqs_cis: torch.Tensor,
+        compress_ratio: Literal[0, 4, 128],
+        head_dim: int,
+        rotate: bool = False,
+        prefix: str = "",
+    ) -> None:
+        super().__init__()
+        self.layer_id = layer_id
+        self.is_in_indexer = is_in_indexer
+        self.dim = config.hidden_size
+        self.head_dim = head_dim
+        self.rope_head_dim = getattr(config, "qk_rope_head_dim", 64)
+        assert compress_ratio != 0, "compress_ratio should not be 0"
+        self.ratio = compress_ratio
+        self.overlap = self.ratio == 4
+        self.rotate = rotate
+        coff = 1 + self.overlap
+
+        self.ape = nn.Parameter(
+            torch.empty(self.ratio, coff * self.head_dim, dtype=torch.float32)
+        )
+        wkv_gate_dtype = torch.bfloat16
+        self.wkv_gate = ReplicatedLinear(
+            self.dim,
+            2 * coff * self.head_dim,
+            bias=False,
+            quant_config=None,
+            prefix=add_prefix("wkv_gate", prefix),
+            params_dtype=wkv_gate_dtype,
+        )
+        self.norm = RMSNorm(
+            self.head_dim, eps=config.rms_norm_eps, weight_dtype=torch.float32
+        )
+        self.freqs_cis = freqs_cis
+
+        self.ape_converted = False
+
+    def apply_ape_hotfix(self):
+        assert not self.ape_converted
+        self.ape_converted = True
+
+        if self.overlap:
+            ape = torch.chunk(self.ape.data, 2, dim=-1)
+            ape = torch.cat([ape[0], ape[1]], dim=0)
+            self.ape.data.copy_(ape.view(self.ratio, -1))
+
+    def _get_state_pool(self, forward_batch: ForwardBatch) -> CompressStatePool:
+        token_to_kv_pool = forward_batch.token_to_kv_pool
+        assert isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool)
+        if self.is_in_indexer:
+            ret = token_to_kv_pool.get_indexer_compress_states(self.layer_id)
+        else:
+            ret = token_to_kv_pool.get_attention_compress_states(self.layer_id)
+
+        assert isinstance(ret, CompressStatePool)
+
+        return ret
+
+    def forward(self, x: torch.Tensor, forward_batch: ForwardBatch) -> torch.Tensor:
+        if forward_batch.forward_mode.is_idle():
+            assert x.shape[0] == 0
+            return x.new_empty(0, self.head_dim)
+
+        kv_score = linear_bf16_fp32(x, self.wkv_gate.weight)
+        if nsa_use_prefill_cp(forward_batch):
+            kv_score = cp_all_gather_rerange_output(
+                kv_score,
+                get_attention_tp_size(),
+                forward_batch,
+                torch.cuda.current_stream(),
+            )
+
+        backend = forward_batch.attn_backend
+        if TYPE_CHECKING:
+            assert isinstance(backend, DeepseekV4AttnBackend)
+        kv_score_buffer = self._get_state_pool(forward_batch)
+        kv_score_buffer = kv_score_buffer.kv_score_buffer.kv_score
+        return backend.forward_compress(
+            kv_score_buffer=kv_score_buffer,
+            kv_score_input=kv_score,
+            ape=self.ape.view(-1, self.head_dim),
+            head_dim=self.head_dim,
+            norm=self.norm,
+            freqs_cis_cache=self.freqs_cis,
+            rotate=self.rotate,
+            compress_ratio=self.ratio,
+            forward_batch=forward_batch,
+            is_paged=True,
+        )

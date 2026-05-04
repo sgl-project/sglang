@@ -3,24 +3,34 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any, List, Optional, Tuple
 
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 import triton
 import triton.language as tl
 
-from sglang.jit_kernel.deepseek_v4 import topk_transform_512, topk_transform_512_v2
+from sglang.jit_kernel.deepseek_v4 import (
+    fused_rope,
+    topk_transform_512,
+    topk_transform_512_v2,
+)
+from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.compression.compressor import Compressor
 from sglang.srt.layers.attention.compression.metadata import PagedIndexerMetadata
 from sglang.srt.layers.attention.indexer_topk_capturer import (
     get_global_indexer_capturer,
 )
+from sglang.srt.layers.attention.nsa.nsa_indexer import rotate_activation
 from sglang.srt.layers.attention.nsa.triton_kernel import act_quant
-from sglang.srt.utils import is_hip
+from sglang.srt.models.dbrx import ReplicatedLinear
+from sglang.srt.utils import add_prefix, is_hip
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.compression.compressor import CompressorBackend
+    from sglang.srt.layers.attention.deepseek_v4_backend import DeepseekV4AttnBackend
+    from sglang.srt.layers.quantization import QuantizationConfig
     from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-    from sglang.srt.models.deepseek_v4 import C4Indexer
 
 
 if is_hip():
@@ -465,3 +475,91 @@ class C4IndexerBackend:
                 c4_indexer.layer_id
             ].compress_layer_id
             indexer_capturer.capture(compress_layer_id, raw_indices)
+
+
+class C4Indexer(nn.Module):
+    def __init__(
+        self,
+        config: DeepSeekV4Config,
+        layer_id: int,
+        freqs_cis: torch.Tensor,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+        alt_streams: Optional[List[torch.cuda.Stream]] = None,
+    ):
+        super().__init__()
+        self.layer_id = layer_id
+        self.dim = config.hidden_size
+        self.n_heads = config.index_n_heads
+        self.head_dim = config.index_head_dim
+        self.rope_head_dim = config.qk_rope_head_dim
+        self.q_lora_rank = config.q_lora_rank
+        self.softmax_scale = self.head_dim**-0.5
+        self.n_local_heads = self.n_heads
+        self.wq_b = ReplicatedLinear(
+            self.q_lora_rank,
+            self.n_heads * self.head_dim,
+            bias=False,
+            quant_config=quant_config,
+            params_dtype=torch.bfloat16,
+            prefix=add_prefix("wq_b", prefix),
+        )
+        self.weights_proj = ReplicatedLinear(
+            self.dim,
+            self.n_heads,
+            bias=False,
+            quant_config=None,
+            params_dtype=torch.bfloat16,
+            prefix=add_prefix("weights_proj", prefix),
+        )
+        self.compressor = Compressor(
+            config,
+            self.layer_id,
+            True,
+            freqs_cis,
+            compress_ratio=4,
+            head_dim=self.head_dim,
+            rotate=True,
+            prefix=add_prefix("compressor", prefix),
+        )
+        self.freqs_cis = freqs_cis
+        self.weight_scale: float = self.softmax_scale * self.n_heads**-0.5
+        self.alt_streams = alt_streams
+
+    def compute_q(self, q_lora: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
+        q, _ = self.wq_b(q_lora)
+        q = q.view(-1, self.n_local_heads, self.head_dim)
+        fused_rope(
+            q[..., -self.rope_head_dim :],
+            None,
+            self.freqs_cis,
+            positions=positions,
+        )
+        q = rotate_activation(q)
+        return q
+
+    def compute_weights(self, x: torch.Tensor, skip_scale=False) -> torch.Tensor:
+        out, _ = self.weights_proj(x)
+        if not skip_scale:
+            out = out * self.weight_scale
+        return out
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        q_lora: torch.Tensor,
+        forward_batch: ForwardBatch,
+        enable_multi_stream: bool = False,
+        q_lora_ready: Optional[torch.cuda.Event] = None,
+    ) -> None:
+        if TYPE_CHECKING:
+            assert isinstance(forward_batch.attn_backend, DeepseekV4AttnBackend)
+        return forward_batch.attn_backend.forward_c4_indexer(
+            x=x,
+            q_lora=q_lora,
+            forward_batch=forward_batch,
+            c4_indexer=self,
+            alt_streams=self.alt_streams,
+            enable_multi_stream=enable_multi_stream,
+            q_lora_ready=q_lora_ready,
+        )
