@@ -651,6 +651,7 @@ class ServerArgs:
     disable_custom_all_reduce: bool = False
     enable_mscclpp: bool = False
     enable_torch_symm_mem: bool = False
+    enable_trtllm_allreduce: bool = False
     pre_warm_nccl: bool = dataclasses.field(
         default_factory=lambda: is_hip()
     )  # Pre-warm NCCL/RCCL to reduce P99 TTFT cold-start latency (default: True for AMD/HIP, False for others)
@@ -6052,6 +6053,14 @@ class ServerArgs:
             "--enable-torch-symm-mem",
             action="store_true",
             help="Enable using torch symm mem for all-reduce kernel and fall back to NCCL. Only supports CUDA device SM90 and above. SM90 supports world size 4, 6, 8. SM100 supports world size 6, 8.",
+        )
+        parser.add_argument(
+            "--enable-trtllm-allreduce",
+            action="store_true",
+            help="Route TP all-reduce through flashinfer's TRT-LLM AR kernel "
+            "(allreduce_fusion(pattern=kAllReduce)). Pre-initializes an IPC "
+            "workspace before CUDA graph capture; falls back to the standard "
+            "AR backend chain when the input exceeds the workspace budget.",
         )
         parser.add_argument(
             "--pre-warm-nccl",

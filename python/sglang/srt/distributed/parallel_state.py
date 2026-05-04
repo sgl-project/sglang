@@ -226,6 +226,7 @@ class GroupCoordinator:
     use_torch_symm_mem_all_reduce: (
         bool  # a hint of whether to use TorchSymmMemAllReduce
     )
+    use_trtllm_all_reduce: bool  # a hint of whether to use TRTLLMAllReduce
     use_message_queue_broadcaster: (
         bool  # a hint of whether to use message queue broadcaster
     )
@@ -233,6 +234,7 @@ class GroupCoordinator:
     pynccl_comm: Optional[Any]  # PyNccl communicator
     ca_comm: Optional[Any]  # Custom allreduce communicator
     torch_symm_mem_comm: Optional[Any]  # Torch symm mem communicator
+    trtllm_comm: Optional[Any]  # TRTLLM allreduce communicator
     mq_broadcaster: Optional[Any]  # shared memory broadcaster
 
     def __init__(
@@ -247,6 +249,7 @@ class GroupCoordinator:
         use_hpu_communicator: bool,
         use_xpu_communicator: bool,
         use_npu_communicator: bool,
+        use_trtllm_all_reduce: bool = False,
         use_message_queue_broadcaster: bool = False,
         group_name: Optional[str] = None,
         gloo_timeout: timedelta = timedelta(seconds=120 * 60),
@@ -328,6 +331,7 @@ class GroupCoordinator:
         self.use_pymscclpp = use_pymscclpp
         self.use_custom_allreduce = use_custom_allreduce
         self.use_torch_symm_mem_all_reduce = use_torch_symm_mem_all_reduce
+        self.use_trtllm_all_reduce = use_trtllm_all_reduce
         self.use_hpu_communicator = use_hpu_communicator
         self.use_xpu_communicator = use_xpu_communicator
         self.use_npu_communicator = use_npu_communicator
@@ -414,6 +418,26 @@ class GroupCoordinator:
                 group=self.cpu_group,
                 device=self.device,
             )
+
+        self.trtllm_comm: Optional[Any] = None
+        if self.use_trtllm_all_reduce and self.world_size > 1:
+            from sglang.srt.distributed.device_communicators.trtllm_all_reduce import (
+                TRTLLMAllReduce,
+            )
+
+            try:
+                self.trtllm_comm = TRTLLMAllReduce(
+                    cpu_group=self.cpu_group,
+                    device_group=self.device_group,
+                    device=self.device,
+                )
+            except Exception as e:
+                logger.warning(
+                    "Setup TRTLLMAllReduce failed with %s; falling back to "
+                    "the standard AR backend chain.",
+                    e,
+                )
+                self.trtllm_comm = None
 
         # Create communicator for other hardware backends
         from sglang.srt.distributed.device_communicators.hpu_communicator import (
@@ -597,6 +621,12 @@ class GroupCoordinator:
 
         outplace_all_reduce_method = None
         if (
+            self.trtllm_comm is not None
+            and not self.trtllm_comm.disabled
+            and self.trtllm_comm.should_trtllm_ar(input_)
+        ):
+            outplace_all_reduce_method = "trtllm"
+        elif (
             self.ca_comm is not None
             and not self.ca_comm.disabled
             and self.ca_comm.should_custom_ar(input_)
@@ -701,8 +731,21 @@ class GroupCoordinator:
         pymscclpp_comm = self.pymscclpp_comm
         torch_symm_mem_comm = self.torch_symm_mem_comm
         pynccl_comm = self.pynccl_comm
-        assert any([qr_comm, ca_comm, pymscclpp_comm, torch_symm_mem_comm, pynccl_comm])
-        if outplace_all_reduce_method == "ca":
+        trtllm_comm = self.trtllm_comm
+        assert any(
+            [
+                qr_comm,
+                ca_comm,
+                pymscclpp_comm,
+                torch_symm_mem_comm,
+                pynccl_comm,
+                trtllm_comm,
+            ]
+        )
+        if outplace_all_reduce_method == "trtllm":
+            assert not trtllm_comm.disabled
+            out = trtllm_comm.trtllm_all_reduce(input_)
+        elif outplace_all_reduce_method == "ca":
             assert not ca_comm.disabled
             out = ca_comm.custom_all_reduce(input_)
         elif outplace_all_reduce_method == "qr":
@@ -1388,6 +1431,12 @@ class GroupCoordinator:
             self.pynccl_comm = None
         if self.ca_comm is not None:
             self.ca_comm = None
+        if self.trtllm_comm is not None:
+            try:
+                self.trtllm_comm.close()
+            except Exception:
+                pass
+            self.trtllm_comm = None
         if self.mq_broadcaster is not None:
             self.mq_broadcaster = None
 
@@ -1414,6 +1463,7 @@ def init_world_group(
         use_hpu_communicator=False,
         use_xpu_communicator=False,
         use_npu_communicator=False,
+        use_trtllm_all_reduce=False,
         group_name="world",
         recovered_rank=recovered_rank,
     )
@@ -1429,6 +1479,7 @@ def init_model_parallel_group(
     group_name: Optional[str] = None,
     use_mscclpp_allreduce: Optional[bool] = None,
     use_torch_symm_mem_allreduce: Optional[bool] = None,
+    use_trtllm_allreduce: Optional[bool] = None,
     recovered_rank: bool = False,
 ) -> GroupCoordinator:
     if use_custom_allreduce is None:
@@ -1437,6 +1488,8 @@ def init_model_parallel_group(
         use_mscclpp_allreduce = _ENABLE_MSCCLPP_ALL_REDUCE
     if use_torch_symm_mem_allreduce is None:
         use_torch_symm_mem_allreduce = _ENABLE_TORCH_SYMM_MEM_ALL_REDUCE
+    if use_trtllm_allreduce is None:
+        use_trtllm_allreduce = _ENABLE_TRTLLM_ALL_REDUCE
     return GroupCoordinator(
         group_ranks=group_ranks,
         local_rank=local_rank,
@@ -1449,6 +1502,7 @@ def init_model_parallel_group(
         use_pymscclpp=use_mscclpp_allreduce,
         use_custom_allreduce=use_custom_allreduce,
         use_torch_symm_mem_all_reduce=use_torch_symm_mem_allreduce,
+        use_trtllm_all_reduce=use_trtllm_allreduce,
         use_hpu_communicator=True,
         use_xpu_communicator=True,
         use_npu_communicator=True,
@@ -1576,6 +1630,7 @@ logger = logging.getLogger(__name__)
 _ENABLE_CUSTOM_ALL_REDUCE = True
 _ENABLE_MSCCLPP_ALL_REDUCE = False
 _ENABLE_TORCH_SYMM_MEM_ALL_REDUCE = False
+_ENABLE_TRTLLM_ALL_REDUCE = False
 
 
 def set_custom_all_reduce(enable: bool):
@@ -1591,6 +1646,11 @@ def set_mscclpp_all_reduce(enable: bool):
 def set_torch_symm_mem_all_reduce(enable: bool):
     global _ENABLE_TORCH_SYMM_MEM_ALL_REDUCE
     _ENABLE_TORCH_SYMM_MEM_ALL_REDUCE = enable
+
+
+def set_trtllm_all_reduce(enable: bool):
+    global _ENABLE_TRTLLM_ALL_REDUCE
+    _ENABLE_TRTLLM_ALL_REDUCE = enable
 
 
 _DEVICE_TO_DISTRIBUTED_BACKEND = {

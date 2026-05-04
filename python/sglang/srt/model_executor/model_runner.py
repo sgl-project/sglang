@@ -70,6 +70,7 @@ from sglang.srt.distributed import (
     set_custom_all_reduce,
     set_mscclpp_all_reduce,
     set_torch_symm_mem_all_reduce,
+    set_trtllm_all_reduce,
 )
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
@@ -1147,6 +1148,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         set_custom_all_reduce(not self.server_args.disable_custom_all_reduce)
         set_mscclpp_all_reduce(self.server_args.enable_mscclpp)
         set_torch_symm_mem_all_reduce(self.server_args.enable_torch_symm_mem)
+        set_trtllm_all_reduce(self.server_args.enable_trtllm_allreduce)
 
         if not self.is_draft_worker:
             if self.device == "cpu":
@@ -2362,19 +2364,35 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         (broadcasts, barriers) inside the graph capture context, which can
         deadlock with custom_all_reduce.register_graph_buffers.
         """
-        if not self.server_args.enable_flashinfer_allreduce_fusion:
+        if not (
+            self.server_args.enable_flashinfer_allreduce_fusion
+            or self.server_args.enable_trtllm_allreduce
+        ):
             return
 
         from sglang.srt.layers.communicator import FUSE_ALLREDUCE_MAX_BATCH_SIZE
-        from sglang.srt.layers.flashinfer_comm_fusion import (
-            pre_initialize_workspaces,
-        )
 
-        pre_initialize_workspaces(
-            max_token_num=FUSE_ALLREDUCE_MAX_BATCH_SIZE,
-            hidden_dim=self.model_config.hidden_size,
-            dtype=self.dtype,
-        )
+        if self.server_args.enable_flashinfer_allreduce_fusion:
+            from sglang.srt.layers.flashinfer_comm_fusion import (
+                pre_initialize_workspaces,
+            )
+
+            pre_initialize_workspaces(
+                max_token_num=FUSE_ALLREDUCE_MAX_BATCH_SIZE,
+                hidden_dim=self.model_config.hidden_size,
+                dtype=self.dtype,
+            )
+
+        if self.server_args.enable_trtllm_allreduce:
+            from sglang.srt.distributed import get_tp_group
+
+            tp_group = get_tp_group()
+            if tp_group.trtllm_comm is not None:
+                tp_group.trtllm_comm.initialize_workspace(
+                    max_token_num=FUSE_ALLREDUCE_MAX_BATCH_SIZE,
+                    hidden_dim=self.model_config.hidden_size,
+                    dtype=self.dtype,
+                )
 
     def _should_run_flashinfer_autotune(self) -> bool:
         """Check if flashinfer autotune should be run."""
