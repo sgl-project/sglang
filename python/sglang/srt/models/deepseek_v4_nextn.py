@@ -7,7 +7,6 @@ from torch import nn
 from transformers import PretrainedConfig
 
 from sglang.srt.distributed import get_pp_group, get_tensor_model_parallel_world_size
-from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import (
     _DpGatheredBufferWrapper,
     dp_gather_partial,
@@ -122,24 +121,16 @@ class DeepseekV4ModelNextN(nn.Module):
             hidden_states = input_embeds
 
         if hidden_states.shape[0] > 0:
-            if envs.SGLANG_FIX_MTP_HC_HIDDEN.get():
-                n_tokens = hidden_states.shape[0]
-                d = self.config.hidden_size
-                hc_flat = forward_batch.spec_info.hidden_states.view(
-                    n_tokens * self.hc_mult, d
-                )
-                h_proj_out, _ = self.h_proj(self.hnorm(hc_flat))
-                h_proj_hidden_states = h_proj_out.view(n_tokens, self.hc_mult, d)
+            n_tokens = hidden_states.shape[0]
+            d = self.config.hidden_size
+            hc_flat = forward_batch.spec_info.hidden_states.view(
+                n_tokens * self.hc_mult, d
+            )
+            h_proj_out, _ = self.h_proj(self.hnorm(hc_flat))
+            h_proj_hidden_states = h_proj_out.view(n_tokens, self.hc_mult, d)
 
-                e_proj_hidden_states, _ = self.e_proj(self.enorm(hidden_states))
-                hidden_states = e_proj_hidden_states[:, None, :] + h_proj_hidden_states
-            else:
-                e_proj_hidden_states, _ = self.e_proj(self.enorm(hidden_states))
-                h_proj_hidden_states, _ = self.h_proj(
-                    self.hnorm(forward_batch.spec_info.hidden_states)
-                )
-                hidden_states = e_proj_hidden_states + h_proj_hidden_states
-                hidden_states = hidden_states.unsqueeze(1).repeat(1, self.hc_mult, 1)
+            e_proj_hidden_states, _ = self.e_proj(self.enorm(hidden_states))
+            hidden_states = e_proj_hidden_states[:, None, :] + h_proj_hidden_states
         else:
             hidden_states = hidden_states.unsqueeze(1).repeat(1, self.hc_mult, 1)
 
@@ -162,18 +153,14 @@ class DeepseekV4ModelNextN(nn.Module):
             input_ids_global=input_ids_global,
         )
 
-        pre_hc_head = (
-            hidden_states.flatten(1) if envs.SGLANG_FIX_MTP_HC_HIDDEN.get() else None
-        )
+        pre_hc_head = hidden_states.flatten(1)
 
         hidden_states = self.hc_head(
             hidden_states, self.hc_head_fn, self.hc_head_scale, self.hc_head_base
         )
         hidden_states = self.shared_head.norm(hidden_states)
 
-        if pre_hc_head is not None:
-            return hidden_states, pre_hc_head
-        return hidden_states
+        return hidden_states, pre_hc_head
 
 
 class DeepseekV4ForCausalLMNextN(DeepseekV4ForCausalLM):
@@ -210,12 +197,7 @@ class DeepseekV4ForCausalLMNextN(DeepseekV4ForCausalLM):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
-        result = self.model(input_ids, positions, forward_batch)
-        pre_hc_head = None
-        if envs.SGLANG_FIX_MTP_HC_HIDDEN.get():
-            hidden_states, pre_hc_head = result
-        else:
-            hidden_states = result
+        hidden_states, pre_hc_head = self.model(input_ids, positions, forward_batch)
         return self.logits_processor(
             input_ids,
             hidden_states,

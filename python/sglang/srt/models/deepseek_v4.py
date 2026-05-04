@@ -1129,18 +1129,14 @@ class DeepseekV4Model(nn.Module):
                 torch.cuda.current_stream(),
             )
 
-        pre_hc_head = (
-            hidden_states.flatten(1) if envs.SGLANG_FIX_MTP_HC_HIDDEN.get() else None
-        )
+        pre_hc_head = hidden_states.flatten(1)
 
         hidden_states = self.hc_head(
             hidden_states, self.hc_head_fn, self.hc_head_scale, self.hc_head_base
         )
         hidden_states = self.norm(hidden_states)
 
-        if pre_hc_head is not None:
-            return hidden_states, pre_hc_head
-        return hidden_states
+        return hidden_states, pre_hc_head
 
 
 class DeepseekV4ForCausalLM(nn.Module):
@@ -1225,11 +1221,9 @@ class DeepseekV4ForCausalLM(nn.Module):
                 input_ids, positions, forward_batch, input_embeds
             )
         aux_hidden_states = None
-        pre_hc_head = None
         if self.capture_aux_hidden_states:
             hidden_states, aux_hidden_states = hidden_states
-        if envs.SGLANG_FIX_MTP_HC_HIDDEN.get():
-            hidden_states, pre_hc_head = hidden_states
+        hidden_states, pre_hc_head = hidden_states
         return self.logits_processor(
             input_ids,
             hidden_states,

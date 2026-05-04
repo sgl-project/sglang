@@ -733,9 +733,7 @@ class ModelConfig:
         self.hidden_size = self.hf_text_config.hidden_size
         hc_mult = getattr(self.hf_text_config, "hc_mult", 1)
         self.spec_hidden_size = (
-            self.hidden_size * hc_mult
-            if hc_mult > 1 and envs.SGLANG_FIX_MTP_HC_HIDDEN.get()
-            else self.hidden_size
+            self.hidden_size * hc_mult if hc_mult > 1 else self.hidden_size
         )
         self.num_hidden_layers = self.hf_text_config.num_hidden_layers
         self.num_attention_layers = self.num_hidden_layers
