@@ -133,6 +133,7 @@ class CompressorPrefillPlan(NamedTuple):
     compress_ratio: int
     plan_c: torch.Tensor  # [num_q_tokens, 16] uint8 --- CompressPlan
     plan_w: torch.Tensor  # [num_q_tokens,  8] uint8 --- WritePlan
+    pin_buffer: Optional[torch.Tensor] = None  # keep alive
 
     def copy_(self, other) -> None:
         assert isinstance(other, CompressorPrefillPlan)
@@ -177,6 +178,7 @@ class CompressorPrefillPlan(NamedTuple):
             compress_ratio,
             torch.from_dlpack(plan_c),
             torch.from_dlpack(plan_w),
+            pin_buffer,
         )
 
     @staticmethod
@@ -208,6 +210,7 @@ class CompressorPrefillPlan(NamedTuple):
             compress_ratio,
             torch.from_dlpack(plan_c),
             torch.from_dlpack(plan_w),
+            pin_buffer,
         )
 
     @property
@@ -234,7 +237,7 @@ def compress_forward(
         head_dim, kv_score_input.dtype, out.dtype, compress_ratio
     )
     fn = module.decode if plan.is_decode else module.prefill
-    fn(kv_score_buffer, kv_score_input, out, ape, *plan[1:])
+    fn(kv_score_buffer, kv_score_input, out, ape, *plan[1:3])
     return out
 
 

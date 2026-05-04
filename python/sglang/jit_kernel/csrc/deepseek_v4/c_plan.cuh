@@ -45,6 +45,7 @@ struct Prefill0Params {
   uint32_t num_q_tokens;
   int32_t compress_ratio;
   int32_t swa_page_size;
+  int32_t mtp_pad;
 };
 
 struct Prefill1Params {
@@ -98,8 +99,6 @@ struct DecodeParamsLegacy {
 };
 
 inline constexpr uint32_t kMaxPrefillBatchSize = 1024;
-
-inline constexpr int32_t kMaxMTPDraftTokens = 4;
 
 SGL_DEVICE uint32_t warp_inclusive_sum(uint32_t lane_id, uint32_t val) {
   static_assert(device::kWarpThreads == 32);
@@ -212,12 +211,8 @@ __global__ __launch_bounds__(1024, 1)  //
         };
       }
 
-      // w-event: A-region tail (position >= first_w_pos) plus, for c4, the swa_page
-      // boundary band so the overlap page is fully populated when prefix-matching
-      // resumes from a page edge. Pull `first_w_pos` back to also cover the trailing
-      // `kMaxMTPDraftTokens` positions so MTP rollback always has the draft tokens.
       const int32_t last_c_pos = (sl / cr) * cr;
-      const int32_t first_w_pos = min(last_c_pos - (is_overlap ? cr : 0), sl - kMaxMTPDraftTokens);
+      const int32_t first_w_pos = min(last_c_pos - (is_overlap ? cr : 0), sl - params.mtp_pad);
       bool do_write = position >= first_w_pos;
       if (!do_write && is_overlap) do_write = (position % sps) >= (sps - cr);
       if (do_write) {
@@ -234,10 +229,7 @@ __global__ __launch_bounds__(1024, 1)  //
       const int32_t sl = s_seq_len[batch_id];
       const int32_t el = sl - pl;
       const int32_t last_c_pos = (sl / cr) * cr;
-      // Include the trailing `kMaxMTPDraftTokens` positions in the always-write tail
-      // so MTP rollback can recover them; see kMaxMTPDraftTokens definition.
-      const int32_t first_w_pos = min(last_c_pos - (is_overlap ? cr : 0), sl - kMaxMTPDraftTokens);
-
+      const int32_t first_w_pos = min(last_c_pos - (is_overlap ? cr : 0), sl - params.mtp_pad);
       for (int32_t j = static_cast<int32_t>(tx); j < el; j += static_cast<int32_t>(block_size)) {
         const int32_t position = pl + j;
         const uint32_t ragged_id = base_e + static_cast<uint32_t>(j);
@@ -291,20 +283,22 @@ __global__ void plan_compress_prefill_kernel_1(const Prefill1Params params) {
   };
 
   if (!plan_c.is_invalid()) {  // 1. in bound. 2. not masked
-    const auto batch_id = plan_c.read_page_1;
-    const auto rid = params.rid_ptr[batch_id];
-    const auto mapping = params.r2t_ptr + rid * params.stride_r2t;
-    // `seq_len` should be ratio-aligned here
-    const auto position_1 = static_cast<int32_t>(plan_c.seq_len - 1);
-    // only used for c4, harmless for c128
-    const auto position_0 = max(position_1 - params.compress_ratio, 0);
-    const auto raw_loc_0 = mapping[position_0];
-    const auto raw_loc_1 = mapping[position_1];
-    const auto swa_loc_0 = params.f2s_ptr[raw_loc_0];
-    const auto swa_loc_1 = params.f2s_ptr[raw_loc_1];
-    plan_c.read_page_0 = compute_loc(swa_loc_0) / params.compress_ratio;
-    plan_c.read_page_1 = compute_loc(swa_loc_1) / params.compress_ratio;
-    params.plan_c[idx] = plan_c;
+    if (plan_c.buffer_len > 0) {
+      const auto batch_id = plan_c.read_page_1;
+      const auto rid = params.rid_ptr[batch_id];
+      const auto mapping = params.r2t_ptr + rid * params.stride_r2t;
+      // `seq_len` should be ratio-aligned here
+      const auto position_1 = static_cast<int32_t>(plan_c.seq_len - 1);
+      // only used for c4, harmless for c128
+      const auto position_0 = max(position_1 - params.compress_ratio, 0);
+      const auto raw_loc_0 = mapping[position_0];
+      const auto raw_loc_1 = mapping[position_1];
+      const auto swa_loc_0 = params.f2s_ptr[raw_loc_0];
+      const auto swa_loc_1 = params.f2s_ptr[raw_loc_1];
+      plan_c.read_page_0 = compute_loc(swa_loc_0) / params.compress_ratio;
+      plan_c.read_page_1 = compute_loc(swa_loc_1) / params.compress_ratio;
+      params.plan_c[idx] = plan_c;
+    }
   } else if (idx < params.num_c_padded) {
     params.plan_c[idx] = PlanC::invalid();
   }
@@ -501,6 +495,10 @@ inline PrefillPlan plan_compress_prefill(
 
   const auto device = device_.unwrap();
   const auto stream = LaunchKernel::resolve_device(device);
+
+  constexpr int32_t kMaxMTPDraftTokens = 4;
+  const auto mtp_pad = std::min(ring_size - compress_ratio, kMaxMTPDraftTokens);
+
   if (cpu_or_gpu.unwrap().device_type == kDLCUDA) {
     // GPU input path: kernel0 builds the (CPU-loop-equivalent) plan metadata directly
     // on device, padding to num_q_tokens with invalid; kernel_1 then finalizes the
@@ -518,6 +516,7 @@ inline PrefillPlan plan_compress_prefill(
         .num_q_tokens = num_q_tokens,
         .compress_ratio = compress_ratio,
         .swa_page_size = swa_page_size,
+        .mtp_pad = mtp_pad,
     };
     LaunchKernel(1, kMaxPrefillBatchSize, device)(plan_compress_prefill_kernel0, params0);
     // kernel_1 sees the already-padded buffers, so num_c == num_w == num_padded == num_q_tokens.
@@ -527,7 +526,7 @@ inline PrefillPlan plan_compress_prefill(
         .rid_ptr = rid_ptr,
         .r2t_ptr = r2t_ptr,
         .f2s_ptr = f2s_ptr,
-        .stride_r2t = req_to_token.size(1),
+        .stride_r2t = req_to_token.stride(0),
         .num_c = num_q_tokens,
         .num_w = num_q_tokens,
         .num_c_padded = num_q_tokens,
@@ -559,16 +558,10 @@ inline PrefillPlan plan_compress_prefill(
     const int32_t extend_len = ext_ptr[i];
     const int32_t prefix_len = seq_len - extend_len;
     const int32_t last_c_pos = seq_len / compress_ratio * compress_ratio;
-    // Pull `first_w_pos` back so the trailing `kMaxMTPDraftTokens` positions always
-    // fall into the always-write tail; without this, c128 with seq_len % 128 == 0
-    // (or c4 with a tiny extend) would drop the MTP draft tokens on rollback.
-    const int32_t first_w_pos = std::min(last_c_pos - (is_overlap ? compress_ratio : 0), seq_len - kMaxMTPDraftTokens);
+    const int32_t first_w_pos = last_c_pos - (is_overlap ? compress_ratio : 0);
     RuntimeCheck(0 < extend_len && extend_len <= seq_len);
     const auto should_write = [=](int32_t position) {
       if (position >= first_w_pos) return true;
-      // Write the last `compress_ratio` positions of every swa_page so the
-      // overlap page is fully populated when prefix-matching resumes from a
-      // swa_page boundary.
       return is_overlap && position % swa_page_size >= (swa_page_size - compress_ratio);
     };
     for (const auto j : irange(extend_len)) {

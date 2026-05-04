@@ -158,9 +158,6 @@ def create_paged_compressor_data(
     # NOTE: This is actually a proxy, which encounter some bug with tvm-ffi.
     # As a workaround, we use `.detach()` to get the real tensor.
     full_to_swa = token_to_kv_pool.full_to_swa_index_mapping.detach()
-
-    # The planner wants int64 across the board for the device tables (so they
-    # can be indexed by int64 multiplication inside the GPU finalize kernel).
     req_pool_indices_i64 = req_pool_indices.to(torch.int64)
 
     if is_prefill:
@@ -188,14 +185,12 @@ def create_paged_compressor_data(
             use_cuda_graph=use_prefill_cuda_graph,
         )
     else:
-        # Decode plan: seq_lens lives on the same device as the input tables
-        # (the c_plan.cuh decode kernel reads everything on GPU).
         return CompressorDecodePlan.generate(
             compress_ratio=compress_ratio,
             req_pool_indices=req_pool_indices_i64,
             req_to_token=req_to_token,
             full_to_swa=full_to_swa,
             seq_lens=seq_lens.to(torch.int64),
-            swa_page_size=int(swa_page_size),
-            ring_size=int(ring_size),
+            swa_page_size=swa_page_size,
+            ring_size=ring_size,
         )

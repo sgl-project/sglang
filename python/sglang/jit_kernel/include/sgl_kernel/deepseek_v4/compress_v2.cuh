@@ -26,14 +26,16 @@ struct alignas(16) CompressPlan {
   uint16_t ragged_id;
   uint16_t buffer_len;
   int32_t read_page_0;
+  /// \brief Stage 0 (CPU): batch_id (used to look up page table).
+  /// \brief Stage 1 (GPU): final state-pool write location.
   int32_t read_page_1;
 
   static SGL_DEVICE __host__ CompressPlan invalid() {
-    return CompressPlan{0, 0, 0, -1, -1};
+    return CompressPlan{-1u, 0, 0, -1, -1};
   }
 
   SGL_DEVICE __host__ bool is_invalid() const {
-    return seq_len == 0;
+    return seq_len == -1u;
   }
 };
 
@@ -47,11 +49,11 @@ struct alignas(8) WritePlan {
   int32_t write_loc;
 
   static SGL_DEVICE __host__ WritePlan invalid() {
-    return WritePlan{0, -1};
+    return WritePlan{-1u, -1};
   }
 
   SGL_DEVICE __host__ bool is_invalid() const {
-    return write_loc < 0;
+    return ragged_id == -1u;
   }
 };
 
