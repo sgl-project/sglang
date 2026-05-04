@@ -5,10 +5,10 @@ use rand::{distr::Alphanumeric, Rng};
 use smg::{
     auth::{ApiKeyEntry, ControlPlaneAuthConfig, JwtConfig, Role},
     config::{
-        CircuitBreakerConfig, ConfigError, ConfigResult, DiscoveryConfig, HealthCheckConfig,
-        HistoryBackend, ManualAssignmentMode, MetricsConfig, OracleConfig, PolicyConfig,
-        PostgresConfig, RedisConfig, RetryConfig, RouterConfig, RoutingMode, TokenizerCacheConfig,
-        TraceConfig,
+        CircuitBreakerConfig, ConfigError, ConfigResult, DiscoveryConfig,
+        DEFAULT_POOL_IDLE_TIMEOUT_SECS, HealthCheckConfig, HistoryBackend, ManualAssignmentMode,
+        MetricsConfig, OracleConfig, PolicyConfig, PostgresConfig, RedisConfig, RetryConfig,
+        RouterConfig, RoutingMode, TokenizerCacheConfig, TraceConfig,
     },
     core::ConnectionMode,
     observability::{
@@ -297,6 +297,16 @@ struct CliArgs {
     /// CORS allowed origins
     #[arg(long, num_args = 0.., help_heading = "Request Handling")]
     cors_allowed_origins: Vec<String>,
+
+    // ==================== HTTP Client Pool ====================
+    /// Idle timeout in seconds for pooled upstream HTTP connections
+    #[arg(
+        long,
+        env = "SMG_POOL_IDLE_TIMEOUT_SECS",
+        default_value_t = DEFAULT_POOL_IDLE_TIMEOUT_SECS,
+        help_heading = "HTTP Client Pool"
+    )]
+    pool_idle_timeout_secs: u64,
 
     // ==================== Rate Limiting ====================
     /// Maximum concurrent requests (-1 to disable)
@@ -972,6 +982,7 @@ impl CliArgs {
             .request_timeout_secs(self.request_timeout_secs)
             .worker_startup_timeout_secs(self.worker_startup_timeout_secs)
             .worker_startup_check_interval_secs(self.worker_startup_check_interval)
+            .pool_idle_timeout_secs(self.pool_idle_timeout_secs)
             .max_concurrent_requests(self.max_concurrent_requests)
             .queue_size(self.queue_size)
             .queue_timeout_secs(self.queue_timeout_secs)
