@@ -1164,6 +1164,29 @@ class CudaGraphRunner:
             self.model_runner.tp_group.barrier()
             run_once()
 
+        if bs in [4, 16, 32]:
+            self.device_module.synchronize()
+            self.model_runner.tp_group.barrier()
+            with profile(
+                activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+                record_shapes=True,
+                with_stack=True,
+            ) as prof:
+                run_once()
+            self.device_module.synchronize()
+
+            rank = (
+                torch.distributed.get_rank()
+                if torch.distributed.is_initialized()
+                else 0
+            )
+            if rank == 0:
+                profile_dir = os.getenv("SGLANG_TORCH_PROFILER_DIR", ".")
+                os.makedirs(profile_dir, exist_ok=True)
+                prof.export_chrome_trace(
+                    os.path.join(profile_dir, f"cuda_graph_warmup_bs{bs}.json")
+                )
+
         if hasattr(attn_backend, "on_after_cuda_graph_warmup_pass"):
             attn_backend.on_after_cuda_graph_warmup_pass()
 

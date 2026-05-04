@@ -590,6 +590,7 @@ class Envs:
     SGLANG_FP8_PAGED_MQA_LOGITS_TORCH = EnvBool(False)
     SGLANG_TOPK_TRANSFORM_512_TORCH = EnvBool(False)
     SGLANG_OPT_BF16_FP32_GEMM_ALGO = EnvBool(False)
+    SGLANG_OPT_USE_HIPBLAS_BF16_FP32_GEMM = EnvBool(False)
     SGLANG_FORCE_TRITON_MOE_FP8 = EnvBool(False)
     # fmt: on
 
