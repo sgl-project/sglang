@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
@@ -165,20 +166,24 @@ def resolve_component_path(
 
 
 def extract_component_path_overrides(extra_args: List[str]) -> Dict[str, str]:
+    normalized_args = []
+    for arg in extra_args:
+        normalized_args.extend(shlex.split(arg))
+
     component_paths: Dict[str, str] = {}
     index = 0
-    while index < len(extra_args):
-        arg = extra_args[index]
+    while index < len(normalized_args):
+        arg = normalized_args[index]
         key_part = arg.split("=", 1)[0] if "=" in arg else arg
         if key_part.startswith("--") and key_part.endswith("-path"):
             component = key_part[2:-5].replace("-", "_")
             if "=" in arg:
                 component_paths[component] = arg.split("=", 1)[1]
-            elif index + 1 < len(extra_args) and not extra_args[index + 1].startswith(
-                "-"
-            ):
+            elif index + 1 < len(normalized_args) and not normalized_args[
+                index + 1
+            ].startswith("-"):
                 index += 1
-                component_paths[component] = extra_args[index]
+                component_paths[component] = normalized_args[index]
         index += 1
 
     for component, path in component_paths.items():
@@ -228,12 +233,14 @@ def select_component_source(
         override_path = component_paths.get(key)
         if override_path is None:
             continue
-        assert has_component_files(override_path), (
+        resolved_override_path = maybe_download_model(override_path)
+        component_paths[key] = resolved_override_path
+        assert has_component_files(resolved_override_path), (
             f"Component override for {component.value} must point directly to a "
             f"component directory: {override_path}"
         )
         if component == ComponentType.TEXT_ENCODER:
-            assert is_text_encoder_config(override_path), (
+            assert is_text_encoder_config(resolved_override_path), (
                 f"Text encoder override must point to a text encoder directory: "
                 f"{override_path}"
             )
@@ -241,7 +248,7 @@ def select_component_source(
             base_model_id=model_id,
             base_model_root=base_model_root,
             component_paths=component_paths,
-            source_path=override_path,
+            source_path=resolved_override_path,
         )
 
     source_path = resolve_component_path(

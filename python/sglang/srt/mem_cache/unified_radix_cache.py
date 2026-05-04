@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import threading
 import time
 from collections import defaultdict
 from functools import partial
@@ -15,17 +16,21 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     EvictParams,
     EvictResult,
     IncLockRefResult,
+    InitLoadBackParams,
     InsertParams,
     InsertResult,
     MatchPrefixParams,
     MatchResult,
 )
+from sglang.srt.mem_cache.hicache_storage import PoolHitPolicy, PoolName, PoolTransfer
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache_components import (
     _NUM_COMPONENT_TYPES,
     BASE_COMPONENT_TYPE,
+    CacheTransferPhase,
     ComponentData,
     ComponentType,
+    EvictLayer,
     FullComponent,
     MambaComponent,
     SWAComponent,
@@ -38,6 +43,7 @@ from sglang.srt.session.streaming_session import StreamingSession
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+    from sglang.srt.server_args import ServerArgs
 
 
 class UnifiedTreeNode:
@@ -53,15 +59,32 @@ class UnifiedTreeNode:
             ComponentData() for _ in range(_NUM_COMPONENT_TYPES)
         ]
         self.last_access_time = get_and_increase_time_counter()
-        self.host_value = None
+        self.hash_value = None
         self.hit_count = 0
-        self.lru_prev: list[UnifiedTreeNode | None] = [None] * _NUM_COMPONENT_TYPES
-        self.lru_next: list[UnifiedTreeNode | None] = [None] * _NUM_COMPONENT_TYPES
+        self.lru_prev: list[UnifiedTreeNode | None] = [None] * (
+            _NUM_COMPONENT_TYPES * 2
+        )
+        self.lru_next: list[UnifiedTreeNode | None] = [None] * (
+            _NUM_COMPONENT_TYPES * 2
+        )
         self.id = UnifiedTreeNode.counter
         UnifiedTreeNode.counter += 1
 
     def component(self, component_type: ComponentType) -> ComponentData:
         return self.component_data[component_type]
+
+    @property
+    def backuped(self) -> bool:
+        """Tree-level: Full KV present on host."""
+        return self.component_data[ComponentType.FULL].host_value is not None
+
+    @property
+    def evicted(self) -> bool:
+        """Tree-level: Full KV not on device (non-root with value=None)."""
+        return (
+            self.parent is not None
+            and self.component_data[ComponentType.FULL].value is None
+        )
 
     def __lt__(self, other: UnifiedTreeNode):
         return self.last_access_time < other.last_access_time
@@ -69,29 +92,35 @@ class UnifiedTreeNode:
 
 class UnifiedLRUList:
     def __init__(
-        self, component_type: ComponentType, tree_components: tuple[ComponentType, ...]
+        self,
+        component_type: ComponentType,
+        tree_components: tuple[ComponentType, ...],
+        use_host_ptr: bool = False,
     ):
         self.component_type = component_type
+        # Pointer slot: host LRU uses offset slots so device/host pointers
+        # never collide on the same node.
+        self._pt: int = component_type + (_NUM_COMPONENT_TYPES if use_host_ptr else 0)
         self.head = UnifiedTreeNode(tree_components)
         self.tail = UnifiedTreeNode(tree_components)
-        self.head.lru_next[component_type] = self.tail
-        self.tail.lru_prev[component_type] = self.head
+        self.head.lru_next[self._pt] = self.tail
+        self.tail.lru_prev[self._pt] = self.head
         self.cache: dict[int, UnifiedTreeNode] = {}
 
     def _add_node_after(self, prev_node: UnifiedTreeNode, new_node: UnifiedTreeNode):
-        ct = self.component_type
-        new_node.lru_prev[ct] = prev_node
-        new_node.lru_next[ct] = prev_node.lru_next[ct]
-        prev_node.lru_next[ct].lru_prev[ct] = new_node
-        prev_node.lru_next[ct] = new_node
+        pt = self._pt
+        new_node.lru_prev[pt] = prev_node
+        new_node.lru_next[pt] = prev_node.lru_next[pt]
+        prev_node.lru_next[pt].lru_prev[pt] = new_node
+        prev_node.lru_next[pt] = new_node
 
     def _add_node(self, node: UnifiedTreeNode):
         self._add_node_after(self.head, node)
 
     def _remove_node(self, node: UnifiedTreeNode):
-        ct = self.component_type
-        node.lru_prev[ct].lru_next[ct] = node.lru_next[ct]
-        node.lru_next[ct].lru_prev[ct] = node.lru_prev[ct]
+        pt = self._pt
+        node.lru_prev[pt].lru_next[pt] = node.lru_next[pt]
+        node.lru_next[pt].lru_prev[pt] = node.lru_prev[pt]
 
     def insert_mru(self, node: UnifiedTreeNode):
         assert node.id not in self.cache
@@ -129,10 +158,11 @@ class UnifiedLRUList:
     def get_prev_no_lock(self, node: UnifiedTreeNode, check_id: bool = True):
         if check_id:
             assert node.id in self.cache
+        pt = self._pt
         ct = self.component_type
-        x = node.lru_prev[ct]
+        x = node.lru_prev[pt]
         while x.component_data[ct].lock_ref > 0:
-            x = x.lru_prev[ct]
+            x = x.lru_prev[pt]
         if x == self.head:
             return None
         return x
@@ -140,10 +170,11 @@ class UnifiedLRUList:
     def get_prev_leaf_no_lock(self, node: UnifiedTreeNode, check_id: bool = True):
         if check_id:
             assert node.id in self.cache
+        pt = self._pt
         ct = self.component_type
-        x = node.lru_prev[ct]
+        x = node.lru_prev[pt]
         while x.component_data[ct].lock_ref > 0 or len(x.children) > 0:
-            x = x.lru_prev[ct]
+            x = x.lru_prev[pt]
         if x == self.head:
             return None
         return x
@@ -191,6 +222,9 @@ class UnifiedRadixCache(BasePrefixCache):
         self._components_tuple: tuple[TreeComponent, ...] = tuple(
             self.components.values()
         )
+        self.hicache_anchor_kv_shared_indices_pools: list[
+            tuple[PoolName, PoolHitPolicy]
+        ] = []
         if self.is_eagle:
             self.key_convert_fn = convert_to_bigram_key
         else:
@@ -203,10 +237,25 @@ class UnifiedRadixCache(BasePrefixCache):
         # internal fall-through to self.inner.xxx never fires -- no recursion.
         self.session = StreamingSession(inner=self)
 
+        self.tp_group = params.tp_cache_group
+        self.tp_world_size = (
+            1
+            if self.tp_group is None
+            else torch.distributed.get_world_size(group=self.tp_group)
+        )
+
+        # HiCache D↔H defaults (overridden by init_hicache)
+        self.cache_controller = None
+        self.write_through_threshold = 256
+
         self.reset()
         logger.info(f"Init Unified RadixTree with components {self.tree_components}")
 
     def reset(self) -> None:
+        self._reset_full()
+
+    def _reset_full(self) -> None:
+        """Full reset: destroy entire tree and all state."""
         self.root_node = UnifiedTreeNode(self.tree_components)
         self.root_node.key = RadixKey([], None)
         self.root_node.component_data[BASE_COMPONENT_TYPE].value = []
@@ -214,10 +263,72 @@ class UnifiedRadixCache(BasePrefixCache):
             self.root_node.component_data[ct].lock_ref = 1
         self.component_evictable_size_ = {ct: 0 for ct in self.tree_components}
         self.component_protected_size_ = {ct: 0 for ct in self.tree_components}
+
         self.lru_lists = {
             ct: UnifiedLRUList(ct, self.tree_components) for ct in self.tree_components
         }
         self.session.slots.clear()
+
+        self.evictable_device_leaves: set[UnifiedTreeNode] = set()
+        self.evictable_host_leaves: set[UnifiedTreeNode] = set()
+        self.host_lru_lists = {
+            ct: UnifiedLRUList(ct, self.tree_components, use_host_ptr=True)
+            for ct in self.tree_components
+        }
+        self.ongoing_write_through: dict[int, UnifiedTreeNode] = {}
+        self.ongoing_load_back: dict[int, UnifiedTreeNode] = {}
+        self.enable_storage = False
+        self.ongoing_prefetch: dict = {}
+        self.ongoing_backup: dict = {}
+
+        if self.cache_controller is not None:
+            self.cache_controller.reset()
+            self.cache_controller.mem_pool_host.clear()
+
+    def init_hicache(self, server_args: ServerArgs, params: CacheInitParams) -> None:
+        """Initialize HiCache infrastructure."""
+        from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
+            attach_hybrid_pool_to_unified_cache,
+        )
+
+        # Direct IO layout fixup (must happen before pool creation)
+        if server_args.hicache_io_backend == "direct":
+            if server_args.hicache_mem_layout == "page_first":
+                server_args.hicache_mem_layout = "page_first_direct"
+                logger.warning(
+                    "Page first layout is not supported with direct IO backend, "
+                    "switching to page first direct layout"
+                )
+
+        self.load_cache_event = threading.Event()
+        self.hicache_anchor_kv_shared_indices_pools.clear()
+        attach_hybrid_pool_to_unified_cache(
+            self,
+            params,
+            server_args,
+            load_cache_event=self.load_cache_event,
+        )
+
+        # State initialization
+        self.write_through_threshold = (
+            1 if server_args.hicache_write_policy == "write_through" else 2
+        )
+        self.load_back_threshold = 256
+
+        logger.info(
+            f"HiCache D\u2194H initialized: "
+            f"host_pool_size={self.host_pool_group.size}, "
+            f"write_policy={server_args.hicache_write_policy}, "
+            f"tp_world_size={self.tp_world_size}, "
+            f"transfer_layer_num={self.cache_controller.layer_num}"
+        )
+
+    def register_hicache_anchor_kv_shared_indices_pool(
+        self,
+        pool_name: PoolName,
+        hit_policy: PoolHitPolicy = PoolHitPolicy.ALL_PAGES,
+    ) -> None:
+        self.hicache_anchor_kv_shared_indices_pools.append((pool_name, hit_policy))
 
     def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
         result = self.session.try_match_prefix(params)
@@ -282,6 +393,8 @@ class UnifiedRadixCache(BasePrefixCache):
         result = IncLockRefResult()
         for component in self._components_tuple:
             result = component.acquire_component_lock(node=node, result=result)
+
+        self._update_evictable_leaf_sets(node)
         return result
 
     def dec_lock_ref(
@@ -294,6 +407,8 @@ class UnifiedRadixCache(BasePrefixCache):
             return DecLockRefResult()
         for component in self._components_tuple:
             component.release_component_lock(node=node, params=params)
+
+        self._update_evictable_leaf_sets(node)
         # TODO: delta is not aggregated from components; no caller uses it yet.
         return DecLockRefResult()
 
@@ -386,7 +501,9 @@ class UnifiedRadixCache(BasePrefixCache):
         ]
 
         # components prepare insert data + return effective cache_len
-        insert_params = InsertParams(prev_prefix_len=req.cache_protected_len)
+        insert_params = InsertParams(
+            prev_prefix_len=req.cache_protected_len, chunked=chunked
+        )
         effective_cache_len = len(token_ids)
         for comp in self._components_tuple:
             cl = comp.prepare_for_caching_req(
@@ -488,11 +605,18 @@ class UnifiedRadixCache(BasePrefixCache):
 
         while len(key) > 0 and child_key in node.children:
             child = node.children[child_key]
+
+            # HiCache: dead node (evicted + not backuped) — stop traversal
+            if child.evicted and not child.backuped:
+                break
+
             prefix_len = child.key.match(key, page_size=self.page_size)
             if prefix_len < len(child.key):
                 # Read-only: do not split, ignore partial match and stop
                 break
-            value.append(child.component_data[BASE_COMPONENT_TYPE].value)
+
+            if not child.evicted:
+                value.append(child.component_data[BASE_COMPONENT_TYPE].value)
             node = child
             _update_best_if_valid(node)
             key = key[prefix_len:]
@@ -520,13 +644,22 @@ class UnifiedRadixCache(BasePrefixCache):
 
         while len(key) > 0 and child_key in node.children:
             child = node.children[child_key]
+
+            # HiCache: dead node (evicted + not backuped) — stop traversal
+            if child.evicted and not child.backuped:
+                break
+
             prefix_len = child.key.match(key, page_size=self.page_size)
             if prefix_len < len(child.key):
+                if child.evicted:
+                    break
                 node = self._split_node(child.key, child, prefix_len)
                 value.append(node.component_data[BASE_COMPONENT_TYPE].value)
                 _update_best_if_valid(node)
                 break
-            value.append(child.component_data[BASE_COMPONENT_TYPE].value)
+
+            if not child.evicted:
+                value.append(child.component_data[BASE_COMPONENT_TYPE].value)
             node = child
             _update_best_if_valid(node)
             key = key[prefix_len:]
@@ -543,14 +676,27 @@ class UnifiedRadixCache(BasePrefixCache):
     ) -> MatchResult:
         node_update = last_node
         for comp in self._components_tuple:
+            if comp.component_type == BASE_COMPONENT_TYPE:
+                continue  # Full uses last_access_time, not LRU
             self.lru_lists[comp.component_type].reset_node_and_parents_mru(
                 node_update, self.root_node, comp.node_has_component_data
             )
+
         cur_time = get_and_increase_time_counter()
         while node_update:
             node_update.last_access_time = cur_time
             cur_time -= 0.00001
             node_update = node_update.parent
+
+        # Walk up to find last_device_node
+        last_device_node = last_node
+        while last_device_node is not self.root_node and last_device_node.evicted:
+            last_device_node = last_device_node.parent
+
+        # Walk up to find last_host_node
+        last_host_node = last_node
+        while last_host_node is not self.root_node and not last_host_node.backuped:
+            last_host_node = last_host_node.parent
 
         if best_value_len > 0:
             device_indices = torch.cat(value[:best_value_len])
@@ -558,8 +704,9 @@ class UnifiedRadixCache(BasePrefixCache):
             device_indices = torch.empty((0,), dtype=torch.int64, device=self.device)
         result = MatchResult(
             device_indices=device_indices,
-            last_device_node=last_node,
-            last_host_node=last_node,
+            last_device_node=last_device_node,
+            last_host_node=last_host_node,
+            host_hit_length=0,
         )
 
         for component in self._components_tuple:
@@ -578,25 +725,26 @@ class UnifiedRadixCache(BasePrefixCache):
         new_node.children = {key[split_len:].child_key(self.page_size): child}
         new_node.parent = child.parent
         new_node.key = child.key[:split_len]
-        new_node.component_data[BASE_COMPONENT_TYPE].value = (
-            child.component_data[BASE_COMPONENT_TYPE].value[:split_len].clone()
-        )
 
         self._for_each_component_lru(child, UnifiedLRUList.remove_node)
 
         child.parent = new_node
         child.key = child.key[split_len:]
-        child.component_data[BASE_COMPONENT_TYPE].value = (
-            child.component_data[BASE_COMPONENT_TYPE].value[split_len:].clone()
-        )
 
         for component in self._components_tuple:
             component.redistribute_on_node_split(new_parent=new_node, child=child)
         new_node.parent.children[key.child_key(self.page_size)] = new_node
 
-        self._for_each_component_lru(new_node, UnifiedLRUList.insert_mru)
-        self._for_each_component_lru(child, UnifiedLRUList.insert_mru)
+        self._for_each_component_lru(
+            new_node, UnifiedLRUList.insert_mru, skip_existing=True
+        )
+        self._for_each_component_lru(
+            child, UnifiedLRUList.insert_mru, skip_existing=True
+        )
         child.last_access_time = get_and_increase_time_counter()
+
+        self._update_evictable_leaf_sets(new_node)
+        self._update_evictable_leaf_sets(child)
         return new_node
 
     def _touch_node(self, node: UnifiedTreeNode):
@@ -615,9 +763,26 @@ class UnifiedRadixCache(BasePrefixCache):
         new_node.key = key
         new_node.component_data[BASE_COMPONENT_TYPE].value = value.clone()
         parent.children[key.child_key(self.page_size)] = new_node
-        self.lru_lists[BASE_COMPONENT_TYPE].insert_mru(new_node)
         self.component_evictable_size_[BASE_COMPONENT_TYPE] += len(value)
+
+        self._update_evictable_leaf_sets(new_node)
+        self._update_evictable_leaf_sets(parent)
         return new_node
+
+    def _unevict_node_on_insert(
+        self, node: UnifiedTreeNode, fresh_value: torch.Tensor
+    ) -> None:
+        """Restore an evicted node's Full device value from fresh KV indices
+        during insert."""
+        ct = BASE_COMPONENT_TYPE
+        cd = node.component_data[ct]
+        assert cd.value is None
+        n = len(fresh_value)
+        cd.value = fresh_value.clone()
+        self.component_evictable_size_[ct] += n
+        self._update_evictable_leaf_sets(node)
+        if node.parent is not None:
+            self._update_evictable_leaf_sets(node.parent)
 
     def _insert_helper(
         self,
@@ -639,25 +804,29 @@ class UnifiedRadixCache(BasePrefixCache):
             if prefix_len < len(node.key):
                 node = self._split_node(node.key, node, prefix_len)
 
-            value_slice = value[:prefix_len]
-            consumed_from = prefix_len
-            # Let each component claim ownership of overlapping KV slots
-            for component in self._components_tuple:
-                comp_consumed_from = component.update_component_on_insert_overlap(
-                    node=node,
-                    prefix_len=prefix_len,
-                    total_prefix_len=total_prefix_length,
-                    value_slice=value_slice,
-                    params=params,
-                )
-                consumed_from = min(consumed_from, comp_consumed_from)
+            if node.evicted:
+                self._unevict_node_on_insert(node, value[:prefix_len])
+            else:
+                value_slice = value[:prefix_len]
+                consumed_from = prefix_len
+                # Let each component claim ownership of overlapping KV slots
+                for component in self._components_tuple:
+                    comp_consumed_from = component.update_component_on_insert_overlap(
+                        node=node,
+                        prefix_len=prefix_len,
+                        total_prefix_len=total_prefix_length,
+                        value_slice=value_slice,
+                        params=params,
+                    )
+                    consumed_from = min(consumed_from, comp_consumed_from)
 
-            dup_start = max(0, params.prev_prefix_len - total_prefix_length)
-            if dup_start < consumed_from:
-                self.token_to_kv_pool_allocator.free(
-                    value_slice[dup_start:consumed_from]
-                )
+                dup_start = max(0, params.prev_prefix_len - total_prefix_length)
+                if dup_start < consumed_from:
+                    self.token_to_kv_pool_allocator.free(
+                        value_slice[dup_start:consumed_from]
+                    )
 
+            self._inc_hit_count(node, params.chunked)
             total_prefix_length += prefix_len
             key = key[prefix_len:]
             value = value[prefix_len:]
@@ -695,34 +864,45 @@ class UnifiedRadixCache(BasePrefixCache):
                 params=params,
                 result=result,
             )
+        if is_new_leaf:
+            self._inc_hit_count(target_node, params.chunked)
         return result
+
+    # ---- Evict Helpers ----
 
     def _cascade_evict(
         self,
         node: UnifiedTreeNode,
         trigger: TreeComponent,
         tracker: dict[ComponentType, int],
+        target: EvictLayer = EvictLayer.DEVICE,
     ):
-        """Cascade eviction from trigger to lower-or-equal priority components.
-
-        When a component evicts a node, all other components with equal or
-        lower eviction_priority on the same node are also evicted.
-        If the node is a leaf, it is removed from the tree and any
-        resulting tombstone ancestors are cleaned up recursively."""
+        """Cascade eviction from trigger to lower-or-equal priority components."""
         is_leaf = len(node.children) == 0
         trigger_priority = trigger.eviction_priority(is_leaf)
 
         for comp in self._components_tuple:
             if comp.eviction_priority(is_leaf) <= trigger_priority:
-                if comp is not trigger and comp.node_has_component_data(node):
-                    assert node.component_data[comp.component_type].lock_ref == 0
+                if comp is not trigger and comp.node_has_component_data(node, target):
+                    cd = node.component_data[comp.component_type]
+                    if EvictLayer.DEVICE in target:
+                        assert cd.lock_ref == 0
+                    if EvictLayer.HOST in target:
+                        assert cd.host_lock_ref == 0
                     self._evict_component_and_detach_lru(
-                        node, comp, is_leaf=is_leaf, tracker=tracker
+                        node, comp, target=target, tracker=tracker
                     )
 
-        if is_leaf:
-            self._remove_leaf_from_parent(node)
-            self._iteratively_delete_tombstone_leaf(node, tracker)
+        # Now that all components (including SWA which depends on Full.value)
+        # have been freed, we can safely tombstone Full.value.
+        # This is deferred from evict_component because free_swa needs it.
+        if (
+            target is EvictLayer.DEVICE
+            and trigger.component_type == BASE_COMPONENT_TYPE
+        ):
+            node.component_data[trigger.component_type].value = None
+
+        self._update_evictable_leaf_sets(node)
 
     def _remove_leaf_from_parent(self, node: UnifiedTreeNode):
         key = node.key.child_key(self.page_size)
@@ -733,49 +913,497 @@ class UnifiedRadixCache(BasePrefixCache):
         self,
         node: UnifiedTreeNode,
         comp: TreeComponent,
-        is_leaf: bool,
-        tracker: dict[ComponentType, int],
-    ) -> int:
-        freed = comp.evict_component(node, is_leaf=is_leaf)
-        tracker[comp.component_type] += freed
-        lru = self.lru_lists[comp.component_type]
-        if lru.in_list(node):
-            lru.remove_node(node)
-        return freed
+        target: EvictLayer = EvictLayer.DEVICE,
+        tracker: dict[ComponentType, int] = None,
+    ) -> tuple[int, int]:
+        device_freed, host_freed = comp.evict_component(node, target=target)
+        if tracker is not None:
+            if EvictLayer.DEVICE in target:
+                tracker[comp.component_type] += device_freed
+            elif EvictLayer.HOST in target:
+                tracker[comp.component_type] += host_freed
+
+        # Detach from the appropriate LRU list(s)
+        ct = comp.component_type
+        for layer, lru_lists in (
+            (EvictLayer.DEVICE, self.lru_lists),
+            (EvictLayer.HOST, self.host_lru_lists),
+        ):
+            if layer in target:
+                lru = lru_lists[ct]
+                if lru.in_list(node):
+                    lru.remove_node(node)
+        return device_freed, host_freed
 
     def _iteratively_delete_tombstone_leaf(
         self, deleted_node: UnifiedTreeNode, tracker: dict[ComponentType, int]
     ):
-        """After a leaf is removed, walk up the parent chain and delete
-        any ancestor that is leaf node and has lost any component data (tombstoned)."""
+        """Walk up from *deleted_node* and cascade-delete childless ancestors.
+
+        Only the Full (base) component decides whether a node survives:
+          - Full device present  → keep as D-leaf
+          - Full host present    → keep as H-leaf
+          - neither              → evict all remaining data, delete, continue up
+        """
+        ct = BASE_COMPONENT_TYPE
         cur = deleted_node.parent
         while cur != self.root_node and len(cur.children) == 0:
-            has_tombstone = any(
-                not comp.node_has_component_data(cur)
-                for comp in self.components.values()
-            )
-            if not has_tombstone:
-                break
-
             if any(
-                cur.component_data[comp.component_type].lock_ref > 0
-                for comp in self.components.values()
-                if comp.node_has_component_data(cur)
+                cd.lock_ref > 0 or cd.host_lock_ref > 0 for cd in cur.component_data
             ):
                 break
 
+            has_device = cur.component_data[ct].value is not None
+            has_host = cur.component_data[ct].host_value is not None
+
+            if has_device:
+                self._update_evictable_leaf_sets(cur)
+                break
+
+            # Full device absent — clean up orphaned aux device data.
             for comp in self.components.values():
                 if comp.node_has_component_data(cur):
                     self._evict_component_and_detach_lru(
-                        cur, comp, is_leaf=True, tracker=tracker
+                        cur, comp, target=EvictLayer.DEVICE, tracker=tracker
                     )
-            self._remove_leaf_from_parent(cur)
-            cur = cur.parent
 
-    def _for_each_component_lru(self, node: UnifiedTreeNode, lru_op):
+            if has_host:
+                self._update_evictable_leaf_sets(cur)
+                break
+
+            # Full absent on both layers — evict remaining host data, delete.
+            for comp in self.components.values():
+                if comp.node_has_component_data(cur, target=EvictLayer.HOST):
+                    self._evict_component_and_detach_lru(
+                        cur, comp, target=EvictLayer.HOST, tracker=tracker
+                    )
+
+            self.evictable_host_leaves.discard(cur)
+            self._remove_leaf_from_parent(cur)
+            parent = cur.parent
+            self._update_evictable_leaf_sets(parent)
+            cur = parent
+
+    def _for_each_component_lru(
+        self,
+        node: UnifiedTreeNode,
+        lru_op,
+        target: EvictLayer = EvictLayer.DEVICE,
+        skip_existing: bool = False,
+    ):
+        """Apply lru_op to each aux component's LRU that has data on this node.
+        If skip_existing=True, skip components already in the target LRU list."""
+        lru_dict = self.host_lru_lists if target is EvictLayer.HOST else self.lru_lists
         for ct in self.tree_components:
-            if node.component_data[ct].value is not None:
-                lru_op(self.lru_lists[ct], node)
+            if ct == BASE_COMPONENT_TYPE:
+                continue  # Full uses leaf sets, not LRU
+            cd = node.component_data[ct]
+            if (cd.host_value if target is EvictLayer.HOST else cd.value) is not None:
+                lru = lru_dict[ct]
+                if skip_existing and lru.in_list(node):
+                    continue
+                lru_op(lru, node)
+
+    def evict_host(
+        self, num_tokens: int, component_type: ComponentType = BASE_COMPONENT_TYPE
+    ) -> int:
+        """Evict host resources for a specific component to free host pool space."""
+        tracker: dict[ComponentType, int] = {ct: 0 for ct in self.tree_components}
+        comp = self.components.get(component_type)
+        if comp is not None:
+            comp.drive_host_eviction(num_tokens, tracker)
+        return tracker[component_type]
+
+    def _is_device_leaf(self, node: UnifiedTreeNode) -> bool:
+        """D-leaf: Full device value present, no child with Full KV on device,
+        unlocked, not root.
+
+        Only the Full (base) component is required; auxiliary components
+        (Mamba, SWA) are not mandatory for D-leaf membership."""
+        ct = BASE_COMPONENT_TYPE
+        if node is self.root_node or node.evicted:
+            return False
+        if any(cd.lock_ref > 0 for cd in node.component_data):
+            return False
+        if any(
+            child.component_data[ct].value is not None
+            for child in node.children.values()
+        ):
+            return False
+        return True
+
+    def _is_host_leaf(self, node: UnifiedTreeNode) -> bool:
+        """H-leaf: evicted, Full host value present, no children, unlocked, not root.
+
+        Only the Full (base) component host_value is required; auxiliary
+        components are not mandatory for H-leaf membership."""
+        if node is self.root_node or not node.evicted:
+            return False
+        if not node.backuped:
+            return False
+        if any(cd.host_lock_ref > 0 for cd in node.component_data):
+            return False
+        if len(node.children) > 0:
+            return False
+        return True
+
+    def _update_evictable_leaf_sets(self, node: UnifiedTreeNode) -> None:
+        """Update both device and host leaf sets for a node."""
+        if self._is_device_leaf(node):
+            self.evictable_device_leaves.add(node)
+        else:
+            self.evictable_device_leaves.discard(node)
+
+        if self._is_host_leaf(node):
+            self.evictable_host_leaves.add(node)
+        else:
+            self.evictable_host_leaves.discard(node)
+
+    def _evict_to_host(
+        self, node: UnifiedTreeNode, tracker: dict[ComponentType, int] = None
+    ) -> None:
+        """GPU→CPU demotion: release all device resources, node stays in tree."""
+        assert not node.evicted and node.backuped
+        trigger = self.components[BASE_COMPONENT_TYPE]
+        self._evict_component_and_detach_lru(
+            node, trigger, target=EvictLayer.DEVICE, tracker=tracker
+        )
+        self._cascade_evict(node, trigger, tracker)
+
+        # after device eviction, insert aux components into host LRU.
+        self._for_each_component_lru(
+            node, UnifiedLRUList.insert_mru, target=EvictLayer.HOST, skip_existing=True
+        )
+        self._update_evictable_leaf_sets(node.parent)
+
+    def _evict_device_leaf(
+        self, node: UnifiedTreeNode, tracker: dict[ComponentType, int]
+    ) -> None:
+        """Evict a device leaf node, choosing the right strategy:
+
+        - backuped: demote to host via _evict_to_host (node stays in tree)
+        - not backuped + write_back: write_backup first, then demote
+        - not backuped + write_through: Cascade evict all components
+
+        All freed device tokens are accumulated into *tracker*.
+        """
+        assert self._is_device_leaf(node), f"node {node.id} is not a D-leaf"
+        if not node.backuped:
+            if (
+                self.cache_controller is not None
+                and self.cache_controller.write_policy == "write_back"
+            ):
+                self.write_backup(node, write_back=True)
+                self._evict_to_host(node, tracker)
+                return
+            else:
+                # Write-through: node has no backup, delete entirely.
+                for comp in self._components_tuple:
+                    self._evict_component_and_detach_lru(
+                        node, comp, target=EvictLayer.ALL, tracker=tracker
+                    )
+                self.evictable_device_leaves.discard(node)
+                parent = node.parent
+                self._remove_leaf_from_parent(node)
+                self._update_evictable_leaf_sets(parent)
+                self._iteratively_delete_tombstone_leaf(node, tracker)
+                return
+        self._evict_to_host(node, tracker)
+
+    def _evict_host_leaf(
+        self, node: UnifiedTreeNode, tracker: dict[ComponentType, int]
+    ) -> None:
+        """Atomically evict all components on a host leaf.
+
+        All freed tokens are accumulated into *tracker*."""
+        assert self._is_host_leaf(node), f"node {node.id} is not an H-leaf"
+
+        for comp in self._components_tuple:
+            _, hf = self._evict_component_and_detach_lru(
+                node, comp, target=EvictLayer.ALL, tracker=None
+            )
+            tracker[comp.component_type] += hf
+        self.evictable_host_leaves.discard(node)
+        self._remove_leaf_from_parent(node)
+        self._iteratively_delete_tombstone_leaf(node, tracker)
+
+    # ---- HiCache: Backup / LoadBack ----
+
+    def write_backup(self, node: UnifiedTreeNode, write_back: bool = False) -> int:
+        """Backup a node's data from device to host (D->H)."""
+        if self.cache_controller is None:
+            return 0
+
+        # Backup invariant (write-through): parent must be backuped first
+        if not write_back and (
+            node.parent is not self.root_node and not node.parent.backuped
+        ):
+            return 0
+
+        # Build aux transfers, keyed per component
+        comp_xfers: dict[ComponentType, list] = {}
+        for comp in self._components_tuple:
+            if comp.component_type == BASE_COMPONENT_TYPE:
+                continue
+            t = comp.build_hicache_transfers(node, CacheTransferPhase.BACKUP_HOST)
+            if t:
+                comp_xfers[comp.component_type] = t
+        anchor_kv_shared_indices_xfers = [
+            PoolTransfer(name=pool_name, hit_policy=hit_policy)
+            for pool_name, hit_policy in self.hicache_anchor_kv_shared_indices_pools
+        ]
+
+        # Pre-evict host if insufficient
+        device_value = node.component_data[BASE_COMPONENT_TYPE].value
+        kv_tokens = len(device_value)
+        host_avail = self.cache_controller.mem_pool_host.available_size()
+        if host_avail < kv_tokens:
+            needed = kv_tokens - host_avail
+            evicted = self.evict_host(needed)
+            if evicted < needed:
+                return 0
+
+        aux_xfers = [x for xfers in comp_xfers.values() for x in xfers]
+        aux_xfers.extend(anchor_kv_shared_indices_xfers)
+        host_indices = self.cache_controller.write(
+            device_value, node_id=node.id, extra_pools=aux_xfers or None
+        )
+        if host_indices is None:
+            return 0
+
+        # Commit
+        kv_xfer = PoolTransfer(name=PoolName.KV, host_indices=host_indices)
+        self.components[BASE_COMPONENT_TYPE].commit_hicache_transfer(
+            node,
+            CacheTransferPhase.BACKUP_HOST,
+            transfers=[kv_xfer],
+        )
+        for ct, xfers in comp_xfers.items():
+            self.components[ct].commit_hicache_transfer(
+                node,
+                CacheTransferPhase.BACKUP_HOST,
+                transfers=xfers,
+            )
+
+        self.ongoing_write_through[node.id] = node
+        if not write_back:
+            self.inc_lock_ref(node)
+        return len(host_indices)
+
+    def load_back(
+        self,
+        node: UnifiedTreeNode,
+        mem_quota: Optional[int] = None,
+        req=None,
+    ) -> Optional[torch.Tensor]:
+        """Load evicted KV data from host back to device (H→D)."""
+        if self.cache_controller is None:
+            return None
+
+        # Build KV transfer
+        last_hit_node = node
+        kv_xfer = self.components[BASE_COMPONENT_TYPE].build_hicache_transfers(
+            last_hit_node, CacheTransferPhase.LOAD_BACK
+        )[0]
+
+        # Lock path & pre-evict if device pool is insufficient
+        nodes_to_load = kv_xfer.nodes_to_load
+        ancestor_node = nodes_to_load[0].parent if nodes_to_load else last_hit_node
+        result = self.inc_lock_ref(ancestor_node)
+        kv_tokens = len(kv_xfer.host_indices)
+
+        # Build aux transfers, keyed per component.
+        comp_xfers: dict[ComponentType, list] = {}
+        for comp in self._components_tuple:
+            if comp.component_type == BASE_COMPONENT_TYPE:
+                continue
+            t = comp.build_hicache_transfers(
+                last_hit_node, CacheTransferPhase.LOAD_BACK, req=req
+            )
+            if t:
+                comp_xfers[comp.component_type] = t
+        anchor_kv_shared_indices_xfers = [
+            PoolTransfer(name=pool_name, hit_policy=hit_policy)
+            for pool_name, hit_policy in self.hicache_anchor_kv_shared_indices_pools
+        ]
+
+        # Skip if there is nothing to load, or if the Full-KV transfer is too
+        # small / exceeds memory quota. Aux transfers should still run even
+        # when the Full-KV load is skipped by thresholding.
+        if (kv_tokens < self.load_back_threshold and not comp_xfers) or (
+            mem_quota is not None and kv_tokens > mem_quota + result.delta
+        ):
+            self.dec_lock_ref(ancestor_node)
+            return None
+
+        avail = self.token_to_kv_pool_allocator.available_size()
+        if avail < kv_tokens:
+            needed = kv_tokens - avail
+            result = self.evict(EvictParams(num_tokens=needed))
+            if result.num_tokens_evicted < needed:
+                self.dec_lock_ref(ancestor_node)
+                return None
+
+        logger.info(
+            "load_back: kv_tokens=%d, node_id=%d",
+            kv_tokens,
+            last_hit_node.id,
+        )
+
+        # Load H→D
+        aux_xfers = [x for xfers in comp_xfers.values() for x in xfers]
+        aux_xfers.extend(anchor_kv_shared_indices_xfers)
+        device_indices = self.cache_controller.load(
+            host_indices=kv_xfer.host_indices,
+            node_id=last_hit_node.id,
+            extra_pools=aux_xfers or None,
+        )
+
+        self.dec_lock_ref(ancestor_node)
+        if device_indices is None:
+            return None
+
+        # Commit: each component gets only its own transfers
+        kv_xfer.device_indices = device_indices
+        self.components[BASE_COMPONENT_TYPE].commit_hicache_transfer(
+            last_hit_node,
+            CacheTransferPhase.LOAD_BACK,
+            [kv_xfer],
+        )
+        for ct, xfers in comp_xfers.items():
+            self.components[ct].commit_hicache_transfer(
+                last_hit_node,
+                CacheTransferPhase.LOAD_BACK,
+                xfers,
+            )
+
+        self._update_evictable_leaf_sets(ancestor_node)
+        self.inc_lock_ref(last_hit_node)
+        self.ongoing_load_back[last_hit_node.id] = last_hit_node
+        return device_indices
+
+    def _inc_hit_count(self, node: UnifiedTreeNode, chunked: bool = False) -> None:
+        """Increment hit count; trigger write_backup when threshold reached."""
+        if self.cache_controller is None:
+            return
+        if node.evicted or chunked:
+            return
+        if self.cache_controller.write_policy == "write_back":
+            return
+        node.hit_count += 1
+        if not node.backuped and node.hit_count >= self.write_through_threshold:
+            self.write_backup(node)
+
+    # ---- HiCache: Async Event Management ----
+
+    def writing_check(self, write_back: bool = False) -> None:
+        """Poll write-through completions."""
+        cc = self.cache_controller
+        if cc is None:
+            return
+
+        if write_back:
+            # Blocking: wait for all pending write-backs
+            while self.ongoing_write_through:
+                for _, finish_event, ack_list in cc.ack_write_queue:
+                    finish_event.synchronize()
+                    for ack_id in ack_list:
+                        self.ongoing_write_through.pop(ack_id, None)
+                cc.ack_write_queue.clear()
+                assert len(self.ongoing_write_through) == 0
+            return
+
+        if len(self.ongoing_write_through) == 0:
+            return
+
+        finish_count = 0
+        for _, finish_event, ack_list in cc.ack_write_queue:
+            if not finish_event.query():
+                break
+            finish_count += 1
+
+        # TP sync: MIN across all ranks for consistent tree updates
+        queue_size = torch.tensor(finish_count, dtype=torch.int, device="cpu")
+        if self.tp_world_size > 1:
+            torch.distributed.all_reduce(
+                queue_size, op=torch.distributed.ReduceOp.MIN, group=self.tp_group
+            )
+        finish_count = int(queue_size.item())
+
+        # Process completed acks
+        while finish_count > 0:
+            _, finish_event, ack_list = cc.ack_write_queue.pop(0)
+            finish_event.synchronize()
+            for ack_id in ack_list:
+                node = self.ongoing_write_through.pop(ack_id)
+                self.dec_lock_ref(node)
+            finish_count -= 1
+
+    def loading_check(self) -> None:
+        """Poll load-back completions."""
+        cc = self.cache_controller
+        if cc is None or not self.ongoing_load_back:
+            return
+        finish_count = 0
+        for _, finish_event, ack_list in cc.ack_load_queue:
+            if not finish_event.query():
+                break
+            finish_count += 1
+            for ack_id in ack_list:
+                node = self.ongoing_load_back.pop(ack_id)
+                self.dec_lock_ref(node)
+        del cc.ack_load_queue[:finish_count]
+
+    # ---- HiCache: Scheduler Entry Points ----
+
+    def init_load_back(
+        self,
+        params: InitLoadBackParams,
+    ) -> tuple[torch.Tensor, UnifiedTreeNode]:
+        """Prepare KV cache loading from host to device.
+        Returns (device_indices, last_node) tuple."""
+        last_node = params.last_host_node
+        mem_quota = params.mem_quota
+        req = params.req
+
+        if last_node.evicted or params.host_hit_length > 0:
+            logger.info(
+                "init_load_back triggered: node_id=%d, host_hit_length=%d",
+                last_node.id,
+                params.host_hit_length,
+            )
+            loading_values = self.load_back(last_node, mem_quota, req=req)
+            if loading_values is not None:
+                logger.info(
+                    "init_load_back success: loaded %d tokens for node %d",
+                    len(loading_values),
+                    last_node.id,
+                )
+                return loading_values, last_node
+
+            # Fallback: walk up to non-evicted ancestor
+            while last_node is not self.root_node and last_node.evicted:
+                last_node = last_node.parent
+
+        return (
+            torch.empty((0,), dtype=torch.int64, device=self.device),
+            last_node,
+        )
+
+    def check_hicache_events(self) -> None:
+        """Called per scheduler step to poll async HiCache events."""
+        self.writing_check()
+        self.loading_check()
+
+    def flush_write_through_acks(self) -> None:
+        """Flush pending write-through acknowledgements."""
+        self.writing_check()
+
+    def ready_to_load_host_cache(self) -> int:
+        """Notify the cache controller to start the KV cache loading."""
+        if self.cache_controller is not None:
+            return self.cache_controller.start_loading()
+        return 0
 
     # ---- Query / Inspection APIs ----
     # These APIs exist for compatibility with other RadixTree implementations.
@@ -845,7 +1473,9 @@ class UnifiedRadixCache(BasePrefixCache):
         stack = [self.root_node]
         while stack:
             node = stack.pop()
-            total_size += len(node.component_data[BASE_COMPONENT_TYPE].value)
+            full_value = node.component_data[BASE_COMPONENT_TYPE].value
+            if full_value is not None:
+                total_size += len(full_value)
             for ct in self.tree_components:
                 if ct == BASE_COMPONENT_TYPE:
                     continue
@@ -861,7 +1491,9 @@ class UnifiedRadixCache(BasePrefixCache):
 
         def _dfs(node: UnifiedTreeNode):
             for child in node.children.values():
-                values.append(child.component_data[BASE_COMPONENT_TYPE].value)
+                v = child.component_data[BASE_COMPONENT_TYPE].value
+                if v is not None:
+                    values.append(v)
                 _dfs(child)
 
         _dfs(self.root_node)
@@ -931,82 +1563,268 @@ class UnifiedRadixCache(BasePrefixCache):
         return nodes
 
     def sanity_check(self):
-        """Thorough sanity check: verify LRU membership, lock state, linked-list
-        integrity, and evictable sizes for every component.
-        Expensive — use only in tests or idle checks."""
+        """Verify tree invariants.
+
+        TODO(hzh): This method has relatively high latency; simplify the
+        check logic once the tree implementation stabilizes.
+        """
         # Skip when streaming sessions hold tree locks: the check asserts
         # all nodes are unlocked during idle, which streaming sessions break
         # by design (they hold a first-turn lock across turns).
         if self.session.any_holding_kv():
             return
-        try:
-            # 1. Collect all nodes from tree
-            all_nodes = self._collect_all_nodes()
 
+        errors: list[str] = []
+        E = errors.append
+        all_nodes = self._collect_all_nodes()
+        all_node_set = set(all_nodes)
+        FCT = BASE_COMPONENT_TYPE
+
+        # ── PART 1: Tree Structure ──
+        # Root state
+        if self.root_node.component_data[FCT].value is None:
+            E("[Root] root missing Full device value")
+        if self.root_node.component_data[FCT].lock_ref <= 0:
+            E(
+                f"[Root] root Full lock_ref={self.root_node.component_data[FCT].lock_ref}"
+            )
+        if self.root_node.parent is not None:
+            E("[Root] root has a parent pointer")
+        # Parent ↔ child bidirectional consistency
+        for node in all_nodes:
+            for child in node.children.values():
+                if child.parent is not node:
+                    pid = child.parent.id if child.parent else None
+                    E(f"[Tree] child {child.id} parent={pid}, expected {node.id}")
+                if child.key is None:
+                    E(f"[Tree] node {child.id} has no key")
+
+        # ── PART 2: Per-node state machine and leaf qualification ──
+        expected_dev_leaves: set[UnifiedTreeNode] = set()
+        expected_hst_leaves: set[UnifiedTreeNode] = set()
+
+        for node in all_nodes:
+            if node is self.root_node:
+                continue
+            nid = node.id
+            full_dev = node.component_data[FCT].value is not None
+            full_hst = node.component_data[FCT].host_value is not None
+
+            # Full is the tree backbone, so aux data requires Full data.
             for ct in self.tree_components:
-                # 2. Basic size invariants
-                assert (
-                    self.component_evictable_size_[ct] >= 0
-                ), f"component_evictable_size_[{ct}] = {self.component_evictable_size_[ct]} < 0"
-                assert (
-                    self.component_protected_size_[ct] >= 0
-                ), f"component_protected_size_[{ct}] = {self.component_protected_size_[ct]} < 0"
+                if ct == FCT:
+                    continue
+                cd = node.component_data[ct]
+                if cd.value is not None and not full_dev:
+                    E(f"node {nid} {ct} device present but Full.value=None")
+                if cd.host_value is not None and not full_hst:
+                    E(f"node {nid} {ct} host present but Full.host_value=None")
 
-                # 3. Verify LRU membership: tree nodes with data == LRU cache entries
-                lru = self.lru_lists[ct]
+            # Every node must keep Full data on at least one layer.
+            if not full_dev and not full_hst:
+                E(f"node {nid} dead: no Full device and no Full host")
+
+            # Parent prefixes must keep data whenever the child does.
+            if node.parent is not None and node.parent is not self.root_node:
+                p_dev = node.parent.component_data[FCT].value is not None
+                p_hst = node.parent.component_data[FCT].host_value is not None
+                if full_dev and not p_dev:
+                    E(f"node {nid} device present but parent {node.parent.id} evicted")
+                if full_hst and not p_hst:
+                    E(f"node {nid} backed up but parent {node.parent.id} not backed up")
+
+            # Lock hierarchy and counters must stay sane.
+            fl = node.component_data[FCT].lock_ref
+            for ct in self.tree_components:
+                cd = node.component_data[ct]
+                if cd.lock_ref < 0:
+                    E(f"node {nid} {ct} lock_ref={cd.lock_ref}")
+                if cd.host_lock_ref < 0:
+                    E(f"node {nid} {ct} host_lock_ref={cd.host_lock_ref}")
+                if ct != FCT and fl < cd.lock_ref:
+                    E(f"node {nid} full_lock={fl} < {ct}_lock={cd.lock_ref}")
+                if cd.value is None and cd.lock_ref > 0:
+                    E(f"node {nid} {ct} evicted but lock_ref={cd.lock_ref}")
+
+            # Collect expected leaf qualification (single pass)
+            if self._is_device_leaf(node):
+                expected_dev_leaves.add(node)
+            if self._is_host_leaf(node):
+                expected_hst_leaves.add(node)
+
+        # ── PART 3: Tracking structures ──
+
+        # Device leaf set must match the expected leaves.
+        if self.evictable_device_leaves != expected_dev_leaves:
+            extra = self.evictable_device_leaves - expected_dev_leaves
+            missing = expected_dev_leaves - self.evictable_device_leaves
+            if extra:
+                E(f"D-leaf extra: {[n.id for n in list(extra)[:5]]}")
+            if missing:
+                E(f"D-leaf missing: {[n.id for n in list(missing)[:5]]}")
+
+        # Host leaf set must match the expected leaves.
+        if self.evictable_host_leaves != expected_hst_leaves:
+            extra = self.evictable_host_leaves - expected_hst_leaves
+            missing = expected_hst_leaves - self.evictable_host_leaves
+            if extra:
+                E(f"H-leaf extra: {[n.id for n in list(extra)[:5]]}")
+            if missing:
+                E(f"H-leaf missing: {[n.id for n in list(missing)[:5]]}")
+
+        # D-leaf ∩ H-leaf = ∅
+        overlap = self.evictable_device_leaves & self.evictable_host_leaves
+        if overlap:
+            E(
+                f"[Leaf] {len(overlap)} in both sets: {[n.id for n in list(overlap)[:5]]}"
+            )
+
+        # Stale nodes: leaf sets must only contain tree-reachable nodes
+        stale = self.evictable_device_leaves - all_node_set
+        if stale:
+            E(
+                f"{len(stale)} stale nodes in device_leaves: {[n.id for n in list(stale)[:5]]}"
+            )
+        stale = self.evictable_host_leaves - all_node_set
+        if stale:
+            E(
+                f"{len(stale)} stale nodes in host_leaves: {[n.id for n in list(stale)[:5]]}"
+            )
+
+        # Per-component LRU tracking
+        for ct in self.tree_components:
+            lru = self.lru_lists[ct]
+            if ct == FCT:
+                # Full uses leaf sets, not LRU
+                if len(lru.cache) > 0:
+                    E(f"Full device LRU not empty: {len(lru.cache)}")
+                if len(self.host_lru_lists[ct].cache) > 0:
+                    E(f"Full host LRU not empty: {len(self.host_lru_lists[ct].cache)}")
+            else:
+                # Aux device values must match the device LRU.
                 tree_ids = {
                     n.id
                     for n in all_nodes
-                    if n != self.root_node and n.component_data[ct].value is not None
+                    if n is not self.root_node
+                    and n.component_data[ct].value is not None
                 }
                 lru_ids = set(lru.cache.keys())
-                assert tree_ids == lru_ids, (
-                    f"[{ct}] LRU membership mismatch: "
-                    f"in_tree_not_lru={tree_ids - lru_ids}, "
-                    f"in_lru_not_tree={lru_ids - tree_ids}"
-                )
-
-                # 4. Walk LRU doubly-linked list: verify structural integrity
-                #    and that all nodes are unlocked (idle check)
-                visited = set()
-                x = lru.head.lru_next[ct]
-                prev = lru.head
-                while x != lru.tail:
-                    assert (
-                        x.lru_prev[ct] == prev
-                    ), f"[{ct}] broken prev link at node {x.id}"
-                    assert (
-                        x.id in lru.cache
-                    ), f"[{ct}] node {x.id} in linked list but not in cache dict"
-                    assert x.id not in visited, f"[{ct}] cycle detected at node {x.id}"
-                    assert x.component_data[ct].lock_ref == 0, (
-                        f"[{ct}] node {x.id} should not be locked when idle, "
-                        f"lock_ref={x.component_data[ct].lock_ref}"
+                if tree_ids != lru_ids:
+                    E(
+                        f"{ct} device LRU: "
+                        f"+tree={tree_ids - lru_ids}, +lru={lru_ids - tree_ids}"
                     )
-                    visited.add(x.id)
-                    prev = x
-                    x = x.lru_next[ct]
-                assert len(visited) == len(lru.cache), (
-                    f"[{ct}] linked list has {len(visited)} nodes, "
-                    f"cache dict has {len(lru.cache)}"
+                # Aux host-only states must match the host LRU.
+                host_lru = self.host_lru_lists[ct]
+                s3_ids = {
+                    n.id
+                    for n in all_nodes
+                    if n is not self.root_node
+                    and n.component_data[ct].value is None
+                    and n.component_data[ct].host_value is not None
+                }
+                host_lru_ids = set(host_lru.cache.keys())
+                if s3_ids != host_lru_ids:
+                    E(
+                        f"{ct} host LRU: "
+                        f"+S3={s3_ids - host_lru_ids}, +lru={host_lru_ids - s3_ids}"
+                    )
+                # The same aux node must not appear in both device and host LRU.
+                inv5_overlap = lru_ids & host_lru_ids
+                if inv5_overlap:
+                    E(f"{ct} in both device and host LRU: {inv5_overlap}")
+                # Linked-list integrity
+                self._check_lru_linked_list(lru, ct, "device", errors)
+                self._check_lru_linked_list(host_lru, ct, "host", errors)
+
+        # ── PART 4: Size Accounting ──
+        for ct in self.tree_components:
+            evictable = 0
+            protected = 0
+            for n in all_nodes:
+                if n is self.root_node:
+                    continue
+                cd = n.component_data[ct]
+                if cd.value is not None:
+                    toks = len(cd.value)
+                    if cd.lock_ref > 0:
+                        protected += toks
+                    else:
+                        evictable += toks
+            if self.component_evictable_size_[ct] != evictable:
+                E(
+                    f"[Size] {ct} evictable={self.component_evictable_size_[ct]} "
+                    f"!= recomputed={evictable}"
+                )
+            if self.component_protected_size_[ct] != protected:
+                E(
+                    f"[Size] {ct} protected={self.component_protected_size_[ct]} "
+                    f"!= recomputed={protected}"
                 )
 
-                # 5. Verify evictable size by walking unlocked LRU nodes
-                recomputed = 0
-                x = lru.get_lru_no_lock()
-                while lru.in_list(x):
-                    v = x.component_data[ct].value
-                    recomputed += len(v) if v is not None else 0
-                    x = lru.get_prev_no_lock(x)
-                assert self.component_evictable_size_[ct] == recomputed, (
-                    f"[{ct}] evictable_size_={self.component_evictable_size_[ct]} "
-                    f"!= recomputed={recomputed}"
+        # ── PART 5: Ongoing Operations ──
+        for nid, n in self.ongoing_write_through.items():
+            if n not in all_node_set:
+                E(f"[Ongoing] write_through node {nid} not in tree")
+            elif n.component_data[FCT].lock_ref <= 0:
+                E(
+                    f"[Ongoing] write_through node {nid} lock_ref={n.component_data[FCT].lock_ref}"
+                )
+        for nid, n in self.ongoing_load_back.items():
+            if n not in all_node_set:
+                E(f"[Ongoing] load_back node {nid} not in tree")
+            elif n.component_data[FCT].lock_ref <= 0:
+                E(
+                    f"[Ongoing] load_back node {nid} lock_ref={n.component_data[FCT].lock_ref}"
                 )
 
-        except Exception as e:
-            logger.error(f"Unified RadixTree sanity check failed: {e}")
+        # ── Result ──
+        if errors:
+            msg = (
+                f"Sanity check FAILED ({len(errors)} violations "
+                f"across {len(all_nodes)} nodes):\n"
+                + "\n".join(f"  {e}" for e in errors)
+            )
+            logger.error(msg)
             self.pretty_print()
-            raise
+            raise AssertionError(msg)
+        logger.debug(
+            f"Sanity check PASSED: {len(all_nodes)} nodes, "
+            f"{len(self.tree_components)} components"
+        )
+
+    def _check_lru_linked_list(
+        self,
+        lru: "UnifiedLRUList",
+        ct: ComponentType,
+        label: str,
+        errors: list[str],
+    ) -> None:
+        """Walk a LRU doubly-linked list, collect integrity errors."""
+        pt = lru._pt  # use LRU's own pointer slot
+        visited: set[int] = set()
+        x = lru.head.lru_next[pt]
+        prev = lru.head
+        while x is not None and x != lru.tail:
+            if x.lru_prev[pt] != prev:
+                errors.append(f"[{label}][{ct}] broken prev at node {x.id}")
+            if x.id not in lru.cache:
+                errors.append(f"[{label}][{ct}] node {x.id} in list not cache")
+            if x.id in visited:
+                errors.append(f"[{label}][{ct}] cycle at node {x.id}")
+                break
+            visited.add(x.id)
+            prev = x
+            x = x.lru_next[pt]
+        if x is None:
+            errors.append(
+                f"[{label}][{ct}] broken chain: lru_next is None "
+                f"after node {prev.id if hasattr(prev, 'id') else 'head'}"
+            )
+        if len(visited) != len(lru.cache):
+            errors.append(
+                f"[{label}][{ct}] list={len(visited)} != cache={len(lru.cache)}"
+            )
 
     def pretty_print(self) -> None:
         stack = [(self.root_node, 0)]
@@ -1025,3 +1843,28 @@ class UnifiedRadixCache(BasePrefixCache):
             )
             for child in node.children.values():
                 stack.append((child, indent + 2))
+
+    def _rebuild_host_leaf_sets(self) -> None:
+        """Rebuild evictable_host_leaves after L1-only reset."""
+        stack = [self.root_node]
+        while stack:
+            node = stack.pop()
+            if node is not self.root_node:
+                self._update_evictable_leaf_sets(node)
+            stack.extend(node.children.values())
+
+    def _rebuild_host_lru_lists(self) -> None:
+        """Rebuild host_lru_lists for extra components after L1-only reset.
+        Walks the tree and adds nodes with host component data to the
+        appropriate host LRU list."""
+        stack = [self.root_node]
+        while stack:
+            node = stack.pop()
+            if node is not self.root_node:
+                for ct in self.tree_components:
+                    if ct == BASE_COMPONENT_TYPE:
+                        continue  # Full uses evictable_host_leaves, not host LRU
+                    cd = node.component_data[ct]
+                    if cd.host_value is not None:
+                        self.host_lru_lists[ct].insert_mru(node)
+            stack.extend(node.children.values())
