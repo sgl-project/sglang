@@ -30,6 +30,13 @@ logger = logging.getLogger(__name__)
 
 
 class ChunkCache(BasePrefixCache):
+    """
+    ChunkCache is used when radix cache is disabled.
+
+    That includes standard chunked-prefill setups and the decode side of P/D
+    disaggregation when decode radix cache is not enabled.
+    """
+
     def __init__(self, params: CacheInitParams):
         self.req_to_token_pool = params.req_to_token_pool
         self.token_to_kv_pool_allocator = params.token_to_kv_pool_allocator

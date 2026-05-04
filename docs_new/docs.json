@@ -365,6 +365,10 @@
       "destination": "/docs/sglang-diffusion/attention_backends"
     },
     {
+      "source": "/diffusion/performance/dynamic_batching.html",
+      "destination": "/docs/sglang-diffusion/dynamic_batching"
+    },
+    {
       "source": "/diffusion/performance/cache/cache_dit.html",
       "destination": "/docs/sglang-diffusion/cache_dit"
     },
@@ -1170,6 +1174,12 @@
                   "docs/sglang-diffusion/performance-optimization",
                   "docs/sglang-diffusion/ring_sp_performance",
                   "docs/sglang-diffusion/attention_backends",
+                  {
+                    "group": "Inference Batching",
+                    "pages": [
+                      "docs/sglang-diffusion/dynamic_batching"
+                    ]
+                  },
                   "docs/sglang-diffusion/profiling",
                   "docs/sglang-diffusion/ci_perf"
                 ]

@@ -172,6 +172,10 @@ def handle_attention_triton(attn, forward_batch):
         return _dispatch_mla_subtype(attn, forward_batch)
 
 
+def handle_attention_intel_xpu(attn, forward_batch):
+    return _handle_attention_backend(attn, forward_batch, "intel_xpu")
+
+
 AttentionBackendRegistry.register("ascend", handle_attention_ascend)
 AttentionBackendRegistry.register("flashinfer", handle_attention_flashinfer)
 AttentionBackendRegistry.register("fa3", handle_attention_fa3)
@@ -182,3 +186,4 @@ AttentionBackendRegistry.register("trtllm_mla", handle_attention_trtllm_mla)
 AttentionBackendRegistry.register("aiter", handle_attention_aiter)
 AttentionBackendRegistry.register("nsa", handle_attention_nsa)
 AttentionBackendRegistry.register("triton", handle_attention_triton)
+AttentionBackendRegistry.register("intel_xpu", handle_attention_intel_xpu)
