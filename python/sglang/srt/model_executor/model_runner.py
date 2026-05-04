@@ -797,7 +797,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if not self.is_hybrid_swa:
             return
 
-        if self.model_config.is_swa_with_compressed_attention:
+        if self.model_config.is_deepseek_v4_arch:
             return
 
         full_attention_layer_ids = [
