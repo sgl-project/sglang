@@ -217,7 +217,8 @@ class BailingMoeForCausalLMNextN(nn.Module):
             self.post_load_weights_func = BailingMoeV2_5ForCausalLM.post_load_weights
         else:
             self.base_load_weights_func = BailingMoEForCausalLM.load_weights
-            self.post_load_weights_func = BailingMoEForCausalLM.post_load_weights
+            # V1 BailingMoeAttention is standard QKV (no kv_b_proj), no fixup needed.
+            self.post_load_weights_func = None
 
     @torch.no_grad()
     def forward(
@@ -244,6 +245,8 @@ class BailingMoeForCausalLMNextN(nn.Module):
         self.base_load_weights_func(self, weights, is_nextn=True)
 
     def post_load_weights(self, weight_names=None):
+        if self.post_load_weights_func is None:
+            return
         self.post_load_weights_func(self, is_nextn=True, weight_names=weight_names)
 
 
