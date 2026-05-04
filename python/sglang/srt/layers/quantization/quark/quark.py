@@ -418,9 +418,7 @@ class QuarkConfig(QuantizationConfig):
                 moe_cfg = self._find_matched_config(moe_name, lookup_stub)
                 for suffix in _SHARED_EXPERT_BODY_PROJ_SUFFIXES:
                     shared_name = f"{base}.mlp.shared_expert.{suffix}"
-                    shared_cfg = self._find_matched_config(
-                        shared_name, lookup_stub
-                    )
+                    shared_cfg = self._find_matched_config(shared_name, lookup_stub)
                     if not deep_compare(moe_cfg, shared_cfg):
                         return False
         except ValueError:
