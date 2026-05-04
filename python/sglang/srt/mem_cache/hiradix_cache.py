@@ -181,6 +181,14 @@ class HiRadixCache(RadixCache):
         )
         self.load_back_threshold = 10
 
+        self.disable_hicache_l1_prefix_reuse = (
+            server_args.disable_hicache_l1_prefix_reuse
+        )
+
+        if self.disable_hicache_l1_prefix_reuse:
+            assert server_args.enable_hierarchical_cache
+            assert not server_args.disable_radix_cache
+
         # Detach storage backend automatically on process shutdown
         atexit.register(self.shutdown)
 
@@ -793,6 +801,13 @@ class HiRadixCache(RadixCache):
                 # DMA confirmed -- block is now on host.
                 self._record_store_event(backuped_node, medium=StorageMedium.CPU)
                 self.dec_lock_ref(backuped_node)
+
+                # if disable L1 prefix reuse, demote to make them evictable sooner,
+                # otherwise we have to wait for the next eviction check to demote them,
+                # which may cause longer eviction latency
+                if self.disable_hicache_l1_prefix_reuse:
+                    self._maybe_demote_backuped_l1_leaves()
+
                 if self.enable_storage:
                     self.write_backup_storage(backuped_node)
             finish_count -= 1
@@ -851,7 +866,13 @@ class HiRadixCache(RadixCache):
                     node is self.root_node
                 ), f"This request holds the node from another tree"
             node = node.parent
-        return DecLockRefResult(delta=delta)
+
+        result = DecLockRefResult(delta=delta)
+
+        if self.disable_hicache_l1_prefix_reuse:
+            self._maybe_demote_backuped_l1_leaves()
+
+        return result
 
     def _update_host_leaf_status(self, node: TreeNode):
         if not node.evicted or node.lock_ref > 0:
@@ -1518,3 +1539,31 @@ class HiRadixCache(RadixCache):
         del self.ongoing_prefetch[rid]
         self.cache_controller.append_host_mem_release(host_indices[:completed_tokens])
         self.cache_controller.prefetch_tokens_occupied -= len(prefetch_key)
+
+    def _maybe_demote_backuped_l1_leaves(self) -> int:
+        if not self.disable_hicache_l1_prefix_reuse:
+            return 0
+
+        total = 0
+
+        while True:
+            victims = [
+                node
+                for node in list(self.evictable_leaves)
+                if node is not self.root_node
+                and node.lock_ref == 0
+                and not node.evicted
+                and node.backuped
+                and node.value is not None
+            ]
+
+            if not victims:
+                return total
+
+            for node in victims:
+                if node not in self.evictable_leaves:
+                    continue
+                if node.lock_ref != 0 or node.evicted or not node.backuped:
+                    continue
+
+                total += self._evict_backuped(node)

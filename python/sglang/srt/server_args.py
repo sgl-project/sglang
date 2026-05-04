@@ -679,6 +679,9 @@ class ServerArgs:
     hicache_storage_prefetch_policy: str = "timeout"
     hicache_storage_backend_extra_config: Optional[str] = None
 
+    # disable L1 prefix reuse (then only L2 reuse is possible if L2 is enabled)
+    disable_hicache_l1_prefix_reuse: bool = False
+
     # Hierarchical sparse attention
     enable_hisparse: bool = False
     hisparse_config: Optional[str] = None
@@ -4091,6 +4094,33 @@ class ServerArgs:
                 "and cannot be used at the same time. Please use only one of them."
             )
 
+        # Check compatibility of L1 prefix reuse with other settings.
+        # L1 prefix reuse requires an L2 CPU KV cache (populated by radix cache).
+        # For deterministic reuse, hicache write policy must be set to write-through.
+        if self.disable_hicache_l1_prefix_reuse:
+            if not self.enable_hierarchical_cache:
+                raise ValueError(
+                    "--no-enable-prefix-caching / "
+                    "--disable-hicache-l1-prefix-reuse requires "
+                    "--enable-hierarchical-cache. Without HiCache there is no "
+                    "CPU L2 KV cache to reuse."
+                )
+
+            if self.disable_radix_cache:
+                raise ValueError(
+                    "--no-enable-prefix-caching cannot be combined with "
+                    "--disable-radix-cache. The new mode must keep HiRadixTree "
+                    "metadata so CPU L2 prefixes can still be matched and loaded back."
+                )
+
+            if self.hicache_write_policy != "write_through":
+                logger.warning(
+                    "--no-enable-prefix-caching only reuses prefixes that have "
+                    "already been backed up to CPU L2. For deterministic testing, "
+                    "use --hicache-write-policy write_through. Current value: %s",
+                    self.hicache_write_policy,
+                )
+
         if self.disaggregation_decode_enable_offload_kvcache:
             if self.disaggregation_mode != "decode":
                 raise ValueError(
@@ -6354,6 +6384,16 @@ class ServerArgs:
             type=int,
             default=ServerArgs.kv_canary_sweep_interval,
             help="Every N forward steps, run a full-pool sweep.",
+        )
+        parser.add_argument(
+            "--no-enable-prefix-caching",
+            "--disable-hicache-l1-prefix-reuse",
+            dest="disable_hicache_l1_prefix_reuse",
+            action="store_true",
+            help=(
+                "HiCache-only: disable serving reusable prefix KV directly from "
+                "GPU L1. Keep HiRadixTree and allow CPU L2 load-back reuse."
+            ),
         )
         parser.add_argument(
             "--cuda-graph-max-bs",
