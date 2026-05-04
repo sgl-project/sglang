@@ -36,7 +36,7 @@ def main():
     parser.add_argument(
         "--cuda", type=str, required=True, choices=SUPPORTED_CUDA_VERSIONS
     )
-    parser.add_argument("--wheel-dir", type=str, default="sgl-deep-gemm/dist")
+    parser.add_argument("--wheel-dir", type=str, default="dist")
     args = parser.parse_args()
     update_wheel_index(args.cuda, args.wheel_dir)
 

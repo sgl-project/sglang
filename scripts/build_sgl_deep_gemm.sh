@@ -1,7 +1,7 @@
 #!/bin/bash
 # Build sgl-deep-gemm wheel inside a CUDA-versioned container.
 #
-# Usage: build.sh <PYTHON_VERSION> <CUDA_VERSION> <DEEPGEMM_SRC> [ARCH]
+# Usage: build_sgl_deep_gemm.sh <PYTHON_VERSION> <CUDA_VERSION> <DEEPGEMM_SRC> [ARCH]
 #   PYTHON_VERSION: e.g. 3.10
 #   CUDA_VERSION:   e.g. 12.9 or 13.0
 #   DEEPGEMM_SRC:   path to a checkout of sgl-project/DeepGEMM
@@ -29,6 +29,8 @@ fi
 PY_TAG="cp${PYTHON_VERSION//.}-cp${PYTHON_VERSION//.}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+DOCKERFILE="${REPO_ROOT}/docker/sgl-deep-gemm.Dockerfile"
 
 DEPS_TAG="sgl-deep-gemm-deps:cuda${CUDA_VERSION}-${PY_TAG}-${ARCH}"
 
@@ -42,7 +44,7 @@ echo "DEPS_TAG:       ${DEPS_TAG}"
 echo "----------------------------------------"
 
 docker build \
-  -f "${SCRIPT_DIR}/Dockerfile" "${SCRIPT_DIR}" \
+  -f "${DOCKERFILE}" "$(dirname "${DOCKERFILE}")" \
   --build-arg BASE_IMG="${BASE_IMG}" \
   --build-arg CUDA_VERSION="${CUDA_VERSION}" \
   --build-arg ARCH="${ARCH}" \

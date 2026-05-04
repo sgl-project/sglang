@@ -65,13 +65,13 @@ jobs:
 
       - name: Build wheel
         run: |
-          chmod +x ./sgl-deep-gemm/build.sh
-          ./sgl-deep-gemm/build.sh "${{ matrix.python-version }}" "${{ matrix.cuda-version }}" "${{ github.workspace }}/DeepGEMM" "${{ matrix.arch }}"
+          chmod +x ./scripts/build_sgl_deep_gemm.sh
+          ./scripts/build_sgl_deep_gemm.sh "${{ matrix.python-version }}" "${{ matrix.cuda-version }}" "${{ github.workspace }}/DeepGEMM" "${{ matrix.arch }}"
 
       - name: Rename wheel
         run: |
-          chmod +x ./sgl-deep-gemm/rename_wheels.sh
-          ./sgl-deep-gemm/rename_wheels.sh DeepGEMM/dist cu129 ${{ matrix.arch }}
+          chmod +x ./scripts/rename_sgl_deep_gemm_whl.sh
+          ./scripts/rename_sgl_deep_gemm_whl.sh DeepGEMM/dist cu129 ${{ matrix.arch }}
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
@@ -88,7 +88,7 @@ jobs:
       - name: Download artifacts
         uses: actions/download-artifact@v4
         with:
-          path: sgl-deep-gemm/dist/
+          path: dist/
           merge-multiple: true
           pattern: deepgemm-wheel-cuda12.9-*
 
@@ -99,7 +99,7 @@ jobs:
           repository: sgl-project/whl
           token: ${{ secrets.GH_PAT_FOR_WHL_RELEASE }}
           files: |
-            sgl-deep-gemm/dist/*
+            dist/*
 
       - name: Clone wheel index
         run: git clone https://oauth2:${WHL_TOKEN}@github.com/sgl-project/whl.git sgl-whl
@@ -156,13 +156,13 @@ jobs:
 
       - name: Build wheel
         run: |
-          chmod +x ./sgl-deep-gemm/build.sh
-          ./sgl-deep-gemm/build.sh "${{ matrix.python-version }}" "${{ matrix.cuda-version }}" "${{ github.workspace }}/DeepGEMM" "${{ matrix.arch }}"
+          chmod +x ./scripts/build_sgl_deep_gemm.sh
+          ./scripts/build_sgl_deep_gemm.sh "${{ matrix.python-version }}" "${{ matrix.cuda-version }}" "${{ github.workspace }}/DeepGEMM" "${{ matrix.arch }}"
 
       - name: Rename wheel
         run: |
-          chmod +x ./sgl-deep-gemm/rename_wheels.sh
-          ./sgl-deep-gemm/rename_wheels.sh DeepGEMM/dist cu130 ${{ matrix.arch }}
+          chmod +x ./scripts/rename_sgl_deep_gemm_whl.sh
+          ./scripts/rename_sgl_deep_gemm_whl.sh DeepGEMM/dist cu130 ${{ matrix.arch }}
 
       - name: Strip +cu130 local version for PyPI upload
         working-directory: DeepGEMM
