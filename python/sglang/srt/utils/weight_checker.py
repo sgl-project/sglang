@@ -1,5 +1,5 @@
 import logging
-from typing import Dict, Iterable, Tuple
+from typing import Dict, Iterable, Set, Tuple
 
 import torch
 
@@ -51,9 +51,18 @@ class WeightChecker:
     def _compare(self):
         assert self._snapshot_tensors is not None
 
+        skip_compare_names = {
+            name
+            for name, param in self._model_state()
+            if getattr(param, "_skip_weight_check", False)
+        }
         _check_tensors(
-            expect_tensors=_postprocess_tensors(self._snapshot_tensors),
-            actual_tensors=_postprocess_tensors(dict(self._model_state())),
+            expect_tensors=_postprocess_tensors(
+                self._snapshot_tensors, skip_compare_names
+            ),
+            actual_tensors=_postprocess_tensors(
+                dict(self._model_state()), skip_compare_names
+            ),
         )
 
     def _model_state(self):
@@ -126,14 +135,11 @@ def _random_like(t: torch.Tensor):
 
 def _postprocess_tensors(
     raw: Dict[str, torch.Tensor],
+    skip_compare_names: Set[str],
 ) -> Iterable[Tuple[str, bool, torch.Tensor]]:
     from sglang.srt.debug_utils.dumper import get_tensor_info
 
-    skip_compare_names = [
-        name
-        for name in raw
-        if any(pattern in name for pattern in ["attn_mqa.k_scale", "attn_mqa.v_scale"])
-    ]
+    skip_compare_names = set(skip_compare_names)
 
     # dequant fp8
     quant_names = [
@@ -145,8 +151,8 @@ def _postprocess_tensors(
     quant_scale_names = [
         name.replace("weight", "weight_scale_inv") for name in quant_names
     ]
-    skip_compare_names += quant_names
-    skip_compare_names += quant_scale_names
+    skip_compare_names.update(quant_names)
+    skip_compare_names.update(quant_scale_names)
     for name in quant_names:
         w_q = raw[name]
         w_s = raw[name.replace("weight", "weight_scale_inv")]
