@@ -158,8 +158,7 @@ class TestU1UGBackendShell(unittest.TestCase):
         self.assertEqual(tuple(image_embeds.shape), (2, 16))
 
     def test_neo_chat_get_image_feature_uses_u1_vision_grid_metadata(self):
-        config = _tiny_neo_chat_config()
-        model = NEOChatModel(config)
+        model = _tiny_neo_chat_model_without_language_model()
         item = MultimodalDataItem(
             modality=Modality.IMAGE,
             feature=torch.arange(4 * 3 * 2 * 2, dtype=torch.float32).view(4, -1),
@@ -177,7 +176,7 @@ class TestU1UGBackendShell(unittest.TestCase):
             offsets=[(1, 2)],
         )
         mm_inputs = MultimodalInputs(mm_items=[mm_item])
-        model = NEOChatModel(_tiny_neo_chat_config())
+        model = _tiny_neo_chat_model_without_language_model()
 
         padded = model.pad_input_ids([151670, 151669, 151669, 151671], mm_inputs)
 
@@ -674,6 +673,15 @@ def _tiny_neo_chat_config():
         },
         downsample_ratio=0.5,
     )
+
+
+def _tiny_neo_chat_model_without_language_model():
+    model = NEOChatModel.__new__(NEOChatModel)
+    torch.nn.Module.__init__(model)
+    model.config = _tiny_neo_chat_config()
+    model.img_context_token_id = model.config.img_context_token_id
+    model.vision_model = NEOVisionModel(model.config.vision_config)
+    return model
 
 
 class FakeServerArgs:
