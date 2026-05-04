@@ -3044,6 +3044,29 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 )
             except Exception:
                 logger.debug("RelayKV runtime observation hook failed", exc_info=True)
+        if os.getenv("SGLANG_RELAYKV_REQ_TO_TOKEN_INSPECTION") == "1":
+            try:
+                import json
+
+                from sglang.srt.relaykv.metrics import (
+                    run_model_runner_req_to_token_runtime_inspection_hook_for_smoke,
+                )
+
+                inspection_result = (
+                    run_model_runner_req_to_token_runtime_inspection_hook_for_smoke(
+                        self,
+                        forward_batch=forward_batch,
+                    )
+                )
+                logger.info(
+                    "relaykv_req_to_token_runtime_inspection=%s",
+                    json.dumps(inspection_result["summary"], sort_keys=True, default=str),
+                )
+            except Exception:
+                logger.debug(
+                    "RelayKV req_to_token runtime inspection hook failed",
+                    exc_info=True,
+                )
 
         if self.msprobe_debugger is not None:
             rank_id = (
