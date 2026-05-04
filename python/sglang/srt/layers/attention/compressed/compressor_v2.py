@@ -22,30 +22,26 @@ if TYPE_CHECKING:
 CompressMetadata: TypeAlias = Union[CompressorDecodePlan, CompressorPrefillPlan]
 
 
+def _use_online_compress(compress_ratio: int) -> bool:
+    """Online state-pool path is c128-only."""
+    return compress_ratio == 128 and envs.SGLANG_OPT_USE_ONLINE_COMPRESS.get()
+
+
 class CompressorBackend:
     def __init__(self):
         super().__init__()
         self.forward_metadata: DeepseekV4Metadata
-        assert (
-            not envs.SGLANG_OPT_USE_ONLINE_COMPRESS.get()
-        ), "online compress 128 not supported yet"
 
     # NOTE: Will be overridden
     def _maybe_upgrade_forward_metadata(self): ...
 
     def _get_paged_compress_metadata(self, compress_ratio: int) -> CompressMetadata:
         attr_name = f"c{compress_ratio}_compress_metadata"
-        metadata = getattr(self.forward_metadata, attr_name)
-        assert isinstance(metadata, (CompressorDecodePlan, CompressorPrefillPlan))
-        return metadata
+        return getattr(self.forward_metadata, attr_name)
 
     def _get_out_loc(self, compress_ratio: int) -> torch.Tensor:
-        core_metadata = self.forward_metadata.core_metadata
-        return (
-            core_metadata.c4_out_loc
-            if compress_ratio == 4
-            else core_metadata.c128_out_loc
-        )
+        attr_name = f"c{compress_ratio}_out_loc"
+        return getattr(self.forward_metadata.core_metadata, attr_name)
 
     def _forward_compress_all_in_one(
         self,
@@ -66,10 +62,14 @@ class CompressorBackend:
         assert rotate == is_indexer == (head_dim == 128)
 
         plan = self._get_paged_compress_metadata(compress_ratio)
-        coff = 2 if is_overlap_compress(compress_ratio) else 1
-        last_dim = 2 * head_dim * coff
-        assert kv_score_buffer.shape[-1] == last_dim
-        kv_score_buffer = kv_score_buffer.view(-1, compress_ratio, last_dim)
+        is_online = _use_online_compress(compress_ratio)
+        if is_online:
+            kv_score_buffer = kv_score_buffer.view(-1, 1, head_dim * 3)
+        else:
+            coff = 2 if is_overlap_compress(compress_ratio) else 1
+            last_dim = 2 * head_dim * coff
+            assert kv_score_buffer.shape[-1] == last_dim
+            kv_score_buffer = kv_score_buffer.view(-1, compress_ratio, last_dim)
         kv_compressed = compress_forward(
             kv_score_buffer=kv_score_buffer,
             kv_score_input=kv_score_input,
@@ -77,6 +77,7 @@ class CompressorBackend:
             plan=plan,
             compress_ratio=compress_ratio,
             head_dim=head_dim,
+            is_online=is_online,
         )
         # NOTE: we use some hack here...
         compress_norm_rope_store(
@@ -153,6 +154,20 @@ def create_paged_compressor_data(
     State-pool slot translation is done inside the C++ planner; the
     Python side just hands the relevant tensors over.
     """
+    if _use_online_compress(compress_ratio):
+        return _create_online_paged_compressor_data(
+            is_prefill=is_prefill,
+            token_to_kv_pool=token_to_kv_pool,
+            req_to_token=req_to_token,
+            req_pool_indices=req_pool_indices,
+            seq_lens=seq_lens,
+            extend_lens=extend_lens,
+            seq_lens_cpu=seq_lens_cpu,
+            extend_lens_cpu=extend_lens_cpu,
+            use_prefill_cuda_graph=use_prefill_cuda_graph,
+            num_q_tokens=num_q_tokens,
+        )
+
     swa_page_size = token_to_kv_pool.swa_page_size
     ring_size = token_to_kv_pool.get_ring_size(compress_ratio=compress_ratio)
     # NOTE: This is actually a proxy, which encounter some bug with tvm-ffi.
@@ -193,4 +208,57 @@ def create_paged_compressor_data(
             seq_lens=seq_lens.to(torch.int64),
             swa_page_size=swa_page_size,
             ring_size=ring_size,
+        )
+
+
+def _create_online_paged_compressor_data(
+    *,
+    is_prefill: bool,
+    token_to_kv_pool: DeepSeekV4TokenToKVPool,
+    req_to_token: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    seq_lens: torch.Tensor,
+    extend_lens: Optional[torch.Tensor],
+    seq_lens_cpu: Optional[List[int]],
+    extend_lens_cpu: Optional[List[int]],
+    use_prefill_cuda_graph: bool,
+    num_q_tokens: Optional[int],
+) -> CompressMetadata:
+    assert not use_prefill_cuda_graph, "online c128 doesn't support cuda graph"
+
+    swa_page_size = int(token_to_kv_pool.swa_page_size)
+    full_to_swa = token_to_kv_pool.full_to_swa_index_mapping.detach()
+    req_pool_indices = req_pool_indices.to(torch.int64)
+
+    if is_prefill:
+        # Sync-on-entry: catch IMA from a prior layer / kernel BEFORE we touch
+        # anything in this builder, so blame doesn't land on us spuriously.
+        assert extend_lens is not None
+        if seq_lens_cpu is not None:
+            assert extend_lens_cpu is not None
+            seq_lens_planner = torch.tensor(seq_lens_cpu, dtype=torch.int64)
+            extend_lens_planner = torch.tensor(extend_lens_cpu, dtype=torch.int64)
+            num_q_tokens_planner = sum(extend_lens_cpu)
+        else:
+            assert num_q_tokens is not None
+            seq_lens_planner = seq_lens.to(torch.int64)
+            extend_lens_planner = extend_lens.to(torch.int64)
+            num_q_tokens_planner = num_q_tokens
+
+        return CompressorPrefillPlan.generate_online(
+            seq_lens=seq_lens_planner,
+            extend_lens=extend_lens_planner,
+            req_pool_indices=req_pool_indices,
+            req_to_token=req_to_token,
+            full_to_swa=full_to_swa,
+            num_q_tokens=int(num_q_tokens_planner),
+            swa_page_size=swa_page_size,
+        )
+    else:
+        return CompressorDecodePlan.generate_online(
+            seq_lens=seq_lens.to(torch.int64),
+            req_pool_indices=req_pool_indices,
+            req_to_token=req_to_token,
+            full_to_swa=full_to_swa,
+            swa_page_size=swa_page_size,
         )
