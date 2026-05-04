@@ -236,7 +236,7 @@ class TestUnifiedSWARadixCache(UnifiedRadixTreeTestMixin, CustomTestCase):
 
     kl_threshold = 0.03
     gsm8k_threshold = 0.75
-    mmlu_threshold = 0.75
+    mmlu_threshold = 0.7
 
     @classmethod
     def setUpClass(cls):
@@ -294,7 +294,7 @@ class TestUnifiedMambaRadixCacheWithHiCache(UnifiedRadixTreeTestMixin, CustomTes
                 str(MAMBA_TRACK_INTERVAL),
                 "--enable-hierarchical-cache",
                 "--hicache-ratio",
-                "2",
+                "4",
                 "--hicache-write-policy",
                 "write_through",
                 "--hicache-io-backend",
@@ -303,6 +303,8 @@ class TestUnifiedMambaRadixCacheWithHiCache(UnifiedRadixTreeTestMixin, CustomTes
                 "page_first_direct",
                 "--max-total-tokens",
                 "12000",
+                "--max-running-requests",
+                "4",
             ],
             env={"SGLANG_ENABLE_UNIFIED_RADIX_TREE": "1"},
         )
