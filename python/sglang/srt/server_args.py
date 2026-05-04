@@ -1673,6 +1673,7 @@ class ServerArgs:
 
         if model_arch in [
             "DeepseekV3ForCausalLM",
+            "DeepseekV32ForCausalLM",
             "KimiK25ForConditionalGeneration",
             "MistralLarge3ForCausalLM",
             "PixtralForConditionalGeneration",
@@ -2142,46 +2143,11 @@ class ServerArgs:
                 support_mamba_cache=False,
             )
         elif model_arch in ["NemotronHForCausalLM"]:
-            model_config = self.get_model_config()
-            if model_config.quantization in [
-                "modelopt",
-                "modelopt_fp8",
-                "modelopt_fp4",
-                "modelopt_mixed",
-            ]:
-                assert model_config.hf_config.mlp_hidden_act == "relu2"
-                if model_config.quantization == "modelopt":
-                    quant_algo = model_config.hf_config.quantization_config[
-                        "quant_algo"
-                    ]
-                    if quant_algo == "MIXED_PRECISION":
-                        self.quantization = "modelopt_mixed"
-                    else:
-                        self.quantization = (
-                            "modelopt_fp4" if quant_algo == "NVFP4" else "modelopt_fp8"
-                        )
-                else:
-                    self.quantization = model_config.quantization
-                if self.moe_runner_backend == "auto":
-                    if is_sm100_supported() and self.moe_a2a_backend == "none":
-                        self.moe_runner_backend = "flashinfer_trtllm"
-                        logger.info(
-                            "Use flashinfer_trtllm as MoE runner backend on sm100 for "
-                            f"{model_arch}"
-                        )
-                    else:
-                        self.moe_runner_backend = "flashinfer_cutlass"
+            from sglang.srt.arg_groups.nemotron_h_hook import (
+                apply_nemotron_h_defaults,
+            )
 
-            self._handle_mamba_radix_cache(
-                model_arch=model_arch,
-                support_mamba_cache=True,
-                support_mamba_cache_extra_buffer=False,
-                sm100_default_attention_backend="flashinfer",
-            )
-            assert self.attention_backend != "triton", (
-                "NemotronHForCausalLM does not support triton attention backend,"
-                "as the first layer might not be an attention layer"
-            )
+            apply_nemotron_h_defaults(self, model_arch)
         elif model_arch in [
             "Qwen3MoeForCausalLM",
             "Qwen3VLMoeForConditionalGeneration",
@@ -3744,10 +3710,12 @@ class ServerArgs:
                         "--disaggregation-decode-enable-radix-cache is incompatible "
                         "with --enable-hisparse"
                     )
-                if self.disaggregation_transfer_backend != "nixl":
+                if self.disaggregation_transfer_backend not in ("nixl", "mooncake"):
                     raise ValueError(
                         "--disaggregation-decode-enable-radix-cache currently "
-                        "requires --disaggregation-transfer-backend nixl"
+                        "requires --disaggregation-transfer-backend in "
+                        "('nixl', 'mooncake'), but got "
+                        f"{self.disaggregation_transfer_backend!r}"
                     )
                 if self.speculative_algorithm is not None:
                     raise ValueError(
@@ -6453,7 +6421,7 @@ class ServerArgs:
         parser.add_argument(
             "--disaggregation-decode-enable-radix-cache",
             action="store_true",
-            help="Enable radix cache on decode server (PD mode). Caches KV prefixes to avoid redundant transfers. Requires --disaggregation-transfer-backend nixl and is incompatible with --enable-hisparse.",
+            help="Enable radix cache on decode server (PD mode). Caches KV prefixes to avoid redundant transfers. Requires --disaggregation-transfer-backend nixl or mooncake and is incompatible with --enable-hisparse.",
         )
         parser.add_argument(
             "--disaggregation-decode-enable-offload-kvcache",
