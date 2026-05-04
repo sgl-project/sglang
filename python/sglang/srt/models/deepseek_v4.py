@@ -1886,6 +1886,23 @@ class DeepseekV4DecoderLayer(nn.Module):
             # returned post should be [n, hc_mult]
             return y, post.squeeze(-1), comb
 
+        if envs.SGLANG_OPT_USE_AITER_MHC_PRE.get():
+            from aiter.ops.mhc import mhc_pre
+
+            post, comb, y = mhc_pre(
+                residual=x,
+                fn=hc_fn,
+                hc_scale=hc_scale,
+                hc_base=hc_base,
+                rms_eps=self.rms_norm_eps,
+                hc_pre_eps=self.hc_eps,
+                hc_sinkhorn_eps=self.hc_eps,
+                hc_post_mult_value=2.0,
+                sinkhorn_repeat=self.hc_sinkhorn_iters,
+            )
+            # returned post should be [n, hc_mult]
+            return y, post.squeeze(-1), comb
+
         if envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.get():
             # DeepGEMM implementation
             import deep_gemm
@@ -1940,6 +1957,14 @@ class DeepseekV4DecoderLayer(nn.Module):
             from sglang.srt.layers.mhc import mhc_post
 
             result = mhc_post(x, residual, post, comb)
+            return result
+
+        elif envs.SGLANG_OPT_USE_AITER_MHC_POST.get():
+            from aiter.ops.mhc import mhc_post
+
+            result = torch.empty_like(residual)
+            mhc_post(result, x, residual, post, comb)
+
             return result
 
         assert residual.shape == (x.shape[0], self.hc_mult, x.shape[-1])
