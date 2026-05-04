@@ -28,6 +28,7 @@ class DeviceTimer:
 
             self._intervals.popleft()
             self._reporter(t=interval.elapsed_time() / 1000.0, **interval.metadata)
+            # print(f"{interval.elapsed_time()=:.6f}, {interval.metadata=}")
 
 
 class GapTimer(DeviceTimer):

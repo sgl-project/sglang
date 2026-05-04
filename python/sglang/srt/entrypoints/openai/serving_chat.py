@@ -419,6 +419,7 @@ class OpenAIServingChat(OpenAIServingBase):
             image_max_dynamic_patch=img_max_dynamic_patch,
             video_max_dynamic_patch=vid_max_dynamic_patch,
             max_dynamic_patch=getattr(request, "max_dynamic_patch", None),
+            use_audio_in_video=getattr(request, "use_audio_in_video", False),
         )
 
         return adapted_request, request
@@ -433,6 +434,13 @@ class OpenAIServingChat(OpenAIServingBase):
 
         self._patch_mistral_skip_special_tokens(request)
 
+        thinking_mode = self._get_reasoning_from_request(request)
+        # SGLang's ReasonerGrammarBackend owns the reasoning prefix
+        # when --reasoning-parser is configured, so builtin xgrammar
+        # tags must describe only the post-reasoning tool-call suffix.
+        xgrammar_reasoning = thinking_mode and (
+            self.tokenizer_manager.server_args.reasoning_parser is not None
+        )
         tool_call_constraint = None
 
         # Apply chat template and its stop strings
@@ -452,6 +460,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 tool_call_constraint = parser.get_structure_constraint(
                     request.tool_choice,
                     parallel_tool_calls=request.parallel_tool_calls,
+                    thinking_mode=xgrammar_reasoning,
                 )
             # Fallback: use generic JSON schema for required/named tool choice
             # only when no parser-specific constraint was set
@@ -1404,9 +1413,14 @@ class OpenAIServingChat(OpenAIServingBase):
                 request.chat_template_kwargs is not None
                 and request.chat_template_kwargs.get("enable_thinking") is True
             )
-        if self.reasoning_parser in ["mistral"]:
-            # Mistral models only reason when reasoning_effort is explicitly
-            # set to a value other than None/"none" (typically "high").
+        if self.reasoning_parser == "hunyuan":
+            # Hy3-preview template emits no <think> when reasoning_effort is
+            # "no_think" / "none" / unset; forcing reasoning would route all
+            # output into reasoning_content.
+            return request.reasoning_effort not in (None, "none", "no_think")
+        if self.reasoning_parser == "mistral":
+            # Mistral only reasons when reasoning_effort is explicitly set
+            # to a non-"none" value (typically "high").
             return (
                 request.reasoning_effort is not None
                 and request.reasoning_effort != "none"

@@ -14,9 +14,10 @@ from __future__ import annotations
 import logging
 import os
 import pprint
+from collections import Counter
 from copy import deepcopy
 from dataclasses import MISSING, asdict, dataclass, field, fields
-from typing import Any, Optional
+from typing import Any, Optional, Union
 
 import PIL.Image
 import torch
@@ -32,10 +33,28 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import (
 )
 from sglang.multimodal_gen.runtime.utils.perf_logger import RequestMetrics
 from sglang.multimodal_gen.utils import align_to
+from sglang.srt.observability.trace import TraceNullContext, TraceReqContext
 
 logger = init_logger(__name__)
 
 SAMPLING_PARAMS_FIELDS = {f.name for f in fields(SamplingParams)}
+
+
+@dataclass
+class BatchMetricsWindow:
+    """Counters accumulated between dynamic batching metric logs.
+
+    `total_capacity` uses each dispatch's effective admission cap, so
+    utilization reflects model/config limits instead of only the user max.
+    """
+
+    dispatches: int = 0
+    total_requests: int = 0
+    total_capacity: int = 0
+    merged_dispatches: int = 0
+    full_dispatches: int = 0
+    wait_times_ms: list[float] = field(default_factory=list)
+    reject_reasons: Counter[str] = field(default_factory=Counter)
 
 
 @dataclass(init=False)
@@ -68,8 +87,13 @@ class Req:
     # Primary encoder embeddings
     prompt_embeds: list[torch.Tensor] | torch.Tensor = field(default_factory=list)
     negative_prompt_embeds: list[torch.Tensor] | None = None
-    prompt_attention_mask: list[torch.Tensor] | None = None
-    negative_attention_mask: list[torch.Tensor] | None = None
+    prompt_attention_mask: list[torch.Tensor | None] | None = None
+    negative_attention_mask: list[torch.Tensor | None] | None = None
+    # Masks and lengths aligned to postprocessed embeddings, one entry per text encoder.
+    prompt_embeds_mask: list[torch.Tensor | None] | None = None
+    negative_prompt_embeds_mask: list[torch.Tensor | None] | None = None
+    prompt_seq_lens: list[list[int]] | None = None
+    negative_prompt_seq_lens: list[list[int]] | None = None
     clip_embedding_pos: list[torch.Tensor] | None = None
     clip_embedding_neg: list[torch.Tensor] | None = None
 
@@ -128,6 +152,14 @@ class Req:
     timestep: torch.Tensor | float | int | None = None
     step_index: int | None = None
 
+    # request-local scheduler used by timestep/denoising stages.
+    # This is optional because the normal worker path executes one request at a time, so it can
+    # point at the stage-local scheduler and preserve warmup/device caches.
+    # Request-local cloned schedulers are only needed when a request can run
+    # concurrently with another request or outlive the stage-local scheduler
+    # state, such as grouped execution or disaggregation.
+    scheduler: Any | None = None
+
     eta: float = 0.0
     sigmas: list[float] | None = None
 
@@ -160,6 +192,11 @@ class Req:
 
     # stage logging
     metrics: Optional["RequestMetrics"] = None
+
+    # tracing context (TraceReqContext or TraceNullContext)
+    trace_ctx: Union[TraceReqContext, TraceNullContext] = field(
+        default_factory=TraceNullContext
+    )
 
     # results
     output: torch.Tensor | None = None
@@ -254,6 +291,13 @@ class Req:
         if self.output_path is None or not output_file_name:
             return None
         return os.path.join(self.output_path, output_file_name)
+
+    @property
+    def resolution_key(self) -> str | None:
+        """Return the batching config resolution key, e.g. "1024x1024"."""
+        if self.width is None or self.height is None:
+            return None
+        return f"{int(self.width)}x{int(self.height)}"
 
     def set_as_warmup(self, warmup_steps: int = 1):
         self.is_warmup = True
@@ -351,6 +395,7 @@ class OutputBatch:
 
     # logged metrics info, directly from Req.timings
     metrics: Optional["RequestMetrics"] = None
+    metrics_list: Optional[list[Optional["RequestMetrics"]]] = None
 
     # For ComfyUI integration: noise prediction from denoising stage
     noise_pred: torch.Tensor | None = None

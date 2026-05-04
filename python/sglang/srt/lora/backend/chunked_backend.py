@@ -113,20 +113,21 @@ class ChunkedSgmvLoRABackend(BaseLoRABackend):
         output_offset: torch.Tensor,
         max_qkv_out_dim: int,
         base_output: torch.Tensor = None,
+        n_slices: int = 3,
         *args,
         **kwargs,
     ) -> torch.Tensor:
 
         # x: (s, input_dim)
-        # qkv_lora_a: (num_lora, 3 * r, input_dim)
-        # qkv_lora_b: (num_lora, output_dim_q + 2 * output_dim_kv, r)
+        # qkv_lora_a: (num_lora, n_slices * r, input_dim)
+        # qkv_lora_b: (num_lora, total_output_dim, r)
         assert isinstance(qkv_lora_b, torch.Tensor)
 
         lora_a_output = chunked_sgmv_lora_shrink_forward(
             x=x,
             weights=qkv_lora_a,
             batch_info=self.batch_info,
-            num_slices=3,
+            num_slices=n_slices,
         )
         lora_output = chunked_sgmv_lora_expand_forward(
             x=lora_a_output,
@@ -202,6 +203,18 @@ class ChunkedSgmvLoRABackend(BaseLoRABackend):
             chunk_size = 16
         return min(self.max_chunk_size, chunk_size)
 
+    @staticmethod
+    def _build_req_seg_indptr(forward_batch: ForwardBatch) -> torch.Tensor:
+        """Build per-request cumulative token boundaries on CPU (pinned)."""
+        bs = forward_batch.batch_size
+        if forward_batch.forward_mode.is_decode():
+            indptr = torch.arange(bs + 1, dtype=torch.int32, pin_memory=True)
+        else:
+            seg_lens = generate_sequence_lengths(forward_batch, device="cpu")
+            indptr = torch.zeros(bs + 1, dtype=torch.int32, pin_memory=True)
+            torch.cumsum(seg_lens, dim=0, out=indptr[1:])
+        return indptr
+
     def init_cuda_graph_batch_info(
         self,
         max_bs_in_cuda_graph: int,
@@ -223,6 +236,8 @@ class ChunkedSgmvLoRABackend(BaseLoRABackend):
                 scalings=torch.zeros(self.max_loras_per_batch, dtype=torch.float),
                 num_segments=None,  # Set per batch
                 max_len=None,  # Not used in CSGMV backend
+                req_seg_indptr=torch.zeros(max_bs_in_cuda_graph + 1, dtype=torch.int32),
+                req_weight_indices=torch.zeros(max_bs_in_cuda_graph, dtype=torch.int32),
             )
 
     def prepare_lora_batch(
@@ -253,9 +268,15 @@ class ChunkedSgmvLoRABackend(BaseLoRABackend):
             scalings, dtype=torch.float, pin_memory=True, device="cpu"
         )
 
+        bs = forward_batch.batch_size
+        req_wi_tensor = torch.tensor(
+            weight_indices, dtype=torch.int32, pin_memory=True, device="cpu"
+        )
+        req_seg_indptr_cpu = self._build_req_seg_indptr(forward_batch)
+
         if not use_cuda_graph:
             batch_info = LoRABatchInfo(
-                bs=forward_batch.batch_size,
+                bs=bs,
                 num_segments=num_segments,
                 max_len=chunk_size,
                 use_cuda_graph=False,
@@ -274,12 +295,17 @@ class ChunkedSgmvLoRABackend(BaseLoRABackend):
                 permutation=torch.empty(
                     (len(permutation),), dtype=torch.int32, device=self.device
                 ),
-                # Not used in chunked kernels
                 seg_lens=None,
+                req_seg_indptr=torch.empty(
+                    (bs + 1,), dtype=torch.int32, device=self.device
+                ),
+                req_weight_indices=torch.empty(
+                    (bs,), dtype=torch.int32, device=self.device
+                ),
             )
         else:
             batch_info = self.cuda_graph_batch_info
-            batch_info.bs = forward_batch.batch_size
+            batch_info.bs = bs
             batch_info.num_segments = num_segments
             batch_info.max_len = chunk_size
 
@@ -295,6 +321,8 @@ class ChunkedSgmvLoRABackend(BaseLoRABackend):
         )
         batch_info.seg_indptr[: num_segments + 1].copy_(seg_indptr, non_blocking=True)
         batch_info.permutation[: len(permutation)].copy_(permutation, non_blocking=True)
+        batch_info.req_seg_indptr[: bs + 1].copy_(req_seg_indptr_cpu, non_blocking=True)
+        batch_info.req_weight_indices[:bs].copy_(req_wi_tensor, non_blocking=True)
 
         self.batch_info = batch_info
         self.lm_head_batch_info, self.lm_head_pass_batch_infos = (

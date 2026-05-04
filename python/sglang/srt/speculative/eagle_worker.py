@@ -71,12 +71,14 @@ from sglang.srt.utils import (
     empty_context,
     get_available_gpu_memory,
     is_cuda,
+    is_musa,
     is_npu,
     next_power_of_2,
 )
 from sglang.srt.utils.patch_torch import monkey_patch_torch_reductions
 
 _is_npu = is_npu()
+_is_musa = is_musa()
 
 if is_cuda():
     from sgl_kernel import segment_packbits  # noqa: F401
@@ -270,6 +272,7 @@ class EAGLEWorker(TpModelWorker):
         Device2DraftCudaGraphRunner = {
             "npu": EAGLEDraftNpuGraphRunner,
             "cuda": EAGLEDraftCudaGraphRunner,
+            "musa": EAGLEDraftCudaGraphRunner,
         }
         # Capture draft
         if self.speculative_num_steps > 1:
@@ -461,7 +464,7 @@ class EAGLEWorker(TpModelWorker):
             return GenerationBatchResult(
                 logits_output=logits_output,
                 next_token_ids=next_token_ids,
-                num_accepted_tokens=0,
+                num_accepted_drafts=0,
                 can_run_cuda_graph=can_run_cuda_graph,
             )
         else:
@@ -481,7 +484,7 @@ class EAGLEWorker(TpModelWorker):
 
             if get_global_tracing_enabled():
                 for idx, req in enumerate(batch.reqs):
-                    accepted = verify_output.accept_length_per_req_cpu[idx]
+                    accepted = verify_output.num_accepted_drafts_per_req_cpu[idx]
                     req.time_stats.set_spec_verify_end_time(accepted_tokens=accepted)
 
             set_time_batch(
@@ -506,13 +509,15 @@ class EAGLEWorker(TpModelWorker):
 
             controller = getattr(self, "adaptive_controller", None)
             if controller is not None:
-                controller.on_verify_complete(verify_output.accept_length_per_req_cpu)
+                controller.on_verify_complete(
+                    verify_output.num_accepted_drafts_per_req_cpu
+                )
 
             return GenerationBatchResult(
                 logits_output=logits_output,
                 next_token_ids=verify_output.verified_id,
-                num_accepted_tokens=sum(verify_output.accept_length_per_req_cpu),
-                accept_length_per_req_cpu=verify_output.accept_length_per_req_cpu,
+                num_accepted_drafts=sum(verify_output.num_accepted_drafts_per_req_cpu),
+                num_accepted_drafts_per_req_cpu=verify_output.num_accepted_drafts_per_req_cpu,
                 can_run_cuda_graph=can_run_cuda_graph,
             )
 
@@ -706,7 +711,7 @@ class EAGLEWorker(TpModelWorker):
     def _draft_preprocess_idle(self, batch: ScheduleBatch):
         batch.spec_info = EagleDraftInput.create_idle_input(
             device=self.device,
-            hidden_size=self.model_config.hidden_size,
+            hidden_size=self.model_config.spec_hidden_size,
             dtype=self.model_config.dtype,
             topk=self.topk,
             capture_hidden_mode=CaptureHiddenMode.LAST,
@@ -763,9 +768,9 @@ class EAGLEWorker(TpModelWorker):
         (
             tree_mask,
             position,
-            retrive_index,
-            retrive_next_token,
-            retrive_next_sibling,
+            retrieve_index,
+            retrieve_next_token,
+            retrieve_next_sibling,
             draft_tokens,
         ) = build_tree_kernel_efficient(
             spec_info.verified_id,
@@ -783,10 +788,10 @@ class EAGLEWorker(TpModelWorker):
             draft_token=draft_tokens,
             custom_mask=tree_mask,
             positions=position,
-            retrive_index=retrive_index,
-            retrive_next_token=retrive_next_token,
-            retrive_next_sibling=retrive_next_sibling,
-            retrive_cum_len=None,
+            retrieve_index=retrieve_index,
+            retrieve_next_token=retrieve_next_token,
+            retrieve_next_sibling=retrieve_next_sibling,
+            retrieve_cum_len=None,
             spec_steps=self.speculative_num_steps,
             topk=self.topk,
             draft_token_num=self.speculative_num_draft_tokens,
@@ -897,10 +902,10 @@ class EAGLEWorker(TpModelWorker):
         assert model_worker_batch.capture_hidden_mode == spec_info.capture_hidden_mode
 
         if batch.has_grammar:
-            retrieve_next_token_cpu = spec_info.retrive_next_token.cpu()
-            retrieve_next_sibling_cpu = spec_info.retrive_next_sibling.cpu()
+            retrieve_next_token_cpu = spec_info.retrieve_next_token.cpu()
+            retrieve_next_sibling_cpu = spec_info.retrieve_next_sibling.cpu()
             draft_tokens_cpu = spec_info.draft_token.view(
-                spec_info.retrive_next_token.shape
+                spec_info.retrieve_next_token.shape
             ).cpu()
 
         # Forward
@@ -927,7 +932,7 @@ class EAGLEWorker(TpModelWorker):
 
             if vocab_mask is not None:
                 assert spec_info.grammar is not None
-                vocab_mask = vocab_mask.to(spec_info.retrive_next_token.device)
+                vocab_mask = vocab_mask.to(spec_info.retrieve_next_token.device)
                 # NOTE (sk): otherwise, this vocab mask will be the one from the previous extend stage
                 # and will be applied to produce wrong results
                 batch.sampling_info.vocab_mask = None
@@ -985,7 +990,7 @@ class EAGLEWorker(TpModelWorker):
 
         accepted_length = (
             torch.tensor(
-                res.accept_length_per_req_cpu,
+                res.num_accepted_drafts_per_req_cpu,
                 device=logits_output.hidden_states.device,
                 dtype=torch.int64,
             )
@@ -1099,7 +1104,8 @@ class EAGLEWorker(TpModelWorker):
         seq_lens_backup = batch.seq_lens.clone()
         seq_lens_cpu_backup = batch.seq_lens_cpu.clone()
         req_pool_indices_backup = batch.req_pool_indices
-        accept_length_backup = batch.spec_info.accept_length.clone()
+        num_accepted_drafts_backup = batch.spec_info.num_accepted_drafts.clone()
+        num_accepted_tokens_backup = batch.spec_info.num_accepted_tokens.clone()
         return_logprob_backup = batch.return_logprob
 
         input_is_idle = batch.forward_mode.is_idle()
@@ -1111,7 +1117,7 @@ class EAGLEWorker(TpModelWorker):
                 self.model_config.hidden_size * 3
                 if self.speculative_algorithm.is_eagle3()
                 and self.eagle_use_aux_hidden_state
-                else self.model_config.hidden_size
+                else self.model_config.spec_hidden_size
             )
             batch.spec_info = EagleDraftInput.create_idle_input(
                 device=self.device,
@@ -1185,7 +1191,8 @@ class EAGLEWorker(TpModelWorker):
         batch.seq_lens = seq_lens_backup
         batch.seq_lens_cpu = seq_lens_cpu_backup
         batch.req_pool_indices = req_pool_indices_backup
-        batch.spec_info.accept_length = accept_length_backup
+        batch.spec_info.num_accepted_drafts = num_accepted_drafts_backup
+        batch.spec_info.num_accepted_tokens = num_accepted_tokens_backup
         batch.return_logprob = return_logprob_backup
 
     def capture_for_decode(
@@ -1214,7 +1221,7 @@ class EAGLEWorker(TpModelWorker):
         return success, message
 
 
-@torch.compile(dynamic=True, disable=_is_npu)
+@torch.compile(dynamic=True, disable=(_is_npu or _is_musa))
 def get_last_loc_large_page_size_top_k_1(
     req_to_token: torch.Tensor,
     req_pool_indices: torch.Tensor,
