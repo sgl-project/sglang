@@ -3,11 +3,16 @@ import io
 import logging
 import re
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 import soundfile as sf
+from fastapi import Request
 
+from sglang.srt.entrypoints.openai.transcription_adapters.base import (
+    TranscriptionAdapter,
+)
 from sglang.srt.managers.io_struct import GenerateReqInput
+from sglang.srt.managers.tokenizer_manager import TokenizerManager
 
 logger = logging.getLogger(__name__)
 
@@ -120,13 +125,13 @@ def normalize_whitespace(text: str) -> str:
 
 
 async def process_asr_chunk(
-    tokenizer_manager,
-    adapter,
+    tokenizer_manager: TokenizerManager,
+    adapter: TranscriptionAdapter,
     state: StreamingASRState,
     audio_data: bytes,
-    sampling_params: dict,
+    sampling_params: Dict[str, Any],
     is_last: bool,
-    raw_request=None,
+    raw_request: Optional[Request] = None,
     routing_key: Optional[str] = None,
 ) -> str:
     """Run inference on one audio chunk. Shared by the HTTP and WebSocket paths."""

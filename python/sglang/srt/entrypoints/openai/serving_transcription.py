@@ -69,6 +69,11 @@ class OpenAIServingTranscription(OpenAIServingBase):
         self._adapter = resolve_adapter(
             getattr(model_config.hf_config, "architectures", [])
         )
+        # Cap concurrent /v1/realtime sessions. The Semaphore is bound to the
+        # event loop on first acquire (uvicorn's loop in normal serving).
+        self._session_semaphore = asyncio.Semaphore(
+            tokenizer_manager.server_args.asr_max_concurrent_sessions
+        )
 
     def _request_id_prefix(self) -> str:
         return "trsc-"
@@ -346,5 +351,10 @@ class OpenAIServingTranscription(OpenAIServingBase):
         yield "data: [DONE]\n\n"
 
     async def handle_websocket(self, websocket: WebSocket) -> None:
-        """Handle a Realtime transcription session over WebSocket."""
-        await handle_realtime_transcription(websocket, self)
+        await handle_realtime_transcription(
+            websocket,
+            tokenizer_manager=self.tokenizer_manager,
+            adapter=self._adapter,
+            server_args=self.tokenizer_manager.server_args,
+            session_semaphore=self._session_semaphore,
+        )

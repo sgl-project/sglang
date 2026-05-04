@@ -449,6 +449,7 @@ class ServerArgs:
     tool_server: Optional[str] = None
     sampling_defaults: str = "model"
     asr_max_buffer_seconds: int = 60
+    asr_max_concurrent_sessions: int = 32
 
     # Data parallelism
     dp_size: int = 1
@@ -4028,6 +4029,11 @@ class ServerArgs:
                 f"--asr-max-buffer-seconds must be positive "
                 f"(got {self.asr_max_buffer_seconds})."
             )
+        if self.asr_max_concurrent_sessions <= 0:
+            raise ValueError(
+                f"--asr-max-concurrent-sessions must be positive "
+                f"(got {self.asr_max_concurrent_sessions})."
+            )
 
     def _handle_other_validations(self):
         # Handle model inference tensor dump.
@@ -5002,6 +5008,15 @@ class ServerArgs:
             "will accumulate before closing the session with a buffer_overflow "
             "error. Guards against OOM when a client streams audio faster than "
             "inference can consume it. Default 60s.",
+        )
+        parser.add_argument(
+            "--asr-max-concurrent-sessions",
+            type=int,
+            default=ServerArgs.asr_max_concurrent_sessions,
+            help="Maximum number of concurrent realtime ASR WebSocket sessions "
+            "served by /v1/realtime. New connections beyond this cap are "
+            "accepted, sent an error{code:too_many_sessions} frame, and closed. "
+            "Default 32.",
         )
 
         # Data parallelism

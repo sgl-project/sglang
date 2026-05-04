@@ -1,42 +1,28 @@
-"""WebSocket transport for OpenAI Realtime API-style transcription.
+"""WebSocket transport for OpenAI Realtime transcription mode.
 
-Protocol:
-    Client -> Server:
-        {"type": "session.start"}                                              # minimum
-        {"type": "session.start", "model": "<model-name>", "language": "en"}   # with hints
-        <binary PCM16 frame>     # 16 kHz mono LE, length must be % 2 == 0
-        {"type": "session.end"}
-    Server -> Client:
-        {"type": "session.started", "session_id": "sess_...", "model": "<model-name>"}
-        {"type": "transcript.delta", "delta": "hello"}
-        {"type": "transcript.final", "text": "hello world", "duration_sec": 1.0,
-         "model": "<model-name>"}
-        {"type": "error", "code": "invalid_state", "message": "..."}
+Endpoint: ``WS /v1/realtime``
+https://platform.openai.com/docs/guides/realtime-transcription
 
-The ``model`` field is echoed back unchanged; sglang serves a single model
-per process, so this field exists for client convenience and does not affect
-routing. ``language`` is an ISO 639-1 hint (e.g. ``"en"``, ``"zh"``) and is
-adapter-specific — adapters that ignore language hints will not be affected.
-
-This protocol is sglang-specific; it does not align with OpenAI's Realtime
-API spec (vLLM's ``/v1/realtime``). Clients written against OpenAI Realtime
-will not work as-is. See ``test/manual/models/test_qwen3_asr.py`` for a
-reference client and the Pydantic event models below for full schema.
+Notable deviations: ``audio.input.sample_rate`` accepts 16/24/48 kHz with
+internal resample to 16 kHz; ``turn_detection`` and ``noise_reduction``
+must be ``null`` (no server-side VAD); ``include[]`` is dropped; the
+model field is echo-only.
 """
 
 from __future__ import annotations
 
+import asyncio
+import base64
 import io
 import json
 import logging
 import uuid
-from typing import TYPE_CHECKING, List, Optional
+from typing import Any, Dict, List, Optional
 
+import librosa
 import numpy as np
 import soundfile as sf
 from fastapi import WebSocket, WebSocketDisconnect
-from pydantic import BaseModel, ValidationError
-from typing_extensions import Literal
 
 from sglang.srt.entrypoints.openai.protocol import TranscriptionRequest
 from sglang.srt.entrypoints.openai.streaming_asr import (
@@ -44,272 +30,270 @@ from sglang.srt.entrypoints.openai.streaming_asr import (
     normalize_whitespace,
     process_asr_chunk,
 )
-
-if TYPE_CHECKING:
-    from sglang.srt.entrypoints.openai.serving_transcription import (
-        OpenAIServingTranscription,
-    )
+from sglang.srt.entrypoints.openai.transcription_adapters.base import (
+    TranscriptionAdapter,
+)
+from sglang.srt.managers.tokenizer_manager import TokenizerManager
+from sglang.srt.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
 
 
-# Realtime transcription protocol-fixed audio format: PCM16, 16 kHz, mono, LE.
-_SAMPLE_RATE = 16000
-_SAMPLE_WIDTH = 2  # bytes per sample (int16)
-_BYTES_PER_SECOND = _SAMPLE_RATE * _SAMPLE_WIDTH
+_MODEL_SAMPLE_RATE = 16000
+_SAMPLE_WIDTH = 2
+# pcm_buffer is always at the model rate (incoming frames are resampled
+# in _on_audio_append) so all buffer math is rate-independent.
+_BYTES_PER_SECOND = _MODEL_SAMPLE_RATE * _SAMPLE_WIDTH
+_DEFAULT_INPUT_SAMPLE_RATE = 24000  # OpenAI default for audio/pcm
+_SUPPORTED_INPUT_SAMPLE_RATES = (16000, 24000, 48000)
 
 
-def _pcm_to_wav(pcm_buffer: bytes) -> bytes:
-    """Wrap raw PCM16 mono 16 kHz bytes in a WAV container so
-    ``soundfile.read`` (called by the multimodal processor) can decode it.
+def _resample_to_model_rate(pcm: bytes, src_rate: int) -> bytes:
+    # assumes int16 LE per audio/pcm spec. Normalize by 2^15 (so int16
+    # maps to [-1, 1]); re-encode by 2^15 - 1 so a clipped 1.0 stays in
+    # int16 range.
+    if src_rate == _MODEL_SAMPLE_RATE or not pcm:
+        return pcm
+    samples = np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32768.0
+    samples = librosa.resample(samples, orig_sr=src_rate, target_sr=_MODEL_SAMPLE_RATE)
+    return (np.clip(samples, -1.0, 1.0) * 32767.0).astype(np.int16).tobytes()
 
-    Note: callers re-encode the entire cumulative buffer per chunk (M1
-    constraint). Cost is bounded by ``--asr-max-buffer-seconds``; M2 plans
-    RadixCache prefix caching to remove this overhead.
-    """
-    if not pcm_buffer:
-        raise ValueError("pcm_buffer is empty")
-    samples = np.frombuffer(pcm_buffer, dtype=np.int16)
+
+def _pcm_to_wav(pcm: bytes) -> bytes:
+    if not pcm:
+        raise ValueError("pcm is empty")
+    samples = np.frombuffer(pcm, dtype=np.int16)
     buf = io.BytesIO()
-    sf.write(buf, samples, _SAMPLE_RATE, format="WAV")
+    sf.write(buf, samples, _MODEL_SAMPLE_RATE, format="WAV")
     return buf.getvalue()
 
 
-# ---- Client -> Server events ----
-
-
-class SessionStartEvent(BaseModel):
-    type: Literal["session.start"] = "session.start"
-    model: Optional[str] = None
-    language: Optional[str] = None
-
-
-class SessionEndEvent(BaseModel):
-    type: Literal["session.end"] = "session.end"
-
-
-# ---- Server -> Client events ----
-
-
-class SessionStartedEvent(BaseModel):
-    type: Literal["session.started"] = "session.started"
-    session_id: str
-    model: Optional[str] = None
-
-
-class TranscriptDeltaEvent(BaseModel):
-    type: Literal["transcript.delta"] = "transcript.delta"
-    delta: str
-
-
-class TranscriptFinalEvent(BaseModel):
-    type: Literal["transcript.final"] = "transcript.final"
-    text: str
-    duration_sec: float
-    model: Optional[str] = None
-
-
-class ErrorEvent(BaseModel):
-    type: Literal["error"] = "error"
-    code: str
-    message: str
-
-
-def _format_validation_error(e: ValidationError) -> str:
-    """Compact summary of Pydantic validation errors for the error event."""
-    parts = []
-    for err in e.errors():
-        loc = ".".join(str(x) for x in err["loc"] if x != "type")
-        parts.append(f"{loc}: {err['msg']}" if loc else err["msg"])
-    return "; ".join(parts) or "Invalid payload"
-
-
 class RealtimeConnection:
-    """Manages a single WebSocket transcription session.
+    """One realtime transcription session.
 
-    Single-task: receive and inference share one coroutine; PCM queues in
-    OS buffers during inference (capped by ``asr_max_buffer_seconds``).
-    ``session.end`` is therefore serialized after any in-flight chunk.
+    Single-task: a single coroutine alternates receive + inference. Frames
+    that arrive during inference queue at the WS transport (asyncio + TCP)
+    and only land in pcm_buffer after inference returns;
+    --asr-max-buffer-seconds bounds the catch-up.
     """
 
     def __init__(
-        self, websocket: WebSocket, serving: OpenAIServingTranscription
+        self,
+        websocket: WebSocket,
+        tokenizer_manager: TokenizerManager,
+        adapter: TranscriptionAdapter,
+        server_args: ServerArgs,
     ) -> None:
         self.websocket = websocket
-        self.serving = serving
-        self.session_id = f"sess_{uuid.uuid4().hex[:12]}"
-        # Initialized in ``_init`` once the adapter has accepted the session.
-        self.state: Optional[StreamingASRState] = None
-        self.chunk_size_bytes = 0
-        self.max_buffer_bytes = 0
-        self.max_buffer_seconds = 0
-        # Per-session mutable state.
-        self.pcm_buffer: bytearray = bytearray()
-        self.last_inference_offset = 0
-        self.total_audio_bytes = 0
-        self.started = False
-        self.emitted_words: List[str] = []
-        self.sampling_params: Optional[dict] = None
-        self.model: Optional[str] = None
+        self.tokenizer_manager = tokenizer_manager
+        self.adapter = adapter
+        self.server_args = server_args
+        self.session_id = f"sess_{uuid.uuid4().hex[:24]}"
+
+        self.input_sample_rate = _DEFAULT_INPUT_SAMPLE_RATE
         self.language: Optional[str] = None
+        self.client_model: Optional[str] = None
+        self.sampling_params: Optional[Dict[str, Any]] = None
+        self.session_configured = False
+        self._current_client_event_id: Optional[str] = None
 
-    @property
-    def has_new_audio(self) -> bool:
-        return len(self.pcm_buffer) > self.last_inference_offset
+        self.state: Optional[StreamingASRState] = None
+        self.pcm_buffer = bytearray()
+        self.last_inference_offset = 0
+        self.emitted_words: List[str] = []
+        self.current_item_id = f"item_{uuid.uuid4().hex[:24]}"
+        self.previous_item_id: Optional[str] = None
 
-    @property
-    def should_trigger_inference(self) -> bool:
-        return (
-            len(self.pcm_buffer) - self.last_inference_offset >= self.chunk_size_bytes
-        )
-
-    @property
-    def duration_sec(self) -> float:
-        return round(self.total_audio_bytes / _BYTES_PER_SECOND, 2)
+        self.max_buffer_seconds = server_args.asr_max_buffer_seconds
+        self.max_buffer_bytes = self.max_buffer_seconds * _BYTES_PER_SECOND
 
     async def handle(self) -> None:
-        """Public entry point. Runs the full session lifecycle."""
-        if not await self._init():
+        if not self.adapter.supports_chunked_streaming:
+            await self._send_error(
+                "not_supported", "Model does not support streaming ASR"
+            )
             return
+
+        await self._send_session("session.created", configured=False)
+
         try:
             await self._run_loop()
         except WebSocketDisconnect:
-            logger.info(
-                f"[realtime_transcription] client disconnected: {self.session_id}"
-            )
+            logger.info("[realtime] client disconnected: %s", self.session_id)
         except Exception:
-            logger.exception(
-                f"[realtime_transcription] unrecoverable error: {self.session_id}"
-            )
+            logger.exception("[realtime] unrecoverable error: %s", self.session_id)
             try:
-                await self._send_error("internal_error", "Internal server error")
-            except (WebSocketDisconnect, RuntimeError):
-                pass
-        finally:
-            await self._safe_close()
-
-    async def _init(self) -> bool:
-        """Accept the WebSocket and initialize per-session state.
-
-        Returns False if the adapter does not support chunked streaming;
-        the WS handshake is still accepted so the client receives an
-        ``unsupported_model`` error event before close.
-        """
-        adapter = self.serving._adapter
-        if not adapter.supports_chunked_streaming:
-            try:
-                await self.websocket.accept()
                 await self._send_error(
-                    "unsupported_model", "Model does not support streaming ASR"
+                    "server_error",
+                    "Internal server error",
+                    error_type="server_error",
                 )
             except (WebSocketDisconnect, RuntimeError):
                 pass
-            await self._safe_close()
-            return False
-
-        self.state = StreamingASRState(**adapter.chunked_streaming_config)
-        max_buffer_seconds = (
-            self.serving.tokenizer_manager.server_args.asr_max_buffer_seconds
-        )
-        self.chunk_size_bytes = int(self.state.chunk_size_sec * _BYTES_PER_SECOND)
-        self.max_buffer_bytes = max_buffer_seconds * _BYTES_PER_SECOND
-        self.max_buffer_seconds = max_buffer_seconds
-        await self.websocket.accept()
-        return True
 
     async def _run_loop(self) -> None:
-        """Main receive/dispatch loop. Returns when session should terminate."""
         while True:
+            self._current_client_event_id = None
             message = await self.websocket.receive()
             if message["type"] == "websocket.disconnect":
                 return
 
             text = message.get("text")
-            data = message.get("bytes")
-            if text:
-                if await self._on_control(text):
-                    return
-            elif data:
-                if await self._on_audio_frame(data):
-                    return
+            if not text:
+                if message.get("bytes") is not None:
+                    await self._send_error(
+                        "invalid_payload",
+                        "Binary frames are not supported on /v1/realtime; "
+                        "use input_audio_buffer.append with base64 audio.",
+                    )
+                continue
 
-    async def _on_control(self, text: str) -> bool:
-        """Dispatch a JSON control message. Returns True if session should end."""
-        try:
-            ctrl = json.loads(text)
-        except json.JSONDecodeError:
-            await self._send_error("invalid_json", "Invalid JSON")
-            return False
-        if not isinstance(ctrl, dict):
-            await self._send_error(
-                "invalid_payload", "Control message must be a JSON object"
-            )
-            return False
-
-        msg_type = ctrl.get("type", "")
-        if msg_type == "session.start":
             try:
-                event = SessionStartEvent.model_validate(ctrl)
-            except ValidationError as e:
-                await self._send_error("invalid_payload", _format_validation_error(e))
-                return False
-            await self._on_session_start(event)
-            return False
-        if msg_type == "session.end":
-            await self._on_session_end()
-            return True  # session.end always terminates the loop
+                event = json.loads(text)
+            except json.JSONDecodeError:
+                await self._send_error("invalid_payload", "Invalid JSON")
+                continue
+            if not isinstance(event, dict):
+                await self._send_error(
+                    "invalid_payload", "Top-level event must be a JSON object"
+                )
+                continue
 
-        await self._send_error("unknown_message", f"Unknown message type: {msg_type}")
+            self._current_client_event_id = event.get("event_id")
+            evt_type = event.get("type", "")
+            terminate = await self._dispatch(evt_type, event)
+            if terminate:
+                return
+
+    async def _dispatch(self, evt_type: str, raw: Dict[str, Any]) -> bool:
+        """Route one client event. Returns True iff the session should terminate."""
+        if evt_type == "session.update":
+            await self._on_session_update(raw)
+        elif evt_type == "input_audio_buffer.append":
+            return await self._on_audio_append(raw)
+        elif evt_type == "input_audio_buffer.commit":
+            await self._on_audio_commit()
+        elif evt_type == "input_audio_buffer.clear":
+            await self._on_audio_clear()
+        else:
+            await self._send_error("unknown_event", f"Unknown event type: {evt_type!r}")
         return False
 
-    async def _on_session_start(self, event: SessionStartEvent) -> None:
-        if self.started:
-            await self._send_error("invalid_state", "Session already started")
-            return
-
-        self.model = event.model
-        self.language = event.language
-        adapter = self.serving._adapter
-        self.sampling_params = adapter.build_sampling_params(
-            TranscriptionRequest(language=event.language)
-            if event.language
-            else TranscriptionRequest()
-        )
-        self.started = True
-        await self._send(
-            SessionStartedEvent(session_id=self.session_id, model=self.model)
-        )
-
-    async def _on_session_end(self) -> None:
-        if not self.started:
-            await self._send_error("invalid_state", "No active session")
-            return
-
-        if self.has_new_audio:
-            await self._run_inference(is_last=True)
-        elif self.state.full_transcript:
-            # Audio length was an exact multiple of chunk_size_bytes; flush any
-            # tokens update() held back without running another inference.
-            tail = self.state.finalize()
-            await self._emit_delta(tail)
-
-        await self._send(
-            TranscriptFinalEvent(
-                # Re-normalize: punctuation can arrive as its own word, leaving
-                # an orphan space before it after " ".join().
-                text=normalize_whitespace(" ".join(self.emitted_words)),
-                duration_sec=self.duration_sec,
-                model=self.model,
-            )
-        )
-
-    async def _on_audio_frame(self, data: bytes) -> bool:
-        """Append an audio frame and maybe trigger inference. Returns True on overflow."""
-        if not self.started:
+    async def _on_session_update(self, raw: Dict[str, Any]) -> None:
+        cfg = raw.get("session") or {}
+        if not isinstance(cfg, dict):
             await self._send_error(
-                "invalid_state", "Send session.start before streaming audio"
+                "invalid_value",
+                "session must be a JSON object",
+                param="session",
+            )
+            return
+
+        sess_type = cfg.get("type")
+        if sess_type is not None and sess_type != "transcription":
+            await self._send_error(
+                "invalid_value",
+                f"session.type must be 'transcription', got {sess_type!r}",
+                param="session.type",
+            )
+            return
+
+        audio = (cfg.get("audio") or {}).get("input") or {}
+
+        fmt = audio.get("format")
+        if fmt and fmt != "audio/pcm":
+            await self._send_error(
+                "invalid_value",
+                f"audio.input.format must be 'audio/pcm', got {fmt!r}",
+                param="session.audio.input.format",
+            )
+            return
+
+        sample_rate = audio.get("sample_rate")
+        if sample_rate is not None:
+            if sample_rate not in _SUPPORTED_INPUT_SAMPLE_RATES:
+                await self._send_error(
+                    "invalid_value",
+                    f"audio.input.sample_rate must be one of "
+                    f"{_SUPPORTED_INPUT_SAMPLE_RATES}, got {sample_rate}",
+                    param="session.audio.input.sample_rate",
+                )
+                return
+            self.input_sample_rate = sample_rate
+        else:
+            self.input_sample_rate = _DEFAULT_INPUT_SAMPLE_RATE
+
+        if audio.get("turn_detection") is not None:
+            await self._send_error(
+                "not_supported",
+                "Server-side VAD is not implemented; "
+                "set audio.input.turn_detection: null and commit explicitly.",
+                param="session.audio.input.turn_detection",
+            )
+            return
+
+        if audio.get("noise_reduction") is not None:
+            await self._send_error(
+                "not_supported",
+                "audio.input.noise_reduction is not supported; set to null.",
+                param="session.audio.input.noise_reduction",
+            )
+            return
+
+        transcription = audio.get("transcription") or {}
+        if transcription.get("prompt") is not None:
+            await self._send_error(
+                "not_supported",
+                "audio.input.transcription.prompt is not supported.",
+                param="session.audio.input.transcription.prompt",
+            )
+            return
+
+        self.client_model = transcription.get("model")
+        self.language = transcription.get("language")
+
+        if self.state is None:
+            self.state = StreamingASRState(**self.adapter.chunked_streaming_config)
+
+        self.sampling_params = self.adapter.build_sampling_params(
+            TranscriptionRequest(language=self.language)
+        )
+
+        self.session_configured = True
+        if self.input_sample_rate != _MODEL_SAMPLE_RATE:
+            logger.info(
+                "[realtime] %s configured: resample %d→%d (ratio %.2f), language=%s",
+                self.session_id,
+                self.input_sample_rate,
+                _MODEL_SAMPLE_RATE,
+                self.input_sample_rate / _MODEL_SAMPLE_RATE,
+                self.language,
+            )
+        await self._send_session("session.updated", configured=True)
+
+    async def _on_audio_append(self, raw: Dict[str, Any]) -> bool:
+        if not self.session_configured:
+            await self._send_error(
+                "invalid_state", "Send session.update before audio frames"
             )
             return False
+
+        audio = raw.get("audio")
+        if not isinstance(audio, str):
+            await self._send_error(
+                "invalid_value",
+                "audio field must be a base64-encoded string",
+                param="audio",
+            )
+            return False
+        try:
+            data = base64.b64decode(audio, validate=True)
+        except (ValueError, TypeError):
+            await self._send_error(
+                "invalid_audio", "audio field is not valid base64", param="audio"
+            )
+            return False
+
         if len(data) % _SAMPLE_WIDTH != 0:
             await self._send_error(
                 "invalid_audio_format",
@@ -317,35 +301,150 @@ class RealtimeConnection:
             )
             return False
 
+        # Resample on append so pcm_buffer stays at 16 kHz; otherwise
+        # _run_inference would re-resample the cumulative buffer every
+        # call (O(N²)). Offload to a thread because librosa.resample with
+        # kaiser_best is synchronous CPU work and 32 concurrent sessions
+        # would otherwise serialize on the event loop.
+        if self.input_sample_rate != _MODEL_SAMPLE_RATE:
+            data = await asyncio.to_thread(
+                _resample_to_model_rate, data, self.input_sample_rate
+            )
         self.pcm_buffer.extend(data)
-        self.total_audio_bytes += len(data)
 
         if len(self.pcm_buffer) > self.max_buffer_bytes:
             await self._send_error(
                 "buffer_overflow",
                 f"Accumulated audio exceeded {self.max_buffer_seconds}s; "
-                "client is sending faster than inference can keep up",
+                f"client is sending faster than inference can keep up",
+                error_type="rate_limit_exceeded",
             )
             return True
 
-        # Cumulative buffer: each inference sees all audio so far,
-        # but trigger only once per chunk_size of new audio.
-        if self.should_trigger_inference:
+        chunk_size = (
+            int(self.state.chunk_size_sec * _BYTES_PER_SECOND) if self.state else 0
+        )
+        if (
+            chunk_size > 0
+            and len(self.pcm_buffer) - self.last_inference_offset >= chunk_size
+        ):
             await self._run_inference(is_last=False)
         return False
 
-    async def _run_inference(self, *, is_last: bool) -> None:
-        wav_data = _pcm_to_wav(bytes(self.pcm_buffer))
-        delta = await process_asr_chunk(
-            tokenizer_manager=self.serving.tokenizer_manager,
-            adapter=self.serving._adapter,
-            state=self.state,
-            audio_data=wav_data,
-            sampling_params=self.sampling_params,
-            is_last=is_last,
+    async def _on_audio_commit(self) -> None:
+        if not self.session_configured:
+            await self._send_error("invalid_state", "Send session.update before commit")
+            return
+        if not self.pcm_buffer:
+            await self._send_error(
+                "invalid_state", "Cannot commit an empty audio buffer"
+            )
+            return
+
+        has_new_audio = len(self.pcm_buffer) > self.last_inference_offset
+        if has_new_audio:
+            # Final inference failed and emitted transcription.failed +
+            # rolled the item; suppress committed/created/completed
+            # because they would contradict the failure event per spec.
+            if not await self._run_inference(is_last=True):
+                return
+        elif self.state and self.state.full_transcript:
+            # Audio length aligned exactly with chunk_size_bytes — no new
+            # inference, but flush the unfixed_token_num tail update()
+            # held back.
+            tail = self.state.finalize()
+            await self._emit_delta(tail)
+
+        transcript = normalize_whitespace(" ".join(self.emitted_words))
+        item_id = self.current_item_id
+        prev_item_id = self.previous_item_id
+
+        await self._send(
+            {
+                "type": "input_audio_buffer.committed",
+                "item_id": item_id,
+                "previous_item_id": prev_item_id,
+            }
         )
+        await self._send(
+            {
+                "type": "conversation.item.created",
+                "previous_item_id": prev_item_id,
+                "item": {
+                    "id": item_id,
+                    "type": "message",
+                    "role": "user",
+                    "status": "completed",
+                    "content": [{"type": "input_audio", "transcript": transcript}],
+                },
+            }
+        )
+        await self._send(
+            {
+                "type": "conversation.item.input_audio_transcription.completed",
+                "item_id": item_id,
+                "content_index": 0,
+                "transcript": transcript,
+            }
+        )
+
+        self._roll_item()
+
+    async def _on_audio_clear(self) -> None:
+        self._reset_buffer_state()
+        await self._send({"type": "input_audio_buffer.cleared"})
+
+    def _reset_buffer_state(self) -> None:
+        self.pcm_buffer = bytearray()
+        self.last_inference_offset = 0
+        self.emitted_words = []
+        self.state = StreamingASRState(**self.adapter.chunked_streaming_config)
+
+    def _roll_item(self) -> None:
+        self.previous_item_id = self.current_item_id
+        self.current_item_id = f"item_{uuid.uuid4().hex[:24]}"
+        self._reset_buffer_state()
+
+    async def _run_inference(self, *, is_last: bool) -> bool:
+        """Run one inference; emit deltas; return False on failure.
+
+        ``is_last`` is purely a state-machine signal for process_asr_chunk
+        (toggles state.finalize() vs state.update()); the model invocation
+        is identical either way.
+
+        On failure, emit transcription.failed and roll the item over —
+        per OpenAI spec ``failed`` is item-terminal, so subsequent audio
+        must belong to a fresh item.
+        """
+        wav_data = _pcm_to_wav(bytes(self.pcm_buffer))
+        try:
+            delta = await process_asr_chunk(
+                tokenizer_manager=self.tokenizer_manager,
+                adapter=self.adapter,
+                state=self.state,
+                audio_data=wav_data,
+                sampling_params=self.sampling_params,
+                is_last=is_last,
+            )
+        except Exception as e:
+            logger.exception("[realtime] inference failed: %s", self.session_id)
+            await self._send(
+                {
+                    "type": "conversation.item.input_audio_transcription.failed",
+                    "item_id": self.current_item_id,
+                    "content_index": 0,
+                    "error": {
+                        "type": "server_error",
+                        "code": "inference_failed",
+                        "message": str(e),
+                    },
+                }
+            )
+            self._roll_item()
+            return False
         self.last_inference_offset = len(self.pcm_buffer)
         await self._emit_delta(delta)
+        return True
 
     async def _emit_delta(self, delta: str) -> None:
         if not delta:
@@ -354,24 +453,113 @@ class RealtimeConnection:
             if not word:
                 continue
             self.emitted_words.append(word)
-            await self._send(TranscriptDeltaEvent(delta=word))
+            await self._send(
+                {
+                    "type": "conversation.item.input_audio_transcription.delta",
+                    "item_id": self.current_item_id,
+                    "content_index": 0,
+                    "delta": word,
+                }
+            )
 
-    async def _send(self, event: BaseModel) -> None:
-        await self.websocket.send_text(event.model_dump_json())
+    async def _send_session(self, event_type: str, *, configured: bool) -> None:
+        transcription = (
+            {"model": self.client_model, "language": self.language}
+            if configured
+            else {"model": None, "language": None}
+        )
+        await self._send(
+            {
+                "type": event_type,
+                "session": {
+                    "id": self.session_id,
+                    "object": "realtime.transcription_session",
+                    "type": "transcription",
+                    "audio": {
+                        "input": {
+                            "format": "audio/pcm",
+                            "sample_rate": self.input_sample_rate,
+                            "transcription": transcription,
+                            "noise_reduction": None,
+                            "turn_detection": None,
+                        },
+                    },
+                },
+            }
+        )
 
-    async def _send_error(self, code: str, message: str) -> None:
-        await self._send(ErrorEvent(code=code, message=message))
+    async def _send(self, event: Dict[str, Any]) -> None:
+        event.setdefault("event_id", f"event_{uuid.uuid4().hex[:24]}")
+        await self.websocket.send_text(json.dumps(event, ensure_ascii=False))
 
-    async def _safe_close(self) -> None:
-        """Close the WebSocket, swallowing the "already gone" errors."""
-        try:
-            await self.websocket.close()
-        except (WebSocketDisconnect, RuntimeError):
-            pass
+    async def _send_error(
+        self,
+        code: str,
+        message: str,
+        param: Optional[str] = None,
+        error_type: str = "invalid_request_error",
+    ) -> None:
+        await self._send(
+            {
+                "type": "error",
+                "error": {
+                    "type": error_type,
+                    "code": code,
+                    "message": message,
+                    "param": param,
+                    "event_id": self._current_client_event_id,
+                },
+            }
+        )
 
 
 async def handle_realtime_transcription(
-    websocket: WebSocket, serving: OpenAIServingTranscription
+    websocket: WebSocket,
+    tokenizer_manager: TokenizerManager,
+    adapter: TranscriptionAdapter,
+    server_args: ServerArgs,
+    session_semaphore: asyncio.Semaphore,
 ) -> None:
-    """Handle a Realtime transcription session over WebSocket."""
-    await RealtimeConnection(websocket, serving).handle()
+    try:
+        await websocket.accept()
+    except (WebSocketDisconnect, RuntimeError):
+        return
+
+    # locked() == True iff value == 0; check + acquire is atomic in single-threaded asyncio.
+    if session_semaphore.locked():
+        try:
+            await websocket.send_text(
+                json.dumps(
+                    {
+                        "type": "error",
+                        "event_id": f"event_{uuid.uuid4().hex[:24]}",
+                        "error": {
+                            "type": "rate_limit_exceeded",
+                            "code": "too_many_sessions",
+                            "message": (
+                                f"Maximum concurrent sessions reached "
+                                f"({server_args.asr_max_concurrent_sessions})."
+                            ),
+                        },
+                    }
+                )
+            )
+        except (WebSocketDisconnect, RuntimeError):
+            pass
+        try:
+            await websocket.close()
+        except (WebSocketDisconnect, RuntimeError):
+            pass
+        return
+    await session_semaphore.acquire()
+
+    try:
+        await RealtimeConnection(
+            websocket, tokenizer_manager, adapter, server_args
+        ).handle()
+    finally:
+        session_semaphore.release()
+        try:
+            await websocket.close()
+        except (WebSocketDisconnect, RuntimeError):
+            pass

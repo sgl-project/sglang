@@ -1,14 +1,15 @@
 """
 Test Qwen3-ASR model support in SGLang.
 
-Tests /v1/audio/transcriptions (HTTP) and
-/v1/audio/transcriptions/stream (WebSocket live audio input).
+Tests /v1/audio/transcriptions (HTTP) and /v1/realtime (OpenAI Realtime
+transcription WebSocket).
 
 Usage:
     python test/manual/models/test_qwen3_asr.py
 """
 
 import asyncio
+import base64
 import io
 import json
 import os
@@ -164,60 +165,105 @@ def _pcm16_from_audio_bytes(audio_bytes):
 async def _stream_websocket_async(
     websocket_url, pcm_bytes, sample_rate, language=None, realtime=False
 ):
-    """Stream PCM over WebSocket; return {text, deltas, session_id, duration_sec}.
-
-    If realtime=True, sleeps between chunks to simulate live audio pacing.
-    """
+    # Drives /v1/realtime end-to-end: session.update → append × N → commit,
+    # then drains delta + committed + item.created + completed. duration_sec
+    # is computed locally because the OpenAI spec does not echo it back.
     chunk_duration = 0.5
-    chunk_bytes = int(chunk_duration * sample_rate * 2)  # int16 = 2 bytes
+    chunk_bytes = int(chunk_duration * sample_rate * 2)
+    duration_sec = round(len(pcm_bytes) / (sample_rate * 2), 2)
 
     async with websockets.connect(websocket_url) as websocket:
-        start_msg = {"type": "session.start"}
+        created = json.loads(await websocket.recv())
+        assert (
+            created.get("type") == "session.created"
+        ), f"expected session.created, got {created!r}"
+        session_id = created["session"]["id"]
+
+        transcription_cfg = {"model": "qwen3-asr"}
         if language:
-            start_msg["language"] = language
-        await websocket.send(json.dumps(start_msg))
-        ack = json.loads(await websocket.recv())
-        assert ack.get("type") == "session.started", f"unexpected ack: {ack}"
-        session_id = ack["session_id"]
+            transcription_cfg["language"] = language
+        await websocket.send(
+            json.dumps(
+                {
+                    "type": "session.update",
+                    "session": {
+                        "type": "transcription",
+                        "audio": {
+                            "input": {
+                                "format": "audio/pcm",
+                                "sample_rate": sample_rate,
+                                "transcription": transcription_cfg,
+                                "noise_reduction": None,
+                                "turn_detection": None,
+                            }
+                        },
+                    },
+                }
+            )
+        )
+
+        while True:
+            evt = json.loads(await websocket.recv())
+            if evt.get("type") == "session.updated":
+                break
+            if evt.get("type") == "error":
+                raise RuntimeError(f"websocket error during update: {evt!r}")
 
         deltas = []
-        final_msg = {}
+        completed_msg = {}
 
         async def receive_loop():
             async for raw in websocket:
                 resp = json.loads(raw)
-                if resp["type"] == "transcript.delta":
+                t = resp.get("type")
+                if t == "conversation.item.input_audio_transcription.delta":
                     deltas.append(resp["delta"])
-                elif resp["type"] == "transcript.final":
-                    final_msg.update(resp)
+                elif t == "conversation.item.input_audio_transcription.completed":
+                    completed_msg.update(resp)
                     return
-                elif resp["type"] == "error":
+                elif t in (
+                    "input_audio_buffer.committed",
+                    "conversation.item.created",
+                ):
+                    continue
+                elif t == "error":
+                    err = resp.get("error", {})
                     raise RuntimeError(
-                        f"websocket error [{resp.get('code', '?')}]: {resp.get('message', '')}"
+                        f"websocket error [{err.get('code', '?')}]: "
+                        f"{err.get('message', '')}"
                     )
+                elif t == "conversation.item.input_audio_transcription.failed":
+                    raise RuntimeError(f"transcription failed: {resp!r}")
 
         receiver = asyncio.create_task(receive_loop())
 
         for offset in range(0, len(pcm_bytes), chunk_bytes):
             chunk = pcm_bytes[offset : offset + chunk_bytes]
-            await websocket.send(chunk)
+            await websocket.send(
+                json.dumps(
+                    {
+                        "type": "input_audio_buffer.append",
+                        "audio": base64.b64encode(chunk).decode("ascii"),
+                    }
+                )
+            )
             if realtime:
                 await asyncio.sleep(chunk_duration)
 
-        await websocket.send(json.dumps({"type": "session.end"}))
+        await websocket.send(json.dumps({"type": "input_audio_buffer.commit"}))
         await receiver
 
-    assert final_msg, "no transcript.final received"
+    assert completed_msg, "no transcription.completed received"
     return {
-        "text": final_msg.get("text", ""),
+        "text": completed_msg.get("transcript", ""),
         "deltas": deltas,
         "session_id": session_id,
-        "duration_sec": final_msg.get("duration_sec", 0.0),
+        "duration_sec": duration_sec,
     }
 
 
 class TestQwen3ASRTranscription(CustomTestCase):
-    """Test Qwen3-ASR via HTTP /v1/audio/transcriptions and WebSocket /v1/audio/transcriptions/stream."""
+    """Test Qwen3-ASR via HTTP /v1/audio/transcriptions and OpenAI Realtime WebSocket /v1/realtime."""
 
     @classmethod
     def setUpClass(cls):
@@ -339,7 +385,7 @@ class TestQwen3ASRTranscription(CustomTestCase):
     def _websocket_url(self):
         return (
             self.base_url.replace("http://", "ws://").replace("https://", "wss://")
-            + "/v1/audio/transcriptions/stream"
+            + "/v1/realtime"
         )
 
     def _stream_websocket(self, audio_url, local_path, language=None, realtime=False):
@@ -385,7 +431,7 @@ class TestQwen3ASRTranscription(CustomTestCase):
 
     @unittest.skipUnless(HAS_WEBSOCKETS, "websockets package not installed")
     def test_chinese_websocket_streaming(self):
-        """Test Chinese audio transcription over WebSocket with session.start.language."""
+        """Test Chinese audio transcription over WebSocket with audio.input.transcription.language."""
         result = self._stream_websocket(
             TEST_AUDIO_ZH_URL, TEST_AUDIO_ZH_LOCAL, language="zh"
         )
@@ -503,11 +549,12 @@ class TestQwen3ASRTranscription(CustomTestCase):
         """Short clip (3s) where the tail is flushed by is_last=True finalize.
 
         The client sends 3s of audio in 0.5s PCM frames. With chunk_size_sec
-        = 2.0, one intermediate inference triggers at the 2s mark; session.end
-        then has ~1s of unseen audio, so ``has_new_audio`` is True and the
-        tail is flushed via ``_run_inference(is_last=True) → state.finalize``.
-        This is the common "client ended mid-chunk" path — distinct from the
-        exact-boundary elif path covered by test_websocket_chunk_boundary_flush.
+        = 2.0, one intermediate inference triggers at the 2s mark;
+        input_audio_buffer.commit then has ~1s of unseen audio, so
+        ``has_new_audio`` is True and the tail is flushed via
+        ``_run_inference(is_last=True) → state.finalize``. This is the common
+        "client ended mid-chunk" path — distinct from the exact-boundary elif
+        path covered by test_websocket_chunk_boundary_flush.
         """
         audio_bytes = download_audio(TEST_AUDIO_MP3_URL, TEST_AUDIO_MP3_LOCAL)
         full_pcm, sr = _pcm16_from_audio_bytes(audio_bytes)
@@ -527,9 +574,9 @@ class TestQwen3ASRTranscription(CustomTestCase):
 
         With chunk_size_sec = 2.0 and frames of 0.5s, sending exactly 4.0s
         of PCM triggers inferences at the 2.0s and 4.0s marks (last_inf
-        lands on the end of the buffer). On session.end, ``has_new_audio``
-        is False but ``state.full_transcript`` is set, so the session-end
-        handler takes the elif branch and flushes the words that
+        lands on the end of the buffer). On input_audio_buffer.commit,
+        ``has_new_audio`` is False but ``state.full_transcript`` is set, so
+        the commit handler takes the elif branch and flushes the words that
         ``state.update`` held back (``unfixed_token_num`` tail) via
         ``state.finalize`` — without running another inference.
 

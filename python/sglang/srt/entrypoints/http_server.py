@@ -1598,9 +1598,12 @@ async def openai_v1_audio_transcriptions(
     )
 
 
-@app.websocket("/v1/audio/transcriptions/stream")
-async def openai_v1_audio_transcriptions_ws(ws: WebSocket):
-    """WebSocket endpoint for real-time streaming audio transcription."""
+@app.websocket("/v1/realtime")
+async def openai_v1_realtime(ws: WebSocket):
+    """OpenAI Realtime transcription WebSocket endpoint.
+
+    See ``serving_transcription_websocket.py`` for the wire protocol.
+    """
     await ws.app.state.openai_serving_transcription.handle_websocket(ws)
 
 
