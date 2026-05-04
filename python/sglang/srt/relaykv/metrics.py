@@ -4837,6 +4837,415 @@ def summarize_relaykv_kv_index_resolution_plans_for_smoke(
     }
 
 
+def _req_to_token_table_for_req_pool_idx_for_smoke(
+    req_to_token_table_by_req_pool_idx: dict[Any, Any] | None,
+    req_pool_idx: Any,
+) -> Any:
+    if not isinstance(req_to_token_table_by_req_pool_idx, dict):
+        return None
+    if req_pool_idx in req_to_token_table_by_req_pool_idx:
+        return req_to_token_table_by_req_pool_idx[req_pool_idx]
+    req_pool_idx_as_str = str(req_pool_idx)
+    if req_pool_idx_as_str in req_to_token_table_by_req_pool_idx:
+        return req_to_token_table_by_req_pool_idx[req_pool_idx_as_str]
+    return None
+
+
+def _req_to_token_int_like_value_for_smoke(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str):
+        try:
+            return int(value)
+        except ValueError:
+            return None
+    return None
+
+
+def _normalize_req_to_token_span_for_smoke(
+    span: Mapping[str, Any],
+    *,
+    request_id: Any,
+    req_pool_idx: int,
+    layer_id: Any,
+    seq_len: int,
+    req_to_token_table: list[Any] | tuple[Any, ...],
+) -> tuple[dict[str, Any] | None, str | None]:
+    block_id = _event_value(span, "block_id")
+    token_start = _event_value(span, "token_start")
+    token_end = _event_value(span, "token_end")
+    token_count = _event_value(span, "token_count")
+
+    if not isinstance(token_start, int) or not isinstance(token_end, int):
+        return None, "invalid_block_span"
+    if not isinstance(token_count, int) or token_count != token_end - token_start:
+        return None, "invalid_block_span"
+    if token_start < 0 or token_end <= token_start:
+        return None, "invalid_block_span"
+    if token_end > seq_len:
+        return None, "token_span_out_of_seq_len"
+
+    req_to_token_entries: list[int] = []
+    for position in range(token_start, token_end):
+        if position >= len(req_to_token_table):
+            return None, "token_position_out_of_req_to_token_table"
+        entry = req_to_token_table[position]
+        if not isinstance(entry, int) or isinstance(entry, bool):
+            return None, "req_to_token_entry_not_int"
+        req_to_token_entries.append(entry)
+
+    return (
+        {
+            "block_id": block_id,
+            "token_start": token_start,
+            "token_end": token_end,
+            "token_count": token_count,
+            "request_id": request_id,
+            "req_pool_idx": req_pool_idx,
+            "layer_id": layer_id,
+            "req_to_token_entries": req_to_token_entries,
+            "entry_count": len(req_to_token_entries),
+            "resolution_source": "synthetic_req_to_token_table",
+        },
+        None,
+    )
+
+
+def _resolve_req_to_token_spans_for_smoke(
+    spans: list[dict[str, Any]],
+    *,
+    request_id: Any,
+    req_pool_idx: int,
+    layer_id: Any,
+    seq_len: int,
+    req_to_token_table: list[Any] | tuple[Any, ...],
+) -> tuple[list[dict[str, Any]], list[str]]:
+    resolved_spans: list[dict[str, Any]] = []
+    blocking_reasons: list[str] = []
+
+    for span in spans:
+        if not isinstance(span, Mapping):
+            blocking_reasons.append("invalid_block_span")
+            continue
+        resolved_span, span_error = _normalize_req_to_token_span_for_smoke(
+            span,
+            request_id=request_id,
+            req_pool_idx=req_pool_idx,
+            layer_id=layer_id,
+            seq_len=seq_len,
+            req_to_token_table=req_to_token_table,
+        )
+        if span_error is not None:
+            blocking_reasons.append(span_error)
+            continue
+        if resolved_span is not None:
+            resolved_spans.append(resolved_span)
+
+    return resolved_spans, list(dict.fromkeys(blocking_reasons))
+
+
+def build_relaykv_req_to_token_resolution_results_for_smoke(
+    kv_index_resolution_plans: list[dict[str, Any]]
+    | tuple[dict[str, Any], ...],
+    req_to_token_table_by_req_pool_idx: dict[Any, Any] | None = None,
+    read_req_to_token: bool = False,
+) -> list[dict[str, Any]]:
+    """Build readonly synthetic req_to_token resolution results for smoke."""
+
+    if not isinstance(kv_index_resolution_plans, (list, tuple)):
+        raise TypeError("kv_index_resolution_plans must be a list or tuple")
+    if (
+        req_to_token_table_by_req_pool_idx is not None
+        and not isinstance(req_to_token_table_by_req_pool_idx, dict)
+    ):
+        raise TypeError(
+            "req_to_token_table_by_req_pool_idx must be a dict or None"
+        )
+
+    results: list[dict[str, Any]] = []
+    for plan in kv_index_resolution_plans:
+        if not isinstance(plan, dict):
+            raise TypeError(
+                "RelayKV req_to_token resolution inputs must be dict plans"
+            )
+
+        request_id = _event_value(plan, "request_id")
+        req_pool_idx_value = _event_req_pool_idx_value(plan)
+        req_pool_idx = _req_to_token_int_like_value_for_smoke(req_pool_idx_value)
+        seq_len = _event_value(plan, "seq_len")
+        layer_id = _event_layer_value(plan)
+        relaykv_working_block_spans = _event_value(plan, "relaykv_working_block_spans")
+        full_kv_block_spans = _event_value(plan, "full_kv_block_spans")
+
+        blocking_reasons: list[str] = []
+        warning_reasons: list[str] = [
+            "readonly_req_to_token_resolution",
+            "no_token_to_kv_pool_read",
+        ]
+
+        if _event_value(plan, "event_type") != "relaykv_kv_index_resolution_plan":
+            blocking_reasons.append("not_kv_index_resolution_plan")
+        if _event_value(plan, "resolution_state") != "block_span_resolved":
+            blocking_reasons.append("kv_index_resolution_not_block_span_resolved")
+        if _event_value(plan, "resolution_mode") != "metadata_only":
+            blocking_reasons.append("kv_index_resolution_not_metadata_only")
+        if read_req_to_token is not True:
+            blocking_reasons.append("read_req_to_token_not_enabled")
+        if req_pool_idx is None:
+            blocking_reasons.append("req_pool_idx_missing_or_invalid")
+        if not isinstance(seq_len, int) or seq_len <= 0:
+            blocking_reasons.append("seq_len_missing_or_invalid")
+        if not isinstance(relaykv_working_block_spans, (list, tuple)):
+            blocking_reasons.append("invalid_block_span")
+        elif not relaykv_working_block_spans:
+            blocking_reasons.append("invalid_block_span")
+        if not isinstance(full_kv_block_spans, (list, tuple)):
+            blocking_reasons.append("invalid_block_span")
+        elif not full_kv_block_spans:
+            blocking_reasons.append("invalid_block_span")
+        if _event_value(plan, "token_to_kv_pool_read") is True:
+            blocking_reasons.append("token_to_kv_pool_read_not_allowed")
+        if _event_value(plan, "kv_pool_read") is True:
+            blocking_reasons.append("kv_pool_read_not_allowed")
+        if _event_value(plan, "tensor_read") is True:
+            blocking_reasons.append("tensor_read_not_allowed")
+        if _event_value(plan, "attention_comparison_executed") is True:
+            blocking_reasons.append("attention_comparison_executed_not_allowed")
+        if _event_value(plan, "attention_override") is True:
+            blocking_reasons.append("attention_override_true_not_allowed")
+        if read_req_to_token and req_to_token_table_by_req_pool_idx is None:
+            blocking_reasons.append("req_to_token_table_missing")
+
+        req_to_token_table: list[Any] | tuple[Any, ...] | None = None
+        relaykv_working_req_to_token_spans: list[dict[str, Any]] = []
+        full_kv_req_to_token_spans: list[dict[str, Any]] = []
+
+        if not blocking_reasons and req_pool_idx is not None:
+            req_to_token_table = _req_to_token_table_for_req_pool_idx_for_smoke(
+                req_to_token_table_by_req_pool_idx,
+                req_pool_idx,
+            )
+            if req_to_token_table is None:
+                blocking_reasons.append("req_to_token_table_for_req_pool_missing")
+            elif not isinstance(req_to_token_table, (list, tuple)):
+                blocking_reasons.append("req_to_token_table_not_indexable")
+
+        if not blocking_reasons and req_to_token_table is not None:
+            (
+                full_kv_req_to_token_spans,
+                full_blocking_reasons,
+            ) = _resolve_req_to_token_spans_for_smoke(
+                list(full_kv_block_spans),
+                request_id=request_id,
+                req_pool_idx=req_pool_idx,
+                layer_id=layer_id,
+                seq_len=seq_len,
+                req_to_token_table=req_to_token_table,
+            )
+            (
+                relaykv_working_req_to_token_spans,
+                working_blocking_reasons,
+            ) = _resolve_req_to_token_spans_for_smoke(
+                list(relaykv_working_block_spans),
+                request_id=request_id,
+                req_pool_idx=req_pool_idx,
+                layer_id=layer_id,
+                seq_len=seq_len,
+                req_to_token_table=req_to_token_table,
+            )
+            blocking_reasons.extend(full_blocking_reasons)
+            blocking_reasons.extend(working_blocking_reasons)
+
+        blocking_reasons = list(dict.fromkeys(blocking_reasons))
+        resolution_state = (
+            "req_to_token_resolved" if not blocking_reasons else "blocked"
+        )
+
+        if blocking_reasons:
+            relaykv_working_req_to_token_spans = []
+            full_kv_req_to_token_spans = []
+            resolved_block_count = 0
+            resolved_token_count = 0
+            req_to_token_entry_count = 0
+            req_to_token_read_flag = False
+            req_to_token_read_count = 0
+        else:
+            resolved_block_count = len(full_kv_req_to_token_spans)
+            resolved_token_count = sum(
+                span["token_count"] for span in full_kv_req_to_token_spans
+            )
+            req_to_token_entry_count = sum(
+                span["entry_count"] for span in full_kv_req_to_token_spans
+            )
+            req_to_token_read_flag = True
+            req_to_token_read_count = req_to_token_entry_count
+
+        results.append(
+            {
+                "event_type": "relaykv_req_to_token_resolution_result",
+                "resolution_state": resolution_state,
+                "resolution_mode": "readonly_synthetic_table",
+                "source": (
+                    "kv_index_resolution_plan_to_req_to_token_resolution_result"
+                ),
+                "request_id": request_id,
+                "req_pool_idx": req_pool_idx_value,
+                "seq_len": seq_len,
+                "layer_id": layer_id,
+                "relaykv_working_req_to_token_spans": (
+                    relaykv_working_req_to_token_spans
+                ),
+                "full_kv_req_to_token_spans": full_kv_req_to_token_spans,
+                "resolved_block_count": resolved_block_count,
+                "resolved_token_count": resolved_token_count,
+                "req_to_token_entry_count": req_to_token_entry_count,
+                "req_to_token_read": req_to_token_read_flag,
+                "req_to_token_read_count": req_to_token_read_count,
+                "token_to_kv_pool_read": False,
+                "token_to_kv_pool_read_count": 0,
+                "kv_pool_read": False,
+                "kv_snapshot": False,
+                "tensor_read": False,
+                "attention_comparison_executed": False,
+                "attention_override": False,
+                "runtime_writeback": False,
+                "scheduler_policy_noop": True,
+                "kv_cache_mutation": False,
+                "source_mutated": False,
+                "blocking_reasons": blocking_reasons,
+                "warning_reasons": warning_reasons,
+            }
+        )
+    return results
+
+
+def summarize_relaykv_req_to_token_resolution_results_for_smoke(
+    results: list[dict[str, Any]] | tuple[dict[str, Any], ...],
+) -> dict[str, Any]:
+    """Summarize readonly synthetic req_to_token resolution results."""
+
+    if not isinstance(results, (list, tuple)):
+        raise TypeError(
+            "RelayKV req_to_token resolution results must be a list or tuple"
+        )
+
+    per_request: Counter[str] = Counter()
+    per_layer: Counter[str] = Counter()
+    per_resolution_state: Counter[str] = Counter()
+    safety_counts: Counter[str] = Counter(
+        {
+            "req_to_token_read_count": 0,
+            "token_to_kv_pool_read_count": 0,
+            "kv_pool_read_count": 0,
+            "kv_snapshot_count": 0,
+            "tensor_read_count": 0,
+            "attention_comparison_executed_count": 0,
+            "attention_override_true_count": 0,
+            "runtime_writeback_true_count": 0,
+            "scheduler_policy_noop_false_count": 0,
+            "kv_cache_mutation_true_count": 0,
+            "source_mutated_true_count": 0,
+        }
+    )
+    req_to_token_resolved_count = 0
+    blocked_count = 0
+    error_count = 0
+    resolved_block_count = 0
+    resolved_token_count = 0
+    req_to_token_entry_count = 0
+
+    for result in results:
+        if not isinstance(result, dict):
+            raise TypeError(
+                "RelayKV req_to_token resolution result must be a dict"
+            )
+
+        state = str(_event_value(result, "resolution_state") or "unknown")
+        per_resolution_state[state] += 1
+        per_request[str(_event_value(result, "request_id"))] += 1
+        per_layer[str(_event_layer_value(result))] += 1
+
+        if state == "req_to_token_resolved":
+            req_to_token_resolved_count += 1
+        elif state == "blocked":
+            blocked_count += 1
+        elif state == "error":
+            error_count += 1
+
+        value = _event_value(result, "resolved_block_count")
+        if isinstance(value, int):
+            resolved_block_count += value
+        value = _event_value(result, "resolved_token_count")
+        if isinstance(value, int):
+            resolved_token_count += value
+        value = _event_value(result, "req_to_token_entry_count")
+        if isinstance(value, int):
+            req_to_token_entry_count += value
+        value = _event_value(result, "req_to_token_read_count")
+        if isinstance(value, int):
+            safety_counts["req_to_token_read_count"] += value
+        value = _event_value(result, "token_to_kv_pool_read_count")
+        if isinstance(value, int):
+            safety_counts["token_to_kv_pool_read_count"] += value
+        if _event_value(result, "kv_pool_read") is True:
+            safety_counts["kv_pool_read_count"] += 1
+        if _event_value(result, "kv_snapshot") is True:
+            safety_counts["kv_snapshot_count"] += 1
+        if _event_value(result, "tensor_read") is True:
+            safety_counts["tensor_read_count"] += 1
+        if _event_value(result, "attention_comparison_executed") is True:
+            safety_counts["attention_comparison_executed_count"] += 1
+        if _event_value(result, "attention_override") is True:
+            safety_counts["attention_override_true_count"] += 1
+        if _event_value(result, "runtime_writeback") is True:
+            safety_counts["runtime_writeback_true_count"] += 1
+        if _event_value(result, "scheduler_policy_noop") is False:
+            safety_counts["scheduler_policy_noop_false_count"] += 1
+        if _event_value(result, "kv_cache_mutation") is True:
+            safety_counts["kv_cache_mutation_true_count"] += 1
+        if _event_value(result, "source_mutated") is True:
+            safety_counts["source_mutated_true_count"] += 1
+
+    return {
+        "summary_type": "relaykv_req_to_token_resolution_result_summary",
+        "total_req_to_token_resolution_results": len(results),
+        "req_to_token_resolved_count": req_to_token_resolved_count,
+        "blocked_count": blocked_count,
+        "error_count": error_count,
+        "resolved_block_count": resolved_block_count,
+        "resolved_token_count": resolved_token_count,
+        "req_to_token_entry_count": req_to_token_entry_count,
+        "per_request_counts": dict(sorted(per_request.items())),
+        "per_layer_counts": dict(sorted(per_layer.items())),
+        "per_resolution_state_counts": dict(sorted(per_resolution_state.items())),
+        "req_to_token_read_count": safety_counts["req_to_token_read_count"],
+        "token_to_kv_pool_read_count": (
+            safety_counts["token_to_kv_pool_read_count"]
+        ),
+        "kv_pool_read_count": safety_counts["kv_pool_read_count"],
+        "kv_snapshot_count": safety_counts["kv_snapshot_count"],
+        "tensor_read_count": safety_counts["tensor_read_count"],
+        "attention_comparison_executed_count": (
+            safety_counts["attention_comparison_executed_count"]
+        ),
+        "attention_override_true_count": (
+            safety_counts["attention_override_true_count"]
+        ),
+        "runtime_writeback_true_count": (
+            safety_counts["runtime_writeback_true_count"]
+        ),
+        "scheduler_policy_noop_false_count": (
+            safety_counts["scheduler_policy_noop_false_count"]
+        ),
+        "kv_cache_mutation_true_count": (
+            safety_counts["kv_cache_mutation_true_count"]
+        ),
+        "source_mutated_true_count": safety_counts["source_mutated_true_count"],
+    }
+
+
 def log_policy_summary(
     events: Iterable[RelayKVPlan | Mapping[str, Any]],
     *,
