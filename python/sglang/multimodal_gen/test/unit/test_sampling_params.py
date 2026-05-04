@@ -1,8 +1,14 @@
 import argparse
 import math
 import unittest
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import (
+    LTX2PipelineConfig,
+    is_ltx23_native_variant,
+    sync_ltx23_runtime_vae_markers,
+)
 from sglang.multimodal_gen.configs.sample.diffusers_generic import (
     DiffusersGenericSamplingParams,
 )
@@ -33,6 +39,14 @@ class TestSamplingParamsValidate(unittest.TestCase):
     def test_num_outputs_per_prompt_must_be_positive(self):
         with self.assertRaisesRegex(ValueError, r"num_outputs_per_prompt"):
             SamplingParams(num_outputs_per_prompt=0)
+
+    def test_seed_accepts_int_or_non_empty_int_list(self):
+        self.assertEqual(SamplingParams(seed=7).seed, 7)
+        self.assertEqual(SamplingParams(seed=[7, 8]).seed, [7, 8])
+        with self.assertRaisesRegex(ValueError, r"seed list"):
+            SamplingParams(seed=[])
+        with self.assertRaisesRegex(ValueError, r"seed"):
+            SamplingParams(seed=[1, -1])
 
     def test_fps_must_be_positive_int(self):
         with self.assertRaisesRegex(ValueError, r"\bfps\b"):
@@ -141,6 +155,33 @@ class TestSamplingParamsSubclass(unittest.TestCase):
                     expected,
                 )
 
+    def test_ltx23_runtime_vae_markers_sync_variant_and_decoder_metadata(self):
+        arch_config = LTX2PipelineConfig().vae_config.arch_config
+
+        self.assertFalse(is_ltx23_native_variant(arch_config))
+        self.assertEqual(arch_config.video_decoder_variant, "ltx_2")
+        self.assertEqual(arch_config.condition_encoder_subdir, "")
+
+        sync_ltx23_runtime_vae_markers(
+            arch_config,
+            SimpleNamespace(
+                arch_config=SimpleNamespace(
+                    ltx_variant="ltx_2_3",
+                    condition_encoder_subdir="ltx23_image_encoder",
+                    video_decoder_variant="ltx_2_3",
+                    video_decoder_config={"_class_name": "AutoencoderKLLTX2Video"},
+                )
+            ),
+        )
+
+        self.assertTrue(is_ltx23_native_variant(arch_config))
+        self.assertEqual(arch_config.condition_encoder_subdir, "ltx23_image_encoder")
+        self.assertEqual(arch_config.video_decoder_variant, "ltx_2_3")
+        self.assertEqual(
+            arch_config.video_decoder_config,
+            {"_class_name": "AutoencoderKLLTX2Video"},
+        )
+
 
 class TestSamplingParamsCliArgs(unittest.TestCase):
     def _parse_cli_kwargs(self, argv: list[str]) -> dict:
@@ -169,6 +210,13 @@ class TestSamplingParamsCliArgs(unittest.TestCase):
         self.assertEqual(kwargs["guidance_scale"], SamplingParams.guidance_scale)
         self.assertEqual(kwargs["negative_prompt"], SamplingParams.negative_prompt)
         self.assertTrue(kwargs["save_output"])
+
+    def test_get_cli_args_accepts_seed_list(self):
+        self.assertEqual(self._parse_cli_kwargs(["--seed", "7"])["seed"], 7)
+        self.assertEqual(
+            self._parse_cli_kwargs(["--seed", "7", "8"])["seed"],
+            [7, 8],
+        )
 
     def test_qwen_image_cli_path_preserves_model_defaults(self):
         params = self._make_qwen_image_params([])

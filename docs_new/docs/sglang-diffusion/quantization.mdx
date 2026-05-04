@@ -1,0 +1,584 @@
+---
+title: "Quantization"
+metatags:
+    description: "SGLang-Diffusion supports quantized transformer checkpoints. In most cases, keep the base model and the quantized transformer override separate."
+---
+
+SGLang-Diffusion supports quantized transformer checkpoints. In most cases, keep
+the base model and the quantized transformer override separate.
+
+## Quick Reference
+
+Use these paths:
+
+- `--model-path`: the base or original model
+- `--transformer-path`: a quantized transformers-style transformer component directory that already contains its own `config.json`
+- `--transformer-weights-path`: quantized transformer weights provided as a single safetensors file, a sharded safetensors directory, a local path, or a Hugging Face repo ID
+
+Recommended example:
+
+```bash
+sglang generate \
+  --model-path black-forest-labs/FLUX.2-dev \
+  --transformer-weights-path black-forest-labs/FLUX.2-dev-NVFP4 \
+  --prompt "a curious pikachu"
+```
+
+For quantized transformers-style transformer component folders:
+
+```bash
+sglang generate \
+  --model-path /path/to/base-model \
+  --transformer-path /path/to/quantized-transformer \
+  --prompt "A Logo With Bold Large Text: SGL Diffusion"
+```
+
+NOTE: Some model-specific integrations also accept a quantized repo or local
+directory directly as `--model-path`, but that is a compatibility path. If a
+repo contains multiple candidate checkpoints, pass
+`--transformer-weights-path` explicitly.
+
+## Quant Families
+
+Here, `quant_family` means a checkpoint and loading family with shared CLI
+usage and loader behavior. It is not just the numeric precision or a kernel
+backend.
+
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <colgroup>
+    <col style={{width: "16.67%"}} />
+    <col style={{width: "16.67%"}} />
+    <col style={{width: "16.67%"}} />
+    <col style={{width: "16.67%"}} />
+    <col style={{width: "16.67%"}} />
+    <col style={{width: "16.67%"}} />
+  </colgroup>
+  <thead>
+    <tr>
+      <th>quant_family</th>
+      <th>checkpoint form</th>
+      <th>canonical CLI</th>
+      <th>supported models</th>
+      <th>extra dependency</th>
+      <th>platform / notes</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><code>fp8</code></td>
+      <td>Quantized transformer component folder, or safetensors with <code>quantization_config</code> metadata</td>
+      <td><code>--transformer-path</code> or <code>--transformer-weights-path</code></td>
+      <td>ALL</td>
+      <td>None</td>
+      <td>Component-folder and single-file flows are both supported</td>
+    </tr>
+    <tr>
+      <td><code>modelopt-fp8</code></td>
+      <td>Converted ModelOpt FP8 transformer directory or repo with <code>config.json</code></td>
+      <td><code>--transformer-path</code></td>
+      <td>FLUX.1, FLUX.2, Wan2.2</td>
+      <td>None</td>
+      <td>Serialized config stays <code>quant_method=modelopt</code> with <code>quant_algo=FP8</code>; <code>dit_layerwise_offload</code> is supported and <code>dit_cpu_offload</code> stays disabled</td>
+    </tr>
+    <tr>
+      <td><code>modelopt-nvfp4</code></td>
+      <td>Mixed transformer directory/repo with <code>config.json</code>, or raw NVFP4 safetensors export/repo</td>
+      <td><code>--transformer-path</code> for mixed overrides; <code>--transformer-weights-path</code> for raw exports</td>
+      <td>FLUX.1, FLUX.2, Wan2.2</td>
+      <td>None</td>
+      <td>Mixed override repos keep the base model separate; raw exports such as <code>black-forest-labs/FLUX.2-dev-NVFP4</code> still use the weights-path flow</td>
+    </tr>
+    <tr>
+      <td><code>nunchaku-svdq</code></td>
+      <td>Pre-quantized Nunchaku transformer weights, usually named <code>svdq-&#123;int4\|fp4&#125;_r&#123;rank&#125;-...</code></td>
+      <td><code>--transformer-weights-path</code></td>
+      <td>Model-specific support such as Qwen-Image, FLUX, and Z-Image</td>
+      <td><code>nunchaku</code></td>
+      <td>SGLang can infer precision and rank from the filename and supports both <code>int4</code> and <code>nvfp4</code></td>
+    </tr>
+    <tr>
+      <td><code>msmodelslim</code></td>
+      <td>Pre-quantized msmodelslim transformer weights</td>
+      <td><code>--model-path</code></td>
+      <td>Wan2.2 family</td>
+      <td>None</td>
+      <td>Currently only compatible with the Ascend NPU family and supports both <code>w8a8</code> and <code>w4a4</code></td>
+    </tr>
+  </tbody>
+</table>
+
+## Validated ModelOpt Checkpoints
+
+This section is the canonical support matrix for the eight diffusion ModelOpt
+checkpoints currently wired up in SGLang docs and B200 CI coverage.
+
+Published checkpoints keep the serialized quantization config as
+`quant_method=modelopt`; the FP8 vs NVFP4 split below is a documentation label
+derived from `quant_algo`.
+
+Seven of the eight repos live under `lmsys/*`. The FLUX.2 NVFP4 entry keeps the
+official `black-forest-labs/FLUX.2-dev-NVFP4` repo.
+
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <colgroup>
+    <col style={{width: "16.67%"}} />
+    <col style={{width: "16.67%"}} />
+    <col style={{width: "16.67%"}} />
+    <col style={{width: "16.67%"}} />
+    <col style={{width: "16.67%"}} />
+    <col style={{width: "16.67%"}} />
+  </colgroup>
+  <thead>
+    <tr>
+      <th>Quant Algo</th>
+      <th>Base Model</th>
+      <th>Preferred CLI</th>
+      <th>HF Repo</th>
+      <th>Current Scope</th>
+      <th>Notes</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><code>FP8</code></td>
+      <td><code>black-forest-labs/FLUX.1-dev</code></td>
+      <td><code>--transformer-path</code></td>
+      <td><code>lmsys/flux1-dev-modelopt-fp8-sglang-transformer</code></td>
+      <td>single-transformer override, deterministic latent/image comparison, H100 benchmark, torch-profiler trace</td>
+      <td>SGLang converter keeps a validated BF16 fallback set for modulation and FF projection layers; use <code>--model-id FLUX.1-dev</code> for local mirrors</td>
+    </tr>
+    <tr>
+      <td><code>FP8</code></td>
+      <td><code>black-forest-labs/FLUX.2-dev</code></td>
+      <td><code>--transformer-path</code></td>
+      <td><code>lmsys/flux2-dev-modelopt-fp8-sglang-transformer</code></td>
+      <td>single-transformer override load and generation path</td>
+      <td>published SGLang-ready transformer override</td>
+    </tr>
+    <tr>
+      <td><code>FP8</code></td>
+      <td><code>Wan-AI/Wan2.2-T2V-A14B-Diffusers</code></td>
+      <td><code>--transformer-path</code></td>
+      <td><code>lmsys/wan22-t2v-a14b-modelopt-fp8-sglang-transformer</code></td>
+      <td>primary <code>transformer</code> quantized, <code>transformer_2</code> kept BF16</td>
+      <td>primary-transformer-only path; keep <code>transformer_2</code> on the base checkpoint, and do not describe this as dual-transformer full-model FP8 unless that path is validated separately</td>
+    </tr>
+    <tr>
+      <td><code>FP8</code></td>
+      <td><code>Qwen/Qwen-Image</code></td>
+      <td><code>--transformer-path</code></td>
+      <td><code>lmsys/qwen-image-modelopt-fp8-sglang-transformer</code></td>
+      <td>single-transformer override, BF16-vs-FP8 image comparison, H100 benchmark, torch-profiler trace</td>
+      <td>shares the Qwen Image FP8 fallback preset; keep <code>img_in</code>, <code>txt_in</code>, timestep embedder, <code>norm_out.linear</code>, <code>proj_out</code>, <code>img_mod</code>/<code>txt_mod</code>, and <code>img_mlp.net.2</code> in BF16</td>
+    </tr>
+    <tr>
+      <td><code>FP8</code></td>
+      <td><code>Qwen/Qwen-Image-Edit-2511</code></td>
+      <td><code>--transformer-path</code></td>
+      <td><code>lmsys/qwen-image-edit-modelopt-fp8-sglang-transformer</code></td>
+      <td>TI2I edit smoke, BF16-vs-FP8 image comparison, H100 benchmark</td>
+      <td>shares <code>QwenImageTransformer2DModel</code> with Qwen Image and uses the same Qwen Image FP8 fallback preset</td>
+    </tr>
+    <tr>
+      <td><code>NVFP4</code></td>
+      <td><code>black-forest-labs/FLUX.1-dev</code></td>
+      <td><code>--transformer-path</code></td>
+      <td><code>lmsys/flux1-dev-modelopt-nvfp4-sglang-transformer</code></td>
+      <td>mixed BF16+NVFP4 transformer override, correctness validation, 4x RTX 5090 benchmark, torch-profiler trace</td>
+      <td>use <code>build_modelopt_nvfp4_transformer.py</code>; validated builder keeps selected FLUX.1 modules in BF16 and sets <code>swap_weight_nibbles=false</code></td>
+    </tr>
+    <tr>
+      <td><code>NVFP4</code></td>
+      <td><code>black-forest-labs/FLUX.2-dev</code></td>
+      <td><code>--transformer-weights-path</code></td>
+      <td><code>black-forest-labs/FLUX.2-dev-NVFP4</code></td>
+      <td>packed-QKV load path</td>
+      <td>official raw export repo; validated packed export detection and runtime layout handling</td>
+    </tr>
+    <tr>
+      <td><code>NVFP4</code></td>
+      <td><code>Wan-AI/Wan2.2-T2V-A14B-Diffusers</code></td>
+      <td><code>--transformer-path</code></td>
+      <td><code>lmsys/wan22-t2v-a14b-modelopt-nvfp4-sglang-transformer</code></td>
+      <td>primary <code>transformer</code> quantized with ModelOpt NVFP4, <code>transformer_2</code> kept BF16</td>
+      <td>primary-transformer-only path; keep <code>transformer_2</code> on the base checkpoint, and current B200/Blackwell bring-up uses <code>SGLANG_DIFFUSION_FLASHINFER_FP4_GEMM_BACKEND=cudnn</code></td>
+    </tr>
+  </tbody>
+</table>
+
+These eight checkpoints are also the intended case set for the B200 diffusion CI
+job (`multimodal-gen-test-1-b200`).
+
+## ModelOpt FP8
+
+### Usage Examples
+
+Converted ModelOpt FP8 checkpoints should be loaded as transformer component
+overrides. If the repo or local directory already contains `config.json`, use
+`--transformer-path`.
+
+```bash
+sglang generate \
+  --model-path black-forest-labs/FLUX.2-dev \
+  --transformer-path lmsys/flux2-dev-modelopt-fp8-sglang-transformer \
+  --prompt "A Logo With Bold Large Text: SGL Diffusion" \
+  --save-output
+```
+
+```bash
+sglang generate \
+  --model-path Wan-AI/Wan2.2-T2V-A14B-Diffusers \
+  --transformer-path lmsys/wan22-t2v-a14b-modelopt-fp8-sglang-transformer \
+  --prompt "a fox walking through neon rain" \
+  --save-output
+```
+
+```bash
+sglang generate \
+  --model-path Qwen/Qwen-Image \
+  --transformer-path lmsys/qwen-image-modelopt-fp8-sglang-transformer \
+  --prompt "A tiny astronaut reading a book under a glass greenhouse" \
+  --save-output
+```
+
+```bash
+sglang generate \
+  --model-path Qwen/Qwen-Image-Edit-2511 \
+  --transformer-path lmsys/qwen-image-edit-modelopt-fp8-sglang-transformer \
+  --image-path /path/to/input.png \
+  --prompt "Turn the scene into a warm watercolor illustration" \
+  --save-output
+```
+
+### Notes
+
+- `--transformer-path` is the canonical flag for converted ModelOpt FP8
+  transformer component repos or directories that already carry `config.json`.
+- If the override repo or local directory contains its own `config.json`,
+  SGLang reads the quantization config from that override instead of relying on
+  the base model config.
+- `--transformer-weights-path` still works when you intentionally point at raw
+  weight files or a directory that should be metadata-probed as weights first.
+- `dit_layerwise_offload` is supported for ModelOpt FP8 checkpoints.
+- `dit_cpu_offload` still stays disabled for ModelOpt FP8 checkpoints.
+- The layerwise offload path now preserves the non-contiguous FP8 weight stride
+  expected by the runtime FP8 GEMM path.
+- On disk, the quantization config stays `quant_method=modelopt` with
+  `quant_algo=FP8`; the `modelopt-fp8` label in this document is a support
+  family name, not a serialized config key.
+- To build the converted checkpoint yourself from a ModelOpt diffusers export,
+  use `python -m sglang.multimodal_gen.tools.build_modelopt_fp8_transformer`.
+
+## ModelOpt NVFP4
+
+### Usage Examples
+
+For mixed ModelOpt NVFP4 transformer overrides that already contain
+`config.json`, keep the base model and quantized transformer separate and use
+`--transformer-path`:
+
+```bash
+sglang generate \
+  --model-path black-forest-labs/FLUX.1-dev \
+  --transformer-path lmsys/flux1-dev-modelopt-nvfp4-sglang-transformer \
+  --prompt "A Logo With Bold Large Text: SGL Diffusion" \
+  --save-output
+```
+
+For raw NVFP4 exports such as the official FLUX.2 release, use
+`--transformer-weights-path`:
+
+```bash
+sglang generate \
+  --model-path black-forest-labs/FLUX.2-dev \
+  --transformer-weights-path black-forest-labs/FLUX.2-dev-NVFP4 \
+  --prompt "A Logo With Bold Large Text: SGL Diffusion" \
+  --save-output
+```
+
+SGLang also supports passing the NVFP4 repo or local directory directly as
+`--model-path`:
+
+```bash
+sglang generate \
+  --model-path black-forest-labs/FLUX.2-dev-NVFP4 \
+  --prompt "A Logo With Bold Large Text: SGL Diffusion" \
+  --save-output
+```
+
+For a dual-transformer Wan2.2 export where only the primary `transformer`
+was quantized:
+
+```bash
+SGLANG_DIFFUSION_FLASHINFER_FP4_GEMM_BACKEND=cudnn \
+sglang generate \
+  --model-path Wan-AI/Wan2.2-T2V-A14B-Diffusers \
+  --transformer-path lmsys/wan22-t2v-a14b-modelopt-nvfp4-sglang-transformer \
+  --prompt "a fox walking through neon rain" \
+  --save-output
+```
+
+### Notes
+
+- Use `--transformer-path` for mixed ModelOpt NVFP4 transformer repos or local
+  directories that already include `config.json`.
+- Use `--transformer-weights-path` for raw NVFP4 exports, individual
+  safetensors files, or repo layouts that should be treated as weights first.
+- For dual-transformer pipelines such as `Wan2.2-T2V-A14B-Diffusers`, the
+  primary `--transformer-path` override targets only `transformer`. Use a
+  per-component override such as `--transformer-2-path` only when you
+  intentionally want a non-default `transformer_2`.
+- On Blackwell, the validated Wan2.2 ModelOpt NVFP4 path currently prefers
+  FlashInfer FP4 GEMM via
+  `SGLANG_DIFFUSION_FLASHINFER_FP4_GEMM_BACKEND=cudnn`.
+- This environment-variable override is a current workaround for NVFP4 cases
+  where the default sglang JIT/CUTLASS `sm100` path rejects a large-M shape at
+  `can_implement()`. The intended long-term fix is to add a validated CUTLASS
+  fallback for those shapes rather than rely on the override.
+- Direct `--model-path` loading is a compatibility path for FLUX.2 NVFP4-style
+  repos or local directories.
+- If `--transformer-weights-path` is provided explicitly, it takes precedence
+  over the compatibility `--model-path` flow.
+- For local directories, SGLang first looks for `*-mixed.safetensors`, then
+  falls back to loading from the directory.
+- To force the generic diffusion ModelOpt FP4 path onto a specific FlashInfer
+  backend, set `SGLANG_DIFFUSION_FLASHINFER_FP4_GEMM_BACKEND`. Supported values
+  include `flashinfer_cudnn`, `flashinfer_cutlass`, and `flashinfer_trtllm`.
+- On disk, the quantization config stays `quant_method=modelopt` with
+  `quant_algo=NVFP4`; the `modelopt-nvfp4` label here is again a documentation
+  family name rather than a serialized config key.
+
+## Nunchaku (SVDQuant)
+
+### Install
+
+Install the runtime dependency first:
+
+```bash
+pip install nunchaku
+```
+
+For platform-specific installation methods and troubleshooting, see the
+[Nunchaku installation guide](https://nunchaku.tech/docs/nunchaku/installation/installation.html).
+
+### File Naming and Auto-Detection
+
+For Nunchaku checkpoints, `--model-path` should still point to the original
+base model, while `--transformer-weights-path` points to the quantized
+transformer weights.
+
+If the basename of `--transformer-weights-path` contains the pattern
+`svdq-(int4|fp4)_r{rank}`, SGLang will automatically:
+- enable SVDQuant
+- infer `--quantization-precision`
+- infer `--quantization-rank`
+
+Examples:
+
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <colgroup>
+    <col style={{width: "25%"}} />
+    <col style={{width: "25%"}} />
+    <col style={{width: "25%"}} />
+    <col style={{width: "25%"}} />
+  </colgroup>
+  <thead>
+    <tr>
+      <th>checkpoint name fragment</th>
+      <th>inferred precision</th>
+      <th>inferred rank</th>
+      <th>notes</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><code>svdq-int4_r32</code></td>
+      <td><code>int4</code></td>
+      <td><code>32</code></td>
+      <td>Standard INT4 checkpoint</td>
+    </tr>
+    <tr>
+      <td><code>svdq-int4_r128</code></td>
+      <td><code>int4</code></td>
+      <td><code>128</code></td>
+      <td>Higher-quality INT4 checkpoint</td>
+    </tr>
+    <tr>
+      <td><code>svdq-fp4_r32</code></td>
+      <td><code>nvfp4</code></td>
+      <td><code>32</code></td>
+      <td><code>fp4</code> in the filename maps to CLI value <code>nvfp4</code></td>
+    </tr>
+    <tr>
+      <td><code>svdq-fp4_r128</code></td>
+      <td><code>nvfp4</code></td>
+      <td><code>128</code></td>
+      <td>Higher-quality NVFP4 checkpoint</td>
+    </tr>
+  </tbody>
+</table>
+
+Common filenames:
+
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <colgroup>
+    <col style={{width: "25%"}} />
+    <col style={{width: "25%"}} />
+    <col style={{width: "25%"}} />
+    <col style={{width: "25%"}} />
+  </colgroup>
+  <thead>
+    <tr>
+      <th>filename</th>
+      <th>precision</th>
+      <th>rank</th>
+      <th>typical use</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><code>svdq-int4_r32-qwen-image.safetensors</code></td>
+      <td><code>int4</code></td>
+      <td><code>32</code></td>
+      <td>Balanced default</td>
+    </tr>
+    <tr>
+      <td><code>svdq-int4_r128-qwen-image.safetensors</code></td>
+      <td><code>int4</code></td>
+      <td><code>128</code></td>
+      <td>Quality-focused</td>
+    </tr>
+    <tr>
+      <td><code>svdq-fp4_r32-qwen-image.safetensors</code></td>
+      <td><code>nvfp4</code></td>
+      <td><code>32</code></td>
+      <td>RTX 50-series / NVFP4 path</td>
+    </tr>
+    <tr>
+      <td><code>svdq-fp4_r128-qwen-image.safetensors</code></td>
+      <td><code>nvfp4</code></td>
+      <td><code>128</code></td>
+      <td>Quality-focused NVFP4</td>
+    </tr>
+    <tr>
+      <td><code>svdq-int4_r32-qwen-image-lightningv1.0-4steps.safetensors</code></td>
+      <td><code>int4</code></td>
+      <td><code>32</code></td>
+      <td>Lightning 4-step</td>
+    </tr>
+    <tr>
+      <td><code>svdq-int4_r128-qwen-image-lightningv1.1-8steps.safetensors</code></td>
+      <td><code>int4</code></td>
+      <td><code>128</code></td>
+      <td>Lightning 8-step</td>
+    </tr>
+  </tbody>
+</table>
+
+If your checkpoint name does not follow this convention, pass
+`--enable-svdquant`, `--quantization-precision`, and `--quantization-rank`
+explicitly.
+
+### Usage Examples
+
+Recommended auto-detected flow:
+
+```bash
+sglang generate \
+  --model-path Qwen/Qwen-Image \
+  --transformer-weights-path /path/to/svdq-int4_r32-qwen-image.safetensors \
+  --prompt "a beautiful sunset" \
+  --save-output
+```
+
+Manual override when the filename does not encode the quant settings:
+
+```bash
+sglang generate \
+  --model-path Qwen/Qwen-Image \
+  --transformer-weights-path /path/to/custom_nunchaku_checkpoint.safetensors \
+  --enable-svdquant \
+  --quantization-precision int4 \
+  --quantization-rank 128 \
+  --prompt "a beautiful sunset" \
+  --save-output
+```
+
+### Notes
+
+- `--transformer-weights-path` is the canonical flag for Nunchaku checkpoints.
+  Older config names such as `quantized_model_path` are treated as
+  compatibility aliases.
+- Auto-detection only happens when the checkpoint basename matches
+  `svdq-(int4|fp4)_r{rank}`.
+- The CLI values are `int4` and `nvfp4`. In filenames, the NVFP4 variant is
+  written as `fp4`.
+- Lightning checkpoints usually expect matching `--num-inference-steps`, such
+  as `4` or `8`.
+- Current runtime validation only allows Nunchaku on NVIDIA CUDA Ampere (SM8x)
+  or SM12x GPUs. Hopper (SM90) is currently rejected.
+
+## [ModelSlim](https://gitcode.com/Ascend/msmodelslim)
+MindStudio-ModelSlim (msModelSlim) is a model offline quantization compression tool launched by MindStudio and optimized for Ascend hardware.
+
+- **Installation**
+
+    ```bash
+    # Clone repo and install msmodelslim:
+    git clone https://gitcode.com/Ascend/msmodelslim.git
+    cd msmodelslim
+    bash install.sh
+    ```
+
+- **Multimodal_sd quantization**
+
+    Download the original floating-point weights of the large model. Taking Wan2.2-T2V-A14B as an example, you can go to [Wan2.2-T2V-A14B](https://modelscope.cn/models/Wan-AI/Wan2.2-T2V-A14B) to obtain the original model weights. Then install other dependencies (related to the model, refer to the modelscope model card).
+    > Note: You can find pre-quantized validated models on [modelscope/Eco-Tech](https://modelscope.cn/models/Eco-Tech).
+
+  Run quantization using one-click quantization (recommended):
+
+  ```bash
+  msmodelslim quant \
+    --model_path /path/to/wan2_2_float_weights \
+    --save_path /path/to/wan2_2_quantized_weights \
+    --device npu \
+    --model_type Wan2_2 \
+    --quant_type w8a8 \
+    --trust_remote_code True
+  ```
+
+  For more detailed examples of quantization of models, as well as information about their support, see the [examples](https://gitcode.com/Ascend/msmodelslim/blob/master/example/multimodal_sd/README.md) section in ModelSLim repo.
+
+  > Note: SGLang does not support quantized embeddings, please disable this option when quantizing using msmodelslim.
+
+- **Auto-Detection and different formats**
+
+    For msmodelslim checkpoints, it's enough to specify only ```--model-path```, the detection of quantization occurs automatically for each layer using parsing of      `quant_model_description.json` config.
+
+    In the case of `Wan2.2` only `Diffusers` weights storage format are supported, whereas modelslim saves the quantized model in the original `Wan2.2` format,
+    for conversion in use `python/sglang/multimodal_gen/tools/wan_repack.py` script:
+
+    ```bash
+    python wan_repack.py \
+      --input-path {path_to_quantized_model} \
+      --output-path {path_to_converted_model}
+    ```
+
+    After that, please copy all files from original `Diffusers` checkpoint (instead of `transformer`/`tranfsormer_2` folders)
+
+- **Usage Example**
+
+    With auto-detected flow:
+
+    ```bash
+    sglang generate \
+      --model-path Eco-Tech/Wan2.2-T2V-A14B-Diffusers-w8a8 \
+      --prompt "a beautiful sunset" \
+      --save-output
+    ```
+
+- **Available Quantization Methods**:
+    - [x]  ```W4A4_DYNAMIC``` linear with online quantization of activations
+    - [x]  ```W8A8``` linear with offline quantization of activations
+    - [x]  ```W8A8_DYNAMIC``` linear with online quantization of activations
+    - [ ]  ```mxfp8``` linear in progress

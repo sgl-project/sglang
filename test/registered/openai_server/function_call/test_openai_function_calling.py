@@ -14,7 +14,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=97, suite="stage-b-test-1-gpu-large")
+register_cuda_ci(est_time=100, suite="stage-b-test-1-gpu-large")
 register_amd_ci(est_time=73, suite="stage-b-test-1-gpu-small-amd")
 
 
@@ -416,8 +416,10 @@ class TestOpenAIServerFunctionCalling(CustomTestCase):
 
     def test_function_call_required(self):
         """
-        Test: Whether tool_choice: "required" works as expected
-        - When tool_choice == "required", the model should return one or more tool_calls.
+        Test: Whether tool_choice: "required" works as expected.
+        - When tool_choice == "required", the model MUST return one or more tool_calls.
+        - The model may choose ANY of the provided tools; we only verify that
+          a tool call exists and the selected name is among the candidates.
         """
         client = openai.Client(api_key=self.api_key, base_url=self.base_url)
 
@@ -459,52 +461,42 @@ class TestOpenAIServerFunctionCalling(CustomTestCase):
                         },
                         "required": ["city"],
                     },
+                    "strict": True,
                 },
             },
         ]
 
-        messages = [{"role": "user", "content": "What is the capital of France?"}]
-        # strict=True ensures constrained decoding enforces the parameter schema.
-        # Without it, tool_choice="required" only guarantees a tool call is made
-        # but arguments are best-effort (may be empty on small models).
-        for tool in tools:
-            tool["function"]["strict"] = True
+        valid_tool_names = {t["function"]["name"] for t in tools}
+
+        messages = [{"role": "user", "content": "Tell me about Paris"}]
         response = client.chat.completions.create(
             model=self.model,
             max_tokens=2048,
             messages=messages,
-            temperature=0.8,
-            top_p=0.8,
+            temperature=0,
             stream=False,
             tools=tools,
             tool_choice="required",
         )
 
         tool_calls = response.choices[0].message.tool_calls
-        self.assertIsNotNone(tool_calls, "No tool_calls in the response")
+        self.assertIsNotNone(
+            tool_calls, "tool_choice='required' must produce tool_calls"
+        )
+        self.assertGreater(len(tool_calls), 0, "tool_calls list should be non-empty")
+
         function_name = tool_calls[0].function.name
+        self.assertIn(
+            function_name,
+            valid_tool_names,
+            f"Function name '{function_name}' is not among the provided tools: {valid_tool_names}",
+        )
+
+        # Verify the arguments are parseable JSON
         arguments = tool_calls[0].function.arguments
         args_obj = json.loads(arguments)
-
-        self.assertEqual(
-            function_name,
-            "get_weather",
-            f"Function name should be 'get_weather', got: {function_name}",
-        )
-        self.assertIn(
-            "city", args_obj, f"Function arguments should have 'city', got: {args_obj}"
-        )
-
-        # Make the test more robust by checking type and accepting valid responses
-        city_value = args_obj["city"]
         self.assertIsInstance(
-            city_value,
-            str,
-            f"Parameter city should be a string, got: {type(city_value)}",
-        )
-        self.assertTrue(
-            "Paris" in city_value or "France" in city_value,
-            f"Parameter city should contain either 'Paris' or 'France', got: {city_value}",
+            args_obj, dict, "Function arguments should be a JSON object"
         )
 
     def test_function_call_specific(self):
