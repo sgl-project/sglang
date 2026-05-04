@@ -520,9 +520,18 @@ class MambaRadixCache(BasePrefixCache):
         ]
 
         if is_insert:
+            # When strip_thinking_cache is active and reasoning tokens exist,
+            # the mamba state covers the full sequence but we only cache the
+            # prompt prefix — the state wouldn't match the cached key.
+            # Skip mamba caching; KV cache still works fine (per-token).
+            skip_mamba_cache = (
+                get_global_server_args().strip_thinking_cache
+                and getattr(req, "reasoning_tokens", 0) > 0
+            )
+
             cache_len = (
                 req.mamba_last_track_seqlen
-                if self.enable_mamba_extra_buffer
+                if self.enable_mamba_extra_buffer and not skip_mamba_cache
                 else len(token_ids)
             )
             if cache_len is None:
@@ -548,7 +557,11 @@ class MambaRadixCache(BasePrefixCache):
 
             # Radix Cache takes one ref in memory pool
             # insert the token_ids and kv_indices into the radix tree
-            if self.enable_mamba_extra_buffer:
+            if skip_mamba_cache:
+                # Skip mamba state caching — state doesn't match cached prefix
+                mamba_value = None
+                mamba_ping_pong_track_buffer_to_keep = None
+            elif self.enable_mamba_extra_buffer:
                 mamba_ping_pong_track_buffer_to_keep = (
                     self.req_to_token_pool.get_mamba_ping_pong_other_idx(
                         req.mamba_next_track_idx
@@ -1109,11 +1122,12 @@ class MambaRadixCache(BasePrefixCache):
     ) -> Tuple[int, bool]:
         # Update the last access time from root to leaf, so that
         # mamba will tombstone the node closer to root first
-        assert mamba_value is not None, "Mamba value should not be None here."
+        # mamba_value may be None when strip_thinking_cache skips mamba caching
+        skip_mamba = mamba_value is None
         node.last_access_time = get_last_access_time()
         if node != self.root_node:
             self.full_lru_list.reset_node_mru(node)
-            if node.mamba_value is not None:
+            if not skip_mamba and node.mamba_value is not None:
                 self.mamba_lru_list.reset_node_mru(node)
         if len(key) == 0:
             return 0, True
@@ -1150,22 +1164,25 @@ class MambaRadixCache(BasePrefixCache):
             new_node.parent = node
             new_node.key = key
             new_node.value = value.clone()
-            new_node.mamba_value = mamba_value
+            new_node.mamba_value = None if skip_mamba else mamba_value
             self.full_lru_list.insert_mru(new_node)
-            self.mamba_lru_list.insert_mru(new_node)
+            if not skip_mamba:
+                self.mamba_lru_list.insert_mru(new_node)
+                self.mamba_evictable_size_ += len(mamba_value)
             node.children[child_key] = new_node
             self.full_evictable_size_ += len(value)
-            self.mamba_evictable_size_ += len(mamba_value)
-        elif node.mamba_value is None:  # add for mamba tombstone
+        elif not skip_mamba and node.mamba_value is None:  # add for mamba tombstone
             node.mamba_value = mamba_value
             self.full_lru_list.reset_node_mru(node)
             self.mamba_lru_list.insert_mru(node)
             self.mamba_evictable_size_ += len(mamba_value)
             node.last_access_time = get_last_access_time()
-        else:  # mamba value already exists
-            mamba_value_exist = True
+        else:  # mamba value already exists or skip_mamba
+            if not skip_mamba:
+                mamba_value_exist = True
             self.full_lru_list.reset_node_mru(node)
-            self.mamba_lru_list.reset_node_mru(node)
+            if not skip_mamba and node.mamba_value is not None:
+                self.mamba_lru_list.reset_node_mru(node)
             node.last_access_time = get_last_access_time()
 
         return total_prefix_length, mamba_value_exist

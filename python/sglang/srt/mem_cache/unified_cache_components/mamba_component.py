@@ -115,7 +115,9 @@ class MambaComponent(TreeComponent):
         params: InsertParams,
         result: InsertResult,
     ) -> None:
-        assert params.mamba_value is not None
+        # mamba_value may be None when strip_thinking_cache skips mamba caching
+        if params.mamba_value is None:
+            return
         if is_new_leaf:
             node.component_data[self.component_type].value = params.mamba_value
             self.cache.lru_lists[self.component_type].insert_mru(node)
@@ -245,6 +247,16 @@ class MambaComponent(TreeComponent):
         token_ids_len: int,
         is_finished: bool,
     ) -> Optional[int]:
+        # When strip_thinking_cache is active and reasoning tokens exist,
+        # the mamba state covers the full sequence but we only cache the
+        # prompt prefix — the state wouldn't match the cached key.
+        # Skip mamba caching entirely; return None so effective_cache_len
+        # is driven by the KV component only.
+        if is_finished and get_global_server_args().strip_thinking_cache:
+            if getattr(req, "reasoning_tokens", 0) > 0:
+                insert_params.mamba_value = None
+                return None
+
         cache_len = (
             req.mamba_last_track_seqlen
             if self.enable_mamba_extra_buffer
