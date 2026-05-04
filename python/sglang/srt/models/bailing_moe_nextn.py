@@ -244,7 +244,10 @@ class BailingMoeForCausalLMNextN(nn.Module):
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         self.base_load_weights_func(self, weights, is_nextn=True)
 
-    def post_load_weights(self, weight_names=None):
+    def post_load_weights(self, is_nextn=True, weight_names=None):
+        # `is_nextn` is pinned to True for the NextN subclass; the parameter is kept
+        # only because the underlying `load_weights` flow calls `self.post_load_weights`
+        # with `is_nextn=...` as a kwarg.
         if self.post_load_weights_func is None:
             return
         self.post_load_weights_func(self, is_nextn=True, weight_names=weight_names)
