@@ -238,14 +238,13 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     && echo '__version__ = "0.0.0"' > sglang/version.py \
     && touch README.md \
     && touch LICENSE \
-    # cu12 torch wheels must be seeded from the cu12x index first: torch 2.11's
-    # default PyPI wheel is cu130, and --extra-index-url below isn't strong
-    # enough to force cu12x resolution when both indexes publish version 2.11.0.
-    && if [ "${CUDA_VERSION%%.*}" = "12" ]; then \
-           python3 -m pip install --index-url https://download.pytorch.org/whl/cu${CUINDEX} \
-               torch torchvision torchaudio ; \
-       fi \
     && python3 -m pip install --extra-index-url https://download.pytorch.org/whl/cu${CUINDEX} ".[${BUILD_TYPE}]" \
+    && if [ "${CUDA_VERSION%%.*}" = "12" ]; then \
+           pip list --format=freeze | awk -F'==' '/-cu13(==|$)/ {print $1}' \
+               | xargs -r python3 -m pip uninstall -y && \
+           python3 -m pip install --index-url https://download.pytorch.org/whl/cu${CUINDEX} \
+               torch torchvision torchaudio --force-reinstall; \
+       fi \
     && cd /sgl-workspace \
     && rm -rf /tmp/sglang_deps \
     && pip freeze | grep -v "^sglang==" > /sgl-workspace/constraints.txt
@@ -541,10 +540,10 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 # it with --no-deps and pair it with the matching nixl-cu12 / nixl-cu13 binary
 # to avoid shipping wrong-CUDA libs on cu13 images.
 RUN --mount=type=cache,target=/root/.cache/pip if [ "${CUDA_VERSION%%.*}" = "12" ]; then \
-    python3 -m pip install nixl nixl-cu12 --no-deps ; \
+    python3 -m pip install nixl-cu12 --no-deps ; \
     python3 -m pip install cuda-python==12.9 ; \
 elif [ "${CUDA_VERSION%%.*}" = "13" ]; then \
-    python3 -m pip install nixl nixl-cu13 --no-deps ; \
+    python3 -m pip install nixl-cu13 --no-deps ; \
     python3 -m pip install cuda-python==13.2.0 ; \
 fi
 
