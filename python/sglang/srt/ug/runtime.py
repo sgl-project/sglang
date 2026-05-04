@@ -154,7 +154,6 @@ class UGSessionRecord:
     srt_request_count: int = 0
     srt_last_request_id: str | None = None
     srt_last_origin_input_len: int = 0
-    srt_last_origin_input_ids: list[int] = field(default_factory=list)
     srt_u_decode_request_count: int = 0
     srt_last_u_decode_request_id: str | None = None
     srt_last_u_decode_origin_input_len: int = 0
@@ -163,8 +162,6 @@ class UGSessionRecord:
     srt_mm_offsets: list[tuple[int, int]] = field(default_factory=list)
     srt_mm_inputs: _UGSessionMMInputs | None = None
     srt_executed_request_count: int = 0
-    srt_last_executed_request_id: str | None = None
-    srt_last_executed_state: str | None = None
     srt_model_runner_forward_request_ids: set[str] = field(default_factory=set)
     srt_sidecar_session_ids: set[str] = field(default_factory=set)
     srt_sidecar_request_count: int = 0
@@ -499,7 +496,6 @@ class UGSessionRuntime:
             "ug_model_state": self._copy_ug_model_state(record.ug_model_state),
             "srt_last_request_id": record.srt_last_request_id,
             "srt_last_origin_input_len": record.srt_last_origin_input_len,
-            "srt_last_origin_input_ids": record.srt_last_origin_input_ids,
             "srt_u_decode_request_count": record.srt_u_decode_request_count,
             "srt_last_u_decode_request_id": record.srt_last_u_decode_request_id,
             "srt_last_u_decode_origin_input_len": (
@@ -509,12 +505,6 @@ class UGSessionRuntime:
             "srt_last_u_decode_text": record.srt_last_u_decode_text,
             "srt_mm_offsets": record.srt_mm_offsets,
             "srt_executed_request_count": record.srt_executed_request_count,
-            "srt_last_executed_request_id": record.srt_last_executed_request_id,
-            "srt_last_executed_state": record.srt_last_executed_state,
-            "srt_model_runner_forward_request_ids": sorted(
-                record.srt_model_runner_forward_request_ids
-            ),
-            "srt_mm_features_released": self._srt_mm_features_released(record),
         }
 
     def _record_for(
@@ -1011,8 +1001,6 @@ class UGSessionRuntime:
                 state=state,
             )
             record.srt_executed_request_count += 1
-            record.srt_last_executed_request_id = req.rid
-            record.srt_last_executed_state = state.value
 
         if getattr(self.srt_request_executor, "finish_request_after_execute", True):
             req.finished_reason = FINISH_LENGTH(len(req.output_ids))
@@ -1027,7 +1015,6 @@ class UGSessionRuntime:
         record.srt_request_count += 1
         record.srt_last_request_id = request_id
         record.srt_last_origin_input_len = len(req.origin_input_ids)
-        record.srt_last_origin_input_ids = list(req.origin_input_ids)
         record.srt_mm_inputs = req.multimodal_inputs
         record.srt_mm_offsets = UGSessionRuntime._collect_mm_offsets(
             req.multimodal_inputs
@@ -1216,10 +1203,10 @@ class UGSessionRuntime:
                 return list(encode(text, add_special_tokens=False))
             except TypeError:
                 return list(encode(text))
-        return self._fake_text_token_ids(text)
+        return self._fallback_text_token_ids(text)
 
     @staticmethod
-    def _fake_text_token_ids(text: str) -> list[int]:
+    def _fallback_text_token_ids(text: str) -> list[int]:
         return [100 + (sum(word.encode("utf-8")) % 1000) for word in text.split()]
 
     @staticmethod
@@ -1230,15 +1217,6 @@ class UGSessionRuntime:
         for item in getattr(mm_inputs, "mm_items", []):
             offsets.extend(getattr(item, "offsets", []) or [])
         return offsets
-
-    @staticmethod
-    def _srt_mm_features_released(record: UGSessionRecord) -> bool:
-        if record.srt_mm_inputs is None:
-            return False
-        for item in record.srt_mm_inputs.mm_items:
-            if item.feature is not None:
-                return False
-        return True
 
     def _ensure_srt_session(self, session_id: str) -> None:
         if self.session_controller is None or session_id in self.session_controller:

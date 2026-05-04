@@ -8,7 +8,7 @@ from copy import deepcopy
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Protocol
+from typing import Any
 
 import torch
 from transformers import AutoTokenizer
@@ -339,7 +339,6 @@ class BAGELSessionContext:
     native_srt_cfg_img_token_count: int | None = None
     native_srt_cfg_img_requires_sidecar: bool = False
     srt_u_forward_results: dict[str, Any] = field(default_factory=dict)
-    srt_u_forward_events: list[tuple[str, str]] = field(default_factory=list)
     srt_last_u_decode_output_ids: tuple[int, ...] = ()
     srt_last_u_decode_text: str = ""
     native_srt_pending_added_tokens: int = 0
@@ -352,7 +351,7 @@ class BAGELUForwardBridge:
     def __init__(
         self,
         *,
-        srt_u_forward_executor: "BAGELSRTUForwardExecutor | None" = None,
+        srt_u_forward_executor: "BAGELNativeSRTUForwardExecutor | None" = None,
     ) -> None:
         if srt_u_forward_executor is None:
             raise BAGELAdapterError(
@@ -373,7 +372,6 @@ class BAGELUForwardBridge:
             session.handle.session_id,
         )
         state = backend._state_for(str(state_session_id))
-        state.srt_u_forward_events.append((request.state, request.request_id))
         result = self.srt_u_forward_executor.execute(
             backend,
             session=session,
@@ -384,25 +382,7 @@ class BAGELUForwardBridge:
             state.srt_u_forward_results[request.request_id] = result
 
 
-class BAGELSRTUForwardExecutor:
-    """Compatibility base for BAGEL U-forward observers."""
-
-    def execute(
-        self,
-        backend: "BAGELInterleaveContextBackend",
-        *,
-        session,
-        request: UGSRTRequestView,
-        messages: list[UGInterleavedMessage],
-    ) -> UGModelPrefillResult | UGModelAppendImageResult | None:
-        del backend, session, request, messages
-        raise BAGELAdapterError(
-            "BAGEL external Python U-forward fallback has been removed; "
-            "use BAGELNativeSRTUForwardExecutor"
-        )
-
-
-class BAGELNativeSRTUForwardExecutor(BAGELSRTUForwardExecutor):
+class BAGELNativeSRTUForwardExecutor:
     """Consumes U-prefill views produced by native SRT BAGEL forward.
 
     It marks the session as SRT-owned so the G denoise path can reuse SRT KV
@@ -1525,61 +1505,10 @@ class BAGELInterleaveContextBackend:
         return int(height), int(width)
 
 
-class BAGELBackendProtocol(Protocol):
-    def prepare_srt_u_message_inputs(
-        self,
-        *,
-        session,
-        message: UGInterleavedMessage,
-        state: UGSegmentState,
-    ) -> list[UGSRTPreparedInput] | None: ...
-
-    def observe_srt_u_forward(
-        self,
-        *,
-        session,
-        request: UGSRTRequestView,
-        messages: list[UGInterleavedMessage],
-    ) -> None: ...
-
-    def prefill_interleaved(
-        self, *, session, messages: list[UGInterleavedMessage]
-    ) -> UGModelPrefillResult: ...
-
-    def decode_next_segment(self, *, session) -> UGDecodeResult: ...
-
-    def decode_vlm_text(
-        self,
-        *,
-        runtime: Any,
-        session: Any,
-        max_new_tokens: int,
-    ) -> UGVLMTextGenerationResult: ...
-
-    def predict_velocity_from_session(
-        self, *, session, request: UGVelocityRequest
-    ) -> torch.Tensor: ...
-
-    def prepare_latents_from_session(
-        self, *, session, request: UGLatentPrepareRequest
-    ) -> UGLatentPrepareResult | None: ...
-
-    def append_generated_image(
-        self, *, session, image: Any | None
-    ) -> UGModelAppendImageResult: ...
-
-    def decode_latents_to_image(
-        self, *, session, request: UGLatentDecodeRequest
-    ) -> Any | None: ...
-
-    def close_session(self, *, session_id: str) -> None: ...
-
-
 class BAGELUGModelAdapter(UGModelAdapterProtocol):
     """BAGEL-facing UG adapter shell.
 
-    The adapter can use either a deterministic mock backend for smoke tests or
-    the SRT-native BAGEL backend. The real backend keeps only tokenizer and
+    The adapter loads the SRT-native BAGEL backend. It keeps tokenizer and
     image transforms in this adapter; SRT owns feature extractors, session
     requests, KV cache, and per-step G velocity execution.
     """
@@ -1588,7 +1517,7 @@ class BAGELUGModelAdapter(UGModelAdapterProtocol):
         self,
         model_path: str,
         *,
-        backend: BAGELBackendProtocol | None = None,
+        backend: Any | None = None,
         native_srt_denoise_executor: BAGELNativeSRTDenoiseExecutor | None = None,
         native_srt_u_context: bool | None = None,
     ) -> None:
@@ -1691,7 +1620,7 @@ class BAGELUGModelAdapter(UGModelAdapterProtocol):
         *,
         native_srt_denoise_executor: BAGELNativeSRTDenoiseExecutor | None = None,
         native_srt_u_context: bool = False,
-    ) -> BAGELBackendProtocol:
+    ) -> Any:
         checkpoint_dir = Path(model_path).expanduser()
         if not checkpoint_dir.exists():
             raise BAGELAdapterError(

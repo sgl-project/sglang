@@ -51,12 +51,8 @@ class UGSRTRequestBoundaryExecutor:
 
     finish_request_after_execute = True
 
-    def __init__(self) -> None:
-        self.events: list[tuple[str, str, int]] = []
-
     def execute_ug_request(self, *, record, req, state) -> None:
-        del record
-        self.events.append((state.value, req.rid, len(req.origin_input_ids)))
+        del record, req, state
 
 
 class UGSRTSchedulerExecutor:
@@ -80,7 +76,6 @@ class UGSRTSchedulerExecutor:
         self.run_synchronously = run_synchronously
         self.max_sync_steps = max_sync_steps
         self.require_idle_scheduler = require_idle_scheduler
-        self.events: list[tuple[str, str, int]] = []
         self.token_bindings: list[UGSRTKVTokenBinding] = []
         self._request_token_bindings: dict[str, UGSRTKVTokenBinding] = {}
         self.ug_u_forward_observer = None
@@ -104,11 +99,10 @@ class UGSRTSchedulerExecutor:
             model_runner.ug_u_forward_observer = observer
 
     def execute_ug_request(self, *, record, req, state) -> None:
-        del record
+        del record, state
         if self.ug_u_forward_observer is not None:
             self.set_ug_u_forward_observer(self.ug_u_forward_observer)
         self._check_scheduler_idle(req)
-        self.events.append((state.value, req.rid, len(req.origin_input_ids)))
         if hasattr(self.scheduler, "init_req_max_new_tokens"):
             self.scheduler.init_req_max_new_tokens(req)
         if not hasattr(self.scheduler, "_add_request_to_queue"):
