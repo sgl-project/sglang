@@ -514,6 +514,13 @@ class TestNgramExternalSamArgs(CustomTestCase):
             )._handle_speculative_decoding()
         self.assertIn("external-corpus-max-tokens", str(context.exception))
 
+    def test_outlines_backend_is_rejected_for_speculative_decoding(self):
+        with self.assertRaises(ValueError) as context:
+            self._make_dummy_ngram_args(
+                grammar_backend="outlines"
+            )._handle_speculative_decoding()
+        self.assertIn("--grammar-backend outlines", str(context.exception))
+
 
 if __name__ == "__main__":
     unittest.main()

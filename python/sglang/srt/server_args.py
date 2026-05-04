@@ -3285,6 +3285,16 @@ class ServerArgs:
                 f"speculative_algorithm == EAGLE, got {self.speculative_algorithm}."
             )
 
+        if (
+            self.speculative_algorithm is not None
+            and self.grammar_backend == "outlines"
+        ):
+            raise ValueError(
+                "Speculative decoding does not currently support "
+                "--grammar-backend outlines. Use xgrammar or llguidance, "
+                "or disable speculative decoding."
+            )
+
         if self.speculative_algorithm == "DFLASH":
             if self.enable_dp_attention:
                 raise ValueError(

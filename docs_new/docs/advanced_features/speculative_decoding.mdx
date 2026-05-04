@@ -118,6 +118,8 @@ SGLang provides several speculative decoding options, including EAGLE-2/EAGLE-3,
 </tbody>
 </table>
 
+`--grammar-backend outlines` is not currently supported with speculative decoding. Launching the server with both `--grammar-backend outlines` and `--speculative-algorithm ...` is rejected during server configuration. Use `xgrammar` or `llguidance`, or disable speculative decoding.
+
 ### Performance Highlights
 
 Please see below for the huge improvements on throughput for LLaMA-Instruct 3.1 8B tested on MT bench that can be achieved via EAGLE3 decoding.

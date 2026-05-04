@@ -432,6 +432,8 @@ SGLang supports two grammar backends:
   - XGrammar currently uses the [GGML BNF format](https://github.com/ggerganov/llama.cpp/blob/master/grammars/README).
 - [Outlines](https://github.com/dottxt-ai/outlines): Supports JSON schema and regular expression constraints.
 
+Outlines currently does not support speculative decoding. Launching the server with both `--grammar-backend outlines` and `--speculative-algorithm ...` is rejected during server configuration. Use `xgrammar` or `llguidance`, or disable speculative decoding.
+
 If instead you want to initialize the Outlines backend, you can use `--grammar-backend outlines` flag:
 
 ```bash Command
