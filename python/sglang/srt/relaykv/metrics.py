@@ -5246,6 +5246,453 @@ def summarize_relaykv_req_to_token_resolution_results_for_smoke(
     }
 
 
+def _blocked_req_to_token_readonly_adapter_payload_for_smoke(
+    plan: dict[str, Any],
+    *,
+    blocking_reasons: list[str],
+    warning_reasons: list[str],
+) -> dict[str, Any]:
+    return {
+        "event_type": "relaykv_req_to_token_readonly_adapter_payload",
+        "adapter_state": "blocked",
+        "adapter_mode": "readonly_bounded_preview",
+        "source": (
+            "kv_index_resolution_plan_to_req_to_token_readonly_adapter_payload"
+        ),
+        "request_id": plan.get("request_id"),
+        "req_pool_idx": plan.get("req_pool_idx"),
+        "seq_len": plan.get("seq_len"),
+        "layer_id": plan.get("layer_id"),
+        "requested_block_count": 0,
+        "requested_token_count": 0,
+        "read_token_count": 0,
+        "preview_entry_count": 0,
+        "preview_entries": [],
+        "entry_count": 0,
+        "entry_min": None,
+        "entry_max": None,
+        "entry_checksum": None,
+        "truncated_preview": False,
+        "req_to_token_read": False,
+        "req_to_token_read_count": 0,
+        "token_to_kv_pool_read": False,
+        "token_to_kv_pool_read_count": 0,
+        "kv_pool_read": False,
+        "kv_snapshot": False,
+        "tensor_read": False,
+        "attention_comparison_executed": False,
+        "attention_override": False,
+        "runtime_writeback": False,
+        "scheduler_policy_noop": True,
+        "kv_cache_mutation": False,
+        "source_mutated": False,
+        "blocking_reasons": blocking_reasons,
+        "warning_reasons": warning_reasons,
+    }
+
+
+def _readonly_adapter_unique_spans_for_smoke(
+    working_spans: list[Any] | tuple[Any, ...],
+    full_spans: list[Any] | tuple[Any, ...],
+    *,
+    seq_len: int,
+) -> tuple[list[dict[str, int]], list[str]]:
+    unique_spans: list[dict[str, int]] = []
+    blocking_reasons: list[str] = []
+    seen: set[tuple[int, int, int]] = set()
+
+    for span in list(full_spans) + list(working_spans):
+        if not isinstance(span, dict):
+            blocking_reasons.append("invalid_block_span")
+            continue
+        block_id = span.get("block_id")
+        token_start = span.get("token_start")
+        token_end = span.get("token_end")
+        token_count = span.get("token_count")
+        if isinstance(block_id, bool) or not isinstance(block_id, int):
+            blocking_reasons.append("invalid_block_span")
+            continue
+        if not isinstance(token_start, int) or not isinstance(token_end, int):
+            blocking_reasons.append("invalid_block_span")
+            continue
+        if not isinstance(token_count, int) or token_count != token_end - token_start:
+            blocking_reasons.append("invalid_block_span")
+            continue
+        if token_start < 0 or token_end <= token_start:
+            blocking_reasons.append("invalid_block_span")
+            continue
+        if token_end > seq_len:
+            blocking_reasons.append("token_span_out_of_seq_len")
+            continue
+        span_key = (block_id, token_start, token_end)
+        if span_key in seen:
+            continue
+        seen.add(span_key)
+        unique_spans.append(
+            {
+                "block_id": block_id,
+                "token_start": token_start,
+                "token_end": token_end,
+                "token_count": token_count,
+            }
+        )
+
+    return unique_spans, list(dict.fromkeys(blocking_reasons))
+
+
+def _read_req_to_token_entries_for_smoke(
+    spans: list[dict[str, int]],
+    *,
+    req_to_token_backing: list[Any] | tuple[Any, ...],
+) -> tuple[list[int], list[str]]:
+    read_entries: list[int] = []
+    blocking_reasons: list[str] = []
+
+    for span in spans:
+        token_start = span["token_start"]
+        token_end = span["token_end"]
+        for position in range(token_start, token_end):
+            if position >= len(req_to_token_backing):
+                blocking_reasons.append("token_position_out_of_req_to_token_table")
+                return [], list(dict.fromkeys(blocking_reasons))
+            entry = req_to_token_backing[position]
+            if isinstance(entry, bool) or not isinstance(entry, int):
+                blocking_reasons.append("req_to_token_entry_not_int")
+                return [], list(dict.fromkeys(blocking_reasons))
+            read_entries.append(entry)
+
+    return read_entries, list(dict.fromkeys(blocking_reasons))
+
+
+def build_relaykv_req_to_token_readonly_adapter_payloads_for_smoke(
+    kv_index_resolution_plans: list[dict[str, Any]]
+    | tuple[dict[str, Any], ...],
+    req_to_token_backing_by_req_pool_idx: dict[Any, Any] | None = None,
+    read_req_to_token: bool = False,
+    max_tokens_per_request: int = 256,
+    max_blocks_per_request: int = 4,
+    max_total_tokens: int = 512,
+    max_preview_entries: int = 8,
+) -> list[dict[str, Any]]:
+    """Build bounded readonly req_to_token adapter payloads for smoke."""
+
+    if not isinstance(kv_index_resolution_plans, (list, tuple)):
+        raise TypeError("kv_index_resolution_plans must be a list or tuple")
+    if (
+        read_req_to_token
+        and req_to_token_backing_by_req_pool_idx is not None
+        and not isinstance(req_to_token_backing_by_req_pool_idx, dict)
+    ):
+        raise TypeError(
+            "req_to_token_backing_by_req_pool_idx must be a dict when "
+            "read_req_to_token=True"
+        )
+
+    total_requested_token_count = 0
+    payloads: list[dict[str, Any]] = []
+
+    for plan in kv_index_resolution_plans:
+        if not isinstance(plan, dict):
+            raise TypeError(
+                "RelayKV req_to_token readonly adapter inputs must be dict plans"
+            )
+
+        blocking_reasons: list[str] = []
+        warning_reasons = [
+            "readonly_bounded_req_to_token_adapter",
+            "no_token_to_kv_pool_read",
+            "preview_only_no_full_entries_logged",
+        ]
+
+        request_id = plan.get("request_id")
+        req_pool_idx_value = plan.get("req_pool_idx")
+        req_pool_idx = _req_to_token_int_like_value_for_smoke(req_pool_idx_value)
+        seq_len = plan.get("seq_len")
+        layer_id = plan.get("layer_id")
+        working_spans = plan.get("relaykv_working_block_spans")
+        full_spans = plan.get("full_kv_block_spans")
+
+        if plan.get("event_type") != "relaykv_kv_index_resolution_plan":
+            blocking_reasons.append("not_kv_index_resolution_plan")
+        if plan.get("resolution_state") != "block_span_resolved":
+            blocking_reasons.append("kv_index_resolution_not_block_span_resolved")
+        if plan.get("resolution_mode") != "metadata_only":
+            blocking_reasons.append("kv_index_resolution_not_metadata_only")
+        if read_req_to_token is not True:
+            blocking_reasons.append("read_req_to_token_not_enabled")
+        if req_pool_idx is None:
+            blocking_reasons.append("req_pool_idx_missing_or_invalid")
+        if not isinstance(seq_len, int) or isinstance(seq_len, bool) or seq_len <= 0:
+            blocking_reasons.append("seq_len_missing_or_invalid")
+        if not isinstance(working_spans, (list, tuple)) or not working_spans:
+            blocking_reasons.append("invalid_block_span")
+        if not isinstance(full_spans, (list, tuple)) or not full_spans:
+            blocking_reasons.append("invalid_block_span")
+        if plan.get("token_to_kv_pool_read") is True:
+            blocking_reasons.append("token_to_kv_pool_read_not_allowed")
+        if plan.get("kv_pool_read") is True:
+            blocking_reasons.append("kv_pool_read_not_allowed")
+        if plan.get("tensor_read") is True:
+            blocking_reasons.append("tensor_read_not_allowed")
+        if plan.get("attention_comparison_executed") is True:
+            blocking_reasons.append("attention_comparison_executed_not_allowed")
+        if plan.get("attention_override") is True:
+            blocking_reasons.append("attention_override_true_not_allowed")
+        if read_req_to_token and req_to_token_backing_by_req_pool_idx is None:
+            blocking_reasons.append("req_to_token_backing_missing")
+
+        if blocking_reasons:
+            payloads.append(
+                _blocked_req_to_token_readonly_adapter_payload_for_smoke(
+                    plan,
+                    blocking_reasons=list(dict.fromkeys(blocking_reasons)),
+                    warning_reasons=warning_reasons,
+                )
+            )
+            continue
+
+        assert isinstance(seq_len, int)
+        assert isinstance(working_spans, (list, tuple))
+        assert isinstance(full_spans, (list, tuple))
+        assert isinstance(req_to_token_backing_by_req_pool_idx, dict)
+
+        req_to_token_backing = _req_to_token_table_for_req_pool_idx_for_smoke(
+            req_to_token_backing_by_req_pool_idx,
+            req_pool_idx,
+        )
+        if req_to_token_backing is None:
+            blocking_reasons.append("req_to_token_backing_for_req_pool_missing")
+        elif not isinstance(req_to_token_backing, (list, tuple)):
+            blocking_reasons.append("req_to_token_backing_not_list_or_tuple")
+
+        unique_spans: list[dict[str, int]] = []
+        if not blocking_reasons:
+            unique_spans, span_blocking_reasons = _readonly_adapter_unique_spans_for_smoke(
+                working_spans,
+                full_spans,
+                seq_len=seq_len,
+            )
+            blocking_reasons.extend(span_blocking_reasons)
+
+        requested_block_count = len(unique_spans)
+        requested_token_count = sum(span["token_count"] for span in unique_spans)
+
+        if requested_block_count > max_blocks_per_request:
+            blocking_reasons.append("requested_block_count_exceeds_limit")
+        if requested_token_count > max_tokens_per_request:
+            blocking_reasons.append("requested_token_count_exceeds_limit")
+        if total_requested_token_count + requested_token_count > max_total_tokens:
+            blocking_reasons.append("total_requested_token_count_exceeds_limit")
+
+        if blocking_reasons:
+            payloads.append(
+                _blocked_req_to_token_readonly_adapter_payload_for_smoke(
+                    plan,
+                    blocking_reasons=list(dict.fromkeys(blocking_reasons)),
+                    warning_reasons=warning_reasons,
+                )
+            )
+            continue
+
+        assert isinstance(req_to_token_backing, (list, tuple))
+        read_entries, read_blocking_reasons = _read_req_to_token_entries_for_smoke(
+            unique_spans,
+            req_to_token_backing=req_to_token_backing,
+        )
+        if read_blocking_reasons:
+            payloads.append(
+                _blocked_req_to_token_readonly_adapter_payload_for_smoke(
+                    plan,
+                    blocking_reasons=read_blocking_reasons,
+                    warning_reasons=warning_reasons,
+                )
+            )
+            continue
+
+        total_requested_token_count += requested_token_count
+        preview_entries = list(read_entries[:max_preview_entries])
+        read_token_count = len(read_entries)
+        payloads.append(
+            {
+                "event_type": "relaykv_req_to_token_readonly_adapter_payload",
+                "adapter_state": "adapter_payload_ready",
+                "adapter_mode": "readonly_bounded_preview",
+                "source": (
+                    "kv_index_resolution_plan_to_req_to_token_readonly_adapter_payload"
+                ),
+                "request_id": request_id,
+                "req_pool_idx": req_pool_idx_value,
+                "seq_len": seq_len,
+                "layer_id": layer_id,
+                "requested_block_count": requested_block_count,
+                "requested_token_count": requested_token_count,
+                "read_token_count": read_token_count,
+                "preview_entry_count": len(preview_entries),
+                "preview_entries": preview_entries,
+                "entry_count": read_token_count,
+                "entry_min": min(read_entries) if read_entries else None,
+                "entry_max": max(read_entries) if read_entries else None,
+                "entry_checksum": (
+                    sum((index + 1) * entry for index, entry in enumerate(read_entries))
+                    % 1000000007
+                ),
+                "truncated_preview": read_token_count > len(preview_entries),
+                "req_to_token_read": True,
+                "req_to_token_read_count": read_token_count,
+                "token_to_kv_pool_read": False,
+                "token_to_kv_pool_read_count": 0,
+                "kv_pool_read": False,
+                "kv_snapshot": False,
+                "tensor_read": False,
+                "attention_comparison_executed": False,
+                "attention_override": False,
+                "runtime_writeback": False,
+                "scheduler_policy_noop": True,
+                "kv_cache_mutation": False,
+                "source_mutated": False,
+                "blocking_reasons": [],
+                "warning_reasons": warning_reasons,
+            }
+        )
+
+    return payloads
+
+
+def summarize_relaykv_req_to_token_readonly_adapter_payloads_for_smoke(
+    payloads: list[dict[str, Any]] | tuple[dict[str, Any], ...],
+) -> dict[str, Any]:
+    """Summarize bounded readonly req_to_token adapter payloads for smoke."""
+
+    if not isinstance(payloads, (list, tuple)):
+        raise TypeError(
+            "RelayKV req_to_token readonly adapter payloads must be a list or tuple"
+        )
+
+    per_request: Counter[str] = Counter()
+    per_layer: Counter[str] = Counter()
+    per_adapter_state: Counter[str] = Counter()
+    safety_counts: Counter[str] = Counter(
+        {
+            "req_to_token_read_count": 0,
+            "token_to_kv_pool_read_count": 0,
+            "kv_pool_read_count": 0,
+            "kv_snapshot_count": 0,
+            "tensor_read_count": 0,
+            "attention_comparison_executed_count": 0,
+            "attention_override_true_count": 0,
+            "runtime_writeback_true_count": 0,
+            "scheduler_policy_noop_false_count": 0,
+            "kv_cache_mutation_true_count": 0,
+            "source_mutated_true_count": 0,
+        }
+    )
+    adapter_payload_ready_count = 0
+    blocked_count = 0
+    error_count = 0
+    requested_block_count = 0
+    requested_token_count = 0
+    read_token_count = 0
+    preview_entry_count = 0
+    truncated_preview_count = 0
+
+    for payload in payloads:
+        if not isinstance(payload, dict):
+            raise TypeError(
+                "RelayKV req_to_token readonly adapter payload must be a dict"
+            )
+
+        state = str(payload.get("adapter_state") or "unknown")
+        per_adapter_state[state] += 1
+        per_request[str(payload.get("request_id"))] += 1
+        per_layer[str(payload.get("layer_id"))] += 1
+
+        if state == "adapter_payload_ready":
+            adapter_payload_ready_count += 1
+        elif state == "blocked":
+            blocked_count += 1
+        elif state == "error":
+            error_count += 1
+
+        value = payload.get("requested_block_count")
+        if isinstance(value, int) and not isinstance(value, bool):
+            requested_block_count += value
+        value = payload.get("requested_token_count")
+        if isinstance(value, int) and not isinstance(value, bool):
+            requested_token_count += value
+        value = payload.get("read_token_count")
+        if isinstance(value, int) and not isinstance(value, bool):
+            read_token_count += value
+        value = payload.get("preview_entry_count")
+        if isinstance(value, int) and not isinstance(value, bool):
+            preview_entry_count += value
+        if payload.get("truncated_preview") is True:
+            truncated_preview_count += 1
+
+        value = payload.get("req_to_token_read_count")
+        if isinstance(value, int) and not isinstance(value, bool):
+            safety_counts["req_to_token_read_count"] += value
+        value = payload.get("token_to_kv_pool_read_count")
+        if isinstance(value, int) and not isinstance(value, bool):
+            safety_counts["token_to_kv_pool_read_count"] += value
+        if payload.get("kv_pool_read") is True:
+            safety_counts["kv_pool_read_count"] += 1
+        if payload.get("kv_snapshot") is True:
+            safety_counts["kv_snapshot_count"] += 1
+        if payload.get("tensor_read") is True:
+            safety_counts["tensor_read_count"] += 1
+        if payload.get("attention_comparison_executed") is True:
+            safety_counts["attention_comparison_executed_count"] += 1
+        if payload.get("attention_override") is True:
+            safety_counts["attention_override_true_count"] += 1
+        if payload.get("runtime_writeback") is True:
+            safety_counts["runtime_writeback_true_count"] += 1
+        if payload.get("scheduler_policy_noop") is False:
+            safety_counts["scheduler_policy_noop_false_count"] += 1
+        if payload.get("kv_cache_mutation") is True:
+            safety_counts["kv_cache_mutation_true_count"] += 1
+        if payload.get("source_mutated") is True:
+            safety_counts["source_mutated_true_count"] += 1
+
+    return {
+        "summary_type": "relaykv_req_to_token_readonly_adapter_payload_summary",
+        "total_req_to_token_adapter_payloads": len(payloads),
+        "adapter_payload_ready_count": adapter_payload_ready_count,
+        "blocked_count": blocked_count,
+        "error_count": error_count,
+        "requested_block_count": requested_block_count,
+        "requested_token_count": requested_token_count,
+        "read_token_count": read_token_count,
+        "preview_entry_count": preview_entry_count,
+        "truncated_preview_count": truncated_preview_count,
+        "per_request_counts": dict(sorted(per_request.items())),
+        "per_layer_counts": dict(sorted(per_layer.items())),
+        "per_adapter_state_counts": dict(sorted(per_adapter_state.items())),
+        "req_to_token_read_count": safety_counts["req_to_token_read_count"],
+        "token_to_kv_pool_read_count": (
+            safety_counts["token_to_kv_pool_read_count"]
+        ),
+        "kv_pool_read_count": safety_counts["kv_pool_read_count"],
+        "kv_snapshot_count": safety_counts["kv_snapshot_count"],
+        "tensor_read_count": safety_counts["tensor_read_count"],
+        "attention_comparison_executed_count": (
+            safety_counts["attention_comparison_executed_count"]
+        ),
+        "attention_override_true_count": (
+            safety_counts["attention_override_true_count"]
+        ),
+        "runtime_writeback_true_count": (
+            safety_counts["runtime_writeback_true_count"]
+        ),
+        "scheduler_policy_noop_false_count": (
+            safety_counts["scheduler_policy_noop_false_count"]
+        ),
+        "kv_cache_mutation_true_count": (
+            safety_counts["kv_cache_mutation_true_count"]
+        ),
+        "source_mutated_true_count": safety_counts["source_mutated_true_count"],
+    }
+
+
 def log_policy_summary(
     events: Iterable[RelayKVPlan | Mapping[str, Any]],
     *,
