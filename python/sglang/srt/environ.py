@@ -615,7 +615,6 @@ class Envs:
 
     # CUDA graph
     SGLANG_PREP_IN_CUDA_GRAPH = EnvBool(True)
-    SGLANG_OPT_V4_DRAFT_EXTEND_CUDA_GRAPH = EnvBool(False)  # usually not useful
 
     # Distributed
     SGLANG_DSV4_FIX_TP_ATTN_A2A_SCATTER = EnvBool(True)

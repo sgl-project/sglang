@@ -12,7 +12,6 @@ from sglang.srt.hardware_backend.npu.graph_runner.eagle_draft_extend_npu_graph_r
 from sglang.srt.hardware_backend.npu.graph_runner.eagle_draft_npu_graph_runner import (
     EAGLEDraftNpuGraphRunner,
 )
-from sglang.srt.layers.attention.deepseek_v4_backend_radix import DeepseekV4BackendRadix
 from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
 from sglang.srt.layers.attention.trtllm_mla_backend import (
     TRTLLMMLABackend,
@@ -311,11 +310,6 @@ class EagleDraftWorker(BaseDraftWorker):
             _is_npu
             or supports_cuda_draft_extend_graph
             or supports_hip_aiter_draft_extend_graph
-            or (
-                _is_cuda
-                and isinstance(self.draft_extend_attn_backend, DeepseekV4BackendRadix)
-                and envs.SGLANG_OPT_V4_DRAFT_EXTEND_CUDA_GRAPH.get()
-            )
         ):
             tic = time.perf_counter()
             before_mem = get_available_gpu_memory(self.device, self.gpu_id)
