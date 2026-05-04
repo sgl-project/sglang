@@ -289,11 +289,42 @@ class VerifyWorker:
 
         return verify_output.verified_id, raw_accept_lens
 
-    def _build_verify_input(self, batch: ScheduleBatch) -> EagleVerifyInput:
+    def draft(self, batch: ScheduleBatch) -> EagleVerifyInput:
+        if batch.forward_mode.is_idle():
+            return EagleVerifyInput.create_idle_input(
+                self.topk,
+                self.speculative_num_steps,
+                self.speculative_num_draft_tokens,
+            )
+
         draft_token_num = self.speculative_num_draft_tokens
         if draft_token_num < 2:
             raise RuntimeError(
                 "External draft verification requires at least one draft token per request."
+            )
+
+        batch.maybe_evict_swa()
+        for req in batch.reqs:
+            req.decode_batch_idx += 1
+        seq_lens_sum = int(torch.sum(batch.seq_lens).item())
+        batch.seq_lens_sum = seq_lens_sum
+
+        # Accumulate penalty
+        sampling_info = getattr(batch, "sampling_info", None)
+        penalizer_orchestrator = getattr(
+            sampling_info, "penalizer_orchestrator", None
+        )
+        if (
+            penalizer_orchestrator is not None
+            and penalizer_orchestrator.is_required
+            and batch.reqs
+        ):
+            penalizer_orchestrator.cumulate_output_tokens(
+                torch.tensor(
+                    [_get_req_tail_token_id(req) for req in batch.reqs],
+                    dtype=torch.int64,
+                    device=batch.device,
+                )
             )
 
         pad_token_id = self._get_pad_token_id()
@@ -313,7 +344,6 @@ class VerifyWorker:
         )
 
         batch_size = batch.batch_size()
-        seq_lens_sum = int(torch.sum(batch.seq_lens).item())
         selected_index, parent_list = _build_linear_topk1_tree_metadata(
             batch_size,
             spec_steps,
@@ -365,7 +395,7 @@ class VerifyWorker:
             result = self.target_worker.forward_batch_generation(model_worker_batch)
             return result
 
-        spec_info = self._build_verify_input(batch)
+        spec_info = self.draft(batch)
         can_use_full_graph_path = (
             spec_info.draft_token_num == self.speculative_num_draft_tokens
         )

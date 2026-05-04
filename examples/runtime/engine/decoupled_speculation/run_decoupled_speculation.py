@@ -267,8 +267,8 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help=(
             "Mamba scheduler strategy for the target/verifier engine. "
-            "For Qwen3.5 decoupled speculation with radix cache, use extra_buffer. "
-            "The drafter keeps its default no_buffer strategy because radix cache is disabled there."
+            "Decoupled verifier and drafter engines disable radix cache, so "
+            "the default no_buffer strategy is normally sufficient."
         ),
     )
     parser.add_argument("--draft-tp-size", type=int, default=1)

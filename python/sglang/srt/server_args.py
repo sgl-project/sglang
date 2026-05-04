@@ -2221,8 +2221,9 @@ class ServerArgs:
             else:
                 if not self.disable_radix_cache:
                     raise ValueError(
-                        f"Speculative decoding for {model_arch} is not compatible with radix cache when using --mamba-scheduler-strategy no_buffer."
-                        "To use radix cache with speculative decoding, please use --mamba-scheduler-strategy extra_buffer and set SGLANG_ENABLE_SPEC_V2=1."
+                        f"Speculative decoding for {model_arch} is not compatible with radix cache when using --mamba-scheduler-strategy no_buffer. "
+                        "To use radix cache with speculative decoding, please use --mamba-scheduler-strategy extra_buffer. "
+                        "For overlap speculative decoding, also set SGLANG_ENABLE_SPEC_V2=1."
                     )
 
     def _handle_sampling_backend(self):

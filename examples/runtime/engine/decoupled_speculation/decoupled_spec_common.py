@@ -281,6 +281,7 @@ def launch_verifier(
         speculative_num_draft_tokens=speculative_num_draft_tokens,
         decoupled_spec_control_endpoints=control_endpoints,
         decoupled_spec_result_endpoints=result_endpoints,
+        disable_radix_cache=True,
     )
     if mamba_scheduler_strategy is not None:
         engine_kwargs["mamba_scheduler_strategy"] = mamba_scheduler_strategy
@@ -490,6 +491,7 @@ class TargetActor:
                 speculative_num_draft_tokens=speculative_num_steps + 1,
                 decoupled_spec_control_endpoints=control_endpoints,
                 decoupled_spec_result_endpoints=result_endpoints,
+                disable_radix_cache=True,
             )
         elif mode == "decode":
             engine_kwargs["disable_piecewise_cuda_graph"] = True
