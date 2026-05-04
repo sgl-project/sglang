@@ -1,21 +1,29 @@
 # SPDX-License-Identifier: Apache-2.0
 
-from types import SimpleNamespace
 from unittest.mock import patch
 import unittest
 
 from sglang.multimodal_gen.configs.pipeline_configs.ug import UGPipelineConfig
+from sglang.multimodal_gen.configs.sample.ug import UGSamplingParams
 from sglang.multimodal_gen.runtime.pipelines.ug import (
     _build_ug_g_segment_executor,
     _load_ug_bridge,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.ug_bagel import (
     BAGELLatentFlowGSegmentExecutor,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.ug_u1 import (
     U1PixelFlowGSegmentExecutor,
+    _u1_guidance_branch,
+    _u1_patch_grid,
+    _u1_timesteps,
 )
-from sglang.multimodal_gen.runtime.pipelines_core.stages.ug import UGGSegmentStage
+from sglang.multimodal_gen.runtime.pipelines_core.stages.ug import (
+    UGContextStage,
+    UGDecodeStage,
+    UGGSegmentStage,
+)
 from sglang.srt.session.session_controller import SessionController
 from sglang.srt.ug.adapter import UGModelRunnerAdapter
 from sglang.srt.ug.context import UGContextBundle, UGContextHandle, UGSessionHandle
@@ -43,8 +51,6 @@ class TestU1UGBackendShell(unittest.TestCase):
     def test_unwired_generation_methods_fail_clearly_until_wired(self):
         adapter = U1UGModelAdapter()
 
-        with self.assertRaisesRegex(NotImplementedError, "SenseNova U1"):
-            adapter.decode_next_segment(session=None)
         with self.assertRaisesRegex(NotImplementedError, "SenseNova U1"):
             adapter.decode_vlm_text(runtime=None, session=None, max_new_tokens=1)
 
@@ -149,6 +155,30 @@ class TestU1UGBackendShell(unittest.TestCase):
 
         self.assertEqual(executor.required_g_kind, "pixel_flow")
 
+    def test_u1_patch_grid_ceil_aligns_to_patch_size(self):
+        self.assertEqual(_u1_patch_grid(height=33, width=65, patch_size=16), (3, 5))
+
+    def test_u1_timesteps_use_num_inference_steps(self):
+        timesteps = _u1_timesteps(num_inference_steps=4, timestep_shift=2.0)
+
+        self.assertEqual(len(timesteps), 4)
+        self.assertGreater(timesteps[0], timesteps[-1])
+
+    def test_u1_guidance_branch_selection(self):
+        self.assertEqual(_u1_guidance_branch(_sampling()), "none")
+        self.assertEqual(
+            _u1_guidance_branch(_sampling(cfg_text_scale=2.0)),
+            "text",
+        )
+        self.assertEqual(
+            _u1_guidance_branch(_sampling(cfg_img_scale=2.0)),
+            "image",
+        )
+        self.assertEqual(
+            _u1_guidance_branch(_sampling(cfg_text_scale=2.0, cfg_img_scale=2.0)),
+            "text_image",
+        )
+
     def test_u1_g_executor_is_accepted_by_pixel_flow_bridge(self):
         bridge = PixelFlowBridge()
         server_args = _make_ug_server_args()
@@ -172,16 +202,74 @@ class TestU1UGBackendShell(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "pixel_flow"):
                 UGGSegmentStage(bridge, U1PixelFlowGSegmentExecutor())
 
-    def test_u1_g_executor_call_fails_clearly_until_wired(self):
+    def test_u1_g_executor_returns_image_and_metadata(self):
         executor = U1PixelFlowGSegmentExecutor()
+        batch = Req(
+            sampling_params=_sampling(
+                height=8,
+                width=8,
+                num_inference_steps=3,
+                cfg_text_scale=2.0,
+            ),
+            prompt="draw a cup",
+            seed=7,
+        )
 
-        with self.assertRaisesRegex(NotImplementedError, "pixel-flow executor"):
-            executor(
-                bridge=PixelFlowBridge(),
-                contexts=_make_contexts(),
-                batch=SimpleNamespace(),
-                server_args=_make_ug_server_args(),
+        result = executor(
+            bridge=PixelFlowBridge(),
+            contexts=_make_contexts(),
+            batch=batch,
+            server_args=_make_ug_server_args(),
+        )
+
+        self.assertEqual(result.type, "image")
+        self.assertEqual(result.image.size, (8, 8))
+        self.assertEqual(result.metadata["g_kind"], "pixel_flow")
+        self.assertEqual(result.metadata["grid"], (1, 1))
+        self.assertEqual(result.metadata["timesteps"], 3)
+        self.assertEqual(result.metadata["guidance"], "text")
+        self.assertFalse(result.metadata["temporary_g_kv"])
+
+    def test_u1_common_stages_run_text_image_text_light_smoke(self):
+        bridge = _load_ug_bridge("sensenova/SenseNova-U1-8B-MoT")
+        server_args = _make_ug_server_args()
+        batch = Req(
+            sampling_params=_sampling(
+                height=8,
+                width=8,
+                num_inference_steps=2,
+            ),
+            prompt="draw a cup",
+            seed=11,
+            extra={"ug_request_metadata": {"mode": "interleave"}},
+        )
+
+        with patch(
+            "sglang.multimodal_gen.runtime.pipelines_core.stages.base."
+            "get_global_server_args",
+            return_value=server_args,
+        ):
+            batch = UGContextStage(bridge).forward(batch, server_args)
+            session = batch.extra["ug_contexts"].full.session
+            session_id = session.session_id
+            batch = UGGSegmentStage(bridge, U1PixelFlowGSegmentExecutor()).forward(
+                batch,
+                server_args,
             )
+            self.assertEqual(
+                bridge.runtime.get_debug_counters(session_id)["append_image_count"],
+                0,
+            )
+            batch = UGDecodeStage(bridge).forward(batch, server_args)
+
+        outputs = batch.extra["ug_output_segments"]
+        self.assertEqual([segment["type"] for segment in outputs], ["image", "text"])
+        self.assertIn("u1_pixel_flow", outputs[1]["text"])
+        self.assertEqual(
+            bridge.runtime.get_debug_counters(session_id)["append_image_count"],
+            1,
+        )
+        bridge.release(batch.extra["ug_contexts"])
 
     def test_pipeline_dispatch_selects_u1_executor_for_pixel_flow(self):
         executor = _build_ug_g_segment_executor(PixelFlowBridge())
@@ -198,8 +286,9 @@ class TestU1UGBackendShell(unittest.TestCase):
 
         self.assertEqual(bridge.g_kind, "pixel_flow")
         self.assertFalse(hasattr(bridge, "prepare_g_latents"))
-        with self.assertRaisesRegex(NotImplementedError, "SenseNova U1"):
-            bridge.prepare_u_context(prompt="draw a cup", image=None)
+        contexts = bridge.prepare_u_context(prompt="draw a cup", image=None)
+        self.assertEqual(contexts.full.session.context_version, 1)
+        bridge.release(contexts)
 
 
 class PixelFlowBridge:
@@ -233,13 +322,30 @@ def _make_contexts():
 
 
 def _make_ug_server_args():
-    return SimpleNamespace(
+    return FakeServerArgs(
         pipeline_config=UGPipelineConfig(default_height=4, default_width=4),
         num_gpus=1,
         enable_cfg_parallel=False,
         disagg_mode=False,
         comfyui_mode=True,
     )
+
+
+def _sampling(**kwargs):
+    values = {
+        "height": 8,
+        "width": 8,
+        "num_inference_steps": 2,
+        "cfg_text_scale": 1.0,
+        "cfg_img_scale": 1.0,
+    }
+    values.update(kwargs)
+    return UGSamplingParams(**values)
+
+
+class FakeServerArgs:
+    def __init__(self, **kwargs):
+        self.__dict__.update(kwargs)
 
 
 def _has_kv_allocator_detail(value):

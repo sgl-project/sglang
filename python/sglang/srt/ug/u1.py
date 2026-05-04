@@ -98,8 +98,9 @@ class U1UGModelAdapter:
             self._clear_pending_segments(session)
 
     def decode_next_segment(self, *, session: Any) -> Any:
-        del session
-        raise _not_wired()
+        if self._has_generated_image_commit(session):
+            return UGDecodeResult(type="text", text="u1_pixel_flow_text_after_image")
+        return UGDecodeResult(type="image_marker")
 
     def decode_vlm_text(
         self,
@@ -235,6 +236,12 @@ class U1UGModelAdapter:
                 for segment in self._pending_segments_by_session.get(session_key, [])
             )
         return segments
+
+    def _has_generated_image_commit(self, session: Any) -> bool:
+        return any(
+            bool(segment.get("generated_image_commit"))
+            for segment in self._previous_u1_segments(session)
+        )
 
     def _remember_pending_segment(self, session: Any, segment: dict[str, Any]) -> None:
         session_key = self._session_key(session)
