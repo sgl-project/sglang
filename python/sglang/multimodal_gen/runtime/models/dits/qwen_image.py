@@ -642,10 +642,19 @@ class QwenImageCrossAttention(nn.Module):
         image_rotary_emb: tuple[torch.Tensor, torch.Tensor],
         **cross_attention_kwargs,
     ):
+        """Run joint text-image attention.
+
+        `attn_mask` or `attention_mask` takes precedence. Otherwise,
+        `encoder_hidden_states_mask` keeps valid text tokens in the joint
+        text-image sequence.
+        """
         seq_len_txt = encoder_hidden_states.shape[1]
         attn_mask = cross_attention_kwargs.get("attn_mask")
         if attn_mask is None:
             attn_mask = cross_attention_kwargs.get("attention_mask")
+        encoder_hidden_states_mask = cross_attention_kwargs.get(
+            "encoder_hidden_states_mask"
+        )
 
         img_query, img_key, img_value, txt_query, txt_key, txt_value = (
             _get_qkv_projections(self, hidden_states, encoder_hidden_states)
@@ -704,6 +713,16 @@ class QwenImageCrossAttention(nn.Module):
         joint_query = torch.cat([txt_query, img_query], dim=1)
         joint_key = torch.cat([txt_key, img_key], dim=1)
         joint_value = torch.cat([txt_value, img_value], dim=1)
+        if attn_mask is None and encoder_hidden_states_mask is not None:
+            image_mask = torch.ones(
+                (hidden_states.shape[0], img_query.shape[1]),
+                device=encoder_hidden_states_mask.device,
+                dtype=torch.bool,
+            )
+            attn_mask = torch.cat(
+                [encoder_hidden_states_mask.to(dtype=torch.bool), image_mask],
+                dim=1,
+            )
 
         # Compute joint attention
         joint_hidden_states = self.attn(
@@ -1306,7 +1325,7 @@ class QwenImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
             encoder_hidden_states (`torch.Tensor` of shape `(batch_size, text_sequence_length, joint_attention_dim)`):
                 Conditional embeddings (embeddings computed from the input conditions such as prompts) to use.
             encoder_hidden_states_mask (`torch.Tensor` of shape `(batch_size, text_sequence_length)`):
-                Mask of the input conditions.
+                Valid-token mask of the input conditions, where True keeps a text token.
             timestep ( `torch.LongTensor`):
                 Used to indicate denoising step.
             attention_kwargs (`dict`, *optional*):
