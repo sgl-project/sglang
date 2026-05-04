@@ -146,6 +146,15 @@ def _run_vlm_official_reference_mode(env) -> Path:
     candidate_path = env.get("SGLANG_TEST_U1_PARITY_CANDIDATE_ARTIFACT")
     if candidate_path:
         candidate = UGParityArtifact.from_json(Path(candidate_path).read_text())
+    elif env.get("SGLANG_TEST_U1_PARITY_RUN_SGLANG_NATIVE_CANDIDATE") == "1":
+        candidate = _run_sglang_native_vlm_candidate(
+            case=case,
+            model_path=env.get("SGLANG_TEST_U1_CANDIDATE_MODEL_PATH") or model_path,
+            image_path=image_path,
+            question=question,
+            max_new_tokens=max_new_tokens,
+            cuda_visible_devices=env.get("SGLANG_TEST_U1_CUDA_VISIBLE_DEVICES"),
+        )
     elif env.get("SGLANG_TEST_U1_PARITY_RUN_SGLANG_CANDIDATE") == "1":
         candidate = _run_sglang_vlm_candidate(
             case=case,
@@ -186,6 +195,200 @@ def _run_vlm_official_reference_mode(env) -> Path:
     if candidate_path and not report.passed:
         raise AssertionError(f"U1 VLM parity failed; report: {bundle / 'report.json'}")
     return bundle
+
+
+def _run_sglang_native_vlm_candidate(
+    *,
+    case: UGParityCase,
+    model_path: str,
+    image_path: Path,
+    question: str,
+    max_new_tokens: int,
+    cuda_visible_devices: str | None,
+) -> UGParityArtifact:
+    if cuda_visible_devices is not None:
+        os.environ["CUDA_VISIBLE_DEVICES"] = cuda_visible_devices
+
+    from transformers import AutoTokenizer
+
+    from sensenova_u1.models.neo_unify.utils import load_image_native
+    from sglang.srt.configs.model_config import ModelConfig
+    from sglang.srt.managers.mm_utils import init_mm_embedding_cache
+    from sglang.srt.model_executor.model_runner import ModelRunner
+    from sglang.srt.server_args import PortArgs, ServerArgs
+
+    tokenizer = AutoTokenizer.from_pretrained(model_path)
+    pixel_values, grid_hw = load_image_native(image_path)
+    input_ids, image_offsets = _build_u1_vlm_input_ids_and_offsets(
+        tokenizer=tokenizer,
+        pixel_values=pixel_values,
+        grid_hw=grid_hw,
+        question=question,
+    )
+
+    server_args = ServerArgs(
+        model_path=model_path,
+        tokenizer_path=model_path,
+        trust_remote_code=False,
+        disable_cuda_graph=True,
+        disable_hybrid_swa_memory=True,
+        mem_fraction_static=0.80,
+        chunked_prefill_size=-1,
+    )
+    port_args = PortArgs.init_new(server_args)
+    model_config = ModelConfig.from_server_args(server_args)
+    runner = ModelRunner(
+        model_config=model_config,
+        mem_fraction_static=server_args.mem_fraction_static,
+        gpu_id=0,
+        tp_rank=0,
+        tp_size=1,
+        pp_rank=0,
+        pp_size=1,
+        nccl_port=port_args.nccl_port,
+        server_args=server_args,
+        moe_ep_rank=0,
+        moe_ep_size=1,
+    )
+    model = runner.model
+    init_mm_embedding_cache()
+
+    generated = []
+    prefix_ids = list(input_ids)
+    with torch.no_grad():
+        for step in range(max_new_tokens):
+            token = _run_native_u1_vlm_full_prefill_step(
+                runner=runner,
+                model=model,
+                model_config=model_config,
+                prefix_ids=prefix_ids,
+                pixel_values=pixel_values,
+                grid_hw=grid_hw,
+                image_offsets=image_offsets,
+                step=step,
+            )
+            generated.append(token)
+            prefix_ids.append(token)
+
+    text = tokenizer.decode(generated, skip_special_tokens=True)
+    return UGParityArtifact(
+        case_id=case.case_id,
+        model=case.model,
+        task=case.task,
+        runner="sglang",
+        text=text,
+        image=summarize_ug_image(image_path),
+        metadata={
+            "candidate_backend": "u1_native_srt_vlm_full_prefill",
+            "native_srt_model_runner": True,
+            "model_cls": type(model).__module__ + "." + type(model).__name__,
+            "language_cls": (
+                type(model.language_model).__module__
+                + "."
+                + type(model.language_model).__name__
+            ),
+            "token_ids": generated,
+            "kv_decode": False,
+        },
+    )
+
+
+def _build_u1_vlm_input_ids_and_offsets(
+    *,
+    tokenizer,
+    pixel_values: torch.Tensor,
+    grid_hw: torch.Tensor,
+    question: str,
+) -> tuple[list[int], list[tuple[int, int]]]:
+    from sensenova_u1.models.neo_unify.conversation import get_conv_template
+
+    del pixel_values
+    img_start_token = "<img>"
+    img_end_token = "</img>"
+    img_context_token = "<IMG_CONTEXT>"
+    img_context_token_id = tokenizer.convert_tokens_to_ids(img_context_token)
+
+    template = get_conv_template("neo1_0")
+    template.append_message(template.roles[0], "<image>\n" + question)
+    template.append_message(template.roles[1], None)
+    query = template.get_prompt()
+    for i in range(grid_hw.shape[0]):
+        num_patch_token = int(grid_hw[i, 0] * grid_hw[i, 1] * 0.5**2)
+        image_tokens = (
+            img_start_token + img_context_token * num_patch_token + img_end_token
+        )
+        query = query.replace("<image>", image_tokens, 1)
+
+    input_ids = tokenizer(query, return_tensors="pt")["input_ids"][0].tolist()
+    selected = [i for i, token in enumerate(input_ids) if token == img_context_token_id]
+    if not selected:
+        raise RuntimeError("U1 native VLM prompt did not contain image context tokens")
+    return input_ids, [(selected[0], selected[-1])]
+
+
+def _run_native_u1_vlm_full_prefill_step(
+    *,
+    runner,
+    model,
+    model_config,
+    prefix_ids: list[int],
+    pixel_values: torch.Tensor,
+    grid_hw: torch.Tensor,
+    image_offsets: list[tuple[int, int]],
+    step: int,
+) -> int:
+    from sglang.bench_one_batch import TreeCacheNamespace
+    from sglang.srt.managers.schedule_batch import (
+        Modality,
+        MultimodalDataItem,
+        MultimodalInputs,
+        Req,
+        ScheduleBatch,
+    )
+    from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+    from sglang.srt.sampling.sampling_params import SamplingParams
+    from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+
+    runner.req_to_token_pool.clear()
+    runner.token_to_kv_pool_allocator.clear()
+    item = MultimodalDataItem(
+        modality=Modality.IMAGE,
+        feature=pixel_values.clone(),
+        model_specific_data={"image_grid_hws": grid_hw.clone()},
+        offsets=image_offsets,
+    )
+    item.set_pad_value()
+    mm_inputs = MultimodalInputs(mm_items=[item])
+    padded_ids = model.pad_input_ids(list(prefix_ids), mm_inputs)
+    req = Req(
+        rid=f"u1-native-vlm-{step}",
+        origin_input_text="",
+        origin_input_ids=padded_ids,
+        sampling_params=SamplingParams(temperature=0.0, max_new_tokens=1),
+    )
+    req.fill_ids = list(padded_ids)
+    req.multimodal_inputs = mm_inputs
+    req.logprob_start_len = -1
+    req.set_extend_input_len(len(req.fill_ids) - len(req.prefix_indices))
+    tree_cache = TreeCacheNamespace(
+        page_size=1,
+        device=runner.device,
+        token_to_kv_pool_allocator=runner.token_to_kv_pool_allocator,
+    )
+    batch = ScheduleBatch.init_new(
+        reqs=[req],
+        req_to_token_pool=runner.req_to_token_pool,
+        token_to_kv_pool_allocator=runner.token_to_kv_pool_allocator,
+        tree_cache=tree_cache,
+        model_config=model_config,
+        enable_overlap=False,
+        spec_algorithm=SpeculativeAlgorithm.NONE,
+    )
+    batch.prepare_for_extend()
+    worker_batch = batch.get_model_worker_batch()
+    forward_batch = ForwardBatch.init_new(worker_batch, runner)
+    output, _ = runner.forward_extend(forward_batch)
+    return int(torch.argmax(output.next_token_logits[0]).item())
 
 
 def _run_sglang_vlm_candidate(

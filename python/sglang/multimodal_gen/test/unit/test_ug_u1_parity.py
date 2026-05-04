@@ -7,6 +7,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import numpy as np
 import torch
@@ -156,6 +157,57 @@ class TestU1OfficialParityHarness(unittest.TestCase):
             self.assertEqual(candidate["debug_counters"]["prefill_count"], 1)
             self.assertTrue(report["passed"])
 
+    def test_u1_vlm_official_reference_mode_can_run_native_srt_candidate(self):
+        module = _load_u1_official_parity_module()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            official_repo = _write_fake_u1_vqa_repo(root, text="native answer")
+            image_path = _write_fake_image(root)
+            output_dir = root / "bundle"
+
+            with patch.object(module, "_run_sglang_native_vlm_candidate") as run_native:
+                run_native.return_value = UGParityArtifact(
+                    case_id="u1-vlm-official-reference",
+                    model="sensenova-u1",
+                    task="vlm",
+                    runner="sglang",
+                    text="native answer",
+                    image=summarize_ug_image(image_path),
+                    metadata={
+                        "candidate_backend": "u1_native_srt_vlm_full_prefill",
+                        "native_srt_model_runner": True,
+                        "kv_decode": False,
+                    },
+                )
+                bundle = module.run_u1_official_parity_from_env(
+                    {
+                        "SGLANG_TEST_U1_PARITY_MODE": "vlm_official_reference",
+                        "SGLANG_TEST_U1_PARITY_RUN_SGLANG_NATIVE_CANDIDATE": "1",
+                        "SGLANG_TEST_U1_PARITY_OUTPUT": str(output_dir),
+                        "SGLANG_TEST_U1_OFFICIAL_PY": sys.executable,
+                        "SGLANG_TEST_U1_OFFICIAL_REPO": str(official_repo),
+                        "SGLANG_TEST_U1_MODEL_PATH": "/fake/model",
+                        "SGLANG_TEST_U1_VLM_IMAGE": str(image_path),
+                        "SGLANG_TEST_U1_VLM_QUESTION": "what is here?",
+                        "SGLANG_TEST_U1_VLM_MAX_NEW_TOKENS": "4",
+                        "SGLANG_TEST_U1_VLM_DEVICE": "cpu",
+                    }
+                )
+
+            candidate = json.loads((bundle / "candidate.json").read_text())
+            report = json.loads((bundle / "report.json").read_text())
+
+            run_native.assert_called_once()
+            self.assertEqual(candidate["text"], "native answer")
+            self.assertTrue(candidate["metadata"]["native_srt_model_runner"])
+            self.assertEqual(
+                candidate["metadata"]["candidate_backend"],
+                "u1_native_srt_vlm_full_prefill",
+            )
+            self.assertFalse(candidate["metadata"]["kv_decode"])
+            self.assertTrue(report["passed"])
+
     def test_runtime_import_firewall_blocks_official_u1_imports(self):
         repo = Path(__file__).resolve().parents[5]
         runtime_root = repo / "python" / "sglang"
@@ -206,6 +258,10 @@ def _case():
 
 
 def _load_u1_official_parity_harness():
+    return _load_u1_official_parity_module().run_u1_official_parity_from_env
+
+
+def _load_u1_official_parity_module():
     repo = Path(__file__).resolve().parents[5]
     path = repo / "test/registered/scheduler/test_u1_official_parity_harness.py"
     spec = importlib.util.spec_from_file_location("u1_official_parity_harness", path)
@@ -213,7 +269,7 @@ def _load_u1_official_parity_harness():
     assert spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
-    return module.run_u1_official_parity_from_env
+    return module
 
 
 def _write_fake_u1_vqa_repo(root: Path, *, text: str) -> Path:
