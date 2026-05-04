@@ -1214,16 +1214,16 @@ class MambaRadixCache(BasePrefixCache):
         return node, full_num_evicted
 
     def _delete_leaf(self, node: TreeNode) -> None:
-        assert (
-            node.mamba_value is not None
-        ), f"Invariant violated: leaf node is a tombstone, {node.id=}"
+        # Nodes created with strip_thinking_cache may have mamba_value=None
+        has_mamba = node.mamba_value is not None
         assert len(node.children) == 0, f"leaf node has children, {node.id=}"
         key = node.key.child_key(self.page_size)
         v = node.parent.children.pop(key, None)
         assert v == node, f"parent does not have child key, {key}"
 
         self.full_evictable_size_ -= len(node.key)
-        self.mamba_evictable_size_ -= len(node.mamba_value)
+        if has_mamba:
+            self.mamba_evictable_size_ -= len(node.mamba_value)
 
     def _tombstone_internal_node(self, node: TreeNode) -> None:
         assert len(node.children) != 0, f"Cannot tombstone a leaf node, {node.id=}"
