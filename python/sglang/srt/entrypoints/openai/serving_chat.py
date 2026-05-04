@@ -508,10 +508,10 @@ class OpenAIServingChat(OpenAIServingBase):
         template_content_format = self.template_manager.jinja_template_content_format
 
         if self.chat_encoding_spec is not None:
-            # Per-request wins; env is fallback so existing
-            # `export SGLANG_ENABLE_THINKING=1` workflow keeps working here.
+            # Per-request wins; env is fallback default for benchmark
+            # workflows that can't pass per-request chat_template_kwargs.
             thinking_requested = (request.chat_template_kwargs or {}).get(
-                "thinking", envs.SGLANG_ENABLE_THINKING.get()
+                "thinking", envs.SGLANG_DEFAULT_THINKING.get()
             )
             thinking_mode = "thinking" if thinking_requested else "chat"
             messages = [msg.model_dump() for msg in request.messages]
