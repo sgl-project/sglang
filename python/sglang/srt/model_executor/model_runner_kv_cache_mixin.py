@@ -287,12 +287,12 @@ class ModelRunnerKVCacheMixin:
 
         # Initialize token_to_kv_pool
         is_nsa_model = is_deepseek_nsa(self.model_config.hf_config)
-        is_v4_model = is_deepseek_v4(self.model_config.hf_config)
+        is_dsv4_model = is_deepseek_v4(self.model_config.hf_config)
 
         # Out-of-tree platform plugin system — used by elif below
         from sglang.srt.platforms import current_platform
 
-        if is_v4_model:
+        if is_dsv4_model:
             swa_page_size = self.page_size
             assert swa_page_size == 256, "In paged swa mode, page_size must be 256."
 
@@ -698,7 +698,7 @@ class ModelRunnerKVCacheMixin:
                             need_sort=need_sort,
                         )
 
-            if self.enable_hisparse and is_v4_model:
+            if self.enable_hisparse and is_dsv4_model:
                 assert self.is_hybrid_swa, "DeepSeek V4 HiSparse requires SWA mode."
                 self.token_to_kv_pool_allocator = (
                     DeepSeekV4HiSparseTokenToKVPoolAllocator(
