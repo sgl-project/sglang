@@ -1227,7 +1227,8 @@ class MambaRadixCache(BasePrefixCache):
 
     def _tombstone_internal_node(self, node: TreeNode) -> None:
         assert len(node.children) != 0, f"Cannot tombstone a leaf node, {node.id=}"
-        self.mamba_evictable_size_ -= len(node.mamba_value)
+        if node.mamba_value is not None:
+            self.mamba_evictable_size_ -= len(node.mamba_value)
         node.mamba_value = None
 
     def _delete_tombstone_leaf(self, node: TreeNode) -> None:
