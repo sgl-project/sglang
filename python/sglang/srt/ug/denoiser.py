@@ -371,36 +371,6 @@ class SRTBackedUGMiddleBridge:
             )
         )
 
-    def decode_next_segment(self, *, contexts: UGContextBundle) -> UGDecodeResult:
-        return self.continue_u_decode(contexts=contexts)
-
-    # Compatibility wrappers for code that still imports the old denoiser names.
-    def build_contexts(self, **kwargs) -> UGContextBundle:
-        return self.prepare_u_context(**kwargs)
-
-    def build_contexts_from_messages(self, **kwargs) -> UGContextBundle:
-        return self.prepare_u_context_from_messages(**kwargs)
-
-    def predict_velocity(self, **kwargs) -> torch.Tensor:
-        return self.predict_g_velocity(**kwargs)
-
-    def prepare_latents(self, **kwargs) -> UGLatentPrepareResult | None:
-        return self.prepare_g_latents(**kwargs)
-
-    def decode_latents(self, **kwargs) -> Any | None:
-        return self.decode_g_latents(**kwargs)
-
-    def append_generated_image(
-        self, *, contexts: UGContextBundle, image: Any | None
-    ) -> None:
-        self.commit_generated_segment(
-            contexts=contexts,
-            segment=UGGSegmentResult(type="image", image=image),
-        )
-
-    def release_contexts(self, contexts: UGContextBundle) -> None:
-        self.release(contexts)
-
 
 def normalize_ug_interleaved_messages(
     messages: list[UGInterleavedMessage | dict[str, Any]],
@@ -427,7 +397,3 @@ def normalize_ug_interleaved_messages(
     if not normalized:
         raise ValueError("UG interleaved messages must not be empty")
     return normalized
-
-
-UGDenoiserBridge = UGMiddleBridge
-SRTBackedUGDenoiserBridge = SRTBackedUGMiddleBridge

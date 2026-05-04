@@ -13,7 +13,6 @@ from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.srt.ug.context import UGContextBundle
 from sglang.srt.ug.denoiser import UGLatentFlowMiddleBridge, UGMiddleBridge
 from sglang.srt.ug.interleaved import UGGSegmentResult
-from sglang.srt.ug.sampling import build_bagel_denoise_schedule
 
 
 class BAGELLatentFlowGSegmentExecutor:
@@ -113,15 +112,14 @@ class BAGELLatentFlowGSegmentExecutor:
         if num_steps <= 0:
             raise ValueError(f"num_inference_steps must be positive, got {num_steps}")
 
-        schedule = build_bagel_denoise_schedule(
-            num_inference_steps=num_steps,
-            timestep_shift=params.timestep_shift,
-            device=x_t.device,
-        )
+        timesteps = torch.linspace(1, 0, num_steps, device=x_t.device)
+        shift = float(params.timestep_shift)
+        timesteps = shift * timesteps / (1 + (shift - 1) * timesteps)
+        dts = timesteps[:-1] - timesteps[1:]
         trajectory_latents = []
         trajectory_timesteps = []
 
-        for i, timestep in enumerate(schedule.timesteps):
+        for i, timestep in enumerate(timesteps[:-1]):
             trajectory_latents.append(x_t)
             trajectory_timesteps.append(timestep)
             velocity = bridge.predict_g_velocity(
@@ -131,7 +129,7 @@ class BAGELLatentFlowGSegmentExecutor:
                 latent_position_ids=batch.extra["ug_latent_position_ids"],
                 sampling_params=params,
             )
-            x_t = x_t - velocity.to(x_t) * schedule.dts[i].to(x_t)
+            x_t = x_t - velocity.to(x_t) * dts[i].to(x_t)
 
         batch.latents = x_t
         if batch.return_trajectory_latents:
@@ -140,7 +138,7 @@ class BAGELLatentFlowGSegmentExecutor:
                 batch.trajectory_timesteps = torch.stack(trajectory_timesteps)
             else:
                 batch.trajectory_latents = x_t[:0]
-                batch.trajectory_timesteps = schedule.timesteps[:0]
+                batch.trajectory_timesteps = timesteps[:0]
 
     @staticmethod
     def _decode_image(

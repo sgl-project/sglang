@@ -18,7 +18,6 @@ from sglang.srt.ug.adapter import (
     UGModelAppendImageResult,
     UGModelPrefillResult,
 )
-from sglang.srt.ug.bagel_cache import BAGELSRTKVCacheFactory
 from sglang.srt.ug.bagel_preprocess import (
     BAGELImageTransform,
     add_bagel_special_tokens,
@@ -35,7 +34,6 @@ from sglang.srt.ug.runtime import (
     UGVelocityRequest,
     UGVLMTextGenerationResult,
 )
-from sglang.srt.ug.sampling import get_bagel_effective_cfg_scales
 
 _BAGEL_REQUIRED_CHECKPOINT_FILES = (
     "llm_config.json",
@@ -481,7 +479,6 @@ class BAGELInterleaveContextBackend:
         *,
         step_runner: Any | None = None,
         u_forward_bridge: BAGELUForwardBridge | None = None,
-        srt_kv_cache_factory: BAGELSRTKVCacheFactory | None = None,
         native_srt_denoise_executor: BAGELNativeSRTDenoiseExecutor | None = None,
         default_image_shape: tuple[int, int] = (1024, 1024),
     ) -> None:
@@ -490,7 +487,6 @@ class BAGELInterleaveContextBackend:
         self.u_forward_bridge = u_forward_bridge or BAGELUForwardBridge(
             srt_u_forward_executor=BAGELNativeSRTUForwardExecutor()
         )
-        self.srt_kv_cache_factory = srt_kv_cache_factory
         self.native_srt_denoise_executor = native_srt_denoise_executor
         self.default_image_shape = default_image_shape
         self.sessions: dict[str, BAGELSessionContext] = {}
@@ -801,8 +797,6 @@ class BAGELInterleaveContextBackend:
 
     def close_session(self, *, session_id: str) -> None:
         self.sessions.pop(session_id, None)
-        if self.srt_kv_cache_factory is not None:
-            self.srt_kv_cache_factory.release_session(session_id)
 
     def _state_for(self, session_id: str) -> BAGELSessionContext:
         state = self.sessions.get(session_id)
@@ -835,16 +829,8 @@ class BAGELInterleaveContextBackend:
         return state
 
     def _init_context(self, *, session_id: str, role: str) -> dict[str, Any]:
-        context = self.inferencer.init_gen_context()
-        if self.srt_kv_cache_factory is None:
-            return context
-        context = dict(context)
-        context["past_key_values"] = self.srt_kv_cache_factory.create_cache(
-            session_id=session_id,
-            role=role,
-            template_cache=context["past_key_values"],
-        )
-        return context
+        del session_id, role
+        return self.inferencer.init_gen_context()
 
     def _clone_context(
         self,
@@ -853,26 +839,11 @@ class BAGELInterleaveContextBackend:
         session_id: str,
         role: str,
     ) -> dict[str, Any]:
-        if self.srt_kv_cache_factory is None:
-            return _clone_context(context)
-        cloned = {
-            key: deepcopy(value)
-            for key, value in context.items()
-            if key != "past_key_values"
-        }
-        cloned["past_key_values"] = self.srt_kv_cache_factory.clone_cache(
-            context["past_key_values"],
-            session_id=session_id,
-            role=role,
-        )
-        return cloned
+        del session_id, role
+        return _clone_context(context)
 
     def _bind_srt_request_tokens(self, request: UGSRTRequestView) -> None:
-        if self.srt_kv_cache_factory is None:
-            return
-        binding = request.metadata.get("srt_kv_token_binding")
-        if binding is not None:
-            self.srt_kv_cache_factory.bind_request_tokens(binding)
+        del request
 
     def _prepare_denoise(
         self,
@@ -1784,7 +1755,19 @@ def _effective_cfg_scales(
     prepared: BAGELNativeSRTPreparedDenoise,
     timestep: torch.Tensor,
 ) -> tuple[float, float]:
-    return get_bagel_effective_cfg_scales(prepared, timestep)
+    t = float(timestep.flatten()[0].detach().cpu())
+    interval = getattr(prepared, "cfg_interval", (0.0, 1.0))
+    if len(interval) != 2:
+        raise ValueError("cfg_interval must contain [start, end]")
+    start, end = (float(interval[0]), float(interval[1]))
+    if not (0.0 <= start <= end <= 1.0):
+        raise ValueError("cfg_interval must satisfy 0 <= start <= end <= 1")
+    if t > start and t <= end:
+        return (
+            float(getattr(prepared, "cfg_text_scale", 1.0)),
+            float(getattr(prepared, "cfg_img_scale", 1.0)),
+        )
+    return 1.0, 1.0
 
 
 def _clone_context(context: dict[str, Any]) -> dict[str, Any]:
