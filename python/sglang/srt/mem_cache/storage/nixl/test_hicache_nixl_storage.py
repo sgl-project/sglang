@@ -276,40 +276,40 @@ class TestNixlUnified(unittest.TestCase):
         self.assertIsNotNone(result)
 
     def test_batch_set_v1_skips_on_nonzero_mla_rank(self):
-         """Test batch_set_v1 is a no-op on nonzero MLA backup ranks."""
-         self.hicache.storage_config.is_mla_model = True
-         self.hicache.storage_config.tp_rank = 1
-         self.hicache.backup_skip = True
-         self.hicache._batch_set_preprocess = MagicMock(
-             side_effect=AssertionError("batch_set_v1 should have been skipped")
-         )
- 
-         results = self.hicache.batch_set_v1(["key1", "key2"], torch.tensor([0, 1]))
- 
-         self.assertEqual(results, [True, True])
-         self.hicache._batch_set_preprocess.assert_not_called()
- 
-     def test_batch_exists_zero_copy_mla_uses_single_key_denominator(self):
-         """Test zero-copy MLA batch_exists counts one storage key per logical key."""
-         self.hicache.is_zero_copy = True
-         self.hicache.is_mla_model = True
-         self.hicache.agent.query_memory = MagicMock(return_value=[object(), None])
- 
-         result = self.hicache.batch_exists(["key1", "key2"])
- 
-         self.assertEqual(result, 1)
- 
-     def test_batch_exists_zero_copy_mha_uses_two_key_denominator(self):
-         """Test zero-copy MHA batch_exists counts k/v pairs per logical key."""
-         self.hicache.is_zero_copy = True
-         self.hicache.is_mla_model = False
-         self.hicache.agent.query_memory = MagicMock(
-             return_value=[object(), object(), None, None]
-         )
- 
-         result = self.hicache.batch_exists(["key1", "key2"])
- 
-         self.assertEqual(result, 1)
+        """Test batch_set_v1 is a no-op on nonzero MLA backup ranks."""
+        self.hicache.storage_config.is_mla_model = True
+        self.hicache.storage_config.tp_rank = 1
+        self.hicache.backup_skip = True
+        self.hicache._batch_set_preprocess = MagicMock(
+            side_effect=AssertionError("batch_set_v1 should have been skipped")
+        )
+
+        results = self.hicache.batch_set_v1(["key1", "key2"], torch.tensor([0, 1]))
+
+        self.assertEqual(results, [True, True])
+        self.hicache._batch_set_preprocess.assert_not_called()
+
+    def test_batch_exists_zero_copy_mla_uses_single_key_denominator(self):
+        """Test zero-copy MLA batch_exists counts one storage key per logical key."""
+        self.hicache.is_zero_copy = True
+        self.hicache.is_mla_model = True
+        self.hicache.agent.query_memory = MagicMock(return_value=[object(), None])
+
+        result = self.hicache.batch_exists(["key1", "key2"])
+
+        self.assertEqual(result, 1)
+
+    def test_batch_exists_zero_copy_mha_uses_two_key_denominator(self):
+        """Test zero-copy MHA batch_exists counts k/v pairs per logical key."""
+        self.hicache.is_zero_copy = True
+        self.hicache.is_mla_model = False
+        self.hicache.agent.query_memory = MagicMock(
+            return_value=[object(), object(), None, None]
+        )
+
+        result = self.hicache.batch_exists(["key1", "key2"])
+
+        self.assertEqual(result, 1)
 
 
 if __name__ == "__main__":
