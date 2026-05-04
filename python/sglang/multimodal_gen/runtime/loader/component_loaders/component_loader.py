@@ -127,7 +127,7 @@ class ComponentLoader(ABC):
             component_attn_name = matched_backend_key or component_name
             if attn_backend is not None:
                 logger.info(
-                    "Using %s backend for component %s",
+                    "Using %s backend for component: %s",
                     attn_backend.name.lower(),
                     matched_backend_key,
                 )
