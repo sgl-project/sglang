@@ -34,6 +34,7 @@ def _dtype_rank(dtype: torch.dtype) -> Optional[int]:
         torch.float8_e4m3fnuz,
         torch.float8_e5m2,
         torch.float8_e5m2fnuz,
+        torch.float8_e8m0fnu,
     ):
         return 0
     if dtype in (torch.float16, torch.bfloat16):

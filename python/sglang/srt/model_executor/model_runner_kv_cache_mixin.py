@@ -5,7 +5,11 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from sglang.srt.configs.model_config import get_nsa_index_head_dim, is_deepseek_nsa
+from sglang.srt.configs.model_config import (
+    get_nsa_index_head_dim,
+    is_deepseek_compressed,
+    is_deepseek_nsa,
+)
 from sglang.srt.distributed.parallel_state import get_world_group
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import get_attention_tp_size
@@ -282,11 +286,48 @@ class ModelRunnerKVCacheMixin:
 
         # Initialize token_to_kv_pool
         is_nsa_model = is_deepseek_nsa(self.model_config.hf_config)
+        is_v4_model = is_deepseek_compressed(self.model_config.hf_config)
 
         # Check out-of-tree platform (plugin system) first
         from sglang.srt.platforms import current_platform
 
-        if current_platform.is_out_of_tree() and not self.mambaish_config:
+        if is_v4_model:
+            from sglang.srt.mem_cache.deepseekv4_memory_pool import (
+                DeepSeekV4TokenToKVPool,
+            )
+
+            if envs.SGLANG_OPT_DPSK_V4_RADIX.get():
+                swa_page_size = self.page_size
+                assert swa_page_size == 256, "In paged swa mode, page_size must be 256."
+            else:
+                swa_page_size = self.model_config.window_size
+                assert (
+                    swa_page_size == 128
+                ), "In ring buffer swa mode, page_size must be 128."
+
+            self.token_to_kv_pool = DeepSeekV4TokenToKVPool(
+                max_num_reqs=self.server_args.max_running_requests,
+                swa_size=self.swa_max_total_num_tokens,
+                c4_size=self.c4_max_total_num_tokens,
+                c128_size=self.c128_max_total_num_tokens,
+                c4_state_pool_size=self.c4_state_pool_size,
+                c128_state_pool_size=self.c128_state_pool_size,
+                page_size=self.page_size,
+                swa_page_size=swa_page_size,
+                dtype=self.kv_cache_dtype,
+                state_dtype=self.state_dtype,
+                qk_nope_head_dim=self.model_config.qk_nope_head_dim,
+                qk_rope_head_dim=self.model_config.qk_rope_head_dim,
+                indexer_head_dim=self.model_config.index_head_dim,
+                layer_num=self.num_effective_layers,
+                device=self.device,
+                enable_memory_saver=self.server_args.enable_memory_saver,
+                compression_ratios=self.model_config.compress_ratios,
+                start_layer=self.start_layer,
+                end_layer=self.end_layer,
+                enable_hisparse=getattr(self, "enable_hisparse", False),
+            )
+        elif current_platform.is_out_of_tree() and not self.mambaish_config:
             if self.use_mla_backend and is_nsa_model:
                 PoolCls = current_platform.get_nsa_kv_pool_cls()
                 self.token_to_kv_pool = PoolCls(
@@ -609,10 +650,19 @@ class ModelRunnerKVCacheMixin:
                         need_sort=need_sort,
                     )
             else:
-                if self.is_hybrid_swa:
+                if self.is_hybrid_swa and not is_v4_model:
                     self.token_to_kv_pool_allocator = SWATokenToKVPoolAllocator(
                         self.full_max_total_num_tokens,
                         self.swa_max_total_num_tokens,
+                        page_size=self.page_size,
+                        dtype=self.kv_cache_dtype,
+                        device=self.device,
+                        kvcache=self.token_to_kv_pool,
+                        need_sort=need_sort,
+                    )
+                elif is_v4_model:
+                    self.token_to_kv_pool_allocator = PagedTokenToKVPoolAllocator(
+                        self.max_total_num_tokens,
                         page_size=self.page_size,
                         dtype=self.kv_cache_dtype,
                         device=self.device,
@@ -723,6 +773,13 @@ class ModelRunnerKVCacheMixin:
         if self.is_hybrid_swa:
             self.full_max_total_num_tokens = config.full_max_total_num_tokens
             self.swa_max_total_num_tokens = config.swa_max_total_num_tokens
+
+        if is_deepseek_compressed(self.model_config.hf_config):
+            self.c4_max_total_num_tokens = config.c4_max_total_num_tokens or 0
+            self.c128_max_total_num_tokens = config.c128_max_total_num_tokens or 0
+            self.c4_state_pool_size = config.c4_state_pool_size or 0
+            self.c128_state_pool_size = config.c128_state_pool_size or 0
+            self.state_dtype = config.state_dtype or torch.float32
 
         self._init_pools()
 

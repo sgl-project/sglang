@@ -19,7 +19,11 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
-from sglang.srt.configs.model_config import get_nsa_index_head_dim, is_deepseek_nsa
+from sglang.srt.configs.model_config import (
+    get_nsa_index_head_dim,
+    is_deepseek_compressed,
+    is_deepseek_nsa,
+)
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.mem_cache.memory_pool import NSATokenToKVPool
 from sglang.srt.utils.common import is_float4_e2m1fn_x2
@@ -33,6 +37,13 @@ class MemoryPoolConfig:
     max_running_requests: Optional[int] = None
     full_max_total_num_tokens: Optional[int] = None
     swa_max_total_num_tokens: Optional[int] = None
+
+    # DSv4 compressed attention pools
+    c4_max_total_num_tokens: Optional[int] = None
+    c128_max_total_num_tokens: Optional[int] = None
+    c4_state_pool_size: Optional[int] = None
+    c128_state_pool_size: Optional[int] = None
+    state_dtype: Optional[torch.dtype] = None
 
     mem_fraction_static: Optional[float] = None
 
@@ -284,10 +295,49 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
         return self._solve_pool_sizes(max_total_num_tokens, page_size)
 
 
+class DSv4PoolConfigurator(MemoryPoolConfigurator):
+    """Configurator for DeepSeekV4 compressed attention models."""
+
+    def __init__(self, mr: ModelRunner):
+        from sglang.srt.model_executor.memory_profiler import DSv4MemoryCalculator
+
+        self._mr = mr
+        self._calculator = DSv4MemoryCalculator(
+            model_config=mr.model_config,
+            page_size=mr.server_args.page_size,
+            swa_ratio=mr.server_args.swa_full_tokens_ratio,
+            is_speculative=not mr.spec_algorithm.is_none(),
+        )
+        self._state_dtype = torch.float32
+
+    def calculate_pool_sizes(
+        self, available_bytes: int, page_size: int
+    ) -> MemoryPoolConfig:
+        pool_sizes = self._calculator.calculate_pool_sizes(available_bytes)
+        return MemoryPoolConfig(
+            max_total_num_tokens=pool_sizes.full_max_total_num_tokens,
+            full_max_total_num_tokens=pool_sizes.full_max_total_num_tokens,
+            swa_max_total_num_tokens=pool_sizes.swa_max_total_num_tokens,
+            c4_max_total_num_tokens=pool_sizes.c4_max_total_num_tokens,
+            c128_max_total_num_tokens=pool_sizes.c128_max_total_num_tokens,
+            c4_state_pool_size=pool_sizes.c4_state_pool_size,
+            c128_state_pool_size=pool_sizes.c128_state_pool_size,
+            state_dtype=self._state_dtype,
+        )
+
+    def calculate_pool_sizes_from_max_tokens(
+        self, max_total_num_tokens: int, page_size: int
+    ) -> MemoryPoolConfig:
+        available_bytes = max_total_num_tokens * self._calculator.bytes_per_full_token
+        return self.calculate_pool_sizes(int(available_bytes), page_size)
+
+
 def create_memory_pool_configurator(
     mr: ModelRunner,
 ) -> MemoryPoolConfigurator:
     """Factory: select the right configurator for the model architecture."""
+    if is_deepseek_compressed(mr.model_config.hf_config):
+        return DSv4PoolConfigurator(mr)
     if mr.is_hybrid_swa:
         return HybridSWAPoolConfigurator(mr)
     # Future: MambaPoolConfigurator

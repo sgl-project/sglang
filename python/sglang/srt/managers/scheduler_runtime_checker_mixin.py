@@ -170,8 +170,12 @@ class SchedulerRuntimeCheckerMixin:
         return self.tree_cache.session_held_mamba_slots(self._active_pool_idxs())
 
     def get_pool_stats(self: Scheduler) -> PoolStats:
-        if self.is_hybrid_swa:
+        if self.is_hybrid_swa and hasattr(
+            self.token_to_kv_pool_allocator, "full_available_size"
+        ):
             pool_stats = self._get_swa_token_info()
+        elif self.is_hybrid_swa:
+            return self._get_token_info()
         elif self.is_hybrid_ssm:
             return self._get_mamba_token_info()
         elif self.enable_hisparse:
@@ -478,7 +482,9 @@ class SchedulerRuntimeCheckerMixin:
         has_leak |= full_leak
         messages.append(full_msg)
 
-        if self.is_hybrid_swa:
+        if self.is_hybrid_swa and hasattr(
+            self.token_to_kv_pool_allocator, "full_available_size"
+        ):
             swa_leak, swa_msg = self._check_swa_pool(ps)
             has_leak |= swa_leak
             messages.append(swa_msg)

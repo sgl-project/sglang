@@ -50,6 +50,8 @@ class AttentionBackend(ABC):
         forward_mode: ForwardMode,
         spec_info: Optional[SpecInput],
         seq_lens_cpu: Optional[torch.Tensor],
+        out_cache_loc: Optional[torch.Tensor] = None,
+        actual_forward_mode: Optional[ForwardMode] = None,
     ):
         """Init the metadata for a forward pass for replaying a cuda graph."""
         raise NotImplementedError()

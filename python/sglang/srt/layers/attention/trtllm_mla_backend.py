@@ -518,6 +518,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         forward_mode: ForwardMode,
         spec_info: Optional[SpecInput],
         seq_lens_cpu: Optional[torch.Tensor],
+        **kwargs,
     ):
         """Replay CUDA graph with new inputs."""
         # Delegate to parent for non-decode modes.

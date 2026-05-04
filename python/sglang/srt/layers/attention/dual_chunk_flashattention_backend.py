@@ -591,6 +591,7 @@ class DualChunkFlashAttentionBackend(AttentionBackend):
         spec_info: Optional[None],
         seq_lens_cpu: Optional[torch.Tensor],
         out_cache_loc: torch.Tensor = None,
+        **kwargs,
     ):
         """Initialize forward metadata for replaying CUDA graph."""
         assert forward_mode.is_decode()

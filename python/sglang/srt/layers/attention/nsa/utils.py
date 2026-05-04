@@ -125,6 +125,9 @@ def pad_nsa_cache_seqlens(forward_batch: "ForwardBatch", nsa_cache_seqlens):
     return nsa_cache_seqlens
 
 
+can_cp_split = None  # lazy alias, set below
+
+
 def can_nsa_cp_split(seq_len: int, cp_size: int, use_nsa: bool, forward_batch):
     if is_nsa_prefill_cp_round_robin_split():
         cur_cp_seq_len = seq_len // cp_size
@@ -226,3 +229,25 @@ def nsa_use_prefill_cp(forward_batch, nsa_enable_prefill_cp=None):
         return True
     else:
         return False
+
+
+# Backward-compatible aliases for DSv4 model imports
+can_cp_split = can_nsa_cp_split
+
+try:
+    from sglang.srt.layers.utils.cp_utils import (  # noqa: F401
+        cp_all_gather_rerange_output,
+        cp_split_and_rebuild_data,
+        cp_split_and_rebuild_position,
+    )
+except ImportError:
+    pass
+
+try:
+    from sglang.srt.layers.utils.cp_utils import (
+        prepare_context_parallel_metadata as prepare_input_dp_with_cp_dsa,
+    )
+except ImportError:
+
+    def prepare_input_dp_with_cp_dsa(*args, **kwargs):
+        raise NotImplementedError("prepare_input_dp_with_cp_dsa not available")

@@ -877,7 +877,10 @@ class Scheduler(
         )
 
         if effective_chunked_prefill_size is not None and self.disable_radix_cache:
-            if not self.is_hybrid_swa:
+            is_v4_compressed = getattr(
+                self.model_config, "is_swa_with_compressed_attention", False
+            )
+            if not self.is_hybrid_swa or is_v4_compressed:
                 from sglang.srt.mem_cache.chunk_cache import ChunkCache
 
                 self.tree_cache = ChunkCache(params)

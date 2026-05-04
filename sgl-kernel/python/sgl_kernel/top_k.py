@@ -80,6 +80,41 @@ def fast_topk_transform_fused(
     return dst_page_table
 
 
+def deepseek_v4_topk_transform_512(
+    scores: torch.Tensor,
+    seq_lens: torch.Tensor,
+    page_table: torch.Tensor,
+    page_indices: torch.Tensor,
+    page_size: int,
+    raw_indices: Optional[torch.Tensor] = None,
+) -> None:
+    """
+    Performs the DeepSeek-V4 indexer top-k selection (TopK = 512) and writes
+    the paged physical slot indices into ``page_indices``. Optionally also
+    writes the row-relative raw token positions into ``raw_indices`` for
+    hisparse capture.
+
+    Args:
+        scores: float32 ``[B, max_seq_len]`` indexer logits, contiguous on dim 1.
+        seq_lens: int32 ``[B]``, true KV length per batch row.
+        page_table: int32 ``[B, num_pages]``, logical->physical page table,
+            contiguous on dim 1.
+        page_indices: int32 ``[B, 512]``, output buffer, contiguous. Filled
+            with paged physical slots; -1 for padding entries.
+        page_size: power-of-two page size (e.g. 256 for V4 decode).
+        raw_indices: optional int32 ``[B, 512]``, output buffer, contiguous.
+            If provided, filled with raw absolute token positions (or -1 for
+            padding entries).
+    """
+    assert scores.dim() == 2
+    assert page_indices.dim() == 2 and page_indices.size(1) == 512
+    if raw_indices is not None:
+        assert raw_indices.dim() == 2 and raw_indices.size(1) == 512
+    torch.ops.sgl_kernel.deepseek_v4_topk_transform_512(
+        scores, seq_lens, page_table, page_indices, page_size, raw_indices
+    )
+
+
 def fast_topk_transform_ragged_fused(
     score: torch.Tensor,
     lengths: torch.Tensor,
