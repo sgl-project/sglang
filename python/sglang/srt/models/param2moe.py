@@ -5,8 +5,6 @@
 # Architecture: Hybrid MoE with GQA attention, sigmoid-scored grouped top-k routing,
 # per-expert bias correction, shared (always-active) experts, and SwiGLU MLP.
 #
-# Reference: vLLM implementation merged at
-#   https://github.com/vllm-project/vllm/pull/38000
 """SGLang Param2MoE model."""
 
 import logging
