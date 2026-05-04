@@ -13,12 +13,12 @@
 # ==============================================================================
 """Common utilities."""
 
-import hashlib
 from typing import Any, List, Optional, Tuple
 
 import torch
 import triton
 import triton.language as tl
+import xxhash
 
 from sglang.srt.environ import envs
 
@@ -363,7 +363,7 @@ def convert_to_bigram_key(tokens: List[int]) -> List[Tuple[int, int]]:
 
 
 def get_hash_str(token_ids: List[int], prior_hash: Optional[str] = None) -> str:
-    hasher = hashlib.sha256()
+    hasher = xxhash.xxh64()
 
     if prior_hash:
         hasher.update(bytes.fromhex(prior_hash))
@@ -381,7 +381,7 @@ def get_hash_str(token_ids: List[int], prior_hash: Optional[str] = None) -> str:
 
 
 def hash_str_to_int64(hash_str: str) -> int:
-    """Convert SHA256 hex string to signed 64-bit integer for events.
+    """Convert 64-bit hex string to signed 64-bit integer for events.
 
     Takes first 16 hex characters (64 bits) and converts to signed int64 range.
     """
