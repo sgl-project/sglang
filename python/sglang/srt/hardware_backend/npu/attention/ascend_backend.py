@@ -1038,7 +1038,7 @@ class AscendAttnBackend(AttentionBackend):
                     attn_output = attn_output.view(
                         -1, layer.tp_q_head_num * layer.v_head_dim
                     )
-                    torch.save(attn_output, "/home/tbaydasov/original_prefill_dump.pt")
+                    torch.save(attn_output, "/home/tbaydasov/pseudo_quant_prefill_dump.pt")
 
             else:
                 causal = True
