@@ -335,7 +335,7 @@ export const DeepSeekV4Deployment = () => {
     // _LAUNCH_HEAD always prepends these:
     // Per-hardware env (whitelist #1: NVSHMEM removed for B200).
     const HW_ENV = {
-      h200:  ["SGLANG_DSV4_FP4_EXPERTS=0"],   // allinone _ENV_H200
+      h200:  [],                              // allinone _ENV_H200
       b200:  [],                              // _ENV_B200 minus NVSHMEM
       gb300: [],                              // _ENV_GB300
       // GB200 multinode needs NCCL MNNVL for cross-node NVLink communication.
@@ -625,7 +625,7 @@ export const DeepSeekV4Deployment = () => {
     const isBlackwell = hardware === "b200" || hardware === "gb200" || isGB300;
 
     const HW_ENV = {
-      h200:  ["SGLANG_DSV4_FP4_EXPERTS=0"],
+      h200:  [],
       b200:  [],
       gb300: [],
       gb200: [],
