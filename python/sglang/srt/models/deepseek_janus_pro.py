@@ -1963,8 +1963,7 @@ class MultiModalityCausalLM(MultiModalityPreTrainedModel):
 
     def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
         if items and items[0].format == MultimodalInputFormat.PRECOMPUTED_EMBEDDING:
-            result = torch.cat([item.feature for item in items])
-            return result.reshape(-1, result.shape[-1])
+            return torch.cat([item.feature for item in items])
 
         pixel_values = torch.concat([item.feature for item in items], dim=0)
         bs, n = pixel_values.shape[0:2]

@@ -896,7 +896,7 @@ class TestJanusProUnderstandsImage(VLMInputTestBase, unittest.IsolatedAsyncioTes
             def build_vision_tower(self, vision_tower_params):
                 # We already know that the configs from https://huggingface.co/deepseek-ai/Janus-Pro-7B/blob/main/config.json#L49
                 # SigLIP is used. For this test, to avoid unnecessary code,
-                # We override the ``build_vision_tower`` method to construct
+                # we override the ``build_vision_tower`` method to construct
                 # ``VisionTransformer``.
                 self.select_feature = "same"
                 model_name = vision_tower_params.get(
