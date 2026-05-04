@@ -109,14 +109,14 @@ backend.
 
 ## Validated ModelOpt Checkpoints
 
-This section is the canonical support matrix for the six diffusion ModelOpt
+This section is the canonical support matrix for the eight diffusion ModelOpt
 checkpoints currently wired up in SGLang docs and B200 CI coverage.
 
 Published checkpoints keep the serialized quantization config as
 `quant_method=modelopt`; the FP8 vs NVFP4 split below is a documentation label
 derived from `quant_algo`.
 
-Five of the six repos live under `lmsys/*`. The FLUX.2 NVFP4 entry keeps the
+Seven of the eight repos live under `lmsys/*`. The FLUX.2 NVFP4 entry keeps the
 official `black-forest-labs/FLUX.2-dev-NVFP4` repo.
 
 <table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
@@ -164,6 +164,22 @@ official `black-forest-labs/FLUX.2-dev-NVFP4` repo.
       <td>primary-transformer-only path; keep <code>transformer_2</code> on the base checkpoint, and do not describe this as dual-transformer full-model FP8 unless that path is validated separately</td>
     </tr>
     <tr>
+      <td><code>FP8</code></td>
+      <td><code>Qwen/Qwen-Image</code></td>
+      <td><code>--transformer-path</code></td>
+      <td><code>lmsys/qwen-image-modelopt-fp8-sglang-transformer</code></td>
+      <td>single-transformer override, BF16-vs-FP8 image comparison, H100 benchmark, torch-profiler trace</td>
+      <td>shares the Qwen Image FP8 fallback preset; keep <code>img_in</code>, <code>txt_in</code>, timestep embedder, <code>norm_out.linear</code>, <code>proj_out</code>, <code>img_mod</code>/<code>txt_mod</code>, and <code>img_mlp.net.2</code> in BF16</td>
+    </tr>
+    <tr>
+      <td><code>FP8</code></td>
+      <td><code>Qwen/Qwen-Image-Edit-2511</code></td>
+      <td><code>--transformer-path</code></td>
+      <td><code>lmsys/qwen-image-edit-modelopt-fp8-sglang-transformer</code></td>
+      <td>TI2I edit smoke, BF16-vs-FP8 image comparison, H100 benchmark</td>
+      <td>shares <code>QwenImageTransformer2DModel</code> with Qwen Image and uses the same Qwen Image FP8 fallback preset</td>
+    </tr>
+    <tr>
       <td><code>NVFP4</code></td>
       <td><code>black-forest-labs/FLUX.1-dev</code></td>
       <td><code>--transformer-path</code></td>
@@ -190,7 +206,7 @@ official `black-forest-labs/FLUX.2-dev-NVFP4` repo.
   </tbody>
 </table>
 
-These six checkpoints are also the intended case set for the B200 diffusion CI
+These eight checkpoints are also the intended case set for the B200 diffusion CI
 job (`multimodal-gen-test-1-b200`).
 
 ## ModelOpt FP8
@@ -214,6 +230,23 @@ sglang generate \
   --model-path Wan-AI/Wan2.2-T2V-A14B-Diffusers \
   --transformer-path lmsys/wan22-t2v-a14b-modelopt-fp8-sglang-transformer \
   --prompt "a fox walking through neon rain" \
+  --save-output
+```
+
+```bash
+sglang generate \
+  --model-path Qwen/Qwen-Image \
+  --transformer-path lmsys/qwen-image-modelopt-fp8-sglang-transformer \
+  --prompt "A tiny astronaut reading a book under a glass greenhouse" \
+  --save-output
+```
+
+```bash
+sglang generate \
+  --model-path Qwen/Qwen-Image-Edit-2511 \
+  --transformer-path lmsys/qwen-image-edit-modelopt-fp8-sglang-transformer \
+  --image-path /path/to/input.png \
+  --prompt "Turn the scene into a warm watercolor illustration" \
   --save-output
 ```
 
