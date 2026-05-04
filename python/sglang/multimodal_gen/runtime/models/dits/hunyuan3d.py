@@ -22,9 +22,9 @@ from sglang.multimodal_gen.runtime.layers.linear import (
     RowParallelLinear,
 )
 from sglang.multimodal_gen.runtime.layers.mlp import MLP
+from sglang.multimodal_gen.runtime.managers.layerwise_offload import OffloadableDiTMixin
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
-from sglang.multimodal_gen.runtime.utils.layerwise_offload import OffloadableDiTMixin
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
@@ -621,6 +621,9 @@ class SGLangAttentionWrapper(torch.nn.Module):
             [nn.Linear(self.inner_dim, query_dim, bias=out_bias), nn.Dropout(dropout)]
         )
 
+        from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (
+            wrap_attention_impl_forward,
+        )
         from sglang.multimodal_gen.runtime.layers.attention.selector import (
             get_attn_backend,
         )
@@ -636,6 +639,7 @@ class SGLangAttentionWrapper(torch.nn.Module):
             num_kv_heads=heads,
             causal=False,
         )
+        wrap_attention_impl_forward(self.attn_impl)
         self._attn_backend_name = attn_backend.get_enum().name
 
     def forward(

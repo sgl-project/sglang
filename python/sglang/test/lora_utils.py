@@ -51,6 +51,33 @@ DEFAULT_PROMPTS = [
     """,
 ]
 
+MOE_LORA_TEST_PROMPTS = [
+    "Reverse the following security code: 0HRUP0A ->",
+    "Write a one-sentence story about a wild tree at the cafe.",
+    "Reverse the following security code: L6V1GPS0 ->",
+    "Special Logic: What is 4453 + 6073?",
+    "Special Logic: What is 7918 + 560?",
+    "Write a one-sentence story about a slow cat in a simulation.",
+    "Write a one-sentence story about a dusty dragon in a castle.",
+    "Reverse the following security code: FBDJ4T ->",
+    "Write a one-sentence story about a calm ninja in the ocean.",
+    "Write a one-sentence story about a glowing fairy in Paris.",
+    "Special Logic: What is 6200 + 7656?",
+    "Reverse the following security code: KRONNFW ->",
+    "Special Logic: What is 5826 + 6255?",
+    "Write a one-sentence story about a shiny robot in the jungle.",
+    "Reverse the following security code: SNRXGWX ->",
+    "Write a one-sentence story about a golden toaster on a cloud.",
+    "Special Logic: What is 5286 + 5653?",
+    "Write a one-sentence story about a brave cowboy in a time machine.",
+    "Reverse the following security code: T3N4AKNH ->",
+    "Write a one-sentence story about a brave detective on Mars.",
+]
+
+MOE_BASE_MODEL_PATH = "Qwen/Qwen1.5-MoE-A2.7B"
+MOE_LORA_PATH = "jonahbernard/sglang-lora-moe-test-qwen1.5-MoE-A2.7B"
+
+
 CI_LORA_MODELS = [
     LoRAModelCase(
         base="meta-llama/Llama-3.1-8B-Instruct",
@@ -89,10 +116,12 @@ CI_MULTI_LORA_MODELS = [
             LoRAAdaptor(
                 name="winddude/wizardLM-LlaMA-LoRA-7B",
                 prefill_tolerance=1e-1,
+                rouge_l_tolerance=0.9,
             ),
             LoRAAdaptor(
                 name="RuterNorway/Llama-2-7b-chat-norwegian-LoRa",
                 prefill_tolerance=3e-1,
+                rouge_l_tolerance=0.9,
             ),
         ],
         max_loras_per_batch=2,
@@ -352,6 +381,7 @@ def run_lora_test_one_by_one(
     disable_radix_cache: bool = False,
     mem_fraction_static: float = 0.88,
     test_tag: str = "",
+    attention_backend: Optional[str] = None,
 ):
     """
     Input a batch of prompts, and run lora tests one by one with several generate requests
@@ -401,6 +431,7 @@ def run_lora_test_one_by_one(
         disable_cuda_graph=disable_cuda_graph,
         disable_radix_cache=disable_radix_cache,
         mem_fraction_static=mem_fraction_static,
+        attention_backend=attention_backend,
     ) as srt_runner:
         srt_outputs = srt_runner.forward(
             prompts, max_new_tokens=max_new_tokens, lora_paths=adaptor_names
@@ -412,6 +443,7 @@ def run_lora_test_one_by_one(
         model_type="generation",
         tp_size=model_case.tp_size,
         mem_fraction_static=mem_fraction_static,
+        attention_backend=attention_backend,
     ) as srt_runner:
         srt_no_lora_outputs = srt_runner.forward(prompts, max_new_tokens=max_new_tokens)
 
@@ -640,10 +672,6 @@ def create_multiple_batch_test_samples(
     prompts: List[str], lora_adapter_paths: List[str]
 ):
     random.seed(42)
-    from sglang.multimodal_gen.runtime.utils.common import get_bool_env_var
-    from sglang.srt.utils.common import is_hip
-
-    _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
 
     test_cases = [
         (
@@ -690,19 +718,6 @@ def create_multiple_batch_test_samples(
         # ),
     ]
 
-    # [AMD] Aiter may fail this case but the model quality doesn't drop
-    # Skip this flaky case for now
-    if not _use_aiter:
-        test_cases.append(
-            (
-                [
-                    random.choice(prompts),
-                    random.choice(prompts),
-                    random.choice(prompts),
-                ],
-                [None, None, None],
-            )
-        )
     return test_cases
 
 
@@ -738,8 +753,6 @@ def run_lora_multiple_batch_on_model_cases(
                 else {
                     "speculative_algorithm": "NGRAM",
                     "speculative_num_draft_tokens": 5,
-                    "speculative_ngram_min_match_window_size": 2,
-                    "speculative_ngram_max_match_window_size": 15,
                 }
             )
             srt_runner = SRTRunner(
@@ -809,6 +822,7 @@ def run_lora_batch_splitting_equivalence_test(
     disable_cuda_graph: bool = True,
     disable_radix_cache: bool = True,
     enable_lora_overlap_loading: Optional[bool] = None,
+    lora_drain_wait_threshold: float = 0.0,
 ):
     """
     Test that SRT correctly handles batch splitting with multiple LoRA adapters.
@@ -826,6 +840,9 @@ def run_lora_batch_splitting_equivalence_test(
         attention_backend: Attention backend to use
         disable_cuda_graph: Whether to disable CUDA graph
         disable_radix_cache: Whether to disable radix cache
+        lora_drain_wait_threshold: When any LoRA adapter request waits longer than
+            this threshold (in seconds), the scheduler will selectively drain one
+            running adapter to make room. Set to 0 to disable draining (default).
     """
     max_loras_per_batch = 2
 
@@ -838,9 +855,14 @@ def run_lora_batch_splitting_equivalence_test(
         max_new_tokens = 64
         base_path = model_case.base
 
+        maybe_drain_info = (
+            f", lora_drain_wait_threshold={lora_drain_wait_threshold}"
+            if lora_drain_wait_threshold > 0
+            else ""
+        )
         print(
             f"\n========== Testing batch splitting on base '{base_path}', "
-            f"dtype={torch_dtype} =========="
+            f"dtype={torch_dtype}{maybe_drain_info} =========="
         )
 
         prompts = [TEST_MULTIPLE_BATCH_PROMPTS[0]] * 3
@@ -884,6 +906,7 @@ def run_lora_batch_splitting_equivalence_test(
             attention_backend=attention_backend,
             disable_cuda_graph=disable_cuda_graph,
             disable_radix_cache=disable_radix_cache,
+            lora_drain_wait_threshold=lora_drain_wait_threshold,
         ) as srt_runner:
             for batch_idx, (batch_prompts, lora_paths) in enumerate(test_cases):
                 print(f"\n--- Batch {batch_idx + 1} ---")

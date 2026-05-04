@@ -63,6 +63,7 @@ class LTX2ArchConfig(DiTArchConfig):
             # We use upstream variable names (patchify_proj, adaln_single) but HF uses different keys.
             #
             # HF key -> SGLang key (upstream naming)
+            r"^model\.diffusion_model\.(.*)$": r"\1",
             r"^proj_in\.(.*)$": r"patchify_proj.\1",
             r"^time_embed\.(.*)$": r"adaln_single.\1",
             r"^audio_proj_in\.(.*)$": r"audio_patchify_proj.\1",
@@ -123,6 +124,10 @@ class LTX2ArchConfig(DiTArchConfig):
     attention_type: LTX2AttentionFunction = LTX2AttentionFunction.DEFAULT
     rope_type: LTX2RopeType = LTX2RopeType.INTERLEAVED
     double_precision_rope: bool = False
+    quantize_video_rope_coords_to_hidden_dtype: bool = False
+    apply_gated_attention: bool = False
+    cross_attention_adaln: bool = False
+    caption_proj_before_connector: bool = False
 
     # Video parameters
     num_attention_heads: int = 32
@@ -146,6 +151,14 @@ class LTX2ArchConfig(DiTArchConfig):
     audio_cross_attention_dim: int = 2048
     audio_positional_embedding_max_pos: list[int] | None = None
     av_ca_timestep_scale_multiplier: int = 1
+
+    # 2.3 connector-related fields may show up in transformer/config.json.
+    connector_attention_head_dim: int = 128
+    connector_num_attention_heads: int = 30
+    connector_num_layers: int = 2
+    audio_connector_attention_head_dim: int = 128
+    audio_connector_num_attention_heads: int = 30
+    audio_connector_num_layers: int = 2
 
     # SGLang-specific parameters
     patch_size: tuple[int, int, int] = (1, 2, 2)

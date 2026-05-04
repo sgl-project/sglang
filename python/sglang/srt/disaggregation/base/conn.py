@@ -95,6 +95,12 @@ class BaseKVSender(ABC):
         """
         ...
 
+    def pop_decode_prefix_len(self) -> int:
+        return 0
+
+    def should_send_kv_chunk(self, num_pages: int, last_chunk: bool) -> bool:
+        return num_pages > 0
+
     @abstractmethod
     def poll(self) -> KVPoll:
         """
@@ -123,12 +129,23 @@ class BaseKVReceiver(ABC):
     @abstractmethod
     def init(
         self,
+        prefill_dp_rank: int,
+    ):
+        """
+        Resolve bootstrap metadata and mark the receiver ready for transfer metadata.
+        """
+        ...
+
+    @abstractmethod
+    def send_metadata(
+        self,
         kv_indices: npt.NDArray[np.int32],
         aux_index: Optional[int] = None,
         state_indices: Optional[List[int]] = None,
+        decode_prefix_len: Optional[int] = None,
     ):
         """
-        Set req's index metadata locally or notify the prefill server about the kv indices, aux index, and state_indices.
+        Notify the prefill server about the kv indices, aux index, and state_indices.
         """
         ...
 

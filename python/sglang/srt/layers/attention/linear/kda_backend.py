@@ -14,7 +14,7 @@ from sglang.srt.layers.attention.mamba.causal_conv1d_triton import (
     causal_conv1d_update,
 )
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
-from sglang.srt.utils import is_cpu, is_npu
+from sglang.srt.utils import is_cpu, is_cuda, is_npu
 from sglang.srt.utils.common import rank0_log
 
 # KDA always uses the triton causal_conv1d_fn (no CUDA override).
@@ -44,6 +44,14 @@ class KDAKernelDispatcher:
 
         if decode_backend.is_triton():
             self.decode_kernel = triton_kernel
+        elif decode_backend.is_cutedsl():
+            if not is_cuda():
+                raise ValueError("KDA CuTe DSL backend requires CUDA")
+            from sglang.srt.layers.attention.linear.kernels.kda_cutedsl import (
+                CuteDSLKDAKernel,
+            )
+
+            self.decode_kernel = CuteDSLKDAKernel()
         else:
             raise ValueError(
                 f"Unsupported KDA decode backend: {decode_backend}. "
@@ -244,6 +252,9 @@ class KDAAttnBackend(MambaAttnBackendBase):
             ssm_states=ssm_states,
             cache_indices=cache_indices,
             query_start_loc=query_start_loc,
+            A_log=layer.A_log,
+            dt_bias=layer.dt_bias,
+            lower_bound=getattr(layer, "lower_bound", None),
         )
 
         return core_attn_out

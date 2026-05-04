@@ -407,7 +407,7 @@ Use upstream SGLang binaries to start dedicated worker processes.
 
 ### Worker Lifecycle & Job Queue
 - `JobQueue` handles asynchronous add/remove operations to avoid blocking clients.
-- `WorkerManager` inspects worker metadata (`/get_server_info`, `/get_model_info`), tracks load, and exposes `flush_cache` and `get_loads`.
+- `WorkerManager` inspects worker metadata (`/server_info`, `/get_model_info`), tracks load, and exposes `flush_cache` and `get_loads`.
 - Per-worker circuit breakers and health probes keep the registry healthy; load monitor feeds metrics to cache-aware and power-of-two policies.
 
 ### Administrative & Worker APIs

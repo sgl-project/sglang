@@ -1,11 +1,19 @@
+import logging
 import os
 import tempfile
+import traceback
 from contextlib import nullcontext
 
 import torch
-from torch.cuda.memory import CUDAPluggableAllocator
+from torch.cuda.memory import (
+    CUDAPluggableAllocator,
+    _cuda_beginAllocateCurrentThreadToPool,
+    _cuda_endAllocateToPool,
+    _cuda_releasePool,
+)
 
 from sglang.srt.distributed.parallel_state import GroupCoordinator
+from sglang.srt.environ import envs
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils.common import torch_release
 
@@ -150,9 +158,9 @@ class SymmetricMemoryContext:
         group_coordinator: GroupCoordinator,
     ):
         self.group_coordinator = group_coordinator
-        self._mem_pool_ctx = torch.cuda.use_mem_pool(get_nccl_mem_pool())
+        self._pool_id = get_nccl_mem_pool().id
+        self._device_index = torch.cuda.current_device()
         self.is_graph_capture = torch.cuda.is_current_stream_capturing()
-        self.exited = False
 
     def __enter__(self):
         assert (
@@ -171,11 +179,7 @@ class SymmetricMemoryContext:
                     _cur_device, _graph_pool_id
                 )
 
-        if self.exited:
-            # mempool ctx (@contextlib.contextmanager) is not re-entrant
-            self._mem_pool_ctx = torch.cuda.use_mem_pool(get_nccl_mem_pool())
-            self.exited = False
-        self._mem_pool_ctx.__enter__()
+        _cuda_beginAllocateCurrentThreadToPool(self._device_index, self._pool_id)
 
         # Set the env var to pass this argument to the C functions.
         os.environ["SGLANG_TMP_NCCL_COMM_VALUE"] = str(
@@ -188,7 +192,8 @@ class SymmetricMemoryContext:
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        self._mem_pool_ctx.__exit__(exc_type, exc_val, exc_tb)
+        _cuda_endAllocateToPool(self._device_index, self._pool_id)
+        _cuda_releasePool(self._device_index, self._pool_id)
 
         if self.is_graph_capture:
             if after_2_8_0:
@@ -201,8 +206,6 @@ class SymmetricMemoryContext:
         global _active_symmetric_memory_context
         _active_symmetric_memory_context = None
 
-        self.exited = True
-
 
 def use_symmetric_memory(group_coordinator: GroupCoordinator, disabled: bool = False):
     disabled = (
@@ -211,3 +214,78 @@ def use_symmetric_memory(group_coordinator: GroupCoordinator, disabled: bool = F
         or group_coordinator.world_size == 1
     )
     return SymmetricMemoryContext(group_coordinator) if not disabled else nullcontext()
+
+
+# --- Debug mode for symmetric memory validation ---
+
+_symm_mem_logger = logging.getLogger(__name__)
+_debug_seen_traces: set = set()
+
+
+def is_tensor_in_symmetric_mempool(tensor: torch.Tensor) -> bool:
+    """Check if a tensor's storage is allocated in the NCCL symmetric memory pool."""
+
+    if _mem_pool is None:
+        return False  # Pool not initialized
+
+    data_ptr = tensor.untyped_storage().data_ptr()
+
+    for segment in _mem_pool.snapshot():
+        for block in segment["blocks"]:
+            if block["address"] == data_ptr:
+                return True
+    return False
+
+
+def debug_check_symmetric_mempool(
+    group_coordinator: GroupCoordinator,
+    tensors: dict,
+    op_name: str,
+) -> None:
+    """
+    Debug check: verify that tensors passed to communication ops are allocated
+    in the NCCL symmetric memory pool.
+
+    Enabled by setting SGLANG_DEBUG_SYMM_MEM=1.
+    Only prints warnings on rank 0 and deduplicates identical stack traces.
+
+    Args:
+        tensors: dict mapping argument name to tensor
+                 (e.g. {"input": t1, "output": t2})
+        op_name: name of the communication operation being checked
+    """
+    if not envs.SGLANG_DEBUG_SYMM_MEM.get() or not is_symmetric_memory_enabled():
+        return
+
+    # Only print on rank 0
+    if not group_coordinator.is_first_rank:
+        return
+
+    bad_names = []
+    bad_details = []
+    for name, tensor in tensors.items():
+        if not is_tensor_in_symmetric_mempool(tensor):
+            bad_names.append(name)
+            bad_details.append(
+                f"  - '{name}' (data_ptr=0x{tensor.storage().data_ptr():x}, "
+                f"shape={list(tensor.shape)}, dtype={tensor.dtype})"
+            )
+
+    if bad_names:
+        traces = traceback.format_stack()
+        # Skip autotune stack traces
+        if any("_flashinfer_autotune" in trace for trace in traces):
+            return
+        stack = "".join(traces[:-1])
+        trace_key = f"{op_name}:{','.join(bad_names)}:{stack}"
+        if trace_key not in _debug_seen_traces:
+            _debug_seen_traces.add(trace_key)
+            _symm_mem_logger.warning(
+                "[SymmMem Debug] %s: %d tensor(s) are NOT in the "
+                "NCCL symmetric memory pool:\n%s\n"
+                "Stack trace:\n%s",
+                op_name,
+                len(bad_names),
+                "\n".join(bad_details),
+                stack,
+            )
