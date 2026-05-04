@@ -313,5 +313,8 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         super().load_weights(weights, is_nextn=True)
 
+    def post_load_weights(self, weight_names=None):
+        super().post_load_weights(is_nextn=True, weight_names=weight_names)
+
 
 EntryClass = [DeepseekV3ForCausalLMNextN]

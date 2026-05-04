@@ -243,8 +243,8 @@ class BailingMoeForCausalLMNextN(nn.Module):
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         self.base_load_weights_func(self, weights, is_nextn=True)
 
-    def post_load_weights(self, is_nextn=False, weight_names=None):
-        self.post_load_weights_func(self, is_nextn=is_nextn, weight_names=weight_names)
+    def post_load_weights(self, weight_names=None):
+        self.post_load_weights_func(self, is_nextn=True, weight_names=weight_names)
 
 
 EntryClass = [BailingMoeForCausalLMNextN]
