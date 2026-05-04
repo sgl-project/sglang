@@ -992,13 +992,24 @@ class Scheduler(SchedulerDisaggMixin):
                 cap,
                 len(self.waiting_queue) + len(admitted),
             )
-            self.return_result(
-                OutputBatch(
-                    error="The request queue is full.",
-                    status_code=503,
-                ),
-                identity,
-            )
+            try:
+                self.return_result(
+                    OutputBatch(
+                        error="The request queue is full.",
+                        status_code=503,
+                    ),
+                    identity,
+                )
+            except zmq.ZMQError as e:
+                # Don't let a transient ZMQ failure on the rejection reply
+                # trip the outer event_loop's _consecutive_error_count and
+                # tear down the scheduler — the rejected req is already lost,
+                # we just want to keep serving.
+                logger.error(
+                    "Failed to send queue-full rejection over ZMQ to identity=%r: %s",
+                    identity,
+                    e,
+                )
         return admitted
 
     def process_received_reqs_with_req_based_warmup(
