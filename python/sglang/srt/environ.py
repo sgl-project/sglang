@@ -559,7 +559,7 @@ class Envs:
     SGLANG_DSV4_FP4_EXPERTS = EnvBool(True)
     # Default reasoning_effort for dsv4 chat encoder when request doesn't set it.
     # Accepts "", "max", "high" (empty string means unset); other values filtered to None.
-    SGLANG_REASONING_EFFORT = EnvStr("")
+    SGLANG_DSV4_REASONING_EFFORT = EnvStr("")
 
     # HiSparse / compressor (HC = HiSparse compressor, MHC = HiSparse hash kernel)
     SGLANG_OPT_DEEPGEMM_HC_PRENORM = EnvBool(True)
@@ -685,6 +685,7 @@ def _convert_SGL_to_SGLANG():
     )
     _print_deprecated_env("SGLANG_PER_TOKEN_GROUP_QUANT_8BIT_V2")
     _print_deprecated_env("SGLANG_ENABLE_THINKING", "SGLANG_DEFAULT_THINKING")
+    _print_deprecated_env("SGLANG_REASONING_EFFORT", "SGLANG_DSV4_REASONING_EFFORT")
     _print_deprecated_env(
         "SGLANG_USE_JIT_ALL_REDUCE", "SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2"
     )

@@ -560,10 +560,10 @@ class OpenAIServingChat(OpenAIServingBase):
             if self.chat_encoding_spec == "dsv4":
                 # V4 encoder only accepts "max" / "high" / None.
                 # OpenAI protocol defaults to "medium" which V4 rejects; drop it.
-                # Fallback: if request didn't set it, try env SGLANG_REASONING_EFFORT.
+                # Fallback: if request didn't set it, try env SGLANG_DSV4_REASONING_EFFORT.
                 effort_source = request.reasoning_effort
                 if effort_source is None:
-                    env_val = envs.SGLANG_REASONING_EFFORT.get()
+                    env_val = envs.SGLANG_DSV4_REASONING_EFFORT.get()
                     if env_val:
                         effort_source = env_val
                 v4_reasoning_effort = (
