@@ -736,12 +736,14 @@ class MambaRadixCache(BasePrefixCache):
             x.full_lock_ref == 0 and x.mamba_lock_ref == 0
         ), f"evict leaf node invalid with {x.id=} {x.full_lock_ref=} {x.mamba_lock_ref=}"
 
-        assert x.mamba_value is not None, f"leaf node mamba value is not None, {x.id=}"
-        # 1. a leaf node, free full tokens and mamba
+        # Leaf nodes created with strip_thinking_cache may have mamba_value = None
+        has_mamba = x.mamba_value is not None
+        # 1. a leaf node, free full tokens and mamba (if present)
         self.token_to_kv_pool_allocator.free(x.value)
         full_num_evicted = len(x.value)
-        self.req_to_token_pool.mamba_pool.free(x.mamba_value)
-        mamba_num_evicted = len(x.mamba_value)
+        mamba_num_evicted = len(x.mamba_value) if has_mamba else 0
+        if has_mamba:
+            self.req_to_token_pool.mamba_pool.free(x.mamba_value)
 
         # 2. get the next node, update the lru lists
         if is_evict_mamba:
@@ -749,7 +751,8 @@ class MambaRadixCache(BasePrefixCache):
         else:
             x_next = self.full_lru_list.get_prev_leaf_no_lock(x)
         self.full_lru_list.remove_node(x)
-        self.mamba_lru_list.remove_node(x)
+        if has_mamba:
+            self.mamba_lru_list.remove_node(x)
 
         # 3. delete the leaf node
         self._delete_leaf(x)
