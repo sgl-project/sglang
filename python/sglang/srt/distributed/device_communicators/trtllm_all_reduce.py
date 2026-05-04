@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import logging
-from typing import Optional, Union
 
 import torch
 import torch.distributed as dist
@@ -40,8 +39,8 @@ class TRTLLMAllReduce:
     def __init__(
         self,
         cpu_group: ProcessGroup,
-        device_group: Optional[ProcessGroup],
-        device: Union[int, str, torch.device],
+        device_group: ProcessGroup | None,
+        device: int | str | torch.device,
     ) -> None:
         self.disabled = True
         self._workspace_manager = None
@@ -88,9 +87,9 @@ class TRTLLMAllReduce:
         self._device = device
         self._world_size = world_size
         self._rank = rank
-        self._max_token_num: Optional[int] = None
-        self._hidden_dim: Optional[int] = None
-        self._dtype: Optional[torch.dtype] = None
+        self._max_token_num: int | None = None
+        self._hidden_dim: int | None = None
+        self._dtype: torch.dtype | None = None
         # Stays disabled until initialize_workspace succeeds on all ranks.
 
     def initialize_workspace(
@@ -98,7 +97,7 @@ class TRTLLMAllReduce:
         max_token_num: int,
         hidden_dim: int,
         dtype: torch.dtype,
-        use_oneshot: Optional[bool] = None,
+        use_oneshot: bool | None = None,
     ) -> bool:
         """Allocate the IPC workspace. Must run before CUDA graph capture.
 
