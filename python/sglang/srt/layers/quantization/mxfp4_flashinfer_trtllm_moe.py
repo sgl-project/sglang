@@ -121,7 +121,7 @@ def _pack_topk_ids_triton_kernel(
     tl.store(out_ptr + offsets, packed, mask=mask)
 
 
-class DeepSeekMxfp4MoEMethod:
+class Mxfp4FlashinferTrtllmMoEMethod:
 
     def __init__(self, fp8_method, prefix: str):
         self._fp8 = fp8_method
@@ -478,7 +478,7 @@ def maybe_fuse_routed_scale_and_shared_add(
     # in-place. Otherwise `routed` is already scale-final and we just add
     # `shared` (or pass through if there is none).
     fused = (
-        isinstance(experts.quant_method, DeepSeekMxfp4MoEMethod)
+        isinstance(experts.quant_method, Mxfp4FlashinferTrtllmMoEMethod)
         and envs.SGLANG_OPT_MXFP4_FUSE_RSF_SHARED_ADD.get()
     )
     if fused:

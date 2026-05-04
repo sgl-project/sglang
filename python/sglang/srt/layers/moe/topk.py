@@ -284,8 +284,8 @@ class TopK(MultiPlatformOp):
             assert num_expert_group is not None and topk_group is not None
 
         self.layer_id = layer_id
-        # flashinfer_mxfp4 backend only: True → STANDARD (DeepSeekMxfp4MoEMethod
-        # consumes), False → BYPASSED (flashinfer's own mxfp4 kernel). No-op otherwise.
+        # flashinfer_mxfp4 backend only: True -> STANDARD (Mxfp4FlashinferTrtllmMoEMethod
+        # consumes), False -> BYPASSED (flashinfer's own mxfp4 kernel). No-op otherwise.
         self.is_fp4_experts = is_fp4_experts
         self.topk_config = TopKConfig(
             top_k=top_k,
