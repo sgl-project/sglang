@@ -1,4 +1,4 @@
-name: Release SGL DeepGEMM
+name: Release sgl-deep-gemm
 
 on:
   workflow_dispatch:
@@ -9,7 +9,7 @@ on:
         required: true
       target:
         type: choice
-        description: 'Build target'
+        description: "Build target (default: all)"
         required: false
         default: 'all'
         options:
@@ -17,7 +17,7 @@ on:
           - 'cu129'
           - 'cu130'
       branch:
-        description: "DeepGEMM branch to build from"
+        description: "DeepGEMM branch to build from (default: release-0426)"
         type: string
         required: false
         default: 'release-0426'
