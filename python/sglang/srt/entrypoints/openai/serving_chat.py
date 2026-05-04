@@ -435,6 +435,9 @@ class OpenAIServingChat(OpenAIServingBase):
         self._patch_mistral_skip_special_tokens(request)
 
         thinking_mode = self._get_reasoning_from_request(request)
+        # SGLang's ReasonerGrammarBackend owns the reasoning prefix
+        # when --reasoning-parser is configured, so builtin xgrammar
+        # tags must describe only the post-reasoning tool-call suffix.
         xgrammar_reasoning = thinking_mode and (
             self.tokenizer_manager.server_args.reasoning_parser is not None
         )
@@ -454,9 +457,6 @@ class OpenAIServingChat(OpenAIServingBase):
                 tools = [item.model_dump() for item in request.tools]
             if self.tool_call_parser:
                 parser = FunctionCallParser(request.tools, self.tool_call_parser)
-                # SGLang's ReasonerGrammarBackend owns the reasoning prefix
-                # when --reasoning-parser is configured, so builtin xgrammar
-                # tags must describe only the post-reasoning tool-call suffix.
                 tool_call_constraint = parser.get_structure_constraint(
                     request.tool_choice,
                     parallel_tool_calls=request.parallel_tool_calls,
