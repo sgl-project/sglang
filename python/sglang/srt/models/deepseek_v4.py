@@ -1094,19 +1094,32 @@ class DeepseekV4DecoderLayer(nn.Module):
             return y, post.squeeze(-1), comb
 
         if envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.get():
-            import deep_gemm
+            try:
+                import deep_gemm
 
-            x_flat = x.flatten(1).bfloat16()
+                x_flat = x.flatten(1).bfloat16()
 
-            m, k = x_flat.shape
-            mix_hc = hc_fn.size(0)
-            d_out = torch.empty((m, mix_hc), dtype=torch.float, device=x.device)
-            s_out = torch.empty((m,), dtype=torch.float, device=x.device)
-            deep_gemm.tf32_hc_prenorm_gemm(
-                x_flat, hc_fn.float().contiguous(), d_out, s_out, num_splits=None
-            )
-            rsqrt = torch.rsqrt(s_out / k + self.rms_norm_eps)
-            mixes = (d_out * rsqrt.unsqueeze(1)).unsqueeze(1)
+                m, k = x_flat.shape
+                mix_hc = hc_fn.size(0)
+                d_out = torch.empty((m, mix_hc), dtype=torch.float, device=x.device)
+                s_out = torch.empty((m,), dtype=torch.float, device=x.device)
+                deep_gemm.tf32_hc_prenorm_gemm(
+                    x_flat,
+                    hc_fn.float().contiguous(),
+                    d_out,
+                    s_out,
+                    num_splits=None,
+                )
+                rsqrt = torch.rsqrt(s_out / k + self.rms_norm_eps)
+                mixes = (d_out * rsqrt.unsqueeze(1)).unsqueeze(1)
+            except (RuntimeError, ImportError):
+                # DeepGEMM not available or unsupported arch (e.g. SM120)
+                x_flat = x.flatten(1).float()
+                sq = x_flat.square()
+                mean = sq.mean(-1, keepdim=True)
+                rsqrt = torch.rsqrt(mean + self.rms_norm_eps)
+                linear_out = F.linear(x_flat, hc_fn)
+                mixes = (linear_out * rsqrt).unsqueeze(1)
         else:
             x_flat = x.flatten(1).float()
             sq = x_flat.square()

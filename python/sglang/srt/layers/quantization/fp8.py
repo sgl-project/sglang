@@ -92,6 +92,12 @@ _is_fp8_fnuz = is_fp8_fnuz()
 _use_hip_int4 = get_bool_env_var("SGLANG_INT4_WEIGHT") and _is_hip
 _use_aiter = envs.SGLANG_USE_AITER.get() and _is_hip
 
+# FP4 E2M1 lookup table (module-level to avoid host→device alloc during CUDA graph capture)
+_FP4_E2M1_LUT_CPU = torch.tensor(
+    [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0], dtype=torch.float32
+)
+_FP4_E2M1_LUT_CACHE: dict[torch.device, torch.Tensor] = {}
+
 if _use_aiter or _use_hip_int4:
     from aiter import ActivationType, QuantType
     from aiter.fused_moe import fused_moe
@@ -941,11 +947,12 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         high_nib = (w_fp4_batch >> 4) & 0x0F
         unpacked = torch.stack([low_nib, high_nib], dim=-1).reshape(E, N, K)
 
-        e2m1_lut = torch.tensor(
-            [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0],
-            dtype=torch.float32,
-            device=w_fp4_batch.device,
-        )
+        # Use cached LUT to avoid host→device alloc during CUDA graph capture
+        dev = w_fp4_batch.device
+        if dev not in _FP4_E2M1_LUT_CACHE:
+            _FP4_E2M1_LUT_CACHE[dev] = _FP4_E2M1_LUT_CPU.to(device=dev)
+        e2m1_lut = _FP4_E2M1_LUT_CACHE[dev]
+
         mag = unpacked & 0x07
         sign = 1 - 2 * ((unpacked >> 3) & 1).float()
         fp4_float = sign * e2m1_lut[mag.long()]
