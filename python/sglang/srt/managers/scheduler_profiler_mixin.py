@@ -216,9 +216,10 @@ class SchedulerProfilerMixin:
 
         return ProfileReqOutput(success=True, message="Succeeded")
 
-    def _merge_profile_traces(self: Scheduler) -> str:
+    def _merge_profile_traceses(self: Scheduler) -> str:
         if not self.merge_profiles:
             return ""
+        return ""
 
         if self.tp_rank != 0:
             return ""
