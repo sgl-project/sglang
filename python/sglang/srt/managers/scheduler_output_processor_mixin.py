@@ -367,9 +367,8 @@ class SchedulerOutputProcessorMixin:
 
         # Feed the adaptive controller now that accept_lens is on CPU,
         # instead of doing a synchronous GPU→CPU copy in the worker hot path.
-        update_fn = getattr(self.model_worker, "on_verify_complete_cpu", None)
-        if update_fn is not None:
-            update_fn(result.num_accepted_drafts_per_req_cpu)
+        # BaseSpecWorker provides a no-op default for non-adaptive workers.
+        self.model_worker.on_verify_complete_cpu(result.num_accepted_drafts_per_req_cpu)
 
         predict_tokens = []
         # In adaptive spec-v2, the worker state may already have switched when this

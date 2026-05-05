@@ -794,9 +794,8 @@ class EAGLEWorkerV2(BaseSpecWorker):
             return batch_output
 
     def on_verify_complete_cpu(self, accepted_draft_tokens: list[int]) -> None:
-        ctrl = getattr(self, "adaptive_controller", None)
-        if ctrl is not None:
-            ctrl.on_verify_complete(accepted_draft_tokens)
+        if self.adaptive_controller is not None:
+            self.adaptive_controller.on_verify_complete(accepted_draft_tokens)
 
     # -- Adaptive speculative decoding protocol --
 
@@ -905,8 +904,8 @@ class EAGLEWorkerV2(BaseSpecWorker):
             dw.draft_attn_backend,
             dw.draft_extend_attn_backend,
             dw.draft_runner.draft_attn_backend,
-            getattr(dw, "cuda_graph_runner", None),
-            getattr(dw, "cuda_graph_runner_for_draft_extend", None),
+            dw.cuda_graph_runner,
+            dw.cuda_graph_runner_for_draft_extend,
             sa.speculative_num_steps,
             sa.speculative_num_draft_tokens,
         )

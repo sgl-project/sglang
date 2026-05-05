@@ -410,9 +410,9 @@ class EAGLEWorker(TpModelWorker):
             self.speculative_num_draft_tokens,
             self.draft_attn_backend,
             self.draft_extend_attn_backend,
-            getattr(self.draft_model_runner, "draft_attn_backend", None),
-            getattr(self, "cuda_graph_runner", None),
-            getattr(self, "cuda_graph_runner_for_draft_extend", None),
+            self.draft_model_runner.draft_attn_backend,
+            self.cuda_graph_runner,
+            self.cuda_graph_runner_for_draft_extend,
             sa.speculative_num_steps,
             sa.speculative_num_draft_tokens,
         )
@@ -514,9 +514,8 @@ class EAGLEWorker(TpModelWorker):
                 batch.reqs, "set_spec_draft_extend_end_time", trace_only=True
             )
 
-            controller = getattr(self, "adaptive_controller", None)
-            if controller is not None:
-                controller.on_verify_complete(
+            if self.adaptive_controller is not None:
+                self.adaptive_controller.on_verify_complete(
                     verify_output.num_accepted_drafts_per_req_cpu
                 )
 
