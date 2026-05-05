@@ -41,8 +41,6 @@ class ControllerElasticEPStatusPublisher(ElasticEPStatusPublisher):
         tp_active_ranks: torch.Tensor,
         tp_active_ranks_cpu: torch.Tensor,
     ) -> None:
-        assert tp_active_ranks.numel() == tp_active_ranks_cpu.numel()
-
         # DPC expects one active bit per DP worker. A DP worker is active only
         # when all TP ranks in that DP group are active in both backend masks.
         active_ranks = tp_active_ranks.detach().cpu().clone()

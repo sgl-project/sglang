@@ -62,11 +62,15 @@ class ElasticEPState:
             else:
                 staging_tp_active_ranks_cpu.copy_(tp_active_ranks)
 
-    def commit_active_snapshot(self) -> bool:
+    def commit_active_snapshot(
+        self, tp_active_ranks_cpu: torch.Tensor, tp_cpu_group
+    ) -> bool:
         """Commit the oldest unconsumed staging snapshot into CPU mirrors.
 
-        Caller must have already synchronized the stream the submit was enqueued
-        on (e.g. via copy_done.synchronize) so staging buffers are ready.
+        The committed mirrors are sticky fault latches: ranks return to active
+        only through explicit recover/reset. Caller must have already
+        synchronized the stream the submit was enqueued on (e.g. via
+        copy_done.synchronize) so staging buffers are ready.
         Returns True if a snapshot was committed.
         """
         if (
@@ -76,11 +80,19 @@ class ElasticEPState:
             return False
         slot = self.pending_staging_slots.pop(0)
         snapshot = self.staging_active_ranks_cpu_slots[slot]
-        self.active_ranks_cpu.copy_(snapshot)
-        if self.staging_tp_active_ranks_cpu_slots is not None:
-            self.tp_active_ranks_cpu.copy_(
-                self.staging_tp_active_ranks_cpu_slots[slot]
-            )
+        tp_snapshot = self.staging_tp_active_ranks_cpu_slots[slot]
+
+        self.active_ranks_cpu.bitwise_and_(self.tp_active_ranks_cpu)
+        self.active_ranks_cpu.bitwise_and_(snapshot)
+        self.active_ranks_cpu.bitwise_and_(tp_snapshot)
+        self.active_ranks_cpu.bitwise_and_(tp_active_ranks_cpu)
+        torch.distributed.all_reduce(
+            self.active_ranks_cpu,
+            op=torch.distributed.ReduceOp.MIN,
+            group=tp_cpu_group,
+        )
+        self.tp_active_ranks_cpu.copy_(self.active_ranks_cpu)
+        tp_active_ranks_cpu.copy_(self.active_ranks_cpu)
         return True
 
     def is_stale_snapshot(self) -> bool:
@@ -275,14 +287,6 @@ def can_recover_ranks(global_ranks: List[int]) -> bool:
 
     world_backend = _get_process_group_backend(torch.distributed.group.WORLD, "cuda")
     return all(mooncake_ep.get_peer_state(world_backend, global_ranks))
-
-
-def try_recover_ranks(global_ranks: List[int]) -> bool:
-    if not can_recover_ranks(global_ranks):
-        # The relaunched ranks have not finished initializing yet.
-        return False
-    recover_ranks(global_ranks)
-    return True
 
 
 def recover_ranks(global_ranks: List[int]) -> None:

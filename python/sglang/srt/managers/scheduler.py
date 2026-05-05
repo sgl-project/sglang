@@ -65,7 +65,6 @@ from sglang.srt.disaggregation.utils import (
 from sglang.srt.distributed import get_pp_group, get_world_group
 from sglang.srt.distributed.parallel_state import get_tp_group
 from sglang.srt.dllm.mixin.scheduler import SchedulerDllmMixin
-from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers.attention.mamba.ops import (
@@ -1514,8 +1513,6 @@ class Scheduler(
             Tuple[ScheduleBatch, Union[GenerationBatchResult, EmbeddingBatchResult]]
         ] = deque()
 
-        _elastic_state = ElasticEPStateManager.instance()
-
         def pop_and_process() -> bool:
             """Commit the oldest result_queue entry. Returns True normally.
             When elastic EP is enabled, syncing copy_done also flushes the
@@ -1523,16 +1520,11 @@ class Scheduler(
             earlier); fault and recovery paths retract in-flight batches and
             return False so the caller skips the rest of the iteration."""
             tmp_batch, tmp_result = self.result_queue.popleft()
-            if _elastic_state is not None:
-                if tmp_result.copy_done is not None:
-                    tmp_result.copy_done.synchronize()
-                if _elastic_state.commit_active_snapshot():
-                    self._publish_active_ranks_from_committed_snapshot()
-                    if _elastic_state.is_stale_snapshot():
-                        self._retract_all_and_rebalance_on_rank_fault()
-                        return False
-                    if self._maybe_recover_ep_ranks_from_cpu_snapshot():
-                        return False
+            if (
+                self.server_args.elastic_ep_backend is not None
+                and not self._handle_elastic_ep_result_boundary(tmp_result)
+            ):
+                return False
             self.process_batch_result(tmp_batch, tmp_result)
             return True
 

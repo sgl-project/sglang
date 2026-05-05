@@ -327,7 +327,7 @@ def broadcast_global_expert_location_metadata(
     newly recovered ones) share exactly the same expert location metadata.
 
     Note: The caller must ensure src_rank is a healthy rank. In recovery scenarios,
-    this function is called after try_recover_ranks succeeds, at which point all
+    this function is called after recover_ranks succeeds, at which point all
     ranks (including src_rank=0) have recovered and are ready.
     """
     metadata = get_global_expert_location_metadata()

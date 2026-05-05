@@ -14,10 +14,36 @@ from sglang.srt.managers.io_struct import AbortReq
 from sglang.srt.managers.schedule_batch import FINISH_ABORT
 
 if TYPE_CHECKING:
-    from sglang.srt.managers.scheduler import Scheduler
+    from sglang.srt.managers.scheduler import EmbeddingBatchResult, Scheduler
+    from sglang.srt.managers.utils import GenerationBatchResult
 
 
 class SchedulerElasticEPMixin:
+    def _handle_elastic_ep_result_boundary(
+        self: Scheduler,
+        result: GenerationBatchResult | EmbeddingBatchResult,
+    ) -> bool:
+        """Handle the elastic EP result boundary before processing outputs.
+
+        Returns False when fault/recovery retracts in-flight work and the
+        caller should skip the rest of the current scheduler iteration.
+        """
+        elastic_ep_state = ElasticEPStateManager.instance()
+        assert elastic_ep_state is not None
+        if result.copy_done is not None:
+            result.copy_done.synchronize()
+        if elastic_ep_state.commit_active_snapshot(
+            self.tp_group.active_ranks_cpu, self.tp_cpu_group
+        ):
+            self._publish_active_ranks_from_committed_snapshot()
+            if elastic_ep_state.is_stale_snapshot():
+                self._retract_all_and_rebalance_on_rank_fault()
+                return False
+            if self._maybe_recover_ep_ranks_from_cpu_snapshot():
+                return False
+
+        return True
+
     def _publish_active_ranks_from_committed_snapshot(self: Scheduler):
         elastic_ep_state = ElasticEPStateManager.instance()
         assert elastic_ep_state is not None
@@ -35,13 +61,13 @@ class SchedulerElasticEPMixin:
         if elastic_ep_state is None or elastic_ep_state.tp_active_ranks_cpu is None:
             return []
 
-        assert elastic_ep_state.tp_active_ranks_cpu.numel() == (
-            self.tp_group.active_ranks_cpu.numel()
+        return (
+            torch.nonzero(
+                elastic_ep_state.tp_active_ranks_cpu == 0, as_tuple=False
+            )
+            .flatten()
+            .tolist()
         )
-        active_ranks = (
-            elastic_ep_state.tp_active_ranks_cpu & self.tp_group.active_ranks_cpu
-        )
-        return torch.nonzero(active_ranks == 0, as_tuple=False).flatten().tolist()
 
     def _retract_inflight_batches_for_elastic_ep(
         self: Scheduler,
