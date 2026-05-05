@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import bisect
+import contextlib
 import gc
 import inspect
 import logging
@@ -138,6 +139,7 @@ class DecodeInputBuffers(ForwardInputBuffers):
     seq_lens: torch.Tensor
     seq_lens_cpu: torch.Tensor
     out_cache_loc: torch.Tensor
+    out_cache_loc_swa: Optional[torch.Tensor]
     positions: torch.Tensor
     mrope_positions: torch.Tensor
     num_token_non_padded: torch.Tensor
@@ -171,6 +173,7 @@ class DecodeInputBuffers(ForwardInputBuffers):
         cache_loc_dtype: torch.dtype,
         enable_mamba_track: bool,
         ne_token_table: Optional[torch.Tensor] = None,
+        is_hybrid_swa: bool = False,
     ) -> "DecodeInputBuffers":
         with torch.device(device):
             input_ids = torch.zeros((max_num_token,), dtype=torch.int64)
@@ -178,6 +181,11 @@ class DecodeInputBuffers(ForwardInputBuffers):
             req_pool_indices = torch.zeros((max_bs,), dtype=torch.int64)
             seq_lens = torch.full((max_bs,), seq_len_fill_value, dtype=torch.int32)
             out_cache_loc = torch.zeros((max_num_token,), dtype=cache_loc_dtype)
+            out_cache_loc_swa = (
+                torch.zeros((max_num_token,), dtype=torch.int64)
+                if is_hybrid_swa
+                else None
+            )
             positions = torch.zeros((max_num_token,), dtype=torch.int64)
             mrope_positions = torch.zeros((3, max_num_token), dtype=torch.int64)
             num_token_non_padded = torch.zeros((1,), dtype=torch.int32)
@@ -249,6 +257,7 @@ class DecodeInputBuffers(ForwardInputBuffers):
             seq_lens=seq_lens,
             seq_lens_cpu=seq_lens_cpu,
             out_cache_loc=out_cache_loc,
+            out_cache_loc_swa=out_cache_loc_swa,
             positions=positions,
             mrope_positions=mrope_positions,
             num_token_non_padded=num_token_non_padded,
@@ -355,6 +364,14 @@ class DecodeInputBuffers(ForwardInputBuffers):
                 dim = src.shape[0]
                 dsts.append(buf[:dim])
                 srcs.append(src)
+
+        # SWA cache location (int32, separate from the int64 batch above).
+        if (
+            self.out_cache_loc_swa is not None
+            and forward_batch.out_cache_loc_swa is not None
+        ):
+            dsts.append(self.out_cache_loc_swa[:raw_num_token])
+            srcs.append(forward_batch.out_cache_loc_swa[:raw_num_token])
 
         # Batch all GPU copies, grouped by dtype pair.
         _grouped_foreach_copy_(dsts, srcs)
@@ -685,6 +702,7 @@ class CudaGraphRunner:
             ne_token_table=(
                 model_runner.token_table if self.use_ngram_embedding else None
             ),
+            is_hybrid_swa=model_runner.is_hybrid_swa,
         )
         self.buffers.share_buffers()
 
@@ -879,9 +897,10 @@ class CudaGraphRunner:
             else:
                 set_pdmux_status(False)
                 for i, sg in enumerate(self.stream_groups):
-                    with graph_capture(
-                        stream=sg[1]
-                    ) as graph_capture_context, profile_context as prof:
+                    with (
+                        graph_capture(stream=sg[1]) as graph_capture_context,
+                        profile_context as prof,
+                    ):
                         self.stream = graph_capture_context.stream
                         _capture_one_stream(i)
 
@@ -1131,6 +1150,15 @@ class CudaGraphRunner:
 
         self.deepep_adapter.capture(is_extend_in_batch=False)
 
+        # swa_loc must be set before capture so that set_kv_buffer's
+        # Python branch (if self.swa_loc is not None) takes the fast path,
+        # and the graph records GPU ops using this buffer instead of the
+        # per-layer translate_loc_from_full_to_swa fallback.
+        if self.buffers.out_cache_loc_swa is not None:
+            self.model_runner.token_to_kv_pool.set_swa_loc(
+                self.buffers.out_cache_loc_swa[:num_tokens]
+            )
+
         for _ in range(2):
             self.device_module.synchronize()
             self.model_runner.tp_group.barrier()
@@ -1218,6 +1246,7 @@ class CudaGraphRunner:
             ),
             pp_proxy_tensors=pp_proxy_tensors,
         )
+
         if (
             self.model_runner.spec_algorithm.is_dflash()
             and self.model_runner.is_draft_worker
@@ -1286,7 +1315,17 @@ class CudaGraphRunner:
         variant_label = self._resolve_lora_variant(forward_batch)
         stream_idx = get_current_stream_idx() if self.enable_pdmux else None
         graph_key = self._make_graph_key(self.bs, stream_idx, variant_label)
-        self.graphs[graph_key].replay()
+        ctx = (
+            self.model_runner.device_timer.wrap(
+                metadata={
+                    "category": forward_batch.forward_mode.name.lower(),
+                }
+            )
+            if self.model_runner.device_timer
+            else contextlib.nullcontext()
+        )
+        with ctx:
+            self.graphs[graph_key].replay()
         output = self.output_buffers[graph_key]
 
         if isinstance(output, LogitsProcessorOutput):
