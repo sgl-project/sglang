@@ -86,6 +86,132 @@ class TestLoadBalanceMethod(unittest.TestCase):
         self.assertIn("'fake'", str(context.exception))
 
 
+class TestHiSparseNsaBackendPolicy(unittest.TestCase):
+    @patch("sglang.srt.server_args.is_hip", return_value=False)
+    def test_hisparse_defaults_to_flashmla_sparse_on_cuda(self, _mock_is_hip):
+        server_args = ServerArgs(model_path="dummy", enable_hisparse=True)
+
+        server_args._set_default_nsa_backends(kv_cache_dtype="bfloat16", major=9)
+
+        self.assertEqual(server_args.nsa_prefill_backend, "flashmla_sparse")
+        self.assertEqual(server_args.nsa_decode_backend, "flashmla_sparse")
+
+    @patch("sglang.srt.server_args.is_hip", return_value=True)
+    def test_hisparse_defaults_to_tilelang_on_rocm(self, _mock_is_hip):
+        server_args = ServerArgs(model_path="dummy", enable_hisparse=True)
+
+        server_args._set_default_nsa_backends(kv_cache_dtype="bfloat16", major=9)
+
+        self.assertEqual(server_args.nsa_prefill_backend, "tilelang")
+        self.assertEqual(server_args.nsa_decode_backend, "tilelang")
+
+    @patch("sglang.srt.server_args.is_hip", return_value=True)
+    def test_hisparse_preserves_rocm_user_backend_and_defaults_missing_side(
+        self, _mock_is_hip
+    ):
+        server_args = ServerArgs(
+            model_path="dummy",
+            enable_hisparse=True,
+            nsa_prefill_backend="tilelang",
+        )
+
+        server_args._set_default_nsa_backends(kv_cache_dtype="bfloat16", major=9)
+
+        self.assertEqual(server_args.nsa_prefill_backend, "tilelang")
+        self.assertEqual(server_args.nsa_decode_backend, "tilelang")
+
+    @patch("sglang.srt.server_args.is_hip", return_value=True)
+    def test_hisparse_rejects_cuda_backend_on_rocm(self, _mock_is_hip):
+        server_args = ServerArgs(
+            model_path="dummy",
+            enable_hisparse=True,
+            nsa_prefill_backend="flashmla_sparse",
+        )
+
+        with self.assertRaisesRegex(ValueError, r"backend\(s\) \[tilelang\]"):
+            server_args._validate_hisparse_nsa_backend("nsa_prefill_backend", "prefill")
+
+    @patch("sglang.srt.server_args.is_hip", return_value=False)
+    def test_hisparse_rejects_rocm_backend_on_cuda(self, _mock_is_hip):
+        server_args = ServerArgs(
+            model_path="dummy",
+            enable_hisparse=True,
+            nsa_decode_backend="tilelang",
+        )
+
+        with self.assertRaisesRegex(ValueError, r"backend\(s\) \[flashmla_sparse\]"):
+            server_args._validate_hisparse_nsa_backend("nsa_decode_backend", "decode")
+
+    def test_hisparse_accepts_bfloat16_kv_cache_dtype(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            enable_hisparse=True,
+            kv_cache_dtype="bfloat16",
+        )
+
+        server_args._validate_hisparse_kv_cache_dtype()
+
+    def test_hisparse_accepts_fp8_e4m3_kv_cache_dtype(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            enable_hisparse=True,
+            kv_cache_dtype="fp8_e4m3",
+        )
+
+        server_args._validate_hisparse_kv_cache_dtype()
+
+    def test_hisparse_rejects_unsupported_kv_cache_dtype(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            enable_hisparse=True,
+            kv_cache_dtype="float16",
+        )
+
+        with self.assertRaisesRegex(ValueError, r"fp8_e4m3"):
+            server_args._validate_hisparse_kv_cache_dtype()
+
+    @patch("sglang.srt.server_args.is_hip", return_value=True)
+    def test_hisparse_rocm_defaults_cap_resource_hungry_settings(self, _mock_is_hip):
+        server_args = ServerArgs(model_path="dummy", enable_hisparse=True)
+
+        server_args._handle_hisparse_rocm_resource_defaults(gpu_mem=196608)
+
+        self.assertEqual(server_args.max_running_requests, 64)
+        self.assertEqual(server_args.cuda_graph_max_bs, 64)
+
+    @patch("sglang.srt.server_args.is_hip", return_value=True)
+    def test_hisparse_rocm_defaults_preserve_explicit_settings(self, _mock_is_hip):
+        server_args = ServerArgs(
+            model_path="dummy",
+            enable_hisparse=True,
+            max_running_requests=128,
+            cuda_graph_max_bs=32,
+        )
+
+        server_args._handle_hisparse_rocm_resource_defaults(gpu_mem=196608)
+
+        self.assertEqual(server_args.max_running_requests, 128)
+        self.assertEqual(server_args.cuda_graph_max_bs, 32)
+
+    @patch("sglang.srt.server_args.is_hip", return_value=True)
+    def test_hisparse_rocm_defaults_skip_larger_memory_gpu(self, _mock_is_hip):
+        server_args = ServerArgs(model_path="dummy", enable_hisparse=True)
+
+        server_args._handle_hisparse_rocm_resource_defaults(gpu_mem=288 * 1024)
+
+        self.assertIsNone(server_args.max_running_requests)
+        self.assertIsNone(server_args.cuda_graph_max_bs)
+
+    @patch("sglang.srt.server_args.is_hip", return_value=False)
+    def test_hisparse_resource_defaults_do_not_apply_on_cuda(self, _mock_is_hip):
+        server_args = ServerArgs(model_path="dummy", enable_hisparse=True)
+
+        server_args._handle_hisparse_rocm_resource_defaults(gpu_mem=196608)
+
+        self.assertIsNone(server_args.max_running_requests)
+        self.assertIsNone(server_args.cuda_graph_max_bs)
+
+
 class TestPortArgs(unittest.TestCase):
     @patch("sglang.srt.server_args.get_free_port")
     @patch("sglang.srt.server_args.tempfile.NamedTemporaryFile")
