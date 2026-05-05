@@ -211,7 +211,14 @@ class UGPipeline(ComposedPipelineBase):
             },
         )
         try:
-            result = self.forward(batch, server_args)
+            if metadata["mode"] == "interleave":
+                result = self._forward_interleave_loop(
+                    batch,
+                    server_args,
+                    metadata=metadata,
+                )
+            else:
+                result = self.forward(batch, server_args)
             contexts = result.extra.get("ug_contexts")
             stats = _collect_interleaved_runtime_stats(
                 self.get_module("ug_bridge"), contexts
@@ -225,6 +232,78 @@ class UGPipeline(ComposedPipelineBase):
             contexts = batch.extra.get("ug_contexts")
             if contexts is not None:
                 self.get_module("ug_bridge").release(contexts)
+
+    def _forward_interleave_loop(
+        self,
+        batch: Req,
+        server_args: ServerArgs,
+        *,
+        metadata: dict[str, Any],
+    ) -> Req:
+        bridge = self.get_module("ug_bridge")
+        g_segment_executor = self.get_module("ug_g_segment_executor")
+        context_stage = UGContextStage(bridge)
+        g_stage = UGGSegmentStage(bridge, g_segment_executor)
+
+        batch = context_stage.forward(batch, server_args)
+        contexts = batch.extra.get("ug_contexts")
+        if contexts is None:
+            raise ValueError("UG interleave loop requires prepared UG contexts")
+
+        output_segments = list(batch.extra.get("ug_pre_image_segments", []))
+        max_images = _resolve_positive_metadata_int(
+            metadata,
+            "max_interleave_images",
+            default=1,
+        )
+        max_text_segments = _resolve_positive_metadata_int(
+            metadata,
+            "max_interleave_text_segments",
+            default=1,
+        )
+
+        for _ in range(max_images):
+            batch = g_stage.forward(batch, server_args)
+            generated_segment = batch.extra.get("ug_generated_segment")
+            if generated_segment is None:
+                raise ValueError("UG interleave loop expected a generated image segment")
+            image_for_append = generated_segment.image
+            output_segments.append(
+                {
+                    "type": "image",
+                    "image": image_for_append,
+                    "metadata": dict(generated_segment.metadata),
+                }
+            )
+            bridge.commit_generated_segment(
+                contexts=contexts,
+                segment=generated_segment,
+            )
+            batch.extra.pop("ug_generated_segment", None)
+
+            next_image_requested = False
+            for _ in range(max_text_segments):
+                post_segment = bridge.continue_u_decode(contexts=contexts)
+                if post_segment.type == "text":
+                    output_segments.append(
+                        {"type": "text", "text": post_segment.text or ""}
+                    )
+                    continue
+                if post_segment.type == "image_marker":
+                    next_image_requested = True
+                    break
+                if post_segment.type == "done":
+                    batch.extra["ug_output_segments"] = output_segments
+                    return batch
+                raise ValueError(
+                    "UG interleave loop expected U text, image marker, or done, "
+                    f"got {post_segment.type}"
+                )
+            if not next_image_requested:
+                break
+
+        batch.extra["ug_output_segments"] = output_segments
+        return batch
 
     def forward_interleaved_batch(
         self,
@@ -384,6 +463,18 @@ def _resolve_vlm_max_new_tokens(
     value = int(value)
     if value <= 0:
         raise ValueError(f"UG VLM max_new_tokens must be positive, got {value}")
+    return value
+
+
+def _resolve_positive_metadata_int(
+    metadata: dict[str, Any],
+    key: str,
+    *,
+    default: int,
+) -> int:
+    value = int(metadata.get(key, default))
+    if value <= 0:
+        raise ValueError(f"UG metadata {key} must be positive, got {value}")
     return value
 
 

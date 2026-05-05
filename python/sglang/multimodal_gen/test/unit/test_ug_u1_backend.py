@@ -11,9 +11,11 @@ from transformers import AutoConfig
 from sglang.multimodal_gen.configs.pipeline_configs.ug import UGPipelineConfig
 from sglang.multimodal_gen.configs.sample.ug import UGSamplingParams
 from sglang.multimodal_gen.runtime.pipelines.ug import (
+    UGPipeline,
     _build_ug_g_segment_executor,
     _load_ug_bridge,
 )
+from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.ug_bagel import (
     BAGELLatentFlowGSegmentExecutor,
@@ -52,8 +54,9 @@ from sglang.srt.models.neo_chat import (
 from sglang.srt.models.registry import ModelRegistry
 from sglang.srt.ug.adapter import UGModelRunnerAdapter
 from sglang.srt.ug.context import UGContextBundle, UGContextHandle, UGSessionHandle
-from sglang.srt.ug.interleaved import UGGSegmentResult
+from sglang.srt.ug.interleaved import UGGSegmentResult, UGInterleavedRequest
 from sglang.srt.ug.runtime import (
+    UGDecodeResult,
     UGInterleavedMessage,
     UGSegmentState,
     UGSessionRuntime,
@@ -785,6 +788,47 @@ class TestU1UGBackendShell(unittest.TestCase):
         )
         bridge.release(batch.extra["ug_contexts"])
 
+    def test_interleaved_api_can_run_bounded_multi_image_loop(self):
+        bridge = LoopInterleaveBridge()
+        executor = LoopImageExecutor()
+        server_args = _make_ug_server_args()
+        request = UGInterleavedRequest.from_segments(
+            [{"type": "text", "text": "draw and continue"}],
+            sampling_params=_sampling(height=8, width=8, num_inference_steps=1),
+            metadata={
+                "mode": "interleave",
+                "max_interleave_images": 2,
+                "max_interleave_text_segments": 2,
+            },
+        )
+
+        with patch(
+            "sglang.multimodal_gen.runtime.pipelines_core.stages.base."
+            "get_global_server_args",
+            return_value=server_args,
+        ):
+            pipeline = UGPipeline(
+                "sensenova/SenseNova-U1-8B-MoT",
+                server_args,
+                loaded_modules={
+                    "ug_bridge": bridge,
+                    "ug_g_segment_executor": executor,
+                },
+                executor=SimpleNamespace(),
+            )
+            response = pipeline.forward_interleaved(request, server_args=server_args)
+
+        self.assertEqual(
+            [segment.type for segment in response.segments],
+            ["image", "text", "image", "text"],
+        )
+        self.assertEqual(
+            [segment.text for segment in response.segments if segment.text],
+            ["after-one", "after-two"],
+        )
+        self.assertEqual(executor.calls, 2)
+        self.assertEqual(bridge.commit_count, 2)
+
     def test_pipeline_dispatch_selects_u1_executor_for_pixel_flow(self):
         executor = _build_ug_g_segment_executor(PixelFlowBridge())
 
@@ -856,6 +900,54 @@ class PixelFlowBridge:
 
 class LatentFlowBridge:
     g_kind = "latent_flow"
+
+
+class LoopInterleaveBridge:
+    g_kind = "pixel_flow"
+    runtime = None
+
+    def __init__(self):
+        self.commit_count = 0
+        self.decode_results = [
+            UGDecodeResult(type="text", text="after-one"),
+            UGDecodeResult(type="image_marker"),
+            UGDecodeResult(type="text", text="after-two"),
+            UGDecodeResult(type="done"),
+        ]
+
+    def prepare_u_context_from_messages(self, *, messages, think, think_max_new_tokens):
+        del messages, think, think_max_new_tokens
+        return _make_contexts()
+
+    def run_g_segment(self, *, contexts, executor):
+        return executor(contexts)
+
+    def commit_generated_segment(self, *, contexts, segment):
+        del contexts, segment
+        self.commit_count += 1
+
+    def continue_u_decode(self, *, contexts):
+        del contexts
+        return self.decode_results.pop(0)
+
+    def release(self, contexts):
+        del contexts
+
+
+class LoopImageExecutor:
+    required_g_kind = "pixel_flow"
+
+    def __init__(self):
+        self.calls = 0
+
+    def __call__(self, *, bridge, contexts, batch, server_args):
+        del bridge, contexts, batch, server_args
+        self.calls += 1
+        return UGGSegmentResult(
+            type="image",
+            image=Image.new("RGB", (8, 8), (self.calls, 2, 3)),
+            metadata={"loop_index": self.calls},
+        )
 
 
 class FakeTreeCache:
@@ -1086,6 +1178,7 @@ def _tiny_neo_chat_model_without_language_model():
 
 class FakeServerArgs:
     def __init__(self, **kwargs):
+        self.disagg_role = RoleType.MONOLITHIC
         self.__dict__.update(kwargs)
 
 
