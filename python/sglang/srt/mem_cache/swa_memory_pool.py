@@ -395,6 +395,7 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             seq_lens_cpu,
             last_loc,
             extend_num_tokens,
+            num_new_pages=num_new_pages,
         )
         alloc_swa_indices = self.swa_attn_allocator.alloc_extend(
             prefix_lens,
@@ -403,6 +404,7 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             seq_lens_cpu,
             swa_last_loc,
             extend_num_tokens,
+            num_new_pages=num_new_pages,
         )
         assert alloc_full_indices is not None
         assert alloc_swa_indices is not None

@@ -752,6 +752,14 @@ def _run_staged_native_component_accuracy_case(
         engine_cls.clear_memory()
 
         ref = ref.to(device=device, dtype=torch.bfloat16).eval()
+        if component == ComponentType.VAE:
+            from sglang.multimodal_gen import envs
+            from sglang.multimodal_gen.runtime.loader.component_loaders.vae_loader import (
+                _convert_conv3d_weights_to_channels_last_3d,
+            )
+
+            if torch.cuda.is_available() and envs.SGLANG_DIFFUSION_VAE_CHANNELS_LAST_3D:
+                _convert_conv3d_weights_to_channels_last_3d(ref)
         ref_call = profile.prepare_reference_call(ref, inputs)
         ref_autocast = (
             torch.autocast(

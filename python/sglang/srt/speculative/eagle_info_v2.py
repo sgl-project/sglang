@@ -116,23 +116,25 @@ class EagleDraftInputV2Mixin:
             )
 
         page_size = batch.token_to_kv_pool_allocator.page_size
-        cur_kv_lens_cpu = []
-        nxt_kv_lens_cpu = []
-        num_needed_tokens = 0
         alloc_len_per_decode = get_alloc_len_per_decode()
-        for r in batch.reqs:
-            # Over-allocation happens here
-            x = r.kv_committed_len + 2 * alloc_len_per_decode - r.kv_allocated_len
-            cur_kv_lens_cpu.append(r.kv_allocated_len)
-            nxt_kv_lens_cpu.append(r.kv_allocated_len + x)
-            num_needed_tokens += x
-            r.kv_allocated_len += x
+        double_alloc = alloc_len_per_decode + alloc_len_per_decode
+
+        cur_kv_lens = [0] * bs
+        nxt_kv_lens = [0] * bs
+        num_needed_tokens = 0
+        for i, r in enumerate(batch.reqs):
+            cur = r.kv_allocated_len
+            nxt = r.kv_committed_len + double_alloc
+            cur_kv_lens[i] = cur
+            nxt_kv_lens[i] = nxt
+            num_needed_tokens += nxt - cur
+            r.kv_allocated_len = nxt
             r.decode_batch_idx += 1
             # Pre-claim bonus slot here (like normal decode); resolve subtracts 1.
             r.kv_committed_len += 1
 
-        cur_kv_lens_cpu = torch.tensor(cur_kv_lens_cpu, dtype=torch.int32, device="cpu")
-        nxt_kv_lens_cpu = torch.tensor(nxt_kv_lens_cpu, dtype=torch.int32, device="cpu")
+        cur_kv_lens_cpu = torch.tensor(cur_kv_lens, dtype=torch.int32, device="cpu")
+        nxt_kv_lens_cpu = torch.tensor(nxt_kv_lens, dtype=torch.int32, device="cpu")
 
         if page_size == 1:
             out_cache_loc = alloc_token_slots(batch.tree_cache, num_needed_tokens)
