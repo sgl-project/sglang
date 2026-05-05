@@ -448,7 +448,6 @@ class SchedulerRuntimeCheckerMixin:
             )
         else:
             req_total_size = self.req_to_token_pool.size
-        req_total_size -= 1
 
         session_req_count = self._session_held_req_count()
         if len(self.req_to_token_pool.free_slots) + session_req_count != req_total_size:
