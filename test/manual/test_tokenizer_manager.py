@@ -426,7 +426,7 @@ class TestDetokenizeTopLogprobsTokens(unittest.TestCase):
         self.stub = Mock(spec=["tokenizer", "detokenize_logprob_tokens"])
         self.stub.tokenizer = Mock()
         self.stub.tokenizer.batch_decode = Mock(
-            side_effect=lambda ids: [f"tok_{i}" for i in ids]
+            side_effect=lambda ids: [f"tok_{i[0]}" for i in ids]
         )
         # Delegate to the real helper so we exercise the production path.
         self.stub.detokenize_logprob_tokens = (
@@ -508,7 +508,7 @@ class TestDetokenizeTopLogprobsTokens(unittest.TestCase):
         self.assertEqual(result, expected)
 
     def test_single_batch_decode_call_with_flattened_ids(self):
-        """Efficiency guarantee: batch_decode is called once with flattened ids."""
+        """Efficiency guarantee: batch_decode is called once with flattened token ids."""
         vals = [[-0.1, -0.2], [], [-0.5, -0.6, -0.7], [-0.9]]
         idxs = [[10, 20], [], [30, 40, 50], [60]]
 
@@ -520,7 +520,7 @@ class TestDetokenizeTopLogprobsTokens(unittest.TestCase):
             self.stub.tokenizer.batch_decode.call_count, 1
         )
         (called_ids,), _ = self.stub.tokenizer.batch_decode.call_args
-        self.assertEqual(list(called_ids), [10, 20, 30, 40, 50, 60])
+        self.assertEqual(list(called_ids), [[10], [20], [30], [40], [50], [60]])
 
     def test_matches_reference_per_position_implementation(self):
         """Batched result is equivalent to per-position decoding."""

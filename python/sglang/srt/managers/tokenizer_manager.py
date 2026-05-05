@@ -2048,7 +2048,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         if not flat_ids:
             return ret
 
-        decoded = self.tokenizer.batch_decode(flat_ids)
+        decoded = self.tokenizer.batch_decode([[idx] for idx in flat_ids])
         offset = 0
         for pos, length in zip(nonempty_positions, lengths):
             chunk_texts = decoded[offset : offset + length]
