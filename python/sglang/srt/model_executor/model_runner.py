@@ -110,11 +110,6 @@ from sglang.srt.layers.attention.attention_registry import (
     ATTENTION_BACKENDS,
     attn_backend_wrapper,
 )
-from sglang.srt.layers.attention.indexer_topk_capturer import (
-    create_indexer_capturer,
-    get_global_indexer_capturer,
-    set_global_indexer_capturer,
-)
 from sglang.srt.layers.attention.nsa.utils import is_nsa_enable_prefill_cp
 from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
 from sglang.srt.layers.dp_attention import (
@@ -126,15 +121,9 @@ from sglang.srt.layers.dp_attention import (
     set_is_extend_in_batch,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-from sglang.srt.layers.moe.routed_experts_capturer import (
-    RoutedExpertsCapturer,
-    get_global_experts_capturer,
-    set_global_experts_capturer,
-)
 from sglang.srt.layers.pooler import EmbeddingPoolerOutput
 from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype
 from sglang.srt.layers.sampler import create_sampler
-from sglang.srt.layers.topk_capturer_base import TopkCaptureOutput
 from sglang.srt.layers.torchao_utils import apply_torchao_config_to_model
 from sglang.srt.lora.lora_manager import LoRAManager
 from sglang.srt.lora.lora_registry import LoRARef
@@ -180,6 +169,17 @@ from sglang.srt.server_args import (
     set_global_server_args_for_scheduler,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.srt.state_capturer.base import TopkCaptureOutput
+from sglang.srt.state_capturer.indexer_topk import (
+    create_indexer_capturer,
+    get_global_indexer_capturer,
+    set_global_indexer_capturer,
+)
+from sglang.srt.state_capturer.routed_experts import (
+    RoutedExpertsCapturer,
+    get_global_experts_capturer,
+    set_global_experts_capturer,
+)
 from sglang.srt.utils import (
     MultiprocessingSerializer,
     broadcast_pyobj,

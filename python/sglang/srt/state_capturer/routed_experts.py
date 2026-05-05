@@ -10,9 +10,9 @@ from sglang.srt.layers.dp_attention import (
     get_dp_local_info,
     is_dp_attention_enabled,
 )
-from sglang.srt.layers.topk_capturer_base import BaseTopkCapturer
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.server_args import get_global_server_args
+from sglang.srt.state_capturer.base import BaseTopkCapturer
 
 
 class RoutedExpertsCapturer(BaseTopkCapturer):

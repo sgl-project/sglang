@@ -6,7 +6,7 @@ import pybase64
 import torch
 
 from sglang.srt.layers.dp_attention import get_attention_tp_size
-from sglang.srt.layers.topk_capturer_base import BaseTopkCapturer
+from sglang.srt.state_capturer.base import BaseTopkCapturer
 
 logger = logging.getLogger(__name__)
 

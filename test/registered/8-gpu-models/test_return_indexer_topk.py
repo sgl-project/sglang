@@ -5,7 +5,7 @@ import unittest
 import aiohttp
 import numpy as np
 
-from sglang.srt.layers.attention.indexer_topk_capturer import (
+from sglang.srt.state_capturer.indexer_topk import (
     extract_indexer_topk_from_meta_info,
 )
 from sglang.srt.utils import kill_process_tree
