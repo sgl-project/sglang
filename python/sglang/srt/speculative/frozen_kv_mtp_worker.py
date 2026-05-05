@@ -39,6 +39,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     ForwardMode,
 )
+from sglang.srt.model_executor.pool_configurator import MemoryPoolConfig
 from sglang.srt.observability.req_time_stats import set_time_batch
 from sglang.srt.observability.trace import get_global_tracing_enabled
 from sglang.srt.server_args import ServerArgs
@@ -124,6 +125,12 @@ class FrozenKVMTPWorker(TpModelWorker):
             target_worker.get_memory_pool()
         )
 
+        target_cfg = target_worker.model_runner.memory_pool_config
+        draft_pool_config = MemoryPoolConfig(
+            max_total_num_tokens=64,  # Dummy value
+            max_running_requests=target_cfg.max_running_requests,
+        )
+
         self.hot_token_id = None
 
         with (
@@ -142,7 +149,7 @@ class FrozenKVMTPWorker(TpModelWorker):
                 is_draft_worker=True,
                 req_to_token_pool=self.req_to_token_pool,
                 token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
-                memory_pool_config=target_worker.model_runner.memory_pool_config,
+                memory_pool_config=draft_pool_config,
             )
 
         embed, head = self.target_worker.model_runner.model.get_embed_and_head()

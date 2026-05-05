@@ -153,8 +153,6 @@ class Gemma4MTPGSM8KMixin:
             "triton",
             "--dtype",
             "bfloat16",
-            "--mem-fraction-static",
-            "0.55",
             "--max-running-requests",
             str(cls._max_running_requests()),
             "--context-length",
@@ -359,6 +357,17 @@ class TestGemma4MTP31BGSM8K(Gemma4MTPGSM8KMixin, CustomTestCase):
     model_pair = ModelPair(
         name="31B",
         target_path="google/gemma-4-31B-it",
+        assistant_path="google/gemma-4-31B-it-assistant",
+        accept_length_threshold=None,
+        server_cuda_visible_devices="0,1",
+        tensor_parallel_size=2,
+    )
+
+
+class TestGemma4NVFP4MTP31BGSM8K(Gemma4MTPGSM8KMixin, CustomTestCase):
+    model_pair = ModelPair(
+        name="31B",
+        target_path="nvidia/Gemma-4-31B-IT-NVFP4",
         assistant_path="google/gemma-4-31B-it-assistant",
         accept_length_threshold=None,
         server_cuda_visible_devices="0,1",
