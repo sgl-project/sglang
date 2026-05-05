@@ -1,3 +1,5 @@
+# to be combined with the sparse coordinator class and sparse algorithm family
+
 import logging
 from typing import List, NamedTuple, Union
 
@@ -91,6 +93,7 @@ class HiSparseCoordinator:
             max_context_len + self.compress_ratio - 1
         ) // self.compress_ratio
 
+        # to have an extra page for new tokens
         self.padded_buffer_size = (
             self.device_buffer_size + self.mem_pool_device.page_size
         )
@@ -120,6 +123,7 @@ class HiSparseCoordinator:
         self.tp_group = tp_group
         self.tp_world_size = torch.distributed.get_world_size(group=self.tp_group)
 
+        # initialize data structures for swap-in kernel
         layer_num = self.mem_pool_device.layer_num
         self.req_device_buffer_tokens = torch.full(
             (layer_num, max_num_req_slots, self.padded_buffer_size),
@@ -145,14 +149,19 @@ class HiSparseCoordinator:
             self.device_buffer_size, dtype=torch.int32, device=device
         )
 
+        # Pre-allocated output buffer for swap_in_selected_pages (CUDA-graph safe)
         self.top_k_device_locs_buffer = torch.full(
             (max_num_req_slots, self.top_k), -1, dtype=torch.int32, device=device
         )
         self.raw_indices_buffer = torch.full(
             (max_num_req_slots, self.top_k), -1, dtype=torch.int32, device=device
         )
+        # Scalar tensor: number of real (non-padded) requests in the batch.
+        # Updated before each graph replay so padded blocks early-return.
         self.num_real_reqs = torch.zeros(1, dtype=torch.int32, device=device)
 
+        # CPU flag: True means "skip backup on the next decode step" because
+        # staging already backed up all prefill tokens.  Cleared after one step.
         self._skip_first_backup = [False] * max_num_req_slots
 
     def set_decode_producer_stream(self, stream) -> None:
@@ -227,6 +236,8 @@ class HiSparseCoordinator:
         else:
             allocated_len = req.kv_allocated_len
             page_size = self.mem_pool_device.page_size
+            # Allocate only enough for current tokens (page-aligned).
+            # When prefill already fills device_buffer_size, include the reserved page.
             alloc_size = min(
                 ((allocated_len + page_size - 1) // page_size) * page_size,
                 self.device_buffer_size,
@@ -272,6 +283,7 @@ class HiSparseCoordinator:
         seq_lens_cpu: torch.Tensor,
         req_pool_indices_cpu: torch.Tensor,
     ) -> torch.Tensor:
+        """Grow device buffers for requests whose sequence length exceeds current capacity."""
         current_caps = self.req_device_buffer_size[req_pool_indices_cpu]
         short_reqs_cpu = seq_lens_cpu <= self.device_buffer_size
         needs_grow_cpu = short_reqs_cpu & (seq_lens_cpu > current_caps)
@@ -280,6 +292,7 @@ class HiSparseCoordinator:
             page_size = self.mem_pool_device.page_size
             grow_indices = torch.where(needs_grow_cpu)[0]
 
+            # Compute all grow sizes on CPU, then do a single bulk allocation
             req_idxs = []
             old_caps = []
             new_caps = []
@@ -351,6 +364,7 @@ class HiSparseCoordinator:
             finish_count += 1
         queue_size = torch.tensor(finish_count, dtype=torch.int, device="cpu")
         if self.tp_world_size > 1:
+            # synchronize TP workers to make sure the same update to scheduler
             torch.distributed.all_reduce(
                 queue_size,
                 op=torch.distributed.ReduceOp.MIN,
@@ -359,6 +373,7 @@ class HiSparseCoordinator:
         finish_count = int(queue_size.item())
         while finish_count > 0:
             _, _, req = self.ack_staging_queue.pop(0)
+            # prepare device buffer and update req
             self.alloc_device_buffer(req)
             self._skip_first_backup[req.req_pool_idx] = True
             req.hisparse_staging = False
@@ -380,6 +395,7 @@ class HiSparseCoordinator:
         )
 
         if not self.is_dsv4_hisparse:
+            # Grow device buffers if needed and resolve the latest-token slot.
             reserved_buffer_loc = self._grow_device_buffers(
                 seq_lens, req_pool_indices, seq_lens_cpu, req_pool_indices_cpu
             )
@@ -387,6 +403,7 @@ class HiSparseCoordinator:
                 :, req_pool_indices, self.device_buffer_size
             ] = reserved_buffer_loc.to(torch.int32)
 
+            # todo, clear the prior mapping as well
             compressed_locs = self.token_to_kv_pool_allocator.get_last_loc_compressed(
                 out_cache_loc
             )
@@ -429,6 +446,21 @@ class HiSparseCoordinator:
         seq_lens_cpu: torch.Tensor,
         req_pool_indices_cpu: torch.Tensor,
     ) -> None:
+        """Back up the previous compressed token to host memory.
+
+        Each newly produced compressed token (one per `compress_ratio` decode
+        steps) must be backed up to host so the swap-in kernel can later
+        recover it.
+
+        Two cases are skipped:
+        - The first decode step right after staging: all prefill tokens were
+          already backed up during staging, so there is nothing new to save.
+        - Steps where `(seq_len - 1) % compress_ratio != 0`: no new compressed
+          token was produced this step.
+        """
+        # Build the list of batch positions that need a host backup.
+        # Skip the first decode step after staging (prefill already backed up),
+        # and skip non-aligned steps that did not produce a new compressed token.
         backup_indices = []
         for i in range(len(seq_lens_cpu)):
             req_idx = int(req_pool_indices_cpu[i])
@@ -446,6 +478,10 @@ class HiSparseCoordinator:
         )
         backup_req_indices = req_pool_indices[backup_indices_gpu]
 
+        # The previous compressed token's position and its device buffer slot:
+        #  compressed_pos = (seq_len - 1) // compress_ratio - 1
+        #  - short: slot = compressed_pos          (within the regular buffer)
+        #  - long:  slot = device_buffer_size      (the reserved slot)
         prev_seq_lens = seq_lens[backup_indices_gpu] - 1
         compressed_prev_seq_lens = prev_seq_lens // self.compress_ratio
         actual_compressed_pos = compressed_prev_seq_lens - 1
@@ -496,9 +532,16 @@ class HiSparseCoordinator:
         self._has_pending_backup = False
 
     def abort_staging_request(self, req: Req) -> None:
+        """Remove a request from the staging queue and free its host + device resources.
+
+        Must be called when aborting a request that has been admitted into staging
+        but has not yet completed (i.e. req.hisparse_staging is True).
+        """
+        # Remove from staging queue
         self.ack_staging_queue = [
             act for act in self.ack_staging_queue if act.req is not req
         ]
+        # Wait for any in-flight staging DMA to complete before freeing
         self.write_staging_stream.synchronize()
 
         prefill_len = len(req.fill_ids)
@@ -507,6 +550,7 @@ class HiSparseCoordinator:
         ]
         self.token_to_kv_pool_allocator.free_hisparse(allocated_locs)
 
+        # Free host memory that was allocated during admit_request_into_staging
         compressed_len = prefill_len // self.compress_ratio
         host_indices = self.req_to_host_pool[req.req_pool_idx, :compressed_len]
         host_indices = host_indices[host_indices >= 0]
@@ -523,12 +567,14 @@ class HiSparseCoordinator:
             self.request_finished(req)
 
     def request_finished(self, req: Req):
+        # release resources only after the execution of a potential overlapped batch
         if self.decode_producer_stream is not None:
             device_module.current_stream().wait_stream(self.decode_producer_stream)
         self.wait_for_pending_backup()
 
         compressed_len = req.seqlen // self.compress_ratio
 
+        # release memory -- only free actually-allocated buffer indices
         current_cap = int(self.req_device_buffer_size[req.req_pool_idx])
         if current_cap > 0:
             side_buf_hi = self.req_to_device_buffer[req.req_pool_idx, :current_cap]
@@ -549,6 +595,7 @@ class HiSparseCoordinator:
         if host_indices.numel() > 0:
             self.mem_pool_host.free(host_indices)
 
+        # clear req info
         self.req_device_buffer_tokens[:, req.req_pool_idx, :] = -1
         self.req_device_buffer_token_locs[:, req.req_pool_idx, :] = -1
         self.req_to_device_buffer[req.req_pool_idx, :] = 0
@@ -564,11 +611,13 @@ class HiSparseCoordinator:
         top_k_result: torch.Tensor,
         layer_id: int,
     ) -> torch.Tensor:
+        """Swap selected top-k tokens into device memory and return their indices."""
         num_reqs = req_pool_indices.size(0)
 
         top_k_indices = self.top_k_device_locs_buffer[:num_reqs]
         top_k_indices.fill_(-1)
 
+        # todo, adjustable for performance
         block_size = 1024
         load_cache_to_device_buffer_mla(
             top_k_tokens=top_k_result,

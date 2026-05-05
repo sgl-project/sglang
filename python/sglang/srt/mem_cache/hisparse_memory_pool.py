@@ -1,3 +1,5 @@
+# mapping on device memory, host memory and memory allocator
+
 import logging
 import weakref
 from typing import Optional
@@ -20,6 +22,7 @@ from sglang.srt.utils.common import get_num_new_pages
 
 logger = logging.getLogger(__name__)
 
+# sgl_kernel.kvcacheio is only available in CUDA/ROCm sgl-kernel builds (not XPU/MPS/NPU/CPU).
 _is_cuda = is_cuda()
 _is_hip = is_hip()
 if _is_cuda or _is_hip:
@@ -220,6 +223,11 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         last_loc: torch.Tensor,
         extend_num_tokens: int,
     ):
+        """Allocate only logical indices without hisparse device indices.
+
+        Used in the direct-to-host transfer path where KV data is written
+        directly to host memory by the prefill node, skipping GPU staging.
+        """
         return self.logical_attn_allocator.alloc_extend(
             prefix_lens,
             prefix_lens_cpu,
@@ -231,13 +239,18 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
     def alloc_device_buffer(self, allocated_indices, need_size: int):
         assert need_size % self.page_size == 0
+        # clear original reference and isolate the buffer from outside addressing, allocate new buffer if needed
         hisparse_indices = self.full_to_hisparse_device_index_mapping[allocated_indices]
         self.full_to_hisparse_device_index_mapping[allocated_indices] = 0
+        # Filter valid (non-zero) hisparse indices.
+        # In the direct-to-host path, mapping is all zeros since no hisparse
+        # device indices were pre-allocated.
         hisparse_indices = hisparse_indices[hisparse_indices > 0]
         if len(hisparse_indices) >= need_size:
             buffer_indices = hisparse_indices[:need_size]
             self.free_hisparse_indices(hisparse_indices[need_size:])
         else:
+            # page alignment, claiming the residual space for an incomplete page
             page_residual_length = len(hisparse_indices) % self.page_size
             if page_residual_length != 0:
                 hisparse_indices = torch.cat(
@@ -263,6 +276,7 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         return buffer_indices
 
     def free_hisparse_indices(self, buffer_indices: torch.Tensor):
+        # disable free group mechanism for device buffer free
         self.hisparse_attn_allocator.is_not_in_free_group = True
         self.hisparse_attn_allocator.free(buffer_indices[buffer_indices > 0])
 
@@ -278,7 +292,7 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         prefix_lens_cpu: torch.Tensor,
         seq_lens: torch.Tensor,
         seq_lens_cpu: torch.Tensor,
-        last_loc: torch.Tensor,
+        last_loc: torch.Tensor,  # last_loc for full layers
         extend_num_tokens: int,
     ):
         assert self.page_size > 1
@@ -327,7 +341,7 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self,
         seq_lens: torch.Tensor,
         seq_lens_cpu: torch.Tensor,
-        last_loc: torch.Tensor,
+        last_loc: torch.Tensor,  # last_loc for full layers
     ):
         return self.logical_attn_allocator.alloc_decode(
             seq_lens, seq_lens_cpu, last_loc
@@ -342,6 +356,7 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def clear(self):
         self.logical_attn_allocator.clear()
         self.hisparse_attn_allocator.clear()
+        # Note: the last item is -1, we don't clear it, see the comment in __init__
         self.full_to_hisparse_device_index_mapping[:-1].fill_(0)
         self.is_not_in_free_group = True
         self.free_group = []

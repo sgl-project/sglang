@@ -2435,6 +2435,7 @@ class Scheduler(
         batch.sampling_info = SamplingBatchInfo.from_schedule_batch(
             batch, self.model_config.vocab_size
         )
+        # todo hisparse, maybe other info to contain for the new batch
         return batch
 
     def get_next_batch_to_run(self) -> Optional[ScheduleBatch]:
@@ -3501,6 +3502,7 @@ class Scheduler(
         return RpcReqOutput(success, "" if not exec else str(exec))
 
     def abort_request(self, recv_req: AbortReq):
+        # todo hisparse, release resources for abort requests in hisparse coordinator
         # Delete requests in the waiting queue
         to_del = []
         for i, req in enumerate(self.waiting_queue):

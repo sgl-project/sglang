@@ -1497,6 +1497,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     dp_cooperation_info: Optional[DPCooperationInfo] = None
     prefill_stats: Optional[PrefillStats] = None
 
+    # HiSparse
     hisparse_coordinator: Optional[HiSparseCoordinator] = None
 
     @classmethod

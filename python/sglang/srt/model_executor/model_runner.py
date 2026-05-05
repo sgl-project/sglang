@@ -754,6 +754,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             self.init_cublas()
             self.init_attention_backend()
             self.kernel_warmup()
+            # Init hisparse coordinator (must happen before CUDA graph capture)
             if self.enable_hisparse:
                 from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
                 from sglang.srt.mem_cache.sparsity import parse_hisparse_config
