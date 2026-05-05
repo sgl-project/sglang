@@ -2221,6 +2221,11 @@ class DeepseekV4Model(nn.Module):
             hidden_states = cp_split_and_rebuild_data(forward_batch, hidden_states)
             positions = cp_split_and_rebuild_position(forward_batch, positions)
 
+        # Reset Compressor's per-step freqs_cis cache from any previous step.
+        for _attr in ("freqs_cis_c4", "freqs_cis_c128"):
+            if hasattr(forward_batch, _attr):
+                delattr(forward_batch, _attr)
+
         for i in range(self.start_layer, self.end_layer):
             # TODO: ctx?
             layer = self.layers[i]
