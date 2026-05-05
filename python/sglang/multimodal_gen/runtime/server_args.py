@@ -561,9 +561,9 @@ class ServerArgs(DisaggArgsMixin):
 
         if (
             self.num_gpus >= 2
-            and self._can_apply_fsdp_cfg_policy(require_memory_headroom=True)
             and not self._has_explicit_memory_policy()
             and not self._has_explicit_parallel_policy()
+            and self._can_apply_fsdp_cfg_policy(require_memory_headroom=True)
         ):
             logger.info(
                 "Automatically selecting FSDP+CFG defaults for multi-GPU Qwen/Wan CFG model"
