@@ -1,4 +1,5 @@
 import logging
+import sys
 
 from sglang.srt.environ import envs
 from sglang.srt.utils import get_device_sm, is_sm100_supported
@@ -12,8 +13,18 @@ def _compute_enable_deep_gemm():
         return False
 
     # SM120 (consumer Blackwell) lacks WGMMA/tcgen05 instructions
-    # required by DeepGEMM SM90/SM100 kernels
+    # required by DeepGEMM SM90/SM100 kernels.
+    # Block the package entirely to prevent _C.init() from triggering
+    # NVCC JIT compilation of tcgen05 kernels on SM120.
     if sm_version == 120:
+        import types
+        import os
+
+        dg = types.ModuleType("deep_gemm")
+        dg.__path__ = []
+        dg.__file__ = os.path.join(os.path.dirname(__file__), "_deep_gemm_stub.py")
+        dg.__version__ = "0.0.0-blocked-sm120"
+        sys.modules["deep_gemm"] = dg
         return False
 
     try:

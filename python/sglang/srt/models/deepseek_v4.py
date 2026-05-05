@@ -1112,7 +1112,7 @@ class DeepseekV4DecoderLayer(nn.Module):
                 )
                 rsqrt = torch.rsqrt(s_out / k + self.rms_norm_eps)
                 mixes = (d_out * rsqrt.unsqueeze(1)).unsqueeze(1)
-            except (RuntimeError, ImportError):
+            except (RuntimeError, ImportError, AttributeError):
                 # DeepGEMM not available or unsupported arch (e.g. SM120)
                 x_flat = x.flatten(1).float()
                 sq = x_flat.square()
