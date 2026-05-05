@@ -377,19 +377,7 @@ class Gemma4AssistantForCausalLM(Gemma4ForCausalLM):
 
     @torch.no_grad()
     def _reorder_embedding_to_centroid_order(self) -> None:
-        """Reorder ``lm_head.weight`` from natural vocab order to centroid order.
-
-        The checkpoint stores ``embed_tokens`` (tied to ``lm_head``) in
-        natural vocab order, but ``_apply_centroid_masking`` indexes it as
-        ``weight.view(C, vpc, H)[centroid_ids]``.  Reordering once at load
-        time turns the scattered gather into a contiguous slice.
-
-        ``token_ordering[i]`` = real vocab ID for centroid-ordered position i,
-        so ``reordered[i] = original[token_ordering[i]]``.
-
-        This is safe because the assistant never uses ``embed_tokens`` for
-        token lookup — ``forward()`` uses ``target_embed_weight`` instead.
-        """
+        """Reorder lm_head.weight from natural vocab order to centroid order."""
         if self.token_ordering is None:
             return
         ordering = self.token_ordering.long()
