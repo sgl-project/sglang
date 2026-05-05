@@ -7,6 +7,10 @@ from typing import Tuple
 from sglang.multimodal_gen.configs.models.dits.base import DiTArchConfig, DiTConfig
 
 
+def is_transformer_block(n: str, m) -> bool:
+    return "transformer_blocks" in n and str.isdigit(n.split(".")[-1])
+
+
 @dataclass
 class QwenImageArchConfig(DiTArchConfig):
     patch_size: int = 1
@@ -21,6 +25,10 @@ class QwenImageArchConfig(DiTArchConfig):
     guidance_embeds: bool = False
     axes_dims_rope: Tuple[int, int, int] = (16, 56, 56)
     zero_cond_t: bool = False
+
+    _fsdp_shard_conditions: list = field(
+        default_factory=lambda: [is_transformer_block]
+    )
 
     stacked_params_mapping: list[tuple[str, str, str]] = field(default_factory=list)
 

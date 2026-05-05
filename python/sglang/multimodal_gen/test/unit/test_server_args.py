@@ -261,6 +261,15 @@ class TestOffloadDefaults(unittest.TestCase):
         self.assertFalse(args.text_encoder_cpu_offload)
         self.assertFalse(args.image_encoder_cpu_offload)
 
+    def test_qwen_dit_has_fsdp_shard_condition(self):
+        conditions = (
+            QwenImagePipelineConfig().dit_config.arch_config._fsdp_shard_conditions
+        )
+
+        self.assertTrue(conditions)
+        self.assertTrue(conditions[0]("transformer_blocks.0", None))
+        self.assertFalse(conditions[0]("transformer_blocks.0.attn", None))
+
     def test_auto_multi_gpu_qwen_preserves_explicit_fsdp_false(self):
         args = self._from_dict_with_pipeline_config(
             QwenImagePipelineConfig(),
