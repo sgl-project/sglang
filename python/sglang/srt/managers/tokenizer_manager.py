@@ -324,6 +324,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     tokenizer_mode=server_args.tokenizer_mode,
                     trust_remote_code=server_args.trust_remote_code,
                     revision=server_args.revision,
+                    tokenizer_backend=server_args.tokenizer_backend,
                 )
 
         # Initialize async dynamic batch tokenizer if enabled (common for both multimodal and non-multimodal)
@@ -453,9 +454,13 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     def init_metric_collector_watchdog(self):
         # Metrics
         if self.enable_metrics:
+            engine_type = DisaggregationMode.to_engine_type(
+                self.server_args.disaggregation_mode
+            )
+
             labels = {
                 "model_name": self.server_args.served_model_name,
-                # TODO: Add lora name/path in the future,
+                "engine_type": engine_type,
             }
             if self.enable_priority_scheduling:
                 labels["priority"] = ""
@@ -470,7 +475,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 bucket_time_to_first_token=self.server_args.bucket_time_to_first_token,
                 bucket_e2e_request_latency=self.server_args.bucket_e2e_request_latency,
                 bucket_inter_token_latency=self.server_args.bucket_inter_token_latency,
-                collect_tokens_histogram=self.server_args.collect_tokens_histogram,
             )
 
             start_cpu_monitor_thread("tokenizer")
@@ -487,14 +491,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     def init_request_dispatcher(self):
         self._result_dispatcher = TypeBasedDispatcher(
             [
-                (
-                    (
-                        BatchStrOutput,
-                        BatchEmbeddingOutput,
-                        BatchTokenIDOutput,
-                    ),
-                    self._handle_batch_output,
-                ),
                 (AbortReq, self._handle_abort_req),
                 (OpenSessionReqOutput, self._handle_open_session_req_output),
                 (
@@ -738,14 +734,24 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     input_text, is_cross_encoder_request
                 )
 
-        if self.mm_processor and obj.contains_mm_input():
+        contains_mm_input = obj.contains_mm_input()
+        is_mossvl = (
+            "MossVLForConditionalGeneration"
+            in self.model_config.hf_config.architectures
+        )
+        should_run_mm_processor = self.mm_processor is not None and (
+            contains_mm_input or is_mossvl
+        )
+
+        if should_run_mm_processor:
             if obj.image_data is not None and not isinstance(obj.image_data, list):
                 obj.image_data = [obj.image_data]
             if obj.video_data is not None and not isinstance(obj.video_data, list):
                 obj.video_data = [obj.video_data]
             if obj.audio_data is not None and not isinstance(obj.audio_data, list):
                 obj.audio_data = [obj.audio_data]
-            self._validate_mm_limits(obj)
+            if contains_mm_input:
+                self._validate_mm_limits(obj)
 
             mm_inputs = None
 
@@ -836,7 +842,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         if (
             self.validate_total_tokens
             and max_new_tokens is not None
-            and (max_new_tokens + input_token_num) >= _max_req_len
+            and (max_new_tokens + input_token_num) > _max_req_len
         ):
             if self.server_args.allow_auto_truncate:
                 logger.warning(
@@ -1623,11 +1629,17 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         while True:
             with self.soft_watchdog.disable():
                 recv_obj = await self.recv_from_detokenizer.recv_pyobj()
-            self._result_dispatcher(recv_obj)
+            if isinstance(
+                recv_obj,
+                (BatchStrOutput, BatchEmbeddingOutput, BatchTokenIDOutput),
+            ):
+                await self._handle_batch_output(recv_obj)
+            else:
+                self._result_dispatcher(recv_obj)
             self.last_receive_tstamp = real_time()
             self.soft_watchdog.feed()
 
-    def _handle_batch_output(
+    async def _handle_batch_output(
         self,
         recv_obj: Union[
             BatchStrOutput,
@@ -1635,6 +1647,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             BatchTokenIDOutput,
         ],
     ):
+        pending_notify: dict[str, ReqState] = {}
+        batch_notify_size = self.server_args.batch_notify_size
         for i, rid in enumerate(recv_obj.rids):
             state = self.rid_to_state.get(rid, None)
             if state is None:
@@ -1689,11 +1703,13 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             if getattr(recv_obj, "output_hidden_states", None):
                 meta_info["hidden_states"] = recv_obj.output_hidden_states[i]
             if getattr(recv_obj, "routed_experts", None):
-                routed_experts_tensor = recv_obj.routed_experts[i]
-                if routed_experts_tensor is not None:
-                    meta_info["routed_experts"] = pybase64.b64encode(
-                        routed_experts_tensor.numpy().tobytes()
-                    ).decode("utf-8")
+                val = recv_obj.routed_experts[i]
+                if val is not None:
+                    # BatchStrOutput is pre-encoded by the detokenizer;
+                    # BatchTokenIDOutput (skip_tokenizer_init) bypasses it.
+                    if isinstance(val, torch.Tensor):
+                        val = pybase64.b64encode(val.numpy().tobytes()).decode("utf-8")
+                    meta_info["routed_experts"] = val
             if getattr(recv_obj, "customized_info", None):
                 for k, v in recv_obj.customized_info.items():
                     meta_info[k] = v[i]
@@ -1833,15 +1849,24 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
             if out_dict is not None:
                 state.out_list.append(out_dict)
-                state.event.set()
+                pending_notify[rid] = state
 
-            # Log metrics and dump
+                if len(pending_notify) >= batch_notify_size:
+                    for s in pending_notify.values():
+                        s.event.set()
+                    pending_notify = {}
+                    await asyncio.sleep(0)
+
             if self.enable_metrics and state.obj.log_metrics:
                 self.collect_metrics(state, recv_obj, i)
             if self.dump_requests_folder and state.finished and state.obj.log_metrics:
                 self.dump_requests(state, out_dict)
             if self.crash_dump_folder and state.finished and state.obj.log_metrics:
                 self.record_request_for_crash_dump(state, out_dict)
+
+        # handle_loop awaits next recv immediately
+        for s in pending_notify.values():
+            s.event.set()
 
         # When skip_tokenizer_init is enabled, tokensizer_manager receives
         # BatchTokenIDOutput.
@@ -2062,23 +2087,26 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         if (
             hasattr(recv_obj, "spec_verify_ct")
             and recv_obj.spec_verify_ct[i] > 0
-            and hasattr(recv_obj, "spec_accepted_tokens")
-            and len(recv_obj.spec_accepted_tokens) > i
+            and hasattr(recv_obj, "spec_accepted_drafts")
+            and len(recv_obj.spec_accepted_drafts) > i
         ):
-            # The draft tokens per speculative step (excluding the target-sampled token).
-            num_guess_tokens = self.server_args.speculative_num_draft_tokens - 1
-            total_draft_tokens = recv_obj.spec_verify_ct[i] * num_guess_tokens
-            accepted_tokens = recv_obj.spec_accepted_tokens[i]
+            # Total number of proposed draft tokens per request.
+            all_drafts = recv_obj.spec_verify_ct[i] * (
+                self.server_args.speculative_num_draft_tokens - 1
+            )
+            accepted_drafts = recv_obj.spec_accepted_drafts[i]
 
             # Calculate per-request acceptance rate and average acceptance length.
-            if total_draft_tokens > 0:
-                # Calculate acceptance rate: accepted / (steps * lookahead)
-                meta_info["spec_accept_rate"] = accepted_tokens / total_draft_tokens
+            if all_drafts > 0:
+                # accept_rate: accepted_drafts / total_proposed_drafts (strict count, no bonus).
+                meta_info["spec_accept_rate"] = accepted_drafts / all_drafts
+                # accept_length: completion_tokens / verify_ct (includes bonus token).
                 meta_info["spec_accept_length"] = (
                     recv_obj.completion_tokens[i] / recv_obj.spec_verify_ct[i]
                 )
-                meta_info["spec_accept_token_num"] = accepted_tokens
-                meta_info["spec_draft_token_num"] = total_draft_tokens
+
+                meta_info["spec_accepted_drafts"] = accepted_drafts
+                meta_info["spec_proposed_drafts"] = all_drafts
                 meta_info["spec_verify_ct"] = recv_obj.spec_verify_ct[i]
 
             # Acceptance histogram: tracks how many decoding steps accepted a certain number of draft tokens.
@@ -2135,13 +2163,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 state.last_completion_tokens = completion_tokens
 
         if state.finished:
-            retraction_count = (
-                recv_obj.retraction_counts[i]
-                if getattr(recv_obj, "retraction_counts", None)
-                and i < len(recv_obj.retraction_counts)
-                else 0
-            )
-
             # Get detailed cache breakdown if available
             cached_tokens_details = None
             if (
@@ -2157,7 +2178,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 recv_obj.cached_tokens[i],
                 state.time_stats.get_e2e_latency(),
                 self._request_has_grammar(state.obj),
-                retraction_count,
                 cached_tokens_details,
             )
 
@@ -2673,6 +2693,7 @@ def _get_processor_wrapper(server_args):
             trust_remote_code=server_args.trust_remote_code,
             revision=server_args.revision,
             use_fast=not server_args.disable_fast_image_processor,
+            tokenizer_backend=server_args.tokenizer_backend,
         )
     except ValueError as e:
         error_message = str(e)
@@ -2686,6 +2707,7 @@ def _get_processor_wrapper(server_args):
                 trust_remote_code=server_args.trust_remote_code,
                 revision=server_args.revision,
                 use_fast=True,
+                tokenizer_backend=server_args.tokenizer_backend,
             )
         else:
             raise e

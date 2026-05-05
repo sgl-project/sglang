@@ -436,19 +436,45 @@ def _apply_post_load_fixes(tokenizer, tokenizer_name, revision):
 # ---------------------------------------------------------------------------
 
 
+_fastokens_patched = False
+
+
+def _ensure_fastokens_patched():
+    """Monkey-patch transformers to use the fastokens backend (once)."""
+    global _fastokens_patched
+    if _fastokens_patched:
+        return
+    try:
+        import fastokens
+    except ImportError:
+        raise ImportError(
+            "The fastokens package is required when --tokenizer-backend=fastokens. "
+            "Install it with: pip install 'sglang[fastokens]'"
+        ) from None
+
+    fastokens.patch_transformers()
+    _fastokens_patched = True
+    logger.info("fastokens backend enabled - transformers patched successfully")
+
+
 def get_tokenizer(
     tokenizer_name: str,
     *args,
     tokenizer_mode: str = "auto",
     trust_remote_code: bool = False,
     tokenizer_revision: Optional[str] = None,
+    tokenizer_backend: str = "huggingface",
     **kwargs,
 ) -> Union[PreTrainedTokenizer, PreTrainedTokenizerFast]:
     """Gets a tokenizer for the given model name via Huggingface."""
+    # Tiktoken format has its own backend — no fastokens patching needed.
     if tokenizer_name.endswith(".json"):
         from sglang.srt.tokenizer.tiktoken_tokenizer import TiktokenTokenizer
 
         return TiktokenTokenizer(tokenizer_name)
+
+    if tokenizer_backend == "fastokens":
+        _ensure_fastokens_patched()
 
     if tokenizer_mode == "slow":
         if kwargs.get("use_fast", False):
@@ -470,12 +496,32 @@ def get_tokenizer(
         **kwargs,
     )
 
-    tokenizer = _auto_tokenizer_from_pretrained(tokenizer_name, *args, **common_kwargs)
+    try:
+        tokenizer = _auto_tokenizer_from_pretrained(
+            tokenizer_name, *args, **common_kwargs
+        )
 
-    if type(tokenizer).__name__ == _TOKENIZERS_BACKEND:
-        tokenizer = _resolve_tokenizers_backend(tokenizer_name, *args, **common_kwargs)
+        # With fastokens, the patched TokenizersBackend.from_pretrained already
+        # returned a tokenizer whose backend is a fastokens shim. Re-resolving via
+        # the declared class (e.g. Qwen2Tokenizer) would discard that work.
+        if (
+            type(tokenizer).__name__ == _TOKENIZERS_BACKEND
+            and tokenizer_backend != "fastokens"
+        ):
+            tokenizer = _resolve_tokenizers_backend(
+                tokenizer_name, *args, **common_kwargs
+            )
 
-    return _apply_post_load_fixes(tokenizer, tokenizer_name, tokenizer_revision)
+        return _apply_post_load_fixes(tokenizer, tokenizer_name, tokenizer_revision)
+    except Exception as e:
+        if tokenizer_backend == "fastokens":
+            raise RuntimeError(
+                f"fastokens failed to load tokenizer for {tokenizer_name!r}. "
+                f"This model's tokenizer may not be supported by fastokens — "
+                f"see https://github.com/crusoecloud/fastokens. "
+                f"Re-run without --tokenizer-backend=fastokens to use the default backend."
+            ) from e
+        raise
 
 
 # ---------------------------------------------------------------------------

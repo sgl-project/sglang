@@ -1178,7 +1178,7 @@ class DFlashWorker:
             return GenerationBatchResult(
                 logits_output=logits_output,
                 next_token_ids=next_token_ids,
-                num_accepted_tokens=0,
+                num_accepted_drafts=0,
                 can_run_cuda_graph=batch_result.can_run_cuda_graph,
             )
 
@@ -1216,7 +1216,7 @@ class DFlashWorker:
             new_verified_id,
             commit_lens,
             next_target_hidden,
-            accept_length_per_req_cpu,
+            num_accepted_drafts_per_req_cpu,
         ) = verify_input.verify(
             batch=batch,
             logits_output=logits_output,
@@ -1239,18 +1239,18 @@ class DFlashWorker:
         batch.spec_info = draft_input
         batch.forward_mode = ForwardMode.DECODE
 
-        num_accepted_tokens = sum(accept_length_per_req_cpu)
+        num_accepted_drafts = sum(num_accepted_drafts_per_req_cpu)
         if not self._logged_first_verify and self.tp_rank == 0:
             logger.info(
-                "DFLASH verify completed. accept_length_per_req=%s",
-                accept_length_per_req_cpu,
+                "DFLASH verify completed. num_accepted_drafts_per_req=%s",
+                num_accepted_drafts_per_req_cpu,
             )
             self._logged_first_verify = True
 
         return GenerationBatchResult(
             logits_output=logits_output,
             next_token_ids=new_verified_id,
-            num_accepted_tokens=num_accepted_tokens,
-            accept_length_per_req_cpu=accept_length_per_req_cpu,
+            num_accepted_drafts=num_accepted_drafts,
+            num_accepted_drafts_per_req_cpu=num_accepted_drafts_per_req_cpu,
             can_run_cuda_graph=can_run_cuda_graph,
         )
