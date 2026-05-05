@@ -8,12 +8,12 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
-from sglang.srt.utils import is_npu
 from sglang.srt.distributed.parallel_state import get_moe_expert_parallel_world_size
 from sglang.srt.layers.dp_attention import (
     get_attention_dp_size,
     is_dp_attention_enabled,
 )
+from sglang.srt.utils import is_npu
 
 _is_npu = is_npu()
 
