@@ -319,10 +319,11 @@ class MultiHttpWorkerDetokenizerMixin:
 
 
 class MultiTokenizerRouter:
-    """A router between tokenizer workers and the scheduler/detokenizer.
+    """A router between tokenizer managers and the scheduler/detokenizer manager.
 
-    Forward: workers → router → scheduler. Backward: detokenizer → router → workers.
-    Also broadcasts pause/continue to all workers for consistent is_pause state.
+    Forward: tokenizer managers → router → scheduler.
+    Backward: detokenizer manager → router → tokenizer managers.
+    Also broadcasts pause/continue to all tokenizer managers for consistent is_pause state.
     """
 
     def __init__(
@@ -353,7 +354,7 @@ class MultiTokenizerRouter:
         self.disaggregation_bootstrap_server = start_disagg_service(self.server_args)
 
         # Worker IPC names for pause/continue broadcasting
-        self.all_worker_ipcs: list[str] = []
+        self.all_worker_ipcs: set[str] = set()
         # Shared socket mapping (both coroutines run on self._loop, so safe)
         self.socket_mapping = SocketMapping()
 
@@ -366,11 +367,12 @@ class MultiTokenizerRouter:
             recv_obj = await self.receive_from_worker.recv_pyobj()
 
             if isinstance(recv_obj, TokenizerWorkerRegisterReq):
-                self.all_worker_ipcs.append(recv_obj.worker_ipc_name)
-                logger.info(
-                    f"Router registered worker IPC: {recv_obj.worker_ipc_name} "
-                    f"(total: {len(self.all_worker_ipcs)})"
-                )
+                if recv_obj.worker_ipc_name not in self.all_worker_ipcs:
+                    self.all_worker_ipcs.add(recv_obj.worker_ipc_name)
+                    logger.info(
+                        f"Router registered worker IPC: {recv_obj.worker_ipc_name} "
+                        f"(total: {len(self.all_worker_ipcs)})"
+                    )
                 continue
 
             if isinstance(
