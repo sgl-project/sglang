@@ -245,7 +245,9 @@ class Gemma3Attention(nn.Module):
 
         with torch.autocast(device_type=q.device.type, enabled=False):
             freq_indices = (
-                torch.arange(0, self.head_dim, 2, dtype=torch.int64, device=q.device).float()
+                torch.arange(
+                    0, self.head_dim, 2, dtype=torch.int64, device=q.device
+                ).float()
                 / self.head_dim
             )
             inv_freq = 1.0 / (self.rope_theta**freq_indices)

@@ -363,9 +363,7 @@ class LTX2RefinementStage(LTX2AVDenoisingStage):
         scheduler.sigmas = scheduler_sigmas
         num_steps = len(scheduler_sigmas) - 1
         scheduler.num_inference_steps = num_steps
-        scheduler.timesteps = (scheduler_sigmas[:num_steps] * 1000).to(
-            distilled_device
-        )
+        scheduler.timesteps = (scheduler_sigmas[:num_steps] * 1000).to(distilled_device)
         scheduler._step_index = None
         scheduler._begin_index = None
 

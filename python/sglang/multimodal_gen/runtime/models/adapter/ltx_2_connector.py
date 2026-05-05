@@ -276,9 +276,9 @@ class LTX2RotaryPosEmbed1d(nn.Module):
         # 2. Calculate 1D RoPE frequencies
         num_rope_elems = 2  # 1 (because 1D) * 2 (for cos, sin) = 2
         if self.double_precision:
-            freqs = _ltx2_connector_rope_freq_grid_np(
-                self.theta, 1, self.dim
-            ).to(device=device)
+            freqs = _ltx2_connector_rope_freq_grid_np(self.theta, 1, self.dim).to(
+                device=device
+            )
         else:
             pow_indices = torch.pow(
                 self.theta,

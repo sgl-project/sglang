@@ -341,8 +341,7 @@ class LTX2DenoisingStage(DenoisingStage):
         return float(
             (
                 -torch.log(
-                    sigma_next.detach().double().cpu()
-                    / sigma.detach().double().cpu()
+                    sigma_next.detach().double().cpu() / sigma.detach().double().cpu()
                 )
             ).item()
         )
@@ -357,9 +356,9 @@ class LTX2DenoisingStage(DenoisingStage):
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         if sigma_down is not None:
             alpha_ratio = (1 - sigma_next) / (1 - sigma_down)
-            sigma_up = (
-                sigma_next**2 - sigma_down**2 * alpha_ratio**2
-            ).clamp(min=0) ** 0.5
+            sigma_up = (sigma_next**2 - sigma_down**2 * alpha_ratio**2).clamp(
+                min=0
+            ) ** 0.5
         elif sigma_up is not None:
             sigma_up.clamp_(max=sigma_next * 0.9999)
             sigmax = sigma_max if sigma_max is not None else torch.ones_like(sigma_next)
@@ -525,14 +524,12 @@ class LTX2DenoisingStage(DenoisingStage):
 
         mid_video_sigma_for_x0 = (
             mid_video_timestep
-            if ctx.use_ltx23_hq_timestep_semantics
-            and mid_video_timestep is not None
+            if ctx.use_ltx23_hq_timestep_semantics and mid_video_timestep is not None
             else sub_sigma
         )
         mid_audio_sigma_for_x0 = (
             mid_audio_timestep
-            if ctx.use_ltx23_hq_timestep_semantics
-            and mid_audio_timestep is not None
+            if ctx.use_ltx23_hq_timestep_semantics and mid_audio_timestep is not None
             else sub_sigma
         )
         midpoint_denoised_video = self._ltx2_velocity_to_x0(
@@ -1964,9 +1961,7 @@ class LTX2DenoisingStage(DenoisingStage):
                     ).float()
                 )
                 substep_audio_noise = (
-                    self._ltx2_res2s_noise_like(
-                        ctx.audio_latents, ctx, substep=True
-                    )
+                    self._ltx2_res2s_noise_like(ctx.audio_latents, ctx, substep=True)
                     if ctx.use_native_hq_res2s_sde_noise
                     else self._randn_like_with_batch_generators(
                         ctx.audio_latents, batch
@@ -2033,9 +2028,7 @@ class LTX2DenoisingStage(DenoisingStage):
                     ).float()
                 )
                 step_audio_noise = (
-                    self._ltx2_res2s_noise_like(
-                        ctx.audio_latents, ctx, substep=False
-                    )
+                    self._ltx2_res2s_noise_like(ctx.audio_latents, ctx, substep=False)
                     if ctx.use_native_hq_res2s_sde_noise
                     else self._randn_like_with_batch_generators(
                         ctx.audio_latents, batch
