@@ -836,15 +836,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         )
 
     def init_indexer_capturer(self):
-        # Producer model exposes a non-zero num_indexer_layers (and a non-zero
-        # index_topk) to opt into capture. NSA models (V3.2) have one indexer
-        # per transformer layer; non-indexer models leave these at 0 and the
-        # capturer stays disabled.
         enable = get_global_server_args().enable_return_indexer_topk
-        # Producer wiring is currently CUDA-only (Indexer.forward_cuda + the
-        # MLA skip_topk reuse path). NPU/other backends would create a capturer
-        # but never feed it, returning all-zero buffers — refuse fail-fast
-        # instead.
+        # Producer wiring is CUDA-only (Indexer.forward_cuda + MLA skip_topk
+        # path); other backends would create a capturer but never feed it.
         if enable and self.device != "cuda":
             logger.warning(
                 "indexer-topk capture is CUDA-only; %s backend not yet wired. "

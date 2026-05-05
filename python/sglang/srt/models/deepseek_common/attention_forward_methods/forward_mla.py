@@ -208,9 +208,8 @@ class DeepseekMLAForwardMixin:
                         layer_id=self.layer_id,
                     )
                 else:
-                    # skip_topk reuses prev layer's indices; mirror them into this
-                    # layer's slot so the captured buffer reflects the indices
-                    # actually used at this layer.
+                    # skip_topk reuses prev layer's indices; mirror into this
+                    # layer's slot so the captured buffer matches what's used.
                     topk_indices = prev_topk_indices
                     if (cap := get_global_indexer_capturer()) is not None:
                         cap.capture(layer_id=self.layer_id, topk_indices=topk_indices)
