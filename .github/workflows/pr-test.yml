@@ -1148,17 +1148,22 @@ jobs:
           # extra dp/ep/dp-attention flags layered on top. Cache key includes
           # per-rank N/K, so a mismatched TP populates shapes the test never asks
           # for and the test still pays cold-JIT cost on a fresh runner.
-          # Nemotron-3-Super-BF16 is intentionally omitted: BF16 model, doesn't
-          # use DeepGEMM kernels, fallback would just waste ~3 min loading it.
+          #
+          # Only models whose runtime path actually invokes DeepGEMM kernels
+          # are listed. Verified empirically on run 25354167665 by counting
+          # "Try DeepGEMM JIT Compiling" events on rank 0:
+          #   - DeepSeek-V3-0324 / V3.2 / GLM-5-FP8 / MiMo-V2-Flash / MiMo-V2.5: emit JITs ✓
+          #   - Nemotron-3-Super-BF16 / MiniMax-M2.5 / Step-3.5-Flash / Qwen3-Next: 0 JITs in
+          #     either warmup or actual test — they use cutlass/triton/per-tensor
+          #     FP8 instead of DeepGEMM (or are BF16). Loading them only wastes
+          #     time. Re-add if a future change makes one of them block-FP8 +
+          #     auto runner backend.
           python3 scripts/ci/cuda/warmup_deep_gemm.py \
             deepseek-ai/DeepSeek-V3-0324:8 \
             deepseek-ai/DeepSeek-V3.2:8 \
             zai-org/GLM-5-FP8:8 \
             XiaomiMiMo/MiMo-V2-Flash:4 \
-            XiaomiMiMo/MiMo-V2.5:8 \
-            MiniMaxAI/MiniMax-M2.5:8 \
-            stepfun-ai/Step-3.5-Flash:8 \
-            Qwen/Qwen3-Next-80B-A3B-Instruct:4
+            XiaomiMiMo/MiMo-V2.5:8
 
       - name: Run test
         timeout-minutes: 30

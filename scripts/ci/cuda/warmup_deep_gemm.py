@@ -47,11 +47,6 @@ FALLBACK_ARGS: Dict[str, List[str]] = {
     # test_mimo_models.py — note: workflow argv must use ":4", not ":8".
     "XiaomiMiMo/MiMo-V2-Flash": ["--dp", "2", "--enable-dp-attention"],
     "XiaomiMiMo/MiMo-V2.5": ["--dp", "2", "--enable-dp-attention"],
-    # test_minimax_m25_basic.py — without --ep-size, MoE shards by TP and
-    # trips a `intermediate_size_per_partition % block_n != 0` check (192 vs
-    # 128) at fp8.py:864. With ep=8 each rank holds full intermediate width
-    # for its expert subset.
-    "MiniMaxAI/MiniMax-M2.5": ["--ep-size", "8"],
 }
 
 # Output substrings that signal a fatal child-rank crash. compile_deep_gemm's
