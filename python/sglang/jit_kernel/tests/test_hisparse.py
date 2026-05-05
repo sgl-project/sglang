@@ -5,8 +5,9 @@ import torch
 
 from sglang.jit_kernel.hisparse import load_cache_to_device_buffer_mla
 from sglang.srt.utils import is_cuda, is_hip, is_npu, is_xpu
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
+register_amd_ci(est_time=30, suite="stage-b-test-1-gpu-small-amd")
 register_cuda_ci(est_time=10, suite="stage-b-kernel-unit-1-gpu-large")
 register_cuda_ci(est_time=120, suite="nightly-kernel-1-gpu", nightly=True)
 

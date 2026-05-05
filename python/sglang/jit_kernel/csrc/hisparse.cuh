@@ -6,7 +6,6 @@
 #include <dlpack/dlpack.h>
 #include <tvm/ffi/container/tensor.h>
 
-#include <cuda_runtime.h>
 #include <stdexcept>
 #include <stdint.h>
 #include <string>
@@ -22,6 +21,16 @@ __device__ __forceinline__ int hash_slot(int32_t key, int hash_size) {
   return ((uint32_t)key * 2654435761u) % (uint32_t)hash_size;
 }
 
+#ifdef USE_ROCM
+__device__ __forceinline__ void
+transfer_item_serial(const void* __restrict__ src_addr, void* __restrict__ dst_addr, int64_t item_size_bytes) {
+  const auto src = static_cast<const char*>(src_addr);
+  auto dst = static_cast<char*>(dst_addr);
+  for (int64_t i = 0; i < item_size_bytes; ++i) {
+    dst[i] = src[i];
+  }
+}
+#else
 __device__ __forceinline__ void
 transfer_item_warp(int32_t lane_id, const void* src_addr, void* dst_addr, int64_t item_size_bytes) {
   // 128-bit bulk transfer via paired 64-bit loads (avoids alignment issues with uint4)
@@ -66,6 +75,7 @@ __device__ __forceinline__ int warp_inclusive_scan(int* s_data, int lane_id, int
   accumulator = __shfl_sync(0xffffffff, val, 31);
   return accumulator;
 }
+#endif
 
 // Shared memory size calculation for dynamic allocation.
 // Layout: int32_t region (4-byte aligned) followed by int16_t region (2-byte aligned).
@@ -145,6 +155,94 @@ __global__ void load_cache_to_device_buffer_kernel(
     return;
   }
 
+  const int newest_slot = HOT_BUFFER_SIZE;
+  const int32_t newest_token = seq_len - 1;
+
+#ifdef USE_ROCM
+  if (tid == 0) {
+    int16_t lru_slots_out[HOT_BUFFER_SIZE];
+    int total_hits = 0;
+    int total_evictable = 0;
+
+    for (int i = 0; i < HOT_BUFFER_SIZE; ++i) {
+      lru_slots_out[i] = -1;
+    }
+
+    // Mark hits, preserve hit order, and compact evictable slots from MRU to LRU.
+    for (int slot_idx = 0; slot_idx < HOT_BUFFER_SIZE; ++slot_idx) {
+      const int16_t buf_slot = req_lru_slots[slot_idx];
+      const int32_t buffer_token = (buf_slot >= 0) ? req_device_buffer_tokens[buf_slot] : -1;
+      bool is_hit = false;
+
+      if (buffer_token >= 0) {
+        for (int topk_idx = 0; topk_idx < NUM_TOP_K; ++topk_idx) {
+          if (req_top_k_tokens[topk_idx] == buffer_token) {
+            req_top_k_device_locs[topk_idx] = req_device_buffer_locs[buf_slot];
+            is_hit = true;
+            lru_slots_out[total_hits++] = buf_slot;
+          }
+        }
+      }
+
+      if (!is_hit && buf_slot >= 0) {
+        lru_slots_out[HOT_BUFFER_SIZE - 1 - total_evictable] = buf_slot;
+        ++total_evictable;
+      }
+    }
+
+    int total_misses = 0;
+    for (int topk_idx = 0; topk_idx < NUM_TOP_K; ++topk_idx) {
+      const int32_t token = req_top_k_tokens[topk_idx];
+      if (token == newest_token) {
+        req_top_k_device_locs[topk_idx] = req_device_buffer_locs[newest_slot];
+        continue;
+      }
+
+      bool is_hit = false;
+      for (int hit_idx = 0; hit_idx < total_hits; ++hit_idx) {
+        const int16_t hit_slot = lru_slots_out[hit_idx];
+        if (hit_slot >= 0 && req_device_buffer_tokens[hit_slot] == token) {
+          is_hit = true;
+          break;
+        }
+      }
+      if (is_hit) {
+        continue;
+      }
+
+      const int16_t evict_slot = lru_slots_out[HOT_BUFFER_SIZE - 1 - total_misses];
+      const int64_t src_loc = req_host_cache_locs[token];
+      const int64_t dst_loc = static_cast<int64_t>(req_device_buffer_locs[evict_slot]);
+
+      req_top_k_device_locs[topk_idx] = req_device_buffer_locs[evict_slot];
+      req_device_buffer_tokens[evict_slot] = token;
+
+      const auto src_k = static_cast<const char*>(host_cache_k) + src_loc * item_size_bytes;
+      auto dst_k = static_cast<char*>(device_buffer_k) + dst_loc * item_size_bytes;
+      transfer_item_serial(src_k, dst_k, item_size_bytes);
+
+      if constexpr (!IsMLA) {
+        const auto src_v = static_cast<const char*>(host_cache_v) + src_loc * item_size_bytes;
+        auto dst_v = static_cast<char*>(device_buffer_v) + dst_loc * item_size_bytes;
+        transfer_item_serial(src_v, dst_v, item_size_bytes);
+      }
+      ++total_misses;
+    }
+
+    total_evictable = HOT_BUFFER_SIZE - total_hits;
+    for (int i = 0; i < HOT_BUFFER_SIZE; ++i) {
+      if (i < total_misses) {
+        req_lru_slots[total_evictable - total_misses + i] = lru_slots_out[HOT_BUFFER_SIZE - 1 - i];
+      } else if (i < total_evictable) {
+        req_lru_slots[i - total_misses] = lru_slots_out[HOT_BUFFER_SIZE - 1 - i];
+      } else {
+        req_lru_slots[i] = lru_slots_out[i - total_evictable];
+      }
+    }
+  }
+  return;
+#else
+
   // Dynamic shared memory layout: int32_t arrays first, then int16_t arrays.
   extern __shared__ char smem_raw[];
   using Layout = SmemLayout<NUM_TOP_K, HOT_BUFFER_SIZE>;
@@ -182,9 +280,6 @@ __global__ void load_cache_to_device_buffer_kernel(
     s_evict_chunk_offset[i] = 0;
   }
   __syncthreads();
-
-  const int newest_slot = HOT_BUFFER_SIZE;
-  const int32_t newest_token = seq_len - 1;
 
   // Insert top-k tokens into shared-memory hash table.
   for (int i = tid; i < NUM_TOP_K; i += BLOCK_SIZE) {
@@ -372,6 +467,7 @@ __global__ void load_cache_to_device_buffer_kernel(
       transfer_item_warp(lane_id, src_v, dst_v, item_size_bytes);
     }
   }
+#endif
 }
 
 template <int BLOCK_SIZE, int NUM_TOP_K, int HOT_BUFFER_SIZE, bool IsMLA>
@@ -405,9 +501,11 @@ void load_cache_to_device_buffer(
   // the correct one is selected at runtime based on seq_lens dtype.
   auto launch = [&](auto kernel_fn, const auto* seq_lens_ptr) {
     constexpr size_t smem_bytes = SmemLayout<NUM_TOP_K, HOT_BUFFER_SIZE>::BYTES;
+#ifndef USE_ROCM
     if constexpr (smem_bytes > 48u * 1024u) {
       cudaFuncSetAttribute(kernel_fn, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes);
     }
+#endif
     LaunchKernel(bs, BLOCK_SIZE, device, smem_bytes)(
         kernel_fn,
         static_cast<const int32_t*>(top_k_tokens.data_ptr()),
