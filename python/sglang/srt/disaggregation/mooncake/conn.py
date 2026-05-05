@@ -21,6 +21,12 @@ from sglang.srt.disaggregation.common.conn import (
     CommonKVReceiver,
     CommonKVSender,
 )
+from sglang.srt.disaggregation.common.staging_handler import (
+    DecodeStagingContext,
+    PrefillStagingContext,
+    StagingRegisterInfo,
+    StagingTransferInfo,
+)
 from sglang.srt.disaggregation.common.utils import (
     FastQueue,
     group_concurrent_contiguous,
@@ -59,14 +65,6 @@ class TransferKVChunk:
     is_last_chunk: bool
     prefill_aux_index: Optional[int]
     state_indices: Optional[List[int]]
-
-
-from sglang.srt.disaggregation.common.staging_handler import (
-    DecodeStagingContext,
-    PrefillStagingContext,
-    StagingRegisterInfo,
-    StagingTransferInfo,
-)
 
 
 # decode
@@ -1710,6 +1708,7 @@ class MooncakeKVSender(CommonKVSender):
                 aux_index=self.aux_index,
                 state_indices=state_indices,
             )
+        self._record_transfer_indices(kv_indices, state_indices)
 
     def poll(self) -> KVPoll:
         if self.conclude_state is None:

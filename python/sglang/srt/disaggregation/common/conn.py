@@ -22,6 +22,7 @@ from sglang.srt.disaggregation.base.conn import (
     BaseKVSender,
     KVArgs,
     KVPoll,
+    KVTransferMetric,
 )
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.distributed import get_pp_group
@@ -442,6 +443,10 @@ class CommonKVSender(BaseKVSender):
         self.bootstrap_room = bootstrap_room
         self.aux_index = None
         self.bootstrap_server_url = bootstrap_addr
+        self.conclude_state: Optional[KVPoll] = None
+        self._transfer_metric = KVTransferMetric()
+        self._transfer_num_kv_indices = 0
+        self._transfer_num_state_indices = 0
         # inner state
         self.curr_idx = 0
         if self.kv_mgr.is_dummy_cp_rank:
@@ -501,6 +506,25 @@ class CommonKVSender(BaseKVSender):
 
     def should_send_kv_chunk(self, num_pages: int, last_chunk: bool) -> bool:
         return num_pages > 0
+
+    def get_transfer_metric(self) -> KVTransferMetric:
+        total_bytes = self._transfer_num_kv_indices * sum(
+            self.kv_mgr.kv_args.kv_item_lens
+        )
+        total_bytes += self._transfer_num_state_indices * sum(
+            self.kv_mgr.kv_args.state_item_lens
+        )
+        self._transfer_metric.transfer_total_bytes = total_bytes
+        return self._transfer_metric
+
+    def _record_transfer_indices(
+        self,
+        kv_indices: npt.NDArray[np.int32],
+        state_indices: Optional[List[int]],
+    ):
+        self._transfer_num_kv_indices += len(kv_indices)
+        if state_indices is not None:
+            self._transfer_num_state_indices += len(state_indices)
 
     def send(
         self,
