@@ -346,6 +346,8 @@ class _DeepEPDispatcherImplBase:
         if self.deepep_output_dtype == DeepOutputDtype.BF16:
             self.params_bytes = 2
             self.use_nvfp4 = self.use_fp8 = False
+            if _is_npu:
+                os.environ["DEEP_NORMAL_MODE_USE_INT8_QUANT"] = "0"
         elif self.deepep_output_dtype == DeepOutputDtype.FP8:
             self.params_bytes = 1
             self.use_nvfp4 = False
@@ -356,6 +358,8 @@ class _DeepEPDispatcherImplBase:
             self.params_bytes = 1
             self.use_nvfp4 = True
             self.use_fp8 = False
+            if _is_npu:
+                os.environ["DEEP_NORMAL_MODE_USE_INT8_QUANT"] = "0"
 
     def dispatch_a(
         self,
