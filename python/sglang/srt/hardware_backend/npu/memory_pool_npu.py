@@ -139,13 +139,12 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
             cache_k, cache_v = layer.quant_method.apply(cache_k, cache_v, layer)
         else:
             if cache_k.dtype != self.dtype:
-
-                    if k_scale is not None:
-                        cache_k.div_(k_scale)
-                    if v_scale is not None:
-                        cache_v.div_(v_scale)
-                    cache_k = cache_k.to(self.dtype)
-                    cache_v = cache_v.to(self.dtype)
+                if k_scale is not None:
+                    cache_k.div_(k_scale)
+                if v_scale is not None:
+                    cache_v.div_(v_scale)
+                cache_k = cache_k.to(self.dtype)
+                cache_v = cache_v.to(self.dtype)
 
             if self.store_dtype != self.dtype:
                 cache_k = cache_k.view(self.store_dtype)

@@ -874,6 +874,9 @@ class AscendAttnBackend(AttentionBackend):
                 .tolist()
             )
 
+        #print(f"q dtype: {q.dtype}")
+        #print(f"k dtype: {k_cache.dtype}")
+        #print(f"v dtype: {v_cache.dtype}")
         attn_output, _ = torch.ops.npu.npu_fused_infer_attention_score(
             query,
             k_cache.view(-1, self.page_size, layer.tp_k_head_num * layer.qk_head_dim),
@@ -964,7 +967,10 @@ class AscendAttnBackend(AttentionBackend):
             v_cache = forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id)
             if (k_cache.dtype != k.dtype) and (k_cache.dtype == torch.int8):
                 #dequant cache back to model type for prefill
-                k_cache_bf16, v_cache_bf16 = layer.quant_method.anti_quant_int8(k_cache, v_cache, layer)
+                #print(f"dequantizing cache for prefill")
+                k_cache, v_cache = layer.quant_method.anti_quant_int8(k_cache, v_cache, layer)
+                #print(f"k dtype after dequant: {k_cache.dtype}")
+                #print(f"v dtype after dequant: {v_cache.dtype}")
             #k, k_scale = torch.ops.npu.npu_dynamic_quant(k)
             #v, v_scale = torch.ops.npu.npu_dynamic_quant(v)
             # print(f"k dtype: {k.dtype}")
@@ -998,11 +1004,11 @@ class AscendAttnBackend(AttentionBackend):
                 )
                 if has_prefix:
                     attn_output = self._forward_extend_fia_paged_kv(
-                        q, k_cache_bf16, v_cache_bf16, layer
+                        q, k_cache, v_cache, layer
                     )
                 else:
                     """FIA will support multi-bs in the later version of CANN"""
-                    print(f"in fia prefill branch")
+                    #print(f"in fia prefill branch")
                     q = q.reshape(-1, layer.tp_q_head_num, layer.qk_head_dim)
                     attn_output = torch.empty(
                         (q.size(0), layer.tp_q_head_num, layer.v_head_dim),
@@ -1038,7 +1044,7 @@ class AscendAttnBackend(AttentionBackend):
                     attn_output = attn_output.view(
                         -1, layer.tp_q_head_num * layer.v_head_dim
                     )
-                    torch.save(attn_output, "/home/tbaydasov/pseudo_quant_prefill_dump.pt")
+                    #torch.save(attn_output, "/home/tbaydasov/original_prefill_dump.pt")
 
             else:
                 causal = True
@@ -1711,6 +1717,7 @@ class AscendAttnBackend(AttentionBackend):
                     self.forward_metadata.seq_lens_cpu_int.cpu().int().tolist()
                 )
             num_tokens = query.shape[0]
+            #print(f"key antiquant scale: {layer.k_quant_scale.shape}", flush=True)
             workspace = torch_npu._npu_fused_infer_attention_score_get_max_workspace(
                 query,
                 k_cache,
@@ -1722,9 +1729,11 @@ class AscendAttnBackend(AttentionBackend):
                 input_layout="BSH",
                 scale=layer.scaling,
                 actual_seq_lengths_kv=actual_seq_len_kv,
-                key_antiquant_scale=layer.k_quant_scale,
+                #key_antiquant_mode=1,
+                #value_antiquant_mode=1,
+                key_antiquant_scale=layer.k_dequant_scale,
                 key_antiquant_offset=layer.k_quant_offset,
-                value_antiquant_scale=layer.v_quant_scale,
+                value_antiquant_scale=layer.v_dequant_scale,
                 value_antiquant_offset=layer.v_quant_offset,
             )
             output = torch.empty(
@@ -1744,14 +1753,18 @@ class AscendAttnBackend(AttentionBackend):
                 input_layout="BSH",
                 scale=layer.scaling,
                 actual_seq_lengths_kv=actual_seq_len_kv,
-                #antiquant_mode=0,
-                key_antiquant_scale=layer.k_quant_scale,
+                #key_antiquant_mode=1,
+                #value_antiquant_mode=1,
+                key_antiquant_scale=layer.k_dequant_scale,
                 key_antiquant_offset=layer.k_quant_offset,
-                value_antiquant_scale=layer.v_quant_scale,
+                value_antiquant_scale=layer.v_dequant_scale,
                 value_antiquant_offset=layer.v_quant_offset,
                 workspace=workspace,
                 out=[output, softmax_lse],
             )
+            #print(f"query shape: {query.shape}", flush=True)
+            #torch.save(output, f"/home/tbaydasov/original_decode_dump/original_decode.pt")
+            #raise ValueError("Debug stop")
             return output.view(num_tokens, layer.tp_q_head_num * layer.v_head_dim)
         else:
             c_kv, k_rope = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)

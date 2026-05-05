@@ -398,7 +398,10 @@ class ModelSlimFusedMoEMethod(FusedMoEMethodBase):
 class ModelSlimKVCacheMethod(BaseKVCacheMethod):
     def __init__(self, config):
         super().__init__(config)
-    
+
+    def rmse(self, predictions, targets):
+        return np.sqrt(((predictions.reshape(-1).float().cpu().numpy() - targets.reshape(-1).float().cpu().numpy()) ** 2).mean())
+
     def create_weights(
         self,
         layer: nn.Module,
@@ -438,8 +441,10 @@ class ModelSlimKVCacheMethod(BaseKVCacheMethod):
             weight_loader=self.weight_loader,
         )
         layer.register_parameter("v_offset", v_offset)
-    
+
     def process_weights_after_loading(self, layer: nn.Module) -> None:
+        print(f"-1 in k_scale: {(layer.k_scale == -1).all().item()}")
+        print(f"-1 in v_scale: {(layer.v_scale == -1).all().item()}")
         device = layer.k_scale.device
         dtype = torch.bfloat16
 
@@ -450,37 +455,42 @@ class ModelSlimKVCacheMethod(BaseKVCacheMethod):
 
         layer.k_quant_offset = torch.nn.Parameter(k_offset.to(dtype), requires_grad=False).unsqueeze(0)
         layer.v_quant_offset = torch.nn.Parameter(v_offset.to(dtype), requires_grad=False).unsqueeze(0)
+        layer.k_dequant_scale = torch.nn.Parameter(layer.k_scale.to(dtype), requires_grad=False).unsqueeze(0)
+        layer.v_dequant_scale = torch.nn.Parameter(layer.v_scale.to(dtype), requires_grad=False).unsqueeze(0)
         layer.k_quant_scale = torch.nn.Parameter(layer.k_scale.reciprocal().to(dtype), requires_grad=False).unsqueeze(0)
         layer.v_quant_scale = torch.nn.Parameter(layer.v_scale.reciprocal().to(dtype), requires_grad=False).unsqueeze(0)
-    
+
     def anti_quant_int8(self, k_cache, v_cache, layer):
         old_shape = k_cache.shape
         #print(f"k cache shape: {k_cache.shape}")
         #print(f"k scale shape: {layer.k_scale.shape}")
-        k_cache = k_cache.view(*k_cache.shape[:-2], 1, -1)
-        v_cache = v_cache.view(*v_cache.shape[:-2], 1, -1)
+        k_cache = k_cache.view(-1, self.kv_size)
+        v_cache = v_cache.view(-1, self.kv_size)
         #print(f"new k cache shape: {k_cache.shape}")
         k_cache_anti_quant = torch_npu.npu_anti_quant(
             x=k_cache,
             scale=layer.k_scale,
             dst_dtype=torch.bfloat16
         )
-        v_cache_anti_quant= torch_npu.npu_anti_quant(
+        v_cache_anti_quant = torch_npu.npu_anti_quant(
             x=v_cache,
             scale=layer.v_scale,
             dst_dtype=torch.bfloat16
         )
-        k_cache = k_cache.view(old_shape)
-        v_cache = v_cache.view(old_shape)
+        k_cache_anti_quant = k_cache_anti_quant.view(old_shape)
+        v_cache_anti_quant = v_cache_anti_quant.view(old_shape)
+
+        #print(f"RMSE of k cache before and after anti quant: {self.rmse(k_cache, k_cache_anti_quant)}")
+        #print(f"RMSE of v cache before and after anti quant: {self.rmse(v_cache, v_cache_anti_quant)}")
         return k_cache_anti_quant, v_cache_anti_quant
 
     def apply(self, k_cache, v_cache, layer):
-        print(f"k_cache shape:{k_cache.shape}")
-        print(f"k quant scale shape: {layer.k_quant_scale.shape}")
+        #print(f"k_cache shape:{k_cache.shape}")
+        #print(f"k quant scale shape: {layer.k_quant_scale.shape}")
         old_shape = k_cache.shape
-        k_cache = k_cache.view(*k_cache.shape[:-2], 1, -1)
-        print(f"new k_cache shape: {k_cache.shape}")
-        v_cache = v_cache.view(*v_cache.shape[:-2], 1, -1)
+        k_cache = k_cache.view(-1, self.kv_size)
+        #print(f"new k_cache shape: {k_cache.shape}")
+        v_cache = v_cache.view(-1, self.kv_size)
 
         key_int8 = torch_npu.npu_quantize(
                     k_cache,
@@ -497,9 +507,50 @@ class ModelSlimKVCacheMethod(BaseKVCacheMethod):
                     torch.qint8,
                     -1,
                     False)
+        
+        # key_bf16 = torch_npu.npu_anti_quant(
+        #     x=key_int8,
+        #     scale=layer.k_scale,
+        #     dst_dtype=torch.bfloat16
+        # )
+
+        # value_bf16 = torch_npu.npu_anti_quant(
+        #     x=value_int8,
+        #     scale=layer.v_scale,
+        #     dst_dtype=torch.bfloat16
+        # )
+
+        # key_bf16 = key_bf16.view(old_shape)
+        # value_bf16 = value_bf16.view(old_shape)
+
+        #key_int8_dynamic, layer.k_quant_scale = torch_npu.npu_dynamic_quant(k_cache)
+        #value_int8_dynamic, layer.v_quant_scale = torch_npu.npu_dynamic_quant(v_cache)
+        #layer.k_quant_scale = layer.k_quant_scale.to(torch.bfloat16).unsqueeze(1)
+        #layer.v_quant_scale = layer.v_quant_scale.to(torch.bfloat16).unsqueeze(1)
+        #print(f"layer k_quant_scale dtype: {layer.k_quant_scale.dtype}")
+        #print(f"layer v_quant_scale dtype: {layer.v_quant_scale.dtype}")
+        # k_cache = k_cache.view(old_shape)
+        # v_cache = v_cache.view(old_shape)
+
         key_int8 = key_int8.view(old_shape)
         value_int8 = value_int8.view(old_shape)
+
+        #key_int8_dynamic = key_int8_dynamic.view(old_shape)
+        #value_int8_dynamic = value_int8_dynamic.view(old_shape)
+
+        # print(f"k_cache shape: {k_cache.shape}")
+        # print(f"v_cache shape: {v_cache.shape}")
+        # print(f"key_int8 shape: {key_int8.shape}")
+        # print(f"value_int8 shape: {value_int8.shape}")
+        # print(f"RMSE of k cache before and after quant: {self.rmse(k_cache, key_int8)}")
+        # print(f"RMSE of v cache before and after quant: {self.rmse(v_cache, value_int8)}")
+
+        # print(f"RMSE of k cache before and after dynamic quant: {self.rmse(k_cache, key_int8_dynamic)}")
+        # print(f"RMSE of v cache before and after dynamic quant: {self.rmse(v_cache, value_int8_dynamic)}")
+
+        #return key_bf16, value_bf16
         return key_int8, value_int8
+        #return key_int8_dynamic, value_int8_dynamic
 
     def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor):
         if isinstance(param, _ColumnvLLMParameter):
