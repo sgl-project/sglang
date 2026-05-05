@@ -423,10 +423,18 @@ class TestDetokenizeTopLogprobsTokens(unittest.TestCase):
 
     def setUp(self):
         self.fn = TokenizerManager.detokenize_top_logprobs_tokens
-        self.stub = Mock(spec=["tokenizer", "detokenize_logprob_tokens"])
-        self.stub.tokenizer = Mock()
+        self.stub = Mock(
+            spec=["tokenizer", "detokenize_logprob_tokens", "_batch_decode_token_ids"]
+        )
+        self.stub.tokenizer = Mock(spec=["batch_decode", "backend_tokenizer"])
+        self.stub.tokenizer.backend_tokenizer = None
         self.stub.tokenizer.batch_decode = Mock(
             side_effect=lambda ids: [f"tok_{i[0]}" for i in ids]
+        )
+        self.stub._batch_decode_token_ids = (
+            lambda token_ids: TokenizerManager._batch_decode_token_ids(
+                self.stub, token_ids
+            )
         )
         # Delegate to the real helper so we exercise the production path.
         self.stub.detokenize_logprob_tokens = (
@@ -521,6 +529,27 @@ class TestDetokenizeTopLogprobsTokens(unittest.TestCase):
         )
         (called_ids,), _ = self.stub.tokenizer.batch_decode.call_args
         self.assertEqual(list(called_ids), [[10], [20], [30], [40], [50], [60]])
+
+    def test_prefers_backend_decode_batch_when_available(self):
+        """Use the tokenizer backend to avoid per-sequence Python decode loops."""
+        vals = [[-0.1, -0.2], [], [-0.5, -0.6, -0.7], [-0.9]]
+        idxs = [[10, 20], [], [30, 40, 50], [60]]
+        backend_tokenizer = Mock(spec=["decode_batch"])
+        backend_tokenizer.decode_batch = Mock(
+            side_effect=lambda ids, skip_special_tokens: [
+                f"tok_{i[0]}_{skip_special_tokens}" for i in ids
+            ]
+        )
+        self.stub.tokenizer.backend_tokenizer = backend_tokenizer
+
+        result = self._call(vals, idxs, decode_to_text=True)
+
+        self.stub.tokenizer.batch_decode.assert_not_called()
+        backend_tokenizer.decode_batch.assert_called_once_with(
+            [[10], [20], [30], [40], [50], [60]], skip_special_tokens=False
+        )
+        self.assertEqual(result[0][0], (-0.1, 10, "tok_10_False"))
+        self.assertEqual(result[2][2], (-0.7, 50, "tok_50_False"))
 
     def test_matches_reference_per_position_implementation(self):
         """Batched result is equivalent to per-position decoding."""

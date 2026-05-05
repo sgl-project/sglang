@@ -2011,12 +2011,19 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             ]
         else:
             assert self.tokenizer is not None
-            # In transformers v5, batch_decode([1, 2, 3]) concatenates all tokens
-            # into one string. Wrap each ID in its own list so they decode separately.
-            token_texts = self.tokenizer.batch_decode(
-                [[idx] for idx in token_logprobs_idx]
-            )
+            token_texts = self._batch_decode_token_ids(token_logprobs_idx)
             return list(zip(token_logprobs_val, token_logprobs_idx, token_texts))
+
+    def _batch_decode_token_ids(self, token_ids: List[int]) -> List[str]:
+        # In transformers v5, batch_decode([1, 2, 3]) concatenates all tokens
+        # into one string. Wrap each ID in its own list so they decode separately.
+        token_id_seqs = [[idx] for idx in token_ids]
+        backend_tokenizer = getattr(self.tokenizer, "backend_tokenizer", None)
+        if backend_tokenizer is not None and hasattr(backend_tokenizer, "decode_batch"):
+            return backend_tokenizer.decode_batch(
+                token_id_seqs, skip_special_tokens=False
+            )
+        return self.tokenizer.batch_decode(token_id_seqs)
 
     def detokenize_top_logprobs_tokens(
         self,
@@ -2048,7 +2055,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         if not flat_ids:
             return ret
 
-        decoded = self.tokenizer.batch_decode([[idx] for idx in flat_ids])
+        decoded = self._batch_decode_token_ids(flat_ids)
         offset = 0
         for pos, length in zip(nonempty_positions, lengths):
             chunk_texts = decoded[offset : offset + length]
