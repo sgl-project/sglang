@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import os
 import subprocess
 import tempfile
@@ -24,6 +25,13 @@ from sglang.srt.ug.runtime import (
     UGSRTPreparedInput,
     UGVLMTextGenerationResult,
 )
+
+U1_IMG_START_TOKEN = "<img>"
+U1_IMG_END_TOKEN = "</img>"
+U1_IMG_CONTEXT_TOKEN = "<IMG_CONTEXT>"
+U1_IMAGE_PLACEHOLDER = "<image>"
+U1_IMAGENET_MEAN = (0.485, 0.456, 0.406)
+U1_IMAGENET_STD = (0.229, 0.224, 0.225)
 
 
 @dataclass(frozen=True, slots=True)
@@ -163,11 +171,38 @@ class U1UGModelAdapter:
     image_token_id = 31001
     generated_image_token_id = 31003
 
-    def __init__(self, *, vlm_backend: U1VLMBackend | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        vlm_backend: U1VLMBackend | None = None,
+        native_tokenizer: Any | None = None,
+    ) -> None:
         self.observed_u_forwards: list[dict[str, Any]] = []
         self._pending_segments_by_session: dict[str, list[dict[str, Any]]] = {}
         self._messages_by_session: dict[str, list[UGInterleavedMessage]] = {}
         self.vlm_backend = vlm_backend
+        self.native_tokenizer = native_tokenizer
+
+    def prepare_srt_u_interleaved_inputs(
+        self,
+        *,
+        session: Any,
+        messages: list[UGInterleavedMessage],
+        state: Any,
+    ) -> list[UGSRTPreparedInput] | None:
+        if state != UGSegmentState.U_PREFILL or self.native_tokenizer is None:
+            return None
+        if not any(message.type == "image" for message in messages):
+            return None
+        if not any(message.type == "text" for message in messages):
+            return None
+        return [
+            build_u1_native_vlm_prepared_input(
+                tokenizer=self.native_tokenizer,
+                messages=messages,
+                session=session,
+            )
+        ]
 
     def prepare_srt_u_message_inputs(
         self,
@@ -530,6 +565,204 @@ class U1SRTBackedUGMiddleBridge:
         )
 
 
+def build_u1_native_vlm_prepared_input(
+    *,
+    tokenizer: Any,
+    messages: list[UGInterleavedMessage],
+    session: Any | None = None,
+) -> UGSRTPreparedInput:
+    image = _first_u1_image_content(messages)
+    question = _u1_question_text(messages)
+    pixel_values, grid_hw = load_u1_native_image(image)
+    input_ids, image_offsets, prompt = build_u1_vlm_input_ids_and_offsets(
+        tokenizer=tokenizer,
+        grid_hw=grid_hw,
+        question=question,
+    )
+
+    from sglang.srt.managers.schedule_batch import (
+        Modality,
+        MultimodalDataItem,
+        MultimodalInputs,
+    )
+
+    item = MultimodalDataItem(
+        modality=Modality.IMAGE,
+        feature=pixel_values,
+        model_specific_data={"image_grid_hws": grid_hw},
+        offsets=image_offsets,
+    )
+    item.set_pad_value()
+    mm_inputs = MultimodalInputs(mm_items=[item])
+    return UGSRTPreparedInput(
+        input_ids=input_ids,
+        input_text=prompt,
+        messages=list(messages),
+        mm_inputs=mm_inputs,
+        adapter_metadata={
+            "u1": {
+                "segment_type": "vlm",
+                "source": "native_vlm_input",
+                "image_grid_hw": [list(map(int, row)) for row in grid_hw.tolist()],
+                "image_offsets": list(image_offsets),
+            },
+            "ug_model_state_updates": {
+                "u1": {
+                    "last_segment_type": "vlm",
+                    "last_source": "native_vlm_input",
+                    "native_vlm_prompt": True,
+                    "session_id": getattr(
+                        getattr(session, "handle", None), "session_id", None
+                    ),
+                }
+            },
+        },
+    )
+
+
+def build_u1_vlm_input_ids_and_offsets(
+    *,
+    tokenizer: Any,
+    grid_hw: Any,
+    question: str,
+) -> tuple[list[int], list[tuple[int, int]], str]:
+    prompt = build_u1_vlm_prompt(question=question)
+    for i in range(int(grid_hw.shape[0])):
+        num_patch_token = int(grid_hw[i, 0] * grid_hw[i, 1] * 0.5**2)
+        image_tokens = (
+            U1_IMG_START_TOKEN
+            + U1_IMG_CONTEXT_TOKEN * num_patch_token
+            + U1_IMG_END_TOKEN
+        )
+        prompt = prompt.replace(U1_IMAGE_PLACEHOLDER, image_tokens, 1)
+
+    tokenized = tokenizer(prompt, return_tensors="pt")
+    input_ids = tokenized["input_ids"][0].tolist()
+    context_token_id = tokenizer.convert_tokens_to_ids(U1_IMG_CONTEXT_TOKEN)
+    selected = [
+        index for index, token_id in enumerate(input_ids) if token_id == context_token_id
+    ]
+    if not selected:
+        raise RuntimeError("U1 native VLM prompt did not contain image context tokens")
+    return input_ids, [(selected[0], selected[-1])], prompt
+
+
+def build_u1_vlm_prompt(*, question: str) -> str:
+    return (
+        f"<|im_start|>user\n{U1_IMAGE_PLACEHOLDER}\n{question}"
+        "<|im_end|>\n<|im_start|>assistant\n"
+    )
+
+
+def load_u1_native_image(
+    image: Any,
+    *,
+    patch_size: int = 16,
+    downsample_ratio: float = 0.5,
+    min_pixels: int = 65536,
+    max_pixels: int = 4194304,
+    upscale: bool = False,
+):
+    if isinstance(image, dict):
+        pixel_values = image.get("pixel_values")
+        grid_hw = image.get("grid_hw", image.get("image_grid_hws"))
+        if pixel_values is not None and grid_hw is not None:
+            import torch
+
+            return (
+                torch.as_tensor(pixel_values, dtype=torch.float32),
+                torch.as_tensor(grid_hw, dtype=torch.long),
+            )
+
+    import numpy as np
+    import torch
+    from PIL import Image
+
+    if not isinstance(image, Image.Image):
+        image = Image.open(image)
+    if image.mode == "RGBA":
+        background = Image.new("RGB", image.size, (255, 255, 255))
+        background.paste(image, mask=image.split()[3])
+        image = background
+    else:
+        image = image.convert("RGB")
+
+    if upscale:
+        image = image.resize((image.width * 2, image.height * 2), Image.BILINEAR)
+
+    resized = _u1_dynamic_preprocess_native_resolution(
+        image,
+        size_factor=int(patch_size // downsample_ratio),
+        min_pixels=min_pixels,
+        max_pixels=max_pixels,
+    )
+    array = np.asarray(resized, dtype=np.float32) / 255.0
+    pixel_values = torch.from_numpy(array).permute(2, 0, 1)
+    mean = torch.tensor(U1_IMAGENET_MEAN, dtype=torch.float32).view(3, 1, 1)
+    std = torch.tensor(U1_IMAGENET_STD, dtype=torch.float32).view(3, 1, 1)
+    pixel_values = (pixel_values - mean) / std
+    return _u1_preprocess_pixel_values(pixel_values, patch_size=patch_size)
+
+
+def _u1_dynamic_preprocess_native_resolution(
+    image: Any,
+    *,
+    size_factor: int,
+    min_pixels: int,
+    max_pixels: int,
+):
+    width, height = image.size
+    resized_height, resized_width = _u1_smart_resize(
+        height,
+        width,
+        factor=size_factor,
+        min_pixels=min_pixels,
+        max_pixels=max_pixels,
+    )
+    return image.resize((resized_width, resized_height))
+
+
+def _u1_smart_resize(
+    height: int,
+    width: int,
+    *,
+    factor: int,
+    min_pixels: int,
+    max_pixels: int,
+) -> tuple[int, int]:
+    if max(height, width) / min(height, width) > 200:
+        raise ValueError(
+            "absolute aspect ratio must be smaller than 200, got "
+            f"{max(height, width) / min(height, width)}"
+        )
+    h_bar = max(factor, round(height / factor) * factor)
+    w_bar = max(factor, round(width / factor) * factor)
+    if h_bar * w_bar > max_pixels:
+        beta = math.sqrt((height * width) / max_pixels)
+        h_bar = max(factor, math.floor(height / beta / factor) * factor)
+        w_bar = max(factor, math.floor(width / beta / factor) * factor)
+    elif h_bar * w_bar < min_pixels:
+        beta = math.sqrt(min_pixels / (height * width))
+        h_bar = math.ceil(height * beta / factor) * factor
+        w_bar = math.ceil(width * beta / factor) * factor
+    return h_bar, w_bar
+
+
+def _u1_preprocess_pixel_values(pixel_values: Any, *, patch_size: int):
+    import torch
+
+    c, h, w = pixel_values.shape
+    grid_h = h // patch_size
+    grid_w = w // patch_size
+    flatten_pixel_values = (
+        pixel_values.view(c, grid_h, patch_size, grid_w, patch_size)
+        .permute(1, 3, 0, 2, 4)
+        .reshape(grid_h * grid_w, c * patch_size**2)
+    )
+    grid_hw = torch.tensor([[grid_h, grid_w]], dtype=torch.long)
+    return flatten_pixel_values.to(torch.float32), grid_hw
+
+
 def _not_wired() -> NotImplementedError:
     return NotImplementedError(
         "SenseNova U1 UG backend is not wired yet. This shell only declares "
@@ -539,21 +772,24 @@ def _not_wired() -> NotImplementedError:
 
 
 def _first_u1_image_path(messages: list[UGInterleavedMessage]) -> Path:
+    content = _first_u1_image_content(messages)
+    if isinstance(content, (str, Path)):
+        return Path(content)
+    save = getattr(content, "save", None)
+    if callable(save):
+        path = Path(tempfile.mkdtemp(prefix="u1-vlm-image-")) / "image.png"
+        save(path)
+        return path
+    raise TypeError(
+        "U1 VLM image message must be a path or PIL image, " f"got {type(content)}"
+    )
+
+
+def _first_u1_image_content(messages: list[UGInterleavedMessage]) -> Any:
     for message in messages:
         if message.type != "image":
             continue
-        content = message.content
-        if isinstance(content, (str, Path)):
-            return Path(content)
-        save = getattr(content, "save", None)
-        if callable(save):
-            path = Path(tempfile.mkdtemp(prefix="u1-vlm-image-")) / "image.png"
-            save(path)
-            return path
-        raise TypeError(
-            "U1 VLM image message must be a path or PIL image, "
-            f"got {type(content)}"
-        )
+        return message.content
     raise ValueError("U1 VLM text generation requires an image message")
 
 

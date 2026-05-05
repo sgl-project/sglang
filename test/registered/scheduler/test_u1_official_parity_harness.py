@@ -25,6 +25,8 @@ from sglang.srt.ug.u1 import (
     U1SubprocessVLMBackend,
     U1UGModelAdapter,
     U1SRTBackedUGMiddleBridge,
+    build_u1_vlm_input_ids_and_offsets,
+    load_u1_native_image,
 )
 
 
@@ -211,17 +213,15 @@ def _run_sglang_native_vlm_candidate(
 
     from transformers import AutoTokenizer
 
-    from sensenova_u1.models.neo_unify.utils import load_image_native
     from sglang.srt.configs.model_config import ModelConfig
     from sglang.srt.managers.mm_utils import init_mm_embedding_cache
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.server_args import PortArgs, ServerArgs
 
     tokenizer = AutoTokenizer.from_pretrained(model_path)
-    pixel_values, grid_hw = load_image_native(image_path)
-    input_ids, image_offsets = _build_u1_vlm_input_ids_and_offsets(
+    pixel_values, grid_hw = load_u1_native_image(image_path)
+    input_ids, image_offsets, _ = build_u1_vlm_input_ids_and_offsets(
         tokenizer=tokenizer,
-        pixel_values=pixel_values,
         grid_hw=grid_hw,
         question=question,
     )
@@ -303,39 +303,6 @@ def _run_sglang_native_vlm_candidate(
             "decode_forwards": max(0, max_new_tokens - 1),
         },
     )
-
-
-def _build_u1_vlm_input_ids_and_offsets(
-    *,
-    tokenizer,
-    pixel_values: torch.Tensor,
-    grid_hw: torch.Tensor,
-    question: str,
-) -> tuple[list[int], list[tuple[int, int]]]:
-    from sensenova_u1.models.neo_unify.conversation import get_conv_template
-
-    del pixel_values
-    img_start_token = "<img>"
-    img_end_token = "</img>"
-    img_context_token = "<IMG_CONTEXT>"
-    img_context_token_id = tokenizer.convert_tokens_to_ids(img_context_token)
-
-    template = get_conv_template("neo1_0")
-    template.append_message(template.roles[0], "<image>\n" + question)
-    template.append_message(template.roles[1], None)
-    query = template.get_prompt()
-    for i in range(grid_hw.shape[0]):
-        num_patch_token = int(grid_hw[i, 0] * grid_hw[i, 1] * 0.5**2)
-        image_tokens = (
-            img_start_token + img_context_token * num_patch_token + img_end_token
-        )
-        query = query.replace("<image>", image_tokens, 1)
-
-    input_ids = tokenizer(query, return_tensors="pt")["input_ids"][0].tolist()
-    selected = [i for i, token in enumerate(input_ids) if token == img_context_token_id]
-    if not selected:
-        raise RuntimeError("U1 native VLM prompt did not contain image context tokens")
-    return input_ids, [(selected[0], selected[-1])]
 
 
 def _run_native_u1_vlm_prefill(

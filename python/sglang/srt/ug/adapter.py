@@ -57,6 +57,14 @@ class UGModelAdapterProtocol(Protocol):
         state: UGSegmentState,
     ) -> list[UGSRTPreparedInput] | None: ...
 
+    def prepare_srt_u_interleaved_inputs(
+        self,
+        *,
+        session: UGModelSessionView,
+        messages: list[UGInterleavedMessage],
+        state: UGSegmentState,
+    ) -> list[UGSRTPreparedInput] | None: ...
+
     def observe_srt_u_forward(
         self,
         *,
@@ -132,6 +140,22 @@ class UGModelRunnerAdapter:
         return prepare(
             session=self._session_view(record),
             message=message,
+            state=state,
+        )
+
+    def prepare_srt_u_interleaved_inputs(
+        self,
+        *,
+        record: UGSessionRecord,
+        messages: list[UGInterleavedMessage],
+        state: UGSegmentState,
+    ) -> list[UGSRTPreparedInput] | None:
+        prepare = getattr(self.adapter, "prepare_srt_u_interleaved_inputs", None)
+        if not callable(prepare):
+            return None
+        return prepare(
+            session=self._session_view(record),
+            messages=messages,
             state=state,
         )
 

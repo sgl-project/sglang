@@ -118,7 +118,11 @@ def _load_ug_bridge(
     if is_sensenova_u1_ug_model(model_path):
         return U1SRTBackedUGMiddleBridge(
             _build_srt_owned_ug_runtime(
-                UGModelRunnerAdapter(U1UGModelAdapter()),
+                UGModelRunnerAdapter(
+                    U1UGModelAdapter(
+                        native_tokenizer=getattr(scheduler, "tokenizer", None)
+                    )
+                ),
                 scheduler=scheduler,
                 srt_request_executor=srt_request_executor,
                 srt_u_decode_max_new_tokens=srt_u_decode_max_new_tokens,

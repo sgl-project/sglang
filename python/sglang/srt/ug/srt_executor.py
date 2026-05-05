@@ -54,6 +54,10 @@ class UGSRTRequestBoundaryExecutor:
     def execute_ug_request(self, *, record, req, state) -> None:
         del record, req, state
 
+    def pad_input_ids(self, input_ids: list[int], mm_inputs: Any) -> list[int]:
+        del mm_inputs
+        return list(input_ids)
+
 
 class UGSRTSchedulerExecutor:
     """Minimal adapter from UG materialized requests into an SRT Scheduler."""
@@ -149,6 +153,14 @@ class UGSRTSchedulerExecutor:
             srt_model,
             forward_batch_provider=self.build_ug_g_forward_batch,
         )
+
+    def pad_input_ids(self, input_ids: list[int], mm_inputs: Any) -> list[int]:
+        model_runner = self._require_model_runner()
+        srt_model = getattr(model_runner, "model", None)
+        pad_input_ids = getattr(srt_model, "pad_input_ids", None)
+        if not callable(pad_input_ids):
+            return list(input_ids)
+        return pad_input_ids(list(input_ids), mm_inputs)
 
     def build_ug_g_forward_batch(
         self,

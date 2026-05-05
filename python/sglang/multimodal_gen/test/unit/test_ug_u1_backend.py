@@ -56,7 +56,11 @@ from sglang.srt.ug.runtime import (
     UGSegmentState,
     UGSessionRuntime,
 )
-from sglang.srt.ug.u1 import U1UGModelAdapter, U1VLMBackendResult
+from sglang.srt.ug.u1 import (
+    U1UGModelAdapter,
+    U1VLMBackendResult,
+    build_u1_vlm_prompt,
+)
 
 
 class TestU1UGBackendShell(unittest.TestCase):
@@ -341,6 +345,77 @@ class TestU1UGBackendShell(unittest.TestCase):
         self.assertEqual(counters["srt_request_count"], 3)
         bridge.runtime.close_session(result.session)
 
+    def test_u1_native_tokenizer_builds_single_real_vlm_prefill(self):
+        adapter = U1UGModelAdapter(native_tokenizer=FakeU1Tokenizer())
+        messages = [
+            UGInterleavedMessage(
+                type="image",
+                content={
+                    "pixel_values": torch.zeros(4, 12),
+                    "grid_hw": torch.tensor([[4, 4]], dtype=torch.long),
+                },
+            ),
+            UGInterleavedMessage(type="text", content="what is here?"),
+        ]
+
+        prepared = adapter.prepare_srt_u_interleaved_inputs(
+            session=None,
+            messages=messages,
+            state=UGSegmentState.U_PREFILL,
+        )
+
+        self.assertEqual(len(prepared), 1)
+        self.assertEqual(prepared[0].messages, messages)
+        self.assertIsNotNone(prepared[0].mm_inputs)
+        self.assertIn(151669, prepared[0].input_ids)
+        self.assertEqual(prepared[0].mm_inputs.mm_items[0].offsets, [(1, 4)])
+        self.assertEqual(
+            prepared[0].adapter_metadata["u1"]["source"],
+            "native_vlm_input",
+        )
+
+    def test_u1_vlm_prompt_matches_neo_chat_template(self):
+        self.assertEqual(
+            build_u1_vlm_prompt(question="What is in this image?"),
+            "<|im_start|>user\n<image>\nWhat is in this image?"
+            "<|im_end|>\n<|im_start|>assistant\n",
+        )
+
+    def test_u1_bridge_native_vlm_prefill_uses_model_pad_once(self):
+        executor = FakePadAndDecodeExecutor([910])
+        adapter = U1UGModelAdapter(native_tokenizer=FakeU1Tokenizer())
+        runtime = UGSessionRuntime(
+            model_runner=UGModelRunnerAdapter(adapter),
+            session_controller=SessionController(FakeTreeCache()),
+            srt_request_executor=executor,
+            tokenizer=FakeTokenizer(),
+        )
+        bridge = _load_u1_bridge(runtime)
+
+        result = bridge.generate_vlm_text(
+            messages=[
+                UGInterleavedMessage(
+                    type="image",
+                    content={
+                        "pixel_values": torch.zeros(4, 12),
+                        "grid_hw": torch.tensor([[4, 4]], dtype=torch.long),
+                    },
+                ),
+                UGInterleavedMessage(type="text", content="what is here?"),
+            ],
+            max_new_tokens=1,
+        )
+
+        counters = runtime.get_debug_counters(result.session)
+        self.assertEqual(result.text, "native:910")
+        self.assertEqual(counters["srt_request_count"], 2)
+        self.assertEqual(executor.pad_call_count, 1)
+        self.assertEqual(len(executor.origin_input_ids_by_request), 2)
+        prefill_ids = executor.origin_input_ids_by_request[0]
+        self.assertIn(999001, prefill_ids)
+        self.assertNotIn(151669, prefill_ids)
+        bridge.runtime.close_session(result.session)
+
     def test_u1_text_prepared_input_carries_causal_rows(self):
         adapter = U1UGModelAdapter()
 
@@ -621,11 +696,54 @@ class FakeSRTDecodeExecutor:
             req.output_ids = self.output_ids[: req.sampling_params.max_new_tokens]
 
 
+class FakePadAndDecodeExecutor(FakeSRTDecodeExecutor):
+    def __init__(self, output_ids):
+        super().__init__(output_ids)
+        self.pad_call_count = 0
+        self.origin_input_ids_by_request = []
+
+    def pad_input_ids(self, input_ids, mm_inputs):
+        self.pad_call_count += 1
+        del mm_inputs
+        return [999001 if token_id == 151669 else token_id for token_id in input_ids]
+
+    def execute_ug_request(self, *, record, req, state):
+        self.origin_input_ids_by_request.append(list(req.origin_input_ids))
+        super().execute_ug_request(record=record, req=req, state=state)
+
+
 class FakeTokenizer:
     bos_token_id = 1
 
     def decode(self, token_ids):
         return "native:" + " ".join(str(token_id) for token_id in token_ids)
+
+
+class FakeU1Tokenizer:
+    def convert_tokens_to_ids(self, token):
+        return {
+            "<IMG_CONTEXT>": 151669,
+            "<img>": 151670,
+            "</img>": 151671,
+        }[token]
+
+    def __call__(self, text, return_tensors=None):
+        del return_tensors
+        ids = []
+        i = 0
+        while i < len(text):
+            if text.startswith("<IMG_CONTEXT>", i):
+                ids.append(151669)
+                i += len("<IMG_CONTEXT>")
+            elif text.startswith("<img>", i):
+                ids.append(151670)
+                i += len("<img>")
+            elif text.startswith("</img>", i):
+                ids.append(151671)
+                i += len("</img>")
+            else:
+                i += 1
+        return {"input_ids": torch.tensor([ids], dtype=torch.long)}
 
 
 class FakeScheduler:

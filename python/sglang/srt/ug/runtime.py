@@ -575,6 +575,7 @@ class UGSessionRuntime:
 
             if mm_inputs is not None:
                 SessionController.adjust_mm_offsets(recv_req, req, mm_inputs)
+                self._pad_srt_multimodal_input_ids(req, mm_inputs)
                 req.extend_image_inputs(mm_inputs)
 
             adapter_metadata = self._apply_prepared_srt_input(
@@ -641,6 +642,9 @@ class UGSessionRuntime:
             prepared=prepared,
             is_final_segment=True,
         )
+        if prepared.mm_inputs is not None:
+            self._pad_srt_multimodal_input_ids(req, prepared.mm_inputs)
+            req.extend_image_inputs(prepared.mm_inputs)
         adapter_metadata["ug_srt_owner_session_id"] = owner_record.session_id
         adapter_metadata["ug_srt_sidecar_role"] = role
         self._record_srt_req(sidecar_record, req, request_id=request_id)
@@ -662,6 +666,12 @@ class UGSessionRuntime:
         )
         owner_record.srt_sidecar_request_count += 1
 
+    def _pad_srt_multimodal_input_ids(self, req: Any, mm_inputs: Any) -> None:
+        pad_input_ids = getattr(self.srt_request_executor, "pad_input_ids", None)
+        if not callable(pad_input_ids):
+            return
+        req.origin_input_ids = pad_input_ids(req.origin_input_ids, mm_inputs)
+
     def _prepare_srt_u_inputs(
         self,
         record: UGSessionRecord,
@@ -669,6 +679,14 @@ class UGSessionRuntime:
         *,
         state: UGSegmentState,
     ) -> list[UGSRTPreparedInput]:
+        prepare_all = getattr(
+            self.model_runner, "prepare_srt_u_interleaved_inputs", None
+        )
+        if callable(prepare_all):
+            custom_inputs = prepare_all(record=record, messages=messages, state=state)
+            if custom_inputs is not None:
+                return custom_inputs
+
         prepare_one = getattr(self.model_runner, "prepare_srt_u_message_inputs", None)
         if not callable(prepare_one):
             input_ids, input_text, mm_inputs = self._tokenize_interleaved_messages(
