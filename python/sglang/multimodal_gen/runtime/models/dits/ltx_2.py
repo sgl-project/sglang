@@ -23,7 +23,6 @@ from sglang.multimodal_gen.runtime.distributed.communication_op import (
     tensor_model_parallel_all_reduce,
 )
 from sglang.multimodal_gen.runtime.layers.attention import LocalAttention, USPAttention
-from sglang.multimodal_gen.runtime.layers.layernorm import apply_qk_norm_across_heads
 from sglang.multimodal_gen.runtime.layers.linear import (
     ColumnParallelLinear,
     RowParallelLinear,
@@ -694,7 +693,8 @@ class LTX2Attention(nn.Module):
 
             if self.qk_norm:
                 assert self.q_norm is not None and self.k_norm is not None
-                q, k = apply_qk_norm_across_heads(q, k, self.q_norm, self.k_norm)
+                q = self.q_norm(q)
+                k = self.k_norm(k)
 
             if pe is not None:
                 cos, sin = pe
