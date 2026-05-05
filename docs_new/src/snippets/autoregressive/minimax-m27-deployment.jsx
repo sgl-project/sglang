@@ -120,7 +120,14 @@ export const MiniMaxM27Deployment = () => {
 
     const modelName = 'MiniMaxAI/MiniMax-M2.7';
 
-    let cmd = 'sglang serve \\\n';
+    const isBlackwell = hardware === 'b200' || hardware === 'gb300';
+    const useAllreduceFusion = hardware === 'h200' || hardware === 'b200' || hardware === 'gb300';
+
+    let cmd = '';
+    if (useAllreduceFusion) {
+      cmd += 'SGLANG_USE_FUSED_PARALLEL_QKNORM=1 \\\n';
+    }
+    cmd += 'sglang serve \\\n';
     cmd += `  --model-path ${modelName}`;
 
     if (gpuCount === '8gpu') {
@@ -139,6 +146,16 @@ export const MiniMaxM27Deployment = () => {
 
     cmd += ' \\\n  --trust-remote-code';
     cmd += ' \\\n  --mem-fraction-static 0.85';
+
+    if (isBlackwell) {
+      cmd += ' \\\n  --moe-runner-backend flashinfer_trtllm_routed';
+      cmd += ' \\\n  --fp8-gemm-backend flashinfer_trtllm';
+      cmd += ' \\\n  --dtype bfloat16';
+    }
+
+    if (useAllreduceFusion) {
+      cmd += ' \\\n  --enable-flashinfer-allreduce-fusion';
+    }
 
     if (isAMD) {
       cmd += ' \\\n  --kv-cache-dtype fp8_e4m3';
