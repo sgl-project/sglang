@@ -104,8 +104,19 @@ if _HAS_XPU:
         # Return a wrapper that matches the CUDA API
         class XPURMSNormWrapper:
             def __init__(self, module, hidden_size, dtype_str):
+                import ctypes
                 self._module = module
                 self._func_name = f"rmsnorm_forward_{dtype_str}_{hidden_size}"
+                self._argtypes = [
+                    ctypes.c_void_p,  # queue
+                    ctypes.c_void_p,  # input
+                    ctypes.c_void_p,  # weight
+                    ctypes.c_void_p,  # output
+                    ctypes.c_int64,   # num_tokens
+                    ctypes.c_int64,   # input_stride
+                    ctypes.c_int64,   # output_stride
+                    ctypes.c_float,   # eps
+                ]
                 
             def rmsnorm(self, input, weight, output, eps):
                 # Validate layout assumptions before calling SYCL kernel
@@ -124,20 +135,8 @@ if _HAS_XPU:
                 input_stride = input.stride(0) if input.dim() > 1 else input.numel()
                 output_stride = output.stride(0) if output.dim() > 1 else output.numel()
                 
-                # Call the SYCL kernel through ctypes
-                import ctypes
-                func = getattr(self._module._lib, self._func_name)
-                func.argtypes = [
-                    ctypes.c_void_p,  # queue
-                    ctypes.c_void_p,  # input
-                    ctypes.c_void_p,  # weight
-                    ctypes.c_void_p,  # output
-                    ctypes.c_int64,   # num_tokens
-                    ctypes.c_int64,   # input_stride
-                    ctypes.c_int64,   # output_stride
-                    ctypes.c_float,   # eps
-                ]
-                func.restype = None
+                # Call the SYCL kernel using the module's helper method
+                func = self._module.get_function(self._func_name, self._argtypes)
                 
                 func(
                     queue,
@@ -184,22 +183,10 @@ if _HAS_XPU:
 
     class XPUQKNormWrapper:
         def __init__(self, module, head_dim, dtype_str):
+            import ctypes
             self._module = module
             self._func_name = f"qknorm_forward_{dtype_str}_{head_dim}"
-
-        def qknorm(self, q, k, q_weight, k_weight, eps):
-            import ctypes
-
-            queue = torch.xpu.current_stream().sycl_queue
-
-            num_tokens = q.shape[0]
-            num_qo_heads = q.shape[1]
-            num_kv_heads = k.shape[1]
-            q_stride = q.stride(0)
-            k_stride = k.stride(0)
-
-            func = getattr(self._module._lib, self._func_name)
-            func.argtypes = [
+            self._argtypes = [
                 ctypes.c_void_p,   # queue
                 ctypes.c_void_p,   # q
                 ctypes.c_void_p,   # k
@@ -212,7 +199,17 @@ if _HAS_XPU:
                 ctypes.c_uint32,   # num_tokens
                 ctypes.c_float,    # eps
             ]
-            func.restype = None
+
+        def qknorm(self, q, k, q_weight, k_weight, eps):
+            queue = torch.xpu.current_stream().sycl_queue
+
+            num_tokens = q.shape[0]
+            num_qo_heads = q.shape[1]
+            num_kv_heads = k.shape[1]
+            q_stride = q.stride(0)
+            k_stride = k.stride(0)
+
+            func = self._module.get_function(self._func_name, self._argtypes)
 
             func(
                 queue,
@@ -293,31 +290,26 @@ def fused_inplace_qknorm(
 
     # XPU-specific path
     if _HAS_XPU and q.device.type == "xpu":
-        try:
-            if (
-                q.dim() != 3
-                or k.dim() != 3
-                or q.size(-1) != head_dim
-                or k.size(-1) != head_dim
-                or not q.is_contiguous()
-                or not k.is_contiguous()
-                or q.storage_offset() != 0
-                or k.storage_offset() != 0
-                or q_weight.numel() != head_dim
-                or k_weight.numel() != head_dim
-                or not q_weight.is_contiguous()
-                or not k_weight.is_contiguous()
-                or q_weight.storage_offset() != 0
-                or k_weight.storage_offset() != 0
-            ):
-                raise ValueError("Unsupported XPU QKNorm layout for JIT kernel")
-            module = _jit_qknorm_module_xpu(head_dim, q.dtype)
-            module.qknorm(q, k, q_weight, k_weight, eps)
-            return
-        except Exception as e:
-            logger.warning(f"XPU JIT QKNorm failed, falling back to PyTorch: {e}")
-            _qknorm_pytorch_fallback(q, k, q_weight, k_weight, eps)
-            return
+        if (
+            q.dim() != 3
+            or k.dim() != 3
+            or q.size(-1) != head_dim
+            or k.size(-1) != head_dim
+            or not q.is_contiguous()
+            or not k.is_contiguous()
+            or q.storage_offset() != 0
+            or k.storage_offset() != 0
+            or q_weight.numel() != head_dim
+            or k_weight.numel() != head_dim
+            or not q_weight.is_contiguous()
+            or not k_weight.is_contiguous()
+            or q_weight.storage_offset() != 0
+            or k_weight.storage_offset() != 0
+        ):
+            raise ValueError("Unsupported XPU QKNorm layout for JIT kernel")
+        module = _jit_qknorm_module_xpu(head_dim, q.dtype)
+        module.qknorm(q, k, q_weight, k_weight, eps)
+        return
 
     # Non-CUDA/non-XPU devices use PyTorch fallback
     if q.device.type != "cuda":
@@ -364,28 +356,22 @@ def rmsnorm(
     # XPU-specific path (early return to avoid touching CUDA flow)
     if _HAS_XPU and input.device.type == "xpu":
         hidden_size = input.size(-1)
-        try:
-            if (
-                input.dim() != 2
-                or out.dim() != 2
-                or not input.is_contiguous()
-                or not out.is_contiguous()
-                or input.storage_offset() != 0
-                or out.storage_offset() != 0
-                or weight.dim() != 1
-                or weight.numel() != hidden_size
-                or not weight.is_contiguous()
-                or weight.storage_offset() != 0
-            ):
-                raise ValueError("Unsupported XPU RMSNorm layout for JIT kernel")
-            module = _jit_rmsnorm_module_xpu(hidden_size, input.dtype)
-            module.rmsnorm(input, weight, out, eps)
-            return
-        except Exception as e:
-            # Fallback to PyTorch implementation if JIT fails
-            logger.warning(f"XPU JIT RMSNorm failed, falling back to PyTorch: {e}")
-            _rmsnorm_pytorch_fallback(input, weight, out, eps)
-            return
+        if (
+            input.dim() != 2
+            or out.dim() != 2
+            or not input.is_contiguous()
+            or not out.is_contiguous()
+            or input.storage_offset() != 0
+            or out.storage_offset() != 0
+            or weight.dim() != 1
+            or weight.numel() != hidden_size
+            or not weight.is_contiguous()
+            or weight.storage_offset() != 0
+        ):
+            raise ValueError("Unsupported XPU RMSNorm layout for JIT kernel")
+        module = _jit_rmsnorm_module_xpu(hidden_size, input.dtype)
+        module.rmsnorm(input, weight, out, eps)
+        return
     
     # Non-XPU backends use PyTorch fallback.
     if input.device.type != "cuda":

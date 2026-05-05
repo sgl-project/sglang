@@ -99,29 +99,79 @@ class XPUFusedRopeWrapper:
     """Wrapper for XPU fused RoPE kernel matching CUDA API."""
 
     def __init__(self, module, is_neox: bool, rope_dim: int, dtype_str: str):
+        import ctypes
         self._module = module
         self._is_neox = is_neox
         self._rope_dim = rope_dim
         self._dtype_str = dtype_str
         self._is_neox_str = "true" if is_neox else "false"
-        # Cache resolved ctypes function objects to avoid repeated symbol lookup
-        # and argtypes/restype assignment on the hot path.
-        self._func_cache: dict = {}
+        # Define argtypes for run_rope
+        self._rope_argtypes = [
+            ctypes.c_void_p,  # queue
+            ctypes.c_void_p,  # q_ptr
+            ctypes.c_void_p,  # k_ptr
+            ctypes.c_void_p,  # cos_sin_cache_ptr
+            ctypes.c_void_p,  # positions
+            ctypes.c_int64,   # q_stride
+            ctypes.c_int64,   # k_stride
+            ctypes.c_int64,   # head_stride
+            ctypes.c_uint32,  # num_qo_heads
+            ctypes.c_uint32,  # num_kv_heads
+            ctypes.c_uint32,  # num_tokens
+        ]
+        # Define argtypes for run_rope_store
+        self._rope_store_argtypes = [
+            ctypes.c_void_p,  # queue
+            ctypes.c_void_p,  # q_ptr
+            ctypes.c_void_p,  # k_ptr
+            ctypes.c_void_p,  # v_ptr
+            ctypes.c_void_p,  # k_cache
+            ctypes.c_void_p,  # v_cache
+            ctypes.c_void_p,  # cos_sin_cache_ptr
+            ctypes.c_void_p,  # positions
+            ctypes.c_void_p,  # out_loc
+            ctypes.c_int64,   # q_stride
+            ctypes.c_int64,   # k_stride
+            ctypes.c_int64,   # v_stride
+            ctypes.c_int64,   # head_stride
+            ctypes.c_int64,   # cache_stride
+            ctypes.c_uint32,  # num_qo_heads
+            ctypes.c_uint32,  # num_kv_heads
+            ctypes.c_uint32,  # num_tokens
+        ]
 
-    def _get_func(self, func_name: str, argtypes: list):
-        """Return a configured ctypes function, building and caching on first use."""
-        if func_name not in self._func_cache:
-            import ctypes
+    def _check_xpu_device(self, *tensors) -> None:
+        """Raise if any tensor is not on an XPU device, or tensors span multiple devices."""
+        devices = set()
+        for t in tensors:
+            if t.device.type != "xpu":
+                raise ValueError(
+                    f"XPU RoPE: all tensors must be on an XPU device, "
+                    f"got tensor on {t.device}"
+                )
+            devices.add(t.device)
+        if len(devices) > 1:
+            raise ValueError(
+                f"XPU RoPE: all tensors must be on the same XPU device, "
+                f"got devices: {devices}"
+            )
 
-            func = getattr(self._module._lib, func_name)
-            func.argtypes = argtypes
-            func.restype = None
-            self._func_cache[func_name] = func
-        return self._func_cache[func_name]
+    def _check_last_dim_contiguous(self, *tensors) -> None:
+        """Raise if any tensor does not have a contiguous last dimension."""
+        for t in tensors:
+            if t.stride(-1) != 1:
+                raise ValueError(
+                    "XPU RoPE requires tensors with a contiguous last dimension "
+                    "(stride(-1) == 1). Pass a contiguous view or call "
+                    ".contiguous() before invoking this function."
+                )
 
     def run_rope(self, q, k, cos_sin_cache, positions):
         """Apply RoPE inplace to *q* and *k*."""
         import ctypes
+
+        # Validate all tensors are on the same XPU device.
+        self._check_xpu_device(q, k, cos_sin_cache, positions)
 
         # Validate tensor dtypes.
         if positions.dtype not in (torch.int32, torch.int64):
@@ -135,11 +185,16 @@ class XPUFusedRopeWrapper:
         # The vectorised kernel loads require elements within each head to be
         # contiguous in memory.  Strides along the batch and head dimensions can
         # be arbitrary (they are read from stride(0)/stride(1)).
-        if q.stride(-1) != 1 or k.stride(-1) != 1:
+        self._check_last_dim_contiguous(q, k)
+        # cos_sin_cache is accessed as base_ptr + pos * rope_dim (row-major);
+        # positions is accessed as a flat array — both must be contiguous.
+        if not cos_sin_cache.is_contiguous():
             raise ValueError(
-                "XPU RoPE requires tensors with a contiguous last dimension "
-                "(stride(-1) == 1).  Pass a contiguous view or call "
-                ".contiguous() before invoking this function."
+                "cos_sin_cache must be contiguous for XPU RoPE"
+            )
+        if not positions.is_contiguous():
+            raise ValueError(
+                "positions must be contiguous for XPU RoPE"
             )
 
         queue = torch.xpu.current_stream().sycl_queue
@@ -151,8 +206,9 @@ class XPUFusedRopeWrapper:
         num_kv_heads = k.shape[1]
         q_stride = q.stride(0)
         k_stride = k.stride(0)
-        # stride(1) is the number of elements between consecutive heads in memory,
-        # which equals head_dim for un-sliced tensors and rope_dim for sliced views.
+        # stride(1) is the number of elements between consecutive heads in memory.
+        # Slicing only the last dimension changes the visible width, but keeps this
+        # head-to-head stride equal to the original layout's spacing.
         head_stride = q.stride(1)
         # Both q and k must share the same inter-head stride so the kernel can use
         # a single head_stride parameter for addressing both buffers.
@@ -177,22 +233,7 @@ class XPUFusedRopeWrapper:
             f"fused_rope_{self._is_neox_str}_{self._rope_dim}_"
             f"{self._dtype_str}_{idtype_str}"
         )
-        func = self._get_func(
-            func_name,
-            [
-                ctypes.c_void_p,  # queue
-                ctypes.c_void_p,  # q_ptr
-                ctypes.c_void_p,  # k_ptr
-                ctypes.c_void_p,  # cos_sin_cache_ptr
-                ctypes.c_void_p,  # positions
-                ctypes.c_int64,   # q_stride
-                ctypes.c_int64,   # k_stride
-                ctypes.c_int64,   # head_stride
-                ctypes.c_uint32,  # num_qo_heads
-                ctypes.c_uint32,  # num_kv_heads
-                ctypes.c_uint32,  # num_tokens
-            ],
-        )
+        func = self._module.get_function(func_name, self._rope_argtypes)
 
         func(
             queue,
@@ -211,6 +252,9 @@ class XPUFusedRopeWrapper:
     def run_rope_store(self, q, k, v, k_cache, v_cache, cos_sin_cache, positions, out_loc):
         """Apply RoPE inplace to *q*/*k* and store the rotated *k* and *v* to cache."""
         import ctypes
+
+        # Validate all tensors are on the same XPU device.
+        self._check_xpu_device(q, k, v, k_cache, v_cache, cos_sin_cache, positions, out_loc)
 
         # Validate tensor dtypes.
         if positions.dtype not in (torch.int32, torch.int64):
@@ -231,10 +275,30 @@ class XPUFusedRopeWrapper:
                 f"cos_sin_cache must be float32, got {cos_sin_cache.dtype}"
             )
         # Same last-dim contiguity requirement as run_rope.
-        if q.stride(-1) != 1 or k.stride(-1) != 1 or v.stride(-1) != 1:
+        self._check_last_dim_contiguous(q, k, v)
+        if not cos_sin_cache.is_contiguous():
             raise ValueError(
-                "XPU RoPE requires tensors with a contiguous last dimension "
-                "(stride(-1) == 1)."
+                "cos_sin_cache must be contiguous for XPU RoPE store"
+            )
+        if not positions.is_contiguous():
+            raise ValueError(
+                "positions must be contiguous for XPU RoPE store"
+            )
+        if not out_loc.is_contiguous():
+            raise ValueError(
+                "out_loc must be contiguous for XPU RoPE store"
+            )
+        # The SYCL kernel uses a single cache_stride for both k_cache and v_cache.
+        # Both caches must therefore be fully contiguous and share the same row stride.
+        if not k_cache.is_contiguous():
+            raise ValueError("k_cache must be contiguous for XPU RoPE store")
+        if not v_cache.is_contiguous():
+            raise ValueError("v_cache must be contiguous for XPU RoPE store")
+        if k_cache.stride(0) != v_cache.stride(0):
+            raise ValueError(
+                f"k_cache and v_cache must have the same row stride for XPU RoPE store, "
+                f"got k_cache.stride(0)={k_cache.stride(0)}, "
+                f"v_cache.stride(0)={v_cache.stride(0)}"
             )
 
         queue = torch.xpu.current_stream().sycl_queue
@@ -284,28 +348,7 @@ class XPUFusedRopeWrapper:
             f"fused_rope_store_{self._is_neox_str}_{self._rope_dim}_"
             f"{self._dtype_str}_{idtype_str}"
         )
-        func = self._get_func(
-            func_name,
-            [
-                ctypes.c_void_p,  # queue
-                ctypes.c_void_p,  # q_ptr
-                ctypes.c_void_p,  # k_ptr
-                ctypes.c_void_p,  # v_ptr
-                ctypes.c_void_p,  # k_cache
-                ctypes.c_void_p,  # v_cache
-                ctypes.c_void_p,  # cos_sin_cache_ptr
-                ctypes.c_void_p,  # positions
-                ctypes.c_void_p,  # out_loc
-                ctypes.c_int64,   # q_stride
-                ctypes.c_int64,   # k_stride
-                ctypes.c_int64,   # v_stride
-                ctypes.c_int64,   # head_stride
-                ctypes.c_int64,   # cache_stride
-                ctypes.c_uint32,  # num_qo_heads
-                ctypes.c_uint32,  # num_kv_heads
-                ctypes.c_uint32,  # num_tokens
-            ],
-        )
+        func = self._module.get_function(func_name, self._rope_store_argtypes)
 
         func(
             queue,

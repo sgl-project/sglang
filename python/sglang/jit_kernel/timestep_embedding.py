@@ -57,8 +57,20 @@ if _HAS_XPU:
         # Return a wrapper that matches the CUDA API
         class XPUTimestepEmbeddingWrapper:
             def __init__(self, module, dtype_str):
+                import ctypes
                 self._module = module
                 self._func_name = f"timestep_embedding_forward_{dtype_str}"
+                self._argtypes = [
+                    ctypes.c_void_p,   # queue
+                    ctypes.c_void_p,   # t
+                    ctypes.c_void_p,   # output
+                    ctypes.c_int,      # dim
+                    ctypes.c_bool,     # flip_sin_to_cos
+                    ctypes.c_float,    # downscale_freq_shift
+                    ctypes.c_float,    # scale
+                    ctypes.c_int,      # max_period
+                    ctypes.c_int,      # batch_size
+                ]
                 
             def timestep_embedding(
                 self,
@@ -86,21 +98,8 @@ if _HAS_XPU:
                 # Get batch size
                 batch_size = t.shape[0]
                 
-                # Call the SYCL kernel through ctypes
-                import ctypes
-                func = getattr(self._module._lib, self._func_name)
-                func.argtypes = [
-                    ctypes.c_void_p,   # queue
-                    ctypes.c_void_p,   # t
-                    ctypes.c_void_p,   # output
-                    ctypes.c_int,      # dim
-                    ctypes.c_bool,     # flip_sin_to_cos
-                    ctypes.c_float,    # downscale_freq_shift
-                    ctypes.c_float,    # scale
-                    ctypes.c_int,      # max_period
-                    ctypes.c_int,      # batch_size
-                ]
-                func.restype = None
+                # Call the SYCL kernel using the module's helper method
+                func = self._module.get_function(self._func_name, self._argtypes)
                 
                 func(
                     queue,
@@ -184,27 +183,20 @@ def timestep_embedding(
     
     # XPU-specific path
     if _HAS_XPU and t.device.type == "xpu":
-        try:
-            if dim % 8 != 0:
-                raise ValueError(f"XPU timestep_embedding requires dim divisible by 8, got {dim}")
-            
-            module = _jit_timestep_embedding_module_xpu(t.dtype)
-            module.timestep_embedding(
-                t,
-                output,
-                dim,
-                flip_sin_to_cos,
-                float(downscale_freq_shift),
-                float(scale),
-                int(max_period),
-            )
-            return output
-        except Exception as e:
-            # Fallback to PyTorch implementation if JIT fails
-            logger.warning(f"XPU JIT timestep_embedding failed, falling back to PyTorch: {e}")
-            return _timestep_embedding_pytorch_fallback(
-                t, dim, flip_sin_to_cos, downscale_freq_shift, scale, max_period
-            )
+        if dim % 8 != 0:
+            raise ValueError(f"XPU timestep_embedding requires dim divisible by 8, got {dim}")
+        
+        module = _jit_timestep_embedding_module_xpu(t.dtype)
+        module.timestep_embedding(
+            t,
+            output,
+            dim,
+            flip_sin_to_cos,
+            float(downscale_freq_shift),
+            float(scale),
+            int(max_period),
+        )
+        return output
     
     # Original CUDA path
     module = _jit_timestep_embedding_module(t.dtype)

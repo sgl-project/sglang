@@ -174,6 +174,7 @@ class SYCLModule:
         self.module_name = module_name
         self._lib = ctypes.CDLL(str(so_path))
         self._functions = {}
+        self._configured_funcs = {}  # Cache for functions with configured argtypes/restype
 
     def __getattr__(self, name: str):
         """Dynamically load function from shared library."""
@@ -197,6 +198,37 @@ class SYCLModule:
                 )
 
         return self._functions[name]
+    
+    def get_function(self, func_name: str, argtypes: list, restype=None):
+        """Get a ctypes function with configured argtypes and restype, with caching.
+        
+        Args:
+            func_name: Name of the exported C function
+            argtypes: List of ctypes types for function arguments
+            restype: Return type (defaults to None for void functions)
+        
+        Returns:
+            Configured ctypes function object
+        
+        Example:
+            func = module.get_function(
+                "my_kernel_fp32",
+                [ctypes.c_void_p, ctypes.c_int, ctypes.c_float]
+            )
+            func(queue_ptr, 10, 3.14)
+        """
+        import ctypes
+        
+        # Use tuple of argtypes for cache key (lists aren't hashable)
+        cache_key = (func_name, tuple(argtypes), restype)
+        
+        if cache_key not in self._configured_funcs:
+            func = getattr(self._lib, func_name)
+            func.argtypes = argtypes
+            func.restype = restype
+            self._configured_funcs[cache_key] = func
+        
+        return self._configured_funcs[cache_key]
 
 
 class _LRUModuleCache:
