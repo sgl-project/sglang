@@ -70,6 +70,7 @@ from sglang.srt.utils.common import (
     is_hip,
     is_musa,
     is_npu,
+    log_info_on_rank0,
     next_power_of_2,
 )
 from sglang.srt.utils.patch_torch import monkey_patch_torch_reductions
@@ -278,15 +279,17 @@ class EagleDraftWorker(BaseDraftWorker):
         if self.speculative_num_steps > 1:
             tic = time.perf_counter()
             before_mem = get_available_gpu_memory(self.device, self.gpu_id)
-            logger.info(
-                f"Capture draft cuda graph begin. This can take up to several minutes. avail mem={before_mem:.2f} GB"
+            log_info_on_rank0(
+                logger,
+                f"Capture draft cuda graph begin. This can take up to several minutes. avail mem={before_mem:.2f} GB",
             )
             self.cuda_graph_runner = Device2DraftCudaGraphRunner[
                 self.target_worker.device
             ](self)
             after_mem = get_available_gpu_memory(self.device, self.gpu_id)
-            logger.info(
-                f"Capture draft cuda graph end. Time elapsed: {time.perf_counter() - tic:.2f} s. mem usage={(before_mem - after_mem):.2f} GB. avail mem={after_mem:.2f} GB."
+            log_info_on_rank0(
+                logger,
+                f"Capture draft cuda graph end. Time elapsed: {time.perf_counter() - tic:.2f} s. mem usage={(before_mem - after_mem):.2f} GB. avail mem={after_mem:.2f} GB.",
             )
 
         Device2ExtendCudaGraphRunner = {
@@ -318,15 +321,17 @@ class EagleDraftWorker(BaseDraftWorker):
         ):
             tic = time.perf_counter()
             before_mem = get_available_gpu_memory(self.device, self.gpu_id)
-            logger.info(
-                f"Capture draft extend cuda graph begin. This can take up to several minutes. avail mem={before_mem:.2f} GB"
+            log_info_on_rank0(
+                logger,
+                f"Capture draft extend cuda graph begin. This can take up to several minutes. avail mem={before_mem:.2f} GB",
             )
             self.cuda_graph_runner_for_draft_extend = Device2ExtendCudaGraphRunner[
                 self.target_worker.device
             ](self)
             after_mem = get_available_gpu_memory(self.device, self.gpu_id)
-            logger.info(
-                f"Capture draft extend cuda graph end. Time elapsed: {time.perf_counter() - tic:.2f} s. mem usage={(before_mem - after_mem):.2f} GB. avail mem={after_mem:.2f} GB."
+            log_info_on_rank0(
+                logger,
+                f"Capture draft extend cuda graph end. Time elapsed: {time.perf_counter() - tic:.2f} s. mem usage={(before_mem - after_mem):.2f} GB. avail mem={after_mem:.2f} GB.",
             )
 
     def draft(self, model_worker_batch: ModelWorkerBatch):
@@ -839,10 +844,11 @@ class EAGLEWorkerV2(BaseSpecWorker):
             )
 
         after_mem = get_available_gpu_memory(self.device, self.gpu_id)
-        logger.info(
+        log_info_on_rank0(
+            logger,
             f"Built adaptive runtime state steps={speculative_num_steps}: "
             f"elapsed={time.perf_counter() - tic:.2f}s, "
-            f"mem={(before_mem - after_mem):.2f}GB"
+            f"mem={(before_mem - after_mem):.2f}GB",
         )
 
         return state
@@ -852,11 +858,12 @@ class EAGLEWorkerV2(BaseSpecWorker):
         if self.speculative_num_steps == state.speculative_num_steps:
             return
 
-        logger.info(
+        log_info_on_rank0(
+            logger,
             "Switch adaptive runtime state: "
             f"steps {self.speculative_num_steps} -> {state.speculative_num_steps}, "
             f"draft_tokens {self.speculative_num_draft_tokens} -> "
-            f"{state.speculative_num_draft_tokens}"
+            f"{state.speculative_num_draft_tokens}",
         )
 
         # Top-level

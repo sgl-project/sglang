@@ -115,6 +115,8 @@ class EagleDraftInputV2Mixin:
                 output_ids
             )
 
+        # TODO(adaptive-spec-v2): drop this D2H once the upstream `seq_lens.cpu()`
+        # sync is removed.
         current_kv_lens_cpu = batch.seq_lens.to(device="cpu")
         page_size = batch.token_to_kv_pool_allocator.page_size
         alloc_len_per_decode = get_alloc_len_per_decode()
