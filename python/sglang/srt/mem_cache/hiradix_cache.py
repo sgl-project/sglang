@@ -935,13 +935,13 @@ class HiRadixCache(RadixCache):
         # host memory pressure), so a conditional skip desyncs the NCCL op
         # sequence and deadlocks under TP > 1. (Matches UnifiedRadixCache.)
         finish_count = 0
-        for ack in self.cache_controller.ack_write_queue:
-            if not ack.finish_event.query():
-                break
-            finish_count += 1
+        if self.pp_rank == 0:
+            for ack in self.cache_controller.ack_write_queue:
+                if not ack.finish_event.query():
+                    break
+                finish_count += 1
         finish_count_tensor = torch.tensor(finish_count, dtype=torch.int, device="cpu")
-        # Keep cache state transitions identical across CPxTP participants.
-        self._all_reduce_attn_groups(finish_count_tensor, torch.distributed.ReduceOp.MIN)
+        self._all_reduce(finish_count_tensor, torch.distributed.ReduceOp.MIN)
         finish_count = int(finish_count_tensor.item())
 
         if finish_count > 0:
@@ -963,25 +963,29 @@ class HiRadixCache(RadixCache):
 
     def loading_check(self):
         finish_count = 0
-        for ack in self.cache_controller.ack_load_queue:
-            if not ack.finish_event.query():
-                # the KV cache loading is still ongoing
-                break
+        if self.pp_rank == 0:
+            for ack in self.cache_controller.ack_load_queue:
+                if not ack.finish_event.query():
+                    break
+                finish_count += 1
+        finish_count_tensor = torch.tensor(finish_count, dtype=torch.int, device="cpu")
+        self._all_reduce(finish_count_tensor, torch.distributed.ReduceOp.MIN)
+        finish_count = int(finish_count_tensor.item())
 
-            # ensure completion of loading, before recording transfer completion and updating cache state
+        if finish_count > 0:
+            logger.debug(f"Process {finish_count} load operations")
+        while finish_count > 0:
+            ack = self.cache_controller.ack_load_queue.pop(0)
             ack.finish_event.synchronize()
+            # ensure completion of loading, before recording transfer completion and updating cache state
             self.cache_controller.record_l1_l2_transfer_complete(
                 direction="onboard",
                 ack=ack,
             )
-
-            finish_count += 1
-            # no need to sync across TP workers as batch forwarding is synced
             for ack_id in ack.node_ids:
                 end_node = self.ongoing_load_back.pop(ack_id)
                 self.dec_lock_ref(end_node)
-
-        del self.cache_controller.ack_load_queue[:finish_count]
+            finish_count -= 1
 
     def is_load_back_event_done(self, consumer_index: int) -> bool:
         """Return True after the local load-back event is complete."""
