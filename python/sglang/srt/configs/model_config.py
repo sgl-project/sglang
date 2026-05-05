@@ -131,9 +131,14 @@ def get_nsa_index_n_heads(config: PretrainedConfig) -> int:
 
 def get_num_indexer_layers(config) -> int:
     """Number of layers exposing an indexer that feeds the global indexer-topk
-    capturer. NSA models (e.g. V3.2) have one indexer per transformer layer;
-    other indexer architectures may set `num_indexer_layers` directly on
-    hf_text_config. Returns 0 disables the capturer.
+    capturer. NSA models (e.g. V3.2) instantiate an `Indexer` on every
+    transformer layer, so this returns `num_hidden_layers`. Note that with
+    `index_topk_freq > 1` some layers reuse the previous layer's topk indices
+    (skip_topk path); the capturer still writes one slot per layer (the reused
+    indices are mirrored into the skipping layer's slot at the call site), so
+    the returned count matches the host buffer's layer dimension. Other
+    indexer architectures may set `num_indexer_layers` directly on
+    hf_text_config; returning 0 disables the capturer.
     """
     if is_deepseek_nsa(config):
         return config.num_hidden_layers

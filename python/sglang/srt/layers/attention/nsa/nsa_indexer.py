@@ -1111,15 +1111,18 @@ class Indexer(MultiPlatformOp):
 
         # Optimization: fast path when skipping topk computation
         if skip_logits_computation and (not self.nsa_enable_prefill_cp):
-            return self._forward_cuda_k_only(
-                x,
-                positions,
-                forward_batch,
+            return self._maybe_capture_topk(
                 layer_id,
-                act_quant,
-                enable_dual_stream,
-                metadata,
-                return_indices,
+                self._forward_cuda_k_only(
+                    x,
+                    positions,
+                    forward_batch,
+                    layer_id,
+                    act_quant,
+                    enable_dual_stream,
+                    metadata,
+                    return_indices,
+                ),
             )
 
         if enable_dual_stream and forward_batch.forward_mode.is_decode_or_idle():
@@ -1217,11 +1220,14 @@ class Indexer(MultiPlatformOp):
                 #     print(
                 #         "HACK: seq_lens empty but x not empty, hackily return all-invalid topk_result"
                 #     )
-                return torch.full(
-                    (x_meta.shape[0], self.index_topk),
-                    -1,
-                    dtype=torch.int,
-                    device=x_meta.device,
+                return self._maybe_capture_topk(
+                    layer_id,
+                    torch.full(
+                        (x_meta.shape[0], self.index_topk),
+                        -1,
+                        dtype=torch.int,
+                        device=x_meta.device,
+                    ),
                 )
 
             if (
@@ -1295,8 +1301,11 @@ class Indexer(MultiPlatformOp):
         return self._maybe_capture_topk(layer_id, topk_result)
 
     def _maybe_capture_topk(
-        self, layer_id: int, topk_result: torch.Tensor
-    ) -> torch.Tensor:
+        self, layer_id: int, topk_result: Optional[torch.Tensor]
+    ) -> Optional[torch.Tensor]:
+        # MHA fast path returns None (no topk indices computed); pass through.
+        if topk_result is None:
+            return None
         if (cap := get_global_indexer_capturer()) is not None:
             cap.capture(layer_id=layer_id, topk_indices=topk_result)
         return topk_result

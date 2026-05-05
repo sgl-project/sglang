@@ -840,12 +840,26 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # index_topk) to opt into capture. NSA models (V3.2) have one indexer
         # per transformer layer; non-indexer models leave these at 0 and the
         # capturer stays disabled.
+        enable = get_global_server_args().enable_return_indexer_topk
+        # Producer wiring is currently CUDA-only (Indexer.forward_cuda + the
+        # MLA skip_topk reuse path). NPU/other backends would create a capturer
+        # but never feed it, returning all-zero buffers — refuse fail-fast
+        # instead.
+        if enable and self.device != "cuda":
+            logger.warning(
+                "indexer-topk capture is CUDA-only; %s backend not yet wired. "
+                "Disabling capturer.",
+                self.device,
+            )
+            set_global_indexer_capturer(None)
+            return
+
         hf_text_config = self.model_config.hf_text_config
         num_indexer_layers = get_num_indexer_layers(hf_text_config)
         index_topk = getattr(hf_text_config, "index_topk", 0)
         set_global_indexer_capturer(
             create_indexer_capturer(
-                enable=get_global_server_args().enable_return_indexer_topk,
+                enable=enable,
                 num_indexer_layers=num_indexer_layers,
                 index_topk=index_topk,
                 num_tokens=self.max_total_num_tokens + self.page_size,
