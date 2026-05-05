@@ -1826,6 +1826,90 @@ class StorageMetricsCollector(_StatLoggerDIMixin):
             self._log_histogram(self.histogram_backup_bandwidth, v)
 
 
+class HiCacheL1L2TransferMetricsCollector:
+    """Prometheus metrics for HiCache L1<->L2 KV block transfers.
+
+    L1: device/GPU KV cache.
+    L2: host/CPU KV cache.
+    """
+
+    def __init__(self, labels: Optional[dict[str, str]] = None):
+        from prometheus_client import Counter, Histogram
+
+        self.labels = labels or {}
+        labelnames = list(self.labels.keys()) + ["direction", "src", "dst"]
+
+        self.transfer_events_total = Counter(
+            "sglang:hicache_l1_l2_transfer_events_total",
+            "Total number of completed HiCache L1<->L2 KV block transfer events.",
+            labelnames=labelnames,
+        )
+
+        self.transfer_blocks_total = Counter(
+            "sglang:hicache_l1_l2_transfer_blocks_total",
+            "Total number of KV cache blocks transferred between HiCache L1 and L2.",
+            labelnames=labelnames,
+        )
+
+        self.transfer_bytes_total = Counter(
+            "sglang:hicache_l1_l2_transfer_bytes_total",
+            "Total number of KV cache bytes transferred between HiCache L1 and L2.",
+            labelnames=labelnames,
+        )
+
+        self.transfer_time_us_total = Counter(
+            "sglang:hicache_l1_l2_transfer_time_us_total",
+            "Total measured transfer time in microseconds for HiCache L1<->L2 KV block transfers.",
+            labelnames=labelnames,
+        )
+
+        self.transfer_duration_us = Histogram(
+            "sglang:hicache_l1_l2_transfer_duration_us",
+            "Observed duration in microseconds for one completed HiCache L1<->L2 KV block transfer.",
+            labelnames=labelnames,
+            buckets=(
+                100,
+                250,
+                500,
+                1_000,
+                2_500,
+                5_000,
+                10_000,
+                25_000,
+                50_000,
+                100_000,
+                250_000,
+                500_000,
+                1_000_000,
+                2_500_000,
+                5_000_000,
+            ),
+        )
+
+    def record_transfer(
+        self,
+        *,
+        direction: str,
+        src: str,
+        dst: str,
+        blocks: int,
+        bytes_: int,
+        xfer_us: int,
+    ) -> None:
+        metric_labels = {
+            **self.labels,
+            "direction": direction,
+            "src": src,
+            "dst": dst,
+        }
+
+        self.transfer_events_total.labels(**metric_labels).inc()
+        self.transfer_blocks_total.labels(**metric_labels).inc(blocks)
+        self.transfer_bytes_total.labels(**metric_labels).inc(bytes_)
+        self.transfer_time_us_total.labels(**metric_labels).inc(xfer_us)
+        self.transfer_duration_us.labels(**metric_labels).observe(xfer_us)
+
+
 class ExpertDispatchCollector(_StatLoggerDIMixin):
     def __init__(self, ep_size: int) -> None:
         from prometheus_client import Histogram as _PromHistogram
