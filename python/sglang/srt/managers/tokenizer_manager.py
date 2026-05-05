@@ -1793,18 +1793,39 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         token_logprobs_idx: List[int],
         decode_to_text: bool,
     ):
-        # TODO: The current implementation only batches the detokenization for top-k tokens per single position.
-        # We should batch all top-k tokens in all positions.
-        ret = []
-        for i in range(len(token_logprobs_val)):
-            if token_logprobs_val[i]:
-                ret.append(
-                    self.detokenize_logprob_tokens(
-                        token_logprobs_val[i], token_logprobs_idx[i], decode_to_text
-                    )
-                )
-            else:
-                ret.append(None)
+        ret: List[Optional[List]] = [None] * len(token_logprobs_val)
+
+        if not decode_to_text:
+            for i, vals in enumerate(token_logprobs_val):
+                if vals:
+                    ret[i] = [
+                        (logprob, token_id, None)
+                        for logprob, token_id in zip(vals, token_logprobs_idx[i])
+                    ]
+            return ret
+
+        assert self.tokenizer is not None
+        flat_ids: List[int] = []
+        nonempty_positions: List[int] = []
+        lengths: List[int] = []
+        for i, vals in enumerate(token_logprobs_val):
+            if vals:
+                idxs = token_logprobs_idx[i]
+                flat_ids.extend(idxs)
+                lengths.append(len(idxs))
+                nonempty_positions.append(i)
+
+        if not flat_ids:
+            return ret
+
+        decoded = self.tokenizer.batch_decode(flat_ids)
+        offset = 0
+        for pos, length in zip(nonempty_positions, lengths):
+            chunk_texts = decoded[offset : offset + length]
+            offset += length
+            ret[pos] = list(
+                zip(token_logprobs_val[pos], token_logprobs_idx[pos], chunk_texts)
+            )
         return ret
 
     def _calculate_spec_decoding_metrics(

@@ -404,5 +404,122 @@ class TestTokenizerManagerIntegration(unittest.TestCase):
         self.assertIsNone(result_token_type_ids)
 
 
+class TestDetokenizeTopLogprobsTokens(unittest.TestCase):
+    """Test cases for detokenize_top_logprobs_tokens batched decoding.
+
+    We avoid constructing a real TokenizerManager (which requires GPU-dependent
+    setup) and instead invoke the method as an unbound function against a bare
+    stand-in object that only exposes the attributes the method actually uses.
+    """
+
+    def setUp(self):
+        self.fn = TokenizerManager.detokenize_top_logprobs_tokens
+        self.stub = Mock(spec=["tokenizer"])
+        self.stub.tokenizer = Mock()
+        self.stub.tokenizer.batch_decode = Mock(
+            side_effect=lambda ids: [f"tok_{i}" for i in ids]
+        )
+
+    def _call(self, vals, idxs, decode_to_text):
+        return self.fn(self.stub, vals, idxs, decode_to_text)
+
+    def _reference_impl(self, vals, idxs, decode_to_text):
+        """Per-position reference — what the old implementation produced."""
+        ret = []
+        for i in range(len(vals)):
+            if vals[i]:
+                if not decode_to_text:
+                    ret.append(
+                        [(lp, tid, None) for lp, tid in zip(vals[i], idxs[i])]
+                    )
+                else:
+                    texts = [f"tok_{tid}" for tid in idxs[i]]
+                    ret.append(list(zip(vals[i], idxs[i], texts)))
+            else:
+                ret.append(None)
+        return ret
+
+    def test_decode_to_text_false_skips_tokenizer(self):
+        """When decode_to_text=False, batch_decode should not be called."""
+        vals = [[-0.1, -0.2], [-0.3]]
+        idxs = [[10, 20], [30]]
+
+        result = self._call(
+            vals, idxs, decode_to_text=False
+        )
+
+        self.stub.tokenizer.batch_decode.assert_not_called()
+        self.assertEqual(
+            result,
+            [[(-0.1, 10, None), (-0.2, 20, None)], [(-0.3, 30, None)]],
+        )
+
+    def test_all_empty_positions_returns_nones(self):
+        """All-empty input returns [None, ...] and never calls batch_decode."""
+        vals = [[], [], None]
+        idxs = [[], [], None]
+
+        result = self._call(
+            vals, idxs, decode_to_text=True
+        )
+
+        self.assertEqual(result, [None, None, None])
+        self.stub.tokenizer.batch_decode.assert_not_called()
+
+    def test_empty_input_list(self):
+        """Zero-length input returns an empty list."""
+        result = self._call(
+            [], [], decode_to_text=True
+        )
+        self.assertEqual(result, [])
+        self.stub.tokenizer.batch_decode.assert_not_called()
+
+    def test_mixed_empty_and_nonempty_positions(self):
+        """Texts are sliced back to the correct positions; empties stay None."""
+        vals = [[-0.1, -0.2], [], [-0.5, -0.6, -0.7], None, [-0.9]]
+        idxs = [[10, 20], [], [30, 40, 50], None, [60]]
+
+        result = self._call(
+            vals, idxs, decode_to_text=True
+        )
+
+        expected = [
+            [(-0.1, 10, "tok_10"), (-0.2, 20, "tok_20")],
+            None,
+            [(-0.5, 30, "tok_30"), (-0.6, 40, "tok_40"), (-0.7, 50, "tok_50")],
+            None,
+            [(-0.9, 60, "tok_60")],
+        ]
+        self.assertEqual(result, expected)
+
+    def test_single_batch_decode_call_with_flattened_ids(self):
+        """Efficiency guarantee: batch_decode is called once with flattened ids."""
+        vals = [[-0.1, -0.2], [], [-0.5, -0.6, -0.7], [-0.9]]
+        idxs = [[10, 20], [], [30, 40, 50], [60]]
+
+        self._call(
+            vals, idxs, decode_to_text=True
+        )
+
+        self.assertEqual(
+            self.stub.tokenizer.batch_decode.call_count, 1
+        )
+        (called_ids,), _ = self.stub.tokenizer.batch_decode.call_args
+        self.assertEqual(list(called_ids), [10, 20, 30, 40, 50, 60])
+
+    def test_matches_reference_per_position_implementation(self):
+        """Batched result is equivalent to per-position decoding."""
+        vals = [[-0.1, -0.2, -0.3], [], [-0.5], None, [-0.7, -0.8]]
+        idxs = [[10, 20, 30], [], [40], None, [50, 60]]
+
+        for decode_to_text in (True, False):
+            self.stub.tokenizer.batch_decode.reset_mock()
+            batched = self._call(
+                vals, idxs, decode_to_text=decode_to_text
+            )
+            expected = self._reference_impl(vals, idxs, decode_to_text)
+            self.assertEqual(batched, expected)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
