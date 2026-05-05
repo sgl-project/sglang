@@ -33,8 +33,18 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
-SGL_TEST_FILES_OFFICIAL_CONSISTENCY_GT_BASE = "https://raw.githubusercontent.com/sgl-project/ci-data/main/diffusion-ci/consistency_gt/official_generated"
-SGL_TEST_FILES_SGLANG_CONSISTENCY_GT_BASE = "https://raw.githubusercontent.com/sgl-project/ci-data/main/diffusion-ci/consistency_gt/sglang_generated"
+SGL_TEST_FILES_CI_DATA_REVISION = "437539b330592b1421d239b22d7d76b4a6d08fda"
+SGL_TEST_FILES_CONSISTENCY_GT_ROOT = (
+    "https://raw.githubusercontent.com/"
+    f"sgl-project/ci-data/{SGL_TEST_FILES_CI_DATA_REVISION}/"
+    "diffusion-ci/consistency_gt"
+)
+SGL_TEST_FILES_OFFICIAL_CONSISTENCY_GT_BASE = (
+    f"{SGL_TEST_FILES_CONSISTENCY_GT_ROOT}/official_generated"
+)
+SGL_TEST_FILES_SGLANG_CONSISTENCY_GT_BASE = (
+    f"{SGL_TEST_FILES_CONSISTENCY_GT_ROOT}/sglang_generated"
+)
 SGL_TEST_FILES_CONSISTENCY_GT_BASE = SGL_TEST_FILES_SGLANG_CONSISTENCY_GT_BASE
 SGL_TEST_FILES_CONSISTENCY_GT_BASES = (
     SGL_TEST_FILES_OFFICIAL_CONSISTENCY_GT_BASE,
