@@ -26,6 +26,6 @@ jobs:
           cd python
           cp ../README.md ../LICENSE .
           pip install build wheel setuptools setuptools-scm
-          python3 -m build
+          python3 -m build --wheel
           pip install twine
           python3 -m twine upload dist/* -u __token__ -p ${{ secrets.PYPI_TOKEN }}
