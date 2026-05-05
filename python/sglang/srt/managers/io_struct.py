@@ -1976,6 +1976,15 @@ class DisaggregationMetrics:
     kv_transfer_latency_ms: float = field(
         default=0.0, metadata={"metric": ("gauge", "KV transfer latency in ms")}
     )
+    kv_transfer_total_mb: float = field(
+        default=0.0, metadata={"metric": ("gauge", "KV transfer size in MB")}
+    )
+    kv_transfer_bootstrap_ms: float = field(
+        default=0.0, metadata={"metric": ("gauge", "KV transfer bootstrap time in ms")}
+    )
+    kv_transfer_alloc_ms: float = field(
+        default=0.0, metadata={"metric": ("gauge", "KV transfer allocation time in ms")}
+    )
 
 
 @dataclass

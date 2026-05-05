@@ -120,6 +120,9 @@ class SchedulerStats:
     num_decode_transfer_queue_reqs: QueueCount = field(default_factory=QueueCount)
     kv_transfer_speed_gb_s: float = 0.0
     kv_transfer_latency_ms: float = 0.0
+    kv_transfer_total_mb: float = 0.0
+    kv_transfer_bootstrap_ms: float = 0.0
+    kv_transfer_alloc_ms: float = 0.0
     pending_prealloc_token_usage: float = 0.0
 
     # Utilization

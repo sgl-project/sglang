@@ -671,6 +671,12 @@ class SchedulerDisaggregationPrefillMixin:
                     self.kv_transfer_latency_ms = metrics["latency_ms"]
                 if "speed_gb_s" in metrics:
                     self.kv_transfer_speed_gb_s = metrics["speed_gb_s"]
+                if "total_mb" in metrics:
+                    self.kv_transfer_total_mb = metrics["total_mb"]
+                if "bootstrap_ms" in metrics:
+                    self.kv_transfer_bootstrap_ms = metrics["bootstrap_ms"]
+                if "alloc_ms" in metrics:
+                    self.kv_transfer_alloc_ms = metrics["alloc_ms"]
 
         # Stream requests which have finished transfer
         self.stream_output(
