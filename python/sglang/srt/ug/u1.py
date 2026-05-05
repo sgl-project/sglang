@@ -223,6 +223,17 @@ class U1UGModelAdapter:
         if message.type == "text":
             return [self._prepare_text_input(session=session, message=message)]
         if message.type == "image":
+            if (
+                state == UGSegmentState.APPEND_IMAGE
+                and self.native_tokenizer is not None
+            ):
+                return [
+                    build_u1_native_generated_image_commit_prepared_input(
+                        tokenizer=self.native_tokenizer,
+                        image=message.content,
+                        session=session,
+                    )
+                ]
             return [
                 self._prepare_image_input(
                     session=session,
@@ -268,6 +279,43 @@ class U1UGModelAdapter:
         if self._has_generated_image_commit(session):
             return UGDecodeResult(type="text", text="u1_pixel_flow_text_after_image")
         return UGDecodeResult(type="image_marker")
+
+    def decode_next_segment_from_runtime(self, *, runtime: Any, session: Any) -> Any:
+        session_view = self._runtime_session_view(runtime=runtime, session=session)
+        if not self._has_generated_image_commit(session_view):
+            return UGDecodeResult(type="image_marker")
+        if self.native_tokenizer is None or runtime is None:
+            return UGDecodeResult(type="text", text="u1_pixel_flow_text_after_image")
+        if getattr(runtime, "srt_request_executor", None) is None:
+            return UGDecodeResult(type="text", text="u1_pixel_flow_text_after_image")
+        max_new_tokens = max(
+            1,
+            int(getattr(runtime, "srt_u_decode_max_new_tokens", 0) or 0),
+        )
+        decoded = runtime.decode_text(
+            session,
+            max_new_tokens=max_new_tokens,
+            greedy=True,
+        )
+        return UGDecodeResult(type="text", text=decoded.text)
+
+    @staticmethod
+    def _runtime_session_view(*, runtime: Any, session: Any) -> Any:
+        if getattr(session, "metadata", None) is not None:
+            return session
+        metadata: dict[str, Any] = {}
+        get_debug_counters = getattr(runtime, "get_debug_counters", None)
+        if callable(get_debug_counters):
+            try:
+                counters = get_debug_counters(session)
+                metadata["ug_model_state"] = counters.get("ug_model_state", {})
+                metadata["srt_last_u_decode_output_ids"] = counters.get(
+                    "srt_last_u_decode_output_ids",
+                    (),
+                )
+            except Exception:
+                metadata = {}
+        return SimpleNamespace(handle=session, metadata=metadata)
 
     def decode_vlm_text(
         self,
@@ -468,7 +516,9 @@ class U1UGModelAdapter:
             raise RuntimeError("U1 VLM decode requires a UG session id")
         messages = self._messages_by_session.get(str(session_key), [])
         if not messages:
-            raise RuntimeError(f"U1 VLM decode has no messages for session {session_key}")
+            raise RuntimeError(
+                f"U1 VLM decode has no messages for session {session_key}"
+            )
         return list(messages)
 
     @staticmethod
@@ -698,12 +748,107 @@ def build_u1_native_t2i_prepared_input(
                     "last_segment_type": "t2i",
                     "last_source": "native_t2i_prompt",
                     "native_t2i_prompt": True,
+                    "open_image_marker": input_ids[-1] == img_start_id,
                     "session_id": getattr(
                         getattr(session, "handle", None), "session_id", None
                     ),
                 }
             },
         },
+    )
+
+
+def build_u1_native_generated_image_commit_prepared_input(
+    *,
+    tokenizer: Any,
+    image: Any,
+    session: Any | None = None,
+    patch_size: int = 16,
+    downsample_ratio: float = 0.5,
+) -> UGSRTPreparedInput:
+    pixel_values, grid_hw = load_u1_generated_image_for_commit(
+        image,
+        patch_size=patch_size,
+    )
+    merge_size = _u1_merge_size_from_downsample_ratio(downsample_ratio)
+    grid_h = int(grid_hw[0, 0])
+    grid_w = int(grid_hw[0, 1])
+    if grid_h % merge_size or grid_w % merge_size:
+        raise ValueError(
+            "U1 generated image patch grid must be divisible by merge size "
+            f"{merge_size}, got {grid_h}x{grid_w}"
+        )
+    token_h = grid_h // merge_size
+    token_w = grid_w // merge_size
+    num_context_tokens = token_h * token_w
+    if num_context_tokens <= 0:
+        raise ValueError("U1 generated image commit requires image context tokens")
+
+    img_start_id = tokenizer.convert_tokens_to_ids(U1_IMG_START_TOKEN)
+    context_id = tokenizer.convert_tokens_to_ids(U1_IMG_CONTEXT_TOKEN)
+    img_end_id = tokenizer.convert_tokens_to_ids(U1_IMG_END_TOKEN)
+    omit_start = _u1_session_has_open_image_marker(session, img_start_id)
+    prefix_len = _u1_session_context_length(session)
+
+    input_ids: list[int] = []
+    position_ids: list[list[int]] = []
+    if omit_start:
+        context_t = prefix_len
+    else:
+        input_ids.append(int(img_start_id))
+        position_ids.append([prefix_len, 0, 0])
+        context_t = prefix_len + 1
+
+    context_start = len(input_ids)
+    input_ids.extend([int(context_id)] * num_context_tokens)
+    for h_idx in range(token_h):
+        for w_idx in range(token_w):
+            position_ids.append([context_t, h_idx, w_idx])
+    context_end = len(input_ids) - 1
+    end_t = context_t + 1
+    input_ids.append(int(img_end_id))
+    position_ids.append([end_t, 0, 0])
+
+    from sglang.srt.managers.schedule_batch import (
+        Modality,
+        MultimodalDataItem,
+        MultimodalInputs,
+    )
+    import torch
+
+    item = MultimodalDataItem(
+        modality=Modality.IMAGE,
+        feature=pixel_values,
+        model_specific_data={"image_grid_hws": grid_hw},
+        offsets=[(context_start, context_end)],
+    )
+    item.set_pad_value()
+    mm_inputs = MultimodalInputs(mm_items=[item])
+    mm_inputs.mrope_positions = torch.tensor(position_ids, dtype=torch.long).t()
+    mm_inputs.mrope_position_delta = (
+        mm_inputs.mrope_positions[:, -1:]
+        .max(
+            dim=0,
+            keepdim=True,
+        )
+        .values
+    )
+
+    message = UGInterleavedMessage(type="image", content=image)
+    metadata = _u1_generated_image_commit_metadata(
+        session=session,
+        token_indices=list(range(context_start, context_end + 1)),
+        grid_hw=grid_hw,
+        omit_start=omit_start,
+    )
+    return UGSRTPreparedInput(
+        input_ids=input_ids,
+        input_text="<u1:generated_image_commit>",
+        messages=[message],
+        position_ids=position_ids,
+        mm_inputs=mm_inputs,
+        mot_image_token_indices=list(range(context_start, context_end + 1)),
+        adapter_metadata=metadata,
     )
 
 
@@ -734,7 +879,9 @@ def build_u1_vlm_input_ids_and_offsets(
     input_ids = _u1_tokenize_to_ids(tokenizer, prompt)
     context_token_id = tokenizer.convert_tokens_to_ids(U1_IMG_CONTEXT_TOKEN)
     selected = [
-        index for index, token_id in enumerate(input_ids) if token_id == context_token_id
+        index
+        for index, token_id in enumerate(input_ids)
+        if token_id == context_token_id
     ]
     if not selected:
         raise RuntimeError("U1 native VLM prompt did not contain image context tokens")
@@ -1033,6 +1180,140 @@ def load_u1_native_image(
     std = torch.tensor(U1_IMAGENET_STD, dtype=torch.float32).view(3, 1, 1)
     pixel_values = (pixel_values - mean) / std
     return _u1_preprocess_pixel_values(pixel_values, patch_size=patch_size)
+
+
+def load_u1_generated_image_for_commit(
+    image: Any,
+    *,
+    patch_size: int = 16,
+):
+    if isinstance(image, dict):
+        pixel_values = image.get("pixel_values")
+        grid_hw = image.get("grid_hw", image.get("image_grid_hws"))
+        if pixel_values is not None and grid_hw is not None:
+            import torch
+
+            return (
+                torch.as_tensor(pixel_values, dtype=torch.float32),
+                torch.as_tensor(grid_hw, dtype=torch.long),
+            )
+
+    import numpy as np
+    import torch
+    from PIL import Image
+
+    if torch.is_tensor(image):
+        pixel_values = image.detach().float().cpu()
+        if pixel_values.ndim == 4:
+            if int(pixel_values.shape[0]) != 1:
+                raise ValueError(
+                    "U1 generated image commit expects a single image tensor, "
+                    f"got batch={int(pixel_values.shape[0])}"
+                )
+            pixel_values = pixel_values[0]
+        if pixel_values.ndim != 3 or int(pixel_values.shape[0]) != 3:
+            raise ValueError(
+                "U1 generated image commit tensor must have shape [3,H,W] "
+                f"or [1,3,H,W], got {tuple(pixel_values.shape)}"
+            )
+        if float(pixel_values.min()) < 0.0:
+            pixel_values = pixel_values * 0.5 + 0.5
+        pixel_values = pixel_values.clamp(0, 1)
+    else:
+        if not isinstance(image, Image.Image):
+            image = Image.open(image)
+        image = image.convert("RGB")
+        array = np.asarray(image, dtype=np.float32) / 255.0
+        pixel_values = torch.from_numpy(array).permute(2, 0, 1)
+
+    height = int(pixel_values.shape[1])
+    width = int(pixel_values.shape[2])
+    if height % patch_size or width % patch_size:
+        raise ValueError(
+            "U1 generated image commit requires image size divisible by "
+            f"patch_size={patch_size}, got {width}x{height}"
+        )
+    mean = torch.tensor(U1_IMAGENET_MEAN, dtype=torch.float32).view(3, 1, 1)
+    std = torch.tensor(U1_IMAGENET_STD, dtype=torch.float32).view(3, 1, 1)
+    pixel_values = (pixel_values - mean) / std
+    return _u1_preprocess_pixel_values(pixel_values, patch_size=patch_size)
+
+
+def _u1_session_context_length(session: Any | None) -> int:
+    handle = getattr(session, "handle", None)
+    context_length = getattr(handle, "context_length", None)
+    if context_length is not None:
+        return int(context_length)
+    return int(getattr(session, "srt_last_origin_input_len", 0) or 0)
+
+
+def _u1_merge_size_from_downsample_ratio(downsample_ratio: float) -> int:
+    if downsample_ratio <= 0:
+        raise ValueError(f"downsample_ratio must be > 0, got {downsample_ratio}")
+    merge_size = int(1 / downsample_ratio)
+    if merge_size <= 0 or abs((1 / merge_size) - downsample_ratio) > 1e-6:
+        raise ValueError(
+            "U1 downsample_ratio must be the reciprocal of an integer, "
+            f"got {downsample_ratio}"
+        )
+    return merge_size
+
+
+def _u1_session_has_open_image_marker(
+    session: Any | None,
+    img_start_token_id: int,
+) -> bool:
+    metadata = getattr(session, "metadata", {}) or {}
+    model_state = metadata.get("ug_model_state") or {}
+    u1_state = model_state.get("u1") or {}
+    if bool(u1_state.get("open_image_marker")):
+        return True
+    last_output_ids = metadata.get("srt_last_u_decode_output_ids") or ()
+    return bool(last_output_ids) and int(last_output_ids[-1]) == int(img_start_token_id)
+
+
+def _u1_generated_image_commit_metadata(
+    *,
+    session: Any | None,
+    token_indices: list[int],
+    grid_hw: Any,
+    omit_start: bool,
+) -> dict[str, Any]:
+    metadata = getattr(session, "metadata", {}) or {}
+    model_state = metadata.get("ug_model_state") or {}
+    previous_state = model_state.get("u1") or {}
+    previous_segments = [
+        dict(segment) for segment in previous_state.get("segments", [])
+    ]
+    u1_segment = {
+        "segment_type": "image",
+        "source": "native_generated_image_commit",
+        "token_indices": list(token_indices),
+        "attention_rows": [
+            {
+                "kind": "image",
+                "attention": "hybrid",
+                "start": min(token_indices) if token_indices else 0,
+                "end": (max(token_indices) + 1) if token_indices else 0,
+            }
+        ],
+        "generated_image_commit": True,
+        "native_generated_image_commit": True,
+        "omit_image_start": bool(omit_start),
+        "image_grid_hw": [list(map(int, row)) for row in grid_hw.tolist()],
+    }
+    u1_state = {
+        "segments": previous_segments + [u1_segment],
+        "last_segment_type": "image",
+        "last_source": "native_generated_image_commit",
+        "last_generated_image_commit": True,
+        "native_generated_image_commit": True,
+        "open_image_marker": False,
+    }
+    return {
+        "u1": u1_segment,
+        "ug_model_state_updates": {"u1": u1_state},
+    }
 
 
 def _u1_dynamic_preprocess_native_resolution(

@@ -70,7 +70,7 @@ class UGSRTPreparedInput:
     input_embeds: list[list[float]] | None = None
     replace_embeds: list[list[float]] | None = None
     replace_positions: list[int] | None = None
-    position_ids: list[int] | None = None
+    position_ids: list[Any] | None = None
     non_causal_query_attention: bool = False
     mot_text_token_indices: list[int] | None = None
     mot_image_token_indices: list[int] | None = None
@@ -794,7 +794,16 @@ class UGSessionRuntime:
 
         if prepared.position_ids is not None:
             suffix_positions = prepared.position_ids[stripped:]
-            req.ug_position_ids = list(range(prefix_len)) + list(suffix_positions)
+            if self._uses_multidim_positions(suffix_positions):
+                req.ug_position_ids = self._full_multidim_positions(
+                    prefix_len=prefix_len,
+                    suffix_positions=suffix_positions,
+                )
+                self._install_multidim_mm_positions(req)
+            else:
+                req.ug_position_ids = list(range(prefix_len)) + [
+                    int(position) for position in suffix_positions
+                ]
 
         if prepared.non_causal_query_attention:
             req.ug_non_causal_query_attention = True
@@ -826,6 +835,40 @@ class UGSessionRuntime:
                 "UG prepared SRT input length is inconsistent with session request"
             )
         return prefix_len, stripped
+
+    @staticmethod
+    def _uses_multidim_positions(positions: list[Any]) -> bool:
+        return bool(positions) and isinstance(positions[0], (list, tuple))
+
+    @staticmethod
+    def _full_multidim_positions(
+        *,
+        prefix_len: int,
+        suffix_positions: list[Any],
+    ) -> list[list[int]]:
+        prefix_positions = [[position, 0, 0] for position in range(prefix_len)]
+        return prefix_positions + [
+            [int(value) for value in position] for position in suffix_positions
+        ]
+
+    @staticmethod
+    def _install_multidim_mm_positions(req: Any) -> None:
+        mm_inputs = getattr(req, "multimodal_inputs", None)
+        positions = getattr(req, "ug_position_ids", None)
+        if mm_inputs is None or not positions:
+            return
+        if not isinstance(positions[0], (list, tuple)):
+            return
+        mrope_positions = torch.tensor(positions, dtype=torch.long).t().contiguous()
+        mm_inputs.mrope_positions = mrope_positions
+        mm_inputs.mrope_position_delta = (
+            mrope_positions[:, -1:]
+            .max(
+                dim=0,
+                keepdim=True,
+            )
+            .values
+        )
 
     def _append_srt_u_decode_request(
         self,

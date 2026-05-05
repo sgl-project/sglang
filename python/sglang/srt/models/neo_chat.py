@@ -958,15 +958,22 @@ class NEOChatModel(nn.Module):
         if getattr(mm_inputs, "im_token_id", None) is None:
             mm_inputs.im_token_id = self.img_context_token_id
         image_grid_hw = _u1_grid_hw_from_mm_inputs(mm_inputs)
-        if image_grid_hw is not None:
+        if (
+            image_grid_hw is not None
+            and getattr(mm_inputs, "mrope_positions", None) is None
+        ):
             mm_inputs.mrope_positions = self.get_thw_indexes(
                 torch.tensor(input_ids, dtype=torch.long),
                 grid_hw=image_grid_hw,
             )
-            mm_inputs.mrope_position_delta = mm_inputs.mrope_positions[:, -1:].max(
-                dim=0,
-                keepdim=True,
-            ).values
+            mm_inputs.mrope_position_delta = (
+                mm_inputs.mrope_positions[:, -1:]
+                .max(
+                    dim=0,
+                    keepdim=True,
+                )
+                .values
+            )
         pattern = MultiModalityDataPaddingPatternMultimodalTokens()
         return pattern.pad_input_tokens(input_ids, mm_inputs)
 
@@ -1224,13 +1231,14 @@ class NEOChatModel(nn.Module):
     ) -> torch.Tensor:
         if positions.ndim == 2 and positions.shape[0] == 3:
             return positions.to(dtype=torch.int64, device=input_ids.device)
-
-        if (
-            getattr(forward_batch, "mrope_positions", None) is not None
-            and getattr(forward_batch.forward_mode, "is_decode", lambda: False)()
-        ):
-            return forward_batch.mrope_positions.to(
-                dtype=torch.int64, device=input_ids.device
+        if positions.ndim == 2 and positions.shape[1] == 3:
+            return (
+                positions.t()
+                .contiguous()
+                .to(
+                    dtype=torch.int64,
+                    device=input_ids.device,
+                )
             )
 
         decode_positions = _u1_decode_thw_positions_from_mm_inputs(
@@ -1239,6 +1247,14 @@ class NEOChatModel(nn.Module):
         )
         if decode_positions is not None:
             return decode_positions
+
+        if (
+            getattr(forward_batch, "mrope_positions", None) is not None
+            and getattr(forward_batch.forward_mode, "is_decode", lambda: False)()
+        ):
+            return forward_batch.mrope_positions.to(
+                dtype=torch.int64, device=input_ids.device
+            )
 
         mm_positions = _u1_thw_positions_from_mm_inputs(
             forward_batch=forward_batch,
@@ -1276,7 +1292,17 @@ class NEOChatModel(nn.Module):
             seq_len = prefix_len + extend_len
             req_positions = positions[0, position_start : position_start + seq_len]
             if req_positions.numel() < seq_len:
-                return
+                extend_positions = positions[
+                    0, position_start : position_start + extend_len
+                ]
+                if extend_positions.numel() < extend_len:
+                    return
+                prefix_positions = torch.arange(
+                    prefix_len,
+                    device=positions.device,
+                    dtype=extend_positions.dtype,
+                )
+                req_positions = torch.cat([prefix_positions, extend_positions], dim=0)
             masks.append(
                 build_u1_block_causal_allowed_mask(
                     req_positions,

@@ -61,8 +61,10 @@ from sglang.srt.ug.runtime import (
 from sglang.srt.ug.u1 import (
     U1UGModelAdapter,
     U1VLMBackendResult,
+    build_u1_native_generated_image_commit_prepared_input,
     build_u1_t2i_prompt,
     build_u1_vlm_prompt,
+    load_u1_generated_image_for_commit,
 )
 
 
@@ -228,6 +230,24 @@ class TestU1UGBackendShell(unittest.TestCase):
         self.assertTrue(mask[5, 2])
         self.assertFalse(mask[1, 2])
         self.assertTrue(mask[6, 5])
+
+    def test_neo_chat_accepts_extend_local_thw_position_rows(self):
+        model = _tiny_neo_chat_model_without_language_model()
+        forward_batch = SimpleNamespace(
+            forward_mode=SimpleNamespace(is_decode=lambda: False),
+            mrope_positions=None,
+            mm_inputs=[],
+            extend_seq_lens_cpu=None,
+            extend_prefix_lens_cpu=None,
+        )
+
+        positions = model._resolve_u1_thw_positions(
+            input_ids=torch.tensor([151669, 151671], dtype=torch.long),
+            positions=torch.tensor([[7, 0, 0], [8, 0, 0]], dtype=torch.long),
+            forward_batch=forward_batch,
+        )
+
+        self.assertEqual(positions.tolist(), [[7, 8], [0, 0], [0, 0]])
 
     def test_neo_chat_uses_u1_specific_qwen3_language_path(self):
         with patch("sglang.srt.models.neo_chat.NEOQwen3ForCausalLM") as language_cls:
@@ -490,6 +510,52 @@ class TestU1UGBackendShell(unittest.TestCase):
         self.assertTrue(metadata["generated_image_commit"])
         self.assertEqual(metadata["source"], "generated_image")
 
+    def test_u1_native_generated_image_commit_uses_understanding_path(self):
+        session = SimpleNamespace(
+            handle=SimpleNamespace(
+                session_id="u1-native-commit",
+                context_length=7,
+            ),
+            metadata={
+                "ug_model_state": {
+                    "u1": {
+                        "open_image_marker": True,
+                        "segments": [],
+                    }
+                }
+            },
+        )
+
+        prepared = build_u1_native_generated_image_commit_prepared_input(
+            tokenizer=FakeU1Tokenizer(),
+            image=Image.new("RGB", (32, 32), (12, 34, 56)),
+            session=session,
+            patch_size=16,
+            downsample_ratio=0.5,
+        )
+
+        self.assertEqual(prepared.input_ids, [151669, 151671])
+        self.assertEqual(prepared.position_ids, [[7, 0, 0], [8, 0, 0]])
+        self.assertEqual(prepared.mm_inputs.mm_items[0].offsets, [(0, 0)])
+        self.assertEqual(tuple(prepared.mm_inputs.mm_items[0].feature.shape), (4, 768))
+        self.assertEqual(
+            prepared.mm_inputs.mrope_positions.tolist(), [[7, 8], [0, 0], [0, 0]]
+        )
+        metadata = prepared.adapter_metadata["u1"]
+        self.assertTrue(metadata["native_generated_image_commit"])
+        self.assertTrue(metadata["omit_image_start"])
+
+    def test_u1_generated_image_commit_tensor_preprocesses_without_resize(self):
+        tensor = torch.zeros(1, 3, 32, 32)
+
+        pixel_values, grid_hw = load_u1_generated_image_for_commit(
+            tensor,
+            patch_size=16,
+        )
+
+        self.assertEqual(tuple(pixel_values.shape), (4, 768))
+        self.assertEqual(grid_hw.tolist(), [[2, 2]])
+
     def test_u1_runtime_prefill_records_u_context_state_without_kv_details(self):
         adapter = U1UGModelAdapter()
         runtime = UGSessionRuntime(
@@ -539,6 +605,64 @@ class TestU1UGBackendShell(unittest.TestCase):
         self.assertTrue(u1_state["segments"][-1]["generated_image_commit"])
         self.assertEqual(u1_state["segments"][-1]["source"], "generated_image")
         self.assertFalse(_has_kv_allocator_detail(u1_state))
+
+    def test_u1_runtime_append_generated_image_uses_native_commit_when_available(self):
+        executor = FakePadAndDecodeExecutor([910])
+        adapter = U1UGModelAdapter(native_tokenizer=FakeU1Tokenizer())
+        runtime = UGSessionRuntime(
+            model_runner=UGModelRunnerAdapter(adapter),
+            session_controller=SessionController(FakeTreeCache()),
+            srt_request_executor=executor,
+            tokenizer=FakeTokenizer(),
+        )
+        handle = runtime.prefill_interleaved(
+            [UGInterleavedMessage(type="text", content="draw a cup")],
+            session_id="u1-native-commit-session",
+        )
+        g_handle = runtime.begin_g_denoise(handle)
+
+        updated = runtime.append_generated_image(
+            g_handle,
+            image=Image.new("RGB", (32, 32), (12, 34, 56)),
+        )
+
+        counters = runtime.get_debug_counters(updated)
+        u1_state = counters["ug_model_state"]["u1"]
+        self.assertEqual(updated.session_id, handle.session_id)
+        self.assertEqual(counters["append_image_count"], 1)
+        self.assertEqual(counters["srt_request_count"], 2)
+        self.assertEqual(executor.pad_call_count, 1)
+        self.assertEqual(u1_state["last_source"], "native_generated_image_commit")
+        self.assertTrue(u1_state["native_generated_image_commit"])
+        self.assertIsNotNone(executor.mrope_positions_by_request[-1])
+
+    def test_u1_post_image_decode_uses_srt_after_native_commit(self):
+        executor = FakePadAndDecodeExecutor([910])
+        adapter = U1UGModelAdapter(native_tokenizer=FakeU1Tokenizer())
+        runtime = UGSessionRuntime(
+            model_runner=UGModelRunnerAdapter(adapter),
+            session_controller=SessionController(FakeTreeCache()),
+            srt_request_executor=executor,
+            tokenizer=FakeTokenizer(),
+        )
+        bridge = _load_u1_bridge(runtime)
+        handle = runtime.prefill_interleaved(
+            [UGInterleavedMessage(type="text", content="draw a cup")],
+            session_id="u1-native-post-decode",
+        )
+        g_handle = runtime.begin_g_denoise(handle)
+        updated = runtime.append_generated_image(
+            g_handle,
+            image=Image.new("RGB", (32, 32), (12, 34, 56)),
+        )
+        contexts = _make_contexts(session=updated)
+
+        decoded = bridge.continue_u_decode(contexts=contexts)
+
+        counters = runtime.get_debug_counters(updated)
+        self.assertEqual(decoded.text, "native:910")
+        self.assertEqual(counters["srt_u_decode_request_count"], 1)
+        self.assertEqual(counters["srt_request_count"], 3)
 
     def test_u1_g_executor_declares_pixel_flow_requirement(self):
         executor = U1PixelFlowGSegmentExecutor()
@@ -761,6 +885,7 @@ class FakePadAndDecodeExecutor(FakeSRTDecodeExecutor):
         super().__init__(output_ids)
         self.pad_call_count = 0
         self.origin_input_ids_by_request = []
+        self.mrope_positions_by_request = []
 
     def pad_input_ids(self, input_ids, mm_inputs):
         self.pad_call_count += 1
@@ -769,6 +894,11 @@ class FakePadAndDecodeExecutor(FakeSRTDecodeExecutor):
 
     def execute_ug_request(self, *, record, req, state):
         self.origin_input_ids_by_request.append(list(req.origin_input_ids))
+        mm_inputs = getattr(req, "multimodal_inputs", None)
+        mrope_positions = getattr(mm_inputs, "mrope_positions", None)
+        if mrope_positions is not None:
+            mrope_positions = mrope_positions.clone()
+        self.mrope_positions_by_request.append(mrope_positions)
         super().execute_ug_request(record=record, req=req, state=state)
 
 
@@ -879,15 +1009,18 @@ def _load_u1_bridge(runtime):
     return U1SRTBackedUGMiddleBridge(runtime)
 
 
-def _make_contexts():
-    session = UGSessionHandle(
-        session_id="u1-test-session",
-        anchor_request_id="u1-test-session:0",
-        context_length=1,
-        context_version=1,
-    )
+def _make_contexts(session=None):
+    if session is None:
+        session = UGSessionHandle(
+            session_id="u1-test-session",
+            anchor_request_id="u1-test-session:0",
+            context_length=1,
+            context_version=1,
+        )
     return UGContextBundle(
-        full=UGContextHandle("u1-test-session:0", 1, session=session),
+        full=UGContextHandle(
+            session.anchor_request_id, session.context_length, session=session
+        ),
         text_cfg=UGContextHandle("u1-test-session:text", 0, session=session),
         image_cfg=UGContextHandle("u1-test-session:image", 0, session=session),
     )
