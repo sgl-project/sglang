@@ -4,6 +4,11 @@ on:
     tags:
       - 'v[0-9]+.*'
   workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release version to publish (e.g. v0.5.11). Overrides setuptools-scm.'
+        required: true
+        type: string
 
 jobs:
   publish:
@@ -27,10 +32,19 @@ jobs:
         run: sudo bash scripts/ci/utils/install_protoc.sh
 
       - name: Build wheel
+        env:
+          # When triggered manually, pin the wheel version to the supplied
+          # input (strip leading `v`) so setuptools-scm doesn't derive a
+          # `.devN+gHASH` version from the branch HEAD.
+          RELEASE_VERSION: ${{ inputs.version }}
         run: |
           cd python
           cp ../README.md ../LICENSE .
           pip install build wheel setuptools setuptools-scm
+          if [ -n "$RELEASE_VERSION" ]; then
+            export SETUPTOOLS_SCM_PRETEND_VERSION="${RELEASE_VERSION#v}"
+            echo "Pinning wheel version to $SETUPTOOLS_SCM_PRETEND_VERSION"
+          fi
           python3 -m build --wheel
 
       # PyPI rejects plain `linux_x86_64` platform tags; auditwheel rewrites
