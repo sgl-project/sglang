@@ -27,6 +27,11 @@ _is_npu = is_npu()
 _is_fp8_fnuz = is_fp8_fnuz()
 if _is_cuda:
     try:
+        _sm = get_device_sm()
+        if _sm == 120:
+            # SM120 (consumer Blackwell) lacks tcgen05/WGMMA instructions
+            # required by DeepGEMM kernels; skip import to avoid JIT errors
+            raise ImportError("DeepGEMM unsupported on SM120")
         import deep_gemm
     except ImportError as e:
         deep_gemm = e
@@ -173,7 +178,7 @@ class Indexer(MultiPlatformOp):
         else:
             self.cp_size = None
             self.cp_rank = None
-        if _is_cuda:
+        if _is_cuda and not isinstance(deep_gemm, ImportError):
             self.sm_count = deep_gemm.get_num_sms()
             self.half_device_sm_count = ceil_align(self.sm_count // 2, 8)
             pp_size = get_global_server_args().pp_size
