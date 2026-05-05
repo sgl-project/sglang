@@ -153,8 +153,6 @@ class Gemma4MTPGSM8KMixin:
             "triton",
             "--dtype",
             "bfloat16",
-            "--mem-fraction-static",
-            "0.55",
             "--max-running-requests",
             str(cls._max_running_requests()),
             "--context-length",
