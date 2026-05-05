@@ -115,7 +115,7 @@ HiCache encapsulates all read, write, and query operations on L3 backends within
 
 - **HiCacheFile**: A simple file-based storage backend for demonstration purposes.
 
-Specifically, **LMCache**, an efficient KV cache layer for enterprise-scale LLM inference, provides an alternative solution to HiCache. Try LMCache [here](https://github.com/sgl-project/sglang/tree/main/python/sglang/srt/mem_cache/storage/lmcache). LMCache supports two transport modes: an in-process layerwise connector (default) and a multi-process daemon connector enabled by `--lmcache-mp-host`. The daemon mode lets the cache outlive the SGLang process and be shared across instances.
+Specifically, **LMCache**, an efficient KV cache layer for enterprise-scale LLM inference, provides an alternative solution to HiCache. Try LMCache [here](https://github.com/sgl-project/sglang/tree/main/python/sglang/srt/mem_cache/storage/lmcache).
 
 ## Related Parameters
 

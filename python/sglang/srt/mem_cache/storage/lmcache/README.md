@@ -71,8 +71,3 @@ python -m sglang.launch_server \
 ```
 
 Setting `--lmcache-mp-host` is the trigger that switches connectors. When unset, SGLang uses Mode A.
-
-### When to pick which
-
-- **Mode A** has lower per-request overhead and is the simplest setup; pick it when the cache only needs to live as long as the server.
-- **Mode B** decouples cache lifetime from server lifetime, lets multiple SGLang instances share the same store, and avoids losing the cache on restart; pick it when those properties matter.
