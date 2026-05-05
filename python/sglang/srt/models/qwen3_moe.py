@@ -84,7 +84,6 @@ from sglang.srt.server_args import get_global_server_args
 from sglang.srt.true_on_policy import (
     get_moe_topk_tiebreak,
     get_on_policy_rms_norm_kwargs,
-    should_disable_fused_qk_norm_mrope,
     should_use_deterministic_moe_combine,
     should_use_deterministic_moe_routing,
 )
@@ -102,7 +101,6 @@ _is_cuda = is_cuda()
 
 if _is_cuda:
     from sglang.jit_kernel.fused_qknorm_rope import (
-        can_use_fused_qk_norm_rope,
         fused_qk_norm_rope,
     )
 
@@ -335,16 +333,15 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         # router_logits: (num_tokens, n_experts)
         router_hidden_states = hidden_states
         gate_weight = getattr(self.gate, "weight", None)
-        if (
-            gate_weight is not None
-            and router_hidden_states.dtype != gate_weight.dtype
-        ):
+        if gate_weight is not None and router_hidden_states.dtype != gate_weight.dtype:
             router_hidden_states = router_hidden_states.to(gate_weight.dtype)
         router_logits, _ = self.gate(router_hidden_states)
         if should_use_deterministic_moe_routing():
             routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
             if get_moe_topk_tiebreak() == "stable_sort":
-                routing_weights, selected_experts = _stable_topk(routing_weights, self.top_k)
+                routing_weights, selected_experts = _stable_topk(
+                    routing_weights, self.top_k
+                )
             else:
                 routing_weights, selected_experts = torch.topk(
                     routing_weights, self.top_k, dim=-1
@@ -374,9 +371,13 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             and not use_reduce_scatter
         ):
             if should_use_deterministic_moe_combine():
-                final_hidden_states = moe_expert_parallel_tree_all_reduce(final_hidden_states)
+                final_hidden_states = moe_expert_parallel_tree_all_reduce(
+                    final_hidden_states
+                )
             else:
-                final_hidden_states = moe_expert_parallel_all_reduce(final_hidden_states)
+                final_hidden_states = moe_expert_parallel_all_reduce(
+                    final_hidden_states
+                )
 
         if (
             self.tp_size > 1
@@ -557,24 +558,11 @@ class Qwen3MoeAttention(nn.Module):
             rope_scaling=rope_scaling,
             dual_chunk_attention_config=dual_chunk_attention_config,
         )
-        # Keep the standard off-policy Qwen3-MoE decode path unchanged. The
-        # parity work only needs to disable these fused paths for true-on-policy;
-        # enabling them here changes generation-time logprobs relative to the
-        # previous off-policy baseline.
         self.compatible_with_fused_kv_buffer = False
         self.compatible_with_fused_qk_norm_rope = False
-        _yarn_factor, _, _, _ = compute_yarn_parameters(config)
         self.use_fused_qk_norm_rope = (
             get_global_server_args().enable_fused_qk_norm_rope
             and self.compatible_with_fused_qk_norm_rope
-            and _is_cuda
-            and can_use_fused_qk_norm_rope(
-                self.head_dim,
-                self.rotary_emb.is_neox_style,
-                torch.bfloat16,
-                _yarn_factor != 1.0,
-            )
-            and not should_disable_fused_qk_norm_mrope()
         )
         self._used_fused_qk_norm_rope_last_call = False
 

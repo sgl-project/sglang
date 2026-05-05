@@ -67,13 +67,10 @@ class DpPaddingMode(IntEnum):
         dp_size = get_attention_dp_size()
 
         if dp_size > 1:
-            try:
-                from sglang.srt.true_on_policy import is_true_on_policy_enabled
+            from sglang.srt.true_on_policy import is_true_on_policy_enabled
 
-                if is_true_on_policy_enabled():
-                    return cls.MAX_LEN
-            except Exception:
-                pass
+            if is_true_on_policy_enabled():
+                return cls.MAX_LEN
 
         # When is_extend_in_batch and dp_size > 1, use SUM_LEN to avoid padding
         # overhead from uneven token distribution.

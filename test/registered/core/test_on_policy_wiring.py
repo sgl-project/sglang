@@ -208,6 +208,7 @@ class TestOnPolicyServerArgs(unittest.TestCase):
         )
         self.assertFalse(result["enable_flashinfer_allreduce_fusion"])
 
+
 class TestDefaultPathUnchanged(unittest.TestCase):
     """Default serving must not enter true-on-policy policy paths."""
 
@@ -268,7 +269,9 @@ class TestOnPolicyHelpers(unittest.TestCase):
             ep_size=1,
         )
 
-    def _moe_contract_args(self, *, tp_size: int = 1, ep_size: int = 1) -> SimpleNamespace:
+    def _moe_contract_args(
+        self, *, tp_size: int = 1, ep_size: int = 1
+    ) -> SimpleNamespace:
         return SimpleNamespace(
             true_on_policy_contract=QWEN3_MOE_TRUE_ON_POLICY_V1,
             tp_size=tp_size,
@@ -349,7 +352,9 @@ class TestOnPolicyHelpers(unittest.TestCase):
         attn_backend = SimpleNamespace(num_splits=7)
 
         self.assertTrue(is_true_on_policy_enabled(server_args))
-        self.assertTrue(should_use_tp_invariant_row_linear(256, server_args=server_args))
+        self.assertTrue(
+            should_use_tp_invariant_row_linear(256, server_args=server_args)
+        )
         self.assertTrue(should_use_deterministic_moe_routing(server_args))
 
         with patch_prefill_only_deterministic_inference_for_cuda_graph(
@@ -427,7 +432,9 @@ class TestOnPolicyHelpers(unittest.TestCase):
                 self._moe_contract_args(tp_size=1, ep_size=4)
             )
         )
-        self.assertEqual(get_moe_topk_tiebreak(self._moe_contract_args()), "stable_sort")
+        self.assertEqual(
+            get_moe_topk_tiebreak(self._moe_contract_args()), "stable_sort"
+        )
 
     def test_qwen3_moe_rollout_tp_still_enables_tp_policy_values(self):
         policy = resolve_true_on_policy_runtime_policy(
@@ -478,7 +485,9 @@ class TestOnPolicyHelpers(unittest.TestCase):
             from sglang.srt.layers import dp_attention
         except ModuleNotFoundError as exc:
             if exc.name == "openai":
-                self.skipTest("openai dependency is unavailable in this CPU test environment")
+                self.skipTest(
+                    "openai dependency is unavailable in this CPU test environment"
+                )
             raise
 
         with (
@@ -542,7 +551,9 @@ class TestOnPolicyHelpers(unittest.TestCase):
             )
         except ModuleNotFoundError as exc:
             if exc.name == "openai":
-                self.skipTest("openai dependency is unavailable in this CPU test environment")
+                self.skipTest(
+                    "openai dependency is unavailable in this CPU test environment"
+                )
             raise
 
         batch = ForwardBatch(
@@ -605,7 +616,9 @@ class TestOnPolicyHelpers(unittest.TestCase):
             from sglang.srt.layers.dp_attention import DpPaddingMode
         except ModuleNotFoundError as exc:
             if exc.name == "openai":
-                self.skipTest("openai dependency is unavailable in this CPU test environment")
+                self.skipTest(
+                    "openai dependency is unavailable in this CPU test environment"
+                )
             raise
 
         communicator = object.__new__(LayerCommunicator)
@@ -649,9 +662,7 @@ class TestOnPolicyHelpers(unittest.TestCase):
         )
         self.assertFalse(
             should_disable_reduce_scatter_for_on_policy(
-                SimpleNamespace(
-                    true_on_policy_contract=None, tp_size=1
-                )
+                SimpleNamespace(true_on_policy_contract=None, tp_size=1)
             )
         )
 
@@ -923,9 +934,7 @@ class TestOnPolicyHelpers(unittest.TestCase):
         )
         self.assertFalse(
             should_disable_flashinfer_allreduce_fusion(
-                SimpleNamespace(
-                    true_on_policy_contract=None, tp_size=1
-                )
+                SimpleNamespace(true_on_policy_contract=None, tp_size=1)
             )
         )
 
@@ -935,9 +944,7 @@ class TestOnPolicyHelpers(unittest.TestCase):
         )
         self.assertFalse(
             should_disable_fused_qk_norm_mrope(
-                SimpleNamespace(
-                    true_on_policy_contract=None, tp_size=1
-                )
+                SimpleNamespace(true_on_policy_contract=None, tp_size=1)
             )
         )
 
@@ -946,9 +953,7 @@ class TestOnPolicyHelpers(unittest.TestCase):
         self.assertTrue(is_true_on_policy_enabled(self._contract_args(tp_size=2)))
         self.assertFalse(
             is_true_on_policy_enabled(
-                SimpleNamespace(
-                    true_on_policy_contract=None, tp_size=1
-                )
+                SimpleNamespace(true_on_policy_contract=None, tp_size=1)
             )
         )
 
@@ -957,9 +962,7 @@ class TestOnPolicyHelpers(unittest.TestCase):
         self.assertFalse(is_tp_invariant_target(self._contract_args(tp_size=1)))
         self.assertFalse(
             is_tp_invariant_target(
-                SimpleNamespace(
-                    true_on_policy_contract=None, tp_size=1
-                )
+                SimpleNamespace(true_on_policy_contract=None, tp_size=1)
             )
         )
 
@@ -1015,7 +1018,9 @@ class TestOnPolicyLinearWiring(unittest.TestCase):
             from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
         except ModuleNotFoundError as exc:
             if exc.name == "openai":
-                self.skipTest("openai dependency is unavailable in this CPU test environment")
+                self.skipTest(
+                    "openai dependency is unavailable in this CPU test environment"
+                )
             raise
 
         method = UnquantizedLinearMethod()
@@ -1023,29 +1028,26 @@ class TestOnPolicyLinearWiring(unittest.TestCase):
         x = torch.empty(4, 2)
         sentinel = torch.empty(4, 3)
 
-        with patch.object(
-            unquant_module, "_should_use_batch_invariant_linear", return_value=True
-        ), patch.object(
-            unquant_module, "_apply_batch_invariant_linear", return_value=sentinel
-        ) as apply_batch_invariant_linear:
+        with (
+            patch.object(
+                unquant_module, "_should_use_batch_invariant_linear", return_value=True
+            ),
+            patch(
+                "sglang.srt.batch_invariant_ops.batch_invariant_linear",
+                return_value=sentinel,
+            ) as mock_bi_linear,
+        ):
             output = method.apply(layer, x)
 
         self.assertEqual(output.data_ptr(), sentinel.data_ptr())
         self.assertEqual(output.shape, sentinel.shape)
-        apply_batch_invariant_linear.assert_called_once_with(layer, x, None)
+        mock_bi_linear.assert_called_once_with(x, layer.weight, None)
 
     def test_batch_invariant_linear_casts_weight_to_input_dtype(self):
-        try:
-            from sglang.srt.layers.quantization import unquant as unquant_module
-        except ModuleNotFoundError as exc:
-            if exc.name == "openai":
-                self.skipTest("openai dependency is unavailable in this CPU test environment")
-            raise
+        from sglang.srt.batch_invariant_ops import batch_invariant_linear
 
-        layer = SimpleNamespace(
-            weight=torch.tensor(
-                [[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]], dtype=torch.bfloat16
-            )
+        weight = torch.tensor(
+            [[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]], dtype=torch.bfloat16
         )
         x = torch.tensor(
             [[1.0, 2.0], [3.0, 4.0], [5.0, 6.0], [7.0, 8.0]],
@@ -1054,22 +1056,17 @@ class TestOnPolicyLinearWiring(unittest.TestCase):
 
         with patch(
             "sglang.srt.batch_invariant_ops.batch_invariant_ops.matmul_persistent",
-            side_effect=AssertionError("fp32 router linears must not JIT persistent matmul"),
+            side_effect=AssertionError("fp32 must not use persistent matmul"),
         ):
-            output = unquant_module._apply_batch_invariant_linear(layer, x, None)
+            output = batch_invariant_linear(x, weight, None)
 
         self.assertEqual(output.dtype, torch.float32)
-        torch.testing.assert_close(output, torch.einsum("bi,oi->bo", x, layer.weight.float()))
+        torch.testing.assert_close(output, torch.einsum("bi,oi->bo", x, weight.float()))
 
     def test_batch_invariant_linear_uses_persistent_for_non_fp32(self):
-        try:
-            from sglang.srt.layers.quantization import unquant as unquant_module
-        except ModuleNotFoundError as exc:
-            if exc.name == "openai":
-                self.skipTest("openai dependency is unavailable in this CPU test environment")
-            raise
+        from sglang.srt.batch_invariant_ops import batch_invariant_linear
 
-        layer = SimpleNamespace(weight=torch.empty(3, 2, dtype=torch.bfloat16))
+        weight = torch.empty(3, 2, dtype=torch.bfloat16)
         x = torch.empty(4, 2, dtype=torch.bfloat16)
         sentinel = torch.empty(4, 3, dtype=torch.bfloat16)
 
@@ -1083,7 +1080,7 @@ class TestOnPolicyLinearWiring(unittest.TestCase):
             "sglang.srt.batch_invariant_ops.batch_invariant_ops.matmul_persistent",
             side_effect=fake_matmul,
         ):
-            output = unquant_module._apply_batch_invariant_linear(layer, x, None)
+            output = batch_invariant_linear(x, weight, None)
 
         self.assertEqual(output.data_ptr(), sentinel.data_ptr())
         self.assertEqual(output.shape, sentinel.shape)

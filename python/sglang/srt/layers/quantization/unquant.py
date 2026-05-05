@@ -73,39 +73,6 @@ def _should_use_batch_invariant_linear(x: torch.Tensor) -> bool:
     return is_batch_invariant_mode_enabled()
 
 
-def _apply_batch_invariant_linear(
-    layer: torch.nn.Module,
-    x: torch.Tensor,
-    bias: Optional[torch.Tensor],
-) -> torch.Tensor:
-    from sglang.srt.batch_invariant_ops import (
-        disable_batch_invariant_mode,
-        enable_batch_invariant_mode,
-        is_batch_invariant_mode_enabled,
-    )
-    from sglang.srt.batch_invariant_ops.batch_invariant_ops import matmul_persistent
-
-    x_shape = x.shape
-    x_2d = x.reshape(-1, x_shape[-1])
-    weight = layer.weight
-    if weight.dtype != x_2d.dtype:
-        weight = weight.to(x_2d.dtype)
-    if bias is not None and bias.dtype != x_2d.dtype:
-        bias = bias.to(x_2d.dtype)
-    if x_2d.dtype == torch.float32:
-        mode_was_enabled = is_batch_invariant_mode_enabled()
-        if mode_was_enabled:
-            disable_batch_invariant_mode()
-        try:
-            output = F.linear(x_2d, weight, bias)
-        finally:
-            if mode_was_enabled:
-                enable_batch_invariant_mode()
-    else:
-        output = matmul_persistent(x_2d, weight.t(), bias)
-    return output.reshape(*x_shape[:-1], layer.weight.shape[0])
-
-
 class UnquantizedEmbeddingMethod(QuantizeMethodBase):
     """Unquantized method for embeddings."""
 
@@ -197,7 +164,9 @@ class UnquantizedLinearMethod(LinearMethodBase):
             return tgemm.mm(x, layer.weight, bias, otype=x.dtype)
 
         if _should_use_batch_invariant_linear(x):
-            return _apply_batch_invariant_linear(layer, x, bias)
+            from sglang.srt.batch_invariant_ops import batch_invariant_linear
+
+            return batch_invariant_linear(x, layer.weight, bias)
 
         return F.linear(x, layer.weight, bias)
 
