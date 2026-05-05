@@ -173,6 +173,13 @@ EOF
 
   # Install accelerate for distributed training and inference support
   docker exec ci_sglang pip install --cache-dir=/sgl-data/pip-cache accelerate || echo "accelerate installation failed"
+
+  # torchcodec is imported at module load by the MiMoV2 multimodal processor.
+  # MiMo-V2.5-Pro is text-only but shares the MiMoV2ForCausalLM architecture with
+  # the multimodal V2.5 variant, so the processor still has to register on import.
+  # Without torchcodec the import fails silently and the server aborts with
+  # "No processor registered for architecture: ['MiMoV2ForCausalLM']".
+  docker exec ci_sglang pip install --cache-dir=/sgl-data/pip-cache torchcodec || echo "torchcodec installation failed"
 fi
 
 if [[ -n "${SKIP_AITER_BUILD}" ]]; then
