@@ -138,25 +138,6 @@ def _jit_compress_module(
 
 
 @cache_once
-def _jit_compress_module_v2_defensive(
-    head_dim: int,
-    dtype_in: torch.dtype,
-    dtype_out: torch.dtype,
-) -> Module:
-    args = make_cpp_args(head_dim, dtype_in, dtype_out, is_arch_support_pdl())
-    kernel_class = f"FlashCompress128Kernel<{args}>"
-    return load_jit(
-        make_name("compress_128_v2_defensive"),
-        *args,
-        cuda_files=["deepseek_v4/c128_v2.cuh"],
-        cuda_wrappers=[
-            ("prefill", f"{kernel_class}::run_prefill"),
-        ],
-        extra_cuda_cflags=["-use_fast_math"],
-    )
-
-
-@cache_once
 def _jit_rmsnorm_head_module(head_dim: int, dtype: torch.dtype):
     args = make_cpp_args(head_dim, dtype, is_arch_support_pdl())
     kernel_class = f"RMSNormKernel<{args}>"
@@ -278,40 +259,6 @@ def _jit_silu_and_mul_clamp_module(dtype: torch.dtype) -> Module:
         cuda_files=["deepseek_v4/silu_and_mul_masked_post_quant.cuh"],
         cuda_wrappers=[("run", f"SiluAndMulClampKernel<{args}>::run")],
         extra_cuda_cflags=["-use_fast_math"],
-    )
-
-
-# ---------------------------------------------------------------------------
-# Byte-equal fallbacks: when SGLANG_OPT_FIX_MEGA_MOE_MEMORY is off, route
-# silu_and_mul_masked_post_quant / silu_and_mul_clamp through these _tmp
-# modules, which load a copy of the optimize-branch kernel (different
-# precision behavior ??? bf16 silu roundtrip, expf, fp32 clamp).
-# ---------------------------------------------------------------------------
-
-
-@cache_once
-def _jit_silu_mul_quant_tmp_module(
-    quant_group_size: int, scale_ue8m0: bool, apply_swiglu_limit: bool
-) -> Module:
-    args = make_cpp_args(
-        quant_group_size, scale_ue8m0, is_arch_support_pdl(), apply_swiglu_limit
-    )
-    return load_jit(
-        make_name("silu_mul_quant_tmp"),
-        *args,
-        cuda_files=["deepseek_v4/silu_and_mul_masked_post_quant_tmp.cuh"],
-        cuda_wrappers=[("run", f"SiluAndMulMaskedPostQuantKernel<{args}>::run")],
-    )
-
-
-@cache_once
-def _jit_silu_and_mul_clamp_tmp_module(dtype: torch.dtype) -> Module:
-    args = make_cpp_args(dtype, is_arch_support_pdl())
-    return load_jit(
-        make_name("silu_and_mul_clamp_tmp"),
-        *args,
-        cuda_files=["deepseek_v4/silu_and_mul_masked_post_quant_tmp.cuh"],
-        cuda_wrappers=[("run", f"SiluAndMulClampKernel<{args}>::run")],
     )
 
 
@@ -599,24 +546,9 @@ def compress_forward(
         out.dtype,
         compress_ratio,
     )
-    if plan.is_decode:
-        F = module.decode
-    elif compress_ratio == 128 and _should_use_c128_prefill_defensive():
-        F = _jit_compress_module_v2_defensive(
-            head_dim,
-            kv_score_input.dtype,
-            out.dtype,
-        ).prefill
-    else:
-        F = module.prefill
+    F = module.decode if plan.is_decode else module.prefill
     F(kv_score_buffer, kv_score_input, out, ape, indices, *plan[1:], extra_data)
     return out
-
-
-def _should_use_c128_prefill_defensive() -> bool:
-    from sglang.srt.environ import envs
-
-    return envs.SGLANG_HANDLE_C128_PREFILL_KERNEL.get()
 
 
 def compress_fused_norm_rope_inplace(
@@ -801,15 +733,7 @@ def silu_and_mul_clamp(
     output: torch.Tensor,
     swiglu_limit: float,
 ) -> None:
-    # Fallback path is hacky on purpose: when the mega-moe-memory flag is off
-    # we must be bitwise-identical to the optimize branch, which used the
-    # pre-refactor kernel.
-    from sglang.srt.environ import envs
-
-    if envs.SGLANG_OPT_FIX_MEGA_MOE_MEMORY.get():
-        module = _jit_silu_and_mul_clamp_module(input.dtype)
-    else:
-        module = _jit_silu_and_mul_clamp_tmp_module(input.dtype)
+    module = _jit_silu_and_mul_clamp_module(input.dtype)
     module.run(input, output, float(swiglu_limit))
 
 
@@ -826,14 +750,9 @@ def silu_and_mul_masked_post_quant(
     swizzle: bool = False,
 ) -> None:
     apply_swiglu_limit = swiglu_limit is not None
-    if swizzle:
-        module = _jit_silu_mul_quant_varlen_module(
-            quant_group_size, scale_ue8m0, swizzle, apply_swiglu_limit
-        )
-    else:
-        module = _jit_silu_mul_quant_tmp_module(
-            quant_group_size, scale_ue8m0, apply_swiglu_limit
-        )
+    module = _jit_silu_mul_quant_varlen_module(
+        quant_group_size, scale_ue8m0, swizzle, apply_swiglu_limit
+    )
     module.run(
         input,
         output,
@@ -993,109 +912,3 @@ def _dispatch_bf16_fp32_backend(
         return z
     else:
         return torch.nn.functional.linear(x.float(), y.float())
-
-
-def _compile_one(*input_tuple) -> None:
-    name, job_fn, *args = input_tuple
-    print(f"Compiling {name}...", flush=True)
-    job_fn(*args)
-    print(f"Finished compiling {name}.", flush=True)
-
-
-def compile_aot():
-    c_dtype = torch.float32
-    jobs = [
-        ("cublas", _jit_torch_cublas_bf16_fp32),
-        ("common", _jit_common_module),
-        ("mask_topk", _jit_mask_topk_module),
-        ("topk", _jit_topk_module),
-        ("topk_v2", _jit_topk_v2_module),
-        ("hash_topk", _jit_hash_topk_module),
-        ("rope", _jit_fused_rope_module),
-        ("metadata", _jit_metadata_module),
-        (
-            "compress_128_4",
-            _jit_compress_module,
-            128,
-            c_dtype,
-            c_dtype,
-            4,
-        ),
-        (
-            "compress_512_4",
-            _jit_compress_module,
-            512,
-            c_dtype,
-            c_dtype,
-            4,
-        ),
-        (
-            "compress_512_128",
-            _jit_compress_module,
-            512,
-            c_dtype,
-            c_dtype,
-            128,
-        ),
-        (
-            "norm_rope_128_64",
-            _jit_norm_rope_module,
-            c_dtype,
-            128,
-            64,
-        ),
-        (
-            "norm_rope_512_64",
-            _jit_norm_rope_module,
-            c_dtype,
-            512,
-            64,
-        ),
-        (
-            "store_flashmla_bf16_swa_256",
-            _jit_fused_store_module,
-            "flashmla",
-            torch.bfloat16,
-            torch.int32,
-            256,
-        ),
-        (
-            "store_flashmla_fp32_c4_64",
-            _jit_fused_store_module,
-            "flashmla",
-            torch.float32,
-            torch.int32,
-            64,
-        ),
-        (
-            "store_flashmla_fp32_c128_2",
-            _jit_fused_store_module,
-            "flashmla",
-            torch.float32,
-            torch.int32,
-            2,
-        ),
-        (
-            "store_indexer_fp32_c4_64",
-            _jit_fused_store_module,
-            "indexer",
-            torch.float32,
-            torch.int32,
-            64,
-        ),
-        (
-            "rmsnorm_head_512_bf16",
-            _jit_rmsnorm_head_module,
-            512,
-            torch.bfloat16,
-        ),
-    ]
-    import multiprocessing
-
-    max_parallel_jobs = min(len(jobs), multiprocessing.cpu_count())
-    with multiprocessing.Pool(processes=max_parallel_jobs) as pool:
-        pool.starmap(_compile_one, jobs)
-
-
-if __name__ == "__main__":
-    compile_aot()
