@@ -82,29 +82,35 @@ class ModelImpl(str, Enum):
     MINDSPORE = "mindspore"
 
 
-def is_deepseek_nsa(config) -> bool:
-    architectures = (
+def _hf_arch(config) -> Optional[str]:
+    """First architecture from a HF config dict or PretrainedConfig (or None)."""
+    archs = (
         config.get("architectures")
         if isinstance(config, dict)
         else getattr(config, "architectures", None)
     )
-    index_topk = (
-        config.get("index_topk")
-        if isinstance(config, dict)
-        else getattr(config, "index_topk", None)
-    )
+    return archs[0] if archs else None
+
+
+def _hf_attr(config, name):
+    """Read an arbitrary field from a HF config dict or PretrainedConfig."""
+    if isinstance(config, dict):
+        return config.get(name)
+    return getattr(config, name, None)
+
+
+def is_deepseek_nsa(config) -> bool:
     return (
-        architectures is not None
-        and architectures[0]
-        in [
+        _hf_arch(config)
+        in (
             "DeepseekV3ForCausalLM",
             "DeepseekV32ForCausalLM",
             "DeepseekV3ForCausalLMNextN",
             "MistralLarge3ForCausalLM",
             "PixtralForConditionalGeneration",
             "GlmMoeDsaForCausalLM",
-        ]
-        and index_topk is not None
+        )
+        and _hf_attr(config, "index_topk") is not None
     )
 
 
@@ -968,10 +974,11 @@ class ModelConfig:
             return "fp8"  # Default fallback
 
     def _get_sliding_window_size(self) -> Optional[int]:
-        sliding_window_size = getattr(self.hf_text_config, "sliding_window_size", None)
-        if sliding_window_size is None:
-            sliding_window_size = getattr(self.hf_text_config, "sliding_window", None)
-        return sliding_window_size
+        for key in ("sliding_window_size", "sliding_window", "window_size"):
+            value = getattr(self.hf_text_config, key, None)
+            if value is not None:
+                return value
+        return None
 
     def _validate_quantize_and_serve_config(self):
         """Validate quantize_and_serve configuration."""
