@@ -14,8 +14,6 @@ _is_musa = is_musa()
 
 IS_CUSTOM_AR_AVAILABLE = _is_cuda or _is_hip or _is_musa
 IS_QUICK_AR_AVAILABLE = _is_hip
-# TODO(zyksir): mscclpp is untested on AMD and therefore disabled.
-IS_MSCCLPP_AR_AVAILABLE = _is_cuda
 
 try:
     import sgl_kernel.allreduce as _custom_ar
@@ -24,7 +22,6 @@ except ImportError as e:
         logger.warning("Failed to import from custom_ar with %r", e)
     IS_CUSTOM_AR_AVAILABLE = False
     IS_QUICK_AR_AVAILABLE = False
-    IS_MSCCLPP_AR_AVAILABLE = False
 
 # region IS_CUSTOM_AR_AVAILABLE
 
@@ -162,47 +159,6 @@ elif _is_hip:
 
     def qr_max_size() -> int:
         return _custom_ar.qr_max_size()
-
-
-# endregion
-
-# region IS_MSCCLPP_AR_AVAILABLE
-
-if not IS_MSCCLPP_AR_AVAILABLE:
-    pass
-
-elif _is_cuda:
-
-    def mscclpp_generate_unique_id() -> bytes:
-        return _custom_ar.mscclpp_generate_unique_id()
-
-    def mscclpp_init_context(
-        unique_id: bytes,
-        rank: int,
-        world_size: int,
-        scratch: torch.Tensor,
-        put_buffer: torch.Tensor,
-        nranks_per_node: int,
-        rank_to_node: List[int],
-        rank_to_ib: List[int],
-        context_selection: int,
-    ) -> int:
-        return _custom_ar.mscclpp_init_context(
-            unique_id,
-            rank,
-            world_size,
-            scratch,
-            put_buffer,
-            nranks_per_node,
-            rank_to_node,
-            rank_to_ib,
-            context_selection,
-        )
-
-    def mscclpp_allreduce(
-        context: int, inp: torch.Tensor, out: torch.Tensor, nthreads: int, nblocks: int
-    ) -> None:
-        return _custom_ar.mscclpp_allreduce(context, inp, out, nthreads, nblocks)
 
 
 # endregion
