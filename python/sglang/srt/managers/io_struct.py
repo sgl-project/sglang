@@ -1111,7 +1111,7 @@ class BatchTokenIDOutput(BaseBatchReq, SpeculativeDecodingMetricsMixin):
     # straight to TokenizerManager, which encodes on demand.
     routed_experts: List[Optional[torch.Tensor]]
 
-    indexer_topk: List[torch.Tensor]
+    indexer_topk: List[Optional[torch.Tensor]]
 
     # The information of placeholder tokens (e.g., image token)
     # idx is the index of the token in the prompt after expansion.
@@ -1176,7 +1176,7 @@ class BatchStrOutput(BaseBatchReq, SpeculativeDecodingMetricsMixin):
     # see BatchTokenIDOutput.routed_experts.
     routed_experts: List[Optional[str]]
 
-    indexer_topk: List[List[int]]
+    indexer_topk: List[Optional[str]]
 
     # The information of placeholder tokens (e.g., image token)
     # idx is the index of the token in the prompt after expansion.

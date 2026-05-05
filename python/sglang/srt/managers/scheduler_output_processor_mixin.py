@@ -7,11 +7,7 @@ import torch
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
-from sglang.srt.layers.attention.indexer_topk_capturer import (
-    get_global_indexer_capturer,
-)
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-from sglang.srt.layers.moe.routed_experts_capturer import get_global_experts_capturer
 from sglang.srt.managers.io_struct import (
     AbortReq,
     BatchEmbeddingOutput,
@@ -25,6 +21,10 @@ from sglang.srt.managers.schedule_batch import (
 )
 from sglang.srt.mem_cache.common import maybe_cache_unfinished_req, release_kv_cache
 from sglang.srt.server_args import MIS_DELIMITER_TOKEN_ID, get_global_server_args
+from sglang.srt.state_capturer.indexer_topk import (
+    get_global_indexer_capturer,
+)
+from sglang.srt.state_capturer.routed_experts import get_global_experts_capturer
 
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import (
@@ -109,7 +109,20 @@ class SchedulerOutputProcessorMixin:
 
     def maybe_collect_routed_experts(self: Scheduler, req: Req):
         """Collect routed experts for a finished request."""
-        req.routed_experts = get_global_experts_capturer().get_routed_experts(
+        capturer = get_global_experts_capturer()
+        if capturer is None:
+            return
+        req.routed_experts = capturer.get_topk(
+            req_pool_idx=req.req_pool_idx,
+            seqlen=req.seqlen,
+            req_to_token_pool=self.req_to_token_pool,
+        )
+
+    def maybe_collect_indexer_topk(self: Scheduler, req: Req):
+        capturer = get_global_indexer_capturer()
+        if capturer is None:
+            return
+        req.indexer_topk = capturer.get_topk(
             req_pool_idx=req.req_pool_idx,
             seqlen=req.seqlen,
             req_to_token_pool=self.req_to_token_pool,
@@ -153,6 +166,9 @@ class SchedulerOutputProcessorMixin:
             if result.routed_experts_output is not None:
                 result.routed_experts_output.finalize()
                 result.routed_experts_output = None
+            if result.indexer_topk_output is not None:
+                result.indexer_topk_output.finalize()
+                result.indexer_topk_output = None
 
             (
                 logits_output,
@@ -415,6 +431,9 @@ class SchedulerOutputProcessorMixin:
         if result.routed_experts_output is not None:
             result.routed_experts_output.finalize()
             result.routed_experts_output = None
+        if result.indexer_topk_output is not None:
+            result.indexer_topk_output.finalize()
+            result.indexer_topk_output = None
 
         logits_output, next_token_ids, can_run_cuda_graph = (
             result.logits_output,
