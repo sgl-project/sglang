@@ -238,7 +238,11 @@ class TestOffloadDefaults(unittest.TestCase):
     def test_auto_wan_layerwise_offload_does_not_disable_explicit_fsdp(self):
         args = self._from_dict_with_pipeline_config(
             WanT2V480PConfig(),
-            kwargs={"num_gpus": 2, "use_fsdp_inference": True},
+            kwargs={
+                "model_path": "Wan-AI/Wan2.1-T2V-1.3B-Diffusers",
+                "num_gpus": 2,
+                "use_fsdp_inference": True,
+            },
         )
 
         self.assertFalse(args.dit_layerwise_offload)
