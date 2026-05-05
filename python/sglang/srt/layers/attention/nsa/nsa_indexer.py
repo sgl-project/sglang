@@ -12,6 +12,9 @@ from sglang.jit_kernel.fused_store_index_cache import (
     fused_store_index_k_cache,
 )
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.indexer_topk_capturer import (
+    get_global_indexer_capturer,
+)
 from sglang.srt.layers.dp_attention import attn_tp_all_gather_into_tensor
 from sglang.srt.layers.layernorm import LayerNorm
 from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype, is_fp8_fnuz
@@ -1268,7 +1271,10 @@ class Indexer(MultiPlatformOp):
                         kv_len_next,
                         actual_seq_q_next,
                     )
-                    return torch.cat([topk_result_prev, topk_result_next], dim=0)
+                    return self._maybe_capture_topk(
+                        layer_id,
+                        torch.cat([topk_result_prev, topk_result_next], dim=0),
+                    )
                 else:
                     topk_result = self._get_topk_ragged(
                         enable_dual_stream,
@@ -1286,6 +1292,13 @@ class Indexer(MultiPlatformOp):
                 topk=self.index_topk,
                 layer_id=layer_id,
             )
+        return self._maybe_capture_topk(layer_id, topk_result)
+
+    def _maybe_capture_topk(
+        self, layer_id: int, topk_result: torch.Tensor
+    ) -> torch.Tensor:
+        if (cap := get_global_indexer_capturer()) is not None:
+            cap.capture(layer_id=layer_id, topk_indices=topk_result)
         return topk_result
 
     def forward_npu(

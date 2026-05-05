@@ -6,6 +6,9 @@ import torch
 
 from sglang.srt.compilation.piecewise_context_manager import is_in_piecewise_cuda_graph
 from sglang.srt.layers import deep_gemm_wrapper
+from sglang.srt.layers.attention.indexer_topk_capturer import (
+    get_global_indexer_capturer,
+)
 from sglang.srt.layers.attention.nsa.utils import nsa_use_prefill_cp
 from sglang.srt.layers.communicator import get_attn_tp_context
 from sglang.srt.layers.quantization.fp8_kernel import (
@@ -205,7 +208,12 @@ class DeepseekMLAForwardMixin:
                         layer_id=self.layer_id,
                     )
                 else:
+                    # skip_topk reuses prev layer's indices; mirror them into this
+                    # layer's slot so the captured buffer reflects the indices
+                    # actually used at this layer.
                     topk_indices = prev_topk_indices
+                    if (cap := get_global_indexer_capturer()) is not None:
+                        cap.capture(layer_id=self.layer_id, topk_indices=topk_indices)
                 current_stream.wait_stream(self.alt_stream)
             else:
                 k_nope = k_nope.unsqueeze(1)
@@ -221,6 +229,10 @@ class DeepseekMLAForwardMixin:
                         )
                     else:
                         topk_indices = prev_topk_indices
+                        if (cap := get_global_indexer_capturer()) is not None:
+                            cap.capture(
+                                layer_id=self.layer_id, topk_indices=topk_indices
+                            )
         else:
             q = self.q_proj(hidden_states)[0].view(
                 -1, self.num_local_heads, self.qk_head_dim

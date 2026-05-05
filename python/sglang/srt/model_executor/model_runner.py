@@ -55,7 +55,12 @@ from sglang.srt.configs import (
 from sglang.srt.configs.device_config import DeviceConfig
 from sglang.srt.configs.linear_attn_model_registry import get_linear_attn_config
 from sglang.srt.configs.load_config import LoadConfig, LoadFormat
-from sglang.srt.configs.model_config import AttentionArch, ModelConfig, ModelImpl
+from sglang.srt.configs.model_config import (
+    AttentionArch,
+    ModelConfig,
+    ModelImpl,
+    get_num_indexer_layers,
+)
 from sglang.srt.configs.update_config import adjust_config_with_unaligned_cpu_tp
 from sglang.srt.constants import GPU_MEMORY_TYPE_WEIGHTS
 from sglang.srt.debug_utils.dumper import dumper
@@ -104,6 +109,11 @@ from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.attention.attention_registry import (
     ATTENTION_BACKENDS,
     attn_backend_wrapper,
+)
+from sglang.srt.layers.attention.indexer_topk_capturer import (
+    create_indexer_capturer,
+    get_global_indexer_capturer,
+    set_global_indexer_capturer,
 )
 from sglang.srt.layers.attention.nsa.utils import is_nsa_enable_prefill_cp
 from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
@@ -306,6 +316,7 @@ class ModelRunnerOutput:
     can_run_graph: bool
     expert_distribution_metrics: Optional[ExpertDistributionMetrics] = None
     routed_experts_output: Optional[TopkCaptureOutput] = None
+    indexer_topk_output: Optional[TopkCaptureOutput] = None
 
 
 class ModelRunner(ModelRunnerKVCacheMixin):
@@ -750,6 +761,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # Init routed experts capturer
         self.init_routed_experts_capturer()
 
+        self.init_indexer_capturer()
+
         # TODO: Refactor device-specific init branches into platform interface (separate PR).
         # Must be called BEFORE init_device_graphs() so CUDA graph capture
         # runs with aux hidden state capture enabled.
@@ -816,6 +829,25 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 enable=get_global_server_args().enable_return_routed_experts,
                 model_config=self.model_config,
                 num_fused_shared_experts=num_fused_shared_experts,
+                num_tokens=self.max_total_num_tokens + self.page_size,
+                max_running_requests=self.max_running_requests,
+                device=self.device,
+            )
+        )
+
+    def init_indexer_capturer(self):
+        # Producer model exposes a non-zero num_indexer_layers (and a non-zero
+        # index_topk) to opt into capture. NSA models (V3.2) have one indexer
+        # per transformer layer; non-indexer models leave these at 0 and the
+        # capturer stays disabled.
+        hf_text_config = self.model_config.hf_text_config
+        num_indexer_layers = get_num_indexer_layers(hf_text_config)
+        index_topk = getattr(hf_text_config, "index_topk", 0)
+        set_global_indexer_capturer(
+            create_indexer_capturer(
+                enable=get_global_server_args().enable_return_indexer_topk,
+                num_indexer_layers=num_indexer_layers,
+                index_topk=index_topk,
                 num_tokens=self.max_total_num_tokens + self.page_size,
                 max_running_requests=self.max_running_requests,
                 device=self.device,
@@ -3221,6 +3253,14 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         no_copy_to_cpu = not self.server_args.disable_overlap_schedule
         if (experts_capturer := get_global_experts_capturer()) is not None:
             output.routed_experts_output = experts_capturer.on_forward_end(
+                forward_batch=forward_batch,
+                can_run_graph=output.can_run_graph,
+                cuda_graph_batch=getattr(self.graph_runner, "bs", None),
+                no_copy_to_cpu=no_copy_to_cpu,
+            )
+
+        if (indexer_capturer := get_global_indexer_capturer()) is not None:
+            output.indexer_topk_output = indexer_capturer.on_forward_end(
                 forward_batch=forward_batch,
                 can_run_graph=output.can_run_graph,
                 cuda_graph_batch=getattr(self.graph_runner, "bs", None),

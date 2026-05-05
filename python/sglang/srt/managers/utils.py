@@ -49,6 +49,7 @@ class GenerationBatchResult:
 
     # Routed experts: pending async D2H for overlap scheduling
     routed_experts_output: Optional[TopkCaptureOutput] = None
+    indexer_topk_output: Optional[TopkCaptureOutput] = None
 
     # metrics
     expert_distribution_metrics: Optional[ExpertDistributionMetrics] = None
@@ -93,6 +94,9 @@ class GenerationBatchResult:
 
         if self.routed_experts_output is not None:
             self.routed_experts_output.copy_to_cpu()
+
+        if self.indexer_topk_output is not None:
+            self.indexer_topk_output.copy_to_cpu()
 
         if (x := self.expert_distribution_metrics) is not None:
             x.copy_to_cpu()
