@@ -2,14 +2,12 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.utils import is_cuda
 
 _FLASHMLA_CREATE_KV_BLOCK_SIZE = 4096
 FLASHMLA_CREATE_KV_BLOCK_SIZE_TRITON = tl.constexpr(_FLASHMLA_CREATE_KV_BLOCK_SIZE)
 
 _is_cuda = is_cuda()
-fp8_dtype = torch.float8_e4m3fnuz if is_fp8_fnuz() else torch.float8_e4m3fn
 
 if _is_cuda:
     from sgl_kernel import concat_mla_absorb_q
@@ -422,12 +420,11 @@ def mla_quantize_and_rope_for_fp8(
 
         Returns:
             tuple: (merged_q_out, k_nope_out, k_rope_out) quantized to FP8
-                - merged_q_out: [seq_len, num_heads, kv_lora_rank + qk_rope_head_dim], dtype=fp8_dtype
-                - k_nope_out:   [seq_len, num_heads, kv_lora_rank], dtype=fp8_dtype
-                - k_rope_out:   [seq_len, num_heads, qk_rope_head_dim], dtype=fp8_dtype
-                  (fp8_dtype is torch.float8_e4m3fnuz on ROCm fnuz GPUs, else torch.float8_e4m3fn)
+                - merged_q_out: [seq_len, num_heads, kv_lora_rank + qk_rope_head_dim], dtype=torch.float8_e4m3fn
+                - k_nope_out:   [seq_len, num_heads, kv_lora_rank], dtype=torch.float8_e4m3fn
+                - k_rope_out:   [seq_len, num_heads, qk_rope_head_dim], dtype=torch.float8_e4m3fn
         """
-    attn_dtype = fp8_dtype
+    attn_dtype = torch.float8_e4m3fn
     q_len, num_heads = q_rope.shape[0], q_rope.shape[1]
 
     # Allocate output tensors with FP8 dtype
