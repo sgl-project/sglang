@@ -126,9 +126,10 @@ class AdaptiveSpeculativeParams:
         self.ema_accept_len = float(self.current_steps - 1)
         self._batch_count = 0
 
-        logger.info(
+        log_info_on_rank0(
+            logger,
             f"AdaptiveSpeculativeParams initialized: "
-            f"steps={self.current_steps}, candidate_steps={self.candidate_steps}"
+            f"steps={self.current_steps}, candidate_steps={self.candidate_steps}",
         )
 
     def update(self, num_accepted_drafts_per_req: list[int]) -> bool:
@@ -180,9 +181,10 @@ class AdaptiveSpeculativeParams:
 
         if target != old_steps:
             self.current_steps = target
-            logger.info(
+            log_info_on_rank0(
+                logger,
                 f"Adaptive spec params updated: steps {old_steps} -> {target} "
-                f"(ema_accept_len={self.ema_accept_len:.2f})"
+                f"(ema_accept_len={self.ema_accept_len:.2f})",
             )
             return True
         return False
