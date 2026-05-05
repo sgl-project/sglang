@@ -431,6 +431,7 @@ class Scheduler(
 
         # Launch a model worker and draft model worker if using speculative decoding
         self.init_model_worker()
+        self.install_device_timer_on_runners()
 
         if (t := envs.SGLANG_TEST_STUCK_SCHEDULER_INIT.get()) > 0:
             time.sleep(t)
@@ -708,18 +709,6 @@ class Scheduler(
             self.model_worker = self.tp_worker
         else:
             self.model_worker = self.draft_worker
-
-        # Install device timer on model runners for fwd occupancy tracking
-        if hasattr(self, "forward_pass_device_timer"):
-            timer = self.forward_pass_device_timer
-            self.tp_worker.model_runner.device_timer = timer
-            if self.draft_worker is not None:
-                dw = getattr(self.draft_worker, "draft_worker", None)
-                if dw is not None:
-                    if hasattr(dw, "draft_runner"):
-                        dw.draft_runner.device_timer = timer
-                    for r in getattr(dw, "draft_runner_list", []):
-                        r.device_timer = timer
 
         # Get token and memory info from the model worker
         (
@@ -2009,6 +1998,7 @@ class Scheduler(
                 require_reasoning=recv_req.require_reasoning,
                 return_hidden_states=recv_req.return_hidden_states,
                 return_routed_experts=recv_req.return_routed_experts,
+                return_indexer_topk=recv_req.return_indexer_topk,
                 eos_token_ids=self.model_config.hf_eos_token_id,
                 bootstrap_host=recv_req.bootstrap_host,
                 bootstrap_port=recv_req.bootstrap_port,
