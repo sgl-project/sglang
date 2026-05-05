@@ -378,6 +378,26 @@ class MoEGate(nn.Module):
 
 
 _MEGA_MOE_SYMM_BUFFER: dict = {}
+_MEGA_MOE_DG_ENV_APPLIED = False
+
+
+def _apply_mega_moe_dg_env() -> None:
+    """Forward sglang's FP4/MXF4 opt-in flags to DeepGEMM via env vars.
+
+    DeepGEMM reads `DG_USE_FP4_ACTS` (and `DG_USE_MXF4_KIND`) at host-function
+    call time — both `get_symm_buffer_for_mega_moe` and `fp8_fp4_mega_moe`.
+    Forwarding once at first use is sufficient (these are static config
+    flags, not per-request state) and matches the `setdefault` pattern so
+    explicit `DG_USE_*` overrides from outside still win.
+    """
+    global _MEGA_MOE_DG_ENV_APPLIED
+    if _MEGA_MOE_DG_ENV_APPLIED:
+        return
+    if envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_FP4_ACTS.get():
+        os.environ.setdefault("DG_USE_FP4_ACTS", "1")
+    if envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_MXF4_KIND.get():
+        os.environ.setdefault("DG_USE_MXF4_KIND", "1")
+    _MEGA_MOE_DG_ENV_APPLIED = True
 
 
 def _get_mega_moe_symm_buffer(
@@ -389,6 +409,8 @@ def _get_mega_moe_symm_buffer(
     intermediate_hidden: int,
 ) -> SymmBuffer:
     import deep_gemm
+
+    _apply_mega_moe_dg_env()
 
     key = (
         id(group),
@@ -1218,9 +1240,8 @@ class DeepseekV2MoE(nn.Module):
         )
 
         padded_max = buf.topk_idx.shape[0]
+        use_fp4_acts = envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_FP4_ACTS.get()
         if envs.SGLANG_OPT_MEGA_MOE_FUSED_PRE_DISPATCH.get():
-            from sglang.jit_kernel.deepseek_v4 import mega_moe_pre_dispatch
-
             if num_tokens > 0:
                 topk_ids_in = topk_ids
                 topk_weights_in = topk_weights
@@ -1229,7 +1250,7 @@ class DeepseekV2MoE(nn.Module):
                 topk_weights_in = hidden_states.new_empty(
                     (0, top_k), dtype=torch.float32
                 )
-            mega_moe_pre_dispatch(
+            deep_gemm.mega_moe_pre_dispatch(
                 hidden_states,
                 topk_ids_in,
                 topk_weights_in,
@@ -1237,14 +1258,23 @@ class DeepseekV2MoE(nn.Module):
                 buf.x_sf,
                 buf.topk_idx,
                 buf.topk_weights,
-                quant_group_size=32,
+                num_tokens=num_tokens,
+                group_size=32,
+                use_fp4_acts=use_fp4_acts,
             )
         else:
             if num_tokens > 0:
-                x_fp8, x_sf = sglang_per_token_group_quant_fp8_ue8m0(
-                    hidden_states, group_size=32
-                )
-                buf.x[:num_tokens].copy_(x_fp8)
+                if use_fp4_acts:
+                    from deep_gemm.utils import per_token_cast_to_fp4
+                    x_q, x_sf = per_token_cast_to_fp4(
+                        hidden_states, use_ue8m0=True, gran_k=32,
+                        use_packed_ue8m0=True,
+                    )
+                else:
+                    x_q, x_sf = sglang_per_token_group_quant_fp8_ue8m0(
+                        hidden_states, group_size=32
+                    )
+                buf.x[:num_tokens].copy_(x_q)
                 buf.x_sf[:num_tokens].copy_(x_sf)
                 buf.topk_idx[:num_tokens].copy_(topk_ids)
                 buf.topk_weights[:num_tokens].copy_(topk_weights)
