@@ -54,7 +54,6 @@ if _is_cuda or _is_xpu or _is_musa:
     if _is_flashinfer_available:
         try:
             from flashinfer.norm import layernorm
-            from flashinfer.norm import rmsnorm as fi_rmsnorm
 
             _flashinfer_layernorm_available = True
         except (ImportError, AttributeError):
@@ -214,9 +213,6 @@ class RMSNorm(MultiPlatformOp):
                     residual = residual + post_residual_addition
                 return x, residual
             return x
-        if envs.SGLANG_OPT_USE_FLASHINFER_NORM.get():
-            return fi_rmsnorm(x, self.weight, self.variance_epsilon)
-
         # sgl_kernel rmsnorm requires 2D input; reshape higher-rank tensors
         needs_reshape = x.dim() != 2 and residual is None
         if needs_reshape:

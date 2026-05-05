@@ -617,10 +617,6 @@ class Envs:
     SGLANG_FIX_ATTN_BACKEND_IDLE = EnvBool(True)
     SGLANG_FIX_PD_IDLE = EnvBool(True)
 
-    # Dangerous untested flags
-    SGLANG_OPT_USE_FAST_MASK_EP = EnvBool(False)
-    SGLANG_OPT_USE_FLASHINFER_NORM = EnvBool(False)
-
     # Symmetric Memory
     SGLANG_SYMM_MEM_PREALLOC_GB_SIZE = EnvInt(-1)
     SGLANG_DEBUG_SYMM_MEM = EnvBool(False)
