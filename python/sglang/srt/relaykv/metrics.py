@@ -6192,6 +6192,376 @@ def summarize_relaykv_actual_req_to_token_pool_adapter_payloads_for_smoke(
     }
 
 
+def _copy_relaykv_metadata_value_for_smoke(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {
+            key: _copy_relaykv_metadata_value_for_smoke(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_copy_relaykv_metadata_value_for_smoke(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_copy_relaykv_metadata_value_for_smoke(item) for item in value)
+    return value
+
+
+def _relaykv_smoke_first_present_value(
+    payload: Mapping[str, Any],
+    *keys: str,
+) -> Any:
+    for key in keys:
+        if key in payload:
+            value = payload.get(key)
+            if value is not None:
+                return value
+    return None
+
+
+def _relaykv_smoke_first_span(
+    payload: Mapping[str, Any],
+) -> Mapping[str, Any] | None:
+    for key in (
+        "relaykv_working_block_spans",
+        "full_kv_block_spans",
+        "relaykv_working_req_to_token_spans",
+        "full_kv_req_to_token_spans",
+    ):
+        value = payload.get(key)
+        if isinstance(value, (list, tuple)) and value:
+            first_item = value[0]
+            if isinstance(first_item, Mapping):
+                return first_item
+    return None
+
+
+def _relaykv_smoke_token_span_from_value(value: Any) -> list[int] | None:
+    if (
+        isinstance(value, (list, tuple))
+        and len(value) == 2
+        and isinstance(value[0], int)
+        and not isinstance(value[0], bool)
+        and isinstance(value[1], int)
+        and not isinstance(value[1], bool)
+    ):
+        return [value[0], value[1]]
+    return None
+
+
+def _relaykv_smoke_logical_block_id(payload: Mapping[str, Any]) -> Any:
+    logical_block_id = _relaykv_smoke_first_present_value(
+        payload,
+        "logical_block_id",
+        "block_id",
+    )
+    if logical_block_id is not None:
+        return logical_block_id
+
+    span = _relaykv_smoke_first_span(payload)
+    if span is not None:
+        block_id = _relaykv_smoke_first_present_value(span, "logical_block_id", "block_id")
+        if block_id is not None:
+            return block_id
+
+    for key in ("relaykv_working_kv_block_ids", "full_kv_block_ids"):
+        value = payload.get(key)
+        if isinstance(value, (list, tuple)) and value:
+            return value[0]
+    return None
+
+
+def _relaykv_smoke_token_span(payload: Mapping[str, Any]) -> list[int] | None:
+    token_span = _relaykv_smoke_token_span_from_value(payload.get("token_span"))
+    if token_span is not None:
+        return token_span
+
+    span = _relaykv_smoke_first_span(payload)
+    if span is None:
+        return None
+
+    token_start = _relaykv_smoke_first_present_value(span, "token_start", "start_token")
+    token_end = _relaykv_smoke_first_present_value(span, "token_end", "end_token")
+    if (
+        isinstance(token_start, int)
+        and not isinstance(token_start, bool)
+        and isinstance(token_end, int)
+        and not isinstance(token_end, bool)
+    ):
+        return [token_start, token_end]
+
+    return _relaykv_smoke_token_span_from_value(span.get("token_span"))
+
+
+def _relaykv_smoke_adapter_metadata(
+    payload: Mapping[str, Any],
+) -> dict[str, Any]:
+    adapter_metadata: dict[str, Any] = {}
+    for key in (
+        "request_id",
+        "req_pool_idx",
+        "seq_len",
+        "pool_source_path",
+        "req_to_token_source",
+        "req_to_token_backing_type",
+        "req_to_token_shape",
+        "req_to_token_device",
+        "req_to_token_dtype",
+    ):
+        if key in payload:
+            adapter_metadata[key] = _copy_relaykv_metadata_value_for_smoke(payload[key])
+    return adapter_metadata
+
+
+def _relaykv_smoke_engine_block_ref(
+    payload: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    req_pool_idx = _event_req_pool_idx_value(payload)
+    preview_present = "req_to_token_entries_preview" in payload
+    cache_position_present = "cache_position" in payload
+    if req_pool_idx is None and not preview_present and not cache_position_present:
+        return None
+
+    engine_block_ref = {
+        "req_pool_idx": _copy_relaykv_metadata_value_for_smoke(req_pool_idx),
+        "cache_position": (
+            _copy_relaykv_metadata_value_for_smoke(payload.get("cache_position"))
+            if cache_position_present
+            else None
+        ),
+        "token_to_kv_pool_index": None,
+    }
+    if preview_present:
+        engine_block_ref["req_to_token_entries_preview"] = (
+            _copy_relaykv_metadata_value_for_smoke(
+                payload.get("req_to_token_entries_preview")
+            )
+        )
+    return engine_block_ref
+
+
+def _relaykv_smoke_decision_state(payload: Mapping[str, Any]) -> Any:
+    return _relaykv_smoke_first_present_value(
+        payload,
+        "decision_state",
+        "adapter_state",
+        "resolution_state",
+        "shadow_capture_state",
+        "runtime_policy_state",
+    )
+
+
+def _relaykv_smoke_fallback_reason(payload: Mapping[str, Any]) -> Any:
+    fallback_reason = _relaykv_smoke_first_present_value(
+        payload,
+        "fallback_reason",
+        "fallback_reason_code",
+    )
+    if fallback_reason is not None:
+        return fallback_reason
+
+    decision_state = _relaykv_smoke_decision_state(payload)
+    if decision_state in {"blocked", "fallback_candidate", "fallback"}:
+        blocking_reasons = payload.get("blocking_reasons")
+        if isinstance(blocking_reasons, (list, tuple)) and blocking_reasons:
+            return blocking_reasons[0]
+        return "blocked"
+    return None
+
+
+def normalize_relaykv_sglang_adapter_schema_for_smoke(
+    payload: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Add Core/Adapter schema fields for smoke payloads without mutating inputs."""
+
+    if not isinstance(payload, Mapping):
+        raise TypeError("payload must be a mapping")
+
+    normalized = _copy_relaykv_metadata_value_for_smoke(dict(payload))
+    if not isinstance(normalized, dict):
+        raise TypeError("normalized payload must be a dict")
+
+    request_id = _relaykv_smoke_first_present_value(
+        payload,
+        "engine_request_id",
+        "request_id",
+    )
+    logical_sequence_id = _relaykv_smoke_first_present_value(
+        payload,
+        "logical_sequence_id",
+        "sequence_id",
+        "request_id",
+    )
+    decision_state = _relaykv_smoke_decision_state(payload)
+
+    normalized["engine_name"] = (
+        normalized.get("engine_name")
+        if normalized.get("engine_name") is not None
+        else "sglang"
+    )
+    normalized["adapter_name"] = (
+        normalized.get("adapter_name")
+        if normalized.get("adapter_name") is not None
+        else "sglang"
+    )
+    normalized["engine_request_id"] = request_id
+    normalized["logical_sequence_id"] = logical_sequence_id
+    normalized["logical_block_id"] = _relaykv_smoke_logical_block_id(payload)
+    normalized["token_span"] = _relaykv_smoke_token_span(payload)
+    normalized["layer_id"] = (
+        normalized.get("layer_id")
+        if normalized.get("layer_id") is not None
+        else _event_layer_value(payload)
+    )
+    normalized["kv_head_group"] = _relaykv_smoke_first_present_value(
+        payload,
+        "kv_head_group",
+        "kv_group",
+        "head_group",
+    )
+    normalized["kv_class"] = (
+        _relaykv_smoke_first_present_value(payload, "kv_class", "kv_cache_class")
+        or "UNKNOWN"
+    )
+    normalized["decision_state"] = decision_state or "SHADOW_ONLY"
+    normalized["fallback_reason"] = _relaykv_smoke_fallback_reason(payload)
+    normalized["position_check_state"] = (
+        normalized.get("position_check_state")
+        if normalized.get("position_check_state") is not None
+        else "not_checked_metadata_only"
+    )
+    normalized["attention_mask_mode"] = (
+        normalized.get("attention_mask_mode")
+        if normalized.get("attention_mask_mode") is not None
+        else "unknown"
+    )
+    normalized["rope_position_consistency"] = (
+        normalized.get("rope_position_consistency")
+        if normalized.get("rope_position_consistency") is not None
+        else "not_checked"
+    )
+    normalized["adapter_metadata"] = _relaykv_smoke_adapter_metadata(payload)
+    normalized["engine_block_ref"] = _relaykv_smoke_engine_block_ref(payload)
+    return normalized
+
+
+def _relaykv_smoke_count_value(payload: Mapping[str, Any], key: str) -> int:
+    value = payload.get(key)
+    if isinstance(value, int) and not isinstance(value, bool):
+        return value
+    return 1 if value is True else 0
+
+
+def summarize_relaykv_sglang_adapter_schema_alignment_for_smoke(
+    payloads: list[Mapping[str, Any]] | tuple[Mapping[str, Any], ...],
+) -> dict[str, Any]:
+    """Summarize normalized Core/Adapter schema alignment for smoke payloads."""
+
+    if not isinstance(payloads, (list, tuple)):
+        raise TypeError("payloads must be a list or tuple")
+
+    normalized_payloads = [
+        normalize_relaykv_sglang_adapter_schema_for_smoke(payload)
+        for payload in payloads
+    ]
+
+    per_event_type: Counter[str] = Counter()
+    per_decision_state: Counter[str] = Counter()
+    token_span_present_count = 0
+    logical_block_id_present_count = 0
+    adapter_metadata_req_pool_idx_count = 0
+    engine_block_ref_req_pool_idx_count = 0
+    engine_block_ref_present_count = 0
+    token_to_kv_pool_index_none_count = 0
+    position_check_default_count = 0
+    safety_counts: Counter[str] = Counter(
+        {
+            "token_to_kv_pool_read_count": 0,
+            "kv_pool_read_count": 0,
+            "kv_snapshot_count": 0,
+            "tensor_read_count": 0,
+            "attention_comparison_executed_count": 0,
+            "attention_override_true_count": 0,
+            "runtime_writeback_true_count": 0,
+            "scheduler_policy_noop_false_count": 0,
+            "kv_cache_mutation_true_count": 0,
+            "source_mutated_true_count": 0,
+        }
+    )
+
+    for payload in normalized_payloads:
+        per_event_type[str(payload.get("event_type") or "unknown")] += 1
+        per_decision_state[str(payload.get("decision_state") or "unknown")] += 1
+        if payload.get("token_span") is not None:
+            token_span_present_count += 1
+        if payload.get("logical_block_id") is not None:
+            logical_block_id_present_count += 1
+        adapter_metadata = payload.get("adapter_metadata")
+        if isinstance(adapter_metadata, Mapping) and "req_pool_idx" in adapter_metadata:
+            adapter_metadata_req_pool_idx_count += 1
+        engine_block_ref = payload.get("engine_block_ref")
+        if isinstance(engine_block_ref, Mapping):
+            engine_block_ref_present_count += 1
+            if "req_pool_idx" in engine_block_ref:
+                engine_block_ref_req_pool_idx_count += 1
+            if engine_block_ref.get("token_to_kv_pool_index") is None:
+                token_to_kv_pool_index_none_count += 1
+        if payload.get("position_check_state") == "not_checked_metadata_only":
+            position_check_default_count += 1
+
+        safety_counts["token_to_kv_pool_read_count"] += _relaykv_smoke_count_value(
+            payload, "token_to_kv_pool_read_count"
+        )
+        safety_counts["kv_pool_read_count"] += _relaykv_smoke_count_value(
+            payload, "kv_pool_read_count"
+        )
+        safety_counts["kv_snapshot_count"] += _relaykv_smoke_count_value(
+            payload, "kv_snapshot_count"
+        )
+        safety_counts["tensor_read_count"] += _relaykv_smoke_count_value(
+            payload, "tensor_read_count"
+        )
+        safety_counts["attention_comparison_executed_count"] += (
+            _relaykv_smoke_count_value(payload, "attention_comparison_executed_count")
+            + (1 if payload.get("attention_comparison_executed") is True else 0)
+        )
+        safety_counts["attention_override_true_count"] += (
+            _relaykv_smoke_count_value(payload, "attention_override_true_count")
+            + (1 if payload.get("attention_override") is True else 0)
+        )
+        safety_counts["runtime_writeback_true_count"] += (
+            _relaykv_smoke_count_value(payload, "runtime_writeback_true_count")
+            + (1 if payload.get("runtime_writeback") is True else 0)
+        )
+        if payload.get("scheduler_policy_noop") is False:
+            safety_counts["scheduler_policy_noop_false_count"] += 1
+        safety_counts["scheduler_policy_noop_false_count"] += _relaykv_smoke_count_value(
+            payload, "scheduler_policy_noop_false_count"
+        )
+        safety_counts["kv_cache_mutation_true_count"] += (
+            _relaykv_smoke_count_value(payload, "kv_cache_mutation_true_count")
+            + (1 if payload.get("kv_cache_mutation") is True else 0)
+        )
+        safety_counts["source_mutated_true_count"] += (
+            _relaykv_smoke_count_value(payload, "source_mutated_true_count")
+            + (1 if payload.get("source_mutated") is True else 0)
+        )
+
+    return {
+        "summary_type": "relaykv_sglang_adapter_schema_alignment_summary",
+        "total_payload_count": len(normalized_payloads),
+        "normalized_payload_count": len(normalized_payloads),
+        "token_span_present_count": token_span_present_count,
+        "logical_block_id_present_count": logical_block_id_present_count,
+        "adapter_metadata_req_pool_idx_count": adapter_metadata_req_pool_idx_count,
+        "engine_block_ref_present_count": engine_block_ref_present_count,
+        "engine_block_ref_req_pool_idx_count": engine_block_ref_req_pool_idx_count,
+        "token_to_kv_pool_index_none_count": token_to_kv_pool_index_none_count,
+        "position_check_default_count": position_check_default_count,
+        "per_event_type_counts": dict(sorted(per_event_type.items())),
+        "per_decision_state_counts": dict(sorted(per_decision_state.items())),
+        **dict(safety_counts),
+    }
+
+
 def build_relaykv_req_to_token_runtime_inspection_payloads_for_smoke(
     forward_batch_like: Any = None,
     req_to_token_pool: Any = None,
