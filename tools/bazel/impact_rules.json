@@ -1,0 +1,36 @@
+[
+  {
+    "name": "srt-managers-server-runtime",
+    "paths": [
+      "python/sglang/srt/managers/**"
+    ],
+    "reason": "Server manager changes are exercised through subprocess/server launch paths, so import reverse deps understate coverage.",
+    "suite_tag_regexes": [
+      "suite-stage-b-test.*",
+      "suite-stage-c-test.*"
+    ]
+  },
+  {
+    "name": "srt-model-executor-runtime",
+    "paths": [
+      "python/sglang/srt/model_executor/**"
+    ],
+    "reason": "Model executor changes flow through model loading and runtime server tests beyond direct imports.",
+    "suite_tag_regexes": [
+      "suite-stage-b-test.*",
+      "suite-stage-c-test.*"
+    ]
+  },
+  {
+    "name": "srt-server-entrypoints",
+    "paths": [
+      "python/sglang/srt/server.py",
+      "python/sglang/srt/entrypoints/**"
+    ],
+    "reason": "Server entrypoint changes affect registered integration tests that start an SGLang server.",
+    "suite_tag_regexes": [
+      "suite-stage-b-test.*",
+      "suite-stage-c-test.*"
+    ]
+  }
+]

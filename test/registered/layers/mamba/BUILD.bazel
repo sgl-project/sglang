@@ -1,3 +1,4 @@
+load("@rules_python//python:defs.bzl", "py_library", "py_test")
 load("//tools/bazel:sgl_defs.bzl", "sgl_amd_test", "sgl_cuda_test")
 
 sgl_cuda_test(
@@ -47,4 +48,11 @@ sgl_amd_test(
     srcs = ["test_causal_conv1d.py"],
     est_time = 25,
     suite = "stage-b-test-1-gpu-small-amd",
+)
+
+py_library(
+    name = "conftest",
+    testonly = True,
+    srcs = ["conftest.py"],
+    visibility = ["//:__subpackages__"],
 )

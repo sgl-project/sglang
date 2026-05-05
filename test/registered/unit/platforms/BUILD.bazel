@@ -5,4 +5,8 @@ sgl_cpu_test(
     srcs = ["test_platform_interface.py"],
     est_time = 7,
     suite = "stage-a-test-cpu",
+    deps = [
+        "//python/sglang/srt/platforms:pkg",
+        "//python/sglang/test/ci:ci_register",
+    ],
 )

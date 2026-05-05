@@ -1,30 +1,6 @@
-# gazelle:python_generation_mode project
-# gazelle:python_test_file_pattern test_*.py
-# gazelle:python_validate_import_statements false
-# gazelle:exclude python/.venv
-# gazelle:exclude python/.pytest_cache
-# gazelle:exclude test/.venv
-# gazelle:exclude test/.pytest_cache
-
 # File import validation should be filescoped TODO.
 
-load("@bazel_gazelle//:def.bzl", "gazelle", "gazelle_binary")
-
-exports_files(["gazelle_python.yaml"])
-
-gazelle_binary(
-    name = "gazelle_multilang",
-    languages = [
-        "@rules_python_gazelle_plugin//python",
-        "//tools/bazel/gazelle/sglang_tests",
-    ],
-)
-
-gazelle(
+alias(
     name = "gazelle",
-    args = [
-        "-r",
-        "test/registered",
-    ],
-    gazelle = ":gazelle_multilang",
+    actual = "//tools/bazel:source_graph",
 )

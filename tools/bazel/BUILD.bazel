@@ -1,6 +1,9 @@
 load("@rules_python//python:defs.bzl", "py_binary")
 
-exports_files(["sgl_defs.bzl"])
+exports_files([
+    "impact_rules.json",
+    "sgl_defs.bzl",
+])
 
 platform(
     name = "linux_aarch64",
@@ -32,5 +35,42 @@ py_binary(
         "//python:pyproject_xpu.toml",
     ],
     main = "gen_deps.py",
+    visibility = ["//visibility:public"],
+)
+
+py_binary(
+    name = "source_graph",
+    srcs = ["gen_source_graph.py"],
+    main = "gen_source_graph.py",
+    visibility = ["//visibility:public"],
+)
+
+py_binary(
+    name = "source_graph_check",
+    srcs = ["gen_source_graph.py"],
+    args = ["--check"],
+    main = "gen_source_graph.py",
+    visibility = ["//visibility:public"],
+)
+
+py_binary(
+    name = "validate_split_graph",
+    srcs = [
+        "gen_source_graph.py",
+        "validate_split_graph.py",
+    ],
+    data = ["impact_rules.json"],
+    main = "validate_split_graph.py",
+    visibility = ["//visibility:public"],
+)
+
+py_binary(
+    name = "select_tests",
+    srcs = [
+        "gen_source_graph.py",
+        "select_tests.py",
+    ],
+    data = ["impact_rules.json"],
+    main = "select_tests.py",
     visibility = ["//visibility:public"],
 )

@@ -1,3 +1,4 @@
+load("@rules_python//python:defs.bzl", "py_library", "py_test")
 load("//tools/bazel:sgl_defs.bzl", "sgl_cpu_test")
 
 sgl_cpu_test(
@@ -6,4 +7,17 @@ sgl_cpu_test(
     est_time = 15,
     nightly = True,
     suite = "stage-a-test-cpu",
+)
+
+py_library(
+    name = "aligner",
+    srcs = ["__init__.py"],
+    visibility = ["//:__subpackages__"],
+)
+
+py_library(
+    name = "conftest",
+    testonly = True,
+    srcs = ["conftest.py"],
+    visibility = ["//:__subpackages__"],
 )

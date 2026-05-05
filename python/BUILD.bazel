@@ -1,4 +1,4 @@
-load("//tools/bazel:sgl_defs.bzl", "sgl_py_library")
+load("@rules_python//python:defs.bzl", "py_library")
 
 exports_files([
     "pyproject.toml",
@@ -8,7 +8,7 @@ exports_files([
     "pyproject_xpu.toml",
 ])
 
-sgl_py_library(
+py_library(
     name = "sglang",
     srcs = glob(["sglang/**/*.py"]),
     data = glob(
@@ -17,6 +17,13 @@ sgl_py_library(
             "sglang/srt/**/*",
         ],
         exclude = ["**/*.py"],
+        allow_empty = True,
     ),
+    deps = [
+        "//python/sglang/srt:environ",
+        "//python/sglang/srt/platforms:pkg",
+        "//python/sglang/srt/plugins:pkg",
+    ],
     imports = ["."],
+    visibility = ["//visibility:public"],
 )

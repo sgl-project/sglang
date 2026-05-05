@@ -70,13 +70,6 @@ sgl_cuda_test(
     suite = "stage-b-test-1-gpu-small",
 )
 
-sgl_cuda_test(
-    name = "test_pp_single_node_cuda_stage_c_test_4_gpu_h100",
-    srcs = ["test_pp_single_node.py"],
-    est_time = 554,
-    suite = "stage-c-test-4-gpu-h100",
-)
-
 sgl_amd_test(
     name = "test_pp_single_node_amd_stage_c_test_4_gpu_amd",
     srcs = ["test_pp_single_node.py"],

@@ -5,6 +5,7 @@ Tests DeviceMixin, SRTPlatform, PlatformEnum, CpuArchEnum, DeviceCapability,
 and the platform discovery / lazy initialization mechanism.
 """
 
+import unittest
 from unittest.mock import MagicMock, patch
 
 from sglang.srt.platforms import _load_platform_class, _resolve_platform
@@ -16,7 +17,6 @@ from sglang.srt.platforms.device_mixin import (
 )
 from sglang.srt.platforms.interface import SRTPlatform
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=7, suite="stage-a-test-cpu")
 
@@ -94,7 +94,7 @@ def _make_platform_ep(name, load_fn=None):
 # ---------------------------------------------------------------------------
 
 
-class TestPlatformEnum(CustomTestCase):
+class TestPlatformEnum(unittest.TestCase):
     """Tests for PlatformEnum enumeration."""
 
     def test_all_expected_values_exist(self):
@@ -114,7 +114,7 @@ class TestPlatformEnum(CustomTestCase):
         self.assertEqual(actual, expected)
 
 
-class TestCpuArchEnum(CustomTestCase):
+class TestCpuArchEnum(unittest.TestCase):
     """Tests for CpuArchEnum enumeration."""
 
     def test_all_expected_values_exist(self):
@@ -128,7 +128,7 @@ class TestCpuArchEnum(CustomTestCase):
 # ---------------------------------------------------------------------------
 
 
-class TestDeviceCapability(CustomTestCase):
+class TestDeviceCapability(unittest.TestCase):
     """Tests for DeviceCapability custom logic (formatting, conversion)."""
 
     def test_as_version_str(self):
@@ -167,7 +167,7 @@ _CUDA_ALIKE = [
 ]
 
 
-class TestDeviceMixin(CustomTestCase):
+class TestDeviceMixin(unittest.TestCase):
     """Tests for DeviceMixin base class."""
 
     def test_platform_identity_methods(self):
@@ -214,7 +214,7 @@ class TestDeviceMixin(CustomTestCase):
 # ---------------------------------------------------------------------------
 
 
-class TestSRTPlatform(CustomTestCase):
+class TestSRTPlatform(unittest.TestCase):
     """Tests for SRTPlatform base class and default behaviors."""
 
     def test_compile_backend_signature_compatibility(self):
@@ -223,7 +223,7 @@ class TestSRTPlatform(CustomTestCase):
         self.assertEqual(base.get_compile_backend(mode="npugraph_ex"), "inductor")
 
 
-class TestSRTPlatformOverrides(CustomTestCase):
+class TestSRTPlatformOverrides(unittest.TestCase):
     """Tests for SRTPlatform method overrides via plugins."""
 
     def test_custom_get_dispatch_key_name(self):
@@ -254,7 +254,7 @@ class TestSRTPlatformOverrides(CustomTestCase):
 # ---------------------------------------------------------------------------
 
 
-class TestResolvePlatformWithEnv(CustomTestCase):
+class TestResolvePlatformWithEnv(unittest.TestCase):
     """Tests for _resolve_platform when SGLANG_PLATFORM is set."""
 
     @patch("sglang.srt.platforms.entry_points")
@@ -317,7 +317,7 @@ class TestResolvePlatformWithEnv(CustomTestCase):
             other_ep.load.assert_not_called()
 
 
-class TestResolvePlatformAutoDiscover(CustomTestCase):
+class TestResolvePlatformAutoDiscover(unittest.TestCase):
     """Tests for _resolve_platform auto-discovery when SGLANG_PLATFORM is not set."""
 
     @patch("sglang.srt.platforms.load_plugins_by_group")
@@ -396,7 +396,7 @@ class TestResolvePlatformAutoDiscover(CustomTestCase):
 # ---------------------------------------------------------------------------
 
 
-class TestLoadPlatformClass(CustomTestCase):
+class TestLoadPlatformClass(unittest.TestCase):
     """Tests for _load_platform_class qualname resolution."""
 
     @patch("sglang.srt.platforms.pkgutil.resolve_name")
@@ -426,7 +426,7 @@ class TestLoadPlatformClass(CustomTestCase):
 # ---------------------------------------------------------------------------
 
 
-class TestCurrentPlatformLazyInit(CustomTestCase):
+class TestCurrentPlatformLazyInit(unittest.TestCase):
     """Tests for current_platform lazy initialization via module __getattr__."""
 
     def setUp(self):

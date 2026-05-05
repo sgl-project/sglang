@@ -2,8 +2,6 @@
 
 load("@rules_python//python:defs.bzl", "py_library", "py_test")
 
-_SGLANG_LIB = "//python:sglang"
-
 _HW_TAGS = {
     "amd": "hw-amd",
     "cpu": "hw-cpu",
@@ -44,12 +42,6 @@ def _est_time_to_timeout(est_time):
     return "eternal", "enormous"
 
 
-def _sglang_dep_for(name):
-    if native.package_name() == "python" and name == "sglang":
-        return []
-    return [_SGLANG_LIB]
-
-
 def sgl_py_library(
         name,
         srcs = None,
@@ -62,7 +54,7 @@ def sgl_py_library(
         name = name,
         srcs = srcs if srcs != None else native.glob(["**/*.py"]),
         data = data,
-        deps = _sglang_dep_for(name) + deps,
+        deps = deps,
         visibility = visibility or ["//visibility:public"],
         **kwargs
     )
@@ -92,7 +84,7 @@ def sgl_registered_test(
         name = name,
         srcs = srcs,
         data = data,
-        deps = [_SGLANG_LIB] + deps,
+        deps = deps,
         env = env,
         size = size,
         tags = [

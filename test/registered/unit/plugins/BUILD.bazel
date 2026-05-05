@@ -1,3 +1,4 @@
+load("@rules_python//python:defs.bzl", "py_library", "py_test")
 load("//tools/bazel:sgl_defs.bzl", "sgl_cpu_test")
 
 sgl_cpu_test(
@@ -12,4 +13,10 @@ sgl_cpu_test(
     srcs = ["test_load_plugins.py"],
     est_time = 7,
     suite = "stage-a-test-cpu",
+)
+
+py_library(
+    name = "plugins",
+    srcs = ["__init__.py"],
+    visibility = ["//:__subpackages__"],
 )

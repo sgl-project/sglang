@@ -1,3 +1,4 @@
+load("@rules_python//python:defs.bzl", "py_library", "py_test")
 load("//tools/bazel:sgl_defs.bzl", "sgl_cuda_test")
 
 sgl_cuda_test(
@@ -19,4 +20,10 @@ sgl_cuda_test(
     srcs = ["test_search_tools.py"],
     est_time = 6,
     suite = "stage-b-test-1-gpu-small",
+)
+
+py_library(
+    name = "auto_benchmark",
+    srcs = ["__init__.py"],
+    visibility = ["//:__subpackages__"],
 )
