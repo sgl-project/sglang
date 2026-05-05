@@ -18,6 +18,7 @@ from __future__ import annotations
 import contextlib
 import datetime
 import gc
+import hashlib
 import inspect
 import logging
 import os
@@ -27,6 +28,7 @@ import time
 import uuid
 from collections import defaultdict
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Callable, List, Optional, Tuple, Union
 
 import torch
@@ -278,6 +280,10 @@ def resolve_language_model(model: nn.Module) -> nn.Module:
     model_cls_name = model.__class__.__name__
     if model_cls_name == "Qwen3OmniMoeForConditionalGeneration":
         return model.thinker.model
+    if hasattr(model, "model"):
+        return model.model
+    if hasattr(model, "language_model"):
+        return model.language_model
     return model.model
 
 
@@ -335,6 +341,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.tp_size = tp_size
         self.moe_ep_rank = moe_ep_rank
         self.moe_ep_size = moe_ep_size
+        self.dp_rank = dp_rank
         self.dp_size = server_args.dp_size if server_args.enable_dp_attention else 1
         self.pp_rank = pp_rank
         self.pp_size = pp_size
@@ -665,6 +672,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.end_layer = getattr(self.model, "end_layer", model_num_layers)
         self.num_effective_layers = self.end_layer - self.start_layer
 
+        self.adjust_hybrid_swa_layers_for_pp()
+
         # For LoopCoder models, each loop has its own layer_id, so we need to multiply by loop_num
         loop_num = getattr(self.model_config.hf_config, "loop_num", 1)
         if loop_num > 1:
@@ -678,23 +687,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 and (self.num_effective_layers == model_num_layers)
             )
         ), "PP is not compatible with MTP models."
-
-        # Consider PP, so use start_layer and end_layer.
-        full_attention_layer_ids = [
-            layer_idx
-            for layer_idx in range(self.start_layer, self.end_layer + 1)
-            if hasattr(self.model_config, "full_attention_layer_ids")
-            and layer_idx in self.model_config.full_attention_layer_ids
-        ]
-        swa_attention_layer_ids = [
-            layer_idx
-            for layer_idx in range(self.start_layer, self.end_layer + 1)
-            if hasattr(self.model_config, "swa_attention_layer_ids")
-            and layer_idx in self.model_config.swa_attention_layer_ids
-        ]
-        # Update back to model_config.
-        self.model_config.swa_attention_layer_ids = swa_attention_layer_ids
-        self.model_config.full_attention_layer_ids = full_attention_layer_ids
 
         # Apply torchao quantization
         torchao_applied = getattr(self.model, "torchao_applied", False)
@@ -791,6 +783,25 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.init_piecewise_cuda_graphs()
 
         self.prealloc_symmetric_memory_pool()
+
+    def adjust_hybrid_swa_layers_for_pp(self):
+        if not self.is_hybrid_swa:
+            return
+
+        full_attention_layer_ids = [
+            layer_idx
+            for layer_idx in range(self.start_layer, self.end_layer + 1)
+            if hasattr(self.model_config, "full_attention_layer_ids")
+            and layer_idx in self.model_config.full_attention_layer_ids
+        ]
+        swa_attention_layer_ids = [
+            layer_idx
+            for layer_idx in range(self.start_layer, self.end_layer + 1)
+            if hasattr(self.model_config, "swa_attention_layer_ids")
+            and layer_idx in self.model_config.swa_attention_layer_ids
+        ]
+        self.model_config.swa_attention_layer_ids = swa_attention_layer_ids
+        self.model_config.full_attention_layer_ids = full_attention_layer_ids
 
     def init_routed_experts_capturer(self):
         if not self.server_args.disable_shared_experts_fusion and hasattr(
@@ -2416,18 +2427,53 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         """Run flashinfer autotune."""
         from flashinfer.autotuner import autotune
 
-        logger.info("Running FlashInfer autotune...")
+        cache_path = self._flashinfer_autotune_cache_path()
+        logger.info("Running FlashInfer autotune with cache: %s", cache_path)
 
         # Run warmup on the non-default stream to avoid NCCL 2.29+ cudaMemcpyBatchAsync
         # calls on default stream (unsupported by CUDA) when --enable-symm-mem is used.
         self.forward_stream.wait_stream(torch.cuda.current_stream())
         with torch.get_device_module(self.device).stream(self.forward_stream):
-            with torch.inference_mode(), autotune():
-                self._dummy_run(
-                    batch_size=self.req_to_token_pool.size, run_ctx=autotune()
-                )
+            with torch.inference_mode(), autotune(True, cache=str(cache_path)):
+                self._dummy_run(batch_size=self.req_to_token_pool.size)
         torch.cuda.current_stream().wait_stream(self.forward_stream)
         logger.info("FlashInfer autotune completed.")
+
+    def _flashinfer_autotune_cache_path(self) -> Path:
+        import flashinfer
+
+        major, minor = torch.cuda.get_device_capability(self.device)
+        arch = f"sm{major}{minor}"
+        flashinfer_version = getattr(flashinfer, "__version__", "unknown")
+
+        server_args = self.server_args
+        model_key = "|".join(
+            [
+                str(server_args.model_path),
+                str(self.dtype),
+                str(server_args.quantization),
+                str(server_args.moe_runner_backend),
+                str(self.tp_size),
+                str(self.pp_size),
+                str(self.dp_size),
+                str(self.moe_ep_size),
+                str(self.model_config.hf_config.__class__.__name__),
+            ]
+        )
+        cache_key = hashlib.sha256(model_key.encode()).hexdigest()[:16]
+        cache_dir = (
+            Path(envs.SGLANG_CACHE_DIR.get())
+            / "flashinfer"
+            / "autotune"
+            / flashinfer_version
+            / arch
+            / cache_key
+        )
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        return (
+            cache_dir
+            / f"rank_tp{self.tp_rank}_pp{self.pp_rank}_dp{self.dp_rank or 0}.json"
+        )
 
     def _dummy_run(self, batch_size: int, run_ctx=None):
         """Run a dummy forward pass for warmup/profiling."""
@@ -2830,8 +2876,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.model.model = resolve_language_model(self.model)
         language_model = getattr(self.model, "language_model", self.model)
 
-        # Some draft models (e.g. eagle3) don't have a standard 'layers' attribute
-        if not hasattr(language_model.model, "layers"):
+        # Resolve model with layers: handle CausalLM wrapper (.model.layers) and direct TextModel (.layers)
+        if hasattr(language_model, "model") and hasattr(language_model.model, "layers"):
+            layer_model = language_model.model
+        elif hasattr(language_model, "layers"):
+            layer_model = language_model
+        else:
             logger.warning(
                 "Disable piecewise CUDA graph because the model does not have a 'layers' attribute"
             )
@@ -2840,7 +2890,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.attention_layers = []
         self.moe_layers = []
         self.moe_fusions = []
-        for layer in language_model.model.layers:
+        for layer in layer_model.layers:
             attn_layer = None
             if hasattr(layer, "self_attn"):
                 if hasattr(layer.self_attn, "attn"):

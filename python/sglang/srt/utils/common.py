@@ -3650,6 +3650,15 @@ def check_cuda_result(raw_output):
     return results
 
 
+def get_cuda_driver_bindings():
+    try:
+        from cuda.bindings import driver as cuda_driver
+    except ImportError:
+        from cuda import cuda as cuda_driver
+
+    return cuda_driver
+
+
 def get_physical_device_id(pytorch_device_id: int) -> int:
     """
     Convert PyTorch logical device ID to physical device ID.
