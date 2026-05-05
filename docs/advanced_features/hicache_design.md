@@ -115,7 +115,7 @@ HiCache encapsulates all read, write, and query operations on L3 backends within
 
 - **HiCacheFile**: A simple file-based storage backend for demonstration purposes.
 
-Specifically, **LMCache**, an efficient KV cache layer for enterprise-scale LLM inference, provides an alternative solution to HiCache. Try LMCache [here](https://github.com/sgl-project/sglang/tree/main/python/sglang/srt/mem_cache/storage/lmcache).
+Specifically, **LMCache**, an efficient KV cache layer for enterprise-scale LLM inference, provides an alternative solution to HiCache. Try LMCache [here](https://github.com/sgl-project/sglang/tree/main/python/sglang/srt/mem_cache/storage/lmcache). LMCache supports two transport modes: an in-process layerwise connector (default) and a multi-process daemon connector enabled by `--lmcache-mp-host`. The daemon mode lets the cache outlive the SGLang process and be shared across instances.
 
 ## Related Parameters
 
@@ -151,6 +151,10 @@ Specifically, **LMCache**, an efficient KV cache layer for enterprise-scale LLM 
 - **`--hicache-storage-backend {file,mooncake,hf3fs,nixl,aibrix,dynamic}`**: Choose the storage backend for the L3 tier. Built-in backends: file, mooncake, hf3fs, nixl, aibrix. For dynamic backend, use --hicache-storage-backend-extra-config to specify: `backend_name` (custom name), `module_path` (Python module path), `class_name` (backend class name). See [Unified Interfaces and Rich L3 Storage Backends](#unified-interfaces-and-rich-l3-storage-backends) for available backends.
 
 - **`--enable-lmcache`**: Using LMCache as an alternative hierarchical cache solution.
+
+- **`--lmcache-mp-host`**: LMCache MP daemon host. When set, SGLang uses the multi-process connector instead of the in-process layerwise one.
+
+- **`--lmcache-mp-port`**: LMCache MP daemon port. Defaults to `5555`.
 
 - **`--hicache-storage-backend-extra-config HICACHE_STORAGE_BACKEND_EXTRA_CONFIG`**: the extra config can be either
   - a JSON string containing extra configuration for the storage backend, e.g., `--hicache-storage-backend-extra-config '{"prefetch_threshold":512, "prefetch_timeout_base": 0.5, "prefetch_timeout_per_ki_token": 0.25}' `, or

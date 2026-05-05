@@ -29,6 +29,12 @@ pip install -e . --no-build-isolation
 
 ## Use LMCache
 
+LMCache supports two transport modes. Pick one based on whether the cache should outlive the SGLang process and be shared across instances.
+
+### Mode A: in-process (default)
+
+Uses `LMCacheLayerwiseConnector`. KV transfer happens per layer inside the SGLang process; the cache lives and dies with the server.
+
 Firstly, setup LMCache config. An example config is set at `example_config.yaml`. For more settings please refer to https://docs.lmcache.ai/api_reference/configurations.html.
 
 Secondly, setup SGLang serving engine with lmcache:
@@ -41,3 +47,32 @@ python -m sglang.launch_server \
   --model-path MODEL \
   --enable-lmcache
 ```
+
+### Mode B: multi-process daemon
+
+Uses `LMCacheMPConnector`. SGLang issues a single blocking retrieve over a ZMQ socket and skips the per-layer KV transfer hook entirely; the daemon owns the KV store, so it survives SGLang restarts and can be shared across SGLang instances.
+
+Terminal 1 — start the LMCache daemon:
+
+```bash
+lmcache server \
+  --host 127.0.0.1 --port 5556 \
+  --chunk-size 256 --l1-size-gb 4 \
+  --eviction-policy LRU --disable-observability
+```
+
+Terminal 2 — start SGLang pointing at the daemon:
+
+```bash
+python -m sglang.launch_server \
+  --model-path MODEL \
+  --enable-lmcache \
+  --lmcache-mp-host 127.0.0.1 --lmcache-mp-port 5556
+```
+
+Setting `--lmcache-mp-host` is the trigger that switches connectors. When unset, SGLang uses Mode A.
+
+### When to pick which
+
+- **Mode A** has lower per-request overhead and is the simplest setup; pick it when the cache only needs to live as long as the server.
+- **Mode B** decouples cache lifetime from server lifetime, lets multiple SGLang instances share the same store, and avoids losing the cache on restart; pick it when those properties matter.
