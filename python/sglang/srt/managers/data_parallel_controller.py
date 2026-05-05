@@ -477,6 +477,18 @@ class DataParallelController:
 
     def maybe_external_dp_rank_routing(self, req: Req):
         if req.data_parallel_rank is not None:
+            # In PD-prefill mode the cross-engine contract is `bootstrap_room`:
+            # the decode-side KV receiver locates the prefill DP rank via
+            # `bootstrap_room % prefill_dp_size`. Honoring an externally-set
+            # `data_parallel_rank` here breaks that contract whenever the two
+            # diverge (e.g., dynamo's KV router picks a rank for load-balance
+            # reasons that has no relation to `bootstrap_room`). Fall through
+            # to follow_bootstrap_room dispatch to keep prefill ↔ decode aligned.
+            if (
+                self.server_args.disaggregation_mode == "prefill"
+                and req.bootstrap_room is not None
+            ):
+                return False
             logger.debug(f"Direct routing to DP rank {req.data_parallel_rank}")
             self.workers[req.data_parallel_rank].send_pyobj(req)
             return True

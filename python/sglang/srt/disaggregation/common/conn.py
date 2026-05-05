@@ -540,6 +540,7 @@ class CommonKVReceiver(BaseKVReceiver):
                             f"Could not fetch bootstrap info for engine rank: {self.kv_mgr.kv_args.engine_rank} and target_dp_group: {self.target_dp_group} and target_pp_rank {target_pp_rank}",
                         )
                         self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
+                        self.bootstrap_infos = None
                         return
 
             self.bootstrap_infos = bootstrap_infos

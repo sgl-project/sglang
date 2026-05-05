@@ -1305,6 +1305,13 @@ class MooncakeKVReceiver(CommonKVReceiver):
         self.init_time = None
         super().__init__(mgr, bootstrap_addr, bootstrap_room, prefill_dp_rank)
 
+        # If super().__init__ hit a failure path it set bootstrap_infos = None
+        # and update_status(KVPoll.Failed). Don't overwrite that with WaitingForInput,
+        # otherwise the scheduler will keep polling a half-initialized receiver and
+        # the next .init() call will AttributeError on bootstrap_infos.
+        if getattr(self, "bootstrap_infos", None) is None:
+            return
+
         self.kv_mgr.addr_to_rooms_tracker[self.bootstrap_addr].add(self.bootstrap_room)
         self.kv_mgr.update_status(self.bootstrap_room, KVPoll.WaitingForInput)
 
