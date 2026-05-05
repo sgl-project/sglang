@@ -609,18 +609,40 @@ impl Router {
             // Uses select! to race stream.next() against tx.closed() so that
             // when the client disconnects the upstream HTTP connection is dropped
             // promptly, allowing the engine to abort the request.
+            // `biased;` drains a ready upstream chunk before observing client
+            // disconnect, so a chunk already produced by reqwest reaches the
+            // client (and any future accumulator) before we tear the loop down.
+            let worker_url_for_log = worker_url.to_string();
             tokio::spawn(async move {
                 futures_util::pin_mut!(stream);
                 loop {
                     tokio::select! {
+                        biased;
                         chunk = stream.next() => {
                             match chunk {
                                 Some(Ok(bytes)) => {
                                     if tx.send(Ok(bytes)).is_err() {
+                                        if tx.is_closed() {
+                                            tracing::debug!(
+                                                "Receiver dropped (likely client disconnect), \
+                                                cancelling upstream stream from {}",
+                                                worker_url_for_log
+                                            );
+                                        } else {
+                                            tracing::warn!(
+                                                "Stream channel send failed unexpectedly for {} \
+                                                while receiver still open",
+                                                worker_url_for_log
+                                            );
+                                        }
                                         break;
                                     }
                                 }
                                 Some(Err(e)) => {
+                                    error!(
+                                        "Upstream stream error from worker {}: {}",
+                                        worker_url_for_log, e
+                                    );
                                     let _ = tx.send(Err(format!("Stream error: {}", e)));
                                     break;
                                 }
@@ -628,7 +650,10 @@ impl Router {
                             }
                         }
                         _ = tx.closed() => {
-                            tracing::info!("Client disconnected, cancelling upstream stream");
+                            tracing::info!(
+                                "Client disconnected, cancelling upstream stream from {}",
+                                worker_url_for_log
+                            );
                             break;
                         }
                     }

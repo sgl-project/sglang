@@ -849,10 +849,16 @@ impl PDRouter {
         // Uses select! to race stream.next() against tx.closed() so that
         // when the client disconnects the upstream HTTP connection is dropped
         // promptly, allowing the engine to abort the request.
+        // `biased;` drains a ready upstream chunk before observing client
+        // disconnect, so a chunk already produced by reqwest reaches the
+        // client (and the logprob merger) before we tear the loop down.
+        let decode_url_for_log = decode_url;
+        let decode_for_breaker = decode.clone();
         tokio::spawn(async move {
             futures_util::pin_mut!(stream);
             loop {
                 tokio::select! {
+                    biased;
                     chunk_result = stream.next() => {
                         match chunk_result {
                             Some(Ok(chunk)) => {
@@ -866,6 +872,17 @@ impl PDRouter {
                                 };
 
                                 if tx.send(Ok(result)).is_err() {
+                                    if tx.is_closed() {
+                                        tracing::debug!(
+                                            "Receiver dropped (likely client disconnect), \
+                                            cancelling upstream PD stream"
+                                        );
+                                    } else {
+                                        tracing::warn!(
+                                            "PD stream channel send failed unexpectedly while \
+                                            receiver still open"
+                                        );
+                                    }
                                     break;
                                 }
 
@@ -874,9 +891,14 @@ impl PDRouter {
                                 }
                             }
                             Some(Err(e)) => {
-                                if let Some(ref url) = decode_url {
-                                    error!("Stream error from decode server {}: {}", url, e);
-                                }
+                                let url_for_log = decode_url_for_log
+                                    .as_deref()
+                                    .unwrap_or(decode_for_breaker.url());
+                                error!(
+                                    "Upstream PD stream error from decode worker {}: {}",
+                                    url_for_log, e
+                                );
+                                decode_for_breaker.circuit_breaker().record_failure();
                                 let _ = tx.send(Err(format!("Stream error: {}", e)));
                                 break;
                             }
@@ -884,7 +906,10 @@ impl PDRouter {
                         }
                     }
                     _ = tx.closed() => {
-                        tracing::info!("Client disconnected, cancelling upstream PD stream");
+                        tracing::info!(
+                            "Client disconnected, cancelling upstream PD stream from {}",
+                            decode_for_breaker.url()
+                        );
                         break;
                     }
                 }

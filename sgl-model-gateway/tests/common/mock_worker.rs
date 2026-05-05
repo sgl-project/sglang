@@ -324,6 +324,69 @@ async fn generate_handler(
     if is_stream {
         let stream_delay = config.response_delay_ms;
 
+        if let Some(num_chunks) = get_slow_stream_chunks_for_port(config.port) {
+            let port = config.port;
+            let delay_ms = stream_delay;
+            let error_after = get_stream_error_after_for_port(port);
+            init_stream_tracking(port, num_chunks);
+
+            let (tx, rx) = tokio::sync::mpsc::channel::<Result<Event, std::io::Error>>(4);
+            tokio::spawn(async move {
+                let timestamp_start = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs_f64();
+                for i in 0..num_chunks {
+                    if let Some(n) = error_after {
+                        if i == n {
+                            let _ = tx
+                                .send(Err(std::io::Error::other(
+                                    "simulated upstream worker crash",
+                                )))
+                                .await;
+                            return;
+                        }
+                    }
+                    if delay_ms > 0 {
+                        tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
+                    }
+                    let data = json!({
+                        "text": format!("chunk-{} ", i),
+                        "meta_info": {
+                            "prompt_tokens": 10,
+                            "completion_tokens": (i + 1) as u64,
+                            "completion_tokens_wo_jump_forward": (i + 1) as u64,
+                            "input_token_logprobs": null,
+                            "output_token_logprobs": null,
+                            "first_token_latency": delay_ms as f64 / 1000.0,
+                            "time_to_first_token": delay_ms as f64 / 1000.0,
+                            "time_per_output_token": 0.01,
+                            "start_time": timestamp_start,
+                            "finish_reason": null
+                        },
+                        "stage": "mid"
+                    });
+                    if tx
+                        .send(Ok(Event::default().data(data.to_string())))
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                    record_chunk_sent(port);
+                }
+                let _ = tx.send(Ok(Event::default().data("[DONE]"))).await;
+                mark_stream_completed(port);
+            });
+
+            let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
+            return (
+                [("x-worker-id", worker_id)],
+                Sse::new(stream).keep_alive(KeepAlive::default()),
+            )
+                .into_response();
+        }
+
         // Check if it's a batch request
         let is_batch = payload.get("text").and_then(|t| t.as_array()).is_some();
 
@@ -451,15 +514,29 @@ async fn chat_completions_handler(
         if let Some(num_chunks) = slow_chunks {
             let port = config.port;
             let delay_ms = config.response_delay_ms;
+            let error_after = get_stream_error_after_for_port(port);
 
             init_stream_tracking(port, num_chunks);
 
-            // Use capacity > 1 so the producer task can detect a dropped receiver
-            // (via send returning Err) without getting permanently parked.
-            let (tx, rx) = tokio::sync::mpsc::channel::<Result<Event, Infallible>>(4);
+            // Small bounded capacity gives a bit of slack between the producer
+            // task and the SSE consumer; on receiver drop, send().await
+            // returns Err and the loop exits regardless of capacity.
+            let (tx, rx) = tokio::sync::mpsc::channel::<Result<Event, std::io::Error>>(4);
 
             tokio::spawn(async move {
                 for i in 0..num_chunks {
+                    if let Some(n) = error_after {
+                        if i == n {
+                            // Inject a transport-level error to exercise the
+                            // gateway's `Some(Err(_))` arm.
+                            let _ = tx
+                                .send(Err(std::io::Error::other(
+                                    "simulated upstream worker crash",
+                                )))
+                                .await;
+                            return;
+                        }
+                    }
                     if delay_ms > 0 {
                         tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
                     }
@@ -476,7 +553,11 @@ async fn chat_completions_handler(
                             "finish_reason": null
                         }]
                     });
-                    if tx.send(Ok(Event::default().data(chunk.to_string()))).await.is_err() {
+                    if tx
+                        .send(Ok(Event::default().data(chunk.to_string())))
+                        .await
+                        .is_err()
+                    {
                         // Client disconnected, stream was cancelled
                         return;
                     }
@@ -992,6 +1073,112 @@ async fn responses_handler(
             Sse::new(stream)
                 .keep_alive(KeepAlive::default())
                 .into_response()
+        } else if let Some(num_chunks) = get_slow_stream_chunks_for_port(config.port) {
+            // Slow-stream mode for /responses cancel tests. Mirrors the
+            // chat-completions slow-stream path so the same set_slow_stream_chunks
+            // helper drives both endpoints.
+            let port = config.port;
+            let delay_ms = config.response_delay_ms;
+            let error_after = get_stream_error_after_for_port(port);
+            let rid = request_id.clone();
+            let msg_id = format!(
+                "msg_{}",
+                Uuid::new_v4().to_string().split('-').next().unwrap()
+            );
+
+            init_stream_tracking(port, num_chunks);
+
+            let (tx, rx) = tokio::sync::mpsc::channel::<Result<Event, std::io::Error>>(4);
+
+            tokio::spawn(async move {
+                // Emit response.created and response.in_progress so the
+                // gateway's /responses persistence accumulator has the
+                // structural events it expects.
+                let created = Event::default().event("response.created").data(
+                    json!({
+                        "type": "response.created",
+                        "response": {
+                            "id": rid.clone(),
+                            "object": "response",
+                            "created_at": timestamp,
+                            "model": "mock-model",
+                            "status": "in_progress"
+                        }
+                    })
+                    .to_string(),
+                );
+                if tx.send(Ok(created)).await.is_err() {
+                    return;
+                }
+                let in_progress = Event::default().event("response.in_progress").data(
+                    json!({
+                        "type": "response.in_progress",
+                        "response": {
+                            "id": rid.clone(),
+                            "object": "response",
+                            "created_at": timestamp,
+                            "model": "mock-model",
+                            "status": "in_progress"
+                        }
+                    })
+                    .to_string(),
+                );
+                if tx.send(Ok(in_progress)).await.is_err() {
+                    return;
+                }
+
+                for i in 0..num_chunks {
+                    if let Some(n) = error_after {
+                        if i == n {
+                            let _ = tx
+                                .send(Err(std::io::Error::other(
+                                    "simulated upstream worker crash",
+                                )))
+                                .await;
+                            return;
+                        }
+                    }
+                    if delay_ms > 0 {
+                        tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
+                    }
+                    let delta = Event::default().event("response.output_text.delta").data(
+                        json!({
+                            "type": "response.output_text.delta",
+                            "output_index": 0,
+                            "content_index": 0,
+                            "item_id": msg_id.clone(),
+                            "delta": format!("chunk-{} ", i)
+                        })
+                        .to_string(),
+                    );
+                    if tx.send(Ok(delta)).await.is_err() {
+                        return;
+                    }
+                    record_chunk_sent(port);
+                }
+
+                let completed = Event::default().event("response.completed").data(
+                    json!({
+                        "type": "response.completed",
+                        "response": {
+                            "id": rid,
+                            "object": "response",
+                            "created_at": timestamp,
+                            "model": "mock-model",
+                            "status": "completed"
+                        }
+                    })
+                    .to_string(),
+                );
+                let _ = tx.send(Ok(completed)).await;
+                let _ = tx.send(Ok(Event::default().data("[DONE]"))).await;
+                mark_stream_completed(port);
+            });
+
+            let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
+            Sse::new(stream)
+                .keep_alive(KeepAlive::default())
+                .into_response()
         } else {
             // Default streaming response
             let stream = stream::once(async move {
@@ -1276,6 +1463,37 @@ fn get_slow_stream_chunks_for_port(port: u16) -> Option<usize> {
     map.get(&port).copied()
 }
 
+// --- Stream error injection (for upstream cancel + error tests) ---
+// When set for `port`, the slow-stream producer emits an io::Error to the
+// SSE stream after the configured number of successfully-sent chunks.
+// reqwest will surface this as a transport error, which exercises the
+// gateway's `Some(Err(_))` arm.
+
+static STREAM_ERROR_AFTER: OnceLock<Mutex<HashMap<u16, usize>>> = OnceLock::new();
+
+fn get_stream_error_after_config() -> &'static Mutex<HashMap<u16, usize>> {
+    STREAM_ERROR_AFTER.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Configure a worker (by port) to abort its SSE stream with an error
+/// after sending `n` chunks. Must be combined with
+/// [`set_slow_stream_chunks`] to take effect.
+pub fn set_stream_error_after_chunks(port: u16, n: usize) {
+    let mut map = get_stream_error_after_config().lock().unwrap();
+    map.insert(port, n);
+}
+
+/// Clear error-injection configuration for a worker port.
+pub fn clear_stream_error_after_chunks(port: u16) {
+    let mut map = get_stream_error_after_config().lock().unwrap();
+    map.remove(&port);
+}
+
+fn get_stream_error_after_for_port(port: u16) -> Option<usize> {
+    let map = get_stream_error_after_config().lock().unwrap();
+    map.get(&port).copied()
+}
+
 // --- Stream cancellation tracking (for upstream cancel tests) ---
 
 /// Tracks the state of a streaming response for cancel verification.
@@ -1304,8 +1522,40 @@ pub fn get_stream_tracking_state(port: u16) -> Option<StreamTrackingState> {
     map.get(&port).cloned()
 }
 
-/// Initialize tracking for a new stream. Callers should invoke
-/// `reset_stream_tracker(port)` before each test to avoid stale state.
+/// Wait until the worker's `chunks_sent` counter for `port` stops advancing
+/// for at least `quiet_window`, or until `timeout` elapses. Returns the
+/// final tracking state. Used by cancel tests to confirm the worker has
+/// actually stopped producing — instead of relying on a fixed `sleep` that
+/// might be shorter or longer than the worker's natural completion time.
+pub async fn wait_for_chunks_plateau(
+    port: u16,
+    quiet_window: tokio::time::Duration,
+    timeout: tokio::time::Duration,
+) -> Option<StreamTrackingState> {
+    let poll_interval = tokio::time::Duration::from_millis(20);
+    let start = tokio::time::Instant::now();
+    let mut last_count = get_stream_tracking_state(port).map(|s| s.chunks_sent);
+    let mut last_change = tokio::time::Instant::now();
+
+    while start.elapsed() < timeout {
+        tokio::time::sleep(poll_interval).await;
+        let now_state = get_stream_tracking_state(port);
+        let now_count = now_state.as_ref().map(|s| s.chunks_sent);
+
+        if now_count != last_count {
+            last_count = now_count;
+            last_change = tokio::time::Instant::now();
+        } else if last_change.elapsed() >= quiet_window {
+            return now_state;
+        }
+    }
+
+    get_stream_tracking_state(port)
+}
+
+// Initialize tracking for a new stream. `map.insert` overwrites any prior
+// entry for this port, so callers don't need to reset first; we still expose
+// `reset_stream_tracker` so tests can opt into removing the entry entirely.
 fn init_stream_tracking(port: u16, total_chunks: usize) {
     let mut map = get_stream_tracker().lock().unwrap();
     map.insert(

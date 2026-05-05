@@ -635,18 +635,46 @@ impl crate::routers::RouterTrait for OpenAIRouter {
                         // Uses select! to race stream.next() against tx.closed() so that
                         // when the client disconnects the upstream HTTP connection is
                         // dropped promptly, allowing the engine to abort the request.
+                        // `biased;` drains a ready upstream chunk before observing client
+                        // disconnect, so any chunk already produced by reqwest reaches
+                        // the client before we tear the loop down.
+                        let url_for_log = url.clone();
+                        let worker_for_log = Arc::clone(&worker);
                         tokio::spawn(async move {
                             futures_util::pin_mut!(stream);
                             loop {
                                 tokio::select! {
+                                    biased;
                                     chunk = stream.next() => {
                                         match chunk {
                                             Some(Ok(bytes)) => {
                                                 if tx.send(Ok(bytes)).is_err() {
+                                                    if tx.is_closed() {
+                                                        tracing::debug!(
+                                                            "Receiver dropped (likely client \
+                                                            disconnect), cancelling upstream \
+                                                            stream from {}",
+                                                            url_for_log
+                                                        );
+                                                    } else {
+                                                        tracing::warn!(
+                                                            "OpenAI stream channel send failed \
+                                                            unexpectedly for {} while receiver \
+                                                            still open",
+                                                            url_for_log
+                                                        );
+                                                    }
                                                     break;
                                                 }
                                             }
                                             Some(Err(e)) => {
+                                                tracing::error!(
+                                                    "Upstream stream error from worker {}: {}",
+                                                    url_for_log, e
+                                                );
+                                                worker_for_log
+                                                    .circuit_breaker()
+                                                    .record_failure();
                                                 let _ = tx.send(Err(format!("Stream error: {}", e)));
                                                 break;
                                             }
@@ -654,7 +682,10 @@ impl crate::routers::RouterTrait for OpenAIRouter {
                                         }
                                     }
                                     _ = tx.closed() => {
-                                        tracing::info!("Client disconnected, cancelling upstream stream");
+                                        tracing::info!(
+                                            "Client disconnected, cancelling upstream stream from {}",
+                                            url_for_log
+                                        );
                                         break;
                                     }
                                 }

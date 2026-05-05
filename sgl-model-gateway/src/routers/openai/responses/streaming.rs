@@ -533,22 +533,24 @@ pub(super) async fn handle_simple_streaming_passthrough(
     let persist_needed = original_request.conversation.is_some();
     let previous_response_id = req.previous_response_id;
     let storage = req.storage;
+    let upstream_url = req.url;
 
     // When persistence is needed (should_store || persist_needed), we must
     // continue consuming upstream even after client disconnect to accumulate
-    // the full response. When neither is needed, we use select! to race
-    // stream.next() against tx.closed() so the upstream HTTP connection is
-    // dropped promptly when the client disconnects.
+    // the full response — the upstream HTTP request is intentionally NOT
+    // cancelled in that branch. When neither is needed, we use select! to
+    // race stream.next() against tx.closed() so the upstream HTTP connection
+    // is dropped promptly when the client disconnects.
     let need_persistence = should_store || persist_needed;
 
     tokio::spawn(async move {
-        let mut accumulator = StreamingResponseAccumulator::new();
-        let mut upstream_failed = false;
-        let mut receiver_connected = true;
         let mut chunk_processor = ChunkProcessor::new();
 
         if need_persistence {
             // Persistence path: keep consuming upstream even after client disconnect
+            let mut accumulator = StreamingResponseAccumulator::new();
+            let mut upstream_failed = false;
+            let mut receiver_connected = true;
             while let Some(chunk_result) = upstream_stream.next().await {
                 match chunk_result {
                     Ok(chunk) => {
@@ -570,23 +572,69 @@ pub(super) async fn handle_simple_streaming_passthrough(
                                 let chunk_to_send = format!("{}\n\n", block_cow);
                                 if tx.send(Ok(Bytes::from(chunk_to_send))).is_err() {
                                     receiver_connected = false;
+                                    tracing::debug!(
+                                        "Client disconnected during /responses persistence \
+                                        stream from {}; continuing to drain upstream for \
+                                        storage",
+                                        upstream_url
+                                    );
                                 }
                             }
                         }
                     }
                     Err(err) => {
                         upstream_failed = true;
+                        tracing::error!(
+                            "Upstream /responses stream error from {}: {}",
+                            upstream_url,
+                            err
+                        );
                         let io_err = io::Error::other(err);
                         let _ = tx.send(Err(io_err));
                         break;
                     }
                 }
             }
+
+            if !upstream_failed {
+                if chunk_processor.has_remaining() {
+                    accumulator.ingest_block(&chunk_processor.take_remaining());
+                }
+                let encountered_error = accumulator.encountered_error().cloned();
+                if let Some(mut response_json) = accumulator.into_final_response() {
+                    patch_response_with_request_metadata(
+                        &mut response_json,
+                        &original_request,
+                        previous_response_id.as_deref(),
+                    );
+
+                    // Always persist conversation items and response (even without conversation)
+                    if let Err(err) = persist_conversation_items(
+                        storage.conversation.clone(),
+                        storage.conversation_item.clone(),
+                        storage.response.clone(),
+                        &response_json,
+                        &original_request,
+                    )
+                    .await
+                    {
+                        warn!("Failed to persist conversation items (stream): {}", err);
+                    }
+                } else if let Some(error_payload) = encountered_error {
+                    warn!("Upstream streaming error payload: {}", error_payload);
+                } else {
+                    warn!("Streaming completed without a final response payload");
+                }
+            }
         } else {
-            // No persistence: use select! to cancel upstream on client disconnect
+            // No persistence: use select! to cancel upstream on client disconnect.
+            // `biased;` drains a ready upstream chunk before observing client
+            // disconnect, so a chunk already produced by reqwest reaches the
+            // client before we tear the loop down.
             futures_util::pin_mut!(upstream_stream);
-            loop {
+            'outer: loop {
                 tokio::select! {
+                    biased;
                     chunk_result = upstream_stream.next() => {
                         match chunk_result {
                             Some(Ok(chunk)) => {
@@ -602,64 +650,45 @@ pub(super) async fn handle_simple_streaming_passthrough(
                                         None => Cow::Borrowed(raw_block.as_str()),
                                     };
 
-                                    if receiver_connected {
-                                        let chunk_to_send = format!("{}\n\n", block_cow);
-                                        if tx.send(Ok(Bytes::from(chunk_to_send))).is_err() {
-                                            receiver_connected = false;
-                                            break;
+                                    let chunk_to_send = format!("{}\n\n", block_cow);
+                                    if tx.send(Ok(Bytes::from(chunk_to_send))).is_err() {
+                                        if tx.is_closed() {
+                                            tracing::debug!(
+                                                "Receiver dropped (likely client disconnect), \
+                                                cancelling upstream /responses stream from {}",
+                                                upstream_url
+                                            );
+                                        } else {
+                                            tracing::warn!(
+                                                "/responses stream channel send failed \
+                                                unexpectedly for {} while receiver still open",
+                                                upstream_url
+                                            );
                                         }
+                                        break 'outer;
                                     }
-                                }
-
-                                if !receiver_connected {
-                                    break;
                                 }
                             }
                             Some(Err(err)) => {
-                                upstream_failed = true;
+                                tracing::error!(
+                                    "Upstream /responses stream error from {}: {}",
+                                    upstream_url, err
+                                );
                                 let io_err = io::Error::other(err);
                                 let _ = tx.send(Err(io_err));
-                                break;
+                                break 'outer;
                             }
-                            None => break,
+                            None => break 'outer,
                         }
                     }
                     _ = tx.closed() => {
-                        tracing::info!("Client disconnected, cancelling upstream stream");
-                        break;
+                        tracing::info!(
+                            "Client disconnected, cancelling upstream /responses stream from {}",
+                            upstream_url
+                        );
+                        break 'outer;
                     }
                 }
-            }
-        }
-
-        if (should_store || persist_needed) && !upstream_failed {
-            if chunk_processor.has_remaining() {
-                accumulator.ingest_block(&chunk_processor.take_remaining());
-            }
-            let encountered_error = accumulator.encountered_error().cloned();
-            if let Some(mut response_json) = accumulator.into_final_response() {
-                patch_response_with_request_metadata(
-                    &mut response_json,
-                    &original_request,
-                    previous_response_id.as_deref(),
-                );
-
-                // Always persist conversation items and response (even without conversation)
-                if let Err(err) = persist_conversation_items(
-                    storage.conversation.clone(),
-                    storage.conversation_item.clone(),
-                    storage.response.clone(),
-                    &response_json,
-                    &original_request,
-                )
-                .await
-                {
-                    warn!("Failed to persist conversation items (stream): {}", err);
-                }
-            } else if let Some(error_payload) = encountered_error {
-                warn!("Upstream streaming error payload: {}", error_payload);
-            } else {
-                warn!("Streaming completed without a final response payload");
             }
         }
     });
@@ -680,7 +709,17 @@ pub(super) async fn handle_simple_streaming_passthrough(
     response
 }
 
-/// Handle streaming WITH MCP tool call interception and execution
+/// Handle streaming WITH MCP tool call interception and execution.
+///
+/// Note on cancellation vs persistence:
+/// Unlike `handle_simple_streaming_passthrough`, this path does *not* keep
+/// consuming the upstream after a client disconnect even when `should_store`
+/// or `persist_needed` is set. Tool interception is multi-iteration and
+/// drives MCP tool execution between iterations, which is unbounded work.
+/// We deliberately give up on persistence when the client is gone so we
+/// don't keep workers and external MCP services busy on results no one
+/// will read. Callers that need guaranteed persistence on disconnect
+/// should not enable MCP tools for that request.
 pub(super) async fn handle_streaming_with_tool_interception(
     client: &reqwest::Client,
     headers: Option<&HeaderMap>,
@@ -744,9 +783,14 @@ pub(super) async fn handle_streaming_with_tool_interception(
 
         loop {
             // Check if the client has already disconnected before making a new
-            // upstream request (e.g. between tool-call iterations).
+            // upstream request (e.g. between tool-call iterations). This avoids
+            // issuing a fresh upstream HTTP request whose response we'd just
+            // discard. Mid-stream disconnects are caught by the inner select!.
             if tx.is_closed() {
-                tracing::info!("Client disconnected before next tool-call iteration, cancelling");
+                tracing::info!(
+                    "Client disconnected before next tool-call iteration to {}, cancelling",
+                    url_clone
+                );
                 return;
             }
 
@@ -760,11 +804,22 @@ pub(super) async fn handle_streaming_with_tool_interception(
             let response = match request_builder.send().await {
                 Ok(r) => r,
                 Err(e) => {
+                    tracing::error!(
+                        "Failed to send /responses tool-interception request to {}: {}",
+                        url_clone,
+                        e
+                    );
                     let error_event = format!(
                         "event: error\ndata: {{\"error\": {{\"message\": \"{}\"}}}}\n\n",
                         e
                     );
-                    let _ = tx.send(Ok(Bytes::from(error_event)));
+                    if tx.send(Ok(Bytes::from(error_event))).is_err() && !tx.is_closed() {
+                        tracing::warn!(
+                            "Failed to forward upstream-error event for {} while receiver \
+                            still open",
+                            url_clone
+                        );
+                    }
                     return;
                 }
             };
@@ -772,8 +827,21 @@ pub(super) async fn handle_streaming_with_tool_interception(
             if !response.status().is_success() {
                 let status = response.status();
                 let body = response.text().await.unwrap_or_default();
+                tracing::error!(
+                    "Upstream /responses tool-interception non-success from {}: status={} \
+                    body={}",
+                    url_clone,
+                    status,
+                    body
+                );
                 let error_event = format!("event: error\ndata: {{\"error\": {{\"message\": \"Upstream error {}: {}\"}}}}\n\n", status, body);
-                let _ = tx.send(Ok(Bytes::from(error_event)));
+                if tx.send(Ok(Bytes::from(error_event))).is_err() && !tx.is_closed() {
+                    tracing::warn!(
+                        "Failed to forward upstream-error event for {} while receiver \
+                        still open",
+                        url_clone
+                    );
+                }
                 return;
             }
 
@@ -781,6 +849,9 @@ pub(super) async fn handle_streaming_with_tool_interception(
             // Uses select! to race stream.next() against tx.closed() so that
             // when the client disconnects the upstream HTTP connection is dropped
             // promptly, allowing the engine to abort the request.
+            // `biased;` drains a ready upstream chunk before observing client
+            // disconnect, so a chunk already produced by reqwest reaches both
+            // the client and the chunk_processor before we tear the loop down.
             let upstream_stream = response.bytes_stream();
             futures_util::pin_mut!(upstream_stream);
             let mut handler = StreamingToolHandler::with_starting_index(next_output_index);
@@ -793,10 +864,15 @@ pub(super) async fn handle_streaming_with_tool_interception(
 
             loop {
                 let chunk_result = tokio::select! {
+                    biased;
                     chunk = upstream_stream.next() => chunk,
                     _ = tx.closed() => {
                         // Client disconnected — drop the stream and exit
-                        tracing::info!("Client disconnected, cancelling upstream tool-interception stream");
+                        tracing::info!(
+                            "Client disconnected, cancelling upstream /responses \
+                            tool-interception stream from {}",
+                            url_clone
+                        );
                         return;
                     }
                 };
@@ -907,8 +983,19 @@ pub(super) async fn handle_streaming_with_tool_interception(
                         }
                     }
                     Some(Err(e)) => {
+                        tracing::error!(
+                            "Upstream /responses tool-interception stream error from {}: {}",
+                            url_clone,
+                            e
+                        );
                         let error_event = format!("event: error\ndata: {{\"error\": {{\"message\": \"Stream error: {}\"}}}}\n\n", e);
-                        let _ = tx.send(Ok(Bytes::from(error_event)));
+                        if tx.send(Ok(Bytes::from(error_event))).is_err() && !tx.is_closed() {
+                            tracing::warn!(
+                                "Failed to forward stream-error event for {} while receiver \
+                                still open",
+                                url_clone
+                            );
+                        }
                         return;
                     }
                     None => break,
