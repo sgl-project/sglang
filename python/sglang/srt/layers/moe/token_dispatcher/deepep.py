@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, NamedTuple, Optional, Tuple, Union
@@ -22,7 +23,9 @@ from sglang.srt.layers.moe.token_dispatcher.base import (
 from sglang.srt.layers.moe.topk import TopKOutput
 from sglang.srt.layers.moe.utils import (
     DeepEPMode,
+    DeepOutputDtype,
     get_deepep_config,
+    get_deepep_output_dtype,
     get_moe_runner_backend,
     is_tbo_enabled,
 )
@@ -324,7 +327,6 @@ class _DeepEPDispatcherImplBase:
         self.params_dtype = params_dtype
         self.deepep_mode = deepep_mode
 
-        self.params_bytes = 2
         # A large value will lead to large memory occupation, thus users should change it accordingly
         self.num_max_dispatch_tokens_per_rank = (
             envs.SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK.get()
@@ -339,6 +341,21 @@ class _DeepEPDispatcherImplBase:
 
         self.overlap_args: Optional[CombineOverlapArgs] = None
         self.meta_overlap_args: Optional[dict] = None
+
+        self.deepep_output_dtype = get_deepep_output_dtype(self)
+        if self.deepep_output_dtype == DeepOutputDtype.BF16:
+            self.params_bytes = 2
+            self.use_nvfp4 = self.use_fp8 = False
+        elif self.deepep_output_dtype == DeepOutputDtype.FP8:
+            self.params_bytes = 1
+            self.use_nvfp4 = False
+            self.use_fp8 = True
+            if _is_npu:
+                os.environ["DEEP_NORMAL_MODE_USE_INT8_QUANT"] = "1"
+        elif self.deepep_output_dtype == DeepOutputDtype.NVFP4:
+            self.params_bytes = 1
+            self.use_nvfp4 = True
+            self.use_fp8 = False
 
     def dispatch_a(
         self,
@@ -366,6 +383,23 @@ class _DeepEPDispatcherImplBase:
 
     def set_quant_config(self, quant_config: dict) -> None:
         self.quant_config = quant_config
+
+        quant_scheme = self.quant_config.get("quant_scheme", None)
+        if quant_scheme is not None:
+            self.deepep_output_dtype = get_deepep_output_dtype(self, quant_scheme)
+            if self.deepep_output_dtype == DeepOutputDtype.BF16:
+                self.params_bytes = 2
+                self.use_nvfp4 = self.use_fp8 = False
+            elif self.deepep_output_dtype == DeepOutputDtype.FP8:
+                self.params_bytes = 1
+                self.use_nvfp4 = False
+                self.use_fp8 = True
+                if _is_npu:
+                    os.environ["DEEP_NORMAL_MODE_USE_INT8_QUANT"] = "1"
+            elif self.deepep_output_dtype == DeepOutputDtype.NVFP4:
+                self.params_bytes = 1
+                self.use_nvfp4 = True
+                self.use_fp8 = False
 
     def set_overlap_args(
         self, combine_overlap_args: CombineOverlapArgs, meta_overlap_args: dict
@@ -396,7 +430,7 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
         if (
             deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
             and not get_moe_runner_backend().is_cutlass()
-            and not envs.SGLANG_DEEPEP_BF16_DISPATCH.get()
+            and self.deepep_output_dtype != DeepOutputDtype.BF16
         ):
             # TODO hard code 128 block quant,use fp8 communication
             hidden_states = sglang_per_token_group_quant_fp8(
@@ -616,18 +650,7 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         hidden_states: torch.Tensor,
         topk_ids: torch.Tensor,
     ):
-        use_nvfp4 = use_fp8 = False
         input_global_scale = self.quant_config.get("input_global_scale", None)
-        if input_global_scale is not None:
-            use_nvfp4 = True
-        elif not get_moe_runner_backend().is_flashinfer_cutedsl() and (
-            not _is_npu or not envs.SGLANG_DEEPEP_BF16_DISPATCH.get()
-        ):
-            # flashinfer_cutedsl expects BF16 dispatch when NVFP4 dispatch is
-            # off; its kernel quantizes to NVFP4 internally.
-            # SGLANG_DEEPEP_BF16_DISPATCH forces BF16 dispatch for NPU
-            # where INT8 input + BF16 weight GMM is not supported.
-            use_fp8 = True
 
         # round_scale / use_ue8m0 are FP8-DeepGEMM specific; they cause DeepEP
         # to return int32-packed UE8M0 scales that don't feed the flashinfer
@@ -639,7 +662,7 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
                 use_ue8m0=deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
                 and deep_gemm_wrapper.DEEPGEMM_BLACKWELL,
             )
-            if use_fp8
+            if self.use_fp8
             else dict()
         )
 
@@ -651,8 +674,8 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
                 topk_ids,
                 self.num_max_dispatch_tokens_per_rank,
                 self.num_experts,
-                use_fp8=use_fp8,
-                **(dict(use_nvfp4=True) if use_nvfp4 else dict()),
+                use_fp8=self.use_fp8,
+                **(dict(use_nvfp4=True) if self.use_nvfp4 else dict()),
                 **(
                     dict(x_global_scale=input_global_scale)
                     if input_global_scale is not None

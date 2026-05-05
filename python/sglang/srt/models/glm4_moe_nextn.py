@@ -14,7 +14,6 @@
 
 """Inference-only GLM-4.5, GLM-4.6 Speculative Decoding."""
 
-import contextlib
 import logging
 from typing import Iterable, Optional, Tuple
 
@@ -23,7 +22,6 @@ from torch import nn
 from transformers import PretrainedConfig
 
 from sglang.srt.distributed import get_tensor_model_parallel_world_size
-from sglang.srt.environ import temp_set_env
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.layernorm import RMSNorm
@@ -156,18 +154,8 @@ class Glm4MoeForCausalLMNextN(Glm4MoeForCausalLM):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
-        # Support unquant speculative draft model
-        if self.needs_quant_draft:
-            cxt = contextlib.nullcontext()
-        else:
-            unquant_patch = {
-                "SGLANG_DEEPEP_BF16_DISPATCH": "1",
-                "DEEP_NORMAL_MODE_USE_INT8_QUANT": "0",
-            }
-            cxt = temp_set_env(allow_sglang=True, **unquant_patch)
 
-        with cxt:
-            hidden_states = self.model(input_ids, positions, forward_batch)
+        hidden_states = self.model(input_ids, positions, forward_batch)
 
         return self.logits_processor(
             input_ids, hidden_states, self.lm_head, forward_batch
