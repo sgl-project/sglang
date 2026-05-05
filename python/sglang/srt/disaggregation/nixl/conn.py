@@ -398,7 +398,7 @@ class NixlKVManager(CommonKVManager):
                                 : len(chunked_dst_kv_indice)
                             ]
 
-                        notif = f"{req.room}_kv_{kv_chunk.chunk_id}_{int(kv_chunk.is_last)}_{self.kv_args.pp_rank}"
+                        notif = f"{req.room}_kv_{kv_chunk.chunk_id}_{int(kv_chunk.is_last)}_{self.kv_args.engine_rank}"
 
                         if self.is_mla_backend or (decode_tp_size == self.attn_tp_size):
                             kv_xfer_handle = self.send_kvcache(
@@ -453,7 +453,9 @@ class NixlKVManager(CommonKVManager):
                         # encode pp_rank in aux notif so receiver can mark
                         # expected_kvs_per_pp[pp_rank] = 0.
                         if len(kv_chunk.prefill_kv_indices) == 0:
-                            aux_notif = f"{req.room}_aux_nokv_{self.kv_args.pp_rank}"
+                            aux_notif = (
+                                f"{req.room}_aux_nokv_{self.kv_args.engine_rank}"
+                            )
                         else:
                             aux_notif = f"{req.room}_aux"
                         aux_xfer_handle = self.send_aux(
