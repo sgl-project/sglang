@@ -57,8 +57,8 @@ Terminal 1 — start the LMCache daemon:
 ```bash
 lmcache server \
   --host 127.0.0.1 --port 5556 \
-  --chunk-size 256 --l1-size-gb 4 \
-  --eviction-policy LRU --disable-observability
+  --chunk-size 256 \
+  --eviction-policy LRU
 ```
 
 Terminal 2 — start SGLang pointing at the daemon:
