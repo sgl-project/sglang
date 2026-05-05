@@ -3,9 +3,8 @@ import json
 import os
 import re
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
-import torch
 from safetensors import safe_open
 
 from sglang.multimodal_gen.runtime.layers.quantization import (
@@ -17,7 +16,59 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 logger = init_logger(__name__)
 
 
+def normalize_flat_modelopt_quant_config(
+    quant_cfg: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    """Fill required diffusers fields for flat ModelOpt component configs."""
+    if not isinstance(quant_cfg, dict) or quant_cfg.get("quant_method") != "modelopt":
+        return quant_cfg
+
+    quant_algo = str(
+        quant_cfg.get("quant_algo")
+        or quant_cfg.get("quantization", {}).get("quant_algo")
+        or ""
+    ).upper()
+    if not quant_algo:
+        return quant_cfg
+
+    normalized = dict(quant_cfg)
+    normalized.setdefault("quant_type", quant_algo)
+    return normalized
+
+
+def _infer_nvfp4_group_size_from_tensors(weight, scale) -> Optional[int]:
+    """Infer NVFP4 group_size from serialized weight/scale tensor shapes."""
+    weight_shape = tuple(getattr(weight, "shape", ()))
+    scale_shape = tuple(getattr(scale, "shape", ()))
+    if len(weight_shape) < 2:
+        return None
+
+    input_size = int(weight_shape[1]) * 2
+    if input_size <= 0:
+        return None
+
+    candidate_num_groups: list[int] = []
+    if len(scale_shape) >= 2:
+        candidate_num_groups.append(int(scale_shape[-1]))
+    elif len(scale_shape) == 1:
+        scale_len = int(scale_shape[0])
+        if scale_len == int(weight_shape[0]):
+            candidate_num_groups.append(1)
+        candidate_num_groups.append(scale_len)
+    else:
+        candidate_num_groups.append(1)
+
+    for num_groups in candidate_num_groups:
+        if num_groups <= 0:
+            continue
+        if input_size % num_groups == 0:
+            return input_size // num_groups
+
+    return None
+
+
 def _resolve_quant_method_name(quant_cfg: dict) -> str:
+    quant_cfg = normalize_flat_modelopt_quant_config(quant_cfg) or quant_cfg
     quant_method = quant_cfg.get("quant_method")
     if quant_method != "modelopt":
         return quant_method
@@ -79,7 +130,9 @@ def get_quant_config(
     if "quantization_config" not in model_config:
         return None
 
-    hf_quant_config = model_config["quantization_config"]
+    hf_quant_config = normalize_flat_modelopt_quant_config(
+        model_config["quantization_config"]
+    )
     if hf_quant_config is not None and not isinstance(hf_quant_config, dict):
         hf_quant_config = hf_quant_config.to_dict()
     quant_cls = _load_quant_cls(hf_quant_config)
@@ -210,6 +263,8 @@ def get_metadata_from_safetensors_file(file_path: str):
 def _build_nvfp4_config_from_safetensors_files(
     file_paths: list[str],
     param_names_mapping_dict: Optional[dict] = None,
+    reverse_param_names_mapping_dict: Optional[dict] = None,
+    fallback_group_size: Optional[int] = None,
 ) -> Optional[QuantizationConfig]:
     """Build a single NVFP4 config by aggregating metadata across multiple files.
 
@@ -220,7 +275,7 @@ def _build_nvfp4_config_from_safetensors_files(
     group_size = None
     quantized_bfl_modules: set[str] = set()
     non_quantized_bfl_modules: set[str] = set()
-    files_with_nvfp4_metadata: list[str] = []
+    files_with_nvfp4_signal: list[str] = []
     checkpoint_uses_packed_qkv = False
     packed_qkv_pattern = re.compile(
         r"^(double_blocks\.\d+\.(img|txt)_attn\.qkv|single_blocks\.\d+\.linear1)\."
@@ -228,79 +283,144 @@ def _build_nvfp4_config_from_safetensors_files(
 
     for file_path in file_paths:
         metadata = get_metadata_from_safetensors_file(file_path)
-        if not metadata:
-            continue
+        quant_config_dict = None
+        metadata_signals_nvfp4 = False
+        if metadata:
+            quant_config_str = metadata.get("_quantization_metadata")
+            if quant_config_str:
+                try:
+                    quant_config_dict = json.loads(quant_config_str)
+                except json.JSONDecodeError:
+                    quant_config_dict = None
+                else:
+                    quant_algo = str(quant_config_dict.get("quant_algo", "")).upper()
+                    quant_type = str(quant_config_dict.get("quant_type", "")).upper()
+                    metadata_signals_nvfp4 = (
+                        "NVFP4" in quant_algo
+                        or "FP4" in quant_algo
+                        or "NVFP4" in quant_type
+                    )
 
-        quant_config_str = metadata.get("_quantization_metadata")
-        if not quant_config_str:
-            continue
-
-        quant_config_dict = json.loads(quant_config_str)
+        file_quantized_modules: set[str] = set()
         if (
-            "format_version" not in quant_config_dict
-            or "layers" not in quant_config_dict
+            quant_config_dict is not None
+            and "format_version" in quant_config_dict
+            and "layers" in quant_config_dict
         ):
-            continue
-
-        layers = quant_config_dict.get("layers", {})
-        file_quantized_modules = {
-            layer_name
-            for layer_name, layer_cfg in layers.items()
-            if isinstance(layer_cfg, dict) and layer_cfg.get("format") == "nvfp4"
-        }
-        if not file_quantized_modules:
-            continue
-
-        files_with_nvfp4_metadata.append(file_path)
-        quantized_bfl_modules.update(file_quantized_modules)
+            layers = quant_config_dict.get("layers", {})
+            file_quantized_modules.update(
+                layer_name
+                for layer_name, layer_cfg in layers.items()
+                if isinstance(layer_cfg, dict) and layer_cfg.get("format") == "nvfp4"
+            )
 
         with safe_open(file_path, framework="pt", device="cpu") as f:
             all_keys = set(f.keys())
             if any(packed_qkv_pattern.match(k) for k in all_keys):
                 checkpoint_uses_packed_qkv = True
 
+            # Some ModelOpt NVFP4 exports only store a flat config.json plus
+            # per-file metadata without the diffusers `layers` section. Infer
+            # quantized modules directly from tensor families in that case:
+            # quantized modules ship `.weight` + `.weight_scale`, while BF16
+            # fallbacks only ship `.weight`.
+            file_quantized_modules.update(
+                key[: -len(".weight_scale")]
+                for key in all_keys
+                if key.endswith(".weight_scale")
+                and f"{key[: -len('.weight_scale')]}.weight" in all_keys
+            )
+
+            if file_quantized_modules or metadata_signals_nvfp4:
+                files_with_nvfp4_signal.append(file_path)
+            quantized_bfl_modules.update(file_quantized_modules)
+
             if group_size is None:
-                for layer_name in file_quantized_modules:
+                for layer_name in sorted(file_quantized_modules):
                     weight_key = f"{layer_name}.weight"
                     scale_key = f"{layer_name}.weight_scale"
                     if weight_key in all_keys and scale_key in all_keys:
                         w = f.get_tensor(weight_key)
                         s = f.get_tensor(scale_key)
-                        input_size = w.shape[1] * 2
-                        group_size = input_size // s.shape[1]
-                        break
+                        group_size = _infer_nvfp4_group_size_from_tensors(w, s)
+                        if group_size is not None:
+                            break
 
             for k in sorted(all_keys):
                 if not k.endswith(".weight"):
                     continue
-                t = f.get_tensor(k)
-                if t.dtype != torch.uint8:
-                    non_quantized_bfl_modules.add(k[: -len(".weight")])
+                module_name = k[: -len(".weight")]
+                if module_name not in file_quantized_modules:
+                    non_quantized_bfl_modules.add(module_name)
 
-    if not files_with_nvfp4_metadata:
+    if not files_with_nvfp4_signal:
         return None
+
+    if (
+        group_size is not None
+        and fallback_group_size is not None
+        and group_size != fallback_group_size
+    ):
+        logger.warning(
+            "NVFP4 group_size inferred from safetensors (%d) does not match config (%d); "
+            "preferring safetensors.",
+            group_size,
+            fallback_group_size,
+        )
+
+    if group_size is None and fallback_group_size is not None:
+        logger.info(
+            "Falling back to config-derived NVFP4 group_size=%d for %s",
+            fallback_group_size,
+            ", ".join(files_with_nvfp4_signal),
+        )
+        group_size = fallback_group_size
 
     if group_size is None:
         logger.warning(
             "Could not infer group_size from NVFP4 safetensors: %s",
-            ", ".join(files_with_nvfp4_metadata),
+            ", ".join(files_with_nvfp4_signal),
         )
         return None
 
     exclude_bfl_modules = sorted(non_quantized_bfl_modules - quantized_bfl_modules)
 
     exclude_modules = []
-    if param_names_mapping_dict:
+    mapping_fn = None
+    reverse_mapping_fn = None
+    if param_names_mapping_dict or reverse_param_names_mapping_dict:
         from sglang.multimodal_gen.runtime.loader.utils import get_param_names_mapping
 
-        mapping_fn = get_param_names_mapping(param_names_mapping_dict)
-        for module_bfl in exclude_bfl_modules:
-            mapped, _, _ = mapping_fn(f"{module_bfl}.weight")
-            exclude_modules.append(
-                mapped[: -len(".weight")] if mapped.endswith(".weight") else mapped
+        if param_names_mapping_dict:
+            mapping_fn = get_param_names_mapping(param_names_mapping_dict)
+        if reverse_param_names_mapping_dict:
+            reverse_mapping_fn = get_param_names_mapping(
+                reverse_param_names_mapping_dict
             )
-    else:
-        exclude_modules = exclude_bfl_modules
+
+    for module_bfl in exclude_bfl_modules:
+        raw_weight_name = f"{module_bfl}.weight"
+        if mapping_fn is not None:
+            mapped, _, _ = mapping_fn(raw_weight_name)
+            if mapped != raw_weight_name:
+                exclude_modules.append(
+                    mapped[: -len(".weight")] if mapped.endswith(".weight") else mapped
+                )
+                continue
+
+        if reverse_mapping_fn is not None:
+            reverse_mapped, _, _ = reverse_mapping_fn(raw_weight_name)
+            if reverse_mapped != raw_weight_name:
+                exclude_modules.append(
+                    reverse_mapped[: -len(".weight")]
+                    if reverse_mapped.endswith(".weight")
+                    else reverse_mapped
+                )
+                continue
+
+        exclude_modules.append(module_bfl)
+
+    exclude_modules = sorted(set(exclude_modules))
 
     try:
         quant_cls = get_quantization_config("modelopt_fp4")
@@ -314,7 +434,7 @@ def _build_nvfp4_config_from_safetensors_files(
         )
         logger.info(
             "Built NVFP4 quant config from %d safetensors: group_size=%d, %d excluded modules, packed_qkv=%s",
-            len(files_with_nvfp4_metadata),
+            len(files_with_nvfp4_signal),
             group_size,
             len(exclude_modules),
             checkpoint_uses_packed_qkv,
@@ -323,7 +443,7 @@ def _build_nvfp4_config_from_safetensors_files(
     except Exception as e:
         logger.warning(
             "Failed to build NVFP4 config from %s: %s",
-            ", ".join(files_with_nvfp4_metadata),
+            ", ".join(files_with_nvfp4_signal),
             e,
         )
         return None
@@ -332,17 +452,27 @@ def _build_nvfp4_config_from_safetensors_files(
 def build_nvfp4_config_from_safetensors(
     file_path: str,
     param_names_mapping_dict: Optional[dict] = None,
+    reverse_param_names_mapping_dict: Optional[dict] = None,
+    fallback_group_size: Optional[int] = None,
 ) -> Optional[QuantizationConfig]:
     """Backward-compatible wrapper for a single safetensors file."""
     return _build_nvfp4_config_from_safetensors_files(
-        [file_path], param_names_mapping_dict
+        [file_path],
+        param_names_mapping_dict,
+        reverse_param_names_mapping_dict,
+        fallback_group_size,
     )
 
 
 def build_nvfp4_config_from_safetensors_list(
     file_paths: list[str],
     param_names_mapping_dict: Optional[dict] = None,
+    reverse_param_names_mapping_dict: Optional[dict] = None,
+    fallback_group_size: Optional[int] = None,
 ) -> Optional[QuantizationConfig]:
     return _build_nvfp4_config_from_safetensors_files(
-        file_paths, param_names_mapping_dict
+        file_paths,
+        param_names_mapping_dict,
+        reverse_param_names_mapping_dict,
+        fallback_group_size,
     )

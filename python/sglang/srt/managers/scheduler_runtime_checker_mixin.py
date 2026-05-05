@@ -8,10 +8,8 @@ from typing import TYPE_CHECKING, List, Optional, Tuple
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
-from sglang.srt.mem_cache.session_aware_cache import SessionAwareCache
 from sglang.srt.observability.metrics_collector import QueueCount
 from sglang.srt.utils.common import ceil_align, raise_error_or_warn
-from sglang.srt.utils.request_logger import disable_request_logging
 from sglang.srt.utils.watchdog import WatchdogRaw
 
 if TYPE_CHECKING:
@@ -157,24 +155,19 @@ class SchedulerRuntimeCheckerMixin:
         return idxs
 
     def _session_held_tokens(self: Scheduler) -> int:
-        if isinstance(self.tree_cache, SessionAwareCache):
-            return self.tree_cache.session_held_tokens(self._active_pool_idxs())
-        return 0
+        return self.tree_cache.session_held_tokens(self._active_pool_idxs())
 
     def _session_held_full_tokens(self: Scheduler) -> int:
-        if isinstance(self.tree_cache, SessionAwareCache):
-            return self.tree_cache.session_held_full_tokens(self._active_pool_idxs())
-        return 0
+        return self.tree_cache.session_held_full_tokens(self._active_pool_idxs())
 
     def _session_held_swa_tokens(self: Scheduler) -> int:
-        if isinstance(self.tree_cache, SessionAwareCache):
-            return self.tree_cache.session_held_swa_tokens(self._active_pool_idxs())
-        return 0
+        return self.tree_cache.session_held_swa_tokens(self._active_pool_idxs())
 
     def _session_held_req_count(self: Scheduler) -> int:
-        if isinstance(self.tree_cache, SessionAwareCache):
-            return self.tree_cache.session_held_req_count()
-        return 0
+        return self.tree_cache.session_held_req_count()
+
+    def _session_held_mamba_slots(self: Scheduler) -> int:
+        return self.tree_cache.session_held_mamba_slots(self._active_pool_idxs())
 
     def get_pool_stats(self: Scheduler) -> PoolStats:
         if self.is_hybrid_swa:
@@ -345,7 +338,7 @@ class SchedulerRuntimeCheckerMixin:
             ps.mamba_available_size,
             ps.mamba_evictable_size,
             self.tree_cache.mamba_protected_size(),
-            0,
+            self._session_held_mamba_slots(),
             self.req_to_token_pool.mamba_pool.size,
         )
         if leak:
@@ -519,7 +512,7 @@ class SchedulerRuntimeCheckerMixin:
         )
         self.stats.num_grammar_queue_reqs = len(self.grammar_manager)
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
-            self.stats.num_prefill_prealloc_queue_reqs = QueueCount.from_reqs(
+            self.stats.num_prefill_bootstrap_queue_reqs = QueueCount.from_reqs(
                 self.disagg_prefill_bootstrap_queue.queue, priority_enabled
             )
             self.stats.num_prefill_inflight_queue_reqs = QueueCount.from_reqs(
@@ -565,6 +558,9 @@ class SchedulerRuntimeCheckerMixin:
         # reset token ratio
         self.new_token_ratio = self.init_new_token_ratio
 
+        # reset device timer window so idle time isn't counted
+        self.reset_device_timer_window()
+
         # sleep until next event
         self.maybe_sleep_on_idle()
 
@@ -573,7 +569,7 @@ def create_scheduler_watchdog(
     scheduler: Scheduler, watchdog_timeout: float, soft: bool = False
 ) -> WatchdogRaw:
     def dump_info() -> str:
-        if scheduler.is_initializing or disable_request_logging():
+        if scheduler.is_initializing:
             return ""
         _, messages = scheduler._check_all_pools(scheduler.get_pool_stats())
         return (

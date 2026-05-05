@@ -30,7 +30,7 @@ from sglang.srt.lora.lora_moe_runners import LoRAInfo
 from sglang.srt.utils import set_random_seed
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=80, suite="stage-b-test-1-gpu-large")
+register_cuda_ci(est_time=17, suite="stage-b-test-1-gpu-large")
 
 
 def generate_request_data(
@@ -416,7 +416,7 @@ def test_lora_moe_runner_multi_expert(
         enable_deterministic_inference = False
 
     with patch(
-        "sglang.srt.layers.moe.fused_moe_triton.fused_moe_triton_config.get_global_server_args",
+        "sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe_triton_config.get_global_server_args",
         return_value=MockServerArgs(),
     ):
         runner = MoeRunner(MoeRunnerBackend.TRITON, config, lora_enabled=True)
@@ -566,7 +566,7 @@ def test_lora_moe_runner_virtual_experts(
         enable_deterministic_inference = False
 
     with patch(
-        "sglang.srt.layers.moe.fused_moe_triton.fused_moe_triton_config.get_global_server_args",
+        "sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe_triton_config.get_global_server_args",
         return_value=MockServerArgs(),
     ):
         runner = MoeRunner(MoeRunnerBackend.TRITON, config, lora_enabled=True)
@@ -758,7 +758,7 @@ def test_lora_moe_runner_marlin(num_tokens, top_k_num, num_experts, max_lora_ran
         enable_deterministic_inference = False
 
     with patch(
-        "sglang.srt.layers.moe.fused_moe_triton.fused_moe_triton_config.get_global_server_args",
+        "sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe_triton_config.get_global_server_args",
         return_value=MockServerArgs(),
     ):
         runner = MoeRunner(MoeRunnerBackend.MARLIN, config, lora_enabled=True)

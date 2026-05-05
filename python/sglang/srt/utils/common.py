@@ -365,7 +365,7 @@ def get_int_env_var(name: str, default: int = 0) -> int:
 
 
 def support_triton(backend: str) -> bool:
-    return backend not in ["torch_native", "intel_amx", "ascend"]
+    return backend not in ["torch_native", "intel_amx"]
 
 
 _ENABLE_TORCH_INFERENCE_MODE = get_bool_env_var(
@@ -590,6 +590,18 @@ def get_available_gpu_memory(
         free_gpu_memory, total_gpu_memory = torch.musa.mem_get_info()
     elif device == "mps":
         free_gpu_memory = psutil.virtual_memory().available
+    else:
+        from sglang.srt.platforms import current_platform
+
+        if not current_platform.is_out_of_tree():
+            raise ValueError(
+                f"Unsupported device type: {device!r}. "
+                "If this is an OOT platform, ensure it is properly registered "
+                "via the 'sglang.platform_plugins' entry point."
+            )
+        total_mem = current_platform.get_device_total_memory(gpu_id)
+        used_mem = current_platform.get_current_memory_usage()
+        free_gpu_memory = total_mem - used_mem
 
     if distributed:
         tensor = torch.tensor(free_gpu_memory, dtype=torch.float32)
@@ -676,6 +688,16 @@ def make_layers_non_pp(
     return layers
 
 
+def get_dispatch_device_backend():
+    if is_cuda_alike():
+        dispatch_key = "CUDA"
+    elif is_xpu():
+        dispatch_key = "XPU"
+    else:
+        raise RuntimeError("No supported accelerator (CUDA/XPU) available")
+    return dispatch_key
+
+
 @lru_cache(maxsize=1)
 def get_device_module():
     return torch.get_device_module()
@@ -688,6 +710,8 @@ def set_random_seed(seed: int) -> None:
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+    if torch.xpu.is_available():
+        torch.xpu.manual_seed_all(seed)
 
 
 def load_audio(
@@ -763,6 +787,13 @@ class ImageData:
     url: str
     detail: Optional[Literal["auto", "low", "high"]] = "auto"
     max_dynamic_patch: Optional[int] = None
+    preprocess_kwargs: Optional[Dict] = None
+
+
+@dataclass
+class VideoData:
+    url: str
+    preprocess_kwargs: Optional[Dict] = None
 
 
 image_extension_names = (".png", ".jpg", ".jpeg", ".webp", ".gif")
@@ -900,7 +931,11 @@ def _normalize_video_input(
         return None
 
 
-def load_video(video_file: Union[str, bytes], use_gpu: bool = True):
+def load_video(video_file: Union[str, bytes, VideoData], use_gpu: bool = True):
+    if isinstance(video_file, VideoData):
+        # preprocess_kwargs is consumed by the multimodal processor, not here.
+        video_file = video_file.url
+
     if isinstance(video_file, (list, tuple, torch.Tensor, np.ndarray)):
         return video_file
 
@@ -1023,7 +1058,7 @@ def check_pkg_version_at_least(pkg: str, min_version: str) -> bool:
 
     Args:
         pkg: Package name (distribution name, e.g., "flashinfer-python")
-        min_version: Minimum version required (e.g., "0.6.7.post3")
+        min_version: Minimum version required (e.g., "0.6.8.post1")
 
     Returns:
         True if package is installed and version >= min_version, False otherwise
@@ -1035,8 +1070,48 @@ def check_pkg_version_at_least(pkg: str, min_version: str) -> bool:
         return False
 
 
-def kill_process_tree(parent_pid, include_parent: bool = True, skip_pid: int = None):
-    """Kill the process and all its child processes."""
+def _wait_for_reap_or_raise(procs, wait_timeout: float) -> None:
+    """Wait for `procs` to exit; warn at ~10s, raise on `wait_timeout`.
+
+    SIGKILL is asynchronous -- children hold GPU context, pinned memory and
+    fds until the kernel reaps them. Raise on timeout so a stuck process
+    surfaces instead of leaving a latent race.
+    """
+    warn_at = min(10.0, wait_timeout / 2)
+    gone, alive = psutil.wait_procs(procs, timeout=warn_at)
+    if not alive:
+        return
+    logger.warning(
+        "kill_process_tree: %d process(es) still alive after %.1fs SIGKILL; "
+        "continuing to wait up to %.1fs total. pids=%s",
+        len(alive),
+        warn_at,
+        wait_timeout,
+        [p.pid for p in alive],
+    )
+    remaining = wait_timeout - warn_at
+    if remaining > 0:
+        _, alive = psutil.wait_procs(alive, timeout=remaining)
+    if alive:
+        raise RuntimeError(
+            f"kill_process_tree: {len(alive)} process(es) not reaped within "
+            f"{wait_timeout}s after SIGKILL; pids={[p.pid for p in alive]}"
+        )
+
+
+def kill_process_tree(
+    parent_pid,
+    include_parent: bool = True,
+    skip_pid: int = None,
+    wait_timeout: Optional[float] = None,
+):
+    """Kill the process and all its child processes.
+
+    `wait_timeout` (seconds) blocks until every killed process is reaped and
+    raises `RuntimeError` on timeout; `None` is fire-and-forget. The
+    `parent_pid == os.getpid()` branch calls `sys.exit(0)` and cannot wait
+    for itself -- use `include_parent=False` if child reap must finish first.
+    """
     if parent_pid is None:
         parent_pid = os.getpid()
         include_parent = False
@@ -1047,11 +1122,13 @@ def kill_process_tree(parent_pid, include_parent: bool = True, skip_pid: int = N
         return
 
     children = itself.children(recursive=True)
+    killed = []
     for child in children:
         if child.pid == skip_pid:
             continue
         try:
             child.kill()
+            killed.append(child)
         except psutil.NoSuchProcess:
             pass
 
@@ -1066,8 +1143,12 @@ def kill_process_tree(parent_pid, include_parent: bool = True, skip_pid: int = N
             # Sometime processes cannot be killed with SIGKILL (e.g, PID=1 launched by kubernetes),
             # so we send an additional signal to kill them.
             itself.send_signal(signal.SIGQUIT)
+            killed.append(itself)
         except psutil.NoSuchProcess:
             pass
+
+    if wait_timeout is not None and killed:
+        _wait_for_reap_or_raise(killed, wait_timeout)
 
 
 def monkey_patch_p2p_access_check():
@@ -1472,7 +1553,7 @@ def get_amdgpu_memory_capacity():
 
 
 def get_device_sm():
-    if torch.cuda.is_available():
+    if torch.cuda.is_available() or is_musa():
         major, minor = torch.cuda.get_device_capability()
         return major * 10 + minor
     return 0
@@ -1671,6 +1752,14 @@ def get_mtgpu_memory_capacity():
 
 
 def get_device_memory_capacity(device: str = None):
+    # OOT platforms provide their own memory query via the platform class.
+    from sglang.srt.platforms import current_platform
+
+    if current_platform.is_out_of_tree():
+        mem_bytes = current_platform.get_device_total_memory()
+        if mem_bytes:
+            return mem_bytes / (1 << 20)  # bytes -> MiB
+        return None
     if is_cuda():
         gpu_mem = get_nvgpu_memory_capacity()
     elif is_hip():
@@ -1882,6 +1971,8 @@ def get_device_count() -> int:
 def get_device_core_count(device_id: int = 0) -> int:
     if (hasattr(torch, "cuda") and torch.cuda.is_available()) or is_musa():
         return torch.cuda.get_device_properties(device_id).multi_processor_count
+    elif hasattr(torch, "xpu") and torch.xpu.is_available():
+        return torch.xpu.get_device_properties(device_id).gpu_eu_count
 
     return 0
 
@@ -1913,6 +2004,12 @@ def get_device_capability(device_id: int = 0) -> Tuple[int, int]:
 
 
 def get_compiler_backend(mode=None) -> str:
+    # OOT platforms provide their own compile backend.
+    from sglang.srt.platforms import current_platform
+
+    if current_platform.is_out_of_tree():
+        return current_platform.get_compile_backend(mode)
+
     if hasattr(torch, "hpu") and torch.hpu.is_available():
         return "hpu_backend"
 
@@ -2002,6 +2099,8 @@ def direct_register_custom_op(
             my_lib.impl(op_name, op_func, "PrivateUse1")
         elif is_xpu():
             my_lib.impl(op_name, op_func, "XPU")
+        elif is_musa():
+            my_lib.impl(op_name, op_func, "MUSA")
         else:
             my_lib.impl(op_name, op_func, "CUDA")
         if fake_impl is not None:
@@ -2266,16 +2365,18 @@ def human_readable_int(value: str) -> int:
 
 def pyspy_dump_schedulers():
     """py-spy dump on all scheduler in a local node."""
-    try:
-        pid = psutil.Process().pid
-        # Command to run py-spy with the PID
-        cmd = f"py-spy dump --native --pid {pid}"
-        result = subprocess.run(
-            cmd, shell=True, capture_output=True, text=True, check=True
-        )
-        logger.error(f"Pyspy dump for PID {pid}:\n{result.stdout}")
-    except subprocess.CalledProcessError as e:
-        logger.error(f"Pyspy failed to dump PID {pid}. Error: {e.stderr}")
+    pid = psutil.Process().pid
+    for attempt, native_flag in enumerate(["--native", ""]):
+        try:
+            cmd = f"py-spy dump {native_flag} --pid {pid}".strip()
+            result = subprocess.run(
+                cmd, shell=True, capture_output=True, text=True, check=True
+            )
+            logger.error(f"Pyspy dump for PID {pid} ({cmd}):\n{result.stdout}")
+            return
+        except subprocess.CalledProcessError as e:
+            logger.error(f"Pyspy failed ({cmd}). Error: {e.stderr}")
+    logger.error(f"All pyspy dump attempts failed for PID {pid}.")
 
 
 def kill_itself_when_parent_died():
@@ -2630,6 +2731,73 @@ def get_quantization_config(hf_config) -> str | None:
     return None
 
 
+def has_fp8_weights_in_checkpoint(model_path: str) -> bool:
+    """Check if a model checkpoint actually contains FP8 (float8_e4m3fn) expert
+    weight tensors by reading safetensors metadata headers.
+
+    This is needed because some models (e.g. DeepSeek V3/R1) use native FP8 MoE
+    experts without declaring it in quantization_config, while other models
+    sharing the same architecture (e.g. Moonlight) are purely BF16.
+
+    Accepts a local directory or a HuggingFace repo ID. For remote repos, only
+    safetensors headers (a few KB) are fetched via byte-range reads; full
+    shards are never downloaded.
+    """
+    import json
+    import struct
+
+    try:
+        if os.path.isdir(model_path):
+
+            def _open(name):
+                return open(os.path.join(model_path, name), "rb")
+
+            def _exists(name):
+                return os.path.exists(os.path.join(model_path, name))
+
+        else:
+            from huggingface_hub import HfFileSystem
+
+            fs = HfFileSystem()
+
+            def _open(name):
+                return fs.open(f"{model_path}/{name}", "rb")
+
+            def _exists(name):
+                return fs.exists(f"{model_path}/{name}")
+
+        if _exists("model.safetensors.index.json"):
+            with _open("model.safetensors.index.json") as f:
+                weight_map = json.loads(f.read()).get("weight_map", {})
+            expert_files = sorted(
+                {v for k, v in weight_map.items() if "experts" in k and "weight" in k}
+            )
+            shard_file = (
+                expert_files[0]
+                if expert_files
+                else next(iter(sorted(set(weight_map.values()))), None)
+            )
+            if shard_file is None:
+                return False
+        elif _exists("model.safetensors"):
+            shard_file = "model.safetensors"
+        else:
+            return False
+
+        with _open(shard_file) as f:
+            header_len = struct.unpack("<Q", f.read(8))[0]
+            header = json.loads(f.read(header_len))
+
+        for key, meta in header.items():
+            if key == "__metadata__":
+                continue
+            if "experts" in key and "weight" in key:
+                return meta.get("dtype") == "F8_E4M3"
+        return False
+    except Exception:
+        return False
+
+
 def flatten_nested_list(nested_list):
     if isinstance(nested_list, list):
         return [
@@ -2695,6 +2863,7 @@ def is_fa3_default_architecture(hf_config):
         "GlmOcrForConditionalGeneration",
         "Step3VLForConditionalGeneration",
         "StepVLForConditionalGeneration",
+        "MiMoV2ForCausalLM",
         "MiMoV2FlashForCausalLM",
     }
     return architectures[0] in default_archs
@@ -2719,8 +2888,30 @@ def log_info_on_rank0(logger, msg):
     try:
         if torch.distributed.is_initialized() and get_tensor_model_parallel_rank() == 0:
             logger.info(msg)
-    except:
-        logger.info(msg)
+    except Exception as e:
+        if torch.distributed.is_initialized():
+            if torch.distributed.get_rank() == 0:
+                logger.info(f"{msg} (rank-check failed: {e})")
+        else:
+            logger.info(f"{msg} (rank-check failed: {e})")
+
+
+def log_debug_on_rank0(logger, msg):
+    """
+    Log a debug message only on tensor model parallel rank 0.
+    Falls back to logging if distributed is not initialized or error occurs.
+    """
+    from sglang.srt.distributed import get_tensor_model_parallel_rank
+
+    try:
+        if torch.distributed.is_initialized() and get_tensor_model_parallel_rank() == 0:
+            logger.debug(msg)
+    except Exception as e:
+        if torch.distributed.is_initialized():
+            if torch.distributed.get_rank() == 0:
+                logger.debug(f"{msg} (rank-check failed: {e})")
+        else:
+            logger.debug(f"{msg} (rank-check failed: {e})")
 
 
 def load_json_config(data: str):
@@ -3299,6 +3490,12 @@ def is_gfx95_supported():
         return False
 
 
+def get_hip_version():
+    if torch.version.hip:
+        return tuple(map(int, torch.version.hip.split("-")[0].split(".")))
+    return (0, 0, 0)
+
+
 # LoRA-related constants and utilities
 SUPPORTED_LORA_TARGET_MODULES = [
     "q_proj",
@@ -3451,6 +3648,15 @@ def check_cuda_result(raw_output):
         raise Exception(f"CUDA error: {err}")
 
     return results
+
+
+def get_cuda_driver_bindings():
+    try:
+        from cuda.bindings import driver as cuda_driver
+    except ImportError:
+        from cuda import cuda as cuda_driver
+
+    return cuda_driver
 
 
 def get_physical_device_id(pytorch_device_id: int) -> int:
