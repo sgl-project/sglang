@@ -16,7 +16,7 @@ from sglang.test.test_utils import (
     try_cached_model,
 )
 
-register_cuda_ci(est_time=120, suite="stage-c-test-8-gpu-h20")
+register_cuda_ci(est_time=300, suite="stage-c-test-8-gpu-h20")
 
 
 def _has_nixl():
@@ -27,18 +27,26 @@ def _has_nixl():
     return True
 
 
-@unittest.skipUnless(
-    is_in_ci() or _has_nixl(),
-    "NIXL is required for decode radix cache disaggregation coverage.",
-)
-class TestDisaggregationDecodeRadixCache(PDDisaggregationServerBase):
+def _has_mooncake():
+    try:
+        import mooncake.engine  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
+class DisaggregationDecodeRadixCacheTestMixin:
     extra_decode_args = ["--disaggregation-decode-enable-radix-cache"]
+    transfer_backend_name = None
 
     @classmethod
     def setUpClass(cls):
         super().setUpClass()
         cls.model = try_cached_model(DEFAULT_MODEL_NAME_FOR_TEST)
-        cls.transfer_backend = ["--disaggregation-transfer-backend", "nixl"]
+        cls.transfer_backend = [
+            "--disaggregation-transfer-backend",
+            cls.transfer_backend_name,
+        ]
         cls.launch_all()
 
     def _assert_process_healthy(self, name, process, url):
@@ -99,11 +107,9 @@ class TestDisaggregationDecodeRadixCache(PDDisaggregationServerBase):
         metrics_second = run_eval(args)
         print(f"Second run metrics: {metrics_second}")
 
-        # Both runs should have reasonable accuracy
         self.assertGreater(metrics_first["score"], 0.80)
         self.assertGreater(metrics_second["score"], 0.80)
 
-        # Second run accuracy should not drop more than 3% compared to first run
         accuracy_drop = metrics_first["score"] - metrics_second["score"]
         self.assertLessEqual(
             accuracy_drop,
@@ -112,6 +118,26 @@ class TestDisaggregationDecodeRadixCache(PDDisaggregationServerBase):
             f"(first={metrics_first['score']:.4f}, second={metrics_second['score']:.4f}), "
             f"exceeds 3% threshold",
         )
+
+
+@unittest.skipUnless(
+    is_in_ci() or _has_nixl(),
+    "NIXL is required for decode radix cache disaggregation coverage.",
+)
+class TestDisaggregationDecodeRadixCacheNixl(
+    DisaggregationDecodeRadixCacheTestMixin, PDDisaggregationServerBase
+):
+    transfer_backend_name = "nixl"
+
+
+@unittest.skipUnless(
+    is_in_ci() or _has_mooncake(),
+    "Mooncake is required for decode radix cache disaggregation coverage.",
+)
+class TestDisaggregationDecodeRadixCacheMooncake(
+    DisaggregationDecodeRadixCacheTestMixin, PDDisaggregationServerBase
+):
+    transfer_backend_name = "mooncake"
 
 
 if __name__ == "__main__":

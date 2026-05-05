@@ -512,7 +512,7 @@ class SchedulerRuntimeCheckerMixin:
         )
         self.stats.num_grammar_queue_reqs = len(self.grammar_manager)
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
-            self.stats.num_prefill_prealloc_queue_reqs = QueueCount.from_reqs(
+            self.stats.num_prefill_bootstrap_queue_reqs = QueueCount.from_reqs(
                 self.disagg_prefill_bootstrap_queue.queue, priority_enabled
             )
             self.stats.num_prefill_inflight_queue_reqs = QueueCount.from_reqs(
