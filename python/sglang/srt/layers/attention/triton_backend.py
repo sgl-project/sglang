@@ -1019,9 +1019,13 @@ class TritonAttnBackend(AttentionBackend):
             prefix_kv_indices = self.forward_metadata.kv_indices
             window_start_pos = None
 
-        # For SWA layers, translate extend indices into SWA-pool index space
-        # so they match the prefix half (already translated) and the write-side
-        # in SWAKVPool.set_kv_buffer.
+        # For SWA layers, the extend half of unified_kv_indices must live in
+        # SWA-pool index space to match the prefix half and the write-side
+        # in SWAKVPool.set_kv_buffer. Mirror that write-side fast path: prefer
+        # the precomputed pool.swa_loc (set by model_runner.forward and by the
+        # cuda graph runners pre-capture, so the graph reads the same static
+        # buffer that set_kv_buffer wrote to), and only translate as a
+        # fallback when it has not been populated.
         extend_kv_indices = forward_batch.out_cache_loc
         pool = forward_batch.token_to_kv_pool
         if (
@@ -1030,9 +1034,12 @@ class TritonAttnBackend(AttentionBackend):
             and isinstance(pool, SWAKVPool)
             and pool.layers_mapping[layer.layer_id][1]
         ):
-            extend_kv_indices = pool.translate_loc_from_full_to_swa(
-                extend_kv_indices
-            )
+            if pool.swa_loc is not None:
+                extend_kv_indices = pool.swa_loc
+            else:
+                extend_kv_indices = pool.translate_loc_from_full_to_swa(
+                    extend_kv_indices
+                )
 
         # Handle cases where extend_seq_lens or extend_start_loc might not be set
         # In speculative decoding, we can infer these from spec_info or compute them
