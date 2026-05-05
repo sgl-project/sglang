@@ -93,7 +93,7 @@ def test_rmsnorm(
             output_sglang = input.clone()
             sglang_jit_rmsnorm(output_sglang, weight, output=output_sglang)
 
-        torch.testing.assert_close(output_sglang, output_ref, atol=0.1, rtol=0.02)
+        torch.testing.assert_close(output_sglang, output_ref, atol=1e-2, rtol=1e-2)
     else:
         input_flashinfer = input.clone()
         output_flashinfer = torch.empty_like(input)
