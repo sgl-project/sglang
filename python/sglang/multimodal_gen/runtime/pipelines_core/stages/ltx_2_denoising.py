@@ -36,8 +36,6 @@ class LTX2DenoisingContext(DenoisingContext):
 
     audio_latents: torch.Tensor | None = None
     audio_scheduler: object | None = None
-    sigmas_cpu: torch.Tensor | None = None
-    sigmas_device: torch.Tensor | None = None
     is_ltx23_variant: bool = False
     use_ltx23_legacy_one_stage: bool = False
     replicate_audio_for_sp: bool = False
@@ -1138,15 +1136,6 @@ class LTX2DenoisingStage(DenoisingStage):
         ctx.audio_latents = batch.audio_latents
         # Video and audio keep separate scheduler state throughout the denoising loop.
         ctx.audio_scheduler = clone_scheduler_runtime(ctx.scheduler)
-        sigmas = getattr(ctx.scheduler, "sigmas", None)
-        if isinstance(sigmas, torch.Tensor):
-            # Python branches need scalar sigma values every step. Keeping a CPU
-            # copy avoids forcing CUDA work to finish just to evaluate those
-            # branches; the device copy remains the source for tensor math.
-            ctx.sigmas_cpu = sigmas.detach().to(device="cpu", dtype=torch.float32)
-            ctx.sigmas_device = sigmas.detach().to(
-                device=ctx.latents.device, dtype=torch.float32
-            )
 
         if ctx.use_ltx23_legacy_one_stage:
             batch.ltx23_audio_replicated_for_sp = False
@@ -1261,10 +1250,7 @@ class LTX2DenoisingStage(DenoisingStage):
             raise ValueError("LTX-2 audio scheduler was not prepared.")
 
         # 1. Read the scheduler sigma pair and derive the Euler delta.
-        sigmas = ctx.sigmas_device
-        sigmas_cpu = ctx.sigmas_cpu
-        if sigmas is None or not isinstance(sigmas, torch.Tensor):
-            sigmas = getattr(ctx.scheduler, "sigmas", None)
+        sigmas = getattr(ctx.scheduler, "sigmas", None)
         if sigmas is None or not isinstance(sigmas, torch.Tensor):
             raise ValueError("Expected scheduler.sigmas to be a tensor for LTX-2.")
         sigma = sigmas[step.step_index].to(
@@ -1274,12 +1260,8 @@ class LTX2DenoisingStage(DenoisingStage):
             device=ctx.latents.device, dtype=torch.float32
         )
         dt = sigma_next - sigma
-        if sigmas_cpu is not None:
-            sigma_val = float(sigmas_cpu[step.step_index].item())
-            sigma_next_val = float(sigmas_cpu[step.step_index + 1].item())
-        else:
-            sigma_val = float(sigma.item())
-            sigma_next_val = float(sigma_next.item())
+        sigma_val = float(sigma.item())
+        sigma_next_val = float(sigma_next.item())
 
         stage1_guider_params = self._get_ltx2_stage1_guider_params(
             batch, server_args, ctx.stage
@@ -1529,7 +1511,6 @@ class LTX2DenoisingStage(DenoisingStage):
             video_latents: torch.Tensor,
             audio_latents: torch.Tensor,
             sigma_value: torch.Tensor,
-            sigma_value_float: float | None = None,
             update_skip_cache: bool,
         ) -> tuple[torch.Tensor, torch.Tensor]:
             original_video_latents = ctx.latents
@@ -1766,8 +1747,7 @@ class LTX2DenoisingStage(DenoisingStage):
                     v_ptb, a_v_ptb = pass_outputs.get("perturbed", (None, None))
                     v_mod, a_v_mod = pass_outputs.get("modality", (None, None))
 
-                if sigma_value_float is None:
-                    sigma_value_float = float(sigma_value.item())
+                sigma_value_float = float(sigma_value.item())
                 video_sigma_for_x0: float | torch.Tensor = sigma_value_float
                 if ctx.denoise_mask is not None:
                     video_sigma_for_x0 = sigma_value.to(
@@ -1877,7 +1857,6 @@ class LTX2DenoisingStage(DenoisingStage):
             video_latents=ctx.latents,
             audio_latents=ctx.audio_latents,
             sigma_value=sigma,
-            sigma_value_float=sigma_val,
             update_skip_cache=True,
         )
 
