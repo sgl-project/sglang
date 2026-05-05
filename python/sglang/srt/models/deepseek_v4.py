@@ -1052,8 +1052,8 @@ class Compressor(nn.Module):
                 pool_kv=kv_and_score_states_pool.kv,
                 kv_score_input_kv=kv_and_scores.kv,
                 ape=self.ape,
-                seq_lens=seq_lens.to(torch.int32),
-                req_pool_indices=req_pool_indices.to(torch.int32),
+                seq_lens=seq_lens,
+                req_pool_indices=req_pool_indices,
                 head_dim=self.head_dim,
             )
         elif self.use_hip_fused_compress and self.ratio == 128 and not self.overlap:
@@ -1065,8 +1065,8 @@ class Compressor(nn.Module):
                 pool_kv=kv_and_score_states_pool.kv,
                 kv_score_input_kv=kv_and_scores.kv,
                 ape=self.ape,
-                seq_lens=seq_lens.to(torch.int32),
-                req_pool_indices=req_pool_indices.to(torch.int32),
+                seq_lens=seq_lens,
+                req_pool_indices=req_pool_indices,
                 head_dim=self.head_dim,
             )
         else:

@@ -16,6 +16,13 @@ from sglang.jit_kernel.utils import (
 from sglang.srt.debug_utils.deepseek_v4_debug_utils import (
     deepseek_v4_moe_code_path_checker,
 )
+from sglang.srt.utils import get_bool_env_var, is_hip
+
+_is_hip = is_hip()
+_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+
+if _use_aiter:
+    from aiter.tuned_gemm import tgemm
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
@@ -750,6 +757,8 @@ def linear_bf16_fp32(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
         z = x.new_empty(x.size(0), y.size(0), dtype=torch.float32)
         deep_gemm.bf16_gemm_nt(x, y, z)
         return z
+    elif _use_aiter:
+        return tgemm.mm(x, y, otype=x.dtype).float()
     else:  # fall back to torch fp32 GEMM
         return torch.nn.functional.linear(x.float(), y.float())
 
