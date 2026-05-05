@@ -131,6 +131,9 @@ class ServerArgs(DisaggArgsMixin):
     # Attention
     attention_backend: str = None
     attention_backend_config: addict.Dict | None = None
+    component_attention_backends: dict[str, str] | str | None = field(
+        default_factory=dict
+    )
     cache_dit_config: str | dict[str, Any] | None = (
         None  # cache-dit config for diffusers
     )
@@ -470,6 +473,11 @@ class ServerArgs(DisaggArgsMixin):
     def _adjust_attention_backend(self):
         if self.attention_backend in ["fa3", "fa4"]:
             self.attention_backend = "fa"
+        self.component_attention_backends = (
+            self._normalize_component_attention_backends(
+                self.component_attention_backends
+            )
+        )
 
         # attention_backend_config
         if self.attention_backend_config is None:
@@ -511,6 +519,82 @@ class ServerArgs(DisaggArgsMixin):
                 )
                 return
             self._set_default_attention_backend()
+
+    @staticmethod
+    def _normalize_attention_backend_name(backend: str) -> str:
+        if not isinstance(backend, str):
+            raise ValueError("Attention backend name must be a string")
+        normalized = backend.strip().lower()
+        if normalized in ("fa3", "fa4"):
+            normalized = "fa"
+        try:
+            return AttentionBackendEnum[normalized.upper()].name.lower()
+        except KeyError:
+            raise ValueError(
+                f"Invalid attention backend '{backend}'. "
+                f"Available options are: {[e.name.lower() for e in AttentionBackendEnum]}"
+            ) from None
+
+    @staticmethod
+    def _parse_component_attention_backend_map(
+        value: dict[str, str] | str | None,
+    ) -> dict[str, str]:
+        if value is None or value == "":
+            return {}
+        if isinstance(value, dict):
+            return dict(value)
+        if not isinstance(value, str):
+            raise ValueError(
+                "component_attention_backends must be a dict or a comma-separated component=backend string"
+            )
+
+        try:
+            parsed = json.loads(value)
+            if not isinstance(parsed, dict):
+                raise ValueError
+            return parsed
+        except (json.JSONDecodeError, ValueError):
+            pass
+
+        result: dict[str, str] = {}
+        for pair in value.split(","):
+            pair = pair.strip()
+            if not pair:
+                continue
+            if "=" not in pair:
+                raise ValueError(
+                    "component_attention_backends must use component=backend entries"
+                )
+            component, backend = pair.split("=", 1)
+            result[component.strip()] = backend.strip()
+        return result
+
+    @classmethod
+    def _normalize_component_attention_backends(
+        cls, value: dict[str, str] | str | None
+    ) -> dict[str, str]:
+        raw = cls._parse_component_attention_backend_map(value)
+        normalized: dict[str, str] = {}
+        for component, backend in raw.items():
+            if not isinstance(component, str):
+                raise ValueError("Component attention backend key must be a string")
+            component_name = component.strip().replace("-", "_")
+            if not component_name:
+                raise ValueError("Component attention backend key must not be empty")
+            normalized[component_name] = cls._normalize_attention_backend_name(backend)
+        return normalized
+
+    def resolve_component_attention_backend(
+        self, *component_names: str | None
+    ) -> tuple[AttentionBackendEnum | None, str | None]:
+        for component_name in component_names:
+            if component_name is None:
+                continue
+            key = component_name.replace("-", "_")
+            backend = self.component_attention_backends.get(key)
+            if backend is not None:
+                return AttentionBackendEnum[backend.upper()], key
+        return None, None
 
     def _adjust_warmup(self):
         if self.warmup_resolutions is not None:
@@ -807,6 +891,16 @@ class ServerArgs(DisaggArgsMixin):
             type=str,
             default=None,
             help="Configuration for the attention backend. Can be a JSON string, a path to a JSON/YAML file, or key=value pairs.",
+        )
+        parser.add_argument(
+            "--component-attention-backends",
+            type=str,
+            default=None,
+            help=(
+                "Per-component attention backend overrides for native pipelines. "
+                "Use component names from model_index.json, e.g. "
+                "'text_encoder=torch_sdpa,transformer=fa'."
+            ),
         )
         parser.add_argument(
             "--cache-dit-config",
@@ -1267,6 +1361,43 @@ class ServerArgs(DisaggArgsMixin):
             component_paths[component] = path
         return component_paths, remaining
 
+    @staticmethod
+    def _extract_component_attention_backends(
+        unknown_args: list[str],
+    ) -> tuple[dict[str, str], list[str]]:
+        component_attention_backends: dict[str, str] = {}
+        remaining: list[str] = []
+        i = 0
+        while i < len(unknown_args):
+            arg = unknown_args[i]
+            key_part = arg.split("=", 1)[0] if "=" in arg else arg
+            component = None
+            if key_part.startswith("--component-attention-backends."):
+                component = key_part[len("--component-attention-backends.") :].replace(
+                    "-", "_"
+                )
+            elif key_part.startswith("--component_attention_backends."):
+                component = key_part[len("--component_attention_backends.") :].replace(
+                    "-", "_"
+                )
+
+            if component is not None:
+                if "=" in arg:
+                    component_attention_backends[component] = arg.split("=", 1)[1]
+                elif i + 1 < len(unknown_args) and not unknown_args[i + 1].startswith(
+                    "-"
+                ):
+                    i += 1
+                    component_attention_backends[component] = unknown_args[i]
+                else:
+                    remaining.append(arg)
+                    i += 1
+                    continue
+            else:
+                remaining.append(arg)
+            i += 1
+        return component_attention_backends, remaining
+
     @classmethod
     def from_cli_args(
         cls, args: argparse.Namespace, unknown_args: list[str] | None = None
@@ -1276,6 +1407,9 @@ class ServerArgs(DisaggArgsMixin):
 
         # extract dynamic --<component>-path from unknown args
         dynamic_paths, remaining = cls._extract_component_paths(unknown_args)
+        dynamic_attention_backends, remaining = (
+            cls._extract_component_attention_backends(remaining)
+        )
         if remaining:
             raise SystemExit(f"error: unrecognized arguments: {' '.join(remaining)}")
 
@@ -1291,6 +1425,12 @@ class ServerArgs(DisaggArgsMixin):
             existing = dict(provided_args.get("component_paths") or {})
             existing.update(dynamic_paths)
             provided_args["component_paths"] = existing
+        if dynamic_attention_backends:
+            existing = cls._parse_component_attention_backend_map(
+                provided_args.get("component_attention_backends")
+            )
+            existing.update(dynamic_attention_backends)
+            provided_args["component_attention_backends"] = existing
 
         return cls.from_dict(provided_args)
 
