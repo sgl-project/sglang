@@ -52,9 +52,7 @@ def is_zimage_layer(name: str, module: object) -> bool:
     last_part = name.split(".")[-1]
     # Preserve Z-Image's finer historical FSDP granularity for perf.
     return last_part.isdigit() and (
-        "layers" in name
-        or "noise_refiner" in name
-        or "context_refiner" in name
+        "layers" in name or "noise_refiner" in name or "context_refiner" in name
     )
 
 
