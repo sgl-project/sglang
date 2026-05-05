@@ -104,13 +104,22 @@ class BaseTopkCapturer:
         topk_size: int,
         device: str,
         name: str,
+        device_topk_size: Optional[int] = None,
     ):
+        """device_topk_size defaults to topk_size; pass a different value when
+        the device buffer needs extra columns (e.g. fused shared experts) that
+        are dropped before writing to host_cache via [:topk_size] truncation.
+        """
         self.num_layers = num_layers
         self.topk_size = topk_size
 
         self.host_cache = BaseHostCache(num_tokens, num_layers, topk_size, name=name)
         self.device_cache = BaseDeviceCache(
-            max_batch_size, num_layers, topk_size, device, name=name
+            max_batch_size,
+            num_layers,
+            device_topk_size if device_topk_size is not None else topk_size,
+            device,
+            name=name,
         )
 
     def capture(self, layer_id: int, topk_indices: torch.Tensor):
@@ -126,8 +135,10 @@ class BaseTopkCapturer:
 
         Default assumes per-rank-local capture: each rank writes [:local_num_tokens)
         to its own device_cache. Subclasses with global-tensor capture semantics
-        (e.g. shared cuda graph buffer indexed by dp_rank) should override.
+        (e.g. shared cuda graph buffer indexed by dp_rank) should override and
+        consume can_run_graph / cuda_graph_batch.
         """
+        del can_run_graph, cuda_graph_batch  # reserved for subclass override
         num_tokens = forward_batch.out_cache_loc.shape[0]
         return self.device_cache.buffer[:num_tokens, :, : self.topk_size]
 

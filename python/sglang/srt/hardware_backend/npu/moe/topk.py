@@ -95,7 +95,7 @@ def fused_topk_npu(
     if (cap := get_global_experts_capturer()) is not None:
         cap.capture(
             layer_id=layer_id,
-            topk_ids=topk_ids,
+            topk_indices=topk_ids,
         )
 
     return StandardTopKOutput(topk_weights, topk_ids, router_logits)

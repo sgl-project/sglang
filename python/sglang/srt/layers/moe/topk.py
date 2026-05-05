@@ -1074,7 +1074,7 @@ def _post_process_topk_ids(
     if (cap := get_global_experts_capturer()) is not None:
         cap.capture(
             layer_id=layer_id,
-            topk_ids=topk_ids,
+            topk_indices=topk_ids,
         )
     if _is_cuda:
         # When shared experts are fused (appended as extra columns in topk_ids),

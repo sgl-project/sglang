@@ -109,7 +109,7 @@ class SchedulerOutputProcessorMixin:
         capturer = get_global_experts_capturer()
         if capturer is None:
             return
-        req.routed_experts = capturer.get_routed_experts(
+        req.routed_experts = capturer.get_topk(
             req_pool_idx=req.req_pool_idx,
             seqlen=req.seqlen,
             req_to_token_pool=self.req_to_token_pool,
