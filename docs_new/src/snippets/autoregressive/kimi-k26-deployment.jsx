@@ -98,8 +98,6 @@ export const KimiK26Deployment = () => {
     const isAMD = hardware === 'mi300x' || hardware === 'mi325x' || hardware === 'mi350x' || hardware === 'mi355x';
     const hwConfig = modelConfigs[hardware];
     const tpValue = hwConfig.tp;
-    const isGBPlatform = hardware === 'gb200' || hardware === 'gb300';
-    const dpValue = tpValue;
 
     let cmd = '';
 
@@ -116,10 +114,7 @@ export const KimiK26Deployment = () => {
     cmd += ' \\\n  --trust-remote-code';
 
     if (dpattention === 'enabled') {
-      if (!isGBPlatform) {
-        cmd += ` \\\n  --dp ${dpValue}`;
-      }
-      cmd += ' \\\n  --enable-dp-attention';
+      cmd += ` \\\n  --dp ${tpValue} \\\n  --enable-dp-attention`;
     }
 
     if (reasoning === 'enabled') {
