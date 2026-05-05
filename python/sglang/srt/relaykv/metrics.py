@@ -7786,6 +7786,421 @@ def run_model_runner_req_to_token_runtime_inspection_hook_for_smoke(
     }
 
 
+def build_relaykv_token_to_kv_pool_runtime_inspection_payloads_for_smoke(
+    runtime_like: Mapping[str, Any] | None = None,
+    token_to_kv_pool: Any = None,
+    inspect_token_to_kv_pool: bool = False,
+) -> list[dict[str, Any]]:
+    """Build metadata-only token_to_kv_pool runtime inspection payloads."""
+
+    if runtime_like is not None and not isinstance(runtime_like, Mapping):
+        raise TypeError("runtime_like must be a mapping or None")
+
+    request_id = None
+    layer_id = None
+    batch_id = None
+    kv_head_group = None
+    decision_state = None
+    kv_class = "UNKNOWN"
+    blocking_reasons: list[str] = []
+
+    if runtime_like is not None:
+        request_id = runtime_like.get("request_id")
+        layer_id = runtime_like.get("layer_id")
+        batch_id = runtime_like.get("batch_id")
+        kv_head_group = runtime_like.get("kv_head_group")
+        decision_state = runtime_like.get("decision_state")
+        kv_class = runtime_like.get("kv_class") or "UNKNOWN"
+
+        if runtime_like.get("token_to_kv_pool_read") is True:
+            blocking_reasons.append("token_to_kv_pool_value_read_not_allowed")
+        if runtime_like.get("token_to_kv_pool_index_read") is True:
+            blocking_reasons.append("token_to_kv_pool_index_read_not_allowed")
+        if runtime_like.get("kv_pool_read") is True:
+            blocking_reasons.append("kv_pool_read_not_allowed")
+        if runtime_like.get("kv_snapshot") is True:
+            blocking_reasons.append("kv_snapshot_not_allowed")
+        if runtime_like.get("tensor_read") is True:
+            blocking_reasons.append("tensor_read_not_allowed")
+        if runtime_like.get("attention_override") is True:
+            blocking_reasons.append("attention_override_true_not_allowed")
+        if runtime_like.get("attention_comparison_executed") is True:
+            blocking_reasons.append("attention_comparison_executed_not_allowed")
+        if runtime_like.get("runtime_writeback") is True:
+            blocking_reasons.append("runtime_writeback_not_allowed")
+        if runtime_like.get("scheduler_policy_noop") is False:
+            blocking_reasons.append("scheduler_mutation_not_allowed")
+        if runtime_like.get("source_mutated") is True:
+            blocking_reasons.append("source_mutation_not_allowed")
+
+    token_to_kv_pool_attr_present = False
+    token_to_kv_pool_attr_observed = False
+    token_to_kv_pool_type = None
+    token_to_kv_pool_module = None
+    token_to_kv_pool_qualname = None
+    token_to_kv_pool_shape = None
+    token_to_kv_pool_device = None
+    token_to_kv_pool_dtype = None
+
+    if inspect_token_to_kv_pool is not True:
+        blocking_reasons.append("inspection_not_enabled")
+    elif token_to_kv_pool is None:
+        blocking_reasons.append("token_to_kv_pool_missing")
+    else:
+        try:
+            token_to_kv_pool_type = type(token_to_kv_pool).__name__
+            token_to_kv_pool_module = type(token_to_kv_pool).__module__
+            token_to_kv_pool_qualname = type(token_to_kv_pool).__qualname__
+            token_to_kv_pool_shape = getattr(token_to_kv_pool, "shape", None)
+            token_to_kv_pool_device = getattr(token_to_kv_pool, "device", None)
+            token_to_kv_pool_dtype = getattr(token_to_kv_pool, "dtype", None)
+        except Exception:
+            blocking_reasons.append("token_to_kv_pool_attr_access_failed")
+        else:
+            token_to_kv_pool_attr_present = True
+            token_to_kv_pool_attr_observed = True
+
+    blocking_reasons = list(dict.fromkeys(blocking_reasons))
+    inspection_state = "metadata_observed" if not blocking_reasons else "blocked"
+    payload = normalize_relaykv_sglang_adapter_schema_for_smoke(
+        {
+            "event_type": "relaykv_token_to_kv_pool_runtime_inspection_payload",
+            "inspection_mode": "runtime_metadata_only",
+            "inspection_state": inspection_state,
+            "source": "token_to_kv_pool_to_runtime_inspection_payload",
+            "request_id": request_id,
+            "layer_id": layer_id,
+            "batch_id": batch_id,
+            "kv_head_group": kv_head_group,
+            "kv_class": kv_class,
+            "decision_state": decision_state or "SHADOW_ONLY",
+            "metadata_observed": not blocking_reasons,
+            "token_to_kv_pool_attr_present": token_to_kv_pool_attr_present,
+            "token_to_kv_pool_attr_observed": token_to_kv_pool_attr_observed,
+            "actual_token_to_kv_pool_inspection": not blocking_reasons,
+            "token_to_kv_pool_type": token_to_kv_pool_type,
+            "token_to_kv_pool_module": token_to_kv_pool_module,
+            "token_to_kv_pool_qualname": token_to_kv_pool_qualname,
+            "token_to_kv_pool_shape": token_to_kv_pool_shape,
+            "token_to_kv_pool_device": token_to_kv_pool_device,
+            "token_to_kv_pool_dtype": token_to_kv_pool_dtype,
+            "token_to_kv_pool_read": False,
+            "token_to_kv_pool_read_count": 0,
+            "actual_token_to_kv_pool_read": False,
+            "actual_token_to_kv_pool_read_count": 0,
+            "req_to_token_read": False,
+            "req_to_token_read_count": 0,
+            "actual_req_to_token_pool_read": False,
+            "actual_req_to_token_pool_read_count": 0,
+            "kv_pool_read": False,
+            "kv_snapshot": False,
+            "tensor_read": False,
+            "attention_comparison_executed": False,
+            "attention_override": False,
+            "runtime_writeback": False,
+            "scheduler_policy_noop": True,
+            "kv_cache_mutation": False,
+            "source_mutated": False,
+            "blocking_reasons": blocking_reasons,
+            "warning_reasons": [
+                "token_to_kv_pool_metadata_only_inspection",
+                "no_token_to_kv_pool_values_read",
+                "no_req_to_token_read",
+            ],
+        }
+    )
+    payload["adapter_metadata"]["token_to_kv_pool_type"] = token_to_kv_pool_type
+    payload["adapter_metadata"]["token_to_kv_pool_module"] = token_to_kv_pool_module
+    payload["adapter_metadata"]["token_to_kv_pool_qualname"] = (
+        token_to_kv_pool_qualname
+    )
+    payload["adapter_metadata"]["token_to_kv_pool_shape"] = token_to_kv_pool_shape
+    payload["adapter_metadata"]["token_to_kv_pool_device"] = token_to_kv_pool_device
+    payload["adapter_metadata"]["token_to_kv_pool_dtype"] = token_to_kv_pool_dtype
+    engine_block_ref = payload.get("engine_block_ref")
+    if not isinstance(engine_block_ref, dict):
+        engine_block_ref = {}
+        payload["engine_block_ref"] = engine_block_ref
+    engine_block_ref["token_to_kv_pool_index"] = None
+    engine_block_ref["physical_kv_index"] = None
+    engine_block_ref["cache_position"] = None
+    if not blocking_reasons:
+        payload["fallback_reason"] = None
+    return [payload]
+
+
+def summarize_relaykv_token_to_kv_pool_runtime_inspection_payloads_for_smoke(
+    payloads: list[dict[str, Any]] | tuple[dict[str, Any], ...],
+) -> dict[str, Any]:
+    """Summarize metadata-only token_to_kv_pool runtime inspection payloads."""
+
+    if not isinstance(payloads, (list, tuple)):
+        raise TypeError(
+            "RelayKV token_to_kv_pool runtime inspection payloads must be a list or tuple"
+        )
+
+    per_request: Counter[str] = Counter()
+    per_layer: Counter[str] = Counter()
+    per_inspection_state: Counter[str] = Counter()
+    safety_counts: Counter[str] = Counter(
+        {
+            "metadata_observed_count": 0,
+            "token_to_kv_pool_attr_present_count": 0,
+            "actual_token_to_kv_pool_inspection_count": 0,
+            "token_to_kv_pool_attr_observed_count": 0,
+            "token_to_kv_pool_read_count": 0,
+            "actual_token_to_kv_pool_read_count": 0,
+            "req_to_token_read_count": 0,
+            "actual_req_to_token_pool_read_count": 0,
+            "kv_pool_read_count": 0,
+            "kv_snapshot_count": 0,
+            "tensor_read_count": 0,
+            "attention_comparison_executed_count": 0,
+            "attention_override_true_count": 0,
+            "runtime_writeback_true_count": 0,
+            "scheduler_policy_noop_false_count": 0,
+            "kv_cache_mutation_true_count": 0,
+            "source_mutated_true_count": 0,
+        }
+    )
+    blocked_count = 0
+    error_count = 0
+
+    for payload in payloads:
+        if not isinstance(payload, dict):
+            raise TypeError(
+                "RelayKV token_to_kv_pool runtime inspection payload must be a dict"
+            )
+
+        state = str(payload.get("inspection_state") or "unknown")
+        per_inspection_state[state] += 1
+        per_request[str(payload.get("request_id"))] += 1
+        per_layer[str(payload.get("layer_id"))] += 1
+
+        if state == "blocked":
+            blocked_count += 1
+        elif state == "error":
+            error_count += 1
+
+        if payload.get("metadata_observed") is True:
+            safety_counts["metadata_observed_count"] += 1
+        if payload.get("token_to_kv_pool_attr_present") is True:
+            safety_counts["token_to_kv_pool_attr_present_count"] += 1
+        if payload.get("actual_token_to_kv_pool_inspection") is True:
+            safety_counts["actual_token_to_kv_pool_inspection_count"] += 1
+        if payload.get("token_to_kv_pool_attr_observed") is True:
+            safety_counts["token_to_kv_pool_attr_observed_count"] += 1
+
+        for key in (
+            "token_to_kv_pool_read_count",
+            "actual_token_to_kv_pool_read_count",
+            "req_to_token_read_count",
+            "actual_req_to_token_pool_read_count",
+        ):
+            value = payload.get(key)
+            if isinstance(value, int) and not isinstance(value, bool):
+                safety_counts[key] += value
+        if payload.get("kv_pool_read") is True:
+            safety_counts["kv_pool_read_count"] += 1
+        if payload.get("kv_snapshot") is True:
+            safety_counts["kv_snapshot_count"] += 1
+        if payload.get("tensor_read") is True:
+            safety_counts["tensor_read_count"] += 1
+        if payload.get("attention_comparison_executed") is True:
+            safety_counts["attention_comparison_executed_count"] += 1
+        if payload.get("attention_override") is True:
+            safety_counts["attention_override_true_count"] += 1
+        if payload.get("runtime_writeback") is True:
+            safety_counts["runtime_writeback_true_count"] += 1
+        if payload.get("scheduler_policy_noop") is False:
+            safety_counts["scheduler_policy_noop_false_count"] += 1
+        if payload.get("kv_cache_mutation") is True:
+            safety_counts["kv_cache_mutation_true_count"] += 1
+        if payload.get("source_mutated") is True:
+            safety_counts["source_mutated_true_count"] += 1
+
+    return {
+        "summary_type": "relaykv_token_to_kv_pool_runtime_inspection_payload_summary",
+        "total_token_to_kv_pool_runtime_inspection_payloads": len(payloads),
+        "blocked_count": blocked_count,
+        "error_count": error_count,
+        "per_request_counts": dict(sorted(per_request.items())),
+        "per_layer_counts": dict(sorted(per_layer.items())),
+        "per_inspection_state_counts": dict(sorted(per_inspection_state.items())),
+        "metadata_observed_count": safety_counts["metadata_observed_count"],
+        "token_to_kv_pool_attr_present_count": (
+            safety_counts["token_to_kv_pool_attr_present_count"]
+        ),
+        "actual_token_to_kv_pool_inspection_count": (
+            safety_counts["actual_token_to_kv_pool_inspection_count"]
+        ),
+        "token_to_kv_pool_attr_observed_count": (
+            safety_counts["token_to_kv_pool_attr_observed_count"]
+        ),
+        "token_to_kv_pool_read_count": (
+            safety_counts["token_to_kv_pool_read_count"]
+        ),
+        "actual_token_to_kv_pool_read_count": (
+            safety_counts["actual_token_to_kv_pool_read_count"]
+        ),
+        "req_to_token_read_count": safety_counts["req_to_token_read_count"],
+        "actual_req_to_token_pool_read_count": (
+            safety_counts["actual_req_to_token_pool_read_count"]
+        ),
+        "kv_pool_read_count": safety_counts["kv_pool_read_count"],
+        "kv_snapshot_count": safety_counts["kv_snapshot_count"],
+        "tensor_read_count": safety_counts["tensor_read_count"],
+        "attention_comparison_executed_count": (
+            safety_counts["attention_comparison_executed_count"]
+        ),
+        "attention_override_true_count": (
+            safety_counts["attention_override_true_count"]
+        ),
+        "runtime_writeback_true_count": (
+            safety_counts["runtime_writeback_true_count"]
+        ),
+        "scheduler_policy_noop_false_count": (
+            safety_counts["scheduler_policy_noop_false_count"]
+        ),
+        "kv_cache_mutation_true_count": (
+            safety_counts["kv_cache_mutation_true_count"]
+        ),
+        "source_mutated_true_count": safety_counts["source_mutated_true_count"],
+    }
+
+
+def run_model_runner_token_to_kv_pool_runtime_inspection_hook_for_smoke(
+    model_runner: Any,
+    forward_batch: Any = None,
+) -> dict[str, Any]:
+    """Run a fake model-runner token_to_kv_pool metadata inspection hook for smoke."""
+
+    token_to_kv_pool = None
+    token_to_kv_pool_path = None
+
+    try:
+        token_to_kv_pool = getattr(model_runner, "token_to_kv_pool", None)
+    except Exception:
+        token_to_kv_pool = None
+    else:
+        if token_to_kv_pool is not None:
+            token_to_kv_pool_path = "model_runner.token_to_kv_pool"
+
+    if token_to_kv_pool is None:
+        try:
+            allocator = getattr(model_runner, "token_to_kv_pool_allocator", None)
+        except Exception:
+            allocator = None
+        if allocator is not None:
+            try:
+                nested_token_to_kv_pool = getattr(allocator, "token_to_kv_pool", None)
+            except Exception:
+                token_to_kv_pool = allocator
+                token_to_kv_pool_path = "model_runner.token_to_kv_pool_allocator"
+            else:
+                if nested_token_to_kv_pool is not None:
+                    token_to_kv_pool = nested_token_to_kv_pool
+                    token_to_kv_pool_path = (
+                        "model_runner.token_to_kv_pool_allocator.token_to_kv_pool"
+                    )
+                else:
+                    token_to_kv_pool = allocator
+                    token_to_kv_pool_path = "model_runner.token_to_kv_pool_allocator"
+
+    if token_to_kv_pool is None:
+        try:
+            allocator = getattr(model_runner, "kv_pool_allocator", None)
+        except Exception:
+            allocator = None
+        if allocator is not None:
+            try:
+                token_to_kv_pool = getattr(allocator, "token_to_kv_pool", None)
+            except Exception:
+                token_to_kv_pool = None
+            else:
+                if token_to_kv_pool is not None:
+                    token_to_kv_pool_path = (
+                        "model_runner.kv_pool_allocator.token_to_kv_pool"
+                    )
+
+    if token_to_kv_pool is None:
+        try:
+            memory_pool = getattr(model_runner, "memory_pool", None)
+        except Exception:
+            memory_pool = None
+        if memory_pool is not None:
+            try:
+                token_to_kv_pool = getattr(memory_pool, "token_to_kv_pool", None)
+            except Exception:
+                token_to_kv_pool = None
+            else:
+                if token_to_kv_pool is not None:
+                    token_to_kv_pool_path = "model_runner.memory_pool.token_to_kv_pool"
+
+    if token_to_kv_pool is None and forward_batch is not None:
+        try:
+            token_to_kv_pool = getattr(forward_batch, "token_to_kv_pool", None)
+        except Exception:
+            token_to_kv_pool = None
+        else:
+            if token_to_kv_pool is not None:
+                token_to_kv_pool_path = "forward_batch.token_to_kv_pool"
+
+    runtime_like = {
+        "request_id": getattr(forward_batch, "request_id", None)
+        if forward_batch is not None
+        else None,
+        "layer_id": getattr(forward_batch, "layer_id", None)
+        if forward_batch is not None
+        else None,
+        "batch_id": getattr(forward_batch, "batch_id", None)
+        if forward_batch is not None
+        else None,
+        "kv_head_group": getattr(forward_batch, "kv_head_group", None)
+        if forward_batch is not None
+        else None,
+        "decision_state": getattr(forward_batch, "decision_state", None)
+        if forward_batch is not None
+        else None,
+        "kv_class": getattr(forward_batch, "kv_class", None)
+        if forward_batch is not None
+        else None,
+    }
+    payloads = build_relaykv_token_to_kv_pool_runtime_inspection_payloads_for_smoke(
+        runtime_like=runtime_like,
+        token_to_kv_pool=token_to_kv_pool,
+        inspect_token_to_kv_pool=True,
+    )
+    for payload in payloads:
+        payload["hook_path"] = token_to_kv_pool_path
+        payload["hook_source"] = (
+            "model_runner_token_to_kv_pool_runtime_inspection_hook"
+        )
+
+    summary = summarize_relaykv_token_to_kv_pool_runtime_inspection_payloads_for_smoke(
+        payloads
+    )
+    summary["hook_path_counts"] = {
+        "none": 0,
+        "model_runner.token_to_kv_pool": 0,
+        "model_runner.token_to_kv_pool_allocator.token_to_kv_pool": 0,
+        "model_runner.token_to_kv_pool_allocator": 0,
+        "model_runner.kv_pool_allocator.token_to_kv_pool": 0,
+        "model_runner.memory_pool.token_to_kv_pool": 0,
+        "forward_batch.token_to_kv_pool": 0,
+    }
+    hook_key = token_to_kv_pool_path or "none"
+    if hook_key not in summary["hook_path_counts"]:
+        summary["hook_path_counts"][hook_key] = 0
+    summary["hook_path_counts"][hook_key] += len(payloads)
+
+    return {
+        "payloads": payloads,
+        "summary": summary,
+        "token_to_kv_pool_path": token_to_kv_pool_path,
+    }
+
+
 def log_policy_summary(
     events: Iterable[RelayKVPlan | Mapping[str, Any]],
     *,
