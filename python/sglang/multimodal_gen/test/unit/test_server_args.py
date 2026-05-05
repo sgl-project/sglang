@@ -12,6 +12,9 @@ from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
 )
 from sglang.multimodal_gen.configs.pipeline_configs.wan import WanT2V480PConfig
 from sglang.multimodal_gen.registry import _get_config_info
+from sglang.multimodal_gen.runtime.models.dits.qwen_image import (
+    QwenImageTransformer2DModel,
+)
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.utils import FlexibleArgumentParser
 
@@ -262,9 +265,7 @@ class TestOffloadDefaults(unittest.TestCase):
         self.assertFalse(args.image_encoder_cpu_offload)
 
     def test_qwen_dit_has_fsdp_shard_condition(self):
-        conditions = (
-            QwenImagePipelineConfig().dit_config.arch_config._fsdp_shard_conditions
-        )
+        conditions = QwenImageTransformer2DModel._fsdp_shard_conditions
 
         self.assertTrue(conditions)
         self.assertTrue(conditions[0]("transformer_blocks.0", None))
