@@ -179,13 +179,9 @@ def get_deepep_output_dtype(self, quant_scheme=None) -> DeepOutputDtype:
     4. Otherwise → FP8 (the default for most models like DeepSeek-V3).
     """
     # 0. Parse server argument.
-    if get_global_server_args().deepep_dispather_output_dtype != "auto":
-        if get_global_server_args().deepep_dispather_output_dtype == "bf16":
-            return DeepOutputDtype.BF16
-        elif get_global_server_args().deepep_dispather_output_dtype == "fp8":
-            return DeepOutputDtype.FP8
-        elif get_global_server_args().deepep_dispather_output_dtype == "nvfp4":
-            return DeepOutputDtype.NVFP4
+    server_args = get_global_server_args()
+    if server_args and server_args.deepep_dispatcher_output_dtype != "auto":
+        return DeepOutputDtype(server_args.deepep_dispatcher_output_dtype)
 
     # 1. NVFP4 is detected inside dispatch_a / _dispatch_core via quant_config; no need to infer here.
     if self.quant_config is not None:
