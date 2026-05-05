@@ -68,6 +68,8 @@ env:
   SGLANG_CUDA_COREDUMP: "1"
   SGLANG_JIT_DEEPGEMM_FAST_WARMUP: true
   SKIP_STAGE_HEALTH_CHECK: ${{ inputs.skip_stage_health_check == true && 'true' || 'false' }}
+  # TEMP: rebuild deepep against the new torch for torch-211-merge PR only — revert before merging to main.
+  FORCE_REBUILD_DEEPEP: '1'
   # Schedule / main-branch dispatch / workflow_call from main use refs/heads/main; PR events use refs/pull/*/merge
   PR_TEST_BYPASS_MAINTENANCE_ON_MAIN: ${{ github.ref == 'refs/heads/main' && 'true' || 'false' }}
   USE_VENV: false
@@ -101,7 +103,6 @@ jobs:
       max_parallel_small: ${{ steps.set-parallel.outputs.max_parallel_small }}
       max_parallel_2gpu: ${{ steps.set-parallel.outputs.max_parallel_2gpu }}
       b200_runner: ${{ steps.set-runner.outputs.b200_runner }}
-      b200_low_disk_runner: ${{ steps.set-runner.outputs.b200_low_disk_runner }}
       enable_retry: ${{ steps.set-retry.outputs.enable_retry }}
       continue_on_error: ${{ steps.set-continue-on-error.outputs.continue_on_error }}
     steps:
@@ -138,7 +139,7 @@ jobs:
               - ".github/workflows/pr-gate.yml"
               - ".github/actions/**"
               - "python/pyproject.toml"
-              - "python/sglang/!(multimodal_gen|jit_kernel/diffusion|jit_kernel/tests/diffusion|jit_kernel/benchmark/diffusion|cli)/**/!(*.md)"
+              - "python/sglang/!(multimodal_gen)/**/!(*.md)"
               - "scripts/ci/cuda/*"
               - "scripts/ci/utils/*"
               - "test/**/!(*.md)"
@@ -283,10 +284,8 @@ jobs:
           target_stage="${{ inputs.target_stage }}"
           if [[ "$sgl_kernel" == "true" && -z "$target_stage" ]]; then
             echo "b200_runner=4-gpu-b200-kernel" >> $GITHUB_OUTPUT
-            echo "b200_low_disk_runner=4-gpu-b200-kernel-low-disk" >> $GITHUB_OUTPUT
           else
             echo "b200_runner=4-gpu-b200" >> $GITHUB_OUTPUT
-            echo "b200_low_disk_runner=4-gpu-b200-low-disk" >> $GITHUB_OUTPUT
           fi
 
       - name: Enable retry for CI
@@ -337,20 +336,19 @@ jobs:
           {
             echo "## Change Detection"
             echo ""
-            echo "| Component            | Changed |"
-            echo "|----------------------|---------|"
-            echo "| main_package         | ${{ steps.filter-api.outputs.main_package || steps.filter.outputs.main_package || steps.run-mode.outputs.run_all_tests }} |"
-            echo "| sgl_kernel (raw)     | ${{ steps.filter-api.outputs.sgl_kernel || steps.filter.outputs.sgl_kernel }} |"
-            echo "| sgl_kernel (used)    | ${{ (!inputs.target_stage || inputs.include_wheel_build) && (steps.filter-api.outputs.sgl_kernel || steps.filter.outputs.sgl_kernel) }} |"
-            echo "| jit_kernel           | ${{ steps.filter-api.outputs.jit_kernel || steps.filter.outputs.jit_kernel || steps.run-mode.outputs.run_all_tests }} |"
-            echo "| multimodal_gen       | ${{ steps.filter-api.outputs.multimodal_gen || steps.filter.outputs.multimodal_gen || steps.run-mode.outputs.run_all_tests }} |"
-            echo "| target_stage         | ${{ inputs.target_stage || '(none)' }} |"
-            echo "| detection_method     | ${{ inputs.target_stage && 'GitHub API' || 'dorny/paths-filter' }} |"
-            echo "| max_parallel         | ${{ steps.set-parallel.outputs.parallel_level }} (h100=${{ steps.set-parallel.outputs.max_parallel }}, 5090=${{ steps.set-parallel.outputs.max_parallel_small }}, 2gpu=${{ steps.set-parallel.outputs.max_parallel_2gpu }}) |"
-            echo "| b200_runner          | ${{ steps.set-runner.outputs.b200_runner }} |"
-            echo "| b200_low_disk_runner | ${{ steps.set-runner.outputs.b200_low_disk_runner }} |"
-            echo "| enable_retry         | ${{ steps.set-retry.outputs.enable_retry }} |"
-            echo "| continue_on_error    | ${{ steps.set-continue-on-error.outputs.continue_on_error }} |"
+            echo "| Component         | Changed |"
+            echo "|-------------------|---------|"
+            echo "| main_package      | ${{ steps.filter-api.outputs.main_package || steps.filter.outputs.main_package || steps.run-mode.outputs.run_all_tests }} |"
+            echo "| sgl_kernel (raw)  | ${{ steps.filter-api.outputs.sgl_kernel || steps.filter.outputs.sgl_kernel }} |"
+            echo "| sgl_kernel (used) | ${{ (!inputs.target_stage || inputs.include_wheel_build) && (steps.filter-api.outputs.sgl_kernel || steps.filter.outputs.sgl_kernel) }} |"
+            echo "| jit_kernel        | ${{ steps.filter-api.outputs.jit_kernel || steps.filter.outputs.jit_kernel || steps.run-mode.outputs.run_all_tests }} |"
+            echo "| multimodal_gen    | ${{ steps.filter-api.outputs.multimodal_gen || steps.filter.outputs.multimodal_gen || steps.run-mode.outputs.run_all_tests }} |"
+            echo "| target_stage      | ${{ inputs.target_stage || '(none)' }} |"
+            echo "| detection_method  | ${{ inputs.target_stage && 'GitHub API' || 'dorny/paths-filter' }} |"
+            echo "| max_parallel      | ${{ steps.set-parallel.outputs.parallel_level }} (h100=${{ steps.set-parallel.outputs.max_parallel }}, 5090=${{ steps.set-parallel.outputs.max_parallel_small }}, 2gpu=${{ steps.set-parallel.outputs.max_parallel_2gpu }}) |"
+            echo "| b200_runner       | ${{ steps.set-runner.outputs.b200_runner }} |"
+            echo "| enable_retry      | ${{ steps.set-retry.outputs.enable_retry }} |"
+            echo "| continue_on_error | ${{ steps.set-continue-on-error.outputs.continue_on_error }} |"
           } >> $GITHUB_STEP_SUMMARY
 
   # =============================================== Wait Jobs for Sequential PR Execution ====================================================
@@ -614,11 +612,18 @@ jobs:
   # =============================================== jit-kernel ====================================================
 
   call-jit-kernel-tests:
-    needs: [check-changes, call-gate]
-    if: needs.check-changes.outputs.jit_kernel == 'true'
+    needs: [check-changes, call-gate, sgl-kernel-build-wheels]
+    if: |
+      always() &&
+      !failure() && !cancelled() &&
+      github.event_name != 'schedule' &&
+      inputs.test_parallel_dispatch != true &&
+      !inputs.target_stage &&
+      needs.check-changes.outputs.jit_kernel == 'true'
     uses: ./.github/workflows/pr-test-jit-kernel.yml
     with:
       jit_kernel: ${{ needs.check-changes.outputs.jit_kernel }}
+      sgl_kernel: ${{ needs.check-changes.outputs.sgl_kernel }}
       b200_runner: ${{ needs.check-changes.outputs.b200_runner }}
       pr_head_sha: ${{ inputs.pr_head_sha || '' }}
       git_ref: ${{ inputs.git_ref || '' }}
@@ -725,11 +730,16 @@ jobs:
 
       # Needed by setuptools-rust to build the bundled native gRPC extension
       # (rust/sglang-grpc) when installing the main `sglang` wheel from source.
-      - name: Install protoc
-        run: sudo bash scripts/ci/utils/install_protoc.sh
+      - name: Install protoc + Rust toolchain
+        timeout-minutes: 10
+        run: bash scripts/ci/utils/install_rust_protoc.sh
 
-      - name: Install Rust toolchain
-        run: bash scripts/ci/utils/install_rustup.sh
+      - name: Rust cache (sglang-grpc)
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust/sglang-grpc
+          shared-key: "sglang-grpc-cpu"
+          save-if: ${{ matrix.partition == 0 }}
 
       # uv pip targets a venv by default; setup-python has no venv — install into that interpreter (see UV_SYSTEM_PYTHON in https://docs.astral.sh/uv/guides/integration/github/)
       - name: Install dependencies
@@ -820,7 +830,10 @@ jobs:
           ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
         )
       )
-    runs-on: 1-gpu-h100
+    # `1-gpu-h100-h200` is a shared label advertised by both the 1-GPU H100 and
+    # 1-GPU H200 runner pools, so this job can land on either. Multimodal_gen
+    # jobs in pr-test-multimodal-gen.yml continue to pin to `1-gpu-h100`.
+    runs-on: 1-gpu-h100-h200
     timeout-minutes: 240
     strategy:
       fail-fast: false
@@ -938,10 +951,7 @@ jobs:
           ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
         )
       )
-    # The `*-low-disk` label (resolved by `set-runner` to `4-gpu-b200-low-disk` or
-    # `4-gpu-b200-kernel-low-disk`) is advertised by both the existing large-disk B200
-    # runners and the new low-disk runner, so this job can land on either pool.
-    runs-on: ${{ needs.check-changes.outputs.b200_low_disk_runner }}
+    runs-on: ${{ needs.check-changes.outputs.b200_runner }}
     timeout-minutes: 240
     strategy:
       fail-fast: false
@@ -970,7 +980,7 @@ jobs:
           CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/cuda/ci_install_dependency.sh
 
       - name: Run test
-        timeout-minutes: 30
+        timeout-minutes: 40
         env:
           CONTINUE_ON_ERROR_FLAG: ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
         run: |
@@ -1174,10 +1184,6 @@ jobs:
     env:
       SGLANG_CI_RDMA_ALL_DEVICES: "mlx5_1,mlx5_2,mlx5_3,mlx5_4"
       CU_VERSION: cu129
-    strategy:
-      fail-fast: false
-      matrix:
-        part: [0, 1]
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -1207,12 +1213,10 @@ jobs:
           CONTINUE_ON_ERROR_FLAG: ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
         run: |
           cd test
-          python3 run_suite.py --hw cuda --suite stage-c-test-8-gpu-h20 --auto-partition-id ${{ matrix.part }} --auto-partition-size 2 $CONTINUE_ON_ERROR_FLAG
+          python3 run_suite.py --hw cuda --suite stage-c-test-8-gpu-h20 $CONTINUE_ON_ERROR_FLAG
 
       - uses: ./.github/actions/upload-cuda-coredumps
         if: failure()
-        with:
-          artifact-suffix: ${{ matrix.part }}
 
       - name: Cleanup venv
         if: always()
@@ -1374,7 +1378,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        part: [0, 1, 2]
+        part: [0, 1, 2, 3, 4, 5]
 
     steps:
       - name: Checkout code
@@ -1405,69 +1409,7 @@ jobs:
           CONTINUE_ON_ERROR_FLAG: ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
         run: |
           cd test
-          python3 run_suite.py --hw cuda --suite stage-c-test-4-gpu-b200 --auto-partition-id ${{ matrix.part }} --auto-partition-size 3 --timeout-per-file 1800 $CONTINUE_ON_ERROR_FLAG
-
-      - uses: ./.github/actions/upload-cuda-coredumps
-        if: failure()
-        with:
-          artifact-suffix: ${{ matrix.part }}
-
-      - name: Cleanup venv
-        if: always()
-        run: bash scripts/ci/cuda/ci_cleanup_venv.sh
-
-  stage-c-test-4-gpu-b200-small:
-    needs: [check-changes, call-gate, wait-for-stage-b, sgl-kernel-build-wheels]
-    if: |
-      always() &&
-      (
-        (inputs.target_stage == 'stage-c-test-4-gpu-b200-small') ||
-        (
-          !inputs.target_stage &&
-          ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == true) || (!failure() && !cancelled())) &&
-          ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
-        )
-      )
-    # The `*-low-disk` label (resolved by `set-runner` to `4-gpu-b200-low-disk` or
-    # `4-gpu-b200-kernel-low-disk`) is advertised by both the existing large-disk B200
-    # runners and the new low-disk runner, so this job can land on either pool.
-    runs-on: ${{ needs.check-changes.outputs.b200_low_disk_runner }}
-    timeout-minutes: 240
-    strategy:
-      fail-fast: false
-      matrix:
-        part: [0, 1, 2]
-
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
-
-      - uses: ./.github/actions/check-stage-health
-
-      - uses: ./.github/actions/check-maintenance
-
-      - name: Download artifacts
-        if: needs.check-changes.outputs.sgl_kernel == 'true'
-        uses: actions/download-artifact@v6
-        with:
-          path: sgl-kernel/dist/
-          merge-multiple: true
-          pattern: wheel-python3.10-cuda*
-
-      - name: Install dependencies
-        timeout-minutes: 20
-        run: |
-          CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/cuda/ci_install_dependency.sh
-
-      - name: Run test
-        timeout-minutes: 30
-        env:
-          CONTINUE_ON_ERROR_FLAG: ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
-        run: |
-          cd test
-          python3 run_suite.py --hw cuda --suite stage-c-test-4-gpu-b200-small --auto-partition-id ${{ matrix.part }} --auto-partition-size 3 --timeout-per-file 1800 $CONTINUE_ON_ERROR_FLAG
+          python3 run_suite.py --hw cuda --suite stage-c-test-4-gpu-b200 --auto-partition-id ${{ matrix.part }} --auto-partition-size 6 --timeout-per-file 1800 $CONTINUE_ON_ERROR_FLAG
 
       - uses: ./.github/actions/upload-cuda-coredumps
         if: failure()
@@ -1559,7 +1501,6 @@ jobs:
         stage-c-test-deepep-4-gpu-h100,
         stage-c-test-deepep-8-gpu-h200,
         stage-c-test-4-gpu-b200,
-        stage-c-test-4-gpu-b200-small,
         # stage-c-test-4-gpu-gb200,  # Temporarily disabled — no GB200 runner
       ]
     if: always()
