@@ -130,8 +130,8 @@ class DeepSeekV4CompressState:
         self.dtype = dtype
         coff = 1 + self.overlap
 
-        state_shape = (max_num_reqs, ratio * coff, 2 * head_dim * coff)
-        self.kv_score_state = torch.empty(state_shape, dtype=dtype, device=device)
+        state_shape = (max_num_reqs + 1, ratio * coff, 2 * head_dim * coff)
+        self.kv_score_state = torch.zeros(state_shape, dtype=dtype, device=device)
 
     def get_state(self) -> KVAndScore:
         if envs.SGLANG_OPT_USE_OLD_COMPRESSOR.get():
