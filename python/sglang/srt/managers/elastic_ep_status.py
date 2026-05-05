@@ -34,6 +34,7 @@ class ControllerElasticEPStatusPublisher(ElasticEPStatusPublisher):
     def __init__(self, send_to_controller: Any, dp_size: int):
         self.send_to_controller = send_to_controller
         self.dp_size = dp_size
+        self.last_status = [True] * dp_size
 
     def publish_active_ranks(
         self,
@@ -48,10 +49,12 @@ class ControllerElasticEPStatusPublisher(ElasticEPStatusPublisher):
         active_ranks &= tp_active_ranks_cpu.detach().cpu()
         assert active_ranks.numel() % self.dp_size == 0
         dp_active_ranks = active_ranks.reshape(self.dp_size, -1).prod(dim=1)
+        status = dp_active_ranks.bool().tolist()
 
-        self.send_to_controller.send_output(
-            ActiveRanksOutput(status=dp_active_ranks.bool().tolist())
-        )
+        if status == self.last_status:
+            return
+        self.last_status = status
+        self.send_to_controller.send_output(ActiveRanksOutput(status=status))
 
 
 def create_elastic_ep_status_publisher(

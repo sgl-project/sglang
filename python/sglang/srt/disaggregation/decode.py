@@ -1255,10 +1255,12 @@ class SchedulerDisaggregationDecodeMixin:
                 if _elastic_state is not None:
                     if tmp_result.copy_done is not None:
                         tmp_result.copy_done.synchronize()
-                    if _elastic_state.publish_active_snapshot():
-                        self._publish_active_ranks_from_cpu_snapshot()
+                    if _elastic_state.commit_active_snapshot():
+                        self._publish_active_ranks_from_committed_snapshot()
                         if _elastic_state.is_stale_snapshot():
                             self._retract_all_and_rebalance_on_rank_fault()
+                            continue
+                        if self._maybe_recover_ep_ranks_from_cpu_snapshot():
                             continue
                 self.process_batch_result(tmp_batch, tmp_result)
             elif batch is None:

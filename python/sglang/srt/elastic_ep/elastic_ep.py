@@ -62,12 +62,12 @@ class ElasticEPState:
             else:
                 staging_tp_active_ranks_cpu.copy_(tp_active_ranks)
 
-    def publish_active_snapshot(self) -> bool:
-        """Publish the oldest unconsumed staging snapshot into CPU mirrors.
+    def commit_active_snapshot(self) -> bool:
+        """Commit the oldest unconsumed staging snapshot into CPU mirrors.
 
         Caller must have already synchronized the stream the submit was enqueued
         on (e.g. via copy_done.synchronize) so staging buffers are ready.
-        Returns True if a snapshot was published.
+        Returns True if a snapshot was committed.
         """
         if (
             not self.pending_staging_slots
@@ -85,7 +85,7 @@ class ElasticEPState:
 
     def is_stale_snapshot(self) -> bool:
         """Return True iff a new fault has appeared since the last handled
-        snapshot. Call publish_active_snapshot() before this check."""
+        snapshot. Call commit_active_snapshot() before this check."""
         return not torch.equal(
             self.active_ranks_cpu, self.last_handled_active_ranks_cpu
         )
@@ -270,16 +270,27 @@ def _refresh_ep_members() -> None:
     EPBuffer._buffer.update_ep_member()
 
 
-def try_recover_ranks(global_ranks: List[int]) -> bool:
+def can_recover_ranks(global_ranks: List[int]) -> bool:
     from mooncake import ep as mooncake_ep
 
     world_backend = _get_process_group_backend(torch.distributed.group.WORLD, "cuda")
-    if not all(mooncake_ep.get_peer_state(world_backend, global_ranks)):
+    return all(mooncake_ep.get_peer_state(world_backend, global_ranks))
+
+
+def try_recover_ranks(global_ranks: List[int]) -> bool:
+    if not can_recover_ranks(global_ranks):
         # The relaunched ranks have not finished initializing yet.
         return False
+    recover_ranks(global_ranks)
+    return True
+
+
+def recover_ranks(global_ranks: List[int]) -> None:
+    from mooncake import ep as mooncake_ep
 
     # Recover the world backend first, then recover each derived process group
     # using ranks mapped into that group's local rank space.
+    world_backend = _get_process_group_backend(torch.distributed.group.WORLD, "cuda")
     mooncake_ep.recover_ranks(world_backend, global_ranks)
 
     for group in _iter_live_parallel_groups():
@@ -297,7 +308,6 @@ def try_recover_ranks(global_ranks: List[int]) -> bool:
         _maybe_create_message_queue(group)
 
     _refresh_ep_members()
-    return True
 
 
 def join_process_groups():

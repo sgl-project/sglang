@@ -172,6 +172,7 @@ from sglang.srt.managers.schedule_policy import (
     SchedulePolicy,
 )
 from sglang.srt.managers.scheduler_dp_attn_mixin import SchedulerDPAttnMixin
+from sglang.srt.managers.scheduler_elastic_ep_mixin import SchedulerElasticEPMixin
 from sglang.srt.managers.scheduler_input_blocker import SchedulerInputBlocker
 from sglang.srt.managers.scheduler_output_processor_mixin import (
     SchedulerOutputProcessorMixin,
@@ -333,6 +334,7 @@ class Scheduler(
     SchedulerRuntimeCheckerMixin,
     SchedulerPPMixin,
     SchedulerDPAttnMixin,
+    SchedulerElasticEPMixin,
     SchedulerDllmMixin,
     SchedulerMlxOverlapMixin,
 ):
@@ -1445,57 +1447,6 @@ class Scheduler(
                     "Request running timeout reached.", HTTPStatus.SERVICE_UNAVAILABLE
                 )
 
-    def _retract_all_and_rebalance_on_rank_fault(self):
-        """Rank fault: drain GPU, retract every in-flight decode req (or
-        abort if over SGLANG_ELASTIC_EP_MAX_RETRACTION), rebalance experts,
-        mark snapshot handled."""
-        self.result_queue.clear()
-        ElasticEPStateManager.instance().clear_pending_snapshots()
-        torch.cuda.synchronize()
-
-        if self.running_batch is not None and not self.running_batch.is_empty():
-            max_retraction = envs.SGLANG_ELASTIC_EP_MAX_RETRACTION.get()
-            abort_reason = FINISH_ABORT(
-                message=f"Elastic EP rank fault; aborted after {max_retraction} retractions.",
-                status_code=HTTPStatus.SERVICE_UNAVAILABLE,
-                err_type="ElasticEPRankFault",
-            )
-            for idx, req in enumerate(list(self.running_batch.reqs)):
-                # release_req frees KV and calls reset_for_retract, which
-                # bumps retraction_count. Hence the post-bump > check.
-                self.running_batch.release_req(idx, 0, self.server_args)
-                if req.retraction_count > max_retraction:
-                    req.finished_reason = abort_reason
-                    self.send_to_tokenizer.send_output(
-                        AbortReq(finished_reason=abort_reason.to_json(),
-                                 rid=req.rid, http_worker_ipc=req.http_worker_ipc),
-                        req,
-                    )
-                else:
-                    self._add_request_to_queue(req, is_retracted=True)
-            self.running_batch.filter_batch(keep_indices=[])
-        self.last_batch = self.cur_batch = None
-
-        eplb_manager = self.tp_worker.model_runner.eplb_manager
-        if eplb_manager is not None:
-            gen = eplb_manager.rebalance()
-            while True:
-                try:
-                    next(gen)
-                except StopIteration:
-                    break
-        ElasticEPStateManager.instance().mark_snapshot_handled()
-
-    def _publish_active_ranks_from_cpu_snapshot(self):
-        elastic_ep_state = ElasticEPStateManager.instance()
-        assert elastic_ep_state is not None
-        assert elastic_ep_state.tp_active_ranks_cpu is not None
-
-        self.elastic_ep_status_publisher.publish_active_ranks(
-            tp_active_ranks=elastic_ep_state.tp_active_ranks_cpu,
-            tp_active_ranks_cpu=self.tp_group.active_ranks_cpu,
-        )
-
     def get_init_info(self) -> Dict[str, Any]:
         """Return scheduler initialization info for handshake.
 
@@ -1569,17 +1520,18 @@ class Scheduler(
             """Commit the oldest result_queue entry. Returns True normally.
             When elastic EP is enabled, syncing copy_done also flushes the
             submit_active_snapshot async copy (same forward_stream, recorded
-            earlier); if the resulting snapshot differs from the last
-            handled one, the abort helper cleans up and we return False so
-            the caller skips the rest of the iteration."""
+            earlier); fault and recovery paths retract in-flight batches and
+            return False so the caller skips the rest of the iteration."""
             tmp_batch, tmp_result = self.result_queue.popleft()
             if _elastic_state is not None:
                 if tmp_result.copy_done is not None:
                     tmp_result.copy_done.synchronize()
-                if _elastic_state.publish_active_snapshot():
-                    self._publish_active_ranks_from_cpu_snapshot()
+                if _elastic_state.commit_active_snapshot():
+                    self._publish_active_ranks_from_committed_snapshot()
                     if _elastic_state.is_stale_snapshot():
                         self._retract_all_and_rebalance_on_rank_fault()
+                        return False
+                    if self._maybe_recover_ep_ranks_from_cpu_snapshot():
                         return False
             self.process_batch_result(tmp_batch, tmp_result)
             return True

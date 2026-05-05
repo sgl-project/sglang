@@ -1,0 +1,113 @@
+from __future__ import annotations
+
+from http import HTTPStatus
+from typing import TYPE_CHECKING, List
+
+import torch
+
+from sglang.srt.elastic_ep.elastic_ep import (
+    ElasticEPStateManager,
+    can_recover_ranks,
+)
+from sglang.srt.environ import envs
+from sglang.srt.managers.io_struct import AbortReq
+from sglang.srt.managers.schedule_batch import FINISH_ABORT
+
+if TYPE_CHECKING:
+    from sglang.srt.managers.scheduler import Scheduler
+
+
+class SchedulerElasticEPMixin:
+    def _publish_active_ranks_from_committed_snapshot(self: Scheduler):
+        elastic_ep_state = ElasticEPStateManager.instance()
+        assert elastic_ep_state is not None
+        assert elastic_ep_state.tp_active_ranks_cpu is not None
+
+        self.elastic_ep_status_publisher.publish_active_ranks(
+            tp_active_ranks=elastic_ep_state.tp_active_ranks_cpu,
+            tp_active_ranks_cpu=self.tp_group.active_ranks_cpu,
+        )
+
+    def _get_elastic_ep_ranks_to_recover_from_cpu_snapshot(
+        self: Scheduler,
+    ) -> List[int]:
+        elastic_ep_state = ElasticEPStateManager.instance()
+        if elastic_ep_state is None or elastic_ep_state.tp_active_ranks_cpu is None:
+            return []
+
+        assert elastic_ep_state.tp_active_ranks_cpu.numel() == (
+            self.tp_group.active_ranks_cpu.numel()
+        )
+        active_ranks = (
+            elastic_ep_state.tp_active_ranks_cpu & self.tp_group.active_ranks_cpu
+        )
+        return torch.nonzero(active_ranks == 0, as_tuple=False).flatten().tolist()
+
+    def _retract_inflight_batches_for_elastic_ep(
+        self: Scheduler,
+        *,
+        abort_message: str,
+        err_type: str,
+    ) -> None:
+        self.result_queue.clear()
+        ElasticEPStateManager.instance().clear_pending_snapshots()
+        torch.cuda.synchronize()
+
+        if self.running_batch is not None and not self.running_batch.is_empty():
+            max_retraction = envs.SGLANG_ELASTIC_EP_MAX_RETRACTION.get()
+            abort_reason = FINISH_ABORT(
+                message=abort_message.format(max_retraction=max_retraction),
+                status_code=HTTPStatus.SERVICE_UNAVAILABLE,
+                err_type=err_type,
+            )
+            for idx, req in enumerate(list(self.running_batch.reqs)):
+                self.running_batch.release_req(idx, 0, self.server_args)
+                if req.retraction_count > max_retraction:
+                    req.finished_reason = abort_reason
+                    self.send_to_tokenizer.send_output(
+                        AbortReq(
+                            finished_reason=abort_reason.to_json(),
+                            rid=req.rid,
+                            http_worker_ipc=req.http_worker_ipc,
+                        ),
+                        req,
+                    )
+                else:
+                    self._add_request_to_queue(req, is_retracted=True)
+            self.running_batch.filter_batch(keep_indices=[])
+        self.last_batch = self.cur_batch = None
+
+    def _retract_all_and_rebalance_on_rank_fault(self: Scheduler):
+        """Rank fault: drain GPU, retract in-flight decode reqs, rebalance."""
+        self._retract_inflight_batches_for_elastic_ep(
+            abort_message=(
+                "Elastic EP rank fault; aborted after {max_retraction} retractions."
+            ),
+            err_type="ElasticEPRankFault",
+        )
+
+        eplb_manager = self.tp_worker.model_runner.eplb_manager
+        if eplb_manager is not None:
+            gen = eplb_manager.rebalance()
+            while True:
+                try:
+                    next(gen)
+                except StopIteration:
+                    break
+        ElasticEPStateManager.instance().mark_snapshot_handled()
+
+    def _maybe_recover_ep_ranks_from_cpu_snapshot(self: Scheduler) -> bool:
+        ranks_to_recover = self._get_elastic_ep_ranks_to_recover_from_cpu_snapshot()
+        if not ranks_to_recover or not can_recover_ranks(ranks_to_recover):
+            return False
+
+        self._retract_inflight_batches_for_elastic_ep(
+            abort_message=(
+                "Elastic EP rank recovery; aborted after "
+                "{max_retraction} retractions."
+            ),
+            err_type="ElasticEPRankRecovery",
+        )
+        self.tp_worker.model_runner.recover_ep_ranks_after_retract(ranks_to_recover)
+        self._publish_active_ranks_from_committed_snapshot()
+        return True
