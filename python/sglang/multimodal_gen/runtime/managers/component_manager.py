@@ -668,6 +668,7 @@ class ComponentResidencyManager:
         module: nn.Module,
         was_on_cuda: bool,
     ) -> None:
+        """explicitly empty cache after potential release of large component"""
         if not use.memory_intensive:
             return
         released_cuda_storage = was_on_cuda and not self._module_on_cuda(module)
