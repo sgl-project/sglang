@@ -1127,76 +1127,78 @@ class LTX2TransformerBlock(nn.Module):
             )
             audio_hidden_states = audio_hidden_states + attn_audio_hidden_states
         # 3. Audio-to-Video and Video-to-Audio Cross-Attention
-        norm_hidden_states = rms_norm(hidden_states, self.norm_eps)
-        norm_audio_hidden_states = rms_norm(audio_hidden_states, self.norm_eps)
+        if not (skip_a2v_cross_attn and skip_v2a_cross_attn):
+            norm_hidden_states = rms_norm(hidden_states, self.norm_eps)
+            norm_audio_hidden_states = rms_norm(audio_hidden_states, self.norm_eps)
 
-        # Compute combined ada params
-        video_per_layer_ca_scale_shift = self.video_a2v_cross_attn_scale_shift_table[
-            :4, :
-        ]
-        video_per_layer_ca_gate = self.video_a2v_cross_attn_scale_shift_table[4:, :]
-
-        video_ca_scale_shift_table = (
-            video_per_layer_ca_scale_shift[None, None, :, :].to(
-                dtype=temb_ca_scale_shift.dtype, device=temb_ca_scale_shift.device
+            # The scale, shift, and gate tensors below are only consumed by the
+            # two AV cross-attention paths. HQ guidance may disable both paths.
+            video_per_layer_ca_scale_shift = (
+                self.video_a2v_cross_attn_scale_shift_table[:4, :]
             )
-            + temb_ca_scale_shift.reshape(
-                batch_size, temb_ca_scale_shift.shape[1], 4, -1
-            )
-        ).unbind(dim=2)
-        video_ca_gate = (
-            video_per_layer_ca_gate[None, None, :, :].to(
-                dtype=temb_ca_gate.dtype, device=temb_ca_gate.device
-            )
-            + temb_ca_gate.reshape(batch_size, temb_ca_gate.shape[1], 1, -1)
-        ).unbind(dim=2)
+            video_per_layer_ca_gate = self.video_a2v_cross_attn_scale_shift_table[4:, :]
 
-        (
-            video_a2v_ca_scale,
-            video_a2v_ca_shift,
-            video_v2a_ca_scale,
-            video_v2a_ca_shift,
-        ) = [t.squeeze(2) for t in video_ca_scale_shift_table]
-        a2v_gate = video_ca_gate[0].squeeze(2)
+            video_ca_scale_shift_table = (
+                video_per_layer_ca_scale_shift[None, None, :, :].to(
+                    dtype=temb_ca_scale_shift.dtype, device=temb_ca_scale_shift.device
+                )
+                + temb_ca_scale_shift.reshape(
+                    batch_size, temb_ca_scale_shift.shape[1], 4, -1
+                )
+            ).unbind(dim=2)
+            video_ca_gate = (
+                video_per_layer_ca_gate[None, None, :, :].to(
+                    dtype=temb_ca_gate.dtype, device=temb_ca_gate.device
+                )
+                + temb_ca_gate.reshape(batch_size, temb_ca_gate.shape[1], 1, -1)
+            ).unbind(dim=2)
 
-        audio_per_layer_ca_scale_shift = self.audio_a2v_cross_attn_scale_shift_table[
-            :4, :
-        ]
-        audio_per_layer_ca_gate = self.audio_a2v_cross_attn_scale_shift_table[4:, :]
+            (
+                video_a2v_ca_scale,
+                video_a2v_ca_shift,
+                video_v2a_ca_scale,
+                video_v2a_ca_shift,
+            ) = [t.squeeze(2) for t in video_ca_scale_shift_table]
+            a2v_gate = video_ca_gate[0].squeeze(2)
 
-        audio_ca_scale_shift_table = (
-            audio_per_layer_ca_scale_shift[None, None, :, :].to(
-                dtype=temb_ca_audio_scale_shift.dtype,
-                device=temb_ca_audio_scale_shift.device,
+            audio_per_layer_ca_scale_shift = (
+                self.audio_a2v_cross_attn_scale_shift_table[:4, :]
             )
-            + temb_ca_audio_scale_shift.reshape(
-                batch_size, temb_ca_audio_scale_shift.shape[1], 4, -1
-            )
-        ).unbind(dim=2)
-        audio_ca_gate = (
-            audio_per_layer_ca_gate[None, None, :, :].to(
-                dtype=temb_ca_audio_gate.dtype, device=temb_ca_audio_gate.device
-            )
-            + temb_ca_audio_gate.reshape(batch_size, temb_ca_audio_gate.shape[1], 1, -1)
-        ).unbind(dim=2)
+            audio_per_layer_ca_gate = self.audio_a2v_cross_attn_scale_shift_table[4:, :]
 
-        (
-            audio_a2v_ca_scale,
-            audio_a2v_ca_shift,
-            audio_v2a_ca_scale,
-            audio_v2a_ca_shift,
-        ) = [t.squeeze(2) for t in audio_ca_scale_shift_table]
-        v2a_gate = audio_ca_gate[0].squeeze(2)
+            audio_ca_scale_shift_table = (
+                audio_per_layer_ca_scale_shift[None, None, :, :].to(
+                    dtype=temb_ca_audio_scale_shift.dtype,
+                    device=temb_ca_audio_scale_shift.device,
+                )
+                + temb_ca_audio_scale_shift.reshape(
+                    batch_size, temb_ca_audio_scale_shift.shape[1], 4, -1
+                )
+            ).unbind(dim=2)
+            audio_ca_gate = (
+                audio_per_layer_ca_gate[None, None, :, :].to(
+                    dtype=temb_ca_audio_gate.dtype, device=temb_ca_audio_gate.device
+                )
+                + temb_ca_audio_gate.reshape(
+                    batch_size, temb_ca_audio_gate.shape[1], 1, -1
+                )
+            ).unbind(dim=2)
 
-        # A2V
-        mod_norm_hidden_states = (
-            norm_hidden_states * (1 + video_a2v_ca_scale) + video_a2v_ca_shift
-        )
-        mod_norm_audio_hidden_states = (
-            norm_audio_hidden_states * (1 + audio_a2v_ca_scale) + audio_a2v_ca_shift
-        )
+            (
+                audio_a2v_ca_scale,
+                audio_a2v_ca_shift,
+                audio_v2a_ca_scale,
+                audio_v2a_ca_shift,
+            ) = [t.squeeze(2) for t in audio_ca_scale_shift_table]
+            v2a_gate = audio_ca_gate[0].squeeze(2)
 
         if not skip_a2v_cross_attn:
+            mod_norm_hidden_states = (
+                norm_hidden_states * (1 + video_a2v_ca_scale) + video_a2v_ca_shift
+            )
+            mod_norm_audio_hidden_states = (
+                norm_audio_hidden_states * (1 + audio_a2v_ca_scale) + audio_a2v_ca_shift
+            )
             a2v_attn_hidden_states = self.audio_to_video_attn(
                 mod_norm_hidden_states,
                 context=mod_norm_audio_hidden_states,
@@ -1211,15 +1213,13 @@ class LTX2TransformerBlock(nn.Module):
                 )
             hidden_states = hidden_states + a2v_gate * a2v_attn_hidden_states
 
-        # V2A
-        mod_norm_hidden_states = (
-            norm_hidden_states * (1 + video_v2a_ca_scale) + video_v2a_ca_shift
-        )
-        mod_norm_audio_hidden_states = (
-            norm_audio_hidden_states * (1 + audio_v2a_ca_scale) + audio_v2a_ca_shift
-        )
-
         if not skip_v2a_cross_attn:
+            mod_norm_hidden_states = (
+                norm_hidden_states * (1 + video_v2a_ca_scale) + video_v2a_ca_shift
+            )
+            mod_norm_audio_hidden_states = (
+                norm_audio_hidden_states * (1 + audio_v2a_ca_scale) + audio_v2a_ca_shift
+            )
             v2a_attn_hidden_states = self.video_to_audio_attn(
                 mod_norm_audio_hidden_states,
                 context=mod_norm_hidden_states,
