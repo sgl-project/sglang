@@ -34,11 +34,13 @@ from sglang.srt.lora.layers import QKVParallelLinearWithLoRA
 from sglang.srt.lora.mem_pool import LoRAMemoryPool
 
 
-def _make_pool(*, head_dim: int, num_attention_heads: int, num_kv_heads: int) -> LoRAMemoryPool:
-    """Build a minimal pool whose `_text_config` carries just enough fields
+def _make_pool(
+    *, head_dim: int, num_attention_heads: int, num_kv_heads: int
+) -> LoRAMemoryPool:
+    """Build a minimal pool whose `base_hf_config` carries just enough fields
     for `_column_parallel_lora_b_per_rank_dim` to do its job."""
     pool = LoRAMemoryPool.__new__(LoRAMemoryPool)
-    pool._text_config = types.SimpleNamespace(
+    pool.base_hf_config = types.SimpleNamespace(
         head_dim=head_dim,
         hidden_size=num_attention_heads * head_dim,
         num_attention_heads=num_attention_heads,
@@ -48,7 +50,11 @@ def _make_pool(*, head_dim: int, num_attention_heads: int, num_kv_heads: int) ->
 
 
 def _qkv_total_output_dim(
-    *, head_dim: int, num_attention_heads: int, num_kv_heads: int, attn_output_gate: bool
+    *,
+    head_dim: int,
+    num_attention_heads: int,
+    num_kv_heads: int,
+    attn_output_gate: bool,
 ) -> int:
     """Mirror the per-model `get_hidden_dim("qkv_proj")` return: the
     un-sharded total, optionally gate-doubled on the q side."""
@@ -144,7 +150,7 @@ class TestColumnParallelLoraBPerRankDim(unittest.TestCase):
         # Defensive: if the text config lacks num_key_value_heads, the
         # helper must not crash and just return the naive even split.
         pool = LoRAMemoryPool.__new__(LoRAMemoryPool)
-        pool._text_config = types.SimpleNamespace(
+        pool.base_hf_config = types.SimpleNamespace(
             head_dim=128,
             hidden_size=4096,
             num_attention_heads=32,

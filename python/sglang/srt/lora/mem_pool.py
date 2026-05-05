@@ -380,7 +380,9 @@ class LoRAMemoryPool:
         if module_name != "qkv_proj":
             return divide(total_output_dim, effective_tp_size)
 
-        cfg = self._text_config
+        cfg = self.base_hf_config
+        if hasattr(cfg, "get_text_config"):
+            cfg = cfg.get_text_config()
         num_kv_heads = getattr(cfg, "num_key_value_heads", None)
         if num_kv_heads is None or num_kv_heads >= effective_tp_size:
             return divide(total_output_dim, effective_tp_size)
