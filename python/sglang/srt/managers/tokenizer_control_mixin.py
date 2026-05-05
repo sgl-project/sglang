@@ -76,6 +76,8 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromDistributedReqOutput,
     UpdateWeightsFromIPCReqInput,
     UpdateWeightsFromIPCReqOutput,
+    UpdateWeightsFromWPIReqInput,
+    UpdateWeightsFromWPIReqOutput,
     UpdateWeightsFromTensorReqInput,
     UpdateWeightsFromTensorReqOutput,
 )
@@ -102,6 +104,7 @@ _COMMUNICATOR_SPECS = [
     ("send_weights_to_remote_instance", SendWeightsToRemoteInstanceReqOutput),
     ("update_weights_from_tensor", UpdateWeightsFromTensorReqOutput),
     ("update_weights_from_ipc", UpdateWeightsFromIPCReqOutput),
+    ("update_weights_from_wpi", UpdateWeightsFromWPIReqOutput),
     ("get_weights_by_name", GetWeightsByNameReqOutput),
     ("release_memory_occupation", ReleaseMemoryOccupationReqOutput),
     ("resume_memory_occupation", ResumeMemoryOccupationReqOutput),
@@ -522,6 +525,40 @@ class TokenizerControlMixin:
                     success, message = result.success, result.message
         except Exception as e:
             error_msg = f"IPC weight update failed: {str(e)}"
+            logger.error(error_msg)
+            success, message = False, error_msg
+
+        if success and obj.weight_version is not None:
+            self._update_weight_version_if_provided(obj.weight_version)
+            message += f" Weight version updated to {obj.weight_version}."
+
+        return success, message
+
+    async def update_weights_from_wpi(
+        self: TokenizerManager,
+        obj: UpdateWeightsFromWPIReqInput,
+        request: Optional[fastapi.Request] = None,
+    ) -> Tuple[bool, str]:
+        """Update weights via WPI."""
+        self.auto_create_handle_loop()
+        try:
+            assert (
+                self.server_args.dp_size == 1 or self.server_args.enable_dp_attention
+            ), "dp_size must be 1 or dp attention must be enabled for update weights from WPI"
+            logger.info("Starting WPI weight update")
+
+            async with self.is_pause_cond:
+                is_paused = self.is_pause
+                if is_paused:
+                    result = (await self.update_weights_from_wpi_communicator(obj))[0]
+                    success, message = result.success, result.message
+
+            if not is_paused:
+                async with self.model_update_lock.writer_lock:
+                    result = (await self.update_weights_from_wpi_communicator(obj))[0]
+                    success, message = result.success, result.message
+        except Exception as e:
+            error_msg = f"WPI weight update failed: {str(e)}"
             logger.error(error_msg)
             success, message = False, error_msg
 
