@@ -21,6 +21,11 @@ jobs:
         with:
           fetch-depth: 0  # Required for setuptools-scm to determine version from tags
 
+      # Needed by setuptools-rust to build the bundled native gRPC extension
+      # (rust/sglang-grpc) when `python -m build` builds the sglang wheel.
+      - name: Install protoc
+        run: sudo bash scripts/ci/utils/install_protoc.sh
+
       - name: Upload to pypi
         run: |
           cd python
