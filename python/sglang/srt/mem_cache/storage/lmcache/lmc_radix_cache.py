@@ -166,6 +166,16 @@ class LMCRadixCache(RadixCache):
         if uncached_len == 0:
             return base_res
 
+        # MP mode keys the daemon-side session by ``req.rid`` so the same
+        # id flows from LOOKUP through STORE/END_SESSION (mirroring vLLM /
+        # TRT-LLM). Some scheduler paths call ``match_prefix`` as a peek
+        # without a Req (e.g. in-batch prefix-caching priority in
+        # schedule_policy); for those, skip the LMCache fetch — the
+        # actual prefill pass through schedule_batch passes ``req`` and
+        # picks up the cached prefix at that time.
+        if params.req is None:
+            return base_res
+
         chunk_size = self.lmcache_connector.chunk_size()
         prefix_pad = value.numel() % chunk_size
 
@@ -189,6 +199,7 @@ class LMCRadixCache(RadixCache):
                 slot_mapping=slot_mapping,
                 offset=value.numel() - prefix_pad,
                 prefix_pad=prefix_pad,
+                request_id=params.req.rid,
             )
         )
         logger.debug("num_retrieved_tokens: %s", num_retrieved)
@@ -247,8 +258,11 @@ class LMCRadixCache(RadixCache):
             req.req_pool_idx, :kv_committed_len
         ]
 
+        # Pass req so MP-mode match_prefix can derive the wire request_id
+        # from req.rid. Falls through the early-return path inside
+        # match_prefix because the just-inserted tokens are already in radix.
         match_result = self.match_prefix(
-            MatchPrefixParams(key=RadixKey(token_ids, req.extra_key))
+            MatchPrefixParams(key=RadixKey(token_ids, req.extra_key), req=req)
         )
         new_last_node = match_result.last_device_node
         assert new_last_node is not None
@@ -259,11 +273,19 @@ class LMCRadixCache(RadixCache):
             token_ids=token_ids,
             kv_indices=kv_indices,
             offset=0,
+            request_id=req.rid,
         )
         with torch.cuda.stream(self.store_stream):
             self.lmcache_connector.store_kv(store_md)
         with self._node_lock:
             self._in_flight_nodes.append(new_last_node)
+        # MP-mode single per-request cleanup hook — fires once regardless of
+        # whether store_kv ran or early-returned, mirroring vLLM's
+        # request_finished hook. Releases the daemon-side session created
+        # by LOOKUP and/or STORE. The in-process connector has no such
+        # session concept and exposes no end_session method.
+        if self._mp_mode:
+            self.lmcache_connector.end_session(req.rid)
 
     def evict(self, params: EvictParams) -> EvictResult:
         """Before base eviction, wait for any outstanding stores and release locks."""
