@@ -176,7 +176,8 @@ def get_deepep_output_dtype(self, quant_scheme=None) -> DeepOutputDtype:
     2.3. If scheme is NPUW4A8Int8DynamicMoEMethod → FP8.
     2.4. If scheme is NPUW4A16Int4DynamicMoEMethod → BF16.
     3. If flashinfer_cutedsl backend is active → BF16 (it quantizes to NVFP4 internally).
-    4. Otherwise → FP8 (the default for most models like DeepSeek-V3).
+    4. Otherwise NPU → BF16 (the default for NPU).
+    5. Otherwise → FP8 (the default for most models like DeepSeek-V3).
     """
     # 0. Parse server argument.
     server_args = get_global_server_args()
@@ -210,7 +211,10 @@ def get_deepep_output_dtype(self, quant_scheme=None) -> DeepOutputDtype:
     if get_moe_runner_backend().is_flashinfer_cutedsl():
         return DeepOutputDtype.BF16
 
-    # 4. Default: FP8
+    # 4. Default on NPU → BF16
+    return DeepOutputDtype.BF16
+
+    # 5. Default → FP8
     return DeepOutputDtype.FP8
 
 
