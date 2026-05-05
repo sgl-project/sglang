@@ -6,7 +6,10 @@ export const KimiK26Deployment = () => {
       title: 'Hardware Platform',
       items: [
         { id: 'h200', label: 'H200', default: true },
+        { id: 'b200', label: 'B200', default: false },
         { id: 'b300', label: 'B300', default: false },
+        { id: 'gb200', label: 'GB200', default: false },
+        { id: 'gb300', label: 'GB300', default: false },
         { id: 'mi300x', label: 'MI300X', default: false },
         { id: 'mi325x', label: 'MI325X', default: false },
         { id: 'mi350x', label: 'MI350X', default: false },
@@ -41,7 +44,10 @@ export const KimiK26Deployment = () => {
 
   const modelConfigs = {
     h200: { tp: 8 },
+    b200: { tp: 8 },
     b300: { tp: 8 },
+    gb200: { tp: 4 },
+    gb300: { tp: 4 },
     mi300x: { tp: 4 },
     mi325x: { tp: 4 },
     mi350x: { tp: 4 },
@@ -92,6 +98,8 @@ export const KimiK26Deployment = () => {
     const isAMD = hardware === 'mi300x' || hardware === 'mi325x' || hardware === 'mi350x' || hardware === 'mi355x';
     const hwConfig = modelConfigs[hardware];
     const tpValue = hwConfig.tp;
+    const isGBPlatform = hardware === 'gb200' || hardware === 'gb300';
+    const dpValue = tpValue;
 
     let cmd = '';
 
@@ -108,7 +116,10 @@ export const KimiK26Deployment = () => {
     cmd += ' \\\n  --trust-remote-code';
 
     if (dpattention === 'enabled') {
-      cmd += ` \\\n  --dp ${tpValue} \\\n  --enable-dp-attention`;
+      if (!isGBPlatform) {
+        cmd += ` \\\n  --dp ${dpValue}`;
+      }
+      cmd += ' \\\n  --enable-dp-attention';
     }
 
     if (reasoning === 'enabled') {
