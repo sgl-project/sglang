@@ -34,6 +34,13 @@ First use [../sglang-diffusion-benchmark-profile/SKILL.md](../sglang-diffusion-b
 - rule out existing mainline fast paths
 - prove the run stayed on the native SGLang diffusion backend, not a diffusers fallback
 
+Before opening AKO, also read
+[../sglang-diffusion-benchmark-profile/existing-fast-paths.md](../sglang-diffusion-benchmark-profile/existing-fast-paths.md).
+It records current mainline fusions plus the open PR watchlist for diffusion
+kernel, VAE, attention, cache, and scheduling work. If an open PR already covers
+the same shape family, use it as prior art or decide whether to rebase/extend it
+instead of starting a duplicate kernel.
+
 If a future specialized optimization skill matches the kernel family better than AKO4ALL, hand off there instead. The diagnosis contract stays the same.
 
 ## Mandatory AKO4ALL Preflight
@@ -58,6 +65,8 @@ By default it uses the existing `origin` URL, or `AKO4ALL_URL` if you need to ov
 - Identify the exact kernel entry point and runtime call sites in `sglang`.
 - Record the target shapes, dtypes, model families, and whether the kernel is on a hot path.
 - Reuse existing unit tests and benchmark entry points when they already exist.
+- Record whether the hotspot overlaps an open PR from `existing-fast-paths.md`;
+  if it does, note the PR number in the AKO context and final PR artifacts.
 
 ### 2. Bootstrap the AKO Harness
 
