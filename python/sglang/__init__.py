@@ -24,6 +24,11 @@ if _sys.platform == "darwin":
         pass
 del _sys
 
+from sglang.srt.utils.hf_transformers_patches import apply_all as _apply_hf_patches
+
+_apply_hf_patches()
+del _apply_hf_patches
+
 # Frontend Language APIs
 from sglang.global_config import global_config
 from sglang.lang.api import (

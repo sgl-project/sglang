@@ -14,7 +14,6 @@ from sgl_kernel.allreduce import *
 from sgl_kernel.attention import (
     cutlass_mla_decode,
     cutlass_mla_get_workspace_size,
-    merge_state,
     merge_state_v2,
 )
 from sgl_kernel.cutlass_moe import cutlass_w4a8_moe_mm, get_cutlass_w4a8_moe_mm_data
@@ -22,7 +21,6 @@ from sgl_kernel.elementwise import (
     concat_mla_absorb_q,
     concat_mla_k,
     copy_to_gpu_no_ce,
-    downcast_fp8,
     fused_add_rmsnorm,
     gelu_and_mul,
     gelu_tanh_and_mul,
@@ -92,7 +90,6 @@ from sgl_kernel.quantization import (
     ggml_mul_mat_vec_a8,
 )
 from sgl_kernel.sampling import (
-    top_k_mask_logits,
     top_k_renorm_prob,
     top_p_renorm_prob,
 )
@@ -128,7 +125,6 @@ _DEBUG_EXPORT_NAMES = [
     "copy_to_gpu_no_ce",
     "cutlass_mla_decode",
     "cutlass_mla_get_workspace_size",
-    "downcast_fp8",
     "dsv3_fused_a_gemm",
     "dsv3_router_gemm",
     "es_fp8_blockwise_scaled_grouped_mm",
@@ -151,7 +147,6 @@ _DEBUG_EXPORT_NAMES = [
     "gptq_shuffle",
     "int8_scaled_mm",
     "kimi_k2_moe_fused_gate",
-    "merge_state",
     "merge_state_v2",
     "moe_align_block_size",
     "moe_fused_gate",
@@ -170,7 +165,6 @@ _DEBUG_EXPORT_NAMES = [
     "sgl_per_token_quant_fp8",
     "shuffle_rows",
     "silu_and_mul",
-    "top_k_mask_logits",
     "top_k_renorm_prob",
     "top_p_renorm_prob",
     "topk_sigmoid",

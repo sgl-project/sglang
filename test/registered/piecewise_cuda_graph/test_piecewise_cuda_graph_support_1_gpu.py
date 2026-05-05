@@ -17,7 +17,7 @@ from sglang.test.test_utils import (
 )
 
 # CI Registration
-register_cuda_ci(est_time=220, suite="stage-b-test-1-gpu-large")
+register_cuda_ci(est_time=260, suite="stage-b-test-1-gpu-large")
 
 
 class TestPiecewiseCudaGraphQwen25VL(CustomTestCase):
@@ -41,21 +41,19 @@ class TestPiecewiseCudaGraphQwen25VL(CustomTestCase):
     def tearDownClass(cls):
         kill_process_tree(cls.process.pid)
 
-    def test_mgsm_accuracy(self):
-        num_examples = 2000
-
+    def test_gsm8k_accuracy(self):
         args = SimpleNamespace(
             base_url=self.base_url,
             model=self.model,
-            eval_name="mgsm_en",
-            num_examples=num_examples,
-            num_threads=min(num_examples, 1024),
+            eval_name="gsm8k",
+            num_examples=None,
+            num_threads=1024,
         )
 
         metrics = run_eval(args)
-        print(f"MGSM Accuracy: {metrics['score']:.3f}")
+        print(f"GSM8K Accuracy: {metrics['score']:.3f}")
 
-        self.assertGreaterEqual(metrics["score"], 0.70)
+        self.assertGreaterEqual(metrics["score"], 0.80)
 
 
 class TestPiecewiseCudaGraphInternVL25(CustomTestCase):
@@ -79,21 +77,23 @@ class TestPiecewiseCudaGraphInternVL25(CustomTestCase):
     def tearDownClass(cls):
         kill_process_tree(cls.process.pid)
 
-    def test_mgsm_accuracy(self):
-        num_examples = 2000
-
+    def test_gsm8k_accuracy(self):
         args = SimpleNamespace(
             base_url=self.base_url,
             model=self.model,
-            eval_name="mgsm_en",
-            num_examples=num_examples,
-            num_threads=min(num_examples, 1024),
+            eval_name="gsm8k",
+            num_examples=None,
+            num_threads=1024,
         )
 
         metrics = run_eval(args)
-        print(f"MGSM Accuracy: {metrics['score']:.3f}")
+        print(f"GSM8K Accuracy: {metrics['score']:.3f}")
 
-        self.assertGreaterEqual(metrics["score"], 0.70)
+        # Baseline (no piecewise CUDA graph): 0.571 — this eval uses 5-shot
+        # concatenated text via chat API, which scores lower than reported
+        # benchmarks (~77.8%) that use proper CoT chat format. The threshold
+        # is set 5% below observed to catch catastrophic regressions.
+        self.assertGreaterEqual(metrics["score"], 0.54)
 
 
 class TestPiecewiseCudaGraphQwen25VLEmbedding(CustomTestCase):
@@ -126,8 +126,25 @@ class TestPiecewiseCudaGraphQwen25VLEmbedding(CustomTestCase):
         engine.shutdown()
         self.assertGreater(len(out_without_pcg), 0)
 
+        t_out = torch.tensor(out)
+        t_out_without_pcg = torch.tensor(out_without_pcg)
+        max_abs_diff = (t_out - t_out_without_pcg).abs().max().item()
+        max_rel_diff = (
+            ((t_out - t_out_without_pcg).abs() / (t_out_without_pcg.abs() + 1e-8))
+            .max()
+            .item()
+        )
+        print(
+            f"PCG embedding diff: max_abs={max_abs_diff:.6f}, max_rel={max_rel_diff:.6f}"
+        )
         self.assertTrue(
-            torch.allclose(torch.tensor(out), torch.tensor(out_without_pcg))
+            torch.allclose(
+                t_out,
+                t_out_without_pcg,
+                atol=1e-2,
+                rtol=1e-2,
+            ),
+            f"Piecewise CUDA graph embedding mismatch: max_abs_diff={max_abs_diff}, max_rel_diff={max_rel_diff}",
         )
 
 

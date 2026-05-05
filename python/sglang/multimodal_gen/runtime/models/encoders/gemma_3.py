@@ -146,23 +146,61 @@ class Gemma3Attention(nn.Module):
             prefix=f"{prefix}.o_proj",
         )
 
+        self.layer_type = (
+            config.text_config.layer_types[layer_id]
+            if hasattr(config.text_config, "layer_types")
+            else None
+        )
         self.is_sliding = (
             config.text_config.layer_types[layer_id] == "sliding_attention"
         )
 
+        rope_parameters = getattr(config.text_config, "rope_parameters", None) or {}
+        layer_rope_params = {}
+        if self.layer_type is not None and isinstance(rope_parameters, dict):
+            layer_rope_params = dict(rope_parameters.get(self.layer_type) or {})
+
         # Initialize the rotary embedding.
         if self.is_sliding:
             # Local attention.
-            self.rope_theta = config.text_config.rope_local_base_freq
-            rope_scaling = None  # Default
+            self.rope_theta = float(
+                layer_rope_params.get(
+                    "rope_theta",
+                    getattr(
+                        config.text_config,
+                        "rope_local_base_freq",
+                        getattr(
+                            getattr(config.text_config, "default_theta", {}),
+                            "get",
+                            lambda *_: 10_000.0,
+                        )("local", 10_000.0),
+                    ),
+                )
+            )
+            rope_scaling = layer_rope_params or None
             # sliding window
             self.sliding_window = get_attention_sliding_window_size(config.text_config)
             # (left, right) = (window, 0) effectively for causal
             self.window_size = (self.sliding_window, 0)
         else:
             # Global attention.
-            self.rope_theta = config.text_config.rope_theta
-            rope_scaling = config.text_config.rope_scaling
+            self.rope_theta = float(
+                layer_rope_params.get(
+                    "rope_theta",
+                    getattr(
+                        config.text_config,
+                        "rope_theta",
+                        getattr(
+                            getattr(config.text_config, "default_theta", {}),
+                            "get",
+                            lambda *_: 1_000_000.0,
+                        )("global", 1_000_000.0),
+                    ),
+                )
+            )
+            rope_scaling = layer_rope_params or getattr(
+                config.text_config, "rope_scaling", None
+            )
             self.sliding_window = None
             self.window_size = (-1, -1)
 
@@ -734,7 +772,9 @@ class Gemma3TextModel(nn.Module):
                     layer_id=i,
                     config=config,
                     quant_config=self.quant_config,
-                    prefix=f"{config.text_config.prefix}.layers.{i}",
+                    prefix=add_prefix(
+                        f"layers.{i}", getattr(config.text_config, "prefix", "")
+                    ),
                 )
                 for i in range(config.text_config.num_hidden_layers)
             ]
@@ -891,6 +931,16 @@ class Gemma3TextModel(nn.Module):
 
 
 class Gemma3ForConditionalGeneration(nn.Module):
+    # transformers 5.6.0 flattened SiglipVisionModel, dropping the
+    # `vision_model` intermediate wrapper. Our reimpl keeps it, so remap
+    # HF source keys back into our nested namespace when transferring weights.
+    param_names_mapping = {
+        r"^(vision_tower\.)(embeddings|encoder|post_layernorm|head)\.": r"\1vision_model.\2.",
+    }
+    reverse_param_names_mapping = {
+        r"^(vision_tower\.)vision_model\.(embeddings|encoder|post_layernorm|head)\.": r"\1\2.",
+    }
+
     def __init__(
         self,
         config: Gemma3Config,

@@ -1,5 +1,5 @@
 """
-E2E smoke test for HiCache storage runtime attach/detach.
+E2E check for HiCache storage runtime attach/detach.
 
 This test launches an SGLang server with hierarchical cache enabled but WITHOUT
 any storage backend at startup, then attaches/detaches a storage backend via the
@@ -28,7 +28,7 @@ from sglang.test.test_utils import (
 )
 from sglang.utils import wait_for_http_ready
 
-register_cuda_ci(est_time=200, suite="stage-b-test-2-gpu-large")
+register_cuda_ci(est_time=139, suite="stage-b-test-2-gpu-large")
 
 
 class TestHiCacheStorageRuntimeAttachDetach(CustomTestCase):

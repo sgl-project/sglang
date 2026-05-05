@@ -122,7 +122,7 @@ def fused_qk_norm_rope_ref(
         q = apply_interleave(q)
         k = apply_interleave(k)
     else:
-        # NeoX style: first half * cos - second half * sin (and vice versa)
+        # NeoX style: first half × cos − second half × sin (and vice versa)
         def apply_neox(x):
             # x: [num_tokens, n_heads, head_dim]
             x1 = x[:, :, : rotary_dim // 2]
@@ -231,7 +231,7 @@ def test_fused_qknorm_rope_partial_rotary(head_dim, is_neox):
 
     # NeoX requires half_rotary_lanes to be power of 2.
     # half_rotary_lanes = rotary_dim / (head_dim / 32) / 2 = (head_dim//2) / (head_dim/32) / 2
-    # = 16 / 2 = 8 -> power of 2, OK for all supported head_dims.
+    # = 16 / 2 = 8 → power of 2, OK for all supported head_dims.
 
     qkv = torch.randn(
         (num_tokens, total_heads * head_dim), dtype=torch.bfloat16, device=device
