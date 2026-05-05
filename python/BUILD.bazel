@@ -1,0 +1,22 @@
+load("//tools/bazel:sgl_defs.bzl", "sgl_py_library")
+
+exports_files([
+    "pyproject.toml",
+    "pyproject_cpu.toml",
+    "pyproject_npu.toml",
+    "pyproject_other.toml",
+    "pyproject_xpu.toml",
+])
+
+sgl_py_library(
+    name = "sglang",
+    srcs = glob(["sglang/**/*.py"]),
+    data = glob(
+        [
+            "sglang/jit_kernel/**/*",
+            "sglang/srt/**/*",
+        ],
+        exclude = ["**/*.py"],
+    ),
+    imports = ["."],
+)

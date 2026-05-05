@@ -78,6 +78,9 @@ docs/_build/
 .pybuilder/
 target/
 
+# Bazel workspace symlinks
+/bazel-*
+
 # Jupyter Notebook
 .ipynb_checkpoints
 

@@ -1,0 +1,15 @@
+load("//tools/bazel:sgl_defs.bzl", "sgl_cpu_test")
+
+sgl_cpu_test(
+    name = "test_hook_registry",
+    srcs = ["test_hook_registry.py"],
+    est_time = 7,
+    suite = "stage-a-test-cpu",
+)
+
+sgl_cpu_test(
+    name = "test_load_plugins",
+    srcs = ["test_load_plugins.py"],
+    est_time = 7,
+    suite = "stage-a-test-cpu",
+)

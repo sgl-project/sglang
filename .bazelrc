@@ -1,0 +1,20 @@
+common --enable_bzlmod
+
+# Keep Python execution tied to the local SGLang environment. Bazel inherits
+# PYTHONPATH for third-party packages so torch/CUDA-style deps stay outside
+# Bazel's dependency graph.
+build --python_path=python/.venv/bin/python
+build --action_env=PYTHONNOUSERSITE=1
+
+test --test_output=errors
+test --test_env=PYTHONPATH
+test --test_env=CUDA_VISIBLE_DEVICES
+test --test_env=SGLANG_PLATFORM
+test --test_env=HF_HOME
+test --test_env=HUGGINGFACE_HUB_CACHE
+test --test_env=HOME
+
+build:x86_64 --platforms=//tools/bazel:linux_x86_64
+build:arm64 --platforms=//tools/bazel:linux_aarch64
+test:x86_64 --test_tag_filters=arch-x86_64,arch-any
+test:arm64 --test_tag_filters=arch-aarch64,arch-any

@@ -1,0 +1,34 @@
+module(
+    name = "sglang",
+    version = "0.0.0",
+)
+
+bazel_dep(name = "platforms", version = "1.0.0")
+bazel_dep(name = "rules_python", version = "1.9.0")
+bazel_dep(name = "gazelle", version = "0.47.0", repo_name = "bazel_gazelle")
+bazel_dep(name = "rules_python_gazelle_plugin", version = "1.9.0")
+
+local_runtime_repo = use_repo_rule(
+    "@rules_python//python/local_toolchains:repos.bzl",
+    "local_runtime_repo",
+)
+
+local_runtime_toolchains_repo = use_repo_rule(
+    "@rules_python//python/local_toolchains:repos.bzl",
+    "local_runtime_toolchains_repo",
+)
+
+local_runtime_repo(
+    name = "local_python",
+    interpreter_path = "python3",
+    on_failure = "fail",
+    dev_dependency = True,
+)
+
+local_runtime_toolchains_repo(
+    name = "local_python_toolchains",
+    runtimes = ["local_python"],
+    dev_dependency = True,
+)
+
+register_toolchains("@local_python_toolchains//:all", dev_dependency = True)
