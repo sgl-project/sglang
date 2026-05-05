@@ -306,10 +306,14 @@ class EagleDraftWorker(BaseDraftWorker):
         )
         # Capture extend
         # TODO: support draft extend cuda graph for more attention backends
-        if self.draft_extend_attn_backend and (
-            _is_npu
-            or supports_cuda_draft_extend_graph
-            or supports_hip_aiter_draft_extend_graph
+        if (
+            self.draft_extend_attn_backend
+            and (
+                _is_npu
+                or supports_cuda_draft_extend_graph
+                or supports_hip_aiter_draft_extend_graph
+            )
+            and not self.server_args.enable_hisparse
         ):
             tic = time.perf_counter()
             before_mem = get_available_gpu_memory(self.device, self.gpu_id)
@@ -322,6 +326,10 @@ class EagleDraftWorker(BaseDraftWorker):
             after_mem = get_available_gpu_memory(self.device, self.gpu_id)
             logger.info(
                 f"Capture draft extend cuda graph end. Time elapsed: {time.perf_counter() - tic:.2f} s. mem usage={(before_mem - after_mem):.2f} GB. avail mem={after_mem:.2f} GB."
+            )
+        elif self.draft_extend_attn_backend and self.server_args.enable_hisparse:
+            logger.info(
+                "Skip draft extend cuda graph because HiSparse remaps KV locations during EAGLE verification."
             )
 
     def draft(self, model_worker_batch: ModelWorkerBatch):

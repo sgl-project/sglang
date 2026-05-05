@@ -667,6 +667,20 @@ class ModelRunnerKVCacheMixin:
                     self.token_to_kv_pool_allocator.full_to_swa_index_mapping
                 )
 
+        if (
+            self.enable_hisparse
+            and isinstance(
+                self.token_to_kv_pool_allocator, HiSparseTokenToKVPoolAllocator
+            )
+            and isinstance(self.token_to_kv_pool, HiSparseNSATokenToKVPool)
+        ):
+            # Draft workers can reuse an allocator while recreating their local
+            # KV pool. Register the mapping unconditionally once both objects
+            # exist so every worker sees the logical->hisparse index table.
+            self.token_to_kv_pool.register_mapping(
+                self.token_to_kv_pool_allocator.full_to_hisparse_device_index_mapping
+            )
+
     def _apply_token_constraints(self: ModelRunner, token_capacity: int) -> int:
         """Apply external constraints to token capacity: user cap, PP sync.
 

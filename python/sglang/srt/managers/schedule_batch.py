@@ -905,6 +905,7 @@ class Req(ReqDllmMixin):
 
         # For hisparse
         self.hisparse_staging = False
+        self.hisparse_spec_info = None
 
     @property
     def seqlen(self) -> int:
@@ -2256,6 +2257,20 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         assert not ret or self.spec_algorithm.supports_spec_v2()
         return ret
 
+    def get_spec_v2_draft_input(self) -> Optional["EagleDraftInput"]:
+        if not self.is_spec_v2:
+            return None
+        draft_input = self.spec_info
+        if draft_input is None:
+            logger.warning(
+                "Spec v2 batch missing spec_info; skipping overlap-specific sync/prep. "
+                "forward_mode=%s reqs=%d",
+                self.forward_mode,
+                len(self.reqs),
+            )
+            return None
+        return draft_input
+
     def prepare_for_decode(self):
         self.forward_mode = ForwardMode.DECODE
         bs = len(self.reqs)
@@ -2267,9 +2282,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         if hasattr(self, "attn_cp_metadata") and self.attn_cp_metadata is not None:
             self.attn_cp_metadata = None
 
-        if self.is_spec_v2:
+        draft_input = self.get_spec_v2_draft_input()
+        if draft_input is not None:
             # TODO(spec-v2): all spec v2 should go through this path
-            draft_input: EagleDraftInput = self.spec_info
             draft_input.prepare_for_decode(self)
 
         if not self.spec_algorithm.is_none():
@@ -2368,10 +2383,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             )
 
     def maybe_wait_verify_done(self):
-        if self.is_spec_v2:
-            draft_input: EagleDraftInput = self.spec_info
-            if draft_input.verify_done is not None:
-                draft_input.verify_done.synchronize()
+        draft_input = self.get_spec_v2_draft_input()
+        if draft_input is not None and draft_input.verify_done is not None:
+            draft_input.verify_done.synchronize()
 
     def filter_batch(
         self,
@@ -2505,8 +2519,17 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.return_hidden_states |= other.return_hidden_states
         self.is_prefill_only = self.is_prefill_only and other.is_prefill_only
 
-        if self.spec_info:
+        if self.spec_info is None:
+            self.spec_info = other.spec_info
+        elif other.spec_info is not None:
             self.spec_info.merge_batch(other.spec_info)
+        elif self.is_spec_v2:
+            logger.warning(
+                "Spec v2 merge_batch received empty other.spec_info; keeping current "
+                "spec_info. self_reqs=%d other_reqs=%d",
+                len(self.reqs),
+                len(other.reqs),
+            )
 
     def get_model_worker_batch(
         self, seq_lens_cpu_cache: Optional[torch.Tensor] = None

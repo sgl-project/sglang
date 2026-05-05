@@ -73,8 +73,9 @@ template <int NUM_TOP_K, int HOT_BUFFER_SIZE>
 struct SmemLayout {
   static constexpr int HASH_SIZE = NUM_TOP_K * 2;
   static constexpr int NUM_BUFFER_CHUNKS = (HOT_BUFFER_SIZE + WARP_SIZE - 1) / WARP_SIZE;
-  // int32_t region: top_k_tokens + chunk_offset + evict_chunk_offset + hash_keys + total_hits + newest_hit
-  static constexpr int TOTAL_INT32 = NUM_TOP_K + (NUM_BUFFER_CHUNKS + 1) + (NUM_BUFFER_CHUNKS + 1) + HASH_SIZE + 2;
+  // int32_t region: top_k_tokens + chunk_offset + evict_chunk_offset + hash_keys
+  // + total_hits + newest_hit + valid_count
+  static constexpr int TOTAL_INT32 = NUM_TOP_K + (NUM_BUFFER_CHUNKS + 1) + (NUM_BUFFER_CHUNKS + 1) + HASH_SIZE + 3;
   // int16_t region: lru_slots_out + hash_vals
   static constexpr int TOTAL_INT16 = HOT_BUFFER_SIZE + HASH_SIZE;
   static constexpr size_t BYTES = TOTAL_INT32 * sizeof(int32_t) + TOTAL_INT16 * sizeof(int16_t);
@@ -138,7 +139,7 @@ __global__ void load_cache_to_device_buffer_kernel(
     const int count = (seq_len < NUM_TOP_K) ? static_cast<int>(seq_len) : NUM_TOP_K;
     for (int i = tid; i < count; i += BLOCK_SIZE) {
       int32_t token_pos = req_top_k_tokens[i];
-      if (token_pos >= 0) {
+      if (token_pos >= 0 && token_pos < seq_len) {
         req_top_k_device_locs[i] = req_device_buffer_locs[token_pos];
       }
     }
@@ -162,6 +163,7 @@ __global__ void load_cache_to_device_buffer_kernel(
   // Scalar counters
   int32_t& s_total_hits = s_hash_keys[HASH_SIZE];
   int32_t& s_newest_hit = s_hash_keys[HASH_SIZE + 1];
+  int32_t& s_valid_count = s_hash_keys[HASH_SIZE + 2];
 
   int16_t* smem_i16 = reinterpret_cast<int16_t*>(smem_i32 + Layout::TOTAL_INT32);
   // Compacted slot ordering: [hits fwd→  ...  ←evictables bwd]
@@ -173,6 +175,7 @@ __global__ void load_cache_to_device_buffer_kernel(
   if (tid == 0) {
     s_total_hits = 0;
     s_newest_hit = 0;
+    s_valid_count = 0;
   }
   for (int i = tid; i < HASH_SIZE; i += BLOCK_SIZE) {
     s_hash_keys[i] = HASH_EMPTY;
@@ -189,13 +192,20 @@ __global__ void load_cache_to_device_buffer_kernel(
   // Insert top-k tokens into shared-memory hash table.
   for (int i = tid; i < NUM_TOP_K; i += BLOCK_SIZE) {
     int32_t token_idx = req_top_k_tokens[i];
-    if (token_idx == newest_token) {
+    if (token_idx < 0 || token_idx >= seq_len) {
+      // Padded or otherwise invalid top-k entries must not become host-cache
+      // misses. A -1 miss would index req_host_cache_locs[-1] and can trigger
+      // illegal memory access under CUDA graph padding.
+      s_top_k_tokens[i] = TOKEN_HIT;
+    } else if (token_idx == newest_token) {
       // If topk includes the latest token, bind its canonical occurrence to newest_slot (at HOT_BUFFER_SIZE) and mark
       // it as a hit. newest_slot is at the first position of the extra page, excluded from LRU tracking.
       s_top_k_tokens[i] = TOKEN_HIT;
       req_top_k_device_locs[i] = req_device_buffer_locs[newest_slot];
-      s_newest_hit = 1;
+      atomicAdd(&s_newest_hit, 1);
+      atomicAdd(&s_valid_count, 1);
     } else {
+      atomicAdd(&s_valid_count, 1);
       int slot = hash_slot(token_idx, HASH_SIZE);
       while (true) {
         int32_t old = atomicCAS(&s_hash_keys[slot], HASH_EMPTY, token_idx);
@@ -336,7 +346,7 @@ __global__ void load_cache_to_device_buffer_kernel(
   }
   __syncthreads();
 
-  total_misses = NUM_TOP_K - s_total_hits - s_newest_hit;
+  total_misses = s_valid_count - s_total_hits - s_newest_hit;
   // Write back LRU order: evictables at front (LRU), hits at back (MRU).
   {
     const int total_evictable = HOT_BUFFER_SIZE - s_total_hits;
@@ -361,6 +371,326 @@ __global__ void load_cache_to_device_buffer_kernel(
 
     const int64_t src_loc = req_host_cache_locs[miss_token];
     const int64_t dst_loc = static_cast<int64_t>(req_device_buffer_locs[evict_slot]);
+
+    const auto src_k = static_cast<const char*>(host_cache_k) + src_loc * item_size_bytes;
+    auto dst_k = static_cast<char*>(device_buffer_k) + dst_loc * item_size_bytes;
+    transfer_item_warp(lane_id, src_k, dst_k, item_size_bytes);
+
+    if constexpr (!IsMLA) {
+      const auto src_v = static_cast<const char*>(host_cache_v) + src_loc * item_size_bytes;
+      auto dst_v = static_cast<char*>(device_buffer_v) + dst_loc * item_size_bytes;
+      transfer_item_warp(lane_id, src_v, dst_v, item_size_bytes);
+    }
+  }
+}
+
+template <int BLOCK_SIZE, int NUM_TOP_K, int HOT_BUFFER_SIZE, bool IsMLA, typename SeqLensT>
+__global__ void prepare_swap_kernel(
+    const int32_t* __restrict__ top_k_tokens,
+    int32_t* __restrict__ device_buffer_tokens,
+    const int64_t* __restrict__ host_cache_locs,
+    const int32_t* __restrict__ device_buffer_locs,
+    int32_t* __restrict__ top_k_device_locs,
+    int32_t* __restrict__ hit_device_locs,
+    int32_t* __restrict__ miss_device_locs,
+    int32_t* __restrict__ hit_count,
+    int64_t* __restrict__ miss_src_locs,
+    int64_t* __restrict__ miss_dst_locs,
+    const int64_t* __restrict__ req_pool_indices,
+    const SeqLensT* __restrict__ seq_lens,
+    int16_t* __restrict__ lru_slots,
+    const int32_t* __restrict__ num_real_reqs,
+    int64_t buffer_stride_0,
+    int64_t host_stride,
+    int64_t lru_slot_stride_0,
+    int64_t top_k_tokens_stride,
+    int64_t top_k_device_locs_stride,
+    int64_t hit_device_locs_stride,
+    int64_t miss_device_locs_stride,
+    int64_t miss_src_locs_stride,
+    int64_t miss_dst_locs_stride,
+    int64_t page_size,
+    int64_t item_size_bytes) {
+  constexpr int NUM_WARPS = BLOCK_SIZE / WARP_SIZE;
+  constexpr int NUM_TOKEN_CHUNKS = (NUM_TOP_K + WARP_SIZE - 1) / WARP_SIZE;
+  constexpr int NUM_BUFFER_CHUNKS = (HOT_BUFFER_SIZE + WARP_SIZE - 1) / WARP_SIZE;
+
+  const int bid = blockIdx.x;
+  if (bid >= num_real_reqs[0]) return;
+
+  const int tid = threadIdx.x;
+  const int warp_id = tid / WARP_SIZE;
+  const int lane_id = tid % WARP_SIZE;
+  const unsigned int lanes_before = ((unsigned int)1 << lane_id) - 1;
+
+  const int64_t rid = req_pool_indices[bid];
+  const int64_t seq_len = seq_lens[bid];
+
+  const int32_t* req_top_k_tokens = top_k_tokens + bid * top_k_tokens_stride;
+  int32_t* req_top_k_device_locs = top_k_device_locs + bid * top_k_device_locs_stride;
+  int32_t* req_hit_device_locs = hit_device_locs + bid * hit_device_locs_stride;
+  int32_t* req_miss_device_locs = miss_device_locs + bid * miss_device_locs_stride;
+  int64_t* req_miss_src_locs = miss_src_locs + bid * miss_src_locs_stride;
+  int64_t* req_miss_dst_locs = miss_dst_locs + bid * miss_dst_locs_stride;
+
+  const int64_t buffer_offset = rid * buffer_stride_0;
+  int32_t* req_device_buffer_tokens = device_buffer_tokens + buffer_offset;
+  const int32_t* req_device_buffer_locs = device_buffer_locs + buffer_offset;
+  const int64_t* req_host_cache_locs = host_cache_locs + rid * host_stride;
+  int16_t* req_lru_slots = lru_slots + rid * lru_slot_stride_0;
+
+  if (tid == 0) {
+    hit_count[bid] = 0;
+  }
+  __syncthreads();
+
+  if (seq_len <= HOT_BUFFER_SIZE) {
+    const int count = (seq_len < NUM_TOP_K) ? static_cast<int>(seq_len) : NUM_TOP_K;
+    for (int i = tid; i < count; i += BLOCK_SIZE) {
+      int32_t token_pos = req_top_k_tokens[i];
+      if (token_pos >= 0 && token_pos < seq_len) {
+        int32_t loc = req_device_buffer_locs[token_pos];
+        req_top_k_device_locs[i] = loc;
+        req_hit_device_locs[i] = loc;
+        atomicAdd(&hit_count[bid], 1);
+      }
+    }
+    return;
+  }
+
+  extern __shared__ char smem_raw[];
+  using Layout = SmemLayout<NUM_TOP_K, HOT_BUFFER_SIZE>;
+  constexpr int HASH_SIZE = Layout::HASH_SIZE;
+
+  int32_t* smem_i32 = reinterpret_cast<int32_t*>(smem_raw);
+  int32_t* s_top_k_tokens = smem_i32;
+  int32_t* s_chunk_offset = s_top_k_tokens + NUM_TOP_K;
+  int32_t* s_evict_chunk_offset = s_chunk_offset + (NUM_BUFFER_CHUNKS + 1);
+  int32_t* s_hash_keys = s_evict_chunk_offset + (NUM_BUFFER_CHUNKS + 1);
+  int32_t& s_total_hits = s_hash_keys[HASH_SIZE];
+  int32_t& s_newest_hit = s_hash_keys[HASH_SIZE + 1];
+  int32_t& s_valid_count = s_hash_keys[HASH_SIZE + 2];
+
+  int16_t* smem_i16 = reinterpret_cast<int16_t*>(smem_i32 + Layout::TOTAL_INT32);
+  int16_t* s_lru_slots_out = smem_i16;
+  int16_t* s_hash_vals = s_lru_slots_out + HOT_BUFFER_SIZE;
+
+  if (tid == 0) {
+    s_total_hits = 0;
+    s_newest_hit = 0;
+    s_valid_count = 0;
+  }
+  for (int i = tid; i < HASH_SIZE; i += BLOCK_SIZE) {
+    s_hash_keys[i] = HASH_EMPTY;
+  }
+  for (int i = tid; i < NUM_BUFFER_CHUNKS + 1; i += BLOCK_SIZE) {
+    s_chunk_offset[i] = 0;
+    s_evict_chunk_offset[i] = 0;
+  }
+  __syncthreads();
+
+  const int newest_slot = HOT_BUFFER_SIZE;
+  const int32_t newest_token = seq_len - 1;
+
+  for (int i = tid; i < NUM_TOP_K; i += BLOCK_SIZE) {
+    int32_t token_idx = req_top_k_tokens[i];
+    if (token_idx < 0 || token_idx >= seq_len) {
+      s_top_k_tokens[i] = TOKEN_HIT;
+    } else if (token_idx == newest_token) {
+      int32_t loc = req_device_buffer_locs[newest_slot];
+      s_top_k_tokens[i] = TOKEN_HIT;
+      req_top_k_device_locs[i] = loc;
+      req_hit_device_locs[i] = loc;
+      atomicAdd(&s_newest_hit, 1);
+      atomicAdd(&s_valid_count, 1);
+    } else {
+      atomicAdd(&s_valid_count, 1);
+      int slot = hash_slot(token_idx, HASH_SIZE);
+      while (true) {
+        int32_t old = atomicCAS(&s_hash_keys[slot], HASH_EMPTY, token_idx);
+        if (old == HASH_EMPTY || old == token_idx) {
+          s_hash_vals[slot] = static_cast<int16_t>(i);
+          break;
+        }
+        slot = (slot + 1) % HASH_SIZE;
+      }
+      s_top_k_tokens[i] = token_idx;
+    }
+  }
+  __syncthreads();
+
+  constexpr int ITERATIONS_PER_WARP_BUFFER = (NUM_BUFFER_CHUNKS + NUM_WARPS - 1) / NUM_WARPS;
+  int total_hit_count = 0;
+  int total_evict_count = 0;
+  for (int iter = 0; iter < ITERATIONS_PER_WARP_BUFFER; iter++) {
+    int chunk_idx = warp_id + iter * NUM_WARPS;
+    bool has_valid_chunk = chunk_idx < NUM_BUFFER_CHUNKS;
+    const int slot_idx = chunk_idx * WARP_SIZE + lane_id;
+    const bool has_valid_slot = has_valid_chunk && (slot_idx < HOT_BUFFER_SIZE);
+    const int16_t buf_slot = has_valid_slot ? req_lru_slots[slot_idx] : -1;
+    int32_t my_buffer_token = (buf_slot >= 0) ? req_device_buffer_tokens[buf_slot] : -1;
+    int my_found_top_k_idx = -1;
+    if (my_buffer_token >= 0) {
+      int h = hash_slot(my_buffer_token, HASH_SIZE);
+      while (true) {
+        int32_t k = s_hash_keys[h];
+        if (k == my_buffer_token) {
+          my_found_top_k_idx = static_cast<int32_t>(s_hash_vals[h]);
+          break;
+        }
+        if (k == HASH_EMPTY) break;
+        h = (h + 1) % HASH_SIZE;
+      }
+    }
+    bool is_hit = my_found_top_k_idx >= 0;
+    bool is_evictable = has_valid_slot && !is_hit;
+
+    if (is_hit) {
+      int32_t loc = req_device_buffer_locs[buf_slot];
+      s_top_k_tokens[my_found_top_k_idx] = TOKEN_HIT;
+      req_top_k_device_locs[my_found_top_k_idx] = loc;
+      req_hit_device_locs[my_found_top_k_idx] = loc;
+    }
+
+    int local_hit_offset = 0;
+    int local_evict_offset = 0;
+    if (has_valid_chunk) {
+      const unsigned int hit_mask = __ballot_sync(0xFFFFFFFF, is_hit);
+      const unsigned int evict_mask = __ballot_sync(0xFFFFFFFF, is_evictable);
+      local_hit_offset = __popc(hit_mask & lanes_before);
+      local_evict_offset = __popc(evict_mask & lanes_before);
+      if (lane_id == 0) {
+        s_chunk_offset[chunk_idx + 1] = __popc(hit_mask);
+        s_evict_chunk_offset[chunk_idx + 1] = __popc(evict_mask);
+      }
+    }
+    __syncthreads();
+
+    if (warp_id == 0) {
+      total_hit_count =
+          warp_inclusive_scan(s_chunk_offset, lane_id, chunk_idx + 1, NUM_BUFFER_CHUNKS + 1, total_hit_count);
+      total_evict_count =
+          warp_inclusive_scan(s_evict_chunk_offset, lane_id, chunk_idx + 1, NUM_BUFFER_CHUNKS + 1, total_evict_count);
+      if (tid == 0) {
+        s_total_hits = total_hit_count;
+      }
+    }
+    __syncthreads();
+
+    if (is_hit) {
+      int hit_offset = s_chunk_offset[chunk_idx] + local_hit_offset;
+      s_lru_slots_out[hit_offset] = buf_slot;
+    }
+    if (is_evictable) {
+      int evict_offset = s_evict_chunk_offset[chunk_idx] + local_evict_offset;
+      s_lru_slots_out[HOT_BUFFER_SIZE - 1 - evict_offset] = buf_slot;
+    }
+  }
+  __syncthreads();
+
+  {
+    const int total_evictable = HOT_BUFFER_SIZE - s_total_hits;
+    for (int i = tid; i < HOT_BUFFER_SIZE; i += BLOCK_SIZE) {
+      if (i < total_evictable) {
+        req_lru_slots[i] = s_lru_slots_out[HOT_BUFFER_SIZE - 1 - i];
+      } else {
+        req_lru_slots[i] = s_lru_slots_out[i - total_evictable];
+      }
+    }
+  }
+
+  for (int i = tid; i < NUM_TOKEN_CHUNKS + 1; i += BLOCK_SIZE) {
+    s_chunk_offset[i] = 0;
+  }
+  __syncthreads();
+
+  int total_misses = 0;
+  constexpr int ITERATIONS_PER_WARP_TOKEN = (NUM_TOKEN_CHUNKS + NUM_WARPS - 1) / NUM_WARPS;
+  for (int iter = 0; iter < ITERATIONS_PER_WARP_TOKEN; iter++) {
+    int chunk_idx = warp_id + iter * NUM_WARPS;
+    bool has_valid_chunk = chunk_idx < NUM_TOKEN_CHUNKS;
+    const int chunk_token_start = chunk_idx * WARP_SIZE;
+    const int my_token_idx = chunk_token_start + lane_id;
+    const bool has_valid_token = has_valid_chunk && (my_token_idx < NUM_TOP_K);
+
+    int32_t my_token = 0;
+    bool is_miss = false;
+    int local_miss_offset = 0;
+    if (has_valid_token) {
+      is_miss = s_top_k_tokens[my_token_idx] != TOKEN_HIT;
+      if (is_miss) {
+        my_token = s_top_k_tokens[my_token_idx];
+      }
+    }
+
+    if (has_valid_chunk) {
+      const unsigned int miss_mask = __ballot_sync(0xFFFFFFFF, is_miss);
+      local_miss_offset = __popc(miss_mask & lanes_before);
+      if (lane_id == 0) {
+        s_chunk_offset[chunk_idx + 1] = __popc(miss_mask);
+      }
+    }
+    __syncthreads();
+
+    if (warp_id == 0) {
+      total_misses = warp_inclusive_scan(s_chunk_offset, lane_id, chunk_idx + 1, NUM_TOKEN_CHUNKS + 1, total_misses);
+    }
+    __syncthreads();
+
+    if (is_miss) {
+      int miss_offset = s_chunk_offset[chunk_idx] + local_miss_offset;
+      int16_t evict_slot = s_lru_slots_out[HOT_BUFFER_SIZE - 1 - miss_offset];
+      s_top_k_tokens[miss_offset] = my_token;
+      int64_t src_loc = req_host_cache_locs[my_token];
+      int64_t dst_loc = static_cast<int64_t>(req_device_buffer_locs[evict_slot]);
+      if (src_loc >= 0 && dst_loc >= 0) {
+        req_top_k_device_locs[my_token_idx] = static_cast<int32_t>(dst_loc);
+        req_miss_device_locs[my_token_idx] = static_cast<int32_t>(dst_loc);
+        req_miss_src_locs[my_token_idx] = src_loc;
+        req_miss_dst_locs[my_token_idx] = dst_loc;
+        req_device_buffer_tokens[evict_slot] = my_token;
+      }
+    }
+  }
+  __syncthreads();
+
+  if (tid == 0) {
+    hit_count[bid] = s_total_hits + s_newest_hit;
+  }
+}
+
+template <int BLOCK_SIZE, bool IsMLA>
+__global__ void execute_h2d_copy_kernel(
+    const int64_t* __restrict__ miss_src_locs,
+    const int64_t* __restrict__ miss_dst_locs,
+    const int32_t* __restrict__ hit_count,
+    const void* __restrict__ host_cache_k,
+    const void* __restrict__ host_cache_v,
+    void* __restrict__ device_buffer_k,
+    void* __restrict__ device_buffer_v,
+    const int32_t* __restrict__ num_real_reqs,
+    int64_t miss_src_locs_stride,
+    int64_t miss_dst_locs_stride,
+    int32_t num_top_k,
+    int64_t item_size_bytes) {
+  constexpr int NUM_WARPS = BLOCK_SIZE / WARP_SIZE;
+
+  const int bid = blockIdx.x;
+  if (bid >= num_real_reqs[0]) return;
+
+  const int tid = threadIdx.x;
+  const int warp_id = tid / WARP_SIZE;
+  const int lane_id = tid % WARP_SIZE;
+
+  const int64_t* req_miss_src_locs = miss_src_locs + bid * miss_src_locs_stride;
+  const int64_t* req_miss_dst_locs = miss_dst_locs + bid * miss_dst_locs_stride;
+
+  for (int miss_idx = warp_id; miss_idx < num_top_k; miss_idx += NUM_WARPS) {
+    const int64_t src_loc = req_miss_src_locs[miss_idx];
+    const int64_t dst_loc = req_miss_dst_locs[miss_idx];
+    if (src_loc < 0 || dst_loc < 0) {
+      continue;
+    }
 
     const auto src_k = static_cast<const char*>(host_cache_k) + src_loc * item_size_bytes;
     auto dst_k = static_cast<char*>(device_buffer_k) + dst_loc * item_size_bytes;
@@ -442,6 +772,119 @@ void load_cache_to_device_buffer(
         load_cache_to_device_buffer_kernel<BLOCK_SIZE, NUM_TOP_K, HOT_BUFFER_SIZE, IsMLA, int32_t>,
         static_cast<const int32_t*>(seq_lens.data_ptr()));
   }
+}
+
+template <int BLOCK_SIZE, int NUM_TOP_K, int HOT_BUFFER_SIZE, bool IsMLA>
+void prepare_swap(
+    tvm::ffi::TensorView top_k_tokens,
+    tvm::ffi::TensorView device_buffer_tokens,
+    tvm::ffi::TensorView host_cache_locs,
+    tvm::ffi::TensorView device_buffer_locs,
+    tvm::ffi::TensorView top_k_device_locs,
+    tvm::ffi::TensorView hit_device_locs,
+    tvm::ffi::TensorView miss_device_locs,
+    tvm::ffi::TensorView hit_count,
+    tvm::ffi::TensorView miss_src_locs,
+    tvm::ffi::TensorView miss_dst_locs,
+    tvm::ffi::TensorView req_pool_indices,
+    tvm::ffi::TensorView seq_lens,
+    tvm::ffi::TensorView lru_slots,
+    tvm::ffi::TensorView num_real_reqs,
+    int64_t page_size,
+    int64_t item_size_bytes) {
+  using namespace host;
+
+  const int64_t bs = top_k_tokens.shape()[0];
+  const int64_t host_stride = host_cache_locs.shape()[1];
+  const int64_t buffer_stride_0 = device_buffer_tokens.strides()[0];
+  const int64_t lru_slot_stride_0 = lru_slots.strides()[0];
+  const int64_t top_k_tokens_stride = top_k_tokens.strides()[0];
+  const int64_t top_k_device_locs_stride = top_k_device_locs.strides()[0];
+  const int64_t hit_device_locs_stride = hit_device_locs.strides()[0];
+  const int64_t miss_device_locs_stride = miss_device_locs.strides()[0];
+  const int64_t miss_src_locs_stride = miss_src_locs.strides()[0];
+  const int64_t miss_dst_locs_stride = miss_dst_locs.strides()[0];
+  const auto device = LaunchKernel::resolve_device(top_k_tokens.device());
+
+  auto launch = [&](auto kernel_fn, const auto* seq_lens_ptr) {
+    constexpr size_t smem_bytes = SmemLayout<NUM_TOP_K, HOT_BUFFER_SIZE>::BYTES;
+    if constexpr (smem_bytes > 48u * 1024u) {
+      cudaFuncSetAttribute(kernel_fn, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes);
+    }
+    LaunchKernel(bs, BLOCK_SIZE, device, smem_bytes)(
+        kernel_fn,
+        static_cast<const int32_t*>(top_k_tokens.data_ptr()),
+        static_cast<int32_t*>(device_buffer_tokens.data_ptr()),
+        static_cast<const int64_t*>(host_cache_locs.data_ptr()),
+        static_cast<const int32_t*>(device_buffer_locs.data_ptr()),
+        static_cast<int32_t*>(top_k_device_locs.data_ptr()),
+        static_cast<int32_t*>(hit_device_locs.data_ptr()),
+        static_cast<int32_t*>(miss_device_locs.data_ptr()),
+        static_cast<int32_t*>(hit_count.data_ptr()),
+        static_cast<int64_t*>(miss_src_locs.data_ptr()),
+        static_cast<int64_t*>(miss_dst_locs.data_ptr()),
+        static_cast<const int64_t*>(req_pool_indices.data_ptr()),
+        seq_lens_ptr,
+        static_cast<int16_t*>(lru_slots.data_ptr()),
+        static_cast<const int32_t*>(num_real_reqs.data_ptr()),
+        buffer_stride_0,
+        host_stride,
+        lru_slot_stride_0,
+        top_k_tokens_stride,
+        top_k_device_locs_stride,
+        hit_device_locs_stride,
+        miss_device_locs_stride,
+        miss_src_locs_stride,
+        miss_dst_locs_stride,
+        page_size,
+        item_size_bytes);
+  };
+
+  const auto dtype = seq_lens.dtype();
+  if (dtype.code == kDLInt && dtype.bits == 64) {
+    launch(
+        prepare_swap_kernel<BLOCK_SIZE, NUM_TOP_K, HOT_BUFFER_SIZE, IsMLA, int64_t>,
+        static_cast<const int64_t*>(seq_lens.data_ptr()));
+  } else {
+    launch(
+        prepare_swap_kernel<BLOCK_SIZE, NUM_TOP_K, HOT_BUFFER_SIZE, IsMLA, int32_t>,
+        static_cast<const int32_t*>(seq_lens.data_ptr()));
+  }
+}
+
+template <int BLOCK_SIZE, bool IsMLA>
+void execute_h2d_copy(
+    tvm::ffi::TensorView miss_src_locs,
+    tvm::ffi::TensorView miss_dst_locs,
+    tvm::ffi::TensorView hit_count,
+    tvm::ffi::TensorView host_cache_k,
+    tvm::ffi::TensorView host_cache_v,
+    tvm::ffi::TensorView device_buffer_k,
+    tvm::ffi::TensorView device_buffer_v,
+    tvm::ffi::TensorView num_real_reqs,
+    int64_t num_top_k,
+    int64_t item_size_bytes) {
+  using namespace host;
+
+  const int64_t bs = miss_src_locs.shape()[0];
+  const int64_t miss_src_locs_stride = miss_src_locs.strides()[0];
+  const int64_t miss_dst_locs_stride = miss_dst_locs.strides()[0];
+  const auto device = LaunchKernel::resolve_device(miss_src_locs.device());
+
+  LaunchKernel(bs, BLOCK_SIZE, device)(
+      execute_h2d_copy_kernel<BLOCK_SIZE, IsMLA>,
+      static_cast<const int64_t*>(miss_src_locs.data_ptr()),
+      static_cast<const int64_t*>(miss_dst_locs.data_ptr()),
+      static_cast<const int32_t*>(hit_count.data_ptr()),
+      host_cache_k.data_ptr(),
+      (IsMLA || host_cache_v.ndim() == 0) ? (const void*)nullptr : host_cache_v.data_ptr(),
+      device_buffer_k.data_ptr(),
+      (IsMLA || device_buffer_v.ndim() == 0) ? (void*)nullptr : device_buffer_v.data_ptr(),
+      static_cast<const int32_t*>(num_real_reqs.data_ptr()),
+      miss_src_locs_stride,
+      miss_dst_locs_stride,
+      static_cast<int32_t>(num_top_k),
+      item_size_bytes);
 }
 
 }  // namespace
