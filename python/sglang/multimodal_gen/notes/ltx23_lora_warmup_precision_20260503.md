@@ -176,3 +176,11 @@ request warmup 会先跑一次 one-step request，并在 stage2 前把 transform
   - `sdpa_output_raw`: not exact, mean_abs `35.7053`, rms `56.4228`。
   - `hidden_01`: not exact, mean_abs `1.6150`, rms `9.7864`（包含 padding tokens 的全量统计）。
 - 结论：第一处漂移不是 QKV/权重/RoPE，而是 masked SDPA 的调用语义：official default 是 repeated K/V + bool mask；当前 `enable_gqa=True` + additive bf16 mask 路径不等价。
+
+## 2026-05-05 基于 component backend 重新收敛 LTX2 text encoder 精度策略
+
+- commits: `992375a51`, `6e18faaea`
+- 变更：将 Gemma masked SDPA mask 改为 official 对齐的 bool keep-mask，并保留 repeat K/V + no `enable_gqa=True` 语义。
+- 变更：基于已合入的 `--component-attention-backends`，LTX2 native pipeline 只强制 `text_encoder=torch_sdpa`，不再把全局 `attention_backend` 改成 `torch_sdpa`；DiT/connector 可以继续使用全局/自动 backend（例如 FA）。
+- 验证：`git diff --check` 通过；本地 `python -m unittest python/sglang/multimodal_gen/test/unit/test_server_args.py` 仍被 Mac PyTorch/SGLang CUDA wrapper import 兼容问题阻塞。
+- 当前精度对齐百分比：raw Gemma hidden 100% bit-exact；最终视频指标需等 GPU CI/远端复测。
