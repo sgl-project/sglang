@@ -8,7 +8,7 @@ import torch
 import torch.nn.functional as F
 
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
-from sglang.srt.utils import is_cuda
+from sglang.srt.utils import is_cuda, is_musa
 
 DEFAULT_DFLASH_MASK_TOKEN = "<|MASK|>"
 
@@ -25,7 +25,7 @@ _DFLASH_VERIFY_SKIP_CUSTOM_MASK_BACKENDS = frozenset(
 )
 
 
-if is_cuda():
+if is_cuda() or is_musa():
     try:
         from sgl_kernel import (
             top_k_renorm_prob,
@@ -618,6 +618,7 @@ def compute_dflash_sampling_accept_len_and_bonus(
         accept_index=accept_index,
         accept_token_num=accept_token_num,
         candidates=candidates_i64,
+        # kwarg LHS retained as `retrive_*` to match sgl_kernel op schema.
         retrive_index=retrieve_index,
         retrive_next_token=retrieve_next_token,
         retrive_next_sibling=retrieve_next_sibling,

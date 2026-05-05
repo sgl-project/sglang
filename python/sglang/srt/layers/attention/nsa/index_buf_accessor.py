@@ -327,6 +327,8 @@ class SetKAndS:
 
     @classmethod
     def triton(cls, pool, buf, loc, index_k, index_k_scale):
+        loc = loc.to(torch.int64)
+
         _set_k_and_s_triton(
             buf=buf,
             loc=loc,

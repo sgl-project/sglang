@@ -100,8 +100,9 @@ concurrency:
   # When called via workflow_call with run_all_tests=true, use a unique group per run to
   # avoid collisions with direct schedule/workflow_dispatch triggers. We use run_all_tests
   # (not github.event_name) to detect this, because github.event_name inherits from the caller.
-  group: pr-test-amd-rocm720-${{ inputs.run_all_tests && format('full-{0}', github.run_id) || inputs.pr_head_sha || inputs.ref || github.ref }}
-  cancel-in-progress: ${{ !inputs.run_all_tests && github.event_name != 'workflow_call' }}
+  # Manual dispatch runs also get unique groups so they never cancel each other.
+  group: pr-test-amd-rocm720-${{ (inputs.run_all_tests || github.event_name == 'workflow_dispatch') && format('full-{0}', github.run_id) || inputs.pr_head_sha || inputs.ref || github.ref }}
+  cancel-in-progress: ${{ !inputs.run_all_tests && github.event_name != 'workflow_call' && github.event_name != 'workflow_dispatch' }}
 
 jobs:
   call-gate:
@@ -637,6 +638,7 @@ jobs:
             -e SGLANG_DENOISE_AGG_TOLERANCE=0.3 \
             -e SGLANG_SKIP_CONSISTENCY=1 \
             -e SGLANG_TEST_NUM_INFERENCE_STEPS=5 \
+            -e SGLANG_DIFFUSION_ARTIFACT_DIR=/sglang-checkout/diffusion-failures \
             -e AITER_JIT_DIR=/sgl-data/aiter-kernels \
             -e MIOPEN_USER_DB_PATH=/sgl-data/miopen-cache \
             -e HF_HUB_ENABLE_HF_TRANSFER=1 \
@@ -651,6 +653,15 @@ jobs:
           # Post-test diagnostics
           echo "=== Post-test System Memory Status ==="
           free -h
+
+      - name: Upload diffusion failure artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: diffusion-failures-amd-rocm720-1gpu-${{ matrix.part }}-${{ github.run_attempt }}
+          path: diffusion-failures/
+          if-no-files-found: ignore
+          retention-days: 7
 
   multimodal-gen-test-2-gpu-amd-rocm720:
     needs: [check-changes]
@@ -751,7 +762,7 @@ jobs:
           docker exec ci_sglang rocm-smi --showmeminfo vram 2>/dev/null || echo "rocm-smi not available"
 
       - name: Run diffusion server tests (2-GPU)
-        timeout-minutes: 80
+        timeout-minutes: 150
         run: |
           # AMD CI: All 2-GPU tests including LoRA
           # Tests: T2V, T2I, I2V, LoRA
@@ -767,6 +778,7 @@ jobs:
             -e SGLANG_DENOISE_AGG_TOLERANCE=0.3 \
             -e SGLANG_SKIP_CONSISTENCY=1 \
             -e SGLANG_TEST_NUM_INFERENCE_STEPS=5 \
+            -e SGLANG_DIFFUSION_ARTIFACT_DIR=/sglang-checkout/diffusion-failures \
             -e AITER_JIT_DIR=/sgl-data/aiter-kernels \
             -e MIOPEN_USER_DB_PATH=/sgl-data/miopen-cache \
             -e HF_HUB_ENABLE_HF_TRANSFER=1 \
@@ -780,6 +792,15 @@ jobs:
           # Post-test diagnostics
           echo "=== Post-test System Memory Status ==="
           free -h
+
+      - name: Upload diffusion failure artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: diffusion-failures-amd-rocm720-2gpu-${{ matrix.part }}-${{ github.run_attempt }}
+          path: diffusion-failures/
+          if-no-files-found: ignore
+          retention-days: 7
 
 
   stage-c-test-4-gpu-amd-rocm720:
