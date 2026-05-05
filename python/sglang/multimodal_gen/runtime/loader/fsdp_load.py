@@ -98,6 +98,47 @@ def _get_param_for_weight_loading(
     return actual_param
 
 
+def _make_class_name_shard_condition(class_names: set[str]):
+    def shard_condition(n: str, m: nn.Module) -> bool:
+        return type(m).__name__ in class_names
+
+    return shard_condition
+
+
+def _is_common_numbered_block(n: str, m: nn.Module) -> bool:
+    if not n:
+        return False
+
+    parts = n.split(".")
+    if not parts[-1].isdigit():
+        return False
+
+    block_containers = {
+        "blocks",
+        "layers",
+        "double_blocks",
+        "single_blocks",
+        "transformer_blocks",
+        "single_transformer_blocks",
+    }
+    return any(part in block_containers for part in parts[:-1])
+
+
+def _resolve_fsdp_shard_conditions(
+    model: torch.nn.Module,
+    fsdp_shard_conditions: list[Callable[[str, nn.Module], bool]] | None,
+) -> tuple[list[Callable[[str, nn.Module], bool]], str]:
+    if fsdp_shard_conditions:
+        return fsdp_shard_conditions, "explicit"
+
+    block_class_names = set(getattr(model, "_repeated_blocks", []) or [])
+    block_class_names.update(getattr(model, "_no_split_modules", []) or [])
+    if block_class_names:
+        return [_make_class_name_shard_condition(block_class_names)], "block-class"
+
+    return [_is_common_numbered_block], "common-numbered-block"
+
+
 def _maybe_dequantize_fp8(
     full_tensor: torch.Tensor,
     target_dtype: torch.dtype,
@@ -248,7 +289,7 @@ def shard_model(
     reshard_after_forward: bool = True,
     mp_policy: MixedPrecisionPolicy | None = MixedPrecisionPolicy(),  # noqa
     mesh: DeviceMesh | None = None,
-    fsdp_shard_conditions: list[Callable[[str, nn.Module], bool]] = [],  # noqa
+    fsdp_shard_conditions: list[Callable[[str, nn.Module], bool]] | None = None,
     pin_cpu_memory: bool = True,
 ) -> None:
     """
@@ -271,12 +312,15 @@ def shard_model(
         pin_cpu_memory (bool): If set to True, FSDP will pin the CPU memory of the offloaded parameters.
 
     """
-    if fsdp_shard_conditions is None or len(fsdp_shard_conditions) == 0:
+    fsdp_shard_conditions, condition_source = _resolve_fsdp_shard_conditions(
+        model, fsdp_shard_conditions
+    )
+    if condition_source != "explicit":
         logger.warning(
-            "The FSDP shard condition list is empty or None. No modules will be sharded in %s",
+            "Using %s FSDP shard condition fallback for %s",
+            condition_source,
             type(model).__name__,
         )
-        return
 
     fsdp_kwargs = {
         "reshard_after_forward": reshard_after_forward,
@@ -298,11 +342,18 @@ def shard_model(
 
     if num_layers_sharded == 0:
         raise ValueError(
-            "No layer modules were sharded. Please check if shard conditions are working as expected."
+            f"No layer modules were sharded in {type(model).__name__}. "
+            f"FSDP shard condition source: {condition_source}."
         )
 
     # Finally shard the entire model to account for any stragglers
     fully_shard(model, **fsdp_kwargs)
+    logger.info(
+        "Applied FSDP to %d submodules in %s using %s shard conditions",
+        num_layers_sharded,
+        type(model).__name__,
+        condition_source,
+    )
 
 
 # TODO(mick): need refactor, to move out checkpoint-specific adjustments

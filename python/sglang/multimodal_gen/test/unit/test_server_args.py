@@ -12,6 +12,9 @@ from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
 )
 from sglang.multimodal_gen.configs.pipeline_configs.wan import WanT2V480PConfig
 from sglang.multimodal_gen.registry import _get_config_info
+from sglang.multimodal_gen.runtime.loader.fsdp_load import (
+    _resolve_fsdp_shard_conditions,
+)
 from sglang.multimodal_gen.runtime.models.dits.qwen_image import (
     QwenImageTransformer2DModel,
 )
@@ -270,6 +273,32 @@ class TestOffloadDefaults(unittest.TestCase):
         self.assertTrue(conditions)
         self.assertTrue(conditions[0]("transformer_blocks.0", None))
         self.assertFalse(conditions[0]("transformer_blocks.0.attn", None))
+
+    def test_fsdp_condition_fallback_uses_repeated_block_class(self):
+        class RepeatedBlock:
+            pass
+
+        class Model:
+            _repeated_blocks = ["RepeatedBlock"]
+            _no_split_modules = []
+
+        conditions, source = _resolve_fsdp_shard_conditions(Model(), [])
+
+        self.assertEqual(source, "block-class")
+        self.assertTrue(conditions[0]("any_name", RepeatedBlock()))
+        self.assertFalse(conditions[0]("transformer_blocks.0.attn", object()))
+
+    def test_fsdp_condition_fallback_uses_common_block_names(self):
+        class Model:
+            _repeated_blocks = []
+            _no_split_modules = []
+
+        conditions, source = _resolve_fsdp_shard_conditions(Model(), [])
+
+        self.assertEqual(source, "common-numbered-block")
+        self.assertTrue(conditions[0]("transformer_blocks.0", object()))
+        self.assertTrue(conditions[0]("layers.10", object()))
+        self.assertFalse(conditions[0]("transformer_blocks.0.attn", object()))
 
     def test_auto_multi_gpu_qwen_preserves_explicit_fsdp_false(self):
         args = self._from_dict_with_pipeline_config(

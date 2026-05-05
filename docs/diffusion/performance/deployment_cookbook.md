@@ -70,6 +70,8 @@ In this example, `balanced` will not re-enable FSDP.
 
 **FSDP** shards DiT weights across multiple GPUs and all-gathers weights during forward. It can reduce CPU offload cost on multi-GPU deployments, especially when combined with CFG parallelism for Qwen/Wan.
 
+FSDP sharding granularity matters. SGLang Diffusion prefers sharding repeated transformer blocks. Coarser sharding lowers wrapper count but can increase all-gather peak memory; finer sharding can reduce transient memory but adds communication and scheduling overhead. If a model does not define an explicit sharding rule, the loader falls back to repeated block class names and common numbered block paths such as `transformer_blocks.0` or `blocks.0`.
+
 **CFG parallelism** splits positive and negative CFG branches across GPUs. For Qwen/Wan workloads with normal step counts, this is the most reliable multi-GPU speedup observed so far.
 
 **SP/Ulysses/Ring** splits sequence work. It can help video workloads, but validated Qwen/Wan runs showed CFG parallelism outperforming SP for latency.
