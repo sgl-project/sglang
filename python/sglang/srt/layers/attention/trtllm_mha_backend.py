@@ -412,7 +412,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             )
 
             self.target_verify_metadata[bs] = metadata
-        elif forward_mode.is_draft_extend():
+        elif forward_mode.is_draft_extend(include_v2=True):
             metadata.cache_seqlens_int32 = self.draft_extend_metadata["cache_seqlens"][
                 :bs
             ]
@@ -519,7 +519,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             metadata.page_table[:, :max_seq_pages].copy_(page_indices // self.page_size)
             self._copy_swa_page_table(metadata, page_indices, max_seq_pages)
             metadata.max_seq_len_q = self.speculative_num_draft_tokens
-        elif forward_mode.is_draft_extend():
+        elif forward_mode.is_draft_extend(include_v2=True):
             metadata = self.draft_extend_metadata[bs]
             metadata.cache_seqlens_int32.copy_(seq_lens)
 
