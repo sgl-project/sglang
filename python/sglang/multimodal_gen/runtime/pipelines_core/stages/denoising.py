@@ -699,7 +699,7 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
             | server_args.pipeline_config.prepare_pos_cond_kwargs(
                 batch,
                 self.device,
-                getattr(self.transformer, "rotary_emb", None),
+                self._get_transformer_attr("rotary_emb"),
                 dtype=target_dtype,
             )
             | dict(
@@ -720,7 +720,7 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                 | server_args.pipeline_config.prepare_neg_cond_kwargs(
                     batch,
                     self.device,
-                    getattr(self.transformer, "rotary_emb", None),
+                    self._get_transformer_attr("rotary_emb"),
                     dtype=target_dtype,
                 )
                 | dict(
@@ -777,6 +777,25 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                 scheduler.model_outputs = [None] * solver_order
             if hasattr(scheduler, "timestep_list"):
                 scheduler.timestep_list = [None] * solver_order
+
+    def _get_transformer_attr(self, name: str) -> Any:
+        seen: set[int] = set()
+        stack = [self.transformer]
+        while stack:
+            module = stack.pop()
+            if module is None or id(module) in seen:
+                continue
+            seen.add(id(module))
+
+            value = getattr(module, name, None)
+            if value is not None:
+                return value
+
+            for wrapper_attr in ("_fsdp_wrapped_module", "module", "_orig_mod"):
+                wrapped = getattr(module, wrapper_attr, None)
+                if wrapped is not None:
+                    stack.append(wrapped)
+        return None
 
     def _prepare_step_state(
         self,
@@ -1293,6 +1312,10 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
 
         # Filter kwargs based on the signature
         params = inspect.signature(target_func).parameters
+        if any(
+            param.kind == inspect.Parameter.VAR_KEYWORD for param in params.values()
+        ):
+            return kwargs
         return {k: v for k, v in kwargs.items() if k in params}
 
     def progress_bar(
@@ -1641,10 +1664,14 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         guidance: torch.Tensor,
         **kwargs,
     ):
+        guidance_kwargs = self.prepare_extra_func_kwargs(
+            getattr(current_model, "forward", current_model),
+            {"guidance": guidance},
+        )
         return current_model(
             hidden_states=latent_model_input,
             timestep=timestep,
-            guidance=guidance,
+            **guidance_kwargs,
             **kwargs,
         )
 

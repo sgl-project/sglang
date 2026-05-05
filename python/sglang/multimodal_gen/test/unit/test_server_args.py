@@ -3,6 +3,10 @@ import sys
 import unittest
 from unittest.mock import patch
 
+from sglang.multimodal_gen.configs.models.fsdp import (
+    is_module_list_entry,
+    is_module_list_entry_in,
+)
 from sglang.multimodal_gen.configs.pipeline_configs.base import (
     ModelTaskType,
     PipelineConfig,
@@ -11,6 +15,9 @@ from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
     QwenImagePipelineConfig,
 )
 from sglang.multimodal_gen.registry import _get_config_info
+from sglang.multimodal_gen.runtime.models.dits.qwen_image import (
+    QwenImageTransformer2DModel,
+)
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.utils import FlexibleArgumentParser
 
@@ -157,6 +164,36 @@ class TestOffloadDefaults(unittest.TestCase):
         )
 
         self.assertTrue(args.vae_cpu_offload)
+
+
+class TestFSDPShardConditions(unittest.TestCase):
+    def test_helpers_match_only_direct_block_entries(self):
+        self.assertTrue(
+            is_module_list_entry("transformer_blocks.0", "transformer_blocks")
+        )
+        self.assertFalse(
+            is_module_list_entry("transformer_blocks.0.ff.net.0", "transformer_blocks")
+        )
+        self.assertTrue(
+            is_module_list_entry_in(
+                "single_transformer_blocks.12",
+                ("transformer_blocks", "single_transformer_blocks"),
+            )
+        )
+        self.assertFalse(
+            is_module_list_entry_in(
+                "single_transformer_blocks.12.attn.to_out.0",
+                ("transformer_blocks", "single_transformer_blocks"),
+            )
+        )
+
+    def test_qwen_dit_has_fsdp_shard_condition(self):
+        conditions = QwenImageTransformer2DModel._fsdp_shard_conditions
+
+        self.assertTrue(conditions)
+        self.assertTrue(conditions[0]("transformer_blocks.0", None))
+        self.assertFalse(conditions[0]("transformer_blocks.0.attn", None))
+        self.assertFalse(conditions[0]("transformer_blocks.0.ff.net.0", None))
 
 
 class TestModelIdResolution(unittest.TestCase):
