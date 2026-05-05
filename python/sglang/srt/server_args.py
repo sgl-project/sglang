@@ -131,6 +131,7 @@ QUANTIZATION_CHOICES = [
     "auto-round",
     "compressed-tensors",  # for Ktransformers
     "modelslim",  # for NPU
+    "quark",  # AMD Quark quantizer (FP8 / MXFP4 / Int4FP8 etc.)
     "quark_int4fp8_moe",
     "unquant",
 ]
@@ -188,6 +189,7 @@ MOE_RUNNER_BACKEND_CHOICES = [
     "flashinfer_cutedsl",
     "cutlass",
     "aiter",
+    "marlin",
 ]
 
 MOE_A2A_BACKEND_CHOICES = [
