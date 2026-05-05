@@ -215,7 +215,7 @@ class SchedulerProfilerMixin:
                         record_op_args=False,
                         gc_detect_threshold=None,
                     )
-                )
+                ),
             )
             self.torch_profiler.start()
             self.profile_in_progress = True
