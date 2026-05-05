@@ -26,11 +26,28 @@ jobs:
       - name: Install protoc
         run: sudo bash scripts/ci/utils/install_protoc.sh
 
-      - name: Upload to pypi
+      - name: Build wheel
         run: |
           cd python
           cp ../README.md ../LICENSE .
           pip install build wheel setuptools setuptools-scm
           python3 -m build --wheel
+
+      # PyPI rejects plain `linux_x86_64` platform tags; auditwheel rewrites
+      # the wheel's platform tag to a `manylinux_*` tag and bundles any
+      # external native deps. The runner's glibc determines the lowest
+      # acceptable manylinux policy (ubuntu-24.04 -> glibc 2.39).
+      - name: Repair wheel for manylinux
+        run: |
+          cd python
+          pip install auditwheel patchelf
+          mkdir -p dist-repaired
+          python3 -m auditwheel repair dist/*.whl -w dist-repaired/
+          rm dist/*.whl
+          mv dist-repaired/*.whl dist/
+
+      - name: Upload to pypi
+        run: |
+          cd python
           pip install twine
           python3 -m twine upload dist/* -u __token__ -p ${{ secrets.PYPI_TOKEN }}
