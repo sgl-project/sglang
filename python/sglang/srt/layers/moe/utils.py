@@ -8,11 +8,14 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
+from sglang.srt.utils import is_npu
 from sglang.srt.distributed.parallel_state import get_moe_expert_parallel_world_size
 from sglang.srt.layers.dp_attention import (
     get_attention_dp_size,
     is_dp_attention_enabled,
 )
+
+_is_npu = is_npu()
 
 if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
@@ -212,7 +215,8 @@ def get_deepep_output_dtype(self, quant_scheme=None) -> DeepOutputDtype:
         return DeepOutputDtype.BF16
 
     # 4. Default on NPU → BF16
-    return DeepOutputDtype.BF16
+    if _is_npu:
+        return DeepOutputDtype.BF16
 
     # 5. Default → FP8
     return DeepOutputDtype.FP8
