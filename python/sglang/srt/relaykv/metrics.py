@@ -7802,6 +7802,8 @@ def build_relaykv_token_to_kv_pool_runtime_inspection_payloads_for_smoke(
     kv_head_group = None
     decision_state = None
     kv_class = "UNKNOWN"
+    token_to_kv_pool_source_path = None
+    token_to_kv_pool_lookup_error = False
     blocking_reasons: list[str] = []
 
     if runtime_like is not None:
@@ -7811,6 +7813,10 @@ def build_relaykv_token_to_kv_pool_runtime_inspection_payloads_for_smoke(
         kv_head_group = runtime_like.get("kv_head_group")
         decision_state = runtime_like.get("decision_state")
         kv_class = runtime_like.get("kv_class") or "UNKNOWN"
+        token_to_kv_pool_source_path = runtime_like.get("token_to_kv_pool_source_path")
+        token_to_kv_pool_lookup_error = (
+            runtime_like.get("token_to_kv_pool_lookup_error") is True
+        )
 
         if runtime_like.get("token_to_kv_pool_read") is True:
             blocking_reasons.append("token_to_kv_pool_value_read_not_allowed")
@@ -7832,6 +7838,8 @@ def build_relaykv_token_to_kv_pool_runtime_inspection_payloads_for_smoke(
             blocking_reasons.append("scheduler_mutation_not_allowed")
         if runtime_like.get("source_mutated") is True:
             blocking_reasons.append("source_mutation_not_allowed")
+        if runtime_like.get("token_to_kv_pool_lookup_error") is True:
+            blocking_reasons.append("token_to_kv_pool_attr_access_failed")
 
     token_to_kv_pool_attr_present = False
     token_to_kv_pool_attr_observed = False
@@ -7844,7 +7852,7 @@ def build_relaykv_token_to_kv_pool_runtime_inspection_payloads_for_smoke(
 
     if inspect_token_to_kv_pool is not True:
         blocking_reasons.append("inspection_not_enabled")
-    elif token_to_kv_pool is None:
+    elif token_to_kv_pool is None and token_to_kv_pool_lookup_error is not True:
         blocking_reasons.append("token_to_kv_pool_missing")
     else:
         try:
@@ -7917,6 +7925,9 @@ def build_relaykv_token_to_kv_pool_runtime_inspection_payloads_for_smoke(
     payload["adapter_metadata"]["token_to_kv_pool_shape"] = token_to_kv_pool_shape
     payload["adapter_metadata"]["token_to_kv_pool_device"] = token_to_kv_pool_device
     payload["adapter_metadata"]["token_to_kv_pool_dtype"] = token_to_kv_pool_dtype
+    payload["adapter_metadata"]["token_to_kv_pool_source_path"] = (
+        token_to_kv_pool_source_path
+    )
     engine_block_ref = payload.get("engine_block_ref")
     if not isinstance(engine_block_ref, dict):
         engine_block_ref = {}
@@ -8077,16 +8088,19 @@ def run_model_runner_token_to_kv_pool_runtime_inspection_hook_for_smoke(
 
     token_to_kv_pool = None
     token_to_kv_pool_path = None
+    token_to_kv_pool_lookup_error = False
 
     try:
         token_to_kv_pool = getattr(model_runner, "token_to_kv_pool", None)
     except Exception:
         token_to_kv_pool = None
+        token_to_kv_pool_lookup_error = True
+        token_to_kv_pool_path = "model_runner.token_to_kv_pool"
     else:
         if token_to_kv_pool is not None:
             token_to_kv_pool_path = "model_runner.token_to_kv_pool"
 
-    if token_to_kv_pool is None:
+    if token_to_kv_pool is None and token_to_kv_pool_lookup_error is not True:
         try:
             allocator = getattr(model_runner, "token_to_kv_pool_allocator", None)
         except Exception:
@@ -8095,8 +8109,11 @@ def run_model_runner_token_to_kv_pool_runtime_inspection_hook_for_smoke(
             try:
                 nested_token_to_kv_pool = getattr(allocator, "token_to_kv_pool", None)
             except Exception:
-                token_to_kv_pool = allocator
-                token_to_kv_pool_path = "model_runner.token_to_kv_pool_allocator"
+                token_to_kv_pool = None
+                token_to_kv_pool_lookup_error = True
+                token_to_kv_pool_path = (
+                    "model_runner.token_to_kv_pool_allocator.token_to_kv_pool"
+                )
             else:
                 if nested_token_to_kv_pool is not None:
                     token_to_kv_pool = nested_token_to_kv_pool
@@ -8107,7 +8124,7 @@ def run_model_runner_token_to_kv_pool_runtime_inspection_hook_for_smoke(
                     token_to_kv_pool = allocator
                     token_to_kv_pool_path = "model_runner.token_to_kv_pool_allocator"
 
-    if token_to_kv_pool is None:
+    if token_to_kv_pool is None and token_to_kv_pool_lookup_error is not True:
         try:
             allocator = getattr(model_runner, "kv_pool_allocator", None)
         except Exception:
@@ -8117,13 +8134,17 @@ def run_model_runner_token_to_kv_pool_runtime_inspection_hook_for_smoke(
                 token_to_kv_pool = getattr(allocator, "token_to_kv_pool", None)
             except Exception:
                 token_to_kv_pool = None
+                token_to_kv_pool_lookup_error = True
+                token_to_kv_pool_path = (
+                    "model_runner.kv_pool_allocator.token_to_kv_pool"
+                )
             else:
                 if token_to_kv_pool is not None:
                     token_to_kv_pool_path = (
                         "model_runner.kv_pool_allocator.token_to_kv_pool"
                     )
 
-    if token_to_kv_pool is None:
+    if token_to_kv_pool is None and token_to_kv_pool_lookup_error is not True:
         try:
             memory_pool = getattr(model_runner, "memory_pool", None)
         except Exception:
@@ -8133,15 +8154,23 @@ def run_model_runner_token_to_kv_pool_runtime_inspection_hook_for_smoke(
                 token_to_kv_pool = getattr(memory_pool, "token_to_kv_pool", None)
             except Exception:
                 token_to_kv_pool = None
+                token_to_kv_pool_lookup_error = True
+                token_to_kv_pool_path = "model_runner.memory_pool.token_to_kv_pool"
             else:
                 if token_to_kv_pool is not None:
                     token_to_kv_pool_path = "model_runner.memory_pool.token_to_kv_pool"
 
-    if token_to_kv_pool is None and forward_batch is not None:
+    if (
+        token_to_kv_pool is None
+        and token_to_kv_pool_lookup_error is not True
+        and forward_batch is not None
+    ):
         try:
             token_to_kv_pool = getattr(forward_batch, "token_to_kv_pool", None)
         except Exception:
             token_to_kv_pool = None
+            token_to_kv_pool_lookup_error = True
+            token_to_kv_pool_path = "forward_batch.token_to_kv_pool"
         else:
             if token_to_kv_pool is not None:
                 token_to_kv_pool_path = "forward_batch.token_to_kv_pool"
@@ -8165,6 +8194,8 @@ def run_model_runner_token_to_kv_pool_runtime_inspection_hook_for_smoke(
         "kv_class": getattr(forward_batch, "kv_class", None)
         if forward_batch is not None
         else None,
+        "token_to_kv_pool_source_path": token_to_kv_pool_path,
+        "token_to_kv_pool_lookup_error": token_to_kv_pool_lookup_error,
     }
     payloads = build_relaykv_token_to_kv_pool_runtime_inspection_payloads_for_smoke(
         runtime_like=runtime_like,
