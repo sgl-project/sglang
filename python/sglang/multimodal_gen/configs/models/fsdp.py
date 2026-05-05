@@ -9,11 +9,7 @@ def is_module_list_entry(name: str, container_name: str) -> bool:
 
 def is_module_list_entry_in(name: str, container_names: tuple[str, ...]) -> bool:
     parts = name.split(".")
-    return (
-        len(parts) >= 2
-        and parts[-2] in container_names
-        and parts[-1].isdigit()
-    )
+    return len(parts) >= 2 and parts[-2] in container_names and parts[-1].isdigit()
 
 
 def is_layer(name: str, module: object) -> bool:
@@ -53,8 +49,12 @@ def is_blocks_or_transformer_blocks(name: str, module: object) -> bool:
 
 
 def is_zimage_layer(name: str, module: object) -> bool:
-    return is_module_list_entry_in(
-        name, ("layers", "noise_refiner", "context_refiner")
+    last_part = name.split(".")[-1]
+    # Preserve Z-Image's finer historical FSDP granularity for perf.
+    return last_part.isdigit() and (
+        "layers" in name
+        or "noise_refiner" in name
+        or "context_refiner" in name
     )
 
 

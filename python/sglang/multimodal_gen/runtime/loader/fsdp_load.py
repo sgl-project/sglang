@@ -89,9 +89,7 @@ def _get_param_for_weight_loading(
     if actual_param is not None and getattr(actual_param, "weight_loader", None):
         return actual_param
 
-    pre_fsdp_weight_loader_params = getattr(
-        model, "_pre_fsdp_weight_loader_params", {}
-    )
+    pre_fsdp_weight_loader_params = getattr(model, "_pre_fsdp_weight_loader_params", {})
     pre_fsdp_param = pre_fsdp_weight_loader_params.get(param_name)
     if pre_fsdp_param is not None:
         return pre_fsdp_param

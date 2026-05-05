@@ -38,9 +38,7 @@ class Flux2MistralTextArchConfig(TextEncoderArchConfig):
             ("qkv_proj", "v_proj", "v"),
         ]
     )
-    _fsdp_shard_conditions: list = field(
-        default_factory=lambda: [is_layer]
-    )
+    _fsdp_shard_conditions: list = field(default_factory=lambda: [is_layer])
 
     def __post_init__(self) -> None:
         self.tokenizer_kwargs = {

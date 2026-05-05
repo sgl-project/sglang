@@ -6,6 +6,7 @@ from unittest.mock import patch
 from sglang.multimodal_gen.configs.models.fsdp import (
     is_module_list_entry,
     is_module_list_entry_in,
+    is_zimage_layer,
 )
 from sglang.multimodal_gen.configs.pipeline_configs.base import (
     ModelTaskType,
@@ -194,6 +195,11 @@ class TestFSDPShardConditions(unittest.TestCase):
         self.assertTrue(conditions[0]("transformer_blocks.0", None))
         self.assertFalse(conditions[0]("transformer_blocks.0.attn", None))
         self.assertFalse(conditions[0]("transformer_blocks.0.ff.net.0", None))
+
+    def test_zimage_condition_keeps_inner_numbered_modules(self):
+        self.assertTrue(is_zimage_layer("layers.0.mlp.0", None))
+        self.assertTrue(is_zimage_layer("noise_refiner.0.attention.to_out.0", None))
+        self.assertFalse(is_zimage_layer("transformer_blocks.0", None))
 
 
 class TestModelIdResolution(unittest.TestCase):

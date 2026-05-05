@@ -7,9 +7,7 @@ from sglang.multimodal_gen.configs.models.fsdp import is_block
 
 @dataclass
 class HeliosArchConfig(DiTArchConfig):
-    _fsdp_shard_conditions: list = field(
-        default_factory=lambda: [is_block]
-    )
+    _fsdp_shard_conditions: list = field(default_factory=lambda: [is_block])
 
     param_names_mapping: dict = field(
         default_factory=lambda: {

@@ -27,9 +27,7 @@ class ZImageArchConfig(DiTArchConfig):
     axes_dims: Tuple[int, int, int] = (32, 48, 48)
     axes_lens: Tuple[int, int, int] = (1024, 512, 512)
 
-    _fsdp_shard_conditions: list = field(
-        default_factory=lambda: [is_zimage_layer]
-    )
+    _fsdp_shard_conditions: list = field(default_factory=lambda: [is_zimage_layer])
 
     stacked_params_mapping: list[tuple[str, str, str]] = field(
         default_factory=lambda: [
