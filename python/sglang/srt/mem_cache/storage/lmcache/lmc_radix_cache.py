@@ -159,13 +159,6 @@ class LMCRadixCache(RadixCache):
         value: torch.Tensor = base_res.device_indices
         last_node: TreeNode = base_res.last_device_node
 
-        if value.numel() == len(key):
-            return base_res
-
-        uncached_len = len(key) - value.numel()
-        if uncached_len == 0:
-            return base_res
-
         # MP mode keys the daemon-side session by ``req.rid`` so the same
         # id flows from LOOKUP through STORE/END_SESSION (mirroring vLLM /
         # TRT-LLM). Some scheduler paths call ``match_prefix`` as a peek
@@ -173,7 +166,22 @@ class LMCRadixCache(RadixCache):
         # schedule_policy); for those, skip the LMCache fetch — the
         # actual prefill pass through schedule_batch passes ``req`` and
         # picks up the cached prefix at that time.
-        if params.req is None:
+        is_mp_load = self._mp_mode and params.req is not None
+
+        # Full-radix-hit / no-fresh-tokens cases: ``_load_into_slots`` won't
+        # fire, so ``start_load_kv`` won't issue a LOOKUP. Send a session-
+        # only LOOKUP via ``ensure_session`` so the eventual STORE+END_SESSION
+        # at request finish lands on a session that has ``lookup_ipc_key``
+        # set, matching vLLM/TRT-LLM's per-request session lifecycle.
+        uncached_len = len(key) - value.numel()
+        if value.numel() == len(key) or uncached_len == 0:
+            if is_mp_load:
+                self.lmcache_connector.ensure_session(
+                    key.token_ids, params.req.rid
+                )
+            return base_res
+
+        if not is_mp_load:
             return base_res
 
         chunk_size = self.lmcache_connector.chunk_size()
@@ -184,6 +192,12 @@ class LMCRadixCache(RadixCache):
 
         token_slots = self.token_to_kv_pool_allocator.alloc(uncached_len)
         if token_slots is None:
+            # Allocation failed — _load_into_slots won't fire, so
+            # start_load_kv won't issue a LOOKUP. Still create the daemon
+            # session so the eventual STORE+END_SESSION pairs cleanly.
+            self.lmcache_connector.ensure_session(
+                key.token_ids, params.req.rid
+            )
             return base_res
 
         slot_mapping = torch.cat(
