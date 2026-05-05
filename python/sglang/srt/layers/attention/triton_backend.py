@@ -29,11 +29,17 @@ if TYPE_CHECKING:
     from sglang.srt.speculative.spec_info import SpecInput
 
 
-def _mla_decode_kv_splits_cap(base_max_kv_splits: int, sm_count: int) -> int:
+_MLA_DECODE_MIN_BLOCK_KV = 32
+
+
+def _mla_decode_kv_splits_cap(
+    base_max_kv_splits: int, sm_count: int, max_context_len: int
+) -> int:
     if sm_count <= 0:
         return base_max_kv_splits
-    cap = next_power_of_2(sm_count * 2)
-    return max(base_max_kv_splits, cap)
+    sm_cap = next_power_of_2(sm_count)
+    ctx_cap = next_power_of_2(triton.cdiv(max_context_len, _MLA_DECODE_MIN_BLOCK_KV))
+    return max(base_max_kv_splits, min(sm_cap, ctx_cap))
 
 
 def logit_capping_mod(logit_capping_method, logit_cap):
@@ -138,7 +144,9 @@ class TritonAttnBackend(AttentionBackend):
         self.max_kv_splits = model_runner.server_args.triton_attention_num_kv_splits
         if self.use_mla:
             self.max_kv_splits = _mla_decode_kv_splits_cap(
-                self.max_kv_splits, self.device_core_count
+                self.max_kv_splits,
+                self.device_core_count,
+                self.max_context_len,
             )
         self.use_pdl = is_arch_support_pdl()
 

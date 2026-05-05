@@ -340,6 +340,7 @@ def _fwd_grouped_kernel_stage1(
 
     if split_kv_end > split_kv_start:
         q = tl.load(Q + offs_q, mask=(mask_h[:, None]) & (mask_d[None, :]), other=0.0)
+        q_k = q.to(K_Buffer.dtype.element_ty)
         if BLOCK_DPE > 0:
             qpe = tl.load(
                 Q + off_qpe, mask=(mask_h[:, None]) & (mask_dpe[None, :]), other=0.0
@@ -357,7 +358,7 @@ def _fwd_grouped_kernel_stage1(
                 mask=(offs_n[None, :] < split_kv_end) & (mask_d[:, None]),
                 other=0.0,
             )
-            qk = tl.dot(q.to(k.dtype), k)
+            qk = tl.dot(q_k, k)
             if BLOCK_DPE > 0:
                 offs_buf_kpe = kv_loc[None, :] * stride_buf_kbs + base_offs_kpe
                 kpe = tl.load(
@@ -563,7 +564,7 @@ def _fwd_kernel_stage2(
         tl.cdiv(tl.cdiv(cur_batch_seq_len, kv_splits), MIN_BLOCK_KV) * MIN_BLOCK_KV
     )
 
-    for split_kv_id in range(0, MAX_KV_SPLITS):
+    for split_kv_id in tl.range(0, MAX_KV_SPLITS, num_stages=2):
         split_kv_start = kv_len_per_split * split_kv_id
         split_kv_end = tl.minimum(split_kv_start + kv_len_per_split, cur_batch_seq_len)
 
