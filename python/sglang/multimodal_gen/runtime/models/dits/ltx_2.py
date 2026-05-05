@@ -102,6 +102,24 @@ def apply_split_rotary_emb(
     x: torch.Tensor, freqs: Tuple[torch.Tensor, torch.Tensor]
 ) -> torch.Tensor:
     cos, sin = freqs
+    if (
+        x.ndim == 3
+        and cos.ndim == 4
+        and sin.ndim == 4
+        and x.dtype == torch.bfloat16
+        and cos.dtype == torch.bfloat16
+        and sin.dtype == torch.bfloat16
+        and x.is_cuda
+        and x.is_contiguous()
+        and cos.is_cuda
+        and sin.is_cuda
+    ):
+        from sglang.jit_kernel.diffusion.triton.ltx2_rotary import (
+            apply_ltx2_split_rotary_emb,
+        )
+
+        return apply_ltx2_split_rotary_emb(x, cos, sin)
+
     x_dtype = x.dtype
     needs_reshape = False
     if x.ndim != 4 and cos.ndim == 4:
