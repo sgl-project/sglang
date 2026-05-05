@@ -1143,16 +1143,22 @@ jobs:
           # Activate venv if available (GITHUB_ENV may have failed to propagate)
           [ -f "${SGLANG_CI_VENV_PATH:-/dev/null}/bin/activate" ] && source "${SGLANG_CI_VENV_PATH}/bin/activate"
           [ -f "${SGLANG_CI_VENV_PATH:-/dev/null}/env.sh" ] && source "${SGLANG_CI_VENV_PATH}/env.sh"
+          # Per-model TP must match how each model is launched in test/registered/
+          # — see FALLBACK_ARGS in scripts/ci/cuda/warmup_deep_gemm.py for the
+          # extra dp/ep/dp-attention flags layered on top. Cache key includes
+          # per-rank N/K, so a mismatched TP populates shapes the test never asks
+          # for and the test still pays cold-JIT cost on a fresh runner.
+          # Nemotron-3-Super-BF16 is intentionally omitted: BF16 model, doesn't
+          # use DeepGEMM kernels, fallback would just waste ~3 min loading it.
           python3 scripts/ci/cuda/warmup_deep_gemm.py \
             deepseek-ai/DeepSeek-V3-0324:8 \
             deepseek-ai/DeepSeek-V3.2:8 \
             zai-org/GLM-5-FP8:8 \
-            XiaomiMiMo/MiMo-V2-Flash:8 \
+            XiaomiMiMo/MiMo-V2-Flash:4 \
             XiaomiMiMo/MiMo-V2.5:8 \
             MiniMaxAI/MiniMax-M2.5:8 \
-            nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16:8 \
             stepfun-ai/Step-3.5-Flash:8 \
-            Qwen/Qwen3-Next-80B-A3B-Instruct:2
+            Qwen/Qwen3-Next-80B-A3B-Instruct:4
 
       - name: Run test
         timeout-minutes: 30

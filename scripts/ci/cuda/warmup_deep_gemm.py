@@ -19,15 +19,49 @@ import os
 import signal
 import subprocess
 import sys
+import threading
 import time
 from math import ceil
 from pathlib import Path
+from typing import Dict, List
 
-# Per-model fallback timeout. If any single model's compile_deep_gemm hangs
-# (e.g. one TP rank crashes and the rest deadlock on a collective), kill its
-# whole process group and continue to the next model rather than letting it
-# eat the entire step budget.
-FALLBACK_TIMEOUT_SEC = 900
+# Per-model fallback timeout. Outer cap: if a subprocess wedges for any reason
+# the crash-marker watcher can't see, kill it after this many seconds. Even
+# the largest cold-cache fallbacks observed (GLM-5-FP8, ~3 min) finish well
+# under this. Crashes that emit a CRASH_MARKERS line abort in seconds via the
+# watcher and don't wait for this timeout.
+FALLBACK_TIMEOUT_SEC = 600
+
+# Per-model extra args passed to `sglang.compile_deep_gemm` so the populated
+# DeepGEMM cache shapes match how each model is actually launched in its test.
+# DeepGEMM cache key = (kernel_type, N, K, num_groups); per-rank N/K depend on
+# tp/dp/ep, so a warmup at the wrong parallelism config populates shapes the
+# test never asks for and the test still pays cold-JIT cost on a fresh runner.
+#
+# Keep these in sync with each model's `other_args` in test/registered/. If the
+# model isn't listed here, only `--tp` is passed.
+FALLBACK_ARGS: Dict[str, List[str]] = {
+    # test_dsa_models_basic.py / _mtp.py / _hisparse.py
+    "deepseek-ai/DeepSeek-V3.2": ["--dp", "8", "--enable-dp-attention"],
+    "zai-org/GLM-5-FP8": ["--dp", "8", "--enable-dp-attention"],
+    # test_mimo_models.py — note: workflow argv must use ":4", not ":8".
+    "XiaomiMiMo/MiMo-V2-Flash": ["--dp", "2", "--enable-dp-attention"],
+    "XiaomiMiMo/MiMo-V2.5": ["--dp", "2", "--enable-dp-attention"],
+    # test_minimax_m25_basic.py — without --ep-size, MoE shards by TP and
+    # trips a `intermediate_size_per_partition % block_n != 0` check (192 vs
+    # 128) at fp8.py:864. With ep=8 each rank holds full intermediate width
+    # for its expert subset.
+    "MiniMaxAI/MiniMax-M2.5": ["--ep-size", "8"],
+}
+
+# Output substrings that signal a fatal child-rank crash. compile_deep_gemm's
+# parent process keeps polling /v1/models for ~timeout seconds even after one
+# TP rank dies, so without this we'd burn the whole FALLBACK_TIMEOUT_SEC on
+# every crashing model.
+CRASH_MARKERS = (
+    "Scheduler hit an exception",
+    "Received sigquit from a child",
+)
 
 # Configure DeepGEMM cache before importing deep_gemm
 os.environ["DG_JIT_CACHE_DIR"] = os.getenv(
@@ -297,14 +331,39 @@ def compile_shapes_lightweight(shapes, m_list):
         print(f"  Done in {elapsed:.1f}s")
 
 
+def _kill_pg_and_wait(proc):
+    """SIGTERM the subprocess's process group, escalate to SIGKILL if needed."""
+    try:
+        os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+    except (ProcessLookupError, OSError):
+        pass
+    try:
+        return proc.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        except (ProcessLookupError, OSError):
+            pass
+        try:
+            return proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            return -1
+
+
 def fallback_compile_deep_gemm(model, tp):
     """Fall back to full sglang.compile_deep_gemm (loads model weights).
 
     Runs in its own process group so a hung subprocess (e.g. one TP rank
     crashes and the rest deadlock on NCCL collectives) can be killed
-    cleanly without leaking children.
+    cleanly without leaking children. Watches subprocess output for crash
+    markers so a deterministic failure aborts in seconds rather than burning
+    the full FALLBACK_TIMEOUT_SEC.
     """
-    print(f"Falling back to full compile_deep_gemm for {model} (tp={tp})...")
+    extra_args = FALLBACK_ARGS.get(model, [])
+    print(
+        f"Falling back to full compile_deep_gemm for {model} "
+        f"(tp={tp}, extra_args={extra_args})..."
+    )
     cmd = [
         sys.executable,
         "-m",
@@ -316,34 +375,57 @@ def fallback_compile_deep_gemm(model, tp):
         "--trust-remote-code",
         "--model-loader-extra-config",
         '{"enable_multithread_load": true, "num_threads": 64}',
+        # Cap compile_deep_gemm's own /v1/models polling loop so it gives up
+        # before our outer timeout has to SIGTERM it.
+        "--timeout",
+        str(FALLBACK_TIMEOUT_SEC),
+        *extra_args,
     ]
-    proc = subprocess.Popen(cmd, preexec_fn=os.setsid)
-    try:
-        rc = proc.wait(timeout=FALLBACK_TIMEOUT_SEC)
-    except subprocess.TimeoutExpired:
-        print(
-            f"Warning: fallback timed out after {FALLBACK_TIMEOUT_SEC}s for "
-            f"{model} (tp={tp}); killing process group and continuing."
-        )
-        try:
-            os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
-        except (ProcessLookupError, OSError):
-            pass
-        try:
-            rc = proc.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            try:
-                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-            except (ProcessLookupError, OSError):
-                pass
-            try:
-                rc = proc.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                rc = -1
-        return False
-    if rc != 0:
-        print(f"Warning: fallback failed for {model} (exit code {rc})")
-    return rc == 0
+
+    crashed = threading.Event()
+    proc = subprocess.Popen(
+        cmd,
+        preexec_fn=os.setsid,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        bufsize=1,
+        text=True,
+    )
+
+    def _watch():
+        # Stream child output to our stdout while scanning for crash markers.
+        for line in proc.stdout:
+            sys.stdout.write(line)
+            sys.stdout.flush()
+            if not crashed.is_set() and any(m in line for m in CRASH_MARKERS):
+                crashed.set()
+
+    watcher = threading.Thread(target=_watch, daemon=True)
+    watcher.start()
+
+    deadline = time.monotonic() + FALLBACK_TIMEOUT_SEC
+    while True:
+        rc = proc.poll()
+        if rc is not None:
+            watcher.join(timeout=2)
+            if rc != 0:
+                print(f"Warning: fallback failed for {model} (exit code {rc})")
+            return rc == 0
+        if crashed.is_set():
+            print(
+                f"Warning: detected crash marker in {model} (tp={tp}) subprocess; "
+                "killing process group and continuing."
+            )
+            _kill_pg_and_wait(proc)
+            return False
+        if time.monotonic() >= deadline:
+            print(
+                f"Warning: fallback timed out after {FALLBACK_TIMEOUT_SEC}s for "
+                f"{model} (tp={tp}); killing process group and continuing."
+            )
+            _kill_pg_and_wait(proc)
+            return False
+        time.sleep(2)
 
 
 def main():
