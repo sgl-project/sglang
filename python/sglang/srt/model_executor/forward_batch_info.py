@@ -105,8 +105,8 @@ class ForwardMode(IntEnum):
     # Used in dLLM
     DLLM_EXTEND = auto()
 
-    def is_prefill(self):
-        return self.is_extend()
+    def is_prefill(self, include_draft_extend_v2: bool = False):
+        return self.is_extend(include_draft_extend_v2=include_draft_extend_v2)
 
     def is_extend(self, include_draft_extend_v2: bool = False):
         return (
