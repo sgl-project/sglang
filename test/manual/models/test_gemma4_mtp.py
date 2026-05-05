@@ -339,7 +339,7 @@ class TestGemma4E2BMTPGSM8K(Gemma4MTPGSM8KMixin, CustomTestCase):
     model_pair = ModelPair(
         name="E2B",
         target_path="google/gemma-4-E2B-it",
-        assistant_path="gg-hf-am/gemma-4-E2B-it-assistant",
+        assistant_path="google/gemma-4-E2B-it-assistant",
         # Loose threshold while we calibrate the algorithm; the GSM8K
         # score check is the primary correctness gate.
         accept_length_threshold=0.0,
@@ -350,7 +350,7 @@ class TestGemma4E4BMTPGSM8K(Gemma4MTPGSM8KMixin, CustomTestCase):
     model_pair = ModelPair(
         name="E4B",
         target_path="google/gemma-4-E4B-it",
-        assistant_path="gg-hf-am/gemma-4-E4B-it-assistant",
+        assistant_path="google/gemma-4-E4B-it-assistant",
         accept_length_threshold=None,
     )
 
@@ -359,7 +359,7 @@ class TestGemma4MTP31BGSM8K(Gemma4MTPGSM8KMixin, CustomTestCase):
     model_pair = ModelPair(
         name="31B",
         target_path="google/gemma-4-31B-it",
-        assistant_path="gg-hf-am/gemma-4-31B-it-assistant",
+        assistant_path="google/gemma-4-31B-it-assistant",
         accept_length_threshold=None,
         server_cuda_visible_devices="0,1",
         tensor_parallel_size=2,
@@ -370,7 +370,7 @@ class TestGemma4MTP26BA4BGSM8K(Gemma4MTPGSM8KMixin, CustomTestCase):
     model_pair = ModelPair(
         name="26B-A4B",
         target_path="google/gemma-4-26B-A4B-it",
-        assistant_path="gg-hf-am/gemma-4-26B-A4B-it-assistant",
+        assistant_path="google/gemma-4-26B-A4B-it-assistant",
         accept_length_threshold=None,
         server_cuda_visible_devices="0,1",
         tensor_parallel_size=2,
