@@ -278,6 +278,38 @@ class TestHiCacheNoEnablePrefixCaching(CustomTestCase):
     def _cached_tokens(self, response_json: dict) -> int:
         return int(response_json.get("meta_info", {}).get("cached_tokens", 0))
 
+    def _assert_server_process_alive(self):
+        rc = self.process.poll()
+        self.assertIsNone(
+            rc,
+            f"SGLang server process exited unexpectedly with code {rc}. "
+            "Check scheduler logs above for memory-pool checker failures.",
+        )
+
+    def _assert_scheduler_healthy(self):
+        self._assert_server_process_alive()
+        try:
+            response = requests.get(
+                f"{self.base_url}/health_generate",
+                timeout=30,
+            )
+        except Exception as exc:
+            self.fail(f"SGLang scheduler is not reachable after workload: {exc}")
+
+        self.assertEqual(
+            response.status_code,
+            200,
+            f"health_generate failed: {response.status_code} {response.text}",
+        )
+
+    def _assert_no_idle_pool_checker_crash(self, idle_seconds: float = 3.0):
+        deadline = time.time() + idle_seconds
+        while time.time() < deadline:
+            self._assert_server_process_alive()
+            time.sleep(0.2)
+
+        self._assert_scheduler_healthy()
+
     def test_repeated_prefix_reuses_l2_not_l1(self):
         shared_prefix = self._make_shared_prefix()
 
@@ -289,12 +321,26 @@ class TestHiCacheNoEnablePrefixCaching(CustomTestCase):
         )
         self.assertIsNotNone(response1)
 
+        cached1 = self._cached_tokens(response1)
+
         events_after_first = self.events.drain_until(
             lambda evs: len(_cpu_backed_and_gpu_demoted_hashes(evs))
             >= MIN_SHARED_BLOCKS,
             timeout=30.0,
         )
+
         demoted_hashes = _cpu_backed_and_gpu_demoted_hashes(events_after_first)
+
+        print(
+            f"Request 1: \n\tcached_tokens={cached1}, \n\tdemoted_hashes={demoted_hashes}"
+        )
+
+        meta1 = response1.get("meta_info", {})
+        print(f"\nRequest 1 meta_info: {meta1}")
+
+        print(
+            f"\nRequest 1 cached tokens (should be None): \n\t{meta1.get('cached_tokens_details', {})}"
+        )
 
         self.assertGreaterEqual(
             len(demoted_hashes),
@@ -323,6 +369,11 @@ class TestHiCacheNoEnablePrefixCaching(CustomTestCase):
         )
         loaded_back_hashes = _stored_hashes(events_after_second, GPU) & demoted_hashes
 
+        # check: cached2 >= MIN_CACHE_HIT_TOKENS, which indicates a large prefix hit from CPU L2, but not GPU L1.
+        print(
+            f"Request 2: \n\tcached_tokens={cached2}, \n\tloaded_back_hashes={loaded_back_hashes}, \n\tdemoted_hashes={demoted_hashes}"
+        )
+
         self.assertGreaterEqual(
             cached2,
             MIN_CACHE_HIT_TOKENS,
@@ -330,6 +381,31 @@ class TestHiCacheNoEnablePrefixCaching(CustomTestCase):
             f"cached_tokens={cached2}.",
         )
 
+        # check more granular cache hit details: evidence of L2 hits and no L1 hits.
+        meta2 = response2.get("meta_info", {})
+        cached_tokens_host = meta2.get("cached_tokens_details", {}).get("host")
+        cached_tokens_device = meta2.get("cached_tokens_details", {}).get("device")
+
+        print(f"\nRequest 2 meta_info: {meta2}")
+        print(
+            f"\nRequest 2 cached tokens: \n\tcache_tokens_host={cached_tokens_host}, \n\tcache_tokens_device={cached_tokens_device}"
+        )
+
+        if cached_tokens_host is not None:
+            self.assertGreaterEqual(
+                int(cached_tokens_host),
+                MIN_CACHE_HIT_TOKENS,
+                f"Expected host/L2 cached tokens, meta_info={meta2}",
+            )
+
+        if cached_tokens_device is not None:
+            self.assertEqual(
+                int(cached_tokens_device),
+                0,
+                f"Expected no device/L1 cached tokens, meta_info={meta2}",
+            )
+
+        # check if the prefix blocks were loaded back from CPU L2 to GPU, rather than reused from GPU L1.
         self.assertGreaterEqual(
             len(loaded_back_hashes),
             MIN_SHARED_BLOCKS,
@@ -338,6 +414,11 @@ class TestHiCacheNoEnablePrefixCaching(CustomTestCase):
             "event appears, the request likely reused an L1 GPU block instead "
             "of exercising L2 load-back.",
         )
+
+        # Important: the scheduler may crash only after the response, when the
+        # runtime checker runs on idle. Without this, unittest can print OK
+        # even though the child server died.
+        self._assert_no_idle_pool_checker_crash()
 
 
 if __name__ == "__main__":
