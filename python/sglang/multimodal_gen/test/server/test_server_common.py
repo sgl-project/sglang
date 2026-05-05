@@ -35,6 +35,7 @@ from sglang.multimodal_gen.test.server.testcase_configs import (
     ScenarioConfig,
 )
 from sglang.multimodal_gen.test.test_utils import (
+    SGL_TEST_FILES_CI_DATA_REVISION,
     _consistency_gt_filenames,
     _get_consistency_gt_dir,
     compare_with_gt,
@@ -569,6 +570,7 @@ Add the expected file(s) to sgl-project/ci-data in diffusion-ci/consistency_gt/s
 For this case, expected file(s): {names}
 
 Repository: https://github.com/sgl-project/ci-data (path: diffusion-ci/consistency_gt/sglang_generated/)
+Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
 
 (Optional) Per-case override in consistency_threshold.json:
   "cases": {{

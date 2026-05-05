@@ -1244,12 +1244,6 @@ class UnifiedRadixCache(BasePrefixCache):
                 self.dec_lock_ref(ancestor_node)
                 return None
 
-        logger.info(
-            "load_back: kv_tokens=%d, node_id=%d",
-            kv_tokens,
-            last_hit_node.id,
-        )
-
         # Load H→D
         aux_xfers = [x for xfers in comp_xfers.values() for x in xfers]
         aux_xfers.extend(anchor_kv_shared_indices_xfers)
@@ -1367,14 +1361,9 @@ class UnifiedRadixCache(BasePrefixCache):
         req = params.req
 
         if last_node.evicted or params.host_hit_length > 0:
-            logger.info(
-                "init_load_back triggered: node_id=%d, host_hit_length=%d",
-                last_node.id,
-                params.host_hit_length,
-            )
             loading_values = self.load_back(last_node, mem_quota, req=req)
             if loading_values is not None:
-                logger.info(
+                logger.debug(
                     "init_load_back success: loaded %d tokens for node %d",
                     len(loading_values),
                     last_node.id,
