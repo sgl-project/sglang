@@ -601,11 +601,10 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
             return StandardCombineInput(hidden_states=output)
         else:
             assert backend.is_triton()
-            assert moe_runner_config.activation in (
-                "silu",
-                "relu2",
-            ), f"activation = {moe_runner_config.activation} is not supported for Triton PATH; \
-silu requires ENV SGLANG_USE_SGL_XPU=1 for the fast path, relu2 is always routed here."
+            assert (
+                moe_runner_config.activation == "silu"
+            ), f"activation = {moe_runner_config.activation} is not supported \
+            for Triton PATH, please set ENV SGLANG_USE_SGL_XPU=1."
 
             quant_info = self.get_triton_quant_info(layer)
             return self.runner.run(dispatch_output, quant_info)
