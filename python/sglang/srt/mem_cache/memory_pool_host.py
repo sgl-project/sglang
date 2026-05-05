@@ -37,6 +37,7 @@ from sglang.srt.mem_cache.memory_pool import (
     MLATokenToKVPool,
     NSATokenToKVPool,
 )
+from sglang.srt.mem_cache.utils import aligned_empty
 from sglang.srt.utils import is_cuda, is_mps, is_npu, is_xpu
 
 _is_cuda = is_cuda()
@@ -84,11 +85,15 @@ class HostTensorAllocator(abc.ABC):
         self.dims = None
 
     def allocate(self, dims: tuple, dtype: torch.dtype, device: str) -> torch.Tensor:
-        """Allocate a tensor of given dims and dtype on the memory."""
+        """Allocate a tensor of given dims and dtype on the memory.
+
+        Returns a buffer with ``data_ptr()`` and ``nbytes`` aligned to the
+        host's RDMA registration alignment (kernel page size) so it can be
+        passed directly to ``cudaHostRegister`` / ``ibv_reg_mr``.
+        """
         self.dtype = dtype
         self.dims = dims
-        tensor = torch.empty(dims, dtype=dtype, device=device)
-        return tensor
+        return aligned_empty(dims, dtype=dtype, device=device)
 
 
 def get_allocator_from_storage(allocator_type):
@@ -138,9 +143,12 @@ def alloc_with_pin_memory(
 ) -> torch.Tensor:
     """
     Allocate tensor using PyTorch's built-in pin_memory flag.
+
+    ``data_ptr()`` and ``nbytes`` are aligned to the host's RDMA registration
+    alignment (kernel page size), so the returned buffer is safe to register
+    with ``ibv_reg_mr`` for NIXL/UCX.
     """
-    buffer = torch.empty(dims, dtype=dtype, device=device, pin_memory=pin_memory)
-    return buffer
+    return aligned_empty(dims, dtype=dtype, device=device, pin_memory=pin_memory)
 
 
 ALLOC_MEMORY_FUNCS = defaultdict(
