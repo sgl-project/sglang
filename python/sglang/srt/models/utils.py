@@ -21,6 +21,8 @@ from typing import TYPE_CHECKING, Any, Optional, Tuple
 
 import numpy as np
 import torch
+import triton
+import triton.language as tl
 
 from sglang.jit_kernel.norm import can_use_fused_inplace_qknorm, fused_inplace_qknorm
 from sglang.srt.environ import envs
@@ -30,6 +32,7 @@ from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import get_current_device_stream_fast, is_cuda, is_hip
 from sglang.srt.utils.custom_op import register_custom_op
 
@@ -388,6 +391,28 @@ class RotaryPosMixin:
         return torch.from_numpy(np.stack([hpos_ids, wpos_ids], axis=-1))
 
 
+def _reshape_for_qk_norm(x: torch.Tensor, head_dim: int) -> torch.Tensor:
+    """Reshape a (..., H*D) tensor into (..., H, D) ahead of QK RMSNorm.
+
+    On CUDA with the inductor piecewise-cuda-graph compiler, return a
+    stride-preserving view so inductor can fuse this reshape with the
+    subsequent RMSNorm (and any upstream/downstream FP8 quant) into a
+    single triton kernel -- the original motivation of #21734.
+
+    Everywhere else (ROCm, or CUDA with the eager PCG fallback), use the
+    flat 2D reshape that forces a copy when the input is a non-contiguous
+    QKV-split stride-trick view. ROCm's RMSNorm kernels assume contiguous
+    inputs and fault on strided tensors (root cause of the #21734 revert
+    in #23159).
+    """
+    if (
+        _is_cuda
+        and get_global_server_args().piecewise_cuda_graph_compiler == "inductor"
+    ):
+        return x.view(*x.shape[:-1], -1, head_dim)
+    return x.reshape(-1, head_dim)
+
+
 def apply_qk_norm(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -422,6 +447,8 @@ def apply_qk_norm(
         and allow_inplace  # TODO(dark): this can be relaxed if needed
         and (q_eps == k_eps)  # TODO(dark): this can also be relaxed
         and not envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.get()
+        and get_global_server_args().piecewise_cuda_graph_compiler
+        != "inductor"  # let inductor fuse QK norm
         and can_use_fused_inplace_qknorm(head_dim, q.dtype)
     ):
         fused_inplace_qknorm(
@@ -437,20 +464,113 @@ def apply_qk_norm(
     if alt_stream is not None and get_is_capture_mode():
         current_stream = get_current_device_stream_fast()
         alt_stream.wait_stream(current_stream)
-        q_by_head = q.reshape(-1, head_dim)
+        q_by_head = _reshape_for_qk_norm(q, head_dim)
         q_by_head = q_norm(q_by_head)
         with torch.cuda.stream(alt_stream):
-            k_by_head = k.reshape(-1, head_dim)
+            k_by_head = _reshape_for_qk_norm(k, head_dim)
             k_by_head = k_norm(k_by_head)
         current_stream.wait_stream(alt_stream)
     else:
-        q_by_head = q.reshape(-1, head_dim)
+        q_by_head = _reshape_for_qk_norm(q, head_dim)
         q_by_head = q_norm(q_by_head)
-        k_by_head = k.reshape(-1, head_dim)
+        k_by_head = _reshape_for_qk_norm(k, head_dim)
         k_by_head = k_norm(k_by_head)
     q = q_by_head.view(q.shape)
     k = k_by_head.view(k.shape)
     return q, k
+
+
+# ---------------------------------------------------------------------------
+# Fused QK GemmaRMSNorm Triton kernel
+# grid = q_rows (the larger dimension in GQA).  Every block computes Q norm
+# for its row; the first k_rows blocks also compute K norm.  No torch.cat,
+# no tl.where for weight selection, no output slice.
+# ---------------------------------------------------------------------------
+@triton.jit
+def _fused_qk_gemma_rmsnorm_kernel(
+    Q_ptr,
+    K_ptr,
+    Q_out_ptr,
+    K_out_ptr,
+    QW_ptr,
+    KW_ptr,
+    q_stride,
+    k_stride,
+    k_rows,
+    HEAD_DIM: tl.constexpr,
+    BLOCK_HD: tl.constexpr,
+    EPS: tl.constexpr,
+    FP16: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    cols = tl.arange(0, BLOCK_HD)
+    mask = cols < HEAD_DIM
+    out_dtype = tl.float16 if FP16 else tl.bfloat16
+
+    # Q norm (every block) — use q_stride to handle non-contiguous input
+    q_off = pid * q_stride + cols
+    q = tl.load(Q_ptr + q_off, mask=mask, other=0.0).to(tl.float32)
+    w_q = tl.load(QW_ptr + cols, mask=mask, other=0.0).to(tl.float32)
+    q_var = tl.sum(q * q, axis=0) / HEAD_DIM
+    q_normed = (q * tl.rsqrt(q_var + EPS) * (w_q + 1.0)).to(out_dtype)
+    # output is always contiguous
+    q_out_off = pid * HEAD_DIM + cols
+    tl.store(Q_out_ptr + q_out_off, q_normed, mask=mask)
+
+    # K norm (first k_rows blocks only) — use k_stride for input
+    if pid < k_rows:
+        k_off = pid * k_stride + cols
+        k = tl.load(K_ptr + k_off, mask=mask, other=0.0).to(tl.float32)
+        w_k = tl.load(KW_ptr + cols, mask=mask, other=0.0).to(tl.float32)
+        k_var = tl.sum(k * k, axis=0) / HEAD_DIM
+        k_normed = (k * tl.rsqrt(k_var + EPS) * (w_k + 1.0)).to(out_dtype)
+        k_out_off = pid * HEAD_DIM + cols
+        tl.store(K_out_ptr + k_out_off, k_normed, mask=mask)
+
+
+def fused_qk_gemma_rmsnorm(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    q_weight: torch.Tensor,
+    k_weight: torch.Tensor,
+    eps: float,
+    head_dim: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Fused QK GemmaRMSNorm — single Triton kernel for both q_norm and k_norm.
+
+    grid = q_rows; every block processes its Q row, and the first k_rows
+    blocks also process K.  No torch.cat, no slice, no tl.where.
+    Passes input strides to the kernel so non-contiguous tensors (e.g. from
+    qkv.split()) are read correctly without an extra .contiguous() copy.
+    """
+    q_flat = q.reshape(-1, head_dim)
+    k_flat = k.reshape(-1, head_dim)
+
+    q_rows = q_flat.shape[0]
+    k_rows = k_flat.shape[0]
+
+    q_out = torch.empty(q_rows, head_dim, dtype=q.dtype, device=q.device)
+    k_out = torch.empty(k_rows, head_dim, dtype=k.dtype, device=k.device)
+
+    BLOCK_HD = triton.next_power_of_2(head_dim)
+
+    _fused_qk_gemma_rmsnorm_kernel[(q_rows,)](
+        q_flat,
+        k_flat,
+        q_out,
+        k_out,
+        q_weight,
+        k_weight,
+        q_flat.stride(0),
+        k_flat.stride(0),
+        k_rows,
+        HEAD_DIM=head_dim,
+        BLOCK_HD=BLOCK_HD,
+        EPS=eps,
+        FP16=(q.dtype == torch.float16),
+    )
+
+    return q_out, k_out
 
 
 # Register the inplace op

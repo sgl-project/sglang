@@ -7,11 +7,7 @@ from typing import Any, Union
 import torch
 
 from sglang.multimodal_gen.runtime.distributed import (
-    get_local_torch_device,
     get_sp_world_size,
-)
-from sglang.multimodal_gen.runtime.distributed.communication_op import (
-    sequence_model_parallel_all_reduce,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.post_training.rl_dataclasses import (
@@ -107,7 +103,7 @@ class SchedulerRLMixin(SchedulerRLDebugMixin):
             )
 
         sharded_noise, _ = rollout_session_data.pipeline_config.shard_latents_for_sp(
-            batch, buffer
+            batch=batch, latents=buffer
         )
         if tuple(sharded_noise.shape) != local_shape:
             raise ValueError(
@@ -145,10 +141,35 @@ class SchedulerRLMixin(SchedulerRLDebugMixin):
             ), "True log-probability computation requires a non-zero noise level."
 
         dt = next_sigma - current_sigma
-        if sde_type == "sde":
+
+        # step_index comes from the denoising-loop counter stashed by
+        # DenoisingStage — scheduler._step_index would differ when
+        # _begin_index != 0 (e.g. partial denoising).
+        sde_step_indices = getattr(batch, "rollout_sde_step_indices", None)
+        loop_step_index = getattr(batch, "_rollout_loop_step_index", None)
+        if (
+            sde_type != "ode"
+            and sde_step_indices is not None
+            and loop_step_index is not None
+            and loop_step_index not in sde_step_indices
+        ):
+            effective_sde_type = "ode"
+        else:
+            effective_sde_type = sde_type
+
+        # sde/cps: cast to fp32 to match flowGRPO semantics and avoid the
+        # 0-dim-fp32 wrapped-scalar promotion demoting log-prob to bf16.
+        # ode: keep dtypes unchanged so rollout(ode) stays bit-exact with
+        # rollout=False (scheduling_flow_match_euler_discrete.step()).
+        # log_prob is computed on the full pre-shard noise buffer so SP ranks
+        # produce identical sums — see collect_rollout_log_probs().
+        if effective_sde_type == "sde":
+            model_output = model_output.float()
+            sample = sample.float()
             variance_noise = self._rollout_variance_noise(
                 batch, model_output, generator
             )
+            full_variance_noise = rollout_session_data.noise_buffer
             std_dev_t = (
                 torch.sqrt(
                     current_sigma
@@ -173,12 +194,15 @@ class SchedulerRLMixin(SchedulerRLDebugMixin):
 
             weighted_variance_noise = variance_noise * noise_std_dev
             prev_sample = prev_sample_mean + weighted_variance_noise
-            log_prob_no_const_val = -(weighted_variance_noise**2)
+            log_prob_no_const_val = -((full_variance_noise * noise_std_dev) ** 2)
 
-        elif sde_type == "cps":
+        elif effective_sde_type == "cps":
+            model_output = model_output.float()
+            sample = sample.float()
             variance_noise = self._rollout_variance_noise(
                 batch, model_output, generator
             )
+            full_variance_noise = rollout_session_data.noise_buffer
             std_dev_t = next_sigma * math.sin(noise_level * math.pi / 2)
             noise_std_dev = std_dev_t
             pred_original_sample = sample - current_sigma * model_output
@@ -189,19 +213,26 @@ class SchedulerRLMixin(SchedulerRLDebugMixin):
 
             weighted_variance_noise = variance_noise * noise_std_dev
             prev_sample = prev_sample_mean + weighted_variance_noise
-            log_prob_no_const_val = -(weighted_variance_noise**2)
+            log_prob_no_const_val = -((full_variance_noise * noise_std_dev) ** 2)
 
-        elif sde_type == "ode":
+        elif effective_sde_type == "ode":
             prev_sample = sample + dt * model_output
             prev_sample_mean = prev_sample
             variance_noise = torch.zeros_like(model_output)
             noise_std_dev = torch.zeros(
                 (), device=model_output.device, dtype=model_output.dtype
             )
-            log_prob_no_const_val = torch.zeros_like(model_output)
-            assert (
-                log_prob_no_const
-            ), "p_ode is always 0, true log_prob is meaningless, set rollout_log_prob_no_const to True to enable log_prob computation"
+            log_prob_no_const_val = torch.zeros(
+                rollout_session_data.latents_shape,
+                device=model_output.device,
+                dtype=torch.float32,
+            )
+            # Only enforce the "no full log-prob with ODE" constraint when the
+            # user explicitly chose ODE globally.
+            if sde_type == "ode":
+                assert (
+                    log_prob_no_const
+                ), "p_ode is always 0, true log_prob is meaningless, set rollout_log_prob_no_const to True to enable log_prob computation"
 
         else:
             raise ValueError(f"Unsupported sde_type: {sde_type}")
@@ -212,7 +243,7 @@ class SchedulerRLMixin(SchedulerRLDebugMixin):
             float(math.prod(log_prob_no_const_val.shape[1:])),
         )
 
-        if log_prob_no_const:
+        if log_prob_no_const or effective_sde_type == "ode":
             log_prob_local_sum = log_prob_no_const_val.sum(dim=reduce_dims)
         else:
             log_prob_local_sum = (
@@ -245,25 +276,20 @@ class SchedulerRLMixin(SchedulerRLDebugMixin):
         self, batch
     ) -> tuple[torch.Tensor, torch.Tensor]:
         rollout_session_data = self._get_rollout_session_data(batch)
-        values_sum = torch.stack(rollout_session_data.local_log_prob_sum, dim=-1)
-        values_count = torch.stack(rollout_session_data.local_log_prob_count, dim=-1)
+        # [B, T]: batch dim 0, denoising step dim 1
+        values_sum = torch.stack(rollout_session_data.local_log_prob_sum, dim=1)
+        values_count = torch.stack(rollout_session_data.local_log_prob_count, dim=1)
         rollout_session_data.local_log_prob_sum = []
         rollout_session_data.local_log_prob_count = []
         return values_sum, values_count
 
     def collect_rollout_log_probs(self, batch: Req) -> torch.Tensor | None:
-        """Consume local rollout log probs and merge for all SP ranks."""
+        """Per-step sums are already computed on the full pre-shard noise
+        buffer inside flow_sde_sampling, so every SP rank holds identical
+        values here and no all-reduce is needed."""
 
         trajectory_log_prob_sum, trajectory_log_prob_count = (
             self.consume_local_rollout_log_probs(batch)
         )
-        if get_sp_world_size() > 1 and getattr(batch, "did_sp_shard_latents", False):
-            packed = torch.stack(
-                [trajectory_log_prob_sum, trajectory_log_prob_count], dim=0
-            ).to(get_local_torch_device())
-            sequence_model_parallel_all_reduce(packed)
-            trajectory_log_prob_sum = packed[0]
-            trajectory_log_prob_count = packed[1]
-
         rollout_log_probs_tensor = trajectory_log_prob_sum / trajectory_log_prob_count
         return rollout_log_probs_tensor.cpu()

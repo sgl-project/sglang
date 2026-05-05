@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import dataclasses
 from abc import ABC, abstractmethod
-from enum import Enum
+from enum import Enum, IntFlag
 from typing import TYPE_CHECKING, Any, Callable, Optional
 
 import torch
@@ -17,6 +17,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
     MatchResult,
 )
+from sglang.srt.mem_cache.hicache_storage import PoolTransfer
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -62,6 +63,24 @@ class ComponentData:
     value: Optional[torch.Tensor] = None
     lock_ref: int = 0
     metadata: dict[str, Any] = dataclasses.field(default_factory=dict)
+    host_value: Optional[torch.Tensor] = None
+    host_lock_ref: int = 0
+
+
+class EvictLayer(IntFlag):
+    """Which storage layer(s) to evict.  Combinable via bitwise OR."""
+
+    DEVICE = 1
+    HOST = 2
+    ALL = DEVICE | HOST
+
+
+class CacheTransferPhase(str, Enum):
+
+    BACKUP_HOST = "backup_host"  # D→H
+    LOAD_BACK = "load_back"  # H→D
+    BACKUP_STORAGE = "backup_storage"  # H→Storage
+    PREFETCH = "prefetch"  # Storage→H
 
 
 def get_and_increase_time_counter() -> float64:
@@ -84,8 +103,13 @@ class TreeComponent(ABC):
     # Subclasses MUST set this as a class attribute (not @property)
     component_type: ComponentType
 
-    def node_has_component_data(self, node: UnifiedTreeNode) -> bool:
-        return node.component_data[self.component_type].value is not None
+    def node_has_component_data(
+        self, node: UnifiedTreeNode, target: EvictLayer = EvictLayer.DEVICE
+    ) -> bool:
+        cd = node.component_data[self.component_type]
+        if target is EvictLayer.DEVICE:
+            return cd.value is not None
+        return cd.host_value is not None
 
     def value_len(self, node: UnifiedTreeNode) -> int:
         value = node.component_data[self.component_type].value
@@ -175,17 +199,22 @@ class TreeComponent(ABC):
         ...
 
     @abstractmethod
-    def evict_component(self, node: UnifiedTreeNode, is_leaf: bool) -> int:
+    def evict_component(
+        self,
+        node: UnifiedTreeNode,
+        target: EvictLayer = EvictLayer.DEVICE,
+    ) -> tuple[int, int]:
         """Free this component's KV resources on a node being evicted.
-        For internal (non-leaf) nodes: free memory and tombstone the value
-        (set to None); the node structure is kept.
-        For leaf nodes: free memory; the node will be deleted by caller.
-        Returns the number of tokens/slots freed.
-        - Full: frees full_value via token_to_kv_pool_allocator.
-        - SWA: frees swa value via swa_token_to_kv_pool_allocator;
-          only tombstones on internal nodes.
-        - Mamba: frees mamba value via mamba_token_to_kv_pool_allocator;
-          only tombstones on internal nodes."""
+
+        *target* controls which layer(s) to evict:
+          - DEVICE: free device memory and tombstone (value = None).
+                    Host data is untouched.
+          - HOST:   free host memory (host_value = None).
+                    Device data is untouched.
+          - ALL:    free both device and host memory.
+                    No tombstone — caller will delete the node.
+
+        Returns (device_freed, host_freed) token counts."""
         ...
 
     def eviction_priority(self, is_leaf: bool) -> int:
@@ -289,4 +318,30 @@ class TreeComponent(ABC):
         or effective_cache_len <= 0); treat as "no insert happened".
         ``insert_params`` is None only on the disabled path; on early-return
         paths it is still provided so components can free their resources."""
+        pass
+
+    # ---- HiCache Hooks ----
+
+    def build_hicache_transfers(
+        self, node: UnifiedTreeNode, phase: CacheTransferPhase, **kw
+    ) -> Optional[list[PoolTransfer]]:
+        """Build transfer descriptors for this component in the given phase.
+        Returns None if the component has nothing to transfer."""
+        return None
+
+    def commit_hicache_transfer(
+        self,
+        node: UnifiedTreeNode,
+        phase: CacheTransferPhase,
+        transfers: list[PoolTransfer] = (),
+    ) -> None:
+        """Post-transfer bookkeeping: store host indices, update LRU, etc."""
+        pass
+
+    def drive_host_eviction(
+        self, num_tokens: int, tracker: dict[ComponentType, int]
+    ) -> None:
+        """Evict from this component's host-side resources.
+        Called by HostPoolGroup when the host pool is full.
+        Default no-op for components without host storage."""
         pass

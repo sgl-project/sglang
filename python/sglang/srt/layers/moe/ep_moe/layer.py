@@ -39,7 +39,7 @@ from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8MoEMethod
 from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.layers.quantization.quark.schemes import QuarkW4A4MXFp4MoE
 from sglang.srt.layers.quantization.w4afp8 import W4AFp8Config, W4AFp8MoEMethod
-from sglang.srt.utils import get_bool_env_var, is_hip, is_npu
+from sglang.srt.utils import get_bool_env_var, get_int_env_var, is_hip, is_npu
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import (
@@ -635,6 +635,10 @@ class MoriEPMoE(DeepEPMoE):
         expert_end_idx = expert_start_idx + self.num_local_experts
         self.expert_mask[expert_start_idx:expert_end_idx] = 1
 
+        self.mori_moe_max_input_tokens = get_int_env_var(
+            "SGLANG_MORI_MOE_MAX_INPUT_TOKENS", 0
+        )
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -680,6 +684,19 @@ class MoriEPMoE(DeepEPMoE):
             dispatch_output.origin_topk_weights,
             dispatch_output.out_dtype,
         )
+
+        # Truncate dispatch tensors to reduce MoE computation on padding rows.
+        # dispatch_a1 has shape (M, hidden_size) where M is the full buffer size,
+        # but only the first dispatch_recv_token_num rows are valid.
+        # mori combine only reads [0, totalRecvTokenNum), so the truncated
+        # output can be passed directly without padding back.
+        if self.mori_moe_max_input_tokens > 0:
+            limit = self.mori_moe_max_input_tokens
+            dispatch_a1 = dispatch_a1[:limit]
+            if dispatch_scale is not None:
+                dispatch_scale = dispatch_scale[:limit]
+            dispatch_ids = dispatch_ids[:limit]
+            dispatch_weights = dispatch_weights[:limit]
 
         w13_weight = self.w13_weight
         w2_weight = self.w2_weight
