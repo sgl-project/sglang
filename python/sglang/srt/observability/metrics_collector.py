@@ -107,7 +107,7 @@ class SchedulerStats:
     num_paused_reqs: int = 0
 
     # PD disaggregation
-    num_prefill_prealloc_queue_reqs: QueueCount = field(default_factory=QueueCount)
+    num_prefill_bootstrap_queue_reqs: QueueCount = field(default_factory=QueueCount)
     num_prefill_inflight_queue_reqs: QueueCount = field(default_factory=QueueCount)
     num_decode_prealloc_queue_reqs: QueueCount = field(default_factory=QueueCount)
     num_decode_transfer_queue_reqs: QueueCount = field(default_factory=QueueCount)
@@ -340,9 +340,9 @@ class SchedulerMetricsCollector:
         # =================================================================
         # PD disaggregation
         # =================================================================
-        self.num_prefill_prealloc_queue_reqs = Gauge(
-            name="sglang:num_prefill_prealloc_queue_reqs",
-            documentation="The number of requests in the prefill prealloc queue.",
+        self.num_prefill_bootstrap_queue_reqs = Gauge(
+            name="sglang:num_prefill_bootstrap_queue_reqs",
+            documentation="The number of requests in the prefill bootstrap queue.",
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
@@ -1080,7 +1080,8 @@ class SchedulerMetricsCollector:
 
         # PD disaggregation
         self._log_gauge_queue_count(
-            self.num_prefill_prealloc_queue_reqs, stats.num_prefill_prealloc_queue_reqs
+            self.num_prefill_bootstrap_queue_reqs,
+            stats.num_prefill_bootstrap_queue_reqs,
         )
         self._log_gauge_queue_count(
             self.num_prefill_inflight_queue_reqs, stats.num_prefill_inflight_queue_reqs
