@@ -201,6 +201,7 @@ class CompressedTensorsConfig(QuantizationConfig):
         ):
             return
         self.target_scheme_map["FusedMoE"] = self.target_scheme_map["Linear"]
+        self.target_scheme_map["DeepEPMoE"] = self.target_scheme_map["Linear"]
 
     @property
     def weight_block_size(self) -> Optional[List[int]]:
@@ -681,6 +682,13 @@ class CompressedTensorsConfig(QuantizationConfig):
                     logger.info_once("Using CompressedTensorsWNA16TritonMoE (ROCm)")
                     return CompressedTensorsWNA16TritonMoE(self)
                 else:
+                    moe_backend = get_moe_runner_backend()
+                    if moe_backend.is_triton():
+                        logger.info_once(
+                            "Using CompressedTensorsWNA16TritonMoE "
+                            "(moe_runner_backend=triton)"
+                        )
+                        return CompressedTensorsWNA16TritonMoE(self)
                     logger.info_once("Using CompressedTensorsWNA16MarlinMoEMethod")
                     return CompressedTensorsWNA16MoE(self)
             else:
@@ -995,6 +1003,12 @@ class CompressedTensorsFusedMoEMethod(FusedMoEMethodBase):
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
         return layer.scheme.create_moe_runner(layer, moe_runner_config)
+
+    def get_triton_quant_info(self, layer: torch.nn.Module):
+        return layer.scheme.get_triton_quant_info(layer)
+
+    def get_marlin_quant_info(self, layer: torch.nn.Module):
+        return layer.scheme.get_marlin_quant_info(layer)
 
     def apply(
         self,

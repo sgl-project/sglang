@@ -44,6 +44,11 @@ def sequence_model_parallel_all_gather(
     return get_sp_group().all_gather(input_, dim)
 
 
+def sequence_model_parallel_all_reduce(input_: torch.Tensor) -> torch.Tensor:
+    """All-reduce the input tensor across model parallel group."""
+    return get_sp_group().all_reduce(input_)
+
+
 def cfg_model_parallel_all_gather(
     input_: torch.Tensor, dim: int = -1, separate_tensors: bool = False
 ) -> torch.Tensor:

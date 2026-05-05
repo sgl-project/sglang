@@ -1,3 +1,5 @@
+import sys
+
 import pytest
 import torch
 
@@ -94,4 +96,4 @@ def test_fused_topk_deepseek(seq_length, params, apply_routed_scaling_factor_on_
 
 
 if __name__ == "__main__":
-    pytest.main([__file__])
+    sys.exit(pytest.main([__file__]))
