@@ -272,11 +272,14 @@ class LMCRadixCache(RadixCache):
             req.req_pool_idx, :kv_committed_len
         ]
 
-        # Pass req so MP-mode match_prefix can derive the wire request_id
-        # from req.rid. Falls through the early-return path inside
-        # match_prefix because the just-inserted tokens are already in radix.
-        match_result = self.match_prefix(
-            MatchPrefixParams(key=RadixKey(token_ids, req.extra_key), req=req)
+        # Bypass the LMCache-aware override here — we just need
+        # ``new_last_node`` from the radix tree, which now contains the
+        # tokens we inserted via ``super().cache_finished_req`` above.
+        # Calling ``self.match_prefix`` would trigger a redundant
+        # ``ensure_session`` LOOKUP on the MP path (the scheduler-time
+        # match_prefix already created the daemon session for this rid).
+        match_result = super().match_prefix(
+            MatchPrefixParams(key=RadixKey(token_ids, req.extra_key))
         )
         new_last_node = match_result.last_device_node
         assert new_last_node is not None
