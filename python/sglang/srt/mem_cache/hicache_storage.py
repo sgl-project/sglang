@@ -43,6 +43,9 @@ class PoolName(str, Enum):
     MAMBA = "mamba"
     INDEXER = "indexer"
 
+    def __str__(self) -> str:
+        return self.value
+
 
 class PoolHitPolicy(str, Enum):
     """Hit policy for batch_exists_v2 per-pool prefix matching.
@@ -61,6 +64,7 @@ class PoolTransfer:
 
     device<->host path : host_indices + device_indices
     host<->storage path: host_indices + keys
+    nodes_to_load      : evicted nodes this transfer covers
     """
 
     name: PoolName
@@ -68,6 +72,7 @@ class PoolTransfer:
     device_indices: Optional[torch.Tensor] = None
     keys: Optional[List[str]] = None
     hit_policy: PoolHitPolicy = PoolHitPolicy.ALL_PAGES
+    nodes_to_load: Optional[List[Any]] = None
 
 
 @dataclass

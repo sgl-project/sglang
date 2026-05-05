@@ -3,6 +3,7 @@ from typing import Union
 
 import torch
 from fastapi import Request
+from fastapi.responses import ORJSONResponse
 
 from sglang.srt.entrypoints.openai.protocol import (
     ErrorResponse,
@@ -76,17 +77,26 @@ class OpenAIServingScore(OpenAIServingBase):
                 query_embed_overrides=query_embed_overrides,
                 item_embed_overrides=item_embed_overrides,
                 request=raw_request,
+                return_pooled_hidden_states=request.return_pooled_hidden_states,
             )
+
+            phs_as_lists = None
+            if result.pooled_hidden_states is not None:
+                phs_as_lists = [
+                    t.tolist() if t is not None else None
+                    for t in result.pooled_hidden_states
+                ]
 
             response = ScoringResponse(
                 scores=result.scores,
+                pooled_hidden_states=phs_as_lists,
                 model=request.model,
                 usage=UsageInfo(
                     prompt_tokens=result.prompt_tokens,
                     total_tokens=result.prompt_tokens,
                 ),
             )
-            return response
+            return ORJSONResponse(content=response.model_dump())
 
         except ValueError as e:
             return self.create_error_response(str(e))

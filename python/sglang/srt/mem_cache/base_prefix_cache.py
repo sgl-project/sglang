@@ -74,7 +74,7 @@ class InsertResult:
 class EvictParams:
     """Unified parameters for evict across different cache types"""
 
-    num_tokens: int
+    num_tokens: int = 0
     swa_num_tokens: int = 0
     mamba_num: int = 0
 
@@ -261,6 +261,27 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
 
     def supports_mamba(self) -> bool:
         return False
+
+    def supports_streaming_session(self) -> bool:
+        return False
+
+    def release_session(self, session_id: str) -> None:
+        pass
+
+    def session_held_tokens(self, active_pool_idxs: Optional[set] = None) -> int:
+        return 0
+
+    def session_held_full_tokens(self, active_pool_idxs: Optional[set] = None) -> int:
+        return 0
+
+    def session_held_swa_tokens(self, active_pool_idxs: Optional[set] = None) -> int:
+        return 0
+
+    def session_held_req_count(self, active_pool_idxs: Optional[set] = None) -> int:
+        return 0
+
+    def session_held_mamba_slots(self, active_pool_idxs: Optional[set] = None) -> int:
+        return 0
 
     def is_chunk_cache(self) -> bool:
         return False

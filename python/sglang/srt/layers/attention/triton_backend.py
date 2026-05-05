@@ -395,9 +395,9 @@ class TritonAttnBackend(AttentionBackend):
             kv_indices = kv_indices.to(torch.int64)
             mask_indptr = None
             # TODO(FIXME): This will trigger an invalid Eagle tree when using
-            # `max(spec_info.accept_length_cpu)`.
+            # `max(spec_info.num_accepted_tokens_cpu)`.
             # It might have been forgotten to update somewhere.
-            max_extend_len = torch.max(spec_info.accept_length).item()
+            max_extend_len = torch.max(spec_info.num_accepted_tokens).item()
             num_kv_splits = None
             attn_logits = None
             attn_lse = None
@@ -646,7 +646,13 @@ class TritonAttnBackend(AttentionBackend):
                 )
 
             custom_mask = self.cuda_graph_custom_mask
-            custom_mask[: spec_info.custom_mask.shape[0]] = spec_info.custom_mask
+            if (
+                spec_info is not None
+                and getattr(spec_info, "custom_mask", None) is not None
+            ):
+                custom_mask[: spec_info.custom_mask.shape[0]] = spec_info.custom_mask
+            else:
+                custom_mask = None
             seq_mask_len = self.num_draft_tokens * (seq_lens + self.num_draft_tokens)
             mask_indptr = self.mask_indptr[: bs + 1]
             mask_indptr[1 : bs + 1] = torch.cumsum(seq_mask_len, dim=0)
@@ -798,7 +804,13 @@ class TritonAttnBackend(AttentionBackend):
                     )
                 )
             custom_mask = self.cuda_graph_custom_mask
-            custom_mask[: spec_info.custom_mask.shape[0]] = spec_info.custom_mask
+            if (
+                spec_info is not None
+                and getattr(spec_info, "custom_mask", None) is not None
+            ):
+                custom_mask[: spec_info.custom_mask.shape[0]] = spec_info.custom_mask
+            else:
+                custom_mask = None
             seq_mask_len = self.num_draft_tokens * (seq_lens + self.num_draft_tokens)
             mask_indptr = self.mask_indptr[: bs + 1]
             mask_indptr[1 : bs + 1] = torch.cumsum(seq_mask_len, dim=0)

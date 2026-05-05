@@ -141,6 +141,7 @@ class CommonKVManager(BaseKVManager):
             )
             self.register_to_bootstrap()
             self.transfer_infos = {}
+            self.req_to_decode_prefix_len: Dict[int, int] = {}
             self.decode_kv_args_table = {}
             self.pp_group = get_pp_group()
             # If a timeout happens on the prefill side, it means prefill instances
@@ -179,6 +180,12 @@ class CommonKVManager(BaseKVManager):
         return self.request_status[bootstrap_room]
 
     def update_status(self, bootstrap_room: int, status: KVPoll):
+        if (
+            status == KVPoll.Failed
+            and self.disaggregation_mode == DisaggregationMode.PREFILL
+            and hasattr(self, "req_to_decode_prefix_len")
+        ):
+            self.req_to_decode_prefix_len.pop(bootstrap_room, None)
         if bootstrap_room not in self.request_status:
             self.request_status[bootstrap_room] = status
         else:
@@ -443,11 +450,28 @@ class CommonKVSender(BaseKVSender):
             return
 
         self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Bootstrapping)
-        if (
-            self.kv_mgr.server_args.dp_size > 1
-            and self.kv_mgr.server_args.load_balance_method != "follow_bootstrap_room"
-        ):
-            self._register_prefill_dp_rank()
+        if self.kv_mgr.server_args.dp_size > 1:
+            if self.kv_mgr.server_args.load_balance_method != "follow_bootstrap_room":
+                self._register_prefill_dp_rank()
+            elif (
+                self.kv_mgr.attn_dp_rank
+                != self.bootstrap_room % self.kv_mgr.server_args.dp_size
+            ):
+                # follow_bootstrap_room was overridden by external routed_dp_rank
+                if envs.SGLANG_DISAGGREGATION_FORCE_QUERY_PREFILL_DP_RANK.get():
+                    self._register_prefill_dp_rank()
+                else:
+                    self.kv_mgr.record_failure(
+                        self.bootstrap_room,
+                        f"follow_bootstrap_room conflict: dispatched to dp_rank "
+                        f"{self.kv_mgr.attn_dp_rank} but bootstrap_room "
+                        f"{self.bootstrap_room} implies dp_rank "
+                        f"{self.bootstrap_room % self.kv_mgr.server_args.dp_size}. "
+                        f"Set SGLANG_DISAGGREGATION_FORCE_QUERY_PREFILL_DP_RANK=1 "
+                        f"to allow mixed routing.",
+                    )
+                    self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
+                    return
 
     def _register_prefill_dp_rank(self):
         """Register this request's prefill dp_rank to the bootstrap server."""
@@ -471,6 +495,12 @@ class CommonKVSender(BaseKVSender):
         logger.debug(
             f"CommonKVSender init with num_kv_indices: {num_kv_indices} and aux_index: {aux_index}"
         )
+
+    def pop_decode_prefix_len(self) -> int:
+        return 0
+
+    def should_send_kv_chunk(self, num_pages: int, last_chunk: bool) -> bool:
+        return num_pages > 0
 
     def send(
         self,
