@@ -48,6 +48,71 @@ class TestServerArgsPathExpansion(unittest.TestCase):
             args.component_paths["vae"], os.path.expanduser("~/fake/local/vae")
         )
 
+    def test_component_attention_backends_are_normalized(self):
+        args = self._from_dict_without_model_resolution(
+            {
+                "model_path": "/data/my-model",
+                "component_attention_backends": "text-encoder=torch_sdpa,transformer=fa3",
+            }
+        )
+
+        self.assertEqual(
+            args.component_attention_backends,
+            {"text_encoder": "torch_sdpa", "transformer": "fa"},
+        )
+
+    def test_component_attention_backend_lookup(self):
+        args = self._from_dict_without_model_resolution(
+            {
+                "model_path": "/data/my-model",
+                "component_attention_backends": {"text_encoder": "torch_sdpa"},
+            }
+        )
+
+        backend, matched_key = args.resolve_component_attention_backend(
+            "text_encoder", "transformer"
+        )
+
+        self.assertEqual(backend.name, "TORCH_SDPA")
+        self.assertEqual(matched_key, "text_encoder")
+
+    def test_invalid_component_attention_backend_raises(self):
+        with self.assertRaises(ValueError):
+            self._from_dict_without_model_resolution(
+                {
+                    "model_path": "/data/my-model",
+                    "component_attention_backends": {"text_encoder": "bad_backend"},
+                }
+            )
+        with self.assertRaises(ValueError):
+            self._from_dict_without_model_resolution(
+                {
+                    "model_path": "/data/my-model",
+                    "component_attention_backends": "text_encoder",
+                }
+            )
+
+    def test_dynamic_component_attention_backend_cli_args(self):
+        parser = FlexibleArgumentParser()
+        ServerArgs.add_cli_args(parser)
+        argv = [
+            "--model-path",
+            "/fake",
+            "--component-attention-backends.text-encoder",
+            "torch_sdpa",
+        ]
+
+        with patch.object(sys, "argv", ["sglang"] + argv):
+            args, unknown_args = parser.parse_known_args(argv)
+            with patch.object(
+                PipelineConfig, "from_kwargs", return_value=QwenImagePipelineConfig()
+            ):
+                server_args = ServerArgs.from_cli_args(args, unknown_args)
+
+        self.assertEqual(
+            server_args.component_attention_backends, {"text_encoder": "torch_sdpa"}
+        )
+
 
 class TestOffloadDefaults(unittest.TestCase):
     def _from_dict_with_task_type(

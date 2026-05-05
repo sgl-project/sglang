@@ -39,6 +39,7 @@ from sglang.srt.disaggregation.utils import (
     is_mla_backend,
     poll_and_all_reduce_attn_cp_tp_group,
     prepare_abort,
+    setup_state_kv_args,
 )
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import (
@@ -176,44 +177,7 @@ class PrefillBootstrapQueue:
         kv_args.ib_device = self.scheduler.server_args.disaggregation_ib_device
         kv_args.gpu_id = self.scheduler.gpu_id
 
-        if hasattr(self.token_to_kv_pool, "get_state_buf_infos"):
-            state_data_ptrs, state_data_lens, state_item_lens = (
-                self.token_to_kv_pool.get_state_buf_infos()
-            )
-            kv_args.state_data_ptrs = state_data_ptrs
-            kv_args.state_data_lens = state_data_lens
-            kv_args.state_item_lens = state_item_lens
-
-            if isinstance(self.token_to_kv_pool, SWAKVPool):
-                kv_args.state_type = "swa"
-            elif isinstance(self.token_to_kv_pool, HybridLinearKVPool):
-                kv_args.state_type = "mamba"
-                # Get state dimension info for cross-TP slice transfer
-                if hasattr(self.token_to_kv_pool, "get_state_dim_per_tensor"):
-                    kv_args.state_dim_per_tensor = (
-                        self.token_to_kv_pool.get_state_dim_per_tensor()
-                    )
-            elif isinstance(self.token_to_kv_pool, NSATokenToKVPool):
-                kv_args.state_type = "nsa"
-                if self.draft_token_to_kv_pool is not None and isinstance(
-                    self.draft_token_to_kv_pool, NSATokenToKVPool
-                ):
-                    (
-                        draft_state_data_ptrs,
-                        draft_state_data_lens,
-                        draft_state_item_lens,
-                    ) = self.draft_token_to_kv_pool.get_state_buf_infos()
-                    kv_args.state_data_ptrs += draft_state_data_ptrs
-                    kv_args.state_data_lens += draft_state_data_lens
-                    kv_args.state_item_lens += draft_state_item_lens
-
-            else:
-                kv_args.state_type = "none"
-        else:
-            kv_args.state_data_ptrs = []
-            kv_args.state_data_lens = []
-            kv_args.state_item_lens = []
-            kv_args.state_type = "none"
+        setup_state_kv_args(kv_args, self.token_to_kv_pool, self.draft_token_to_kv_pool)
 
         kv_manager_class = get_kv_class(self.transfer_backend, KVClassType.MANAGER)
         kv_manager = kv_manager_class(

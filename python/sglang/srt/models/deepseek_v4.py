@@ -563,7 +563,8 @@ class Compressor(nn.Module):
         ).sum(dim=1)
         self.print_tensor(kv_compressed, "kv_before_norm")
         if self.use_hip_fused_compress:
-            freqs_cis = self.freqs_cis[(seq_lens - 1) // self.ratio * self.ratio]
+            # HIP-only: share the per-step freqs_cis gather across layers.
+            freqs_cis = self._init_freqs_cis_per_decode_step(forward_batch, seq_lens)
             fused_norm_rope_inplace_triton(
                 kv_compressed, self.norm.weight, self.norm.eps, freqs_cis
             )
@@ -789,7 +790,8 @@ class Compressor(nn.Module):
         ).sum(dim=1)
         self.print_tensor(kv_compressed, "kv_before_norm")
         if self.use_hip_fused_compress:
-            freqs_cis = self.freqs_cis[(seq_lens - 1) // self.ratio * self.ratio]
+            # HIP-only: share the per-step freqs_cis gather across layers.
+            freqs_cis = self._init_freqs_cis_per_decode_step(forward_batch, seq_lens)
             fused_norm_rope_inplace_triton(
                 kv_compressed, self.norm.weight, self.norm.eps, freqs_cis
             )
@@ -1030,6 +1032,19 @@ class Compressor(nn.Module):
 
         return compressed_kv_output
 
+    def _init_freqs_cis_per_decode_step(
+        self,
+        forward_batch: ForwardBatch,
+        seq_lens: torch.Tensor,
+    ) -> torch.Tensor:
+        attr = f"freqs_cis_c{self.ratio}"
+        cached = getattr(forward_batch, attr, None)
+        if cached is not None:
+            return cached
+        decoded = self.freqs_cis[(seq_lens - 1) // self.ratio * self.ratio]
+        setattr(forward_batch, attr, decoded)
+        return decoded
+
     def compress_decode_old(
         self,
         kv_and_scores: KVAndScore,
@@ -1052,8 +1067,8 @@ class Compressor(nn.Module):
                 pool_kv=kv_and_score_states_pool.kv,
                 kv_score_input_kv=kv_and_scores.kv,
                 ape=self.ape,
-                seq_lens=seq_lens.to(torch.int32),
-                req_pool_indices=req_pool_indices.to(torch.int32),
+                seq_lens=seq_lens,
+                req_pool_indices=req_pool_indices,
                 head_dim=self.head_dim,
             )
         elif self.use_hip_fused_compress and self.ratio == 128 and not self.overlap:
@@ -1065,8 +1080,8 @@ class Compressor(nn.Module):
                 pool_kv=kv_and_score_states_pool.kv,
                 kv_score_input_kv=kv_and_scores.kv,
                 ape=self.ape,
-                seq_lens=seq_lens.to(torch.int32),
-                req_pool_indices=req_pool_indices.to(torch.int32),
+                seq_lens=seq_lens,
+                req_pool_indices=req_pool_indices,
                 head_dim=self.head_dim,
             )
         else:
@@ -1127,7 +1142,8 @@ class Compressor(nn.Module):
             ).sum(dim=1)
         self.print_tensor(kv_compressed, "kv_before_norm")
         if self.use_hip_fused_compress:
-            freqs_cis = self.freqs_cis[(seq_lens - 1) // self.ratio * self.ratio]
+            # HIP-only: share the per-step freqs_cis gather across layers.
+            freqs_cis = self._init_freqs_cis_per_decode_step(forward_batch, seq_lens)
             fused_norm_rope_inplace_triton(
                 kv_compressed, self.norm.weight, self.norm.eps, freqs_cis
             )
@@ -2204,6 +2220,11 @@ class DeepseekV4Model(nn.Module):
         if nsa_use_prefill_cp(forward_batch):
             hidden_states = cp_split_and_rebuild_data(forward_batch, hidden_states)
             positions = cp_split_and_rebuild_position(forward_batch, positions)
+
+        # Reset Compressor's per-step freqs_cis cache from any previous step.
+        for _attr in ("freqs_cis_c4", "freqs_cis_c128"):
+            if hasattr(forward_batch, _attr):
+                delattr(forward_batch, _attr)
 
         for i in range(self.start_layer, self.end_layer):
             # TODO: ctx?
