@@ -7,6 +7,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.base import (
     ModelTaskType,
     PipelineConfig,
 )
+from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import LTX2PipelineConfig
 from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
     QwenImagePipelineConfig,
 )
@@ -112,6 +113,25 @@ class TestServerArgsPathExpansion(unittest.TestCase):
         self.assertEqual(
             server_args.component_attention_backends, {"text_encoder": "torch_sdpa"}
         )
+
+    def test_ltx2_text_encoder_uses_sdpa_component_backend(self):
+        with patch.object(
+            PipelineConfig, "from_kwargs", return_value=LTX2PipelineConfig()
+        ):
+            args = ServerArgs.from_dict(
+                {
+                    "model_path": "/data/LTX-2.3",
+                    "component_attention_backends": {
+                        "text_encoder": "fa",
+                        "transformer": "fa",
+                    },
+                }
+            )
+
+        self.assertEqual(
+            args.component_attention_backends["text_encoder"], "torch_sdpa"
+        )
+        self.assertEqual(args.component_attention_backends["transformer"], "fa")
 
 
 class TestOffloadDefaults(unittest.TestCase):
