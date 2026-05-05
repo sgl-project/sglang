@@ -319,7 +319,11 @@ class MultiHttpWorkerDetokenizerMixin:
 
 
 class MultiTokenizerRouter:
-    """A router to receive requests from TokenizerWorker"""
+    """A router between tokenizer workers and the scheduler/detokenizer.
+
+    Forward: workers → router → scheduler. Backward: detokenizer → router → workers.
+    Also broadcasts pause/continue to all workers for consistent is_pause state.
+    """
 
     def __init__(
         self,
@@ -343,22 +347,21 @@ class MultiTokenizerRouter:
         self._task = asyncio.run_coroutine_threadsafe(
             self.router_worker_obj(), self._loop
         )
-        # Start handle_loop simultaneously
         self._handle_task = asyncio.run_coroutine_threadsafe(
             print_exception_wrapper(self.handle_loop), self._loop
         )
         self.disaggregation_bootstrap_server = start_disagg_service(self.server_args)
 
-        # Registered worker IPC names for broadcasting
+        # Worker IPC names for pause/continue broadcasting
         self.all_worker_ipcs: list[str] = []
-        # Shared socket mapping used by both router_worker_obj (broadcast) and
-        # handle_loop (response routing). Safe because both run on self._loop.
+        # Shared socket mapping (both coroutines run on self._loop, so safe)
         self.socket_mapping = SocketMapping()
 
     def _run_loop(self):
         self._loop.run_forever()
 
     async def router_worker_obj(self):
+        """Forward path: workers → scheduler, with pause/continue broadcast."""
         while True:
             recv_obj = await self.receive_from_worker.recv_pyobj()
 
@@ -373,13 +376,13 @@ class MultiTokenizerRouter:
             if isinstance(
                 recv_obj, (PauseGenerationReqInput, ContinueGenerationReqInput)
             ):
-                # Broadcast to all workers
+                # Broadcast to ALL workers so every worker's is_pause is set
                 is_pause = isinstance(recv_obj, PauseGenerationReqInput)
                 broadcast = PauseContinueBroadcast(is_pause=is_pause)
                 for ipc_name in self.all_worker_ipcs:
                     self.socket_mapping.send_output(ipc_name, broadcast)
-                # Forward to scheduler (except abort mode, which drains
-                # in-flight requests via abort_request polling instead)
+                # Forward to scheduler rank 0 (it broadcasts to all TP/PP/DP
+                # ranks internally). Skip for abort mode which drains via polling.
                 if not (
                     isinstance(recv_obj, PauseGenerationReqInput)
                     and recv_obj.mode == "abort"
@@ -390,12 +393,12 @@ class MultiTokenizerRouter:
             await self.send_to_scheduler.send_pyobj(recv_obj)
 
     async def handle_loop(self):
+        """Backward path: detokenizer → route results to correct worker."""
         while True:
             recv_obj = await self.recv_from_detokenizer.recv_pyobj()
             await self._distribute_result_to_workers(recv_obj)
 
     async def _distribute_result_to_workers(self, recv_obj):
-        # Distribute result to each worker
         if isinstance(recv_obj, BaseReq):
             ipc_names = [recv_obj.http_worker_ipc]
         elif isinstance(recv_obj, BaseBatchReq):
