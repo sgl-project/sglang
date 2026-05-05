@@ -128,13 +128,6 @@ class SchedulerOutputProcessorMixin:
             req_to_token_pool=self.req_to_token_pool,
         )
 
-    def maybe_collect_indexer_topk(self: Scheduler, req: Req):
-        req.indexer_topk = get_global_indexer_capturer().get_topk(
-            req_pool_idx=req.req_pool_idx,
-            seqlen=req.seqlen,
-            req_to_token_pool=self.req_to_token_pool,
-        )
-
     def maybe_collect_customized_info(
         self: Scheduler, i: int, req: Req, logits_output: LogitsProcessorOutput
     ):
