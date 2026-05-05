@@ -33,7 +33,7 @@ def _load_fa3_kernels():
     # which is expected to be more stable and compatible
     if envs.SGLANG_USE_SGL_FA3_KERNEL.get():
         logger.debug(
-            f"SGLANG_USE_SGL_FA3_KERNEL=True, use sgl-kernel implementation for FlashAttention v3 "
+            "SGLANG_USE_SGL_FA3_KERNEL=True, use sgl-kernel implementation for FlashAttention v3 "
         )
         return _load_fa3_kernel_from_sgl()
 
