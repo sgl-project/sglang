@@ -1,6 +1,8 @@
 import logging
 from typing import Optional
 
+import torch
+
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.layers.topk_capturer_base import BaseTopkCapturer
 
@@ -49,6 +51,21 @@ def get_global_indexer_capturer() -> Optional[IndexerTopkCapturer]:
 def set_global_indexer_capturer(capturer: Optional[IndexerTopkCapturer]):
     global _global_indexer_capturer
     _global_indexer_capturer = capturer
+
+
+def maybe_capture_indexer_topk(
+    layer_id: int, topk_indices: Optional[torch.Tensor]
+) -> Optional[torch.Tensor]:
+    """Capture topk for layer_id if a capturer is set; pass through unchanged.
+
+    Works in both expression context (`return maybe_capture_indexer_topk(...)`)
+    and statement context (call for side-effect, ignore return).
+    """
+    if topk_indices is None:
+        return None
+    if (cap := get_global_indexer_capturer()) is not None:
+        cap.capture(layer_id=layer_id, topk_indices=topk_indices)
+    return topk_indices
 
 
 def create_indexer_capturer(

@@ -13,7 +13,7 @@ from sglang.jit_kernel.fused_store_index_cache import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.indexer_topk_capturer import (
-    get_global_indexer_capturer,
+    maybe_capture_indexer_topk,
 )
 from sglang.srt.layers.dp_attention import attn_tp_all_gather_into_tensor
 from sglang.srt.layers.layernorm import LayerNorm
@@ -1124,7 +1124,7 @@ class Indexer(MultiPlatformOp):
 
         # Optimization: fast path when skipping topk computation
         if skip_logits_computation and (not self.nsa_enable_prefill_cp):
-            return self._maybe_capture_topk(
+            return maybe_capture_indexer_topk(
                 layer_id,
                 self._forward_cuda_k_only(
                     x,
@@ -1233,7 +1233,7 @@ class Indexer(MultiPlatformOp):
                 #     print(
                 #         "HACK: seq_lens empty but x not empty, hackily return all-invalid topk_result"
                 #     )
-                return self._maybe_capture_topk(
+                return maybe_capture_indexer_topk(
                     layer_id,
                     torch.full(
                         (x_meta.shape[0], self.index_topk),
@@ -1290,7 +1290,7 @@ class Indexer(MultiPlatformOp):
                         kv_len_next,
                         actual_seq_q_next,
                     )
-                    return self._maybe_capture_topk(
+                    return maybe_capture_indexer_topk(
                         layer_id,
                         torch.cat([topk_result_prev, topk_result_next], dim=0),
                     )
@@ -1311,17 +1311,7 @@ class Indexer(MultiPlatformOp):
                 topk=self.index_topk,
                 layer_id=layer_id,
             )
-        return self._maybe_capture_topk(layer_id, topk_result)
-
-    def _maybe_capture_topk(
-        self, layer_id: int, topk_result: Optional[torch.Tensor]
-    ) -> Optional[torch.Tensor]:
-        # MHA fast path returns None (no topk indices computed); pass through.
-        if topk_result is None:
-            return None
-        if (cap := get_global_indexer_capturer()) is not None:
-            cap.capture(layer_id=layer_id, topk_indices=topk_result)
-        return topk_result
+        return maybe_capture_indexer_topk(layer_id, topk_result)
 
     def forward_npu(
         self,
