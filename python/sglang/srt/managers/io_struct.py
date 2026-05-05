@@ -177,6 +177,7 @@ class GenerateReqInput(BaseReq):
     return_hidden_states: Union[List[bool], bool] = False
     # Whether to return captured routed experts
     return_routed_experts: bool = False
+    return_indexer_topk: bool = False
     # The start location in the prompt for returning routed experts.
     routed_experts_start_len: int = 0
 
@@ -653,6 +654,7 @@ class GenerateReqInput(BaseReq):
                 else self.return_hidden_states
             ),
             return_routed_experts=self.return_routed_experts,
+            return_indexer_topk=self.return_indexer_topk,
             modalities=self.modalities[i] if self.modalities else None,
             session_params=self.session_params,
             lora_path=self.lora_path[i] if self.lora_path is not None else None,
@@ -730,6 +732,8 @@ class TokenizedGenerateReqInput(BaseReq):
     return_routed_experts: bool = False
     # The start location in the prompt for returning routed experts.
     routed_experts_start_len: int = 0
+
+    return_indexer_topk: bool = False
 
     # The input embeds
     input_embeds: Optional[Union[List[List[List[float]]], List[List[float]]]] = None
@@ -1107,6 +1111,8 @@ class BatchTokenIDOutput(BaseBatchReq, SpeculativeDecodingMetricsMixin):
     # straight to TokenizerManager, which encodes on demand.
     routed_experts: List[Optional[torch.Tensor]]
 
+    indexer_topk: List[Optional[torch.Tensor]]
+
     # The information of placeholder tokens (e.g., image token)
     # idx is the index of the token in the prompt after expansion.
     # val is the length of padded tokens after expansion.
@@ -1169,6 +1175,8 @@ class BatchStrOutput(BaseBatchReq, SpeculativeDecodingMetricsMixin):
     # tokenizer hot path. Underlying tensor shape is (token, layer, top_k);
     # see BatchTokenIDOutput.routed_experts.
     routed_experts: List[Optional[str]]
+
+    indexer_topk: List[Optional[str]]
 
     # The information of placeholder tokens (e.g., image token)
     # idx is the index of the token in the prompt after expansion.
@@ -1371,6 +1379,20 @@ class PauseGenerationReqInput(BaseReq):
 @dataclass
 class ContinueGenerationReqInput(BaseReq):
     pass
+
+
+@dataclass
+class TokenizerWorkerRegisterReq:
+    """Sent by each TokenizerWorker on startup to register its IPC name with the router."""
+
+    worker_ipc_name: str
+
+
+@dataclass
+class PauseContinueBroadcast:
+    """Broadcast from router to all workers to set is_pause state."""
+
+    is_pause: bool
 
 
 @dataclass
