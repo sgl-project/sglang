@@ -123,7 +123,7 @@ class PyMscclppCommunicator:
         if self.world_size == 8:
             self.algos_config = self._create_native_algorithms()
             self._tune(5, 10, 20, self.algos_config)
-        elif self.world_size == 16 or self.world_size == 32:
+        elif self.world_size == 16 or self.world_size == 32 or self.world_size == 64:
             self.dsl_algos_config = self._create_dsl_algorithms()
             self._tune(5, 10, 20, self.dsl_algos_config)
 
@@ -218,6 +218,7 @@ class PyMscclppCommunicator:
                                 best_time = avg_time
                                 best_config = (algo, nb, nt)
             if best_config:
+                print(f"Best config for size {size}: {best_config[0].__name__}, nblocks: {best_config[1]}, nthreads: {best_config[2]}")
                 self.best_configs[size] = best_config
 
         torch.cuda.synchronize()
