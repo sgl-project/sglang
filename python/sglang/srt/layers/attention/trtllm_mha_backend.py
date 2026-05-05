@@ -528,15 +528,33 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             metadata.cu_seqlens_k[1:].copy_(
                 torch.cumsum(metadata.cache_seqlens_int32, dim=0, dtype=torch.int32)
             )
-            extend_lens = spec_info.num_accepted_tokens[:bs]
-            if spec_info.num_accepted_tokens_cpu:
-                metadata.max_seq_len_q = max(spec_info.num_accepted_tokens_cpu)
+            if forward_mode.is_draft_extend_v2():
+                num_tokens_per_bs = (
+                    spec_info.num_tokens_per_req
+                    if getattr(spec_info, "num_tokens_per_req", None) is not None
+                    and spec_info.num_tokens_per_req > 0
+                    else self.speculative_num_draft_tokens
+                )
+                metadata.max_seq_len_q = num_tokens_per_bs
+                metadata.cu_seqlens_q[1:].copy_(
+                    torch.arange(
+                        num_tokens_per_bs,
+                        bs * num_tokens_per_bs + 1,
+                        num_tokens_per_bs,
+                        dtype=torch.int32,
+                        device=metadata.cu_seqlens_q.device,
+                    )
+                )
             else:
-                metadata.max_seq_len_q = 1
+                extend_lens = spec_info.num_accepted_tokens[:bs]
+                if spec_info.num_accepted_tokens_cpu:
+                    metadata.max_seq_len_q = max(spec_info.num_accepted_tokens_cpu)
+                else:
+                    metadata.max_seq_len_q = 1
 
-            metadata.cu_seqlens_q[1:].copy_(
-                torch.cumsum(extend_lens, dim=0, dtype=torch.int32)
-            )
+                metadata.cu_seqlens_q[1:].copy_(
+                    torch.cumsum(extend_lens, dim=0, dtype=torch.int32)
+                )
 
             max_seq_pages = (
                 metadata.max_seq_len_k + self.page_size - 1
