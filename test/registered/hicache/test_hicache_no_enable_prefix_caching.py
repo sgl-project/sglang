@@ -201,6 +201,7 @@ class TestHiCacheNoEnablePrefixCaching(CustomTestCase):
             str(200 if is_hip() else 100),
             "--page-size",
             str(PAGE_SIZE),
+            # enable detailed cache events for testing
             "--enable-cache-report",
             "--max-running-requests",
             "8",
