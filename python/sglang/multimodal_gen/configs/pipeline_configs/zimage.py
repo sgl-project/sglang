@@ -14,6 +14,8 @@ from sglang.multimodal_gen.configs.models.vaes.flux import FluxVAEConfig
 from sglang.multimodal_gen.configs.pipeline_configs.base import (
     ImagePipelineConfig,
     ModelTaskType,
+    TextConditioningOutput,
+    pad_text_embeddings_with_mask,
 )
 from sglang.multimodal_gen.configs.post_training.pipeline_configs import (
     ZImageRolloutPipelineMixin,
@@ -32,10 +34,24 @@ def zimage_preprocess_text(prompt: str):
     return messages
 
 
-def zimage_postprocess_text(outputs: BaseEncoderOutput, _text_inputs) -> torch.Tensor:
+def zimage_postprocess_text(
+    outputs: BaseEncoderOutput, _text_inputs
+) -> torch.Tensor | TextConditioningOutput:
+    """Return unpadded Z-Image text embeddings.
+
+    Batched outputs return TextConditioningOutput to preserve per-prompt text
+    lengths.
+    """
     device = outputs.hidden_states[-2].device
     prompt_mask = _text_inputs.attention_mask.to(device).bool()
-    return outputs.hidden_states[-2][0][prompt_mask[0]]
+    hidden_states = outputs.hidden_states[-2]
+    if hidden_states.shape[0] == 1:
+        return hidden_states[0][prompt_mask[0]]
+
+    split_hidden_states = [
+        hidden_states[idx][prompt_mask[idx]] for idx in range(hidden_states.shape[0])
+    ]
+    return pad_text_embeddings_with_mask(split_hidden_states)
 
 
 class TransformersModelConfig(EncoderConfig):
@@ -177,8 +193,72 @@ class ZImagePipelineConfig(ZImageRolloutPipelineMixin, ImagePipelineConfig):
             plan = self._build_zimage_sp_plan(batch)
         return plan
 
+    def _split_text_embeds_for_dit(self, batch, *, negative: bool = False):
+        """Return per-request text tensors, trimming padded batched embeddings."""
+        embeds = batch.negative_prompt_embeds if negative else batch.prompt_embeds
+        if embeds is None:
+            return None
+
+        if isinstance(embeds, (list, tuple)):
+            if not embeds:
+                return []
+            embeds = embeds[0]
+
+        if not torch.is_tensor(embeds):
+            return embeds
+
+        if embeds.ndim == 2:
+            return [embeds]
+
+        if embeds.ndim != 3:
+            raise ValueError(
+                "Z-Image text embeddings must have shape [seq, dim] or [batch, seq, dim]"
+            )
+
+        seq_lens = self.require_text_seq_lens(
+            batch,
+            0,
+            negative=negative,
+            expected_batch_size=int(embeds.shape[0]),
+        )
+        return [
+            embeds[idx, :seq_len].contiguous() for idx, seq_len in enumerate(seq_lens)
+        ]
+
+    def _caption_rope_length(self, prompt_embeds, batch, *, negative: bool = False):
+        """Return the shared caption RoPE length for current text embeddings."""
+        if torch.is_tensor(prompt_embeds):
+            if prompt_embeds.ndim == 2:
+                return int(prompt_embeds.shape[0])
+            if prompt_embeds.ndim == 3:
+                seq_lens = self.require_text_seq_lens(
+                    batch,
+                    0,
+                    negative=negative,
+                    expected_batch_size=int(prompt_embeds.shape[0]),
+                )
+                return max(seq_lens) if seq_lens else int(prompt_embeds.shape[1])
+
+        if isinstance(prompt_embeds, (list, tuple)) and prompt_embeds:
+            first = prompt_embeds[0]
+            if torch.is_tensor(first):
+                if first.ndim == 3:
+                    seq_lens = self.require_text_seq_lens(
+                        batch,
+                        0,
+                        negative=negative,
+                        expected_batch_size=int(first.shape[0]),
+                    )
+                    return max(seq_lens) if seq_lens else int(first.shape[1])
+                return max(int(item.shape[0]) for item in prompt_embeds)
+
+        raise ValueError("Unable to infer Z-Image caption length for rotary embeddings")
+
     def get_pos_prompt_embeds(self, batch):
-        return batch.prompt_embeds
+        return self._split_text_embeds_for_dit(batch, negative=False)
+
+    def get_neg_prompt_embeds(self, batch):
+        return self._split_text_embeds_for_dit(batch, negative=True)
 
     def get_latent_dtype(self, prompt_dtype: torch.dtype) -> torch.dtype:
         # Match the official diffusers Z-Image pipeline, which samples latents in fp32
@@ -252,7 +332,23 @@ class ZImagePipelineConfig(ZImageRolloutPipelineMixin, ImagePipelineConfig):
             return latents[:, :, 0, :, :]
         return latents.view(bs, channels, height, width)
 
-    def get_freqs_cis(self, prompt_embeds, width, height, device, rotary_emb, batch):
+    def get_freqs_cis(
+        self,
+        prompt_embeds,
+        width,
+        height,
+        device,
+        rotary_emb,
+        batch,
+        *,
+        negative: bool = False,
+    ):
+        """Build caption and image RoPE caches for Z-Image conditioning.
+
+        Batched prompts use stored text lengths. SP mode builds image caches for
+        the local spatial shard.
+        """
+
         def create_coordinate_grid(size, start=None, device=None):
             if start is None:
                 start = (0 for _ in size)
@@ -269,7 +365,9 @@ class ZImagePipelineConfig(ZImageRolloutPipelineMixin, ImagePipelineConfig):
             # SP path: keep caption replicated on every rank and build local-only
             # image freqs_cis matching the spatial shard.
             plan = self._get_zimage_sp_plan(batch)
-            cap_ori_len = prompt_embeds.size(0)
+            cap_ori_len = self._caption_rope_length(
+                prompt_embeds, batch, negative=negative
+            )
             cap_padding_len = (-cap_ori_len) % self.SEQ_LEN_MULTIPLE
 
             # caption (replicated prefix)
@@ -304,7 +402,7 @@ class ZImagePipelineConfig(ZImageRolloutPipelineMixin, ImagePipelineConfig):
             x_freqs_cis = rotary_emb(img_pos_ids)
             return (cap_freqs_cis, x_freqs_cis)
 
-        cap_ori_len = prompt_embeds.size(0)
+        cap_ori_len = self._caption_rope_length(prompt_embeds, batch, negative=negative)
         cap_padding_len = (-cap_ori_len) % self.SEQ_LEN_MULTIPLE
         cap_padded_pos_ids = create_coordinate_grid(
             size=(cap_ori_len + cap_padding_len, 1, 1),
@@ -361,14 +459,21 @@ class ZImagePipelineConfig(ZImageRolloutPipelineMixin, ImagePipelineConfig):
         }
 
     def prepare_neg_cond_kwargs(self, batch, device, rotary_emb, dtype):
+        use_negative_embeds = batch.negative_prompt_embeds is not None
+        prompt_embeds = (
+            batch.negative_prompt_embeds[0]
+            if use_negative_embeds
+            else batch.prompt_embeds[0]
+        )
         return {
             "freqs_cis": self.get_freqs_cis(
-                batch.prompt_embeds[0],
+                prompt_embeds,
                 batch.width,
                 batch.height,
                 device,
                 rotary_emb,
                 batch,
+                negative=use_negative_embeds,
             ),
             "image_seq_len_target": (
                 self._get_zimage_sp_plan(batch)["img_seq_target"]
