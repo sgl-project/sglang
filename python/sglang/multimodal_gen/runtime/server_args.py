@@ -76,6 +76,14 @@ LTX2_TWO_STAGE_DEVICE_MODES = ("original", "snapshot", "resident")
 LTX2_TWO_STAGE_PIPELINE_NAMES = ("LTX2TwoStagePipeline", "LTX2TwoStageHQPipeline")
 # H200-class GPUs (>=130 GiB total) can usually keep both LTX2 DiTs resident.
 LTX2_RESIDENT_AUTO_ENABLE_MEM_GB = 130
+PERFORMANCE_MODES = ("auto", "throughput", "memory", "balanced")
+PERFORMANCE_MODE_ALIASES = {
+    "aggressive": "throughput",
+    "conservative": "memory",
+    "balance": "balanced",
+}
+QWEN_FSDP_CFG_MIN_AVAILABLE_MEM_GB = 70
+WAN_FSDP_CFG_MIN_AVAILABLE_MEM_GB = 40
 
 
 def _normalize_ltx2_two_stage_device_mode(mode: str | None) -> str | None:
@@ -147,6 +155,7 @@ class ServerArgs(DisaggArgsMixin):
 
     # Parallelism
     num_gpus: int = 1
+    performance_mode: str = "auto"
     tp_size: Optional[int] = None
     sp_degree: Optional[int] = None
     # sequence parallelism
@@ -194,7 +203,7 @@ class ServerArgs(DisaggArgsMixin):
     text_encoder_cpu_offload: bool | None = None
     image_encoder_cpu_offload: bool | None = None
     vae_cpu_offload: bool | None = False
-    use_fsdp_inference: bool = False
+    use_fsdp_inference: bool | None = None
     pin_cpu_memory: bool = True
     ltx2_two_stage_device_mode: str | None = None
 
@@ -313,6 +322,7 @@ class ServerArgs(DisaggArgsMixin):
 
     def _adjust_parameters(self):
         """set defaults and normalize values."""
+        self._adjust_performance_policy()
         self._adjust_offload()
         self._adjust_ltx2_two_stage_device_mode()
         self._adjust_path()
@@ -324,6 +334,7 @@ class ServerArgs(DisaggArgsMixin):
         self._adjust_attention_backend()
         self._adjust_platform_specific()
         self._adjust_autocast()
+        self._finalize_auto_flags()
         self.adjust_pipeline_config()
 
     def _validate_parameters(self):
@@ -357,6 +368,208 @@ class ServerArgs(DisaggArgsMixin):
         if resolution.transformer_weights_path:
             self.transformer_weights_path = resolution.transformer_weights_path
         self.nunchaku_config = resolution.nunchaku_config
+
+    def _normalize_performance_mode(self) -> str:
+        mode = (self.performance_mode or "auto").lower()
+        mode = PERFORMANCE_MODE_ALIASES.get(mode, mode)
+        if mode not in PERFORMANCE_MODES:
+            valid_modes = PERFORMANCE_MODES + tuple(PERFORMANCE_MODE_ALIASES)
+            raise ValueError(
+                f"Invalid performance_mode={self.performance_mode!r}. "
+                f"Expected one of {valid_modes}."
+            )
+        return mode
+
+    def _set_if_unset(self, attr: str, value: Any) -> bool:
+        if getattr(self, attr) is None:
+            setattr(self, attr, value)
+            return True
+        return False
+
+    def _set_gpu_resident_defaults(self, *, use_fsdp: bool) -> None:
+        changed = []
+        for attr, value in (
+            ("use_fsdp_inference", use_fsdp),
+            ("dit_cpu_offload", False),
+            ("dit_layerwise_offload", False),
+            ("text_encoder_cpu_offload", False),
+            ("image_encoder_cpu_offload", False),
+        ):
+            if self._set_if_unset(attr, value):
+                changed.append(f"{attr}={value}")
+
+        if changed:
+            logger.info(
+                "Applied GPU-resident performance defaults: %s", ", ".join(changed)
+            )
+
+    def _set_component_offload_defaults(self) -> None:
+        changed = []
+        for attr in (
+            "dit_cpu_offload",
+            "text_encoder_cpu_offload",
+            "image_encoder_cpu_offload",
+        ):
+            if self._set_if_unset(attr, True):
+                changed.append(f"{attr}=True")
+
+        if self._set_if_unset("use_fsdp_inference", False):
+            changed.append("use_fsdp_inference=False")
+
+        if changed:
+            logger.info(
+                "Applied low-memory component offload defaults: %s",
+                ", ".join(changed),
+            )
+
+    def _is_wan_or_mova_pipeline(self) -> bool:
+        pipeline_name_lower = self.pipeline_config.__class__.__name__.lower()
+        return "wan" in pipeline_name_lower or "mova" in pipeline_name_lower
+
+    def _is_qwen_or_wan_pipeline(self) -> bool:
+        pipeline_name_lower = self.pipeline_config.__class__.__name__.lower()
+        return "qwen" in pipeline_name_lower or "wan" in pipeline_name_lower
+
+    def _get_max_available_device_memory_gb(self) -> float | None:
+        if current_platform.is_cpu():
+            return None
+
+        available_memories = []
+        for device_id in range(
+            self.base_gpu_id, self.base_gpu_id + max(1, self.num_gpus)
+        ):
+            try:
+                available_memories.append(
+                    current_platform.get_available_gpu_memory(
+                        device_id=device_id,
+                        empty_cache=False,
+                    )
+                )
+            except Exception:
+                continue
+        if available_memories:
+            return max(available_memories)
+
+        try:
+            return (
+                current_platform.get_device_total_memory(self.base_gpu_id)
+                / BYTES_PER_GB
+            )
+        except Exception:
+            return None
+
+    def _has_explicit_memory_policy(self) -> bool:
+        return any(
+            getattr(self, attr) is not None
+            for attr in (
+                "use_fsdp_inference",
+                "dit_cpu_offload",
+                "dit_layerwise_offload",
+                "text_encoder_cpu_offload",
+                "image_encoder_cpu_offload",
+            )
+        )
+
+    def _has_explicit_parallel_policy(self) -> bool:
+        return any(
+            getattr(self, attr) is not None
+            for attr in (
+                "tp_size",
+                "sp_degree",
+                "ulysses_degree",
+                "ring_degree",
+                "enable_cfg_parallel",
+            )
+        )
+
+    def _supports_high_confidence_fsdp_cfg(self) -> bool:
+        return self._is_qwen_or_wan_pipeline() and self._model_default_uses_cfg()
+
+    def _min_available_memory_for_fsdp_cfg(self) -> float:
+        pipeline_name_lower = self.pipeline_config.__class__.__name__.lower()
+        if "qwen" in pipeline_name_lower:
+            return QWEN_FSDP_CFG_MIN_AVAILABLE_MEM_GB
+        if "wan" in pipeline_name_lower:
+            return WAN_FSDP_CFG_MIN_AVAILABLE_MEM_GB
+        return QWEN_FSDP_CFG_MIN_AVAILABLE_MEM_GB
+
+    def _has_enough_available_memory_for_fsdp_cfg(self) -> bool:
+        max_available_gb = self._get_max_available_device_memory_gb()
+        if max_available_gb is None:
+            return True
+
+        required_gb = self._min_available_memory_for_fsdp_cfg()
+        if max_available_gb < required_gb:
+            logger.info(
+                "Skipping automatic FSDP+CFG defaults: max available GPU memory %.2f GiB is below %.2f GiB for %s",
+                max_available_gb,
+                required_gb,
+                self.pipeline_config.__class__.__name__,
+            )
+            return False
+        return True
+
+    def _can_apply_fsdp_cfg_policy(self, *, require_memory_headroom: bool) -> bool:
+        if not self._supports_high_confidence_fsdp_cfg():
+            return False
+        return (
+            not require_memory_headroom
+            or self._has_enough_available_memory_for_fsdp_cfg()
+        )
+
+    def _adjust_performance_policy(self):
+        self.performance_mode = self._normalize_performance_mode()
+
+        if current_platform.is_cpu():
+            return
+
+        if self.performance_mode == "throughput":
+            logger.info("Applying performance_mode=throughput")
+            if self.num_gpus >= 2 and self._can_apply_fsdp_cfg_policy(
+                require_memory_headroom=False
+            ):
+                self._set_gpu_resident_defaults(use_fsdp=True)
+                self._set_if_unset("enable_cfg_parallel", True)
+            else:
+                self._set_gpu_resident_defaults(use_fsdp=False)
+            return
+
+        if self.performance_mode == "memory":
+            logger.info("Applying performance_mode=memory")
+            self._set_if_unset("use_fsdp_inference", False)
+            if (
+                self._is_wan_or_mova_pipeline()
+                and not envs.SGLANG_CACHE_DIT_ENABLED
+                and current_platform.enable_dit_layerwise_offload_for_wan_by_default()
+            ):
+                self._set_if_unset("dit_layerwise_offload", True)
+                self._set_if_unset("dit_cpu_offload", False)
+                self._set_if_unset("text_encoder_cpu_offload", True)
+                self._set_if_unset("image_encoder_cpu_offload", True)
+            else:
+                self._set_component_offload_defaults()
+            return
+
+        if self.performance_mode == "balanced":
+            logger.info("Applying performance_mode=balanced")
+            if self.num_gpus >= 2 and self._can_apply_fsdp_cfg_policy(
+                require_memory_headroom=True
+            ):
+                self._set_gpu_resident_defaults(use_fsdp=True)
+                self._set_if_unset("enable_cfg_parallel", True)
+            return
+
+        if (
+            self.num_gpus >= 2
+            and self._can_apply_fsdp_cfg_policy(require_memory_headroom=True)
+            and not self._has_explicit_memory_policy()
+            and not self._has_explicit_parallel_policy()
+        ):
+            logger.info(
+                "Automatically selecting FSDP+CFG defaults for multi-GPU Qwen/Wan CFG model"
+            )
+            self._set_gpu_resident_defaults(use_fsdp=True)
+            self.enable_cfg_parallel = True
 
     def adjust_pipeline_config(self):
         # enable parallel folding when SP is enabled
@@ -644,7 +857,7 @@ class ServerArgs(DisaggArgsMixin):
         ring_unspecified = self.ring_degree is None
         cfg_unspecified = self.enable_cfg_parallel is None
 
-        if current_platform.is_cpu() and self.tp_size > 1:
+        if current_platform.is_cpu() and (self.tp_size or 1) > 1:
             # CPU platform reuse num_gpus to represent num cpu numa nodes as devices
             self.num_gpus = self.tp_size
 
@@ -756,6 +969,10 @@ class ServerArgs(DisaggArgsMixin):
             if (
                 "wan" in pipeline_name_lower or "mova" in pipeline_name_lower
             ) and self.dit_layerwise_offload is None:
+                if self.use_fsdp_inference:
+                    self.dit_layerwise_offload = False
+                    return
+
                 auto_enable_layerwise_offload = (
                     current_platform.enable_dit_layerwise_offload_for_wan_by_default()
                 )
@@ -785,6 +1002,18 @@ class ServerArgs(DisaggArgsMixin):
     def _adjust_autocast(self):
         if self.disable_autocast is None:
             self.disable_autocast = not self.pipeline_config.enable_autocast
+
+    def _finalize_auto_flags(self):
+        if self.use_fsdp_inference is None:
+            self.use_fsdp_inference = False
+        if self.dit_cpu_offload is None:
+            self.dit_cpu_offload = False
+        if self.dit_layerwise_offload is None:
+            self.dit_layerwise_offload = False
+        if self.text_encoder_cpu_offload is None:
+            self.text_encoder_cpu_offload = False
+        if self.image_encoder_cpu_offload is None:
+            self.image_encoder_cpu_offload = False
 
     def _parse_attention_backend_config(self, config_str: str) -> dict[str, Any]:
         """parse attention backend config from string."""
@@ -929,6 +1158,22 @@ class ServerArgs(DisaggArgsMixin):
             type=int,
             default=ServerArgs.num_gpus,
             help="The number of GPUs to use.",
+        )
+        parser.add_argument(
+            "--performance-mode",
+            "--mode",
+            type=str,
+            choices=PERFORMANCE_MODES + tuple(PERFORMANCE_MODE_ALIASES),
+            default=ServerArgs.performance_mode,
+            help=(
+                "Preset for performance and memory defaults. "
+                "'auto' only applies high-confidence defaults; "
+                "'throughput' favors GPU-resident execution and may OOM; "
+                "'memory' favors lower GPU memory usage; "
+                "'balanced' prefers FSDP+CFG on validated multi-GPU Qwen/Wan CFG models. "
+                "Aliases: aggressive=throughput, conservative=memory, balance=balanced. "
+                "Explicit offload/FSDP/parallelism flags take precedence."
+            ),
         )
 
         parser.add_argument(
@@ -1506,6 +1751,8 @@ class ServerArgs(DisaggArgsMixin):
                 # For '--arg=value', this gets 'arg'; for '--arg', this also gets 'arg'.
                 arg_name = arg.split("=", 1)[0].replace("-", "_").lstrip("_")
                 provided_arg_names.add(arg_name)
+        if "mode" in provided_arg_names:
+            provided_arg_names.add("performance_mode")
 
         # Populate provided_args if the argument from the namespace was on the command line.
         for k, v in vars(args).items():

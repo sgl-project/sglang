@@ -79,6 +79,25 @@ def _make_param_like(
     return new_param
 
 
+def _get_param_for_weight_loading(
+    model: torch.nn.Module,
+    param_dict: dict[str, torch.nn.Parameter],
+    param_name: str,
+) -> torch.nn.Parameter | None:
+    actual_param = param_dict.get(param_name)
+    if actual_param is not None and getattr(actual_param, "weight_loader", None):
+        return actual_param
+
+    pre_fsdp_weight_loader_params = getattr(
+        model, "_pre_fsdp_weight_loader_params", {}
+    )
+    pre_fsdp_param = pre_fsdp_weight_loader_params.get(param_name)
+    if pre_fsdp_param is not None:
+        return pre_fsdp_param
+
+    return actual_param
+
+
 def _maybe_dequantize_fp8(
     full_tensor: torch.Tensor,
     target_dtype: torch.dtype,
@@ -161,6 +180,11 @@ def maybe_load_fsdp_model(
         logger.info("Disabling FSDP for MPS platform as it's not compatible")
 
     if use_fsdp:
+        model._pre_fsdp_weight_loader_params = {
+            n: p
+            for n, p in model.named_parameters()
+            if getattr(p, "weight_loader", None)
+        }
         world_size = hsdp_replicate_dim * hsdp_shard_dim
         if not fsdp_inference:
             hsdp_replicate_dim = world_size
@@ -393,7 +417,9 @@ def load_model_from_full_model_state_dict(
 
         if not hasattr(meta_sharded_param, "device_mesh"):
             full_tensor = full_tensor.to(device=device, dtype=target_dtype)
-            actual_param = param_dict.get(target_param_name)
+            actual_param = _get_param_for_weight_loading(
+                model, param_dict, target_param_name
+            )
             weight_loader = (
                 getattr(actual_param, "weight_loader", None)
                 if actual_param is not None
@@ -440,6 +466,38 @@ def load_model_from_full_model_state_dict(
                 sharded_tensor = sharded_tensor.cpu()
         else:
             full_tensor = full_tensor.to(device=device, dtype=target_dtype)
+            actual_param = _get_param_for_weight_loading(
+                model, param_dict, target_param_name
+            )
+            weight_loader = (
+                getattr(actual_param, "weight_loader", None)
+                if actual_param is not None
+                else None
+            )
+            if weight_loader is not None:
+                assert actual_param is not None
+                tp_sharded_tensor = torch.empty(
+                    tuple(actual_param.shape),
+                    device=device,
+                    dtype=target_dtype,
+                )
+                temp_param = _make_param_like(actual_param, tp_sharded_tensor)
+                if not (
+                    tp_sharded_tensor.is_floating_point()
+                    or tp_sharded_tensor.is_complex()
+                ):
+                    temp_param.requires_grad = False
+                try:
+                    weight_loader(temp_param, full_tensor)
+                except AssertionError as exc:
+                    raise AssertionError(
+                        "Failed to TP-shard/load FSDP parameter "
+                        f"{target_param_name}: full_tensor.shape={tuple(full_tensor.shape)}, "
+                        f"meta_sharded_param.shape={tuple(meta_sharded_param.shape)}, "
+                        f"temp_param.shape={tuple(temp_param.shape)}, "
+                        f"param_cls={type(actual_param).__name__}"
+                    ) from exc
+                full_tensor = temp_param.data
             sharded_tensor = distribute_tensor(
                 full_tensor,
                 meta_sharded_param.device_mesh,

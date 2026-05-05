@@ -794,13 +794,18 @@ class GPUWorker:
 OOM_MSG = f"""
 OOM detected. Possible solutions:
   - If the OOM occurs during loading:
-    1. Enable CPU offload for memory-intensive components, or use `--dit-layerwise-offload` for DiT
+    1. Check the maximum available memory on the selected GPU(s), not only total capacity.
+    2. For single-GPU deployment, use `--performance-mode memory`, component CPU offload,
+       or `--dit-layerwise-offload` for supported Wan/MOVA DiTs.
+    3. For multi-GPU deployment, use `--performance-mode balanced` or explicit
+       `--use-fsdp-inference true` to shard DiT weights with FSDP. FSDP is not a
+       single-GPU substitute for CPU offload.
   - If the OOM occurs during runtime:
-    1. Enable SP and/or TP (in a multi-GPU setup)
-    2. Reduce the number of output tokens by lowering resolution or decreasing `--num-frames`
-    3. Opt for a sparse-attention backend
-    4. Enable FSDP by `--use-fsdp-inference` (in a multi-GPU setup)
-    5. Enable quantization (e.g. nunchaku)
+    1. Reduce resolution, `--num-frames`, or batch size.
+    2. Use `--performance-mode memory` for lower memory usage.
+    3. Enable SP/Ulysses/Ring for sequence-heavy workloads in multi-GPU setups.
+    4. Use FSDP+CFG for validated multi-GPU Qwen/Wan CFG workloads.
+    5. Use a lower-memory attention backend or quantization when available.
   Or, open an issue on GitHub https://github.com/sgl-project/sglang/issues/new/choose
 """
 

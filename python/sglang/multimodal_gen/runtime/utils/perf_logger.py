@@ -93,8 +93,21 @@ def get_diffusion_perf_log_dir() -> str:
     if log_dir:
         return os.path.abspath(log_dir)
     if log_dir is None:
-        sglang_path = Path(sglang.__file__).resolve()
-        target_path = (sglang_path.parent / "../../.cache/logs").resolve()
+        sglang_file = getattr(sglang, "__file__", None)
+        if sglang_file:
+            target_path = (
+                Path(sglang_file).resolve().parent / "../../.cache/logs"
+            ).resolve()
+            return str(target_path)
+
+        envs_file = getattr(envs, "__file__", None)
+        if envs_file:
+            target_path = (
+                Path(envs_file).resolve().parents[3] / ".cache/logs"
+            ).resolve()
+            return str(target_path)
+
+        target_path = (Path.cwd() / ".cache/logs").resolve()
         return str(target_path)
     return ""
 
@@ -365,5 +378,5 @@ class PerformanceLogger:
                 with open(log_file, "a", encoding="utf-8") as f:
                     f.write(json.dumps(dataclasses.asdict(record)) + "\n")
 
-        except (OSError, PermissionError) as e:
+        except (OSError, PermissionError, TypeError) as e:
             print(f"WARNING: Failed to log performance record: {e}", file=sys.stderr)

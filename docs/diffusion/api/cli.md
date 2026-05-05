@@ -74,6 +74,7 @@ Use `sglang generate --help` and `sglang serve --help` for the full argument lis
 - `--model-path {MODEL}`: model path or Hugging Face model ID
 - `--lora-path {PATH}` and `--lora-nickname {NAME}`: load a LoRA adapter
 - `--num-gpus {N}`: number of GPUs to use
+- `--performance-mode {auto|throughput|memory|balanced}`: preset for memory/performance defaults; explicit offload, FSDP, and parallelism flags take precedence
 - `--tp-size {N}`: tensor parallelism size, mainly for encoders
 - `--sp-degree {N}`: sequence parallelism size
 - `--ulysses-degree {N}` and `--ring-degree {N}`: USP parallelism controls
