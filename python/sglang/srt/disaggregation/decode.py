@@ -687,19 +687,31 @@ class DecodePreallocQueue:
                 for x in self.scheduler.running_batch.reqs
             )
 
-        reserved_tokens = self.num_reserved_decode_tokens * (
+        n_active = (
             len(self.scheduler.running_batch.reqs)
             + len(self.transfer_queue.queue)
             + len(self.scheduler.waiting_queue)
         )
+        reserved_tokens = self.num_reserved_decode_tokens * n_active
         if self._uses_swa_tail_prealloc():
             full_allocatable_tokens = (
                 self.token_to_kv_pool_allocator.full_available_size()
                 - max(reserved_tokens, need_space_for_single_req)
             )
+            # SWA growth is bounded by the sliding window: once a req's SWA
+            # footprint reaches `sliding_window_size`, further decode tokens
+            # evict old ones and net growth is zero. The linear reservation
+            # `num_reserved_decode_tokens * n_active` (correct for the full
+            # pool) over-reserves SWA in steady state. Cap by the actual
+            # remaining headroom up to per-req window cap.
+            window_size = self.scheduler.sliding_window_size or 0
+            swa_total = self.token_to_kv_pool_allocator.size_swa
+            swa_used = swa_total - self.token_to_kv_pool_allocator.swa_available_size()
+            swa_growth_potential = max(0, n_active * window_size - swa_used)
+            swa_reserved_tokens = min(reserved_tokens, swa_growth_potential)
             swa_allocatable_tokens = (
                 self.token_to_kv_pool_allocator.swa_available_size()
-                - max(reserved_tokens, need_swa_space_for_single_req)
+                - max(swa_reserved_tokens, need_swa_space_for_single_req)
             )
         else:
             allocatable_tokens = self.token_to_kv_pool_allocator.available_size() - max(
@@ -718,7 +730,19 @@ class DecodePreallocQueue:
                 self.scheduler.last_batch.reqs
             )
             full_allocatable_tokens -= prebuilt_reserved_tokens
-            swa_allocatable_tokens -= prebuilt_reserved_tokens
+            if self._uses_swa_tail_prealloc():
+                # Apply the same SWA growth-cap bound to the prebuilt-batch
+                # contribution: at most the window-cap headroom can grow.
+                # window_size and swa metrics computed above remain valid.
+                prebuilt_n = len(self.scheduler.last_batch.reqs)
+                prebuilt_swa_growth = max(
+                    0, prebuilt_n * window_size - swa_used
+                )
+                swa_allocatable_tokens -= min(
+                    prebuilt_reserved_tokens, prebuilt_swa_growth
+                )
+            else:
+                swa_allocatable_tokens -= prebuilt_reserved_tokens
 
         if count_retracted:
             for req in self.retracted_queue:

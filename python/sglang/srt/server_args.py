@@ -1075,6 +1075,8 @@ class ServerArgs:
                 + list(range(272, 512, 16))
                 + list(range(512, self.cuda_graph_max_bs + 1, 32))
             )
+            if capture_bs[-1] != self.cuda_graph_max_bs:
+                capture_bs.append(self.cuda_graph_max_bs)
         else:
             # Spec decoding case: less padding for smaller batch sizes
             capture_bs = (
@@ -1084,6 +1086,8 @@ class ServerArgs:
                 + list(range(72, 257, 8))
                 + list(range(272, self.cuda_graph_max_bs + 1, 16))
             )
+            if capture_bs[-1] != self.cuda_graph_max_bs:
+                capture_bs.append(self.cuda_graph_max_bs)
 
         capture_bs = [bs for bs in capture_bs if bs <= self.cuda_graph_max_bs]
 
