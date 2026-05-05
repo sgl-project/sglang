@@ -287,6 +287,11 @@ class HiCacheController:
         self.pp_size = pp_size
         self.enable_storage_metrics = enable_storage_metrics
 
+        # Draft KV pool support (best-effort piggyback on target L2/L3 ops).
+        self.has_draft = False
+        self.mem_pool_device_draft = None
+        self.mem_pool_host_draft = None
+
         # Default storage page IO functions (may be overridden by attach).
         self.page_get_func = self._generic_page_get
         self.page_set_func = self._generic_page_set
@@ -718,6 +723,13 @@ class HiCacheController:
             self.mem_pool_host.backup_from_device_all_layer(
                 self.mem_pool_device, host_indices, device_indices, self.io_backend
             )
+            if self.has_draft:
+                self.mem_pool_host_draft.backup_from_device_all_layer(
+                    self.mem_pool_device_draft,
+                    host_indices,
+                    device_indices,
+                    self.io_backend,
+                )
             finish_event.record()
             # NOTE: We must save the host indices and device indices here,
             # this is because we need to guarantee that these tensors are
@@ -791,6 +803,14 @@ class HiCacheController:
                     i,
                     self.io_backend,
                 )
+                if self.has_draft and i < self.mem_pool_host_draft.layer_num:
+                    self.mem_pool_host_draft.load_to_device_per_layer(
+                        self.mem_pool_device_draft,
+                        host_indices,
+                        device_indices,
+                        i,
+                        self.io_backend,
+                    )
                 producer_event.complete(i)
             # NOTE: We must save the host indices and device indices here,
             # this is because we need to guarantee that these tensors are
@@ -819,6 +839,17 @@ class HiCacheController:
 
         self.mem_pool_host.free(host_indices)
         return len(host_indices)
+
+    def set_draft_kv_pool(self, draft_device_pool, draft_host_pool) -> None:
+        """Register draft KV pools so L2/L3 ops piggyback draft transfers."""
+        self.has_draft = True
+        self.mem_pool_device_draft = draft_device_pool
+        self.mem_pool_host_draft = draft_host_pool
+        logger.info(
+            "HiCache draft KV registered: %s (host %d slots)",
+            type(draft_device_pool).__name__,
+            draft_host_pool.size,
+        )
 
     def prefetch(
         self,
@@ -895,6 +926,13 @@ class HiCacheController:
             batch_host_indices = operation.host_indices[
                 i * self.page_size : (i + len(batch_hashes)) * self.page_size
             ]
+
+            # Best-effort draft L3 read before publishing target completion.
+            # Otherwise wait_complete can race and load back target KV before
+            # draft KV reaches host memory.
+            if self.has_draft:
+                self._draft_page_get(batch_hashes, batch_host_indices)
+
             prev_completed_tokens = operation.completed_tokens
             # Get one batch token, and update the completed_tokens if succeed
             extra_info = HiCacheStorageExtraInfo(prefix_keys=prefix_keys)
@@ -1045,6 +1083,45 @@ class HiCacheController:
             self.storage_backend.batch_set_v1(hash_values, host_indices, extra_info)
         )
 
+    def _draft_page_set(self, hash_values, host_indices) -> None:
+        """Best-effort write draft KV pages to L3 with 'd:' prefixed keys.
+
+        TODO: support batch_set_v1 (zero-copy) for high-performance backends.
+        """
+        try:
+            draft_keys = [f"d:{h}" for h in hash_values]
+            draft_data = [
+                self.mem_pool_host_draft.get_data_page(host_indices[i * self.page_size])
+                for i in range(len(draft_keys))
+            ]
+            self.storage_backend.batch_set(draft_keys, draft_data)
+        except Exception:
+            logger.debug(
+                "Draft L3 write failed (best-effort), skipping.", exc_info=True
+            )
+
+    def _draft_page_get(self, hash_values, host_indices) -> None:
+        """Best-effort read draft KV pages from L3 with 'd:' prefixed keys.
+
+        TODO: support batch_get_v1 (zero-copy) for high-performance backends.
+        """
+        try:
+            draft_keys = [f"d:{h}" for h in hash_values]
+            draft_dummy = [
+                self.mem_pool_host_draft.get_dummy_flat_data_page() for _ in draft_keys
+            ]
+            draft_pages = self.storage_backend.batch_get(draft_keys, draft_dummy)
+            if draft_pages is None:
+                return
+
+            for i, p in enumerate(draft_pages):
+                if p is not None:
+                    self.mem_pool_host_draft.set_from_flat_data_page(
+                        host_indices[i * self.page_size], p
+                    )
+        except Exception:
+            logger.debug("Draft L3 read failed (best-effort), skipping.", exc_info=True)
+
     # Backup batch by batch
     def _page_backup(self, operation):
         # Backup batch by batch
@@ -1063,6 +1140,10 @@ class HiCacheController:
                     f"Write page to storage: {len(batch_hashes)} pages failed."
                 )
                 break
+
+            # Best-effort draft L3 write alongside target.
+            if self.has_draft:
+                self._draft_page_set(batch_hashes, batch_host_indices)
 
             if prefix_keys and len(prefix_keys) > 0:
                 prefix_keys += batch_hashes

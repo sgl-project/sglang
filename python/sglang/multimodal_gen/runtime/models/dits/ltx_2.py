@@ -31,9 +31,9 @@ from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config impor
     QuantizationConfig,
 )
 from sglang.multimodal_gen.runtime.layers.visual_embedding import timestep_embedding
+from sglang.multimodal_gen.runtime.managers.layerwise_offload import OffloadableDiTMixin
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
-from sglang.multimodal_gen.runtime.utils.layerwise_offload import OffloadableDiTMixin
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
@@ -102,6 +102,24 @@ def apply_split_rotary_emb(
     x: torch.Tensor, freqs: Tuple[torch.Tensor, torch.Tensor]
 ) -> torch.Tensor:
     cos, sin = freqs
+    if (
+        x.ndim == 3
+        and cos.ndim == 4
+        and sin.ndim == 4
+        and x.dtype == torch.bfloat16
+        and cos.dtype == torch.bfloat16
+        and sin.dtype == torch.bfloat16
+        and x.is_cuda
+        and x.is_contiguous()
+        and cos.is_cuda
+        and sin.is_cuda
+    ):
+        from sglang.jit_kernel.diffusion.triton.ltx2_rotary import (
+            apply_ltx2_split_rotary_emb,
+        )
+
+        return apply_ltx2_split_rotary_emb(x, cos, sin)
+
     x_dtype = x.dtype
     needs_reshape = False
     if x.ndim != 4 and cos.ndim == 4:
@@ -1450,6 +1468,7 @@ class LTX2VideoTransformer3DModel(CachableDiT, OffloadableDiTMixin):
             base_num_frames=cross_attn_pos_embed_max_pos,
             sampling_rate=16000,
             hop_length=160,
+            scale_factors=self.audio_scale_factors,
             theta=float(arch.positional_embedding_theta),
             causal_offset=causal_offset,
             modality="audio",

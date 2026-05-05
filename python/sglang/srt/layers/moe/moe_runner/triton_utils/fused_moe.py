@@ -312,7 +312,7 @@ def _swiglu_silu_clamp_mul(x, gemm1_limit):
 
 
 @torch.compile
-def _swiglu_gpt_oss_sigmoid_alpha(x, gemm1_alpha, gemm1_limit):
+def swiglu_gpt_oss_sigmoid_alpha(x, gemm1_alpha, gemm1_limit):
     # NOTE: This variant uses gemm1_alpha, unlike _swiglu_silu_clamp_mul.
     # At present, only GPT-OSS uses this variant.
     gate, up = x[..., ::2], x[..., 1::2]
@@ -521,7 +521,7 @@ def _fused_moe_kernel_sequence(
         # - gemm1_alpha == None and gemm1_limit != None: silu+clamp+mul(limit-only)
         if gemm1_alpha is not None:
             assert gemm1_limit is not None
-            intermediate_cache2 = _swiglu_gpt_oss_sigmoid_alpha(
+            intermediate_cache2 = swiglu_gpt_oss_sigmoid_alpha(
                 intermediate_cache1.view(-1, N), gemm1_alpha, gemm1_limit
             )
         elif gemm1_limit is not None:

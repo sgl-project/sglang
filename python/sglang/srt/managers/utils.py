@@ -8,7 +8,7 @@ import torch
 
 from sglang.srt.eplb.expert_distribution import ExpertDistributionMetrics
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-from sglang.srt.layers.moe.routed_experts_capturer import RoutedExpertsOutput
+from sglang.srt.layers.topk_capturer_base import TopkCaptureOutput
 from sglang.srt.managers.overlap_utils import FutureIndices
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
@@ -28,7 +28,7 @@ class GenerationBatchResult:
     pp_hidden_states_proxy_tensors: Optional[PPProxyTensors] = None
     next_token_ids: Optional[Union[torch.Tensor, List[torch.Tensor]]] = None
     num_accepted_drafts: int = 0  # no bonus included
-    accept_length_per_req_cpu: Optional[List[int]] = None
+    num_accepted_drafts_per_req_cpu: Optional[List[int]] = None
     can_run_cuda_graph: bool = False
 
     # For output processing
@@ -48,7 +48,7 @@ class GenerationBatchResult:
     next_draft_input: Optional[EagleDraftInput] = None
 
     # Routed experts: pending async D2H for overlap scheduling
-    routed_experts_output: Optional[RoutedExpertsOutput] = None
+    routed_experts_output: Optional[TopkCaptureOutput] = None
 
     # metrics
     expert_distribution_metrics: Optional[ExpertDistributionMetrics] = None

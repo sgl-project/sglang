@@ -3,7 +3,10 @@ import sys
 import unittest
 from unittest.mock import patch
 
-from sglang.multimodal_gen.configs.pipeline_configs.base import PipelineConfig
+from sglang.multimodal_gen.configs.pipeline_configs.base import (
+    ModelTaskType,
+    PipelineConfig,
+)
 from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
     QwenImagePipelineConfig,
 )
@@ -44,6 +47,116 @@ class TestServerArgsPathExpansion(unittest.TestCase):
         self.assertEqual(
             args.component_paths["vae"], os.path.expanduser("~/fake/local/vae")
         )
+
+    def test_component_attention_backends_are_normalized(self):
+        args = self._from_dict_without_model_resolution(
+            {
+                "model_path": "/data/my-model",
+                "component_attention_backends": "text-encoder=torch_sdpa,transformer=fa3",
+            }
+        )
+
+        self.assertEqual(
+            args.component_attention_backends,
+            {"text_encoder": "torch_sdpa", "transformer": "fa"},
+        )
+
+    def test_component_attention_backend_lookup(self):
+        args = self._from_dict_without_model_resolution(
+            {
+                "model_path": "/data/my-model",
+                "component_attention_backends": {"text_encoder": "torch_sdpa"},
+            }
+        )
+
+        backend, matched_key = args.resolve_component_attention_backend(
+            "text_encoder", "transformer"
+        )
+
+        self.assertEqual(backend.name, "TORCH_SDPA")
+        self.assertEqual(matched_key, "text_encoder")
+
+    def test_invalid_component_attention_backend_raises(self):
+        with self.assertRaises(ValueError):
+            self._from_dict_without_model_resolution(
+                {
+                    "model_path": "/data/my-model",
+                    "component_attention_backends": {"text_encoder": "bad_backend"},
+                }
+            )
+        with self.assertRaises(ValueError):
+            self._from_dict_without_model_resolution(
+                {
+                    "model_path": "/data/my-model",
+                    "component_attention_backends": "text_encoder",
+                }
+            )
+
+    def test_dynamic_component_attention_backend_cli_args(self):
+        parser = FlexibleArgumentParser()
+        ServerArgs.add_cli_args(parser)
+        argv = [
+            "--model-path",
+            "/fake",
+            "--component-attention-backends.text-encoder",
+            "torch_sdpa",
+        ]
+
+        with patch.object(sys, "argv", ["sglang"] + argv):
+            args, unknown_args = parser.parse_known_args(argv)
+            with patch.object(
+                PipelineConfig, "from_kwargs", return_value=QwenImagePipelineConfig()
+            ):
+                server_args = ServerArgs.from_cli_args(args, unknown_args)
+
+        self.assertEqual(
+            server_args.component_attention_backends, {"text_encoder": "torch_sdpa"}
+        )
+
+
+class TestOffloadDefaults(unittest.TestCase):
+    def _from_dict_with_task_type(
+        self,
+        task_type,
+        *,
+        memory_gb=80,
+        kwargs=None,
+    ):
+        pipeline_config = PipelineConfig()
+        pipeline_config.task_type = task_type
+        with (
+            patch.object(PipelineConfig, "from_kwargs", return_value=pipeline_config),
+            patch(
+                "sglang.multimodal_gen.runtime.server_args.current_platform.is_cpu",
+                return_value=False,
+            ),
+            patch(
+                "sglang.multimodal_gen.runtime.server_args.current_platform.get_device_total_memory",
+                return_value=memory_gb * 1024**3,
+            ),
+        ):
+            return ServerArgs.from_dict({"model_path": "/fake", **(kwargs or {})})
+
+    def test_vae_cpu_offload_defaults_false_for_video_generation(self):
+        args = self._from_dict_with_task_type(ModelTaskType.T2V)
+
+        self.assertFalse(args.vae_cpu_offload)
+
+    def test_vae_cpu_offload_defaults_false_on_low_memory_gpu(self):
+        args = self._from_dict_with_task_type(ModelTaskType.T2V, memory_gb=16)
+
+        self.assertFalse(args.vae_cpu_offload)
+        self.assertTrue(args.dit_cpu_offload)
+        self.assertTrue(args.text_encoder_cpu_offload)
+        self.assertTrue(args.image_encoder_cpu_offload)
+
+    def test_explicit_vae_cpu_offload_true_is_preserved(self):
+        args = self._from_dict_with_task_type(
+            ModelTaskType.T2V,
+            kwargs={"vae_cpu_offload": True},
+        )
+
+        self.assertTrue(args.vae_cpu_offload)
 
 
 class TestModelIdResolution(unittest.TestCase):
@@ -209,6 +322,23 @@ class TestPipelineResolutionCliOverride(unittest.TestCase):
             server_args = ServerArgs.from_cli_args(args, unknown_args)
 
         self.assertEqual(server_args.pipeline_config.resolution, 768)
+
+    def test_disable_autocast_is_preserved_after_pipeline_config_resolution(self):
+        parser = FlexibleArgumentParser()
+        ServerArgs.add_cli_args(parser)
+        argv = [
+            "--model-path",
+            "Qwen/Qwen-Image-Layered",
+            "--disable-autocast",
+            "true",
+        ]
+
+        with patch.object(sys, "argv", ["sglang"] + argv):
+            args, unknown_args = parser.parse_known_args(argv)
+            server_args = ServerArgs.from_cli_args(args, unknown_args)
+
+        self.assertTrue(server_args.pipeline_config.disable_autocast)
+        self.assertTrue(server_args.disable_autocast)
 
 
 if __name__ == "__main__":
