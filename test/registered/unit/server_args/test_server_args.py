@@ -86,6 +86,63 @@ class TestLoadBalanceMethod(unittest.TestCase):
         self.assertIn("'fake'", str(context.exception))
 
 
+class TestHiSparseNsaBackendPolicy(unittest.TestCase):
+    @patch("sglang.srt.server_args.is_hip", return_value=False)
+    def test_hisparse_defaults_to_flashmla_sparse_on_cuda(self, _mock_is_hip):
+        server_args = ServerArgs(model_path="dummy", enable_hisparse=True)
+
+        server_args._set_default_nsa_backends(kv_cache_dtype="bfloat16", major=9)
+
+        self.assertEqual(server_args.nsa_prefill_backend, "flashmla_sparse")
+        self.assertEqual(server_args.nsa_decode_backend, "flashmla_sparse")
+
+    @patch("sglang.srt.server_args.is_hip", return_value=True)
+    def test_hisparse_defaults_to_tilelang_on_rocm(self, _mock_is_hip):
+        server_args = ServerArgs(model_path="dummy", enable_hisparse=True)
+
+        server_args._set_default_nsa_backends(kv_cache_dtype="bfloat16", major=9)
+
+        self.assertEqual(server_args.nsa_prefill_backend, "tilelang")
+        self.assertEqual(server_args.nsa_decode_backend, "tilelang")
+
+    @patch("sglang.srt.server_args.is_hip", return_value=True)
+    def test_hisparse_preserves_rocm_user_backend_and_defaults_missing_side(
+        self, _mock_is_hip
+    ):
+        server_args = ServerArgs(
+            model_path="dummy",
+            enable_hisparse=True,
+            nsa_prefill_backend="tilelang",
+        )
+
+        server_args._set_default_nsa_backends(kv_cache_dtype="bfloat16", major=9)
+
+        self.assertEqual(server_args.nsa_prefill_backend, "tilelang")
+        self.assertEqual(server_args.nsa_decode_backend, "tilelang")
+
+    @patch("sglang.srt.server_args.is_hip", return_value=True)
+    def test_hisparse_rejects_cuda_backend_on_rocm(self, _mock_is_hip):
+        server_args = ServerArgs(
+            model_path="dummy",
+            enable_hisparse=True,
+            nsa_prefill_backend="flashmla_sparse",
+        )
+
+        with self.assertRaisesRegex(ValueError, r"backend\(s\) \[tilelang\]"):
+            server_args._validate_hisparse_nsa_backend("nsa_prefill_backend", "prefill")
+
+    @patch("sglang.srt.server_args.is_hip", return_value=False)
+    def test_hisparse_rejects_rocm_backend_on_cuda(self, _mock_is_hip):
+        server_args = ServerArgs(
+            model_path="dummy",
+            enable_hisparse=True,
+            nsa_decode_backend="tilelang",
+        )
+
+        with self.assertRaisesRegex(ValueError, r"backend\(s\) \[flashmla_sparse\]"):
+            server_args._validate_hisparse_nsa_backend("nsa_decode_backend", "decode")
+
+
 class TestPortArgs(unittest.TestCase):
     @patch("sglang.srt.server_args.get_free_port")
     @patch("sglang.srt.server_args.tempfile.NamedTemporaryFile")

@@ -398,7 +398,15 @@ class HiSparseCoordinator:
             :, req_pool_indices, self.device_buffer_size
         ] = reserved_buffer_loc.to(torch.int32)
 
-        # todo, clear the prior mapping as well
+        previous_locs = self.mem_pool_device._translate_loc_to_hisparse_device(
+            out_cache_loc
+        )
+        stale_locs = previous_locs[
+            (previous_locs > 0) & (previous_locs != reserved_buffer_loc)
+        ]
+        if stale_locs.numel() > 0:
+            self.token_to_kv_pool_allocator.free_hisparse_indices(stale_locs)
+
         self.mem_pool_device.full_to_hisparse_device_index_mapping[out_cache_loc] = (
             reserved_buffer_loc
         )
