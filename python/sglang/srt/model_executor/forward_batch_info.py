@@ -490,7 +490,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             dimensions=batch.dimensions,
             return_hidden_states_before_norm=batch.return_hidden_states_before_norm,
             return_pooled_hidden_states=batch.return_pooled_hidden_states,
-            rids=[req.rid for req in batch.reqs],
+            rids=(
+                [req.rid for req in batch.reqs]
+                if model_runner.server_args.debug_tensor_dump_output_folder is not None
+                else None
+            ),
         )
         device = model_runner.device
 
