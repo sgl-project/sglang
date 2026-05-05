@@ -554,7 +554,7 @@ TWO_GPU_CASES = [
         "ltx_2_two_stage_t2v",
         DiffusionServerArgs(
             model_path="Lightricks/LTX-2",
-            ulysses_degree=2,
+            tp_size=2,
             dit_layerwise_offload=True,
             extras=["--pipeline-class-name LTX2TwoStagePipeline"],
         ),
@@ -564,7 +564,7 @@ TWO_GPU_CASES = [
         "ltx_2_3_two_stage_ti2v_2gpus",
         DiffusionServerArgs(
             model_path="Lightricks/LTX-2.3",
-            ulysses_degree=2,
+            tp_size=2,
             extras=[
                 "--pipeline-class-name LTX2TwoStagePipeline --ltx2-two-stage-device-mode original"
             ],
@@ -584,7 +584,7 @@ TWO_GPU_CASES = [
         "ltx_2.3_two_stage_t2v_2gpus",
         DiffusionServerArgs(
             model_path="Lightricks/LTX-2.3",
-            ulysses_degree=2,
+            tp_size=2,
             extras=[
                 "--pipeline-class-name LTX2TwoStagePipeline",
                 "--ltx2-two-stage-device-mode original",
@@ -661,7 +661,7 @@ TWO_GPU_CASES = [
         "ltx_2.3_one_stage_ti2v",
         DiffusionServerArgs(
             model_path="Lightricks/LTX-2.3",
-            ulysses_degree=2,
+            tp_size=2,
         ),
         TI2V_sampling_params,
         run_component_accuracy_check=False,
