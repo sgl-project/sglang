@@ -212,7 +212,8 @@ def flash_attn_varlen_func(
             "flash_attn at sgl-kernel is only supported on sm90 and above"
         )
 
-    return _load_fa3_kernels()["flash_attn_varlen_func"](
+    return _call_fa3_kernel(
+        _load_fa3_kernels()["flash_attn_varlen_func"],
         q=q,
         k=k,
         v=v,
