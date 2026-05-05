@@ -4,6 +4,11 @@ on:
     tags:
       - 'v[0-9]+.*'
   workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release version to publish (e.g. v0.5.11). Overrides setuptools-scm.'
+        required: true
+        type: string
 
 jobs:
   publish:
@@ -21,11 +26,42 @@ jobs:
         with:
           fetch-depth: 0  # Required for setuptools-scm to determine version from tags
 
-      - name: Upload to pypi
+      # Needed by setuptools-rust to build the bundled native gRPC extension
+      # (rust/sglang-grpc) when `python -m build` builds the sglang wheel.
+      - name: Install protoc
+        run: sudo bash scripts/ci/utils/install_protoc.sh
+
+      - name: Build wheel
+        env:
+          # When triggered manually, pin the wheel version to the supplied
+          # input (strip leading `v`) so setuptools-scm doesn't derive a
+          # `.devN+gHASH` version from the branch HEAD.
+          RELEASE_VERSION: ${{ inputs.version }}
         run: |
           cd python
           cp ../README.md ../LICENSE .
           pip install build wheel setuptools setuptools-scm
-          python3 -m build
+          if [ -n "$RELEASE_VERSION" ]; then
+            export SETUPTOOLS_SCM_PRETEND_VERSION="${RELEASE_VERSION#v}"
+            echo "Pinning wheel version to $SETUPTOOLS_SCM_PRETEND_VERSION"
+          fi
+          python3 -m build --wheel
+
+      # PyPI rejects plain `linux_x86_64` platform tags; auditwheel rewrites
+      # the wheel's platform tag to a `manylinux_*` tag and bundles any
+      # external native deps. The runner's glibc determines the lowest
+      # acceptable manylinux policy (ubuntu-24.04 -> glibc 2.39).
+      - name: Repair wheel for manylinux
+        run: |
+          cd python
+          pip install auditwheel patchelf
+          mkdir -p dist-repaired
+          python3 -m auditwheel repair dist/*.whl -w dist-repaired/
+          rm dist/*.whl
+          mv dist-repaired/*.whl dist/
+
+      - name: Upload to pypi
+        run: |
+          cd python
           pip install twine
           python3 -m twine upload dist/* -u __token__ -p ${{ secrets.PYPI_TOKEN }}

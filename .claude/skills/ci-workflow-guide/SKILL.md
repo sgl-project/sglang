@@ -12,6 +12,7 @@ This skill covers the CI **infrastructure** layer — how tests are dispatched, 
 ## Naming Conventions
 
 - **Suite**: `stage-{a,b,c}-test-{gpu_count}-gpu-{hardware}` (e.g., `stage-b-test-1-gpu-small`)
+- **Test group**: Directory-level registered test group under `test/registered/` (e.g., `hicache` maps to `test/registered/hicache/test_*.py`)
 - **CI runner**: `{gpu_count}-gpu-{hardware}` (e.g., `1-gpu-5090`, `4-gpu-h100`, `8-gpu-h200`)
 
 ---
@@ -385,5 +386,6 @@ group: pr-test-{event_name}-{branch}-{pr_sha}-{stage}
 | `/tag-and-rerun-ci` | Adds label + reruns |
 | `/rerun-stage <stage>` | Dispatches `pr-test.yml` with `target_stage=<stage>` |
 | `/rerun-test <test-file>` | Reruns a specific test file via `rerun-test.yml` |
+| `/rerun-group <group> [<group> ...]` | Expands registered test groups, then reuses `/rerun-test` |
 
 Handled by `scripts/ci/utils/slash_command_handler.py` → `.github/workflows/slash-command-handler.yml`.
