@@ -81,12 +81,27 @@ def _stub_verify_tree_greedy_func(
     accept_index,
     accept_token_num,
     candidates,
-    retrive_index,
-    retrive_next_token,
-    retrive_next_sibling,
     target_predict,
     topk,
+    retrive_index=None,
+    retrive_next_token=None,
+    retrive_next_sibling=None,
+    retrieve_index=None,
+    retrieve_next_token=None,
+    retrieve_next_sibling=None,
 ):
+    retrive_index = retrive_index if retrive_index is not None else retrieve_index
+    retrive_next_token = (
+        retrive_next_token if retrive_next_token is not None else retrieve_next_token
+    )
+    retrive_next_sibling = (
+        retrive_next_sibling
+        if retrive_next_sibling is not None
+        else retrieve_next_sibling
+    )
+    assert retrive_index is not None
+    assert retrive_next_token is not None
+    assert retrive_next_sibling is not None
     predicts.copy_(target_predict.flatten())
     accept_index.fill_(-1)
     accept_index[:, 0] = 0
@@ -117,6 +132,9 @@ def _make_verify_input():
         retrive_index=torch.tensor([[0]], dtype=torch.int32),
         retrive_next_token=torch.tensor([[0]], dtype=torch.int32),
         retrive_next_sibling=torch.tensor([[-1]], dtype=torch.int32),
+        retrieve_index=torch.tensor([[0]], dtype=torch.int32),
+        retrieve_next_token=torch.tensor([[0]], dtype=torch.int32),
+        retrieve_next_sibling=torch.tensor([[-1]], dtype=torch.int32),
         spec_steps=0,
         topk=1,
         grammar=None,
