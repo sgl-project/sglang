@@ -8,7 +8,7 @@ on:
         required: false
         default: ""
       tag:
-        description: "Custom tag suffix (overrides pr_number in tag). E.g. 'my-test' → dev-x86-my-test, dev-cu13-my-test, etc."
+        description: "Custom tag suffix (overrides pr_number in tag). E.g. 'my-test' → dev-my-test, dev-cu13-my-test, etc."
         required: false
         default: ""
   schedule:
@@ -86,16 +86,6 @@ jobs:
 
       - name: Build and Push Dev Image
         run: |
-          # Tag suffix: custom tag > pr number > none
-          SUFFIX=""
-          if [ -n "${{ inputs.tag }}" ]; then
-            SUFFIX="-${{ inputs.tag }}"
-          elif [ -n "${{ inputs.pr_number }}" ]; then
-            SUFFIX="-pr-${{ inputs.pr_number }}"
-          fi
-
-          TAG="dev-${{ matrix.arch_tag }}${SUFFIX}"
-
           # Nightly (schedule) installs latest release; manual dispatch builds from checked-out source
           if [ "${{ github.event_name }}" = "schedule" ]; then
             SOURCE_ARG="--build-arg USE_LATEST_SGLANG=1"
@@ -103,12 +93,10 @@ jobs:
             SOURCE_ARG="--build-arg BRANCH_TYPE=local"
           fi
 
-          echo "Building lmsysorg/sglang:${TAG}"
-
           docker buildx build \
             --platform ${{ matrix.platform }} \
-            --push \
-            --target framework \
+            --output type=image,name=lmsysorg/sglang,push-by-digest=true,name-canonical=true,push=true \
+            --target framework_final \
             -f docker/Dockerfile \
             --build-arg CUDA_VERSION=${{ matrix.version }} \
             --build-arg BUILD_TYPE=${{ matrix.build_type }} \
@@ -116,9 +104,20 @@ jobs:
             --build-arg GRACE_BLACKWELL=${{ matrix.grace_blackwell }} \
             ${SOURCE_ARG} \
             --build-arg INSTALL_FLASHINFER_JIT_CACHE=1 \
-            -t lmsysorg/sglang:${TAG} \
+            --metadata-file /tmp/metadata.json \
             --no-cache \
             .
+
+          DIGEST=$(python3 -c "import json; print(json.load(open('/tmp/metadata.json'))['containerimage.digest'])")
+          echo "Pushed digest: ${DIGEST}"
+          echo "${DIGEST}" > /tmp/digest.txt
+
+      - name: Upload digest
+        uses: actions/upload-artifact@v4
+        with:
+          name: digest-${{ matrix.arch_tag }}
+          path: /tmp/digest.txt
+          retention-days: 1
 
   create-manifests:
     runs-on: ubuntu-22.04
@@ -141,8 +140,23 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
+      - name: Download x86 digest
+        uses: actions/download-artifact@v4
+        with:
+          name: digest-${{ matrix.variant.x86 }}
+          path: /tmp/digests/x86
+
+      - name: Download arm64 digest
+        uses: actions/download-artifact@v4
+        with:
+          name: digest-${{ matrix.variant.arm64 }}
+          path: /tmp/digests/arm64
+
       - name: Create multi-arch manifest
         run: |
+          X86_DIGEST=$(cat /tmp/digests/x86/digest.txt)
+          ARM64_DIGEST=$(cat /tmp/digests/arm64/digest.txt)
+
           SUFFIX=""
           if [ -n "${{ inputs.tag }}" ]; then
             SUFFIX="-${{ inputs.tag }}"
@@ -151,8 +165,6 @@ jobs:
           fi
 
           TAG="${{ matrix.variant.base }}${SUFFIX}"
-          X86_TAG="dev-${{ matrix.variant.x86 }}${SUFFIX}"
-          ARM64_TAG="dev-${{ matrix.variant.arm64 }}${SUFFIX}"
 
           # For nightly (no suffix), also stamp a dated tag
           EXTRA_TAG=""
@@ -164,8 +176,8 @@ jobs:
           docker buildx imagetools create \
             -t lmsysorg/sglang:${TAG} \
             ${EXTRA_TAG} \
-            lmsysorg/sglang:${X86_TAG} \
-            lmsysorg/sglang:${ARM64_TAG}
+            lmsysorg/sglang@${X86_DIGEST} \
+            lmsysorg/sglang@${ARM64_DIGEST}
 
           echo "✓ Published lmsysorg/sglang:${TAG}"
 

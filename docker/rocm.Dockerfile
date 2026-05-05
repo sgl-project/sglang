@@ -27,7 +27,7 @@ ENV BUILD_TRITON="0"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
-ENV AITER_COMMIT="v0.1.10.post3"
+ENV AITER_COMMIT_DEFAULT="v0.1.12.post1"
 
 # ===============================
 # Base image 942 with rocm720 and args
@@ -37,7 +37,7 @@ ENV BUILD_TRITON="1"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
-ENV AITER_COMMIT="v0.1.10.post3"
+ENV AITER_COMMIT_DEFAULT="v0.1.12.post1"
 
 # ===============================
 # Base image 950 and args
@@ -47,7 +47,7 @@ ENV BUILD_TRITON="0"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
-ENV AITER_COMMIT="v0.1.10.post3"
+ENV AITER_COMMIT_DEFAULT="v0.1.12.post1"
 
 # ===============================
 # Base image 950 with rocm720 and args
@@ -57,7 +57,7 @@ ENV BUILD_TRITON="1"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
-ENV AITER_COMMIT="v0.1.10.post3"
+ENV AITER_COMMIT_DEFAULT="v0.1.12.post1"
 
 # ===============================
 # Chosen arch and args
@@ -79,6 +79,8 @@ ARG TRITON_REPO="https://github.com/triton-lang/triton.git"
 ARG TRITON_COMMIT="42270451990532c67e69d753fbd026f28fcc4840"
 
 ARG AITER_REPO="https://github.com/ROCm/aiter.git"
+ARG AITER_COMMIT=""
+ENV AITER_COMMIT="${AITER_COMMIT:-${AITER_COMMIT_DEFAULT}}"
 
 ARG LLVM_REPO="https://github.com/jrbyrnes/llvm-project.git"
 ARG LLVM_BRANCH="MainOpSelV2"
@@ -88,7 +90,7 @@ ARG MOONCAKE_REPO="https://github.com/kvcache-ai/Mooncake.git"
 ARG MOONCAKE_COMMIT="b6a841dc78c707ec655a563453277d969fb8f38d"
 
 ARG TILELANG_REPO="https://github.com/tile-ai/tilelang.git"
-ARG TILELANG_COMMIT="ebf4a7cb8881432165ae8760e99d209d905c704a"
+ARG TILELANG_COMMIT="a55a82302bf7f3c5af635b5c9146f728185cc900"
 
 ARG FHT_REPO="https://github.com/jeffdaily/fast-hadamard-transform.git"
 ARG FHT_BRANCH="rocm"
@@ -98,12 +100,39 @@ ARG ENABLE_MORI=0
 ARG NIC_BACKEND=none
 
 ARG MORI_REPO="https://github.com/ROCm/mori.git"
-ARG MORI_COMMIT="2f88d06aba75400262ca5c1ca5986cf1fdf4cd82"
+ARG MORI_COMMIT="v1.1.0"
 
 # AMD AINIC apt repo settings
 ARG AINIC_VERSION=1.117.5
 ARG UBUNTU_CODENAME=jammy
 USER root
+
+# Fix hipDeviceGetName returning empty string in ROCm 7.0 docker images.
+# The ROCm 7.0 base image is missing libdrm-amdgpu-common which provides the
+# amdgpu.ids device-ID-to-marketing-name mapping file.
+# ROCm 7.2 base images already ship these packages, so this step is skipped.
+# See https://github.com/ROCm/ROCm/issues/5992
+RUN set -eux; \
+    case "${GPU_ARCH}" in \
+      *rocm720*) \
+        echo "ROCm 7.2 (GPU_ARCH=${GPU_ARCH}): libdrm-amdgpu packages already present, skipping"; \
+        ;; \
+      *) \
+        echo "ROCm 7.0 (GPU_ARCH=${GPU_ARCH}): installing libdrm-amdgpu packages"; \
+        curl -fsSL https://repo.radeon.com/rocm/rocm.gpg.key \
+          | gpg --dearmor -o /etc/apt/keyrings/amdgpu-graphics.gpg \
+        && echo 'deb [arch=amd64,i386 signed-by=/etc/apt/keyrings/amdgpu-graphics.gpg] https://repo.radeon.com/graphics/7.0/ubuntu jammy main' \
+          > /etc/apt/sources.list.d/amdgpu-graphics.list \
+        && apt-get update \
+        && apt-get install -y --no-install-recommends \
+             libdrm-amdgpu-common \
+             libdrm-amdgpu-amdgpu1 \
+             libdrm2-amdgpu \
+        && rm -rf /var/lib/apt/lists/* \
+        && cp /opt/amdgpu/share/libdrm/amdgpu.ids /usr/share/libdrm/amdgpu.ids; \
+        ;; \
+    esac
+
 
 # Install some basic utilities
 RUN python -m pip install --upgrade pip && pip install setuptools_scm
@@ -144,36 +173,23 @@ RUN if [ "$BUILD_LLVM" = "1" ]; then \
 # (SETUPTOOLS_SCM_PRETEND_VERSION is set later for SGLang nightly builds and would otherwise
 # leak into AITER's version when AITER uses setuptools_scm)
 ENV SETUPTOOLS_SCM_PRETEND_VERSION=
-RUN pip uninstall -y aiter \
- && pip install psutil pybind11 # Required by AITER setup.py
+RUN pip uninstall -y aiter
 RUN git clone ${AITER_REPO} \
  && cd aiter \
  && git checkout ${AITER_COMMIT} \
- && git submodule update --init --recursive
-
-# Hot patches for AITER in v0.1.10.post3
-# This is for ROCm 7.2 only, because of the image rebase from vllm
-# to rocm/pytorch.
-RUN set -eux; \
-    case "${GPU_ARCH}" in \
-      *rocm720*) \
-        echo "ROCm 7.2 flavor detected from GPU_ARCH=${GPU_ARCH}"; \
-        cd aiter \
-        && sed -i '459 s/if.*:/if False:/' aiter/ops/triton/attention/pa_mqa_logits.py; \
-        ;; \
-      *) \
-        echo "Not rocm720 (GPU_ARCH=${GPU_ARCH}), skip patch"; \
-        ;; \
-    esac
+ && git submodule update --init --recursive \
+ && pip install -r requirements.txt
 
 RUN cd aiter \
      && echo "[AITER] GPU_ARCH=${GPU_ARCH}" \
      && if [ "$BUILD_AITER_ALL" = "1" ] && [ "$BUILD_LLVM" = "1" ]; then \
-          sh -c "HIP_CLANG_PATH=/sgl-workspace/llvm-project/build/bin/ PREBUILD_KERNELS=1 GPU_ARCHS=$GPU_ARCH_LIST python setup.py develop"; \
+          sh -c "HIP_CLANG_PATH=/sgl-workspace/llvm-project/build/bin/ PREBUILD_KERNELS=1 GPU_ARCHS=$GPU_ARCH_LIST python setup.py build_ext --inplace" \
+          && sh -c "HIP_CLANG_PATH=/sgl-workspace/llvm-project/build/bin/ GPU_ARCHS=$GPU_ARCH_LIST pip install --config-settings editable_mode=compat -e ."; \
         elif [ "$BUILD_AITER_ALL" = "1" ]; then \
-          sh -c "PREBUILD_KERNELS=1 GPU_ARCHS=$GPU_ARCH_LIST python setup.py develop"; \
+          sh -c "PREBUILD_KERNELS=1 GPU_ARCHS=$GPU_ARCH_LIST python setup.py build_ext --inplace" \
+          && sh -c "GPU_ARCHS=$GPU_ARCH_LIST pip install --config-settings editable_mode=compat -e ."; \
         else \
-          sh -c "GPU_ARCHS=$GPU_ARCH_LIST python setup.py develop"; \
+          sh -c "GPU_ARCHS=$GPU_ARCH_LIST pip install --config-settings editable_mode=compat -e ."; \
         fi \
       && echo "export PYTHONPATH=/sgl-workspace/aiter:\${PYTHONPATH}" >> /etc/bash.bashrc
 
@@ -364,17 +380,14 @@ RUN /bin/bash -lc 'set -euo pipefail; \
       initramfs-tools \
   && rm -rf /var/lib/apt/lists/*; \
   \
-  # NIC backend deps
+  # NIC backend deps — mori auto-detects NIC at runtime (MORI_DEVICE_NIC env var override).
+  # Only vendor packages are installed here for dlopen (e.g. libionic.so); no compile-time flags needed.
   case "${NIC_BACKEND}" in \
     # default: mlx5
     none) \
-      export USE_IONIC="OFF"; \
-      export USE_BNXT="OFF"; \
       ;; \
     # AMD NIC
     ainic) \
-      export USE_IONIC="ON"; \
-      export USE_BNXT="OFF"; \
       apt-get update && apt-get install -y --no-install-recommends ca-certificates curl gnupg apt-transport-https && \
       rm -rf /var/lib/apt/lists/* && mkdir -p /etc/apt/keyrings; \
       curl -fsSL https://repo.radeon.com/rocm/rocm.gpg.key | gpg --dearmor > /etc/apt/keyrings/amdainic.gpg; \
@@ -388,8 +401,6 @@ RUN /bin/bash -lc 'set -euo pipefail; \
       ;; \
     # TODO: Add Broadcom bnxt packages/repos here later.
     # bnxt) \
-    #   export USE_IONIC="OFF"; \
-    #   export USE_BNXT="ON"; \
     #   echo "[MORI] NIC_BACKEND=bnxt: USE_BNXT=ON. Add Broadcom bnxt packages/repos here later."; \
     #   ;; \
     *) \
@@ -400,7 +411,7 @@ RUN /bin/bash -lc 'set -euo pipefail; \
   \
   # Build/install MORI
   export MORI_GPU_ARCHS="${GPU_ARCH_LIST}"; \
-  echo "[MORI] MORI_GPU_ARCHS=${MORI_GPU_ARCHS} USE_IONIC=${USE_IONIC} USE_BNXT=${USE_BNXT}"; \
+  echo "[MORI] MORI_GPU_ARCHS=${MORI_GPU_ARCHS} NIC_BACKEND=${NIC_BACKEND}"; \
   rm -rf /sgl-workspace/mori; \
   git clone "${MORI_REPO}" /sgl-workspace/mori; \
   cd /sgl-workspace/mori; \

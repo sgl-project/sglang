@@ -125,8 +125,8 @@ class SchedulerUpdateWeightsMixin:
         self: Scheduler, recv_req: ReleaseMemoryOccupationReqInput
     ):
         assert (
-            self._is_no_request()
-        ), "release_memory_occupation should be called only when no ongoing request."
+            self.is_fully_idle()
+        ), "release_memory_occupation should be called only when server is idle."
 
         tags = recv_req.tags
 
@@ -220,6 +220,7 @@ def _export_static_state(model):
 
 
 def _import_static_state(model, static_params):
-    self_named_buffers = dict(model.named_buffers())
-    for name, tensor in static_params["buffers"]:
-        self_named_buffers[name][...] = tensor
+    with torch.inference_mode():
+        self_named_buffers = dict(model.named_buffers())
+        for name, tensor in static_params["buffers"]:
+            self_named_buffers[name][...] = tensor

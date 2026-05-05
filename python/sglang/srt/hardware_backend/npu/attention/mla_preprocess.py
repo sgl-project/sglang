@@ -266,7 +266,12 @@ class NPUFusedMLAPreprocess(torch.nn.Module):
     ):
         bsz, _ = hidden_states.view(-1, hidden_states.shape[-1]).shape
         self.dtype = hidden_states.dtype
-        self.cos, self.sin = self.get_sin_cos(positions)
+        if self.layer_id == 0:
+            self.cos, self.sin = self.get_sin_cos(positions)
+            self.rotary_emb.cos_cached, self.rotary_emb.sin_cache = self.cos, self.sin
+        else:
+            self.cos, self.sin = self.rotary_emb.cos_cached, self.rotary_emb.sin_cache
+
         self.kvCache, self.kvCacheRope, self.slotmapping = (
             self.get_kv_cache_and_cache_idx(forward_batch)
         )
@@ -340,7 +345,12 @@ class NPUFusedMLAPreprocess(torch.nn.Module):
             self.has_preprocess_weights = True
             self.dtype = hidden_states.dtype
 
-        cos, sin = self.get_sin_cos(positions)
+        if self.layer_id == 0:
+            cos, sin = self.get_sin_cos(positions)
+            self.rotary_emb.cos_cached, self.rotary_emb.sin_cache = cos, sin
+        else:
+            cos, sin = self.rotary_emb.cos_cached, self.rotary_emb.sin_cache
+
         k_cache, v_cache, slot_mapping = self.get_kv_cache_and_cache_idx(forward_batch)
 
         q_nope_out = torch.empty(

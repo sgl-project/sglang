@@ -19,6 +19,7 @@ from transformers import AutoProcessor, PreTrainedTokenizer
 from sglang.benchmark.datasets import get_dataset
 from sglang.benchmark.utils import get_processor, get_tokenizer
 from sglang.profiler import run_profile
+from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST
 from sglang.srt.entrypoints.http_server import launch_server
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import is_blackwell, kill_process_tree
@@ -94,6 +95,8 @@ class BenchArgs:
     skip_warmup: bool = False
     show_report: bool = False
     profile: bool = False
+    profile_activities: Tuple[str] = ("CPU", "GPU")
+    profile_start_step: Optional[int] = None
     profile_steps: int = 5
     profile_by_stage: bool = False
     profile_prefix: Optional[str] = None
@@ -111,6 +114,7 @@ class BenchArgs:
     seed: int = 42
     cache_hit_rate: float = 0.0
     backend: str = "sglang"
+    fake_prefill: bool = False
     server_args_for_metrics: Optional[List[str]] = None
 
     @staticmethod
@@ -141,6 +145,20 @@ class BenchArgs:
         parser.add_argument("--skip-warmup", action="store_true")
         parser.add_argument("--show-report", action="store_true")
         parser.add_argument("--profile", action="store_true")
+        parser.add_argument(
+            "--profile-activities",
+            type=str,
+            nargs="+",
+            default=("CPU", "GPU"),
+            choices=["CPU", "GPU", "XPU"],
+            help="Profiler activities: CPU, GPU, XPU. use torch profiler.",
+        )
+        parser.add_argument(
+            "--profile-start-step",
+            type=int,
+            default=BenchArgs.profile_start_step,
+            help="Start profiling after this many forward steps. Useful for warmup.",
+        )
         parser.add_argument(
             "--profile-steps", type=int, default=BenchArgs.profile_steps
         )
@@ -225,6 +243,14 @@ class BenchArgs:
             default=BenchArgs.backend,
             choices=["sglang", "vllm"],
             help="Backend server type (sglang or vllm).",
+        )
+        parser.add_argument(
+            "--fake-prefill",
+            action="store_true",
+            default=BenchArgs.fake_prefill,
+            help="Enable fake prefill mode for decode-only benchmarking. "
+            "Use with a decode server running --disaggregation-transfer-backend fake "
+            "to benchmark pure decode performance without a real prefill node.",
         )
         parser.add_argument(
             "--server-args-for-metrics",
@@ -394,6 +420,8 @@ def run_one_case(
     result_filename: str,
     tokenizer: PreTrainedTokenizer | AutoProcessor,
     profile: bool = False,
+    profile_activities: Tuple[str] = ("CPU", "GPU"),
+    profile_start_step: Optional[int] = None,
     profile_steps: int = BenchArgs.profile_steps,
     profile_by_stage: bool = False,
     profile_prefix: Optional[str] = BenchArgs.profile_prefix,
@@ -408,6 +436,7 @@ def run_one_case(
     gsp_system_prompt_len: int = BenchArgs.gsp_system_prompt_len,
     gsp_question_len: int = BenchArgs.gsp_question_len,
     gsp_output_len: int = BenchArgs.gsp_output_len,
+    fake_prefill: bool = False,
 ):
     if backend == "vllm":
         # You need to have export VLLM_SERVER_DEV_MODE=1 in your environment to use this endpoint.
@@ -502,6 +531,9 @@ def run_one_case(
         payload["input_ids"] = input_ids
         if image_data is not None:
             payload["image_data"] = image_data
+        if fake_prefill:
+            payload["bootstrap_host"] = FAKE_BOOTSTRAP_HOST
+            payload["bootstrap_room"] = 0
         gen_url = url + "/generate"
 
     # Warm up cache if cache_hit_rate > 0.0
@@ -523,10 +555,11 @@ def run_one_case(
         profile_link: str = run_profile(
             url=url,
             num_steps=profile_steps,
-            activities=["CPU", "GPU"],
+            activities=profile_activities,
             output_dir=profile_output_dir,
             profile_by_stage=profile_by_stage,
             profile_prefix=profile_prefix,
+            start_step=profile_start_step,
         )
 
     # Get metrics before the request (for cache hit rate calculation)
@@ -590,7 +623,7 @@ def run_one_case(
         last_gen_throughput = -1
         acc_length = -1
     else:
-        response = requests.get(url + "/get_server_info", timeout=DEFAULT_TIMEOUT)
+        response = requests.get(url + "/server_info", timeout=DEFAULT_TIMEOUT)
         response.raise_for_status()
         server_info = response.json()
         internal_state = server_info.get("internal_states", [{}])
@@ -774,7 +807,7 @@ def run_benchmark_internal(
         skip_max_running_requests_threshold = float("inf")
     else:
         model_name = None
-        response = requests.get(base_url + "/get_server_info", timeout=DEFAULT_TIMEOUT)
+        response = requests.get(base_url + "/server_info", timeout=DEFAULT_TIMEOUT)
         response.raise_for_status()
         server_info = response.json()
         if "tokenizer_path" in server_info:
@@ -845,6 +878,7 @@ def run_benchmark_internal(
                 parallel_batch=bench_args.parallel_batch,
                 backend=bench_args.backend,
                 model_name=model_name,
+                fake_prefill=bench_args.fake_prefill,
                 **gsp_kwargs,
             )
         print("=" * 8 + " Warmup End   " + "=" * 8 + "\n")
@@ -881,6 +915,7 @@ def run_benchmark_internal(
                     cache_hit_rate=bench_args.cache_hit_rate,
                     backend=bench_args.backend,
                     model_name=model_name,
+                    fake_prefill=bench_args.fake_prefill,
                     **gsp_kwargs,
                 )
             )
@@ -918,12 +953,15 @@ def run_benchmark_internal(
                             parallel_batch=bench_args.parallel_batch,
                             cache_hit_rate=bench_args.cache_hit_rate,
                             profile=bench_args.profile,
+                            profile_activities=bench_args.profile_activities,
+                            profile_start_step=bench_args.profile_start_step,
                             profile_steps=bench_args.profile_steps,
                             profile_by_stage=bench_args.profile_by_stage,
                             profile_prefix=profile_prefix,
                             profile_output_dir=bench_args.profile_output_dir,
                             backend=bench_args.backend,
                             model_name=model_name,
+                            fake_prefill=bench_args.fake_prefill,
                             **gsp_kwargs,
                         )
                     )

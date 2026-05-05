@@ -1,11 +1,17 @@
 import argparse
 import glob
+import os
 import sys
 from typing import List
 
 import tabulate
 
-from sglang.test.ci.ci_register import CIRegistry, HWBackend, collect_tests
+from sglang.test.ci.ci_register import (
+    CIRegistry,
+    HWBackend,
+    auto_partition,
+    collect_tests,
+)
 from sglang.test.ci.ci_utils import run_unittest_files
 
 HW_MAPPING = {
@@ -17,34 +23,40 @@ HW_MAPPING = {
 
 # Per-commit test suites (run on every PR)
 PER_COMMIT_SUITES = {
-    HWBackend.CPU: ["default", "stage-a-cpu-only"],
+    HWBackend.CPU: ["stage-a-test-cpu"],
     HWBackend.AMD: [
-        "stage-a-test-1-amd",
-        "stage-b-test-small-1-gpu-amd",
-        "stage-b-test-small-1-gpu-amd-nondeterministic",
-        "stage-b-test-small-1-gpu-amd-mi35x",
+        "stage-a-test-1-gpu-small-amd",
+        "stage-b-test-1-gpu-small-amd",
+        "stage-b-test-1-gpu-small-amd-nondeterministic",
+        "stage-b-test-1-gpu-small-amd-mi35x",
         "stage-b-test-large-8-gpu-35x-disaggregation-amd",
-        "stage-b-test-large-1-gpu-amd",
-        "stage-b-test-large-2-gpu-amd",
-        "stage-c-test-aiter-fusion-8-gpu-amd",
+        "stage-b-test-1-gpu-large-amd",
+        "stage-b-test-2-gpu-large-amd",
+        "stage-c-test-4-gpu-amd",
+        "stage-c-test-large-8-gpu-amd",
         "stage-c-test-large-8-gpu-amd-mi35x",
     ],
     HWBackend.CUDA: [
-        "stage-a-test-1",
-        "stage-b-test-small-1-gpu",
-        "stage-b-test-large-1-gpu",
-        "stage-b-test-large-2-gpu",
+        "stage-a-test-1-gpu-small",
+        "stage-b-test-1-gpu-small",
+        "stage-b-test-1-gpu-large",
+        "stage-b-test-2-gpu-large",
+        "stage-b-test-4-gpu-b200",
+        "stage-b-kernel-unit-1-gpu-large",
+        "stage-b-kernel-unit-1-gpu-b200",
+        "stage-b-kernel-unit-8-gpu-h200",
+        "stage-b-kernel-benchmark-1-gpu-large",
         "stage-c-test-4-gpu-h100",
         "stage-c-test-4-gpu-b200",
         "stage-c-test-4-gpu-gb200",
-        "stage-c-test-deepep-4-gpu",
         "stage-c-test-8-gpu-h20",
         "stage-c-test-8-gpu-h200",
         "stage-c-test-8-gpu-b200",
+        "stage-c-test-deepep-4-gpu-h100",
         "stage-c-test-deepep-8-gpu-h200",
     ],
     HWBackend.NPU: [
-        "stage-a-test-1",
+        "stage-a-test-1-gpu-small",
         "stage-b-test-1-npu-a2",
         "stage-b-test-2-npu-a2",
         "stage-b-test-4-npu-a3",
@@ -66,16 +78,22 @@ NIGHTLY_SUITES = {
         "nightly-8-gpu-h200-basic",  # Basic tests for large models on H200
         "nightly-8-gpu-b200-basic",  # Basic tests for large models on B200
         "nightly-8-gpu-common",  # Common tests that run on both H200 and B200
+        "nightly-kernel-1-gpu",
+        "nightly-kernel-8-gpu-h200",
         # Eval and perf suites (2-gpu)
         "nightly-eval-text-2-gpu",
         "nightly-eval-vlm-2-gpu",
         "nightly-perf-text-2-gpu",
         "nightly-perf-vlm-2-gpu",
+        # GB300 (4x B200 NVL4) nightly suite
+        "nightly-4-gpu-gb300",
     ],
     HWBackend.AMD: [
         "nightly-amd",
         "nightly-amd-1-gpu",
         "nightly-amd-1-gpu-mi35x",
+        "nightly-amd-1-gpu-zimage-turbo",
+        "nightly-amd-4-gpu",
         "nightly-amd-8-gpu",
         "nightly-amd-vlm",
         # MI35x 8-GPU suite (different model configs)
@@ -88,8 +106,54 @@ NIGHTLY_SUITES = {
         "nightly-4-npu-a3",
         "nightly-8-npu-a3",
         "nightly-16-npu-a3",
+        "full-1-npu-a3",
+        "full-2-npu-a3",
+        "full-4-npu-a3",
+        "full-8-npu-a3",
+        "full-16-npu-a3",
     ],
 }
+
+
+OTHER_SUITES = {
+    HWBackend.CPU: [
+        "default",
+    ],
+    HWBackend.CUDA: [
+        "stress",
+        "weekly-8-gpu-h200",
+    ],
+}
+
+
+_SUITE_CHECKED_BACKENDS = {HWBackend.CUDA, HWBackend.CPU}
+
+
+def _valid_suites_by_backend() -> dict:
+    """Build a mapping from backend to its set of valid suite names."""
+    result = {}
+    for suite_dict in (PER_COMMIT_SUITES, NIGHTLY_SUITES, OTHER_SUITES):
+        for backend, suites in suite_dict.items():
+            if backend not in result:
+                result[backend] = set()
+            result[backend].update(suites)
+    return result
+
+
+def validate_all_suites(all_tests: List[CIRegistry]):
+    """Fail fast if any test is registered to a suite that doesn't belong to its backend."""
+    valid_by_backend = _valid_suites_by_backend()
+    errors = []
+    for t in all_tests:
+        if t.backend not in _SUITE_CHECKED_BACKENDS:
+            continue
+        valid = valid_by_backend.get(t.backend, set())
+        if t.suite not in valid:
+            errors.append(
+                f"  {t.filename}: backend={t.backend.name}, suite='{t.suite}'"
+            )
+    if errors:
+        raise ValueError("Tests registered to invalid suites:\n" + "\n".join(errors))
 
 
 def filter_tests(
@@ -114,33 +178,6 @@ def filter_tests(
     skipped_tests = [t for t in ci_tests if t.disabled is not None]
 
     return enabled_tests, skipped_tests
-
-
-def auto_partition(files: List[CIRegistry], rank, size):
-    """
-    Partition files into size sublists with approximately equal sums of estimated times
-    using a greedy algorithm (LPT heuristic), and return the partition for the specified rank.
-    """
-    if not files or size <= 0:
-        return []
-
-    # Sort files by estimated_time in descending order (LPT heuristic).
-    # Use filename as tie-breaker to ensure deterministic partitioning
-    # regardless of glob ordering.
-    sorted_files = sorted(files, key=lambda f: (-f.est_time, f.filename))
-
-    partitions = [[] for _ in range(size)]
-    partition_sums = [0.0] * size
-
-    # Greedily assign each file to the partition with the smallest current total time
-    for file in sorted_files:
-        min_sum_idx = min(range(size), key=partition_sums.__getitem__)
-        partitions[min_sum_idx].append(file)
-        partition_sums[min_sum_idx] += file.est_time
-
-    if rank < size:
-        return partitions[rank]
-    return []
 
 
 def pretty_print_tests(
@@ -189,16 +226,33 @@ def run_a_suite(args):
     auto_partition_id = args.auto_partition_id
     auto_partition_size = args.auto_partition_size
 
-    # All tests (per-commit and nightly) are now in registered/
+    # Use absolute paths so the script works from any working directory
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    repo_root = os.path.dirname(script_dir)
+
+    # Registered tests under test/registered/
     files = [
         f
-        for f in glob.glob("registered/**/*.py", recursive=True)
+        for f in glob.glob(
+            os.path.join(script_dir, "registered", "**", "*.py"), recursive=True
+        )
         if not f.endswith("/conftest.py") and not f.endswith("/__init__.py")
     ]
-    # Strict: all registered files must have proper registration
+
+    # JIT kernel tests and benchmarks (live alongside kernel source)
+    jit_kernel_dir = os.path.join(repo_root, "python", "sglang", "jit_kernel")
+    files += glob.glob(
+        os.path.join(jit_kernel_dir, "tests", "**", "test_*.py"), recursive=True
+    )
+    files += glob.glob(
+        os.path.join(jit_kernel_dir, "benchmark", "**", "bench_*.py"), recursive=True
+    )
+
+    # Strict: all discovered files must have proper registration
     sanity_check = True
 
     all_tests = collect_tests(files, sanity_check=sanity_check)
+    validate_all_suites(all_tests)
     ci_tests, skipped_tests = filter_tests(all_tests, hw, suite, nightly)
 
     if auto_partition_size:

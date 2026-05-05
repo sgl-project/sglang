@@ -21,14 +21,13 @@ from collections import OrderedDict, defaultdict
 from typing import Dict, List, Optional, Tuple, Union
 
 import psutil
-import pybase64
 import setproctitle
 import zmq
 
+from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import (
     BatchEmbeddingOutput,
-    BatchMultimodalDecodeReq,
     BatchStrOutput,
     BatchTokenIDOutput,
     FreezeGCReq,
@@ -39,10 +38,10 @@ from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import (
     configure_logger,
     freeze_gc,
-    get_zmq_socket,
     kill_itself_when_parent_died,
 )
 from sglang.srt.utils.hf_transformers_utils import get_tokenizer
+from sglang.srt.utils.network import get_zmq_socket
 from sglang.srt.utils.watchdog import Watchdog
 from sglang.utils import (
     TypeBasedDispatcher,
@@ -88,15 +87,8 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
         # Init running status
         self.init_running_status(server_args)
 
-        if server_args.enable_metrics:
-            start_cpu_monitor_thread("detokenizer")
-
         # Init dispatcher
         self.init_request_dispatcher()
-
-    @staticmethod
-    def is_health_check_request(rid: Optional[str]) -> bool:
-        return isinstance(rid, str) and rid.startswith("HEALTH_CHECK")
 
     def init_ipc_channels(self, port_args: PortArgs):
         context = zmq.Context(2)
@@ -120,9 +112,8 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
 
     def init_running_status(self, server_args: ServerArgs):
         self.decode_status = LimitedCapacityDict(capacity=DETOKENIZER_MAX_STATES)
-        self.is_dummy = False
-        self.is_tool_call_parser_gpt_oss = server_args.tool_call_parser == "gpt-oss"
         self.disable_tokenizer_batch_decode = server_args.disable_tokenizer_batch_decode
+        self.is_tool_call_parser_gpt_oss = server_args.tool_call_parser == "gpt-oss"
 
         self.soft_watchdog = Watchdog.create(
             debug_name="DetokenizerManager",
@@ -131,12 +122,14 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             test_stuck_time=envs.SGLANG_TEST_STUCK_DETOKENIZER.get(),
         )
 
+        if server_args.enable_metrics:
+            start_cpu_monitor_thread("detokenizer")
+
     def init_request_dispatcher(self):
         self._request_dispatcher = TypeBasedDispatcher(
             [
                 (BatchEmbeddingOutput, self.handle_batch_embedding_out),
                 (BatchTokenIDOutput, self.handle_batch_token_id_out),
-                (BatchMultimodalDecodeReq, self.handle_multimodal_decode_req),
                 (FreezeGCReq, self.handle_freeze_gc_req),
             ]
         )
@@ -190,12 +183,11 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
     ) -> List[str]:
         """Batch decode with grouping by (skip_special_tokens, spaces_between_special_tokens)."""
 
-        assert self.tokenizer is not None
-
         # fast path
         first_skip, first_space = skip_list[0], space_list[0]
-        if all(s == first_skip for s in skip_list) and all(
-            sp == first_space for sp in space_list
+        if all(
+            s == first_skip and sp == first_space
+            for s, sp in zip(skip_list, space_list)
         ):
             return self.tokenizer.batch_decode(
                 ids_list,
@@ -236,9 +228,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
                     surr_offset=0,
                     read_offset=recv_obj.read_offsets[i],
                 )
-                if not self.is_health_check_request(rid):
-                    # for health check requests, we do not store the decode status
-                    self.decode_status[rid] = s
+                self.decode_status[rid] = s
             else:
                 s = self.decode_status[rid]
                 s.decode_ids.extend(recv_obj.decode_ids[i])
@@ -254,22 +244,16 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
 
         # Decode token ids to strings
         if not self.disable_tokenizer_batch_decode:
-            if not self.is_dummy:
-                # Run normal batch decode
-                surr_texts = self._grouped_batch_decode(
-                    surr_ids,
-                    recv_obj.skip_special_tokens,
-                    recv_obj.spaces_between_special_tokens,
-                )
-                read_texts = self._grouped_batch_decode(
-                    read_ids,
-                    recv_obj.skip_special_tokens,
-                    recv_obj.spaces_between_special_tokens,
-                )
-            else:
-                # If it is dummy weights, just return dummy strings to prevent potential detokenization edge cases
-                surr_texts = ["dog" for _ in surr_ids]
-                read_texts = ["cat" for _ in read_ids]
+            surr_texts = self._grouped_batch_decode(
+                surr_ids,
+                recv_obj.skip_special_tokens,
+                recv_obj.spaces_between_special_tokens,
+            )
+            read_texts = self._grouped_batch_decode(
+                read_ids,
+                recv_obj.skip_special_tokens,
+                recv_obj.spaces_between_special_tokens,
+            )
         else:
             # Do not use batch decode to prevent some detokenization edge cases (e.g., gpt-oss).
             surr_texts = [
@@ -297,30 +281,22 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
         output_strs = []
         for i in range(bs):
             rid = recv_obj.rids[i]
-            if self.is_health_check_request(rid):
-                s = DecodeStatus(
-                    decoded_text=recv_obj.decoded_texts[i],
-                    decode_ids=recv_obj.decode_ids[i],
-                    surr_offset=0,
-                    read_offset=recv_obj.read_offsets[i],
+            try:
+                s = self.decode_status[rid]
+            except KeyError:
+                raise RuntimeError(
+                    f"Decode status not found for request {rid}. "
+                    "It may be due to the request being evicted from the decode status due to memory pressure. "
+                    "Please increase the maximum number of requests by setting "
+                    "the SGLANG_DETOKENIZER_MAX_STATES environment variable to a bigger value than the default value. "
+                    f"The current value is {DETOKENIZER_MAX_STATES}. "
+                    "For more details, see: https://github.com/sgl-project/sglang/issues/2812"
                 )
-            else:
-                try:
-                    s = self.decode_status[rid]
-                except KeyError:
-                    raise RuntimeError(
-                        f"Decode status not found for request {rid}. "
-                        "It may be due to the request being evicted from the decode status due to memory pressure. "
-                        "Please increase the maximum number of requests by setting "
-                        "the SGLANG_DETOKENIZER_MAX_STATES environment variable to a bigger value than the default value. "
-                        f"The current value is {DETOKENIZER_MAX_STATES}. "
-                        "For more details, see: https://github.com/sgl-project/sglang/issues/2812"
-                    )
             new_text = read_texts[i][len(surr_texts[i]) :]
             if recv_obj.finished_reasons[i] is None:
                 # Streaming chunk: update the decode status
-                if len(new_text) > 0 and not new_text.endswith("�"):
-                    s.decoded_text = s.decoded_text + new_text
+                if new_text and not new_text.endswith("�"):
+                    s.decoded_text += new_text
                     s.surr_offset = s.read_offset
                     s.read_offset = len(s.decode_ids)
                     new_text = ""
@@ -335,27 +311,13 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
                 recv_obj.finished_reasons[i],
                 recv_obj.no_stop_trim[i],
             )
+
             # Incrementally send text.
             incremental_output = output_str[s.sent_offset :]
             s.sent_offset = len(output_str)
             output_strs.append(incremental_output)
 
         return output_strs
-
-    def _extract_routed_experts(
-        self, recv_obj: BatchTokenIDOutput
-    ) -> list[str | None] | None:
-        routed_experts = None
-        if recv_obj.routed_experts is not None:
-            routed_experts = [
-                (
-                    pybase64.b64encode(routed_experts.numpy().tobytes()).decode("utf-8")
-                    if routed_experts is not None
-                    else None
-                )
-                for routed_experts in recv_obj.routed_experts
-            ]
-        return routed_experts
 
     def handle_batch_token_id_out(self, recv_obj: BatchTokenIDOutput):
         # If handling idle batch, set output_strs to [].
@@ -364,8 +326,6 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             if len(recv_obj.rids) > 0
             else []
         )
-        routed_experts = self._extract_routed_experts(recv_obj)
-
         return BatchStrOutput(
             rids=recv_obj.rids,
             http_worker_ipcs=recv_obj.http_worker_ipcs,
@@ -373,6 +333,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             output_strs=output_strs,
             output_ids=recv_obj.output_ids,
             prompt_tokens=recv_obj.prompt_tokens,
+            reasoning_tokens=recv_obj.reasoning_tokens,
             completion_tokens=recv_obj.completion_tokens,
             cached_tokens=recv_obj.cached_tokens,
             cached_tokens_details=recv_obj.cached_tokens_details,
@@ -393,7 +354,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             output_token_ids_logprobs_idx=recv_obj.output_token_ids_logprobs_idx,
             output_token_entropy_val=recv_obj.output_token_entropy_val,
             output_hidden_states=recv_obj.output_hidden_states,
-            routed_experts=routed_experts,
+            routed_experts=recv_obj.routed_experts,
             customized_info=recv_obj.customized_info,
             placeholder_tokens_idx=None,
             placeholder_tokens_val=None,
@@ -404,12 +365,13 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             time_stats=recv_obj.time_stats,
         )
 
-    def handle_multimodal_decode_req(self, recv_obj: BatchMultimodalDecodeReq):
-        raise NotImplementedError()
-
     def handle_freeze_gc_req(self, recv_req: FreezeGCReq):
         freeze_gc("Detokenizer Manager")
         return None
+
+
+def is_health_check_request(rid: Optional[str]) -> bool:
+    return isinstance(rid, str) and rid.startswith(HEALTH_CHECK_RID_PREFIX)
 
 
 class LimitedCapacityDict(OrderedDict):
@@ -435,6 +397,7 @@ def run_detokenizer_process(
     configure_logger(server_args)
     parent_process = psutil.Process().parent()
 
+    manager = None
     try:
         manager = detokenizer_manager_class(server_args, port_args)
         if server_args.tokenizer_worker_num == 1:
@@ -444,5 +407,6 @@ def run_detokenizer_process(
     except Exception:
         traceback = get_exception_traceback()
         logger.error(f"DetokenizerManager hit an exception: {traceback}")
-        manager.maybe_clear_socket_mapping()
+        if manager is not None:
+            manager.maybe_clear_socket_mapping()
         parent_process.send_signal(signal.SIGQUIT)

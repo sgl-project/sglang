@@ -2,6 +2,7 @@ from typing import Callable
 
 from torch import nn
 
+from sglang.kernel_api_logging import debug_kernel_api
 from sglang.srt.utils import (
     cpu_has_amx_support,
     is_cpu,
@@ -67,6 +68,7 @@ class MultiPlatformOp(nn.Module):
         self.is_torch_compile = False
 
     # Please do not override this method, because `self._forward_method` can change when in torch compile mode
+    @debug_kernel_api
     def forward(self, *args, **kwargs):
         return self._forward_method(*args, **kwargs)
 

@@ -3,7 +3,7 @@ import unittest
 from types import SimpleNamespace
 
 from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.few_shot_gsm8k import run_eval
+from sglang.test.run_eval import run_eval
 from sglang.test.server_fixtures.disaggregation_fixture import (
     PDDisaggregationServerBase,
 )
@@ -39,6 +39,8 @@ class TestDisaggregationPrefillPPAccuracy(PDDisaggregationServerBase):
             "--trust-remote-code",
             "--disaggregation-mode",
             "prefill",
+            "--disaggregation-bootstrap-port",
+            cls.bootstrap_port,
             "--tp-size",
             "2",
             "--pp-size",
@@ -59,6 +61,8 @@ class TestDisaggregationPrefillPPAccuracy(PDDisaggregationServerBase):
             "--trust-remote-code",
             "--disaggregation-mode",
             "decode",
+            "--disaggregation-bootstrap-port",
+            cls.bootstrap_port,
             "--tp-size",
             "2",
             "--base-gpu-id",
@@ -74,18 +78,18 @@ class TestDisaggregationPrefillPPAccuracy(PDDisaggregationServerBase):
 
     def test_gsm8k(self):
         args = SimpleNamespace(
-            num_shots=5,
-            data_path=None,
-            num_questions=200,
-            max_new_tokens=512,
-            parallel=128,
-            host=f"http://{self.base_host}",
-            port=int(self.lb_port),
+            base_url=self.base_url,
+            model=self.model,
+            eval_name="gsm8k",
+            api="completion",
+            max_tokens=512,
+            num_examples=200,
+            num_threads=128,
         )
         metrics = run_eval(args)
         print(f"{metrics=}")
 
-        self.assertGreater(metrics["accuracy"], 0.24)
+        self.assertGreater(metrics["score"], 0.24)
         # Wait a little bit so that the memory check happens.
         time.sleep(5)
 
@@ -112,6 +116,8 @@ class TestDisaggregationPrefillPPDynamicChunkAccuracy(PDDisaggregationServerBase
             "--trust-remote-code",
             "--disaggregation-mode",
             "prefill",
+            "--disaggregation-bootstrap-port",
+            cls.bootstrap_port,
             "--tp-size",
             "2",
             "--pp-size",
@@ -133,6 +139,8 @@ class TestDisaggregationPrefillPPDynamicChunkAccuracy(PDDisaggregationServerBase
             "--trust-remote-code",
             "--disaggregation-mode",
             "decode",
+            "--disaggregation-bootstrap-port",
+            cls.bootstrap_port,
             "--tp-size",
             "2",
             "--base-gpu-id",
@@ -148,18 +156,18 @@ class TestDisaggregationPrefillPPDynamicChunkAccuracy(PDDisaggregationServerBase
 
     def test_gsm8k(self):
         args = SimpleNamespace(
-            num_shots=5,
-            data_path=None,
-            num_questions=200,
-            max_new_tokens=512,
-            parallel=128,
-            host=f"http://{self.base_host}",
-            port=int(self.lb_port),
+            base_url=self.base_url,
+            model=self.model,
+            eval_name="gsm8k",
+            api="completion",
+            max_tokens=512,
+            num_examples=200,
+            num_threads=128,
         )
         metrics = run_eval(args)
         print(f"{metrics=}")
 
-        self.assertGreater(metrics["accuracy"], 0.24)
+        self.assertGreater(metrics["score"], 0.24)
         # Wait a little bit so that the memory check happens.
         time.sleep(5)
 
@@ -186,6 +194,8 @@ class TestDisaggregationDecodePPAccuracy(PDDisaggregationServerBase):
             "--trust-remote-code",
             "--disaggregation-mode",
             "prefill",
+            "--disaggregation-bootstrap-port",
+            cls.bootstrap_port,
             "--tp-size",
             "2",
             "--pp-size",
@@ -206,6 +216,8 @@ class TestDisaggregationDecodePPAccuracy(PDDisaggregationServerBase):
             "--trust-remote-code",
             "--disaggregation-mode",
             "decode",
+            "--disaggregation-bootstrap-port",
+            cls.bootstrap_port,
             "--tp-size",
             "2",
             "--pp-size",
@@ -223,18 +235,18 @@ class TestDisaggregationDecodePPAccuracy(PDDisaggregationServerBase):
 
     def test_gsm8k(self):
         args = SimpleNamespace(
-            num_shots=5,
-            data_path=None,
-            num_questions=200,
-            max_new_tokens=512,
-            parallel=128,
-            host=f"http://{self.base_host}",
-            port=int(self.lb_port),
+            base_url=self.base_url,
+            model=self.model,
+            eval_name="gsm8k",
+            api="completion",
+            max_tokens=512,
+            num_examples=200,
+            num_threads=128,
         )
         metrics = run_eval(args)
         print(f"{metrics=}")
 
-        self.assertGreater(metrics["accuracy"], 0.24)
+        self.assertGreater(metrics["score"], 0.24)
         # Wait a little bit so that the memory check happens.
         time.sleep(5)
 

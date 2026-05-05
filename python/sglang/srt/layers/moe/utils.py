@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import logging
+import os
 from contextlib import contextmanager
 from enum import Enum, IntEnum
 from typing import TYPE_CHECKING, Optional
+
+import torch
 
 from sglang.srt.distributed.parallel_state import get_moe_expert_parallel_world_size
 from sglang.srt.layers.dp_attention import (
@@ -22,9 +25,11 @@ class MoeA2ABackend(Enum):
     NONE = "none"
     DEEPEP = "deepep"
     MOONCAKE = "mooncake"
+    NIXL = "nixl"
     MORI = "mori"
     ASCEND_FUSEEP = "ascend_fuseep"
     FLASHINFER = "flashinfer"
+    CUSTOMIZED = "customized"
 
     @classmethod
     def _missing_(cls, value):
@@ -44,6 +49,9 @@ class MoeA2ABackend(Enum):
     def is_mooncake(self):
         return self == MoeA2ABackend.MOONCAKE
 
+    def is_nixl(self):
+        return self == MoeA2ABackend.NIXL
+
     def is_flashinfer(self):
         return self == MoeA2ABackend.FLASHINFER
 
@@ -53,6 +61,9 @@ class MoeA2ABackend(Enum):
     def is_mori(self):
         return self == MoeA2ABackend.MORI
 
+    def is_customized(self):
+        return self == MoeA2ABackend.CUSTOMIZED
+
 
 class MoeRunnerBackend(Enum):
 
@@ -61,6 +72,7 @@ class MoeRunnerBackend(Enum):
     TRITON = "triton"
     TRITON_KERNELS = "triton_kernel"
     FLASHINFER_TRTLLM = "flashinfer_trtllm"
+    FLASHINFER_TRTLLM_ROUTED = "flashinfer_trtllm_routed"
     FLASHINFER_CUTLASS = "flashinfer_cutlass"
     FLASHINFER_MXFP4 = "flashinfer_mxfp4"
     FLASHINFER_CUTEDSL = "flashinfer_cutedsl"
@@ -81,6 +93,9 @@ class MoeRunnerBackend(Enum):
 
     def is_flashinfer_trtllm(self):
         return self == MoeRunnerBackend.FLASHINFER_TRTLLM
+
+    def is_flashinfer_trtllm_routed(self):
+        return self == MoeRunnerBackend.FLASHINFER_TRTLLM_ROUTED
 
     def is_flashinfer_cutlass(self):
         return self == MoeRunnerBackend.FLASHINFER_CUTLASS
@@ -242,6 +257,12 @@ def is_sbo_enabled() -> bool:
     return IS_SBO_ENABLED
 
 
+def is_deepep_class_backend() -> bool:
+    """Check if the MoE backend is DeepEP-family (DeepEP, Mooncake, or Mori)."""
+    b = get_moe_a2a_backend()
+    return b.is_deepep() or b.is_mooncake() or b.is_mori()
+
+
 def get_tbo_token_distribution_threshold() -> float:
     global TBO_TOKEN_DISTRIBUTION_THRESHOLD
     if TBO_TOKEN_DISTRIBUTION_THRESHOLD is None:
@@ -273,6 +294,21 @@ def should_use_flashinfer_cutlass_moe_fp4_allgather():
         and get_moe_runner_backend().is_flashinfer_cutlass()
         and is_dp_attention_enabled()
         and MOE_QUANTIZATION == "modelopt_fp4"
+        and get_moe_expert_parallel_world_size() == get_attention_dp_size()
+    )
+
+
+def should_use_dp_reduce_scatterv():
+    """
+    Use reduce_scatterv in the standard dispatcher's combine() for DP attention
+    with EP, replacing the default all-reduce + dp_scatter path.
+    Only changes the combine (post-kernel) communication; dispatch is unchanged.
+    """
+    return (
+        not should_use_flashinfer_cutlass_moe_fp4_allgather()
+        and get_moe_a2a_backend().is_none()
+        and is_dp_attention_enabled()
+        and get_attention_dp_size() > 1
         and get_moe_expert_parallel_world_size() == get_attention_dp_size()
     )
 
@@ -333,3 +369,51 @@ class RoutingMethodType(IntEnum):
     TopK = (5,)
     # Unspecified
     Unspecified = 6
+
+
+AITER_PADDING_SIZE = 128
+TRITON_PADDING_SIZE = 128
+
+
+# Unit of padding - context dependent
+def get_moe_padding_size(is_aiter_moe):
+    if is_aiter_moe:
+        return AITER_PADDING_SIZE
+    else:
+        return (
+            TRITON_PADDING_SIZE
+            if bool(int(os.getenv("SGLANG_MOE_PADDING", "0")))
+            else 0
+        )
+
+
+def get_moe_weight_sizes(inter_dim, is_concat, is_packed, is_aiter_moe):
+    """
+    Calculate dimensions for MoE weight tensors.
+
+    Args:
+        inter_dim: Base intermediate dimension.
+        is_concat: If True, fusions W1 (gate) and W3 (up) projections.
+        is_packed: If True, uses 4-bit quantization (two FP4 elements per byte).
+        is_aiter_moe: If True, applies Aiter-specific kernel padding alignment.
+    """
+    # w2_down_dim is the packing rank, but w13_up_dim not (of matrix to matmul)
+    w13_up_dim = 2 * inter_dim if is_concat else inter_dim
+    w2_down_dim = inter_dim // 2 if is_packed else inter_dim
+
+    if is_aiter_moe:
+        padding_size = get_moe_padding_size(True)
+        align_aiter = lambda n: ((n + padding_size - 1) // padding_size) * padding_size
+        is_padded = (w2_down_dim % padding_size) > 0
+        if is_padded:
+            # w2_down_dim, padding & aligned, unit: parameter dtype
+            w2_down_dim = align_aiter(w2_down_dim)
+        # up proj + gate fusion : 2x
+        if is_concat:
+            w13_up_dim = w2_down_dim * 2
+        # packed
+        if hasattr(torch, "float4_e2m1fn_x2") and is_packed:
+            # w13_up_dim (row rank of matmul matrix) is not packing dim, *2 to recover
+            w13_up_dim *= 2
+
+    return (w13_up_dim, w2_down_dim, False if not is_aiter_moe else is_padded)

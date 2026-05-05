@@ -25,6 +25,7 @@ from sglang.srt.managers.io_struct import (
 )
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, Req
 from sglang.srt.mem_cache.session_aware_cache import SessionAwareCache
+from sglang.srt.utils.common import log_info_on_rank0
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
@@ -92,6 +93,8 @@ class Session:
         self.timeout = timeout
         self.last_active_time: float = time.monotonic()
         self.req_nodes: Dict[str, SessionReqNode] = {}
+        self.close_on_finish: bool = False
+        self._inflight: bool = False
 
     def is_timed_out(self) -> bool:
         if self.timeout is None:
@@ -115,7 +118,10 @@ class Session:
         abort_message = ""
         if self.streaming:
             # Streaming sessions: only simple appends allowed; reject otherwise.
-            if session_params.replace:
+            if self._inflight:
+                abort = True
+                abort_message = "Streaming session already has an active request."
+            elif session_params.replace:
                 abort = True
                 abort_message = "Streaming sessions do not support replace."
             elif session_params.drop_previous_output:
@@ -128,7 +134,9 @@ class Session:
                 abort_message = "Streaming sessions do not support offset."
             elif self.req_nodes:
                 assert len(self.req_nodes) == 1
-                _, last_req_node = self.req_nodes.popitem()
+                # Peek (don't pop) the single req_node. req_nodes is updated
+                # only in finish_req after the request completes successfully.
+                [last_req_node] = self.req_nodes.values()
                 last_req = last_req_node.req
         elif session_params.replace:
             if session_params.rid is None:
@@ -164,6 +172,19 @@ class Session:
                 and req.input_ids[0] == tokenizer.bos_token_id
             ):
                 req.input_ids = req.input_ids[1:]
+                # Adjust mm_item offsets since they were computed on
+                # the pre-strip sequence (with BOS at position 0)
+                if req.mm_inputs:
+                    for item in req.mm_inputs.mm_items:
+                        if item.offsets:
+                            if any(s == 0 for s, _ in item.offsets):
+                                logging.warning(
+                                    "mm_item offset starts at 0 (BOS position), "
+                                    "clamping to 0 after BOS strip"
+                                )
+                            item.offsets = [
+                                (max(0, s - 1), max(0, e - 1)) for s, e in item.offsets
+                            ]
 
             input_ids = (
                 last_req.origin_input_ids
@@ -225,14 +246,26 @@ class Session:
         if abort:
             new_req.set_finish_with_abort(abort_message)
         elif self.streaming:
-            if last_req is not None:
-                last_req.session = None
-            self.req_nodes[req.rid] = SessionReqNode(new_req)
+            # req_nodes is NOT updated here — finish_req() handles it.
+            self._inflight = True
         else:
             new_req_node = SessionReqNode(new_req, last_req_node)
             self.req_nodes[req.rid] = new_req_node
 
         return new_req
+
+    def finish_req(self, req):
+        """Update req_nodes after a streaming request finishes successfully."""
+        self._inflight = False
+        if self.req_nodes:
+            [prev_node] = self.req_nodes.values()
+            prev_node.req.session = None
+            self.req_nodes.clear()
+        self.req_nodes[req.rid] = SessionReqNode(req)
+
+    def abort_req(self):
+        """Clear inflight flag on abort (req_nodes stays unchanged)."""
+        self._inflight = False
 
 
 class SessionController:
@@ -262,6 +295,9 @@ class SessionController:
                 streaming=bool(recv_req.streaming),
                 timeout=recv_req.timeout,
             )
+            log_info_on_rank0(
+                logger, f"Session opened: {session_id} (active={len(self.sessions)})"
+            )
             return OpenSessionReqOutput(session_id, True)
 
     def close(self, recv_req: CloseSessionReqInput):
@@ -273,25 +309,84 @@ class SessionController:
 
     def _close(self, session_id: str):
         session = self.sessions[session_id]
-        if session.streaming and session.req_nodes:
+        req = None
+        has_unfinished_request = False
+        if session.streaming and session._inflight:
+            has_unfinished_request = True
+        elif session.streaming and session.req_nodes:
             assert len(session.req_nodes) == 1
-            req = next(iter(session.req_nodes.values())).req
+            [last_node] = session.req_nodes.values()
+            req = last_node.req
             if not req.finished():
-                req.session = None
+                has_unfinished_request = True
+
+        if has_unfinished_request:
+            # An in-flight request is still decoding on this session's KV
+            # memory. Freeing now would corrupt the scheduler. Mark the
+            # session for deferred cleanup: the request keeps its session
+            # reference so cache_finished_req takes the streaming path,
+            # and we schedule release_session for after it completes.
+            session.close_on_finish = True
+            logger.info(
+                "Deferring session close for %s (unfinished request)",
+                session_id,
+            )
+            return
+
+        # No owning request -- safe to release immediately.
+        if session.streaming and session.req_nodes:
+            req = next(iter(session.req_nodes.values())).req
+            req.session = None
+
+        # Release multimodal features held by session requests.
+        # Session reqs skip the normal mm cleanup path (scheduler and
+        # output_processor) so features stay alive until the session closes.
+        seen_mm = set()
+        for node in session.req_nodes.values():
+            mm = node.req.multimodal_inputs
+            if mm is not None and id(mm) not in seen_mm:
+                seen_mm.add(id(mm))
+                mm.release_features()
+            node.req.multimodal_inputs = None
+
         if isinstance(self.tree_cache, SessionAwareCache):
             self.tree_cache.release_session(session_id)
         del self.sessions[session_id]
+        log_info_on_rank0(
+            logger, f"Session closed: {session_id} (active={len(self.sessions)})"
+        )
 
     def maybe_reap(self, now: float, interval: float = 1.0):
         # reap sessions every second
         if now - self._last_reap_time > interval:
             self._last_reap_time = now
+
+            # Finish deferred closes for sessions whose requests completed.
+            pending = [
+                sid
+                for sid, session in self.sessions.items()
+                if session.close_on_finish and self._all_requests_finished(session)
+            ]
+            for sid in pending:
+                log_info_on_rank0(
+                    logger, f"Deferred close ready for session {sid}, releasing."
+                )
+                # Reset close_on_finish so _close proceeds with the release.
+                self.sessions[sid].close_on_finish = False
+                self._close(sid)
+
             timed_out = [
                 sid for sid, session in self.sessions.items() if session.is_timed_out()
             ]
             for sid in timed_out:
-                logger.info(f"Session {sid} timed out, closing.")
+                log_info_on_rank0(logger, f"Session {sid} timed out, closing.")
                 self._close(sid)
+
+    @staticmethod
+    def _all_requests_finished(session: Session) -> bool:
+        if not session.req_nodes:
+            return True
+        return all(node.req.finished() for node in session.req_nodes.values())
 
     @staticmethod
     def adjust_mm_offsets(recv_req: TokenizedGenerateReqInput, req: Req, image_inputs):

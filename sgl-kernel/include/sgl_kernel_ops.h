@@ -103,8 +103,6 @@ void mscclpp_allreduce(fptr_t _context, torch::Tensor& inp, torch::Tensor& out, 
 /*
  * From csrc/attention
  */
-void merge_state(
-    at::Tensor v_a, at::Tensor s_a, at::Tensor v_b, at::Tensor s_b, at::Tensor v_merged, at::Tensor s_merged);
 void merge_state_v2(
     at::Tensor v_a, at::Tensor s_a, at::Tensor v_b, at::Tensor s_b, at::Tensor v_merged, at::Tensor s_merged);
 void cutlass_mla_decode(
@@ -135,20 +133,6 @@ void silu_and_mul(at::Tensor& out, at::Tensor& input);
 void gelu_tanh_and_mul(at::Tensor& out, at::Tensor& input);
 void gelu_and_mul(at::Tensor& out, at::Tensor& input);
 
-void apply_rope_pos_ids_cos_sin_cache(
-    at::Tensor q,
-    at::Tensor k,
-    at::Tensor q_rope,
-    at::Tensor k_rope,
-    at::Tensor cos_sin_cache,
-    at::Tensor pos_ids,
-    bool interleave,
-    bool enable_pdl,
-    const std::optional<at::Tensor>& v,
-    const std::optional<at::Tensor>& k_buffer,
-    const std::optional<at::Tensor>& v_buffer,
-    const std::optional<at::Tensor>& kv_cache_loc);
-
 void rotary_embedding(
     torch::Tensor& positions,
     torch::Tensor& query,
@@ -156,17 +140,6 @@ void rotary_embedding(
     int64_t head_size,
     torch::Tensor& cos_sin_cache,
     bool is_neox);
-
-void downcast_fp8(
-    at::Tensor& k,
-    at::Tensor& v,
-    at::Tensor& k_out,
-    at::Tensor& v_out,
-    at::Tensor& k_scale,
-    at::Tensor& v_scale,
-    at::Tensor& loc,
-    int64_t mult,
-    int64_t offset);
 
 void copy_to_gpu_no_ce(const at::Tensor& input, at::Tensor& output);
 void concat_mla_k(torch::Tensor k, torch::Tensor k_nope, torch::Tensor k_rope);
@@ -199,13 +172,6 @@ void gelu_quick(at::Tensor& out, const at::Tensor& input);
  * From csrc/gemm
  */
 torch::Tensor awq_dequantize(torch::Tensor qweight, torch::Tensor scales, torch::Tensor qzeros);
-void cutlass_scaled_fp4_mm(
-    torch::Tensor& D,
-    torch::Tensor const& A,
-    torch::Tensor const& B,
-    torch::Tensor const& A_sf,
-    torch::Tensor const& B_sf,
-    torch::Tensor const& alpha);
 torch::Tensor int8_scaled_mm(
     const torch::Tensor& mat_a,
     const torch::Tensor& mat_b,
@@ -226,8 +192,6 @@ torch::Tensor fp8_blockwise_scaled_mm(
     const torch::Tensor& scales_a,
     const torch::Tensor& scales_b,
     const torch::Dtype& out_dtype);
-void scaled_fp4_quant(
-    torch::Tensor& output, torch::Tensor const& input, torch::Tensor& output_scale, torch::Tensor const& input_scale);
 void sgl_per_token_group_quant_8bit(
     at::Tensor input,
     at::Tensor output_q,
@@ -248,7 +212,6 @@ void sgl_per_token_group_quant_8bit_v2(
     bool scale_ue8m0,
     bool fuse_silu_and_mul,
     const std::optional<torch::Tensor>& masked_m);
-void sgl_per_tensor_quant_fp8(at::Tensor input, at::Tensor output_q, at::Tensor output_s, bool is_static);
 void sgl_per_token_quant_fp8(at::Tensor input, at::Tensor output_q, at::Tensor output_s);
 void bmm_fp8(
     at::Tensor A,
@@ -379,35 +342,6 @@ void fused_qk_norm_rope(
     double high,
     double attention_factor,
     int64_t rotary_dim);
-
-void cutlass_fp4_group_mm(
-    torch::Tensor& output,
-    const torch::Tensor& a,
-    const torch::Tensor& b,
-    const torch::Tensor& a_blockscale,
-    const torch::Tensor& b_blockscales,
-    const torch::Tensor& alphas,
-    const torch::Tensor& ab_strides,
-    const torch::Tensor& c_strides,
-    const torch::Tensor& problem_sizes,
-    const torch::Tensor& expert_offsets,
-    const torch::Tensor& sf_offsets);
-
-void scaled_fp4_experts_quant(
-    torch::Tensor& output,
-    torch::Tensor& output_scale,
-    torch::Tensor const& input,
-    torch::Tensor const& input_global_scale,
-    torch::Tensor const& input_offset_by_experts,
-    torch::Tensor const& output_scale_offset_by_experts);
-
-void silu_and_mul_scaled_fp4_experts_quant(
-    torch::Tensor& output,
-    torch::Tensor& output_scale,
-    torch::Tensor const& input,
-    torch::Tensor const& input_global_scale,
-    torch::Tensor const& mask,
-    bool use_silu_and_mul);
 
 /*
  * From csrc/moe/cutlass_moe/w4a8
@@ -647,7 +581,6 @@ void transfer_kv_all_layer_direct_lf_pf(
  * From csrc/memory
  */
 at::Tensor weak_ref_tensor(const at::Tensor& tensor);
-void store_kv_cache(at::Tensor k_cache, at::Tensor v_cache, at::Tensor out_loc, at::Tensor k, at::Tensor v);
 
 /*
  * From FlashInfer
@@ -657,9 +590,6 @@ void top_k_renorm_probs(
 
 void top_p_renorm_probs(
     at::Tensor probs, at::Tensor renorm_probs, std::optional<at::Tensor> maybe_top_p_arr, double top_p_val);
-
-void top_k_mask_logits(
-    at::Tensor logits, at::Tensor mask_logits, std::optional<at::Tensor> maybe_top_k_arr, int64_t top_k_val);
 
 namespace flash {
 /*

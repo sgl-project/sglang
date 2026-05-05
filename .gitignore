@@ -178,6 +178,7 @@ benchmark/llava_bench/images
 benchmark/llava_bench/mme_pack
 *.jsonl
 tmp*.txt
+/tmp/
 
 # Torch Compile logs
 tl_out/
@@ -224,15 +225,10 @@ work_dirs/
 *.exe
 *.out
 *.app
-
-compile_commands.json
-
 *.iml
 
 # VSCode
 .vscode
-
-1
 
 # Autoenv
 .env.leave
@@ -243,6 +239,7 @@ Cargo.lock
 # Generated vision test fixtures (regenerate with: python scripts/generate_vision_golden.py)
 sgl-model-gateway/tests/fixtures/golden/
 
+# Other repos
 lmms-eval
 
 **/.serena/
@@ -261,7 +258,7 @@ inputs/
 
 # setuptools-scm generated version file
 python/sglang/_version.py
-
+python/kernel.lock
 
 # MUSA section
 # Generated source files by torchada

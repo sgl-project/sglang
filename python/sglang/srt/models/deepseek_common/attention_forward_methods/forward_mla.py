@@ -16,6 +16,7 @@ from sglang.srt.layers.quantization.fp8_kernel import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.models.deepseek_common.utils import (
     FORWARD_ABSORB_CORE_ATTENTION_BACKENDS,
+    _is_cpu,
     _is_cublas_ge_129,
     _is_cuda,
     _is_gfx95_supported,
@@ -90,6 +91,7 @@ class DeepseekMLAForwardMixin:
         forward_batch: ForwardBatch,
         zero_allocator: BumpAllocator,
         llama_4_scaling: Optional[torch.Tensor] = None,
+        prev_topk_indices: Optional[torch.Tensor] = None,
     ):
         from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 
@@ -181,18 +183,7 @@ class DeepseekMLAForwardMixin:
                     q = self.q_b_proj(q)[0].view(
                         -1, self.num_local_heads, self.qk_head_dim
                     )
-                topk_indices = self.indexer(
-                    x=hidden_states,
-                    q_lora=q_lora,
-                    positions=positions,
-                    forward_batch=forward_batch,
-                    layer_id=self.layer_id,
-                )
-                current_stream.wait_stream(self.alt_stream)
-            else:
-                k_nope = k_nope.unsqueeze(1)
-                q = self.q_b_proj(q)[0].view(-1, self.num_local_heads, self.qk_head_dim)
-                if q_lora is not None:
+                if not self.skip_topk or prev_topk_indices is None:
                     topk_indices = self.indexer(
                         x=hidden_states,
                         q_lora=q_lora,
@@ -200,6 +191,23 @@ class DeepseekMLAForwardMixin:
                         forward_batch=forward_batch,
                         layer_id=self.layer_id,
                     )
+                else:
+                    topk_indices = prev_topk_indices
+                current_stream.wait_stream(self.alt_stream)
+            else:
+                k_nope = k_nope.unsqueeze(1)
+                q = self.q_b_proj(q)[0].view(-1, self.num_local_heads, self.qk_head_dim)
+                if q_lora is not None:
+                    if not self.skip_topk or prev_topk_indices is None:
+                        topk_indices = self.indexer(
+                            x=hidden_states,
+                            q_lora=q_lora,
+                            positions=positions,
+                            forward_batch=forward_batch,
+                            layer_id=self.layer_id,
+                        )
+                    else:
+                        topk_indices = prev_topk_indices
         else:
             q = self.q_proj(hidden_states)[0].view(
                 -1, self.num_local_heads, self.qk_head_dim
@@ -268,26 +276,34 @@ class DeepseekMLAForwardMixin:
                     )
 
         elif self.w_kc.dtype == torch.float8_e4m3fn:
-            # fix bmm_fp8 error under cublas12.9 caused by bumpallocator, detail in pr#11612
-            q_nope_val, q_nope_scale = per_tensor_quant_mla_fp8(
-                q_nope.transpose(0, 1),
-                (
-                    torch.zeros((1,), dtype=torch.float32, device=q_nope.device)
-                    if _is_cublas_ge_129
-                    else zero_allocator.allocate(1)
-                ),
-            )
-            q_nope_out = bmm_fp8(
-                q_nope_val, self.w_kc, q_nope_scale, self.w_scale, torch.bfloat16
-            )
+            if _is_cpu:
+                q_nope_out = torch.bmm(
+                    q_nope.to(torch.bfloat16).transpose(0, 1),
+                    self.w_kc.to(torch.bfloat16) * self.w_scale,
+                )
+            else:
+                # fix bmm_fp8 error under cublas12.9 caused by bumpallocator, detail in pr#11612
+                q_nope_val, q_nope_scale = per_tensor_quant_mla_fp8(
+                    q_nope.transpose(0, 1),
+                    (
+                        torch.zeros((1,), dtype=torch.float32, device=q_nope.device)
+                        if _is_cublas_ge_129
+                        else zero_allocator.allocate(1)
+                    ),
+                )
+                q_nope_out = bmm_fp8(
+                    q_nope_val, self.w_kc, q_nope_scale, self.w_scale, torch.bfloat16
+                )
         else:
             q_nope_out = torch.bmm(q_nope.transpose(0, 1), self.w_kc)
 
         q_nope_out = q_nope_out.transpose(0, 1)
 
+        skip_rope_for_nsa_tilelang_fused = self._skip_rope_for_nsa_tilelang_fused()
         if (
             self.rotary_emb is not None
             and (not self._fuse_rope_for_trtllm_mla(forward_batch))
+            and (not skip_rope_for_nsa_tilelang_fused)
             and (not _use_aiter or not _is_gfx95_supported or self.use_nsa)
         ):
             q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
@@ -325,24 +341,69 @@ class DeepseekMLAForwardMixin:
         save_kv_cache = True
 
         if self.current_attention_backend in FORWARD_ABSORB_CORE_ATTENTION_BACKENDS:
-            extra_args = {}
-            if self._fuse_rope_for_trtllm_mla(forward_batch):
-                extra_args = {
-                    "cos_sin_cache": self.rotary_emb.cos_sin_cache,
-                    "is_neox": self.rotary_emb.is_neox_style,
-                    "llama_4_scaling": llama_4_scaling,
-                }
-
-            attn_output = self.attn_mqa(
-                q_nope_out,
-                k_nope,
-                k_nope,
-                forward_batch,
-                q_rope=q_pe,
-                k_rope=k_pe,
-                **extra_args,
-                **(dict(topk_indices=topk_indices) if topk_indices is not None else {}),
-            )
+            if self._skip_rope_for_nsa_tilelang_fused() and self.rotary_emb is not None:
+                cos = self.rotary_emb.cos_cache
+                sin = self.rotary_emb.sin_cache
+                kv_cache_dtype = (
+                    fp8_dtype if self.kv_cache_dtype == "fp8_e4m3" else q_nope_out.dtype
+                )
+                q_cat, _, k_pe_fused, _ = fused_qk_rope_cat_and_cache_mla(
+                    q_nope_out,
+                    q_pe,
+                    k_nope,
+                    k_pe,
+                    forward_batch.token_to_kv_pool.get_key_buffer(
+                        self.attn_mqa.layer_id
+                    ),
+                    forward_batch.out_cache_loc,
+                    positions,
+                    cos,
+                    sin,
+                    self.attn_mqa.k_scale,
+                    self.rotary_emb.is_neox_style,
+                    q_out_dtype=kv_cache_dtype,
+                )
+                q_nope_fused = q_cat[..., : self.kv_lora_rank]
+                q_pe_fused = q_cat[..., self.kv_lora_rank :]
+                save_kv_cache = False
+                if llama_4_scaling is not None:
+                    q_nope_fused *= llama_4_scaling
+                attn_output = self.attn_mqa(
+                    q_nope_fused,
+                    None,
+                    None,
+                    forward_batch,
+                    q_rope=q_pe_fused,
+                    k_rope=k_pe_fused,
+                    save_kv_cache=save_kv_cache,
+                    **(
+                        dict(topk_indices=topk_indices)
+                        if topk_indices is not None
+                        else {}
+                    ),
+                )
+            else:
+                extra_args = {}
+                if self._fuse_rope_for_trtllm_mla(forward_batch):
+                    extra_args = {
+                        "cos_sin_cache": self.rotary_emb.cos_sin_cache,
+                        "is_neox": self.rotary_emb.is_neox_style,
+                        "llama_4_scaling": llama_4_scaling,
+                    }
+                attn_output = self.attn_mqa(
+                    q_nope_out,
+                    k_nope,
+                    k_nope,
+                    forward_batch,
+                    q_rope=q_pe,
+                    k_rope=k_pe,
+                    **extra_args,
+                    **(
+                        dict(topk_indices=topk_indices)
+                        if topk_indices is not None
+                        else {}
+                    ),
+                )
         else:
             if _use_aiter_gfx95:
                 cos = self.rotary_emb.cos_cache
@@ -455,22 +516,31 @@ class DeepseekMLAForwardMixin:
                 attn_bmm_output = attn_bmm_output.transpose(0, 1).flatten(1, 2)
 
         elif self.w_vc.dtype == torch.float8_e4m3fn:
-            attn_output_val, attn_output_scale = per_tensor_quant_mla_fp8(
-                attn_output.transpose(0, 1),
-                (
-                    torch.zeros((1,), dtype=torch.float32, device=attn_output.device)
-                    if _is_cublas_ge_129
-                    else zero_allocator.allocate(1)
-                ),
-            )
-            attn_bmm_output = bmm_fp8(
-                attn_output_val,
-                self.w_vc,
-                attn_output_scale,
-                self.w_scale,
-                torch.bfloat16,
-            )
-            attn_bmm_output = attn_bmm_output.transpose(0, 1).flatten(1, 2)
+            if _is_cpu:
+                attn_bmm_output = torch.bmm(
+                    attn_output.to(torch.bfloat16).transpose(0, 1),
+                    self.w_vc.to(torch.bfloat16) * self.w_scale,
+                )
+                attn_bmm_output = attn_bmm_output.transpose(0, 1).flatten(1, 2)
+            else:
+                attn_output_val, attn_output_scale = per_tensor_quant_mla_fp8(
+                    attn_output.transpose(0, 1),
+                    (
+                        torch.zeros(
+                            (1,), dtype=torch.float32, device=attn_output.device
+                        )
+                        if _is_cublas_ge_129
+                        else zero_allocator.allocate(1)
+                    ),
+                )
+                attn_bmm_output = bmm_fp8(
+                    attn_output_val,
+                    self.w_vc,
+                    attn_output_scale,
+                    self.w_scale,
+                    torch.bfloat16,
+                )
+                attn_bmm_output = attn_bmm_output.transpose(0, 1).flatten(1, 2)
         else:
             if is_in_piecewise_cuda_graph():
                 # torch dynamo requires out= op was called where output tensor was non-contiguous
@@ -494,7 +564,14 @@ class DeepseekMLAForwardMixin:
                 )
         output, _ = self.o_proj(attn_bmm_output)
 
-        return output
+        if self.next_skip_topk is None:
+            return output
+
+        # Return topk_indices for the next layer when enabling index cache
+        if not self.next_skip_topk:
+            return output, None
+        else:
+            return output, topk_indices
 
     def _fuse_rope_for_trtllm_mla(
         self: DeepseekV2AttentionMLA, forward_batch: ForwardBatch
@@ -515,4 +592,18 @@ class DeepseekMLAForwardMixin:
                 or forward_batch.forward_mode.is_target_verify()
             )
             and forward_batch.attn_backend.data_type == torch.float8_e4m3fn
+        )
+
+    def _skip_rope_for_nsa_tilelang_fused(self: DeepseekV2AttentionMLA) -> bool:
+        """
+        Check if we should skip rope and use fused rope+cache path for TileLang NSA on gfx95.
+        """
+        server_args = get_global_server_args()
+        return (
+            _use_aiter_gfx95
+            and self.current_attention_backend == "nsa"
+            and (
+                server_args.nsa_decode_backend == "tilelang"
+                or server_args.nsa_prefill_backend == "tilelang"
+            )
         )

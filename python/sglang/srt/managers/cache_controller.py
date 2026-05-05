@@ -261,10 +261,18 @@ class HiCacheController:
         storage_backend_extra_config: Optional[dict] = None,
         pp_rank: int = 0,
         pp_size: int = 1,
+        attn_cp_rank: int = 0,
+        attn_cp_size: int = 1,
+        enable_storage_metrics: bool = False,
     ):
         self.tp_group = tp_group
         self.mem_pool_device_allocator = token_to_kv_pool_allocator
-        self.mem_pool_device = token_to_kv_pool_allocator.get_kvcache()
+        mem_pool_device = token_to_kv_pool_allocator.get_kvcache()
+        from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
+
+        if isinstance(mem_pool_device, HybridLinearKVPool):
+            mem_pool_device = mem_pool_device.full_kv_pool
+        self.mem_pool_device = mem_pool_device
         self.mem_pool_host = mem_pool_host
         self.write_policy = write_policy
         self.page_size = page_size
@@ -274,6 +282,9 @@ class HiCacheController:
         self.storage_backend_type = None
         self.pp_rank = pp_rank
         self.pp_size = pp_size
+        self.attn_cp_rank = attn_cp_rank
+        self.attn_cp_size = attn_cp_size
+        self.enable_storage_metrics = enable_storage_metrics
 
         # Default storage page IO functions (may be overridden by attach).
         self.page_get_func = self._generic_page_get
@@ -423,7 +434,7 @@ class HiCacheController:
         # Rollback-safe init: if creation fails, keep controller state consistent
         # for future attach attempts.
         self.storage_backend_type = storage_backend
-        from sglang.srt.mem_cache.hicache_storage import get_hash_str
+        from sglang.srt.mem_cache.utils import get_hash_str
 
         self.get_hash_str = get_hash_str
         self.storage_config = self._generate_storage_config(
@@ -472,7 +483,10 @@ class HiCacheController:
             self.page_get_func = self._generic_page_get
             self.page_set_func = self._generic_page_set
 
-            if (self.storage_backend_type in ["hf3fs", "mooncake", "eic", "nixl"]) or (
+            if (
+                self.storage_backend_type
+                in ["hf3fs", "mooncake", "eic", "nixl", "simm"]
+            ) or (
                 self.storage_backend_type == "dynamic"
                 and bool(self.storage_config.extra_config.get("interface_v1", 0))
             ):
@@ -571,6 +585,8 @@ class HiCacheController:
         model_name: Optional[str] = None,
         storage_backend_extra_config: Optional[dict] = None,
     ):
+        if storage_backend_extra_config is None:
+            storage_backend_extra_config = {}
 
         if is_dp_attention_enabled():
             self.tp_rank = get_attention_tp_rank()
@@ -602,7 +618,10 @@ class HiCacheController:
             tp_size=self.tp_size,
             pp_rank=self.pp_rank,
             pp_size=self.pp_size,
+            attn_cp_rank=self.attn_cp_rank,
+            attn_cp_size=self.attn_cp_size,
             is_mla_model=is_mla_backend,
+            enable_storage_metrics=self.enable_storage_metrics,
             is_page_first_layout=self.mem_pool_host.layout == "page_first",
             model_name=model_name,
             tp_lcm_size=tp_lcm_size,
@@ -718,6 +737,10 @@ class HiCacheController:
                 return host_indices, device_indices.index_select(0, idx)
             elif self.mem_pool_host.layout == "page_first_direct":
                 return host_indices, device_indices.cpu()
+            else:
+                raise ValueError(
+                    f"Unsupported layout {self.mem_pool_host.layout!r} for io backend 'direct'"
+                )
         elif self.io_backend == "kernel_ascend":
             return host_indices, device_indices.cpu()
         else:

@@ -12,6 +12,7 @@ from sglang.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
     is_in_ci,
+    popen_launch_pd_server,
     popen_with_error_check,
 )
 from sglang.utils import wait_for_http_ready
@@ -28,10 +29,14 @@ class PDDisaggregationServerBase(CustomTestCase):
         cls.lb_port = base_port
         cls.prefill_port = f"{int(base_port) + 100}"
         cls.decode_port = f"{int(base_port) + 200}"
+        cls.bootstrap_port = f"{int(base_port) + 500}"
         cls.prefill_url = f"http://{cls.base_host}:{cls.prefill_port}"
         cls.decode_url = f"http://{cls.base_host}:{cls.decode_port}"
         cls.lb_url = f"http://{cls.base_host}:{cls.lb_port}"
-        print(f"{cls.base_host=} {cls.lb_port=} {cls.prefill_port=} {cls.decode_port=}")
+        cls.base_url = cls.lb_url
+        print(
+            f"{cls.base_host=} {cls.lb_port=} {cls.prefill_port=} {cls.decode_port=} {cls.bootstrap_port=}"
+        )
         cls.process_lb, cls.process_decode, cls.process_prefill = None, None, None
 
         # config transfer backend and rdma devices
@@ -51,6 +56,59 @@ class PDDisaggregationServerBase(CustomTestCase):
                 cls.rdma_devices = []
                 msg = "No RDMA devices specified for disaggregation test, using default settings."
                 warnings.warn(msg)
+
+    # Subclasses can set these to customize server args
+    extra_prefill_args = []
+    extra_decode_args = []
+
+    @classmethod
+    def start_prefill(cls):
+        prefill_args = [
+            "--trust-remote-code",
+            "--disaggregation-mode",
+            "prefill",
+            "--disaggregation-bootstrap-port",
+            cls.bootstrap_port,
+            "--tp",
+            "1",
+        ] + list(cls.extra_prefill_args)
+        prefill_args += cls.transfer_backend + cls.rdma_devices
+        cls.process_prefill = popen_launch_pd_server(
+            cls.model,
+            cls.prefill_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=prefill_args,
+        )
+
+    @classmethod
+    def start_decode(cls):
+        decode_args = [
+            "--trust-remote-code",
+            "--disaggregation-mode",
+            "decode",
+            "--disaggregation-bootstrap-port",
+            cls.bootstrap_port,
+            "--tp",
+            "1",
+            "--base-gpu-id",
+            "1",
+        ] + list(cls.extra_decode_args)
+        decode_args += cls.transfer_backend + cls.rdma_devices
+        cls.process_decode = popen_launch_pd_server(
+            cls.model,
+            cls.decode_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=decode_args,
+        )
+
+    @classmethod
+    def launch_all(cls):
+        """Start prefill, decode, wait for health, and launch LB."""
+        cls.start_prefill()
+        cls.start_decode()
+        cls.wait_server_ready(cls.prefill_url + "/health", process=cls.process_prefill)
+        cls.wait_server_ready(cls.decode_url + "/health", process=cls.process_decode)
+        cls.launch_lb()
 
     @classmethod
     def launch_lb(cls):
@@ -246,11 +304,13 @@ def get_rdma_devices_args():
     )
 
     rdma_devices = []
+    base_gpu = min(gpu_indices)
     for gpu_idx in gpu_indices:
-        nic_index = min(gpu_idx // gpus_per_rdma, n_rdma - 1)
+        nic_index = min((gpu_idx - base_gpu) // gpus_per_rdma, n_rdma - 1)
         rdma_devices.append(rdma_all_devices[nic_index])
 
     if not rdma_devices:
         return ",".join(_pick_default_pair(rdma_all_devices))
 
-    return ",".join(rdma_devices)
+    # Deduplicate while preserving order
+    return ",".join(dict.fromkeys(rdma_devices))
