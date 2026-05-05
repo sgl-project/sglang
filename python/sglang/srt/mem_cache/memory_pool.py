@@ -138,14 +138,10 @@ class ReqToTokenPool:
             enable=enable_memory_saver
         )
 
-        self.size = size
+        self.size = size + 1
         self.max_context_len = max_context_len
         self.device = device
         with memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
-            # +1 row for padding slot 0 (mirrors KV pool): cuda-graph padded
-            # batches default req_pool_indices to 0, so routing dummies through
-            # unowned slot 0 keeps req_to_token[0, :] zero and downstream writes
-            # harmless.
             self.req_to_token = torch.zeros(
                 (size + 1, max_context_len), dtype=torch.int32, device=device
             )
@@ -189,7 +185,7 @@ class ReqToTokenPool:
         req.req_pool_idx = None
 
     def clear(self):
-        self.free_slots = list(range(1, self.size + 1))
+        self.free_slots = list(range(1, self.size))
 
 
 class MambaPool:

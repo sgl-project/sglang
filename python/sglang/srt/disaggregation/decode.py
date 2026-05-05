@@ -126,12 +126,11 @@ class DecodeReqToTokenPool:
             enable=enable_memory_saver
         )
 
-        self.size = size
+        self.size = size + 1
         self.max_context_len = max_context_len
         self.device = device
         self.pre_alloc_size = pre_alloc_size
         with memory_saver_adapter.region(tag=GPU_MEMORY_TYPE_KV_CACHE):
-            # +1 row 0 padding; mirrors ReqToTokenPool / KV pool padding slot 0.
             self.req_to_token = torch.zeros(
                 (size + pre_alloc_size + 1, max_context_len),
                 dtype=torch.int32,
@@ -175,7 +174,7 @@ class DecodeReqToTokenPool:
         req.req_pool_idx = None
 
     def clear(self):
-        self.free_slots = list(range(1, self.size + self.pre_alloc_size + 1))
+        self.free_slots = list(range(1, self.size + self.pre_alloc_size))
 
 
 class HybridMambaDecodeReqToTokenPool(HybridReqToTokenPool):
@@ -240,7 +239,7 @@ class HybridMambaDecodeReqToTokenPool(HybridReqToTokenPool):
         )
 
     def clear(self):
-        self.free_slots = list(range(1, self.size + self.pre_alloc_size + 1))
+        self.free_slots = list(range(1, self.size + self.pre_alloc_size))
         self.mamba_pool.clear()
 
 
