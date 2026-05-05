@@ -850,19 +850,28 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
         Returns a dict with latency_ms, total_mb, speed_gb_s if computable, else None.
         """
         result = {}
-        assert transfer_metric.transfer_total_bytes is not None
 
         # Transfer latency, size, and speed
-        if transfer_metric.transfer_latency_s is not None:
+        if (
+            transfer_metric.transfer_latency_s is not None
+            and transfer_metric.transfer_total_bytes is not None
+        ):
             transfer_latency_s = transfer_metric.transfer_latency_s
+        elif transfer_metric.transfer_total_bytes is not None:
+            if (
+                self.prefill_transfer_queue_entry_time <= 0
+                or self.prefill_kv_transfer_finish_time <= 0
+            ):
+                transfer_latency_s = None
+            else:
+                transfer_latency_s = (
+                    self.prefill_kv_transfer_finish_time
+                    - self.prefill_transfer_queue_entry_time
+                )
         else:
-            if self.prefill_transfer_queue_entry_time <= 0 or self.completion_time <= 0:
-                return result if result else None
-            transfer_latency_s = (
-                self.completion_time - self.prefill_transfer_queue_entry_time
-            )
+            transfer_latency_s = None
 
-        if transfer_latency_s > 0:
+        if transfer_latency_s is not None and transfer_latency_s > 0:
             latency_ms = transfer_latency_s * 1000
 
             total_bytes = transfer_metric.transfer_total_bytes
