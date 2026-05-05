@@ -693,6 +693,7 @@ class ServerArgs:
     keep_mm_feature_on_device: bool = False
     enable_return_hidden_states: bool = False
     enable_return_routed_experts: bool = False
+    enable_return_routed_expert_weights: bool = False
     scheduler_recv_interval: int = 1
     numa_node: Optional[List[int]] = None
     enable_deterministic_inference: bool = False
@@ -6265,6 +6266,15 @@ class ServerArgs:
             "--enable-return-routed-experts",
             action="store_true",
             help="Enable returning routed experts of each layer with responses.",
+        )
+        parser.add_argument(
+            "--enable-return-routed-expert-weights",
+            action="store_true",
+            help=(
+                "Enable returning routing softmax weights of each layer alongside "
+                "the routed experts. Requires --enable-return-routed-experts. "
+                "Adds a parallel float32 buffer to the routed experts capturer."
+            ),
         )
         parser.add_argument(
             "--scheduler-recv-interval",
