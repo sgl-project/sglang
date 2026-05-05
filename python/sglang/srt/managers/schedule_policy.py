@@ -890,6 +890,10 @@ class PrefillAdder:
                 req.prefix_indices = torch.cat([req.prefix_indices, new_indices])
                 req.set_extend_input_len(len(req.fill_ids) - len(req.prefix_indices))
                 prefix_len = len(req.prefix_indices)
+
+                # Critical for L2 load-back + L1 demotion:
+                # loaded-back prefix KV is already owned by the tree/request and must not
+                # be freed as duplicate KV in cache_finished_req().
                 req.cache_protected_len = prefix_len
 
             input_tokens = self.ceil_paged_tokens(req.extend_input_len)

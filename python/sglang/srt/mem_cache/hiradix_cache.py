@@ -63,6 +63,7 @@ from sglang.srt.observability.metrics_collector import (
 )
 
 if TYPE_CHECKING:
+    from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.mem_cache.cache_init_params import CacheInitParams
     from sglang.srt.server_args import ServerArgs
 
@@ -184,6 +185,7 @@ class HiRadixCache(RadixCache):
         self.disable_hicache_l1_prefix_reuse = (
             server_args.disable_hicache_l1_prefix_reuse
         )
+        self._l1_demote_in_progress = False
 
         if self.disable_hicache_l1_prefix_reuse:
             assert server_args.enable_hierarchical_cache
@@ -796,24 +798,29 @@ class HiRadixCache(RadixCache):
         while finish_count > 0:
             _, finish_event, ack_list = self.cache_controller.ack_write_queue.pop(0)
             finish_event.synchronize()
+
+            did_ack = False
+
             for ack_id in ack_list:
                 backuped_node = self.ongoing_write_through.pop(ack_id)
                 # DMA confirmed -- block is now on host.
                 self._record_store_event(backuped_node, medium=StorageMedium.CPU)
                 self.dec_lock_ref(backuped_node)
-
-                # if disable L1 prefix reuse, demote to make them evictable sooner,
-                # otherwise we have to wait for the next eviction check to demote them,
-                # which may cause longer eviction latency
-                if self.disable_hicache_l1_prefix_reuse:
-                    self._maybe_demote_backuped_l1_leaves()
-
                 if self.enable_storage:
                     self.write_backup_storage(backuped_node)
+
+                did_ack = True
+
             finish_count -= 1
+
+            if did_ack:
+                self._maybe_demote_backuped_l1_leaves()
 
     def loading_check(self):
         finish_count = 0
+
+        did_ack = False
+
         for _, finish_event, ack_list in self.cache_controller.ack_load_queue:
             if not finish_event.query():
                 # the KV cache loading is still ongoing
@@ -824,8 +831,13 @@ class HiRadixCache(RadixCache):
                 end_node = self.ongoing_load_back.pop(ack_id)
                 self.dec_lock_ref(end_node)
 
+                did_ack = True
+
         # ACK until all events are processed
         del self.cache_controller.ack_load_queue[:finish_count]
+
+        if did_ack:
+            self._maybe_demote_backuped_l1_leaves()
 
     def evictable_size(self):
         return self.evictable_size_
@@ -867,12 +879,7 @@ class HiRadixCache(RadixCache):
                 ), f"This request holds the node from another tree"
             node = node.parent
 
-        result = DecLockRefResult(delta=delta)
-
-        if self.disable_hicache_l1_prefix_reuse:
-            self._maybe_demote_backuped_l1_leaves()
-
-        return result
+        return DecLockRefResult(delta=delta)
 
     def _update_host_leaf_status(self, node: TreeNode):
         if not node.evicted or node.lock_ref > 0:
@@ -1540,30 +1547,54 @@ class HiRadixCache(RadixCache):
         self.cache_controller.append_host_mem_release(host_indices[:completed_tokens])
         self.cache_controller.prefetch_tokens_occupied -= len(prefetch_key)
 
+    def _is_l1_demote_candidate(self, node: TreeNode) -> bool:
+        return (
+            node is not self.root_node
+            and node in self.evictable_leaves
+            and node.lock_ref == 0
+            and not node.evicted
+            and node.backuped
+            and node.value is not None
+            and node.id not in self.ongoing_load_back
+            and node.id not in self.ongoing_write_through
+        )
+
     def _maybe_demote_backuped_l1_leaves(self) -> int:
         if not self.disable_hicache_l1_prefix_reuse:
             return 0
 
-        total = 0
+        if self._l1_demote_in_progress:
+            return 0
 
-        while True:
-            victims = [
-                node
-                for node in list(self.evictable_leaves)
-                if node is not self.root_node
-                and node.lock_ref == 0
-                and not node.evicted
-                and node.backuped
-                and node.value is not None
-            ]
+        self._l1_demote_in_progress = True
+        try:
+            total = 0
 
-            if not victims:
-                return total
+            while True:
+                victims = [
+                    node
+                    for node in list(self.evictable_leaves)
+                    if self._is_l1_demote_candidate(node)
+                ]
 
-            for node in victims:
-                if node not in self.evictable_leaves:
-                    continue
-                if node.lock_ref != 0 or node.evicted or not node.backuped:
-                    continue
+                if not victims:
+                    return total
 
-                total += self._evict_backuped(node)
+                progressed = False
+                for node in victims:
+                    # Re-check because demoting one leaf can change parent/child state.
+                    if not self._is_l1_demote_candidate(node):
+                        continue
+
+                    total += self._evict_backuped(node)
+                    progressed = True
+
+                if not progressed:
+                    return total
+        finally:
+            self._l1_demote_in_progress = False
+
+    def cache_finished_req(self, req: Req, is_insert: bool = True):
+        ret = super().cache_finished_req(req, is_insert=is_insert)
+        self._maybe_demote_backuped_l1_leaves()
+        return ret
