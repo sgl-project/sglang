@@ -1,0 +1,25 @@
+load("//tools/bazel:sgl_defs.bzl", "sgl_cpu_test")
+
+sgl_cpu_test(
+    name = "test_code_patcher",
+    srcs = ["test_code_patcher.py"],
+    est_time = 10,
+    nightly = True,
+    suite = "stage-a-test-cpu",
+)
+
+sgl_cpu_test(
+    name = "test_dumper_integration",
+    srcs = ["test_dumper_integration.py"],
+    est_time = 10,
+    nightly = True,
+    suite = "stage-a-test-cpu",
+)
+
+sgl_cpu_test(
+    name = "test_source_editor",
+    srcs = ["test_source_editor.py"],
+    est_time = 10,
+    nightly = True,
+    suite = "stage-a-test-cpu",
+)

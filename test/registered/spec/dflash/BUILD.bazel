@@ -1,0 +1,8 @@
+load("//tools/bazel:sgl_defs.bzl", "sgl_cuda_test")
+
+sgl_cuda_test(
+    name = "test_dflash",
+    srcs = ["test_dflash.py"],
+    est_time = 302,
+    suite = "stage-b-test-1-gpu-small",
+)

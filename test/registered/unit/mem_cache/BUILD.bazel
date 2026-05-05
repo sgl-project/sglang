@@ -1,0 +1,106 @@
+load("//tools/bazel:sgl_defs.bzl", "sgl_amd_test", "sgl_cpu_test", "sgl_cuda_test")
+
+sgl_cuda_test(
+    name = "test_radix_cache_slru_accuracy",
+    srcs = ["test_radix_cache_slru_accuracy.py"],
+    est_time = 8,
+    suite = "stage-b-test-1-gpu-small",
+)
+
+sgl_cuda_test(
+    name = "test_radix_cache_unit_cuda_stage_b_test_1_gpu_small",
+    srcs = ["test_radix_cache_unit.py"],
+    est_time = 15,
+    suite = "stage-b-test-1-gpu-small",
+)
+
+sgl_amd_test(
+    name = "test_radix_cache_unit_amd_stage_b_test_1_gpu_small_amd",
+    srcs = ["test_radix_cache_unit.py"],
+    est_time = 5,
+    suite = "stage-b-test-1-gpu-small-amd",
+)
+
+sgl_cpu_test(
+    name = "test_streaming_session_unit",
+    srcs = ["test_streaming_session_unit.py"],
+    est_time = 12,
+    suite = "stage-a-test-cpu",
+)
+
+sgl_cuda_test(
+    name = "test_swa_unittest_cuda_stage_b_test_1_gpu_large",
+    srcs = ["test_swa_unittest.py"],
+    est_time = 9,
+    suite = "stage-b-test-1-gpu-large",
+)
+
+sgl_amd_test(
+    name = "test_swa_unittest_amd_stage_b_test_1_gpu_small_amd",
+    srcs = ["test_swa_unittest.py"],
+    est_time = 10,
+    suite = "stage-b-test-1-gpu-small-amd",
+)
+
+sgl_cuda_test(
+    name = "test_unified_radix_cache_bench",
+    srcs = ["test_unified_radix_cache_bench.py"],
+    est_time = 25,
+    suite = "stage-b-test-1-gpu-small",
+)
+
+sgl_cuda_test(
+    name = "test_decode_radix_lock_ref",
+    srcs = ["test_decode_radix_lock_ref.py"],
+    est_time = 10,
+    suite = "stage-b-test-1-gpu-small",
+)
+
+sgl_cuda_test(
+    name = "test_swa_eviction_boundary_cuda_stage_b_test_1_gpu_large",
+    srcs = ["test_swa_eviction_boundary.py"],
+    est_time = 12,
+    suite = "stage-b-test-1-gpu-large",
+)
+
+sgl_amd_test(
+    name = "test_swa_eviction_boundary_amd_stage_b_test_1_gpu_small_amd",
+    srcs = ["test_swa_eviction_boundary.py"],
+    est_time = 10,
+    suite = "stage-b-test-1-gpu-small-amd",
+)
+
+sgl_cuda_test(
+    name = "test_unified_radix_cache_unittest",
+    srcs = ["test_unified_radix_cache_unittest.py"],
+    est_time = 10,
+    suite = "stage-b-test-1-gpu-small",
+)
+
+sgl_cpu_test(
+    name = "test_evict_policy",
+    srcs = ["test_evict_policy.py"],
+    est_time = 6,
+    suite = "stage-a-test-cpu",
+)
+
+sgl_cuda_test(
+    name = "test_mamba_unittest_cuda_stage_b_test_1_gpu_small",
+    srcs = ["test_mamba_unittest.py"],
+    est_time = 10,
+    suite = "stage-b-test-1-gpu-small",
+)
+
+sgl_amd_test(
+    name = "test_mamba_unittest_amd_stage_b_test_1_gpu_small_amd",
+    srcs = ["test_mamba_unittest.py"],
+    est_time = 9,
+    suite = "stage-b-test-1-gpu-small-amd",
+)
+
+sgl_cuda_test(
+    name = "test_nsa_pool_host_unit",
+    srcs = ["test_nsa_pool_host_unit.py"],
+    est_time = 9,
+    suite = "stage-b-test-1-gpu-small",
+)

@@ -1,0 +1,128 @@
+load("//tools/bazel:sgl_defs.bzl", "sgl_amd_test", "sgl_cuda_test")
+
+sgl_cuda_test(
+    name = "test_disaggregation_pp",
+    srcs = ["test_disaggregation_pp.py"],
+    est_time = 216,
+    suite = "stage-c-test-8-gpu-h20",
+)
+
+sgl_cuda_test(
+    name = "test_flashinfer_fusion_preflight",
+    srcs = ["test_flashinfer_fusion_preflight.py"],
+    est_time = 30,
+    suite = "stage-b-test-2-gpu-large",
+)
+
+sgl_cuda_test(
+    name = "test_data_parallelism_cuda_stage_b_test_2_gpu_large",
+    srcs = ["test_data_parallelism.py"],
+    est_time = 91,
+    suite = "stage-b-test-2-gpu-large",
+)
+
+sgl_amd_test(
+    name = "test_data_parallelism_amd_stage_b_test_2_gpu_large_amd",
+    srcs = ["test_data_parallelism.py"],
+    est_time = 73,
+    suite = "stage-b-test-2-gpu-large-amd",
+)
+
+sgl_cuda_test(
+    name = "test_disaggregation_different_tp",
+    srcs = ["test_disaggregation_different_tp.py"],
+    est_time = 375,
+    suite = "stage-c-test-8-gpu-h20",
+)
+
+sgl_cuda_test(
+    name = "test_dp_attention",
+    srcs = ["test_dp_attention.py"],
+    est_time = 524,
+    suite = "stage-b-test-2-gpu-large",
+)
+
+sgl_cuda_test(
+    name = "test_disaggregation_decode_radix_cache",
+    srcs = ["test_disaggregation_decode_radix_cache.py"],
+    est_time = 300,
+    suite = "stage-c-test-8-gpu-h20",
+)
+
+sgl_cuda_test(
+    name = "test_disaggregation_dp_attention",
+    srcs = ["test_disaggregation_dp_attention.py"],
+    est_time = 443,
+    suite = "stage-c-test-8-gpu-h20",
+)
+
+sgl_cuda_test(
+    name = "test_disaggregation_hybrid_attention",
+    srcs = ["test_disaggregation_hybrid_attention.py"],
+    est_time = 695,
+    suite = "stage-c-test-8-gpu-h200",
+)
+
+sgl_cuda_test(
+    name = "test_parallel_state",
+    srcs = ["test_parallel_state.py"],
+    est_time = 8,
+    suite = "stage-b-test-1-gpu-small",
+)
+
+sgl_cuda_test(
+    name = "test_pp_single_node_cuda_stage_c_test_4_gpu_h100",
+    srcs = ["test_pp_single_node.py"],
+    est_time = 554,
+    suite = "stage-c-test-4-gpu-h100",
+)
+
+sgl_amd_test(
+    name = "test_pp_single_node_amd_stage_c_test_4_gpu_amd",
+    srcs = ["test_pp_single_node.py"],
+    est_time = 650,
+    suite = "stage-c-test-4-gpu-amd",
+)
+
+sgl_cuda_test(
+    name = "test_disaggregation_aarch64",
+    srcs = ["test_disaggregation_aarch64.py"],
+    est_time = 300,
+    suite = "stage-c-test-4-gpu-gb200",
+)
+
+sgl_cuda_test(
+    name = "test_dp_attention_large_cuda_stage_c_test_4_gpu_h100",
+    srcs = ["test_dp_attention_large.py"],
+    est_time = 245,
+    suite = "stage-c-test-4-gpu-h100",
+)
+
+sgl_amd_test(
+    name = "test_dp_attention_large_amd_stage_c_test_4_gpu_amd",
+    srcs = ["test_dp_attention_large.py"],
+    est_time = 350,
+    suite = "stage-c-test-4-gpu-amd",
+)
+
+sgl_cuda_test(
+    name = "test_epd_disaggregation",
+    srcs = ["test_epd_disaggregation.py"],
+    est_time = 97,
+    nightly = True,
+    suite = "nightly-4-gpu",
+)
+
+sgl_cuda_test(
+    name = "test_load_weights_from_remote_instance_cuda_stage_b_test_2_gpu_large",
+    srcs = ["test_load_weights_from_remote_instance.py"],
+    est_time = 145,
+    suite = "stage-b-test-2-gpu-large",
+)
+
+sgl_amd_test(
+    name = "test_load_weights_from_remote_instance_amd_stage_b_test_2_gpu_large_amd",
+    srcs = ["test_load_weights_from_remote_instance.py"],
+    est_time = 72,
+    suite = "stage-b-test-2-gpu-large-amd",
+)

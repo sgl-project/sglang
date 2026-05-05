@@ -1,0 +1,25 @@
+load("//tools/bazel:sgl_defs.bzl", "sgl_npu_test")
+
+sgl_npu_test(
+    name = "test_npu_gemma_2_27b_v0_2",
+    srcs = ["test_npu_gemma_2_27b_v0_2.py"],
+    est_time = 400,
+    nightly = True,
+    suite = "full-1-npu-a3",
+)
+
+sgl_npu_test(
+    name = "test_npu_internlm2_7b_reward",
+    srcs = ["test_npu_internlm2_7b_reward.py"],
+    est_time = 400,
+    nightly = True,
+    suite = "full-4-npu-a3",
+)
+
+sgl_npu_test(
+    name = "test_npu_llama_3_1_8b_v0_2",
+    srcs = ["test_npu_llama_3_1_8b_v0_2.py"],
+    est_time = 400,
+    nightly = True,
+    suite = "full-1-npu-a3",
+)

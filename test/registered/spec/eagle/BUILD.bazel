@@ -1,0 +1,86 @@
+load("//tools/bazel:sgl_defs.bzl", "sgl_amd_test", "sgl_cuda_test")
+
+sgl_cuda_test(
+    name = "test_deepseek_v3_fp4_mtp_small",
+    srcs = ["test_deepseek_v3_fp4_mtp_small.py"],
+    est_time = 420,
+    suite = "stage-b-test-4-gpu-b200",
+)
+
+sgl_cuda_test(
+    name = "test_eagle_infer_a",
+    srcs = ["test_eagle_infer_a.py"],
+    est_time = 357,
+    suite = "stage-b-test-1-gpu-large",
+)
+
+sgl_cuda_test(
+    name = "test_eagle_infer_beta_dp_attention",
+    srcs = ["test_eagle_infer_beta_dp_attention.py"],
+    est_time = 123,
+    suite = "stage-c-test-4-gpu-b200",
+)
+
+sgl_cuda_test(
+    name = "test_eagle_infer_beta_dp_attention_large",
+    srcs = ["test_eagle_infer_beta_dp_attention_large.py"],
+    est_time = 600,
+    nightly = True,
+    suite = "nightly-8-gpu-b200",
+)
+
+sgl_cuda_test(
+    name = "test_adaptive_speculative",
+    srcs = ["test_adaptive_speculative.py"],
+    est_time = 76,
+    suite = "stage-b-test-1-gpu-large",
+)
+
+sgl_cuda_test(
+    name = "test_eagle3_basic_cuda_stage_b_test_1_gpu_small",
+    srcs = ["test_eagle3_basic.py"],
+    est_time = 88,
+    suite = "stage-b-test-1-gpu-small",
+)
+
+sgl_amd_test(
+    name = "test_eagle3_basic_amd_stage_b_test_1_gpu_small",
+    srcs = ["test_eagle3_basic.py"],
+    est_time = 50,
+    suite = "stage-b-test-1-gpu-small",
+)
+
+sgl_cuda_test(
+    name = "test_eagle_constrained_decoding",
+    srcs = ["test_eagle_constrained_decoding.py"],
+    est_time = 116,
+    suite = "stage-b-test-1-gpu-large",
+)
+
+sgl_cuda_test(
+    name = "test_eagle_dp_attention_cuda_stage_c_test_4_gpu_h100",
+    srcs = ["test_eagle_dp_attention.py"],
+    est_time = 99,
+    suite = "stage-c-test-4-gpu-h100",
+)
+
+sgl_amd_test(
+    name = "test_eagle_dp_attention_amd_stage_c_test_4_gpu_amd",
+    srcs = ["test_eagle_dp_attention.py"],
+    est_time = 200,
+    suite = "stage-c-test-4-gpu-amd",
+)
+
+sgl_cuda_test(
+    name = "test_eagle_infer_b",
+    srcs = ["test_eagle_infer_b.py"],
+    est_time = 847,
+    suite = "stage-b-test-1-gpu-large",
+)
+
+sgl_cuda_test(
+    name = "test_eagle_infer_beta",
+    srcs = ["test_eagle_infer_beta.py"],
+    est_time = 369,
+    suite = "stage-b-test-1-gpu-small",
+)

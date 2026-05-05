@@ -1,0 +1,8 @@
+load("//tools/bazel:sgl_defs.bzl", "sgl_amd_test")
+
+sgl_amd_test(
+    name = "test_aiter_allreduce_fusion_amd",
+    srcs = ["test_aiter_allreduce_fusion_amd.py"],
+    est_time = 240,
+    suite = "stage-c-test-large-8-gpu-amd",
+)

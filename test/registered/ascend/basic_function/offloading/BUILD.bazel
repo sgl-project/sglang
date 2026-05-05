@@ -1,0 +1,9 @@
+load("//tools/bazel:sgl_defs.bzl", "sgl_npu_test")
+
+sgl_npu_test(
+    name = "test_npu_offload_modes",
+    srcs = ["test_npu_offload_modes.py"],
+    est_time = 800,
+    nightly = True,
+    suite = "nightly-2-npu-a3",
+)

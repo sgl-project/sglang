@@ -1,0 +1,8 @@
+load("//tools/bazel:sgl_defs.bzl", "sgl_cuda_test")
+
+sgl_cuda_test(
+    name = "test_deepseek_v32_cp_single_node",
+    srcs = ["test_deepseek_v32_cp_single_node.py"],
+    est_time = 616,
+    suite = "stage-c-test-deepep-8-gpu-h200",
+)

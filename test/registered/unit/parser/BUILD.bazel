@@ -1,0 +1,43 @@
+load("//tools/bazel:sgl_defs.bzl", "sgl_cpu_test")
+
+sgl_cpu_test(
+    name = "test_code_completion_parser",
+    srcs = ["test_code_completion_parser.py"],
+    est_time = 7,
+    suite = "stage-a-test-cpu",
+)
+
+sgl_cpu_test(
+    name = "test_conversation",
+    srcs = ["test_conversation.py"],
+    est_time = 7,
+    suite = "stage-a-test-cpu",
+)
+
+sgl_cpu_test(
+    name = "test_harmony_parser",
+    srcs = ["test_harmony_parser.py"],
+    est_time = 7,
+    suite = "stage-a-test-cpu",
+)
+
+sgl_cpu_test(
+    name = "test_jinja_template_utils",
+    srcs = ["test_jinja_template_utils.py"],
+    est_time = 7,
+    suite = "stage-a-test-cpu",
+)
+
+sgl_cpu_test(
+    name = "test_reasoning_content_without_parser",
+    srcs = ["test_reasoning_content_without_parser.py"],
+    est_time = 7,
+    suite = "stage-a-test-cpu",
+)
+
+sgl_cpu_test(
+    name = "test_reasoning_parser",
+    srcs = ["test_reasoning_parser.py"],
+    est_time = 7,
+    suite = "stage-a-test-cpu",
+)

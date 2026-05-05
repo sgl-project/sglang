@@ -1,0 +1,8 @@
+load("//tools/bazel:sgl_defs.bzl", "sgl_cpu_test")
+
+sgl_cpu_test(
+    name = "test_server_args",
+    srcs = ["test_server_args.py"],
+    est_time = 10,
+    suite = "stage-a-test-cpu",
+)

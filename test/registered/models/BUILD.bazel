@@ -1,0 +1,121 @@
+load("//tools/bazel:sgl_defs.bzl", "sgl_amd_test", "sgl_cuda_test")
+
+sgl_cuda_test(
+    name = "test_kimi_linear_models",
+    srcs = ["test_kimi_linear_models.py"],
+    est_time = 178,
+    suite = "stage-b-test-2-gpu-large",
+)
+
+sgl_cuda_test(
+    name = "test_nvidia_nemotron_nano_v2_vl",
+    srcs = ["test_nvidia_nemotron_nano_v2_vl.py"],
+    est_time = 256,
+    suite = "stage-b-test-1-gpu-large",
+)
+
+sgl_cuda_test(
+    name = "test_qwen_models_cuda_stage_b_test_1_gpu_small",
+    srcs = ["test_qwen_models.py"],
+    est_time = 108,
+    suite = "stage-b-test-1-gpu-small",
+)
+
+sgl_amd_test(
+    name = "test_qwen_models_amd_stage_b_test_1_gpu_small_amd",
+    srcs = ["test_qwen_models.py"],
+    est_time = 130,
+    suite = "stage-b-test-1-gpu-small-amd",
+)
+
+sgl_cuda_test(
+    name = "test_transformers_models_cuda_stage_b_test_1_gpu_small",
+    srcs = ["test_transformers_models.py"],
+    est_time = 177,
+    suite = "stage-b-test-1-gpu-small",
+)
+
+sgl_amd_test(
+    name = "test_transformers_models_amd_stage_b_test_1_gpu_small_amd",
+    srcs = ["test_transformers_models.py"],
+    est_time = 320,
+    suite = "stage-b-test-1-gpu-small-amd",
+)
+
+sgl_cuda_test(
+    name = "test_vlm_models_cuda_stage_b_test_1_gpu_large",
+    srcs = ["test_vlm_models.py"],
+    est_time = 317,
+    suite = "stage-b-test-1-gpu-large",
+)
+
+sgl_amd_test(
+    name = "test_vlm_models_amd_stage_b_test_1_gpu_small_amd_nondeterministic",
+    srcs = ["test_vlm_models.py"],
+    est_time = 850,
+    suite = "stage-b-test-1-gpu-small-amd-nondeterministic",
+)
+
+sgl_cuda_test(
+    name = "test_compressed_tensors_models_cuda_stage_b_test_1_gpu_large",
+    srcs = ["test_compressed_tensors_models.py"],
+    est_time = 65,
+    suite = "stage-b-test-1-gpu-large",
+)
+
+sgl_amd_test(
+    name = "test_compressed_tensors_models_amd_stage_b_test_1_gpu_small_amd",
+    srcs = ["test_compressed_tensors_models.py"],
+    est_time = 42,
+    suite = "stage-b-test-1-gpu-small-amd",
+)
+
+sgl_cuda_test(
+    name = "test_ministral4_models",
+    srcs = ["test_ministral4_models.py"],
+    est_time = 200,
+    suite = "stage-b-test-2-gpu-large",
+)
+
+sgl_cuda_test(
+    name = "test_nvidia_nemotron_3_nano",
+    srcs = ["test_nvidia_nemotron_3_nano.py"],
+    est_time = 564,
+    suite = "stage-b-test-2-gpu-large",
+)
+
+sgl_cuda_test(
+    name = "test_nvidia_nemotron_nano_v2",
+    srcs = ["test_nvidia_nemotron_nano_v2.py"],
+    est_time = 249,
+    suite = "stage-b-test-2-gpu-large",
+)
+
+sgl_cuda_test(
+    name = "test_qwen3_next_models_fp4",
+    srcs = ["test_qwen3_next_models_fp4.py"],
+    est_time = 500,
+    nightly = True,
+    suite = "nightly-4-gpu-b200",
+)
+
+sgl_cuda_test(
+    name = "test_transformers_backend_eval",
+    srcs = ["test_transformers_backend_eval.py"],
+    est_time = 48,
+    suite = "stage-b-test-1-gpu-small",
+)
+
+sgl_cuda_test(
+    name = "test_generation_models_cuda_stage_b_test_1_gpu_large",
+    srcs = ["test_generation_models.py"],
+    est_time = 150,
+    suite = "stage-b-test-1-gpu-large",
+)
+
+sgl_amd_test(
+    name = "test_generation_models_amd_stage_b_test_1_gpu_small_amd",
+    srcs = ["test_generation_models.py"],
+    est_time = 106,
+    suite = "stage-b-test-1-gpu-small-amd",
+)

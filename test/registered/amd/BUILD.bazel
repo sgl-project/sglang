@@ -1,0 +1,137 @@
+load("//tools/bazel:sgl_defs.bzl", "sgl_amd_test")
+
+sgl_amd_test(
+    name = "test_deepseek_v3_basic",
+    srcs = ["test_deepseek_v3_basic.py"],
+    est_time = 952,
+    suite = "stage-c-test-large-8-gpu-amd",
+)
+
+sgl_amd_test(
+    name = "test_deepseek_v3_basic_kv_fp8",
+    srcs = ["test_deepseek_v3_basic_kv_fp8.py"],
+    est_time = 1200,
+    nightly = True,
+    suite = "nightly-amd-8-gpu-deepseek-v3-kv-fp8",
+)
+
+sgl_amd_test(
+    name = "test_deepseek_v4_fp4",
+    srcs = ["test_deepseek_v4_fp4.py"],
+    est_time = 7200,
+    nightly = True,
+    suite = "nightly-amd-8-gpu-mi35x-deepseek-v4-flash",
+)
+
+sgl_amd_test(
+    name = "test_deepseek_v4_fp8",
+    srcs = ["test_deepseek_v4_fp8.py"],
+    est_time = 7200,
+    nightly = True,
+    suite = "nightly-amd-8-gpu-mi35x-deepseek-v4-flash",
+)
+
+sgl_amd_test(
+    name = "test_deepseek_v4_pro_fp4",
+    srcs = ["test_deepseek_v4_pro_fp4.py"],
+    est_time = 14400,
+    nightly = True,
+    suite = "nightly-amd-8-gpu-mi35x-deepseek-v4-pro",
+)
+
+sgl_amd_test(
+    name = "test_moriep_small",
+    srcs = ["test_moriep_small.py"],
+    est_time = 1200,
+    suite = "stage-c-test-large-8-gpu-amd",
+)
+
+sgl_amd_test(
+    name = "test_qwen3_instruct_mxfp4",
+    srcs = ["test_qwen3_instruct_mxfp4.py"],
+    est_time = 3600,
+    nightly = True,
+    suite = "nightly-8-gpu-mi35x-qwen3-235b-mxfp4",
+)
+
+sgl_amd_test(
+    name = "test_deepseek_r1_mxfp4_8gpu",
+    srcs = ["test_deepseek_r1_mxfp4_8gpu.py"],
+    est_time = 3600,
+    suite = "stage-c-test-large-8-gpu-amd-mi35x",
+)
+
+sgl_amd_test(
+    name = "test_deepseek_v32_basic",
+    srcs = ["test_deepseek_v32_basic.py"],
+    est_time = 3600,
+    suite = "stage-c-test-large-8-gpu-amd",
+)
+
+sgl_amd_test(
+    name = "test_deepseek_v3_mtp_kv_fp8",
+    srcs = ["test_deepseek_v3_mtp_kv_fp8.py"],
+    est_time = 1200,
+    nightly = True,
+    suite = "nightly-amd-8-gpu-deepseek-v3-kv-fp8",
+)
+
+sgl_amd_test(
+    name = "test_kimi_k2_instruct",
+    srcs = ["test_kimi_k2_instruct.py"],
+    est_time = 3600,
+    suite = "stage-c-test-large-8-gpu-amd",
+)
+
+sgl_amd_test(
+    name = "test_qwen3_instruct",
+    srcs = ["test_qwen3_instruct.py"],
+    est_time = 3600,
+    nightly = True,
+    suite = "nightly-8-gpu-qwen3-235b",
+)
+
+sgl_amd_test(
+    name = "test_zimage_turbo",
+    srcs = ["test_zimage_turbo.py"],
+    est_time = 1800,
+    nightly = True,
+    suite = "nightly-amd-1-gpu-zimage-turbo",
+)
+
+sgl_amd_test(
+    name = "test_deepseek_v3_mtp",
+    srcs = ["test_deepseek_v3_mtp.py"],
+    est_time = 980,
+    suite = "stage-c-test-large-8-gpu-amd",
+)
+
+sgl_amd_test(
+    name = "test_qwen3_instruct_fp8",
+    srcs = ["test_qwen3_instruct_fp8.py"],
+    est_time = 3600,
+    nightly = True,
+    suite = "nightly-8-gpu-qwen3-235b",
+)
+
+sgl_amd_test(
+    name = "test_deepseek_v4_pro_fp8",
+    srcs = ["test_deepseek_v4_pro_fp8.py"],
+    est_time = 14400,
+    nightly = True,
+    suite = "nightly-amd-8-gpu-mi35x-deepseek-v4-pro",
+)
+
+sgl_amd_test(
+    name = "test_kimi_k25_mxfp4",
+    srcs = ["test_kimi_k25_mxfp4.py"],
+    est_time = 3600,
+    suite = "stage-c-test-large-8-gpu-amd-mi35x",
+)
+
+sgl_amd_test(
+    name = "test_qwen3_coder_next_8gpu",
+    srcs = ["test_qwen3_coder_next_8gpu.py"],
+    est_time = 3600,
+    suite = "stage-c-test-large-8-gpu-amd-mi35x",
+)

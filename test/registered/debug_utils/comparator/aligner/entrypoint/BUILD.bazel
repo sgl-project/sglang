@@ -1,0 +1,17 @@
+load("//tools/bazel:sgl_defs.bzl", "sgl_cpu_test")
+
+sgl_cpu_test(
+    name = "test_executor",
+    srcs = ["test_executor.py"],
+    est_time = 15,
+    nightly = True,
+    suite = "stage-a-test-cpu",
+)
+
+sgl_cpu_test(
+    name = "test_planner",
+    srcs = ["test_planner.py"],
+    est_time = 15,
+    nightly = True,
+    suite = "stage-a-test-cpu",
+)

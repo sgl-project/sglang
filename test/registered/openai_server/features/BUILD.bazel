@@ -1,0 +1,36 @@
+load("//tools/bazel:sgl_defs.bzl", "sgl_amd_test", "sgl_cuda_test")
+
+sgl_cuda_test(
+    name = "test_json_mode_cuda_stage_b_test_1_gpu_small",
+    srcs = ["test_json_mode.py"],
+    est_time = 118,
+    suite = "stage-b-test-1-gpu-small",
+)
+
+sgl_amd_test(
+    name = "test_json_mode_amd_stage_b_test_1_gpu_small_amd",
+    srcs = ["test_json_mode.py"],
+    est_time = 180,
+    suite = "stage-b-test-1-gpu-small-amd",
+)
+
+sgl_cuda_test(
+    name = "test_openai_server_ebnf_cuda_stage_b_test_1_gpu_small",
+    srcs = ["test_openai_server_ebnf.py"],
+    est_time = 44,
+    suite = "stage-b-test-1-gpu-small",
+)
+
+sgl_amd_test(
+    name = "test_openai_server_ebnf_amd_stage_b_test_1_gpu_small_amd",
+    srcs = ["test_openai_server_ebnf.py"],
+    est_time = 20,
+    suite = "stage-b-test-1-gpu-small-amd",
+)
+
+sgl_cuda_test(
+    name = "test_openai_server_hidden_states",
+    srcs = ["test_openai_server_hidden_states.py"],
+    est_time = 222,
+    suite = "stage-b-test-1-gpu-small",
+)

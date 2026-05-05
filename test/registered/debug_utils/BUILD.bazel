@@ -1,0 +1,81 @@
+load("//tools/bazel:sgl_defs.bzl", "sgl_amd_test", "sgl_cpu_test", "sgl_cuda_test")
+
+sgl_cuda_test(
+    name = "test_crash_dump_cuda_nightly_1_gpu_nightly",
+    srcs = ["test_crash_dump.py"],
+    est_time = 40,
+    nightly = True,
+    suite = "nightly-1-gpu",
+)
+
+sgl_amd_test(
+    name = "test_crash_dump_amd_nightly_amd_1_gpu_nightly",
+    srcs = ["test_crash_dump.py"],
+    est_time = 40,
+    nightly = True,
+    suite = "nightly-amd-1-gpu",
+)
+
+sgl_cuda_test(
+    name = "test_engine_dumper_comparator_e2e",
+    srcs = ["test_engine_dumper_comparator_e2e.py"],
+    est_time = 300,
+    nightly = True,
+    suite = "nightly-4-gpu",
+)
+
+sgl_cuda_test(
+    name = "test_soft_watchdog_cuda_nightly_1_gpu_nightly",
+    srcs = ["test_soft_watchdog.py"],
+    est_time = 120,
+    nightly = True,
+    suite = "nightly-1-gpu",
+)
+
+sgl_amd_test(
+    name = "test_soft_watchdog_amd_nightly_amd_1_gpu_nightly",
+    srcs = ["test_soft_watchdog.py"],
+    est_time = 120,
+    nightly = True,
+    suite = "nightly-amd-1-gpu",
+)
+
+sgl_cpu_test(
+    name = "test_dump_comparator",
+    srcs = ["test_dump_comparator.py"],
+    est_time = 30,
+    nightly = True,
+    suite = "stage-a-test-cpu",
+)
+
+sgl_cpu_test(
+    name = "test_dump_loader",
+    srcs = ["test_dump_loader.py"],
+    est_time = 30,
+    nightly = True,
+    suite = "stage-a-test-cpu",
+)
+
+sgl_cuda_test(
+    name = "test_dumper_cuda_nightly_2_gpu_nightly",
+    srcs = ["test_dumper.py"],
+    est_time = 30,
+    nightly = True,
+    suite = "nightly-2-gpu",
+)
+
+sgl_amd_test(
+    name = "test_dumper_amd_nightly_amd_nightly",
+    srcs = ["test_dumper.py"],
+    est_time = 60,
+    nightly = True,
+    suite = "nightly-amd",
+)
+
+sgl_cpu_test(
+    name = "test_schedule_simulator",
+    srcs = ["test_schedule_simulator.py"],
+    est_time = 120,
+    nightly = True,
+    suite = "stage-a-test-cpu",
+)

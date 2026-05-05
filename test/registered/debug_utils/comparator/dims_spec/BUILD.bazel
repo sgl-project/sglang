@@ -1,0 +1,33 @@
+load("//tools/bazel:sgl_defs.bzl", "sgl_cpu_test")
+
+sgl_cpu_test(
+    name = "test_dim_parser",
+    srcs = ["test_dim_parser.py"],
+    est_time = 5,
+    nightly = True,
+    suite = "stage-a-test-cpu",
+)
+
+sgl_cpu_test(
+    name = "test_dims_parser",
+    srcs = ["test_dims_parser.py"],
+    est_time = 5,
+    nightly = True,
+    suite = "stage-a-test-cpu",
+)
+
+sgl_cpu_test(
+    name = "test_tensor_naming",
+    srcs = ["test_tensor_naming.py"],
+    est_time = 5,
+    nightly = True,
+    suite = "stage-a-test-cpu",
+)
+
+sgl_cpu_test(
+    name = "test_types",
+    srcs = ["test_types.py"],
+    est_time = 5,
+    nightly = True,
+    suite = "stage-a-test-cpu",
+)

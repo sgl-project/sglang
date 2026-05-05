@@ -1,0 +1,55 @@
+load("//tools/bazel:sgl_defs.bzl", "sgl_npu_test")
+
+sgl_npu_test(
+    name = "test_npu_radix_cache",
+    srcs = ["test_npu_radix_cache.py"],
+    est_time = 400,
+    nightly = True,
+    suite = "nightly-1-npu-a3",
+)
+
+sgl_npu_test(
+    name = "test_npu_hicache_mha_npu_stage_b_test_1_npu_a2",
+    srcs = ["test_npu_hicache_mha.py"],
+    est_time = 400,
+    suite = "stage-b-test-1-npu-a2",
+)
+
+sgl_npu_test(
+    name = "test_npu_hicache_mha_npu_nightly_1_npu_a3_nightly",
+    srcs = ["test_npu_hicache_mha.py"],
+    est_time = 400,
+    nightly = True,
+    suite = "nightly-1-npu-a3",
+)
+
+sgl_npu_test(
+    name = "test_npu_hicache_mla_npu_stage_b_test_4_npu_a3",
+    srcs = ["test_npu_hicache_mla.py"],
+    est_time = 400,
+    suite = "stage-b-test-4-npu-a3",
+)
+
+sgl_npu_test(
+    name = "test_npu_hicache_mla_npu_nightly_4_npu_a3_nightly",
+    srcs = ["test_npu_hicache_mla.py"],
+    est_time = 400,
+    nightly = True,
+    suite = "nightly-4-npu-a3",
+)
+
+sgl_npu_test(
+    name = "test_npu_hierarchical_cache",
+    srcs = ["test_npu_hierarchical_cache.py"],
+    est_time = 400,
+    nightly = True,
+    suite = "nightly-1-npu-a3",
+)
+
+sgl_npu_test(
+    name = "test_npu_hierarchical_cache_mutually_exclusive",
+    srcs = ["test_npu_hierarchical_cache_mutually_exclusive.py"],
+    est_time = 400,
+    nightly = True,
+    suite = "nightly-1-npu-a3",
+)

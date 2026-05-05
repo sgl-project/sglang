@@ -1,0 +1,50 @@
+load("//tools/bazel:sgl_defs.bzl", "sgl_amd_test", "sgl_cuda_test")
+
+sgl_cuda_test(
+    name = "test_mamba2_mixer",
+    srcs = ["test_mamba2_mixer.py"],
+    est_time = 32,
+    suite = "stage-b-test-2-gpu-large",
+)
+
+sgl_cuda_test(
+    name = "test_mamba_ssm_cuda_stage_b_test_1_gpu_small",
+    srcs = ["test_mamba_ssm.py"],
+    est_time = 10,
+    suite = "stage-b-test-1-gpu-small",
+)
+
+sgl_amd_test(
+    name = "test_mamba_ssm_amd_stage_b_test_1_gpu_small_amd",
+    srcs = ["test_mamba_ssm.py"],
+    est_time = 20,
+    suite = "stage-b-test-1-gpu-small-amd",
+)
+
+sgl_cuda_test(
+    name = "test_mamba_ssm_ssd_cuda_stage_b_test_1_gpu_small",
+    srcs = ["test_mamba_ssm_ssd.py"],
+    est_time = 10,
+    suite = "stage-b-test-1-gpu-small",
+)
+
+sgl_amd_test(
+    name = "test_mamba_ssm_ssd_amd_stage_b_test_1_gpu_small_amd",
+    srcs = ["test_mamba_ssm_ssd.py"],
+    est_time = 34,
+    suite = "stage-b-test-1-gpu-small-amd",
+)
+
+sgl_cuda_test(
+    name = "test_causal_conv1d_cuda_stage_b_test_1_gpu_small",
+    srcs = ["test_causal_conv1d.py"],
+    est_time = 11,
+    suite = "stage-b-test-1-gpu-small",
+)
+
+sgl_amd_test(
+    name = "test_causal_conv1d_amd_stage_b_test_1_gpu_small_amd",
+    srcs = ["test_causal_conv1d.py"],
+    est_time = 25,
+    suite = "stage-b-test-1-gpu-small-amd",
+)

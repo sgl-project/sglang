@@ -1,0 +1,63 @@
+load("//tools/bazel:sgl_defs.bzl", "sgl_amd_test", "sgl_cuda_test")
+
+sgl_cuda_test(
+    name = "test_qwen3_fp4_trtllm_gen_moe",
+    srcs = ["test_qwen3_fp4_trtllm_gen_moe.py"],
+    est_time = 300,
+    nightly = True,
+    suite = "nightly-1-gpu",
+)
+
+sgl_cuda_test(
+    name = "test_torch_compile_cuda_stage_b_test_1_gpu_large",
+    srcs = ["test_torch_compile.py"],
+    est_time = 126,
+    suite = "stage-b-test-1-gpu-large",
+)
+
+sgl_amd_test(
+    name = "test_torch_compile_amd_stage_b_test_1_gpu_small_amd",
+    srcs = ["test_torch_compile.py"],
+    est_time = 1100,
+    suite = "stage-b-test-1-gpu-small-amd",
+)
+
+sgl_cuda_test(
+    name = "test_deepseek_r1_fp8_trtllm_backend",
+    srcs = ["test_deepseek_r1_fp8_trtllm_backend.py"],
+    est_time = 3600,
+    nightly = True,
+    suite = "nightly-8-gpu-b200",
+)
+
+sgl_cuda_test(
+    name = "test_deepseek_v3_fp4_cutedsl_moe",
+    srcs = ["test_deepseek_v3_fp4_cutedsl_moe.py"],
+    est_time = 900,
+    nightly = True,
+    suite = "nightly-4-gpu-b200",
+)
+
+sgl_cuda_test(
+    name = "test_deepseek_v3_fp4_cutlass_moe",
+    srcs = ["test_deepseek_v3_fp4_cutlass_moe.py"],
+    est_time = 900,
+    nightly = True,
+    suite = "nightly-4-gpu-b200",
+)
+
+sgl_cuda_test(
+    name = "test_flashinfer_trtllm_gen_attn_backend",
+    srcs = ["test_flashinfer_trtllm_gen_attn_backend.py"],
+    est_time = 300,
+    nightly = True,
+    suite = "nightly-4-gpu-b200",
+)
+
+sgl_cuda_test(
+    name = "test_flashinfer_trtllm_gen_moe_backend",
+    srcs = ["test_flashinfer_trtllm_gen_moe_backend.py"],
+    est_time = 600,
+    nightly = True,
+    suite = "nightly-4-gpu-b200",
+)

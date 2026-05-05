@@ -1,0 +1,15 @@
+load("//tools/bazel:sgl_defs.bzl", "sgl_cpu_test", "sgl_cuda_test")
+
+sgl_cuda_test(
+    name = "test_llava",
+    srcs = ["test_llava.py"],
+    est_time = 9,
+    suite = "stage-b-test-1-gpu-small",
+)
+
+sgl_cpu_test(
+    name = "test_qwen3_5_packed_weight_loader",
+    srcs = ["test_qwen3_5_packed_weight_loader.py"],
+    est_time = 4,
+    suite = "stage-a-test-cpu",
+)

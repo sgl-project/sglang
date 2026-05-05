@@ -1,0 +1,73 @@
+load("//tools/bazel:sgl_defs.bzl", "sgl_amd_test", "sgl_cpu_test", "sgl_cuda_test")
+
+sgl_cpu_test(
+    name = "test_video_utils",
+    srcs = ["test_video_utils.py"],
+    est_time = 7,
+    suite = "stage-a-test-cpu",
+)
+
+sgl_cuda_test(
+    name = "test_vision_chunked_prefill_cuda_stage_b_test_1_gpu_large",
+    srcs = ["test_vision_chunked_prefill.py"],
+    est_time = 156,
+    suite = "stage-b-test-1-gpu-large",
+)
+
+sgl_amd_test(
+    name = "test_vision_chunked_prefill_amd_stage_b_test_1_gpu_small_amd",
+    srcs = ["test_vision_chunked_prefill.py"],
+    est_time = 270,
+    suite = "stage-b-test-1-gpu-small-amd",
+)
+
+sgl_cuda_test(
+    name = "test_vision_openai_server_a",
+    srcs = ["test_vision_openai_server_a.py"],
+    est_time = 780,
+    suite = "stage-b-test-1-gpu-large",
+)
+
+sgl_cuda_test(
+    name = "test_vlm_input_format",
+    srcs = ["test_vlm_input_format.py"],
+    est_time = 747,
+    suite = "stage-b-test-1-gpu-large",
+)
+
+sgl_cuda_test(
+    name = "test_vlm_tp4",
+    srcs = ["test_vlm_tp4.py"],
+    est_time = 133,
+    suite = "stage-c-test-4-gpu-h100",
+)
+
+sgl_cuda_test(
+    name = "test_encoder_dp_cuda_nightly_4_gpu_nightly",
+    srcs = ["test_encoder_dp.py"],
+    est_time = 500,
+    nightly = True,
+    suite = "nightly-4-gpu",
+)
+
+sgl_amd_test(
+    name = "test_encoder_dp_amd_nightly_amd_4_gpu_nightly",
+    srcs = ["test_encoder_dp.py"],
+    est_time = 500,
+    nightly = True,
+    suite = "nightly-amd-4-gpu",
+)
+
+sgl_cuda_test(
+    name = "test_evs_cuda_stage_b_test_1_gpu_small",
+    srcs = ["test_evs.py"],
+    est_time = 11,
+    suite = "stage-b-test-1-gpu-small",
+)
+
+sgl_amd_test(
+    name = "test_evs_amd_stage_b_test_1_gpu_small_amd",
+    srcs = ["test_evs.py"],
+    est_time = 20,
+    suite = "stage-b-test-1-gpu-small-amd",
+)

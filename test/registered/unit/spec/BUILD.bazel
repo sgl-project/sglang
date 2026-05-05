@@ -1,0 +1,22 @@
+load("//tools/bazel:sgl_defs.bzl", "sgl_cpu_test")
+
+sgl_cpu_test(
+    name = "test_adaptive_spec_params",
+    srcs = ["test_adaptive_spec_params.py"],
+    est_time = 6,
+    suite = "stage-a-test-cpu",
+)
+
+sgl_cpu_test(
+    name = "test_ngram_corpus",
+    srcs = ["test_ngram_corpus.py"],
+    est_time = 26,
+    suite = "stage-a-test-cpu",
+)
+
+sgl_cpu_test(
+    name = "test_spec_utils_traverse_tree",
+    srcs = ["test_spec_utils_traverse_tree.py"],
+    est_time = 4,
+    suite = "stage-a-test-cpu",
+)

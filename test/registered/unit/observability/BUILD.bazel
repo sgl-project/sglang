@@ -1,0 +1,51 @@
+load("//tools/bazel:sgl_defs.bzl", "sgl_cpu_test")
+
+sgl_cpu_test(
+    name = "test_cpu_monitor",
+    srcs = ["test_cpu_monitor.py"],
+    est_time = 60,
+    nightly = True,
+    suite = "stage-a-test-cpu",
+)
+
+sgl_cpu_test(
+    name = "test_func_timer",
+    srcs = ["test_func_timer.py"],
+    est_time = 6,
+    suite = "stage-a-test-cpu",
+)
+
+sgl_cpu_test(
+    name = "test_label_transform",
+    srcs = ["test_label_transform.py"],
+    est_time = 6,
+    suite = "stage-a-test-cpu",
+)
+
+sgl_cpu_test(
+    name = "test_metrics_utils",
+    srcs = ["test_metrics_utils.py"],
+    est_time = 6,
+    suite = "stage-a-test-cpu",
+)
+
+sgl_cpu_test(
+    name = "test_request_metrics_exporter",
+    srcs = ["test_request_metrics_exporter.py"],
+    est_time = 6,
+    suite = "stage-a-test-cpu",
+)
+
+sgl_cpu_test(
+    name = "test_startup_func_log_and_timer",
+    srcs = ["test_startup_func_log_and_timer.py"],
+    est_time = 6,
+    suite = "stage-a-test-cpu",
+)
+
+sgl_cpu_test(
+    name = "test_trace",
+    srcs = ["test_trace.py"],
+    est_time = 6,
+    suite = "stage-a-test-cpu",
+)

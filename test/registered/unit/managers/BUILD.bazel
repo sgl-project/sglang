@@ -1,0 +1,78 @@
+load("//tools/bazel:sgl_defs.bzl", "sgl_amd_test", "sgl_cpu_test", "sgl_cuda_test")
+
+sgl_cpu_test(
+    name = "test_scheduler_chunked_req_gate",
+    srcs = ["test_scheduler_chunked_req_gate.py"],
+    est_time = 6,
+    suite = "stage-a-test-cpu",
+)
+
+sgl_cpu_test(
+    name = "test_scheduler_flush_cache",
+    srcs = ["test_scheduler_flush_cache.py"],
+    est_time = 14,
+    suite = "stage-a-test-cpu",
+)
+
+sgl_cpu_test(
+    name = "test_scheduler_pause_generation",
+    srcs = ["test_scheduler_pause_generation.py"],
+    est_time = 15,
+    suite = "stage-a-test-cpu",
+)
+
+sgl_cpu_test(
+    name = "test_dp_budget",
+    srcs = ["test_dp_budget.py"],
+    est_time = 11,
+    suite = "stage-a-test-cpu",
+)
+
+sgl_cuda_test(
+    name = "test_hisparse_unit",
+    srcs = ["test_hisparse_unit.py"],
+    est_time = 10,
+    suite = "stage-b-test-1-gpu-small",
+)
+
+sgl_cuda_test(
+    name = "test_io_struct_cuda_stage_b_test_1_gpu_large",
+    srcs = ["test_io_struct.py"],
+    est_time = 8,
+    suite = "stage-b-test-1-gpu-large",
+)
+
+sgl_amd_test(
+    name = "test_io_struct_amd_stage_b_test_1_gpu_small_amd",
+    srcs = ["test_io_struct.py"],
+    est_time = 8,
+    suite = "stage-b-test-1-gpu-small-amd",
+)
+
+sgl_cuda_test(
+    name = "test_prefill_adder_cuda_stage_b_test_1_gpu_small",
+    srcs = ["test_prefill_adder.py"],
+    est_time = 9,
+    suite = "stage-b-test-1-gpu-small",
+)
+
+sgl_amd_test(
+    name = "test_prefill_adder_amd_stage_b_test_1_gpu_small_amd",
+    srcs = ["test_prefill_adder.py"],
+    est_time = 2,
+    suite = "stage-b-test-1-gpu-small-amd",
+)
+
+sgl_cuda_test(
+    name = "test_profile_merger_http_api_cuda_stage_b_test_1_gpu_small",
+    srcs = ["test_profile_merger_http_api.py"],
+    est_time = 8,
+    suite = "stage-b-test-1-gpu-small",
+)
+
+sgl_amd_test(
+    name = "test_profile_merger_http_api_amd_stage_b_test_1_gpu_small_amd",
+    srcs = ["test_profile_merger_http_api.py"],
+    est_time = 9,
+    suite = "stage-b-test-1-gpu-small-amd",
+)

@@ -1,0 +1,22 @@
+load("//tools/bazel:sgl_defs.bzl", "sgl_cuda_test")
+
+sgl_cuda_test(
+    name = "test_constrained_decoding_spec_reasoning",
+    srcs = ["test_constrained_decoding_spec_reasoning.py"],
+    est_time = 137,
+    suite = "stage-b-test-2-gpu-large",
+)
+
+sgl_cuda_test(
+    name = "test_ngram_speculative_decoding",
+    srcs = ["test_ngram_speculative_decoding.py"],
+    est_time = 254,
+    suite = "stage-b-test-1-gpu-large",
+)
+
+sgl_cuda_test(
+    name = "test_standalone_speculative_decoding",
+    srcs = ["test_standalone_speculative_decoding.py"],
+    est_time = 406,
+    suite = "stage-b-test-1-gpu-large",
+)

@@ -1,0 +1,134 @@
+load("//tools/bazel:sgl_defs.bzl", "sgl_amd_test", "sgl_cuda_test")
+
+sgl_cuda_test(
+    name = "test_triton_sliding_window_cuda_stage_b_test_1_gpu_large",
+    srcs = ["test_triton_sliding_window.py"],
+    est_time = 93,
+    suite = "stage-b-test-1-gpu-large",
+)
+
+sgl_amd_test(
+    name = "test_triton_sliding_window_amd_stage_b_test_1_gpu_small_amd",
+    srcs = ["test_triton_sliding_window.py"],
+    est_time = 200,
+    suite = "stage-b-test-1-gpu-small-amd",
+)
+
+sgl_amd_test(
+    name = "test_wave_attention_kernels",
+    srcs = ["test_wave_attention_kernels.py"],
+    est_time = 60,
+    suite = "stage-a-test-1-gpu-small-amd",
+)
+
+sgl_cuda_test(
+    name = "test_create_kvindices_cuda_stage_b_test_1_gpu_small",
+    srcs = ["test_create_kvindices.py"],
+    est_time = 7,
+    suite = "stage-b-test-1-gpu-small",
+)
+
+sgl_amd_test(
+    name = "test_create_kvindices_amd_stage_b_test_1_gpu_small_amd",
+    srcs = ["test_create_kvindices.py"],
+    est_time = 10,
+    suite = "stage-b-test-1-gpu-small-amd",
+)
+
+sgl_cuda_test(
+    name = "test_fa3",
+    srcs = ["test_fa3.py"],
+    est_time = 551,
+    suite = "stage-b-test-1-gpu-large",
+)
+
+sgl_cuda_test(
+    name = "test_flash_attention_4",
+    srcs = ["test_flash_attention_4.py"],
+    est_time = 265,
+    suite = "stage-b-test-4-gpu-b200",
+)
+
+sgl_cuda_test(
+    name = "test_gdn_noncontiguous_stride",
+    srcs = ["test_gdn_noncontiguous_stride.py"],
+    est_time = 7,
+    suite = "stage-b-test-1-gpu-large",
+)
+
+sgl_cuda_test(
+    name = "test_hybrid_attn_backend",
+    srcs = ["test_hybrid_attn_backend.py"],
+    est_time = 407,
+    suite = "stage-b-test-1-gpu-large",
+)
+
+sgl_cuda_test(
+    name = "test_local_attn",
+    srcs = ["test_local_attn.py"],
+    est_time = 217,
+    suite = "stage-c-test-4-gpu-h100",
+)
+
+sgl_cuda_test(
+    name = "test_triton_attention_backend_cuda_stage_b_test_1_gpu_large",
+    srcs = ["test_triton_attention_backend.py"],
+    est_time = 177,
+    suite = "stage-b-test-1-gpu-large",
+)
+
+sgl_amd_test(
+    name = "test_triton_attention_backend_amd_stage_b_test_1_gpu_small_amd",
+    srcs = ["test_triton_attention_backend.py"],
+    est_time = 1400,
+    suite = "stage-b-test-1-gpu-small-amd",
+)
+
+sgl_cuda_test(
+    name = "test_triton_attention_kernels_cuda_stage_b_test_1_gpu_large",
+    srcs = ["test_triton_attention_kernels.py"],
+    est_time = 19,
+    suite = "stage-b-test-1-gpu-large",
+)
+
+sgl_amd_test(
+    name = "test_triton_attention_kernels_amd_stage_b_test_1_gpu_small_amd",
+    srcs = ["test_triton_attention_kernels.py"],
+    est_time = 30,
+    suite = "stage-b-test-1-gpu-small-amd",
+)
+
+sgl_cuda_test(
+    name = "test_chunk_gated_delta_rule",
+    srcs = ["test_chunk_gated_delta_rule.py"],
+    est_time = 11,
+    suite = "stage-b-test-1-gpu-large",
+)
+
+sgl_cuda_test(
+    name = "test_kda_kernels",
+    srcs = ["test_kda_kernels.py"],
+    est_time = 12,
+    suite = "stage-b-test-1-gpu-large",
+)
+
+sgl_cuda_test(
+    name = "test_normal_decode_set_metadata",
+    srcs = ["test_normal_decode_set_metadata.py"],
+    est_time = 11,
+    suite = "stage-b-test-1-gpu-large",
+)
+
+sgl_cuda_test(
+    name = "test_torch_native_attention_backend_cuda_stage_b_test_1_gpu_small",
+    srcs = ["test_torch_native_attention_backend.py"],
+    est_time = 140,
+    suite = "stage-b-test-1-gpu-small",
+)
+
+sgl_amd_test(
+    name = "test_torch_native_attention_backend_amd_stage_b_test_1_gpu_small_amd",
+    srcs = ["test_torch_native_attention_backend.py"],
+    est_time = 150,
+    suite = "stage-b-test-1-gpu-small-amd",
+)

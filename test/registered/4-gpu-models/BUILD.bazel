@@ -1,0 +1,78 @@
+load("//tools/bazel:sgl_defs.bzl", "sgl_cuda_test")
+
+sgl_cuda_test(
+    name = "test_gpt_oss_4gpu_cuda_stage_c_test_4_gpu_h100",
+    srcs = ["test_gpt_oss_4gpu.py"],
+    est_time = 392,
+    suite = "stage-c-test-4-gpu-h100",
+)
+
+sgl_cuda_test(
+    name = "test_gpt_oss_4gpu_cuda_stage_c_test_4_gpu_b200",
+    srcs = ["test_gpt_oss_4gpu.py"],
+    est_time = 740,
+    suite = "stage-c-test-4-gpu-b200",
+)
+
+sgl_cuda_test(
+    name = "test_nvidia_nemotron_3_super_nvfp4",
+    srcs = ["test_nvidia_nemotron_3_super_nvfp4.py"],
+    est_time = 710,
+    suite = "stage-c-test-4-gpu-b200",
+)
+
+sgl_cuda_test(
+    name = "test_qwen35_fp4_triton",
+    srcs = ["test_qwen35_fp4_triton.py"],
+    est_time = 720,
+    suite = "stage-c-test-4-gpu-b200",
+)
+
+sgl_cuda_test(
+    name = "test_qwen35_models",
+    srcs = ["test_qwen35_models.py"],
+    est_time = 768,
+    suite = "stage-c-test-4-gpu-b200",
+)
+
+sgl_cuda_test(
+    name = "test_qwen3_next_models",
+    srcs = ["test_qwen3_next_models.py"],
+    est_time = 142,
+    suite = "stage-c-test-4-gpu-h100",
+)
+
+sgl_cuda_test(
+    name = "test_qwen3_next_models_mtp",
+    srcs = ["test_qwen3_next_models_mtp.py"],
+    est_time = 422,
+    suite = "stage-c-test-4-gpu-h100",
+)
+
+sgl_cuda_test(
+    name = "test_deepseek_v3_cutedsl_4gpu",
+    srcs = ["test_deepseek_v3_cutedsl_4gpu.py"],
+    est_time = 1800,
+    suite = "stage-c-test-4-gpu-gb200",
+)
+
+sgl_cuda_test(
+    name = "test_qwen35_fp4_mtp_v2",
+    srcs = ["test_qwen35_fp4_mtp_v2.py"],
+    est_time = 540,
+    suite = "stage-c-test-4-gpu-b200",
+)
+
+sgl_cuda_test(
+    name = "test_qwen35_hicache",
+    srcs = ["test_qwen35_hicache.py"],
+    est_time = 540,
+    suite = "stage-c-test-4-gpu-h100",
+)
+
+sgl_cuda_test(
+    name = "test_qwen3_30b",
+    srcs = ["test_qwen3_30b.py"],
+    est_time = 261,
+    suite = "stage-c-test-4-gpu-h100",
+)

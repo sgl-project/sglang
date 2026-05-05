@@ -1,0 +1,31 @@
+load("//tools/bazel:sgl_defs.bzl", "sgl_amd_test", "sgl_cuda_test")
+
+sgl_cuda_test(
+    name = "test_eval_accuracy_large_cuda_stage_b_test_1_gpu_small",
+    srcs = ["test_eval_accuracy_large.py"],
+    est_time = 496,
+    suite = "stage-b-test-1-gpu-small",
+)
+
+sgl_amd_test(
+    name = "test_eval_accuracy_large_amd_stage_b_test_1_gpu_small_amd",
+    srcs = ["test_eval_accuracy_large.py"],
+    est_time = 420,
+    suite = "stage-b-test-1-gpu-small-amd",
+)
+
+sgl_cuda_test(
+    name = "test_text_models_gsm8k_eval",
+    srcs = ["test_text_models_gsm8k_eval.py"],
+    est_time = 3600,
+    nightly = True,
+    suite = "nightly-eval-text-2-gpu",
+)
+
+sgl_cuda_test(
+    name = "test_vlms_mmmu_eval",
+    srcs = ["test_vlms_mmmu_eval.py"],
+    est_time = 7200,
+    nightly = True,
+    suite = "nightly-eval-vlm-2-gpu",
+)

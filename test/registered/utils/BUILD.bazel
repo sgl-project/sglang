@@ -1,0 +1,97 @@
+load("//tools/bazel:sgl_defs.bzl", "sgl_amd_test", "sgl_cpu_test", "sgl_cuda_test")
+
+sgl_cpu_test(
+    name = "test_numa_utils_cpu_stage_a_test_cpu",
+    srcs = ["test_numa_utils.py"],
+    est_time = 7,
+    suite = "stage-a-test-cpu",
+)
+
+sgl_cuda_test(
+    name = "test_numa_utils_cuda_stage_c_test_4_gpu_gb200",
+    srcs = ["test_numa_utils.py"],
+    est_time = 10,
+    suite = "stage-c-test-4-gpu-gb200",
+)
+
+sgl_cuda_test(
+    name = "test_numa_utils_cuda_stage_c_test_8_gpu_b200",
+    srcs = ["test_numa_utils.py"],
+    est_time = 10,
+    suite = "stage-c-test-8-gpu-b200",
+)
+
+sgl_amd_test(
+    name = "test_bench_typebaseddispatcher",
+    srcs = ["test_bench_typebaseddispatcher.py"],
+    est_time = 10,
+    suite = "stage-b-test-1-gpu-small-amd",
+)
+
+sgl_cpu_test(
+    name = "test_network_address",
+    srcs = ["test_network_address.py"],
+    est_time = 7,
+    suite = "stage-a-test-cpu",
+)
+
+sgl_cuda_test(
+    name = "test_request_logger_cuda_nightly_1_gpu_nightly",
+    srcs = ["test_request_logger.py"],
+    est_time = 120,
+    nightly = True,
+    suite = "nightly-1-gpu",
+)
+
+sgl_amd_test(
+    name = "test_request_logger_amd_nightly_amd_1_gpu_nightly",
+    srcs = ["test_request_logger.py"],
+    est_time = 120,
+    nightly = True,
+    suite = "nightly-amd-1-gpu",
+)
+
+sgl_cuda_test(
+    name = "test_scheduler_status_logger_cuda_nightly_1_gpu_nightly",
+    srcs = ["test_scheduler_status_logger.py"],
+    est_time = 120,
+    nightly = True,
+    suite = "nightly-1-gpu",
+)
+
+sgl_amd_test(
+    name = "test_scheduler_status_logger_amd_nightly_amd_1_gpu_nightly",
+    srcs = ["test_scheduler_status_logger.py"],
+    est_time = 120,
+    nightly = True,
+    suite = "nightly-amd-1-gpu",
+)
+
+sgl_cpu_test(
+    name = "test_socket_utils",
+    srcs = ["test_socket_utils.py"],
+    est_time = 7,
+    suite = "stage-a-test-cpu",
+)
+
+sgl_amd_test(
+    name = "test_type_based_dispatcher",
+    srcs = ["test_type_based_dispatcher.py"],
+    est_time = 10,
+    suite = "stage-b-test-1-gpu-small-amd",
+)
+
+sgl_cpu_test(
+    name = "test_log_utils",
+    srcs = ["test_log_utils.py"],
+    est_time = 6,
+    suite = "stage-a-test-cpu",
+)
+
+sgl_cuda_test(
+    name = "test_model_file_verifier",
+    srcs = ["test_model_file_verifier.py"],
+    est_time = 120,
+    nightly = True,
+    suite = "nightly-1-gpu",
+)

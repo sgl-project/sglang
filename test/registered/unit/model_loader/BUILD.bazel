@@ -1,0 +1,36 @@
+load("//tools/bazel:sgl_defs.bzl", "sgl_amd_test", "sgl_cpu_test", "sgl_cuda_test")
+
+sgl_cpu_test(
+    name = "test_runai_model_streamer_loader",
+    srcs = ["test_runai_model_streamer_loader.py"],
+    est_time = 6,
+    suite = "stage-a-test-cpu",
+)
+
+sgl_cuda_test(
+    name = "test_modelopt_export_cuda_stage_b_test_1_gpu_large",
+    srcs = ["test_modelopt_export.py"],
+    est_time = 11,
+    suite = "stage-b-test-1-gpu-large",
+)
+
+sgl_amd_test(
+    name = "test_modelopt_export_amd_stage_b_test_1_gpu_small_amd",
+    srcs = ["test_modelopt_export.py"],
+    est_time = 9,
+    suite = "stage-b-test-1-gpu-small-amd",
+)
+
+sgl_cuda_test(
+    name = "test_modelopt_loader",
+    srcs = ["test_modelopt_loader.py"],
+    est_time = 11,
+    suite = "stage-b-test-1-gpu-small",
+)
+
+sgl_cpu_test(
+    name = "test_prefetch_checkpoints",
+    srcs = ["test_prefetch_checkpoints.py"],
+    est_time = 10,
+    suite = "stage-a-test-cpu",
+)

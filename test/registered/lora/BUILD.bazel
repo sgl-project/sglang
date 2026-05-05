@@ -1,0 +1,291 @@
+load("//tools/bazel:sgl_defs.bzl", "sgl_amd_test", "sgl_cuda_test")
+
+sgl_cuda_test(
+    name = "test_lora_gpt_oss_20b_logprob_diff",
+    srcs = ["test_lora_gpt_oss_20b_logprob_diff.py"],
+    est_time = 300,
+    suite = "stage-c-test-4-gpu-b200",
+)
+
+sgl_cuda_test(
+    name = "test_lora_openai_api_cuda_nightly_1_gpu_nightly",
+    srcs = ["test_lora_openai_api.py"],
+    est_time = 30,
+    nightly = True,
+    suite = "nightly-1-gpu",
+)
+
+sgl_amd_test(
+    name = "test_lora_openai_api_amd_nightly_amd_1_gpu_nightly",
+    srcs = ["test_lora_openai_api.py"],
+    est_time = 30,
+    nightly = True,
+    suite = "nightly-amd-1-gpu",
+)
+
+sgl_cuda_test(
+    name = "test_lora_overlap_loading_cuda_stage_b_test_1_gpu_large",
+    srcs = ["test_lora_overlap_loading.py"],
+    est_time = 48,
+    suite = "stage-b-test-1-gpu-large",
+)
+
+sgl_amd_test(
+    name = "test_lora_overlap_loading_amd_stage_b_test_1_gpu_small_amd",
+    srcs = ["test_lora_overlap_loading.py"],
+    est_time = 75,
+    suite = "stage-b-test-1-gpu-small-amd",
+)
+
+sgl_cuda_test(
+    name = "test_lora_qwen3_5_35b_a3b_logprob_diff",
+    srcs = ["test_lora_qwen3_5_35b_a3b_logprob_diff.py"],
+    est_time = 160,
+    suite = "stage-c-test-4-gpu-b200",
+)
+
+sgl_cuda_test(
+    name = "test_lora_qwen3_vl_30b_a3b_instruct_logprob_diff",
+    srcs = ["test_lora_qwen3_vl_30b_a3b_instruct_logprob_diff.py"],
+    est_time = 160,
+    suite = "stage-c-test-4-gpu-b200",
+)
+
+sgl_cuda_test(
+    name = "test_lora_update",
+    srcs = ["test_lora_update.py"],
+    est_time = 487,
+    suite = "stage-b-test-1-gpu-large",
+)
+
+sgl_cuda_test(
+    name = "test_lora_eviction_policy_cuda_nightly_1_gpu_nightly",
+    srcs = ["test_lora_eviction_policy.py"],
+    est_time = 200,
+    nightly = True,
+    suite = "nightly-1-gpu",
+)
+
+sgl_amd_test(
+    name = "test_lora_eviction_policy_amd_nightly_amd_1_gpu_nightly",
+    srcs = ["test_lora_eviction_policy.py"],
+    est_time = 200,
+    nightly = True,
+    suite = "nightly-amd-1-gpu",
+)
+
+sgl_cuda_test(
+    name = "test_lora_hf_sgl_logprob_diff_cuda_stage_b_test_1_gpu_small",
+    srcs = ["test_lora_hf_sgl_logprob_diff.py"],
+    est_time = 150,
+    suite = "stage-b-test-1-gpu-small",
+)
+
+sgl_amd_test(
+    name = "test_lora_hf_sgl_logprob_diff_amd_stage_b_test_1_gpu_small_amd",
+    srcs = ["test_lora_hf_sgl_logprob_diff.py"],
+    est_time = 250,
+    suite = "stage-b-test-1-gpu-small-amd",
+)
+
+sgl_cuda_test(
+    name = "test_lora_kimi_k25_logprob_diff",
+    srcs = ["test_lora_kimi_k25_logprob_diff.py"],
+    est_time = 360,
+    suite = "nightly-8-gpu-b200",
+)
+
+sgl_cuda_test(
+    name = "test_lora_moe_tp_logprob_diff",
+    srcs = ["test_lora_moe_tp_logprob_diff.py"],
+    est_time = 200,
+    suite = "stage-b-test-2-gpu-large",
+)
+
+sgl_cuda_test(
+    name = "test_lora_qwen3_5_4b_logprob_diff",
+    srcs = ["test_lora_qwen3_5_4b_logprob_diff.py"],
+    est_time = 90,
+    suite = "stage-b-test-1-gpu-large",
+)
+
+sgl_cuda_test(
+    name = "test_lora_tp",
+    srcs = ["test_lora_tp.py"],
+    est_time = 190,
+    suite = "stage-c-test-8-gpu-h200",
+)
+
+sgl_cuda_test(
+    name = "test_fused_moe_lora_kernel",
+    srcs = ["test_fused_moe_lora_kernel.py"],
+    est_time = 28,
+    suite = "stage-b-test-1-gpu-large",
+)
+
+sgl_cuda_test(
+    name = "test_lora_deepseek_v3_base_logprob_diff",
+    srcs = ["test_lora_deepseek_v3_base_logprob_diff.py"],
+    est_time = 300,
+    suite = "nightly-8-gpu-b200",
+)
+
+sgl_cuda_test(
+    name = "test_lora_moe_runner",
+    srcs = ["test_lora_moe_runner.py"],
+    est_time = 17,
+    suite = "stage-b-test-1-gpu-large",
+)
+
+sgl_cuda_test(
+    name = "test_lora_moe_vllm_sgl_logprob_diff",
+    srcs = ["test_lora_moe_vllm_sgl_logprob_diff.py"],
+    est_time = 50,
+    suite = "stage-b-test-1-gpu-large",
+)
+
+sgl_cuda_test(
+    name = "test_lora_nemotron_3_super_120b_a12b_logprob_diff",
+    srcs = ["test_lora_nemotron_3_super_120b_a12b_logprob_diff.py"],
+    est_time = 300,
+    suite = "stage-c-test-4-gpu-b200",
+)
+
+sgl_cuda_test(
+    name = "test_lora_qwen3_8b_logprob_diff",
+    srcs = ["test_lora_qwen3_8b_logprob_diff.py"],
+    est_time = 40,
+    suite = "stage-b-test-1-gpu-large",
+)
+
+sgl_cuda_test(
+    name = "test_lora_drainer_cuda_stage_b_test_1_gpu_small",
+    srcs = ["test_lora_drainer.py"],
+    est_time = 100,
+    suite = "stage-b-test-1-gpu-small",
+)
+
+sgl_amd_test(
+    name = "test_lora_drainer_amd_stage_b_test_1_gpu_small_amd",
+    srcs = ["test_lora_drainer.py"],
+    est_time = 100,
+    suite = "stage-b-test-1-gpu-small-amd",
+)
+
+sgl_cuda_test(
+    name = "test_lora_tied_lm_head",
+    srcs = ["test_lora_tied_lm_head.py"],
+    est_time = 120,
+    nightly = True,
+    suite = "nightly-1-gpu",
+)
+
+sgl_cuda_test(
+    name = "test_marlin_lora_correctness",
+    srcs = ["test_marlin_lora_correctness.py"],
+    est_time = 129,
+    suite = "stage-b-test-1-gpu-large",
+)
+
+sgl_cuda_test(
+    name = "test_embedding_lora_support",
+    srcs = ["test_embedding_lora_support.py"],
+    est_time = 150,
+    suite = "nightly-1-gpu",
+)
+
+sgl_cuda_test(
+    name = "test_lora_backend",
+    srcs = ["test_lora_backend.py"],
+    est_time = 224,
+    suite = "stage-b-test-1-gpu-small",
+)
+
+sgl_cuda_test(
+    name = "test_lora_radix_cache_cuda_nightly_1_gpu_nightly",
+    srcs = ["test_lora_radix_cache.py"],
+    est_time = 200,
+    nightly = True,
+    suite = "nightly-1-gpu",
+)
+
+sgl_amd_test(
+    name = "test_lora_radix_cache_amd_nightly_amd_1_gpu_nightly",
+    srcs = ["test_lora_radix_cache.py"],
+    est_time = 200,
+    nightly = True,
+    suite = "nightly-amd-1-gpu",
+)
+
+sgl_cuda_test(
+    name = "test_sgemm_sorted_by_adapter",
+    srcs = ["test_sgemm_sorted_by_adapter.py"],
+    est_time = 11,
+    suite = "stage-b-test-1-gpu-large",
+)
+
+sgl_cuda_test(
+    name = "test_lora_eviction_cuda_stage_b_test_1_gpu_small",
+    srcs = ["test_lora_eviction.py"],
+    est_time = 263,
+    suite = "stage-b-test-1-gpu-small",
+)
+
+sgl_amd_test(
+    name = "test_lora_eviction_amd_stage_b_test_1_gpu_small_amd",
+    srcs = ["test_lora_eviction.py"],
+    est_time = 224,
+    suite = "stage-b-test-1-gpu-small-amd",
+)
+
+sgl_cuda_test(
+    name = "test_lora_qwen3_30b_a3b_instruct_2507_logprob_diff",
+    srcs = ["test_lora_qwen3_30b_a3b_instruct_2507_logprob_diff.py"],
+    est_time = 160,
+    suite = "stage-c-test-4-gpu-b200",
+)
+
+sgl_cuda_test(
+    name = "test_multi_lora_backend_cuda_stage_b_test_1_gpu_large",
+    srcs = ["test_multi_lora_backend.py"],
+    est_time = 99,
+    suite = "stage-b-test-1-gpu-large",
+)
+
+sgl_amd_test(
+    name = "test_multi_lora_backend_amd_stage_b_test_1_gpu_small_amd",
+    srcs = ["test_multi_lora_backend.py"],
+    est_time = 100,
+    suite = "stage-b-test-1-gpu-small-amd",
+)
+
+sgl_cuda_test(
+    name = "test_chunked_sgmv_backend",
+    srcs = ["test_chunked_sgmv_backend.py"],
+    est_time = 60,
+    nightly = True,
+    suite = "nightly-1-gpu",
+)
+
+sgl_cuda_test(
+    name = "test_lora_openai_compatible_cuda_nightly_1_gpu_nightly",
+    srcs = ["test_lora_openai_compatible.py"],
+    est_time = 150,
+    nightly = True,
+    suite = "nightly-1-gpu",
+)
+
+sgl_amd_test(
+    name = "test_lora_openai_compatible_amd_nightly_amd_1_gpu_nightly",
+    srcs = ["test_lora_openai_compatible.py"],
+    est_time = 150,
+    nightly = True,
+    suite = "nightly-amd-1-gpu",
+)
+
+sgl_cuda_test(
+    name = "test_virtual_experts_kernels",
+    srcs = ["test_virtual_experts_kernels.py"],
+    est_time = 15,
+    suite = "stage-b-test-1-gpu-small",
+)

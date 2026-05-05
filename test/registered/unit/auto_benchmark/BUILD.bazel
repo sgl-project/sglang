@@ -1,0 +1,22 @@
+load("//tools/bazel:sgl_defs.bzl", "sgl_cuda_test")
+
+sgl_cuda_test(
+    name = "test_dataset_tools",
+    srcs = ["test_dataset_tools.py"],
+    est_time = 6,
+    suite = "stage-b-test-1-gpu-small",
+)
+
+sgl_cuda_test(
+    name = "test_run_candidate",
+    srcs = ["test_run_candidate.py"],
+    est_time = 6,
+    suite = "stage-b-test-1-gpu-small",
+)
+
+sgl_cuda_test(
+    name = "test_search_tools",
+    srcs = ["test_search_tools.py"],
+    est_time = 6,
+    suite = "stage-b-test-1-gpu-small",
+)

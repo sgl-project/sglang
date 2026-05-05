@@ -1,0 +1,8 @@
+load("//tools/bazel:sgl_defs.bzl", "sgl_cpu_test")
+
+sgl_cpu_test(
+    name = "test_kimik2_detector",
+    srcs = ["test_kimik2_detector.py"],
+    est_time = 5,
+    suite = "stage-a-test-cpu",
+)

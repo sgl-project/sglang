@@ -1,0 +1,49 @@
+load("//tools/bazel:sgl_defs.bzl", "sgl_cpu_test")
+
+sgl_cpu_test(
+    name = "test_executor",
+    srcs = ["test_executor.py"],
+    est_time = 15,
+    nightly = True,
+    suite = "stage-a-test-cpu",
+)
+
+sgl_cpu_test(
+    name = "test_planner",
+    srcs = ["test_planner.py"],
+    est_time = 30,
+    nightly = True,
+    suite = "stage-a-test-cpu",
+)
+
+sgl_cpu_test(
+    name = "test_thd_seq_lens_loader",
+    srcs = ["test_thd_seq_lens_loader.py"],
+    est_time = 15,
+    nightly = True,
+    suite = "stage-a-test-cpu",
+)
+
+sgl_cpu_test(
+    name = "test_aux_loader",
+    srcs = ["test_aux_loader.py"],
+    est_time = 15,
+    nightly = True,
+    suite = "stage-a-test-cpu",
+)
+
+sgl_cpu_test(
+    name = "test_aux_plugins",
+    srcs = ["test_aux_plugins.py"],
+    est_time = 15,
+    nightly = True,
+    suite = "stage-a-test-cpu",
+)
+
+sgl_cpu_test(
+    name = "test_concat_steps",
+    srcs = ["test_concat_steps.py"],
+    est_time = 15,
+    nightly = True,
+    suite = "stage-a-test-cpu",
+)

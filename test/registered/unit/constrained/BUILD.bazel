@@ -1,0 +1,29 @@
+load("//tools/bazel:sgl_defs.bzl", "sgl_cpu_test")
+
+sgl_cpu_test(
+    name = "test_base_grammar_backend",
+    srcs = ["test_base_grammar_backend.py"],
+    est_time = 2,
+    suite = "stage-a-test-cpu",
+)
+
+sgl_cpu_test(
+    name = "test_grammar_manager",
+    srcs = ["test_grammar_manager.py"],
+    est_time = 2,
+    suite = "stage-a-test-cpu",
+)
+
+sgl_cpu_test(
+    name = "test_reasoner_grammar_backend",
+    srcs = ["test_reasoner_grammar_backend.py"],
+    est_time = 2,
+    suite = "stage-a-test-cpu",
+)
+
+sgl_cpu_test(
+    name = "test_utils",
+    srcs = ["test_utils.py"],
+    est_time = 1,
+    suite = "stage-a-test-cpu",
+)

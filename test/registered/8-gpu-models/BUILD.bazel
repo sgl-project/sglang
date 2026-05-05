@@ -1,0 +1,160 @@
+load("//tools/bazel:sgl_defs.bzl", "sgl_cuda_test")
+
+sgl_cuda_test(
+    name = "test_deepseek_v3_mtp",
+    srcs = ["test_deepseek_v3_mtp.py"],
+    est_time = 309,
+    suite = "stage-c-test-8-gpu-h200",
+)
+
+sgl_cuda_test(
+    name = "test_minimax_m25",
+    srcs = ["test_minimax_m25.py"],
+    est_time = 1800,
+    nightly = True,
+    suite = "nightly-8-gpu-common",
+)
+
+sgl_cuda_test(
+    name = "test_nvidia_nemotron_3_super_nightly",
+    srcs = ["test_nvidia_nemotron_3_super_nightly.py"],
+    est_time = 5400,
+    nightly = True,
+    suite = "nightly-8-gpu-common",
+)
+
+sgl_cuda_test(
+    name = "test_dsa_models_mtp",
+    srcs = ["test_dsa_models_mtp.py"],
+    est_time = 1048,
+    suite = "stage-c-test-8-gpu-h200",
+)
+
+sgl_cuda_test(
+    name = "test_llama4",
+    srcs = ["test_llama4.py"],
+    est_time = 1800,
+    nightly = True,
+    suite = "nightly-8-gpu-common",
+)
+
+sgl_cuda_test(
+    name = "test_mimo_models",
+    srcs = ["test_mimo_models.py"],
+    est_time = 330,
+    suite = "stage-c-test-8-gpu-h200",
+)
+
+sgl_cuda_test(
+    name = "test_step3p5_flash_chain_mtp",
+    srcs = ["test_step3p5_flash_chain_mtp.py"],
+    est_time = 663,
+    suite = "stage-c-test-8-gpu-h200",
+)
+
+sgl_cuda_test(
+    name = "test_dsa_models_basic",
+    srcs = ["test_dsa_models_basic.py"],
+    est_time = 1047,
+    suite = "stage-c-test-8-gpu-h200",
+)
+
+sgl_cuda_test(
+    name = "test_glm_46",
+    srcs = ["test_glm_46.py"],
+    est_time = 1800,
+    nightly = True,
+    suite = "nightly-8-gpu-common",
+)
+
+sgl_cuda_test(
+    name = "test_glm_51_fp8",
+    srcs = ["test_glm_51_fp8.py"],
+    est_time = 1800,
+    nightly = True,
+    suite = "nightly-8-gpu-common",
+)
+
+sgl_cuda_test(
+    name = "test_gpt_oss_120b",
+    srcs = ["test_gpt_oss_120b.py"],
+    est_time = 1800,
+    nightly = True,
+    suite = "nightly-8-gpu-common",
+)
+
+sgl_cuda_test(
+    name = "test_qwen35",
+    srcs = ["test_qwen35.py"],
+    est_time = 1800,
+    nightly = True,
+    suite = "nightly-8-gpu-common",
+)
+
+sgl_cuda_test(
+    name = "test_ring_2_5_1t",
+    srcs = ["test_ring_2_5_1t.py"],
+    est_time = 510,
+    nightly = True,
+    suite = "nightly-8-gpu-common",
+)
+
+sgl_cuda_test(
+    name = "test_deepseek_v32_indexcache",
+    srcs = ["test_deepseek_v32_indexcache.py"],
+    est_time = 492,
+    suite = "stage-c-test-8-gpu-h200",
+)
+
+sgl_cuda_test(
+    name = "test_dsa_models_hisparse",
+    srcs = ["test_dsa_models_hisparse.py"],
+    est_time = 720,
+    nightly = True,
+    suite = "stage-c-test-8-gpu-h200",
+)
+
+sgl_cuda_test(
+    name = "test_kimi_k25",
+    srcs = ["test_kimi_k25.py"],
+    est_time = 3600,
+    nightly = True,
+    suite = "nightly-8-gpu-common",
+)
+
+sgl_cuda_test(
+    name = "test_minimax_m25_basic",
+    srcs = ["test_minimax_m25_basic.py"],
+    est_time = 307,
+    suite = "stage-c-test-8-gpu-h200",
+)
+
+sgl_cuda_test(
+    name = "test_mistral_large3",
+    srcs = ["test_mistral_large3.py"],
+    est_time = 3000,
+    nightly = True,
+    suite = "nightly-8-gpu-common",
+)
+
+sgl_cuda_test(
+    name = "test_nvidia_nemotron_3_super_bf16",
+    srcs = ["test_nvidia_nemotron_3_super_bf16.py"],
+    est_time = 376,
+    suite = "stage-c-test-8-gpu-h200",
+)
+
+sgl_cuda_test(
+    name = "test_deepseek_v32",
+    srcs = ["test_deepseek_v32.py"],
+    est_time = 5400,
+    nightly = True,
+    suite = "nightly-8-gpu-common",
+)
+
+sgl_cuda_test(
+    name = "test_deepseek_v3_basic",
+    srcs = ["test_deepseek_v3_basic.py"],
+    est_time = 301,
+    suite = "stage-c-test-8-gpu-h200",
+)

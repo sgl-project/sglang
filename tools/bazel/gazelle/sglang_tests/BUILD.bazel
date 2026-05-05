@@ -1,0 +1,16 @@
+load("@rules_go//go:def.bzl", "go_library")
+
+go_library(
+    name = "sglang_tests",
+    srcs = ["sglang_tests.go"],
+    importpath = "github.com/sgl-project/sglang/tools/bazel/gazelle/sglang_tests",
+    visibility = ["//visibility:public"],
+    deps = [
+        "@bazel_gazelle//config",
+        "@bazel_gazelle//label",
+        "@bazel_gazelle//language",
+        "@bazel_gazelle//repo",
+        "@bazel_gazelle//resolve",
+        "@bazel_gazelle//rule",
+    ],
+)

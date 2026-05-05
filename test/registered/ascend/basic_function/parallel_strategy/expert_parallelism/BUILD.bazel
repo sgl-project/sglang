@@ -1,0 +1,46 @@
+load("//tools/bazel:sgl_defs.bzl", "sgl_npu_test")
+
+sgl_npu_test(
+    name = "test_npu_deepep_low_latency_qwen3_480b",
+    srcs = ["test_npu_deepep_low_latency_qwen3_480b.py"],
+    est_time = 200,
+    suite = "nightly-16-npu-a3",
+)
+
+sgl_npu_test(
+    name = "test_npu_deepep_npu_stage_b_test_16_npu_a3",
+    srcs = ["test_npu_deepep.py"],
+    est_time = 400,
+    suite = "stage-b-test-16-npu-a3",
+)
+
+sgl_npu_test(
+    name = "test_npu_deepep_npu_nightly_16_npu_a3_nightly",
+    srcs = ["test_npu_deepep.py"],
+    est_time = 400,
+    nightly = True,
+    suite = "nightly-16-npu-a3",
+)
+
+sgl_npu_test(
+    name = "test_npu_deepep_auto_deepseek_v3_2_w8a8",
+    srcs = ["test_npu_deepep_auto_deepseek_v3_2_w8a8.py"],
+    est_time = 400,
+    nightly = True,
+    suite = "nightly-16-npu-a3",
+)
+
+sgl_npu_test(
+    name = "test_npu_deepep_auto_qwen3_480b",
+    srcs = ["test_npu_deepep_auto_qwen3_480b.py"],
+    est_time = 200,
+    nightly = True,
+    suite = "nightly-16-npu-a3",
+)
+
+sgl_npu_test(
+    name = "test_npu_deepep_low_latency_deepseek_v3_2_w8a8",
+    srcs = ["test_npu_deepep_low_latency_deepseek_v3_2_w8a8.py"],
+    est_time = 200,
+    suite = "nightly-16-npu-a3",
+)

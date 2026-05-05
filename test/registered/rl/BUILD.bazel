@@ -1,0 +1,92 @@
+load("//tools/bazel:sgl_defs.bzl", "sgl_amd_test", "sgl_cpu_test", "sgl_cuda_test")
+
+sgl_cuda_test(
+    name = "test_lora_load_from_tensor_cuda_stage_b_test_1_gpu_large",
+    srcs = ["test_lora_load_from_tensor.py"],
+    est_time = 102,
+    suite = "stage-b-test-1-gpu-large",
+)
+
+sgl_amd_test(
+    name = "test_lora_load_from_tensor_amd_stage_b_test_1_gpu_small_amd",
+    srcs = ["test_lora_load_from_tensor.py"],
+    est_time = 90,
+    suite = "stage-b-test-1-gpu-small-amd",
+)
+
+sgl_cuda_test(
+    name = "test_multi_instance_release_memory_occupation",
+    srcs = ["test_multi_instance_release_memory_occupation.py"],
+    est_time = 57,
+    suite = "stage-c-test-4-gpu-h100",
+)
+
+sgl_cuda_test(
+    name = "test_update_weights_from_disk_blackwell",
+    srcs = ["test_update_weights_from_disk_blackwell.py"],
+    est_time = 400,
+    suite = "stage-c-test-4-gpu-b200",
+)
+
+sgl_cuda_test(
+    name = "test_update_weights_from_distributed_cuda_stage_b_test_2_gpu_large",
+    srcs = ["test_update_weights_from_distributed.py"],
+    est_time = 137,
+    suite = "stage-b-test-2-gpu-large",
+)
+
+sgl_amd_test(
+    name = "test_update_weights_from_distributed_amd_stage_b_test_2_gpu_large_amd",
+    srcs = ["test_update_weights_from_distributed.py"],
+    est_time = 400,
+    suite = "stage-b-test-2-gpu-large-amd",
+)
+
+sgl_cuda_test(
+    name = "test_update_weights_from_tensor_cuda_stage_b_test_1_gpu_small",
+    srcs = ["test_update_weights_from_tensor.py"],
+    est_time = 147,
+    suite = "stage-b-test-1-gpu-small",
+)
+
+sgl_amd_test(
+    name = "test_update_weights_from_tensor_amd_stage_b_test_1_gpu_small_amd",
+    srcs = ["test_update_weights_from_tensor.py"],
+    est_time = 195,
+    suite = "stage-b-test-1-gpu-small-amd",
+)
+
+sgl_cuda_test(
+    name = "test_fp32_lm_head_cuda_stage_b_test_1_gpu_small",
+    srcs = ["test_fp32_lm_head.py"],
+    est_time = 9,
+    suite = "stage-b-test-1-gpu-small",
+)
+
+sgl_amd_test(
+    name = "test_fp32_lm_head_amd_stage_b_test_1_gpu_small_amd",
+    srcs = ["test_fp32_lm_head.py"],
+    est_time = 15,
+    suite = "stage-b-test-1-gpu-small-amd",
+)
+
+sgl_cuda_test(
+    name = "test_patch_torch",
+    srcs = ["test_patch_torch.py"],
+    est_time = 38,
+    suite = "stage-b-test-2-gpu-large",
+)
+
+sgl_cpu_test(
+    name = "test_pause_generation_tensor_consistency",
+    srcs = ["test_pause_generation_tensor_consistency.py"],
+    est_time = 7,
+    suite = "stage-a-test-cpu",
+)
+
+sgl_cuda_test(
+    name = "test_return_routed_experts",
+    srcs = ["test_return_routed_experts.py"],
+    est_time = 185,
+    suite = "stage-b-test-2-gpu-large",
+)

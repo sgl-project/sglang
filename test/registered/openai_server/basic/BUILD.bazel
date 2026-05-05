@@ -1,0 +1,43 @@
+load("//tools/bazel:sgl_defs.bzl", "sgl_amd_test", "sgl_cuda_test")
+
+sgl_cuda_test(
+    name = "test_http2_server",
+    srcs = ["test_http2_server.py"],
+    est_time = 52,
+    suite = "stage-b-test-1-gpu-small",
+)
+
+sgl_cuda_test(
+    name = "test_openai_server_cuda_stage_b_test_1_gpu_small",
+    srcs = ["test_openai_server.py"],
+    est_time = 182,
+    suite = "stage-b-test-1-gpu-small",
+)
+
+sgl_amd_test(
+    name = "test_openai_server_amd_stage_b_test_1_gpu_small_amd",
+    srcs = ["test_openai_server.py"],
+    est_time = 200,
+    suite = "stage-b-test-1-gpu-small-amd",
+)
+
+sgl_cuda_test(
+    name = "test_serving_transcription",
+    srcs = ["test_serving_transcription.py"],
+    est_time = 60,
+    suite = "stage-b-test-1-gpu-small",
+)
+
+sgl_cuda_test(
+    name = "test_anthropic_server_cuda_stage_b_test_1_gpu_small",
+    srcs = ["test_anthropic_server.py"],
+    est_time = 40,
+    suite = "stage-b-test-1-gpu-small",
+)
+
+sgl_amd_test(
+    name = "test_anthropic_server_amd_stage_b_test_1_gpu_small_amd",
+    srcs = ["test_anthropic_server.py"],
+    est_time = 140,
+    suite = "stage-b-test-1-gpu-small-amd",
+)

@@ -1,0 +1,43 @@
+load("//tools/bazel:sgl_defs.bzl", "sgl_amd_test", "sgl_cuda_test")
+
+sgl_cuda_test(
+    name = "test_metrics_cuda_stage_b_test_1_gpu_small",
+    srcs = ["test_metrics.py"],
+    est_time = 74,
+    suite = "stage-b-test-1-gpu-small",
+)
+
+sgl_amd_test(
+    name = "test_metrics_amd_stage_b_test_1_gpu_small_amd",
+    srcs = ["test_metrics.py"],
+    est_time = 32,
+    suite = "stage-b-test-1-gpu-small-amd",
+)
+
+sgl_cuda_test(
+    name = "test_priority_metrics_cuda_stage_b_test_1_gpu_small",
+    srcs = ["test_priority_metrics.py"],
+    est_time = 60,
+    suite = "stage-b-test-1-gpu-small",
+)
+
+sgl_amd_test(
+    name = "test_priority_metrics_amd_stage_b_test_1_gpu_small_amd",
+    srcs = ["test_priority_metrics.py"],
+    est_time = 60,
+    suite = "stage-b-test-1-gpu-small-amd",
+)
+
+sgl_cuda_test(
+    name = "test_tracing",
+    srcs = ["test_tracing.py"],
+    est_time = 113,
+    suite = "stage-b-test-1-gpu-small",
+)
+
+sgl_cuda_test(
+    name = "test_tracing_disaggregation",
+    srcs = ["test_tracing_disaggregation.py"],
+    est_time = 65,
+    suite = "stage-b-test-2-gpu-large",
+)

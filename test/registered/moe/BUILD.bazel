@@ -1,0 +1,72 @@
+load("//tools/bazel:sgl_defs.bzl", "sgl_amd_test", "sgl_cuda_test")
+
+sgl_cuda_test(
+    name = "test_moe_ep",
+    srcs = ["test_moe_ep.py"],
+    est_time = 279,
+    suite = "stage-b-test-2-gpu-large",
+)
+
+sgl_cuda_test(
+    name = "test_torch_compile_moe_cuda_stage_b_test_1_gpu_large",
+    srcs = ["test_torch_compile_moe.py"],
+    est_time = 130,
+    suite = "stage-b-test-1-gpu-large",
+)
+
+sgl_amd_test(
+    name = "test_torch_compile_moe_amd_stage_b_test_1_gpu_small_amd",
+    srcs = ["test_torch_compile_moe.py"],
+    est_time = 1400,
+    suite = "stage-b-test-1-gpu-small-amd",
+)
+
+sgl_cuda_test(
+    name = "test_triton_fused_moe",
+    srcs = ["test_triton_fused_moe.py"],
+    est_time = 13,
+    suite = "stage-b-test-1-gpu-large",
+)
+
+sgl_cuda_test(
+    name = "test_triton_moe_channel_fp8_kernel",
+    srcs = ["test_triton_moe_channel_fp8_kernel.py"],
+    est_time = 17,
+    suite = "stage-b-test-1-gpu-large",
+)
+
+sgl_cuda_test(
+    name = "test_cutedsl_moe",
+    srcs = ["test_cutedsl_moe.py"],
+    est_time = 590,
+    suite = "stage-c-test-4-gpu-b200",
+)
+
+sgl_cuda_test(
+    name = "test_fused_moe_cuda_stage_b_test_1_gpu_large",
+    srcs = ["test_fused_moe.py"],
+    est_time = 87,
+    suite = "stage-b-test-1-gpu-large",
+)
+
+sgl_amd_test(
+    name = "test_fused_moe_amd_stage_b_test_1_gpu_small_amd",
+    srcs = ["test_fused_moe.py"],
+    est_time = 30,
+    suite = "stage-b-test-1-gpu-small-amd",
+)
+
+sgl_cuda_test(
+    name = "test_glm4_moe_models",
+    srcs = ["test_glm4_moe_models.py"],
+    est_time = 171,
+    suite = "stage-b-test-2-gpu-large",
+)
+
+sgl_cuda_test(
+    name = "test_hybrid_dp_ep_tp_mtp",
+    srcs = ["test_hybrid_dp_ep_tp_mtp.py"],
+    est_time = 5400,
+    nightly = True,
+    suite = "weekly-8-gpu-h200",
+)

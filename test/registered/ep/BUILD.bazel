@@ -1,0 +1,22 @@
+load("//tools/bazel:sgl_defs.bzl", "sgl_cuda_test")
+
+sgl_cuda_test(
+    name = "test_deepep_large",
+    srcs = ["test_deepep_large.py"],
+    est_time = 528,
+    suite = "stage-c-test-deepep-8-gpu-h200",
+)
+
+sgl_cuda_test(
+    name = "test_deepep_small",
+    srcs = ["test_deepep_small.py"],
+    est_time = 478,
+    suite = "stage-c-test-deepep-4-gpu-h100",
+)
+
+sgl_cuda_test(
+    name = "test_mooncake_ep_small",
+    srcs = ["test_mooncake_ep_small.py"],
+    est_time = 82,
+    suite = "stage-c-test-deepep-4-gpu-h100",
+)

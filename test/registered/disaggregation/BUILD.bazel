@@ -1,0 +1,15 @@
+load("//tools/bazel:sgl_defs.bzl", "sgl_cuda_test")
+
+sgl_cuda_test(
+    name = "test_disaggregation_basic",
+    srcs = ["test_disaggregation_basic.py"],
+    est_time = 509,
+    suite = "stage-b-test-2-gpu-large",
+)
+
+sgl_cuda_test(
+    name = "test_specv2_kvcache_offloading",
+    srcs = ["test_specv2_kvcache_offloading.py"],
+    est_time = 8,
+    suite = "stage-b-test-1-gpu-small",
+)

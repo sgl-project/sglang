@@ -1,0 +1,65 @@
+load("//tools/bazel:sgl_defs.bzl", "sgl_cuda_test")
+
+sgl_cuda_test(
+    name = "test_kimi_k25_nvfp4",
+    srcs = ["test_kimi_k25_nvfp4.py"],
+    est_time = 7200,
+    nightly = True,
+    suite = "nightly-4-gpu-gb300",
+)
+
+sgl_cuda_test(
+    name = "test_qwen35_fp8",
+    srcs = ["test_qwen35_fp8.py"],
+    est_time = 7200,
+    nightly = True,
+    suite = "nightly-4-gpu-gb300",
+)
+
+sgl_cuda_test(
+    name = "test_qwen35_nvfp4",
+    srcs = ["test_qwen35_nvfp4.py"],
+    est_time = 7200,
+    nightly = True,
+    suite = "nightly-4-gpu-gb300",
+)
+
+sgl_cuda_test(
+    name = "test_deepseek_v32",
+    srcs = ["test_deepseek_v32.py"],
+    est_time = 7200,
+    nightly = True,
+    suite = "nightly-4-gpu-gb300",
+)
+
+sgl_cuda_test(
+    name = "test_deepseek_v32_nvfp4",
+    srcs = ["test_deepseek_v32_nvfp4.py"],
+    est_time = 7200,
+    nightly = True,
+    suite = "nightly-4-gpu-gb300",
+)
+
+sgl_cuda_test(
+    name = "test_glm5_fp8",
+    srcs = ["test_glm5_fp8.py"],
+    est_time = 7200,
+    nightly = True,
+    suite = "nightly-4-gpu-gb300",
+)
+
+sgl_cuda_test(
+    name = "test_glm5_nvfp4",
+    srcs = ["test_glm5_nvfp4.py"],
+    est_time = 7200,
+    nightly = True,
+    suite = "nightly-4-gpu-gb300",
+)
+
+sgl_cuda_test(
+    name = "test_kimi_k25",
+    srcs = ["test_kimi_k25.py"],
+    est_time = 7200,
+    nightly = True,
+    suite = "nightly-4-gpu-gb300",
+)

@@ -1,0 +1,15 @@
+load("//tools/bazel:sgl_defs.bzl", "sgl_cuda_test")
+
+sgl_cuda_test(
+    name = "test_pcg_with_speculative_decoding",
+    srcs = ["test_pcg_with_speculative_decoding.py"],
+    est_time = 531,
+    suite = "stage-b-test-2-gpu-large",
+)
+
+sgl_cuda_test(
+    name = "test_piecewise_cuda_graph_support_1_gpu",
+    srcs = ["test_piecewise_cuda_graph_support_1_gpu.py"],
+    est_time = 260,
+    suite = "stage-b-test-1-gpu-large",
+)

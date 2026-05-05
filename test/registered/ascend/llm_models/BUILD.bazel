@@ -1,0 +1,250 @@
+load("//tools/bazel:sgl_defs.bzl", "sgl_npu_test")
+
+sgl_npu_test(
+    name = "test_npu_glm4_9b_chat",
+    srcs = ["test_npu_glm4_9b_chat.py"],
+    est_time = 400,
+    nightly = True,
+    suite = "nightly-1-npu-a3",
+)
+
+sgl_npu_test(
+    name = "test_npu_exaone_3",
+    srcs = ["test_npu_exaone_3.py"],
+    est_time = 400,
+    suite = "full-1-npu-a3",
+)
+
+sgl_npu_test(
+    name = "test_npu_persimmon_8b_chat",
+    srcs = ["test_npu_persimmon_8b_chat.py"],
+    est_time = 400,
+    suite = "full-1-npu-a3",
+)
+
+sgl_npu_test(
+    name = "test_npu_qwen3_32b",
+    srcs = ["test_npu_qwen3_32b.py"],
+    est_time = 400,
+    nightly = True,
+    suite = "nightly-4-npu-a3",
+)
+
+sgl_npu_test(
+    name = "test_npu_smollm_1_7b",
+    srcs = ["test_npu_smollm_1_7b.py"],
+    est_time = 400,
+    nightly = True,
+    suite = "full-1-npu-a3",
+)
+
+sgl_npu_test(
+    name = "test_npu_llama_2_7b_communications_compression",
+    srcs = ["test_npu_llama_2_7b_communications_compression.py"],
+    est_time = 400,
+    suite = "nightly-2-npu-a3",
+)
+
+sgl_npu_test(
+    name = "test_npu_mistral_7b",
+    srcs = ["test_npu_mistral_7b.py"],
+    est_time = 400,
+    nightly = True,
+    suite = "nightly-1-npu-a3",
+)
+
+sgl_npu_test(
+    name = "test_npu_qwen3_8b_communications_quantization",
+    srcs = ["test_npu_qwen3_8b_communications_quantization.py"],
+    est_time = 400,
+    suite = "nightly-2-npu-a3",
+)
+
+sgl_npu_test(
+    name = "test_npu_gemma_3_4b_it_llm",
+    srcs = ["test_npu_gemma_3_4b_it_llm.py"],
+    est_time = 400,
+    nightly = True,
+    suite = "nightly-1-npu-a3",
+)
+
+sgl_npu_test(
+    name = "test_npu_baichuan2_13b_chat",
+    srcs = ["test_npu_baichuan2_13b_chat.py"],
+    est_time = 400,
+    nightly = True,
+    suite = "nightly-1-npu-a3",
+)
+
+sgl_npu_test(
+    name = "test_npu_deepseek_v3_2_exp_w8a8",
+    srcs = ["test_npu_deepseek_v3_2_exp_w8a8.py"],
+    est_time = 400,
+    nightly = True,
+    suite = "nightly-16-npu-a3",
+)
+
+sgl_npu_test(
+    name = "test_npu_qwen3_coder_480b_a35b",
+    srcs = ["test_npu_qwen3_coder_480b_a35b.py"],
+    est_time = 400,
+    nightly = True,
+    suite = "nightly-16-npu-a3",
+)
+
+sgl_npu_test(
+    name = "test_npu_phi_4_multimodal_llm",
+    srcs = ["test_npu_phi_4_multimodal_llm.py"],
+    est_time = 400,
+    nightly = True,
+    suite = "nightly-1-npu-a3",
+)
+
+sgl_npu_test(
+    name = "test_npu_qwen3_235b_a22b_w8a8",
+    srcs = ["test_npu_qwen3_235b_a22b_w8a8.py"],
+    est_time = 400,
+    nightly = True,
+    suite = "nightly-8-npu-a3",
+)
+
+sgl_npu_test(
+    name = "test_npu_qwen3_30b",
+    srcs = ["test_npu_qwen3_30b.py"],
+    est_time = 400,
+    nightly = True,
+    suite = "nightly-2-npu-a3",
+)
+
+sgl_npu_test(
+    name = "test_npu_qwen3_30b_attn_cp",
+    srcs = ["test_npu_qwen3_30b_attn_cp.py"],
+    est_time = 500,
+    nightly = True,
+    suite = "nightly-4-npu-a3",
+)
+
+sgl_npu_test(
+    name = "test_npu_granite_3_1_8b",
+    srcs = ["test_npu_granite_3_1_8b.py"],
+    est_time = 400,
+    nightly = True,
+    suite = "full-1-npu-a3",
+)
+
+sgl_npu_test(
+    name = "test_ascend_dbrx_instruct",
+    srcs = ["test_ascend_dbrx_instruct.py"],
+    est_time = 400,
+    nightly = True,
+    suite = "nightly-8-npu-a3",
+)
+
+sgl_npu_test(
+    name = "test_npu_afm_4_5b",
+    srcs = ["test_npu_afm_4_5b.py"],
+    est_time = 400,
+    nightly = True,
+    suite = "full-1-npu-a3",
+)
+
+sgl_npu_test(
+    name = "test_npu_chatglm2_6b",
+    srcs = ["test_npu_chatglm2_6b.py"],
+    est_time = 400,
+    nightly = True,
+    suite = "nightly-1-npu-a3",
+)
+
+sgl_npu_test(
+    name = "test_npu_qwen3_0_6b",
+    srcs = ["test_npu_qwen3_0_6b.py"],
+    est_time = 400,
+    nightly = True,
+    suite = "nightly-1-npu-a3",
+)
+
+sgl_npu_test(
+    name = "test_npu_internlm2_7b",
+    srcs = ["test_npu_internlm2_7b.py"],
+    est_time = 400,
+    nightly = True,
+    suite = "nightly-1-npu-a3",
+)
+
+sgl_npu_test(
+    name = "test_npu_llama_2_7b",
+    srcs = ["test_npu_llama_2_7b.py"],
+    est_time = 400,
+    nightly = True,
+    suite = "nightly-1-npu-a3",
+)
+
+sgl_npu_test(
+    name = "test_npu_mimo_7b_rl",
+    srcs = ["test_npu_mimo_7b_rl.py"],
+    est_time = 400,
+    nightly = True,
+    suite = "full-1-npu-a3",
+)
+
+sgl_npu_test(
+    name = "test_npu_qwen3_1_7b_gptq_int8",
+    srcs = ["test_npu_qwen3_1_7b_gptq_int8.py"],
+    est_time = 400,
+    suite = "per-commit-1-npu-a2",
+)
+
+sgl_npu_test(
+    name = "test_npu_qwq_32b_w8a8",
+    srcs = ["test_npu_qwq_32b_w8a8.py"],
+    est_time = 400,
+    nightly = True,
+    suite = "nightly-2-npu-a3",
+)
+
+sgl_npu_test(
+    name = "test_npu_stablelm_2_1_6b",
+    srcs = ["test_npu_stablelm_2_1_6b.py"],
+    est_time = 400,
+    nightly = True,
+    suite = "full-1-npu-a3",
+)
+
+sgl_npu_test(
+    name = "test_ascend_minimax_m2",
+    srcs = ["test_ascend_minimax_m2.py"],
+    est_time = 400,
+    nightly = True,
+    suite = "nightly-8-npu-a3",
+)
+
+sgl_npu_test(
+    name = "test_npu_c4ai_command_r_v01",
+    srcs = ["test_npu_c4ai_command_r_v01.py"],
+    est_time = 400,
+    suite = "full-2-npu-a3",
+)
+
+sgl_npu_test(
+    name = "test_npu_ling_lite",
+    srcs = ["test_npu_ling_lite.py"],
+    est_time = 400,
+    nightly = True,
+    suite = "full-2-npu-a3",
+)
+
+sgl_npu_test(
+    name = "test_npu_qwen3_30b_w4a4",
+    srcs = ["test_npu_qwen3_30b_w4a4.py"],
+    est_time = 400,
+    suite = "per-commit-2-npu-a2",
+)
+
+sgl_npu_test(
+    name = "test_npu_granite_3_0_3b_a800m",
+    srcs = ["test_npu_granite_3_0_3b_a800m.py"],
+    est_time = 400,
+    nightly = True,
+    suite = "full-1-npu-a3",
+)

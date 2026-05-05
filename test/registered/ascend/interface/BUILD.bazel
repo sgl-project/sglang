@@ -1,0 +1,49 @@
+load("//tools/bazel:sgl_defs.bzl", "sgl_npu_test")
+
+sgl_npu_test(
+    name = "test_npu_api_encode",
+    srcs = ["test_npu_api_encode.py"],
+    est_time = 400,
+    nightly = True,
+    suite = "nightly-1-npu-a3",
+)
+
+sgl_npu_test(
+    name = "test_npu_matched_stop",
+    srcs = ["test_npu_matched_stop.py"],
+    est_time = 400,
+    nightly = True,
+    suite = "nightly-1-npu-a3",
+)
+
+sgl_npu_test(
+    name = "test_npu_openai_server_ignore_eos",
+    srcs = ["test_npu_openai_server_ignore_eos.py"],
+    est_time = 400,
+    nightly = True,
+    suite = "nightly-2-npu-a3",
+)
+
+sgl_npu_test(
+    name = "test_npu_penalty",
+    srcs = ["test_npu_penalty.py"],
+    est_time = 400,
+    nightly = True,
+    suite = "nightly-1-npu-a3",
+)
+
+sgl_npu_test(
+    name = "test_npu_api",
+    srcs = ["test_npu_api.py"],
+    est_time = 1600,
+    nightly = True,
+    suite = "nightly-npu-a3-merged",
+)
+
+sgl_npu_test(
+    name = "test_npu_api_abort_request",
+    srcs = ["test_npu_api_abort_request.py"],
+    est_time = 400,
+    nightly = True,
+    suite = "nightly-1-npu-a3",
+)

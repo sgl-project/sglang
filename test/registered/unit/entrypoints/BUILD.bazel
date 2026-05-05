@@ -1,0 +1,15 @@
+load("//tools/bazel:sgl_defs.bzl", "sgl_cpu_test")
+
+sgl_cpu_test(
+    name = "test_ssl_cert_refresher",
+    srcs = ["test_ssl_cert_refresher.py"],
+    est_time = 14,
+    suite = "stage-a-test-cpu",
+)
+
+sgl_cpu_test(
+    name = "test_v1_loads_aggregate",
+    srcs = ["test_v1_loads_aggregate.py"],
+    est_time = 10,
+    suite = "stage-a-test-cpu",
+)

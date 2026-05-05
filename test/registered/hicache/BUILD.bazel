@@ -1,0 +1,78 @@
+load("//tools/bazel:sgl_defs.bzl", "sgl_amd_test", "sgl_cuda_test")
+
+sgl_cuda_test(
+    name = "test_hicache_spec_file_storage",
+    srcs = ["test_hicache_spec_file_storage.py"],
+    est_time = 600,
+    suite = "stage-b-test-1-gpu-large",
+)
+
+sgl_cuda_test(
+    name = "test_hicache_storage_cuda_stage_b_test_1_gpu_small",
+    srcs = ["test_hicache_storage.py"],
+    est_time = 99,
+    suite = "stage-b-test-1-gpu-small",
+)
+
+sgl_amd_test(
+    name = "test_hicache_storage_amd_stage_b_test_1_gpu_small_amd",
+    srcs = ["test_hicache_storage.py"],
+    est_time = 300,
+    suite = "stage-b-test-1-gpu-small-amd",
+)
+
+sgl_cuda_test(
+    name = "test_hicache_storage_3fs_backend_cuda_stage_b_test_2_gpu_large",
+    srcs = ["test_hicache_storage_3fs_backend.py"],
+    est_time = 150,
+    suite = "stage-b-test-2-gpu-large",
+)
+
+sgl_amd_test(
+    name = "test_hicache_storage_3fs_backend_amd_stage_b_test_2_gpu_large",
+    srcs = ["test_hicache_storage_3fs_backend.py"],
+    est_time = 300,
+    suite = "stage-b-test-2-gpu-large",
+)
+
+sgl_cuda_test(
+    name = "test_hicache_storage_file_backend_cuda_stage_b_test_2_gpu_large",
+    srcs = ["test_hicache_storage_file_backend.py"],
+    est_time = 148,
+    suite = "stage-b-test-2-gpu-large",
+)
+
+sgl_amd_test(
+    name = "test_hicache_storage_file_backend_amd_stage_b_test_2_gpu_large_amd",
+    srcs = ["test_hicache_storage_file_backend.py"],
+    est_time = 526,
+    suite = "stage-b-test-2-gpu-large-amd",
+)
+
+sgl_cuda_test(
+    name = "test_hicache_storage_mooncake_backend",
+    srcs = ["test_hicache_storage_mooncake_backend.py"],
+    est_time = 236,
+    suite = "stage-b-test-2-gpu-large",
+)
+
+sgl_cuda_test(
+    name = "test_hicache_storage_runtime_attach_detach",
+    srcs = ["test_hicache_storage_runtime_attach_detach.py"],
+    est_time = 139,
+    suite = "stage-b-test-2-gpu-large",
+)
+
+sgl_cuda_test(
+    name = "test_hicache_variants_cuda_stage_b_test_1_gpu_large",
+    srcs = ["test_hicache_variants.py"],
+    est_time = 450,
+    suite = "stage-b-test-1-gpu-large",
+)
+
+sgl_amd_test(
+    name = "test_hicache_variants_amd_stage_b_test_1_gpu_small_amd",
+    srcs = ["test_hicache_variants.py"],
+    est_time = 524,
+    suite = "stage-b-test-1-gpu-small-amd",
+)

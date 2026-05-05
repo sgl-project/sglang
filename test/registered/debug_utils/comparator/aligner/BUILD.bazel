@@ -1,0 +1,9 @@
+load("//tools/bazel:sgl_defs.bzl", "sgl_cpu_test")
+
+sgl_cpu_test(
+    name = "test_axis_aligner",
+    srcs = ["test_axis_aligner.py"],
+    est_time = 15,
+    nightly = True,
+    suite = "stage-a-test-cpu",
+)

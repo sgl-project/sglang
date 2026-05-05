@@ -1,0 +1,9 @@
+load("//tools/bazel:sgl_defs.bzl", "sgl_npu_test")
+
+sgl_npu_test(
+    name = "test_npu_eagle3",
+    srcs = ["test_npu_eagle3.py"],
+    est_time = 400,
+    nightly = True,
+    suite = "nightly-1-npu-a3",
+)

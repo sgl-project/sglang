@@ -1,0 +1,131 @@
+load("//tools/bazel:sgl_defs.bzl", "sgl_amd_test", "sgl_cuda_test")
+
+sgl_cuda_test(
+    name = "test_bench_one_batch_1gpu_cuda_stage_b_test_1_gpu_large",
+    srcs = ["test_bench_one_batch_1gpu.py"],
+    est_time = 95,
+    suite = "stage-b-test-1-gpu-large",
+)
+
+sgl_amd_test(
+    name = "test_bench_one_batch_1gpu_amd_stage_b_test_1_gpu_large_amd",
+    srcs = ["test_bench_one_batch_1gpu.py"],
+    est_time = 120,
+    suite = "stage-b-test-1-gpu-large-amd",
+)
+
+sgl_cuda_test(
+    name = "test_bench_one_batch_2gpu_cuda_stage_b_test_2_gpu_large",
+    srcs = ["test_bench_one_batch_2gpu.py"],
+    est_time = 209,
+    suite = "stage-b-test-2-gpu-large",
+)
+
+sgl_amd_test(
+    name = "test_bench_one_batch_2gpu_amd_stage_b_test_2_gpu_large_amd",
+    srcs = ["test_bench_one_batch_2gpu.py"],
+    est_time = 630,
+    suite = "stage-b-test-2-gpu-large-amd",
+)
+
+sgl_cuda_test(
+    name = "test_bench_serving_1gpu_large_cuda_stage_b_test_1_gpu_large",
+    srcs = ["test_bench_serving_1gpu_large.py"],
+    est_time = 286,
+    suite = "stage-b-test-1-gpu-large",
+)
+
+sgl_amd_test(
+    name = "test_bench_serving_1gpu_large_amd_stage_b_test_1_gpu_large_amd",
+    srcs = ["test_bench_serving_1gpu_large.py"],
+    est_time = 300,
+    suite = "stage-b-test-1-gpu-large-amd",
+)
+
+sgl_cuda_test(
+    name = "test_bench_serving_1gpu_part1_cuda_stage_b_test_1_gpu_large",
+    srcs = ["test_bench_serving_1gpu_part1.py"],
+    est_time = 1210,
+    suite = "stage-b-test-1-gpu-large",
+)
+
+sgl_amd_test(
+    name = "test_bench_serving_1gpu_part1_amd_stage_b_test_1_gpu_large_amd",
+    srcs = ["test_bench_serving_1gpu_part1.py"],
+    est_time = 1100,
+    suite = "stage-b-test-1-gpu-large-amd",
+)
+
+sgl_cuda_test(
+    name = "test_bench_serving_2gpu_cuda_stage_b_test_2_gpu_large",
+    srcs = ["test_bench_serving_2gpu.py"],
+    est_time = 721,
+    suite = "stage-b-test-2-gpu-large",
+)
+
+sgl_amd_test(
+    name = "test_bench_serving_2gpu_amd_stage_b_test_2_gpu_large_amd",
+    srcs = ["test_bench_serving_2gpu.py"],
+    est_time = 1450,
+    suite = "stage-b-test-2-gpu-large-amd",
+)
+
+sgl_cuda_test(
+    name = "test_dpsk_v3_fp4_4gpu_perf",
+    srcs = ["test_dpsk_v3_fp4_4gpu_perf.py"],
+    est_time = 2000,
+    nightly = True,
+    suite = "nightly-4-gpu-b200",
+)
+
+sgl_cuda_test(
+    name = "test_gpt_oss_4gpu_perf",
+    srcs = ["test_gpt_oss_4gpu_perf.py"],
+    est_time = 600,
+    nightly = True,
+    suite = "nightly-4-gpu-b200",
+)
+
+sgl_cuda_test(
+    name = "test_text_models_perf",
+    srcs = ["test_text_models_perf.py"],
+    est_time = 3600,
+    nightly = True,
+    suite = "nightly-perf-text-2-gpu",
+)
+
+sgl_cuda_test(
+    name = "test_bench_serving_1gpu_part2_cuda_stage_b_test_1_gpu_large",
+    srcs = ["test_bench_serving_1gpu_part2.py"],
+    est_time = 968,
+    suite = "stage-b-test-1-gpu-large",
+)
+
+sgl_amd_test(
+    name = "test_bench_serving_1gpu_part2_amd_stage_b_test_1_gpu_large_amd",
+    srcs = ["test_bench_serving_1gpu_part2.py"],
+    est_time = 900,
+    suite = "stage-b-test-1-gpu-large-amd",
+)
+
+sgl_cuda_test(
+    name = "test_vlm_perf_5090_cuda_stage_b_test_1_gpu_small",
+    srcs = ["test_vlm_perf_5090.py"],
+    est_time = 406,
+    suite = "stage-b-test-1-gpu-small",
+)
+
+sgl_amd_test(
+    name = "test_vlm_perf_5090_amd_stage_b_test_1_gpu_small_amd",
+    srcs = ["test_vlm_perf_5090.py"],
+    est_time = 500,
+    suite = "stage-b-test-1-gpu-small-amd",
+)
+
+sgl_cuda_test(
+    name = "test_vlms_perf",
+    srcs = ["test_vlms_perf.py"],
+    est_time = 7200,
+    nightly = True,
+    suite = "nightly-perf-vlm-2-gpu",
+)

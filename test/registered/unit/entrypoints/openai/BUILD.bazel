@@ -1,0 +1,50 @@
+load("//tools/bazel:sgl_defs.bzl", "sgl_cpu_test")
+
+sgl_cpu_test(
+    name = "test_matched_stop",
+    srcs = ["test_matched_stop.py"],
+    est_time = 6,
+    suite = "stage-a-test-cpu",
+)
+
+sgl_cpu_test(
+    name = "test_protocol",
+    srcs = ["test_protocol.py"],
+    est_time = 7,
+    suite = "stage-a-test-cpu",
+)
+
+sgl_cpu_test(
+    name = "test_serving_chat",
+    srcs = ["test_serving_chat.py"],
+    est_time = 11,
+    suite = "stage-a-test-cpu",
+)
+
+sgl_cpu_test(
+    name = "test_serving_completions",
+    srcs = ["test_serving_completions.py"],
+    est_time = 11,
+    suite = "stage-a-test-cpu",
+)
+
+sgl_cpu_test(
+    name = "test_serving_embedding",
+    srcs = ["test_serving_embedding.py"],
+    est_time = 10,
+    suite = "stage-a-test-cpu",
+)
+
+sgl_cpu_test(
+    name = "test_serving_transcription",
+    srcs = ["test_serving_transcription.py"],
+    est_time = 4,
+    suite = "stage-a-test-cpu",
+)
+
+sgl_cpu_test(
+    name = "test_whisper_adapter",
+    srcs = ["test_whisper_adapter.py"],
+    est_time = 2,
+    suite = "stage-a-test-cpu",
+)

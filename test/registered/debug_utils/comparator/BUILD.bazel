@@ -1,0 +1,129 @@
+load("//tools/bazel:sgl_defs.bzl", "sgl_cpu_test")
+
+sgl_cpu_test(
+    name = "test_dump_loader",
+    srcs = ["test_dump_loader.py"],
+    est_time = 10,
+    nightly = True,
+    suite = "stage-a-test-cpu",
+)
+
+sgl_cpu_test(
+    name = "test_log_sink",
+    srcs = ["test_log_sink.py"],
+    est_time = 10,
+    nightly = True,
+    suite = "stage-a-test-cpu",
+)
+
+sgl_cpu_test(
+    name = "test_preset",
+    srcs = ["test_preset.py"],
+    est_time = 5,
+    nightly = True,
+    suite = "stage-a-test-cpu",
+)
+
+sgl_cpu_test(
+    name = "test_per_token_visualizer",
+    srcs = ["test_per_token_visualizer.py"],
+    est_time = 30,
+    nightly = True,
+    suite = "stage-a-test-cpu",
+)
+
+sgl_cpu_test(
+    name = "test_bundle_matcher",
+    srcs = ["test_bundle_matcher.py"],
+    est_time = 15,
+    nightly = True,
+    suite = "stage-a-test-cpu",
+)
+
+sgl_cpu_test(
+    name = "test_display",
+    srcs = ["test_display.py"],
+    est_time = 10,
+    nightly = True,
+    suite = "stage-a-test-cpu",
+)
+
+sgl_cpu_test(
+    name = "test_meta_overrider",
+    srcs = ["test_meta_overrider.py"],
+    est_time = 10,
+    nightly = True,
+    suite = "stage-a-test-cpu",
+)
+
+sgl_cpu_test(
+    name = "test_utils",
+    srcs = ["test_utils.py"],
+    est_time = 10,
+    nightly = True,
+    suite = "stage-a-test-cpu",
+)
+
+sgl_cpu_test(
+    name = "test_model_validation",
+    srcs = ["test_model_validation.py"],
+    est_time = 10,
+    nightly = True,
+    suite = "stage-a-test-cpu",
+)
+
+sgl_cpu_test(
+    name = "test_output_types",
+    srcs = ["test_output_types.py"],
+    est_time = 10,
+    nightly = True,
+    suite = "stage-a-test-cpu",
+)
+
+sgl_cpu_test(
+    name = "test_bundle_comparator",
+    srcs = ["test_bundle_comparator.py"],
+    est_time = 15,
+    nightly = True,
+    suite = "stage-a-test-cpu",
+)
+
+sgl_cpu_test(
+    name = "test_dp_utils",
+    srcs = ["test_dp_utils.py"],
+    est_time = 15,
+    nightly = True,
+    suite = "stage-a-test-cpu",
+)
+
+sgl_cpu_test(
+    name = "test_e2e_demo",
+    srcs = ["test_e2e_demo.py"],
+    est_time = 10,
+    nightly = True,
+    suite = "default",
+)
+
+sgl_cpu_test(
+    name = "test_entrypoint",
+    srcs = ["test_entrypoint.py"],
+    est_time = 30,
+    nightly = True,
+    suite = "stage-a-test-cpu",
+)
+
+sgl_cpu_test(
+    name = "test_manually_verify",
+    srcs = ["test_manually_verify.py"],
+    est_time = 60,
+    nightly = True,
+    suite = "stage-a-test-cpu",
+)
+
+sgl_cpu_test(
+    name = "test_visualizer",
+    srcs = ["test_visualizer.py"],
+    est_time = 30,
+    nightly = True,
+    suite = "stage-a-test-cpu",
+)

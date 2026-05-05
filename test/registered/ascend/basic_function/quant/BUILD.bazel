@@ -1,0 +1,92 @@
+load("//tools/bazel:sgl_defs.bzl", "sgl_npu_test")
+
+sgl_npu_test(
+    name = "test_npu_gptq_moe_npu_stage_b_test_1_npu_a2",
+    srcs = ["test_npu_gptq_moe.py"],
+    est_time = 400,
+    suite = "stage-b-test-1-npu-a2",
+)
+
+sgl_npu_test(
+    name = "test_npu_gptq_moe_npu_nightly_1_npu_a3_nightly",
+    srcs = ["test_npu_gptq_moe.py"],
+    est_time = 400,
+    nightly = True,
+    suite = "nightly-1-npu-a3",
+)
+
+sgl_npu_test(
+    name = "test_npu_w4a4_quantization_npu_stage_b_test_4_npu_a3",
+    srcs = ["test_npu_w4a4_quantization.py"],
+    est_time = 400,
+    suite = "stage-b-test-4-npu-a3",
+)
+
+sgl_npu_test(
+    name = "test_npu_w4a4_quantization_npu_nightly_4_npu_a3_nightly",
+    srcs = ["test_npu_w4a4_quantization.py"],
+    est_time = 400,
+    nightly = True,
+    suite = "nightly-4-npu-a3",
+)
+
+sgl_npu_test(
+    name = "test_npu_w8a8_quantization_npu_stage_b_test_1_npu_a2",
+    srcs = ["test_npu_w8a8_quantization.py"],
+    est_time = 400,
+    suite = "stage-b-test-1-npu-a2",
+)
+
+sgl_npu_test(
+    name = "test_npu_w8a8_quantization_npu_nightly_1_npu_a3_nightly",
+    srcs = ["test_npu_w8a8_quantization.py"],
+    est_time = 400,
+    nightly = True,
+    suite = "nightly-1-npu-a3",
+)
+
+sgl_npu_test(
+    name = "test_npu_autoround_dense_npu_stage_b_test_1_npu_a2",
+    srcs = ["test_npu_autoround_dense.py"],
+    est_time = 400,
+    suite = "stage-b-test-1-npu-a2",
+)
+
+sgl_npu_test(
+    name = "test_npu_autoround_dense_npu_nightly_1_npu_a3_nightly",
+    srcs = ["test_npu_autoround_dense.py"],
+    est_time = 400,
+    nightly = True,
+    suite = "nightly-1-npu-a3",
+)
+
+sgl_npu_test(
+    name = "test_npu_autoround_moe_npu_stage_b_test_1_npu_a2",
+    srcs = ["test_npu_autoround_moe.py"],
+    est_time = 400,
+    suite = "stage-b-test-1-npu-a2",
+)
+
+sgl_npu_test(
+    name = "test_npu_autoround_moe_npu_nightly_1_npu_a3_nightly",
+    srcs = ["test_npu_autoround_moe.py"],
+    est_time = 400,
+    nightly = True,
+    suite = "nightly-1-npu-a3",
+)
+
+sgl_npu_test(
+    name = "test_npu_gguf",
+    srcs = ["test_npu_gguf.py"],
+    est_time = 300,
+    nightly = True,
+    suite = "nightly-1-npu-a3",
+)
+
+sgl_npu_test(
+    name = "test_npu_gguf_moe",
+    srcs = ["test_npu_gguf_moe.py"],
+    est_time = 500,
+    nightly = True,
+    suite = "nightly-2-npu-a3",
+)

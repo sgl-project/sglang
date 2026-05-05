@@ -1,0 +1,57 @@
+load("//tools/bazel:sgl_defs.bzl", "sgl_amd_test", "sgl_cuda_test")
+
+sgl_cuda_test(
+    name = "test_flashmla",
+    srcs = ["test_flashmla.py"],
+    est_time = 314,
+    suite = "stage-b-test-1-gpu-large",
+)
+
+sgl_cuda_test(
+    name = "test_mla_cuda_stage_b_test_1_gpu_large",
+    srcs = ["test_mla.py"],
+    est_time = 181,
+    suite = "stage-b-test-1-gpu-large",
+)
+
+sgl_amd_test(
+    name = "test_mla_amd_stage_b_test_1_gpu_small_amd",
+    srcs = ["test_mla.py"],
+    est_time = 1100,
+    suite = "stage-b-test-1-gpu-small-amd",
+)
+
+sgl_cuda_test(
+    name = "test_mla_deepseek_v3",
+    srcs = ["test_mla_deepseek_v3.py"],
+    est_time = 543,
+    suite = "stage-b-test-1-gpu-large",
+)
+
+sgl_cuda_test(
+    name = "test_mla_flashinfer",
+    srcs = ["test_mla_flashinfer.py"],
+    est_time = 260,
+    suite = "stage-b-test-1-gpu-large",
+)
+
+sgl_cuda_test(
+    name = "test_mla_fp8_cuda_stage_b_test_1_gpu_large",
+    srcs = ["test_mla_fp8.py"],
+    est_time = 104,
+    suite = "stage-b-test-1-gpu-large",
+)
+
+sgl_amd_test(
+    name = "test_mla_fp8_amd_stage_b_test_1_gpu_small_amd",
+    srcs = ["test_mla_fp8.py"],
+    est_time = 800,
+    suite = "stage-b-test-1-gpu-small-amd",
+)
+
+sgl_cuda_test(
+    name = "test_mla_int8_deepseek_v3",
+    srcs = ["test_mla_int8_deepseek_v3.py"],
+    est_time = 313,
+    suite = "stage-b-test-1-gpu-large",
+)

@@ -1,0 +1,161 @@
+load("//tools/bazel:sgl_defs.bzl", "sgl_amd_test")
+
+sgl_amd_test(
+    name = "test_deepseek_r1_eval_amd",
+    srcs = ["test_deepseek_r1_eval_amd.py"],
+    est_time = 7200,
+    nightly = True,
+    suite = "nightly-amd-accuracy-8-gpu-deepseek-r1",
+)
+
+sgl_amd_test(
+    name = "test_deepseek_v31_eval_amd",
+    srcs = ["test_deepseek_v31_eval_amd.py"],
+    est_time = 3600,
+    nightly = True,
+    suite = "nightly-amd-accuracy-8-gpu-deepseek-v31",
+)
+
+sgl_amd_test(
+    name = "test_glm5_eval_amd",
+    srcs = ["test_glm5_eval_amd.py"],
+    est_time = 3600,
+    nightly = True,
+    suite = "nightly-amd-accuracy-8-gpu-glm5",
+)
+
+sgl_amd_test(
+    name = "test_gpt_oss_eval_amd",
+    srcs = ["test_gpt_oss_eval_amd.py"],
+    est_time = 1800,
+    nightly = True,
+    suite = "nightly-amd-accuracy-8-gpu-gpt-oss",
+)
+
+sgl_amd_test(
+    name = "test_minimax_m25_eval_amd",
+    srcs = ["test_minimax_m25_eval_amd.py"],
+    est_time = 3600,
+    nightly = True,
+    suite = "nightly-amd-accuracy-8-gpu-minimax-m25",
+)
+
+sgl_amd_test(
+    name = "test_glm51_eval_amd",
+    srcs = ["test_glm51_eval_amd.py"],
+    est_time = 3600,
+    nightly = True,
+    suite = "nightly-amd-accuracy-8-gpu-glm51",
+)
+
+sgl_amd_test(
+    name = "test_grok1_fp8_eval_amd",
+    srcs = ["test_grok1_fp8_eval_amd.py"],
+    est_time = 1500,
+    nightly = True,
+    suite = "nightly-amd-accuracy-8-gpu-grok1-fp8",
+)
+
+sgl_amd_test(
+    name = "test_kimi_k26_eval_amd",
+    srcs = ["test_kimi_k26_eval_amd.py"],
+    est_time = 3600,
+    nightly = True,
+    suite = "nightly-amd-accuracy-8-gpu-kimi-k26",
+)
+
+sgl_amd_test(
+    name = "test_qwen35_eval_amd",
+    srcs = ["test_qwen35_eval_amd.py"],
+    est_time = 3600,
+    nightly = True,
+    suite = "nightly-amd-accuracy-8-gpu-qwen35",
+)
+
+sgl_amd_test(
+    name = "test_deepseek_v32_dp_eval_amd",
+    srcs = ["test_deepseek_v32_dp_eval_amd.py"],
+    est_time = 5400,
+    nightly = True,
+    suite = "nightly-amd-accuracy-8-gpu-deepseek-v32-dp",
+)
+
+sgl_amd_test(
+    name = "test_deepseek_v32_eval_amd",
+    srcs = ["test_deepseek_v32_eval_amd.py"],
+    est_time = 3600,
+    nightly = True,
+    suite = "nightly-amd-accuracy-8-gpu-deepseek-v32",
+)
+
+sgl_amd_test(
+    name = "test_deepseek_v32_tc_eval_amd",
+    srcs = ["test_deepseek_v32_tc_eval_amd.py"],
+    est_time = 7200,
+    nightly = True,
+    suite = "nightly-amd-accuracy-8-gpu-deepseek-v32-tc",
+)
+
+sgl_amd_test(
+    name = "test_gsm8k_eval_amd",
+    srcs = ["test_gsm8k_eval_amd.py"],
+    est_time = 3600,
+    nightly = True,
+    suite = "nightly-amd",
+)
+
+sgl_amd_test(
+    name = "test_kimi_k2_eval_amd",
+    srcs = ["test_kimi_k2_eval_amd.py"],
+    est_time = 3600,
+    nightly = True,
+    suite = "nightly-amd-accuracy-8-gpu-kimi-k2",
+)
+
+sgl_amd_test(
+    name = "test_minimax_m27_eval_amd",
+    srcs = ["test_minimax_m27_eval_amd.py"],
+    est_time = 3600,
+    nightly = True,
+    suite = "nightly-amd-accuracy-8-gpu-minimax-m27",
+)
+
+sgl_amd_test(
+    name = "test_vlms_mmmu_eval_amd",
+    srcs = ["test_vlms_mmmu_eval_amd.py"],
+    est_time = 7200,
+    nightly = True,
+    suite = "nightly-amd-accuracy-2-gpu-vlm",
+)
+
+sgl_amd_test(
+    name = "test_deepseek_v32_mtp_eval_amd",
+    srcs = ["test_deepseek_v32_mtp_eval_amd.py"],
+    est_time = 3600,
+    nightly = True,
+    suite = "nightly-amd-accuracy-8-gpu-deepseek-v32-mtp",
+)
+
+sgl_amd_test(
+    name = "test_grok1_int4_eval_amd",
+    srcs = ["test_grok1_int4_eval_amd.py"],
+    est_time = 1500,
+    nightly = True,
+    suite = "nightly-amd-accuracy-8-gpu-grok1-int4",
+)
+
+sgl_amd_test(
+    name = "test_grok2_eval_amd",
+    srcs = ["test_grok2_eval_amd.py"],
+    est_time = 1500,
+    nightly = True,
+    suite = "nightly-amd-accuracy-8-gpu-grok2",
+)
+
+sgl_amd_test(
+    name = "test_kimi_k25_eval_amd",
+    srcs = ["test_kimi_k25_eval_amd.py"],
+    est_time = 3600,
+    nightly = True,
+    suite = "nightly-amd-accuracy-8-gpu-kimi-k25",
+)

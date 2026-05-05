@@ -1,0 +1,24 @@
+load("//tools/bazel:sgl_defs.bzl", "sgl_cuda_test")
+
+sgl_cuda_test(
+    name = "test_fp4_moe",
+    srcs = ["test_fp4_moe.py"],
+    est_time = 300,
+    nightly = True,
+    suite = "nightly-4-gpu-b200",
+)
+
+sgl_cuda_test(
+    name = "test_fused_topk_deepseek",
+    srcs = ["test_fused_topk_deepseek.py"],
+    est_time = 2,
+    nightly = True,
+    suite = "nightly-1-gpu",
+)
+
+sgl_cuda_test(
+    name = "test_nsa_indexer",
+    srcs = ["test_nsa_indexer.py"],
+    est_time = 18,
+    suite = "stage-b-test-1-gpu-large",
+)

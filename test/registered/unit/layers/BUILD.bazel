@@ -1,0 +1,22 @@
+load("//tools/bazel:sgl_defs.bzl", "sgl_cpu_test", "sgl_cuda_test")
+
+sgl_cuda_test(
+    name = "test_mamba_state_scatter_triton",
+    srcs = ["test_mamba_state_scatter_triton.py"],
+    est_time = 7,
+    suite = "stage-b-test-1-gpu-small",
+)
+
+sgl_cpu_test(
+    name = "test_pooler_score_and_pool",
+    srcs = ["test_pooler_score_and_pool.py"],
+    est_time = 10,
+    suite = "stage-a-test-cpu",
+)
+
+sgl_cuda_test(
+    name = "test_conv_layer",
+    srcs = ["test_conv_layer.py"],
+    est_time = 7,
+    suite = "stage-b-test-1-gpu-small",
+)

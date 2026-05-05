@@ -1,0 +1,144 @@
+load("//tools/bazel:sgl_defs.bzl", "sgl_amd_test", "sgl_cuda_test")
+
+sgl_cuda_test(
+    name = "test_hidden_states_cuda_stage_b_test_1_gpu_small",
+    srcs = ["test_hidden_states.py"],
+    est_time = 45,
+    suite = "stage-b-test-1-gpu-small",
+)
+
+sgl_amd_test(
+    name = "test_hidden_states_amd_stage_b_test_1_gpu_small_amd",
+    srcs = ["test_hidden_states.py"],
+    est_time = 55,
+    suite = "stage-b-test-1-gpu-small-amd",
+)
+
+sgl_cuda_test(
+    name = "test_mm_process_config_cuda_stage_b_test_1_gpu_small",
+    srcs = ["test_mm_process_config.py"],
+    est_time = 9,
+    suite = "stage-b-test-1-gpu-small",
+)
+
+sgl_amd_test(
+    name = "test_mm_process_config_amd_stage_b_test_1_gpu_small_amd",
+    srcs = ["test_mm_process_config.py"],
+    est_time = 1,
+    suite = "stage-b-test-1-gpu-small-amd",
+)
+
+sgl_cuda_test(
+    name = "test_srt_engine_cuda_stage_b_test_1_gpu_large",
+    srcs = ["test_srt_engine.py"],
+    est_time = 387,
+    suite = "stage-b-test-1-gpu-large",
+)
+
+sgl_amd_test(
+    name = "test_srt_engine_amd_stage_b_test_1_gpu_small_amd",
+    srcs = ["test_srt_engine.py"],
+    est_time = 261,
+    suite = "stage-b-test-1-gpu-small-amd",
+)
+
+sgl_cuda_test(
+    name = "test_cpp_radix_cache",
+    srcs = ["test_cpp_radix_cache.py"],
+    est_time = 60,
+    nightly = True,
+    suite = "nightly-1-gpu",
+)
+
+sgl_cuda_test(
+    name = "test_deterministic_cuda_stage_b_test_1_gpu_large",
+    srcs = ["test_deterministic.py"],
+    est_time = 207,
+    suite = "stage-b-test-1-gpu-large",
+)
+
+sgl_amd_test(
+    name = "test_deterministic_amd_stage_b_test_1_gpu_small_amd",
+    srcs = ["test_deterministic.py"],
+    est_time = 278,
+    suite = "stage-b-test-1-gpu-small-amd",
+)
+
+sgl_cuda_test(
+    name = "test_gpt_oss_1gpu_cuda_stage_b_test_1_gpu_large",
+    srcs = ["test_gpt_oss_1gpu.py"],
+    est_time = 408,
+    suite = "stage-b-test-1-gpu-large",
+)
+
+sgl_amd_test(
+    name = "test_gpt_oss_1gpu_amd_stage_b_test_1_gpu_small_amd_mi35x",
+    srcs = ["test_gpt_oss_1gpu.py"],
+    est_time = 750,
+    suite = "stage-b-test-1-gpu-small-amd-mi35x",
+)
+
+sgl_cuda_test(
+    name = "test_gpt_oss_sm120",
+    srcs = ["test_gpt_oss_sm120.py"],
+    est_time = 345,
+    suite = "stage-b-test-1-gpu-small",
+)
+
+sgl_cuda_test(
+    name = "test_qwen3_next_deterministic",
+    srcs = ["test_qwen3_next_deterministic.py"],
+    est_time = 200,
+    nightly = True,
+    suite = "nightly-4-gpu",
+)
+
+sgl_cuda_test(
+    name = "test_request_queue_validation_cuda_stage_b_test_1_gpu_small",
+    srcs = ["test_request_queue_validation.py"],
+    est_time = 53,
+    suite = "stage-b-test-1-gpu-small",
+)
+
+sgl_amd_test(
+    name = "test_request_queue_validation_amd_stage_b_test_1_gpu_small_amd",
+    srcs = ["test_request_queue_validation.py"],
+    est_time = 70,
+    suite = "stage-b-test-1-gpu-small-amd",
+)
+
+sgl_cuda_test(
+    name = "test_srt_endpoint_cuda_stage_b_test_1_gpu_small",
+    srcs = ["test_srt_endpoint.py"],
+    est_time = 134,
+    suite = "stage-b-test-1-gpu-small",
+)
+
+sgl_amd_test(
+    name = "test_srt_endpoint_amd_stage_b_test_1_gpu_small_amd",
+    srcs = ["test_srt_endpoint.py"],
+    est_time = 130,
+    suite = "stage-b-test-1-gpu-small-amd",
+)
+
+sgl_cuda_test(
+    name = "test_deepseek_v3_deterministic",
+    srcs = ["test_deepseek_v3_deterministic.py"],
+    est_time = 240,
+    nightly = True,
+    suite = "nightly-1-gpu",
+)
+
+sgl_cuda_test(
+    name = "test_engine_child_pids",
+    srcs = ["test_engine_child_pids.py"],
+    est_time = 77,
+    suite = "stage-b-test-1-gpu-small",
+)
+
+sgl_cuda_test(
+    name = "test_gemma4_moe_deterministic",
+    srcs = ["test_gemma4_moe_deterministic.py"],
+    est_time = 420,
+    suite = "stage-b-test-2-gpu-large",
+)

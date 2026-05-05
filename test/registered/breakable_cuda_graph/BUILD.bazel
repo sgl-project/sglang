@@ -1,0 +1,8 @@
+load("//tools/bazel:sgl_defs.bzl", "sgl_cuda_test")
+
+sgl_cuda_test(
+    name = "test_breakable_cuda_graph",
+    srcs = ["test_breakable_cuda_graph.py"],
+    est_time = 79,
+    suite = "stage-b-test-1-gpu-large",
+)

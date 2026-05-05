@@ -1,0 +1,17 @@
+load("//tools/bazel:sgl_defs.bzl", "sgl_amd_test", "sgl_cuda_test")
+
+sgl_cuda_test(
+    name = "test_batch_invariant_ops_cuda_nightly_1_gpu_nightly",
+    srcs = ["test_batch_invariant_ops.py"],
+    est_time = 10,
+    nightly = True,
+    suite = "nightly-1-gpu",
+)
+
+sgl_amd_test(
+    name = "test_batch_invariant_ops_amd_nightly_amd_1_gpu_mi35x_nightly",
+    srcs = ["test_batch_invariant_ops.py"],
+    est_time = 10,
+    nightly = True,
+    suite = "nightly-amd-1-gpu-mi35x",
+)

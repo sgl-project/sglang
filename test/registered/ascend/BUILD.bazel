@@ -1,0 +1,9 @@
+load("//tools/bazel:sgl_defs.bzl", "sgl_npu_test")
+
+sgl_npu_test(
+    name = "test_npu_memory_consumption",
+    srcs = ["test_npu_memory_consumption.py"],
+    est_time = 400,
+    nightly = True,
+    suite = "nightly-2-npu-a3",
+)

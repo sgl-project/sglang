@@ -1,0 +1,15 @@
+load("//tools/bazel:sgl_defs.bzl", "sgl_amd_test", "sgl_cuda_test")
+
+sgl_cuda_test(
+    name = "test_build_eagle_tree_cuda_stage_b_test_1_gpu_small",
+    srcs = ["test_build_eagle_tree.py"],
+    est_time = 6,
+    suite = "stage-b-test-1-gpu-small",
+)
+
+sgl_amd_test(
+    name = "test_build_eagle_tree_amd_stage_b_test_1_gpu_small_amd",
+    srcs = ["test_build_eagle_tree.py"],
+    est_time = 3,
+    suite = "stage-b-test-1-gpu-small-amd",
+)

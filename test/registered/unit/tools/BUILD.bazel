@@ -1,0 +1,15 @@
+load("//tools/bazel:sgl_defs.bzl", "sgl_cpu_test")
+
+sgl_cpu_test(
+    name = "test_docker_build_metadata_args",
+    srcs = ["test_docker_build_metadata_args.py"],
+    est_time = 0,
+    suite = "stage-a-test-cpu",
+)
+
+sgl_cpu_test(
+    name = "test_get_version_tag",
+    srcs = ["test_get_version_tag.py"],
+    est_time = 0,
+    suite = "stage-a-test-cpu",
+)

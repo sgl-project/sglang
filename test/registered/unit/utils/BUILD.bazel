@@ -1,0 +1,72 @@
+load("//tools/bazel:sgl_defs.bzl", "sgl_amd_test", "sgl_cpu_test", "sgl_cuda_test")
+
+sgl_cpu_test(
+    name = "test_auth",
+    srcs = ["test_auth.py"],
+    est_time = 1,
+    suite = "stage-a-test-cpu",
+)
+
+sgl_cpu_test(
+    name = "test_gauge_histogram",
+    srcs = ["test_gauge_histogram.py"],
+    est_time = 6,
+    suite = "stage-a-test-cpu",
+)
+
+sgl_cpu_test(
+    name = "test_hf_transformers",
+    srcs = ["test_hf_transformers.py"],
+    est_time = 6,
+    suite = "stage-a-test-cpu",
+)
+
+sgl_cpu_test(
+    name = "test_hf_transformers_fastokens",
+    srcs = ["test_hf_transformers_fastokens.py"],
+    est_time = 30,
+    suite = "stage-a-test-cpu",
+)
+
+sgl_cpu_test(
+    name = "test_http_server_auth",
+    srcs = ["test_http_server_auth.py"],
+    est_time = 6,
+    suite = "stage-a-test-cpu",
+)
+
+sgl_cpu_test(
+    name = "test_subprocess_watchdog",
+    srcs = ["test_subprocess_watchdog.py"],
+    est_time = 9,
+    suite = "stage-a-test-cpu",
+)
+
+sgl_cpu_test(
+    name = "test_json_response",
+    srcs = ["test_json_response.py"],
+    est_time = 6,
+    suite = "stage-a-test-cpu",
+)
+
+sgl_cpu_test(
+    name = "test_patch_tokenizer",
+    srcs = ["test_patch_tokenizer.py"],
+    est_time = 30,
+    nightly = True,
+    suite = "stage-a-test-cpu",
+)
+
+sgl_cuda_test(
+    name = "test_profile_merger_cuda_stage_b_test_1_gpu_small",
+    srcs = ["test_profile_merger.py"],
+    est_time = 9,
+    suite = "stage-b-test-1-gpu-small",
+)
+
+sgl_amd_test(
+    name = "test_profile_merger_amd_stage_b_test_1_gpu_small_amd",
+    srcs = ["test_profile_merger.py"],
+    est_time = 8,
+    suite = "stage-b-test-1-gpu-small-amd",
+)

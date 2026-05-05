@@ -1,0 +1,8 @@
+load("//tools/bazel:sgl_defs.bzl", "sgl_cuda_test")
+
+sgl_cuda_test(
+    name = "test_mem_pool_ep_unit",
+    srcs = ["test_mem_pool_ep_unit.py"],
+    est_time = 9,
+    suite = "stage-b-test-1-gpu-small",
+)

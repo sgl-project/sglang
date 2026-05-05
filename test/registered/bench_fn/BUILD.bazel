@@ -1,0 +1,31 @@
+load("//tools/bazel:sgl_defs.bzl", "sgl_amd_test", "sgl_cpu_test", "sgl_cuda_test")
+
+sgl_cuda_test(
+    name = "test_bench_serving_functionality_cuda_nightly_1_gpu_nightly",
+    srcs = ["test_bench_serving_functionality.py"],
+    est_time = 300,
+    nightly = True,
+    suite = "nightly-1-gpu",
+)
+
+sgl_amd_test(
+    name = "test_bench_serving_functionality_amd_nightly_amd_1_gpu_nightly",
+    srcs = ["test_bench_serving_functionality.py"],
+    est_time = 300,
+    nightly = True,
+    suite = "nightly-amd-1-gpu",
+)
+
+sgl_cpu_test(
+    name = "test_bench_serving_reasoning_stream",
+    srcs = ["test_bench_serving_reasoning_stream.py"],
+    est_time = 10,
+    suite = "stage-a-test-cpu",
+)
+
+sgl_cpu_test(
+    name = "test_benchmark_datasets_api",
+    srcs = ["test_benchmark_datasets_api.py"],
+    est_time = 6,
+    suite = "stage-a-test-cpu",
+)

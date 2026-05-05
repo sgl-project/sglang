@@ -1,0 +1,29 @@
+load("//tools/bazel:sgl_defs.bzl", "sgl_cpu_test")
+
+sgl_cpu_test(
+    name = "test_sampling_batch_info",
+    srcs = ["test_sampling_batch_info.py"],
+    est_time = 9,
+    suite = "stage-a-test-cpu",
+)
+
+sgl_cpu_test(
+    name = "test_sampling_params",
+    srcs = ["test_sampling_params.py"],
+    est_time = 7,
+    suite = "stage-a-test-cpu",
+)
+
+sgl_cpu_test(
+    name = "test_custom_logit_processor",
+    srcs = ["test_custom_logit_processor.py"],
+    est_time = 7,
+    suite = "stage-a-test-cpu",
+)
+
+sgl_cpu_test(
+    name = "test_penaltylib",
+    srcs = ["test_penaltylib.py"],
+    est_time = 9,
+    suite = "stage-a-test-cpu",
+)

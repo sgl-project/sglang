@@ -1,0 +1,106 @@
+load("//tools/bazel:sgl_defs.bzl", "sgl_amd_test", "sgl_cuda_test")
+
+sgl_cuda_test(
+    name = "test_cross_encoder_models_cuda_stage_b_test_1_gpu_small",
+    srcs = ["test_cross_encoder_models.py"],
+    est_time = 125,
+    suite = "stage-b-test-1-gpu-small",
+)
+
+sgl_amd_test(
+    name = "test_cross_encoder_models_amd_stage_b_test_1_gpu_small_amd",
+    srcs = ["test_cross_encoder_models.py"],
+    est_time = 150,
+    suite = "stage-b-test-1-gpu-small-amd",
+)
+
+sgl_cuda_test(
+    name = "test_encoder_embedding_models",
+    srcs = ["test_encoder_embedding_models.py"],
+    est_time = 444,
+    suite = "stage-b-test-1-gpu-small",
+)
+
+sgl_cuda_test(
+    name = "test_pooled_hidden_states",
+    srcs = ["test_pooled_hidden_states.py"],
+    est_time = 100,
+    suite = "stage-b-test-1-gpu-small",
+)
+
+sgl_cuda_test(
+    name = "test_reward_models_cuda_stage_b_test_1_gpu_small",
+    srcs = ["test_reward_models.py"],
+    est_time = 166,
+    suite = "stage-b-test-1-gpu-small",
+)
+
+sgl_amd_test(
+    name = "test_reward_models_amd_stage_b_test_1_gpu_small_amd_nondeterministic",
+    srcs = ["test_reward_models.py"],
+    est_time = 132,
+    suite = "stage-b-test-1-gpu-small-amd-nondeterministic",
+)
+
+sgl_cuda_test(
+    name = "test_score_api",
+    srcs = ["test_score_api.py"],
+    est_time = 71,
+    suite = "stage-b-test-1-gpu-small",
+)
+
+sgl_cuda_test(
+    name = "test_score_engine",
+    srcs = ["test_score_engine.py"],
+    est_time = 85,
+    suite = "stage-b-test-1-gpu-small",
+)
+
+sgl_cuda_test(
+    name = "test_serving_rerank_cuda_stage_b_test_1_gpu_large",
+    srcs = ["test_serving_rerank.py"],
+    est_time = 9,
+    suite = "stage-b-test-1-gpu-large",
+)
+
+sgl_amd_test(
+    name = "test_serving_rerank_amd_stage_b_test_1_gpu_small_amd",
+    srcs = ["test_serving_rerank.py"],
+    est_time = 10,
+    suite = "stage-b-test-1-gpu-small-amd",
+)
+
+sgl_cuda_test(
+    name = "test_embed_overrides",
+    srcs = ["test_embed_overrides.py"],
+    est_time = 9,
+    suite = "stage-b-test-1-gpu-small",
+)
+
+sgl_cuda_test(
+    name = "test_embedding_models",
+    srcs = ["test_embedding_models.py"],
+    est_time = 136,
+    suite = "stage-b-test-1-gpu-small",
+)
+
+sgl_cuda_test(
+    name = "test_multi_item_scoring",
+    srcs = ["test_multi_item_scoring.py"],
+    est_time = 211,
+    suite = "stage-b-test-1-gpu-small",
+)
+
+sgl_cuda_test(
+    name = "test_openai_embedding_cuda_stage_b_test_1_gpu_small",
+    srcs = ["test_openai_embedding.py"],
+    est_time = 91,
+    suite = "stage-b-test-1-gpu-small",
+)
+
+sgl_amd_test(
+    name = "test_openai_embedding_amd_stage_b_test_1_gpu_small_amd",
+    srcs = ["test_openai_embedding.py"],
+    est_time = 141,
+    suite = "stage-b-test-1-gpu-small-amd",
+)

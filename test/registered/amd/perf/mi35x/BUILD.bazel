@@ -1,0 +1,113 @@
+load("//tools/bazel:sgl_defs.bzl", "sgl_amd_test")
+
+sgl_amd_test(
+    name = "test_grok1_int4_perf_mi35x",
+    srcs = ["test_grok1_int4_perf_mi35x.py"],
+    est_time = 1500,
+    nightly = True,
+    suite = "nightly-perf-8-gpu-mi35x-grok1-int4",
+)
+
+sgl_amd_test(
+    name = "test_kimi_k26_perf_mi35x",
+    srcs = ["test_kimi_k26_perf_mi35x.py"],
+    est_time = 5400,
+    nightly = True,
+    suite = "nightly-perf-8-gpu-mi35x-kimi-k26",
+)
+
+sgl_amd_test(
+    name = "test_minimax_m25_perf_mi35x",
+    srcs = ["test_minimax_m25_perf_mi35x.py"],
+    est_time = 5400,
+    nightly = True,
+    suite = "nightly-perf-8-gpu-mi35x-minimax-m25",
+)
+
+sgl_amd_test(
+    name = "test_minimax_m27_perf_mi35x",
+    srcs = ["test_minimax_m27_perf_mi35x.py"],
+    est_time = 5400,
+    nightly = True,
+    suite = "nightly-perf-8-gpu-mi35x-minimax-m27",
+)
+
+sgl_amd_test(
+    name = "test_qwen35_fp8_perf_mi35x",
+    srcs = ["test_qwen35_fp8_perf_mi35x.py"],
+    est_time = 5400,
+    nightly = True,
+    suite = "nightly-perf-8-gpu-mi35x-qwen35-fp8",
+)
+
+sgl_amd_test(
+    name = "test_deepseek_r1_mxfp4_ar_fusion_perf_mi35x",
+    srcs = ["test_deepseek_r1_mxfp4_ar_fusion_perf_mi35x.py"],
+    est_time = 18000,
+    nightly = True,
+    suite = "nightly-perf-8-gpu-mi35x-deepseek-r1-mxfp4-ar-fusion",
+)
+
+sgl_amd_test(
+    name = "test_deepseek_r1_mxfp4_kv_fp8_perf_mi35x",
+    srcs = ["test_deepseek_r1_mxfp4_kv_fp8_perf_mi35x.py"],
+    est_time = 18000,
+    nightly = True,
+    suite = "nightly-perf-8-gpu-mi35x-deepseek-r1-mxfp4-kv-fp8",
+)
+
+sgl_amd_test(
+    name = "test_deepseek_v32_basic_perf_mi35x",
+    srcs = ["test_deepseek_v32_basic_perf_mi35x.py"],
+    est_time = 5400,
+    nightly = True,
+    suite = "nightly-perf-8-gpu-mi35x-deepseek-v32-basic",
+)
+
+sgl_amd_test(
+    name = "test_deepseek_v32_mtp_perf_mi35x",
+    srcs = ["test_deepseek_v32_mtp_perf_mi35x.py"],
+    est_time = 5400,
+    nightly = True,
+    suite = "nightly-perf-8-gpu-mi35x-deepseek-v32-mtp",
+)
+
+sgl_amd_test(
+    name = "test_glm51_perf_mi35x",
+    srcs = ["test_glm51_perf_mi35x.py"],
+    est_time = 5400,
+    nightly = True,
+    suite = "nightly-perf-8-gpu-mi35x-glm51",
+)
+
+sgl_amd_test(
+    name = "test_glm5_mxfp4_perf_mi35x",
+    srcs = ["test_glm5_mxfp4_perf_mi35x.py"],
+    est_time = 18000,
+    nightly = True,
+    suite = "nightly-perf-8-gpu-mi35x-glm5-mxfp4",
+)
+
+sgl_amd_test(
+    name = "test_glm5_perf_mi35x",
+    srcs = ["test_glm5_perf_mi35x.py"],
+    est_time = 5400,
+    nightly = True,
+    suite = "nightly-perf-8-gpu-mi35x-glm5",
+)
+
+sgl_amd_test(
+    name = "test_grok2_perf_mi35x",
+    srcs = ["test_grok2_perf_mi35x.py"],
+    est_time = 1500,
+    nightly = True,
+    suite = "nightly-perf-8-gpu-mi35x-grok2",
+)
+
+sgl_amd_test(
+    name = "test_deepseek_r1_mxfp4_perf_mi35x",
+    srcs = ["test_deepseek_r1_mxfp4_perf_mi35x.py"],
+    est_time = 18000,
+    nightly = True,
+    suite = "nightly-perf-8-gpu-mi35x-deepseek-r1-mxfp4",
+)

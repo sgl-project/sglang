@@ -1,0 +1,61 @@
+load("//tools/bazel:sgl_defs.bzl", "sgl_npu_test")
+
+sgl_npu_test(
+    name = "test_npu_compile_graph_tp1_bf16_npu_stage_b_test_1_npu_a2",
+    srcs = ["test_npu_compile_graph_tp1_bf16.py"],
+    est_time = 400,
+    suite = "stage-b-test-1-npu-a2",
+)
+
+sgl_npu_test(
+    name = "test_npu_compile_graph_tp1_bf16_npu_nightly_1_npu_a3_nightly",
+    srcs = ["test_npu_compile_graph_tp1_bf16.py"],
+    est_time = 400,
+    nightly = True,
+    suite = "nightly-1-npu-a3",
+)
+
+sgl_npu_test(
+    name = "test_npu_graph_tp1_bf16_npu_stage_b_test_1_npu_a2",
+    srcs = ["test_npu_graph_tp1_bf16.py"],
+    est_time = 400,
+    suite = "stage-b-test-1-npu-a2",
+)
+
+sgl_npu_test(
+    name = "test_npu_graph_tp1_bf16_npu_nightly_1_npu_a3_nightly",
+    srcs = ["test_npu_graph_tp1_bf16.py"],
+    est_time = 400,
+    nightly = True,
+    suite = "nightly-1-npu-a3",
+)
+
+sgl_npu_test(
+    name = "test_npu_graph_tp2_bf16_npu_stage_b_test_2_npu_a2",
+    srcs = ["test_npu_graph_tp2_bf16.py"],
+    est_time = 400,
+    suite = "stage-b-test-2-npu-a2",
+)
+
+sgl_npu_test(
+    name = "test_npu_graph_tp2_bf16_npu_nightly_2_npu_a3_nightly",
+    srcs = ["test_npu_graph_tp2_bf16.py"],
+    est_time = 400,
+    nightly = True,
+    suite = "nightly-2-npu-a3",
+)
+
+sgl_npu_test(
+    name = "test_npu_piecewise_graph_prefill_npu_stage_b_test_1_npu_a2",
+    srcs = ["test_npu_piecewise_graph_prefill.py"],
+    est_time = 400,
+    suite = "stage-b-test-1-npu-a2",
+)
+
+sgl_npu_test(
+    name = "test_npu_piecewise_graph_prefill_npu_nightly_1_npu_a3_nightly",
+    srcs = ["test_npu_piecewise_graph_prefill.py"],
+    est_time = 400,
+    nightly = True,
+    suite = "nightly-1-npu-a3",
+)

@@ -1,0 +1,108 @@
+load("//tools/bazel:sgl_defs.bzl", "sgl_amd_test", "sgl_cpu_test", "sgl_cuda_test")
+
+sgl_cuda_test(
+    name = "test_priority_scheduling_cuda_stage_b_test_1_gpu_small",
+    srcs = ["test_priority_scheduling.py"],
+    est_time = 149,
+    suite = "stage-b-test-1-gpu-small",
+)
+
+sgl_amd_test(
+    name = "test_priority_scheduling_amd_stage_b_test_1_gpu_small_amd",
+    srcs = ["test_priority_scheduling.py"],
+    est_time = 195,
+    suite = "stage-b-test-1-gpu-small-amd",
+)
+
+sgl_cuda_test(
+    name = "test_routing_key_scheduling_cuda_nightly_1_gpu_nightly",
+    srcs = ["test_routing_key_scheduling.py"],
+    est_time = 120,
+    nightly = True,
+    suite = "nightly-1-gpu",
+)
+
+sgl_amd_test(
+    name = "test_routing_key_scheduling_amd_nightly_amd_1_gpu_nightly",
+    srcs = ["test_routing_key_scheduling.py"],
+    est_time = 120,
+    nightly = True,
+    suite = "nightly-amd-1-gpu",
+)
+
+sgl_cpu_test(
+    name = "test_abort_with_metrics",
+    srcs = ["test_abort_with_metrics.py"],
+    est_time = 7,
+    suite = "stage-a-test-cpu",
+)
+
+sgl_cuda_test(
+    name = "test_retract_decode_cuda_stage_b_test_1_gpu_small",
+    srcs = ["test_retract_decode.py"],
+    est_time = 353,
+    suite = "stage-b-test-1-gpu-small",
+)
+
+sgl_amd_test(
+    name = "test_retract_decode_amd_stage_b_test_1_gpu_small_amd",
+    srcs = ["test_retract_decode.py"],
+    est_time = 600,
+    suite = "stage-b-test-1-gpu-small-amd",
+)
+
+sgl_cuda_test(
+    name = "test_scheduler_control_cuda_stage_b_test_1_gpu_small",
+    srcs = ["test_scheduler_control.py"],
+    est_time = 367,
+    suite = "stage-b-test-1-gpu-small",
+)
+
+sgl_amd_test(
+    name = "test_scheduler_control_amd_stage_b_test_1_gpu_small_amd",
+    srcs = ["test_scheduler_control.py"],
+    est_time = 300,
+    suite = "stage-b-test-1-gpu-small-amd",
+)
+
+sgl_cuda_test(
+    name = "test_mixed_chunked_prefill_cuda_stage_b_test_1_gpu_small",
+    srcs = ["test_mixed_chunked_prefill.py"],
+    est_time = 167,
+    suite = "stage-b-test-1-gpu-small",
+)
+
+sgl_amd_test(
+    name = "test_mixed_chunked_prefill_amd_stage_b_test_1_gpu_small_amd",
+    srcs = ["test_mixed_chunked_prefill.py"],
+    est_time = 180,
+    suite = "stage-b-test-1-gpu-small-amd",
+)
+
+sgl_cuda_test(
+    name = "test_no_chunked_prefill_cuda_stage_b_test_1_gpu_large",
+    srcs = ["test_no_chunked_prefill.py"],
+    est_time = 131,
+    suite = "stage-b-test-1-gpu-large",
+)
+
+sgl_amd_test(
+    name = "test_no_chunked_prefill_amd_stage_b_test_1_gpu_small_amd",
+    srcs = ["test_no_chunked_prefill.py"],
+    est_time = 108,
+    suite = "stage-b-test-1-gpu-small-amd",
+)
+
+sgl_cuda_test(
+    name = "test_no_overlap_scheduler_cuda_stage_b_test_1_gpu_large",
+    srcs = ["test_no_overlap_scheduler.py"],
+    est_time = 267,
+    suite = "stage-b-test-1-gpu-large",
+)
+
+sgl_amd_test(
+    name = "test_no_overlap_scheduler_amd_stage_b_test_1_gpu_small_amd",
+    srcs = ["test_no_overlap_scheduler.py"],
+    est_time = 275,
+    suite = "stage-b-test-1-gpu-small-amd",
+)

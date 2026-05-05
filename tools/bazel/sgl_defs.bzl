@@ -5,6 +5,7 @@ load("@rules_python//python:defs.bzl", "py_library", "py_test")
 _SGLANG_LIB = "//python:sglang"
 
 _HW_TAGS = {
+    "amd": "hw-amd",
     "cpu": "hw-cpu",
     "cuda": "hw-cuda",
     "npu": "hw-npu",
@@ -79,10 +80,14 @@ def sgl_registered_test(
         data = [],
         tags = [],
         env = {},
+        nightly = False,
         target_compatible_with = [],
         **kwargs):
     """Mirror register_*_ci metadata as Bazel tags and platform constraints."""
     timeout, size = _est_time_to_timeout(est_time)
+    cadence_tag = "nightly" if nightly else "per-commit"
+    if "main" not in kwargs and len(srcs) == 1:
+        kwargs["main"] = srcs[0]
     py_test(
         name = name,
         srcs = srcs,
@@ -95,6 +100,7 @@ def sgl_registered_test(
             _HW_TAGS[hw],
             _PROFILE_TAGS[profile],
             _ARCH_TAGS[arch],
+            cadence_tag,
         ] + tags,
         target_compatible_with = _ARCH_CONSTRAINTS[arch] + target_compatible_with,
         timeout = timeout,
@@ -110,6 +116,19 @@ def sgl_cpu_test(name, srcs, suite, est_time, arch = "any", **kwargs):
         est_time = est_time,
         hw = "cpu",
         profile = "cpu",
+        arch = arch,
+        **kwargs
+    )
+
+
+def sgl_amd_test(name, srcs, suite, est_time, arch = "x86_64", **kwargs):
+    sgl_registered_test(
+        name = name,
+        srcs = srcs,
+        suite = suite,
+        est_time = est_time,
+        hw = "amd",
+        profile = "other",
         arch = arch,
         **kwargs
     )

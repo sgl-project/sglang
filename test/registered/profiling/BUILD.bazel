@@ -1,0 +1,15 @@
+load("//tools/bazel:sgl_defs.bzl", "sgl_amd_test", "sgl_cuda_test")
+
+sgl_cuda_test(
+    name = "test_start_profile_cuda_stage_b_test_1_gpu_small",
+    srcs = ["test_start_profile.py"],
+    est_time = 42,
+    suite = "stage-b-test-1-gpu-small",
+)
+
+sgl_amd_test(
+    name = "test_start_profile_amd_stage_b_test_1_gpu_small_amd",
+    srcs = ["test_start_profile.py"],
+    est_time = 60,
+    suite = "stage-b-test-1-gpu-small-amd",
+)

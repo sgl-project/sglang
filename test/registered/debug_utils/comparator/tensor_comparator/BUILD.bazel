@@ -1,0 +1,25 @@
+load("//tools/bazel:sgl_defs.bzl", "sgl_cpu_test")
+
+sgl_cpu_test(
+    name = "test_comparator",
+    srcs = ["test_comparator.py"],
+    est_time = 20,
+    nightly = True,
+    suite = "stage-a-test-cpu",
+)
+
+sgl_cpu_test(
+    name = "test_formatter",
+    srcs = ["test_formatter.py"],
+    est_time = 10,
+    nightly = True,
+    suite = "stage-a-test-cpu",
+)
+
+sgl_cpu_test(
+    name = "test_types",
+    srcs = ["test_types.py"],
+    est_time = 10,
+    nightly = True,
+    suite = "stage-a-test-cpu",
+)

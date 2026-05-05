@@ -1,0 +1,43 @@
+load("//tools/bazel:sgl_defs.bzl", "sgl_amd_test", "sgl_cuda_test")
+
+sgl_cuda_test(
+    name = "test_anthropic_tool_use_cuda_stage_b_test_1_gpu_large",
+    srcs = ["test_anthropic_tool_use.py"],
+    est_time = 50,
+    suite = "stage-b-test-1-gpu-large",
+)
+
+sgl_amd_test(
+    name = "test_anthropic_tool_use_amd_stage_b_test_1_gpu_small_amd",
+    srcs = ["test_anthropic_tool_use.py"],
+    est_time = 140,
+    suite = "stage-b-test-1-gpu-small-amd",
+)
+
+sgl_cuda_test(
+    name = "test_openai_function_calling_cuda_stage_b_test_1_gpu_large",
+    srcs = ["test_openai_function_calling.py"],
+    est_time = 100,
+    suite = "stage-b-test-1-gpu-large",
+)
+
+sgl_amd_test(
+    name = "test_openai_function_calling_amd_stage_b_test_1_gpu_small_amd",
+    srcs = ["test_openai_function_calling.py"],
+    est_time = 73,
+    suite = "stage-b-test-1-gpu-small-amd",
+)
+
+sgl_cuda_test(
+    name = "test_tool_choice_cuda_stage_b_test_1_gpu_small",
+    srcs = ["test_tool_choice.py"],
+    est_time = 204,
+    suite = "stage-b-test-1-gpu-small",
+)
+
+sgl_amd_test(
+    name = "test_tool_choice_amd_stage_b_test_1_gpu_small_amd",
+    srcs = ["test_tool_choice.py"],
+    est_time = 258,
+    suite = "stage-b-test-1-gpu-small-amd",
+)

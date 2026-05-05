@@ -1,0 +1,22 @@
+load("//tools/bazel:sgl_defs.bzl", "sgl_amd_test", "sgl_cuda_test")
+
+sgl_cuda_test(
+    name = "test_input_embeddings_cuda_stage_b_test_1_gpu_small",
+    srcs = ["test_input_embeddings.py"],
+    est_time = 42,
+    suite = "stage-b-test-1-gpu-small",
+)
+
+sgl_amd_test(
+    name = "test_input_embeddings_amd_stage_b_test_1_gpu_small_amd",
+    srcs = ["test_input_embeddings.py"],
+    est_time = 38,
+    suite = "stage-b-test-1-gpu-small-amd",
+)
+
+sgl_cuda_test(
+    name = "test_input_embeds_chunked",
+    srcs = ["test_input_embeds_chunked.py"],
+    est_time = 43,
+    suite = "stage-b-test-1-gpu-small",
+)

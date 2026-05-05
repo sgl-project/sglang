@@ -1,0 +1,15 @@
+load("//tools/bazel:sgl_defs.bzl", "sgl_cpu_test")
+
+sgl_cpu_test(
+    name = "test_balanced_packing",
+    srcs = ["test_balanced_packing.py"],
+    est_time = 7,
+    suite = "stage-a-test-cpu",
+)
+
+sgl_cpu_test(
+    name = "test_compute_logical_to_rank_dispatch_physical_map",
+    srcs = ["test_compute_logical_to_rank_dispatch_physical_map.py"],
+    est_time = 7,
+    suite = "stage-a-test-cpu",
+)

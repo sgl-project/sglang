@@ -1,0 +1,29 @@
+load("//tools/bazel:sgl_defs.bzl", "sgl_cuda_test")
+
+sgl_cuda_test(
+    name = "test_session_control",
+    srcs = ["test_session_control.py"],
+    est_time = 87,
+    suite = "stage-b-test-1-gpu-large",
+)
+
+sgl_cuda_test(
+    name = "test_session_latency",
+    srcs = ["test_session_latency.py"],
+    est_time = 122,
+    suite = "stage-b-test-1-gpu-large",
+)
+
+sgl_cuda_test(
+    name = "test_streaming_session",
+    srcs = ["test_streaming_session.py"],
+    est_time = 691,
+    suite = "stage-b-test-1-gpu-large",
+)
+
+sgl_cuda_test(
+    name = "test_streaming_session_swa",
+    srcs = ["test_streaming_session_swa.py"],
+    est_time = 519,
+    suite = "stage-b-test-1-gpu-large",
+)

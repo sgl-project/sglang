@@ -1,0 +1,29 @@
+load("//tools/bazel:sgl_defs.bzl", "sgl_cuda_test")
+
+sgl_cuda_test(
+    name = "test_stress_deepseek_v3",
+    srcs = ["test_stress_deepseek_v3.py"],
+    est_time = 2700,
+    suite = "stress",
+)
+
+sgl_cuda_test(
+    name = "test_stress_glm_4_6",
+    srcs = ["test_stress_glm_4_6.py"],
+    est_time = 2700,
+    suite = "stress",
+)
+
+sgl_cuda_test(
+    name = "test_stress_kimi_k2",
+    srcs = ["test_stress_kimi_k2.py"],
+    est_time = 2700,
+    suite = "stress",
+)
+
+sgl_cuda_test(
+    name = "test_stress_qwen3_235b",
+    srcs = ["test_stress_qwen3_235b.py"],
+    est_time = 2700,
+    suite = "stress",
+)

@@ -1,0 +1,57 @@
+load("//tools/bazel:sgl_defs.bzl", "sgl_cpu_test")
+
+sgl_cpu_test(
+    name = "test_unknown_tool_name",
+    srcs = ["test_unknown_tool_name.py"],
+    est_time = 5,
+    suite = "stage-a-test-cpu",
+)
+
+sgl_cpu_test(
+    name = "test_function_call_parser",
+    srcs = ["test_function_call_parser.py"],
+    est_time = 15,
+    suite = "stage-a-test-cpu",
+)
+
+sgl_cpu_test(
+    name = "test_hermes_detector",
+    srcs = ["test_hermes_detector.py"],
+    est_time = 1,
+    suite = "stage-a-test-cpu",
+)
+
+sgl_cpu_test(
+    name = "test_hunyuan_detector",
+    srcs = ["test_hunyuan_detector.py"],
+    est_time = 7,
+    suite = "stage-a-test-cpu",
+)
+
+sgl_cpu_test(
+    name = "test_json_schema_constraint",
+    srcs = ["test_json_schema_constraint.py"],
+    est_time = 5,
+    suite = "stage-a-test-cpu",
+)
+
+sgl_cpu_test(
+    name = "test_llama32_detector",
+    srcs = ["test_llama32_detector.py"],
+    est_time = 1,
+    suite = "stage-a-test-cpu",
+)
+
+sgl_cpu_test(
+    name = "test_mistral_detector",
+    srcs = ["test_mistral_detector.py"],
+    est_time = 1,
+    suite = "stage-a-test-cpu",
+)
+
+sgl_cpu_test(
+    name = "test_parallel_tool_calls",
+    srcs = ["test_parallel_tool_calls.py"],
+    est_time = 5,
+    suite = "stage-a-test-cpu",
+)

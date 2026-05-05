@@ -1,0 +1,8 @@
+load("//tools/bazel:sgl_defs.bzl", "sgl_amd_test")
+
+sgl_amd_test(
+    name = "test_rope_rocm",
+    srcs = ["test_rope_rocm.py"],
+    est_time = 3,
+    suite = "stage-b-test-1-gpu-small-amd",
+)

@@ -1,0 +1,8 @@
+load("//tools/bazel:sgl_defs.bzl", "sgl_cpu_test")
+
+sgl_cpu_test(
+    name = "test_mmmu_eval_utils",
+    srcs = ["test_mmmu_eval_utils.py"],
+    est_time = 5,
+    suite = "stage-a-test-cpu",
+)
