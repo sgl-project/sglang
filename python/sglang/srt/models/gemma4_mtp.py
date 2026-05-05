@@ -105,7 +105,6 @@ class Gemma4AssistantForCausalLM(Gemma4ForCausalLM):
             prefix=add_prefix("post_projection", prefix),
         )
 
-        # Full-vocab logits per rank → ``skip_all_gather=True`` for both heads.
         if text_config.tie_word_embeddings:
             self.lm_head = self.model.embed_tokens
         else:
@@ -314,8 +313,13 @@ class Gemma4AssistantForCausalLM(Gemma4ForCausalLM):
             .view(self.num_centroids, self.vocab_size_per_centroid)[top_k_indices]
             .view(num_tokens, -1)
         )
-        mask_value = selected_logits.min() - 1.0
-        output = mask_value.expand(num_tokens, self.vocab_size).clone()
+        mask_value = torch.finfo(selected_logits.dtype).min / 2
+        output = torch.full(
+            (num_tokens, self.vocab_size),
+            mask_value,
+            dtype=selected_logits.dtype,
+            device=selected_logits.device,
+        )
         output.scatter_(dim=-1, index=centroid_vocab_indices, src=selected_logits)
         return output.view(*prefix_shape, self.vocab_size)
 

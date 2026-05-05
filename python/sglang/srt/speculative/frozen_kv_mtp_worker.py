@@ -112,8 +112,10 @@ class FrozenKVMTPWorker(TpModelWorker):
             "_resolve_speculative_algorithm_alias."
         )
 
+        # Assistant reads target KV directly, so its context length must match the target.
         server_args.context_length = target_worker.model_runner.model_config.context_len
 
+        # Defer cuda graph capture; we do it ourselves below.
         backup_disable_cuda_graph = server_args.disable_cuda_graph
         server_args.disable_cuda_graph = True
 

@@ -304,6 +304,7 @@ def add_rl_on_policy_target_choices(choices):
 def _resolve_speculative_algorithm_alias(
     speculative_algorithm: Optional[str],
     speculative_draft_model_path: Optional[str],
+    trust_remote_code: bool = False,
 ) -> Optional[str]:
     """Resolve CLI speculative algorithm; NEXTN/EAGLE may become FROZEN_KV_MTP for Gemma4 assistant drafts."""
 
@@ -312,7 +313,7 @@ def _resolve_speculative_algorithm_alias(
         from transformers import AutoConfig
 
         cfg = AutoConfig.from_pretrained(
-            speculative_draft_model_path, trust_remote_code=True
+            speculative_draft_model_path, trust_remote_code=trust_remote_code
         )
         is_gemma4_draft = "Gemma4AssistantForCausalLM" in (
             getattr(cfg, "architectures", None) or []
@@ -3315,6 +3316,7 @@ class ServerArgs:
         self.speculative_algorithm = _resolve_speculative_algorithm_alias(
             self.speculative_algorithm,
             self.speculative_draft_model_path,
+            trust_remote_code=self.trust_remote_code,
         )
 
         if self.speculative_skip_dp_mlp_sync:
