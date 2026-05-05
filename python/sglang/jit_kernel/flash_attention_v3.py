@@ -16,15 +16,15 @@ SGL_FA3_KERNEL_REVISION = "v1"
 DEFAULT_FA3_KERNEL_LOCKFILE = "kernels.lock"
 
 
-def _call_fa3_kernel(kernel, *args, out=None):
+def _call_fa3_kernel(kernel, *args, out=None, **kwargs):
     if out is None:
-        return kernel(*args)
+        return kernel(*args, **kwargs)
     try:
-        return kernel(*args, out=out)
+        return kernel(*args, **kwargs, out=out)
     except TypeError as exc:
         if "unexpected keyword argument 'out'" not in str(exc):
             raise
-        return kernel(*args)
+        return kernel(*args, **kwargs)
 
 
 @cache_once
