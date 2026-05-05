@@ -2138,9 +2138,9 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         if write_back:
             # Blocking: wait for all pending write-backs
             while self.ongoing_write_through:
-                for _, finish_event, ack_list in cc.ack_write_queue:
-                    finish_event.synchronize()
-                    for ack_id in ack_list:
+                for ack in cc.ack_write_queue:
+                    ack.finish_event.synchronize()
+                    for ack_id in ack.node_ids:
                         entry = self.ongoing_write_through.pop(ack_id, None)
                         if entry is not None:
                             node, params = entry
@@ -2157,8 +2157,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             return
 
         finish_count = 0
-        for _, finish_event, ack_list in cc.ack_write_queue:
-            if not finish_event.query():
+        for ack in cc.ack_write_queue:
+            if not ack.finish_event.query():
                 break
             finish_count += 1
 
@@ -2169,9 +2169,16 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
         # Process completed acks
         while finish_count > 0:
-            _, finish_event, ack_list = cc.ack_write_queue.pop(0)
-            finish_event.synchronize()
-            for ack_id in ack_list:
+            ack = cc.ack_write_queue.pop(0)
+            ack.finish_event.synchronize()
+
+            # Post-ack callback for cache controller (e.g. to trigger next write-backs)
+            self.cache_controller.record_l1_l2_transfer_complete(
+                direction="onboard",
+                ack=ack,
+            )
+
+            for ack_id in ack.node_ids:
                 node, params = self.ongoing_write_through.pop(ack_id)
                 self._record_store_event(node, medium=StorageMedium.CPU)
                 self.dec_lock_ref(node, params)
@@ -2185,11 +2192,19 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         if cc is None or not self.ongoing_load_back:
             return
         finish_count = 0
-        for _, finish_event, ack_list in cc.ack_load_queue:
-            if not finish_event.query():
+        for ack in cc.ack_load_queue:
+            if not ack.finish_event.query():
                 break
+
+            # ensure completion of loading, before recording transfer completion and updating cache state
+            ack.finish_event.synchronize()
+            self.cache_controller.record_l1_l2_transfer_complete(
+                direction="onboard",
+                ack=ack,
+            )
+
             finish_count += 1
-            for ack_id in ack_list:
+            for ack_id in ack.node_ids:
                 node, lock_params = self.ongoing_load_back.pop(ack_id)
                 self.dec_lock_ref(node, lock_params)
         del cc.ack_load_queue[:finish_count]
