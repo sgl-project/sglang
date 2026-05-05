@@ -5,10 +5,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from sglang.jit_kernel.diffusion.group_norm_silu import apply_group_norm_silu
 from sglang.jit_kernel.diffusion.triton.group_norm_silu import triton_group_norm_silu
-from sglang.multimodal_gen.runtime.models.vaes.hunyuanvae import (
-    _apply_hunyuan_group_norm_silu,
-)
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=8, suite="stage-b-kernel-unit-1-gpu-large")
@@ -70,21 +68,18 @@ def test_triton_group_norm_silu(
 @torch.no_grad()
 @pytest.mark.parametrize("shape,num_groups", TEST_CASES[:2])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-def test_apply_hunyuan_group_norm_silu(
-    monkeypatch: pytest.MonkeyPatch,
+def test_apply_group_norm_silu(
     shape: tuple[int, ...],
     num_groups: int,
     dtype: torch.dtype,
 ) -> None:
-    monkeypatch.setenv("SGLANG_USE_CUDA_HUNYUANVIDEO_GROUP_NORM_SILU", "1")
-
     norm = nn.GroupNorm(num_groups, shape[1], eps=1e-5, affine=True).to(
         device=DEVICE, dtype=dtype
     )
     activation = nn.SiLU()
     hidden_states = torch.randn(shape, device=DEVICE, dtype=dtype)
 
-    actual = _apply_hunyuan_group_norm_silu(hidden_states, norm, activation)
+    actual = apply_group_norm_silu(hidden_states, norm, activation)
     expected = activation(norm(hidden_states))
 
     atol, rtol = _tol(dtype)
