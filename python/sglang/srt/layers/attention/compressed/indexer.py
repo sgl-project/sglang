@@ -399,12 +399,16 @@ class C4IndexerBackend:
         elif envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get():
             fn = fp8_paged_mqa_logits_torch
         else:
-            if envs.SGLANG_OPT_DG_PAGED_MQA_LOGITS_CHUNK_SIZE.get() != -1:
-                from sglang.srt.layers.deep_gemm_wrapper.paged_mqa_logits import (
-                    fp8_paged_mqa_logits_chunked as fn,
-                )
-            else:
-                from deep_gemm import fp8_paged_mqa_logits as fn
+            try:
+                if envs.SGLANG_OPT_DG_PAGED_MQA_LOGITS_CHUNK_SIZE.get() != -1:
+                    from sglang.srt.layers.deep_gemm_wrapper.paged_mqa_logits import (
+                        fp8_paged_mqa_logits_chunked as fn,
+                    )
+                else:
+                    from deep_gemm import fp8_paged_mqa_logits as fn
+            except (ImportError, RuntimeError, FileNotFoundError):
+                # DeepGEMM not available or SM120 unsupported, use PyTorch fallback
+                fn = fp8_paged_mqa_logits_torch
 
         _c4sl = indexer_metadata.c4_seq_lens
         if _c4sl.dim() == 1:
