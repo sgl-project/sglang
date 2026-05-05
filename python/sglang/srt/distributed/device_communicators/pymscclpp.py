@@ -218,7 +218,6 @@ class PyMscclppCommunicator:
                                 best_time = avg_time
                                 best_config = (algo, nb, nt)
             if best_config:
-                print(f"Best config for size {size}: {best_config[0].__name__}, nblocks: {best_config[1]}, nthreads: {best_config[2]}")
                 self.best_configs[size] = best_config
 
         torch.cuda.synchronize()
