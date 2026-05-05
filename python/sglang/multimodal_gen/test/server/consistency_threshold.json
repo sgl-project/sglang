@@ -112,7 +112,7 @@
         "ltx_2.3_two_stage_t2v_2gpus": {
             "clip_threshold": 0.79,
             "ssim_threshold": 0.12,
-            "psnr_threshold": 12.1,
+            "psnr_threshold": 20.0,
             "mean_abs_diff_threshold": 51.1
         },
         "wan2_1_t2v_1.3b_teacache_enabled": {
@@ -250,7 +250,7 @@
         "ltx_2_3_two_stage_ti2v_2gpus": {
             "clip_threshold": 0.92,
             "ssim_threshold": 0.60,
-            "psnr_threshold": 17.7,
+            "psnr_threshold": 20.0,
             "mean_abs_diff_threshold": 19.5
         }
     },
