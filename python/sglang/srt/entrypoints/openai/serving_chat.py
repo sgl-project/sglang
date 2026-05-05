@@ -264,6 +264,12 @@ class OpenAIServingChat(OpenAIServingBase):
                 "Please set stream=false when using return_prompt_token_ids=true."
             )
 
+        if request.return_completion_token_ids and request.stream:
+            raise ValueError(
+                "return_completion_token_ids is not supported with streaming. "
+                "Please set stream=false when using return_completion_token_ids=true."
+            )
+
         is_multimodal = self.tokenizer_manager.model_config.is_multimodal
 
         # Process messages and apply chat template
@@ -1037,6 +1043,13 @@ class OpenAIServingChat(OpenAIServingBase):
                 else None
             )
 
+            # Extract completion_token_ids if requested
+            choice_completion_token_ids = (
+                ret_item.get("output_ids")
+                if request.return_completion_token_ids
+                else None
+            )
+
             choice_meta_info = (
                 ret_item["meta_info"] if request.return_meta_info else None
             )
@@ -1058,6 +1071,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 ),
                 hidden_states=hidden_states,
                 prompt_token_ids=choice_prompt_token_ids,
+                completion_token_ids=choice_completion_token_ids,
                 meta_info=choice_meta_info,
             )
             choices.append(choice_data)

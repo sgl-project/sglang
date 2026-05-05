@@ -590,6 +590,7 @@ class ChatCompletionRequest(BaseModel):
     return_routed_experts: bool = False
     return_cached_tokens_details: bool = False
     return_prompt_token_ids: bool = False
+    return_completion_token_ids: bool = False
     return_meta_info: bool = False
     reasoning_effort: Optional[Literal["none", "low", "medium", "high"]] = Field(
         default=None,
@@ -853,6 +854,7 @@ class ChatCompletionResponseChoice(BaseModel):
     matched_stop: Union[None, int, str] = None
     hidden_states: Optional[object] = None
     prompt_token_ids: Optional[List[int]] = None
+    completion_token_ids: Optional[List[int]] = None
     meta_info: Optional[Dict[str, Any]] = None
 
     @model_serializer(mode="wrap")
@@ -862,6 +864,8 @@ class ChatCompletionResponseChoice(BaseModel):
             data.pop("hidden_states", None)
         if self.prompt_token_ids is None:
             data.pop("prompt_token_ids", None)
+        if self.completion_token_ids is None:
+            data.pop("completion_token_ids", None)
         if self.meta_info is None:
             data.pop("meta_info", None)
         return data

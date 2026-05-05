@@ -566,6 +566,7 @@ async def model_info():
     result = {
         "model_path": _global_state.tokenizer_manager.model_path,
         "tokenizer_path": _global_state.tokenizer_manager.server_args.tokenizer_path,
+        "tokenizer_sha256": _compute_tokenizer_sha256(),
         "is_generation": _global_state.tokenizer_manager.is_generation,
         "preferred_sampling_params": _global_state.tokenizer_manager.server_args.preferred_sampling_params,
         "weight_version": _global_state.tokenizer_manager.server_args.weight_version,
@@ -577,6 +578,39 @@ async def model_info():
         # "hf_config": model_config.hf_config.to_dict(),
     }
     return result
+
+
+_TOKENIZER_SHA256_CACHE: Optional[str] = None
+
+
+def _compute_tokenizer_sha256() -> Optional[str]:
+    """Return a SHA256 of the active tokenizer's canonical JSON form.
+
+    Used by agent-side consistency checks (see
+    harbor.utils.tokenizer_identity.assert_tokenizer_matches in Harbor's
+    tito/agentic-path-infra branch) to abort the rollout when the trainer
+    and rollout tokenizers have drifted. A mismatch silently corrupts the
+    training signal for RL (W-TITO bullet 5).
+
+    Returns None when the tokenizer is not a HF fast tokenizer exposing
+    `backend_tokenizer.to_str()` (the only form with a stable canonical
+    representation). Cached after the first call.
+    """
+    global _TOKENIZER_SHA256_CACHE
+    if _TOKENIZER_SHA256_CACHE is not None:
+        return _TOKENIZER_SHA256_CACHE
+    try:
+        tokenizer = _global_state.tokenizer_manager.tokenizer
+    except AttributeError:
+        return None
+    backend = getattr(tokenizer, "backend_tokenizer", None)
+    to_str = getattr(backend, "to_str", None) if backend is not None else None
+    if to_str is None or not callable(to_str):
+        return None
+    import hashlib
+
+    _TOKENIZER_SHA256_CACHE = hashlib.sha256(to_str().encode("utf-8")).hexdigest()
+    return _TOKENIZER_SHA256_CACHE
 
 
 @app.get("/get_weight_version")

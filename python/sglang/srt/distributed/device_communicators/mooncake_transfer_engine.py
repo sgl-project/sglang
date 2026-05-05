@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+import threading
 from typing import List, Optional
 
 from sglang.srt.environ import envs
@@ -10,6 +11,14 @@ logger = logging.getLogger(__name__)
 
 # Module-level shared engine instance, set by init_mooncake_transfer_engine().
 _mooncake_transfer_engine: Optional["MooncakeTransferEngine"] = None
+
+# Serialization locks for ibv_reg_mr workaround on M2's SR-IOV VF IB devices.
+# nvidia-peermem's page callback segfaults under concurrent GPU memory registration
+# from multiple IB contexts. Sequential registration works on all 8 HCAs.
+# See LLM360/RL360 docs/gateway-smg-version-drift.md and reproducer scripts at
+# /mnt/weka/shrd/k2pta/rl360/ibv_reg_mr_stress.py for the diagnosis.
+_ibv_reg_lock = threading.Lock()  # serializes register/batch_register calls
+_init_lock = threading.Lock()  # serializes engine initialization
 
 
 def get_ib_devices_for_gpu(ib_device_str: Optional[str], gpu_id: int) -> Optional[str]:
@@ -123,7 +132,8 @@ class MooncakeTransferEngine:
 
     def register(self, ptr, length):
         try:
-            ret_value = self.engine.register_memory(ptr, length)
+            with _ibv_reg_lock:
+                ret_value = self.engine.register_memory(ptr, length)
         except Exception:
             # Mark register as failed
             ret_value = -1
@@ -144,7 +154,8 @@ class MooncakeTransferEngine:
     def batch_register(self, ptrs: List[int], lengths: List[int]) -> int:
         """Batch register multiple memory regions."""
         try:
-            ret_value = self.engine.batch_register_memory(ptrs, lengths)
+            with _ibv_reg_lock:
+                ret_value = self.engine.batch_register_memory(ptrs, lengths)
         except Exception:
             # Mark batch register as failed
             ret_value = -1
@@ -273,12 +284,13 @@ def init_mooncake_transfer_engine(
     mooncake transfer is needed.
     """
     global _mooncake_transfer_engine
-    if _mooncake_transfer_engine is not None:
+    with _init_lock:
+        if _mooncake_transfer_engine is not None:
+            return _mooncake_transfer_engine
+        _mooncake_transfer_engine = MooncakeTransferEngine(
+            hostname=hostname, gpu_id=gpu_id, ib_device=ib_device
+        )
         return _mooncake_transfer_engine
-    _mooncake_transfer_engine = MooncakeTransferEngine(
-        hostname=hostname, gpu_id=gpu_id, ib_device=ib_device
-    )
-    return _mooncake_transfer_engine
 
 
 def get_mooncake_transfer_engine() -> Optional[MooncakeTransferEngine]:

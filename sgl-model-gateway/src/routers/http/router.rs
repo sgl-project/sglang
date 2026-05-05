@@ -541,6 +541,11 @@ impl Router {
                 .post(format!("{}{}", worker_url_prefix, route))
                 .json(&json_val)
         } else {
+            if tracing::enabled!(tracing::Level::DEBUG) {
+                if let Ok(body_str) = serde_json::to_string(typed_req) {
+                    debug!(target: "smg::tito_debug", "Forwarding typed request body to worker: {}", body_str);
+                }
+            }
             self.client
                 .post(format!("{}{}", worker_url, route))
                 .json(typed_req) // Use json() directly with typed request
@@ -583,6 +588,9 @@ impl Router {
 
             let response = match res.bytes().await {
                 Ok(body) => {
+                    if tracing::enabled!(tracing::Level::DEBUG) {
+                        debug!(target: "smg::tito_debug", "Response body from worker: {}", String::from_utf8_lossy(&body));
+                    }
                     let mut response = Response::new(Body::from(body));
                     *response.status_mut() = status;
                     *response.headers_mut() = response_headers;

@@ -337,6 +337,74 @@ class TestModelSerialization(unittest.TestCase):
         self.assertEqual(data["choices"][0]["hidden_states"], [0.1, 0.2, 0.3])
 
 
+class TestCompletionTokenIds(unittest.TestCase):
+    """Cover the token-in-token-out (TITO) response-side additions:
+
+    * `return_completion_token_ids` on `ChatCompletionRequest` (flag default False).
+    * `completion_token_ids` on `ChatCompletionResponseChoice` (Optional[List[int]]).
+    * `_serialize` drops the field when None, keeps it when populated.
+    """
+
+    def test_request_accepts_return_completion_token_ids_flag(self):
+        req = ChatCompletionRequest(
+            model="test-model",
+            messages=[{"role": "user", "content": "hi"}],
+            return_completion_token_ids=True,
+        )
+        self.assertTrue(req.return_completion_token_ids)
+
+    def test_request_flag_defaults_false(self):
+        req = ChatCompletionRequest(
+            model="test-model",
+            messages=[{"role": "user", "content": "hi"}],
+        )
+        self.assertFalse(req.return_completion_token_ids)
+
+    def test_response_choice_accepts_completion_token_ids(self):
+        choice = ChatCompletionResponseChoice(
+            index=0,
+            message=ChatMessage(role="assistant", content="ok"),
+            finish_reason="stop",
+            completion_token_ids=[10, 20, 30],
+        )
+        self.assertEqual(choice.completion_token_ids, [10, 20, 30])
+
+    def test_completion_token_ids_dropped_when_none(self):
+        """_serialize pops completion_token_ids when None, mirroring the
+        existing behavior for hidden_states and prompt_token_ids."""
+        choice = ChatCompletionResponseChoice(
+            index=0,
+            message=ChatMessage(role="assistant", content="ok"),
+            finish_reason="stop",
+            completion_token_ids=None,
+        )
+        response = ChatCompletionResponse(
+            id="test-id",
+            model="test-model",
+            choices=[choice],
+            usage=UsageInfo(prompt_tokens=3, completion_tokens=1, total_tokens=4),
+        )
+        data = response.model_dump()
+        self.assertNotIn("completion_token_ids", data["choices"][0])
+
+    def test_completion_token_ids_kept_when_set(self):
+        choice = ChatCompletionResponseChoice(
+            index=0,
+            message=ChatMessage(role="assistant", content="ok"),
+            finish_reason="stop",
+            completion_token_ids=[10, 20, 30],
+        )
+        response = ChatCompletionResponse(
+            id="test-id",
+            model="test-model",
+            choices=[choice],
+            usage=UsageInfo(prompt_tokens=3, completion_tokens=3, total_tokens=6),
+        )
+        data = response.model_dump()
+        self.assertIn("completion_token_ids", data["choices"][0])
+        self.assertEqual(data["choices"][0]["completion_token_ids"], [10, 20, 30])
+
+
 class TestValidationEdgeCases(unittest.TestCase):
     """Test edge cases and validation scenarios"""
 
