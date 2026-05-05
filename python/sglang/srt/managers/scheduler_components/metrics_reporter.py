@@ -57,9 +57,18 @@ class PrefillStats:
 
     log_input_tokens: int
     log_hit_tokens: int
-    new_token_ratio: float
-    num_running_reqs: QueueCount
-    num_new_seqs: int  # len(can_run_list)
+
+    # Detailed prefix-cache hit split.
+    # log_hit_tokens should equal:
+    #   log_hit_tokens_device + log_hit_tokens_host + log_hit_tokens_storage
+    # when storage accounting is enabled. Without L3 storage, storage is 0.
+    log_hit_tokens_device: int = 0
+    log_hit_tokens_host: int = 0
+    log_hit_tokens_storage: int = 0
+
+    new_token_ratio: float = 0.0
+    num_running_reqs: QueueCount = None
+    num_new_seqs: int = 0  # len(can_run_list)
     reprocessed_log_input_tokens: int = 0
     reprocessed_log_hit_tokens: int = 0
     num_pending_tokens: int = 0
@@ -77,6 +86,11 @@ class PrefillStats:
             log_hit_tokens=adder.log_hit_tokens,
             reprocessed_log_input_tokens=adder.reprocessed_log_input_tokens,
             reprocessed_log_hit_tokens=adder.reprocessed_log_hit_tokens,
+            log_hit_tokens_device=getattr(
+                adder, "log_hit_tokens_device", adder.log_hit_tokens
+            ),
+            log_hit_tokens_host=getattr(adder, "log_hit_tokens_host", 0),
+            log_hit_tokens_storage=getattr(adder, "log_hit_tokens_storage", 0),
             new_token_ratio=adder.new_token_ratio,
             num_running_reqs=QueueCount.from_reqs(
                 running_reqs, enable_priority_scheduling
@@ -538,11 +552,25 @@ class SchedulerMetricsReporter:
         )
         iter_msg = f" [{batch_iter}]" if LOG_FORWARD_ITERS else ""
 
+        cache_split_msg = (
+            f"#cached-token-device: {prefill_stats.log_hit_tokens_device}, "
+            f"#cached-token-host: {prefill_stats.log_hit_tokens_host}, "
+        )
+
+        if (
+            getattr(self, "enable_hicache_storage", False)
+            or prefill_stats.log_hit_tokens_storage > 0
+        ):
+            cache_split_msg += (
+                f"#cached-token-storage: {prefill_stats.log_hit_tokens_storage}, "
+            )
+
         msg = (
             f"Prefill batch{iter_msg}, "
             f"#new-seq: {prefill_stats.num_new_seqs}, "
             f"#new-token: {prefill_stats.log_input_tokens}, "
             f"#cached-token: {prefill_stats.log_hit_tokens}, "
+            f"{cache_split_msg}"
             f"{token_usage_msg}"
             f"#running-req: {prefill_stats.num_running_reqs.total}, "
             f"#queue-req: {len(self.scheduler.waiting_queue)}, "

@@ -462,8 +462,15 @@ class PrefillAdder:
         self.can_run_list = []
         self.preempt_list = []
         self.new_chunked_req = None
+
         self.log_hit_tokens = 0
+
         self.reprocessed_log_hit_tokens = 0
+
+        self.log_hit_tokens_device = 0
+        self.log_hit_tokens_host = 0
+        self.log_hit_tokens_storage = 0
+
         # TODO(lsyin): report the real input tokens excluding page alignment
         self.log_input_tokens = 0
         self.reprocessed_log_input_tokens = 0
@@ -612,6 +619,10 @@ class PrefillAdder:
         extend_input_len: int,
         max_new_tokens: int,
         retracted_stain: bool,
+        *,
+        device_hit_tokens: Optional[int] = None,
+        host_hit_tokens: int = 0,
+        storage_hit_tokens: int = 0,
     ):
         # TODO(lsyin): check this workaround logic, which only ensures the prefill will not out of memory, and may be too conservative
         extend_input_len = self.ceil_paged_tokens(extend_input_len)
@@ -638,6 +649,15 @@ class PrefillAdder:
             self.reprocessed_log_hit_tokens += prefix_len
             self.reprocessed_log_input_tokens += extend_input_len
 
+        # New split. Default keeps old call sites correct: if nobody passes a
+        # split, assume all cached tokens are device/L1 hits.
+        if device_hit_tokens is None:
+            device_hit_tokens = prefix_len
+
+        self.log_hit_tokens_device += int(device_hit_tokens)
+        self.log_hit_tokens_host += int(host_hit_tokens)
+        self.log_hit_tokens_storage += int(storage_hit_tokens)
+
     def _get_dllm_remain_tokens(self) -> int:
         _rem_tokens = min(
             self.rem_dllm_tokens,
@@ -649,7 +669,15 @@ class PrefillAdder:
 
         return _rem_tokens
 
-    def _add_dllm_req(self, req: Req, prefix_len: int):
+    def _add_dllm_req(
+        self,
+        req: Req,
+        prefix_len: int,
+        *,
+        device_hit_tokens: Optional[int] = None,
+        host_hit_tokens: int = 0,
+        storage_hit_tokens: int = 0,
+    ):
         # FIXME: consider the case when rem_dllm_tokens < dllm_block_size,
         # the diffusion unmask process may have some problems
         # Make sure at least one page is available
@@ -663,7 +691,15 @@ class PrefillAdder:
 
         self.can_run_list.append(req)
 
-        self._update_prefill_budget(prefix_len, trunc_len, 0, req.retracted_stain)
+        self._update_prefill_budget(
+            prefix_len,
+            trunc_len,
+            0,
+            req.retracted_stain,
+            device_hit_tokens=device_hit_tokens,
+            host_hit_tokens=host_hit_tokens,
+            storage_hit_tokens=storage_hit_tokens,
+        )
 
     def _req_inc_lock_ref(self, req: Req):
         result = self.tree_cache.inc_lock_ref(req.last_node)
@@ -907,6 +943,35 @@ class PrefillAdder:
         real_input_tokens = self.ceil_paged_tokens(real_input_tokens)
         prefix_len = len(req.prefix_indices)
 
+        # Split cached prefix hits by source before L2 load-back mutates
+        # req.prefix_indices.
+        device_hit_tokens = len(req.prefix_indices)
+        host_hit_tokens_raw = int(getattr(req, "host_hit_length", 0) or 0)
+        storage_hit_tokens = int(getattr(req, "storage_hit_length", 0) or 0)
+
+        # If L3 storage is enabled, storage hits are usually materialized into the
+        # host tier before match/load-back. Keep the accounting mutually exclusive:
+        #   total cached = device + host + storage
+        # For pure L1/L2 HiCache, storage_hit_tokens is 0.
+        storage_hit_tokens = min(storage_hit_tokens, host_hit_tokens_raw)
+        host_hit_tokens = host_hit_tokens_raw - storage_hit_tokens
+
+        if device_hit_tokens + host_hit_tokens + storage_hit_tokens != prefix_len:
+            logger.warning(
+                "Cached-token split mismatch: total=%d, device=%d, host=%d, "
+                "storage=%d, rid=%s",
+                prefix_len,
+                device_hit_tokens,
+                host_hit_tokens,
+                storage_hit_tokens,
+                req.rid,
+            )
+
+        # Cache the split hit tokens in the request
+        req.cached_tokens_device = device_hit_tokens
+        req.cached_tokens_host = host_hit_tokens
+        req.cached_tokens_storage = storage_hit_tokens
+
         if total_tokens >= self.rem_total_tokens:
             return AddReqResult.NO_TOKEN
 
@@ -973,7 +1038,13 @@ class PrefillAdder:
                     truncation_align_size is None
                 ), "truncation_align_size is not supported for dllm prefill"
 
-                self._add_dllm_req(req, prefix_len)
+                self._add_dllm_req(
+                    req,
+                    prefix_len,
+                    device_hit_tokens=device_hit_tokens,
+                    host_hit_tokens=host_hit_tokens,
+                    storage_hit_tokens=storage_hit_tokens,
+                )
                 self._req_inc_lock_ref(req)
             elif self.rem_chunk_tokens is None or input_tokens <= self.rem_chunk_tokens:
                 # Non-chunked prefill — the whole sequence is committed this iter.
@@ -991,6 +1062,9 @@ class PrefillAdder:
                         CLIP_MAX_NEW_TOKENS,
                     ),
                     req.retracted_stain,
+                    device_hit_tokens=device_hit_tokens,
+                    host_hit_tokens=host_hit_tokens,
+                    storage_hit_tokens=storage_hit_tokens,
                 )
             else:
                 # Make sure at least one page is available
@@ -1027,7 +1101,13 @@ class PrefillAdder:
 
                 self._req_inc_lock_ref(req)
                 self._update_prefill_budget(
-                    prefix_len, trunc_len, 0, req.retracted_stain
+                    prefix_len,
+                    trunc_len,
+                    0,
+                    req.retracted_stain,
+                    device_hit_tokens=device_hit_tokens,
+                    host_hit_tokens=host_hit_tokens,
+                    storage_hit_tokens=storage_hit_tokens,
                 )
 
         return self.budget_state()
