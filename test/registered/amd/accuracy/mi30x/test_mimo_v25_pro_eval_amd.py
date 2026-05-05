@@ -1,17 +1,20 @@
 """AMD MiMo-V2.5-Pro GSM8K Completion Evaluation Test (8-GPU)
 
-Tests XiaomiMiMo/MiMo-V2.5-Pro (1.02T MoE, 42B active, FP8) with TP=8 + EP=8
-configuration using the few-shot completion benchmark on MI325/MI300X.
+Tests XiaomiMiMo/MiMo-V2.5-Pro (1.02T MoE, 42B active, FP8) with TP=8 +
+multi-layer EAGLE MTP using the few-shot completion benchmark on MI325/MI300X.
 
 The model uses the native SGLang ``MiMoV2ForCausalLM`` architecture with hybrid
 attention (interleaved sliding-window + full-attention layers, head_dim=192,
-GQA ratio 16). On AMD HIP the default ``aiter`` backend handles both attention
-variants; ``--ep-size 8`` distributes the 384 routed experts across the
-8 GPUs and ``--swa-full-tokens-ratio`` keeps the KV-cache footprint within the
-192 GB / 256 GB HBM budget. MiMo emits ``<think>...</think>`` blocks, so we
-enable ``--reasoning-parser mimo`` and use the GSM8K few-shot completion
-harness (which extracts the trailing number after the reasoning block) as the
-accuracy signal.
+GQA ratio 16). Server args follow AMD's published Day-0 SGLang deployment
+recipe for MiMo-V2.5-Pro on Instinct GPUs:
+
+  https://www.amd.com/en/developer/resources/technical-articles/2026/day-0-support-for-xiaomi-mimo-v2-5-pro-on-amd-instinct-gpus-.html
+
+Key choices from that recipe: ``--attention-backend triton`` (the
+AMD-validated backend for this model on Instinct), no expert parallelism,
+``--disable-radix-cache``, large chunked prefill (128 K), and the SpecV2
+multi-layer EAGLE proposer (``SGLANG_ENABLE_SPEC_V2=1``). The MiMo MTP weights
+ship in the checkpoint, so EAGLE is part of the AMD-validated path.
 
 Registry: nightly-amd-accuracy-8-gpu-mimo-v25-pro suite
 """
@@ -76,27 +79,40 @@ MIMO_V25_PRO_MODELS = [
         tp_size=8,
         accuracy_threshold=0.90,
         timeout=5400,
-        variant="TP8+EP8",
+        variant="TP8+EAGLE",
+        # Server args mirror AMD's published Day-0 SGLang recipe for
+        # MiMo-V2.5-Pro on Instinct GPUs (triton attention, no expert
+        # parallelism, multi-layer EAGLE MTP, large chunked prefill).
+        # Source: https://www.amd.com/en/developer/resources/technical-articles/2026/day-0-support-for-xiaomi-mimo-v2-5-pro-on-amd-instinct-gpus-.html
         other_args=[
-            "--ep-size",
-            "8",
             "--trust-remote-code",
             "--attention-backend",
-            "aiter",
+            "triton",
+            "--disable-radix-cache",
             "--mem-fraction-static",
-            "0.85",
+            "0.8",
             "--chunked-prefill-size",
-            "16384",
-            "--swa-full-tokens-ratio",
-            "0.3",
-            "--reasoning-parser",
-            "mimo",
-            "--model-loader-extra-config",
-            '{"enable_multithread_load": true}',
+            "131072",
+            "--max-running-requests",
+            "64",
+            "--speculative-algorithm",
+            "EAGLE",
+            "--speculative-num-steps",
+            "3",
+            "--speculative-eagle-topk",
+            "1",
+            "--speculative-num-draft-tokens",
+            "4",
+            "--enable-multi-layer-eagle",
             "--watchdog-timeout",
             "1200",
+            "--model-loader-extra-config",
+            '{"enable_multithread_load": true}',
         ],
-        env_vars={"SGLANG_USE_AITER": "1"},
+        env_vars={
+            "SGLANG_USE_AITER": "1",
+            "SGLANG_ENABLE_SPEC_V2": "1",
+        },
     ),
 ]
 

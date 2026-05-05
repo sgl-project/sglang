@@ -1,11 +1,18 @@
 """MI35x MiMo-V2.5-Pro GSM8K Completion Evaluation Test (8-GPU)
 
-Tests XiaomiMiMo/MiMo-V2.5-Pro (1.02T MoE, 42B active, FP8) with TP=8 + EP=8
-configuration using the few-shot completion benchmark on MI355X (gfx950).
+Tests XiaomiMiMo/MiMo-V2.5-Pro (1.02T MoE, 42B active, FP8) with TP=8 +
+multi-layer EAGLE MTP using the few-shot completion benchmark on MI355X
+(gfx950, 288 GB HBM3e).
 
-Mirrors the MI30x file (`test_mimo_v25_pro_eval_amd.py`) with the standard
-MI35x deltas: longer ``est_time``/``timeout`` budget and the suite name
-``nightly-amd-accuracy-8-gpu-mi35x-mimo-v25-pro``.
+Server args follow AMD's published Day-0 SGLang deployment recipe for
+MiMo-V2.5-Pro on Instinct GPUs (the recipe is targeted at MI355X):
+
+  https://www.amd.com/en/developer/resources/technical-articles/2026/day-0-support-for-xiaomi-mimo-v2-5-pro-on-amd-instinct-gpus-.html
+
+Mirrors the MI30x file (``test_mimo_v25_pro_eval_amd.py``) with the standard
+MI35x deltas: longer ``est_time``/``timeout`` budget, the suite name
+``nightly-amd-accuracy-8-gpu-mi35x-mimo-v25-pro``, and the ``HF_HOME`` /
+``HF_HUB_CACHE`` overrides for the MI35x runner's shared model cache.
 
 Registry: nightly-amd-accuracy-8-gpu-mi35x-mimo-v25-pro suite
 """
@@ -74,27 +81,40 @@ MI35X_MIMO_V25_PRO_MODELS = [
         tp_size=8,
         accuracy_threshold=0.90,
         timeout=7200,
-        variant="TP8+EP8",
+        variant="TP8+EAGLE",
+        # Server args mirror AMD's published Day-0 SGLang recipe for
+        # MiMo-V2.5-Pro on Instinct GPUs (triton attention, no expert
+        # parallelism, multi-layer EAGLE MTP, large chunked prefill).
+        # Source: https://www.amd.com/en/developer/resources/technical-articles/2026/day-0-support-for-xiaomi-mimo-v2-5-pro-on-amd-instinct-gpus-.html
         other_args=[
-            "--ep-size",
-            "8",
             "--trust-remote-code",
             "--attention-backend",
-            "aiter",
+            "triton",
+            "--disable-radix-cache",
             "--mem-fraction-static",
-            "0.85",
+            "0.8",
             "--chunked-prefill-size",
-            "16384",
-            "--swa-full-tokens-ratio",
-            "0.3",
-            "--reasoning-parser",
-            "mimo",
-            "--model-loader-extra-config",
-            '{"enable_multithread_load": true}',
+            "131072",
+            "--max-running-requests",
+            "64",
+            "--speculative-algorithm",
+            "EAGLE",
+            "--speculative-num-steps",
+            "3",
+            "--speculative-eagle-topk",
+            "1",
+            "--speculative-num-draft-tokens",
+            "4",
+            "--enable-multi-layer-eagle",
             "--watchdog-timeout",
             "1200",
+            "--model-loader-extra-config",
+            '{"enable_multithread_load": true}',
         ],
-        env_vars={"SGLANG_USE_AITER": "1"},
+        env_vars={
+            "SGLANG_USE_AITER": "1",
+            "SGLANG_ENABLE_SPEC_V2": "1",
+        },
     ),
 ]
 
