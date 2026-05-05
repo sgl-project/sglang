@@ -755,8 +755,8 @@
         },
         "joyai_image_edit_ti2i": {
             "stages_ms": {
-                "InputValidationStage": 32.2,
-                "ImageEncodingStage": 948.69,
+                "InputValidationStage": 29.6,
+                "ImageEncodingStage": 740.87,
                 "ImageVAEEncodingStage": 70.47,
                 "LatentPreparationStage": 0.17,
                 "TimestepPreparationStage": 20.66,
@@ -1963,12 +1963,12 @@
         "qwen_image_edit_2511_ti2i": {
             "stages_ms": {
                 "DecodingStage": 19.39,
-                "InputValidationStage": 55.64,
+                "InputValidationStage": 54.97,
                 "DenoisingStage": 22253.55,
                 "ImageEncodingStage": 733.67,
-                "LatentPreparationStage": 0.19,
+                "LatentPreparationStage": 0.13,
                 "TimestepPreparationStage": 12.36,
-                "ImageVAEEncodingStage": 96.46
+                "ImageVAEEncodingStage": 84.65
             },
             "denoise_step_ms": {
                 "0": 416.33,
@@ -2012,7 +2012,7 @@
                 "38": 557.72,
                 "39": 559.24
             },
-            "expected_e2e_ms": 23525.28,
+            "expected_e2e_ms": 23405.08,
             "expected_avg_denoise_ms": 556.18,
             "expected_median_denoise_ms": 560.34,
             "estimated_full_test_time_s": 143.7
