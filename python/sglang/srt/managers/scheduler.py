@@ -25,6 +25,8 @@ from dataclasses import dataclass
 from http import HTTPStatus
 from typing import Any, Deque, Dict, List, Optional, Tuple, Union
 
+import msgspec
+
 from sglang.srt.utils.common import suppress_noisy_warnings
 
 suppress_noisy_warnings()
@@ -145,6 +147,8 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromIPCReqInput,
     UpdateWeightsFromTensorReqInput,
+    sock_recv,
+    sock_send,
 )
 from sglang.srt.managers.mm_utils import (
     has_shm_features,
@@ -1657,7 +1661,7 @@ class Scheduler(
                     try:
                         if self.recv_limit_reached(len(recv_reqs)):
                             break
-                        recv_req = self.recv_from_tokenizer.recv_pyobj(zmq.NOBLOCK)
+                        recv_req = sock_recv(self.recv_from_tokenizer, zmq.NOBLOCK)
                     except zmq.ZMQError:
                         break
                     recv_reqs.append(recv_req)
@@ -1666,7 +1670,7 @@ class Scheduler(
                     try:
                         if self.recv_limit_reached(len(recv_reqs)):
                             break
-                        recv_rpc = self.recv_from_rpc.recv_pyobj(zmq.NOBLOCK)
+                        recv_rpc = sock_recv(self.recv_from_rpc, zmq.NOBLOCK)
                     except zmq.ZMQError:
                         break
                     recv_reqs.append(recv_rpc)
@@ -1842,7 +1846,7 @@ class Scheduler(
                     self.send_to_tokenizer.send_output(output, recv_req)
                 else:
                     if self.recv_from_rpc is not None:
-                        self.recv_from_rpc.send_pyobj(output)
+                        sock_send(self.recv_from_rpc, output)
 
         self._check_pending_flush()
         if self.external_corpus_manager is not None:
@@ -3815,21 +3819,20 @@ class SenderWrapper:
 
     def send_output(
         self,
-        output: Union[BaseReq, BaseBatchReq],
-        recv_obj: Optional[Union[BaseReq, BaseBatchReq]] = None,
+        output: Union[BaseReq, BaseBatchReq, msgspec.Struct],
+        recv_obj: Optional[Union[BaseReq, BaseBatchReq, msgspec.Struct]] = None,
     ):
         if self.socket is None:
             return
 
         if (
-            isinstance(recv_obj, BaseReq)
-            and recv_obj.http_worker_ipc is not None
-            and output.http_worker_ipc is None
+            getattr(recv_obj, "http_worker_ipc", None) is not None
+            and getattr(output, "http_worker_ipc", None) is None
         ):
             # handle communicator reqs for multi-http worker case
             output.http_worker_ipc = recv_obj.http_worker_ipc
 
-        self.socket.send_pyobj(output)
+        sock_send(self.socket, output)
 
 
 def dispatch_event_loop(scheduler: Scheduler):

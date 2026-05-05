@@ -6,6 +6,7 @@ import zmq.asyncio
 
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.srt.managers.io_struct import sock_recv, sock_send
 
 logger = init_logger(__name__)
 
@@ -78,8 +79,8 @@ class SchedulerClient:
     def forward(self, batch: Any) -> Any:
         """Sends a batch or request to the scheduler and waits for the response."""
         try:
-            self.scheduler_socket.send_pyobj(batch)
-            output_batch = self.scheduler_socket.recv_pyobj()
+            sock_send(self.scheduler_socket, batch)
+            output_batch = sock_recv(self.scheduler_socket)
             return output_batch
         except zmq.error.Again:
             logger.error("Timeout waiting for response from scheduler.")
@@ -101,8 +102,8 @@ class SchedulerClient:
 
         try:
             ping_socket.connect(endpoint)
-            ping_socket.send_pyobj({"method": "ping"})
-            ping_socket.recv_pyobj()
+            sock_send(ping_socket, {"method": "ping"})
+            sock_recv(ping_socket)
             return True
         except zmq.error.Again:
             return False

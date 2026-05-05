@@ -570,6 +570,9 @@ class Envs:
     SGLANG_PLATFORM = EnvStr("")
     SGLANG_PLUGINS = EnvStr("")
 
+    # Msgpck IPC object support
+    SGLANG_IPC_USE_MSGPACK = EnvBool(False)
+
 
 envs = Envs()
 EnvField._allow_set_name = False

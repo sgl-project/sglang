@@ -19,6 +19,7 @@ processes (TokenizerManager, DetokenizerManager, Scheduler).
 from __future__ import annotations
 
 import copy
+import pickle
 import uuid
 from abc import ABC
 from collections import Counter
@@ -1885,11 +1886,6 @@ class LoRAUpdateOutput(BaseReq):
     loaded_adapters: Optional[Dict[str, LoRARef]] = None
 
 
-LoadLoRAAdapterReqOutput = UnloadLoRAAdapterReqOutput = (
-    LoadLoRAAdapterFromTensorsReqOutput
-) = LoRAUpdateOutput
-
-
 class BlockReqType(Enum):
     BLOCK = 1
     UNBLOCK = 2
@@ -2115,3 +2111,11 @@ def _check_all_req_types():
 
 
 _check_all_req_types()
+
+
+def serialize(obj: Union[BaseReq, BaseBatchReq]) -> bytes:
+    return pickle.dumps(obj)
+
+
+def deserialize(data: bytes) -> Union[BaseReq, BaseBatchReq]:
+    return pickle.loads(data)

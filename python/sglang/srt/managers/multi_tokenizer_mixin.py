@@ -43,6 +43,10 @@ from sglang.srt.managers.io_struct import (
     BatchEmbeddingOutput,
     BatchStrOutput,
     BatchTokenIDOutput,
+    sock_recv,
+    sock_recv_async,
+    sock_send,
+    sock_send_async,
 )
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.server_args import PortArgs, ServerArgs
@@ -83,7 +87,7 @@ class SocketMapping:
 
         if ipc_name not in self._mapping:
             self._register_ipc_mapping(ipc_name, is_tokenizer=False)
-        self._mapping[ipc_name].send_pyobj(output)
+        sock_send(self._mapping[ipc_name], output)
 
 
 def _extract_field_by_index(
@@ -299,7 +303,7 @@ class MultiHttpWorkerDetokenizerMixin:
         """The event loop that handles requests, for multi multi-http-worker mode"""
         self.socket_mapping = SocketMapping()
         while True:
-            recv_obj = self.recv_from_scheduler.recv_pyobj()
+            recv_obj = sock_recv(self.recv_from_scheduler)
             output = self._request_dispatcher(recv_obj)
             if output is None:
                 continue
@@ -350,14 +354,14 @@ class MultiTokenizerRouter:
 
     async def router_worker_obj(self):
         while True:
-            recv_obj = await self.receive_from_worker.recv_pyobj()
-            await self.send_to_scheduler.send_pyobj(recv_obj)
+            recv_obj = await sock_recv_async(self.receive_from_worker)
+            await sock_send_async(self.send_to_scheduler, recv_obj)
 
     async def handle_loop(self):
         # special reqs will recv from scheduler, need to route to right worker
         self.socket_mapping = SocketMapping()
         while True:
-            recv_obj = await self.recv_from_detokenizer.recv_pyobj()
+            recv_obj = await sock_recv_async(self.recv_from_detokenizer)
             await self._distribute_result_to_workers(recv_obj)
 
     async def _distribute_result_to_workers(self, recv_obj):
@@ -504,14 +508,3 @@ def monkey_patch_uvicorn_multiprocessing(timeout: float = 10):
         logger.warning(
             "uvicorn.supervisors.multiprocess not found, skipping monkey patch"
         )
-
-
-class SenderWrapper:
-    def __init__(self, port_args: PortArgs, send_to_scheduler: zmq.Socket):
-        self.port_args = port_args
-        self.send_to_scheduler = send_to_scheduler
-
-    def send_pyobj(self, obj):
-        if isinstance(obj, BaseReq):
-            obj.http_worker_ipc = self.port_args.tokenizer_ipc_name
-        self.send_to_scheduler.send_pyobj(obj)

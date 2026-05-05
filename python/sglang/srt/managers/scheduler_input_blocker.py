@@ -99,8 +99,8 @@ class _State(Enum):
 
 @contextmanager
 def input_blocker_guard_region(send_to_scheduler):
-    send_to_scheduler.send_pyobj(BlockReqInput(BlockReqType.BLOCK))
+    send_to_scheduler.send_obj(BlockReqInput(BlockReqType.BLOCK))
     try:
         yield
     finally:
-        send_to_scheduler.send_pyobj(BlockReqInput(BlockReqType.UNBLOCK))
+        send_to_scheduler.send_obj(BlockReqInput(BlockReqType.UNBLOCK))
