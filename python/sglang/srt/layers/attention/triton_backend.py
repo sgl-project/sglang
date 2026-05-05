@@ -1019,13 +1019,9 @@ class TritonAttnBackend(AttentionBackend):
             prefix_kv_indices = self.forward_metadata.kv_indices
             window_start_pos = None
 
-        # For SWA layers, the extend half of unified_kv_indices must live in
-        # SWA-pool index space to match the prefix half and the write-side
-        # in SWAKVPool.set_kv_buffer. Mirror that write-side fast path: prefer
-        # the precomputed pool.swa_loc (set by model_runner.forward and by the
-        # cuda graph runners pre-capture, so the graph reads the same static
-        # buffer that set_kv_buffer wrote to), and only translate as a
-        # fallback when it has not been populated.
+        # For SWA layers, mirror SWAKVPool.set_kv_buffer: read from the
+        # precomputed pool.swa_loc. Translate out_cache_loc to SWA-pool index space
+        # as a fallback when pool.swa_loc is not pre-populated.
         extend_kv_indices = forward_batch.out_cache_loc
         pool = forward_batch.token_to_kv_pool
         if (
