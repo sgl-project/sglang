@@ -12,6 +12,7 @@ from typing import Dict, List, Optional, Set, Tuple, Union
 import numpy as np
 import numpy.typing as npt
 import requests
+import torch.distributed as dist
 import zmq
 from aiohttp import web
 
@@ -351,8 +352,6 @@ class CommonKVManager(BaseKVManager):
         """
         if not self.dist_init_addr:
             return local_port
-
-        import torch.distributed as dist
 
         if not (dist.is_available() and dist.is_initialized()):
             raise RuntimeError(
