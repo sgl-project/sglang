@@ -199,8 +199,10 @@ def _run_mega_routed(
         quant_group_size=32,
     )
 
+    # Allocate at least one row so y has a non-null CUDA data_ptr;
+    # the DeepGEMM tvm-ffi binding rejects nullptr in convert_to_torch_tensor().
     y = torch.empty(
-        (num_tokens, hidden_size),
+        (max(num_tokens, 1), hidden_size),
         dtype=torch.bfloat16,
         device=hidden_states.device,
     )
@@ -215,6 +217,7 @@ def _run_mega_routed(
         activation_clamp=swiglu_limit,
         fast_math=True,
     )
+    y = y[:num_tokens]
 
     if not moe.experts.should_fuse_routed_scaling_factor_in_topk:
         y.mul_(moe.routed_scaling_factor)
