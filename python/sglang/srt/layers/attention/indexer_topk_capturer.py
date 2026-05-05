@@ -1,6 +1,8 @@
 import logging
 from typing import Optional
 
+import numpy as np
+import pybase64
 import torch
 
 from sglang.srt.layers.dp_attention import get_attention_tp_size
@@ -66,6 +68,17 @@ def maybe_capture_indexer_topk(
     if (cap := get_global_indexer_capturer()) is not None:
         cap.capture(layer_id=layer_id, topk_indices=topk_indices)
     return topk_indices
+
+
+def extract_indexer_topk_from_meta_info(data):
+    # Mirrors extract_routed_experts_from_meta_info: indices are returned as
+    # base64-encoded int32 bytes. Caller reshapes to (seqlen-1, num_indexer_layers,
+    # index_topk).
+    indexer_topk_base64 = data["meta_info"].get("indexer_topk", None)
+    indexer_topk = np.frombuffer(
+        pybase64.b64decode(indexer_topk_base64.encode("utf-8")), dtype=np.int32
+    )
+    return indexer_topk
 
 
 def create_indexer_capturer(
