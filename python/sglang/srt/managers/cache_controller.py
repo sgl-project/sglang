@@ -28,6 +28,9 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolName,
     PoolTransfer,
 )
+from sglang.srt.observability.metrics_collector import (
+    HiCacheL1L2TransferMetricsCollector,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
@@ -148,6 +151,18 @@ class HiCacheAck(NamedTuple):
     finish_event: device_module.Event
     node_ids: List[int]
 
+    # Number of KV token slots moved by this merged operation.
+    token_count: int
+
+    # Number of KV blocks moved. For HiCache this should be token_count // page_size.
+    block_count: int
+
+    # Estimated total bytes moved for this operation.
+    byte_count: int
+
+    # Host-side fallback timer start. Used only if device event elapsed_time is unavailable.
+    start_time_ns: int
+
 
 class StorageOperation:
     counter = 0
@@ -225,6 +240,8 @@ class HiCacheController:
         model_name: Optional[str] = None,
         storage_backend_extra_config: Optional[dict] = None,
         enable_storage_metrics: bool = False,
+        enable_metrics: bool = False,
+        extra_metric_labels: Optional[dict[str, str]] = None,
     ):
         self.tp_group = tp_group
         self.attn_cp_group = attn_cp_group
@@ -246,6 +263,28 @@ class HiCacheController:
         self.storage_backend = None
         self.storage_backend_type = None
         self.enable_storage_metrics = enable_storage_metrics
+
+        # init L1/L2 transfer metrics collection (device-host transfers triggered by write/load).
+        self.enable_l1_l2_transfer_metrics = enable_metrics
+        self.hicache_l1_l2_transfer_metrics_collector = None
+
+        self.hicache_l1_l2_transfer_totals = {
+            "offload": {
+                "events": 0,
+                "blocks": 0,
+                "bytes": 0,
+                "xfer_us": 0,
+            },
+            "onboard": {
+                "events": 0,
+                "blocks": 0,
+                "bytes": 0,
+                "xfer_us": 0,
+            },
+        }
+
+        if self.enable_l1_l2_transfer_metrics:
+            self._init_l1_l2_transfer_metrics(extra_metric_labels)
 
         # Draft KV pool support (best-effort piggyback on target L2/L3 ops).
         self.has_draft = False
@@ -692,6 +731,9 @@ class HiCacheController:
         start_event = device_module.Event()
         finish_event = device_module.Event()
 
+        token_count = int(host_indices.numel())
+        start_time_ns = time.perf_counter_ns()
+
         start_event.record()
         with device_module.stream(self.write_stream):
             start_event.wait(self.write_stream)
@@ -714,7 +756,15 @@ class HiCacheController:
             if device_indices.is_cuda:
                 device_indices.record_stream(self.write_stream)
 
-        self.ack_write_queue.append(HiCacheAck(start_event, finish_event, op.node_ids))
+        self.ack_write_queue.append(
+            self._make_hicache_ack(
+                start_event=start_event,
+                finish_event=finish_event,
+                node_ids=op.node_ids,
+                token_count=token_count,
+                start_time_ns=start_time_ns,
+            )
+        )
 
     def load(
         self,
@@ -766,6 +816,10 @@ class HiCacheController:
         )
         self.load_queue.clear()
         producer_event = self.layer_done_counter.events[producer_id]
+
+        token_count = int(host_indices.numel())
+        start_time_ns = time.perf_counter_ns()
+
         producer_event.start_event.record()
 
         with device_module.stream(self.load_stream):
@@ -796,10 +850,12 @@ class HiCacheController:
                 device_indices.record_stream(self.load_stream)
 
         self.ack_load_queue.append(
-            HiCacheAck(
+            self._make_hicache_ack(
                 start_event=producer_event.start_event,
                 finish_event=producer_event.finish_event,
                 node_ids=op.node_ids,
+                token_count=token_count,
+                start_time_ns=start_time_ns,
             )
         )
         return producer_id
@@ -1206,3 +1262,179 @@ class HiCacheController:
 
             except Empty:
                 continue
+
+    def _init_l1_l2_transfer_metrics(
+        self,
+        extra_metric_labels: Optional[dict[str, str]] = None,
+    ) -> None:
+        """Initialize Prometheus metrics for L1<->L2 transfer accounting."""
+
+        from sglang.srt.distributed import (
+            get_tensor_model_parallel_rank,
+            get_tensor_model_parallel_world_size,
+        )
+        from sglang.srt.layers.dp_attention import (
+            get_attention_dp_rank,
+            get_attention_tp_rank,
+            get_attention_tp_size,
+            is_dp_attention_enabled,
+        )
+
+        if is_dp_attention_enabled():
+            tp_rank = get_attention_tp_rank()
+            tp_size = get_attention_tp_size()
+            dp_rank = get_attention_dp_rank()
+        else:
+            tp_rank = get_tensor_model_parallel_rank()
+            tp_size = get_tensor_model_parallel_world_size()
+            dp_rank = 0
+
+        attn_cp_rank, attn_cp_size = self.get_attn_cp_rank_and_size()
+
+        labels = {
+            "tp_rank": str(tp_rank),
+            "tp_size": str(tp_size),
+            "dp_rank": str(dp_rank),
+            "pp_rank": str(self.pp_rank),
+            "pp_size": str(self.pp_size),
+            "attn_cp_rank": str(attn_cp_rank),
+            "attn_cp_size": str(attn_cp_size),
+            "io_backend": str(self.io_backend),
+        }
+
+        if extra_metric_labels:
+            labels.update({k: str(v) for k, v in extra_metric_labels.items()})
+
+        self.hicache_l1_l2_transfer_metrics_collector = (
+            HiCacheL1L2TransferMetricsCollector(labels)
+        )
+
+    def _host_pool_bytes_per_token(self) -> int:
+        """Return bytes per token slot for the host-side KV pools.
+
+        Handles both a normal HostKVCache and HostPoolGroup-style wrappers.
+        """
+        if hasattr(self.mem_pool_host, "entries"):
+            return sum(
+                int(entry.host_pool.size_per_token)
+                for entry in self.mem_pool_host.entries
+            )
+
+        return int(getattr(self.mem_pool_host, "size_per_token", 0))
+
+    def _estimate_l1_l2_transfer_bytes(self, token_count: int) -> int:
+        """Estimate total bytes moved for one L1<->L2 transfer operation."""
+        bytes_per_token = self._host_pool_bytes_per_token()
+        total = int(token_count) * bytes_per_token
+
+        if self.has_draft and self.mem_pool_host_draft is not None:
+            total += int(token_count) * int(
+                getattr(self.mem_pool_host_draft, "size_per_token", 0)
+            )
+
+        return total
+
+    def _make_hicache_ack(
+        self,
+        *,
+        start_event: device_module.Event,
+        finish_event: device_module.Event,
+        node_ids: List[int],
+        token_count: int,
+        start_time_ns: int,
+    ) -> HiCacheAck:
+        block_count = int(token_count) // int(self.page_size)
+        byte_count = self._estimate_l1_l2_transfer_bytes(token_count)
+
+        return HiCacheAck(
+            start_event=start_event,
+            finish_event=finish_event,
+            node_ids=node_ids,
+            token_count=int(token_count),
+            block_count=block_count,
+            byte_count=byte_count,
+            start_time_ns=start_time_ns,
+        )
+
+    def _transfer_elapsed_us(self, ack: HiCacheAck) -> int:
+        """Return transfer duration in microseconds.
+
+        Prefer device event timing. Fall back to host elapsed time for devices/backends
+        that do not expose elapsed_time().
+        """
+        try:
+            return max(0, int(ack.start_event.elapsed_time(ack.finish_event) * 1000))
+        except Exception:
+            return max(0, int((time.perf_counter_ns() - ack.start_time_ns) // 1000))
+
+    def record_l1_l2_transfer_complete(
+        self,
+        *,
+        direction: str,
+        ack: HiCacheAck,
+    ) -> None:
+        """Record logs and Prometheus metrics after a transfer ack completes.
+
+        direction:
+        - "offload": L1 -> L2
+        - "onboard": L2 -> L1
+        """
+        if direction == "offload":
+            action = "Offload"
+            src = "sglang_hicache::L1"
+            dst = "sglang_hicache::L2"
+        elif direction == "onboard":
+            action = "Onboard"
+            src = "sglang_hicache::L2"
+            dst = "sglang_hicache::L1"
+        else:
+            raise ValueError(f"Unknown HiCache L1/L2 transfer direction: {direction}")
+
+        xfer_us = self._transfer_elapsed_us(ack)
+        ts_us = time.time_ns() // 1000
+
+        logger.info(
+            "%s transfer complete ts_us=%d blocks=%d bytes=%d xfer_us=%d "
+            "bandwidth=%.2fGB/s "
+            'src="%s" dst="%s"',
+            action,
+            ts_us,
+            ack.block_count,
+            ack.byte_count,
+            xfer_us,
+            ack.byte_count * 0.001 / xfer_us if xfer_us > 0 else 0,
+            src,
+            dst,
+        )
+
+        if self.hicache_l1_l2_transfer_metrics_collector is not None:
+            self.hicache_l1_l2_transfer_metrics_collector.record_transfer(
+                direction=direction,
+                src=src,
+                dst=dst,
+                blocks=ack.block_count,
+                bytes_=ack.byte_count,
+                xfer_us=xfer_us,
+            )
+
+        totals = self.hicache_l1_l2_transfer_totals[direction]
+        totals["events"] += 1
+        totals["blocks"] += ack.block_count
+        totals["bytes"] += ack.byte_count
+        totals["xfer_us"] += xfer_us
+
+        logger.info(
+            '%s transfer cumulative direction="%s" total_events=%d '
+            "total_blocks=%d total_bytes=%d total_xfer_us=%d "
+            "bandwidth=%.2fGB/s cumulative "
+            'src="%s" dst="%s"',
+            action,
+            direction,
+            totals["events"],
+            totals["blocks"],
+            totals["bytes"],
+            totals["xfer_us"],
+            totals["bytes"] * 0.001 / totals["xfer_us"] if totals["xfer_us"] > 0 else 0,
+            src,
+            dst,
+        )
