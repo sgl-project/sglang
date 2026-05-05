@@ -63,6 +63,9 @@ class RoutedExpertsCapturer:
         self.num_experts_per_tok = model_config.hf_text_config.num_experts_per_tok
 
         server_args = get_global_server_args()
+        # FIXME: spec decoding is not accounted for here. The device buffer can
+        # overflow when max_running_requests * num_verify_tokens exceeds
+        # chunked_prefill_size * dp_size.
         max_batch_size = max(
             server_args.chunked_prefill_size * server_args.dp_size,
             max_running_requests,
