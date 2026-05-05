@@ -132,7 +132,7 @@ class DecodeReqToTokenPool:
         self.device = device
         self.pre_alloc_size = pre_alloc_size
         with memory_saver_adapter.region(tag=GPU_MEMORY_TYPE_KV_CACHE):
-            # +1 row 0 padding; mirrors ReqToTokenPool / KV pool padding slot 0.
+            # +1 padding row at index 0; see ReqToTokenPool for rationale.
             self.req_to_token = torch.zeros(
                 (self._alloc_size, max_context_len),
                 dtype=torch.int32,

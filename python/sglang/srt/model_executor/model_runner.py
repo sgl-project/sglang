@@ -2754,8 +2754,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if self.use_ngram_embedding:
             from sglang.srt.layers.n_gram_embedding import NgramEmbedding
 
-            # Match req_to_token's row count: this table is indexed by
-            # req_pool_idx (incl. padding slot 0).
+            # Sized to mirror req_to_token (indexed by req_pool_idx).
             self.token_table = torch.empty(
                 self.req_to_token_pool.req_to_token.shape[0],
                 self.model_config.context_len,

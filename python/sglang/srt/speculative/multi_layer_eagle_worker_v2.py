@@ -146,8 +146,8 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
 
         self.init_lm_head()
 
-        # Used for KV Cache reversion. Match req_to_token's row count so triton
-        # kernels can index by req_pool_idx (incl. padding slot 0) without OOB.
+        # KV cache reversion buffer; sized to mirror req_to_token (indexed by
+        # req_pool_idx).
         self.req_to_hidden_states_pool = torch.empty(
             (
                 self.req_to_token_pool.req_to_token.shape[0],

@@ -139,10 +139,8 @@ class ReqToTokenPool:
         )
 
         self.size = size
-        # +1 row for padding slot 0 (mirrors KV pool): cuda-graph padded
-        # batches default req_pool_indices to 0, so routing dummies through
-        # unowned slot 0 keeps req_to_token[0, :] zero and downstream writes
-        # harmless.
+        # +1 padding row at index 0: cuda-graph padded batches default
+        # req_pool_indices to 0, so dummy reads/writes land here harmlessly.
         self._alloc_size = size + 1
         self.max_context_len = max_context_len
         self.device = device
