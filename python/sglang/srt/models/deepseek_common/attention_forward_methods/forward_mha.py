@@ -13,6 +13,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.models.deepseek_common.utils import (
     _is_cuda,
     _is_hip,
+    _is_musa,
     _is_npu,
     _use_aiter_gfx95,
 )
@@ -491,7 +492,7 @@ class DeepseekMHAForwardMixin:
         # Temporary for DeepSeek V3/R1 only, but can generalize if needed
         k_shape = (k_nope.shape[0], self.num_local_heads, self.qk_head_dim)
         if (
-            _is_cuda
+            (_is_cuda or _is_musa)
             and (self.num_local_heads == 128)
             and (self.qk_nope_head_dim == 128)
             and (self.qk_rope_head_dim == 64)

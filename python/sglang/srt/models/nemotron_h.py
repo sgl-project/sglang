@@ -51,6 +51,7 @@ from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.topk import TopK
+from sglang.srt.layers.moe.utils import RoutingMethodType
 from sglang.srt.layers.quantization import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
@@ -58,6 +59,12 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     DEFAULT_VOCAB_PADDING_SIZE,
     ParallelLMHead,
     VocabParallelEmbedding,
+)
+from sglang.srt.model_executor.breakable_cuda_graph.breakable_cuda_graph import (
+    eager_on_graph,
+)
+from sglang.srt.model_executor.breakable_cuda_graph.context import (
+    is_in_breakable_cuda_graph,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import (
@@ -184,6 +191,7 @@ class NemotronHMoE(nn.Module):
             activation=config.mlp_hidden_act,
             layer_id=layer_idx,
             is_gated=False,
+            routing_method_type=RoutingMethodType.DeepSeekV3,
         )
         if config.n_shared_experts:
             self.shared_experts = NemotronHMLP(
@@ -429,6 +437,11 @@ class NemotronHMambaDecoderLayer(nn.Module):
         else:
             hidden_states, residual = self.norm(hidden_states, residual)
 
+        if is_in_breakable_cuda_graph():
+            output = torch.empty_like(hidden_states)
+            breakable_nemotron_mamba2_with_output(hidden_states, output, self.layer_id)
+            return output, residual
+
         if is_in_piecewise_cuda_graph():
             output = torch.empty_like(hidden_states)
             nemotron_mamba2_with_output(hidden_states, output, self.layer_id)
@@ -652,6 +665,17 @@ class NemotronHForCausalLM(nn.Module):
     packed_modules_mapping = {
         "qkv_proj": ["q_proj", "k_proj", "v_proj"],
     }
+    supported_lora_modules = [
+        "qkv_proj",
+        "o_proj",
+        "out_proj",
+        "in_proj",
+        "up_proj",
+        "gate_up_proj",
+        "down_proj",
+        "fc1_latent_proj",
+        "fc2_latent_proj",
+    ]
 
     remap_prefix = {"backbone": "model"}
     remap_substr = {
@@ -734,6 +758,100 @@ class NemotronHForCausalLM(nn.Module):
 
     def get_input_embeddings(self) -> VocabParallelEmbedding:
         return self.model.embed_tokens
+
+    def get_stacked_multiply(self, module_name):
+        """Non-gated MoE uses stacked_multiply=1 for gate_up_proj_moe."""
+        if module_name == "gate_up_proj_moe":
+            return 1  # Non-gated: only w1, no w3
+        # Fall back to defaults for everything else
+        from sglang.srt.lora.utils import get_stacked_multiply
+
+        return get_stacked_multiply(module_name)
+
+    def get_hidden_dim(self, module_name, layer_idx):
+        """Return (input_dim, output_dim) for LoRA buffers, per layer type."""
+        config = self.config
+        layer_type = config.layers_block_type[layer_idx]
+        hidden_size = config.hidden_size
+        head_dim = getattr(
+            config, "head_dim", hidden_size // config.num_attention_heads
+        )
+
+        if module_name == "qkv_proj":
+            return (
+                hidden_size,
+                head_dim
+                * (config.num_attention_heads + config.num_key_value_heads * 2),
+            )
+        elif module_name == "o_proj":
+            return (
+                head_dim * config.num_attention_heads,
+                hidden_size,
+            )
+        elif module_name == "out_proj":
+            # Mamba out_proj: RowParallelLinear from mamba_intermediate to hidden_size
+            mamba_intermediate = config.mamba_num_heads * config.mamba_head_dim
+            return mamba_intermediate, hidden_size
+        elif module_name == "gate_up_proj":
+            if layer_type == "mamba":
+                # Mamba in_proj gate component: output = mamba_num_heads * mamba_head_dim
+                mamba_intermediate = config.mamba_num_heads * config.mamba_head_dim
+                return hidden_size, mamba_intermediate * 2
+            elif layer_type == "moe":
+                # Shared expert: only has up_proj (no gate), but gets stacked
+                shared_inter = (
+                    config.moe_shared_expert_intermediate_size * config.n_shared_experts
+                )
+                return hidden_size, shared_inter * 2
+            else:
+                # MLP layer
+                return hidden_size, config.intermediate_size * 2
+        elif module_name == "up_proj":
+            if layer_type == "moe":
+                shared_inter = (
+                    config.moe_shared_expert_intermediate_size * config.n_shared_experts
+                )
+                return hidden_size, shared_inter
+            else:
+                return hidden_size, config.intermediate_size
+        elif module_name == "down_proj":
+            if layer_type == "moe":
+                shared_inter = (
+                    config.moe_shared_expert_intermediate_size * config.n_shared_experts
+                )
+                return shared_inter, hidden_size
+            else:
+                return config.intermediate_size, hidden_size
+        elif module_name == "in_proj":
+            # Mamba in_proj: gate_proj + x_proj, each mamba_intermediate wide
+            mamba_intermediate = config.mamba_num_heads * config.mamba_head_dim
+            return hidden_size, mamba_intermediate * 2
+        elif module_name == "x_proj":
+            # Mamba x_proj: projects from hidden_size to mamba_intermediate
+            mamba_intermediate = config.mamba_num_heads * config.mamba_head_dim
+            return hidden_size, mamba_intermediate
+        elif module_name == "gate_up_proj_moe":
+            # Non-gated MoE: only w1, no w3. stacked_multiply=1.
+            # For latent MoE, experts operate in moe_latent_size space.
+            moe_hidden = getattr(config, "moe_latent_size", None) or hidden_size
+            return moe_hidden, config.moe_intermediate_size
+        elif module_name == "down_proj_moe":
+            moe_hidden = getattr(config, "moe_latent_size", None) or hidden_size
+            return config.moe_intermediate_size, moe_hidden
+        elif module_name == "fc1_latent_proj":
+            moe_latent = getattr(config, "moe_latent_size", None) or hidden_size
+            return hidden_size, moe_latent
+        elif module_name == "fc2_latent_proj":
+            moe_latent = getattr(config, "moe_latent_size", None) or hidden_size
+            return moe_latent, hidden_size
+        elif module_name == "embed_tokens":
+            return config.vocab_size, hidden_size
+        elif module_name == "lm_head":
+            return hidden_size, config.vocab_size
+        else:
+            raise NotImplementedError(
+                f"get_hidden_dim not implemented for {module_name}"
+            )
 
     @torch.no_grad()
     def forward(
@@ -912,4 +1030,10 @@ def nemotron_mamba2_with_output(
 
     # Copy result back; output may be larger (padded) so only fill actual tokens
     output[:num_actual_tokens].view(ret.shape).copy_(ret)
-    return
+    if output.shape[0] != num_actual_tokens:
+        output[num_actual_tokens:].zero_()
+
+
+breakable_nemotron_mamba2_with_output = eager_on_graph(True)(
+    nemotron_mamba2_with_output
+)
