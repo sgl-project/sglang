@@ -2029,10 +2029,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         if not decode_to_text:
             for i, vals in enumerate(token_logprobs_val):
                 if vals:
-                    ret[i] = [
-                        (logprob, token_id, None)
-                        for logprob, token_id in zip(vals, token_logprobs_idx[i])
-                    ]
+                    ret[i] = self.detokenize_logprob_tokens(
+                        vals, token_logprobs_idx[i], decode_to_text
+                    )
             return ret
 
         assert self.tokenizer is not None

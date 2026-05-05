@@ -423,10 +423,16 @@ class TestDetokenizeTopLogprobsTokens(unittest.TestCase):
 
     def setUp(self):
         self.fn = TokenizerManager.detokenize_top_logprobs_tokens
-        self.stub = Mock(spec=["tokenizer"])
+        self.stub = Mock(spec=["tokenizer", "detokenize_logprob_tokens"])
         self.stub.tokenizer = Mock()
         self.stub.tokenizer.batch_decode = Mock(
             side_effect=lambda ids: [f"tok_{i}" for i in ids]
+        )
+        # Delegate to the real helper so we exercise the production path.
+        self.stub.detokenize_logprob_tokens = (
+            lambda vals, idxs, decode_to_text: TokenizerManager.detokenize_logprob_tokens(
+                self.stub, vals, idxs, decode_to_text
+            )
         )
 
     def _call(self, vals, idxs, decode_to_text):
