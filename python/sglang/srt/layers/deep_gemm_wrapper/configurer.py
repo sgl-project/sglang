@@ -11,6 +11,11 @@ def _compute_enable_deep_gemm():
     if sm_version < 90:
         return False
 
+    # SM120 (consumer Blackwell) lacks WGMMA/tcgen05 instructions
+    # required by DeepGEMM SM90/SM100 kernels
+    if sm_version == 120:
+        return False
+
     try:
         import deep_gemm  # noqa: F401
     except ImportError:
