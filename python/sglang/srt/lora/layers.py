@@ -629,7 +629,16 @@ class QKVParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
         kv_start_idx = kv_proj_shard_size * kv_shard_id
         kv_end_idx = kv_start_idx + kv_proj_shard_size
 
-        q_size, k_size, _ = base_layer.output_sizes
+        # `base_layer.output_sizes[1]` and `[2]` are the QKVParallelLinear's
+        # per-rank K/V dims times `tp_size`, so they over-count K/V by
+        # `num_kv_head_replicas` whenever `tp_size > total_num_kv_heads`.
+        # The PEFT-format LoRA `B` here is the unreplicated stacked layout
+        # `[q_total, k_total, v_total]`, so offsets into it must use the
+        # unreplicated K/V sizes — otherwise the V slice falls past the
+        # end of `B` and silently returns 0 rows, which then trips the
+        # buffer-shape assert in the LoRA mem pool.
+        q_size = base_layer.output_sizes[0]
+        k_size = base_layer.output_sizes[1] // num_kv_head_replicas
         B_q_shard = B[q_start_idx:q_end_idx, :]
         B_k_shard = B[q_size + kv_start_idx : q_size + kv_end_idx, :]
         B_v_shard = B[q_size + k_size + kv_start_idx : q_size + k_size + kv_end_idx, :]
