@@ -583,6 +583,7 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
     # other
     transfer_speed_gb_s: float = 0.0
     transfer_total_mb: float = 0.0
+    kv_transfer_metrics: Optional[dict] = None
     # Number of prefill retries for this request
     prefill_retry_count: int = 0
 
@@ -914,7 +915,8 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
                     alloc_ms=alloc_ms,
                 )
 
-        return result if result else None
+        self.kv_transfer_metrics = result if result else None
+        return self.kv_transfer_metrics
 
     def set_quick_finish_time(self, ts=None):
         ts = ts or time.perf_counter()
@@ -1127,6 +1129,8 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
                 "prefill_launch_latency": self.get_prefill_launch_latency(),
             }
         )
+        if self.kv_transfer_metrics:
+            meta_data["kv_transfer"] = self.kv_transfer_metrics
         return meta_data
 
     def format_duration(self, duration: float) -> str:

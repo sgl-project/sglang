@@ -190,6 +190,25 @@ class TestFormatOutputData(unittest.TestCase):
         self.assertIn("latency", result)
         self.assertNotIn("secret", result)
 
+    def test_preserves_nested_kv_transfer_meta_info(self):
+        server_args = _make_server_args("/tmp/unused")
+        exporter = _ConcreteExporter(
+            server_args, obj_skip_names=None, out_skip_names=None
+        )
+
+        obj = _GenerateReqInput(rid="req-1")
+        kv_transfer = {
+            "latency_ms": 125.0,
+            "total_mb": 16.0,
+            "speed_gb_s": 0.125,
+            "bootstrap_ms": 3.0,
+            "alloc_ms": 2.0,
+        }
+        out_dict = {"meta_info": {"kv_transfer": kv_transfer}}
+        result = exporter._format_output_data(obj, out_dict)
+
+        self.assertEqual(result["kv_transfer"], kv_transfer)
+
 
 class TestFileRequestMetricsExporter(unittest.TestCase):
     def setUp(self):

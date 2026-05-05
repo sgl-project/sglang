@@ -122,6 +122,32 @@ class TestKVTransferMetrics(CustomTestCase):
 
         mock_collector.observe_kv_transfer_metrics.assert_not_called()
 
+    def test_kv_transfer_metrics_are_exported_in_meta_info(self):
+        stats = _make_stats(queue_entry=1.0, transfer_finish=1.2, completion=6.0)
+        result = stats.compute_and_observe_kv_transfer_metrics(
+            KVTransferMetric(transfer_total_bytes=_TRANSFER_BYTES)
+        )
+
+        meta_info = stats.convert_to_output_meta_info()
+
+        self.assertIsNotNone(result)
+        self.assertIn("kv_transfer", meta_info)
+        self.assertEqual(meta_info["kv_transfer"], result)
+        self.assertAlmostEqual(
+            meta_info["kv_transfer"]["latency_ms"], 200.0, places=3
+        )
+
+    def test_kv_transfer_meta_info_is_omitted_when_metrics_missing(self):
+        stats = _make_stats(queue_entry=1.0, transfer_finish=0.0, completion=6.0)
+        result = stats.compute_and_observe_kv_transfer_metrics(
+            KVTransferMetric(transfer_total_bytes=_TRANSFER_BYTES)
+        )
+
+        meta_info = stats.convert_to_output_meta_info()
+
+        self.assertIsNone(result)
+        self.assertNotIn("kv_transfer", meta_info)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
