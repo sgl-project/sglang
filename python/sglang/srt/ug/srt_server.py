@@ -11,11 +11,11 @@ from typing import Any
 
 
 @dataclass
-class UGBAGELSRTSchedulerHandle:
-    """Owns the SRT scheduler and temporary BAGEL language-model view."""
+class UGSRTSchedulerHandle:
+    """Owns the SRT scheduler and optional temporary model view."""
 
     scheduler: Any
-    model_view_dir: tempfile.TemporaryDirectory
+    model_view_dir: tempfile.TemporaryDirectory | None = None
 
     def close(self) -> None:
         for name in (
@@ -27,7 +27,11 @@ class UGBAGELSRTSchedulerHandle:
             close = getattr(socket, "close", None)
             if callable(close):
                 close(linger=0)
-        self.model_view_dir.cleanup()
+        if self.model_view_dir is not None:
+            self.model_view_dir.cleanup()
+
+
+UGBAGELSRTSchedulerHandle = UGSRTSchedulerHandle
 
 
 class _NoopSender:
@@ -38,6 +42,11 @@ class _NoopSender:
 def is_real_bagel_ug_model(model_path: str | None, model_id: str | None = None) -> bool:
     identifier = " ".join(str(value or "") for value in (model_path, model_id)).lower()
     return "bagel" in identifier
+
+
+def is_real_u1_ug_model(model_path: str | None, model_id: str | None = None) -> bool:
+    identifier = " ".join(str(value or "") for value in (model_path, model_id)).lower()
+    return "sensenova-u1" in identifier or "sensenova_u1" in identifier
 
 
 def build_bagel_language_model_view(
@@ -85,7 +94,7 @@ def create_bagel_srt_scheduler(
     chunked_prefill_size: int = 256,
     attention_backend: str | None = None,
     log_level: str = "error",
-) -> UGBAGELSRTSchedulerHandle:
+) -> UGSRTSchedulerHandle:
     """Create the SRT Scheduler used as the BAGEL UG session owner."""
 
     from sglang.srt.managers.scheduler import Scheduler
@@ -130,10 +139,65 @@ def create_bagel_srt_scheduler(
     )
     _replace_sender_with_noop(scheduler, "send_to_tokenizer")
     _replace_sender_with_noop(scheduler, "send_to_detokenizer")
-    return UGBAGELSRTSchedulerHandle(
+    return UGSRTSchedulerHandle(
         scheduler=scheduler,
         model_view_dir=model_view_dir,
     )
+
+
+def create_u1_srt_scheduler(
+    *,
+    checkpoint_dir: str,
+    gpu_id: int = 0,
+    dtype: str = "bfloat16",
+    mem_fraction_static: float = 0.35,
+    chunked_prefill_size: int = 256,
+    attention_backend: str | None = None,
+    log_level: str = "error",
+) -> UGSRTSchedulerHandle:
+    """Create the SRT Scheduler used as the SenseNova U1 UG session owner."""
+
+    from sglang.srt.managers.scheduler import Scheduler
+    from sglang.srt.server_args import (
+        PortArgs,
+        ServerArgs,
+        set_global_server_args_for_scheduler,
+    )
+
+    server_args = ServerArgs(
+        model_path=str(Path(checkpoint_dir).expanduser()),
+        tokenizer_path=str(Path(checkpoint_dir).expanduser()),
+        trust_remote_code=False,
+        dtype=dtype,
+        tp_size=1,
+        pp_size=1,
+        dp_size=1,
+        disable_cuda_graph=True,
+        disable_piecewise_cuda_graph=True,
+        disable_overlap_schedule=True,
+        skip_server_warmup=True,
+        attention_backend=attention_backend,
+        mem_fraction_static=float(mem_fraction_static),
+        chunked_prefill_size=int(chunked_prefill_size),
+        log_level=log_level,
+    )
+    server_args.check_server_args()
+    set_global_server_args_for_scheduler(server_args)
+
+    scheduler = Scheduler(
+        server_args,
+        PortArgs.init_new(server_args),
+        gpu_id=int(gpu_id),
+        tp_rank=0,
+        moe_ep_rank=0,
+        pp_rank=0,
+        attn_cp_rank=0,
+        moe_dp_rank=0,
+        dp_rank=None,
+    )
+    _replace_sender_with_noop(scheduler, "send_to_tokenizer")
+    _replace_sender_with_noop(scheduler, "send_to_detokenizer")
+    return UGSRTSchedulerHandle(scheduler=scheduler)
 
 
 def _replace_sender_with_noop(scheduler: Any, name: str) -> None:

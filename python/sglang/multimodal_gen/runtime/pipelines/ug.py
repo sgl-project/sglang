@@ -90,10 +90,10 @@ def _load_ug_bridge(
     scheduler=None,
     srt_u_decode_max_new_tokens: int | None = None,
 ) -> UGMiddleBridge:
-    if srt_u_decode_max_new_tokens is None:
-        srt_u_decode_max_new_tokens = 1 if scheduler is not None else 0
     srt_request_executor = _build_srt_request_executor(scheduler)
     if "bagel" in model_path.lower():
+        if srt_u_decode_max_new_tokens is None:
+            srt_u_decode_max_new_tokens = 1 if scheduler is not None else 0
         native_srt_denoise_executor = None
         native_srt_u_context = False
         if scheduler is not None:
@@ -116,6 +116,8 @@ def _load_ug_bridge(
             )
         )
     if is_sensenova_u1_ug_model(model_path):
+        if srt_u_decode_max_new_tokens is None:
+            srt_u_decode_max_new_tokens = 0
         return U1SRTBackedUGMiddleBridge(
             _build_srt_owned_ug_runtime(
                 UGModelRunnerAdapter(

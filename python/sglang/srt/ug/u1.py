@@ -8,6 +8,7 @@ import subprocess
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Protocol
 
 from sglang.srt.ug.adapter import UGModelAppendImageResult, UGModelPrefillResult
@@ -16,7 +17,7 @@ from sglang.srt.ug.denoiser import (
     SRTBackedUGMiddleBridge,
     UGGSegmentExecutor,
 )
-from sglang.srt.ug.interleaved import UGGKind
+from sglang.srt.ug.interleaved import UGGKind, UGGSegmentResult
 from sglang.srt.ug.runtime import (
     UGDecodeResult,
     UGInterleavedMessage,
@@ -192,10 +193,18 @@ class U1UGModelAdapter:
     ) -> list[UGSRTPreparedInput] | None:
         if state != UGSegmentState.U_PREFILL or self.native_tokenizer is None:
             return None
-        if not any(message.type == "image" for message in messages):
+        has_image = any(message.type == "image" for message in messages)
+        has_text = any(message.type == "text" for message in messages)
+        if not has_text:
             return None
-        if not any(message.type == "text" for message in messages):
-            return None
+        if not has_image:
+            return [
+                build_u1_native_t2i_prepared_input(
+                    tokenizer=self.native_tokenizer,
+                    messages=messages,
+                    session=session,
+                )
+            ]
         return [
             build_u1_native_vlm_prepared_input(
                 tokenizer=self.native_tokenizer,
@@ -539,6 +548,42 @@ class U1SRTBackedUGMiddleBridge:
     ) -> Any:
         return self._bridge.run_g_segment(contexts=contexts, executor=executor)
 
+    def run_native_pixel_flow_g_segment(
+        self,
+        *,
+        contexts: UGContextBundle,
+        batch: Any,
+        server_args: Any,
+    ) -> UGGSegmentResult | None:
+        srt_executor = self.runtime.srt_request_executor
+        create_executor = getattr(
+            srt_executor,
+            "create_u1_native_srt_pixel_flow_executor",
+            None,
+        )
+        if not callable(create_executor):
+            return None
+        if contexts.full.session is None:
+            raise ValueError("U1 native pixel-flow requires a SRT UG session")
+        get_binding = getattr(srt_executor, "get_latest_ug_session_token_binding", None)
+        if not callable(get_binding):
+            raise RuntimeError(
+                "U1 native pixel-flow requires latest SRT session token binding"
+            )
+        binding = get_binding(contexts.full.session.session_id)
+        if binding is None:
+            raise RuntimeError(
+                "U1 native pixel-flow has no SRT KV token binding for session "
+                f"{contexts.full.session.session_id}"
+            )
+        native_executor = create_executor()
+        return native_executor.generate(
+            contexts=contexts,
+            batch=batch,
+            server_args=server_args,
+            srt_kv_token_binding=binding,
+        )
+
     def commit_generated_segment(
         self,
         *,
@@ -620,6 +665,56 @@ def build_u1_native_vlm_prepared_input(
     )
 
 
+def build_u1_native_t2i_prepared_input(
+    *,
+    tokenizer: Any,
+    messages: list[UGInterleavedMessage],
+    session: Any | None = None,
+) -> UGSRTPreparedInput:
+    prompt_text = _u1_question_text(messages)
+    prompt = build_u1_t2i_prompt(prompt=prompt_text)
+    input_ids = _u1_tokenize_to_ids(
+        tokenizer,
+        prompt,
+        add_special_tokens=False,
+    )
+    if not input_ids:
+        raise RuntimeError("U1 native T2I prompt produced no input ids")
+    img_start_id = tokenizer.convert_tokens_to_ids(U1_IMG_START_TOKEN)
+    if img_start_id not in input_ids:
+        raise RuntimeError("U1 native T2I prompt did not contain <img> token")
+    return UGSRTPreparedInput(
+        input_ids=input_ids,
+        input_text=prompt,
+        messages=list(messages),
+        adapter_metadata={
+            "u1": {
+                "segment_type": "t2i",
+                "source": "native_t2i_prompt",
+                "prompt_ends_with_image_marker": input_ids[-1] == img_start_id,
+            },
+            "ug_model_state_updates": {
+                "u1": {
+                    "last_segment_type": "t2i",
+                    "last_source": "native_t2i_prompt",
+                    "native_t2i_prompt": True,
+                    "session_id": getattr(
+                        getattr(session, "handle", None), "session_id", None
+                    ),
+                }
+            },
+        },
+    )
+
+
+def build_u1_t2i_prompt(*, prompt: str) -> str:
+    return (
+        f"<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n"
+        "<think>\n\n</think>\n\n"
+        f"{U1_IMG_START_TOKEN}"
+    )
+
+
 def build_u1_vlm_input_ids_and_offsets(
     *,
     tokenizer: Any,
@@ -636,8 +731,7 @@ def build_u1_vlm_input_ids_and_offsets(
         )
         prompt = prompt.replace(U1_IMAGE_PLACEHOLDER, image_tokens, 1)
 
-    tokenized = tokenizer(prompt, return_tensors="pt")
-    input_ids = tokenized["input_ids"][0].tolist()
+    input_ids = _u1_tokenize_to_ids(tokenizer, prompt)
     context_token_id = tokenizer.convert_tokens_to_ids(U1_IMG_CONTEXT_TOKEN)
     selected = [
         index for index, token_id in enumerate(input_ids) if token_id == context_token_id
@@ -652,6 +746,243 @@ def build_u1_vlm_prompt(*, question: str) -> str:
         f"<|im_start|>user\n{U1_IMAGE_PLACEHOLDER}\n{question}"
         "<|im_end|>\n<|im_start|>assistant\n"
     )
+
+
+class U1NativeSRTPixelFlowExecutor:
+    """Run SenseNova U1 pixel-flow G steps through SRT's ModelRunner/KV path."""
+
+    def __init__(
+        self,
+        srt_model: Any,
+        *,
+        forward_batch_provider: Any,
+    ) -> None:
+        self.srt_model = srt_model
+        self.forward_batch_provider = forward_batch_provider
+
+    def generate(
+        self,
+        *,
+        contexts: UGContextBundle,
+        batch: Any,
+        server_args: Any,
+        srt_kv_token_binding: Any,
+    ) -> UGGSegmentResult:
+        del server_args
+        import numpy as np
+        import torch
+        from PIL import Image
+
+        if contexts.full.session is None:
+            raise ValueError("U1 native pixel-flow requires contexts.full.session")
+        sampling_params = batch.sampling_params
+        cfg_text_scale = float(getattr(sampling_params, "cfg_text_scale", 1.0))
+        cfg_img_scale = float(getattr(sampling_params, "cfg_img_scale", 1.0))
+        if cfg_text_scale > 1.0 or cfg_img_scale > 1.0:
+            raise NotImplementedError(
+                "U1 native SRT pixel-flow currently supports CFG scale <= 1.0; "
+                "CFG side branches are a later parity step"
+            )
+
+        image_size = _u1_batch_image_size(batch)
+        width, height = image_size
+        patch_size = int(self.srt_model.patch_size)
+        merge_size = int(1 / float(self.srt_model.downsample_ratio))
+        divisor = patch_size * merge_size
+        if width % divisor or height % divisor:
+            raise ValueError(
+                "U1 native pixel-flow image size must be divisible by "
+                f"{divisor}, got {width}x{height}"
+            )
+
+        token_h = height // divisor
+        token_w = width // divisor
+        grid_h = height // patch_size
+        grid_w = width // patch_size
+        steps = int(getattr(sampling_params, "num_inference_steps", None) or 0)
+        if steps <= 0:
+            raise ValueError(f"num_inference_steps must be positive, got {steps}")
+
+        device = _u1_model_device(self.srt_model)
+        dtype = _u1_model_dtype(self.srt_model)
+        seed = int(getattr(batch, "seed", None) or 0)
+        generator = torch.Generator(device=device).manual_seed(seed)
+        noise_scale = float(
+            self.srt_model.noise_scale_for_image(grid_h=grid_h, grid_w=grid_w)
+        )
+        image_prediction = noise_scale * torch.randn(
+            (1, 3, height, width),
+            device=device,
+            dtype=dtype,
+            generator=generator,
+        )
+        gen_grid_hw = torch.tensor([[grid_h, grid_w]], device=device, dtype=torch.long)
+        timesteps = torch.linspace(0.0, 1.0, steps + 1, device=device)
+        timesteps = self.srt_model.apply_time_schedule(
+            timesteps,
+            image_seq_len=token_h * token_w,
+            timestep_shift=float(getattr(sampling_params, "timestep_shift", 1.0)),
+        )
+        indexes_image = self.srt_model.build_t2i_image_indexes(
+            token_h=token_h,
+            token_w=token_w,
+            text_len=int(getattr(srt_kv_token_binding, "token_count")),
+            device=device,
+        )
+        generation_input = {
+            "packed_seqlens": torch.tensor(
+                [token_h * token_w], dtype=torch.int32, device=device
+            ),
+            "packed_position_ids": indexes_image,
+        }
+        prepared = SimpleNamespace(
+            generation_input=generation_input,
+            srt_kv_token_binding=srt_kv_token_binding,
+        )
+
+        for step_i in range(steps):
+            timestep = timesteps[step_i]
+            next_timestep = timesteps[step_i + 1]
+            z = self.srt_model.patchify(image_prediction, patch_size * merge_size)
+            image_input = self.srt_model.patchify(
+                image_prediction,
+                patch_size,
+                channel_first=True,
+            )
+            image_embeds = self.srt_model.extract_feature(
+                image_input.view(grid_h * grid_w, -1),
+                gen_model=True,
+                grid_hw=gen_grid_hw,
+            ).view(1, token_h * token_w, -1)
+            timestep_values = timestep.expand(token_h * token_w)
+            timestep_embeddings = self.srt_model.fm_modules["timestep_embedder"](
+                timestep_values
+            ).view(1, token_h * token_w, -1)
+            if getattr(self.srt_model, "add_noise_scale_embedding", False):
+                noise_values = torch.full_like(
+                    timestep_values,
+                    noise_scale / float(self.srt_model.noise_scale_max_value),
+                )
+                timestep_embeddings = timestep_embeddings + self.srt_model.fm_modules[
+                    "noise_scale_embedder"
+                ](noise_values).view(1, token_h * token_w, -1)
+            image_embeds = image_embeds + timestep_embeddings
+
+            forward_batch_context = self.forward_batch_provider(
+                prepared=prepared,
+                latent_tokens=image_embeds,
+                timestep=timestep,
+            )
+            forward_batch = getattr(
+                forward_batch_context,
+                "forward_batch",
+                forward_batch_context,
+            )
+            try:
+                v_pred = self.srt_model.predict_u1_pixel_flow_from_srt(
+                    image_embeds=image_embeds,
+                    indexes_image=indexes_image,
+                    forward_batch=forward_batch,
+                    timestep=timestep,
+                    z=z,
+                    image_size=image_size,
+                )
+            finally:
+                release = getattr(forward_batch_context, "release", None)
+                if callable(release):
+                    release()
+
+            z = z + (next_timestep - timestep) * v_pred
+            image_prediction = self.srt_model.unpatchify(
+                z,
+                patch_size * merge_size,
+                height,
+                width,
+            )
+
+        array = (
+            (image_prediction[0].float() * 0.5 + 0.5)
+            .clamp(0, 1)
+            .permute(1, 2, 0)
+            .detach()
+            .cpu()
+            .numpy()
+        )
+        image = Image.fromarray((array * 255.0).round().astype(np.uint8), "RGB")
+        return UGGSegmentResult(
+            type="image",
+            image=image,
+            metadata={
+                "g_kind": "pixel_flow",
+                "native_srt_pixel_flow": True,
+                "temporary_g_kv": True,
+                "timesteps": steps,
+                "seed": seed,
+                "width": width,
+                "height": height,
+                "grid": (token_h, token_w),
+                "noise_scale": noise_scale,
+            },
+        )
+
+
+def _u1_tokenize_to_ids(
+    tokenizer: Any,
+    prompt: str,
+    *,
+    add_special_tokens: bool | None = None,
+) -> list[int]:
+    kwargs = {"return_tensors": "pt"}
+    if add_special_tokens is not None:
+        kwargs["add_special_tokens"] = add_special_tokens
+    try:
+        tokenized = tokenizer(prompt, **kwargs)
+    except TypeError:
+        tokenized = tokenizer(prompt, return_tensors="pt")
+    input_ids = tokenized["input_ids"]
+    if hasattr(input_ids, "tolist"):
+        return input_ids[0].tolist()
+    return list(input_ids[0])
+
+
+def _u1_batch_image_size(batch: Any) -> tuple[int, int]:
+    sampling_params = batch.sampling_params
+    height = _u1_first_int(
+        getattr(batch, "height", None),
+        getattr(sampling_params, "height", None),
+        default=1024,
+    )
+    width = _u1_first_int(
+        getattr(batch, "width", None),
+        getattr(sampling_params, "width", None),
+        default=1024,
+    )
+    return width, height
+
+
+def _u1_first_int(*values, default: int) -> int:
+    for value in values:
+        if value is not None:
+            return int(value)
+    return int(default)
+
+
+def _u1_model_device(srt_model: Any):
+    import torch
+
+    vision_model = getattr(srt_model, "vision_model", None)
+    device = getattr(vision_model, "device", None)
+    if device is not None:
+        return device
+    return next(srt_model.parameters()).device
+
+
+def _u1_model_dtype(srt_model: Any):
+    vision_model = getattr(srt_model, "vision_model", None)
+    dtype = getattr(vision_model, "dtype", None)
+    if dtype is not None:
+        return dtype
+    return next(srt_model.parameters()).dtype
 
 
 def load_u1_native_image(

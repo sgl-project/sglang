@@ -154,6 +154,31 @@ class UGSRTSchedulerExecutor:
             forward_batch_provider=self.build_ug_g_forward_batch,
         )
 
+    def create_u1_native_srt_pixel_flow_executor(self):
+        """Create a SenseNova U1 pixel-flow executor backed by ModelRunner."""
+
+        from sglang.srt.ug.u1 import U1NativeSRTPixelFlowExecutor
+
+        model_runner = self._require_model_runner()
+        srt_model = getattr(model_runner, "model", None)
+        if srt_model is None:
+            raise UGSRTSchedulerExecutorError(
+                "UG U1 native pixel-flow requires model_runner.model"
+            )
+        return U1NativeSRTPixelFlowExecutor(
+            srt_model,
+            forward_batch_provider=self.build_ug_g_forward_batch,
+        )
+
+    def get_latest_ug_session_token_binding(
+        self,
+        session_id: str,
+    ) -> UGSRTKVTokenBinding | None:
+        for binding in reversed(self.token_bindings):
+            if binding.session_id == session_id:
+                return binding
+        return None
+
     def pad_input_ids(self, input_ids: list[int], mm_inputs: Any) -> list[int]:
         model_runner = self._require_model_runner()
         srt_model = getattr(model_runner, "model", None)
@@ -231,7 +256,12 @@ class UGSRTSchedulerExecutor:
             raise UGSRTSchedulerExecutorError(
                 "UG G forward requires at least one timestep query token"
             )
-        if int(packed_position_ids.numel()) != extend_num_tokens:
+        position_token_count = (
+            int(packed_position_ids.shape[-1])
+            if int(packed_position_ids.ndim) > 1
+            else int(packed_position_ids.numel())
+        )
+        if position_token_count != extend_num_tokens:
             raise UGSRTSchedulerExecutorError(
                 "UG G packed_position_ids must match packed_seqlens"
             )

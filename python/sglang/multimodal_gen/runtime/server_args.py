@@ -169,7 +169,7 @@ class ServerArgs(DisaggArgsMixin):
     )
 
     # Experimental UG native SRT scheduler settings. These are used only for
-    # BAGEL-style UGPipeline entrypoints where SRT owns the U session/KV cache.
+    # UGPipeline entrypoints where SRT owns the U session/KV cache.
     ug_srt_mem_fraction_static: float = 0.35
     ug_srt_chunked_prefill_size: int = 256
     ug_srt_u_decode_max_new_tokens: int = 1

@@ -33,6 +33,16 @@ class U1PixelFlowGSegmentExecutor:
                 "SenseNova U1 pixel-flow executor requires g_kind='pixel_flow', got "
                 f"{getattr(bridge, 'g_kind', None)!r}"
             )
+        run_native = getattr(bridge, "run_native_pixel_flow_g_segment", None)
+        if callable(run_native):
+            native_segment = run_native(
+                contexts=contexts,
+                batch=batch,
+                server_args=server_args,
+            )
+            if native_segment is not None:
+                return native_segment
+
         height, width = _u1_image_size(batch=batch, server_args=server_args)
         grid = _u1_patch_grid(
             height=height,

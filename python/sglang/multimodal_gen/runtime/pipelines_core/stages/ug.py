@@ -172,6 +172,7 @@ class UGDecodeStage(PipelineStage):
             batch.extra["ug_output_segments"] = _build_ug_output_segments(
                 pre_image_segments=batch.extra.get("ug_pre_image_segments", []),
                 image=image_for_append,
+                image_metadata=generated_segment.metadata,
                 post_image_segment=batch.extra["ug_post_image_segment"],
             )
         elif contexts is not None:
@@ -179,6 +180,7 @@ class UGDecodeStage(PipelineStage):
                 {
                     "type": "image",
                     "image": image_for_append,
+                    "metadata": dict(generated_segment.metadata),
                 }
             ]
         return batch
@@ -316,10 +318,14 @@ def _build_ug_output_segments(
     *,
     pre_image_segments,
     image: Image.Image,
+    image_metadata=None,
     post_image_segment,
 ) -> list[dict]:
     output_segments = list(pre_image_segments)
-    output_segments.append({"type": "image", "image": image})
+    image_segment = {"type": "image", "image": image}
+    if image_metadata:
+        image_segment["metadata"] = dict(image_metadata)
+    output_segments.append(image_segment)
     if post_image_segment.type == "text":
         output_segments.append({"type": "text", "text": post_image_segment.text or ""})
     elif post_image_segment.type != "done":

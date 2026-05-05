@@ -98,6 +98,22 @@ class NEOChatConfig(PretrainedConfig):
         img_context_token_id: int = 151669,
         img_start_token_id: int = 151670,
         img_end_token_id: int = 151671,
+        fm_head_layers: int = 2,
+        fm_head_dim: int = 1536,
+        fm_head_mlp_ratio: float = 1.0,
+        use_pixel_head: bool = False,
+        concat_time_token_num: int = 0,
+        noise_scale: float = 1.0,
+        noise_scale_mode: str = "resolution",
+        noise_scale_base_image_seq_len: int = 64,
+        add_noise_scale_embedding: bool = True,
+        noise_scale_max_value: float = 8.0,
+        time_schedule: str = "standard",
+        time_shift_type: str = "exponential",
+        base_shift: float = 0.5,
+        max_shift: float = 1.15,
+        base_image_seq_len: int = 64,
+        max_image_seq_len: int = 4096,
         **kwargs,
     ) -> None:
         super().__init__(**kwargs)
@@ -128,6 +144,22 @@ class NEOChatConfig(PretrainedConfig):
         self.img_context_token_id = img_context_token_id
         self.img_start_token_id = img_start_token_id
         self.img_end_token_id = img_end_token_id
+        self.fm_head_layers = fm_head_layers
+        self.fm_head_dim = fm_head_dim
+        self.fm_head_mlp_ratio = fm_head_mlp_ratio
+        self.use_pixel_head = use_pixel_head
+        self.concat_time_token_num = concat_time_token_num
+        self.noise_scale = noise_scale
+        self.noise_scale_mode = noise_scale_mode
+        self.noise_scale_base_image_seq_len = noise_scale_base_image_seq_len
+        self.add_noise_scale_embedding = add_noise_scale_embedding
+        self.noise_scale_max_value = noise_scale_max_value
+        self.time_schedule = time_schedule
+        self.time_shift_type = time_shift_type
+        self.base_shift = base_shift
+        self.max_shift = max_shift
+        self.base_image_seq_len = base_image_seq_len
+        self.max_image_seq_len = max_image_seq_len
 
         self.hidden_size = self.llm_config.hidden_size
         self.tie_word_embeddings = self.llm_config.tie_word_embeddings
@@ -148,6 +180,22 @@ class NEOChatConfig(PretrainedConfig):
         output["img_context_token_id"] = self.img_context_token_id
         output["img_start_token_id"] = self.img_start_token_id
         output["img_end_token_id"] = self.img_end_token_id
+        output["fm_head_layers"] = self.fm_head_layers
+        output["fm_head_dim"] = self.fm_head_dim
+        output["fm_head_mlp_ratio"] = self.fm_head_mlp_ratio
+        output["use_pixel_head"] = self.use_pixel_head
+        output["concat_time_token_num"] = self.concat_time_token_num
+        output["noise_scale"] = self.noise_scale
+        output["noise_scale_mode"] = self.noise_scale_mode
+        output["noise_scale_base_image_seq_len"] = self.noise_scale_base_image_seq_len
+        output["add_noise_scale_embedding"] = self.add_noise_scale_embedding
+        output["noise_scale_max_value"] = self.noise_scale_max_value
+        output["time_schedule"] = self.time_schedule
+        output["time_shift_type"] = self.time_shift_type
+        output["base_shift"] = self.base_shift
+        output["max_shift"] = self.max_shift
+        output["base_image_seq_len"] = self.base_image_seq_len
+        output["max_image_seq_len"] = self.max_image_seq_len
         return output
 
 

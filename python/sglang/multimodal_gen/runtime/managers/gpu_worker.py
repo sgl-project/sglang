@@ -86,11 +86,13 @@ def _should_attach_ug_srt_scheduler(server_args: ServerArgs) -> bool:
     if getattr(server_args, "pipeline_class_name", None) not in (None, "UGPipeline"):
         return False
 
-    from sglang.srt.ug.srt_server import is_real_bagel_ug_model
+    from sglang.srt.ug.srt_server import is_real_bagel_ug_model, is_real_u1_ug_model
 
-    return is_real_bagel_ug_model(
-        getattr(server_args, "model_path", None),
-        getattr(server_args, "model_id", None),
+    model_path = getattr(server_args, "model_path", None)
+    model_id = getattr(server_args, "model_id", None)
+    return (
+        is_real_bagel_ug_model(model_path, model_id)
+        or is_real_u1_ug_model(model_path, model_id)
     )
 
 
@@ -103,13 +105,22 @@ def _maybe_attach_ug_srt_scheduler(
         return None
     if server_args.num_gpus != 1 or server_args.enable_cfg_parallel:
         raise RuntimeError(
-            "BAGEL UGPipeline native SRT entrypoint currently supports only "
+            "UGPipeline native SRT entrypoint currently supports only "
             "single-GPU execution with CFG parallel disabled"
         )
 
-    from sglang.srt.ug.srt_server import create_bagel_srt_scheduler
+    from sglang.srt.ug.srt_server import (
+        create_bagel_srt_scheduler,
+        create_u1_srt_scheduler,
+        is_real_u1_ug_model,
+    )
 
-    handle = create_bagel_srt_scheduler(
+    create_scheduler = (
+        create_u1_srt_scheduler
+        if is_real_u1_ug_model(server_args.model_path, server_args.model_id)
+        else create_bagel_srt_scheduler
+    )
+    handle = create_scheduler(
         checkpoint_dir=server_args.model_path,
         gpu_id=local_rank,
         mem_fraction_static=server_args.ug_srt_mem_fraction_static,

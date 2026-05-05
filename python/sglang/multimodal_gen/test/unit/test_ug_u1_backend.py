@@ -4,6 +4,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 import unittest
 
+from PIL import Image
 import torch
 from transformers import AutoConfig
 
@@ -51,6 +52,7 @@ from sglang.srt.models.neo_chat import (
 from sglang.srt.models.registry import ModelRegistry
 from sglang.srt.ug.adapter import UGModelRunnerAdapter
 from sglang.srt.ug.context import UGContextBundle, UGContextHandle, UGSessionHandle
+from sglang.srt.ug.interleaved import UGGSegmentResult
 from sglang.srt.ug.runtime import (
     UGInterleavedMessage,
     UGSegmentState,
@@ -59,6 +61,7 @@ from sglang.srt.ug.runtime import (
 from sglang.srt.ug.u1 import (
     U1UGModelAdapter,
     U1VLMBackendResult,
+    build_u1_t2i_prompt,
     build_u1_vlm_prompt,
 )
 
@@ -237,7 +240,7 @@ class TestU1UGBackendShell(unittest.TestCase):
         self.assertTrue(issubclass(NEOQwen3ForCausalLM, torch.nn.Module))
         self.assertTrue(issubclass(NEOQwen3Model, torch.nn.Module))
 
-    def test_u1_language_weight_mapper_keeps_only_qwen3_u_path(self):
+    def test_u1_language_weight_mapper_routes_qwen3_u_and_g_paths(self):
         self.assertEqual(
             map_u1_language_model_weight_name("language_model.model.layers.0.weight"),
             "model.layers.0.weight",
@@ -246,10 +249,11 @@ class TestU1UGBackendShell(unittest.TestCase):
             map_u1_language_model_weight_name("language_model.lm_head.weight"),
             "lm_head.weight",
         )
-        self.assertIsNone(
+        self.assertEqual(
             map_u1_language_model_weight_name(
                 "language_model.model.layers.0.self_attn.q_proj_mot_gen.weight"
-            )
+            ),
+            "model.layers.0.self_attn.q_proj_mot_gen.weight",
         )
         self.assertIsNone(map_u1_language_model_weight_name("vision_model.patch.weight"))
         self.assertIsNone(map_u1_language_model_weight_name("fm_modules.fm_head.weight"))
@@ -379,6 +383,30 @@ class TestU1UGBackendShell(unittest.TestCase):
             build_u1_vlm_prompt(question="What is in this image?"),
             "<|im_start|>user\n<image>\nWhat is in this image?"
             "<|im_end|>\n<|im_start|>assistant\n",
+        )
+
+    def test_u1_t2i_prompt_matches_official_image_marker_prefix(self):
+        self.assertEqual(
+            build_u1_t2i_prompt(prompt="draw a cup"),
+            "<|im_start|>user\ndraw a cup<|im_end|>\n"
+            "<|im_start|>assistant\n<think>\n\n</think>\n\n<img>",
+        )
+
+    def test_u1_native_tokenizer_builds_t2i_prefill_with_image_marker(self):
+        adapter = U1UGModelAdapter(native_tokenizer=FakeU1Tokenizer())
+
+        prepared = adapter.prepare_srt_u_interleaved_inputs(
+            session=None,
+            messages=[UGInterleavedMessage(type="text", content="draw a cup")],
+            state=UGSegmentState.U_PREFILL,
+        )
+
+        self.assertEqual(len(prepared), 1)
+        self.assertEqual(prepared[0].input_ids[-1], 151670)
+        self.assertIsNone(prepared[0].mm_inputs)
+        self.assertEqual(
+            prepared[0].adapter_metadata["u1"]["source"],
+            "native_t2i_prompt",
         )
 
     def test_u1_bridge_native_vlm_prefill_uses_model_pad_once(self):
@@ -665,6 +693,38 @@ class TestU1UGBackendShell(unittest.TestCase):
         self.assertIs(bridge.runtime.srt_request_executor.scheduler, scheduler)
         self.assertEqual(bridge.runtime.srt_u_decode_max_new_tokens, 2)
 
+    def test_load_u1_bridge_scheduler_defaults_to_no_pre_image_decode(self):
+        bridge = _load_ug_bridge(
+            "sensenova/SenseNova-U1-8B-MoT",
+            scheduler=FakeScheduler(),
+        )
+
+        self.assertEqual(bridge.runtime.srt_u_decode_max_new_tokens, 0)
+
+    def test_u1_pixel_flow_executor_delegates_to_native_srt_when_available(self):
+        srt_executor = FakeNativePixelFlowSRTExecutor()
+        runtime = UGSessionRuntime(
+            model_runner=UGModelRunnerAdapter(U1UGModelAdapter()),
+            session_controller=SessionController(FakeTreeCache()),
+            srt_request_executor=srt_executor,
+        )
+        bridge = _load_u1_bridge(runtime)
+        batch = Req(
+            sampling_params=_sampling(height=8, width=8, num_inference_steps=2),
+            seed=3,
+        )
+
+        result = U1PixelFlowGSegmentExecutor()(
+            bridge=bridge,
+            contexts=_make_contexts(),
+            batch=batch,
+            server_args=_make_ug_server_args(),
+        )
+
+        self.assertTrue(result.metadata["native_srt_pixel_flow"])
+        self.assertEqual(result.image.size, (8, 8))
+        self.assertEqual(len(srt_executor.native_calls), 1)
+
 
 class PixelFlowBridge:
     g_kind = "pixel_flow"
@@ -760,6 +820,42 @@ class FakeScheduler:
 
 class FakeModelConfig:
     vocab_size = 32000
+
+
+class FakeNativePixelFlowSRTExecutor:
+    def __init__(self):
+        self.native_calls = []
+
+    def create_u1_native_srt_pixel_flow_executor(self):
+        return FakeNativePixelFlowExecutor(self)
+
+    def get_latest_ug_session_token_binding(self, session_id):
+        return SimpleNamespace(
+            session_id=session_id,
+            request_id=f"{session_id}:u1",
+            token_count=4,
+            token_indices=torch.arange(4, dtype=torch.long),
+        )
+
+
+class FakeNativePixelFlowExecutor:
+    def __init__(self, owner):
+        self.owner = owner
+
+    def generate(self, *, contexts, batch, server_args, srt_kv_token_binding):
+        del server_args
+        self.owner.native_calls.append(
+            {
+                "session_id": contexts.full.session.session_id,
+                "seed": batch.seed,
+                "token_count": srt_kv_token_binding.token_count,
+            }
+        )
+        return UGGSegmentResult(
+            type="image",
+            image=Image.new("RGB", (8, 8), (7, 8, 9)),
+            metadata={"g_kind": "pixel_flow", "native_srt_pixel_flow": True},
+        )
 
 
 class FakeU1VLMBackend:

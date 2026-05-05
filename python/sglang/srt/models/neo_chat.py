@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Iterable, Optional, Tuple
 
@@ -32,7 +33,7 @@ from sglang.srt.managers.schedule_batch import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen2 import Qwen2Model
-from sglang.srt.models.qwen3 import Qwen3DecoderLayer, Qwen3ForCausalLM
+from sglang.srt.models.qwen3 import Qwen3DecoderLayer, Qwen3ForCausalLM, Qwen3MLP
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import add_prefix, is_cuda
 
@@ -148,6 +149,61 @@ def apply_2d_rotary_pos_emb(
     return torch.cat((rotated_x, rotated_y), dim=-1)
 
 
+class U1TimestepEmbedder(nn.Module):
+    """SenseNova U1 scalar timestep embedder for pixel-flow G tokens."""
+
+    def __init__(self, hidden_size: int, frequency_embedding_size: int = 256) -> None:
+        super().__init__()
+        self.frequency_embedding_size = int(frequency_embedding_size)
+        self.mlp = nn.Sequential(
+            nn.Linear(self.frequency_embedding_size, hidden_size, bias=True),
+            nn.SiLU(),
+            nn.Linear(hidden_size, hidden_size, bias=True),
+        )
+
+    @staticmethod
+    def timestep_embedding(
+        t: torch.Tensor,
+        dim: int,
+        max_period: float = 10000.0,
+    ) -> torch.Tensor:
+        half = dim // 2
+        freqs = torch.exp(
+            -math.log(max_period)
+            * torch.arange(0, half, dtype=torch.float32, device=t.device)
+            / half
+        )
+        args = t[:, None].float() * freqs[None]
+        embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
+        if dim % 2:
+            embedding = torch.cat(
+                [embedding, torch.zeros_like(embedding[:, :1])],
+                dim=-1,
+            )
+        return embedding
+
+    def forward(self, t: torch.Tensor) -> torch.Tensor:
+        t_freq = self.timestep_embedding(t, self.frequency_embedding_size)
+        return self.mlp(t_freq.to(dtype=self.mlp[0].weight.dtype))
+
+
+class U1ConvDecoder(nn.Module):
+    """Optional U1 pixel head used by some checkpoints."""
+
+    def __init__(self, input_dim: int = 4096, hidden_dim: int = 1024) -> None:
+        super().__init__()
+        self.ps1 = nn.PixelShuffle(2)
+        self.conv1 = nn.Conv2d(input_dim // 4, hidden_dim, kernel_size=3, padding=1)
+        self.act1 = nn.GELU()
+        self.ps2 = nn.PixelShuffle(2)
+        self.conv2 = nn.Conv2d(hidden_dim // 4, 192, kernel_size=3, padding=1)
+        self.ps3 = nn.PixelShuffle(8)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.act1(self.conv1(self.ps1(x)))
+        return self.ps3(self.conv2(self.ps2(x)))
+
+
 def build_u1_vlm_thw_indexes(
     input_ids: torch.Tensor | list[int] | tuple[int, ...],
     *,
@@ -243,8 +299,6 @@ def iter_u1_language_model_weights(
 
 
 def map_u1_language_model_weight_name(name: str) -> str | None:
-    if "mot_gen" in name:
-        return None
     if name.startswith("language_model."):
         return name[len("language_model.") :]
     if name.startswith("model.") or name.startswith("lm_head."):
@@ -457,11 +511,36 @@ class NEOQwen3Attention(nn.Module):
             reduce_results=False,
             prefix=add_prefix("o_proj", prefix),
         )
+        self.qkv_proj_mot_gen = QKVParallelLinear(
+            self.hidden_size,
+            self.head_dim,
+            self.total_num_heads,
+            self.total_num_kv_heads,
+            bias=bool(config.attention_bias),
+            quant_config=quant_config,
+            tp_rank=attn_tp_rank,
+            tp_size=attn_tp_size,
+            prefix=add_prefix("qkv_proj_mot_gen", prefix),
+        )
+        self.o_proj_mot_gen = RowParallelLinear(
+            self.total_num_heads * self.head_dim,
+            self.hidden_size,
+            bias=bool(config.attention_bias),
+            quant_config=quant_config,
+            tp_rank=attn_tp_rank,
+            tp_size=attn_tp_size,
+            reduce_results=False,
+            prefix=add_prefix("o_proj_mot_gen", prefix),
+        )
 
         self.q_norm = RMSNorm(self.t_head_dim, eps=config.rms_norm_eps)
         self.k_norm = RMSNorm(self.t_head_dim, eps=config.rms_norm_eps)
         self.q_norm_hw = RMSNorm(self.hw_head_dim, eps=config.rms_norm_eps)
         self.k_norm_hw = RMSNorm(self.hw_head_dim, eps=config.rms_norm_eps)
+        self.q_norm_mot_gen = RMSNorm(self.t_head_dim, eps=config.rms_norm_eps)
+        self.k_norm_mot_gen = RMSNorm(self.t_head_dim, eps=config.rms_norm_eps)
+        self.q_norm_hw_mot_gen = RMSNorm(self.hw_head_dim, eps=config.rms_norm_eps)
+        self.k_norm_hw_mot_gen = RMSNorm(self.hw_head_dim, eps=config.rms_norm_eps)
 
         self.rotary_emb = get_rope(
             self.t_head_dim,
@@ -496,10 +575,62 @@ class NEOQwen3Attention(nn.Module):
             positions = _u1_text_only_thw_positions(positions)
 
         qkv, _ = self.qkv_proj(hidden_states)
+        output_proj = self.o_proj
+        q_norm = self.q_norm
+        k_norm = self.k_norm
+        q_norm_hw = self.q_norm_hw
+        k_norm_hw = self.k_norm_hw
+        return self._forward_from_qkv(
+            positions=positions,
+            hidden_states=hidden_states,
+            forward_batch=forward_batch,
+            qkv=qkv,
+            output_proj=output_proj,
+            q_norm=q_norm,
+            k_norm=k_norm,
+            q_norm_hw=q_norm_hw,
+            k_norm_hw=k_norm_hw,
+        )
+
+    def forward_gen(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> torch.Tensor:
+        if positions.ndim != 2 or positions.shape[0] != 3:
+            positions = _u1_text_only_thw_positions(positions)
+
+        qkv, _ = self.qkv_proj_mot_gen(hidden_states)
+        return self._forward_from_qkv(
+            positions=positions,
+            hidden_states=hidden_states,
+            forward_batch=forward_batch,
+            qkv=qkv,
+            output_proj=self.o_proj_mot_gen,
+            q_norm=self.q_norm_mot_gen,
+            k_norm=self.k_norm_mot_gen,
+            q_norm_hw=self.q_norm_hw_mot_gen,
+            k_norm_hw=self.k_norm_hw_mot_gen,
+        )
+
+    def _forward_from_qkv(
+        self,
+        *,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+        qkv: torch.Tensor,
+        output_proj: RowParallelLinear,
+        q_norm: RMSNorm,
+        k_norm: RMSNorm,
+        q_norm_hw: RMSNorm,
+        k_norm_hw: RMSNorm,
+    ) -> torch.Tensor:
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
-        q = self._split_u1_heads(q, self.num_heads, self.q_norm, self.q_norm_hw)
-        k = self._split_u1_heads(k, self.num_kv_heads, self.k_norm, self.k_norm_hw)
+        q = self._split_u1_heads(q, self.num_heads, q_norm, q_norm_hw)
+        k = self._split_u1_heads(k, self.num_kv_heads, k_norm, k_norm_hw)
         q_t, q_h, q_w = q
         k_t, k_h, k_w = k
 
@@ -526,7 +657,7 @@ class NEOQwen3Attention(nn.Module):
         ).reshape(num_tokens, self.kv_size)
 
         attn_output = self.attn(q, k, v, forward_batch)
-        output, _ = self.o_proj(attn_output)
+        output, _ = output_proj(attn_output)
         return output
 
     def _split_u1_heads(
@@ -571,6 +702,51 @@ class NEOQwen3DecoderLayer(Qwen3DecoderLayer):
             quant_config=quant_config,
             prefix=add_prefix("self_attn", prefix),
         )
+        self.mlp_mot_gen = Qwen3MLP(
+            hidden_size=self.hidden_size,
+            intermediate_size=config.intermediate_size,
+            hidden_act=config.hidden_act,
+            quant_config=quant_config,
+            prefix=add_prefix("mlp_mot_gen", prefix),
+        )
+        self.input_layernorm_mot_gen = RMSNorm(
+            config.hidden_size,
+            eps=config.rms_norm_eps,
+        )
+        self.post_attention_layernorm_mot_gen = RMSNorm(
+            config.hidden_size,
+            eps=config.rms_norm_eps,
+        )
+
+    def forward_gen(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+        residual: Optional[torch.Tensor],
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if residual is None:
+            residual = hidden_states
+            hidden_states = self.input_layernorm_mot_gen(hidden_states)
+        else:
+            hidden_states, residual = self.input_layernorm_mot_gen(
+                hidden_states,
+                residual,
+            )
+
+        if hidden_states.shape[0] != 0:
+            hidden_states = self.self_attn.forward_gen(
+                positions=positions,
+                hidden_states=hidden_states,
+                forward_batch=forward_batch,
+            )
+
+        hidden_states, residual = self.post_attention_layernorm_mot_gen(
+            hidden_states,
+            residual,
+        )
+        hidden_states = self.mlp_mot_gen(hidden_states)
+        return hidden_states, residual
 
 
 class NEOQwen3Model(Qwen2Model):
@@ -588,6 +764,38 @@ class NEOQwen3Model(Qwen2Model):
             decoder_layer_type=NEOQwen3DecoderLayer,
             alt_stream=alt_stream,
         )
+        if self.pp_group.is_last_rank:
+            self.norm_mot_gen = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+
+    def forward_gen_embeds(
+        self,
+        *,
+        input_embeds: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> torch.Tensor:
+        if not self.pp_group.is_first_rank or not self.pp_group.is_last_rank:
+            raise NotImplementedError(
+                "SenseNova U1 pixel-flow G forward is currently single-stage PP only"
+            )
+
+        hidden_states = input_embeds
+        residual = None
+        for i in range(self.start_layer, self.end_layer):
+            layer = self.layers[i]
+            hidden_states, residual = layer.forward_gen(
+                positions=positions,
+                hidden_states=hidden_states,
+                forward_batch=forward_batch,
+                residual=residual,
+            )
+
+        if hidden_states.shape[0] != 0:
+            if residual is None:
+                hidden_states = self.norm_mot_gen(hidden_states)
+            else:
+                hidden_states, _ = self.norm_mot_gen(hidden_states, residual)
+        return hidden_states
 
 
 class NEOQwen3ForCausalLM(Qwen3ForCausalLM):
@@ -625,6 +833,19 @@ class NEOQwen3ForCausalLM(Qwen3ForCausalLM):
         self.pooler = Pooler(pooling_type=PoolingType.LAST, normalize=True)
         self.capture_aux_hidden_states = False
 
+    def forward_u1_gen_embeds(
+        self,
+        *,
+        input_embeds: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> torch.Tensor:
+        return self.model.forward_gen_embeds(
+            input_embeds=input_embeds,
+            positions=positions,
+            forward_batch=forward_batch,
+        )
+
 
 class NEOChatModel(nn.Module):
     """Native SenseNova U1 model shell.
@@ -656,6 +877,52 @@ class NEOChatModel(nn.Module):
             prefix=add_prefix("language_model", prefix),
         )
         self.model = self.language_model.model
+        self.fm_modules = self._build_fm_modules(config)
+        self.use_deep_fm_head = int(config.fm_head_layers) > 2
+        self.use_pixel_head = bool(config.use_pixel_head)
+        self.concat_time_token_num = int(config.concat_time_token_num)
+        self.noise_scale = float(config.noise_scale)
+        self.noise_scale_mode = str(config.noise_scale_mode)
+        self.noise_scale_base_image_seq_len = int(
+            config.noise_scale_base_image_seq_len
+        )
+        self.add_noise_scale_embedding = bool(config.add_noise_scale_embedding)
+        self.noise_scale_max_value = float(config.noise_scale_max_value)
+        self.time_schedule = str(config.time_schedule)
+        self.time_shift_type = str(config.time_shift_type)
+        self.base_shift = float(config.base_shift)
+        self.max_shift = float(config.max_shift)
+        self.base_image_seq_len = int(config.base_image_seq_len)
+        self.max_image_seq_len = int(config.max_image_seq_len)
+
+    def _build_fm_modules(self, config: NEOChatConfig) -> nn.ModuleDict:
+        merge_size = _merge_size_from_downsample_ratio(float(config.downsample_ratio))
+        output_dim = 3 * (int(config.vision_config.patch_size) * merge_size) ** 2
+        hidden_size = int(config.llm_config.hidden_size)
+        if bool(config.use_pixel_head):
+            fm_head: nn.Module = U1ConvDecoder(hidden_size)
+        elif int(config.fm_head_layers) <= 2:
+            fm_head = nn.Sequential(
+                nn.Linear(hidden_size, 4096, bias=True),
+                nn.GELU(),
+                nn.Linear(4096, output_dim, bias=True),
+            )
+        else:
+            raise NotImplementedError(
+                "SenseNova U1 native SRT currently supports fm_head_layers <= 2 "
+                "or use_pixel_head checkpoints"
+            )
+
+        modules = nn.ModuleDict(
+            {
+                "vision_model_mot_gen": NEOVisionModel(config.vision_config),
+                "timestep_embedder": U1TimestepEmbedder(hidden_size),
+                "fm_head": fm_head,
+            }
+        )
+        if bool(config.add_noise_scale_embedding):
+            modules["noise_scale_embedder"] = U1TimestepEmbedder(hidden_size)
+        return modules
 
     @torch.no_grad()
     def forward(
@@ -723,6 +990,168 @@ class NEOChatModel(nn.Module):
             grid_hw=grid_hw,
         ).last_hidden_state
 
+    def extract_feature(
+        self,
+        pixel_values: torch.Tensor,
+        *,
+        grid_hw: torch.Tensor,
+        gen_model: bool = False,
+    ) -> torch.Tensor:
+        vision_model = (
+            self.fm_modules["vision_model_mot_gen"] if gen_model else self.vision_model
+        )
+        return vision_model(
+            pixel_values=pixel_values.to(
+                device=vision_model.device,
+                dtype=vision_model.dtype,
+            ),
+            grid_hw=grid_hw.to(device=vision_model.device, dtype=torch.long),
+        ).last_hidden_state
+
+    def patchify(
+        self,
+        images: torch.Tensor,
+        patch_size: int,
+        *,
+        channel_first: bool = False,
+    ) -> torch.Tensor:
+        h, w = images.shape[2] // patch_size, images.shape[3] // patch_size
+        x = images.reshape(images.shape[0], 3, h, patch_size, w, patch_size)
+        if channel_first:
+            x = torch.einsum("nchpwq->nhwcpq", x)
+        else:
+            x = torch.einsum("nchpwq->nhwpqc", x)
+        return x.reshape(images.shape[0], h * w, patch_size**2 * 3)
+
+    def unpatchify(
+        self,
+        x: torch.Tensor,
+        patch_size: int,
+        h: int | None = None,
+        w: int | None = None,
+    ) -> torch.Tensor:
+        if h is None or w is None:
+            h = w = int(x.shape[1] ** 0.5)
+        else:
+            h = h // patch_size
+            w = w // patch_size
+        x = x.reshape(x.shape[0], h, w, patch_size, patch_size, 3)
+        x = torch.einsum("nhwpqc->nchpwq", x)
+        return x.reshape(x.shape[0], 3, h * patch_size, w * patch_size)
+
+    def build_t2i_image_indexes(
+        self,
+        *,
+        token_h: int,
+        token_w: int,
+        text_len: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        t_image = torch.full(
+            (token_h * token_w,),
+            int(text_len),
+            dtype=torch.long,
+            device=device,
+        )
+        idx = torch.arange(token_h * token_w, device=device, dtype=torch.long)
+        h_image = idx // token_w
+        w_image = idx % token_w
+        return torch.stack([t_image, h_image, w_image], dim=0)
+
+    def apply_time_schedule(
+        self,
+        timesteps: torch.Tensor,
+        *,
+        image_seq_len: int,
+        timestep_shift: float,
+    ) -> torch.Tensor:
+        sigma = 1 - timesteps
+        schedule = self.time_schedule
+        if timestep_shift != 1:
+            schedule = "standard"
+        if schedule == "standard":
+            shift = float(timestep_shift)
+            sigma = shift * sigma / (1 + (shift - 1) * sigma)
+        elif schedule == "dynamic":
+            mu = self._calculate_dynamic_mu(image_seq_len)
+            mu_t = timesteps.new_tensor(mu)
+            if self.time_shift_type == "exponential":
+                shift = torch.exp(mu_t)
+                sigma = shift * sigma / (1 + (shift - 1) * sigma)
+            elif self.time_shift_type == "linear":
+                sigma = mu_t / (mu_t + (1 / sigma - 1))
+            else:
+                raise ValueError(f"Unsupported U1 time_shift_type: {self.time_shift_type}")
+        else:
+            raise ValueError(f"Unsupported U1 time_schedule: {schedule}")
+        return 1 - sigma
+
+    def noise_scale_for_image(self, *, grid_h: int, grid_w: int) -> float:
+        merge_size = _merge_size_from_downsample_ratio(float(self.downsample_ratio))
+        noise_scale = float(self.noise_scale)
+        if self.noise_scale_mode in {"resolution", "dynamic", "dynamic_sqrt"}:
+            base = float(self.noise_scale_base_image_seq_len)
+            scale = math.sqrt((grid_h * grid_w) / (merge_size**2) / base)
+            noise_scale = scale * float(self.noise_scale)
+            if self.noise_scale_mode == "dynamic_sqrt":
+                noise_scale = math.sqrt(noise_scale)
+        return min(noise_scale, float(self.noise_scale_max_value))
+
+    def predict_u1_pixel_flow_from_srt(
+        self,
+        *,
+        image_embeds: torch.Tensor,
+        indexes_image: torch.Tensor,
+        forward_batch: ForwardBatch,
+        timestep: torch.Tensor,
+        z: torch.Tensor,
+        image_size: tuple[int, int],
+    ) -> torch.Tensor:
+        batch_size, image_token_num = image_embeds.shape[:2]
+        hidden_states = self.language_model.forward_u1_gen_embeds(
+            input_embeds=image_embeds.reshape(-1, image_embeds.shape[-1]),
+            positions=indexes_image,
+            forward_batch=forward_batch,
+        ).view(batch_size, image_token_num, -1)
+
+        if self.use_pixel_head:
+            merge_size = _merge_size_from_downsample_ratio(float(self.downsample_ratio))
+            token_h = image_size[1] // (self.patch_size * merge_size)
+            token_w = image_size[0] // (self.patch_size * merge_size)
+            img_2d = hidden_states.view(batch_size, token_h, token_w, -1)
+            img_2d = torch.einsum("b h w c -> b c h w", img_2d).contiguous()
+            x_pred_2d = self.fm_modules["fm_head"](img_2d)
+            x_pred = (
+                x_pred_2d.view(
+                    batch_size,
+                    3,
+                    token_h,
+                    self.patch_size * merge_size,
+                    token_w,
+                    self.patch_size * merge_size,
+                )
+                .permute(0, 2, 4, 3, 5, 1)
+                .contiguous()
+                .view(batch_size, image_token_num, -1)
+            )
+        else:
+            x_pred = self.fm_modules["fm_head"](hidden_states).view(
+                batch_size,
+                image_token_num,
+                -1,
+            )
+
+        t = timestep.to(device=z.device, dtype=z.dtype)
+        return (x_pred - z) / (1 - t).clamp_min(float(getattr(self.config, "t_eps", 0.02)))
+
+    def _calculate_dynamic_mu(self, image_seq_len: int) -> float:
+        denom = self.max_image_seq_len - self.base_image_seq_len
+        if denom == 0:
+            return float(self.base_shift)
+        slope = (self.max_shift - self.base_shift) / denom
+        bias = self.base_shift - slope * self.base_image_seq_len
+        return float(image_seq_len) * slope + bias
+
     def get_input_embeddings(self) -> nn.Embedding:
         return self.language_model.get_input_embeddings()
 
@@ -767,7 +1196,7 @@ class NEOChatModel(nn.Module):
 
         def llm_weights():
             for name, loaded_weight in weights:
-                if name.startswith("vision_model."):
+                if name.startswith(("vision_model.", "fm_modules.")):
                     if name in params_dict:
                         param = params_dict[name]
                         weight_loader = getattr(
