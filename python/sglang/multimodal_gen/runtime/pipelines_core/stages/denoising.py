@@ -179,10 +179,11 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         self.vae = vae
         self.pipeline = weakref.ref(pipeline) if pipeline else None
 
-        # TODO(will): hack, should use the actual one in dit
+        selected_attention_backend = self._infer_transformer_attention_backend()
         self.attn_backend = get_attn_backend(
             head_size=attn_head_size,
             dtype=torch.float16,
+            selected_attention_backend=selected_attention_backend,
         )
 
         # cfg
@@ -194,6 +195,26 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         self._cache_dit_enabled = False
         self._cached_num_steps = None
         self._is_warmed_up = False
+
+    def _infer_transformer_attention_backend(self) -> AttentionBackendEnum | None:
+        backends = {
+            backend
+            for transformer in (self.transformer, self.transformer_2)
+            if transformer is not None
+            for module in transformer.modules()
+            if isinstance(
+                (backend := getattr(module, "backend", None)), AttentionBackendEnum
+            )
+        }
+        if not backends:
+            return None
+        if len(backends) > 1:
+            logger.warning(
+                "Multiple transformer attention backends detected: %s. "
+                "Using one backend for denoising metadata.",
+                sorted(backend.name.lower() for backend in backends),
+            )
+        return sorted(backends, key=lambda backend: backend.name)[0]
 
     def component_uses(
         self, server_args: ServerArgs, stage_name: str | None = None

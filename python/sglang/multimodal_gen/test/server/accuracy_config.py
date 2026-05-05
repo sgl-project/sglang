@@ -297,6 +297,9 @@ SKIP_COMPONENTS: Dict[str, Dict[ComponentType, ComponentSkip]] = {
         ),
     },
     "mova_360p_ring1_uly2": {
+        ComponentType.VAE: ComponentSkip(
+            "Representative MOVA VAE accuracy is covered by mova_360p_tp2; ring/ulysses topology does not exercise a distinct VAE component"
+        ),
         ComponentType.TRANSFORMER: ComponentSkip(
             "HF reference transformer cannot be materialized from the MOVA video_dit repo layout"
         ),
