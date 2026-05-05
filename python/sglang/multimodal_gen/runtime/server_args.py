@@ -131,6 +131,9 @@ class ServerArgs(DisaggArgsMixin):
     # Attention
     attention_backend: str = None
     attention_backend_config: addict.Dict | None = None
+    component_attention_backends: dict[str, str] | str | None = field(
+        default_factory=dict
+    )
     cache_dit_config: str | dict[str, Any] | None = (
         None  # cache-dit config for diffusers
     )
@@ -190,7 +193,7 @@ class ServerArgs(DisaggArgsMixin):
     dit_offload_prefetch_size: float = 0.0
     text_encoder_cpu_offload: bool | None = None
     image_encoder_cpu_offload: bool | None = None
-    vae_cpu_offload: bool | None = None
+    vae_cpu_offload: bool | None = False
     use_fsdp_inference: bool = False
     pin_cpu_memory: bool = True
     ltx2_two_stage_device_mode: str | None = None
@@ -225,6 +228,11 @@ class ServerArgs(DisaggArgsMixin):
     webui_port: int | None = 12312
 
     scheduler_port: int = 5555
+    batching_mode: str = "dynamic"
+    batching_max_size: int = 1
+    batching_delay_ms: float = 0.0
+    batching_config: str | None = None
+    enable_batching_metrics: bool = False
 
     # Strict port mode: fail if requested port is unavailable instead of auto-selecting
     strict_ports: bool = False
@@ -325,6 +333,7 @@ class ServerArgs(DisaggArgsMixin):
         if not current_platform.is_cpu():
             self._validate_parallelism()
         self._validate_cfg_parallel()
+        self._validate_batching()
 
     def _adjust_save_paths(self):
         """Normalize empty-string save paths to None (disabled)."""
@@ -376,15 +385,15 @@ class ServerArgs(DisaggArgsMixin):
 
         # TODO: to be handled by each platform
         if current_platform.get_device_total_memory() / BYTES_PER_GB < 30:
-            logger.info("Enabling all offloading for GPU with low device memory")
+            logger.info(
+                "Enabling large component offloading for GPU with low device memory"
+            )
             if self.dit_cpu_offload is None:
                 self.dit_cpu_offload = True
             if self.text_encoder_cpu_offload is None:
                 self.text_encoder_cpu_offload = True
             if self.image_encoder_cpu_offload is None:
                 self.image_encoder_cpu_offload = True
-            if self.vae_cpu_offload is None:
-                self.vae_cpu_offload = True
         elif self.pipeline_config.task_type.is_image_gen():
             logger.info(
                 "Disabling some offloading (except dit, text_encoder) for image generation model"
@@ -395,8 +404,6 @@ class ServerArgs(DisaggArgsMixin):
                 self.text_encoder_cpu_offload = True
             if self.image_encoder_cpu_offload is None:
                 self.image_encoder_cpu_offload = False
-            if self.vae_cpu_offload is None:
-                self.vae_cpu_offload = False
         else:
             if self.dit_cpu_offload is None:
                 self.dit_cpu_offload = True
@@ -404,8 +411,6 @@ class ServerArgs(DisaggArgsMixin):
                 self.text_encoder_cpu_offload = True
             if self.image_encoder_cpu_offload is None:
                 self.image_encoder_cpu_offload = True
-            if self.vae_cpu_offload is None:
-                self.vae_cpu_offload = True
 
     def _adjust_ltx2_two_stage_device_mode(self):
         if not self._is_ltx23_two_stage_pipeline():
@@ -468,6 +473,11 @@ class ServerArgs(DisaggArgsMixin):
     def _adjust_attention_backend(self):
         if self.attention_backend in ["fa3", "fa4"]:
             self.attention_backend = "fa"
+        self.component_attention_backends = (
+            self._normalize_component_attention_backends(
+                self.component_attention_backends
+            )
+        )
 
         # attention_backend_config
         if self.attention_backend_config is None:
@@ -509,6 +519,82 @@ class ServerArgs(DisaggArgsMixin):
                 )
                 return
             self._set_default_attention_backend()
+
+    @staticmethod
+    def _normalize_attention_backend_name(backend: str) -> str:
+        if not isinstance(backend, str):
+            raise ValueError("Attention backend name must be a string")
+        normalized = backend.strip().lower()
+        if normalized in ("fa3", "fa4"):
+            normalized = "fa"
+        try:
+            return AttentionBackendEnum[normalized.upper()].name.lower()
+        except KeyError:
+            raise ValueError(
+                f"Invalid attention backend '{backend}'. "
+                f"Available options are: {[e.name.lower() for e in AttentionBackendEnum]}"
+            ) from None
+
+    @staticmethod
+    def _parse_component_attention_backend_map(
+        value: dict[str, str] | str | None,
+    ) -> dict[str, str]:
+        if value is None or value == "":
+            return {}
+        if isinstance(value, dict):
+            return dict(value)
+        if not isinstance(value, str):
+            raise ValueError(
+                "component_attention_backends must be a dict or a comma-separated component=backend string"
+            )
+
+        try:
+            parsed = json.loads(value)
+            if not isinstance(parsed, dict):
+                raise ValueError
+            return parsed
+        except (json.JSONDecodeError, ValueError):
+            pass
+
+        result: dict[str, str] = {}
+        for pair in value.split(","):
+            pair = pair.strip()
+            if not pair:
+                continue
+            if "=" not in pair:
+                raise ValueError(
+                    "component_attention_backends must use component=backend entries"
+                )
+            component, backend = pair.split("=", 1)
+            result[component.strip()] = backend.strip()
+        return result
+
+    @classmethod
+    def _normalize_component_attention_backends(
+        cls, value: dict[str, str] | str | None
+    ) -> dict[str, str]:
+        raw = cls._parse_component_attention_backend_map(value)
+        normalized: dict[str, str] = {}
+        for component, backend in raw.items():
+            if not isinstance(component, str):
+                raise ValueError("Component attention backend key must be a string")
+            component_name = component.strip().replace("-", "_")
+            if not component_name:
+                raise ValueError("Component attention backend key must not be empty")
+            normalized[component_name] = cls._normalize_attention_backend_name(backend)
+        return normalized
+
+    def resolve_component_attention_backend(
+        self, *component_names: str | None
+    ) -> tuple[AttentionBackendEnum | None, str | None]:
+        for component_name in component_names:
+            if component_name is None:
+                continue
+            key = component_name.replace("-", "_")
+            backend = self.component_attention_backends.get(key)
+            if backend is not None:
+                return AttentionBackendEnum[backend.upper()], key
+        return None, None
 
     def _adjust_warmup(self):
         if self.warmup_resolutions is not None:
@@ -807,6 +893,16 @@ class ServerArgs(DisaggArgsMixin):
             help="Configuration for the attention backend. Can be a JSON string, a path to a JSON/YAML file, or key=value pairs.",
         )
         parser.add_argument(
+            "--component-attention-backends",
+            type=str,
+            default=None,
+            help=(
+                "Per-component attention backend overrides for native pipelines. "
+                "Use component names from model_index.json, e.g. "
+                "'text_encoder=torch_sdpa,transformer=fa'."
+            ),
+        )
+        parser.add_argument(
             "--cache-dit-config",
             type=str,
             default=ServerArgs.cache_dit_config,
@@ -1021,6 +1117,41 @@ class ServerArgs(DisaggArgsMixin):
             help="Port for the scheduler server.",
         )
         parser.add_argument(
+            "--batching-mode",
+            type=str,
+            default=ServerArgs.batching_mode,
+            choices=["dynamic"],
+            help="Request batching scheduler mode. Currently only 'dynamic' is implemented.",
+        )
+        parser.add_argument(
+            "--batching-max-size",
+            type=int,
+            default=ServerArgs.batching_max_size,
+            help="Maximum number of compatible generation requests to merge into one batch.",
+        )
+        parser.add_argument(
+            "--batching-delay-ms",
+            type=float,
+            default=ServerArgs.batching_delay_ms,
+            help="Maximum time (in ms) to wait for forming a larger batch before dispatch.",
+        )
+        parser.add_argument(
+            "--batching-config",
+            type=str,
+            default=ServerArgs.batching_config,
+            help=(
+                "Optional JSON file with {'schema_version': 1, 'rules': [...]} "
+                "batching admission rules that can cap model/resolution shapes "
+                "below --batching-max-size."
+            ),
+        )
+        parser.add_argument(
+            "--enable-batching-metrics",
+            action="store_true",
+            default=ServerArgs.enable_batching_metrics,
+            help="Log periodic batch efficiency metrics such as realized batch size and queue wait time.",
+        )
+        parser.add_argument(
             "--host",
             type=str,
             default=ServerArgs.host,
@@ -1230,6 +1361,43 @@ class ServerArgs(DisaggArgsMixin):
             component_paths[component] = path
         return component_paths, remaining
 
+    @staticmethod
+    def _extract_component_attention_backends(
+        unknown_args: list[str],
+    ) -> tuple[dict[str, str], list[str]]:
+        component_attention_backends: dict[str, str] = {}
+        remaining: list[str] = []
+        i = 0
+        while i < len(unknown_args):
+            arg = unknown_args[i]
+            key_part = arg.split("=", 1)[0] if "=" in arg else arg
+            component = None
+            if key_part.startswith("--component-attention-backends."):
+                component = key_part[len("--component-attention-backends.") :].replace(
+                    "-", "_"
+                )
+            elif key_part.startswith("--component_attention_backends."):
+                component = key_part[len("--component_attention_backends.") :].replace(
+                    "-", "_"
+                )
+
+            if component is not None:
+                if "=" in arg:
+                    component_attention_backends[component] = arg.split("=", 1)[1]
+                elif i + 1 < len(unknown_args) and not unknown_args[i + 1].startswith(
+                    "-"
+                ):
+                    i += 1
+                    component_attention_backends[component] = unknown_args[i]
+                else:
+                    remaining.append(arg)
+                    i += 1
+                    continue
+            else:
+                remaining.append(arg)
+            i += 1
+        return component_attention_backends, remaining
+
     @classmethod
     def from_cli_args(
         cls, args: argparse.Namespace, unknown_args: list[str] | None = None
@@ -1239,6 +1407,9 @@ class ServerArgs(DisaggArgsMixin):
 
         # extract dynamic --<component>-path from unknown args
         dynamic_paths, remaining = cls._extract_component_paths(unknown_args)
+        dynamic_attention_backends, remaining = (
+            cls._extract_component_attention_backends(remaining)
+        )
         if remaining:
             raise SystemExit(f"error: unrecognized arguments: {' '.join(remaining)}")
 
@@ -1254,6 +1425,12 @@ class ServerArgs(DisaggArgsMixin):
             existing = dict(provided_args.get("component_paths") or {})
             existing.update(dynamic_paths)
             provided_args["component_paths"] = existing
+        if dynamic_attention_backends:
+            existing = cls._parse_component_attention_backend_map(
+                provided_args.get("component_attention_backends")
+            )
+            existing.update(dynamic_attention_backends)
+            provided_args["component_attention_backends"] = existing
 
         return cls.from_dict(provided_args)
 
@@ -1460,6 +1637,14 @@ class ServerArgs(DisaggArgsMixin):
             raise ValueError(
                 "CFG Parallelism is enabled via `--enable-cfg-parallel`, but num_gpus == 1"
             )
+
+    def _validate_batching(self):
+        if self.batching_mode != "dynamic":
+            raise ValueError("batching_mode must be one of: dynamic")
+        if self.batching_max_size < 1:
+            raise ValueError("batching_max_size must be >= 1")
+        if self.batching_delay_ms < 0:
+            raise ValueError("batching_delay_ms must be >= 0")
 
     def _set_default_attention_backend(self) -> None:
         """Configure ROCm defaults when users do not specify an attention backend."""

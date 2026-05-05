@@ -91,6 +91,30 @@ class FluxPipelineConfig(ImagePipelineConfig):
         # Flux v1 does not use attention masks for text encoders.
         return None
 
+    def build_text_conditioning_mask(
+        self,
+        text_inputs: dict,
+        text_encoder_attention_mask: "torch.Tensor | None",
+        prompt_embeds: "torch.Tensor",
+        encoder_index: int,
+    ) -> "torch.Tensor":
+        """Use all-valid fixed-length masks for Flux v1 text embeddings."""
+        if prompt_embeds.ndim < 2:
+            raise ValueError(
+                "prompt_embeds must have shape [batch, seq, ...] or [seq, ...]"
+            )
+        if prompt_embeds.ndim == 2:
+            shape = (1, prompt_embeds.shape[0])
+        else:
+            shape = prompt_embeds.shape[:2]
+        return torch.ones(shape, dtype=torch.bool)
+
+    @staticmethod
+    def seq_lens_from_text_conditioning_mask(mask: "torch.Tensor") -> list[int]:
+        if mask.ndim != 2:
+            raise ValueError("text conditioning mask must have shape [batch, seq]")
+        return [int(mask.shape[1])] * int(mask.shape[0])
+
     def get_text_encoder_pooler_output(self, outputs, encoder_index):
         return outputs.pooler_output
 
@@ -143,7 +167,27 @@ class FluxPipelineConfig(ImagePipelineConfig):
 
         return latent_image_ids
 
-    def get_freqs_cis(self, prompt_embeds, width, height, device, rotary_emb, batch):
+    @staticmethod
+    def _validate_fixed_text_seq_lens(prompt_embeds, txt_seq_lens):
+        if prompt_embeds.ndim < 3:
+            raise ValueError(
+                "Flux text conditioning expects prompt_embeds with shape [batch, seq, dim]"
+            )
+        batch_size, seq_len = prompt_embeds.shape[:2]
+        if len(txt_seq_lens) != batch_size:
+            raise ValueError(
+                f"Flux text sequence lengths have {len(txt_seq_lens)} entries, expected {batch_size}."
+            )
+        if any(int(seq_len_i) != seq_len for seq_len_i in txt_seq_lens):
+            raise ValueError(
+                "Flux currently requires fixed-length text conditioning; "
+                f"got seq_lens={txt_seq_lens}, expected all {seq_len}."
+            )
+
+    def get_freqs_cis(
+        self, prompt_embeds, width, height, device, rotary_emb, batch, txt_seq_lens
+    ):
+        self._validate_fixed_text_seq_lens(prompt_embeds, txt_seq_lens)
         txt_ids = torch.zeros(prompt_embeds.shape[1], 3, device=device)
         img_ids = self._prepare_latent_image_ids(
             original_height=height,
@@ -175,6 +219,21 @@ class FluxPipelineConfig(ImagePipelineConfig):
         return latents
 
     def prepare_pos_cond_kwargs(self, batch, device, rotary_emb, dtype):
+        """Build Flux positive-conditioning kwargs from encoded text state.
+
+        Flux v1 uses encoder index 1 (the T5 encoder) as the token stream that
+        is concatenated with image tokens for rotary position embeddings. The
+        text encoding stage stores per-request sequence lengths in
+        batch.prompt_seq_lens; read them here instead of inferring from padded
+        embeddings so grouped multi-output requests preserve their explicit
+        text-conditioning contract.
+        """
+        txt_seq_lens = self.require_text_seq_lens(
+            batch,
+            1,
+            negative=False,
+            expected_batch_size=batch.prompt_embeds[1].shape[0],
+        )
         return {
             "freqs_cis": self.get_freqs_cis(
                 batch.prompt_embeds[1],
@@ -183,6 +242,7 @@ class FluxPipelineConfig(ImagePipelineConfig):
                 device,
                 rotary_emb,
                 batch,
+                txt_seq_lens,
             ),
             "pooled_projections": (
                 batch.pooled_embeds[0] if batch.pooled_embeds else None
@@ -190,6 +250,13 @@ class FluxPipelineConfig(ImagePipelineConfig):
         }
 
     def prepare_neg_cond_kwargs(self, batch, device, rotary_emb, dtype):
+        """Build Flux negative-conditioning kwargs using T5 sequence lengths."""
+        txt_seq_lens = self.require_text_seq_lens(
+            batch,
+            1,
+            negative=True,
+            expected_batch_size=batch.negative_prompt_embeds[1].shape[0],
+        )
         return {
             "freqs_cis": self.get_freqs_cis(
                 batch.negative_prompt_embeds[1],
@@ -198,6 +265,7 @@ class FluxPipelineConfig(ImagePipelineConfig):
                 device,
                 rotary_emb,
                 batch,
+                txt_seq_lens,
             ),
             "pooled_projections": (
                 batch.neg_pooled_embeds[0] if batch.neg_pooled_embeds else None
@@ -412,6 +480,14 @@ class Flux2PipelineConfig(FluxPipelineConfig):
         # Flux2 does not use pooler output.
         return None
 
+    def supports_dynamic_batching(self):
+        """Allow batching for Flux2 text-only requests.
+
+        Flux2 is a TI2I pipeline, so image-input requests are rejected by the
+        scheduler's request-level batching checks.
+        """
+        return True
+
     def tokenize_prompt(self, prompts: list[str], tokenizer, tok_kwargs) -> dict:
         messages = build_flux2_text_messages(prompts)
         inputs = tokenizer.apply_chat_template(
@@ -513,7 +589,10 @@ class Flux2PipelineConfig(FluxPipelineConfig):
         image_latent_ids = image_latent_ids.repeat(batch.batch_size, 1, 1)
         batch.condition_image_latent_ids = image_latent_ids.to(get_local_torch_device())
 
-    def get_freqs_cis(self, prompt_embeds, width, height, device, rotary_emb, batch):
+    def get_freqs_cis(
+        self, prompt_embeds, width, height, device, rotary_emb, batch, txt_seq_lens
+    ):
+        self._validate_fixed_text_seq_lens(prompt_embeds, txt_seq_lens)
         txt_ids = _prepare_text_ids(prompt_embeds).to(device=device)
 
         img_ids = batch.latent_ids
@@ -544,6 +623,19 @@ class Flux2PipelineConfig(FluxPipelineConfig):
         return cos, sin
 
     def prepare_pos_cond_kwargs(self, batch, device, rotary_emb, dtype):
+        """Build Flux2 positive-conditioning kwargs from encoded text state.
+
+        Flux2 uses encoder index 0 for the Mistral text stream. The stored
+        sequence lengths are passed through to rotary-position preparation so
+        grouped requests use the same text-length metadata that was produced
+        during text encoding.
+        """
+        txt_seq_lens = self.require_text_seq_lens(
+            batch,
+            0,
+            negative=False,
+            expected_batch_size=batch.prompt_embeds[0].shape[0],
+        )
         return {
             "freqs_cis": self.get_freqs_cis(
                 batch.prompt_embeds[0],
@@ -552,6 +644,7 @@ class Flux2PipelineConfig(FluxPipelineConfig):
                 device,
                 rotary_emb,
                 batch,
+                txt_seq_lens,
             )
         }
 

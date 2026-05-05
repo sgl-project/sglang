@@ -18,6 +18,14 @@ def _solid_image(value: int, size: int = 32) -> np.ndarray:
     return np.full((size, size, 3), value, dtype=np.uint8)
 
 
+def test_consistency_gt_urls_are_pinned_to_ci_data_revision():
+    revision_path = f"/ci-data/{test_utils.SGL_TEST_FILES_CI_DATA_REVISION}/"
+
+    assert "/ci-data/main/" not in test_utils.SGL_TEST_FILES_CONSISTENCY_GT_ROOT
+    assert revision_path in test_utils.SGL_TEST_FILES_OFFICIAL_CONSISTENCY_GT_BASE
+    assert revision_path in test_utils.SGL_TEST_FILES_SGLANG_CONSISTENCY_GT_BASE
+
+
 def test_pixel_metrics_identical_image():
     image = _solid_image(128)
 
