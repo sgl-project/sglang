@@ -469,6 +469,7 @@ class SchedulerMetricsMixin:
 
             # Utilization / LoRA / HiCache
             self.calculate_utilization()
+            self.stats.fwd_occupancy = getattr(self, "fwd_occupancy", float("nan"))
             self.update_lora_metrics()
             self._log_hicache_stats()
             self.metrics_collector.log_stats(self.stats)
@@ -661,6 +662,7 @@ class SchedulerMetricsMixin:
 
             # Utilization / LoRA / HiCache
             self.calculate_utilization()
+            self.stats.fwd_occupancy = getattr(self, "fwd_occupancy", float("nan"))
             self.update_lora_metrics()
             self._log_hicache_stats()
             self.metrics_collector.log_stats(self.stats)
