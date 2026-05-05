@@ -364,6 +364,17 @@ class TestGemma4MTP31BGSM8K(Gemma4MTPGSM8KMixin, CustomTestCase):
     )
 
 
+class TestGemma4NVFP4MTP31BGSM8K(Gemma4MTPGSM8KMixin, CustomTestCase):
+    model_pair = ModelPair(
+        name="31B",
+        target_path="nvidia/Gemma-4-31B-IT-NVFP4",
+        assistant_path="google/gemma-4-31B-it-assistant",
+        accept_length_threshold=None,
+        server_cuda_visible_devices="0,1",
+        tensor_parallel_size=2,
+    )
+
+
 class TestGemma4MTP26BA4BGSM8K(Gemma4MTPGSM8KMixin, CustomTestCase):
     model_pair = ModelPair(
         name="26B-A4B",
