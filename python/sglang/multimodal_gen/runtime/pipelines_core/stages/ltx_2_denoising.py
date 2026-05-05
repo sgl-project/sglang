@@ -461,8 +461,14 @@ class LTX2DenoisingStage(DenoisingStage):
 
         sigma_d = sigma.double()
         sigma_next_d = sigma_next.double()
-        h = self._ltx2_res2s_step_size_scalar(sigma_d, sigma_next_d)
-        a21, b1, b2 = self._ltx2_get_res2s_coefficients_scalar(h)
+        if ctx.use_ltx23_hq_timestep_semantics:
+            h = self._ltx2_res2s_step_size_scalar(sigma_d, sigma_next_d)
+            a21, b1, b2 = self._ltx2_get_res2s_coefficients_scalar(h)
+            h_value = h
+        else:
+            h = -torch.log(torch.clamp(sigma_next_d / sigma_d, min=1e-12))
+            a21, b1, b2 = self._ltx2_get_res2s_coefficients(h)
+            h_value = float(h.item())
         sub_sigma = torch.sqrt(torch.clamp(sigma_d * sigma_next_d, min=0.0))
 
         anchor_video = ctx.latents.double()
@@ -509,7 +515,7 @@ class LTX2DenoisingStage(DenoisingStage):
         )
 
         # Bongmath anchor refinement for the first stage-2 step.
-        if h < 0.5 and sigma_val > 0.03:
+        if h_value < 0.5 and sigma_val > 0.03:
             x_mid_v = midpoint_video_latents.double()
             x_mid_a = midpoint_audio_latents.double()
             for _ in range(100):
@@ -557,21 +563,23 @@ class LTX2DenoisingStage(DenoisingStage):
                 ctx.audio_latents, batch
             ).float()
         )
-        # Official res2s keeps main-step SDE sigmas in scheduler dtype; only
-        # deterministic RK/substep math uses double precision.
+        sde_sigma = sigma if ctx.use_ltx23_hq_timestep_semantics else sigma_d
+        sde_sigma_next = (
+            sigma_next if ctx.use_ltx23_hq_timestep_semantics else sigma_next_d
+        )
         next_video = self._ltx2_res2s_sde_step(
             sample=anchor_video,
             denoised_sample=next_video_det,
-            sigma=sigma,
-            sigma_next=sigma_next,
+            sigma=sde_sigma,
+            sigma_next=sde_sigma_next,
             noise=step_noise_video,
             terminal=False,
         )
         next_audio = self._ltx2_res2s_sde_step(
             sample=anchor_audio,
             denoised_sample=next_audio_det,
-            sigma=sigma,
-            sigma_next=sigma_next,
+            sigma=sde_sigma,
+            sigma_next=sde_sigma_next,
             noise=step_noise_audio,
             terminal=False,
         )
@@ -1941,8 +1949,14 @@ class LTX2DenoisingStage(DenoisingStage):
             else:
                 sigma_d = sigma.double()
                 sigma_next_d = sigma_next.double()
-                h = self._ltx2_res2s_step_size_scalar(sigma_d, sigma_next_d)
-                a21, b1, b2 = self._ltx2_get_res2s_coefficients_scalar(h)
+                if ctx.use_ltx23_hq_timestep_semantics:
+                    h = self._ltx2_res2s_step_size_scalar(sigma_d, sigma_next_d)
+                    a21, b1, b2 = self._ltx2_get_res2s_coefficients_scalar(h)
+                    h_value = h
+                else:
+                    h = -torch.log(torch.clamp(sigma_next_d / sigma_d, min=1e-12))
+                    a21, b1, b2 = self._ltx2_get_res2s_coefficients(h)
+                    h_value = float(h.item())
                 sub_sigma = torch.sqrt(torch.clamp(sigma_d * sigma_next_d, min=0.0))
 
                 anchor_video = ctx.latents.double()
@@ -1993,7 +2007,7 @@ class LTX2DenoisingStage(DenoisingStage):
                     dtype=ctx.audio_latents.dtype
                 )
 
-                if h < 0.5 and sigma_val > 0.03:
+                if h_value < 0.5 and sigma_val > 0.03:
                     x_mid_v = midpoint_video_latents.double()
                     x_mid_a = midpoint_audio_latents.double()
                     for _ in range(100):
@@ -2034,21 +2048,23 @@ class LTX2DenoisingStage(DenoisingStage):
                         ctx.audio_latents, batch
                     ).float()
                 )
-                # Official res2s keeps main-step SDE sigmas in scheduler dtype;
-                # only deterministic RK/substep math uses double precision.
+                sde_sigma = sigma if ctx.use_ltx23_hq_timestep_semantics else sigma_d
+                sde_sigma_next = (
+                    sigma_next if ctx.use_ltx23_hq_timestep_semantics else sigma_next_d
+                )
                 next_video_latents = self._ltx2_res2s_sde_step(
                     sample=anchor_video,
                     denoised_sample=next_video_deterministic,
-                    sigma=sigma,
-                    sigma_next=sigma_next,
+                    sigma=sde_sigma,
+                    sigma_next=sde_sigma_next,
                     noise=step_video_noise,
                     terminal=False,
                 )
                 next_audio_latents = self._ltx2_res2s_sde_step(
                     sample=anchor_audio,
                     denoised_sample=next_audio_deterministic,
-                    sigma=sigma,
-                    sigma_next=sigma_next,
+                    sigma=sde_sigma,
+                    sigma_next=sde_sigma_next,
                     noise=step_audio_noise,
                     terminal=False,
                 )
