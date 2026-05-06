@@ -334,29 +334,29 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         dispose_tensor(hidden_states)
         dispose_tensor(hidden_states_scale)
 
-        assert (
-            self.swiglu_limit is not None
-        ), f"swiglu_limit must be non-None for DeepSeek V4 (got {self.swiglu_limit!r})"
         swiglu_limit_arg: Optional[float] = None
-        assert (
-            not _MASKED_GEMM_FAST_ACT
-        ), "DeepSeek V4 does not support SGLANG_MASKED_GEMM_FAST_ACT"
-        assert (
-            envs.SGLANG_OPT_USE_JIT_EP_ACTIVATION.get()
-        ), "DeepSeek V4 requires SGLANG_OPT_USE_JIT_EP_ACTIVATION=True"
+        if self.swiglu_limit is not None:
+            # DeepSeek V4: clamped swiglu requires JIT EP activation; the
+            # FAST_ACT fused-quant path doesn't carry a swiglu_limit arg.
+            assert (
+                not _MASKED_GEMM_FAST_ACT
+            ), "DeepSeek V4 does not support SGLANG_MASKED_GEMM_FAST_ACT"
+            assert (
+                envs.SGLANG_OPT_USE_JIT_EP_ACTIVATION.get()
+            ), "DeepSeek V4 requires SGLANG_OPT_USE_JIT_EP_ACTIVATION=True"
 
-        if envs.SGLANG_OPT_SWIGLU_CLAMP_FUSION.get():
-            swiglu_limit_arg = self.swiglu_limit
-        else:
-            gateup_output = einops.rearrange(
-                gateup_output, "grp tok hidden -> (grp tok) hidden"
-            )
-            gateup_output = _apply_swiglu_limit(
-                gateup_output, swiglu_limit=self.swiglu_limit
-            )
-            gateup_output = einops.rearrange(
-                gateup_output, "(grp tok) hidden -> grp tok hidden", grp=num_groups
-            )
+            if envs.SGLANG_OPT_SWIGLU_CLAMP_FUSION.get():
+                swiglu_limit_arg = self.swiglu_limit
+            else:
+                gateup_output = einops.rearrange(
+                    gateup_output, "grp tok hidden -> (grp tok) hidden"
+                )
+                gateup_output = _apply_swiglu_limit(
+                    gateup_output, swiglu_limit=self.swiglu_limit
+                )
+                gateup_output = einops.rearrange(
+                    gateup_output, "(grp tok) hidden -> grp tok hidden", grp=num_groups
+                )
 
         # Act
         down_input, down_input_scale = _varlen_deep_gemm_silu_mul_quant(
