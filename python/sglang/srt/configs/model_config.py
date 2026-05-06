@@ -1470,6 +1470,8 @@ def is_hybrid_swa_model(model_architectures: List[str]):
         "Step3p5MTP",
         "Gemma4ForCausalLM",
         "Gemma4ForConditionalGeneration",
+        "Exaone4_5_ForConditionalGeneration",
+        "Exaone4_5_ForConditionalGenerationMTP"
     }
     return any(arch in hybrid_swa_archs for arch in model_architectures)
 
@@ -1531,6 +1533,23 @@ def get_hybrid_layer_ids(
         full_attention_layer_ids = [
             i for i, x in enumerate(layer_types) if x == "full_attention"
         ]
+    elif (
+        "Exaone4_5_ForConditionalGeneration" in model_architectures
+        or "Exaone4_5_ForConditionalGenerationMTP" in model_architectures
+    ):
+        pattern = getattr(hf_text_config, "sliding_window_pattern", None)
+        if pattern is None:
+            swa_attention_layer_ids = []
+            full_attention_layer_ids = list(range(num_hidden_layers))
+        else:
+            swa_attention_layer_ids = [
+                i for i in range(num_hidden_layers)
+                if pattern[i % len(pattern)].upper() == "L"
+            ]
+            full_attention_layer_ids = [
+                i for i in range(num_hidden_layers)
+                if pattern[i % len(pattern)].upper() == "G"
+            ]
     else:
         swa_attention_layer_ids = None
         full_attention_layer_ids = None

@@ -1914,17 +1914,28 @@ class ServerArgs:
             if self.is_attention_backend_not_set():
                 self.attention_backend = "triton"
                 logger.info("Use triton as default attention backend for Gemma4")
-        elif model_arch in ["Exaone4ForCausalLM", "Exaone4_5_ForConditionalGeneration", "ExaoneMoEForCausalLM"]:
+        elif model_arch in ["Exaone4ForCausalLM", "ExaoneMoEForCausalLM"]:
             if hf_config.sliding_window_pattern is not None:
                 logger.warning(
                     f"Disabling hybrid SWA memory for {model_arch} as it is not yet supported."
                 )
                 self.disable_hybrid_swa_memory = True
                 # https://docs.sglang.ai/advanced_features/attention_backend.html
+            if is_sm90_supported():
                 accepted_backends = ["fa3", "triton", "trtllm_mha"]
-                assert (
-                    self.attention_backend in accepted_backends
-                ), f"One of the attention backends in {accepted_backends} is required for {model_arch}, but got {self.attention_backend}"
+            else:
+                accepted_backends = ["triton"]
+            assert (
+                self.attention_backend in accepted_backends
+            ), f"One of the attention backends in {accepted_backends} is required for {model_arch}, but got {self.attention_backend}"
+        elif model_arch == "Exaone4_5_ForConditionalGeneration":
+            if is_sm90_supported():
+                accepted_backends = ["fa3", "triton", "trtllm_mha"]
+            else:
+                accepted_backends = ["triton"]
+            assert (
+                self.attention_backend in accepted_backends
+            ), f"One of the attention backends in {accepted_backends} is required for {model_arch}, but got {self.attention_backend}"
         elif model_arch in ["Olmo2ForCausalLM"]:
             # FIXME: https://github.com/sgl-project/sglang/pull/7367 is not compatible with Olmo3 model.
             logger.warning(
