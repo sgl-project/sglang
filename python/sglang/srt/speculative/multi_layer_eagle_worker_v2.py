@@ -190,9 +190,10 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
             self.draft_extend_attn_backend_list.append(
                 draft_backend_factory.create_draft_extend_backend()
             )
-            self.draft_runner_list[step].attn_backend = (
-                self.draft_extend_attn_backend_list[-1]
-            )
+            if self.draft_extend_attn_backend_list[-1] is not None:
+                self.draft_runner_list[step].attn_backend = (
+                    self.draft_extend_attn_backend_list[-1]
+                )
 
     def init_cuda_graphs(self):
         """Capture cuda graphs."""
