@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from collections import Counter
 from collections.abc import Iterable, Mapping
 from dataclasses import asdict, dataclass, field
@@ -8990,6 +8991,7 @@ def run_model_runner_token_to_kv_pool_runtime_inspection_hook_for_smoke(
 def run_model_runner_live_token_to_kv_pool_index_read_hook_for_smoke(
     model_runner: Any,
     forward_batch: Any = None,
+    explicit_req_to_token_resolution_payloads: Any = None,
 ) -> dict[str, Any]:
     """Run a guarded live-like token_to_kv_pool index read hook for smoke only."""
 
@@ -9082,28 +9084,68 @@ def run_model_runner_live_token_to_kv_pool_index_read_hook_for_smoke(
             if token_to_kv_pool is not None:
                 token_to_kv_pool_path = "forward_batch.token_to_kv_pool"
 
+    req_to_token_resolution_bridge_enabled = (
+        os.getenv("SGLANG_RELAYKV_REQ_TO_TOKEN_RESOLUTION_BRIDGE") == "1"
+    )
     req_to_token_resolution_results = None
     req_to_token_resolution_results_path = None
-    for owner, path in (
-        (forward_batch, "relaykv_req_to_token_resolution_results"),
-        (forward_batch, "req_to_token_resolution_results"),
-        (model_runner, "relaykv_req_to_token_resolution_results"),
-        (model_runner, "req_to_token_resolution_results"),
-    ):
-        if owner is None:
-            continue
-        try:
-            value = getattr(owner, path, None)
-        except Exception:
-            continue
-        if value is not None:
-            req_to_token_resolution_results = value
+    req_to_token_resolution_bridge_state = "not_attempted"
+    req_to_token_resolution_bridge_payload_count = 0
+    req_to_token_resolution_bridge_valid_count = 0
+    req_to_token_resolution_bridge_source_path = None
+    req_to_token_resolution_bridge_blocked_reason = None
+
+    if req_to_token_resolution_bridge_enabled:
+        bridge_results = build_relaykv_req_to_token_resolution_bridge_payloads_for_smoke(
+            forward_batch=forward_batch,
+            model_runner=model_runner,
+            explicit_payloads=explicit_req_to_token_resolution_payloads,
+            bridge_enabled=True,
+        )
+        bridge_result = bridge_results[0]
+        req_to_token_resolution_bridge_state = str(
+            bridge_result.get("bridge_state") or "unknown"
+        )
+        req_to_token_resolution_bridge_payload_count = int(
+            bridge_result.get("payload_count") or 0
+        )
+        req_to_token_resolution_bridge_valid_count = int(
+            bridge_result.get("valid_payload_count") or 0
+        )
+        req_to_token_resolution_bridge_source_path = bridge_result.get(
+            "bridge_source_path"
+        )
+        req_to_token_resolution_bridge_blocked_reason = bridge_result.get(
+            "blocked_reason"
+        )
+        if req_to_token_resolution_bridge_state == "bridged":
+            req_to_token_resolution_results = bridge_result[
+                "req_to_token_resolution_payloads"
+            ]
             req_to_token_resolution_results_path = (
-                f"forward_batch.{path}"
-                if owner is forward_batch
-                else f"model_runner.{path}"
+                req_to_token_resolution_bridge_source_path
             )
-            break
+    else:
+        for owner, path in (
+            (forward_batch, "relaykv_req_to_token_resolution_results"),
+            (forward_batch, "req_to_token_resolution_results"),
+            (model_runner, "relaykv_req_to_token_resolution_results"),
+            (model_runner, "req_to_token_resolution_results"),
+        ):
+            if owner is None:
+                continue
+            try:
+                value = getattr(owner, path, None)
+            except Exception:
+                continue
+            if value is not None:
+                req_to_token_resolution_results = value
+                req_to_token_resolution_results_path = (
+                    f"forward_batch.{path}"
+                    if owner is forward_batch
+                    else f"model_runner.{path}"
+                )
+                break
 
     request_id = (
         getattr(forward_batch, "request_id", None) if forward_batch is not None else None
@@ -9142,7 +9184,22 @@ def run_model_runner_live_token_to_kv_pool_index_read_hook_for_smoke(
             "adapter_metadata": {
                 "req_to_token_resolution_results_path": (
                     req_to_token_resolution_results_path
-                )
+                ),
+                "req_to_token_resolution_bridge_enabled": (
+                    req_to_token_resolution_bridge_enabled
+                ),
+                "req_to_token_resolution_bridge_state": (
+                    req_to_token_resolution_bridge_state
+                ),
+                "req_to_token_resolution_bridge_payload_count": (
+                    req_to_token_resolution_bridge_payload_count
+                ),
+                "req_to_token_resolution_bridge_source_path": (
+                    req_to_token_resolution_bridge_source_path
+                ),
+                "req_to_token_resolution_bridge_blocked_reason": (
+                    req_to_token_resolution_bridge_blocked_reason
+                ),
             },
             "engine_block_ref": {},
             "full_kv_req_to_token_spans": None,
@@ -9159,12 +9216,21 @@ def run_model_runner_live_token_to_kv_pool_index_read_hook_for_smoke(
         payloads = [
             _blocked_live_token_to_kv_pool_index_read_result_for_smoke(
                 blocked_source_payload,
-                blocking_reasons=["req_to_token_resolution_results_missing"],
+                blocking_reasons=[
+                    req_to_token_resolution_bridge_blocked_reason
+                    if req_to_token_resolution_bridge_enabled
+                    and req_to_token_resolution_bridge_blocked_reason is not None
+                    else "req_to_token_resolution_results_missing"
+                ],
                 warning_reasons=[
                     "guarded_live_token_to_kv_pool_index_read",
                     "bounded_index_lookup_only",
                     "no_kv_pool_read",
-                    "missing_req_to_token_resolution_results",
+                    (
+                        "req_to_token_resolution_bridge_blocked"
+                        if req_to_token_resolution_bridge_enabled
+                        else "missing_req_to_token_resolution_results"
+                    ),
                 ],
                 source_path=token_to_kv_pool_path,
                 token_to_kv_pool_type=_token_to_kv_pool_object_type_for_smoke(
@@ -9198,6 +9264,21 @@ def run_model_runner_live_token_to_kv_pool_index_read_hook_for_smoke(
             adapter_metadata["req_to_token_resolution_results_path"] = (
                 req_to_token_resolution_results_path
             )
+            adapter_metadata["req_to_token_resolution_bridge_enabled"] = (
+                req_to_token_resolution_bridge_enabled
+            )
+            adapter_metadata["req_to_token_resolution_bridge_state"] = (
+                req_to_token_resolution_bridge_state
+            )
+            adapter_metadata["req_to_token_resolution_bridge_payload_count"] = (
+                req_to_token_resolution_bridge_payload_count
+            )
+            adapter_metadata["req_to_token_resolution_bridge_source_path"] = (
+                req_to_token_resolution_bridge_source_path
+            )
+            adapter_metadata["req_to_token_resolution_bridge_blocked_reason"] = (
+                req_to_token_resolution_bridge_blocked_reason
+            )
 
     summary = summarize_relaykv_live_token_to_kv_pool_index_read_results_for_smoke(
         payloads
@@ -9216,6 +9297,24 @@ def run_model_runner_live_token_to_kv_pool_index_read_hook_for_smoke(
         summary["hook_path_counts"][hook_key] = 0
     summary["hook_path_counts"][hook_key] += len(payloads)
     summary["req_to_token_resolution_results_path"] = req_to_token_resolution_results_path
+    summary["req_to_token_resolution_bridge_enabled"] = (
+        req_to_token_resolution_bridge_enabled
+    )
+    summary["req_to_token_resolution_bridge_state"] = (
+        req_to_token_resolution_bridge_state
+    )
+    summary["req_to_token_resolution_bridge_payload_count"] = (
+        req_to_token_resolution_bridge_payload_count
+    )
+    summary["req_to_token_resolution_bridge_valid_count"] = (
+        req_to_token_resolution_bridge_valid_count
+    )
+    summary["req_to_token_resolution_bridge_source_path"] = (
+        req_to_token_resolution_bridge_source_path
+    )
+    summary["req_to_token_resolution_bridge_blocked_reason"] = (
+        req_to_token_resolution_bridge_blocked_reason
+    )
 
     return {
         "payloads": payloads,
