@@ -258,7 +258,7 @@ def compile_one_shape(kernel_type, n, k, num_groups, m_list):
                     (lhs_q[:m], lhs_s[:m]),
                     (rhs_q, rhs_s),
                     out[:m],
-                    m_indices=m_indices[:m],
+                    m_indices[:m],
                 )
 
         elif kernel_type == "MASKED":
