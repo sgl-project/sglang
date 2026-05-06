@@ -201,10 +201,12 @@ docker exec ci_sglang pip uninstall -y torchcodec >/dev/null 2>&1 || true
 docker exec ci_sglang bash -c '
 set -euo pipefail
 SITE=$(python3 -c "import site, sys; sys.stdout.write(site.getsitepackages()[0])")
-rm -rf "$SITE/torchcodec"
-mkdir -p "$SITE/torchcodec/decoders"
-cat > "$SITE/torchcodec/__init__.py" << "PY"
+STUB_VERSION="0.11.1"
+rm -rf "$SITE/torchcodec" "$SITE"/torchcodec-*.dist-info
+mkdir -p "$SITE/torchcodec/decoders" "$SITE/torchcodec-${STUB_VERSION}.dist-info"
+cat > "$SITE/torchcodec/__init__.py" << PY
 """Stub torchcodec for AMD CI (text-only MiMo-V2.5-Pro)."""
+__version__ = "${STUB_VERSION}"
 PY
 cat > "$SITE/torchcodec/decoders/__init__.py" << "PY"
 """Stub torchcodec.decoders providing a placeholder AudioDecoder.
@@ -221,6 +223,16 @@ class AudioDecoder:
             "torchcodec is stubbed in AMD CI; audio inputs are not supported."
         )
 PY
+# PEP 376 .dist-info so importlib.metadata.version("torchcodec") succeeds.
+# transformers.audio_utils calls this at module-import time.
+cat > "$SITE/torchcodec-${STUB_VERSION}.dist-info/METADATA" << PY
+Metadata-Version: 2.1
+Name: torchcodec
+Version: ${STUB_VERSION}
+Summary: Stub torchcodec for AMD CI (text-only MiMo-V2.5-Pro)
+PY
+echo "amd-ci-stub" > "$SITE/torchcodec-${STUB_VERSION}.dist-info/INSTALLER"
+: > "$SITE/torchcodec-${STUB_VERSION}.dist-info/RECORD"
 '
 
 if [[ -n "${SKIP_AITER_BUILD}" ]]; then
