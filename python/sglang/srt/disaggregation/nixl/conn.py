@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import dataclasses
+import json
 import logging
 import struct
 import threading
@@ -27,6 +28,21 @@ from sglang.srt.disaggregation.utils import (
 from sglang.srt.environ import envs
 from sglang.srt.server_args import ServerArgs
 
+try:
+    from nixl._bindings import (
+        nixlBackendError,
+        nixlCancelledError,
+        nixlRemoteDisconnectError,
+    )
+
+    _NIXL_TRANSPORT_ERRORS = (
+        nixlRemoteDisconnectError,
+        nixlBackendError,
+        nixlCancelledError,
+    )
+except ImportError:
+    _NIXL_TRANSPORT_ERRORS = (RuntimeError,)
+
 logger = logging.getLogger(__name__)
 
 GUARD = "NixlMsgGuard".encode("ascii")
@@ -44,8 +60,15 @@ class TransferInfo:
     dst_aux_index: int
     required_dst_info_num: int
     dst_state_indices: List[int]
+    decode_prefix_len: Optional[int] = None  # for decode radix cache
 
     def is_dummy(self):
+        # A transfer is "dummy" only for CP non-authoritative ranks.
+        # When dst_kv_indices is empty due to a decode-side radix cache
+        # full hit (decode_prefix_len > 0), the transfer is NOT dummy --
+        # aux/state data still needs to be sent.
+        if self.dst_kv_indices.size == 0 and self.decode_prefix_len:
+            return False
         return self.dst_kv_indices.size == 0
 
     @classmethod
@@ -65,6 +88,9 @@ class TransferInfo:
             dst_aux_index=int(msg[5].decode("ascii")),
             required_dst_info_num=int(msg[6].decode("ascii")),
             dst_state_indices=dst_state_indices,
+            decode_prefix_len=(
+                int(msg[8].decode("ascii")) if len(msg) > 8 and msg[8] != b"" else None
+            ),  # hacky just add it into the message that will be sent
         )
 
 
@@ -84,6 +110,8 @@ class KVArgsRegisterInfo:
     decode_tp_size: int
     decode_tp_rank: int
     dst_kv_item_len: int
+    dst_state_item_lens: list[int] = dataclasses.field(default_factory=list)
+    dst_state_dim_per_tensor: list[int] = dataclasses.field(default_factory=list)
 
     @classmethod
     def from_zmq(cls, msg: List[bytes]):
@@ -92,6 +120,15 @@ class KVArgsRegisterInfo:
             dst_state_data_ptrs = list(struct.unpack(f"{len(msg[7]) // 8}Q", msg[7]))
         else:
             dst_state_data_ptrs = []
+
+        dst_state_item_lens = []
+        dst_state_dim_per_tensor = []
+        if len(msg) > 12 and len(msg[12]) > 0:
+            dst_state_item_lens = list(struct.unpack(f"{len(msg[12]) // 4}I", msg[12]))
+        if len(msg) > 13 and len(msg[13]) > 0:
+            dst_state_dim_per_tensor = list(
+                struct.unpack(f"{len(msg[13]) // 4}I", msg[13])
+            )
 
         return cls(
             room=str(msg[0].decode("ascii")),
@@ -106,6 +143,8 @@ class KVArgsRegisterInfo:
             decode_tp_size=int(msg[9].decode("ascii")),
             decode_tp_rank=int(msg[10].decode("ascii")),
             dst_kv_item_len=int(msg[11].decode("ascii")),
+            dst_state_item_lens=dst_state_item_lens,
+            dst_state_dim_per_tensor=dst_state_dim_per_tensor,
         )
 
 
@@ -173,11 +212,30 @@ class NixlKVManager(CommonKVManager):
             ) from e
 
         backend = envs.SGLANG_DISAGGREGATION_NIXL_BACKEND.get()
-        agent_config = nixl_agent_config(
-            backends=[backend],
-            num_threads=(8 if disaggregation_mode == DisaggregationMode.PREFILL else 0),
+        num_threads = 8 if disaggregation_mode == DisaggregationMode.PREFILL else 0
+        backend_params = json.loads(
+            envs.SGLANG_DISAGGREGATION_NIXL_BACKEND_PARAMS.get()
         )
+        if not isinstance(backend_params, dict) or not all(
+            isinstance(key, str) and isinstance(value, str)
+            for key, value in backend_params.items()
+        ):
+            raise ValueError(
+                "SGLANG_DISAGGREGATION_NIXL_BACKEND_PARAMS must be a JSON object "
+                "with string keys and string values"
+            )
+        agent_config = nixl_agent_config(backends=[], num_threads=num_threads)
         self.agent = nixl_agent(str(uuid.uuid4()), agent_config)
+        if num_threads > 0:
+            # TODO: Remove this once NIXL passes thread parameters from
+            # nixl_agent_config to explicitly-created backends.
+            if backend == "UCX" or backend == "OBJ":
+                backend_params.setdefault("num_threads", str(num_threads))
+            elif backend == "GDS_MT":
+                backend_params.setdefault("thread_count", str(num_threads))
+            elif backend == "UCCL":
+                backend_params.setdefault("num_cpus", str(num_threads))
+        self.agent.create_backend(backend, backend_params)
 
         available_plugins = self.agent.get_plugin_list()
         if backend not in available_plugins:
@@ -344,6 +402,14 @@ class NixlKVManager(CommonKVManager):
     ):
         """Generic KV cache transfer supporting both MHA and MLA architectures.
         Used by both send_kvcache and maybe_send_extra."""
+        # Convert pointer lists to np.uint64 arrays up front.
+        # torch.int exceeds np.int64 range on Intel XPU (addresses have bit 63 set, e.g.
+        # 0xffff81ab54e01000). Casting here prevents overflow when these values
+        # are later used in numpy arithmetic.
+        src_data_ptrs = np.array(src_data_ptrs, dtype=np.uint64)
+        dst_data_ptrs = np.array(dst_data_ptrs, dtype=np.uint64)
+        item_lens = np.array(item_lens, dtype=np.uint64)
+
         # group by indices
         prefill_kv_blocks, dst_kv_blocks = group_concurrent_contiguous(
             prefill_data_indices, dst_data_indices
@@ -391,11 +457,11 @@ class NixlKVManager(CommonKVManager):
 
         # Precompute block starts/lengths to reduce Python-level loops.
         prefill_starts = np.fromiter(
-            (block[0] for block in prefill_kv_blocks), dtype=np.int64
+            (block[0] for block in prefill_kv_blocks), dtype=np.uint64
         )
-        dst_starts = np.fromiter((block[0] for block in dst_kv_blocks), dtype=np.int64)
+        dst_starts = np.fromiter((block[0] for block in dst_kv_blocks), dtype=np.uint64)
         block_lens = np.fromiter(
-            (len(block) for block in prefill_kv_blocks), dtype=np.int64
+            (len(block) for block in prefill_kv_blocks), dtype=np.uint64
         )
 
         for src_ptr, dst_ptr, item_len in layers_params:
@@ -407,14 +473,14 @@ class NixlKVManager(CommonKVManager):
 
         def make_req_array(addr_chunks, len_chunks, gpu):
             if not addr_chunks:
-                return np.empty((0, 3), dtype=np.int64)
-            flat_addrs = np.concatenate(addr_chunks)
-            flat_lens = np.concatenate(len_chunks)
+                return np.empty((0, 3), dtype=np.uint64)
+            flat_addrs = np.concatenate(addr_chunks).astype(np.uint64, copy=False)
+            flat_lens = np.concatenate(len_chunks).astype(np.uint64, copy=False)
             return np.column_stack(
                 (
                     flat_addrs,
                     flat_lens,
-                    np.full_like(flat_addrs, gpu),
+                    np.full_like(flat_addrs, gpu, dtype=np.uint64),
                 )
             )
 
@@ -477,25 +543,35 @@ class NixlKVManager(CommonKVManager):
         # Get configuration from kv_args
         local_tp_rank_in_group = self.kv_args.engine_rank % prefill_tp_size
         dst_tp_rank_in_group = decode_tp_rank % decode_tp_size
-        num_kv_heads = self.kv_args.kv_head_num
-
-        # Calculate head distribution
-        src_heads_per_rank = num_kv_heads
-        dst_heads_per_rank = num_kv_heads * prefill_tp_size // decode_tp_size
 
         src_kv_item_len = self.kv_args.kv_item_lens[0]
         page_size = self.kv_args.page_size
 
+        # Use total KV head count (not per-rank) for correct head distribution.
+        # Per-rank kv_head_num is max(1, total//tp) which loses info when total < tp.
+        total_kv_heads = getattr(self.kv_args, "total_kv_head_num", 0)
+        if total_kv_heads <= 0:
+            total_kv_heads = self.kv_args.kv_head_num * prefill_tp_size
+
+        src_heads_per_rank = max(1, total_kv_heads // prefill_tp_size)
+        dst_heads_per_rank = max(1, total_kv_heads // decode_tp_size)
+
         bytes_per_head_slice_to_send = (
             dst_kv_item_len // page_size // dst_heads_per_rank
         )
+
+        # GQA replication: how many prefill ranks share the same KV head
+        src_replication = max(1, prefill_tp_size // total_kv_heads)
 
         # Determine which heads to send
         if prefill_tp_size > decode_tp_size:
             # Multiple prefill ranks to one decode rank
             src_head_start_offset = 0
             num_heads_to_send = src_heads_per_rank
-            dst_head_start_offset = local_tp_rank_in_group * src_heads_per_rank
+            unique_head_idx = local_tp_rank_in_group // src_replication
+            dst_head_start_offset = (
+                unique_head_idx * src_heads_per_rank
+            ) % dst_heads_per_rank
         else:
             # Send KVCache from 1 prefill instance to multiple decode instances
             src_head_start_offset = (
@@ -555,13 +631,13 @@ class NixlKVManager(CommonKVManager):
 
         def make_req_array(addr_chunks, size, gpu):
             if not addr_chunks:
-                return np.empty((0, 3), dtype=np.int64)
-            flat_addrs = np.concatenate(addr_chunks)
+                return np.empty((0, 3), dtype=np.uint64)
+            flat_addrs = np.concatenate(addr_chunks).astype(np.uint64, copy=False)
             return np.column_stack(
                 (
                     flat_addrs,
-                    np.full_like(flat_addrs, size),
-                    np.full_like(flat_addrs, gpu),
+                    np.full_like(flat_addrs, size, dtype=np.uint64),
+                    np.full_like(flat_addrs, gpu, dtype=np.uint64),
                 )
             )
 
@@ -671,6 +747,106 @@ class NixlKVManager(CommonKVManager):
             raise Exception("Failed to post Mamba state transfer")
         return xfer_handle
 
+    def _send_mamba_state_slice(
+        self,
+        peer_name: str,
+        prefill_state_indices: List[int],
+        dst_state_data_ptrs: list[int],
+        dst_state_indices: List[int],
+        dst_gpu_id: int,
+        notif: str,
+        dst_state_item_lens: list[int],
+        dst_state_dim_per_tensor: list[int],
+        decode_tp_size: int,
+        decode_tp_rank: int,
+    ):
+        """Transfer Mamba states with TP slice support via RDMA.
+
+        When prefill and decode have different attn_tp_size, we slice the
+        TP-sharded dimension (3rd dim) of conv_state and temporal_state
+        accordingly, mirroring Mooncake's _send_mamba_state_slice.
+        """
+        logger.warning_once(
+            "Using Mamba state slice transfer for different TP sizes. "
+            f"Prefill attn_tp_size={self.attn_tp_size}, "
+            f"Decode attn_tp_size={decode_tp_size}."
+        )
+        assert len(prefill_state_indices) == 1, "Mamba should have single state index"
+
+        prefill_state_data_ptrs = self.kv_args.state_data_ptrs
+        prefill_state_item_lens = self.kv_args.state_item_lens
+        src_state_dim_per_tensor = getattr(self.kv_args, "state_dim_per_tensor", [])
+
+        if not src_state_dim_per_tensor or not dst_state_dim_per_tensor:
+            return self._send_mamba_state(
+                peer_name,
+                prefill_state_indices,
+                dst_state_data_ptrs,
+                dst_state_indices,
+                dst_gpu_id,
+                notif,
+            )
+
+        local_tp_rank_in_group = self.kv_args.engine_rank % self.attn_tp_size
+        dst_tp_rank_in_group = decode_tp_rank % decode_tp_size
+
+        src_addrs = []
+        dst_addrs = []
+
+        for i, dst_state_ptr in enumerate(dst_state_data_ptrs):
+            src_item_len = prefill_state_item_lens[i]
+            dst_item_len = dst_state_item_lens[i]
+            src_dim = src_state_dim_per_tensor[i]
+            dst_dim = dst_state_dim_per_tensor[i]
+
+            src_bytes_per_dim = src_item_len // src_dim
+            dst_bytes_per_dim = dst_item_len // dst_dim
+
+            if self.attn_tp_size > decode_tp_size:
+                src_dim_start = 0
+                num_dims_to_send = src_dim
+                writers_per_decode = self.attn_tp_size // decode_tp_size
+                local_writer_idx = local_tp_rank_in_group % writers_per_decode
+                dst_dim_start = local_writer_idx * src_dim
+            else:
+                src_dim_start = (dst_tp_rank_in_group * dst_dim) % src_dim
+                num_dims_to_send = dst_dim
+                dst_dim_start = 0
+
+            src_dim_offset = src_dim_start * src_bytes_per_dim
+            dst_dim_offset = dst_dim_start * dst_bytes_per_dim
+            bytes_to_send = num_dims_to_send * src_bytes_per_dim
+
+            src_addr = (
+                prefill_state_data_ptrs[i]
+                + src_item_len * int(prefill_state_indices[0])
+                + src_dim_offset
+            )
+            dst_addr = (
+                dst_state_ptr
+                + dst_item_len * int(dst_state_indices[0])
+                + dst_dim_offset
+            )
+            src_addrs.append((src_addr, bytes_to_send, self.kv_args.gpu_id))
+            dst_addrs.append((dst_addr, bytes_to_send, dst_gpu_id))
+
+        src_descs = self.agent.get_xfer_descs(src_addrs, "VRAM")
+        dst_descs = self.agent.get_xfer_descs(dst_addrs, "VRAM")
+
+        xfer_handle = self.agent.initialize_xfer(
+            "WRITE",
+            src_descs,
+            dst_descs,
+            peer_name,
+            notif.encode("ascii"),
+        )
+        if not xfer_handle:
+            raise Exception("Failed to create Mamba state slice transfer")
+        state = self.agent.transfer(xfer_handle)
+        if state == "ERR":
+            raise Exception("Failed to post Mamba state slice transfer")
+        return xfer_handle
+
     def maybe_send_extra(
         self,
         peer_name: str,
@@ -680,14 +856,26 @@ class NixlKVManager(CommonKVManager):
         dst_gpu_id: int,
         notif: str,
         decode_tp_size: int,
+        decode_tp_rank: int = 0,
+        dst_state_item_lens: list[int] | None = None,
+        dst_state_dim_per_tensor: list[int] | None = None,
     ):
         """Send state or extra pool data with type-specific handling."""
         state_type = getattr(self.kv_args, "state_type", "none")
 
         if state_type == "mamba":
             if self.attn_tp_size != decode_tp_size:
-                raise RuntimeError(
-                    "PD Disaggregation does NOT support PD different TP sizes for hybrid mamba models yet."
+                return self._send_mamba_state_slice(
+                    peer_name,
+                    prefill_state_indices,
+                    dst_state_data_ptrs,
+                    dst_state_indices,
+                    dst_gpu_id,
+                    notif,
+                    dst_state_item_lens or [],
+                    dst_state_dim_per_tensor or [],
+                    decode_tp_size,
+                    decode_tp_rank,
                 )
             return self._send_mamba_state(
                 peer_name,
@@ -748,37 +936,44 @@ class NixlKVManager(CommonKVManager):
             assert len(chunked_dst_kv_indice) == len(kv_indices)
             assert req.agent_name in self.decode_kv_args_table
 
-            notif = f"{req.room}_kv_{chunk_id}_{int(is_last)}_{self.kv_args.pp_rank}"
             decode_tp_size = self.decode_kv_args_table[req.agent_name].decode_tp_size
 
-            if self.is_mla_backend or (decode_tp_size == self.attn_tp_size):
-                kv_xfer_handle = self.send_kvcache(
-                    req.agent_name,
-                    kv_indices,
-                    self.decode_kv_args_table[req.agent_name].dst_kv_ptrs,
-                    chunked_dst_kv_indice,
-                    self.decode_kv_args_table[req.agent_name].gpu_id,
-                    notif,
-                )
-            else:
-                kv_xfer_handle = self.send_kvcache_slice(
-                    req.agent_name,
-                    kv_indices,
-                    self.decode_kv_args_table[req.agent_name].dst_kv_ptrs,
-                    chunked_dst_kv_indice,
-                    self.decode_kv_args_table[req.agent_name].gpu_id,
-                    notif,
-                    prefill_tp_size=self.attn_tp_size,
-                    decode_tp_size=decode_tp_size,
-                    decode_tp_rank=self.decode_kv_args_table[
-                        req.agent_name
-                    ].decode_tp_rank,
-                    dst_kv_item_len=self.decode_kv_args_table[
-                        req.agent_name
-                    ].dst_kv_item_len,
+            # Skip KV RDMA transfer when there are no pages to send
+            # (e.g., decode-side radix cache matched the entire prefix).
+            # Aux data is still sent below when is_last=True.
+            if len(kv_indices) > 0:
+                notif = (
+                    f"{req.room}_kv_{chunk_id}_{int(is_last)}_{self.kv_args.pp_rank}"
                 )
 
-            handles.append(kv_xfer_handle)
+                if self.is_mla_backend or (decode_tp_size == self.attn_tp_size):
+                    kv_xfer_handle = self.send_kvcache(
+                        req.agent_name,
+                        kv_indices,
+                        self.decode_kv_args_table[req.agent_name].dst_kv_ptrs,
+                        chunked_dst_kv_indice,
+                        self.decode_kv_args_table[req.agent_name].gpu_id,
+                        notif,
+                    )
+                else:
+                    kv_xfer_handle = self.send_kvcache_slice(
+                        req.agent_name,
+                        kv_indices,
+                        self.decode_kv_args_table[req.agent_name].dst_kv_ptrs,
+                        chunked_dst_kv_indice,
+                        self.decode_kv_args_table[req.agent_name].gpu_id,
+                        notif,
+                        prefill_tp_size=self.attn_tp_size,
+                        decode_tp_size=decode_tp_size,
+                        decode_tp_rank=self.decode_kv_args_table[
+                            req.agent_name
+                        ].decode_tp_rank,
+                        dst_kv_item_len=self.decode_kv_args_table[
+                            req.agent_name
+                        ].dst_kv_item_len,
+                    )
+
+                handles.append(kv_xfer_handle)
             # Only the last chunk we need to send the aux data.
             if is_last:
                 if state_indices is not None:
@@ -789,23 +984,34 @@ class NixlKVManager(CommonKVManager):
                         dst_info.dst_state_data_ptrs,
                         req.dst_state_indices,
                         dst_info.gpu_id,
-                        f"{req.room}_state_{self.kv_args.pp_rank}",
+                        f"{req.room}_state_{self.kv_args.engine_rank}",
                         decode_tp_size,
+                        decode_tp_rank=dst_info.decode_tp_rank,
+                        dst_state_item_lens=dst_info.dst_state_item_lens,
+                        dst_state_dim_per_tensor=dst_info.dst_state_dim_per_tensor,
                     )
                     if state_xfer_handle is not None:
                         handles.append(state_xfer_handle)
 
                 assert aux_index is not None
+                # When no KV pages were sent (decode-side cache hit),
+                # encode pp_rank in aux notif so receiver can mark
+                # expected_kvs_per_pp[pp_rank] = 0.
+                if len(kv_indices) == 0:
+                    aux_notif = f"{req.room}_aux_nokv_{self.kv_args.pp_rank}"
+                else:
+                    aux_notif = f"{req.room}_aux"
                 aux_xfer_handle = self.send_aux(
                     req.agent_name,
                     aux_index,
                     self.decode_kv_args_table[req.agent_name].dst_aux_ptrs,
                     req.dst_aux_index,
-                    f"{req.room}_aux",
+                    aux_notif,
                 )
                 handles.append(aux_xfer_handle)
         if is_last:
             del self.transfer_infos[bootstrap_room]
+            self.req_to_decode_prefix_len.pop(bootstrap_room, None)
         return handles
 
     def update_transfer_status(self):
@@ -838,6 +1044,15 @@ class NixlKVManager(CommonKVManager):
                             )
                 elif components[1] == "aux":
                     self.transfer_statuses[room].received_aux = True
+                    # Handle "nokv" marker: no KV pages were sent for
+                    # this pp_rank (decode-side radix cache hit).
+                    if len(components) > 3 and components[2] == "nokv":
+                        pp_rank = int(components[3])
+                        self.transfer_statuses[room].expected_kvs_per_pp[pp_rank] = 0
+                    if self.transfer_statuses[room].num_pp_ranks_expected is None:
+                        self.transfer_statuses[room].num_pp_ranks_expected = (
+                            self.required_prefill_response_num_table.get(room, 1)
+                        )
                 elif components[1] == "state":
                     pp_rank = int(components[2]) if len(components) > 2 else 0
                     self.transfer_statuses[room].received_state_per_pp.add(pp_rank)
@@ -879,6 +1094,14 @@ class NixlKVManager(CommonKVManager):
                 ].required_dst_info_num
                 logger.debug(f"got info {room=} {agent_name=} {required_dst_info_num=}")
                 if len(self.transfer_infos[room]) == required_dst_info_num:
+                    self.req_to_decode_prefix_len[room] = next(
+                        (
+                            info.decode_prefix_len
+                            for info in self.transfer_infos[room].values()
+                            if info.decode_prefix_len is not None
+                        ),
+                        0,
+                    )
                     logger.debug(f"{room=} is bootstrapped")
                     self.update_status(room, KVPoll.WaitingForInput)
 
@@ -898,12 +1121,24 @@ class NixlKVSender(CommonKVSender):
         self.xfer_handles = []
         self.has_sent = False
         self.chunk_id = 0
+        self._send_failed = False
+        self._send_error: Optional[Exception] = None
+        self._transfer_start_time: Optional[float] = None
+
+    def pop_decode_prefix_len(self) -> int:
+        return self.kv_mgr.req_to_decode_prefix_len.pop(self.bootstrap_room, 0)
+
+    def should_send_kv_chunk(self, num_pages: int, last_chunk: bool) -> bool:
+        return num_pages > 0 or last_chunk
 
     def send(
         self,
         kv_indices: npt.NDArray[np.int32],
         state_indices: Optional[List[int]] = None,
     ):
+        if self._send_failed:
+            return
+
         index_slice = slice(self.curr_idx, self.curr_idx + len(kv_indices))
         self.curr_idx += len(kv_indices)
         is_last = self.curr_idx == self.num_kv_indices
@@ -922,15 +1157,30 @@ class NixlKVSender(CommonKVSender):
                 self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Success)
                 return
 
-        new_xfer_handles = self.kv_mgr.add_transfer_request(
-            self.bootstrap_room,
-            kv_indices,
-            index_slice,
-            is_last,
-            self.chunk_id,
-            self.aux_index,
-            state_indices,
-        )
+        if self._transfer_start_time is None and (
+            len(kv_indices) > 0 or state_indices is not None
+        ):
+            self._transfer_start_time = time.perf_counter()
+
+        try:
+            new_xfer_handles = self.kv_mgr.add_transfer_request(
+                self.bootstrap_room,
+                kv_indices,
+                index_slice,
+                is_last,
+                self.chunk_id,
+                self.aux_index,
+                state_indices,
+            )
+        except _NIXL_TRANSPORT_ERRORS as e:
+            logger.warning(
+                f"KVSender transfer request failed for room {self.bootstrap_room}: {e}"
+            )
+            self._send_failed = True
+            self._send_error = e
+            return
+
+        self._record_transfer_indices(kv_indices, state_indices)
         self.xfer_handles.extend(new_xfer_handles)
         self.chunk_id += 1
         if is_last:
@@ -938,16 +1188,39 @@ class NixlKVSender(CommonKVSender):
             del self.kv_mgr.request_status[self.bootstrap_room]
 
     def poll(self) -> KVPoll:
+        if self._send_failed:
+            return KVPoll.Failed  # type: ignore
         if not self.has_sent:
             return self.kv_mgr.check_status(self.bootstrap_room)
-        states = [self.kv_mgr.agent.check_xfer_state(x) for x in self.xfer_handles]
-        if all([x == "DONE" for x in states]):
+        try:
+            states = [self.kv_mgr.agent.check_xfer_state(x) for x in self.xfer_handles]
+        except _NIXL_TRANSPORT_ERRORS as e:
+            logger.warning(
+                f"KVSender check_xfer_state failed for room {self.bootstrap_room}: {e}"
+            )
+            self._send_failed = True
+            self._send_error = e
+            return KVPoll.Failed  # type: ignore
+        if all(x == "DONE" for x in states):
+            if (
+                self._transfer_start_time is not None
+                and self._transfer_metric.transfer_latency_s is None
+            ):
+                self._transfer_metric.transfer_latency_s = (
+                    time.perf_counter() - self._transfer_start_time
+                )
             return KVPoll.Success  # type: ignore
-        if any([x == "ERR" for x in states]):
-            raise Exception("KVSender transfer encountered an error.")
+        if any(x == "ERR" for x in states):
+            self._send_failed = True
+            self._send_error = RuntimeError(
+                f"NIXL transfer error for room {self.bootstrap_room}"
+            )
+            return KVPoll.Failed  # type: ignore
         return KVPoll.WaitingForInput  # type: ignore
 
     def failure_exception(self):
+        if self._send_error is not None:
+            raise self._send_error
         raise RuntimeError("NIXL KVSender Exception")
 
 
@@ -973,6 +1246,7 @@ class NixlKVReceiver(CommonKVReceiver):
         kv_indices: npt.NDArray[np.int32],
         aux_index: Optional[int] = None,
         state_indices: Optional[List[int]] = None,
+        decode_prefix_len: Optional[int] = None,
     ):
         if self.bootstrap_infos is None:
             logger.error(
@@ -1006,6 +1280,7 @@ class NixlKVReceiver(CommonKVReceiver):
                             if not is_dummy and state_indices is not None
                             else b""
                         ),
+                        str(decode_prefix_len or 0).encode("ascii"),
                     ]
                 )
 
@@ -1068,6 +1343,17 @@ class NixlKVReceiver(CommonKVReceiver):
                 struct.pack("Q", ptr) for ptr in self.kv_mgr.kv_args.state_data_ptrs
             )
 
+            packed_state_item_lens = b"".join(
+                struct.pack("I", item_len)
+                for item_len in self.kv_mgr.kv_args.state_item_lens
+            )
+            state_dim_per_tensor = getattr(
+                self.kv_mgr.kv_args, "state_dim_per_tensor", []
+            )
+            packed_state_dim_per_tensor = b"".join(
+                struct.pack("I", dim) for dim in state_dim_per_tensor
+            )
+
             with lock:
                 sock.send_multipart(
                     [
@@ -1084,6 +1370,8 @@ class NixlKVReceiver(CommonKVReceiver):
                         str(self.kv_mgr.attn_tp_size).encode("ascii"),
                         str(self.kv_mgr.kv_args.engine_rank).encode("ascii"),
                         str(self.kv_mgr.kv_args.kv_item_lens[0]).encode("ascii"),
+                        packed_state_item_lens,
+                        packed_state_dim_per_tensor,
                     ]
                 )
 

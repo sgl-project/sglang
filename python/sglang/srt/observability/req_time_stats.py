@@ -37,6 +37,7 @@ from sglang.srt.observability.trace import (
 from sglang.srt.utils import get_bool_env_var
 
 if TYPE_CHECKING:
+    from sglang.srt.disaggregation.base.conn import KVTransferMetric
     from sglang.srt.managers.schedule_batch import ScheduleBatch
 
 SGLANG_TEST_REQUEST_TIME_STATS = get_bool_env_var("SGLANG_TEST_REQUEST_TIME_STATS")
@@ -188,6 +189,28 @@ class RequestStage:
         "quick_finish",
         level=1,
         metrics_is_observed=True,
+    )
+
+    # speculative decode
+    SPEC_DRAFT = RequestStageConfig(
+        "spec_draft",
+        level=2,
+    )
+
+    SPEC_VERIFY = RequestStageConfig(
+        "spec_verify",
+        level=2,
+    )
+
+    SPEC_DRAFT_EXTEND = RequestStageConfig(
+        "spec_draft_extend",
+        level=3,
+    )
+
+    # CPU-side run batch
+    RUN_BATCH_CPU = RequestStageConfig(
+        "run_batch_cpu",
+        level=4,
     )
 
     # other
@@ -550,6 +573,12 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
     last_decode_scheduled_time: float = 0.0
     last_forward_entry_time: float = 0.0
     last_prefill_finished_time: float = 0.0
+    run_batch_cpu_start_time: float = 0.0
+
+    # speculative decoding
+    spec_draft_start_time: float = 0.0
+    spec_verify_start_time: float = 0.0
+    spec_draft_extend_start_time: float = 0.0
 
     # other
     transfer_speed_gb_s: float = 0.0
@@ -576,6 +605,54 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
         calibrate_time_diff()
         ts = ts or time.perf_counter()
         self.scheduler_recv_time = ts
+
+    def set_spec_draft_start_time(self, ts=None):
+        if ts is None:
+            ts = time.perf_counter()
+        self.spec_draft_start_time = ts
+
+    def set_spec_draft_end_time(self, ts=None):
+        if ts is None:
+            ts = time.perf_counter()
+
+        stage = RequestStage.SPEC_DRAFT
+        self.trace_slice(stage, self.spec_draft_start_time, ts)
+
+    def set_spec_verify_start_time(self, ts=None):
+        if ts is None:
+            ts = time.perf_counter()
+        self.spec_verify_start_time = ts
+
+    def set_spec_verify_end_time(self, ts=None, accepted_tokens: int = 0):
+        if ts is None:
+            ts = time.perf_counter()
+        stage = RequestStage.SPEC_VERIFY
+        self.trace_slice(
+            stage, self.spec_verify_start_time, ts, {"accepted_tokens": accepted_tokens}
+        )
+
+    def set_spec_draft_extend_start_time(self, ts=None):
+        if ts is None:
+            ts = time.perf_counter()
+        self.spec_draft_extend_start_time = ts
+
+    def set_spec_draft_extend_end_time(self, ts=None):
+        if ts is None:
+            ts = time.perf_counter()
+        stage = RequestStage.SPEC_DRAFT_EXTEND
+        self.trace_slice(stage, self.spec_draft_extend_start_time, ts)
+
+    def set_run_batch_cpu_start_time(self, ts=None, attrs=None):
+        ts = ts or time.perf_counter()
+        self.run_batch_cpu_start_time = ts
+
+    def set_run_batch_cpu_end_time(self, ts=None, attrs=None):
+        ts = ts or time.perf_counter()
+        if self.run_batch_cpu_start_time > 0.0:
+            self.trace_slice(
+                RequestStage.RUN_BATCH_CPU, self.run_batch_cpu_start_time, ts, attrs
+            )
+            self.run_batch_cpu_start_time = 0.0
 
     def set_retract_time(self, ts=None):
         ts = ts or time.perf_counter()
@@ -766,27 +843,30 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
 
     def compute_and_observe_kv_transfer_metrics(
         self,
-        num_tokens: int,
-        page_size: int,
-        bytes_per_page_all_layers: int,
+        transfer_metric: KVTransferMetric,
     ) -> Optional[dict]:
         """Compute KV transfer metrics and observe them via the metrics collector.
 
         Returns a dict with latency_ms, total_mb, speed_gb_s if computable, else None.
         """
-        from sglang.srt.disaggregation.utils import kv_to_page_num
-
         result = {}
+        if transfer_metric.transfer_total_bytes is None:
+            return result if result else None
 
         # Transfer latency, size, and speed
-        if self.prefill_transfer_queue_entry_time > 0 and self.completion_time > 0:
+        if transfer_metric.transfer_latency_s is not None:
+            transfer_latency_s = transfer_metric.transfer_latency_s
+        else:
+            if self.prefill_transfer_queue_entry_time <= 0 or self.completion_time <= 0:
+                return result if result else None
             transfer_latency_s = (
                 self.completion_time - self.prefill_transfer_queue_entry_time
             )
+
+        if transfer_latency_s > 0:
             latency_ms = transfer_latency_s * 1000
 
-            num_pages = kv_to_page_num(num_tokens, page_size)
-            total_bytes = bytes_per_page_all_layers * num_pages
+            total_bytes = transfer_metric.transfer_total_bytes
             total_mb = total_bytes / (1024 * 1024)
             self.transfer_total_mb = total_mb
 
@@ -904,8 +984,12 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
 
     def convert_to_duration(self) -> str:
         if self.disagg_mode == DisaggregationMode.NULL:
-            queue_duration = self.forward_entry_time - self.wait_queue_entry_time
-            forward_duration = self.completion_time - self.forward_entry_time
+            queue_duration = self.duration_between(
+                self.wait_queue_entry_time, self.forward_entry_time
+            )
+            forward_duration = self.duration_between(
+                self.forward_entry_time, self.completion_time
+            )
 
             if SGLANG_TEST_REQUEST_TIME_STATS:
                 assert (
@@ -914,11 +998,15 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
 
             return f"queue_duration={self.format_duration(queue_duration)}, forward_duration={self.format_duration(forward_duration)}, start_time={self.wait_queue_entry_time:.3f}"
         elif self.disagg_mode == DisaggregationMode.PREFILL:
-            bootstrap_queue_duration = (
-                self.wait_queue_entry_time - self.prefill_bootstrap_queue_entry_time
+            bootstrap_queue_duration = self.duration_between(
+                self.prefill_bootstrap_queue_entry_time, self.wait_queue_entry_time
             )
-            queue_duration = self.forward_entry_time - self.wait_queue_entry_time
-            forward_duration = self.completion_time - self.forward_entry_time
+            queue_duration = self.duration_between(
+                self.wait_queue_entry_time, self.forward_entry_time
+            )
+            forward_duration = self.duration_between(
+                self.forward_entry_time, self.completion_time
+            )
 
             if SGLANG_TEST_REQUEST_TIME_STATS:
                 if self.wait_queue_entry_time > 0:
@@ -930,11 +1018,11 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
 
             # Break down bootstrap_queue_duration into sub-phases
             if self.bootstrap_done_time > 0:
-                bootstrap_duration = (
-                    self.bootstrap_done_time - self.prefill_bootstrap_queue_entry_time
+                bootstrap_duration = self.duration_between(
+                    self.prefill_bootstrap_queue_entry_time, self.bootstrap_done_time
                 )
-                alloc_wait_duration = (
-                    self.wait_queue_entry_time - self.bootstrap_done_time
+                alloc_wait_duration = self.duration_between(
+                    self.bootstrap_done_time, self.wait_queue_entry_time
                 )
                 if SGLANG_TEST_REQUEST_TIME_STATS:
                     assert (
@@ -958,15 +1046,22 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
                 f"#retries={self.prefill_retry_count}"
             )
         elif self.disagg_mode == DisaggregationMode.DECODE:
-            prealloc_duration = (
-                self.decode_transfer_queue_entry_time
-                - self.decode_prealloc_queue_entry_time
+            prealloc_duration = self.duration_between(
+                self.decode_prealloc_queue_entry_time,
+                self.decode_transfer_queue_entry_time,
             )
-            transfer_duration = (
-                self.wait_queue_entry_time - self.decode_transfer_queue_entry_time
+            transfer_duration = self.duration_between(
+                self.decode_transfer_queue_entry_time,
+                self.wait_queue_entry_time,
             )
-            queue_duration = self.forward_entry_time - self.wait_queue_entry_time
-            forward_duration = self.completion_time - self.forward_entry_time
+            queue_duration = self.duration_between(
+                self.wait_queue_entry_time,
+                self.forward_entry_time,
+            )
+            forward_duration = self.duration_between(
+                self.forward_entry_time,
+                self.completion_time,
+            )
 
             if SGLANG_TEST_REQUEST_TIME_STATS:
                 if self.wait_queue_entry_time > 0:
@@ -979,11 +1074,11 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
 
             # Break down prealloc_duration into sub-phases
             if self.bootstrap_done_time > 0:
-                bootstrap_duration = (
-                    self.bootstrap_done_time - self.decode_prealloc_queue_entry_time
+                bootstrap_duration = self.duration_between(
+                    self.decode_prealloc_queue_entry_time, self.bootstrap_done_time
                 )
-                alloc_wait_duration = (
-                    self.decode_transfer_queue_entry_time - self.bootstrap_done_time
+                alloc_wait_duration = self.duration_between(
+                    self.bootstrap_done_time, self.decode_transfer_queue_entry_time
                 )
                 if SGLANG_TEST_REQUEST_TIME_STATS:
                     assert (
@@ -1029,6 +1124,11 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
     def format_duration(self, duration: float) -> str:
         return f"{duration * 1e3:.2f}ms"
 
+    def duration_between(self, start: float, end: float) -> float:
+        if start <= 0 or end <= 0:
+            return 0.0
+        return end - start
+
 
 def set_schedule_time_batch(batch: ScheduleBatch):
     # only for tracing
@@ -1049,11 +1149,21 @@ def set_schedule_time_batch(batch: ScheduleBatch):
         req.time_stats.set_last_scheduled_time(batch.forward_mode, ts, _attrs)
 
 
-def set_time_batch(reqs: List[Any], set_func: str):
+def set_time_batch(
+    reqs: List[Any],
+    set_func: str,
+    trace_only: bool = False,
+    attrs: Optional[Dict[str, Any]] = None,
+):
     if reqs is None or len(reqs) == 0:
+        return
+    if trace_only and not get_global_tracing_enabled():
         return
 
     ts = time.perf_counter()
     for req in reqs:
         method = getattr(req.time_stats, set_func)
-        method(ts)
+        if attrs is None:
+            method(ts)
+        else:
+            method(ts, attrs)

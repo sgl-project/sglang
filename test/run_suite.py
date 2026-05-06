@@ -43,6 +43,7 @@ PER_COMMIT_SUITES = {
         "stage-b-test-2-gpu-large",
         "stage-b-test-4-gpu-b200",
         "stage-b-kernel-unit-1-gpu-large",
+        "stage-b-kernel-unit-1-gpu-b200",
         "stage-b-kernel-unit-8-gpu-h200",
         "stage-b-kernel-benchmark-1-gpu-large",
         "stage-c-test-4-gpu-h100",
