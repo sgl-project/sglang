@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, List, Optional
 
@@ -10,6 +11,13 @@ from sglang.srt.server_args import ServerArgs
 
 if TYPE_CHECKING:
     from sglang.srt.disaggregation.utils import DisaggregationMode
+
+
+@dataclasses.dataclass
+class KVTransferMetric:
+    # Backends that cannot isolate transfer latency can leave this as None.
+    transfer_latency_s: Optional[float] = None
+    transfer_total_bytes: Optional[int] = None
 
 
 class KVArgs:
@@ -100,6 +108,11 @@ class BaseKVSender(ABC):
 
     def should_send_kv_chunk(self, num_pages: int, last_chunk: bool) -> bool:
         return num_pages > 0
+
+    @abstractmethod
+    def get_transfer_metric(self) -> KVTransferMetric:
+        """Return backend-specific transfer metrics for this sender."""
+        ...
 
     @abstractmethod
     def poll(self) -> KVPoll:
