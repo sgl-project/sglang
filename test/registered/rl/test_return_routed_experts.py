@@ -15,7 +15,6 @@ from sglang.srt.state_capturer.routed_experts import (
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import (
-    DEFAULT_ENABLE_ROUTED_EXPERTS_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
@@ -23,6 +22,11 @@ from sglang.test.test_utils import (
 )
 
 register_cuda_ci(est_time=400, suite="stage-c-test-4-gpu-h100")
+
+# FP8 variant of Qwen3-30B-A3B: required because DeepEP normal/LL fast paths in
+# ep_moe/layer.py only run for {Fp8Config (via deep_gemm), W4AFp8Config, aiter,
+# NPU, modelopt_fp4+cutedsl}. Bf16 hits an `assert False, "deprecated"` today.
+MODEL_PATH = "Qwen/Qwen3-30B-A3B-FP8"
 
 SHAREGPT_REPO_ID = "anon8231489123/ShareGPT_Vicuna_unfiltered"
 SHAREGPT_FILENAME = "ShareGPT_V3_unfiltered_cleaned_split.json"
@@ -146,7 +150,7 @@ class TestReturnRoutedExperts(CustomTestCase):
         other_args,
     ):
         process = popen_launch_server(
-            DEFAULT_ENABLE_ROUTED_EXPERTS_MODEL_NAME_FOR_TEST,
+            MODEL_PATH,
             DEFAULT_URL_FOR_TEST,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=other_args,
