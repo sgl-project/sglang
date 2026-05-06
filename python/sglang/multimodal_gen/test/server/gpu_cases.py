@@ -590,7 +590,7 @@ TWO_GPU_CASES = [
                 "--ltx2-two-stage-device-mode original",
             ],
         ),
-        T2V_sampling_params,
+        DiffusionSamplingParams(prompt=T2V_PROMPT, extras={"seed": 42}),
         run_component_accuracy_check=False,
     ),
     # I2V LoRA test case
