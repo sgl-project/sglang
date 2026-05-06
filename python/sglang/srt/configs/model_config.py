@@ -479,23 +479,21 @@ class ModelConfig:
             and not self.disable_hybrid_swa_memory
         )
 
-        if not self.is_hybrid_swa:
-            return
+        if self.is_hybrid_swa:
+            logger.info(f"Hybrid swa model: {self.hf_config.architectures=}")
 
-        logger.info(f"Hybrid swa model: {self.hf_config.architectures=}")
-
-        self.is_deepseek_v4_arch = any(
-            arch in ["DeepseekV4ForCausalLM", "DeepseekV4ForCausalLMNextN"]
-            for arch in self.hf_config.architectures
-        )
-
-        if self.is_hybrid_swa and not self.is_deepseek_v4_arch:
-            self.swa_attention_layer_ids, self.full_attention_layer_ids = (
-                get_hybrid_layer_ids(
-                    self.hf_config.architectures,
-                    self.hf_text_config,
-                )
+            self.is_deepseek_v4_arch = any(
+                arch in ["DeepseekV4ForCausalLM", "DeepseekV4ForCausalLMNextN"]
+                for arch in self.hf_config.architectures
             )
+
+            if not self.is_deepseek_v4_arch:
+                self.swa_attention_layer_ids, self.full_attention_layer_ids = (
+                    get_hybrid_layer_ids(
+                        self.hf_config.architectures,
+                        self.hf_text_config,
+                    )
+                )
 
         self.has_attention_sinks = self._detect_attention_sinks()
 
