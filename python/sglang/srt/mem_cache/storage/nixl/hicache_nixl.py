@@ -81,6 +81,7 @@ class HiCacheNixl(HiCacheStorage):
             raise RuntimeError("Failed to create NIXL backend")
 
         self.registration = NixlRegistration(self.agent)
+        self.is_zero_copy = False
 
     def _get_suffixed_key(self, key: str) -> str:
         return key + self.config_suffix

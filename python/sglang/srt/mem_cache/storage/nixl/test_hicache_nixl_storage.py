@@ -37,16 +37,21 @@ class TestNixlUnified(unittest.TestCase):
         self.storage_config = HiCacheStorageConfig(
             tp_rank=0,
             tp_size=2,
+            pp_rank=0,
+            pp_size=1,
+            attn_cp_rank=0,
+            attn_cp_size=1,
             is_mla_model=False,
             is_page_first_layout=False,
             model_name="test_model",
+            enable_storage_metrics=False,
+            extra_config={"plugin": {"posix": {"active": True}}},
         )
 
         try:
             self.hicache = HiCacheNixl(
                 storage_config=self.storage_config,
                 file_path=self.test_dir,
-                plugin="POSIX",
             )
         except ImportError:
             self.skipTest("NIXL not available, skipping NIXL storage tests")
@@ -250,20 +255,14 @@ class TestNixlUnified(unittest.TestCase):
         tensors = [torch.randn(5, 5) for _ in range(3)]
         self.assertIsNotNone(self.hicache.register_buffers(tensors))
 
-    def test_register_files_with_tuples(self):
-        """Test registration of files using NIXL tuples."""
+    def test_register_files(self):
+        """Test registration of files with NIXL."""
         files = [os.path.join(self.test_dir, f"test_file_{i}.bin") for i in range(3)]
         for file in files:
             self.file_manager.create_file(file)
 
-        # Create tuples and register
-        tuples = self.file_manager.files_to_nixl_tuples(files)
-        self.hicache.register_files(tuples)
-
-        # Verify tuples
-        self.assertEqual(len(tuples), len(files))
-        for t, f in zip(tuples, files):
-            self.assertEqual(t[3], f)  # Check file path
+        result = self.hicache.register_files(files)
+        self.assertIsNotNone(result)
 
 
 if __name__ == "__main__":
