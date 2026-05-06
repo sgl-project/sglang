@@ -598,6 +598,11 @@ class Envs:
     # SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_FP4_ACTS is also set; DeepGEMM asserts
     # this combination on the host side.
     SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_MXF4_KIND = EnvBool(False)
+    # Stream B (combine path): when set, the L2 epilogue ships FP8 E4M3 +
+    # per-(token, N=128) UE8M0 SF over NVLink instead of BF16. Halves
+    # NVLink bytes/token on the second a2a. Independent of FP4 acts /
+    # MXF4 kind. Forwarded to DG_USE_FP8_COMBINE=1.
+    SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_FP8_COMBINE = EnvBool(False)
 
     # TopK
     SGLANG_OPT_USE_FUSED_HASH_TOPK = EnvBool(True)

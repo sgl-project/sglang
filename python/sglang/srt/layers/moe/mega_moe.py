@@ -54,6 +54,8 @@ def _apply_mega_moe_dg_env() -> None:
         os.environ.setdefault("DG_USE_FP4_ACTS", "1")
     if envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_MXF4_KIND.get():
         os.environ.setdefault("DG_USE_MXF4_KIND", "1")
+    if envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_FP8_COMBINE.get():
+        os.environ.setdefault("DG_USE_FP8_COMBINE", "1")
     _MEGA_MOE_DG_ENV_APPLIED = True
 
 
