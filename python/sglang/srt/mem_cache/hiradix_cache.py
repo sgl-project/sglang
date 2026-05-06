@@ -31,12 +31,6 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolName,
     PoolTransfer,
 )
-from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
-    HybridCacheController,
-)
-from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
-    attach_hybrid_nsa_pool_to_hiradix_cache,
-)
 from sglang.srt.mem_cache.memory_pool import (
     MHATokenToKVPool,
     MLATokenToKVPool,
@@ -45,6 +39,12 @@ from sglang.srt.mem_cache.memory_pool import (
 from sglang.srt.mem_cache.memory_pool_host import (
     MHATokenToKVPoolHost,
     MLATokenToKVPoolHost,
+)
+from sglang.srt.mem_cache.multi_pool.multi_pool_assembler import (
+    attach_multi_pool_nsa_to_hiradix_cache,
+)
+from sglang.srt.mem_cache.multi_pool.multi_pool_cache_controller import (
+    MultiPoolCacheController,
 )
 from sglang.srt.mem_cache.radix_cache import (
     RadixCache,
@@ -80,7 +80,7 @@ class HiRadixCache(RadixCache):
                 allocator_type=server_args.hicache_storage_backend,
             )
         elif isinstance(self.kv_cache, NSATokenToKVPool):
-            # Filled by attach_hybrid_nsa_pool_to_hiradix_cache after storage extra_config is parsed.
+            # Filled by attach_multi_pool_nsa_to_hiradix_cache after storage extra_config is parsed.
             self.token_to_kv_pool_host = None
         elif isinstance(self.kv_cache, MLATokenToKVPool):
             self.token_to_kv_pool_host = MLATokenToKVPoolHost(
@@ -121,7 +121,7 @@ class HiRadixCache(RadixCache):
 
         self.load_cache_event = threading.Event()
         if isinstance(self.kv_cache, NSATokenToKVPool):
-            attach_hybrid_nsa_pool_to_hiradix_cache(
+            attach_multi_pool_nsa_to_hiradix_cache(
                 self,
                 params,
                 server_args,
@@ -633,7 +633,7 @@ class HiRadixCache(RadixCache):
         return height
 
     def _get_extra_pools(self) -> dict:
-        if not isinstance(self.cache_controller, HybridCacheController):
+        if not isinstance(self.cache_controller, MultiPoolCacheController):
             return {}
         if isinstance(self.kv_cache, NSATokenToKVPool):
             pool = PoolTransfer(
@@ -645,8 +645,8 @@ class HiRadixCache(RadixCache):
             return {}
 
     def _get_hybrid_storage_attach_kwargs(self) -> dict:
-        """Extra kwargs for attach_storage_backend when controller is HybridCacheController."""
-        if isinstance(self.cache_controller, HybridCacheController):
+        """Extra kwargs for attach_storage_backend when controller is MultiPoolCacheController."""
+        if isinstance(self.cache_controller, MultiPoolCacheController):
             return {"host_pools": self.cache_controller.mem_pool_host.entries}
         return {}
 

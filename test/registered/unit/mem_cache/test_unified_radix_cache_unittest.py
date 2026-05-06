@@ -1202,7 +1202,7 @@ class UnifiedRadixCacheSuite:
         return False
 
     def _init_hicache(self, tree):
-        import sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler as assembler
+        import sglang.srt.mem_cache.multi_pool.multi_pool_assembler as assembler
 
         orig_kv_host_pool = assembler.MHATokenToKVPoolHost
         orig_mamba_host_pool = assembler.MambaPoolHost

@@ -23,12 +23,6 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchResult,
 )
 from sglang.srt.mem_cache.hicache_storage import PoolHitPolicy, PoolName, PoolTransfer
-from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
-    PrefetchOperation,
-)
-from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
-    attach_hybrid_pool_to_mamba_cache,
-)
 from sglang.srt.mem_cache.mamba_radix_cache import (
     LRUList,
     MambaRadixCache,
@@ -36,6 +30,12 @@ from sglang.srt.mem_cache.mamba_radix_cache import (
     get_last_access_time,
 )
 from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, HybridReqToTokenPool
+from sglang.srt.mem_cache.multi_pool.multi_pool_assembler import (
+    attach_multi_pool_to_mamba_cache,
+)
+from sglang.srt.mem_cache.multi_pool.multi_pool_cache_controller import (
+    PrefetchOperation,
+)
 from sglang.srt.mem_cache.radix_cache import (
     RadixKey,
     compute_node_hash_values,
@@ -135,7 +135,7 @@ class HiMambaRadixCache(MambaRadixCache):
         self.prefetch_stop_policy = server_args.hicache_storage_prefetch_policy
 
         self.load_cache_event = threading.Event()
-        attach_hybrid_pool_to_mamba_cache(
+        attach_multi_pool_to_mamba_cache(
             self,
             params,
             server_args,

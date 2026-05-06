@@ -4,9 +4,6 @@ import logging
 from typing import TYPE_CHECKING, Any, Callable, Optional
 
 from sglang.srt.mem_cache.hicache_storage import PoolHitPolicy, PoolName
-from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
-    HybridCacheController,
-)
 from sglang.srt.mem_cache.memory_pool_host import (
     HostPoolGroup,
     MambaPoolHost,
@@ -14,6 +11,9 @@ from sglang.srt.mem_cache.memory_pool_host import (
     MLATokenToKVPoolHost,
     NSAIndexerPoolHost,
     PoolEntry,
+)
+from sglang.srt.mem_cache.multi_pool.multi_pool_cache_controller import (
+    MultiPoolCacheController,
 )
 
 if TYPE_CHECKING:
@@ -109,7 +109,7 @@ def build_kv_only_stack(
     attn_cp_rank: int = 0,
     attn_cp_size: int = 1,
     enable_storage_metrics: bool = False,
-) -> tuple[HostPoolGroup, HybridCacheController]:
+) -> tuple[HostPoolGroup, MultiPoolCacheController]:
     transfer_layer_num = len(full_layer_mapping)
     kv_host_pool = build_kv_host_pool(
         kv_pool=kv_pool,
@@ -129,7 +129,7 @@ def build_kv_only_stack(
         )
     ]
     host_pool_group = HostPoolGroup(entries)
-    cache_controller = HybridCacheController(
+    cache_controller = MultiPoolCacheController(
         params.token_to_kv_pool_allocator,
         host_pool_group,
         page_size,
@@ -178,7 +178,7 @@ def build_hybrid_mamba_stack(
     attn_cp_rank: int = 0,
     attn_cp_size: int = 1,
     enable_storage_metrics: bool = False,
-) -> tuple[HostPoolGroup, HybridCacheController]:
+) -> tuple[HostPoolGroup, MultiPoolCacheController]:
     transfer_layer_num = len(full_layer_mapping | mamba_layer_mapping)
     kv_host_pool = build_kv_host_pool(
         kv_pool=kv_pool,
@@ -213,7 +213,7 @@ def build_hybrid_mamba_stack(
         ),
     ]
     host_pool_group = HostPoolGroup(entries)
-    cache_controller = HybridCacheController(
+    cache_controller = MultiPoolCacheController(
         params.token_to_kv_pool_allocator,
         host_pool_group,
         page_size,
@@ -261,7 +261,7 @@ def build_shared_anchor_stack(
     attn_cp_rank: int = 0,
     attn_cp_size: int = 1,
     enable_storage_metrics: bool = False,
-) -> tuple[HostPoolGroup, HybridCacheController]:
+) -> tuple[HostPoolGroup, MultiPoolCacheController]:
     transfer_layer_num = len(full_layer_mapping)
     kv_host_pool = build_kv_host_pool(
         kv_pool=kv_pool,
@@ -290,7 +290,7 @@ def build_shared_anchor_stack(
         ),
     ]
     host_pool_group = HostPoolGroup(entries)
-    cache_controller = HybridCacheController(
+    cache_controller = MultiPoolCacheController(
         params.token_to_kv_pool_allocator,
         host_pool_group,
         page_size,
@@ -314,7 +314,7 @@ def build_shared_anchor_stack(
     return host_pool_group, cache_controller
 
 
-def attach_hybrid_pool_to_unified_cache(
+def attach_multi_pool_to_unified_cache(
     cache: UnifiedRadixCache,
     params: CacheInitParams,
     server_args: ServerArgs,
@@ -323,7 +323,7 @@ def attach_hybrid_pool_to_unified_cache(
     attn_cp_group: Optional["torch.distributed.ProcessGroup"] = None,
     attn_tp_group: Optional["torch.distributed.ProcessGroup"] = None,
 ) -> None:
-    """Attach HostPoolGroup + HybridCacheController to UnifiedRadixCache."""
+    """Attach HostPoolGroup + MultiPoolCacheController to UnifiedRadixCache."""
     from sglang.srt.mem_cache.base_prefix_cache import EvictParams
     from sglang.srt.mem_cache.memory_pool import (
         HybridLinearKVPool,
@@ -457,16 +457,16 @@ def attach_hybrid_pool_to_unified_cache(
         )
 
         logger.info(
-            "Attached hybrid pool stack to UnifiedRadixCache: pools=%s, transfer_layer_num=%s",
+            "Attached multi-pool stack to UnifiedRadixCache: pools=%s, transfer_layer_num=%s",
             "KV + MAMBA" if mamba_stack else "KV + INDEXER" if nsa_stack else "KV",
             transfer_layer_num,
         )
     except Exception:
-        logger.exception("attach_hybrid_pool_to_unified_cache failed")
+        logger.exception("attach_multi_pool_to_unified_cache failed")
         raise
 
 
-def attach_hybrid_nsa_pool_to_hiradix_cache(
+def attach_multi_pool_nsa_to_hiradix_cache(
     radix_cache: HiRadixCache,
     params: CacheInitParams,
     server_args: ServerArgs,
@@ -478,7 +478,7 @@ def attach_hybrid_nsa_pool_to_hiradix_cache(
     attn_cp_group: Optional["torch.distributed.ProcessGroup"] = None,
     attn_tp_group: Optional["torch.distributed.ProcessGroup"] = None,
 ) -> None:
-    """Attach HostPoolGroup (KV + indexer) + HybridCacheController for HiRadixCache.
+    """Attach HostPoolGroup (KV + indexer) + MultiPoolCacheController for HiRadixCache.
 
     This entrypoint is currently intended only for HiRadixCache's NSA path.
     """
@@ -517,16 +517,16 @@ def attach_hybrid_nsa_pool_to_hiradix_cache(
         radix_cache.token_to_kv_pool_host = host_pool_group
         radix_cache.cache_controller = cache_controller
         logger.info(
-            "Attached hybrid NSA pool stack to HiRadixCache: pools=KV + INDEXER, "
+            "Attached multi-pool NSA stack to HiRadixCache: pools=KV + INDEXER, "
             "transfer_layer_num=%s",
             len(layer_mapping),
         )
     except Exception:
-        logger.exception("attach_hybrid_nsa_pool_to_hiradix_cache failed")
+        logger.exception("attach_multi_pool_nsa_to_hiradix_cache failed")
         raise
 
 
-def attach_hybrid_pool_to_mamba_cache(
+def attach_multi_pool_to_mamba_cache(
     mamba_cache: HiMambaRadixCache,
     params: CacheInitParams,
     server_args: ServerArgs,
@@ -538,7 +538,7 @@ def attach_hybrid_pool_to_mamba_cache(
     attn_cp_group: Optional["torch.distributed.ProcessGroup"] = None,
     attn_tp_group: Optional["torch.distributed.ProcessGroup"] = None,
 ) -> None:
-    """Attach HostPoolGroup (KV + Mamba) + HybridCacheController for HiMambaRadixCache.
+    """Attach HostPoolGroup (KV + Mamba) + MultiPoolCacheController for HiMambaRadixCache.
 
     This entrypoint is currently intended only for HiMambaRadixCache.
     """
@@ -582,10 +582,10 @@ def attach_hybrid_pool_to_mamba_cache(
         )
         hybrid_kv.register_layer_transfer_counter(cache_controller.layer_done_counter)
         logger.info(
-            "Attached hybrid Mamba pool stack to HiMambaRadixCache: pools=KV + MAMBA, "
+            "Attached multi-pool Mamba stack to HiMambaRadixCache: pools=KV + MAMBA, "
             "transfer_layer_num=%s",
             mamba_cache.transfer_layer_num,
         )
     except Exception:
-        logger.exception("attach_hybrid_pool_to_mamba_cache failed")
+        logger.exception("attach_multi_pool_to_mamba_cache failed")
         raise

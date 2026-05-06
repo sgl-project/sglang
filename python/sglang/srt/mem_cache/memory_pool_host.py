@@ -1666,7 +1666,7 @@ class PoolEntry:
     # When True, host_pool uses the same logical slot indices as the anchor pool
     # (e.g. DSA indexer); HostPoolGroup.free mirrors frees to this pool.
     share_indices_with_anchor: bool = False
-    # Optional eviction callbacks for auto-alloc in HybridCacheController.
+    # Optional eviction callbacks for auto-alloc in MultiPoolCacheController.
     # host_evict_fn(n): evict n slots from the host pool (used by write()).
     # device_evict_fn(n): evict n slots from the device pool (used by load()).
     host_evict_fn: Optional[Callable] = None

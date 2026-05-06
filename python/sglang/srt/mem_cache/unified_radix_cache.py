@@ -287,8 +287,8 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def init_hicache(self, server_args: ServerArgs, params: CacheInitParams) -> None:
         """Initialize HiCache infrastructure."""
-        from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
-            attach_hybrid_pool_to_unified_cache,
+        from sglang.srt.mem_cache.multi_pool.multi_pool_assembler import (
+            attach_multi_pool_to_unified_cache,
         )
 
         # Direct IO layout fixup (must happen before pool creation)
@@ -302,7 +302,7 @@ class UnifiedRadixCache(BasePrefixCache):
 
         self.load_cache_event = threading.Event()
         self.hicache_anchor_kv_shared_indices_pools.clear()
-        attach_hybrid_pool_to_unified_cache(
+        attach_multi_pool_to_unified_cache(
             self,
             params,
             server_args,

@@ -146,7 +146,7 @@ class PrefetchOperation(StorageOperation):
         return self._terminated_flag
 
 
-class HybridCacheController(BaseHiCacheController):
+class MultiPoolCacheController(BaseHiCacheController):
     def __init__(
         self,
         token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,

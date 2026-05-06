@@ -66,7 +66,7 @@ node.component_data = {
 | `full_component.py` | `FullComponent` — standard full-attention KV cache component |
 | `swa_component.py` | `SWAComponent` — sliding-window attention component with tombstone/window tracking |
 | `mamba_component.py` | `MambaComponent` — Mamba/SSM state component with copy-on-write |
-| `hybrid_cache_controller.py` | `HybridCacheController` — HiCache 3-tier storage controller (L1 GPU → L2 CPU → L3 Disk) |
+| `multi_pool_cache_controller.py` | `MultiPoolCacheController` — HiCache 3-tier storage controller (L1 GPU → L2 CPU → L3 Disk) |
 | `__init__.py` | Re-exports: `ComponentName`, `ComponentData`, `TreeComponent`, `FullComponent`, `SWAComponent`, `MambaComponent` |
 
 ---
