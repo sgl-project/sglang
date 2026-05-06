@@ -163,11 +163,9 @@ class FlashinferDispatcher(BaseDispatcher):
         topk_ids = topk_output.topk_ids
         topk_weights = topk_output.topk_weights
 
-        # Track if this DP worker has no tokens (idle rank).
         # Unlike the old dummy-token approach, we pass 0-size tensors directly
         # to the alltoall kernel, which handles local_num_tokens=0 natively
         # (same as TRT-LLM). The kernel keeps 1 thread alive for sync.
-        self.is_idle_rank = x.shape[0] == 0
 
         global_scale = self.quant_config.get("input_global_scale", None)
         if global_scale is not None:
@@ -247,5 +245,4 @@ class FlashinferDispatcher(BaseDispatcher):
         )
 
         del self.runtime_max_tokens_per_rank
-        del self.is_idle_rank
         return hidden_states
