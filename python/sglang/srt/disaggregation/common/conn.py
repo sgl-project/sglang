@@ -95,6 +95,8 @@ class CommonKVManager(BaseKVManager):
         is_mla_backend: Optional[bool] = False,
     ):
         self.kv_args = args
+        self.kv_item_lens_sum = sum(args.kv_item_lens)
+        self.state_item_lens_sum = sum(args.state_item_lens)
         self.is_mla_backend = is_mla_backend
         self.disaggregation_mode = disaggregation_mode
         self.server_args = server_args
@@ -508,12 +510,8 @@ class CommonKVSender(BaseKVSender):
         return num_pages > 0
 
     def get_transfer_metric(self) -> KVTransferMetric:
-        total_bytes = self._transfer_num_kv_indices * sum(
-            self.kv_mgr.kv_args.kv_item_lens
-        )
-        total_bytes += self._transfer_num_state_indices * sum(
-            self.kv_mgr.kv_args.state_item_lens
-        )
+        total_bytes = self._transfer_num_kv_indices * self.kv_mgr.kv_item_lens_sum
+        total_bytes += self._transfer_num_state_indices * self.kv_mgr.state_item_lens_sum
         self._transfer_metric.transfer_total_bytes = total_bytes
         return self._transfer_metric
 

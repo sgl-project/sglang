@@ -850,7 +850,8 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
         Returns a dict with latency_ms, total_mb, speed_gb_s if computable, else None.
         """
         result = {}
-        assert transfer_metric.transfer_total_bytes is not None
+        if transfer_metric.transfer_total_bytes is None:
+            return result if result else None
 
         # Transfer latency, size, and speed
         if transfer_metric.transfer_latency_s is not None:

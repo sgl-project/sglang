@@ -659,7 +659,8 @@ class SchedulerDisaggregationPrefillMixin:
                 continue
             if req.bootstrap_host == FAKE_BOOTSTRAP_HOST:
                 continue
-            if getattr(req.disagg_kv_sender.kv_mgr, "is_dummy_cp_rank", False):
+            kv_mgr = getattr(req.disagg_kv_sender, "kv_mgr", None)
+            if kv_mgr and getattr(kv_mgr, "is_dummy_cp_rank", False):
                 continue
             metrics = req.time_stats.compute_and_observe_kv_transfer_metrics(
                 req.disagg_kv_sender.get_transfer_metric()
