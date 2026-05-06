@@ -161,11 +161,9 @@ class FlashinferDispatcher(BaseDispatcher):
         topk_ids = topk_output.topk_ids
         topk_weights = topk_output.topk_weights
 
-        # Track if this DP worker has no tokens (idle rank).
         # Unlike the old dummy-token approach, we pass 0-size tensors directly
         # to the alltoall kernel, which handles local_num_tokens=0 natively
         # (same as TRT-LLM). The kernel keeps 1 thread alive for sync.
-        self.is_idle_rank = x.shape[0] == 0
 
         global_scale = self.quant_config.get("input_global_scale", None)
         if global_scale is not None:
@@ -194,6 +192,12 @@ class FlashinferDispatcher(BaseDispatcher):
             if get_dp_global_num_tokens() is not None
             else x.shape[0]
         )
+        # Passing topk_ids + invalid_token_expert_id triggers the sanitize step
+        # inside moe_a2a. The recv buffer has shape
+        # [ep_size, max_tokens_per_rank, ...], so any rank below max leaves
+        # padding slots whose expert_id would otherwise route to a real expert
+        # and waste downstream MoE compute. Sanitizing the padding to a
+        # sentinel id is structural, not optional.
         recv_tensors = self.moe_a2a.dispatch(
             topk_ids,
             payloads,
@@ -239,5 +243,4 @@ class FlashinferDispatcher(BaseDispatcher):
         )
 
         del self.runtime_max_tokens_per_rank
-        del self.is_idle_rank
         return hidden_states
