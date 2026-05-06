@@ -9168,6 +9168,11 @@ def run_model_runner_real_req_to_token_pool_bounded_read_hook_for_smoke(
 ) -> dict[str, Any]:
     """Run a smoke-only bounded real req_to_token_pool read hook."""
 
+    allow_scalar_tensor_item_conversion = (
+        os.getenv("SGLANG_RELAYKV_REAL_REQ_TO_TOKEN_POOL_SCALAR_ITEM_CONVERSION")
+        == "1"
+    )
+
     runtime_observation_payloads, runtime_observation_source_path = (
         _relaykv_runtime_req_to_token_payload_source_for_smoke(
             forward_batch=forward_batch,
@@ -9234,6 +9239,7 @@ def run_model_runner_real_req_to_token_pool_bounded_read_hook_for_smoke(
         runtime_observation_payloads=runtime_observation_payloads,
         req_to_token_pool_object=req_to_token_pool_object,
         read_req_to_token_pool=True,
+        allow_scalar_tensor_item_conversion=allow_scalar_tensor_item_conversion,
         max_tokens_per_request=256,
         max_total_tokens=1024,
         source_path=req_to_token_pool_source_path,
@@ -9241,6 +9247,7 @@ def run_model_runner_real_req_to_token_pool_bounded_read_hook_for_smoke(
     summary = summarize_relaykv_real_req_to_token_pool_bounded_read_results_for_smoke(
         read_results,
         read_enabled=True,
+        allow_scalar_tensor_item_conversion=allow_scalar_tensor_item_conversion,
         max_tokens_per_request=256,
         max_total_tokens=1024,
     )
