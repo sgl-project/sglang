@@ -4,6 +4,7 @@ import json
 import logging
 from collections import Counter
 from collections.abc import Iterable, Mapping
+from dataclasses import asdict, dataclass, field
 from typing import Any, Dict, Optional
 
 from .planner import RelayKVPlan
@@ -24,6 +25,56 @@ POLICY_EVENT_LOG_KEYS = (
     "risk_level",
     "policy_reason",
 )
+
+
+@dataclass(frozen=True)
+class RelayKVBlockMeta:
+    """Reserved RelayKV block metadata for future retrieval-only annotations."""
+
+    query_block_score: Optional[float] = None
+    middle_layer_query_block_score: Optional[float] = None
+    retrieval_criticality_rank: Optional[int] = None
+    gather_anchor_score: Optional[float] = None
+    aggregate_retrieval_score: Optional[float] = None
+    massive_qk_score: Optional[float] = None
+    working_set_stability_score: Optional[float] = None
+    last_retrieved_step: Optional[int] = None
+    retrieval_reuse_count: Optional[int] = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class RelayKVGroupMeta:
+    """Reserved RelayKV per-kv-head-group metadata.
+
+    For GQA-style models, any future per-head retrieval scores should be
+    aggregated into `kv_head_group` scores before populating this schema.
+    """
+
+    layer_id: int
+    kv_head_group: int
+    retrieval_head_score: Optional[float] = None
+    query_dependent_group_score: Optional[float] = None
+    group_budget_bonus: Optional[int] = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class RelayKVPolicyDecision:
+    """Reserved RelayKV policy metadata for future temporal-reuse bookkeeping."""
+
+    temporal_reuse_enabled: bool = False
+    reused_block_ids: list[int] = field(default_factory=list)
+    newly_retrieved_block_ids: list[int] = field(default_factory=list)
+    selection_stability_ratio: Optional[float] = None
+    selection_reason_counts: dict[str, int] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
 
 
 def log_shadow_plan(
