@@ -1019,8 +1019,23 @@ class TritonAttnBackend(AttentionBackend):
             prefix_kv_indices = self.forward_metadata.kv_indices
             window_start_pos = None
 
-        # Build unified kv_indices using fused Triton kernel
+        # For SWA layers, mirror SWAKVPool.set_kv_buffer: read from the
+        # precomputed pool.swa_loc. Translate out_cache_loc to SWA-pool index space
+        # as a fallback when pool.swa_loc is not pre-populated.
         extend_kv_indices = forward_batch.out_cache_loc
+        pool = forward_batch.token_to_kv_pool
+        if (
+            layer.sliding_window_size is not None
+            and layer.sliding_window_size > -1
+            and isinstance(pool, SWAKVPool)
+            and pool.layers_mapping[layer.layer_id][1]
+        ):
+            if pool.swa_loc is not None:
+                extend_kv_indices = pool.swa_loc
+            else:
+                extend_kv_indices = pool.translate_loc_from_full_to_swa(
+                    extend_kv_indices
+                )
 
         # Handle cases where extend_seq_lens or extend_start_loc might not be set
         # In speculative decoding, we can infer these from spec_info or compute them
