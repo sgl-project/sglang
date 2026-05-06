@@ -157,11 +157,12 @@ class SchedulerMetricsMixin:
                 self._mfu_log_read_bytes = 0.0
                 self._mfu_log_write_bytes = 0.0
 
+        self.fwd_occupancy = float("nan")
+
         if ENABLE_METRICS_DEVICE_TIMER:
             self._device_timer_window_batch_count = 0
             self._device_timer_window_gpu_time = 0.0
             self._device_timer_window_start = None
-            self.fwd_occupancy = float("nan")
 
             def _wrap_execution_reporter(**kwargs):
                 self._device_timer_window_gpu_time += kwargs["t"]
@@ -177,6 +178,19 @@ class SchedulerMetricsMixin:
         self.scheduler_status_logger = SchedulerStatusLogger.maybe_create(
             enable_metrics=self.enable_metrics
         )
+
+    def install_device_timer_on_runners(self: Scheduler):
+        if not hasattr(self, "forward_pass_device_timer"):
+            return
+        timer = self.forward_pass_device_timer
+        self.tp_worker.model_runner.device_timer = timer
+        if self.draft_worker is not None:
+            dw = getattr(self.draft_worker, "draft_worker", None)
+            if dw is not None:
+                if hasattr(dw, "draft_runner"):
+                    dw.draft_runner.device_timer = timer
+                for r in getattr(dw, "draft_runner_list", []):
+                    r.device_timer = timer
 
     def init_kv_events(self: Scheduler, kv_events_config: Optional[str]):
         self.enable_kv_cache_events = bool(
@@ -373,7 +387,7 @@ class SchedulerMetricsMixin:
         )
 
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
-            msg += f"#prealloc-req: {len(self.disagg_prefill_bootstrap_queue.queue)}, "
+            msg += f"#bootstrap-req: {len(self.disagg_prefill_bootstrap_queue.queue)}, "
             msg += f"#inflight-req: {len(self.disagg_prefill_inflight_queue)}, "
 
         if (
@@ -438,7 +452,7 @@ class SchedulerMetricsMixin:
 
             # PD disaggregation
             if self.disaggregation_mode == DisaggregationMode.PREFILL:
-                self.stats.num_prefill_prealloc_queue_reqs = QueueCount.from_reqs(
+                self.stats.num_prefill_bootstrap_queue_reqs = QueueCount.from_reqs(
                     self.disagg_prefill_bootstrap_queue.queue, priority_enabled
                 )
                 self.stats.num_prefill_inflight_queue_reqs = QueueCount.from_reqs(
@@ -456,6 +470,7 @@ class SchedulerMetricsMixin:
 
             # Utilization / LoRA / HiCache
             self.calculate_utilization()
+            self.stats.fwd_occupancy = self.fwd_occupancy
             self.update_lora_metrics()
             self._log_hicache_stats()
             self.metrics_collector.log_stats(self.stats)
@@ -615,7 +630,7 @@ class SchedulerMetricsMixin:
 
             # PD disaggregation
             if self.disaggregation_mode == DisaggregationMode.PREFILL:
-                self.stats.num_prefill_prealloc_queue_reqs = QueueCount.from_reqs(
+                self.stats.num_prefill_bootstrap_queue_reqs = QueueCount.from_reqs(
                     self.disagg_prefill_bootstrap_queue.queue, priority_enabled
                 )
                 self.stats.num_prefill_inflight_queue_reqs = QueueCount.from_reqs(
@@ -648,6 +663,7 @@ class SchedulerMetricsMixin:
 
             # Utilization / LoRA / HiCache
             self.calculate_utilization()
+            self.stats.fwd_occupancy = self.fwd_occupancy
             self.update_lora_metrics()
             self._log_hicache_stats()
             self.metrics_collector.log_stats(self.stats)
@@ -861,7 +877,7 @@ class SchedulerMetricsMixin:
         disaggregation = None
         if include_all or "disagg" in include:
             mode_str = "null"
-            prefill_prealloc = 0
+            prefill_bootstrap = 0
             prefill_inflight = 0
             decode_prealloc = 0
             decode_transfer = 0
@@ -869,7 +885,7 @@ class SchedulerMetricsMixin:
 
             if self.disaggregation_mode == DisaggregationMode.PREFILL:
                 mode_str = "prefill"
-                prefill_prealloc = len(self.disagg_prefill_bootstrap_queue.queue)
+                prefill_bootstrap = len(self.disagg_prefill_bootstrap_queue.queue)
                 prefill_inflight = len(self.disagg_prefill_inflight_queue)
             elif self.disaggregation_mode == DisaggregationMode.DECODE:
                 mode_str = "decode"
@@ -881,7 +897,7 @@ class SchedulerMetricsMixin:
 
             disaggregation = DisaggregationMetrics(
                 mode=mode_str,
-                prefill_prealloc_queue_reqs=prefill_prealloc,
+                prefill_bootstrap_queue_reqs=prefill_bootstrap,
                 prefill_inflight_queue_reqs=prefill_inflight,
                 decode_prealloc_queue_reqs=decode_prealloc,
                 decode_transfer_queue_reqs=decode_transfer,
@@ -946,3 +962,4 @@ class SchedulerMetricsMixin:
     def reset_device_timer_window(self: Scheduler):
         if ENABLE_METRICS_DEVICE_TIMER:
             self._device_timer_window_batch_count = 0
+            self.fwd_occupancy = float("nan")
