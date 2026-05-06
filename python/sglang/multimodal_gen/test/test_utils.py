@@ -50,12 +50,13 @@ SGL_TEST_FILES_CONSISTENCY_GT_BASES = (
     SGL_TEST_FILES_OFFICIAL_CONSISTENCY_GT_BASE,
     SGL_TEST_FILES_SGLANG_CONSISTENCY_GT_BASE,
 )
+# Keep non-comparable LTX CI scenarios on sglang_generated rather than hiding
+# remaining semantic gaps behind very loose official thresholds.
 SGL_TEST_FILES_OFFICIAL_CONSISTENCY_GT_CASES = frozenset(
     {
+        "ltx_2_two_stage_t2v",
         "ltx_2.3_one_stage_ti2v",
         "ltx_2.3_two_stage_t2v_2gpus",
-        "ltx_2_3_hq_pipeline",
-        "ltx_2_3_two_stage_ti2v_2gpus",
     }
 )
 CONSISTENCY_THRESHOLD_JSON_PATH = (
@@ -963,10 +964,28 @@ def _remote_consistency_gt_candidates(
 
 
 def _remote_file_exists(url: str) -> bool:
-    try:
-        return requests.head(url, timeout=10, allow_redirects=True).status_code == 200
-    except requests.RequestException:
-        return False
+    for method in ("head", "get"):
+        try:
+            if method == "head":
+                resp = requests.head(url, timeout=10, allow_redirects=True)
+            else:
+                resp = requests.get(
+                    url,
+                    timeout=10,
+                    allow_redirects=True,
+                    headers={"Range": "bytes=0-0"},
+                    stream=True,
+                )
+            try:
+                if resp.status_code in (200, 206):
+                    return True
+                if resp.status_code not in (403, 405, 429) and resp.status_code < 500:
+                    return False
+            finally:
+                resp.close()
+        except requests.RequestException:
+            pass
+    return False
 
 
 def _find_remote_consistency_gt_files(
