@@ -1668,7 +1668,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 "finish_reason": recv_obj.finished_reasons[i],
                 "prompt_tokens": recv_obj.prompt_tokens[i],
                 "weight_version": self.server_args.weight_version,
-                "total_retractions": recv_obj.retraction_counts[i],
+                "num_retractions": recv_obj.retraction_counts[i],
             }
 
             if self.enable_metrics:
