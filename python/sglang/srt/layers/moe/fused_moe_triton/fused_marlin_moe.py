@@ -260,10 +260,7 @@ def fused_marlin_moe(
     output = hidden_states if inplace else torch.empty_like(hidden_states)
 
     if is_mxfp4_marlin:
-        torch.sum(intermediate_cache3, dim=1, out=output)
-        if routed_scaling_factor is not None:
-            output.mul_(routed_scaling_factor)
-        return output
+        return torch.sum(intermediate_cache3, dim=1, out=output)
     else:
         if routed_scaling_factor is None:
             routed_scaling_factor = 1.0
