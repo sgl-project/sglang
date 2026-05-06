@@ -768,21 +768,21 @@ class EAGLEWorkerV2(BaseSpecWorker):
 
         # Correct some buffers due to the overlap plan
         if self.plan_stream:
+            torch.get_device_module(self.device).current_stream().wait_stream(
+                self.plan_stream
+            )
             if (
-                self._target_worker.model_runner.model_is_mrope
+                _is_npu
+                and self._target_worker.model_runner.model_is_mrope
                 and batch.spec_info is not None
                 and getattr(batch.spec_info, "positions", None) is not None
                 and not batch.forward_mode.is_idle()
-                and _is_npu
             ):
                 # mrope_position depends on draft output in default stream and is computed in plan stream,
                 # causing errors. Compute it here for correct values.
                 verify_forward_batch.compute_spec_mrope_positions(
                     self._target_worker.model_runner, batch
                 )
-            torch.get_device_module(self.device).current_stream().wait_stream(
-                self.plan_stream
-            )
 
             # Some values such as custom_mask and position depend on the output of draft,
             # so the previous plan step used the wrong values. Here, we need to run the related
