@@ -2019,27 +2019,27 @@
         },
         "fsdp-inference": {
             "stages_ms": {
-                "InputValidationStage": 0.05,
-                "LatentPreparationStage": 0.15,
-                "TextEncodingStage": 297.4,
-                "TimestepPreparationStage": 57.84,
-                "DecodingStage": 8.17,
-                "DenoisingStage": 2142.47
+                "InputValidationStage": 0.06,
+                "LatentPreparationStage": 0.16,
+                "TextEncodingStage": 305.97,
+                "TimestepPreparationStage": 57.19,
+                "DecodingStage": 16.88,
+                "DenoisingStage": 2422.53
             },
             "denoise_step_ms": {
-                "0": 80.53,
-                "1": 188.09,
-                "2": 219.79,
-                "3": 219.53,
-                "4": 218.6,
-                "5": 216.57,
-                "6": 215.51,
-                "7": 215.09,
-                "8": 215.14
+                "0": 259.26,
+                "1": 284.25,
+                "2": 283.74,
+                "3": 270.48,
+                "4": 278.55,
+                "5": 271.58,
+                "6": 270.89,
+                "7": 277.75,
+                "8": 270.1
             },
-            "expected_e2e_ms": 2745.03,
-            "expected_avg_denoise_ms": 237.53,
-            "expected_median_denoise_ms": 260.88,
+            "expected_e2e_ms": 2775.88,
+            "expected_avg_denoise_ms": 268.55,
+            "expected_median_denoise_ms": 268.51,
             "estimated_full_test_time_s": 122.7
         },
         "hunyuan3d_shape_gen": {
