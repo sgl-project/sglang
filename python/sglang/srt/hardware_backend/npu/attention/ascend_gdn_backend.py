@@ -14,6 +14,9 @@ from sglang.srt.hardware_backend.npu.attention.ascend_hybrid_linear_attn_backend
     AscendMambaAttnBackendBase,
 )
 from sglang.srt.layers.attention.linear.gdn_backend import GDNKernelDispatcher
+from sglang.srt.layers.attention.linear.gdn_chunk_meta import (
+    build_gdn_chunked_prefill_meta,
+)
 from sglang.srt.layers.attention.linear.utils import (
     get_linear_attn_decode_backend,
     get_linear_attn_prefill_backend,
@@ -27,6 +30,21 @@ from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
 fused_gdn_gating = fused_gdn_gating_npu
 causal_conv1d_fn = causal_conv1d_fn_npu
 causal_conv1d_update = causal_conv1d_update_npu
+
+
+def _cu_seqlens_cpu_from_seq_lens(seq_lens_cpu) -> torch.Tensor:
+    if isinstance(seq_lens_cpu, torch.Tensor):
+        seq_lens = seq_lens_cpu.detach()
+        if seq_lens.device.type != "cpu":
+            seq_lens = seq_lens.cpu()
+        seq_lens = seq_lens.to(dtype=torch.int32)
+    else:
+        seq_lens = torch.tensor(seq_lens_cpu, dtype=torch.int32)
+
+    cu_seqlens = torch.empty(seq_lens.numel() + 1, dtype=torch.int32)
+    cu_seqlens[0] = 0
+    cu_seqlens[1:] = torch.cumsum(seq_lens, dim=0)
+    return cu_seqlens
 
 
 class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
@@ -45,6 +63,44 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
         decode_backend = get_linear_attn_decode_backend()
         prefill_backend = get_linear_attn_prefill_backend()
         self.kernel_dispatcher = GDNKernelDispatcher(decode_backend, prefill_backend)
+
+    def _get_non_spec_chunked_prefill_meta(
+        self,
+        forward_batch: ForwardBatch,
+        num_heads: int,
+        device: torch.device,
+    ):
+        if (
+            self.graph_mode
+            or not forward_batch.forward_mode.is_extend_without_speculative()
+            or not forward_batch.spec_algorithm.is_none()
+            or forward_batch.extend_seq_lens_cpu is None
+        ):
+            return None, None
+
+        cu_seqlens_cpu = getattr(self.forward_metadata, "cu_seqlens_cpu", None)
+        if cu_seqlens_cpu is None:
+            cu_seqlens_cpu = _cu_seqlens_cpu_from_seq_lens(
+                forward_batch.extend_seq_lens_cpu
+            )
+            self.forward_metadata.cu_seqlens_cpu = cu_seqlens_cpu
+
+        prebuilt_meta = getattr(
+            self.forward_metadata, "non_spec_chunked_prefill_meta", None
+        )
+        prebuilt_meta_num_heads = getattr(
+            self.forward_metadata, "non_spec_chunked_prefill_meta_num_heads", None
+        )
+        if prebuilt_meta is None or prebuilt_meta_num_heads != num_heads:
+            prebuilt_meta = build_gdn_chunked_prefill_meta(
+                cu_seqlens_cpu=cu_seqlens_cpu,
+                num_heads=num_heads,
+                device=device,
+            )
+            self.forward_metadata.non_spec_chunked_prefill_meta = prebuilt_meta
+            self.forward_metadata.non_spec_chunked_prefill_meta_num_heads = num_heads
+
+        return cu_seqlens_cpu, prebuilt_meta
 
     def prepare_gdn_inputs(
         self,
@@ -335,6 +391,11 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
             value = value.view(1, actual_seq_len, layer.num_v_heads, layer.head_v_dim)
 
             g, beta = fused_gdn_gating(layer.A_log, a, b, layer.dt_bias)
+            cu_seqlens_cpu, prebuilt_meta = self._get_non_spec_chunked_prefill_meta(
+                forward_batch,
+                layer.num_v_heads,
+                mixed_qkv.device,
+            )
             core_attn_out, last_recurrent_state, h = self.kernel_dispatcher.extend(
                 q=query,
                 k=key,
@@ -344,6 +405,8 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
                 ssm_states=ssm_states,
                 cache_indices=cache_indices,
                 query_start_loc=query_start_loc,
+                cu_seqlens_cpu=cu_seqlens_cpu,
+                prebuilt_meta=prebuilt_meta,
             )
             if last_recurrent_state is not None:
                 last_recurrent_state = last_recurrent_state.to(

@@ -140,7 +140,16 @@ class TritonGDNKernel(LinearAttnKernelBase):
         if is_npu() or is_cpu():
             recurrent_state = ssm_states[cache_indices]
             recurrent_state_indices_args = {}
-        return chunk_gated_delta_rule(
+
+        prefill_metadata_args = {}
+        prebuilt_meta = kwargs.get("prebuilt_meta")
+        cu_seqlens_cpu = kwargs.get("cu_seqlens_cpu")
+        if prebuilt_meta is not None:
+            prefill_metadata_args["prebuilt_meta"] = prebuilt_meta
+        if cu_seqlens_cpu is not None:
+            prefill_metadata_args["cu_seqlens_cpu"] = cu_seqlens_cpu
+
+        call_kwargs = dict(
             q=q,
             k=k,
             v=v,
@@ -152,6 +161,14 @@ class TritonGDNKernel(LinearAttnKernelBase):
             use_qk_l2norm_in_kernel=True,
             **recurrent_state_indices_args,
         )
+        try:
+            return chunk_gated_delta_rule(**call_kwargs, **prefill_metadata_args)
+        except TypeError as err:
+            if not prefill_metadata_args or not any(
+                name in str(err) for name in ("prebuilt_meta", "cu_seqlens_cpu")
+            ):
+                raise
+            return chunk_gated_delta_rule(**call_kwargs)
 
     def target_verify(
         self,
