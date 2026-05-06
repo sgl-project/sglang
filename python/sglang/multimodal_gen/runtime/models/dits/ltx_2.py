@@ -41,10 +41,6 @@ logger = init_logger(__name__)
 
 ADALN_NUM_BASE_PARAMS = 6
 ADALN_NUM_CROSS_ATTN_PARAMS = 3
-_LTX2_FUSED_NORM_SCALE_SHIFT = None
-_LTX2_FUSED_NORM_SCALE_SHIFT_IMPORT_FAILED = False
-_LTX2_FUSED_SCALE_RESIDUAL_NORM_SCALE_SHIFT = None
-_LTX2_FUSED_SCALE_RESIDUAL_NORM_SCALE_SHIFT_IMPORT_FAILED = False
 
 
 def adaln_embedding_coefficient(cross_attention_adaln: bool) -> int:
@@ -398,103 +394,13 @@ def rms_norm(x: torch.Tensor, eps: float) -> torch.Tensor:
     return F.rms_norm(x, normalized_shape=(x.shape[-1],), eps=eps)
 
 
-def _ltx2_can_use_fused_norm_scale_shift(
+def _ltx2_can_use_scale_shift_kernel(
     x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor
 ) -> bool:
-    # The CuTe kernel is profitable on LTX2.3's large video states. Keep
-    # smaller audio states on the native path; their extra launch cost was higher
-    # than the work saved in microbenchmarks.
+    # The scale-shift kernel is only profitable on LTX2.3's large video states.
+    # Smaller audio states stay on the native path because their extra launch
+    # cost is higher than the pointwise work saved.
     return (
-        x.is_cuda
-        and x.is_contiguous()
-        and x.dtype in (torch.float16, torch.bfloat16)
-        and x.ndim == 3
-        and 4096 <= x.shape[-1] <= 8192
-        and x.shape[-1] % 256 == 0
-        and scale.stride(-1) == 1
-        and shift.stride(-1) == 1
-    )
-
-
-def _ltx2_get_fused_norm_scale_shift():
-    global _LTX2_FUSED_NORM_SCALE_SHIFT
-    global _LTX2_FUSED_NORM_SCALE_SHIFT_IMPORT_FAILED
-
-    if _LTX2_FUSED_NORM_SCALE_SHIFT_IMPORT_FAILED:
-        return None
-    if _LTX2_FUSED_NORM_SCALE_SHIFT is None:
-        try:
-            from sglang.jit_kernel.diffusion.cutedsl.scale_residual_norm_scale_shift import (
-                fused_norm_scale_shift,
-            )
-
-            _LTX2_FUSED_NORM_SCALE_SHIFT = fused_norm_scale_shift
-        except ImportError:
-            _LTX2_FUSED_NORM_SCALE_SHIFT_IMPORT_FAILED = True
-            return None
-    return _LTX2_FUSED_NORM_SCALE_SHIFT
-
-
-def _ltx2_get_fused_scale_residual_norm_scale_shift():
-    global _LTX2_FUSED_SCALE_RESIDUAL_NORM_SCALE_SHIFT
-    global _LTX2_FUSED_SCALE_RESIDUAL_NORM_SCALE_SHIFT_IMPORT_FAILED
-
-    if _LTX2_FUSED_SCALE_RESIDUAL_NORM_SCALE_SHIFT_IMPORT_FAILED:
-        return None
-    if _LTX2_FUSED_SCALE_RESIDUAL_NORM_SCALE_SHIFT is None:
-        try:
-            from sglang.jit_kernel.diffusion.cutedsl.scale_residual_norm_scale_shift import (
-                fused_scale_residual_norm_scale_shift,
-            )
-
-            _LTX2_FUSED_SCALE_RESIDUAL_NORM_SCALE_SHIFT = (
-                fused_scale_residual_norm_scale_shift
-            )
-        except ImportError:
-            _LTX2_FUSED_SCALE_RESIDUAL_NORM_SCALE_SHIFT_IMPORT_FAILED = True
-            return None
-    return _LTX2_FUSED_SCALE_RESIDUAL_NORM_SCALE_SHIFT
-
-
-def _ltx2_fused_norm_scale_shift(
-    x: torch.Tensor,
-    shift: torch.Tensor,
-    scale: torch.Tensor,
-    norm_type: str,
-    eps: float,
-) -> torch.Tensor | None:
-    if not _ltx2_can_use_fused_norm_scale_shift(x, shift, scale):
-        return None
-
-    fused_norm_scale_shift = _ltx2_get_fused_norm_scale_shift()
-    if fused_norm_scale_shift is None:
-        return None
-
-    return fused_norm_scale_shift(
-        x,
-        None,
-        None,
-        scale.contiguous(),
-        shift.contiguous(),
-        norm_type,
-        eps,
-    )
-
-
-def rms_norm_scale_shift(
-    x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor, eps: float
-) -> torch.Tensor:
-    out = _ltx2_fused_norm_scale_shift(x, shift, scale, "rms", eps)
-    if out is not None:
-        return out
-
-    return rms_norm(x, eps) * (1 + scale) + shift
-
-
-def scale_shift(
-    x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor
-) -> torch.Tensor:
-    if (
         x.is_cuda
         and x.is_contiguous()
         and x.dtype in (torch.float16, torch.bfloat16)
@@ -504,9 +410,23 @@ def scale_shift(
         and shift.is_cuda
         and scale.stride(-1) == 1
         and shift.stride(-1) == 1
-    ):
+    )
+
+
+def scale_shift(
+    x: torch.Tensor,
+    shift: torch.Tensor,
+    scale: torch.Tensor,
+) -> torch.Tensor:
+    if _ltx2_can_use_scale_shift_kernel(x, shift, scale):
         return fuse_scale_shift_kernel(x, scale.contiguous(), shift.contiguous())
     return x * (1 + scale) + shift
+
+
+def rms_norm_scale_shift(
+    x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor, eps: float
+) -> torch.Tensor:
+    return scale_shift(rms_norm(x, eps), shift, scale)
 
 
 def scale_residual_rms_norm_scale_shift(
@@ -517,27 +437,6 @@ def scale_residual_rms_norm_scale_shift(
     scale: torch.Tensor,
     eps: float,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    if (
-        _ltx2_can_use_fused_norm_scale_shift(residual, shift, scale)
-        and x.is_contiguous()
-        and x.shape == residual.shape
-        and x.dtype == residual.dtype
-        and gate.stride(-1) == 1
-    ):
-        fused = _ltx2_get_fused_scale_residual_norm_scale_shift()
-        if fused is not None:
-            return fused(
-                residual,
-                x,
-                gate.contiguous(),
-                None,
-                None,
-                scale.contiguous(),
-                shift.contiguous(),
-                "rms",
-                eps,
-            )
-
     residual_out = residual + x * gate
     return rms_norm_scale_shift(residual_out, shift, scale, eps), residual_out
 
