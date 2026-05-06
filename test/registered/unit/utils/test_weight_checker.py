@@ -87,8 +87,10 @@ class _TinyModel(nn.Module):
 
     def __init__(self):
         super().__init__()
-        self.w = nn.Parameter(torch.randn(4, 4))
-        self.b = nn.Parameter(torch.zeros(4))
+        # requires_grad=False matches sglang's inference-time params, so _reset_tensors
+        # can do in-place copy_ on them (autograd would otherwise reject it).
+        self.w = nn.Parameter(torch.randn(4, 4), requires_grad=False)
+        self.b = nn.Parameter(torch.zeros(4), requires_grad=False)
         self.register_buffer("running_mean", torch.zeros(4))
         # Buffer names that match weight_checker's hard-coded skip patterns.
         self.register_buffer("rotary_emb_cos_sin_cache", torch.full((8,), 3.14))
