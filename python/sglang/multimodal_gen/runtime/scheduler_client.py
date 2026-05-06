@@ -6,6 +6,7 @@ import zmq
 import zmq.asyncio
 
 from sglang.multimodal_gen.runtime.cancellation import (
+    CLIENT_CANCELLED_REASON,
     CancelGenerationReq,
     mark_request_cancelled,
 )
@@ -183,7 +184,7 @@ class AsyncSchedulerClient:
         self,
         request_id: str,
         *,
-        reason: str = "client_cancelled",
+        reason: str = CLIENT_CANCELLED_REASON,
         timeout_ms: int = 1000,
     ) -> Any:
         """Mark a request cancelled and ask the scheduler to drop queued work."""

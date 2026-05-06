@@ -1,3 +1,10 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Utilities for compacting active batch state after cancellation.
+
+The denoising loop owns tensors, scheduler state, and per-request metadata when
+cancellation is observed, so batch slicing lives in one shared helper.
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -34,6 +41,8 @@ PROMPT_BATCH_FIELDS = (
     "negative_audio_prompt_embeds",
 )
 
+# Fields with one item per generated output. These use output indices because a
+# single request may produce multiple samples.
 OUTPUT_BATCH_FIELDS = (
     "seeds",
     "generator",
@@ -47,6 +56,9 @@ OUTPUT_BATCH_FIELDS = (
     "condition_image_latent_ids",
 )
 
+# Denoising contexts keep prompt- and output-aligned state outside the Req. Keep
+# the field lists explicit so adding a new cached tensor requires a conscious
+# compaction decision.
 CTX_PROMPT_FIELDS = (
     "image_kwargs",
     "pos_cond_kwargs",
@@ -81,12 +93,20 @@ SCHEDULER_BATCH_STATE_FIELDS = (
 
 @dataclass(slots=True)
 class DynamicBatchLayout:
+    """Mapping from the current compacted batch back to original requests.
+
+    `active_request_indices` stores indices into `original_request_ids`, not
+    local positions. This lets the scheduler split outputs in the original
+    client order after one or more compaction passes.
+    """
+
     original_request_ids: list[str]
     active_request_indices: list[int]
     num_outputs_per_request: list[int]
 
     @classmethod
     def from_req(cls, batch: Req) -> "DynamicBatchLayout | None":
+        """Read dynamic-batch metadata from a Req, if it is a merged request."""
         extra = batch.extra if isinstance(batch.extra, dict) else {}
         original_request_ids = extra.get("dynamic_batch_original_request_ids")
         if original_request_ids is None:
@@ -139,6 +159,11 @@ class DynamicBatchLayout:
         )
 
     def kept_output_indices(self, keep_prompt_indices: list[int]) -> list[int]:
+        """Map kept local request positions to output positions.
+
+        A request can have `num_outputs_per_prompt > 1`, so request indices and
+        output indices are not always the same space.
+        """
         keep_prompt_indices = set(keep_prompt_indices)
         keep_output_indices: list[int] = []
         output_start = 0
@@ -154,6 +179,8 @@ class DynamicBatchLayout:
 
 @dataclass(slots=True)
 class BatchCompactionContext:
+    """Subset of denoising state that must stay aligned with the compacted Req."""
+
     latents: torch.Tensor
     image_kwargs: dict[str, Any]
     pos_cond_kwargs: dict[str, Any]
@@ -169,6 +196,8 @@ class BatchCompactionContext:
 
 @dataclass(slots=True)
 class BatchCompactionResult:
+    """Summary returned to the denoising loop for logging and control flow."""
+
     old_request_count: int = 0
     new_request_count: int = 0
 
@@ -187,6 +216,7 @@ def _slice_tensor_first_dim(value: torch.Tensor, indices: list[int]) -> torch.Te
 
 
 def _has_nested_batch_axis(value: Any, expected_first_dim: int) -> bool:
+    """Return whether a container includes data aligned to the batch dimension."""
     if isinstance(value, torch.Tensor):
         return value.ndim > 0 and int(value.shape[0]) == expected_first_dim
     if isinstance(value, dict):
@@ -207,6 +237,11 @@ def _has_nested_batch_axis(value: Any, expected_first_dim: int) -> bool:
 
 
 def slice_batch_axis(value: Any, indices: list[int], expected_first_dim: int) -> Any:
+    """Slice values whose first dimension represents the current batch.
+
+    Tuples are usually structural metadata, such as RoPE caches or shapes, so
+    they are only sliced recursively when a child carries a batch axis.
+    """
     if value is None:
         return None
 
@@ -246,6 +281,7 @@ def _cancel_mask_across_workers(
     server_args: Any,
     device: torch.device,
 ) -> list[bool]:
+    """Return a cancellation mask that is identical on every distributed rank."""
     cancel_mask = [
         1 if is_request_cancelled(request_id, server_args) else 0
         for request_id in request_ids
@@ -276,6 +312,7 @@ def _compact_scheduler_state(
     keep_output_indices: list[int],
     old_output_count: int,
 ) -> None:
+    """Slice scheduler history that tracks one item per generated output."""
     if scheduler is None:
         return
     for name in SCHEDULER_BATCH_STATE_FIELDS:
@@ -301,6 +338,11 @@ def compact_dynamic_batch(
     ctx: Any,
     server_args: Any,
 ) -> BatchCompactionResult:
+    """Remove cancelled requests from an active dynamic batch at a step boundary.
+
+    Prompt-aligned fields are sliced by request index; output-aligned fields are
+    sliced by output index because one request can produce multiple outputs.
+    """
     layout = DynamicBatchLayout.from_req(batch)
     if layout is None:
         return BatchCompactionResult()
@@ -343,6 +385,7 @@ def compact_dynamic_batch(
         layout.active_request_indices[index] for index in keep_prompt_indices
     ]
 
+    # Prompt-side tensors/masks stay aligned to logical requests.
     batch.prompt = slice_batch_axis(
         batch.prompt,
         keep_prompt_indices,
@@ -350,9 +393,13 @@ def compact_dynamic_batch(
     )
     for name in PROMPT_BATCH_FIELDS:
         _slice_attr(batch, name, keep_prompt_indices, old_prompt_count)
+
+    # Latents, RNG state, and outputs stay aligned to generated samples.
     for name in OUTPUT_BATCH_FIELDS:
         _slice_attr(batch, name, keep_output_indices, old_output_count)
 
+    # Preserve original request indices so scheduler-side output splitting can
+    # return cancelled placeholders for removed requests.
     batch.extra["dynamic_batch_request_ids"] = [
         layout.original_request_ids[index] for index in next_active_indices
     ]
@@ -375,6 +422,7 @@ def compact_dynamic_batch(
     for name in CTX_OUTPUT_FIELDS:
         _slice_attr(ctx, name, keep_output_indices, old_output_count)
 
+    # Some stages read latents from Req after the context is compacted.
     if hasattr(ctx, "latents"):
         batch.latents = ctx.latents
     if hasattr(ctx, "audio_latents"):

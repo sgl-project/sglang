@@ -6,11 +6,11 @@ from sglang.multimodal_gen.runtime.cancellation import raise_if_cancelled
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.models.utils import pred_noise_to_pred_video
+from sglang.multimodal_gen.runtime.pipelines_core.batch_compaction import (
+    BatchCompactionContext,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.diffusion_scheduler_utils import (
     get_or_create_request_scheduler,
-)
-from sglang.multimodal_gen.runtime.pipelines_core.dynamic_batching import (
-    BatchCompactionContext,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import DenoisingStage

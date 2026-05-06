@@ -1,3 +1,10 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Helpers for cooperative cancellation across scheduler processes.
+
+Running denoising loops observe marker files because HTTP handlers, the
+scheduler, and distributed workers do not share process-local state.
+"""
+
 import json
 import os
 import tempfile
@@ -6,22 +13,22 @@ from dataclasses import dataclass
 from typing import Any
 from urllib.parse import quote
 
-DEFAULT_CANCEL_REASON = "client_cancelled"
-DEFAULT_CANCEL_MESSAGE = "Generation cancelled by client"
+CLIENT_CANCELLED_REASON = "client_cancelled"
+CLIENT_CANCELLED_MESSAGE = "Generation cancelled by client"
 
 
 @dataclass
 class CancelGenerationReq:
     request_id: str
-    reason: str = DEFAULT_CANCEL_REASON
+    reason: str = CLIENT_CANCELLED_REASON
 
 
 class RequestCancelledError(RuntimeError):
     def __init__(
         self,
         request_id: str,
-        reason: str = DEFAULT_CANCEL_REASON,
-        message: str = DEFAULT_CANCEL_MESSAGE,
+        reason: str = CLIENT_CANCELLED_REASON,
+        message: str = CLIENT_CANCELLED_MESSAGE,
     ) -> None:
         self.request_id = request_id
         self.reason = reason
@@ -48,7 +55,7 @@ def _marker_path(request_id: str, server_args: Any) -> str:
 def mark_request_cancelled(
     request_id: str,
     server_args: Any,
-    reason: str = DEFAULT_CANCEL_REASON,
+    reason: str = CLIENT_CANCELLED_REASON,
 ) -> None:
     if not request_id:
         return
@@ -80,7 +87,7 @@ def is_request_cancelled(request_id: str, server_args: Any) -> bool:
 def get_cancel_reason(
     request_id: str,
     server_args: Any,
-    default: str = DEFAULT_CANCEL_REASON,
+    default: str = CLIENT_CANCELLED_REASON,
 ) -> str:
     if not request_id:
         return default
@@ -109,7 +116,11 @@ def _aliases_for_req(req: Any) -> set[str]:
 
 
 def request_alias_groups(payload: Any) -> list[set[str]]:
-    """Return cancel-id aliases for each logical request in a payload."""
+    """Return cancel-id aliases grouped by logical request.
+
+    Dynamic batches have one synthetic execution id, while each original request
+    must remain independently cancellable.
+    """
     if isinstance(payload, list):
         groups = [group for item in payload for group in request_alias_groups(item)]
         return [group for group in groups if group]
@@ -155,6 +166,11 @@ def is_payload_cancelled(
     *,
     require_all_for_batched: bool = True,
 ) -> bool:
+    """Return whether a payload should stop because cancellation was requested.
+
+    Dynamic batches require all members by default; pass `False` when removing
+    cancelled members while keeping the rest of the batch alive.
+    """
     groups = request_alias_groups(payload)
     if not groups:
         return False

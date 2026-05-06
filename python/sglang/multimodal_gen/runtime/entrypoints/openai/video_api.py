@@ -25,8 +25,8 @@ from sglang.multimodal_gen.configs.sample.sampling_params import (
     generate_request_id,
 )
 from sglang.multimodal_gen.runtime.cancellation import (
-    DEFAULT_CANCEL_MESSAGE,
-    DEFAULT_CANCEL_REASON,
+    CLIENT_CANCELLED_MESSAGE,
+    CLIENT_CANCELLED_REASON,
     RequestCancelledError,
     mark_request_cancelled,
     raise_if_cancelled,
@@ -146,8 +146,8 @@ def _cancelled_video_fields() -> dict[str, Any]:
         "status": "cancelled",
         "completed_at": int(time.time()),
         "error": {
-            "type": DEFAULT_CANCEL_REASON,
-            "message": DEFAULT_CANCEL_MESSAGE,
+            "type": CLIENT_CANCELLED_REASON,
+            "message": CLIENT_CANCELLED_MESSAGE,
         },
     }
 
@@ -191,14 +191,14 @@ async def _cancel_video_job(video_id: str) -> dict[str, Any]:
     if status in ("completed", "failed", "deleted"):
         return job
 
-    mark_request_cancelled(video_id, get_global_server_args(), DEFAULT_CANCEL_REASON)
+    mark_request_cancelled(video_id, get_global_server_args(), CLIENT_CANCELLED_REASON)
     updated = await VIDEO_STORE.update_fields(
         video_id,
         {
             "status": "cancelling",
             "error": {
-                "type": DEFAULT_CANCEL_REASON,
-                "message": DEFAULT_CANCEL_MESSAGE,
+                "type": CLIENT_CANCELLED_REASON,
+                "message": CLIENT_CANCELLED_MESSAGE,
             },
         },
     )

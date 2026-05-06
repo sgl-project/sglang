@@ -17,7 +17,8 @@ from sglang.multimodal_gen.configs.sample.sampling_params import (
     SamplingParams,
 )
 from sglang.multimodal_gen.runtime.cancellation import (
-    DEFAULT_CANCEL_MESSAGE,
+    CLIENT_CANCELLED_MESSAGE,
+    CLIENT_CANCELLED_REASON,
     RequestCancelledError,
     raise_if_cancelled,
 )
@@ -336,8 +337,8 @@ async def process_generation_batch(
         if result.cancelled:
             raise RequestCancelledError(
                 request_id=batch.request_id,
-                reason=result.cancel_reason or "client_cancelled",
-                message=result.error or DEFAULT_CANCEL_MESSAGE,
+                reason=result.cancel_reason or CLIENT_CANCELLED_REASON,
+                message=result.error or CLIENT_CANCELLED_MESSAGE,
             )
 
         if result.output is None and result.output_file_paths is None:
