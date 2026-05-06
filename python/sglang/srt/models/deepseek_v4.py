@@ -1006,7 +1006,14 @@ class DeepseekV4DecoderLayer(nn.Module):
         hc_fn: torch.Tensor,
         hc_scale: torch.Tensor,
         hc_base: torch.Tensor,
+        norm: Optional[nn.Module] = None,
     ):
+        """If `norm` is given, the returned hidden_states are post-norm.
+        When the TileLang path + SGLANG_OPT_FUSE_HC_PRE_NORM is on, the norm
+        is fused into mhc_pre's big_fuse kernel; otherwise we fall back to a
+        separate norm() call. Caller must NOT apply `norm` again.
+        """
+
         @maybe_torch_compile
         def hc_pre_torch_impl(x, hc_fn):
             x_flat = x.flatten(1).float()
@@ -1029,6 +1036,14 @@ class DeepseekV4DecoderLayer(nn.Module):
         if envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.get():
             from sglang.srt.layers.mhc import mhc_pre
 
+            fuse_norm = (
+                norm is not None and envs.SGLANG_OPT_FUSE_HC_PRE_NORM.get()
+            )
+            mhc_kwargs = {}
+            if fuse_norm:
+                mhc_kwargs["norm_weight"] = norm.weight.data
+                mhc_kwargs["norm_eps"] = norm.variance_epsilon
+
             post, comb, y = mhc_pre(
                 residual=x,
                 fn=hc_fn,
@@ -1039,7 +1054,10 @@ class DeepseekV4DecoderLayer(nn.Module):
                 hc_sinkhorn_eps=self.hc_eps,
                 hc_post_mult_value=2.0,
                 sinkhorn_repeat=self.hc_sinkhorn_iters,
+                **mhc_kwargs,
             )
+            if not fuse_norm and norm is not None:
+                y = norm(y)
             return y, post.squeeze(-1), comb
 
         if envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.get():
@@ -1070,7 +1088,10 @@ class DeepseekV4DecoderLayer(nn.Module):
             self.hc_eps,
         )
         y = (pre.squeeze(1).unsqueeze(-1) * x_flat.view(shape)).sum(dim=1)
-        return y.to(dtype), post.squeeze(1), comb.squeeze(1)
+        y = y.to(dtype)
+        if norm is not None:
+            y = norm(y)
+        return y, post.squeeze(1), comb.squeeze(1)
 
     def hc_post(
         self,
@@ -1116,9 +1137,12 @@ class DeepseekV4DecoderLayer(nn.Module):
 
         residual = hidden_states
         hidden_states, post, comb = self.hc_pre(
-            hidden_states, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base
+            hidden_states,
+            self.hc_attn_fn,
+            self.hc_attn_scale,
+            self.hc_attn_base,
+            norm=self.input_layernorm,
         )
-        hidden_states = self.input_layernorm(hidden_states)
 
         hidden_states = self.self_attn(
             x=hidden_states,
@@ -1129,9 +1153,12 @@ class DeepseekV4DecoderLayer(nn.Module):
         hidden_states = self.hc_post(hidden_states, residual, post, comb)
         residual = hidden_states
         hidden_states, post, comb = self.hc_pre(
-            hidden_states, self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base
+            hidden_states,
+            self.hc_ffn_fn,
+            self.hc_ffn_scale,
+            self.hc_ffn_base,
+            norm=self.post_attention_layernorm,
         )
-        hidden_states = self.post_attention_layernorm(hidden_states)
 
         _use_cp = self.nsa_enable_prefill_cp and nsa_use_prefill_cp(forward_batch)
         _use_tp_moe_gather = (
