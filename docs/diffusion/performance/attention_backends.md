@@ -42,8 +42,9 @@ For SGLang-native pipelines, the CLI accepts the lowercase names of `AttentionBa
 The selection order in `runtime/layers/attention/selector.py` is:
 
 1. `global_force_attn_backend(...)` / `global_force_attn_backend_context_manager(...)`
-2. CLI `--attention-backend` (`ServerArgs.attention_backend`)
-3. Auto selection (platform capability, dtype, and installed packages)
+2. Component override from `--component-attention-backends` while that component is being constructed
+3. CLI `--attention-backend` (`ServerArgs.attention_backend`)
+4. Auto selection (platform capability, dtype, and installed packages)
 
 ## Configuration
 
@@ -121,6 +122,20 @@ sglang generate \
   --prompt "..." \
   --attention-backend torch_sdpa
 ```
+
+### Override one component
+
+Use component overrides when a specific module needs different attention semantics from the main transformer:
+
+```bash
+sglang generate \
+  --model-path <MODEL_PATH_OR_ID> \
+  --prompt "..." \
+  --attention-backend fa \
+  --component-attention-backends text_encoder=torch_sdpa
+```
+
+Component keys match pipeline module names from `model_index.json`, such as `text_encoder`, `text_encoder_2`, `transformer`, `transformer_2`, or `connectors`.
 
 ### Using Sliding Tile Attention (STA)
 
