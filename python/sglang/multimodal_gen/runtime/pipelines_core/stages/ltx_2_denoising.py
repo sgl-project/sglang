@@ -19,9 +19,6 @@ from sglang.multimodal_gen.runtime.pipelines_core.diffusion_scheduler_utils impo
     clone_scheduler_runtime,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
-from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
-    StageParallelismType,
-)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import (
     DenoisingContext,
     DenoisingStage,
@@ -127,12 +124,6 @@ class LTX2DenoisingStage(DenoisingStage):
             transformer=transformer, scheduler=scheduler, vae=vae, **kwargs
         )
         self.sampler_name = sampler_name
-
-    @property
-    def parallelism_type(self) -> StageParallelismType:
-        if self.server_args.enable_cfg_parallel:
-            return StageParallelismType.CFG_PARALLEL
-        return StageParallelismType.REPLICATED
 
     @staticmethod
     def _randn_like_with_batch_generators(
