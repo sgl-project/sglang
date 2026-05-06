@@ -122,7 +122,7 @@ class LPLBSolver:
 
         # Separate single-copy vs replicated experts.
         # Stored as int64 so they can be used directly as index tensors in
-        # _solve_torch without per-call .long() casts (Tier 1 optimization).
+        # _solve without per-call .long() casts (Tier 1 optimization).
         self.log_single = torch.nonzero(logcnt == 1).flatten().to(torch.int64)
         self.phy_single = log2phy[self.log_single, 0].to(torch.int64)
         self.log_replicated = torch.nonzero(logcnt > 1).flatten().to(torch.int64)
@@ -171,8 +171,8 @@ class LPLBSolver:
         self.c_vec[-2] = 1.0
         self.c_vec[-1] = 1000.0
 
-        # Store log2phy as int64 so torch.take in _solve_torch doesn't need a
-        # per-call .long() cast (Tier 1 optimization).
+        # Store log2phy as int64 so it can be used directly as index tensor
+        # without per-call .long() casts (Tier 1 optimization).
         self.log2phy = log2phy.to(torch.int64).contiguous()
 
         # Pre-JIT-compile the fused IPM kernel for this (NC, NV) shape so the
@@ -180,12 +180,9 @@ class LPLBSolver:
         # real request. No-op when the fused backend is unavailable.
         nc = self.A_base.shape[0]
         nv = self.A_base.shape[1] + 1  # +1 for Big-M column added in solve()
-        try:
-            from sglang.jit_kernel.lplb.torch_solver import warmup as _ipm_warmup
+        from sglang.jit_kernel.lplb.torch_solver import warmup as _ipm_warmup
 
-            _ipm_warmup(nc, nv, num_iters=5, device=device)
-        except Exception as e:  # pragma: no cover
-            logger.warning(f"LPLB IPM warmup skipped: {e}")
+        _ipm_warmup(nc, nv, num_iters=5, device=device)
 
         # Pre-compute A_base row sum (used in every prep call).
         self._A_base_row_sum = self.A_base.sum(dim=1).contiguous()  # (NC,)
@@ -194,7 +191,7 @@ class LPLBSolver:
         # into. All writes are contiguous full-tensor stores (no strided
         # ``out=`` semantics), so the reuse is safe under high concurrency.
         # Constructed lazily on the first solve() call (we don't know the
-        # device-side log2phy_prob shape until then) — see _solve_torch.
+        # device-side log2phy_prob shape until then) — see _solve.
         self._A_full = torch.empty(nc, nv, dtype=torch.float32, device=device)
         self._A_full[:, : nv - 1].copy_(self.A_base)
         self._b = torch.empty(nc, dtype=torch.float32, device=device)
@@ -250,77 +247,34 @@ class LPLBSolver:
             global_counts = self.ep_group.all_reduce(global_counts)
 
         # Step 3: Run LP solver
-        log2phy_prob = self._solve_torch(global_counts)
+        return self._solve(global_counts)
 
-        return log2phy_prob
-
-    def _solve_torch(self, global_counts: torch.Tensor) -> torch.Tensor:
+    def _solve(self, global_counts: torch.Tensor) -> torch.Tensor:
         """Three CUDA kernel launches replace ~14 torch ops.
 
         Pipeline (all writes go into pre-allocated buffers from __init__):
             prep_lp_inputs → solve_ipm → extract_log2phy_prob
-        Falls back to the all-torch reference path when the JIT CUDA backend
-        is unavailable (e.g. CPU host or missing Math-DX).
+        Raises if the JIT CUDA backend is unavailable.
         """
-        from sglang.jit_kernel.lplb import torch_solver
+        from sglang.jit_kernel.lplb import cuda_solver
 
-        torch_solver._init_fused_backend()
-        if torch_solver._FUSED_AVAILABLE:
-            try:
-                from sglang.jit_kernel.lplb import cuda_solver
-
-                cuda_solver.prep_lp_inputs(
-                    self._A_full,
-                    self._b,
-                    self._t1,
-                    global_counts,
-                    self.log_single,
-                    self.log_replicated,
-                    self.B1,
-                    self._A_base_row_sum,
-                )
-                cuda_solver.solve_ipm(
-                    self._A_full, self._b, self.c_vec, result=self._x
-                )
-                cuda_solver.extract_log2phy_prob(
-                    self._log2phy_prob,
-                    self._x,
-                    self._t1,
-                    self.phy_single,
-                    self.phy_replicated,
-                    self.log2phy,
-                )
-                return self._log2phy_prob
-            except Exception as e:  # pragma: no cover
-                logger.warning(
-                    f"LPLB JIT prep/post path failed ({e!r}); falling back to torch."
-                )
-
-        # Torch reference fallback (also used on CPU / non-Hopper GPUs).
-        from sglang.jit_kernel.lplb.torch_solver import solve_ipm
-
-        # Clamp denominator on-device to keep the all-zero case finite without
-        # forcing a host sync per solve.
-        total = global_counts.sum()
-        counts_norm = global_counts / total.clamp(min=1.0)
-
-        t1 = counts_norm[self.log_single]
-
-        b1 = counts_norm[self.log_replicated]
-        b2 = -(self.B1 @ t1).flatten()
-        b = torch.cat([b1, b2])
-
-        big_M_col = b - self._A_base_row_sum
-        A_full = torch.hstack([self.A_base, big_M_col.unsqueeze(1)])
-
-        x = solve_ipm(A_full, b, self.c_vec)
-
-        x_ratios = x[: self.num_red_phy].clamp(min=0)
-        phy_prob = torch.zeros(
-            self.num_single + self.num_red_phy + 1,
-            dtype=torch.float32,
-            device=global_counts.device,
+        cuda_solver.prep_lp_inputs(
+            self._A_full,
+            self._b,
+            self._t1,
+            global_counts,
+            self.log_single,
+            self.log_replicated,
+            self.B1,
+            self._A_base_row_sum,
         )
-        phy_prob[self.phy_replicated] = x_ratios
-        phy_prob[self.phy_single] = t1
-        return torch.take(phy_prob, self.log2phy)
+        cuda_solver.solve_ipm(self._A_full, self._b, self.c_vec, result=self._x)
+        cuda_solver.extract_log2phy_prob(
+            self._log2phy_prob,
+            self._x,
+            self._t1,
+            self.phy_single,
+            self.phy_replicated,
+            self.log2phy,
+        )
+        return self._log2phy_prob

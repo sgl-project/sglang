@@ -7,9 +7,8 @@ public API so any external import keeps working.
 """
 
 from sglang.jit_kernel.lplb.cuda_solver import (  # noqa: F401
-    _FUSED_REJECTED_SHAPES,
     solve_ipm,
     warmup,
 )
 
-__all__ = ["solve_ipm", "warmup", "_FUSED_REJECTED_SHAPES"]
+__all__ = ["solve_ipm", "warmup"]
