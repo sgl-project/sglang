@@ -483,22 +483,39 @@ def main():
             print(f"  SKIP   {model} (tp={tp}): config.json not in HF cache")
             continue
 
+        # Models with FALLBACK_ARGS launch with extra dp/ep/dp-attention flags
+        # that change per-rank N/K. The lightweight path doesn't model those —
+        # it computes attention shapes assuming TP-only sharding — so dedup'ing
+        # such a model to a no-override DeepSeek V2/V3 lookalike (e.g. V3.2 →
+        # V3-0324) silently picks the wrong attention shapes for the test's
+        # actual launch config. Force these through fallback so the populated
+        # cache matches the real test.
+        has_fallback_override = model in FALLBACK_ARGS
+
         key = get_architecture_key(config, tp)
-        if key in seen_keys:
+        if key in seen_keys and not has_fallback_override:
             print(f"  DEDUP  {model} (tp={tp}): same shapes as {seen_keys[key]}")
             continue
 
-        if is_deepseek_v2v3(config):
+        if is_deepseek_v2v3(config) and not has_fallback_override:
             shapes = compute_deepseek_v2v3_shapes(config, tp)
             seen_keys[key] = model
             to_process.append((model, tp, config, shapes))
             print(f"  FOUND  {model} (tp={tp}): {len(shapes)} DeepGEMM shape(s)")
         else:
-            # Unknown architecture: will use fallback
             seen_keys[key] = model
             to_process.append((model, tp, config, None))
-            arch = config.get("architectures", ["unknown"])
-            print(f"  FOUND  {model} (tp={tp}): unknown arch {arch}, will use fallback")
+            if has_fallback_override:
+                print(
+                    f"  FOUND  {model} (tp={tp}): forced fallback (extra args "
+                    f"{FALLBACK_ARGS[model]})"
+                )
+            else:
+                arch = config.get("architectures", ["unknown"])
+                print(
+                    f"  FOUND  {model} (tp={tp}): unknown arch {arch}, "
+                    "will use fallback"
+                )
 
     if not to_process:
         print("\nNo models to process. Done.")
