@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Any, AsyncGenerator, Dict, List, Optional, Uni
 from fastapi import Request
 from fastapi.responses import ORJSONResponse, StreamingResponse
 
+from sglang.srt.entrypoints.codec_frame import encode_frame
 from sglang.srt.entrypoints.openai.protocol import (
     CompletionRequest,
     CompletionResponse,
@@ -107,11 +108,22 @@ class OpenAIServingCompletion(OpenAIServingBase):
         # Resolve LoRA adapter from model parameter or explicit lora_path
         lora_path = self._resolve_lora_path(request.model, request.lora_path)
 
+        # For binary formats, force logprob collection so we can extract the
+        # chosen token IDs from output_token_logprobs (format: [(logprob,
+        # token_id, token_str), …]). top_logprobs_num=0 means "only the
+        # chosen token" — no top-k overhead.
+        binary = request.stream_format != "json"
+        return_logprob = binary or (request.logprobs is not None)
+        top_logprobs_num = (
+            0 if binary and request.logprobs is None
+            else (request.logprobs if request.logprobs is not None else 0)
+        )
+
         adapted_request = GenerateReqInput(
             **prompt_kwargs,
             sampling_params=sampling_params,
-            return_logprob=request.logprobs is not None,
-            top_logprobs_num=request.logprobs if request.logprobs is not None else 0,
+            return_logprob=return_logprob,
+            top_logprobs_num=top_logprobs_num,
             logprob_start_len=logprob_start_len,
             return_text_in_logprobs=True,
             stream=request.stream,
@@ -183,7 +195,22 @@ class OpenAIServingCompletion(OpenAIServingBase):
         request: CompletionRequest,
         raw_request: Request,
     ) -> Union[StreamingResponse, ErrorResponse]:
-        """Handle streaming completion request"""
+        """Handle streaming completion request.
+
+        Dispatches to the binary Codec generator when stream_format is
+        'msgpack' or 'protobuf'; otherwise uses the standard SSE path.
+        """
+        if request.stream_format != "json":
+            return StreamingResponse(
+                self._generate_binary_stream(adapted_request, request, raw_request),
+                media_type=(
+                    "application/x-protobuf"
+                    if request.stream_format == "protobuf"
+                    else "application/x-msgpack"
+                ),
+                background=self.tokenizer_manager.create_abort_task(adapted_request),
+            )
+
         generator = self._generate_completion_stream(
             adapted_request, request, raw_request
         )
@@ -204,6 +231,66 @@ class OpenAIServingCompletion(OpenAIServingBase):
             media_type="text/event-stream",
             background=self.tokenizer_manager.create_abort_task(adapted_request),
         )
+
+    async def _generate_binary_stream(
+        self,
+        adapted_request: GenerateReqInput,
+        request: CompletionRequest,
+        raw_request: Request,
+    ):
+        """
+        Yield raw Codec frames (bytes) for binary stream_format requests.
+
+        Token IDs are extracted from output_token_logprobs, which is populated
+        whenever return_logprob=True.  Each logprob entry has the form
+        (log_probability, token_id, token_string) — we take the middle element.
+
+        The text delta is never computed or transmitted.  For agent-to-agent
+        workloads the caller passes the IDs directly into the next model's
+        prompt without detokenization.
+        """
+        n_prev_tokens: dict[int, int] = {}
+        incremental = (
+            self.tokenizer_manager.server_args.incremental_streaming_output
+        )
+        try:
+            async for content in self.tokenizer_manager.generate_request(
+                adapted_request, raw_request
+            ):
+                index = content.get("index", 0)
+                meta = content["meta_info"]
+
+                n_prev = n_prev_tokens.get(index, 0)
+                total = meta.get("output_token_logprobs_length", 0)
+                raw_logprobs = meta.get("output_token_logprobs", [])
+
+                # Slice to get only the new tokens in this chunk.
+                new_logprobs = raw_logprobs if incremental else raw_logprobs[n_prev:total]
+                n_prev_tokens[index] = total
+
+                token_ids = [tok_id for _, tok_id, _ in new_logprobs]
+
+                finish_reason_obj = meta.get("finish_reason")
+                finish_reason = (
+                    finish_reason_obj["type"] if finish_reason_obj else None
+                )
+                done = finish_reason is not None
+
+                yield encode_frame(
+                    request.stream_format,
+                    token_ids,
+                    done=done,
+                    finish_reason=finish_reason,
+                )
+                if done:
+                    return
+
+        except Exception:
+            # Emit a terminal error frame so binary clients can distinguish
+            # a server error from a cleanly truncated stream.
+            yield encode_frame(
+                request.stream_format, [], done=True, finish_reason="error"
+            )
 
     async def _generate_completion_stream(
         self,

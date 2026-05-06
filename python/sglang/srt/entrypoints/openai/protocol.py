@@ -319,10 +319,29 @@ class CompletionRequest(BaseModel):
     # For custom metric labels
     custom_labels: Optional[Dict[str, str]] = None
 
+    # Codec binary transport (https://github.com/wdunn001/Codec).
+    # "json"     — default SSE path, unchanged.
+    # "msgpack"  — stream CodecFrame objects as concatenated MessagePack.
+    # "protobuf" — stream CodecFrame objects with 4-byte big-endian length prefix.
+    stream_format: Literal["json", "msgpack", "protobuf"] = "json"
+
     @model_validator(mode="before")
     @classmethod
     def _handle_deprecated_dp_rank(cls, values):
         return _migrate_deprecated_dp_rank(values)
+
+    @model_validator(mode="after")
+    def _validate_stream_format(self) -> "CompletionRequest":
+        if self.stream_format != "json":
+            if self.n > 1:
+                raise ValueError(
+                    f"stream_format='{self.stream_format}' requires n=1. "
+                    "CodecFrame carries no choice index; multiple sequences "
+                    "would be interleaved with no way for the client to demultiplex them."
+                )
+            # Binary formats are always streaming — force it on.
+            self.stream = True
+        return self
 
     @field_validator("max_tokens")
     @classmethod

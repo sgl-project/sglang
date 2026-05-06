@@ -1487,6 +1487,74 @@ async def openai_v1_completions(request: CompletionRequest, raw_request: Request
     )
 
 
+@app.post("/v1/completions/codec")
+async def openai_v1_completions_codec(raw_request: Request):
+    """Codec bidirectional binary endpoint.
+
+    Accepts a binary-encoded CodecRequest (prompt_ids + sampling params) and
+    streams CodecFrame responses in the same binary format. No text ever
+    enters the transport — token IDs flow directly from one model to the next.
+
+    Content-Type / Accept:
+      application/x-msgpack   — MessagePack framing (default)
+      application/x-protobuf  — Protobuf framing (4-byte big-endian length prefix)
+    """
+    from sglang.srt.entrypoints.codec_frame import (
+        decode_msgpack,
+        decode_protobuf_request,
+        encode_frame,
+    )
+    from fastapi.responses import StreamingResponse as _SR
+
+    content_type = raw_request.headers.get("content-type", "application/x-msgpack")
+    body = await raw_request.body()
+
+    try:
+        if "protobuf" in content_type:
+            params = decode_protobuf_request(body)
+            stream_format = params.get("stream_format", "protobuf")
+        else:
+            params = decode_msgpack(body)
+            stream_format = params.get("stream_format", "msgpack")
+    except Exception as e:
+        from fastapi.responses import ORJSONResponse as _OR
+        return _OR({"error": f"Codec: failed to decode request: {e}"}, status_code=400)
+
+    prompt_ids = params.get("prompt_ids", [])
+    if not prompt_ids:
+        from fastapi.responses import ORJSONResponse as _OR
+        return _OR({"error": "Codec: prompt_ids is required"}, status_code=400)
+
+    # Build a CompletionRequest with token-ID prompt and binary stream_format.
+    from sglang.srt.entrypoints.openai.protocol import CompletionRequest as _CR
+    request = _CR(
+        model=raw_request.app.state.openai_serving_completion.tokenizer_manager.server_args.served_model_name,
+        prompt=prompt_ids,
+        max_tokens=params.get("max_tokens", 256),
+        temperature=params.get("temperature", 1.0),
+        stop=params.get("stop"),
+        stream_format=stream_format,
+        stream=True,
+    )
+
+    return await raw_request.app.state.openai_serving_completion.handle_request(
+        request, raw_request
+    )
+
+
+@app.get("/codec/schema")
+async def codec_schema():
+    """Return the Codec .proto schema for client code generation.
+
+    Usage:
+        curl http://localhost:30000/codec/schema > codec.proto
+        protoc --python_out=. codec.proto
+    """
+    from sglang.srt.entrypoints.codec_frame import PROTO_SCHEMA
+    from fastapi.responses import PlainTextResponse
+    return PlainTextResponse(PROTO_SCHEMA, media_type="text/plain")
+
+
 @app.post("/v1/chat/completions", dependencies=[Depends(validate_json_request)])
 async def openai_v1_chat_completions(
     request: ChatCompletionRequest, raw_request: Request
