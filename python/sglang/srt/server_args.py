@@ -641,6 +641,7 @@ class ServerArgs:
     disable_cuda_graph_padding: bool = False
     enable_breakable_cuda_graph: bool = False
     enable_profile_cuda_graph: bool = False
+    enable_cuda_graph_collective_break: bool = False
     enable_cudagraph_gc: bool = False
     debug_cuda_graph: bool = False
     enable_layerwise_nvtx_marker: bool = False
@@ -2215,6 +2216,12 @@ class ServerArgs:
                     support_mamba_cache_extra_buffer=True,
                     sm100_default_attention_backend=sm100_default_attn_backend,
                 )
+                if self.nnodes > 1 and not self.disable_cuda_graph:
+                    logger.info(
+                        "Enable CUDA graph collective breaks for multi-node %s.",
+                        model_arch,
+                    )
+                    self.enable_cuda_graph_collective_break = True
 
         elif model_arch in ["Glm4MoeForCausalLM"]:
             if is_sm100_supported():
@@ -5998,6 +6005,12 @@ class ServerArgs:
             "--enable-profile-cuda-graph",
             action="store_true",
             help="Enable profiling of cuda graph capture.",
+        )
+        parser.add_argument(
+            "--enable-cuda-graph-collective-break",
+            action="store_true",
+            default=ServerArgs.enable_cuda_graph_collective_break,
+            help=argparse.SUPPRESS,
         )
         parser.add_argument(
             "--enable-cudagraph-gc",

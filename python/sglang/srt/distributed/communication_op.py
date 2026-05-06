@@ -5,6 +5,10 @@ from typing import Any, Dict, Optional, Tuple, Union
 import torch
 import torch.distributed
 
+from sglang.srt.model_executor.breakable_cuda_graph.breakable_cuda_graph import (
+    eager_on_graph,
+)
+
 from .parallel_state import (
     get_attn_tp_group,
     get_moe_ep_group,
@@ -13,9 +17,18 @@ from .parallel_state import (
 )
 
 
+def _tensor_model_parallel_all_reduce(input_: torch.Tensor) -> torch.Tensor:
+    return get_tp_group().all_reduce(input_)
+
+
+bcg_tensor_model_parallel_all_reduce = eager_on_graph(True)(
+    _tensor_model_parallel_all_reduce
+)
+
+
 def tensor_model_parallel_all_reduce(input_: torch.Tensor) -> torch.Tensor:
     """All-reduce the input tensor across model parallel group."""
-    return get_tp_group().all_reduce(input_)
+    return bcg_tensor_model_parallel_all_reduce(input_)
 
 
 def tensor_model_parallel_quant_all_reduce(input_: torch.Tensor) -> torch.Tensor:
@@ -60,9 +73,18 @@ def broadcast_tensor_dict(
     return get_tp_group().broadcast_tensor_dict(tensor_dict, src)
 
 
+def _attention_tensor_model_parallel_all_reduce(input_: torch.Tensor) -> torch.Tensor:
+    return get_attn_tp_group().all_reduce(input_)
+
+
+bcg_attention_tensor_model_parallel_all_reduce = eager_on_graph(True)(
+    _attention_tensor_model_parallel_all_reduce
+)
+
+
 def attention_tensor_model_parallel_all_reduce(input_: torch.Tensor) -> torch.Tensor:
     """All-reduce the input tensor across attention parallel group."""
-    return get_attn_tp_group().all_reduce(input_)
+    return bcg_attention_tensor_model_parallel_all_reduce(input_)
 
 
 def attention_tensor_model_parallel_quant_all_reduce(
@@ -72,11 +94,29 @@ def attention_tensor_model_parallel_quant_all_reduce(
     return get_attn_tp_group().quant_all_reduce(input_)
 
 
+def _moe_tensor_model_parallel_all_reduce(input_: torch.Tensor) -> torch.Tensor:
+    return get_moe_tp_group().all_reduce(input_)
+
+
+bcg_moe_tensor_model_parallel_all_reduce = eager_on_graph(True)(
+    _moe_tensor_model_parallel_all_reduce
+)
+
+
 def moe_tensor_model_parallel_all_reduce(input_: torch.Tensor) -> torch.Tensor:
     """All-reduce the input tensor across moe parallel group."""
-    return get_moe_tp_group().all_reduce(input_)
+    return bcg_moe_tensor_model_parallel_all_reduce(input_)
+
+
+def _moe_expert_parallel_all_reduce(input_: torch.Tensor) -> torch.Tensor:
+    return get_moe_ep_group().all_reduce(input_)
+
+
+bcg_moe_expert_parallel_all_reduce = eager_on_graph(True)(
+    _moe_expert_parallel_all_reduce
+)
 
 
 def moe_expert_parallel_all_reduce(input_: torch.Tensor) -> torch.Tensor:
     """All-reduce the input tensor across moe expert parallel group."""
-    return get_moe_ep_group().all_reduce(input_)
+    return bcg_moe_expert_parallel_all_reduce(input_)

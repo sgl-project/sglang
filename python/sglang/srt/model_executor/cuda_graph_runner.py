@@ -592,6 +592,9 @@ class CudaGraphRunner:
         self.enable_profile_cuda_graph = (
             model_runner.server_args.enable_profile_cuda_graph
         )
+        self.enable_cuda_graph_collective_break = (
+            model_runner.server_args.enable_cuda_graph_collective_break
+        )
         self.tp_size = model_runner.server_args.tp_size
         self.dp_size = model_runner.server_args.dp_size
         self.pp_size = model_runner.server_args.pp_size
@@ -920,7 +923,11 @@ class CudaGraphRunner:
             and get_bool_env_var("SGLANG_MEMORY_SAVER_CUDA_GRAPH")
         )
 
-        if envs.SGLANG_USE_BREAKABLE_CUDA_GRAPH.get():
+        use_breakable_cuda_graph = (
+            envs.SGLANG_USE_BREAKABLE_CUDA_GRAPH.get()
+            or self.enable_cuda_graph_collective_break
+        )
+        if use_breakable_cuda_graph:
             if memory_saver_adapter.enabled:
                 raise NotImplementedError(
                     "Breakable CUDA graph is not compatible with memory saver mode"
@@ -943,7 +950,10 @@ class CudaGraphRunner:
         return out
 
     def _create_device_graph(self):
-        if envs.SGLANG_USE_BREAKABLE_CUDA_GRAPH.get():
+        if (
+            envs.SGLANG_USE_BREAKABLE_CUDA_GRAPH.get()
+            or self.enable_cuda_graph_collective_break
+        ):
             if _is_hip:
                 raise RuntimeError("Breakable CUDA graph is not supported on ROCm/HIP")
             return BreakableCUDAGraph()
