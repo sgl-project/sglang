@@ -693,6 +693,7 @@ class ServerArgs:
     keep_mm_feature_on_device: bool = False
     enable_return_hidden_states: bool = False
     enable_return_routed_experts: bool = False
+    enable_return_indexer_topk: bool = False
     scheduler_recv_interval: int = 1
     numa_node: Optional[List[int]] = None
     enable_deterministic_inference: bool = False
@@ -1707,7 +1708,7 @@ class ServerArgs:
                     self.attention_backend = "nsa"
                     logger.info("Use nsa attention backend for DeepSeek with DSA.")
 
-                if not is_npu():  # CUDA or ROCm GPU
+                if not is_npu() and not is_xpu():  # CUDA or ROCm GPU
                     if self.enable_nsa_prefill_context_parallel:
                         logger.warning(
                             "Context parallel feature is still under experiment. It has only been verified on Hopper platform."
@@ -6265,6 +6266,11 @@ class ServerArgs:
             "--enable-return-routed-experts",
             action="store_true",
             help="Enable returning routed experts of each layer with responses.",
+        )
+        parser.add_argument(
+            "--enable-return-indexer-topk",
+            action="store_true",
+            help="Enable returning indexer topk indices of layers with indexer with responses.",
         )
         parser.add_argument(
             "--scheduler-recv-interval",
