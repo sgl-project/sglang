@@ -691,6 +691,13 @@ def _get_norm_eps(norm: nn.Module) -> Optional[float]:
     return getattr(norm, "variance_epsilon", getattr(norm, "eps", None))
 
 
+def _get_tensor_model_parallel_world_size_or_one() -> int:
+    try:
+        return get_tensor_model_parallel_world_size()
+    except AssertionError:
+        return 1
+
+
 def apply_qk_norm_across_heads(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -713,6 +720,11 @@ def apply_qk_norm_across_heads(
     if (
         _is_cuda
         and allow_inplace
+        and _get_tensor_model_parallel_world_size_or_one() == 1
+        and not hasattr(q_norm, "full_hidden_size")
+        and not hasattr(k_norm, "full_hidden_size")
+        and not isinstance(q_norm, nn.RMSNorm)
+        and not isinstance(k_norm, nn.RMSNorm)
         and q.shape == k.shape
         and hidden_size is not None
         and q.shape[-1] == hidden_size
