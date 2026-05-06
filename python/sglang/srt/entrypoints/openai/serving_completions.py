@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Any, AsyncGenerator, Dict, List, Optional, Uni
 from fastapi import Request
 from fastapi.responses import ORJSONResponse, StreamingResponse
 
+from sglang.srt.entrypoints.codec_compression import wrap_streaming_response
 from sglang.srt.entrypoints.codec_frame import encode_frame
 from sglang.srt.entrypoints.openai.protocol import (
     CompletionRequest,
@@ -202,13 +203,15 @@ class OpenAIServingCompletion(OpenAIServingBase):
         'msgpack' or 'protobuf'; otherwise uses the standard SSE path.
         """
         if request.stream_format != "json":
-            return StreamingResponse(
+            media_type = (
+                "application/x-protobuf"
+                if request.stream_format == "protobuf"
+                else "application/x-msgpack"
+            )
+            return wrap_streaming_response(
+                raw_request.headers.get("accept-encoding", ""),
                 self._generate_binary_stream(adapted_request, request, raw_request),
-                media_type=(
-                    "application/x-protobuf"
-                    if request.stream_format == "protobuf"
-                    else "application/x-msgpack"
-                ),
+                media_type=media_type,
                 background=self.tokenizer_manager.create_abort_task(adapted_request),
             )
 
