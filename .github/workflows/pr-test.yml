@@ -67,7 +67,7 @@ env:
   SGLANG_IS_IN_CI: true
   SGLANG_CUDA_COREDUMP: "1"
   SGLANG_JIT_DEEPGEMM_FAST_WARMUP: true
-  SKIP_STAGE_HEALTH_CHECK: 'true'
+  SKIP_STAGE_HEALTH_CHECK: ${{ inputs.skip_stage_health_check == true && 'true' || 'false' }}
   # TEMP: rebuild deepep against the new torch for torch-211-merge PR only — revert before merging to main.
   FORCE_REBUILD_DEEPEP: '1'
   # Schedule / main-branch dispatch / workflow_call from main use refs/heads/main; PR events use refs/pull/*/merge
@@ -1033,7 +1033,7 @@ jobs:
     secrets: inherit
 
   stage-c-test-4-gpu-h100:
-    needs: [check-changes, call-gate, wait-for-stage-a, sgl-kernel-build-wheels]
+    needs: [check-changes, call-gate, wait-for-stage-b, sgl-kernel-build-wheels]
     if: |
       always() &&
       (
@@ -1091,7 +1091,7 @@ jobs:
         run: bash scripts/ci/cuda/ci_cleanup_venv.sh
 
   stage-c-test-8-gpu-h200:
-    needs: [check-changes, call-gate, wait-for-stage-a, sgl-kernel-build-wheels]
+    needs: [check-changes, call-gate, wait-for-stage-b, sgl-kernel-build-wheels]
     if: |
       always() &&
       (
@@ -1168,7 +1168,7 @@ jobs:
         run: bash scripts/ci/cuda/ci_cleanup_venv.sh
 
   stage-c-test-8-gpu-h20:
-    needs: [check-changes, call-gate, wait-for-stage-a, sgl-kernel-build-wheels]
+    needs: [check-changes, call-gate, wait-for-stage-b, sgl-kernel-build-wheels]
     if: |
       always() &&
       (
@@ -1223,7 +1223,7 @@ jobs:
         run: bash scripts/ci/cuda/ci_cleanup_venv.sh
 
   stage-c-test-deepep-4-gpu-h100:
-    needs: [check-changes, call-gate, wait-for-stage-a, sgl-kernel-build-wheels]
+    needs: [check-changes, call-gate, wait-for-stage-b, sgl-kernel-build-wheels]
     if: |
       always() &&
       (
@@ -1292,7 +1292,7 @@ jobs:
         run: bash scripts/ci/cuda/ci_cleanup_venv.sh
 
   stage-c-test-deepep-8-gpu-h200:
-    needs: [check-changes, call-gate, wait-for-stage-a, sgl-kernel-build-wheels]
+    needs: [check-changes, call-gate, wait-for-stage-b, sgl-kernel-build-wheels]
     if: |
       always() &&
       (
@@ -1362,7 +1362,7 @@ jobs:
         run: bash scripts/ci/cuda/ci_cleanup_venv.sh
 
   stage-c-test-4-gpu-b200:
-    needs: [check-changes, call-gate, wait-for-stage-a, sgl-kernel-build-wheels]
+    needs: [check-changes, call-gate, wait-for-stage-b, sgl-kernel-build-wheels]
     if: |
       always() &&
       (
