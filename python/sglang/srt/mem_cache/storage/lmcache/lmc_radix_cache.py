@@ -417,10 +417,14 @@ class LMCRadixCache(RadixCache):
         )
         with torch.cuda.stream(self.store_stream):
             self.lmcache_connector.store_kv(store_md)
-        with self._node_lock:
-            self._in_flight_nodes.append(new_last_node)
         if self._mp_mode:
+            # MP store_kv blocks until the daemon's signal event fires, so the slots are safe to evict immediately.
+            self.dec_lock_ref(new_last_node)
             self.lmcache_connector.end_session(req.rid)
+        else:
+            # Layerwise store is async on store_stream; defer the unlock to evict()'s store_stream.synchronize().
+            with self._node_lock:
+                self._in_flight_nodes.append(new_last_node)
 
     def evict(self, params: EvictParams) -> EvictResult:
         """Before base eviction, wait for any outstanding stores and release locks."""
