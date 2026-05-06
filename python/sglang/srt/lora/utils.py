@@ -134,6 +134,29 @@ def get_hidden_dim(
                 config.hidden_size,
                 q_lora_rank + kv_lora_rank + qk_rope_head_dim,
             )
+        elif module_name == "q_b_proj":
+            q_lora_rank = getattr(config, "q_lora_rank", None)
+            qk_nope_head_dim = getattr(config, "qk_nope_head_dim", None)
+            qk_rope_head_dim = getattr(config, "qk_rope_head_dim", None)
+            if q_lora_rank is None or qk_nope_head_dim is None or qk_rope_head_dim is None:
+                raise NotImplementedError(
+                    "q_b_proj requires q_lora_rank, qk_nope_head_dim, "
+                    "and qk_rope_head_dim in the model config"
+                )
+            qk_head_dim = qk_nope_head_dim + qk_rope_head_dim
+            return q_lora_rank, config.num_attention_heads * qk_head_dim
+        elif module_name == "kv_b_proj":
+            kv_lora_rank = getattr(config, "kv_lora_rank", None)
+            qk_nope_head_dim = getattr(config, "qk_nope_head_dim", None)
+            v_head_dim = getattr(config, "v_head_dim", None)
+            if kv_lora_rank is None or qk_nope_head_dim is None or v_head_dim is None:
+                raise NotImplementedError(
+                    "kv_b_proj requires kv_lora_rank, qk_nope_head_dim, "
+                    "and v_head_dim in the model config"
+                )
+            return kv_lora_rank, config.num_attention_heads * (
+                qk_nope_head_dim + v_head_dim
+            )
         elif module_name == "gate_up_proj_moe":
             moe_inter = (
                 getattr(config, "moe_intermediate_size", None)
@@ -197,6 +220,9 @@ def get_normalized_target_modules(
         "unembed_tokens": "lm_head",
         "q_a_proj": "fused_qkv_a_proj_with_mqa",
         "kv_a_proj_with_mqa": "fused_qkv_a_proj_with_mqa",
+        "fused_qkv_a_proj_with_mqa": "fused_qkv_a_proj_with_mqa",
+        "q_b_proj": "q_b_proj",
+        "kv_b_proj": "kv_b_proj",
     }
 
     result = set()
@@ -274,6 +300,8 @@ _KNOWN_LORA_TARGET_MODULES = frozenset(
         "embed_tokens",
         "lm_head",
         "fused_qkv_a_proj_with_mqa",
+        "q_b_proj",
+        "kv_b_proj",
     }
 )
 

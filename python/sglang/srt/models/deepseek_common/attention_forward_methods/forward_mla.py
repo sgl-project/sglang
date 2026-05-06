@@ -320,6 +320,7 @@ class DeepseekMLAForwardMixin:
             q_nope_out = torch.bmm(q_nope.transpose(0, 1), self.w_kc)
 
         q_nope_out = q_nope_out.transpose(0, 1)
+        q_nope_out = self._apply_kv_b_lora_q_correction(q_nope, q_nope_out)
 
         skip_rope_for_nsa_tilelang_fused = self._skip_rope_for_nsa_tilelang_fused()
         if (
@@ -589,6 +590,9 @@ class DeepseekMLAForwardMixin:
                         -1, self.num_local_heads, self.v_head_dim
                     ).transpose(0, 1),
                 )
+        attn_bmm_output = self._apply_kv_b_lora_v_correction(
+            attn_output, attn_bmm_output
+        )
         output, _ = self.o_proj(attn_bmm_output)
 
         if self.next_skip_topk is None:

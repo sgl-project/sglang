@@ -76,16 +76,17 @@ def _get_moe_tp_context() -> Tuple[int, int]:
 
 def _moe_runner_keeps_global_expert_ids() -> bool:
     """True if the active MoE runner keeps global `topk_ids` instead of
-    remapping to local IDs. Mirrors the predicate in `StandardDispatcher`."""
+    remapping to local IDs. Mirrors the predicate in `StandardDispatcher`.
+
+    ``flashinfer_cutlass`` is excluded: ``FusedMoEWithLoRA._run_moe_core_nvfp4``
+    remaps to local IDs internally and indexes LoRA buffers by local id, so
+    LOCAL-keyed buffers are required (and avoid an ``ep_size``× over-alloc).
+    """
     try:
         from sglang.srt.layers.moe.utils import get_moe_runner_backend
 
         b = get_moe_runner_backend()
-        return (
-            b.is_flashinfer_cutlass()
-            or b.is_flashinfer_cutedsl()
-            or b.is_flashinfer_trtllm_routed()
-        )
+        return b.is_flashinfer_cutedsl() or b.is_flashinfer_trtllm_routed()
     except Exception:  # pragma: no cover - backend not initialized
         return False
 
