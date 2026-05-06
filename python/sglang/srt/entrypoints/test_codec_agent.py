@@ -9,14 +9,14 @@ with what the client-side watchers produce.
 Run:
     pytest -xvs python/sglang/srt/entrypoints/test_codec_agent.py
 """
+
 from __future__ import annotations
 
 from sglang.srt.entrypoints.codec_agent import (
     ToolWatcher,
-    parse_tool_call,
     make_call_id,
+    parse_tool_call,
 )
-
 
 # Synthetic markers — small ints chosen for readable assertions.
 START = 90

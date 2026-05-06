@@ -121,7 +121,9 @@ def _encode_tool_call_msg(call: dict) -> bytes:
         parts.append(b"\x0a" + _varint(len(b)) + b)  # field 1: string name
     args = call.get("arguments_json", "")
     bargs = args.encode()
-    parts.append(b"\x12" + _varint(len(bargs)) + bargs)  # field 2: string arguments_json
+    parts.append(
+        b"\x12" + _varint(len(bargs)) + bargs
+    )  # field 2: string arguments_json
     cid = call.get("id")
     if cid:
         b = cid.encode()

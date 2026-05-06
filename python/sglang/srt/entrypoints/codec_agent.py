@@ -28,12 +28,12 @@ field on CompletionRequest / ChatCompletionRequest.
 No new external dependencies — only stdlib + the codec_frame module
 in this same package.
 """
+
 from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
 from typing import Any, List, Optional, Tuple
-
 
 # ---------------------------------------------------------------------------
 # Tool-call data model (mirrors openai-style { id, name, arguments } shape)
@@ -109,9 +109,7 @@ class ToolWatcher:
         self._st.inside = False
         self._st.region_ids = []
 
-    def feed(
-        self, ids: List[int]
-    ) -> Tuple[List[int], List[List[int]]]:
+    def feed(self, ids: List[int]) -> Tuple[List[int], List[List[int]]]:
         """Process a batch of newly-emitted token IDs.
 
         Returns:

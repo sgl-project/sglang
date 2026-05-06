@@ -8,14 +8,14 @@ from typing import TYPE_CHECKING, Any, AsyncGenerator, Dict, List, Optional, Uni
 from fastapi import Request
 from fastapi.responses import ORJSONResponse, StreamingResponse
 
-from sglang.srt.entrypoints.codec_compression import wrap_streaming_response
-from sglang.srt.entrypoints.codec_frame import encode_frame
 from sglang.srt.entrypoints.codec_agent import (
     ToolWatcher,
     detokenize_region,
     make_call_id,
     parse_tool_call,
 )
+from sglang.srt.entrypoints.codec_compression import wrap_streaming_response
+from sglang.srt.entrypoints.codec_frame import encode_frame
 from sglang.srt.entrypoints.openai.protocol import (
     CompletionRequest,
     CompletionResponse,
