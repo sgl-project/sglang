@@ -1382,20 +1382,6 @@ class ContinueGenerationReqInput(BaseReq):
 
 
 @dataclass
-class TokenizerWorkerRegisterReq:
-    """Sent by each TokenizerWorker on startup to register its IPC name with the router."""
-
-    worker_ipc_name: str
-
-
-@dataclass
-class PauseContinueBroadcast:
-    """Broadcast from router to all workers to set is_pause state."""
-
-    is_pause: bool
-
-
-@dataclass
 class UpdateWeightFromDiskReqInput(BaseReq):
     # The model path with the new weights
     model_path: str

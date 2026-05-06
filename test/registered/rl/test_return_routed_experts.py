@@ -13,21 +13,20 @@ from sglang.srt.state_capturer.routed_experts import (
     extract_routed_experts_from_meta_info,
 )
 from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import (
-    DEFAULT_ENABLE_ROUTED_EXPERTS_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=185, suite="stage-b-test-2-gpu-large")
-register_amd_ci(
-    est_time=200,
-    suite="stage-b-test-2-gpu-large-amd",
-    disabled="TP=2 DP=2 routed expert mismatch >15% on AMD; needs TP/DP tuning + concurrency reduction",
-)
+register_cuda_ci(est_time=400, suite="stage-c-test-4-gpu-h100")
+
+# FP8 variant of Qwen3-30B-A3B: required because DeepEP normal/LL fast paths in
+# ep_moe/layer.py only run for {Fp8Config (via deep_gemm), W4AFp8Config, aiter,
+# NPU, modelopt_fp4+cutedsl}. Bf16 hits an `assert False, "deprecated"` today.
+MODEL_PATH = "Qwen/Qwen3-30B-A3B-FP8"
 
 SHAREGPT_REPO_ID = "anon8231489123/ShareGPT_Vicuna_unfiltered"
 SHAREGPT_FILENAME = "ShareGPT_V3_unfiltered_cleaned_split.json"
@@ -35,34 +34,43 @@ logger = logging.getLogger(__name__)
 
 
 class TestReturnRoutedExperts(CustomTestCase):
-    # modified from test_hicache.py
+    """End-to-end check that --enable-return-routed-experts stays correct
+    under DeepEP a2a + attn_tp_size > 1, across overlap/cuda-graph/radix
+    optimisations.
+
+    Both servers run ``--tp 4 --dp 2 --enable-dp-attention --moe-a2a-backend
+    deepep`` so attn_tp_size=2 and the all-gather hot path in
+    RoutedExpertsCapturer.capture is hit on every step. Baseline disables
+    overlap/cuda-graph/radix to give a deterministic ground truth; reference
+    leaves them on. If the gather were skipping a rank or racing against the
+    forward stream, the captured topk_ids would diverge between the two.
+    """
+
     @classmethod
     def setUpClass(cls):
-
-        cls.baseline_args = [
+        common = [
             "--enable-return-routed-experts",
             "--enable-deterministic-inference",
+            "--tp",
+            4,
+            "--dp",
+            2,
+            "--enable-dp-attention",
+            "--moe-a2a-backend",
+            "deepep",
+            # Force normal-mode dispatch: deepep auto routes decode through
+            # low_latency mode whose buffer (num_max_dispatch_tokens_per_rank)
+            # is undersized for cuda graph capture at default --cuda-graph-max-bs.
+            "--deepep-mode",
+            "normal",
+        ]
+        cls.baseline_args = common + [
             "--disable-overlap-schedule",
             "--disable-cuda-graph",
             "--disable-radix-cache",
-            "--tp",
-            2,
-            "--dp",
-            2,
-            "--enable-dp-attention",
         ]
-        cls.reference_args = [
-            "--enable-return-routed-experts",
-            "--enable-deterministic-inference",
-            "--tp",
-            2,
-            "--dp",
-            2,
-            "--enable-dp-attention",
-        ]
-        cls.sampling_args = {
-            "temperature": 0,
-        }
+        cls.reference_args = common
+        cls.sampling_args = {"temperature": 0}
         # prepare ShareGPT dataset
         dataset_path = download_and_cache_hf_file(SHAREGPT_REPO_ID, SHAREGPT_FILENAME)
         with open(dataset_path) as f:
@@ -147,7 +155,7 @@ class TestReturnRoutedExperts(CustomTestCase):
         other_args,
     ):
         process = popen_launch_server(
-            DEFAULT_ENABLE_ROUTED_EXPERTS_MODEL_NAME_FOR_TEST,
+            MODEL_PATH,
             DEFAULT_URL_FOR_TEST,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=other_args,
