@@ -250,7 +250,6 @@ class XPUFusedRopeWrapper:
 
     def run_rope_store(self, q, k, v, k_cache, v_cache, cos_sin_cache, positions, out_loc):
         """Apply RoPE inplace to *q*/*k* and store the rotated *k* and *v* to cache."""
-        import ctypes
 
         # Validate all tensors are on the same XPU device.
         self._check_xpu_device(q, k, v, k_cache, v_cache, cos_sin_cache, positions, out_loc)
