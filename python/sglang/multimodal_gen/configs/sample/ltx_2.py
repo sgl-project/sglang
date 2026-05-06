@@ -9,9 +9,7 @@ from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 class LTX2SamplingParams(SamplingParams):
     """Sampling parameters for LTX-2."""
 
-    # Match the reference defaults used by ltx-pipelines (one-stage).
-    # See: LTX-2/packages/ltx-pipelines/src/ltx_pipelines/utils/constants.py
-    seed: int = 10
+    seed: int = 42
     generator_device: str = "cpu"
 
     # Video parameters

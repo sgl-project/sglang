@@ -259,11 +259,16 @@ jobs:
               --generator-device cuda
           elif [ "$SOURCE_GROUP" = "ltx" ] || [ "$SOURCE_GROUP" = "ltx23" ]; then
             cd python
+            extra_ltx_args=()
+            if [ "$CASE_ID" = "ltx_2_3_hq_pipeline" ]; then
+              extra_ltx_args+=(--num-frames 24)
+            fi
             set +e
             PYTHONPATH=/tmp/mmgen-official-code/LTX-2/packages/ltx-core/src:/tmp/mmgen-official-code/LTX-2/packages/ltx-pipelines/src:$PWD:$PYTHONPATH \
               python ../ci-data/diffusion-ci/repro_scripts/gen_official_ltx23.py \
                 --out-dir ./${{ env.OUTPUT_NAME }} \
-                --case-ids "$CASE_ID"
+                --case-ids "$CASE_ID" \
+                "${extra_ltx_args[@]}"
             status=$?
             set -e
             if [ "$status" -ne 0 ]; then
