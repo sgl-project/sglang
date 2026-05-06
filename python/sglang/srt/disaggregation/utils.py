@@ -564,7 +564,7 @@ def setup_state_kv_args(
     # heterogeneous list (SWA + compress + indexer), so the per-layer K/V
     # transfer path used for "swa"/"nsa" does not apply.
     if isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool):
-        kv_args.state_type = "v4"
+        kv_args.state_type = "dsv4"
     elif isinstance(token_to_kv_pool, BaseSWAKVPool):
         kv_args.state_type = "swa"
     elif isinstance(token_to_kv_pool, HybridLinearKVPool):

@@ -938,7 +938,7 @@ class NixlKVManager(CommonKVManager):
                 dst_gpu_id=dst_gpu_id,
                 notif=notif,
             )
-        elif state_type == "v4":
+        elif state_type == "dsv4":
             return self._send_state_pages_flat(
                 peer_name,
                 prefill_state_indices,
