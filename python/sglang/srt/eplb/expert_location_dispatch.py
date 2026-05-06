@@ -93,19 +93,14 @@ def topk_ids_logical_to_physical(
         return _topk_ids_logical_to_physical_static(topk_ids, info)
     if info.ep_dispatch_algorithm in ["dynamic", "fake"]:
         return _topk_ids_logical_to_physical_dynamic(topk_ids, info)
-    if info.ep_dispatch_algorithm == "lp" and log2phy_prob is not None:
-        return _topk_ids_logical_to_physical_probability(topk_ids, info, log2phy_prob)
     if info.ep_dispatch_algorithm == "lp":
-        # LP requested but no probability tensor was supplied (per-layer solver
-        # missing). Silently falls back to dynamic by default; --lplb-require-lp
-        # makes this a hard failure so benchmarks can't measure the wrong path.
-        if get_global_server_args().lplb_require_lp:
+        if log2phy_prob is None:
             raise RuntimeError(
-                "--lplb-require-lp is set but log2phy_prob is None at dispatch "
+                "ep_dispatch_algorithm='lp' but log2phy_prob is None at dispatch "
                 f"time (info.lplb_solver={info.lplb_solver!r}, "
                 f"topk_ids.shape={tuple(topk_ids.shape)})."
             )
-        return _topk_ids_logical_to_physical_dynamic(topk_ids, info)
+        return _topk_ids_logical_to_physical_probability(topk_ids, info, log2phy_prob)
     raise NotImplementedError(f"Unknown algorithm {info.ep_dispatch_algorithm}")
 
 

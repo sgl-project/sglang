@@ -13,7 +13,7 @@ Numba path (numba dispatcher chain + ``as_cuda_array`` per tensor).
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Tuple
+from typing import TYPE_CHECKING
 
 import torch
 
@@ -33,9 +33,6 @@ DEFAULT_BLOCK_DIM = 256
 # Per-element kernels (post-LP dispatch) saturate easily — also 256.
 DISPATCH_BLOCK_DIM = 256
 DEFAULT_NUM_ITERS = 5
-
-# Shapes that failed to compile or launch — never tried again.
-_FUSED_REJECTED_SHAPES: set[Tuple[int, int]] = set()
 
 
 def _sm_ver() -> int:
@@ -67,26 +64,16 @@ def warmup(
     device: str = "cuda",
 ) -> None:
     """JIT-compile the kernel for ``(nc, nv)`` so the first real solve isn't
-    paying the compile cost. Safe to call when the kernel can't compile —
-    becomes a no-op and adds the shape to ``_FUSED_REJECTED_SHAPES``.
+    paying the compile cost. Raises on compile or launch failure.
     """
-    if (nc, nv) in _FUSED_REJECTED_SHAPES:
-        return
-    try:
-        module = _ipm_module(nc, nv, DEFAULT_BLOCK_DIM, num_iters, _sm_ver())
-        # Trigger any first-call lazy initialization.
-        A = torch.zeros(nc, nv, dtype=torch.float32, device=device)
-        b = torch.zeros(nc, dtype=torch.float32, device=device)
-        c = torch.zeros(nv, dtype=torch.float32, device=device)
-        result = torch.empty(nv, dtype=torch.float32, device=device)
-        module.ipm_solve(A, b, c, result)
-        logger.info(f"LPLB CUDA IPM solver: warmed up for (NC={nc}, NV={nv})")
-    except Exception as e:  # pragma: no cover
-        _FUSED_REJECTED_SHAPES.add((nc, nv))
-        logger.warning(
-            f"LPLB CUDA IPM solver: warmup failed for (NC={nc}, NV={nv}): {e}. "
-            "Falling back to torch IPM for this shape."
-        )
+    module = _ipm_module(nc, nv, DEFAULT_BLOCK_DIM, num_iters, _sm_ver())
+    # Trigger any first-call lazy initialization.
+    A = torch.zeros(nc, nv, dtype=torch.float32, device=device)
+    b = torch.zeros(nc, dtype=torch.float32, device=device)
+    c = torch.zeros(nv, dtype=torch.float32, device=device)
+    result = torch.empty(nv, dtype=torch.float32, device=device)
+    module.ipm_solve(A, b, c, result)
+    logger.info(f"LPLB CUDA IPM solver: warmed up for (NC={nc}, NV={nv})")
 
 
 def solve_ipm(
@@ -96,10 +83,10 @@ def solve_ipm(
     num_iters: int = DEFAULT_NUM_ITERS,
     result: "torch.Tensor | None" = None,
 ) -> torch.Tensor:
-    """Drop-in replacement for ``torch_solver._solve_ipm_torch``.
+    """Run the fused single-SM IPM kernel.
 
-    Runs the fused single-SM IPM kernel (cuBLASDx GEMM + hand-written
-    Cholesky) with the dispatch path described in the module docstring.
+    cuBLASDx GEMMs + hand-written block Cholesky, dispatched per the
+    module docstring.
 
     Args:
         A: Constraint matrix, shape ``(NC, NV)``, float32, on CUDA.

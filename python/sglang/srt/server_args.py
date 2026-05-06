@@ -642,8 +642,6 @@ class ServerArgs:
     )
     ep_num_redundant_experts: int = 0
     ep_dispatch_algorithm: Optional[Literal["static", "dynamic", "fake", "lp"]] = None
-    lplb_require_lp: bool = False
-    lplb_require_fused: bool = False
     init_expert_location: str = "trivial"
     enable_eplb: bool = False
     eplb_algorithm: str = "auto"
@@ -5985,20 +5983,6 @@ class ServerArgs:
             type=str,
             default=ServerArgs.ep_dispatch_algorithm,
             help="The algorithm to choose ranks for redundant experts in expert parallel.",
-        )
-        parser.add_argument(
-            "--lplb-require-lp",
-            action="store_true",
-            help="When --ep-dispatch-algorithm=lp is set, raise instead of silently "
-            "falling back to dynamic dispatch. Used by benchmarks/tests to prove "
-            "LP actually ran.",
-        )
-        parser.add_argument(
-            "--lplb-require-fused",
-            action="store_true",
-            help="When --ep-dispatch-algorithm=lp is set, raise instead of silently "
-            "falling back to the torch IPM reference when the fused cuBLASDx kernel "
-            "is unavailable or rejected.",
         )
         parser.add_argument(
             "--init-expert-location",

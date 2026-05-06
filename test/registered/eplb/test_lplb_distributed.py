@@ -100,8 +100,6 @@ def _worker_main(local_rank: int, world_size: int):
     set_global_server_args_for_scheduler(
         ServerArgs(
             model_path="dummy",
-            lplb_require_lp=True,
-            lplb_require_fused=True,
         )
     )
 
@@ -175,10 +173,10 @@ def _build_solver():
 
 def _expected_output(solver, expected_global_counts: torch.Tensor) -> torch.Tensor:
     """Oracle: what `solver.solve(*)` should produce given known global
-    counts. Uses the solver's own `_solve_torch` so we match implementation
+    counts. Uses the solver's own `_solve` so we match implementation
     quirks (regularization, on-device clamp normalization, etc.).
     """
-    return solver._solve_torch(expected_global_counts.float().cuda())
+    return solver._solve(expected_global_counts.float().cuda())
 
 
 def _check_solver_with_empty_rank(rank: int, world_size: int, device: torch.device):
@@ -313,7 +311,7 @@ def _check_post_rebalance_reinit(rank: int, world_size: int, device: torch.devic
     )
 
     # Positive oracle: each output should match its OWN solver's
-    # `_solve_torch` of the SUMMED global counts (rank 0's bincount; rank 1
+    # `_solve` of the SUMMED global counts (rank 0's bincount; rank 1
     # contributes zero). Both ranks compare against the same global oracle
     # since solve() all-reduces the counts.
     expected_counts = torch.bincount(rank0_topk.flatten().long(), minlength=NUM_LOGICAL)
