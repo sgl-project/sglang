@@ -23,6 +23,7 @@ from transformers import AutoProcessor
 from sglang.srt.configs.device_config import DeviceConfig
 from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.configs.model_config import ModelConfig
+from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.disaggregation.encode_receiver import EmbeddingData
 from sglang.srt.distributed.parallel_state import (
     get_default_distributed_backend,
@@ -57,6 +58,14 @@ from sglang.srt.utils.network import (
 )
 
 logger = logging.getLogger(__name__)
+
+HEALTH_CHECK_TIMEOUT = 10
+
+# Minimal 32x32 black PNG for health check dummy encode
+MINIMUM_PNG_PICTURE_BASE64 = "iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAACXBIWXMAAA7EAAAOxAGVKw4bAAAAbUlEQVRYhe3VsQ2AMAxE0Y/lIgNQULD/OqyCMgCihCKSG4yRuKuiNH6JLsoEbMACOGBcua9HOR7Y6w6swBwMy0qLTpkeI77qdEBpBFAHBBDAGH8WrwJKI4AAegUCfAKgEgpQDvh3CR3oQCuav58qlAw73kKCSgAAAABJRU5ErkJggg=="
+
+# Minimal WAV: 16kHz mono 16-bit PCM, 160 samples (0.01s) of silence
+MINIMUM_WAV_SILENCE_BASE64 = "UklGRmQBAABXQVZFZm10IBAAAAABAAEAgD4AAAB9AAACABAAZGF0YUABAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=="
 
 rid_lock = asyncio.Lock()
 rid_to_receive_endpoint: Dict[str, List[str]] = dict()
@@ -1572,11 +1581,71 @@ async def handle_scheduler_receive_url_request(request: dict):
 async def health_generate():
     """
     Health check endpoint for the encoder server.
-    Returns 200 if the encoder is initialized and ready.
+    Performs a dummy encode to verify the encoder is functional.
+    Returns 200 if the encoder is healthy, 503 otherwise.
     """
     if encoder is None:
         return Response(status_code=503)
-    return Response(status_code=200)
+
+    # Skip the dummy encode when real requests are already in flight — the
+    # ongoing traffic already proves liveness, matching the scheduler's
+    # `is_fully_idle`-based health-check skip pattern.
+    if encoder.embedding_to_send:
+        return Response(status_code=200)
+
+    # Pick the first available modality for the dummy encode
+    if encoder.image_processor is not None:
+        mm_items = [f"data:image/png;base64,{MINIMUM_PNG_PICTURE_BASE64}"]
+        modality = Modality.IMAGE
+    elif encoder.audio_processor is not None:
+        mm_items = [f"data:audio/wav;base64,{MINIMUM_WAV_SILENCE_BASE64}"]
+        modality = Modality.AUDIO
+    else:
+        # No processor available, fall back to liveness check only
+        return Response(status_code=200)
+
+    try:
+        req_id = f"{HEALTH_CHECK_RID_PREFIX}_{time.time()}"
+
+        dummy_request = {
+            "mm_items": mm_items,
+            "modality": modality.name,
+            "req_id": req_id,
+            "num_parts": 1,
+            "part_idx": 0,
+        }
+
+        # Broadcast to other TP ranks so distributed ops stay in sync
+        for socket in send_sockets:
+            socket.send_pyobj(dummy_request)
+
+        # Run encode on rank 0 with timeout
+        _, _, _, error_msg, _ = await asyncio.wait_for(
+            encoder.encode(
+                mm_items=mm_items,
+                modality=modality,
+                req_id=req_id,
+                num_parts=1,
+                part_idx=0,
+            ),
+            timeout=HEALTH_CHECK_TIMEOUT,
+        )
+
+        # Clean up stored embedding
+        encoder.embedding_to_send.pop(req_id, None)
+
+        if error_msg:
+            logger.error(f"Encoder health check failed: {error_msg}")
+            return Response(status_code=503)
+
+        return Response(status_code=200)
+
+    except asyncio.TimeoutError:
+        logger.error(f"Encoder health check timed out after {HEALTH_CHECK_TIMEOUT}s")
+        return Response(status_code=503)
+    except Exception as e:
+        logger.error(f"Encoder health check failed: {e}")
+        return Response(status_code=503)
 
 
 @app.api_route("/start_profile", methods=["GET", "POST"])

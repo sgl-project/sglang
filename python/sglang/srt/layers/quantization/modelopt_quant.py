@@ -24,7 +24,10 @@ from sglang.srt.layers.moe import (
 )
 from sglang.srt.layers.moe.cutlass_moe_params import CutlassMoEParams, CutlassMoEType
 from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
-from sglang.srt.layers.moe.utils import should_use_flashinfer_cutlass_moe_fp4_allgather
+from sglang.srt.layers.moe.utils import (
+    is_flashinfer_cutedsl_v1_path,
+    should_use_flashinfer_cutlass_moe_fp4_allgather,
+)
 from sglang.srt.layers.parameter import ModelWeightParameter, PerTensorScaleParameter
 from sglang.srt.layers.quantization.base_config import (
     FusedMoEMethodBase,
@@ -1005,20 +1008,19 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
 
             topk_config = topk_output.topk_config
 
-            # Constraints for ModelOpt FP8 MoE
-            assert (
-                self.moe_runner_config.activation == "silu"
-            ), "Only silu is supported for flashinfer fp8 moe"
+            from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
+                get_activation_type,
+            )
 
-            # Enforce Llama4 routing for ModelOpt FP8 MoE for now.
-            # TODO(brayden): support other routing methods
-            assert topk_config.top_k == 1, "ModelOpt FP8 MoE requires top_k==1"
-            assert (
-                not topk_config.num_expert_group
-            ), "ModelOpt FP8 MoE does not support expert grouping"
-            assert (
-                not topk_config.topk_group
-            ), "ModelOpt FP8 MoE does not support grouped top-k"
+            _SUPPORTED_FP8_ACTIVATIONS = {"silu", "relu2"}
+            assert self.moe_runner_config.activation in _SUPPORTED_FP8_ACTIVATIONS, (
+                f"Only {_SUPPORTED_FP8_ACTIVATIONS} are supported for "
+                f"flashinfer trtllm fp8 moe, got '{self.moe_runner_config.activation}'"
+            )
+
+            routing_method_type = getattr(
+                layer, "routing_method_type", RoutingMethodType.Llama4
+            )
 
             quant_info = FlashInferTrtllmFp8MoeQuantInfo(
                 w13_weight=layer.w13_weight,
@@ -1027,13 +1029,14 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
                 local_expert_offset=layer.moe_ep_rank * layer.num_local_experts,
                 local_num_experts=layer.num_local_experts,
                 intermediate_size=layer.w2_weight.shape[2],
-                routing_method_type=RoutingMethodType.Llama4,
+                routing_method_type=routing_method_type,
                 block_quant=False,
                 w13_input_scale=layer.w13_input_scale,
                 output1_scales_scalar=layer.output1_scales_scalar,
                 output1_scales_gate_scalar=layer.output1_scales_gate_scalar,
                 output2_scales_scalar=layer.output2_scales_scalar,
                 use_routing_scales_on_input=True,
+                activation_type=get_activation_type(self.moe_runner_config.activation),
             )
 
             return fused_experts_none_to_flashinfer_trtllm_fp8(
@@ -1546,6 +1549,29 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
 
         return get_moe_runner_backend().is_flashinfer_cutedsl()
 
+    # ----- CuteDSL v1 vs v2 path helpers -----
+    #
+    # "v1": cutedsl + deepep low-latency.
+    #   - Bypasses MoeRunner entirely; calls apply_without_routing_weights ->
+    #     flashinfer_cutedsl_moe_masked (grouped_gemm_nt_masked).
+    #   - Expects W13 in default [Gate, Up] order, NOT interleaved.
+    #   - Uses swizzled blockscales directly (w13_blockscale_swizzled).
+    #
+    # "v2" (standard): cutedsl + none/flashinfer a2a.
+    #   - Uses MoeRunner with @register_fused_func CuteDslMoEWrapper kernels.
+    #   - Expects W13 in [Up, Gate] order, interleaved in 64-row chunks.
+    #   - Uses MMA-layout blockscales (w13_blockscale_mma).
+
+    @property
+    def _is_cutedsl_v1_deepep(self) -> bool:
+        """CuteDSL v1 + DeepEP low-latency path (no MoeRunner)."""
+        return is_flashinfer_cutedsl_v1_path()
+
+    @property
+    def _is_cutedsl_v2_standard(self) -> bool:
+        """New CuteDSL standard path (a2a=none or flashinfer, uses MoeRunner)."""
+        return self.enable_flashinfer_cutedsl_moe and not self._is_cutedsl_v1_deepep
+
     def create_weights(
         self,
         layer: torch.nn.Module,
@@ -1812,9 +1838,11 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         else:
             # CUTLASS processing - handle w13 and w2 separately
 
-            if self.enable_flashinfer_cutedsl_moe and layer.moe_runner_config.is_gated:
-                # For the CuteDSL FP4 path, interleave the two logical W13 halves
-                # in 64-row chunks before swizzling the block-scales.
+            if self._is_cutedsl_v2_standard and layer.moe_runner_config.is_gated:
+                # CuteDSL v2 only: interleave the two logical W13 halves in
+                # 64-row chunks for the fused SwiGLU GEMM1 layout expected by
+                # CuteDslMoEWrapper.  The v1 (deepep) path uses
+                # grouped_gemm_nt_masked which expects plain contiguous halves.
                 from sglang.srt.layers.moe.moe_runner.flashinfer_cutedsl import (
                     interleave_w13_halves,
                 )
@@ -1876,8 +1904,10 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 layer, "w2_blockscale_swizzled", w2_blockscale_swizzled
             )
 
-            if self.enable_flashinfer_cutedsl_moe:
-                # CuteDSL expects MMA layout for weight scales. Convert from swizzled bytes.
+            if self._is_cutedsl_v2_standard:
+                # CuteDSL v2 only: convert blockscales to MMA layout for
+                # CuteDslMoEWrapper.  The v1 (deepep) path uses the
+                # swizzled blockscales directly via flashinfer_cutedsl_moe_masked.
                 from flashinfer.cute_dsl.utils import convert_sf_to_mma_layout
 
                 from sglang.srt.layers.moe.moe_runner.flashinfer_cutedsl import (
@@ -1940,9 +1970,10 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
 
     @property
     def load_up_proj_weight_first(self) -> bool:
-        # Load W13 as [Up, Gate] for FlashInfer CUTLASS/CuteDSL kernels.
+        # Load W13 as [Up, Gate] for FlashInfer CUTLASS and CuteDSL v2 kernels.
+        # The CuteDSL v1 (deepep) path uses [Gate, Up] -- do NOT flip.
         return self.moe_runner_config.is_gated and (
-            self.enable_flashinfer_cutlass_moe or self.enable_flashinfer_cutedsl_moe
+            self.enable_flashinfer_cutlass_moe or self._is_cutedsl_v2_standard
         )
 
     def create_moe_runner(
@@ -1958,6 +1989,11 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
 
         if moe_runner_backend.is_flashinfer_cutedsl():
             import sglang.srt.layers.moe.moe_runner.flashinfer_cutedsl  # noqa: F401 – triggers @register_fused_func
+
+            # CuteDSL v1 (deepep) uses the apply_without_routing_weights
+            # path (flashinfer_cutedsl_moe_masked) and does not need a MoeRunner.
+            if self._is_cutedsl_v1_deepep:
+                return
 
         if not moe_runner_backend.is_flashinfer_cutlass():
             self.runner = MoeRunner(moe_runner_backend, moe_runner_config)
@@ -2010,6 +2046,9 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
 
             return self.runner.run(dispatch_output, quant_info)
 
+        # CuteDSL v2 standard path (a2a=none/flashinfer).
+        # The v1 (deepep) path never reaches apply(); it goes through
+        # apply_without_routing_weights instead.
         if self.enable_flashinfer_cutedsl_moe:
             from sglang.srt.layers.moe.moe_runner.flashinfer_cutedsl import (
                 CuteDslFp4MoeQuantInfo,
@@ -2124,6 +2163,14 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         masked_m: torch.Tensor,
         moe_runner_config: MoeRunnerConfig,
     ) -> torch.Tensor:
+        """CuteDSL v1 (deepep low-latency) path.
+
+        Called by the DeepEP dispatcher instead of apply().  Uses
+        flashinfer_cutedsl_moe_masked (grouped_gemm_nt_masked) directly,
+        bypassing MoeRunner.  Weights must be in default [Gate, Up] order
+        and NOT interleaved -- see _is_cutedsl_v1_deepep guards in
+        process_weights_after_loading and load_up_proj_weight_first.
+        """
         assert (
             moe_runner_config.activation == "silu"
         ), "Only SiLU activation is supported."
@@ -2136,6 +2183,21 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         from sglang.srt.layers.moe.flashinfer_cutedsl_moe import (
             flashinfer_cutedsl_moe_masked,
         )
+
+        # flashinfer_cutedsl_moe_masked reinterprets scales as float8_e4m3fn.
+        # Same-dtype .view is a no-op; only wider dtypes (e.g. int32-packed
+        # UE8M0) need stride(-1)==1.
+        if (
+            MOE_NVFP4_DISPATCH
+            and x[1] is not None
+            and x[1].element_size() != 1
+            and x[1].stride(-1) != 1
+        ):
+            raise AssertionError(
+                f"NVFP4 dispatch scale has stride(-1)={x[1].stride(-1)}, "
+                f"dtype={x[1].dtype}; .view(float8_e4m3fn) requires stride(-1)==1. "
+                "Try SGLANG_MOE_NVFP4_DISPATCH=0 or check DeepEP version."
+            )
 
         down_gemm_overlap_args: Optional[DownGemmOverlapArgs] = getattr(
             layer, "down_gemm_overlap_args", None
