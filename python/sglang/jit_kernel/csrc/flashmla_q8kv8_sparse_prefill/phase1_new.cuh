@@ -9,7 +9,6 @@
 #pragma once
 
 #include "config.h"
-#include "flashmla_utils.h"
 #include "helpers.h"
 #include <cuda_fp8.h>
 
@@ -43,10 +42,10 @@ struct KernelTemplateQ8New {
   using fp8_t = cutlass::float_e4m3_t;
 
   enum NamedBarriers : uint32_t {
-    wg0_bunch_0_ready = 0,  // v35: now signals BOTH sM (max logits) AND sS0 (P fp8) ready
-    wg1_bunch_0_ready = 1,  // v35: now signals BOTH sM AND sS1 (P fp8) ready
-    vt0_left_ready = 2,     // v36: V[0] LEFT half done (256 = prod+WG0)
-    vt0_right_ready = 3,    // v36: V[0] RIGHT half done (256 = prod+WG1)
+    wg0_bunch_0_ready = 0,  // WG0 publishes max logits and local P buffer.
+    wg1_bunch_0_ready = 1,  // WG1 publishes max logits and local P buffer.
+    vt0_left_ready = 2,     // V[0] left half done (producer + WG0 arrivals).
+    vt0_right_ready = 3,    // V[0] right half done (producer + WG1 arrivals).
     sL_ready = 4,           // post-loop only
     warpgroup0_sync = 5,    // post-loop only; reused in-loop as vt1_for_wg0
     warpgroup1_sync = 6,    // post-loop only; reused in-loop as vt1_for_wg1
@@ -128,8 +127,7 @@ struct KernelTemplateQ8New {
     } q_o;
     array_aligned<fp8_t, cosize_v<SmemLayoutK>> k[2];    // 2x K double-buffer, fp8
     array_aligned<fp8_t, cosize_v<SmemLayoutVt>> vt[2];  // 2x Vt transposed buffer, fp8
-    array_aligned<fp8_t, 128 * 36> s[2];                 // 2x S buffer for remote PV, fp8
-                                                         // v46: padded stride 36B (9 banks, coprime 32)
+    array_aligned<fp8_t, 128 * 36> s[2];  // 2x S buffer, padded to a 36B row stride to avoid bank conflicts.
 
     bool is_kv_valid[2][B_TOPK];
     float2 sM[32];
@@ -137,9 +135,8 @@ struct KernelTemplateQ8New {
     float final_max_logits[64], final_lse[64];
     transac_bar_t bar_q, bar_k0_ready[2], bar_k1_ready[2], bar_is_kv_valid_ready;
     transac_bar_t bar_k0_free, bar_k1_free;
-    // v9a: Transaction barriers for Vt buffer lifetime.
-    // Consumers arrive after PV drain; producer waits before V transpose.
-    // Separate from K-free to enable early K-free signaling.
+    // Consumers arrive after PV drains; the producer waits before reusing the Vt buffer.
+    // These barriers are separate from K-free so K buffers can be released earlier.
     transac_bar_t bar_vt_free[2];  // bar_vt_free[0] protects Vt[0], bar_vt_free[1] protects Vt[1]
   };
 
@@ -189,8 +186,7 @@ struct KernelTemplateQ8New {
       plan.bar_is_kv_valid_ready.init(16);
       CUTE_UNROLL
       for (int i = 0; i < 2; ++i) {
-        // v9a: Transaction barriers for Vt buffer safety.
-        // 256 arrivals: 128 from WG0 + 128 from WG1 (both consumer WGs).
+        // Transaction barriers for Vt buffer safety: 128 arrivals from each consumer WG.
         plan.bar_vt_free[i].init(256);
       }
       fence_barrier_init();
@@ -289,7 +285,7 @@ struct KernelTemplateQ8New {
 
       // online_softmax: compute softmax on rP (f32), then convert to fp8
       auto online_softmax_and_rescale_o = [&](auto wg_tag) {
-        // v35: removed redundant bar_is_kv_valid_ready.wait() -- already done in mask_rP
+        // mask_rP already waits for the validity mask.
         constexpr bool IS_WG1 = std::is_same_v<decltype(wg_tag), Warpgroup1>;
         const float scale = qk_combined_scale_div_log2;
         float r_sM[2];
@@ -397,8 +393,7 @@ struct KernelTemplateQ8New {
                 *reinterpret_cast<uint32_t*>(cur_rOb + i * 8 + 6),
                 *reinterpret_cast<uint128_t*>(stsm_addrs[i] + tile_idx * (B_H * 64)));
           }
-          // v47: STSM is generic proxy, not async. Barrier arrive/wait
-          // provides sufficient ordering via release/acquire semantics.
+          // STSM is generic proxy, not async; the barrier provides release/acquire ordering.
           asm volatile("" ::: "memory");
           NamedBarrier::arrive_and_wait(
               128, warpgroup_idx ? NamedBarriers::warpgroup1_sync : NamedBarriers::warpgroup0_sync);
@@ -415,12 +410,12 @@ struct KernelTemplateQ8New {
         cute::tma_store_arrive();
       };
 
-      // v32: Save/load P regs to/from smem using flat thread-indexed layout.
+      // Save/load P regs to/from smem using a flat thread-indexed layout.
       // Each thread writes/reads its 32 fp8 values at a unique offset.
       // This preserves the RS A-reg ordering exactly, so the reader can
       // load back and use RS GMMA directly (no SS GMMA layout issues).
       constexpr int kP_per_thread = 32;  // ((4,2,2),1,2) = 32 fp8 per thread
-      // v46: Pad stride from 32 to 36 bytes to eliminate bank conflicts.
+      // Pad stride from 32 to 36 bytes to avoid shared-memory bank conflicts.
       // Stride 32B = only 4 banks (8-way conflict). Stride 36B = 9 banks
       // (gcd(9,32)=1 -> zero conflicts: every warp thread hits a unique bank).
       constexpr int kP_stride = 36;
@@ -499,7 +494,7 @@ struct KernelTemplateQ8New {
           save_rP_fp8_to_sS(plan.s[0].data());
           NamedBarrier::arrive(256, NamedBarriers::wg0_bunch_0_ready);
 
-          // v36: Wait for Vt[0] LEFT only (prod+WG0, 256 threads).
+          // Wait for Vt[0] left half only (producer + WG0 arrivals).
           // V[0]-RIGHT may still be transposing; WG0 doesn't need it.
           NamedBarrier::arrive_and_wait(256, vt0_left_ready);
 
@@ -507,7 +502,7 @@ struct KernelTemplateQ8New {
           gemm_rs(false, TiledMMA_PV_LocalP{}, rP_fp8_local, sVt0l, rO, idx_in_warpgroup);
           warpgroup_commit_batch();
 
-          // v38: Overlap PV-local GMMA drain with barrier waits + sM read + sS1 load.
+          // Overlap PV-local GMMA drain with barrier waits, sM read, and peer P load.
           NamedBarrier::arrive_and_wait(256, NamedBarriers::wg1_bunch_0_ready);
           float new_rM[2], scale_factors_arr[2];
           *(float2*)new_rM = plan.sM[idx_in_warpgroup / 4];
@@ -554,7 +549,7 @@ struct KernelTemplateQ8New {
           }
         }
 
-        // v34: Fix column permutation from fp8 V transpose.
+        // Undo the column permutation from the fp8 V transpose before writing O.
         // CLayout_64x256: col bit0 = t1_bit0 (thread), col bit3 = v1 (register).
         // V transpose introduces bit0<->bit3 swap. Fix by cross-thread exchange:
         //   thread with t1_bit0=0, v1=1 <-> thread with t1_bit0=1, v1=0
@@ -649,7 +644,7 @@ struct KernelTemplateQ8New {
           load_sS_to_rP(plan.s[0].data());
           NamedBarrier::arrive_and_wait(256, s_consumed_ready);
 
-          // v36: Wait for Vt[0] RIGHT only (prod+WG1, 256 threads).
+          // Wait for Vt[0] right half only (producer + WG1 arrivals).
           // V[0]-LEFT was signaled earlier; WG1 doesn't need it.
           NamedBarrier::arrive_and_wait(256, vt0_right_ready);
 
@@ -676,7 +671,7 @@ struct KernelTemplateQ8New {
           }
         }
 
-        // v34: Fix column permutation (WG1) -- same cross-thread exchange.
+        // Undo the fp8 V-transpose column permutation for WG1.
         {
           int t1_bit0 = (threadIdx.x >> 2) & 1;
 #pragma unroll
@@ -709,7 +704,7 @@ struct KernelTemplateQ8New {
             plan.final_max_logits[real_row] = is_no_valid_tokens ? -INFINITY : rM[row] * CUDART_LN2_F;
             plan.final_lse[real_row] = is_no_valid_tokens ? +INFINITY : logf(rL[row]) + rM[row] * CUDART_LN2_F;
           }
-          // v47: Regular stores, not async proxy. Barrier provides ordering.
+          // Regular stores are not async-proxy operations; the barrier provides ordering.
           asm volatile("" ::: "memory");
         }
 
@@ -791,7 +786,7 @@ struct KernelTemplateQ8New {
       using SmemLayoutTransposeV_t = typename SmemTransposeV::SmemLayoutTransposeV;
       using SmemLayoutTransposeVt_t = typename SmemTransposeV::SmemLayoutTransposeVt;
 
-      // v59: transpose_v_half uses FA3-style STSM thread layout (bank-conflict-free)
+      // Use the FA3-style STSM thread layout for the fp8 V transpose.
       // but same composition-based framework as before.
       auto transpose_v_half = [&](int smem_k_buf, int vt_buf, int tile_start, int tile_end) {
         Tensor sV_src = as_position_independent_swizzle_tensor(
@@ -813,14 +808,14 @@ struct KernelTemplateQ8New {
 
       int cur_bar_wait_phase_prod = 1;
 
-      // v58: Prologue -- prefetch first iteration's indices before loop.
+      // Prologue: prefetch the first iteration's indices before the loop.
       // Subsequent iterations' indices are prefetched during V transpose
       // of the prior iteration, hiding __ldg latency behind compute.
       load_token_indices(0);
 
       CUTE_NO_UNROLL
       for (int block_idx = 0; block_idx < num_topk_blocks; block_idx += 2) {
-        // v58: Indices already loaded (prologue or prev iteration's prefetch).
+        // Indices are already loaded by the prologue or the previous iteration's prefetch.
 
         plan.bar_k0_free.wait(cur_bar_wait_phase_prod);
         plan.bar_k1_free.wait(cur_bar_wait_phase_prod);
@@ -874,7 +869,7 @@ struct KernelTemplateQ8New {
         transpose_v_half(0, 0, 0, 4);
         NamedBarrier::arrive(256, vt0_left_ready);
 
-        // v52: Reorder V transposes -- V[1]-LEFT before V[0]-RIGHT.
+        // Transpose V[1] left before V[0] right to match the consumer handoff order.
         // WG0 is on the critical path (feeds WG1 via sM/wg0_bunch).
         // WG0 waits for vt1_for_wg0 (V[1]-LEFT) for PV-remote.
         // Moving V[1]-LEFT earlier (2nd instead of 4th) reduces WG0
