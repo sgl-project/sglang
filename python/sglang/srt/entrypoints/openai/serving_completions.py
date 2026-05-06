@@ -109,23 +109,11 @@ class OpenAIServingCompletion(OpenAIServingBase):
         # Resolve LoRA adapter from model parameter or explicit lora_path
         lora_path = self._resolve_lora_path(request.model, request.lora_path)
 
-        # For binary formats, force logprob collection so we can extract the
-        # chosen token IDs from output_token_logprobs (format: [(logprob,
-        # token_id, token_str), …]). top_logprobs_num=0 means "only the
-        # chosen token" — no top-k overhead.
-        binary = request.stream_format != "json"
-        return_logprob = binary or (request.logprobs is not None)
-        top_logprobs_num = (
-            0
-            if binary and request.logprobs is None
-            else (request.logprobs if request.logprobs is not None else 0)
-        )
-
         adapted_request = GenerateReqInput(
             **prompt_kwargs,
             sampling_params=sampling_params,
-            return_logprob=return_logprob,
-            top_logprobs_num=top_logprobs_num,
+            return_logprob=request.logprobs is not None,
+            top_logprobs_num=request.logprobs if request.logprobs is not None else 0,
             logprob_start_len=logprob_start_len,
             return_text_in_logprobs=True,
             stream=request.stream,
@@ -245,13 +233,17 @@ class OpenAIServingCompletion(OpenAIServingBase):
         """
         Yield raw Codec frames (bytes) for binary stream_format requests.
 
-        Token IDs are extracted from output_token_logprobs, which is populated
-        whenever return_logprob=True.  Each logprob entry has the form
-        (log_probability, token_id, token_string) — we take the middle element.
+        Token IDs come straight from `content["output_ids"]` — the
+        TokenizerManager surfaces them in the streamed dict regardless of
+        whether logprobs were requested. No detokenization, no logprob
+        machinery, no top-k overhead.
 
-        The text delta is never computed or transmitted.  For agent-to-agent
-        workloads the caller passes the IDs directly into the next model's
-        prompt without detokenization.
+        The shape of `output_ids` depends on the server's incremental mode:
+          incremental_streaming_output=True  → already a per-chunk delta
+          incremental_streaming_output=False → cumulative; slice by length
+
+        For agent-to-agent workloads the caller passes the yielded IDs
+        directly into the next model's prompt without ever materialising text.
         """
         n_prev_tokens: dict[int, int] = {}
         incremental = self.tokenizer_manager.server_args.incremental_streaming_output
@@ -260,27 +252,23 @@ class OpenAIServingCompletion(OpenAIServingBase):
                 adapted_request, raw_request
             ):
                 index = content.get("index", 0)
-                meta = content["meta_info"]
+                output_ids = content.get("output_ids") or []
 
-                n_prev = n_prev_tokens.get(index, 0)
-                total = meta.get("output_token_logprobs_length", 0)
-                raw_logprobs = meta.get("output_token_logprobs", [])
+                if incremental:
+                    new_ids = list(output_ids)
+                else:
+                    n_prev = n_prev_tokens.get(index, 0)
+                    new_ids = list(output_ids[n_prev:])
+                    n_prev_tokens[index] = len(output_ids)
 
-                # Slice to get only the new tokens in this chunk.
-                new_logprobs = (
-                    raw_logprobs if incremental else raw_logprobs[n_prev:total]
-                )
-                n_prev_tokens[index] = total
-
-                token_ids = [tok_id for _, tok_id, _ in new_logprobs]
-
+                meta = content.get("meta_info", {}) or {}
                 finish_reason_obj = meta.get("finish_reason")
                 finish_reason = finish_reason_obj["type"] if finish_reason_obj else None
                 done = finish_reason is not None
 
                 yield encode_frame(
                     request.stream_format,
-                    token_ids,
+                    new_ids,
                     done=done,
                     finish_reason=finish_reason,
                 )
