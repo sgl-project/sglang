@@ -1459,6 +1459,23 @@ class FlashInferIndicesUpdaterPrefill:
                 )
             )
 
+        # HiSparse MHA pool: kv_indices from req_to_token are LOGICAL
+        # addresses (in [0, size * host_to_device_ratio)).  Translate to
+        # physical hisparse slots in the small device pool before
+        # FlashInfer reads.  Mirrors the SWA translation above.
+        from sglang.srt.mem_cache.hisparse_memory_pool import (
+            HiSparseTokenToKVPoolAllocator,
+        )
+        if isinstance(
+            self.token_to_kv_pool_allocator, HiSparseTokenToKVPoolAllocator
+        ):
+            kv_last_index = kv_indptr[-1]
+            kv_indices[:kv_last_index] = (
+                self.token_to_kv_pool_allocator.translate_loc_from_full_to_hisparse(
+                    kv_indices[:kv_last_index]
+                )
+            )
+
         # cached part
         # Conditionally set multi-item parameters
         if multi_item_params is not None and multi_item_params.is_enabled():

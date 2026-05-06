@@ -88,6 +88,17 @@ def _parse_sparse_config(server_args) -> SparseConfig:
     backend = extra_config.pop("backend", None)
     min_sparse_prompt_len = extra_config.pop("min_sparse_prompt_len", None)
     page_size = extra_config.pop("page_size", None)
+    # Quest-specific knob; defaulted below when algorithm == "quest".
+    quest_page_size = extra_config.pop("quest_page_size", None)
+
+    if algorithm == "quest":
+        if quest_page_size is None:
+            quest_page_size = 64
+        if top_k % quest_page_size != 0:
+            raise ValueError(
+                f"hisparse_config: top_k ({top_k}) must be divisible by "
+                f"quest_page_size ({quest_page_size}) for algorithm='quest'."
+            )
 
     return SparseConfig(
         top_k=top_k,
@@ -97,6 +108,7 @@ def _parse_sparse_config(server_args) -> SparseConfig:
         backend=backend,
         page_size=page_size,
         min_sparse_prompt_len=min_sparse_prompt_len,
+        quest_page_size=quest_page_size,
         sparse_extra_config=extra_config,
     )
 

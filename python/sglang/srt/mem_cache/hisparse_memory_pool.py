@@ -10,7 +10,7 @@ from sglang.srt.mem_cache.allocator import (
     BaseTokenToKVPoolAllocator,
     PagedTokenToKVPoolAllocator,
 )
-from sglang.srt.mem_cache.memory_pool import NSATokenToKVPool
+from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, NSATokenToKVPool
 from sglang.srt.utils import is_cuda, is_hip
 from sglang.srt.utils.common import get_num_new_pages
 
@@ -18,10 +18,16 @@ from sglang.srt.utils.common import get_num_new_pages
 _is_cuda = is_cuda()
 _is_hip = is_hip()
 if _is_cuda or _is_hip:
-    from sgl_kernel.kvcacheio import transfer_kv_all_layer_mla
+    from sgl_kernel.kvcacheio import transfer_kv_all_layer, transfer_kv_all_layer_mla
 else:
 
     def transfer_kv_all_layer_mla(*args, **kwargs):
+        raise RuntimeError(
+            "HiSparse device KV transfer requires sgl_kernel.kvcacheio (CUDA/ROCm). "
+            "It is not available on this backend."
+        )
+
+    def transfer_kv_all_layer(*args, **kwargs):
         raise RuntimeError(
             "HiSparse device KV transfer requires sgl_kernel.kvcacheio (CUDA/ROCm). "
             "It is not available on this backend."
@@ -119,6 +125,158 @@ class HiSparseNSATokenToKVPool(NSATokenToKVPool):
 
     def load_cpu_copy(self, kv_cache_cpu, indices):
         raise NotImplementedError("HiSparseDevicePool does not support load_cpu_copy")
+
+
+class HiSparseMHATokenToKVPool(MHATokenToKVPool):
+    """MHA counterpart of :class:`HiSparseNSATokenToKVPool`.
+
+    Sizes its physical K/V buffers to hold BOTH:
+
+      * the ``size * host_to_device_ratio`` "logical" rows that the
+        ``logical_attn_allocator`` hands out during prefill (so FlashInfer's
+        regular prefill kernel can read prefill K/V at logical addresses
+        without any translation), and
+      * the ``size`` decode-time hot-buffer rows that the
+        ``hisparse_attn_allocator`` carves out for swap-in.
+
+    Both ranges are non-overlapping inside one MHA tensor.  ``set_kv_buffer``
+    runs every write through ``_resolve_write_loc``: when the coordinator
+    has reserved a hot-buffer slot for ``loc`` (mapping > 0) the write is
+    redirected there; otherwise it lands at the original logical row.
+
+    Trade-off vs the NSA-style "small device pool" design: this wastes
+    ``ratio * size * head_num * head_dim * 2 bytes`` of device memory
+    (because logical rows are duplicated on host), but lets us reuse
+    FlashInfer's standard paged prefill backend without modification.  In
+    practice, set ``host_to_device_ratio`` low (e.g., 1 or 2) for MHA to
+    minimise the waste.
+
+    NOTE: an earlier attempt to align with NSA's "small device pool + mapping
+    table + translated FlashInfer prefill" design (commit log under tag
+    ``v5_q3``) introduced a correctness regression that took GSM8K from 0.84
+    back to 0.0 in production at long context (small-model repros stayed
+    bit-exact, suggesting an interaction between chunked prefill, the
+    mapping table, and the translated kv_indices that doesn't surface at
+    small scale).  Reverted to the inflated design.  The right fix needs
+    a deeper trace of the chunked-prefill K/V write-vs-read path.
+    """
+
+    def __init__(
+        self,
+        size: int,
+        page_size: int,
+        head_num: int,
+        head_dim: int,
+        dtype: torch.dtype,
+        layer_num: int,
+        device: str,
+        enable_memory_saver: bool,
+        host_to_device_ratio: int = 2,
+        start_layer: Optional[int] = None,
+        end_layer: Optional[int] = None,
+        enable_alt_stream: bool = True,
+        enable_kv_cache_copy: bool = False,
+    ):
+        # v5 redo: physical_size = size (no inflation).  All accesses go
+        # through the mapping table — set_kv_buffer translates writes,
+        # and FlashInfer's prefill backend translates kv_indices reads
+        # via a hook that mirrors the SWA pool pattern.  See module
+        # docstring for the chunked-prefill / overlap-schedule / cuda-graph
+        # bisection that motivated re-enabling this design.
+        del host_to_device_ratio  # not used here; allocator owns the ratio
+        super().__init__(
+            size=size,
+            page_size=page_size,
+            dtype=dtype,
+            head_num=head_num,
+            head_dim=head_dim,
+            layer_num=layer_num,
+            device=device,
+            enable_memory_saver=enable_memory_saver,
+            start_layer=start_layer,
+            end_layer=end_layer,
+            enable_alt_stream=enable_alt_stream,
+            enable_kv_cache_copy=enable_kv_cache_copy,
+        )
+        # bytes per token per layer for ONE side (K or V); the host pool keeps
+        # K and V in separate buffers, so the swap-in kernel uses this stride.
+        self.bytes_per_token_one_side = head_num * head_dim * self.dtype.itemsize
+
+        self.full_to_hisparse_device_index_mapping: Optional[torch.Tensor] = None
+
+    def register_mapping(self, full_to_hisparse_device_index_mapping: torch.Tensor):
+        self.full_to_hisparse_device_index_mapping = (
+            full_to_hisparse_device_index_mapping
+        )
+
+    def _translate_loc_to_hisparse_device(self, loc: torch.Tensor) -> torch.Tensor:
+        """Return raw mapping entries (0 = no hot-buffer slot reserved)."""
+        if self.full_to_hisparse_device_index_mapping is None:
+            return loc
+        return self.full_to_hisparse_device_index_mapping[loc]
+
+    def translate_loc_to_hisparse_device(self, loc: torch.Tensor) -> torch.Tensor:
+        return self._translate_loc_to_hisparse_device(loc).to(torch.int32)
+
+    def _resolve_write_loc(self, loc: torch.Tensor) -> torch.Tensor:
+        """Translate logical loc → physical hisparse slot via the mapping
+        table.  Mapping ≤ 0 means "no slot reserved" (warmup placeholder
+        or capture-time); route to row 0 (the MHATokenToKVPool pad row).
+        Real allocator-assigned mappings are always > 0 because
+        ``PagedTokenToKVPoolAllocator`` skips slot 0 (reserved as pad).
+        """
+        if self.full_to_hisparse_device_index_mapping is None:
+            return loc
+        mapped = self.full_to_hisparse_device_index_mapping[loc]
+        return torch.where(mapped > 0, mapped, torch.zeros_like(mapped))
+
+    def set_kv_buffer(
+        self,
+        layer: RadixAttention,
+        loc: torch.Tensor,
+        cache_k: torch.Tensor,
+        cache_v: torch.Tensor,
+        k_scale: Optional[float] = None,
+        v_scale: Optional[float] = None,
+        layer_id_override: Optional[int] = None,
+    ):
+        loc = self._resolve_write_loc(loc)
+        super().set_kv_buffer(
+            layer,
+            loc,
+            cache_k,
+            cache_v,
+            k_scale=k_scale,
+            v_scale=v_scale,
+            layer_id_override=layer_id_override,
+        )
+
+    def transfer_values_on_device(self, dst_indices, src_indices):
+        if not (_is_cuda or _is_hip):
+            raise RuntimeError(
+                "HiSparseMHATokenToKVPool.transfer_values_on_device requires "
+                "sgl_kernel.kvcacheio (CUDA/ROCm)."
+            )
+        transfer_kv_all_layer(
+            src_k_layers=self.k_data_ptrs,
+            dst_k_layers=self.k_data_ptrs,
+            src_v_layers=self.v_data_ptrs,
+            dst_v_layers=self.v_data_ptrs,
+            src_indices=src_indices,
+            dst_indices=dst_indices,
+            item_size=self.bytes_per_token_one_side,
+            num_layers=self.layer_num,
+        )
+
+    def get_cpu_copy(self, indices):
+        raise NotImplementedError(
+            "HiSparseMHATokenToKVPool does not support get_cpu_copy"
+        )
+
+    def load_cpu_copy(self, kv_cache_cpu, indices):
+        raise NotImplementedError(
+            "HiSparseMHATokenToKVPool does not support load_cpu_copy"
+        )
 
 
 class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
@@ -260,6 +418,24 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.hisparse_attn_allocator.is_not_in_free_group = True
         self.hisparse_attn_allocator.free(buffer_indices[buffer_indices > 0])
 
+    def translate_loc_from_full_to_hisparse(self, kv_indices: torch.Tensor) -> torch.Tensor:
+        """Map logical kv_indices (in [0, size_full)) → physical slots in
+        the small device pool (in [0, size_hisparse)).
+
+        Used by the FlashInfer prefill backend to rewrite logical indices
+        before reading from the (small) MHA K/V tensors.  Mirrors SWA's
+        ``translate_loc_from_full_to_swa``.
+
+        Mapping == 0 (no device slot reserved) maps to row 0 (the pad
+        row); mapping == -1 (sentinel tail) likewise.  Real prefill
+        positions always have mapping > 0 — alloc_extend sets it.
+        """
+        assert self.full_to_hisparse_device_index_mapping is not None
+        mapped = self.full_to_hisparse_device_index_mapping[kv_indices]
+        return torch.where(
+            mapped > 0, mapped, torch.zeros_like(mapped)
+        ).to(torch.int32)
+
     def get_last_loc_hisparse_device(self, last_locs: torch.Tensor):
         hisparse_last_locs = self._kvcache._translate_loc_to_hisparse_device(last_locs)
         return hisparse_last_locs
@@ -378,7 +554,16 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             return
 
         if self.is_not_in_free_group:
-            self.logical_attn_allocator.free(free_index)
+            # Hisparse early-frees prefill logical slots at admit time and
+            # zeros the corresponding req_to_token entries (so new prefills
+            # can reuse the slots while the current req decodes).  At
+            # completion, the chunk_cache passes the full req_to_token range
+            # — including those zero sentinels — to free.  Filter them out
+            # of the logical free path; ``free_hisparse`` already filters
+            # zero mappings internally so the hot-buffer side is safe.
+            nonzero = free_index[free_index > 0]
+            if nonzero.numel() > 0:
+                self.logical_attn_allocator.free(nonzero)
             self.free_hisparse(free_index)
         else:
             self.free_group.append(free_index)

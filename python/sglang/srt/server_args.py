@@ -139,6 +139,8 @@ ATTENTION_BACKEND_CHOICES = [
     "fa3",
     "fa4",
     "flashinfer",
+    "flashinfer_hisparse",
+    "flashinfer_quest",
     "flashmla",
     "trtllm_mla",
     "trtllm_mha",
@@ -1582,7 +1584,13 @@ class ServerArgs:
         user_set_decode = self.nsa_decode_backend is not None
 
         # HiSparse requires flashmla_sparse for both prefill and decode
+        # (DSA-native path only — algorithm=quest uses MHA + flashinfer
+        # and never touches the NSA backend selection).
         if self.enable_hisparse:
+            from sglang.srt.mem_cache.sparsity import parse_hisparse_config
+
+            if parse_hisparse_config(self).algorithm == "quest":
+                return
             if not user_set_prefill:
                 self.nsa_prefill_backend = "flashmla_sparse"
             if not user_set_decode:
@@ -6723,30 +6731,90 @@ class ServerArgs:
                     "--default-priority-value has no effect without --enable-priority-scheduling"
                 )
 
+        # Check flashinfer_quest (Mode 2: Quest sparse decode without
+        # hisparse offloading).  This branch fires when the user picks the
+        # flashinfer_quest backend without enabling hisparse.
+        is_quest_only_backend = (
+            self.attention_backend == "flashinfer_quest"
+            or self.decode_attention_backend == "flashinfer_quest"
+        )
+        if is_quest_only_backend and not self.enable_hisparse:
+            from sglang.srt.mem_cache.sparsity import parse_hisparse_config
+
+            quest_cfg = parse_hisparse_config(self)
+            if quest_cfg.algorithm != "quest":
+                raise ValueError(
+                    "--attention-backend flashinfer_quest requires "
+                    "--hisparse-config '{\"algorithm\": \"quest\", ...}'."
+                )
+            assert self.disable_radix_cache, (
+                "flashinfer_quest currently requires --disable-radix-cache."
+            )
+            if self.kv_cache_dtype != "bfloat16":
+                raise ValueError(
+                    f"flashinfer_quest requires bfloat16 KV cache, got "
+                    f"--kv-cache-dtype={self.kv_cache_dtype}."
+                )
+            # Quest's prefill bounds bookkeeping recomputes from scratch
+            # under chunked prefill — wasteful and not validated.  Force
+            # chunked-prefill off for cleaner accounting.
+            if self.chunked_prefill_size > 0:
+                logger.warning(
+                    "flashinfer_quest disables chunked prefill (was "
+                    f"--chunked-prefill-size {self.chunked_prefill_size})."
+                )
+                self.chunked_prefill_size = -1
+
         # Check hisparse
         if self.enable_hisparse:
             from sglang.srt.configs.model_config import is_deepseek_nsa
+            from sglang.srt.mem_cache.sparsity import parse_hisparse_config
 
             hf_config = self.get_model_config().hf_config
-            assert is_deepseek_nsa(hf_config), (
-                "--enable-hisparse is only supported for DSA (DeepSeek Sparse Attention) models now"
-                "(e.g., DeepSeek V3.2, GLM-5). "
-            )
+            hisparse_cfg = parse_hisparse_config(self)
+            is_quest = hisparse_cfg.algorithm == "quest"
+
+            if not is_quest:
+                # DSA-native hisparse path: requires a DSA model and pins
+                # the NSA backends to flashmla_sparse.
+                assert is_deepseek_nsa(hf_config), (
+                    "--enable-hisparse without algorithm='quest' requires a DSA "
+                    "(DeepSeek Sparse Attention) model (e.g., DeepSeek V3.2, "
+                    "GLM-5).  For non-DSA models pass "
+                    "--hisparse-config '{\"algorithm\": \"quest\"}'."
+                )
+                for attr, label in [
+                    ("nsa_prefill_backend", "prefill"),
+                    ("nsa_decode_backend", "decode"),
+                ]:
+                    backend = getattr(self, attr)
+                    if backend is not None and backend != "flashmla_sparse":
+                        raise ValueError(
+                            f"HiSparse requires flashmla_sparse NSA {label} backend, "
+                            f"but got --nsa-{label}-backend={backend}. "
+                            f"Please use --nsa-{label}-backend=flashmla_sparse or omit it."
+                        )
+            else:
+                # Quest hisparse path: non-DSA MHA models.  The NSA backends
+                # don't apply (the new flashinfer_hisparse decode backend is
+                # used instead — see attention_registry.py).
+                assert not is_deepseek_nsa(hf_config), (
+                    "algorithm='quest' is intended for non-DSA MHA models; "
+                    "drop the algorithm setting to use the DSA-native hisparse path."
+                )
+                # HiSparseTokenToKVPoolAllocator's alloc_extend requires
+                # page_size > 1 (paged storage).  Default to 64 here so the
+                # user doesn't need to know the constraint.
+                if self.page_size is None or self.page_size <= 1:
+                    self.page_size = 64
+                    logger.warning(
+                        "HiSparse Quest mode requires page_size > 1; "
+                        "setting page_size=64."
+                    )
 
             assert (
                 self.disable_radix_cache
             ), "Hierarchical sparse attention currently requires --disable-radix-cache."
-            for attr, label in [
-                ("nsa_prefill_backend", "prefill"),
-                ("nsa_decode_backend", "decode"),
-            ]:
-                backend = getattr(self, attr)
-                if backend is not None and backend != "flashmla_sparse":
-                    raise ValueError(
-                        f"HiSparse requires flashmla_sparse NSA {label} backend, "
-                        f"but got --nsa-{label}-backend={backend}. "
-                        f"Please use --nsa-{label}-backend=flashmla_sparse or omit it."
-                    )
 
             if self.kv_cache_dtype != "bfloat16":
                 raise ValueError(

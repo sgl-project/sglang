@@ -28,6 +28,39 @@ def register_attention_backend(name):
     return decorator
 
 
+@register_attention_backend("flashinfer_quest")
+def create_flashinfer_quest_backend(runner):
+    """Quest sparse decode WITHOUT hisparse offloading.
+
+    Uses a regular MHATokenToKVPool (full KV on GPU); Quest selects top-k
+    token positions per layer and FlashInfer attends to those positions.
+    Requires ``--hisparse-config '{"algorithm": "quest", ...}'`` and
+    ``--disable-radix-cache``; does NOT require ``--enable-hisparse``.
+    """
+    from sglang.srt.layers.attention.flashinfer_quest_backend import (
+        FlashInferQuestDecodeBackend,
+    )
+
+    return FlashInferQuestDecodeBackend(runner)
+
+
+@register_attention_backend("flashinfer_hisparse")
+def create_flashinfer_hisparse_backend(runner):
+    """Quest + HiSparse + FlashInfer decode-only backend.
+
+    Decode-only: must be paired with a prefill backend via HybridAttnBackend
+    (typically ``--prefill-attention-backend flashinfer``).  Requires
+    ``--enable-hisparse`` and ``--hisparse-config '{"algorithm": "quest", ...}'``;
+    the runner constructs the QuestAlgorithm + MHA hisparse pool + coordinator
+    upstream and we pull from there.
+    """
+    from sglang.srt.layers.attention.flashinfer_hisparse_backend import (
+        FlashInferHiSparseDecodeBackend,
+    )
+
+    return FlashInferHiSparseDecodeBackend.from_runner(runner)
+
+
 @register_attention_backend("flashinfer")
 def create_flashinfer_backend(runner):
     import torch

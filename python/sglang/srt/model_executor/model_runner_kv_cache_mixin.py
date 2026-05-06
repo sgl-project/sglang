@@ -14,6 +14,7 @@ from sglang.srt.mem_cache.allocator import (
     TokenToKVPoolAllocator,
 )
 from sglang.srt.mem_cache.hisparse_memory_pool import (
+    HiSparseMHATokenToKVPool,
     HiSparseNSATokenToKVPool,
     HiSparseTokenToKVPoolAllocator,
 )
@@ -540,6 +541,37 @@ class ModelRunnerKVCacheMixin:
                         layer_num=self.num_effective_layers,
                         device=self.device,
                         enable_memory_saver=self.server_args.enable_memory_saver,
+                        start_layer=self.start_layer,
+                        end_layer=self.end_layer,
+                        enable_alt_stream=not self.server_args.enable_pdmux,
+                        enable_kv_cache_copy=(
+                            self.server_args.speculative_algorithm is not None
+                        ),
+                    )
+                elif self.enable_hisparse:
+                    # Quest hisparse on a non-DSA MHA model.  The DSA
+                    # path is handled separately above (HiSparseNSATokenToKVPool).
+                    from sglang.srt.mem_cache.sparsity import (
+                        parse_hisparse_config,
+                    )
+
+                    hisparse_cfg = parse_hisparse_config(self.server_args)
+                    assert hisparse_cfg.algorithm == "quest", (
+                        "enable_hisparse for non-DSA models requires "
+                        "hisparse_config algorithm='quest'"
+                    )
+                    self.token_to_kv_pool = HiSparseMHATokenToKVPool(
+                        size=self.max_total_num_tokens,
+                        page_size=self.page_size,
+                        head_num=self.model_config.get_num_kv_heads(
+                            get_attention_tp_size()
+                        ),
+                        head_dim=self.model_config.head_dim,
+                        dtype=self.kv_cache_dtype,
+                        layer_num=self.num_effective_layers,
+                        device=self.device,
+                        enable_memory_saver=self.server_args.enable_memory_saver,
+                        host_to_device_ratio=hisparse_cfg.host_to_device_ratio,
                         start_layer=self.start_layer,
                         end_layer=self.end_layer,
                         enable_alt_stream=not self.server_args.enable_pdmux,

@@ -710,23 +710,62 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         # Init hisparse coordinator (must happen before CUDA graph capture)
         if self.enable_hisparse:
-            from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
+            from sglang.srt.managers.hisparse_coordinator import (
+                MODE_DSA_NATIVE,
+                MODE_QUEST,
+                HiSparseCoordinator,
+            )
             from sglang.srt.mem_cache.sparsity import parse_hisparse_config
 
             hisparse_cfg = parse_hisparse_config(self.server_args)
-            self.hisparse_coordinator = HiSparseCoordinator(
-                req_to_token_pool=self.req_to_token_pool,
-                token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
-                top_k=hisparse_cfg.top_k,
-                device_buffer_size=hisparse_cfg.device_buffer_size,
-                device=self.device,
-                tp_group=(
-                    self.attention_tp_group.cpu_group
-                    if self.server_args.enable_dp_attention
-                    else self.tp_group.cpu_group
-                ),
-                host_to_device_ratio=hisparse_cfg.host_to_device_ratio,
+            tp_group = (
+                self.attention_tp_group.cpu_group
+                if self.server_args.enable_dp_attention
+                else self.tp_group.cpu_group
             )
+
+            if hisparse_cfg.algorithm == "quest":
+                from sglang.srt.mem_cache.sparsity.algorithms.quest_algorithm import (
+                    QuestAlgorithm,
+                )
+
+                quest = QuestAlgorithm(
+                    top_k=hisparse_cfg.top_k,
+                    page_size=hisparse_cfg.quest_page_size,
+                    device=torch.device(self.device),
+                )
+                quest.init_storage(
+                    start_layer=self.start_layer,
+                    end_layer=self.end_layer,
+                    max_reqs=self.req_to_token_pool.req_to_token.shape[0],
+                    max_context_len=self.req_to_token_pool.max_context_len,
+                    kv_heads=self.model_config.get_num_kv_heads(
+                        get_attention_tp_size()
+                    ),
+                    head_dim=self.model_config.head_dim,
+                )
+                self.hisparse_coordinator = HiSparseCoordinator(
+                    req_to_token_pool=self.req_to_token_pool,
+                    token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+                    top_k=hisparse_cfg.top_k,
+                    device_buffer_size=hisparse_cfg.device_buffer_size,
+                    device=self.device,
+                    tp_group=tp_group,
+                    host_to_device_ratio=hisparse_cfg.host_to_device_ratio,
+                    mode=MODE_QUEST,
+                    quest_algorithm=quest,
+                )
+            else:
+                self.hisparse_coordinator = HiSparseCoordinator(
+                    req_to_token_pool=self.req_to_token_pool,
+                    token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+                    top_k=hisparse_cfg.top_k,
+                    device_buffer_size=hisparse_cfg.device_buffer_size,
+                    device=self.device,
+                    tp_group=tp_group,
+                    host_to_device_ratio=hisparse_cfg.host_to_device_ratio,
+                    mode=MODE_DSA_NATIVE,
+                )
 
         # Init routed experts capturer
         self.init_routed_experts_capturer()

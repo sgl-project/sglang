@@ -1,22 +1,40 @@
 # to be combined with the sparse coordinator class and sparse algorithm family
 
 import logging
-from typing import List, NamedTuple
+from typing import TYPE_CHECKING, List, NamedTuple, Optional
 
 import torch
 
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.mem_cache.hisparse_memory_pool import (
+    HiSparseMHATokenToKVPool,
     HiSparseNSATokenToKVPool,
     HiSparseTokenToKVPoolAllocator,
 )
-from sglang.srt.mem_cache.memory_pool_host import MLATokenToKVPoolHost
+from sglang.srt.mem_cache.memory_pool_host import (
+    MHATokenToKVPoolHost,
+    MLATokenToKVPoolHost,
+)
 from sglang.srt.utils import get_device_module
 
 device_module = get_device_module()
 
-from sglang.jit_kernel.hisparse import load_cache_to_device_buffer_mla
+from sglang.jit_kernel.hisparse import (
+    load_cache_to_device_buffer_mha,
+    load_cache_to_device_buffer_mla,
+)
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+
+if TYPE_CHECKING:
+    from sglang.srt.mem_cache.sparsity.algorithms.quest_algorithm import QuestAlgorithm
+
+# Recognised modes for HiSparseCoordinator.  ``dsa_native`` is the original
+# path: top-k token positions come from the model's native DSA indexer.
+# ``quest`` swaps in QuestAlgorithm as the index source and adds bounds-update
+# hooks at staging admit and eager-backup time.
+MODE_DSA_NATIVE = "dsa_native"
+MODE_QUEST = "quest"
+_VALID_MODES = (MODE_DSA_NATIVE, MODE_QUEST)
 
 logger = logging.getLogger(__name__)
 
@@ -44,24 +62,74 @@ class HiSparseCoordinator:
         device: str,
         tp_group: torch.distributed.ProcessGroup,
         host_to_device_ratio: int = 2,
+        mode: str = MODE_DSA_NATIVE,
+        quest_algorithm: Optional["QuestAlgorithm"] = None,
     ):
+        if mode not in _VALID_MODES:
+            raise ValueError(
+                f"Unknown HiSparseCoordinator mode {mode!r}; expected one of {_VALID_MODES}"
+            )
+        if mode == MODE_QUEST:
+            if quest_algorithm is None:
+                raise ValueError(
+                    "HiSparseCoordinator with mode='quest' requires a quest_algorithm"
+                )
+            if quest_algorithm.page_k_min is None:
+                raise RuntimeError(
+                    "QuestAlgorithm.init_storage(...) must be called before "
+                    "constructing HiSparseCoordinator with mode='quest'"
+                )
+            if quest_algorithm.top_k != top_k:
+                raise ValueError(
+                    f"QuestAlgorithm.top_k ({quest_algorithm.top_k}) must match "
+                    f"HiSparseCoordinator.top_k ({top_k})"
+                )
+        elif quest_algorithm is not None:
+            raise ValueError(
+                "quest_algorithm provided but mode != 'quest'; refusing to ignore "
+                "to avoid silent misconfiguration"
+            )
+
+        self.mode = mode
+        self.quest_algorithm = quest_algorithm
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
         self.top_k = top_k
         self.device_buffer_size = device_buffer_size
         self.device = device
 
-        self.mem_pool_device: HiSparseNSATokenToKVPool = (
-            self.token_to_kv_pool_allocator.get_kvcache()
-        )
-        self.mem_pool_host = MLATokenToKVPoolHost(
-            device_pool=self.mem_pool_device,
-            host_to_device_ratio=host_to_device_ratio,
-            host_size=0,
-            page_size=1,  # for simplicity, we set page size to 1 to enable backup one token at a time
-            layout="layer_first",
-            override_kv_cache_dim=self.mem_pool_device.kv_cache_dim,
-        )
+        self.mem_pool_device = self.token_to_kv_pool_allocator.get_kvcache()
+        # Pool type must match mode: dsa_native ↔ NSA pool, quest ↔ MHA pool.
+        # The mismatch is caught here rather than failing later at swap_in.
+        if mode == MODE_DSA_NATIVE:
+            if not isinstance(self.mem_pool_device, HiSparseNSATokenToKVPool):
+                raise TypeError(
+                    f"mode='dsa_native' requires HiSparseNSATokenToKVPool, got "
+                    f"{type(self.mem_pool_device).__name__}"
+                )
+            self.mem_pool_host = MLATokenToKVPoolHost(
+                device_pool=self.mem_pool_device,
+                host_to_device_ratio=host_to_device_ratio,
+                host_size=0,
+                # page_size=1 so backup happens one token at a time (matches
+                # the per-token swap-in kernel granularity).
+                page_size=1,
+                layout="layer_first",
+                override_kv_cache_dim=self.mem_pool_device.kv_cache_dim,
+            )
+        else:  # MODE_QUEST
+            if not isinstance(self.mem_pool_device, HiSparseMHATokenToKVPool):
+                raise TypeError(
+                    f"mode='quest' requires HiSparseMHATokenToKVPool, got "
+                    f"{type(self.mem_pool_device).__name__}"
+                )
+            self.mem_pool_host = MHATokenToKVPoolHost(
+                device_pool=self.mem_pool_device,
+                host_to_device_ratio=host_to_device_ratio,
+                host_size=0,
+                page_size=1,
+                layout="layer_first",
+            )
 
         max_num_reqs = req_to_token_pool.req_to_token.shape[0]
         max_context_len = req_to_token_pool.max_context_len
@@ -86,6 +154,18 @@ class HiSparseCoordinator:
 
         self.write_staging_stream = device_module.Stream()
         self.decode_backup_stream = device_module.Stream()
+        # Quest mode only: parallel stream for prefill bounds compute so
+        # ``finish_event`` can fire as soon as the host backup is done,
+        # without waiting for the (fused but still ~1s for 16K-token reqs)
+        # bounds work.  Decode start waits on the bounds event explicitly via
+        # ``wait_for_pending_bounds`` in the decode backend's
+        # ``init_forward_metadata``.
+        self.quest_bounds_stream = (
+            device_module.Stream() if mode == MODE_QUEST else None
+        )
+        # Per-req bounds event, populated at admit, popped at first decode
+        # init.  Empty in non-Quest modes.
+        self._pending_bounds_events: dict[int, device_module.Event] = {}
         self.ack_staging_queue: List[HiSparseAct] = []
         self.decode_producer_stream = None
         self._backup_done_event = device_module.Event()
@@ -180,13 +260,52 @@ class HiSparseCoordinator:
             self.mem_pool_host.backup_from_device_all_layer(
                 self.mem_pool_device, host_indices, device_indices, io_backend="kernel"
             )
+            # finish_event gates collect_ready_reqs admission.  Record it
+            # right after the host backup completes — we no longer wait on
+            # the (potentially expensive) Quest bounds compute, which is
+            # consumed only at decode start (see wait_for_pending_bounds).
             finish_event.record()
             if host_indices.is_cuda:
                 host_indices.record_stream(self.write_staging_stream)
             if device_indices.is_cuda:
                 device_indices.record_stream(self.write_staging_stream)
 
+        # Quest mode: compute per-page K bounds in parallel on a dedicated
+        # bounds_stream.  The bounds are needed only at decode start (read
+        # by retrieve_topk); init_forward_metadata in the hisparse decode
+        # backend waits on bounds_event before the first layer's
+        # retrieve_topk runs.
+        if self.mode == MODE_QUEST:
+            bounds_event = device_module.Event()
+            with device_module.stream(self.quest_bounds_stream):
+                start_event.wait(self.quest_bounds_stream)
+                self._update_quest_prefill_representations(req, device_indices)
+                bounds_event.record()
+                if device_indices.is_cuda:
+                    device_indices.record_stream(self.quest_bounds_stream)
+            self._pending_bounds_events[req.req_pool_idx] = bounds_event
+
         self.ack_staging_queue.append(HiSparseAct(start_event, finish_event, req))
+
+    def _update_quest_prefill_representations(
+        self, req: Req, device_indices: torch.Tensor
+    ) -> None:
+        """Quest-mode hook: populate page bounds from prefill K (on device).
+
+        Called from inside ``admit_request_into_staging``'s
+        ``write_staging_stream`` block.  Issues a SINGLE fused Triton kernel
+        launch that processes all Quest layers and all pages in this
+        request's prefill, replacing the previous num_layers Python loop
+        (which dominated p50 TTFT in quest_hisparse mode at long context).
+        """
+        quest = self.quest_algorithm
+        # Fused kernel reads K via per-layer pointers; mem_pool_device exposes
+        # them as ``k_data_ptrs`` (uint64 tensor of pointer values).
+        quest.update_prefill_representations_fused(
+            req_pool_idx=req.req_pool_idx,
+            k_data_ptrs=self.mem_pool_device.k_data_ptrs,
+            prefill_indices=device_indices,
+        )
 
     def admit_request_direct(self, req: Req) -> None:
         """Direct-to-host path: KV data already resides in host pool via RDMA.
@@ -298,11 +417,69 @@ class HiSparseCoordinator:
             _, _, req = self.ack_staging_queue.pop(0)
             # prepare device buffer and update req
             self.alloc_device_buffer(req)
+            # Free this req's prefill logical pool slots NOW.  Their data has
+            # already been backed up to host (gating finish_event) and the
+            # decode hot buffer has been carved out of the mapping by
+            # alloc_device_buffer; the slots no longer carry authoritative
+            # data, and decode reads via req_to_host_pool — never via these
+            # logical positions.  Without this early free, slots stay
+            # allocated through the entire decode (~28 s for 2K tokens at
+            # 14 ms/tok), capping concurrent reqs at
+            # ``max_total_tokens / input_len`` ≈ 4 in the long-context bench
+            # — the dominant cause of the quest_hisparse TTFT regression.
+            self._early_free_prefill_logical_slots(req)
             req.hisparse_staging = False
             self._skip_first_backup[req.req_pool_idx] = True
             finish_count -= 1
             ready_reqs.append(req)
         return ready_reqs
+
+    def _early_free_prefill_logical_slots(self, req: Req) -> None:
+        """Release prefill logical pool entries after admit, EXCEPT the
+        last page (which alloc_decode reads via ``last_loc =
+        req_to_token[req_idx, prefill_len - 1]`` for page-alignment).
+
+        Frees the whole-page prefix in one go and zeros the corresponding
+        req_to_token positions so cache_finished_req's free path skips
+        them; the kept last page is freed normally at completion.
+
+        The last page is freed in one piece — keeping a partial page
+        intact avoids a double-free, because PagedTokenToKVPoolAllocator
+        frees at page granularity (``unique(slot // page_size)``), so
+        keeping ANY slot in a page prevents the page from being early-
+        freed.
+
+        Safe because:
+          * decode reads K from req_to_host_pool, not req_to_token's
+            prefill range;
+          * mapping[prefill_locs] was zeroed by alloc_device_buffer above;
+          * new decode tokens get freshly allocated (req_to_token positions
+            >= prefill_len) and remain valid.
+        """
+        prefill_len = req.kv_allocated_len
+        if prefill_len <= 0:
+            return
+        page_size = self.mem_pool_device.page_size
+        # Keep slots in [keep_start, prefill_len) — that's the last page
+        # (possibly partial if prefill_len isn't page-aligned).
+        keep_start = ((prefill_len - 1) // page_size) * page_size
+        if keep_start <= 0:
+            # Whole prefill fits in one page; can't early-free anything
+            # without losing alloc_decode's last_loc reference.
+            return
+        req_to_token = self.req_to_token_pool.req_to_token
+        early_indices = req_to_token[
+            req.req_pool_idx, :keep_start
+        ].clone()
+        # Filter out any pad-row sentinels that may already be present.
+        valid = early_indices > 0
+        to_free = early_indices[valid]
+        if to_free.numel() > 0:
+            self.token_to_kv_pool_allocator.logical_attn_allocator.free(to_free)
+        # Mark the freed positions so cache_finished_req's free skips them
+        # (HiSparseTokenToKVPoolAllocator.free filters zero entries out of
+        # the logical-free path).
+        req_to_token[req.req_pool_idx, :keep_start] = 0
 
     def _grow_device_buffers(
         self,
@@ -463,6 +640,14 @@ class HiSparseCoordinator:
             self.decode_backup_stream.wait_stream(schedule_stream)
             if self.decode_producer_stream is not None:
                 self.decode_backup_stream.wait_stream(self.decode_producer_stream)
+            # Quest mode: accumulate the just-decoded token's K into running
+            # min/max for every layer, then advance per-request counters.
+            # Runs before the host DMA on the same stream; both read from
+            # the same device K rows.  The next forward pass waits on
+            # _backup_done_event (recorded after the DMA), so retrieve_topk
+            # in the next step sees fully-updated bounds.
+            if self.mode == MODE_QUEST:
+                self._update_quest_decode_representations(backup_req_indices, device_locs)
             self.mem_pool_host.backup_from_device_all_layer(
                 self.mem_pool_device,
                 host_locs,
@@ -480,11 +665,57 @@ class HiSparseCoordinator:
                 device_locs.record_stream(self.decode_backup_stream)
         self._has_pending_backup = True
 
+    def _update_quest_decode_representations(
+        self,
+        backup_req_indices: torch.Tensor,
+        device_locs: torch.Tensor,
+    ) -> None:
+        """Quest-mode hook: running min/max accumulate + finalize.
+
+        Called from inside ``_eager_backup_previous_token``'s
+        ``decode_backup_stream`` block.  Uses the fused all-layer Triton
+        kernel (one launch instead of num_layers Python iterations), then a
+        single finalize that advances counters and copies completed pages
+        (if any) into ``page_k_min/max``.
+        """
+        quest = self.quest_algorithm
+        quest.update_decode_representations_fused(
+            k_data_ptrs=self.mem_pool_device.k_data_ptrs,
+            req_indices=backup_req_indices,
+            device_locs=device_locs,
+        )
+        quest.maybe_finalize_decode_representations(backup_req_indices)
+
     def wait_for_pending_backup(self) -> None:
         if not self._has_pending_backup:
             return
         self._backup_done_event.wait(device_module.current_stream())
         self._has_pending_backup = False
+
+    def wait_for_pending_bounds(self, req_pool_indices: torch.Tensor) -> None:
+        """Wait on Quest prefill bounds events for any reqs in this batch.
+
+        Quest mode runs prefill bounds on ``quest_bounds_stream`` in parallel
+        with the host backup (so admission isn't gated on bounds).  Decode
+        start must wait on those events before retrieve_topk reads
+        ``page_k_bounds``.  Called once per decode step from the hisparse
+        decode backend's ``init_forward_metadata`` family.
+
+        After waiting, the events are popped from the pending dict; subsequent
+        decode steps for the same reqs are no-ops (the dict lookup is cheap).
+        Most steps will find an empty dict (no bounds to wait on) and return
+        without any device-host sync.
+        """
+        if self.mode != MODE_QUEST or not self._pending_bounds_events:
+            return
+        current = device_module.current_stream()
+        # Only the first decode step after admit pays the host roundtrip.
+        # We could avoid this by tagging events to a device-side mask, but
+        # the overhead is one-shot per request and dwarfed by what we save.
+        for rpi in req_pool_indices.cpu().tolist():
+            evt = self._pending_bounds_events.pop(int(rpi), None)
+            if evt is not None:
+                evt.wait(current)
 
     def get_front_topk_tokens(
         self,
@@ -597,6 +828,12 @@ class HiSparseCoordinator:
         ]
         # Wait for any in-flight staging DMA to complete before freeing
         self.write_staging_stream.synchronize()
+        # Quest: also sync the bounds compute (parallel stream) and drop
+        # any pending event so a future admit into this slot starts clean.
+        if self.mode == MODE_QUEST:
+            pending = self._pending_bounds_events.pop(req.req_pool_idx, None)
+            if pending is not None:
+                pending.synchronize()
 
         # Free host memory that was allocated during admit_request_into_staging
         host_indices = self.req_to_host_pool[req.req_pool_idx, : req.kv_allocated_len]
@@ -620,6 +857,17 @@ class HiSparseCoordinator:
         if self._has_pending_backup:
             self._backup_done_event.wait(device_module.current_stream())
             self._has_pending_backup = False
+
+        # Quest mode: clear page_valid bits and reset running buffers for
+        # this slot before any other request can be admitted into it.  If a
+        # bounds event for this slot was never consumed (e.g. req finished
+        # before its first decode step), wait on it so invalidate_request
+        # doesn't race the in-flight kernel.
+        if self.mode == MODE_QUEST:
+            pending = self._pending_bounds_events.pop(req.req_pool_idx, None)
+            if pending is not None:
+                pending.wait(device_module.current_stream())
+            self.quest_algorithm.invalidate_request(req.req_pool_idx)
 
         # release memory — only free actually-allocated buffer indices
         current_cap = int(self.req_device_buffer_size[req.req_pool_idx])
@@ -673,13 +921,11 @@ class HiSparseCoordinator:
         top_k_indices.fill_(-1)
         # todo, adjustable for performance
         block_size = 1024
-        load_cache_to_device_buffer_mla(
+        common_kwargs = dict(
             top_k_tokens=top_k_result,
             device_buffer_tokens=self.req_device_buffer_tokens[layer_id],
             host_cache_locs=self.req_to_host_pool,
             device_buffer_locs=self.req_device_buffer_token_locs[layer_id],
-            host_cache=self.mem_pool_host.kv_buffer[layer_id],
-            device_buffer=self.mem_pool_device.kv_buffer[layer_id],
             top_k_device_locs=top_k_indices,
             req_pool_indices=req_pool_indices,
             seq_lens=seq_lens,
@@ -691,4 +937,21 @@ class HiSparseCoordinator:
             block_size=block_size,
             num_real_reqs=self.num_real_reqs,
         )
+        if self.mode == MODE_QUEST:
+            # MHA: separate K and V buffers on host (k_buffer/v_buffer
+            # properties on MHATokenToKVPoolHost) and on device.
+            load_cache_to_device_buffer_mha(
+                host_k_cache=self.mem_pool_host.k_buffer[layer_id],
+                host_v_cache=self.mem_pool_host.v_buffer[layer_id],
+                device_k_buffer=self.mem_pool_device.k_buffer[layer_id],
+                device_v_buffer=self.mem_pool_device.v_buffer[layer_id],
+                **common_kwargs,
+            )
+        else:
+            # MLA: combined K/V in a single buffer.
+            load_cache_to_device_buffer_mla(
+                host_cache=self.mem_pool_host.kv_buffer[layer_id],
+                device_buffer=self.mem_pool_device.kv_buffer[layer_id],
+                **common_kwargs,
+            )
         return top_k_indices

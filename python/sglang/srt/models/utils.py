@@ -28,6 +28,7 @@ from sglang.jit_kernel.norm import can_use_fused_inplace_qknorm, fused_inplace_q
 from sglang.srt.environ import envs
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.utils.cp_utils import is_prefill_context_parallel_enabled
+from sglang.srt.mem_cache.hisparse_memory_pool import HiSparseMHATokenToKVPool
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -274,12 +275,22 @@ class AutoWeightsLoader:
 
 
 def enable_fused_set_kv_buffer(forward_batch: ForwardBatch):
-    """Enable fused set_kv_buffer only on CUDA with bfloat16 KV cache."""
+    """Enable fused set_kv_buffer only on CUDA with bfloat16 KV cache.
+
+    Disabled for HiSparseMHATokenToKVPool: that pool's set_kv_buffer
+    redirects writes through a logical→physical mapping (small-pool
+    design), which the fused ROPE+set_kv kernel doesn't honor.  Without
+    this guard, prefill K lands at pool[logical_loc] but decode reads
+    from pool[mapping[logical_loc]] = pool[hisparse_slot] — a different
+    address — producing garbage attention output once the unrelated
+    hisparse slot has been written by a previous request.
+    """
     return (
         _is_cuda
         and hasattr(forward_batch.token_to_kv_pool, "dtype")
         and forward_batch.token_to_kv_pool.dtype == torch.bfloat16
         and not isinstance(forward_batch.token_to_kv_pool, SWAKVPool)
+        and not isinstance(forward_batch.token_to_kv_pool, HiSparseMHATokenToKVPool)
         and not is_prefill_context_parallel_enabled()
     ) or (_is_hip and not is_prefill_context_parallel_enabled())
 

@@ -62,6 +62,10 @@ class SparseConfig:
     backend: Optional[str] = None
     page_size: Optional[int] = None
     min_sparse_prompt_len: Optional[int] = None
+    # Quest-specific: page granularity for the bounding-box representation.
+    # Distinct from ``page_size`` (which is the KV pool's storage granularity).
+    # Must divide ``top_k`` evenly.  Defaults to 64 when algorithm == "quest".
+    quest_page_size: Optional[int] = None
     sparse_extra_config: dict = field(
         default_factory=dict
     )  # Algorithm-specific config, parsed by each algorithm
