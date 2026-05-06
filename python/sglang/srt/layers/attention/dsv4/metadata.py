@@ -108,11 +108,7 @@ class PagedIndexerMetadata:
         else:
             import deep_gemm
 
-            if envs.SGLANG_OPT_DG_PAGED_MQA_LOGITS_CHUNK_SIZE.get() != -1:
-                from sglang.srt.layers.deep_gemm_wrapper.paged_mqa_logits import (
-                    get_paged_mqa_logits_metadata_chunked as get_paged_mqa_logits_metadata,
-                )
-            elif envs.SGLANG_OPT_USE_JIT_INDEXER_METADATA.get():
+            if envs.SGLANG_OPT_USE_JIT_INDEXER_METADATA.get():
                 from sglang.jit_kernel.deepseek_v4 import get_paged_mqa_logits_metadata
             else:
                 from deep_gemm import get_paged_mqa_logits_metadata
@@ -126,10 +122,7 @@ class PagedIndexerMetadata:
                 deep_gemm.get_num_sms(),
             )
 
-            if envs.SGLANG_OPT_DG_PAGED_MQA_LOGITS_CHUNK_SIZE.get() != -1:
-                pass
-            else:
-                assert isinstance(self.deep_gemm_metadata, torch.Tensor)
+            assert isinstance(self.deep_gemm_metadata, torch.Tensor)
 
         from sglang.jit_kernel.deepseek_v4 import plan_topk_v2
 
