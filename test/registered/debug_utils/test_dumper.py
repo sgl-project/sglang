@@ -3069,8 +3069,8 @@ class TestGrafterDistributed:
         """User transform doubles the received tensor before copy_."""
         module_name = "_xform_user_basic"
         (tmp_path / f"{module_name}.py").write_text(
-            "def transform(received_list, target):\n"
-            "    return received_list[0] * 2\n"
+            "def transform(graft_input):\n"
+            "    return graft_input.received_list[0] * 2\n"
         )
         graft_port = find_available_port(29610)
         _run_graft_test(
@@ -3145,7 +3145,7 @@ class TestGrafterDistributed:
         grafter logs and skips the copy_, leaving target unchanged."""
         module_name = "_xform_throws"
         (tmp_path / f"{module_name}.py").write_text(
-            "def transform(received_list, target):\n"
+            "def transform(graft_input):\n"
             "    raise RuntimeError('intentional test error from user transform')\n"
         )
         graft_port = find_available_port(29635)
@@ -3200,8 +3200,8 @@ class TestGrafterDistributed:
         module_name = "_xform_returns_wrong_shape"
         (tmp_path / f"{module_name}.py").write_text(
             "import torch\n"
-            "def transform(received_list, target):\n"
-            "    return torch.zeros(99, device=target.device)\n"
+            "def transform(graft_input):\n"
+            "    return torch.zeros(99, device=graft_input.target.device)\n"
         )
         graft_port = find_available_port(29665)
         _run_graft_test(
@@ -3241,6 +3241,84 @@ class TestGrafterDistributed:
                 output = captured.getvalue()
                 assert "transform/copy_ raised" in output, output
                 assert "Traceback (most recent call last)" in output, output
+        finally:
+            if grafter._pg is not None:
+                dist.destroy_process_group(grafter._pg)
+
+    def test_extras_flow_to_recv_transform(self, tmp_path: Path):
+        """Sender attaches per-call grafter_extras; recv transform reads them
+        and uses them to compute the override value."""
+        module_name = "_xform_uses_extras"
+        (tmp_path / f"{module_name}.py").write_text(
+            "import torch\n"
+            "def transform(graft_input):\n"
+            "    fill = graft_input.received_extras_list[0]['fill_value']\n"
+            "    return torch.full_like(graft_input.target, fill)\n"
+        )
+        graft_port = find_available_port(29645)
+        _run_graft_test(
+            self._test_extras_func,
+            graft_port=graft_port,
+            group_name="grafter_extras",
+            transform_dir=str(tmp_path),
+            transform_path=f"{module_name}.transform",
+        )
+
+    @staticmethod
+    def _test_extras_func(rank, graft_port, group_name, transform_dir, transform_path):
+        sys.path.insert(0, transform_dir)
+        grafter = _Grafter(
+            config=_make_grafter_test_config(
+                rank=rank,
+                graft_port=graft_port,
+                group_name=group_name,
+                transform_path=transform_path,
+            )
+        )
+        try:
+            if rank == 0:
+                tensor = torch.tensor([1.0, 2.0, 3.0], device="cuda:0")
+                grafter.maybe_intercept(
+                    value=tensor,
+                    tags={"name": "x"},
+                    extras={"fill_value": 42.0},
+                )
+            else:
+                target = torch.zeros(3, device="cuda:1")
+                grafter.maybe_intercept(value=target, tags={"name": "x"})
+                assert target.tolist() == [42.0, 42.0, 42.0], target.tolist()
+        finally:
+            if grafter._pg is not None:
+                dist.destroy_process_group(grafter._pg)
+
+    def test_extras_default_none_flow(self):
+        """When the sender omits `grafter_extras`, the recv transform sees a
+        list of Nones."""
+        graft_port = find_available_port(29650)
+        _run_graft_test(
+            self._test_extras_none_func,
+            graft_port=graft_port,
+            group_name="grafter_extras_none",
+        )
+
+    @staticmethod
+    def _test_extras_none_func(rank, graft_port, group_name):
+        grafter = _Grafter(
+            config=_make_grafter_test_config(
+                rank=rank, graft_port=graft_port, group_name=group_name
+            )
+        )
+        try:
+            if rank == 0:
+                tensor = torch.tensor([1.0, 2.0, 3.0], device="cuda:0")
+                grafter.maybe_intercept(value=tensor, tags={"name": "x"})
+            else:
+                target = torch.zeros(3, device="cuda:1")
+                with _capture_stdout() as captured:
+                    grafter.maybe_intercept(value=target, tags={"name": "x"})
+                output = captured.getvalue()
+                assert "sender_extras=[None]" in output, output
+                assert target.tolist() == [1.0, 2.0, 3.0], target.tolist()
         finally:
             if grafter._pg is not None:
                 dist.destroy_process_group(grafter._pg)
@@ -3357,13 +3435,13 @@ class TestGrafterMultiRankCpu:
         module_name = "_xform_assert_4_senders"
         (tmp_path / f"{module_name}.py").write_text(
             "import torch\n"
-            "def transform(received_list, target):\n"
-            "    rl = received_list\n"
+            "def transform(graft_input):\n"
+            "    rl = graft_input.received_list\n"
             "    assert len(rl) == 4, f'expected 4 senders, got {len(rl)}'\n"
             "    for i, t in enumerate(rl):\n"
             "        v = float(t.flatten()[0].item())\n"
             "        assert v == float(i), f'rl[{i}][0]={v}, want {float(i)}'\n"
-            "    return torch.full_like(target, 999.0)\n"
+            "    return torch.full_like(graft_input.target, 999.0)\n"
         )
         graft_port = find_available_port(29655)
         _run_graft_test_cpu_multi(
@@ -3408,13 +3486,13 @@ class TestGrafterMultiRankCpu:
         module_name = "_xform_assert_2_senders_t2b"
         (tmp_path / f"{module_name}.py").write_text(
             "import torch\n"
-            "def transform(received_list, target):\n"
-            "    rl = received_list\n"
+            "def transform(graft_input):\n"
+            "    rl = graft_input.received_list\n"
             "    assert len(rl) == 2, f'expected 2 senders, got {len(rl)}'\n"
             "    for i, t in enumerate(rl):\n"
             "        v = float(t.flatten()[0].item())\n"
             "        assert v == float(i + 100), f'rl[{i}][0]={v}'\n"
-            "    return torch.full_like(target, 7.0)\n"
+            "    return torch.full_like(graft_input.target, 7.0)\n"
         )
         graft_port = find_available_port(29670)
         _run_graft_test_cpu_multi(
@@ -3503,11 +3581,11 @@ class TestGrafterMultiRankCpu:
         module_name = "_xform_concat_mixed_shape"
         (tmp_path / f"{module_name}.py").write_text(
             "import torch\n"
-            "def transform(received_list, target):\n"
-            "    expected_shapes = [(i + 1,) for i in range(len(received_list))]\n"
-            "    actual_shapes = [tuple(t.shape) for t in received_list]\n"
+            "def transform(graft_input):\n"
+            "    expected_shapes = [(i + 1,) for i in range(len(graft_input.received_list))]\n"
+            "    actual_shapes = [tuple(t.shape) for t in graft_input.received_list]\n"
             "    assert actual_shapes == expected_shapes, actual_shapes\n"
-            "    return torch.cat(received_list)\n"
+            "    return torch.cat(graft_input.received_list)\n"
         )
         graft_port = find_available_port(29680)
         _run_graft_test_cpu_multi(
