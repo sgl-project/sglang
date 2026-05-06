@@ -21,10 +21,14 @@ from sglang.srt.models.deepseek_common.utils import (
     _is_cuda,
     _is_gfx95_supported,
     _is_hip,
+    _is_musa,
     _use_aiter,
     _use_aiter_gfx95,
 )
 from sglang.srt.server_args import get_global_server_args
+from sglang.srt.state_capturer.indexer_topk import (
+    maybe_capture_indexer_topk,
+)
 from sglang.srt.utils import BumpAllocator
 
 if TYPE_CHECKING:
@@ -204,7 +208,11 @@ class DeepseekMLAForwardMixin:
                         layer_id=self.layer_id,
                     )
                 else:
-                    topk_indices = prev_topk_indices
+                    # skip_topk reuses prev layer's indices; mirror into this
+                    # layer's slot so the captured buffer matches what's used.
+                    topk_indices = maybe_capture_indexer_topk(
+                        self.layer_id, prev_topk_indices
+                    )
                 current_stream.wait_stream(self.alt_stream)
             else:
                 k_nope = k_nope.unsqueeze(1)
@@ -219,7 +227,9 @@ class DeepseekMLAForwardMixin:
                             layer_id=self.layer_id,
                         )
                     else:
-                        topk_indices = prev_topk_indices
+                        topk_indices = maybe_capture_indexer_topk(
+                            self.layer_id, prev_topk_indices
+                        )
         else:
             q = self.q_proj(hidden_states)[0].view(
                 -1, self.num_local_heads, self.qk_head_dim
@@ -553,6 +563,11 @@ class DeepseekMLAForwardMixin:
                     torch.bfloat16,
                 )
                 attn_bmm_output = attn_bmm_output.transpose(0, 1).flatten(1, 2)
+        elif _is_musa:
+            attn_bmm_output = torch.bmm(
+                attn_output.to(torch.bfloat16).transpose(0, 1), self.w_vc
+            )
+            attn_bmm_output = attn_bmm_output.transpose(0, 1).flatten(1, 2)
         else:
             if is_in_piecewise_cuda_graph():
                 # torch dynamo requires out= op was called where output tensor was non-contiguous

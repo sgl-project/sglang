@@ -129,6 +129,10 @@ def get_model_config(
         E = config.num_experts // ep_size
         topk = config.num_experts_per_tok
         intermediate_size = config.moe_intermediate_size
+    elif architecture == "HYV3ForCausalLM":
+        E = config.num_experts // ep_size
+        topk = config.num_experts_per_tok
+        intermediate_size = config.expert_hidden_dim
     elif architecture == "NemotronHForCausalLM":
         E = config.n_routed_experts // ep_size
         topk = config.num_experts_per_tok
@@ -137,6 +141,10 @@ def get_model_config(
     elif architecture == "Gemma4ForConditionalGeneration":
         E = config.num_experts // ep_size
         topk = config.top_k_experts
+        intermediate_size = config.moe_intermediate_size
+    elif architecture == "Lfm2MoeForCausalLM":
+        E = config.num_experts // ep_size
+        topk = config.num_experts_per_tok
         intermediate_size = config.moe_intermediate_size
     else:
         # Default: Mixtral

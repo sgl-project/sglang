@@ -147,6 +147,7 @@ ALLOC_MEMORY_FUNCS = defaultdict(
     lambda: alloc_with_host_register,
     {
         "npu": alloc_with_pin_memory,
+        "musa": alloc_with_pin_memory,
     },
 )
 

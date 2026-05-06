@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING, Any, Callable, Optional
 
-from sglang.srt.mem_cache.hicache_storage import PoolName
+from sglang.srt.mem_cache.hicache_storage import PoolHitPolicy, PoolName
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
 )
@@ -17,6 +17,8 @@ from sglang.srt.mem_cache.memory_pool_host import (
 )
 
 if TYPE_CHECKING:
+    import torch
+
     from sglang.srt.mem_cache.cache_init_params import CacheInitParams
     from sglang.srt.mem_cache.hi_mamba_radix_cache import HiMambaRadixCache
     from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
@@ -94,6 +96,8 @@ def build_kv_only_stack(
     page_size: int,
     tp_group,
     load_cache_event,
+    attn_cp_group: Optional["torch.distributed.ProcessGroup"] = None,
+    attn_tp_group: Optional["torch.distributed.ProcessGroup"] = None,
     storage_backend: Optional[str],
     use_mla: bool,
     override_kv_cache_dim: Optional[int] = None,
@@ -131,6 +135,8 @@ def build_kv_only_stack(
         page_size,
         tp_group,
         load_cache_event=load_cache_event,
+        attn_cp_group=attn_cp_group,
+        attn_tp_group=attn_tp_group,
         write_policy=server_args.hicache_write_policy,
         io_backend=server_args.hicache_io_backend,
         storage_backend=storage_backend,
@@ -158,6 +164,8 @@ def build_hybrid_mamba_stack(
     page_size: int,
     tp_group,
     load_cache_event,
+    attn_cp_group: Optional["torch.distributed.ProcessGroup"] = None,
+    attn_tp_group: Optional["torch.distributed.ProcessGroup"] = None,
     storage_backend: Optional[str],
     use_mla: bool,
     host_mamba_evict_fn: Optional[Callable[[int], Any]] = None,
@@ -211,6 +219,8 @@ def build_hybrid_mamba_stack(
         page_size,
         tp_group,
         load_cache_event=load_cache_event,
+        attn_cp_group=attn_cp_group,
+        attn_tp_group=attn_tp_group,
         write_policy=server_args.hicache_write_policy,
         io_backend=server_args.hicache_io_backend,
         storage_backend=storage_backend,
@@ -237,6 +247,8 @@ def build_shared_anchor_stack(
     page_size: int,
     tp_group,
     load_cache_event,
+    attn_cp_group: Optional["torch.distributed.ProcessGroup"] = None,
+    attn_tp_group: Optional["torch.distributed.ProcessGroup"] = None,
     storage_backend: Optional[str],
     use_mla: bool,
     override_kv_cache_dim: Optional[int] = None,
@@ -284,6 +296,8 @@ def build_shared_anchor_stack(
         page_size,
         tp_group,
         load_cache_event=load_cache_event,
+        attn_cp_group=attn_cp_group,
+        attn_tp_group=attn_tp_group,
         write_policy=server_args.hicache_write_policy,
         io_backend=server_args.hicache_io_backend,
         storage_backend=storage_backend,
@@ -306,10 +320,16 @@ def attach_hybrid_pool_to_unified_cache(
     server_args: ServerArgs,
     *,
     load_cache_event,
+    attn_cp_group: Optional["torch.distributed.ProcessGroup"] = None,
+    attn_tp_group: Optional["torch.distributed.ProcessGroup"] = None,
 ) -> None:
     """Attach HostPoolGroup + HybridCacheController to UnifiedRadixCache."""
     from sglang.srt.mem_cache.base_prefix_cache import EvictParams
-    from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, MLATokenToKVPool
+    from sglang.srt.mem_cache.memory_pool import (
+        HybridLinearKVPool,
+        MLATokenToKVPool,
+        NSATokenToKVPool,
+    )
     from sglang.srt.mem_cache.unified_cache_components import ComponentType
 
     try:
@@ -329,6 +349,7 @@ def attach_hybrid_pool_to_unified_cache(
             }, "Non-hybrid KV pool currently only supports FULL-only UnifiedRadixCache."
 
         mamba_stack = isinstance(kvcache, HybridLinearKVPool)
+        nsa_stack = isinstance(kvcache, NSATokenToKVPool)
         if mamba_stack:
             full_layer_mapping = dict(kvcache.full_attention_layer_id_mapping)
             mamba_layer_mapping = dict(params.req_to_token_pool.mamba_map)
@@ -342,6 +363,8 @@ def attach_hybrid_pool_to_unified_cache(
                 page_size=cache.page_size,
                 tp_group=params.tp_cache_group,
                 load_cache_event=load_cache_event,
+                attn_cp_group=attn_cp_group,
+                attn_tp_group=attn_tp_group,
                 storage_backend=None,
                 use_mla=use_mla,
                 host_mamba_evict_fn=lambda n: cache.evict_host(n, ComponentType.MAMBA),
@@ -363,6 +386,45 @@ def attach_hybrid_pool_to_unified_cache(
                 cache_controller.layer_done_counter
             )
             transfer_layer_num = len(full_layer_mapping | mamba_layer_mapping)
+        elif nsa_stack:
+            full_layer_mapping = {
+                layer_id: layer_id for layer_id in range(full_kv_pool.layer_num)
+            }
+            host_pool_group, cache_controller = build_shared_anchor_stack(
+                params=params,
+                server_args=server_args,
+                kv_pool=full_kv_pool,
+                shared_pool_name=PoolName.INDEXER,
+                full_layer_mapping=full_layer_mapping,
+                page_size=cache.page_size,
+                tp_group=params.tp_cache_group,
+                load_cache_event=load_cache_event,
+                storage_backend=None,
+                use_mla=use_mla,
+                shared_host_pool_factory=lambda kv_host_pool: NSAIndexerPoolHost(
+                    full_kv_pool,
+                    kv_host_pool,
+                    server_args.hicache_mem_layout,
+                    allocator_type=server_args.hicache_storage_backend,
+                ),
+                pp_rank=params.pp_rank,
+                pp_size=params.pp_size,
+                attn_cp_rank=params.attn_cp_rank,
+                attn_cp_size=params.attn_cp_size,
+            )
+            cache.full_kv_pool_host = host_pool_group.get_pool(PoolName.KV)
+            cache.host_pool_group = host_pool_group
+            cache.cache_controller = cache_controller
+            # Register the NSA indexer pool as sharing anchor-KV indices so
+            # HiCache backup/load emits its PoolTransfer together with KV.
+            cache.register_hicache_anchor_kv_shared_indices_pool(
+                PoolName.INDEXER,
+                hit_policy=PoolHitPolicy.ALL_PAGES,
+            )
+            cache.components[ComponentType.FULL]._full_kv_pool_host = (
+                cache.full_kv_pool_host
+            )
+            transfer_layer_num = len(full_layer_mapping)
         else:
             full_layer_mapping = {
                 layer_id: layer_id for layer_id in range(full_kv_pool.layer_num)
@@ -375,6 +437,8 @@ def attach_hybrid_pool_to_unified_cache(
                 page_size=cache.page_size,
                 tp_group=params.tp_cache_group,
                 load_cache_event=load_cache_event,
+                attn_cp_group=attn_cp_group,
+                attn_tp_group=attn_tp_group,
                 storage_backend=None,
                 use_mla=use_mla,
                 pp_rank=params.pp_rank,
@@ -394,7 +458,7 @@ def attach_hybrid_pool_to_unified_cache(
 
         logger.info(
             "Attached hybrid pool stack to UnifiedRadixCache: pools=%s, transfer_layer_num=%s",
-            "KV + MAMBA" if mamba_stack else "KV",
+            "KV + MAMBA" if mamba_stack else "KV + INDEXER" if nsa_stack else "KV",
             transfer_layer_num,
         )
     except Exception:
@@ -411,6 +475,8 @@ def attach_hybrid_nsa_pool_to_hiradix_cache(
     prefetch_threshold: int,
     enable_storage_metrics: bool,
     load_cache_event,
+    attn_cp_group: Optional["torch.distributed.ProcessGroup"] = None,
+    attn_tp_group: Optional["torch.distributed.ProcessGroup"] = None,
 ) -> None:
     """Attach HostPoolGroup (KV + indexer) + HybridCacheController for HiRadixCache.
 
@@ -428,6 +494,8 @@ def attach_hybrid_nsa_pool_to_hiradix_cache(
             page_size=radix_cache.page_size,
             tp_group=radix_cache.tp_group,
             load_cache_event=load_cache_event,
+            attn_cp_group=attn_cp_group,
+            attn_tp_group=attn_tp_group,
             storage_backend=server_args.hicache_storage_backend,
             use_mla=True,
             prefetch_threshold=prefetch_threshold,
@@ -467,6 +535,8 @@ def attach_hybrid_pool_to_mamba_cache(
     prefetch_threshold: int,
     load_cache_event,
     enable_storage_metrics: bool = False,
+    attn_cp_group: Optional["torch.distributed.ProcessGroup"] = None,
+    attn_tp_group: Optional["torch.distributed.ProcessGroup"] = None,
 ) -> None:
     """Attach HostPoolGroup (KV + Mamba) + HybridCacheController for HiMambaRadixCache.
 
@@ -487,6 +557,8 @@ def attach_hybrid_pool_to_mamba_cache(
             page_size=params.page_size,
             tp_group=params.tp_cache_group,
             load_cache_event=load_cache_event,
+            attn_cp_group=attn_cp_group,
+            attn_tp_group=attn_tp_group,
             storage_backend=server_args.hicache_storage_backend,
             use_mla=hybrid_kv.use_mla,
             host_mamba_evict_fn=mamba_cache.evict_mamba_host,

@@ -54,7 +54,7 @@ from sglang.srt.disaggregation.base import BaseKVSender
 from sglang.srt.disaggregation.decode_schedule_batch_mixin import (
     ScheduleBatchDisaggregationDecodeMixin,
 )
-from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST, DisaggregationMode
 from sglang.srt.distributed.parallel_state import get_tensor_model_parallel_rank
 from sglang.srt.dllm.mixin.req import ReqDllmMixin
 from sglang.srt.environ import envs
@@ -385,6 +385,11 @@ class MultimodalProcessorOutput:
     mrope_positions: Optional[torch.Tensor] = None
     mrope_position_delta: Optional[torch.Tensor] = None
 
+    # Moss-VL related
+    vision_position_ids: Optional[torch.Tensor] = None
+    media_nums_per_sample: Optional[List[int]] = None
+    visible_frame_counts: Optional[torch.Tensor] = None
+
     # for transformers-compatibility
     token_type_ids: Optional[torch.Tensor] = None
 
@@ -404,6 +409,9 @@ class MultimodalProcessorOutput:
             audio_end_id=d.get("audio_end_id"),
             mrope_positions=d.get("mrope_positions"),
             mrope_position_delta=d.get("mrope_position_delta"),
+            vision_position_ids=d.get("vision_position_ids"),
+            media_nums_per_sample=d.get("media_nums_per_sample"),
+            visible_frame_counts=d.get("visible_frame_counts"),
         )
 
 
@@ -435,6 +443,11 @@ class MultimodalInputs:
     mrope_positions: Optional[torch.Tensor] = None
     mrope_position_delta: Optional[torch.Tensor] = None
     mrope_position_delta_repeated_cache: Optional[torch.Tensor] = None
+
+    # Moss-VL related
+    vision_position_ids: Optional[torch.Tensor] = None
+    media_nums_per_sample: Optional[List[int]] = None
+    visible_frame_counts: Optional[torch.Tensor] = None
 
     def release_features(self):
         """Release feature tensors to free GPU memory."""
@@ -494,6 +507,9 @@ class MultimodalInputs:
             "audio_start_id",
             "audio_end_id",
             "audio_token_id",
+            "vision_position_ids",
+            "media_nums_per_sample",
+            "visible_frame_counts",
         ]
         for arg in optional_args:
             val = getattr(obj, arg, None)
@@ -579,6 +595,7 @@ class Req(ReqDllmMixin):
         require_reasoning: bool = False,
         return_hidden_states: bool = False,
         return_routed_experts: bool = False,
+        return_indexer_topk: bool = False,
         eos_token_ids: Optional[Set[int]] = None,
         bootstrap_host: Optional[str] = None,
         bootstrap_port: Optional[int] = None,
@@ -798,6 +815,11 @@ class Req(ReqDllmMixin):
         self.routed_experts: Optional[torch.Tensor] = (
             None  # cpu tensor: shape (seqlen, topk)
         )
+
+        self.return_indexer_topk = return_indexer_topk
+        self.indexer_topk: Optional[torch.Tensor] = (
+            None  # cpu tensor: shape (seqlen, num_indexer_layers, index_topk)
+        )
         # Customized info
         self.customized_info: Optional[Dict[str, List[Any]]] = None
 
@@ -823,13 +845,11 @@ class Req(ReqDllmMixin):
             False  # Track if breakdown was already computed
         )
 
-        # The number of verification forward passes in the speculative decoding.
-        # This is used to compute the average acceptance length per request.
+        # Per-request count of verification forward passes.
         self.spec_verify_ct = 0
 
-        # The number of accepted tokens in speculative decoding for this request.
-        # This is used to compute the acceptance rate and average acceptance length per request.
-        self.spec_accepted_tokens = 0
+        # Per-request count of accepted draft tokens (excludes the bonus token).
+        self.spec_accepted_drafts = 0
 
         # Acceptance histogram for speculative decoding.
         # List index = number of accepted tokens in a step, List value = count of steps with that many accepted tokens.
@@ -854,6 +874,7 @@ class Req(ReqDllmMixin):
         self.bootstrap_host: str = bootstrap_host
         self.bootstrap_port: Optional[int] = bootstrap_port
         self.bootstrap_room: Optional[int] = bootstrap_room
+        self.skip_radix_cache_insert = bootstrap_host == FAKE_BOOTSTRAP_HOST
         self.disagg_kv_sender: Optional[BaseKVSender] = None
 
         self.routed_dp_rank: Optional[int] = routed_dp_rank
@@ -1214,7 +1235,9 @@ class Req(ReqDllmMixin):
 
         self.prefix_indices = torch.empty((0,), dtype=torch.int64)
         self.routed_experts = None
+        self.indexer_topk = None
         self.last_node = None
+        self.cache_protected_len = 0
         self.swa_uuid_for_lock = None
         self.extend_input_len = 0
         self.is_retracted = True
@@ -1250,13 +1273,19 @@ class Req(ReqDllmMixin):
         token_indices = req_to_token_pool.req_to_token[
             self.req_pool_idx, : self.seqlen - 1
         ]
-        self.kv_cache_cpu = token_to_kv_pool_allocator.get_cpu_copy(token_indices)
+        # Copies over both the kv cache and mamba state if available
+        self.kv_cache_cpu = token_to_kv_pool_allocator.get_cpu_copy(
+            token_indices, mamba_indices=self.mamba_pool_idx
+        )
 
     def load_kv_cache(self, req_to_token_pool, token_to_kv_pool_allocator):
         token_indices = req_to_token_pool.req_to_token[
             self.req_pool_idx, : self.seqlen - 1
         ]
-        token_to_kv_pool_allocator.load_cpu_copy(self.kv_cache_cpu, token_indices)
+        # Loads both the kv cache and mamba state if exists
+        token_to_kv_pool_allocator.load_cpu_copy(
+            self.kv_cache_cpu, token_indices, mamba_indices=self.mamba_pool_idx
+        )
         del self.kv_cache_cpu
 
     def log_time_stats(self):
@@ -1447,6 +1476,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # Whether to return captured experts
     return_routed_experts: bool = False
 
+    return_indexer_topk: bool = False
+
     # Whether this batch is prefill-only (no token generation needed)
     is_prefill_only: bool = False
 
@@ -1500,6 +1531,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             spec_algorithm=spec_algorithm,
             return_hidden_states=any(req.return_hidden_states for req in reqs),
             return_routed_experts=any(req.return_routed_experts for req in reqs),
+            return_indexer_topk=any(req.return_indexer_topk for req in reqs),
             is_prefill_only=all(req.is_prefill_only for req in reqs),
             chunked_req=chunked_req,
             dllm_config=dllm_config,
@@ -1588,6 +1620,49 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         assert (
             len(self.out_cache_loc) == self.extend_num_tokens
         ), f"Expected {len(self.out_cache_loc)}, got {self.extend_num_tokens}"
+
+        if self.extend_input_logprob_token_ids is not None:
+            new_token_ids_parts = []
+            offset = 0
+            for i, req in enumerate(self.reqs):
+                encoder_len = self.encoder_lens_cpu[i]
+                old_start_len = self.extend_logprob_start_lens[i]
+                old_contribution = req.extend_input_len - old_start_len
+
+                if len(req.prefix_indices) < encoder_len:
+                    tokens_to_strip = max(0, encoder_len - old_start_len)
+                    new_token_ids_parts.append(
+                        self.extend_input_logprob_token_ids[
+                            offset + tokens_to_strip : offset + old_contribution
+                        ]
+                    )
+                    self.extend_logprob_start_lens[i] = max(
+                        0, old_start_len - encoder_len
+                    )
+                else:
+                    new_token_ids_parts.append(
+                        self.extend_input_logprob_token_ids[
+                            offset : offset + old_contribution
+                        ]
+                    )
+
+                offset += old_contribution
+
+            if new_token_ids_parts:
+                self.extend_input_logprob_token_ids = torch.cat(new_token_ids_parts)
+            else:
+                self.extend_input_logprob_token_ids = None
+
+        for i, req in enumerate(self.reqs):
+            encoder_len = self.encoder_lens_cpu[i]
+            if encoder_len == 0:
+                continue
+            if len(req.prefix_indices) < encoder_len:
+                req.extend_input_len -= encoder_len
+                req.extend_logprob_start_len = max(
+                    0, req.extend_logprob_start_len - encoder_len
+                )
+            req.logprob_start_len = max(req.logprob_start_len, encoder_len)
 
     def prepare_for_extend(self):
         self.forward_mode = ForwardMode.EXTEND
@@ -1825,6 +1900,17 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         )
         self.replace_embeds = replace_embeds_tensor
         self.replace_positions = replace_positions_tensor
+        for mm_input in multimodal_inputs:
+            if mm_input is None:
+                continue
+            if isinstance(mm_input.vision_position_ids, torch.Tensor):
+                mm_input.vision_position_ids = mm_input.vision_position_ids.to(
+                    self.device, non_blocking=True
+                )
+            if isinstance(mm_input.visible_frame_counts, torch.Tensor):
+                mm_input.visible_frame_counts = mm_input.visible_frame_counts.to(
+                    self.device, non_blocking=True
+                )
         self.multimodal_inputs = multimodal_inputs
         self.token_type_ids = token_type_ids_tensor
         self.seq_lens_sum = sum(seq_lens)
