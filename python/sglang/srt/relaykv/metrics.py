@@ -8168,6 +8168,83 @@ def _relaykv_req_to_token_value_shape_observation_for_smoke(
     }
 
 
+def _relaykv_try_scalar_tensor_item_to_int_for_smoke(
+    value: Any,
+    *,
+    allow_scalar_tensor_item_conversion: bool,
+) -> tuple[int | None, dict[str, Any]]:
+    observation = _relaykv_req_to_token_value_shape_observation_for_smoke(value)
+    conversion_metadata = {
+        "scalar_tensor_item_conversion_enabled": allow_scalar_tensor_item_conversion,
+        "scalar_tensor_item_conversion_attempted": False,
+        "scalar_tensor_item_conversion_succeeded": False,
+        "scalar_tensor_item_conversion_blocked_reason": None,
+        "scalar_tensor_item_conversion_count": 0,
+        "scalar_tensor_item_conversion_dtype": observation.get("value_dtype"),
+        "scalar_tensor_item_conversion_shape": observation.get("value_shape"),
+        "scalar_tensor_item_conversion_device": observation.get("value_device"),
+    }
+
+    if allow_scalar_tensor_item_conversion is not True:
+        conversion_metadata["scalar_tensor_item_conversion_blocked_reason"] = (
+            "scalar_tensor_item_conversion_not_enabled"
+        )
+        return None, conversion_metadata
+
+    if observation.get("value_is_tensor_like") is not True:
+        conversion_metadata["scalar_tensor_item_conversion_blocked_reason"] = (
+            "scalar_tensor_item_conversion_not_tensor_like"
+        )
+        return None, conversion_metadata
+
+    if not (
+        observation.get("value_is_scalar_like") is True
+        or observation.get("value_is_one_element_like") is True
+    ):
+        conversion_metadata["scalar_tensor_item_conversion_blocked_reason"] = (
+            "scalar_tensor_item_conversion_shape_not_scalar_or_one_element"
+        )
+        return None, conversion_metadata
+
+    try:
+        item_attr = getattr(value, "item")
+    except Exception:
+        conversion_metadata["scalar_tensor_item_conversion_blocked_reason"] = (
+            "scalar_tensor_item_conversion_item_missing"
+        )
+        return None, conversion_metadata
+    if not callable(item_attr):
+        conversion_metadata["scalar_tensor_item_conversion_blocked_reason"] = (
+            "scalar_tensor_item_conversion_item_missing"
+        )
+        return None, conversion_metadata
+
+    conversion_metadata["scalar_tensor_item_conversion_attempted"] = True
+    try:
+        item_value = item_attr()
+    except Exception:
+        conversion_metadata["scalar_tensor_item_conversion_blocked_reason"] = (
+            "scalar_tensor_item_conversion_item_failed"
+        )
+        return None, conversion_metadata
+
+    if isinstance(item_value, bool):
+        conversion_metadata["scalar_tensor_item_conversion_blocked_reason"] = (
+            "scalar_tensor_item_conversion_item_not_int"
+        )
+        return None, conversion_metadata
+    if not isinstance(item_value, int):
+        conversion_metadata["scalar_tensor_item_conversion_blocked_reason"] = (
+            "scalar_tensor_item_conversion_item_not_int"
+        )
+        return None, conversion_metadata
+
+    conversion_metadata["scalar_tensor_item_conversion_succeeded"] = True
+    conversion_metadata["scalar_tensor_item_conversion_count"] = 1
+    conversion_metadata["scalar_tensor_item_conversion_blocked_reason"] = None
+    return item_value, conversion_metadata
+
+
 def build_relaykv_req_to_token_pool_value_shape_inspection_results_for_smoke(
     *,
     runtime_observation_payloads: Any = None,
@@ -8422,6 +8499,7 @@ def build_relaykv_real_req_to_token_pool_bounded_read_results_for_smoke(
     runtime_observation_payloads: Any = None,
     req_to_token_pool_object: Any = None,
     read_req_to_token_pool: bool = False,
+    allow_scalar_tensor_item_conversion: bool = False,
     max_tokens_per_request: int = 256,
     max_total_tokens: int = 1024,
     source_path: str | None = None,
@@ -8456,6 +8534,14 @@ def build_relaykv_real_req_to_token_pool_bounded_read_results_for_smoke(
                 "blocked_reason": "req_to_token_pool_read_not_enabled",
                 "source_path": source_path,
                 "source_mutated": False,
+                "scalar_tensor_item_conversion_enabled": allow_scalar_tensor_item_conversion,
+                "scalar_tensor_item_conversion_attempted": False,
+                "scalar_tensor_item_conversion_succeeded": False,
+                "scalar_tensor_item_conversion_blocked_reason": None,
+                "scalar_tensor_item_conversion_count": 0,
+                "scalar_tensor_item_conversion_dtype": None,
+                "scalar_tensor_item_conversion_shape": None,
+                "scalar_tensor_item_conversion_device": None,
                 "req_to_token_read_count": 0,
                 "actual_req_to_token_pool_read_count": 0,
                 "token_to_kv_pool_read_count": 0,
@@ -8495,6 +8581,14 @@ def build_relaykv_real_req_to_token_pool_bounded_read_results_for_smoke(
                 "blocked_reason": "runtime_observation_payloads_missing",
                 "source_path": source_path,
                 "source_mutated": False,
+                "scalar_tensor_item_conversion_enabled": allow_scalar_tensor_item_conversion,
+                "scalar_tensor_item_conversion_attempted": False,
+                "scalar_tensor_item_conversion_succeeded": False,
+                "scalar_tensor_item_conversion_blocked_reason": None,
+                "scalar_tensor_item_conversion_count": 0,
+                "scalar_tensor_item_conversion_dtype": None,
+                "scalar_tensor_item_conversion_shape": None,
+                "scalar_tensor_item_conversion_device": None,
                 "req_to_token_read_count": 0,
                 "actual_req_to_token_pool_read_count": 0,
                 "token_to_kv_pool_read_count": 0,
@@ -8534,6 +8628,14 @@ def build_relaykv_real_req_to_token_pool_bounded_read_results_for_smoke(
                 "blocked_reason": "req_to_token_pool_object_missing",
                 "source_path": source_path,
                 "source_mutated": False,
+                "scalar_tensor_item_conversion_enabled": allow_scalar_tensor_item_conversion,
+                "scalar_tensor_item_conversion_attempted": False,
+                "scalar_tensor_item_conversion_succeeded": False,
+                "scalar_tensor_item_conversion_blocked_reason": None,
+                "scalar_tensor_item_conversion_count": 0,
+                "scalar_tensor_item_conversion_dtype": None,
+                "scalar_tensor_item_conversion_shape": None,
+                "scalar_tensor_item_conversion_device": None,
                 "req_to_token_read_count": 0,
                 "actual_req_to_token_pool_read_count": 0,
                 "token_to_kv_pool_read_count": 0,
@@ -8573,6 +8675,14 @@ def build_relaykv_real_req_to_token_pool_bounded_read_results_for_smoke(
                 "blocked_reason": "runtime_observation_payloads_missing",
                 "source_path": source_path,
                 "source_mutated": False,
+                "scalar_tensor_item_conversion_enabled": allow_scalar_tensor_item_conversion,
+                "scalar_tensor_item_conversion_attempted": False,
+                "scalar_tensor_item_conversion_succeeded": False,
+                "scalar_tensor_item_conversion_blocked_reason": None,
+                "scalar_tensor_item_conversion_count": 0,
+                "scalar_tensor_item_conversion_dtype": None,
+                "scalar_tensor_item_conversion_shape": None,
+                "scalar_tensor_item_conversion_device": None,
                 "req_to_token_read_count": 0,
                 "actual_req_to_token_pool_read_count": 0,
                 "token_to_kv_pool_read_count": 0,
@@ -8628,6 +8738,13 @@ def build_relaykv_real_req_to_token_pool_bounded_read_results_for_smoke(
                 blocked_reason = "max_total_tokens_exceeded"
 
         read_values: list[int] = []
+        scalar_tensor_item_conversion_attempted = False
+        scalar_tensor_item_conversion_succeeded = False
+        scalar_tensor_item_conversion_blocked_reason = None
+        scalar_tensor_item_conversion_count = 0
+        scalar_tensor_item_conversion_dtype = None
+        scalar_tensor_item_conversion_shape = None
+        scalar_tensor_item_conversion_device = None
         if blocked_reason is None:
             assert token_positions is not None
             for token_position in token_positions:
@@ -8640,11 +8757,59 @@ def build_relaykv_real_req_to_token_pool_bounded_read_results_for_smoke(
                     blocked_reason = value_error
                     read_values = []
                     break
-                if isinstance(value, bool) or not isinstance(value, int):
-                    blocked_reason = "req_to_token_pool_value_not_int"
-                    read_values = []
-                    break
-                read_values.append(value)
+                converted_value = None
+                if isinstance(value, int) and not isinstance(value, bool):
+                    converted_value = value
+                else:
+                    converted_value, conversion_metadata = (
+                        _relaykv_try_scalar_tensor_item_to_int_for_smoke(
+                            value,
+                            allow_scalar_tensor_item_conversion=allow_scalar_tensor_item_conversion,
+                        )
+                    )
+                    scalar_tensor_item_conversion_attempted = (
+                        scalar_tensor_item_conversion_attempted
+                        or bool(
+                            conversion_metadata.get(
+                                "scalar_tensor_item_conversion_attempted"
+                            )
+                        )
+                    )
+                    scalar_tensor_item_conversion_succeeded = (
+                        scalar_tensor_item_conversion_succeeded
+                        or bool(
+                            conversion_metadata.get(
+                                "scalar_tensor_item_conversion_succeeded"
+                            )
+                        )
+                    )
+                    scalar_tensor_item_conversion_count += int(
+                        conversion_metadata.get("scalar_tensor_item_conversion_count")
+                        or 0
+                    )
+                    if scalar_tensor_item_conversion_dtype is None:
+                        scalar_tensor_item_conversion_dtype = conversion_metadata.get(
+                            "scalar_tensor_item_conversion_dtype"
+                        )
+                    if scalar_tensor_item_conversion_shape is None:
+                        scalar_tensor_item_conversion_shape = conversion_metadata.get(
+                            "scalar_tensor_item_conversion_shape"
+                        )
+                    if scalar_tensor_item_conversion_device is None:
+                        scalar_tensor_item_conversion_device = conversion_metadata.get(
+                            "scalar_tensor_item_conversion_device"
+                        )
+                    blocked_conversion_reason = conversion_metadata.get(
+                        "scalar_tensor_item_conversion_blocked_reason"
+                    )
+                    if converted_value is None:
+                        scalar_tensor_item_conversion_blocked_reason = (
+                            blocked_conversion_reason
+                        )
+                        blocked_reason = "req_to_token_pool_value_not_int"
+                        read_values = []
+                        break
+                read_values.append(converted_value)
 
         checksum = None
         if read_values:
@@ -8678,6 +8843,26 @@ def build_relaykv_real_req_to_token_pool_bounded_read_results_for_smoke(
             "blocked_reason": blocked_reason,
             "source_path": source_path,
             "source_mutated": False,
+            "scalar_tensor_item_conversion_enabled": allow_scalar_tensor_item_conversion,
+            "scalar_tensor_item_conversion_attempted": (
+                scalar_tensor_item_conversion_attempted
+            ),
+            "scalar_tensor_item_conversion_succeeded": (
+                scalar_tensor_item_conversion_succeeded
+            ),
+            "scalar_tensor_item_conversion_blocked_reason": (
+                scalar_tensor_item_conversion_blocked_reason
+            ),
+            "scalar_tensor_item_conversion_count": scalar_tensor_item_conversion_count,
+            "scalar_tensor_item_conversion_dtype": (
+                scalar_tensor_item_conversion_dtype
+            ),
+            "scalar_tensor_item_conversion_shape": (
+                scalar_tensor_item_conversion_shape
+            ),
+            "scalar_tensor_item_conversion_device": (
+                scalar_tensor_item_conversion_device
+            ),
             "req_to_token_read_count": len(read_values) if blocked_reason is None else 0,
             "actual_req_to_token_pool_read_count": (
                 len(read_values) if blocked_reason is None else 0
@@ -8706,6 +8891,7 @@ def summarize_relaykv_real_req_to_token_pool_bounded_read_results_for_smoke(
     results: list[dict[str, Any]] | tuple[dict[str, Any], ...],
     *,
     read_enabled: bool,
+    allow_scalar_tensor_item_conversion: bool = False,
     max_tokens_per_request: int,
     max_total_tokens: int,
 ) -> dict[str, Any]:
@@ -8720,6 +8906,10 @@ def summarize_relaykv_real_req_to_token_pool_bounded_read_results_for_smoke(
     blocked_count = 0
     error_count = 0
     total_req_to_token_index_count = 0
+    scalar_tensor_item_conversion_attempted_count = 0
+    scalar_tensor_item_conversion_succeeded_count = 0
+    scalar_tensor_item_conversion_blocked_count = 0
+    scalar_tensor_item_conversion_blocked_reason_counts: Counter[str] = Counter()
     safety_counts: Counter[str] = Counter(
         {
             "req_to_token_read_count": 0,
@@ -8753,6 +8943,18 @@ def summarize_relaykv_real_req_to_token_pool_bounded_read_results_for_smoke(
         value = result.get("req_to_token_index_count")
         if isinstance(value, int) and not isinstance(value, bool):
             total_req_to_token_index_count += value
+        if result.get("scalar_tensor_item_conversion_attempted") is True:
+            scalar_tensor_item_conversion_attempted_count += 1
+        if result.get("scalar_tensor_item_conversion_succeeded") is True:
+            scalar_tensor_item_conversion_succeeded_count += 1
+        blocked_conversion_reason = result.get(
+            "scalar_tensor_item_conversion_blocked_reason"
+        )
+        if blocked_conversion_reason is not None:
+            scalar_tensor_item_conversion_blocked_count += 1
+            scalar_tensor_item_conversion_blocked_reason_counts[
+                str(blocked_conversion_reason)
+            ] += 1
         for key in safety_counts:
             value = result.get(key)
             if isinstance(value, int) and not isinstance(value, bool):
@@ -8766,6 +8968,19 @@ def summarize_relaykv_real_req_to_token_pool_bounded_read_results_for_smoke(
         "blocked_count": blocked_count,
         "error_count": error_count,
         "total_req_to_token_index_count": total_req_to_token_index_count,
+        "scalar_tensor_item_conversion_enabled": allow_scalar_tensor_item_conversion,
+        "scalar_tensor_item_conversion_attempted_count": (
+            scalar_tensor_item_conversion_attempted_count
+        ),
+        "scalar_tensor_item_conversion_succeeded_count": (
+            scalar_tensor_item_conversion_succeeded_count
+        ),
+        "scalar_tensor_item_conversion_blocked_count": (
+            scalar_tensor_item_conversion_blocked_count
+        ),
+        "scalar_tensor_item_conversion_blocked_reason_counts": dict(
+            scalar_tensor_item_conversion_blocked_reason_counts
+        ),
         "max_tokens_per_request": max_tokens_per_request,
         "max_total_tokens": max_total_tokens,
         **{key: safety_counts[key] for key in sorted(safety_counts)},
