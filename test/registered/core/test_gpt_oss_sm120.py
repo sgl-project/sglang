@@ -5,7 +5,7 @@ import torch
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.gpt_oss_common import BaseTestGptOss
 
-register_cuda_ci(est_time=330, suite="stage-b-test-1-gpu-small")
+register_cuda_ci(est_time=345, suite="stage-b-test-1-gpu-small")
 
 
 @unittest.skipIf(not torch.cuda.is_available(), "CUDA is not available")

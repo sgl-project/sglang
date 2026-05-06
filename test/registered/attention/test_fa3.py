@@ -20,7 +20,7 @@ from sglang.test.test_utils import (
 
 # FlashAttention3 integration tests (requires SM 90+ / H100)
 # Multiple test classes: FA3, FA3+MLA, FA3+SpecDecode variants
-register_cuda_ci(est_time=390, suite="stage-b-test-1-gpu-large")
+register_cuda_ci(est_time=551, suite="stage-b-test-1-gpu-large")
 
 GSM_DATASET_PATH = None
 

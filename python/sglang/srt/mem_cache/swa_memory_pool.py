@@ -12,6 +12,7 @@ from sglang.srt.mem_cache.allocator import (
 from sglang.srt.mem_cache.memory_pool import KVCache, MHATokenToKVPool
 from sglang.srt.mem_cache.utils import maybe_init_custom_mem_pool
 from sglang.srt.utils import is_npu
+from sglang.srt.utils.common import get_num_new_pages
 
 _is_npu = is_npu()
 
@@ -197,7 +198,7 @@ class SWAKVPool(KVCache):
         src_loc_swa = self.translate_loc_from_full_to_swa(src_loc)
         self.swa_kv_pool.move_kv_cache(tgt_loc_swa, src_loc_swa)
 
-    def get_cpu_copy(self, indices):
+    def get_cpu_copy(self, indices, mamba_indices=None):
         # For SWA, we need to copy KV cache from both full and SWA pools
         # The indices are for the full pool, and we use mapping to get SWA indices
         full_kv_cpu = self.full_kv_pool.get_cpu_copy(indices)
@@ -212,7 +213,7 @@ class SWAKVPool(KVCache):
 
         return {"full": full_kv_cpu, "swa": swa_kv_cpu}
 
-    def load_cpu_copy(self, kv_cache_cpu, indices):
+    def load_cpu_copy(self, kv_cache_cpu, indices, mamba_indices=None):
         # Load KV cache back from CPU to both full and SWA pools
         # Note: indices here are NEW indices (newly allocated), different from get_cpu_copy indices
         full_kv_cpu = kv_cache_cpu["full"]
@@ -376,10 +377,13 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         extend_num_tokens: int,
     ):
         assert self.page_size > 1
-        num_tokens = extend_num_tokens + len(seq_lens) * self.page_size
-        if num_tokens > self.full_attn_allocator.available_size():
+
+        num_new_pages = get_num_new_pages(
+            seq_lens=seq_lens_cpu, page_size=self.page_size, prefix_lens=prefix_lens_cpu
+        )
+        if num_new_pages > self.full_attn_allocator.available_size() // self.page_size:
             return None
-        if num_tokens > self.swa_attn_allocator.available_size():
+        if num_new_pages > self.swa_attn_allocator.available_size() // self.page_size:
             return None
 
         swa_last_loc = self.translate_loc_from_full_to_swa(last_loc)
@@ -391,6 +395,7 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             seq_lens_cpu,
             last_loc,
             extend_num_tokens,
+            num_new_pages=num_new_pages,
         )
         alloc_swa_indices = self.swa_attn_allocator.alloc_extend(
             prefix_lens,
@@ -399,6 +404,7 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             seq_lens_cpu,
             swa_last_loc,
             extend_num_tokens,
+            num_new_pages=num_new_pages,
         )
         assert alloc_full_indices is not None
         assert alloc_swa_indices is not None
@@ -480,8 +486,10 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.is_not_in_free_group = True
         self.free_group = []
 
-    def get_cpu_copy(self, indices):
-        return self._kvcache.get_cpu_copy(indices)
+    def get_cpu_copy(self, indices, mamba_indices=None):
+        return self._kvcache.get_cpu_copy(indices, mamba_indices=mamba_indices)
 
-    def load_cpu_copy(self, kv_cache_cpu, indices):
-        return self._kvcache.load_cpu_copy(kv_cache_cpu, indices)
+    def load_cpu_copy(self, kv_cache_cpu, indices, mamba_indices=None):
+        return self._kvcache.load_cpu_copy(
+            kv_cache_cpu, indices, mamba_indices=mamba_indices
+        )

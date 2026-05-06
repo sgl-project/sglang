@@ -14,7 +14,7 @@ from sglang.test.test_utils import (
     write_github_step_summary,
 )
 
-register_cuda_ci(est_time=300, suite="stage-c-test-8-gpu-h200")
+register_cuda_ci(est_time=307, suite="stage-c-test-8-gpu-h200")
 
 MINIMAX_M25_MODEL_PATH = "MiniMaxAI/MiniMax-M2.5"
 

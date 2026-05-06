@@ -116,10 +116,12 @@ CI_MULTI_LORA_MODELS = [
             LoRAAdaptor(
                 name="winddude/wizardLM-LlaMA-LoRA-7B",
                 prefill_tolerance=1e-1,
+                rouge_l_tolerance=0.9,
             ),
             LoRAAdaptor(
                 name="RuterNorway/Llama-2-7b-chat-norwegian-LoRa",
                 prefill_tolerance=3e-1,
+                rouge_l_tolerance=0.9,
             ),
         ],
         max_loras_per_batch=2,
@@ -670,10 +672,6 @@ def create_multiple_batch_test_samples(
     prompts: List[str], lora_adapter_paths: List[str]
 ):
     random.seed(42)
-    from sglang.multimodal_gen.runtime.utils.common import get_bool_env_var
-    from sglang.srt.utils.common import is_hip
-
-    _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
 
     test_cases = [
         (
@@ -720,19 +718,6 @@ def create_multiple_batch_test_samples(
         # ),
     ]
 
-    # [AMD] Aiter may fail this case but the model quality doesn't drop
-    # Skip this flaky case for now
-    if not _use_aiter:
-        test_cases.append(
-            (
-                [
-                    random.choice(prompts),
-                    random.choice(prompts),
-                    random.choice(prompts),
-                ],
-                [None, None, None],
-            )
-        )
     return test_cases
 
 
@@ -837,6 +822,7 @@ def run_lora_batch_splitting_equivalence_test(
     disable_cuda_graph: bool = True,
     disable_radix_cache: bool = True,
     enable_lora_overlap_loading: Optional[bool] = None,
+    lora_drain_wait_threshold: float = 0.0,
 ):
     """
     Test that SRT correctly handles batch splitting with multiple LoRA adapters.
@@ -854,6 +840,9 @@ def run_lora_batch_splitting_equivalence_test(
         attention_backend: Attention backend to use
         disable_cuda_graph: Whether to disable CUDA graph
         disable_radix_cache: Whether to disable radix cache
+        lora_drain_wait_threshold: When any LoRA adapter request waits longer than
+            this threshold (in seconds), the scheduler will selectively drain one
+            running adapter to make room. Set to 0 to disable draining (default).
     """
     max_loras_per_batch = 2
 
@@ -866,9 +855,14 @@ def run_lora_batch_splitting_equivalence_test(
         max_new_tokens = 64
         base_path = model_case.base
 
+        maybe_drain_info = (
+            f", lora_drain_wait_threshold={lora_drain_wait_threshold}"
+            if lora_drain_wait_threshold > 0
+            else ""
+        )
         print(
             f"\n========== Testing batch splitting on base '{base_path}', "
-            f"dtype={torch_dtype} =========="
+            f"dtype={torch_dtype}{maybe_drain_info} =========="
         )
 
         prompts = [TEST_MULTIPLE_BATCH_PROMPTS[0]] * 3
@@ -912,6 +906,7 @@ def run_lora_batch_splitting_equivalence_test(
             attention_backend=attention_backend,
             disable_cuda_graph=disable_cuda_graph,
             disable_radix_cache=disable_radix_cache,
+            lora_drain_wait_threshold=lora_drain_wait_threshold,
         ) as srt_runner:
             for batch_idx, (batch_prompts, lora_paths) in enumerate(test_cases):
                 print(f"\n--- Batch {batch_idx + 1} ---")

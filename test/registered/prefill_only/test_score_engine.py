@@ -4,14 +4,18 @@ Two model types, two scoring modes:
 
   TestCausalLMScoring        — CausalLM, single-item and batched multi-item
   TestSeqClsScoring          — SequenceClassification, single-item mode
-  TestSeqClsMISScoring       — SequenceClassification, MIS delimiter mode
+  TestSeqClsMISScoring       — SequenceClassification, MIS mode (--enable-mis)
+  TestSeqClsMISAdvancedScoring — SeqCls MIS with 12 labels (tensor shape stress)
 
 The Engine (Python API) is the right layer for correctness testing: it
 exercises tokenization, forward pass, pooling, and score extraction without
 the HTTP serialization overhead.  HTTP-layer tests live in test_score_api.py.
+Thorough MIS tests (parity, concurrency, generation models) live in
+test_multi_item_scoring.py.
 """
 
 import json
+import os
 import unittest
 from unittest.mock import patch
 
@@ -22,12 +26,10 @@ from sglang.srt.entrypoints.engine import Engine
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import DEFAULT_SMALL_MODEL_NAME_FOR_TEST, CustomTestCase
 
-register_cuda_ci(est_time=200, suite="stage-b-test-1-gpu-small")
+register_cuda_ci(est_time=85, suite="stage-b-test-1-gpu-small")
 
-_CAUSAL_LM_MODEL = DEFAULT_SMALL_MODEL_NAME_FOR_TEST  # Llama-3.2-1B-Instruct
-_SEQCLS_MODEL = "Qwen/Qwen3-0.6B"  # backbone; arch overridden to SeqCls below
-# <|endoftext|> for Qwen3 tokenizer — used as MIS delimiter
-_QWEN3_EOT_TOKEN_ID = 151643
+_CAUSAL_LM_MODEL = os.environ.get("TEST_MODEL_NAME", DEFAULT_SMALL_MODEL_NAME_FOR_TEST)
+_SEQCLS_MODEL = os.environ.get("TEST_CLASSIFICATION_BASE_MODEL", "Qwen/Qwen3-0.6B")
 
 
 # ---------------------------------------------------------------------------
@@ -368,10 +370,9 @@ class TestSeqClsScoring(CustomTestCase):
 class TestSeqClsMISScoring(CustomTestCase):
     """SeqCls MIS: all items packed into one sequence separated by delimiter token.
 
-    score_and_pool() extracts per-item scores at delimiter positions.
-    Two sub-cases are tested:
-      - NUM_LABELS=2  — standard binary classification head
-      - NUM_LABELS=12 — stress-tests 2-D tensor indexing in score_and_pool()
+    Uses --enable-mis which hardcodes delimiter token ID 9999.
+    Basic pipeline correctness only — thorough MIS tests (parity,
+    concurrency, advanced) live in test_multi_item_scoring.py.
     """
 
     NUM_LABELS = 2
@@ -382,7 +383,8 @@ class TestSeqClsMISScoring(CustomTestCase):
             model_path=_SEQCLS_MODEL,
             disable_radix_cache=True,
             chunked_prefill_size=-1,
-            multi_item_scoring_delimiter=_QWEN3_EOT_TOKEN_ID,
+            enable_mis=True,
+            attention_backend="flashinfer",
             json_model_override_args=json.dumps(
                 {
                     "architectures": ["Qwen3ForSequenceClassification"],
@@ -432,32 +434,6 @@ class TestSeqClsMISScoring(CustomTestCase):
             self.assertEqual(len(row), self.NUM_LABELS)
             self.assertAlmostEqual(sum(row), 1.0, places=5)
 
-    def test_mis_items_produce_distinct_scores(self):
-        """Different items must yield different score vectors.
-
-        Catches bugs where all delimiter positions share the same pooled
-        hidden state (e.g. off-by-one in score_and_pool indexing).
-        """
-        items = [
-            "Option A is about cats",
-            "Option B is about dogs",
-            "Option C is about fish",
-        ]
-        scores = self.engine.score(query="Rate each option:", items=items).scores
-        self.assertEqual(len(scores), len(items))
-        self.assertFalse(
-            all(scores[0] == s for s in scores[1:]),
-            f"All items returned identical scores — delimiter indexing is likely broken. "
-            f"Scores: {scores[0]}",
-        )
-
-    def test_mis_deterministic(self):
-        """Identical MIS requests return identical scores."""
-        kwargs = dict(query="Evaluate:", items=["alpha", "beta", "gamma"])
-        self.assertEqual(
-            self.engine.score(**kwargs).scores, self.engine.score(**kwargs).scores
-        )
-
 
 # ---------------------------------------------------------------------------
 # SequenceClassification — MIS with many labels (tensor shape stress test)
@@ -479,7 +455,8 @@ class TestSeqClsMISAdvancedScoring(CustomTestCase):
             model_path=_SEQCLS_MODEL,
             disable_radix_cache=True,
             chunked_prefill_size=-1,
-            multi_item_scoring_delimiter=_QWEN3_EOT_TOKEN_ID,
+            enable_mis=True,
+            attention_backend="flashinfer",
             json_model_override_args=json.dumps(
                 {
                     "architectures": ["Qwen3ForSequenceClassification"],
@@ -505,17 +482,6 @@ class TestSeqClsMISAdvancedScoring(CustomTestCase):
         for row in scores:
             self.assertEqual(len(row), self.NUM_LABELS)
             self.assertAlmostEqual(sum(row), 1.0, places=5)
-
-    def test_many_items_produce_distinct_scores(self):
-        """15 items should not all return identical score vectors."""
-        items = [f"City {i}" for i in range(15)]
-        scores = self.engine.score(query="Classify each city:", items=items).scores
-        self.assertEqual(len(scores), len(items))
-        self.assertGreater(
-            len({tuple(s) for s in scores}),
-            1,
-            "All 15 items returned identical scores",
-        )
 
 
 if __name__ == "__main__":

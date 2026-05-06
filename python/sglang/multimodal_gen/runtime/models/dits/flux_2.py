@@ -42,12 +42,12 @@ from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
     NDRotaryEmbedding,
     apply_flashinfer_rope_qk_inplace,
 )
+from sglang.multimodal_gen.runtime.managers.layerwise_offload import OffloadableDiTMixin
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
 from sglang.multimodal_gen.runtime.platforms import (
     AttentionBackendEnum,
     current_platform,
 )
-from sglang.multimodal_gen.runtime.utils.layerwise_offload import OffloadableDiTMixin
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)  # pylint: disable=invalid-name
@@ -172,9 +172,12 @@ class Flux2Attention(torch.nn.Module, AttentionModuleMixin):
         self.added_kv_proj_dim = added_kv_proj_dim
         self.added_proj_bias = added_proj_bias
 
-        # Fuse Q/K/V into a single linear when using NVFP4: the checkpoint stores them
-        # packed as one tensor, so a fused layer avoids splitting during weight loading.
-        self.use_fused_qkv = isinstance(quant_config, ModelOptFp4Config)
+        # Some FLUX.2 NVFP4 checkpoints store Q/K/V packed as a single tensor, while
+        # ModelOpt's standard diffusers export keeps the original to_q/to_k/to_v layout.
+        # Only enable the fused loader path for the packed checkpoint family.
+        self.use_fused_qkv = isinstance(quant_config, ModelOptFp4Config) and getattr(
+            quant_config, "checkpoint_uses_packed_qkv", False
+        )
         self.use_fused_added_qkv = self.use_fused_qkv
 
         if self.use_fused_qkv:
@@ -484,7 +487,10 @@ class Flux2ParallelSelfAttention(torch.nn.Module, AttentionModuleMixin):
                 param.data.copy_(loaded_weight)
 
         self.to_out.weight_loader = _loader
-        self.to_out.weight.weight_loader = _loader
+        if hasattr(self.to_out.weight, "_weight_loader"):
+            self.to_out.weight._weight_loader = _loader
+        else:
+            self.to_out.weight.weight_loader = _loader
 
     def forward(
         self,
@@ -827,7 +833,11 @@ class Flux2PosEmbed(nn.Module):
             repeat_interleave_real=False,
             dtype=(
                 torch.float64
-                if current_platform.is_float64_supported()
+                if (
+                    current_platform.is_float64_supported()
+                    if hasattr(current_platform, "is_float64_supported")
+                    else True
+                )
                 else torch.float32
             ),
         )
@@ -855,6 +865,8 @@ class Flux2Transformer2DModel(CachableDiT, OffloadableDiTMixin):
     _supported_attention_backends = {
         AttentionBackendEnum.TORCH_SDPA,
         AttentionBackendEnum.FA,
+        AttentionBackendEnum.AITER,
+        AttentionBackendEnum.AITER_SAGE,
     }
 
     def post_load_weights(self) -> None:

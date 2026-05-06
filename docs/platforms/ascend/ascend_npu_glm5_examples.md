@@ -53,10 +53,16 @@ docker run -itd --shm-size=16g --privileged=true --name ${NAME} \
 swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:${TAG}
 ```
 
-Note: Using this image, you need to update transformers to main branch
+### Best Practices
+Note: Using this image for **best practices**, you need to update transformers to version 5.3.0
 ``` shell
 # reinstall transformers
-pip install git+https://github.com/huggingface/transformers.git
+
+# Install transformers version 5.3.0 from PyPI
+pip install transformers==5.3.0
+
+# Install from GitHub v5.3.0 tag from GitHub
+pip install git+https://github.com/huggingface/transformers.git@v5.3.0
 ```
 
 ## Deployment

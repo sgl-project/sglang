@@ -5,10 +5,14 @@ import pytest
 import torch
 
 from sglang.jit_kernel.nvfp4 import cutlass_scaled_fp4_mm, scaled_fp4_quant
+from sglang.multimodal_gen.runtime.layers.quantization import (
+    modelopt_quant as diffusion_modelopt_quant,
+)
 from sglang.multimodal_gen.runtime.layers.quantization.modelopt_quant import (
     ModelOptFp4Config,
     ModelOptFp4LinearMethod,
 )
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.srt.layers.quantization.modelopt_quant import pad_nvfp4_weight
 from sglang.test.ci.ci_register import register_cuda_ci
 
@@ -110,12 +114,29 @@ def _quantize_weight_for_checkpoint(
     return weight_fp4, weight_scale_linear.contiguous()
 
 
+def _set_diffusion_fp4_backend(
+    monkeypatch: pytest.MonkeyPatch, backend: str | None
+) -> None:
+    if backend is None:
+        monkeypatch.delenv(
+            "SGLANG_DIFFUSION_FLASHINFER_FP4_GEMM_BACKEND", raising=False
+        )
+    else:
+        monkeypatch.setenv("SGLANG_DIFFUSION_FLASHINFER_FP4_GEMM_BACKEND", backend)
+
+    current_platform.__class__.get_modelopt_flashinfer_fp4_backend.cache_clear()
+    current_platform.__class__.get_modelopt_fp4_gemm_op.cache_clear()
+    diffusion_modelopt_quant._get_fp4_gemm_op.cache_clear()
+
+
 def _build_layer(
     weight_fp4: torch.Tensor,
     weight_scale_linear: torch.Tensor,
     input_global_scale: torch.Tensor,
     weight_global_scale: torch.Tensor,
-) -> None:
+    *,
+    weight_scale_device: torch.device | str | None = None,
+) -> tuple[ModelOptFp4LinearMethod, torch.nn.Module]:
     output_size, input_size_half = weight_fp4.shape
     input_size = input_size_half * 2
     method = ModelOptFp4LinearMethod(
@@ -142,19 +163,62 @@ def _build_layer(
         (1.0 / weight_global_scale).reshape_as(layer.weight_scale_2)
     )
     layer.weight_scale.data.copy_(weight_scale_linear)
+    if weight_scale_device is not None:
+        layer.weight_scale = torch.nn.Parameter(
+            layer.weight_scale.detach().to(weight_scale_device), requires_grad=False
+        )
 
     method.process_weights_after_loading(layer)
 
-    expected_weight, expected_padding_cols = pad_nvfp4_weight(weight_fp4)
-    expected_scale_shape = (
-        ((output_size + 128 - 1) // 128) * 128,
-        (((input_size // BLOCK_SIZE) + 4 - 1) // 4) * 4,
-    )
+    _, flashinfer_backend = current_platform.get_modelopt_fp4_gemm_op()
+    if flashinfer_backend == "trtllm":
+        expected_weight, _ = pad_nvfp4_weight(
+            weight_fp4, n_alignment=128, k_alignment=0
+        )
+        expected_scale = weight_scale_linear
+        if expected_scale.shape[0] != expected_weight.shape[0]:
+            pad_n = expected_weight.shape[0] - expected_scale.shape[0]
+            expected_scale = torch.nn.functional.pad(expected_scale, (0, 0, 0, pad_n))
 
-    assert torch.equal(layer.weight, expected_weight)
-    assert layer.weight_scale_interleaved.shape == expected_scale_shape
-    assert layer.weight_scale_interleaved.dtype == torch.float8_e4m3fn
-    assert layer.weights_padding_cols == expected_padding_cols
+        expected_padding_cols = 0
+        if expected_scale.shape[1] % 4 != 0:
+            padded_scale_k = ((expected_scale.shape[1] + 4 - 1) // 4) * 4
+            pad_scale_k = padded_scale_k - expected_scale.shape[1]
+            expected_scale = torch.nn.functional.pad(
+                expected_scale, (0, pad_scale_k, 0, 0)
+            )
+            pad_weight_k = pad_scale_k * 8
+            expected_weight = torch.nn.functional.pad(
+                expected_weight, (0, pad_weight_k, 0, 0)
+            )
+            expected_padding_cols = pad_weight_k
+
+        expected_weight = flashinfer.shuffle_matrix_a(
+            expected_weight.view(torch.uint8), 128
+        )
+        expected_scale = (
+            flashinfer.shuffle_matrix_sf_a(expected_scale.view(torch.uint8), 128)
+            .reshape(expected_scale.shape)
+            .view(torch.float8_e4m3fn)
+        )
+
+        assert torch.equal(layer.weight, expected_weight)
+        assert torch.equal(
+            layer.weight_scale_interleaved.view(torch.uint8),
+            expected_scale.view(torch.uint8),
+        )
+        assert layer.weights_padding_cols == expected_padding_cols
+    else:
+        expected_weight, expected_padding_cols = pad_nvfp4_weight(weight_fp4)
+        expected_scale_shape = (
+            ((output_size + 128 - 1) // 128) * 128,
+            (((input_size // BLOCK_SIZE) + 4 - 1) // 4) * 4,
+        )
+
+        assert torch.equal(layer.weight, expected_weight)
+        assert layer.weight_scale_interleaved.shape == expected_scale_shape
+        assert layer.weight_scale_interleaved.dtype == torch.float8_e4m3fn
+        assert layer.weights_padding_cols == expected_padding_cols
     torch.testing.assert_close(
         layer.alpha,
         (1.0 / (input_global_scale * weight_global_scale)).to(torch.float32),
@@ -163,6 +227,7 @@ def _build_layer(
         layer.input_scale_inv,
         input_global_scale.to(torch.float32),
     )
+    return method, layer
 
 
 def _resolve_mode(mode: str):
@@ -170,6 +235,8 @@ def _resolve_mode(mode: str):
         return scaled_fp4_quant, cutlass_scaled_fp4_mm, None
     if mode == "flashinfer2":
         return flashinfer.fp4_quantize, flashinfer.mm_fp4, "cudnn"
+    if mode == "flashinfer_trtllm":
+        return flashinfer.fp4_quantize, flashinfer.mm_fp4, "trtllm"
     raise ValueError(f"Unknown mode: {mode}")
 
 
@@ -177,8 +244,14 @@ def _resolve_mode(mode: str):
     not _nvfp4_supported(),
     reason="Diffusion NVFP4 scaled mm correctness requires Blackwell GPUs",
 )
+@pytest.mark.parametrize(
+    "backend", [None, "flashinfer_trtllm"], ids=["default", "flashinfer_trtllm"]
+)
 @pytest.mark.parametrize("m,n,k", TEST_CASES)
-def test_checkpoint_processing(m: int, n: int, k: int) -> None:
+def test_checkpoint_processing(
+    monkeypatch: pytest.MonkeyPatch, backend: str | None, m: int, n: int, k: int
+) -> None:
+    _set_diffusion_fp4_backend(monkeypatch, backend)
     generator = torch.Generator(device=DEVICE)
     generator.manual_seed(20260404 + m + n + k)
 
@@ -245,6 +318,81 @@ def test_flux2_shape_correctness(mode: str) -> None:
 
     diff = _calc_diff(actual, expected.to(dtype=DTYPE))
     assert diff < DEEPGEMM_FP4_MAX_DIFF, f"{mode=}, {m=}, {n=}, {k=}, {diff=:.6f}"
+
+
+@pytest.mark.skipif(
+    not _nvfp4_supported(),
+    reason="Diffusion NVFP4 scaled mm correctness requires Blackwell GPUs",
+)
+def test_flux2_shape_correctness_flashinfer_trtllm(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _set_diffusion_fp4_backend(monkeypatch, "flashinfer_trtllm")
+
+    m, n, k = FLUX2_PROJECTION_SHAPE
+    generator = torch.Generator(device=DEVICE)
+    generator.manual_seed(20260404 + m + n + k + 17)
+
+    x = torch.randn((m, k), device=DEVICE, dtype=DTYPE, generator=generator)
+    weight = torch.randn((n, k), device=DEVICE, dtype=DTYPE, generator=generator)
+    input_global_scale = _make_global_scale(x)
+    weight_global_scale = _make_global_scale(weight)
+    weight_fp4, weight_scale_linear = _quantize_weight_for_checkpoint(
+        weight, weight_global_scale
+    )
+
+    method, layer = _build_layer(
+        weight_fp4, weight_scale_linear, input_global_scale, weight_global_scale
+    )
+    actual = method.apply(layer, x)
+
+    x_fp4, x_scale_swizzled = flashinfer.fp4_quantize(x, input_global_scale)
+    weight_fp4_ref, weight_scale_swizzled = flashinfer.fp4_quantize(
+        weight, weight_global_scale
+    )
+    if x_scale_swizzled.dtype == torch.uint8:
+        x_scale_swizzled = x_scale_swizzled.view(torch.float8_e4m3fn)
+    if weight_scale_swizzled.dtype == torch.uint8:
+        weight_scale_swizzled = weight_scale_swizzled.view(torch.float8_e4m3fn)
+
+    expected = torch.matmul(
+        _dequantize_nvfp4(x_fp4, x_scale_swizzled, input_global_scale),
+        _dequantize_nvfp4(
+            weight_fp4_ref, weight_scale_swizzled, weight_global_scale
+        ).t(),
+    )
+
+    diff = _calc_diff(actual, expected.to(dtype=DTYPE))
+    assert diff < DEEPGEMM_FP4_MAX_DIFF, f"{m=}, {n=}, {k=}, {diff=:.6f}"
+
+
+@pytest.mark.skipif(
+    not _nvfp4_supported(),
+    reason="Diffusion NVFP4 scaled mm correctness requires Blackwell GPUs",
+)
+def test_checkpoint_processing_flashinfer_trtllm_cpu_weight_scale(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _set_diffusion_fp4_backend(monkeypatch, "flashinfer_trtllm")
+
+    m, n, k = FLUX2_PROJECTION_SHAPE
+    generator = torch.Generator(device=DEVICE)
+    generator.manual_seed(20260413 + m + n + k)
+
+    weight = torch.randn((n, k), device=DEVICE, dtype=DTYPE, generator=generator)
+    input_global_scale = torch.tensor(512.0, device=DEVICE, dtype=torch.float32)
+    weight_global_scale = _make_global_scale(weight)
+    weight_fp4, weight_scale_linear = _quantize_weight_for_checkpoint(
+        weight, weight_global_scale
+    )
+
+    _build_layer(
+        weight_fp4,
+        weight_scale_linear,
+        input_global_scale,
+        weight_global_scale,
+        weight_scale_device="cpu",
+    )
 
 
 if __name__ == "__main__":
