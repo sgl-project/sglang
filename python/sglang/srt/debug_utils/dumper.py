@@ -7,6 +7,7 @@ import re
 import socket
 import threading
 import time
+import traceback
 from abc import ABC, abstractmethod
 from collections.abc import Callable
 from contextlib import contextmanager
@@ -151,6 +152,11 @@ class DumperConfig(_BaseConfig):
     grafter_backend: str = "nccl"
     grafter_group_name: str = "graft"
     grafter_timeout: int = 300
+    # Fully-qualified Python path "pkg.subpkg.module.fn_name". When set, the
+    # recv side calls this function with (received_list, target) and copies
+    # the result into target. None -> use the default identity-by-rank
+    # fallback in `_Grafter._default_transform`.
+    grafter_transform_path: Optional[str] = None
 
     @classmethod
     def _env_prefix(cls) -> str:
@@ -837,21 +843,65 @@ class _Grafter:
         is_send = self._is_sender(role=role, direction=direction)
 
         # 1+1 broadcast: sender side ships the tensor as a pickled object;
-        # recv side calls `value.copy_()` with the received tensor.
+        # recv side feeds it through the user transform (default: identity)
+        # and `value.copy_()` the result.
         sender_rank = 0 if direction == _GraftDirection.B2T else 1
         obj_list: list = [None]
         if is_send:
             obj_list = [value]
             _log(f"[Grafter] send role={role.value} dir={direction.value} tags={tags}")
         dist.broadcast_object_list(obj_list, src=sender_rank, group=self._pg)
-        if not is_send:
-            received = obj_list[0]
-            if isinstance(received, torch.Tensor):
-                # Pickled CUDA tensors restore to their original-device name;
-                # that may not match this process's local device, so normalize.
-                received = received.to(value.device)
+        if is_send:
+            return
+
+        received = obj_list[0]
+        if isinstance(received, torch.Tensor):
+            # Pickled CUDA tensors restore to their original-device name;
+            # that may not match this process's local device, so normalize.
+            received = received.to(value.device)
+        # Transform + copy_ are wrapped: a buggy user transform must NOT
+        # crash the whole training/inference run. On error we log the full
+        # traceback and skip this graft point; downstream sees the recv
+        # side's original tensor unchanged.
+        try:
+            value_to_override = self._apply_transform([received], target=value)
             _log(f"[Grafter] recv role={role.value} dir={direction.value} tags={tags}")
-            value.copy_(received)
+            value.copy_(value_to_override)
+        except Exception as e:
+            _log(
+                f"[Grafter] recv role={role.value} dir={direction.value} "
+                f"tags={tags} transform/copy_ raised {type(e).__name__}: {e}; "
+                f"skipping graft for this call (target tensor unchanged)\n"
+                f"{traceback.format_exc()}"
+            )
+
+    def _apply_transform(
+        self,
+        received_list: list,
+        *,
+        target: torch.Tensor,
+    ) -> torch.Tensor:
+        path = self._config.grafter_transform_path
+        if path is None:
+            return self._default_transform(received_list, target=target)
+        return _load_function(path)(received_list, target)
+
+    @staticmethod
+    def _default_transform(
+        received_list: list, *, target: torch.Tensor
+    ) -> torch.Tensor:
+        """Identity-by-rank fallback. For the 1+1 setup currently supported,
+        just returns the single received tensor; requires shape match."""
+        candidate = received_list[0]
+        if candidate.shape != target.shape:
+            raise RuntimeError(
+                f"[Grafter] no grafter_transform_path set; default "
+                f"identity-by-rank requires matching shapes but "
+                f"received_list[0].shape={tuple(candidate.shape)} != "
+                f"target.shape={tuple(target.shape)}. Provide a transform via "
+                f"DUMPER_GRAFTER_TRANSFORM_PATH=pkg.module.symbol."
+            )
+        return candidate
 
     def _classify_direction(self, tags: dict) -> Optional["_GraftDirection"]:
         cfg = self._config
@@ -1337,6 +1387,26 @@ def _get_local_ip_by_remote() -> Optional[str]:
     except Exception:
         _log("Can not get local ip by remote")
     return None
+
+
+@functools.lru_cache(maxsize=None)
+def _load_function(path: str) -> Callable:
+    """Resolve a fully-qualified Python path 'pkg.module.symbol' to its object.
+
+    Copied (verbatim, minus the function-registry branch) from
+    miles.utils.misc.load_function -- kept inline so dumper.py has no
+    cross-package dependency.
+    """
+    import importlib
+
+    module_path, _, attr = path.rpartition(".")
+    if not module_path:
+        raise ValueError(
+            f"_load_function expects 'pkg.module.symbol', got {path!r} "
+            f"(missing dotted prefix)"
+        )
+    module = importlib.import_module(module_path)
+    return getattr(module, attr)
 
 
 def _init_custom_process_group(

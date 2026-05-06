@@ -23,6 +23,7 @@ from sglang.srt.debug_utils.dumper import (
     _format_tags,
     _get_default_exp_name,
     _Grafter,
+    _load_function,
     _log,
     _map_tensor,
     _materialize_value,
@@ -2809,6 +2810,28 @@ class TestGrafterFilterMatching:
         grafter.maybe_intercept(value=torch.zeros(2), tags={"name": "other"})
         assert grafter._pg is None
 
+    def test_load_function_bad_module(self):
+        with pytest.raises(ModuleNotFoundError):
+            _load_function("no_such_pkg.no_such_module.transform")
+
+    def test_load_function_missing_attr(self):
+        # `os.path` exists but has no `definitely_no_such_attr`.
+        with pytest.raises(AttributeError):
+            _load_function("os.path.definitely_no_such_attr")
+
+    def test_load_function_no_dotted_prefix(self):
+        with pytest.raises(ValueError, match=r"missing dotted prefix"):
+            _load_function("only_one_segment")
+
+    def test_load_function_non_callable_resolves_but_call_fails(self):
+        """`_load_function` itself only does attribute lookup -- it doesn't
+        verify the result is callable. A non-callable target manifests at
+        call time as TypeError; we still want the failure to be debuggable."""
+        sep = _load_function("os.path.sep")  # str, not a callable
+        assert isinstance(sep, str)
+        with pytest.raises(TypeError):
+            sep()
+
 
 def _run_graft_test(worker_func, **kwargs):
     """Spawn one GPU-using process per role (rank 0 = baseline, rank 1 = target).
@@ -2866,6 +2889,7 @@ def _make_grafter_test_config(
     timeout: int = 30,
     b2t_filter: Optional[str] = "name == 'x'",
     t2b_filter: Optional[str] = None,
+    transform_path: Optional[str] = None,
 ) -> DumperConfig:
     """Build a DumperConfig for distributed grafter tests. rank 0 -> baseline,
     rank 1 -> target. Both sides are world_size=1 within their own role's
@@ -2883,6 +2907,7 @@ def _make_grafter_test_config(
         grafter_target_world_size=1,
         grafter_group_name=group_name,
         grafter_timeout=timeout,
+        grafter_transform_path=transform_path,
     )
 
 
@@ -3036,6 +3061,186 @@ class TestGrafterDistributed:
                 assert grafter._pg is pg_after_first
                 assert t1.tolist() == [1.0, 2.0, 3.0]
                 assert t2.tolist() == [4.0, 5.0, 6.0]
+        finally:
+            if grafter._pg is not None:
+                dist.destroy_process_group(grafter._pg)
+
+    def test_recv_with_user_transform(self, tmp_path: Path):
+        """User transform doubles the received tensor before copy_."""
+        module_name = "_xform_user_basic"
+        (tmp_path / f"{module_name}.py").write_text(
+            "def transform(received_list, target):\n"
+            "    return received_list[0] * 2\n"
+        )
+        graft_port = find_available_port(29610)
+        _run_graft_test(
+            self._test_user_transform_func,
+            graft_port=graft_port,
+            group_name="grafter_transform",
+            transform_dir=str(tmp_path),
+            transform_path=f"{module_name}.transform",
+        )
+
+    @staticmethod
+    def _test_user_transform_func(
+        rank, graft_port, group_name, transform_dir, transform_path
+    ):
+        sys.path.insert(0, transform_dir)
+        grafter = _Grafter(
+            config=_make_grafter_test_config(
+                rank=rank,
+                graft_port=graft_port,
+                group_name=group_name,
+                transform_path=transform_path,
+            )
+        )
+        try:
+            if rank == 0:
+                tensor = torch.tensor([1.0, 2.0, 3.0], device="cuda:0")
+                grafter.maybe_intercept(value=tensor, tags={"name": "x"})
+            else:
+                target = torch.zeros(3, device="cuda:1")
+                grafter.maybe_intercept(value=target, tags={"name": "x"})
+                assert target.tolist() == [2.0, 4.0, 6.0], f"got {target.tolist()}"
+        finally:
+            if grafter._pg is not None:
+                dist.destroy_process_group(grafter._pg)
+
+    def test_default_fallback_shape_mismatch_does_not_crash(self):
+        """When sender shape != target shape, default identity fallback raises;
+        the grafter must catch it, log, and leave target unchanged."""
+        graft_port = find_available_port(29615)
+        _run_graft_test(
+            self._test_shape_mismatch_func,
+            graft_port=graft_port,
+            group_name="grafter_shape_mismatch",
+        )
+
+    @staticmethod
+    def _test_shape_mismatch_func(rank, graft_port, group_name):
+        grafter = _Grafter(
+            config=_make_grafter_test_config(
+                rank=rank, graft_port=graft_port, group_name=group_name
+            )
+        )
+        try:
+            if rank == 0:
+                tensor = torch.tensor([1.0, 2.0, 3.0], device="cuda:0")
+                grafter.maybe_intercept(value=tensor, tags={"name": "x"})
+            else:
+                target = torch.tensor([7.0, 7.0, 7.0, 7.0], device="cuda:1")
+                grafter.maybe_intercept(value=target, tags={"name": "x"})
+                assert target.tolist() == [
+                    7.0,
+                    7.0,
+                    7.0,
+                    7.0,
+                ], f"target should be unchanged after shape-mismatch graft, got {target.tolist()}"
+        finally:
+            if grafter._pg is not None:
+                dist.destroy_process_group(grafter._pg)
+
+    def test_user_transform_exception_does_not_crash(self, tmp_path: Path):
+        """A user transform that raises must NOT bring down the system; the
+        grafter logs and skips the copy_, leaving target unchanged."""
+        module_name = "_xform_throws"
+        (tmp_path / f"{module_name}.py").write_text(
+            "def transform(received_list, target):\n"
+            "    raise RuntimeError('intentional test error from user transform')\n"
+        )
+        graft_port = find_available_port(29635)
+        _run_graft_test(
+            self._test_transform_throws_func,
+            graft_port=graft_port,
+            group_name="grafter_throws",
+            transform_dir=str(tmp_path),
+            transform_path=f"{module_name}.transform",
+            module_name=module_name,
+        )
+
+    @staticmethod
+    def _test_transform_throws_func(
+        rank, graft_port, group_name, transform_dir, transform_path, module_name
+    ):
+        sys.path.insert(0, transform_dir)
+        grafter = _Grafter(
+            config=_make_grafter_test_config(
+                rank=rank,
+                graft_port=graft_port,
+                group_name=group_name,
+                transform_path=transform_path,
+            )
+        )
+        try:
+            if rank == 0:
+                tensor = torch.tensor([1.0, 2.0, 3.0], device="cuda:0")
+                grafter.maybe_intercept(value=tensor, tags={"name": "x"})
+            else:
+                target = torch.tensor([9.0, 9.0, 9.0], device="cuda:1")
+                with _capture_stdout() as captured:
+                    grafter.maybe_intercept(value=target, tags={"name": "x"})
+                assert target.tolist() == [
+                    9.0,
+                    9.0,
+                    9.0,
+                ], f"target must be unchanged when transform throws, got {target.tolist()}"
+                output = captured.getvalue()
+                assert "transform/copy_ raised RuntimeError" in output, output
+                assert "intentional test error" in output, output
+                assert "Traceback (most recent call last)" in output, output
+                assert f"{module_name}.py" in output, output
+        finally:
+            if grafter._pg is not None:
+                dist.destroy_process_group(grafter._pg)
+
+    def test_copy_failure_does_not_crash(self, tmp_path: Path):
+        """If the user transform returns a tensor whose shape doesn't match
+        target, `value.copy_(value_to_override)` raises -- and that error
+        must be caught, logged with traceback, and target left unchanged."""
+        module_name = "_xform_returns_wrong_shape"
+        (tmp_path / f"{module_name}.py").write_text(
+            "import torch\n"
+            "def transform(received_list, target):\n"
+            "    return torch.zeros(99, device=target.device)\n"
+        )
+        graft_port = find_available_port(29665)
+        _run_graft_test(
+            self._test_copy_failure_func,
+            graft_port=graft_port,
+            group_name="grafter_copy_fail",
+            transform_dir=str(tmp_path),
+            transform_path=f"{module_name}.transform",
+        )
+
+    @staticmethod
+    def _test_copy_failure_func(
+        rank, graft_port, group_name, transform_dir, transform_path
+    ):
+        sys.path.insert(0, transform_dir)
+        grafter = _Grafter(
+            config=_make_grafter_test_config(
+                rank=rank,
+                graft_port=graft_port,
+                group_name=group_name,
+                transform_path=transform_path,
+            )
+        )
+        try:
+            if rank == 0:
+                tensor = torch.tensor([1.0, 2.0, 3.0], device="cuda:0")
+                grafter.maybe_intercept(value=tensor, tags={"name": "x"})
+            else:
+                target = torch.tensor([7.0, 7.0, 7.0], device="cuda:1")
+                with _capture_stdout() as captured:
+                    grafter.maybe_intercept(value=target, tags={"name": "x"})
+                assert target.tolist() == [
+                    7.0,
+                    7.0,
+                    7.0,
+                ], f"target must be unchanged on copy_ failure, got {target.tolist()}"
+                output = captured.getvalue()
+                assert "transform/copy_ raised" in output, output
+                assert "Traceback (most recent call last)" in output, output
         finally:
             if grafter._pg is not None:
                 dist.destroy_process_group(grafter._pg)
