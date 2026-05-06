@@ -283,3 +283,104 @@ def gemma_dual_rmsnorm_residual_scalar(
         BLOCK_SIZE=BLOCK_SIZE,
     )
     return out
+
+
+@triton.jit
+def _fused_kv_norm_kernel(
+    X_ptr,  # input: shared K/V raw projection, shape [M, N]
+    K_weight_ptr,  # k_norm weight, shape [N]
+    K_out_ptr,  # output: normalised K, shape [M, N]
+    V_out_ptr,  # output: normalised V, shape [M, N]
+    stride_x,
+    stride_k,
+    stride_v,
+    N,
+    eps: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """Fused kernel: reads x once, writes k = rmsnorm(x, k_weight) and v = rmsnorm(x).
+
+    For attention_k_eq_v layers where K and V share the same raw projection:
+      - K = x * rrms * k_weight   (standard RMSNorm with learned scale)
+      - V = x * rrms              (RMSNorm without scale, i.e. unit normalisation)
+
+    Both share the same rrms = rsqrt(mean(x^2) + eps), so we compute it once.
+    """
+    row = tl.program_id(0)
+    cols = tl.arange(0, BLOCK_SIZE)
+    mask = cols < N
+
+    # Load input once
+    x = tl.load(X_ptr + row * stride_x + cols, mask=mask, other=0.0).to(tl.float32)
+
+    # Load k_norm weights
+    k_w = tl.load(K_weight_ptr + cols, mask=mask, other=0.0).to(tl.float32)
+
+    # Shared RMS computation
+    var = tl.sum(x * x, axis=0) / N
+    rrms = tl.rsqrt(var + eps)
+
+    # V = x * rrms (no learned scale)
+    v_out = x * rrms
+
+    # K = x * rrms * k_weight
+    k_out = v_out * k_w
+
+    # Store both outputs
+    tl.store(K_out_ptr + row * stride_k + cols, k_out.to(x.dtype), mask=mask)
+    tl.store(V_out_ptr + row * stride_v + cols, v_out.to(x.dtype), mask=mask)
+
+
+def fused_kv_norm(
+    x: torch.Tensor,
+    k_weight: torch.Tensor,
+    eps: float = 1e-6,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Fused k_norm + v_derive for attention_k_eq_v layers.
+
+    Given input x (the shared K/V projection output), computes:
+      k = rmsnorm(x, k_weight)    — standard RMSNorm with learned scale
+      v = rmsnorm(x)              — RMSNorm with unit scale (no learned weights)
+
+    Both norms share the same RMS denominator, so we read x once and compute
+    rsqrt(mean(x^2) + eps) once.
+
+    Args:
+        x: Input tensor of shape [*, head_dim].  Will be reshaped to 2D
+           internally; the last dimension is the normalisation dimension.
+        k_weight: Learned scale for k_norm, shape [head_dim].
+        eps: Epsilon for numerical stability.
+
+    Returns:
+        (k, v) tuple of tensors with the same shape as x.
+    """
+    needs_reshape = x.dim() != 2
+    if needs_reshape:
+        original_shape = x.shape
+        x = x.contiguous().reshape(-1, original_shape[-1])
+
+    assert x.stride(-1) == 1, "Expected contiguous last dimension"
+    M, N = x.shape
+    BLOCK_SIZE = triton.next_power_of_2(N)
+
+    k_out = torch.empty_like(x)
+    v_out = torch.empty_like(x)
+
+    _fused_kv_norm_kernel[(M,)](
+        x,
+        k_weight,
+        k_out,
+        v_out,
+        x.stride(0),
+        k_out.stride(0),
+        v_out.stride(0),
+        N,
+        eps=eps,
+        BLOCK_SIZE=BLOCK_SIZE,
+    )
+
+    if needs_reshape:
+        k_out = k_out.reshape(original_shape)
+        v_out = v_out.reshape(original_shape)
+
+    return k_out, v_out

@@ -623,6 +623,17 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
         (".gate_up_proj", ".gate_proj", 0),
     ]
 
+    # k_eq_v layers use MergedColumnParallelLinear (qk_proj) instead of
+    # QKVParallelLinear (qkv_proj).  Map checkpoint q_proj / k_proj to
+    # integer shard ids 0 and 1 respectively.
+    k_eq_v_stacked_params_mapping = [
+        # (param_name, shard_name, shard_id)
+        (".qk_proj", ".q_proj", 0),
+        (".qk_proj", ".k_proj", 1),
+        (".gate_up_proj", ".up_proj", 1),
+        (".gate_up_proj", ".gate_proj", 0),
+    ]
+
     # Regex for fused QKV in vision/audio towers.
     # Vision: *.self_attn.{q,k,v}_proj.*  Audio: *.attn.{q,k,v}_proj.*
     _RE_TOWER_QKV = re.compile(
@@ -790,17 +801,12 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
             if "vision_tower." in name or "audio_tower." in name:
                 name = self._remap_tower_name(name, params_dict)
 
-            # attention_k_eq_v: full-attention layers have no v_proj in the
-            # checkpoint (K and V share weights).  When we see a k_proj weight
-            # for one of these layers, load it into both the "k" and "v" shards
-            # of the fused QKV so the forward produces v_raw == k_raw.
-            should_dup_k_to_v = (
-                ".k_proj." in name
-                and k_eq_v_layers
-                and "language_model." in name
-                and (m := re.search(r"layers\.(\d+)\.", name)) is not None
-                and int(m.group(1)) in k_eq_v_layers
-            )
+            # Determine whether this weight belongs to a k_eq_v layer.
+            is_k_eq_v_layer = False
+            if k_eq_v_layers and "language_model." in name:
+                m_layer = re.search(r"layers\.(\d+)\.", name)
+                if m_layer is not None:
+                    is_k_eq_v_layer = int(m_layer.group(1)) in k_eq_v_layers
 
             # Per-expert checkpoint format used by compressed-tensors / FP8
             # (e.g. RedHatAI/*-FP8-Dynamic). Each expert is stored as a
@@ -855,7 +861,14 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
                         weight_loader(param, chunk, name, sid, i)
                 break
             else:
-                for param_name, weight_name, shard_id in self.stacked_params_mapping:
+                # Select the right stacked_params mapping based on whether
+                # this is a k_eq_v layer (qk_proj) or standard (qkv_proj).
+                mapping = (
+                    self.k_eq_v_stacked_params_mapping
+                    if is_k_eq_v_layer
+                    else self.stacked_params_mapping
+                )
+                for param_name, weight_name, shard_id in mapping:
                     name = orig_name
                     if weight_name not in name:
                         continue
@@ -865,8 +878,6 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
                     param = params_dict[name]
                     weight_loader = param.weight_loader
                     weight_loader(param, loaded_weight, shard_id)
-                    if should_dup_k_to_v:
-                        weight_loader(param, loaded_weight, "v")
                     break
                 else:
                     name = orig_name
