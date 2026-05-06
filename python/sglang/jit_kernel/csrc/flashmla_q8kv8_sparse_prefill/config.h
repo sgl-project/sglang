@@ -7,7 +7,6 @@
 
 #include "defines.h"
 #include "params.h"
-#include <cooperative_groups.h>
 #include <cstdio>
 #include <cstdlib>
 #include <math_constants.h>
@@ -39,9 +38,3 @@ __host__ __device__ __forceinline__ T ceil_div(T a, T b) {
 }
 
 }  // namespace ku
-
-namespace sm90::fwd {
-
-using namespace cute;
-
-};  // namespace sm90::fwd
