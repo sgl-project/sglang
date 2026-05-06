@@ -31,6 +31,21 @@ from sglang.srt.disaggregation.utils import (
 from sglang.srt.environ import envs
 from sglang.srt.server_args import ServerArgs
 
+try:
+    from nixl._bindings import (
+        nixlBackendError,
+        nixlCancelledError,
+        nixlRemoteDisconnectError,
+    )
+
+    _NIXL_TRANSPORT_ERRORS = (
+        nixlRemoteDisconnectError,
+        nixlBackendError,
+        nixlCancelledError,
+    )
+except ImportError:
+    _NIXL_TRANSPORT_ERRORS = (RuntimeError,)
+
 logger = logging.getLogger(__name__)
 
 GUARD = "NixlMsgGuard".encode("ascii")
@@ -545,6 +560,14 @@ class NixlKVManager(CommonKVManager):
     ):
         """Generic KV cache transfer supporting both MHA and MLA architectures.
         Used by both send_kvcache and maybe_send_extra."""
+        # Convert pointer lists to np.uint64 arrays up front.
+        # torch.int exceeds np.int64 range on Intel XPU (addresses have bit 63 set, e.g.
+        # 0xffff81ab54e01000). Casting here prevents overflow when these values
+        # are later used in numpy arithmetic.
+        src_data_ptrs = np.array(src_data_ptrs, dtype=np.uint64)
+        dst_data_ptrs = np.array(dst_data_ptrs, dtype=np.uint64)
+        item_lens = np.array(item_lens, dtype=np.uint64)
+
         # group by indices
         prefill_kv_blocks, dst_kv_blocks = group_concurrent_contiguous(
             prefill_data_indices, dst_data_indices
@@ -592,11 +615,11 @@ class NixlKVManager(CommonKVManager):
 
         # Precompute block starts/lengths to reduce Python-level loops.
         prefill_starts = np.fromiter(
-            (block[0] for block in prefill_kv_blocks), dtype=np.int64
+            (block[0] for block in prefill_kv_blocks), dtype=np.uint64
         )
-        dst_starts = np.fromiter((block[0] for block in dst_kv_blocks), dtype=np.int64)
+        dst_starts = np.fromiter((block[0] for block in dst_kv_blocks), dtype=np.uint64)
         block_lens = np.fromiter(
-            (len(block) for block in prefill_kv_blocks), dtype=np.int64
+            (len(block) for block in prefill_kv_blocks), dtype=np.uint64
         )
 
         for src_ptr, dst_ptr, item_len in layers_params:
@@ -608,14 +631,14 @@ class NixlKVManager(CommonKVManager):
 
         def make_req_array(addr_chunks, len_chunks, gpu):
             if not addr_chunks:
-                return np.empty((0, 3), dtype=np.int64)
-            flat_addrs = np.concatenate(addr_chunks)
-            flat_lens = np.concatenate(len_chunks)
+                return np.empty((0, 3), dtype=np.uint64)
+            flat_addrs = np.concatenate(addr_chunks).astype(np.uint64, copy=False)
+            flat_lens = np.concatenate(len_chunks).astype(np.uint64, copy=False)
             return np.column_stack(
                 (
                     flat_addrs,
                     flat_lens,
-                    np.full_like(flat_addrs, gpu),
+                    np.full_like(flat_addrs, gpu, dtype=np.uint64),
                 )
             )
 
@@ -766,13 +789,13 @@ class NixlKVManager(CommonKVManager):
 
         def make_req_array(addr_chunks, size, gpu):
             if not addr_chunks:
-                return np.empty((0, 3), dtype=np.int64)
-            flat_addrs = np.concatenate(addr_chunks)
+                return np.empty((0, 3), dtype=np.uint64)
+            flat_addrs = np.concatenate(addr_chunks).astype(np.uint64, copy=False)
             return np.column_stack(
                 (
                     flat_addrs,
-                    np.full_like(flat_addrs, size),
-                    np.full_like(flat_addrs, gpu),
+                    np.full_like(flat_addrs, size, dtype=np.uint64),
+                    np.full_like(flat_addrs, gpu, dtype=np.uint64),
                 )
             )
 
@@ -1183,6 +1206,9 @@ class NixlKVSender(CommonKVSender):
         super().__init__(mgr, bootstrap_addr, bootstrap_room, dest_tp_ranks, pp_rank)
         self.has_sent = False
         self.chunk_id = 0
+        self._send_failed = False
+        self._send_error: Optional[Exception] = None
+        self._transfer_start_time: Optional[float] = None
 
     def pop_decode_prefix_len(self) -> int:
         return self.kv_mgr.req_to_decode_prefix_len.pop(self.bootstrap_room, 0)
@@ -1195,6 +1221,9 @@ class NixlKVSender(CommonKVSender):
         kv_indices: npt.NDArray[np.int32],
         state_indices: Optional[List[int]] = None,
     ):
+        if self._send_failed:
+            return
+
         index_slice = slice(self.curr_idx, self.curr_idx + len(kv_indices))
         self.curr_idx += len(kv_indices)
         is_last = self.curr_idx == self.num_kv_indices
@@ -1213,6 +1242,11 @@ class NixlKVSender(CommonKVSender):
                 self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Success)
                 return
 
+        if self._transfer_start_time is None and (
+            len(kv_indices) > 0 or state_indices is not None
+        ):
+            self._transfer_start_time = time.perf_counter()
+
         self.kv_mgr.add_transfer_request(
             self.bootstrap_room,
             kv_indices,
@@ -1222,17 +1256,31 @@ class NixlKVSender(CommonKVSender):
             self.aux_index,
             state_indices,
         )
+        self._record_transfer_indices(kv_indices, state_indices)
         self.chunk_id += 1
         if is_last:
             self.has_sent = True
 
     def poll(self) -> KVPoll:
-        return self.kv_mgr.check_status(self.bootstrap_room)
+        if self._send_failed:
+            return KVPoll.Failed  # type: ignore
+        status = self.kv_mgr.check_status(self.bootstrap_room)
+        if (
+            status == KVPoll.Success
+            and self._transfer_start_time is not None
+            and self._transfer_metric.transfer_latency_s is None
+        ):
+            self._transfer_metric.transfer_latency_s = (
+                time.perf_counter() - self._transfer_start_time
+            )
+        return status
 
     def clear(self):
         self.kv_mgr.request_status.pop(self.bootstrap_room, None)
 
     def failure_exception(self):
+        if self._send_error is not None:
+            raise self._send_error
         raise RuntimeError("NIXL KVSender Exception")
 
 

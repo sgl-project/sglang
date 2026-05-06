@@ -1165,6 +1165,7 @@ class QwenImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
     _repeated_blocks = ["QwenImageTransformerBlock"]
 
     param_names_mapping = QwenImageDitConfig().arch_config.param_names_mapping
+    _fsdp_shard_conditions = QwenImageDitConfig().arch_config._fsdp_shard_conditions
 
     @classmethod
     def get_nunchaku_quant_rules(cls) -> dict[str, list[str]]:
