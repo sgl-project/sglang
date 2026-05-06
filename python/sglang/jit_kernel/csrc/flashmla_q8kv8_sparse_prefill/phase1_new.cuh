@@ -94,9 +94,7 @@ struct KernelTemplateQ8New {
   using SmemLayoutHalfVt = SmemLayoutVtTiles_FP8<D_V / 64 / 2>;  // (256, 64) fp8
   using SmemLayoutO = SmemLayoutOTiles<D_V / 64>;
 
-  // V transpose helper type
-  // Source layout: (B_TOPK, D_V) fp8 in K-major sw64 -> same as SmemLayoutKTiles_FP8<D_V/64>
-  using SmemTransposeV = SmemTransposeFp8_64x64<B_TOPK, D_V, SmemLayoutKTiles_FP8<D_V / 64>>;
+  using SmemTransposeV = SmemTransposeFp8_64x64<B_TOPK, D_V>;
 
   // ========================================================================
   // FP8 GMMA atoms -- native E4M3, k=32
