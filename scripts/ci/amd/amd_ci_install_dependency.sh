@@ -235,6 +235,54 @@ echo "amd-ci-stub" > "$SITE/torchcodec-${STUB_VERSION}.dist-info/INSTALLER"
 : > "$SITE/torchcodec-${STUB_VERSION}.dist-info/RECORD"
 '
 
+# AMD CI text-only patch for the MiMoV2 multimodal processor.
+#
+# Why this is needed:
+#   The text-only MiMo-V2.5-Pro and the multimodal MiMo-V2.5 share the
+#   `MiMoV2ForCausalLM` architecture name. Once the multimodal processor
+#   registers (via the torchcodec stub above), SGLang instantiates it for both
+#   variants. `MiMoV2Processor.__init__` then unconditionally accesses
+#   `hf_config.vision_config`, which does not exist on the text-only V2.5-Pro
+#   config and aborts the server launch with:
+#       AttributeError: 'MiMoV2Config' object has no attribute 'vision_config'
+#
+# Patch (applied only inside the AMD CI container, never committed to the
+# upstream source tree): wrap the body of `__init__` in a `hasattr` guard so
+# the processor returns immediately for text-only configs. Vision/audio code
+# paths are never exercised by V2.5-Pro requests, so the early return is safe.
+docker exec ci_sglang python3 - <<'PYPATCH'
+import sys
+
+PATH = "/sglang-checkout/python/sglang/srt/multimodal/processors/mimo_v2.py"
+ANCHOR = (
+    "        super().__init__(hf_config, server_args, _processor, *args, **kwargs)\n"
+    "        self.vision_config = Qwen2_5_VLVisionConfig.from_dict(hf_config.vision_config)"
+)
+PATCHED = (
+    "        super().__init__(hf_config, server_args, _processor, *args, **kwargs)\n"
+    "        # AMD CI: MiMo-V2.5-Pro shares MiMoV2ForCausalLM with the multimodal\n"
+    "        # V2.5 variant but is text-only and has no vision_config; skip the\n"
+    "        # vision/audio init so the server can launch.\n"
+    "        if not hasattr(hf_config, \"vision_config\"):\n"
+    "            return\n"
+    "        self.vision_config = Qwen2_5_VLVisionConfig.from_dict(hf_config.vision_config)"
+)
+GUARD_MARK = "AMD CI: MiMo-V2.5-Pro shares MiMoV2ForCausalLM"
+
+with open(PATH) as f:
+    src = f.read()
+
+if GUARD_MARK in src:
+    print("[AMD CI patch] mimo_v2.py text-only guard already present")
+elif ANCHOR in src:
+    src = src.replace(ANCHOR, PATCHED, 1)
+    with open(PATH, "w") as f:
+        f.write(src)
+    print("[AMD CI patch] applied text-only guard to MiMoV2Processor.__init__")
+else:
+    sys.exit("[AMD CI patch] anchor not found in mimo_v2.py; upstream changed")
+PYPATCH
+
 if [[ -n "${SKIP_AITER_BUILD}" ]]; then
   exit 0
 fi
