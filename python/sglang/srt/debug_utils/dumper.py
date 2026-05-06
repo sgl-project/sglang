@@ -885,7 +885,7 @@ class _Grafter:
         if is_send:
             _log(
                 f"[Grafter] send role={role.value} dir={direction.value} "
-                f"tags={tags} extras={extras}"
+                f"tags={tags} extras={extras} local={get_tensor_info(value)}"
             )
             return
 
@@ -902,6 +902,7 @@ class _Grafter:
         # crash the whole training/inference run. On error we log the full
         # traceback and skip this graft point; downstream sees the recv
         # side's original tensor unchanged.
+        info_before_overridden = get_tensor_info(value)
         try:
             value_to_override = self._apply_transform(
                 tags=tags,
@@ -909,10 +910,14 @@ class _Grafter:
                 received_extras_list=sender_extras,
                 target=value,
             )
+            diff = _compare_tensors_quick(value, value_to_override)
             _log(
                 f"[Grafter] recv role={role.value} dir={direction.value} "
                 f"tags={tags} n_senders={len(sender_tensors)} "
-                f"sender_extras={sender_extras}"
+                f"sender_extras={sender_extras} "
+                f"before_overridden={info_before_overridden} "
+                f"to_override={get_tensor_info(value_to_override)} "
+                f"diff_pre_vs_new={diff}"
             )
             value.copy_(value_to_override)
         except Exception as e:
@@ -1174,6 +1179,35 @@ def _get_world_size():
 def _log(msg: str) -> None:
     """Print a log line tagged with the current rank and wall-clock time."""
     print(f"[Dumper, rank={_get_rank()}, t={time.time():.3f}] {msg}", flush=True)
+
+
+def _compare_tensors_quick(a: "torch.Tensor", b: "torch.Tensor") -> str:
+    """One-line summary of how close two tensors are. Inspired by
+    sglang.srt.debug_utils.dump_comparator._compute_and_print_diff;
+    intentionally inlined here to keep dumper.py free of cross-file imports.
+
+    Different dtypes are fine -- we unify by casting both to fp32, which is
+    enough for the order-of-magnitude diff summary we log."""
+    if a.shape != b.shape:
+        return f"shape mismatch (a={tuple(a.shape)} vs b={tuple(b.shape)})"
+    if a.numel() == 0:
+        return "empty"
+    a_float = a.detach().to(torch.float32)
+    b_float = b.detach().to(torch.float32)
+    raw_abs = (a_float - b_float).abs()
+    max_abs = raw_abs.max().item()
+    mean_abs = raw_abs.mean().item()
+    rel_diff = _calc_rel_diff(a_float, b_float).item()
+    return f"rel_diff={rel_diff:.6g} max_abs={max_abs:.6g} mean_abs={mean_abs:.6g}"
+
+
+# Copied verbatim from sglang.srt.debug_utils.dump_comparator (originally from
+# DeepGEMM). Kept inline here so dumper.py has no cross-file imports.
+def _calc_rel_diff(x: "torch.Tensor", y: "torch.Tensor"):
+    x, y = x.double(), y.double()
+    denominator = (x * x + y * y).sum()
+    sim = 2 * (x * y).sum() / denominator
+    return 1 - sim
 
 
 def _obj_to_dict(obj):
