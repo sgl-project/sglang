@@ -98,6 +98,13 @@ class SchedulerStats:
     kv_evictable_tokens: int = 0
     kv_used_tokens: int = 0
 
+    swa_available_tokens: int = 0
+    swa_evictable_tokens: int = 0
+    swa_used_tokens: int = 0
+    mamba_available_tokens: int = 0
+    mamba_evictable_tokens: int = 0
+    mamba_used_tokens: int = 0
+
     # Speculative decoding
     spec_accept_length: float = 0.0
     spec_accept_rate: float = 0.0
@@ -117,6 +124,7 @@ class SchedulerStats:
 
     # Utilization
     utilization: float = 0.0
+    fwd_occupancy: float = float("nan")
 
     # Scheduler policy
     new_token_ratio: float = 0.0
@@ -289,6 +297,42 @@ class SchedulerMetricsCollector:
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
+        self.swa_available_tokens = Gauge(
+            name="sglang:swa_available_tokens",
+            documentation="Number of free token slots in the SWA pool (hybrid-SWA only).",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.swa_evictable_tokens = Gauge(
+            name="sglang:swa_evictable_tokens",
+            documentation="Number of evictable (radix-cached) token slots in the SWA pool.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.swa_used_tokens = Gauge(
+            name="sglang:swa_used_tokens",
+            documentation="Number of actively used token slots in the SWA pool.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.mamba_available_tokens = Gauge(
+            name="sglang:mamba_available_tokens",
+            documentation="Number of free state slots in the mamba SSM pool (hybrid-SSM only).",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.mamba_evictable_tokens = Gauge(
+            name="sglang:mamba_evictable_tokens",
+            documentation="Number of evictable (radix-cached) state slots in the mamba SSM pool.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.mamba_used_tokens = Gauge(
+            name="sglang:mamba_used_tokens",
+            documentation="Number of actively used state slots in the mamba SSM pool.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
 
         # =================================================================
         # Speculative decoding
@@ -425,6 +469,12 @@ class SchedulerMetricsCollector:
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
+        self.fwd_occupancy = Gauge(
+            name="sglang:fwd_occupancy",
+            documentation="Forward pass GPU occupancy percentage.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
 
         # =================================================================
         # Scheduler policy
@@ -539,10 +589,14 @@ class SchedulerMetricsCollector:
             documentation="Histogram of queueing time in seconds.",
             labelnames=labels.keys(),
             buckets=[
-                0.0,
-                0.1,
-                0.2,
-                0.5,
+                0.000,
+                0.001,
+                0.005,
+                0.010,
+                0.050,
+                0.100,
+                0.200,
+                0.500,
                 1,
                 2,
                 3,
@@ -1069,6 +1123,12 @@ class SchedulerMetricsCollector:
         self._log_gauge(self.kv_available_tokens, stats.kv_available_tokens)
         self._log_gauge(self.kv_evictable_tokens, stats.kv_evictable_tokens)
         self._log_gauge(self.kv_used_tokens, stats.kv_used_tokens)
+        self._log_gauge(self.swa_available_tokens, stats.swa_available_tokens)
+        self._log_gauge(self.swa_evictable_tokens, stats.swa_evictable_tokens)
+        self._log_gauge(self.swa_used_tokens, stats.swa_used_tokens)
+        self._log_gauge(self.mamba_available_tokens, stats.mamba_available_tokens)
+        self._log_gauge(self.mamba_evictable_tokens, stats.mamba_evictable_tokens)
+        self._log_gauge(self.mamba_used_tokens, stats.mamba_used_tokens)
 
         # Speculative decoding
         self._log_gauge(self.spec_accept_length, stats.spec_accept_length)
@@ -1098,6 +1158,7 @@ class SchedulerMetricsCollector:
 
         # Utilization
         self._log_gauge(self.utilization, stats.utilization)
+        self._log_gauge(self.fwd_occupancy, stats.fwd_occupancy)
 
         # Scheduler policy
         self._log_gauge(self.new_token_ratio, stats.new_token_ratio)
@@ -1256,6 +1317,14 @@ class TokenizerMetricsCollector:
         self.prompt_tokens_histogram = Histogram(
             name="sglang:prompt_tokens_histogram",
             documentation="Histogram of prompt token length.",
+            labelnames=labels.keys(),
+            buckets=generate_buckets(
+                server_args.prompt_tokens_buckets, default_bucket_prompt_tokens
+            ),
+        )
+        self.uncached_prompt_tokens_histogram = Histogram(
+            name="sglang:uncached_prompt_tokens_histogram",
+            documentation="Histogram of uncached (compute) prompt token length.",
             labelnames=labels.keys(),
             buckets=generate_buckets(
                 server_args.prompt_tokens_buckets, default_bucket_prompt_tokens
@@ -1434,6 +1503,9 @@ class TokenizerMetricsCollector:
             self.num_so_requests_total.labels(**labels).inc(1)
         self.histogram_e2e_request_latency.labels(**labels).observe(float(e2e_latency))
         self.prompt_tokens_histogram.labels(**labels).observe(float(prompt_tokens))
+        self.uncached_prompt_tokens_histogram.labels(**labels).observe(
+            float(prompt_tokens - cached_tokens)
+        )
         self.generation_tokens_histogram.labels(**labels).observe(
             float(generation_tokens)
         )
