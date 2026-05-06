@@ -859,6 +859,7 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
         else:
             if self.prefill_transfer_queue_entry_time <= 0 or self.completion_time <= 0:
                 return result if result else None
+            # Note: This only capture the last chunk time
             transfer_latency_s = (
                 self.completion_time - self.prefill_transfer_queue_entry_time
             )

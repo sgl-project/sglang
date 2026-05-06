@@ -544,7 +544,7 @@ class CommonKVSender(BaseKVSender):
             self.bootstrap_room,
             "Aborted by AbortReq.",
         )
-        # Explicitly set the status to failure since this request has been aborted
+        self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
         self.conclude_state = KVPoll.Failed
 
 
@@ -739,7 +739,7 @@ class CommonKVReceiver(BaseKVReceiver):
             self.bootstrap_room,
             "Aborted by AbortReq.",
         )
-        # Explicitly set the status to failure since this request has been aborted
+        self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
         self.conclude_state = KVPoll.Failed
 
 
