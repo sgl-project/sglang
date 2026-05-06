@@ -77,9 +77,8 @@ def _is_main_guard(test: ast.expr) -> bool:
 
 
 def _is_bare_pytest_main_call(stmt: ast.stmt) -> bool:
-    """Match `pytest.main(...)` as a bare expression statement (i.e. its
-    return value is discarded). `sys.exit(pytest.main(...))` and
-    `code = pytest.main(...)` are fine."""
+    """Match `pytest.main(...)` whose return value is discarded.
+    `sys.exit(pytest.main(...))` and `code = pytest.main(...)` are fine."""
     if not isinstance(stmt, ast.Expr):
         return False
     call = stmt.value
