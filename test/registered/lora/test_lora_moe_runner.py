@@ -415,10 +415,15 @@ def test_lora_moe_runner_multi_expert(
 
     class MockServerArgs:
         enable_deterministic_inference = False
+        enable_fused_moe_sum_all_reduce = False
 
+    mock_args = MockServerArgs()
     with patch(
         "sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe_triton_config.get_global_server_args",
-        return_value=MockServerArgs(),
+        return_value=mock_args,
+    ), patch(
+        "sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe.get_global_server_args",
+        return_value=mock_args,
     ):
         runner = MoeRunner(MoeRunnerBackend.TRITON, config, lora_enabled=True)
 
@@ -565,10 +570,15 @@ def test_lora_moe_runner_virtual_experts(
 
     class MockServerArgs:
         enable_deterministic_inference = False
+        enable_fused_moe_sum_all_reduce = False
 
+    mock_args = MockServerArgs()
     with patch(
         "sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe_triton_config.get_global_server_args",
-        return_value=MockServerArgs(),
+        return_value=mock_args,
+    ), patch(
+        "sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe.get_global_server_args",
+        return_value=mock_args,
     ):
         runner = MoeRunner(MoeRunnerBackend.TRITON, config, lora_enabled=True)
 
