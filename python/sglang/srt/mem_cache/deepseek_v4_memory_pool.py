@@ -546,7 +546,6 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             if ratio != 0:
                 compress_state_pool = CompressStatePool(
                     size=size,
-                    swa_page_size=self.swa_page_size,
                     ring_size=ring_size,
                     overlap=overlap,
                     head_dim=self.qk_nope_head_dim + self.qk_rope_head_dim,
@@ -560,7 +559,6 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             if ratio == 4:
                 indexer_compress_state_pool = CompressStatePool(
                     size=size,
-                    swa_page_size=self.swa_page_size,
                     ring_size=ring_size,
                     overlap=overlap,
                     head_dim=self.indexer_head_dim,

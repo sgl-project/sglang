@@ -37,7 +37,6 @@ class CompressStatePool:
     def __init__(
         self,
         size: int,
-        swa_page_size: int,
         ring_size: int,
         overlap: bool,
         head_dim: int,
@@ -47,10 +46,7 @@ class CompressStatePool:
         ratio: int,
         online: bool = False,
     ):
-        self.swa_page_size = swa_page_size
         self.ring_size = ring_size
-        self.enable_memory_saver = enable_memory_saver
-        self.online = online
 
         if online:
             assert ring_size == 1, "online compress requires ring_size=1"
