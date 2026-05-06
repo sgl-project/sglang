@@ -1107,7 +1107,6 @@ class MoriKVReceiver(CommonKVReceiver):
         if self.bootstrap_room is None:
             return
         super().abort()
-        self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
         self.clear()
 
 
