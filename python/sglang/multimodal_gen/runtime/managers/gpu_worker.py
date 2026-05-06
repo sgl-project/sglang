@@ -15,6 +15,11 @@ import torch
 from setproctitle import setproctitle
 
 from sglang.multimodal_gen import envs
+from sglang.multimodal_gen.runtime.cancellation import (
+    DEFAULT_CANCEL_MESSAGE,
+    RequestCancelledError,
+    raise_if_cancelled,
+)
 from sglang.multimodal_gen.runtime.distributed import (
     get_sp_group,
     get_tp_rank,
@@ -326,6 +331,8 @@ class GPUWorker:
                     stack.enter_context(
                         trace_slice(item.trace_ctx, DiffStage.GPU_FORWARD)
                     )
+                for item in log_reqs:
+                    raise_if_cancelled(item, self.server_args)
                 result = forward_fn()
 
             # disagg roles return raw Req so callers can keep and transfer intermediate tensors
@@ -334,6 +341,10 @@ class GPUWorker:
                 return result
 
             output_batch = self._to_output_batch(result)
+            if output_batch.active_request_indices is None:
+                output_batch.active_request_indices = req.extra.get(
+                    "dynamic_batch_active_request_indices"
+                )
             self._record_output_peak_memory(output_batch)
 
             output_metrics = self._iter_output_metrics(output_batch)
@@ -357,6 +368,8 @@ class GPUWorker:
             # file-path-only responses avoid serializing generated tensors between
             # scheduler_client and gpu_worker.
             if req.save_output and req.return_file_paths_only:
+                for item in log_reqs:
+                    raise_if_cancelled(item, self.server_args)
                 save_output_paths(output_batch)
                 output_batch.output = None
                 output_batch.audio = None
@@ -387,6 +400,27 @@ class GPUWorker:
                     meta={"model": self.server_args.model_path},
                     tag="server_perf_dump",
                 )
+        except RequestCancelledError as e:
+            logger.info("Cancelled %s: %s", error_context, e)
+            if output_batch is None:
+                output_batch = OutputBatch()
+            output_batch.error = DEFAULT_CANCEL_MESSAGE
+            output_batch.cancelled = True
+            output_batch.cancel_reason = e.reason
+            output_batch.output = None
+            output_batch.audio = None
+            output_batch.audio_sample_rate = None
+            output_batch.output_file_paths = None
+            output_batch.active_request_indices = req.extra.get(
+                "dynamic_batch_active_request_indices"
+            )
+            if output_batch.metrics is None and log_reqs:
+                output_batch.metrics = log_reqs[0].metrics
+            if len(log_reqs) > 1:
+                output_batch.metrics_list = [item.metrics for item in log_reqs]
+            self._record_output_peak_memory(output_batch)
+            if torch.cuda.is_initialized():
+                torch.cuda.empty_cache()
         except Exception as e:
             logger.error(
                 f"Error executing {error_context}: {e}",
@@ -397,6 +431,9 @@ class GPUWorker:
             if output_batch is None:
                 output_batch = OutputBatch()
             output_batch.error = f"Error executing {error_context}: {e}"
+            output_batch.active_request_indices = req.extra.get(
+                "dynamic_batch_active_request_indices"
+            )
             self._record_output_peak_memory(output_batch)
             # clean cache if OOM
             if torch.cuda.is_initialized():
@@ -521,6 +558,7 @@ class GPUWorker:
             enable_upscaling=req.enable_upscaling,
             upscaling_model_path=req.upscaling_model_path,
             upscaling_scale=req.upscaling_scale,
+            cancel_check=lambda: raise_if_cancelled(req, self.server_args),
         )
 
     def _save_group_output_paths(
@@ -552,6 +590,7 @@ class GPUWorker:
             enable_upscaling=first_req.enable_upscaling,
             upscaling_model_path=first_req.upscaling_model_path,
             upscaling_scale=first_req.upscaling_scale,
+            cancel_check=lambda: raise_if_cancelled(reqs, self.server_args),
         )
 
     @staticmethod
@@ -614,6 +653,9 @@ class GPUWorker:
             rollout_trajectory_data=getattr(result, "rollout_trajectory_data", None),
             noise_pred=getattr(result, "noise_pred", None),
             trajectory_decoded=getattr(result, "trajectory_decoded", None),
+            active_request_indices=getattr(result, "extra", {}).get(
+                "dynamic_batch_active_request_indices"
+            ),
         )
 
     @staticmethod
@@ -642,6 +684,9 @@ class GPUWorker:
     ) -> None:
         if output_batch.error is not None and merged.error is None:
             merged.error = output_batch.error
+        if output_batch.cancelled:
+            merged.cancelled = True
+            merged.cancel_reason = output_batch.cancel_reason
         merged.peak_memory_mb = max(merged.peak_memory_mb, output_batch.peak_memory_mb)
         if (
             merged.trajectory_timesteps is None

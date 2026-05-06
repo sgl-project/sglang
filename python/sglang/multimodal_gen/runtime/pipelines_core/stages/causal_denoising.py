@@ -2,11 +2,15 @@
 
 import torch  # type: ignore
 
+from sglang.multimodal_gen.runtime.cancellation import raise_if_cancelled
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.models.utils import pred_noise_to_pred_video
 from sglang.multimodal_gen.runtime.pipelines_core.diffusion_scheduler_utils import (
     get_or_create_request_scheduler,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.dynamic_batching import (
+    BatchCompactionContext,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import DenoisingStage
@@ -104,9 +108,37 @@ class CausalDMDDenoisingStage(DenoisingStage):
         # Latents and prompts
         assert batch.latents is not None, "latents must be provided"
         latents = batch.latents  # [B, C, T, H, W]
-        b, c, t, h, w = latents.shape
+        t, h, w = latents.shape[2:]
         prompt_embeds = batch.prompt_embeds
         assert torch.isnan(prompt_embeds[0]).sum() == 0
+
+        def compact_current_batch(current_latents=None):
+            nonlocal h, image_kwargs, latents, pos_cond_kwargs, prompt_embeds, t, w
+            ctx = BatchCompactionContext(
+                latents=latents,
+                image_kwargs=image_kwargs,
+                pos_cond_kwargs=pos_cond_kwargs,
+                neg_cond_kwargs={},
+                extra_step_kwargs={},
+                guidance=None,
+                scheduler=scheduler,
+                trajectory_latents=[],
+                current_latents=current_latents,
+                kv_cache1=self.kv_cache1,
+                crossattn_cache=self.crossattn_cache,
+            )
+            self._compact_dynamic_batch_if_needed(ctx, batch, server_args)
+            raise_if_cancelled(batch, server_args)
+            latents = ctx.latents
+            image_kwargs = ctx.image_kwargs
+            pos_cond_kwargs = ctx.pos_cond_kwargs
+            prompt_embeds = batch.prompt_embeds
+            self.kv_cache1 = ctx.kv_cache1
+            self.crossattn_cache = ctx.crossattn_cache
+            t, h, w = latents.shape[2:]
+            return ctx.current_latents
+
+        compact_current_batch()
 
         # Initialize or reset caches
         if self.kv_cache1 is None:
@@ -228,6 +260,7 @@ class CausalDMDDenoisingStage(DenoisingStage):
         # DMD loop in causal blocks
         with self.progress_bar(total=len(block_sizes) * len(timesteps)) as progress_bar:
             for current_num_frames in block_sizes:
+                compact_current_batch()
                 current_latents = latents[
                     :, :, start_index : start_index + current_num_frames, :, :
                 ]
@@ -236,6 +269,9 @@ class CausalDMDDenoisingStage(DenoisingStage):
                 video_raw_latent_shape = noise_latents_btchw.shape
 
                 for i, t_cur in enumerate(timesteps):
+                    current_latents = compact_current_batch(current_latents)
+                    noise_latents_btchw = current_latents.permute(0, 2, 1, 3, 4)
+                    video_raw_latent_shape = noise_latents_btchw.shape
                     # Copy for pred conversion
                     noise_latents = noise_latents_btchw.clone()
                     latent_model_input = current_latents.to(target_dtype)

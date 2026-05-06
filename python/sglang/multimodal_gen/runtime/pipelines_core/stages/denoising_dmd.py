@@ -4,6 +4,7 @@ import time
 
 import torch
 
+from sglang.multimodal_gen.runtime.cancellation import raise_if_cancelled
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.models.schedulers.scheduling_flow_match_euler_discrete import (
@@ -96,6 +97,16 @@ class DmdDenoisingStage(DenoisingStage):
         denoising_loop_start_time = time.time()
         with self.progress_bar(total=len(timesteps)) as progress_bar:
             for i, t in enumerate(timesteps):
+                prepared_vars.latents = latents
+                prepared_vars.scheduler = scheduler
+                prepared_vars.image_kwargs = image_kwargs
+                prepared_vars.pos_cond_kwargs = pos_cond_kwargs
+                self._compact_dynamic_batch_if_needed(prepared_vars, batch, server_args)
+                latents = prepared_vars.latents
+                image_kwargs = prepared_vars.image_kwargs
+                pos_cond_kwargs = prepared_vars.pos_cond_kwargs
+                video_raw_latent_shape = latents.shape
+                raise_if_cancelled(batch, server_args)
                 # Skip if interrupted
                 if hasattr(self, "interrupt") and self.interrupt:
                     continue

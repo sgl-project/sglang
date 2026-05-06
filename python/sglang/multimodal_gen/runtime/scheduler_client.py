@@ -5,6 +5,10 @@ from typing import Any
 import zmq
 import zmq.asyncio
 
+from sglang.multimodal_gen.runtime.cancellation import (
+    CancelGenerationReq,
+    mark_request_cancelled,
+)
 from sglang.multimodal_gen.runtime.ipc_array import materialize_file_refs
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
@@ -147,7 +151,7 @@ class AsyncSchedulerClient:
         self.context = zmq.asyncio.Context()
         logger.debug("AsyncSchedulerClient initialized with zmq.asyncio.Context")
 
-    async def forward(self, batch: Any) -> Any:
+    async def forward(self, batch: Any, *, timeout_ms: int | None = None) -> Any:
         """Sends a batch or request to the scheduler and waits for the response."""
         if self.context is None:
             raise RuntimeError(
@@ -158,7 +162,7 @@ class AsyncSchedulerClient:
         socket = self.context.socket(zmq.REQ)
         socket.setsockopt(zmq.LINGER, 0)
         # 100 minute timeout
-        socket.setsockopt(zmq.RCVTIMEO, 6000000)
+        socket.setsockopt(zmq.RCVTIMEO, timeout_ms or 6000000)
 
         endpoint = self.server_args.scheduler_endpoint
         socket.connect(endpoint)
@@ -174,6 +178,24 @@ class AsyncSchedulerClient:
             raise TimeoutError("Scheduler did not respond in time.")
         finally:
             socket.close()
+
+    async def cancel(
+        self,
+        request_id: str,
+        *,
+        reason: str = "client_cancelled",
+        timeout_ms: int = 1000,
+    ) -> Any:
+        """Mark a request cancelled and ask the scheduler to drop queued work."""
+        if self.server_args is None:
+            raise RuntimeError(
+                "AsyncSchedulerClient is not initialized. Call initialize() first."
+            )
+        mark_request_cancelled(request_id, self.server_args, reason)
+        return await self.forward(
+            CancelGenerationReq(request_id=request_id, reason=reason),
+            timeout_ms=timeout_ms,
+        )
 
     async def ping(self) -> bool:
         """
