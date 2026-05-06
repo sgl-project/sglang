@@ -7740,11 +7740,87 @@ def run_model_runner_runtime_req_to_token_payload_production_hook_for_smoke(
             model_runner=model_runner,
         )
     )
+    explicit_req_to_token_entries_present = (
+        explicit_req_to_token_entries_source_path is not None
+    )
+    metadata_derived_entries_enabled = (
+        os.getenv("SGLANG_RELAYKV_RUNTIME_METADATA_DERIVED_REQ_TO_TOKEN_ENTRIES")
+        == "1"
+    )
+    metadata_derived_entries_state = "not_attempted"
+    metadata_derived_entry_count = 0
+    metadata_derived_result_count = 0
+    metadata_derived_blocked_count = 0
+    metadata_derived_source_path = None
+    metadata_derived_blocked_reason = None
+    req_to_token_entry_source = "none"
+
+    effective_req_to_token_entries = explicit_req_to_token_entries
+    if explicit_req_to_token_entries_present:
+        req_to_token_entry_source = "explicit"
+    elif metadata_derived_entries_enabled:
+        metadata_derived_results = (
+            build_relaykv_runtime_metadata_derived_req_to_token_entries_for_smoke(
+                runtime_observation_payloads=runtime_observation_payloads,
+                kv_index_resolution_plans=kv_index_resolution_plans,
+                production_enabled=True,
+                max_tokens_per_request=256,
+                max_total_tokens=1024,
+            )
+        )
+        metadata_derived_summary = (
+            summarize_relaykv_runtime_metadata_derived_req_to_token_entries_for_smoke(
+                metadata_derived_results,
+                production_enabled=True,
+                max_tokens_per_request=256,
+                max_total_tokens=1024,
+            )
+        )
+        metadata_derived_result_count = len(metadata_derived_results)
+        metadata_derived_blocked_count = int(
+            metadata_derived_summary.get("blocked_count") or 0
+        )
+        derived_entries_found = None
+        for result in metadata_derived_results:
+            if not isinstance(result, Mapping):
+                continue
+            derived_entries = result.get("derived_req_to_token_entries")
+            if result.get("derivation_state") == "derived" and isinstance(
+                derived_entries, list
+            ):
+                derived_entries_found = list(derived_entries)
+                metadata_derived_entry_count = len(derived_entries_found)
+                metadata_derived_entries_state = "derived"
+                metadata_derived_blocked_reason = None
+                adapter_metadata = result.get("adapter_metadata")
+                if isinstance(adapter_metadata, Mapping):
+                    metadata_derived_source_path = adapter_metadata.get(
+                        "runtime_metadata_derivation_source_path"
+                    )
+                if metadata_derived_source_path is None:
+                    metadata_derived_source_path = runtime_observation_source_path
+                effective_req_to_token_entries = derived_entries_found
+                req_to_token_entry_source = "metadata_derived"
+                break
+        if derived_entries_found is None:
+            metadata_derived_entries_state = "blocked"
+            for result in metadata_derived_results:
+                if not isinstance(result, Mapping):
+                    continue
+                metadata_derived_blocked_reason = result.get("blocked_reason")
+                adapter_metadata = result.get("adapter_metadata")
+                if isinstance(adapter_metadata, Mapping):
+                    metadata_derived_source_path = adapter_metadata.get(
+                        "runtime_metadata_derivation_source_path"
+                    )
+                if metadata_derived_source_path is None:
+                    metadata_derived_source_path = runtime_observation_source_path
+                break
 
     payloads = build_relaykv_runtime_req_to_token_resolution_payloads_for_smoke(
         runtime_observation_payloads=runtime_observation_payloads,
         kv_index_resolution_plans=kv_index_resolution_plans,
-        explicit_req_to_token_entries=explicit_req_to_token_entries,
+        explicit_req_to_token_entries=effective_req_to_token_entries,
         production_enabled=True,
         max_tokens_per_request=256,
         max_total_tokens=1024,
@@ -7788,6 +7864,31 @@ def run_model_runner_runtime_req_to_token_payload_production_hook_for_smoke(
         adapter_metadata["explicit_req_to_token_entries_source_path"] = (
             explicit_req_to_token_entries_source_path
         )
+        adapter_metadata["metadata_derived_entries_enabled"] = (
+            metadata_derived_entries_enabled
+        )
+        adapter_metadata["metadata_derived_entries_state"] = (
+            metadata_derived_entries_state
+        )
+        adapter_metadata["metadata_derived_entry_count"] = (
+            metadata_derived_entry_count
+        )
+        adapter_metadata["metadata_derived_result_count"] = (
+            metadata_derived_result_count
+        )
+        adapter_metadata["metadata_derived_blocked_count"] = (
+            metadata_derived_blocked_count
+        )
+        adapter_metadata["metadata_derived_source_path"] = (
+            metadata_derived_source_path
+        )
+        adapter_metadata["metadata_derived_blocked_reason"] = (
+            metadata_derived_blocked_reason
+        )
+        adapter_metadata["explicit_req_to_token_entries_present"] = (
+            explicit_req_to_token_entries_present
+        )
+        adapter_metadata["req_to_token_entry_source"] = req_to_token_entry_source
         adapter_metadata["payload_attached"] = payload_attached
         adapter_metadata["payload_attach_target"] = payload_attach_target
 
@@ -7809,6 +7910,17 @@ def run_model_runner_runtime_req_to_token_payload_production_hook_for_smoke(
     summary["explicit_req_to_token_entries_source_path"] = (
         explicit_req_to_token_entries_source_path
     )
+    summary["metadata_derived_entries_enabled"] = metadata_derived_entries_enabled
+    summary["metadata_derived_entries_state"] = metadata_derived_entries_state
+    summary["metadata_derived_entry_count"] = metadata_derived_entry_count
+    summary["metadata_derived_result_count"] = metadata_derived_result_count
+    summary["metadata_derived_blocked_count"] = metadata_derived_blocked_count
+    summary["metadata_derived_source_path"] = metadata_derived_source_path
+    summary["metadata_derived_blocked_reason"] = metadata_derived_blocked_reason
+    summary["explicit_req_to_token_entries_present"] = (
+        explicit_req_to_token_entries_present
+    )
+    summary["req_to_token_entry_source"] = req_to_token_entry_source
     return {"payloads": payloads, "summary": summary}
 
 
