@@ -2,13 +2,15 @@ from __future__ import annotations
 
 import logging
 import threading
-from typing import TYPE_CHECKING, Optional
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any, Optional, Tuple
 
 import torch
 
 from sglang.srt.mem_cache.base_prefix_cache import (
     EvictParams,
     EvictResult,
+    InitLoadBackParams,
     MatchPrefixParams,
     MatchResult,
 )
@@ -33,6 +35,25 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class _LMCacheLoadMarker:
+    """Carries the data ``init_load_back`` needs from the
+    ``match_prefix`` call that decided a load is warranted.
+
+    Stuffed into ``MatchResult.last_host_node`` for the MP path; the
+    base ``BasePrefixCache.last_host_node`` is typed ``Any`` so this
+    is fine. ``init_load_back`` reads it back from
+    ``InitLoadBackParams.last_host_node`` to know what to allocate
+    and retrieve.
+    """
+
+    token_ids: Any  # the engine's token id sequence (list-like)
+    extra_key: Any  # RadixKey extra-key (model-supplied disambiguator)
+    value_numel: int  # number of tokens already in radix at match time
+    matched: int  # daemon-reported chunk-aligned match count from LOOKUP
+    last_device_node: Any  # last on-device TreeNode at match time
 
 
 class LayerTransferCounter:
@@ -159,29 +180,24 @@ class LMCRadixCache(RadixCache):
         value: torch.Tensor = base_res.device_indices
         last_node: TreeNode = base_res.last_device_node
 
-        # MP mode keys the daemon-side session by ``req.rid`` so the same
-        # id flows from LOOKUP through STORE/END_SESSION (mirroring vLLM /
-        # TRT-LLM). Some scheduler paths call ``match_prefix`` as a peek
-        # without a Req (e.g. in-batch prefix-caching priority in
-        # schedule_policy); for those, skip the LMCache fetch — the
-        # actual prefill pass through schedule_batch passes ``req`` and
-        # picks up the cached prefix at that time.
+        # In MP mode the daemon-side session is keyed by ``req.rid`` so
+        # the same id flows from LOOKUP through STORE/END_SESSION. Peek
+        # callers in ``schedule_policy`` don't pass a Req (the field is
+        # Mamba-flavored optional in SGLang); fall through to the radix
+        # result for those — the real ``schedule_batch`` pass passes
+        # ``req`` and our two-phase load lands then.
         is_mp_load = self._mp_mode and params.req is not None
 
-        # Full-radix-hit / no-fresh-tokens cases: ``_load_into_slots`` won't
-        # fire, so ``start_load_kv`` won't issue a LOOKUP. Send a session-
-        # only LOOKUP via ``ensure_session`` so the eventual STORE+END_SESSION
-        # at request finish lands on a session that has ``lookup_ipc_key``
-        # set, matching vLLM/TRT-LLM's per-request session lifecycle.
-        uncached_len = len(key) - value.numel()
-        if value.numel() == len(key) or uncached_len == 0:
-            if is_mp_load:
-                self.lmcache_connector.ensure_session(
-                    key.token_ids, params.req.rid
-                )
-            return base_res
+        if is_mp_load:
+            return self._mp_match_prefix(key, base_res, value, last_node, params.req)
 
-        if not is_mp_load:
+        # In-process mode below: existing single-shot pattern that runs
+        # LOOKUP + first-layer retrieve inside ``start_load_kv`` and lets
+        # the per-layer transfer hook drive the rest during forward.
+        if value.numel() == len(key):
+            return base_res
+        uncached_len = len(key) - value.numel()
+        if uncached_len == 0:
             return base_res
 
         chunk_size = self.lmcache_connector.chunk_size()
@@ -192,12 +208,6 @@ class LMCRadixCache(RadixCache):
 
         token_slots = self.token_to_kv_pool_allocator.alloc(uncached_len)
         if token_slots is None:
-            # Allocation failed — _load_into_slots won't fire, so
-            # start_load_kv won't issue a LOOKUP. Still create the daemon
-            # session so the eventual STORE+END_SESSION pairs cleanly.
-            self.lmcache_connector.ensure_session(
-                key.token_ids, params.req.rid
-            )
             return base_res
 
         slot_mapping = torch.cat(
@@ -213,7 +223,7 @@ class LMCRadixCache(RadixCache):
                 slot_mapping=slot_mapping,
                 offset=value.numel() - prefix_pad,
                 prefix_pad=prefix_pad,
-                request_id=params.req.rid,
+                request_id="",
             )
         )
         logger.debug("num_retrieved_tokens: %s", num_retrieved)
@@ -247,6 +257,145 @@ class LMCRadixCache(RadixCache):
             last_device_node=last_node,
             last_host_node=last_node,
         )
+
+    def _mp_match_prefix(
+        self,
+        key: RadixKey,
+        base_res: MatchResult,
+        value: torch.Tensor,
+        last_node: TreeNode,
+        req: Req,
+    ) -> MatchResult:
+        """Phase-1 of the MP-mode two-phase load.
+
+        Fires LOOKUP via ``connector.lookup_kv`` (no GPU copy). If the
+        daemon's matched-token count goes beyond what radix already
+        has, return a ``MatchResult`` with ``host_hit_length`` set so
+        the SGLang scheduler will call our ``init_load_back`` at
+        dispatch time to fire the actual RETRIEVE. Otherwise, release
+        the held read locks and return the radix-only result.
+
+        In both cases the daemon now has a session keyed by ``req.rid``
+        with ``lookup_ipc_key`` set, so the eventual STORE+END_SESSION
+        in ``cache_finished_req`` reuses it without warnings.
+        """
+        matched = self.lmcache_connector.lookup_kv(key.token_ids, req.rid)
+        if matched <= value.numel():
+            # LMCache had nothing fresh beyond what's already in radix.
+            # Release the read locks; pending entry stays so end_session
+            # still sends END_SESSION wire (clean session lifecycle).
+            self.lmcache_connector.release_pending(req.rid)
+            return base_res
+
+        marker = _LMCacheLoadMarker(
+            token_ids=key.token_ids,
+            extra_key=key.extra_key,
+            value_numel=int(value.numel()),
+            matched=matched,
+            last_device_node=last_node,
+        )
+        return MatchResult(
+            device_indices=value,
+            last_device_node=last_node,
+            last_host_node=marker,
+            host_hit_length=matched - int(value.numel()),
+        )
+
+    def init_load_back(  # type: ignore[override]
+        self, params: InitLoadBackParams
+    ) -> Tuple[torch.Tensor, Any]:
+        """Phase-2 of the MP-mode two-phase load.
+
+        Called by the scheduler at dispatch time when ``match_prefix``
+        returned ``host_hit_length > 0``. Allocates the new GPU slots,
+        builds the slot_mapping, fires RETRIEVE via
+        ``connector.retrieve_kv`` (which uses the cached LOOKUP result
+        from ``_mp_match_prefix`` — no second LOOKUP wire), inserts a
+        new ``TreeNode`` into the radix tree, and returns
+        ``(new_indices, new_last_node)`` for the scheduler to splice
+        onto ``req.prefix_indices``.
+        """
+        marker = params.last_host_node
+        if not isinstance(marker, _LMCacheLoadMarker) or params.req is None:
+            # Shouldn't happen if our match_prefix produced this hit,
+            # but guard anyway.
+            return (
+                torch.empty((0,), dtype=torch.int64, device=self.device),
+                (
+                    marker
+                    if isinstance(marker, TreeNode)
+                    else (params.req.last_node if params.req is not None else None)
+                ),
+            )
+
+        req = params.req
+        last_node: TreeNode = marker.last_device_node
+        new_count = marker.matched - marker.value_numel
+
+        if self.token_to_kv_pool_allocator.available_size() < new_count:
+            self.evict(EvictParams(num_tokens=new_count))
+
+        token_slots = self.token_to_kv_pool_allocator.alloc(new_count)
+        if token_slots is None:
+            # Allocation failed; release held locks and report no load.
+            self.lmcache_connector.release_pending(req.rid)
+            return (
+                torch.empty((0,), dtype=torch.int64, device=self.device),
+                last_node,
+            )
+
+        chunk_size = self.lmcache_connector.chunk_size()
+        prefix_pad = marker.value_numel % chunk_size
+
+        slot_mapping = torch.cat(
+            [
+                torch.full(
+                    (marker.value_numel,),
+                    -1,
+                    dtype=torch.int64,
+                    device=self.device,
+                ),
+                token_slots.detach().clone().to(torch.int64).to(self.device),
+            ]
+        )
+
+        with torch.cuda.stream(self.load_stream):
+            retrieved = self.lmcache_connector.retrieve_kv(
+                LoadMetadata(
+                    token_ids=marker.token_ids,
+                    slot_mapping=slot_mapping,
+                    offset=marker.value_numel - prefix_pad,
+                    prefix_pad=prefix_pad,
+                    request_id=req.rid,
+                )
+            )
+        torch.cuda.current_stream().wait_stream(self.load_stream)
+
+        if retrieved <= 0:
+            self.token_to_kv_pool_allocator.free(token_slots)
+            return (
+                torch.empty((0,), dtype=torch.int64, device=self.device),
+                last_node,
+            )
+
+        fetched = retrieved - prefix_pad
+        if fetched < new_count:
+            self.token_to_kv_pool_allocator.free(token_slots[fetched:])
+
+        new_node = TreeNode(priority=last_node.priority)
+        new_node.key = RadixKey(
+            marker.token_ids[marker.value_numel : marker.value_numel + fetched],
+            marker.extra_key,
+        )
+        new_node.value = token_slots[:fetched]
+        new_node.parent = last_node
+        last_node.children[new_node.key.child_key(self.page_size)] = new_node
+        self.evictable_size_ += fetched
+
+        self._record_store_event(new_node.parent)
+        self._record_store_event(new_node)
+
+        return token_slots[:fetched], new_node
 
     def cache_finished_req(self, req: Req, is_insert: bool = True) -> None:  # type: ignore[override]
         """On request completion, insert device KV into radix and store to LMCache."""
