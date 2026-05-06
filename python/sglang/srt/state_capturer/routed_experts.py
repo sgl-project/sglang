@@ -78,8 +78,10 @@ class RoutedExpertsCapturer(BaseTopkCapturer):
             device_topk_size=topk_size + num_fused_shared_experts,
         )
 
-        # DeepEP a2a path needs an attn-tp all-gather to reconstruct the full
-        # batch before storing into device_cache; pre-allocate the gather tgt.
+        # DeepEP a2a path: each attn-TP rank only sees its scattered slice of
+        # topk_ids. All-gather across attn-TP at capture time so device_cache
+        # holds the full batch and the existing _get_local_slice / D2H sync
+        # paths work unchanged. Pre-allocate the gather target.
         if get_moe_a2a_backend().is_deepep():
             attn_tp_size = get_attention_tp_size() if is_dp_attention_enabled() else 1
             self.gather_buffer = torch.empty(
@@ -106,7 +108,10 @@ class RoutedExpertsCapturer(BaseTopkCapturer):
         can_run_graph: bool,
         cuda_graph_batch: Optional[int],
     ) -> torch.Tensor:
-        if is_dp_attention_enabled():
+        # Under DeepEP, capture() already attn_tp_all_gathered into the head of
+        # the per-rank buffer, so the local DP rank's data lives at [0:N_local]
+        # rather than at the global [start_pos:end_pos] offset.
+        if is_dp_attention_enabled() and not get_moe_a2a_backend().is_deepep():
             local_start_pos, local_num_tokens = get_dp_local_info(forward_batch)
             if can_run_graph:
                 local_start_pos = get_attention_dp_rank() * cuda_graph_batch
