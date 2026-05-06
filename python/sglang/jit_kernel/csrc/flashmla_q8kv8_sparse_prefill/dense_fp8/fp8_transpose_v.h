@@ -58,33 +58,6 @@ struct SmemTransposeFp8_64x64 {
   TiledCopySTSM tiled_copy_stsm;
 
   template <class SmemTensor, class SmemTensorOut>
-  CUTLASS_DEVICE void transpose(SmemTensor&& s_in, SmemTensorOut&& s_out) {
-    using namespace cute;
-
-    auto tid = threadIdx.x % cutlass::NumThreadsPerWarpGroup;
-    auto thr_copy_ldsm = tiled_copy_ldsm.get_thread_slice(tid);
-    auto thr_copy_stsm = tiled_copy_stsm.get_thread_slice(tid);
-
-    auto tXsX = thr_copy_ldsm.partition_S(s_in);
-    auto tXrX = make_tensor<Element>(shape(tXsX));
-    auto tXsX_out = thr_copy_stsm.partition_D(s_out);
-
-    cute::copy(tiled_copy_ldsm, tXsX, tXrX);
-
-    auto data = tXrX.data();
-    CUTLASS_PRAGMA_UNROLL
-    for (int n = 0; n < size(tXrX); n += 8) {
-      uint32_t* data_32bit = reinterpret_cast<uint32_t*>(&data[n]);
-      auto upper = data_32bit[0];
-      auto lower = data_32bit[1];
-      data_32bit[0] = __byte_perm(upper, lower, 0x6420);
-      data_32bit[1] = __byte_perm(upper, lower, 0x7531);
-    }
-
-    cute::copy(tiled_copy_stsm, tXrX, tXsX_out);
-  }
-
-  template <class SmemTensor, class SmemTensorOut>
   CUTLASS_DEVICE void
   transpose_pair(SmemTensor&& s_in0, SmemTensorOut&& s_out0, SmemTensor&& s_in1, SmemTensorOut&& s_out1) {
     using namespace cute;
