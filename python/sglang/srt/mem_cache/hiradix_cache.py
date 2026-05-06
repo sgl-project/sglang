@@ -53,7 +53,6 @@ from sglang.srt.mem_cache.radix_cache import (
     compute_node_hash_values,
     split_node_hash_value,
 )
-from sglang.srt.mem_cache.utils import convert_to_bigram_key
 from sglang.srt.observability.metrics_collector import StorageMetricsCollector
 
 if TYPE_CHECKING:
@@ -98,11 +97,11 @@ class HiRadixCache(RadixCache):
             )
 
         self.tp_group = params.tp_cache_group
+        self.attn_cp_group = params.attn_cp_cache_group
+        self.attn_tp_group = params.attn_tp_cache_group
         self.tp_world_size = torch.distributed.get_world_size(group=self.tp_group)
         self.pp_rank = params.pp_rank
         self.pp_size = params.pp_size
-        self.attn_cp_rank = params.attn_cp_rank
-        self.attn_cp_size = params.attn_cp_size
         self.enable_storage = server_args.hicache_storage_backend is not None
         self.enable_storage_metrics = self.enable_storage and params.enable_metrics
         self.extra_metric_labels = server_args.extra_metric_labels
@@ -130,6 +129,8 @@ class HiRadixCache(RadixCache):
                 prefetch_threshold=prefetch_threshold,
                 enable_storage_metrics=self.enable_storage_metrics,
                 load_cache_event=self.load_cache_event,
+                attn_cp_group=self.attn_cp_group,
+                attn_tp_group=self.attn_tp_group,
             )
         else:
             self.cache_controller = HiCacheController(
@@ -138,6 +139,8 @@ class HiRadixCache(RadixCache):
                 self.page_size,
                 self.tp_group,
                 load_cache_event=self.load_cache_event,
+                attn_cp_group=self.attn_cp_group,
+                attn_tp_group=self.attn_tp_group,
                 write_policy=server_args.hicache_write_policy,
                 io_backend=server_args.hicache_io_backend,
                 storage_backend=server_args.hicache_storage_backend,
@@ -146,8 +149,6 @@ class HiRadixCache(RadixCache):
                 storage_backend_extra_config=extra_config,
                 pp_rank=self.pp_rank,
                 pp_size=self.pp_size,
-                attn_cp_rank=self.attn_cp_rank,
-                attn_cp_size=self.attn_cp_size,
                 enable_storage_metrics=self.enable_storage_metrics,
             )
         self._apply_storage_runtime_config(
@@ -183,6 +184,24 @@ class HiRadixCache(RadixCache):
         self.evictable_host_leaves = set()
 
         super().__init__(params=params)
+
+    def _all_reduce_attn_groups(self, tensor: torch.Tensor, op):
+        reduced = False
+        for group in (self.attn_cp_group, self.attn_tp_group):
+            if group is not None and torch.distributed.get_world_size(group=group) > 1:
+                torch.distributed.all_reduce(tensor, op=op, group=group)
+                reduced = True
+        if not reduced and self.tp_world_size > 1:
+            torch.distributed.all_reduce(tensor, op=op, group=self.tp_group)
+
+    def _barrier_attn_groups(self):
+        waited = False
+        for group in (self.attn_cp_group, self.attn_tp_group):
+            if group is not None and torch.distributed.get_world_size(group=group) > 1:
+                torch.distributed.barrier(group=group)
+                waited = True
+        if not waited and self.tp_world_size > 1:
+            torch.distributed.barrier(group=self.tp_group)
 
     def shutdown(self):
         """Best-effort auto-detach of storage backend on process shutdown.
@@ -220,14 +239,17 @@ class HiRadixCache(RadixCache):
         self.enable_storage_metrics = enable_storage_metrics
 
         if self.enable_storage_metrics:
+            attn_cp_rank, attn_cp_size = (
+                self.cache_controller.get_attn_cp_rank_and_size()
+            )
             labels = {
                 "storage_backend": storage_backend,
                 "tp_rank": self.cache_controller.tp_rank,
                 "dp_rank": self.cache_controller.dp_rank,
                 "pp_rank": self.cache_controller.pp_rank,
                 "pp_size": self.cache_controller.pp_size,
-                "attn_cp_rank": self.cache_controller.attn_cp_rank,
-                "attn_cp_size": self.cache_controller.attn_cp_size,
+                "attn_cp_rank": attn_cp_rank,
+                "attn_cp_size": attn_cp_size,
             }
             if extra_metric_labels:
                 labels.update(extra_metric_labels)
@@ -741,13 +763,8 @@ class HiRadixCache(RadixCache):
                 break
             finish_count += 1
         queue_size = torch.tensor(finish_count, dtype=torch.int, device="cpu")
-        if self.tp_world_size > 1:
-            # synchronize TP workers to make the same update to radix cache
-            torch.distributed.all_reduce(
-                queue_size,
-                op=torch.distributed.ReduceOp.MIN,
-                group=self.tp_group,
-            )
+        # Keep cache state transitions identical across CPxTP participants.
+        self._all_reduce_attn_groups(queue_size, torch.distributed.ReduceOp.MIN)
 
         finish_count = int(queue_size.item())
         while finish_count > 0:
@@ -829,7 +846,7 @@ class HiRadixCache(RadixCache):
             return
 
         for child in node.children.values():
-            if child.evicted:
+            if child.backuped:
                 if node in self.evictable_host_leaves:
                     self.evictable_host_leaves.remove(node)
                 return
@@ -1074,10 +1091,7 @@ class HiRadixCache(RadixCache):
             ],
             dtype=torch.int,
         )
-        if self.tp_world_size > 1:
-            torch.distributed.all_reduce(
-                qsizes, op=torch.distributed.ReduceOp.MIN, group=self.tp_group
-            )
+        self._all_reduce_attn_groups(qsizes, torch.distributed.ReduceOp.MIN)
 
         n_revoke, n_backup, n_release = map(int, qsizes.tolist())
         self._drain_storage_control_queues_impl(
@@ -1118,18 +1132,13 @@ class HiRadixCache(RadixCache):
             return True
 
         operation_terminated = operation.is_terminated()
-        if self.tp_world_size > 1:
-            states = torch.tensor(
-                [1 - int(can_terminate), int(operation_terminated)],
-                dtype=torch.int,
-            )
-            torch.distributed.all_reduce(
-                states,
-                op=torch.distributed.ReduceOp.MAX,
-                group=self.tp_group,
-            )
-            can_terminate = states[0].item() == 0
-            operation_terminated = states[1].item() == 1
+        states = torch.tensor(
+            [1 - int(can_terminate), int(operation_terminated)],
+            dtype=torch.int,
+        )
+        self._all_reduce_attn_groups(states, torch.distributed.ReduceOp.MAX)
+        can_terminate = states[0].item() == 0
+        operation_terminated = states[1].item() == 1
         # the operation should be terminated if it is already terminated on any TP worker
         # or it meets the termination condition on all TP workers
         can_terminate = can_terminate or operation_terminated
@@ -1142,7 +1151,7 @@ class HiRadixCache(RadixCache):
 
         # todo: more policies for prefetch progress such as timeout
         # the current policy is to prefetch with best effort and terminate when queuing is over
-        last_host_node, token_ids, host_indices, operation = self.ongoing_prefetch[
+        last_host_node, prefetch_key, host_indices, operation = self.ongoing_prefetch[
             req_id
         ]
 
@@ -1159,24 +1168,17 @@ class HiRadixCache(RadixCache):
         logger.debug(f"Prefetch {req_id} completed with {completed_tokens} tokens")
 
         min_completed_tokens = completed_tokens
-        if self.tp_world_size > 1:
-            # synchrnoize TP workers to make the same update to hiradix cache
-            completed_tokens_tensor = torch.tensor(
-                min_completed_tokens, dtype=torch.int
-            )
-            torch.distributed.all_reduce(
-                completed_tokens_tensor,
-                op=torch.distributed.ReduceOp.MIN,
-                group=self.tp_group,
-            )
-            min_completed_tokens = completed_tokens_tensor.item()
-        fetched_token_ids = token_ids[:min_completed_tokens]
+        # Synchronize workers before mutating host cache tree state.
+        completed_tokens_tensor = torch.tensor(min_completed_tokens, dtype=torch.int)
+        self._all_reduce_attn_groups(
+            completed_tokens_tensor, torch.distributed.ReduceOp.MIN
+        )
+        min_completed_tokens = completed_tokens_tensor.item()
+        fetched_key = prefetch_key[:min_completed_tokens]
         written_indices = host_indices[:min_completed_tokens]
         matched_length = self._insert_helper_host(
             last_host_node,
-            RadixKey(
-                token_ids=fetched_token_ids, extra_key=last_host_node.key.extra_key
-            ),
+            fetched_key,
             written_indices,
             hash_value[: min_completed_tokens // self.page_size],
         )
@@ -1187,7 +1189,7 @@ class HiRadixCache(RadixCache):
         )
         last_host_node.release_host()
         del self.ongoing_prefetch[req_id]
-        self.cache_controller.prefetch_tokens_occupied -= len(token_ids)
+        self.cache_controller.prefetch_tokens_occupied -= len(prefetch_key)
 
         # Track tokens actually loaded from storage for this request (L3 hits)
         loaded_from_storage = min_completed_tokens - matched_length
@@ -1216,10 +1218,9 @@ class HiRadixCache(RadixCache):
         return self.prefetch_loaded_tokens_by_reqid.pop(req_id, 0)
 
     def match_prefix(self, params: MatchPrefixParams):
-        key = params.key
         empty_value = torch.empty((0,), dtype=torch.int64, device=self.device)
-        key, _ = key.maybe_to_bigram_view(self.is_eagle)
-        if self.disable or len(key) == 0:
+
+        def empty_match_result():
             return MatchResult(
                 device_indices=empty_value,
                 last_device_node=self.root_node,
@@ -1227,8 +1228,14 @@ class HiRadixCache(RadixCache):
                 host_hit_length=0,
             )
 
+        if self.disable:
+            return empty_match_result()
+
+        key = params.key
+        key, _ = key.maybe_to_bigram_view(self.is_eagle)
         key = key.page_aligned(self.page_size)
-        page_aligned_len = len(key)
+        if len(key) == 0:
+            return empty_match_result()
 
         value, last_node = self._match_prefix_helper(self.root_node, key)
         if value:
@@ -1259,16 +1266,14 @@ class HiRadixCache(RadixCache):
         last_hash: Optional[str] = None,
         prefix_keys: Optional[List[str]] = None,
     ):
-        new_input_tokens = (
-            convert_to_bigram_key(new_input_tokens)
-            if self.is_eagle
-            else new_input_tokens
+        prefetch_key = RadixKey(
+            new_input_tokens,
+            extra_key=last_host_node.key.extra_key,
+            is_bigram=self.is_eagle,
         )
         # align the number of fetching tokens to the page size
-        prefetch_length = len(new_input_tokens) - (
-            len(new_input_tokens) % self.page_size
-        )
-        new_input_tokens = new_input_tokens[:prefetch_length]
+        prefetch_key = prefetch_key.page_aligned(self.page_size)
+        prefetch_length = len(prefetch_key)
         if (
             not self.enable_storage
             or prefetch_length < self.prefetch_threshold
@@ -1282,24 +1287,32 @@ class HiRadixCache(RadixCache):
             self.evict_host(prefetch_length)
             host_indices = self.cache_controller.mem_pool_host.alloc(prefetch_length)
         if host_indices is None:
-            last_host_node.release_host()
-            # no sufficient host memory for prefetch
-            return
+            avaliable_size = self.cache_controller.mem_pool_host.available_size()
+            prefetch_length = avaliable_size - (avaliable_size % self.page_size)
+            if prefetch_length >= self.prefetch_threshold:
+                new_input_tokens = new_input_tokens[:prefetch_length]
+                host_indices = self.cache_controller.mem_pool_host.alloc(
+                    prefetch_length
+                )
+            else:
+                last_host_node.release_host()
+                # no sufficient host memory for prefetch
+                return
         operation = self.cache_controller.prefetch(
             req_id,
             host_indices,
-            new_input_tokens,
+            prefetch_key,
             last_hash,
             prefix_keys,
             **self._get_extra_pools(),
         )
         self.ongoing_prefetch[req_id] = (
             last_host_node,
-            new_input_tokens,
+            prefetch_key,
             host_indices,
             operation,
         )
-        self.cache_controller.prefetch_tokens_occupied += len(new_input_tokens)
+        self.cache_controller.prefetch_tokens_occupied += len(prefetch_key)
 
     def _insert_helper_host(
         self, node: TreeNode, key: RadixKey, host_value, hash_value
@@ -1489,14 +1502,15 @@ class HiRadixCache(RadixCache):
         if rid not in self.ongoing_prefetch:
             return
 
-        last_host_node, token_ids, host_indices, operation = self.ongoing_prefetch[rid]
+        last_host_node, prefetch_key, host_indices, operation = self.ongoing_prefetch[
+            rid
+        ]
         if operation.host_indices is None:
             return
 
         completed_tokens, _ = self.cache_controller.terminate_prefetch(operation)
-        if self.tp_world_size > 1:
-            torch.distributed.barrier(group=self.tp_group)
+        self._barrier_attn_groups()
         last_host_node.release_host()
         del self.ongoing_prefetch[rid]
         self.cache_controller.append_host_mem_release(host_indices[:completed_tokens])
-        self.cache_controller.prefetch_tokens_occupied -= len(token_ids)
+        self.cache_controller.prefetch_tokens_occupied -= len(prefetch_key)

@@ -365,6 +365,10 @@
       "destination": "/docs/sglang-diffusion/attention_backends"
     },
     {
+      "source": "/diffusion/performance/dynamic_batching.html",
+      "destination": "/docs/sglang-diffusion/dynamic_batching"
+    },
+    {
       "source": "/diffusion/performance/cache/cache_dit.html",
       "destination": "/docs/sglang-diffusion/cache_dit"
     },
@@ -825,7 +829,8 @@
                   "docs/developer_guide/bench_serving"
                 ]
               },
-              "docs/developer_guide/evaluating_new_models"
+              "docs/developer_guide/evaluating_new_models",
+              "docs/developer_guide/msprobe_debugging_guide"
             ]
           },
           {
@@ -940,6 +945,7 @@
                   {
                     "group": "DeepSeek",
                     "pages": [
+                      "cookbook/autoregressive/DeepSeek/DeepSeek-V4",
                       "cookbook/autoregressive/DeepSeek/DeepSeek-V3_2",
                       "cookbook/autoregressive/DeepSeek/DeepSeek-V3_1",
                       "cookbook/autoregressive/DeepSeek/DeepSeek-V3",
@@ -1004,6 +1010,7 @@
                   {
                     "group": "NVIDIA",
                     "pages": [
+                      "cookbook/autoregressive/NVIDIA/Nemotron3-Nano-Omni",
                       "cookbook/autoregressive/NVIDIA/Nemotron3-Nano",
                       "cookbook/autoregressive/NVIDIA/Nemotron3-Super"
                     ]
@@ -1025,6 +1032,7 @@
                   {
                     "group": "InclusionAI",
                     "pages": [
+                      "cookbook/autoregressive/InclusionAI/Ling-2.6",
                       "cookbook/autoregressive/InclusionAI/Ling-2.5-1T",
                       "cookbook/autoregressive/InclusionAI/Ring-2.5-1T",
                       "cookbook/autoregressive/InclusionAI/LLaDA-2.1"
@@ -1053,12 +1061,14 @@
                     "pages": [
                       "cookbook/autoregressive/Mistral/Ministral-3",
                       "cookbook/autoregressive/Mistral/Mistral-Small-4",
+                      "cookbook/autoregressive/Mistral/Mistral-Medium-3.5",
                       "cookbook/autoregressive/Mistral/Devstral-2"
                     ]
                   },
                   {
                     "group": "Xiaomi",
                     "pages": [
+                      "cookbook/autoregressive/Xiaomi/MiMo-V2.5",
                       "cookbook/autoregressive/Xiaomi/MiMo-V2-Flash"
                     ]
                   },
@@ -1091,6 +1101,12 @@
                     "pages": [
                       "cookbook/diffusion/Wan/Wan2.1",
                       "cookbook/diffusion/Wan/Wan2.2"
+                    ]
+                  },
+                  {
+                    "group": "LTX",
+                    "pages": [
+                      "cookbook/diffusion/LTX/LTX"
                     ]
                   },
                   {
@@ -1158,6 +1174,12 @@
                   "docs/sglang-diffusion/performance-optimization",
                   "docs/sglang-diffusion/ring_sp_performance",
                   "docs/sglang-diffusion/attention_backends",
+                  {
+                    "group": "Inference Batching",
+                    "pages": [
+                      "docs/sglang-diffusion/dynamic_batching"
+                    ]
+                  },
                   "docs/sglang-diffusion/profiling",
                   "docs/sglang-diffusion/ci_perf"
                 ]

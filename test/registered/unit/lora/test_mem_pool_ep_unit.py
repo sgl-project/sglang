@@ -16,7 +16,7 @@ Usage:
 from sglang.test.ci.ci_register import register_cuda_ci
 
 # CPU-only unit test; no CUDA/distributed dependencies.
-register_cuda_ci(est_time=4, suite="stage-b-test-1-gpu-small")
+register_cuda_ci(est_time=9, suite="stage-b-test-1-gpu-small")
 
 import types
 import unittest
@@ -605,6 +605,125 @@ class TestMoeBufferShardsByMoeTp(unittest.TestCase):
         q_b = pool.get_lora_B_shape("qkv_proj", model, 8, 0)
         # head_dim * (heads + 2*kv_heads) / tp_size = 8 * 24 / 4 = 48.
         self.assertEqual(q_b, (2, 48, 8))
+
+
+class TestLoadBufferPassesMoeTpRankToSlice(unittest.TestCase):
+    """Regression: `load_lora_weight_to_buffer` must hand `moe_tp_rank` (not
+    the outer `tp_rank`) to `slice_moe_lora_{a,b}_weights`.
+
+    Per-expert MoE weights are sharded along
+    `moe_tp_size = tp_size // ep_size // dp_size`, NOT the outer `tp_size`.
+    The bug only surfaces when those two values differ — i.e. when
+    `1 < ep_size < tp_size`. Concrete reproducer (`tp=4 ep=2`):
+
+      moe_tp_size = 2; outer rank 3 has moe_tp_rank=1.
+      `intermediate_size_per_partition = moe_inter / 2 = 384`.
+      Slicing with the OUTER rank (3) computes `start = 3 * 384 = 1152`,
+      which is past the full `moe_inter = 768`, returning a `[r, 0]`-shaped
+      tensor that fails the shape-match assert in `load_lora_weight_tensor`.
+
+    This test exercises `load_lora_weight_to_buffer` end-to-end with a
+    minimal mocked `FusedMoEWithLoRA` whose slicer captures-and-raises so
+    we don't need to satisfy buffer-copy shape constraints.
+    """
+
+    class _StopAfterCapture(Exception):
+        """Sentinel raised from the mocked slicer to short-circuit
+        execution before the buffer-copy phase (which would need real
+        shapes the test does not provide)."""
+
+    def test_moe_tp_rank_used_for_slicing_when_ep_lt_tp(self):
+        from sglang.srt.lora.layers import FusedMoEWithLoRA
+
+        # tp=4 ep=2 → moe_tp_size=2. Pick OUTER rank 3 so moe_tp_rank=1.
+        # The two values differ; the bug would surface on this exact rank.
+        pool = LoRAMemoryPool.__new__(LoRAMemoryPool)
+        pool.tp_size = 4
+        pool.tp_rank = 3
+        pool.moe_tp_size = 2
+        pool.moe_tp_rank = 1
+        pool.moe_ep_size = 2
+        pool.moe_ep_rank = 1
+        pool.moe_use_local_expert_ids = True
+        pool._num_experts_local = 1
+        pool.num_layer = 1
+        pool.target_modules = {"gate_up_proj", "down_proj"}
+        pool.experts_shared_outer_loras = False
+        pool.strict_loading = False
+        pool.lora_added_tokens_size = 0
+        # Tiny placeholder buffers — the mocked slicer raises before any of
+        # this is read in the buffer-copy phase.
+        pool.A_buffer = {
+            "gate_up_proj_moe": [torch.zeros(1, 1, 1, 1)],
+            "down_proj_moe": [torch.zeros(1, 1, 1, 1)],
+        }
+        pool.B_buffer = {
+            "gate_up_proj_moe": [torch.zeros(1, 1, 1, 1)],
+            "down_proj_moe": [torch.zeros(1, 1, 1, 1)],
+        }
+        pool.embedding_A_buffer = {}
+        pool.embedding_B_buffer = {}
+        pool.lm_head_A_buffer = {}
+        pool.lm_head_B_buffer = {}
+        pool.new_embeddings_buffer = {}
+
+        captured_ranks = []
+
+        moe_mod = mock.MagicMock(spec=FusedMoEWithLoRA)
+
+        def capture_a(weights, tp_rank, target_module):
+            captured_ranks.append(("A", target_module, tp_rank))
+            raise TestLoadBufferPassesMoeTpRankToSlice._StopAfterCapture()
+
+        def capture_b(weights, tp_rank, target_module):
+            captured_ranks.append(("B", target_module, tp_rank))
+            raise TestLoadBufferPassesMoeTpRankToSlice._StopAfterCapture()
+
+        moe_mod.slice_moe_lora_a_weights.side_effect = capture_a
+        moe_mod.slice_moe_lora_b_weights.side_effect = capture_b
+
+        # Adapter with one per-expert MoE LoRA-A weight. The expert regex
+        # `experts\.(\d+)\.` must match the key, which routes the weight
+        # into `temp_A_buffer["gate_up_proj_moe"]` — the dict shape that
+        # makes `temp_A_buffer.get("gate_up_proj_moe") is not None` true,
+        # which in turn triggers `slice_moe_lora_a_weights` (and the
+        # capture).
+        adapter = mock.MagicMock()
+        adapter.config.r = 4
+        adapter.scaling = 1.0
+        adapter.embedding_layers = {}
+        adapter.added_tokens_embeddings = {}
+        adapter.layers = [
+            types.SimpleNamespace(
+                weights={
+                    "model.layers.0.mlp.experts.0.gate_up_proj.lora_A.weight": (
+                        torch.zeros(8, 4)
+                    ),
+                },
+            )
+        ]
+
+        with self.assertRaises(TestLoadBufferPassesMoeTpRankToSlice._StopAfterCapture):
+            pool.load_lora_weight_to_buffer(
+                uid="test",
+                buffer_id=0,
+                lora_adapter=adapter,
+                lora_modules=[{"mlp.experts": moe_mod}],
+                lora_embed_tokens_module=None,
+                lora_lm_head_module=None,
+            )
+
+        self.assertGreater(len(captured_ranks), 0, "slicing was never invoked")
+        for ab, target_module, rank in captured_ranks:
+            self.assertEqual(
+                rank,
+                pool.moe_tp_rank,
+                f"slice_moe_lora_{ab.lower()}_weights for {target_module} "
+                f"received rank={rank}; expected moe_tp_rank="
+                f"{pool.moe_tp_rank} (outer tp_rank is {pool.tp_rank}). "
+                "Passing the outer tp_rank slices past "
+                "intermediate_size_per_partition when ep_size < tp_size.",
+            )
 
 
 if __name__ == "__main__":

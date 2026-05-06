@@ -9,7 +9,7 @@ import torch
 from torch.nn.utils.rnn import pad_sequence
 
 from sglang.benchmark.utils import download_and_cache_hf_file
-from sglang.srt.layers.moe.routed_experts_capturer import (
+from sglang.srt.state_capturer.routed_experts import (
     extract_routed_experts_from_meta_info,
 )
 from sglang.srt.utils import kill_process_tree
@@ -22,7 +22,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=164, suite="stage-b-test-2-gpu-large")
+register_cuda_ci(est_time=185, suite="stage-b-test-2-gpu-large")
 register_amd_ci(
     est_time=200,
     suite="stage-b-test-2-gpu-large-amd",
