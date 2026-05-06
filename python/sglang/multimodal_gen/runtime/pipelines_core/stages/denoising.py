@@ -1313,8 +1313,7 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         params = inspect.signature(target_func).parameters
         result = (
             any(
-                param.kind == inspect.Parameter.VAR_KEYWORD
-                for param in params.values()
+                param.kind == inspect.Parameter.VAR_KEYWORD for param in params.values()
             ),
             frozenset(params),
         )
