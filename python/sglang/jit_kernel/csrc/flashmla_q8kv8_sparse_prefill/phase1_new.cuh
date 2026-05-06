@@ -155,8 +155,8 @@ struct KernelTemplateQ8New {
     extern __shared__ char wksp_buf[];
     SharedMemoryPlan& plan = *reinterpret_cast<SharedMemoryPlan*>(wksp_buf);
 
-    const float q_scale = params.q_scale_ptr ? __ldg(params.q_scale_ptr) : params.q_scale;
-    const float kv_scale = params.kv_scale_ptr ? __ldg(params.kv_scale_ptr) : params.kv_scale;
+    const float q_scale = __ldg(params.q_scale_ptr);
+    const float kv_scale = __ldg(params.kv_scale_ptr);
     const float qk_combined_scale_div_log2 = q_scale * kv_scale * params.sm_scale_div_log2;
 
     if (warp_idx == 0 && elect_one_sync()) {
