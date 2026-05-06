@@ -304,7 +304,6 @@ class SymmetricMemoryContext:
         global _active_symmetric_memory_context
         _active_symmetric_memory_context = None
 
-
     def _register_segments_for_comm(self):
         """
         Register all tracked segments with the current comm.
