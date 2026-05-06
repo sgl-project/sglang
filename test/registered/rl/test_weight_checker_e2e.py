@@ -15,14 +15,17 @@
 
 Exercises the full HTTP -> tokenizer_manager -> scheduler -> model_runner ->
 WeightChecker chain on a real engine. Unit tests in
-test/registered/unit/utils/test_weight_checker.py cover the in-module logic
-with stubs; this file is the thin integration cover."""
+test/registered/unit/utils/test_weight_checker.py cover the in-module
+logic; this file is the thin integration cover plus interaction with
+update_weights_from_tensor."""
 
 import unittest
+from typing import List, Tuple
 
 import requests
+import torch
 
-from sglang.srt.utils import kill_process_tree
+from sglang.srt.utils import MultiprocessingSerializer, kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
@@ -32,7 +35,12 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=120, suite="stage-b-test-1-gpu-small")
+register_cuda_ci(est_time=150, suite="stage-b-test-1-gpu-small")
+
+# Shape of model.layers.X.mlp.up_proj.weight in DEFAULT_SMALL_MODEL_NAME_FOR_TEST
+# (Llama-3.2-1B-Instruct, fused gate_up under sglang's naming). Mirrors the
+# constant used in test/registered/rl/test_update_weights_from_tensor.py.
+_UP_PROJ_SHAPE = (16384, 2048)
 
 
 class TestWeightCheckerE2E(CustomTestCase):
@@ -60,6 +68,20 @@ class TestWeightCheckerE2E(CustomTestCase):
             f"{self.url}/weights_checker", json={"action": action}, timeout=120
         )
 
+    def _update_weights(
+        self, named_tensors: List[Tuple[str, torch.Tensor]]
+    ) -> requests.Response:
+        return requests.post(
+            f"{self.url}/update_weights_from_tensor",
+            json={
+                "serialized_named_tensors": [
+                    MultiprocessingSerializer.serialize(named_tensors, output_str=True)
+                ],
+                "flush_cache": True,
+            },
+            timeout=120,
+        )
+
     def test_a_snapshot_then_compare_unchanged_succeeds(self):
         resp = self._post("snapshot")
         self.assertEqual(resp.status_code, 200)
@@ -73,6 +95,42 @@ class TestWeightCheckerE2E(CustomTestCase):
         resp = self._post("nonsense_action")
         self.assertEqual(resp.status_code, 400)
         self.assertIn("Unsupported", resp.json()["message"])
+
+    def test_c_update_with_diff_tensor_makes_compare_fail(self):
+        """A snapshot then an update with new bytes must make compare fail."""
+        self.assertEqual(self._post("snapshot").status_code, 200)
+
+        param_name = "model.layers.5.mlp.up_proj.weight"
+        new_tensor = torch.full(_UP_PROJ_SHAPE, 1.5, device="cuda")
+        update_resp = self._update_weights([(param_name, new_tensor)])
+        self.assertEqual(update_resp.status_code, 200)
+        self.assertTrue(update_resp.json()["success"])
+
+        resp = self._post("compare")
+        self.assertEqual(resp.status_code, 400)
+        body = resp.json()
+        self.assertFalse(body["success"])
+        self.assertIn(param_name, body["message"])
+
+    def test_d_update_with_same_tensor_keeps_compare_passing(self):
+        """Prime a param, snapshot, push the same bytes again, compare must pass."""
+        param_name = "model.layers.6.mlp.up_proj.weight"
+        same_tensor = torch.full(_UP_PROJ_SHAPE, 0.25, device="cuda")
+
+        # Step 1: prime the param to a known value.
+        self.assertTrue(
+            self._update_weights([(param_name, same_tensor)]).json()["success"]
+        )
+        # Step 2: snapshot the now-primed state.
+        self.assertEqual(self._post("snapshot").status_code, 200)
+        # Step 3: push the exact same bytes again — should be a byte-perfect no-op.
+        self.assertTrue(
+            self._update_weights([(param_name, same_tensor)]).json()["success"]
+        )
+        # Step 4: compare passes.
+        resp = self._post("compare")
+        self.assertEqual(resp.status_code, 200)
+        self.assertTrue(resp.json()["success"])
 
     def test_z_snapshot_reset_compare_detects_diff(self):
         """Destructive: leaves weights randomized. Named test_z_* so it runs last."""
