@@ -97,20 +97,19 @@ class KimiK2Detector(BaseFormatDetector):
             logger.debug("function_call_tuples: %s", function_call_tuples)
 
             tool_calls = []
-            for match in function_call_tuples:
+            for i, match in enumerate(function_call_tuples):
                 function_id, function_args = match
                 m = self.tool_call_id_regex.match(function_id)
                 if not m:
                     logger.warning("Unexpected tool_call_id format: %s", function_id)
                     continue
                 function_name = m.group("name")
-                function_idx = int(m.group("index"))
 
                 logger.debug(f"function_name {function_name}")
 
                 tool_calls.append(
                     ToolCallItem(
-                        tool_index=function_idx,
+                        tool_index=i,
                         name=function_name,
                         parameters=function_args,
                     )
