@@ -143,6 +143,7 @@ class DumperConfig(_BaseConfig):
     grafter_enable: bool = False
     grafter_role: str = ""  # required if enabled: "baseline" or "target"
     grafter_b2t_filter: Optional[str] = None  # names flowing baseline -> target
+    grafter_t2b_filter: Optional[str] = None  # names flowing target -> baseline
     grafter_master_address: str = ""  # required if enabled
     grafter_master_port: int = -1  # required if enabled (positive port)
     grafter_baseline_world_size: int = -1  # required if enabled
@@ -178,9 +179,12 @@ class DumperConfig(_BaseConfig):
                 f"grafter_target_world_size must be > 0 when grafter_enable=True, "
                 f"got {self.grafter_target_world_size}"
             )
-            assert self.grafter_b2t_filter is not None, (
-                "grafter_enable=True but grafter_b2t_filter is not set; "
-                "nothing would ever be grafted"
+            assert (
+                self.grafter_b2t_filter is not None
+                or self.grafter_t2b_filter is not None
+            ), (
+                "grafter_enable=True but neither grafter_b2t_filter nor "
+                "grafter_t2b_filter is set; nothing would ever be grafted"
             )
 
     @property
@@ -789,14 +793,20 @@ class _GraftRole(enum.Enum):
     TARGET = "target"
 
 
+class _GraftDirection(enum.Enum):
+    B2T = "b2t"  # name flows baseline -> target
+    T2B = "t2b"  # name flows target -> baseline
+
+
 class _Grafter:
     """1+1 cross-system tensor grafter.
 
-    Both sides set the SAME `grafter_b2t_filter` (names that flow
-    baseline -> target). The only per-side difference is `grafter_role`,
-    which tells the side whether it's the sender (baseline) or the
-    receiver (target). Receiver overwrites its local target tensor with
-    the sender's via `value.copy_()`.
+    Both sides set the SAME `grafter_b2t_filter` (names that flow baseline ->
+    target) and `grafter_t2b_filter` (names that flow target -> baseline).
+    The only per-side difference is `grafter_role`, which tells the side
+    whether it's the sender or the receiver for the matched direction.
+    Receiver overwrites its local target tensor with the sender's via
+    `value.copy_()`.
     """
 
     def __init__(self, *, config: DumperConfig) -> None:
@@ -808,12 +818,13 @@ class _Grafter:
         if not cfg.grafter_enable:
             return
 
-        if not self._match(cfg.grafter_b2t_filter, tags):
+        direction = self._classify_direction(tags)
+        if direction is None:
             return
 
         if not isinstance(value, torch.Tensor):
             _log(
-                f"[Grafter] tags={tags} matched grafter_b2t_filter but "
+                f"[Grafter] tags={tags} matched grafter_{direction.value}_filter but "
                 f"value is not a torch.Tensor (got type={type(value).__name__}); "
                 f"skipping graft. Common cause: dumper.dump called with a "
                 f"non-tensor value (dict, list, ...) on this name. Either "
@@ -823,23 +834,44 @@ class _Grafter:
 
         self._ensure_group()
         role = _GraftRole(cfg.grafter_role)
+        is_send = self._is_sender(role=role, direction=direction)
 
-        # b2t with 1+1: baseline rank is sender (graft rank 0), target is recv
-        # (graft rank 1). Use broadcast_object_list so receiver can have an
-        # arbitrarily shaped placeholder; sender ships a pickled tensor.
+        # 1+1 broadcast: sender side ships the tensor as a pickled object;
+        # recv side calls `value.copy_()` with the received tensor.
+        sender_rank = 0 if direction == _GraftDirection.B2T else 1
         obj_list: list = [None]
-        if role == _GraftRole.BASELINE:
+        if is_send:
             obj_list = [value]
-            _log(f"[Grafter] send role=baseline tags={tags}")
-        dist.broadcast_object_list(obj_list, src=0, group=self._pg)
-        if role == _GraftRole.TARGET:
+            _log(f"[Grafter] send role={role.value} dir={direction.value} tags={tags}")
+        dist.broadcast_object_list(obj_list, src=sender_rank, group=self._pg)
+        if not is_send:
             received = obj_list[0]
             if isinstance(received, torch.Tensor):
                 # Pickled CUDA tensors restore to their original-device name;
                 # that may not match this process's local device, so normalize.
                 received = received.to(value.device)
-            _log(f"[Grafter] recv role=target tags={tags}")
+            _log(f"[Grafter] recv role={role.value} dir={direction.value} tags={tags}")
             value.copy_(received)
+
+    def _classify_direction(self, tags: dict) -> Optional["_GraftDirection"]:
+        cfg = self._config
+        match_b2t = self._match(cfg.grafter_b2t_filter, tags)
+        match_t2b = self._match(cfg.grafter_t2b_filter, tags)
+        if match_b2t and match_t2b:
+            raise RuntimeError(
+                f"[Grafter] tags={tags} matched BOTH grafter_b2t_filter "
+                f"and grafter_t2b_filter"
+            )
+        if match_b2t:
+            return _GraftDirection.B2T
+        if match_t2b:
+            return _GraftDirection.T2B
+        return None
+
+    @staticmethod
+    def _is_sender(*, role: "_GraftRole", direction: "_GraftDirection") -> bool:
+        # baseline is the sender for B2T names; target is the sender for T2B.
+        return (role == _GraftRole.BASELINE) == (direction == _GraftDirection.B2T)
 
     @staticmethod
     def _match(expr: Optional[str], tags: dict) -> bool:

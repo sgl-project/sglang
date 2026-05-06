@@ -2702,6 +2702,113 @@ class TestGrafterFilterMatching:
         assert grafter._pg is None
         assert "value is not a torch.Tensor" in out, out
 
+    def test_overlap_filters_raise(self):
+        grafter = _Grafter(
+            config=_unit_grafter_config(
+                grafter_b2t_filter="name == 'x'",
+                grafter_t2b_filter="name == 'x'",
+            )
+        )
+        with pytest.raises(
+            RuntimeError,
+            match=r"matched BOTH grafter_b2t_filter and grafter_t2b_filter",
+        ):
+            grafter.maybe_intercept(value=torch.zeros(2), tags={"name": "x"})
+
+    def test_unmatched_non_tensor_silent(self):
+        """Non-tensor + unmatched name -> silent skip, no print."""
+        grafter = _Grafter(config=_unit_grafter_config())
+        with _capture_stdout() as captured:
+            grafter.maybe_intercept(value=42, tags={"name": "other"})
+        assert grafter._pg is None
+        assert "[Grafter]" not in captured.getvalue(), captured.getvalue()
+
+    def test_filter_expression_uses_extra_tags(self):
+        """Filter expressions can reference any tag key, not just 'name'."""
+        grafter = _Grafter(
+            config=_unit_grafter_config(
+                grafter_b2t_filter="name == 'x' and layer_id < 3",
+                grafter_t2b_filter="name == 'x' and layer_id < 3",
+            )
+        )
+        # layer_id=1 -> both filters match -> overlap raise (proves filter saw layer_id).
+        with pytest.raises(RuntimeError, match=r"matched BOTH"):
+            grafter.maybe_intercept(
+                value=torch.zeros(2),
+                tags={"name": "x", "layer_id": 1},
+            )
+        # layer_id=5 -> neither filter matches -> silent skip.
+        grafter.maybe_intercept(value=torch.zeros(2), tags={"name": "x", "layer_id": 5})
+        assert grafter._pg is None
+
+    def test_filter_expression_only_uses_non_name_tag(self):
+        """A filter that doesn't reference `name` at all is still valid; it
+        should match purely on the other tag(s)."""
+        grafter = _Grafter(
+            config=_unit_grafter_config(
+                grafter_b2t_filter=None,
+                grafter_t2b_filter="layer_id < 3",
+            )
+        )
+        # layer_id absent -> resolves to None; `None < 3` raises TypeError.
+        with pytest.raises(TypeError):
+            grafter.maybe_intercept(value=torch.zeros(2), tags={"name": "x"})
+
+    def test_filter_expression_unknown_tag_resolves_to_none(self):
+        """Unknown tag keys resolve to None inside filter expressions, so
+        `layer_id is None` works as an "absent" probe without raising."""
+        grafter = _Grafter(
+            config=_unit_grafter_config(
+                grafter_b2t_filter=None,
+                grafter_t2b_filter="layer_id is None and name == 'x'",
+            )
+        )
+        # No `layer_id` in tags -> resolves to None -> filter matches -> tries
+        # to init the recv group (which we can't actually do here without a
+        # real PG, so we expect the assertion failure from _ensure_group).
+        with pytest.raises(AssertionError, match="default torch.distributed"):
+            grafter.maybe_intercept(value=torch.zeros(2), tags={"name": "x"})
+
+    def test_filter_expression_syntax_error_raises(self):
+        """A filter string that isn't valid Python should surface as a
+        SyntaxError so the misconfiguration is loud, not silent."""
+        grafter = _Grafter(
+            config=_unit_grafter_config(grafter_b2t_filter="name == "),
+        )
+        with pytest.raises(SyntaxError):
+            grafter.maybe_intercept(value=torch.zeros(2), tags={"name": "x"})
+
+    def test_filter_expression_undefined_helper_raises(self):
+        """Referencing an undefined helper inside a filter (e.g. a function
+        the user expected to be in scope) should NOT be silently treated as
+        False. The filter namespace is a `_DefaultNoneDict` (unknown keys
+        resolve to None), so calling an undefined helper raises TypeError
+        (`'NoneType' object is not callable`) -- loud enough to surface the
+        misconfiguration."""
+        grafter = _Grafter(
+            config=_unit_grafter_config(
+                grafter_b2t_filter="totally_undefined_helper(name)"
+            ),
+        )
+        with pytest.raises(TypeError, match=r"NoneType.* not callable"):
+            grafter.maybe_intercept(value=torch.zeros(2), tags={"name": "x"})
+
+    def test_filter_can_use_re_search(self):
+        """`re.search` is exposed inside filter expressions as `search()`."""
+        grafter = _Grafter(
+            config=_unit_grafter_config(
+                grafter_b2t_filter="search(r'attn.*', name) is not None",
+                grafter_t2b_filter=None,
+            )
+        )
+        # name='attn_input' matches /attn.*/ -> tries to init group (hits
+        # the no-default-PG assertion, proving the regex matched).
+        with pytest.raises(AssertionError, match="default torch.distributed"):
+            grafter.maybe_intercept(value=torch.zeros(2), tags={"name": "attn_input"})
+        # name='other' does not match -> silent skip.
+        grafter.maybe_intercept(value=torch.zeros(2), tags={"name": "other"})
+        assert grafter._pg is None
+
 
 def _run_graft_test(worker_func, **kwargs):
     """Spawn one GPU-using process per role (rank 0 = baseline, rank 1 = target).
@@ -2758,6 +2865,7 @@ def _make_grafter_test_config(
     group_name: str,
     timeout: int = 30,
     b2t_filter: Optional[str] = "name == 'x'",
+    t2b_filter: Optional[str] = None,
 ) -> DumperConfig:
     """Build a DumperConfig for distributed grafter tests. rank 0 -> baseline,
     rank 1 -> target. Both sides are world_size=1 within their own role's
@@ -2768,6 +2876,7 @@ def _make_grafter_test_config(
         grafter_enable=True,
         grafter_role=role,
         grafter_b2t_filter=b2t_filter,
+        grafter_t2b_filter=t2b_filter,
         grafter_master_address="127.0.0.1",
         grafter_master_port=graft_port,
         grafter_baseline_world_size=1,
@@ -2800,6 +2909,36 @@ class TestGrafterDistributed:
                 target = torch.zeros(3, device="cuda:1")
                 grafter.maybe_intercept(value=target, tags={"name": "x"})
                 assert target.tolist() == [1.0, 2.0, 3.0], f"got {target.tolist()}"
+        finally:
+            if grafter._pg is not None:
+                dist.destroy_process_group(grafter._pg)
+
+    def test_t2b_copy_roundtrip(self):
+        """Target (rank 1) sends 'x' to baseline (rank 0), baseline.copy_'s it."""
+        graft_port = find_available_port(29605)
+        _run_graft_test(
+            self._test_t2b_func, graft_port=graft_port, group_name="grafter_t2b"
+        )
+
+    @staticmethod
+    def _test_t2b_func(rank, graft_port, group_name):
+        grafter = _Grafter(
+            config=_make_grafter_test_config(
+                rank=rank,
+                graft_port=graft_port,
+                group_name=group_name,
+                b2t_filter=None,
+                t2b_filter="name == 'x'",
+            )
+        )
+        try:
+            if rank == 1:
+                tensor = torch.tensor([4.0, 5.0, 6.0], device="cuda:1")
+                grafter.maybe_intercept(value=tensor, tags={"name": "x"})
+            else:
+                target = torch.zeros(3, device="cuda:0")
+                grafter.maybe_intercept(value=target, tags={"name": "x"})
+                assert target.tolist() == [4.0, 5.0, 6.0], f"got {target.tolist()}"
         finally:
             if grafter._pg is not None:
                 dist.destroy_process_group(grafter._pg)
