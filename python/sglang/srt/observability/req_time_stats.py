@@ -615,7 +615,10 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
         if self.trace_ctx.tracing_enable:
             stage = RequestStage.SPEC_VERIFY
             self.trace_slice(
-                stage, self.spec_verify_start_time, ts, {"accepted_tokens": accepted_tokens}
+                stage,
+                self.spec_verify_start_time,
+                ts,
+                {"accepted_tokens": accepted_tokens},
             )
 
     def set_spec_draft_extend_start_time(self, ts=None):
@@ -999,9 +1002,7 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
                     f"alloc_wait_duration={self.format_duration(alloc_wait_duration)}, "
                 )
             else:
-                bootstrap_fields = (
-                    f"bootstrap_queue_duration={self.format_duration(bootstrap_queue_duration)}, "
-                )
+                bootstrap_fields = f"bootstrap_queue_duration={self.format_duration(bootstrap_queue_duration)}, "
 
             return (
                 f"{bootstrap_fields}"
@@ -1056,9 +1057,7 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
                     f"alloc_wait_duration={self.format_duration(alloc_wait_duration)}, "
                 )
             else:
-                prealloc_fields = (
-                    f"prealloc_queue_duration={self.format_duration(prealloc_duration)}, "
-                )
+                prealloc_fields = f"prealloc_queue_duration={self.format_duration(prealloc_duration)}, "
 
             return (
                 f"{prealloc_fields}"
