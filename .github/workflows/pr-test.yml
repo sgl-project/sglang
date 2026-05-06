@@ -830,10 +830,7 @@ jobs:
           ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
         )
       )
-    # `1-gpu-h100-h200` is a shared label advertised by both the 1-GPU H100 and
-    # 1-GPU H200 runner pools, so this job can land on either. Multimodal_gen
-    # jobs in pr-test-multimodal-gen.yml continue to pin to `1-gpu-h100`.
-    runs-on: 1-gpu-h100-h200
+    runs-on: 1-gpu-h100
     timeout-minutes: 240
     strategy:
       fail-fast: false
