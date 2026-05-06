@@ -456,10 +456,21 @@ class Indexer(MultiPlatformOp):
         # Reuse pre-computed schedule metadata if available (from init_forward_metadata),
         # otherwise fall back to computing it here.
         schedule_metadata = getattr(metadata, "paged_mqa_schedule_metadata", None)
+        # DeepGEMM release-0426 requires context_lens to be 2D [B, next_n], where
+        # B is the *original* batch size (matching the precompute in nsa_backend).
+        if seqlens_32.dim() == 2:
+            seqlens_32_2d = seqlens_32
+        else:
+            original_batch_size = metadata.get_seqlens_int32().numel()
+            assert seqlens_32.numel() % original_batch_size == 0, (
+                f"seqlens_32 size {seqlens_32.numel()} is not a multiple of "
+                f"batch_size {original_batch_size}"
+            )
+            seqlens_32_2d = seqlens_32.view(original_batch_size, -1)
         if _is_cuda:
             if schedule_metadata is None:
                 schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
-                    seqlens_32, blocksize, self.sm_count
+                    seqlens_32_2d, blocksize, self.sm_count
                 )
 
         assert len(q_fp8.shape) == 3
@@ -508,7 +519,7 @@ class Indexer(MultiPlatformOp):
                 q_fp8[:q_offset],
                 kv_cache_fp8,
                 weights[:q_offset],
-                seqlens_32,
+                seqlens_32_2d,
                 block_tables,
                 schedule_metadata,
                 max_seq_len,
