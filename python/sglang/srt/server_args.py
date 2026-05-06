@@ -188,6 +188,7 @@ MOE_RUNNER_BACKEND_CHOICES = [
     "flashinfer_cutedsl",
     "cutlass",
     "aiter",
+    "cutlass_w4afp8",
 ]
 
 MOE_A2A_BACKEND_CHOICES = [

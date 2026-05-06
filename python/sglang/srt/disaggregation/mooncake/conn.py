@@ -9,7 +9,7 @@ import struct
 import threading
 import time
 from collections import defaultdict
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import numpy.typing as npt
@@ -35,6 +35,7 @@ from sglang.srt.disaggregation.utils import (
 from sglang.srt.distributed.parallel_state import get_mooncake_transfer_engine
 from sglang.srt.environ import envs
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.utils import get_int_env_var
 from sglang.srt.utils.network import NetworkAddress
 
 logger = logging.getLogger(__name__)
@@ -195,6 +196,8 @@ class MooncakeKVManager(CommonKVManager):
         is_mla_backend: Optional[bool] = False,
     ):
         super().__init__(args, disaggregation_mode, server_args, is_mla_backend)
+        self.failure_records: Dict[int, str] = {}
+        self.failure_lock = threading.Lock()
         self.init_engine()
         self.register_buffer_to_engine()
         self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
@@ -253,6 +256,19 @@ class MooncakeKVManager(CommonKVManager):
                 self._staging_handler = None
                 self._chunk_writer_counts: dict = defaultdict(lambda: defaultdict(list))
             self.start_decode_thread()
+            # If a timeout happens on the decode side, it means decode instances
+            # fail to receive the KV Cache transfer done signal after bootstrapping.
+            # These timeout requests should be aborted to release the tree cache.
+            self.waiting_timeout = get_int_env_var(
+                "SGLANG_DISAGGREGATION_WAITING_TIMEOUT", 300
+            )
+
+
+    def _ensure_failure_tracking(self):
+        if not hasattr(self, "failure_lock"):
+            self.failure_lock = threading.Lock()
+        if not hasattr(self, "failure_records"):
+            self.failure_records = {}
 
     def init_engine(self):
         self.engine = get_mooncake_transfer_engine()
@@ -1601,6 +1617,25 @@ class MooncakeKVManager(CommonKVManager):
             )
         )
 
+    def check_status(self, bootstrap_room: int):
+        return self.request_status[bootstrap_room]
+
+    def update_status(self, bootstrap_room: int, status: KVPoll):
+        if bootstrap_room not in self.request_status:
+            self.request_status[bootstrap_room] = status
+        else:
+            # NOTE: status is only allowed to be incremented unless it is KVPoll.Failed
+            if status == KVPoll.Failed:
+                self.request_status[bootstrap_room] = KVPoll.Failed
+            else:
+                self.request_status[bootstrap_room] = max(
+                    self.request_status[bootstrap_room], status
+                )
+
+    def record_failure(self, bootstrap_room: int, failure_reason: str):
+        self._ensure_failure_tracking()
+        with self.failure_lock:
+            self.failure_records[bootstrap_room] = failure_reason
     def get_session_id(self):
         return self.engine.get_session_id()
 

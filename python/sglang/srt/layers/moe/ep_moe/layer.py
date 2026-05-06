@@ -13,6 +13,7 @@ from sglang.srt.layers.moe import (
     get_deepep_mode,
     get_moe_a2a_backend,
     get_moe_runner_backend,
+    get_moe_quantization
 )
 from sglang.srt.layers.moe.fused_moe_triton.layer import (
     FusedMoE,
@@ -130,6 +131,9 @@ class DeepEPMoE(FusedMoE):
             self.use_fp8_w8a8 = False
             self.use_block_quant = False
 
+        if get_moe_quantization() == "w4afp8":
+            self.use_w4afp8 = True
+
         self.deepep_mode = get_deepep_mode()
 
         if (
@@ -193,7 +197,8 @@ class DeepEPMoE(FusedMoE):
 
         # TODO: can we call super().forward here?
         dispatch_output = self.dispatcher.dispatch(
-            hidden_states=hidden_states, topk_output=topk_output
+            hidden_states=hidden_states, topk_output=topk_output,
+            static_scale=self.w13_input_scale.float() if self.use_w4afp8 else None,
         )
         combine_input = self.run_moe_core(dispatch_output)
         hidden_states = self.dispatcher.combine(
@@ -210,6 +215,7 @@ class DeepEPMoE(FusedMoE):
         return self.dispatcher.dispatch(
             hidden_states=hidden_states,
             topk_output=topk_output,
+            static_scale=self.w13_input_scale.float() if self.use_w4afp8 else None,
         )
 
     def run_moe_core(

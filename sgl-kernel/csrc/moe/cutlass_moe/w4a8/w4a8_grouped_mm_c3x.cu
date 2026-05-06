@@ -98,19 +98,23 @@ void dispatch_w4a8_moe_mm_sm90(
     torch::Tensor const& d_strides,
     torch::Tensor const& s_strides,
     int64_t chunk_size,
-    int64_t topk) {
-  uint32_t const m = a_tensors.size(0) / topk;
-  uint32_t const n = d_tensors.size(1);
-  uint32_t const k = a_tensors.size(1);
+    int64_t topk,
+    int64_t expected_m_per_group) {
+  uint32_t const m = expected_m_per_group;
+  uint32_t const n = d_tensors.size(-1);
+  uint32_t const k = a_tensors.size(-1);
 
-  if (n == 4096 && k == 7168) {
+   if (n == 4096 && k == 7168) {
     // group gemm 1
     if (m <= 4) {
       INVOKE_GEMM_WITH_CONFIG((SM90_PP<64, 32, 512, 2, 1, 1>));
     } else if (m <= 32) {
       INVOKE_GEMM_WITH_CONFIG((SM90_CO<128, 16, 512, 2, 1, 1>));
+    } else if (m <= 64) {
+      INVOKE_GEMM_WITH_CONFIG((SM90_CO<128, 32, 512, 1, 1, 1>));
     } else if (m <= 256) {
-      INVOKE_GEMM_WITH_CONFIG((SM90_CO<128, 16, 512, 1, 1, 1>));
+      // update tune
+      INVOKE_GEMM_WITH_CONFIG((SM90_CO<128, 64, 512, 1, 1, 1>));
     } else if (m <= 1024) {
       INVOKE_GEMM_WITH_CONFIG((SM90_CO<128, 32, 512, 2, 1, 1>));
     } else if (m <= 4096) {
@@ -124,8 +128,11 @@ void dispatch_w4a8_moe_mm_sm90(
     // group gemm 2
     if (m <= 8) {
       INVOKE_GEMM_WITH_CONFIG((SM90_PP<64, 16, 512, 1, 1, 1>));
-    } else if (m <= 512) {
+    } else if (m <= 64) {
       INVOKE_GEMM_WITH_CONFIG((SM90_CO<128, 32, 512, 1, 1, 1>));
+    } else if (m <= 512) {
+      // update tune
+      INVOKE_GEMM_WITH_CONFIG((SM90_CO<128, 64, 512, 1, 1, 1>));
     } else if (m <= 4096) {
       // Optimized for prefill: larger cluster for better throughput
       INVOKE_GEMM_WITH_CONFIG((SM90_CO<128, 64, 512, 2, 1, 1>));
@@ -196,7 +203,8 @@ void cutlass_w4a8_moe_mm_sm90(
     torch::Tensor const& d_strides,
     torch::Tensor const& s_strides,
     int64_t chunk_size,
-    int64_t topk) {
+    int64_t topk,
+    int64_t expected_m_per_group) {
   dispatch_w4a8_moe_mm_sm90(
       d_tensors,
       a_tensors,
@@ -210,5 +218,6 @@ void cutlass_w4a8_moe_mm_sm90(
       d_strides,
       s_strides,
       chunk_size,
-      topk);
+      topk,
+      expected_m_per_group);
 }

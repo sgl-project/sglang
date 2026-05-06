@@ -165,6 +165,9 @@ if _use_aiter:
     from sglang.srt.layers.rocm_linear_utils import aiter_dsv3_router_gemm
 
 if _use_aiter_gfx95:
+    from aiter.ops.triton.fused_fp8_quant import (
+        fused_rms_fp8_group_quant,
+    )
     from sglang.srt.layers.rocm_linear_utils import (
         get_dsv3_gemm_output_zero_allocator_size,
     )
@@ -580,7 +583,7 @@ class DeepseekV2MoE(nn.Module):
         return [
             x.data
             for name, x in self.experts.named_parameters()
-            if name not in ["correction_bias"]
+            if name not in ["correction_bias", "w13_input_scale", "w2_input_scale"]
             and filter_moe_weight_param_global_expert(
                 name, x, self.experts.num_local_experts
             )
@@ -1086,6 +1089,7 @@ class DeepseekV2MoE(nn.Module):
             self.experts.dispatcher.dispatch_a(
                 hidden_states=state.hidden_states_mlp_input,
                 topk_output=state.pop("topk_output"),
+                **(dict(static_scale=self.experts.w13_input_scale.float()) if self.experts.w13_input_scale is not None else dict()),
                 tbo_subbatch_index=state.get("tbo_subbatch_index"),
             )
 
@@ -1580,6 +1584,139 @@ class DeepseekV2AttentionMLA(
             qkv_latent = self.fused_qkv_a_proj_with_mqa(hidden_states)[0]
         return qkv_latent
 
+    def forward_normal_prepare(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+        zero_allocator: BumpAllocator,
+    ):
+        if self.q_lora_rank is not None:
+            q, latent_cache = (
+                get_attn_tp_context()
+                .fetch_qkv_latent()
+                .split(
+                    [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim],
+                    dim=-1,
+                )
+            )
+
+            # NSA Indexer: cache quantized keys, auto-skip topk for sequences <= nsa_index_topk
+
+            if self.use_nsa:
+                q_lora = self.q_a_layernorm(q)
+                q = self.q_b_proj(q_lora)[0].view(
+                    -1, self.num_local_heads, self.qk_head_dim
+                )
+                _ = self.indexer(
+                    x=hidden_states,
+                    q_lora=q_lora,
+                    positions=positions,
+                    forward_batch=forward_batch,
+                    layer_id=self.layer_id,
+                    return_indices=False,
+                )
+
+            elif _use_aiter_gfx95 and self.q_b_proj.weight.dtype == torch.float8_e4m3fn:
+
+                q, _, _, _ = fused_rms_fp8_group_quant(
+                    q,
+                    self.q_a_layernorm.weight,
+                    self.q_a_layernorm.variance_epsilon,
+                    None,
+                    None,
+                    None,
+                    group_size=128,
+                    dtype_quant=torch.float8_e4m3fn,
+                    res1=None,
+                    output_unquantized_inp1=False,
+                )
+                q = self.q_b_proj(q)[0].view(-1, self.num_local_heads, self.qk_head_dim)
+            else:
+                q = self.q_a_layernorm(q)
+                q = self.q_b_proj(q)[0].view(-1, self.num_local_heads, self.qk_head_dim)
+
+        else:
+            q = self.q_proj(hidden_states)[0].view(
+                -1, self.num_local_heads, self.qk_head_dim
+            )
+            latent_cache = self.kv_a_proj_with_mqa(hidden_states)[0]
+
+        _, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
+        kv_a, _ = latent_cache.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
+        latent_cache = latent_cache.unsqueeze(1)
+
+        if _use_aiter_gfx95 and self.kv_b_proj.weight.dtype == torch.float8_e4m3fn:
+
+            kv_a_quanted, kv_a, _, _ = fused_rms_fp8_group_quant(
+                kv_a,
+                self.kv_a_layernorm.weight,
+                self.kv_a_layernorm.variance_epsilon,
+                None,
+                None,
+                None,
+                group_size=128,
+                dtype_quant=torch.float8_e4m3fn,
+                res1=None,
+                output_unquantized_inp1=True,  # return unqaunt kv_a
+            )
+
+        else:
+            kv_a = self.kv_a_layernorm(kv_a)
+
+        # kv_a = self.kv_a_layernorm(kv_a)
+
+        k_pe = latent_cache[:, :, self.kv_lora_rank :]
+        if self.rotary_emb is not None:
+            q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
+        q[..., self.qk_nope_head_dim :] = q_pe
+
+        self._set_mla_kv_buffer(latent_cache, kv_a, k_pe, forward_batch)
+        if (
+            forward_batch.mha_one_shot
+            and sum(forward_batch.extend_prefix_lens_cpu) != 0
+        ):
+            if self.use_nsa and self.kv_cache_dtype == "fp8_e4m3":
+                # FP8 path: dequantize NSA-specific FP8 format to BF16
+                kv_a, k_pe = self._get_mla_kv_buffer_from_fp8(forward_batch)
+            else:
+                # BF16/FP16 path: directly fetch from cache
+                kv_a, k_pe = self._get_mla_kv_buffer(
+                    forward_batch.fetch_mha_one_shot_kv_indices(),
+                    q.dtype,
+                    forward_batch,
+                )
+        if _use_aiter_gfx95 and self.kv_b_proj.weight.dtype == torch.float8_e4m3fn:
+            kv = self.kv_b_proj(
+                kv_a_quanted,
+            )[0]
+        else:
+            kv = self.kv_b_proj(kv_a)[0]
+        kv = kv.view(-1, self.num_local_heads, self.qk_nope_head_dim + self.v_head_dim)
+        k_nope = kv[..., : self.qk_nope_head_dim]
+        v = kv[..., self.qk_nope_head_dim :]
+
+        k = self._concat_and_cast_mha_k(k_nope, k_pe, forward_batch)
+        return q, k, v, forward_batch
+
+    def forward_normal_core(self, q, k, v, forward_batch):
+        attn_output = self.attn_mha(q, k, v, forward_batch, save_kv_cache=False)
+        attn_output = attn_output.reshape(-1, self.num_local_heads * self.v_head_dim)
+        output, _ = self.o_proj(attn_output)
+        return output
+
+    def _fuse_rope_for_trtllm_mla(self, forward_batch: ForwardBatch) -> bool:
+        """
+        Check if we should skip rope and do fused rope+quantize for TRTLLM MLA decode in fp8_e4m3 path.
+        """
+        return (
+            self.current_attention_backend == "trtllm_mla"
+            and (
+                forward_batch.forward_mode.is_decode_or_idle()
+                or forward_batch.forward_mode.is_target_verify()
+            )
+            and forward_batch.attn_backend.data_type == torch.float8_e4m3fn
+        )
     def rebuild_cp_kv_cache(self, latent_cache, forward_batch, k_nope, k_pe):
         # support allgather+rerrange
         latent_cache[..., : self.kv_lora_rank] = k_nope.squeeze(1)
