@@ -28,7 +28,6 @@ import torch
 from sglang.srt.utils import MultiprocessingSerializer, kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import (
-    DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
@@ -37,10 +36,10 @@ from sglang.test.test_utils import (
 
 register_cuda_ci(est_time=150, suite="stage-b-test-1-gpu-small")
 
-# Shape of model.layers.X.mlp.up_proj.weight in DEFAULT_SMALL_MODEL_NAME_FOR_TEST
-# (Llama-3.2-1B-Instruct, fused gate_up under sglang's naming). Mirrors the
-# constant used in test/registered/rl/test_update_weights_from_tensor.py.
-_UP_PROJ_SHAPE = (16384, 2048)
+_MODEL_NAME = "Qwen/Qwen3-0.6B"
+# Shape of model.layers.X.mlp.gate_up_proj.weight in Qwen3-0.6B:
+# intermediate_size (3072) * 2 fused = 6144 rows, hidden_size = 1024 cols.
+_GATE_UP_PROJ_SHAPE = (6144, 1024)
 
 
 class TestWeightCheckerE2E(CustomTestCase):
@@ -54,7 +53,7 @@ class TestWeightCheckerE2E(CustomTestCase):
     def setUpClass(cls):
         cls.url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(
-            DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
+            _MODEL_NAME,
             cls.url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
         )
@@ -100,8 +99,8 @@ class TestWeightCheckerE2E(CustomTestCase):
         """A snapshot then an update with new bytes must make compare fail."""
         self.assertEqual(self._post("snapshot").status_code, 200)
 
-        param_name = "model.layers.5.mlp.up_proj.weight"
-        new_tensor = torch.full(_UP_PROJ_SHAPE, 1.5, device="cuda")
+        param_name = "model.layers.5.mlp.gate_up_proj.weight"
+        new_tensor = torch.full(_GATE_UP_PROJ_SHAPE, 1.5, device="cuda")
         update_resp = self._update_weights([(param_name, new_tensor)])
         self.assertEqual(update_resp.status_code, 200)
         self.assertTrue(update_resp.json()["success"])
@@ -114,8 +113,8 @@ class TestWeightCheckerE2E(CustomTestCase):
 
     def test_d_update_with_same_tensor_keeps_compare_passing(self):
         """Prime a param, snapshot, push the same bytes again, compare must pass."""
-        param_name = "model.layers.6.mlp.up_proj.weight"
-        same_tensor = torch.full(_UP_PROJ_SHAPE, 0.25, device="cuda")
+        param_name = "model.layers.6.mlp.gate_up_proj.weight"
+        same_tensor = torch.full(_GATE_UP_PROJ_SHAPE, 0.25, device="cuda")
 
         # Step 1: prime the param to a known value.
         self.assertTrue(
