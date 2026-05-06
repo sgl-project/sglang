@@ -195,6 +195,7 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         self._cache_dit_enabled = False
         self._cached_num_steps = None
         self._is_warmed_up = False
+        self._extra_func_kwarg_names_cache: dict[int, tuple[bool, frozenset[str]]] = {}
 
     def _infer_transformer_attention_backend(self) -> AttentionBackendEnum | None:
         backends = {
@@ -699,7 +700,7 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
             | server_args.pipeline_config.prepare_pos_cond_kwargs(
                 batch,
                 self.device,
-                getattr(self.transformer, "rotary_emb", None),
+                self._get_transformer_attr("rotary_emb"),
                 dtype=target_dtype,
             )
             | dict(
@@ -720,7 +721,7 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                 | server_args.pipeline_config.prepare_neg_cond_kwargs(
                     batch,
                     self.device,
-                    getattr(self.transformer, "rotary_emb", None),
+                    self._get_transformer_attr("rotary_emb"),
                     dtype=target_dtype,
                 )
                 | dict(
@@ -777,6 +778,25 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                 scheduler.model_outputs = [None] * solver_order
             if hasattr(scheduler, "timestep_list"):
                 scheduler.timestep_list = [None] * solver_order
+
+    def _get_transformer_attr(self, name: str) -> Any:
+        seen: set[int] = set()
+        stack = [self.transformer]
+        while stack:
+            module = stack.pop()
+            if module is None or id(module) in seen:
+                continue
+            seen.add(id(module))
+
+            value = getattr(module, name, None)
+            if value is not None:
+                return value
+
+            for wrapper_attr in ("_fsdp_wrapped_module", "module", "_orig_mod"):
+                wrapped = getattr(module, wrapper_attr, None)
+                if wrapped is not None:
+                    stack.append(wrapped)
+        return None
 
     def _prepare_step_state(
         self,
@@ -1270,15 +1290,7 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         self._finalize_denoising_loop(ctx, batch, server_args)
         return batch
 
-    # TODO: this will extends the preparation stage, should let subclass/passed-in variables decide which to prepare
-    def prepare_extra_func_kwargs(self, func, kwargs) -> dict[str, Any]:
-        """
-        Prepare extra kwargs for the scheduler step / denoise step.
-
-        Args:
-            func: The function to prepare kwargs for.
-            kwargs: The kwargs to prepare.
-        """
+    def _get_extra_func_kwarg_names(self, func) -> tuple[bool, frozenset[str]]:
         import functools
 
         # Handle cache-dit's partial wrapping logic.
@@ -1290,10 +1302,37 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
 
         # Unwrap any decorators (e.g. functools.wraps)
         target_func = inspect.unwrap(func)
+        cache_target = (
+            target_func.__func__ if inspect.ismethod(target_func) else target_func
+        )
+        cache_key = id(cache_target)
+        cached = self._extra_func_kwarg_names_cache.get(cache_key)
+        if cached is not None:
+            return cached
 
-        # Filter kwargs based on the signature
         params = inspect.signature(target_func).parameters
-        return {k: v for k, v in kwargs.items() if k in params}
+        result = (
+            any(
+                param.kind == inspect.Parameter.VAR_KEYWORD for param in params.values()
+            ),
+            frozenset(params),
+        )
+        self._extra_func_kwarg_names_cache[cache_key] = result
+        return result
+
+    # TODO: this will extends the preparation stage, should let subclass/passed-in variables decide which to prepare
+    def prepare_extra_func_kwargs(self, func, kwargs) -> dict[str, Any]:
+        """
+        Prepare extra kwargs for the scheduler step / denoise step.
+
+        Args:
+            func: The function to prepare kwargs for.
+            kwargs: The kwargs to prepare.
+        """
+        accepts_var_kwargs, param_names = self._get_extra_func_kwarg_names(func)
+        if accepts_var_kwargs:
+            return kwargs
+        return {k: v for k, v in kwargs.items() if k in param_names}
 
     def progress_bar(
         self, iterable: Iterable | None = None, total: int | None = None
@@ -1641,10 +1680,14 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         guidance: torch.Tensor,
         **kwargs,
     ):
+        guidance_kwargs = self.prepare_extra_func_kwargs(
+            getattr(current_model, "forward", current_model),
+            {"guidance": guidance},
+        )
         return current_model(
             hidden_states=latent_model_input,
             timestep=timestep,
-            guidance=guidance,
+            **guidance_kwargs,
             **kwargs,
         )
 
