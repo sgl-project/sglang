@@ -2812,6 +2812,20 @@ class ServerArgs:
         if self.grammar_backend is None:
             self.grammar_backend = "xgrammar"
 
+        if (
+            self.grammar_backend == "outlines"
+            and self.speculative_algorithm is not None
+        ):
+            raise ValueError(
+                f"Grammar backend 'outlines' is incompatible with speculative decoding "
+                f"(--speculative-algorithm {self.speculative_algorithm}). "
+                f"The Outlines grammar object does not implement rollback() and uses "
+                f"a dense bool mask instead of the packed int32 bitmask that the "
+                f"speculative verifier expects. "
+                f"Please use --grammar-backend xgrammar or --grammar-backend llguidance "
+                f"for grammar-constrained generation with speculative decoding."
+            )
+
     def _handle_mamba_backend(self):
         if self.mamba_backend == "flashinfer":
             if is_flashinfer_available():
