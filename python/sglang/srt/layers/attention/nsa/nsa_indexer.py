@@ -150,7 +150,7 @@ class BaseIndexerMetadata(ABC):
 
 
 def rotate_activation(x: torch.Tensor) -> torch.Tensor:
-    if _is_hip or _is_sm103:
+    if _is_hip:
         from fast_hadamard_transform import hadamard_transform
     else:
         try:
