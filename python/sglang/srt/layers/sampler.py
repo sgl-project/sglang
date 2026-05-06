@@ -45,6 +45,7 @@ _BUILT_IN_SAMPLING_BACKENDS = {"flashinfer", "pytorch", "ascend"}
 
 cfg_lyrics = 1.3
 
+
 class Sampler(nn.Module):
     def __init__(self):
         super().__init__()
@@ -69,7 +70,7 @@ class Sampler(nn.Module):
         # Apply the custom logit processors if registered in the sampling info
         if sampling_info.has_custom_logit_processor:
             apply_custom_logit_processor(logits, sampling_info)
-        
+
         USE_MUSIC_PREPROCESSOR = get_bool_env_var("USE_MUSIC_PREPROCESSOR")
 
         if USE_MUSIC_PREPROCESSOR:
