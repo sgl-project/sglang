@@ -53,6 +53,9 @@ from sglang.srt.layers.attention.nsa.hisa.orchestrator import (
 from sglang.srt.layers.attention.nsa.hisa.orchestrator_legacy import (
     fp8_native_hierarchy_paged_mqa_logits_no_pool_cache,
 )
+from sglang.srt.layers.attention.nsa.hisa.hisa_topk_fused import (
+    hisa_topk_transform_dispatch,
+)
 from sglang.srt.layers.attention.nsa.hisa.triton_kernels import hisa_coord_transform
 from sglang.srt.layers.attention.nsa.utils import (
     cp_all_gather_rerange_output,
@@ -601,26 +604,16 @@ class HisaIndexer(MultiPlatformOp):
         block_sparse_logits = block_sparse_logits.squeeze(1)  # [B, block_topk*k_block_size]
         topk_block_indices = topk_block_indices.squeeze(1)    # [B, block_topk]
 
-        # vLLM-patch-style conversion (indexers.py:498-520), topk via fast_topk_v2
-        # and the gather + mask steps fused into a single triton kernel
-        # (hisa_coord_transform). Every row of block_sparse_logits has
-        # `sparse_len` valid entries, so pass full lengths to fast_topk_v2.
-        from sgl_kernel import fast_topk_v2
-        # Hisa clamps its block-topk stage to the actual number of K blocks
-        # when seq is short; sparse_len = block_sparse_logits.shape[-1] not
-        # block_topk * k_block_size.
-        B, sparse_len = block_sparse_logits.shape
-        full_lens = torch.full(
-            (B,), sparse_len, dtype=torch.int32, device=block_sparse_logits.device
-        )
-        relevant = fast_topk_v2(block_sparse_logits, full_lens, self.index_topk)
-        # PAGED decode: ks=None (kernel outputs absolute per-request K positions,
-        # masked by seq_lens). Matches the torch chain that was here before.
-        topk_result = hisa_coord_transform(
-            relevant, topk_block_indices,
-            lens=seqlens_32[:q_offset],
-            k_block_size=self.hisa_k_block_size,
-            ks=None,
+        # vLLM-patch-style conversion (indexers.py:498-520): radix-select +
+        # gather + mask in a single CUDA kernel. The dispatch picks between
+        # the fused kernel (default), the legacy 2-kernel chain (env override),
+        # and the SGLANG_NSA_FUSE_TOPK=1 path (reserved). PAGED decode uses
+        # ``seq_lens`` for masking; output is absolute per-request K positions.
+        topk_result = hisa_topk_transform_dispatch(
+            metadata,
+            block_sparse_logits, topk_block_indices,
+            self.hisa_k_block_size,
+            ke=seqlens_32[:q_offset],
         )
 
         # ------------------------------------------------------------------
@@ -1062,22 +1055,14 @@ class HisaIndexer(MultiPlatformOp):
                     default_block_sparse_logits=block_sparse_logits,
                     default_topk_block_indices=topk_block_indices,
                 )
-            # vLLM-patch-style conversion (indexers.py:435-458): topk via
-            # fast_topk_v2 and the gather + ks-subtract + mask steps fused
-            # into a single triton kernel (hisa_coord_transform).
-            from sgl_kernel import fast_topk_v2
-            M, sparse_len = block_sparse_logits.shape
-            full_lens = torch.full(
-                (M,), sparse_len, dtype=torch.int32,
-                device=block_sparse_logits.device,
-            )
-            relevant = fast_topk_v2(
-                block_sparse_logits, full_lens, self.index_topk
-            )
-            # RAGGED prefill: ks-relative output, causal mask via (ks, ke).
-            topk_result[:q_offset] = hisa_coord_transform(
-                relevant, topk_block_indices,
-                lens=ke, k_block_size=self.hisa_k_block_size, ks=ks,
+            # vLLM-patch-style conversion (indexers.py:435-458): radix-select
+            # + gather + ks-subtract + mask in a single CUDA kernel.
+            # RAGGED prefill: output is ks-relative, mask via (ks, ke).
+            topk_result[:q_offset] = hisa_topk_transform_dispatch(
+                metadata,
+                block_sparse_logits, topk_block_indices,
+                self.hisa_k_block_size,
+                ke=ke, ks=ks,
             )
             return topk_result
 
@@ -1100,7 +1085,6 @@ class HisaIndexer(MultiPlatformOp):
             seq_lens_expanded.shape[0] == q_offset
         ), f"seq_lens_expanded length mismatch: {seq_lens_expanded.shape[0]} != {q_offset}"
 
-        from sgl_kernel import fast_topk_v2
         # Same dispatch as the non-chunked branch above (triton default at all
         # K; SGLANG_HISA_DISABLE_TRITON=1 falls back to tilelang).
         use_triton = os.environ.get("SGLANG_HISA_DISABLE_TRITON") != "1"
@@ -1140,20 +1124,12 @@ class HisaIndexer(MultiPlatformOp):
                     default_topk_block_indices=topk_block_indices,
                     chunk_start=start,
                 )
-            # Same conversion as the non-chunked branch, via the fused kernel.
-            M_chunk, sparse_len = block_sparse_logits.shape
-            full_lens = torch.full(
-                (M_chunk,), sparse_len, dtype=torch.int32,
-                device=block_sparse_logits.device,
-            )
-            relevant = fast_topk_v2(
-                block_sparse_logits, full_lens, self.index_topk
-            )
-            topk_result[start:end] = hisa_coord_transform(
-                relevant, topk_block_indices,
-                lens=ke[start:end],
-                k_block_size=self.hisa_k_block_size,
-                ks=ks[start:end],
+            # Same conversion as the non-chunked branch, via the dispatch.
+            topk_result[start:end] = hisa_topk_transform_dispatch(
+                metadata,
+                block_sparse_logits, topk_block_indices,
+                self.hisa_k_block_size,
+                ke=ke[start:end], ks=ks[start:end],
             )
             start = end
 
