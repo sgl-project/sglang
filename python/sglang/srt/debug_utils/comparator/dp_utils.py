@@ -7,18 +7,16 @@ from typing import Optional
 
 import torch
 
+from sglang.srt.debug_utils.comparator.dims_spec import ParallelAxis
 from sglang.srt.debug_utils.dump_loader import ValueWithMeta
 
 _PARALLEL_INFO_KEYS = ("sglang_parallel_info", "megatron_parallel_info")
-
-_DP_RANK_FIELD = "dp_rank"
-_DP_SIZE_FIELD = "dp_size"
 
 
 def filter_to_non_empty_dp_rank(
     items: list[ValueWithMeta],
     *,
-    dp_group_alias: Optional[str] = None,
+    dp_axis: ParallelAxis,
 ) -> list[ValueWithMeta]:
     """Filter items to the single non-empty dp_rank.
 
@@ -26,16 +24,15 @@ def filter_to_non_empty_dp_rank(
     - dp_size > 1: group by dp_rank, assert exactly one group has non-empty
       tensors, return that group.
 
-    When *dp_group_alias* is set (e.g. ``"moe_dp"``), the function looks
-    for ``<alias>_rank`` / ``<alias>_size`` instead of the default
-    ``dp_rank`` / ``dp_size``.  If the aliased fields are absent the
-    filter is a noop (items returned unchanged).
+    *dp_axis* determines which rank/size fields to look up (e.g.
+    ``ParallelAxis.MOE_DP`` → ``moe_dp_rank`` / ``moe_dp_size``).
+    If the fields are absent the filter is a noop (items returned unchanged).
     """
     if not items:
         return items
 
     dp_info: Optional[tuple[int, int]] = _extract_dp_info(
-        items[0].meta, dp_group_alias=dp_group_alias
+        items[0].meta, dp_axis=dp_axis
     )
     if dp_info is None:
         return items
@@ -51,7 +48,7 @@ def filter_to_non_empty_dp_rank(
     groups: dict[int, list[ValueWithMeta]] = defaultdict(list)
     for item in items:
         item_dp: Optional[tuple[int, int]] = _extract_dp_info(
-            item.meta, dp_group_alias=dp_group_alias
+            item.meta, dp_axis=dp_axis
         )
         rank: int = item_dp[0] if item_dp is not None else 0
         groups[rank].append(item)
@@ -71,15 +68,16 @@ def filter_to_non_empty_dp_rank(
 def _extract_dp_info(
     meta: dict,
     *,
-    dp_group_alias: Optional[str] = None,
+    dp_axis: ParallelAxis,
 ) -> Optional[tuple[int, int]]:
     """Extract (dp_rank, dp_size) from meta's parallel_info block.
 
-    When *dp_group_alias* is given, look for ``<alias>_rank``/``<alias>_size``
-    instead of the default ``dp_rank``/``dp_size``.
+    *dp_axis* determines which fields to look up: e.g.
+    ``ParallelAxis.DP`` → ``dp_rank``/``dp_size``,
+    ``ParallelAxis.MOE_DP`` → ``moe_dp_rank``/``moe_dp_size``.
     """
-    rank_field: str = f"{dp_group_alias}_rank" if dp_group_alias else _DP_RANK_FIELD
-    size_field: str = f"{dp_group_alias}_size" if dp_group_alias else _DP_SIZE_FIELD
+    rank_field: str = f"{dp_axis.value}_rank"
+    size_field: str = f"{dp_axis.value}_size"
 
     for key in _PARALLEL_INFO_KEYS:
         info = meta.get(key)

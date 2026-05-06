@@ -2,7 +2,23 @@
 # Install the dependency in CI.
 set -euxo pipefail
 
-bash scripts/ci/cuda/ci_install_dependency.sh
+# Source (not bash) so that venv activation, $PIP_CMD, $CU_VERSION, $NVCC_VER, and
+# $PIP_INSTALL_SUFFIX all propagate into this shell. Without sourcing, the subshell
+# exits and this script would fall back to system Python.
+#
+# Note: any `exit N` or `set -e` trip inside the sourced script terminates *this*
+# script too (bash runs sourced commands in the current shell, so `exit` is not
+# caught by `if`/`||`). The real error message appears upstream in the log.
+# shellcheck disable=SC1091
+source scripts/ci/cuda/ci_install_dependency.sh
+
+# In venv mode, PIP_CMD must be set by the sourced script. If it isn't, the
+# source chain is broken and we'd silently fall back to system `pip` below —
+# exactly the split-install bug the migration is meant to prevent.
+if [ -z "${PIP_CMD:-}" ]; then
+    echo "FATAL:PIP_CMD is unset after sourcing ci_install_dependency.sh"
+    exit 1
+fi
 
 export GDRCOPY_HOME=/usr/src/gdrdrv-2.5.1/
 export CUDA_HOME=/usr/local/cuda
@@ -15,7 +31,10 @@ if [ "$ARCH" != "x86_64" ] && [ "$ARCH" != "aarch64" ]; then
     exit 1
 fi
 
-if python3 -c "import deep_ep" >/dev/null 2>&1; then
+if [ "${FORCE_REBUILD_DEEPEP:-0}" = "1" ]; then
+    echo "FORCE_REBUILD_DEEPEP=1; uninstalling any cached deep_ep before rebuild."
+    ${PIP_UNINSTALL_CMD:-pip uninstall -y} deep_ep ${PIP_UNINSTALL_SUFFIX:-} || true
+elif python3 -c "import deep_ep" >/dev/null 2>&1; then
     echo "deep_ep is already installed or importable. Skipping installation."
     exit 0
 fi
@@ -96,24 +115,41 @@ fi
 
 cd ${DEEPEP_DIR}
 if [ "$GRACE_BLACKWELL" = "1" ]; then
-    CUDA_VERSION=$(nvidia-smi | grep "CUDA Version" | head -n1 | awk '{print $9}')
+    # Resolve the toolkit CUDA version. Preference order:
+    #   1. $NVCC_VER inherited from the sourced ci_install_dependency.sh
+    #      (both scripts agree on the detected value, no re-detection cost).
+    #   2. Local `nvcc --version` (authoritative — container toolkit).
+    #   3. `nvidia-smi` (host driver; last resort).
+    if [ -n "${NVCC_VER:-}" ]; then
+        CUDA_VERSION="$NVCC_VER"
+    elif command -v nvcc >/dev/null 2>&1; then
+        CUDA_VERSION=$(nvcc --version | grep -oP 'release \K[0-9]+\.[0-9]+')
+    else
+        CUDA_VERSION=$(nvidia-smi | grep "CUDA Version" | head -n1 | awk '{print $9}' || true)
+    fi
+    if [ -z "${CUDA_VERSION:-}" ]; then
+        echo "FATAL: could not determine CUDA toolkit version (NVCC_VER unset, nvcc missing, nvidia-smi empty)"
+        exit 1
+    fi
     if [ "$CUDA_VERSION" = "12.8" ]; then
         CHOSEN_TORCH_CUDA_ARCH_LIST='10.0'
     elif awk -v ver="$CUDA_VERSION" 'BEGIN {exit !(ver > 12.8)}'; then
-        # With cuda > 12.8, the compiler supports 10.3, so we should use
-        # CHOSEN_TORCH_CUDA_ARCH_LIST='10.0;10.3'
-        #
-        # However, our CI machine has a weird setup and nvidia-smi reports wrong CUDA version in the container.
-        # The container is actually cuda 12.8, but nvidia-smi reports 13.0, leading to compilation errors. so we
-        # drop 10.3.
-        CHOSEN_TORCH_CUDA_ARCH_LIST='10.0'
+        # CUDA > 12.8 supports sm_103 (Blackwell)
+        CHOSEN_TORCH_CUDA_ARCH_LIST='10.0;10.3'
     else
         echo "Unsupported CUDA version for Grace Blackwell: $CUDA_VERSION" && exit 1
     fi && \
     if [ "${CUDA_VERSION%%.*}" = "13" ]; then \
         sed -i "/^    include_dirs = \['csrc\/'\]/a\    include_dirs.append('${CUDA_HOME}/include/cccl')" setup.py; \
     fi
-    TORCH_CUDA_ARCH_LIST="${CHOSEN_TORCH_CUDA_ARCH_LIST}" pip install --no-build-isolation .
+    TORCH_CUDA_ARCH_LIST="${CHOSEN_TORCH_CUDA_ARCH_LIST}" ${PIP_CMD:-pip} install --no-build-isolation . ${PIP_INSTALL_SUFFIX:-}
 else
+    # CUDA 13.0 puts CCCL headers in /usr/local/cuda/include/cccl/ but nvshmem
+    # includes them as <cuda/__cccl_config> expecting /usr/local/cuda/include/cuda/.
+    # Add the cccl path to setup.py include_dirs so the compiler finds them.
+    NVCC_MAJOR=$(nvcc --version 2>/dev/null | grep -oP 'release \K[0-9]+' || echo "0")
+    if [ "$NVCC_MAJOR" = "13" ]; then
+        sed -i "/^    include_dirs = \['csrc\/'\]/a\    include_dirs.append('${CUDA_HOME:-/usr/local/cuda}/include/cccl')" setup.py
+    fi
     python3 setup.py install
 fi

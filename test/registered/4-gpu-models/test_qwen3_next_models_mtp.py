@@ -1,13 +1,12 @@
 import unittest
 
-from sglang.srt.environ import envs
 from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.kits.gsm8k_accuracy_kit import GSM8KMixin
+from sglang.test.kits.eval_accuracy_kit import GSM8KMixin
 from sglang.test.kits.kl_divergence_kit import KLDivergenceMixin
 from sglang.test.kits.prefix_cache_branching_kit import PrefixCacheBranchingMixin
 from sglang.test.server_fixtures.default_fixture import DefaultServerBase
 
-register_cuda_ci(est_time=500, suite="stage-c-test-4-gpu-h100")
+register_cuda_ci(est_time=422, suite="stage-c-test-4-gpu-h100")
 
 QWEN3_NEXT_MODEL = "Qwen/Qwen3-Next-80B-A3B-Instruct"
 
@@ -68,11 +67,10 @@ class TestQwen3NextMTPTopk(
     ]
 
 
-# TODO(hzh): After merging the PR that fixes specv2 to correctly return log probs,
-# add KLDivergenceMixin back. https://github.com/sgl-project/sglang/pull/18645
-class TestQwen3NextMTPV2(GSM8KMixin, DefaultServerBase):
+class TestQwen3NextMTPV2(GSM8KMixin, KLDivergenceMixin, DefaultServerBase):
     model = QWEN3_NEXT_MODEL
     gsm8k_accuracy_thres = 0.93
+    kl_div_thres = 0.0035
     other_args = [
         "--trust-remote-code",
         "--speculative-algorithm",
@@ -94,16 +92,6 @@ class TestQwen3NextMTPV2(GSM8KMixin, DefaultServerBase):
         "--mamba-track-interval",
         "128",
     ]
-
-    @classmethod
-    def setUpClass(cls):
-        envs.SGLANG_ENABLE_SPEC_V2.set(True)
-        super().setUpClass()
-
-    @classmethod
-    def tearDownClass(cls):
-        envs.SGLANG_ENABLE_SPEC_V2.set(False)
-        super().tearDownClass()
 
 
 if __name__ == "__main__":

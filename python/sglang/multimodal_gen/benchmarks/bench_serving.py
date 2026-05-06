@@ -39,12 +39,27 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import (
     init_logger,
 )
 from sglang.multimodal_gen.test.test_utils import print_divider, print_value_formatted
+from sglang.srt.utils.network import NetworkAddress
 
 logger = init_logger(__name__)
 
 # Patch size used for computing area units (e.g. in latent diffusion models).
 PATCH_SIZE = 16
 PATCH_AREA = PATCH_SIZE * PATCH_SIZE
+
+
+def _get_response_output_count(resp_json: Dict[str, Any]) -> int:
+    if isinstance(resp_json.get("num_outputs"), int):
+        return resp_json["num_outputs"]
+    if isinstance(resp_json.get("data"), list):
+        return len(resp_json["data"])
+    if isinstance(resp_json.get("file_paths"), list):
+        return len(resp_json["file_paths"])
+    if isinstance(resp_json.get("urls"), list):
+        return len(resp_json["urls"])
+    if resp_json.get("file_path") or resp_json.get("url"):
+        return 1
+    return 0
 
 
 def _compute_scale_factor(req: RequestFuncInput, args) -> Optional[float]:
@@ -141,6 +156,7 @@ async def async_request_image_sglang(
         data.add_field("model", input.model)
         data.add_field("prompt", input.prompt)
         data.add_field("response_format", "b64_json")
+        data.add_field("n", str(input.num_outputs_per_prompt))
 
         if input.width and input.height:
             data.add_field("size", f"{input.width}x{input.height}")
@@ -171,6 +187,7 @@ async def async_request_image_sglang(
                     resp_json = await response.json()
                     output.response_body = resp_json
                     output.success = True
+                    output.output_count = _get_response_output_count(resp_json)
                     if "peak_memory_mb" in resp_json:
                         output.peak_memory_mb = resp_json["peak_memory_mb"]
                 else:
@@ -184,12 +201,14 @@ async def async_request_image_sglang(
         payload = {
             "model": input.model,
             "prompt": input.prompt,
-            "n": 1,
+            "n": input.num_outputs_per_prompt,
             "response_format": "b64_json",
         }
 
         if input.width and input.height:
             payload["size"] = f"{input.width}x{input.height}"
+        if input.num_inference_steps:
+            payload["num_inference_steps"] = input.num_inference_steps
 
         # Merge extra parameters
         payload.update(input.extra_body)
@@ -200,6 +219,7 @@ async def async_request_image_sglang(
                     resp_json = await response.json()
                     output.response_body = resp_json
                     output.success = True
+                    output.output_count = _get_response_output_count(resp_json)
                     if "peak_memory_mb" in resp_json:
                         output.peak_memory_mb = resp_json["peak_memory_mb"]
                 else:
@@ -236,6 +256,7 @@ async def async_request_video_sglang(
         data = aiohttp.FormData()
         data.add_field("model", input.model)
         data.add_field("prompt", input.prompt)
+        data.add_field("num_outputs_per_prompt", str(input.num_outputs_per_prompt))
 
         if input.width and input.height:
             data.add_field("size", f"{input.width}x{input.height}")
@@ -293,11 +314,14 @@ async def async_request_video_sglang(
         payload: Dict[str, Any] = {
             "model": input.model,
             "prompt": input.prompt,
+            "num_outputs_per_prompt": input.num_outputs_per_prompt,
         }
         if input.width and input.height:
             payload["size"] = f"{input.width}x{input.height}"
         if input.num_frames:
             payload["num_frames"] = input.num_frames
+        if input.num_inference_steps:
+            payload["num_inference_steps"] = input.num_inference_steps
         if input.fps:
             payload["fps"] = input.fps
 
@@ -345,6 +369,7 @@ async def async_request_video_sglang(
                     if status == "completed":
                         output.success = True
                         output.response_body = status_data
+                        output.output_count = _get_response_output_count(status_data)
                         if "peak_memory_mb" in status_data:
                             output.peak_memory_mb = status_data["peak_memory_mb"]
                         break
@@ -389,17 +414,29 @@ def calculate_metrics(
 
     num_success = len(success_outputs)
     latencies = [o.latency for o in success_outputs]
-    peak_memories = [o.peak_memory_mb for o in success_outputs if o.peak_memory_mb > 0]
+    completed_outputs = sum(o.output_count for o in success_outputs)
+    peak_memories = [
+        o.peak_memory_mb
+        for o in success_outputs
+        if o.peak_memory_mb is not None and o.peak_memory_mb > 0
+    ]
 
     metrics = {
         "duration": total_duration,
         "completed_requests": num_success,
+        "completed_outputs": completed_outputs,
         "failed_requests": len(error_outputs),
         "throughput_qps": num_success / total_duration if total_duration > 0 else 0,
+        "output_throughput_ops": (
+            completed_outputs / total_duration if total_duration > 0 else 0
+        ),
         "latency_mean": np.mean(latencies) if latencies else 0,
         "latency_median": np.median(latencies) if latencies else 0,
-        "latency_p99": np.percentile(latencies, 99) if latencies else 0,
         "latency_p50": np.percentile(latencies, 50) if latencies else 0,
+        "latency_p90": np.percentile(latencies, 90) if latencies else 0,
+        "latency_p95": np.percentile(latencies, 95) if latencies else 0,
+        "latency_p99": np.percentile(latencies, 99) if latencies else 0,
+        "num_outputs_per_prompt": args.num_outputs_per_prompt,
         "peak_memory_mb_max": max(peak_memories) if peak_memories else 0,
         "peak_memory_mb_mean": np.mean(peak_memories) if peak_memories else 0,
         "peak_memory_mb_median": np.median(peak_memories) if peak_memories else 0,
@@ -457,7 +494,7 @@ async def benchmark(args):
 
     # Construct base_url if not provided
     if args.base_url is None:
-        args.base_url = f"http://{args.host}:{args.port}"
+        args.base_url = NetworkAddress(args.host, args.port).to_url()
 
     # Wait for service
     wait_for_service(args.base_url)
@@ -517,6 +554,11 @@ async def benchmark(args):
         request_func = async_request_image_sglang
 
     setattr(args, "task_name", task_name)
+
+    if args.random_request_config and args.dataset != "random":
+        raise ValueError(
+            "--random-request-config can only be used with --dataset random"
+        )
 
     if args.dataset == "vbench":
         dataset = VBenchDataset(args, api_url, args.model)
@@ -613,14 +655,21 @@ async def benchmark(args):
         "Successful requests:",
         f"{metrics['completed_requests']}/{len(requests_list)}",
     )
+    print_value_formatted("Completed outputs:", metrics["completed_outputs"])
+    print_value_formatted("Outputs per prompt:", metrics["num_outputs_per_prompt"])
 
     # Section 3: Performance Metrics
     print_divider(50)
 
     print_value_formatted("Request throughput (req/s):", metrics["throughput_qps"])
+    print_value_formatted(
+        "Output throughput (outputs/s):", metrics["output_throughput_ops"]
+    )
 
     print_value_formatted("Latency Mean (s):", metrics["latency_mean"])
     print_value_formatted("Latency Median (s):", metrics["latency_median"])
+    print_value_formatted("Latency P90 (s):", metrics["latency_p90"])
+    print_value_formatted("Latency P95 (s):", metrics["latency_p95"])
     print_value_formatted("Latency P99 (s):", metrics["latency_p99"])
 
     if metrics["peak_memory_mb_max"] > 0:
@@ -698,6 +747,12 @@ if __name__ == "__main__":
         "--num-prompts", type=int, default=10, help="Number of prompts to benchmark."
     )
     parser.add_argument(
+        "--num-outputs-per-prompt",
+        type=int,
+        default=1,
+        help="Number of generated outputs requested per prompt.",
+    )
+    parser.add_argument(
         "--max-concurrency",
         type=int,
         default=1,
@@ -719,6 +774,26 @@ if __name__ == "__main__":
     )
     parser.add_argument("--width", type=int, default=None, help="Image/Video width.")
     parser.add_argument("--height", type=int, default=None, help="Image/Video height.")
+    parser.add_argument(
+        "--random-request-config",
+        type=str,
+        default=None,
+        help=(
+            "JSON string defining random request profiles. "
+            "Each profile may contain: width, height, num_inference_steps, "
+            "num_outputs_per_prompt, etc. "
+            "The 'weight' field controls sampling probability (relative weight). "
+            "Example: "
+            '[{"width":512,"height":512,"num_inference_steps":20,"weight":0.15},'
+            '{"width":768,"height":768,"num_inference_steps":20,"weight":0.85}]'
+        ),
+    )
+    parser.add_argument(
+        "--random-request-seed",
+        type=int,
+        default=42,
+        help="Random seed for sampling request profiles (default: 42).",
+    )
     parser.add_argument(
         "--num-frames", type=int, default=None, help="Number of frames (for video)."
     )

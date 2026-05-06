@@ -327,6 +327,8 @@ class SetKAndS:
 
     @classmethod
     def triton(cls, pool, buf, loc, index_k, index_k_scale):
+        loc = loc.to(torch.int64)
+
         _set_k_and_s_triton(
             buf=buf,
             loc=loc,
@@ -624,7 +626,7 @@ def _get_k_and_s_triton(
     :param page_indices: (num_pages,), int32/int64
     :param seq_lens: tensor of sequence lens, int64
     :param seq_len_sum: sum of all sequence len, int32
-    :param seq_len_sum: max of sequence len, int32
+    :param max_seq_len: max of sequence len, int32
     :param page_size: int, typically 64
     :param index_head_dim: int, typically 128
     :return: tuple of (k_out, s_out) where

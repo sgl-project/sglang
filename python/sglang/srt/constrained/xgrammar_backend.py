@@ -23,16 +23,20 @@ from xgrammar import (
     CompiledGrammar,
     GrammarCompiler,
     GrammarMatcher,
+    StructuralTag,
     StructuralTagItem,
     TokenizerInfo,
     allocate_token_bitmask,
 )
 
 from sglang.srt.constrained.base_grammar_backend import (
-    INVALID_GRAMMAR_OBJ,
     BaseGrammarBackend,
     BaseGrammarObject,
     GrammarStats,
+    InvalidGrammarObject,
+)
+from sglang.srt.constrained.torch_ops.bitmask_ops import (
+    apply_token_bitmask_inplace_torch,
 )
 from sglang.srt.constrained.utils import is_legacy_structural_tag
 from sglang.srt.utils import is_hip
@@ -104,15 +108,13 @@ class XGrammarGrammar(BaseGrammarObject):
         return vocab_mask.to(device, non_blocking=True)
 
     def apply_vocab_mask(self, logits: torch.Tensor, vocab_mask: torch.Tensor) -> None:
-        if (
-            logits.device.type == "cuda"
-            or logits.device.type == "npu"
-            or logits.device.type == "xpu"
-        ):
+        if logits.device.type in {"cuda", "xpu", "musa"}:
             if _is_hip:
                 apply_token_bitmask_inplace_cuda(logits, vocab_mask)
             else:
                 apply_token_bitmask_inplace_triton(logits, vocab_mask)
+        elif logits.device.type == "npu":
+            apply_token_bitmask_inplace_torch(logits, vocab_mask)
         else:
             raise RuntimeError(f"Unsupported device: {logits.device.type}")
 
@@ -266,7 +268,7 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
 
         except (RuntimeError, json.decoder.JSONDecodeError, UnicodeDecodeError) as e:
             logger.error(f"Hit invalid json_schema: {key_string=}, {e=}")
-            return INVALID_GRAMMAR_OBJ
+            return InvalidGrammarObject(str(e))
         return self._from_context(ctx, key_string, GrammarStats(dispatch_type="json"))
 
     def dispatch_ebnf(self, key_string: str) -> BaseGrammarObject:
@@ -274,7 +276,7 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
             ctx = self.grammar_compiler.compile_grammar(key_string)
         except RuntimeError as e:
             logger.error(f"Hit invalid ebnf: {key_string=}, {e=}")
-            return INVALID_GRAMMAR_OBJ
+            return InvalidGrammarObject(str(e))
         return self._from_context(ctx, key_string, GrammarStats(dispatch_type="ebnf"))
 
     def dispatch_regex(self, key_string: str) -> BaseGrammarObject:
@@ -282,7 +284,7 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
             ctx = self.grammar_compiler.compile_regex(key_string)
         except RuntimeError as e:
             logger.error(f"Hit invalid regex: {key_string=}, {e=}")
-            return INVALID_GRAMMAR_OBJ
+            return InvalidGrammarObject(str(e))
         return self._from_context(ctx, key_string, GrammarStats(dispatch_type="regex"))
 
     def dispatch_structural_tag(self, key_string: str) -> BaseGrammarObject:
@@ -299,9 +301,11 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
                     )
                     for structure in structural_tag["structures"]
                 ]
-                ctx = self.grammar_compiler.compile_structural_tag(
+                new_tag = StructuralTag.from_legacy_structural_tag(
                     tags, structural_tag["triggers"]
                 )
+                new_tag.format.at_least_one = structural_tag.get("at_least_one", False)
+                ctx = self.grammar_compiler.compile_structural_tag(new_tag)
             else:
                 format_dict = structural_tag.get("format")
                 if isinstance(format_dict, dict):
@@ -311,12 +315,13 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
                 ctx = self.grammar_compiler.compile_structural_tag(key_string)
         except (RuntimeError, json.decoder.JSONDecodeError) as e:
             logger.error(f"Hit invalid structural_tag: {key_string=}, {e=}")
-            return INVALID_GRAMMAR_OBJ
+            return InvalidGrammarObject(str(e))
         return self._from_context(
             ctx, key_string, GrammarStats(dispatch_type="structural_tag")
         )
 
     def reset(self):
+        super().reset()
         self.grammar_compiler.clear_cache()
 
 

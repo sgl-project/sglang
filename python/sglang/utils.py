@@ -5,7 +5,6 @@ import json
 import logging
 import os
 import random
-import socket
 import ssl
 import subprocess
 import sys
@@ -16,7 +15,7 @@ import warnings
 import weakref
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
-from functools import wraps
+from functools import cached_property, wraps
 from io import BytesIO
 from json import dumps
 from typing import Any, Callable, List, Optional, Tuple, Type, Union
@@ -31,6 +30,56 @@ from tqdm import tqdm
 from sglang.srt.environ import envs
 
 logger = logging.getLogger(__name__)
+
+KNOWN_NON_DIFFUSERS_DIFFUSION_MODEL_PATTERNS: dict[str, str] = {
+    "hunyuan3d": "Hunyuan3D2Pipeline",
+    "flux.2-dev-nvfp4": "Flux2NvfpPipeline",
+}
+
+
+def load_diffusion_overlay_registry_from_env() -> dict[str, dict[str, Any]]:
+    raw_value = os.getenv("SGLANG_DIFFUSION_MODEL_OVERLAY_REGISTRY", "").strip()
+    if not raw_value:
+        return {}
+
+    if raw_value.startswith("{"):
+        payload = json.loads(raw_value)
+    else:
+        with open(os.path.expanduser(raw_value), encoding="utf-8") as f:
+            payload = json.load(f)
+
+    if not isinstance(payload, dict):
+        return {}
+
+    normalized: dict[str, dict[str, Any]] = {}
+    for source_model_id, spec in payload.items():
+        if isinstance(spec, str):
+            normalized[source_model_id] = {"overlay_repo_id": spec}
+        elif isinstance(spec, dict) and spec.get("overlay_repo_id"):
+            normalized[source_model_id] = dict(spec)
+    return normalized
+
+
+def has_diffusion_overlay_registry_match(
+    model_path: str, registry: dict[str, dict[str, Any]] | None = None
+) -> bool:
+    registry = (
+        load_diffusion_overlay_registry_from_env() if registry is None else registry
+    )
+    if model_path in registry:
+        return True
+    if not os.path.exists(model_path):
+        return False
+    base_name = os.path.basename(os.path.normpath(model_path))
+    return any(base_name == key.rsplit("/", 1)[-1] for key in registry)
+
+
+def is_known_non_diffusers_diffusion_model(model_path: str) -> bool:
+    model_path_lower = model_path.lower()
+    return any(
+        pattern in model_path_lower
+        for pattern in KNOWN_NON_DIFFUSERS_DIFFUSION_MODEL_PATTERNS
+    )
 
 
 def execute_once(func):
@@ -124,6 +173,8 @@ def dump_state_text(filename: str, states: list, mode: str = "w"):
 
 
 def normalize_base_url(host: str, port: int) -> str:
+    from sglang.srt.utils.network import NetworkAddress
+
     if host.startswith("http://") or host.startswith("https://"):
         warnings.warn(
             f"Including the scheme in --host ('{host}') is deprecated. "
@@ -131,17 +182,24 @@ def normalize_base_url(host: str, port: int) -> str:
             DeprecationWarning,
             stacklevel=2,
         )
-    else:
-        host = f"http://{host}"
-    return f"{host}:{port}"
+        return f"{host}:{port}"
+    return NetworkAddress(host, port).to_url()
 
 
 class HttpResponse:
     def __init__(self, resp):
         self.resp = resp
 
+    @cached_property
+    def _body(self):
+        return self.resp.read()
+
     def json(self):
-        return json.loads(self.resp.read())
+        return json.loads(self._body)
+
+    @property
+    def text(self):
+        return self._body.decode("utf-8", errors="replace")
 
     @property
     def status_code(self):
@@ -196,7 +254,16 @@ def encode_image_base64(image_path: Union[str, bytes]):
     elif isinstance(image_path, bytes):
         return pybase64.b64encode(image_path).decode("utf-8")
     else:
-        # image_path is PIL.WebPImagePlugin.WebPImageFile
+        import torch
+
+        if isinstance(image_path, torch.Tensor):
+            # Convert GPU-decoded image tensor (C, H, W) uint8 to PIL Image
+            from PIL import Image
+
+            tensor = image_path.cpu() if image_path.device.type != "cpu" else image_path
+            image_path = Image.fromarray(tensor.permute(1, 2, 0).numpy())
+
+        # image_path is a PIL Image
         image = image_path
         buffered = BytesIO()
         image.save(buffered, format="PNG")
@@ -393,18 +460,15 @@ def reserve_port(host, start=30000, end=40000):
     Reserve an available port by trying to bind a socket.
     Returns a tuple (port, lock_socket) where `lock_socket` is kept open to hold the lock.
     """
+    from sglang.srt.utils.network import try_bind_socket
+
     candidates = list(range(start, end))
     random.shuffle(candidates)
-
     for port in candidates:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         try:
-            # Attempt to bind to the port on localhost
-            sock.bind((host, port))
+            sock = try_bind_socket(host, port)
             return port, sock
-        except socket.error:
-            sock.close()  # Failed to bind, try next port
+        except OSError:
             continue
     raise RuntimeError("No free port available.")
 

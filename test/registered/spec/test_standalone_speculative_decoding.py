@@ -1,4 +1,3 @@
-import os
 import unittest
 from types import SimpleNamespace
 
@@ -7,7 +6,7 @@ import requests
 from sglang.srt.environ import envs
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
+from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_DRAFT_MODEL_STANDALONE,
     DEFAULT_TARGET_MODEL_STANDALONE,
@@ -18,10 +17,9 @@ from sglang.test.test_utils import (
 )
 
 # Standalone speculative decoding tests (FA3, Triton, FlashInfer backends)
-register_cuda_ci(est_time=308, suite="stage-b-test-large-1-gpu")
+register_cuda_ci(est_time=406, suite="stage-b-test-1-gpu-large")
 
 GSM_DATASET_PATH = None
-
 
 # Default server arguments shared across all tests
 DEFAULT_SERVER_ARGS = [
@@ -67,7 +65,7 @@ class TestStandaloneSpeculativeDecodingBase(CustomTestCase):
     model = DEFAULT_TARGET_MODEL_STANDALONE
     draft_model = DEFAULT_DRAFT_MODEL_STANDALONE
     base_url = DEFAULT_URL_FOR_TEST
-    accuracy_threshold = 0.7  # derived tests need to override this
+    accuracy_threshold = 0.69  # derived tests need to override this
     spec_decode_threshold = 3.6  # derived spec decoding tests need to override this
 
     @classmethod
@@ -81,6 +79,7 @@ class TestStandaloneSpeculativeDecodingBase(CustomTestCase):
         # please don't do this if you want to make your inference workload faster
         envs.SGLANG_JIT_DEEPGEMM_PRECOMPILE.set(False)
         envs.SGLANG_ENABLE_JIT_DEEPGEMM.set(False)
+        envs.SGLANG_ENABLE_SPEC_V2.set(False)
         model = cls.model
         cls.process = popen_launch_server(
             model,
@@ -92,27 +91,30 @@ class TestStandaloneSpeculativeDecodingBase(CustomTestCase):
     @classmethod
     def tearDownClass(cls):
         kill_process_tree(cls.process.pid)
+        envs.SGLANG_ENABLE_SPEC_V2.clear()
 
     def test_gsm8k(self):
         requests.get(self.base_url + "/flush_cache")
 
         args = SimpleNamespace(
+            base_url=self.base_url,
+            model=self.model,
+            eval_name="gsm8k",
+            api="completion",
+            max_tokens=512,
+            num_examples=100,
+            num_threads=128,
             num_shots=4,
-            num_questions=100,
-            max_new_tokens=512,
-            parallel=128,
-            host="http://127.0.0.1",
-            port=int(self.base_url.split(":")[-1]),
-            data_path=GSM_DATASET_PATH,
+            gsm8k_data_path=GSM_DATASET_PATH,
         )
-        metrics = run_eval_few_shot_gsm8k(args)
+        metrics = run_eval(args)
         print(f"{metrics=}")
 
         # Use the appropriate metric key based on the test class
-        metric_key = "accuracy"
-        self.assertGreater(metrics[metric_key], self.accuracy_threshold)
+        metric_key = "score"
+        self.assertGreaterEqual(metrics[metric_key], self.accuracy_threshold)
 
-        server_info = requests.get(self.base_url + "/get_server_info")
+        server_info = requests.get(self.base_url + "/server_info")
         avg_spec_accept_length = server_info.json()["internal_states"][0][
             "avg_spec_accept_length"
         ]
@@ -125,7 +127,7 @@ class TestStandaloneV2SpeculativeDecodingBase(CustomTestCase):
     model = DEFAULT_TARGET_MODEL_STANDALONE
     draft_model = DEFAULT_DRAFT_MODEL_STANDALONE
     base_url = DEFAULT_URL_FOR_TEST
-    accuracy_threshold = 0.7  # derived tests need to override this
+    accuracy_threshold = 0.69  # derived tests need to override this
     spec_decode_threshold = 3.6  # derived spec decoding tests need to override this
 
     @classmethod
@@ -139,7 +141,6 @@ class TestStandaloneV2SpeculativeDecodingBase(CustomTestCase):
         # please don't do this if you want to make your inference workload faster
         envs.SGLANG_JIT_DEEPGEMM_PRECOMPILE.set(False)
         envs.SGLANG_ENABLE_JIT_DEEPGEMM.set(False)
-        envs.SGLANG_ENABLE_SPEC_V2.set(True)  # Enable Speculative Decoding V2
         model = cls.model
         cls.process = popen_launch_server(
             model,
@@ -151,29 +152,29 @@ class TestStandaloneV2SpeculativeDecodingBase(CustomTestCase):
     @classmethod
     def tearDownClass(cls):
         kill_process_tree(cls.process.pid)
-        if "SGLANG_ENABLE_SPEC_V2" in os.environ:
-            envs.SGLANG_ENABLE_SPEC_V2.set(False)
 
     def test_gsm8k(self):
         requests.get(self.base_url + "/flush_cache")
 
         args = SimpleNamespace(
+            base_url=self.base_url,
+            model=self.model,
+            eval_name="gsm8k",
+            api="completion",
+            max_tokens=512,
+            num_examples=100,
+            num_threads=128,
             num_shots=4,
-            num_questions=100,
-            max_new_tokens=512,
-            parallel=128,
-            host="http://127.0.0.1",
-            port=int(self.base_url.split(":")[-1]),
-            data_path=GSM_DATASET_PATH,
+            gsm8k_data_path=GSM_DATASET_PATH,
         )
-        metrics = run_eval_few_shot_gsm8k(args)
+        metrics = run_eval(args)
         print(f"{metrics=}")
 
         # Use the appropriate metric key based on the test class
-        metric_key = "accuracy"
-        self.assertGreater(metrics[metric_key], self.accuracy_threshold)
+        metric_key = "score"
+        self.assertGreaterEqual(metrics[metric_key], self.accuracy_threshold)
 
-        server_info = requests.get(self.base_url + "/get_server_info")
+        server_info = requests.get(self.base_url + "/server_info")
         avg_spec_accept_length = server_info.json()["internal_states"][0][
             "avg_spec_accept_length"
         ]

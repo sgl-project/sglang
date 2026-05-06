@@ -17,6 +17,7 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.activation import get_act_fn
 from sglang.srt.layers.attention import vision_utils
 from sglang.srt.layers.attention.vision import SingletonCache, VisionAttention
+from sglang.srt.layers.conv import Conv2dLayer
 from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -113,7 +114,7 @@ class InternVisionEmbeddings(nn.Module):
             torch.randn(1, 1, self.embed_dim),
         )
 
-        self.patch_embedding = nn.Conv2d(
+        self.patch_embedding = Conv2dLayer(
             in_channels=3,
             out_channels=self.embed_dim,
             kernel_size=self.patch_size,
@@ -332,6 +333,7 @@ class InternVisionEncoder(nn.Module):
     def forward(
         self,
         inputs_embeds,
+        cu_seqlens=None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
     ) -> Union[Tuple, BaseModelOutput]:
@@ -365,7 +367,8 @@ class InternVisionEncoder(nn.Module):
         encoder_states = () if output_hidden_states else None
         hidden_states = inputs_embeds
 
-        cu_seqlens = SingletonCache()
+        if cu_seqlens is None:
+            cu_seqlens = SingletonCache()
 
         for idx, encoder_layer in enumerate(self.layers):
             if output_hidden_states:

@@ -12,6 +12,11 @@ from typing import List, Optional
 import torch
 import torch.distributed as dist
 
+from sglang.multimodal_gen.runtime.distributed.parallel_state import (
+    get_ring_parallel_world_size,
+    get_tp_world_size,
+    get_ulysses_parallel_world_size,
+)
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
@@ -107,15 +112,15 @@ def _build_parallelism_config(
     ulysses_size = None
     ring_size = None
     if sp_group is not None:
-        ulysses_size = getattr(sp_group, "ulysses_world_size", None)
-        ring_size = getattr(sp_group, "ring_world_size", None)
+        ulysses_size = get_ulysses_parallel_world_size()
+        ring_size = get_ring_parallel_world_size()
 
     tp_size = None
     if tp_group is not None:
-        tp_size = dist.get_world_size(tp_group)
+        tp_size = get_tp_world_size()
 
     return ParallelismConfig(
-        backend=ParallelismBackend.NATIVE_PYTORCH,
+        backend=ParallelismBackend.AUTO,
         ulysses_size=ulysses_size,
         ring_size=ring_size,
         tp_size=tp_size,
@@ -526,13 +531,16 @@ def refresh_context_on_transformer(
     verbose: bool = False,
 ) -> None:
     """Refresh cache-dit context for transformer."""
+    steps_computation_mask = None
+    if scm_preset is not None:
+        steps_computation_mask = cache_dit.steps_mask(
+            mask_policy=scm_preset, total_steps=num_inference_steps
+        )
     cache_dit.refresh_context(
         transformer,
         cache_config=DBCacheConfig().reset(
             num_inference_steps=num_inference_steps,
-            steps_computation_mask=cache_dit.steps_mask(
-                mask_policy=scm_preset, total_steps=num_inference_steps
-            ),
+            steps_computation_mask=steps_computation_mask,
             steps_computation_policy=scm_preset,
         ),
         verbose=verbose,
@@ -549,13 +557,20 @@ def refresh_context_on_dual_transformer(
     verbose: bool = False,
 ) -> None:
     """Refresh cache-dit context for dual transformers."""
+    high_noise_steps_computation_mask = None
+    low_noise_steps_computation_mask = None
+    if scm_preset is not None:
+        high_noise_steps_computation_mask = cache_dit.steps_mask(
+            mask_policy=scm_preset, total_steps=num_high_noise_steps
+        )
+        low_noise_steps_computation_mask = cache_dit.steps_mask(
+            mask_policy=scm_preset, total_steps=num_low_noise_steps
+        )
     cache_dit.refresh_context(
         transformer,
         cache_config=DBCacheConfig().reset(
             num_inference_steps=num_high_noise_steps,
-            steps_computation_mask=cache_dit.steps_mask(
-                mask_policy=scm_preset, total_steps=num_high_noise_steps
-            ),
+            steps_computation_mask=high_noise_steps_computation_mask,
             steps_computation_policy=scm_preset,
         ),
         verbose=verbose,
@@ -564,9 +579,7 @@ def refresh_context_on_dual_transformer(
         transformer_2,
         cache_config=DBCacheConfig().reset(
             num_inference_steps=num_low_noise_steps,
-            steps_computation_mask=cache_dit.steps_mask(
-                mask_policy=scm_preset, total_steps=num_low_noise_steps
-            ),
+            steps_computation_mask=low_noise_steps_computation_mask,
             steps_computation_policy=scm_preset,
         ),
         verbose=verbose,
