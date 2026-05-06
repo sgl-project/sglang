@@ -30,7 +30,6 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
-from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     is_flashinfer_available,
     log_info_on_rank0,
@@ -117,10 +116,6 @@ class DeepSeekW4A16MoEMethod:
     def __init__(self, fp8_method, prefix: str):
         self._fp8 = fp8_method
         self.prefix = prefix
-        # Kept for parity with mxfp4_deepseek; unused by cutlass_fused_moe.
-        self.flashinfer_mxfp4_moe_precision = (
-            get_global_server_args().flashinfer_mxfp4_moe_precision
-        )
 
     def create_moe_runner(self, layer, moe_runner_config):
         self.moe_runner_config = moe_runner_config
@@ -309,9 +304,6 @@ class DeepSeekW4A16MoEMethod:
                 f"Unsupported topk output format for W4A16 MoE: {topk_output.format}"
             )
 
-        # RC-X2: topk_weights renorm (DISABLED for testing - original code without renorm)
-        # topk_weights = topk_weights / topk_weights.sum(-1, keepdim=True)
-
         # RSF fix: pre-multiply topk_weights by routed_scaling_factor (DSv4=1.5).
         # cutlass_fused_moe treats token_final_scales as the FINAL output weight per expert,
         # so it must include RSF. The post-hoc output.mul_(rsf) approach was wrong because
@@ -384,12 +376,5 @@ class DeepSeekW4A16MoEMethod:
             output=symm_output,
         )
         output = symm_output
-
-        # Apply routed_scaling_factor: pre-multiplied into topk_weights above (RC-RSF),
-        # so skip post-hoc multiply to avoid double application.
-        # if not envs.SGLANG_OPT_MXFP4_FUSE_RSF_SHARED_ADD.get():
-        #     rsf = layer.moe_runner_config.routed_scaling_factor
-        #     if rsf is not None and rsf != 1.0:
-        #         output.mul_(rsf)
 
         return StandardCombineInput(hidden_states=output)

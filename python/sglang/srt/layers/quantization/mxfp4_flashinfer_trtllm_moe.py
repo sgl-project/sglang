@@ -1,4 +1,3 @@
-
 from __future__ import annotations
 
 import logging
@@ -42,7 +41,6 @@ if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import CombineInput, DispatchOutput
 
 
-from sglang.srt.debug_utils.deepseek_v4_debug_utils import deepseek_v4_moe_code_path_checker
 from sglang.srt.environ import envs
 from sglang.srt.utils.common import get_bool_env_var
 
@@ -473,11 +471,6 @@ class DeepSeekMxfp4MoEMethod:
                 num_tokens, out_hidden_size, dtype=torch.bfloat16, device=x_quant.device
             )
 
-        if envs.SGLANG_DSV4_2604_SUBMODE.get() == "2604B" and (
-            self._gemm1_clamp_limit_tensor is not None
-        ):
-            deepseek_v4_moe_code_path_checker.observed += 1
-
         output = trtllm_fp4_block_scale_routed_moe(
             topk_ids=packed_topk,
             routing_bias=None,
@@ -534,3 +527,26 @@ class DeepSeekMxfp4MoEMethod:
 
         return StandardCombineInput(hidden_states=output)
 
+
+def maybe_fuse_routed_scale_and_shared_add(
+    experts,
+    routed: torch.Tensor,
+    shared: torch.Tensor | None,
+    routed_scaling_factor: float,
+) -> torch.Tensor:
+    # When MxFP4 fusion is on, the upstream `routed *= scale` is skipped and
+    # the scaling is folded into the shared-add via `shared.add_(routed,
+    # alpha=scale)`. With no shared output, the missing scale is applied
+    # in-place. Otherwise `routed` is already scale-final and we just add
+    # `shared` (or pass through if there is none).
+    fused = (
+        isinstance(experts.quant_method, DeepSeekMxfp4MoEMethod)
+        and envs.SGLANG_OPT_MXFP4_FUSE_RSF_SHARED_ADD.get()
+    )
+    if fused:
+        if shared is not None:
+            return shared.add_(routed, alpha=routed_scaling_factor)
+        return routed.mul_(routed_scaling_factor)
+    if shared is not None:
+        routed += shared
+    return routed
