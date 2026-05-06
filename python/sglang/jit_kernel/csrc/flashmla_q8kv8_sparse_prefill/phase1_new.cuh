@@ -82,10 +82,6 @@ struct KernelTemplateQ8New {
       tile_to_shape(GMMA::Layout_K_SW64_Atom<fp8_t>{}, Shape<Int<64 * NUM_TILES>, Int<B_TOPK>>{}, Step<_1, _2>{}),
       Shape<_1, _1>{}));
 
-  // S (P buffer for remote PV): fp8, K-major for PV SS GMMA A-operand
-  using SmemLayoutS_FP8 = decltype(coalesce(
-      tile_to_shape(GMMA::Layout_K_SW64_Atom<fp8_t>{}, Shape<Int<B_H>, Int<B_TOPK>>{}), Shape<_1, _1>{}));
-
   // O: bf16 output (unchanged from q16)
   template <int NUM_TILES>
   using SmemLayoutOTiles = decltype(coalesce(
@@ -96,7 +92,6 @@ struct KernelTemplateQ8New {
   using SmemLayoutK = SmemLayoutKTiles_FP8<D_Q / 64>;
   using SmemLayoutVt = SmemLayoutVtTiles_FP8<D_V / 64>;          // (512, 64) fp8
   using SmemLayoutHalfVt = SmemLayoutVtTiles_FP8<D_V / 64 / 2>;  // (256, 64) fp8
-  using SmemLayoutS = SmemLayoutS_FP8;
   using SmemLayoutO = SmemLayoutOTiles<D_V / 64>;
 
   // V transpose helper type
@@ -159,14 +154,6 @@ struct KernelTemplateQ8New {
 
     extern __shared__ char wksp_buf[];
     SharedMemoryPlan& plan = *reinterpret_cast<SharedMemoryPlan*>(wksp_buf);
-
-    // Smem tensors -- fp8
-    Tensor sQ = make_tensor(make_smem_ptr(plan.q_o.q.data()), SmemLayoutQ{});
-    Tensor sO = make_tensor(make_smem_ptr(plan.q_o.o.data()), SmemLayoutO{});
-
-    // S buffers for remote PV -- fp8
-    Tensor sS0 = make_tensor(make_smem_ptr(plan.s[0].data()), SmemLayoutS{});
-    Tensor sS1 = make_tensor(make_smem_ptr(plan.s[1].data()), SmemLayoutS{});
 
     const float q_scale = params.q_scale_ptr ? __ldg(params.q_scale_ptr) : params.q_scale;
     const float kv_scale = params.kv_scale_ptr ? __ldg(params.kv_scale_ptr) : params.kv_scale;
@@ -259,7 +246,6 @@ struct KernelTemplateQ8New {
       struct Warpgroup1 {};
 
       // fp8 QK GEMM: 64-wide tiles, k=32, so 64/32=2 k-steps per tile
-      static constexpr int NUM_QK_TILES = D_Q / 64;
       auto qkt_gemm_one_tile = [&](auto wg_tag, int tile_idx, bool clear_accum) {
         constexpr bool IS_WG1 = std::is_same_v<decltype(wg_tag), Warpgroup1>;
         TiledMMA_QK tiled_mma_QK;
