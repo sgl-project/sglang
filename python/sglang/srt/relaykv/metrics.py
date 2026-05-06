@@ -6319,9 +6319,104 @@ def _token_to_kv_pool_entry_for_smoke(
             return token_to_kv_pool_table[req_to_token_entry_as_str]
         return None
 
-    if req_to_token_entry < 0 or req_to_token_entry >= len(token_to_kv_pool_table):
+    if isinstance(token_to_kv_pool_table, (list, tuple)):
+        if req_to_token_entry < 0 or req_to_token_entry >= len(token_to_kv_pool_table):
+            return None
+        return token_to_kv_pool_table[req_to_token_entry]
+
+    try:
+        physical_kv_index = token_to_kv_pool_table[req_to_token_entry]
+    except Exception:
+        req_to_token_entry_as_str = str(req_to_token_entry)
+        try:
+            physical_kv_index = token_to_kv_pool_table[req_to_token_entry_as_str]
+        except Exception:
+            raise
+    return physical_kv_index
+
+
+def _token_to_kv_pool_object_type_for_smoke(token_to_kv_pool_object: Any) -> str | None:
+    if token_to_kv_pool_object is None:
         return None
-    return token_to_kv_pool_table[req_to_token_entry]
+    return type(token_to_kv_pool_object).__name__
+
+
+def _token_to_kv_pool_object_shape_for_smoke(
+    token_to_kv_pool_object: Any,
+) -> list[int] | None:
+    if token_to_kv_pool_object is None:
+        return None
+    shape = getattr(token_to_kv_pool_object, "shape", None)
+    if isinstance(shape, (list, tuple)):
+        dims: list[int] = []
+        for dim in shape:
+            if isinstance(dim, bool) or not isinstance(dim, int):
+                return None
+            dims.append(dim)
+        return dims
+    return None
+
+
+def _token_to_kv_pool_object_is_indexable_for_smoke(
+    token_to_kv_pool_object: Any,
+) -> bool:
+    if isinstance(token_to_kv_pool_object, (dict, list, tuple)):
+        return True
+    if token_to_kv_pool_object is None:
+        return False
+    getitem = getattr(token_to_kv_pool_object, "__getitem__", None)
+    return callable(getitem)
+
+
+def _token_to_kv_pool_entry_from_live_object_for_smoke(
+    token_to_kv_pool_object: Any,
+    req_to_token_entry: int,
+) -> tuple[Any, str | None]:
+    try:
+        physical_kv_index = _token_to_kv_pool_entry_for_smoke(
+            token_to_kv_pool_object,
+            req_to_token_entry,
+        )
+    except Exception:
+        return None, "token_to_kv_pool_index_read_failed"
+    return physical_kv_index, None
+
+
+def _read_live_physical_kv_indexes_for_smoke(
+    req_to_token_spans: list[Mapping[str, Any]],
+    *,
+    token_to_kv_pool_object: Any,
+) -> tuple[list[int], list[str]]:
+    physical_kv_indexes: list[int] = []
+    blocking_reasons: list[str] = []
+
+    for span in req_to_token_spans:
+        req_to_token_entries = _event_value(span, "req_to_token_entries")
+        if not isinstance(req_to_token_entries, (list, tuple)):
+            blocking_reasons.append("req_to_token_entries_missing")
+            return [], list(dict.fromkeys(blocking_reasons))
+        for entry in req_to_token_entries:
+            if isinstance(entry, bool) or not isinstance(entry, int):
+                blocking_reasons.append("req_to_token_entry_not_int")
+                return [], list(dict.fromkeys(blocking_reasons))
+            physical_kv_index, read_error = _token_to_kv_pool_entry_from_live_object_for_smoke(
+                token_to_kv_pool_object,
+                entry,
+            )
+            if read_error is not None:
+                blocking_reasons.append(read_error)
+                return [], list(dict.fromkeys(blocking_reasons))
+            if physical_kv_index is None:
+                blocking_reasons.append("token_to_kv_pool_entry_missing")
+                return [], list(dict.fromkeys(blocking_reasons))
+            if isinstance(physical_kv_index, bool) or not isinstance(
+                physical_kv_index, int
+            ):
+                blocking_reasons.append("token_to_kv_pool_entry_not_int")
+                return [], list(dict.fromkeys(blocking_reasons))
+            physical_kv_indexes.append(physical_kv_index)
+
+    return physical_kv_indexes, []
 
 
 def _read_physical_kv_indexes_for_smoke(
@@ -6356,6 +6451,435 @@ def _read_physical_kv_indexes_for_smoke(
             physical_kv_indexes.append(physical_kv_index)
 
     return physical_kv_indexes, []
+
+
+def _blocked_live_token_to_kv_pool_index_read_result_for_smoke(
+    result: Mapping[str, Any],
+    *,
+    blocking_reasons: list[str],
+    warning_reasons: list[str],
+    source_path: str | None,
+    token_to_kv_pool_type: str | None,
+    token_to_kv_pool_shape: list[int] | None,
+    read_token_to_kv_pool_index: bool,
+    max_tokens_per_request: int,
+    max_total_tokens: int,
+) -> dict[str, Any]:
+    blocked_result = normalize_relaykv_sglang_adapter_schema_for_smoke(result)
+    adapter_metadata = blocked_result.get("adapter_metadata")
+    if isinstance(adapter_metadata, Mapping):
+        payload_adapter_metadata = _copy_relaykv_metadata_value_for_smoke(
+            dict(adapter_metadata)
+        )
+    else:
+        payload_adapter_metadata = {}
+    payload_adapter_metadata.update(
+        {
+            "token_to_kv_pool_source_path": source_path,
+            "token_to_kv_pool_type": token_to_kv_pool_type,
+            "token_to_kv_pool_shape": token_to_kv_pool_shape,
+            "live_index_read_enabled": read_token_to_kv_pool_index,
+            "max_tokens_per_request": max_tokens_per_request,
+            "max_total_tokens": max_total_tokens,
+            "truncated_preview": False,
+        }
+    )
+
+    existing_engine_block_ref = blocked_result.get("engine_block_ref")
+    if isinstance(existing_engine_block_ref, Mapping):
+        engine_block_ref = _copy_relaykv_metadata_value_for_smoke(
+            dict(existing_engine_block_ref)
+        )
+    else:
+        engine_block_ref = {}
+    engine_block_ref["token_to_kv_pool_index"] = None
+    engine_block_ref["cache_position"] = None
+    engine_block_ref["physical_kv_index_preview"] = []
+    engine_block_ref["physical_kv_index_count"] = 0
+    engine_block_ref["physical_kv_index_checksum"] = None
+
+    blocked_result.update(
+        {
+            "event_type": "relaykv_live_token_to_kv_pool_index_read_result",
+            "resolution_state": "blocked",
+            "adapter_mode": "live_token_to_kv_pool_bounded_index_read",
+            "source": (
+                "req_to_token_resolution_result_to_"
+                "live_token_to_kv_pool_index_read_result"
+            ),
+            "adapter_metadata": payload_adapter_metadata,
+            "engine_block_ref": engine_block_ref,
+            "requested_token_count": 0,
+            "read_token_count": 0,
+            "physical_kv_index_count": 0,
+            "physical_kv_index_preview_count": 0,
+            "physical_kv_index_checksum": None,
+            "req_to_token_read_count": 0,
+            "actual_req_to_token_pool_read_count": 0,
+            "token_to_kv_pool_read_count": 0,
+            "actual_token_to_kv_pool_read_count": 0,
+            "live_token_to_kv_pool_index_read_count": 0,
+            "kv_pool_read_count": 0,
+            "kv_snapshot_count": 0,
+            "tensor_read_count": 0,
+            "attention_comparison_executed_count": 0,
+            "attention_override_true_count": 0,
+            "runtime_writeback_true_count": 0,
+            "scheduler_policy_noop_false_count": 0,
+            "kv_cache_mutation_true_count": 0,
+            "source_mutated_true_count": 0,
+            "req_to_token_read": False,
+            "actual_req_to_token_pool_read": False,
+            "token_to_kv_pool_read": False,
+            "actual_token_to_kv_pool_read": False,
+            "live_token_to_kv_pool_index_read": False,
+            "kv_pool_read": False,
+            "kv_snapshot": False,
+            "tensor_read": False,
+            "attention_comparison_executed": False,
+            "attention_override": False,
+            "runtime_writeback": False,
+            "scheduler_policy_noop": True,
+            "kv_cache_mutation": False,
+            "source_mutated": False,
+            "blocking_reasons": blocking_reasons,
+            "warning_reasons": warning_reasons,
+        }
+    )
+    blocked_result["decision_state"] = "SHADOW_ONLY"
+    blocked_result["fallback_reason"] = (
+        blocked_result.get("fallback_reason")
+        if blocked_result.get("fallback_reason") is not None
+        else (blocking_reasons[0] if blocking_reasons else None)
+    )
+    return blocked_result
+
+
+def build_relaykv_live_token_to_kv_pool_index_read_results_for_smoke(
+    req_to_token_resolution_results: list[dict[str, Any]]
+    | tuple[dict[str, Any], ...],
+    token_to_kv_pool_object: Any = None,
+    read_token_to_kv_pool_index: bool = False,
+    max_tokens_per_request: int = 256,
+    max_total_tokens: int = 1024,
+    source_path: str | None = None,
+    max_preview_entries: int = 8,
+) -> list[dict[str, Any]]:
+    """Build guarded live-like bounded token_to_kv_pool index read results."""
+
+    if not isinstance(req_to_token_resolution_results, (list, tuple)):
+        raise TypeError("req_to_token_resolution_results must be a list or tuple")
+
+    token_to_kv_pool_type = _token_to_kv_pool_object_type_for_smoke(
+        token_to_kv_pool_object
+    )
+    token_to_kv_pool_shape = _token_to_kv_pool_object_shape_for_smoke(
+        token_to_kv_pool_object
+    )
+    total_requested_token_count = 0
+    results: list[dict[str, Any]] = []
+
+    for result in req_to_token_resolution_results:
+        if not isinstance(result, dict):
+            raise TypeError(
+                "RelayKV live token_to_kv_pool index read inputs must be dict results"
+            )
+
+        blocking_reasons: list[str] = []
+        warning_reasons = [
+            "guarded_live_token_to_kv_pool_index_read",
+            "bounded_index_lookup_only",
+            "no_kv_pool_read",
+            "preview_only_no_full_indices_logged",
+        ]
+
+        full_kv_req_to_token_spans = _event_value(result, "full_kv_req_to_token_spans")
+        if _event_value(result, "event_type") != "relaykv_req_to_token_resolution_result":
+            blocking_reasons.append("not_req_to_token_resolution_result")
+        if _event_value(result, "resolution_state") != "req_to_token_resolved":
+            blocking_reasons.append("req_to_token_resolution_not_resolved")
+        if read_token_to_kv_pool_index is not True:
+            blocking_reasons.append("live_index_read_not_enabled")
+        if read_token_to_kv_pool_index and token_to_kv_pool_object is None:
+            blocking_reasons.append("token_to_kv_pool_object_missing")
+        elif read_token_to_kv_pool_index and not _token_to_kv_pool_object_is_indexable_for_smoke(
+            token_to_kv_pool_object
+        ):
+            blocking_reasons.append("token_to_kv_pool_object_not_indexable")
+        if not isinstance(full_kv_req_to_token_spans, (list, tuple)):
+            blocking_reasons.append("req_to_token_entries_missing")
+        elif not full_kv_req_to_token_spans:
+            blocking_reasons.append("req_to_token_entries_missing")
+        if _event_value(result, "kv_pool_read") is True:
+            blocking_reasons.append("kv_pool_read_not_allowed")
+        if _event_value(result, "kv_snapshot") is True:
+            blocking_reasons.append("kv_snapshot_not_allowed")
+        if _event_value(result, "tensor_read") is True:
+            blocking_reasons.append("tensor_read_not_allowed")
+        if _event_value(result, "attention_override") is True:
+            blocking_reasons.append("attention_override_true_not_allowed")
+        if _event_value(result, "attention_comparison_executed") is True:
+            blocking_reasons.append("attention_comparison_executed_not_allowed")
+        if _event_value(result, "runtime_writeback") is True:
+            blocking_reasons.append("runtime_writeback_not_allowed")
+        if _event_value(result, "scheduler_policy_noop") is False:
+            blocking_reasons.append("scheduler_mutation_not_allowed")
+        if _event_value(result, "kv_cache_mutation") is True:
+            blocking_reasons.append("kv_cache_mutation_not_allowed")
+        if _event_value(result, "source_mutated") is True:
+            blocking_reasons.append("source_mutation_not_allowed")
+
+        requested_token_count = 0
+        if not blocking_reasons:
+            assert isinstance(full_kv_req_to_token_spans, (list, tuple))
+            for span in full_kv_req_to_token_spans:
+                if not isinstance(span, Mapping):
+                    blocking_reasons.append("req_to_token_entries_missing")
+                    break
+                req_to_token_entries = _event_value(span, "req_to_token_entries")
+                if not isinstance(req_to_token_entries, (list, tuple)):
+                    blocking_reasons.append("req_to_token_entries_missing")
+                    break
+                requested_token_count += len(req_to_token_entries)
+
+        if requested_token_count > max_tokens_per_request:
+            blocking_reasons.append("max_tokens_per_request_exceeded")
+        if total_requested_token_count + requested_token_count > max_total_tokens:
+            blocking_reasons.append("max_total_tokens_exceeded")
+
+        blocking_reasons = list(dict.fromkeys(blocking_reasons))
+        if blocking_reasons:
+            results.append(
+                _blocked_live_token_to_kv_pool_index_read_result_for_smoke(
+                    result,
+                    blocking_reasons=blocking_reasons,
+                    warning_reasons=warning_reasons,
+                    source_path=source_path,
+                    token_to_kv_pool_type=token_to_kv_pool_type,
+                    token_to_kv_pool_shape=token_to_kv_pool_shape,
+                    read_token_to_kv_pool_index=read_token_to_kv_pool_index,
+                    max_tokens_per_request=max_tokens_per_request,
+                    max_total_tokens=max_total_tokens,
+                )
+            )
+            continue
+
+        assert isinstance(full_kv_req_to_token_spans, (list, tuple))
+        physical_kv_indexes, read_blocking_reasons = _read_live_physical_kv_indexes_for_smoke(
+            list(full_kv_req_to_token_spans),
+            token_to_kv_pool_object=token_to_kv_pool_object,
+        )
+        if read_blocking_reasons:
+            results.append(
+                _blocked_live_token_to_kv_pool_index_read_result_for_smoke(
+                    result,
+                    blocking_reasons=read_blocking_reasons,
+                    warning_reasons=warning_reasons,
+                    source_path=source_path,
+                    token_to_kv_pool_type=token_to_kv_pool_type,
+                    token_to_kv_pool_shape=token_to_kv_pool_shape,
+                    read_token_to_kv_pool_index=read_token_to_kv_pool_index,
+                    max_tokens_per_request=max_tokens_per_request,
+                    max_total_tokens=max_total_tokens,
+                )
+            )
+            continue
+
+        total_requested_token_count += requested_token_count
+        preview_entries = list(physical_kv_indexes[:max_preview_entries])
+        checksum = (
+            sum((index + 1) * entry for index, entry in enumerate(physical_kv_indexes))
+            % 1000000007
+        )
+        normalized_result = normalize_relaykv_sglang_adapter_schema_for_smoke(result)
+        adapter_metadata = normalized_result.get("adapter_metadata")
+        if isinstance(adapter_metadata, Mapping):
+            payload_adapter_metadata = _copy_relaykv_metadata_value_for_smoke(
+                dict(adapter_metadata)
+            )
+        else:
+            payload_adapter_metadata = {}
+        payload_adapter_metadata.update(
+            {
+                "token_to_kv_pool_source_path": source_path,
+                "token_to_kv_pool_type": token_to_kv_pool_type,
+                "token_to_kv_pool_shape": token_to_kv_pool_shape,
+                "live_index_read_enabled": read_token_to_kv_pool_index,
+                "max_tokens_per_request": max_tokens_per_request,
+                "max_total_tokens": max_total_tokens,
+                "truncated_preview": len(physical_kv_indexes) > len(preview_entries),
+            }
+        )
+
+        existing_engine_block_ref = normalized_result.get("engine_block_ref")
+        if isinstance(existing_engine_block_ref, Mapping):
+            engine_block_ref = _copy_relaykv_metadata_value_for_smoke(
+                dict(existing_engine_block_ref)
+            )
+        else:
+            engine_block_ref = {}
+        engine_block_ref["token_to_kv_pool_index"] = None
+        engine_block_ref["cache_position"] = None
+        engine_block_ref["physical_kv_index_preview"] = preview_entries
+        engine_block_ref["physical_kv_index_count"] = len(physical_kv_indexes)
+        engine_block_ref["physical_kv_index_checksum"] = checksum
+
+        normalized_result.update(
+            {
+                "event_type": "relaykv_live_token_to_kv_pool_index_read_result",
+                "resolution_state": "physical_kv_index_resolved",
+                "adapter_mode": "live_token_to_kv_pool_bounded_index_read",
+                "source": (
+                    "req_to_token_resolution_result_to_"
+                    "live_token_to_kv_pool_index_read_result"
+                ),
+                "adapter_metadata": payload_adapter_metadata,
+                "engine_block_ref": engine_block_ref,
+                "requested_token_count": requested_token_count,
+                "read_token_count": len(physical_kv_indexes),
+                "physical_kv_index_count": len(physical_kv_indexes),
+                "physical_kv_index_preview_count": len(preview_entries),
+                "physical_kv_index_checksum": checksum,
+                "req_to_token_read_count": 0,
+                "actual_req_to_token_pool_read_count": 0,
+                "token_to_kv_pool_read_count": len(physical_kv_indexes),
+                "actual_token_to_kv_pool_read_count": len(physical_kv_indexes),
+                "live_token_to_kv_pool_index_read_count": len(physical_kv_indexes),
+                "kv_pool_read_count": 0,
+                "kv_snapshot_count": 0,
+                "tensor_read_count": 0,
+                "attention_comparison_executed_count": 0,
+                "attention_override_true_count": 0,
+                "runtime_writeback_true_count": 0,
+                "scheduler_policy_noop_false_count": 0,
+                "kv_cache_mutation_true_count": 0,
+                "source_mutated_true_count": 0,
+                "req_to_token_read": False,
+                "actual_req_to_token_pool_read": False,
+                "token_to_kv_pool_read": True,
+                "actual_token_to_kv_pool_read": True,
+                "live_token_to_kv_pool_index_read": True,
+                "kv_pool_read": False,
+                "kv_snapshot": False,
+                "tensor_read": False,
+                "attention_comparison_executed": False,
+                "attention_override": False,
+                "runtime_writeback": False,
+                "scheduler_policy_noop": True,
+                "kv_cache_mutation": False,
+                "source_mutated": False,
+                "blocking_reasons": [],
+                "warning_reasons": warning_reasons,
+            }
+        )
+        normalized_result["decision_state"] = "SHADOW_ONLY"
+        results.append(normalized_result)
+
+    return results
+
+
+def summarize_relaykv_live_token_to_kv_pool_index_read_results_for_smoke(
+    results: list[dict[str, Any]] | tuple[dict[str, Any], ...],
+) -> dict[str, Any]:
+    """Summarize guarded live-like bounded token_to_kv_pool index read results."""
+
+    if not isinstance(results, (list, tuple)):
+        raise TypeError(
+            "RelayKV live token_to_kv_pool index read results must be a list or tuple"
+        )
+
+    per_request: Counter[str] = Counter()
+    per_layer: Counter[str] = Counter()
+    per_resolution_state: Counter[str] = Counter()
+    safety_counts: Counter[str] = Counter(
+        {
+            "req_to_token_read_count": 0,
+            "actual_req_to_token_pool_read_count": 0,
+            "token_to_kv_pool_read_count": 0,
+            "actual_token_to_kv_pool_read_count": 0,
+            "live_token_to_kv_pool_index_read_count": 0,
+            "kv_pool_read_count": 0,
+            "kv_snapshot_count": 0,
+            "tensor_read_count": 0,
+            "attention_comparison_executed_count": 0,
+            "attention_override_true_count": 0,
+            "runtime_writeback_true_count": 0,
+            "scheduler_policy_noop_false_count": 0,
+            "kv_cache_mutation_true_count": 0,
+            "source_mutated_true_count": 0,
+        }
+    )
+    resolved_count = 0
+    blocked_count = 0
+    error_count = 0
+    requested_token_count = 0
+    read_token_count = 0
+    physical_kv_index_count = 0
+    physical_kv_index_preview_count = 0
+    truncated_preview_count = 0
+
+    for result in results:
+        if not isinstance(result, dict):
+            raise TypeError(
+                "RelayKV live token_to_kv_pool index read result must be a dict"
+            )
+
+        state = str(_event_value(result, "resolution_state") or "unknown")
+        per_resolution_state[state] += 1
+        per_request[str(_event_value(result, "request_id"))] += 1
+        per_layer[str(_event_layer_value(result))] += 1
+
+        if state == "physical_kv_index_resolved":
+            resolved_count += 1
+        elif state == "blocked":
+            blocked_count += 1
+        elif state == "error":
+            error_count += 1
+
+        for key in (
+            "requested_token_count",
+            "read_token_count",
+            "physical_kv_index_count",
+            "physical_kv_index_preview_count",
+        ):
+            value = _event_value(result, key)
+            if isinstance(value, int) and not isinstance(value, bool):
+                if key == "requested_token_count":
+                    requested_token_count += value
+                elif key == "read_token_count":
+                    read_token_count += value
+                elif key == "physical_kv_index_count":
+                    physical_kv_index_count += value
+                else:
+                    physical_kv_index_preview_count += value
+
+        adapter_metadata = _event_value(result, "adapter_metadata")
+        if isinstance(adapter_metadata, Mapping) and adapter_metadata.get(
+            "truncated_preview"
+        ) is True:
+            truncated_preview_count += 1
+
+        for key in safety_counts:
+            value = _event_value(result, key)
+            if isinstance(value, int) and not isinstance(value, bool):
+                safety_counts[key] += value
+
+    return {
+        "summary_type": "relaykv_live_token_to_kv_pool_index_read_result_summary",
+        "total_live_token_to_kv_pool_index_read_results": len(results),
+        "physical_kv_index_resolved_count": resolved_count,
+        "blocked_count": blocked_count,
+        "error_count": error_count,
+        "requested_token_count": requested_token_count,
+        "read_token_count": read_token_count,
+        "physical_kv_index_count": physical_kv_index_count,
+        "physical_kv_index_preview_count": physical_kv_index_preview_count,
+        "truncated_preview_count": truncated_preview_count,
+        "per_request_counts": dict(sorted(per_request.items())),
+        "per_layer_counts": dict(sorted(per_layer.items())),
+        "per_resolution_state_counts": dict(sorted(per_resolution_state.items())),
+        **{key: safety_counts[key] for key in sorted(safety_counts)},
+    }
 
 
 def build_relaykv_physical_kv_index_resolution_results_for_smoke(
