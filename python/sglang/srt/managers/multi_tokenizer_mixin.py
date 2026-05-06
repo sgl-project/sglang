@@ -125,8 +125,8 @@ def _handle_output_by_index(output, i):
         new_output = BatchTokenIDOutput(
             rids=[output.rids[i]],
             spec_verify_ct=_extract_field_by_index(output, "spec_verify_ct", i),
-            spec_accepted_tokens=_extract_field_by_index(
-                output, "spec_accepted_tokens", i
+            spec_accepted_drafts=_extract_field_by_index(
+                output, "spec_accepted_drafts", i
             ),
             spec_acceptance_histogram=_extract_field_by_index(
                 output, "spec_acceptance_histogram", i
@@ -213,8 +213,8 @@ def _handle_output_by_index(output, i):
         new_output = BatchStrOutput(
             rids=[output.rids[i]],
             spec_verify_ct=_extract_field_by_index(output, "spec_verify_ct", i),
-            spec_accepted_tokens=_extract_field_by_index(
-                output, "spec_accepted_tokens", i
+            spec_accepted_drafts=_extract_field_by_index(
+                output, "spec_accepted_drafts", i
             ),
             spec_acceptance_histogram=_extract_field_by_index(
                 output, "spec_acceptance_histogram", i
@@ -271,6 +271,9 @@ def _handle_output_by_index(output, i):
             ),
             routed_experts=_extract_field_by_index(
                 output, "routed_experts", i, check_length=False
+            ),
+            indexer_topk=_extract_field_by_index(
+                output, "indexer_topk", i, check_length=False
             ),
             customized_info=_extract_field_by_index(
                 output, "customized_info", i, check_length=False

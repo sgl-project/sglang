@@ -15,6 +15,30 @@ if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
 
 
+def _init_npu_conv_state(
+    conv_state_in, conv_state_shape, speculative_num_draft_tokens: Optional[int] = None
+):
+    extra_conv_len = 0
+    if speculative_num_draft_tokens is not None:
+        extra_conv_len = speculative_num_draft_tokens - 1
+
+    # conv_state shape (layers, pool_size, conv_wind + draft_step, dim) for conv1d ascendc ops require dim as last dim
+    conv_state = [
+        torch.zeros(
+            size=(
+                conv_state_in.shape[0],
+                conv_state_in.shape[1],
+                conv_shape[1] + extra_conv_len,
+                conv_shape[0],
+            ),
+            dtype=conv_state_in.dtype,
+            device=conv_state_in.device,
+        )
+        for conv_shape in conv_state_shape
+    ]
+    return conv_state
+
+
 class NPUMHATokenToKVPool(MHATokenToKVPool):
 
     def __init__(

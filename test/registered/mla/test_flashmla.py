@@ -9,6 +9,7 @@ from types import SimpleNamespace
 import requests
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.run_eval import run_eval
@@ -21,7 +22,7 @@ from sglang.test.test_utils import (
 )
 
 # FlashMLA attention backend tests with MTP speculative decoding
-register_cuda_ci(est_time=700, suite="stage-b-test-1-gpu-large")
+register_cuda_ci(est_time=314, suite="stage-b-test-1-gpu-large")
 
 
 class TestFlashMLAAttnBackend(unittest.TestCase):
@@ -97,12 +98,13 @@ class TestFlashMLAMTP(CustomTestCase):
                 ]
             )
         # Use longer timeout for DeepGEMM JIT compilation which can take 10-20 minutes
-        cls.process = popen_launch_server(
-            cls.model,
-            cls.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH * 2,
-            other_args=other_args,
-        )
+        with envs.SGLANG_ENABLE_SPEC_V2.override(False):
+            cls.process = popen_launch_server(
+                cls.model,
+                cls.base_url,
+                timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH * 2,
+                other_args=other_args,
+            )
 
     @classmethod
     def tearDownClass(cls):
