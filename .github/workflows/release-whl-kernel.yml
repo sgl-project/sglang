@@ -301,10 +301,15 @@ jobs:
 
       - name: Build wheels
         run: |
-          cp 3rdparty/amd/wheel/sgl-kernel/* sgl-kernel/
           cd sgl-kernel
-          chmod +x ./build_rocm.sh
-          ./build_rocm.sh "${{ matrix.rocm-version }}"
+          AMDGPU_TARGET="gfx942;gfx950" python setup_rocm.py bdist_wheel
+
+          # Rename wheel to include ROCm version
+          cd dist
+          for wheel in *.whl; do
+            new_wheel=$(echo "$wheel" | sed "s/\(sgl_kernel-[^-]*\)-/\1+rocm${{ matrix.rocm-version }}-/")
+            mv "$wheel" "$new_wheel"
+          done
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
