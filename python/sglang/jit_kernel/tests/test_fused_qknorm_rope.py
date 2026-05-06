@@ -5,6 +5,8 @@ Validates fused_qk_norm_rope against a pure-PyTorch reference and (when
 available) the sgl_kernel AOT implementation.
 """
 
+import sys
+
 import pytest
 import torch
 
@@ -445,4 +447,4 @@ def test_fused_qknorm_rope_vs_aot(head_dim, is_neox):
 
 
 if __name__ == "__main__":
-    pytest.main([__file__, "-v"])
+    sys.exit(pytest.main([__file__, "-v"]))

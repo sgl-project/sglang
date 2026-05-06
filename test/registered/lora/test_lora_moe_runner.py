@@ -13,6 +13,7 @@
 # ==============================================================================
 
 import random
+import sys
 from unittest.mock import patch
 
 import pytest
@@ -785,4 +786,4 @@ def test_lora_moe_runner_marlin(num_tokens, top_k_num, num_experts, max_lora_ran
 
 
 if __name__ == "__main__":
-    pytest.main([__file__])
+    sys.exit(pytest.main([__file__]))

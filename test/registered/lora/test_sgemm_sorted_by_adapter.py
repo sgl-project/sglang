@@ -1,5 +1,6 @@
 """Test that sgemm kernels produce identical results with and without SORTED_BY_ADAPTER."""
 
+import sys
 from typing import Any
 
 import pytest
@@ -233,4 +234,4 @@ def test_single_adapter():
 
 
 if __name__ == "__main__":
-    pytest.main([__file__, "-v"])
+    sys.exit(pytest.main([__file__, "-v"]))

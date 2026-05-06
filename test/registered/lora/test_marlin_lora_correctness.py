@@ -19,6 +19,7 @@ Fake-quantizes random weights to int4/Marlin format and dequantizes them with th
 same path, then runs both backends through MoeRunner and compares LoRA deltas.
 """
 
+import sys
 from unittest.mock import patch
 
 import pytest
@@ -286,4 +287,4 @@ def test_marlin_vs_triton_lora_correctness(num_tokens, top_k):
 
 
 if __name__ == "__main__":
-    pytest.main([__file__])
+    sys.exit(pytest.main([__file__]))

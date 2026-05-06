@@ -11,6 +11,8 @@ We disable TF32 so cuDNN (Conv3d) and cuBLAS (F.linear) both use
 full FP32 precision, enabling strict numerical comparison.
 """
 
+import sys
+
 import pytest
 import torch
 import torch.nn as nn
@@ -289,4 +291,4 @@ def test_hunyuanvideo_no_bias():
 
 
 if __name__ == "__main__":
-    pytest.main([__file__, "-v", "--tb=short"])
+    sys.exit(pytest.main([__file__, "-v", "--tb=short"]))

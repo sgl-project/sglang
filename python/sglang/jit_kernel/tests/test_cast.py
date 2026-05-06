@@ -1,3 +1,5 @@
+import sys
+
 import pytest
 import torch
 
@@ -311,4 +313,4 @@ def test_downcast_fp8_static_cast_boundary(dtype):
 
 
 if __name__ == "__main__":
-    pytest.main([__file__, "-v"])
+    sys.exit(pytest.main([__file__, "-v"]))
