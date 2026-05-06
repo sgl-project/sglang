@@ -528,6 +528,7 @@ def _fused_moe_kernel_sequence(
     if activation == "silu" and is_gated:
         # - gemm1_alpha != None: GPT-OSS-style swiglu(alpha, limit)
         # - gemm1_alpha == None and gemm1_limit != None: silu+clamp+mul(limit-only)
+        # - swiglu_limit != None: DeepSeek V4 swiglu clamp + silu_and_mul (CUDA/HIP only)
         if gemm1_alpha is not None:
             assert gemm1_limit is not None
             intermediate_cache2 = swiglu_gpt_oss_sigmoid_alpha(
@@ -537,20 +538,17 @@ def _fused_moe_kernel_sequence(
             intermediate_cache2 = _swiglu_silu_clamp_mul(
                 intermediate_cache1.view(-1, N), gemm1_limit
             )
-        else:
-            # DeepSeek V4: optional swiglu clamp before silu_and_mul.
+        elif swiglu_limit is not None:
+            # DeepSeek V4: swiglu clamp before silu_and_mul.
             # Two paths gated by SGLANG_OPT_SWIGLU_CLAMP_FUSION:
             #   fusion=True: clamp fused into act_and_mul_triton or silu_and_mul_clamp
             #   fusion=False: explicit clamp_ on intermediate_cache1 (path checker)
-            assert (
-                swiglu_limit is not None
-            ), f"swiglu_limit must be non-None for DeepSeek V4 (got {swiglu_limit!r})"
-
-            swiglu_limit_for_triton: Optional[float] = None
-            swiglu_limit_for_silu_and_mul_clamp: Optional[float] = None
             assert swiglu_limit == 10
             assert intermediate_cache1.shape == (total_tokens, N)
             assert _is_cuda or _is_hip, "DeepSeek V4 only supports CUDA/HIP downstream"
+
+            swiglu_limit_for_triton: Optional[float] = None
+            swiglu_limit_for_silu_and_mul_clamp: Optional[float] = None
 
             if envs.SGLANG_OPT_SWIGLU_CLAMP_FUSION.get():
                 if filter_expert:
@@ -567,38 +565,44 @@ def _fused_moe_kernel_sequence(
                     min=-swiglu_limit, max=swiglu_limit
                 )
 
-            if _is_cuda or _is_hip or _is_xpu:
-                if not filter_expert:
-                    if swiglu_limit_for_silu_and_mul_clamp is not None:
-                        from sglang.jit_kernel.deepseek_v4 import silu_and_mul_clamp
+            if not filter_expert:
+                if swiglu_limit_for_silu_and_mul_clamp is not None:
+                    from sglang.jit_kernel.deepseek_v4 import silu_and_mul_clamp
 
-                        silu_and_mul_clamp(
-                            intermediate_cache1.view(-1, N),
-                            intermediate_cache2,
-                            swiglu_limit_for_silu_and_mul_clamp,
-                        )
-                    else:
-                        silu_and_mul(
-                            intermediate_cache1.view(-1, N), intermediate_cache2
-                        )
-                else:
-                    act_and_mul_triton(
+                    silu_and_mul_clamp(
                         intermediate_cache1.view(-1, N),
                         intermediate_cache2,
-                        config,
-                        topk_ids,
-                        expert_ids,
-                        down_moe_use_tma,
-                        activation,
-                        swiglu_limit=swiglu_limit_for_triton,
+                        swiglu_limit_for_silu_and_mul_clamp,
                     )
-            elif _is_musa:
-                # MUSA: explicit clamp_ above (fusion=False path) handles DeepSeek V4;
-                # _silu_and_mul_musa does not accept swiglu_limit.
-                intermediate_cache2 = _silu_and_mul_musa(
-                    intermediate_cache1.view(-1, N)
+                else:
+                    silu_and_mul(intermediate_cache1.view(-1, N), intermediate_cache2)
+            else:
+                act_and_mul_triton(
+                    intermediate_cache1.view(-1, N),
+                    intermediate_cache2,
+                    config,
+                    topk_ids,
+                    expert_ids,
+                    down_moe_use_tma,
+                    activation,
+                    swiglu_limit=swiglu_limit_for_triton,
                 )
-            elif _has_vllm_ops:
+        elif _is_cuda or _is_hip or _is_xpu:
+            if filter_expert and _is_cuda:
+                # HIP/XPU fall through to the unfiltered path: the down kernel
+                # zeros filtered rows without reading their input.
+                silu_and_mul(
+                    intermediate_cache1.view(-1, N),
+                    intermediate_cache2,
+                    expert_ids=(expert_ids if down_moe_use_tma else topk_ids.view(-1)),
+                    expert_step=(config["BLOCK_SIZE_M"] if down_moe_use_tma else 1),
+                )
+            else:
+                silu_and_mul(intermediate_cache1.view(-1, N), intermediate_cache2)
+        elif _is_musa:
+            intermediate_cache2 = _silu_and_mul_musa(intermediate_cache1.view(-1, N))
+        else:
+            if _has_vllm_ops:
                 vllm_ops.silu_and_mul(
                     intermediate_cache2, intermediate_cache1.view(-1, N)
                 )
