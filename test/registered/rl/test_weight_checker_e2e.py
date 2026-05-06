@@ -37,9 +37,12 @@ from sglang.test.test_utils import (
 register_cuda_ci(est_time=150, suite="stage-b-test-1-gpu-small")
 
 _MODEL_NAME = "Qwen/Qwen3-0.6B"
-# Shape of model.layers.X.mlp.gate_up_proj.weight in Qwen3-0.6B:
-# intermediate_size (3072) * 2 fused = 6144 rows, hidden_size = 1024 cols.
-_GATE_UP_PROJ_SHAPE = (6144, 1024)
+# We address the up half via the HF-style unfused name "up_proj.weight". sglang's
+# stacked_params_mapping rewrites this to "gate_up_proj.weight" with shard_id=1,
+# so the upload writes only the up half of the fused tensor. Sending the fused
+# name directly hits a name.replace() collision (gate_up_proj contains up_proj),
+# producing a malformed key like "gate_gate_up_proj.weight" and crashing load.
+_UP_PROJ_SHAPE = (3072, 1024)  # intermediate_size, hidden_size for Qwen3-0.6B
 
 
 class TestWeightCheckerE2E(CustomTestCase):
@@ -99,9 +102,11 @@ class TestWeightCheckerE2E(CustomTestCase):
         """A snapshot then an update with new bytes must make compare fail."""
         self.assertEqual(self._post("snapshot").status_code, 200)
 
-        param_name = "model.layers.5.mlp.gate_up_proj.weight"
-        new_tensor = torch.full(_GATE_UP_PROJ_SHAPE, 1.5, device="cuda")
-        update_resp = self._update_weights([(param_name, new_tensor)])
+        # The unfused HF name "up_proj" is what update_weights_from_tensor accepts;
+        # sglang's loader rewrites it onto the fused gate_up_proj tensor.
+        upload_name = "model.layers.5.mlp.up_proj.weight"
+        new_tensor = torch.full(_UP_PROJ_SHAPE, 1.5, device="cuda")
+        update_resp = self._update_weights([(upload_name, new_tensor)])
         self.assertEqual(update_resp.status_code, 200)
         self.assertTrue(update_resp.json()["success"])
 
@@ -109,12 +114,14 @@ class TestWeightCheckerE2E(CustomTestCase):
         self.assertEqual(resp.status_code, 400)
         body = resp.json()
         self.assertFalse(body["success"])
-        self.assertIn(param_name, body["message"])
+        # The error references the fused on-device parameter name, not the upload alias.
+        self.assertIn("model.layers.5.mlp.gate_up_proj.weight", body["message"])
+        self.assertIn("max_abs_err", body["message"])
 
     def test_d_update_with_same_tensor_keeps_compare_passing(self):
         """Prime a param, snapshot, push the same bytes again, compare must pass."""
-        param_name = "model.layers.6.mlp.gate_up_proj.weight"
-        same_tensor = torch.full(_GATE_UP_PROJ_SHAPE, 0.25, device="cuda")
+        param_name = "model.layers.6.mlp.up_proj.weight"
+        same_tensor = torch.full(_UP_PROJ_SHAPE, 0.25, device="cuda")
 
         # Step 1: prime the param to a known value.
         self.assertTrue(
