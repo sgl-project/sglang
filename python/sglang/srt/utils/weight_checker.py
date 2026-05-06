@@ -11,6 +11,18 @@ from sglang.srt.layers.quantization.fp8_utils import (
 logger = logging.getLogger(__name__)
 
 
+_NON_PERSISTENT_BUFFER_PATTERNS = (
+    "cos_sin_cache",
+    "inv_freq",
+    "freqs_cis",
+    "_weight_fp32",
+)
+
+
+def _is_non_persistent_buffer_name(name: str) -> bool:
+    return any(pat in name for pat in _NON_PERSISTENT_BUFFER_PATTERNS)
+
+
 class WeightChecker:
     def __init__(self, model_runner):
         self._model_runner = model_runner
@@ -38,7 +50,7 @@ class WeightChecker:
 
     def _reset_tensors(self):
         for name, param in self._model_state():
-            if "cos_sin_cache" in name or "freqs_cis" in name or "_weight_fp32" in name:
+            if _is_non_persistent_buffer_name(name):
                 continue
             param.copy_(_random_like(param))
 
@@ -125,21 +137,12 @@ def _postprocess_tensors(
 
     skip_compare_names = []
 
-    # Skip non-persistent buffers like cos_sin_cache
-    # These buffers are registered with persistent=False and are not saved in checkpoints
-    # They should be recomputed after loading weights, so we don't compare them here
-    non_persistent_buffer_patterns = [
-        "cos_sin_cache",  # RoPE cache
-        "inv_freq",  # RoPE inverse frequency (if it exists as buffer)
-        "_weight_fp32",  # FP32 cache of gate weight (e.g. Glm4MoeGate)
-    ]
-
+    # Skip non-persistent buffers (registered with persistent=False; recomputed
+    # after weight load and not part of the synced payload).
     for name in raw:
-        for pattern in non_persistent_buffer_patterns:
-            if pattern in name:
-                skip_compare_names.append(name)
-                logger.info(f"[check_tensors] Skipping non-persistent buffer: {name}")
-                break
+        if _is_non_persistent_buffer_name(name):
+            skip_compare_names.append(name)
+            logger.info(f"[check_tensors] Skipping non-persistent buffer: {name}")
 
     # dequant fp8
     quant_names = [
