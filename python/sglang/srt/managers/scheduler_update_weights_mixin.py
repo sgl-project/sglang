@@ -48,11 +48,15 @@ class SchedulerUpdateWeightsMixin:
     ):
         """In-place update of the weights from disk."""
         success, message = self.tp_worker.update_weights_from_disk(recv_req)
-        if success:
-            if recv_req.flush_cache:
-                flush_cache_success = self.flush_cache()
-                assert flush_cache_success, "Cache flush failed after updating weights"
-        else:
+        tp_success = success
+        if success and self.draft_worker is not None:
+            success, message = self.draft_worker.update_weights_from_disk(recv_req)
+        if tp_success and recv_req.flush_cache:
+            flush_cache_success = self.flush_cache(
+                empty_cache=recv_req.torch_empty_cache
+            )
+            assert flush_cache_success, "Cache flush failed after updating weights"
+        if not success:
             logger.error(message)
         return UpdateWeightFromDiskReqOutput(success, message, 0)
 
@@ -78,7 +82,9 @@ class SchedulerUpdateWeightsMixin:
         success, message = self.tp_worker.update_weights_from_distributed(recv_req)
         if success:
             if recv_req.flush_cache:
-                flush_cache_success = self.flush_cache()
+                flush_cache_success = self.flush_cache(
+                    empty_cache=recv_req.torch_empty_cache
+                )
                 assert flush_cache_success, "Cache flush failed after updating weights"
         else:
             logger.error(message)
@@ -88,12 +94,17 @@ class SchedulerUpdateWeightsMixin:
         self: Scheduler, recv_req: UpdateWeightsFromTensorReqInput
     ):
         """Update the online model parameter from tensors."""
-        worker = self.draft_worker or self.tp_worker
+        if recv_req.disable_draft_model:
+            worker = self.tp_worker
+        else:
+            worker = self.draft_worker or self.tp_worker
         success, message = worker.update_weights_from_tensor(recv_req)
         # TODO extract common code b/t update_weights_from_distributed and update_weights_from_tensor later
         if success:
             if recv_req.flush_cache:
-                flush_cache_success = self.flush_cache()
+                flush_cache_success = self.flush_cache(
+                    empty_cache=recv_req.torch_empty_cache
+                )
                 assert flush_cache_success, "Cache flush failed after updating weights"
         else:
             logger.error(message)
@@ -105,11 +116,15 @@ class SchedulerUpdateWeightsMixin:
     ):
         """Update the online model parameter from IPC for checkpoint-engine integration."""
         success, message = self.tp_worker.update_weights_from_ipc(recv_req)
-        if success:
-            if recv_req.flush_cache:
-                flush_cache_success = self.flush_cache()
-                assert flush_cache_success, "Cache flush failed after updating weights"
-        else:
+        tp_success = success
+        if success and self.draft_worker is not None:
+            success, message = self.draft_worker.update_weights_from_ipc(recv_req)
+        if tp_success and recv_req.flush_cache:
+            flush_cache_success = self.flush_cache(
+                empty_cache=recv_req.torch_empty_cache
+            )
+            assert flush_cache_success, "Cache flush failed after updating weights"
+        if not success:
             logger.error(message)
         torch.distributed.barrier(group=self.tp_cpu_group)
         return UpdateWeightsFromIPCReqOutput(success, message)
@@ -122,8 +137,8 @@ class SchedulerUpdateWeightsMixin:
         self: Scheduler, recv_req: ReleaseMemoryOccupationReqInput
     ):
         assert (
-            self._is_no_request()
-        ), "release_memory_occupation should be called only when no ongoing request."
+            self.is_fully_idle()
+        ), "release_memory_occupation should be called only when server is idle."
 
         tags = recv_req.tags
 
@@ -217,6 +232,7 @@ def _export_static_state(model):
 
 
 def _import_static_state(model, static_params):
-    self_named_buffers = dict(model.named_buffers())
-    for name, tensor in static_params["buffers"]:
-        self_named_buffers[name][...] = tensor
+    with torch.inference_mode():
+        self_named_buffers = dict(model.named_buffers())
+        for name, tensor in static_params["buffers"]:
+            self_named_buffers[name][...] = tensor

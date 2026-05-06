@@ -6,25 +6,33 @@ from typing import List
 
 import numpy as np
 import torch
-from decord import VideoReader, cpu, gpu
 from PIL import Image
 
-from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
+from sglang.srt.managers.schedule_batch import (
+    Modality,
+    MultimodalDataItem,
+    MultimodalProcessorOutput,
+)
 from sglang.srt.models.interns1 import InternS1ForConditionalGeneration
 from sglang.srt.models.internvl import InternVLChatModel
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor,
+    BaseMultiModalProcessorOutput,
     MultimodalSpecialTokens,
 )
+from sglang.srt.utils import get_device
+from sglang.srt.utils.video_decoder import VideoDecoderWrapper
 
 logger = logging.getLogger(__name__)
 
 
 class InternVLProcessor(BaseMultimodalProcessor):
     models = [InternVLChatModel, InternS1ForConditionalGeneration]
+    gpu_image_decode = False  # InternVL HF processor does not support tensor inputs
 
     IMAGENET_MEAN = [0.485, 0.456, 0.406]
     IMAGENET_STD = [0.229, 0.224, 0.225]
+    IMAGE_MAX_NUM = 12
 
     DEFAULT_VIDEO_NUM_FRAMES = 32
     VIDEO_MAX_NUM = 1
@@ -71,7 +79,17 @@ class InternVLProcessor(BaseMultimodalProcessor):
             tokenizer = self._processor
         self.tokenizer = tokenizer
 
-        llm_arch = hf_config.llm_config.architectures[0]
+        # Support both InternVL (llm_config) and InternS1 (text_config).
+        # Different multimodal models use different field names for the text backbone:
+        # - InternVL uses: hf_config.llm_config
+        # - InternS1 uses: hf_config.text_config
+        # - Some store architectures at top-level
+        text_cfg = (
+            getattr(hf_config, "llm_config", None)
+            or getattr(hf_config, "text_config", None)
+            or hf_config
+        )
+        llm_arch = (getattr(text_cfg, "architectures", []) or [None])[0]
         self.llm_arch = llm_arch
         video_token_map = {
             "Qwen2ForCausalLM": "<|video_pad|>",
@@ -86,6 +104,11 @@ class InternVLProcessor(BaseMultimodalProcessor):
             else None
         )
 
+        self.image_token_id = (
+            tokenizer.convert_tokens_to_ids(self.IMG_CONTEXT)
+            if self.IMG_CONTEXT
+            else None
+        )
         self.num_image_token = int(
             (image_size // patch_size) ** 2 * (hf_config.downsample_ratio**2)
         )
@@ -97,7 +120,7 @@ class InternVLProcessor(BaseMultimodalProcessor):
         # Offset token id use IMG_CONTEXT / VIDEO_CONTEXT
         self.mm_tokens = MultimodalSpecialTokens(
             image_token=self.IMAGE_PLACEHOLDER_TOKEN,
-            image_token_id=tokenizer.convert_tokens_to_ids(self.IMG_CONTEXT),
+            image_token_id=self.image_token_id,
             video_token=self.VIDEO_PLACEHOLDER_TOKEN,
             video_token_id=self.video_token_id,
         ).build(_image_processor)
@@ -115,14 +138,14 @@ class InternVLProcessor(BaseMultimodalProcessor):
             getattr(server_args, "context_length", None)
             or getattr(server_args, "max_context_len", None)
             or getattr(hf_config, "max_position_embeddings", None)
-            or getattr(
-                getattr(hf_config, "llm_config", None), "max_position_embeddings", None
-            )
+            or getattr(text_cfg, "max_position_embeddings", None)
             or self.CONTEXT_FALLBACK
         )
 
     @staticmethod
-    def dynamic_preprocess(tensor, image_size=448, max_num=12, use_thumbnail=False):
+    def dynamic_preprocess(
+        tensor, image_size=448, max_num=IMAGE_MAX_NUM, use_thumbnail=False
+    ):
         # Tensor: (C,H,W) float on GPU
         C, H, W = tensor.shape
         aspect_ratio = W / H
@@ -185,14 +208,8 @@ class InternVLProcessor(BaseMultimodalProcessor):
         return torch.stack(tiles).to(torch.bfloat16)
 
     @staticmethod
-    def _open_video_reader(path: str) -> VideoReader:
-        try:
-            return VideoReader(path, ctx=gpu(0), num_threads=1)
-        except (RuntimeError, OSError) as e:
-            logger.warning(
-                "[internvl] VideoReader gpu decode failed (%s), fallback CPU", e
-            )
-            return VideoReader(path, ctx=cpu(0), num_threads=1)
+    def _open_video_reader(path: str):
+        return VideoDecoderWrapper(path)
 
     def _ensure_placeholders_before_assistant(
         self, prompt: str, placeholder: str, want: int
@@ -239,9 +256,113 @@ class InternVLProcessor(BaseMultimodalProcessor):
         frames_per_video = max(1, max_total_frames // max(num_videos, 1))
         return max(1, min(int(requested), int(frames_per_video)))
 
+    @staticmethod
+    def _has_special_format(image_data, video_data):
+        """Check if any input items use processor_output or precomputed_embedding format."""
+        for data in list(image_data or []) + list(video_data or []):
+            if isinstance(data, dict) and data.get("format") in (
+                "processor_output",
+                "precomputed_embedding",
+            ):
+                return True
+        return False
+
+    async def _process_special_format(
+        self, image_data, video_data, input_text, request_obj, **kwargs
+    ):
+        """Handle processor_output and precomputed_embedding input formats.
+
+        Delegates to the base class process_and_combine_mm_data which has
+        built-in support for these formats.
+        """
+        # When user provides input_ids directly, input_text may be a list of ints
+        if isinstance(input_text, list):
+            user_input_ids = input_text
+            prompt = ""
+        else:
+            user_input_ids = None
+            prompt = input_text or ""
+
+        # When the prompt is empty (user provided input_ids directly),
+        # load_mm_data can't match multimodal tokens to data items.
+        # Build BaseMultiModalProcessorOutput directly from the dict items.
+        if not prompt and (image_data or video_data):
+            images = [d for d in (image_data or []) if isinstance(d, dict)]
+            videos = [d for d in (video_data or []) if isinstance(d, dict)]
+
+            # Raise if raw (non-dict) images/videos were silently filtered out.
+            # InternVL cannot process raw images without a text prompt because
+            # dynamic tiling and placeholder expansion require the prompt string.
+            raw_img_dropped = len(image_data or []) - len(images)
+            raw_vid_dropped = len(video_data or []) - len(videos)
+            if raw_img_dropped > 0 or raw_vid_dropped > 0:
+                raise ValueError(
+                    f"[internvl] Cannot process raw images/videos with pre-tokenized "
+                    f"input_ids. Provide multimodal data in 'processor_output' or "
+                    f"'precomputed_embedding' format, or use a text prompt instead. "
+                    f"(raw images dropped: {raw_img_dropped}, "
+                    f"raw videos dropped: {raw_vid_dropped})"
+                )
+
+            base_output = BaseMultiModalProcessorOutput(
+                input_text=prompt,
+                images=images,
+                videos=videos,
+            )
+        else:
+            base_output = self.load_mm_data(
+                prompt=prompt,
+                image_data=image_data,
+                video_data=video_data,
+                multimodal_tokens=self.mm_tokens,
+                discard_alpha_channel=True,
+            )
+
+        mm_items, input_ids_tensor, ret = self.process_and_combine_mm_data(
+            base_output, self.mm_tokens
+        )
+
+        # If user provided input_ids directly, use those and recompute offsets
+        if user_input_ids is not None:
+            input_ids_tensor = torch.tensor(user_input_ids, dtype=torch.long)
+            for mm_item in mm_items:
+                if (
+                    mm_item.modality == Modality.VIDEO
+                    and self.video_token_id is not None
+                ):
+                    mm_token_id = self.video_token_id
+                else:
+                    mm_token_id = self.img_context_token_id
+                mm_item.offsets = self.get_mm_items_offset(
+                    input_ids=input_ids_tensor,
+                    mm_token_id=mm_token_id,
+                )
+
+        return MultimodalProcessorOutput(
+            input_ids=input_ids_tensor.flatten().tolist(),
+            mm_items=mm_items,
+            im_start_id=self.img_start_token_id,
+            im_end_id=self.img_end_token_id,
+            im_token_id=self.img_context_token_id,
+            video_token_id=self.video_token_id,
+        )
+
     async def process_mm_data_async(
         self, image_data, input_text, request_obj, **kwargs
     ):
+        video_data = getattr(request_obj, "video_data", None) or []
+
+        # Handle processor_output and precomputed_embedding formats
+        if isinstance(input_text, list) or self._has_special_format(
+            image_data, video_data
+        ):
+            return await self._process_special_format(
+                image_data=image_data,
+                video_data=video_data,
+                input_text=input_text,
+                request_obj=request_obj,
+                **kwargs,
+            )
 
         is_internlm2 = self.llm_arch == "InternLM2ForCausalLM"
 
@@ -264,6 +385,25 @@ class InternVLProcessor(BaseMultimodalProcessor):
     async def process_qwen_mm_data_async(
         self, image_data, input_text, request_obj, **kwargs
     ):
+
+        img_max_num = (
+            getattr(request_obj, "image_max_dynamic_patch", None)
+            or getattr(request_obj, "max_dynamic_patch", None)
+            or kwargs.get("image_max_dynamic_patch")
+            or kwargs.get("max_dynamic_patch")
+            or self.IMAGE_MAX_NUM
+        )
+        img_max_num = max(1, int(img_max_num))
+
+        vid_max_num = (
+            getattr(request_obj, "video_max_dynamic_patch", None)
+            or getattr(request_obj, "max_dynamic_patch", None)
+            or kwargs.get("video_max_dynamic_patch")
+            or kwargs.get("max_dynamic_patch")
+            or self.VIDEO_MAX_NUM
+        )
+        vid_max_num = max(1, int(vid_max_num))
+
         # Qwen/Qwen3 branch: OpenAI-style placeholders <image>/<video>
         prompt = input_text or ""
         video_data = getattr(request_obj, "video_data", None) or []
@@ -297,7 +437,7 @@ class InternVLProcessor(BaseMultimodalProcessor):
             len(base_output.videos),
         )
 
-        mean, std = self._get_normalize_tensors(device="cuda")
+        mean, std = self._get_normalize_tensors(device=get_device())
 
         # ----- Images -> tiles -----
         num_patches_list: List[int] = []
@@ -307,14 +447,15 @@ class InternVLProcessor(BaseMultimodalProcessor):
             if isinstance(image, Image.Image):
                 img_np = np.array(image.convert("RGB"))
                 tensor = (
-                    torch.from_numpy(img_np).permute(2, 0, 1).cuda().float() / 255.0
+                    torch.from_numpy(img_np).permute(2, 0, 1).to(get_device()).float()
+                    / 255.0
                 )
             else:
-                tensor = image.cuda()
+                tensor = image.to(get_device())
 
             tensor = (tensor - mean) / std
             tiles = self.dynamic_preprocess(
-                tensor, image_size=448, max_num=12, use_thumbnail=True
+                tensor, image_size=448, max_num=img_max_num, use_thumbnail=True
             )
             pixel_values_list.append(tiles)
             num_patches_list.append(int(tiles.shape[0]))
@@ -345,11 +486,8 @@ class InternVLProcessor(BaseMultimodalProcessor):
 
         if base_output.videos and num_frames > 0 and self.video_token_id is not None:
             for video in base_output.videos:
-                vr = (
-                    video
-                    if isinstance(video, VideoReader)
-                    else self._open_video_reader(str(video))
-                )
+                is_video_obj = isinstance(video, VideoDecoderWrapper)
+                vr = video if is_video_obj else self._open_video_reader(str(video))
                 max_frame = len(vr) - 1
                 frame_indices = (
                     [0]
@@ -360,21 +498,20 @@ class InternVLProcessor(BaseMultimodalProcessor):
                 per_video_tiles = []
                 per_video_patch_cnt = []
                 for fi in frame_indices:
-                    frame = vr[int(fi)]
-                    img_np = (
-                        frame.asnumpy()
-                        if hasattr(frame, "asnumpy")
-                        else np.array(frame)
-                    )
+                    img_np = vr[int(fi)]
                     frame_t = (
-                        torch.from_numpy(img_np).permute(2, 0, 1).cuda().float() / 255.0
+                        torch.from_numpy(img_np)
+                        .permute(2, 0, 1)
+                        .to(get_device())
+                        .float()
+                        / 255.0
                     )
                     frame_t = (frame_t - mean) / std
 
                     tiles = self.dynamic_preprocess(
                         frame_t,
                         image_size=448,
-                        max_num=self.VIDEO_MAX_NUM,
+                        max_num=vid_max_num,
                         use_thumbnail=self.VIDEO_USE_THUMBNAIL,
                     )
                     per_video_tiles.append(tiles)
@@ -394,6 +531,7 @@ class InternVLProcessor(BaseMultimodalProcessor):
 
         input_text_mid = base_output.input_text or prompt
         input_text_mid = input_text_mid.replace(self.IMAGE_PLACEHOLDER_TOKEN, img_ph)
+        input_text_mid = input_text_mid.replace(self.IMG_CONTEXT, img_ph)
 
         if self.VIDEO_CONTEXT_TOKEN and self.video_token_id is not None:
             input_text_mid = input_text_mid.replace(
@@ -438,24 +576,34 @@ class InternVLProcessor(BaseMultimodalProcessor):
         image_offsets = []
         if image_tensor is not None:
             image_offsets = self.get_mm_items_offset(
-                input_ids=input_ids_tensor.to("cuda"),
+                input_ids=input_ids_tensor.to(get_device()),
                 mm_token_id=self.img_context_token_id,
             )
 
         video_offsets = []
         if video_tensor is not None and self.video_token_id is not None:
             video_offsets = self.get_mm_items_offset(
-                input_ids=input_ids_tensor.to("cuda"),
+                input_ids=input_ids_tensor.to(get_device()),
                 mm_token_id=self.video_token_id,
             )
 
         items = []
         if image_tensor is not None:
-            items.append(
-                MultimodalDataItem(
-                    feature=image_tensor, modality=Modality.IMAGE, offsets=image_offsets
-                )
+            # Split per-image for better cache granularity
+            assert len(num_patches_list) == len(image_offsets), (
+                f"InternVL: num_patches_list ({len(num_patches_list)}) != "
+                f"image_offsets ({len(image_offsets)})"
             )
+            cumulative = 0
+            for i, num_patches in enumerate(num_patches_list):
+                items.append(
+                    MultimodalDataItem(
+                        feature=image_tensor[cumulative : cumulative + num_patches],
+                        modality=Modality.IMAGE,
+                        offsets=[image_offsets[i]],
+                    )
+                )
+                cumulative += num_patches
         if video_tensor is not None:
             items.append(
                 MultimodalDataItem(
@@ -463,14 +611,14 @@ class InternVLProcessor(BaseMultimodalProcessor):
                 )
             )
 
-        return {
-            "input_ids": input_ids,
-            "mm_items": items,
-            "im_start_id": self.img_start_token_id,
-            "im_end_id": self.img_end_token_id,
-            "im_token_id": self.img_context_token_id,
-            "video_token_id": self.video_token_id,
-        }
+        return MultimodalProcessorOutput(
+            input_ids=input_ids,
+            mm_items=items,
+            im_start_id=self.img_start_token_id,
+            im_end_id=self.img_end_token_id,
+            im_token_id=self.img_context_token_id,
+            video_token_id=self.video_token_id,
+        )
 
     async def process_internlm2_mm_data_async(
         self, image_data, input_text, request_obj, **kwargs
@@ -503,7 +651,7 @@ class InternVLProcessor(BaseMultimodalProcessor):
             discard_alpha_channel=True,
         )
 
-        mean, std = self._get_normalize_tensors(device="cuda")
+        mean, std = self._get_normalize_tensors(device=get_device())
 
         num_patches_list: List[int] = []
         pixel_values_list: List[torch.Tensor] = []
@@ -512,10 +660,11 @@ class InternVLProcessor(BaseMultimodalProcessor):
             if isinstance(image, Image.Image):
                 img_np = np.array(image.convert("RGB"))
                 tensor = (
-                    torch.from_numpy(img_np).permute(2, 0, 1).cuda().float() / 255.0
+                    torch.from_numpy(img_np).permute(2, 0, 1).to(get_device()).float()
+                    / 255.0
                 )
             else:
-                tensor = image.cuda()
+                tensor = image.to(get_device())
 
             tensor = (tensor - mean) / std
             tiles = self.dynamic_preprocess(
@@ -558,23 +707,33 @@ class InternVLProcessor(BaseMultimodalProcessor):
         image_offsets = []
         if pixel_values is not None:
             image_offsets = self.get_mm_items_offset(
-                input_ids=input_ids_tensor.to("cuda"),
+                input_ids=input_ids_tensor.to(get_device()),
                 mm_token_id=self.img_context_token_id,
             )
 
         items = []
         if pixel_values is not None:
-            items.append(
-                MultimodalDataItem(
-                    feature=pixel_values, modality=Modality.IMAGE, offsets=image_offsets
-                )
+            # Split per-image for better cache granularity
+            assert len(num_patches_list) == len(image_offsets), (
+                f"InternVL: num_patches_list ({len(num_patches_list)}) != "
+                f"image_offsets ({len(image_offsets)})"
             )
+            cumulative = 0
+            for i, num_patches in enumerate(num_patches_list):
+                items.append(
+                    MultimodalDataItem(
+                        feature=pixel_values[cumulative : cumulative + num_patches],
+                        modality=Modality.IMAGE,
+                        offsets=[image_offsets[i]],
+                    )
+                )
+                cumulative += num_patches
 
-        return {
-            "input_ids": input_ids,
-            "mm_items": items,
-            "im_start_id": self.img_start_token_id,
-            "im_end_id": self.img_end_token_id,
-            "im_token_id": self.img_context_token_id,
-            "video_token_id": self.video_token_id,
-        }
+        return MultimodalProcessorOutput(
+            input_ids=input_ids,
+            mm_items=items,
+            im_start_id=self.img_start_token_id,
+            im_end_id=self.img_end_token_id,
+            im_token_id=self.img_context_token_id,
+            video_token_id=self.video_token_id,
+        )

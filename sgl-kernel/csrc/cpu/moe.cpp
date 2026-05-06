@@ -1,6 +1,7 @@
+#include "moe.h"
+
 #include "common.h"
 #include "gemm.h"
-#include "vec.h"
 
 namespace {
 
@@ -24,112 +25,6 @@ namespace {
 //     2. add prefetch for load A which is indexed access
 //     3. abstract at::native::cpublas::brgemm with WoQ gemm (M = 1 & M != 1)
 //
-
-template <typename scalar_t>
-inline void fill_stub(scalar_t* __restrict__ out, scalar_t val, int64_t size) {
-  using Vec = at::vec::Vectorized<scalar_t>;
-  const Vec data_vec(val);
-  at::vec::map<scalar_t>([data_vec](Vec out) { return out = data_vec; }, out, out, size);
-}
-
-template <typename scalar_t>
-inline void copy_stub(scalar_t* __restrict__ out, const scalar_t* __restrict__ input, int64_t size) {
-  using Vec = at::vec::Vectorized<scalar_t>;
-// no remainder
-#pragma GCC unroll 4
-  for (int64_t d = 0; d < size; d += Vec::size()) {
-    Vec data = Vec::loadu(input + d);
-    data.store(out + d);
-  }
-}
-
-template <typename scalar_t>
-inline void copy_mul_stub(scalar_t* __restrict__ out, const float* __restrict__ input, float weight, int64_t size) {
-  using bVec = at::vec::Vectorized<scalar_t>;
-  using fVec = at::vec::Vectorized<float>;
-  constexpr int kVecSize = bVec::size();
-  const fVec weight_vec = fVec(weight);
-  int64_t d;
-#pragma GCC unroll 4
-  for (d = 0; d <= size - kVecSize; d += kVecSize) {
-    fVec data0 = fVec::loadu(input + d) * weight_vec;
-    fVec data1 = fVec::loadu(input + d + fVec::size()) * weight_vec;
-    bVec out_vec = convert_from_float_ext<scalar_t>(data0, data1);
-    out_vec.store(out + d);
-  }
-  for (; d < size; ++d) {
-    out[d] = static_cast<scalar_t>(input[d] * weight);
-  }
-}
-
-// acc from [topk, K] to [K]
-template <typename scalar_t>
-inline void sum_stub(scalar_t* __restrict__ out, const scalar_t* __restrict__ input, int64_t topk, int64_t K) {
-  using bVec = at::vec::Vectorized<scalar_t>;
-  using fVec = at::vec::Vectorized<float>;
-  constexpr int kVecSize = bVec::size();
-  if (topk == 1) {
-    // do copy for topk = 1
-    copy_stub(out, input, K);
-  } else {
-    // do sum for topk != 1
-    int64_t d;
-#pragma GCC unroll 4
-    for (d = 0; d <= K - kVecSize; d += kVecSize) {
-      fVec sum_fvec0 = fVec(0.f);
-      fVec sum_fvec1 = fVec(0.f);
-      for (int t = 0; t < topk; ++t) {
-        bVec x_bvec = bVec::loadu(input + t * K + d);
-        fVec x_fvec0, x_fvec1;
-        std::tie(x_fvec0, x_fvec1) = at::vec::convert_to_float(x_bvec);
-
-        sum_fvec0 += x_fvec0;
-        sum_fvec1 += x_fvec1;
-      }
-      bVec out_bvec = convert_from_float_ext<scalar_t>(sum_fvec0, sum_fvec1);
-      out_bvec.store(out + d);
-    }
-    for (; d < K; ++d) {
-      float sum_val = 0.f;
-      for (int t = 0; t < topk; ++t) {
-        sum_val += static_cast<float>(input[t * K + d]);
-      }
-      out[d] = static_cast<scalar_t>(sum_val);
-    }
-  }
-}
-
-// out = input + input2 * scale
-template <typename scalar_t>
-inline void add_mul_stub(
-    scalar_t* __restrict__ out,
-    const float* __restrict__ input,
-    const scalar_t* __restrict__ input2,
-    float scale,
-    int64_t size) {
-  using bVec = at::vec::Vectorized<scalar_t>;
-  using fVec = at::vec::Vectorized<float>;
-  constexpr int kVecSize = bVec::size();
-  const fVec s_vec = fVec(scale);
-  int64_t d;
-#pragma GCC unroll 4
-  for (d = 0; d <= size - kVecSize; d += kVecSize) {
-    fVec x0 = fVec::loadu(input + d);
-    fVec x1 = fVec::loadu(input + d + fVec::size());
-
-    bVec y_bvec = bVec::loadu(input2 + d);
-    fVec y0, y1;
-    std::tie(y0, y1) = at::vec::convert_to_float(y_bvec);
-
-    x0 = x0 + y0 * s_vec;
-    x1 = x1 + y1 * s_vec;
-    bVec out_vec = convert_from_float_ext<scalar_t>(x0, x1);
-    out_vec.store(out + d);
-  }
-  for (; d < size; ++d) {
-    out[d] = static_cast<scalar_t>(input[d] + float(input2[d]) * scale);
-  }
-}
 
 template <int BLOCK_M>
 int moe_align_block_size(
@@ -600,13 +495,15 @@ void fused_experts_kernel_impl(
       const scalar_t* __restrict__ B0 = packed_w1 + expert_id * stride_e + nb_upper * BLOCK_N * stride_n;
       const scalar_t* __restrict__ B1 = packed_w1 + expert_id * stride_e + nb_lower * BLOCK_N * stride_n;
 
-      // 1.a load A
-      const int32_t* A_ids = sorted_ids + mb * BLOCK_M;
       int64_t m_size = offsets[mb + 1] - offsets[mb];
 
-      for (int64_t m = 0; m < m_size; ++m) {
-        int32_t index = A_ids[m] / topk;
-        copy_stub(A + m * K, input + index * K, K);
+      if (nb_offset == 0) {
+        // 1.a load A
+        const int32_t* A_ids = sorted_ids + mb * BLOCK_M;
+        for (int64_t m = 0; m < m_size; ++m) {
+          int32_t index = A_ids[m] / topk;
+          copy_stub(A + m * K, input + index * K, K);
+        }
       }
 
       if (use_brgemm) {
@@ -765,6 +662,8 @@ void shared_expert_kernel_impl(
 
   const bool use_brgemm = can_use_brgemm<scalar_t>(M);
 
+  const bool apply_scaling_factor = fused_experts_out != nullptr;
+
   // here we only parallel on half of 2N to fuse silu_and_mul with gemm
   parallel_2d(MB, NB, [&](int64_t mb0, int64_t mb1, int64_t nb0, int64_t nb1) {
     // get local pointers
@@ -888,9 +787,11 @@ void shared_expert_kernel_impl(
 
       // 2.b copy from C to output and add fused_experts_out
       scalar_t* __restrict__ out = output + mb * BLOCK_M * K + nb * BLOCK_N;
-      const scalar_t* __restrict__ fused_out = fused_experts_out + mb * BLOCK_M * K + nb * BLOCK_N;
+      const scalar_t* __restrict__ fused_out =
+          apply_scaling_factor ? fused_experts_out + mb * BLOCK_M * K + nb * BLOCK_N : nullptr;
       for (int64_t m = 0; m < m_size; ++m) {
-        add_mul_stub(out + m * K, C + m * BLOCK_N, fused_out + m * K, routed_scaling_factor, n_size);
+        const scalar_t* __restrict__ fused_out_row = apply_scaling_factor ? (fused_out + m * K) : nullptr;
+        add_mul_stub(out + m * K, C + m * BLOCK_N, fused_out_row, routed_scaling_factor, n_size);
       }
     });
 
@@ -908,14 +809,10 @@ static inline void check_moe_scales(
     bool use_fp8_w8a16,
     const std::optional<at::Tensor>& w1_scale,
     const std::optional<at::Tensor>& w2_scale,
-    const std::optional<std::vector<int64_t>> block_size,
-    const std::optional<at::Tensor>& a1_scale,
-    const std::optional<at::Tensor>& a2_scale) {
+    const std::optional<std::vector<int64_t>> block_size) {
   if (use_int8_w8a8) {
     TORCH_CHECK(w1_scale.has_value(), "missing w1_scale for int8 w8a8.");
     TORCH_CHECK(w2_scale.has_value(), "missing w2_scale for int8 w8a8.");
-    TORCH_CHECK(!a1_scale.has_value(), "static quantization for activation not supported.");
-    TORCH_CHECK(!a2_scale.has_value(), "static quantization for activation not supported.");
   }
   if (use_fp8_w8a16) {
     TORCH_CHECK(w1_scale.has_value(), "missing w1_scale for fp8 w8a16.");
@@ -942,6 +839,7 @@ static inline void check_moe_scales(
 // topk_weights: [M, topk]
 // topk_ids: [M, topk] (int32_t)
 //
+
 at::Tensor fused_experts_cpu(
     at::Tensor& hidden_states,
     at::Tensor& w1,
@@ -949,17 +847,13 @@ at::Tensor fused_experts_cpu(
     at::Tensor& topk_weights,
     at::Tensor& topk_ids,
     bool inplace,
-    bool use_int8_w8a8,
-    bool use_fp8_w8a16,
+    int64_t moe_comp_method,
     const std::optional<at::Tensor>& w1_scale,
     const std::optional<at::Tensor>& w2_scale,
+    const std::optional<at::Tensor>& w1_zero,
+    const std::optional<at::Tensor>& w2_zero,
     const std::optional<std::vector<int64_t>> block_size,
-    const std::optional<at::Tensor>& a1_scale,
-    const std::optional<at::Tensor>& a2_scale,
     bool is_vnni) {
-  RECORD_FUNCTION(
-      "sgl-kernel::fused_experts_cpu", std::vector<c10::IValue>({hidden_states, w1, w2, topk_weights, topk_ids}));
-
   auto packed_w1 = is_vnni ? w1 : convert_weight_packed(w1);
   auto packed_w2 = is_vnni ? w2 : convert_weight_packed(w2);
 
@@ -972,8 +866,13 @@ at::Tensor fused_experts_cpu(
   CHECK_INPUT(w2);
   CHECK_EQ(topk_weights.sizes(), topk_ids.sizes());
   CHECK_DIM(2, hidden_states);
-  CHECK_DIM(3, w1);
-  CHECK_DIM(3, w2);
+  if (moe_comp_method == CPUQuantMethod::INT4_W4A8 && is_vnni) {
+    CHECK_DIM(4, w1);
+    CHECK_DIM(4, w2);
+  } else {
+    CHECK_DIM(3, w1);
+    CHECK_DIM(3, w2);
+  }
   CHECK_DIM(2, topk_weights);
   CHECK_DIM(2, topk_ids);
 
@@ -987,22 +886,29 @@ at::Tensor fused_experts_cpu(
 
   int64_t M = hidden_states.size(0);
   int64_t K = hidden_states.size(1);
-  int64_t N = w1.size(1) / 2;
+  int64_t N = moe_comp_method == CPUQuantMethod::INT4_W4A8 ? w1_scale.value().size(1) * w1_scale.value().size(3) / 2
+                                                           : w1.size(1) / 2;
   int64_t E = w1.size(0);
   int64_t topk = topk_weights_.size(1);
 
   // we use int32_t compensation for int8 w8a8
-  int64_t packed_K = get_row_size(K, use_int8_w8a8);
-  int64_t packed_N = get_row_size(N, use_int8_w8a8);
+  int64_t packed_K = get_row_size(K, moe_comp_method == CPUQuantMethod::INT8_W8A8);
+  int64_t packed_N = get_row_size(N, moe_comp_method == CPUQuantMethod::INT8_W8A8);
 
   // check weight shapes
   CHECK_EQ(w2.size(0), E);
-  CHECK_EQ(w2.size(1), K);
-  CHECK_EQ(packed_w1.size(2), packed_K);
-  CHECK_EQ(packed_w2.size(2), packed_N);
-
+  if (!(moe_comp_method == CPUQuantMethod::INT4_W4A8)) {
+    CHECK_EQ(w2.size(1), K);
+    CHECK_EQ(packed_w1.size(2), packed_K / (moe_comp_method == CPUQuantMethod::INT4_W4A8 ? 2 : 1));
+    CHECK_EQ(packed_w2.size(2), packed_N / (moe_comp_method == CPUQuantMethod::INT4_W4A8 ? 2 : 1));
+  }
   // check scales
-  check_moe_scales(use_int8_w8a8, use_fp8_w8a16, w1_scale, w2_scale, block_size, a1_scale, a2_scale);
+  check_moe_scales(
+      moe_comp_method == CPUQuantMethod::INT8_W8A8,
+      moe_comp_method == CPUQuantMethod::FP8_W8A16,
+      w1_scale,
+      w2_scale,
+      block_size);
 
   at::Tensor out_hidden_states = inplace ? hidden_states : at::empty_like(hidden_states);
 
@@ -1058,24 +964,29 @@ at::Tensor fused_experts_cpu(
   //   7. intermediate_cache0 : [M * topk, 2N]
   //   8. B_tmp : [T, MAX_CACHE_BLOCK_SIZE, BLOCK_N, std::max(K, N)]
   //
-  int64_t buffer_size_nbytes = M * topk * N * 2 + M * topk * K * 2 +
-                               num_threads * BLOCK_M * K * (use_int8_w8a8 ? 1 : 2) +
-                               num_threads * 2 * BLOCK_M * BLOCK_N * sizeof(float);
+  int64_t buffer_size_nbytes =
+      M * topk * N * 2 + M * topk * K * 2 +
+      num_threads * BLOCK_M * K *
+          (moe_comp_method == CPUQuantMethod::INT8_W8A8 | moe_comp_method == CPUQuantMethod::INT4_W4A8 ? 1 : 2) +
+      num_threads * 2 * BLOCK_M * BLOCK_N * sizeof(float);
 
-  if (use_int8_w8a8) {
+  if (moe_comp_method == CPUQuantMethod::INT8_W8A8) {
     buffer_size_nbytes += std::max(M * K, M * topk * N) + M * topk * sizeof(float);
   }
-  if (use_fp8_w8a16) {
+  if (moe_comp_method == CPUQuantMethod::FP8_W8A16) {
     buffer_size_nbytes += M * topk * 2 * N * 2 + num_threads * MAX_CACHE_BLOCK_SIZE * BLOCK_N * std::max(K, N) * 2;
   }
-
+  if (moe_comp_method == CPUQuantMethod::INT4_W4A8) {
+    buffer_size_nbytes += M * topk * 2 * N * 2 + std::max(M * K, M * topk * N) + M * topk * sizeof(float) +
+                          num_threads * 2 * get_4bit_block_k_size(K / w1_scale.value().size(2)) * BLOCK_N;
+  }
   auto buffer2 = at::empty({buffer_size_nbytes}, hidden_states.options().dtype(at::kChar));
 
   AT_DISPATCH_REDUCED_FLOATING_TYPES(st, "fused_experts_kernel_impl", [&] {
     scalar_t* __restrict__ intermediate_cache1 = (scalar_t*)((void*)(buffer2.data_ptr<int8_t>()));
     scalar_t* __restrict__ intermediate_cache2 = intermediate_cache1 + M * topk * N;
 
-    if (use_int8_w8a8) {
+    if (moe_comp_method == CPUQuantMethod::INT8_W8A8) {
       uint8_t* __restrict__ A_tmp = (uint8_t*)((void*)(intermediate_cache2 + M * topk * K));
       float* __restrict__ C_tmp = (float*)((void*)(A_tmp + num_threads * BLOCK_M * K));
       uint8_t* __restrict__ Aq_tmp = (uint8_t*)((void*)(C_tmp + num_threads * 2 * BLOCK_M * BLOCK_N));
@@ -1109,7 +1020,7 @@ at::Tensor fused_experts_cpu(
           E,
           topk,
           num_tokens_post_pad);
-    } else if (use_fp8_w8a16) {
+    } else if (moe_comp_method == CPUQuantMethod::FP8_W8A16) {
       // here we just ignore C_tmp as it is not used
       scalar_t* __restrict__ A_tmp = (scalar_t*)((void*)(intermediate_cache2 + M * topk * K));
       float* __restrict__ C_tmp = (float*)((void*)(A_tmp + num_threads * BLOCK_M * K));
@@ -1133,6 +1044,48 @@ at::Tensor fused_experts_cpu(
           block_size_N,
           block_size_K,
           topk_weights_.data_ptr<float>(),
+          sorted_ids,
+          expert_ids,
+          offsets,
+          M,
+          N,
+          K,
+          E,
+          topk,
+          num_tokens_post_pad);
+    } else if (moe_comp_method == CPUQuantMethod::INT4_W4A8) {
+      uint8_t* __restrict__ A_tmp = (uint8_t*)((void*)(intermediate_cache2 + M * topk * K));
+      float* __restrict__ C_tmp = (float*)((void*)(A_tmp + num_threads * BLOCK_M * K));
+      scalar_t* __restrict__ intermediate_cache0 = (scalar_t*)((void*)(C_tmp + num_threads * 2 * BLOCK_M * BLOCK_N));
+      uint8_t* __restrict__ Aq_tmp = (uint8_t*)((void*)(intermediate_cache0 + M * topk * 2 * N));
+      float* __restrict__ As_tmp = (float*)((void*)(Aq_tmp + std::max(M * K, M * topk * N)));
+      int8_t* __restrict__ dqB_tmp = (int8_t*)((void*)(As_tmp + M * topk));
+
+      // weight + compensation shape = [Nc, Kc, block_n * block_k / 2 + block_n*sizeof(int32_t)]
+      // scales/qzeros shape = [E, Nc, G, block_n]
+      int64_t num_groups = w1_scale.value().size(2);
+      const int group_size = K / num_groups;
+      // TODO: check scales and zeros
+      fused_experts_int4_w4a8_kernel_impl<scalar_t>(
+          out_hidden_states.data_ptr<scalar_t>(),
+          intermediate_cache0,
+          intermediate_cache1,
+          intermediate_cache2,
+          A_tmp,
+          Aq_tmp,
+          As_tmp,
+          nullptr,
+          C_tmp,
+          dqB_tmp,
+          hidden_states.data_ptr<scalar_t>(),
+          packed_w1.data_ptr<uint8_t>(),
+          packed_w2.data_ptr<uint8_t>(),
+          w1_zero.value().data_ptr<int8_t>(),
+          w2_zero.value().data_ptr<int8_t>(),
+          w1_scale.value().data_ptr<float>(),
+          w2_scale.value().data_ptr<float>(),
+          group_size,
+          topk_weights.data_ptr<float>(),
           sorted_ids,
           expert_ids,
           offsets,
@@ -1180,34 +1133,37 @@ at::Tensor shared_expert_cpu(
     at::Tensor& hidden_states,
     at::Tensor& w1,
     at::Tensor& w2,
-    at::Tensor& fused_experts_out,
-    double routed_scaling_factor,
+    const std::optional<at::Tensor>& fused_experts_out,
+    const std::optional<double> routed_scaling_factor,
     bool inplace,
     bool use_int8_w8a8,
     bool use_fp8_w8a16,
     const std::optional<at::Tensor>& w1_scale,
     const std::optional<at::Tensor>& w2_scale,
     const std::optional<std::vector<int64_t>> block_size,
-    const std::optional<at::Tensor>& a1_scale,
-    const std::optional<at::Tensor>& a2_scale,
     bool is_vnni) {
-  RECORD_FUNCTION("sgl-kernel::shared_expert_cpu", std::vector<c10::IValue>({hidden_states, w1, w2}));
-
   auto packed_w1 = is_vnni ? w1 : convert_weight_packed(w1);
   auto packed_w2 = is_vnni ? w2 : convert_weight_packed(w2);
 
   constexpr int64_t BLOCK_M = block_size_m();
   constexpr int64_t BLOCK_N = block_size_n();
 
+  double routed_scaling_factor_value = 0;
+  if (routed_scaling_factor.has_value()) {
+    TORCH_CHECK(fused_experts_out.has_value(), "shared_expert_cpu: expect fused_experts_out.");
+    const auto fused_experts_out_tensor = fused_experts_out.value();
+    routed_scaling_factor_value = routed_scaling_factor.value();
+    CHECK_INPUT(fused_experts_out_tensor);
+    CHECK_EQ(hidden_states.sizes(), fused_experts_out_tensor.sizes());
+  }
+
   const auto st = hidden_states.scalar_type();
   CHECK_INPUT(hidden_states);
-  CHECK_INPUT(fused_experts_out);
   CHECK_INPUT(w1);
   CHECK_INPUT(w2);
   CHECK_DIM(2, hidden_states);
   CHECK_DIM(2, w1);
   CHECK_DIM(2, w2);
-  CHECK_EQ(hidden_states.sizes(), fused_experts_out.sizes());
   CHECK_EQ(hidden_states.scalar_type(), st);
 
   int64_t M = hidden_states.size(0);
@@ -1224,7 +1180,7 @@ at::Tensor shared_expert_cpu(
   CHECK_EQ(packed_w2.size(1), packed_N);
 
   // check scales
-  check_moe_scales(use_int8_w8a8, use_fp8_w8a16, w1_scale, w2_scale, block_size, a1_scale, a2_scale);
+  check_moe_scales(use_int8_w8a8, use_fp8_w8a16, w1_scale, w2_scale, block_size);
 
   at::Tensor out_hidden_states = inplace ? hidden_states : at::empty_like(hidden_states);
 
@@ -1275,8 +1231,8 @@ at::Tensor shared_expert_cpu(
           packed_w2.data_ptr<int8_t>(),
           w1s.data_ptr<float>(),
           w2s.data_ptr<float>(),
-          fused_experts_out.data_ptr<scalar_t>(),
-          routed_scaling_factor,
+          conditional_data_ptr<scalar_t>(fused_experts_out),
+          routed_scaling_factor_value,
           M,
           N,
           K);
@@ -1298,8 +1254,8 @@ at::Tensor shared_expert_cpu(
           w2s.data_ptr<float>(),
           block_size_N,
           block_size_K,
-          fused_experts_out.data_ptr<scalar_t>(),
-          routed_scaling_factor,
+          conditional_data_ptr<scalar_t>(fused_experts_out),
+          routed_scaling_factor_value,
           M,
           N,
           K);
@@ -1311,8 +1267,8 @@ at::Tensor shared_expert_cpu(
           hidden_states.data_ptr<scalar_t>(),
           packed_w1.data_ptr<scalar_t>(),
           packed_w2.data_ptr<scalar_t>(),
-          fused_experts_out.data_ptr<scalar_t>(),
-          routed_scaling_factor,
+          conditional_data_ptr<scalar_t>(fused_experts_out),
+          routed_scaling_factor_value,
           M,
           N,
           K);

@@ -6,8 +6,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from sglang.srt.disaggregation.utils import prepare_abort
-from sglang.srt.mem_cache.common import release_kv_cache
+from sglang.srt.mem_cache.common import maybe_cache_unfinished_req
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 
@@ -43,9 +42,10 @@ class ScheduleBatchDisaggregationDecodeMixin:
         offset = 0
         for i, req in enumerate(reqs):
             req_pool_indices.append(req.req_pool_idx)
+            pre_len = len(req.prefix_indices)
 
             chunk = self.req_to_token_pool.req_to_token[req.req_pool_idx][
-                : req.extend_input_len
+                pre_len : pre_len + req.extend_input_len
             ]
             assert (
                 offset + req.extend_input_len <= total_size
@@ -53,7 +53,6 @@ class ScheduleBatchDisaggregationDecodeMixin:
             out_cache_loc[offset : offset + req.extend_input_len] = chunk
             offset += req.extend_input_len
 
-            pre_len = len(req.prefix_indices)
             seq_len = len(req.origin_input_ids) + max(0, len(req.output_ids) - 1)
             seq_lens.append(seq_len)
             if len(req.output_ids) == 0:
@@ -111,7 +110,7 @@ class ScheduleBatchDisaggregationDecodeMixin:
         self.output_ids = []
         for req in self.reqs:
             self.output_ids.append(req.output_ids[-1])
-            self.tree_cache.cache_unfinished_req(req)
+            maybe_cache_unfinished_req(req, self.tree_cache)
             if req.grammar is not None:
                 # FIXME: this try-except block is for handling unexpected xgrammar issue.
                 try:
@@ -120,12 +119,15 @@ class ScheduleBatchDisaggregationDecodeMixin:
                     if req.grammar.current_token is None:
                         req.grammar.accept_token(req.output_ids[-1])
                 except ValueError as e:
+                    from sglang.srt.managers.schedule_batch import FINISH_ABORT
+
                     # Grammar accept_token can raise ValueError if the token is not in the grammar.
                     # This can happen if the grammar is not set correctly or the token is invalid.
+                    # Use to_finish (not finished_reason) so that process_batch_result_prebuilt
+                    # handles the release via check_finished -> release_kv_cache in one place.
                     error_message = f"Grammar accept_token failed for req {req.rid} with token {req.output_ids[-1]}: {e}"
-                    release_kv_cache(req, self.tree_cache)
-                    prepare_abort(
-                        req, error_message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR
+                    req.to_finish = FINISH_ABORT(
+                        error_message, HTTPStatus.INTERNAL_SERVER_ERROR
                     )
                 req.grammar.finished = req.finished()
         self.output_ids = torch.tensor(self.output_ids, device=self.device)

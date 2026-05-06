@@ -4,15 +4,13 @@ use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use tracing::{debug, info};
+use wfaas::{StepExecutor, StepResult, WorkflowContext, WorkflowError, WorkflowResult};
 
-use crate::{
-    app_context::AppContext,
-    core::{
-        model_card::ModelCard, BasicWorkerBuilder, CircuitBreakerConfig, ConnectionMode,
-        HealthConfig, RuntimeType, Worker, WorkerType,
-    },
-    protocols::worker_spec::WorkerConfigRequest,
-    workflow::{StepExecutor, StepResult, WorkflowContext, WorkflowError, WorkflowResult},
+use crate::core::{
+    circuit_breaker::CircuitBreakerConfig,
+    steps::workflow_data::{ExternalWorkerWorkflowData, WorkerList},
+    worker::{HealthConfig, RuntimeType, WorkerType},
+    BasicWorkerBuilder, ConnectionMode, Worker,
 };
 
 /// Normalize URL for external APIs (ensure https://).
@@ -28,11 +26,18 @@ fn normalize_external_url(url: &str) -> String {
 pub struct CreateExternalWorkersStep;
 
 #[async_trait]
-impl StepExecutor for CreateExternalWorkersStep {
-    async fn execute(&self, context: &mut WorkflowContext) -> WorkflowResult<StepResult> {
-        let config: Arc<WorkerConfigRequest> = context.get_or_err("worker_config")?;
-        let app_context: Arc<AppContext> = context.get_or_err("app_context")?;
-        let model_cards: Arc<Vec<ModelCard>> = context.get_or_err("model_cards")?;
+impl StepExecutor<ExternalWorkerWorkflowData> for CreateExternalWorkersStep {
+    async fn execute(
+        &self,
+        context: &mut WorkflowContext<ExternalWorkerWorkflowData>,
+    ) -> WorkflowResult<StepResult> {
+        let config = &context.data.config;
+        let app_context = context
+            .data
+            .app_context
+            .as_ref()
+            .ok_or_else(|| WorkflowError::ContextValueNotFound("app_context".to_string()))?;
+        let model_cards = &context.data.model_cards;
 
         // Build configs from router settings
         let circuit_breaker_config = {
@@ -53,6 +58,7 @@ impl StepExecutor for CreateExternalWorkersStep {
                 endpoint: cfg.endpoint.clone(),
                 failure_threshold: cfg.failure_threshold,
                 success_threshold: cfg.success_threshold,
+                disable_health_check: cfg.disable_health_check || config.disable_health_check,
             }
         };
 
@@ -91,7 +97,11 @@ impl StepExecutor for CreateExternalWorkersStep {
             }
 
             let worker = Arc::new(builder.build()) as Arc<dyn Worker>;
-            worker.set_healthy(false);
+            if health_config.disable_health_check {
+                worker.set_healthy(true);
+            } else {
+                worker.set_healthy(false);
+            }
 
             info!(
                 "Created wildcard worker at {} (accepts any model, user auth forwarded)",
@@ -125,7 +135,11 @@ impl StepExecutor for CreateExternalWorkersStep {
                 }
 
                 let worker = Arc::new(builder.build()) as Arc<dyn Worker>;
-                worker.set_healthy(false);
+                if health_config.disable_health_check {
+                    worker.set_healthy(true);
+                } else {
+                    worker.set_healthy(false);
+                }
 
                 debug!(
                     "Created external worker for model {} at {}",
@@ -142,8 +156,10 @@ impl StepExecutor for CreateExternalWorkersStep {
             );
         }
 
-        context.set("workers", workers);
-        context.set("labels", labels);
+        // Store results in workflow data
+        context.data.workers = Some(WorkerList::from_workers(&workers));
+        context.data.actual_workers = Some(workers);
+        context.data.labels = labels;
         Ok(StepResult::Success)
     }
 

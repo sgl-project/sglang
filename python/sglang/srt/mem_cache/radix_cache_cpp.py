@@ -2,11 +2,20 @@ from __future__ import annotations
 
 import logging
 import time
-from typing import TYPE_CHECKING, List, Set
+from typing import TYPE_CHECKING, List, Optional, Set
 
 import torch
 
-from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, MatchResult
+from sglang.srt.mem_cache.base_prefix_cache import (
+    BasePrefixCache,
+    DecLockRefParams,
+    DecLockRefResult,
+    EvictParams,
+    EvictResult,
+    IncLockRefResult,
+    MatchPrefixParams,
+    MatchResult,
+)
 from sglang.srt.mem_cache.cpp_radix_tree.radix_tree import (
     IOHandle,
     RadixTreeCpp,
@@ -89,7 +98,8 @@ class RadixCacheCpp(BasePrefixCache):
             raise NotImplementedError("Host cache is not supported yet")
         self.tree.reset()
 
-    def match_prefix(self, key: RadixKey, **kwargs) -> MatchResult:
+    def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
+        key = params.key
         device_indices_vec, host_indices_length, node_gpu, node_cpu = (
             self.tree.match_prefix(key.token_ids)
         )
@@ -116,30 +126,38 @@ class RadixCacheCpp(BasePrefixCache):
 
         raise NotImplementedError("Host cache is not supported yet")
 
-    def dec_lock_ref(self, node: TreeNodeCpp):
+    def dec_lock_ref(
+        self, node: TreeNodeCpp, params: Optional[DecLockRefParams] = None
+    ) -> DecLockRefResult:
         """
         Decrement the reference count of a node to root of the radix tree.
         Args:
             node (TreeNodeCpp): The handle of the node to decrement the reference count for.
         """
         self.tree.lock_ref(node, False)  # do not increment
+        return DecLockRefResult()
 
-    def inc_lock_ref(self, node: TreeNodeCpp):
+    def inc_lock_ref(self, node: TreeNodeCpp) -> IncLockRefResult:
         """
         Increment the reference count of from a node to root of the radix tree.
         Args:
             node (TreeNodeCpp): The handle of the node to increment the reference count for.
         """
         self.tree.lock_ref(node, True)
+        return IncLockRefResult()
 
-    def evict(self, num_tokens: int):
+    def evict(self, params: EvictParams) -> EvictResult:
         start_time = time.perf_counter()
+        num_tokens = params.num_tokens
         evicted_device_indices = self.tree.evict(num_tokens)
+
+        num_evicted = 0
         for indice in evicted_device_indices:
+            num_evicted += len(indice)
             self.token_to_kv_pool_allocator.free(indice)
 
-        # FIXME: not sure about the real evict length here
-        self.update_eviction_metrics(num_tokens, start_time)
+        self.update_eviction_metrics(num_evicted, start_time)
+        return EvictResult(num_tokens_evicted=num_evicted)
 
     def evictable_size(self):
         return self.tree.evictable_size()
@@ -187,7 +205,6 @@ class RadixCacheCpp(BasePrefixCache):
 
         # Remove req slot release the cache lock
         self.dec_lock_ref(req.last_node)
-        self.req_to_token_pool.free(req.req_pool_idx)
 
     def cache_unfinished_req(self, req: Req, chunked=False):
         """Cache request when it is unfinished."""

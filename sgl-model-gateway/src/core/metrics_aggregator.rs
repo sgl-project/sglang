@@ -76,7 +76,7 @@ fn merge_family(a: PrometheusFamily, b: PrometheusFamily) -> anyhow::Result<Prom
         .map_err(|e| anyhow::anyhow!("failed to merge samples: {e:?}"))
 }
 
-pub fn try_reduce<I, T, E, F>(iterable: I, f: F) -> Result<Option<T>, E>
+fn try_reduce<I, T, E, F>(iterable: I, f: F) -> Result<Option<T>, E>
 where
     I: IntoIterator<Item = T>,
     F: FnMut(T, T) -> Result<T, E>,

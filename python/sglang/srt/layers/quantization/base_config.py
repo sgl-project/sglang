@@ -10,6 +10,7 @@ from torch import nn
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
+    from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
     from sglang.srt.layers.moe.token_dispatcher import CombineInput, DispatchOutput
     from sglang.srt.models.utils import WeightsMapper
 
@@ -17,7 +18,6 @@ if TYPE_CHECKING:
 class QuantizeMethodBase(ABC):
     """Base class for different quantized methods."""
 
-    @abstractmethod
     def create_weights(
         self, layer: torch.nn.Module, *weight_args, **extra_weight_attrs
     ):
@@ -44,7 +44,6 @@ class QuantizeMethodBase(ABC):
 class LinearMethodBase(QuantizeMethodBase):
     """Base class for different (maybe quantized) linear methods."""
 
-    @abstractmethod
     def create_weights(
         self,
         layer: torch.nn.Module,
@@ -84,7 +83,6 @@ class LinearMethodBase(QuantizeMethodBase):
 
 class FusedMoEMethodBase(QuantizeMethodBase):
 
-    @abstractmethod
     def create_weights(
         self,
         layer: torch.nn.Module,
@@ -96,7 +94,6 @@ class FusedMoEMethodBase(QuantizeMethodBase):
     ):
         raise NotImplementedError
 
-    @abstractmethod
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
@@ -109,6 +106,19 @@ class FusedMoEMethodBase(QuantizeMethodBase):
         dispatch_output: DispatchOutput,
     ) -> CombineInput:
         raise NotImplementedError
+
+    def get_triton_quant_info(self, layer: torch.nn.Module) -> "TritonMoeQuantInfo":
+        """Return a ``TritonMoeQuantInfo`` describing the quantisation state
+        stored on *layer*.
+
+        The LoRA MoE runner calls this so that ``invoke_fused_moe_kernel``
+        receives the correct flags / scales / block-shape for the base
+        weights.  Each quantisation method must override this with the
+        same construction it already uses inside ``apply()``.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} must implement get_triton_quant_info()"
+        )
 
 
 class QuantizationConfig(ABC):
@@ -230,7 +240,9 @@ class QuantizationConfig(ABC):
         """
         raise NotImplementedError()
 
-    def apply_sglang_mapper(self, hf_to_sglang_mapper: "WeightsMapper"):  # noqa: B027
+    def apply_weight_name_mapper(
+        self, hf_to_sglang_mapper: "WeightsMapper"
+    ):  # noqa: B027
         """
         Interface for models to update module names referenced in
         quantization configs in order to reflect the sglang model structure

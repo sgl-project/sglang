@@ -8,9 +8,14 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 
+from sglang.srt.distributed import get_tp_group
+from sglang.srt.layers.dp_attention import (
+    get_attention_tp_group,
+    is_dp_attention_enabled,
+)
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.schedule_batch import ModelWorkerBatch, ScheduleBatch
-from sglang.srt.mem_cache.chunk_cache import SWAChunkCache
+from sglang.srt.managers.utils import get_alloc_len_per_decode
 from sglang.srt.mem_cache.common import (
     alloc_paged_token_slots_extend,
     alloc_token_slots,
@@ -23,17 +28,19 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
 )
 from sglang.srt.model_executor.model_runner import ModelRunner
+from sglang.srt.sampling.penaltylib.repetition_penalty import apply_scaling_penalties
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.speculative.eagle_utils import verify_tree_greedy_func
 from sglang.srt.speculative.spec_utils import (
     SIMULATE_ACC_LEN,
     generate_simulated_accept_index,
 )
-from sglang.srt.utils.common import is_cuda, is_hip, is_npu, next_power_of_2
+from sglang.srt.utils.common import is_cuda, is_hip, is_musa, is_npu, next_power_of_2
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
 _is_npu = is_npu()
+_is_musa = is_musa()
 
 if TYPE_CHECKING:
     from sglang.srt.managers.tp_worker import TpModelWorker
@@ -42,7 +49,7 @@ if TYPE_CHECKING:
     )
     from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
 
-if is_cuda():
+if is_cuda() or is_musa():
     from sgl_kernel import (
         top_k_renorm_prob,
         top_p_renorm_prob,
@@ -80,9 +87,7 @@ def assign_draft_cache_locs_page_size_1(
 @dataclass
 class EagleDraftInputV2Mixin:
     def prepare_for_decode(self: EagleDraftInput, batch: ScheduleBatch):
-        if isinstance(batch.tree_cache, SWAChunkCache):
-            for req in batch.reqs:
-                batch.tree_cache.evict_swa(req, req.seqlen - 1)
+        batch.maybe_evict_swa()
 
         from sglang.srt.speculative.spec_utils import assign_req_to_token_pool_func
 
@@ -91,20 +96,45 @@ class EagleDraftInputV2Mixin:
         # Now seq_lens is correct
         batch.maybe_wait_verify_done()
 
-        page_size = batch.token_to_kv_pool_allocator.page_size
-        cur_kv_lens_cpu = []
-        nxt_kv_lens_cpu = []
-        num_needed_tokens = 0
-        for r in batch.reqs:
-            # Over-allocation happens here
-            x = r.kv_committed_len + 2 * self.ALLOC_LEN_PER_DECODE - r.kv_allocated_len
-            cur_kv_lens_cpu.append(r.kv_allocated_len)
-            nxt_kv_lens_cpu.append(r.kv_allocated_len + x)
-            num_needed_tokens += x
-            r.kv_allocated_len += x
+        # Accumulate penalty
+        # This is a relaxed version of penalties for speculative decoding.
+        if batch.sampling_info.penalizer_orchestrator.is_required:
+            output_ids = torch.tensor(
+                [
+                    (
+                        req.output_ids[-1]
+                        if len(req.output_ids)
+                        else req.origin_input_ids[-1]
+                    )
+                    for req in batch.reqs
+                ],
+                dtype=torch.int64,
+                device=batch.device,
+            )
+            batch.sampling_info.penalizer_orchestrator.cumulate_output_tokens(
+                output_ids
+            )
 
-        cur_kv_lens_cpu = torch.tensor(cur_kv_lens_cpu, dtype=torch.int32, device="cpu")
-        nxt_kv_lens_cpu = torch.tensor(nxt_kv_lens_cpu, dtype=torch.int32, device="cpu")
+        page_size = batch.token_to_kv_pool_allocator.page_size
+        alloc_len_per_decode = get_alloc_len_per_decode()
+        double_alloc = alloc_len_per_decode + alloc_len_per_decode
+
+        cur_kv_lens = [0] * bs
+        nxt_kv_lens = [0] * bs
+        num_needed_tokens = 0
+        for i, r in enumerate(batch.reqs):
+            cur = r.kv_allocated_len
+            nxt = r.kv_committed_len + double_alloc
+            cur_kv_lens[i] = cur
+            nxt_kv_lens[i] = nxt
+            num_needed_tokens += nxt - cur
+            r.kv_allocated_len = nxt
+            r.decode_batch_idx += 1
+            # Pre-claim bonus slot here (like normal decode); resolve subtracts 1.
+            r.kv_committed_len += 1
+
+        cur_kv_lens_cpu = torch.tensor(cur_kv_lens, dtype=torch.int32, device="cpu")
+        nxt_kv_lens_cpu = torch.tensor(nxt_kv_lens, dtype=torch.int32, device="cpu")
 
         if page_size == 1:
             out_cache_loc = alloc_token_slots(batch.tree_cache, num_needed_tokens)
@@ -169,8 +199,8 @@ class EagleDraftInputV2Mixin:
             )
 
         # Get a forward batch
-        self.num_tokens_per_batch = topk
-        self.num_tokens_for_logprob_per_batch = topk
+        self.num_tokens_per_req = topk
+        self.num_tokens_for_logprob_per_req = topk
         batch.capture_hidden_mode = CaptureHiddenMode.LAST
         self.positions = batch.seq_lens.repeat_interleave(topk, dim=0)
         forward_batch = ForwardBatch.init_new(batch, draft_model_runner)
@@ -232,6 +262,30 @@ class EagleVerifyInputV2Mixin:
                 device=device,
             )
 
+            # Set mamba_track_indices for mamba prefix-cache state tracking
+            if get_global_server_args().enable_mamba_extra_buffer():
+                mapping = (
+                    req_to_token_pool.req_index_to_mamba_ping_pong_track_buffer_mapping
+                )
+                req_pool_idx_tensor = batch.req_pool_indices.to(
+                    device=mapping.device, dtype=torch.int64
+                )
+                track_col_idx = torch.tensor(
+                    [req.mamba_next_track_idx for req in batch.reqs],
+                    dtype=torch.int64,
+                    pin_memory=True,
+                ).to(mapping.device, non_blocking=True)
+                batch.mamba_track_indices = mapping[
+                    req_pool_idx_tensor, track_col_idx
+                ].to(dtype=torch.int64)
+                batch.mamba_track_mask = None
+                batch.mamba_track_seqlens = None
+
+            # Populate seq_lens_cpu/seq_lens_sum on the verify input so that
+            # TBO's split_spec_info can slice the custom_mask correctly.
+            self.seq_lens_cpu = batch.seq_lens_cpu
+            self.seq_lens_sum = batch.seq_lens_sum
+
         # Get a forward batch
         batch.forward_mode = (
             ForwardMode.IDLE
@@ -267,19 +321,41 @@ class EagleVerifyInputV2Mixin:
         (which contains spec decoding information).
         """
         if batch.forward_mode.is_idle():
-            predict = torch.empty(0, dtype=torch.long, device=batch.input_ids.device)
-            accept_length = torch.empty(
+            predict = torch.empty(0, dtype=torch.int32, device=batch.input_ids.device)
+            num_accepted_drafts = torch.empty(
                 0, dtype=torch.int32, device=batch.input_ids.device
             )
             accept_index = torch.empty(
                 0, dtype=torch.int32, device=batch.input_ids.device
             )
-            return predict, accept_length, accept_index
+            return predict, num_accepted_drafts, accept_index
 
         bs = len(batch.seq_lens)
         sampling_info = batch.sampling_info
         next_token_logits = logits_output.next_token_logits
         device = batch.input_ids.device
+
+        # Apply penalty
+        # This is a relaxed version of penalties for speculative decoding.
+        if sampling_info.acc_additive_penalties is not None:
+            next_token_logits.add_(
+                torch.repeat_interleave(
+                    sampling_info.acc_additive_penalties, self.draft_token_num, dim=0
+                )
+            )
+        if sampling_info.acc_scaling_penalties is not None:
+            apply_scaling_penalties(
+                next_token_logits,
+                torch.repeat_interleave(
+                    sampling_info.acc_scaling_penalties, self.draft_token_num, dim=0
+                ),
+            )
+        if sampling_info.logit_bias is not None:
+            next_token_logits.add_(
+                torch.repeat_interleave(
+                    sampling_info.logit_bias, self.draft_token_num, dim=0
+                )
+            )
 
         # Apply grammar mask if provided
         if vocab_mask is not None:
@@ -294,20 +370,20 @@ class EagleVerifyInputV2Mixin:
         accept_index = torch.full(
             (bs, self.spec_steps + 1), -1, dtype=torch.int32, device=device
         )
-        accept_length = torch.empty((bs,), dtype=torch.int32, device=device)
+        num_accepted_drafts = torch.empty((bs,), dtype=torch.int32, device=device)
 
         # Sample tokens
-        if sampling_info.is_all_greedy or _is_npu:
+        if sampling_info.is_all_greedy or _is_npu or _is_hip:
             target_predict = torch.argmax(next_token_logits, dim=-1)
             target_predict = target_predict.reshape(bs, self.draft_token_num)
-            predict, accept_index, accept_length = verify_tree_greedy_func(
+            predict, accept_index, num_accepted_drafts = verify_tree_greedy_func(
                 predicts=predict,  # mutable
                 accept_index=accept_index,  # mutable
-                accept_token_num=accept_length,  # mutable
+                accept_token_num=num_accepted_drafts,  # mutable
                 candidates=candidates,
-                retrive_index=self.retrive_index,
-                retrive_next_token=self.retrive_next_token,
-                retrive_next_sibling=self.retrive_next_sibling,
+                retrieve_index=self.retrieve_index,
+                retrieve_next_token=self.retrieve_next_token,
+                retrieve_next_sibling=self.retrieve_next_sibling,
                 target_predict=target_predict,
                 topk=self.topk,
             )
@@ -345,11 +421,12 @@ class EagleVerifyInputV2Mixin:
             tree_speculative_sampling_target_only(
                 predicts=predict,  # mutable
                 accept_index=accept_index,  # mutable
-                accept_token_num=accept_length,  # mutable
+                accept_token_num=num_accepted_drafts,  # mutable
                 candidates=candidates,
-                retrive_index=self.retrive_index,
-                retrive_next_token=self.retrive_next_token,
-                retrive_next_sibling=self.retrive_next_sibling,
+                # kwarg LHS retained as `retrive_*` to match sgl_kernel op schema.
+                retrive_index=self.retrieve_index,
+                retrive_next_token=self.retrieve_next_token,
+                retrive_next_sibling=self.retrieve_next_sibling,
                 uniform_samples=coins,
                 uniform_samples_for_final_sampling=coins_for_final_sampling,
                 target_probs=target_probs,
@@ -359,20 +436,35 @@ class EagleVerifyInputV2Mixin:
                 deterministic=True,
             )
 
+            # Sync sampling results across TP ranks: different GPUs may
+            # produce slightly different target_probs due to floating-point
+            # non-determinism in softmax/top_k/top_p, causing different
+            # sampled tokens. Broadcast from rank 0 to ensure consistency.
+            tp_group = (
+                get_attention_tp_group()
+                if is_dp_attention_enabled()
+                else get_tp_group()
+            )
+            if tp_group.world_size > 1:
+                tp_group.broadcast(predict, src=0)
+                tp_group.broadcast(accept_index, src=0)
+                tp_group.broadcast(num_accepted_drafts, src=0)
+
         if SIMULATE_ACC_LEN > 0:
             # Do simulation
             accept_index = generate_simulated_accept_index(
                 accept_index=accept_index,
                 predict=predict,  # mutable
-                accept_length=accept_length,  # mutable
+                num_accepted_drafts=num_accepted_drafts,  # mutable
                 simulate_acc_len=SIMULATE_ACC_LEN,
                 bs=bs,
                 spec_steps=self.spec_steps,
             )
 
-        # Include the bonus token
-        accept_length.add_(1)
-        return predict, accept_length, accept_index
+        # `num_accepted_drafts` stays drafts-only inside this function; the returned
+        # tensor includes the trailing/bonus token via out-of-place +1 so the
+        # name no longer flips semantics mid-function (naming doc C2).
+        return predict, num_accepted_drafts + 1, accept_index
 
 
 @triton.jit
@@ -385,9 +477,10 @@ def fill_new_verified_id(
     # NOTE: we cannot fuse any in-place operations of `accept_lens` inside this kernel
     # because this kernel reads accept_lens
     pid = tl.program_id(axis=0)
-    accept_length = tl.load(accept_lens + pid)
+    # `accept_lens` includes the bonus token; the last accepted slot is at -1.
+    accept_len = tl.load(accept_lens + pid)
 
-    verified_id_idx = num_draft_tokens * pid + accept_length - 1
+    verified_id_idx = num_draft_tokens * pid + accept_len - 1
     verified_id_data = tl.load(verified_id + verified_id_idx)
     tl.store(new_verified_id + pid, verified_id_data)
 
@@ -454,7 +547,7 @@ def assign_extend_cache_locs_func(
     draft_token_num: int,
     device,
 ) -> torch.Tensor:
-    if _is_cuda or _is_hip:
+    if _is_cuda or _is_hip or _is_musa:
         out_cache_loc = torch.empty(
             (batch_size * draft_token_num,),
             dtype=torch.int64,

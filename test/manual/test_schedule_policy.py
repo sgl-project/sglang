@@ -1,6 +1,6 @@
 import unittest
 
-from sglang.srt.managers.schedule_batch import Req
+from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.schedule_policy import (
     CacheAgnosticPolicy,
     CacheAwarePolicy,
@@ -196,6 +196,118 @@ class TestSchedulePolicy(CustomTestCase):
         self.assertEqual(waiting_queue[0].rid, 1)
         self.assertEqual(waiting_queue[1].rid, 2)
         self.assertEqual(waiting_queue[2].rid, 3)
+
+    def test_calc_priority_routing_key_scheduling(self):
+        """Test routing-key policy: prioritize by routing key frequency in running batch."""
+        tree_cache = RadixCache.create_simulated()
+
+        running_reqs = [
+            Req("r1", "a", [1], SamplingParams(), routing_key="key_a"),
+            Req("r2", "b", [2], SamplingParams(), routing_key="key_a"),
+            Req("r3", "c", [3], SamplingParams(), routing_key="key_b"),
+        ]
+        running_batch = ScheduleBatch(reqs=running_reqs)
+
+        waiting_queue = [
+            Req("w1", "d", [4], SamplingParams(), routing_key="key_b"),
+            Req("w2", "e", [5], SamplingParams(), routing_key="key_a"),
+            Req("w3", "f", [6], SamplingParams(), routing_key="key_c"),
+        ]
+
+        policy = SchedulePolicy(
+            policy="routing-key",
+            tree_cache=tree_cache,
+            enable_hierarchical_cache=False,
+            enable_priority_scheduling=False,
+            schedule_low_priority_values_first=False,
+        )
+        policy.calc_priority(waiting_queue, running_batch)
+
+        self.assertEqual(waiting_queue[0].rid, "w2")
+        self.assertEqual(waiting_queue[1].rid, "w1")
+        self.assertEqual(waiting_queue[2].rid, "w3")
+
+    def test_calc_priority_routing_key_tie_break_by_lexicographic_order(self):
+        """Test routing-key policy: tie-break by lexicographic order."""
+        tree_cache = RadixCache.create_simulated()
+
+        running_reqs = [
+            Req("r1", "a", [1], SamplingParams(), routing_key="key_b"),
+            Req("r2", "b", [2], SamplingParams(), routing_key="key_a"),
+        ]
+        running_batch = ScheduleBatch(reqs=running_reqs)
+
+        waiting_queue = [
+            Req("w1", "d", [4], SamplingParams(), routing_key="key_b"),
+            Req("w2", "e", [5], SamplingParams(), routing_key="key_a"),
+        ]
+
+        policy = SchedulePolicy(
+            policy="routing-key",
+            tree_cache=tree_cache,
+            enable_hierarchical_cache=False,
+            enable_priority_scheduling=False,
+            schedule_low_priority_values_first=False,
+        )
+        policy.calc_priority(waiting_queue, running_batch)
+
+        self.assertEqual(waiting_queue[0].rid, "w2")
+        self.assertEqual(waiting_queue[1].rid, "w1")
+
+    def test_calc_priority_routing_key_no_match_deprioritized(self):
+        """Test routing-key policy: requests without matching routing keys are deprioritized."""
+        tree_cache = RadixCache.create_simulated()
+
+        running_reqs = [
+            Req("r1", "a", [1], SamplingParams(), routing_key="key_a"),
+            Req("r2", "b", [2], SamplingParams(), routing_key="key_b"),
+            Req("r3", "c", [3], SamplingParams(), routing_key="key_c"),
+        ]
+        running_batch = ScheduleBatch(reqs=running_reqs)
+
+        waiting_queue = [
+            Req("w1", "d", [4], SamplingParams(), routing_key="key_d"),
+            Req("w2", "e", [5], SamplingParams(), routing_key="key_e"),
+            Req("w3", "f", [6], SamplingParams(), routing_key="key_c"),
+        ]
+
+        policy = SchedulePolicy(
+            policy="routing-key",
+            tree_cache=tree_cache,
+            enable_hierarchical_cache=False,
+            enable_priority_scheduling=False,
+            schedule_low_priority_values_first=False,
+        )
+        policy.calc_priority(waiting_queue, running_batch)
+
+        self.assertEqual(waiting_queue[0].rid, "w3")
+        self.assertEqual(waiting_queue[1].rid, "w1")
+        self.assertEqual(waiting_queue[2].rid, "w2")
+
+    def test_calc_priority_routing_key_empty_running_batch(self):
+        """Test routing-key policy: empty running batch keeps original order."""
+        tree_cache = RadixCache.create_simulated()
+
+        running_batch = ScheduleBatch(reqs=[])
+
+        waiting_queue = [
+            Req("w1", "d", [4], SamplingParams(), routing_key="key_a"),
+            Req("w2", "e", [5], SamplingParams(), routing_key="key_b"),
+            Req("w3", "f", [6], SamplingParams(), routing_key="key_c"),
+        ]
+
+        policy = SchedulePolicy(
+            policy="routing-key",
+            tree_cache=tree_cache,
+            enable_hierarchical_cache=False,
+            enable_priority_scheduling=False,
+            schedule_low_priority_values_first=False,
+        )
+        policy.calc_priority(waiting_queue, running_batch)
+
+        self.assertEqual(waiting_queue[0].rid, "w1")
+        self.assertEqual(waiting_queue[1].rid, "w2")
+        self.assertEqual(waiting_queue[2].rid, "w3")
 
 
 if __name__ == "__main__":

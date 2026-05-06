@@ -26,6 +26,7 @@ from transformers.utils import torch_int
 
 from sglang.srt.layers.activation import get_act_fn
 from sglang.srt.layers.attention.vision import VisionAttention
+from sglang.srt.layers.conv import Conv2dLayer
 from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.managers.mm_utils import (
@@ -36,7 +37,7 @@ from sglang.srt.managers.schedule_batch import MultimodalDataItem, MultimodalInp
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.ernie4 import Ernie4_5_ForCausalLM
-from sglang.srt.utils import add_prefix
+from sglang.srt.utils import add_prefix, is_npu
 
 
 class Projector(nn.Module):
@@ -113,7 +114,7 @@ class SiglipVisionEmbeddings(nn.Module):
         self.image_size = config.image_size
         self.patch_size = config.patch_size
 
-        self.patch_embedding = nn.Conv2d(
+        self.patch_embedding = Conv2dLayer(
             in_channels=config.num_channels,
             out_channels=self.embed_dim,
             kernel_size=self.patch_size,
@@ -442,7 +443,9 @@ class SiglipEncoder(nn.Module):
         rope_emb = rope_emb_max_grid[pids].flatten(1)
         rope_emb = rope_emb.repeat(1, 2)
         rope_emb = (rope_emb.cos(), rope_emb.sin())
-
+        # cu_seqlens must be on cpu because of npu_flash_attention_unpad operator restriction
+        if is_npu() and isinstance(cu_seqlens, torch.Tensor):
+            cu_seqlens = cu_seqlens.to("cpu")
         attn_cu_seqlens = cu_seqlens
         hidden_states = inputs_embeds
 

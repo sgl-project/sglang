@@ -6,23 +6,31 @@ import math
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from diffusers.models.embeddings import (
     CombinedTimestepGuidanceTextProjEmbeddings as _CombinedTimestepGuidanceTextProjEmbeddings,
 )
 from diffusers.models.embeddings import (
     CombinedTimestepTextProjEmbeddings as _CombinedTimestepTextProjEmbeddings,
 )
-from diffusers.models.embeddings import PixArtAlphaTextProjection, TimestepEmbedding
+from diffusers.models.embeddings import (
+    PixArtAlphaTextProjection,
+    TimestepEmbedding,
+)
 from diffusers.models.embeddings import Timesteps as _Timesteps
+from diffusers.models.embeddings import (
+    get_timestep_embedding as timestep_embedding_diffusers,
+)
 
-try:
-    from sgl_kernel.elementwise import timestep_embedding as timestep_embedding_cuda
-except Exception as _e:
-    pass
-
+from sglang.jit_kernel.timestep_embedding import (
+    timestep_embedding as timestep_embedding_cuda,
+)
 from sglang.multimodal_gen.runtime.layers.activation import get_act_fn
-from sglang.multimodal_gen.runtime.layers.linear import ReplicatedLinear
+from sglang.multimodal_gen.runtime.layers.linear import ColumnParallelLinear
 from sglang.multimodal_gen.runtime.layers.mlp import MLP
+from sglang.multimodal_gen.runtime.platforms import current_platform
+
+_is_cuda = current_platform.is_cuda()
 
 
 class PatchEmbed(nn.Module):
@@ -51,12 +59,13 @@ class PatchEmbed(nn.Module):
         prefix: str = "",
     ):
         super().__init__()
-        # Convert patch_size to 2-tuple
         if isinstance(patch_size, list | tuple):
             if len(patch_size) == 1:
-                patch_size = (patch_size[0], patch_size[0])
+                patch_size = (1, patch_size[0], patch_size[0])
+            elif len(patch_size) == 2:
+                patch_size = (1, patch_size[0], patch_size[1])
         else:
-            patch_size = (patch_size, patch_size)
+            patch_size = (1, patch_size, patch_size)
 
         self.patch_size = patch_size
         self.flatten = flatten
@@ -72,23 +81,54 @@ class PatchEmbed(nn.Module):
         self.norm = norm_layer(embed_dim) if norm_layer else nn.Identity()
 
     def forward(self, x):
+        if x.dim() == 5:
+            B, C, T, H, W = x.shape
+            pt, ph, pw = self.patch_size
+
+            if T % pt == 0 and H % ph == 0 and W % pw == 0:
+                T_ = T // pt
+                H_ = H // ph
+                W_ = W // pw
+
+                x = x.reshape(B, C, T_, pt, H_, ph, W_, pw)
+                x = x.permute(0, 2, 4, 6, 1, 3, 5, 7).contiguous()
+                x = x.reshape(B, T_ * H_ * W_, C * pt * ph * pw)
+
+                w = self.proj.weight.reshape(self.proj.weight.shape[0], -1)
+                x = F.linear(x, w, self.proj.bias)  # [B, T'*H'*W', embed_dim]
+
+                if not self.flatten:
+                    x = x.reshape(B, T_, H_, W_, -1).permute(0, 4, 1, 2, 3).contiguous()
+
+                x = self.norm(x)
+                return x
+
+        # Fallback to Conv3d for non-5D input or indivisible spatial dims.
         x = self.proj(x)
         if self.flatten:
-            x = x.flatten(2).transpose(1, 2)  # BCHW -> BNC
+            x = x.flatten(2).transpose(1, 2)
         x = self.norm(x)
         return x
 
 
 class Timesteps(_Timesteps):
     def forward(self, timesteps: torch.Tensor) -> torch.Tensor:
-        t_emb = timestep_embedding_cuda(
-            timesteps,
-            self.num_channels,
-            flip_sin_to_cos=self.flip_sin_to_cos,
-            downscale_freq_shift=self.downscale_freq_shift,
-            scale=self.scale,
-        )
-        return t_emb
+        if _is_cuda:
+            return timestep_embedding_cuda(
+                timesteps,
+                self.num_channels,
+                flip_sin_to_cos=self.flip_sin_to_cos,
+                downscale_freq_shift=self.downscale_freq_shift,
+                scale=self.scale,
+            )
+        else:
+            return timestep_embedding_diffusers(
+                timesteps,
+                self.num_channels,
+                flip_sin_to_cos=self.flip_sin_to_cos,
+                downscale_freq_shift=self.downscale_freq_shift,
+                scale=self.scale,
+            )
 
 
 class CombinedTimestepGuidanceTextProjEmbeddings(
@@ -219,8 +259,12 @@ class ModulateProjection(nn.Module):
         super().__init__()
         self.factor = factor
         self.hidden_size = hidden_size
-        self.linear = ReplicatedLinear(
-            hidden_size, hidden_size * factor, bias=True, params_dtype=dtype
+        self.linear = ColumnParallelLinear(
+            hidden_size,
+            hidden_size * factor,
+            bias=True,
+            gather_output=True,
+            params_dtype=dtype,
         )
         self.act = get_act_fn(act_layer)
 

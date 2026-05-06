@@ -25,7 +25,7 @@ use rand::{
     rng as thread_rng, Rng,
 };
 // Import the tree module
-use sgl_model_gateway::policies::tree::Tree;
+use smg::policies::tree::Tree;
 
 // Global results storage for summary
 lazy_static::lazy_static! {

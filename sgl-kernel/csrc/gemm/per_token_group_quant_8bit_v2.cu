@@ -90,16 +90,25 @@ __forceinline__ __device__ OUT_DTYPE_T extract_required_scale_format(float value
 }
 
 __device__ __forceinline__ void st_global(const int4* ptr, const int4& value) {
+#ifndef USE_MUSA
   asm volatile(
       "st.global.v4.s32 [%0], {%1, %2, %3, %4};" ::"l"(ptr), "r"(value.x), "r"(value.y), "r"(value.z), "r"(value.w));
+#else
+  int4* p = const_cast<int4*>(ptr);
+  *p = value;
+#endif
 }
 
 __device__ __forceinline__ int4 ld_global_nc(const int4* ptr) {
+#ifndef USE_MUSA
   int4 ret;
   asm volatile("ld.global.nc.v4.s32 {%0, %1, %2, %3}, [%4];"
                : "=r"(ret.x), "=r"(ret.y), "=r"(ret.z), "=r"(ret.w)
                : "l"(ptr));
   return ret;
+#else
+  return *ptr;
+#endif
 }
 
 template <typename T>
@@ -452,7 +461,7 @@ void sgl_per_token_group_quant_8bit_v2(
 #define LAUNCH_KERNEL(GROUP_SIZE, T, DST_DTYPE)                                                                     \
   do {                                                                                                              \
     constexpr int THREADS_PER_SUBWARP = GROUP_SIZE / 16;                                                            \
-    TORCH_CHECK(THREADS_PER_SUBWARP* INPUT_PRIMARY_VEC_NUM_BYTES == group_size * sizeof(T));                        \
+    TORCH_CHECK(THREADS_PER_SUBWARP * INPUT_PRIMARY_VEC_NUM_BYTES == group_size * sizeof(T));                       \
                                                                                                                     \
     using dst_dtype_info = DtypeInfo<DST_DTYPE>;                                                                    \
     CHECK_EQ(dst_dtype_info::MIN, min_8bit);                                                                        \

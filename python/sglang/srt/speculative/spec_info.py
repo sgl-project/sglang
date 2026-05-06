@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, List, Optional, Tuple, Type, Union
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import ModelWorkerBatch
     from sglang.srt.managers.tp_worker import TpModelWorker
+    from sglang.srt.server_args import ServerArgs
     from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
     from sglang.srt.speculative.ngram_worker import NGRAMWorker
 
@@ -14,6 +15,7 @@ if TYPE_CHECKING:
 class SpeculativeAlgorithm(Enum):
     """Enumeration of speculative decoding algorithms."""
 
+    DFLASH = auto()
     EAGLE = auto()
     EAGLE3 = auto()
     STANDALONE = auto()
@@ -32,12 +34,18 @@ class SpeculativeAlgorithm(Enum):
     def is_none(self) -> bool:
         return self == SpeculativeAlgorithm.NONE
 
+    def is_speculative(self) -> bool:
+        return self != SpeculativeAlgorithm.NONE
+
     def is_eagle(self) -> bool:
         # NOTE: EAGLE3 is a variant of EAGLE
         return self == SpeculativeAlgorithm.EAGLE or self == SpeculativeAlgorithm.EAGLE3
 
     def is_eagle3(self) -> bool:
         return self == SpeculativeAlgorithm.EAGLE3
+
+    def is_dflash(self) -> bool:
+        return self == SpeculativeAlgorithm.DFLASH
 
     def is_standalone(self) -> bool:
         return self == SpeculativeAlgorithm.STANDALONE
@@ -49,12 +57,39 @@ class SpeculativeAlgorithm(Enum):
         return self.is_eagle() or self.is_standalone()
 
     def create_worker(
-        self, enable_overlap: bool = False
+        self, server_args: ServerArgs
     ) -> Optional[Union[Type[BaseSpecWorker], Type[TpModelWorker], Type[NGRAMWorker]]]:
-        if self.is_none():
-            return None
+        assert (
+            not self.is_none()
+        ), "Cannot create worker for NONE speculative algorithm."
 
-        if self.is_eagle():
+        enable_overlap = not server_args.disable_overlap_schedule
+
+        if self.is_dflash():
+            if enable_overlap:
+                raise ValueError(
+                    "DFLASH does not support overlap scheduling (spec v2)."
+                )
+            from sglang.srt.speculative.dflash_worker import DFlashWorker
+
+            return DFlashWorker
+
+        if self.is_eagle() and server_args.enable_multi_layer_eagle:
+            # FIXME: migrate to EagleWorker
+            if enable_overlap:
+                from sglang.srt.speculative.multi_layer_eagle_worker_v2 import (
+                    MultiLayerEagleWorkerV2,
+                )
+
+                return MultiLayerEagleWorkerV2
+
+            from sglang.srt.speculative.multi_layer_eagle_worker import (
+                MultiLayerEagleWorker,
+            )
+
+            return MultiLayerEagleWorker
+
+        elif self.is_eagle():
             if enable_overlap:
                 from sglang.srt.speculative.eagle_worker_v2 import EAGLEWorkerV2
 
@@ -92,6 +127,8 @@ class SpecInputType(IntEnum):
     # If all algorithms can share the same datastrucutre of draft_input and verify_input, consider simplify it
     EAGLE_DRAFT = auto()
     EAGLE_VERIFY = auto()
+    DFLASH_DRAFT = auto()
+    DFLASH_VERIFY = auto()
     NGRAM_VERIFY = auto()
 
 
@@ -102,11 +139,15 @@ class SpecInput(ABC):
     def is_draft_input(self) -> bool:
         # FIXME: remove this function which is only used for assertion
         # or use another variable name like `draft_input` to substitute `spec_info`
-        return self.spec_input_type == SpecInputType.EAGLE_DRAFT
+        return self.spec_input_type in {
+            SpecInputType.EAGLE_DRAFT,
+            SpecInputType.DFLASH_DRAFT,
+        }
 
     def is_verify_input(self) -> bool:
         return self.spec_input_type in {
             SpecInputType.EAGLE_VERIFY,
+            SpecInputType.DFLASH_VERIFY,
             SpecInputType.NGRAM_VERIFY,
         }
 

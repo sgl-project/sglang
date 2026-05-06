@@ -7,6 +7,7 @@ from typing import Optional, Tuple
 import torch
 import triton
 
+from sglang.srt.constrained.base_grammar_backend import BaseGrammarObject
 from sglang.srt.server_args import get_global_server_args
 
 logger = logging.getLogger(__name__)
@@ -33,9 +34,9 @@ from sglang.srt.speculative.spec_utils import (
     get_src_tgt_cache_loc,
     get_target_cache_loc,
 )
-from sglang.srt.utils import is_cuda, is_hip, next_power_of_2
+from sglang.srt.utils import is_cuda, is_hip, is_musa, next_power_of_2
 
-if is_cuda():
+if is_cuda() or is_musa():
     from sgl_kernel import (
         top_k_renorm_prob,
         top_p_renorm_prob,
@@ -53,20 +54,22 @@ class NgramVerifyInput(SpecInput):
         draft_token: torch.Tensor,
         tree_mask: torch.Tensor,
         positions: torch.Tensor,
-        retrive_index: torch.Tensor,
-        retrive_next_token: torch.Tensor,
-        retrive_next_sibling: torch.Tensor,
+        retrieve_index: torch.Tensor,
+        retrieve_next_token: torch.Tensor,
+        retrieve_next_sibling: torch.Tensor,
         draft_token_num: int,
+        grammar: BaseGrammarObject = None,
     ):
         super().__init__(SpecInputType.NGRAM_VERIFY)
         self.draft_token = draft_token
         self.custom_mask = tree_mask
         self.positions = positions
-        self.retrive_index = retrive_index
-        self.retrive_next_token = retrive_next_token
-        self.retrive_next_sibling = retrive_next_sibling
+        self.retrieve_index = retrieve_index
+        self.retrieve_next_token = retrieve_next_token
+        self.retrieve_next_sibling = retrieve_next_sibling
         self.draft_token_num = draft_token_num
         self.device = self.custom_mask.device
+        self.grammar = grammar
 
     def get_spec_adjust_token_coefficient(self) -> Tuple[int, int]:
         return self.draft_token_num, self.draft_token_num
@@ -158,6 +161,7 @@ class NgramVerifyInput(SpecInput):
         accept_index_cpu = self.accepted_indices.tolist()
         predict_cpu = self.predict.tolist()
         has_finished = False
+        think_end_id = batch.model_config.think_end_id
 
         # Iterate every accepted token and check if req has finished after append the token
         # should be checked BEFORE free kv cache slots
@@ -167,6 +171,8 @@ class NgramVerifyInput(SpecInput):
                     break
                 id = predict_cpu[idx]
                 req.output_ids.append(id)
+                if req.require_reasoning and think_end_id is not None:
+                    req.update_reasoning_tokens(id, think_end_id)
                 req.check_finished()
                 if req.finished():
                     has_finished = True
@@ -185,12 +191,12 @@ class NgramVerifyInput(SpecInput):
                             )
                             raise e
             req.spec_verify_ct += 1
-            req.spec_accepted_tokens += (
-                sum(1 for idx in accept_index_row if idx != -1) - 1
-            )
+            accepted_draft_tokens = sum(1 for idx in accept_index_row if idx != -1) - 1
+            req.spec_accepted_drafts += accepted_draft_tokens
+            req.update_spec_acceptance_histogram(accepted_draft_tokens)
 
         if has_finished:
-            self.accept_length = (self.accepted_indices != -1).sum(dim=1) - 1
+            self.num_accepted_drafts = (self.accepted_indices != -1).sum(dim=1) - 1
         self.accepted_indices = self.accepted_indices[self.accepted_indices != -1]
 
         logits_output.next_token_logits = logits_output.next_token_logits[
@@ -203,7 +209,10 @@ class NgramVerifyInput(SpecInput):
         self.verified_id = self.predict[self.accepted_indices]
 
     def _free_cache(
-        self, batch: ScheduleBatch, page_size: int, accept_length_cpu: torch.Tensor
+        self,
+        batch: ScheduleBatch,
+        page_size: int,
+        num_accepted_drafts_cpu: torch.Tensor,
     ):
         bs = batch.batch_size()
         # Free the KV cache for unaccepted tokens
@@ -220,7 +229,7 @@ class NgramVerifyInput(SpecInput):
                 batch.seq_lens,
                 batch.out_cache_loc,
                 self.accepted_indices,
-                self.accept_length,
+                self.num_accepted_drafts,
                 self.draft_token_num,
                 page_size,
             )
@@ -237,12 +246,12 @@ class NgramVerifyInput(SpecInput):
             # to_free_slots also needs to be page-aligned without the first partial page
             #
             # split each row of out_cache_loc into two parts.
-            # 1. the first part goes to tgt_cache_loc. length = accept_length[i] + 1
+            # 1. the first part goes to tgt_cache_loc. length = num_accepted_drafts[i] + 1
             # 2. the second part goes to to_free_slots.
             get_target_cache_loc[(bs,)](
                 tgt_cache_loc,
                 to_free_slots,
-                self.accept_length,
+                self.num_accepted_drafts,
                 to_free_num_slots,
                 batch.out_cache_loc,
                 self.draft_token_num,
@@ -259,16 +268,16 @@ class NgramVerifyInput(SpecInput):
             )
             batch.out_cache_loc = tgt_cache_loc
 
-        accept_length_list = accept_length_cpu.tolist()
+        num_accepted_drafts_list = num_accepted_drafts_cpu.tolist()
         for i, req in enumerate(batch.reqs):
-            req.kv_committed_len += accept_length_list[i] + 1
+            req.kv_committed_len += num_accepted_drafts_list[i] + 1
             req.kv_allocated_len = req.kv_committed_len
 
         assign_req_to_token_pool[(bs,)](
             batch.req_pool_indices,
             batch.req_to_token_pool.req_to_token,
             batch.seq_lens,
-            batch.seq_lens + self.accept_length + 1,
+            batch.seq_lens + self.num_accepted_tokens,
             batch.out_cache_loc,
             batch.req_to_token_pool.req_to_token.shape[1],
             triton.next_power_of_2(bs),
@@ -290,16 +299,19 @@ class NgramVerifyInput(SpecInput):
         self.accepted_indices = torch.full(
             (bs, self.draft_token_num), -1, dtype=torch.int32, device=self.device
         )
-        self.accept_length = torch.empty((bs,), dtype=torch.int32, device=self.device)
+        self.num_accepted_drafts = torch.empty(
+            (bs,), dtype=torch.int32, device=self.device
+        )
 
         verify_tree_greedy(
             predicts=self.predict,  # mutable
             accept_index=self.accepted_indices,  # mutable
-            accept_token_num=self.accept_length,  # mutable
+            accept_token_num=self.num_accepted_drafts,  # mutable
             candidates=candidates,
-            retrive_index=self.retrive_index,
-            retrive_next_token=self.retrive_next_token,
-            retrive_next_sibling=self.retrive_next_sibling,
+            # kwarg LHS retained as `retrive_*` to match sgl_kernel op schema.
+            retrive_index=self.retrieve_index,
+            retrive_next_token=self.retrieve_next_token,
+            retrive_next_sibling=self.retrieve_next_sibling,
             target_predict=target_predict,
         )
 
@@ -317,7 +329,9 @@ class NgramVerifyInput(SpecInput):
         self.accepted_indices = torch.full(
             (bs, self.draft_token_num), -1, dtype=torch.int32, device=self.device
         )
-        self.accept_length = torch.empty((bs,), dtype=torch.int32, device=self.device)
+        self.num_accepted_drafts = torch.empty(
+            (bs,), dtype=torch.int32, device=self.device
+        )
         # apply temperature and get target probs
         expanded_temperature = torch.repeat_interleave(
             sampling_info.temperatures, self.draft_token_num, dim=0
@@ -357,11 +371,12 @@ class NgramVerifyInput(SpecInput):
         tree_speculative_sampling_target_only(
             predicts=self.predict,  # mutable
             accept_index=self.accepted_indices,  # mutable
-            accept_token_num=self.accept_length,  # mutable
+            accept_token_num=self.num_accepted_drafts,  # mutable
             candidates=candidates.to(torch.int64),
-            retrive_index=self.retrive_index.to(torch.int64),
-            retrive_next_token=self.retrive_next_token.to(torch.int64),
-            retrive_next_sibling=self.retrive_next_sibling.to(torch.int64),
+            # kwarg LHS retained as `retrive_*` to match sgl_kernel op schema.
+            retrive_index=self.retrieve_index.to(torch.int64),
+            retrive_next_token=self.retrieve_next_token.to(torch.int64),
+            retrive_next_sibling=self.retrieve_next_sibling.to(torch.int64),
             uniform_samples=coins,
             uniform_samples_for_final_sampling=coins_for_final_sampling,
             target_probs=target_probs,
@@ -378,13 +393,15 @@ class NgramVerifyInput(SpecInput):
         page_size: int,
         vocab_mask: Optional[torch.Tensor] = None,  # For grammar
     ) -> torch.Tensor:
-        bs = self.retrive_index.shape[0]
+        bs = self.retrieve_index.shape[0]
         sampling_info = batch.sampling_info
 
         if bs != len(sampling_info):
             sampling_info = copy.deepcopy(sampling_info)
-            # NOTE: retrive_index are the indices of the requests that are kept.
-            sampling_info.filter_batch(self.retrive_index.tolist(), self.retrive_index)
+            # NOTE: retrieve_index are the indices of the requests that are kept.
+            sampling_info.filter_batch(
+                self.retrieve_index.tolist(), self.retrieve_index
+            )
 
         # Apply the custom logit processors if registered in the sampling info.
         if sampling_info.has_custom_logit_processor:
@@ -395,17 +412,20 @@ class NgramVerifyInput(SpecInput):
             )
 
         # Apply penalty
-        if sampling_info.penalizer_orchestrator.is_required:
+        if (
+            sampling_info.penalizer_orchestrator.is_required
+            or sampling_info.logit_bias is not None
+        ):
             # This is a relaxed version of penalties for speculative decoding.
-            linear_penalty = torch.zeros(
-                (bs, logits_output.next_token_logits.shape[1]),
-                dtype=torch.float32,
-                device=self.device,
+            sampling_info.penalizer_orchestrator.apply(
+                logits_output.next_token_logits, repeat=self.draft_token_num
             )
-            sampling_info.apply_logits_bias(linear_penalty)
-            logits_output.next_token_logits.add_(
-                torch.repeat_interleave(linear_penalty, self.draft_token_num, dim=0)
-            )
+            if sampling_info.logit_bias is not None:
+                logits_output.next_token_logits.add_(
+                    torch.repeat_interleave(
+                        sampling_info.logit_bias, self.draft_token_num, dim=0
+                    )
+                )
 
         # Apply grammar mask
         if vocab_mask is not None:
@@ -432,15 +452,20 @@ class NgramVerifyInput(SpecInput):
 
         self._fill_requests(batch, logits_output)
 
-        accept_length_cpu = self.accept_length.cpu()
-        num_accepted_tokens = accept_length_cpu.sum().item()
+        # Sync the bonus-included view after the kernel + `_fill_requests`
+        # finalize `num_accepted_drafts`.
+        self.num_accepted_tokens = self.num_accepted_drafts + 1
 
-        self._free_cache(batch, page_size, accept_length_cpu)
+        num_accepted_drafts_cpu = self.num_accepted_drafts.cpu()
+        num_accepted_tokens_cpu = num_accepted_drafts_cpu + 1
+        num_accepted_drafts = num_accepted_drafts_cpu.sum().item()
 
-        batch.seq_lens.add_(self.accept_length + 1)
-        batch.seq_lens_cpu.add_(accept_length_cpu + 1)
+        self._free_cache(batch, page_size, num_accepted_drafts_cpu)
 
-        return logits_output, self.verified_id, num_accepted_tokens
+        batch.seq_lens.add_(self.num_accepted_tokens)
+        batch.seq_lens_cpu.add_(num_accepted_tokens_cpu)
+
+        return logits_output, self.verified_id, num_accepted_drafts
 
     def filter_batch(self, new_indices: torch.Tensor, has_been_filtered: bool = True):
         pass

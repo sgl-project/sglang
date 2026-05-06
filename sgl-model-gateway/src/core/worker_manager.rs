@@ -4,16 +4,13 @@
 
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
-use axum::{
-    response::{IntoResponse, Response},
-    Json,
-};
+use axum::response::{IntoResponse, Response};
 use futures::{
     future,
     stream::{self, StreamExt},
 };
 use http::StatusCode;
-use serde_json::{json, Value};
+use serde_json::Value;
 use tokio::{
     sync::{watch, Mutex},
     task::JoinHandle,
@@ -68,46 +65,6 @@ async fn fan_out(
         .buffer_unordered(MAX_CONCURRENT)
         .collect()
         .await
-}
-
-impl IntoResponse for FlushCacheResult {
-    fn into_response(self) -> Response {
-        let status = if self.failed.is_empty() {
-            StatusCode::OK
-        } else {
-            StatusCode::PARTIAL_CONTENT
-        };
-
-        let mut body = json!({
-            "status": if self.failed.is_empty() { "success" } else { "partial_success" },
-            "message": self.message,
-            "workers_flushed": self.successful.len(),
-            "total_http_workers": self.http_workers,
-            "total_workers": self.total_workers
-        });
-
-        if !self.failed.is_empty() {
-            body["successful"] = json!(self.successful);
-            body["failed"] = json!(self
-                .failed
-                .into_iter()
-                .map(|(url, err)| json!({"worker": url, "error": err}))
-                .collect::<Vec<_>>());
-        }
-
-        (status, Json(body)).into_response()
-    }
-}
-
-impl IntoResponse for WorkerLoadsResult {
-    fn into_response(self) -> Response {
-        let loads: Vec<Value> = self
-            .loads
-            .iter()
-            .map(|info| json!({"worker": &info.worker, "load": info.load}))
-            .collect();
-        Json(json!({"workers": loads})).into_response()
-    }
 }
 
 pub enum EngineMetricsResult {
@@ -252,7 +209,7 @@ impl WorkerManager {
         url: &str,
         api_key: Option<&str>,
     ) -> isize {
-        let load_url = format!("{}/get_load", url);
+        let load_url = format!("{}/v1/loads?include=core", url);
         let mut req = client.get(&load_url).timeout(REQUEST_TIMEOUT);
         if let Some(key) = api_key {
             req = req.bearer_auth(key);
@@ -260,12 +217,12 @@ impl WorkerManager {
 
         match req.send().await {
             Ok(r) if r.status().is_success() => match r.json::<Value>().await {
-                Ok(json) if json.is_array() => json
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .filter_map(|e| e.get("num_tokens").and_then(|v| v.as_i64()))
-                    .sum::<i64>() as isize,
+                Ok(json) => json
+                    .get("aggregate")
+                    .and_then(|a| a.get("total_tokens"))
+                    .and_then(|v| v.as_i64())
+                    .map(|n| n as isize)
+                    .unwrap_or(-1),
                 _ => -1,
             },
             _ => -1,
