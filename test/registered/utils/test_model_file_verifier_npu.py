@@ -20,7 +20,7 @@ from sglang.srt.utils.model_file_verifier import (
     generate_checksums,
     verify,
 )
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_npu_ci
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
