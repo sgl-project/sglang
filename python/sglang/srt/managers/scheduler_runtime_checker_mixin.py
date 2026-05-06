@@ -266,8 +266,10 @@ class SchedulerRuntimeCheckerMixin:
         swa_num_used = self.swa_tokens_per_layer - (
             swa_available_size + swa_evictable_size
         )
-        # HiSparse host-backup makes the device pool counter transiently
-        # over-released; clamp to 0 to keep token_usage / leak checks sane.
+        # FIXME(hisparse): host-backup transiently over-releases the device pool
+        # counter, producing negative full_num_used / swa_num_used. We clamp to 0
+        # to keep token_usage / leak checks sane, but the underlying accounting
+        # bug should be fixed so the clamp can go away.
         if self.enable_hisparse:
             full_num_used = max(0, full_num_used)
             swa_num_used = max(0, swa_num_used)
