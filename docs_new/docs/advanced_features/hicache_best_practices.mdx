@@ -17,6 +17,7 @@ SGLang HiCache extends the traditional RadixAttention with a three-tier hierarch
 --enable-hierarchical-cache           # Enable HiCache
 --hicache-ratio 2                     # Host memory ratio (2x GPU memory)
 --hicache-size 100                    # Host memory size in GBs, will override the above ratio
+--hicache-disable-mamba               # Optional: do not allocate a host Mamba state pool for hybrid Mamba models
 --hicache-io-backend kernel           # The I/O backend of moving data between CPU and GPU
 --hicache-write-policy write_through  # Cache write policy from GPU to CPU
 --hicache-storage-backend             # Optional storage backend (e.g., hf3fs, mooncake, etc.)
