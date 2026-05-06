@@ -5,7 +5,7 @@ from sglang.test.kits.lm_eval_kit import LMEvalMixin
 from sglang.test.server_fixtures.default_fixture import DefaultServerBase
 
 register_cuda_ci(
-    est_time=564,
+    est_time=640,
     suite="stage-b-test-2-gpu-large",
 )
 
