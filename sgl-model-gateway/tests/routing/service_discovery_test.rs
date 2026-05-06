@@ -44,6 +44,8 @@ mod service_discovery_tests {
                 health_status: HealthStatus::Healthy,
                 response_delay_ms: 0,
                 fail_rate: 0.0,
+                routed_experts_b64: None,
+                always_emit_routed_experts: false,
             }],
         )
         .await;
@@ -92,6 +94,8 @@ mod service_discovery_tests {
                 health_status: HealthStatus::Healthy,
                 response_delay_ms: 0,
                 fail_rate: 0.0,
+                routed_experts_b64: None,
+                always_emit_routed_experts: false,
             }],
         )
         .await;
@@ -151,6 +155,8 @@ mod service_discovery_tests {
                     health_status: HealthStatus::Healthy,
                     response_delay_ms: 0,
                     fail_rate: 0.0,
+                    routed_experts_b64: None,
+                    always_emit_routed_experts: false,
                 },
                 MockWorkerConfig {
                     port: 20004,
@@ -158,6 +164,8 @@ mod service_discovery_tests {
                     health_status: HealthStatus::Healthy,
                     response_delay_ms: 0,
                     fail_rate: 0.0,
+                    routed_experts_b64: None,
+                    always_emit_routed_experts: false,
                 },
             ],
         )
@@ -235,6 +243,8 @@ mod service_discovery_tests {
                 health_status: HealthStatus::Healthy,
                 response_delay_ms: 0,
                 fail_rate: 0.0,
+                routed_experts_b64: None,
+                always_emit_routed_experts: false,
             }],
         )
         .await;

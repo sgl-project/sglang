@@ -129,6 +129,96 @@ impl GenerateRoutingView {
     }
 }
 
+/// Classifier output for a failed routing-view parse. Lets the HTTP
+/// entrypoint return a structured 400 with the right error code.
+pub enum ParseErrorKind {
+    /// The bytes weren't even valid JSON (truncated body, garbled
+    /// content-type, etc.). Surface as `json_parse_error`.
+    Json,
+    /// The bytes parsed as JSON but a known SGLang extension field
+    /// (e.g. `return_routed_experts`) had the wrong value type.
+    /// Surface as `invalid_sglang_extension` with the offending field
+    /// named — matches the contract the older `body_raw` design had,
+    /// so a mistyped flag isn't lumped into a generic JSON error.
+    InvalidSglangExtension(&'static str),
+    /// The bytes parsed as JSON but a routing-view field the gateway
+    /// itself reads (e.g. `model: 42`) had the wrong type. This is a
+    /// shape error on a non-extension field, so it stays a
+    /// `json_parse_error`. Kept distinct so future code can choose a
+    /// different code for it without entangling the extension case.
+    InvalidViewField,
+}
+
+/// Inspect the original request bytes and the failing routing-view
+/// parse error, and pick the right [`ParseErrorKind`].
+///
+/// Strategy: re-parse the body as a generic `serde_json::Value`. If
+/// that succeeds, the bytes are valid JSON but a typed field on the
+/// view didn't match — walk the known SGLang extension keys and check
+/// whether one of them is present with the wrong type. If yes, it's
+/// `InvalidSglangExtension(field)`. Otherwise it's a non-extension
+/// shape mismatch (`InvalidViewField`). If the second parse also fails,
+/// the bytes truly aren't JSON: `Json`.
+///
+/// The cost is one extra `from_slice::<Value>` on the failure path —
+/// happy path is unchanged.
+pub fn classify_parse_error<V: ViewSchema>(body: &[u8]) -> ParseErrorKind {
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(body) else {
+        return ParseErrorKind::Json;
+    };
+    let Some(obj) = value.as_object() else {
+        // Top-level wasn't an object — every routing view requires
+        // one. Treat as a shape error on the view, not as malformed
+        // JSON.
+        return ParseErrorKind::InvalidViewField;
+    };
+    for &field in V::EXTENSION_FIELDS {
+        if let Some(slot) = obj.get(field) {
+            if !V::extension_type_matches(field, slot) {
+                return ParseErrorKind::InvalidSglangExtension(field);
+            }
+        }
+    }
+    ParseErrorKind::InvalidViewField
+}
+
+/// Glue trait so `classify_parse_error` can drive both `ChatRoutingView`
+/// and `GenerateRoutingView` without duplicating the field-list /
+/// type-check tables. Each view enumerates the SGLang extension keys it
+/// strictly types and validates a candidate `Value` against the
+/// expected type.
+pub trait ViewSchema {
+    /// SGLang extension keys this view types strictly. A value present
+    /// under one of these names with the wrong JSON type is reported
+    /// as `invalid_sglang_extension` rather than the generic JSON
+    /// parse error.
+    const EXTENSION_FIELDS: &'static [&'static str];
+
+    /// Returns `true` when `value` matches the expected type for
+    /// `field`. `field` is guaranteed to be one of `EXTENSION_FIELDS`.
+    fn extension_type_matches(field: &str, value: &serde_json::Value) -> bool;
+}
+
+impl ViewSchema for ChatRoutingView {
+    const EXTENSION_FIELDS: &'static [&'static str] = &["return_routed_experts"];
+    fn extension_type_matches(field: &str, value: &serde_json::Value) -> bool {
+        match field {
+            "return_routed_experts" => value.is_boolean(),
+            _ => true,
+        }
+    }
+}
+
+impl ViewSchema for GenerateRoutingView {
+    const EXTENSION_FIELDS: &'static [&'static str] = &["return_routed_experts"];
+    fn extension_type_matches(field: &str, value: &serde_json::Value) -> bool {
+        match field {
+            "return_routed_experts" => value.is_boolean(),
+            _ => true,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

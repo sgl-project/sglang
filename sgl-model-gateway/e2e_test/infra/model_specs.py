@@ -91,6 +91,26 @@ MODEL_SPECS: dict[str, dict] = {
         "tp": 2,
         "features": ["chat", "streaming", "reasoning", "harmony"],
     },
+    # DeepSeek-V2-Lite — small MoE (64 routed experts, top-6) used for
+    # `return_routed_experts` e2e verification. The two flags it needs:
+    # `--trust-remote-code` (custom modeling code in the HF repo) and
+    # `--enable-return-routed-experts` (the SGLang server-side feature
+    # gate; without it the response carries no `routed_experts` even
+    # when the request asks for it).
+    "dsv2-lite": {
+        "model": _resolve_model_path("deepseek-ai/DeepSeek-V2-Lite"),
+        "memory_gb": 32,
+        "tp": 1,
+        "worker_args": [
+            "--trust-remote-code",
+            "--enable-return-routed-experts",
+            # CUDA-graph capture trips the apply_rope_inplace kernel on
+            # sglang 0.5.10rc0 + V2-Lite + this container; eager mode
+            # avoids the capture entirely. Slower but startup-stable.
+            "--disable-cuda-graph",
+        ],
+        "features": ["chat", "streaming"],
+    },
 }
 
 

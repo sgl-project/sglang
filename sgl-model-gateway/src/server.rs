@@ -53,7 +53,9 @@ use crate::{
     },
     routers::{
         conversations,
-        http::routing_view::{ChatRoutingView, GenerateRoutingView},
+        http::routing_view::{
+            classify_parse_error, ChatRoutingView, GenerateRoutingView, ParseErrorKind,
+        },
         mesh::{
             get_app_config, get_cluster_status, get_global_rate_limit, get_global_rate_limit_stats,
             get_mesh_health, get_policy_state, get_policy_states, get_worker_state,
@@ -190,17 +192,41 @@ async fn read_body_bytes(request: Request) -> Result<Bytes, Response> {
 }
 
 fn json_parse_error(message: String) -> Response {
+    bad_request_with_code(message, "json_parse_error")
+}
+
+fn bad_request_with_code(message: String, code: &'static str) -> Response {
     (
         StatusCode::BAD_REQUEST,
         Json(json!({
             "error": {
                 "message": message,
                 "type": "invalid_request_error",
-                "code": "json_parse_error"
+                "code": code,
             }
         })),
     )
         .into_response()
+}
+
+/// Convert a failed routing-view parse into a structured 400. Promotes
+/// known-extension type mismatches (e.g. `return_routed_experts: "yes"`)
+/// to `invalid_sglang_extension` instead of folding them into the
+/// generic `json_parse_error`. Mirrors the contract the older `body_raw`
+/// design exposed via `parse_sglang_extensions`.
+fn view_parse_error<V: crate::routers::http::routing_view::ViewSchema>(
+    body: &Bytes,
+    err: serde_json::Error,
+) -> Response {
+    match classify_parse_error::<V>(body) {
+        ParseErrorKind::InvalidSglangExtension(field) => bad_request_with_code(
+            format!("Invalid SGLang extension field `{field}`: {err}"),
+            "invalid_sglang_extension",
+        ),
+        ParseErrorKind::Json | ParseErrorKind::InvalidViewField => {
+            json_parse_error(format!("Invalid JSON data: {err}"))
+        }
+    }
 }
 
 async fn generate(
@@ -218,7 +244,7 @@ async fn generate(
     };
     let view: GenerateRoutingView = match serde_json::from_slice(&body) {
         Ok(v) => v,
-        Err(e) => return json_parse_error(format!("Invalid JSON data: {}", e)),
+        Err(e) => return view_parse_error::<GenerateRoutingView>(&body, e),
     };
     state.router.route_generate(Some(&headers), &view, &body).await
 }
@@ -238,7 +264,7 @@ async fn v1_chat_completions(
     };
     let view: ChatRoutingView = match serde_json::from_slice(&body) {
         Ok(v) => v,
-        Err(e) => return json_parse_error(format!("Invalid JSON data: {}", e)),
+        Err(e) => return view_parse_error::<ChatRoutingView>(&body, e),
     };
     state.router.route_chat(Some(&headers), &view, &body).await
 }

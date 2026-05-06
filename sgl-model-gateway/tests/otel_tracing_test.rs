@@ -112,6 +112,8 @@ async fn test_router_with_tracing() {
         health_status: HealthStatus::Healthy,
         response_delay_ms: 0,
         fail_rate: 0.0,
+        routed_experts_b64: None,
+        always_emit_routed_experts: false,
     });
 
     let worker_url = mock_worker.start().await.unwrap();
