@@ -6503,6 +6503,7 @@ def _blocked_live_token_to_kv_pool_index_read_result_for_smoke(
         {
             "event_type": "relaykv_live_token_to_kv_pool_index_read_result",
             "resolution_state": "blocked",
+            "read_state": "blocked",
             "adapter_mode": "live_token_to_kv_pool_bounded_index_read",
             "source": (
                 "req_to_token_resolution_result_to_"
@@ -6556,6 +6557,131 @@ def _blocked_live_token_to_kv_pool_index_read_result_for_smoke(
     return blocked_result
 
 
+def _relaykv_token_to_kv_pool_source_for_smoke(
+    *,
+    forward_batch: Any = None,
+    model_runner: Any = None,
+) -> tuple[Any, str | None, bool]:
+    token_to_kv_pool = None
+    token_to_kv_pool_path = None
+    token_to_kv_pool_lookup_error = False
+
+    try:
+        token_to_kv_pool = getattr(model_runner, "token_to_kv_pool", None)
+    except Exception:
+        token_to_kv_pool = None
+        token_to_kv_pool_lookup_error = True
+        token_to_kv_pool_path = "model_runner.token_to_kv_pool"
+    else:
+        if token_to_kv_pool is not None:
+            token_to_kv_pool_path = "model_runner.token_to_kv_pool"
+
+    if token_to_kv_pool is None and token_to_kv_pool_lookup_error is not True:
+        try:
+            allocator = getattr(model_runner, "token_to_kv_pool_allocator", None)
+        except Exception:
+            allocator = None
+        if allocator is not None:
+            try:
+                nested_token_to_kv_pool = getattr(allocator, "token_to_kv_pool", None)
+            except Exception:
+                token_to_kv_pool = None
+                token_to_kv_pool_lookup_error = True
+                token_to_kv_pool_path = (
+                    "model_runner.token_to_kv_pool_allocator.token_to_kv_pool"
+                )
+            else:
+                if nested_token_to_kv_pool is not None:
+                    token_to_kv_pool = nested_token_to_kv_pool
+                    token_to_kv_pool_path = (
+                        "model_runner.token_to_kv_pool_allocator.token_to_kv_pool"
+                    )
+                else:
+                    token_to_kv_pool = allocator
+                    token_to_kv_pool_path = "model_runner.token_to_kv_pool_allocator"
+
+    if token_to_kv_pool is None and token_to_kv_pool_lookup_error is not True:
+        try:
+            allocator = getattr(model_runner, "kv_pool_allocator", None)
+        except Exception:
+            allocator = None
+        if allocator is not None:
+            try:
+                token_to_kv_pool = getattr(allocator, "token_to_kv_pool", None)
+            except Exception:
+                token_to_kv_pool = None
+                token_to_kv_pool_lookup_error = True
+                token_to_kv_pool_path = (
+                    "model_runner.kv_pool_allocator.token_to_kv_pool"
+                )
+            else:
+                if token_to_kv_pool is not None:
+                    token_to_kv_pool_path = (
+                        "model_runner.kv_pool_allocator.token_to_kv_pool"
+                    )
+
+    if token_to_kv_pool is None and token_to_kv_pool_lookup_error is not True:
+        try:
+            memory_pool = getattr(model_runner, "memory_pool", None)
+        except Exception:
+            memory_pool = None
+        if memory_pool is not None:
+            try:
+                token_to_kv_pool = getattr(memory_pool, "token_to_kv_pool", None)
+            except Exception:
+                token_to_kv_pool = None
+                token_to_kv_pool_lookup_error = True
+                token_to_kv_pool_path = "model_runner.memory_pool.token_to_kv_pool"
+            else:
+                if token_to_kv_pool is not None:
+                    token_to_kv_pool_path = "model_runner.memory_pool.token_to_kv_pool"
+
+    if (
+        token_to_kv_pool is None
+        and token_to_kv_pool_lookup_error is not True
+        and forward_batch is not None
+    ):
+        try:
+            token_to_kv_pool = getattr(forward_batch, "token_to_kv_pool", None)
+        except Exception:
+            token_to_kv_pool = None
+            token_to_kv_pool_lookup_error = True
+            token_to_kv_pool_path = "forward_batch.token_to_kv_pool"
+        else:
+            if token_to_kv_pool is not None:
+                token_to_kv_pool_path = "forward_batch.token_to_kv_pool"
+
+    if (
+        token_to_kv_pool is None
+        and token_to_kv_pool_lookup_error is not True
+        and forward_batch is not None
+    ):
+        try:
+            allocator = getattr(forward_batch, "token_to_kv_pool_allocator", None)
+        except Exception:
+            allocator = None
+        if allocator is not None:
+            try:
+                nested_token_to_kv_pool = getattr(allocator, "token_to_kv_pool", None)
+            except Exception:
+                token_to_kv_pool = None
+                token_to_kv_pool_lookup_error = True
+                token_to_kv_pool_path = (
+                    "forward_batch.token_to_kv_pool_allocator.token_to_kv_pool"
+                )
+            else:
+                if nested_token_to_kv_pool is not None:
+                    token_to_kv_pool = nested_token_to_kv_pool
+                    token_to_kv_pool_path = (
+                        "forward_batch.token_to_kv_pool_allocator.token_to_kv_pool"
+                    )
+                else:
+                    token_to_kv_pool = allocator
+                    token_to_kv_pool_path = "forward_batch.token_to_kv_pool_allocator"
+
+    return token_to_kv_pool, token_to_kv_pool_path, token_to_kv_pool_lookup_error
+
+
 def build_relaykv_live_token_to_kv_pool_index_read_results_for_smoke(
     req_to_token_resolution_results: list[dict[str, Any]]
     | tuple[dict[str, Any], ...],
@@ -6602,11 +6728,21 @@ def build_relaykv_live_token_to_kv_pool_index_read_results_for_smoke(
         if read_token_to_kv_pool_index is not True:
             blocking_reasons.append("live_index_read_not_enabled")
         if read_token_to_kv_pool_index and token_to_kv_pool_object is None:
-            blocking_reasons.append("token_to_kv_pool_object_missing")
+            if _event_value(result, "req_to_token_resolution_bridge_state") == "bridged":
+                blocking_reasons.append(
+                    "token_to_kv_pool_object_missing_after_bridged_req_to_token_payload"
+                )
+            else:
+                blocking_reasons.append("token_to_kv_pool_object_missing")
         elif read_token_to_kv_pool_index and not _token_to_kv_pool_object_is_indexable_for_smoke(
             token_to_kv_pool_object
         ):
-            blocking_reasons.append("token_to_kv_pool_object_not_indexable")
+            if _event_value(result, "req_to_token_resolution_bridge_state") == "bridged":
+                blocking_reasons.append(
+                    "token_to_kv_pool_object_not_indexable_after_bridged_req_to_token_payload"
+                )
+            else:
+                blocking_reasons.append("token_to_kv_pool_object_not_indexable")
         if not isinstance(full_kv_req_to_token_spans, (list, tuple)):
             blocking_reasons.append("req_to_token_entries_missing")
         elif not full_kv_req_to_token_spans:
@@ -6729,6 +6865,7 @@ def build_relaykv_live_token_to_kv_pool_index_read_results_for_smoke(
             {
                 "event_type": "relaykv_live_token_to_kv_pool_index_read_result",
                 "resolution_state": "physical_kv_index_resolved",
+                "read_state": "resolved",
                 "adapter_mode": "live_token_to_kv_pool_bounded_index_read",
                 "source": (
                     "req_to_token_resolution_result_to_"
@@ -11897,94 +12034,12 @@ def run_model_runner_live_token_to_kv_pool_index_read_hook_for_smoke(
 ) -> dict[str, Any]:
     """Run a guarded live-like token_to_kv_pool index read hook for smoke only."""
 
-    token_to_kv_pool = None
-    token_to_kv_pool_path = None
-    token_to_kv_pool_lookup_error = False
-
-    try:
-        token_to_kv_pool = getattr(model_runner, "token_to_kv_pool", None)
-    except Exception:
-        token_to_kv_pool = None
-        token_to_kv_pool_lookup_error = True
-        token_to_kv_pool_path = "model_runner.token_to_kv_pool"
-    else:
-        if token_to_kv_pool is not None:
-            token_to_kv_pool_path = "model_runner.token_to_kv_pool"
-
-    if token_to_kv_pool is None and token_to_kv_pool_lookup_error is not True:
-        try:
-            allocator = getattr(model_runner, "token_to_kv_pool_allocator", None)
-        except Exception:
-            allocator = None
-        if allocator is not None:
-            try:
-                nested_token_to_kv_pool = getattr(allocator, "token_to_kv_pool", None)
-            except Exception:
-                token_to_kv_pool = None
-                token_to_kv_pool_lookup_error = True
-                token_to_kv_pool_path = (
-                    "model_runner.token_to_kv_pool_allocator.token_to_kv_pool"
-                )
-            else:
-                if nested_token_to_kv_pool is not None:
-                    token_to_kv_pool = nested_token_to_kv_pool
-                    token_to_kv_pool_path = (
-                        "model_runner.token_to_kv_pool_allocator.token_to_kv_pool"
-                    )
-                else:
-                    token_to_kv_pool = allocator
-                    token_to_kv_pool_path = "model_runner.token_to_kv_pool_allocator"
-
-    if token_to_kv_pool is None and token_to_kv_pool_lookup_error is not True:
-        try:
-            allocator = getattr(model_runner, "kv_pool_allocator", None)
-        except Exception:
-            allocator = None
-        if allocator is not None:
-            try:
-                token_to_kv_pool = getattr(allocator, "token_to_kv_pool", None)
-            except Exception:
-                token_to_kv_pool = None
-                token_to_kv_pool_lookup_error = True
-                token_to_kv_pool_path = (
-                    "model_runner.kv_pool_allocator.token_to_kv_pool"
-                )
-            else:
-                if token_to_kv_pool is not None:
-                    token_to_kv_pool_path = (
-                        "model_runner.kv_pool_allocator.token_to_kv_pool"
-                    )
-
-    if token_to_kv_pool is None and token_to_kv_pool_lookup_error is not True:
-        try:
-            memory_pool = getattr(model_runner, "memory_pool", None)
-        except Exception:
-            memory_pool = None
-        if memory_pool is not None:
-            try:
-                token_to_kv_pool = getattr(memory_pool, "token_to_kv_pool", None)
-            except Exception:
-                token_to_kv_pool = None
-                token_to_kv_pool_lookup_error = True
-                token_to_kv_pool_path = "model_runner.memory_pool.token_to_kv_pool"
-            else:
-                if token_to_kv_pool is not None:
-                    token_to_kv_pool_path = "model_runner.memory_pool.token_to_kv_pool"
-
-    if (
-        token_to_kv_pool is None
-        and token_to_kv_pool_lookup_error is not True
-        and forward_batch is not None
-    ):
-        try:
-            token_to_kv_pool = getattr(forward_batch, "token_to_kv_pool", None)
-        except Exception:
-            token_to_kv_pool = None
-            token_to_kv_pool_lookup_error = True
-            token_to_kv_pool_path = "forward_batch.token_to_kv_pool"
-        else:
-            if token_to_kv_pool is not None:
-                token_to_kv_pool_path = "forward_batch.token_to_kv_pool"
+    token_to_kv_pool, token_to_kv_pool_path, token_to_kv_pool_lookup_error = (
+        _relaykv_token_to_kv_pool_source_for_smoke(
+            forward_batch=forward_batch,
+            model_runner=model_runner,
+        )
+    )
 
     req_to_token_resolution_bridge_enabled = (
         os.getenv("SGLANG_RELAYKV_REQ_TO_TOKEN_RESOLUTION_BRIDGE") == "1"
@@ -12021,9 +12076,19 @@ def run_model_runner_live_token_to_kv_pool_index_read_hook_for_smoke(
             "blocked_reason"
         )
         if req_to_token_resolution_bridge_state == "bridged":
-            req_to_token_resolution_results = bridge_result[
-                "req_to_token_resolution_payloads"
-            ]
+            bridged_payloads = bridge_result["req_to_token_resolution_payloads"]
+            req_to_token_resolution_results = []
+            for payload in bridged_payloads:
+                if isinstance(payload, Mapping):
+                    payload_copy = dict(payload)
+                    payload_copy["req_to_token_resolution_bridge_state"] = "bridged"
+                    payload_copy["req_to_token_resolution_bridge_enabled"] = True
+                    payload_copy["req_to_token_resolution_bridge_source_path"] = (
+                        req_to_token_resolution_bridge_source_path
+                    )
+                    req_to_token_resolution_results.append(payload_copy)
+                else:
+                    req_to_token_resolution_results.append(payload)
             req_to_token_resolution_results_path = (
                 req_to_token_resolution_bridge_source_path
             )
@@ -12105,6 +12170,15 @@ def run_model_runner_live_token_to_kv_pool_index_read_hook_for_smoke(
             },
             "engine_block_ref": {},
             "full_kv_req_to_token_spans": None,
+            "req_to_token_resolution_bridge_state": (
+                req_to_token_resolution_bridge_state
+            ),
+            "req_to_token_resolution_bridge_enabled": (
+                req_to_token_resolution_bridge_enabled
+            ),
+            "req_to_token_resolution_bridge_source_path": (
+                req_to_token_resolution_bridge_source_path
+            ),
             "kv_pool_read": False,
             "kv_snapshot": False,
             "tensor_read": False,
@@ -12181,6 +12255,9 @@ def run_model_runner_live_token_to_kv_pool_index_read_hook_for_smoke(
             adapter_metadata["req_to_token_resolution_bridge_blocked_reason"] = (
                 req_to_token_resolution_bridge_blocked_reason
             )
+            adapter_metadata["token_to_kv_pool_lookup_error"] = (
+                token_to_kv_pool_lookup_error
+            )
 
     summary = summarize_relaykv_live_token_to_kv_pool_index_read_results_for_smoke(
         payloads
@@ -12193,6 +12270,8 @@ def run_model_runner_live_token_to_kv_pool_index_read_hook_for_smoke(
         "model_runner.kv_pool_allocator.token_to_kv_pool": 0,
         "model_runner.memory_pool.token_to_kv_pool": 0,
         "forward_batch.token_to_kv_pool": 0,
+        "forward_batch.token_to_kv_pool_allocator.token_to_kv_pool": 0,
+        "forward_batch.token_to_kv_pool_allocator": 0,
     }
     hook_key = token_to_kv_pool_path or "none"
     if hook_key not in summary["hook_path_counts"]:
@@ -12217,6 +12296,18 @@ def run_model_runner_live_token_to_kv_pool_index_read_hook_for_smoke(
     summary["req_to_token_resolution_bridge_blocked_reason"] = (
         req_to_token_resolution_bridge_blocked_reason
     )
+    summary["token_to_kv_pool_source_path"] = token_to_kv_pool_path
+    summary["token_to_kv_pool_lookup_error"] = token_to_kv_pool_lookup_error
+    if (
+        int(summary.get("blocked_count") or 0) > 0
+        and summary.get("blocked_reason") is None
+    ):
+        for payload in payloads:
+            if isinstance(payload, Mapping):
+                blocking_reasons = payload.get("blocking_reasons")
+                if isinstance(blocking_reasons, list) and blocking_reasons:
+                    summary["blocked_reason"] = blocking_reasons[0]
+                    break
 
     return {
         "payloads": payloads,
