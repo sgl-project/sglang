@@ -96,7 +96,6 @@ static inline SparseAttnFwdQ8SM90NewParams _make_common_params(
   params.d_qk = (int)d_qk_val;
   params.d_v = (int)d_v_val;
   params.topk = (int)topk_val;
-  params.sm_scale = (float)sm_scale_val;
   params.sm_scale_div_log2 = (float)sm_scale_val * (float)M_LOG2E;
 
   params.q = reinterpret_cast<const uint8_t*>(q.data_ptr());
@@ -105,8 +104,6 @@ static inline SparseAttnFwdQ8SM90NewParams _make_common_params(
   params.attn_sink = nullptr;
   params.topk_length = nullptr;
 
-  params.q_scale = 0.0f;
-  params.kv_scale = 0.0f;
   params.q_scale_ptr = static_cast<const float*>(q_scale.data_ptr());
   params.kv_scale_ptr = static_cast<const float*>(kv_scale.data_ptr());
 

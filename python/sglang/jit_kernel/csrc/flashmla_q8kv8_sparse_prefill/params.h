@@ -6,7 +6,7 @@
 
 struct SparseAttnFwdQ8SM90NewParams {
   int s_q, s_kv, h_q, h_kv, d_qk, d_v, topk;
-  float sm_scale, sm_scale_div_log2;
+  float sm_scale_div_log2;
 
   const uint8_t* __restrict__ q;
   const uint8_t* __restrict__ kv;
@@ -14,8 +14,6 @@ struct SparseAttnFwdQ8SM90NewParams {
   float* __restrict__ attn_sink;
   int* __restrict__ topk_length;
 
-  float q_scale;
-  float kv_scale;
   const float* __restrict__ q_scale_ptr;
   const float* __restrict__ kv_scale_ptr;
 
