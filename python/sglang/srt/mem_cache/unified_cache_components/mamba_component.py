@@ -347,7 +347,7 @@ class MambaComponent(TreeComponent):
             if cd.value is not None:
                 return None
 
-            # restore single node if host_value exists and
+            # restore single node if host_value exists
             if cd.host_value is not None and cd.value is None:
                 transfers.append(
                     PoolTransfer(
