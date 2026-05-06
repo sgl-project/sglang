@@ -24,7 +24,7 @@ RUN pip install -e /workspace/sglang/python/
 # DeepGEMM depends on at the resolved versions.
 RUN pip uninstall -y deep-gemm deep_gemm 2>/dev/null; \
     cd /tmp && rm -rf DeepGEMM && \
-    git clone https://github.com/sgl-project/DeepGEMM.git -b release && \
+    git clone https://github.com/sgl-project/DeepGEMM.git && \
     cd DeepGEMM && git checkout 7f2a70 && \
     git submodule update --init --recursive && \
     bash install.sh
