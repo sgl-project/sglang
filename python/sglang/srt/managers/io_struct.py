@@ -38,7 +38,7 @@ from sglang.srt.observability.req_time_stats import (
     SchedulerReqTimeStats,
 )
 from sglang.srt.sampling.sampling_params import SamplingParams
-from sglang.srt.utils import ImageData
+from sglang.srt.utils import ImageData, VideoData
 
 # Handle serialization of Image for pydantic
 if TYPE_CHECKING:
@@ -93,8 +93,9 @@ class SpeculativeDecodingMetricsMixin:
     # Verify count: number of verification forward passes
     spec_verify_ct: List[int]
 
-    # Accepted tokens: Number of accepted tokens during speculative decoding
-    spec_accepted_tokens: List[int]
+    # Accepted drafts: Number of accepted draft tokens during speculative decoding
+    # (strict drafts-only count, excludes the bonus token).
+    spec_accepted_drafts: List[int]
 
     # Acceptance histogram: List of lists, where each inner list represents histogram counts.
     # List index = number of accepted tokens in a step, List value = count of steps with that many accepted tokens.
@@ -117,7 +118,7 @@ class SessionParams:
 # Individual data item types for each modality
 ImageDataInputItem = Union[Image, str, ImageData, Dict]
 AudioDataInputItem = Union[str, Dict]
-VideoDataInputItem = Union[str, Dict]
+VideoDataInputItem = Union[str, VideoData, Dict]
 # Union type for any multimodal data item
 MultimodalDataInputItem = Union[
     ImageDataInputItem, VideoDataInputItem, AudioDataInputItem
@@ -176,6 +177,7 @@ class GenerateReqInput(BaseReq):
     return_hidden_states: Union[List[bool], bool] = False
     # Whether to return captured routed experts
     return_routed_experts: bool = False
+    return_indexer_topk: bool = False
     # The start location in the prompt for returning routed experts.
     routed_experts_start_len: int = 0
 
@@ -652,6 +654,7 @@ class GenerateReqInput(BaseReq):
                 else self.return_hidden_states
             ),
             return_routed_experts=self.return_routed_experts,
+            return_indexer_topk=self.return_indexer_topk,
             modalities=self.modalities[i] if self.modalities else None,
             session_params=self.session_params,
             lora_path=self.lora_path[i] if self.lora_path is not None else None,
@@ -729,6 +732,8 @@ class TokenizedGenerateReqInput(BaseReq):
     return_routed_experts: bool = False
     # The start location in the prompt for returning routed experts.
     routed_experts_start_len: int = 0
+
+    return_indexer_topk: bool = False
 
     # The input embeds
     input_embeds: Optional[Union[List[List[List[float]]], List[List[float]]]] = None
@@ -1100,9 +1105,13 @@ class BatchTokenIDOutput(BaseBatchReq, SpeculativeDecodingMetricsMixin):
     # Hidden states
     output_hidden_states: List[List[float]]
 
-    # The routed experts for each token, including both input and output tokens
-    # routed_experts[i] is a tensor of shape (token, layer, top_k) for request i
+    # Per-request routed experts (input + output tokens), shape
+    # (token, layer, top_k). DetokenizerManager encodes to base64 into
+    # BatchStrOutput; on the skip_tokenizer_init path the scheduler sends this
+    # straight to TokenizerManager, which encodes on demand.
     routed_experts: List[Optional[torch.Tensor]]
+
+    indexer_topk: List[Optional[torch.Tensor]]
 
     # The information of placeholder tokens (e.g., image token)
     # idx is the index of the token in the prompt after expansion.
@@ -1162,9 +1171,12 @@ class BatchStrOutput(BaseBatchReq, SpeculativeDecodingMetricsMixin):
     # Hidden states
     output_hidden_states: List[List[float]]
 
-    # The routed experts for each token, including both input and output tokens
-    # routed_experts[i] is a tensor of shape (token, layer, top_k) for request i
-    routed_experts: List[Optional[torch.Tensor]]
+    # Per-request routed experts, base64-encoded by DetokenizerManager off the
+    # tokenizer hot path. Underlying tensor shape is (token, layer, top_k);
+    # see BatchTokenIDOutput.routed_experts.
+    routed_experts: List[Optional[str]]
+
+    indexer_topk: List[Optional[str]]
 
     # The information of placeholder tokens (e.g., image token)
     # idx is the index of the token in the prompt after expansion.
@@ -1915,7 +1927,12 @@ class SpeculativeMetrics:
     """Speculative decoding metrics."""
 
     accept_length: float = field(
-        metadata={"metric": ("gauge", "Avg accepted tokens per step")}
+        metadata={
+            "metric": (
+                "gauge",
+                "Mean acceptance length (accepted drafts + bonus token per forward)",
+            )
+        }
     )
     accept_rate: float = field(
         metadata={"metric": ("gauge", "Speculative acceptance rate")}
@@ -1938,8 +1955,8 @@ class DisaggregationMetrics:
     """PD disaggregation metrics."""
 
     mode: str  # "prefill", "decode", or "null" - not a metric
-    prefill_prealloc_queue_reqs: int = field(
-        default=0, metadata={"metric": ("gauge", "Prefill prealloc queue requests")}
+    prefill_bootstrap_queue_reqs: int = field(
+        default=0, metadata={"metric": ("gauge", "Prefill bootstrap queue requests")}
     )
     prefill_inflight_queue_reqs: int = field(
         default=0, metadata={"metric": ("gauge", "Prefill inflight queue requests")}

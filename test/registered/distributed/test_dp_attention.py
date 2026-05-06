@@ -68,6 +68,38 @@ class TestDPAttentionDP2TP2(
         cls._env_override.__exit__(None, None, None)
 
 
+class TestDPAttentionMixedChunk(
+    CustomTestCase,
+    GSM8KMixin,
+):
+    gsm8k_accuracy_thres = 0.6
+
+    @classmethod
+    def setUpClass(cls):
+        cls.model = DEFAULT_MLA_MODEL_NAME_FOR_TEST
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=[
+                "--trust-remote-code",
+                "--tp",
+                "2",
+                "--enable-dp-attention",
+                "--dp",
+                "2",
+                "--enable-mixed-chunk",
+                "--chunked-prefill-size",
+                "256",
+            ],
+        )
+
+    @classmethod
+    def tearDownClass(cls):
+        kill_process_tree(cls.process.pid)
+
+
 class TestDPRetract(
     CustomTestCase,
     JSONConstrainedMixin,

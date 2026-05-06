@@ -633,6 +633,20 @@ class GroupCoordinator:
             inplace_all_reduce(input_, group_name=self.unique_name)
             return input_
 
+    def quant_all_reduce(self, input_: torch.Tensor) -> torch.Tensor:
+        """
+        User-facing quant-all-reduce function similar to all-reduce. (NPU support only)
+        """
+        # Bypass the function if we are using only 1 GPU.
+        if self.world_size == 1:
+            return input_
+
+        if self.npu_communicator is not None and not self.npu_communicator.disabled:
+            return self.npu_communicator.quant_all_reduce(input_)
+        else:
+            inplace_all_reduce(input_, group_name=self.unique_name)
+            return input_
+
     def fused_allreduce_rmsnorm(
         self,
         input_: torch.Tensor,
