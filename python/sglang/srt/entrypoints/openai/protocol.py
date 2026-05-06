@@ -694,6 +694,14 @@ class ChatCompletionRequest(BaseModel):
     # Deprecated: use routed_dp_rank instead
     data_parallel_rank: Optional[int] = None
 
+    # Codec binary transport (https://github.com/wdunn001/Codec).
+    # See CompletionRequest.stream_format for the same field on completions.
+    # When set to "msgpack" or "protobuf", chat-specific structure (assistant
+    # role, tool calls, finish_reason struct) is dropped — the response is
+    # raw token IDs only. Clients run their own chat-protocol decoding over
+    # the decoded text if they want it.
+    stream_format: Literal["json", "msgpack", "protobuf"] = "json"
+
     # OpenAI/SGLang default sampling parameters
     _DEFAULT_SAMPLING_PARAMS = {
         "temperature": 1.0,
@@ -707,6 +715,18 @@ class ChatCompletionRequest(BaseModel):
     @classmethod
     def _handle_deprecated_dp_rank(cls, values):
         return _migrate_deprecated_dp_rank(values)
+
+    @model_validator(mode="after")
+    def _validate_stream_format(self) -> "ChatCompletionRequest":
+        if self.stream_format != "json":
+            if self.n > 1:
+                raise ValueError(
+                    f"stream_format='{self.stream_format}' requires n=1. "
+                    "CodecFrame carries no choice index; multiple sequences "
+                    "would be interleaved with no way for the client to demultiplex them."
+                )
+            self.stream = True
+        return self
 
     @model_validator(mode="before")
     @classmethod
