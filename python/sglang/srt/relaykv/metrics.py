@@ -6919,6 +6919,7 @@ def _relaykv_runtime_req_to_token_entries_for_smoke(
 def _relaykv_runtime_req_to_token_blocked_result_for_smoke(
     source_payload: Mapping[str, Any] | None,
     *,
+    production_enabled: bool,
     blocking_reasons: list[str],
     max_tokens_per_request: int,
     max_total_tokens: int,
@@ -6937,7 +6938,7 @@ def _relaykv_runtime_req_to_token_blocked_result_for_smoke(
         payload_adapter_metadata = {}
     payload_adapter_metadata.update(
         {
-            "runtime_req_to_token_payload_production_enabled": False,
+            "runtime_req_to_token_payload_production_enabled": production_enabled,
             "max_tokens_per_request": max_tokens_per_request,
             "max_total_tokens": max_total_tokens,
         }
@@ -7010,6 +7011,7 @@ def build_relaykv_runtime_req_to_token_resolution_payloads_for_smoke(
         return [
             _relaykv_runtime_req_to_token_blocked_result_for_smoke(
                 None,
+                production_enabled=False,
                 blocking_reasons=[
                     "runtime_req_to_token_payload_production_not_enabled"
                 ],
@@ -7022,6 +7024,7 @@ def build_relaykv_runtime_req_to_token_resolution_payloads_for_smoke(
         return [
             _relaykv_runtime_req_to_token_blocked_result_for_smoke(
                 None,
+                production_enabled=True,
                 blocking_reasons=["source_payload_invalid"],
                 max_tokens_per_request=max_tokens_per_request,
                 max_total_tokens=max_total_tokens,
@@ -7032,6 +7035,7 @@ def build_relaykv_runtime_req_to_token_resolution_payloads_for_smoke(
         return [
             _relaykv_runtime_req_to_token_blocked_result_for_smoke(
                 source_payloads[0] if source_payloads else None,
+                production_enabled=True,
                 blocking_reasons=[entries_error],
                 max_tokens_per_request=max_tokens_per_request,
                 max_total_tokens=max_total_tokens,
@@ -7043,6 +7047,7 @@ def build_relaykv_runtime_req_to_token_resolution_payloads_for_smoke(
         return [
             _relaykv_runtime_req_to_token_blocked_result_for_smoke(
                 source_payloads[0] if source_payloads else None,
+                production_enabled=True,
                 blocking_reasons=["max_tokens_per_request_exceeded"],
                 max_tokens_per_request=max_tokens_per_request,
                 max_total_tokens=max_total_tokens,
@@ -7054,6 +7059,7 @@ def build_relaykv_runtime_req_to_token_resolution_payloads_for_smoke(
         return [
             _relaykv_runtime_req_to_token_blocked_result_for_smoke(
                 resolved_source_payloads[0],
+                production_enabled=True,
                 blocking_reasons=["max_total_tokens_exceeded"],
                 max_tokens_per_request=max_tokens_per_request,
                 max_total_tokens=max_total_tokens,
@@ -7067,6 +7073,7 @@ def build_relaykv_runtime_req_to_token_resolution_payloads_for_smoke(
         return [
             _relaykv_runtime_req_to_token_blocked_result_for_smoke(
                 resolved_source_payloads[0],
+                production_enabled=True,
                 blocking_reasons=["source_payload_invalid"],
                 max_tokens_per_request=max_tokens_per_request,
                 max_total_tokens=max_total_tokens,
@@ -7078,6 +7085,7 @@ def build_relaykv_runtime_req_to_token_resolution_payloads_for_smoke(
                 return [
                     _relaykv_runtime_req_to_token_blocked_result_for_smoke(
                         resolved_source_payloads[0],
+                        production_enabled=True,
                         blocking_reasons=["source_payload_invalid"],
                         max_tokens_per_request=max_tokens_per_request,
                         max_total_tokens=max_total_tokens,
@@ -7095,6 +7103,7 @@ def build_relaykv_runtime_req_to_token_resolution_payloads_for_smoke(
             results.append(
                 _relaykv_runtime_req_to_token_blocked_result_for_smoke(
                     None,
+                    production_enabled=True,
                     blocking_reasons=["source_payload_invalid"],
                     max_tokens_per_request=max_tokens_per_request,
                     max_total_tokens=max_total_tokens,
@@ -7227,8 +7236,17 @@ def summarize_relaykv_runtime_req_to_token_resolution_payloads_for_smoke(
         {
             "req_to_token_read_count": 0,
             "actual_req_to_token_pool_read_count": 0,
+            "token_to_kv_pool_read_count": 0,
+            "actual_token_to_kv_pool_read_count": 0,
+            "live_token_to_kv_pool_index_read_count": 0,
             "kv_pool_read_count": 0,
+            "kv_snapshot_count": 0,
             "tensor_read_count": 0,
+            "attention_comparison_executed_count": 0,
+            "attention_override_true_count": 0,
+            "runtime_writeback_true_count": 0,
+            "scheduler_policy_noop_false_count": 0,
+            "kv_cache_mutation_true_count": 0,
             "source_mutated_true_count": 0,
         }
     )
@@ -7244,10 +7262,34 @@ def summarize_relaykv_runtime_req_to_token_resolution_payloads_for_smoke(
             blocked_count += 1
         elif state == "error":
             error_count += 1
-        for key in totals:
+        for key in (
+            "req_to_token_read_count",
+            "actual_req_to_token_pool_read_count",
+            "token_to_kv_pool_read_count",
+            "actual_token_to_kv_pool_read_count",
+            "live_token_to_kv_pool_index_read_count",
+        ):
             value = payload.get(key)
             if isinstance(value, int) and not isinstance(value, bool):
                 totals[key] += value
+        if payload.get("kv_pool_read") is True:
+            totals["kv_pool_read_count"] += 1
+        if payload.get("kv_snapshot") is True:
+            totals["kv_snapshot_count"] += 1
+        if payload.get("tensor_read") is True:
+            totals["tensor_read_count"] += 1
+        if payload.get("attention_comparison_executed") is True:
+            totals["attention_comparison_executed_count"] += 1
+        if payload.get("attention_override") is True:
+            totals["attention_override_true_count"] += 1
+        if payload.get("runtime_writeback") is True:
+            totals["runtime_writeback_true_count"] += 1
+        if payload.get("scheduler_policy_noop") is False:
+            totals["scheduler_policy_noop_false_count"] += 1
+        if payload.get("kv_cache_mutation") is True:
+            totals["kv_cache_mutation_true_count"] += 1
+        if payload.get("source_mutated") is True:
+            totals["source_mutated_true_count"] += 1
 
     return {
         "event_type": (
@@ -7262,6 +7304,172 @@ def summarize_relaykv_runtime_req_to_token_resolution_payloads_for_smoke(
         "max_total_tokens": max_total_tokens,
         **{key: totals[key] for key in sorted(totals)},
     }
+
+
+def _relaykv_runtime_req_to_token_payload_source_for_smoke(
+    *,
+    forward_batch: Any = None,
+    model_runner: Any = None,
+) -> tuple[Any, str | None]:
+    for owner, path in (
+        (forward_batch, "relaykv_runtime_observation_payloads"),
+        (forward_batch, "relaykv_runtime_observation_metadata"),
+        (model_runner, "relaykv_runtime_observation_payloads"),
+    ):
+        if owner is None:
+            continue
+        try:
+            value = getattr(owner, path, None)
+        except Exception:
+            continue
+        if value is None:
+            continue
+        owner_name = "forward_batch" if owner is forward_batch else "model_runner"
+        if isinstance(value, Mapping):
+            return [value], f"{owner_name}.{path}"
+        return value, f"{owner_name}.{path}"
+    return None, None
+
+
+def _relaykv_runtime_kv_index_resolution_plans_for_smoke(
+    *,
+    forward_batch: Any = None,
+    model_runner: Any = None,
+) -> tuple[Any, str | None]:
+    for owner, path in (
+        (forward_batch, "relaykv_kv_index_resolution_plans"),
+        (model_runner, "relaykv_kv_index_resolution_plans"),
+    ):
+        if owner is None:
+            continue
+        try:
+            value = getattr(owner, path, None)
+        except Exception:
+            continue
+        if value is None:
+            continue
+        owner_name = "forward_batch" if owner is forward_batch else "model_runner"
+        if isinstance(value, Mapping):
+            return [value], f"{owner_name}.{path}"
+        return value, f"{owner_name}.{path}"
+    return None, None
+
+
+def _relaykv_runtime_explicit_req_to_token_entries_for_smoke(
+    *,
+    forward_batch: Any = None,
+    model_runner: Any = None,
+) -> tuple[Any, str | None]:
+    for owner, path in (
+        (forward_batch, "relaykv_explicit_req_to_token_entries_for_smoke"),
+        (model_runner, "relaykv_explicit_req_to_token_entries_for_smoke"),
+    ):
+        if owner is None:
+            continue
+        try:
+            value = getattr(owner, path, None)
+        except Exception:
+            continue
+        if value is not None:
+            owner_name = "forward_batch" if owner is forward_batch else "model_runner"
+            return value, f"{owner_name}.{path}"
+    return None, None
+
+
+def run_model_runner_runtime_req_to_token_payload_production_hook_for_smoke(
+    model_runner: Any,
+    forward_batch: Any = None,
+) -> dict[str, Any]:
+    """Run a smoke-only runtime req_to_token payload production hook."""
+
+    runtime_observation_payloads, runtime_observation_source_path = (
+        _relaykv_runtime_req_to_token_payload_source_for_smoke(
+            forward_batch=forward_batch,
+            model_runner=model_runner,
+        )
+    )
+    kv_index_resolution_plans, kv_index_resolution_plan_source_path = (
+        _relaykv_runtime_kv_index_resolution_plans_for_smoke(
+            forward_batch=forward_batch,
+            model_runner=model_runner,
+        )
+    )
+    explicit_req_to_token_entries, explicit_req_to_token_entries_source_path = (
+        _relaykv_runtime_explicit_req_to_token_entries_for_smoke(
+            forward_batch=forward_batch,
+            model_runner=model_runner,
+        )
+    )
+
+    payloads = build_relaykv_runtime_req_to_token_resolution_payloads_for_smoke(
+        runtime_observation_payloads=runtime_observation_payloads,
+        kv_index_resolution_plans=kv_index_resolution_plans,
+        explicit_req_to_token_entries=explicit_req_to_token_entries,
+        production_enabled=True,
+        max_tokens_per_request=256,
+        max_total_tokens=1024,
+    )
+    payload_attached = False
+    payload_attach_target = None
+    relaykv_payload_attr_write_count = 0
+    if any(
+        payload.get("resolution_state") == "req_to_token_resolved"
+        for payload in payloads
+        if isinstance(payload, Mapping)
+    ):
+        for owner, target in (
+            (forward_batch, "forward_batch.relaykv_req_to_token_resolution_payloads"),
+            (model_runner, "model_runner.relaykv_req_to_token_resolution_payloads"),
+        ):
+            if owner is None:
+                continue
+            try:
+                setattr(owner, "relaykv_req_to_token_resolution_payloads", payloads)
+            except Exception:
+                continue
+            payload_attached = True
+            payload_attach_target = target
+            relaykv_payload_attr_write_count = len(payloads)
+            break
+
+    for payload in payloads:
+        if not isinstance(payload, dict):
+            continue
+        adapter_metadata = payload.get("adapter_metadata")
+        if not isinstance(adapter_metadata, dict):
+            adapter_metadata = {}
+            payload["adapter_metadata"] = adapter_metadata
+        adapter_metadata["runtime_observation_payload_source_path"] = (
+            runtime_observation_source_path
+        )
+        adapter_metadata["kv_index_resolution_plan_source_path"] = (
+            kv_index_resolution_plan_source_path
+        )
+        adapter_metadata["explicit_req_to_token_entries_source_path"] = (
+            explicit_req_to_token_entries_source_path
+        )
+        adapter_metadata["payload_attached"] = payload_attached
+        adapter_metadata["payload_attach_target"] = payload_attach_target
+
+    summary = summarize_relaykv_runtime_req_to_token_resolution_payloads_for_smoke(
+        payloads,
+        production_enabled=True,
+        max_tokens_per_request=256,
+        max_total_tokens=1024,
+    )
+    summary["payload_attached"] = payload_attached
+    summary["payload_attach_target"] = payload_attach_target
+    summary["relaykv_payload_attr_write_count"] = relaykv_payload_attr_write_count
+    summary["runtime_observation_payload_source_path"] = (
+        runtime_observation_source_path
+    )
+    summary["kv_index_resolution_plan_source_path"] = (
+        kv_index_resolution_plan_source_path
+    )
+    summary["explicit_req_to_token_entries_source_path"] = (
+        explicit_req_to_token_entries_source_path
+    )
+    return {"payloads": payloads, "summary": summary}
 
 
 def _relaykv_req_to_token_resolution_payload_bridge_source(
