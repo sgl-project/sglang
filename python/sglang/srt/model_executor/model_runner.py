@@ -55,7 +55,12 @@ from sglang.srt.configs import (
 from sglang.srt.configs.device_config import DeviceConfig
 from sglang.srt.configs.linear_attn_model_registry import get_linear_attn_config
 from sglang.srt.configs.load_config import LoadConfig, LoadFormat
-from sglang.srt.configs.model_config import AttentionArch, ModelConfig, ModelImpl
+from sglang.srt.configs.model_config import (
+    AttentionArch,
+    ModelConfig,
+    ModelImpl,
+    get_num_indexer_layers,
+)
 from sglang.srt.configs.update_config import adjust_config_with_unaligned_cpu_tp
 from sglang.srt.constants import GPU_MEMORY_TYPE_WEIGHTS
 from sglang.srt.debug_utils.dumper import dumper
@@ -116,12 +121,6 @@ from sglang.srt.layers.dp_attention import (
     set_is_extend_in_batch,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-from sglang.srt.layers.moe.routed_experts_capturer import (
-    RoutedExpertsCapturer,
-    RoutedExpertsOutput,
-    get_global_experts_capturer,
-    set_global_experts_capturer,
-)
 from sglang.srt.layers.pooler import EmbeddingPoolerOutput
 from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype
 from sglang.srt.layers.sampler import create_sampler
@@ -170,6 +169,17 @@ from sglang.srt.server_args import (
     set_global_server_args_for_scheduler,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.srt.state_capturer.base import TopkCaptureOutput
+from sglang.srt.state_capturer.indexer_topk import (
+    create_indexer_capturer,
+    get_global_indexer_capturer,
+    set_global_indexer_capturer,
+)
+from sglang.srt.state_capturer.routed_experts import (
+    RoutedExpertsCapturer,
+    get_global_experts_capturer,
+    set_global_experts_capturer,
+)
 from sglang.srt.utils import (
     MultiprocessingSerializer,
     broadcast_pyobj,
@@ -305,7 +315,8 @@ class ModelRunnerOutput:
     logits_output: Union[LogitsProcessorOutput, PPProxyTensors]
     can_run_graph: bool
     expert_distribution_metrics: Optional[ExpertDistributionMetrics] = None
-    routed_experts_output: Optional[RoutedExpertsOutput] = None
+    routed_experts_output: Optional[TopkCaptureOutput] = None
+    indexer_topk_output: Optional[TopkCaptureOutput] = None
 
 
 class ModelRunner(ModelRunnerKVCacheMixin):
@@ -750,6 +761,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # Init routed experts capturer
         self.init_routed_experts_capturer()
 
+        self.init_indexer_capturer()
+
         # TODO: Refactor device-specific init branches into platform interface (separate PR).
         # Must be called BEFORE init_device_graphs() so CUDA graph capture
         # runs with aux hidden state capture enabled.
@@ -816,6 +829,33 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 enable=get_global_server_args().enable_return_routed_experts,
                 model_config=self.model_config,
                 num_fused_shared_experts=num_fused_shared_experts,
+                num_tokens=self.max_total_num_tokens + self.page_size,
+                max_running_requests=self.max_running_requests,
+                device=self.device,
+            )
+        )
+
+    def init_indexer_capturer(self):
+        enable = get_global_server_args().enable_return_indexer_topk
+        # Producer wiring is CUDA-only (Indexer.forward_cuda + MLA skip_topk
+        # path); other backends would create a capturer but never feed it.
+        if enable and self.device != "cuda":
+            logger.warning(
+                "indexer-topk capture is CUDA-only; %s backend not yet wired. "
+                "Disabling capturer.",
+                self.device,
+            )
+            set_global_indexer_capturer(None)
+            return
+
+        hf_text_config = self.model_config.hf_text_config
+        num_indexer_layers = get_num_indexer_layers(hf_text_config)
+        index_topk = getattr(hf_text_config, "index_topk", 0)
+        set_global_indexer_capturer(
+            create_indexer_capturer(
+                enable=enable,
+                num_indexer_layers=num_indexer_layers,
+                index_topk=index_topk,
                 num_tokens=self.max_total_num_tokens + self.page_size,
                 max_running_requests=self.max_running_requests,
                 device=self.device,
@@ -2754,8 +2794,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if self.use_ngram_embedding:
             from sglang.srt.layers.n_gram_embedding import NgramEmbedding
 
+            # Sized to mirror req_to_token (indexed by req_pool_idx).
             self.token_table = torch.empty(
-                self.req_to_token_pool.size,
+                self.req_to_token_pool.req_to_token.shape[0],
                 self.model_config.context_len,
                 dtype=torch.int32,
                 device=self.device,
@@ -3219,12 +3260,21 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         output.expert_distribution_metrics = recorder_outputs.get("metrics")
 
         no_copy_to_cpu = not self.server_args.disable_overlap_schedule
-        output.routed_experts_output = get_global_experts_capturer().on_forward_end(
-            forward_batch=forward_batch,
-            can_run_graph=output.can_run_graph,
-            cuda_graph_batch=getattr(self.graph_runner, "bs", None),
-            no_copy_to_cpu=no_copy_to_cpu,
-        )
+        if (experts_capturer := get_global_experts_capturer()) is not None:
+            output.routed_experts_output = experts_capturer.on_forward_end(
+                forward_batch=forward_batch,
+                can_run_graph=output.can_run_graph,
+                cuda_graph_batch=getattr(self.graph_runner, "bs", None),
+                no_copy_to_cpu=no_copy_to_cpu,
+            )
+
+        if (indexer_capturer := get_global_indexer_capturer()) is not None:
+            output.indexer_topk_output = indexer_capturer.on_forward_end(
+                forward_batch=forward_batch,
+                can_run_graph=output.can_run_graph,
+                cuda_graph_batch=getattr(self.graph_runner, "bs", None),
+                no_copy_to_cpu=no_copy_to_cpu,
+            )
 
         if self.eplb_manager is not None:
             self.eplb_manager.on_forward_pass_end()

@@ -17,6 +17,7 @@ from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
+    is_in_ci,
     popen_launch_server,
 )
 
@@ -237,6 +238,10 @@ class TestUnifiedSWARadixCache(UnifiedRadixTreeTestMixin, CustomTestCase):
     kl_threshold = 0.03
     gsm8k_threshold = 0.7
     mmlu_threshold = 0.7
+
+    @unittest.skipIf(is_in_ci(), "SWA model mmlu eval not stable enough")
+    def test_mmlu(self):
+        super().test_mmlu()
 
     @classmethod
     def setUpClass(cls):

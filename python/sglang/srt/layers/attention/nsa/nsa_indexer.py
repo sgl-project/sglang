@@ -16,6 +16,9 @@ from sglang.srt.layers.dp_attention import attn_tp_all_gather_into_tensor
 from sglang.srt.layers.layernorm import LayerNorm
 from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype, is_fp8_fnuz
 from sglang.srt.layers.utils import MultiPlatformOp
+from sglang.srt.state_capturer.indexer_topk import (
+    maybe_capture_indexer_topk,
+)
 from sglang.srt.utils import (
     add_prefix,
     ceil_align,
@@ -1062,6 +1065,19 @@ class Indexer(MultiPlatformOp):
             index_k_scale=k_scale,
         )
 
+    def forward_xpu(
+        self,
+        x: torch.Tensor,
+        q_lora: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        layer_id: int,
+        return_indices: bool = True,
+    ) -> Optional[torch.Tensor]:
+        return self.forward_cuda(
+            x, q_lora, positions, forward_batch, layer_id, return_indices
+        )
+
     def forward_cuda(
         self,
         x: torch.Tensor,
@@ -1108,15 +1124,18 @@ class Indexer(MultiPlatformOp):
 
         # Optimization: fast path when skipping topk computation
         if skip_logits_computation and (not self.nsa_enable_prefill_cp):
-            return self._forward_cuda_k_only(
-                x,
-                positions,
-                forward_batch,
+            return maybe_capture_indexer_topk(
                 layer_id,
-                act_quant,
-                enable_dual_stream,
-                metadata,
-                return_indices,
+                self._forward_cuda_k_only(
+                    x,
+                    positions,
+                    forward_batch,
+                    layer_id,
+                    act_quant,
+                    enable_dual_stream,
+                    metadata,
+                    return_indices,
+                ),
             )
 
         if enable_dual_stream and forward_batch.forward_mode.is_decode_or_idle():
@@ -1214,11 +1233,14 @@ class Indexer(MultiPlatformOp):
                 #     print(
                 #         "HACK: seq_lens empty but x not empty, hackily return all-invalid topk_result"
                 #     )
-                return torch.full(
-                    (x_meta.shape[0], self.index_topk),
-                    -1,
-                    dtype=torch.int,
-                    device=x_meta.device,
+                return maybe_capture_indexer_topk(
+                    layer_id,
+                    torch.full(
+                        (x_meta.shape[0], self.index_topk),
+                        -1,
+                        dtype=torch.int,
+                        device=x_meta.device,
+                    ),
                 )
 
             if (
@@ -1268,7 +1290,10 @@ class Indexer(MultiPlatformOp):
                         kv_len_next,
                         actual_seq_q_next,
                     )
-                    return torch.cat([topk_result_prev, topk_result_next], dim=0)
+                    return maybe_capture_indexer_topk(
+                        layer_id,
+                        torch.cat([topk_result_prev, topk_result_next], dim=0),
+                    )
                 else:
                     topk_result = self._get_topk_ragged(
                         enable_dual_stream,
@@ -1286,7 +1311,7 @@ class Indexer(MultiPlatformOp):
                 topk=self.index_topk,
                 layer_id=layer_id,
             )
-        return topk_result
+        return maybe_capture_indexer_topk(layer_id, topk_result)
 
     def forward_npu(
         self,

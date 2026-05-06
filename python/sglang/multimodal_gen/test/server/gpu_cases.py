@@ -4,6 +4,7 @@ from sglang.multimodal_gen.test.server.testcase_configs import (
     MODELOPT_FLUX1_NVFP4_TRANSFORMER,
     MODELOPT_FLUX2_FP8_TRANSFORMER,
     MODELOPT_FLUX2_NVFP4_WEIGHTS,
+    MODELOPT_HUNYUANVIDEO_FP8_TRANSFORMER,
     MODELOPT_NVFP4_B200_ENV_VARS,
     MODELOPT_QWEN_IMAGE_EDIT_FP8_TRANSFORMER,
     MODELOPT_QWEN_IMAGE_FP8_TRANSFORMER,
@@ -402,6 +403,18 @@ else:
             modality="video",
             sampling_params=MODELOPT_T2V_CI_sampling_params,
             extras=["--transformer-path", MODELOPT_WAN22_FP8_TRANSFORMER],
+        ),
+        _make_modelopt_ci_case(
+            "hunyuanvideo_modelopt_fp8_t2v",
+            model_path="hunyuanvideo-community/HunyuanVideo",
+            modality="video",
+            sampling_params=MODELOPT_T2V_CI_sampling_params,
+            extras=[
+                "--transformer-path",
+                MODELOPT_HUNYUANVIDEO_FP8_TRANSFORMER,
+                "--text-encoder-cpu-offload",
+                "--pin-cpu-memory",
+            ],
         ),
         _make_modelopt_ci_case(
             "qwen_image_modelopt_fp8_t2i",
