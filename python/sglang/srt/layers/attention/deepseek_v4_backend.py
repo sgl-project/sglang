@@ -364,6 +364,7 @@ class DeepseekV4AttnBackend(
             DSV4RawVerifyMetadata,
             DSV4RawDecodeMetadata,
         ] = None
+        self._replay_forward_batch: Optional[ForwardBatch] = None  # FIXME: out-of-band
 
     def _move_to_device(self, x: List[int]) -> torch.Tensor:
         pin_tensor = torch.tensor(x, dtype=torch.int32, pin_memory=True)
@@ -775,10 +776,13 @@ class DeepseekV4AttnBackend(
         forward_mode: ForwardMode,
         spec_info: Optional[SpecInput],
         seq_lens_cpu: Optional[torch.Tensor],
-        out_cache_loc: Optional[torch.Tensor] = None,
-        actual_forward_mode: Optional[ForwardMode] = None,
     ) -> None:
         bucket = _GraphBucket.of(forward_mode)
+
+        # FIXME: see cuda_graph_runner — this attribute is set out-of-band.
+        fb = self._replay_forward_batch
+        out_cache_loc = fb.out_cache_loc
+        actual_forward_mode = fb.forward_mode
 
         if actual_forward_mode == ForwardMode.IDLE and envs.SGLANG_FIX_PD_IDLE.get():
             logger.debug(
@@ -1213,6 +1217,7 @@ class DeepseekV4MultiStepBackend(DeepseekV4AttnBackend):
         if self.speculative_num_steps == 1:
             return
 
+        self.attn_backends[0]._replay_forward_batch = forward_batch
         self.attn_backends[0].init_forward_metadata_replay_cuda_graph(
             bs=bs,
             req_pool_indices=forward_batch.req_pool_indices,
@@ -1222,8 +1227,8 @@ class DeepseekV4MultiStepBackend(DeepseekV4AttnBackend):
             forward_mode=ForwardMode.DECODE,
             spec_info=forward_batch.spec_info,
             seq_lens_cpu=forward_batch.seq_lens_cpu,
-            out_cache_loc=forward_batch.out_cache_loc,
         )
+        self.attn_backends[0]._replay_forward_batch = None
         temp_metadata = self.attn_backends[0].forward_metadata
 
         for i in range(1, self.speculative_num_steps - 1):
