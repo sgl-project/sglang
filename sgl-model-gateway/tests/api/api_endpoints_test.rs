@@ -2055,4 +2055,51 @@ mod sglang_extension_tests {
 
         ctx.shutdown().await;
     }
+
+    /// Mirror of `test_unified_chat_streaming_forwards_routed_experts`
+    /// for `/generate`. Pins that the unified router does NOT reject
+    /// streaming + `return_routed_experts` on the SGLang-native
+    /// endpoint either — the streaming-reject (`400`) is a PD-only
+    /// contract because only PD has a merge step. A regression where
+    /// someone copy-pasted the PD streaming-reject into the unified
+    /// `/generate` path would break this test.
+    #[tokio::test]
+    async fn test_unified_generate_streaming_forwards_routed_experts() {
+        let ctx = AppTestContext::new(vec![MockWorkerConfig {
+            port: 18127,
+            ..MockWorkerConfig::default()
+        }])
+        .await;
+        let app = ctx.create_app().await;
+
+        let payload = json!({
+            "text": "hi",
+            "return_routed_experts": true,
+            "stream": true,
+        });
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/generate")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_string(&payload).unwrap()))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "unified /generate streaming + return_routed_experts must not be rejected"
+        );
+
+        let received = &ctx.workers[0].recorded_requests()[0];
+        assert_eq!(
+            received.get("return_routed_experts"),
+            Some(&json!(true)),
+            "the streaming setup must still forward the flag to the backend"
+        );
+        assert_eq!(received.get("stream"), Some(&json!(true)));
+
+        ctx.shutdown().await;
+    }
 }
