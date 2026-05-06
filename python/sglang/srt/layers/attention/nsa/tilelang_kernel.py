@@ -1,4 +1,5 @@
 import functools
+import os
 from functools import lru_cache
 from typing import Any, Optional, Tuple
 
@@ -55,6 +56,14 @@ INT32 = "int32"
 UINT8 = "uint8"
 
 
+def _debug_dsv4_attn_enabled() -> bool:
+    return os.environ.get("SGLANG_DEBUG_DSV4_ATTN", "0") == "1" and (
+        not torch.distributed.is_available()
+        or not torch.distributed.is_initialized()
+        or torch.distributed.get_rank() == 0
+    )
+
+
 def fast_log2_ceil(x):
     bits_x = T.reinterpret("uint32", x)
     exp_x = (bits_x >> 23) & 0xFF
@@ -78,9 +87,10 @@ def _pick_inner_iter(seq: int, ni: int, cu: int, block_per_cu: int) -> int:
     enough work per CU (seq * ni / inner_iter / cu >= block_per_cu), so we avoid
     under-utilization while minimizing the number of partial groups.
     """
+    # 16384, 2, 256, 2
 
-    max_it = int(seq * ni / (cu * block_per_cu))
-    it = ni
+    max_it = int(seq * ni / (cu * block_per_cu)) # 16384 * 2/(256*2) = 64
+    it = ni # 2
     while it >= 2:
         if it <= max_it and ni % it == 0:
             return it
@@ -1540,8 +1550,8 @@ def _build_fp8_combined_view(k_cache: torch.Tensor) -> Tuple[torch.Tensor, int, 
             stride. Same storage ashe input, no copy.
     """
     k_u8 = k_cache.view(torch.uint8) if k_cache.dtype != torch.uint8 else k_cache
-    num_blocks = k_u8.shape[0]
-    block_size = k_u8.shape[1]
+    num_blocks = k_u8.shape[0] 
+    block_size = k_u8.shape[1] # 128
     block_pad_u32 = k_u8.stride(0) // 4
     storage = k_u8.untyped_storage()
     flat_u32 = torch.empty(0, dtype=torch.uint32, device=k_u8.device).set_(
@@ -1580,20 +1590,20 @@ def _topk_length_sentinel(device: torch.device, batch: int) -> torch.Tensor:
     },
 )
 def dpsk_v4_fp8_partial_kernel(
-    num_heads: int,
-    topk1: int,
-    block_size_kv_1: int,
-    topk2: int = 0,
-    block_size_kv_2: int = 0,
+    num_heads: int, # 128
+    topk1: int, # 128
+    block_size_kv_1: int, # 128
+    topk2: int = 0, # 512||64
+    block_size_kv_2: int = 0, 
     *,
     dim: int = 448,
     tail_dim: int = 64,
     sm_scale: float = 0.0,
-    block_I: int = 64,
-    inner_iter: int = 1,
-    inner_iter_2: int = 0,
-    num_stages: int = 0,
-    threads: int = 512,
+    block_I: int = 64,# 64
+    inner_iter: int = 1, # 2
+    inner_iter_2: int = 0, # 8||1
+    num_stages: int = 0, # 2
+    threads: int = 512, # 512
 ) -> Any:
     """
     Read FP8 K cache directly, dequantise to BF16 in-kernel, do flash-attn
@@ -1606,13 +1616,13 @@ def dpsk_v4_fp8_partial_kernel(
     else:
         sm_scale = sm_scale * log2e
     assert dim == 448 and tail_dim == 64
-    assert topk1 % block_I == 0
+    assert topk1 % block_I == 0 # 128 % 64
     assert (
-        topk1 // block_I
-    ) % inner_iter == 0, (
+        topk1 // block_I # 128 // 64
+    ) % inner_iter == 0, ( # 2
         f"NI_1={topk1 // block_I} must be divisible by inner_iter={inner_iter}"
     )
-    assert block_size_kv_1 > 0 and (block_size_kv_1 & (block_size_kv_1 - 1)) == 0
+    assert block_size_kv_1 > 0 and (block_size_kv_1 & (block_size_kv_1 - 1)) == 0 # 2 的平方.
 
     is_dual = topk2 > 0
     if is_dual:
@@ -1625,12 +1635,12 @@ def dpsk_v4_fp8_partial_kernel(
         )
         assert block_size_kv_2 > 0 and (block_size_kv_2 & (block_size_kv_2 - 1)) == 0
 
-    PACKED_W = dim + 2 * tail_dim
+    PACKED_W = dim + 2 * tail_dim # 448 + 2 * 64 = 576
     NOPE_TILE = 64
-    NUM_TILES = dim // NOPE_TILE
+    NUM_TILES = dim // NOPE_TILE # 7 = 448 / 64 
     SCALE_W = 8
-    PACKED_W4 = PACKED_W // 4
-    SCALE_W4 = SCALE_W // 4
+    PACKED_W4 = PACKED_W // 4 # 576 // 4 = 144
+    SCALE_W4 = SCALE_W // 4 # 2
 
     kv_group = 1
     batch = T.symbolic("batch")
@@ -1648,14 +1658,14 @@ def dpsk_v4_fp8_partial_kernel(
     padded_H = max(tilelang.math.next_power_of_2(head_kv), 16)
     if head_kv > 64:
         assert head_kv % 64 == 0
-    REPLICATE_H = (head_kv + 63) // 64 if head_kv > 64 else 1
+    REPLICATE_H = (head_kv + 63) // 64 if head_kv > 64 else 1 # 2
     H_per_block = 64 if REPLICATE_H > 1 else padded_H
 
-    NI_1 = topk1 // BI
-    n_groups_1 = NI_1 // inner_iter
-    NI_2 = (topk2 // BI) if is_dual else 0
-    n_groups_2 = (NI_2 // inner_iter_2) if is_dual else 0
-    n_groups = n_groups_1 + n_groups_2
+    NI_1 = topk1 // BI # 2 = 128 // 64
+    n_groups_1 = NI_1 // inner_iter # 1 = 2 // 2
+    NI_2 = (topk2 // BI) if is_dual else 0 # 8||1 = 512||64 // 64
+    n_groups_2 = (NI_2 // inner_iter_2) if is_dual else 0 # 1 8||8
+    n_groups = n_groups_1 + n_groups_2 # 2 = 1 + 1
 
     BS_KV_1 = block_size_kv_1
     NOPE_ROPE_U32_PER_BLOCK_1 = BS_KV_1 * PACKED_W4
@@ -1700,7 +1710,7 @@ def dpsk_v4_fp8_partial_kernel(
             ) as (bx, by, bz):
                 Q_shared = T.alloc_fragment([H_per_block, D], BF16)
                 Q_tail_shared = T.alloc_fragment([H_per_block, D_tail], BF16)
-                K_packed_shared = T.alloc_shared([BI, PACKED_W4], "uint32")
+                K_packed_shared = T.alloc_shared([BI, PACKED_W4], "uint32") # 64, 144
                 K_scale_shared = T.alloc_shared([BI, SCALE_W4], "uint32")
                 KV_shared = T.alloc_shared([BI, D], BF16)
                 K_tail_shared = T.alloc_shared([BI, D_tail], BF16)
@@ -1724,42 +1734,44 @@ def dpsk_v4_fp8_partial_kernel(
                 T.fill(sumexp, 0)
                 T.fill(m_i, -(2**30))
 
+                # b_i__0_8191, g_i__0_0
                 b_i, g_i = by, bz
                 # bx encodes (s_i, h_replicate, group_i).
-                spans_per_seq = REPLICATE_H * n_groups
-                s_i = bx // spans_per_seq
-                rest = bx % spans_per_seq
+                spans_per_seq = REPLICATE_H * n_groups  # 4 = 2 * 2 
+                s_i = bx // spans_per_seq # seq_len 维度
+                rest = bx % spans_per_seq # (h_rep, group_i)
                 group_i = rest // REPLICATE_H
                 h_rep = rest % REPLICATE_H
-                H0 = g_i * padded_H + (0 if REPLICATE_H == 1 else h_rep * 64)
+                # (s_i__0_0, group_i__0_1, h_rep__0_1) = bx
+                H0 = g_i * padded_H + (0 if REPLICATE_H == 1 else h_rep * 64) # 0/64 同一个kv cache段内的偏移. 哪个head对吧.
                 H1 = H0 + H_per_block
 
-                T.copy(Q[b_i, s_i, H0:H1, :D], Q_shared)
-                T.copy(Q[b_i, s_i, H0:H1, D : D + D_tail], Q_tail_shared)
+                T.copy(Q[b_i, s_i, H0:H1, :D], Q_shared) # NoPE: [64, 448]
+                T.copy(Q[b_i, s_i, H0:H1, D : D + D_tail], Q_tail_shared) # RoPE: [64,64]
 
-                tk_len_1 = Topk_length_1[b_i]
+                tk_len_1 = Topk_length_1[b_i] # 读这个batch实际的topk长度.
                 tk_len_2 = Topk_length_2[b_i]
 
                 # Phase 1 (groups [0, n_groups_1)).
-                if group_i < n_groups_1:
-                    for k_i in T.Pipelined(inner_iter, num_stages=num_stages):
-                        iter_i = group_i * inner_iter + k_i
-                        for bi_i in T.Parallel(BI):
+                if group_i < n_groups_1: # SWA
+                    for k_i in T.Pipelined(inner_iter, num_stages=num_stages): # 2 
+                        iter_i = group_i * inner_iter + k_i # tile编号. 128个位置，选择[0:63] 或者 [64:127]
+                        for bi_i in T.Parallel(BI): # 64
                             pos = iter_i * BI + bi_i
-                            idx = Indices_1[b_i, s_i, pos]
+                            idx = Indices_1[b_i, s_i, pos] # SWA indices.
                             valid = (idx >= 0) & (pos < tk_len_1)
                             page_idx_shared[bi_i] = T.if_then_else(valid, idx, 0)
                             mask[bi_i] = valid
 
-                        for bi_i, w_i in T.Parallel(BI, PACKED_W4):
+                        for bi_i, w_i in T.Parallel(BI, PACKED_W4): # 64, 144
                             page = page_idx_shared[bi_i]
-                            block_id = page // BS_KV_1
+                            block_id = page // BS_KV_1 # page // 128
                             t_in_block = page % BS_KV_1
-                            K_packed_shared[bi_i, w_i] = K_combined_1[
+                            K_packed_shared[bi_i, w_i] = K_combined_1[ # s[64, 144] = K[] 每个token是packed_w4长度. ok 这个没问题.
                                 block_id, t_in_block * PACKED_W4 + w_i
                             ]
 
-                        for bi_i, w_i in T.Parallel(BI, SCALE_W4):
+                        for bi_i, w_i in T.Parallel(BI, SCALE_W4): # 64, 2
                             page = page_idx_shared[bi_i]
                             block_id = page // BS_KV_1
                             t_in_block = page % BS_KV_1
@@ -1768,15 +1780,15 @@ def dpsk_v4_fp8_partial_kernel(
                                 NOPE_ROPE_U32_PER_BLOCK_1 + t_in_block * SCALE_W4 + w_i,
                             ]
 
-                        for bi_i, ti in T.Parallel(BI, NUM_TILES):
+                        for bi_i, ti in T.Parallel(BI, NUM_TILES): # 64, 7
                             word_idx = ti // 4
                             byte_in_word = ti % 4
-                            word = K_scale_shared[bi_i, word_idx]
+                            word = K_scale_shared[bi_i, word_idx] # 每个kv 2 uint32.
                             scale_byte_local[bi_i, ti] = (
                                 word >> T.Cast("uint32", byte_in_word * 8)
                             ) & T.uint32(0xFF)
 
-                        for bi_i, d_i in T.Parallel(BI, D):
+                        for bi_i, d_i in T.Parallel(BI, D): # 64, 448
                             word_idx = d_i // 4
                             byte_in_word = d_i % 4
                             word = K_packed_shared[bi_i, word_idx]
@@ -1813,38 +1825,38 @@ def dpsk_v4_fp8_partial_kernel(
                             acc_s[h_i, bi_i] = T.if_then_else(
                                 mask[bi_i], 0, -T.infinity(acc_s.dtype)
                             )
-                        T.gemm(
+                        T.gemm( # nope gemm
                             Q_shared,
                             KV_shared,
                             acc_s,
                             transpose_B=True,
                             policy=T.GemmWarpPolicy.FullRow,
                         )
-                        T.gemm(
+                        T.gemm( # rope gemm
                             Q_tail_shared,
                             K_tail_shared,
                             acc_s,
                             transpose_B=True,
                             policy=T.GemmWarpPolicy.FullRow,
                         )
-                        T.copy(m_i, m_i_prev)
-                        T.reduce_max(acc_s, m_i, dim=1, clear=False)
+                        T.copy(m_i, m_i_prev) # 上一次结束时候的 row_max坐下备份
+                        T.reduce_max(acc_s, m_i, dim=1, clear=False) # 当前的 row_max
                         for h_i in T.Parallel(H_per_block):
-                            m_i[h_i] = T.max(m_i[h_i], m_i_prev[h_i])
+                            m_i[h_i] = T.max(m_i[h_i], m_i_prev[h_i]) # 总的最大.
                         for h_i in T.Parallel(H_per_block):
-                            alpha[h_i] = T.exp2((m_i_prev[h_i] - m_i[h_i]) * sm_scale)
+                            alpha[h_i] = T.exp2((m_i_prev[h_i] - m_i[h_i]) * sm_scale) # 剩下的 max.
                         for h_i, bi_i in T.Parallel(H_per_block, BI):
                             acc_s[h_i, bi_i] = T.exp2(
-                                acc_s[h_i, bi_i] * sm_scale - m_i[h_i] * sm_scale
+                                acc_s[h_i, bi_i] * sm_scale - m_i[h_i] * sm_scale # 差值做exp
                             )
-                        T.reduce_sum(acc_s, sumexp_i, dim=1)
+                        T.reduce_sum(acc_s, sumexp_i, dim=1) # sumexp.
                         for h_i in T.Parallel(H_per_block):
-                            sumexp[h_i] = sumexp[h_i] * alpha[h_i] + sumexp_i[h_i]
+                            sumexp[h_i] = sumexp[h_i] * alpha[h_i] + sumexp_i[h_i] # 贡献加到上一个去.
                         for h_i, d_i in T.Parallel(H_per_block, D):
-                            acc_o[h_i, d_i] *= alpha[h_i]
+                            acc_o[h_i, d_i] *= alpha[h_i] # 上一轮按照贡献缩放 acc_o
                         for h_i, d_i in T.Parallel(H_per_block, D_tail):
-                            acc_o_tail[h_i, d_i] *= alpha[h_i]
-                        T.copy(acc_s, S_shared)
+                            acc_o_tail[h_i, d_i] *= alpha[h_i] # 类似.
+                        T.copy(acc_s, S_shared) # 保存一下用来做gemm
                         T.gemm(
                             S_shared, KV_shared, acc_o, policy=T.GemmWarpPolicy.FullRow
                         )
@@ -1853,7 +1865,7 @@ def dpsk_v4_fp8_partial_kernel(
                             K_tail_shared,
                             acc_o_tail,
                             policy=T.GemmWarpPolicy.FullRow,
-                        )
+                        ) # 两次gemm.
                 else:
                     # Phase 2 (groups [n_groups_1, n_groups)).
                     for k_i in T.Pipelined(inner_iter_2, num_stages=num_stages):
@@ -2314,8 +2326,8 @@ with optional second cache (`extra_k_cache`).
 
 
 def dpsk_v4_fp8_attention_fwd(
-    q: torch.Tensor,
-    k_cache: torch.Tensor,
+    q: torch.Tensor, # [B, S, H, D] [8192, 1, 128, 512]
+    k_cache: torch.Tensor, # [8193, 128, 1, 584]
     block_table: Optional[torch.Tensor],
     cache_seqlens: Optional[torch.Tensor],
     head_dim_v: int,
@@ -2324,42 +2336,42 @@ def dpsk_v4_fp8_attention_fwd(
     softmax_scale: Optional[float] = None,
     causal: bool = False,
     is_fp8_kvcache: bool = False,
-    indices: Optional[torch.Tensor] = None,
-    attn_sink: Optional[torch.Tensor] = None,
-    extra_k_cache: Optional[torch.Tensor] = None,
-    extra_indices_in_kvcache: Optional[torch.Tensor] = None,
-    topk_length: Optional[torch.Tensor] = None,
-    extra_topk_length: Optional[torch.Tensor] = None,
+    indices: Optional[torch.Tensor] = None, # [8192, 1, 128]
+    attn_sink: Optional[torch.Tensor] = None, # [128]
+    extra_k_cache: Optional[torch.Tensor] = None, #[1754, 64||2, 1, 584]
+    extra_indices_in_kvcache: Optional[torch.Tensor] = None, # [8192, 1, 512||64]
+    topk_length: Optional[torch.Tensor] = None, # [8192]
+    extra_topk_length: Optional[torch.Tensor] = None, # [8192]
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Follows the original `flash_mla.flash_mla_with_kvcache` signature.
     """
     if _is_gfx95_supported:
         block_I, threads, num_stages, block_per_cu, cu = 64, 512, 0, 2, 256
-    else:
-        block_I, threads, num_stages, block_per_cu, cu = 32, 128, 1, 1, 304
+    # else:
+    #     block_I, threads, num_stages, block_per_cu, cu = 32, 128, 1, 1, 304
 
-    batch, seq_len, num_heads, _ = q.shape
+    batch, seq_len, num_heads, _ = q.shape # [8192, 1, 128]
     # Partial grid is (seq_len * REPLICATE_H * n_groups, batch, kv_group); the
     # heuristic in _pick_inner_iter assumes `total_blocks = seq * ni / inner_iter`,
     # so `seq` must include REPLICATE_H or n_groups doubles for medium batches.
-    replicate_h = max((num_heads + 63) // 64, 1)
-    seq = batch * seq_len * replicate_h
+    replicate_h = max((num_heads + 63) // 64, 1) # 2
+    seq = batch * seq_len * replicate_h # 8192 * 1 * 2 = 16384
 
-    k1, _, bs_kv_1 = _build_fp8_combined_view(k_cache)
-    topk1 = indices.shape[-1]
-    ni_1 = topk1 // block_I
+    k1, _, bs_kv_1 = _build_fp8_combined_view(k_cache) # bs_kv_1 = 128 # k1: compbined_view kvcache.
+    topk1 = indices.shape[-1] # 128
+    ni_1 = topk1 // block_I # 2
     tk_len_1 = (
-        topk_length
+        topk_length # 8192
         if topk_length is not None
-        else _topk_length_sentinel(q.device, batch)
+        else _topk_length_sentinel(q.device, batch) # ?? TODO when?
     )
-    if attn_sink is None:
+    if attn_sink is None: # 128, 这个是干啥的？
         attn_sink = torch.full(
             (num_heads,), float("-inf"), dtype=torch.float32, device=q.device
         )
 
-    has_extra = extra_k_cache is not None
+    has_extra = extra_k_cache is not None # True
     if not has_extra:
         inner_iter_1 = _pick_inner_iter(seq, ni_1, cu, block_per_cu)
         partial = dpsk_v4_fp8_partial_kernel(
@@ -2375,31 +2387,33 @@ def dpsk_v4_fp8_attention_fwd(
         partial_o, partial_lse = partial(q, k1, indices, tk_len_1)
         n_groups = ni_1 // inner_iter_1
     else:
-        k2, _, bs_kv_2 = _build_fp8_combined_view(extra_k_cache)
-        topk2 = extra_indices_in_kvcache.shape[-1]
-        ni_2 = topk2 // block_I
+        k2, _, bs_kv_2 = _build_fp8_combined_view(extra_k_cache) # bs_kv_2 = 64||2
+        topk2 = extra_indices_in_kvcache.shape[-1] # 512||64
+        ni_2 = topk2 // block_I # 8 || 1
         # Each phase picks its own optimal split-K independently — kernel
         # body uses two T.Pipelined loops with separate compile-time iter
         # counts, no shared-divisor constraint.
-        inner_iter_1 = _pick_inner_iter(seq, ni_1, cu, block_per_cu)
-        inner_iter_2 = _pick_inner_iter(seq, ni_2, cu, block_per_cu)
+        # 16384, 8, 256, 2
+        inner_iter_1 = _pick_inner_iter(seq, ni_1, cu, block_per_cu) # 2
+        inner_iter_2 = _pick_inner_iter(seq, ni_2, cu, block_per_cu) # 8 || 1
+
         tk_len_2 = (
             extra_topk_length
             if extra_topk_length is not None
             else _topk_length_sentinel(q.device, batch)
         )
         partial = dpsk_v4_fp8_partial_kernel(
-            num_heads,
-            topk1,
-            bs_kv_1,
-            topk2,
-            bs_kv_2,
+            num_heads, # 128
+            topk1, # 128
+            bs_kv_1, # 128
+            topk2, # 512||64
+            bs_kv_2, # 64||2
             sm_scale=softmax_scale,
-            block_I=block_I,
+            block_I=block_I,# 64
             inner_iter=inner_iter_1,
             inner_iter_2=inner_iter_2,
-            num_stages=num_stages,
-            threads=threads,
+            num_stages=num_stages, # 2
+            threads=threads, # 512
         )
         partial_o, partial_lse = partial(
             q,
@@ -2410,7 +2424,15 @@ def dpsk_v4_fp8_attention_fwd(
             extra_indices_in_kvcache,
             tk_len_2,
         )
-        n_groups = ni_1 // inner_iter_1 + ni_2 // inner_iter_2
+        n_groups = ni_1 // inner_iter_1 + ni_2 // inner_iter_2 # 2 
+
+    if _debug_dsv4_attn_enabled():
+        print(
+            f"[dsv4_attn_plan] q_shape={tuple(q.shape)} {has_extra=} {seq=} {block_I=} {threads=} {topk1=} {ni_1=} {inner_iter_1=} {topk2=} {ni_2=} {inner_iter_2=} {n_groups=} {bs_kv_1=} {bs_kv_2=}",
+            f"{k_cache.shape=}, {indices.shape=}, {attn_sink.shape=}, {extra_k_cache.shape=}, {extra_indices_in_kvcache.shape=}, topk_length={topk_length.shape if topk_length is not None else None},"
+            f"extra_topk_length={extra_topk_length.shape if extra_topk_length is not None else None}, {k1.shape=}, {k2.shape=}, {bs_kv_1=} {bs_kv_2=}",
+            flush=True,
+        )
 
     combine = dpsk_v4_combine_kernel(
         num_heads,
