@@ -109,7 +109,7 @@ class VideoDecoderWrapper:
             if t.device.type == "cpu":
                 try:
                     return t.pin_memory()
-                except Exception:
+                except RuntimeError:
                     return t
             return t
 
