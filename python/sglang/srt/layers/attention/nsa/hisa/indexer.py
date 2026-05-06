@@ -218,18 +218,13 @@ class HisaIndexer(MultiPlatformOp):
         # ---- hisa-specific ----
         self.hisa_k_block_size = hisa_k_block_size
         self.hisa_block_topk = hisa_block_topk
-        # Phase 1: HisaIndexer produces output matching the fast_topk_v2
-        # contract (ks-relative positions for RAGGED, absolute per-request
-        # positions for PAGED decode, -1 padding). The downstream consumer
-        # at nsa_backend.py:1357 must take the *unfused* branch — otherwise
-        # it would treat our output as an already-transformed page_table and
-        # break.
-        if envs.SGLANG_NSA_FUSE_TOPK.get():
-            raise NotImplementedError(
-                "HisaIndexer requires SGLANG_NSA_FUSE_TOPK=0 (unfused topk path). "
-                "The fused-topk path would skip the Python fast_topk_v2 + "
-                "coord_transform bridge that HisaIndexer relies on."
-            )
+        # Both SGLANG_NSA_FUSE_TOPK={0,1} are supported. The dispatch in
+        # `hisa_topk_transform_dispatch` selects between:
+        #   - FUSE_TOPK=0: ks-relative / absolute positions (downstream
+        #     transform_index_page_table_* applies the page-table gather);
+        #   - FUSE_TOPK=1: pre-applied page_table_1 indices (PAGED) or
+        #     `raw_rel + topk_indices_offset` (RAGGED), matching upstream's
+        #     fast_topk_transform_*_fused contracts.
         self.hidden_size = hidden_size
         self.n_heads = index_n_heads
         self.head_dim = index_head_dim
@@ -605,10 +600,9 @@ class HisaIndexer(MultiPlatformOp):
         topk_block_indices = topk_block_indices.squeeze(1)    # [B, block_topk]
 
         # vLLM-patch-style conversion (indexers.py:498-520): radix-select +
-        # gather + mask in a single CUDA kernel. The dispatch picks between
-        # the fused kernel (default), the legacy 2-kernel chain (env override),
-        # and the SGLANG_NSA_FUSE_TOPK=1 path (reserved). PAGED decode uses
-        # ``seq_lens`` for masking; output is absolute per-request K positions.
+        # gather + mask in a single CUDA kernel. PAGED decode uses ``seq_lens``
+        # (passed as ``ke``) for masking; output is absolute per-request K
+        # positions.
         topk_result = hisa_topk_transform_dispatch(
             metadata,
             block_sparse_logits, topk_block_indices,
