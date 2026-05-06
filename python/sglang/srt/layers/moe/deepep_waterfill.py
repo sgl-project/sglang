@@ -420,11 +420,15 @@ class DeepEPWaterfillBalancer:
         )
         return buf
 
-    def _should_use_local_shared_expansion(self, num_tokens: int) -> bool:
-        """Return whether static mode should skip waterfill for small batches."""
+    def _is_low_batch(self, num_tokens: int) -> bool:
+        """Return whether waterfill should skip balancing for small batches."""
+        return num_tokens < self.MIN_BATCH_FOR_BALANCE
+
+    def _can_skip_dispatch_plan_for_low_batch(self, num_tokens: int) -> bool:
+        """Return whether static mode can skip dispatch-plan setup entirely."""
         return (
             self.static_rank_load is not None
-            and num_tokens < self.MIN_BATCH_FOR_BALANCE
+            and self._is_low_batch(num_tokens)
         )
 
     def _build_static_dispatch_plan(self, routed_counts: Tensor) -> WaterfillDispatchPlan:
@@ -515,7 +519,7 @@ class DeepEPWaterfillBalancer:
         if num_tokens == 0:
             return _empty_expanded(topk_ids, topk_weights)
 
-        if self._should_use_local_shared_expansion(num_tokens):
+        if self._is_low_batch(num_tokens):
             return expand_topk_with_shared_expert(
                 topk_ids,
                 topk_weights,
@@ -554,9 +558,10 @@ class DeepEPWaterfillBalancer:
         self, topk_output: StandardTopKOutput, num_tokens: int
     ) -> StandardTopKOutput:
         """Expand topk [N, 8] -> [N, 9] with waterfill-assigned shared expert."""
-        if self._should_use_local_shared_expansion(num_tokens):
-            # Static EPLB low-batch path can use local expansion. Dynamic mode
-            # always all-reduces so decode and extend have the same participation.
+        if self._can_skip_dispatch_plan_for_low_batch(num_tokens):
+            # Static EPLB low-batch path can use local expansion without
+            # communication. Dynamic mode still all-reduces before materializing
+            # local expansion so all ranks participate consistently.
             expanded_ids, expanded_weights = expand_topk_with_shared_expert(
                 topk_output.topk_ids,
                 topk_output.topk_weights,
