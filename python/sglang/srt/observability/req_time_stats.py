@@ -37,6 +37,7 @@ from sglang.srt.observability.trace import (
 from sglang.srt.utils import get_bool_env_var
 
 if TYPE_CHECKING:
+    from sglang.srt.disaggregation.base.conn import KVTransferMetric
     from sglang.srt.managers.schedule_batch import ScheduleBatch
 
 SGLANG_TEST_REQUEST_TIME_STATS = get_bool_env_var("SGLANG_TEST_REQUEST_TIME_STATS")
@@ -842,27 +843,30 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
 
     def compute_and_observe_kv_transfer_metrics(
         self,
-        num_tokens: int,
-        page_size: int,
-        bytes_per_page_all_layers: int,
+        transfer_metric: KVTransferMetric,
     ) -> Optional[dict]:
         """Compute KV transfer metrics and observe them via the metrics collector.
 
         Returns a dict with latency_ms, total_mb, speed_gb_s if computable, else None.
         """
-        from sglang.srt.mem_cache.common import kv_to_page_num
-
         result = {}
+        if transfer_metric.transfer_total_bytes is None:
+            return result if result else None
 
         # Transfer latency, size, and speed
-        if self.prefill_transfer_queue_entry_time > 0 and self.completion_time > 0:
+        if transfer_metric.transfer_latency_s is not None:
+            transfer_latency_s = transfer_metric.transfer_latency_s
+        else:
+            if self.prefill_transfer_queue_entry_time <= 0 or self.completion_time <= 0:
+                return result if result else None
             transfer_latency_s = (
                 self.completion_time - self.prefill_transfer_queue_entry_time
             )
+
+        if transfer_latency_s > 0:
             latency_ms = transfer_latency_s * 1000
 
-            num_pages = kv_to_page_num(num_tokens, page_size)
-            total_bytes = bytes_per_page_all_layers * num_pages
+            total_bytes = transfer_metric.transfer_total_bytes
             total_mb = total_bytes / (1024 * 1024)
             self.transfer_total_mb = total_mb
 
@@ -980,8 +984,12 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
 
     def convert_to_duration(self) -> str:
         if self.disagg_mode == DisaggregationMode.NULL:
-            queue_duration = self.forward_entry_time - self.wait_queue_entry_time
-            forward_duration = self.completion_time - self.forward_entry_time
+            queue_duration = self.duration_between(
+                self.wait_queue_entry_time, self.forward_entry_time
+            )
+            forward_duration = self.duration_between(
+                self.forward_entry_time, self.completion_time
+            )
 
             if SGLANG_TEST_REQUEST_TIME_STATS:
                 assert (
@@ -990,11 +998,15 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
 
             return f"queue_duration={self.format_duration(queue_duration)}, forward_duration={self.format_duration(forward_duration)}, start_time={self.wait_queue_entry_time:.3f}"
         elif self.disagg_mode == DisaggregationMode.PREFILL:
-            bootstrap_queue_duration = (
-                self.wait_queue_entry_time - self.prefill_bootstrap_queue_entry_time
+            bootstrap_queue_duration = self.duration_between(
+                self.prefill_bootstrap_queue_entry_time, self.wait_queue_entry_time
             )
-            queue_duration = self.forward_entry_time - self.wait_queue_entry_time
-            forward_duration = self.completion_time - self.forward_entry_time
+            queue_duration = self.duration_between(
+                self.wait_queue_entry_time, self.forward_entry_time
+            )
+            forward_duration = self.duration_between(
+                self.forward_entry_time, self.completion_time
+            )
 
             if SGLANG_TEST_REQUEST_TIME_STATS:
                 if self.wait_queue_entry_time > 0:
@@ -1006,11 +1018,11 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
 
             # Break down bootstrap_queue_duration into sub-phases
             if self.bootstrap_done_time > 0:
-                bootstrap_duration = (
-                    self.bootstrap_done_time - self.prefill_bootstrap_queue_entry_time
+                bootstrap_duration = self.duration_between(
+                    self.prefill_bootstrap_queue_entry_time, self.bootstrap_done_time
                 )
-                alloc_wait_duration = (
-                    self.wait_queue_entry_time - self.bootstrap_done_time
+                alloc_wait_duration = self.duration_between(
+                    self.bootstrap_done_time, self.wait_queue_entry_time
                 )
                 if SGLANG_TEST_REQUEST_TIME_STATS:
                     assert (
@@ -1034,15 +1046,22 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
                 f"#retries={self.prefill_retry_count}"
             )
         elif self.disagg_mode == DisaggregationMode.DECODE:
-            prealloc_duration = (
-                self.decode_transfer_queue_entry_time
-                - self.decode_prealloc_queue_entry_time
+            prealloc_duration = self.duration_between(
+                self.decode_prealloc_queue_entry_time,
+                self.decode_transfer_queue_entry_time,
             )
-            transfer_duration = (
-                self.wait_queue_entry_time - self.decode_transfer_queue_entry_time
+            transfer_duration = self.duration_between(
+                self.decode_transfer_queue_entry_time,
+                self.wait_queue_entry_time,
             )
-            queue_duration = self.forward_entry_time - self.wait_queue_entry_time
-            forward_duration = self.completion_time - self.forward_entry_time
+            queue_duration = self.duration_between(
+                self.wait_queue_entry_time,
+                self.forward_entry_time,
+            )
+            forward_duration = self.duration_between(
+                self.forward_entry_time,
+                self.completion_time,
+            )
 
             if SGLANG_TEST_REQUEST_TIME_STATS:
                 if self.wait_queue_entry_time > 0:
@@ -1055,11 +1074,11 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
 
             # Break down prealloc_duration into sub-phases
             if self.bootstrap_done_time > 0:
-                bootstrap_duration = (
-                    self.bootstrap_done_time - self.decode_prealloc_queue_entry_time
+                bootstrap_duration = self.duration_between(
+                    self.decode_prealloc_queue_entry_time, self.bootstrap_done_time
                 )
-                alloc_wait_duration = (
-                    self.decode_transfer_queue_entry_time - self.bootstrap_done_time
+                alloc_wait_duration = self.duration_between(
+                    self.bootstrap_done_time, self.decode_transfer_queue_entry_time
                 )
                 if SGLANG_TEST_REQUEST_TIME_STATS:
                     assert (
@@ -1104,6 +1123,11 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
 
     def format_duration(self, duration: float) -> str:
         return f"{duration * 1e3:.2f}ms"
+
+    def duration_between(self, start: float, end: float) -> float:
+        if start <= 0 or end <= 0:
+            return 0.0
+        return end - start
 
 
 def set_schedule_time_batch(batch: ScheduleBatch):

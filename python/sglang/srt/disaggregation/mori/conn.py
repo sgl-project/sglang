@@ -882,6 +882,7 @@ class MoriKVSender(CommonKVSender):
             aux_index=self.aux_index if is_last else None,
         )
         self.transfer_statuses.extend(statuses)
+        self._record_transfer_indices(kv_indices, None)
         if infos is not None:
             self.pending_infos = infos
             self.sent_last_chunk = True
