@@ -396,6 +396,9 @@ class GPUWorker:
                 output_batch = OutputBatch()
             output_batch.error = f"Error executing {error_context}: {e}"
             self._record_output_peak_memory(output_batch)
+            # clean cache if OOM
+            if torch.cuda.is_initialized():
+                torch.cuda.empty_cache()
         return output_batch
 
     def _record_output_peak_memory(self, output_batch: OutputBatch) -> None:
