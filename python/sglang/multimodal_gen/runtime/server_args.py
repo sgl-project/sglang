@@ -76,6 +76,7 @@ LTX2_TWO_STAGE_DEVICE_MODES = ("original", "snapshot", "resident")
 LTX2_TWO_STAGE_PIPELINE_NAMES = ("LTX2TwoStagePipeline", "LTX2TwoStageHQPipeline")
 # H200-class GPUs (>=130 GiB total) can usually keep both LTX2 DiTs resident.
 LTX2_RESIDENT_AUTO_ENABLE_MEM_GB = 130
+LTX2_TEXT_ENCODER_RESIDENT_AUTO_ENABLE_MEM_GB = 130
 
 
 def _normalize_ltx2_two_stage_device_mode(mode: str | None) -> str | None:
@@ -383,8 +384,29 @@ class ServerArgs(DisaggArgsMixin):
             # CPU platform does not need offload
             return
 
+        device_total_memory_gb = (
+            current_platform.get_device_total_memory() / BYTES_PER_GB
+        )
+        device_name = (
+            str(current_platform.get_device_name(0)).upper()
+            if current_platform.is_cuda()
+            else ""
+        )
+        keep_ltx2_text_encoder_resident = (
+            self.enable_cfg_parallel
+            and self._is_ltx23_two_stage_pipeline()
+            and current_platform.is_cuda()
+            and (
+                "H200" in device_name
+                or (
+                    device_total_memory_gb
+                    >= LTX2_TEXT_ENCODER_RESIDENT_AUTO_ENABLE_MEM_GB
+                )
+            )
+        )
+
         # TODO: to be handled by each platform
-        if current_platform.get_device_total_memory() / BYTES_PER_GB < 30:
+        if device_total_memory_gb < 30:
             logger.info(
                 "Enabling large component offloading for GPU with low device memory"
             )
@@ -408,7 +430,15 @@ class ServerArgs(DisaggArgsMixin):
             if self.dit_cpu_offload is None:
                 self.dit_cpu_offload = True
             if self.text_encoder_cpu_offload is None:
-                self.text_encoder_cpu_offload = True
+                self.text_encoder_cpu_offload = not keep_ltx2_text_encoder_resident
+                if keep_ltx2_text_encoder_resident:
+                    logger.info(
+                        "Disabling text_encoder_cpu_offload by default for LTX2 "
+                        "two-stage CFG parallel on high-memory CUDA GPU "
+                        "(%s, %.2f GiB total)",
+                        device_name,
+                        device_total_memory_gb,
+                    )
             if self.image_encoder_cpu_offload is None:
                 self.image_encoder_cpu_offload = True
 
