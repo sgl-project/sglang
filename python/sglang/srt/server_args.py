@@ -245,6 +245,10 @@ NSA_CHOICES = [
     "trtllm",
 ]
 
+HISPARSE_CUDA_NSA_BACKENDS = ("flashmla_sparse",)
+HISPARSE_ROCM_NSA_BACKENDS = ("tilelang",)
+HISPARSE_KV_CACHE_DTYPES = ("bfloat16", "fp8_e4m3")
+
 MAMBA_SCHEDULER_STRATEGY_CHOICES = ["auto", "no_buffer", "extra_buffer"]
 
 MAMBA_BACKEND_CHOICES = ["triton", "flashinfer"]
@@ -1603,14 +1607,14 @@ class ServerArgs:
         user_set_prefill = self.nsa_prefill_backend is not None
         user_set_decode = self.nsa_decode_backend is not None
 
-        # HiSparse requires flashmla_sparse for both prefill and decode
         if self.enable_hisparse:
+            backend = self._get_default_hisparse_nsa_backend()
             if not user_set_prefill:
-                self.nsa_prefill_backend = "flashmla_sparse"
+                self.nsa_prefill_backend = backend
             if not user_set_decode:
-                self.nsa_decode_backend = "flashmla_sparse"
+                self.nsa_decode_backend = backend
             logger.warning(
-                f"HiSparse enabled: using flashmla_sparse NSA backends "
+                f"HiSparse enabled: using {backend} NSA backends "
                 f"(prefill={self.nsa_prefill_backend}, decode={self.nsa_decode_backend})."
             )
             return
@@ -1646,6 +1650,39 @@ class ServerArgs:
 
         logger.warning(
             f"Set NSA backends for {self.kv_cache_dtype} KV Cache: prefill={self.nsa_prefill_backend}, decode={self.nsa_decode_backend}."
+        )
+
+    def _get_default_hisparse_nsa_backend(self) -> str:
+        if is_hip():
+            return "tilelang"
+        return "flashmla_sparse"
+
+    def _get_supported_hisparse_nsa_backends(self) -> tuple[str, ...]:
+        if is_hip():
+            return HISPARSE_ROCM_NSA_BACKENDS
+        return HISPARSE_CUDA_NSA_BACKENDS
+
+    def _validate_hisparse_nsa_backend(self, attr: str, label: str):
+        backend = getattr(self, attr)
+        supported_backends = self._get_supported_hisparse_nsa_backends()
+        if backend is not None and backend not in supported_backends:
+            supported = ", ".join(supported_backends)
+            raise ValueError(
+                f"HiSparse supports NSA {label} backend(s) [{supported}] on this platform, "
+                f"but got --nsa-{label}-backend={backend}. "
+                f"Please use --nsa-{label}-backend={self._get_default_hisparse_nsa_backend()} or omit it."
+            )
+
+    def _validate_hisparse_kv_cache_dtype(self):
+        if self.kv_cache_dtype in HISPARSE_KV_CACHE_DTYPES:
+            return
+
+        choices = " or ".join(
+            f"--kv-cache-dtype={dtype}" for dtype in HISPARSE_KV_CACHE_DTYPES
+        )
+        raise ValueError(
+            f"HiSparse requires one of {HISPARSE_KV_CACHE_DTYPES} KV cache dtypes, "
+            f"but got --kv-cache-dtype={self.kv_cache_dtype}. Please use {choices}."
         )
 
     def _handle_model_specific_adjustments(self):
@@ -6880,19 +6917,9 @@ class ServerArgs:
                 ("nsa_prefill_backend", "prefill"),
                 ("nsa_decode_backend", "decode"),
             ]:
-                backend = getattr(self, attr)
-                if backend is not None and backend != "flashmla_sparse":
-                    raise ValueError(
-                        f"HiSparse requires flashmla_sparse NSA {label} backend, "
-                        f"but got --nsa-{label}-backend={backend}. "
-                        f"Please use --nsa-{label}-backend=flashmla_sparse or omit it."
-                    )
+                self._validate_hisparse_nsa_backend(attr, label)
 
-            if self.kv_cache_dtype != "bfloat16":
-                raise ValueError(
-                    f"HiSparse requires bfloat16 KV cache, but got --kv-cache-dtype={self.kv_cache_dtype}. "
-                    f"Please use --kv-cache-dtype=bfloat16."
-                )
+            self._validate_hisparse_kv_cache_dtype()
 
         assert (
             self.schedule_conservativeness >= 0
