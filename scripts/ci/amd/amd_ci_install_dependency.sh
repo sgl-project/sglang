@@ -179,6 +179,9 @@ EOF
   # the multimodal V2.5 variant, so the processor still has to register on import.
   # Without torchcodec the import fails silently and the server aborts with
   # "No processor registered for architecture: ['MiMoV2ForCausalLM']".
+  # torchcodec also needs FFmpeg shared libs (libavcodec 4-8) at runtime, which
+  # the ROCm base image does not ship by default.
+  docker exec ci_sglang bash -c "command -v ffmpeg >/dev/null 2>&1 || (apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ffmpeg)" || echo "ffmpeg installation failed"
   docker exec ci_sglang pip install --cache-dir=/sgl-data/pip-cache torchcodec || echo "torchcodec installation failed"
 fi
 
