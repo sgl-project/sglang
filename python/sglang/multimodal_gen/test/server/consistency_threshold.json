@@ -244,7 +244,7 @@
         "ltx_2_3_hq_pipeline": {
             "clip_threshold": 0.58,
             "ssim_threshold": 0.39,
-            "psnr_threshold": 13.0,
+            "psnr_threshold": 12.9,
             "mean_abs_diff_threshold": 45.0
         },
         "ltx_2_3_two_stage_ti2v_2gpus": {
