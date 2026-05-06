@@ -13,7 +13,7 @@
 # ==============================================================================
 """DeepEP Waterfill: shared expert as 9th routed expert, dispatched to least-loaded rank."""
 
-from typing import Optional, Tuple
+from typing import NamedTuple, Optional, Tuple
 
 import torch
 import triton
@@ -26,6 +26,14 @@ from sglang.srt.layers.moe.topk import StandardTopKOutput
 LOCAL_SHARED_MARKER = -1  # Invalid expert ID; DeepEP ignores expert_id < 0.
 _LOCAL_PREF_NUMER = 11  # local-rank preference = 11/10
 _LOCAL_PREF_DENOM = 10
+
+
+class WaterfillDispatchPlan(NamedTuple):
+    """Framework-neutral waterfill inputs prepared by the SGLang wrapper."""
+
+    rank_load: Tensor
+    allow_all_ranks: bool
+    target_total: int
 
 
 def _empty_expanded(topk_ids: Tensor, topk_weights: Tensor):
@@ -251,10 +259,10 @@ def _waterfill_expand_kernel(
     )
 
 
-def waterfill_prepare_dispatch_fused(
+def materialize_waterfill_dispatch_fused(
     topk_ids: Tensor,
     topk_weights: Tensor,
-    routed_counts: Tensor,
+    rank_load: Tensor,
     num_routed_experts: int,
     world_size: int,
     source_rank: int,
@@ -262,7 +270,13 @@ def waterfill_prepare_dispatch_fused(
     allow_all_ranks: bool = False,
     target_total: int = 0,
 ) -> Tuple[Tensor, Tensor]:
-    """Fused waterfill + expand + ID remapping via Triton kernel."""
+    """Materialize waterfill rank selection into DeepEP expanded TopK layout.
+
+    The Triton kernel intentionally fuses rank selection and layout writeback
+    for performance. Its boundary is still adapter-local: inputs are plain
+    tensors plus rank-load state, and no SGLang ``StandardTopKOutput`` or
+    communication API enters this function.
+    """
     num_tokens = topk_ids.shape[0]
     topk = topk_ids.shape[1]
     old_experts_per_rank = num_routed_experts // world_size
@@ -283,7 +297,7 @@ def waterfill_prepare_dispatch_fused(
     _waterfill_expand_kernel[grid](
         topk_ids,
         topk_weights,
-        routed_counts,
+        rank_load,
         expanded_topk_ids,
         expanded_topk_weights,
         num_tokens,
@@ -406,19 +420,102 @@ class DeepEPWaterfillBalancer:
         )
         return buf
 
-    def prepare_dispatch(
+    def _should_use_local_shared_expansion(self, num_tokens: int) -> bool:
+        """Return whether static mode should skip waterfill for small batches."""
+        return (
+            self.static_rank_load is not None
+            and num_tokens < self.MIN_BATCH_FOR_BALANCE
+        )
+
+    def _build_static_dispatch_plan(self, routed_counts: Tensor) -> WaterfillDispatchPlan:
+        """Build static-mode waterfill inputs without framework communication.
+
+        Static Waterfill currently uses EPLB metadata availability to choose the
+        no-all-reduce path. The rank-load tensor passed to the fused kernel keeps
+        the existing PR behavior.
+        """
+        return WaterfillDispatchPlan(
+            rank_load=routed_counts,
+            allow_all_ranks=True,
+            target_total=0,
+        )
+
+    def _build_dynamic_dispatch_plan(
+        self,
+        routed_counts: Tensor,
+        local_tokens_per_rank: Optional[Tensor],
+        topk: int,
+    ) -> WaterfillDispatchPlan:
+        """Build dynamic waterfill inputs from globally reduced routed counts."""
+        rank_load = (
+            routed_counts + local_tokens_per_rank
+            if local_tokens_per_rank is not None
+            else routed_counts
+        )
+        total_routed_t = routed_counts.sum()
+        total_tokens_global_t = total_routed_t // topk
+        total_effective_t = rank_load.sum()
+        max_effective_t = rank_load.max()
+        target_total = int(
+            (total_effective_t + total_tokens_global_t + self.world_size - 1)
+            // self.world_size
+        )
+        allow_all_ranks = bool(max_effective_t <= target_total)
+        return WaterfillDispatchPlan(
+            rank_load=rank_load,
+            allow_all_ranks=allow_all_ranks,
+            target_total=target_total,
+        )
+
+    def _all_reduce_dynamic_rank_load(
+        self, local_routed_counts: Tensor, num_tokens: int
+    ) -> Tuple[Tensor, Tensor]:
+        """Aggregate dynamic load with SGLang EP communication."""
+        from sglang.srt.distributed import get_moe_ep_group
+        from sglang.srt.distributed.communication_op import (
+            moe_expert_parallel_all_reduce,
+        )
+
+        group = get_moe_ep_group()
+        world = group.world_size
+        buf = torch.zeros(
+            world * 2, dtype=torch.int64, device=local_routed_counts.device
+        )
+        buf[:world] = local_routed_counts
+        rank = group.rank_in_group
+        buf[world + rank : world + rank + 1].fill_(num_tokens)
+        buf = moe_expert_parallel_all_reduce(buf)
+        return buf[:world], buf[world:]
+
+    def _build_dispatch_plan(
+        self, topk_ids: Tensor, num_tokens: int
+    ) -> WaterfillDispatchPlan:
+        """Prepare rank-load state for the waterfill selection boundary."""
+        local_routed_counts = self.count_local_routed(topk_ids)
+        if self.static_rank_load is not None:
+            return self._build_static_dispatch_plan(local_routed_counts)
+
+        global_routed_counts, local_tokens_per_rank = self._all_reduce_dynamic_rank_load(
+            local_routed_counts, num_tokens
+        )
+        return self._build_dynamic_dispatch_plan(
+            global_routed_counts,
+            local_tokens_per_rank=local_tokens_per_rank,
+            topk=topk_ids.shape[1],
+        )
+
+    def _materialize_dispatch(
         self,
         topk_ids: Tensor,
         topk_weights: Tensor,
-        routed_counts: Tensor,
-        local_tokens_per_rank: Optional[Tensor] = None,
+        dispatch_plan: WaterfillDispatchPlan,
     ) -> Tuple[Tensor, Tensor]:
-        """Expand topk [N, 8] → [N, 9] with waterfill-assigned shared expert."""
+        """Convert a waterfill dispatch plan into DeepEP expanded TopK tensors."""
         num_tokens = topk_ids.shape[0]
         if num_tokens == 0:
             return _empty_expanded(topk_ids, topk_weights)
 
-        if num_tokens < self.MIN_BATCH_FOR_BALANCE:
+        if self._should_use_local_shared_expansion(num_tokens):
             return expand_topk_with_shared_expert(
                 topk_ids,
                 topk_weights,
@@ -428,47 +525,36 @@ class DeepEPWaterfillBalancer:
                 self.shared_weight,
             )
 
-        effective_load = (
-            routed_counts + local_tokens_per_rank
-            if local_tokens_per_rank is not None
-            else routed_counts
-        )
-        topk = topk_ids.shape[1]
-
-        if self.static_rank_load is not None:
-            allow_all_ranks = True
-            target_total = 0
-        else:
-            total_routed_t = routed_counts.sum()
-            total_tokens_global_t = total_routed_t // topk
-            total_effective_t = effective_load.sum()
-            max_effective_t = effective_load.max()
-            target_total = int(
-                (total_effective_t + total_tokens_global_t + self.world_size - 1)
-                // self.world_size
-            )
-            allow_all_ranks = bool(max_effective_t <= target_total)
-
-        return waterfill_prepare_dispatch_fused(
+        return materialize_waterfill_dispatch_fused(
             topk_ids,
             topk_weights,
-            effective_load,
+            dispatch_plan.rank_load,
             self.num_routed_experts,
             self.world_size,
             self.rank,
             self.shared_weight,
-            allow_all_ranks=allow_all_ranks,
-            target_total=target_total,
+            allow_all_ranks=dispatch_plan.allow_all_ranks,
+            target_total=dispatch_plan.target_total,
+        )
+
+    @staticmethod
+    def _with_expanded_topk(
+        topk_output: StandardTopKOutput,
+        expanded_ids: Tensor,
+        expanded_weights: Tensor,
+    ) -> StandardTopKOutput:
+        """Wrap expanded tensors back into SGLang's StandardTopKOutput."""
+        return StandardTopKOutput(
+            topk_weights=expanded_weights,
+            topk_ids=expanded_ids,
+            router_logits=topk_output.router_logits,
         )
 
     def expand_topk(
         self, topk_output: StandardTopKOutput, num_tokens: int
     ) -> StandardTopKOutput:
         """Expand topk [N, 8] -> [N, 9] with waterfill-assigned shared expert."""
-        if (
-            self.static_rank_load is not None
-            and num_tokens < self.MIN_BATCH_FOR_BALANCE
-        ):
+        if self._should_use_local_shared_expansion(num_tokens):
             # Static EPLB low-batch path can use local expansion. Dynamic mode
             # always all-reduces so decode and extend have the same participation.
             expanded_ids, expanded_weights = expand_topk_with_shared_expert(
@@ -479,41 +565,12 @@ class DeepEPWaterfillBalancer:
                 self.rank,
                 self.shared_weight,
             )
-            return StandardTopKOutput(
-                topk_weights=expanded_weights,
-                topk_ids=expanded_ids,
-                router_logits=topk_output.router_logits,
-            )
+            return self._with_expanded_topk(topk_output, expanded_ids, expanded_weights)
 
-        from sglang.srt.distributed import get_moe_ep_group
-        from sglang.srt.distributed.communication_op import (
-            moe_expert_parallel_all_reduce,
-        )
-
-        local_routed_counts = self.count_local_routed(topk_output.topk_ids)
-        if self.static_rank_load is not None:
-            global_routed_counts, local_tokens_per_rank = local_routed_counts, None
-        else:
-            group = get_moe_ep_group()
-            world = group.world_size
-            buf = torch.zeros(
-                world * 2, dtype=torch.int64, device=topk_output.topk_ids.device
-            )
-            buf[:world] = local_routed_counts
-            rank = group.rank_in_group
-            buf[world + rank : world + rank + 1].fill_(num_tokens)
-            buf = moe_expert_parallel_all_reduce(buf)
-            global_routed_counts = buf[:world]
-            local_tokens_per_rank = buf[world:]
-
-        expanded_ids, expanded_weights = self.prepare_dispatch(
+        dispatch_plan = self._build_dispatch_plan(topk_output.topk_ids, num_tokens)
+        expanded_ids, expanded_weights = self._materialize_dispatch(
             topk_output.topk_ids,
             topk_output.topk_weights,
-            global_routed_counts,
-            local_tokens_per_rank=local_tokens_per_rank,
+            dispatch_plan,
         )
-        return StandardTopKOutput(
-            topk_weights=expanded_weights,
-            topk_ids=expanded_ids,
-            router_logits=topk_output.router_logits,
-        )
+        return self._with_expanded_topk(topk_output, expanded_ids, expanded_weights)
