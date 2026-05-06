@@ -38,6 +38,8 @@ class WeightChecker:
 
     def _reset_tensors(self):
         for name, param in self._model_state():
+            if "cos_sin_cache" in name or "freqs_cis" in name or "_weight_fp32" in name:
+                continue
             param.copy_(_random_like(param))
 
     def _compare(self):
@@ -123,6 +125,22 @@ def _postprocess_tensors(
 
     skip_compare_names = []
 
+    # Skip non-persistent buffers like cos_sin_cache
+    # These buffers are registered with persistent=False and are not saved in checkpoints
+    # They should be recomputed after loading weights, so we don't compare them here
+    non_persistent_buffer_patterns = [
+        "cos_sin_cache",  # RoPE cache
+        "inv_freq",  # RoPE inverse frequency (if it exists as buffer)
+        "_weight_fp32",  # FP32 cache of gate weight (e.g. Glm4MoeGate)
+    ]
+
+    for name in raw:
+        for pattern in non_persistent_buffer_patterns:
+            if pattern in name:
+                skip_compare_names.append(name)
+                logger.info(f"[check_tensors] Skipping non-persistent buffer: {name}")
+                break
+
     # dequant fp8
     quant_names = [
         name
@@ -131,18 +149,20 @@ def _postprocess_tensors(
         if name.endswith("weight") and name.replace("weight", "weight_scale_inv") in raw
     ]
     skip_compare_names += quant_names
+    skip_compare_names += [
+        name.replace("weight", "weight_scale_inv") for name in quant_names
+    ]
     for name in quant_names:
         w_q = raw[name]
         w_s = raw[name.replace("weight", "weight_scale_inv")]
 
         try:
-            # TODO this is only needed for Blackwell
-            w_s_inverse_transformed = inverse_transform_scale_ue8m0(
-                w_s, mn=w_q.shape[-2]
-            )
+            if w_s.dtype == torch.int32:
+                # UE8M0 packed format (Blackwell DeepGEMM)
+                w_s = inverse_transform_scale_ue8m0(w_s, mn=w_q.shape[-2])
             w_dequant = block_quant_dequant(
                 w_q,
-                w_s_inverse_transformed,
+                w_s,
                 # TODO do not hardcode
                 block_size=[128, 128],
                 dtype=torch.bfloat16,
