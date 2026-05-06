@@ -30,7 +30,7 @@ class MiMoV2Adapter(TranscriptionAdapter):
         usage: TranscriptionUsage,
     ) -> TranscriptionVerboseResponse:
         return TranscriptionVerboseResponse(
-            language=request.language or "en",
+            language=request.language,
             duration=round(request.audio_duration_s, 2),
             text=text,
             segments=[],
