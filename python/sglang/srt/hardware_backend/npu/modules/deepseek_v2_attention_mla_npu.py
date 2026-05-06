@@ -155,6 +155,13 @@ def forward_mla_prepare_npu(
     zero_allocator: "BumpAllocator",
     layer_scatter_modes,
 ):
+    # Ensure v_kc and w_vc are on the same device as hidden_states
+    # These are tensor attributes, note nn.Parameter. so they need special handling(For OffloaderV1)
+    if m.w_kc is not None and m.w_kc.device != hidden_states.device:
+        m.w_kc = m.w_kc.to(hidden_states.device, non_blocking=True)
+    if m.w_vc is not None and m.w_vc.device != hidden_states.device:
+        m.w_vc = m.w_vc.to(hidden_states.device, non_blocking=True)
+
     if is_mla_preprocess_enabled():
         if not hasattr(m, "mla_preprocess"):
             m.mla_preprocess = NPUFusedMLAPreprocess(
