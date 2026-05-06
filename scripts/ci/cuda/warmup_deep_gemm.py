@@ -45,8 +45,30 @@ FALLBACK_ARGS: Dict[str, List[str]] = {
     "deepseek-ai/DeepSeek-V3.2": ["--dp", "8", "--enable-dp-attention"],
     "zai-org/GLM-5-FP8": ["--dp", "8", "--enable-dp-attention"],
     # test_mimo_models.py — note: workflow argv must use ":4", not ":8".
-    "XiaomiMiMo/MiMo-V2-Flash": ["--dp", "2", "--enable-dp-attention"],
-    "XiaomiMiMo/MiMo-V2.5": ["--dp", "2", "--enable-dp-attention"],
+    "XiaomiMiMo/MiMo-V2-Flash": [
+        "--dp",
+        "2",
+        "--enable-dp-attention",
+        "--attention-backend",
+        "fa3",
+    ],
+    # MiMo-V2.5 is multimodal. Without --mm-enable-dp-encoder, the vision
+    # encoder runs on DP0 only; DP1 enters forward_idle and the two desync
+    # at the next collective, deadlocking the warmup batch (observed in run
+    # 25408125444 — server came up, JIT events emitted, then /generate hung
+    # 600s in vision attn .item() sync). Match the test launch in
+    # test_mimo_models.py TestMiMoV2 so both DP groups participate
+    # symmetrically through the encoder.
+    "XiaomiMiMo/MiMo-V2.5": [
+        "--dp",
+        "2",
+        "--enable-dp-attention",
+        "--mm-enable-dp-encoder",
+        "--attention-backend",
+        "fa3",
+        "--mm-attention-backend",
+        "fa3",
+    ],
 }
 
 # Output substrings that signal a fatal child-rank crash. compile_deep_gemm's
