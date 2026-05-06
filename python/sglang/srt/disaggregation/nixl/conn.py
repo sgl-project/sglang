@@ -1123,6 +1123,7 @@ class NixlKVSender(CommonKVSender):
         self.chunk_id = 0
         self._send_failed = False
         self._send_error: Optional[Exception] = None
+        self._transfer_start_time: Optional[float] = None
 
     def pop_decode_prefix_len(self) -> int:
         return self.kv_mgr.req_to_decode_prefix_len.pop(self.bootstrap_room, 0)
@@ -1156,6 +1157,11 @@ class NixlKVSender(CommonKVSender):
                 self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Success)
                 return
 
+        if self._transfer_start_time is None and (
+            len(kv_indices) > 0 or state_indices is not None
+        ):
+            self._transfer_start_time = time.perf_counter()
+
         try:
             new_xfer_handles = self.kv_mgr.add_transfer_request(
                 self.bootstrap_room,
@@ -1174,6 +1180,7 @@ class NixlKVSender(CommonKVSender):
             self._send_error = e
             return
 
+        self._record_transfer_indices(kv_indices, state_indices)
         self.xfer_handles.extend(new_xfer_handles)
         self.chunk_id += 1
         if is_last:
@@ -1195,6 +1202,13 @@ class NixlKVSender(CommonKVSender):
             self._send_error = e
             return KVPoll.Failed  # type: ignore
         if all(x == "DONE" for x in states):
+            if (
+                self._transfer_start_time is not None
+                and self._transfer_metric.transfer_latency_s is None
+            ):
+                self._transfer_metric.transfer_latency_s = (
+                    time.perf_counter() - self._transfer_start_time
+                )
             return KVPoll.Success  # type: ignore
         if any(x == "ERR" for x in states):
             self._send_failed = True
