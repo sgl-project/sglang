@@ -7317,6 +7317,9 @@ class ServerArgs:
         # Check LoRA
         self.check_lora_server_args()
 
+        # Check LPLB
+        self.check_lplb_server_args()
+
         # Check speculative decoding
         if self.speculative_algorithm is not None:
             assert (
@@ -7458,6 +7461,22 @@ class ServerArgs:
         if self.kv_canary_sweep_interval > 0 and self.kv_canary == "none":
             raise ValueError(
                 "--kv-canary-sweep-interval requires --kv-canary in {log, raise}"
+            )
+
+    def check_lplb_server_args(self):
+        if self.ep_dispatch_algorithm != "lp":
+            return
+        if not self.enable_dp_attention:
+            raise ValueError(
+                "--ep-dispatch-algorithm=lp requires --enable-dp-attention. "
+                "LP dispatch participates in the EP all-reduce on every MoE "
+                "forward, which is only safe under DP-attention."
+            )
+        if self.moe_a2a_backend != "deepep":
+            raise ValueError(
+                "--ep-dispatch-algorithm=lp requires --moe-a2a-backend=deepep "
+                f"(got {self.moe_a2a_backend!r}). LP dispatch is only validated "
+                "against the DeepEP backend."
             )
 
     def check_lora_server_args(self):

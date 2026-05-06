@@ -17,8 +17,8 @@ Critical invariants this test catches that the CPU tests cannot:
        summed counts (this is the discriminator that tells "all-reduce
        happened" apart from "rank silently used local-only counts and
        coincidentally produced a finite tensor").
-    4. With `--lplb-require-fused` set in ServerArgs, no silent fallback to
-       the torch IPM masks a fused-kernel failure (the gate raises instead).
+    4. The fused-only contract holds end-to-end: a fused-kernel failure
+       must surface as an exception (no silent torch fallback exists).
     5. Post-rebalance reinit produces solvers tied to the new metadata —
        outputs change when `phy2log` changes.
 
@@ -89,9 +89,9 @@ def test_lplb_distributed_two_rank():
 
 def _worker_main(local_rank: int, world_size: int):
     """Per-rank entry point under torch.multiprocessing.spawn."""
-    # Inject ServerArgs with --lplb-require-lp / --lplb-require-fused turned on
-    # so any silent fallback raises. Must run before any LPLB module reads the
-    # server args.
+    # Inject minimal ServerArgs before any LPLB module reads the global state.
+    # Silent fallbacks no longer exist — the fused CUDA path is the only LP
+    # path, so this test relies on hard failures, not gating flags.
     from sglang.srt.server_args import (
         ServerArgs,
         set_global_server_args_for_scheduler,
