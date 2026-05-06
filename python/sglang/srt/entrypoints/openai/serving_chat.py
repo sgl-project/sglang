@@ -17,6 +17,12 @@ from jsonschema import Draft202012Validator, SchemaError
 
 from sglang.srt.entrypoints.codec_compression import wrap_streaming_response
 from sglang.srt.entrypoints.codec_frame import encode_frame
+from sglang.srt.entrypoints.codec_agent import (
+    ToolWatcher,
+    detokenize_region,
+    make_call_id,
+    parse_tool_call,
+)
 from sglang.srt.entrypoints.openai.encoding_dsv32 import encode_messages
 from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionRequest,
@@ -778,6 +784,16 @@ class OpenAIServingChat(OpenAIServingBase):
         """
         n_prev_tokens: dict[int, int] = {}
         incremental = self.tokenizer_manager.server_args.incremental_streaming_output
+
+        # Server-side ToolWatcher (see CompletionRequest.tool_watcher).
+        watcher: Optional[ToolWatcher] = None
+        tool_call_seq = 0
+        if request.tool_watcher is not None:
+            watcher = ToolWatcher(
+                start_id=int(request.tool_watcher["start_id"]),
+                end_id=int(request.tool_watcher["end_id"]),
+            )
+
         try:
             async for content in self.tokenizer_manager.generate_request(
                 adapted_request, raw_request
@@ -797,11 +813,29 @@ class OpenAIServingChat(OpenAIServingBase):
                 finish_reason = finish_reason_obj["type"] if finish_reason_obj else None
                 done = finish_reason is not None
 
+                tool_calls_payload: list[dict] = []
+                if watcher is not None:
+                    passthrough_ids, completed_regions = watcher.feed(new_ids)
+                    new_ids = passthrough_ids
+                    for body_ids in completed_regions:
+                        tool_call_seq += 1
+                        try:
+                            body_text = detokenize_region(
+                                self.tokenizer_manager.tokenizer, body_ids
+                            )
+                        except Exception:
+                            body_text = ""
+                        ev = parse_tool_call(
+                            body_text, call_id=make_call_id(tool_call_seq)
+                        )
+                        tool_calls_payload.append(ev.to_wire_dict())
+
                 yield encode_frame(
                     request.stream_format,
                     new_ids,
                     done=done,
                     finish_reason=finish_reason,
+                    tool_calls=tool_calls_payload or None,
                 )
                 if done:
                     return

@@ -325,6 +325,16 @@ class CompletionRequest(BaseModel):
     # "protobuf" — stream CodecFrame objects with 4-byte big-endian length prefix.
     stream_format: Literal["json", "msgpack", "protobuf"] = "json"
 
+    # Codec server-side ToolWatcher: detect <start_id>...<end_id> regions
+    # in the output token stream, parse the body as JSON, and surface a
+    # tool_calls field on the wire frame whose `ids` come from
+    # immediately after the region. Markers are consumed (not forwarded).
+    # The watcher state machine is the same one the Codec clients (TS,
+    # Python, .NET, C) ship — server-side detection just saves the
+    # client a detokenize+regex pass.
+    # Set to a dict with start_id and end_id (uint32) to enable; null disables.
+    tool_watcher: Optional[Dict[str, int]] = None
+
     @model_validator(mode="before")
     @classmethod
     def _handle_deprecated_dp_rank(cls, values):
@@ -341,6 +351,24 @@ class CompletionRequest(BaseModel):
                 )
             # Binary formats are always streaming — force it on.
             self.stream = True
+        if self.tool_watcher is not None:
+            tw = self.tool_watcher
+            if not isinstance(tw, dict) or "start_id" not in tw or "end_id" not in tw:
+                raise ValueError(
+                    "tool_watcher must be a dict with integer start_id and end_id. "
+                    "Pass the tokenizer's special-token IDs for your model's "
+                    "tool-call markers (e.g. Qwen-2.5: 151657 / 151658)."
+                )
+            if not isinstance(tw["start_id"], int) or not isinstance(tw["end_id"], int):
+                raise ValueError("tool_watcher.start_id and end_id must be integers")
+            if self.stream_format == "json":
+                # JSON-SSE has no defined surface for tool_calls today; we
+                # don't attempt to graft one on. Codec stream formats only.
+                raise ValueError(
+                    "tool_watcher requires stream_format='msgpack' or 'protobuf'. "
+                    "Server-side detection currently surfaces results only on the "
+                    "Codec wire format."
+                )
         return self
 
     @field_validator("max_tokens")
@@ -702,6 +730,9 @@ class ChatCompletionRequest(BaseModel):
     # the decoded text if they want it.
     stream_format: Literal["json", "msgpack", "protobuf"] = "json"
 
+    # Codec server-side ToolWatcher — see CompletionRequest.tool_watcher.
+    tool_watcher: Optional[Dict[str, int]] = None
+
     # OpenAI/SGLang default sampling parameters
     _DEFAULT_SAMPLING_PARAMS = {
         "temperature": 1.0,
@@ -726,6 +757,18 @@ class ChatCompletionRequest(BaseModel):
                     "would be interleaved with no way for the client to demultiplex them."
                 )
             self.stream = True
+        if self.tool_watcher is not None:
+            tw = self.tool_watcher
+            if not isinstance(tw, dict) or "start_id" not in tw or "end_id" not in tw:
+                raise ValueError(
+                    "tool_watcher must be a dict with integer start_id and end_id"
+                )
+            if not isinstance(tw["start_id"], int) or not isinstance(tw["end_id"], int):
+                raise ValueError("tool_watcher.start_id and end_id must be integers")
+            if self.stream_format == "json":
+                raise ValueError(
+                    "tool_watcher requires stream_format='msgpack' or 'protobuf'"
+                )
         return self
 
     @model_validator(mode="before")

@@ -41,6 +41,18 @@ message CodecFrame {
   repeated uint32 ids           = 1 [packed = true];
   bool            done          = 2;
   optional string finish_reason = 3;
+  // Server-side tool-call detection (opt-in via request.tool_watcher).
+  // When the model emits a complete <start>..</end> region in this
+  // chunk, the parsed result rides along on the same frame whose `ids`
+  // come from immediately after the region. Multiple tool calls in
+  // one frame are emitted as a list.
+  repeated ToolCall tool_calls  = 4;
+}
+
+message ToolCall {
+  optional string name           = 1; // parsed from JSON body when shape matches
+  string          arguments_json = 2; // raw JSON body between markers
+  optional string id             = 3; // server-generated, e.g. "tc_<hex>"
 }
 
 // Input to POST /v1/completions/codec (bidirectional binary endpoint).
@@ -62,11 +74,19 @@ _decoder = msgspec.msgpack.Decoder()
 
 
 def encode_msgpack(
-    ids: List[int], *, done: bool, finish_reason: Optional[str] = None
+    ids: List[int],
+    *,
+    done: bool,
+    finish_reason: Optional[str] = None,
+    tool_calls: Optional[List[dict]] = None,
 ) -> bytes:
     frame: dict = {"ids": ids, "done": done}
     if finish_reason is not None:
         frame["finish_reason"] = finish_reason
+    if tool_calls:
+        # List of dicts shaped like
+        # {"name": ..., "arguments_json": ..., "id": ...}
+        frame["tool_calls"] = tool_calls
     return _encoder.encode(frame)
 
 
@@ -91,8 +111,30 @@ def _varint(n: int) -> bytes:
     return bytes(parts)
 
 
+def _encode_tool_call_msg(call: dict) -> bytes:
+    """Encode a single ToolCall sub-message (no length prefix; that's
+    added by the caller as a length-delimited field in CodecFrame)."""
+    parts: list[bytes] = []
+    name = call.get("name")
+    if name:
+        b = name.encode()
+        parts.append(b"\x0a" + _varint(len(b)) + b)  # field 1: string name
+    args = call.get("arguments_json", "")
+    bargs = args.encode()
+    parts.append(b"\x12" + _varint(len(bargs)) + bargs)  # field 2: string arguments_json
+    cid = call.get("id")
+    if cid:
+        b = cid.encode()
+        parts.append(b"\x1a" + _varint(len(b)) + b)  # field 3: string id
+    return b"".join(parts)
+
+
 def encode_protobuf(
-    ids: List[int], *, done: bool, finish_reason: Optional[str] = None
+    ids: List[int],
+    *,
+    done: bool,
+    finish_reason: Optional[str] = None,
+    tool_calls: Optional[List[dict]] = None,
 ) -> bytes:
     """Encode a CodecFrame as protobuf with a 4-byte big-endian length prefix."""
     parts: list[bytes] = []
@@ -109,6 +151,13 @@ def encode_protobuf(
     if finish_reason:
         enc = finish_reason.encode()
         parts.append(b"\x1a" + _varint(len(enc)) + enc)
+
+    # Field 4: repeated ToolCall tool_calls (length-delimited messages)
+    if tool_calls:
+        for call in tool_calls:
+            sub = _encode_tool_call_msg(call)
+            # Tag for field 4, wire type 2 (length-delimited) = (4 << 3) | 2 = 0x22
+            parts.append(b"\x22" + _varint(len(sub)) + sub)
 
     payload = b"".join(parts)
     return struct.pack(">I", len(payload)) + payload
@@ -200,8 +249,13 @@ def encode_frame(
     *,
     done: bool,
     finish_reason: Optional[str] = None,
+    tool_calls: Optional[List[dict]] = None,
 ) -> bytes:
     """Dispatch to the correct encoder based on stream_format."""
     if stream_format == "protobuf":
-        return encode_protobuf(ids, done=done, finish_reason=finish_reason)
-    return encode_msgpack(ids, done=done, finish_reason=finish_reason)
+        return encode_protobuf(
+            ids, done=done, finish_reason=finish_reason, tool_calls=tool_calls
+        )
+    return encode_msgpack(
+        ids, done=done, finish_reason=finish_reason, tool_calls=tool_calls
+    )
