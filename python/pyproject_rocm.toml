@@ -19,6 +19,7 @@ dependencies = ["aiohttp", "requests", "tqdm", "numpy", "IPython", "setproctitle
 runtime_common = [
   "IPython",
   "aiohttp",
+  "apache-tvm-ffi>=0.1.5,<0.2",
   "anthropic>=0.20.0",
   "blobfile==3.0.0",
   "av",
@@ -58,8 +59,8 @@ runtime_common = [
   "timm==1.0.16",
   "torchao==0.9.0",
   "tqdm",
-  "mistral_common>=1.11.0",
-  "transformers==5.5.4",
+  "mistral_common>=1.9.0",
+  "transformers==5.3.0",
   "uvicorn",
   "uvloop",
   "xgrammar==0.1.32",
@@ -90,13 +91,18 @@ tracing = [
 
 test = [
   "accelerate",
+  "addict",
+  "bitsandbytes",
   "expecttest",
-  "gguf",
   "jsonlines",
   "matplotlib",
   "pandas",
+  "parameterized",
   "peft>=0.18.0",
+  "polars",
   "pytest",
+  "pytest-cov",
+  "diff-cover",
   "sentence_transformers",
   "tabulate",
 ]
@@ -110,7 +116,7 @@ rocm700 = [
   "torchaudio @ https://repo.radeon.com/rocm/manylinux/rocm-rel-7.0.2/torchaudio-2.9.0%2Brocm7.0.2.gite3c6ee2b-cp310-cp310-linux_x86_64.whl",
   "torchvision @ https://repo.radeon.com/rocm/manylinux/rocm-rel-7.0.2/torchvision-0.24.0%2Brocm7.0.2.gitb919bd0c-cp310-cp310-linux_x86_64.whl",
   "mooncake-transfer-engine-non-cuda==0.3.8.post1",
-  "sglang-kernel @ https://github.com/sgl-project/whl/releases/download/v0.4.1/sglang_kernel-0.4.1+rocm700-cp310-abi3-manylinux2014_x86_64.whl",
+  "sglang-kernel @ https://github.com/sgl-project/whl/releases/download/v0.4.2/sglang_kernel-0.4.2+rocm700-cp310-abi3-manylinux2014_x86_64.whl",
   "amd-aiter",
 ]
 
@@ -121,7 +127,7 @@ rocm720 = [
   "torchaudio @ https://repo.radeon.com/rocm/manylinux/rocm-rel-7.2/torchaudio-2.9.0%2Brocm7.2.0.gite3c6ee2b-cp310-cp310-linux_x86_64.whl",
   "torchvision @ https://repo.radeon.com/rocm/manylinux/rocm-rel-7.2/torchvision-0.24.0%2Brocm7.2.0.gitb919bd0c-cp310-cp310-linux_x86_64.whl",
   "mooncake-transfer-engine-non-cuda==0.3.8.post1",
-  "sglang-kernel @ https://github.com/sgl-project/whl/releases/download/v0.4.1/sglang_kernel-0.4.1+rocm720-cp310-abi3-manylinux2014_x86_64.whl",
+  "sglang-kernel @ https://github.com/sgl-project/whl/releases/download/v0.4.2/sglang_kernel-0.4.2+rocm720-cp310-abi3-manylinux2014_x86_64.whl",
   "amd-aiter",
 ]
 
@@ -141,11 +147,11 @@ diffusion_hip = [
   "peft>=0.18.0",
   "st_attn==0.0.7",
   "vsa==0.0.4",
-  "runai_model_streamer>=0.15.5",
-  "cache-dit==1.1.8",
+  "runai_model_streamer>=0.15.7",
+  "cache-dit==1.3.0",
 ]
 
-all_hip = ["sglang[srt_hip]", "sglang[diffusion_hip]"]
+all_hip = ["sglang[srt_hip]", "sglang[diffusion_hip]", "sglang[tracing]"]
 
 dev_hip = ["sglang[all_hip]", "sglang[test]"]
 
@@ -155,6 +161,7 @@ dev_hip = ["sglang[all_hip]", "sglang[test]"]
 
 [project.scripts]
 sglang = "sglang.cli.main:main"
+killall_sglang = "sglang.cli.killall:main"
 
 [tool.setuptools.package-data]
 "sglang" = [
