@@ -1654,6 +1654,7 @@ def dpsk_v4_fp8_partial_kernel(
     head_kv = num_heads // kv_group
     D = dim
     D_tail = tail_dim
+    D_all = D + D_tail
     BI = block_I
     padded_H = max(tilelang.math.next_power_of_2(head_kv), 16)
     if head_kv > 64:
@@ -1673,11 +1674,11 @@ def dpsk_v4_fp8_partial_kernel(
         BS_KV_2 = block_size_kv_2
         NOPE_ROPE_U32_PER_BLOCK_2 = BS_KV_2 * PACKED_W4
 
-    q_shape = [batch, seq_len, num_heads, D + D_tail]
+    q_shape = [batch, seq_len, num_heads, D_all]
     k1_shape = [num_blocks_kv_1, block_pad_u32_1]
     indices1_shape = [batch, seq_len, topk1]
     topk_length_shape = [batch]
-    partial_o_shape = [batch, seq_len, n_groups, num_heads, D + D_tail]
+    partial_o_shape = [batch, seq_len, n_groups, num_heads, D_all]
     partial_lse_shape = [batch, seq_len, n_groups, num_heads]
     if is_dual:
         k2_shape = [num_blocks_kv_2, block_pad_u32_2]
@@ -1708,29 +1709,26 @@ def dpsk_v4_fp8_partial_kernel(
             with T.Kernel(
                 seq_len * REPLICATE_H * n_groups, batch, kv_group, threads=threads
             ) as (bx, by, bz):
-                Q_shared = T.alloc_fragment([H_per_block, D], BF16)
-                Q_tail_shared = T.alloc_fragment([H_per_block, D_tail], BF16)
-                K_packed_shared = T.alloc_shared([BI, PACKED_W4], "uint32") # 64, 144
-                K_scale_shared = T.alloc_shared([BI, SCALE_W4], "uint32")
-                KV_shared = T.alloc_shared([BI, D], BF16)
-                K_tail_shared = T.alloc_shared([BI, D_tail], BF16)
-                S_shared = T.alloc_shared([H_per_block, BI], BF16)
-                page_idx_shared = T.alloc_shared([BI], INT32)
+                Q_shared = T.alloc_fragment([H_per_block, D_all], BF16) # 64, 512 # 64*512*2 = 65536
+                K_packed_shared = T.alloc_shared([BI, PACKED_W4], "uint32") # 64*144 = 36864
+                K_scale_shared = T.alloc_shared([BI, SCALE_W4], "uint32") # 64*2 = 128
+                KV_shared = T.alloc_shared([BI, D_all], BF16) # 64*512*2 = 65536
+                S_shared = T.alloc_shared([H_per_block, BI], BF16) # 64*64*2=8192
+                page_idx_shared = T.alloc_shared([BI], INT32) # 64*4=256
 
                 mask = T.alloc_fragment([BI], "bool")
                 scale_byte_local = T.alloc_fragment([BI, NUM_TILES], "uint32")
 
-                acc_o = T.alloc_fragment([H_per_block, D], accum_dtype)
-                acc_o_tail = T.alloc_fragment([H_per_block, D_tail], accum_dtype)
-                acc_s = T.alloc_fragment([H_per_block, BI], accum_dtype)
-                sumexp = T.alloc_fragment([H_per_block], accum_dtype)
-                sumexp_i = T.alloc_fragment([H_per_block], accum_dtype)
+                acc_o = T.alloc_fragment([H_per_block, D_all], accum_dtype) # 64, 512
+                acc_s = T.alloc_fragment([H_per_block, BI], accum_dtype) # 64 64 / 512 = 8
+                sumexp = T.alloc_fragment([H_per_block], accum_dtype) # 64 / 512 = 1
+                sumexp_i = T.alloc_fragment([H_per_block], accum_dtype) # 64 / 512 = 1
+                alpha = T.alloc_fragment([H_per_block], accum_dtype) # 64 / 512 = 1
                 alpha = T.alloc_fragment([H_per_block], accum_dtype)
-                m_i = T.alloc_fragment([H_per_block], accum_dtype)
-                m_i_prev = T.alloc_fragment([H_per_block], accum_dtype)
+                m_i = T.alloc_fragment([H_per_block], accum_dtype) # 64 / 512 = 1
+                m_i_prev = T.alloc_fragment([H_per_block], accum_dtype) # 64 / 512 = 1
 
                 T.fill(acc_o, 0)
-                T.fill(acc_o_tail, 0)
                 T.fill(sumexp, 0)
                 T.fill(m_i, -(2**30))
 
@@ -1746,8 +1744,7 @@ def dpsk_v4_fp8_partial_kernel(
                 H0 = g_i * padded_H + (0 if REPLICATE_H == 1 else h_rep * 64) # 0/64 同一个kv cache段内的偏移. 哪个head对吧.
                 H1 = H0 + H_per_block
 
-                T.copy(Q[b_i, s_i, H0:H1, :D], Q_shared) # NoPE: [64, 448]
-                T.copy(Q[b_i, s_i, H0:H1, D : D + D_tail], Q_tail_shared) # RoPE: [64,64]
+                T.copy(Q[b_i, s_i, H0:H1, :D_all], Q_shared)
 
                 tk_len_1 = Topk_length_1[b_i] # 读这个batch实际的topk长度.
                 tk_len_2 = Topk_length_2[b_i]
@@ -1817,7 +1814,7 @@ def dpsk_v4_fp8_partial_kernel(
                                 word & T.uint32(0xFFFF),
                                 (word >> T.uint32(16)) & T.uint32(0xFFFF),
                             )
-                            K_tail_shared[bi_i, j] = T.reinterpret(
+                            KV_shared[bi_i, D + j] = T.reinterpret(
                                 BF16, T.Cast("uint16", half_u32)
                             )
 
@@ -1825,17 +1822,10 @@ def dpsk_v4_fp8_partial_kernel(
                             acc_s[h_i, bi_i] = T.if_then_else(
                                 mask[bi_i], 0, -T.infinity(acc_s.dtype)
                             )
-                        T.gemm( # nope gemm
+                        T.gemm(
                             Q_shared,
                             KV_shared,
-                            acc_s,
-                            transpose_B=True,
-                            policy=T.GemmWarpPolicy.FullRow,
-                        )
-                        T.gemm( # rope gemm
-                            Q_tail_shared,
-                            K_tail_shared,
-                            acc_s,
+                            acc_s, # [64, 64]
                             transpose_B=True,
                             policy=T.GemmWarpPolicy.FullRow,
                         )
@@ -1852,20 +1842,15 @@ def dpsk_v4_fp8_partial_kernel(
                         T.reduce_sum(acc_s, sumexp_i, dim=1) # sumexp.
                         for h_i in T.Parallel(H_per_block):
                             sumexp[h_i] = sumexp[h_i] * alpha[h_i] + sumexp_i[h_i] # 贡献加到上一个去.
-                        for h_i, d_i in T.Parallel(H_per_block, D):
+                        for h_i, d_i in T.Parallel(H_per_block, D + D_tail):
                             acc_o[h_i, d_i] *= alpha[h_i] # 上一轮按照贡献缩放 acc_o
-                        for h_i, d_i in T.Parallel(H_per_block, D_tail):
-                            acc_o_tail[h_i, d_i] *= alpha[h_i] # 类似.
                         T.copy(acc_s, S_shared) # 保存一下用来做gemm
                         T.gemm(
-                            S_shared, KV_shared, acc_o, policy=T.GemmWarpPolicy.FullRow
+                            S_shared,  # [64, 64]
+                            KV_shared, # [64, 512]
+                            acc_o,  # [64, 512]
+                            policy=T.GemmWarpPolicy.FullRow
                         )
-                        T.gemm(
-                            S_shared,
-                            K_tail_shared,
-                            acc_o_tail,
-                            policy=T.GemmWarpPolicy.FullRow,
-                        ) # 两次gemm.
                 else:
                     # Phase 2 (groups [n_groups_1, n_groups)).
                     for k_i in T.Pipelined(inner_iter_2, num_stages=num_stages):
@@ -1931,7 +1916,7 @@ def dpsk_v4_fp8_partial_kernel(
                                 word & T.uint32(0xFFFF),
                                 (word >> T.uint32(16)) & T.uint32(0xFFFF),
                             )
-                            K_tail_shared[bi_i, j] = T.reinterpret(
+                            KV_shared[bi_i, D + j] = T.reinterpret(
                                 BF16, T.Cast("uint16", half_u32)
                             )
 
@@ -1942,13 +1927,6 @@ def dpsk_v4_fp8_partial_kernel(
                         T.gemm(
                             Q_shared,
                             KV_shared,
-                            acc_s,
-                            transpose_B=True,
-                            policy=T.GemmWarpPolicy.FullRow,
-                        )
-                        T.gemm(
-                            Q_tail_shared,
-                            K_tail_shared,
                             acc_s,
                             transpose_B=True,
                             policy=T.GemmWarpPolicy.FullRow,
@@ -1966,28 +1944,16 @@ def dpsk_v4_fp8_partial_kernel(
                         T.reduce_sum(acc_s, sumexp_i, dim=1)
                         for h_i in T.Parallel(H_per_block):
                             sumexp[h_i] = sumexp[h_i] * alpha[h_i] + sumexp_i[h_i]
-                        for h_i, d_i in T.Parallel(H_per_block, D):
+                        for h_i, d_i in T.Parallel(H_per_block, D + D_tail):
                             acc_o[h_i, d_i] *= alpha[h_i]
-                        for h_i, d_i in T.Parallel(H_per_block, D_tail):
-                            acc_o_tail[h_i, d_i] *= alpha[h_i]
                         T.copy(acc_s, S_shared)
                         T.gemm(
                             S_shared, KV_shared, acc_o, policy=T.GemmWarpPolicy.FullRow
                         )
-                        T.gemm(
-                            S_shared,
-                            K_tail_shared,
-                            acc_o_tail,
-                            policy=T.GemmWarpPolicy.FullRow,
-                        )
 
                 # Pre-normalise + write log2-LSE (combine handles attn_sink).
-                for h_i, d_i in T.Parallel(H_per_block, D):
+                for h_i, d_i in T.Parallel(H_per_block, D + D_tail):
                     acc_o[h_i, d_i] = acc_o[h_i, d_i] / T.if_then_else(
-                        sumexp[h_i] == 0.0, 1.0, sumexp[h_i]
-                    )
-                for h_i, d_i in T.Parallel(H_per_block, D_tail):
-                    acc_o_tail[h_i, d_i] = acc_o_tail[h_i, d_i] / T.if_then_else(
                         sumexp[h_i] == 0.0, 1.0, sumexp[h_i]
                     )
                 for h_i in T.Parallel(H_per_block):
@@ -1996,8 +1962,7 @@ def dpsk_v4_fp8_partial_kernel(
                         -(2.0**30),
                         T.log2(sumexp[h_i]) + m_i[h_i] * sm_scale,
                     )
-                T.copy(acc_o, Partial_O[b_i, s_i, group_i, H0:H1, :D])
-                T.copy(acc_o_tail, Partial_O[b_i, s_i, group_i, H0:H1, D : D + D_tail])
+                T.copy(acc_o, Partial_O[b_i, s_i, group_i, H0:H1, :D_all])
                 T.copy(m_i, Partial_LSE[b_i, s_i, group_i, H0:H1])
 
         return main
@@ -2019,20 +1984,17 @@ def dpsk_v4_fp8_partial_kernel(
         with T.Kernel(
             seq_len * REPLICATE_H * n_groups, batch, kv_group, threads=threads
         ) as (bx, by, bz):
-            Q_shared = T.alloc_fragment([H_per_block, D], BF16)
-            Q_tail_shared = T.alloc_fragment([H_per_block, D_tail], BF16)
+            Q_shared = T.alloc_fragment([H_per_block, D_all], BF16)
             K_packed_shared = T.alloc_shared([BI, PACKED_W4], "uint32")
             K_scale_shared = T.alloc_shared([BI, SCALE_W4], "uint32")
-            KV_shared = T.alloc_shared([BI, D], BF16)
-            K_tail_shared = T.alloc_shared([BI, D_tail], BF16)
+            KV_shared = T.alloc_shared([BI, D_all], BF16)
             S_shared = T.alloc_shared([H_per_block, BI], BF16)
             page_idx_shared = T.alloc_shared([BI], INT32)
 
             mask = T.alloc_fragment([BI], "bool")
             scale_byte_local = T.alloc_fragment([BI, NUM_TILES], "uint32")
 
-            acc_o = T.alloc_fragment([H_per_block, D], accum_dtype)
-            acc_o_tail = T.alloc_fragment([H_per_block, D_tail], accum_dtype)
+            acc_o = T.alloc_fragment([H_per_block, D_all], accum_dtype)
             acc_s = T.alloc_fragment([H_per_block, BI], accum_dtype)
             sumexp = T.alloc_fragment([H_per_block], accum_dtype)
             sumexp_i = T.alloc_fragment([H_per_block], accum_dtype)
@@ -2041,7 +2003,6 @@ def dpsk_v4_fp8_partial_kernel(
             m_i_prev = T.alloc_fragment([H_per_block], accum_dtype)
 
             T.fill(acc_o, 0)
-            T.fill(acc_o_tail, 0)
             T.fill(sumexp, 0)
             T.fill(m_i, -(2**30))
 
@@ -2054,8 +2015,7 @@ def dpsk_v4_fp8_partial_kernel(
             H0 = g_i * padded_H + (0 if REPLICATE_H == 1 else h_rep * 64)
             H1 = H0 + H_per_block
 
-            T.copy(Q[b_i, s_i, H0:H1, :D], Q_shared)
-            T.copy(Q[b_i, s_i, H0:H1, D : D + D_tail], Q_tail_shared)
+            T.copy(Q[b_i, s_i, H0:H1, :D_all], Q_shared)
 
             tk_len_1 = Topk_length_1[b_i]
 
@@ -2120,7 +2080,7 @@ def dpsk_v4_fp8_partial_kernel(
                         word & T.uint32(0xFFFF),
                         (word >> T.uint32(16)) & T.uint32(0xFFFF),
                     )
-                    K_tail_shared[bi_i, j] = T.reinterpret(
+                    KV_shared[bi_i, D + j] = T.reinterpret(
                         BF16, T.Cast("uint16", half_u32)
                     )
 
@@ -2131,13 +2091,6 @@ def dpsk_v4_fp8_partial_kernel(
                 T.gemm(
                     Q_shared,
                     KV_shared,
-                    acc_s,
-                    transpose_B=True,
-                    policy=T.GemmWarpPolicy.FullRow,
-                )
-                T.gemm(
-                    Q_tail_shared,
-                    K_tail_shared,
                     acc_s,
                     transpose_B=True,
                     policy=T.GemmWarpPolicy.FullRow,
@@ -2155,22 +2108,13 @@ def dpsk_v4_fp8_partial_kernel(
                 T.reduce_sum(acc_s, sumexp_i, dim=1)
                 for h_i in T.Parallel(H_per_block):
                     sumexp[h_i] = sumexp[h_i] * alpha[h_i] + sumexp_i[h_i]
-                for h_i, d_i in T.Parallel(H_per_block, D):
+                for h_i, d_i in T.Parallel(H_per_block, D_all):
                     acc_o[h_i, d_i] *= alpha[h_i]
-                for h_i, d_i in T.Parallel(H_per_block, D_tail):
-                    acc_o_tail[h_i, d_i] *= alpha[h_i]
                 T.copy(acc_s, S_shared)
                 T.gemm(S_shared, KV_shared, acc_o, policy=T.GemmWarpPolicy.FullRow)
-                T.gemm(
-                    S_shared, K_tail_shared, acc_o_tail, policy=T.GemmWarpPolicy.FullRow
-                )
 
-            for h_i, d_i in T.Parallel(H_per_block, D):
+            for h_i, d_i in T.Parallel(H_per_block, D_all):
                 acc_o[h_i, d_i] = acc_o[h_i, d_i] / T.if_then_else(
-                    sumexp[h_i] == 0.0, 1.0, sumexp[h_i]
-                )
-            for h_i, d_i in T.Parallel(H_per_block, D_tail):
-                acc_o_tail[h_i, d_i] = acc_o_tail[h_i, d_i] / T.if_then_else(
                     sumexp[h_i] == 0.0, 1.0, sumexp[h_i]
                 )
             for h_i in T.Parallel(H_per_block):
@@ -2179,8 +2123,7 @@ def dpsk_v4_fp8_partial_kernel(
                     -(2.0**30),
                     T.log2(sumexp[h_i]) + m_i[h_i] * sm_scale,
                 )
-            T.copy(acc_o, Partial_O[b_i, s_i, group_i, H0:H1, :D])
-            T.copy(acc_o_tail, Partial_O[b_i, s_i, group_i, H0:H1, D : D + D_tail])
+            T.copy(acc_o, Partial_O[b_i, s_i, group_i, H0:H1, :D_all])
             T.copy(m_i, Partial_LSE[b_i, s_i, group_i, H0:H1])
 
     return main
@@ -2396,6 +2339,7 @@ def dpsk_v4_fp8_attention_fwd(
         # 16384, 8, 256, 2
         inner_iter_1 = _pick_inner_iter(seq, ni_1, cu, block_per_cu) # 2
         inner_iter_2 = _pick_inner_iter(seq, ni_2, cu, block_per_cu) # 8 || 1
+        # inner_iter_2 = min(inner_iter_2, 4) # TODO(zty) 好像有一点点用...
 
         tk_len_2 = (
             extra_topk_length

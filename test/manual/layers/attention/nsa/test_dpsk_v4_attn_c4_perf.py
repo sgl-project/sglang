@@ -26,6 +26,8 @@ or:
 """
 
 from __future__ import annotations
+import os
+os.system("rm -rf ~/.tilelang")
 
 from typing import Any, Dict, Tuple
 
@@ -225,6 +227,11 @@ def test_dpsk_v4_c4_correctness():
     out_ref, lse_ref = flash_mla_with_kvcache_torch(**inputs)
     out_kernel, lse_kernel = dpsk_v4_fp8_attention_fwd(**inputs)
 
+    # `flash_mla_with_kvcache_torch` returns lse as [b, h_q, s_q] (after a
+    # `transpose(1, 2)` inside ref_sparse_attn_decode); the kernel returns
+    # [b, s_q, h_q]. Align them before comparing.
+    lse_ref = lse_ref.transpose(1, 2)
+
     # Loose-ish thresholds: kernel uses online softmax with split-K; ref does
     # full softmax in fp32. Tolerances mirror those used in
     # debug_flash_mla_adapter._assert_close.
@@ -265,8 +272,38 @@ def test_dpsk_v4_c4_perf():
 if __name__ == "__main__":
     inputs = _build_inputs(PERF_BATCH, PERF_SWA_BLOCKS, PERF_EXTRA_BLOCKS)
     out, lse = dpsk_v4_fp8_attention_fwd(**inputs)
+
     print(f"out.shape = {tuple(out.shape)} dtype = {out.dtype}")
     print(f"lse.shape = {tuple(lse.shape)} dtype = {lse.dtype}")
+
+    print("\n[correctness] running torch ref on full perf shape ...")
+    out_ref, lse_ref = flash_mla_with_kvcache_torch(**inputs)
+    # ref returns lse as [b, h_q, s_q]; kernel as [b, s_q, h_q]. Align.
+    lse_ref = lse_ref.transpose(1, 2)
+
+    out_diff = (out.float() - out_ref.float()).abs()
+    finite_lse = torch.isfinite(lse) & torch.isfinite(lse_ref)
+    lse_diff = (lse[finite_lse].float() - lse_ref[finite_lse].float()).abs()
+    print(
+        f"  out  diff: max={out_diff.max().item():.4e} "
+        f"mean={out_diff.mean().item():.4e}"
+    )
+    print(
+        f"  lse  diff: max={lse_diff.max().item():.4e} "
+        f"mean={lse_diff.mean().item():.4e} "
+        f"(over {finite_lse.sum().item()}/{lse.numel()} finite entries)"
+    )
+    torch.testing.assert_close(
+        out.float(), out_ref.float(), rtol=5e-2, atol=2e-2
+    )
+    if finite_lse.any():
+        torch.testing.assert_close(
+            lse[finite_lse].float(),
+            lse_ref[finite_lse].float(),
+            rtol=1e-2,
+            atol=1e-3,
+        )
+    print("[correctness] passed")
 
     fn = lambda: dpsk_v4_fp8_attention_fwd(**inputs)
     stats = _benchmark(fn)
