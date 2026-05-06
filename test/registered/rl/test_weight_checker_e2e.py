@@ -138,6 +138,74 @@ class TestWeightCheckerE2E(CustomTestCase):
         self.assertEqual(resp.status_code, 200)
         self.assertTrue(resp.json()["success"])
 
+    def test_e_checksum_returns_ranks_with_hashes(self):
+        """checksum action must yield a ranks list with hex hashes per rank."""
+        resp = self._post("checksum")
+        self.assertEqual(resp.status_code, 200)
+        body = resp.json()
+        self.assertTrue(body["success"])
+        self.assertIn("ranks", body)
+        ranks = body["ranks"]
+        self.assertIsInstance(ranks, list)
+        self.assertGreaterEqual(len(ranks), 1)
+
+        first = ranks[0]
+        self.assertIn("checksums", first)
+        self.assertIn("parallelism_info", first)
+
+        info = first["parallelism_info"]
+        for key in (
+            "tp_rank",
+            "tp_size",
+            "dp_rank",
+            "dp_size",
+            "pp_rank",
+            "pp_size",
+            "rank",
+            "size",
+        ):
+            self.assertIn(key, info)
+
+        checksums = first["checksums"]
+        self.assertGreater(len(checksums), 0)
+        for name, h in checksums.items():
+            self.assertIsInstance(h, str)
+            self.assertEqual(len(h), 16, f"unexpected hash length for {name!r}: {h!r}")
+            int(h, 16)
+
+    def test_e_checksum_is_stable_across_calls(self):
+        """Two consecutive checksum calls with no weight update must match."""
+        first = self._post("checksum").json()["ranks"]
+        second = self._post("checksum").json()["ranks"]
+        self.assertEqual(first, second)
+
+    def test_e_checksum_changes_after_weight_update(self):
+        """Updating a tensor must change its corresponding hash."""
+        param_name = "model.layers.7.mlp.up_proj.weight"
+        fused_name = "model.layers.7.mlp.gate_up_proj.weight"
+
+        before = self._post("checksum").json()["ranks"][0]["checksums"]
+        before_hash = before.get(fused_name)
+        self.assertIsNotNone(before_hash, f"missing {fused_name!r} in checksum keys")
+
+        new_tensor = torch.full(_UP_PROJ_SHAPE, 0.5, device="cuda")
+        self.assertTrue(
+            self._update_weights([(param_name, new_tensor)]).json()["success"]
+        )
+
+        after = self._post("checksum").json()["ranks"][0]["checksums"]
+        self.assertNotEqual(after[fused_name], before_hash)
+
+    def test_e_checksum_skips_non_persistent_buffers(self):
+        """No checksum entry should contain a non-persistent-buffer substring."""
+        ranks = self._post("checksum").json()["ranks"]
+        for rank in ranks:
+            for name in rank["checksums"]:
+                self.assertNotIn("cos_sin_cache", name)
+                self.assertNotIn("inv_freq", name)
+                self.assertNotIn("freqs_cis", name)
+                self.assertNotIn("_weight_fp32", name)
+
     def test_z_snapshot_reset_compare_detects_diff(self):
         """Destructive: leaves weights randomized. Named test_z_* so it runs last."""
         self.assertEqual(self._post("snapshot").status_code, 200)

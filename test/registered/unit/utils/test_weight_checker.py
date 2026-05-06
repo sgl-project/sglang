@@ -26,8 +26,12 @@ from sglang.srt.layers.quantization.fp8_utils import (
     transform_scale_ue8m0,
 )
 from sglang.srt.utils.weight_checker import (
+    ChecksumInfo,
+    ParallelismInfo,
     WeightChecker,
     _check_tensors,
+    _hash_tensor,
+    _is_non_persistent_buffer_name,
     _postprocess_tensors,
     _random_like,
 )
@@ -99,11 +103,26 @@ class _TinyModel(nn.Module):
 
 
 class _FakeModelRunner:
-    """Minimal stand-in: WeightChecker only touches `.model.named_parameters()` and
-    `.model.named_buffers()`, nothing else."""
+    """Minimal stand-in: WeightChecker touches `.model.named_parameters()`,
+    `.model.named_buffers()`, plus parallelism attributes for the checksum action."""
 
-    def __init__(self, model: nn.Module):
+    def __init__(
+        self,
+        model: nn.Module,
+        tp_rank: int = 0,
+        tp_size: int = 1,
+        dp_rank: int = 0,
+        dp_size: int = 1,
+        pp_rank: int = 0,
+        pp_size: int = 1,
+    ):
         self.model = model
+        self.tp_rank = tp_rank
+        self.tp_size = tp_size
+        self.dp_rank = dp_rank
+        self.dp_size = dp_size
+        self.pp_rank = pp_rank
+        self.pp_size = pp_size
 
 
 # ---------------------------------------------------------------------------
@@ -449,18 +468,165 @@ class TestHandle(_WeightCheckerTestBase):
     def test_routes_to_actions(self):
         with patch.object(self.checker, "_snapshot") as m_snap, patch.object(
             self.checker, "_reset_tensors"
-        ) as m_reset, patch.object(self.checker, "_compare") as m_compare:
+        ) as m_reset, patch.object(self.checker, "_compare") as m_compare, patch.object(
+            self.checker, "_compute_checksum", return_value={"checksums": {}}
+        ) as m_checksum:
             self.checker.handle("snapshot")
             self.checker.handle("reset_tensors")
             self.checker.handle("compare")
+            self.checker.handle("checksum")
             m_snap.assert_called_once()
             m_reset.assert_called_once()
             m_compare.assert_called_once()
+            m_checksum.assert_called_once()
+
+    def test_returns_none_for_non_checksum_actions(self):
+        self.assertIsNone(self.checker.handle("snapshot"))
+        self.assertIsNone(self.checker.handle("compare"))
+
+    def test_returns_dict_for_checksum_action(self):
+        out = self.checker.handle("checksum")
+        self.assertIsInstance(out, dict)
+        self.assertIn("checksums", out)
+        self.assertIn("parallelism_info", out)
 
     def test_unknown_action_raises(self):
         with self.assertRaises(Exception) as ctx:
             self.checker.handle("nonsense_action")
         self.assertIn("Unsupported", str(ctx.exception))
+
+
+# ---------------------------------------------------------------------------
+# _is_non_persistent_buffer_name
+# ---------------------------------------------------------------------------
+
+
+class TestIsNonPersistentBufferName(CustomTestCase):
+
+    def test_matches_cos_sin_cache_substring(self):
+        self.assertTrue(
+            _is_non_persistent_buffer_name("model.rotary_emb.cos_sin_cache")
+        )
+
+    def test_matches_inv_freq_substring(self):
+        self.assertTrue(_is_non_persistent_buffer_name("model.rotary_emb.inv_freq"))
+
+    def test_matches_freqs_cis_substring(self):
+        self.assertTrue(_is_non_persistent_buffer_name("model.rotary_emb.freqs_cis"))
+
+    def test_matches_weight_fp32_substring(self):
+        self.assertTrue(
+            _is_non_persistent_buffer_name("model.layers.0.mlp.gate._weight_fp32")
+        )
+
+    def test_does_not_match_normal_param_names(self):
+        self.assertFalse(_is_non_persistent_buffer_name("model.layers.0.mlp.weight"))
+        self.assertFalse(_is_non_persistent_buffer_name("model.embed_tokens.weight"))
+
+
+# ---------------------------------------------------------------------------
+# _hash_tensor
+# ---------------------------------------------------------------------------
+
+
+class TestHashTensor(CustomTestCase):
+
+    def test_stable_for_same_input(self):
+        t = torch.arange(64, dtype=torch.float32).cuda()
+        self.assertEqual(_hash_tensor(t), _hash_tensor(t.clone()))
+
+    def test_changes_with_data(self):
+        a = torch.zeros(64, dtype=torch.float32).cuda()
+        b = torch.ones(64, dtype=torch.float32).cuda()
+        self.assertNotEqual(_hash_tensor(a), _hash_tensor(b))
+
+    def test_returns_16_char_hex(self):
+        t = torch.zeros(64, dtype=torch.float32).cuda()
+        h = _hash_tensor(t)
+        self.assertEqual(len(h), 16)
+        int(h, 16)  # raises if not hex
+
+    def test_does_not_mutate_input(self):
+        t = torch.arange(64, dtype=torch.float32).cuda()
+        before = t.clone()
+        _hash_tensor(t)
+        torch.testing.assert_close(t, before)
+
+
+# ---------------------------------------------------------------------------
+# _compute_checksum
+# ---------------------------------------------------------------------------
+
+
+class _ChecksumTestBase(CustomTestCase):
+
+    def setUp(self):
+        torch.manual_seed(0)
+        self.model = _TinyModel().cuda()
+        self.runner = _FakeModelRunner(
+            self.model,
+            tp_rank=2,
+            tp_size=4,
+            dp_rank=1,
+            dp_size=2,
+            pp_rank=0,
+            pp_size=1,
+        )
+        self.checker = WeightChecker(model_runner=self.runner)
+
+
+class TestComputeChecksum(_ChecksumTestBase):
+
+    def test_returns_dict_with_expected_top_level_keys(self):
+        out = self.checker._compute_checksum()
+        self.assertEqual(set(out.keys()), {"checksums", "parallelism_info"})
+
+    def test_skips_non_persistent_buffers(self):
+        out = self.checker._compute_checksum()
+        names = set(out["checksums"].keys())
+        # Normal params and buffers are present.
+        self.assertIn("w", names)
+        self.assertIn("b", names)
+        self.assertIn("running_mean", names)
+        # Non-persistent buffer patterns are filtered out.
+        self.assertNotIn("rotary_emb_cos_sin_cache", names)
+        self.assertNotIn("rotary_emb_freqs_cis", names)
+        self.assertNotIn("gate_proj_weight_fp32_cache", names)
+
+    def test_hashes_are_hex_strings(self):
+        out = self.checker._compute_checksum()
+        for name, h in out["checksums"].items():
+            self.assertEqual(len(h), 16, f"unexpected hash length for {name!r}")
+            int(h, 16)
+
+    def test_parallelism_info_reflects_runner_state(self):
+        info = self.checker._compute_checksum()["parallelism_info"]
+        self.assertEqual(info["tp_rank"], 2)
+        self.assertEqual(info["tp_size"], 4)
+        self.assertEqual(info["dp_rank"], 1)
+        self.assertEqual(info["dp_size"], 2)
+        self.assertEqual(info["pp_rank"], 0)
+        self.assertEqual(info["pp_size"], 1)
+        # rank/size come from torch.distributed; default to 0/1 when uninitialized.
+        self.assertIn("rank", info)
+        self.assertIn("size", info)
+
+    def test_checksum_is_stable_for_unchanged_weights(self):
+        first = self.checker._compute_checksum()
+        second = self.checker._compute_checksum()
+        self.assertEqual(first, second)
+
+    def test_checksum_changes_after_param_mutation(self):
+        first = self.checker._compute_checksum()["checksums"]["w"]
+        with torch.no_grad():
+            self.model.w.data.fill_(99.0)
+        second = self.checker._compute_checksum()["checksums"]["w"]
+        self.assertNotEqual(first, second)
+
+    def test_validates_against_pydantic_schema(self):
+        out = self.checker._compute_checksum()
+        info = ChecksumInfo.model_validate(out)
+        self.assertIsInstance(info.parallelism_info, ParallelismInfo)
 
 
 if __name__ == "__main__":
