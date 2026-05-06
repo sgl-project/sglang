@@ -12,7 +12,7 @@ Usage:
     # Tag the run for later compare_perf.py usage
     python3 python/sglang/multimodal_gen/.claude/skills/sglang-diffusion-benchmark-profile/scripts/bench_diffusion_denoise.py --model flux --label tuned
 
-    # All 15 preset models
+    # All 19 preset models
     python3 python/sglang/multimodal_gen/.claude/skills/sglang-diffusion-benchmark-profile/scripts/bench_diffusion_denoise.py --all
 
     # Show preset order, model path, and nightly mapping
@@ -42,7 +42,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
-from diffusion_skill_env import (
+from diffusion_skill_env import (  # noqa: E402
     ensure_dir,
     get_assets_dir,
     get_output_dir,
@@ -297,6 +297,84 @@ MODELS = {
             "false",
         ],
     },
+    # 16. Skill-only extra preset
+    # Requires: <repo>/inputs/diffusion_benchmark/figs/cat.png
+    "joyai-edit": {
+        "path": "jdopensource/JoyAI-Image-Edit-Diffusers",
+        "prompt": "Make the cat wear a red hat",
+        "image_path": str(ASSET_DIR / "cat.png"),
+        "extra_args": [
+            "--width=1024",
+            "--height=1024",
+            "--num-inference-steps=40",
+            "--guidance-scale=4.0",
+            "--dit-layerwise-offload",
+            "false",
+            "--dit-cpu-offload",
+            "false",
+            "--num-gpus=2",
+            "--enable-cfg-parallel",
+            "--ulysses-degree=1",
+        ],
+    },
+    # 17. Skill-only extra preset
+    # Requires: <repo>/inputs/diffusion_benchmark/figs/cat.png
+    "firered-edit-1.0": {
+        "path": "FireRedTeam/FireRed-Image-Edit-1.0",
+        "prompt": "Make the cat wear a red hat",
+        "image_path": str(ASSET_DIR / "cat.png"),
+        "extra_args": [
+            "--width=1024",
+            "--height=1024",
+            "--num-inference-steps=40",
+            "--guidance-scale=4.0",
+            "--dit-layerwise-offload",
+            "false",
+            "--dit-cpu-offload",
+            "false",
+            "--num-gpus=2",
+            "--enable-cfg-parallel",
+            "--ulysses-degree=1",
+        ],
+    },
+    # 18. Skill-only extra preset
+    # Requires: <repo>/inputs/diffusion_benchmark/figs/cat.png
+    "firered-edit-1.1": {
+        "path": "FireRedTeam/FireRed-Image-Edit-1.1",
+        "prompt": "Make the cat wear a red hat",
+        "image_path": str(ASSET_DIR / "cat.png"),
+        "extra_args": [
+            "--width=1024",
+            "--height=1024",
+            "--num-inference-steps=40",
+            "--guidance-scale=4.0",
+            "--dit-layerwise-offload",
+            "false",
+            "--dit-cpu-offload",
+            "false",
+            "--num-gpus=2",
+            "--enable-cfg-parallel",
+            "--ulysses-degree=1",
+        ],
+    },
+    # 19. Skill-only extra preset
+    # Requires: <repo>/inputs/diffusion_benchmark/figs/cat.png
+    "hunyuan3d-shape": {
+        "path": "tencent/Hunyuan3D-2",
+        "prompt": "generate 3d mesh",
+        "image_path": str(ASSET_DIR / "cat.png"),
+        "config_overrides": {
+            "paint_enable": False,
+        },
+        "extra_args": [
+            "--num-inference-steps=50",
+            "--guidance-scale=5.0",
+            "--dit-layerwise-offload",
+            "false",
+            "--dit-cpu-offload",
+            "false",
+        ],
+    },
 }
 
 
@@ -310,6 +388,9 @@ def required_gpus_for_model(model_key: str) -> int:
         "ltx23-ti2v-two-stage",
         "ltx23-one-stage",
         "ltx23-two-stage",
+        "joyai-edit",
+        "firered-edit-1.0",
+        "firered-edit-1.1",
     }:
         return 2
     return 1
@@ -369,6 +450,15 @@ def build_sglang_cmd(
 
     if "image_path" in cfg:
         cmd.append(f"--image-path={cfg['image_path']}")
+
+    if "config_overrides" in cfg:
+        config_dir = ensure_dir(
+            get_output_dir("benchmarks", REPO_ROOT) / "generated_configs"
+        )
+        config_path = config_dir / f"{model_key}.json"
+        with open(config_path, "w") as f:
+            json.dump(cfg["config_overrides"], f, indent=2, sort_keys=True)
+        cmd.append(f"--config={config_path}")
 
     cmd.extend(cfg["extra_args"])
 
@@ -563,7 +653,7 @@ def main():
         choices=list(MODELS.keys()),
         help="Model to benchmark (default: flux)",
     )
-    parser.add_argument("--all", action="store_true", help="Benchmark all 15 models")
+    parser.add_argument("--all", action="store_true", help="Benchmark all 19 models")
     parser.add_argument(
         "--list-models",
         action="store_true",
