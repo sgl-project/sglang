@@ -26,6 +26,7 @@ Pattern follows `test/registered/layers/mamba/test_mamba2_mixer.py` —
 `torch.multiprocessing.spawn` is required because `torch.distributed`
 plays poorly with arbitrary subprocess launchers.
 """
+
 import pytest
 import torch
 
@@ -207,9 +208,10 @@ def _check_solver_with_empty_rank(rank: int, world_size: int, device: torch.devi
     actual = solver.solve(topk_ids)
 
     # Shape + finiteness sanity.
-    assert actual.shape == (NUM_LOGICAL, solver.max_copies), (
-        f"rank {rank}: bad output shape {actual.shape}"
-    )
+    assert actual.shape == (
+        NUM_LOGICAL,
+        solver.max_copies,
+    ), f"rank {rank}: bad output shape {actual.shape}"
     assert torch.isfinite(actual).all(), f"rank {rank}: non-finite values in output"
     assert (actual >= 0).all(), f"rank {rank}: negative probabilities"
 
@@ -250,9 +252,9 @@ def _check_all_ranks_empty(rank: int, world_size: int, device: torch.device):
 
     assert torch.isfinite(actual).all(), f"rank {rank}: non-finite for empty-batch"
     assert (actual >= 0).all(), f"rank {rank}: negative for empty-batch"
-    assert torch.allclose(actual, expected, atol=1e-4, rtol=1e-3), (
-        f"rank {rank}: empty-batch output disagrees with all-zero oracle"
-    )
+    assert torch.allclose(
+        actual, expected, atol=1e-4, rtol=1e-3
+    ), f"rank {rank}: empty-batch output disagrees with all-zero oracle"
 
 
 def _check_solver_determinism(rank: int, world_size: int, device: torch.device):

@@ -18,12 +18,13 @@
 // Templated on (MAX_COPIES, BLOCK_DIM). MAX_COPIES is small (typically 2-3)
 // so the per-row prefix sum unrolls into a few instructions per thread.
 
-#include <dlpack/dlpack.h>
-#include <tvm/ffi/container/tensor.h>
-
 #include <sgl_kernel/tensor.h>
 #include <sgl_kernel/utils.h>
+
 #include <sgl_kernel/utils.cuh>
+
+#include <dlpack/dlpack.h>
+#include <tvm/ffi/container/tensor.h>
 
 #include <cstdint>
 
@@ -31,11 +32,11 @@ namespace {
 
 template <int MAX_COPIES, int BLOCK_DIM>
 __global__ void dispatch_probability_kernel(
-    int32_t* __restrict__ out_topk_ids,        // (N,)
-    const int32_t* __restrict__ in_topk_ids,   // (N,)
-    const float* __restrict__ log2phy_prob,    // (NUM_LOGICAL, MAX_COPIES)
-    const int32_t* __restrict__ log2phy_map,   // (NUM_LOGICAL, MAX_COPIES)
-    const float* __restrict__ random_vals,     // (N,)
+    int32_t* __restrict__ out_topk_ids,       // (N,)
+    const int32_t* __restrict__ in_topk_ids,  // (N,)
+    const float* __restrict__ log2phy_prob,   // (NUM_LOGICAL, MAX_COPIES)
+    const int32_t* __restrict__ log2phy_map,  // (NUM_LOGICAL, MAX_COPIES)
+    const float* __restrict__ random_vals,    // (N,)
     int N) {
   const int idx = blockIdx.x * BLOCK_DIM + threadIdx.x;
   if (idx >= N) return;
@@ -85,41 +86,27 @@ __global__ void dispatch_probability_kernel(
 
 template <int MAX_COPIES, int BLOCK_DIM>
 void dispatch_probability(
-    tvm::ffi::TensorView out_topk_ids,    // (N,) int32
-    tvm::ffi::TensorView in_topk_ids,     // (N,) int32
-    tvm::ffi::TensorView log2phy_prob,    // (NUM_LOGICAL, MAX_COPIES) float32
-    tvm::ffi::TensorView log2phy_map,     // (NUM_LOGICAL, MAX_COPIES) int32
-    tvm::ffi::TensorView random_vals) {   // (N,) float32
+    tvm::ffi::TensorView out_topk_ids,   // (N,) int32
+    tvm::ffi::TensorView in_topk_ids,    // (N,) int32
+    tvm::ffi::TensorView log2phy_prob,   // (NUM_LOGICAL, MAX_COPIES) float32
+    tvm::ffi::TensorView log2phy_map,    // (NUM_LOGICAL, MAX_COPIES) int32
+    tvm::ffi::TensorView random_vals) {  // (N,) float32
   using namespace host;
 
   SymbolicSize N{"num_topk_entries"};
   SymbolicSize NUM_LOGICAL{"num_logical"};
   SymbolicDevice device_;
 
-  TensorMatcher({N})
-      .with_dtype<int32_t>()
-      .with_device<kDLCUDA>(device_)
-      .verify(out_topk_ids)
-      .verify(in_topk_ids);
-  TensorMatcher({NUM_LOGICAL, MAX_COPIES})
-      .with_dtype<float>()
-      .with_device<kDLCUDA>(device_)
-      .verify(log2phy_prob);
-  TensorMatcher({NUM_LOGICAL, MAX_COPIES})
-      .with_dtype<int32_t>()
-      .with_device<kDLCUDA>(device_)
-      .verify(log2phy_map);
-  TensorMatcher({N})
-      .with_dtype<float>()
-      .with_device<kDLCUDA>(device_)
-      .verify(random_vals);
+  TensorMatcher({N}).with_dtype<int32_t>().with_device<kDLCUDA>(device_).verify(out_topk_ids).verify(in_topk_ids);
+  TensorMatcher({NUM_LOGICAL, MAX_COPIES}).with_dtype<float>().with_device<kDLCUDA>(device_).verify(log2phy_prob);
+  TensorMatcher({NUM_LOGICAL, MAX_COPIES}).with_dtype<int32_t>().with_device<kDLCUDA>(device_).verify(log2phy_map);
+  TensorMatcher({N}).with_dtype<float>().with_device<kDLCUDA>(device_).verify(random_vals);
 
   const int n = static_cast<int>(N.unwrap());
   const int grid = (n + BLOCK_DIM - 1) / BLOCK_DIM;
   const DLDevice device = device_.unwrap();
 
-  using KernelT = void (*)(int32_t*, const int32_t*, const float*,
-                           const int32_t*, const float*, int);
+  using KernelT = void (*)(int32_t*, const int32_t*, const float*, const int32_t*, const float*, int);
   KernelT kernel = dispatch_probability_kernel<MAX_COPIES, BLOCK_DIM>;
 
   LaunchKernel(grid, BLOCK_DIM, device)(
