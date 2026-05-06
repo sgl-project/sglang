@@ -12,7 +12,7 @@ DSv4 FP4 checkpoint (SGLANG_DSV4_MODE=2604 SGLANG_DSV4_FP4_EXPERTS=1): weight
 shapes and dtypes are identical; only the post-load layout and the kernel
 call differ.
 
-Usage: --moe-runner-backend flashinfer_w4a16 --moe-a2a-backend none
+Usage: --moe-runner-backend flashinfer_cutlass_wmxfp4a16 --moe-a2a-backend none
        with SGLANG_DSV4_MODE=2604 SGLANG_DSV4_FP4_EXPERTS=1
 """
 
@@ -51,7 +51,6 @@ if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import CombineInput, DispatchOutput
 
 
-from sglang.srt.debug_utils.deepseek_v4_debug_utils import deepseek_v4_moe_code_path_checker as sunrise_moe_code_path_checker
 from sglang.srt.environ import envs
 
 
@@ -126,15 +125,7 @@ class DeepSeekW4A16MoEMethod:
     def create_moe_runner(self, layer, moe_runner_config):
         self.moe_runner_config = moe_runner_config
 
-        # Sanity check: 2604B/260415 ckpt's HF config has swiglu_limit=10.0;
-        # 2604A does not. Same check as mxfp4_deepseek.
         swiglu_limit = moe_runner_config.swiglu_limit
-        is_2604b = envs.SGLANG_DSV4_2604_SUBMODE.get() in ("2604B", "260415")
-        assert is_2604b == (swiglu_limit is not None), (
-            f"swiglu_limit must be non-None iff submode=2604B/260415 "
-            f"(got submode={envs.SGLANG_DSV4_2604_SUBMODE.get()!r}, "
-            f"swiglu_limit={swiglu_limit!r})"
-        )
         self._swiglu_limit_tensor = (
             torch.full(
                 (layer.num_local_experts,),
@@ -258,47 +249,6 @@ class DeepSeekW4A16MoEMethod:
             w13_scale = _fp32_to_ue8m0(w13_scale)
             w2_scale = _fp32_to_ue8m0(w2_scale)
 
-        # bf16-weight debug path: dequant FP4+UE8M0 → bf16 once. Two downstream
-        # consumers share this:
-        #   - BF16_API: apply() calls plain bf16 cutlass_fused_moe (skips the
-        #     SM90 mixed-input kernel and the SM90 interleave).
-        #   - TORCH_REF: apply() calls a pure-torch MoE forward (skips the
-        #     flashinfer bf16 grouped GEMM too).
-        # Both are independent numerical references for W4A16 acc drops.
-        use_bf16_api = envs.SGLANG_HACK_DEBUG_W4A16_USE_BF16_API.get()
-        use_torch_ref = envs.SGLANG_HACK_DEBUG_W4A16_USE_TORCH_REF.get()
-        assert not (use_bf16_api and use_torch_ref), (
-            "SGLANG_HACK_DEBUG_W4A16_USE_BF16_API and "
-            "SGLANG_HACK_DEBUG_W4A16_USE_TORCH_REF are mutually exclusive"
-        )
-        if use_bf16_api or use_torch_ref:
-            consumer = "bf16-API" if use_bf16_api else "torch-ref"
-            log_info_on_rank0(
-                logger,
-                f"Dequant FP4 → bf16 for {consumer} path (layer: {self.prefix})...",
-            )
-            w13_bf16 = _dequant_mxfp4(
-                w13.contiguous().view(torch.uint8),
-                w13_scale.contiguous().view(torch.uint8),
-            )
-            w2_bf16 = _dequant_mxfp4(
-                w2.contiguous().view(torch.uint8),
-                w2_scale.contiguous().view(torch.uint8),
-            )
-            layer.w13_weight = Parameter(w13_bf16, requires_grad=False)
-            layer.w2_weight = Parameter(w2_bf16, requires_grad=False)
-            # Drop scale parameters — bf16 path does not read them. Replace
-            # with zero-size placeholders to keep any attribute-existence
-            # checks happy.
-            layer.w13_weight_scale_inv = Parameter(
-                torch.empty(0, device=w13_bf16.device), requires_grad=False
-            )
-            layer.w2_weight_scale_inv = Parameter(
-                torch.empty(0, device=w2_bf16.device), requires_grad=False
-            )
-            torch.cuda.empty_cache()
-            return
-
         # Pre-interleave MXFP4 weights and scales (runs once at load time).
         # Shapes after interleave:
         #   weights: same as input (byte-permutation only).
@@ -339,17 +289,10 @@ class DeepSeekW4A16MoEMethod:
         # --- Step A: Prepare weights and sizes ---
         w13 = layer.w13_weight
         w2 = layer.w2_weight
-        use_bf16_api = envs.SGLANG_HACK_DEBUG_W4A16_USE_BF16_API.get()
-        use_torch_ref = envs.SGLANG_HACK_DEBUG_W4A16_USE_TORCH_REF.get()
-        if use_bf16_api or use_torch_ref:
-            # bf16 weights path: weights already dequanted to bf16 in
-            # process_weights_after_loading; no scale tensors to pass.
-            quant_scales_arg = None
-        else:
-            quant_scales_arg = [
-                layer.w13_weight_scale_inv.view(torch.int32),
-                layer.w2_weight_scale_inv.view(torch.int32),
-            ]
+        quant_scales_arg = [
+            layer.w13_weight_scale_inv.view(torch.int32),
+            layer.w2_weight_scale_inv.view(torch.int32),
+        ]
 
         # w13/w2 are pre-interleaved uint8 (W4A16) or plain bf16 (bf16-API);
         # logical shapes come from the layer-configured sizes rather than
@@ -411,22 +354,8 @@ class DeepSeekW4A16MoEMethod:
             )
 
         # --- Step E: Call kernel ---
-        # DSv4 260415 ships a per-MoE-layer sanity counter that deepseek_v4.py
-        # asserts is bumped exactly once per forward (see deepseek_v4.py:2014).
-        # Mirror the mxfp4_deepseek bump so the checker is satisfied.
-        sunrise_moe_code_path_checker.observed += 1
-
-        swiglu_limit_arg = (
-            None
-            if envs.SGLANG_HACK_DEBUG_W4A16_REMOVE_SWIGLU_LIMIT.get()
-            else self._swiglu_limit_tensor
-        )
-
+        swiglu_limit_arg = self._swiglu_limit_tensor
         _moe_fn = cutlass_fused_moe
-        if use_torch_ref:
-            from sglang.srt.debug_utils.w4a16_moe_ref_related import (
-                torch_ref_cutlass_fused_moe as _moe_fn,
-            )
 
         # RC-X1 fix: pass full SwiGLU triplet (alpha=1, beta=0, limit)
         # flashinfer test always passes all three; leaving alpha/beta None
@@ -450,7 +379,7 @@ class DeepSeekW4A16MoEMethod:
             ep_rank=layer.moe_ep_rank,
             tp_size=1,
             tp_rank=0,
-            use_w4_group_scaling=not use_bf16_api,
+            use_w4_group_scaling=True,
             tune_max_num_tokens=next_power_of_2(x.shape[0]),
             output=symm_output,
         )

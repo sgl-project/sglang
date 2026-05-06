@@ -266,7 +266,7 @@ class Fp8Config(QuantizationConfig):
             if (
                 envs.SGLANG_DSV4_MODE.get() == "2604"
                 and envs.SGLANG_DSV4_FP4_EXPERTS.get()
-                and get_moe_runner_backend().is_flashinfer_w4a16()
+                and get_moe_runner_backend().is_flashinfer_cutlass_wmxfp4a16()
             ):
                 from sglang.srt.layers.quantization.w4a16_deepseek import (
                     DeepSeekW4A16MoEMethod,

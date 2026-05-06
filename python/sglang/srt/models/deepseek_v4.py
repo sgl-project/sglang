@@ -1134,13 +1134,7 @@ class DeepseekV4ForCausalLM(nn.Module):
         return name
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]], is_nextn=False):
-        assert envs.SGLANG_DSV4_MODE.get() in ["2601", "2604"]
-        if envs.SGLANG_DSV4_MODE.get() == "2604":
-            assert envs.SGLANG_DSV4_2604_SUBMODE.get() in ["2604A", "2604B", "260415"]
-        else:
-            assert envs.SGLANG_DSV4_2604_SUBMODE.get() == ""
-
-        params_dict = dict(self.named_parameters())
+params_dict = dict(self.named_parameters())
         loaded_params: Set[str] = set()
 
         if is_nextn:

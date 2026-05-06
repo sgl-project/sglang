@@ -90,7 +90,7 @@ class StandardDispatcher(BaseDispatcher):
         backend = get_moe_runner_backend()
         self.enable_flashinfer_cutlass_moe = backend.is_flashinfer_cutlass()
         self.enable_flashinfer_mxfp4_moe = backend.is_flashinfer_mxfp4()
-        self.enable_flashinfer_w4a16_moe = backend.is_flashinfer_w4a16()
+        self.enable_flashinfer_cutlass_wmxfp4a16_moe = backend.is_flashinfer_cutlass_wmxfp4a16()
         self.enable_flashinfer_trtllm_routed_moe = backend.is_flashinfer_trtllm_routed()
         # Skip local expert mapping when the backend handles EP with global expert IDs:
         # - cutlass / cutedsl / trtllm_routed handle EP internally
@@ -103,7 +103,7 @@ class StandardDispatcher(BaseDispatcher):
                 self.enable_flashinfer_mxfp4_moe
                 and envs.SGLANG_OPT_MXFP4_SKIP_DISPATCHER_MAPPING.get()
             )
-            or self.enable_flashinfer_w4a16_moe
+            or self.enable_flashinfer_cutlass_wmxfp4a16_moe
         )
         self.num_experts = moe_runner_config.num_experts
         self.num_local_experts = moe_runner_config.num_local_experts

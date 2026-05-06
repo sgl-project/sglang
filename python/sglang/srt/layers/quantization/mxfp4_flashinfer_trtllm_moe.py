@@ -145,12 +145,9 @@ class DeepSeekMxfp4MoEMethod:
             self.runner = MoeRunner(MoeRunnerBackend.MARLIN, moe_runner_config)
 
         swiglu_limit = moe_runner_config.swiglu_limit
-        is_2604b_or_260415 = envs.SGLANG_DSV4_2604_SUBMODE.get() in ("2604B", "260415")
-        assert is_2604b_or_260415 == (swiglu_limit is not None), (
-            f"swiglu_limit must be non-None iff submode=2604B or 260415 "
-            f"(got submode={envs.SGLANG_DSV4_2604_SUBMODE.get()!r}, "
-            f"swiglu_limit={swiglu_limit!r})"
-        )
+        assert (
+            swiglu_limit is not None
+        ), f"swiglu_limit must be non-None for DeepSeek V4 (got {swiglu_limit!r})"
         self._gemm1_clamp_limit_tensor = (
             torch.full(
                 (layer.num_local_experts,),
