@@ -20,9 +20,9 @@ jobs:
         arch: [x86_64, aarch64]
         include:
           - arch: x86_64
-            runner: x64-kernel-build-node
+            runner: x64-docker-build-node
           - arch: aarch64
-            runner: arm-kernel-build-node
+            runner: arm-docker-build-node
     runs-on: ${{ matrix.runner }}
     steps:
       # Self-hosted build nodes retain the workspace across jobs. Prior builds
