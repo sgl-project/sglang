@@ -654,19 +654,16 @@ class SchedulerDisaggregationPrefillMixin:
         for req in done_reqs:
             req.time_stats.set_completion_time()
 
-        page_size = self.token_to_kv_pool_allocator.page_size
-        kv_item_lens = (
-            self.disagg_prefill_bootstrap_queue.kv_manager.kv_args.kv_item_lens
-        )
-        bytes_per_page_all_layers = sum(kv_item_lens)
-
         for req in done_reqs:
             if isinstance(req.finished_reason, FINISH_ABORT):
                 continue
+            if req.bootstrap_host == FAKE_BOOTSTRAP_HOST:
+                continue
+            kv_mgr = getattr(req.disagg_kv_sender, "kv_mgr", None)
+            if kv_mgr and getattr(kv_mgr, "is_dummy_cp_rank", False):
+                continue
             metrics = req.time_stats.compute_and_observe_kv_transfer_metrics(
-                num_tokens=len(req.origin_input_ids),
-                page_size=page_size,
-                bytes_per_page_all_layers=bytes_per_page_all_layers,
+                req.disagg_kv_sender.get_transfer_metric()
             )
             if metrics:
                 # Update last-value for REST API
