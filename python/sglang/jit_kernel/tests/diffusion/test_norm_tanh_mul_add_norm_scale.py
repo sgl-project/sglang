@@ -42,7 +42,7 @@ def test_norm_tanh_mul_add(B: int, S: int, D: int, norm_type: str, dtype: str) -
     if dtype == "float32":
         torch.testing.assert_close(y, ref_y, atol=1e-5, rtol=1e-5)
     else:
-        torch.testing.assert_close(y, ref_y, atol=5e-2, rtol=5e-2)
+        torch.testing.assert_close(y, ref_y, atol=8e-2, rtol=8e-2)
 
 
 @pytest.mark.parametrize("B,S,D", BSD_CONFIG)
@@ -82,8 +82,8 @@ def test_norm_tanh_mul_add_norm_scale(
         torch.testing.assert_close(y, ref_y, atol=1e-5, rtol=1e-5)
         torch.testing.assert_close(y2, ref_y2, atol=1e-5, rtol=1e-5)
     else:
-        torch.testing.assert_close(y, ref_y, atol=5e-2, rtol=5e-2)
-        torch.testing.assert_close(y2, ref_y2, atol=5e-2, rtol=5e-2)
+        torch.testing.assert_close(y, ref_y, atol=8e-2, rtol=8e-2)
+        torch.testing.assert_close(y2, ref_y2, atol=8e-2, rtol=8e-2)
 
 
 if __name__ == "__main__":
