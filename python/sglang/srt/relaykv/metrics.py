@@ -8055,6 +8055,368 @@ def _relaykv_read_req_to_token_value_for_smoke(
     return value, None
 
 
+def _relaykv_shallow_noncallable_attr_for_smoke(
+    value: Any,
+    attr_name: str,
+) -> tuple[bool, Any]:
+    try:
+        attr_value = getattr(value, attr_name)
+    except Exception:
+        return False, None
+    if callable(attr_value):
+        return False, None
+    return True, attr_value
+
+
+def _relaykv_normalize_shape_metadata_for_smoke(value: Any) -> list[int] | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return [value]
+    if isinstance(value, (list, tuple)):
+        normalized: list[int] = []
+        for item in value:
+            if isinstance(item, bool) or not isinstance(item, int):
+                return None
+            normalized.append(item)
+        return normalized
+    return None
+
+
+def _relaykv_req_to_token_value_shape_observation_for_smoke(
+    value: Any,
+) -> dict[str, Any]:
+    value_type = value.__class__
+    value_type_name = value_type.__name__
+    value_module = value_type.__module__
+    value_qualname = value_type.__qualname__
+
+    has_shape, raw_shape = _relaykv_shallow_noncallable_attr_for_smoke(value, "shape")
+    normalized_shape = _relaykv_normalize_shape_metadata_for_smoke(raw_shape)
+    if not has_shape:
+        has_size, raw_size = _relaykv_shallow_noncallable_attr_for_smoke(value, "size")
+        if has_size:
+            size_shape = _relaykv_normalize_shape_metadata_for_smoke(raw_size)
+            if size_shape is not None:
+                has_shape = True
+                normalized_shape = size_shape
+
+    has_dtype, raw_dtype = _relaykv_shallow_noncallable_attr_for_smoke(value, "dtype")
+    has_device, raw_device = _relaykv_shallow_noncallable_attr_for_smoke(value, "device")
+    has_ndim, raw_ndim = _relaykv_shallow_noncallable_attr_for_smoke(value, "ndim")
+
+    value_len = None
+    value_has_len = False
+    try:
+        computed_len = len(value)
+    except Exception:
+        computed_len = None
+    else:
+        if isinstance(computed_len, int) and not isinstance(computed_len, bool):
+            value_has_len = True
+            value_len = computed_len
+
+    value_is_int = isinstance(value, int) and not isinstance(value, bool)
+    value_is_bool = isinstance(value, bool)
+    value_is_float = isinstance(value, float)
+    value_is_list = isinstance(value, list)
+    value_is_tuple = isinstance(value, tuple)
+    value_is_tensor_like = bool(has_shape or has_dtype or has_device)
+
+    value_is_scalar_like = False
+    if normalized_shape == []:
+        value_is_scalar_like = True
+    elif isinstance(raw_ndim, int) and not isinstance(raw_ndim, bool) and raw_ndim == 0:
+        value_is_scalar_like = True
+
+    value_is_one_element_like = False
+    if normalized_shape is not None:
+        if normalized_shape == []:
+            value_is_one_element_like = True
+        elif normalized_shape:
+            product = 1
+            for dim in normalized_shape:
+                if dim < 0:
+                    product = 0
+                    break
+                product *= dim
+            if product == 1:
+                value_is_one_element_like = True
+    elif value_has_len and value_len == 1:
+        value_is_one_element_like = True
+
+    return {
+        "value_type_name": value_type_name,
+        "value_module": value_module,
+        "value_qualname": value_qualname,
+        "value_has_shape": has_shape,
+        "value_shape": normalized_shape,
+        "value_has_dtype": has_dtype,
+        "value_dtype": str(raw_dtype) if has_dtype else None,
+        "value_has_device": has_device,
+        "value_device": str(raw_device) if has_device else None,
+        "value_has_len": value_has_len,
+        "value_len": value_len,
+        "value_is_int": value_is_int,
+        "value_is_bool": value_is_bool,
+        "value_is_float": value_is_float,
+        "value_is_list": value_is_list,
+        "value_is_tuple": value_is_tuple,
+        "value_is_tensor_like": value_is_tensor_like,
+        "value_is_scalar_like": value_is_scalar_like,
+        "value_is_one_element_like": value_is_one_element_like,
+    }
+
+
+def build_relaykv_req_to_token_pool_value_shape_inspection_results_for_smoke(
+    *,
+    runtime_observation_payloads: Any = None,
+    req_to_token_pool_object: Any = None,
+    inspect_req_to_token_pool_value_shape: bool = False,
+    max_tokens_per_request: int = 8,
+    max_total_tokens: int = 16,
+    source_path: str | None = None,
+) -> list[dict[str, Any]]:
+    """Inspect shallow metadata for bounded req_to_token pool values without conversion."""
+
+    source_payloads, payload_source_path = _relaykv_runtime_req_to_token_source_payloads_for_smoke(
+        runtime_observation_payloads
+    )
+    if source_path is None:
+        source_path = payload_source_path
+
+    base_result = {
+        "event_type": "relaykv_req_to_token_pool_value_shape_inspection_result",
+        "adapter_mode": "req_to_token_pool_value_shape_inspection",
+        "decision_state": "SHADOW_ONLY",
+        "engine_name": "sglang",
+        "adapter_name": "sglang",
+        "engine_request_id": None,
+        "logical_sequence_id": None,
+        "req_pool_idx": None,
+        "token_span": None,
+        "seq_len": None,
+        "source_path": source_path,
+        "probed_value_count": 0,
+        "value_shape_observations": [],
+        "blocked_reason": None,
+        "source_mutated": False,
+        "req_to_token_value_shape_inspection_count": 0,
+        "req_to_token_read_count": 0,
+        "actual_req_to_token_pool_read_count": 0,
+        "token_to_kv_pool_read_count": 0,
+        "actual_token_to_kv_pool_read_count": 0,
+        "live_token_to_kv_pool_index_read_count": 0,
+        "kv_pool_read_count": 0,
+        "kv_snapshot_count": 0,
+        "tensor_read_count": 0,
+        "attention_comparison_executed_count": 0,
+        "attention_override_true_count": 0,
+        "runtime_writeback_true_count": 0,
+        "scheduler_policy_noop_false_count": 0,
+        "kv_cache_mutation_true_count": 0,
+        "source_mutated_true_count": 0,
+    }
+
+    if inspect_req_to_token_pool_value_shape is not True:
+        blocked = dict(base_result)
+        blocked["inspection_state"] = "blocked"
+        blocked["blocked_reason"] = "req_to_token_pool_value_shape_inspection_not_enabled"
+        return [blocked]
+
+    if source_payloads is None or (
+        source_payloads == [] and runtime_observation_payloads is not None
+    ):
+        blocked = dict(base_result)
+        blocked["inspection_state"] = "blocked"
+        blocked["blocked_reason"] = "runtime_observation_payloads_missing"
+        return [blocked]
+
+    if req_to_token_pool_object is None:
+        blocked = dict(base_result)
+        blocked["inspection_state"] = "blocked"
+        blocked["blocked_reason"] = "req_to_token_pool_object_missing"
+        return [blocked]
+
+    assert source_payloads is not None
+    results: list[dict[str, Any]] = []
+    total_tokens = 0
+
+    for payload in source_payloads:
+        if not isinstance(payload, Mapping):
+            raise TypeError(
+                "RelayKV req_to_token pool value shape inspection inputs must be mappings"
+            )
+        normalized = normalize_relaykv_sglang_adapter_schema_for_smoke(payload)
+        req_pool_idx = _relaykv_req_pool_idx_from_runtime_observation_payload_for_smoke(
+            payload
+        )
+        token_positions, token_span, seq_len, token_error = (
+            _relaykv_bounded_req_to_token_positions_for_smoke(payload)
+        )
+        blocked_reason = None
+        if req_pool_idx is None:
+            blocked_reason = "req_pool_idx_missing"
+        elif token_positions is None and token_error == "token_span_invalid":
+            blocked_reason = "token_span_invalid"
+        elif token_positions is None and token_error == "seq_len_invalid":
+            blocked_reason = "seq_len_invalid"
+        elif token_positions is None:
+            blocked_reason = "token_span_or_seq_len_missing"
+
+        if blocked_reason is None:
+            assert token_positions is not None
+            if len(token_positions) > max_tokens_per_request:
+                blocked_reason = "max_tokens_per_request_exceeded"
+            elif total_tokens + len(token_positions) > max_total_tokens:
+                blocked_reason = "max_total_tokens_exceeded"
+
+        observations: list[dict[str, Any]] = []
+        probe_count = 0
+        if blocked_reason is None:
+            assert token_positions is not None
+            for token_position in token_positions:
+                value, value_error = _relaykv_read_req_to_token_value_for_smoke(
+                    req_to_token_pool_object,
+                    req_pool_idx,
+                    token_position,
+                )
+                if value_error is not None:
+                    blocked_reason = value_error
+                    break
+                probe_count += 1
+                observations.append(
+                    _relaykv_req_to_token_value_shape_observation_for_smoke(value)
+                )
+            total_tokens += probe_count
+
+        result = dict(base_result)
+        result.update(
+            {
+                "inspection_state": (
+                    "inspected" if blocked_reason is None else "blocked"
+                ),
+                "engine_request_id": normalized.get("engine_request_id"),
+                "logical_sequence_id": normalized.get("logical_sequence_id"),
+                "req_pool_idx": req_pool_idx,
+                "token_span": token_span,
+                "seq_len": seq_len,
+                "probed_value_count": probe_count,
+                "value_shape_observations": observations,
+                "blocked_reason": blocked_reason,
+                "req_to_token_value_shape_inspection_count": probe_count,
+                "req_to_token_read_count": probe_count,
+                "actual_req_to_token_pool_read_count": probe_count,
+            }
+        )
+        results.append(result)
+
+    return results
+
+
+def summarize_relaykv_req_to_token_pool_value_shape_inspection_results_for_smoke(
+    results: list[dict[str, Any]] | tuple[dict[str, Any], ...],
+    *,
+    inspection_enabled: bool,
+    max_tokens_per_request: int,
+    max_total_tokens: int,
+) -> dict[str, Any]:
+    """Summarize shallow req_to_token pool value shape inspections."""
+
+    if not isinstance(results, (list, tuple)):
+        raise TypeError(
+            "RelayKV req_to_token pool value shape inspection results must be a list or tuple"
+        )
+
+    inspected_count = 0
+    blocked_count = 0
+    error_count = 0
+    total_probed_value_count = 0
+    observed_type_counts: Counter[str] = Counter()
+    observed_shape_counts: Counter[str] = Counter()
+    observed_dtype_counts: Counter[str] = Counter()
+    observed_device_counts: Counter[str] = Counter()
+    observed_scalar_like_count = 0
+    observed_one_element_like_count = 0
+    safety_counts: Counter[str] = Counter(
+        {
+            "req_to_token_value_shape_inspection_count": 0,
+            "req_to_token_read_count": 0,
+            "actual_req_to_token_pool_read_count": 0,
+            "token_to_kv_pool_read_count": 0,
+            "actual_token_to_kv_pool_read_count": 0,
+            "live_token_to_kv_pool_index_read_count": 0,
+            "kv_pool_read_count": 0,
+            "kv_snapshot_count": 0,
+            "tensor_read_count": 0,
+            "attention_comparison_executed_count": 0,
+            "attention_override_true_count": 0,
+            "runtime_writeback_true_count": 0,
+            "scheduler_policy_noop_false_count": 0,
+            "kv_cache_mutation_true_count": 0,
+            "source_mutated_true_count": 0,
+        }
+    )
+
+    for result in results:
+        if not isinstance(result, Mapping):
+            raise TypeError(
+                "RelayKV req_to_token pool value shape inspection result must be a mapping"
+            )
+        state = str(result.get("inspection_state") or "unknown")
+        if state == "inspected":
+            inspected_count += 1
+        elif state == "blocked":
+            blocked_count += 1
+        elif state == "error":
+            error_count += 1
+
+        probed = result.get("probed_value_count")
+        if isinstance(probed, int) and not isinstance(probed, bool):
+            total_probed_value_count += probed
+
+        observations = result.get("value_shape_observations")
+        if isinstance(observations, list):
+            for observation in observations:
+                if not isinstance(observation, Mapping):
+                    continue
+                observed_type_counts[str(observation.get("value_type_name") or "unknown")] += 1
+                shape_value = observation.get("value_shape")
+                observed_shape_counts[json.dumps(shape_value, sort_keys=True)] += 1
+                dtype_value = observation.get("value_dtype")
+                observed_dtype_counts[str(dtype_value)] += 1
+                device_value = observation.get("value_device")
+                observed_device_counts[str(device_value)] += 1
+                if observation.get("value_is_scalar_like") is True:
+                    observed_scalar_like_count += 1
+                if observation.get("value_is_one_element_like") is True:
+                    observed_one_element_like_count += 1
+
+        for key in safety_counts:
+            value = result.get(key)
+            if isinstance(value, int) and not isinstance(value, bool):
+                safety_counts[key] += value
+
+    return {
+        "event_type": "relaykv_req_to_token_pool_value_shape_inspection_summary",
+        "inspection_enabled": inspection_enabled,
+        "result_count": len(results),
+        "inspected_count": inspected_count,
+        "blocked_count": blocked_count,
+        "error_count": error_count,
+        "total_probed_value_count": total_probed_value_count,
+        "observed_type_counts": dict(observed_type_counts),
+        "observed_shape_counts": dict(observed_shape_counts),
+        "observed_dtype_counts": dict(observed_dtype_counts),
+        "observed_device_counts": dict(observed_device_counts),
+        "observed_scalar_like_count": observed_scalar_like_count,
+        "observed_one_element_like_count": observed_one_element_like_count,
+        "max_tokens_per_request": max_tokens_per_request,
+        "max_total_tokens": max_total_tokens,
+        **{key: safety_counts[key] for key in sorted(safety_counts)},
+    }
+
+
 def build_relaykv_real_req_to_token_pool_bounded_read_results_for_smoke(
     *,
     runtime_observation_payloads: Any = None,
