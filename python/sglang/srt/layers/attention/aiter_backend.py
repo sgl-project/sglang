@@ -20,6 +20,7 @@ from sglang.srt.layers.attention.triton_ops.aiter_unified_attention import (
 from sglang.srt.layers.attention.utils import (
     create_flashinfer_kv_indices_triton,
     create_flashmla_kv_indices_triton,
+    get_aiter_mla_head_padding,
 )
 from sglang.srt.layers.dp_attention import (
     get_attention_tp_size,
@@ -264,36 +265,9 @@ class AiterAttnBackend(AttentionBackend):
                 f"Provided {self.num_head} number of heads.\n"
                 "Try adjusting tensor_parallel_size value."
             )
-            _disable_head_pad = (
-                __import__("os").environ.get("SGLANG_AITER_MLA_DISABLE_HEAD_PAD", "1")
-                != "0"
+            self.num_head_padded, self.head_repeat_factor = get_aiter_mla_head_padding(
+                self.num_head
             )
-            if _disable_head_pad and self.num_head == 8:
-                self.num_head_padded = self.num_head
-                self.head_repeat_factor = 1
-            else:
-                self.num_head_padded = 16 if self.num_head < 16 else self.num_head
-                self.head_repeat_factor = (
-                    16 // self.num_head if self.num_head < 16 else 1
-                )
-            try:
-                import os as _os
-                import sys as _sys
-
-                if _os.environ.get("LOCAL_RANK", "0") in ("0", ""):
-                    _sys.stderr.write(
-                        "[aiter_backend_patched] layer init: "
-                        f"num_head={self.num_head} "
-                        f"num_head_padded={self.num_head_padded} "
-                        f"head_repeat_factor={self.head_repeat_factor} "
-                        f"DISABLE_HEAD_PAD="
-                        f"{_os.environ.get('SGLANG_AITER_MLA_DISABLE_HEAD_PAD','<unset>')} "
-                        f"MLA_PERSIST="
-                        f"{_os.environ.get('SGLANG_AITER_MLA_PERSIST','<unset>')}\n"
-                    )
-                    _sys.stderr.flush()
-            except Exception:
-                pass
             self.enable_dp_attention = is_dp_attention_enabled()
             self.qo_indptr_ = torch.zeros(
                 (max_bs + 1,), dtype=torch.int32, device=model_runner.device

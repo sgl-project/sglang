@@ -57,6 +57,37 @@ def get_num_page_per_block_flashmla(page_size: int = 64) -> int:
     return num_page_per_block
 
 
+# AITER MLA decode ships dedicated kernels for these head counts. For everything
+# else we fall back to padding up to the qh16 kernel. The nhead=8 fp8/fp8 path
+# was added by ROCm/aiter#3014; on aiter builds without #3014, callers that need
+# nhead=8 must use a build that includes it (or pad to 16 via repeat_interleave).
+_AITER_MLA_NATIVE_HEADS = (8, 16, 32, 64, 128)
+
+
+def get_aiter_mla_head_padding(num_head: int) -> tuple[int, int]:
+    """Decide head-axis padding for the AITER MLA decode kernels.
+
+    Returns ``(num_head_padded, head_repeat_factor)`` where ``num_head_padded``
+    is the head count actually fed to the AITER kernel and
+    ``head_repeat_factor == num_head_padded // num_head`` is the multiplier
+    applied to ``q`` along the head axis (via ``repeat_interleave``) before the
+    kernel call.
+
+    Rules:
+        - ``num_head`` already supported natively by AITER → no padding,
+          ``head_repeat_factor = 1``.
+        - ``num_head < 8`` (in practice only ``4``) → pad to ``16`` and replicate
+          along the head axis so the qh16 kernel handles it.
+
+    This replaces the previous ``SGLANG_AITER_MLA_DISABLE_HEAD_PAD`` env-var
+    toggle, which was needed before ROCm/aiter#3014 added a native nhead=8 fp8
+    decode kernel.
+    """
+    if num_head in _AITER_MLA_NATIVE_HEADS or num_head >= 16:
+        return num_head, 1
+    return 16, 16 // num_head
+
+
 @triton.jit
 def create_flashmla_kv_indices_triton(
     req_to_token_ptr,  # [max_batch, max_context_len]
