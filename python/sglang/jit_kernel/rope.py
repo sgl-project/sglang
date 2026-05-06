@@ -166,6 +166,21 @@ class XPUFusedRopeWrapper:
                     ".contiguous() before invoking this function."
                 )
 
+    def _check_alignment(self, *tensors) -> None:
+        """Raise if any tensor has misaligned data for vectorized loads.
+        
+        The SYCL kernel uses aligned 2-element vector loads for fp16/bf16,
+        requiring storage_offset() to be even (divisible by 2).
+        """
+        for t in tensors:
+            if t.dtype in (torch.float16, torch.bfloat16):
+                if t.storage_offset() % 2 != 0:
+                    raise ValueError(
+                        f"XPU RoPE requires even storage_offset for {t.dtype} tensors "
+                        f"(2-element vector alignment). Got storage_offset={t.storage_offset()}. "
+                        f"Use .contiguous() or ensure slicing starts at even indices."
+                    )
+
     def run_rope(self, q, k, cos_sin_cache, positions):
         """Apply RoPE inplace to *q* and *k*."""
 
@@ -181,10 +196,35 @@ class XPUFusedRopeWrapper:
             raise ValueError(
                 f"cos_sin_cache must be float32, got {cos_sin_cache.dtype}"
             )
+        # Validate q and k have consistent dtypes and match the compiled dtype
+        if q.dtype != k.dtype:
+            raise ValueError(
+                f"q and k must have the same dtype, got q.dtype={q.dtype}, k.dtype={k.dtype}"
+            )
+        expected_dtype = torch.float16 if self._dtype_str == "fp16" else torch.bfloat16
+        if q.dtype != expected_dtype:
+            raise ValueError(
+                f"q/k dtype must match compiled dtype {expected_dtype} (compiled as {self._dtype_str}), "
+                f"got {q.dtype}"
+            )
+        # Validate shape consistency: all tensors must have the same batch size
+        num_tokens = q.shape[0]
+        if k.shape[0] != num_tokens:
+            raise ValueError(
+                f"q and k must have the same batch size (shape[0]), "
+                f"got q.shape[0]={num_tokens}, k.shape[0]={k.shape[0]}"
+            )
+        if positions.numel() != num_tokens:
+            raise ValueError(
+                f"positions.numel() must equal batch size, "
+                f"got positions.numel()={positions.numel()}, expected {num_tokens}"
+            )
         # The vectorised kernel loads require elements within each head to be
         # contiguous in memory.  Strides along the batch and head dimensions can
         # be arbitrary (they are read from stride(0)/stride(1)).
         self._check_last_dim_contiguous(q, k)
+        # Validate alignment for vectorized loads (2-element vectors for fp16/bf16)
+        self._check_alignment(q, k)
         # cos_sin_cache is accessed as base_ptr + pos * rope_dim (row-major);
         # positions is accessed as a flat array — both must be contiguous.
         if not cos_sin_cache.is_contiguous():
@@ -200,7 +240,6 @@ class XPUFusedRopeWrapper:
 
         # Use actual strides so that partial-RoPE views (e.g. q[..., :rope_dim])
         # are handled correctly without an additional contiguous copy.
-        num_tokens = q.shape[0]
         num_qo_heads = q.shape[1]
         num_kv_heads = k.shape[1]
         q_stride = q.stride(0)
@@ -272,8 +311,39 @@ class XPUFusedRopeWrapper:
             raise ValueError(
                 f"cos_sin_cache must be float32, got {cos_sin_cache.dtype}"
             )
+        # Validate q, k, and v have consistent dtypes and match the compiled dtype
+        if q.dtype != k.dtype or q.dtype != v.dtype:
+            raise ValueError(
+                f"q, k, and v must have the same dtype, "
+                f"got q.dtype={q.dtype}, k.dtype={k.dtype}, v.dtype={v.dtype}"
+            )
+        expected_dtype = torch.float16 if self._dtype_str == "fp16" else torch.bfloat16
+        if q.dtype != expected_dtype:
+            raise ValueError(
+                f"q/k/v dtype must match compiled dtype {expected_dtype} (compiled as {self._dtype_str}), "
+                f"got {q.dtype}"
+            )
+        # Validate shape consistency: all tensors must have the same batch size
+        num_tokens = q.shape[0]
+        if k.shape[0] != num_tokens or v.shape[0] != num_tokens:
+            raise ValueError(
+                f"q, k, and v must have the same batch size (shape[0]), "
+                f"got q.shape[0]={num_tokens}, k.shape[0]={k.shape[0]}, v.shape[0]={v.shape[0]}"
+            )
+        if positions.numel() != num_tokens:
+            raise ValueError(
+                f"positions.numel() must equal batch size, "
+                f"got positions.numel()={positions.numel()}, expected {num_tokens}"
+            )
+        if out_loc.numel() != num_tokens:
+            raise ValueError(
+                f"out_loc.numel() must equal batch size, "
+                f"got out_loc.numel()={out_loc.numel()}, expected {num_tokens}"
+            )
         # Same last-dim contiguity requirement as run_rope.
         self._check_last_dim_contiguous(q, k, v)
+        # Validate alignment for vectorized loads (2-element vectors for fp16/bf16)
+        self._check_alignment(q, k, v)
         if not cos_sin_cache.is_contiguous():
             raise ValueError(
                 "cos_sin_cache must be contiguous for XPU RoPE store"
@@ -301,7 +371,6 @@ class XPUFusedRopeWrapper:
 
         queue = torch.xpu.current_stream().sycl_queue
 
-        num_tokens = q.shape[0]
         num_qo_heads = q.shape[1]
         num_kv_heads = k.shape[1]
         q_stride = q.stride(0)

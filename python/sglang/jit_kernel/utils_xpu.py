@@ -198,7 +198,7 @@ class SYCLModule:
                 )
 
         return self._functions[name]
-    
+
     def get_function(self, func_name: str, argtypes: list, restype=None):
         """Get a ctypes function with configured argtypes and restype, with caching.
         
@@ -217,8 +217,6 @@ class SYCLModule:
             )
             func(queue_ptr, 10, 3.14)
         """
-        import ctypes
-        
         # Use tuple of argtypes for cache key (lists aren't hashable)
         cache_key = (func_name, tuple(argtypes), restype)
         
