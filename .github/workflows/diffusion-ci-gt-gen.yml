@@ -172,6 +172,10 @@ jobs:
           ref: ${{ inputs.ci_data_ref || 'main' }}
           path: ci-data
           token: ${{ secrets.GH_PAT_FOR_NIGHTLY_CI_DATA }}
+          sparse-checkout: |
+            diffusion-ci/repro_scripts
+            diffusion-ci/consistency_gt/official_generated/case_map.json
+          sparse-checkout-cone-mode: false
 
       - name: Prepare sgl-kernel/dist for prebuilt wheel
         if: inputs.kernel_artifact_run_id != ''
