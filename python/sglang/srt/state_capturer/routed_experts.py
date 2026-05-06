@@ -1,4 +1,4 @@
-from typing import Optional
+from typing import Optional, Tuple
 
 import numpy as np
 import pybase64
@@ -9,13 +9,27 @@ from sglang.srt.layers.dp_attention import (
     attn_tp_all_gather_into_tensor,
     get_attention_dp_rank,
     get_attention_tp_size,
-    get_dp_local_info,
     is_dp_attention_enabled,
 )
 from sglang.srt.layers.moe import get_moe_a2a_backend
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.state_capturer.base import BaseTopkCapturer
+
+
+def _get_dp_local_slice_indices(
+    forward_batch: ForwardBatch,
+    can_run_graph: bool,
+    cuda_graph_batch: Optional[int],
+) -> Tuple[int, int]:
+    global_num_tokens = forward_batch.global_num_tokens_cpu
+    dp_rank = get_attention_dp_rank()
+    local_num_tokens = global_num_tokens[dp_rank]
+    if can_run_graph:
+        local_start_pos = dp_rank * cuda_graph_batch
+    else:
+        local_start_pos = sum(global_num_tokens[:dp_rank])
+    return local_start_pos, local_start_pos + local_num_tokens
 
 
 class RoutedExpertsCapturer(BaseTopkCapturer):
@@ -112,10 +126,9 @@ class RoutedExpertsCapturer(BaseTopkCapturer):
         # the per-rank buffer, so the local DP rank's data lives at [0:N_local]
         # rather than at the global [start_pos:end_pos] offset.
         if is_dp_attention_enabled() and not get_moe_a2a_backend().is_deepep():
-            local_start_pos, local_num_tokens = get_dp_local_info(forward_batch)
-            if can_run_graph:
-                local_start_pos = get_attention_dp_rank() * cuda_graph_batch
-            local_end_pos = local_start_pos + local_num_tokens
+            local_start_pos, local_end_pos = _get_dp_local_slice_indices(
+                forward_batch, can_run_graph, cuda_graph_batch
+            )
         else:
             local_start_pos, local_end_pos = 0, forward_batch.out_cache_loc.shape[0]
         return self.device_cache.buffer[
