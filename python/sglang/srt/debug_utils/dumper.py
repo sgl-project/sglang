@@ -222,7 +222,7 @@ class _Dumper:
         self._ensure_exp_name()
 
         self._state.step += 1
-        print(f"[Dumper] [{time.time()}] step={self._state.step}")
+        _log(f"step={self._state.step}")
 
     def dump(
         self,
@@ -340,7 +340,7 @@ class _Dumper:
         from sglang.srt.debug_utils.source_patcher import apply_patches_from_config
 
         yaml_content: str = Path(config_path).read_text()
-        print(f"[source_patcher] loading config from {config_path}")
+        _log(f"[source_patcher] loading config from {config_path}")
         apply_patches_from_config(
             yaml_content,
             extra_imports=["from sglang.srt.debug_utils.dumper import dumper"],
@@ -521,8 +521,8 @@ class _Dumper:
         path = Path(self._config.dir) / self._config.exp_name / full_filename
 
         if self._config.enable_output_console:
-            print(
-                f"[{tag}] [{rank}, {time.time()}] {path} "
+            _log(
+                f"[{tag}] {path} "
                 f"type={type(value)} "
                 f"shape={value.shape if isinstance(value, torch.Tensor) else None} "
                 f"dtype={value.dtype if isinstance(value, torch.Tensor) else None} "
@@ -570,7 +570,7 @@ class _Dumper:
                 timeout_seconds=self._config.collective_timeout
             )
             self.configure(exp_name=name)
-            print(f"[Dumper] Choose exp_name={name}")
+            _log(f"Choose exp_name={name}")
 
 
 # -------------------------------------- hook dumper ------------------------------------------
@@ -754,11 +754,11 @@ def _torch_save(value, path: str):
             if "not pickleable" in str(e):
                 stripped = _strip_parameter(value)
                 if stripped is not value:
-                    print(f"[Dumper] Observe error={e} and try pickling .data")
+                    _log(f"Observe error={e} and try pickling .data")
                     return _torch_save(stripped, path)
             raise
     except Exception as e:
-        print(f"[Dumper] Observe error={e} when saving data, skip the tensor")
+        _log(f"Observe error={e} when saving data, skip the tensor")
 
 
 def _map_tensor(value, fn: Callable[[torch.Tensor], torch.Tensor]):
@@ -792,11 +792,10 @@ def _collective_with_timeout(fn, operation_name: str, timeout_seconds: int = 60)
 
     def watchdog():
         if not completed.wait(timeout=timeout_seconds):
-            print(
-                f"\n[Dumper] WARNING: '{operation_name}' has not completed after "
+            _log(
+                f"WARNING: '{operation_name}' has not completed after "
                 f"{timeout_seconds}s. This usually means not all ranks are "
-                f"participating in this collective operation.\n",
-                flush=True,
+                f"participating in this collective operation."
             )
 
     thread = threading.Thread(target=watchdog, daemon=True)
@@ -845,7 +844,7 @@ def _cleanup_old_dumps(base_dir: Path, exp_name: Optional[str] = None) -> None:
 
         for entry in targets:
             shutil.rmtree(entry)
-            print(f"[Dumper] Cleaned up {entry}")
+            _log(f"Cleaned up {entry}")
 
     if dist.is_initialized():
         _collective_with_timeout(
@@ -866,6 +865,11 @@ def _get_world_size():
         return dist.get_world_size()
     else:
         return 1
+
+
+def _log(msg: str) -> None:
+    """Print a log line tagged with the current rank and wall-clock time."""
+    print(f"[Dumper, rank={_get_rank()}, t={time.time():.3f}] {msg}", flush=True)
 
 
 def _obj_to_dict(obj):
@@ -962,12 +966,10 @@ class _DumperHttpManager:
             self._rpc_broadcast = rpc_broadcast
 
             if http_port == "reuse":
-                print(
-                    "[Dumper] Standalone HTTP server disabled, reusing existing ports"
-                )
+                _log("Standalone HTTP server disabled, reusing existing ports")
             else:
                 _start_http_server(prefix="/dumper/", target=self, http_port=http_port)
-                print(f"[Dumper] HTTP server started on port {http_port}")
+                _log(f"HTTP server started on port {http_port}")
 
     # ------------------------------- public ---------------------------------
 
@@ -1008,7 +1010,7 @@ def _make_http_handler(*, prefix: str, target):
             method = self.path[len(prefix) :]
             try:
                 req_body = self._get_request_body()
-                print(f"[Dumper#{_get_rank()}] HTTP {self.path} {req_body=}")
+                _log(f"HTTP {self.path} {req_body=}")
                 result = target.handle_request(method=method, body=req_body)
                 resp_body = json.dumps(result).encode()
                 self.send_response(200)
@@ -1053,13 +1055,13 @@ def _create_zmq_rpc_broadcast(
                 result = getattr(handler, req["method"])(*req["args"], **req["kwargs"])
                 resp = {"result": result, "error": None}
             except Exception as e:
-                print(f"[Dumper.ZmqRpc] error inside handler: {e}")
+                _log(f"[ZmqRpc] error inside handler: {e}")
                 resp = {"result": None, "error": str(e)}
             sock.send_pyobj(resp)
 
     thread = threading.Thread(target=serve_loop, daemon=True)
     thread.start()
-    print(f"[Dumper.ZmqRpc] rank={rank} server started at {local_addr}")
+    _log(f"[ZmqRpc] server started at {local_addr}")
 
     if dist.is_initialized():
         all_addresses = [None] * world_size
@@ -1070,7 +1072,7 @@ def _create_zmq_rpc_broadcast(
         )
     else:
         all_addresses = [local_addr]
-    print(f"[Dumper.ZmqRpc] rank={rank} all_addresses={all_addresses}")
+    _log(f"[ZmqRpc] all_addresses={all_addresses}")
 
     if rank == 0:
         handles = []
@@ -1166,7 +1168,7 @@ def _get_local_ip_by_remote() -> Optional[str]:
         s.connect(("2001:4860:4860::8888", 80))  # Doesn't need to be reachable
         return s.getsockname()[0]
     except Exception:
-        print("Can not get local ip by remote")
+        _log("Can not get local ip by remote")
     return None
 
 

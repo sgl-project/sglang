@@ -20,6 +20,7 @@ from sglang.srt.debug_utils.dumper import (
     _Dumper,
     _format_tags,
     _get_default_exp_name,
+    _log,
     _map_tensor,
     _materialize_value,
     _MegatronPlugin,
@@ -377,8 +378,19 @@ class TestTorchSave:
         _torch_save({"fn": lambda: None}, path)
 
         captured = capsys.readouterr()
-        assert "[Dumper] Observe error=" in captured.out
+        assert "[Dumper, rank=" in captured.out
+        assert "Observe error=" in captured.out
         assert "skip the tensor" in captured.out
+
+
+class TestLog:
+    def test_log_format(self):
+        with _capture_stdout() as captured:
+            _log("hello")
+        out = captured.getvalue()
+        assert "hello" in out, out
+        assert "[Dumper, rank=" in out, out
+        assert ", t=" in out, out
 
 
 class TestCollectiveTimeout:
