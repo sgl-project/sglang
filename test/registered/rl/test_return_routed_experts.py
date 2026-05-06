@@ -13,7 +13,7 @@ from sglang.srt.state_capturer.routed_experts import (
     extract_routed_experts_from_meta_info,
 )
 from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import (
     DEFAULT_ENABLE_ROUTED_EXPERTS_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -22,12 +22,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=185, suite="stage-b-test-2-gpu-large")
-register_amd_ci(
-    est_time=200,
-    suite="stage-b-test-2-gpu-large-amd",
-    disabled="TP=2 DP=2 routed expert mismatch >15% on AMD; needs TP/DP tuning + concurrency reduction",
-)
+register_cuda_ci(est_time=400, suite="stage-c-test-4-gpu-h100")
 
 SHAREGPT_REPO_ID = "anon8231489123/ShareGPT_Vicuna_unfiltered"
 SHAREGPT_FILENAME = "ShareGPT_V3_unfiltered_cleaned_split.json"
@@ -35,10 +30,20 @@ logger = logging.getLogger(__name__)
 
 
 class TestReturnRoutedExperts(CustomTestCase):
-    # modified from test_hicache.py
+    """End-to-end check that --enable-return-routed-experts is correct under
+    DeepEP a2a + attn_tp_size > 1.
+
+    Reference uses ``--moe-a2a-backend deepep`` with tp=4 dp=2 so attn_tp_size=2,
+    which exercises the all-gather hot path in RoutedExpertsCapturer.capture.
+    Without that gather, each attn-TP rank would only stage its scattered slice
+    and the captured topk would be wrong on rank > 0; this is dead code under
+    non-DeepEP / attn_tp_size==1 setups, so a dedicated config is required.
+    """
+
     @classmethod
     def setUpClass(cls):
-
+        # Baseline: deterministic, simple path. attn_tp_size=1 (tp=dp=4) so the
+        # DeepEP gather is bypassed and capture goes through the trivial path.
         cls.baseline_args = [
             "--enable-return-routed-experts",
             "--enable-deterministic-inference",
@@ -46,23 +51,27 @@ class TestReturnRoutedExperts(CustomTestCase):
             "--disable-cuda-graph",
             "--disable-radix-cache",
             "--tp",
-            2,
+            4,
             "--dp",
-            2,
+            4,
             "--enable-dp-attention",
         ]
+        # Reference: tp=4 dp=2 → attn_tp_size=2, DeepEP a2a active. Same model
+        # weights + temperature=0 + deterministic-inference must yield the same
+        # topk_ids as baseline (modulo the <10% tolerance the original test
+        # already used to absorb residual non-determinism in EP MoE).
         cls.reference_args = [
             "--enable-return-routed-experts",
             "--enable-deterministic-inference",
             "--tp",
-            2,
+            4,
             "--dp",
             2,
             "--enable-dp-attention",
+            "--moe-a2a-backend",
+            "deepep",
         ]
-        cls.sampling_args = {
-            "temperature": 0,
-        }
+        cls.sampling_args = {"temperature": 0}
         # prepare ShareGPT dataset
         dataset_path = download_and_cache_hf_file(SHAREGPT_REPO_ID, SHAREGPT_FILENAME)
         with open(dataset_path) as f:
