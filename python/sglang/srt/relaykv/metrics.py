@@ -6883,6 +6883,387 @@ def summarize_relaykv_live_token_to_kv_pool_index_read_results_for_smoke(
     }
 
 
+def _relaykv_runtime_req_to_token_source_payloads_for_smoke(
+    runtime_observation_payloads: Any,
+) -> tuple[list[Mapping[str, Any]] | None, str | None]:
+    if runtime_observation_payloads is None:
+        return None, None
+    if not isinstance(runtime_observation_payloads, (list, tuple)):
+        return [], "runtime_observation_payloads"
+    normalized_payloads: list[Mapping[str, Any]] = []
+    for payload in runtime_observation_payloads:
+        if not isinstance(payload, Mapping):
+            return [], "runtime_observation_payloads"
+        normalized_payloads.append(payload)
+    return normalized_payloads, "runtime_observation_payloads"
+
+
+def _relaykv_runtime_req_to_token_entries_for_smoke(
+    explicit_req_to_token_entries: Any,
+) -> tuple[list[int] | None, str | None]:
+    if explicit_req_to_token_entries is None:
+        return None, "explicit_req_to_token_entries_missing"
+    if not isinstance(explicit_req_to_token_entries, (list, tuple)):
+        return None, "explicit_req_to_token_entries_not_list"
+
+    normalized_entries: list[int] = []
+    for entry in explicit_req_to_token_entries:
+        if isinstance(entry, bool) or not isinstance(entry, int):
+            return None, "explicit_req_to_token_entry_not_int"
+        normalized_entries.append(entry)
+    if not normalized_entries:
+        return None, "explicit_req_to_token_entries_missing"
+    return normalized_entries, None
+
+
+def _relaykv_runtime_req_to_token_blocked_result_for_smoke(
+    source_payload: Mapping[str, Any] | None,
+    *,
+    blocking_reasons: list[str],
+    max_tokens_per_request: int,
+    max_total_tokens: int,
+) -> dict[str, Any]:
+    normalized = (
+        normalize_relaykv_sglang_adapter_schema_for_smoke(source_payload)
+        if isinstance(source_payload, Mapping)
+        else normalize_relaykv_sglang_adapter_schema_for_smoke({})
+    )
+    adapter_metadata = normalized.get("adapter_metadata")
+    if isinstance(adapter_metadata, Mapping):
+        payload_adapter_metadata = _copy_relaykv_metadata_value_for_smoke(
+            dict(adapter_metadata)
+        )
+    else:
+        payload_adapter_metadata = {}
+    payload_adapter_metadata.update(
+        {
+            "runtime_req_to_token_payload_production_enabled": False,
+            "max_tokens_per_request": max_tokens_per_request,
+            "max_total_tokens": max_total_tokens,
+        }
+    )
+
+    normalized.update(
+        {
+            "event_type": "relaykv_req_to_token_resolution_result",
+            "resolution_state": "blocked",
+            "adapter_mode": "runtime_req_to_token_payload_production",
+            "source": "runtime_metadata_to_req_to_token_resolution_result",
+            "decision_state": "SHADOW_ONLY",
+            "engine_name": "sglang",
+            "adapter_name": "sglang",
+            "adapter_metadata": payload_adapter_metadata,
+            "full_kv_req_to_token_spans": [],
+            "relaykv_working_req_to_token_spans": [],
+            "resolved_block_count": 0,
+            "resolved_token_count": 0,
+            "req_to_token_entry_count": 0,
+            "req_to_token_read": False,
+            "req_to_token_read_count": 0,
+            "actual_req_to_token_pool_read": False,
+            "actual_req_to_token_pool_read_count": 0,
+            "token_to_kv_pool_read": False,
+            "token_to_kv_pool_read_count": 0,
+            "actual_token_to_kv_pool_read": False,
+            "actual_token_to_kv_pool_read_count": 0,
+            "live_token_to_kv_pool_index_read": False,
+            "live_token_to_kv_pool_index_read_count": 0,
+            "kv_pool_read": False,
+            "kv_snapshot": False,
+            "tensor_read": False,
+            "attention_comparison_executed": False,
+            "attention_override": False,
+            "runtime_writeback": False,
+            "scheduler_policy_noop": True,
+            "kv_cache_mutation": False,
+            "source_mutated": False,
+            "blocking_reasons": list(dict.fromkeys(blocking_reasons)),
+            "warning_reasons": [
+                "runtime_req_to_token_payload_production",
+                "metadata_only_no_live_req_to_token_read",
+                "no_token_to_kv_pool_read",
+            ],
+        }
+    )
+    return normalized
+
+
+def build_relaykv_runtime_req_to_token_resolution_payloads_for_smoke(
+    *,
+    runtime_observation_payloads: Any = None,
+    kv_index_resolution_plans: Any = None,
+    explicit_req_to_token_entries: Any = None,
+    production_enabled: bool = False,
+    max_tokens_per_request: int = 256,
+    max_total_tokens: int = 1024,
+) -> list[dict[str, Any]]:
+    """Build smoke-only req_to_token resolution payloads from safe metadata."""
+
+    source_payloads, source_path = _relaykv_runtime_req_to_token_source_payloads_for_smoke(
+        runtime_observation_payloads
+    )
+    explicit_entries, entries_error = _relaykv_runtime_req_to_token_entries_for_smoke(
+        explicit_req_to_token_entries
+    )
+
+    if production_enabled is not True:
+        return [
+            _relaykv_runtime_req_to_token_blocked_result_for_smoke(
+                None,
+                blocking_reasons=[
+                    "runtime_req_to_token_payload_production_not_enabled"
+                ],
+                max_tokens_per_request=max_tokens_per_request,
+                max_total_tokens=max_total_tokens,
+            )
+        ]
+
+    if source_payloads == [] and runtime_observation_payloads is not None:
+        return [
+            _relaykv_runtime_req_to_token_blocked_result_for_smoke(
+                None,
+                blocking_reasons=["source_payload_invalid"],
+                max_tokens_per_request=max_tokens_per_request,
+                max_total_tokens=max_total_tokens,
+            )
+        ]
+
+    if entries_error is not None:
+        return [
+            _relaykv_runtime_req_to_token_blocked_result_for_smoke(
+                source_payloads[0] if source_payloads else None,
+                blocking_reasons=[entries_error],
+                max_tokens_per_request=max_tokens_per_request,
+                max_total_tokens=max_total_tokens,
+            )
+        ]
+
+    assert explicit_entries is not None
+    if len(explicit_entries) > max_tokens_per_request:
+        return [
+            _relaykv_runtime_req_to_token_blocked_result_for_smoke(
+                source_payloads[0] if source_payloads else None,
+                blocking_reasons=["max_tokens_per_request_exceeded"],
+                max_tokens_per_request=max_tokens_per_request,
+                max_total_tokens=max_total_tokens,
+            )
+        ]
+
+    resolved_source_payloads = source_payloads or [{}]
+    if len(explicit_entries) * len(resolved_source_payloads) > max_total_tokens:
+        return [
+            _relaykv_runtime_req_to_token_blocked_result_for_smoke(
+                resolved_source_payloads[0],
+                blocking_reasons=["max_total_tokens_exceeded"],
+                max_tokens_per_request=max_tokens_per_request,
+                max_total_tokens=max_total_tokens,
+            )
+        ]
+
+    normalized_plans: list[Mapping[str, Any] | None] = []
+    if kv_index_resolution_plans is None:
+        normalized_plans = [None] * len(resolved_source_payloads)
+    elif not isinstance(kv_index_resolution_plans, (list, tuple)):
+        return [
+            _relaykv_runtime_req_to_token_blocked_result_for_smoke(
+                resolved_source_payloads[0],
+                blocking_reasons=["source_payload_invalid"],
+                max_tokens_per_request=max_tokens_per_request,
+                max_total_tokens=max_total_tokens,
+            )
+        ]
+    else:
+        for plan in kv_index_resolution_plans:
+            if plan is not None and not isinstance(plan, Mapping):
+                return [
+                    _relaykv_runtime_req_to_token_blocked_result_for_smoke(
+                        resolved_source_payloads[0],
+                        blocking_reasons=["source_payload_invalid"],
+                        max_tokens_per_request=max_tokens_per_request,
+                        max_total_tokens=max_total_tokens,
+                    )
+                ]
+            normalized_plans.append(plan)
+        if len(normalized_plans) < len(resolved_source_payloads):
+            normalized_plans.extend(
+                [None] * (len(resolved_source_payloads) - len(normalized_plans))
+            )
+
+    results: list[dict[str, Any]] = []
+    for index, source_payload in enumerate(resolved_source_payloads):
+        if not isinstance(source_payload, Mapping):
+            results.append(
+                _relaykv_runtime_req_to_token_blocked_result_for_smoke(
+                    None,
+                    blocking_reasons=["source_payload_invalid"],
+                    max_tokens_per_request=max_tokens_per_request,
+                    max_total_tokens=max_total_tokens,
+                )
+            )
+            continue
+
+        normalized = normalize_relaykv_sglang_adapter_schema_for_smoke(source_payload)
+        adapter_metadata = normalized.get("adapter_metadata")
+        if isinstance(adapter_metadata, Mapping):
+            payload_adapter_metadata = _copy_relaykv_metadata_value_for_smoke(
+                dict(adapter_metadata)
+            )
+        else:
+            payload_adapter_metadata = {}
+        payload_adapter_metadata.update(
+            {
+                "runtime_req_to_token_payload_production_enabled": True,
+                "runtime_req_to_token_payload_source_path": source_path,
+                "max_tokens_per_request": max_tokens_per_request,
+                "max_total_tokens": max_total_tokens,
+            }
+        )
+        plan = normalized_plans[index] if index < len(normalized_plans) else None
+        if isinstance(plan, Mapping):
+            payload_adapter_metadata["kv_index_resolution_plan_metadata"] = (
+                _copy_relaykv_metadata_value_for_smoke(dict(plan))
+            )
+
+        token_span = normalized.get("token_span")
+        if not _relaykv_smoke_token_span_from_value(token_span):
+            token_span = [0, len(explicit_entries)]
+            normalized["token_span"] = token_span
+        logical_block_id = normalized.get("logical_block_id")
+        if logical_block_id is None:
+            logical_block_id = _relaykv_smoke_first_present_value(
+                source_payload,
+                "logical_block_id",
+                "block_id",
+            )
+            if logical_block_id is None and isinstance(plan, Mapping):
+                logical_block_id = _relaykv_smoke_logical_block_id(plan)
+            normalized["logical_block_id"] = logical_block_id
+
+        token_start = 0
+        token_end = len(explicit_entries)
+        if (
+            isinstance(token_span, list)
+            and len(token_span) == 2
+            and isinstance(token_span[0], int)
+            and isinstance(token_span[1], int)
+        ):
+            token_start = token_span[0]
+            token_end = token_span[1]
+
+        req_to_token_span = {
+            "block_id": logical_block_id,
+            "token_start": token_start,
+            "token_end": token_end,
+            "token_count": len(explicit_entries),
+            "req_to_token_entries": list(explicit_entries),
+            "entry_count": len(explicit_entries),
+            "resolution_source": "runtime_metadata_explicit_req_to_token_entries",
+        }
+        normalized.update(
+            {
+                "event_type": "relaykv_req_to_token_resolution_result",
+                "resolution_state": "req_to_token_resolved",
+                "adapter_mode": "runtime_req_to_token_payload_production",
+                "source": "runtime_metadata_to_req_to_token_resolution_result",
+                "decision_state": "SHADOW_ONLY",
+                "engine_name": "sglang",
+                "adapter_name": "sglang",
+                "adapter_metadata": payload_adapter_metadata,
+                "full_kv_req_to_token_spans": [req_to_token_span],
+                "relaykv_working_req_to_token_spans": [req_to_token_span],
+                "resolved_block_count": 1,
+                "resolved_token_count": len(explicit_entries),
+                "req_to_token_entry_count": len(explicit_entries),
+                "req_to_token_read": False,
+                "req_to_token_read_count": 0,
+                "actual_req_to_token_pool_read": False,
+                "actual_req_to_token_pool_read_count": 0,
+                "token_to_kv_pool_read": False,
+                "token_to_kv_pool_read_count": 0,
+                "actual_token_to_kv_pool_read": False,
+                "actual_token_to_kv_pool_read_count": 0,
+                "live_token_to_kv_pool_index_read": False,
+                "live_token_to_kv_pool_index_read_count": 0,
+                "kv_pool_read": False,
+                "kv_snapshot": False,
+                "tensor_read": False,
+                "attention_comparison_executed": False,
+                "attention_override": False,
+                "runtime_writeback": False,
+                "scheduler_policy_noop": True,
+                "kv_cache_mutation": False,
+                "source_mutated": False,
+                "blocking_reasons": [],
+                "warning_reasons": [
+                    "runtime_req_to_token_payload_production",
+                    "metadata_only_no_live_req_to_token_read",
+                    "no_token_to_kv_pool_read",
+                ],
+            }
+        )
+        results.append(normalized)
+
+    return results
+
+
+def summarize_relaykv_runtime_req_to_token_resolution_payloads_for_smoke(
+    payloads: list[dict[str, Any]] | tuple[dict[str, Any], ...],
+    *,
+    production_enabled: bool,
+    max_tokens_per_request: int,
+    max_total_tokens: int,
+) -> dict[str, Any]:
+    """Summarize smoke-only runtime req_to_token payload production results."""
+
+    if not isinstance(payloads, (list, tuple)):
+        raise TypeError(
+            "RelayKV runtime req_to_token payloads must be a list or tuple"
+        )
+
+    resolved_count = 0
+    blocked_count = 0
+    error_count = 0
+    totals: Counter[str] = Counter(
+        {
+            "req_to_token_read_count": 0,
+            "actual_req_to_token_pool_read_count": 0,
+            "kv_pool_read_count": 0,
+            "tensor_read_count": 0,
+            "source_mutated_true_count": 0,
+        }
+    )
+    for payload in payloads:
+        if not isinstance(payload, dict):
+            raise TypeError(
+                "RelayKV runtime req_to_token payload result must be a dict"
+            )
+        state = str(payload.get("resolution_state") or "unknown")
+        if state == "req_to_token_resolved":
+            resolved_count += 1
+        elif state == "blocked":
+            blocked_count += 1
+        elif state == "error":
+            error_count += 1
+        for key in totals:
+            value = payload.get(key)
+            if isinstance(value, int) and not isinstance(value, bool):
+                totals[key] += value
+
+    return {
+        "event_type": (
+            "relaykv_runtime_req_to_token_resolution_payload_production_summary"
+        ),
+        "production_enabled": production_enabled,
+        "payload_count": len(payloads),
+        "resolved_count": resolved_count,
+        "blocked_count": blocked_count,
+        "error_count": error_count,
+        "max_tokens_per_request": max_tokens_per_request,
+        "max_total_tokens": max_total_tokens,
+        **{key: totals[key] for key in sorted(totals)},
+    }
+
+
 def _relaykv_req_to_token_resolution_payload_bridge_source(
     *,
     forward_batch: Any = None,
