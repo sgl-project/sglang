@@ -156,7 +156,26 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                 * kv_size
             )
 
-            if is_float4_e2m1fn_x2(kv_cache_dtype):
+            if hasattr(mr, "turboquant_bits"):
+                # TurboQuant: packed indices + bf16 dequant_scale per layer.
+                # No shared dequant buffer (fused kernels read packed directly).
+                n = model_config.get_num_kv_heads(tp_size)
+                d = model_config.head_dim
+                k_bits = getattr(mr, "turboquant_k_bits", mr.turboquant_bits)
+                v_bits = getattr(mr, "turboquant_v_bits", mr.turboquant_bits)
+
+                def _packed_bytes(bits, n, d):
+                    if bits == 2:
+                        return n * (d // 4)  # uint8, 4 values/byte
+                    else:  # 4-bit
+                        return n * (d // 2)  # uint8, 2 values/byte
+
+                per_layer_per_token = (
+                    _packed_bytes(k_bits, n, d) + _packed_bytes(v_bits, n, d)
+                    + 2 * n * 2  # k_dequant_scale + v_dequant_scale (bf16)
+                )
+                cell_size = per_layer_per_token * num_layers
+            elif is_float4_e2m1fn_x2(kv_cache_dtype):
                 # kv_scale_buffer
                 scale_block_size = 16
                 n = model_config.get_num_kv_heads(tp_size)
