@@ -50,6 +50,14 @@ SGL_TEST_FILES_CONSISTENCY_GT_BASES = (
     SGL_TEST_FILES_OFFICIAL_CONSISTENCY_GT_BASE,
     SGL_TEST_FILES_SGLANG_CONSISTENCY_GT_BASE,
 )
+SGL_TEST_FILES_OFFICIAL_CONSISTENCY_GT_CASES = frozenset(
+    {
+        "ltx_2.3_one_stage_ti2v",
+        "ltx_2.3_two_stage_t2v_2gpus",
+        "ltx_2_3_hq_pipeline",
+        "ltx_2_3_two_stage_ti2v_2gpus",
+    }
+)
 CONSISTENCY_THRESHOLD_JSON_PATH = (
     Path(__file__).resolve().parent / "server" / "consistency_threshold.json"
 )
@@ -967,7 +975,13 @@ def _find_remote_consistency_gt_files(
     is_video: bool,
     output_format: str | None = None,
 ) -> list[tuple[str, str]]:
-    for base_url in SGL_TEST_FILES_CONSISTENCY_GT_BASES:
+    bases = SGL_TEST_FILES_CONSISTENCY_GT_BASES
+    if case_id not in SGL_TEST_FILES_OFFICIAL_CONSISTENCY_GT_CASES:
+        bases = (
+            SGL_TEST_FILES_SGLANG_CONSISTENCY_GT_BASE,
+            SGL_TEST_FILES_OFFICIAL_CONSISTENCY_GT_BASE,
+        )
+    for base_url in bases:
         candidates = _remote_consistency_gt_candidates(
             base_url, case_id, num_gpus, is_video, output_format
         )
