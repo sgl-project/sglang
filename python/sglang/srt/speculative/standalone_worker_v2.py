@@ -8,6 +8,9 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.moe.utils import speculative_moe_backend_context
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.speculative.adaptive_runtime_state import (
+    AdaptiveController,
+)
 from sglang.srt.speculative.eagle_utils import TreeMaskMode
 from sglang.srt.speculative.eagle_worker_v2 import EagleDraftWorker, EAGLEWorkerV2
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -66,6 +69,9 @@ class StandaloneDraftWorker(EagleDraftWorker):
         self.speculative_algorithm = SpeculativeAlgorithm.from_string(
             server_args.speculative_algorithm
         )
+
+        # TODO: Adaptive speculative
+        self.adaptive_controller: Optional[AdaptiveController] = None
 
         # Set constant
         from sglang.srt.speculative.eagle_info import EagleDraftInput
