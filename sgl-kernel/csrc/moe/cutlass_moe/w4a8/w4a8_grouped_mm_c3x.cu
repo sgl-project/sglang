@@ -104,7 +104,7 @@ void dispatch_w4a8_moe_mm_sm90(
   uint32_t const n = d_tensors.size(-1);
   uint32_t const k = a_tensors.size(-1);
 
-   if (n == 4096 && k == 7168) {
+  if (n == 4096 && k == 7168) {
     // group gemm 1
     if (m <= 4) {
       INVOKE_GEMM_WITH_CONFIG((SM90_PP<64, 32, 512, 2, 1, 1>));

@@ -19,7 +19,6 @@ from sglang.srt.layers.moe.token_dispatcher.base import (
     DispatchOutput,
     DispatchOutputFormat,
 )
-from sglang.srt.layers.moe.utils import DeepEPMode, get_deepep_config, is_tbo_enabled
 from sglang.srt.layers.moe.topk import TopKOutput
 from sglang.srt.layers.moe.utils import (
     DeepEPMode,
@@ -658,8 +657,16 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
                 self.num_max_dispatch_tokens_per_rank,
                 self.num_experts,
                 use_fp8=use_fp8,
-                **(dict(use_per_tensor_quantization=use_fp8) if static_scale is not None else dict()),
-                **(dict(static_scale=static_scale) if static_scale is not None else dict()),
+                **(
+                    dict(use_per_tensor_quantization=use_fp8)
+                    if static_scale is not None
+                    else dict()
+                ),
+                **(
+                    dict(static_scale=static_scale)
+                    if static_scale is not None
+                    else dict()
+                ),
                 **(dict(use_nvfp4=True) if use_nvfp4 else dict()),
                 **(
                     dict(x_global_scale=input_global_scale)

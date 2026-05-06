@@ -23,7 +23,6 @@ else:
 
 from sglang.jit_kernel.per_tensor_quant_fp8 import per_tensor_quant_fp8
 from sglang.srt.distributed import get_moe_expert_parallel_world_size
-from sglang.srt.utils import get_bool_env_var
 from sglang.srt.layers.moe.ep_moe.kernels import (
     cutlass_w4_run_moe_ep_preproess,
     deepep_ll_get_cutlass_w4a8_moe_mm_data,
@@ -36,6 +35,7 @@ from sglang.srt.layers.moe.ep_moe.kernels import (
     silu_and_mul_masked_post_per_tensor_quant_fwd,
     silu_mul_static_tensorwise_quant_for_cutlass_moe,
 )
+from sglang.srt.utils import get_bool_env_var
 
 
 def cutlass_w4a8_moe(
@@ -513,9 +513,7 @@ def cutlass_w4a8_moe_deepep_ll(
         k,
     )
 
-    gateup_input = torch.empty(
-        a_states.shape, dtype=torch.float8_e4m3fn, device=device
-    )
+    gateup_input = torch.empty(a_states.shape, dtype=torch.float8_e4m3fn, device=device)
     if a_scales is not None:
         fp8_per_token_to_per_tensor_quant_triton(
             x=a_states,

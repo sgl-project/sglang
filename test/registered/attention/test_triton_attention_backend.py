@@ -3,6 +3,7 @@ Usage:
 python3 -m unittest test_triton_attention_backend.TestTritonAttnBackend.test_mmlu
 """
 
+import os
 import unittest
 from types import SimpleNamespace
 

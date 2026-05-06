@@ -13,6 +13,7 @@ from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     CustomTestCase,
+    is_in_ci,
     popen_launch_server,
 )
 

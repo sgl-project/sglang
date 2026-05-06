@@ -26,6 +26,7 @@ from sglang.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
     calculate_rouge_l,
+    is_in_ci,
     popen_launch_server,
 )
 

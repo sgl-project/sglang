@@ -20,7 +20,12 @@ from sglang.srt.layers.amx_utils import (
     _amx_process_weight_after_loading,
 )
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
-from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend, MoeRunnerConfig, get_moe_runner_backend
+from sglang.srt.layers.moe import (
+    MoeRunner,
+    MoeRunnerBackend,
+    MoeRunnerConfig,
+    get_moe_runner_backend,
+)
 from sglang.srt.layers.moe.moe_runner.deep_gemm import DeepGemmMoeQuantInfo
 from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
     FlashInferTrtllmFp8MoeQuantInfo,
@@ -801,7 +806,10 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         )
         self.with_bias = False
         self.cutlass_fp8_supported = cutlass_fp8_supported()
-        if get_moe_runner_backend().is_cutlass() or get_moe_runner_backend().is_cutlass_w4afp8():
+        if (
+            get_moe_runner_backend().is_cutlass()
+            or get_moe_runner_backend().is_cutlass_w4afp8()
+        ):
             assert (
                 cutlass_fp8_supported()
             ), "cutlass_fp8 MoE requires CUDA 12.0+ with SM90 or CUDA 12.4+ with SM89"
@@ -1664,7 +1672,10 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             if quant_info is not None:
                 return self.runner.run(dispatch_output, quant_info)
 
-        if get_moe_runner_backend().is_cutlass_w4afp8() or get_moe_runner_backend().is_cutlass():
+        if (
+            get_moe_runner_backend().is_cutlass_w4afp8()
+            or get_moe_runner_backend().is_cutlass()
+        ):
             from sglang.srt.layers.moe.cutlass_moe import cutlass_fused_experts_fp8
 
             with use_symmetric_memory(

@@ -263,7 +263,6 @@ class MooncakeKVManager(CommonKVManager):
                 "SGLANG_DISAGGREGATION_WAITING_TIMEOUT", 300
             )
 
-
     def _ensure_failure_tracking(self):
         if not hasattr(self, "failure_lock"):
             self.failure_lock = threading.Lock()
@@ -1636,6 +1635,7 @@ class MooncakeKVManager(CommonKVManager):
         self._ensure_failure_tracking()
         with self.failure_lock:
             self.failure_records[bootstrap_room] = failure_reason
+
     def get_session_id(self):
         return self.engine.get_session_id()
 

@@ -19,6 +19,7 @@ from sglang.test.test_utils import (
     DEFAULT_DRAFT_MODEL_EAGLE3,
     DEFAULT_MODEL_NAME_FOR_TEST,
     DEFAULT_TARGET_MODEL_EAGLE3,
+    is_in_ci,
 )
 
 register_cuda_ci(est_time=509, suite="stage-b-test-2-gpu-large")

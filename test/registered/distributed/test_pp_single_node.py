@@ -7,6 +7,7 @@ python3 -m unittest test_pp_single_node.TestQwenVLPPAccuracy.test_mmmu
 python3 -m unittest test_pp_single_node.TestPPMixedChunk.test_gsm8k
 """
 
+import os
 import time
 import unittest
 from types import SimpleNamespace

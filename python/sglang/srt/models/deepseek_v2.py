@@ -168,6 +168,7 @@ if _use_aiter_gfx95:
     from aiter.ops.triton.fused_fp8_quant import (
         fused_rms_fp8_group_quant,
     )
+
     from sglang.srt.layers.rocm_linear_utils import (
         get_dsv3_gemm_output_zero_allocator_size,
     )
@@ -1089,7 +1090,11 @@ class DeepseekV2MoE(nn.Module):
             self.experts.dispatcher.dispatch_a(
                 hidden_states=state.hidden_states_mlp_input,
                 topk_output=state.pop("topk_output"),
-                **(dict(static_scale=self.experts.w13_input_scale.float()) if self.experts.w13_input_scale is not None else dict()),
+                **(
+                    dict(static_scale=self.experts.w13_input_scale.float())
+                    if self.experts.w13_input_scale is not None
+                    else dict()
+                ),
                 tbo_subbatch_index=state.get("tbo_subbatch_index"),
             )
 
@@ -1717,6 +1722,7 @@ class DeepseekV2AttentionMLA(
             )
             and forward_batch.attn_backend.data_type == torch.float8_e4m3fn
         )
+
     def rebuild_cp_kv_cache(self, latent_cache, forward_batch, k_nope, k_pe):
         # support allgather+rerrange
         latent_cache[..., : self.kv_lora_rank] = k_nope.squeeze(1)

@@ -1,3 +1,4 @@
+import os
 import unittest
 
 from sglang.srt.utils import kill_process_tree
