@@ -70,7 +70,9 @@ def validate_deepseek_v4_cp(server_args: "ServerArgs") -> None:
             f"got {server_args.nsa_prefill_cp_mode}"
         )
 
+    server_args.enable_dp_attention = True
     server_args.moe_dense_tp_size = 1
+    server_args.attn_cp_size = server_args.tp_size // server_args.dp_size
     assert (
         server_args.dp_size == 1
     ), "For round-robin split mode, dp attention is not supported."
@@ -80,5 +82,5 @@ def validate_deepseek_v4_cp(server_args: "ServerArgs") -> None:
     logger.warning(
         f"Enable Context Parallel for DeepSeekV4, "
         f"dp_size={server_args.dp_size}, moe_dense_tp_size={server_args.moe_dense_tp_size}, "
-        f"ep_size={server_args.ep_size}, tp_size={server_args.tp_size}"
+        f"attn_cp_size={server_args.attn_cp_size}, ep_size={server_args.ep_size}, tp_size={server_args.tp_size}"
     )

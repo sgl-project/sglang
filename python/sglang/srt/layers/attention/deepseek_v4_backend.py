@@ -37,8 +37,10 @@ from sglang.srt.layers.attention.dsv4.metadata_kernel import (
 from sglang.srt.layers.attention.dsv4.quant_k_cache import (
     quant_to_nope_fp8_rope_bf16_pack_triton,
 )
-from sglang.srt.layers.attention.nsa.utils import is_nsa_prefill_cp_round_robin_split
-from sglang.srt.layers.dp_attention import get_attention_tp_rank, get_attention_tp_size
+from sglang.srt.layers.dp_attention import (
+    get_attention_cp_rank,
+    get_attention_cp_size,
+)
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.speculative.spec_info import SpecInput
@@ -197,8 +199,8 @@ class DSV4AttnMetadata:
     ]
 
     def apply_cp_reindex(self) -> None:
-        cp_rank = get_attention_tp_rank()
-        cp_size = get_attention_tp_size()
+        cp_rank = get_attention_cp_rank()
+        cp_size = get_attention_cp_size()
         idx = slice(cp_rank, None, cp_size)
         pre_global_len = self.seq_lens_casual.shape[0]
         assert pre_global_len % cp_size == 0, (
@@ -1138,8 +1140,6 @@ class DeepseekV4AttnBackend(
 
         if need_compress:
             core_attn_metadata.init_compression_metadata()
-            if is_prefill and is_nsa_prefill_cp_round_robin_split():
-                core_attn_metadata.apply_cp_reindex()
             core_attn_metadata.init_flashmla_related()
         else:
             core_attn_metadata.c4_sparse_topk_lengths = None
