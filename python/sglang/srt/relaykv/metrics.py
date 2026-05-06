@@ -6682,6 +6682,543 @@ def _relaykv_token_to_kv_pool_source_for_smoke(
     return token_to_kv_pool, token_to_kv_pool_path, token_to_kv_pool_lookup_error
 
 
+def _relaykv_safe_type_metadata_for_smoke(value: Any) -> tuple[str | None, str | None, str | None]:
+    if value is None:
+        return None, None, None
+    value_type = type(value)
+    return (
+        getattr(value_type, "__name__", None),
+        getattr(value_type, "__module__", None),
+        getattr(value_type, "__qualname__", None),
+    )
+
+
+def _relaykv_safe_noncallable_attr_for_smoke(
+    value: Any,
+    attr_name: str,
+) -> tuple[bool, Any, bool]:
+    try:
+        attr_value = getattr(value, attr_name)
+    except Exception:
+        return False, None, True
+    if callable(attr_value):
+        return True, None, False
+    return True, attr_value, False
+
+
+def _relaykv_safe_shape_value_for_smoke(value: Any) -> tuple[bool, Any, bool]:
+    attr_present, shape_value, attr_error = _relaykv_safe_noncallable_attr_for_smoke(
+        value,
+        "shape",
+    )
+    if attr_error:
+        return False, None, True
+    if not attr_present:
+        return False, None, False
+    if isinstance(shape_value, (list, tuple)):
+        dims: list[int] = []
+        for dim in shape_value:
+            if isinstance(dim, bool) or not isinstance(dim, int):
+                return True, shape_value, False
+            dims.append(dim)
+        if isinstance(shape_value, tuple):
+            return True, tuple(dims), False
+        return True, dims, False
+    return True, shape_value, False
+
+
+def _relaykv_safe_dtype_string_for_smoke(value: Any) -> tuple[bool, str | None, bool]:
+    attr_present, dtype_value, attr_error = _relaykv_safe_noncallable_attr_for_smoke(
+        value,
+        "dtype",
+    )
+    if attr_error:
+        return False, None, True
+    if not attr_present:
+        return False, None, False
+    try:
+        return True, str(dtype_value), False
+    except Exception:
+        return True, None, True
+
+
+def _relaykv_safe_device_string_for_smoke(value: Any) -> tuple[bool, str | None, bool]:
+    attr_present, device_value, attr_error = _relaykv_safe_noncallable_attr_for_smoke(
+        value,
+        "device",
+    )
+    if attr_error:
+        return False, None, True
+    if not attr_present:
+        return False, None, False
+    try:
+        return True, str(device_value), False
+    except Exception:
+        return True, None, True
+
+
+def _relaykv_safe_ndim_value_for_smoke(value: Any) -> tuple[bool, int | None, bool]:
+    attr_present, ndim_value, attr_error = _relaykv_safe_noncallable_attr_for_smoke(
+        value,
+        "ndim",
+    )
+    if attr_error:
+        return False, None, True
+    if not attr_present:
+        return False, None, False
+    if isinstance(ndim_value, int) and not isinstance(ndim_value, bool):
+        return True, ndim_value, False
+    return True, None, False
+
+
+def _relaykv_safe_len_value_for_smoke(value: Any) -> tuple[bool, int | None, bool]:
+    try:
+        length = len(value)
+    except Exception:
+        return True, None, True
+    if isinstance(length, int) and not isinstance(length, bool):
+        return True, length, False
+    return True, None, False
+
+
+def _relaykv_object_has_getitem_for_smoke(value: Any) -> bool:
+    if value is None:
+        return False
+    return callable(getattr(type(value), "__getitem__", None))
+
+
+def _relaykv_known_method_presence_for_smoke(value: Any) -> dict[str, bool]:
+    known_method_names = (
+        "get",
+        "get_flat_data",
+        "get_data",
+        "get_kv_indices",
+        "get_kv_index",
+        "get_index",
+        "get_token_index",
+        "get_token_to_kv_pool",
+        "get_token_to_kv",
+        "read",
+        "lookup",
+    )
+    presence: dict[str, bool] = {}
+    value_type = type(value)
+    for method_name in known_method_names:
+        presence[method_name] = callable(getattr(value_type, method_name, None))
+    return presence
+
+
+def _relaykv_shallow_object_summary_for_smoke(
+    value: Any,
+) -> dict[str, Any]:
+    (
+        type_name,
+        module_name,
+        qualname,
+    ) = _relaykv_safe_type_metadata_for_smoke(value)
+    has_shape, shape_value, shape_error = _relaykv_safe_shape_value_for_smoke(value)
+    has_dtype, dtype_value, dtype_error = _relaykv_safe_dtype_string_for_smoke(value)
+    has_device, device_value, device_error = _relaykv_safe_device_string_for_smoke(
+        value
+    )
+    has_ndim, ndim_value, ndim_error = _relaykv_safe_ndim_value_for_smoke(value)
+    has_len, len_value, len_error = _relaykv_safe_len_value_for_smoke(value)
+    size_present, size_value, size_error = _relaykv_safe_noncallable_attr_for_smoke(
+        value,
+        "size",
+    )
+    is_tensor_like = has_shape or has_dtype or has_device
+    return {
+        "type_name": type_name,
+        "module": module_name,
+        "qualname": qualname,
+        "has_getitem": _relaykv_object_has_getitem_for_smoke(value),
+        "has_shape": has_shape,
+        "shape": shape_value,
+        "shape_error": shape_error,
+        "has_dtype": has_dtype,
+        "dtype": dtype_value,
+        "dtype_error": dtype_error,
+        "has_device": has_device,
+        "device": device_value,
+        "device_error": device_error,
+        "has_ndim": has_ndim,
+        "ndim": ndim_value,
+        "ndim_error": ndim_error,
+        "has_len": has_len,
+        "len": len_value,
+        "len_error": len_error,
+        "has_size_attr": size_present,
+        "size_attr": size_value,
+        "size_attr_error": size_error,
+        "is_tensor_like": is_tensor_like,
+    }
+
+
+def build_relaykv_token_to_kv_pool_object_interface_inspection_results_for_smoke(
+    *,
+    token_to_kv_pool_object: Any = None,
+    model_runner: Any = None,
+    forward_batch: Any = None,
+    inspect_token_to_kv_pool_object_interface: bool = False,
+    source_path: str | None = None,
+) -> list[dict[str, Any]]:
+    if inspect_token_to_kv_pool_object_interface is not True:
+        blocked_reason = "token_to_kv_pool_object_interface_inspection_not_enabled"
+        return [
+            {
+                "event_type": "relaykv_token_to_kv_pool_object_interface_inspection_result",
+                "inspection_state": "blocked",
+                "adapter_mode": "token_to_kv_pool_object_interface_inspection",
+                "decision_state": "SHADOW_ONLY",
+                "engine_name": "sglang",
+                "adapter_name": "sglang",
+                "source_path": source_path,
+                "object_type_name": None,
+                "object_module": None,
+                "object_qualname": None,
+                "object_has_getitem": False,
+                "object_has_shape": False,
+                "object_shape": None,
+                "object_has_dtype": False,
+                "object_dtype": None,
+                "object_has_device": False,
+                "object_device": None,
+                "object_has_len": False,
+                "object_len": None,
+                "known_method_presence": {},
+                "known_attr_presence": {},
+                "known_attr_summaries": [],
+                "candidate_next_source_paths": [],
+                "blocked_reason": blocked_reason,
+                "req_to_token_read_count": 0,
+                "actual_req_to_token_pool_read_count": 0,
+                "token_to_kv_pool_read_count": 0,
+                "actual_token_to_kv_pool_read_count": 0,
+                "live_token_to_kv_pool_index_read_count": 0,
+                "kv_pool_read_count": 0,
+                "kv_snapshot_count": 0,
+                "tensor_read_count": 0,
+                "attention_comparison_executed_count": 0,
+                "attention_override_true_count": 0,
+                "runtime_writeback_true_count": 0,
+                "scheduler_policy_noop_false_count": 0,
+                "kv_cache_mutation_true_count": 0,
+                "source_mutated_true_count": 0,
+                "source_mutated": False,
+            }
+        ]
+
+    if token_to_kv_pool_object is None:
+        blocked_reason = "token_to_kv_pool_object_missing"
+        return [
+            {
+                "event_type": "relaykv_token_to_kv_pool_object_interface_inspection_result",
+                "inspection_state": "blocked",
+                "adapter_mode": "token_to_kv_pool_object_interface_inspection",
+                "decision_state": "SHADOW_ONLY",
+                "engine_name": "sglang",
+                "adapter_name": "sglang",
+                "source_path": source_path,
+                "object_type_name": None,
+                "object_module": None,
+                "object_qualname": None,
+                "object_has_getitem": False,
+                "object_has_shape": False,
+                "object_shape": None,
+                "object_has_dtype": False,
+                "object_dtype": None,
+                "object_has_device": False,
+                "object_device": None,
+                "object_has_len": False,
+                "object_len": None,
+                "known_method_presence": {},
+                "known_attr_presence": {},
+                "known_attr_summaries": [],
+                "candidate_next_source_paths": [],
+                "blocked_reason": blocked_reason,
+                "req_to_token_read_count": 0,
+                "actual_req_to_token_pool_read_count": 0,
+                "token_to_kv_pool_read_count": 0,
+                "actual_token_to_kv_pool_read_count": 0,
+                "live_token_to_kv_pool_index_read_count": 0,
+                "kv_pool_read_count": 0,
+                "kv_snapshot_count": 0,
+                "tensor_read_count": 0,
+                "attention_comparison_executed_count": 0,
+                "attention_override_true_count": 0,
+                "runtime_writeback_true_count": 0,
+                "scheduler_policy_noop_false_count": 0,
+                "kv_cache_mutation_true_count": 0,
+                "source_mutated_true_count": 0,
+                "source_mutated": False,
+            }
+        ]
+
+    object_summary = _relaykv_shallow_object_summary_for_smoke(token_to_kv_pool_object)
+    known_method_presence = _relaykv_known_method_presence_for_smoke(
+        token_to_kv_pool_object
+    )
+    known_attr_names = (
+        "token_to_kv_pool",
+        "token_to_kv",
+        "token_to_kv_pool_allocator",
+        "req_to_token_pool",
+        "req_to_token",
+        "pool",
+        "indices",
+        "index",
+        "data",
+        "storage",
+        "tensor",
+        "device",
+        "dtype",
+        "shape",
+    )
+    known_attr_presence: dict[str, bool] = {}
+    known_attr_summaries: list[dict[str, Any]] = []
+    candidate_next_source_paths: list[str] = []
+
+    for attr_name in known_attr_names:
+        attr_present, attr_value, attr_error = _relaykv_safe_noncallable_attr_for_smoke(
+            token_to_kv_pool_object,
+            attr_name,
+        )
+        known_attr_presence[attr_name] = attr_present and not attr_error
+        if not attr_present or attr_error:
+            continue
+        attr_summary = _relaykv_shallow_object_summary_for_smoke(attr_value)
+        attr_type_name, attr_module, _ = _relaykv_safe_type_metadata_for_smoke(attr_value)
+        entry = {
+            "attr_name": attr_name,
+            "attr_present": True,
+            "attr_type_name": attr_type_name,
+            "attr_module": attr_module,
+            "attr_has_getitem": attr_summary["has_getitem"],
+            "attr_has_shape": attr_summary["has_shape"],
+            "attr_shape": attr_summary["shape"],
+            "attr_has_dtype": attr_summary["has_dtype"],
+            "attr_dtype": attr_summary["dtype"],
+            "attr_has_device": attr_summary["has_device"],
+            "attr_device": attr_summary["device"],
+        }
+        known_attr_summaries.append(entry)
+        if source_path and (attr_summary["has_getitem"] or attr_summary["is_tensor_like"]):
+            candidate_next_source_paths.append(f"{source_path}.{attr_name}")
+
+    return [
+        {
+            "event_type": "relaykv_token_to_kv_pool_object_interface_inspection_result",
+            "inspection_state": "inspected",
+            "adapter_mode": "token_to_kv_pool_object_interface_inspection",
+            "decision_state": "SHADOW_ONLY",
+            "engine_name": "sglang",
+            "adapter_name": "sglang",
+            "source_path": source_path,
+            "object_type_name": object_summary["type_name"],
+            "object_module": object_summary["module"],
+            "object_qualname": object_summary["qualname"],
+            "object_has_getitem": object_summary["has_getitem"],
+            "object_has_shape": object_summary["has_shape"],
+            "object_shape": object_summary["shape"],
+            "object_has_dtype": object_summary["has_dtype"],
+            "object_dtype": object_summary["dtype"],
+            "object_has_device": object_summary["has_device"],
+            "object_device": object_summary["device"],
+            "object_has_len": object_summary["has_len"],
+            "object_len": object_summary["len"],
+            "known_method_presence": known_method_presence,
+            "known_attr_presence": known_attr_presence,
+            "known_attr_summaries": known_attr_summaries,
+            "candidate_next_source_paths": sorted(set(candidate_next_source_paths)),
+            "blocked_reason": None,
+            "req_to_token_read_count": 0,
+            "actual_req_to_token_pool_read_count": 0,
+            "token_to_kv_pool_read_count": 0,
+            "actual_token_to_kv_pool_read_count": 0,
+            "live_token_to_kv_pool_index_read_count": 0,
+            "kv_pool_read_count": 0,
+            "kv_snapshot_count": 0,
+            "tensor_read_count": 0,
+            "attention_comparison_executed_count": 0,
+            "attention_override_true_count": 0,
+            "runtime_writeback_true_count": 0,
+            "scheduler_policy_noop_false_count": 0,
+            "kv_cache_mutation_true_count": 0,
+            "source_mutated_true_count": 0,
+            "source_mutated": False,
+        }
+    ]
+
+
+def summarize_relaykv_token_to_kv_pool_object_interface_inspection_results_for_smoke(
+    results: list[dict[str, Any]] | tuple[dict[str, Any], ...],
+) -> dict[str, Any]:
+    if not isinstance(results, (list, tuple)):
+        raise TypeError(
+            "RelayKV token_to_kv_pool object interface inspection results must be a list or tuple"
+        )
+
+    observed_type_counts: Counter[str] = Counter()
+    observed_shape_counts: Counter[str] = Counter()
+    observed_dtype_counts: Counter[str] = Counter()
+    observed_device_counts: Counter[str] = Counter()
+    known_method_presence_counts: Counter[str] = Counter()
+    known_attr_presence_counts: Counter[str] = Counter()
+    candidate_indexable_attr_names: set[str] = set()
+    candidate_tensor_like_attr_names: set[str] = set()
+    candidate_next_source_paths: set[str] = set()
+    blocked_reason = None
+    blocked_count = 0
+    error_count = 0
+    inspected_count = 0
+    object_has_getitem_count = 0
+    source_path = None
+
+    for result in results:
+        if not isinstance(result, dict):
+            raise TypeError(
+                "RelayKV token_to_kv_pool object interface inspection result must be a dict"
+            )
+        state = str(result.get("inspection_state") or "unknown")
+        source_path = result.get("source_path") or source_path
+        if state == "inspected":
+            inspected_count += 1
+        elif state == "blocked":
+            blocked_count += 1
+        elif state == "error":
+            error_count += 1
+        if blocked_reason is None and result.get("blocked_reason"):
+            blocked_reason = result.get("blocked_reason")
+        if result.get("object_has_getitem") is True:
+            object_has_getitem_count += 1
+        object_type_name = result.get("object_type_name")
+        if object_type_name:
+            observed_type_counts[str(object_type_name)] += 1
+        object_shape = result.get("object_shape")
+        if object_shape is not None:
+            observed_shape_counts[str(object_shape)] += 1
+        object_dtype = result.get("object_dtype")
+        if object_dtype is not None:
+            observed_dtype_counts[str(object_dtype)] += 1
+        object_device = result.get("object_device")
+        if object_device is not None:
+            observed_device_counts[str(object_device)] += 1
+        known_method_presence = result.get("known_method_presence")
+        if isinstance(known_method_presence, Mapping):
+            for method_name, present in known_method_presence.items():
+                if present is True:
+                    known_method_presence_counts[str(method_name)] += 1
+        known_attr_presence = result.get("known_attr_presence")
+        if isinstance(known_attr_presence, Mapping):
+            for attr_name, present in known_attr_presence.items():
+                if present is True:
+                    known_attr_presence_counts[str(attr_name)] += 1
+        attr_summaries = result.get("known_attr_summaries")
+        if isinstance(attr_summaries, list):
+            for attr_summary in attr_summaries:
+                if not isinstance(attr_summary, Mapping):
+                    continue
+                attr_name = attr_summary.get("attr_name")
+                if not attr_name:
+                    continue
+                if attr_summary.get("attr_has_getitem") is True:
+                    candidate_indexable_attr_names.add(str(attr_name))
+                if (
+                    attr_summary.get("attr_has_shape") is True
+                    or attr_summary.get("attr_has_dtype") is True
+                    or attr_summary.get("attr_has_device") is True
+                ):
+                    candidate_tensor_like_attr_names.add(str(attr_name))
+        next_paths = result.get("candidate_next_source_paths")
+        if isinstance(next_paths, list):
+            for next_path in next_paths:
+                if next_path:
+                    candidate_next_source_paths.add(str(next_path))
+
+    return {
+        "event_type": "relaykv_token_to_kv_pool_object_interface_inspection_summary",
+        "inspection_enabled": True,
+        "result_count": len(results),
+        "inspected_count": inspected_count,
+        "blocked_count": blocked_count,
+        "error_count": error_count,
+        "source_path": source_path,
+        "observed_type_counts": dict(sorted(observed_type_counts.items())),
+        "observed_shape_counts": dict(sorted(observed_shape_counts.items())),
+        "observed_dtype_counts": dict(sorted(observed_dtype_counts.items())),
+        "observed_device_counts": dict(sorted(observed_device_counts.items())),
+        "object_has_getitem_count": object_has_getitem_count,
+        "known_method_presence_counts": dict(
+            sorted(known_method_presence_counts.items())
+        ),
+        "known_attr_presence_counts": dict(sorted(known_attr_presence_counts.items())),
+        "candidate_indexable_attr_names": sorted(candidate_indexable_attr_names),
+        "candidate_tensor_like_attr_names": sorted(candidate_tensor_like_attr_names),
+        "candidate_next_source_paths": sorted(candidate_next_source_paths),
+        "blocked_reason": blocked_reason,
+        "req_to_token_read_count": 0,
+        "actual_req_to_token_pool_read_count": 0,
+        "token_to_kv_pool_read_count": 0,
+        "actual_token_to_kv_pool_read_count": 0,
+        "live_token_to_kv_pool_index_read_count": 0,
+        "kv_pool_read_count": 0,
+        "kv_snapshot_count": 0,
+        "tensor_read_count": 0,
+        "attention_comparison_executed_count": 0,
+        "attention_override_true_count": 0,
+        "runtime_writeback_true_count": 0,
+        "scheduler_policy_noop_false_count": 0,
+        "kv_cache_mutation_true_count": 0,
+        "source_mutated_true_count": 0,
+    }
+
+
+def run_model_runner_token_to_kv_pool_object_interface_inspection_hook_for_smoke(
+    model_runner: Any,
+    forward_batch: Any = None,
+    *,
+    inspect_token_to_kv_pool_object_interface: bool = True,
+) -> dict[str, Any]:
+    token_to_kv_pool, token_to_kv_pool_path, token_to_kv_pool_lookup_error = (
+        _relaykv_token_to_kv_pool_source_for_smoke(
+            forward_batch=forward_batch,
+            model_runner=model_runner,
+        )
+    )
+    results = build_relaykv_token_to_kv_pool_object_interface_inspection_results_for_smoke(
+        token_to_kv_pool_object=token_to_kv_pool,
+        model_runner=model_runner,
+        forward_batch=forward_batch,
+        inspect_token_to_kv_pool_object_interface=inspect_token_to_kv_pool_object_interface,
+        source_path=token_to_kv_pool_path,
+    )
+    summary = summarize_relaykv_token_to_kv_pool_object_interface_inspection_results_for_smoke(
+        results
+    )
+    summary["token_to_kv_pool_lookup_error"] = token_to_kv_pool_lookup_error
+    summary["hook_path_counts"] = {
+        "none": 0,
+        "model_runner.token_to_kv_pool": 0,
+        "model_runner.token_to_kv_pool_allocator.token_to_kv_pool": 0,
+        "model_runner.token_to_kv_pool_allocator": 0,
+        "model_runner.kv_pool_allocator.token_to_kv_pool": 0,
+        "model_runner.memory_pool.token_to_kv_pool": 0,
+        "forward_batch.token_to_kv_pool": 0,
+        "forward_batch.token_to_kv_pool_allocator.token_to_kv_pool": 0,
+        "forward_batch.token_to_kv_pool_allocator": 0,
+    }
+    hook_key = token_to_kv_pool_path or "none"
+    if hook_key not in summary["hook_path_counts"]:
+        summary["hook_path_counts"][hook_key] = 0
+    summary["hook_path_counts"][hook_key] += len(results)
+    return {
+        "payloads": results,
+        "summary": summary,
+        "token_to_kv_pool_path": token_to_kv_pool_path,
+    }
+
+
 def build_relaykv_live_token_to_kv_pool_index_read_results_for_smoke(
     req_to_token_resolution_results: list[dict[str, Any]]
     | tuple[dict[str, Any], ...],
