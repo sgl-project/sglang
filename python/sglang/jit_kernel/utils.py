@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import functools
+import hashlib
 import importlib.util
 import logging
 import os
@@ -91,6 +92,7 @@ DEFAULT_INCLUDE = [str(KERNEL_PATH / "include")]
 DEFAULT_CFLAGS = ["-std=c++20", "-O3"]
 DEFAULT_LDFLAGS = []
 CPP_TEMPLATE_TYPE: TypeAlias = Union[int, float, str, bool, torch.dtype]
+JIT_SOURCE_EXTENSIONS = frozenset((".c", ".cc", ".cpp", ".cu", ".cuh", ".h", ".hpp"))
 
 
 class CPPArgList(list[str]):
@@ -126,6 +128,185 @@ def make_cpp_args(*args: CPP_TEMPLATE_TYPE) -> CPPArgList:
         raise TypeError(f"Unsupported argument type for cpp template: {type(arg)}")
 
     return CPPArgList(_convert(arg) for arg in args)
+
+
+@dataclass(frozen=True)
+class JitArtifactCacheInfo:
+    """Information for external SGLang JIT artifact cache hooks."""
+
+    module_name: str
+    cache_key: str
+    build_directory: pathlib.Path
+    artifact_path: pathlib.Path
+
+
+JitArtifactRestoreHook: TypeAlias = Callable[[JitArtifactCacheInfo], "Module | None"]
+JitArtifactStoreHook: TypeAlias = Callable[[JitArtifactCacheInfo], None]
+JitArtifactCacheHook: TypeAlias = Tuple[JitArtifactRestoreHook, JitArtifactStoreHook]
+_JIT_ARTIFACT_CACHE_HOOKS: List[JitArtifactCacheHook] = []
+
+
+def register_jit_artifact_cache(
+    restore: JitArtifactRestoreHook,
+    store: JitArtifactStoreHook,
+) -> Callable[[], None]:
+    """Register external restore/store hooks for compiled SGLang JIT artifacts.
+
+    The restore hook should return a loaded module on a cache hit, or ``None`` on a
+    miss. The store hook is called after a successful local build when
+    ``info.artifact_path`` exists. Exceptions from hooks are logged and ignored so
+    JIT compilation can still proceed.
+
+    Returns a function that unregisters the hook pair.
+    """
+
+    hook = (restore, store)
+    _JIT_ARTIFACT_CACHE_HOOKS.append(hook)
+
+    def unregister() -> None:
+        try:
+            _JIT_ARTIFACT_CACHE_HOOKS.remove(hook)
+        except ValueError:
+            pass
+
+    return unregister
+
+
+def _file_digest(path: str) -> Tuple[str, str]:
+    path_obj = pathlib.Path(path).resolve()
+    digest = hashlib.sha256()
+    with path_obj.open("rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            digest.update(chunk)
+
+    try:
+        source_id = str(path_obj.relative_to(KERNEL_PATH))
+    except ValueError:
+        source_id = str(path_obj)
+    return source_id, digest.hexdigest()
+
+
+@cache_once
+def _jit_kernel_include_digest() -> str:
+    digest = hashlib.sha256()
+    root = KERNEL_PATH / "include"
+    if not root.exists():
+        return digest.hexdigest()
+    for path in sorted(p for p in root.rglob("*") if p.is_file()):
+        if path.suffix not in JIT_SOURCE_EXTENSIONS:
+            continue
+        digest.update(repr(_file_digest(str(path))).encode())
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
+def _tvm_ffi_cache_dir() -> pathlib.Path:
+    from sglang.srt.environ import envs
+
+    return pathlib.Path(envs.SGLANG_CACHE_DIR.get()).expanduser() / "tvm-ffi"
+
+
+def _jit_module_extension() -> str:
+    import tvm_ffi.cpp.extension as tvm_ext
+
+    return ".dll" if tvm_ext.IS_WINDOWS else ".so"
+
+
+def _jit_build_directory(
+    module_name: str,
+    *,
+    cpp_files: List[str],
+    cuda_files: List[str],
+    cpp_wrappers: List[Tuple[str, str]],
+    cuda_wrappers: List[Tuple[str, str]],
+    extra_cflags: List[str],
+    extra_cuda_cflags: List[str],
+    target_arch: str | None,
+    extra_ldflags: List[str],
+    extra_include_paths: List[str],
+    extra_dependencies: List[str] | None,
+    header_only: bool,
+) -> Tuple[pathlib.Path, str]:
+    import tvm_ffi
+
+    digest = hashlib.sha256()
+
+    def add(value: object) -> None:
+        digest.update(repr(value).encode())
+        digest.update(b"\0")
+
+    add(module_name)
+    add(header_only)
+    add(
+        [
+            str(pathlib.Path(path).relative_to(KERNEL_PATH / "csrc"))
+            for path in cpp_files
+        ]
+    )
+    add(
+        [
+            str(pathlib.Path(path).relative_to(KERNEL_PATH / "csrc"))
+            for path in cuda_files
+        ]
+    )
+    add(cpp_wrappers)
+    add(cuda_wrappers)
+    add(extra_cflags)
+    add(extra_cuda_cflags)
+    add(target_arch)
+    add(extra_ldflags)
+    add(extra_include_paths)
+    add(sorted(extra_dependencies or []))
+    add(getattr(tvm_ffi, "__version__", None))
+    add(torch.version.cuda)
+    add(torch.version.hip)
+    add(_jit_kernel_include_digest())
+    add([_file_digest(path) for path in sorted(cpp_files)])
+    add([_file_digest(path) for path in sorted(cuda_files)])
+
+    cache_key = digest.hexdigest()[:16]
+    return _tvm_ffi_cache_dir() / f"{module_name}_{cache_key}", cache_key
+
+
+def _jit_artifact_cache_info(
+    module_name: str, cache_key: str, build_directory: pathlib.Path
+) -> JitArtifactCacheInfo:
+    return JitArtifactCacheInfo(
+        module_name=module_name,
+        cache_key=cache_key,
+        build_directory=build_directory,
+        artifact_path=build_directory / f"{module_name}{_jit_module_extension()}",
+    )
+
+
+def _restore_jit_artifact(info: JitArtifactCacheInfo) -> Module | None:
+    for restore, _ in list(_JIT_ARTIFACT_CACHE_HOOKS):
+        try:
+            module = restore(info)
+        except Exception:
+            logger.warning(
+                "SGLang JIT artifact restore hook failed for %s",
+                info.module_name,
+                exc_info=True,
+            )
+            continue
+        if module is not None:
+            return module
+    return None
+
+
+def _store_jit_artifact(info: JitArtifactCacheInfo) -> None:
+    if not info.artifact_path.exists():
+        return
+    for _, store in list(_JIT_ARTIFACT_CACHE_HOOKS):
+        try:
+            store(info)
+        except Exception:
+            logger.warning(
+                "SGLang JIT artifact store hook failed for %s",
+                info.module_name,
+                exc_info=True,
+            )
 
 
 def load_jit(
@@ -195,6 +376,37 @@ def load_jit(
         extra_include_paths += _REGISTERED_DEPENDENCIES[dep]()
 
     module_name = "sgl_kernel_jit_" + "_".join(str(arg) for arg in args)
+    artifact_info = None
+    with _jit_compile_context():
+        default_cuda_cflags = _get_default_target_flags()
+        target_arch = (
+            os.environ.get("TVM_FFI_ROCM_ARCH_LIST")
+            if is_hip_runtime()
+            else os.environ.get("TVM_FFI_CUDA_ARCH_LIST")
+        )
+
+    if build_directory is None:
+        build_dir, cache_key = _jit_build_directory(
+            module_name,
+            cpp_files=cpp_files,
+            cuda_files=cuda_files,
+            cpp_wrappers=cpp_wrappers or [],
+            cuda_wrappers=cuda_wrappers or [],
+            extra_cflags=DEFAULT_CFLAGS + extra_cflags,
+            extra_cuda_cflags=default_cuda_cflags + extra_cuda_cflags,
+            target_arch=target_arch,
+            extra_ldflags=DEFAULT_LDFLAGS + extra_ldflags,
+            extra_include_paths=DEFAULT_INCLUDE + extra_include_paths,
+            extra_dependencies=extra_dependencies,
+            header_only=header_only,
+        )
+        build_directory = str(build_dir)
+        artifact_info = _jit_artifact_cache_info(module_name, cache_key, build_dir)
+
+        restored_module = _restore_jit_artifact(artifact_info)
+        if restored_module is not None:
+            return restored_module
+
     if header_only:
         cpp_wrappers = cpp_wrappers or []
         cuda_wrappers = cuda_wrappers or []
@@ -205,29 +417,35 @@ def load_jit(
         cuda_sources = [f'#include "{path}"' for path in cuda_files]
         cuda_sources += [_make_wrapper(tup) for tup in cuda_wrappers]
         with _jit_compile_context():
-            return load_inline(
+            module = load_inline(
                 module_name,
                 cpp_sources=cpp_sources,
                 cuda_sources=cuda_sources,
                 extra_cflags=DEFAULT_CFLAGS + extra_cflags,
-                extra_cuda_cflags=_get_default_target_flags() + extra_cuda_cflags,
+                extra_cuda_cflags=default_cuda_cflags + extra_cuda_cflags,
                 extra_ldflags=DEFAULT_LDFLAGS + extra_ldflags,
                 extra_include_paths=DEFAULT_INCLUDE + extra_include_paths,
                 build_directory=build_directory,
             )
+        if artifact_info is not None:
+            _store_jit_artifact(artifact_info)
+        return module
     else:
         assert cpp_wrappers is None and cuda_wrappers is None
         with _jit_compile_context():
-            return load(
+            module = load(
                 module_name,
                 cpp_files=cpp_files,
                 cuda_files=cuda_files,
                 extra_cflags=DEFAULT_CFLAGS + extra_cflags,
-                extra_cuda_cflags=_get_default_target_flags() + extra_cuda_cflags,
+                extra_cuda_cflags=default_cuda_cflags + extra_cuda_cflags,
                 extra_ldflags=DEFAULT_LDFLAGS + extra_ldflags,
                 extra_include_paths=DEFAULT_INCLUDE + extra_include_paths,
                 build_directory=build_directory,
             )
+        if artifact_info is not None:
+            _store_jit_artifact(artifact_info)
+        return module
 
 
 @dataclass
@@ -410,4 +628,6 @@ __all__ = [
     "get_jit_cuda_arch",
     "is_arch_support_pdl",
     "register_dependency",
+    "register_jit_artifact_cache",
+    "JitArtifactCacheInfo",
 ]
