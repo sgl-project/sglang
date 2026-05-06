@@ -6916,6 +6916,346 @@ def _relaykv_runtime_req_to_token_entries_for_smoke(
     return normalized_entries, None
 
 
+def build_relaykv_runtime_metadata_derived_req_to_token_entries_for_smoke(
+    *,
+    runtime_observation_payloads: Any = None,
+    kv_index_resolution_plans: Any = None,
+    production_enabled: bool = False,
+    max_tokens_per_request: int = 256,
+    max_total_tokens: int = 1024,
+) -> list[dict[str, Any]]:
+    """Build smoke-only synthetic req_to_token entries from safe runtime metadata."""
+
+    results: list[dict[str, Any]] = []
+    if production_enabled is not True:
+        return [
+            {
+                "event_type": (
+                    "relaykv_runtime_metadata_derived_req_to_token_entries_result"
+                ),
+                "derivation_state": "blocked",
+                "derivation_mode": "runtime_metadata_only",
+                "engine_request_id": None,
+                "logical_sequence_id": None,
+                "token_span": None,
+                "layer_id": None,
+                "kv_head_group": None,
+                "derived_req_to_token_entries": [],
+                "derived_entry_count": 0,
+                "blocked_reason": "runtime_metadata_derivation_not_enabled",
+                "source_mutated": False,
+                "req_to_token_read_count": 0,
+                "actual_req_to_token_pool_read_count": 0,
+                "token_to_kv_pool_read_count": 0,
+                "actual_token_to_kv_pool_read_count": 0,
+                "live_token_to_kv_pool_index_read_count": 0,
+                "kv_pool_read_count": 0,
+                "kv_snapshot_count": 0,
+                "tensor_read_count": 0,
+                "attention_comparison_executed_count": 0,
+                "attention_override_true_count": 0,
+                "runtime_writeback_true_count": 0,
+                "scheduler_policy_noop_false_count": 0,
+                "kv_cache_mutation_true_count": 0,
+                "source_mutated_true_count": 0,
+            }
+        ]
+
+    payloads, source_path = _relaykv_runtime_req_to_token_source_payloads_for_smoke(
+        runtime_observation_payloads
+    )
+    normalized_plans: list[Mapping[str, Any] | None] = []
+    if kv_index_resolution_plans is None:
+        normalized_plans = []
+    elif not isinstance(kv_index_resolution_plans, (list, tuple)):
+        payloads = []
+        source_path = "runtime_observation_payloads"
+    else:
+        for plan in kv_index_resolution_plans:
+            if plan is not None and not isinstance(plan, Mapping):
+                payloads = []
+                source_path = "runtime_observation_payloads"
+                break
+            normalized_plans.append(plan)
+
+    if payloads is None:
+        return [
+            {
+                "event_type": (
+                    "relaykv_runtime_metadata_derived_req_to_token_entries_result"
+                ),
+                "derivation_state": "blocked",
+                "derivation_mode": "runtime_metadata_only",
+                "engine_request_id": None,
+                "logical_sequence_id": None,
+                "token_span": None,
+                "layer_id": None,
+                "kv_head_group": None,
+                "derived_req_to_token_entries": [],
+                "derived_entry_count": 0,
+                "blocked_reason": "runtime_observation_payloads_missing",
+                "source_mutated": False,
+                "req_to_token_read_count": 0,
+                "actual_req_to_token_pool_read_count": 0,
+                "token_to_kv_pool_read_count": 0,
+                "actual_token_to_kv_pool_read_count": 0,
+                "live_token_to_kv_pool_index_read_count": 0,
+                "kv_pool_read_count": 0,
+                "kv_snapshot_count": 0,
+                "tensor_read_count": 0,
+                "attention_comparison_executed_count": 0,
+                "attention_override_true_count": 0,
+                "runtime_writeback_true_count": 0,
+                "scheduler_policy_noop_false_count": 0,
+                "kv_cache_mutation_true_count": 0,
+                "source_mutated_true_count": 0,
+            }
+        ]
+
+    if payloads == [] and runtime_observation_payloads is not None:
+        return [
+            {
+                "event_type": (
+                    "relaykv_runtime_metadata_derived_req_to_token_entries_result"
+                ),
+                "derivation_state": "blocked",
+                "derivation_mode": "runtime_metadata_only",
+                "engine_request_id": None,
+                "logical_sequence_id": None,
+                "token_span": None,
+                "layer_id": None,
+                "kv_head_group": None,
+                "derived_req_to_token_entries": [],
+                "derived_entry_count": 0,
+                "blocked_reason": "runtime_observation_payload_invalid",
+                "source_mutated": False,
+                "req_to_token_read_count": 0,
+                "actual_req_to_token_pool_read_count": 0,
+                "token_to_kv_pool_read_count": 0,
+                "actual_token_to_kv_pool_read_count": 0,
+                "live_token_to_kv_pool_index_read_count": 0,
+                "kv_pool_read_count": 0,
+                "kv_snapshot_count": 0,
+                "tensor_read_count": 0,
+                "attention_comparison_executed_count": 0,
+                "attention_override_true_count": 0,
+                "runtime_writeback_true_count": 0,
+                "scheduler_policy_noop_false_count": 0,
+                "kv_cache_mutation_true_count": 0,
+                "source_mutated_true_count": 0,
+            }
+        ]
+
+    assert payloads is not None
+    total_derived_entries = 0
+    for index, payload in enumerate(payloads):
+        plan = normalized_plans[index] if index < len(normalized_plans) else None
+        normalized = normalize_relaykv_sglang_adapter_schema_for_smoke(payload)
+        adapter_metadata = normalized.get("adapter_metadata")
+        if isinstance(adapter_metadata, Mapping):
+            result_adapter_metadata = _copy_relaykv_metadata_value_for_smoke(
+                dict(adapter_metadata)
+            )
+        else:
+            result_adapter_metadata = {}
+        result_adapter_metadata["runtime_metadata_derivation_source_path"] = source_path
+        if isinstance(plan, Mapping):
+            result_adapter_metadata["kv_index_resolution_plan_metadata"] = (
+                _copy_relaykv_metadata_value_for_smoke(dict(plan))
+            )
+
+        engine_request_id = normalized.get("engine_request_id")
+        logical_sequence_id = normalized.get("logical_sequence_id")
+        token_span = _relaykv_smoke_token_span_from_value(normalized.get("token_span"))
+        if token_span is None:
+            token_span = _relaykv_smoke_token_span_from_value(payload.get("token_span"))
+        seq_len = _relaykv_smoke_first_present_value(
+            payload,
+            "seq_len",
+        )
+        if seq_len is None and isinstance(plan, Mapping):
+            seq_len = _relaykv_smoke_first_present_value(plan, "seq_len")
+        if seq_len is None and isinstance(result_adapter_metadata, Mapping):
+            seq_len = result_adapter_metadata.get("seq_len")
+
+        blocked_reason = None
+        derived_entries: list[int] = []
+        derived_token_span = token_span
+        if token_span is not None:
+            token_start, token_end = token_span
+            if token_start < 0 or token_end <= token_start:
+                blocked_reason = "invalid_token_span"
+            else:
+                derived_count = token_end - token_start
+                if derived_count > max_tokens_per_request:
+                    blocked_reason = "max_tokens_per_request_exceeded"
+                elif total_derived_entries + derived_count > max_total_tokens:
+                    blocked_reason = "max_total_tokens_exceeded"
+                else:
+                    derived_entries = list(range(token_start, token_end))
+                    total_derived_entries += derived_count
+        else:
+            if isinstance(seq_len, bool) or not isinstance(seq_len, int) or seq_len <= 0:
+                blocked_reason = "invalid_seq_len"
+            else:
+                derived_end = min(seq_len, max_tokens_per_request)
+                if derived_end <= 0:
+                    blocked_reason = "invalid_seq_len"
+                elif total_derived_entries + derived_end > max_total_tokens:
+                    blocked_reason = "max_total_tokens_exceeded"
+                else:
+                    derived_entries = list(range(0, derived_end))
+                    derived_token_span = [0, derived_end]
+                    total_derived_entries += derived_end
+
+        if token_span is None and seq_len is None and blocked_reason is None:
+            blocked_reason = "runtime_metadata_missing"
+
+        results.append(
+            {
+                "event_type": (
+                    "relaykv_runtime_metadata_derived_req_to_token_entries_result"
+                ),
+                "derivation_state": "derived" if blocked_reason is None else "blocked",
+                "derivation_mode": "runtime_metadata_only",
+                "engine_request_id": engine_request_id,
+                "logical_sequence_id": logical_sequence_id,
+                "token_span": derived_token_span,
+                "layer_id": normalized.get("layer_id"),
+                "kv_head_group": normalized.get("kv_head_group"),
+                "derived_req_to_token_entries": derived_entries,
+                "derived_entry_count": len(derived_entries),
+                "blocked_reason": blocked_reason,
+                "source_mutated": False,
+                "adapter_metadata": result_adapter_metadata,
+                "engine_block_ref": normalized.get("engine_block_ref"),
+                "synthetic_metadata_only": True,
+                "req_to_token_read_count": 0,
+                "actual_req_to_token_pool_read_count": 0,
+                "token_to_kv_pool_read_count": 0,
+                "actual_token_to_kv_pool_read_count": 0,
+                "live_token_to_kv_pool_index_read_count": 0,
+                "kv_pool_read_count": 0,
+                "kv_snapshot_count": 0,
+                "tensor_read_count": 0,
+                "attention_comparison_executed_count": 0,
+                "attention_override_true_count": 0,
+                "runtime_writeback_true_count": 0,
+                "scheduler_policy_noop_false_count": 0,
+                "kv_cache_mutation_true_count": 0,
+                "source_mutated_true_count": 0,
+            }
+        )
+
+    if not results:
+        return [
+            {
+                "event_type": (
+                    "relaykv_runtime_metadata_derived_req_to_token_entries_result"
+                ),
+                "derivation_state": "blocked",
+                "derivation_mode": "runtime_metadata_only",
+                "engine_request_id": None,
+                "logical_sequence_id": None,
+                "token_span": None,
+                "layer_id": None,
+                "kv_head_group": None,
+                "derived_req_to_token_entries": [],
+                "derived_entry_count": 0,
+                "blocked_reason": "runtime_metadata_missing",
+                "source_mutated": False,
+                "req_to_token_read_count": 0,
+                "actual_req_to_token_pool_read_count": 0,
+                "token_to_kv_pool_read_count": 0,
+                "actual_token_to_kv_pool_read_count": 0,
+                "live_token_to_kv_pool_index_read_count": 0,
+                "kv_pool_read_count": 0,
+                "kv_snapshot_count": 0,
+                "tensor_read_count": 0,
+                "attention_comparison_executed_count": 0,
+                "attention_override_true_count": 0,
+                "runtime_writeback_true_count": 0,
+                "scheduler_policy_noop_false_count": 0,
+                "kv_cache_mutation_true_count": 0,
+                "source_mutated_true_count": 0,
+            }
+        ]
+
+    return results
+
+
+def summarize_relaykv_runtime_metadata_derived_req_to_token_entries_for_smoke(
+    results: list[dict[str, Any]] | tuple[dict[str, Any], ...],
+    *,
+    production_enabled: bool,
+    max_tokens_per_request: int,
+    max_total_tokens: int,
+) -> dict[str, Any]:
+    """Summarize smoke-only runtime metadata-derived req_to_token entries."""
+
+    if not isinstance(results, (list, tuple)):
+        raise TypeError(
+            "RelayKV runtime metadata-derived req_to_token results must be a list or tuple"
+        )
+
+    derived_count = 0
+    blocked_count = 0
+    error_count = 0
+    total_derived_entries = 0
+    totals: Counter[str] = Counter(
+        {
+            "req_to_token_read_count": 0,
+            "actual_req_to_token_pool_read_count": 0,
+            "token_to_kv_pool_read_count": 0,
+            "actual_token_to_kv_pool_read_count": 0,
+            "live_token_to_kv_pool_index_read_count": 0,
+            "kv_pool_read_count": 0,
+            "kv_snapshot_count": 0,
+            "tensor_read_count": 0,
+            "attention_comparison_executed_count": 0,
+            "attention_override_true_count": 0,
+            "runtime_writeback_true_count": 0,
+            "scheduler_policy_noop_false_count": 0,
+            "kv_cache_mutation_true_count": 0,
+            "source_mutated_true_count": 0,
+        }
+    )
+    for result in results:
+        if not isinstance(result, dict):
+            raise TypeError(
+                "RelayKV runtime metadata-derived req_to_token result must be a dict"
+            )
+        state = str(result.get("derivation_state") or "unknown")
+        if state == "derived":
+            derived_count += 1
+        elif state == "blocked":
+            blocked_count += 1
+        elif state == "error":
+            error_count += 1
+
+        value = result.get("derived_entry_count")
+        if isinstance(value, int) and not isinstance(value, bool):
+            total_derived_entries += value
+
+        for key in totals:
+            value = result.get(key)
+            if isinstance(value, int) and not isinstance(value, bool):
+                totals[key] += value
+
+    return {
+        "event_type": "relaykv_runtime_metadata_derived_req_to_token_entries_summary",
+        "production_enabled": production_enabled,
+        "result_count": len(results),
+        "derived_count": derived_count,
+        "blocked_count": blocked_count,
+        "error_count": error_count,
+        "total_derived_entries": total_derived_entries,
+        "max_tokens_per_request": max_tokens_per_request,
+        "max_total_tokens": max_total_tokens,
+        **{key: totals[key] for key in sorted(totals)},
+    }
+
+
 def _relaykv_runtime_req_to_token_blocked_result_for_smoke(
     source_payload: Mapping[str, Any] | None,
     *,
