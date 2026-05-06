@@ -1487,6 +1487,72 @@ async def openai_v1_completions(request: CompletionRequest, raw_request: Request
     )
 
 
+@app.post("/v1/completions/codec")
+async def openai_v1_completions_codec(raw_request: Request):
+    """Codec bidirectional binary endpoint.
+
+    Accepts a binary-encoded CodecRequest (prompt_ids + sampling params) and
+    streams CodecFrame responses in the same binary format. No text ever
+    enters the transport — token IDs flow directly from one model to the next.
+
+    This is an alternative to POST /v1/completions with prompt: int[] +
+    stream_format: "msgpack". Both achieve "no text on the wire"; this
+    endpoint additionally accepts a binary request body, which is more
+    bandwidth-efficient for very large prompts (>50K tokens) where a JSON
+    [int, int, ...] array is 2-3x larger than the equivalent msgpack
+    packed varint encoding.
+
+    For typical prompts (<10K tokens) the JSON path is fine — pick whichever
+    fits your client better.
+
+    Content-Type / Accept:
+      application/x-msgpack   — MessagePack framing (default)
+      application/x-protobuf  — Protobuf framing (4-byte big-endian length prefix)
+    """
+    from fastapi.responses import ORJSONResponse
+
+    from sglang.srt.entrypoints.codec_frame import (
+        decode_msgpack,
+        decode_protobuf_request,
+    )
+    from sglang.srt.entrypoints.openai.protocol import CompletionRequest
+
+    content_type = raw_request.headers.get("content-type", "application/x-msgpack")
+    body = await raw_request.body()
+
+    try:
+        if "protobuf" in content_type:
+            params = decode_protobuf_request(body)
+            stream_format = params.get("stream_format", "protobuf")
+        else:
+            params = decode_msgpack(body)
+            stream_format = params.get("stream_format", "msgpack")
+    except Exception as e:
+        return ORJSONResponse(
+            {"error": f"Codec: failed to decode request: {e}"}, status_code=400
+        )
+
+    prompt_ids = params.get("prompt_ids", [])
+    if not prompt_ids:
+        return ORJSONResponse(
+            {"error": "Codec: prompt_ids is required"}, status_code=400
+        )
+
+    request = CompletionRequest(
+        model=raw_request.app.state.openai_serving_completion.tokenizer_manager.server_args.served_model_name,
+        prompt=prompt_ids,
+        max_tokens=params.get("max_tokens", 256),
+        temperature=params.get("temperature", 1.0),
+        stop=params.get("stop"),
+        stream_format=stream_format,
+        stream=True,
+    )
+
+    return await raw_request.app.state.openai_serving_completion.handle_request(
+        request, raw_request
+    )
+
+
 @app.get("/codec/schema")
 async def codec_schema():
     """Return the Codec .proto schema for client code generation.
