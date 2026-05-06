@@ -511,7 +511,9 @@ class CommonKVSender(BaseKVSender):
 
     def get_transfer_metric(self) -> KVTransferMetric:
         total_bytes = self._transfer_num_kv_indices * self.kv_mgr.kv_item_lens_sum
-        total_bytes += self._transfer_num_state_indices * self.kv_mgr.state_item_lens_sum
+        total_bytes += (
+            self._transfer_num_state_indices * self.kv_mgr.state_item_lens_sum
+        )
         self._transfer_metric.transfer_total_bytes = total_bytes
         return self._transfer_metric
 
