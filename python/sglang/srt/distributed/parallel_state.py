@@ -23,12 +23,10 @@ If you only need to use the distributed environment without model/pipeline
 """
 
 import contextlib
-import contextvars
 import gc
 import logging
 import os
 import pickle
-import threading
 import weakref
 from collections import namedtuple
 from contextlib import contextmanager, nullcontext
@@ -64,86 +62,6 @@ _is_npu = is_npu()
 _is_cpu = is_cpu()
 _is_xpu = is_xpu()
 _is_musa = is_musa()
-_use_aiter = get_bool_env_var("SGLANG_USE_AITER")
-_use_aiter_cuda_comm = get_bool_env_var("USE_AITER_COMM")
-
-
-_aiter_cuda_comm_in_active_forward: contextvars.ContextVar[bool] = (
-    contextvars.ContextVar("_aiter_cuda_comm_in_active_forward", default=False)
-)
-
-
-def _should_use_aiter_cuda_comm_for_forward(forward_batch: Any) -> bool:
-    if not (_use_aiter_cuda_comm and _use_aiter):
-        return False
-    m = forward_batch.forward_mode
-    if m.is_decode() or m.is_idle():
-        return False
-    # Chunked prefill runs extend + decode in one forward; keep standard AR for safety.
-    if m.is_mixed():
-        return False
-    if m.is_target_verify():
-        return False
-    if m.is_prebuilt():
-        return False
-    return True
-
-
-@contextlib.contextmanager
-def forward_aiter_cuda_comm_scope(forward_batch: Any):
-    """Restrict Aiter cuda quick all-reduce to prefill-like forwards (see env USE_AITER_COMM)."""
-    token = _aiter_cuda_comm_in_active_forward.set(
-        _should_use_aiter_cuda_comm_for_forward(forward_batch)
-    )
-    try:
-        yield
-    finally:
-        _aiter_cuda_comm_in_active_forward.reset(token)
-
-
-_model_runner_ar_scope_patch_lock = threading.Lock()
-_model_runner_ar_scope_patch_installed = False
-
-
-def _lazy_install_forward_aiter_cuda_comm_patch() -> None:
-    """Wrap ModelRunner._forward_raw once USE_AITER_COMM needs forward-mode context."""
-    global _model_runner_ar_scope_patch_installed
-    if _model_runner_ar_scope_patch_installed:
-        return
-    if not (_use_aiter_cuda_comm and _use_aiter):
-        _model_runner_ar_scope_patch_installed = True
-        return
-    with _model_runner_ar_scope_patch_lock:
-        if _model_runner_ar_scope_patch_installed:
-            return
-        try:
-            from sglang.srt.model_executor.model_runner import ModelRunner
-        except ImportError:
-            return
-
-        _orig_forward_raw = ModelRunner._forward_raw
-
-        def _forward_raw_with_aiter_scope(
-            self,
-            forward_batch,
-            skip_attn_backend_init,
-            pp_proxy_tensors,
-            reinit_attn_backend=False,
-            split_forward_count=1,
-        ):
-            with forward_aiter_cuda_comm_scope(forward_batch):
-                return _orig_forward_raw(
-                    self,
-                    forward_batch,
-                    skip_attn_backend_init,
-                    pp_proxy_tensors,
-                    reinit_attn_backend=reinit_attn_backend,
-                    split_forward_count=split_forward_count,
-                )
-
-        ModelRunner._forward_raw = _forward_raw_with_aiter_scope
-        _model_runner_ar_scope_patch_installed = True
-
 
 TensorMetadata = namedtuple("TensorMetadata", ["device", "dtype", "size"])
 
@@ -501,20 +419,6 @@ class GroupCoordinator:
             self.mq_broadcaster = MessageQueue.create_from_process_group(
                 self.cpu_group, 1 << 22, 6
             )
-        if _use_aiter:
-            from aiter.dist.parallel_state import set_custom_all_reduce
-
-            set_custom_all_reduce(True)
-            self._aiter_cuda_comm = None
-
-            if _use_aiter_cuda_comm:
-                from aiter.dist.device_communicators.communicator_cuda import (
-                    CudaCommunicator as AiterCudaCommunicator,
-                )
-
-                self._aiter_cuda_comm = AiterCudaCommunicator(
-                    cpu_group=self.cpu_group, device=self.device, unique_name="tp"
-                )
 
     def __repr__(self):
         return (
@@ -637,7 +541,6 @@ class GroupCoordinator:
         a new tensor in the same op. So we need to figure out if the op is
         in-place or out-of-place ahead of time.
         """
-        _lazy_install_forward_aiter_cuda_comm_patch()
         # Bypass the function if we are using only 1 GPU.
         if self.world_size == 1:
             return input_
@@ -687,26 +590,17 @@ class GroupCoordinator:
 
         outplace_all_reduce_method = None
         if (
+            self.ca_comm is not None
+            and not self.ca_comm.disabled
+            and self.ca_comm.should_custom_ar(input_)
+        ):
+            outplace_all_reduce_method = "ca"
+        elif (
             self.qr_comm is not None
             and not self.qr_comm.disabled
             and self.qr_comm.should_quick_allreduce(input_)
         ):
             outplace_all_reduce_method = "qr"
-        elif (
-            self._aiter_cuda_comm is not None
-            and _use_aiter
-            and _use_aiter_cuda_comm
-            and _aiter_cuda_comm_in_active_forward.get()
-        ):
-            # Prefill-only quick AR (before dispatch CAR).
-            outplace_all_reduce_method = "aiter_cuda_comm"
-        elif (
-            self.ca_comm is not None
-            and not self.ca_comm.disabled
-            and self.ca_comm.should_custom_ar(input_)
-        ):
-            # Decode / fallback: dispatch_custom_allreduce() on ROCm.
-            outplace_all_reduce_method = "ca"
         elif (
             self.pymscclpp_comm is not None
             and not self.pymscclpp_comm.disabled
@@ -732,6 +626,74 @@ class GroupCoordinator:
             inplace_all_reduce(input_, group_name=self.unique_name)
             return input_
 
+    def fused_allreduce_rmsnorm(
+        self,
+        input_: torch.Tensor,
+        residual_inp_: torch.Tensor,
+        weight_: torch.Tensor,
+        eps: float,
+        prefill_support: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.world_size == 1:
+            return self._fused_allreduce_rmsnorm_out_place(
+                input_, residual_inp_, weight_, eps, prefill_support
+            )
+
+        return self._fused_allreduce_rmsnorm_out_place(
+            input_, residual_inp_, weight_, eps, prefill_support
+        )
+
+    def _fused_allreduce_rmsnorm_out_place(
+        self,
+        input_: torch.Tensor,
+        residual_inp_: torch.Tensor,
+        weight_: torch.Tensor,
+        eps: float,
+        prefill_support: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        ca_comm = self.ca_comm
+        total_bytes = input_.numel() * input_.element_size()
+        can_use_fused_ar_rms = (
+            int(input_.shape[-1]) <= 16384
+            and total_bytes < 8 * 1024 * 8192
+            and self.world_size != 6
+        )
+        allow_fused_ar_rms = not get_bool_env_var("SGLANG_USE_AITER_NEW_CA", "true")
+        if (
+            ca_comm is not None
+            and not ca_comm.disabled
+            and hasattr(ca_comm, "custom_fused_ar_rms")
+            and ca_comm.should_custom_ar(input_)
+            and can_use_fused_ar_rms
+            and allow_fused_ar_rms
+        ):
+            if prefill_support or total_bytes <= 64 * 1024 * 1024:
+                use_1stage_override = {"1": True, "0": False}.get(
+                    os.environ.get("AITER_AR_1STAGE", "")
+                )
+                use_1stage = (
+                    use_1stage_override
+                    if use_1stage_override is not None
+                    else (total_bytes <= 128 * 1024)
+                )
+                out = ca_comm.custom_fused_ar_rms(
+                    input_,
+                    residual_inp_,
+                    weight_,
+                    eps,
+                    use_1stage,
+                )
+                if out is not None:
+                    return out
+
+        ar_out = self.all_reduce(input_)
+        residual_out = ar_out + residual_inp_
+        residual_fp32 = residual_out.to(torch.float32)
+        variance = residual_fp32.pow(2).mean(dim=-1, keepdim=True)
+        out = residual_fp32 * torch.rsqrt(variance + eps)
+        out = (out * weight_.to(torch.float32)).to(ar_out.dtype)
+        return out, residual_out
+
     def _all_reduce_out_place(
         self, input_: torch.Tensor, outplace_all_reduce_method: str
     ) -> torch.Tensor:
@@ -740,31 +702,18 @@ class GroupCoordinator:
         pymscclpp_comm = self.pymscclpp_comm
         torch_symm_mem_comm = self.torch_symm_mem_comm
         pynccl_comm = self.pynccl_comm
-        assert any(
-            [
-                qr_comm,
-                ca_comm,
-                pymscclpp_comm,
-                torch_symm_mem_comm,
-                pynccl_comm,
-                outplace_all_reduce_method == "aiter_cuda_comm"
-                and self._aiter_cuda_comm is not None,
-                outplace_all_reduce_method == "aiter_ca" is not None,
-            ]
-        )
-        if outplace_all_reduce_method == "qr":
-            assert not qr_comm.disabled
-            out = qr_comm.quick_all_reduce(input_)
-        elif outplace_all_reduce_method == "ca":
+        assert any([qr_comm, ca_comm, pymscclpp_comm, torch_symm_mem_comm, pynccl_comm])
+        if outplace_all_reduce_method == "ca":
             assert not ca_comm.disabled
             out = ca_comm.custom_all_reduce(
                 input_, use_new=get_bool_env_var("SGLANG_USE_AITER_NEW_CA", "true")
             )
+        elif outplace_all_reduce_method == "qr":
+            assert not qr_comm.disabled
+            out = qr_comm.quick_all_reduce(input_)
         elif outplace_all_reduce_method == "torch_symm_mem":
             assert not torch_symm_mem_comm.disabled
             out = torch_symm_mem_comm.all_reduce(input_)
-        elif outplace_all_reduce_method == "aiter_cuda_comm":
-            out = self._aiter_cuda_comm.all_reduce(input_)
         elif outplace_all_reduce_method == "pymscclpp":
             assert not pymscclpp_comm.disabled
             out = pymscclpp_comm.all_reduce(input_)
@@ -1986,10 +1935,6 @@ def initialize_model_parallel(
         use_custom_allreduce=False,
         group_name="pp",
     )
-
-    # Install ModelRunner forward wrapper early so the first inference forward runs inside
-    # forward_aiter_cuda_comm_scope (lazy install from all_reduce can be too late).
-    _lazy_install_forward_aiter_cuda_comm_patch()
 
 
 def create_custom_parallel_group(

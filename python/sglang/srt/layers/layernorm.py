@@ -87,6 +87,53 @@ if _is_npu:
     import torch_npu
 
 
+def _forward_with_allreduce_fusion_impl(
+    module,
+    x: torch.Tensor,
+    residual: Optional[torch.Tensor] = None,
+    post_residual_addition: Optional[torch.Tensor] = None,
+    *,
+    allow_flashinfer: bool,
+):
+    if residual is not None:
+        from sglang.srt.distributed import (
+            get_tensor_model_parallel_world_size,
+            get_tp_group,
+        )
+
+        if get_tensor_model_parallel_world_size() > 1:
+            fused_residual = (
+                residual
+                if post_residual_addition is None
+                else residual + post_residual_addition
+            )
+            if _is_hip and _use_aiter:
+                if not get_bool_env_var("SGLANG_USE_AITER_NEW_CA", "true"):
+                    return get_tp_group().fused_allreduce_rmsnorm(
+                        x,
+                        fused_residual,
+                        module.weight,
+                        module.variance_epsilon,
+                    )
+                return module.forward(x, residual, post_residual_addition)
+
+            if allow_flashinfer:
+                from sglang.srt.layers.flashinfer_comm_fusion import (
+                    flashinfer_allreduce_residual_rmsnorm,
+                )
+
+                fused_result = flashinfer_allreduce_residual_rmsnorm(
+                    input_tensor=x,
+                    residual=fused_residual,
+                    weight=module.weight,
+                    eps=module.variance_epsilon,
+                )
+                if fused_result[0] is not None:
+                    return fused_result
+
+    return module.forward(x, residual, post_residual_addition)
+
+
 class RMSNorm(MultiPlatformOp):
     def __init__(
         self,
@@ -304,28 +351,13 @@ class RMSNorm(MultiPlatformOp):
         residual: Optional[torch.Tensor] = None,
         post_residual_addition: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-        """
-        Forward method with allreduce fusion, prioritizing flashinfer fused operations
-        """
-        if residual is not None:
-            from sglang.srt.distributed import get_tensor_model_parallel_world_size
-            from sglang.srt.layers.flashinfer_comm_fusion import (
-                flashinfer_allreduce_residual_rmsnorm,
-            )
-
-            if get_tensor_model_parallel_world_size() > 1:
-                if post_residual_addition is not None:
-                    residual = residual + post_residual_addition
-                fused_result = flashinfer_allreduce_residual_rmsnorm(
-                    input_tensor=x,
-                    residual=residual,
-                    weight=self.weight,
-                    eps=self.variance_epsilon,
-                )
-                if fused_result[0] is not None:
-                    return fused_result
-
-        return self.forward(x, residual, post_residual_addition)
+        return _forward_with_allreduce_fusion_impl(
+            self,
+            x,
+            residual,
+            post_residual_addition,
+            allow_flashinfer=True,
+        )
 
 
 class LayerNorm(MultiPlatformOp):
@@ -558,6 +590,20 @@ class GemmaRMSNorm(MultiPlatformOp):
         post_residual_addition: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         return self._forward_impl(x, residual, post_residual_addition)
+
+    def forward_with_allreduce_fusion(
+        self,
+        x: torch.Tensor,
+        residual: Optional[torch.Tensor] = None,
+        post_residual_addition: Optional[torch.Tensor] = None,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        return _forward_with_allreduce_fusion_impl(
+            self,
+            x,
+            residual,
+            post_residual_addition,
+            allow_flashinfer=False,
+        )
 
 
 class Gemma3RMSNorm(MultiPlatformOp):

@@ -88,16 +88,33 @@ elif _is_npu:
 FUSE_ALLREDUCE_MAX_BATCH_SIZE = 2048
 
 
-def apply_flashinfer_allreduce_fusion(batch_size: int):
+def _is_hip_aiter_allreduce_fusion_enabled() -> bool:
     return (
-        # NOTE: flashinfer 0.6.1 caused performance regression on sm100 for allreduce fusion
-        # Ref: https://github.com/sgl-project/sglang/issues/17237
-        (_is_sm90_supported or _is_sm100_supported)
-        and _is_flashinfer_available
+        _use_aiter
+        and is_hip()
+        and not get_bool_env_var("SGLANG_USE_AITER_NEW_CA", "true")
+    )
+
+
+def apply_flashinfer_allreduce_fusion(batch_size: int):
+    hip_aiter_allreduce_fusion_enabled = _is_hip_aiter_allreduce_fusion_enabled()
+    return (
+        (
+            (
+                # NOTE: flashinfer 0.6.1 caused performance regression on sm100 for allreduce fusion
+                # Ref: https://github.com/sgl-project/sglang/issues/17237
+                (_is_sm90_supported or _is_sm100_supported)
+                and _is_flashinfer_available
+            )
+            or hip_aiter_allreduce_fusion_enabled
+        )
         and batch_size > 0
         and batch_size <= FUSE_ALLREDUCE_MAX_BATCH_SIZE
         and not is_dp_attention_enabled()
-        and get_global_server_args().enable_flashinfer_allreduce_fusion
+        and (
+            get_global_server_args().enable_flashinfer_allreduce_fusion
+            or hip_aiter_allreduce_fusion_enabled
+        )
     )
 
 

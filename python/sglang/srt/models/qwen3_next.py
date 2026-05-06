@@ -425,7 +425,12 @@ class Qwen3HybridLinearDecoderLayer(nn.Module):
         use_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
             forward_batch
         )
-        hidden_states = self.mlp(hidden_states, forward_batch, use_reduce_scatter)
+        hidden_states = self.mlp(
+            hidden_states,
+            forward_batch,
+            False,
+            use_reduce_scatter,
+        )
 
         hidden_states, residual = self.layer_communicator.postprocess_layer(
             hidden_states, residual, forward_batch
@@ -656,7 +661,12 @@ class Qwen3HybridAttentionDecoderLayer(nn.Module):
         use_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
             forward_batch
         )
-        hidden_states = self.mlp(hidden_states, forward_batch, use_reduce_scatter)
+        hidden_states = self.mlp(
+            hidden_states,
+            forward_batch,
+            False,
+            use_reduce_scatter,
+        )
 
         hidden_states, residual = self.layer_communicator.postprocess_layer(
             hidden_states, residual, forward_batch
