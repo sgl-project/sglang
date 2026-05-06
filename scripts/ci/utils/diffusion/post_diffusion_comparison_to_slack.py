@@ -61,7 +61,9 @@ def _build_case_rows(results: list[dict]) -> list[str]:
         suffix = ""
         sglang = valid.get("sglang")
         if sglang is not None:
-            slower = [fw for fw, lat in valid.items() if fw != "sglang" and sglang > lat]
+            slower = [
+                fw for fw, lat in valid.items() if fw != "sglang" and sglang > lat
+            ]
             if slower:
                 suffix = f" | :warning: slower than {', '.join(sorted(slower))}"
         rows.append(
@@ -144,7 +146,9 @@ def post_diffusion_comparison_to_slack(results_file: str) -> bool:
         chunk = ""
         for row in body_lines:
             if len(chunk) + len(row) + 1 > 3800:
-                client.chat_postMessage(channel=channel, thread_ts=thread_ts, text=chunk)
+                client.chat_postMessage(
+                    channel=channel, thread_ts=thread_ts, text=chunk
+                )
                 chunk = row
             else:
                 chunk = f"{chunk}\n{row}" if chunk else row

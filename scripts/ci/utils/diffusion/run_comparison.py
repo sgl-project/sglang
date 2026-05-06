@@ -796,9 +796,7 @@ def send_request_lightx2v(base_url: str, case: dict, config: dict) -> float:
         poll_resp = requests.get(poll_url, timeout=30)
         poll_resp.raise_for_status()
         poll_data = poll_resp.json()
-        status = (
-            poll_data.get("status") or poll_data.get("task_status") or ""
-        ).upper()
+        status = (poll_data.get("status") or poll_data.get("task_status") or "").upper()
         if status == "COMPLETED":
             break
         elif status in ("FAILED", "CANCELLED"):
@@ -889,7 +887,9 @@ def run_single(
         # _filter_ld_library_path_for_venv docstring).
         env["PATH"] = framework_bin_dir + ":" + env.get("PATH", "")
         env["VIRTUAL_ENV"] = os.path.dirname(framework_bin_dir)
-        inherit_ld = os.environ.get("COMPARISON_INHERIT_LD_LIBRARY_PATH", "").strip().lower()
+        inherit_ld = (
+            os.environ.get("COMPARISON_INHERIT_LD_LIBRARY_PATH", "").strip().lower()
+        )
         if inherit_ld in ("1", "true", "yes"):
             # Optional: keep full host LD_LIBRARY_PATH (e.g. unusual CUDA layouts).
             pass
