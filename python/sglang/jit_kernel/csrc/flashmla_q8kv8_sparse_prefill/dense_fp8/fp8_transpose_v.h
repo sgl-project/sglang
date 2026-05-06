@@ -10,7 +10,7 @@
 
 #pragma once
 
-template <int kBlockN, int kHeadDim, typename SmemLayoutK>
+template <int kBlockN, int kHeadDim>
 struct SmemTransposeFp8_64x64 {
   static_assert((kBlockN % 64 == 0) && (kHeadDim % 64 == 0));
 
