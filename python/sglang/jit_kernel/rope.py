@@ -324,7 +324,10 @@ class XPUFusedRopeWrapper:
         if head_stride != self._rope_dim:
             raise ValueError(
                 f"head_stride ({head_stride}) must equal rope_dim ({self._rope_dim}) "
-                f"for XPU RoPE fused store. Use partial-RoPE slicing before calling."
+                f"for XPU RoPE fused store. Partial-RoPE slicing alone does not change "
+                f"stride(1) in PyTorch; pass tensors with stride(1) == rope_dim, e.g. "
+                f"use x = x[..., :rope_dim].contiguous(), or allocate tensors with "
+                f"head_dim == rope_dim."
             )
         # Each cache row must hold exactly num_kv_heads * rope_dim elements so that
         # the per-head scatter (loc * cache_stride + head_id * head_stride) stays
