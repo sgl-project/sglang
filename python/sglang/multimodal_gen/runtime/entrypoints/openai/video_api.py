@@ -10,6 +10,7 @@ from typing import Any, Dict, Optional
 
 from fastapi import (
     APIRouter,
+    BackgroundTasks,
     File,
     Form,
     HTTPException,
@@ -180,7 +181,47 @@ async def _mark_video_cancelled(job_id: str) -> dict[str, Any] | None:
     return await VIDEO_STORE.update_fields(job_id, _cancelled_video_fields())
 
 
-async def _cancel_video_job(video_id: str) -> dict[str, Any]:
+async def _notify_scheduler_cancel(video_id: str) -> None:
+    from sglang.multimodal_gen.runtime.scheduler_client import async_scheduler_client
+
+    try:
+        ack = await async_scheduler_client.cancel(video_id)
+        ack_output = getattr(ack, "output", None)
+        if isinstance(ack_output, dict) and ack_output.get("state") == "queued":
+            await _mark_video_cancelled(video_id)
+    except Exception as e:
+        logger.debug(
+            "Scheduler cancel request for video %s did not ack: %s",
+            video_id,
+            e,
+        )
+
+
+def _log_scheduler_cancel_task_result(task: asyncio.Task[None]) -> None:
+    try:
+        task.result()
+    except asyncio.CancelledError:
+        pass
+    except Exception:
+        logger.exception("Unexpected video cancel notification failure")
+
+
+def _schedule_scheduler_cancel_notification(
+    video_id: str,
+    background_tasks: BackgroundTasks | None,
+) -> None:
+    if background_tasks is not None:
+        background_tasks.add_task(_notify_scheduler_cancel, video_id)
+        return
+
+    task = asyncio.create_task(_notify_scheduler_cancel(video_id))
+    task.add_done_callback(_log_scheduler_cancel_task_result)
+
+
+async def _cancel_video_job(
+    video_id: str,
+    background_tasks: BackgroundTasks | None = None,
+) -> dict[str, Any]:
     job = await VIDEO_STORE.get(video_id)
     if not job:
         raise HTTPException(status_code=404, detail="Video not found")
@@ -202,20 +243,7 @@ async def _cancel_video_job(video_id: str) -> dict[str, Any]:
             },
         },
     )
-
-    from sglang.multimodal_gen.runtime.scheduler_client import async_scheduler_client
-
-    try:
-        ack = await async_scheduler_client.cancel(video_id)
-        ack_output = getattr(ack, "output", None)
-        if isinstance(ack_output, dict) and ack_output.get("state") == "queued":
-            updated = await _mark_video_cancelled(video_id)
-    except Exception as e:
-        logger.debug(
-            "Scheduler cancel request for video %s did not ack: %s",
-            video_id,
-            e,
-        )
+    _schedule_scheduler_cancel_notification(video_id, background_tasks)
 
     return updated or job
 
@@ -519,19 +547,25 @@ async def retrieve_video(video_id: str = Path(...)):
 
 
 @router.post("/{video_id}/cancel", response_model=VideoResponse)
-async def cancel_video(video_id: str = Path(...)):
-    job = await _cancel_video_job(video_id)
+async def cancel_video(
+    background_tasks: BackgroundTasks,
+    video_id: str = Path(...),
+):
+    job = await _cancel_video_job(video_id, background_tasks)
     return VideoResponse(**job)
 
 
 @router.delete("/{video_id}", response_model=VideoResponse)
-async def delete_video(video_id: str = Path(...)):
+async def delete_video(
+    background_tasks: BackgroundTasks,
+    video_id: str = Path(...),
+):
     job = await VIDEO_STORE.get(video_id)
     if not job:
         raise HTTPException(status_code=404, detail="Video not found")
 
     if job.get("status") in ("queued", "in_progress", "cancelling"):
-        cancelled_job = await _cancel_video_job(video_id)
+        cancelled_job = await _cancel_video_job(video_id, background_tasks)
         return VideoResponse(**cancelled_job)
 
     job = await VIDEO_STORE.pop(video_id)
