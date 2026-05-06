@@ -5,6 +5,7 @@ import re
 import sys
 import threading
 import time
+import traceback
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Optional
@@ -386,6 +387,47 @@ class TestTorchSave:
         assert "[Dumper, rank=" in captured.out
         assert "Observe error=" in captured.out
         assert "skip the tensor" in captured.out
+
+
+class TestLog:
+    def test_log_format(self):
+        with _capture_stdout() as captured:
+            _log("hello")
+        out = captured.getvalue()
+        assert "hello" in out, out
+        assert "[Dumper, rank=" in out, out
+        assert ", t=" in out, out
+
+
+class TestCompareTensorsQuick:
+    def test_identical(self):
+        a = torch.tensor([1.0, 2.0, 3.0])
+        s = _compare_tensors_quick(a, a.clone())
+        assert "rel_diff=0" in s, s
+        assert "max_abs=0" in s, s
+
+    def test_diverged(self):
+        a = torch.tensor([1.0, 2.0, 3.0])
+        b = torch.tensor([1.0, 2.0, 4.0])  # last element differs by 1
+        s = _compare_tensors_quick(a, b)
+        assert "max_abs=1" in s, s
+        assert "rel_diff=" in s, s
+
+    def test_shape_mismatch(self):
+        s = _compare_tensors_quick(torch.zeros(3), torch.zeros(4))
+        assert "shape mismatch" in s, s
+
+    def test_dtype_unified(self):
+        s = _compare_tensors_quick(
+            torch.zeros(3, dtype=torch.float32),
+            torch.zeros(3, dtype=torch.float64),
+        )
+        assert "rel_diff=" in s, s
+        assert "max_abs=" in s, s
+
+    def test_empty(self):
+        s = _compare_tensors_quick(torch.zeros(0), torch.zeros(0))
+        assert s == "empty"
 
 
 class TestCollectiveTimeout:
