@@ -17,7 +17,10 @@ from sglang.srt.utils import get_device_module
 
 device_module = get_device_module()
 
-from sglang.jit_kernel.hisparse import load_cache_to_device_buffer_mla
+from sglang.jit_kernel.hisparse import (
+    load_cache_to_device_buffer_dsv4_mla,
+    load_cache_to_device_buffer_mla,
+)
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 
 logger = logging.getLogger(__name__)
@@ -619,7 +622,12 @@ class HiSparseCoordinator:
 
         # todo, adjustable for performance
         block_size = 1024
-        load_cache_to_device_buffer_mla(
+        swap_in_fn = (
+            load_cache_to_device_buffer_dsv4_mla
+            if self.is_dsv4_hisparse
+            else load_cache_to_device_buffer_mla
+        )
+        swap_in_fn(
             top_k_tokens=top_k_result,
             device_buffer_tokens=self.req_device_buffer_tokens[layer_id],
             host_cache_locs=self.req_to_host_pool,

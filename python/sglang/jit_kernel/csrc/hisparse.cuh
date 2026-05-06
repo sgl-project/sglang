@@ -86,7 +86,18 @@ struct SmemLayout {
 // req_pool_indices and seq_lens can each be int32_t or int64_t
 // Layout: [HOT_BUFFER_SIZE slots for LRU] + [page_size slots for newest token]
 // newest_slot is at HOT_BUFFER_SIZE (first position of extra page)
-template <int BLOCK_SIZE, int NUM_TOP_K, int HOT_BUFFER_SIZE, bool IsMLA, typename SeqLensT, typename ReqPoolIndicesT>
+//
+// IsDsv4Layout selects the miss-copy addressing:
+//   false -> generic byte-stride: device + host both linear, stride = item_size_bytes
+//   true  -> DSv4 page-padded device + linear host (kvcacheio.cuh hardcoded constants)
+template <
+    int BLOCK_SIZE,
+    int NUM_TOP_K,
+    int HOT_BUFFER_SIZE,
+    bool IsMLA,
+    bool IsDsv4Layout,
+    typename SeqLensT,
+    typename ReqPoolIndicesT>
 __global__ void load_cache_to_device_buffer_kernel(
     const int32_t* __restrict__ top_k_tokens,
     int32_t* __restrict__ device_buffer_tokens,
@@ -108,6 +119,7 @@ __global__ void load_cache_to_device_buffer_kernel(
     int64_t top_k_device_locs_stride,
     int64_t page_size,
     int64_t item_size_bytes) {
+  static_assert(!IsDsv4Layout || IsMLA, "DSv4 page-padded layout is K-only (MLA).");
   // todo hisparse: support page wise sparsity
   constexpr int NUM_WARPS = BLOCK_SIZE / WARP_SIZE;
   constexpr int NUM_TOKEN_CHUNKS = (NUM_TOP_K + WARP_SIZE - 1) / WARP_SIZE;
@@ -364,26 +376,30 @@ __global__ void load_cache_to_device_buffer_kernel(
     const int64_t src_loc = req_host_cache_locs[miss_token];
     const int64_t dst_loc = static_cast<int64_t>(req_device_buffer_locs[evict_slot]);
 
-    if constexpr (IsMLA) {
-      // MLA path: page-padded device layout, linear CPU layout (see kvcacheio.cuh).
-      // transfer_item handles both sides' pointer math and uses 8-byte-aligned loads.
+    if constexpr (IsDsv4Layout) {
+      // DSv4 path: page-padded device layout + linear host layout, K-only.
+      // Uses kvcacheio.cuh's hardcoded constants (kGPUPageSize=64, kCPUItemBytes=584).
       device::hisparse::transfer_item<device::hisparse::TransferDirection::HostToDevice>(
           /*dst_cache=*/device_buffer_k,
           /*src_cache=*/const_cast<void*>(host_cache_k),
           /*dst_index=*/static_cast<int32_t>(dst_loc),
           /*src_index=*/static_cast<int32_t>(src_loc));
     } else {
+      // Generic path: device + host both linear, stride = item_size_bytes.
       const auto src_k = static_cast<const char*>(host_cache_k) + src_loc * item_size_bytes;
       auto dst_k = static_cast<char*>(device_buffer_k) + dst_loc * item_size_bytes;
       transfer_item_warp(lane_id, src_k, dst_k, item_size_bytes);
-      const auto src_v = static_cast<const char*>(host_cache_v) + src_loc * item_size_bytes;
-      auto dst_v = static_cast<char*>(device_buffer_v) + dst_loc * item_size_bytes;
-      transfer_item_warp(lane_id, src_v, dst_v, item_size_bytes);
+
+      if constexpr (!IsMLA) {
+        const auto src_v = static_cast<const char*>(host_cache_v) + src_loc * item_size_bytes;
+        auto dst_v = static_cast<char*>(device_buffer_v) + dst_loc * item_size_bytes;
+        transfer_item_warp(lane_id, src_v, dst_v, item_size_bytes);
+      }
     }
   }
 }
 
-template <int BLOCK_SIZE, int NUM_TOP_K, int HOT_BUFFER_SIZE, bool IsMLA>
+template <int BLOCK_SIZE, int NUM_TOP_K, int HOT_BUFFER_SIZE, bool IsMLA, bool IsDsv4Layout>
 void load_cache_to_device_buffer(
     tvm::ffi::TensorView top_k_tokens,
     tvm::ffi::TensorView device_buffer_tokens,
@@ -448,22 +464,50 @@ void load_cache_to_device_buffer(
 
   if (seq_is_i64 && rpi_is_i64) {
     launch(
-        load_cache_to_device_buffer_kernel<BLOCK_SIZE, NUM_TOP_K, HOT_BUFFER_SIZE, IsMLA, int64_t, int64_t>,
+        load_cache_to_device_buffer_kernel<
+            BLOCK_SIZE,
+            NUM_TOP_K,
+            HOT_BUFFER_SIZE,
+            IsMLA,
+            IsDsv4Layout,
+            int64_t,
+            int64_t>,
         static_cast<const int64_t*>(seq_lens.data_ptr()),
         static_cast<const int64_t*>(req_pool_indices.data_ptr()));
   } else if (seq_is_i64 && !rpi_is_i64) {
     launch(
-        load_cache_to_device_buffer_kernel<BLOCK_SIZE, NUM_TOP_K, HOT_BUFFER_SIZE, IsMLA, int64_t, int32_t>,
+        load_cache_to_device_buffer_kernel<
+            BLOCK_SIZE,
+            NUM_TOP_K,
+            HOT_BUFFER_SIZE,
+            IsMLA,
+            IsDsv4Layout,
+            int64_t,
+            int32_t>,
         static_cast<const int64_t*>(seq_lens.data_ptr()),
         static_cast<const int32_t*>(req_pool_indices.data_ptr()));
   } else if (!seq_is_i64 && rpi_is_i64) {
     launch(
-        load_cache_to_device_buffer_kernel<BLOCK_SIZE, NUM_TOP_K, HOT_BUFFER_SIZE, IsMLA, int32_t, int64_t>,
+        load_cache_to_device_buffer_kernel<
+            BLOCK_SIZE,
+            NUM_TOP_K,
+            HOT_BUFFER_SIZE,
+            IsMLA,
+            IsDsv4Layout,
+            int32_t,
+            int64_t>,
         static_cast<const int32_t*>(seq_lens.data_ptr()),
         static_cast<const int64_t*>(req_pool_indices.data_ptr()));
   } else {
     launch(
-        load_cache_to_device_buffer_kernel<BLOCK_SIZE, NUM_TOP_K, HOT_BUFFER_SIZE, IsMLA, int32_t, int32_t>,
+        load_cache_to_device_buffer_kernel<
+            BLOCK_SIZE,
+            NUM_TOP_K,
+            HOT_BUFFER_SIZE,
+            IsMLA,
+            IsDsv4Layout,
+            int32_t,
+            int32_t>,
         static_cast<const int32_t*>(seq_lens.data_ptr()),
         static_cast<const int32_t*>(req_pool_indices.data_ptr()));
   }
