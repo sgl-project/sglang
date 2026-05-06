@@ -7987,6 +7987,578 @@ def summarize_relaykv_runtime_observation_metadata_source_bridge_payloads_for_sm
     return summary
 
 
+def _relaykv_req_pool_idx_from_runtime_observation_payload_for_smoke(
+    payload: Mapping[str, Any],
+) -> Any:
+    req_pool_idx = _relaykv_smoke_first_present_value(
+        payload,
+        "req_pool_idx",
+        "req_pool_index",
+    )
+    if req_pool_idx is not None:
+        return req_pool_idx
+    engine_block_ref = payload.get("engine_block_ref")
+    if isinstance(engine_block_ref, Mapping):
+        return _relaykv_smoke_first_present_value(
+            engine_block_ref,
+            "req_pool_idx",
+            "req_pool_index",
+        )
+    return None
+
+
+def _relaykv_bounded_req_to_token_positions_for_smoke(
+    payload: Mapping[str, Any],
+) -> tuple[list[int] | None, list[int] | None, Any, str | None]:
+    token_span = _relaykv_smoke_token_span(payload)
+    if token_span is not None:
+        token_start, token_end = token_span
+        if token_start < 0 or token_end <= token_start:
+            return None, token_span, None, "token_span_invalid"
+        return list(range(token_start, token_end)), token_span, None, None
+
+    seq_len = _relaykv_smoke_first_present_value(payload, "seq_len")
+    adapter_metadata = payload.get("adapter_metadata")
+    if seq_len is None and isinstance(adapter_metadata, Mapping):
+        seq_len = adapter_metadata.get("seq_len")
+    if isinstance(seq_len, bool) or not isinstance(seq_len, int) or seq_len <= 0:
+        return None, None, seq_len, "seq_len_invalid"
+    return list(range(0, seq_len)), [0, seq_len], seq_len, None
+
+
+def _relaykv_read_req_to_token_value_for_smoke(
+    req_to_token_pool_object: Any,
+    req_pool_idx: Any,
+    token_position: int,
+) -> tuple[Any, str | None]:
+    try:
+        if isinstance(req_to_token_pool_object, dict):
+            pool_row = req_to_token_pool_object.get(req_pool_idx)
+            if pool_row is None and not isinstance(req_pool_idx, str):
+                pool_row = req_to_token_pool_object.get(str(req_pool_idx))
+            if pool_row is None:
+                return None, "req_to_token_pool_index_error"
+        else:
+            pool_row = req_to_token_pool_object[req_pool_idx]
+    except Exception:
+        return None, "req_to_token_pool_index_error"
+
+    try:
+        if isinstance(pool_row, dict):
+            value = pool_row.get(token_position)
+            if value is None:
+                value = pool_row.get(str(token_position))
+        else:
+            value = pool_row[token_position]
+    except Exception:
+        return None, "req_to_token_pool_index_error"
+    return value, None
+
+
+def build_relaykv_real_req_to_token_pool_bounded_read_results_for_smoke(
+    *,
+    runtime_observation_payloads: Any = None,
+    req_to_token_pool_object: Any = None,
+    read_req_to_token_pool: bool = False,
+    max_tokens_per_request: int = 256,
+    max_total_tokens: int = 1024,
+    source_path: str | None = None,
+) -> list[dict[str, Any]]:
+    """Read bounded req_to_token entries from a fake readonly req_to_token pool."""
+
+    source_payloads, payload_source_path = _relaykv_runtime_req_to_token_source_payloads_for_smoke(
+        runtime_observation_payloads
+    )
+    if source_path is None:
+        source_path = payload_source_path
+
+    if read_req_to_token_pool is not True:
+        return [
+            {
+                "event_type": "relaykv_real_req_to_token_pool_bounded_read_result",
+                "read_state": "blocked",
+                "adapter_mode": "real_req_to_token_pool_bounded_read",
+                "decision_state": "SHADOW_ONLY",
+                "engine_name": "sglang",
+                "adapter_name": "sglang",
+                "engine_request_id": None,
+                "logical_sequence_id": None,
+                "req_pool_idx": None,
+                "token_span": None,
+                "seq_len": None,
+                "layer_id": None,
+                "kv_head_group": None,
+                "req_to_token_index_preview": [],
+                "req_to_token_index_count": 0,
+                "req_to_token_index_checksum": None,
+                "blocked_reason": "req_to_token_pool_read_not_enabled",
+                "source_path": source_path,
+                "source_mutated": False,
+                "req_to_token_read_count": 0,
+                "actual_req_to_token_pool_read_count": 0,
+                "token_to_kv_pool_read_count": 0,
+                "actual_token_to_kv_pool_read_count": 0,
+                "live_token_to_kv_pool_index_read_count": 0,
+                "kv_pool_read_count": 0,
+                "kv_snapshot_count": 0,
+                "tensor_read_count": 0,
+                "attention_comparison_executed_count": 0,
+                "attention_override_true_count": 0,
+                "runtime_writeback_true_count": 0,
+                "scheduler_policy_noop_false_count": 0,
+                "kv_cache_mutation_true_count": 0,
+                "source_mutated_true_count": 0,
+            }
+        ]
+
+    if source_payloads is None:
+        return [
+            {
+                "event_type": "relaykv_real_req_to_token_pool_bounded_read_result",
+                "read_state": "blocked",
+                "adapter_mode": "real_req_to_token_pool_bounded_read",
+                "decision_state": "SHADOW_ONLY",
+                "engine_name": "sglang",
+                "adapter_name": "sglang",
+                "engine_request_id": None,
+                "logical_sequence_id": None,
+                "req_pool_idx": None,
+                "token_span": None,
+                "seq_len": None,
+                "layer_id": None,
+                "kv_head_group": None,
+                "req_to_token_index_preview": [],
+                "req_to_token_index_count": 0,
+                "req_to_token_index_checksum": None,
+                "blocked_reason": "runtime_observation_payloads_missing",
+                "source_path": source_path,
+                "source_mutated": False,
+                "req_to_token_read_count": 0,
+                "actual_req_to_token_pool_read_count": 0,
+                "token_to_kv_pool_read_count": 0,
+                "actual_token_to_kv_pool_read_count": 0,
+                "live_token_to_kv_pool_index_read_count": 0,
+                "kv_pool_read_count": 0,
+                "kv_snapshot_count": 0,
+                "tensor_read_count": 0,
+                "attention_comparison_executed_count": 0,
+                "attention_override_true_count": 0,
+                "runtime_writeback_true_count": 0,
+                "scheduler_policy_noop_false_count": 0,
+                "kv_cache_mutation_true_count": 0,
+                "source_mutated_true_count": 0,
+            }
+        ]
+
+    if req_to_token_pool_object is None:
+        return [
+            {
+                "event_type": "relaykv_real_req_to_token_pool_bounded_read_result",
+                "read_state": "blocked",
+                "adapter_mode": "real_req_to_token_pool_bounded_read",
+                "decision_state": "SHADOW_ONLY",
+                "engine_name": "sglang",
+                "adapter_name": "sglang",
+                "engine_request_id": None,
+                "logical_sequence_id": None,
+                "req_pool_idx": None,
+                "token_span": None,
+                "seq_len": None,
+                "layer_id": None,
+                "kv_head_group": None,
+                "req_to_token_index_preview": [],
+                "req_to_token_index_count": 0,
+                "req_to_token_index_checksum": None,
+                "blocked_reason": "req_to_token_pool_object_missing",
+                "source_path": source_path,
+                "source_mutated": False,
+                "req_to_token_read_count": 0,
+                "actual_req_to_token_pool_read_count": 0,
+                "token_to_kv_pool_read_count": 0,
+                "actual_token_to_kv_pool_read_count": 0,
+                "live_token_to_kv_pool_index_read_count": 0,
+                "kv_pool_read_count": 0,
+                "kv_snapshot_count": 0,
+                "tensor_read_count": 0,
+                "attention_comparison_executed_count": 0,
+                "attention_override_true_count": 0,
+                "runtime_writeback_true_count": 0,
+                "scheduler_policy_noop_false_count": 0,
+                "kv_cache_mutation_true_count": 0,
+                "source_mutated_true_count": 0,
+            }
+        ]
+
+    if source_payloads == [] and runtime_observation_payloads is not None:
+        return [
+            {
+                "event_type": "relaykv_real_req_to_token_pool_bounded_read_result",
+                "read_state": "blocked",
+                "adapter_mode": "real_req_to_token_pool_bounded_read",
+                "decision_state": "SHADOW_ONLY",
+                "engine_name": "sglang",
+                "adapter_name": "sglang",
+                "engine_request_id": None,
+                "logical_sequence_id": None,
+                "req_pool_idx": None,
+                "token_span": None,
+                "seq_len": None,
+                "layer_id": None,
+                "kv_head_group": None,
+                "req_to_token_index_preview": [],
+                "req_to_token_index_count": 0,
+                "req_to_token_index_checksum": None,
+                "blocked_reason": "runtime_observation_payloads_missing",
+                "source_path": source_path,
+                "source_mutated": False,
+                "req_to_token_read_count": 0,
+                "actual_req_to_token_pool_read_count": 0,
+                "token_to_kv_pool_read_count": 0,
+                "actual_token_to_kv_pool_read_count": 0,
+                "live_token_to_kv_pool_index_read_count": 0,
+                "kv_pool_read_count": 0,
+                "kv_snapshot_count": 0,
+                "tensor_read_count": 0,
+                "attention_comparison_executed_count": 0,
+                "attention_override_true_count": 0,
+                "runtime_writeback_true_count": 0,
+                "scheduler_policy_noop_false_count": 0,
+                "kv_cache_mutation_true_count": 0,
+                "source_mutated_true_count": 0,
+            }
+        ]
+
+    assert source_payloads is not None
+    results: list[dict[str, Any]] = []
+    total_tokens = 0
+    max_preview_entries = 8
+    checksum_modulus = 1000000007
+
+    for payload in source_payloads:
+        if not isinstance(payload, Mapping):
+            raise TypeError(
+                "RelayKV real req_to_token pool bounded read inputs must be mappings"
+            )
+
+        normalized = normalize_relaykv_sglang_adapter_schema_for_smoke(payload)
+        req_pool_idx = _relaykv_req_pool_idx_from_runtime_observation_payload_for_smoke(
+            payload
+        )
+        token_positions, token_span, seq_len, token_error = (
+            _relaykv_bounded_req_to_token_positions_for_smoke(payload)
+        )
+        blocked_reason = None
+        if req_pool_idx is None:
+            blocked_reason = "req_pool_idx_missing"
+        elif token_positions is None and token_error in {
+            "token_span_invalid",
+            "seq_len_invalid",
+        }:
+            blocked_reason = token_error
+        elif token_positions is None:
+            blocked_reason = "token_span_or_seq_len_missing"
+
+        if blocked_reason is None:
+            assert token_positions is not None
+            if len(token_positions) > max_tokens_per_request:
+                blocked_reason = "max_tokens_per_request_exceeded"
+            elif total_tokens + len(token_positions) > max_total_tokens:
+                blocked_reason = "max_total_tokens_exceeded"
+
+        read_values: list[int] = []
+        if blocked_reason is None:
+            assert token_positions is not None
+            for token_position in token_positions:
+                value, value_error = _relaykv_read_req_to_token_value_for_smoke(
+                    req_to_token_pool_object,
+                    req_pool_idx,
+                    token_position,
+                )
+                if value_error is not None:
+                    blocked_reason = value_error
+                    read_values = []
+                    break
+                if isinstance(value, bool) or not isinstance(value, int):
+                    blocked_reason = "req_to_token_pool_value_not_int"
+                    read_values = []
+                    break
+                read_values.append(value)
+
+        checksum = None
+        if read_values:
+            checksum = (
+                sum((index + 1) * value for index, value in enumerate(read_values))
+                % checksum_modulus
+            )
+
+        if blocked_reason is None:
+            total_tokens += len(read_values)
+
+        result = {
+            "event_type": "relaykv_real_req_to_token_pool_bounded_read_result",
+            "read_state": (
+                "req_to_token_pool_resolved" if blocked_reason is None else "blocked"
+            ),
+            "adapter_mode": "real_req_to_token_pool_bounded_read",
+            "decision_state": "SHADOW_ONLY",
+            "engine_name": "sglang",
+            "adapter_name": "sglang",
+            "engine_request_id": normalized.get("engine_request_id"),
+            "logical_sequence_id": normalized.get("logical_sequence_id"),
+            "req_pool_idx": req_pool_idx,
+            "token_span": token_span,
+            "seq_len": seq_len,
+            "layer_id": normalized.get("layer_id"),
+            "kv_head_group": normalized.get("kv_head_group"),
+            "req_to_token_index_preview": list(read_values[:max_preview_entries]),
+            "req_to_token_index_count": len(read_values),
+            "req_to_token_index_checksum": checksum,
+            "blocked_reason": blocked_reason,
+            "source_path": source_path,
+            "source_mutated": False,
+            "req_to_token_read_count": len(read_values) if blocked_reason is None else 0,
+            "actual_req_to_token_pool_read_count": (
+                len(read_values) if blocked_reason is None else 0
+            ),
+            "token_to_kv_pool_read_count": 0,
+            "actual_token_to_kv_pool_read_count": 0,
+            "live_token_to_kv_pool_index_read_count": 0,
+            "kv_pool_read_count": 0,
+            "kv_snapshot_count": 0,
+            "tensor_read_count": 0,
+            "attention_comparison_executed_count": 0,
+            "attention_override_true_count": 0,
+            "runtime_writeback_true_count": 0,
+            "scheduler_policy_noop_false_count": 0,
+            "kv_cache_mutation_true_count": 0,
+            "source_mutated_true_count": 0,
+            "adapter_metadata": normalized.get("adapter_metadata"),
+            "engine_block_ref": normalized.get("engine_block_ref"),
+        }
+        results.append(result)
+
+    return results
+
+
+def summarize_relaykv_real_req_to_token_pool_bounded_read_results_for_smoke(
+    results: list[dict[str, Any]] | tuple[dict[str, Any], ...],
+    *,
+    read_enabled: bool,
+    max_tokens_per_request: int,
+    max_total_tokens: int,
+) -> dict[str, Any]:
+    """Summarize bounded real req_to_token pool readonly read smoke results."""
+
+    if not isinstance(results, (list, tuple)):
+        raise TypeError(
+            "RelayKV real req_to_token pool bounded read results must be a list or tuple"
+        )
+
+    resolved_count = 0
+    blocked_count = 0
+    error_count = 0
+    total_req_to_token_index_count = 0
+    safety_counts: Counter[str] = Counter(
+        {
+            "req_to_token_read_count": 0,
+            "actual_req_to_token_pool_read_count": 0,
+            "token_to_kv_pool_read_count": 0,
+            "actual_token_to_kv_pool_read_count": 0,
+            "live_token_to_kv_pool_index_read_count": 0,
+            "kv_pool_read_count": 0,
+            "kv_snapshot_count": 0,
+            "tensor_read_count": 0,
+            "attention_comparison_executed_count": 0,
+            "attention_override_true_count": 0,
+            "runtime_writeback_true_count": 0,
+            "scheduler_policy_noop_false_count": 0,
+            "kv_cache_mutation_true_count": 0,
+            "source_mutated_true_count": 0,
+        }
+    )
+    for result in results:
+        if not isinstance(result, Mapping):
+            raise TypeError(
+                "RelayKV real req_to_token pool bounded read result must be a mapping"
+            )
+        state = str(result.get("read_state") or "unknown")
+        if state == "req_to_token_pool_resolved":
+            resolved_count += 1
+        elif state == "blocked":
+            blocked_count += 1
+        elif state == "error":
+            error_count += 1
+        value = result.get("req_to_token_index_count")
+        if isinstance(value, int) and not isinstance(value, bool):
+            total_req_to_token_index_count += value
+        for key in safety_counts:
+            value = result.get(key)
+            if isinstance(value, int) and not isinstance(value, bool):
+                safety_counts[key] += value
+
+    return {
+        "event_type": "relaykv_real_req_to_token_pool_bounded_read_summary",
+        "read_enabled": read_enabled,
+        "result_count": len(results),
+        "resolved_count": resolved_count,
+        "blocked_count": blocked_count,
+        "error_count": error_count,
+        "total_req_to_token_index_count": total_req_to_token_index_count,
+        "max_tokens_per_request": max_tokens_per_request,
+        "max_total_tokens": max_total_tokens,
+        **{key: safety_counts[key] for key in sorted(safety_counts)},
+    }
+
+
+def build_relaykv_req_to_token_resolution_payloads_from_real_pool_read_for_smoke(
+    real_pool_read_results: list[dict[str, Any]] | tuple[dict[str, Any], ...],
+) -> list[dict[str, Any]]:
+    """Convert bounded real req_to_token pool read results into resolution payloads."""
+
+    if not isinstance(real_pool_read_results, (list, tuple)):
+        raise TypeError(
+            "RelayKV real req_to_token pool bounded read results must be a list or tuple"
+        )
+
+    payloads: list[dict[str, Any]] = []
+    for result in real_pool_read_results:
+        if not isinstance(result, Mapping):
+            raise TypeError(
+                "RelayKV real req_to_token pool bounded read result must be a mapping"
+            )
+        normalized = normalize_relaykv_sglang_adapter_schema_for_smoke(result)
+        adapter_metadata = normalized.get("adapter_metadata")
+        if isinstance(adapter_metadata, Mapping):
+            payload_adapter_metadata = _copy_relaykv_metadata_value_for_smoke(
+                dict(adapter_metadata)
+            )
+        else:
+            payload_adapter_metadata = {}
+        payload_adapter_metadata["real_req_to_token_pool_bounded_read_source_path"] = (
+            result.get("source_path")
+        )
+
+        if result.get("read_state") != "req_to_token_pool_resolved":
+            normalized.update(
+                {
+                    "event_type": "relaykv_req_to_token_resolution_result",
+                    "resolution_state": "blocked",
+                    "adapter_mode": "real_req_to_token_pool_bounded_read_conversion",
+                    "source": (
+                        "real_req_to_token_pool_bounded_read_result_to_"
+                        "req_to_token_resolution_result"
+                    ),
+                    "decision_state": "SHADOW_ONLY",
+                    "adapter_metadata": payload_adapter_metadata,
+                    "full_kv_req_to_token_spans": [],
+                    "relaykv_working_req_to_token_spans": [],
+                    "resolved_block_count": 0,
+                    "resolved_token_count": 0,
+                    "req_to_token_entry_count": 0,
+                    "req_to_token_read": False,
+                    "req_to_token_read_count": 0,
+                    "actual_req_to_token_pool_read": False,
+                    "actual_req_to_token_pool_read_count": 0,
+                    "token_to_kv_pool_read": False,
+                    "token_to_kv_pool_read_count": 0,
+                    "actual_token_to_kv_pool_read": False,
+                    "actual_token_to_kv_pool_read_count": 0,
+                    "live_token_to_kv_pool_index_read": False,
+                    "live_token_to_kv_pool_index_read_count": 0,
+                    "kv_pool_read": False,
+                    "kv_snapshot": False,
+                    "tensor_read": False,
+                    "attention_comparison_executed": False,
+                    "attention_override": False,
+                    "runtime_writeback": False,
+                    "scheduler_policy_noop": True,
+                    "kv_cache_mutation": False,
+                    "source_mutated": False,
+                    "blocking_reasons": [result.get("blocked_reason")],
+                    "warning_reasons": [
+                        "real_req_to_token_pool_bounded_read_conversion"
+                    ],
+                }
+            )
+            payloads.append(normalized)
+            continue
+
+        token_span = _relaykv_smoke_token_span_from_value(result.get("token_span")) or [
+            0,
+            int(result.get("req_to_token_index_count") or 0),
+        ]
+        req_to_token_entries = list(result.get("req_to_token_index_preview") or [])
+        req_to_token_count = int(result.get("req_to_token_index_count") or 0)
+        engine_block_ref = normalized.get("engine_block_ref")
+        if isinstance(engine_block_ref, Mapping):
+            payload_engine_block_ref = _copy_relaykv_metadata_value_for_smoke(
+                dict(engine_block_ref)
+            )
+        else:
+            payload_engine_block_ref = {}
+        payload_engine_block_ref["req_to_token_index_count"] = req_to_token_count
+        payload_engine_block_ref["req_to_token_index_checksum"] = result.get(
+            "req_to_token_index_checksum"
+        )
+
+        req_to_token_span = {
+            "block_id": normalized.get("logical_block_id"),
+            "token_start": token_span[0],
+            "token_end": token_span[1],
+            "token_count": req_to_token_count,
+            "req_to_token_entries": req_to_token_entries,
+            "entry_count": req_to_token_count,
+            "resolution_source": "real_req_to_token_pool_bounded_read",
+        }
+        normalized.update(
+            {
+                "event_type": "relaykv_req_to_token_resolution_result",
+                "resolution_state": "req_to_token_resolved",
+                "adapter_mode": "real_req_to_token_pool_bounded_read_conversion",
+                "source": (
+                    "real_req_to_token_pool_bounded_read_result_to_"
+                    "req_to_token_resolution_result"
+                ),
+                "decision_state": "SHADOW_ONLY",
+                "adapter_metadata": payload_adapter_metadata,
+                "engine_block_ref": payload_engine_block_ref,
+                "full_kv_req_to_token_spans": [req_to_token_span],
+                "relaykv_working_req_to_token_spans": [req_to_token_span],
+                "resolved_block_count": 1,
+                "resolved_token_count": req_to_token_count,
+                "req_to_token_entry_count": req_to_token_count,
+                "req_to_token_read": True,
+                "req_to_token_read_count": req_to_token_count,
+                "actual_req_to_token_pool_read": True,
+                "actual_req_to_token_pool_read_count": req_to_token_count,
+                "token_to_kv_pool_read": False,
+                "token_to_kv_pool_read_count": 0,
+                "actual_token_to_kv_pool_read": False,
+                "actual_token_to_kv_pool_read_count": 0,
+                "live_token_to_kv_pool_index_read": False,
+                "live_token_to_kv_pool_index_read_count": 0,
+                "kv_pool_read": False,
+                "kv_snapshot": False,
+                "tensor_read": False,
+                "attention_comparison_executed": False,
+                "attention_override": False,
+                "runtime_writeback": False,
+                "scheduler_policy_noop": True,
+                "kv_cache_mutation": False,
+                "source_mutated": False,
+                "blocking_reasons": [],
+                "warning_reasons": [
+                    "real_req_to_token_pool_bounded_read_conversion",
+                    "bounded_preview_only",
+                    "no_token_to_kv_pool_read",
+                ],
+            }
+        )
+        payloads.append(normalized)
+
+    return payloads
+
+
 def _relaykv_runtime_kv_index_resolution_plans_for_smoke(
     *,
     forward_batch: Any = None,
