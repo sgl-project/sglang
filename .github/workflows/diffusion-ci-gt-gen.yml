@@ -121,10 +121,6 @@ jobs:
               "flux_2_image_t2i",
               "flux_2_klein_image_t2i",
               "flux_2_ti2i",
-              "ltx_2_two_stage_t2v",
-              "ltx_2.3_two_stage_t2v_2gpus",
-              "ltx_2_3_hq_pipeline",
-              "ltx_2_3_two_stage_ti2v_2gpus",
           }
           include = []
           for group in selected_groups:
