@@ -723,8 +723,6 @@ def apply_qk_norm_across_heads(
         and _get_tensor_model_parallel_world_size_or_one() == 1
         and not hasattr(q_norm, "full_hidden_size")
         and not hasattr(k_norm, "full_hidden_size")
-        and not isinstance(q_norm, nn.RMSNorm)
-        and not isinstance(k_norm, nn.RMSNorm)
         and q.shape == k.shape
         and hidden_size is not None
         and q.shape[-1] == hidden_size
