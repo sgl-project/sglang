@@ -22,6 +22,7 @@ from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config impor
     QuantizationConfig,
     QuantizeMethodBase,
 )
+from sglang.multimodal_gen.runtime.layers.fp8_cast import is_fp8_cast_dtype
 from sglang.multimodal_gen.runtime.layers.utils import get_group_rank, get_group_size
 
 # yapf: disable
@@ -155,6 +156,11 @@ class UnquantizedLinearMethod(LinearMethodBase):
     def apply(
         self, layer: torch.nn.Module, x: torch.Tensor, bias: torch.Tensor | None = None
     ) -> torch.Tensor:
+        if is_fp8_cast_dtype(layer.weight.dtype):
+            weight = layer.weight.to(dtype=x.dtype)
+            bias = bias.to(dtype=x.dtype) if bias is not None else None
+            return F.linear(x, weight, bias)
+
         output = (
             F.linear(x, layer.weight, bias)
             if IS_AMP_SUPPORTED or bias is None

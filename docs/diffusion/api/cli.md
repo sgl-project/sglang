@@ -98,6 +98,7 @@ For quantized transformer checkpoints, prefer:
 - `--model-path` for the base pipeline
 - `--transformer-path` for a quantized `transformers` transformer component folder
 - `--transformer-weights-path` for a quantized safetensors file, directory, or repo
+- `--transformer-weight-quantization fp8-cast` to store selected native transformer linear weights in FP8 after loading and upcast them during inference. This is opt-in and currently intended for matching LTX official fp8-cast behavior.
 
 See [Quantization](../quantization.md) for supported quantization families and examples.
 
