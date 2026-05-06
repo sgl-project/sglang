@@ -1937,7 +1937,7 @@ class MooncakeKVSender(CommonKVSender):
             self.bootstrap_room,
             kv_indices,
             index_slice,
-            is_last=is_last,
+            is_last_chunk=is_last,
             aux_index=self.aux_index if is_last else None,
             state_indices=state_indices if is_last else None,
             layer_id=layer_id,
