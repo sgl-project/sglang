@@ -88,10 +88,6 @@ class DiffusionTestCaseVisitor(ast.NodeVisitor):
             self._process_assignment([node.target], node.value)
         self.generic_visit(node)
 
-    def visit_Expr(self, node: ast.Expr):
-        self._process_append(node.value)
-        self.generic_visit(node)
-
     def visit_AugAssign(self, node: ast.AugAssign):
         self._process_aug_assignment(node.target, node.op, node.value)
         self.generic_visit(node)
@@ -104,23 +100,6 @@ class DiffusionTestCaseVisitor(ast.NodeVisitor):
                 case_ids = self._extract_case_ids(value)
                 if case_ids is not None:
                     self.cases[list_name] = case_ids
-
-    def _process_append(self, value: ast.AST):
-        """Process CASE_LIST.append(DiffusionTestCase(...)) calls."""
-        if not isinstance(value, ast.Call):
-            return
-        if not isinstance(value.func, ast.Attribute) or value.func.attr != "append":
-            return
-        if not isinstance(value.func.value, ast.Name):
-            return
-
-        list_name = value.func.value.id
-        if list_name not in CASE_LIST_TO_SUITE or len(value.args) != 1:
-            return
-
-        case_id = self._extract_case_id_from_call(value.args[0])
-        if case_id:
-            self.cases.setdefault(list_name, []).append(case_id)
 
     def _process_aug_assignment(self, target: ast.AST, op: ast.AST, value: ast.AST):
         """Process `+=` style assignment to merge case lists."""
@@ -343,11 +322,7 @@ def parse_testcase_configs(config_path: Path) -> Dict[str, List[str]]:
     visitor = DiffusionTestCaseVisitor()
     visitor.visit(tree)
 
-    return {
-        list_name: case_ids
-        for list_name, case_ids in visitor.cases.items()
-        if list_name in CASE_LIST_TO_SUITE
-    }
+    return visitor.cases
 
 
 def parse_run_suite_standalone_data(
