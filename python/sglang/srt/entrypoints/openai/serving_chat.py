@@ -1401,7 +1401,7 @@ class OpenAIServingChat(OpenAIServingBase):
         if not self.reasoning_parser:
             return False
 
-        if self.reasoning_parser == "deepseek-v3":
+        if self.reasoning_parser in ["deepseek-v3", "deepseek-v4"]:
             # Models that require explicit enable thinking (thinking=True)
             return (
                 request.chat_template_kwargs is not None

@@ -144,6 +144,7 @@ ATTENTION_BACKEND_CHOICES = [
     "torch_native",
     "flex_attention",
     "nsa",
+    "compressed",
     # NVIDIA specific
     "cutlass_mla",
     "fa3",
@@ -1679,6 +1680,22 @@ class ServerArgs:
             "PixtralForConditionalGeneration",
         ]:
             self.dtype = "bfloat16"
+
+        if model_arch in [
+            "DeepseekV4ForCausalLM",
+        ]:
+            if self.is_attention_backend_not_set():
+                self.attention_backend = "compressed"
+            if self.page_size is None:
+                self.page_size = 256
+            if self.kv_cache_dtype == "auto":
+                self.kv_cache_dtype = "fp8_e4m3"
+                logger.warning(
+                    f"Setting KV cache dtype to {self.kv_cache_dtype} for {model_arch}."
+                )
+            logger.info(
+                f"Use compressed attention backend for {model_arch}, setting page_size to {self.page_size}."
+            )
 
         if model_arch in [
             "DeepseekV3ForCausalLM",

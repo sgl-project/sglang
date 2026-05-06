@@ -114,6 +114,13 @@ def is_deepseek_nsa(config) -> bool:
     )
 
 
+def is_deepseek_compressed(config: PretrainedConfig) -> bool:
+    return config.architectures is not None and (
+        config.architectures[0] == "DeepseekV4ForCausalLM"
+        or config.architectures[0] == "DeepseekV4ForCausalLMNextN"
+    )
+
+
 def get_nsa_index_head_dim(config: PretrainedConfig) -> int:
     assert is_deepseek_nsa(config)
     return config.index_head_dim
@@ -367,6 +374,13 @@ class ModelConfig:
         ]:
             self.hf_config.architectures[0] = "DeepseekV3ForCausalLMNextN"
 
+        if (
+            is_draft_model
+            and self.hf_config.architectures[0] == "DeepseekV4ForCausalLM"
+        ):
+            self.hf_config.architectures[0] = "DeepseekV4ForCausalLMNextN"
+            self.hf_config.num_nextn_predict_layers = 1
+
         if is_draft_model and self.hf_config.architectures[0] in [
             "Glm4MoeForCausalLM",
             "Glm4MoeLiteForCausalLM",
@@ -433,7 +447,20 @@ class ModelConfig:
             and not self.disable_hybrid_swa_memory
         )
 
-        if self.is_hybrid_swa:
+        if not self.is_hybrid_swa:
+            self.has_attention_sinks = self._detect_attention_sinks()
+            self.is_hybrid_swa_compress = False
+            self.is_swa_with_compressed_attention = False
+            return
+
+        logger.info(f"Hybrid swa model: {self.hf_config.architectures=}")
+
+        self.is_swa_with_compressed_attention = any(
+            arch in ["DeepseekV4ForCausalLM", "DeepseekV4ForCausalLMNextN"]
+            for arch in self.hf_config.architectures
+        )
+
+        if self.is_hybrid_swa and not self.is_swa_with_compressed_attention:
             self.swa_attention_layer_ids, self.full_attention_layer_ids = (
                 get_hybrid_layer_ids(
                     self.hf_config.architectures,
@@ -526,8 +553,35 @@ class ModelConfig:
             "swa_v_head_dim",
             self.swa_head_dim,
         )
-        # FIXME: temporary special judge for MLA architecture
+        # DeepseekV4 uses compressed attention (MHA architecture, not MLA)
         if (
+            "DeepseekV4ForCausalLM" in self.hf_config.architectures
+            or "DeepseekV4ForCausalLMNextN" in self.hf_config.architectures
+        ):
+            self.qk_rope_head_dim = self.hf_config.qk_rope_head_dim
+            if envs.SGLANG_DSV4_MODE.get() == "2604":
+                self.qk_nope_head_dim = self.hf_config.head_dim - self.qk_rope_head_dim
+                self.window_size = self.hf_config.sliding_window
+            else:
+                self.qk_nope_head_dim = self.hf_config.qk_nope_head_dim
+                self.window_size = self.hf_config.window_size
+            self.head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
+            if envs.SGLANG_DSV4_MODE.get() == "2604":
+                self.v_head_dim = self.head_dim
+            self.index_head_dim = self.hf_config.index_head_dim
+            self.compress_ratios = self.hf_config.compress_ratios
+            self.attention_arch = AttentionArch.MHA
+            self.scaling = 1 / math.sqrt(self.qk_nope_head_dim + self.qk_rope_head_dim)
+            if self.hf_config.rope_scaling:
+                mscale_all_dim = self.hf_config.rope_scaling.get(
+                    "mscale_all_dim", False
+                )
+                scaling_factor = self.hf_config.rope_scaling.get("factor", 1.0)
+                mscale = yarn_get_mscale(scaling_factor, float(mscale_all_dim))
+                self.scaling = self.scaling * mscale * mscale
+
+        # FIXME: temporary special judge for MLA architecture
+        elif (
             "DeepseekV2ForCausalLM" in self.hf_config.architectures
             or "DeepseekV32ForCausalLM" in self.hf_config.architectures
             or "DeepseekV3ForCausalLM" in self.hf_config.architectures
@@ -1568,6 +1622,8 @@ def is_hybrid_swa_model(model_architectures: List[str]):
 
     hybrid_swa_archs = {
         "Llama4ForConditionalGeneration",
+        "DeepseekV4ForCausalLM",
+        "DeepseekV4ForCausalLMNextN",
         "GptOssForCausalLM",
         *MIMO_V2_MODEL_ARCHS,
         "MiMoV2MTP",

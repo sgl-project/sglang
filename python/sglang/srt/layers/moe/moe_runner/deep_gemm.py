@@ -141,9 +141,15 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         running_state: dict,
     ) -> torch.Tensor:
         from sglang.srt.layers.moe.ep_moe.kernels import tma_align_input_scale
-        from sglang.srt.layers.quantization.fp8_kernel import (
-            sglang_per_token_group_quant_fp8,
-        )
+
+        if _is_hip:
+            from sglang.srt.layers.quantization.fp8_kernel import (
+                per_token_group_quant_fp8 as sglang_per_token_group_quant_fp8,
+            )
+        else:
+            from sglang.srt.layers.quantization.fp8_kernel import (
+                sglang_per_token_group_quant_fp8,
+            )
 
         hidden_states = runner_input.hidden_states
         hidden_states_scale = runner_input.hidden_states_scale

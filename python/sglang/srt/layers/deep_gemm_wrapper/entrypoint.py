@@ -4,6 +4,7 @@ from typing import Any, Optional, Tuple
 
 import torch
 
+from sglang.srt.configs.deepseek_v4 import get_fp4_experts
 from sglang.srt.environ import envs
 from sglang.srt.layers.deep_gemm_wrapper import compile_utils
 from sglang.srt.layers.deep_gemm_wrapper.configurer import (  # noqa: F401
@@ -50,12 +51,17 @@ def grouped_gemm_nt_f8f8bf16_masked(
             overlap_args.num_sms if overlap_args is not None else None
         ):
 
+            fp4_kwargs = (
+                dict(recipe_a=(1, 128), recipe_b=(1, 32)) if get_fp4_experts() else {}
+            )
+
             return deep_gemm.fp8_m_grouped_gemm_nt_masked(
                 lhs,
                 rhs,
                 out,
                 masked_m,
                 expected_m,
+                **fp4_kwargs,
                 **(
                     dict(
                         enable_overlap=True,
@@ -93,8 +99,15 @@ def grouped_gemm_nt_f8f8bf16_contig(
     _sanity_check_input(lhs)
     _sanity_check_input(rhs)
 
+    if envs.SGLANG_HACK_SKIP_FP4_FP8_GEMM.get():
+        out.zero_()
+        return
+    fp4_kwargs = dict(recipe_a=(1, 128), recipe_b=(1, 32)) if get_fp4_experts() else {}
+
     with compile_utils.deep_gemm_execution_hook(m, n, k, num_groups, kernel_type):
-        deep_gemm.m_grouped_fp8_gemm_nt_contiguous(lhs, rhs, out, m_indices)
+        deep_gemm.m_grouped_fp8_gemm_nt_contiguous(
+            lhs, rhs, out, m_indices, **fp4_kwargs
+        )
 
 
 def gemm_nt_f8f8bf16(

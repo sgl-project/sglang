@@ -327,6 +327,106 @@ def _override_v_head_dim_if_zero(config: PretrainedConfig, patch: int = 128) -> 
         )
 
 
+def _load_deepseek_temp_model(
+    model_path: str,
+    model_type: str,
+    architecture: str,
+    trust_remote_code: bool = False,
+    revision: Optional[str] = None,
+    **kwargs,
+):
+    import tempfile
+
+    local_path = download_from_hf(model_path)
+    config_file = os.path.join(local_path, "config.json")
+    if not os.path.exists(config_file):
+        raise RuntimeError(f"Can't find config file in {local_path}.")
+
+    with open(config_file, "r") as f:
+        config_json = json.load(f)
+
+    config_json["architectures"] = [architecture]
+    config_json["model_type"] = "deepseek_v3"
+
+    tmp_path = os.path.join(tempfile.gettempdir(), "_tmp_config_folder")
+    os.makedirs(tmp_path, exist_ok=True)
+
+    unique_path = os.path.join(tmp_path, f"{model_type}_{os.getpid()}")
+    with open(unique_path, "w") as f:
+        json.dump(config_json, f)
+
+    return AutoConfig.from_pretrained(
+        unique_path, trust_remote_code=trust_remote_code, revision=revision, **kwargs
+    )
+
+
+def _load_deepseek_v32_model(
+    model_path: str,
+    trust_remote_code: bool = False,
+    revision: Optional[str] = None,
+    **kwargs,
+):
+    return _load_deepseek_temp_model(
+        model_path,
+        model_type="deepseek_v32",
+        architecture="DeepseekV3ForCausalLM",
+        trust_remote_code=trust_remote_code,
+        revision=revision,
+        **kwargs,
+    )
+
+
+def _load_deepseek_v4_model(
+    model_path: str,
+    trust_remote_code: bool = False,
+    revision: Optional[str] = None,
+    **kwargs,
+):
+    import tempfile
+
+    local_path = download_from_hf(model_path)
+    config_file = os.path.join(local_path, "config.json")
+    if not os.path.exists(config_file):
+        raise RuntimeError(f"Can't find config file in {local_path}.")
+
+    with open(config_file, "r") as f:
+        config_json = json.load(f)
+
+    raw_config = dict(config_json)
+    config_json["architectures"] = ["DeepseekV4ForCausalLM"]
+    config_json["model_type"] = "deepseek_v3"
+
+    tmp_dir = os.path.join(
+        tempfile.gettempdir(), "_tmp_config_folder", f"deepseek_v4_{os.getpid()}"
+    )
+    os.makedirs(tmp_dir, exist_ok=True)
+    with open(os.path.join(tmp_dir, "config.json"), "w") as f:
+        json.dump(config_json, f)
+
+    config = AutoConfig.from_pretrained(
+        tmp_dir, trust_remote_code=trust_remote_code, revision=revision, **kwargs
+    )
+
+    for key in [
+        "rope_theta",
+        "compress_rope_theta",
+        "window_size",
+        "qk_nope_head_dim",
+        "v_head_dim",
+        "o_lora_rank",
+        "o_groups",
+        "n_hash_layers",
+        "hc_mult",
+        "hc_sinkhorn_iters",
+        "hc_eps",
+        "expert_dtype",
+    ]:
+        if key in raw_config and not hasattr(config, key):
+            setattr(config, key, raw_config[key])
+
+    return config
+
+
 # ---------------------------------------------------------------------------
 # Context length / generation config / sparse attention
 # ---------------------------------------------------------------------------

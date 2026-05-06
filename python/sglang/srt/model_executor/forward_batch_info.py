@@ -592,7 +592,14 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 ret._compute_mrope_positions(model_runner, batch)
 
         # Precompute SWA cache location once for all SWA layers
-        if model_runner.is_hybrid_swa and ret.out_cache_loc is not None:
+        if (
+            model_runner.is_hybrid_swa
+            and ret.out_cache_loc is not None
+            and hasattr(
+                model_runner.token_to_kv_pool_allocator,
+                "translate_loc_from_full_to_swa",
+            )
+        ):
             ret.out_cache_loc_swa = (
                 model_runner.token_to_kv_pool_allocator.translate_loc_from_full_to_swa(
                     ret.out_cache_loc

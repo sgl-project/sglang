@@ -388,6 +388,7 @@ class MambaAttnBackendBase(AttentionBackend):
         forward_mode: ForwardMode,
         spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
         seq_lens_cpu: Optional[torch.Tensor],
+        **kwargs,
     ):
         self.forward_metadata = self._replay_metadata(
             bs, req_pool_indices, forward_mode, spec_info, seq_lens_cpu
@@ -681,6 +682,7 @@ class Mamba2AttnBackend(MambaAttnBackendBase):
         forward_mode: ForwardMode,
         spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
         seq_lens_cpu: Optional[torch.Tensor],
+        **kwargs,
     ):
         metadata = self._replay_metadata(
             bs, req_pool_indices, forward_mode, spec_info, seq_lens_cpu
@@ -802,6 +804,7 @@ class HybridLinearAttnBackend(AttentionBackend):
         forward_mode: ForwardMode,
         spec_info: Optional[SpecInput],
         seq_lens_cpu: Optional[torch.Tensor],
+        **kwargs,
     ):
         for attn_backend in self.attn_backend_list:
             attn_backend.init_forward_metadata_replay_cuda_graph(
@@ -813,6 +816,7 @@ class HybridLinearAttnBackend(AttentionBackend):
                 forward_mode,
                 spec_info,
                 seq_lens_cpu,
+                **kwargs,
             )
 
     def get_cuda_graph_seq_len_fill_value(self):
