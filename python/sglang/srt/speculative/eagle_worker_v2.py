@@ -794,8 +794,9 @@ class EAGLEWorkerV2(BaseSpecWorker):
             return batch_output
 
     def on_verify_complete_cpu(self, accepted_draft_tokens: list[int]) -> None:
-        if self.adaptive_controller is not None:
-            self.adaptive_controller.on_verify_complete(accepted_draft_tokens)
+        adaptive_controller = getattr(self, "adaptive_controller", None)
+        if adaptive_controller is not None:
+            adaptive_controller.on_verify_complete(accepted_draft_tokens)
 
     # -- Adaptive speculative decoding protocol --
 
