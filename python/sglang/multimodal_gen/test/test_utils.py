@@ -33,16 +33,22 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
-SGL_TEST_FILES_OFFICIAL_CONSISTENCY_GT_BASE = "https://raw.githubusercontent.com/sgl-project/ci-data/main/diffusion-ci/consistency_gt/official_generated"
-SGL_TEST_FILES_SGLANG_CONSISTENCY_GT_BASE = "https://raw.githubusercontent.com/sgl-project/ci-data/main/diffusion-ci/consistency_gt/sglang_generated"
+SGL_TEST_FILES_CI_DATA_REVISION = "4d9eff3b05b0ffe1d3529e8bb148b63af11a4b92"
+SGL_TEST_FILES_CONSISTENCY_GT_ROOT = (
+    "https://raw.githubusercontent.com/"
+    f"sgl-project/ci-data/{SGL_TEST_FILES_CI_DATA_REVISION}/"
+    "diffusion-ci/consistency_gt"
+)
+SGL_TEST_FILES_OFFICIAL_CONSISTENCY_GT_BASE = (
+    f"{SGL_TEST_FILES_CONSISTENCY_GT_ROOT}/official_generated"
+)
+SGL_TEST_FILES_SGLANG_CONSISTENCY_GT_BASE = (
+    f"{SGL_TEST_FILES_CONSISTENCY_GT_ROOT}/sglang_generated"
+)
 SGL_TEST_FILES_CONSISTENCY_GT_BASE = SGL_TEST_FILES_SGLANG_CONSISTENCY_GT_BASE
 SGL_TEST_FILES_CONSISTENCY_GT_BASES = (
     SGL_TEST_FILES_OFFICIAL_CONSISTENCY_GT_BASE,
     SGL_TEST_FILES_SGLANG_CONSISTENCY_GT_BASE,
-    # Legacy fallback during migration from sglang-bot/sglang-ci-data
-    "https://raw.githubusercontent.com/sglang-bot/sglang-ci-data/main/diffusion-ci/consistency_gt/official_generated",
-    "https://raw.githubusercontent.com/sglang-bot/sglang-ci-data/main/diffusion-ci/consistency_gt/sglang_generated",
-    "https://raw.githubusercontent.com/sglang-bot/sglang-ci-data/main/diffusion-ci/consistency_gt",
 )
 CONSISTENCY_THRESHOLD_JSON_PATH = (
     Path(__file__).resolve().parent / "server" / "consistency_threshold.json"

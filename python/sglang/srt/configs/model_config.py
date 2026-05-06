@@ -82,29 +82,35 @@ class ModelImpl(str, Enum):
     MINDSPORE = "mindspore"
 
 
-def is_deepseek_nsa(config) -> bool:
-    architectures = (
+def _hf_arch(config) -> Optional[str]:
+    """First architecture from a HF config dict or PretrainedConfig (or None)."""
+    archs = (
         config.get("architectures")
         if isinstance(config, dict)
         else getattr(config, "architectures", None)
     )
-    index_topk = (
-        config.get("index_topk")
-        if isinstance(config, dict)
-        else getattr(config, "index_topk", None)
-    )
+    return archs[0] if archs else None
+
+
+def _hf_attr(config, name):
+    """Read an arbitrary field from a HF config dict or PretrainedConfig."""
+    if isinstance(config, dict):
+        return config.get(name)
+    return getattr(config, name, None)
+
+
+def is_deepseek_nsa(config) -> bool:
     return (
-        architectures is not None
-        and architectures[0]
-        in [
+        _hf_arch(config)
+        in (
             "DeepseekV3ForCausalLM",
             "DeepseekV32ForCausalLM",
             "DeepseekV3ForCausalLMNextN",
             "MistralLarge3ForCausalLM",
             "PixtralForConditionalGeneration",
             "GlmMoeDsaForCausalLM",
-        ]
-        and index_topk is not None
+        )
+        and _hf_attr(config, "index_topk") is not None
     )
 
 
@@ -121,6 +127,19 @@ def get_nsa_index_topk(config: PretrainedConfig) -> int:
 def get_nsa_index_n_heads(config: PretrainedConfig) -> int:
     assert is_deepseek_nsa(config)
     return config.index_n_heads
+
+
+def get_num_indexer_layers(config) -> int:
+    """Layer count for the global indexer-topk capturer's host buffer.
+
+    NSA models (V3.2) instantiate an Indexer on every transformer layer.
+    With index_topk_freq > 1 some layers reuse prev layer's topk; those still
+    get a slot (mirrored at the MLA call site). Other architectures: set
+    num_indexer_layers on hf_text_config; 0 disables the capturer.
+    """
+    if is_deepseek_nsa(config):
+        return config.num_hidden_layers
+    return getattr(config, "num_indexer_layers", 0)
 
 
 class ModelConfig:
@@ -343,6 +362,7 @@ class ModelConfig:
 
         if is_draft_model and self.hf_config.architectures[0] in [
             "DeepseekV3ForCausalLM",
+            "DeepseekV32ForCausalLM",
             "GlmMoeDsaForCausalLM",
         ]:
             self.hf_config.architectures[0] = "DeepseekV3ForCausalLMNextN"
@@ -967,10 +987,11 @@ class ModelConfig:
             return "fp8"  # Default fallback
 
     def _get_sliding_window_size(self) -> Optional[int]:
-        sliding_window_size = getattr(self.hf_text_config, "sliding_window_size", None)
-        if sliding_window_size is None:
-            sliding_window_size = getattr(self.hf_text_config, "sliding_window", None)
-        return sliding_window_size
+        for key in ("sliding_window_size", "sliding_window", "window_size"):
+            value = getattr(self.hf_text_config, key, None)
+            if value is not None:
+                return value
+        return None
 
     def _validate_quantize_and_serve_config(self):
         """Validate quantize_and_serve configuration."""
