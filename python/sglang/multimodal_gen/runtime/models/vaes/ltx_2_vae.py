@@ -661,6 +661,7 @@ class LTX23VideoMidBlock3d(nn.Module):
         self,
         hidden_states: torch.Tensor,
         temb: Optional[torch.Tensor] = None,
+        generator: Optional[torch.Generator] = None,
         causal: bool = True,
     ) -> torch.Tensor:
         if self.time_embedder is not None:
@@ -674,7 +675,7 @@ class LTX23VideoMidBlock3d(nn.Module):
             temb = temb.view(hidden_states.size(0), -1, 1, 1, 1)
 
         for res_block in self.res_blocks:
-            hidden_states = res_block(hidden_states, temb, causal=causal)
+            hidden_states = res_block(hidden_states, temb, generator, causal=causal)
 
         return hidden_states
 
@@ -1116,6 +1117,7 @@ class LTX2VideoDecoder3d(nn.Module):
         hidden_states: torch.Tensor,
         temb: Optional[torch.Tensor] = None,
         causal: Optional[bool] = None,
+        generator: Optional[torch.Generator] = None,
     ) -> torch.Tensor:
         causal = causal or self.is_causal
 
@@ -1126,18 +1128,20 @@ class LTX2VideoDecoder3d(nn.Module):
 
         if torch.is_grad_enabled() and self.gradient_checkpointing:
             hidden_states = self._gradient_checkpointing_func(
-                self.mid_block, hidden_states, temb, None, causal
+                self.mid_block, hidden_states, temb, generator, causal
             )
 
             for up_block in self.up_blocks:
                 hidden_states = self._gradient_checkpointing_func(
-                    up_block, hidden_states, temb, None, causal
+                    up_block, hidden_states, temb, generator, causal
                 )
         else:
-            hidden_states = self.mid_block(hidden_states, temb, causal=causal)
+            hidden_states = self.mid_block(
+                hidden_states, temb, generator, causal=causal
+            )
 
             for up_block in self.up_blocks:
-                hidden_states = up_block(hidden_states, temb, causal=causal)
+                hidden_states = up_block(hidden_states, temb, generator, causal=causal)
 
         hidden_states = self.norm_out(hidden_states)
 
@@ -1253,7 +1257,10 @@ class LTX23VideoDecoder3d(nn.Module):
         self.patch_size_t = patch_size_t
         self.out_channels = out_channels * patch_size**2
         self.is_causal = is_causal
+        self.timestep_conditioning = timestep_conditioning
         self.per_channel_statistics = LTX23PerChannelStatistics(in_channels)
+        self.decode_noise_scale = 0.025
+        self.decode_timestep = 0.05
 
         feature_channels = base_channels * 8
         self.conv_in = LTX2VideoCausalConv3d(
@@ -1310,20 +1317,44 @@ class LTX23VideoDecoder3d(nn.Module):
         hidden_states: torch.Tensor,
         temb: Optional[torch.Tensor] = None,
         causal: Optional[bool] = None,
+        generator: Optional[torch.Generator] = None,
     ) -> torch.Tensor:
         causal = self.is_causal if causal is None else causal
+        batch_size = hidden_states.shape[0]
+
+        if self.timestep_conditioning:
+            noise = (
+                torch.randn(
+                    hidden_states.size(),
+                    generator=generator,
+                    dtype=hidden_states.dtype,
+                    device=hidden_states.device,
+                )
+                * self.decode_noise_scale
+            )
+            hidden_states = noise + (1.0 - self.decode_noise_scale) * hidden_states
 
         hidden_states = self.per_channel_statistics.un_normalize(hidden_states)
+
+        if temb is None and self.timestep_conditioning:
+            temb = torch.full(
+                (batch_size,),
+                self.decode_timestep,
+                device=hidden_states.device,
+                dtype=hidden_states.dtype,
+            )
         hidden_states = self.conv_in(hidden_states, causal=causal)
 
-        if self.timestep_scale_multiplier is not None and temb is not None:
+        if self.timestep_scale_multiplier is not None:
             temb = temb * self.timestep_scale_multiplier
 
         for up_block in self.up_blocks:
             if isinstance(up_block, LTX23VideoMidBlock3d):
-                hidden_states = up_block(hidden_states, temb, causal=causal)
+                hidden_states = up_block(
+                    hidden_states, temb, generator, causal=causal
+                )
             elif isinstance(up_block, LTX2VideoResnetBlock3d):
-                hidden_states = up_block(hidden_states, None, causal=causal)
+                hidden_states = up_block(hidden_states, None, generator, causal=causal)
             else:
                 hidden_states = up_block(hidden_states, causal=causal)
 
@@ -1334,10 +1365,10 @@ class LTX23VideoDecoder3d(nn.Module):
                 timestep=temb.flatten(),
                 resolution=None,
                 aspect_ratio=None,
-                batch_size=hidden_states.size(0),
+                batch_size=batch_size,
                 hidden_dtype=hidden_states.dtype,
             )
-            temb = temb.view(hidden_states.size(0), -1, 1, 1, 1).unflatten(1, (2, -1))
+            temb = temb.view(batch_size, -1, 1, 1, 1).unflatten(1, (2, -1))
             temb = temb + self.scale_shift_table[None, ..., None, None, None]
             shift, scale = temb.unbind(dim=1)
             hidden_states = hidden_states * (1 + scale) + shift
@@ -1610,6 +1641,7 @@ class AutoencoderKLLTX2Video(ParallelTiledVAE):
         z: torch.Tensor,
         temb: Optional[torch.Tensor] = None,
         causal: Optional[bool] = None,
+        generator: Optional[torch.Generator] = None,
         return_dict: bool = True,
     ) -> Union[DecoderOutput, torch.Tensor]:
         batch_size, num_channels, num_frames, height, width = z.shape
@@ -1625,15 +1657,25 @@ class AutoencoderKLLTX2Video(ParallelTiledVAE):
 
         if self.use_framewise_decoding and num_frames > tile_latent_min_num_frames:
             return self._temporal_tiled_decode(
-                z, temb, causal=causal, return_dict=return_dict
+                z,
+                temb,
+                causal=causal,
+                generator=generator,
+                return_dict=return_dict,
             )
 
         if self.use_tiling and (
             width > tile_latent_min_width or height > tile_latent_min_height
         ):
-            return self.tiled_decode(z, temb, causal=causal, return_dict=return_dict)
+            return self.tiled_decode(
+                z,
+                temb,
+                causal=causal,
+                generator=generator,
+                return_dict=return_dict,
+            )
 
-        dec = self.decoder(z, temb, causal=causal)
+        dec = self.decoder(z, temb, causal=causal, generator=generator)
 
         if not return_dict:
             return (dec,)
@@ -1645,6 +1687,7 @@ class AutoencoderKLLTX2Video(ParallelTiledVAE):
         z: torch.Tensor,
         temb: Optional[torch.Tensor] = None,
         causal: Optional[bool] = None,
+        generator: Optional[torch.Generator] = None,
         return_dict: bool = True,
     ) -> Union[DecoderOutput, torch.Tensor]:
         """
@@ -1663,17 +1706,19 @@ class AutoencoderKLLTX2Video(ParallelTiledVAE):
         if self.use_slicing and z.shape[0] > 1:
             if temb is not None:
                 decoded_slices = [
-                    self._decode(z_slice, t_slice, causal=causal).sample
+                    self._decode(
+                        z_slice, t_slice, causal=causal, generator=generator
+                    ).sample
                     for z_slice, t_slice in (z.split(1), temb.split(1))
                 ]
             else:
                 decoded_slices = [
-                    self._decode(z_slice, causal=causal).sample
+                    self._decode(z_slice, causal=causal, generator=generator).sample
                     for z_slice in z.split(1)
                 ]
             decoded = torch.cat(decoded_slices)
         else:
-            decoded = self._decode(z, temb, causal=causal).sample
+            decoded = self._decode(z, temb, causal=causal, generator=generator).sample
 
         if not return_dict:
             return (decoded,)
@@ -1785,6 +1830,7 @@ class AutoencoderKLLTX2Video(ParallelTiledVAE):
         z: torch.Tensor,
         temb: Optional[torch.Tensor],
         causal: Optional[bool] = None,
+        generator: Optional[torch.Generator] = None,
         return_dict: bool = True,
     ) -> Union[DecoderOutput, torch.Tensor]:
         r"""
@@ -1837,6 +1883,7 @@ class AutoencoderKLLTX2Video(ParallelTiledVAE):
                     ],
                     temb,
                     causal=causal,
+                    generator=generator,
                 )
 
                 row.append(time)
@@ -1914,6 +1961,7 @@ class AutoencoderKLLTX2Video(ParallelTiledVAE):
         z: torch.Tensor,
         temb: Optional[torch.Tensor],
         causal: Optional[bool] = None,
+        generator: Optional[torch.Generator] = None,
         return_dict: bool = True,
     ) -> Union[DecoderOutput, torch.Tensor]:
         batch_size, num_channels, num_frames, height, width = z.shape
@@ -1943,10 +1991,14 @@ class AutoencoderKLLTX2Video(ParallelTiledVAE):
                 or tile.shape[-2] > tile_latent_min_height
             ):
                 decoded = self.tiled_decode(
-                    tile, temb, causal=causal, return_dict=True
+                    tile,
+                    temb,
+                    causal=causal,
+                    generator=generator,
+                    return_dict=True,
                 ).sample
             else:
-                decoded = self.decoder(tile, temb, causal=causal)
+                decoded = self.decoder(tile, temb, causal=causal, generator=generator)
             if i > 0:
                 decoded = decoded[:, :, :-1, :, :]
             row.append(decoded)
@@ -1984,7 +2036,7 @@ class AutoencoderKLLTX2Video(ParallelTiledVAE):
             z = posterior.sample(generator=generator)
         else:
             z = posterior.mode()
-        dec = self.decode(z, temb, causal=decoder_causal)
+        dec = self.decode(z, temb, causal=decoder_causal, generator=generator)
         if not return_dict:
             return (dec.sample,)
         return dec

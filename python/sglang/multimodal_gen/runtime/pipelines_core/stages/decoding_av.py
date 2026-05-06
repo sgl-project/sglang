@@ -73,7 +73,10 @@ class LTX2AVDecodingStage(DecodingStage):
                         self.vae.enable_tiling()
                 except Exception:
                     pass
-                decode_output = self.vae.decode(latents)
+                decode_generator = batch.extra.get("ltx2_decode_generator")
+                if not isinstance(decode_generator, torch.Generator):
+                    decode_generator = None
+                decode_output = self.vae.decode(latents, generator=decode_generator)
                 if isinstance(decode_output, tuple):
                     video = decode_output[0]
                 elif hasattr(decode_output, "sample"):

@@ -328,6 +328,8 @@ class LTX2RefinementStage(LTX2AVDenoisingStage):
                     audio_noise * audio_scaled_mask
                     + batch.audio_latents * (1 - audio_scaled_mask)
                 ).to(batch.audio_latents.dtype)
+        if is_ltx23:
+            batch.extra["ltx2_decode_generator"] = renoise_generator
         if not is_ltx23:
             batch.latents = batch.latents.to(
                 device=batch.latents.device, dtype=torch.float32
