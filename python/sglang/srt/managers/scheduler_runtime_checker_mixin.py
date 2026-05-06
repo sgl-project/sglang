@@ -124,8 +124,14 @@ class PoolStats:
         stats.full_token_usage = self.full_token_usage
         if self.is_hybrid_swa:
             stats.swa_token_usage = self.swa_token_usage
+            stats.swa_available_tokens = self.swa_available_size
+            stats.swa_evictable_tokens = self.swa_evictable_size
+            stats.swa_used_tokens = self.swa_num_used
         if self.is_hybrid_ssm:
             stats.mamba_usage = self.mamba_usage
+            stats.mamba_available_tokens = self.mamba_available_size
+            stats.mamba_evictable_tokens = self.mamba_evictable_size
+            stats.mamba_used_tokens = self.mamba_num_used
         stats.kv_available_tokens = self.full_available_size
         stats.kv_evictable_tokens = self.full_evictable_size
         stats.kv_used_tokens = self.full_num_used
@@ -512,7 +518,7 @@ class SchedulerRuntimeCheckerMixin:
         )
         self.stats.num_grammar_queue_reqs = len(self.grammar_manager)
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
-            self.stats.num_prefill_prealloc_queue_reqs = QueueCount.from_reqs(
+            self.stats.num_prefill_bootstrap_queue_reqs = QueueCount.from_reqs(
                 self.disagg_prefill_bootstrap_queue.queue, priority_enabled
             )
             self.stats.num_prefill_inflight_queue_reqs = QueueCount.from_reqs(
