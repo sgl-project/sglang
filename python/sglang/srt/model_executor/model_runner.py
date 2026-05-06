@@ -3113,6 +3113,29 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     "RelayKV runtime req_to_token payload production hook failed",
                     exc_info=True,
                 )
+        if os.getenv("SGLANG_RELAYKV_REAL_REQ_TO_TOKEN_POOL_BOUNDED_READ") == "1":
+            try:
+                import json
+
+                from sglang.srt.relaykv.metrics import (
+                    run_model_runner_real_req_to_token_pool_bounded_read_hook_for_smoke,
+                )
+
+                inspection_result = (
+                    run_model_runner_real_req_to_token_pool_bounded_read_hook_for_smoke(
+                        self,
+                        forward_batch=forward_batch,
+                    )
+                )
+                logger.info(
+                    "relaykv_real_req_to_token_pool_bounded_read_summary=%s",
+                    json.dumps(inspection_result["summary"], sort_keys=True, default=str),
+                )
+            except Exception:
+                logger.debug(
+                    "RelayKV real req_to_token_pool bounded read hook failed",
+                    exc_info=True,
+                )
         if os.getenv("SGLANG_RELAYKV_TOKEN_TO_KV_POOL_INDEX_READ") == "1":
             try:
                 import json

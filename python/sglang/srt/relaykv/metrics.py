@@ -8559,6 +8559,184 @@ def build_relaykv_req_to_token_resolution_payloads_from_real_pool_read_for_smoke
     return payloads
 
 
+def _relaykv_real_req_to_token_pool_source_for_smoke(
+    *,
+    forward_batch: Any = None,
+    model_runner: Any = None,
+) -> tuple[Any, str | None]:
+    for owner, owner_name in (
+        (model_runner, "model_runner"),
+        (forward_batch, "forward_batch"),
+    ):
+        if owner is None:
+            continue
+        try:
+            direct_value = getattr(owner, "req_to_token_pool", None)
+        except Exception:
+            direct_value = None
+        if direct_value is not None:
+            try:
+                nested_value = getattr(direct_value, "req_to_token", None)
+            except Exception:
+                nested_value = None
+            if nested_value is not None:
+                return nested_value, f"{owner_name}.req_to_token_pool.req_to_token"
+            return direct_value, f"{owner_name}.req_to_token_pool"
+    return None, None
+
+
+def run_model_runner_real_req_to_token_pool_bounded_read_hook_for_smoke(
+    model_runner: Any,
+    forward_batch: Any = None,
+) -> dict[str, Any]:
+    """Run a smoke-only bounded real req_to_token_pool read hook."""
+
+    runtime_observation_payloads, runtime_observation_source_path = (
+        _relaykv_runtime_req_to_token_payload_source_for_smoke(
+            forward_batch=forward_batch,
+            model_runner=model_runner,
+        )
+    )
+    runtime_observation_source_bridge_state = "not_attempted"
+    runtime_observation_source_bridge_payload_count = 0
+    runtime_observation_source_bridge_valid_count = 0
+    runtime_observation_source_bridge_source_path = None
+    runtime_observation_source_bridge_blocked_reason = None
+
+    if runtime_observation_payloads is None:
+        runtime_observation_bridge_results = (
+            build_relaykv_runtime_observation_metadata_source_bridge_payloads_for_smoke(
+                forward_batch=forward_batch,
+                model_runner=model_runner,
+                bridge_enabled=True,
+            )
+        )
+        runtime_observation_bridge_summary = (
+            summarize_relaykv_runtime_observation_metadata_source_bridge_payloads_for_smoke(
+                runtime_observation_bridge_results
+            )
+        )
+        runtime_observation_source_bridge_state = str(
+            runtime_observation_bridge_summary.get("bridge_state") or "blocked"
+        )
+        runtime_observation_source_bridge_payload_count = int(
+            runtime_observation_bridge_summary.get("payload_count") or 0
+        )
+        runtime_observation_source_bridge_valid_count = int(
+            runtime_observation_bridge_summary.get("valid_payload_count") or 0
+        )
+        runtime_observation_source_bridge_source_path = (
+            runtime_observation_bridge_summary.get("bridge_source_path")
+        )
+        runtime_observation_source_bridge_blocked_reason = (
+            runtime_observation_bridge_summary.get("blocked_reason")
+        )
+        if runtime_observation_bridge_results:
+            first_result = runtime_observation_bridge_results[0]
+            if isinstance(first_result, Mapping):
+                bridged_payloads = first_result.get("runtime_observation_payloads")
+                if (
+                    runtime_observation_source_bridge_state == "bridged"
+                    and isinstance(bridged_payloads, list)
+                    and bridged_payloads
+                ):
+                    runtime_observation_payloads = bridged_payloads
+                    runtime_observation_source_path = (
+                        runtime_observation_source_bridge_source_path
+                    )
+    else:
+        runtime_observation_source_bridge_state = "not_needed"
+
+    req_to_token_pool_object, req_to_token_pool_source_path = (
+        _relaykv_real_req_to_token_pool_source_for_smoke(
+            forward_batch=forward_batch,
+            model_runner=model_runner,
+        )
+    )
+    read_results = build_relaykv_real_req_to_token_pool_bounded_read_results_for_smoke(
+        runtime_observation_payloads=runtime_observation_payloads,
+        req_to_token_pool_object=req_to_token_pool_object,
+        read_req_to_token_pool=True,
+        max_tokens_per_request=256,
+        max_total_tokens=1024,
+        source_path=req_to_token_pool_source_path,
+    )
+    summary = summarize_relaykv_real_req_to_token_pool_bounded_read_results_for_smoke(
+        read_results,
+        read_enabled=True,
+        max_tokens_per_request=256,
+        max_total_tokens=1024,
+    )
+
+    payloads = build_relaykv_req_to_token_resolution_payloads_from_real_pool_read_for_smoke(
+        read_results
+    )
+    resolved_payloads = [
+        payload
+        for payload in payloads
+        if isinstance(payload, Mapping)
+        and payload.get("resolution_state") == "req_to_token_resolved"
+    ]
+
+    req_to_token_payload_attached = False
+    req_to_token_payload_attach_target = None
+    relaykv_payload_attr_write_count = 0
+    if resolved_payloads:
+        for owner, target in (
+            (forward_batch, "forward_batch.relaykv_req_to_token_resolution_payloads"),
+            (model_runner, "model_runner.relaykv_req_to_token_resolution_payloads"),
+        ):
+            if owner is None:
+                continue
+            try:
+                setattr(owner, "relaykv_req_to_token_resolution_payloads", payloads)
+            except Exception:
+                continue
+            req_to_token_payload_attached = True
+            req_to_token_payload_attach_target = target
+            relaykv_payload_attr_write_count = len(payloads)
+            break
+
+    blocked_reason = None
+    for result in read_results:
+        if isinstance(result, Mapping):
+            blocked_reason = result.get("blocked_reason")
+            if blocked_reason is not None:
+                break
+
+    summary["hook_enabled"] = True
+    summary["req_to_token_pool_source_path"] = req_to_token_pool_source_path
+    summary["runtime_observation_payload_source_path"] = (
+        runtime_observation_source_path
+    )
+    summary["runtime_observation_source_bridge_state"] = (
+        runtime_observation_source_bridge_state
+    )
+    summary["runtime_observation_source_bridge_payload_count"] = (
+        runtime_observation_source_bridge_payload_count
+    )
+    summary["runtime_observation_source_bridge_valid_count"] = (
+        runtime_observation_source_bridge_valid_count
+    )
+    summary["runtime_observation_source_bridge_source_path"] = (
+        runtime_observation_source_bridge_source_path
+    )
+    summary["runtime_observation_source_bridge_blocked_reason"] = (
+        runtime_observation_source_bridge_blocked_reason
+    )
+    summary["req_to_token_payload_attached"] = req_to_token_payload_attached
+    summary["req_to_token_payload_attach_target"] = req_to_token_payload_attach_target
+    summary["relaykv_payload_attr_write_count"] = relaykv_payload_attr_write_count
+    summary["payload_count"] = len(payloads)
+    summary["blocked_reason"] = blocked_reason
+
+    return {
+        "read_results": read_results,
+        "payloads": payloads,
+        "summary": summary,
+    }
+
+
 def _relaykv_runtime_kv_index_resolution_plans_for_smoke(
     *,
     forward_batch: Any = None,
