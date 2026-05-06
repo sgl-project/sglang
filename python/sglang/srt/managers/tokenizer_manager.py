@@ -1932,6 +1932,26 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerScoreMixin):
                 meta_info["spec_draft_token_num"] = total_draft_tokens
                 meta_info["spec_verify_ct"] = recv_obj.spec_verify_ct[i]
 
+            if (
+                hasattr(recv_obj, "spec_valid_draft_tokens")
+                and len(recv_obj.spec_valid_draft_tokens) > i
+                and hasattr(recv_obj, "spec_valid_accepted_tokens")
+                and len(recv_obj.spec_valid_accepted_tokens) > i
+            ):
+                valid_draft_tokens = recv_obj.spec_valid_draft_tokens[i]
+                valid_accepted_tokens = recv_obj.spec_valid_accepted_tokens[i]
+                if (
+                    valid_draft_tokens is not None
+                    and valid_accepted_tokens is not None
+                ):
+                    meta_info["spec_valid_draft_token_num"] = valid_draft_tokens
+                    meta_info["spec_valid_accept_token_num"] = valid_accepted_tokens
+                    meta_info["spec_valid_accept_rate"] = (
+                        valid_accepted_tokens / valid_draft_tokens
+                        if valid_draft_tokens > 0
+                        else 0
+                    )
+
             # Acceptance histogram: tracks how many decoding steps accepted a certain number of draft tokens.
             if (
                 recv_obj.spec_acceptance_histogram

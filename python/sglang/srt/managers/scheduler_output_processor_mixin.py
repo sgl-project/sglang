@@ -1223,6 +1223,7 @@ class SchedulerOutputProcessorMixin:
                     verified_ids.append(int(item))
 
         offset = 0
+        valid_draft_metric_updates: list[tuple[Req, int, int]] = []
         for req, accept_len in zip(batch.reqs, accept_lens):
             accept_len = int(accept_len)
             segment_len = accept_len + 1
@@ -1269,12 +1270,16 @@ class SchedulerOutputProcessorMixin:
                     f"accepted_draft_tokens={accepted_draft_tokens} "
                     f"draft_snapshot_prefix={expected_draft_tokens}"
                 )
+            valid_draft_metric_updates.append((req, len(draft_buffer), accept_len))
 
         if offset != len(verified_ids):
             raise RuntimeError(
                 "Decoupled verify returned extra verified ids: "
                 f"consumed={offset} total={len(verified_ids)}"
             )
+        for req, valid_draft_tokens, valid_accepted_tokens in valid_draft_metric_updates:
+            req.spec_valid_draft_tokens += valid_draft_tokens
+            req.spec_valid_accepted_tokens += valid_accepted_tokens
 
     def process_batch_result_idle(
         self: Scheduler,
@@ -1921,6 +1926,8 @@ class SchedulerOutputProcessorMixin:
         cached_tokens_details = []  # Detailed breakdown by cache source
         spec_verify_ct = []
         spec_accepted_tokens = []
+        spec_valid_draft_tokens = []
+        spec_valid_accepted_tokens = []
         spec_acceptance_histogram = []
         retraction_counts = []
         output_hidden_states = None
@@ -2031,6 +2038,11 @@ class SchedulerOutputProcessorMixin:
                     spec_verify_ct.append(req.spec_verify_ct)
                     spec_accepted_tokens.append(req.spec_accepted_tokens)
                     spec_acceptance_histogram.append(req.spec_acceptance_histogram)
+                    if self.spec_algorithm.is_decoupled_verify():
+                        spec_valid_draft_tokens.append(req.spec_valid_draft_tokens)
+                        spec_valid_accepted_tokens.append(
+                            req.spec_valid_accepted_tokens
+                        )
 
                 if return_logprob:
                     if (
@@ -2135,6 +2147,8 @@ class SchedulerOutputProcessorMixin:
                     http_worker_ipcs=http_worker_ipcs,
                     spec_verify_ct=spec_verify_ct,
                     spec_accepted_tokens=spec_accepted_tokens,
+                    spec_valid_draft_tokens=spec_valid_draft_tokens,
+                    spec_valid_accepted_tokens=spec_valid_accepted_tokens,
                     spec_acceptance_histogram=spec_acceptance_histogram,
                     time_stats=time_stats,
                     finished_reasons=finished_reasons,

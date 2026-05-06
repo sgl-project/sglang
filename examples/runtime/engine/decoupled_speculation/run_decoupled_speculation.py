@@ -131,6 +131,9 @@ class ModeMetrics:
     per_request: list[dict[str, Any]]
     avg_spec_accept_length: float | None = None
     avg_spec_accept_rate: float | None = None
+    avg_spec_valid_accept_rate: float | None = None
+    total_spec_valid_draft_token_num: int = 0
+    total_spec_valid_accept_token_num: int = 0
 
 
 def parse_args() -> argparse.Namespace:
@@ -351,6 +354,16 @@ def parse_args() -> argparse.Namespace:
         "--decoupled-spec-trace-dir",
         default=None,
         help="Directory for decoupled speculative decoding CSV trace files.",
+    )
+    parser.add_argument(
+        "--decoupled-spec-allow-partial",
+        type=str_to_bool,
+        default=True,
+        help=(
+            "Whether the verifier may snapshot currently available partial draft "
+            "tails. Set to false to block until every request in the verifier "
+            "batch has enough draft tokens."
+        ),
     )
     return parser.parse_args()
 
@@ -907,10 +920,14 @@ def validate_resources(args: argparse.Namespace) -> tuple[int, int]:
     return target_nnodes, target_gpus_per_node
 
 
-def _get_drafter_debug_env_vars(
+def _get_decoupled_spec_actor_env_vars(
     args: argparse.Namespace | None = None,
 ) -> dict[str, str]:
     env_vars: dict[str, str] = {}
+    if args is not None:
+        env_vars["SGLANG_DECOUPLED_SPEC_ALLOW_PARTIAL"] = (
+            "1" if args.decoupled_spec_allow_partial else "0"
+        )
     for env_name in (
         "SGLANG_DECOUPLED_SPEC_DEBUG",
         "SGLANG_DECOUPLED_SPEC_TRACE_DIR",
@@ -929,15 +946,15 @@ def launch_draft_actors(
 ) -> tuple[list[Any], list[str]]:
     actors = []
     control_endpoints = []
-    debug_env_vars = _get_drafter_debug_env_vars(args)
+    actor_env_vars = _get_decoupled_spec_actor_env_vars(args)
     for replica_index in range(args.num_draft_replicas):
         actor_options: dict[str, Any] = dict(
             num_gpus=args.draft_tp_size,
             num_cpus=1,
             max_concurrency=128,
         )
-        if debug_env_vars:
-            actor_options["runtime_env"] = {"env_vars": debug_env_vars}
+        if actor_env_vars:
+            actor_options["runtime_env"] = {"env_vars": actor_env_vars}
         actor = DraftActor.options(**actor_options).remote(
             model_path=args.draft_model_path,
             tp_size=args.draft_tp_size,
@@ -975,7 +992,7 @@ def launch_target_actors(
     control_endpoints: list[str] | None = None,
     result_endpoints: list[str] | None = None,
 ) -> list[Any]:
-    debug_env_vars = _get_drafter_debug_env_vars(args)
+    actor_env_vars = _get_decoupled_spec_actor_env_vars(args)
     actors = []
     for node_rank in range(target_nnodes):
         scheduling_strategy = PlacementGroupSchedulingStrategy(
@@ -987,8 +1004,8 @@ def launch_target_actors(
             num_cpus=1,
             scheduling_strategy=scheduling_strategy,
         )
-        if debug_env_vars:
-            actor_options["runtime_env"] = {"env_vars": debug_env_vars}
+        if actor_env_vars:
+            actor_options["runtime_env"] = {"env_vars": actor_env_vars}
         actor = TargetActor.options(**actor_options).remote(
             mode=mode,
             model_path=args.target_model_path,
@@ -1036,6 +1053,25 @@ def _float_or_none(value: Any) -> float | None:
         return None
 
 
+def _get_valid_draft_acceptance_stats(
+    meta_info: dict[str, Any],
+) -> tuple[int, int, float | None]:
+    valid_draft_tokens = meta_info.get("spec_valid_draft_token_num")
+    valid_accepted_tokens = meta_info.get("spec_valid_accept_token_num")
+    if valid_draft_tokens is None or valid_accepted_tokens is None:
+        return 0, 0, None
+
+    valid_draft_tokens = int(valid_draft_tokens)
+    valid_accepted_tokens = int(valid_accepted_tokens)
+    if valid_draft_tokens <= 0:
+        return valid_draft_tokens, valid_accepted_tokens, None
+
+    valid_accept_rate = _float_or_none(meta_info.get("spec_valid_accept_rate"))
+    if valid_accept_rate is None:
+        valid_accept_rate = valid_accepted_tokens / valid_draft_tokens
+    return valid_draft_tokens, valid_accepted_tokens, valid_accept_rate
+
+
 def collect_mode_metrics(
     *,
     mode: str,
@@ -1051,6 +1087,8 @@ def collect_mode_metrics(
     total_generated_tokens = 0
     total_accepted_tokens = 0
     total_draft_tokens = 0
+    total_valid_draft_tokens = 0
+    total_valid_accepted_tokens = 0
     total_verify_ct = 0
     per_request = []
     for index, (sample, output) in enumerate(zip(prompt_samples, outputs, strict=True)):
@@ -1066,8 +1104,15 @@ def collect_mode_metrics(
             draft_tokens,
             verify_ct,
         ) = _get_real_verify_acceptance_stats(meta_info)
+        (
+            valid_draft_tokens,
+            valid_accepted_tokens,
+            valid_accept_rate,
+        ) = _get_valid_draft_acceptance_stats(meta_info)
         total_accepted_tokens += accepted_tokens
         total_draft_tokens += draft_tokens
+        total_valid_draft_tokens += valid_draft_tokens
+        total_valid_accepted_tokens += valid_accepted_tokens
         total_verify_ct += verify_ct
         output_text = output.get("text", "")
         finish_reason = meta_info.get("finish_reason")
@@ -1090,6 +1135,9 @@ def collect_mode_metrics(
             "spec_accept_rate": accept_rate,
             "spec_accept_token_num": accepted_tokens or None,
             "spec_draft_token_num": draft_tokens or None,
+            "spec_valid_accept_rate": valid_accept_rate,
+            "spec_valid_accept_token_num": valid_accepted_tokens or None,
+            "spec_valid_draft_token_num": valid_draft_tokens or None,
             "spec_verify_ct": verify_ct or None,
             "finish_reason": finish_reason,
             "output_text_preview": (
@@ -1118,6 +1166,11 @@ def collect_mode_metrics(
     avg_accept_rate = (
         total_accepted_tokens / total_draft_tokens if total_draft_tokens > 0 else None
     )
+    avg_valid_accept_rate = (
+        total_valid_accepted_tokens / total_valid_draft_tokens
+        if total_valid_draft_tokens > 0
+        else None
+    )
     return ModeMetrics(
         mode=mode,
         generation_time_s=generation_time_s,
@@ -1126,6 +1179,9 @@ def collect_mode_metrics(
         per_request=per_request,
         avg_spec_accept_length=avg_accept_length,
         avg_spec_accept_rate=avg_accept_rate,
+        avg_spec_valid_accept_rate=avg_valid_accept_rate,
+        total_spec_valid_draft_token_num=total_valid_draft_tokens,
+        total_spec_valid_accept_token_num=total_valid_accepted_tokens,
     )
 
 
@@ -1225,6 +1281,7 @@ def build_result(
             "skip_decode": args.skip_decode,
             "show_responses": args.show_responses,
             "decoupled_spec_trace_dir": args.decoupled_spec_trace_dir,
+            "decoupled_spec_allow_partial": args.decoupled_spec_allow_partial,
         },
         "dataset": {
             "total_rows": total_rows,
@@ -1277,7 +1334,15 @@ def _csv_fieldnames_for_mode(mode_key: str) -> list[str]:
         "duration",
     ]
     if mode_key == "decoupled_spec":
-        fieldnames.extend(["spec_accept_length", "spec_accept_rate"])
+        fieldnames.extend(
+            [
+                "spec_accept_length",
+                "spec_accept_rate",
+                "spec_valid_accept_rate",
+                "spec_valid_accept_token_num",
+                "spec_valid_draft_token_num",
+            ]
+        )
     return fieldnames
 
 
@@ -1288,6 +1353,11 @@ def _csv_output_record(mode_key: str, item: dict[str, Any]) -> dict[str, Any]:
             {
                 "spec_accept_length": item["spec_accept_length"],
                 "spec_accept_rate": item["spec_accept_rate"],
+                "spec_valid_accept_rate": item["spec_valid_accept_rate"],
+                "spec_valid_accept_token_num": item[
+                    "spec_valid_accept_token_num"
+                ],
+                "spec_valid_draft_token_num": item["spec_valid_draft_token_num"],
             }
         )
     return record
@@ -1314,6 +1384,22 @@ def write_output_files(result: dict[str, Any], output_dir: str) -> list[Path]:
         requests = []
         for item in mode_items:
             record = _request_output_record(item)
+            if mode_key == "decoupled_spec":
+                record.update(
+                    {
+                        "spec_accept_length": item["spec_accept_length"],
+                        "spec_accept_rate": item["spec_accept_rate"],
+                        "spec_valid_accept_rate": item[
+                            "spec_valid_accept_rate"
+                        ],
+                        "spec_valid_accept_token_num": item[
+                            "spec_valid_accept_token_num"
+                        ],
+                        "spec_valid_draft_token_num": item[
+                            "spec_valid_draft_token_num"
+                        ],
+                    }
+                )
             record.update(
                 {
                     "prompt": item.get("prompt_text", ""),
@@ -1366,7 +1452,10 @@ def print_summary(result: dict[str, Any]) -> None:
         f"generated_tokens={spec['total_generated_tokens']}, "
         f"output_throughput={spec['output_throughput_tok_per_s']:.3f} tok/s, "
         f"avg_spec_accept_length={spec['avg_spec_accept_length']}, "
-        f"avg_spec_accept_rate={spec['avg_spec_accept_rate']}"
+        f"avg_spec_accept_rate={spec['avg_spec_accept_rate']}, "
+        f"avg_spec_valid_accept_rate={spec['avg_spec_valid_accept_rate']}, "
+        f"valid_accept_tokens={spec['total_spec_valid_accept_token_num']}, "
+        f"valid_draft_tokens={spec['total_spec_valid_draft_token_num']}"
     )
     if decode is not None:
         print(
@@ -1391,6 +1480,9 @@ def print_summary(result: dict[str, Any]) -> None:
             f"request_latency_s={item['request_latency_s']}, "
             f"spec_accept_length={item['spec_accept_length']}, "
             f"spec_accept_rate={item['spec_accept_rate']}, "
+            f"spec_valid_accept_rate={item['spec_valid_accept_rate']}, "
+            f"spec_valid_accept_token_num={item['spec_valid_accept_token_num']}, "
+            f"spec_valid_draft_token_num={item['spec_valid_draft_token_num']}, "
             f"spec_verify_ct={item['spec_verify_ct']}"
         )
     if result["config"].get("show_responses"):

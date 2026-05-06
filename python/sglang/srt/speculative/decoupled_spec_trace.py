@@ -204,6 +204,30 @@ TRACE_EVENT_SCHEMAS: dict[tuple[str, str], list[str]] = {
         "num_stream_outputs",
         "emitted_token_lens_by_req",
     ),
+    ("draft_adapter", "drain_outgoing_results"): _fields(
+        "drafter_rank",
+        "queue_size_before",
+        "queue_size_after",
+        "num_result_batches",
+        "num_stream_outputs",
+    ),
+    ("draft_adapter", "drain_control_socket"): _fields(
+        "drafter_rank",
+        "pending_controls_before",
+        "pending_controls_after",
+        "num_control_batches",
+        "num_control_messages",
+    ),
+    ("draft_adapter", "idle_wait"): _fields(
+        "drafter_rank",
+        "wait_timeout_ms",
+        "wakeup_set_before_wait",
+        "wakeup_set_after_wait",
+        "queue_size_before_wait",
+        "queue_size_after_wait",
+        "pending_controls_before_wait",
+        "pending_controls_after_wait",
+    ),
 }
 
 
@@ -283,7 +307,6 @@ class DecoupledSpecCsvTracer:
         for key, value in event.row.items():
             row[key] = self._serialize_value(value)
         writer.writerow(row)
-        self._files[(event.component, op)].flush()
 
     def _flush_files(self) -> None:
         for file in self._files.values():

@@ -60,11 +60,15 @@ class DraftTailBuffer:
         self.required_tail_len = max(0, int(required_tail_len))
         self.enable_debug_prints = bool(enable_debug_prints)
         self._lock = threading.Lock()
+        self._condition = threading.Condition(self._lock)
+        self._closed = False
         self._states: dict[str, RequestDraftTailState] = {}
 
     def close(self) -> None:
-        with self._lock:
+        with self._condition:
+            self._closed = True
             self._states.clear()
+            self._condition.notify_all()
 
     def has_request(self, request_id: str) -> bool:
         with self._lock:
@@ -80,9 +84,10 @@ class DraftTailBuffer:
     def open_requests(self, messages: list[DraftSync]) -> None:
         if not messages:
             return
-        with self._lock:
+        with self._condition:
             for message in messages:
                 self._open_request_locked(message)
+            self._condition.notify_all()
 
     def _open_request_locked(self, message: DraftSync) -> None:
         committed_len = len(message.committed_output_ids)
@@ -95,9 +100,10 @@ class DraftTailBuffer:
     def apply_verify_commits(self, messages: list[VerifyCommit]) -> None:
         if not messages:
             return
-        with self._lock:
+        with self._condition:
             for message in messages:
                 self._apply_commit_locked(message)
+            self._condition.notify_all()
 
     def _apply_commit_locked(self, message: VerifyCommit) -> dict | None:
         state = self._states.get(message.request_id)
@@ -189,9 +195,10 @@ class DraftTailBuffer:
     def close_requests(self, messages: list[DraftClose]) -> None:
         if not messages:
             return
-        with self._lock:
+        with self._condition:
             for message in messages:
                 self._close_request_locked(message)
+            self._condition.notify_all()
 
     def _close_request_locked(self, message: DraftClose) -> None:
         self._states.pop(message.request_id, None)
@@ -203,7 +210,7 @@ class DraftTailBuffer:
         collect_stats: bool = False,
     ) -> dict | None:
         commit_stats: list[dict] = []
-        with self._lock:
+        with self._condition:
             for message in iter_control_batch_messages(batch):
                 if isinstance(message, DraftSync):
                     self._open_request_locked(message)
@@ -213,6 +220,7 @@ class DraftTailBuffer:
                         commit_stats.append(commit_stat)
                 elif isinstance(message, DraftClose):
                     self._close_request_locked(message)
+            self._condition.notify_all()
         if not collect_stats:
             return None
         return {
@@ -253,13 +261,14 @@ class DraftTailBuffer:
         if not batch.outputs:
             return None
         append_stats = self._new_append_stats(batch) if collect_stats else None
-        with self._lock:
+        with self._condition:
             for output in batch.outputs:
                 result = self._push_one_locked(batch, output)
                 if append_stats is not None:
                     self._record_append_result_locked(append_stats, output, result)
             if append_stats is not None:
                 self._fill_append_after_lens_locked(append_stats)
+            self._condition.notify_all()
         return append_stats
 
     def _push_one_locked(
@@ -475,6 +484,14 @@ class DraftTailBuffer:
         append_stats["committed_lens_after_by_req"] = committed_lens_after_by_req
         append_stats.pop("_index_by_request_id", None)
 
+    def _has_required_tail_tokens_locked(self, reqs: list) -> bool:
+        for req in reqs:
+            state = self._states.get(req.rid)
+            assert state, f"unexpected request_id={req.rid}"
+            if state.consumable_tail_len() < self.required_tail_len:
+                return False
+        return True
+
     def get_draft_snapshots(
         self,
         reqs: list,
@@ -482,16 +499,22 @@ class DraftTailBuffer:
         allow_partial: bool = True,
         include_raw_tail_tokens: bool = False,
     ) -> list[DraftTailSnapshot]:
-        with self._lock:
+        with self._condition:
+            if not allow_partial:
+                while (
+                    not self._closed
+                    and not self._has_required_tail_tokens_locked(reqs)
+                ):
+                    self._condition.wait()
+                if self._closed:
+                    raise RuntimeError(
+                        "DraftTailBuffer closed while waiting for draft tail tokens."
+                    )
+
             snapshots: list[DraftTailSnapshot] = []
             for req in reqs:
                 state = self._states.get(req.rid)
                 assert state, f"unexpected request_id={req.rid}"
-                if (
-                    not allow_partial
-                    and state.consumable_tail_len() < self.required_tail_len
-                ):
-                    raise NotImplementedError("blocking snapshot draft tokens has not been implenmented")
                 snapshots.append(
                     DraftTailSnapshot(
                         request_id=req.rid,

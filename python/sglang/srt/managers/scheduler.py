@@ -1388,7 +1388,7 @@ class Scheduler(
             assert draft_tail_buffer is not None
             local_snapshots = draft_tail_buffer.get_draft_snapshots(
                 target_reqs,
-                allow_partial=True,
+                allow_partial=envs.SGLANG_DECOUPLED_SPEC_ALLOW_PARTIAL.get(),
                 include_raw_tail_tokens=trace_enabled,
             )
 

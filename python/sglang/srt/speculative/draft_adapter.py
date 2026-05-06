@@ -25,6 +25,8 @@ from sglang.srt.utils.network import get_zmq_socket
 
 DraftControlMessage = DraftSync | VerifyCommit | DraftClose
 
+ADAPTER_IDLE_WAIT_TIMEOUT_S = 0.0005 # 0.5ms
+
 
 @dataclass
 class DraftAdapterThread:
@@ -91,13 +93,19 @@ class DraftAdapterThread:
             socket.close(linger=0)
 
     def _drain_control_socket(self) -> bool:
+        trace_enabled = getattr(getattr(self, "tracer", None), "enabled", False)
+        drain_start_ns = time.perf_counter_ns() if trace_enabled else 0
+        pending_controls_before = (
+            self._pending_controls_size() if trace_enabled else 0
+        )
+        num_control_batches = 0
+        num_control_messages = 0
         did_work = False
         if self.control_recv_socket is None:
             return did_work
 
         while True:
             try:
-                trace_enabled = getattr(getattr(self, "tracer", None), "enabled", False)
                 start_ns = time.perf_counter_ns() if trace_enabled else 0
                 message = self.control_recv_socket.recv_pyobj(zmq.NOBLOCK)
                 recv_duration_ms = (
@@ -121,6 +129,8 @@ class DraftAdapterThread:
             if int(control_batch.dst_drafter_rank) != int(self.drafter_rank):
                 continue
             control_messages = iter_control_batch_messages(control_batch)
+            num_control_batches += 1
+            num_control_messages += len(control_messages)
             if control_messages:
                 with self._pending_lock:
                     self._pending_controls.extend(control_messages)
@@ -130,6 +140,17 @@ class DraftAdapterThread:
                     control_batch,
                     duration_ms=recv_duration_ms,
                 )
+        if trace_enabled and did_work:
+            self.tracer.record(
+                "draft_adapter",
+                "drain_control_socket",
+                duration_ms=(time.perf_counter_ns() - drain_start_ns) / 1_000_000,
+                drafter_rank=int(self.drafter_rank),
+                pending_controls_before=pending_controls_before,
+                pending_controls_after=self._pending_controls_size(),
+                num_control_batches=num_control_batches,
+                num_control_messages=num_control_messages,
+            )
         return did_work
 
     def drain_sync_messages(self) -> list[DraftSync]:
@@ -193,14 +214,32 @@ class DraftAdapterThread:
             )
 
     def _drain_outgoing_results(self) -> bool:
+        trace_enabled = getattr(getattr(self, "tracer", None), "enabled", False)
+        drain_start_ns = time.perf_counter_ns() if trace_enabled else 0
+        queue_size_before = self._outgoing_results_size() if trace_enabled else 0
         did_work = False
+        num_result_batches = 0
+        num_stream_outputs = 0
         while True:
             try:
                 result_batch = self._outgoing_results.get_nowait()
             except queue.Empty:
                 break
             did_work = True
+            num_result_batches += 1
+            num_stream_outputs += len(result_batch.outputs)
             self._send_draft_results(result_batch)
+        if trace_enabled and did_work:
+            self.tracer.record(
+                "draft_adapter",
+                "drain_outgoing_results",
+                duration_ms=(time.perf_counter_ns() - drain_start_ns) / 1_000_000,
+                drafter_rank=int(self.drafter_rank),
+                queue_size_before=queue_size_before,
+                queue_size_after=self._outgoing_results_size(),
+                num_result_batches=num_result_batches,
+                num_stream_outputs=num_stream_outputs,
+            )
         return did_work
 
     def _send_draft_results(self, result_batch: DraftTailStreamOutputBatch) -> None:
@@ -306,6 +345,47 @@ class DraftAdapterThread:
             fields["dst_verifier_rank"] = int(dst_verifier_rank)
         self.tracer.record("draft_adapter", op, **fields)
 
+    def _outgoing_results_size(self) -> int:
+        try:
+            return int(self._outgoing_results.qsize())
+        except (AttributeError, NotImplementedError):
+            return -1
+
+    def _pending_controls_size(self) -> int:
+        with self._pending_lock:
+            return len(self._pending_controls)
+
+    def _idle_wait(self) -> None:
+        trace_enabled = getattr(getattr(self, "tracer", None), "enabled", False)
+        if not trace_enabled:
+            self._wakeup.wait(timeout=ADAPTER_IDLE_WAIT_TIMEOUT_S)
+            self._wakeup.clear()
+            return
+
+        queue_size_before = self._outgoing_results_size()
+        pending_controls_before = self._pending_controls_size()
+        wakeup_set_before = self._wakeup.is_set()
+        start_ns = time.perf_counter_ns()
+        self._wakeup.wait(timeout=ADAPTER_IDLE_WAIT_TIMEOUT_S)
+        duration_ms = (time.perf_counter_ns() - start_ns) / 1_000_000
+        wakeup_set_after = self._wakeup.is_set()
+        queue_size_after = self._outgoing_results_size()
+        pending_controls_after = self._pending_controls_size()
+        self._wakeup.clear()
+        self.tracer.record(
+            "draft_adapter",
+            "idle_wait",
+            duration_ms=duration_ms,
+            drafter_rank=int(self.drafter_rank),
+            wait_timeout_ms=ADAPTER_IDLE_WAIT_TIMEOUT_S * 1_000,
+            wakeup_set_before_wait=wakeup_set_before,
+            wakeup_set_after_wait=wakeup_set_after,
+            queue_size_before_wait=queue_size_before,
+            queue_size_after_wait=queue_size_after,
+            pending_controls_before_wait=pending_controls_before,
+            pending_controls_after_wait=pending_controls_after,
+        )
+
     def _run(self) -> None:
         while not self._closed.is_set():
             did_work = False
@@ -316,5 +396,4 @@ class DraftAdapterThread:
                 break
 
             if not did_work:
-                self._wakeup.wait(timeout=0.0005) # 0.5ms
-                self._wakeup.clear()
+                self._idle_wait()
