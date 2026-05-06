@@ -773,6 +773,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 and batch.spec_info is not None
                 and getattr(batch.spec_info, "positions", None) is not None
                 and not batch.forward_mode.is_idle()
+                and _is_npu
             ):
                 # mrope_position depends on draft output in default stream and is computed in plan stream,
                 # causing errors. Compute it here for correct values.
