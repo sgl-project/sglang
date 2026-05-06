@@ -518,43 +518,46 @@ class TestNgramExternalSamArgs(CustomTestCase):
 class TestGrammarBackendSpeculativeGuard(unittest.TestCase):
     """Tests for _handle_grammar_backend: outlines + speculative → ValueError (issue #24413)."""
 
+    def _make_args(self, **overrides):
+        args = ServerArgs(model_path="dummy")
+        for key, value in overrides.items():
+            setattr(args, key, value)
+        return args
+
     def test_outlines_with_speculative_raises(self):
         with self.assertRaises(ValueError) as context:
-            ServerArgs(
-                model_path="dummy",
+            self._make_args(
                 grammar_backend="outlines",
                 speculative_algorithm="EAGLE",
-            )
+            )._handle_grammar_backend()
         self.assertIn("outlines", str(context.exception))
         self.assertIn("incompatible with speculative decoding", str(context.exception))
 
     def test_outlines_with_ngram_speculative_raises(self):
         with self.assertRaises(ValueError) as context:
-            ServerArgs(
-                model_path="dummy",
+            self._make_args(
                 grammar_backend="outlines",
                 speculative_algorithm="NGRAM",
-            )
+            )._handle_grammar_backend()
         self.assertIn("outlines", str(context.exception))
 
     def test_xgrammar_with_speculative_allowed(self):
-        server_args = ServerArgs(
-            model_path="dummy",
+        args = self._make_args(
             grammar_backend="xgrammar",
             speculative_algorithm="EAGLE",
         )
-        self.assertEqual(server_args.grammar_backend, "xgrammar")
+        args._handle_grammar_backend()
+        self.assertEqual(args.grammar_backend, "xgrammar")
 
     def test_outlines_without_speculative_allowed(self):
-        server_args = ServerArgs(
-            model_path="dummy",
-            grammar_backend="outlines",
-        )
-        self.assertEqual(server_args.grammar_backend, "outlines")
+        args = self._make_args(grammar_backend="outlines")
+        args._handle_grammar_backend()
+        self.assertEqual(args.grammar_backend, "outlines")
 
     def test_default_grammar_backend_is_xgrammar(self):
-        server_args = ServerArgs(model_path="dummy")
-        self.assertEqual(server_args.grammar_backend, "xgrammar")
+        args = self._make_args()
+        args._handle_grammar_backend()
+        self.assertEqual(args.grammar_backend, "xgrammar")
 
 
 if __name__ == "__main__":
