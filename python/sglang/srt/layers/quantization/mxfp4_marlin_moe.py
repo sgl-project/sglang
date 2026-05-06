@@ -34,7 +34,7 @@ class Mxfp4MarlinMoEMethod:
         layer: Module,
         num_experts: int,
         hidden_size: int,
-        intermediate_size: int,
+        intermediate_size_per_partition: int,
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ):
@@ -44,7 +44,7 @@ class Mxfp4MarlinMoEMethod:
             layer,
             num_experts,
             hidden_size,
-            intermediate_size,
+            intermediate_size_per_partition,
             params_dtype,
             **extra_weight_attrs,
         )
