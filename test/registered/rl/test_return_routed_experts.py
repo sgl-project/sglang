@@ -30,37 +30,21 @@ logger = logging.getLogger(__name__)
 
 
 class TestReturnRoutedExperts(CustomTestCase):
-    """End-to-end check that --enable-return-routed-experts is correct under
-    DeepEP a2a + attn_tp_size > 1.
+    """End-to-end check that --enable-return-routed-experts stays correct
+    under DeepEP a2a + attn_tp_size > 1, across overlap/cuda-graph/radix
+    optimisations.
 
-    Reference uses ``--moe-a2a-backend deepep`` with tp=4 dp=2 so attn_tp_size=2,
-    which exercises the all-gather hot path in RoutedExpertsCapturer.capture.
-    Without that gather, each attn-TP rank would only stage its scattered slice
-    and the captured topk would be wrong on rank > 0; this is dead code under
-    non-DeepEP / attn_tp_size==1 setups, so a dedicated config is required.
+    Both servers run ``--tp 4 --dp 2 --enable-dp-attention --moe-a2a-backend
+    deepep`` so attn_tp_size=2 and the all-gather hot path in
+    RoutedExpertsCapturer.capture is hit on every step. Baseline disables
+    overlap/cuda-graph/radix to give a deterministic ground truth; reference
+    leaves them on. If the gather were skipping a rank or racing against the
+    forward stream, the captured topk_ids would diverge between the two.
     """
 
     @classmethod
     def setUpClass(cls):
-        # Baseline: deterministic, simple path. attn_tp_size=1 (tp=dp=4) so the
-        # DeepEP gather is bypassed and capture goes through the trivial path.
-        cls.baseline_args = [
-            "--enable-return-routed-experts",
-            "--enable-deterministic-inference",
-            "--disable-overlap-schedule",
-            "--disable-cuda-graph",
-            "--disable-radix-cache",
-            "--tp",
-            4,
-            "--dp",
-            4,
-            "--enable-dp-attention",
-        ]
-        # Reference: tp=4 dp=2 → attn_tp_size=2, DeepEP a2a active. Same model
-        # weights + temperature=0 + deterministic-inference must yield the same
-        # topk_ids as baseline (modulo the <10% tolerance the original test
-        # already used to absorb residual non-determinism in EP MoE).
-        cls.reference_args = [
+        common = [
             "--enable-return-routed-experts",
             "--enable-deterministic-inference",
             "--tp",
@@ -71,6 +55,12 @@ class TestReturnRoutedExperts(CustomTestCase):
             "--moe-a2a-backend",
             "deepep",
         ]
+        cls.baseline_args = common + [
+            "--disable-overlap-schedule",
+            "--disable-cuda-graph",
+            "--disable-radix-cache",
+        ]
+        cls.reference_args = common
         cls.sampling_args = {"temperature": 0}
         # prepare ShareGPT dataset
         dataset_path = download_and_cache_hf_file(SHAREGPT_REPO_ID, SHAREGPT_FILENAME)
