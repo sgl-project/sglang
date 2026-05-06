@@ -157,11 +157,12 @@ class SchedulerMetricsMixin:
                 self._mfu_log_read_bytes = 0.0
                 self._mfu_log_write_bytes = 0.0
 
+        self.fwd_occupancy = float("nan")
+
         if ENABLE_METRICS_DEVICE_TIMER:
             self._device_timer_window_batch_count = 0
             self._device_timer_window_gpu_time = 0.0
             self._device_timer_window_start = None
-            self.fwd_occupancy = float("nan")
 
             def _wrap_execution_reporter(**kwargs):
                 self._device_timer_window_gpu_time += kwargs["t"]
@@ -469,6 +470,7 @@ class SchedulerMetricsMixin:
 
             # Utilization / LoRA / HiCache
             self.calculate_utilization()
+            self.stats.fwd_occupancy = self.fwd_occupancy
             self.update_lora_metrics()
             self._log_hicache_stats()
             self.metrics_collector.log_stats(self.stats)
@@ -661,6 +663,7 @@ class SchedulerMetricsMixin:
 
             # Utilization / LoRA / HiCache
             self.calculate_utilization()
+            self.stats.fwd_occupancy = self.fwd_occupancy
             self.update_lora_metrics()
             self._log_hicache_stats()
             self.metrics_collector.log_stats(self.stats)

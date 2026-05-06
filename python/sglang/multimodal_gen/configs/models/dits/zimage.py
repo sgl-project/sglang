@@ -5,17 +5,7 @@ from dataclasses import dataclass, field
 from typing import Tuple
 
 from sglang.multimodal_gen.configs.models.dits.base import DiTArchConfig, DiTConfig
-
-
-def is_zimage_layer(n: str, m) -> bool:
-    """Returns if the module should be sharded for Z-Image model."""
-    if "layers" in n and str.isdigit(n.split(".")[-1]):
-        return True
-    if ("noise_refiner" in n or "context_refiner" in n) and str.isdigit(
-        n.split(".")[-1]
-    ):
-        return True
-    return False
+from sglang.multimodal_gen.configs.models.fsdp import is_zimage_layer
 
 
 @dataclass
