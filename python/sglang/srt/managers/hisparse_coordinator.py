@@ -11,11 +11,14 @@ from sglang.srt.mem_cache.hisparse_memory_pool import (
     HiSparseTokenToKVPoolAllocator,
 )
 from sglang.srt.mem_cache.memory_pool_host import MLATokenToKVPoolHost
-from sglang.srt.utils import get_device_module
+from sglang.srt.utils import get_device_module, is_npu
 
 device_module = get_device_module()
 
-from sglang.jit_kernel.hisparse import load_cache_to_device_buffer_mla
+if not is_npu():
+    from sglang.jit_kernel.hisparse import load_cache_to_device_buffer_mla
+else:
+    load_cache_to_device_buffer_mla = None
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 
 logger = logging.getLogger(__name__)
@@ -109,7 +112,7 @@ class HiSparseCoordinator:
             device=device,
         )
         self._lru_init = torch.arange(
-            self.device_buffer_size, dtype=torch.int16, device=device
+            self.device_buffer_size, dtype=torch.int32, device=device
         )
         self.lru_slots = (
             self._lru_init.view(1, 1, -1)
@@ -671,6 +674,14 @@ class HiSparseCoordinator:
         num_reqs = req_pool_indices.size(0)
         top_k_indices = self.top_k_device_locs_buffer[:num_reqs]
         top_k_indices.fill_(-1)
+        # On NPU, fall back to naive per-request loop since JIT CUDA kernel is unavailable
+        if is_npu():
+            return self.naive_load_topk(
+                req_pool_indices=req_pool_indices,
+                seq_lens=seq_lens,
+                top_k_tokens=top_k_result,
+                layer_id=layer_id,
+            )
         # todo, adjustable for performance
         block_size = 1024
         load_cache_to_device_buffer_mla(
