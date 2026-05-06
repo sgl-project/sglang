@@ -390,13 +390,6 @@ class LoRAMemoryPool:
         head_dim = getattr(cfg, "head_dim", None) or (
             cfg.hidden_size // cfg.num_attention_heads
         )
-        # `total_output_dim` from `get_hidden_dim("qkv_proj")` is
-        # `head_dim * (q_heads + 2 * num_kv_heads)`, where `q_heads` may
-        # already include `attn_output_gate` doubling. Subtract the K+V
-        # portion to recover the q dim, divide it by tp_size (q is never
-        # replicated), and add the per-rank K+V contribution which is
-        # exactly `head_dim` each (1 KV head, replicated across the
-        # `tp_size // num_kv_heads` ranks that share it).
         kv_dim_total = 2 * num_kv_heads * head_dim
         q_dim_total = total_output_dim - kv_dim_total
         q_per_rank = divide(q_dim_total, effective_tp_size)
