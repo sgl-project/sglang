@@ -13,8 +13,12 @@ from __future__ import annotations
 import json
 import logging
 import os
+import sys
+import tempfile
 import time
 import uuid
+from contextlib import contextmanager
+from datetime import datetime
 from typing import Any, List, Optional, Tuple
 
 import requests
@@ -40,6 +44,10 @@ ENABLE_ASCEND_MEMCACHE_WARMUP = False
 DEFAULT_ASCEND_MEMCACHE_TRACE_LOGGING = True
 # <= 0 means no limit (print all keys).
 DEFAULT_ASCEND_MEMCACHE_TRACE_MAX_KEYS = 0
+DEFAULT_ASCEND_MEMCACHE_PRINT_SAMPLE_KEYS = False
+DEFAULT_ASCEND_MEMCACHE_SUPPRESS_HYBM_WARN = True
+DEFAULT_ASCEND_MEMCACHE_TRACE_FILE_NAME = "ascend_memcache_trace.log"
+_HYBM_WARN_FRAGMENT = "HYBM hybm_va_manager.cpp:173 GetRank] No allocated spaces found."
 
 logger = logging.getLogger(__name__)
 
@@ -93,6 +101,31 @@ def _apply_dict_to_local_config(local_cfg: Any, data: dict) -> List[str]:
             continue
         setattr(local_cfg, key, value)
     return unknown
+
+
+@contextmanager
+def _capture_c_stderr() -> tuple[list[str], bool]:
+    captured_lines: list[str] = []
+    try:
+        stderr_fd = sys.stderr.fileno()
+    except Exception:
+        yield captured_lines, False
+        return
+
+    saved_fd = os.dup(stderr_fd)
+    try:
+        with tempfile.TemporaryFile(mode="w+b") as tmp:
+            os.dup2(tmp.fileno(), stderr_fd)
+            try:
+                yield captured_lines, True
+            finally:
+                os.dup2(saved_fd, stderr_fd)
+                tmp.seek(0)
+                captured = tmp.read().decode("utf-8", errors="replace")
+                if captured:
+                    captured_lines.extend(captured.splitlines())
+    finally:
+        os.close(saved_fd)
 
 
 #------------------------------------------------------------
@@ -232,24 +265,66 @@ class AscendMemcacheStore(HiCacheStorage):
                 str(DEFAULT_ASCEND_MEMCACHE_TRACE_MAX_KEYS),
             )
         )
+        self.print_sample_keys = os.getenv(
+            "SGLANG_ASCEND_MEMCACHE_PRINT_SAMPLE_KEYS",
+            "1" if DEFAULT_ASCEND_MEMCACHE_PRINT_SAMPLE_KEYS else "0",
+        ).lower() in ("1", "true", "yes", "on")
+        self.suppress_hybm_warn = os.getenv(
+            "SGLANG_ASCEND_MEMCACHE_SUPPRESS_HYBM_WARN",
+            "1" if DEFAULT_ASCEND_MEMCACHE_SUPPRESS_HYBM_WARN else "0",
+        ).lower() in ("1", "true", "yes", "on")
+        self.trace_log_path = os.getenv(
+            "SGLANG_ASCEND_MEMCACHE_TRACE_LOG_PATH",
+            os.path.join(os.path.dirname(__file__), DEFAULT_ASCEND_MEMCACHE_TRACE_FILE_NAME),
+        )
         logger.warning(
-            "[AscendMemcacheTraceInit] enabled=%s max_keys=%s",
+            "[AscendMemcacheTraceInit] enabled=%s max_keys=%s print_sample_keys=%s trace_log_path=%s suppress_hybm_warn=%s",
             self.enable_trace_logging,
             self.trace_max_keys,
+            self.print_sample_keys,
+            self.trace_log_path,
+            self.suppress_hybm_warn,
         )
 
     def _trace_enabled(self) -> bool:
         return self.enable_trace_logging and logger.isEnabledFor(logging.INFO)
 
     def _sample_keys(self, keys: List[str]) -> List[str]:
+        if not self.print_sample_keys:
+            return []
         if self.trace_max_keys <= 0:
             return list(keys)
         return list(keys[: self.trace_max_keys])
 
+    def _append_trace_file(self, payload: dict) -> None:
+        try:
+            os.makedirs(os.path.dirname(self.trace_log_path), exist_ok=True)
+            with open(self.trace_log_path, "a", encoding="utf-8") as fout:
+                fout.write(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {payload}\n")
+        except Exception as exc:
+            logger.warning("Failed to append Ascend memcache trace file: %s", exc)
+
+    def _run_memcache_call(self, fn, *args):
+        if not self.suppress_hybm_warn:
+            return fn(*args)
+        with _capture_c_stderr() as (captured_lines, intercepted):
+            result = fn(*args)
+        if not intercepted:
+            return result
+        for line in captured_lines:
+            if _HYBM_WARN_FRAGMENT in line:
+                continue
+            print(line, file=sys.stderr)
+        return result
+
     def _trace_event(self, payload: dict) -> None:
         if not self._trace_enabled():
             return
-        logger.info("[AscendMemcacheTrace] %s", payload)
+        trace_payload = dict(payload)
+        if not self.print_sample_keys:
+            trace_payload.pop("sample_keys", None)
+        logger.info("[AscendMemcacheTrace] %s", trace_payload)
+        self._append_trace_file(trace_payload)
 
     #与Mooncake一致
     def register_buffer(self, tensor: torch.Tensor):
@@ -894,12 +969,16 @@ class AscendMemcacheStore(HiCacheStorage):
     def _put_batch_zero_copy_impl(
         self, key_strs: List[str], buffer_ptrs: List[int], buffer_sizes: List[int]
     ) -> List[int]:
-        return self.store.batch_put_from(key_strs, buffer_ptrs, buffer_sizes)
+        return self._run_memcache_call(
+            self.store.batch_put_from, key_strs, buffer_ptrs, buffer_sizes
+        )
 
     def _get_batch_zero_copy_impl(
         self, key_strs: List[str], buffer_ptrs: List[int], buffer_sizes: List[int]
     ) -> List[int]:
-        raw = self.store.batch_get_into(key_strs, buffer_ptrs, buffer_sizes)
+        raw = self._run_memcache_call(
+            self.store.batch_get_into, key_strs, buffer_ptrs, buffer_sizes
+        )
         # memcache_hybrid reports 0 on success, but HiCache read postprocess expects
         # positive values for success and negative values for failures.
         out: List[int] = []
@@ -908,7 +987,7 @@ class AscendMemcacheStore(HiCacheStorage):
         return out
 
     def _batch_exist(self, key_strs: List[str]) -> List[int]:
-        return self.store.batch_is_exist(key_strs)
+        return self._run_memcache_call(self.store.batch_is_exist, key_strs)
 
     def get_stats(self):
         storage_metrics = StorageMetrics()
