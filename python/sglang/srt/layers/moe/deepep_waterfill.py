@@ -493,7 +493,7 @@ class DeepEPWaterfillBalancer:
 
     def _build_dispatch_plan(
         self, topk_ids: Tensor, num_tokens: int
-    ) -> WaterfillDispatchPlan:
+    ) -> Optional[WaterfillDispatchPlan]:
         """Prepare rank-load state for the waterfill selection boundary."""
         local_routed_counts = self.count_local_routed(topk_ids)
         if self.static_rank_load is not None:
@@ -502,6 +502,8 @@ class DeepEPWaterfillBalancer:
         global_routed_counts, local_tokens_per_rank = self._all_reduce_dynamic_rank_load(
             local_routed_counts, num_tokens
         )
+        if self._is_low_batch(num_tokens):
+            return None
         return self._build_dynamic_dispatch_plan(
             global_routed_counts,
             local_tokens_per_rank=local_tokens_per_rank,
@@ -573,6 +575,21 @@ class DeepEPWaterfillBalancer:
             return self._with_expanded_topk(topk_output, expanded_ids, expanded_weights)
 
         dispatch_plan = self._build_dispatch_plan(topk_output.topk_ids, num_tokens)
+        if dispatch_plan is None:
+            if num_tokens == 0:
+                expanded_ids, expanded_weights = _empty_expanded(
+                    topk_output.topk_ids, topk_output.topk_weights
+                )
+            else:
+                expanded_ids, expanded_weights = expand_topk_with_shared_expert(
+                    topk_output.topk_ids,
+                    topk_output.topk_weights,
+                    self.num_routed_experts,
+                    self.world_size,
+                    self.rank,
+                    self.shared_weight,
+                )
+            return self._with_expanded_topk(topk_output, expanded_ids, expanded_weights)
         expanded_ids, expanded_weights = self._materialize_dispatch(
             topk_output.topk_ids,
             topk_output.topk_weights,
