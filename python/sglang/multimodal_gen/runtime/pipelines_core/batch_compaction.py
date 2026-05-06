@@ -95,6 +95,11 @@ SCHEDULER_BATCH_STATE_FIELDS = (
 class DynamicBatchLayout:
     """Mapping from the current compacted batch back to original requests.
 
+    The compaction entrypoint is generic, but the current merged-request
+    metadata is produced by dynamic batching. Keep that decoding isolated here
+    so future batching modes can add their own layout adapter without changing
+    denoising-loop call sites.
+
     `active_request_indices` stores indices into `original_request_ids`, not
     local positions. This lets the scheduler split outputs in the original
     client order after one or more compaction passes.
@@ -333,15 +338,17 @@ def _slice_attr(obj: Any, name: str, indices: list[int], size: int) -> None:
         setattr(obj, name, slice_batch_axis(getattr(obj, name), indices, size))
 
 
-def compact_dynamic_batch(
+def compact_batch(
     batch: Req,
     ctx: Any,
     server_args: Any,
 ) -> BatchCompactionResult:
-    """Remove cancelled requests from an active dynamic batch at a step boundary.
+    """Remove cancelled requests from an active batch at a step boundary.
 
     Prompt-aligned fields are sliced by request index; output-aligned fields are
     sliced by output index because one request can produce multiple outputs.
+    Today this handles dynamic-batch metadata; other batching layouts should
+    plug in here rather than add cancellation-specific logic to denoising loops.
     """
     layout = DynamicBatchLayout.from_req(batch)
     if layout is None:

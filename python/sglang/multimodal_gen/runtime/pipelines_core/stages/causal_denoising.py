@@ -113,6 +113,7 @@ class CausalDMDDenoisingStage(DenoisingStage):
         assert torch.isnan(prompt_embeds[0]).sum() == 0
 
         def compact_current_batch(current_latents=None):
+            """Compact shared causal-DMD state and refresh local aliases."""
             nonlocal h, image_kwargs, latents, pos_cond_kwargs, prompt_embeds, t, w
             ctx = BatchCompactionContext(
                 latents=latents,
@@ -127,7 +128,7 @@ class CausalDMDDenoisingStage(DenoisingStage):
                 kv_cache1=self.kv_cache1,
                 crossattn_cache=self.crossattn_cache,
             )
-            self._compact_dynamic_batch_if_needed(ctx, batch, server_args)
+            self._compact_batch_if_needed(ctx, batch, server_args)
             raise_if_cancelled(batch, server_args)
             latents = ctx.latents
             image_kwargs = ctx.image_kwargs

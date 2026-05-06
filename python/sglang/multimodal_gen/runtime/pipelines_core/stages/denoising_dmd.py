@@ -101,7 +101,7 @@ class DmdDenoisingStage(DenoisingStage):
                 prepared_vars.scheduler = scheduler
                 prepared_vars.image_kwargs = image_kwargs
                 prepared_vars.pos_cond_kwargs = pos_cond_kwargs
-                self._compact_dynamic_batch_if_needed(prepared_vars, batch, server_args)
+                self._compact_batch_if_needed(prepared_vars, batch, server_args)
                 latents = prepared_vars.latents
                 image_kwargs = prepared_vars.image_kwargs
                 pos_cond_kwargs = prepared_vars.pos_cond_kwargs
