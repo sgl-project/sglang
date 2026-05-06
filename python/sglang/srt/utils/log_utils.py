@@ -16,19 +16,20 @@ def create_log_targets(
     *, targets: Optional[List[str]], name_prefix: str
 ) -> List[logging.Logger]:
     if not targets:
-        return [_create_stdout_logger(name_prefix)]
+        return [_create_log_target_stdout(name_prefix)]
     return [_create_log_target(t, name_prefix) for t in targets]
 
 
 def _create_log_target(target: str, name_prefix: str) -> logging.Logger:
     if target.lower() == "stdout":
-        return _create_stdout_logger(name_prefix)
+        return _create_log_target_stdout(name_prefix)
     return _create_log_target_file(target, name_prefix)
 
 
-def _create_stdout_logger(name_prefix: str) -> logging.Logger:
-    handler = logging.StreamHandler(sys.stdout)
-    return _create_logger_with_handler(f"{name_prefix}.stdout", handler)
+def _create_log_target_stdout(name_prefix: str) -> logging.Logger:
+    return _create_logger_with_handler(
+        f"{name_prefix}.stdout", logging.StreamHandler(sys.stdout)
+    )
 
 
 def _create_log_target_file(directory: str, name_prefix: str) -> logging.Logger:
@@ -49,7 +50,9 @@ def _create_logger_with_handler(name: str, handler: logging.Handler) -> logging.
     logger.setLevel(logging.INFO)
     logger.propagate = False
     if not logger.handlers:
-        handler.setFormatter(logging.Formatter("%(message)s"))
+        handler.setFormatter(
+            logging.Formatter("[%(asctime)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
+        )
         logger.addHandler(handler)
     return logger
 
