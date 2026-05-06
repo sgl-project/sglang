@@ -82,3 +82,7 @@
 /python/sglang/srt/multimodal/processors/gemma4.py @mickqian @JustinTong0323 @yhyang201 @yuan-luo @kpham-sgl
 /docs_new/cookbook/autoregressive/Google/Gemma4.mdx @wisclmy0611 @zijiexia @Richardczl98 @kpham-sgl
 /docs_new/src/snippets/autoregressive/gemma4-deployment.jsx @wisclmy0611 @zijiexia @Richardczl98 @kpham-sgl
+/python/sglang/srt/speculative/ngram_*.py @hnyls2002 @Qiaolin-Yu @kpham-sgl
+/python/sglang/srt/speculative/cpp_ngram @hnyls2002 @Qiaolin-Yu @kpham-sgl
+/python/sglang/jit_kernel/ngram_*.py @hnyls2002 @Qiaolin-Yu @kpham-sgl
+/python/sglang/jit_kernel/csrc/ngram_corpus @hnyls2002 @Qiaolin-Yu @kpham-sgl

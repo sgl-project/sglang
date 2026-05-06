@@ -15,11 +15,9 @@ from __future__ import annotations
 
 import dataclasses
 import logging
-from functools import lru_cache
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple, Union
 
 from sglang.srt.environ import envs
-from sglang.srt.utils.common import get_bool_env_var
 from sglang.srt.utils.log_utils import create_log_targets, log_json
 
 if TYPE_CHECKING:
@@ -235,12 +233,6 @@ class RequestLogger:
     def _log(self, msg: str) -> None:
         for target in self.targets:
             target.info(msg)
-
-
-# TODO remove this?
-@lru_cache(maxsize=2)
-def disable_request_logging() -> bool:
-    return get_bool_env_var("SGLANG_DISABLE_REQUEST_LOGGING")
 
 
 # TODO unify this w/ `_transform_data_for_logging` if we find performance enough
