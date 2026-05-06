@@ -2,7 +2,6 @@ import random
 import unittest
 
 import sglang as sgl
-from sglang.srt.environ import envs
 from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import (
@@ -13,7 +12,7 @@ from sglang.test.test_utils import (
     CustomTestCase,
 )
 
-register_cuda_ci(est_time=357, suite="stage-b-test-1-gpu-large")
+register_cuda_ci(est_time=450, suite="nightly-1-gpu", nightly=True)
 
 
 class TestEAGLEEngine(CustomTestCase):
@@ -34,14 +33,6 @@ class TestEAGLEEngine(CustomTestCase):
         "batch_avg_accept_len": 1.9,
         "accept_len": 3.6,
     }
-
-    @classmethod
-    def setUpClass(cls):
-        envs.SGLANG_ENABLE_SPEC_V2.set(False)
-
-    @classmethod
-    def tearDownClass(cls):
-        envs.SGLANG_ENABLE_SPEC_V2.clear()
 
     def setUp(self):
         self.prompt = "Today is a sunny day and I like"

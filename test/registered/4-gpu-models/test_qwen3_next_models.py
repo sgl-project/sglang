@@ -18,6 +18,7 @@ class TestQwen3Next(
     cache_chunk_size = 64
     gsm8k_accuracy_thres = 0.93
     kl_div_thres = 0.0025
+    kl_div_thres_decode = 0.004
     other_args = [
         "--tp-size",
         "4",

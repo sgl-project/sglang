@@ -1,8 +1,8 @@
 name: Release Docker Images
 #
-# Builds and publishes framework Docker images (full development environment):
-#   - lmsysorg/sglang:v{version}, lmsysorg/sglang:latest (cuda 13)
-#   - lmsysorg/sglang:v{version}-cu129, lmsysorg/sglang:latest-cu129
+# This workflow builds and publishes framework Docker images (full development environment):
+#   - lmsysorg/sglang:v{version}, lmsysorg/sglang:latest
+#   - lmsysorg/sglang:v{version}-cu130, lmsysorg/sglang:latest-cu130
 #
 on:
   push:
@@ -14,9 +14,16 @@ on:
         description: "Version to build (without v prefix, e.g., 0.5.7)"
         required: true
       image_repo:
-        description: "Docker Hub repo to push to. Use lmsysorg/sglang-staging for testing."
+        description: "Upstream-only Docker Hub repo. Ignored by bytedance-iaas Volcengine builds."
         required: false
         default: "lmsysorg/sglang"
+
+env:
+  VOLCENGINE_CR_REGISTRY: ${{ vars.VOLCENGINE_CR_REGISTRY }}
+  VOLCENGINE_CR_NAMESPACE: ${{ vars.VOLCENGINE_CR_NAMESPACE }}
+  VOLCENGINE_CR_REPOSITORY: ${{ vars.VOLCENGINE_CR_REPOSITORY || 'sglang' }}
+  VOLCENGINE_CR_USERNAME: ${{ secrets.VOLCENGINE_CR_USERNAME }}
+  VOLCENGINE_CR_PASSWORD: ${{ secrets.VOLCENGINE_CR_PASSWORD }}
 
 jobs:
   resolve-version:
@@ -40,6 +47,7 @@ jobs:
           echo "version=${VERSION}" >> $GITHUB_OUTPUT
 
   build-and-publish:
+    if: github.repository == 'sgl-project/sglang'
     needs: resolve-version
     uses: ./.github/workflows/_docker-build-and-publish.yml
     with:
@@ -53,3 +61,224 @@ jobs:
           {"cuda": "cu129", "tags": ["v${{ needs.resolve-version.outputs.version }}-cu129", "latest-cu129"]}
         ]
     secrets: inherit
+
+  validate-volcengine-version-tag:
+    if: github.repository == 'bytedance-iaas/sglang'
+    runs-on: ubuntu-22.04
+    outputs:
+      git-tag-value: ${{ steps.tag.outputs.value }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Fetch version tags
+        run: git fetch --force --tags origin
+
+      - name: Resolve required git tag
+        id: tag
+        run: |
+          set -euo pipefail
+
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            RAW_TAG="v${{ github.event.inputs.version }}"
+            if ! git rev-parse -q --verify "refs/tags/${RAW_TAG}" >/dev/null; then
+              RAW_TAG="${{ github.event.inputs.version }}"
+            fi
+          else
+            RAW_TAG="${GITHUB_REF_NAME}"
+          fi
+
+          if [ -z "${RAW_TAG}" ] || ! git rev-parse -q --verify "refs/tags/${RAW_TAG}" >/dev/null; then
+            echo "::error::Version image publishing requires an existing git tag"
+            exit 1
+          fi
+
+          echo "value=${RAW_TAG#v}" >> "$GITHUB_OUTPUT"
+
+  publish-x86:
+    if: github.repository == 'bytedance-iaas/sglang'
+    needs: [validate-volcengine-version-tag]
+    environment: "prod"
+    env:
+      BYTED_INTERNAL_EXTRA_TOOLS_APT_URL: ${{ vars.BYTED_INTERNAL_EXTRA_TOOLS_APT_URL || 'http://mirrors.ivolces.com/extra-tools/ubuntu' }}
+      BYTED_INTERNAL_EXTRA_TOOLS_GPG_URL: ${{ vars.BYTED_INTERNAL_EXTRA_TOOLS_GPG_URL || 'https://mirrors.ivolces.com/extra-tools/ubuntu/GPG-KEY-system' }}
+      HTTP_PROXY: http://100.68.162.211:3128
+      HTTPS_PROXY: http://100.68.162.211:3128
+      ALL_PROXY: http://100.68.162.211:3128
+      NO_PROXY: localhost,127.0.0.1,::1,mirrors.ivolces.com,.ivolces.com,.volceapi.com,.byted.org,eic-sdk-release.tos-cn-beijing.ivolces.com,scqq9isgq31i0fb8nt4eg.apigateway-cn-beijing.volceapi.com,bytedpypi.byted.org,mirrors.byted.org,iaas-gpu-cn-beijing.cr.volces.com
+    outputs:
+      digest-cu129: ${{ steps.build-cu129.outputs.digest }}
+      digest-cu130: ${{ steps.build-cu130.outputs.digest }}
+    strategy:
+      matrix:
+        variant:
+          - cuda_version: "12.9.1"
+            build_type: "all"
+            grace_blackwell: 0
+    runs-on: x64-docker-build-node
+    steps:
+      - name: Delete huge unnecessary tools folder
+        run: rm -rf /opt/hostedtoolcache
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Fetch version tags
+        run: git fetch --force --tags origin
+
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: false
+          docker-images: false
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          swap-storage: false
+
+      - name: Set up Docker Buildx with local Docker Hub mirror
+        uses: docker/setup-buildx-action@v3
+        with:
+          driver-opts: |
+            network=host
+          buildkitd-config-inline: |
+            [registry."docker.io"]
+              mirrors = ["127.0.0.1:5000"]
+
+      - name: Get version from tag
+        id: version
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            VERSION="${{ github.event.inputs.version }}"
+          else
+            # Extract version from tag (e.g., v0.5.7 -> 0.5.7)
+            VERSION="${GITHUB_REF_NAME#v}"
+          fi
+
+          # Validate version format
+          if [ -z "$VERSION" ]; then
+            echo "::error::Version is empty"
+            exit 1
+          fi
+          if ! echo "$VERSION" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+'; then
+            echo "::error::Invalid version format: $VERSION (expected: X.Y.Z)"
+            exit 1
+          fi
+
+          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+
+      - name: Build AMD64 Framework
+        id: build-cu129
+        run: |
+          version=${{ steps.version.outputs.version }}
+          docker buildx build \
+            --target framework_final \
+            --platform linux/amd64 \
+            --output type=image,name=${VOLCENGINE_CR_REGISTRY}/${VOLCENGINE_CR_NAMESPACE}/${VOLCENGINE_CR_REPOSITORY},push-by-digest=true,name-canonical=true,push=true \
+            -f docker/Dockerfile \
+            --build-arg CUDA_VERSION=${{ matrix.variant.cuda_version }} \
+            --build-arg BUILD_TYPE=${{ matrix.variant.build_type }} \
+            --build-arg GRACE_BLACKWELL=${{ matrix.variant.grace_blackwell }} \
+            --build-arg HTTP_PROXY=${HTTP_PROXY} \
+            --build-arg HTTPS_PROXY=${HTTPS_PROXY} \
+            --build-arg ALL_PROXY=${ALL_PROXY} \
+            --build-arg NO_PROXY=${NO_PROXY} \
+            --build-arg INSTALL_FLASHINFER_JIT_CACHE=1 \
+            --build-arg SGL_VERSION=${version} \
+            --build-arg BYTED_INTERNAL_EXTRA_TOOLS_APT_URL=${BYTED_INTERNAL_EXTRA_TOOLS_APT_URL} \
+            --build-arg BYTED_INTERNAL_EXTRA_TOOLS_GPG_URL=${BYTED_INTERNAL_EXTRA_TOOLS_GPG_URL} \
+            --metadata-file /tmp/metadata-cu129-framework.json \
+            --no-cache \
+            .
+
+          DIGEST=$(python3 -c "import json; print(json.load(open('/tmp/metadata-cu129-framework.json'))['containerimage.digest'])")
+          echo "Pushed digest: ${DIGEST}"
+          echo "digest=${DIGEST}" >> $GITHUB_OUTPUT
+
+      - name: Build and Push AMD64 Framework (CUDA 13)
+        id: build-cu130
+        run: |
+          version=${{ steps.version.outputs.version }}
+          docker buildx build \
+            --target framework_final \
+            --platform linux/amd64 \
+            --output type=image,name=${VOLCENGINE_CR_REGISTRY}/${VOLCENGINE_CR_NAMESPACE}/${VOLCENGINE_CR_REPOSITORY},push-by-digest=true,name-canonical=true,push=true \
+            -f docker/Dockerfile \
+            --build-arg CUDA_VERSION=13.0.1 \
+            --build-arg BUILD_TYPE=${{ matrix.variant.build_type }} \
+            --build-arg HTTP_PROXY=${HTTP_PROXY} \
+            --build-arg HTTPS_PROXY=${HTTPS_PROXY} \
+            --build-arg ALL_PROXY=${ALL_PROXY} \
+            --build-arg NO_PROXY=${NO_PROXY} \
+            --build-arg INSTALL_FLASHINFER_JIT_CACHE=1 \
+            --build-arg GRACE_BLACKWELL=0 \
+            --build-arg SGL_VERSION=${version} \
+            --build-arg BYTED_INTERNAL_EXTRA_TOOLS_APT_URL=${BYTED_INTERNAL_EXTRA_TOOLS_APT_URL} \
+            --build-arg BYTED_INTERNAL_EXTRA_TOOLS_GPG_URL=${BYTED_INTERNAL_EXTRA_TOOLS_GPG_URL} \
+            --metadata-file /tmp/metadata-cu130-framework.json \
+            --no-cache \
+            .
+
+          DIGEST=$(python3 -c "import json; print(json.load(open('/tmp/metadata-cu130-framework.json'))['containerimage.digest'])")
+          echo "Pushed digest: ${DIGEST}"
+          echo "digest=${DIGEST}" >> $GITHUB_OUTPUT
+
+  create-manifests:
+    if: github.repository == 'bytedance-iaas/sglang'
+    runs-on: ubuntu-22.04
+    needs: [validate-volcengine-version-tag, publish-x86]
+    environment: "prod"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Fetch version tags
+        run: git fetch --force --tags origin
+
+      - name: Login to Volcengine CR
+        run: |
+          set -euo pipefail
+          echo "${VOLCENGINE_CR_PASSWORD}" | docker login "${VOLCENGINE_CR_REGISTRY}" --username "${VOLCENGINE_CR_USERNAME}" --password-stdin
+
+      - name: Get version from tag
+        id: version
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            VERSION="${{ github.event.inputs.version }}"
+          else
+            # Extract version from tag (e.g., v0.5.7 -> 0.5.7)
+            VERSION="${GITHUB_REF_NAME#v}"
+          fi
+
+          # Validate version format
+          if [ -z "$VERSION" ]; then
+            echo "::error::Version is empty"
+            exit 1
+          fi
+          if ! echo "$VERSION" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+'; then
+            echo "::error::Invalid version format: $VERSION (expected: X.Y.Z)"
+            exit 1
+          fi
+
+          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+
+      - name: Create release manifests
+        run: |
+          CU129_AMD64_FW=${{ needs.publish-x86.outputs.digest-cu129 }}
+          CU130_AMD64_FW=${{ needs.publish-x86.outputs.digest-cu130 }}
+          VOLCENGINE_IMAGE="${VOLCENGINE_CR_REGISTRY}/${VOLCENGINE_CR_NAMESPACE}/${VOLCENGINE_CR_REPOSITORY}"
+          VOLCENGINE_TAG_CU129=$(python3 scripts/ci/get_volcengine_image_tag.py --mode version --tag-value "${{ needs.validate-volcengine-version-tag.outputs.git-tag-value }}")
+          VOLCENGINE_TAG_CU130=$(python3 scripts/ci/get_volcengine_image_tag.py --mode version --tag-value "${{ needs.validate-volcengine-version-tag.outputs.git-tag-value }}" --cuda-suffix cu130)
+
+          docker buildx imagetools create \
+            -t "${VOLCENGINE_IMAGE}:${VOLCENGINE_TAG_CU129}" \
+            "${VOLCENGINE_IMAGE}@${CU129_AMD64_FW}"
+
+          docker buildx imagetools create \
+            -t "${VOLCENGINE_IMAGE}:${VOLCENGINE_TAG_CU130}" \
+            "${VOLCENGINE_IMAGE}@${CU130_AMD64_FW}"
+
+          echo "✓ Published ${VOLCENGINE_IMAGE} release tags"

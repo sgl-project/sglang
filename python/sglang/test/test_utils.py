@@ -43,7 +43,7 @@ from sglang.srt.utils import (
     kill_process_tree,
     retry,
 )
-from sglang.srt.utils.network import is_port_available
+from sglang.srt.utils.network import is_port_available, wait_port_available
 from sglang.test.run_eval import run_eval
 from sglang.utils import get_exception_traceback, normalize_base_url
 
@@ -881,6 +881,9 @@ def popen_launch_server(
     # Build server command
     _, host, port = base_url.split(":")
     host = host[2:]
+    wait_port_available(
+        int(port), "SGLang test server port", timeout_s=300, raise_exception=True
+    )
 
     use_mixed_pd_engine = not pd_separated and num_replicas is not None
     if pd_separated or use_mixed_pd_engine:
@@ -1099,6 +1102,24 @@ def get_benchmark_args(
     )
 
 
+def _ensure_synthetic_sharegpt_dataset(num_rows: int = 1024) -> str:
+    dataset_path = "/tmp/sglang-bench-random-sharegpt.json"
+    if not os.path.exists(dataset_path):
+        prompt = "Please explain the purpose of continuous integration. " * 32
+        answer = "Continuous integration catches regressions early. " * 32
+        rows = [
+            {
+                "conversations": [
+                    {"from": "human", "value": f"{prompt} Example {i}."},
+                    {"from": "gpt", "value": answer},
+                ]
+            }
+            for i in range(num_rows)
+        ]
+        Path(dataset_path).write_text(json.dumps(rows), encoding="utf-8")
+    return dataset_path
+
+
 def run_bench_serving(
     model,
     num_prompts,
@@ -1120,6 +1141,8 @@ def run_bench_serving(
 ):
     if device == "auto":
         device = auto_config_device()
+    if dataset_name == "random" and not dataset_path:
+        dataset_path = _ensure_synthetic_sharegpt_dataset()
     # Launch the server
     base_url = DEFAULT_URL_FOR_TEST
     process = popen_launch_server(
@@ -1556,6 +1579,8 @@ def run_bench_one_batch(model, other_args):
 
 
 def run_bench_offline_throughput(model, other_args):
+    dataset_path = _ensure_synthetic_sharegpt_dataset()
+
     command = [
         "python3",
         "-m",
@@ -1568,6 +1593,8 @@ def run_bench_offline_throughput(model, other_args):
         "256",
         "--random-output-len",
         "256",
+        "--dataset-path",
+        dataset_path,
         "--model-path",
         model,
         *[str(x) for x in other_args],
@@ -1602,6 +1629,11 @@ def run_bench_one_batch_server(
     simulate_spec_acc_lens=None,
 ):
     from sglang.bench_one_batch_server import run_benchmark
+
+    if getattr(bench_args, "dataset_name", "") == "random" and not getattr(
+        bench_args, "dataset_path", ""
+    ):
+        bench_args.dataset_path = _ensure_synthetic_sharegpt_dataset()
 
     if simulate_spec_acc_lens is not None:
         env = {**os.environ, "SIMULATE_ACC_LEN": str(simulate_spec_acc_lens)}

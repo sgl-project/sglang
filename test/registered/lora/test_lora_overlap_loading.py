@@ -27,14 +27,26 @@ from sglang.test.lora_utils import (
     CI_MULTI_LORA_MODELS,
     run_lora_batch_splitting_equivalence_test,
 )
-from sglang.test.test_utils import CustomTestCase
+from sglang.test.test_utils import CustomTestCase, has_hf_cache_entry
 
-register_cuda_ci(est_time=48, suite="stage-b-test-1-gpu-large")
+register_cuda_ci(est_time=75, suite="stage-b-test-1-gpu-large")
 register_amd_ci(est_time=75, suite="stage-b-test-1-gpu-small-amd")
 
 
 class TestLoRAOverlapLoading(CustomTestCase):
     def test_ci_lora_models_batch_splitting(self):
+        missing = []
+        for model in CI_MULTI_LORA_MODELS:
+            if not has_hf_cache_entry(model.base):
+                missing.append(model.base)
+            for adaptor in model.adaptors:
+                if not has_hf_cache_entry(adaptor.name):
+                    missing.append(adaptor.name)
+        if missing:
+            self.skipTest(
+                f"Missing LoRA cache entries: {', '.join(sorted(set(missing)))}"
+            )
+
         run_lora_batch_splitting_equivalence_test(
             CI_MULTI_LORA_MODELS, enable_lora_overlap_loading=True
         )

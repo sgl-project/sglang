@@ -40,10 +40,25 @@ def find_all_hf_snapshots():
         List of (model_name, snapshot_dir) tuples, sorted by mtime (newest first)
     """
     hf_home = os.environ.get("HF_HOME", os.path.expanduser("~/.cache/huggingface"))
-    hub_dir = os.path.join(hf_home, "hub")
 
-    if not os.path.isdir(hub_dir):
-        print(f"HF hub directory not found: {hub_dir}")
+    candidate_dirs = []
+    explicit_cache = os.environ.get("HUGGINGFACE_HUB_CACHE") or os.environ.get(
+        "HF_HUB_CACHE"
+    )
+    if explicit_cache:
+        candidate_dirs.append(explicit_cache)
+
+    # Support both HF_HOME=/path/to/huggingface and HF_HOME=/path/to/cache-root.
+    candidate_dirs.extend([os.path.join(hf_home, "hub"), hf_home])
+
+    hub_dir = None
+    for candidate in candidate_dirs:
+        if os.path.isdir(candidate) and glob.glob(os.path.join(candidate, "models--*")):
+            hub_dir = candidate
+            break
+
+    if hub_dir is None:
+        print("HF hub directory not found in candidates: " + ", ".join(candidate_dirs))
         return []
 
     snapshots = []

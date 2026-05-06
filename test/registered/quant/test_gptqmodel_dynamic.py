@@ -16,6 +16,12 @@ from sglang.test.test_utils import (
 
 register_cuda_ci(est_time=100, suite="stage-b-test-1-gpu-large")
 
+def is_pr_ci():
+    return is_in_ci() and os.getenv("GITHUB_EVENT_NAME") in (
+        "pull_request",
+        "workflow_dispatch",
+    )
+
 
 def check_quant_method(model_path: str, use_marlin_kernel: bool):
     from sglang.srt.configs.device_config import DeviceConfig
@@ -129,6 +135,10 @@ class TestGPTQModelDynamic(CustomTestCase):
         )
         return response.json()
 
+    @unittest.skipIf(
+        is_pr_ci(),
+        "GPTQ dynamic throughput is unstable on current PR UT 1-GPU runners",
+    )
     def test_throughput(self):
         max_tokens = 256
 

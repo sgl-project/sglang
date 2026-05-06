@@ -27,6 +27,32 @@ def format_longbench_v2_example(example):
     return f"{context} {question}"
 
 
+def _build_synthetic_input_ids(tokenizer, max_prompt_tokens, num_samples):
+    """Build deterministic long prompts when the CI environment is offline."""
+    seed_text = (
+        "Long context reasoning passage. "
+        "The system should preserve cache and logprob consistency across repeated turns. "
+        "Each paragraph introduces numbered facts, intermediate constraints, and a final question. "
+    )
+    input_ids = []
+    for i in range(num_samples):
+        text = (
+            f"Example {i}. " + seed_text + f"Question {i}: summarize fact {i % 7}. "
+        ) * 256
+        tokens = tokenizer.encode(text)
+        truncate_len = int(max_prompt_tokens * (0.75 + (i % 7) * 0.08))
+        input_ids.append(tokens[:truncate_len])
+    return input_ids
+
+
+def _is_offline_ci():
+    return (
+        os.getenv("HF_HUB_OFFLINE") == "1"
+        or os.getenv("TRANSFORMERS_OFFLINE") == "1"
+        or os.getenv("SGLANG_IS_IN_CI")
+    )
+
+
 def get_input_ids(
     tokenizer_path, max_prompt_tokens=DEFAULT_PROMPT_TOKENS, num_samples=None
 ):
@@ -50,6 +76,10 @@ def get_input_ids(
     cache_file = os.path.join(
         CACHE_DIR, f"input_ids_{safe_name}_{max_prompt_tokens}_{num_samples}.json"
     )
+    synthetic_cache_file = os.path.join(
+        CACHE_DIR,
+        f"input_ids_{safe_name}_{max_prompt_tokens}_{num_samples}_synthetic.json",
+    )
 
     if os.path.exists(cache_file):
         print(f"Loading from local cache: {cache_file}")
@@ -57,6 +87,14 @@ def get_input_ids(
             input_ids = json.load(f)
         _cached_input_ids[cache_key] = input_ids
         print(f"Loaded {len(input_ids)} prompts from cache")
+        return input_ids
+
+    if _is_offline_ci() and os.path.exists(synthetic_cache_file):
+        print(f"Loading from local synthetic cache: {synthetic_cache_file}")
+        with open(synthetic_cache_file, "r") as f:
+            input_ids = json.load(f)
+        _cached_input_ids[cache_key] = input_ids
+        print(f"Loaded {len(input_ids)} synthetic prompts from cache")
         return input_ids
 
     # Download from HuggingFace using streaming
@@ -69,20 +107,31 @@ def get_input_ids(
 
     tokenizer = get_tokenizer(tokenizer_path)
 
-    print(f"Downloading {num_samples} samples from LongBench V2 (streaming)...")
-    dataset = load_dataset(
-        LONGBENCH_V2_DATASET, split=LONGBENCH_V2_SPLIT, streaming=True
-    )
-
     input_ids = []
-    for i, example in enumerate(dataset):
-        if len(input_ids) >= num_samples:
-            break
-        text = format_longbench_v2_example(example)
-        tokens = tokenizer.encode(text)
-        # Truncate to a random length between 0.5x and 1.5x of max_prompt_tokens
-        truncate_len = int(max_prompt_tokens * random.uniform(0.5, 1.5))
-        input_ids.append(tokens[:truncate_len])
+    print(f"Downloading {num_samples} samples from LongBench V2 (streaming)...")
+    try:
+        dataset = load_dataset(
+            LONGBENCH_V2_DATASET, split=LONGBENCH_V2_SPLIT, streaming=True
+        )
+        for i, example in enumerate(dataset):
+            if len(input_ids) >= num_samples:
+                break
+            text = format_longbench_v2_example(example)
+            tokens = tokenizer.encode(text)
+            # Truncate to a random length between 0.5x and 1.5x of max_prompt_tokens
+            truncate_len = int(max_prompt_tokens * random.uniform(0.5, 1.5))
+            input_ids.append(tokens[:truncate_len])
+    except Exception as exc:
+        if not _is_offline_ci():
+            raise
+        print(
+            "LongBench V2 is unavailable in offline CI; "
+            f"using synthetic prompts instead. Error: {exc}"
+        )
+        input_ids = _build_synthetic_input_ids(
+            tokenizer, max_prompt_tokens, num_samples
+        )
+        cache_file = synthetic_cache_file
 
     # Save to local cache
     with open(cache_file, "w") as f:

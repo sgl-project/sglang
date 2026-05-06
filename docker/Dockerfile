@@ -21,6 +21,8 @@ ARG GITHUB_ARTIFACTORY=github.com
 ARG INSTALL_FLASHINFER_JIT_CACHE=0
 ARG FLASHINFER_VERSION=0.6.8.post1
 ARG MOONCAKE_VERSION=0.3.10.post2
+ARG BYTED_INTERNAL_EXTRA_TOOLS_APT_URL=http://mirrors.byted.org/extra-tools/ubuntu
+ARG BYTED_INTERNAL_EXTRA_TOOLS_GPG_URL=https://mirrors.byted.org/extra-tools/ubuntu/GPG-KEY-system
 #if need other arg please add in MOONCAKE_COMPILE_ARG
 ARG MOONCAKE_COMPILE_ARG="-DUSE_HTTP=ON -DUSE_MNNVL=ON -DUSE_CUDA=ON -DWITH_EP=ON"
 
@@ -39,12 +41,37 @@ RUN if [ -n "$UBUNTU_MIRROR" ]; then \
     sed -i "s|http://.*security.ubuntu.com|$UBUNTU_MIRROR|g" /etc/apt/sources.list; \
 fi
 
+RUN cat <<'EOF' >/usr/local/bin/apt-install-with-retry
+#!/bin/sh
+set -eu
+
+attempt=1
+max_attempts="${APT_INSTALL_MAX_ATTEMPTS:-3}"
+
+while :; do
+    rm -rf /var/lib/apt/lists/*
+    if apt-get -o Acquire::Retries=5 -o Acquire::http::No-Cache=true -o Acquire::https::No-Cache=true update \
+        && apt-get -o Acquire::Retries=5 -o Acquire::http::No-Cache=true -o Acquire::https::No-Cache=true install -y --no-install-recommends "$@"; then
+        exit 0
+    fi
+
+    if [ "$attempt" -ge "$max_attempts" ]; then
+        exit 1
+    fi
+
+    sleep $((attempt * 10))
+    attempt=$((attempt + 1))
+done
+EOF
+
+RUN chmod +x /usr/local/bin/apt-install-with-retry
+
 # Python setup (combined with apt update to reduce layers)
 # Ubuntu 24.04 ships Python 3.12 in main, so we no longer need the deadsnakes
 # PPA. Dropping it avoids transient Launchpad 504s in `add-apt-repository`.
 RUN --mount=type=cache,target=/var/cache/apt,id=base-apt \
-    apt update && apt install -y --no-install-recommends wget software-properties-common \
-    && apt install -y --no-install-recommends python3.12-full python3.12-dev \
+    apt-install-with-retry wget software-properties-common \
+    && apt-install-with-retry python3.12-full python3.12-dev \
     && update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.12 2 \
     && update-alternatives --set python3 /usr/bin/python3.12 \
     && wget -q https://bootstrap.pypa.io/get-pip.py \
@@ -58,7 +85,7 @@ RUN --mount=type=cache,target=/var/cache/apt,id=base-apt \
 
 # Install system dependencies (organized by category for better caching)
 RUN --mount=type=cache,target=/var/cache/apt,id=base-apt \
-    apt-get update && apt-get install -y --no-install-recommends \
+    apt-install-with-retry \
     # Core system utilities
     ca-certificates \
     software-properties-common \
@@ -434,6 +461,8 @@ ARG USE_LATEST_SGLANG
 ARG GITHUB_ARTIFACTORY
 ARG MOONCAKE_VERSION
 ARG MOONCAKE_COMPILE_ARG
+ARG BYTED_INTERNAL_EXTRA_TOOLS_APT_URL
+ARG BYTED_INTERNAL_EXTRA_TOOLS_GPG_URL
 
 WORKDIR /sgl-workspace
 
@@ -547,6 +576,15 @@ elif [ "${CUDA_VERSION%%.*}" = "13" ]; then \
     python3 -m pip install cuda-python==13.2.0 ; \
 fi
 
+# Install IAAS internal packages and sources.
+RUN set -eux; \
+    http_proxy='' https_proxy='' python3 -m pip install https://eic-sdk-release.tos-cn-beijing.ivolces.com/python/eic-1.5.2-py3-none-any.whl; \
+    http_proxy='' https_proxy='' python3 -m pip install boto3; \
+    curl -fsSL ${BYTED_INTERNAL_EXTRA_TOOLS_GPG_URL} | gpg --dearmor -o /etc/apt/trusted.gpg.d/volc-extra-tools.gpg; \
+    echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/trusted.gpg.d/volc-extra-tools.gpg] ${BYTED_INTERNAL_EXTRA_TOOLS_APT_URL} jammy main" > /etc/apt/sources.list.d/volctools.list; \
+    apt-install-with-retry onion-ai-data; \
+    rm -rf /var/lib/apt/lists/*
+
 # Add yank script
 COPY --chown=root:root --chmod=755 docker/configs/yank /usr/local/bin/yank
 
@@ -592,6 +630,7 @@ ARG BUILD_TYPE
 ARG CUDA_VERSION
 ARG SGL_VERSION
 ARG USE_LATEST_SGLANG
+ARG INSTALL_LOCAL_SGL_KERNEL_WHEEL=0
 
 WORKDIR /sgl-workspace
 
@@ -612,6 +651,9 @@ RUN if [ "$BRANCH_TYPE" = "local" ]; then \
 RUN --mount=type=cache,target=/root/.cache/pip \
     cd /sgl-workspace/sglang \
     && python3 -m pip install --no-deps -e "python[${BUILD_TYPE}]" \
+    && if [ "$INSTALL_LOCAL_SGL_KERNEL_WHEEL" = "1" ]; then \
+        python3 -m pip install /sgl-workspace/sglang/.ci-artifacts/sgl-kernel/*.whl --force-reinstall --no-deps; \
+    fi \
     && kernels lock python \
     && ( success=0; for i in 1 2 3; do \
     echo "Attempt $i/3: downloading sgl-kernel cubins..." && \

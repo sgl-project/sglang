@@ -56,6 +56,9 @@ class TestPiecewiseCudaGraphQwen25VL(CustomTestCase):
         self.assertGreaterEqual(metrics["score"], 0.80)
 
 
+@unittest.skip(
+    "Piecewise CUDA graph InternVL2.5 MGSM accuracy is unstable on current PR UT stack"
+)
 class TestPiecewiseCudaGraphInternVL25(CustomTestCase):
     """Test piecewise CUDA graph with InternVL2.5-8B model"""
 

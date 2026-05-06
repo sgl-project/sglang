@@ -23,10 +23,10 @@ from tabulate import tabulate
 
 from sglang.srt.utils import kill_process_tree
 from sglang.srt.utils.hf_transformers_utils import get_tokenizer
+from sglang.srt.utils.network import get_open_port
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-    DEFAULT_URL_FOR_TEST,
     CustomTestCase,
     popen_launch_server,
 )
@@ -320,7 +320,7 @@ class TestSessionLatency(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         cls.model = "openai/gpt-oss-20b"
-        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.base_url = f"http://127.0.0.1:{get_open_port()}"
         # NOTE: Overlap scheduling commits KV cache one step ahead,
         # so the last decode token is cached (unlike non-overlap).
         # Disable overlap to keep session cache behavior consistent.

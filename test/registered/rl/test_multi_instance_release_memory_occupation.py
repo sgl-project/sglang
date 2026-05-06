@@ -1,6 +1,7 @@
 import gc
 import multiprocessing
 import os
+import signal
 import traceback
 import unittest
 from multiprocessing import Process
@@ -38,6 +39,9 @@ TEST_SUITE = dict(
 # Llama-3.2-1B bf16 is ~2GB total, ~1GB per TP rank.
 # KV cache with mem_fraction_static=0.83 is much larger.
 MIN_DELTA_MB = 200
+SUBPROCESS_RESULT_TIMEOUT = 600
+SUBPROCESS_JOIN_TIMEOUT = 120
+SUBPROCESS_TERMINATE_TIMEOUT = 30
 
 
 class EngineWrapper:
@@ -147,12 +151,39 @@ class TestMultiInstanceReleaseMemoryOccupation(CustomTestCase):
             )
             p.start()
             processes.append(p)
+        output_writer.close()
 
-        for _ in range(world_size):
-            self.assertTrue(
-                output_reader.recv(), f"Subprocess fail. Check the logs above."
+        try:
+            for _ in range(world_size):
+                self.assertTrue(
+                    output_reader.poll(SUBPROCESS_RESULT_TIMEOUT),
+                    "Timed out waiting for subprocess result.",
+                )
+                self.assertTrue(
+                    output_reader.recv(), f"Subprocess fail. Check the logs above."
+                )
+            for p in processes:
+                p.join(SUBPROCESS_JOIN_TIMEOUT)
+            alive_processes = [p for p in processes if p.is_alive()]
+            self.assertFalse(
+                alive_processes,
+                f"Subprocesses did not exit cleanly: {[p.pid for p in alive_processes]}",
             )
-        for p in processes:
+        finally:
+            output_reader.close()
+            _terminate_processes(processes)
+
+
+def _terminate_processes(processes):
+    for p in processes:
+        if p.is_alive():
+            p.terminate()
+    for p in processes:
+        if p.is_alive():
+            p.join(SUBPROCESS_TERMINATE_TIMEOUT)
+    for p in processes:
+        if p.is_alive():
+            os.kill(p.pid, signal.SIGKILL)
             p.join()
 
 
@@ -263,11 +294,17 @@ def _run_sglang_subprocess(
         traceback.print_exc()
         execution_ok = False
 
-    output_writer.send(execution_ok)
-    output_writer.close()
+    try:
+        output_writer.send(execution_ok)
+    except (BrokenPipeError, EOFError, OSError):
+        pass
+    finally:
+        output_writer.close()
 
-    if engine:
+    if execution_ok and engine:
         engine.shutdown()
+    if dist.is_initialized():
+        dist.destroy_process_group()
 
 
 if __name__ == "__main__":

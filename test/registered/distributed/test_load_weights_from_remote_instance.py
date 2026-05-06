@@ -38,7 +38,7 @@ from sglang.utils import terminate_process
 
 mp.set_start_method("spawn", force=True)
 
-register_cuda_ci(est_time=145, suite="stage-b-test-2-gpu-large")
+register_cuda_ci(est_time=130, suite="nightly-2-gpu", nightly=True)
 register_amd_ci(est_time=72, suite="stage-b-test-2-gpu-large-amd")
 
 
@@ -195,7 +195,9 @@ def init_process_dst(
             remote_instance_weight_loader_send_weights_group_ports=ports,
             load_format="remote_instance",
             remote_instance_weight_loader_backend=remote_instance_loader_backend,
-            remote_instance_weight_loader_start_seed_via_transfer_engine=False,
+            remote_instance_weight_loader_start_seed_via_transfer_engine=(
+                remote_instance_loader_backend == "transfer_engine"
+            ),
         )
     else:
         host, _, port = DEFAULT_URL_FOR_TEST.rpartition(":")
@@ -356,7 +358,6 @@ class TestLoadWeightsFromRemoteInstance(CustomTestCase):
         assert torch.cuda.device_count() >= 2, "At least 2 GPUs are required"
         # test_suits : tp, dp, model_name, backend, dst_instance_id
         if is_in_ci():
-            # FIXME: refactor this test to have less random behavior
             mode = random.choice(["Engine", "Server"])
             remote_instance_loader_backend = random.choice(["nccl", "transfer_engine"])
             test_suits = [

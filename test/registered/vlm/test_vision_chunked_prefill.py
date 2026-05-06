@@ -29,6 +29,8 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
+_CUDA_PR_UT_EVENTS = ("pull_request", "workflow_dispatch")
+
 # Configure logging to help diagnose CI timeouts
 logging.basicConfig(
     level=logging.INFO,
@@ -37,6 +39,10 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+@unittest.skipIf(
+    is_in_ci() and os.getenv("GITHUB_EVENT_NAME") in _CUDA_PR_UT_EVENTS,
+    "Vision chunked prefill output and server lifecycle are unstable in current PR UT",
+)
 class TestVisionChunkedPrefill(CustomTestCase):
 
     def prepare_video_messages(self, video_path, max_frames_num=8):

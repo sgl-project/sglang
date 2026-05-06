@@ -20,6 +20,7 @@ register_cuda_ci(est_time=130, suite="stage-b-test-1-gpu-large")
 register_amd_ci(est_time=1400, suite="stage-b-test-1-gpu-small-amd")
 
 
+@unittest.skip("Torch compile MoE is unstable on PR UT runners")
 class TestTorchCompileMoe(CustomTestCase):
     @classmethod
     def setUpClass(cls):

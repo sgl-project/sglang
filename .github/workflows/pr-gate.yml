@@ -12,7 +12,7 @@ on:
 
 jobs:
   pr-gate:
-    # 1. for commits on main: no gating needed
+    # 1. for commits on the target base branch: no gating needed
     # 2. for workflow_dispatch: this can only be triggered by users with write access
     runs-on: ubuntu-latest
     steps:
@@ -40,8 +40,8 @@ jobs:
           echo "PR Labels: ${{ steps.pr.outputs.labels }}"
           echo "PR Draft: ${{ steps.pr.outputs.draft }}"
           echo "PR User: ${{ steps.pr.outputs.user }}"
-          echo "Require run-ci: ${{ inputs.require-run-ci }}"
-          echo "Cool down minutes: ${{ inputs.cool-down-minutes }}"
+          echo "Require run-ci: ${{ inputs['require-run-ci'] }}"
+          echo "Cool down minutes: ${{ inputs['cool-down-minutes'] }}"
           echo "==================="
 
       - name: Block draft PR
@@ -51,7 +51,7 @@ jobs:
           exit 1
 
       - name: Require run-ci label (optional)
-        if:  github.event_name == 'pull_request' && inputs.require-run-ci == true
+        if:  github.event_name == 'pull_request' && inputs['require-run-ci'] == true
         run: |
           labels='${{ steps.pr.outputs.labels }}'
           if [[ "${{ contains(fromJson(steps.pr.outputs.labels), 'run-ci') }}" == "false" ]]; then
@@ -60,15 +60,16 @@ jobs:
           fi
 
       - name: Enforce rate limit for low-permission actors (optional)
-        if: github.event_name == 'pull_request' && inputs.cool-down-minutes > 0
+        if: github.event_name == 'pull_request' && inputs['cool-down-minutes'] > 0
         uses: actions/github-script@v7
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
-            const DEFAULT_MINUTES = Number("${{ inputs.cool-down-minutes }}");
+            const DEFAULT_MINUTES = Number("${{ inputs['cool-down-minutes'] }}");
             const owner = context.repo.owner;
             const repo = context.repo.repo;
             const eventName = context.eventName;
+            const baseRef = context.payload.pull_request?.base?.ref || process.env.GITHUB_REF_NAME || "main";
             const curRun = await github.rest.actions.getWorkflowRun({
               owner, repo, run_id: context.runId
             });
@@ -104,7 +105,7 @@ jobs:
                 owner,
                 repo,
                 path: ".github/CI_PERMISSIONS.json",
-                ref: "main",
+                ref: baseRef,
               });
 
               if (!Array.isArray(contentResp.data) && contentResp.data && "content" in contentResp.data) {

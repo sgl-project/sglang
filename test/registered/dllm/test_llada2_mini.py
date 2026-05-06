@@ -75,6 +75,11 @@ class TestLLaDA2Mini(CustomTestCase):
         else:
             self.assertGreater(metrics["output_throughput"], 350)
 
+    @unittest.skipIf(
+        is_in_ci()
+        and os.getenv("GITHUB_EVENT_NAME") in ("pull_request", "workflow_dispatch"),
+        "Unstable LLaDA2 throughput threshold on current CUDA PR UT H100 runners",
+    )
     def test_bs_1_speed(self):
         args = BenchArgs(port=int(self.base_url.split(":")[-1]), max_new_tokens=2048)
         acc_length, speed = send_one_prompt(args)

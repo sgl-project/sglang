@@ -22,7 +22,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=245, suite="stage-c-test-4-gpu-h100")
+register_cuda_ci(est_time=350, suite="nightly-4-gpu", nightly=True)
 register_amd_ci(est_time=350, suite="stage-c-test-4-gpu-amd")
 
 
@@ -56,11 +56,11 @@ class TestDPAttentionDP2TP4(
     def tearDownClass(cls):
         kill_process_tree(cls.process.pid)
 
-    def test_gsm8k(self):
+    def test_mgsm_en(self):
         args = SimpleNamespace(
             base_url=self.base_url,
             model=self.model,
-            eval_name="gsm8k",
+            eval_name="mgsm_en",
             num_examples=None,
             num_threads=1024,
         )

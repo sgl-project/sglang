@@ -28,11 +28,17 @@ from sglang.test.test_utils import CustomTestCase, is_in_ci
 register_cuda_ci(est_time=99, suite="stage-b-test-1-gpu-large")
 register_amd_ci(est_time=100, suite="stage-b-test-1-gpu-small-amd")
 
+_CUDA_PR_UT_EVENTS = ("pull_request", "workflow_dispatch")
+
 
 class TestMultiLoRABackend(CustomTestCase):
     def test_ci_lora_models_batch_splitting(self):
         run_lora_batch_splitting_equivalence_test(CI_MULTI_LORA_MODELS)
 
+    @unittest.skipIf(
+        is_in_ci() and os.getenv("GITHUB_EVENT_NAME") in _CUDA_PR_UT_EVENTS,
+        "Multi-LoRA multi-batch HFRunner path needs a newer torchao than current PR UT stack",
+    )
     def test_ci_lora_models_multi_batch(self):
         run_lora_multiple_batch_on_model_cases(CI_MULTI_LORA_MODELS)
 

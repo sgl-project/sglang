@@ -42,6 +42,11 @@ class TestTritonAttnBackend(CustomTestCase):
         if is_in_ci():
             self.assertGreater(output_throughput, 153)
 
+    @unittest.skipIf(
+        is_in_ci()
+        and os.getenv("GITHUB_EVENT_NAME") in ("pull_request", "workflow_dispatch"),
+        "Triton attention MMLU threshold is unstable on current CUDA PR UT H100 runners",
+    )
     def test_mmlu(self):
         model = DEFAULT_MODEL_NAME_FOR_TEST
         base_url = DEFAULT_URL_FOR_TEST

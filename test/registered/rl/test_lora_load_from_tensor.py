@@ -200,6 +200,11 @@ class TestLoRALoadFromTensor(CustomTestCase):
             "Output after applying LoRA does not match expected result",
         )
 
+    @unittest.skipIf(
+        is_in_ci()
+        and os.getenv("GITHUB_EVENT_NAME") in ("pull_request", "workflow_dispatch"),
+        "HF LoRA logprob path requires a newer torchao than the current CUDA PR UT image",
+    )
     def test_lora_logp_diff_with_huggingface(self):
         """
         Test comparing SGLang and HuggingFace LoRA logprobs when loading LoRA from tensors.

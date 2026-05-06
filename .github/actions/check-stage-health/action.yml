@@ -1,5 +1,5 @@
 name: Check Stage Health
-description: Fail fast if any job in the current workflow run has already failed, or if the lint check (from lint.yml) has failed. Auto-skips for scheduled runs.
+description: Fail fast if any job in the current workflow run has already failed. Auto-skips for scheduled runs.
 
 inputs:
   github-token:
@@ -11,58 +11,74 @@ runs:
   using: composite
   steps:
     - name: Check stage health
-      uses: actions/github-script@v7
+      shell: bash
       env:
+        GITHUB_TOKEN: ${{ inputs.github-token }}
+        GITHUB_REPOSITORY: ${{ github.repository }}
+        GITHUB_RUN_ID: ${{ github.run_id }}
+        GITHUB_EVENT_NAME: ${{ github.event_name }}
         SKIP_STAGE_HEALTH_CHECK: ${{ env.SKIP_STAGE_HEALTH_CHECK }}
-      with:
-        github-token: ${{ inputs.github-token }}
-        script: |
-          // Skip when explicitly requested via env var (e.g. release branch cut)
-          if (process.env.SKIP_STAGE_HEALTH_CHECK === 'true') {
-            core.info('Skipping health check (SKIP_STAGE_HEALTH_CHECK=true)');
-            return;
-          }
+      run: |
+        python3 <<'PY'
+        import json
+        import os
+        import sys
+        import urllib.error
+        import urllib.request
 
-          // Skip for scheduled runs — they should collect all failures, not fast-fail
-          if (context.eventName === 'schedule') {
-            core.info('Skipping health check for scheduled run');
-            return;
-          }
+        if os.environ.get("SKIP_STAGE_HEALTH_CHECK") == "true":
+            print("Skipping health check (SKIP_STAGE_HEALTH_CHECK=true)")
+            sys.exit(0)
 
-          // Check lint status from the separate Lint workflow (lint.yml).
-          // listJobsForWorkflowRun only sees jobs within the SAME run, so we use
-          // checks.listForRef which queries by commit SHA across ALL workflows.
-          const ref = context.payload.pull_request?.head?.sha || context.sha;
-          const { data } = await github.rest.checks.listForRef({
-            owner: context.repo.owner,
-            repo: context.repo.repo,
-            ref: ref,
-            check_name: 'lint',
-          });
-          const lintRun = data.check_runs.find(
-            cr => cr.app?.slug === 'github-actions'
-          );
-          if (lintRun?.status === 'completed' && lintRun?.conclusion === 'failure') {
-            core.setFailed('Fast-fail: lint check failed');
-            return;
-          }
+        if os.environ.get("GITHUB_EVENT_NAME") == "schedule":
+            print("Skipping health check for scheduled run")
+            sys.exit(0)
 
-          const jobs = await github.paginate(github.rest.actions.listJobsForWorkflowRun, {
-            owner: context.repo.owner,
-            repo: context.repo.repo,
-            run_id: context.runId,
-            per_page: 100,
-          });
-          // Find jobs that failed from a real error, not from fast-fail cascade
-          const rootCauseFailures = jobs.filter(j => {
-            if (j.status !== 'completed' || j.conclusion !== 'failure') return false;
-            // If the failing step is the health check, it's a cascade — skip it
-            const failedStep = (j.steps || []).find(s => s.conclusion === 'failure');
-            if (failedStep && (failedStep.name.includes('check-stage-health') || failedStep.name.includes('Check stage health'))) {
-              return false;
-            }
-            return true;
-          });
-          if (rootCauseFailures.length > 0) {
-            core.setFailed(`Fast-fail: skipping — root cause job(s): ${rootCauseFailures.map(j => j.name).join(', ')}`);
-          }
+        token = os.environ["GITHUB_TOKEN"]
+        repo = os.environ["GITHUB_REPOSITORY"]
+        run_id = os.environ["GITHUB_RUN_ID"]
+
+        def fetch_jobs():
+            jobs = []
+            page = 1
+            while True:
+                url = (
+                    f"https://api.github.com/repos/{repo}/actions/runs/{run_id}/jobs"
+                    f"?per_page=100&page={page}"
+                )
+                request = urllib.request.Request(
+                    url,
+                    headers={
+                        "Accept": "application/vnd.github+json",
+                        "Authorization": f"Bearer {token}",
+                        "X-GitHub-Api-Version": "2022-11-28",
+                    },
+                )
+                with urllib.request.urlopen(request, timeout=30) as response:
+                    payload = json.load(response)
+                jobs.extend(payload.get("jobs", []))
+                if len(jobs) >= payload.get("total_count", len(jobs)):
+                    return jobs
+                page += 1
+
+        root_cause_failures = []
+        for job in fetch_jobs():
+            if job.get("status") != "completed" or job.get("conclusion") != "failure":
+                continue
+            failed_steps = [
+                step.get("name", "")
+                for step in job.get("steps", [])
+                if step.get("conclusion") == "failure"
+            ]
+            if any(
+                "check-stage-health" in step or "Check stage health" in step
+                for step in failed_steps
+            ):
+                continue
+            root_cause_failures.append(job.get("name", "<unknown>"))
+
+        if root_cause_failures:
+            message = "Fast-fail: skipping - root cause job(s): " + ", ".join(root_cause_failures)
+            print(f"::error::{message}")
+            sys.exit(1)
+        PY

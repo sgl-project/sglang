@@ -34,163 +34,117 @@ runs:
   steps:
     - name: Wait for jobs to complete
       id: wait
-      uses: actions/github-script@v7
+      shell: bash
       env:
+        GITHUB_TOKEN: ${{ inputs.github-token }}
+        GITHUB_REPOSITORY: ${{ github.repository }}
+        GITHUB_RUN_ID: ${{ github.run_id }}
         INPUT_STAGE_NAME: ${{ inputs.stage-name }}
         INPUT_JOBS: ${{ inputs.jobs }}
         INPUT_MAX_WAIT_MINUTES: ${{ inputs.max-wait-minutes }}
         INPUT_POLL_INTERVAL_SECONDS: ${{ inputs.poll-interval-seconds }}
-      with:
-        github-token: ${{ inputs.github-token }}
-        script: |
-          const stageName = process.env.INPUT_STAGE_NAME;
-          const jobSpecs = JSON.parse(process.env.INPUT_JOBS);
-          const maxWaitMinutes = parseInt(process.env.INPUT_MAX_WAIT_MINUTES);
-          const pollIntervalSeconds = parseInt(process.env.INPUT_POLL_INTERVAL_SECONDS);
-          const maxAttempts = (maxWaitMinutes * 60) / pollIntervalSeconds;
+      run: |
+        python3 <<'PY'
+        import json
+        import os
+        import sys
+        import time
+        import urllib.request
 
-          // Normalize job specs into a uniform format
-          const normalizedSpecs = jobSpecs.map(spec => {
-            if (typeof spec === 'string') {
-              return { prefix: spec, expected_count: 1, exact: true };
-            }
-            return { ...spec, exact: false };
-          });
+        stage_name = os.environ["INPUT_STAGE_NAME"]
+        job_specs = json.loads(os.environ["INPUT_JOBS"])
+        max_wait_minutes = int(os.environ["INPUT_MAX_WAIT_MINUTES"])
+        poll_interval_seconds = int(os.environ["INPUT_POLL_INTERVAL_SECONDS"])
+        max_attempts = max(1, (max_wait_minutes * 60) // poll_interval_seconds)
+        token = os.environ["GITHUB_TOKEN"]
+        repo = os.environ["GITHUB_REPOSITORY"]
+        run_id = os.environ["GITHUB_RUN_ID"]
 
-          const totalExpectedJobs = normalizedSpecs.reduce((sum, s) => sum + s.expected_count, 0);
+        normalized_specs = []
+        for spec in job_specs:
+            if isinstance(spec, str):
+                normalized_specs.append({"prefix": spec, "expected_count": 1, "exact": True})
+            else:
+                normalized_specs.append({**spec, "exact": False})
 
-          const matchesSpec = (jobName, spec) => {
-            if (spec.exact) {
-              return jobName === spec.prefix;
-            }
-            return jobName === spec.prefix || jobName.startsWith(spec.prefix + ' (');
-          };
+        total_expected_jobs = sum(spec["expected_count"] for spec in normalized_specs)
 
-          // Use ETag conditional requests to avoid consuming rate limit when nothing changed.
-          // GitHub returns 304 Not Modified for unchanged data, which is FREE (no rate limit cost).
-          let lastEtag = '';
-          let lastJobs = null;
-          let apiCalls = 0;
-          let cachedCalls = 0;
+        def set_result(value):
+            github_output = os.environ.get("GITHUB_OUTPUT")
+            if github_output:
+                with open(github_output, "a", encoding="utf-8") as output:
+                    output.write(f"result={value}\n")
 
-          async function fetchJobs() {
-            const url = `GET /repos/{owner}/{repo}/actions/runs/{run_id}/jobs`;
-            const params = {
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              run_id: context.runId,
-              per_page: 100,
-              headers: {},
-            };
-            if (lastEtag) {
-              params.headers['if-none-match'] = lastEtag;
-            }
+        def matches_spec(job_name, spec):
+            if spec["exact"]:
+                return job_name == spec["prefix"]
+            return job_name == spec["prefix"] or job_name.startswith(spec["prefix"] + " (")
 
-            try {
-              const response = await github.request(url, params);
-              apiCalls++;
-              const rateRemaining = response.headers['x-ratelimit-remaining'] || '?';
-              const rateLimit = response.headers['x-ratelimit-limit'] || '?';
-              console.log(`[rate-limit] ${rateRemaining}/${rateLimit} remaining (ETag: ${lastEtag ? 'sent' : 'none'}) | this session: ${apiCalls} paid, ${cachedCalls} free`);
-              lastEtag = response.headers.etag || '';
-              const jobs = response.data.jobs;
+        def fetch_jobs():
+            jobs = []
+            page = 1
+            while True:
+                url = (
+                    f"https://api.github.com/repos/{repo}/actions/runs/{run_id}/jobs"
+                    f"?per_page=100&page={page}"
+                )
+                request = urllib.request.Request(
+                    url,
+                    headers={
+                        "Accept": "application/vnd.github+json",
+                        "Authorization": f"Bearer {token}",
+                        "X-GitHub-Api-Version": "2022-11-28",
+                    },
+                )
+                with urllib.request.urlopen(request, timeout=30) as response:
+                    payload = json.load(response)
+                    remaining = response.headers.get("x-ratelimit-remaining", "?")
+                    limit = response.headers.get("x-ratelimit-limit", "?")
+                if page == 1:
+                    print(f"[rate-limit] {remaining}/{limit} remaining")
+                jobs.extend(payload.get("jobs", []))
+                if len(jobs) >= payload.get("total_count", len(jobs)):
+                    return jobs
+                page += 1
 
-              // Handle pagination if >100 jobs
-              // ETag only covers page 1, so invalidate it to avoid stale cache
-              // when later pages change but page 1 doesn't.
-              if (response.data.total_count > 100) {
-                lastEtag = '';
-                for (let page = 2; page <= Math.ceil(response.data.total_count / 100); page++) {
-                  const { data: pageData } = await github.request(url, {
-                    ...params,
-                    page,
-                    headers: {},
-                  });
-                  jobs.push(...pageData.jobs);
-                }
-              }
+        for attempt in range(max_attempts):
+            jobs = fetch_jobs()
+            all_completed = True
+            failed_jobs = []
+            completed_count = 0
+            total_count = 0
 
-              lastJobs = jobs;
-              return { jobs, cached: false };
-            } catch (err) {
-              if (err.status === 304 && lastJobs) {
-                cachedCalls++;
-                console.log(`[rate-limit] 304 Not Modified | this session: ${apiCalls} paid, ${cachedCalls} free`);
-                return { jobs: lastJobs, cached: true };
-              }
-              throw err;
-            }
-          }
+            for spec in normalized_specs:
+                matching_jobs = [job for job in jobs if matches_spec(job.get("name", ""), spec)]
+                for job in matching_jobs:
+                    total_count += 1
+                    print(f"{job.get('name')}: status={job.get('status')}, conclusion={job.get('conclusion')}")
+                    if job.get("status") == "completed":
+                        completed_count += 1
+                        if job.get("conclusion") not in ("success", "skipped"):
+                            failed_jobs.append(job.get("name", "<unknown>"))
+                    else:
+                        all_completed = False
 
-          for (let attempt = 0; attempt < maxAttempts; attempt++) {
-            const { jobs, cached } = await fetchJobs();
+                if len(matching_jobs) < spec["expected_count"]:
+                    print(f"{spec['prefix']}: found {len(matching_jobs)}/{spec['expected_count']} jobs (waiting for more)")
+                    all_completed = False
 
-            let allCompleted = true;
-            let failedJobs = [];
-            let completedCount = 0;
-            let totalCount = 0;
+            print(f"[{stage_name}] Progress: {completed_count}/{total_count} jobs completed (expected {total_expected_jobs})")
 
-            for (const spec of normalizedSpecs) {
-              const matchingJobs = jobs.filter(job => matchesSpec(job.name, spec));
+            if failed_jobs:
+                set_result("failure")
+                print(f"::error::{stage_name} jobs failed: {', '.join(failed_jobs)}")
+                sys.exit(1)
 
-              for (const job of matchingJobs) {
-                totalCount++;
-                if (!cached) {
-                  console.log(`${job.name}: status=${job.status}, conclusion=${job.conclusion}`);
-                }
+            if all_completed and total_count >= total_expected_jobs:
+                set_result("success")
+                sys.exit(0)
 
-                if (job.status === 'completed') {
-                  completedCount++;
-                  if (job.conclusion !== 'success' && job.conclusion !== 'skipped') {
-                    failedJobs.push(job.name);
-                  }
-                } else {
-                  allCompleted = false;
-                }
-              }
+            print(f"Waiting {poll_interval_seconds}s... (attempt {attempt + 1}/{max_attempts})")
+            time.sleep(poll_interval_seconds)
 
-              if (matchingJobs.length < spec.expected_count) {
-                // Job-level `if:` is evaluated before matrix expansion. When it
-                // evaluates false, GitHub emits exactly one "skipped" entry using
-                // the un-expanded job name (bare prefix, no " (shard)" suffix)
-                // instead of N matrix entries. Detect that precise shape so we
-                // don't poll forever — and so we don't mistake a partially
-                // materialized dynamic/reusable matrix for a skipped one.
-                const unexpandedSkip = matchingJobs.length === 1 &&
-                  matchingJobs[0].name === spec.prefix &&
-                  matchingJobs[0].status === 'completed' &&
-                  matchingJobs[0].conclusion === 'skipped';
-                if (unexpandedSkip) {
-                  const missing = spec.expected_count - 1;
-                  totalCount += missing;
-                  completedCount += missing;
-                  if (!cached) {
-                    console.log(`${spec.prefix}: job-level skip (bare entry, conclusion=skipped); treating as all ${spec.expected_count} skipped`);
-                  }
-                } else {
-                  console.log(`${spec.prefix}: found ${matchingJobs.length}/${spec.expected_count} jobs (waiting for more)`);
-                  allCompleted = false;
-                }
-              }
-            }
-
-            console.log(`[${stageName}] Progress: ${completedCount}/${totalCount} jobs completed (expected ${totalExpectedJobs})${cached ? ' (cached, no rate limit cost)' : ''}`);
-
-            // Fail fast if any jobs failed
-            if (failedJobs.length > 0) {
-              core.setOutput('result', 'failure');
-              core.setFailed(`${stageName} jobs failed: ${failedJobs.join(', ')}`);
-              return;
-            }
-
-            if (allCompleted && totalCount >= totalExpectedJobs) {
-              core.setOutput('result', 'success');
-              return;
-            }
-
-            console.log(`Waiting ${pollIntervalSeconds}s... (attempt ${attempt + 1}/${maxAttempts})`);
-            await new Promise(resolve => setTimeout(resolve, pollIntervalSeconds * 1000));
-          }
-
-          core.setFailed(`Timeout waiting for ${stageName} jobs`);
-          core.setOutput('result', 'timeout');
+        set_result("timeout")
+        print(f"::error::Timeout waiting for {stage_name} jobs")
+        sys.exit(1)
+        PY

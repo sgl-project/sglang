@@ -14,7 +14,7 @@ on:
         description: "Version to build (without v prefix, e.g., 0.5.7)"
         required: true
       image_repo:
-        description: "Docker Hub repo to push to. Use lmsysorg/sglang-staging for testing."
+        description: "Upstream-only Docker Hub repo. Ignored by bytedance-iaas Volcengine builds."
         required: false
         default: "lmsysorg/sglang"
 

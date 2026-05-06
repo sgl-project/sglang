@@ -24,6 +24,11 @@ from sglang.test.test_utils import (
 register_cuda_ci(est_time=509, suite="stage-b-test-2-gpu-large")
 
 
+@unittest.skipIf(
+    is_in_ci()
+    and os.getenv("GITHUB_EVENT_NAME") in ("pull_request", "workflow_dispatch"),
+    "Disaggregation accuracy server setup is unstable in current hostNetwork PR UT",
+)
 class TestDisaggregationAccuracy(PauseResumeInPlaceMixin, PDDisaggregationServerBase):
     @classmethod
     def setUpClass(cls):
