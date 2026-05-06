@@ -491,7 +491,7 @@ def mhc_pre_big_fuse_with_norm_tilelang(
     hc_mult3 = hc_mult * (2 + hc_mult)
     if gemm_last_dim < 0:
         gemm_last_dim = hc_mult3
-    hidden_block = math.gcd(512, hidden_size)
+    hidden_block = math.gcd(1024, hidden_size)
 
     gemm_out_mul: T.Tensor[[n_splits, num_tokens, gemm_last_dim], T.float32]
     gemm_out_sqrsum: T.Tensor[[n_splits, num_tokens], T.float32]
@@ -501,7 +501,7 @@ def mhc_pre_big_fuse_with_norm_tilelang(
     post_mix: T.Tensor[[num_tokens, hc_mult], T.float32]
     comb_mix: T.Tensor[[num_tokens, hc_mult * hc_mult], T.float32]
     layer_input: T.Tensor[[num_tokens, hidden_size], T.bfloat16]
-    norm_weight: T.Tensor[[hidden_size], T.float32]
+    norm_weight: T.Tensor[[hidden_size], T.bfloat16]
 
     ENABLE_PDL = is_arch_support_pdl()
     with T.Kernel(num_tokens, threads=96) as i:
@@ -575,17 +575,26 @@ def mhc_pre_big_fuse_with_norm_tilelang(
                     + hc_pre_eps
                 )
 
-            # Stash unnormalized weighted-sum output in shared memory; we
-            # need it again in the second sweep after sum_sq is reduced.
-            output_shared = T.alloc_shared(hidden_size, T.float32)
-            sumsq = T.alloc_fragment(1, T.float32)
-            sumsq[0] = T.float32(0.0)
+            # Stash unnormalized weighted-sum output in shared memory as
+            # bf16 (matches the rounding the reference path does when sgl
+            # RMSNorm reads bf16). 14KB at hidden=7168 vs 28KB if fp32.
+            output_shared = T.alloc_shared(hidden_size, T.bfloat16)
+            # Per-position partial sumsq accumulator. Each iteration adds
+            # its tile's ol*ol into the same hidden_block-sized fragment;
+            # since addition is commutative over hidden positions, this
+            # has no cross-iteration scalar dependency and pipelines.
+            sumsq_per_pos = T.alloc_fragment(hidden_block, T.float32)
+            T.clear(sumsq_per_pos)
 
-            for i0_h in T.serial(hidden_size // hidden_block):
-                xs = T.alloc_shared((hc_mult, hidden_block), T.float32)
+            for i0_h in T.Pipelined(hidden_size // hidden_block, num_stages=3):
+                # Stage residual as bf16 (matches storage dtype) — halves the
+                # shared-mem footprint of the staging buffer vs fp32 (8KB→4KB
+                # per stage at hc_mult=4, hidden_block=512), freeing room for
+                # higher CTA occupancy.
+                xs = T.alloc_shared((hc_mult, hidden_block), T.bfloat16)
                 xl = T.alloc_fragment((hc_mult, hidden_block), T.float32)
                 T.copy(residual[i, 0, i0_h * hidden_block], xs)
-                T.copy(xs, xl)
+                T.copy(xs, xl)  # bf16 → fp32 happens in this register copy
 
                 ol = T.alloc_fragment(hidden_block, T.float32)
                 T.clear(ol)
@@ -595,30 +604,26 @@ def mhc_pre_big_fuse_with_norm_tilelang(
                     for i1_h in T.Parallel(hidden_block):
                         ol[i1_h] += pre * xl[i_hc, i1_h]
 
-                ol_sq = T.alloc_fragment(hidden_block, T.float32)
                 for i1_h in T.Parallel(hidden_block):
-                    ol_sq[i1_h] = ol[i1_h] * ol[i1_h]
+                    sumsq_per_pos[i1_h] += ol[i1_h] * ol[i1_h]
+                    output_shared[i0_h * hidden_block + i1_h] = T.bfloat16(ol[i1_h])
 
-                tile_sumsq = T.alloc_fragment(1, T.float32)
-                T.reduce_sum(ol_sq, tile_sumsq, dim=0)
-                sumsq[0] += tile_sumsq[0]
-
-                for i1_h in T.Parallel(hidden_block):
-                    output_shared[i0_h * hidden_block + i1_h] = ol[i1_h]
-
+            # Single CTA-wide reduce after pass 1.
+            sumsq = T.alloc_fragment(1, T.float32)
+            T.reduce_sum(sumsq_per_pos, sumsq, dim=0)
             rsqrt_norm = T.alloc_fragment(1, T.float32)
             rsqrt_norm[0] = T.rsqrt(sumsq[0] / hidden_size + norm_eps)
 
             for i0_h in T.Pipelined(hidden_size // hidden_block, num_stages=2):
-                w_shared = T.alloc_shared(hidden_block, T.float32)
+                w_shared = T.alloc_shared(hidden_block, T.bfloat16)
                 w_local = T.alloc_fragment(hidden_block, T.float32)
                 T.copy(norm_weight[i0_h * hidden_block], w_shared)
-                T.copy(w_shared, w_local)
+                T.copy(w_shared, w_local)  # bf16 → fp32 in register
 
                 ol = T.alloc_fragment(hidden_block, T.float32)
                 for i1_h in T.Parallel(hidden_block):
                     ol[i1_h] = (
-                        output_shared[i0_h * hidden_block + i1_h]
+                        T.float32(output_shared[i0_h * hidden_block + i1_h])
                         * rsqrt_norm[0]
                         * w_local[i1_h]
                     )
@@ -760,11 +765,14 @@ def mhc_pre(
         assert norm_weight.shape == (hidden_size,), (
             f"norm_weight shape {tuple(norm_weight.shape)} != (hidden_size={hidden_size},)"
         )
-        norm_weight_f = (
-            norm_weight.float() if norm_weight.dtype != torch.float32 else norm_weight
-        )
-        if not norm_weight_f.is_contiguous():
-            norm_weight_f = norm_weight_f.contiguous()
+        # The kernel takes bf16 norm_weight directly to skip a per-call dtype
+        # cast. Production RMSNorm.weight is bf16 after model.to(bf16); for an
+        # fp32 weight we cast once but warn since this signals the calling
+        # module wasn't dtype-cast as expected.
+        if norm_weight.dtype != torch.bfloat16:
+            norm_weight = norm_weight.to(torch.bfloat16)
+        if not norm_weight.is_contiguous():
+            norm_weight = norm_weight.contiguous()
         mhc_pre_big_fuse_with_norm_tilelang(
             gemm_out_mul,
             gemm_out_sqrsum,
@@ -774,7 +782,7 @@ def mhc_pre(
             post_mix,
             comb_mix,
             layer_input,
-            norm_weight_f,
+            norm_weight,
             hidden_size,
             rms_eps,
             hc_pre_eps,

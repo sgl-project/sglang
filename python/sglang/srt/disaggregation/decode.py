@@ -1130,9 +1130,12 @@ class SchedulerDisaggregationDecodeMixin:
                 self.server_args.disaggregation_decode_polling_interval
             )
 
-        self.polling_count = (self.polling_count + 1) % self.polling_interval
+        self.polling_count = (self.polling_count + 1) % 256
+        
+        flag1 = self.polling_count % 4 == 0 or (self.last_batch and len(self.last_batch.reqs) < 450)
+        flag2 = self.polling_count % 8 == 0 or (self.last_batch and len(self.last_batch.reqs) < 650)
 
-        if self.polling_count % self.polling_interval == 0 or (self.last_batch and len(self.last_batch.reqs) < 450):
+        if  flag1 and flag2:
             req_conns, _ = self.disagg_decode_prealloc_queue.pop_preallocated()
             self.disagg_decode_transfer_queue.extend(req_conns)
             alloc_reqs = (
