@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
+from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.mem_cache.base_prefix_cache import (
     EvictParams,
     EvictResult,
@@ -13,7 +14,6 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchResult,
 )
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
-from sglang.srt.configs.model_config import AttentionArch
 
 try:
     from lmcache.integration.sglang.sglang_adapter import (
@@ -96,9 +96,14 @@ class LMCRadixCache(RadixCache):
             k_pool=getattr(
                 kvcache,
                 "k_buffer",
-                getattr(self.token_to_kv_pool_allocator._kvcache, 
-                        "kv_buffer" if model_config.attention_arch == AttentionArch.MLA 
-                        else "k_buffer"),
+                getattr(
+                    self.token_to_kv_pool_allocator._kvcache,
+                    (
+                        "kv_buffer"
+                        if model_config.attention_arch == AttentionArch.MLA
+                        else "k_buffer"
+                    ),
+                ),
             ),
             v_pool=getattr(
                 kvcache,
