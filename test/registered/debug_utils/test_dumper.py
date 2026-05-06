@@ -5,7 +5,6 @@ import re
 import sys
 import threading
 import time
-import traceback
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Optional

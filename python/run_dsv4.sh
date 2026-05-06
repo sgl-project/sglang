@@ -26,9 +26,10 @@ export SGLANG_REASONING_EFFORT=max
 export SGLANG_FORCE_TRITON_MOE_FP8=0
 export SGLANG_OPT_USE_AITER_MHC_PRE=true
 export SGLANG_OPT_USE_AITER_MHC_POST=true
+export SGLANG_OPT_USE_TRITON_SWA_PREPARE=true
 
 MODEL=/dockerx/data/deepseek-ai/DeepSeek-V4-Pro
-MODEL=/dockerx/data/sgl-project/DeepSeek-V4-Flash-FP8/
+#MODEL=/dockerx/data/sgl-project/DeepSeek-V4-Flash-FP8/
 
 python3 -m sglang.launch_server \
     --model-path ${MODEL} \
