@@ -68,7 +68,7 @@ def run_cfg_parallel(
         _logged_dispatch_keys.add(dispatch_key)
         branch_names = [branches[i].name for i in my_indices] if my_indices else ["(idle)"]
         logger.info(
-            "CFG parallel dispatch: rank %d/%d → [%s]",
+            "CFG parallel dispatch: rank %d/%d -> [%s]",
             cfg_rank,
             cfg_world_size,
             ", ".join(branch_names),
@@ -93,14 +93,14 @@ def run_cfg_parallel(
     while len(my_preds) < max_per_rank:
         my_preds.append(tuple(torch.zeros_like(t) for t in ref))
 
-    # All-gather each slot × output element with separate_tensors=True.
-    # all_slots[slot][elem] = list[Tensor] indexed by CFG rank — no reshape.
+    # All-gather each slot and output element with separate_tensors=True.
+    # all_slots[slot][elem] = list[Tensor] indexed by CFG rank; no reshape.
     all_slots: list[list[list[torch.Tensor]]] = [
         [cfg_model_parallel_all_gather(p, dim=0, separate_tensors=True) for p in slot_pred]
         for slot_pred in my_preds
     ]
 
-    # Reconstruct in branch order: branch bid → owner rank (bid % W), slot (bid // W).
+    # Reconstruct in branch order: branch bid -> owner rank, slot.
     n_elems = len(ref)
     final: list[torch.Tensor | tuple[torch.Tensor, ...]] = []
     for bid in range(n_branches):
@@ -118,8 +118,8 @@ def dispatch_branches(n_branches: int, n_ranks: int) -> list[list[int]]:
     branch indices assigned to rank ``r``.  Branch ``i`` goes to rank
     ``i % n_ranks``.
 
-    Example — 4 passes, 2 GPUs:
-        rank 0 → [0, 2],  rank 1 → [1, 3]
+    Example: 4 passes, 2 GPUs:
+        rank 0 -> [0, 2],  rank 1 -> [1, 3]
     """
     assignments: list[list[int]] = [[] for _ in range(n_ranks)]
     for i in range(n_branches):

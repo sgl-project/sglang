@@ -90,7 +90,7 @@ class CFGPolicy:
         return _unwrap(tuple(results))
 
 
-# ── helpers used by CFGPolicy and run_cfg_parallel ──────────────────────────
+# Helpers used by CFGPolicy and run_cfg_parallel.
 
 def _wrap(
     pred: torch.Tensor | tuple[torch.Tensor, ...],
