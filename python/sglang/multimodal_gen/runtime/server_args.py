@@ -75,6 +75,7 @@ logger = init_logger(__name__)
 WAN_LAYERWISE_OFFLOAD_AUTO_DISABLE_MEM_GB = 130
 LTX2_TWO_STAGE_DEVICE_MODES = ("original", "snapshot", "resident")
 LTX2_TWO_STAGE_PIPELINE_NAMES = ("LTX2TwoStagePipeline", "LTX2TwoStageHQPipeline")
+TRANSFORMER_WEIGHT_QUANTIZATION_CHOICES = ("fp8-cast",)
 # H200-class GPUs (>=130 GiB total) can usually keep both LTX2 DiTs resident.
 LTX2_RESIDENT_AUTO_ENABLE_MEM_GB = 130
 
@@ -184,6 +185,8 @@ class ServerArgs(DisaggArgsMixin):
 
     # path to pre-quantized transformer weights (single .safetensors or directory).
     transformer_weights_path: str | None = None
+    # post-load transformer weight cast, currently used to match LTX official fp8-cast.
+    transformer_weight_quantization: str | None = None
     # can restrict layers to adapt, e.g. ["q_proj"]
     # Will adapt only q, k, v, o by default.
     lora_target_modules: list[str] | None = None
@@ -317,6 +320,7 @@ class ServerArgs(DisaggArgsMixin):
         self._adjust_offload()
         self._adjust_ltx2_two_stage_device_mode()
         self._adjust_path()
+        self._adjust_transformer_weight_quantization()
         self._adjust_quant_config()
         self._adjust_warmup()
         self._adjust_network_ports()
@@ -358,6 +362,17 @@ class ServerArgs(DisaggArgsMixin):
         if resolution.transformer_weights_path:
             self.transformer_weights_path = resolution.transformer_weights_path
         self.nunchaku_config = resolution.nunchaku_config
+
+    def _adjust_transformer_weight_quantization(self):
+        if self.transformer_weight_quantization is None:
+            return
+        quantization = self.transformer_weight_quantization.lower()
+        if quantization not in TRANSFORMER_WEIGHT_QUANTIZATION_CHOICES:
+            raise ValueError(
+                f"Invalid transformer_weight_quantization={quantization!r}. "
+                f"Expected one of {TRANSFORMER_WEIGHT_QUANTIZATION_CHOICES}."
+            )
+        self.transformer_weight_quantization = quantization
 
     def adjust_pipeline_config(self):
         # enable parallel folding when SP is enabled
@@ -1236,6 +1251,17 @@ class ServerArgs(DisaggArgsMixin):
             type=str,
             default=ServerArgs.lora_weight_name,
             help="Specific safetensors filename to load from a multi-file LoRA repo",
+        )
+        parser.add_argument(
+            "--transformer-weight-quantization",
+            type=str,
+            choices=TRANSFORMER_WEIGHT_QUANTIZATION_CHOICES,
+            default=ServerArgs.transformer_weight_quantization,
+            help=(
+                "Post-load transformer weight quantization. "
+                "'fp8-cast' stores selected transformer linear weights in FP8 "
+                "and upcasts them during inference; disabled by default."
+            ),
         )
         # Add pipeline configuration arguments
         PipelineConfig.add_cli_args(parser)
