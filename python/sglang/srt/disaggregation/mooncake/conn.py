@@ -1753,13 +1753,6 @@ class MooncakeKVSender(CommonKVSender):
             )
         raise KVTransferError(self.bootstrap_room, failure_reason)
 
-    def abort(self):
-        self.kv_mgr.record_failure(
-            self.bootstrap_room,
-            "Aborted by AbortReq.",
-        )
-        self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
-        self.conclude_state = KVPoll.Failed
 
 
 class MooncakeKVReceiver(CommonKVReceiver):
@@ -1942,13 +1935,6 @@ class MooncakeKVReceiver(CommonKVReceiver):
             )
         raise KVTransferError(self.bootstrap_room, failure_reason)
 
-    def abort(self):
-        self.kv_mgr.record_failure(
-            self.bootstrap_room,
-            "Aborted by AbortReq.",
-        )
-        self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
-        self.conclude_state = KVPoll.Failed
 
 
 class MooncakeKVBootstrapServer(CommonKVBootstrapServer):
