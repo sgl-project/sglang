@@ -1,10 +1,3 @@
-"""Static check that no test file calls `pytest.main(...)` bare in its
-`__main__` block. The CI runner (`ci_utils.run_files`) decides pass/fail by
-reading the wrapping python script's exit code; a bare `pytest.main([__file__])`
-discards pytest's exit code, so the script returns 0 even when assertions fail
-and the runner silently reports the file as PASSED.
-"""
-
 import ast
 import pathlib
 import unittest
