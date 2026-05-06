@@ -845,7 +845,7 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         batch: Req,
         server_args: ServerArgs,
     ) -> bool:
-        """Apply cooperative cancellation before launching the next denoise step."""
+        """Compact cancelled members; raise if no active request remains."""
         result = compact_batch(batch=batch, ctx=ctx, server_args=server_args)
         if result.compacted:
             self.log_info(
