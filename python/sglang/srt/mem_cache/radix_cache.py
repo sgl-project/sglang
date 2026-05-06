@@ -336,7 +336,10 @@ class RadixCache(BasePrefixCache):
 
         if self.token_to_kv_pool_allocator:
             dev = self.token_to_kv_pool_allocator.device
-            self.device = dev if isinstance(dev, torch.device) else torch.device("cpu")
+            if isinstance(dev, (str, torch.device)):
+                self.device = torch.device(dev)
+            else:
+                self.device = torch.device("cpu")
         else:
             self.device = torch.device("cpu")
 
