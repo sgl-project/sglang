@@ -2290,7 +2290,7 @@ def dpsk_v4_fp8_attention_fwd(
     Follows the original `flash_mla.flash_mla_with_kvcache` signature.
     """
     if _is_gfx95_supported:
-        block_I, threads, num_stages, block_per_cu, cu = 64, 512, 0, 2, 256
+        block_I, threads, num_stages, block_per_cu, cu = 32, 512, 0, 2, 256
     # else:
     #     block_I, threads, num_stages, block_per_cu, cu = 32, 128, 1, 1, 304
 

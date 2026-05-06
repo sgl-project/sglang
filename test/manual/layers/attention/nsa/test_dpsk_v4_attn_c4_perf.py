@@ -26,8 +26,8 @@ or:
 """
 
 from __future__ import annotations
-import os
-os.system("rm -rf ~/.tilelang")
+# import os
+# os.system("rm -rf ~/.tilelang")
 
 from typing import Any, Dict, Tuple
 
@@ -272,10 +272,12 @@ def test_dpsk_v4_c4_perf():
 if __name__ == "__main__":
     inputs = _build_inputs(PERF_BATCH, PERF_SWA_BLOCKS, PERF_EXTRA_BLOCKS)
     out, lse = dpsk_v4_fp8_attention_fwd(**inputs)
+    out, lse = dpsk_v4_fp8_attention_fwd(**inputs)
 
+    torch.cuda.synchronize()
     print(f"out.shape = {tuple(out.shape)} dtype = {out.dtype}")
     print(f"lse.shape = {tuple(lse.shape)} dtype = {lse.dtype}")
-
+    1/0
     print("\n[correctness] running torch ref on full perf shape ...")
     out_ref, lse_ref = flash_mla_with_kvcache_torch(**inputs)
     # ref returns lse as [b, h_q, s_q]; kernel as [b, s_q, h_q]. Align.
