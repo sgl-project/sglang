@@ -218,12 +218,13 @@ class HisaIndexer(MultiPlatformOp):
         # positions for PAGED decode, -1 padding). The downstream consumer
         # at nsa_backend.py:1357 must take the *unfused* branch — otherwise
         # it would treat our output as an already-transformed page_table and
-        # break. Enforce by asserting SGLANG_NSA_FUSE_TOPK=0.
-        assert not envs.SGLANG_NSA_FUSE_TOPK.get(), (
-            "HisaIndexer requires SGLANG_NSA_FUSE_TOPK=0 (unfused topk path). "
-            "Launch sglang with this env var set; downstream handles the "
-            "page_table / +topk_indices_offset mapping on top of our output."
-        )
+        # break.
+        if envs.SGLANG_NSA_FUSE_TOPK.get():
+            raise NotImplementedError(
+                "HisaIndexer requires SGLANG_NSA_FUSE_TOPK=0 (unfused topk path). "
+                "The fused-topk path would skip the Python fast_topk_v2 + "
+                "coord_transform bridge that HisaIndexer relies on."
+            )
         self.hidden_size = hidden_size
         self.n_heads = index_n_heads
         self.head_dim = index_head_dim

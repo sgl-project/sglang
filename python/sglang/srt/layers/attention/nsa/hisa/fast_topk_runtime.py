@@ -81,6 +81,15 @@ def fast_topk_runtime(score: torch.Tensor, topk: int) -> torch.Tensor:
         ``[B, topk]`` i32 — top-``topk`` indices (unsorted). No ``-1``
         sentinels (since ``L >= topk``).
     """
+    if not 0 < topk <= MAX_TOPK:
+        raise ValueError(
+            f"fast_topk_runtime: topk={topk} out of supported range (0, {MAX_TOPK}]"
+        )
+    if topk > score.size(1):
+        raise ValueError(
+            f"fast_topk_runtime: topk={topk} > score.size(1)={score.size(1)}; "
+            "caller must clamp topk to row width."
+        )
     indices = score.new_empty((score.size(0), topk), dtype=torch.int32)
     torch.ops.hisa_fast_topk.fast_topk_runtime(score, indices)
     return indices
