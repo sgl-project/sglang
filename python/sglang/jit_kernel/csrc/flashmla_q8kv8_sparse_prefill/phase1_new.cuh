@@ -424,6 +424,33 @@ struct KernelTemplateQ8New {
         }
       };
 
+      auto undo_v_transpose_col_permutation = [&]() {
+        // Undo the column permutation from the fp8 V transpose before writing O.
+        // CLayout_64x256: col bit0 = t1_bit0 (thread), col bit3 = v1 (register).
+        // V transpose introduces bit0<->bit3 swap. Fix by cross-thread exchange:
+        //   thread with t1_bit0=0, v1=1 <-> thread with t1_bit0=1, v1=0
+        // Within each 4-element group (same v2=row): idx%4 in {0,1} are v1=0, {2,3} are v1=1.
+        int t1_bit0 = (threadIdx.x >> 2) & 1;
+#pragma unroll
+        for (int g = 0; g < 32; g++) {
+          float a = rO(4 * g + 0);
+          float b = rO(4 * g + 1);
+          float c = rO(4 * g + 2);
+          float d = rO(4 * g + 3);
+          float send0 = t1_bit0 ? a : c;
+          float send1 = t1_bit0 ? b : d;
+          float recv0 = __shfl_xor_sync(0xFFFFFFFF, send0, 4);
+          float recv1 = __shfl_xor_sync(0xFFFFFFFF, send1, 4);
+          if (t1_bit0 == 0) {
+            rO(4 * g + 2) = recv0;
+            rO(4 * g + 3) = recv1;
+          } else {
+            rO(4 * g + 0) = recv0;
+            rO(4 * g + 1) = recv1;
+          }
+        }
+      };
+
       // ============================================================
       // WG0 Pipeline -- native fp8
       // ============================================================
@@ -535,35 +562,7 @@ struct KernelTemplateQ8New {
           }
         }
 
-        // Undo the column permutation from the fp8 V transpose before writing O.
-        // CLayout_64x256: col bit0 = t1_bit0 (thread), col bit3 = v1 (register).
-        // V transpose introduces bit0<->bit3 swap. Fix by cross-thread exchange:
-        //   thread with t1_bit0=0, v1=1 <-> thread with t1_bit0=1, v1=0
-        // Within each 4-element group (same v2=row): idx%4 in {0,1} are v1=0, {2,3} are v1=1.
-        {
-          int t1_bit0 = (threadIdx.x >> 2) & 1;
-#pragma unroll
-          for (int g = 0; g < 32; g++) {
-            // v1=0 elements (correct for t1_bit0=0, wrong for t1_bit0=1)
-            float a = rO(4 * g + 0);
-            float b = rO(4 * g + 1);
-            // v1=1 elements (wrong for t1_bit0=0, correct for t1_bit0=1)
-            float c = rO(4 * g + 2);
-            float d = rO(4 * g + 3);
-            // Each thread sends its "wrong" values; partner sends theirs
-            float send0 = t1_bit0 ? a : c;
-            float send1 = t1_bit0 ? b : d;
-            float recv0 = __shfl_xor_sync(0xFFFFFFFF, send0, 4);
-            float recv1 = __shfl_xor_sync(0xFFFFFFFF, send1, 4);
-            if (t1_bit0 == 0) {
-              rO(4 * g + 2) = recv0;
-              rO(4 * g + 3) = recv1;
-            } else {
-              rO(4 * g + 0) = recv0;
-              rO(4 * g + 1) = recv1;
-            }
-          }
-        }
+        undo_v_transpose_col_permutation();
 
         reduce_L();
         store_O();
@@ -657,28 +656,7 @@ struct KernelTemplateQ8New {
           }
         }
 
-        // Undo the fp8 V-transpose column permutation for WG1.
-        {
-          int t1_bit0 = (threadIdx.x >> 2) & 1;
-#pragma unroll
-          for (int g = 0; g < 32; g++) {
-            float a = rO(4 * g + 0);
-            float b = rO(4 * g + 1);
-            float c = rO(4 * g + 2);
-            float d = rO(4 * g + 3);
-            float send0 = t1_bit0 ? a : c;
-            float send1 = t1_bit0 ? b : d;
-            float recv0 = __shfl_xor_sync(0xFFFFFFFF, send0, 4);
-            float recv1 = __shfl_xor_sync(0xFFFFFFFF, send1, 4);
-            if (t1_bit0 == 0) {
-              rO(4 * g + 2) = recv0;
-              rO(4 * g + 3) = recv1;
-            } else {
-              rO(4 * g + 0) = recv0;
-              rO(4 * g + 1) = recv1;
-            }
-          }
-        }
+        undo_v_transpose_col_permutation();
 
         reduce_L();
         store_O();
