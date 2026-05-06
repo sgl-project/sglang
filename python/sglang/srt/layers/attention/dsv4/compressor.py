@@ -20,7 +20,7 @@ from sglang.srt.layers.attention.dsv4.quant_k_cache import (
 )
 from sglang.srt.layers.attention.nsa.triton_kernel import act_quant
 from sglang.srt.layers.attention.nsa.utils import nsa_use_prefill_cp
-from sglang.srt.layers.dp_attention import get_attention_tp_size
+from sglang.srt.layers.dp_attention import get_attention_cp_size
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.utils.cp_utils import cp_all_gather_rerange_output
@@ -355,7 +355,7 @@ class Compressor(nn.Module):
         if nsa_use_prefill_cp(forward_batch):
             kv_score = cp_all_gather_rerange_output(
                 kv_score,
-                get_attention_tp_size(),
+                get_attention_cp_size(),
                 forward_batch,
                 torch.cuda.current_stream(),
             )
