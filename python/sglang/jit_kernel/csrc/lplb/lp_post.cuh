@@ -15,26 +15,31 @@
 //
 // Single-block launch. `phy_prob` lives in shared memory.
 
-#include <dlpack/dlpack.h>
-#include <tvm/ffi/container/tensor.h>
-
 #include <sgl_kernel/tensor.h>
 #include <sgl_kernel/utils.h>
+
 #include <sgl_kernel/utils.cuh>
+
+#include <dlpack/dlpack.h>
+#include <tvm/ffi/container/tensor.h>
 
 #include <cstdint>
 
 namespace {
 
-template <int NUM_LOGICAL, int MAX_COPIES, int NUM_SINGLE, int NUM_RED_PHY,
-          int BLOCK_DIM>
+template <
+    int NUM_LOGICAL,
+    int MAX_COPIES,
+    int NUM_SINGLE,
+    int NUM_RED_PHY,
+    int BLOCK_DIM>
 __global__ void lp_post_kernel(
-    float* __restrict__ log2phy_prob,           // (NUM_LOGICAL, MAX_COPIES) — written
-    const float* __restrict__ x,                // (NV,) — IPM output
-    const float* __restrict__ t1,               // (NUM_SINGLE,) — from prep
-    const int64_t* __restrict__ phy_single,     // (NUM_SINGLE,)
-    const int64_t* __restrict__ phy_replicated, // (NUM_RED_PHY,)
-    const int64_t* __restrict__ log2phy) {      // (NUM_LOGICAL, MAX_COPIES)
+    float* __restrict__ log2phy_prob,            // (NUM_LOGICAL, MAX_COPIES) — written
+    const float* __restrict__ x,                 // (NV,) — IPM output
+    const float* __restrict__ t1,                // (NUM_SINGLE,) — from prep
+    const int64_t* __restrict__ phy_single,      // (NUM_SINGLE,)
+    const int64_t* __restrict__ phy_replicated,  // (NUM_RED_PHY,)
+    const int64_t* __restrict__ log2phy) {       // (NUM_LOGICAL, MAX_COPIES)
   constexpr int PHY_PROB_SIZE = NUM_SINGLE + NUM_RED_PHY + 1;
 
   extern __shared__ unsigned char raw_smem[];
@@ -70,48 +75,32 @@ __global__ void lp_post_kernel(
   }
 }
 
-template <int NUM_LOGICAL, int MAX_COPIES, int NUM_SINGLE, int NUM_RED_PHY,
-          int BLOCK_DIM>
-void lp_post(tvm::ffi::TensorView log2phy_prob, tvm::ffi::TensorView x,
-             tvm::ffi::TensorView t1, tvm::ffi::TensorView phy_single,
-             tvm::ffi::TensorView phy_replicated,
-             tvm::ffi::TensorView log2phy) {
+template <int NUM_LOGICAL, int MAX_COPIES, int NUM_SINGLE, int NUM_RED_PHY, int BLOCK_DIM>
+void lp_post(
+    tvm::ffi::TensorView log2phy_prob,
+    tvm::ffi::TensorView x,
+    tvm::ffi::TensorView t1,
+    tvm::ffi::TensorView phy_single,
+    tvm::ffi::TensorView phy_replicated,
+    tvm::ffi::TensorView log2phy) {
   using namespace host;
 
   SymbolicDevice device_;
-  TensorMatcher({NUM_LOGICAL, MAX_COPIES})
-      .with_dtype<float>()
-      .with_device<kDLCUDA>(device_)
-      .verify(log2phy_prob);
-  TensorMatcher({NUM_SINGLE})
-      .with_dtype<float>()
-      .with_device<kDLCUDA>(device_)
-      .verify(t1);
-  TensorMatcher({NUM_SINGLE})
-      .with_dtype<int64_t>()
-      .with_device<kDLCUDA>(device_)
-      .verify(phy_single);
-  TensorMatcher({NUM_RED_PHY})
-      .with_dtype<int64_t>()
-      .with_device<kDLCUDA>(device_)
-      .verify(phy_replicated);
-  TensorMatcher({NUM_LOGICAL, MAX_COPIES})
-      .with_dtype<int64_t>()
-      .with_device<kDLCUDA>(device_)
-      .verify(log2phy);
+  TensorMatcher({NUM_LOGICAL, MAX_COPIES}).with_dtype<float>().with_device<kDLCUDA>(device_).verify(log2phy_prob);
+  TensorMatcher({NUM_SINGLE}).with_dtype<float>().with_device<kDLCUDA>(device_).verify(t1);
+  TensorMatcher({NUM_SINGLE}).with_dtype<int64_t>().with_device<kDLCUDA>(device_).verify(phy_single);
+  TensorMatcher({NUM_RED_PHY}).with_dtype<int64_t>().with_device<kDLCUDA>(device_).verify(phy_replicated);
+  TensorMatcher({NUM_LOGICAL, MAX_COPIES}).with_dtype<int64_t>().with_device<kDLCUDA>(device_).verify(log2phy);
   // x has shape (NV,) which we don't constrain at this layer.
 
   constexpr int PHY_PROB_SIZE = NUM_SINGLE + NUM_RED_PHY + 1;
   const size_t smem_bytes = PHY_PROB_SIZE * sizeof(float);
 
-  using KernelT = void (*)(float*, const float*, const float*,
-                           const int64_t*, const int64_t*, const int64_t*);
-  KernelT kernel =
-      lp_post_kernel<NUM_LOGICAL, MAX_COPIES, NUM_SINGLE, NUM_RED_PHY, BLOCK_DIM>;
+  using KernelT = void (*)(float*, const float*, const float*, const int64_t*, const int64_t*, const int64_t*);
+  KernelT kernel = lp_post_kernel<NUM_LOGICAL, MAX_COPIES, NUM_SINGLE, NUM_RED_PHY, BLOCK_DIM>;
 
   if (smem_bytes > 48 * 1024) {
-    cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                         static_cast<int>(smem_bytes));
+    cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smem_bytes));
   }
 
   const DLDevice device = device_.unwrap();

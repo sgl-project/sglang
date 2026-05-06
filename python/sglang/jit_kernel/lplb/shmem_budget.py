@@ -36,7 +36,7 @@ GPU_BUDGETS_BYTES: dict[str, int] = {
     "a100": 160 * 1024,
     "h100": 223 * 1024,
     "h200": 223 * 1024,
-    "h20":  223 * 1024,
+    "h20": 223 * 1024,
     "b200": 224 * 1024,
 }
 
@@ -74,7 +74,9 @@ def shmem_bytes(nc: int, nv: int, bytes_per_elem: int = _BYTES_PER_ELEM) -> int:
     return bytes_per_elem * (nc * nv + nc * nc + 3 * nv + nc) + _RUNTIME_PAD_BYTES
 
 
-def breakdown(nc: int, nv: int, bytes_per_elem: int = _BYTES_PER_ELEM) -> ShmemBreakdown:
+def breakdown(
+    nc: int, nv: int, bytes_per_elem: int = _BYTES_PER_ELEM
+) -> ShmemBreakdown:
     """Per-array byte breakdown — useful for debugging shmem pressure."""
     b = bytes_per_elem
     return ShmemBreakdown(
@@ -128,6 +130,7 @@ def max_nc_for_nv(nv: int, gpu: str = "h100") -> int:
         return 0
     # NC^2 + (NV+1)*NC - rhs <= 0
     import math
+
     disc = (nv + 1) ** 2 + 4 * rhs
     nc_max = int((-(nv + 1) + math.sqrt(disc)) / 2.0)
     while nc_max > 0 and shmem_bytes(nc_max, nv) > cap:

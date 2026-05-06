@@ -649,10 +649,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 )
             )
 
-        if (
-            self.server_args.ep_dispatch_algorithm == "lp"
-            and not self.is_draft_worker
-        ):
+        if self.server_args.ep_dispatch_algorithm == "lp" and not self.is_draft_worker:
             self._init_lplb_solvers()
 
         # Expert parallelism

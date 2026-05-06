@@ -50,10 +50,8 @@ def _init_fused_backend() -> None:
         return
 
     try:
-        from sglang.jit_kernel.lplb.cuda_solver import (
-            solve_ipm as fused_solve_ipm,
-            warmup as fused_warmup,
-        )
+        from sglang.jit_kernel.lplb.cuda_solver import solve_ipm as fused_solve_ipm
+        from sglang.jit_kernel.lplb.cuda_solver import warmup as fused_warmup
         from sglang.jit_kernel.lplb.shmem_budget import assert_fits
     except ImportError as e:
         logger.info(
@@ -92,9 +90,7 @@ def warmup(nc: int, nv: int, num_iters: int = 5, device: str = "cuda") -> None:
     """
     _init_fused_backend()
     if not _FUSED_AVAILABLE:
-        raise RuntimeError(
-            f"LPLB fused solver unavailable: {_unavailable_reason()}"
-        )
+        raise RuntimeError(f"LPLB fused solver unavailable: {_unavailable_reason()}")
     _FUSED_ASSERT_FITS(nc, nv, gpu="h100")
     _FUSED_WARMUP(nc, nv, num_iters=num_iters, device=device)
 
@@ -128,9 +124,7 @@ def solve_ipm(
 
     _init_fused_backend()
     if not _FUSED_AVAILABLE:
-        raise RuntimeError(
-            f"LPLB fused solver unavailable: {_unavailable_reason()}"
-        )
+        raise RuntimeError(f"LPLB fused solver unavailable: {_unavailable_reason()}")
     if not A.is_cuda:
         raise RuntimeError(
             f"LPLB fused solver requires CUDA tensors; got A on {A.device}."

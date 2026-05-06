@@ -41,7 +41,9 @@ def _sm_ver() -> int:
 
 
 @cache_once
-def _ipm_module(nc: int, nv: int, block_dim: int, num_iters: int, sm_ver: int) -> "Module":
+def _ipm_module(
+    nc: int, nv: int, block_dim: int, num_iters: int, sm_ver: int
+) -> "Module":
     """JIT-compile the IPM kernel for one shape. Cached for the process lifetime."""
     args = make_cpp_args(nc, nv, block_dim, sm_ver, num_iters)
     # The kernel uses cuBLASDx (header-only) for the GEMMs and a hand-written
@@ -155,7 +157,9 @@ def prep_lp_inputs(
     num_red_log = log_replicated.shape[0]
     num_gpus, _ns = B1.shape
     module = _prep_module(nc, nv, num_single, num_red_log, num_gpus, DEFAULT_BLOCK_DIM)
-    module.lp_prep(A_full, b, t1, global_counts, log_single, log_replicated, B1, A_base_row_sum)
+    module.lp_prep(
+        A_full, b, t1, global_counts, log_single, log_replicated, B1, A_base_row_sum
+    )
 
 
 @cache_once
@@ -190,7 +194,9 @@ def extract_log2phy_prob(
     num_logical, max_copies = log2phy_prob.shape
     num_single = phy_single.shape[0]
     num_red_phy = phy_replicated.shape[0]
-    module = _post_module(num_logical, max_copies, num_single, num_red_phy, DEFAULT_BLOCK_DIM)
+    module = _post_module(
+        num_logical, max_copies, num_single, num_red_phy, DEFAULT_BLOCK_DIM
+    )
     module.lp_post(log2phy_prob, x, t1, phy_single, phy_replicated, log2phy)
 
 

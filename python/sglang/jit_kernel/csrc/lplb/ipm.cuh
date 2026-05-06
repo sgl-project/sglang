@@ -17,16 +17,16 @@
 // BLOCK_DIM, SM_VER, NUM_ITERS) so each unique shape is compiled once via
 // sglang's tvm-ffi load_jit cache.
 
-#include <cublasdx.hpp>
+#include <sgl_kernel/tensor.h>
+#include <sgl_kernel/utils.h>
+
+#include <sgl_kernel/utils.cuh>
 
 #include <dlpack/dlpack.h>
 #include <tvm/ffi/container/tensor.h>
 
-#include <sgl_kernel/tensor.h>
-#include <sgl_kernel/utils.h>
-#include <sgl_kernel/utils.cuh>
-
 #include <cstdint>
+#include <cublasdx.hpp>
 
 namespace {
 
@@ -110,29 +110,22 @@ __device__ __forceinline__ void cholesky_solve(float a[N][N], float b[N]) {
 
 template <int M, int N, int K, int SM_VER, int BLOCK_DIM>
 __device__ __forceinline__ void matmul_NT(float* a, float* b, float* c) {
-  decltype(cublasdx::Size<M, N, K>() +
-           cublasdx::Function<cublasdx::function::MM>() +
-           cublasdx::Arrangement<cublasdx::row_major, cublasdx::col_major>() +
-           cublasdx::SM<SM_VER>() + cublasdx::Block() +
-           cublasdx::BlockDim<BLOCK_DIM>())()
+  decltype(cublasdx::Size<M, N, K>() + cublasdx::Function<cublasdx::function::MM>() + cublasdx::Arrangement<cublasdx::row_major, cublasdx::col_major>() + cublasdx::SM<SM_VER>() + cublasdx::Block() + cublasdx::BlockDim<BLOCK_DIM>())()
       .execute(1.f, a, b, 0.f, c);
 }
 
 template <int M, int N, int K, int SM_VER, int BLOCK_DIM>
 __device__ __forceinline__ void matmul_NN(float* a, float* b, float* c) {
-  decltype(cublasdx::Size<M, N, K>() +
-           cublasdx::Function<cublasdx::function::MM>() +
-           cublasdx::Arrangement<cublasdx::row_major, cublasdx::row_major>() +
-           cublasdx::SM<SM_VER>() + cublasdx::Block() +
-           cublasdx::BlockDim<BLOCK_DIM>())()
+  decltype(cublasdx::Size<M, N, K>() + cublasdx::Function<cublasdx::function::MM>() + cublasdx::Arrangement<cublasdx::row_major, cublasdx::row_major>() + cublasdx::SM<SM_VER>() + cublasdx::Block() + cublasdx::BlockDim<BLOCK_DIM>())()
       .execute(1.f, a, b, 0.f, c);
 }
 
 template <int NC, int NV, int BLOCK_DIM, int SM_VER, int NUM_ITERS>
-__global__ void ipm_solve_kernel(float* __restrict__ result,
-                                 const float* __restrict__ input_a,
-                                 const float* __restrict__ input_b,
-                                 const float* __restrict__ input_c) {
+__global__ void ipm_solve_kernel(
+    float* __restrict__ result,
+    const float* __restrict__ input_a,
+    const float* __restrict__ input_b,
+    const float* __restrict__ input_c) {
   using SMem = ipm_smem<NC, NV>;
   extern __shared__ unsigned char raw_smem[];
   SMem* smem = reinterpret_cast<SMem*>(raw_smem);
@@ -215,15 +208,13 @@ __global__ void ipm_solve_kernel(float* __restrict__ result,
       max_residual = fmaxf(max_residual, fabsf(ax2c[i] - b[i]));
     }
     for (int offset = 16; offset > 0; offset >>= 1) {
-      max_residual =
-          fmaxf(max_residual, __shfl_down_sync(0xffffffff, max_residual, offset));
+      max_residual = fmaxf(max_residual, __shfl_down_sync(0xffffffff, max_residual, offset));
     }
   }
 
   auto& avail_flag = smem->avail_flag;
   if (tid == 0) {
-    avail_flag = (d_max < 0.1f && x[NV - 1] >= 0.f && x[NV - 1] < 1e-4f &&
-                  max_residual < 0.05f);
+    avail_flag = (d_max < 0.1f && x[NV - 1] >= 0.f && x[NV - 1] < 1e-4f && max_residual < 0.05f);
   }
   __syncthreads();
 
@@ -239,21 +230,14 @@ __global__ void ipm_solve_kernel(float* __restrict__ result,
 }
 
 template <int NC, int NV, int BLOCK_DIM, int SM_VER, int NUM_ITERS>
-void ipm_solve(tvm::ffi::TensorView A, tvm::ffi::TensorView b,
-               tvm::ffi::TensorView c, tvm::ffi::TensorView result) {
+void ipm_solve(tvm::ffi::TensorView A, tvm::ffi::TensorView b, tvm::ffi::TensorView c, tvm::ffi::TensorView result) {
   using namespace host;
 
   SymbolicDevice device_;
-  TensorMatcher({NC, NV})
-      .with_dtype<float>()
-      .with_device<kDLCUDA>(device_)
-      .verify(A);
+  TensorMatcher({NC, NV}).with_dtype<float>().with_device<kDLCUDA>(device_).verify(A);
   TensorMatcher({NC}).with_dtype<float>().with_device<kDLCUDA>(device_).verify(b);
   TensorMatcher({NV}).with_dtype<float>().with_device<kDLCUDA>(device_).verify(c);
-  TensorMatcher({NV})
-      .with_dtype<float>()
-      .with_device<kDLCUDA>(device_)
-      .verify(result);
+  TensorMatcher({NV}).with_dtype<float>().with_device<kDLCUDA>(device_).verify(result);
 
   const DLDevice device = device_.unwrap();
   const size_t smem_bytes = sizeof(ipm_smem<NC, NV>);
@@ -264,9 +248,7 @@ void ipm_solve(tvm::ffi::TensorView A, tvm::ffi::TensorView b,
   // Opt in to >48 KB dynamic shared memory if needed (Hopper supports up to
   // 228 KB per block).
   if (smem_bytes > 48 * 1024) {
-    cudaFuncSetAttribute(
-        kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
-        static_cast<int>(smem_bytes));
+    cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smem_bytes));
   }
 
   LaunchKernel(/*grid_dim=*/1, /*block_dim=*/BLOCK_DIM, device, smem_bytes)(
