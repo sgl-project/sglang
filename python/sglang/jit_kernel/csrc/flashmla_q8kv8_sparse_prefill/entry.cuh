@@ -35,38 +35,35 @@ _set_device_stream_and_sm(SparseAttnFwdQ8SM90NewParams& params, tvm::ffi::Tensor
   params.num_sm = _get_num_sm_cached(dev.device_id);
 }
 
-static inline void _run_q8kv8(SparseAttnFwdQ8SM90NewParams& params, bool have_topk_length, bool have_attn_sink) {
-  if (params.d_qk == 512) {
-    if (have_topk_length) {
-      if (have_attn_sink) {
-        sm90::fwd::run_fwd_phase1_q8_sm90_new_kernel<512, true, true>(params);
-      } else {
-        sm90::fwd::run_fwd_phase1_q8_sm90_new_kernel<512, true, false>(params);
-      }
+template <int D_QK>
+static inline void
+_run_q8kv8_for_head_dim(SparseAttnFwdQ8SM90NewParams& params, bool have_topk_length, bool have_attn_sink) {
+  if (have_topk_length) {
+    if (have_attn_sink) {
+      sm90::fwd::run_fwd_phase1_q8_sm90_new_kernel<D_QK, true, true>(params);
     } else {
-      if (have_attn_sink) {
-        sm90::fwd::run_fwd_phase1_q8_sm90_new_kernel<512, false, true>(params);
-      } else {
-        sm90::fwd::run_fwd_phase1_q8_sm90_new_kernel<512, false, false>(params);
-      }
-    }
-  } else if (params.d_qk == 576) {
-    if (have_topk_length) {
-      if (have_attn_sink) {
-        sm90::fwd::run_fwd_phase1_q8_sm90_new_kernel<576, true, true>(params);
-      } else {
-        sm90::fwd::run_fwd_phase1_q8_sm90_new_kernel<576, true, false>(params);
-      }
-    } else {
-      if (have_attn_sink) {
-        sm90::fwd::run_fwd_phase1_q8_sm90_new_kernel<576, false, true>(params);
-      } else {
-        sm90::fwd::run_fwd_phase1_q8_sm90_new_kernel<576, false, false>(params);
-      }
+      sm90::fwd::run_fwd_phase1_q8_sm90_new_kernel<D_QK, true, false>(params);
     }
   } else {
-    fprintf(stderr, "sparse_prefill_q8kv8: unsupported d_qk=%d (must be 512 or 576)\n", params.d_qk);
-    exit(1);
+    if (have_attn_sink) {
+      sm90::fwd::run_fwd_phase1_q8_sm90_new_kernel<D_QK, false, true>(params);
+    } else {
+      sm90::fwd::run_fwd_phase1_q8_sm90_new_kernel<D_QK, false, false>(params);
+    }
+  }
+}
+
+static inline void _run_q8kv8(SparseAttnFwdQ8SM90NewParams& params, bool have_topk_length, bool have_attn_sink) {
+  switch (params.d_qk) {
+    case 512:
+      _run_q8kv8_for_head_dim<512>(params, have_topk_length, have_attn_sink);
+      return;
+    case 576:
+      _run_q8kv8_for_head_dim<576>(params, have_topk_length, have_attn_sink);
+      return;
+    default:
+      fprintf(stderr, "sparse_prefill_q8kv8: unsupported d_qk=%d (must be 512 or 576)\n", params.d_qk);
+      exit(1);
   }
 }
 
