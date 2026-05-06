@@ -148,9 +148,7 @@ def cp_split_and_rebuild_position(forward_batch, positions: torch.Tensor):
     return positions
 
 
-def cp_all_gather_reorganized_into_tensor(
-    input_tensor, total_len, cp_size, forward_batch, stream
-):
+def cp_all_gather_reorganized_into_tensor(input_tensor, cp_size, forward_batch, stream):
     """
     Allgather communication for context_parallel(kv_cache, index_k, hidden_states).
     This implementation mainly consists of three parts:
@@ -158,11 +156,6 @@ def cp_all_gather_reorganized_into_tensor(
     Step 2, allgather communication(async).
     Step 3, removing the padding and reassembling the data according to the actual tokens.
     """
-    # Pad target is the largest per-rank contribution, not ceil(total_len / cp_size):
-    # with bs > 1 and mixed sequence lengths, one rank's share can exceed the
-    # uniform ceil value, which would otherwise silently reduce F.pad to a
-    # no-op and produce shape-mismatched allgather inputs.
-    del total_len
     max_len = forward_batch.attn_cp_metadata.max_rank_len[0]
     pad_size = max_len - input_tensor.shape[0]
     if pad_size > 0:
@@ -202,15 +195,12 @@ def cp_all_gather_reorganized_into_tensor(
 
 
 def cp_all_gather_reorganized_into_tensor_kv_cache(
-    input_tensor, total_len, cp_size, forward_batch, stream
+    input_tensor, cp_size, forward_batch, stream
 ):
     """
     Allgather communication for context_parallel KV cache.
     Handles multi-dimensional tensors (e.g., [seq_len, num_heads, head_dim]).
     """
-    # See cp_all_gather_reorganized_into_tensor for why we prefer metadata's
-    # max_rank_len over ceil(total_len / cp_size).
-    del total_len
     max_len = forward_batch.attn_cp_metadata.max_rank_len[0]
     pad_size = max_len - input_tensor.shape[0]
     if pad_size > 0:
@@ -304,7 +294,6 @@ def cp_all_gather_rerange_output(input_tensor, cp_size, forward_batch, stream):
     bs_seq_len, hidden_size = input_tensor.shape
     output_tensor = cp_all_gather_reorganized_into_tensor(
         input_tensor,
-        forward_batch.attn_cp_metadata.total_seq_lens,
         cp_size,
         forward_batch,
         stream,
@@ -342,7 +331,6 @@ def cp_all_gather_rerange_kv_cache(input_tensor, cp_size, forward_batch, stream)
     """
     output_tensor = cp_all_gather_reorganized_into_tensor_kv_cache(
         input_tensor,
-        forward_batch.attn_cp_metadata.total_seq_lens,
         cp_size,
         forward_batch,
         stream,
@@ -463,13 +451,8 @@ def prepare_context_parallel_metadata(
     i.e. all prev blocks first, then all next blocks -- so torch.split at
     total_q_prev_tokens cleanly separates them.
     """
-    # `extend_seqs_len` is required for bs > 1 support. Fall back to a single-
-    # sequence view of `kv_len` for back-compat with any callers that have not
-    # yet been updated.
-    if extend_seqs_len is None:
-        extend_seqs_len = [int(kv_len)]
-    else:
-        extend_seqs_len = [int(x) for x in extend_seqs_len]
+    assert extend_seqs_len is not None
+    extend_seqs_len = [int(x) for x in extend_seqs_len]
 
     bs = len(extend_seqs_len)
     cp_segment_num = cp_size * 2
