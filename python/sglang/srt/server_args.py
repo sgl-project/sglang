@@ -1623,7 +1623,9 @@ class ServerArgs:
         user_set_prefill = self.nsa_prefill_backend is not None
         user_set_decode = self.nsa_decode_backend is not None
 
-        if apply_hisparse_nsa_backend_defaults(self, user_set_prefill, user_set_decode):
+        if apply_hisparse_nsa_backend_defaults(
+            self, user_set_prefill, user_set_decode, kv_cache_dtype
+        ):
             return
 
         if not user_set_prefill and not user_set_decode and is_hip():
@@ -6896,6 +6898,7 @@ class ServerArgs:
         from sglang.srt.arg_groups.hisparse_hook import validate_hisparse
 
         validate_hisparse(self)
+
         assert (
             self.schedule_conservativeness >= 0
         ), "schedule_conservativeness must be non-negative"

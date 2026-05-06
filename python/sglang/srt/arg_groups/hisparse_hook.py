@@ -7,28 +7,43 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+# Backend/dtype pairing: flashmla_sparse only takes BF16 KV;
+# flashmla_kv only supports FP8 (it always reads KV as FP8 via
+# is_fp8_kvcache=True, inline-quantizing BF16 would defeat HiSparse).
+_HISPARSE_ALLOWED_BACKENDS_BY_DTYPE = {
+    "bfloat16": {"flashmla_sparse"},
+    "fp8_e4m3": {"flashmla_kv"},
+}
+
+
+def _hisparse_default_backend(kv_cache_dtype: str) -> str:
+    return "flashmla_kv" if kv_cache_dtype == "fp8_e4m3" else "flashmla_sparse"
+
+
 def apply_hisparse_nsa_backend_defaults(
     server_args: "ServerArgs",
     user_set_prefill: bool,
     user_set_decode: bool,
+    kv_cache_dtype: str,
 ) -> bool:
-    """Force flashmla_sparse as NSA backend when --enable-hisparse is set.
+    """Pick NSA backends for --enable-hisparse based on KV dtype.
 
-    Returns True if hisparse handled backend selection (caller should skip its
-    own default logic), False otherwise.
+    BF16 KV -> flashmla_sparse, FP8 KV -> flashmla_kv. Returns True if hisparse
+    handled backend selection (caller should skip its own default logic).
     """
-    # HiSparse requires flashmla_sparse for both prefill and decode
-    if server_args.enable_hisparse:
-        if not user_set_prefill:
-            server_args.nsa_prefill_backend = "flashmla_sparse"
-        if not user_set_decode:
-            server_args.nsa_decode_backend = "flashmla_sparse"
-        logger.warning(
-            f"HiSparse enabled: using flashmla_sparse NSA backends "
-            f"(prefill={server_args.nsa_prefill_backend}, decode={server_args.nsa_decode_backend})."
-        )
-        return True
-    return False
+    if not server_args.enable_hisparse:
+        return False
+
+    backend = _hisparse_default_backend(kv_cache_dtype)
+    if not user_set_prefill:
+        server_args.nsa_prefill_backend = backend
+    if not user_set_decode:
+        server_args.nsa_decode_backend = backend
+    logger.warning(
+        f"HiSparse enabled ({kv_cache_dtype}): using NSA backends "
+        f"prefill={server_args.nsa_prefill_backend}, decode={server_args.nsa_decode_backend}."
+    )
+    return True
 
 
 def validate_hisparse(server_args: "ServerArgs") -> None:
@@ -52,15 +67,29 @@ def validate_hisparse(server_args: "ServerArgs") -> None:
         server_args.disable_radix_cache
     ), "Hierarchical sparse attention currently requires --disable-radix-cache."
 
-    if not is_v4_hisparse:
-        for attr, label in [
-            ("nsa_prefill_backend", "prefill"),
-            ("nsa_decode_backend", "decode"),
-        ]:
-            backend = getattr(server_args, attr)
-            if backend is not None and backend != "flashmla_sparse":
-                raise ValueError(
-                    f"HiSparse requires flashmla_sparse NSA {label} backend, "
-                    f"but got --nsa-{label}-backend={backend}. "
-                    f"Please use --nsa-{label}-backend=flashmla_sparse or omit it."
-                )
+    # DSv4 hisparse handles its own dtype/backend pairing elsewhere; the dtype-
+    # aware checks below only apply to the DSA hisparse path.
+    if is_v4_hisparse:
+        return
+
+    if server_args.kv_cache_dtype not in ("bfloat16", "auto", "fp8_e4m3"):
+        raise ValueError(
+            f"HiSparse requires bfloat16 or fp8_e4m3 KV cache, "
+            f"but got --kv-cache-dtype={server_args.kv_cache_dtype}. "
+            f"Please use --kv-cache-dtype=bfloat16 or fp8_e4m3."
+        )
+
+    allowed_backends = _HISPARSE_ALLOWED_BACKENDS_BY_DTYPE.get(
+        server_args.kv_cache_dtype, {"flashmla_sparse", "flashmla_kv"}
+    )
+    for attr, label in [
+        ("nsa_prefill_backend", "prefill"),
+        ("nsa_decode_backend", "decode"),
+    ]:
+        backend = getattr(server_args, attr)
+        if backend is not None and backend not in allowed_backends:
+            raise ValueError(
+                f"HiSparse with --kv-cache-dtype={server_args.kv_cache_dtype} requires "
+                f"--nsa-{label}-backend in {sorted(allowed_backends)}, "
+                f"but got {backend}."
+            )
