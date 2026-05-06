@@ -33,7 +33,7 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
-SGL_TEST_FILES_CI_DATA_REVISION = "aa957125e8ce60cec265e20e7bf1151f69a2785d"
+SGL_TEST_FILES_CI_DATA_REVISION = "ccfe0ec1b866ced14ef9260e69059820dbcd6a07"
 SGL_TEST_FILES_CONSISTENCY_GT_ROOT = (
     "https://raw.githubusercontent.com/"
     f"sgl-project/ci-data/{SGL_TEST_FILES_CI_DATA_REVISION}/"
@@ -54,7 +54,6 @@ SGL_TEST_FILES_CONSISTENCY_GT_BASES = (
 # remaining semantic gaps behind very loose official thresholds.
 SGL_TEST_FILES_OFFICIAL_CONSISTENCY_GT_CASES = frozenset(
     {
-        "ltx_2_two_stage_t2v",
         "ltx_2.3_one_stage_ti2v",
         "ltx_2.3_two_stage_t2v_2gpus",
     }
