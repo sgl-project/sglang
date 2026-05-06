@@ -437,6 +437,19 @@ class SchedulerDisaggregationPrefillMixin:
         """Return adaptive group_size, or 0 if pipelining should not be used."""
         if not envs.SGLANG_PIPELINED_KV_TRANSFER.get():
             return 0
+
+        # Multimodal guard: pipelined KV transfer is not compatible with VL/audio
+        # models because the forward pass embeds visual/audio tokens in place and
+        # `send_kv_chunk` only transfers text-KV indices. Falling back to the
+        # normal path avoids potential crashes or silent data corruption.
+        if any(req.multimodal_inputs is not None for req in batch.reqs):
+            logger.debug(
+                "Pipeline skip: multimodal inputs detected in batch "
+                "(batch_size=%d)",
+                len(batch.reqs),
+            )
+            return 0
+
         min_tokens = envs.SGLANG_PIPELINE_MIN_TOKENS.get()
         avg_tokens = sum(req.extend_input_len for req in batch.reqs) // len(batch.reqs)
         if avg_tokens < min_tokens:
