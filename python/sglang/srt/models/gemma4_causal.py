@@ -27,7 +27,10 @@ from transformers import (
 from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
 )
-from sglang.srt.layers.gemma4_fused_ops import gemma_rmsnorm_residual_scalar
+from sglang.srt.layers.gemma4_fused_ops import (
+    gemma_dual_rmsnorm_residual_scalar,
+    gemma_rmsnorm_residual_scalar,
+)
 from sglang.srt.layers.layernorm import Gemma4RMSNorm, RMSNorm
 from sglang.srt.layers.linear import (
     QKVParallelLinear,
@@ -545,12 +548,36 @@ class Gemma4DecoderLayer(nn.Module):
 
             # Dense MLP branch
             hidden_states_1 = self.mlp(hidden_states)
-            hidden_states_1 = self.post_feedforward_layernorm_1(hidden_states_1)
 
             # MoE branch: router sees residual (= post_attn_out + old_residual)
             router_logits = self.router(moe_input)
             hidden_states_2 = self.pre_feedforward_layernorm_2(moe_input)
             hidden_states_2 = self.moe(hidden_states_2, router_logits)
+
+            # Fused: (rmsnorm(rmsnorm(h1,w1) + rmsnorm(h2,w2), w3) + residual) * scalar
+            if (
+                not self.has_ple
+                and hidden_states_1.is_cuda
+                and hidden_states_1.dim() == 2
+            ):
+                norm1 = self.post_feedforward_layernorm_1
+                norm2 = self.post_feedforward_layernorm_2
+                norm3 = self.post_feedforward_layernorm
+                hidden_states = gemma_dual_rmsnorm_residual_scalar(
+                    hidden_states_1,
+                    norm1.weight.data,
+                    hidden_states_2,
+                    norm2.weight.data,
+                    norm3.weight.data,
+                    residual,
+                    self.layer_scalar,
+                    norm1.variance_epsilon,
+                    norm2.variance_epsilon,
+                    norm3.variance_epsilon,
+                )
+                return hidden_states, None
+
+            hidden_states_1 = self.post_feedforward_layernorm_1(hidden_states_1)
             hidden_states_2 = self.post_feedforward_layernorm_2(hidden_states_2)
 
             # Combine branches

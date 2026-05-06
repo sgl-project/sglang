@@ -121,7 +121,7 @@ class DmdDenoisingStage(DenoisingStage):
                         )
                     else:
                         current_model = self.transformer
-                        self._manage_device_placement(current_model, None, server_args)
+                        self._manage_dit_use_site(current_model, "transformer", batch)
                     # Expand latents for I2V
                     noise_latents = latents.clone()
                     latent_model_input = latents.to(target_dtype)
@@ -170,10 +170,13 @@ class DmdDenoisingStage(DenoisingStage):
                                 **pos_cond_kwargs,
                             ).permute(0, 2, 1, 3, 4)
 
+                        video_timesteps = t_expand[:, None].expand(
+                            -1, pred_noise.shape[1]
+                        )
                         pred_video = pred_noise_to_pred_video(
                             pred_noise=pred_noise.flatten(0, 1),
                             noise_input_latent=noise_latents.flatten(0, 1),
-                            timestep=t_expand,
+                            timestep=video_timesteps,
                             scheduler=scheduler,
                         ).unflatten(0, pred_noise.shape[:2])
 
@@ -232,44 +235,18 @@ class DmdDenoisingStage(DenoisingStage):
         if boundary_timestep is None or t_int >= boundary_timestep:
             # High-noise stage
             current_model = self.transformer
-            model_to_offload = self.transformer_2
             current_guidance_scale = batch.guidance_scale
+            current_phase = "transformer"
         else:
             # Low-noise stage
             current_model = self.transformer_2
-            model_to_offload = self.transformer
             current_guidance_scale = batch.guidance_scale_2
+            current_phase = "transformer_2"
 
-        self._manage_device_placement(current_model, model_to_offload, server_args)
+        self._manage_dit_use_site(current_model, current_phase, batch)
 
         assert current_model is not None, "The model for the current step is not set."
         return current_model, current_guidance_scale
-
-    def _manage_device_placement(
-        self,
-        model_to_use: torch.nn.Module,
-        model_to_offload: torch.nn.Module | None,
-        server_args: ServerArgs,
-    ):
-        """
-        Manages the offload / load behavior of dit
-        """
-        if not server_args.dit_cpu_offload:
-            return
-
-        # Offload the unused model if it's on CUDA
-        if (
-            model_to_offload is not None
-            and next(model_to_offload.parameters()).device.type == "cuda"
-        ):
-            model_to_offload.to("cpu")
-
-        # Load the model to use if it's on CPU
-        if (
-            model_to_use is not None
-            and next(model_to_use.parameters()).device.type == "cpu"
-        ):
-            model_to_use.to(get_local_torch_device())
 
     def _handle_boundary_ratio(
         self,

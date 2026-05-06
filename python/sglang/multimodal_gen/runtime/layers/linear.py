@@ -232,6 +232,7 @@ class ReplicatedLinear(LinearBase):
         skip_bias_add: bool = False,
         params_dtype: torch.dtype | None = None,
         quant_config: QuantizationConfig | None = None,
+        output_sizes: list[int] | None = None,
         prefix: str = "",
     ):
         super().__init__(
@@ -245,10 +246,11 @@ class ReplicatedLinear(LinearBase):
 
         # All the linear layer supports quant method.
         assert self.quant_method is not None
+        output_partition_sizes = output_sizes or [self.output_size]
         self.quant_method.create_weights(
             self,
             self.input_size,
-            [self.output_size],
+            output_partition_sizes,
             self.input_size,
             self.output_size,
             self.params_dtype,
@@ -497,7 +499,6 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
         loaded_weight: torch.Tensor,
         loaded_shard_id: int | None = None,
     ) -> None:
-
         param_data = param.data
         output_dim = getattr(param, "output_dim", None)
         # Special case for AQLM codebooks.
@@ -829,7 +830,6 @@ class QKVParallelLinear(ColumnParallelLinear):
         loaded_weight: torch.Tensor,
         loaded_shard_id: str | None = None,
     ):
-
         param_data = param.data
         output_dim = getattr(param, "output_dim", None)
         # Special case for AQLM codebooks.
@@ -866,7 +866,6 @@ class QKVParallelLinear(ColumnParallelLinear):
             ]
 
             for shard_id, shard_offset, shard_size in shard_offsets:
-
                 loaded_weight_shard = loaded_weight.narrow(
                     output_dim, shard_offset, shard_size
                 )
@@ -1037,7 +1036,6 @@ class RowParallelLinear(LinearBase):
         param_data.copy_(loaded_weight)
 
     def weight_loader_v2(self, param: BasevLLMParameter, loaded_weight: torch.Tensor):
-
         # Special case for loading scales off disk, which often do not
         # have a shape (such as in the case of AutoFP8).
         if len(loaded_weight.shape) == 0:
