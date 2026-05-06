@@ -57,12 +57,11 @@ class _LMCacheLoadMarker:
 
 
 class LayerTransferCounter:
-    """Per-layer hook the in-process layerwise connector uses to interleave
-    LMCache loads with model execution.
+    """Minimal adapter that lets the memory pool notify LMCache per-layer.
 
-    The KV pool calls `wait_until(layer_id)` after finishing a layer, which
-    we translate into a `load_kv_layerwise(layer_id)` call on the LMCache
-    connector within the provided CUDA stream.
+    The KV pool calls `wait_until(layer_id)` after finishing a layer, which we
+    translate into a `load_kv_layerwise(layer_id)` call on the LMCache connector
+    within the provided CUDA stream.
     """
 
     def __init__(
@@ -87,9 +86,18 @@ class LMCRadixCache(RadixCache):
     """RadixCache + LMCache IO.
 
     In-process mode (no MP host) keeps the existing layerwise connector and
-    its per-layer transfer hook. MP mode uses the non-layerwise
-    `LMCacheMPConnector`: a single blocking retrieve completes in
-    `match_prefix` before the forward pass, so no per-layer hook is needed.
+    its per-layer transfer hook: ``match_prefix`` kicks off the load via
+    ``start_load_kv`` and SGLang's per-layer KV-pool hook drives subsequent
+    layers during forward.
+
+    MP mode uses ``LMCacheMPConnector`` with a HiCache-style two-phase
+    load: ``match_prefix`` fires LOOKUP only (``connector.lookup_kv``) and
+    returns ``host_hit_length`` on the ``MatchResult``; the SGLang
+    scheduler then calls our :meth:`init_load_back` at dispatch time,
+    which fires the actual RETRIEVE (``connector.retrieve_kv``) into
+    pre-allocated GPU slots. No per-layer hook is registered for the MP
+    path — a single ``multi_layer_block_kv_transfer`` kernel covers all
+    layers.
     """
 
     def __init__(
@@ -156,18 +164,15 @@ class LMCRadixCache(RadixCache):
             with self._node_lock:
                 self._in_flight_nodes.clear()
 
-    def _load_into_slots(self, load_metadata: LoadMetadata) -> int:
-        with torch.cuda.stream(self.load_stream):
-            num = self.lmcache_connector.start_load_kv(load_metadata)
-        if self._mp_mode:
-            # MP non-layerwise: start_load_kv host-blocked until every layer
-            # was queued on load_stream. Make compute streams wait for those
-            # writes before reading the slots.
-            torch.cuda.current_stream().wait_stream(self.load_stream)
-        return num
-
     def match_prefix(self, params: MatchPrefixParams) -> MatchResult:  # type: ignore[override]
-        """Match cached prefix; if there's a tail miss, prefetch from LMCache."""
+        """Match cached prefix; if there's a tail miss, prefetch from LMCache.
+
+        Reuses the base matching logic to obtain (value, last_node). If there
+        remains a *page-aligned* uncached suffix and there is room (or after
+        eviction), we allocate token slots and trigger an async LMCache load
+        into those slots, then materialize a new child node for the retrieved
+        chunk.
+        """
         key = params.key
         if self.disable or not key:
             return super().match_prefix(params)
@@ -180,22 +185,24 @@ class LMCRadixCache(RadixCache):
         value: torch.Tensor = base_res.device_indices
         last_node: TreeNode = base_res.last_device_node
 
-        # In MP mode the daemon-side session is keyed by ``req.rid`` so
-        # the same id flows from LOOKUP through STORE/END_SESSION. Peek
-        # callers in ``schedule_policy`` don't pass a Req (the field is
-        # Mamba-flavored optional in SGLang); fall through to the radix
-        # result for those — the real ``schedule_batch`` pass passes
-        # ``req`` and our two-phase load lands then.
-        is_mp_load = self._mp_mode and params.req is not None
-
-        if is_mp_load:
+        # MP mode goes through the two-phase split: ``_mp_match_prefix``
+        # fires LOOKUP only here, ``init_load_back`` fires RETRIEVE later.
+        # Peek callers in ``schedule_policy`` don't pass a Req (the field
+        # is Mamba-flavored optional in SGLang); for those we just return
+        # the radix-only result — the real ``schedule_batch`` pass passes
+        # ``req`` and the two-phase load lands then.
+        if self._mp_mode:
+            if params.req is None:
+                return base_res
             return self._mp_match_prefix(key, base_res, value, last_node, params.req)
 
-        # In-process mode below: existing single-shot pattern that runs
-        # LOOKUP + first-layer retrieve inside ``start_load_kv`` and lets
-        # the per-layer transfer hook drive the rest during forward.
+        # In-process mode below: the layerwise ``LMCacheLayerwiseConnector``
+        # still does the single-shot ``start_load_kv`` (LOOKUP + first
+        # layer) and lets the per-layer transfer hook drive the rest
+        # during forward.
         if value.numel() == len(key):
             return base_res
+
         uncached_len = len(key) - value.numel()
         if uncached_len == 0:
             return base_res
@@ -217,15 +224,14 @@ class LMCRadixCache(RadixCache):
             ]
         )
 
-        num_retrieved = self._load_into_slots(
-            LoadMetadata(
-                token_ids=key.token_ids,
-                slot_mapping=slot_mapping,
-                offset=value.numel() - prefix_pad,
-                prefix_pad=prefix_pad,
-                request_id="",
+        with torch.cuda.stream(self.load_stream):
+            num_retrieved = self.lmcache_connector.start_load_kv(
+                LoadMetadata(
+                    token_ids=key.token_ids,  # full page-aligned key
+                    slot_mapping=slot_mapping,
+                    offset=value.numel() - prefix_pad,  # LMCache offset convention
+                )
             )
-        )
         logger.debug("num_retrieved_tokens: %s", num_retrieved)
 
         if num_retrieved > 0:
@@ -234,29 +240,31 @@ class LMCRadixCache(RadixCache):
             )
         else:
             self.token_to_kv_pool_allocator.free(token_slots)
-            return base_res
 
-        fetched = num_retrieved - prefix_pad
-        new_node = TreeNode(priority=last_node.priority)
-        start = value.numel()
-        end = start + fetched
-        new_node.key = key[start:end]
-        new_node.value = token_slots[:fetched]
-        new_node.parent = last_node
-        last_node.children[new_node.key.child_key(self.page_size)] = new_node
-        last_node = new_node
+        if num_retrieved > 0:
+            fetched = num_retrieved - prefix_pad
+            new_node = TreeNode(priority=last_node.priority)
+            start = value.numel()
+            end = start + fetched
+            new_node.key = key[start:end]
+            new_node.value = token_slots[:fetched]
+            new_node.parent = last_node
+            last_node.children[new_node.key.child_key(self.page_size)] = new_node
+            last_node = new_node
 
-        value = torch.cat([value, token_slots[:fetched]])
-        self.evictable_size_ += fetched
+            value = torch.cat([value, token_slots[:fetched]])
+            self.evictable_size_ += fetched
 
-        self._record_store_event(new_node.parent)
-        self._record_store_event(new_node)
+            self._record_store_event(new_node.parent)
+            self._record_store_event(new_node)
 
-        return MatchResult(
-            device_indices=value,
-            last_device_node=last_node,
-            last_host_node=last_node,
-        )
+            return MatchResult(
+                device_indices=value,
+                last_device_node=last_node,
+                last_host_node=last_node,
+            )
+
+        return base_res
 
     def _mp_match_prefix(
         self,
@@ -424,8 +432,8 @@ class LMCRadixCache(RadixCache):
         # Bypass the LMCache-aware override here — we just need
         # ``new_last_node`` from the radix tree, which now contains the
         # tokens we inserted via ``super().cache_finished_req`` above.
-        # Calling ``self.match_prefix`` would trigger a redundant
-        # ``ensure_session`` LOOKUP on the MP path (the scheduler-time
+        # Calling ``self.match_prefix`` would fire a redundant
+        # ``connector.lookup_kv`` on the MP path (the scheduler-time
         # match_prefix already created the daemon session for this rid).
         match_result = super().match_prefix(
             MatchPrefixParams(key=RadixKey(token_ids, req.extra_key))
