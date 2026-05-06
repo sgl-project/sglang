@@ -69,6 +69,9 @@ from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
+
+# Models
+from sglang.srt.managers.mm_utils import general_mm_embed_routine
 from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import (
@@ -1226,7 +1229,6 @@ class Qwen3_5ForCausalLM(nn.Module):
             num_groups=None,
         )
 
-
     @torch.no_grad()
     def forward_split_prefill(
         self,
@@ -2017,7 +2019,6 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
             num_groups=None,
         )
 
-
     @torch.no_grad()
     def forward_split_prefill(
         self,
@@ -2060,5 +2061,6 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
             return result
 
         return None
+
 
 EntryClass = [Qwen3_5MoeForConditionalGeneration, Qwen3_5ForConditionalGeneration]
