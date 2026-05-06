@@ -45,6 +45,7 @@ from sglang.srt.managers.mm_utils import (
 )
 from sglang.srt.managers.schedule_batch import MultimodalDataItem, MultimodalInputs
 from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.models.mistral import MistralForCausalLMMistralFormat
 from sglang.srt.models.mistral_large_3 import MistralLarge3ForCausalLM
 
 USE_XFORMERS_OPS = False
@@ -83,18 +84,32 @@ class PixtralForConditionalGeneration(nn.Module):
         super().__init__()
         self.config = config
         dataclass_fields = {field.name for field in fields(VisionEncoderArgs)}
+        config_dict = self.config.vision_config.to_dict()
+        if config_dict.get("rope_parameters"):  # transformers v5 compatibility
+            config_dict["rope_theta"] = config_dict["rope_parameters"].get("rope_theta")
+            config_dict["rope_scaling"] = config_dict["rope_parameters"]
+            config_dict.pop("rope_parameters")
         vision_args = {
-            key: value
-            for key, value in self.config.vision_config.to_dict().items()
-            if key in dataclass_fields
+            key: value for key, value in config_dict.items() if key in dataclass_fields
         }
 
         self.vision_args = VisionEncoderArgs(**vision_args)
 
-        self.language_model = MistralLarge3ForCausalLM(
-            config=self.config.text_config,
-            quant_config=kwargs.get("quant_config"),
-        )
+        # Choose language model based on text architecture:
+        # MLA text configs use DeepSeek V3 backbone (model_type="deepseek_v3"),
+        # GQA text configs use the standard Llama-style Mistral backbone.
+        text_config = self.config.text_config
+        is_mla = getattr(text_config, "model_type", "") == "deepseek_v3"
+        if is_mla:
+            self.language_model = MistralLarge3ForCausalLM(
+                config=text_config,
+                quant_config=kwargs.get("quant_config"),
+            )
+        else:
+            self.language_model = MistralForCausalLMMistralFormat(
+                config=text_config,
+                quant_config=kwargs.get("quant_config"),
+            )
 
         self.vision_encoder = VisionTransformer(self.vision_args)
 

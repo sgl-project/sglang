@@ -47,7 +47,7 @@ class MatchPrefixParams:
 class InsertParams:
     """Unified parameters for insert across different cache types"""
 
-    key: RadixKey
+    key: Optional[RadixKey] = None
     value: Optional[torch.Tensor] = None
 
     # Mamba specific
@@ -74,7 +74,7 @@ class InsertResult:
 class EvictParams:
     """Unified parameters for evict across different cache types"""
 
-    num_tokens: int
+    num_tokens: int = 0
     swa_num_tokens: int = 0
     mamba_num: int = 0
 
@@ -95,6 +95,10 @@ class IncLockRefResult:
     delta: Optional[int] = None
     swa_uuid_for_lock: Optional[int] = None
 
+    def to_dec_params(self) -> "DecLockRefParams":
+        """Convert to the corresponding DecLockRefParams for dec_lock_ref."""
+        return DecLockRefParams(swa_uuid_for_lock=self.swa_uuid_for_lock)
+
 
 @dataclasses.dataclass
 class DecLockRefParams:
@@ -110,6 +114,16 @@ class DecLockRefResult:
     delta: Optional[int] = None
 
 
+@dataclasses.dataclass
+class InitLoadBackParams:
+    """Unified parameters for init_load_back across different cache types"""
+
+    last_host_node: Any
+    host_hit_length: int
+    mem_quota: Optional[int] = None
+    req: Optional[Req] = None
+
+
 class MatchResult(NamedTuple):
     """Result of a prefix match operation.
 
@@ -119,8 +133,10 @@ class MatchResult(NamedTuple):
         last_host_node  :   The last TreeNode on the host that was matched.
                             Note that if HiCache is not enabled,
                             this **must** be the same as `last_device_node`.
-        last_host_backup_node: The deepest backuped node for prefetch from storage.
-        host_hit_length :   Length of the KV cache hit on the host, if applicable.
+        host_hit_length :   Length of the host cache hit. For pure-KV caches this is the
+                            number of evicted KV tokens on CPU. For hybrid Mamba models this
+                            is max(kv_host_tokens, 1-if-mamba-on-host) so that a mamba-only
+                            host hit still triggers load-back without adding a separate field.
                             0 if HiCache is not enabled.
         mamba_branching_seqlen: The mamba radix cache branching point, which is the longest
                                 page-aligned position that could've been cache hit if there
@@ -130,7 +146,6 @@ class MatchResult(NamedTuple):
     device_indices: torch.Tensor
     last_device_node: Any
     last_host_node: Any
-    last_host_backup_node: Any = None
     host_hit_length: int = 0
     mamba_branching_seqlen: Optional[int] = None
     cache_protected_len: Optional[int] = None
@@ -215,8 +230,7 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
 
     def init_load_back(
         self,
-        last_host_node: Any,
-        host_hit_length: int,
+        params: InitLoadBackParams,
     ) -> Tuple[torch.Tensor, Any]:
         """
         Preparing KV cache loading from host to device.
@@ -251,6 +265,27 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
 
     def supports_mamba(self) -> bool:
         return False
+
+    def supports_streaming_session(self) -> bool:
+        return False
+
+    def release_session(self, session_id: str) -> None:
+        pass
+
+    def session_held_tokens(self, active_pool_idxs: Optional[set] = None) -> int:
+        return 0
+
+    def session_held_full_tokens(self, active_pool_idxs: Optional[set] = None) -> int:
+        return 0
+
+    def session_held_swa_tokens(self, active_pool_idxs: Optional[set] = None) -> int:
+        return 0
+
+    def session_held_req_count(self, active_pool_idxs: Optional[set] = None) -> int:
+        return 0
+
+    def session_held_mamba_slots(self, active_pool_idxs: Optional[set] = None) -> int:
+        return 0
 
     def is_chunk_cache(self) -> bool:
         return False

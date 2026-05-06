@@ -16,6 +16,7 @@ on:
 permissions:
   actions: write
   contents: write
+  issues: read
   pull-requests: read
 
 jobs:
@@ -148,8 +149,9 @@ jobs:
     needs: cut-release-branch
     uses: ./.github/workflows/pr-test.yml
     with:
-      ref: ${{ needs.cut-release-branch.outputs.branch_name }}
+      git_ref: ${{ needs.cut-release-branch.outputs.branch_name }}
       run_all_tests: true
+      skip_stage_health_check: true
     secrets: inherit
 
   run-pr-tests-amd:
