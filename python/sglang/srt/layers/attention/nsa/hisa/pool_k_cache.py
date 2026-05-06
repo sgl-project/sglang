@@ -26,7 +26,7 @@ from typing import List, Optional
 
 import torch
 
-from sglang.srt.layers.attention.nsa.hisa.custom_ops import (
+from sglang.srt.layers.attention.nsa.hisa.tilelang_kernels import (
     fp8_native_paged_mean_pooling_completed_blocks_interface,
 )
 from sglang.srt.mem_cache.memory_pool import NSATokenToKVPool
@@ -385,7 +385,7 @@ class HisaNSATokenToKVPool(NSATokenToKVPool):
         pool_k_pages = self.pool_k_pages[layer_id - self.start_layer]
         if self.k_block_size < self.page_size:
             # k<paged_block_size: tilelang asserts pooling % paged == 0; use SK15.
-            from sglang.srt.layers.attention.nsa.hisa_triton.kernels import (
+            from sglang.srt.layers.attention.nsa.hisa.triton_kernels import (
                 update_pool_for_completed_blocks_triton,
             )
             update_pool_for_completed_blocks_triton(

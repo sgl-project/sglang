@@ -19,10 +19,10 @@ import torch
 from sgl_kernel import fast_topk_v2
 import deep_gemm
 
-from sglang.srt.layers.attention.nsa.hisa.custom_ops import (
+from sglang.srt.layers.attention.nsa.hisa.tilelang_legacy import (
     fp8_native_hierarchy_mqa_logits_tilelang_legacy,
 )
-from sglang.srt.layers.attention.nsa.hisa.triton_kernel import hisa_coord_transform
+from sglang.srt.layers.attention.nsa.hisa.triton_kernels import hisa_coord_transform
 
 
 DEVICE = torch.device("cuda")

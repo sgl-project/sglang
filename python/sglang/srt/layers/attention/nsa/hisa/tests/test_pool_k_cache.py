@@ -15,7 +15,7 @@ import traceback
 
 import torch
 
-from sglang.srt.layers.attention.nsa.hisa.custom_ops import (
+from sglang.srt.layers.attention.nsa.hisa.tilelang_legacy import (
     fp8_native_paged_mean_pooling_interface,
 )
 from sglang.srt.layers.attention.nsa.hisa.pool_k_cache import (

@@ -17,7 +17,7 @@ import traceback
 
 import torch
 
-from sglang.srt.layers.attention.nsa.hisa.triton_kernel import hisa_coord_transform
+from sglang.srt.layers.attention.nsa.hisa.triton_kernels import hisa_coord_transform
 
 
 DEVICE = torch.device("cuda")

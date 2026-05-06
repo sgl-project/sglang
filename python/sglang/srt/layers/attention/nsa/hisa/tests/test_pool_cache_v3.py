@@ -15,7 +15,7 @@ import sys
 
 import torch
 
-from sglang.srt.layers.attention.nsa.hisa.custom_ops import (
+from sglang.srt.layers.attention.nsa.hisa.tilelang_legacy import (
     fp8_native_paged_mean_pooling_interface,
     fp8_native_paged_mean_pooling_tail_only_interface,
     fp8_native_hierarchy_paged_mqa_logits_tilelang_legacy,

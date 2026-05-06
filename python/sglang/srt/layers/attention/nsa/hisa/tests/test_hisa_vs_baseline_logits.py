@@ -23,7 +23,7 @@ import sys
 import torch
 import deep_gemm
 
-from sglang.srt.layers.attention.nsa.hisa.custom_ops import (
+from sglang.srt.layers.attention.nsa.hisa.tilelang_legacy import (
     fp8_native_hierarchy_mqa_logits_tilelang_legacy,
 )
 

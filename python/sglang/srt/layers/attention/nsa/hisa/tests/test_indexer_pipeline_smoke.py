@@ -20,7 +20,7 @@ import traceback
 import torch
 from sgl_kernel import fast_topk_v2
 
-from sglang.srt.layers.attention.nsa.hisa.custom_ops import (
+from sglang.srt.layers.attention.nsa.hisa.tilelang_legacy import (
     fp8_native_hierarchy_mqa_logits_tilelang_legacy,
     fp8_native_hierarchy_paged_mqa_logits_tilelang_legacy,
 )

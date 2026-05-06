@@ -41,7 +41,7 @@ import torch
 
 # Kernels under test (imported directly from source; any future edit will be
 # picked up automatically).
-from sglang.srt.layers.attention.nsa.hisa.custom_ops import (
+from sglang.srt.layers.attention.nsa.hisa.tilelang_legacy import (
     batch_pool_mqa_attn_return_logits_interface,
     pool_mqa_attn_return_logits_interface,
     fp8_native_block_mean_pooling_interface,
