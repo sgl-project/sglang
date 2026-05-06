@@ -1,5 +1,6 @@
 from contextlib import contextmanager
 from dataclasses import dataclass, field
+import math
 
 import torch
 from diffusers.utils.torch_utils import randn_tensor
@@ -389,6 +390,8 @@ class LTX2DenoisingStage(DenoisingStage):
         batch: Req,
         sigma: torch.Tensor,
         sigma_next: torch.Tensor,
+        sigma_val: float,
+        sigma_next_val: float,
         model_video_velocity: torch.Tensor,
         model_audio_velocity: torch.Tensor,
         midpoint_model_call,
@@ -400,9 +403,6 @@ class LTX2DenoisingStage(DenoisingStage):
         final RK2 combination with SDE noise). Mirrors the guided stage-1 res2s
         math but without CFG/STG (stage-2 HQ uses the simple CFG path).
         """
-        sigma_val = float(sigma.item())
-        sigma_next_val = float(sigma_next.item())
-
         if sigma_val == 0.0:
             denoised_video = ctx.latents.float()
             denoised_audio = ctx.audio_latents.float()
@@ -421,6 +421,7 @@ class LTX2DenoisingStage(DenoisingStage):
         sigma_d = sigma.double()
         sigma_next_d = sigma_next.double()
         h = -torch.log(torch.clamp(sigma_next_d / sigma_d, min=1e-12))
+        h_scalar = -math.log(max(sigma_next_val / sigma_val, 1e-12))
         a21, b1, b2 = self._ltx2_get_res2s_coefficients(h)
         sub_sigma = torch.sqrt(torch.clamp(sigma_d * sigma_next_d, min=0.0))
 
@@ -468,7 +469,7 @@ class LTX2DenoisingStage(DenoisingStage):
         )
 
         # Bongmath anchor refinement for the first stage-2 step.
-        if float(h.item()) < 0.5 and sigma_val > 0.03:
+        if h_scalar < 0.5 and sigma_val > 0.03:
             x_mid_v = midpoint_video_latents.double()
             x_mid_a = midpoint_audio_latents.double()
             for _ in range(100):
@@ -1253,15 +1254,17 @@ class LTX2DenoisingStage(DenoisingStage):
         sigmas = getattr(ctx.scheduler, "sigmas", None)
         if sigmas is None or not isinstance(sigmas, torch.Tensor):
             raise ValueError("Expected scheduler.sigmas to be a tensor for LTX-2.")
-        sigma = sigmas[step.step_index].to(
+        sigma_source = sigmas[step.step_index]
+        sigma_next_source = sigmas[step.step_index + 1]
+        sigma_val = float(sigma_source.item())
+        sigma_next_val = float(sigma_next_source.item())
+        sigma = sigma_source.to(
             device=ctx.latents.device, dtype=torch.float32
         )
-        sigma_next = sigmas[step.step_index + 1].to(
+        sigma_next = sigma_next_source.to(
             device=ctx.latents.device, dtype=torch.float32
         )
         dt = sigma_next - sigma
-        sigma_val = float(sigma.item())
-        sigma_next_val = float(sigma_next.item())
 
         stage1_guider_params = self._get_ltx2_stage1_guider_params(
             batch, server_args, ctx.stage
@@ -1429,6 +1432,8 @@ class LTX2DenoisingStage(DenoisingStage):
                     batch=batch,
                     sigma=sigma,
                     sigma_next=sigma_next,
+                    sigma_val=sigma_val,
+                    sigma_next_val=sigma_next_val,
                     model_video_velocity=model_video,
                     model_audio_velocity=model_audio,
                     midpoint_model_call=_stage2_midpoint_model_call,
@@ -1511,6 +1516,7 @@ class LTX2DenoisingStage(DenoisingStage):
             video_latents: torch.Tensor,
             audio_latents: torch.Tensor,
             sigma_value: torch.Tensor,
+            sigma_value_float: float,
             update_skip_cache: bool,
         ) -> tuple[torch.Tensor, torch.Tensor]:
             original_video_latents = ctx.latents
@@ -1747,7 +1753,6 @@ class LTX2DenoisingStage(DenoisingStage):
                     v_ptb, a_v_ptb = pass_outputs.get("perturbed", (None, None))
                     v_mod, a_v_mod = pass_outputs.get("modality", (None, None))
 
-                sigma_value_float = float(sigma_value.item())
                 video_sigma_for_x0: float | torch.Tensor = sigma_value_float
                 if ctx.denoise_mask is not None:
                     video_sigma_for_x0 = sigma_value.to(
@@ -1857,6 +1862,7 @@ class LTX2DenoisingStage(DenoisingStage):
             video_latents=ctx.latents,
             audio_latents=ctx.audio_latents,
             sigma_value=sigma,
+            sigma_value_float=sigma_val,
             update_skip_cache=True,
         )
 
@@ -1868,8 +1874,10 @@ class LTX2DenoisingStage(DenoisingStage):
                 sigma_d = sigma.double()
                 sigma_next_d = sigma_next.double()
                 h = -torch.log(torch.clamp(sigma_next_d / sigma_d, min=1e-12))
+                h_scalar = -math.log(max(sigma_next_val / sigma_val, 1e-12))
                 a21, b1, b2 = self._ltx2_get_res2s_coefficients(h)
                 sub_sigma = torch.sqrt(torch.clamp(sigma_d * sigma_next_d, min=0.0))
+                sub_sigma_val = math.sqrt(max(sigma_val * sigma_next_val, 0.0))
 
                 anchor_video = ctx.latents.double()
                 anchor_audio = ctx.audio_latents.double()
@@ -1921,7 +1929,7 @@ class LTX2DenoisingStage(DenoisingStage):
                     dtype=ctx.audio_latents.dtype
                 )
 
-                if float(h.item()) < 0.5 and sigma_val > 0.03:
+                if h_scalar < 0.5 and sigma_val > 0.03:
                     x_mid_v = midpoint_video_latents.double()
                     x_mid_a = midpoint_audio_latents.double()
                     for _ in range(100):
@@ -1935,6 +1943,7 @@ class LTX2DenoisingStage(DenoisingStage):
                         video_latents=midpoint_video_latents,
                         audio_latents=midpoint_audio_latents,
                         sigma_value=sub_sigma,
+                        sigma_value_float=sub_sigma_val,
                         update_skip_cache=False,
                     )
                 )
