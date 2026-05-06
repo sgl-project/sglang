@@ -34,7 +34,7 @@ from sglang.srt.layers.attention.dsv4.metadata import (
 from sglang.srt.layers.attention.dsv4.metadata_kernel import (
     init_compression_metadata as _init_compression_metadata_triton,
 )
-from sglang.srt.layers.attention.nsa.quant_k_cache_v4 import (
+from sglang.srt.layers.attention.dsv4.quant_k_cache import (
     quant_to_nope_fp8_rope_bf16_pack_triton,
 )
 from sglang.srt.layers.attention.nsa.utils import is_nsa_prefill_cp_round_robin_split

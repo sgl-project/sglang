@@ -15,7 +15,7 @@ from sglang.jit_kernel.deepseek_v4 import (
 )
 from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
 from sglang.srt.environ import envs
-from sglang.srt.layers.attention.nsa.quant_k_cache_v4 import (
+from sglang.srt.layers.attention.dsv4.quant_k_cache import (
     quant_to_nope_fp8_rope_bf16_pack_triton,
 )
 from sglang.srt.layers.attention.nsa.triton_kernel import act_quant

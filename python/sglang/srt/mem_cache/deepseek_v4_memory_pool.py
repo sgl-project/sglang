@@ -9,8 +9,11 @@ import torch
 from sglang.jit_kernel.deepseek_v4 import fused_store_cache
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.environ import envs
-from sglang.srt.layers.attention.nsa import index_buf_accessor, index_buf_accessor_v4
-from sglang.srt.layers.attention.nsa.index_buf_accessor_v4 import NopeFp8RopeBf16Pack
+from sglang.srt.layers.attention.dsv4 import (
+    index_buf_accessor as dsv4_index_buf_accessor,
+)
+from sglang.srt.layers.attention.dsv4.index_buf_accessor import NopeFp8RopeBf16Pack
+from sglang.srt.layers.attention.nsa import index_buf_accessor
 from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.mem_cache.deepseek_v4_compress_state import CompressStatePool
 from sglang.srt.mem_cache.memory_pool import KVCache
@@ -119,7 +122,7 @@ class DeepSeekV4SingleKVPool(KVCache):
         loc: torch.Tensor,
         cache_nope_fp8_rope_bf16_pack: NopeFp8RopeBf16Pack,
     ):
-        index_buf_accessor_v4.SetKAndS.execute(
+        dsv4_index_buf_accessor.SetKAndS.execute(
             pool=self,
             buf=self.kv_buffer[layer_id],
             loc=loc,
