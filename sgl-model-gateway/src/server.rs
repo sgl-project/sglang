@@ -13,6 +13,7 @@ use axum::{
     routing::{delete, get, post},
     Json, Router,
 };
+use bytes::Bytes;
 use rustls::crypto::ring;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -40,11 +41,9 @@ use crate::{
         otel_trace,
     },
     protocols::{
-        chat::ChatCompletionRequest,
         classify::ClassifyRequest,
         completion::CompletionRequest,
         embedding::EmbeddingRequest,
-        generate::GenerateRequest,
         parser::{ParseFunctionCallRequest, SeparateReasoningRequest},
         rerank::V1RerankReqInput,
         responses::{ResponsesGetParams, ResponsesRequest},
@@ -54,6 +53,7 @@ use crate::{
     },
     routers::{
         conversations,
+        http::routing_view::{ChatRoutingView, GenerateRoutingView},
         mesh::{
             get_app_config, get_cluster_status, get_global_rate_limit, get_global_rate_limit_stats,
             get_mesh_health, get_policy_state, get_policy_states, get_worker_state,
@@ -169,27 +169,78 @@ async fn get_model_info(State(state): State<Arc<AppState>>, req: Request) -> Res
     state.router.get_model_info(req).await
 }
 
+/// Read the raw request body up to a generous limit. Matches what
+/// `Json::from_request` would have consumed.
+async fn read_body_bytes(request: Request) -> Result<Bytes, Response> {
+    axum::body::to_bytes(request.into_body(), usize::MAX)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "error": {
+                        "message": format!("Failed to read request body: {}", e),
+                        "type": "invalid_request_error",
+                        "code": "body_read_error"
+                    }
+                })),
+            )
+                .into_response()
+        })
+}
+
+fn json_parse_error(message: String) -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(json!({
+            "error": {
+                "message": message,
+                "type": "invalid_request_error",
+                "code": "json_parse_error"
+            }
+        })),
+    )
+        .into_response()
+}
+
 async fn generate(
     State(state): State<Arc<AppState>>,
     headers: http::HeaderMap,
-    Json(body): Json<GenerateRequest>,
+    request: Request,
 ) -> Response {
-    let model_id = body.model.as_deref();
-    state
-        .router
-        .route_generate(Some(&headers), &body, model_id)
-        .await
+    // Proto-pattern: read raw body, then parse only the fields the
+    // router itself reads for routing decisions. Everything else
+    // (including SGLang RL extension fields) stays in `body` and
+    // flows through verbatim.
+    let body = match read_body_bytes(request).await {
+        Ok(b) => b,
+        Err(resp) => return resp,
+    };
+    let view: GenerateRoutingView = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(e) => return json_parse_error(format!("Invalid JSON data: {}", e)),
+    };
+    state.router.route_generate(Some(&headers), &view, &body).await
 }
 
 async fn v1_chat_completions(
     State(state): State<Arc<AppState>>,
     headers: http::HeaderMap,
-    ValidatedJson(body): ValidatedJson<ChatCompletionRequest>,
+    request: Request,
 ) -> Response {
-    state
-        .router
-        .route_chat(Some(&headers), &body, Some(&body.model))
-        .await
+    // Proto-pattern: see `generate` above. Mirrors the SGLang gRPC
+    // `OpenAIRequest { bytes json_body }` design — the gateway is a
+    // protocol-version-agnostic forwarder, the receiving server
+    // unmarshals the JSON.
+    let body = match read_body_bytes(request).await {
+        Ok(b) => b,
+        Err(resp) => return resp,
+    };
+    let view: ChatRoutingView = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(e) => return json_parse_error(format!("Invalid JSON data: {}", e)),
+    };
+    state.router.route_chat(Some(&headers), &view, &body).await
 }
 
 async fn v1_completions(

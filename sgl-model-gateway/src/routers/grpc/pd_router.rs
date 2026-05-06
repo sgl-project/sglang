@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use axum::{http::HeaderMap, response::Response};
+use bytes::Bytes;
 use tracing::debug;
 
 use super::{context::SharedComponents, pipeline::RequestPipeline};
@@ -14,7 +15,10 @@ use crate::{
     },
     observability::metrics::{metrics_labels, Metrics},
     protocols::{chat::ChatCompletionRequest, generate::GenerateRequest},
-    routers::RouterTrait,
+    routers::{
+        http::routing_view::{ChatRoutingView, GenerateRoutingView},
+        RouterTrait,
+    },
 };
 
 /// gRPC PD (Prefill-Decode) router implementation for SGLang
@@ -223,19 +227,32 @@ impl RouterTrait for GrpcPDRouter {
     async fn route_generate(
         &self,
         headers: Option<&HeaderMap>,
-        body: &GenerateRequest,
-        model_id: Option<&str>,
+        view: &GenerateRoutingView,
+        body: &Bytes,
     ) -> Response {
-        self.route_generate_impl(headers, body, model_id).await
+        let typed: GenerateRequest = match serde_json::from_slice(body) {
+            Ok(v) => v,
+            Err(e) => {
+                return crate::routers::error::bad_request("json_parse_failed", format!("{e}"))
+            }
+        };
+        self.route_generate_impl(headers, &typed, view.model.as_deref())
+            .await
     }
 
     async fn route_chat(
         &self,
         headers: Option<&HeaderMap>,
-        body: &ChatCompletionRequest,
-        model_id: Option<&str>,
+        view: &ChatRoutingView,
+        body: &Bytes,
     ) -> Response {
-        self.route_chat_impl(headers, body, model_id).await
+        let typed: ChatCompletionRequest = match serde_json::from_slice(body) {
+            Ok(v) => v,
+            Err(e) => {
+                return crate::routers::error::bad_request("json_parse_failed", format!("{e}"))
+            }
+        };
+        self.route_chat_impl(headers, &typed, Some(&view.model)).await
     }
 
     fn router_type(&self) -> &'static str {

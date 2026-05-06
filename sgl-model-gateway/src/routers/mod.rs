@@ -9,15 +9,17 @@ use axum::{
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
 };
+use bytes::Bytes;
 
-use crate::protocols::{
-    chat::ChatCompletionRequest,
-    classify::ClassifyRequest,
-    completion::CompletionRequest,
-    embedding::EmbeddingRequest,
-    generate::GenerateRequest,
-    rerank::RerankRequest,
-    responses::{ResponsesGetParams, ResponsesRequest},
+use crate::{
+    protocols::{
+        classify::ClassifyRequest,
+        completion::CompletionRequest,
+        embedding::EmbeddingRequest,
+        rerank::RerankRequest,
+        responses::{ResponsesGetParams, ResponsesRequest},
+    },
+    routers::http::routing_view::{ChatRoutingView, GenerateRoutingView},
 };
 
 pub mod conversations;
@@ -75,12 +77,21 @@ pub trait RouterTrait: Send + Sync + Debug {
             .into_response()
     }
 
-    /// Route a generate request
+    /// Route a generate request.
+    ///
+    /// **Proto-pattern signature** — see
+    /// `proto/sglang/runtime/v1/sglang.proto::OpenAIRequest`. `view`
+    /// captures only the fields the gateway router itself reads
+    /// (model, stream, return_logprob, return_routed_experts, batch
+    /// hints, optional prompt text). `body` is the original client
+    /// request bytes — every other field, including SGLang RL
+    /// extension fields the router doesn't branch on, rides through
+    /// unchanged to the backend.
     async fn route_generate(
         &self,
         _headers: Option<&HeaderMap>,
-        _body: &GenerateRequest,
-        _model_id: Option<&str>,
+        _view: &GenerateRoutingView,
+        _body: &Bytes,
     ) -> Response {
         (
             StatusCode::NOT_IMPLEMENTED,
@@ -89,12 +100,13 @@ pub trait RouterTrait: Send + Sync + Debug {
             .into_response()
     }
 
-    /// Route a chat completion request
+    /// Route a chat completion request. See `route_generate` for the
+    /// meaning of `view` and `body`.
     async fn route_chat(
         &self,
         headers: Option<&HeaderMap>,
-        body: &ChatCompletionRequest,
-        model_id: Option<&str>,
+        view: &ChatRoutingView,
+        body: &Bytes,
     ) -> Response;
 
     /// Route a completion request

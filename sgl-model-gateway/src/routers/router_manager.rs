@@ -14,6 +14,7 @@ use axum::{
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
 };
+use bytes::Bytes;
 use dashmap::DashMap;
 use serde_json::Value;
 use tracing::{debug, info, warn};
@@ -23,15 +24,16 @@ use crate::{
     config::RoutingMode,
     core::{ConnectionMode, RuntimeType, WorkerRegistry, WorkerType},
     protocols::{
-        chat::ChatCompletionRequest,
         classify::ClassifyRequest,
         completion::CompletionRequest,
         embedding::EmbeddingRequest,
-        generate::GenerateRequest,
         rerank::RerankRequest,
         responses::{ResponsesGetParams, ResponsesRequest},
     },
-    routers::RouterTrait,
+    routers::{
+        http::routing_view::{ChatRoutingView, GenerateRoutingView},
+        RouterTrait,
+    },
     server::ServerConfig,
 };
 
@@ -494,13 +496,11 @@ impl RouterTrait for RouterManager {
     async fn route_generate(
         &self,
         headers: Option<&HeaderMap>,
-        body: &GenerateRequest,
-        model_id: Option<&str>,
+        view: &GenerateRoutingView,
+        body: &Bytes,
     ) -> Response {
-        // In IGW mode, resolve model_id and fail fast if not resolvable
-        // In non-IGW mode, pass through to router (router handles validation)
-        let effective_model_id = if self.enable_igw {
-            match self.resolve_model_id(model_id) {
+        let _effective_model_id = if self.enable_igw {
+            match self.resolve_model_id(view.model.as_deref()) {
                 Ok(id) => Some(id),
                 Err(err_response) => return *err_response,
             }
@@ -508,13 +508,10 @@ impl RouterTrait for RouterManager {
             None
         };
 
-        let router =
-            self.select_router_for_request(headers, effective_model_id.as_deref().or(model_id));
+        let router = self.select_router_for_request(headers, view.model.as_deref());
 
         if let Some(router) = router {
-            router
-                .route_generate(headers, body, effective_model_id.as_deref().or(model_id))
-                .await
+            router.route_generate(headers, view, body).await
         } else {
             (
                 StatusCode::NOT_FOUND,
@@ -527,15 +524,11 @@ impl RouterTrait for RouterManager {
     async fn route_chat(
         &self,
         headers: Option<&HeaderMap>,
-        body: &ChatCompletionRequest,
-        model_id: Option<&str>,
+        view: &ChatRoutingView,
+        body: &Bytes,
     ) -> Response {
-        // In IGW mode, resolve model_id and fail fast if not resolvable
-        // In non-IGW mode, pass through to router (router handles validation)
-        let effective_model_id = if self.enable_igw {
-            // Use provided model_id or fall back to body.model
-            let model = model_id.or(Some(&body.model));
-            match self.resolve_model_id(model) {
+        let _effective_model_id = if self.enable_igw {
+            match self.resolve_model_id(Some(&view.model)) {
                 Ok(id) => Some(id),
                 Err(err_response) => return *err_response,
             }
@@ -543,17 +536,14 @@ impl RouterTrait for RouterManager {
             None
         };
 
-        let router =
-            self.select_router_for_request(headers, effective_model_id.as_deref().or(model_id));
+        let router = self.select_router_for_request(headers, Some(&view.model));
 
         if let Some(router) = router {
-            router
-                .route_chat(headers, body, effective_model_id.as_deref().or(model_id))
-                .await
+            router.route_chat(headers, view, body).await
         } else {
             (
                 StatusCode::NOT_FOUND,
-                format!("Model '{}' not found or no router available", body.model),
+                format!("Model '{}' not found or no router available", view.model),
             )
                 .into_response()
         }

@@ -5,6 +5,7 @@ use axum::{
     http::HeaderMap,
     response::{IntoResponse, Response},
 };
+use bytes::Bytes;
 use tracing::debug;
 
 use super::{
@@ -30,7 +31,10 @@ use crate::{
         generate::GenerateRequest,
         responses::{ResponsesGetParams, ResponsesRequest},
     },
-    routers::RouterTrait,
+    routers::{
+        http::routing_view::{ChatRoutingView, GenerateRoutingView},
+        RouterTrait,
+    },
 };
 
 /// gRPC router implementation for SGLang
@@ -377,19 +381,36 @@ impl RouterTrait for GrpcRouter {
     async fn route_generate(
         &self,
         headers: Option<&HeaderMap>,
-        body: &GenerateRequest,
-        model_id: Option<&str>,
+        view: &GenerateRoutingView,
+        body: &Bytes,
     ) -> Response {
-        self.route_generate_impl(headers, body, model_id).await
+        // gRPC builds its own typed proto request. Re-parse the body
+        // into the typed struct so the existing impl can keep using
+        // it. The HTTP entrypoint already parsed a routing view from
+        // the same bytes; this is the consumer that needs more.
+        let typed: GenerateRequest = match serde_json::from_slice(body) {
+            Ok(v) => v,
+            Err(e) => {
+                return crate::routers::error::bad_request("json_parse_failed", format!("{e}"))
+            }
+        };
+        self.route_generate_impl(headers, &typed, view.model.as_deref())
+            .await
     }
 
     async fn route_chat(
         &self,
         headers: Option<&HeaderMap>,
-        body: &ChatCompletionRequest,
-        model_id: Option<&str>,
+        view: &ChatRoutingView,
+        body: &Bytes,
     ) -> Response {
-        self.route_chat_impl(headers, body, model_id).await
+        let typed: ChatCompletionRequest = match serde_json::from_slice(body) {
+            Ok(v) => v,
+            Err(e) => {
+                return crate::routers::error::bad_request("json_parse_failed", format!("{e}"))
+            }
+        };
+        self.route_chat_impl(headers, &typed, Some(&view.model)).await
     }
 
     async fn route_responses(

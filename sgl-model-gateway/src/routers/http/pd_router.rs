@@ -7,6 +7,8 @@ use axum::{
     http::{header::CONTENT_TYPE, HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
 };
+use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine};
+use bytes::Bytes;
 use futures_util::StreamExt;
 use memchr::memmem;
 use reqwest::Client;
@@ -29,18 +31,18 @@ use crate::{
     },
     policies::{LoadBalancingPolicy, PolicyRegistry, SelectWorkerInfo},
     protocols::{
-        chat::{ChatCompletionRequest, ChatMessage, MessageContent},
         classify::ClassifyRequest,
-        common::{InputIds, StringOrArray},
+        common::StringOrArray,
         completion::CompletionRequest,
         embedding::EmbeddingRequest,
-        generate::GenerateRequest,
         rerank::RerankRequest,
     },
     routers::{
         error,
         grpc::utils::{error_type_from_status, route_to_endpoint},
-        header_utils, RouterTrait,
+        header_utils,
+        http::routing_view::{ChatRoutingView, GenerateRoutingView},
+        RouterTrait,
     },
 };
 
@@ -60,9 +62,21 @@ struct PDRequestContext<'a> {
     batch_size: Option<usize>,
     is_stream: bool,
     return_logprob: bool,
+    /// SGLang RL extension. When true and `is_stream` is false, PD
+    /// merges `routed_experts` from the prefill response into the
+    /// decode response (base64 prefix-suffix concat).
+    return_routed_experts: bool,
     request_text: Option<String>,
     model_id: Option<&'a str>,
     headers: Option<HeaderMap>,
+}
+
+impl PDRequestContext<'_> {
+    /// Whether the response merge step needs to walk the prefill JSON.
+    /// Logprobs and routed_experts both live there.
+    fn needs_prefill_json_merge(&self) -> bool {
+        !self.is_stream && (self.return_logprob || self.return_routed_experts)
+    }
 }
 
 impl PDRouter {
@@ -181,24 +195,10 @@ impl PDRouter {
         error::internal_error("serialization_failed", "Failed to serialize request")
     }
 
-    fn get_generate_batch_size(req: &GenerateRequest) -> Option<usize> {
-        // GenerateRequest doesn't support batch via arrays, only via input_ids
-        if let Some(InputIds::Batch(batches)) = &req.input_ids {
-            if !batches.is_empty() {
-                return Some(batches.len());
-            }
-        }
-        None
-    }
-
-    fn get_chat_batch_size(req: &ChatCompletionRequest) -> Option<usize> {
-        if let Some(n) = req.n {
-            if n > 1 {
-                return Some(n as usize);
-            }
-        }
-        None
-    }
+    // get_generate_batch_size / get_chat_batch_size moved to
+    // GenerateRoutingView::batch_size / ChatRoutingView::batch_size —
+    // the routing view computes batch size at parse time without
+    // needing the full typed struct.
 
     fn get_completion_batch_size(req: &CompletionRequest) -> Option<usize> {
         if let StringOrArray::Array(arr) = &req.prompt {
@@ -600,28 +600,16 @@ impl PDRouter {
                         .await;
                 }
 
-                // Process prefill response
-                let prefill_body = if context.return_logprob {
-                    match self
-                        .process_prefill_response(
-                            prefill_result,
-                            prefill.url(),
-                            context.return_logprob,
-                        )
-                        .await
-                    {
-                        Ok((_, body)) => body,
-                        Err(error_response) => return error_response,
-                    }
-                } else {
-                    // Even if we don't need logprobs, we should check prefill status
-                    match self
-                        .process_prefill_response(prefill_result, prefill.url(), false)
-                        .await
-                    {
-                        Ok((_, body)) => body,
-                        Err(error_response) => return error_response,
-                    }
+                // Process prefill response. We need the prefill body
+                // when *any* prefill-side merge applies (logprobs or
+                // routed_experts).
+                let needs_prefill_json = context.needs_prefill_json_merge();
+                let prefill_body = match self
+                    .process_prefill_response(prefill_result, prefill.url(), needs_prefill_json)
+                    .await
+                {
+                    Ok((_, body)) => body,
+                    Err(error_response) => return error_response,
                 };
 
                 if context.is_stream {
@@ -651,11 +639,12 @@ impl PDRouter {
                     )
                 } else {
                     // Non-streaming response
-                    if context.return_logprob {
+                    if context.needs_prefill_json_merge() {
                         self.process_non_streaming_response(
                             res,
                             status,
                             context.return_logprob,
+                            context.return_routed_experts,
                             prefill_body,
                         )
                         .await
@@ -903,6 +892,7 @@ impl PDRouter {
         res: reqwest::Response,
         status: StatusCode,
         return_logprob: bool,
+        return_routed_experts: bool,
         prefill_body: Option<bytes::Bytes>,
     ) -> Response {
         let response = res.bytes().await;
@@ -914,7 +904,7 @@ impl PDRouter {
             }
         };
 
-        if !return_logprob {
+        if !return_logprob && !return_routed_experts {
             return (status, decode_body).into_response();
         }
 
@@ -922,16 +912,22 @@ impl PDRouter {
             return (status, decode_body).into_response();
         };
 
-        // Merge logprobs from prefill and decode
+        // Parse both responses to walk into them for merging logprobs
+        // and/or routed_experts.
         let (Ok(prefill_json), Ok(mut decode_json)) = (
             serde_json::from_slice::<Value>(&prefill_body),
             serde_json::from_slice::<Value>(&decode_body),
         ) else {
-            warn!("Failed to parse responses for logprob merging");
+            warn!("Failed to parse responses for prefill/decode merging");
             return (status, decode_body).into_response();
         };
 
-        Self::merge_logprobs_in_json(&prefill_json, &mut decode_json);
+        if return_logprob {
+            Self::merge_logprobs_in_json(&prefill_json, &mut decode_json);
+        }
+        if return_routed_experts {
+            Self::merge_routed_experts(&prefill_json, &mut decode_json);
+        }
 
         // Return merged response
         match serde_json::to_vec(&decode_json) {
@@ -1062,6 +1058,82 @@ impl PDRouter {
             }
         }
         request
+    }
+
+    /// Merge `routed_experts` from prefill into the decode response.
+    ///
+    /// SGLang's RL extension ships expert ids as a base64-packed byte
+    /// string. The decode worker echoes the prefill's leading bytes
+    /// (first `prefill_len` bytes of decode are the same as prefill)
+    /// and appends per-token expert ids in the suffix. To produce the
+    /// merged stream the gateway concatenates `prefill_bytes ++
+    /// decode_bytes[prefill_len..]` and writes that back into
+    /// `decode_json["routed_experts"]`. Returns `true` when a merge
+    /// happened, `false` if either side was missing or unparsable.
+    ///
+    /// Caller (`merge_prefill_json`) walks two known envelopes for
+    /// this field: `meta_info.routed_experts` on `/generate`
+    /// responses, and `sglext.routed_experts` on OpenAI-compatible
+    /// responses (the `sglext` envelope is a typed contract upstream
+    /// — see `python/sglang/srt/entrypoints/openai/protocol.py::SglExt`).
+    fn merge_routed_experts_in_json(prefill_json: &Value, decode_json: &mut Value) -> bool {
+        let (Some(prefill_routed_experts), Some(decode_routed_experts)) = (
+            prefill_json.get("routed_experts").and_then(Value::as_str),
+            decode_json.get("routed_experts").and_then(Value::as_str),
+        ) else {
+            return false;
+        };
+
+        // Base64 decode failures here mean the client asked for merged
+        // routed_experts but will receive only decode-side payload.
+        // Log as error so data-integrity events show up in dashboards;
+        // leave decode_json untouched.
+        let prefill_bytes = match BASE64_STANDARD.decode(prefill_routed_experts) {
+            Ok(b) => b,
+            Err(error) => {
+                error!("routed_experts_decode_failed (prefill): merge skipped: {error}");
+                return false;
+            }
+        };
+        let decode_bytes = match BASE64_STANDARD.decode(decode_routed_experts) {
+            Ok(b) => b,
+            Err(error) => {
+                error!("routed_experts_decode_failed (decode): merge skipped: {error}");
+                return false;
+            }
+        };
+
+        let suffix = decode_bytes.get(prefill_bytes.len()..).unwrap_or_default();
+        let mut merged = Vec::with_capacity(prefill_bytes.len() + suffix.len());
+        merged.extend_from_slice(&prefill_bytes);
+        merged.extend_from_slice(suffix);
+
+        if let Some(slot) = decode_json.get_mut("routed_experts") {
+            *slot = Value::String(BASE64_STANDARD.encode(&merged));
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Walk both possible response shapes (chat-completions
+    /// `sglext.routed_experts` and `/generate` `meta_info.routed_experts`)
+    /// and merge whichever applies.
+    fn merge_routed_experts(prefill_json: &Value, decode_json: &mut Value) -> bool {
+        let mut merged_any = false;
+        // chat: response.sglext.routed_experts
+        if let Some(prefill_sglext) = prefill_json.get("sglext") {
+            if let Some(decode_sglext) = decode_json.get_mut("sglext") {
+                merged_any |= Self::merge_routed_experts_in_json(prefill_sglext, decode_sglext);
+            }
+        }
+        // generate: response.meta_info.routed_experts
+        if let Some(prefill_meta) = prefill_json.get("meta_info") {
+            if let Some(decode_meta) = decode_json.get_mut("meta_info") {
+                merged_any |= Self::merge_routed_experts_in_json(prefill_meta, decode_meta);
+            }
+        }
+        merged_any
     }
 
     // Helper to merge logprobs from prefill and decode responses
@@ -1248,73 +1320,106 @@ impl RouterTrait for PDRouter {
     async fn route_generate(
         &self,
         headers: Option<&HeaderMap>,
-        body: &GenerateRequest,
-        model_id: Option<&str>,
+        view: &GenerateRoutingView,
+        body: &Bytes,
     ) -> Response {
-        let is_stream = body.stream;
-        let return_logprob = body.return_logprob.unwrap_or(false);
+        let is_stream = view.stream;
+        let return_logprob = view.return_logprob.unwrap_or(false);
+        let return_routed_experts = view.return_routed_experts;
+
+        if is_stream && return_routed_experts {
+            return error::bad_request(
+                "streaming_routed_experts_unsupported",
+                "return_routed_experts is not supported with stream=true on PD mode \
+                 (the streaming SSE path does not merge routed_experts across \
+                 prefill/decode); send the request with stream=false to receive \
+                 merged routed_experts",
+            );
+        }
 
         let request_text = if self.policies_need_request_text() {
-            body.text.as_deref().map(|s| s.to_string())
+            view.text.clone()
         } else {
             None
         };
 
-        let batch_size = Self::get_generate_batch_size(body);
+        // PD has to mutate the body (bootstrap_host/port/room
+        // injection per attempt), so we parse to Value here. Unlike
+        // the unified router, PD can never get to O(1) wire-build.
+        let request_json: Value = match serde_json::from_slice(body) {
+            Ok(v) => v,
+            Err(e) => {
+                return error::bad_request(
+                    "json_parse_failed",
+                    format!("Failed to parse request body as JSON: {e}"),
+                );
+            }
+        };
 
         let context = PDRequestContext {
             route: "/generate",
-            batch_size,
+            batch_size: view.batch_size(),
             is_stream,
             return_logprob,
+            return_routed_experts,
             request_text,
-            model_id,
+            model_id: view.model.as_deref(),
             headers: headers.cloned(),
         };
 
-        self.execute_dual_dispatch(headers, body, context).await
+        self.execute_dual_dispatch(headers, &request_json, context)
+            .await
     }
 
     async fn route_chat(
         &self,
         headers: Option<&HeaderMap>,
-        body: &ChatCompletionRequest,
-        model_id: Option<&str>,
+        view: &ChatRoutingView,
+        body: &Bytes,
     ) -> Response {
-        let is_stream = body.stream;
-        let return_logprob = body.logprobs;
+        let is_stream = view.stream;
+        let return_logprob = view.logprobs;
+        let return_routed_experts = view.return_routed_experts;
 
-        let request_text = if self.policies_need_request_text() {
-            body.messages.first().and_then(|msg| match msg {
-                ChatMessage::User { content, .. } => match content {
-                    MessageContent::Text(text) => Some(text.clone()),
-                    MessageContent::Parts(_) => None,
-                },
-                ChatMessage::Developer { content, .. } => match content {
-                    MessageContent::Text(text) => Some(text.clone()),
-                    MessageContent::Parts(_) => None,
-                },
-                ChatMessage::System { content, .. } => Some(content.to_simple_string()),
-                _ => None,
-            })
-        } else {
-            None
+        if is_stream && return_routed_experts {
+            return error::bad_request(
+                "streaming_routed_experts_unsupported",
+                "return_routed_experts is not supported with stream=true on PD mode \
+                 (the streaming SSE path does not merge routed_experts across \
+                 prefill/decode); send the request with stream=false to receive \
+                 merged routed_experts",
+            );
+        }
+
+        // Cache-aware text extraction on chat would walk the JSON
+        // messages array. Demo skips it; production could add a
+        // lazy text view (e.g. messages: Vec<RawValue>) and walk on
+        // demand.
+        let request_text = None;
+
+        let request_json: Value = match serde_json::from_slice(body) {
+            Ok(v) => v,
+            Err(e) => {
+                return error::bad_request(
+                    "json_parse_failed",
+                    format!("Failed to parse request body as JSON: {e}"),
+                );
+            }
         };
-
-        // Calculate batch size
-        let batch_size = Self::get_chat_batch_size(body);
 
         let context = PDRequestContext {
             route: "/v1/chat/completions",
-            batch_size,
+            batch_size: view.batch_size(),
             is_stream,
             return_logprob,
+            return_routed_experts,
             request_text,
-            model_id,
+            model_id: Some(&view.model),
             headers: headers.cloned(),
         };
 
-        self.execute_dual_dispatch(headers, body, context).await
+        self.execute_dual_dispatch(headers, &request_json, context)
+            .await
     }
 
     async fn route_completion(
@@ -1343,6 +1448,7 @@ impl RouterTrait for PDRouter {
             batch_size,
             is_stream,
             return_logprob,
+            return_routed_experts: false,
             request_text,
             model_id,
             headers: headers.cloned(),
@@ -1369,6 +1475,7 @@ impl RouterTrait for PDRouter {
             batch_size: None,
             is_stream: false,
             return_logprob: false,
+            return_routed_experts: false,
             request_text: req_text,
             model_id,
             headers: headers.cloned(),
