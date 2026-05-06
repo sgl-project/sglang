@@ -176,6 +176,19 @@ def hash_topk(
     routed_scaling_factor: float = 1.0,
     scoring_func: str = "sqrtsoftplus",
 ) -> Tuple[torch.Tensor, torch.Tensor]:
+
+    if is_hip_runtime():
+        from sglang.jit_kernel.hash_topk import hash_topk_triton
+
+        return hash_topk_triton(
+            router_logits,
+            input_ids,
+            tid2eid,
+            num_fused_shared_experts,
+            routed_scaling_factor,
+            scoring_func,
+        )
+
     assert scoring_func == "sqrtsoftplus"
     num_tokens = router_logits.size(0)
     topk_routed = tid2eid.size(1)
