@@ -3,11 +3,6 @@ import sys
 import pytest
 import torch
 
-try:
-    import triton
-except ImportError:
-    triton = None
-
 from sglang.jit_kernel.utils import get_ci_test_range
 from sglang.test.ci.ci_register import register_cuda_ci
 
