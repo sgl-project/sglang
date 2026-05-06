@@ -34,7 +34,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=150, suite="stage-b-test-1-gpu-small")
+register_cuda_ci(est_time=150, suite="stage-b-test-1-gpu-large")
 
 _MODEL_NAME = "Qwen/Qwen3-0.6B"
 # We address the up half via the HF-style unfused name "up_proj.weight". sglang's
