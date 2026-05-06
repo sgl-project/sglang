@@ -6882,6 +6882,186 @@ def summarize_relaykv_live_token_to_kv_pool_index_read_results_for_smoke(
     }
 
 
+def _relaykv_req_to_token_resolution_payload_bridge_source(
+    *,
+    forward_batch: Any = None,
+    model_runner: Any = None,
+    explicit_payloads: Any = None,
+) -> tuple[Any, str | None]:
+    if explicit_payloads is not None:
+        return explicit_payloads, "explicit_payloads"
+
+    for owner, path in (
+        (forward_batch, "relaykv_req_to_token_resolution_results"),
+        (forward_batch, "relaykv_req_to_token_resolution_payloads"),
+        (model_runner, "relaykv_req_to_token_resolution_results"),
+        (model_runner, "relaykv_req_to_token_resolution_payloads"),
+    ):
+        if owner is None:
+            continue
+        value = getattr(owner, path, None)
+        if value is not None:
+            owner_name = "forward_batch" if owner is forward_batch else "model_runner"
+            return value, f"{owner_name}.{path}"
+    return None, None
+
+
+def _is_valid_req_to_token_resolution_payload_for_smoke(payload: Any) -> bool:
+    if not isinstance(payload, dict):
+        return False
+    if payload.get("event_type") != "relaykv_req_to_token_resolution_result":
+        return False
+    if payload.get("resolution_state") != "req_to_token_resolved":
+        return False
+    spans = payload.get("full_kv_req_to_token_spans")
+    if not isinstance(spans, (list, tuple)) or not spans:
+        return False
+    for span in spans:
+        if not isinstance(span, Mapping):
+            return False
+        entries = _event_value(span, "req_to_token_entries")
+        if not isinstance(entries, (list, tuple)) or not entries:
+            return False
+    return True
+
+
+def build_relaykv_req_to_token_resolution_bridge_payloads_for_smoke(
+    *,
+    forward_batch: Any = None,
+    model_runner: Any = None,
+    explicit_payloads: Any = None,
+    bridge_enabled: bool = False,
+) -> list[dict[str, Any]]:
+    """Build shallow req_to_token resolution bridge payloads for smoke only."""
+
+    source_value, source_path = _relaykv_req_to_token_resolution_payload_bridge_source(
+        forward_batch=forward_batch,
+        model_runner=model_runner,
+        explicit_payloads=explicit_payloads,
+    )
+
+    blocked_reason = None
+    bridge_state = "bridged"
+    valid_payloads: list[dict[str, Any]] = []
+    payload_count = 0
+    blocked_payload_count = 0
+
+    if bridge_enabled is not True:
+        bridge_state = "blocked"
+        blocked_reason = "bridge_not_enabled"
+    elif source_value is None:
+        bridge_state = "blocked"
+        blocked_reason = "bridge_source_missing"
+    elif not isinstance(source_value, (list, tuple)):
+        bridge_state = "blocked"
+        blocked_reason = "bridge_source_not_list_or_tuple"
+    elif len(source_value) == 0:
+        bridge_state = "blocked"
+        blocked_reason = "bridge_source_empty"
+    else:
+        payload_count = len(source_value)
+        for payload in source_value:
+            if _is_valid_req_to_token_resolution_payload_for_smoke(payload):
+                valid_payloads.append(_copy_relaykv_metadata_value_for_smoke(dict(payload)))
+            else:
+                blocked_payload_count += 1
+        if not valid_payloads:
+            bridge_state = "blocked"
+            blocked_reason = "bridge_payload_invalid"
+        elif blocked_payload_count > 0:
+            bridge_state = "bridged"
+
+    result = {
+        "event_type": "relaykv_req_to_token_resolution_payload_bridge_result",
+        "bridge_state": bridge_state,
+        "bridge_mode": "runtime_payload_bridge",
+        "payload_count": payload_count,
+        "valid_payload_count": len(valid_payloads),
+        "blocked_payload_count": blocked_payload_count,
+        "bridge_source_path": source_path,
+        "blocked_reason": blocked_reason,
+        "req_to_token_resolution_payloads": valid_payloads,
+        "source_mutated": False,
+        "req_to_token_read_count": 0,
+        "actual_req_to_token_pool_read_count": 0,
+        "kv_pool_read_count": 0,
+        "kv_snapshot_count": 0,
+        "tensor_read_count": 0,
+        "attention_comparison_executed_count": 0,
+        "attention_override_true_count": 0,
+        "runtime_writeback_true_count": 0,
+        "scheduler_policy_noop_false_count": 0,
+        "kv_cache_mutation_true_count": 0,
+        "source_mutated_true_count": 0,
+    }
+    return [result]
+
+
+def summarize_relaykv_req_to_token_resolution_bridge_payloads_for_smoke(
+    bridge_results: list[dict[str, Any]] | tuple[dict[str, Any], ...],
+) -> dict[str, Any]:
+    """Summarize shallow req_to_token resolution bridge payloads for smoke only."""
+
+    if not isinstance(bridge_results, (list, tuple)):
+        raise TypeError(
+            "RelayKV req_to_token resolution bridge results must be a list or tuple"
+        )
+
+    per_bridge_state: Counter[str] = Counter()
+    per_source_path: Counter[str] = Counter()
+    totals: Counter[str] = Counter(
+        {
+            "payload_count": 0,
+            "valid_payload_count": 0,
+            "blocked_payload_count": 0,
+            "req_to_token_read_count": 0,
+            "actual_req_to_token_pool_read_count": 0,
+            "kv_pool_read_count": 0,
+            "kv_snapshot_count": 0,
+            "tensor_read_count": 0,
+            "attention_comparison_executed_count": 0,
+            "attention_override_true_count": 0,
+            "runtime_writeback_true_count": 0,
+            "scheduler_policy_noop_false_count": 0,
+            "kv_cache_mutation_true_count": 0,
+            "source_mutated_true_count": 0,
+        }
+    )
+    bridged_count = 0
+    blocked_count = 0
+    error_count = 0
+
+    for result in bridge_results:
+        if not isinstance(result, dict):
+            raise TypeError(
+                "RelayKV req_to_token resolution bridge result must be a dict"
+            )
+        state = str(result.get("bridge_state") or "unknown")
+        per_bridge_state[state] += 1
+        per_source_path[str(result.get("bridge_source_path"))] += 1
+        if state == "bridged":
+            bridged_count += 1
+        elif state == "blocked":
+            blocked_count += 1
+        elif state == "error":
+            error_count += 1
+        for key in totals:
+            value = result.get(key)
+            if isinstance(value, int) and not isinstance(value, bool):
+                totals[key] += value
+
+    return {
+        "summary_type": "relaykv_req_to_token_resolution_payload_bridge_summary",
+        "total_bridge_results": len(bridge_results),
+        "bridged_count": bridged_count,
+        "blocked_count": blocked_count,
+        "error_count": error_count,
+        "per_bridge_state_counts": dict(sorted(per_bridge_state.items())),
+        "per_source_path_counts": dict(sorted(per_source_path.items())),
+        **{key: totals[key] for key in sorted(totals)},
+    }
+
+
 def build_relaykv_physical_kv_index_resolution_results_for_smoke(
     req_to_token_resolution_results: list[dict[str, Any]]
     | tuple[dict[str, Any], ...],
