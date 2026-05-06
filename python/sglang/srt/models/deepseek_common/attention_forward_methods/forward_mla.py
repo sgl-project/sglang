@@ -28,8 +28,8 @@ from sglang.srt.models.deepseek_common.utils import (
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import BumpAllocator, get_bool_env_var
 
-_use_aiter_fused_mla_qk_rope = (
-    get_bool_env_var("SGLANG_AITER_FUSED_MLA_QK_ROPE", "True") and _use_aiter_gfx95
+_use_aiter_fused_qk_rope_cat_and_cache_mla = (
+    get_bool_env_var("SGLANG_AITER_FUSED_QK_ROPE_CAT_AND_CACHE_MLA", "True") and _use_aiter_gfx95
 )
 
 
@@ -423,7 +423,7 @@ class DeepseekMLAForwardMixin:
                     ),
                 )
         else:
-            if _use_aiter_fused_mla_qk_rope:
+            if _use_aiter_fused_qk_rope_cat_and_cache_mla:
                 cos = self.rotary_emb.cos_cache
                 sin = self.rotary_emb.sin_cache
 
