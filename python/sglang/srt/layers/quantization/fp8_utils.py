@@ -667,7 +667,6 @@ def deepgemm_w8a8_block_fp8_linear_with_fallback(
             weight_scale = _unpack_ue8m0_scale_for_triton(
                 weight_scale, weight.shape, block_size
             )
-
         return triton_w8a8_block_fp8_linear(
             input, weight, block_size, weight_scale, input_scale, bias
         )
@@ -1239,6 +1238,7 @@ def requant_weight_ue8m0(
         weight_dequant=weight_dequant,
         weight_block_size=weight_block_size,
     )
+
     out_s = transform_scale_ue8m0(out_s, mn=out_w.shape[-2])
 
     return out_w, out_s
