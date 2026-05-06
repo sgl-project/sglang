@@ -70,9 +70,6 @@ class StandaloneDraftWorker(EagleDraftWorker):
             server_args.speculative_algorithm
         )
 
-        # TODO: Adaptive speculative
-        self.adaptive_controller: Optional[AdaptiveController] = None
-
         # Set constant
         from sglang.srt.speculative.eagle_info import EagleDraftInput
 
@@ -189,3 +186,6 @@ class StandaloneWorkerV2(EAGLEWorkerV2):
         self.extend_lens = torch.empty((), dtype=torch.int64, device=self.device)
 
         self.plan_stream, self.plan_stream_ctx = _get_plan_stream(self.device)
+
+        # TODO: Adaptive speculative
+        self.adaptive_controller: Optional[AdaptiveController] = None
