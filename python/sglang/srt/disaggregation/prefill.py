@@ -792,6 +792,7 @@ class SchedulerDisaggregationPrefillMixin:
             elif isinstance(
                 self.token_to_kv_pool_allocator.get_kvcache(), BaseSWAKVPool
             ):
+                # SWA hybrid model: send last window KV indices
                 seq_len = len(req.fill_ids)
                 window_size = self.sliding_window_size
                 window_start = max(0, seq_len - window_size)
