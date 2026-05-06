@@ -889,12 +889,6 @@ def linear_bf16_fp32(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     from sglang.srt.environ import envs
 
     algo = envs.SGLANG_OPT_BF16_FP32_GEMM_ALGO.get()
-
-    if algo == "auto":
-        from sglang.srt.layers.linear_bf16_fp32.selector import pick_backend
-
-        algo = pick_backend(m=x.size(0), n=y.size(0), k=x.size(1))
-
     return _dispatch_bf16_fp32_backend(x, y, algo=algo)
 
 
