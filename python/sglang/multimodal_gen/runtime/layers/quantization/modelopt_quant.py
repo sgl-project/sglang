@@ -475,7 +475,7 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
             output_dim=0,
             weight_loader=weight_loader,
         )
-
+        set_weight_attrs(weight_scale, {"missing_param_init": "ones"})
         layer.register_parameter("weight_scale", weight_scale)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
