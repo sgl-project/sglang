@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import socket
+import sys
 from datetime import datetime
 from logging.handlers import TimedRotatingFileHandler
 from typing import List, Optional, Union
@@ -15,14 +16,19 @@ def create_log_targets(
     *, targets: Optional[List[str]], name_prefix: str
 ) -> List[logging.Logger]:
     if not targets:
-        return [logging.getLogger(name_prefix)]
+        return [_create_stdout_logger(name_prefix)]
     return [_create_log_target(t, name_prefix) for t in targets]
 
 
 def _create_log_target(target: str, name_prefix: str) -> logging.Logger:
     if target.lower() == "stdout":
-        return logging.getLogger(name_prefix)
+        return _create_stdout_logger(name_prefix)
     return _create_log_target_file(target, name_prefix)
+
+
+def _create_stdout_logger(name_prefix: str) -> logging.Logger:
+    handler = logging.StreamHandler(sys.stdout)
+    return _create_logger_with_handler(f"{name_prefix}.stdout", handler)
 
 
 def _create_log_target_file(directory: str, name_prefix: str) -> logging.Logger:
