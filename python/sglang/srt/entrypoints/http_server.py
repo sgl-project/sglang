@@ -1295,11 +1295,13 @@ async def resume_memory_occupation(
 @app.post("/weights_checker")
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def check_weights(obj: CheckWeightsReqInput, request: Request):
-    success, message = await _global_state.tokenizer_manager.check_weights(obj, request)
-    return ORJSONResponse(
-        {"success": success, "message": message},
-        status_code=200 if success else HTTPStatus.BAD_REQUEST,
+    success, message, ranks = await _global_state.tokenizer_manager.check_weights(
+        obj, request
     )
+    body = {"success": success, "message": message}
+    if ranks is not None:
+        body["ranks"] = ranks
+    return ORJSONResponse(body, status_code=200 if success else HTTPStatus.BAD_REQUEST)
 
 
 @app.api_route("/slow_down", methods=["GET", "POST"])
@@ -1990,8 +1992,9 @@ def _execute_server_warmup(server_args: ServerArgs):
             )
             if res.status_code == 200:
                 logger.info(
-                    f"End of prefill disaggregation mode warmup with status {res.status_code}, resp: {res.json()}"
+                    f"Disaggregation warmup request completed with status {res.status_code}, resp: {res.json()}"
                 )
+                logger.info("End of disaggregation warmup")
                 _global_state.tokenizer_manager.server_status = ServerStatus.Up
             else:
                 logger.info(

@@ -8,7 +8,7 @@ from typing import List
 
 import torch
 
-from sglang.srt.utils import is_hip, kill_process_tree
+from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.run_eval import run_eval
 from sglang.test.runners import DEFAULT_PROMPTS, SRTRunner, check_close_model_outputs
@@ -21,7 +21,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=244, suite="stage-b-test-1-gpu-small")
+register_cuda_ci(est_time=177, suite="stage-b-test-1-gpu-small")
 register_amd_ci(est_time=320, suite="stage-b-test-1-gpu-small-amd")
 
 
@@ -69,27 +69,6 @@ class TestTransformersFallbackEndpoint(CustomTestCase):
         self.assertGreater(metrics["score"], self.gsm8k_lower_bound)
 
 
-@unittest.skipIf(is_hip(), "TorchAO int4wo quantization is not supported on AMD GPUs")
-class TestTransformersFallbackTorchAO(TestTransformersFallbackEndpoint):
-    @classmethod
-    def setUpClass(cls):
-        cls.model = DEFAULT_MODEL_NAME_FOR_TEST
-        cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.process = popen_launch_server(
-            cls.model,
-            cls.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=[
-                "--model-impl",
-                "transformers",
-                "--torchao-config",
-                "int4wo-128",
-            ],
-        )
-        cls.mmlu_lower_bound = 0.63
-        cls.gsm8k_lower_bound = 0.65
-
-
 @dataclasses.dataclass
 class ModelCase:
     model_path: str
@@ -99,7 +78,6 @@ class ModelCase:
     rouge_l_tolerance: float = 1
     skip_long_prompt: bool = False
     trust_remote_code: bool = False
-    torchao_config: str = None
     torch_dtype: torch.dtype = torch.float16
 
 
@@ -133,7 +111,6 @@ class TestTransformersFallbackEngine(CustomTestCase):
             model_type="generation",
             model_impl="transformers",
             trust_remote_code=model_case.trust_remote_code,
-            torchao_config=model_case.torchao_config,
         ) as srt_runner:
             srt_outputs = srt_runner.forward(prompts, max_new_tokens=max_new_tokens)
 
@@ -143,7 +120,6 @@ class TestTransformersFallbackEngine(CustomTestCase):
             torch_dtype=model_case.torch_dtype,
             model_type="generation",
             trust_remote_code=model_case.trust_remote_code,
-            torchao_config=model_case.torchao_config,
         ) as srt_runner:
             srt_transformers_outputs = srt_runner.forward(
                 prompts, max_new_tokens=max_new_tokens

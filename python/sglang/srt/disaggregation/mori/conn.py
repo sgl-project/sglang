@@ -882,6 +882,7 @@ class MoriKVSender(CommonKVSender):
             aux_index=self.aux_index if is_last else None,
         )
         self.transfer_statuses.extend(statuses)
+        self._record_transfer_indices(kv_indices, None)
         if infos is not None:
             self.pending_infos = infos
             self.sent_last_chunk = True
@@ -1033,6 +1034,7 @@ class MoriKVReceiver(CommonKVReceiver):
         kv_indices: npt.NDArray[np.int32],
         aux_index: Optional[int] = None,
         state_indices: Optional[List[int]] = None,
+        decode_prefix_len: Optional[int] = None,
     ):
         if self.bootstrap_infos is None or self.bootstrap_room is None:
             return
@@ -1105,7 +1107,6 @@ class MoriKVReceiver(CommonKVReceiver):
         if self.bootstrap_room is None:
             return
         super().abort()
-        self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
         self.clear()
 
 
