@@ -106,10 +106,12 @@ class VideoDecoderWrapper:
         import torch
 
         def _maybe_pin(t):
-            try:
-                return t.pin_memory()
-            except Exception:
-                return t
+            if t.device.type == "cpu":
+                try:
+                    return t.pin_memory()
+                except Exception:
+                    return t
+            return t
 
         if _BACKEND == "torchcodec":
             batch = self._decoder.get_frames_at(indices)
