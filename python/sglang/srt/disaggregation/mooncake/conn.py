@@ -1754,7 +1754,6 @@ class MooncakeKVSender(CommonKVSender):
         raise KVTransferError(self.bootstrap_room, failure_reason)
 
 
-
 class MooncakeKVReceiver(CommonKVReceiver):
     def __init__(
         self,
@@ -1934,7 +1933,6 @@ class MooncakeKVReceiver(CommonKVReceiver):
                 self.bootstrap_room, "Failed due to an unknown reason from another rank"
             )
         raise KVTransferError(self.bootstrap_room, failure_reason)
-
 
 
 class MooncakeKVBootstrapServer(CommonKVBootstrapServer):
