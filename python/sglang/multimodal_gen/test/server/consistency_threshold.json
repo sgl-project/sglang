@@ -104,7 +104,7 @@
             "mean_abs_diff_threshold": 8.0
         },
         "ltx_2.3_one_stage_ti2v": {
-            "clip_threshold": 0.64,
+            "clip_threshold": 0.62,
             "ssim_threshold": 0.42,
             "psnr_threshold": 8.8,
             "mean_abs_diff_threshold": 59.0
