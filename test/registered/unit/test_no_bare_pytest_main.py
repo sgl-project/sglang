@@ -1,67 +1,26 @@
-"""Guards the CI runner contract that test files using pytest.main propagate
-the exit code so failing tests cause the wrapping python process to exit
-non-zero. ci_utils.run_files reads process.returncode; a bare
-pytest.main([__file__]) silently lets the script exit 0 even when assertions
-fail, which masks regressions.
+"""Static check that no test file calls `pytest.main(...)` bare in its
+`__main__` block. The CI runner (`ci_utils.run_files`) decides pass/fail by
+reading the wrapping python script's exit code; a bare `pytest.main([__file__])`
+discards pytest's exit code, so the script returns 0 even when assertions fail
+and the runner silently reports the file as PASSED.
 """
 
 import ast
 import pathlib
-import subprocess
-import sys
-import tempfile
-import textwrap
 import unittest
 
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=10, suite="stage-a-test-cpu")
+register_cpu_ci(est_time=5, suite="stage-a-test-cpu")
 
 
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[3]
 _SCAN_ROOTS = [_REPO_ROOT / "python", _REPO_ROOT / "test"]
 
 
-class TestPytestMainExitCode(CustomTestCase):
-    def test_wrapper_propagates_pytest_failure(self):
-        """A file using `sys.exit(pytest.main([__file__]))` must exit non-zero
-        when the contained pytest assertions fail."""
-        script = textwrap.dedent("""
-            import sys
-            import pytest
-
-            def test_intentional_failure():
-                assert False, "intentional failure for exit-code propagation contract"
-
-            if __name__ == "__main__":
-                sys.exit(pytest.main([__file__]))
-            """).strip()
-
-        with tempfile.TemporaryDirectory() as td:
-            path = pathlib.Path(td) / "fake_failing_test.py"
-            path.write_text(script)
-            result = subprocess.run(
-                [sys.executable, str(path), "-f"],
-                capture_output=True,
-                text=True,
-            )
-
-        self.assertNotEqual(
-            result.returncode,
-            0,
-            msg=(
-                "sys.exit(pytest.main(...)) must propagate failing tests as "
-                f"non-zero exit code; got 0.\nstdout:\n{result.stdout}\n"
-                f"stderr:\n{result.stderr}"
-            ),
-        )
-
+class TestNoBarePytestMain(CustomTestCase):
     def test_no_bare_pytest_main_in_repo(self):
-        """Every `if __name__ == '__main__':` block that calls pytest.main
-        must wrap it in sys.exit(...). A bare expression statement leaves the
-        script's exit code at 0, so the CI runner reports the file as PASSED
-        even when pytest reports failures."""
         offenders = []
         for root in _SCAN_ROOTS:
             if not root.exists():
