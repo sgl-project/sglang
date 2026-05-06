@@ -339,11 +339,17 @@ class TestCheckTensors(CustomTestCase):
 
 
 class _WeightCheckerTestBase(CustomTestCase):
-    """Shared fixture: fresh _TinyModel + WeightChecker per test."""
+    """Shared fixture: fresh _TinyModel + WeightChecker per test, on CUDA.
+
+    The model lives on CUDA so that _snapshot's `.detach().cpu()` produces
+    an independent CPU copy. On a CPU model `.cpu()` is a no-op and the
+    snapshot would alias the live storage, which masks reset-then-compare
+    divergence.
+    """
 
     def setUp(self):
         torch.manual_seed(0)
-        self.model = _TinyModel()
+        self.model = _TinyModel().cuda()
         self.checker = WeightChecker(model_runner=_FakeModelRunner(self.model))
 
 
@@ -363,7 +369,6 @@ class TestSnapshot(_WeightCheckerTestBase):
         self.assertEqual(keys, expected)
 
     def test_detaches_and_moves_to_cpu(self):
-        self.model.cuda()
         self.checker._snapshot()
         for tensor in self.checker._snapshot_tensors.values():
             self.assertEqual(tensor.device.type, "cpu")
