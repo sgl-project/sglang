@@ -173,17 +173,55 @@ EOF
 
   # Install accelerate for distributed training and inference support
   docker exec ci_sglang pip install --cache-dir=/sgl-data/pip-cache accelerate || echo "accelerate installation failed"
-
-  # torchcodec is imported at module load by the MiMoV2 multimodal processor.
-  # MiMo-V2.5-Pro is text-only but shares the MiMoV2ForCausalLM architecture with
-  # the multimodal V2.5 variant, so the processor still has to register on import.
-  # Without torchcodec the import fails silently and the server aborts with
-  # "No processor registered for architecture: ['MiMoV2ForCausalLM']".
-  # torchcodec also needs FFmpeg shared libs (libavcodec 4-8) at runtime, which
-  # the ROCm base image does not ship by default.
-  docker exec ci_sglang bash -c "command -v ffmpeg >/dev/null 2>&1 || (apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ffmpeg)" || echo "ffmpeg installation failed"
-  docker exec ci_sglang pip install --cache-dir=/sgl-data/pip-cache torchcodec || echo "torchcodec installation failed"
 fi
+
+# Install a stub `torchcodec` package so the MiMoV2 multimodal processor can
+# import (`from torchcodec.decoders import AudioDecoder`) and register itself.
+#
+# Why this is needed:
+#   - MiMoV2 multimodal processor is registered for the `MiMoV2ForCausalLM`
+#     architecture, which is shared by the text-only MiMo-V2.5-Pro and the
+#     multimodal MiMo-V2.5 variants. If the import fails, the processor does
+#     not register, and the server aborts at startup with:
+#         ValueError: No processor registered for architecture:
+#                     ['MiMoV2ForCausalLM']
+#
+# Why a stub instead of the real wheel:
+#   - The real torchcodec wheel bundles `libtorchcodec_coreN.so` binaries that
+#     require both a matching FFmpeg ABI (libavutil 5/6/7/8 for cores 5-8) and
+#     a recent torch ABI for core 4. The AMD ROCm container ships FFmpeg 4
+#     (libavutil.so.56) and torch 2.11+, leaving no loadable core, so
+#     `torchcodec` fails to import even after `apt-get install ffmpeg`.
+#   - MiMo-V2.5-Pro is text-only and never invokes the audio decoder, so a
+#     stub that only satisfies the import path is sufficient.
+#
+# Installed unconditionally (i.e. also under --skip-test-time-deps) because the
+# MiMo-V2.5-Pro nightly jobs run on the ROCm 7.2 workflow path too.
+docker exec ci_sglang pip uninstall -y torchcodec >/dev/null 2>&1 || true
+docker exec ci_sglang bash -c '
+set -euo pipefail
+SITE=$(python3 -c "import site, sys; sys.stdout.write(site.getsitepackages()[0])")
+rm -rf "$SITE/torchcodec"
+mkdir -p "$SITE/torchcodec/decoders"
+cat > "$SITE/torchcodec/__init__.py" << "PY"
+"""Stub torchcodec for AMD CI (text-only MiMo-V2.5-Pro)."""
+PY
+cat > "$SITE/torchcodec/decoders/__init__.py" << "PY"
+"""Stub torchcodec.decoders providing a placeholder AudioDecoder.
+
+MiMo-V2.5-Pro is text-only, so the AMD nightly tests never invoke this. The
+stub exists solely so that `from torchcodec.decoders import AudioDecoder`
+succeeds and the MiMoV2 multimodal processor can register itself.
+"""
+
+
+class AudioDecoder:
+    def __init__(self, *args, **kwargs):
+        raise RuntimeError(
+            "torchcodec is stubbed in AMD CI; audio inputs are not supported."
+        )
+PY
+'
 
 if [[ -n "${SKIP_AITER_BUILD}" ]]; then
   exit 0
