@@ -158,9 +158,7 @@ def fused_topk_npu(
                 topk_ids, expert_location_dispatch_info
             )
 
-        get_global_expert_distribution_recorder().on_select_experts(
-            topk_ids=topk_ids
-        )
+        get_global_expert_distribution_recorder().on_select_experts(topk_ids=topk_ids)
         if (cap := get_global_experts_capturer()) is not None:
             cap.capture(
                 layer_id=layer_id,
