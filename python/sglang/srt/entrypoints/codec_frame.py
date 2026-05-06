@@ -21,6 +21,7 @@ Protobuf     (Content-Type: application/x-protobuf)
 
 No new dependencies: msgspec is already in SGLang's requirements.
 """
+
 from __future__ import annotations
 
 import struct

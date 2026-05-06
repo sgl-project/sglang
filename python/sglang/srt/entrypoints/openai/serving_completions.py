@@ -115,7 +115,8 @@ class OpenAIServingCompletion(OpenAIServingBase):
         binary = request.stream_format != "json"
         return_logprob = binary or (request.logprobs is not None)
         top_logprobs_num = (
-            0 if binary and request.logprobs is None
+            0
+            if binary and request.logprobs is None
             else (request.logprobs if request.logprobs is not None else 0)
         )
 
@@ -250,9 +251,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
         prompt without detokenization.
         """
         n_prev_tokens: dict[int, int] = {}
-        incremental = (
-            self.tokenizer_manager.server_args.incremental_streaming_output
-        )
+        incremental = self.tokenizer_manager.server_args.incremental_streaming_output
         try:
             async for content in self.tokenizer_manager.generate_request(
                 adapted_request, raw_request
@@ -265,15 +264,15 @@ class OpenAIServingCompletion(OpenAIServingBase):
                 raw_logprobs = meta.get("output_token_logprobs", [])
 
                 # Slice to get only the new tokens in this chunk.
-                new_logprobs = raw_logprobs if incremental else raw_logprobs[n_prev:total]
+                new_logprobs = (
+                    raw_logprobs if incremental else raw_logprobs[n_prev:total]
+                )
                 n_prev_tokens[index] = total
 
                 token_ids = [tok_id for _, tok_id, _ in new_logprobs]
 
                 finish_reason_obj = meta.get("finish_reason")
-                finish_reason = (
-                    finish_reason_obj["type"] if finish_reason_obj else None
-                )
+                finish_reason = finish_reason_obj["type"] if finish_reason_obj else None
                 done = finish_reason is not None
 
                 yield encode_frame(

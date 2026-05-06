@@ -1499,12 +1499,11 @@ async def openai_v1_completions_codec(raw_request: Request):
       application/x-msgpack   — MessagePack framing (default)
       application/x-protobuf  — Protobuf framing (4-byte big-endian length prefix)
     """
+
     from sglang.srt.entrypoints.codec_frame import (
         decode_msgpack,
         decode_protobuf_request,
-        encode_frame,
     )
-    from fastapi.responses import StreamingResponse as _SR
 
     content_type = raw_request.headers.get("content-type", "application/x-msgpack")
     body = await raw_request.body()
@@ -1518,15 +1517,18 @@ async def openai_v1_completions_codec(raw_request: Request):
             stream_format = params.get("stream_format", "msgpack")
     except Exception as e:
         from fastapi.responses import ORJSONResponse as _OR
+
         return _OR({"error": f"Codec: failed to decode request: {e}"}, status_code=400)
 
     prompt_ids = params.get("prompt_ids", [])
     if not prompt_ids:
         from fastapi.responses import ORJSONResponse as _OR
+
         return _OR({"error": "Codec: prompt_ids is required"}, status_code=400)
 
     # Build a CompletionRequest with token-ID prompt and binary stream_format.
     from sglang.srt.entrypoints.openai.protocol import CompletionRequest as _CR
+
     request = _CR(
         model=raw_request.app.state.openai_serving_completion.tokenizer_manager.server_args.served_model_name,
         prompt=prompt_ids,
@@ -1550,8 +1552,10 @@ async def codec_schema():
         curl http://localhost:30000/codec/schema > codec.proto
         protoc --python_out=. codec.proto
     """
-    from sglang.srt.entrypoints.codec_frame import PROTO_SCHEMA
     from fastapi.responses import PlainTextResponse
+
+    from sglang.srt.entrypoints.codec_frame import PROTO_SCHEMA
+
     return PlainTextResponse(PROTO_SCHEMA, media_type="text/plain")
 
 
