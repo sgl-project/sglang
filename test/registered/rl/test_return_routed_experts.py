@@ -58,6 +58,11 @@ class TestReturnRoutedExperts(CustomTestCase):
             "--enable-dp-attention",
             "--moe-a2a-backend",
             "deepep",
+            # Force normal-mode dispatch: deepep auto routes decode through
+            # low_latency mode whose buffer (num_max_dispatch_tokens_per_rank)
+            # is undersized for cuda graph capture at default --cuda-graph-max-bs.
+            "--deepep-mode",
+            "normal",
         ]
         cls.baseline_args = common + [
             "--disable-overlap-schedule",
