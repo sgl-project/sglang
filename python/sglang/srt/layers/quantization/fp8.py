@@ -257,6 +257,13 @@ class Fp8Config(QuantizationConfig):
 
             fp8_method = Fp8MoEMethod(self)
 
+            if self.is_fp4_experts and get_moe_runner_backend().is_marlin():
+                from sglang.srt.layers.quantization.mxfp4_marlin_moe import (
+                    Mxfp4MarlinMoEMethod,
+                )
+
+                return Mxfp4MarlinMoEMethod(fp8_method, prefix=prefix)
+
             if self.is_fp4_experts and get_moe_runner_backend().is_flashinfer_mxfp4():
                 from sglang.srt.layers.quantization.mxfp4_flashinfer_trtllm_moe import (
                     Mxfp4FlashinferTrtllmMoEMethod,
@@ -1162,6 +1169,11 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             will_use_deepgemm = self.is_deepgemm_moe_runner_backend_enabled()
 
             if self.is_fp4_expert:
+                if get_moe_runner_backend().is_marlin():
+                    layer.w13_weight.data = layer.w13_weight.data.view(torch.int8)
+                    layer.w2_weight.data = layer.w2_weight.data.view(torch.int8)
+                    return
+
                 layer.w13_weight.data = layer.w13_weight.data.view(torch.int8)
                 layer.w2_weight.data = layer.w2_weight.data.view(torch.int8)
 
