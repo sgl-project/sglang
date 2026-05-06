@@ -1,0 +1,471 @@
+name: Release SGLang ROCm Wheels (v3)
+
+on:
+  # Run daily at 3 AM UTC (after sgl-kernel nightly at 1 AM)
+  schedule:
+    - cron: '0 3 * * *'
+  # Triggered by nightly Docker workflow or Dockerfile changes
+  repository_dispatch:
+    types: [rocm-nightly-release]
+  push:
+    paths:
+      - 'docker/rocm.Dockerfile'  # Trigger when AITER version might change
+  # Manual trigger for testing and releases
+  workflow_dispatch:
+    inputs:
+      commit_sha:
+        description: 'Specific commit SHA to build (leave empty for latest)'
+        required: false
+        type: string
+      rocm_version:
+        description: 'ROCm version (e.g., 700 or 720, or "all" for both)'
+        required: false
+        default: 'all'
+        type: string
+      is_release:
+        description: 'Is this a release build? (affects version format)'
+        required: false
+        default: false
+        type: boolean
+      force_aiter_rebuild:
+        description: 'Force AITER rebuild even if version unchanged'
+        required: false
+        default: false
+        type: boolean
+
+concurrency:
+  group: release-sglang-rocm-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Stage 1: Check if AITER needs to be rebuilt
+  check-aiter-version:
+    if: |
+      github.repository == 'sgl-project/sglang' &&
+      (inputs.rocm_version == 'all' || inputs.rocm_version == matrix.rocm-version || inputs.rocm_version == '')
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        rocm-version: ["700", "720"]
+    outputs:
+      rebuild_needed_700: ${{ steps.check.outputs.rebuild_needed_700 }}
+      rebuild_needed_720: ${{ steps.check.outputs.rebuild_needed_720 }}
+      aiter_version_700: ${{ steps.check.outputs.aiter_version_700 }}
+      aiter_version_720: ${{ steps.check.outputs.aiter_version_720 }}
+      aiter_commit_700: ${{ steps.check.outputs.aiter_commit_700 }}
+      aiter_commit_720: ${{ steps.check.outputs.aiter_commit_720 }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.client_payload.commit_sha || inputs.commit_sha || github.sha }}
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AMD_AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AMD_AWS_SECRET_ACCESS_KEY }}
+          aws-region: us-east-2
+
+      - name: Check AITER version for ROCm ${{ matrix.rocm-version }}
+        id: check
+        env:
+          AMD_S3_BUCKET_NAME: ${{ secrets.AMD_S3_BUCKET_NAME }}
+        run: |
+          chmod +x scripts/check_aiter_version.sh
+          ROCM_VER="${{ matrix.rocm-version }}"
+          OUTPUT=$(bash scripts/check_aiter_version.sh "$ROCM_VER")
+          echo "$OUTPUT"
+
+          # Parse output
+          REBUILD_NEEDED=$(echo "$OUTPUT" | grep "^REBUILD_NEEDED=" | cut -d'=' -f2)
+          AITER_VERSION=$(echo "$OUTPUT" | grep "^AITER_VERSION=" | cut -d'=' -f2)
+          AITER_COMMIT=$(echo "$OUTPUT" | grep "^AITER_COMMIT=" | cut -d'=' -f2)
+
+          # Force rebuild if requested via workflow input
+          if [[ "${{ inputs.force_aiter_rebuild }}" == "true" ]]; then
+            echo "Force rebuild requested via workflow input"
+            REBUILD_NEEDED=true
+          fi
+
+          # Output with ROCm version suffix for cross-job access
+          echo "rebuild_needed_${ROCM_VER}=${REBUILD_NEEDED}" >> $GITHUB_OUTPUT
+          echo "aiter_version_${ROCM_VER}=${AITER_VERSION}" >> $GITHUB_OUTPUT
+          echo "aiter_commit_${ROCM_VER}=${AITER_COMMIT}" >> $GITHUB_OUTPUT
+
+          echo "AITER check results for ROCm ${ROCM_VER}:"
+          echo "  Version: ${AITER_VERSION}"
+          echo "  Commit: ${AITER_COMMIT}"
+          echo "  Rebuild needed: ${REBUILD_NEEDED}"
+
+  # Stage 2: Build AITER wheels (conditional)
+  build-aiter-rocm:
+    needs: check-aiter-version
+    if: |
+      (matrix.rocm-version == '700' && needs.check-aiter-version.outputs.rebuild_needed_700 == 'true') ||
+      (matrix.rocm-version == '720' && needs.check-aiter-version.outputs.rebuild_needed_720 == 'true')
+    runs-on: amd-docker-scale
+    strategy:
+      matrix:
+        rocm-version: ["700", "720"]
+    env:
+      AITER_REPO: "https://github.com/ROCm/aiter.git"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.client_payload.commit_sha || inputs.commit_sha || github.sha }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Build AITER ROCm ${{ matrix.rocm-version }} wheel
+        id: build
+        run: |
+          ROCM_VER="${{ matrix.rocm-version }}"
+          AITER_COMMIT="${{ needs.check-aiter-version.outputs.aiter_commit }}"
+
+          # Determine base image and GPU arch based on ROCm version
+          if [[ "${ROCM_VER}" == "700" ]]; then
+            IMAGE="rocm/sgl-dev:rocm7-vllm-20250904"
+            GPU_ARCH="gfx942;gfx950"
+          elif [[ "${ROCM_VER}" == "720" ]]; then
+            IMAGE="rocm/pytorch:rocm7.2_ubuntu22.04_py3.10_pytorch_release_2.9.1"
+            GPU_ARCH="gfx942;gfx950"
+          else
+            echo "Unsupported ROCm version: ${ROCM_VER}"
+            exit 1
+          fi
+
+          echo "Pulling Docker image: ${IMAGE}"
+          docker pull "${IMAGE}"
+
+          # Create output directory
+          mkdir -p dist_rocm${ROCM_VER}
+
+          # Build wheel in Docker container
+          docker run --rm \
+            -v $(pwd):/workspace \
+            -e AITER_REPO="${AITER_REPO}" \
+            -e AITER_COMMIT="${AITER_COMMIT}" \
+            -e GPU_ARCH="${GPU_ARCH}" \
+            -e ROCM_VERSION="${ROCM_VER}" \
+            ${IMAGE} \
+            bash -c "
+              set -ex
+              cd /workspace
+
+              # Clone and build AITER
+              git clone \${AITER_REPO} aiter_build
+              cd aiter_build
+              git checkout \${AITER_COMMIT}
+              git submodule update --init --recursive
+
+              # Install dependencies
+              pip install -r requirements.txt
+              pip install wheel setuptools
+
+              # Build wheel with setup.py (PREBUILD_KERNELS=0 for current AITER)
+              PREBUILD_KERNELS=0 GPU_ARCHS=\${GPU_ARCH} python3 setup.py bdist_wheel
+
+              # Copy wheel to workspace without renaming
+              # Note: AITER wheels are NOT versioned with +rocm suffix
+              # They are built per ROCm version but keep the same version string
+              cd dist
+              for wheel in *.whl; do
+                echo \"Built wheel: \$wheel\"
+                echo \"\$wheel\" > /workspace/wheel_name.txt
+              done
+
+              # Copy to workspace
+              cp *.whl /workspace/dist_rocm\${ROCM_VERSION}/
+            "
+
+          # Get the wheel name
+          WHEEL_NAME=$(cat wheel_name.txt)
+          echo "Built AITER wheel: ${WHEEL_NAME}"
+
+          # Cleanup
+          rm -rf aiter_build wheel_name.txt
+
+      - name: Upload AITER wheel artifact for ROCm ${{ matrix.rocm-version }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: aiter-wheel-rocm${{ matrix.rocm-version }}
+          path: dist_rocm${{ matrix.rocm-version }}/*.whl
+          retention-days: 7
+
+  # Stage 3: Build sglang wheels
+  build-sglang-rocm:
+    needs: [check-aiter-version, build-aiter-rocm]
+    if: |
+      always() &&
+      ((matrix.rocm-version == '700' && needs.check-aiter-version.outputs.aiter_version_700 != '') ||
+       (matrix.rocm-version == '720' && needs.check-aiter-version.outputs.aiter_version_720 != ''))
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        rocm-version: ["700", "720"]
+    outputs:
+      wheel_version: ${{ steps.build.outputs.wheel_version }}
+      commit_hash: ${{ steps.version.outputs.commit_hash }}
+      build_date: ${{ steps.version.outputs.build_date }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.client_payload.commit_sha || inputs.commit_sha || github.sha }}
+          fetch-depth: 0  # Need full history for setuptools-scm
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Install build dependencies
+        run: |
+          pip install build wheel setuptools setuptools-scm
+
+      - name: Determine version
+        id: version
+        run: |
+          TAG=$(python3 python/tools/get_version_tag.py)
+          COMMIT_HASH=$(git rev-parse --short HEAD)
+          BUILD_DATE=$(date -u +%Y%m%d)
+
+          echo "commit_hash=${COMMIT_HASH}" >> $GITHUB_OUTPUT
+          echo "build_date=${BUILD_DATE}" >> $GITHUB_OUTPUT
+          echo "base_tag=${TAG}" >> $GITHUB_OUTPUT
+
+      - name: Build ROCm ${{ matrix.rocm-version }} wheel
+        id: build
+        run: |
+          cd python
+          cp ../README.md ../LICENSE .
+
+          # Use pyproject_rocm.toml
+          cp pyproject_rocm.toml pyproject.toml
+
+          TAG="${{ steps.version.outputs.base_tag }}"
+          VERSION=${TAG#v}  # Remove 'v' prefix
+          COMMIT_HASH="${{ steps.version.outputs.commit_hash }}"
+          BUILD_DATE="${{ steps.version.outputs.build_date }}"
+          ROCM_VER="${{ matrix.rocm-version }}"
+
+          if [[ "${{ inputs.is_release }}" == "true" ]]; then
+            # Release build: use standard version (e.g., 0.5.9)
+            # NO +rocm suffix in v3
+            WHEEL_VERSION="${VERSION}"
+            echo "Building RELEASE wheel: ${WHEEL_VERSION}"
+          else
+            # Nightly build: increment patch and add dev suffix
+            MAJOR=$(echo "$VERSION" | cut -d. -f1)
+            MINOR=$(echo "$VERSION" | cut -d. -f2)
+            PATCH_RAW=$(echo "$VERSION" | cut -d. -f3)
+            PATCH=$(echo "$PATCH_RAW" | sed 's/[^0-9].*//')
+            NEXT_PATCH=$((PATCH + 1))
+            NEXT_VERSION="${MAJOR}.${MINOR}.${NEXT_PATCH}"
+
+            # Nightly format: X.Y.Z.devDATE+gHASH (NO +rocm in v3)
+            WHEEL_VERSION="${NEXT_VERSION}.dev${BUILD_DATE}+g${COMMIT_HASH}"
+            echo "Building NIGHTLY wheel: ${WHEEL_VERSION}"
+          fi
+
+          export SETUPTOOLS_SCM_PRETEND_VERSION="${WHEEL_VERSION}"
+
+          # Update sglang-kernel dependency URL to match ROCm version
+          KERNEL_VERSION="0.4.1"  # TODO: Make this dynamic or read from a config
+          sed -i "s|sglang-kernel @ https://github.com/sgl-project/whl/releases/download/v.*|sglang-kernel @ https://github.com/sgl-project/whl/releases/download/v${KERNEL_VERSION}/sglang_kernel-${KERNEL_VERSION}+rocm${ROCM_VER}-cp310-abi3-manylinux2014_x86_64.whl\",|g" pyproject.toml
+
+          # Build wheel
+          python3 -m build --wheel
+
+          # Extract actual version from built wheel
+          WHEEL_FILE=$(ls dist/*.whl)
+          ACTUAL_VERSION=$(echo "$WHEEL_FILE" | sed 's/.*sglang-\(.*\)-py3.*/\1/')
+
+          echo "Built wheel: $WHEEL_FILE"
+          echo "Wheel version: ${ACTUAL_VERSION}"
+          echo "wheel_version=${ACTUAL_VERSION}" >> $GITHUB_OUTPUT
+
+          # Move wheel to rocm-specific directory for upload
+          mkdir -p ../dist/rocm${ROCM_VER}
+          mv dist/*.whl ../dist/rocm${ROCM_VER}/
+
+      - name: Upload sglang wheel artifact for ROCm ${{ matrix.rocm-version }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: sglang-wheel-rocm${{ matrix.rocm-version }}
+          path: dist/rocm${{ matrix.rocm-version }}/*.whl
+          retention-days: 7
+
+  # Stage 4: Upload to S3 (both AITER and sglang)
+  upload-to-s3:
+    needs: [check-aiter-version, build-aiter-rocm, build-sglang-rocm]
+    if: |
+      always() &&
+      ((matrix.rocm-version == '700' && needs.check-aiter-version.outputs.aiter_version_700 != '') ||
+       (matrix.rocm-version == '720' && needs.check-aiter-version.outputs.aiter_version_720 != ''))
+    runs-on: ubuntu-latest
+    environment: 'prod'
+    strategy:
+      matrix:
+        rocm-version: ["700", "720"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download sglang wheel artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: sglang-wheel-rocm${{ matrix.rocm-version }}
+          path: dist/sglang/
+
+      - name: Download AITER wheel artifact (if built)
+        if: needs.check-aiter-version.outputs.rebuild_needed == 'true'
+        uses: actions/download-artifact@v4
+        with:
+          name: aiter-wheel-rocm${{ matrix.rocm-version }}
+          path: dist/aiter/
+        continue-on-error: true
+
+      - name: List downloaded wheels
+        run: |
+          echo "Downloaded wheels:"
+          ls -lh dist/
+
+      - name: Create PEP 503 index structure (v3 - separated simple/ and packages/)
+        run: |
+          ROCM_VER="${{ matrix.rocm-version }}"
+
+          # Create v3 directory structure: separate simple/ and packages/
+          mkdir -p s3_upload/rocm${ROCM_VER}/simple
+          mkdir -p s3_upload/rocm${ROCM_VER}/packages
+
+          # === sglang package ===
+          mkdir -p s3_upload/rocm${ROCM_VER}/simple/sglang
+          mkdir -p s3_upload/rocm${ROCM_VER}/packages/sglang
+
+          # Copy sglang wheels to packages/
+          cp dist/sglang/*.whl s3_upload/rocm${ROCM_VER}/packages/sglang/
+
+          # Create sglang package index (simple/sglang/index.html)
+          cd s3_upload/rocm${ROCM_VER}/simple/sglang
+          cat > index.html << 'EOF'
+          <!DOCTYPE html>
+          <html>
+          <head><title>Links for sglang</title></head>
+          <body>
+          <h1>Links for sglang</h1>
+          EOF
+
+          # Add links with relative paths to packages/
+          for wheel in ../../packages/sglang/*.whl; do
+            filename=$(basename "$wheel")
+            sha256=$(sha256sum "$wheel" | cut -d' ' -f1)
+            echo "<a href=\"../../packages/sglang/${filename}#sha256=${sha256}\">${filename}</a><br>" >> index.html
+          done
+
+          echo "</body></html>" >> index.html
+
+          cd ../../../..  # Back to workspace root
+
+          # === AITER package (if built) ===
+          if [[ -d dist/aiter ]] && [[ -n "$(ls -A dist/aiter 2>/dev/null)" ]]; then
+            echo "AITER wheels found, adding to index"
+
+            mkdir -p s3_upload/rocm${ROCM_VER}/simple/amd-aiter
+            mkdir -p s3_upload/rocm${ROCM_VER}/packages/amd-aiter
+
+            # Copy AITER wheels to packages/
+            cp dist/aiter/*.whl s3_upload/rocm${ROCM_VER}/packages/amd-aiter/
+
+            # Create AITER package index
+            cd s3_upload/rocm${ROCM_VER}/simple/amd-aiter
+            cat > index.html << 'EOF'
+          <!DOCTYPE html>
+          <html>
+          <head><title>Links for amd-aiter</title></head>
+          <body>
+          <h1>Links for amd-aiter</h1>
+          EOF
+
+            for wheel in ../../packages/amd-aiter/*.whl; do
+              filename=$(basename "$wheel")
+              sha256=$(sha256sum "$wheel" | cut -d' ' -f1)
+              echo "<a href=\"../../packages/amd-aiter/${filename}#sha256=${sha256}\">${filename}</a><br>" >> index.html
+            done
+
+            echo "</body></html>" >> index.html
+
+            cd ../../../..  # Back to workspace root
+
+            # Create root index with both packages
+            cd s3_upload/rocm${ROCM_VER}/simple
+            cat > index.html << 'EOF'
+          <!DOCTYPE html>
+          <html>
+          <head><title>Simple index</title></head>
+          <body>
+          <h1>Simple index</h1>
+          <a href="amd-aiter/">amd-aiter</a><br>
+          <a href="sglang/">sglang</a><br>
+          </body>
+          </html>
+          EOF
+          else
+            echo "No AITER wheels found, creating sglang-only root index"
+
+            # Create root index with only sglang
+            cd s3_upload/rocm${ROCM_VER}/simple
+            cat > index.html << 'EOF'
+          <!DOCTYPE html>
+          <html>
+          <head><title>Simple index</title></head>
+          <body>
+          <h1>Simple index</h1>
+          <a href="sglang/">sglang</a><br>
+          </body>
+          </html>
+          EOF
+          fi
+
+          cd ../../..  # Back to workspace root
+
+          echo "Created v3 index structure for ROCm ${ROCM_VER}:"
+          ls -lR s3_upload/rocm${ROCM_VER}/
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AMD_AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AMD_AWS_SECRET_ACCESS_KEY }}
+          aws-region: us-east-2
+
+      - name: Upload to S3
+        run: |
+          ROCM_VER="${{ matrix.rocm-version }}"
+          S3_BUCKET="${{ secrets.AMD_S3_BUCKET_NAME }}"
+
+          # Upload simple/ (HTML indices)
+          aws s3 sync s3_upload/rocm${ROCM_VER}/simple/ \
+            s3://${S3_BUCKET}/sglang/rocm${ROCM_VER}/simple/ \
+            --acl public-read \
+            --cache-control "max-age=3600"
+
+          # Upload packages/ (wheel files)
+          aws s3 sync s3_upload/rocm${ROCM_VER}/packages/ \
+            s3://${S3_BUCKET}/sglang/rocm${ROCM_VER}/packages/ \
+            --acl public-read \
+            --cache-control "max-age=3600"
+
+          echo ""
+          echo "✅ Uploaded to S3:"
+          echo "  - s3://${S3_BUCKET}/sglang/rocm${ROCM_VER}/simple/"
+          echo "  - s3://${S3_BUCKET}/sglang/rocm${ROCM_VER}/packages/"
+          echo ""
+          echo "Users can install with:"
+          if [[ "${{ inputs.is_release }}" == "true" ]]; then
+            echo "  pip install 'sglang[srt_hip,rocm${ROCM_VER}]' \\"
+          else
+            echo "  pip install 'sglang[srt_hip,rocm${ROCM_VER}]' --pre \\"
+          fi
+          echo "    --extra-index-url https://${S3_BUCKET}.s3.amazonaws.com/sglang/rocm${ROCM_VER}/simple/"
