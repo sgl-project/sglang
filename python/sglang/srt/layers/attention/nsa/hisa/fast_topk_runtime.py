@@ -22,6 +22,7 @@ Usage::
     indices = fast_topk_runtime(score_2d_f32, topk)
     # Returns [B, topk] int32 (unsorted, no -1 sentinels).
 """
+
 from __future__ import annotations
 
 import os
@@ -29,7 +30,6 @@ from pathlib import Path
 
 import torch
 from torch.utils.cpp_extension import load
-
 
 _HERE = Path(__file__).resolve().parent
 _CSRC = _HERE / "csrc"

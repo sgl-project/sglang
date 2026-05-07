@@ -9,6 +9,7 @@ all-triton no-cache path).
 Once the env-var fallback is dropped, this file can be deleted alongside
 ``tilelang_legacy.py``.
 """
+
 from __future__ import annotations
 
 import torch
@@ -22,11 +23,11 @@ from sglang.srt.layers.attention.nsa.hisa.triton_kernels import (
 
 
 def fp8_native_hierarchy_paged_mqa_logits_no_pool_cache(
-    q_fp8: torch.Tensor,                # [B, 1, H, D] fp8
-    kv_cache_fp8: torch.Tensor,         # [num_blocks, paged_block_size, 1, D+4] uint8
-    weights: torch.Tensor,              # [B*1, H] f32
-    context_lens: torch.Tensor,         # [B] i32 — raw seq_len per request
-    block_tables: torch.Tensor,         # [B, max_kv_blocks] i32
+    q_fp8: torch.Tensor,  # [B, 1, H, D] fp8
+    kv_cache_fp8: torch.Tensor,  # [num_blocks, paged_block_size, 1, D+4] uint8
+    weights: torch.Tensor,  # [B*1, H] f32
+    context_lens: torch.Tensor,  # [B] i32 — raw seq_len per request
+    block_tables: torch.Tensor,  # [B, max_kv_blocks] i32
     k_block_size: int,
     block_topk: int,
     max_seq_len: int,

@@ -1372,7 +1372,8 @@ class DeepseekV2AttentionMLA(
             use_hisa = getattr(config, "use_hisa", False)
             if use_hisa:
                 missing = [
-                    name for name in ("hisa_k_block_size", "hisa_block_topk")
+                    name
+                    for name in ("hisa_k_block_size", "hisa_block_topk")
                     if not hasattr(config, name)
                 ]
                 if missing:

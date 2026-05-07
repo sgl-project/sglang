@@ -11,9 +11,11 @@ All other tilelang code (legacy orchestrators, ablation variants, torch-ref
 impls) lives in ``tilelang_legacy.py`` and is slated for removal once the
 SGLANG_HISA_DISABLE_TRITON fallback is dropped.
 """
-import torch
+
 import tilelang
+import torch
 from tilelang import language as T
+
 
 @tilelang.jit(
     pass_configs={
@@ -24,7 +26,7 @@ def fp8_native_block_mean_pooling(
     max_num_pooling_blocks: int,
     pooling_block_size: int,
     dim: int,
-    block_N: int=64,
+    block_N: int = 64,
     num_stages=1,
     threads=256,
 ):
@@ -52,10 +54,10 @@ def fp8_native_block_mean_pooling(
 
     @T.prim_func
     def fp8_native_block_mean_pooling_kernel(
-        K: T.Tensor(k_size, dtype=dtype), # type: ignore
-        KScale: T.Tensor(scale_size, dtype=accum_dtype), # type: ignore
-        BlockedK: T.Tensor(blocked_k_size, dtype=dtype), # type: ignore
-        BlockedKScale: T.Tensor(blocked_k_scale_size, dtype=accum_dtype), # type: ignore
+        K: T.Tensor(k_size, dtype=dtype),  # type: ignore
+        KScale: T.Tensor(scale_size, dtype=accum_dtype),  # type: ignore
+        BlockedK: T.Tensor(blocked_k_size, dtype=dtype),  # type: ignore
+        BlockedKScale: T.Tensor(blocked_k_scale_size, dtype=accum_dtype),  # type: ignore
     ):
         with T.Kernel(T.ceildiv(seq_len_k, pooling_block_size), threads=threads) as bx:
             index_k = T.alloc_fragment([block_N, dim], dtype)
@@ -78,7 +80,7 @@ def fp8_native_block_mean_pooling(
 
                 if cur_tl_block_size == block_N:
                     # Fast path: full tile, bulk TMA load.
-                    T.copy(K[tl_block_s:tl_block_s + block_N, :], index_k)
+                    T.copy(K[tl_block_s : tl_block_s + block_N, :], index_k)
                     for bn_i in T.Parallel(block_N):
                         scale[bn_i] = KScale[tl_block_s + bn_i]
                 else:
@@ -95,13 +97,18 @@ def fp8_native_block_mean_pooling(
 
                 T.reduce_sum(index_k, acc, dim=0, clear=False)
 
-            inv_count = T.cast(1.0, accum_dtype) / T.cast(cur_pooling_block_size, accum_dtype)
+            inv_count = T.cast(1.0, accum_dtype) / T.cast(
+                cur_pooling_block_size, accum_dtype
+            )
             for d_i in T.Parallel(dim):
                 acc[d_i] = acc[d_i] * inv_count
 
             # Re-quantize the f32 mean to fp8 with a per-block scale.
             T.reduce_absmax(acc, max_abs, dim=0, clear=True)
-            block_scale = T.max(max_abs[0] * T.cast(FP8_MAX_INV, accum_dtype), T.cast(1e-10, accum_dtype))
+            block_scale = T.max(
+                max_abs[0] * T.cast(FP8_MAX_INV, accum_dtype),
+                T.cast(1e-10, accum_dtype),
+            )
             inv_block_scale = T.cast(1.0, accum_dtype) / block_scale
 
             for d_i in T.Parallel(dim):
@@ -115,8 +122,12 @@ def fp8_native_block_mean_pooling_interface(k, k_scale, k_block_size):
     seq_len_k, d = k.shape
     max_num_pooling_blocks = (seq_len_k + k_block_size - 1) // k_block_size
 
-    blocked_k = torch.empty((max_num_pooling_blocks, d), device=k.device, dtype=torch.float8_e4m3fn)
-    blocked_k_scale = torch.empty((max_num_pooling_blocks,), device=k.device, dtype=torch.float32)
+    blocked_k = torch.empty(
+        (max_num_pooling_blocks, d), device=k.device, dtype=torch.float8_e4m3fn
+    )
+    blocked_k_scale = torch.empty(
+        (max_num_pooling_blocks,), device=k.device, dtype=torch.float32
+    )
     kernel = fp8_native_block_mean_pooling(
         max_num_pooling_blocks=max_num_pooling_blocks,
         pooling_block_size=k_block_size,
@@ -138,7 +149,7 @@ def fp8_native_block_mean_pooling_interface(k, k_scale, k_block_size):
 )
 def fp8_native_block_mean_pooling_grouped(
     max_num_pooling_blocks: int,
-    pooling_block_size: int,   # K, must divide block_N
+    pooling_block_size: int,  # K, must divide block_N
     dim: int,
     block_N: int = 64,
     threads: int = 256,
@@ -173,10 +184,10 @@ def fp8_native_block_mean_pooling_grouped(
 
     @T.prim_func
     def fp8_native_block_mean_pooling_grouped_kernel(
-        K: T.Tensor([seq_len_k, dim], dtype=dtype),                            # type: ignore
-        KScale: T.Tensor([seq_len_k], dtype=accum_dtype),                       # type: ignore
-        BlockedK: T.Tensor([max_num_pooling_blocks, dim], dtype=dtype),         # type: ignore
-        BlockedKScale: T.Tensor([max_num_pooling_blocks], dtype=accum_dtype),   # type: ignore
+        K: T.Tensor([seq_len_k, dim], dtype=dtype),  # type: ignore
+        KScale: T.Tensor([seq_len_k], dtype=accum_dtype),  # type: ignore
+        BlockedK: T.Tensor([max_num_pooling_blocks, dim], dtype=dtype),  # type: ignore
+        BlockedKScale: T.Tensor([max_num_pooling_blocks], dtype=accum_dtype),  # type: ignore
     ):
         # Grid: one CTA per block_N tokens (= G pool blocks).
         with T.Kernel(T.ceildiv(seq_len_k, block_N), threads=threads) as bx:
@@ -200,8 +211,7 @@ def fp8_native_block_mean_pooling_grouped(
             for bn_i, d_i in T.Parallel(block_N, dim):
                 if bn_i < cur_block_size:
                     index_k[bn_i, d_i] = (
-                        T.cast(K[tl_block_s + bn_i, d_i], accum_dtype)
-                        * scale[bn_i]
+                        T.cast(K[tl_block_s + bn_i, d_i], accum_dtype) * scale[bn_i]
                     )
 
             # Per-pool sum: build a [G, K, dim] view of index_k and reduce
@@ -245,7 +255,8 @@ def fp8_native_block_mean_pooling_grouped(
                         T.cast(1e-10, accum_dtype),
                     )
                     BlockedK[out_idx, d_i] = T.cast(
-                        acc_per_pool[g_i, d_i] / bs, dtype,
+                        acc_per_pool[g_i, d_i] / bs,
+                        dtype,
                     )
             for g_i in T.Parallel(G):
                 out_idx = bx * G + g_i
@@ -259,14 +270,20 @@ def fp8_native_block_mean_pooling_grouped(
     return fp8_native_block_mean_pooling_grouped_kernel
 
 
-def fp8_native_block_mean_pooling_grouped_interface(k, k_scale, k_block_size, block_N=64):
+def fp8_native_block_mean_pooling_grouped_interface(
+    k, k_scale, k_block_size, block_N=64
+):
     """Tilelang grouped mean-pool for K < block_N. Same I/O contract as
     ``fp8_native_block_mean_pooling_interface``."""
     seq_len_k, d = k.shape
     max_num_pooling_blocks = (seq_len_k + k_block_size - 1) // k_block_size
 
-    blocked_k = torch.empty((max_num_pooling_blocks, d), device=k.device, dtype=torch.float8_e4m3fn)
-    blocked_k_scale = torch.empty((max_num_pooling_blocks,), device=k.device, dtype=torch.float32)
+    blocked_k = torch.empty(
+        (max_num_pooling_blocks, d), device=k.device, dtype=torch.float8_e4m3fn
+    )
+    blocked_k_scale = torch.empty(
+        (max_num_pooling_blocks,), device=k.device, dtype=torch.float32
+    )
     kernel = fp8_native_block_mean_pooling_grouped(
         max_num_pooling_blocks=max_num_pooling_blocks,
         pooling_block_size=k_block_size,
@@ -332,15 +349,15 @@ def fp8_native_paged_mean_pooling_completed_blocks(
 
     @T.prim_func
     def kernel(
-        KvCacheFP8View: T.Tensor(kv_cache_fp8_shape, fp8_dtype),              # type: ignore
-        KvCacheFP32View: T.Tensor(kv_cache_fp32_shape, accum_dtype),          # type: ignore
-        ReqToToken: T.Tensor(req_to_token_shape, index_dtype),                # type: ignore
-        PoolPageTables: T.Tensor(pool_page_tables_shape, index_dtype),        # type: ignore
-        ReqPoolIndices: T.Tensor(seq_len_shape, req_pool_idx_dtype),          # type: ignore
-        PrevSeqLens: T.Tensor(seq_len_shape, index_dtype),                    # type: ignore
-        NewSeqLens: T.Tensor(seq_len_shape, index_dtype),                     # type: ignore
-        PoolKPagesFP8View: T.Tensor(pool_k_pages_fp8_shape, fp8_dtype),       # type: ignore
-        PoolKPagesFP32View: T.Tensor(pool_k_pages_fp32_shape, accum_dtype),   # type: ignore
+        KvCacheFP8View: T.Tensor(kv_cache_fp8_shape, fp8_dtype),  # type: ignore
+        KvCacheFP32View: T.Tensor(kv_cache_fp32_shape, accum_dtype),  # type: ignore
+        ReqToToken: T.Tensor(req_to_token_shape, index_dtype),  # type: ignore
+        PoolPageTables: T.Tensor(pool_page_tables_shape, index_dtype),  # type: ignore
+        ReqPoolIndices: T.Tensor(seq_len_shape, req_pool_idx_dtype),  # type: ignore
+        PrevSeqLens: T.Tensor(seq_len_shape, index_dtype),  # type: ignore
+        NewSeqLens: T.Tensor(seq_len_shape, index_dtype),  # type: ignore
+        PoolKPagesFP8View: T.Tensor(pool_k_pages_fp8_shape, fp8_dtype),  # type: ignore
+        PoolKPagesFP32View: T.Tensor(pool_k_pages_fp32_shape, accum_dtype),  # type: ignore
     ):
         with T.Kernel(batch, max_pool_per_req_grid, threads=threads) as (bx, by):
             b = bx
@@ -378,9 +395,10 @@ def fp8_native_paged_mean_pooling_completed_blocks(
                     T.copy(KvCacheFP32View[phys_page, scale_offset:], scale_shared)
 
                     for n_i, d_i in T.Parallel(block_N, dim):
-                        index_k_reshaped[n_i, d_i] = T.cast(
-                            index_k_reshaped[n_i, d_i], accum_dtype
-                        ) * scale_shared[n_i]
+                        index_k_reshaped[n_i, d_i] = (
+                            T.cast(index_k_reshaped[n_i, d_i], accum_dtype)
+                            * scale_shared[n_i]
+                        )
 
                     T.reduce_sum(index_k_reshaped, acc, dim=0, clear=False)
 
@@ -407,13 +425,13 @@ def fp8_native_paged_mean_pooling_completed_blocks(
 
 
 def fp8_native_paged_mean_pooling_completed_blocks_interface(
-    kv_cache_flat: torch.Tensor,           # [num_pages, page_size * (D + 4)] uint8
-    req_to_token: torch.Tensor,            # [R, T] int32
-    pool_page_tables: torch.Tensor,        # [R, max_pool_pages] int32
-    req_pool_indices: torch.Tensor,        # [B] int64
-    prev_seq_lens: torch.Tensor,           # [B] int32
-    new_seq_lens: torch.Tensor,            # [B] int32
-    pool_k_pages: torch.Tensor,            # [N_pool_pages, pool_page_size * (D+4)] uint8 IN-OUT
+    kv_cache_flat: torch.Tensor,  # [num_pages, page_size * (D + 4)] uint8
+    req_to_token: torch.Tensor,  # [R, T] int32
+    pool_page_tables: torch.Tensor,  # [R, max_pool_pages] int32
+    req_pool_indices: torch.Tensor,  # [B] int64
+    prev_seq_lens: torch.Tensor,  # [B] int32
+    new_seq_lens: torch.Tensor,  # [B] int32
+    pool_k_pages: torch.Tensor,  # [N_pool_pages, pool_page_size * (D+4)] uint8 IN-OUT
     k_block_size: int,
     paged_block_size: int,
     pool_page_size: int,

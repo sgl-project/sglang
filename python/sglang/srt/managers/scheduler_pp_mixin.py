@@ -662,6 +662,7 @@ class SchedulerPPMixin:
                     from sglang.srt.layers.attention.nsa.hisa.pool_k_cache import (
                         maybe_free_hisa_pool_blocks,
                     )
+
                     maybe_free_hisa_pool_blocks(
                         self.token_to_kv_pool_allocator.get_kvcache(),
                         req.req_pool_idx,

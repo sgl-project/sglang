@@ -19,6 +19,7 @@ Two output contracts, selected by the indexer's dispatch based on
 The .cu is JIT-compiled on first import via ``torch.utils.cpp_extension.load``
 and cached under ``$TORCH_EXTENSIONS_DIR``.
 """
+
 from __future__ import annotations
 
 import os
@@ -29,7 +30,6 @@ import torch
 from torch.utils.cpp_extension import load
 
 from sglang.srt.environ import envs
-
 
 _HERE = Path(__file__).resolve().parent
 _CSRC = _HERE / "csrc"
@@ -58,11 +58,12 @@ TOPK = 2048
 # topk + coord-transform (output = HISA's token-position contract)
 # ---------------------------------------------------------------------------
 
+
 def hisa_topk_coord_transform_fused(
-    score: torch.Tensor,                # [B, sparse_len] f32
-    topk_block_idx: torch.Tensor,       # [B, block_topk] i32
+    score: torch.Tensor,  # [B, sparse_len] f32
+    topk_block_idx: torch.Tensor,  # [B, block_topk] i32
     k_block_size: int,
-    ke: torch.Tensor,                 # [B] i32 — ke for RAGGED, seq_lens for PAGED
+    ke: torch.Tensor,  # [B] i32 — ke for RAGGED, seq_lens for PAGED
     ks: Optional[torch.Tensor] = None,  # [B] i32 — None → PAGED, else RAGGED
     out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
@@ -90,21 +91,35 @@ def hisa_topk_coord_transform_fused(
         ke = ke.to(torch.int32)
     B, sparse_len = score.shape
     full_lens = torch.full(
-        (B,), sparse_len, dtype=torch.int32, device=score.device,
+        (B,),
+        sparse_len,
+        dtype=torch.int32,
+        device=score.device,
     )
     if out is None:
         out = torch.empty((B, TOPK), dtype=torch.int32, device=score.device)
     if ks is None:
         # PAGED: lens = seq_lens.
         torch.ops.hisa_topk_fused.topk_coord_transform_fused_paged(
-            score, full_lens, topk_block_idx, ke, out, k_block_size,
+            score,
+            full_lens,
+            topk_block_idx,
+            ke,
+            out,
+            k_block_size,
         )
     else:
         # RAGGED: lens = ke.
         if ks.dtype != torch.int32:
             ks = ks.to(torch.int32)
         torch.ops.hisa_topk_fused.topk_coord_transform_fused_ragged(
-            score, full_lens, topk_block_idx, ks, ke, out, k_block_size,
+            score,
+            full_lens,
+            topk_block_idx,
+            ks,
+            ke,
+            out,
+            k_block_size,
         )
     return out
 
@@ -116,12 +131,13 @@ def hisa_topk_coord_transform_fused(
 # topk_indices`) works unchanged.
 # ---------------------------------------------------------------------------
 
+
 def hisa_topk_transform_paged(
-    score: torch.Tensor,             # [M, sparse_len] f32 (M = total query tokens)
-    topk_block_idx: torch.Tensor,    # [M, block_topk] i32 (per-token)
-    seq_lens: torch.Tensor,          # [M] i32 — per-token K end (seq_lens)
-    page_table_1: torch.Tensor,      # [B, max_seqlen_k] i32 (per-batch!)
-    cu_seqlens_q: torch.Tensor,      # [B+1] i32 (cumulative; arange(B+1) for decode)
+    score: torch.Tensor,  # [M, sparse_len] f32 (M = total query tokens)
+    topk_block_idx: torch.Tensor,  # [M, block_topk] i32 (per-token)
+    seq_lens: torch.Tensor,  # [M] i32 — per-token K end (seq_lens)
+    page_table_1: torch.Tensor,  # [B, max_seqlen_k] i32 (per-batch!)
+    cu_seqlens_q: torch.Tensor,  # [B+1] i32 (cumulative; arange(B+1) for decode)
     k_block_size: int,
     out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
@@ -146,22 +162,31 @@ def hisa_topk_transform_paged(
         cu_seqlens_q = cu_seqlens_q.to(torch.int32)
     M, sparse_len = score.shape
     full_lens = torch.full(
-        (M,), sparse_len, dtype=torch.int32, device=score.device,
+        (M,),
+        sparse_len,
+        dtype=torch.int32,
+        device=score.device,
     )
     if out is None:
         out = torch.empty((M, TOPK), dtype=torch.int32, device=score.device)
     torch.ops.hisa_topk_fused.topk_transform_paged(
-        score, full_lens, topk_block_idx, seq_lens, page_table_1, cu_seqlens_q,
-        out, k_block_size,
+        score,
+        full_lens,
+        topk_block_idx,
+        seq_lens,
+        page_table_1,
+        cu_seqlens_q,
+        out,
+        k_block_size,
     )
     return out
 
 
 def hisa_topk_transform_ragged(
-    score: torch.Tensor,                # [B, sparse_len] f32
-    topk_block_idx: torch.Tensor,       # [B, block_topk] i32
-    ks: torch.Tensor,                   # [B] i32 — per-row kv start
-    ke: torch.Tensor,                   # [B] i32 — per-row kv end
+    score: torch.Tensor,  # [B, sparse_len] f32
+    topk_block_idx: torch.Tensor,  # [B, block_topk] i32
+    ks: torch.Tensor,  # [B] i32 — per-row kv start
+    ke: torch.Tensor,  # [B] i32 — per-row kv end
     topk_indices_offset: torch.Tensor,  # [B] i32 — per-row global flat offset
     k_block_size: int,
     out: Optional[torch.Tensor] = None,
@@ -188,13 +213,22 @@ def hisa_topk_transform_ragged(
         topk_indices_offset = topk_indices_offset.to(torch.int32)
     B, sparse_len = score.shape
     full_lens = torch.full(
-        (B,), sparse_len, dtype=torch.int32, device=score.device,
+        (B,),
+        sparse_len,
+        dtype=torch.int32,
+        device=score.device,
     )
     if out is None:
         out = torch.empty((B, TOPK), dtype=torch.int32, device=score.device)
     torch.ops.hisa_topk_fused.topk_transform_ragged(
-        score, full_lens, topk_block_idx, ks, ke, topk_indices_offset,
-        out, k_block_size,
+        score,
+        full_lens,
+        topk_block_idx,
+        ks,
+        ke,
+        topk_indices_offset,
+        out,
+        k_block_size,
     )
     return out
 
@@ -203,14 +237,15 @@ def hisa_topk_transform_ragged(
 # Unified dispatch — mirror upstream NSAIndexerMetadata.topk_transform style.
 # ---------------------------------------------------------------------------
 
+
 def hisa_topk_transform_dispatch(
-    metadata,                                   # NSAIndexerMetadata-like
-    block_sparse_logits: torch.Tensor,          # [M, sparse_len] f32
-    topk_block_indices: torch.Tensor,           # [M, block_topk] i32
+    metadata,  # NSAIndexerMetadata-like
+    block_sparse_logits: torch.Tensor,  # [M, sparse_len] f32
+    topk_block_indices: torch.Tensor,  # [M, block_topk] i32
     k_block_size: int,
     *,
-    ke: torch.Tensor,                           # mirrors upstream's `ke_offset`
-    ks: Optional[torch.Tensor] = None,          # mirrors upstream's `row_starts`
+    ke: torch.Tensor,  # mirrors upstream's `ke_offset`
+    ks: Optional[torch.Tensor] = None,  # mirrors upstream's `row_starts`
 ) -> torch.Tensor:
     """HISA's topk-transform dispatch, parallel to upstream's
     ``NSAIndexerMetadata.topk_transform`` (nsa_backend.py:212-276).
@@ -242,7 +277,11 @@ def hisa_topk_transform_dispatch(
     if not fuse_topk or force_unfused:
         # FUSE_TOPK=0: route by caller intent (ks=None → PAGED, else RAGGED).
         return hisa_topk_coord_transform_fused(
-            block_sparse_logits, topk_block_indices, k_block_size, ks=ks, ke=ke,
+            block_sparse_logits,
+            topk_block_indices,
+            k_block_size,
+            ks=ks,
+            ke=ke,
         )
     elif method == TopkTransformMethod.PAGED:
         # cu_seqlens_q from attn_metadata is already the cumulative form

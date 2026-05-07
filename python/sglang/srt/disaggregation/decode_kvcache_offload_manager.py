@@ -259,7 +259,10 @@ class DecodeKVCacheOffloadManager:
         from sglang.srt.layers.attention.nsa.hisa.pool_k_cache import (
             HisaNSATokenToKVPool,
         )
-        if isinstance(self.token_to_kv_pool_allocator.get_kvcache(), HisaNSATokenToKVPool):
+
+        if isinstance(
+            self.token_to_kv_pool_allocator.get_kvcache(), HisaNSATokenToKVPool
+        ):
             raise NotImplementedError(
                 "DecodeKVCacheOffloadManager + HisaNSATokenToKVPool not supported: "
                 "release path bypasses the pool-page free hook."

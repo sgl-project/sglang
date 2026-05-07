@@ -13,12 +13,14 @@ This file is slated for deletion once that env-var fallback is dropped. The
 three production-active interfaces it re-exports are physically defined in
 ``tilelang_kernels.py``.
 """
-import torch
+
 import tilelang
+import torch
 from tilelang import language as T
 
+
 @tilelang.jit(
-        pass_configs={
+    pass_configs={
         tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True,
     },
 )
@@ -70,14 +72,22 @@ def pool_mqa_attn_return_logits(
             cu_k_e_max = -2147483648
 
             for bq_i in T.serial(block_Q):
-                cu_k_s_min = T.min(cu_k_s_min, T.min(CuSeqLenBlockedKS[seq_len_i + bq_i], seq_len_blocked_kv))
+                cu_k_s_min = T.min(
+                    cu_k_s_min,
+                    T.min(CuSeqLenBlockedKS[seq_len_i + bq_i], seq_len_blocked_kv),
+                )
             for bq_i in T.serial(block_Q):
-                cu_k_e_max = T.max(cu_k_e_max, T.min(CuSeqLenBlockedKE[seq_len_i + bq_i], seq_len_blocked_kv))
+                cu_k_e_max = T.max(
+                    cu_k_e_max,
+                    T.min(CuSeqLenBlockedKE[seq_len_i + bq_i], seq_len_blocked_kv),
+                )
 
             T.copy(IndexQ[seq_len_i * heads, 0], index_q_shared)
             T.copy(Weights[seq_len_i, 0], weights)
 
-            for nbn_i in T.Pipelined(T.ceildiv(cu_k_e_max - cu_k_s_min, block_N), num_stages=num_stages):
+            for nbn_i in T.Pipelined(
+                T.ceildiv(cu_k_e_max - cu_k_s_min, block_N), num_stages=num_stages
+            ):
                 T.copy(IndexBlockedK[cu_k_s_min + nbn_i * block_N, 0], index_k_shared)
 
                 T.gemm(
@@ -90,12 +100,16 @@ def pool_mqa_attn_return_logits(
                 )
 
                 for bn_i, bq_i, h_i in T.Parallel(block_N, block_Q, heads):
-                    s_reshaped[bn_i, bq_i, h_i] = (T.max(s_reshaped[bn_i, bq_i, h_i], 0) * weights[bq_i, h_i]) 
+                    s_reshaped[bn_i, bq_i, h_i] = (
+                        T.max(s_reshaped[bn_i, bq_i, h_i], 0) * weights[bq_i, h_i]
+                    )
 
                 T.reduce_sum(s_reshaped, logits, dim=-1, clear=True)
 
                 for bq_i, bn_i in T.Parallel(block_Q, block_N):
-                    Logits[seq_len_i + bq_i, cu_k_s_min + nbn_i * block_N + bn_i] = logits[bn_i, bq_i]
+                    Logits[seq_len_i + bq_i, cu_k_s_min + nbn_i * block_N + bn_i] = (
+                        logits[bn_i, bq_i]
+                    )
 
     return pool_mqa_attn_return_logits_kernel
 
@@ -130,6 +144,7 @@ def clean_logits_(
 
     return clean_logits_kernel
 
+
 @tilelang.jit
 def force_maintain_logits_(
     threads: int = 512,
@@ -159,6 +174,7 @@ def force_maintain_logits_(
                         Logits[bx, idx] = T.infinity(dtype)
 
     return force_maintain_logits_kernel
+
 
 @tilelang.jit
 def clean_and_maintain_logits_(
@@ -192,12 +208,27 @@ def clean_and_maintain_logits_(
 
     return clean_and_maintain_logits_kernel
 
-def pool_mqa_attn_return_logits_interface(q, blocked_kv, kv_block_size, weights, cu_seqlen_blocked_ks, cu_seqlen_blocked_ke, clean_logits=True, force_maintain=True, dtype="bfloat16"):
+
+def pool_mqa_attn_return_logits_interface(
+    q,
+    blocked_kv,
+    kv_block_size,
+    weights,
+    cu_seqlen_blocked_ks,
+    cu_seqlen_blocked_ke,
+    clean_logits=True,
+    force_maintain=True,
+    dtype="bfloat16",
+):
     seq_len, heads, index_dim = q.shape
     seq_len_blocked_kv = blocked_kv.shape[0]
 
-    pool_mqa_attn_return_logits_kernel = pool_mqa_attn_return_logits(heads=heads, index_dim=index_dim, dtype=dtype)
-    logits = torch.empty([seq_len, seq_len_blocked_kv], device=q.device, dtype=torch.float32)
+    pool_mqa_attn_return_logits_kernel = pool_mqa_attn_return_logits(
+        heads=heads, index_dim=index_dim, dtype=dtype
+    )
+    logits = torch.empty(
+        [seq_len, seq_len_blocked_kv], device=q.device, dtype=torch.float32
+    )
     pool_mqa_attn_return_logits_kernel(
         q.view(seq_len * heads, index_dim),
         blocked_kv,
@@ -208,15 +239,20 @@ def pool_mqa_attn_return_logits_interface(q, blocked_kv, kv_block_size, weights,
     )
     if clean_logits and force_maintain:
         clean_and_maintain_logits_kernel = clean_and_maintain_logits_()
-        clean_and_maintain_logits_kernel(logits, cu_seqlen_blocked_ks, cu_seqlen_blocked_ke)
+        clean_and_maintain_logits_kernel(
+            logits, cu_seqlen_blocked_ks, cu_seqlen_blocked_ke
+        )
     else:
         clean_logits_kernel = clean_logits_()
         force_maintain_logits_kernel = force_maintain_logits_()
         if clean_logits:
             clean_logits_kernel(logits, cu_seqlen_blocked_ks, cu_seqlen_blocked_ke)
         if force_maintain:
-            force_maintain_logits_kernel(logits, cu_seqlen_blocked_ks, cu_seqlen_blocked_ke)
+            force_maintain_logits_kernel(
+                logits, cu_seqlen_blocked_ks, cu_seqlen_blocked_ke
+            )
     return logits
+
 
 @tilelang.jit(
     pass_configs={
@@ -293,9 +329,13 @@ def block_sparse_mqa_attn_return_logits(
                         policy=T.GemmWarpPolicy.FullCol,
                     )
 
-                    for bn_i, bq_i, h_i in T.Parallel(block_N, H_per_block // heads, heads):
-                        s_reshaped[bn_i, bq_i, h_i] = (T.max(s_reshaped[bn_i, bq_i, h_i], 0) * weights[bq_i, h_i])
-                    
+                    for bn_i, bq_i, h_i in T.Parallel(
+                        block_N, H_per_block // heads, heads
+                    ):
+                        s_reshaped[bn_i, bq_i, h_i] = (
+                            T.max(s_reshaped[bn_i, bq_i, h_i], 0) * weights[bq_i, h_i]
+                        )
+
                     T.reduce_sum(s_reshaped, logits, dim=-1, clear=True)
 
                     for i_i in T.Parallel(block_N):
@@ -304,8 +344,10 @@ def block_sparse_mqa_attn_return_logits(
                             logits[i_i, 0] = -T.infinity(accum_dtype)
 
                     for bn_i in T.Parallel(block_N):
-                        Logits[seq_len_i, n_i * kv_block_size + b_i * block_N + bn_i] = logits[bn_i, 0] 
-    
+                        Logits[
+                            seq_len_i, n_i * kv_block_size + b_i * block_N + bn_i
+                        ] = logits[bn_i, 0]
+
     @T.prim_func
     def block_sparse_mqa_attn_return_logits_kernel_for_small_pooling_size(
         IndexQ: T.Tensor(index_q_shape, dtype),  # type: ignore
@@ -348,8 +390,10 @@ def block_sparse_mqa_attn_return_logits(
                 )
 
                 for bn_i, bq_i, h_i in T.Parallel(block_N, H_per_block // heads, heads):
-                    s_reshaped[bn_i, bq_i, h_i] = (T.max(s_reshaped[bn_i, bq_i, h_i], 0) * weights[bq_i, h_i])
-                
+                    s_reshaped[bn_i, bq_i, h_i] = (
+                        T.max(s_reshaped[bn_i, bq_i, h_i], 0) * weights[bq_i, h_i]
+                    )
+
                 T.reduce_sum(s_reshaped, logits, dim=-1, clear=True)
 
                 for i_i in T.Parallel(block_N):
@@ -358,20 +402,34 @@ def block_sparse_mqa_attn_return_logits(
                         logits[i_i, 0] = -T.infinity(accum_dtype)
 
                 for bn_i in T.Parallel(block_N):
-                    Logits[seq_len_i, n_i * kv_block_size + bn_i] = logits[bn_i, 0] 
+                    Logits[seq_len_i, n_i * kv_block_size + bn_i] = logits[bn_i, 0]
 
     if kv_block_size == block_N:
         return block_sparse_mqa_attn_return_logits_kernel_for_small_pooling_size
     else:
         return block_sparse_mqa_attn_return_logits_kernel
 
-def block_sparse_mqa_attn_return_logits_interface(q, kv, topk_block_index, kv_block_size, weights, cu_seqlen_ks, cu_seqlen_ke, dtype="bfloat16"):
+
+def block_sparse_mqa_attn_return_logits_interface(
+    q,
+    kv,
+    topk_block_index,
+    kv_block_size,
+    weights,
+    cu_seqlen_ks,
+    cu_seqlen_ke,
+    dtype="bfloat16",
+):
     seq_len, heads, index_dim = q.shape
     seq_len_kv = kv.shape[0]
     topk = topk_block_index.shape[1]
 
-    block_sparse_mqa_attn_return_logits_kernel = block_sparse_mqa_attn_return_logits(heads=heads, index_dim=index_dim, kv_block_size=kv_block_size, topk=topk)
-    logits = torch.empty([seq_len, topk * kv_block_size], device=q.device, dtype=torch.float32)
+    block_sparse_mqa_attn_return_logits_kernel = block_sparse_mqa_attn_return_logits(
+        heads=heads, index_dim=index_dim, kv_block_size=kv_block_size, topk=topk
+    )
+    logits = torch.empty(
+        [seq_len, topk * kv_block_size], device=q.device, dtype=torch.float32
+    )
     block_sparse_mqa_attn_return_logits_kernel(
         q.view(seq_len * heads, index_dim),
         kv,
@@ -382,6 +440,7 @@ def block_sparse_mqa_attn_return_logits_interface(q, kv, topk_block_index, kv_bl
         cu_seqlen_ke,
     )
     return logits
+
 
 def ref_block_mean_pooling(k, k_block_size):
     seq_len_k = k.shape[0]
@@ -394,9 +453,10 @@ def ref_block_mean_pooling(k, k_block_size):
         block_mean = block_kv.mean(dim=0, keepdim=True)  # [block_size, D] -> [1, D]
         blocked_k_mean.append(block_mean)
     # ref_blocked_k = torch.cat(blocked_k_mean, dim=0)  # [num_block, D]
-    blocked_k = torch.cat(blocked_k_mean, dim=0) 
-    
+    blocked_k = torch.cat(blocked_k_mean, dim=0)
+
     return blocked_k
+
 
 @tilelang.jit(
     pass_configs={
@@ -405,28 +465,28 @@ def ref_block_mean_pooling(k, k_block_size):
 )
 def block_mean_pooling(
     max_num_pooling_blocks: int,
-    pooling_block_size: int, 
+    pooling_block_size: int,
     dim: int,
-    block_N: int=64,
+    block_N: int = 64,
     num_stages=1,
     threads=256,
     dtype="bfloat16",
 ):
     accum_dtype = T.float32
-    
+
     seq_len_k = T.dynamic("seq_len_k")
     k_size = [seq_len_k, dim]
     blocked_k_size = [max_num_pooling_blocks, dim]
 
     @T.prim_func
     def block_mean_pooling_kernel(
-        K: T.Tensor(k_size, dtype=dtype), # type: ignore
-        BlockedK: T.Tensor(blocked_k_size, dtype=accum_dtype), # type: ignore
+        K: T.Tensor(k_size, dtype=dtype),  # type: ignore
+        BlockedK: T.Tensor(blocked_k_size, dtype=accum_dtype),  # type: ignore
     ):
         with T.Kernel(T.ceildiv(seq_len_k, pooling_block_size), threads=threads) as bx:
             index_k = T.alloc_fragment([block_N, dim], dtype)
             acc = T.alloc_fragment([dim], accum_dtype)
-            T.fill(acc, 0.0) 
+            T.fill(acc, 0.0)
 
             k_start = bx * pooling_block_size
             k_end = T.min(k_start + pooling_block_size, seq_len_k)
@@ -437,7 +497,7 @@ def block_mean_pooling(
 
                 tl_block_s = k_start + b_i * block_N
                 tl_block_e = T.min(k_start + (b_i + 1) * block_N, k_end)
-                T.copy(K[tl_block_s:tl_block_s + block_N, :], index_k)
+                T.copy(K[tl_block_s : tl_block_s + block_N, :], index_k)
 
                 cur_tl_block_size = tl_block_e - tl_block_s
                 for n_i in T.parallel(block_N):
@@ -446,19 +506,22 @@ def block_mean_pooling(
                             index_k[n_i, d_i] = T.cast(0, accum_dtype)
 
                 T.reduce_sum(index_k, acc, dim=0, clear=False)
-            
+
             for d_i in T.parallel(dim):
                 acc[d_i] = acc[d_i] / T.cast(cur_pooling_block_size, accum_dtype)
-            
+
             T.copy(acc, BlockedK[bx, :])
-    
+
     return block_mean_pooling_kernel
+
 
 def block_mean_pooling_interface(k, k_block_size):
     seq_len_k, d = k.shape
     max_num_pooling_blocks = (seq_len_k + k_block_size - 1) // k_block_size
 
-    blocked_k = torch.empty((max_num_pooling_blocks, d), device=k.device, dtype=torch.float32)
+    blocked_k = torch.empty(
+        (max_num_pooling_blocks, d), device=k.device, dtype=torch.float32
+    )
     kernel = block_mean_pooling(
         max_num_pooling_blocks=max_num_pooling_blocks,
         pooling_block_size=k_block_size,
@@ -472,13 +535,14 @@ def block_mean_pooling_interface(k, k_block_size):
 
     return blocked_k
 
+
 def fp8_hierarchy_mqa_logits(
     q: torch.Tensor,
     kv: tuple[torch.Tensor, torch.Tensor],
     weights: torch.Tensor,
     cu_seqlen_ks: torch.Tensor,
     cu_seqlen_ke: torch.Tensor,
-    k_block_size: int, 
+    k_block_size: int,
     block_topk: int,
 ) -> torch.Tensor:
     """Compute FP8 MQA logits for a single sequence without KV paging.
@@ -515,33 +579,40 @@ def fp8_hierarchy_mqa_logits(
     # blocked_k = ref_block_mean_pooling(k, k_block_size)  # [num_block, D]
     blocked_k = block_mean_pooling_interface(k, k_block_size)  # [num_block, D]
 
-    block_k_indexer_score = pool_mqa_attn_return_logits_interface(q=q, blocked_kv=blocked_k, kv_block_size=k_block_size, weights=weights, cu_seqlen_blocked_ks=cu_seqlen_blocked_ks, cu_seqlen_blocked_ke=cu_seqlen_blocked_ke)
+    block_k_indexer_score = pool_mqa_attn_return_logits_interface(
+        q=q,
+        blocked_kv=blocked_k,
+        kv_block_size=k_block_size,
+        weights=weights,
+        cu_seqlen_blocked_ks=cu_seqlen_blocked_ks,
+        cu_seqlen_blocked_ke=cu_seqlen_blocked_ke,
+    )
 
-    topk_block_indices = torch.topk(block_k_indexer_score, k=min(block_topk, block_k_indexer_score.shape[-1]), dim=-1).indices  # [M, topk]
+    topk_block_indices = torch.topk(
+        block_k_indexer_score,
+        k=min(block_topk, block_k_indexer_score.shape[-1]),
+        dim=-1,
+    ).indices  # [M, topk]
     topk_block_indices = topk_block_indices.to(torch.int32)
 
-    block_sparse_logits = block_sparse_mqa_attn_return_logits_interface(q=q, kv=k, topk_block_index=topk_block_indices, kv_block_size=k_block_size, weights=weights, cu_seqlen_ks=cu_seqlen_ks, cu_seqlen_ke=cu_seqlen_ke)
+    block_sparse_logits = block_sparse_mqa_attn_return_logits_interface(
+        q=q,
+        kv=k,
+        topk_block_index=topk_block_indices,
+        kv_block_size=k_block_size,
+        weights=weights,
+        cu_seqlen_ks=cu_seqlen_ks,
+        cu_seqlen_ke=cu_seqlen_ke,
+    )
 
     return block_sparse_logits, topk_block_indices
-
 
 
 # Re-exported from tilelang_kernels.py (production-active interfaces).
 # Kept here so legacy orchestrators in this file can keep calling them.
 from sglang.srt.layers.attention.nsa.hisa.tilelang_kernels import (
-    fp8_native_block_mean_pooling,
     fp8_native_block_mean_pooling_interface,
-    fp8_native_block_mean_pooling_grouped,
-    fp8_native_block_mean_pooling_grouped_interface,
-    fp8_native_paged_mean_pooling_completed_blocks,
-    fp8_native_paged_mean_pooling_completed_blocks_interface,
 )
-
-
-
-
-
-
 
 
 @tilelang.jit(
@@ -578,13 +649,13 @@ def pool_mqa_attn_return_logits_fp8(
 
     @T.prim_func
     def pool_mqa_attn_return_logits_fp8_kernel(
-        IndexQ: T.Tensor(index_q_shape, fp8_dtype),                     # type: ignore
-        IndexBlockedK: T.Tensor(index_k_shape, fp8_dtype),              # type: ignore
-        IndexBlockedKScale: T.Tensor(index_k_scale_shape, accum_dtype), # type: ignore
-        Logits: T.Tensor(logits_shape, accum_dtype),                    # type: ignore
-        Weights: T.Tensor([seq_len, heads], accum_dtype),               # type: ignore
-        CuSeqLenBlockedKS: T.Tensor([seq_len], index_dtype),            # type: ignore
-        CuSeqLenBlockedKE: T.Tensor([seq_len], index_dtype),            # type: ignore
+        IndexQ: T.Tensor(index_q_shape, fp8_dtype),  # type: ignore
+        IndexBlockedK: T.Tensor(index_k_shape, fp8_dtype),  # type: ignore
+        IndexBlockedKScale: T.Tensor(index_k_scale_shape, accum_dtype),  # type: ignore
+        Logits: T.Tensor(logits_shape, accum_dtype),  # type: ignore
+        Weights: T.Tensor([seq_len, heads], accum_dtype),  # type: ignore
+        CuSeqLenBlockedKS: T.Tensor([seq_len], index_dtype),  # type: ignore
+        CuSeqLenBlockedKE: T.Tensor([seq_len], index_dtype),  # type: ignore
     ):
         with T.Kernel(T.ceildiv(seq_len, block_Q), threads=threads) as bx:
             index_q_shared = T.alloc_shared([block_Q * heads, index_dim], fp8_dtype)
@@ -605,16 +676,27 @@ def pool_mqa_attn_return_logits_fp8(
             cu_k_e_max = -2147483648
 
             for bq_i in T.serial(block_Q):
-                cu_k_s_min = T.min(cu_k_s_min, T.min(CuSeqLenBlockedKS[seq_len_i + bq_i], seq_len_blocked_kv))
+                cu_k_s_min = T.min(
+                    cu_k_s_min,
+                    T.min(CuSeqLenBlockedKS[seq_len_i + bq_i], seq_len_blocked_kv),
+                )
             for bq_i in T.serial(block_Q):
-                cu_k_e_max = T.max(cu_k_e_max, T.min(CuSeqLenBlockedKE[seq_len_i + bq_i], seq_len_blocked_kv))
+                cu_k_e_max = T.max(
+                    cu_k_e_max,
+                    T.min(CuSeqLenBlockedKE[seq_len_i + bq_i], seq_len_blocked_kv),
+                )
 
             T.copy(IndexQ[seq_len_i * heads, 0], index_q_shared)
             T.copy(Weights[seq_len_i, 0], weights)
 
-            for nbn_i in T.Pipelined(T.ceildiv(cu_k_e_max - cu_k_s_min, block_N), num_stages=num_stages):
+            for nbn_i in T.Pipelined(
+                T.ceildiv(cu_k_e_max - cu_k_s_min, block_N), num_stages=num_stages
+            ):
                 T.copy(IndexBlockedK[cu_k_s_min + nbn_i * block_N, 0], index_k_shared)
-                T.copy(IndexBlockedKScale[cu_k_s_min + nbn_i * block_N], index_k_scale_fragment)
+                T.copy(
+                    IndexBlockedKScale[cu_k_s_min + nbn_i * block_N],
+                    index_k_scale_fragment,
+                )
 
                 T.gemm(
                     index_k_shared,
@@ -626,23 +708,43 @@ def pool_mqa_attn_return_logits_fp8(
                 )
 
                 for bn_i, bq_i, h_i in T.Parallel(block_N, block_Q, heads):
-                    s_reshaped[bn_i, bq_i, h_i] = (T.max(s_reshaped[bn_i, bq_i, h_i] * index_k_scale_fragment[bn_i], 0) * weights[bq_i, h_i])
+                    s_reshaped[bn_i, bq_i, h_i] = (
+                        T.max(
+                            s_reshaped[bn_i, bq_i, h_i] * index_k_scale_fragment[bn_i],
+                            0,
+                        )
+                        * weights[bq_i, h_i]
+                    )
 
                 T.reduce_sum(s_reshaped, logits, dim=-1, clear=True)
 
                 for bq_i, bn_i in T.Parallel(block_Q, block_N):
-                    Logits[seq_len_i + bq_i, cu_k_s_min + nbn_i * block_N + bn_i] = logits[bn_i, bq_i]
+                    Logits[seq_len_i + bq_i, cu_k_s_min + nbn_i * block_N + bn_i] = (
+                        logits[bn_i, bq_i]
+                    )
 
     return pool_mqa_attn_return_logits_fp8_kernel
 
 
-def pool_mqa_attn_return_logits_fp8_interface(q_fp8, blocked_kv_fp8, blocked_kv_scale, kv_block_size, weights_f32, cu_seqlen_blocked_ks, cu_seqlen_blocked_ke, clean_logits=True, force_maintain=True):
+def pool_mqa_attn_return_logits_fp8_interface(
+    q_fp8,
+    blocked_kv_fp8,
+    blocked_kv_scale,
+    kv_block_size,
+    weights_f32,
+    cu_seqlen_blocked_ks,
+    cu_seqlen_blocked_ke,
+    clean_logits=True,
+    force_maintain=True,
+):
     """Prefill block-MQA interface: fp8 Q + fp8 BlockedK + f32 scale + f32 Weights."""
     seq_len, heads, index_dim = q_fp8.shape
     seq_len_blocked_kv = blocked_kv_fp8.shape[0]
 
     kernel = pool_mqa_attn_return_logits_fp8(heads=heads, index_dim=index_dim)
-    logits = torch.empty([seq_len, seq_len_blocked_kv], device=q_fp8.device, dtype=torch.float32)
+    logits = torch.empty(
+        [seq_len, seq_len_blocked_kv], device=q_fp8.device, dtype=torch.float32
+    )
     kernel(
         q_fp8.view(seq_len * heads, index_dim),
         blocked_kv_fp8,
@@ -654,7 +756,9 @@ def pool_mqa_attn_return_logits_fp8_interface(q_fp8, blocked_kv_fp8, blocked_kv_
     )
     if clean_logits and force_maintain:
         clean_and_maintain_logits_kernel = clean_and_maintain_logits_()
-        clean_and_maintain_logits_kernel(logits, cu_seqlen_blocked_ks, cu_seqlen_blocked_ke)
+        clean_and_maintain_logits_kernel(
+            logits, cu_seqlen_blocked_ks, cu_seqlen_blocked_ke
+        )
     else:
         if clean_logits:
             clean_logits_()(logits, cu_seqlen_blocked_ks, cu_seqlen_blocked_ke)
@@ -700,7 +804,7 @@ def fp8_native_block_sparse_mqa_attn_return_logits(
     def fp8_native_block_sparse_mqa_attn_return_logits_kernel(
         IndexQ: T.Tensor(index_q_shape, fp8_dtype),  # type: ignore
         IndexK: T.Tensor(index_k_shape, fp8_dtype),  # type: ignore
-        IndexKScale: T.Tensor(index_k_scale_shape, accum_dtype), # type: ignore
+        IndexKScale: T.Tensor(index_k_scale_shape, accum_dtype),  # type: ignore
         TopKBlockIndex: T.Tensor([seq_len, topk], topk_index_dtype),  # type: ignore
         Logits: T.Tensor(logits_shape, accum_dtype),  # type: ignore
         Weights: T.Tensor([seq_len, heads], accum_dtype),  # type: ignore
@@ -728,7 +832,10 @@ def fp8_native_block_sparse_mqa_attn_return_logits(
             cu_k_s_min = CuSeqLenKS[seq_len_i]
             cu_k_e_max = CuSeqLenKE[seq_len_i]
 
-            T.copy(IndexQ[seq_len_i * heads:seq_len_i * heads + H_per_block, :], index_q_shared)
+            T.copy(
+                IndexQ[seq_len_i * heads : seq_len_i * heads + H_per_block, :],
+                index_q_shared,
+            )
             T.copy(Weights[seq_len_i, :], weights)
 
             for n_i in T.serial(topk):
@@ -740,7 +847,7 @@ def fp8_native_block_sparse_mqa_attn_return_logits(
                 for b_i in T.Pipelined(kv_block_size // block_N, num_stages=num_stages):
                     block_s_i = block_s + b_i * block_N
 
-                    T.copy(IndexK[block_s_i:block_s_i + block_N, :], index_k_shared)
+                    T.copy(IndexK[block_s_i : block_s_i + block_N, :], index_k_shared)
                     # 1D scale load via T.Parallel to avoid TMA MISALIGNED_ADDRESS
                     # (CUDA err 715) at unaligned seq_len_kv base addresses.
                     for bn_i in T.Parallel(block_N):
@@ -759,9 +866,14 @@ def fp8_native_block_sparse_mqa_attn_return_logits(
                         policy=T.GemmWarpPolicy.FullRow,
                     )
 
-                    for bn_i, bq_i, h_i in T.Parallel(block_N, H_per_block // heads, heads):
-                        s_reshaped[bn_i, bq_i, h_i] = (T.max(s_reshaped[bn_i, bq_i, h_i] * scale_shared[bn_i], 0) * weights[bq_i, h_i])
-                    
+                    for bn_i, bq_i, h_i in T.Parallel(
+                        block_N, H_per_block // heads, heads
+                    ):
+                        s_reshaped[bn_i, bq_i, h_i] = (
+                            T.max(s_reshaped[bn_i, bq_i, h_i] * scale_shared[bn_i], 0)
+                            * weights[bq_i, h_i]
+                        )
+
                     T.reduce_sum(s_reshaped, logits, dim=-1, clear=True)
 
                     for i_i in T.Parallel(block_N):
@@ -770,13 +882,15 @@ def fp8_native_block_sparse_mqa_attn_return_logits(
                             logits[i_i, 0] = -T.infinity(accum_dtype)
 
                     for bn_i in T.Parallel(block_N):
-                        Logits[seq_len_i, n_i * kv_block_size + b_i * block_N + bn_i] = logits[bn_i, 0] 
-    
+                        Logits[
+                            seq_len_i, n_i * kv_block_size + b_i * block_N + bn_i
+                        ] = logits[bn_i, 0]
+
     @T.prim_func
     def fp8_native_block_sparse_mqa_attn_return_logits_kernel_for_small_pooling_size(
         IndexQ: T.Tensor(index_q_shape, fp8_dtype),  # type: ignore
         IndexK: T.Tensor(index_k_shape, fp8_dtype),  # type: ignore
-        IndexKScale: T.Tensor(index_k_scale_shape, accum_dtype), # type: ignore
+        IndexKScale: T.Tensor(index_k_scale_shape, accum_dtype),  # type: ignore
         TopKBlockIndex: T.Tensor([seq_len, topk], topk_index_dtype),  # type: ignore
         Logits: T.Tensor(logits_shape, accum_dtype),  # type: ignore
         Weights: T.Tensor([seq_len, heads], accum_dtype),  # type: ignore
@@ -801,7 +915,10 @@ def fp8_native_block_sparse_mqa_attn_return_logits(
             cu_k_s_min = CuSeqLenKS[seq_len_i]
             cu_k_e_max = CuSeqLenKE[seq_len_i]
 
-            T.copy(IndexQ[seq_len_i * heads:seq_len_i * heads + H_per_block, :], index_q_shared)
+            T.copy(
+                IndexQ[seq_len_i * heads : seq_len_i * heads + H_per_block, :],
+                index_q_shared,
+            )
             T.copy(Weights[seq_len_i, :], weights)
 
             for n_i in T.serial(topk):
@@ -810,7 +927,7 @@ def fp8_native_block_sparse_mqa_attn_return_logits(
                 topk_block_id = T.cast(TopKBlockIndex[seq_len_i, n_i], index_dtype)
                 block_s_i = topk_block_id * kv_block_size
 
-                T.copy(IndexK[block_s_i:block_s_i + block_N, :], index_k_shared)
+                T.copy(IndexK[block_s_i : block_s_i + block_N, :], index_k_shared)
                 # 1D scale load via T.Parallel to avoid TMA MISALIGNED_ADDRESS
                 # (CUDA err 715) at unaligned seq_len_kv base addresses.
                 for bn_i in T.Parallel(block_N):
@@ -828,8 +945,11 @@ def fp8_native_block_sparse_mqa_attn_return_logits(
                 )
 
                 for bn_i, bq_i, h_i in T.Parallel(block_N, H_per_block // heads, heads):
-                    s_reshaped[bn_i, bq_i, h_i] = (T.max(s_reshaped[bn_i, bq_i, h_i] * scale_shared[bn_i], 0) * weights[bq_i, h_i])
-                
+                    s_reshaped[bn_i, bq_i, h_i] = (
+                        T.max(s_reshaped[bn_i, bq_i, h_i] * scale_shared[bn_i], 0)
+                        * weights[bq_i, h_i]
+                    )
+
                 T.reduce_sum(s_reshaped, logits, dim=-1, clear=True)
 
                 for i_i in T.Parallel(block_N):
@@ -838,20 +958,39 @@ def fp8_native_block_sparse_mqa_attn_return_logits(
                         logits[i_i, 0] = -T.infinity(accum_dtype)
 
                 for bn_i in T.Parallel(block_N):
-                    Logits[seq_len_i, n_i * kv_block_size + bn_i] = logits[bn_i, 0] 
+                    Logits[seq_len_i, n_i * kv_block_size + bn_i] = logits[bn_i, 0]
 
     if kv_block_size == block_N:
-        return fp8_native_block_sparse_mqa_attn_return_logits_kernel_for_small_pooling_size
+        return (
+            fp8_native_block_sparse_mqa_attn_return_logits_kernel_for_small_pooling_size
+        )
     else:
         return fp8_native_block_sparse_mqa_attn_return_logits_kernel
 
-def fp8_native_block_sparse_mqa_attn_return_logits_interface(q, k, k_scale, topk_block_index, kv_block_size, weights, cu_seqlen_ks, cu_seqlen_ke, dtype="bfloat16"):
+
+def fp8_native_block_sparse_mqa_attn_return_logits_interface(
+    q,
+    k,
+    k_scale,
+    topk_block_index,
+    kv_block_size,
+    weights,
+    cu_seqlen_ks,
+    cu_seqlen_ke,
+    dtype="bfloat16",
+):
     seq_len, heads, index_dim = q.shape
     seq_len_kv = k.shape[0]
     topk = topk_block_index.shape[1]
 
-    block_sparse_mqa_attn_return_logits_kernel = fp8_native_block_sparse_mqa_attn_return_logits(heads=heads, index_dim=index_dim, kv_block_size=kv_block_size, topk=topk)
-    logits = torch.empty([seq_len, topk * kv_block_size], device=q.device, dtype=torch.float32)
+    block_sparse_mqa_attn_return_logits_kernel = (
+        fp8_native_block_sparse_mqa_attn_return_logits(
+            heads=heads, index_dim=index_dim, kv_block_size=kv_block_size, topk=topk
+        )
+    )
+    logits = torch.empty(
+        [seq_len, topk * kv_block_size], device=q.device, dtype=torch.float32
+    )
     block_sparse_mqa_attn_return_logits_kernel(
         q.view(seq_len * heads, index_dim),
         k,
@@ -871,11 +1010,11 @@ def fp8_native_block_sparse_mqa_attn_return_logits_interface(q, k, k_scale, topk
     },
 )
 def fp8_native_block_sparse_mqa_attn_return_logits_grouped(
-    kv_block_size,    # K, must be < block_N and divide block_N
-    topk,             # must be divisible by G = block_N // K
+    kv_block_size,  # K, must be < block_N and divide block_N
+    topk,  # must be divisible by G = block_N // K
     heads,
     index_dim,
-    block_N=128,      # GEMM tile / parallelism dial.
+    block_N=128,  # GEMM tile / parallelism dial.
     threads=256,
 ):
     """Grouped variant of ``fp8_native_block_sparse_mqa_attn_return_logits``
@@ -899,13 +1038,11 @@ def fp8_native_block_sparse_mqa_attn_return_logits_grouped(
     index_dtype = T.int32
     topk_index_dtype = T.int64
 
-    assert block_N % kv_block_size == 0, (
-        f"block_N ({block_N}) must be divisible by kv_block_size ({kv_block_size})"
-    )
+    assert (
+        block_N % kv_block_size == 0
+    ), f"block_N ({block_N}) must be divisible by kv_block_size ({kv_block_size})"
     G = block_N // kv_block_size
-    assert topk % G == 0, (
-        f"topk ({topk}) must be divisible by G ({G})"
-    )
+    assert topk % G == 0, f"topk ({topk}) must be divisible by G ({G})"
     num_chunks = topk // G
 
     H_per_block = heads
@@ -944,7 +1081,10 @@ def fp8_native_block_sparse_mqa_attn_return_logits_grouped(
             cu_k_s_min = CuSeqLenKS[seq_len_i]
             cu_k_e_max = CuSeqLenKE[seq_len_i]
 
-            T.copy(IndexQ[seq_len_i * heads:seq_len_i * heads + H_per_block, :], index_q_shared)
+            T.copy(
+                IndexQ[seq_len_i * heads : seq_len_i * heads + H_per_block, :],
+                index_q_shared,
+            )
             T.copy(Weights[seq_len_i, :], weights)
 
             for n_i in T.serial(num_chunks):
@@ -957,11 +1097,15 @@ def fp8_native_block_sparse_mqa_attn_return_logits_grouped(
                 # (a T.serial(G) inner loop would split warp-spec
                 # producer/consumer scopes).
                 for g_i in range(G):
-                    topk_block_id = T.cast(TopKBlockIndex[seq_len_i, n_i_start + g_i], index_dtype)
+                    topk_block_id = T.cast(
+                        TopKBlockIndex[seq_len_i, n_i_start + g_i], index_dtype
+                    )
                     block_s_i = topk_block_id * kv_block_size
                     T.copy(
-                        IndexK[block_s_i:block_s_i + kv_block_size, :],
-                        index_k_shared[g_i * kv_block_size:(g_i + 1) * kv_block_size, :],
+                        IndexK[block_s_i : block_s_i + kv_block_size, :],
+                        index_k_shared[
+                            g_i * kv_block_size : (g_i + 1) * kv_block_size, :
+                        ],
                     )
 
                 # CHANGE vs vanilla: scale source addr depends on
@@ -972,8 +1116,12 @@ def fp8_native_block_sparse_mqa_attn_return_logits_grouped(
                 for bn_i in T.Parallel(block_N):
                     g_i = bn_i // kv_block_size
                     b_i = bn_i - g_i * kv_block_size
-                    topk_block_id = T.cast(TopKBlockIndex[seq_len_i, n_i_start + g_i], index_dtype)
-                    scale_shared[bn_i] = IndexKScale[topk_block_id * kv_block_size + b_i]
+                    topk_block_id = T.cast(
+                        TopKBlockIndex[seq_len_i, n_i_start + g_i], index_dtype
+                    )
+                    scale_shared[bn_i] = IndexKScale[
+                        topk_block_id * kv_block_size + b_i
+                    ]
 
                 T.gemm(
                     index_k_shared,
@@ -985,7 +1133,10 @@ def fp8_native_block_sparse_mqa_attn_return_logits_grouped(
                 )
 
                 for bn_i, bq_i, h_i in T.Parallel(block_N, H_per_block // heads, heads):
-                    s_reshaped[bn_i, bq_i, h_i] = (T.max(s_reshaped[bn_i, bq_i, h_i] * scale_shared[bn_i], 0) * weights[bq_i, h_i])
+                    s_reshaped[bn_i, bq_i, h_i] = (
+                        T.max(s_reshaped[bn_i, bq_i, h_i] * scale_shared[bn_i], 0)
+                        * weights[bq_i, h_i]
+                    )
 
                 T.reduce_sum(s_reshaped, logits, dim=-1, clear=True)
 
@@ -994,7 +1145,9 @@ def fp8_native_block_sparse_mqa_attn_return_logits_grouped(
                 for i_i in T.Parallel(block_N):
                     g_i = i_i // kv_block_size
                     b_i = i_i - g_i * kv_block_size
-                    topk_block_id = T.cast(TopKBlockIndex[seq_len_i, n_i_start + g_i], index_dtype)
+                    topk_block_id = T.cast(
+                        TopKBlockIndex[seq_len_i, n_i_start + g_i], index_dtype
+                    )
                     k_i = topk_block_id * kv_block_size + b_i
                     if k_i < cu_k_s_min or k_i >= cu_k_e_max:
                         logits[i_i, 0] = -T.infinity(accum_dtype)
@@ -1002,14 +1155,23 @@ def fp8_native_block_sparse_mqa_attn_return_logits_grouped(
                 # CHANGE vs vanilla: output offset uses ``n_i_start``
                 # (G groups stored back-to-back).
                 for bn_i in T.Parallel(block_N):
-                    Logits[seq_len_i, n_i_start * kv_block_size + bn_i] = logits[bn_i, 0]
+                    Logits[seq_len_i, n_i_start * kv_block_size + bn_i] = logits[
+                        bn_i, 0
+                    ]
 
     return fp8_native_block_sparse_mqa_attn_return_logits_grouped_kernel
 
 
 def fp8_native_block_sparse_mqa_attn_return_logits_grouped_interface(
-    q, k, k_scale, topk_block_index, kv_block_size, weights,
-    cu_seqlen_ks, cu_seqlen_ke, block_N=128,
+    q,
+    k,
+    k_scale,
+    topk_block_index,
+    kv_block_size,
+    weights,
+    cu_seqlen_ks,
+    cu_seqlen_ke,
+    block_N=128,
 ):
     """Tilelang grouped block-sparse MQA for K < block_N.
 
@@ -1021,38 +1183,45 @@ def fp8_native_block_sparse_mqa_attn_return_logits_grouped_interface(
     """
     seq_len, heads, index_dim = q.shape
     topk = topk_block_index.shape[1]
-    assert block_N % kv_block_size == 0, (
-        f"block_N ({block_N}) must be divisible by kv_block_size ({kv_block_size})"
-    )
+    assert (
+        block_N % kv_block_size == 0
+    ), f"block_N ({block_N}) must be divisible by kv_block_size ({kv_block_size})"
     G = block_N // kv_block_size
     pad = (G - (topk % G)) % G
     topk_padded = topk + pad
 
     if pad > 0:
         topk_pad = torch.full(
-            (seq_len, pad), -1,
-            device=topk_block_index.device, dtype=topk_block_index.dtype,
+            (seq_len, pad),
+            -1,
+            device=topk_block_index.device,
+            dtype=topk_block_index.dtype,
         )
         topk_block_index_padded = torch.cat([topk_block_index, topk_pad], dim=1)
     else:
         topk_block_index_padded = topk_block_index
 
     kernel = fp8_native_block_sparse_mqa_attn_return_logits_grouped(
-        heads=heads, index_dim=index_dim,
-        kv_block_size=kv_block_size, topk=topk_padded,
+        heads=heads,
+        index_dim=index_dim,
+        kv_block_size=kv_block_size,
+        topk=topk_padded,
         block_N=block_N,
     )
     logits_padded = torch.empty(
         [seq_len, topk_padded * kv_block_size],
-        device=q.device, dtype=torch.float32,
+        device=q.device,
+        dtype=torch.float32,
     )
     kernel(
         q.view(seq_len * heads, index_dim),
-        k, k_scale,
+        k,
+        k_scale,
         topk_block_index_padded,
         logits_padded,
         weights,
-        cu_seqlen_ks, cu_seqlen_ke,
+        cu_seqlen_ks,
+        cu_seqlen_ke,
     )
     if pad > 0:
         return logits_padded[:, : topk * kv_block_size].contiguous()
@@ -1065,7 +1234,7 @@ def fp8_native_hierarchy_mqa_logits_tilelang_legacy(
     weights: torch.Tensor,
     cu_seqlen_ks: torch.Tensor,
     cu_seqlen_ke: torch.Tensor,
-    k_block_size: int, 
+    k_block_size: int,
     block_topk: int,
 ) -> torch.Tensor:
     """Compute FP8 MQA logits for a single sequence without KV paging.
@@ -1089,26 +1258,54 @@ def fp8_native_hierarchy_mqa_logits_tilelang_legacy(
     k_scales = k_scales.view(torch.float32)
 
     if k_scales.ndim == 2:
-        assert k_scales.shape[1] == 1, "k_scales should have shape [N] or [N, 1], but got shape {}".format(k_scales.shape)
+        assert (
+            k_scales.shape[1] == 1
+        ), "k_scales should have shape [N] or [N, 1], but got shape {}".format(
+            k_scales.shape
+        )
         k_scales = k_scales.squeeze(1)
 
     cu_seqlen_blocked_ks = cu_seqlen_ks // k_block_size
     cu_seqlen_blocked_ke = (cu_seqlen_ke + k_block_size - 1) // k_block_size
 
     # Mean pool now outputs fp8 + per-block f32 scale (re-quantized in kernel).
-    blocked_k, blocked_k_scale = fp8_native_block_mean_pooling_interface(k_fp8, k_scales, k_block_size)
+    blocked_k, blocked_k_scale = fp8_native_block_mean_pooling_interface(
+        k_fp8, k_scales, k_block_size
+    )
 
     # pool_mqa_fp8 uses fp8×fp8 GEMM; no Python-level cast for Q or weights.
-    block_k_indexer_score = pool_mqa_attn_return_logits_fp8_interface(q_fp8=q, blocked_kv_fp8=blocked_k, blocked_kv_scale=blocked_k_scale, kv_block_size=k_block_size, weights_f32=weights, cu_seqlen_blocked_ks=cu_seqlen_blocked_ks, cu_seqlen_blocked_ke=cu_seqlen_blocked_ke)
+    block_k_indexer_score = pool_mqa_attn_return_logits_fp8_interface(
+        q_fp8=q,
+        blocked_kv_fp8=blocked_k,
+        blocked_kv_scale=blocked_k_scale,
+        kv_block_size=k_block_size,
+        weights_f32=weights,
+        cu_seqlen_blocked_ks=cu_seqlen_blocked_ks,
+        cu_seqlen_blocked_ke=cu_seqlen_blocked_ke,
+    )
 
     # bf16 + sorted=False: bf16 topk is ~40% faster than f32 on [M, num_blocks],
     # and downstream sparse_mqa doesn't depend on n_i ordering.  Validated with
     # longbench_samsum (--limit 32): rouge 0.4544 ± 0.028 (> 0.40 baseline).
     # torch.topk returns int64; sparse_mqa kernel now accepts int64 directly,
     # avoiding an otherwise-needed int64→int32 cast.
-    topk_block_indices = torch.topk(block_k_indexer_score.bfloat16(), k=min(block_topk, block_k_indexer_score.shape[-1]), dim=-1, sorted=False).indices  # [M, topk] int64
+    topk_block_indices = torch.topk(
+        block_k_indexer_score.bfloat16(),
+        k=min(block_topk, block_k_indexer_score.shape[-1]),
+        dim=-1,
+        sorted=False,
+    ).indices  # [M, topk] int64
 
-    block_sparse_logits = fp8_native_block_sparse_mqa_attn_return_logits_interface(q=q, k=k_fp8, k_scale=k_scales, topk_block_index=topk_block_indices, kv_block_size=k_block_size, weights=weights, cu_seqlen_ks=cu_seqlen_ks, cu_seqlen_ke=cu_seqlen_ke)
+    block_sparse_logits = fp8_native_block_sparse_mqa_attn_return_logits_interface(
+        q=q,
+        k=k_fp8,
+        k_scale=k_scales,
+        topk_block_index=topk_block_indices,
+        kv_block_size=k_block_size,
+        weights=weights,
+        cu_seqlen_ks=cu_seqlen_ks,
+        cu_seqlen_ke=cu_seqlen_ke,
+    )
 
     return block_sparse_logits, topk_block_indices
 
@@ -1121,11 +1318,11 @@ def fp8_native_hierarchy_mqa_logits_with_pool_cache(
     cu_seqlen_ke: torch.Tensor,
     k_block_size: int,
     block_topk: int,
-    blocked_k_cache: torch.Tensor,         # [max_pool_blocks, D] fp8  IN-OUT
-    blocked_k_scale_cache: torch.Tensor,   # [max_pool_blocks]    f32  IN-OUT
-    new_k_start: int,                      # start token index (inclusive) of the NEW K slice in k_fp8
-    new_k_end: int,                        # end   token index (exclusive) of the NEW K slice
-    current_num_pool: int,                 # number of valid pool blocks in blocked_k_cache for this step
+    blocked_k_cache: torch.Tensor,  # [max_pool_blocks, D] fp8  IN-OUT
+    blocked_k_scale_cache: torch.Tensor,  # [max_pool_blocks]    f32  IN-OUT
+    new_k_start: int,  # start token index (inclusive) of the NEW K slice in k_fp8
+    new_k_end: int,  # end   token index (exclusive) of the NEW K slice
+    current_num_pool: int,  # number of valid pool blocks in blocked_k_cache for this step
 ):
     """Chunked-prefill variant of ``fp8_native_hierarchy_mqa_logits_tilelang_legacy``.
 
@@ -1151,9 +1348,9 @@ def fp8_native_hierarchy_mqa_logits_with_pool_cache(
         f"new_k_start ({new_k_start}) must be a multiple of k_block_size "
         f"({k_block_size}) so cache writes land on pool-block boundaries."
     )
-    assert new_k_end > new_k_start, (
-        f"new_k_end ({new_k_end}) must be > new_k_start ({new_k_start})"
-    )
+    assert (
+        new_k_end > new_k_start
+    ), f"new_k_end ({new_k_end}) must be > new_k_start ({new_k_start})"
 
     k_fp8, k_scales = kv
     k_scales = k_scales.view(torch.float32)
@@ -1187,15 +1384,20 @@ def fp8_native_hierarchy_mqa_logits_with_pool_cache(
     topk_block_indices = torch.topk(
         block_k_indexer_score.bfloat16(),
         k=min(block_topk, block_k_indexer_score.shape[-1]),
-        dim=-1, sorted=False,
+        dim=-1,
+        sorted=False,
     ).indices
 
     # 3) sparse_mqa on raw K (unchanged from no-cache pipeline).
     block_sparse_logits = fp8_native_block_sparse_mqa_attn_return_logits_interface(
-        q=q, k=k_fp8, k_scale=k_scales,
+        q=q,
+        k=k_fp8,
+        k_scale=k_scales,
         topk_block_index=topk_block_indices,
-        kv_block_size=k_block_size, weights=weights,
-        cu_seqlen_ks=cu_seqlen_ks, cu_seqlen_ke=cu_seqlen_ke,
+        kv_block_size=k_block_size,
+        weights=weights,
+        cu_seqlen_ks=cu_seqlen_ks,
+        cu_seqlen_ke=cu_seqlen_ke,
     )
     return block_sparse_logits, topk_block_indices
 
@@ -1387,23 +1589,23 @@ def batch_decode_pool_mqa_attn_return_logits_fp8_legacy(
     batch = T.dynamic("batch")
     nb = T.dynamic("seq_len_blocked_kv")
 
-    q_shape = [batch, heads, index_dim]            # fp8
-    k_shape = [batch, nb, index_dim]               # fp8
-    k_scale_shape = [batch, nb]                    # f32 per-block scale
+    q_shape = [batch, heads, index_dim]  # fp8
+    k_shape = [batch, nb, index_dim]  # fp8
+    k_scale_shape = [batch, nb]  # f32 per-block scale
     logits_shape = [batch, nb]
-    w_shape = [batch, heads]                       # f32
+    w_shape = [batch, heads]  # f32
 
     block_H_pad = T.ceildiv(block_H, 16) * 16
     assert block_H_pad == heads
 
     @T.prim_func
     def kernel(
-        Q: T.Tensor(q_shape, fp8_dtype),                    # type: ignore
-        BlockedK: T.Tensor(k_shape, fp8_dtype),             # type: ignore
+        Q: T.Tensor(q_shape, fp8_dtype),  # type: ignore
+        BlockedK: T.Tensor(k_shape, fp8_dtype),  # type: ignore
         BlockedKScale: T.Tensor(k_scale_shape, accum_dtype),  # type: ignore
-        Logits: T.Tensor(logits_shape, accum_dtype),        # type: ignore
-        Weights: T.Tensor(w_shape, accum_dtype),            # type: ignore
-        ContextLens: T.Tensor([batch], index_dtype),        # type: ignore
+        Logits: T.Tensor(logits_shape, accum_dtype),  # type: ignore
+        Weights: T.Tensor(w_shape, accum_dtype),  # type: ignore
+        ContextLens: T.Tensor([batch], index_dtype),  # type: ignore
     ):
         with T.Kernel(batch, 1, threads=threads) as (bx, by):
             k_shared = T.alloc_shared([block_N, index_dim], fp8_dtype)
@@ -1435,7 +1637,9 @@ def batch_decode_pool_mqa_attn_return_logits_fp8_legacy(
 
                 # Apply per-K-block scale + relu + per-head weights, fused.
                 for kn_i, hn_i in T.Parallel(block_N, block_H_pad):
-                    s[kn_i, hn_i] = T.max(s[kn_i, hn_i] * k_scale_fragment[kn_i], 0) * w[hn_i]
+                    s[kn_i, hn_i] = (
+                        T.max(s[kn_i, hn_i] * k_scale_fragment[kn_i], 0) * w[hn_i]
+                    )
 
                 T.reduce_sum(s, logits_accum, dim=1, clear=True)
 
@@ -1474,16 +1678,22 @@ def batch_pool_mqa_attn_return_logits_fp8_legacy_interface(
     _B, seq_len_kv, _D = blocked_kv_fp8.shape
     assert seq_len_q == 1, "decode expects q_len=1"
 
-    q_2d = q_fp8.squeeze(1)                  # [B, H, D] fp8
-    w_2d = weights_f32.view(B, H)            # [B, H] f32
+    q_2d = q_fp8.squeeze(1)  # [B, H, D] fp8
+    w_2d = weights_f32.view(B, H)  # [B, H] f32
 
     logits = torch.empty((B, seq_len_kv), device=q_fp8.device, dtype=torch.float32)
     kernel = batch_decode_pool_mqa_attn_return_logits_fp8_legacy(
-        heads=H, index_dim=D, block_N=block_N, block_H=H,
+        heads=H,
+        index_dim=D,
+        block_N=block_N,
+        block_H=H,
     )
-    assert context_lens.dtype == torch.int32, f"context_lens must be int32, got {context_lens.dtype}"
+    assert (
+        context_lens.dtype == torch.int32
+    ), f"context_lens must be int32, got {context_lens.dtype}"
     kernel(q_2d, blocked_kv_fp8, blocked_kv_scale, logits, w_2d, context_lens)
     return logits.unsqueeze(1)  # [B, 1, Nb]
+
 
 @tilelang.jit(
     pass_configs={
@@ -1516,9 +1726,15 @@ def paged_block_sparse_mqa_attn_return_logits(
     H_per_block = heads
     block_N = paged_block_size
     assert block_N > 0, "block_N must be positive"
-    assert kv_block_size >= block_N and kv_block_size % block_N == 0, "block_N must divide kv_block_size"
-    assert paged_block_size >= block_N and paged_block_size % block_N == 0, "block_N must divide paged_block_size"
-    assert paged_block_size == block_N, "for simplicity we require paged_block_size == block_N in this kernel"
+    assert (
+        kv_block_size >= block_N and kv_block_size % block_N == 0
+    ), "block_N must divide kv_block_size"
+    assert (
+        paged_block_size >= block_N and paged_block_size % block_N == 0
+    ), "block_N must divide paged_block_size"
+    assert (
+        paged_block_size == block_N
+    ), "for simplicity we require paged_block_size == block_N in this kernel"
 
     @T.prim_func
     def paged_block_sparse_mqa_attn_return_logits_kernel(
@@ -1553,7 +1769,10 @@ def paged_block_sparse_mqa_attn_return_logits(
                 for b_i in T.Pipelined(kv_block_size // block_N, num_stages=num_stages):
                     block_s_i = block_s + b_i * block_N
 
-                    if block_s_i // paged_block_size >= 0 and block_s_i // paged_block_size < max_blocks:
+                    if (
+                        block_s_i // paged_block_size >= 0
+                        and block_s_i // paged_block_size < max_blocks
+                    ):
                         phys = BlockTables[b, block_s_i // paged_block_size]
                         T.copy(KvCache[phys, :, 0, :], index_k_shared)
 
@@ -1566,20 +1785,31 @@ def paged_block_sparse_mqa_attn_return_logits(
                         policy=T.GemmWarpPolicy.FullCol,
                     )
 
-                    for bn_i, bq_i, h_i in T.Parallel(block_N, H_per_block // heads, heads):
-                        s_reshaped[bn_i, bq_i, h_i] = (T.max(s_reshaped[bn_i, bq_i, h_i], 0) * weights[bq_i, h_i])
-                    
+                    for bn_i, bq_i, h_i in T.Parallel(
+                        block_N, H_per_block // heads, heads
+                    ):
+                        s_reshaped[bn_i, bq_i, h_i] = (
+                            T.max(s_reshaped[bn_i, bq_i, h_i], 0) * weights[bq_i, h_i]
+                        )
+
                     T.reduce_sum(s_reshaped, logits, dim=-1, clear=True)
 
                     for i_i in T.Parallel(block_N):
                         k_i = block_s_i + i_i
                         p = k_i // paged_block_size
-                        if (k_i < cu_k_s_min) or (k_i >= cu_k_e_max) or (p < 0) or (p >= max_blocks):
+                        if (
+                            (k_i < cu_k_s_min)
+                            or (k_i >= cu_k_e_max)
+                            or (p < 0)
+                            or (p >= max_blocks)
+                        ):
                             logits[i_i, 0] = -T.infinity(accum_dtype)
 
                     for bn_i in T.Parallel(block_N):
-                        Logits[b, seq_len_i, n_i * kv_block_size + b_i * block_N + bn_i] = logits[bn_i, 0]
-    
+                        Logits[
+                            b, seq_len_i, n_i * kv_block_size + b_i * block_N + bn_i
+                        ] = logits[bn_i, 0]
+
     @T.prim_func
     def paged_block_sparse_mqa_attn_return_logits_kernel_for_small_pooling_size(
         IndexQ: T.Tensor(index_q_shape, dtype),  # type: ignore
@@ -1611,7 +1841,10 @@ def paged_block_sparse_mqa_attn_return_logits(
                 topk_block_id = TopKBlockIndex[b, seq_len_i, n_i]
                 block_s_i = topk_block_id * kv_block_size
 
-                if block_s_i // paged_block_size >= 0 and block_s_i // paged_block_size < max_blocks:
+                if (
+                    block_s_i // paged_block_size >= 0
+                    and block_s_i // paged_block_size < max_blocks
+                ):
                     phys = BlockTables[b, block_s_i // paged_block_size]
                     T.copy(KvCache[phys, :, 0, :], index_k_shared)
 
@@ -1625,14 +1858,21 @@ def paged_block_sparse_mqa_attn_return_logits(
                 )
 
                 for bn_i, bq_i, h_i in T.Parallel(block_N, H_per_block // heads, heads):
-                    s_reshaped[bn_i, bq_i, h_i] = (T.max(s_reshaped[bn_i, bq_i, h_i], 0) * weights[bq_i, h_i])
-                
+                    s_reshaped[bn_i, bq_i, h_i] = (
+                        T.max(s_reshaped[bn_i, bq_i, h_i], 0) * weights[bq_i, h_i]
+                    )
+
                 T.reduce_sum(s_reshaped, logits, dim=-1, clear=True)
 
                 for i_i in T.Parallel(block_N):
                     k_i = block_s_i + i_i
                     p = k_i // paged_block_size
-                    if (k_i < cu_k_s_min) or (k_i >= cu_k_e_max) or (p < 0) or (p >= max_blocks):
+                    if (
+                        (k_i < cu_k_s_min)
+                        or (k_i >= cu_k_e_max)
+                        or (p < 0)
+                        or (p >= max_blocks)
+                    ):
                         logits[i_i, 0] = -T.infinity(accum_dtype)
 
                 for bn_i in T.Parallel(block_N):
@@ -1642,6 +1882,7 @@ def paged_block_sparse_mqa_attn_return_logits(
         return paged_block_sparse_mqa_attn_return_logits_kernel_for_small_pooling_size
     else:
         return paged_block_sparse_mqa_attn_return_logits_kernel
+
 
 def paged_block_sparse_mqa_attn_return_logits_interface(
     q,
@@ -1685,66 +1926,76 @@ def paged_block_sparse_mqa_attn_return_logits_interface(
     )
     return logits
 
+
 def ref_paged_mean_pooling(
-        kv_cache: torch.Tensor,
-        context_lens: torch.Tensor,
-        block_tables: torch.Tensor,
-        k_block_size: int,
-    ):
-        """
-        Args:
-            kv_cache: [num_blocks, block_size, 1, D]
-            context_lens: [B]
-            block_tables: [B, max_blocks]  (逻辑 paged block -> 物理 block)
-        Returns:
-            blocked_k: [B, max_num_pooling_blocks, D]  (已 padding)
-            num_pooling_blocks: [B]  (每个样本真实的 pooling block 数，用于 mask)
-        """
-        device = kv_cache.device
-        B = int(context_lens.shape[0])
-        block_size = int(kv_cache.shape[1])        # paged block size，通常 64（修复原来的错误）
-        D = int(kv_cache.shape[-1])
+    kv_cache: torch.Tensor,
+    context_lens: torch.Tensor,
+    block_tables: torch.Tensor,
+    k_block_size: int,
+):
+    """
+    Args:
+        kv_cache: [num_blocks, block_size, 1, D]
+        context_lens: [B]
+        block_tables: [B, max_blocks]  (逻辑 paged block -> 物理 block)
+    Returns:
+        blocked_k: [B, max_num_pooling_blocks, D]  (已 padding)
+        num_pooling_blocks: [B]  (每个样本真实的 pooling block 数，用于 mask)
+    """
+    device = kv_cache.device
+    B = int(context_lens.shape[0])
+    block_size = int(kv_cache.shape[1])  # paged block size，通常 64（修复原来的错误）
+    D = int(kv_cache.shape[-1])
 
-        # 每个样本需要的 k-block 数不同，先 pad 到 batch 内最大值
-        assert B > 0
-        max_seqlen = int(context_lens.max().item())
-        max_num_pooling_blocks = (max_seqlen + k_block_size - 1) // k_block_size
+    # 每个样本需要的 k-block 数不同，先 pad 到 batch 内最大值
+    assert B > 0
+    max_seqlen = int(context_lens.max().item())
+    max_num_pooling_blocks = (max_seqlen + k_block_size - 1) // k_block_size
 
-        blocked_k = torch.zeros(
-            (B, max_num_pooling_blocks, D),
-            device=device,
-            dtype=kv_cache.dtype,
-        )
-        num_pooling_blocks = torch.empty((B,), device=device, dtype=torch.int32)
+    blocked_k = torch.zeros(
+        (B, max_num_pooling_blocks, D),
+        device=device,
+        dtype=kv_cache.dtype,
+    )
+    num_pooling_blocks = torch.empty((B,), device=device, dtype=torch.int32)
 
-        for b in range(B):
-            seqlen = int(context_lens[b].item())
-            nblocks = (seqlen + k_block_size - 1) // k_block_size
-            num_pooling_blocks[b] = nblocks
+    for b in range(B):
+        seqlen = int(context_lens[b].item())
+        nblocks = (seqlen + k_block_size - 1) // k_block_size
+        num_pooling_blocks[b] = nblocks
 
-            for n in range(nblocks):
-                pooling_block_start = n * k_block_size
-                pooling_block_end = min((n + 1) * k_block_size, seqlen)
-                pooling_block_len = pooling_block_end - pooling_block_start
-                if pooling_block_len <= 0:
-                    continue
+        for n in range(nblocks):
+            pooling_block_start = n * k_block_size
+            pooling_block_end = min((n + 1) * k_block_size, seqlen)
+            pooling_block_len = pooling_block_end - pooling_block_start
+            if pooling_block_len <= 0:
+                continue
 
-                # 计算覆盖该 pooling block 所需的 paged blocks（注意：用 block_size，不是 block_tables.shape[1]）
-                paged_block_start = pooling_block_start // block_size
-                paged_block_end = (pooling_block_end + block_size - 1) // block_size  # exclusive
-                paged_block_indices = block_tables[b, paged_block_start:paged_block_end].to(torch.long)
+            # 计算覆盖该 pooling block 所需的 paged blocks（注意：用 block_size，不是 block_tables.shape[1]）
+            paged_block_start = pooling_block_start // block_size
+            paged_block_end = (
+                pooling_block_end + block_size - 1
+            ) // block_size  # exclusive
+            paged_block_indices = block_tables[b, paged_block_start:paged_block_end].to(
+                torch.long
+            )
 
-                # [num_paged_blocks, block_size, 1, D] -> [num_paged_blocks*block_size, D]
-                paged_blocks = kv_cache.index_select(0, paged_block_indices)
-                tokens = paged_blocks.reshape(-1, 1, D).reshape(-1, D)
+            # [num_paged_blocks, block_size, 1, D] -> [num_paged_blocks*block_size, D]
+            paged_blocks = kv_cache.index_select(0, paged_block_indices)
+            tokens = paged_blocks.reshape(-1, 1, D).reshape(-1, D)
 
-                # pooling_block_start 可能落在 paged block 中间，切片到准确的 token 范围
-                offset = pooling_block_start - paged_block_start * block_size  # == pooling_block_start % block_size
-                tokens = tokens[offset : offset + pooling_block_len]           # [pooling_block_len, D]
+            # pooling_block_start 可能落在 paged block 中间，切片到准确的 token 范围
+            offset = (
+                pooling_block_start - paged_block_start * block_size
+            )  # == pooling_block_start % block_size
+            tokens = tokens[
+                offset : offset + pooling_block_len
+            ]  # [pooling_block_len, D]
 
-                blocked_k[b, n] = tokens.mean(dim=0)
+            blocked_k[b, n] = tokens.mean(dim=0)
 
-        return blocked_k, num_pooling_blocks
+    return blocked_k, num_pooling_blocks
+
 
 @tilelang.jit(
     pass_configs={
@@ -1773,14 +2024,16 @@ def paged_mean_pooling(
     blocked_k_shape = [batch, max_num_pooling_blocks, dim]
 
     block_N = paged_block_size
-    assert pooling_block_size % block_N == 0, "For simplicity, we require pooling_block_size to be a multiple of paged_block_size"
+    assert (
+        pooling_block_size % block_N == 0
+    ), "For simplicity, we require pooling_block_size to be a multiple of paged_block_size"
 
     @T.prim_func
     def paged_mean_pooling_kernel(
-        KvCache: T.Tensor(kv_cache_shape, dtype), # type: ignore
-        BlockTables: T.Tensor(block_tables_shape, index_dtype), # type: ignore
-        ContextLens: T.Tensor(context_lens_shape, index_dtype), # type: ignore
-        BlockedK: T.Tensor(blocked_k_shape, accum_dtype), # type: ignore
+        KvCache: T.Tensor(kv_cache_shape, dtype),  # type: ignore
+        BlockTables: T.Tensor(block_tables_shape, index_dtype),  # type: ignore
+        ContextLens: T.Tensor(context_lens_shape, index_dtype),  # type: ignore
+        BlockedK: T.Tensor(blocked_k_shape, accum_dtype),  # type: ignore
     ):
         with T.Kernel(batch, max_num_pooling_blocks, threads=threads) as (bx, by):
             b = bx
@@ -1799,7 +2052,9 @@ def paged_mean_pooling(
                     T.fill(index_k_shared, 0.0)
 
                     if paged_block_s // paged_block_size < max_blocks:
-                        paged_block_phys_id = BlockTables[b, paged_block_s // paged_block_size]
+                        paged_block_phys_id = BlockTables[
+                            b, paged_block_s // paged_block_size
+                        ]
                         T.copy(KvCache[paged_block_phys_id, :, 0, :], index_k_shared)
 
                     for n_i, d_i in T.Parallel(block_N, dim):
@@ -1816,13 +2071,14 @@ def paged_mean_pooling(
 
     return paged_mean_pooling_kernel
 
+
 def paged_mean_pooling_interface(
-        max_num_pooling_blocks: int,
-        kv_cache: torch.Tensor,
-        context_lens: torch.Tensor,
-        block_tables: torch.Tensor,
-        k_block_size: int,
-    ):
+    max_num_pooling_blocks: int,
+    kv_cache: torch.Tensor,
+    context_lens: torch.Tensor,
+    block_tables: torch.Tensor,
+    k_block_size: int,
+):
     """
     Args:
         kv_cache: [num_blocks, block_size, 1, D]
@@ -1836,9 +2092,18 @@ def paged_mean_pooling_interface(
     batch, max_blocks = block_tables.shape
     assert head == 1, "Only support head=1 for now"
 
-    blocked_k = torch.empty((batch, max_num_pooling_blocks, dim), device=kv_cache.device, dtype=torch.float32)
+    blocked_k = torch.empty(
+        (batch, max_num_pooling_blocks, dim),
+        device=kv_cache.device,
+        dtype=torch.float32,
+    )
 
-    kernel = paged_mean_pooling(paged_block_size=paged_block_size, pooling_block_size=k_block_size, max_num_pooling_blocks=max_num_pooling_blocks, dim=dim)
+    kernel = paged_mean_pooling(
+        paged_block_size=paged_block_size,
+        pooling_block_size=k_block_size,
+        max_num_pooling_blocks=max_num_pooling_blocks,
+        dim=dim,
+    )
     kernel(
         kv_cache,
         block_tables,
@@ -1850,6 +2115,7 @@ def paged_mean_pooling_interface(
     num_pooling_blocks = (context_lens + k_block_size - 1) // k_block_size
     return blocked_k, num_pooling_blocks
 
+
 def fp8_hierarchy_paged_mqa_logits(
     q_fp8: torch.Tensor,
     kv_cache_fp8: torch.Tensor,
@@ -1859,7 +2125,7 @@ def fp8_hierarchy_paged_mqa_logits(
     schedule_metadata: torch.Tensor,
     max_model_len: int,
     max_seq_len: int,
-    k_block_size: int, 
+    k_block_size: int,
     block_topk: int,
 ) -> torch.Tensor:
     """Compute FP8 MQA logits using paged KV-cache.
@@ -1884,7 +2150,7 @@ def fp8_hierarchy_paged_mqa_logits(
         `torch.float32`.
     """
 
-    # TODO 
+    # TODO
     # 1. convert q, kv and weights to bf16
     # 2. call the paged version of tilelang kernels
 
@@ -1895,14 +2161,20 @@ def fp8_hierarchy_paged_mqa_logits(
     num_blocks, block_size, _, D_plus_4 = kv_cache_fp8.shape
     kv_cache = kv_cache_fp8.view(num_blocks, -1)
 
-    scale = kv_cache[:, block_size * dim:]  # [num_blocks]
-    kv_cache = kv_cache[:, :block_size * dim].view(fp8_dtype)      # [num_blocks, block_size * dim]
-    scale = scale.contiguous().view(torch.float32) 
+    scale = kv_cache[:, block_size * dim :]  # [num_blocks]
+    kv_cache = kv_cache[:, : block_size * dim].view(
+        fp8_dtype
+    )  # [num_blocks, block_size * dim]
+    scale = scale.contiguous().view(torch.float32)
 
-    kv_cache = kv_cache.view(num_blocks, block_size, 1, dim)  # [num_blocks, block_size, dim]
+    kv_cache = kv_cache.view(
+        num_blocks, block_size, 1, dim
+    )  # [num_blocks, block_size, dim]
     scale = scale.view(num_blocks, block_size)
 
-    kv_cache = kv_cache.float() * scale[:, :, None, None]  # [num_blocks, block_size, 1, D]
+    kv_cache = (
+        kv_cache.float() * scale[:, :, None, None]
+    )  # [num_blocks, block_size, 1, D]
     # TODO bfloat16 compute
     # kv_cache = kv_cache.to(torch.bfloat16)
     # scale = scale.to(torch.bfloat16)
@@ -1911,17 +2183,38 @@ def fp8_hierarchy_paged_mqa_logits(
     q = q.bfloat16()
     kv_cache = kv_cache.bfloat16()
     weights = weights.bfloat16()
-    
-    max_num_pooling_blocks = (max_seq_len + k_block_size - 1) // k_block_size
-    blocked_k, num_pooling_blocks = paged_mean_pooling_interface(max_num_pooling_blocks, kv_cache, context_lens, block_tables, k_block_size)  # [B, num_pooling_blocks, D], [B]
 
-    block_k_indexer_score = batch_pool_mqa_attn_return_logits_interface(q=q, blocked_kv=blocked_k, kv_block_size=k_block_size, weights=weights, context_lens=num_pooling_blocks)  # [B, next_n, num_pooling_blocks]
-    topk_block_indices = torch.topk(block_k_indexer_score, k=min(block_topk, block_k_indexer_score.shape[-1]), dim=-1).indices  # [B, next_n, topk]
+    max_num_pooling_blocks = (max_seq_len + k_block_size - 1) // k_block_size
+    blocked_k, num_pooling_blocks = paged_mean_pooling_interface(
+        max_num_pooling_blocks, kv_cache, context_lens, block_tables, k_block_size
+    )  # [B, num_pooling_blocks, D], [B]
+
+    block_k_indexer_score = batch_pool_mqa_attn_return_logits_interface(
+        q=q,
+        blocked_kv=blocked_k,
+        kv_block_size=k_block_size,
+        weights=weights,
+        context_lens=num_pooling_blocks,
+    )  # [B, next_n, num_pooling_blocks]
+    topk_block_indices = torch.topk(
+        block_k_indexer_score,
+        k=min(block_topk, block_k_indexer_score.shape[-1]),
+        dim=-1,
+    ).indices  # [B, next_n, topk]
     topk_block_indices = topk_block_indices.to(torch.int32)
 
-    block_sparse_k_indexer_score = paged_block_sparse_mqa_attn_return_logits_interface(q=q, kv_cache=kv_cache, topk_block_index=topk_block_indices, kv_block_size=k_block_size, weights=weights, context_lens=context_lens, block_tables=block_tables)  # [B, next_n, topk*kv_block_size]
+    block_sparse_k_indexer_score = paged_block_sparse_mqa_attn_return_logits_interface(
+        q=q,
+        kv_cache=kv_cache,
+        topk_block_index=topk_block_indices,
+        kv_block_size=k_block_size,
+        weights=weights,
+        context_lens=context_lens,
+        block_tables=block_tables,
+    )  # [B, next_n, topk*kv_block_size]
 
     return block_sparse_k_indexer_score, topk_block_indices
+
 
 def fp8_mqa_logits_torch(
     q: torch.Tensor,
@@ -1954,7 +2247,7 @@ def fp8_mqa_logits_torch(
 
     if scale.ndim == 2:
         assert scale.shape[-1] == 1
-        scale = scale.squeeze(-1)   # [N]
+        scale = scale.squeeze(-1)  # [N]
 
     mask_lo = (
         torch.arange(0, seq_len_kv, device="cuda")[None, :] >= cu_seqlen_ks[:, None]
@@ -1969,6 +2262,7 @@ def fp8_mqa_logits_torch(
     logits = logits.masked_fill(~mask, float("-inf"))
 
     return logits
+
 
 def fp8_paged_mqa_logits_torch(
     q: torch.Tensor,
@@ -2007,15 +2301,20 @@ def fp8_paged_mqa_logits_torch(
     # kv_cache, scale = kv_cache[..., :dim], kv_cache[..., dim:]
     num_blocks, block_size, _, _ = kv_cache.size()
     kv_cache = kv_cache.view(num_blocks, -1)
-    
-    
-    scale = kv_cache[:, block_size * dim:] # [num_blocks, block_size]
-    kv_cache = kv_cache[:, :block_size * dim].view(fp8_dtype) # [num_blocks, block_size*dim]
 
-    kv_cache = kv_cache.view(num_blocks, block_size, 1, dim)  # [num_blocks, block_size, dim]
+    scale = kv_cache[:, block_size * dim :]  # [num_blocks, block_size]
+    kv_cache = kv_cache[:, : block_size * dim].view(
+        fp8_dtype
+    )  # [num_blocks, block_size*dim]
+
+    kv_cache = kv_cache.view(
+        num_blocks, block_size, 1, dim
+    )  # [num_blocks, block_size, dim]
     scale = scale.contiguous().view(torch.float32)  # [num_blocks, block_size]
 
-    kv_cache = kv_cache.float() * scale[:, :, None, None]  # [num_blocks, block_size, 1, dim]
+    kv_cache = (
+        kv_cache.float() * scale[:, :, None, None]
+    )  # [num_blocks, block_size, 1, dim]
 
     q = q.float()
     # scale = scale.contiguous().view(torch.float32)
@@ -2057,6 +2356,7 @@ def fp8_paged_mqa_logits_torch(
             ] = torch.where(k_offsets[None, :] <= q_offsets[:, None], s, float("-inf"))
     return logits
 
+
 @tilelang.jit(
     pass_configs={
         tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True,
@@ -2091,16 +2391,18 @@ def fp8_native_paged_mean_pooling(
     FP8_MAX_INV = 1.0 / 448.0
 
     block_N = paged_block_size
-    assert pooling_block_size % block_N == 0, f"For simplicity, we require pooling_block_size {pooling_block_size} to be a multiple of paged_block_size {block_N}"
+    assert (
+        pooling_block_size % block_N == 0
+    ), f"For simplicity, we require pooling_block_size {pooling_block_size} to be a multiple of paged_block_size {block_N}"
 
     @T.prim_func
     def fp8_native_paged_mean_pooling_kernel(
-        KvCacheFP8View: T.Tensor(kv_cache_fp8_shape, dtype), # type: ignore
-        KvCacheFP32View: T.Tensor(kv_cache_fp32_shape, accum_dtype), # type: ignore
-        BlockTables: T.Tensor(block_tables_shape, index_dtype), # type: ignore
-        ContextLens: T.Tensor(context_lens_shape, index_dtype), # type: ignore
-        BlockedK: T.Tensor(blocked_k_shape, dtype), # type: ignore
-        BlockedKScale: T.Tensor(blocked_k_scale_shape, accum_dtype), # type: ignore
+        KvCacheFP8View: T.Tensor(kv_cache_fp8_shape, dtype),  # type: ignore
+        KvCacheFP32View: T.Tensor(kv_cache_fp32_shape, accum_dtype),  # type: ignore
+        BlockTables: T.Tensor(block_tables_shape, index_dtype),  # type: ignore
+        ContextLens: T.Tensor(context_lens_shape, index_dtype),  # type: ignore
+        BlockedK: T.Tensor(blocked_k_shape, dtype),  # type: ignore
+        BlockedKScale: T.Tensor(blocked_k_scale_shape, accum_dtype),  # type: ignore
     ):
         with T.Kernel(batch, max_num_pooling_blocks, threads=threads) as (bx, by):
             b = bx
@@ -2122,25 +2424,41 @@ def fp8_native_paged_mean_pooling(
                     T.fill(index_k_shared, 0.0)
 
                     if paged_block_s // paged_block_size < max_blocks:
-                        paged_block_phys_id = BlockTables[b, paged_block_s // paged_block_size]
-                        T.copy(KvCacheFP8View[paged_block_phys_id, :fp8_end], index_k_shared)
-                        T.copy(KvCacheFP32View[paged_block_phys_id, scale_offset:], scale_shared)
+                        paged_block_phys_id = BlockTables[
+                            b, paged_block_s // paged_block_size
+                        ]
+                        T.copy(
+                            KvCacheFP8View[paged_block_phys_id, :fp8_end],
+                            index_k_shared,
+                        )
+                        T.copy(
+                            KvCacheFP32View[paged_block_phys_id, scale_offset:],
+                            scale_shared,
+                        )
 
                     for n_i, d_i in T.Parallel(block_N, dim):
                         tl_block_idx = paged_block_s + n_i
-                        index_k_reshaped[n_i, d_i] = T.cast(index_k_reshaped[n_i, d_i], accum_dtype) * scale_shared[n_i]
+                        index_k_reshaped[n_i, d_i] = (
+                            T.cast(index_k_reshaped[n_i, d_i], accum_dtype)
+                            * scale_shared[n_i]
+                        )
                         if tl_block_idx >= k_end:
                             index_k_reshaped[n_i, d_i] = T.cast(0, accum_dtype)
 
                     T.reduce_sum(index_k_reshaped, acc, dim=0, clear=False)
 
-                inv_count = T.cast(1.0, accum_dtype) / T.cast(cur_pooling_block_size, accum_dtype)
+                inv_count = T.cast(1.0, accum_dtype) / T.cast(
+                    cur_pooling_block_size, accum_dtype
+                )
                 for d_i in T.Parallel(dim):
                     acc[d_i] = acc[d_i] * inv_count
 
             # Re-quantize f32 mean to fp8 with per-block scale.
             T.reduce_absmax(acc, max_abs, dim=0, clear=True)
-            block_scale = T.max(max_abs[0] * T.cast(FP8_MAX_INV, accum_dtype), T.cast(1e-10, accum_dtype))
+            block_scale = T.max(
+                max_abs[0] * T.cast(FP8_MAX_INV, accum_dtype),
+                T.cast(1e-10, accum_dtype),
+            )
             inv_block_scale = T.cast(1.0, accum_dtype) / block_scale
             for d_i in T.Parallel(dim):
                 BlockedK[b, by, d_i] = T.cast(acc[d_i] * inv_block_scale, dtype)
@@ -2148,13 +2466,14 @@ def fp8_native_paged_mean_pooling(
 
     return fp8_native_paged_mean_pooling_kernel
 
+
 def fp8_native_paged_mean_pooling_interface(
-        max_num_pooling_blocks: int,
-        kv_cache: torch.Tensor,
-        context_lens: torch.Tensor,
-        block_tables: torch.Tensor,
-        k_block_size: int,
-    ):
+    max_num_pooling_blocks: int,
+    kv_cache: torch.Tensor,
+    context_lens: torch.Tensor,
+    block_tables: torch.Tensor,
+    k_block_size: int,
+):
     """Returns (blocked_k fp8, blocked_k_scale f32, num_pooling_blocks)."""
     num_blocks, paged_block_size, head, DPlus4 = kv_cache.shape
     batch, max_blocks = block_tables.shape
@@ -2163,10 +2482,21 @@ def fp8_native_paged_mean_pooling_interface(
     dim = DPlus4 - 4
     kv_cache = kv_cache.view(num_blocks, paged_block_size * (dim + 4))
 
-    blocked_k = torch.empty((batch, max_num_pooling_blocks, dim), device=kv_cache.device, dtype=torch.float8_e4m3fn)
-    blocked_k_scale = torch.empty((batch, max_num_pooling_blocks), device=kv_cache.device, dtype=torch.float32)
+    blocked_k = torch.empty(
+        (batch, max_num_pooling_blocks, dim),
+        device=kv_cache.device,
+        dtype=torch.float8_e4m3fn,
+    )
+    blocked_k_scale = torch.empty(
+        (batch, max_num_pooling_blocks), device=kv_cache.device, dtype=torch.float32
+    )
 
-    kernel = fp8_native_paged_mean_pooling(paged_block_size=paged_block_size, pooling_block_size=k_block_size, max_num_pooling_blocks=max_num_pooling_blocks, dim=dim)
+    kernel = fp8_native_paged_mean_pooling(
+        paged_block_size=paged_block_size,
+        pooling_block_size=k_block_size,
+        max_num_pooling_blocks=max_num_pooling_blocks,
+        dim=dim,
+    )
     kernel(
         kv_cache.view(torch.float8_e4m3fn),
         kv_cache.view(torch.float32),
@@ -2225,9 +2555,9 @@ def fp8_native_paged_mean_pooling_tail_only_legacy(
     FP8_MAX_INV = 1.0 / 448.0
 
     block_N = paged_block_size
-    assert pooling_block_size % block_N == 0, (
-        "For simplicity, we require pooling_block_size to be a multiple of paged_block_size"
-    )
+    assert (
+        pooling_block_size % block_N == 0
+    ), "For simplicity, we require pooling_block_size to be a multiple of paged_block_size"
 
     @T.prim_func
     def fp8_native_paged_mean_pooling_tail_only_kernel(
@@ -2262,39 +2592,57 @@ def fp8_native_paged_mean_pooling_tail_only_legacy(
                         T.fill(index_k_shared, 0.0)
 
                         if paged_block_s // paged_block_size < max_blocks:
-                            paged_block_phys_id = BlockTables[b, paged_block_s // paged_block_size]
-                            T.copy(KvCacheFP8View[paged_block_phys_id, :fp8_end], index_k_shared)
-                            T.copy(KvCacheFP32View[paged_block_phys_id, scale_offset:], scale_shared)
+                            paged_block_phys_id = BlockTables[
+                                b, paged_block_s // paged_block_size
+                            ]
+                            T.copy(
+                                KvCacheFP8View[paged_block_phys_id, :fp8_end],
+                                index_k_shared,
+                            )
+                            T.copy(
+                                KvCacheFP32View[paged_block_phys_id, scale_offset:],
+                                scale_shared,
+                            )
 
                         for n_i, d_i in T.Parallel(block_N, dim):
                             tl_block_idx = paged_block_s + n_i
-                            index_k_reshaped[n_i, d_i] = T.cast(index_k_reshaped[n_i, d_i], accum_dtype) * scale_shared[n_i]
+                            index_k_reshaped[n_i, d_i] = (
+                                T.cast(index_k_reshaped[n_i, d_i], accum_dtype)
+                                * scale_shared[n_i]
+                            )
                             if tl_block_idx >= k_end:
                                 index_k_reshaped[n_i, d_i] = T.cast(0, accum_dtype)
 
                         T.reduce_sum(index_k_reshaped, acc, dim=0, clear=False)
 
-                    inv_count = T.cast(1.0, accum_dtype) / T.cast(cur_pooling_block_size, accum_dtype)
+                    inv_count = T.cast(1.0, accum_dtype) / T.cast(
+                        cur_pooling_block_size, accum_dtype
+                    )
                     for d_i in T.Parallel(dim):
                         acc[d_i] = acc[d_i] * inv_count
 
                 # Re-quantize the tail's f32 mean to fp8 with a per-block scale.
                 T.reduce_absmax(acc, max_abs, dim=0, clear=True)
-                block_scale = T.max(max_abs[0] * T.cast(FP8_MAX_INV, accum_dtype), T.cast(1e-10, accum_dtype))
+                block_scale = T.max(
+                    max_abs[0] * T.cast(FP8_MAX_INV, accum_dtype),
+                    T.cast(1e-10, accum_dtype),
+                )
                 inv_block_scale = T.cast(1.0, accum_dtype) / block_scale
                 for d_i in T.Parallel(dim):
-                    BlockedK[b, tail_idx, d_i] = T.cast(acc[d_i] * inv_block_scale, dtype)
+                    BlockedK[b, tail_idx, d_i] = T.cast(
+                        acc[d_i] * inv_block_scale, dtype
+                    )
                 BlockedKScale[b, tail_idx] = block_scale
 
     return fp8_native_paged_mean_pooling_tail_only_kernel
 
 
 def fp8_native_paged_mean_pooling_tail_only_legacy_interface(
-    blocked_k: torch.Tensor,           # [B, max_num_pooling_blocks, D]  fp8   IN-OUT
-    blocked_k_scale: torch.Tensor,     # [B, max_num_pooling_blocks]     f32   IN-OUT
-    kv_cache: torch.Tensor,            # [num_blocks, paged_block_size, 1, D+4]
-    context_lens: torch.Tensor,        # [B] int32
-    block_tables: torch.Tensor,        # [B, max_blocks] int32
+    blocked_k: torch.Tensor,  # [B, max_num_pooling_blocks, D]  fp8   IN-OUT
+    blocked_k_scale: torch.Tensor,  # [B, max_num_pooling_blocks]     f32   IN-OUT
+    kv_cache: torch.Tensor,  # [num_blocks, paged_block_size, 1, D+4]
+    context_lens: torch.Tensor,  # [B] int32
+    block_tables: torch.Tensor,  # [B, max_blocks] int32
     k_block_size: int,
 ):
     """Simulates a cache-based decode: caller has already populated all
@@ -2305,7 +2653,9 @@ def fp8_native_paged_mean_pooling_tail_only_legacy_interface(
     num_blocks, paged_block_size, head, DPlus4 = kv_cache.shape
     assert head == 1, "Only support head=1 for now"
     batch, max_num_pooling_blocks, dim = blocked_k.shape
-    assert dim == DPlus4 - 4, f"dim mismatch: blocked_k.dim={dim} vs DPlus4-4={DPlus4 - 4}"
+    assert (
+        dim == DPlus4 - 4
+    ), f"dim mismatch: blocked_k.dim={dim} vs DPlus4-4={DPlus4 - 4}"
     assert blocked_k_scale.shape == (batch, max_num_pooling_blocks)
 
     kv_cache_flat = kv_cache.view(num_blocks, paged_block_size * (dim + 4))
@@ -2390,18 +2740,18 @@ def fp8_native_paged_mean_pooling_tail_only(
     FP8_MAX_INV = 1.0 / 448.0
 
     block_N = paged_block_size  # 64
-    assert pooling_block_size % block_N == 0, (
-        "pooling_block_size must be a multiple of paged_block_size"
-    )
+    assert (
+        pooling_block_size % block_N == 0
+    ), "pooling_block_size must be a multiple of paged_block_size"
 
     @T.prim_func
     def kernel(
-        KvCacheFP8View: T.Tensor(kv_cache_fp8_shape, fp8_dtype),             # type: ignore
-        KvCacheFP32View: T.Tensor(kv_cache_fp32_shape, accum_dtype),         # type: ignore
-        BlockTables: T.Tensor(block_tables_shape, index_dtype),              # type: ignore
-        ContextLens: T.Tensor(context_lens_shape, index_dtype),              # type: ignore
-        PoolPageTables: T.Tensor(pool_page_tables_shape, index_dtype),       # type: ignore
-        PoolKPagesFP8View: T.Tensor(pool_k_pages_fp8_shape, fp8_dtype),      # type: ignore
+        KvCacheFP8View: T.Tensor(kv_cache_fp8_shape, fp8_dtype),  # type: ignore
+        KvCacheFP32View: T.Tensor(kv_cache_fp32_shape, accum_dtype),  # type: ignore
+        BlockTables: T.Tensor(block_tables_shape, index_dtype),  # type: ignore
+        ContextLens: T.Tensor(context_lens_shape, index_dtype),  # type: ignore
+        PoolPageTables: T.Tensor(pool_page_tables_shape, index_dtype),  # type: ignore
+        PoolKPagesFP8View: T.Tensor(pool_k_pages_fp8_shape, fp8_dtype),  # type: ignore
         PoolKPagesFP32View: T.Tensor(pool_k_pages_fp32_shape, accum_dtype),  # type: ignore
     ):
         with T.Kernel(batch, threads=threads) as bx:
@@ -2427,19 +2777,32 @@ def fp8_native_paged_mean_pooling_tail_only(
                         T.fill(index_k_shared, 0.0)
 
                         if paged_block_s // paged_block_size < max_blocks:
-                            paged_block_phys_id = BlockTables[b, paged_block_s // paged_block_size]
-                            T.copy(KvCacheFP8View[paged_block_phys_id, :fp8_end], index_k_shared)
-                            T.copy(KvCacheFP32View[paged_block_phys_id, scale_offset:], scale_shared)
+                            paged_block_phys_id = BlockTables[
+                                b, paged_block_s // paged_block_size
+                            ]
+                            T.copy(
+                                KvCacheFP8View[paged_block_phys_id, :fp8_end],
+                                index_k_shared,
+                            )
+                            T.copy(
+                                KvCacheFP32View[paged_block_phys_id, scale_offset:],
+                                scale_shared,
+                            )
 
                         for n_i, d_i in T.Parallel(block_N, dim):
                             tl_block_idx = paged_block_s + n_i
-                            index_k_reshaped[n_i, d_i] = T.cast(index_k_reshaped[n_i, d_i], accum_dtype) * scale_shared[n_i]
+                            index_k_reshaped[n_i, d_i] = (
+                                T.cast(index_k_reshaped[n_i, d_i], accum_dtype)
+                                * scale_shared[n_i]
+                            )
                             if tl_block_idx >= k_end:
                                 index_k_reshaped[n_i, d_i] = T.cast(0, accum_dtype)
 
                         T.reduce_sum(index_k_reshaped, acc, dim=0, clear=False)
 
-                    inv_count = T.cast(1.0, accum_dtype) / T.cast(cur_pooling_block_size, accum_dtype)
+                    inv_count = T.cast(1.0, accum_dtype) / T.cast(
+                        cur_pooling_block_size, accum_dtype
+                    )
                     for d_i in T.Parallel(dim):
                         acc[d_i] = acc[d_i] * inv_count
 
@@ -2455,7 +2818,9 @@ def fp8_native_paged_mean_pooling_tail_only(
                 #   fp8 row `slot` occupies bytes [slot * dim, (slot + 1) * dim)
                 #   f32 scale for row `slot` at f32 index (pool_page_size * dim) // 4 + slot
                 logical_page = tail_pblk // pool_page_size
-                slot = tail_pblk - logical_page * pool_page_size  # == tail_pblk % pool_page_size
+                slot = (
+                    tail_pblk - logical_page * pool_page_size
+                )  # == tail_pblk % pool_page_size
                 phys = PoolPageTables[b, logical_page]
                 fp8_row_off = slot * dim
                 scale_f32_idx = pool_page_size * dim // 4 + slot
@@ -2469,11 +2834,11 @@ def fp8_native_paged_mean_pooling_tail_only(
 
 
 def fp8_native_paged_mean_pooling_tail_only_interface(
-    kv_cache: torch.Tensor,              # [num_blocks, paged_block_size, 1, D+4] uint8
-    context_lens: torch.Tensor,          # [B] int32
-    block_tables: torch.Tensor,          # [B, max_blocks] int32
-    pool_page_tables: torch.Tensor,      # [B, max_pool_pages] int32
-    pool_k_pages: torch.Tensor,          # [N_pool_pages, pool_page_size * (D+4)] uint8 IN-OUT
+    kv_cache: torch.Tensor,  # [num_blocks, paged_block_size, 1, D+4] uint8
+    context_lens: torch.Tensor,  # [B] int32
+    block_tables: torch.Tensor,  # [B, max_blocks] int32
+    pool_page_tables: torch.Tensor,  # [B, max_pool_pages] int32
+    pool_k_pages: torch.Tensor,  # [N_pool_pages, pool_page_size * (D+4)] uint8 IN-OUT
     k_block_size: int,
     pool_page_size: int,
 ):
@@ -2498,10 +2863,6 @@ def fp8_native_paged_mean_pooling_tail_only_interface(
         pool_k_pages.view(torch.float8_e4m3fn),
         pool_k_pages.view(torch.float32),
     )
-
-
-
-
 
 
 @tilelang.jit(
@@ -2540,7 +2901,10 @@ def batch_decode_pool_mqa_attn_return_logits_fp8(
 
     q_shape = [batch, heads, index_dim]
     pool_k_pages_fp8_shape = [num_pool_pages_global, pool_page_size * (index_dim + 4)]
-    pool_k_pages_fp32_shape = [num_pool_pages_global, pool_page_size * (index_dim + 4) // 4]
+    pool_k_pages_fp32_shape = [
+        num_pool_pages_global,
+        pool_page_size * (index_dim + 4) // 4,
+    ]
     pool_page_tables_shape = [batch, max_pool_pages]
     logits_shape = [batch, max_pool_pages * pool_page_size]
     w_shape = [batch, heads]
@@ -2553,13 +2917,13 @@ def batch_decode_pool_mqa_attn_return_logits_fp8(
 
     @T.prim_func
     def kernel(
-        Q: T.Tensor(q_shape, fp8_dtype),                                    # type: ignore
-        PoolKPagesFP8View: T.Tensor(pool_k_pages_fp8_shape, fp8_dtype),     # type: ignore
-        PoolKPagesFP32View: T.Tensor(pool_k_pages_fp32_shape, accum_dtype), # type: ignore
-        PoolPageTables: T.Tensor(pool_page_tables_shape, index_dtype),      # type: ignore
-        Logits: T.Tensor(logits_shape, accum_dtype),                        # type: ignore
-        Weights: T.Tensor(w_shape, accum_dtype),                            # type: ignore
-        ContextLensPool: T.Tensor([batch], index_dtype),                    # type: ignore
+        Q: T.Tensor(q_shape, fp8_dtype),  # type: ignore
+        PoolKPagesFP8View: T.Tensor(pool_k_pages_fp8_shape, fp8_dtype),  # type: ignore
+        PoolKPagesFP32View: T.Tensor(pool_k_pages_fp32_shape, accum_dtype),  # type: ignore
+        PoolPageTables: T.Tensor(pool_page_tables_shape, index_dtype),  # type: ignore
+        Logits: T.Tensor(logits_shape, accum_dtype),  # type: ignore
+        Weights: T.Tensor(w_shape, accum_dtype),  # type: ignore
+        ContextLensPool: T.Tensor([batch], index_dtype),  # type: ignore
     ):
         with T.Kernel(batch, 1, threads=threads) as (bx, by):
             k_shared = T.alloc_shared([block_N * index_dim], fp8_dtype)
@@ -2594,7 +2958,9 @@ def batch_decode_pool_mqa_attn_return_logits_fp8(
                 )
 
                 for kn_i, hn_i in T.Parallel(block_N, block_H_pad):
-                    s[kn_i, hn_i] = T.max(s[kn_i, hn_i] * k_scale_shared[kn_i], 0) * w[hn_i]
+                    s[kn_i, hn_i] = (
+                        T.max(s[kn_i, hn_i] * k_scale_shared[kn_i], 0) * w[hn_i]
+                    )
 
                 T.reduce_sum(s, logits_accum, dim=1, clear=True)
 
@@ -2612,11 +2978,11 @@ def batch_decode_pool_mqa_attn_return_logits_fp8(
 
 
 def batch_pool_mqa_attn_return_logits_fp8_interface(
-    q_fp8: torch.Tensor,                 # [B, 1, H, D] fp8
-    pool_k_pages: torch.Tensor,          # [N_pool_pages, pool_page_size * (D+4)] uint8
-    pool_page_tables: torch.Tensor,      # [B, max_pool_pages] int32
-    weights_f32: torch.Tensor,           # [B, H] f32 (or [B*1, H])
-    context_lens_pool: torch.Tensor,     # [B] int32 — num pool blocks per req
+    q_fp8: torch.Tensor,  # [B, 1, H, D] fp8
+    pool_k_pages: torch.Tensor,  # [N_pool_pages, pool_page_size * (D+4)] uint8
+    pool_page_tables: torch.Tensor,  # [B, max_pool_pages] int32
+    weights_f32: torch.Tensor,  # [B, H] f32 (or [B*1, H])
+    context_lens_pool: torch.Tensor,  # [B] int32 — num pool blocks per req
     *,
     pool_page_size: int = 64,
 ):
@@ -2632,35 +2998,45 @@ def batch_pool_mqa_attn_return_logits_fp8_interface(
         f"pool_page_size * (D + 4) = {pool_page_size * (D + 4)}"
     )
 
-    q_2d = q_fp8.squeeze(1)                  # [B, H, D] fp8
-    w_2d = weights_f32.view(B, H)            # [B, H] f32
+    q_2d = q_fp8.squeeze(1)  # [B, H, D] fp8
+    w_2d = weights_f32.view(B, H)  # [B, H] f32
 
     pool_k_fp8_view = pool_k_pages.view(torch.float8_e4m3fn)
     pool_k_f32_view = pool_k_pages.view(torch.float32)
 
     logits = torch.empty(
-        (B, max_pool_pages * pool_page_size), device=q_fp8.device, dtype=torch.float32,
+        (B, max_pool_pages * pool_page_size),
+        device=q_fp8.device,
+        dtype=torch.float32,
     )
     kernel = batch_decode_pool_mqa_attn_return_logits_fp8(
-        heads=H, index_dim=D, pool_page_size=pool_page_size, block_H=H,
+        heads=H,
+        index_dim=D,
+        pool_page_size=pool_page_size,
+        block_H=H,
     )
     assert context_lens_pool.dtype == torch.int32
     assert pool_page_tables.dtype == torch.int32
     kernel(
-        q_2d, pool_k_fp8_view, pool_k_f32_view,
-        pool_page_tables, logits, w_2d, context_lens_pool,
+        q_2d,
+        pool_k_fp8_view,
+        pool_k_f32_view,
+        pool_page_tables,
+        logits,
+        w_2d,
+        context_lens_pool,
     )
     return logits.unsqueeze(1)  # [B, 1, max_pool_pages * pool_page_size]
 
 
 def fp8_native_hierarchy_paged_mqa_logits_tilelang_with_pool_cache(
-    q_fp8: torch.Tensor,                # [B, 1, H, D] fp8
-    kv_cache_fp8: torch.Tensor,         # [num_blocks, paged_block_size, 1, D+4] uint8
-    pool_k_pages: torch.Tensor,         # [N_pool_pages, pool_page_size, D+4] uint8 (cached)
-    pool_page_tables: torch.Tensor,     # [B, max_pool_pages] int32
-    weights: torch.Tensor,              # [B*1, H] f32
-    context_lens: torch.Tensor,         # [B] int32 — raw seq_len per request
-    block_tables: torch.Tensor,         # [B, max_kv_blocks] int32
+    q_fp8: torch.Tensor,  # [B, 1, H, D] fp8
+    kv_cache_fp8: torch.Tensor,  # [num_blocks, paged_block_size, 1, D+4] uint8
+    pool_k_pages: torch.Tensor,  # [N_pool_pages, pool_page_size, D+4] uint8 (cached)
+    pool_page_tables: torch.Tensor,  # [B, max_pool_pages] int32
+    weights: torch.Tensor,  # [B*1, H] f32
+    context_lens: torch.Tensor,  # [B] int32 — raw seq_len per request
+    block_tables: torch.Tensor,  # [B, max_kv_blocks] int32
     k_block_size: int,
     pool_page_size: int,
     block_topk: int,
@@ -2673,7 +3049,8 @@ def fp8_native_hierarchy_paged_mqa_logits_tilelang_with_pool_cache(
     """
     # 1) Refresh tail pool block in place.
     fp8_native_paged_mean_pooling_tail_only_interface(
-        kv_cache=kv_cache_fp8, context_lens=context_lens,
+        kv_cache=kv_cache_fp8,
+        context_lens=context_lens,
         block_tables=block_tables,
         pool_page_tables=pool_page_tables,
         pool_k_pages=pool_k_pages,
@@ -2696,14 +3073,21 @@ def fp8_native_hierarchy_paged_mqa_logits_tilelang_with_pool_cache(
     topk_block_indices = torch.topk(
         block_k_indexer_score,
         k=min(block_topk, block_k_indexer_score.shape[-1]),
-        dim=-1, sorted=False,
+        dim=-1,
+        sorted=False,
     ).indices
 
     # 4) Sparse paged MQA on the selected blocks (identical to v1 / v2b).
-    block_sparse_k_indexer_score = fp8_native_paged_block_sparse_mqa_attn_return_logits_interface(
-        q_fp8=q_fp8, kv_cache_fp8=kv_cache_fp8,
-        topk_block_index=topk_block_indices, kv_block_size=k_block_size,
-        weights=weights, context_lens=context_lens, block_tables=block_tables,
+    block_sparse_k_indexer_score = (
+        fp8_native_paged_block_sparse_mqa_attn_return_logits_interface(
+            q_fp8=q_fp8,
+            kv_cache_fp8=kv_cache_fp8,
+            topk_block_index=topk_block_indices,
+            kv_block_size=k_block_size,
+            weights=weights,
+            context_lens=context_lens,
+            block_tables=block_tables,
+        )
     )
     return block_sparse_k_indexer_score, topk_block_indices
 
@@ -2753,9 +3137,15 @@ def fp8_native_paged_block_sparse_mqa_attn_return_logits(
     H_per_block = heads
     block_N = paged_block_size
     assert block_N > 0, "block_N must be positive"
-    assert kv_block_size >= block_N and kv_block_size % block_N == 0, "block_N must divide kv_block_size"
-    assert paged_block_size >= block_N and paged_block_size % block_N == 0, "block_N must divide paged_block_size"
-    assert paged_block_size == block_N, "for simplicity we require paged_block_size == block_N in this kernel"
+    assert (
+        kv_block_size >= block_N and kv_block_size % block_N == 0
+    ), "block_N must divide kv_block_size"
+    assert (
+        paged_block_size >= block_N and paged_block_size % block_N == 0
+    ), "block_N must divide paged_block_size"
+    assert (
+        paged_block_size == block_N
+    ), "for simplicity we require paged_block_size == block_N in this kernel"
 
     @T.prim_func
     def fp8_native_paged_block_sparse_mqa_attn_return_logits_kernel(
@@ -2805,14 +3195,23 @@ def fp8_native_paged_block_sparse_mqa_attn_return_logits(
                 for b_i in T.Pipelined(kv_block_size // block_N, num_stages=num_stages):
                     block_s_i = block_s + b_i * block_N
 
-                    if block_s_i // paged_block_size >= 0 and block_s_i // paged_block_size < max_blocks:
+                    if (
+                        block_s_i // paged_block_size >= 0
+                        and block_s_i // paged_block_size < max_blocks
+                    ):
                         phys = BlockTables[b, block_s_i // paged_block_size]
                         # disable_tma forces vectorized LDG (TMA needs same-dtype
                         # 2D layout that's incompatible with this 1D K slice).
-                        T.copy(KvCacheFP8View[phys, :fp8_end], index_k_shared, disable_tma=True)
+                        T.copy(
+                            KvCacheFP8View[phys, :fp8_end],
+                            index_k_shared,
+                            disable_tma=True,
+                        )
                         # 1D scale load via T.Parallel (TMA 1D alignment unsafe).
                         for bn_i in T.Parallel(block_N):
-                            index_k_scale_shared[bn_i] = KvCacheFP32View[phys, scale_offset + bn_i]
+                            index_k_scale_shared[bn_i] = KvCacheFP32View[
+                                phys, scale_offset + bn_i
+                            ]
 
                     # fp8 × fp8 → f32 GEMM; K scale applied post-GEMM.
                     T.gemm(
@@ -2824,19 +3223,35 @@ def fp8_native_paged_block_sparse_mqa_attn_return_logits(
                         policy=T.GemmWarpPolicy.FullRow,
                     )
 
-                    for bn_i, bq_i, h_i in T.Parallel(block_N, H_per_block // heads, heads):
-                        s_reshaped[bn_i, bq_i, h_i] = (T.max(s_reshaped[bn_i, bq_i, h_i] * index_k_scale_shared[bn_i], 0) * weights[bq_i, h_i])
+                    for bn_i, bq_i, h_i in T.Parallel(
+                        block_N, H_per_block // heads, heads
+                    ):
+                        s_reshaped[bn_i, bq_i, h_i] = (
+                            T.max(
+                                s_reshaped[bn_i, bq_i, h_i]
+                                * index_k_scale_shared[bn_i],
+                                0,
+                            )
+                            * weights[bq_i, h_i]
+                        )
 
                     T.reduce_sum(s_reshaped, logits, dim=-1, clear=True)
 
                     for i_i in T.Parallel(block_N):
                         k_i = block_s_i + i_i
                         p = k_i // paged_block_size
-                        if (k_i < cu_k_s_min) or (k_i >= cu_k_e_max) or (p < 0) or (p >= max_blocks):
+                        if (
+                            (k_i < cu_k_s_min)
+                            or (k_i >= cu_k_e_max)
+                            or (p < 0)
+                            or (p >= max_blocks)
+                        ):
                             logits[i_i, 0] = -T.infinity(accum_dtype)
 
                     for bn_i in T.Parallel(block_N):
-                        Logits[b, seq_len_i, n_i * kv_block_size + b_i * block_N + bn_i] = logits[bn_i, 0]
+                        Logits[
+                            b, seq_len_i, n_i * kv_block_size + b_i * block_N + bn_i
+                        ] = logits[bn_i, 0]
 
     @T.prim_func
     def fp8_native_paged_block_sparse_mqa_attn_return_logits_kernel_for_small_pooling_size(
@@ -2881,11 +3296,18 @@ def fp8_native_paged_block_sparse_mqa_attn_return_logits(
                 topk_block_id = T.cast(TopKBlockIndex[b, seq_len_i, n_i], index_dtype)
                 block_s_i = topk_block_id * kv_block_size
 
-                if block_s_i // paged_block_size >= 0 and block_s_i // paged_block_size < max_blocks:
+                if (
+                    block_s_i // paged_block_size >= 0
+                    and block_s_i // paged_block_size < max_blocks
+                ):
                     phys = BlockTables[b, block_s_i // paged_block_size]
-                    T.copy(KvCacheFP8View[phys, :fp8_end], index_k_shared, disable_tma=True)
+                    T.copy(
+                        KvCacheFP8View[phys, :fp8_end], index_k_shared, disable_tma=True
+                    )
                     for bn_i in T.Parallel(block_N):
-                        index_k_scale_shared[bn_i] = KvCacheFP32View[phys, scale_offset + bn_i]
+                        index_k_scale_shared[bn_i] = KvCacheFP32View[
+                            phys, scale_offset + bn_i
+                        ]
 
                 T.gemm(
                     index_k_reshaped,
@@ -2897,14 +3319,24 @@ def fp8_native_paged_block_sparse_mqa_attn_return_logits(
                 )
 
                 for bn_i, bq_i, h_i in T.Parallel(block_N, H_per_block // heads, heads):
-                    s_reshaped[bn_i, bq_i, h_i] = (T.max(s_reshaped[bn_i, bq_i, h_i] * index_k_scale_shared[bn_i], 0) * weights[bq_i, h_i])
+                    s_reshaped[bn_i, bq_i, h_i] = (
+                        T.max(
+                            s_reshaped[bn_i, bq_i, h_i] * index_k_scale_shared[bn_i], 0
+                        )
+                        * weights[bq_i, h_i]
+                    )
 
                 T.reduce_sum(s_reshaped, logits, dim=-1, clear=True)
 
                 for i_i in T.Parallel(block_N):
                     k_i = block_s_i + i_i
                     p = k_i // paged_block_size
-                    if (k_i < cu_k_s_min) or (k_i >= cu_k_e_max) or (p < 0) or (p >= max_blocks):
+                    if (
+                        (k_i < cu_k_s_min)
+                        or (k_i >= cu_k_e_max)
+                        or (p < 0)
+                        or (p >= max_blocks)
+                    ):
                         logits[i_i, 0] = -T.infinity(accum_dtype)
 
                 for bn_i in T.Parallel(block_N):
@@ -2914,6 +3346,7 @@ def fp8_native_paged_block_sparse_mqa_attn_return_logits(
         return fp8_native_paged_block_sparse_mqa_attn_return_logits_kernel_for_small_pooling_size
     else:
         return fp8_native_paged_block_sparse_mqa_attn_return_logits_kernel
+
 
 def fp8_native_paged_block_sparse_mqa_attn_return_logits_interface(
     q_fp8,
@@ -2930,7 +3363,9 @@ def fp8_native_paged_block_sparse_mqa_attn_return_logits_interface(
 
     num_blocks, paged_block_size, _, D_plus_4 = kv_cache_fp8.shape
     assert _ == 1, "Only support head=1 for k in indexer"
-    assert D_plus_4 - 4 == index_dim, f"Expected kv_cache last dim to be index_dim+4, but got {D_plus_4} vs {index_dim+4}"
+    assert (
+        D_plus_4 - 4 == index_dim
+    ), f"Expected kv_cache last dim to be index_dim+4, but got {D_plus_4} vs {index_dim+4}"
 
     if weights.ndim == 2:
         weights = weights.view(batch, seq_len, heads)
@@ -2955,9 +3390,15 @@ def fp8_native_paged_block_sparse_mqa_attn_return_logits_interface(
     # topk_block_index is int64 (torch.topk's native output); other indices are
     # already int32 from vLLM.  Skipping .to() saves Python-level no-op casts
     # (~5-15μs).  Asserts catch caller bugs early.
-    assert topk_block_index.dtype == torch.int64, f"topk_block_index must be int64, got {topk_block_index.dtype}"
-    assert context_lens.dtype == torch.int32, f"context_lens must be int32, got {context_lens.dtype}"
-    assert block_tables.dtype == torch.int32, f"block_tables must be int32, got {block_tables.dtype}"
+    assert (
+        topk_block_index.dtype == torch.int64
+    ), f"topk_block_index must be int64, got {topk_block_index.dtype}"
+    assert (
+        context_lens.dtype == torch.int32
+    ), f"context_lens must be int32, got {context_lens.dtype}"
+    assert (
+        block_tables.dtype == torch.int32
+    ), f"block_tables must be int32, got {block_tables.dtype}"
     kernel(
         q_fp8,
         kv_cache_fp8_2d,
@@ -2970,6 +3411,7 @@ def fp8_native_paged_block_sparse_mqa_attn_return_logits_interface(
     )
     return logits
 
+
 def fp8_native_hierarchy_paged_mqa_logits_tilelang_legacy(
     q_fp8: torch.Tensor,
     kv_cache_fp8: torch.Tensor,
@@ -2979,7 +3421,7 @@ def fp8_native_hierarchy_paged_mqa_logits_tilelang_legacy(
     schedule_metadata: torch.Tensor,
     max_model_len: int,
     max_seq_len: int,
-    k_block_size: int, 
+    k_block_size: int,
     block_topk: int,
 ) -> torch.Tensor:
     """Compute FP8 MQA logits using paged KV-cache.
@@ -3010,7 +3452,15 @@ def fp8_native_hierarchy_paged_mqa_logits_tilelang_legacy(
     max_num_pooling_blocks = (max_seq_len + k_block_size - 1) // k_block_size
     # Mean pool outputs fp8 + per-block f32 scale; pool_mqa_fp8 consumes
     # them directly via fp8×fp8 GEMM (no Python dequant, no bf16 cast).
-    blocked_k_fp8, blocked_k_scale, num_pooling_blocks = fp8_native_paged_mean_pooling_interface(max_num_pooling_blocks, kv_cache_fp8, context_lens, block_tables, k_block_size)
+    blocked_k_fp8, blocked_k_scale, num_pooling_blocks = (
+        fp8_native_paged_mean_pooling_interface(
+            max_num_pooling_blocks,
+            kv_cache_fp8,
+            context_lens,
+            block_tables,
+            k_block_size,
+        )
+    )
 
     block_k_indexer_score = batch_pool_mqa_attn_return_logits_fp8_legacy_interface(
         q_fp8=q_fp8,
@@ -3023,9 +3473,24 @@ def fp8_native_hierarchy_paged_mqa_logits_tilelang_legacy(
     # sorted=False skips internal sort (sparse_mqa doesn't need order); bf16 cast
     # not worth it here because block_k_indexer_score is small (B × Nb, B ≤ 64).
     # torch.topk returns int64; paged sparse_mqa now accepts int64 directly.
-    topk_block_indices = torch.topk(block_k_indexer_score, k=min(block_topk, block_k_indexer_score.shape[-1]), dim=-1, sorted=False).indices  # [B, next_n, topk] int64
+    topk_block_indices = torch.topk(
+        block_k_indexer_score,
+        k=min(block_topk, block_k_indexer_score.shape[-1]),
+        dim=-1,
+        sorted=False,
+    ).indices  # [B, next_n, topk] int64
 
-    block_sparse_k_indexer_score = fp8_native_paged_block_sparse_mqa_attn_return_logits_interface(q_fp8=q_fp8, kv_cache_fp8=kv_cache_fp8, topk_block_index=topk_block_indices, kv_block_size=k_block_size, weights=weights, context_lens=context_lens, block_tables=block_tables)  # [B, next_n, topk*kv_block_size]
+    block_sparse_k_indexer_score = (
+        fp8_native_paged_block_sparse_mqa_attn_return_logits_interface(
+            q_fp8=q_fp8,
+            kv_cache_fp8=kv_cache_fp8,
+            topk_block_index=topk_block_indices,
+            kv_block_size=k_block_size,
+            weights=weights,
+            context_lens=context_lens,
+            block_tables=block_tables,
+        )
+    )  # [B, next_n, topk*kv_block_size]
 
     return block_sparse_k_indexer_score, topk_block_indices
 
@@ -3033,8 +3498,8 @@ def fp8_native_hierarchy_paged_mqa_logits_tilelang_legacy(
 def fp8_native_hierarchy_paged_mqa_logits_with_pool_cache(
     q_fp8: torch.Tensor,
     kv_cache_fp8: torch.Tensor,
-    blocked_k_cache: torch.Tensor,         # [B, max_num_pooling_blocks, D] fp8   IN-OUT
-    blocked_k_scale_cache: torch.Tensor,   # [B, max_num_pooling_blocks]    f32   IN-OUT
+    blocked_k_cache: torch.Tensor,  # [B, max_num_pooling_blocks, D] fp8   IN-OUT
+    blocked_k_scale_cache: torch.Tensor,  # [B, max_num_pooling_blocks]    f32   IN-OUT
     weights: torch.Tensor,
     context_lens: torch.Tensor,
     block_tables: torch.Tensor,
@@ -3052,8 +3517,12 @@ def fp8_native_hierarchy_paged_mqa_logits_with_pool_cache(
     """
     # 1) Refresh tail block from raw KV cache (in place).
     fp8_native_paged_mean_pooling_tail_only_legacy_interface(
-        blocked_k_cache, blocked_k_scale_cache,
-        kv_cache_fp8, context_lens, block_tables, k_block_size,
+        blocked_k_cache,
+        blocked_k_scale_cache,
+        kv_cache_fp8,
+        context_lens,
+        block_tables,
+        k_block_size,
     )
     num_pooling_blocks = (context_lens + k_block_size - 1) // k_block_size
 
@@ -3071,14 +3540,21 @@ def fp8_native_hierarchy_paged_mqa_logits_with_pool_cache(
     topk_block_indices = torch.topk(
         block_k_indexer_score,
         k=min(block_topk, block_k_indexer_score.shape[-1]),
-        dim=-1, sorted=False,
+        dim=-1,
+        sorted=False,
     ).indices
 
     # 4) fine-grained paged sparse MQA on the selected blocks.
-    block_sparse_k_indexer_score = fp8_native_paged_block_sparse_mqa_attn_return_logits_interface(
-        q_fp8=q_fp8, kv_cache_fp8=kv_cache_fp8,
-        topk_block_index=topk_block_indices, kv_block_size=k_block_size,
-        weights=weights, context_lens=context_lens, block_tables=block_tables,
+    block_sparse_k_indexer_score = (
+        fp8_native_paged_block_sparse_mqa_attn_return_logits_interface(
+            q_fp8=q_fp8,
+            kv_cache_fp8=kv_cache_fp8,
+            topk_block_index=topk_block_indices,
+            kv_block_size=k_block_size,
+            weights=weights,
+            context_lens=context_lens,
+            block_tables=block_tables,
+        )
     )
 
     return block_sparse_k_indexer_score, topk_block_indices

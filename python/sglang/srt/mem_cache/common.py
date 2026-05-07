@@ -493,6 +493,7 @@ def alloc_for_extend(
     from sglang.srt.layers.attention.nsa.hisa.pool_k_cache import (
         maybe_alloc_hisa_pool_for_extend,
     )
+
     maybe_alloc_hisa_pool_for_extend(
         batch.tree_cache.token_to_kv_pool_allocator.get_kvcache(),
         req_pool_indices,
@@ -575,6 +576,7 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
     from sglang.srt.layers.attention.nsa.hisa.pool_k_cache import (
         maybe_alloc_hisa_pool_for_decode,
     )
+
     seq_lens_after = (batch.seq_lens_cpu + token_per_req).tolist()
     maybe_alloc_hisa_pool_for_decode(
         batch.tree_cache.token_to_kv_pool_allocator.get_kvcache(),
@@ -644,6 +646,7 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
     from sglang.srt.layers.attention.nsa.hisa.pool_k_cache import (
         maybe_free_hisa_pool_blocks,
     )
+
     maybe_free_hisa_pool_blocks(
         tree_cache.token_to_kv_pool_allocator.get_kvcache(),
         req.req_pool_idx,

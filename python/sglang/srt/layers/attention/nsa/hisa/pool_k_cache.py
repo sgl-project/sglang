@@ -19,6 +19,7 @@ Why paged instead of a flat ``pool_k_buffer``:
 Scheduler integrations live in ``mem_cache/common.py`` (alloc_for_extend/
 alloc_for_decode/release_kv_cache) and ``scheduler_pp_mixin.py``.
 """
+
 from __future__ import annotations
 
 import logging
@@ -30,7 +31,6 @@ from sglang.srt.layers.attention.nsa.hisa.tilelang_kernels import (
     fp8_native_paged_mean_pooling_completed_blocks_interface,
 )
 from sglang.srt.mem_cache.memory_pool import NSATokenToKVPool
-
 
 logger = logging.getLogger(__name__)
 
@@ -153,8 +153,8 @@ class HisaNSATokenToKVPool(NSATokenToKVPool):
         # small allocator slack. Per page: 8192 real tokens of context. For
         # size=353664 tokens → num_pool_pages_global = 44 pages.
         num_pool_pages_global = (
-            (self.size + tokens_per_pool_page - 1) // tokens_per_pool_page
-        )
+            self.size + tokens_per_pool_page - 1
+        ) // tokens_per_pool_page
         # Over-provision by 50% to reduce allocator contention over mixed-size
         # requests (pool-page granularity means short requests can still burn
         # a full page each).
@@ -195,17 +195,22 @@ class HisaNSATokenToKVPool(NSATokenToKVPool):
         # Persistent int32 scratch for prev / new seq_lens — graph-capturable
         # dtype casts (source may be int64 in prefill path). Tiny tensors.
         self._scratch_prev_lens_i32 = torch.zeros(
-            max_running_requests, dtype=torch.int32, device=self.device,
+            max_running_requests,
+            dtype=torch.int32,
+            device=self.device,
         )
         self._scratch_new_lens_i32 = torch.zeros(
-            max_running_requests, dtype=torch.int32, device=self.device,
+            max_running_requests,
+            dtype=torch.int32,
+            device=self.device,
         )
         # Persistent int32 scratch for the per-batch pool_page_tables slice
         # (see get_pool_page_tables): avoids a per-layer allocator hit from
         # fancy indexing. Full width; caller takes a [:B] view.
         self._scratch_pool_page_tables = torch.zeros(
             (max_running_requests, max_pool_pages_per_req),
-            dtype=torch.int32, device=self.device,
+            dtype=torch.int32,
+            device=self.device,
         )
         # Per-layer pool watermark: ``pool_watermark[layer, req]`` is the
         # token position up to which we've already mean-pooled K for that
@@ -220,7 +225,8 @@ class HisaNSATokenToKVPool(NSATokenToKVPool):
         # skip layers 1..N-1.
         self._pool_watermark_i32 = torch.zeros(
             (self.layer_num, max_running_requests),
-            dtype=torch.int32, device=self.device,
+            dtype=torch.int32,
+            device=self.device,
         )
 
         logger.info(
@@ -231,7 +237,11 @@ class HisaNSATokenToKVPool(NSATokenToKVPool):
             pool_page_size,
             num_pool_pages_global,
             max_pool_pages_per_req,
-            num_pool_pages_global * pool_page_size * (self.index_head_dim + 4) / 1024 / 1024,
+            num_pool_pages_global
+            * pool_page_size
+            * (self.index_head_dim + 4)
+            / 1024
+            / 1024,
         )
 
     # ------------------------------------------------------------------
@@ -304,9 +314,7 @@ class HisaNSATokenToKVPool(NSATokenToKVPool):
                 continue
             new_page_ids = self.pool_page_allocator.alloc(num_new)
             if new_page_ids is None:
-                raise RuntimeError(
-                    f"HisaPoolPageAllocator OOM on decode req={req_idx}"
-                )
+                raise RuntimeError(f"HisaPoolPageAllocator OOM on decode req={req_idx}")
             self.req_to_pool_page.write(req_idx, prev_pages, new_page_ids)
 
     def free_req_pool_pages(self, req_pool_idx: int) -> None:
@@ -339,7 +347,9 @@ class HisaNSATokenToKVPool(NSATokenToKVPool):
         """
         layer_local = layer_id - self.start_layer
         torch.index_select(
-            self._pool_watermark_i32[layer_local], 0, req_pool_indices,
+            self._pool_watermark_i32[layer_local],
+            0,
+            req_pool_indices,
             out=out_prev,
         )
 
@@ -369,10 +379,10 @@ class HisaNSATokenToKVPool(NSATokenToKVPool):
     def update_pool_for_completed_blocks(
         self,
         layer_id: int,
-        req_to_token: torch.Tensor,       # [max_running_req, max_ctx] int32
-        req_pool_indices: torch.Tensor,   # [B] int64
-        prev_seq_lens: torch.Tensor,      # [B] int32
-        new_seq_lens: torch.Tensor,       # [B] int32
+        req_to_token: torch.Tensor,  # [max_running_req, max_ctx] int32
+        req_pool_indices: torch.Tensor,  # [B] int64
+        prev_seq_lens: torch.Tensor,  # [B] int32
+        new_seq_lens: torch.Tensor,  # [B] int32
         max_pool_per_req_grid: int,
     ) -> None:
         """Mean-pool any blocks that became full during this forward and
@@ -388,6 +398,7 @@ class HisaNSATokenToKVPool(NSATokenToKVPool):
             from sglang.srt.layers.attention.nsa.hisa.triton_kernels import (
                 update_pool_for_completed_blocks_triton,
             )
+
             update_pool_for_completed_blocks_triton(
                 kv_cache_flat=kv_cache_flat,
                 req_to_token=req_to_token,
@@ -442,7 +453,10 @@ class HisaNSATokenToKVPool(NSATokenToKVPool):
         B = req_pool_indices.shape[0]
         out = self._scratch_pool_page_tables[:B]
         torch.index_select(
-            self.req_to_pool_page.req_to_pool_page, 0, req_pool_indices, out=out,
+            self.req_to_pool_page.req_to_pool_page,
+            0,
+            req_pool_indices,
+            out=out,
         )
         return out
 

@@ -17,10 +17,10 @@
 #include <c10/cuda/CUDAStream.h>
 #include <c10/macros/Macros.h>
 #include <c10/util/Exception.h>
-#include <torch/library.h>
-#include <torch/extension.h>
 #include <cuda.h>
 #include <cuda_fp16.h>
+#include <torch/extension.h>
+#include <torch/library.h>
 
 #include <cstddef>
 #include <cstdint>
@@ -34,14 +34,15 @@ constexpr int kThreadsPerBlock = 1024;
 constexpr size_t kSmem = 8 * 1024 * sizeof(uint32_t);
 
 struct FastTopKParams {
-  const float* __restrict__ input;
-  int32_t* __restrict__ indices;
+  const float *__restrict__ input;
+  int32_t *__restrict__ indices;
   int64_t input_stride;
-  int32_t length;  // same for every row — caller masks invalid positions to -inf
+  int32_t length; // same for every row — caller masks invalid positions to -inf
 };
 
 // length <= topk → all valid rows are top; pad with -1 to topk.
-__device__ void naive_topk_cuda(int32_t* __restrict__ indice, int32_t length, int32_t topk) {
+__device__ void naive_topk_cuda(int32_t *__restrict__ indice, int32_t length,
+                                int32_t topk) {
   const auto tid = threadIdx.x;
   for (int i = tid; i < topk; i += kThreadsPerBlock) {
     indice[i] = (i < length) ? i : -1;
@@ -51,7 +52,8 @@ __device__ void naive_topk_cuda(int32_t* __restrict__ indice, int32_t length, in
 __device__ __forceinline__ uint8_t convert_to_uint8(float x) {
   __half h = __float2half_rn(x);
   uint16_t bits = __half_as_ushort(h);
-  uint16_t key = (bits & 0x8000) ? static_cast<uint16_t>(~bits) : static_cast<uint16_t>(bits | 0x8000);
+  uint16_t key = (bits & 0x8000) ? static_cast<uint16_t>(~bits)
+                                 : static_cast<uint16_t>(bits | 0x8000);
   return static_cast<uint8_t>(key >> 8);
 }
 
@@ -60,8 +62,9 @@ __device__ __forceinline__ uint32_t convert_to_uint32(float x) {
   return (bits & 0x80000000u) ? ~bits : (bits | 0x80000000u);
 }
 
-__device__ void fast_topk_cuda_tl(
-    const float* __restrict__ input, int* __restrict__ index, int row_start, int length, int topk_target) {
+__device__ void fast_topk_cuda_tl(const float *__restrict__ input,
+                                  int *__restrict__ index, int row_start,
+                                  int length, int topk_target) {
   // 8-bit radix-select. Assumes length > topk_target (caller guarantees).
   int topk = topk_target;
   constexpr auto BLOCK_SIZE = 1024;
@@ -73,13 +76,14 @@ __device__ void fast_topk_cuda_tl(
   alignas(128) __shared__ int s_threshold_bin_id;
   alignas(128) __shared__ int s_num_input[2];
 
-  auto& s_histogram = s_histogram_buf[0];
+  auto &s_histogram = s_histogram_buf[0];
   extern __shared__ int s_input_idx[][SMEM_INPUT_SIZE];
 
   const int tx = threadIdx.x;
 
   // stage 1: 8-bit coarse histogram
-  if (tx < RADIX + 1) s_histogram[tx] = 0;
+  if (tx < RADIX + 1)
+    s_histogram[tx] = 0;
   __syncthreads();
 
   for (int idx = tx; idx < length; idx += BLOCK_SIZE) {
@@ -118,7 +122,8 @@ __device__ void fast_topk_cuda_tl(
 
   if (topk == 0) {
     for (int idx = tx; idx < length; idx += BLOCK_SIZE) {
-      const auto bin = static_cast<int>(convert_to_uint8(input[idx + row_start]));
+      const auto bin =
+          static_cast<int>(convert_to_uint8(input[idx + row_start]));
       if (bin > threshold_bin) {
         const auto pos = ::atomicAdd(&s_counter, 1);
         index[pos] = idx;
@@ -159,7 +164,9 @@ __device__ void fast_topk_cuda_tl(
     const auto r_idx = round % 2;
 
     const auto _raw_num_input = s_num_input[r_idx];
-    const auto num_input = (_raw_num_input < int(SMEM_INPUT_SIZE)) ? _raw_num_input : int(SMEM_INPUT_SIZE);
+    const auto num_input = (_raw_num_input < int(SMEM_INPUT_SIZE))
+                               ? _raw_num_input
+                               : int(SMEM_INPUT_SIZE);
 
     run_cumsum();
     if (tx < RADIX && s_histogram[tx] > topk && s_histogram[tx + 1] <= topk) {
@@ -176,7 +183,8 @@ __device__ void fast_topk_cuda_tl(
       for (int i = tx; i < num_input; i += BLOCK_SIZE) {
         const auto idx = s_input_idx[r_idx][i];
         const auto offset = 24 - round * 8;
-        const auto bin = (convert_to_uint32(input[idx + row_start]) >> offset) & 0xFF;
+        const auto bin =
+            (convert_to_uint32(input[idx + row_start]) >> offset) & 0xFF;
         if (bin > threshold_bin) {
           const auto pos = ::atomicAdd(&s_counter, 1);
           index[pos] = idx;
@@ -222,7 +230,7 @@ __device__ void fast_topk_cuda_tl(
 
 __global__ __launch_bounds__(kThreadsPerBlock) void topk_kernel_runtime(
     const FastTopKParams params, int32_t topk) {
-  const auto& [input, indices, input_stride, length] = params;
+  const auto &[input, indices, input_stride, length] = params;
   const auto bid = static_cast<uint64_t>(blockIdx.x);
   const auto indice = indices + bid * topk;
   const auto score = input + bid * input_stride;
@@ -242,24 +250,24 @@ __global__ __launch_bounds__(kThreadsPerBlock) void topk_kernel_runtime(
 // at import time is fragile across multi-device / multi-context setups.
 // Skipping it entirely is the simplest robust answer.
 
-}  // namespace
+} // namespace
 
-void fast_topk_runtime_interface(
-    const at::Tensor& score,
-    at::Tensor& indices) {
+void fast_topk_runtime_interface(const at::Tensor &score, at::Tensor &indices) {
   TORCH_CHECK(score.is_cuda(), "score must be CUDA");
   TORCH_CHECK(indices.is_cuda(), "indices must be CUDA");
-  TORCH_CHECK(score.dim() == 2 && score.stride(1) == 1, "score [B, L] f32, last-dim contiguous");
+  TORCH_CHECK(score.dim() == 2 && score.stride(1) == 1,
+              "score [B, L] f32, last-dim contiguous");
   TORCH_CHECK(score.scalar_type() == at::kFloat, "score must be f32");
-  TORCH_CHECK(indices.dim() == 2 && indices.is_contiguous(), "indices [B, topk] i32 contiguous");
+  TORCH_CHECK(indices.dim() == 2 && indices.is_contiguous(),
+              "indices [B, topk] i32 contiguous");
   TORCH_CHECK(indices.scalar_type() == at::kInt, "indices must be i32");
 
   const int64_t B = score.size(0);
   const int64_t L = score.size(1);
   const int64_t topk = indices.size(1);
   TORCH_CHECK(indices.size(0) == B, "indices.size(0) must match score.size(0)");
-  TORCH_CHECK(topk > 0 && topk <= MaxTopK,
-              "topk must be in (0, ", MaxTopK, "], got ", topk);
+  TORCH_CHECK(topk > 0 && topk <= MaxTopK, "topk must be in (0, ", MaxTopK,
+              "], got ", topk);
   TORCH_CHECK(L >= topk, "score.size(1)=", L, " must be >= topk=", topk);
 
   FastTopKParams params{
@@ -272,13 +280,14 @@ void fast_topk_runtime_interface(
   const auto stream = at::cuda::getCurrentCUDAStream().stream();
   const auto grid = dim3{static_cast<uint32_t>(B)};
   const auto block = dim3{kThreadsPerBlock};
-  topk_kernel_runtime<<<grid, block, kSmem, stream>>>(params, static_cast<int32_t>(topk));
-  TORCH_CHECK(cudaGetLastError() == cudaSuccess, "topk_kernel_runtime launch failed");
+  topk_kernel_runtime<<<grid, block, kSmem, stream>>>(
+      params, static_cast<int32_t>(topk));
+  TORCH_CHECK(cudaGetLastError() == cudaSuccess,
+              "topk_kernel_runtime launch failed");
 }
 
 TORCH_LIBRARY(hisa_fast_topk, m) {
-  m.def(
-      "fast_topk_runtime(Tensor score, Tensor(a!) indices) -> ()");
+  m.def("fast_topk_runtime(Tensor score, Tensor(a!) indices) -> ()");
 }
 
 TORCH_LIBRARY_IMPL(hisa_fast_topk, CUDA, m) {

@@ -40,12 +40,9 @@ from sglang.srt.distributed import (
 )
 from sglang.srt.distributed.parallel_state import get_pp_group
 from sglang.srt.layers import deep_gemm_wrapper
-from sglang.srt.layers.attention.nsa.hisa.tilelang_legacy import (
-    fp8_native_hierarchy_mqa_logits_tilelang_legacy,
-    fp8_native_hierarchy_paged_mqa_logits_tilelang_legacy,
-    fp8_native_hierarchy_paged_mqa_logits_tilelang_with_pool_cache,
+from sglang.srt.layers.attention.nsa.hisa.hisa_topk_fused import (
+    hisa_topk_transform_dispatch,
 )
-from sglang.srt.layers.attention.nsa.hisa.pool_k_cache import HisaNSATokenToKVPool
 from sglang.srt.layers.attention.nsa.hisa.orchestrator import (
     fp8_native_hierarchy_mqa_logits,
     fp8_native_hierarchy_paged_mqa_logits,
@@ -53,8 +50,11 @@ from sglang.srt.layers.attention.nsa.hisa.orchestrator import (
 from sglang.srt.layers.attention.nsa.hisa.orchestrator_legacy import (
     fp8_native_hierarchy_paged_mqa_logits_no_pool_cache,
 )
-from sglang.srt.layers.attention.nsa.hisa.hisa_topk_fused import (
-    hisa_topk_transform_dispatch,
+from sglang.srt.layers.attention.nsa.hisa.pool_k_cache import HisaNSATokenToKVPool
+from sglang.srt.layers.attention.nsa.hisa.tilelang_legacy import (
+    fp8_native_hierarchy_mqa_logits_tilelang_legacy,
+    fp8_native_hierarchy_paged_mqa_logits_tilelang_legacy,
+    fp8_native_hierarchy_paged_mqa_logits_tilelang_with_pool_cache,
 )
 from sglang.srt.layers.attention.nsa.hisa.triton_kernels import hisa_coord_transform
 from sglang.srt.layers.attention.nsa.utils import (
@@ -93,6 +93,7 @@ def _warmup_sgl_kernel_fast_topk_once() -> None:
     if _SGL_KERNEL_TOPK_WARMED or not _is_cuda:
         return
     from sgl_kernel import fast_topk_v2
+
     side = torch.cuda.Stream()
     side.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(side):
@@ -540,14 +541,18 @@ class HisaIndexer(MultiPlatformOp):
                 # as the main paged path (nsa_indexer.py:478-483) — backend may
                 # pre-compute it once per forward; otherwise we build it here.
                 pool_schedule = getattr(
-                    metadata, "pool_paged_mqa_schedule_metadata", None,
+                    metadata,
+                    "pool_paged_mqa_schedule_metadata",
+                    None,
                 )
                 if pool_schedule is None and _is_cuda:
                     npbpr = (
                         seqlens_32[:q_offset] + self.hisa_k_block_size - 1
                     ) // self.hisa_k_block_size
                     pool_schedule = deep_gemm.get_paged_mqa_logits_metadata(
-                        npbpr, kv_pool.pool_page_size, self.sm_count,
+                        npbpr,
+                        kv_pool.pool_page_size,
+                        self.sm_count,
                     )
                 block_sparse_logits, topk_block_indices = (
                     fp8_native_hierarchy_paged_mqa_logits(
@@ -596,8 +601,10 @@ class HisaIndexer(MultiPlatformOp):
                 )
             )
         # Hisa paged output has a leading next_n=1 dim; squeeze.
-        block_sparse_logits = block_sparse_logits.squeeze(1)  # [B, block_topk*k_block_size]
-        topk_block_indices = topk_block_indices.squeeze(1)    # [B, block_topk]
+        block_sparse_logits = block_sparse_logits.squeeze(
+            1
+        )  # [B, block_topk*k_block_size]
+        topk_block_indices = topk_block_indices.squeeze(1)  # [B, block_topk]
 
         # vLLM-patch-style conversion (indexers.py:498-520): radix-select +
         # gather + mask in a single CUDA kernel. PAGED decode uses ``seq_lens``
@@ -605,7 +612,8 @@ class HisaIndexer(MultiPlatformOp):
         # positions.
         topk_result = hisa_topk_transform_dispatch(
             metadata,
-            block_sparse_logits, topk_block_indices,
+            block_sparse_logits,
+            topk_block_indices,
             self.hisa_k_block_size,
             ke=seqlens_32[:q_offset],
         )
@@ -656,10 +664,10 @@ class HisaIndexer(MultiPlatformOp):
     @torch.inference_mode()
     def _compare_logits_vs_v1(
         self,
-        v1_blk: torch.Tensor,           # [M, K_topk] int (any int)
-        def_blk: torch.Tensor,          # [M, K_topk] int
-        v1_logits: torch.Tensor,        # [M, K_topk * kbs] f32
-        def_logits: torch.Tensor,       # [M, K_topk * kbs] f32
+        v1_blk: torch.Tensor,  # [M, K_topk] int (any int)
+        def_blk: torch.Tensor,  # [M, K_topk] int
+        v1_logits: torch.Tensor,  # [M, K_topk * kbs] f32
+        def_logits: torch.Tensor,  # [M, K_topk * kbs] f32
         label_prefix: str,
         chunk_start: int = 0,
     ) -> None:
@@ -686,7 +694,7 @@ class HisaIndexer(MultiPlatformOp):
 
         # IoU per row via merge-sort adjacency (assumes no in-row duplicates).
         merged = torch.cat([v1_sorted_blk, def_sorted_blk], dim=-1).sort(dim=-1).values
-        inter = (merged[:, :-1] == merged[:, 1:]).sum(dim=-1)        # [M]
+        inter = (merged[:, :-1] == merged[:, 1:]).sum(dim=-1)  # [M]
         union = 2 * K_topk - inter
         iou = inter.float() / union.float().clamp_min(1)
 
@@ -715,8 +723,11 @@ class HisaIndexer(MultiPlatformOp):
 
         try:
             torch.testing.assert_close(
-                def_check, v1_check,
-                atol=abs_th, rtol=rel_th, equal_nan=True,
+                def_check,
+                v1_check,
+                atol=abs_th,
+                rtol=rel_th,
+                equal_nan=True,
             )
         except AssertionError as e:
             n_match = int(match_mask.sum().item())
@@ -738,9 +749,9 @@ class HisaIndexer(MultiPlatformOp):
         schedule_metadata,
         max_seq_len: int,
         q_offset: int,
-        v3_block_sparse_logits: torch.Tensor,   # [B, sparse_len] already squeezed
-        v3_topk_block_indices: torch.Tensor,    # [B, block_topk] int64 already squeezed
-        v3_topk_result: torch.Tensor,           # [q_offset, index_topk] int32
+        v3_block_sparse_logits: torch.Tensor,  # [B, sparse_len] already squeezed
+        v3_topk_block_indices: torch.Tensor,  # [B, block_topk] int64 already squeezed
+        v3_topk_result: torch.Tensor,  # [q_offset, index_topk] int32
     ) -> None:
         """DEBUG: re-run v1 fresh hierarchy paged MQA and compare logits
         + final topk indices against the v3 (pool-cache) output.
@@ -753,29 +764,36 @@ class HisaIndexer(MultiPlatformOp):
         iou_th = float(os.environ.get("SGLANG_HISA_VERIFY_IOU", "0.99"))
 
         # --- v1 reference: fresh mean-pool + block_mqa + sparse_paged ---
-        v1_block_sparse, v1_topk_block = fp8_native_hierarchy_paged_mqa_logits_tilelang_legacy(
-            q_fp8[:q_offset],
-            kv_cache_fp8,
-            weights[:q_offset],
-            seqlens_32,
-            block_tables,
-            schedule_metadata,
-            max_model_len=max_seq_len,
-            max_seq_len=max_seq_len,
-            k_block_size=self.hisa_k_block_size,
-            block_topk=self.hisa_block_topk,
+        v1_block_sparse, v1_topk_block = (
+            fp8_native_hierarchy_paged_mqa_logits_tilelang_legacy(
+                q_fp8[:q_offset],
+                kv_cache_fp8,
+                weights[:q_offset],
+                seqlens_32,
+                block_tables,
+                schedule_metadata,
+                max_model_len=max_seq_len,
+                max_seq_len=max_seq_len,
+                k_block_size=self.hisa_k_block_size,
+                block_topk=self.hisa_block_topk,
+            )
         )
-        v1_block_sparse = v1_block_sparse.squeeze(1)   # [B, sparse_len]
-        v1_topk_block = v1_topk_block.squeeze(1)       # [B, block_topk] int64
+        v1_block_sparse = v1_block_sparse.squeeze(1)  # [B, sparse_len]
+        v1_topk_block = v1_topk_block.squeeze(1)  # [B, block_topk] int64
 
         from sgl_kernel import fast_topk_v2
+
         B, sparse_len = v1_block_sparse.shape
         full_lens = torch.full(
-            (B,), sparse_len, dtype=torch.int32, device=v1_block_sparse.device,
+            (B,),
+            sparse_len,
+            dtype=torch.int32,
+            device=v1_block_sparse.device,
         )
         v1_relevant = fast_topk_v2(v1_block_sparse, full_lens, self.index_topk)
         v1_topk_result = hisa_coord_transform(
-            v1_relevant, v1_topk_block,
+            v1_relevant,
+            v1_topk_block,
             lens=seqlens_32[:q_offset],
             k_block_size=self.hisa_k_block_size,
             ks=None,
@@ -786,8 +804,9 @@ class HisaIndexer(MultiPlatformOp):
         v1_tr = v1_topk_result
         merged_tr = torch.cat([v1_tr, v3_tr], dim=-1).sort(dim=-1).values
         # Equal-adjacent pairs that are not the -1 sentinel = intersection size.
-        inter_tr = ((merged_tr[:, :-1] == merged_tr[:, 1:])
-                    & (merged_tr[:, :-1] != -1)).sum(dim=-1)
+        inter_tr = (
+            (merged_tr[:, :-1] == merged_tr[:, 1:]) & (merged_tr[:, :-1] != -1)
+        ).sum(dim=-1)
         v1_count = (v1_tr != -1).sum(dim=-1)
         v3_count = (v3_tr != -1).sum(dim=-1)
         union_tr = v1_count + v3_count - inter_tr
@@ -795,8 +814,10 @@ class HisaIndexer(MultiPlatformOp):
         bad = (iou_tr < iou_th).nonzero(as_tuple=True)[0]
         if bad.numel() > 0:
             for b, v, vi, vv in zip(
-                bad.tolist(), iou_tr[bad].tolist(),
-                v1_count[bad].tolist(), v3_count[bad].tolist(),
+                bad.tolist(),
+                iou_tr[bad].tolist(),
+                v1_count[bad].tolist(),
+                v3_count[bad].tolist(),
             ):
                 print(
                     f"[HISA_VERIFY layer={layer_id} b={b}] final topk IoU="
@@ -817,13 +838,13 @@ class HisaIndexer(MultiPlatformOp):
     def _hisa_verify_prefill_vs_v1(
         self,
         layer_id: int,
-        q_fp8_slice: torch.Tensor,                  # [M, H, D] fp8
-        kv_fp8: tuple,                              # (k_fp8 [N, D] fp8, k_scale)
-        weights_slice: torch.Tensor,                # [M, H] f32
-        ks_slice: torch.Tensor,                     # [M] i32
-        ke_slice: torch.Tensor,                     # [M] i32
+        q_fp8_slice: torch.Tensor,  # [M, H, D] fp8
+        kv_fp8: tuple,  # (k_fp8 [N, D] fp8, k_scale)
+        weights_slice: torch.Tensor,  # [M, H] f32
+        ks_slice: torch.Tensor,  # [M] i32
+        ke_slice: torch.Tensor,  # [M] i32
         default_block_sparse_logits: torch.Tensor,  # [M, sparse_len] f32
-        default_topk_block_indices: torch.Tensor,   # [M, block_topk] int64
+        default_topk_block_indices: torch.Tensor,  # [M, block_topk] int64
         chunk_start: int = 0,
     ) -> None:
         """Re-run v1 (tilelang_legacy) prefill and compare per-row logits +
@@ -831,9 +852,13 @@ class HisaIndexer(MultiPlatformOp):
         with self._with_real_sm_count():
             v1_block_sparse, v1_topk_block = (
                 fp8_native_hierarchy_mqa_logits_tilelang_legacy(
-                    q_fp8_slice, kv_fp8, weights_slice,
-                    ks_slice, ke_slice,
-                    self.hisa_k_block_size, self.hisa_block_topk,
+                    q_fp8_slice,
+                    kv_fp8,
+                    weights_slice,
+                    ks_slice,
+                    ke_slice,
+                    self.hisa_k_block_size,
+                    self.hisa_block_topk,
                 )
             )
         self._compare_logits_vs_v1(
@@ -993,7 +1018,10 @@ class HisaIndexer(MultiPlatformOp):
         q_offset = ks.shape[0]
         k_offset = k_fp8.shape[0]
         need_chunk, free_mem = self._should_chunk_mqa_logits(
-            q_offset, k_offset, device, forward_batch=forward_batch,
+            q_offset,
+            k_offset,
+            device,
+            forward_batch=forward_batch,
         )
 
         if not need_chunk:
@@ -1054,9 +1082,11 @@ class HisaIndexer(MultiPlatformOp):
             # RAGGED prefill: output is ks-relative, mask via (ks, ke).
             topk_result[:q_offset] = hisa_topk_transform_dispatch(
                 metadata,
-                block_sparse_logits, topk_block_indices,
+                block_sparse_logits,
+                topk_block_indices,
                 self.hisa_k_block_size,
-                ke=ke, ks=ks,
+                ke=ke,
+                ks=ks,
             )
             return topk_result
 
@@ -1066,10 +1096,10 @@ class HisaIndexer(MultiPlatformOp):
         hisa_cols = self.hisa_block_topk * self.hisa_k_block_size
         pool_cols = (k_offset + self.hisa_k_block_size - 1) // self.hisa_k_block_size
         bytes_per_row = (
-            pool_cols * 4                       # pool_mqa output
-            + self.hisa_block_topk * 4          # topk_block_indices
-            + hisa_cols * 4                     # block_sparse_logits
-            + self.index_topk * 4 * 2           # fast_topk_v2 + coord_transform outputs
+            pool_cols * 4  # pool_mqa output
+            + self.hisa_block_topk * 4  # topk_block_indices
+            + hisa_cols * 4  # block_sparse_logits
+            + self.index_topk * 4 * 2  # fast_topk_v2 + coord_transform outputs
         )
         # Reserve 50% of free memory for the peak tensors.
         max_rows = max(1, int((free_mem * 0.5) // max(bytes_per_row, 1)))
@@ -1121,9 +1151,11 @@ class HisaIndexer(MultiPlatformOp):
             # Same conversion as the non-chunked branch, via the dispatch.
             topk_result[start:end] = hisa_topk_transform_dispatch(
                 metadata,
-                block_sparse_logits, topk_block_indices,
+                block_sparse_logits,
+                topk_block_indices,
                 self.hisa_k_block_size,
-                ke=ke[start:end], ks=ks[start:end],
+                ke=ke[start:end],
+                ks=ks[start:end],
             )
             start = end
 

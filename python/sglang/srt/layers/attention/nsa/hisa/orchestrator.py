@@ -15,6 +15,7 @@ fp8 ULP drift <= 2.6% rel, topk-2048 IoU >= 0.997 vs tilelang — within fp8
 accumulation noise, no e2e regression expected (verify with
 ``SGLANG_HISA_VERIFY=1`` when flipping the default).
 """
+
 from __future__ import annotations
 
 import os
@@ -22,13 +23,15 @@ import os
 import deep_gemm
 import torch
 
+from sglang.srt.layers.attention.nsa.hisa.fast_topk_runtime import (
+    MAX_TOPK as _FAST_TOPK_MAX,
+)
+from sglang.srt.layers.attention.nsa.hisa.fast_topk_runtime import (
+    fast_topk_runtime,
+)
 from sglang.srt.layers.attention.nsa.hisa.tilelang_kernels import (
     fp8_native_block_mean_pooling_grouped_interface,
     fp8_native_block_mean_pooling_interface,
-)
-from sglang.srt.layers.attention.nsa.hisa.fast_topk_runtime import (
-    MAX_TOPK as _FAST_TOPK_MAX,
-    fast_topk_runtime,
 )
 from sglang.srt.layers.attention.nsa.hisa.triton_kernels import (
     block_sparse_mqa_triton,
@@ -36,7 +39,6 @@ from sglang.srt.layers.attention.nsa.hisa.triton_kernels import (
     force_maintain_logits_triton,
     sparse_paged_mqa_triton,
 )
-
 
 # Stage 3: fast_topk_runtime for all K (prefill + decode); only falls back
 # to torch.topk(bf16) when topk > _FAST_TOPK_MAX (out of fast_topk's range).
@@ -46,7 +48,8 @@ _FAST_TOPK_DISABLE = os.environ.get("SGLANG_HISA_FAST_TOPK_DISABLE", "0") == "1"
 
 
 def _stage3_topk_prefill(
-    score_2d: torch.Tensor, block_topk: int,
+    score_2d: torch.Tensor,
+    block_topk: int,
 ) -> torch.Tensor:
     """Prefill stage 3: [seq, L] f32 → [seq, topk] (i32 fast / i64 torch).
 
@@ -59,13 +62,17 @@ def _stage3_topk_prefill(
     if _FAST_TOPK_DISABLE or topk > _FAST_TOPK_MAX:
         # bf16 path: ~40% faster than f32 torch.topk on long rows.
         return torch.topk(
-            score_2d.bfloat16(), k=topk, dim=-1, sorted=False,
+            score_2d.bfloat16(),
+            k=topk,
+            dim=-1,
+            sorted=False,
         ).indices
     return fast_topk_runtime(score_2d, topk)
 
 
 def _stage3_topk_decode(
-    score_3d: torch.Tensor, block_topk: int,
+    score_3d: torch.Tensor,
+    block_topk: int,
 ) -> torch.Tensor:
     """Decode stage 3: [B, 1, L] f32 → [B, 1, topk] (i32 fast / i64 torch).
 
@@ -83,18 +90,18 @@ def _stage3_topk_decode(
 
 
 def fp8_native_hierarchy_paged_mqa_logits(
-    q_fp8: torch.Tensor,                # [B, 1, H, D] fp8
-    kv_cache_fp8: torch.Tensor,         # [num_blocks, paged_block_size, 1, D+4] uint8
-    pool_k_pages: torch.Tensor,         # [num_pool_pages_global, pool_page_size * (D+4)] uint8
-    pool_page_tables: torch.Tensor,     # [B, max_pool_pages] i32
-    weights: torch.Tensor,              # [B*1, H] f32
-    context_lens: torch.Tensor,         # [B] i32 — raw seq_len per request
-    block_tables: torch.Tensor,         # [B, max_kv_blocks] i32
+    q_fp8: torch.Tensor,  # [B, 1, H, D] fp8
+    kv_cache_fp8: torch.Tensor,  # [num_blocks, paged_block_size, 1, D+4] uint8
+    pool_k_pages: torch.Tensor,  # [num_pool_pages_global, pool_page_size * (D+4)] uint8
+    pool_page_tables: torch.Tensor,  # [B, max_pool_pages] i32
+    weights: torch.Tensor,  # [B*1, H] f32
+    context_lens: torch.Tensor,  # [B] i32 — raw seq_len per request
+    block_tables: torch.Tensor,  # [B, max_kv_blocks] i32
     k_block_size: int,
     pool_page_size: int,
     block_topk: int,
-    max_seq_len: int,                   # max ctx in tokens (= block_tables.shape[1] * 64 in production)
-    schedule_metadata: torch.Tensor,    # DG pool-domain schedule, computed by caller (graph-stable buffer)
+    max_seq_len: int,  # max ctx in tokens (= block_tables.shape[1] * 64 in production)
+    schedule_metadata: torch.Tensor,  # DG pool-domain schedule, computed by caller (graph-stable buffer)
     paged_block_size: int = 64,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     # 1) Tail-pool refresh is *skipped*. Stage 2's force_maintain at
@@ -126,7 +133,10 @@ def fp8_native_hierarchy_paged_mqa_logits(
     # ~5-10% decode-stage cost in the favorable shapes; weigh vs e2e.
     num_pool_blocks_per_req = (context_lens + k_block_size - 1) // k_block_size
     pool_k_view = pool_k_pages.view(
-        pool_k_pages.shape[0], pool_page_size, 1, q_fp8.shape[-1] + 4,
+        pool_k_pages.shape[0],
+        pool_page_size,
+        1,
+        q_fp8.shape[-1] + 4,
     )
     weights_2d = weights if weights.dim() == 2 else weights.view(-1, weights.shape[-1])
     # Max pool blocks across the batch, derived from the main-KV table capacity:
@@ -134,19 +144,22 @@ def fp8_native_hierarchy_paged_mqa_logits(
     # pool_page_tables.shape (which carries the pool allocator's outer padding).
     max_pool_seq_len = (max_seq_len + k_block_size - 1) // k_block_size
     block_k_indexer_score = deep_gemm.fp8_paged_mqa_logits(
-        q_fp8,                      # [B, 1, H, D]
-        pool_k_view,                # [N_pp, pool_page_size, 1, D+4]
-        weights_2d,                 # [B, H]
-        num_pool_blocks_per_req,    # [B] i32 — pool-block "context_lens"
-        pool_page_tables,           # [B, max_pp] i32
+        q_fp8,  # [B, 1, H, D]
+        pool_k_view,  # [N_pp, pool_page_size, 1, D+4]
+        weights_2d,  # [B, H]
+        num_pool_blocks_per_req,  # [B] i32 — pool-block "context_lens"
+        pool_page_tables,  # [B, max_pp] i32
         schedule_metadata,
         max_pool_seq_len,
         clean_logits=True,
     )  # [B*1, max_pool_seq_len] f32 (-inf past num_pool_blocks_per_req)
     force_maintain_logits_decode_triton(
-        block_k_indexer_score, num_pool_blocks_per_req,
+        block_k_indexer_score,
+        num_pool_blocks_per_req,
     )
-    block_k_indexer_score = block_k_indexer_score.unsqueeze(1)  # [B, 1, max_pool_seq_len]
+    block_k_indexer_score = block_k_indexer_score.unsqueeze(
+        1
+    )  # [B, 1, max_pool_seq_len]
 
     # 3) Top-k over pool blocks.
     topk_block_indices = _stage3_topk_decode(block_k_indexer_score, block_topk)
@@ -165,11 +178,13 @@ def fp8_native_hierarchy_paged_mqa_logits(
 
 
 def fp8_native_hierarchy_mqa_logits(
-    q_fp8: torch.Tensor,                             # [seq, H, D] fp8
-    kv: tuple[torch.Tensor, torch.Tensor],           # (k_fp8 [N, D] fp8, k_scale [N, 4] uint8 OR [N] f32)
-    weights: torch.Tensor,                           # [seq, H] f32
-    cu_seqlen_ks: torch.Tensor,                      # [seq] i32
-    cu_seqlen_ke: torch.Tensor,                      # [seq] i32
+    q_fp8: torch.Tensor,  # [seq, H, D] fp8
+    kv: tuple[
+        torch.Tensor, torch.Tensor
+    ],  # (k_fp8 [N, D] fp8, k_scale [N, 4] uint8 OR [N] f32)
+    weights: torch.Tensor,  # [seq, H] f32
+    cu_seqlen_ks: torch.Tensor,  # [seq] i32
+    cu_seqlen_ke: torch.Tensor,  # [seq] i32
     k_block_size: int,
     block_topk: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -205,9 +220,9 @@ def fp8_native_hierarchy_mqa_logits(
     if k_scales.dtype == torch.uint8:
         k_scales = k_scales.view(torch.float32)
     if k_scales.ndim == 2:
-        assert k_scales.shape[1] == 1, (
-            f"k_scales should be [N] or [N, 1], got {k_scales.shape}"
-        )
+        assert (
+            k_scales.shape[1] == 1
+        ), f"k_scales should be [N] or [N, 1], got {k_scales.shape}"
         k_scales = k_scales.squeeze(1)
 
     # 1) Mean-pool ragged K → tilelang. Bench (test_grouped_mean_pool.py) shows
@@ -216,12 +231,18 @@ def fp8_native_hierarchy_mqa_logits(
     # ~24μs). The vanilla tilelang kernel has a boundary OOB at K<block_N=64,
     # so we route those to the bounds-safe grouped variant.
     if k_block_size < 64:
-        blocked_k_fp8, blocked_k_scale = fp8_native_block_mean_pooling_grouped_interface(
-            k_fp8, k_scales, k_block_size,
+        blocked_k_fp8, blocked_k_scale = (
+            fp8_native_block_mean_pooling_grouped_interface(
+                k_fp8,
+                k_scales,
+                k_block_size,
+            )
         )
     else:
         blocked_k_fp8, blocked_k_scale = fp8_native_block_mean_pooling_interface(
-            k_fp8, k_scales, k_block_size,
+            k_fp8,
+            k_scales,
+            k_block_size,
         )
 
     # 2) Block-MQA on blocked_k → DeepGEMM ``fp8_mqa_logits``. Per-stage A/B
@@ -250,7 +271,9 @@ def fp8_native_hierarchy_mqa_logits(
         clean_logits=True,
     )[:, :n_blocks]
     force_maintain_logits_triton(
-        block_k_indexer_score, cu_seqlen_blocked_ks, cu_seqlen_blocked_ke,
+        block_k_indexer_score,
+        cu_seqlen_blocked_ks,
+        cu_seqlen_blocked_ke,
     )
 
     # 3) Top-k over pool blocks. fast_topk_runtime at K∈{16,32} (1.45-1.83×),
