@@ -215,9 +215,7 @@ def _materialize_output_batch_file_refs(output_batch: Any) -> None:
     if not isinstance(output_batch, OutputBatch):
         return
 
-    # Materialization happens at the first scheduler client boundary.  The file
-    # ref unlinks itself after np.load, so downstream code receives ordinary
-    # numpy arrays and does not need to understand the transport detail.
+    # Materialize at the first client boundary; file refs unlink themselves.
     start_time = time.perf_counter()
     output_batch.output = materialize_file_refs(output_batch.output)
     if output_batch.metrics is not None:

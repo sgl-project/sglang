@@ -371,8 +371,7 @@ class GPUWorker:
                     torch.cuda.empty_cache()
             else:
                 # For offline return_frames requests, doing the tensor->uint8 frame
-                # conversion here keeps the expensive D2H copy inside the worker
-                # process/metrics and avoids sending GPU tensors through scheduler ZMQ.
+                # conversion here avoids sending GPU tensors through scheduler ZMQ.
                 self._materialize_frame_outputs_for_return(output_batch, req)
 
             if torch.cuda.is_initialized() and output_batch.output is None:
@@ -413,9 +412,6 @@ class GPUWorker:
     def _materialize_frame_outputs_for_return(
         self, output_batch: OutputBatch, req: Req
     ) -> None:
-        # Keep file-saving and non-frame-return requests on the existing path.
-        # This optimization targets the API shape that wants decoded frames back
-        # in Python, not the CLI/server path that only needs output files.
         if (
             self.rank != 0
             or output_batch.output is None
@@ -454,8 +450,7 @@ class GPUWorker:
             and not req.enable_frame_interpolation
             and not req.enable_upscaling
         ):
-            # Match post_process_sample's direct tensor conversion:
-            # decoded tensors are C/F/H/W, returned frames are F/H/W/C uint8.
+            # Match post_process_sample: C/F/H/W float tensor -> F/H/W/C uint8.
             if output.dim() == 3:
                 output = output.unsqueeze(1)
             output = (output * 255).clamp(0, 255).to(torch.uint8)
@@ -467,11 +462,8 @@ class GPUWorker:
             and output.ndim == 4
             and output.shape[-1] in (1, 3, 4)
         ):
-            # Some pipeline configs already postprocess to HWC uint8 frames.
             return output
 
-        # Interpolation/upscaling and less common output formats still need the
-        # general post-processing path to preserve behavior.
         frames = post_process_sample(
             output,
             req.data_type,
