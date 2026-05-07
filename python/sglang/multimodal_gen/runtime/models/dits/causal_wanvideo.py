@@ -13,7 +13,7 @@ from torch.nn.attention.flex_attention import (
     flex_attention,
 )
 
-from sglang.multimodal_gen.runtime.utils.layerwise_offload import OffloadableDiTMixin
+from sglang.multimodal_gen.runtime.managers.layerwise_offload import OffloadableDiTMixin
 
 # wan 1.3B model has a weird channel / head configurations and require max-autotune to work with flexattention
 # see https://github.com/pytorch/pytorch/issues/133254
