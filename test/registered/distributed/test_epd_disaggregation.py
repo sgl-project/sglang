@@ -1,10 +1,7 @@
-import glob
 import io
-import json
 import os
 import re
 import subprocess
-import tempfile
 import threading
 import time
 import unittest
@@ -17,7 +14,7 @@ from grpc_health.v1 import health_pb2, health_pb2_grpc
 from sglang.srt.utils import kill_process_tree
 from sglang.srt.utils.network import get_zmq_socket_on_host
 from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.kits.mmmu_vlm_kit import _run_lmms_eval_with_retry
+from sglang.test.kits.mmmu_vlm_kit import MMMUMixin
 from sglang.test.server_fixtures.disaggregation_fixture import (
     PDDisaggregationServerBase,
 )
@@ -622,13 +619,18 @@ class TestEPDDisaggregationOmni(PDDisaggregationServerBase):
 
 
 @unittest.skipIf(is_in_ci(), "Skipping in CI to reduce multi-GPU runtime")
-class TestEPDDisaggregationOneEncoder(PDDisaggregationServerBase):
+class TestEPDDisaggregationOneEncoder(MMMUMixin, PDDisaggregationServerBase):
     """Test EPD disaggregation with single encode server"""
+
+    # MMMUMixin knobs — Qwen2.5-VL-3B-Instruct gets ~0.40 on the 50-sample subset.
+    accuracy = 0.40
+    mmmu_args = ["--limit", "50"]
 
     @classmethod
     def setUpClass(cls):
         super().setUpClass()
         cls.model = DEFAULT_SMALL_VLM_MODEL_NAME_FOR_TEST
+        cls.base_url = cls.lb_url  # MMMUMixin reads this for OPENAI_API_BASE
         cls.encode_port = f"{int(cls.lb_port) + 300}"
         cls.encode_url = f"http://{cls.base_host}:{cls.encode_port}"
 
@@ -747,71 +749,7 @@ class TestEPDDisaggregationOneEncoder(PDDisaggregationServerBase):
                 except Exception as e:
                     print(f"Error killing process: {e}")
 
-    def run_mmmu_eval(self, model_version: str, output_path: str, limit: str = "50"):
-        """
-        Evaluate a VLM on the MMMU validation set with lmms-eval.
-        Reference: test_vlm_models.py
-
-        Args:
-            model_version: Model version/checkpoint to evaluate
-            output_path: Path to save evaluation results
-            limit: Number of samples to evaluate (default: "50" for CI time constraints)
-        """
-        model = "openai_compatible"
-        tp = 1
-        tasks = "mmmu_val"
-        batch_size = 32
-        log_suffix = "openai_compatible"
-        os.makedirs(output_path, exist_ok=True)
-
-        model_args = f'model_version="{model_version}",tp={tp}'
-
-        cmd = [
-            "python3",
-            "-m",
-            "lmms_eval",
-            "--model",
-            model,
-            "--model_args",
-            model_args,
-            "--tasks",
-            tasks,
-            "--batch_size",
-            str(batch_size),
-            "--log_samples",
-            "--log_samples_suffix",
-            log_suffix,
-            "--output_path",
-            str(output_path),
-            "--limit",
-            limit,
-        ]
-
-        _run_lmms_eval_with_retry(cmd, timeout=3600)
-
-    def test_mmmu(self):
-        """Test MMMU evaluation with EPD disaggregation"""
-        # Use a per-test temp dir so result-file lookup can't be confused by
-        # stale JSON left in `./logs/` by neighbouring tests in the same suite.
-        with tempfile.TemporaryDirectory(prefix="epd_one_encoder_mmmu_") as output_path:
-            self.run_mmmu_eval(self.model, output_path)
-
-            # `**` with recursive=True already matches files at the top level
-            # of output_path, so no separate non-recursive fallback is needed.
-            result_files = glob.glob(f"{output_path}/**/*.json", recursive=True)
-            if not result_files:
-                self.fail(f"No JSON result files found in {output_path}")
-
-            result_file_path = result_files[0]
-            with open(result_file_path, "r") as f:
-                result = json.load(f)
-                print(f"MMMU result: {result}")
-
-            mmmu_accuracy = result["results"]["mmmu_val"]["mmmu_acc,none"]
-            print(f"MMMU accuracy: {mmmu_accuracy:.4f}")
-
-            # for qwen2.5-vl-3b-instruct, the accuracy is 0.40
-            self.assertGreater(mmmu_accuracy, 0.40)
+    # test_mmmu and run_mmmu_eval are inherited from MMMUMixin.
 
 
 @unittest.skipIf(
@@ -997,16 +935,21 @@ class TestEPDDisaggregationQwen35(PDDisaggregationServerBase):
         )
 
 
-class TestEPDDisaggregationMultiEncoders(PDDisaggregationServerBase):
+class TestEPDDisaggregationMultiEncoders(MMMUMixin, PDDisaggregationServerBase):
     """
     Test EPD disaggregation with multiple encode servers for load balancing.
     Both encode servers run on GPU 0 (different ports) for testing load distribution.
     """
 
+    # MMMUMixin knobs — Qwen2.5-VL-3B-Instruct gets ~0.40 on the 50-sample subset.
+    accuracy = 0.40
+    mmmu_args = ["--limit", "50"]
+
     @classmethod
     def setUpClass(cls):
         super().setUpClass()
         cls.model = DEFAULT_SMALL_VLM_MODEL_NAME_FOR_TEST
+        cls.base_url = cls.lb_url  # MMMUMixin reads this for OPENAI_API_BASE
         cls.encode_port1 = f"{int(cls.lb_port) + 300}"
         cls.encode_port2 = f"{int(cls.lb_port) + 301}"
         cls.encode_url1 = f"http://{cls.base_host}:{cls.encode_port1}"
@@ -1147,82 +1090,22 @@ class TestEPDDisaggregationMultiEncoders(PDDisaggregationServerBase):
                 except Exception as e:
                     print(f"Error killing process: {e}")
 
-    def run_mmmu_eval(self, model_version: str, output_path: str, limit: str = "50"):
-        """
-        Evaluate a VLM on the MMMU validation set with lmms-eval.
-        Reference: test_vlm_models.py
-
-        Args:
-            model_version: Model version/checkpoint to evaluate
-            output_path: Path to save evaluation results
-            limit: Number of samples to evaluate (default: "50" for CI time constraints)
-        """
-        model = "openai_compatible"
-        tp = 1
-        tasks = "mmmu_val"
-        batch_size = 32
-        log_suffix = "openai_compatible"
-        os.makedirs(output_path, exist_ok=True)
-
-        model_args = f'model_version="{model_version}",tp={tp}'
-
-        cmd = [
-            "python3",
-            "-m",
-            "lmms_eval",
-            "--model",
-            model,
-            "--model_args",
-            model_args,
-            "--tasks",
-            tasks,
-            "--batch_size",
-            str(batch_size),
-            "--log_samples",
-            "--log_samples_suffix",
-            log_suffix,
-            "--output_path",
-            str(output_path),
-            "--limit",
-            limit,
-        ]
-
-        _run_lmms_eval_with_retry(cmd, timeout=3600)
-
-    def test_mmmu(self):
-        """Test MMMU evaluation with EPD disaggregation (multiple encoders)"""
-        # Use a per-test temp dir so result-file lookup can't be confused by
-        # stale JSON left in `./logs/` by neighbouring tests in the same suite.
-        with tempfile.TemporaryDirectory(
-            prefix="epd_multi_encoder_mmmu_"
-        ) as output_path:
-            self.run_mmmu_eval(self.model, output_path)
-
-            # `**` with recursive=True already matches files at the top level
-            # of output_path, so no separate non-recursive fallback is needed.
-            result_files = glob.glob(f"{output_path}/**/*.json", recursive=True)
-            if not result_files:
-                self.fail(f"No JSON result files found in {output_path}")
-
-            result_file_path = result_files[0]
-            with open(result_file_path, "r") as f:
-                result = json.load(f)
-                print(f"MMMU result (multi encoder): {result}")
-
-            mmmu_accuracy = result["results"]["mmmu_val"]["mmmu_acc,none"]
-            print(f"MMMU accuracy (multi encoder): {mmmu_accuracy:.4f}")
-            # for qwen2.5-vl-3b-instruct, the accuracy is 0.40
-            self.assertGreater(mmmu_accuracy, 0.40)
+    # test_mmmu and run_mmmu_eval are inherited from MMMUMixin.
 
 
 @unittest.skipIf(is_in_ci(), "Skipping in CI to reduce multi-GPU runtime")
-class TestEPDDisaggregationGrpcEncoderMMMU(PDDisaggregationServerBase):
+class TestEPDDisaggregationGrpcEncoderMMMU(MMMUMixin, PDDisaggregationServerBase):
     """Test MMMU evaluation with gRPC encoder in EPD mode."""
+
+    # MMMUMixin knobs — Qwen2.5-VL-3B-Instruct gets ~0.40 on the 50-sample subset.
+    accuracy = 0.40
+    mmmu_args = ["--limit", "50"]
 
     @classmethod
     def setUpClass(cls):
         super().setUpClass()
         cls.model = DEFAULT_SMALL_VLM_MODEL_NAME_FOR_TEST
+        cls.base_url = cls.lb_url  # MMMUMixin reads this for OPENAI_API_BASE
         cls.encode_port = f"{int(cls.lb_port) + 304}"
         cls.encode_url = f"grpc://{cls.base_host}:{cls.encode_port}"
 
@@ -1372,62 +1255,7 @@ class TestEPDDisaggregationGrpcEncoderMMMU(PDDisaggregationServerBase):
                 except Exception as e:
                     print(f"Error killing process: {e}")
 
-    def run_mmmu_eval(self, model_version: str, output_path: str, limit: str = "50"):
-        model = "openai_compatible"
-        tp = 1
-        tasks = "mmmu_val"
-        batch_size = 32
-        log_suffix = "openai_compatible"
-        os.makedirs(output_path, exist_ok=True)
-
-        model_args = f'model_version="{model_version}",tp={tp}'
-
-        cmd = [
-            "python3",
-            "-m",
-            "lmms_eval",
-            "--model",
-            model,
-            "--model_args",
-            model_args,
-            "--tasks",
-            tasks,
-            "--batch_size",
-            str(batch_size),
-            "--log_samples",
-            "--log_samples_suffix",
-            log_suffix,
-            "--output_path",
-            str(output_path),
-            "--limit",
-            limit,
-        ]
-
-        _run_lmms_eval_with_retry(cmd, timeout=3600)
-
-    def test_mmmu(self):
-        # Use a per-test temp dir so result-file lookup can't be confused by
-        # stale JSON left in `./logs/` by neighbouring tests in the same suite.
-        with tempfile.TemporaryDirectory(
-            prefix="epd_grpc_encoder_mmmu_"
-        ) as output_path:
-            self.run_mmmu_eval(self.model, output_path)
-
-            # `**` with recursive=True already matches files at the top level
-            # of output_path, so no separate non-recursive fallback is needed.
-            result_files = glob.glob(f"{output_path}/**/*.json", recursive=True)
-            if not result_files:
-                self.fail(f"No JSON result files found in {output_path}")
-
-            result_file_path = result_files[0]
-            with open(result_file_path, "r") as f:
-                result = json.load(f)
-                print(f"MMMU result (grpc encoder): {result}")
-
-            mmmu_accuracy = result["results"]["mmmu_val"]["mmmu_acc,none"]
-            print(f"MMMU accuracy (grpc encoder): {mmmu_accuracy:.4f}")
-            # for qwen2.5-vl-3b-instruct, the accuracy is 0.40
-            self.assertGreater(mmmu_accuracy, 0.40)
+    # test_mmmu and run_mmmu_eval are inherited from MMMUMixin.
 
 
 @unittest.skipIf(is_in_ci(), "Skipping in CI to reduce multi-GPU runtime")
