@@ -134,10 +134,14 @@ def prepare_moe_mxfp4_layer_for_marlin(layer: torch.nn.Module) -> None:
 
     layer.w13_weight = torch.nn.Parameter(w13_marlin, requires_grad=False)
     layer.w2_weight = torch.nn.Parameter(w2_marlin, requires_grad=False)
-    layer.w13_weight_scale_inv = torch.nn.Parameter(w13_scale_marlin, requires_grad=False)
+    layer.w13_weight_scale_inv = torch.nn.Parameter(
+        w13_scale_marlin, requires_grad=False
+    )
     layer.w2_weight_scale_inv = torch.nn.Parameter(w2_scale_marlin, requires_grad=False)
 
     if w13_bias is not None:
-        layer.w13_bias = torch.nn.Parameter(_permute_bias(w13_bias), requires_grad=False)
+        layer.w13_bias = torch.nn.Parameter(
+            _permute_bias(w13_bias), requires_grad=False
+        )
     if w2_bias is not None:
         layer.w2_bias = torch.nn.Parameter(_permute_bias(w2_bias), requires_grad=False)

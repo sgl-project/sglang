@@ -24,7 +24,6 @@
 #include "../marlin/dequant.h"
 #include "../marlin/marlin.cuh"
 #include "../marlin/marlin_dtypes.cuh"
-
 #include <type_traits>
 
 #define STATIC_ASSERT_SCALAR_TYPE_VALID(scalar_t)                                        \
@@ -450,8 +449,7 @@ __global__ void Marlin(
 
     cp_async4_pred(
         sh_block_sorted_ids_int4 + threadIdx.x,
-        reinterpret_cast<const int4*>(sorted_token_ids_ptr) +
-            (block_id * moe_block_size / 4 + threadIdx.x),
+        reinterpret_cast<const int4*>(sorted_token_ids_ptr) + (block_id * moe_block_size / 4 + threadIdx.x),
         threadIdx.x < moe_block_size / 4);
 
     cp_async_fence();
@@ -474,14 +472,10 @@ __global__ void Marlin(
       }
 
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 750
-      if constexpr (moe_block_size >= 16)
-        local_count += __shfl_down_sync(0xFFFFFFFF, local_count, 16);
-      if constexpr (moe_block_size >= 8)
-        local_count += __shfl_down_sync(0xFFFFFFFF, local_count, 8);
-      if constexpr (moe_block_size >= 4)
-        local_count += __shfl_down_sync(0xFFFFFFFF, local_count, 4);
-      if constexpr (moe_block_size >= 2)
-        local_count += __shfl_down_sync(0xFFFFFFFF, local_count, 2);
+      if constexpr (moe_block_size >= 16) local_count += __shfl_down_sync(0xFFFFFFFF, local_count, 16);
+      if constexpr (moe_block_size >= 8) local_count += __shfl_down_sync(0xFFFFFFFF, local_count, 8);
+      if constexpr (moe_block_size >= 4) local_count += __shfl_down_sync(0xFFFFFFFF, local_count, 4);
+      if constexpr (moe_block_size >= 2) local_count += __shfl_down_sync(0xFFFFFFFF, local_count, 2);
 
       local_count += __shfl_down_sync(0xFFFFFFFF, local_count, 1);
       block_num_valid_tokens = local_count;
@@ -500,8 +494,7 @@ __global__ void Marlin(
         idx = idx < prob_m_top_k ? idx : 0;
         scalar_t topk_weight_tmp = Dtype::float2num(topk_weights_ptr[idx]);
         if constexpr (w_type == host::kFE2M1f && s_type == host::kFE4M3fn) {
-          sh_block_topk_weights[threadIdx.x] =
-              __hmul2(global_scale, Dtype::num2num2(topk_weight_tmp));
+          sh_block_topk_weights[threadIdx.x] = __hmul2(global_scale, Dtype::num2num2(topk_weight_tmp));
         } else {
           sh_block_topk_weights[threadIdx.x] = Dtype::num2num2(topk_weight_tmp);
         }
@@ -1040,8 +1033,7 @@ __global__ void Marlin(
           int4* sh_s_stage = sh_s + s_sh_stage * pipe;
 
           if constexpr (!is_8bit_scale) {
-            reinterpret_cast<int4*>(&frag_s[k % 2])[0] =
-                sh_s_stage[s_sh_rd + cur_group_id * s_sh_stride];
+            reinterpret_cast<int4*>(&frag_s[k % 2])[0] = sh_s_stage[s_sh_rd + cur_group_id * s_sh_stride];
           } else {
             reinterpret_cast<int2*>(&frag_s[k % 2])[0] =
                 reinterpret_cast<int2*>(sh_s_stage)[s_sh_rd + cur_group_id * (2 * s_sh_stride)];
@@ -1239,16 +1231,14 @@ __global__ void Marlin(
     }
 
     // FP4/FP8 scale dequantization (E4M3 for NVFP4 and E8M0 for MXFP4).
-    if constexpr ((s_type == host::kFE4M3fn || s_type == host::kFE8M0fnu) &&
-                  !(std::is_same<scalar_t2, half2>::value &&
-                    s_type == host::kFE8M0fnu)) {
+    if constexpr (
+        (s_type == host::kFE4M3fn || s_type == host::kFE8M0fnu) &&
+        !(std::is_same<scalar_t2, half2>::value && s_type == host::kFE8M0fnu)) {
       int s_quant_0 = reinterpret_cast<int*>(frag_s[k2])[0];
       int s_quant_1 = reinterpret_cast<int*>(frag_s[k2])[1];
 
-      dequant_fp8_scales<scalar_t2, s_type_id>(
-          s_quant_0, reinterpret_cast<scalar_t2*>(&frag_s[k2]));
-      dequant_fp8_scales<scalar_t2, s_type_id>(
-          s_quant_1, reinterpret_cast<scalar_t2*>(&frag_s[k2]) + 2);
+      dequant_fp8_scales<scalar_t2, s_type_id>(s_quant_0, reinterpret_cast<scalar_t2*>(&frag_s[k2]));
+      dequant_fp8_scales<scalar_t2, s_type_id>(s_quant_1, reinterpret_cast<scalar_t2*>(&frag_s[k2]) + 2);
     }
 
 // We have the m dimension as the inner loop in order to encourage overlapping
@@ -1882,8 +1872,10 @@ __global__ void Marlin(
             s_gl_rd = s_sh_stride * slice_col + threadIdx.x;
             zp_gl_rd = zp_sh_stride * slice_col + threadIdx.x;
           } else if constexpr (group_blocks >= thread_k_blocks) {
-            s_gl_rd = s_gl_stride * ((thread_k_blocks * slice_row) / group_blocks) + s_sh_stride * slice_col + threadIdx.x;
-            zp_gl_rd = zp_gl_stride * ((thread_k_blocks * slice_row) / group_blocks) + zp_sh_stride * slice_col + threadIdx.x;
+            s_gl_rd =
+                s_gl_stride * ((thread_k_blocks * slice_row) / group_blocks) + s_sh_stride * slice_col + threadIdx.x;
+            zp_gl_rd =
+                zp_gl_stride * ((thread_k_blocks * slice_row) / group_blocks) + zp_sh_stride * slice_col + threadIdx.x;
           } else {
             s_gl_rd = s_gl_stride * ((thread_k_blocks * slice_row) / group_blocks + threadIdx.x / s_sh_stride) +
                       s_sh_stride * slice_col + threadIdx.x % s_sh_stride;

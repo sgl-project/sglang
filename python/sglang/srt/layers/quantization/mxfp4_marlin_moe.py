@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING
 import torch
 from torch.nn import Module
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.moe.moe_runner.marlin import MarlinMoeQuantInfo
 from sglang.srt.layers.moe.utils import MoeRunnerBackend
 from sglang.srt.utils import log_info_on_rank0
