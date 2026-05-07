@@ -671,12 +671,21 @@ class MultiLayerEagleWorker(TpModelWorker):
                 eagle_config = (
                     getattr(self.model_config.hf_config, "eagle_config", None) or {}
                 )
-                num_aux = len(
-                    eagle_config.get(
-                        "eagle_aux_hidden_state_layer_ids", [None, None, None]
-                    )
+                num_aux = getattr(
+                    self.model_config.hf_config, "num_aux_hidden_states", None
                 )
-                hidden_size = self.model_config.hidden_size * num_aux
+                if num_aux is None:
+                    num_aux = len(
+                        eagle_config.get(
+                            "eagle_aux_hidden_state_layer_ids", [None, None, None]
+                        )
+                    )
+                target_hidden = getattr(
+                    self.model_config.hf_config,
+                    "target_hidden_size",
+                    self.model_config.hidden_size,
+                )
+                hidden_size = target_hidden * num_aux
             else:
                 hidden_size = self.model_config.hidden_size
             batch.spec_info = EagleDraftInput.create_idle_input(
