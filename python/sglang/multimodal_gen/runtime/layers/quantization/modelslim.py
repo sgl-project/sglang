@@ -121,15 +121,14 @@ class ModelSlimConfig(QuantizationConfig):
         self,
         layer_name: str,
     ) -> ModelSlimLinearScheme:
+        full_weight_name = layer_name + ".weight"
         if self._name_mapper is not None:
-            mapped_name, _, _ = self._name_mapper(layer_name + ".weight")
+            mapped_name, _, _ = self._name_mapper(full_weight_name)
         else:
-            mapped_name = layer_name
+            mapped_name = full_weight_name
+
         quant_type = self.quant_description.get(mapped_name, "")
-        if self._name_mapper is not None:
-            prefix = mapped_name.removesuffix(".weight")
-        else:
-            prefix = layer_name
+        prefix = mapped_name.removesuffix(".weight")
         if quant_type == "W8A8_DYNAMIC" or quant_type == "W8A8":
             return ModelSlimW8A8Int8(quant_config=self.quant_description, prefix=prefix)
         elif quant_type == "W4A4_DYNAMIC":
