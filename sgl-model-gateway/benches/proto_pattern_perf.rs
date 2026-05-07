@@ -27,9 +27,7 @@
 use bytes::Bytes;
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use serde_json::json;
-use smg::{
-    protocols::chat::ChatCompletionRequest, routers::http::routing_view::ChatRoutingView,
-};
+use smg::{protocols::chat::ChatCompletionRequest, routers::http::routing_view::ChatRoutingView};
 
 fn small_chat() -> Bytes {
     Bytes::from(
@@ -127,8 +125,7 @@ fn bench_proto_vs_typed(c: &mut Criterion) {
             body,
             |b, body| {
                 b.iter(|| {
-                    let view: ChatRoutingView =
-                        serde_json::from_slice(black_box(body)).unwrap();
+                    let view: ChatRoutingView = serde_json::from_slice(black_box(body)).unwrap();
                     black_box(view);
                 });
             },
@@ -158,8 +155,7 @@ fn bench_proto_vs_typed(c: &mut Criterion) {
             body,
             |b, body| {
                 b.iter(|| {
-                    let view: ChatRoutingView =
-                        serde_json::from_slice(black_box(body)).unwrap();
+                    let view: ChatRoutingView = serde_json::from_slice(black_box(body)).unwrap();
                     let cloned = body.clone();
                     black_box((view, cloned));
                 });

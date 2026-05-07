@@ -11,15 +11,12 @@ use axum::{
 };
 use bytes::Bytes;
 
-use crate::{
-    protocols::{
-        classify::ClassifyRequest,
-        completion::CompletionRequest,
-        embedding::EmbeddingRequest,
-        rerank::RerankRequest,
-        responses::{ResponsesGetParams, ResponsesRequest},
-    },
-    routers::http::routing_view::{ChatRoutingView, GenerateRoutingView},
+use crate::protocols::{
+    classify::ClassifyRequest,
+    completion::CompletionRequest,
+    embedding::EmbeddingRequest,
+    rerank::RerankRequest,
+    responses::{ResponsesGetParams, ResponsesRequest},
 };
 
 pub mod conversations;
@@ -80,18 +77,20 @@ pub trait RouterTrait: Send + Sync + Debug {
     /// Route a generate request.
     ///
     /// **Proto-pattern signature** — see
-    /// `proto/sglang/runtime/v1/sglang.proto::OpenAIRequest`. `view`
-    /// captures only the fields the gateway router itself reads
-    /// (model, stream, return_logprob, return_routed_experts, batch
-    /// hints, optional prompt text). `body` is the original client
-    /// request bytes — every other field, including SGLang RL
-    /// extension fields the router doesn't branch on, rides through
-    /// unchanged to the backend.
+    /// `proto/sglang/runtime/v1/sglang.proto::OpenAIRequest`. `body`
+    /// is the original client request bytes; the receiving router
+    /// parses exactly what it needs (HTTP unified parses a routing
+    /// view, PD parses a `Value` because it has to mutate the body
+    /// for bootstrap injection, gRPC parses the typed proto request).
+    /// Routing decisions that need a model id come from `model_id`
+    /// when `RouterManager` resolved one in IGW mode (single
+    /// registered model = implicit default); otherwise routers fall
+    /// back to whatever's in `body`.
     async fn route_generate(
         &self,
         _headers: Option<&HeaderMap>,
-        _view: &GenerateRoutingView,
         _body: &Bytes,
+        _model_id: Option<&str>,
     ) -> Response {
         (
             StatusCode::NOT_IMPLEMENTED,
@@ -101,12 +100,12 @@ pub trait RouterTrait: Send + Sync + Debug {
     }
 
     /// Route a chat completion request. See `route_generate` for the
-    /// meaning of `view` and `body`.
+    /// meaning of `body` and `model_id`.
     async fn route_chat(
         &self,
         headers: Option<&HeaderMap>,
-        view: &ChatRoutingView,
         body: &Bytes,
+        model_id: Option<&str>,
     ) -> Response;
 
     /// Route a completion request

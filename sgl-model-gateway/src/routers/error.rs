@@ -71,7 +71,7 @@ pub fn create_error(
         headers,
         Json(ErrorResponse {
             error: ErrorDetail {
-                error_type: status_code_to_str(status),
+                error_type: error_type_for_status(status),
                 code: &code_str,
                 message: &message_str,
             },
@@ -80,10 +80,21 @@ pub fn create_error(
         .into_response()
 }
 
-fn status_code_to_str(status_code: StatusCode) -> &'static str {
-    status_code
-        .canonical_reason()
-        .unwrap_or("Unknown Status Code")
+/// OpenAI-compat error class string. SDK clients classify on this
+/// field — `RateLimitError`, `AuthenticationError`, etc. are
+/// dispatched off the `error.type` value, so a 429 must come back as
+/// `rate_limit_error` (not the catch-all `invalid_request_error`)
+/// for client retry/backoff logic to fire.
+fn error_type_for_status(status: StatusCode) -> &'static str {
+    match status {
+        StatusCode::UNAUTHORIZED => "authentication_error",
+        StatusCode::FORBIDDEN => "permission_error",
+        StatusCode::NOT_FOUND => "not_found_error",
+        StatusCode::TOO_MANY_REQUESTS => "rate_limit_error",
+        s if s.is_client_error() => "invalid_request_error",
+        s if s.is_server_error() => "server_error",
+        _ => "api_error",
+    }
 }
 
 pub fn extract_error_code_from_response<B>(response: &Response<B>) -> &str {

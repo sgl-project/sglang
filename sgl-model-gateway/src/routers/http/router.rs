@@ -38,7 +38,7 @@ use crate::{
         error::{self, extract_error_code_from_response},
         grpc::utils::{error_type_from_status, route_to_endpoint},
         header_utils,
-        http::routing_view::{ChatRoutingView, GenerateRoutingView},
+        http::routing_view::{view_parse_error, ChatRoutingView, GenerateRoutingView},
         RouterTrait,
     },
 };
@@ -657,7 +657,7 @@ impl Router {
                 Ok(v) => v,
                 Err(e) => {
                     return error::bad_request(
-                        "json_parse_failed",
+                        "json_parse_error",
                         format!("dp_aware: failed to parse body as JSON: {e}"),
                     );
                 }
@@ -712,8 +712,8 @@ impl Router {
             }
         };
 
-        let status =
-            StatusCode::from_u16(res.status().as_u16()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+        let status = StatusCode::from_u16(res.status().as_u16())
+            .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
 
         if !is_stream {
             let response_headers = header_utils::preserve_response_headers(res.headers());
@@ -1019,14 +1019,18 @@ impl RouterTrait for Router {
     async fn route_generate(
         &self,
         headers: Option<&HeaderMap>,
-        view: &GenerateRoutingView,
         body: &Bytes,
+        model_id: Option<&str>,
     ) -> Response {
+        let view: GenerateRoutingView = match serde_json::from_slice(body) {
+            Ok(v) => v,
+            Err(e) => return view_parse_error::<GenerateRoutingView>(body, e),
+        };
         self.route_bytes_request(
             headers,
             body,
             "/generate",
-            view.model.as_deref(),
+            model_id.or(view.model.as_deref()),
             view.stream,
             view.text.as_deref(),
         )
@@ -1036,14 +1040,18 @@ impl RouterTrait for Router {
     async fn route_chat(
         &self,
         headers: Option<&HeaderMap>,
-        view: &ChatRoutingView,
         body: &Bytes,
+        model_id: Option<&str>,
     ) -> Response {
+        let view: ChatRoutingView = match serde_json::from_slice(body) {
+            Ok(v) => v,
+            Err(e) => return view_parse_error::<ChatRoutingView>(body, e),
+        };
         self.route_bytes_request(
             headers,
             body,
             "/v1/chat/completions",
-            Some(&view.model),
+            model_id.or(Some(view.model.as_str())),
             view.stream,
             // Cache-aware text extraction for chat would walk the
             // messages array. The unified router doesn't currently

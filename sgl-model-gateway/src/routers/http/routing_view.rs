@@ -219,6 +219,47 @@ impl ViewSchema for GenerateRoutingView {
     }
 }
 
+/// Walks an already-parsed JSON value and returns the first SGLang
+/// extension field that violates its expected type, or `None` when
+/// every present extension field is correctly typed. Used by routers
+/// (e.g. PD) that parse the body to `serde_json::Value` directly and
+/// therefore can't rely on a typed-deserialize failure to surface
+/// extension type errors.
+pub fn validate_extensions_in_value<V: ViewSchema>(
+    value: &serde_json::Value,
+) -> Option<&'static str> {
+    let obj = value.as_object()?;
+    for &field in V::EXTENSION_FIELDS {
+        if let Some(slot) = obj.get(field) {
+            if !V::extension_type_matches(field, slot) {
+                return Some(field);
+            }
+        }
+    }
+    None
+}
+
+/// Convert a failed routing-view parse into a structured 400. Promotes
+/// known-extension type mismatches (e.g. `return_routed_experts: "yes"`)
+/// to `invalid_sglang_extension` instead of folding them into the
+/// generic `json_parse_error`. Routers that parse a typed view (HTTP
+/// unified, gRPC) call this on `serde_json::Error`.
+pub fn view_parse_error<V: ViewSchema>(
+    body: &bytes::Bytes,
+    err: serde_json::Error,
+) -> axum::response::Response {
+    use crate::routers::error::bad_request;
+    match classify_parse_error::<V>(body) {
+        ParseErrorKind::InvalidSglangExtension(field) => bad_request(
+            "invalid_sglang_extension",
+            format!("Invalid SGLang extension field `{field}`: {err}"),
+        ),
+        ParseErrorKind::Json | ParseErrorKind::InvalidViewField => {
+            bad_request("json_parse_error", format!("Invalid JSON data: {err}"))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -289,5 +330,83 @@ mod tests {
         let v: GenerateRoutingView = serde_json::from_slice(body).unwrap();
         assert_eq!(v.text.as_deref(), Some("hello world"));
         assert!(v.return_routed_experts);
+    }
+
+    /// Routers that take a permissive `Value` parse (PD, gRPC) rely
+    /// on this helper to surface the same `invalid_sglang_extension`
+    /// 400 the typed-view path would produce. These tests pin that
+    /// contract so a future router added on the same shape stays
+    /// honest.
+    mod validate_extensions {
+        use serde_json::json;
+
+        use super::super::*;
+
+        #[test]
+        fn flags_wrong_typed_chat_extension() {
+            let value = json!({
+                "model": "x",
+                "messages": [],
+                "return_routed_experts": "yes"
+            });
+            assert_eq!(
+                validate_extensions_in_value::<ChatRoutingView>(&value),
+                Some("return_routed_experts")
+            );
+        }
+
+        #[test]
+        fn flags_wrong_typed_generate_extension() {
+            let value = json!({"text": "hi", "return_routed_experts": 1});
+            assert_eq!(
+                validate_extensions_in_value::<GenerateRoutingView>(&value),
+                Some("return_routed_experts")
+            );
+        }
+
+        #[test]
+        fn passes_correctly_typed_extension() {
+            let value = json!({
+                "model": "x",
+                "messages": [],
+                "return_routed_experts": true
+            });
+            assert_eq!(
+                validate_extensions_in_value::<ChatRoutingView>(&value),
+                None
+            );
+        }
+
+        #[test]
+        fn passes_when_extension_absent() {
+            let value = json!({"model": "x", "messages": []});
+            assert_eq!(
+                validate_extensions_in_value::<ChatRoutingView>(&value),
+                None
+            );
+        }
+
+        #[test]
+        fn null_extension_value_is_a_type_mismatch() {
+            // `null` is not a boolean — surface as
+            // `invalid_sglang_extension` so the client sees it
+            // instead of having the field silently dropped.
+            let value = json!({"return_routed_experts": null});
+            assert_eq!(
+                validate_extensions_in_value::<GenerateRoutingView>(&value),
+                Some("return_routed_experts")
+            );
+        }
+
+        #[test]
+        fn non_object_top_level_returns_none() {
+            // Top-level shape mismatch isn't this helper's concern;
+            // typed parse will reject downstream.
+            let value = json!([1, 2, 3]);
+            assert_eq!(
+                validate_extensions_in_value::<ChatRoutingView>(&value),
+                None
+            );
+        }
     }
 }

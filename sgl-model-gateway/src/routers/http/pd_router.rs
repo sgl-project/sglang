@@ -31,17 +31,14 @@ use crate::{
     },
     policies::{LoadBalancingPolicy, PolicyRegistry, SelectWorkerInfo},
     protocols::{
-        classify::ClassifyRequest,
-        common::StringOrArray,
-        completion::CompletionRequest,
-        embedding::EmbeddingRequest,
-        rerank::RerankRequest,
+        classify::ClassifyRequest, common::StringOrArray, completion::CompletionRequest,
+        embedding::EmbeddingRequest, rerank::RerankRequest,
     },
     routers::{
         error,
         grpc::utils::{error_type_from_status, route_to_endpoint},
         header_utils,
-        http::routing_view::{ChatRoutingView, GenerateRoutingView},
+        http::routing_view::{validate_extensions_in_value, ChatRoutingView, GenerateRoutingView},
         RouterTrait,
     },
 };
@@ -195,10 +192,10 @@ impl PDRouter {
         error::internal_error("serialization_failed", "Failed to serialize request")
     }
 
-    // get_generate_batch_size / get_chat_batch_size moved to
-    // GenerateRoutingView::batch_size / ChatRoutingView::batch_size —
-    // the routing view computes batch size at parse time without
-    // needing the full typed struct.
+    // Batch-size derivation lives in the free functions
+    // `generate_batch_size_from_value` / `chat_batch_size_from_value`
+    // below so PD can read them off the same `Value` it parses for
+    // bootstrap injection.
 
     fn get_completion_batch_size(req: &CompletionRequest) -> Option<usize> {
         if let StringOrArray::Array(arr) = &req.prompt {
@@ -686,6 +683,40 @@ impl PDRouter {
         let prefill_policy = self.policy_registry.get_prefill_policy();
         let decode_policy = self.policy_registry.get_decode_policy();
         prefill_policy.needs_request_text() || decode_policy.needs_request_text()
+    }
+
+    /// Pull the cache-aware routing prefix out of an already-parsed
+    /// chat body. Mirrors the pre-refactor typed extraction:
+    /// - first message only;
+    /// - user/developer with string content → that string (multimodal
+    ///   parts intentionally yield `None`, since hashing on a flat
+    ///   image URL gives no useful prefix);
+    /// - system with string content → that string;
+    /// - system with parts → concatenation of `text`-typed parts (so
+    ///   multimodal system prompts still produce a stable hash key);
+    /// - everything else → `None`.
+    fn extract_chat_request_text(json: &Value) -> Option<String> {
+        let msg = json.get("messages")?.as_array()?.first()?;
+        let role = msg.get("role")?.as_str()?;
+        let content = msg.get("content")?;
+        match role {
+            "user" | "developer" => content.as_str().map(str::to_string),
+            "system" => match content {
+                Value::String(s) => Some(s.clone()),
+                Value::Array(parts) => {
+                    let joined: String = parts
+                        .iter()
+                        .filter_map(|p| {
+                            (p.get("type")?.as_str()? == "text")
+                                .then(|| p.get("text")?.as_str().map(str::to_string))?
+                        })
+                        .collect();
+                    (!joined.is_empty()).then_some(joined)
+                }
+                _ => None,
+            },
+            _ => None,
+        }
     }
 
     async fn select_pd_pair(
@@ -1320,12 +1351,36 @@ impl RouterTrait for PDRouter {
     async fn route_generate(
         &self,
         headers: Option<&HeaderMap>,
-        view: &GenerateRoutingView,
         body: &Bytes,
+        model_id: Option<&str>,
     ) -> Response {
-        let is_stream = view.stream;
-        let return_logprob = view.return_logprob.unwrap_or(false);
-        let return_routed_experts = view.return_routed_experts;
+        // PD has to mutate the body (bootstrap_host/port/room
+        // injection per attempt), so we parse to `Value` either way.
+        // Routing-decision fields are read off the same `Value` so
+        // there's no second `from_slice` over the bytes.
+        let request_json: Value = match serde_json::from_slice(body) {
+            Ok(v) => v,
+            Err(e) => {
+                return error::bad_request("json_parse_error", format!("Invalid JSON data: {e}"));
+            }
+        };
+
+        // Preserve the structured-400 contract: SGLang extension
+        // fields with the wrong type get the named
+        // `invalid_sglang_extension` code instead of being silently
+        // forwarded. The view's typed Deserialize would have caught
+        // this; with a permissive Value parse we re-check explicitly.
+        if let Some(field) = validate_extensions_in_value::<GenerateRoutingView>(&request_json) {
+            return error::bad_request(
+                "invalid_sglang_extension",
+                format!("Invalid SGLang extension field `{field}`"),
+            );
+        }
+
+        let is_stream = json_bool(&request_json, "stream").unwrap_or(false);
+        let return_logprob = json_bool(&request_json, "return_logprob").unwrap_or(false);
+        let return_routed_experts =
+            json_bool(&request_json, "return_routed_experts").unwrap_or(false);
 
         if is_stream && return_routed_experts {
             return error::bad_request(
@@ -1337,33 +1392,27 @@ impl RouterTrait for PDRouter {
             );
         }
 
-        let request_text = if self.policies_need_request_text() {
-            view.text.clone()
-        } else {
-            None
-        };
+        let body_model = request_json.get("model").and_then(Value::as_str);
+        let effective_model = model_id.or(body_model);
 
-        // PD has to mutate the body (bootstrap_host/port/room
-        // injection per attempt), so we parse to Value here. Unlike
-        // the unified router, PD can never get to O(1) wire-build.
-        let request_json: Value = match serde_json::from_slice(body) {
-            Ok(v) => v,
-            Err(e) => {
-                return error::bad_request(
-                    "json_parse_failed",
-                    format!("Failed to parse request body as JSON: {e}"),
-                );
-            }
-        };
+        let request_text = self
+            .policies_need_request_text()
+            .then(|| {
+                request_json
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            })
+            .flatten();
 
         let context = PDRequestContext {
             route: "/generate",
-            batch_size: view.batch_size(),
+            batch_size: generate_batch_size_from_value(&request_json),
             is_stream,
             return_logprob,
             return_routed_experts,
             request_text,
-            model_id: view.model.as_deref(),
+            model_id: effective_model,
             headers: headers.cloned(),
         };
 
@@ -1374,12 +1423,27 @@ impl RouterTrait for PDRouter {
     async fn route_chat(
         &self,
         headers: Option<&HeaderMap>,
-        view: &ChatRoutingView,
         body: &Bytes,
+        model_id: Option<&str>,
     ) -> Response {
-        let is_stream = view.stream;
-        let return_logprob = view.logprobs;
-        let return_routed_experts = view.return_routed_experts;
+        let request_json: Value = match serde_json::from_slice(body) {
+            Ok(v) => v,
+            Err(e) => {
+                return error::bad_request("json_parse_error", format!("Invalid JSON data: {e}"));
+            }
+        };
+
+        if let Some(field) = validate_extensions_in_value::<ChatRoutingView>(&request_json) {
+            return error::bad_request(
+                "invalid_sglang_extension",
+                format!("Invalid SGLang extension field `{field}`"),
+            );
+        }
+
+        let is_stream = json_bool(&request_json, "stream").unwrap_or(false);
+        let return_logprob = json_bool(&request_json, "logprobs").unwrap_or(false);
+        let return_routed_experts =
+            json_bool(&request_json, "return_routed_experts").unwrap_or(false);
 
         if is_stream && return_routed_experts {
             return error::bad_request(
@@ -1391,30 +1455,24 @@ impl RouterTrait for PDRouter {
             );
         }
 
-        // Cache-aware text extraction on chat would walk the JSON
-        // messages array. Demo skips it; production could add a
-        // lazy text view (e.g. messages: Vec<RawValue>) and walk on
-        // demand.
-        let request_text = None;
+        let body_model = request_json.get("model").and_then(Value::as_str);
+        let effective_model = model_id.or(body_model);
 
-        let request_json: Value = match serde_json::from_slice(body) {
-            Ok(v) => v,
-            Err(e) => {
-                return error::bad_request(
-                    "json_parse_failed",
-                    format!("Failed to parse request body as JSON: {e}"),
-                );
-            }
-        };
+        // Cache-aware / manual policies hash on the request prefix; if
+        // no active policy needs it, skip the walk entirely.
+        let request_text = self
+            .policies_need_request_text()
+            .then(|| Self::extract_chat_request_text(&request_json))
+            .flatten();
 
         let context = PDRequestContext {
             route: "/v1/chat/completions",
-            batch_size: view.batch_size(),
+            batch_size: chat_batch_size_from_value(&request_json),
             is_stream,
             return_logprob,
             return_routed_experts,
             request_text,
-            model_id: Some(&view.model),
+            model_id: effective_model,
             headers: headers.cloned(),
         };
 
@@ -1514,6 +1572,36 @@ impl RouterTrait for PDRouter {
 
     fn router_type(&self) -> &'static str {
         "pd"
+    }
+}
+
+/// Read a top-level JSON boolean field by name. Used by the PD
+/// router to pull routing flags (`stream`, `return_logprob`,
+/// `return_routed_experts`) off the `Value` it already parsed for
+/// bootstrap injection.
+fn json_bool(value: &Value, key: &str) -> Option<bool> {
+    value.get(key)?.as_bool()
+}
+
+/// Mirrors `GenerateRoutingView::batch_size` but reads from a raw
+/// `Value` so PD doesn't have to re-construct the typed view. SGLang's
+/// `input_ids` is either `Vec<u32>` (single — its length is the token
+/// count, NOT the batch size) or `Vec<Vec<u32>>` (batch — outer length
+/// IS the batch size); disambiguate by the type of the first element.
+fn generate_batch_size_from_value(value: &Value) -> Option<usize> {
+    let arr = value.get("input_ids")?.as_array()?;
+    match arr.first() {
+        Some(Value::Array(_)) => Some(arr.len()),
+        _ => None,
+    }
+}
+
+/// Mirrors `ChatRoutingView::batch_size`: `n > 1` triggers PD batch
+/// estimation, anything else is single-shot.
+fn chat_batch_size_from_value(value: &Value) -> Option<usize> {
+    match value.get("n")?.as_u64()? {
+        n if n > 1 => Some(n as usize),
+        _ => None,
     }
 }
 
@@ -1682,5 +1770,103 @@ mod tests {
         // Guards dropped when response dropped
         assert_eq!(prefill_ref.load(), 0);
         assert_eq!(decode_ref.load(), 0);
+    }
+
+    /// Cache-aware policies hash on a stable text prefix per request.
+    /// These tests pin the JSON-walker behaviour for each role +
+    /// content shape, so the routing prefix is consistent with what
+    /// the hash policies expect.
+    mod extract_chat_request_text {
+        use serde_json::json;
+
+        use super::super::PDRouter;
+
+        #[test]
+        fn user_string_content() {
+            let body = json!({
+                "messages": [{"role": "user", "content": "deep learning is"}]
+            });
+            assert_eq!(
+                PDRouter::extract_chat_request_text(&body),
+                Some("deep learning is".to_string())
+            );
+        }
+
+        #[test]
+        fn developer_string_content() {
+            let body = json!({
+                "messages": [{"role": "developer", "content": "be concise"}]
+            });
+            assert_eq!(
+                PDRouter::extract_chat_request_text(&body),
+                Some("be concise".to_string())
+            );
+        }
+
+        #[test]
+        fn system_string_content() {
+            let body = json!({
+                "messages": [{"role": "system", "content": "you are helpful"}]
+            });
+            assert_eq!(
+                PDRouter::extract_chat_request_text(&body),
+                Some("you are helpful".to_string())
+            );
+        }
+
+        #[test]
+        fn user_multimodal_parts_yields_none() {
+            // Match pre-refactor: hashing on a flat image URL gives no
+            // useful prefix, so user/developer with parts → None.
+            let body = json!({
+                "messages": [{
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "describe this image"},
+                        {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAA"}}
+                    ]
+                }]
+            });
+            assert_eq!(PDRouter::extract_chat_request_text(&body), None);
+        }
+
+        #[test]
+        fn system_multimodal_parts_concatenates_text() {
+            let body = json!({
+                "messages": [{
+                    "role": "system",
+                    "content": [
+                        {"type": "text", "text": "you are "},
+                        {"type": "text", "text": "helpful"},
+                        {"type": "image_url", "image_url": {"url": "ignored"}}
+                    ]
+                }]
+            });
+            assert_eq!(
+                PDRouter::extract_chat_request_text(&body),
+                Some("you are helpful".to_string())
+            );
+        }
+
+        #[test]
+        fn assistant_first_message_yields_none() {
+            // Only user/developer/system carry a routing-meaningful prefix.
+            let body = json!({
+                "messages": [{"role": "assistant", "content": "earlier reply"}]
+            });
+            assert_eq!(PDRouter::extract_chat_request_text(&body), None);
+        }
+
+        #[test]
+        fn missing_messages_yields_none() {
+            let body = json!({"model": "x"});
+            assert_eq!(PDRouter::extract_chat_request_text(&body), None);
+        }
+
+        #[test]
+        fn empty_messages_yields_none() {
+            let body = json!({"messages": []});
+            assert_eq!(PDRouter::extract_chat_request_text(&body), None);
+        }
     }
 }

@@ -30,12 +30,28 @@ use crate::{
         rerank::RerankRequest,
         responses::{ResponsesGetParams, ResponsesRequest},
     },
-    routers::{
-        http::routing_view::{ChatRoutingView, GenerateRoutingView},
-        RouterTrait,
-    },
+    routers::{error, RouterTrait},
     server::ServerConfig,
 };
+
+/// Read the `model` field out of a parsed body for IGW dispatch.
+/// Distinguishes three input shapes that previously all collapsed
+/// to "no model":
+/// - `Some(Ok(Some(s)))` — explicit string model id;
+/// - `Some(Ok(None))` — field absent, or present as JSON `null`;
+/// - `Some(Err(_))` — field present but not a string, e.g. `model: 42`;
+///   surface a structured 400 instead of silently routing to the
+///   single-model implicit default.
+fn extract_body_model(value: &Value) -> Result<Option<&str>, Response> {
+    match value.get("model") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(s)) => Ok(Some(s.as_str())),
+        Some(_) => Err(error::bad_request(
+            "json_parse_error",
+            "Field `model` must be a string",
+        )),
+    }
+}
 
 #[derive(Debug, Clone, Hash, Eq, PartialEq)]
 pub struct RouterId(&'static str);
@@ -248,13 +264,10 @@ impl RouterManager {
         let available_models = self.worker_registry.get_models();
 
         match available_models.len() {
-            0 => Err(Box::new(
-                (
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "No models available - no workers registered",
-                )
-                    .into_response(),
-            )),
+            0 => Err(Box::new(error::service_unavailable(
+                "no_models_available",
+                "No models available - no workers registered",
+            ))),
             1 => {
                 // Single model: use it as implicit default
                 debug!(
@@ -263,19 +276,13 @@ impl RouterManager {
                 );
                 Ok(available_models[0].clone())
             }
-            _ => {
-                // Multiple models: require explicit model specification
-                Err(Box::new(
-                    (
-                        StatusCode::BAD_REQUEST,
-                        format!(
-                            "Model must be specified. Available models: {}",
-                            available_models.join(", ")
-                        ),
-                    )
-                        .into_response(),
-                ))
-            }
+            _ => Err(Box::new(error::bad_request(
+                "model_required",
+                format!(
+                    "Model must be specified. Available models: {}",
+                    available_models.join(", ")
+                ),
+            ))),
         }
     }
 
@@ -417,11 +424,10 @@ impl RouterTrait for RouterManager {
         if has_healthy_workers {
             (StatusCode::OK, "At least one router has healthy workers").into_response()
         } else {
-            (
-                StatusCode::SERVICE_UNAVAILABLE,
+            error::service_unavailable(
+                "no_healthy_workers",
                 "No routers with healthy workers available",
             )
-                .into_response()
         }
     }
 
@@ -443,7 +449,7 @@ impl RouterTrait for RouterManager {
         let model_names = self.worker_registry.get_models();
 
         if model_names.is_empty() {
-            (StatusCode::SERVICE_UNAVAILABLE, "No models available").into_response()
+            error::service_unavailable("no_models_available", "No models available")
         } else {
             // Convert model names to OpenAI-compatible model objects
             let models: Vec<Value> = model_names
@@ -489,64 +495,111 @@ impl RouterTrait for RouterManager {
         if let Some(router) = router {
             router.get_model_info(req).await
         } else {
-            (StatusCode::SERVICE_UNAVAILABLE, "No routers available").into_response()
+            error::service_unavailable("no_routers_available", "No routers available")
         }
     }
 
     async fn route_generate(
         &self,
         headers: Option<&HeaderMap>,
-        view: &GenerateRoutingView,
         body: &Bytes,
+        model_id: Option<&str>,
     ) -> Response {
-        let _effective_model_id = if self.enable_igw {
-            match self.resolve_model_id(view.model.as_deref()) {
-                Ok(id) => Some(id),
-                Err(err_response) => return *err_response,
+        // Non-IGW fast path: hand body+model_id straight to the default
+        // router and skip parsing entirely.
+        if !self.enable_igw {
+            let Some(router) = self.select_router_for_request(headers, model_id) else {
+                return error::not_found(
+                    "no_router_available",
+                    "No router available for this request",
+                );
+            };
+            return router.route_generate(headers, body, model_id).await;
+        }
+
+        // IGW: parse `Value` so a malformed body fails fast with a
+        // structured error here, rather than being silently routed to
+        // the implicit-default model and only rejected later by the
+        // chosen router (which would pollute metrics/labels with a
+        // model the client never asked for).
+        let value: Value = match serde_json::from_slice(body) {
+            Ok(v) => v,
+            Err(e) => {
+                return error::bad_request("json_parse_error", format!("Invalid JSON data: {e}"));
             }
-        } else {
-            None
+        };
+        let body_model = match extract_body_model(&value) {
+            Ok(m) => m,
+            Err(resp) => return resp,
+        };
+        let effective_model_id = match self.resolve_model_id(body_model) {
+            Ok(id) => id,
+            Err(err_response) => return *err_response,
         };
 
-        let router = self.select_router_for_request(headers, view.model.as_deref());
-
-        if let Some(router) = router {
-            router.route_generate(headers, view, body).await
-        } else {
-            (
-                StatusCode::NOT_FOUND,
+        let Some(router) = self.select_router_for_request(headers, Some(&effective_model_id))
+        else {
+            return error::not_found(
+                "no_router_available",
                 "No router available for this request",
-            )
-                .into_response()
-        }
+            );
+        };
+
+        router
+            .route_generate(headers, body, Some(&effective_model_id))
+            .await
     }
 
     async fn route_chat(
         &self,
         headers: Option<&HeaderMap>,
-        view: &ChatRoutingView,
         body: &Bytes,
+        model_id: Option<&str>,
     ) -> Response {
-        let _effective_model_id = if self.enable_igw {
-            match self.resolve_model_id(Some(&view.model)) {
-                Ok(id) => Some(id),
-                Err(err_response) => return *err_response,
+        if !self.enable_igw {
+            let Some(router) = self.select_router_for_request(headers, model_id) else {
+                return error::not_found(
+                    "no_router_available",
+                    "No router available for this request",
+                );
+            };
+            return router.route_chat(headers, body, model_id).await;
+        }
+
+        // IGW: same shape as generate — hard-fail on malformed JSON
+        // here so it can't masquerade as "no model field" and reach
+        // an unrelated worker. Chat clients normally supply `model`;
+        // when they don't and a single model is registered the IGW
+        // resolver still treats it as the implicit default.
+        let value: Value = match serde_json::from_slice(body) {
+            Ok(v) => v,
+            Err(e) => {
+                return error::bad_request("json_parse_error", format!("Invalid JSON data: {e}"));
             }
-        } else {
-            None
+        };
+        let body_model = match extract_body_model(&value) {
+            Ok(m) => m,
+            Err(resp) => return resp,
+        };
+        let effective_model_id = match self.resolve_model_id(body_model) {
+            Ok(id) => id,
+            Err(err_response) => return *err_response,
         };
 
-        let router = self.select_router_for_request(headers, Some(&view.model));
+        let Some(router) = self.select_router_for_request(headers, Some(&effective_model_id))
+        else {
+            return error::not_found(
+                "no_router_available",
+                format!(
+                    "Model '{}' not found or no router available",
+                    effective_model_id
+                ),
+            );
+        };
 
-        if let Some(router) = router {
-            router.route_chat(headers, view, body).await
-        } else {
-            (
-                StatusCode::NOT_FOUND,
-                format!("Model '{}' not found or no router available", view.model),
-            )
-                .into_response()
-        }
+        router
+            .route_chat(headers, body, Some(&effective_model_id))
+            .await
     }
 
     async fn route_completion(
@@ -576,11 +629,10 @@ impl RouterTrait for RouterManager {
                 .route_completion(headers, body, effective_model_id.as_deref().or(model_id))
                 .await
         } else {
-            (
-                StatusCode::NOT_FOUND,
+            error::not_found(
+                "no_router_available",
                 format!("Model '{}' not found or no router available", body.model),
             )
-                .into_response()
         }
     }
 
@@ -596,11 +648,10 @@ impl RouterTrait for RouterManager {
         if let Some(router) = router {
             router.route_responses(headers, body, selected_model).await
         } else {
-            (
-                StatusCode::NOT_FOUND,
+            error::not_found(
+                "no_router_available",
                 "No router available to handle responses request",
             )
-                .into_response()
         }
     }
 
@@ -614,11 +665,10 @@ impl RouterTrait for RouterManager {
         if let Some(router) = router {
             router.get_response(headers, response_id, params).await
         } else {
-            (
-                StatusCode::NOT_FOUND,
+            error::not_found(
+                "no_router_available",
                 format!("No router available to get response '{}'", response_id),
             )
-                .into_response()
         }
     }
 
@@ -627,11 +677,10 @@ impl RouterTrait for RouterManager {
         if let Some(router) = router {
             router.cancel_response(headers, response_id).await
         } else {
-            (
-                StatusCode::NOT_FOUND,
+            error::not_found(
+                "no_router_available",
                 format!("No router available to cancel response '{}'", response_id),
             )
-                .into_response()
         }
     }
 
@@ -654,11 +703,10 @@ impl RouterTrait for RouterManager {
         if let Some(router) = router {
             router.list_response_input_items(headers, response_id).await
         } else {
-            (
-                StatusCode::NOT_FOUND,
+            error::not_found(
+                "no_router_available",
                 "No router available to list response input items",
             )
-                .into_response()
         }
     }
 
@@ -673,11 +721,10 @@ impl RouterTrait for RouterManager {
         if let Some(router) = router {
             router.route_embeddings(headers, body, model_id).await
         } else {
-            (
-                StatusCode::NOT_FOUND,
+            error::not_found(
+                "no_router_available",
                 format!("Model '{}' not found or no router available", body.model),
             )
-                .into_response()
         }
     }
 
@@ -692,11 +739,10 @@ impl RouterTrait for RouterManager {
         if let Some(router) = router {
             router.route_classify(headers, body, model_id).await
         } else {
-            (
-                StatusCode::NOT_FOUND,
+            error::not_found(
+                "no_router_available",
                 format!("Model '{}' not found or no router available", body.model),
             )
-                .into_response()
         }
     }
 
@@ -711,11 +757,10 @@ impl RouterTrait for RouterManager {
         if let Some(router) = router {
             router.route_rerank(headers, body, model_id).await
         } else {
-            (
-                StatusCode::NOT_FOUND,
+            error::not_found(
+                "no_router_available",
                 "No router available for rerank request",
             )
-                .into_response()
         }
     }
 
@@ -735,5 +780,94 @@ impl std::fmt::Debug for RouterManager {
             .field("workers_count", &self.worker_registry.get_all().len())
             .field("default_router", &*default_router)
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{collections::HashMap, sync::Mutex};
+
+    use super::*;
+    use crate::core::{BasicWorkerBuilder, Worker};
+
+    /// Mock router that records the `model_id` argument it receives,
+    /// so tests can assert what `RouterManager` plumbed through.
+    #[derive(Debug, Default)]
+    struct CaptureRouter {
+        seen_generate_model: Mutex<Vec<Option<String>>>,
+    }
+
+    #[async_trait]
+    impl RouterTrait for CaptureRouter {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+
+        async fn route_generate(
+            &self,
+            _headers: Option<&HeaderMap>,
+            _body: &Bytes,
+            model_id: Option<&str>,
+        ) -> Response {
+            self.seen_generate_model
+                .lock()
+                .unwrap()
+                .push(model_id.map(str::to_string));
+            (StatusCode::OK, "captured").into_response()
+        }
+
+        async fn route_chat(
+            &self,
+            _headers: Option<&HeaderMap>,
+            _body: &Bytes,
+            _model_id: Option<&str>,
+        ) -> Response {
+            (StatusCode::OK, "captured").into_response()
+        }
+
+        fn router_type(&self) -> &'static str {
+            "capture-mock"
+        }
+    }
+
+    /// IGW (k8s-mode) implicit-default-model contract: when service
+    /// discovery has registered exactly one model and the client
+    /// omits `"model"`, the manager must resolve it via
+    /// `resolve_model_id` and forward the resolved id to the chosen
+    /// router as `model_id`. Without this, downstream metrics labels,
+    /// worker selection, and cache-aware policies all lose the
+    /// model dimension.
+    #[tokio::test]
+    async fn igw_route_generate_propagates_resolved_model() {
+        let registry = Arc::new(WorkerRegistry::new());
+        let mut labels = HashMap::new();
+        labels.insert("model_id".to_string(), "test-model-a".to_string());
+        let worker: Arc<dyn Worker> = Arc::from(
+            BasicWorkerBuilder::new("http://capture-worker:9999")
+                .worker_type(WorkerType::Regular)
+                .labels(labels)
+                .build(),
+        );
+        registry.register(worker);
+
+        let mut manager = RouterManager::new(registry);
+        manager.enable_igw = true;
+        let manager = Arc::new(manager);
+
+        let capture = Arc::new(CaptureRouter::default());
+        manager.register_router(router_ids::HTTP_REGULAR, capture.clone());
+
+        // Client omits "model" in the body — IGW must resolve the
+        // single registered worker's model id and pass it down.
+        let body = Bytes::from(r#"{"text":"hi"}"#);
+        let response = manager.route_generate(None, &body, None).await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let seen = capture.seen_generate_model.lock().unwrap().clone();
+        assert_eq!(
+            seen,
+            vec![Some("test-model-a".to_string())],
+            "downstream router must see the IGW-resolved model id, not None"
+        );
     }
 }

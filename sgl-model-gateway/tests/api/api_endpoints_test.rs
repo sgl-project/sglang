@@ -1726,8 +1726,7 @@ mod sglang_extension_tests {
     /// echoes whatever `routed_experts_b64` it was configured with).
     #[tokio::test]
     async fn test_unified_generate_forwards_routed_experts() {
-        let expected_b64 =
-            base64::engine::general_purpose::STANDARD.encode([10u8, 20, 30]);
+        let expected_b64 = base64::engine::general_purpose::STANDARD.encode([10u8, 20, 30]);
         let ctx = AppTestContext::new(vec![MockWorkerConfig {
             port: 18120,
             routed_experts_b64: Some(expected_b64.clone()),
@@ -1772,8 +1771,7 @@ mod sglang_extension_tests {
     /// Same shape for `/v1/chat/completions`.
     #[tokio::test]
     async fn test_unified_chat_forwards_routed_experts() {
-        let expected_b64 =
-            base64::engine::general_purpose::STANDARD.encode([40u8, 50, 60]);
+        let expected_b64 = base64::engine::general_purpose::STANDARD.encode([40u8, 50, 60]);
         let ctx = AppTestContext::new(vec![MockWorkerConfig {
             port: 18121,
             routed_experts_b64: Some(expected_b64.clone()),
@@ -1921,10 +1919,7 @@ mod sglang_extension_tests {
 
     /// Drain the response body and assert it carries the
     /// `invalid_sglang_extension` error code naming the offending field.
-    async fn assert_invalid_sglang_extension(
-        resp: axum::response::Response,
-        expected_field: &str,
-    ) {
+    async fn assert_invalid_sglang_extension(resp: axum::response::Response, expected_field: &str) {
         let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
             .await
             .unwrap();

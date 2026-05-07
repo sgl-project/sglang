@@ -53,9 +53,6 @@ use crate::{
     },
     routers::{
         conversations,
-        http::routing_view::{
-            classify_parse_error, ChatRoutingView, GenerateRoutingView, ParseErrorKind,
-        },
         mesh::{
             get_app_config, get_cluster_status, get_global_rate_limit, get_global_rate_limit_stats,
             get_mesh_health, get_policy_state, get_policy_states, get_worker_state,
@@ -177,56 +174,11 @@ async fn read_body_bytes(request: Request) -> Result<Bytes, Response> {
     axum::body::to_bytes(request.into_body(), usize::MAX)
         .await
         .map_err(|e| {
-            (
-                StatusCode::BAD_REQUEST,
-                Json(json!({
-                    "error": {
-                        "message": format!("Failed to read request body: {}", e),
-                        "type": "invalid_request_error",
-                        "code": "body_read_error"
-                    }
-                })),
+            crate::routers::error::bad_request(
+                "body_read_error",
+                format!("Failed to read request body: {e}"),
             )
-                .into_response()
         })
-}
-
-fn json_parse_error(message: String) -> Response {
-    bad_request_with_code(message, "json_parse_error")
-}
-
-fn bad_request_with_code(message: String, code: &'static str) -> Response {
-    (
-        StatusCode::BAD_REQUEST,
-        Json(json!({
-            "error": {
-                "message": message,
-                "type": "invalid_request_error",
-                "code": code,
-            }
-        })),
-    )
-        .into_response()
-}
-
-/// Convert a failed routing-view parse into a structured 400. Promotes
-/// known-extension type mismatches (e.g. `return_routed_experts: "yes"`)
-/// to `invalid_sglang_extension` instead of folding them into the
-/// generic `json_parse_error`. Mirrors the contract the older `body_raw`
-/// design exposed via `parse_sglang_extensions`.
-fn view_parse_error<V: crate::routers::http::routing_view::ViewSchema>(
-    body: &Bytes,
-    err: serde_json::Error,
-) -> Response {
-    match classify_parse_error::<V>(body) {
-        ParseErrorKind::InvalidSglangExtension(field) => bad_request_with_code(
-            format!("Invalid SGLang extension field `{field}`: {err}"),
-            "invalid_sglang_extension",
-        ),
-        ParseErrorKind::Json | ParseErrorKind::InvalidViewField => {
-            json_parse_error(format!("Invalid JSON data: {err}"))
-        }
-    }
 }
 
 async fn generate(
@@ -234,19 +186,20 @@ async fn generate(
     headers: http::HeaderMap,
     request: Request,
 ) -> Response {
-    // Proto-pattern: read raw body, then parse only the fields the
-    // router itself reads for routing decisions. Everything else
-    // (including SGLang RL extension fields) stays in `body` and
-    // flows through verbatim.
+    // Proto-pattern: read raw body, hand it to the router. Each
+    // concrete router parses exactly what it needs (HTTP unified
+    // parses a routing view, PD parses a `Value` because it has to
+    // mutate the body for bootstrap injection, gRPC parses the typed
+    // proto request). RouterManager peeks at `model` for IGW
+    // dispatch and passes the resolved id forward as `model_id`.
     let body = match read_body_bytes(request).await {
         Ok(b) => b,
         Err(resp) => return resp,
     };
-    let view: GenerateRoutingView = match serde_json::from_slice(&body) {
-        Ok(v) => v,
-        Err(e) => return view_parse_error::<GenerateRoutingView>(&body, e),
-    };
-    state.router.route_generate(Some(&headers), &view, &body).await
+    state
+        .router
+        .route_generate(Some(&headers), &body, None)
+        .await
 }
 
 async fn v1_chat_completions(
@@ -262,11 +215,7 @@ async fn v1_chat_completions(
         Ok(b) => b,
         Err(resp) => return resp,
     };
-    let view: ChatRoutingView = match serde_json::from_slice(&body) {
-        Ok(v) => v,
-        Err(e) => return view_parse_error::<ChatRoutingView>(&body, e),
-    };
-    state.router.route_chat(Some(&headers), &view, &body).await
+    state.router.route_chat(Some(&headers), &body, None).await
 }
 
 async fn v1_completions(

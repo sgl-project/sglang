@@ -16,7 +16,9 @@ use crate::{
     observability::metrics::{metrics_labels, Metrics},
     protocols::{chat::ChatCompletionRequest, generate::GenerateRequest},
     routers::{
-        http::routing_view::{ChatRoutingView, GenerateRoutingView},
+        http::routing_view::{
+            validate_extensions_in_value, view_parse_error, ChatRoutingView, GenerateRoutingView,
+        },
         RouterTrait,
     },
 };
@@ -227,32 +229,65 @@ impl RouterTrait for GrpcPDRouter {
     async fn route_generate(
         &self,
         headers: Option<&HeaderMap>,
-        view: &GenerateRoutingView,
         body: &Bytes,
+        model_id: Option<&str>,
     ) -> Response {
-        let typed: GenerateRequest = match serde_json::from_slice(body) {
+        // See `GrpcRouter::route_generate` for the rationale on
+        // routing through `Value` to preserve the
+        // `invalid_sglang_extension` 400 contract; without this, a
+        // wrong-typed extension field is silently dropped by the
+        // typed proto deserialize.
+        let value: serde_json::Value = match serde_json::from_slice(body) {
+            Ok(v) => v,
+            Err(e) => return view_parse_error::<GenerateRoutingView>(body, e),
+        };
+        if let Some(field) = validate_extensions_in_value::<GenerateRoutingView>(&value) {
+            return crate::routers::error::bad_request(
+                "invalid_sglang_extension",
+                format!("Invalid SGLang extension field `{field}`"),
+            );
+        }
+        let typed: GenerateRequest = match serde_json::from_value(value) {
             Ok(v) => v,
             Err(e) => {
-                return crate::routers::error::bad_request("json_parse_failed", format!("{e}"))
+                return crate::routers::error::bad_request(
+                    "json_parse_error",
+                    format!("Invalid JSON data: {e}"),
+                );
             }
         };
-        self.route_generate_impl(headers, &typed, view.model.as_deref())
+        let effective_model = model_id.or(typed.model.as_deref());
+        self.route_generate_impl(headers, &typed, effective_model)
             .await
     }
 
     async fn route_chat(
         &self,
         headers: Option<&HeaderMap>,
-        view: &ChatRoutingView,
         body: &Bytes,
+        model_id: Option<&str>,
     ) -> Response {
-        let typed: ChatCompletionRequest = match serde_json::from_slice(body) {
+        let value: serde_json::Value = match serde_json::from_slice(body) {
+            Ok(v) => v,
+            Err(e) => return view_parse_error::<ChatRoutingView>(body, e),
+        };
+        if let Some(field) = validate_extensions_in_value::<ChatRoutingView>(&value) {
+            return crate::routers::error::bad_request(
+                "invalid_sglang_extension",
+                format!("Invalid SGLang extension field `{field}`"),
+            );
+        }
+        let typed: ChatCompletionRequest = match serde_json::from_value(value) {
             Ok(v) => v,
             Err(e) => {
-                return crate::routers::error::bad_request("json_parse_failed", format!("{e}"))
+                return crate::routers::error::bad_request(
+                    "json_parse_error",
+                    format!("Invalid JSON data: {e}"),
+                );
             }
         };
-        self.route_chat_impl(headers, &typed, Some(&view.model)).await
+        let effective_model = model_id.or(Some(typed.model.as_str()));
+        self.route_chat_impl(headers, &typed, effective_model).await
     }
 
     fn router_type(&self) -> &'static str {
