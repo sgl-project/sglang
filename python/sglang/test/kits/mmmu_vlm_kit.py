@@ -198,9 +198,6 @@ class MMMUMixin:
             # Run evaluation
             self.run_mmmu_eval(self.model, output_path)
 
-            # Get the result file. `**` with recursive=True already matches
-            # files at the top level of output_path, so no separate
-            # non-recursive fallback is needed.
             result_files = glob.glob(f"{output_path}/**/*.json", recursive=True)
 
             if not result_files:
@@ -353,8 +350,6 @@ class MMMUMultiModelTestBase(CustomTestCase):
             if custom_env:
                 process_env.update(custom_env)
             # if test vlm with cuda_ipc feature, open this env_var
-            # (test_vlm_models exercises the same path on nightly-amd-4-gpu without issue,
-            # so this is safe to set unconditionally for both CUDA and ROCm runners).
             process_env["SGLANG_USE_CUDA_IPC_TRANSPORT"] = "1"
 
             # Prepare stdout/stderr redirection if needed
@@ -390,9 +385,6 @@ class MMMUMultiModelTestBase(CustomTestCase):
             # Run evaluation
             self.run_mmmu_eval(model.model, output_path)
 
-            # Get the result file. `**` with recursive=True already matches
-            # files at the top level of output_path, so no separate
-            # non-recursive fallback is needed.
             result_files = glob.glob(f"{output_path}/**/*.json", recursive=True)
 
             if not result_files:

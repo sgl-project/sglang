@@ -19,8 +19,7 @@ MODELS = [
 
 
 class TestVLMEncoderDP(MMMUMultiModelTestBase):
-    # encoder_dp specifics layered on top of MMMUMultiModelTestBase's default args
-    # (--cuda-graph-max-bs comes after the kit's "64" so it last-wins to "32").
+    # --cuda-graph-max-bs 32 last-wins over the kit's default 64.
     other_args = [
         "--mm-enable-dp-encoder",
         "--tp=4",
@@ -29,14 +28,13 @@ class TestVLMEncoderDP(MMMUMultiModelTestBase):
     ]
 
     def test_vlm_mmmu_benchmark(self):
-        """Test VLM models against MMMU benchmark."""
         models_to_test = MODELS
 
         if is_in_ci():
             models_to_test = [random.choice(MODELS)]
 
         for model in models_to_test:
-            # Per-model temp dir so cross-test file pollution can't be read back.
+            # Per-model temp dir avoids cross-test cached results.
             with tempfile.TemporaryDirectory(
                 prefix=f"encoder_dp_{model.model.replace('/', '_')}_"
             ) as output_path:

@@ -622,7 +622,7 @@ class TestEPDDisaggregationOmni(PDDisaggregationServerBase):
 class TestEPDDisaggregationOneEncoder(MMMUMixin, PDDisaggregationServerBase):
     """Test EPD disaggregation with single encode server"""
 
-    # MMMUMixin knobs — Qwen2.5-VL-3B-Instruct gets ~0.40 on the 50-sample subset.
+    # Qwen2.5-VL-3B-Instruct scores ~0.40 on the 50-sample MMMU subset.
     accuracy = 0.40
     mmmu_args = ["--limit", "50"]
 
@@ -748,8 +748,6 @@ class TestEPDDisaggregationOneEncoder(MMMUMixin, PDDisaggregationServerBase):
                     kill_process_tree(process.pid)
                 except Exception as e:
                     print(f"Error killing process: {e}")
-
-    # test_mmmu and run_mmmu_eval are inherited from MMMUMixin.
 
 
 @unittest.skipIf(
@@ -941,7 +939,7 @@ class TestEPDDisaggregationMultiEncoders(MMMUMixin, PDDisaggregationServerBase):
     Both encode servers run on GPU 0 (different ports) for testing load distribution.
     """
 
-    # MMMUMixin knobs — Qwen2.5-VL-3B-Instruct gets ~0.40 on the 50-sample subset.
+    # Qwen2.5-VL-3B-Instruct scores ~0.40 on the 50-sample MMMU subset.
     accuracy = 0.40
     mmmu_args = ["--limit", "50"]
 
@@ -1090,14 +1088,12 @@ class TestEPDDisaggregationMultiEncoders(MMMUMixin, PDDisaggregationServerBase):
                 except Exception as e:
                     print(f"Error killing process: {e}")
 
-    # test_mmmu and run_mmmu_eval are inherited from MMMUMixin.
-
 
 @unittest.skipIf(is_in_ci(), "Skipping in CI to reduce multi-GPU runtime")
 class TestEPDDisaggregationGrpcEncoderMMMU(MMMUMixin, PDDisaggregationServerBase):
     """Test MMMU evaluation with gRPC encoder in EPD mode."""
 
-    # MMMUMixin knobs — Qwen2.5-VL-3B-Instruct gets ~0.40 on the 50-sample subset.
+    # Qwen2.5-VL-3B-Instruct scores ~0.40 on the 50-sample MMMU subset.
     accuracy = 0.40
     mmmu_args = ["--limit", "50"]
 
@@ -1254,8 +1250,6 @@ class TestEPDDisaggregationGrpcEncoderMMMU(MMMUMixin, PDDisaggregationServerBase
                     kill_process_tree(process.pid)
                 except Exception as e:
                     print(f"Error killing process: {e}")
-
-    # test_mmmu and run_mmmu_eval are inherited from MMMUMixin.
 
 
 @unittest.skipIf(is_in_ci(), "Skipping in CI to reduce multi-GPU runtime")
