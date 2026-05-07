@@ -5593,7 +5593,7 @@ class ServerArgs:
                 "Enable FlashInfer allreduce fusion and choose backend. "
                 "When not set the feature is disabled. "
                 "'auto': choose best backend (trtllm single-node, mnnvl multi-node). "
-                "'trtllm': single-node only, supports fused quantization. "
+                "'trtllm': single-node only. "
                 "'mnnvl': single-node and multi-node via MNNVL fabric (SM100). "
                 "Fuses allreduce with Residual + RMSNorm for supported MoE models."
             ),

@@ -112,28 +112,15 @@ if is_flashinfer_available():
     try:
         import flashinfer.comm as comm
 
-        if hasattr(comm, "allreduce_fusion") and hasattr(
-            comm, "create_allreduce_fusion_workspace"
-        ):
-            _flashinfer_comm = comm
-        else:
-            logger.warning(
-                "flashinfer.comm unified allreduce_fusion API is not available, "
-                "falling back to standard implementation"
-            )
-    except ImportError:
+        _flashinfer_comm = comm
+        _create_allreduce_fusion_workspace = comm.create_allreduce_fusion_workspace
+        _allreduce_fusion = comm.allreduce_fusion
+        _AllReduceFusionPattern = comm.AllReduceFusionPattern
+    except (ImportError, AttributeError) as e:
         logger.warning(
-            "flashinfer.comm is not available, falling back to standard "
-            "implementation"
-        )
-
-    if _flashinfer_comm is not None:
-        _create_allreduce_fusion_workspace = (
-            _flashinfer_comm.create_allreduce_fusion_workspace
-        )
-        _allreduce_fusion = getattr(_flashinfer_comm, "allreduce_fusion", None)
-        _AllReduceFusionPattern = getattr(
-            _flashinfer_comm, "AllReduceFusionPattern", None
+            "flashinfer.comm allreduce_fusion API is not available (%s), "
+            "falling back to standard implementation",
+            e,
         )
 
     try:
@@ -172,32 +159,6 @@ if is_flashinfer_available():
             "flashinfer.comm.mnnvl.TorchDistBackend is not available, "
             "allreduce fusion will use the default process group"
         )
-
-    if _AllReduceFusionPattern is None or _allreduce_fusion is None:
-        try:
-            from flashinfer.comm.allreduce import (
-                AllReduceFusionPattern,
-                allreduce_fusion,
-                create_allreduce_fusion_workspace,
-            )
-
-            if _AllReduceFusionPattern is None:
-                _AllReduceFusionPattern = AllReduceFusionPattern
-            if _create_allreduce_fusion_workspace is None:
-                _create_allreduce_fusion_workspace = create_allreduce_fusion_workspace
-            if _allreduce_fusion is None:
-                _allreduce_fusion = allreduce_fusion
-        except ImportError:
-            try:
-                from flashinfer.comm.trtllm_ar import AllReduceFusionPattern
-
-                if _AllReduceFusionPattern is None:
-                    _AllReduceFusionPattern = AllReduceFusionPattern
-            except ImportError:
-                pass
-            logger.warning(
-                "FlashInfer unified allreduce API not fully available, using legacy paths"
-            )
 
     try:
         from flashinfer.comm.mnnvl import CommBackend
@@ -876,21 +837,14 @@ def flashinfer_allreduce_residual_rmsnorm(
     residual_out = torch.empty_like(residual)
     norm_out = torch.empty_like(input_tensor)
 
-    fusion = _allreduce_fusion
-    pattern_cls = _AllReduceFusionPattern
-    if fusion is None:
-        fusion = getattr(_flashinfer_comm, "allreduce_fusion", None)
-    if pattern_cls is None:
-        pattern_cls = getattr(_flashinfer_comm, "AllReduceFusionPattern", None)
+    if _allreduce_fusion is None or _AllReduceFusionPattern is None:
+        return None, None
 
     try:
-        if fusion is None or pattern_cls is None:
-            return None, None
-
-        fusion(
+        _allreduce_fusion(
             input=input_tensor,
             workspace=workspace_manager.workspace,
-            pattern=pattern_cls.kARResidualRMSNorm,
+            pattern=_AllReduceFusionPattern.kARResidualRMSNorm,
             launch_with_pdl=trigger_completion_at_end,
             use_oneshot=use_oneshot,
             fp32_acc=fp32_acc,
