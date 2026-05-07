@@ -21,6 +21,7 @@ from sglang.srt.layers.attention.dsv4.indexer import C4Indexer
 from sglang.srt.layers.attention.nsa.utils import (
     can_nsa_cp_split,
     is_nsa_enable_prefill_cp,
+    is_nsa_prefill_cp_round_robin_split,
     nsa_use_prefill_cp,
 )
 from sglang.srt.layers.communicator import get_attn_tp_context
@@ -30,6 +31,8 @@ from sglang.srt.layers.dp_attention import (
     attn_tp_all_gather,
     dp_gather_partial,
     dp_scatter,
+    get_attention_cp_rank,
+    get_attention_cp_size,
     get_attention_dp_size,
     get_attention_tp_rank,
     get_attention_tp_size,
@@ -151,7 +154,7 @@ class MQALayer(nn.Module):
         self.tp_size = attn_tp_size = get_attention_tp_size()
         self.nsa_enable_prefill_cp = is_nsa_enable_prefill_cp()
         if self.nsa_enable_prefill_cp:
-            self.cp_size = get_attention_tp_size()
+            self.cp_size = get_attention_cp_size()
             self.tp_rank = attn_tp_rank = 0
             self.tp_size = attn_tp_size = 1
         self.layer_id = layer_id
@@ -791,8 +794,8 @@ class DeepseekV4DecoderLayer(nn.Module):
                 "CP requires DeepEP (moe_a2a_backend == deepep). "
                 "Only DeepEP is tested with CP's per-rank token split."
             )
-            cp_rank = get_attention_tp_rank()
-            cp_size = get_attention_tp_size()
+            cp_rank = get_attention_cp_rank()
+            cp_size = get_attention_cp_size()
             input_ids = input_ids[cp_rank::cp_size].contiguous()
             input_ids_global = input_ids
         elif _use_tp_moe_gather:
@@ -872,7 +875,7 @@ class DeepseekV4Model(nn.Module):
 
         self.nsa_enable_prefill_cp = is_nsa_enable_prefill_cp()
         if self.nsa_enable_prefill_cp:
-            self.cp_size = get_attention_tp_size()
+            self.cp_size = get_attention_cp_size()
 
     def hc_head(
         self,
@@ -982,8 +985,8 @@ class DeepseekV4ForCausalLM(nn.Module):
 
         self.nsa_enable_prefill_cp = is_nsa_enable_prefill_cp()
         if self.nsa_enable_prefill_cp:
-            self.cp_rank = get_attention_tp_rank()
-            self.cp_size = get_attention_tp_size()
+            self.cp_rank = get_attention_cp_rank()
+            self.cp_size = get_attention_cp_size()
 
     @property
     def routed_experts_weights_of_layer(self):
@@ -1018,6 +1021,17 @@ class DeepseekV4ForCausalLM(nn.Module):
                     self.cp_size,
                     forward_batch.seq_lens_cpu.tolist(),
                 )
+                if is_nsa_prefill_cp_round_robin_split():
+                    metadata = forward_batch.attn_backend.forward_metadata
+                    core_meta = metadata.core_attn_metadata
+                    core_meta.apply_cp_reindex()
+                    core_meta.init_flashmla_related()
+                    if metadata.indexer_metadata is not None:
+                        metadata.indexer_metadata = (
+                            forward_batch.attn_backend.init_forward_metadata_indexer(
+                                core_meta
+                            )
+                        )
 
         with get_attn_tp_context().maybe_input_scattered(forward_batch):
             hidden_states = self.model.forward(
