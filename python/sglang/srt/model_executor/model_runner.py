@@ -1993,13 +1993,17 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         CudaGraphRunner.__init__() via lora_manager.init_cuda_graph_batch_info(),
         because it needs capture-time parameters (max_bs, num_tokens_per_bs)
         that are only available at that stage.
+
+        Layers whose `_quant_info` is None (the FlashInfer-CUTLASS NVFP4
+        path) are skipped: they bypass the Triton MoE+LoRA runner these
+        buffers feed and use their own lazy `_shared_lora_inter` scratch.
         """
         from sglang.srt.lora.layers import FusedMoEWithLoRA
 
         max_bs = self.server_args.cuda_graph_max_bs
         max_loras = self.server_args.max_loras_per_batch
         for module in self.model.modules():
-            if isinstance(module, FusedMoEWithLoRA):
+            if isinstance(module, FusedMoEWithLoRA) and module._quant_info is not None:
                 self.lora_manager.init_cuda_graph_moe_buffers(
                     max_bs, max_loras, self.dtype, module
                 )

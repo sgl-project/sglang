@@ -6,10 +6,15 @@ from torch import nn
 
 from sglang.srt.distributed import (
     get_tensor_model_parallel_rank,
+    get_tp_group,
     split_tensor_along_last_dim,
     tensor_model_parallel_all_gather,
     tensor_model_parallel_all_reduce,
 )
+from sglang.srt.distributed.device_communicators.pynccl_allocator import (
+    use_symmetric_memory,
+)
+from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
     MergedColumnParallelLinear,
@@ -18,6 +23,8 @@ from sglang.srt.layers.linear import (
     RowParallelLinear,
 )
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+from sglang.srt.layers.moe.token_dispatcher import CombineInput, DispatchOutput
+from sglang.srt.layers.moe.token_dispatcher.standard import StandardCombineInput
 from sglang.srt.layers.moe.topk import TopKOutput
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
@@ -25,6 +32,17 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.lora.backend.base_backend import BaseLoRABackend
 from sglang.srt.lora.utils import LoRABatchInfo, get_lm_head_lora_b_shard_size
+from sglang.srt.utils import is_cuda, is_hip
+
+_is_cuda = is_cuda()
+_is_hip = is_hip()
+
+# `silu_and_mul` is used by the NVFP4 expert-LoRA path in `_run_moe_core_nvfp4`
+# when the FlashInfer-CUTLASS gate-up layout is `[gate | up]`.
+if _is_cuda:
+    from sgl_kernel import silu_and_mul
+elif _is_hip:
+    from vllm._custom_ops import silu_and_mul
 
 
 class BaseLayerWithLoRA(nn.Module):
@@ -878,7 +896,18 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
 
         self.experts_shared_outer_loras: bool = False
         self.lora_use_virtual_experts: bool = False
+        self.num_experts = base_layer.num_experts
+        self.num_local_experts = base_layer.num_local_experts
+        self.moe_ep_rank = base_layer.moe_ep_rank
+        self.moe_ep_size = base_layer.moe_ep_size
+        self.moe_tp_rank = base_layer.moe_tp_rank
+        self.moe_tp_size = base_layer.moe_tp_size
+        self.hidden_size = base_layer.hidden_size
+        self.reduce_results = base_layer.reduce_results
+        self.layer_id = base_layer.layer_id
         self.quant_method = base_layer.quant_method
+        self.dispatcher = base_layer.dispatcher
+        self.moe_runner_config = base_layer.moe_runner_config
 
         self.tp_size = getattr(base_layer, "moe_tp_size", 1)
         self.tp_rank = getattr(base_layer, "moe_tp_rank", 0)
@@ -905,12 +934,33 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
             runner_backend = base_layer.quant_method.runner.runner_backend
         else:
             runner_backend = MoeRunnerBackend.TRITON
+        self._runner_backend = runner_backend
 
-        self._lora_runner = MoeRunner(
-            runner_backend,
-            base_layer.moe_runner_config,
-            lora_enabled=True,
+        # `MoeRunner` has no `flashinfer_cutlass` branch (it raises);
+        # we override `forward_impl` / `run_moe_core` to handle that
+        # backend directly via `_run_moe_core_nvfp4`.
+        if runner_backend.is_flashinfer_cutlass():
+            self._lora_runner = None
+        else:
+            self._lora_runner = MoeRunner(
+                runner_backend,
+                base_layer.moe_runner_config,
+                lora_enabled=True,
+            )
+
+        self._lora_A_w13_swapped: Optional[torch.Tensor] = None
+        self._lora_B_w13_swapped: Optional[torch.Tensor] = None
+        self._w13_needs_swap = getattr(
+            base_layer.quant_method, "load_up_proj_weight_first", False
         )
+        self._lora_inter: Optional[torch.Tensor] = None
+        # `LoRAMemoryPool` pre-multiplies per-expert MoE LoRA B weights by
+        # `lora_adapter.scaling` at load time (see `mem_pool.py`'s handling of
+        # `gate_up_proj_moe` / `down_proj_moe`).  The main MoE LoRA runner
+        # therefore does not multiply by scaling at kernel time.  Our
+        # `triton_moe_lora_delta` kernel takes a scaling tensor and applies it,
+        # so to avoid double-scaling on the NVFP4 path we pass a constant 1.0.
+        self._unit_scaling: Optional[torch.Tensor] = None
 
         if runner_backend.is_marlin():
             from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
@@ -927,10 +977,19 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         elif runner_backend.is_triton():
             assert base_layer.quant_method is not None, "Quant method must be set"
             self._quant_info = base_layer.quant_method.get_triton_quant_info(base_layer)
+        elif runner_backend.is_flashinfer_cutlass():
+            self._quant_info = None
         else:
             raise NotImplementedError(
                 f"LoRA MoE not supported for backend {runner_backend}"
             )
+
+    def __getattr__(self, name: str):
+        try:
+            return super().__getattr__(name)
+        except AttributeError:
+            pass
+        return getattr(self.base_layer, name)
 
     def set_lora_info(
         self,
@@ -945,6 +1004,18 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         self.gate_up_lora_b_weights = gate_up_lora_b_weights
         self.down_lora_a_weights = down_lora_a_weights
         self.down_lora_b_weights = down_lora_b_weights
+
+        # Swap-scratch for the FlashInfer-CUTLASS [up | gate] w13 layout.
+        # Pre-allocated once and refreshed in place per forward via `.copy_()`
+        # from the live LoRA buffers — `LoRAMemoryPool` mutates those buffers
+        # on every dynamic `/load_lora_adapter`, and per-call `torch.cat`
+        # allocations fragment the caching allocator.
+        if self._w13_needs_swap:
+            self._lora_A_w13_swapped = torch.empty_like(gate_up_lora_a_weights)
+            self._lora_B_w13_swapped = torch.empty_like(gate_up_lora_b_weights)
+
+        if self._is_nvfp4():
+            self._lora_inter = FusedMoEWithLoRA._shared_lora_inter
 
     def _get_lora_info(self):
         """Build LoRAInfo for the current batch."""
@@ -999,6 +1070,159 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
             lora_use_virtual_experts=self.lora_use_virtual_experts,
         )
 
+    _shared_lora_inter: Optional[torch.Tensor] = None
+
+    # Cap (rows) for the shared NVFP4 LoRA intermediate buffer.  Sized to
+    # `max_prefill_tokens * top_k_max`; at rank_a<=128 bf16 this is <=64 MB.
+    # Must not grow after warmup: captured CUDA graphs bake the data_ptr().
+    _LORA_INTER_INITIAL_CAPACITY: int = 1 << 18  # 262144
+
+    def _alloc_lora_inter(self, required_rows: int):
+        """Allocate the shared NVFP4 LoRA intermediate buffer once.
+
+        Class-level (all MoE layers run sequentially).  Refuses to grow
+        because captured CUDA graphs reference its `data_ptr()`.
+        """
+        rank_a = self.gate_up_lora_a_weights.shape[2]
+        device = self.gate_up_lora_a_weights.device
+
+        if FusedMoEWithLoRA._shared_lora_inter is None:
+            capacity = max(required_rows, FusedMoEWithLoRA._LORA_INTER_INITIAL_CAPACITY)
+            FusedMoEWithLoRA._shared_lora_inter = torch.empty(
+                (capacity, rank_a), dtype=torch.bfloat16, device=device
+            )
+        elif (
+            FusedMoEWithLoRA._shared_lora_inter.shape[0] < required_rows
+            or FusedMoEWithLoRA._shared_lora_inter.shape[1] < rank_a
+        ):
+            # Refuse to grow: would invalidate captured CUDA graphs. If this
+            # ever fires in practice, raise the initial capacity above
+            # rather than silently reallocating.
+            raise RuntimeError(
+                f"FusedMoEWithLoRA._shared_lora_inter exhausted: "
+                f"have shape={tuple(FusedMoEWithLoRA._shared_lora_inter.shape)}, "
+                f"need rows>={required_rows}, cols>={rank_a}. "
+                f"Growing this buffer is unsafe — it is referenced by captured "
+                f"CUDA graphs as a baked pointer. Increase "
+                f"FusedMoEWithLoRA._LORA_INTER_INITIAL_CAPACITY (currently "
+                f"{FusedMoEWithLoRA._LORA_INTER_INITIAL_CAPACITY}) to cover the "
+                f"true worst-case total_tokens for your server config."
+            )
+
+        self._lora_inter = FusedMoEWithLoRA._shared_lora_inter
+
+    def _ensure_lora_inter_capacity(self, required_rows: int):
+        if self._lora_inter is None or self._lora_inter.shape[0] < required_rows:
+            self._alloc_lora_inter(required_rows)
+
+    def _get_unit_scaling(self) -> torch.Tensor:
+        """Lazy-allocate a 1-element fp32 ``[1.0]`` tensor on the LoRA buffer
+        device, used as the kernel-side scaling argument when the per-expert
+        MoE LoRA B weights are already pre-scaled by `LoRAMemoryPool` at load
+        time. Stable data_ptr() across CUDA graph capture/replay."""
+        if self._unit_scaling is None:
+            device = self.gate_up_lora_a_weights.device
+            self._unit_scaling = torch.ones(1, dtype=torch.float32, device=device)
+        return self._unit_scaling
+
+    def forward_impl(self, hidden_states: torch.Tensor, topk_output: TopKOutput):
+        origin_hidden_states_dim = hidden_states.shape[-1]
+        assert self.quant_method is not None
+
+        dispatch_output = self.dispatcher.dispatch(
+            hidden_states=hidden_states, topk_output=topk_output
+        )
+
+        combine_input = self.run_moe_core(dispatch_output=dispatch_output)
+
+        with use_symmetric_memory(
+            get_tp_group(), disabled=not is_allocation_symmetric()
+        ):
+            final_hidden_states = self.dispatcher.combine(combine_input=combine_input)
+            final_hidden_states = final_hidden_states[
+                ..., :origin_hidden_states_dim
+            ].contiguous()
+
+        if self.reduce_results and (self.moe_tp_size > 1 or self.moe_ep_size > 1):
+            final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+
+        return final_hidden_states
+
+    def _build_token_adapter_ids(
+        self, num_tokens: int, device: torch.device
+    ) -> Optional[torch.Tensor]:
+        batch_info = self.lora_backend.batch_info
+        if batch_info is None:
+            return None
+
+        bs = batch_info.bs
+
+        if batch_info.use_cuda_graph:
+            return batch_info.weight_indices[:num_tokens].to(torch.int32)
+
+        weight_indices_cpu = getattr(batch_info, "weight_indices_cpu", None)
+        seg_lens_cpu = getattr(batch_info, "seg_lens_cpu", None)
+        if weight_indices_cpu is not None and seg_lens_cpu is not None:
+            token_adapter_ids_cpu = torch.repeat_interleave(
+                weight_indices_cpu[:bs],
+                seg_lens_cpu[:bs].to(torch.int64),
+            )
+            token_adapter_ids = token_adapter_ids_cpu.to(
+                device=device, dtype=torch.int32, non_blocking=True
+            )
+        elif batch_info.seg_lens is not None:
+            seg_lens = batch_info.seg_lens[:bs]
+            token_adapter_ids = torch.repeat_interleave(
+                batch_info.weight_indices[:bs],
+                seg_lens.to(torch.int64),
+            )
+        elif batch_info.seg_indptr is not None:
+            seg_lens = batch_info.seg_indptr[1 : bs + 1] - batch_info.seg_indptr[:bs]
+            token_adapter_ids = torch.repeat_interleave(
+                batch_info.weight_indices[:bs],
+                seg_lens.to(torch.int64),
+            )
+        else:
+            token_adapter_ids = torch.repeat_interleave(
+                batch_info.weight_indices[:bs],
+                torch.ones(bs, dtype=torch.int64, device=device),
+            )
+
+        if token_adapter_ids.shape[0] != num_tokens:
+            token_adapter_ids = (
+                batch_info.weight_indices[0:1]
+                .to(torch.int32)
+                .expand(num_tokens)
+                .clone()
+            )
+
+        return token_adapter_ids
+
+    def _is_nvfp4(self) -> bool:
+        return self.base_layer.w13_weight.dtype == torch.uint8
+
+    def _get_active_lora_slots(self, batch_info) -> list[int]:
+        if batch_info is None:
+            return []
+
+        active_slots = list(getattr(batch_info, "active_weight_indices_cpu", ()))
+        if active_slots:
+            return active_slots
+
+        return list(range(self.lora_backend.max_loras_per_batch))
+
+    def run_moe_core(self, dispatch_output: DispatchOutput) -> CombineInput:
+        """Run MoE computation with LoRA support (flashinfer_cutlass backend).
+
+        For NVFP4 models: a single CUTLASS-based path is used for both
+        prefill and decode (`cutlass_fp4_group_mm` is CUDA-graph safe).
+        """
+        if self._is_nvfp4():
+            return self._run_moe_core_nvfp4(dispatch_output)
+        raise NotImplementedError(
+            "flashinfer_cutlass LoRA support is only implemented for NVFP4 models"
+        )
+
     def forward(self, hidden_states: torch.Tensor, topk_output: TopKOutput, **kwargs):
         """
         Forward pass with integrated LoRA computation.
@@ -1008,10 +1232,10 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         2. After down projection, before final reduction
         """
 
-        # Build LoRA info for this batch
-        lora_info = self._get_lora_info()
+        if self._runner_backend.is_flashinfer_cutlass():
+            return self.forward_impl(hidden_states, topk_output)
 
-        # run lora moe_runner
+        lora_info = self._get_lora_info()
         return self._forward_with_lora(hidden_states, topk_output, lora_info, **kwargs)
 
     def _forward_with_lora(
@@ -1043,6 +1267,257 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         final_hidden_states = base_layer.dispatcher.combine(combine_input=combine_input)
 
         return final_hidden_states
+
+    def _run_moe_core_nvfp4(self, dispatch_output: DispatchOutput) -> CombineInput:
+        """NVFP4 LoRA path: CUTLASS grouped FP4 GEMMs + Triton LoRA deltas.
+
+        Single path for prefill and decode (`cutlass_fp4_group_mm` is CUDA-
+        graph safe). When the FlashInfer-CUTLASS loader stored w13 as
+        ``[up | gate]`` (``_w13_needs_swap``), we keep that layout and swap
+        the LoRA buffers in place to avoid per-call ``torch.cat`` fragmenting
+        the caching allocator. CUDA-graph captures bake the active-slot
+        iteration, so we iterate all slots and mask via ``sorted_adapter_ids``.
+        """
+        from sgl_kernel import prepare_moe_input
+        from sglang.srt.layers.moe.cutlass_moe import (
+            cutlass_fp4_group_mm,
+            scaled_fp4_experts_quant,
+            shuffle_rows,
+        )
+        from sglang.srt.layers.moe.cutlass_moe_params import (
+            CutlassMoEParams,
+            CutlassMoEType,
+        )
+        from sglang.srt.lora.fused_fp4_lora_moe import triton_moe_lora_delta
+
+        hidden_states = dispatch_output.hidden_states
+        topk_output = dispatch_output.topk_output
+        topk_weights = topk_output.topk_weights
+        topk_ids = topk_output.topk_ids
+        moe_config = self.moe_runner_config
+        layer = self.base_layer
+
+        m_a = hidden_states.shape[0]
+        num_topk = topk_ids.shape[1]
+        out_dtype = hidden_states.dtype
+        device = hidden_states.device
+        E = self.num_local_experts
+        K = self.hidden_size
+        N = layer.w2_weight.shape[2] * 2  # intermediate_size_per_partition
+
+        # ---------------------------------------- remap topk to local IDs
+        if self.dispatcher.local_expert_mapping is not None:
+            local_ids = topk_ids.clone()
+            non_local = local_ids < 0
+            local_ids[non_local] = 0
+            local_weights = topk_weights.clone()
+            local_weights[non_local] = 0.0
+        else:
+            local_offset = self.moe_ep_rank * E
+            local_ids = topk_ids - local_offset
+            non_local = (local_ids < 0) | (local_ids >= E)
+            local_ids = local_ids.clone()
+            local_ids[non_local] = 0
+            local_weights = topk_weights.clone()
+            local_weights[non_local] = 0.0
+
+        # ---------------------------------------- expert offsets / a_map
+        # Reuse the base layer's `cutlass_moe_params`; with the modelopt
+        # NVFP4 fix it is sized for `num_local_experts` (matching the per-
+        # rank shapes of `w13_weight` / `w2_weight` / their blockscales),
+        # and the FP4 grouped GEMM iterates `expert_offsets.size(0)` experts.
+        # Constructing a fresh per-call object would invalidate captured CUDA
+        # graphs (offset / problem-size pointers would change between
+        # captures); reusing the base layer's params keeps them stable.
+        params = getattr(layer, "cutlass_moe_params", None)
+        if params is None:
+            params = CutlassMoEParams(
+                CutlassMoEType.BlockscaledFP4,
+                device,
+                num_experts=E,
+                intermediate_size_per_partition=N,
+                hidden_size=K,
+            )
+            layer.cutlass_moe_params = params
+        offsets = params.expert_offsets
+        total_tokens = m_a * num_topk
+
+        a_map = torch.empty(total_tokens, dtype=torch.int32, device=device)
+        c_map = torch.empty(total_tokens, dtype=torch.int32, device=device)
+        prepare_moe_input(
+            local_ids.to(torch.int32),
+            offsets,
+            params.problem_sizes1,
+            params.problem_sizes2,
+            a_map,
+            c_map,
+            E,
+            N,
+            K,
+            params.blockscale_offsets,
+        )
+
+        # ---------------------------------------- LoRA setup
+        batch_info = self.lora_backend.batch_info
+        has_lora = (
+            self.gate_up_lora_a_weights is not None
+            and self.gate_up_lora_b_weights is not None
+            and batch_info is not None
+        )
+        active_slots = self._get_active_lora_slots(batch_info) if has_lora else []
+
+        use_dynamic_slot_masking = False
+        if has_lora:
+            if batch_info.use_cuda_graph:
+                # Graph mode bakes the active-slot iteration at capture
+                # time, so iterate over all possible slots and use
+                # per-token masking at replay.
+                active_slots = list(range(self.lora_backend.max_loras_per_batch))
+                use_dynamic_slot_masking = True
+            else:
+                use_dynamic_slot_masking = len(active_slots) > 1
+
+        # Only materialise sorted_input when LoRA needs it.
+        sorted_input = None
+        sorted_adapter_ids = None
+        if has_lora:
+            sorted_input = shuffle_rows(hidden_states, a_map, (total_tokens, K))
+            self._ensure_lora_inter_capacity(total_tokens)
+            if use_dynamic_slot_masking:
+                token_adapter_ids = self._build_token_adapter_ids(m_a, device)
+                sorted_adapter_ids = token_adapter_ids[a_map.long()]
+
+        # ---------------------------------------- GEMM1: w13 base
+        w13_input_scale = layer.w13_input_scale_quant.view(-1).float()
+        if w13_input_scale.shape[0] != E:
+            w13_input_scale = w13_input_scale.expand(E).contiguous()
+
+        rep_a_fp4, rep_a_blockscale = scaled_fp4_experts_quant(
+            hidden_states,
+            w13_input_scale,
+            offsets,
+            params.blockscale_offsets,
+            num_topk,
+            expert_map=a_map,
+        )
+        gateup_flat = cutlass_fp4_group_mm(
+            rep_a_fp4,
+            layer.w13_weight,
+            rep_a_blockscale,
+            layer.w13_blockscale_swizzled,
+            layer.g1_alphas,
+            out_dtype,
+            params.to_gemm1_args(),
+        )
+        del rep_a_fp4, rep_a_blockscale
+
+        # ---------------------------------------- LoRA w13 delta
+        if has_lora:
+            # Refresh swap-scratch in place: `LoRAMemoryPool` mutates
+            # `gate_up_lora_*_weights` on every dynamic adapter load, so a
+            # snapshot taken at `set_lora_info` time would be stale.
+            if self._w13_needs_swap:
+                half_A = self.gate_up_lora_a_weights.shape[2] // 2
+                self._lora_A_w13_swapped[:, :, :half_A, :].copy_(
+                    self.gate_up_lora_a_weights[:, :, half_A:, :]
+                )
+                self._lora_A_w13_swapped[:, :, half_A:, :].copy_(
+                    self.gate_up_lora_a_weights[:, :, :half_A, :]
+                )
+                half_B = self.gate_up_lora_b_weights.shape[2] // 2
+                self._lora_B_w13_swapped[:, :, :half_B, :].copy_(
+                    self.gate_up_lora_b_weights[:, :, half_B:, :]
+                )
+                self._lora_B_w13_swapped[:, :, half_B:, :].copy_(
+                    self.gate_up_lora_b_weights[:, :, :half_B, :]
+                )
+                w13_A = self._lora_A_w13_swapped
+                w13_B = self._lora_B_w13_swapped
+            else:
+                w13_A = self.gate_up_lora_a_weights
+                w13_B = self.gate_up_lora_b_weights
+
+            for slot in active_slots:
+                if sorted_adapter_ids is not None:
+                    mask = (sorted_adapter_ids == slot).unsqueeze(-1).to(out_dtype)
+                    lora_input = sorted_input * mask
+                else:
+                    lora_input = sorted_input
+                triton_moe_lora_delta(
+                    output=gateup_flat,
+                    sorted_input=lora_input,
+                    expert_offsets=offsets,
+                    lora_A=w13_A[slot],
+                    lora_B=w13_B[slot],
+                    scaling=self._get_unit_scaling(),
+                    is_stacked=True,
+                    inter=self._lora_inter[:total_tokens],
+                )
+
+        # ---------------------------------------- silu + mul
+        if self._w13_needs_swap:
+            # Layout is ``[up | gate]``: no fused kernel, do silu in fp32
+            # to match `silu_and_mul`'s precision (bf16 silu accumulates
+            # rounding error across 60 MoE layers).
+            intermediate = (
+                torch.nn.functional.silu(gateup_flat[:, N:].float())
+                * gateup_flat[:, :N].float()
+            ).to(out_dtype)
+        else:
+            intermediate = torch.empty(total_tokens, N, dtype=out_dtype, device=device)
+            silu_and_mul(gateup_flat, intermediate)
+        del gateup_flat
+
+        # ---------------------------------------- GEMM2: w2 base
+        w2_input_scale = layer.w2_input_scale_quant.view(-1).float()
+        if w2_input_scale.shape[0] != E:
+            w2_input_scale = w2_input_scale.expand(E).contiguous()
+
+        int_fp4, int_blockscale = scaled_fp4_experts_quant(
+            intermediate,
+            w2_input_scale,
+            offsets,
+            params.blockscale_offsets,
+            num_topk,
+        )
+        out_flat = cutlass_fp4_group_mm(
+            int_fp4,
+            layer.w2_weight,
+            int_blockscale,
+            layer.w2_blockscale_swizzled,
+            layer.g2_alphas,
+            out_dtype,
+            params.to_gemm2_args(),
+        )
+        del int_fp4, int_blockscale
+
+        # ---------------------------------------- LoRA w2 delta
+        if has_lora:
+            for slot in active_slots:
+                if sorted_adapter_ids is not None:
+                    mask = (sorted_adapter_ids == slot).unsqueeze(-1).to(out_dtype)
+                    lora_input = intermediate * mask
+                else:
+                    lora_input = intermediate
+                triton_moe_lora_delta(
+                    output=out_flat,
+                    sorted_input=lora_input,
+                    expert_offsets=offsets,
+                    lora_A=self.down_lora_a_weights[slot],
+                    lora_B=self.down_lora_b_weights[slot],
+                    scaling=self._get_unit_scaling(),
+                    is_stacked=False,
+                    inter=self._lora_inter[:total_tokens],
+                )
+
+        del intermediate, sorted_input
+
+        # ---------------------------------------- combine
+        c2 = shuffle_rows(out_flat, c_map, (total_tokens, K))
+        c2 = c2.view(m_a, num_topk, K)
+        if not moe_config.apply_router_weight_on_input:
+            c2 = c2 * local_weights.view(m_a, num_topk, 1).to(out_dtype)
+        return StandardCombineInput(hidden_states=c2.sum(dim=1).to(out_dtype))
 
     def slice_lora_a_weights(self, A: torch.Tensor, tp_rank: int):
         return A
