@@ -613,6 +613,7 @@ impl Router {
             // disconnect, so a chunk already produced by reqwest reaches the
             // client (and any future accumulator) before we tear the loop down.
             let worker_url_for_log = worker_url.to_string();
+            let worker_for_breaker = worker.clone();
             tokio::spawn(async move {
                 futures_util::pin_mut!(stream);
                 loop {
@@ -622,19 +623,11 @@ impl Router {
                             match chunk {
                                 Some(Ok(bytes)) => {
                                     if tx.send(Ok(bytes)).is_err() {
-                                        if tx.is_closed() {
-                                            tracing::debug!(
-                                                "Receiver dropped (likely client disconnect), \
-                                                cancelling upstream stream from {}",
-                                                worker_url_for_log
-                                            );
-                                        } else {
-                                            tracing::warn!(
-                                                "Stream channel send failed unexpectedly for {} \
-                                                while receiver still open",
-                                                worker_url_for_log
-                                            );
-                                        }
+                                        tracing::debug!(
+                                            "Receiver dropped (likely client disconnect), \
+                                            cancelling upstream stream from {}",
+                                            worker_url_for_log
+                                        );
                                         break;
                                     }
                                 }
@@ -643,6 +636,9 @@ impl Router {
                                         "Upstream stream error from worker {}: {}",
                                         worker_url_for_log, e
                                     );
+                                    if let Some(w) = &worker_for_breaker {
+                                        w.circuit_breaker().record_failure();
+                                    }
                                     let _ = tx.send(Err(format!("Stream error: {}", e)));
                                     break;
                                 }

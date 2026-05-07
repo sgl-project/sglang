@@ -41,6 +41,43 @@ async fn read_n_chunks(body: &mut Body, max_chunks: usize) -> usize {
     chunks_read
 }
 
+/// Read up to `max_chunks` data frames, returning the count and accumulated
+/// bytes so callers can parse the SSE payload (e.g. to capture a `response.id`
+/// before dropping the body).
+async fn read_n_chunks_with_bytes(body: &mut Body, max_chunks: usize) -> (usize, Vec<u8>) {
+    let mut chunks_read = 0;
+    let mut buf: Vec<u8> = Vec::new();
+    while chunks_read < max_chunks {
+        match body.frame().await {
+            Some(Ok(frame)) if frame.is_data() => {
+                if let Ok(data) = frame.into_data() {
+                    buf.extend_from_slice(&data);
+                }
+                chunks_read += 1;
+            }
+            Some(Ok(_)) => continue,
+            _ => break,
+        }
+    }
+    (chunks_read, buf)
+}
+
+/// Extract the `id` field from the first `response.created` SSE event in `buf`.
+/// Returns `None` if the event hasn't arrived yet (caller should read more).
+fn extract_response_id_from_sse(buf: &[u8]) -> Option<String> {
+    let s = std::str::from_utf8(buf).ok()?;
+    let data_line = s
+        .lines()
+        .find(|l| l.starts_with("data:") && l.contains("\"response.created\""))?;
+    let json_str = data_line.trim_start_matches("data:").trim();
+    let value: serde_json::Value = serde_json::from_str(json_str).ok()?;
+    value
+        .get("response")
+        .and_then(|r| r.get("id"))
+        .and_then(|id| id.as_str())
+        .map(|s| s.to_string())
+}
+
 /// Default plateau parameters: stop polling once chunks_sent has been
 /// stable for 250ms, with a 3s overall timeout. Both bounds are generous
 /// enough to absorb CI noise while still being faster than any natural
@@ -710,7 +747,11 @@ mod upstream_cancel_tests {
         assert_eq!(resp.status(), StatusCode::OK);
 
         let mut body = resp.into_body();
-        let _ = read_n_chunks(&mut body, 2).await;
+        // Read enough frames to capture the response.created event so we
+        // can later look up the stored response by its id.
+        let (_, captured) = read_n_chunks_with_bytes(&mut body, 3).await;
+        let response_id =
+            extract_response_id_from_sse(&captured).expect("response.created event with id");
         drop(body);
 
         // With persistence the gateway keeps reading; worker should
@@ -729,6 +770,32 @@ mod upstream_cancel_tests {
             state.chunks_sent, state.total_chunks
         );
         assert_eq!(state.chunks_sent, state.total_chunks);
+
+        // Draining is necessary but not sufficient — also verify the
+        // gateway actually called persist_conversation_items and the
+        // response landed in storage. Poll briefly because persistence
+        // happens after the upstream loop exits.
+        let storage = ctx.app_context.response_storage.clone();
+        let stored = {
+            use data_connector::ResponseId;
+            let id = ResponseId::from(response_id.clone());
+            let mut found = None;
+            for _ in 0..20 {
+                if let Ok(Some(r)) = storage.get_response(&id).await {
+                    found = Some(r);
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            found.unwrap_or_else(|| {
+                panic!(
+                    "Response {} should have been persisted after client \
+                     disconnect on store=true /responses stream",
+                    response_id
+                )
+            })
+        };
+        assert_eq!(stored.id.0, response_id);
 
         clear_slow_stream_chunks(worker_port);
         ctx.shutdown().await;
@@ -797,5 +864,135 @@ mod upstream_cancel_tests {
 
         clear_slow_stream_chunks(worker_port);
         ctx.shutdown().await;
+    }
+
+    /// Tool-interception streaming cancel: when the client disconnects mid
+    /// second-turn (after the gateway has executed an MCP tool call and
+    /// re-issued an upstream request), the gateway must drop that second
+    /// upstream connection promptly. This guards the explicit policy
+    /// documented at `streaming.rs:712-722` ("don't keep workers and
+    /// external MCP services busy on results no one will read") against
+    /// silent regression — the inner `select! { ... _ = tx.closed() }`
+    /// in `handle_streaming_with_tool_interception` is the load-bearing
+    /// piece.
+    #[tokio::test]
+    async fn test_tool_interception_streaming_cancel_on_client_disconnect() {
+        use crate::common::mock_mcp_server::MockMCPServer;
+        use crate::common::mock_worker::{HealthStatus, MockWorker, MockWorkerConfig, WorkerType};
+        use smg::routers::{RouterFactory, RouterTrait};
+
+        let worker_port = 20263;
+        let total_chunks: usize = 20;
+
+        reset_stream_tracker(worker_port);
+        set_slow_stream_chunks(worker_port, total_chunks);
+
+        let mut mcp = MockMCPServer::start().await.expect("start mcp");
+        let mcp_yaml = format!(
+            "servers:\n  - name: mock\n    protocol: streamable\n    url: {}\n",
+            mcp.url()
+        );
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let cfg_path = dir.path().join("mcp.yaml");
+        std::fs::write(&cfg_path, mcp_yaml).expect("write mcp cfg");
+
+        let mut worker = MockWorker::new(MockWorkerConfig {
+            port: worker_port,
+            worker_type: WorkerType::Regular,
+            health_status: HealthStatus::Healthy,
+            response_delay_ms: 50,
+            fail_rate: 0.0,
+        });
+        let worker_url = worker.start().await.expect("start worker");
+        // Allow the mock worker's HTTP listener to bind before the router
+        // probes its health.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let router_cfg = RouterConfig::builder()
+            .openai_mode(vec![worker_url])
+            .random_policy()
+            .host("127.0.0.1")
+            .port(4263)
+            .max_payload_size(8 * 1024 * 1024)
+            .request_timeout_secs(60)
+            .worker_startup_timeout_secs(5)
+            .worker_startup_check_interval_secs(1)
+            .max_concurrent_requests(32)
+            .queue_timeout_secs(5)
+            .build_unchecked();
+
+        let ctx = crate::common::create_test_context_with_mcp_config(
+            router_cfg,
+            cfg_path.to_str().unwrap(),
+        )
+        .await;
+        let router: Arc<dyn RouterTrait> =
+            Arc::from(RouterFactory::create_router(&ctx).await.expect("router"));
+        let app = crate::common::test_app::create_test_app_with_context(router, ctx);
+
+        let payload = json!({
+            "model": "mock-model",
+            "input": "search something",
+            "stream": true,
+            "store": false,
+            "tools": [{
+                "type": "mcp",
+                "server_label": "mock",
+                "server_url": mcp.url()
+            }]
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/responses")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_string(&payload).unwrap()))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let mut body = resp.into_body();
+        // Pull a few frames so the body keeps draining while the gateway
+        // works through turn 1 (tool call) and starts turn 2 (slow text).
+        let _ = read_n_chunks(&mut body, 8).await;
+
+        // Wait until the slow second-turn upstream request has actually
+        // started producing chunks — only the slow-stream branch in the
+        // mock initialises the tracker, so seeing chunks_sent>0 here
+        // means we're inside the second upstream request.
+        let mut waited_ms: u64 = 0;
+        loop {
+            if let Some(s) = get_stream_tracking_state(worker_port) {
+                if s.chunks_sent > 0 {
+                    break;
+                }
+            }
+            if waited_ms >= 5000 {
+                panic!(
+                    "Second-turn upstream stream never started producing chunks \
+                     within 5s — tool-interception path did not reach select!"
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            waited_ms += 50;
+        }
+
+        let snapshot = get_stream_tracking_state(worker_port)
+            .map(|s| s.chunks_sent)
+            .unwrap_or(0);
+        drop(body);
+
+        let final_state = assert_cancelled_before_completion(worker_port).await;
+        assert!(
+            final_state.chunks_sent <= snapshot + 4,
+            "Tool-interception second-turn chunks_sent grew by more than \
+             the buffer ({} -> {}) — cancel did not propagate to upstream",
+            snapshot,
+            final_state.chunks_sent
+        );
+
+        clear_slow_stream_chunks(worker_port);
+        worker.stop().await;
+        mcp.stop().await;
     }
 }

@@ -872,17 +872,10 @@ impl PDRouter {
                                 };
 
                                 if tx.send(Ok(result)).is_err() {
-                                    if tx.is_closed() {
-                                        tracing::debug!(
-                                            "Receiver dropped (likely client disconnect), \
-                                            cancelling upstream PD stream"
-                                        );
-                                    } else {
-                                        tracing::warn!(
-                                            "PD stream channel send failed unexpectedly while \
-                                            receiver still open"
-                                        );
-                                    }
+                                    tracing::debug!(
+                                        "Receiver dropped (likely client disconnect), \
+                                        cancelling upstream PD stream"
+                                    );
                                     break;
                                 }
 

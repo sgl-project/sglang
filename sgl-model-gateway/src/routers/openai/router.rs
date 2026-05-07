@@ -649,21 +649,12 @@ impl crate::routers::RouterTrait for OpenAIRouter {
                                         match chunk {
                                             Some(Ok(bytes)) => {
                                                 if tx.send(Ok(bytes)).is_err() {
-                                                    if tx.is_closed() {
-                                                        tracing::debug!(
-                                                            "Receiver dropped (likely client \
-                                                            disconnect), cancelling upstream \
-                                                            stream from {}",
-                                                            url_for_log
-                                                        );
-                                                    } else {
-                                                        tracing::warn!(
-                                                            "OpenAI stream channel send failed \
-                                                            unexpectedly for {} while receiver \
-                                                            still open",
-                                                            url_for_log
-                                                        );
-                                                    }
+                                                    tracing::debug!(
+                                                        "Receiver dropped (likely client \
+                                                        disconnect), cancelling upstream \
+                                                        stream from {}",
+                                                        url_for_log
+                                                    );
                                                     break;
                                                 }
                                             }

@@ -925,8 +925,13 @@ async fn responses_handler(
             Sse::new(stream)
                 .keep_alive(KeepAlive::default())
                 .into_response()
-        } else if has_tools && has_function_output {
-            // Second turn: emit streaming text response
+        } else if has_tools
+            && has_function_output
+            && get_slow_stream_chunks_for_port(config.port).is_none()
+        {
+            // Second turn: emit streaming text response.
+            // If slow-stream is configured, fall through to the slow-stream
+            // branch below so cancel tests can disconnect mid second-turn.
             let rid = request_id.clone();
             let msg_id = format!(
                 "msg_{}",
@@ -1157,6 +1162,9 @@ async fn responses_handler(
                     record_chunk_sent(port);
                 }
 
+                let aggregated_text = (0..num_chunks)
+                    .map(|i| format!("chunk-{} ", i))
+                    .collect::<String>();
                 let completed = Event::default().event("response.completed").data(
                     json!({
                         "type": "response.completed",
@@ -1165,7 +1173,16 @@ async fn responses_handler(
                             "object": "response",
                             "created_at": timestamp,
                             "model": "mock-model",
-                            "status": "completed"
+                            "status": "completed",
+                            "output": [{
+                                "id": msg_id,
+                                "type": "message",
+                                "role": "assistant",
+                                "content": [{
+                                    "type": "output_text",
+                                    "text": aggregated_text
+                                }]
+                            }]
                         }
                     })
                     .to_string(),

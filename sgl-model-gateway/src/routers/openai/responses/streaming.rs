@@ -596,7 +596,13 @@ pub(super) async fn handle_simple_streaming_passthrough(
                 }
             }
 
-            if !upstream_failed {
+            if upstream_failed {
+                warn!(
+                    "Skipping /responses persistence due to upstream stream error from {}: \
+                    store={} conversation={:?}",
+                    upstream_url, should_store, original_request.conversation
+                );
+            } else {
                 if chunk_processor.has_remaining() {
                     accumulator.ingest_block(&chunk_processor.take_remaining());
                 }
@@ -652,19 +658,11 @@ pub(super) async fn handle_simple_streaming_passthrough(
 
                                     let chunk_to_send = format!("{}\n\n", block_cow);
                                     if tx.send(Ok(Bytes::from(chunk_to_send))).is_err() {
-                                        if tx.is_closed() {
-                                            tracing::debug!(
-                                                "Receiver dropped (likely client disconnect), \
-                                                cancelling upstream /responses stream from {}",
-                                                upstream_url
-                                            );
-                                        } else {
-                                            tracing::warn!(
-                                                "/responses stream channel send failed \
-                                                unexpectedly for {} while receiver still open",
-                                                upstream_url
-                                            );
-                                        }
+                                        tracing::debug!(
+                                            "Receiver dropped (likely client disconnect), \
+                                            cancelling upstream /responses stream from {}",
+                                            upstream_url
+                                        );
                                         break 'outer;
                                     }
                                 }
@@ -813,13 +811,7 @@ pub(super) async fn handle_streaming_with_tool_interception(
                         "event: error\ndata: {{\"error\": {{\"message\": \"{}\"}}}}\n\n",
                         e
                     );
-                    if tx.send(Ok(Bytes::from(error_event))).is_err() && !tx.is_closed() {
-                        tracing::warn!(
-                            "Failed to forward upstream-error event for {} while receiver \
-                            still open",
-                            url_clone
-                        );
-                    }
+                    let _ = tx.send(Ok(Bytes::from(error_event)));
                     return;
                 }
             };
@@ -835,13 +827,7 @@ pub(super) async fn handle_streaming_with_tool_interception(
                     body
                 );
                 let error_event = format!("event: error\ndata: {{\"error\": {{\"message\": \"Upstream error {}: {}\"}}}}\n\n", status, body);
-                if tx.send(Ok(Bytes::from(error_event))).is_err() && !tx.is_closed() {
-                    tracing::warn!(
-                        "Failed to forward upstream-error event for {} while receiver \
-                        still open",
-                        url_clone
-                    );
-                }
+                let _ = tx.send(Ok(Bytes::from(error_event)));
                 return;
             }
 
@@ -989,13 +975,7 @@ pub(super) async fn handle_streaming_with_tool_interception(
                             e
                         );
                         let error_event = format!("event: error\ndata: {{\"error\": {{\"message\": \"Stream error: {}\"}}}}\n\n", e);
-                        if tx.send(Ok(Bytes::from(error_event))).is_err() && !tx.is_closed() {
-                            tracing::warn!(
-                                "Failed to forward stream-error event for {} while receiver \
-                                still open",
-                                url_clone
-                            );
-                        }
+                        let _ = tx.send(Ok(Bytes::from(error_event)));
                         return;
                     }
                     None => break,
