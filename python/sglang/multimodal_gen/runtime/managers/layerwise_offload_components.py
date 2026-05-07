@@ -1,6 +1,75 @@
 from collections.abc import Sequence
 
 LAYERWISE_OFFLOAD_ALL_COMPONENTS = "all"
+DIT_COMPONENT_NAMES = frozenset(
+    {
+        "transformer",
+        "transformer_2",
+        "video_dit",
+        "video_dit_2",
+        "audio_dit",
+        "dual_tower_bridge",
+    }
+)
+VAE_COMPONENT_NAMES = frozenset(
+    {
+        "vae",
+        "video_vae",
+        "audio_vae",
+        "vocoder",
+        "spatial_upsampler",
+        "condition_image_encoder",
+    }
+)
+CPU_OFFLOAD_FLAG_NAMES = (
+    "dit_cpu_offload",
+    "text_encoder_cpu_offload",
+    "image_encoder_cpu_offload",
+    "vae_cpu_offload",
+)
+
+
+def is_dit_component_name(component_name: str) -> bool:
+    return component_name in DIT_COMPONENT_NAMES
+
+
+def is_text_encoder_component_name(component_name: str) -> bool:
+    return component_name.startswith("text_encoder") or component_name.endswith(
+        "text_encoder"
+    )
+
+
+def is_image_encoder_component_name(component_name: str) -> bool:
+    return component_name == "image_encoder"
+
+
+def is_vae_component_name(component_name: str) -> bool:
+    return component_name in VAE_COMPONENT_NAMES
+
+
+def cpu_offload_flags_for_layerwise_components(
+    component_names: Sequence[str],
+) -> tuple[str, ...]:
+    if LAYERWISE_OFFLOAD_ALL_COMPONENTS in component_names:
+        return CPU_OFFLOAD_FLAG_NAMES
+
+    flag_names: list[str] = []
+    for component_name in component_names:
+        if is_dit_component_name(component_name):
+            flag_name = "dit_cpu_offload"
+        elif is_text_encoder_component_name(component_name):
+            flag_name = "text_encoder_cpu_offload"
+        elif is_image_encoder_component_name(component_name):
+            flag_name = "image_encoder_cpu_offload"
+        elif is_vae_component_name(component_name):
+            flag_name = "vae_cpu_offload"
+        else:
+            continue
+
+        if flag_name not in flag_names:
+            flag_names.append(flag_name)
+
+    return tuple(flag_names)
 
 
 def normalize_layerwise_offload_components(

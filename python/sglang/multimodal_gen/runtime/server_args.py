@@ -38,6 +38,7 @@ from sglang.multimodal_gen.runtime.layers.quantization.configs.nunchaku_config i
 )
 from sglang.multimodal_gen.runtime.loader.utils import BYTES_PER_GB
 from sglang.multimodal_gen.runtime.managers.layerwise_offload_components import (
+    cpu_offload_flags_for_layerwise_components,
     normalize_layerwise_offload_components,
 )
 from sglang.multimodal_gen.runtime.platforms import (
@@ -819,7 +820,41 @@ class ServerArgs(DisaggArgsMixin):
             self.dit_layerwise_offload = True
             self.dit_layerwise_offload_auto_enabled = False
             self.layerwise_offload_components = component_names
+            self._disable_cpu_offload_for_layerwise_components(component_names)
             return
+
+    def _disable_cpu_offload_for_layerwise_components(
+        self, component_names: list[str]
+    ) -> None:
+        # Layerwise offload owns H2D/D2H for selected component weights.
+        flag_names = cpu_offload_flags_for_layerwise_components(component_names)
+        disabled_flag_names: list[str] = []
+
+        if "dit_cpu_offload" in flag_names and self.dit_cpu_offload is not False:
+            self.dit_cpu_offload = False
+            disabled_flag_names.append("dit_cpu_offload")
+        if (
+            "text_encoder_cpu_offload" in flag_names
+            and self.text_encoder_cpu_offload is not False
+        ):
+            self.text_encoder_cpu_offload = False
+            disabled_flag_names.append("text_encoder_cpu_offload")
+        if (
+            "image_encoder_cpu_offload" in flag_names
+            and self.image_encoder_cpu_offload is not False
+        ):
+            self.image_encoder_cpu_offload = False
+            disabled_flag_names.append("image_encoder_cpu_offload")
+        if "vae_cpu_offload" in flag_names and self.vae_cpu_offload is not False:
+            self.vae_cpu_offload = False
+            disabled_flag_names.append("vae_cpu_offload")
+
+        if disabled_flag_names:
+            logger.info(
+                "Disabling %s because the selected layerwise offload components "
+                "manage the same weights.",
+                ", ".join(disabled_flag_names),
+            )
 
     def _adjust_autocast(self):
         if self.disable_autocast is None:
@@ -1602,7 +1637,12 @@ class ServerArgs(DisaggArgsMixin):
                 )
                 self.use_fsdp_inference = False
 
-            if self.dit_cpu_offload is None:
+            layerwise_components = self.layerwise_offload_components
+            should_disable_dit_cpu_offload = layerwise_components is None or (
+                "dit_cpu_offload"
+                in cpu_offload_flags_for_layerwise_components(layerwise_components)
+            )
+            if should_disable_dit_cpu_offload and self.dit_cpu_offload is not False:
                 logger.warning(
                     "dit_layerwise_offload is enabled, automatically disabling dit_cpu_offload."
                 )

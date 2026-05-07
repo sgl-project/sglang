@@ -16,6 +16,12 @@ from sglang.multimodal_gen.runtime.managers.component_resident_strategies import
 from sglang.multimodal_gen.runtime.managers.layerwise_offload import (
     is_layerwise_offloaded_module,
 )
+from sglang.multimodal_gen.runtime.managers.layerwise_offload_components import (
+    is_dit_component_name,
+    is_image_encoder_component_name,
+    is_text_encoder_component_name,
+    is_vae_component_name,
+)
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
@@ -87,16 +93,6 @@ class ComponentResidencyPipeline(Protocol):
     component_residency_strategies: MutableMapping[str, "ComponentResidencyStrategy"]
 
 
-DIT_COMPONENT_NAMES = {
-    "transformer",
-    "transformer_2",
-    "video_dit",
-    "video_dit_2",
-    "audio_dit",
-    "dual_tower_bridge",
-}
-
-
 def is_fsdp_managed_module(module: nn.Module) -> bool:
     return module.__class__.__name__.startswith("FSDP")
 
@@ -106,22 +102,13 @@ def should_cpu_offload_component(
 ) -> bool:
     if server_args.use_fsdp_inference or is_fsdp_managed_module(module):
         return False
-    if component_name in DIT_COMPONENT_NAMES:
+    if is_dit_component_name(component_name):
         return bool(server_args.dit_cpu_offload)
-    if component_name.startswith("text_encoder") or component_name.endswith(
-        "text_encoder"
-    ):
+    if is_text_encoder_component_name(component_name):
         return bool(server_args.text_encoder_cpu_offload)
-    if component_name == "image_encoder":
+    if is_image_encoder_component_name(component_name):
         return bool(server_args.image_encoder_cpu_offload)
-    if component_name in {
-        "vae",
-        "video_vae",
-        "audio_vae",
-        "vocoder",
-        "spatial_upsampler",
-        "condition_image_encoder",
-    }:
+    if is_vae_component_name(component_name):
         return bool(server_args.vae_cpu_offload)
     return False
 

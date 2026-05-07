@@ -225,6 +225,27 @@ class TestOffloadDefaults(unittest.TestCase):
 
         self.assertTrue(args.vae_cpu_offload)
 
+    def test_layerwise_components_disable_matching_cpu_offloads(self):
+        args = self._from_dict_with_task_type(
+            ModelTaskType.T2V,
+            memory_gb=16,
+            kwargs={
+                "layerwise_offload_components": [
+                    "text_encoder",
+                    "image_encoder",
+                    "video_dit",
+                    "vae",
+                ],
+                "vae_cpu_offload": True,
+            },
+        )
+
+        self.assertTrue(args.dit_layerwise_offload)
+        self.assertFalse(args.dit_cpu_offload)
+        self.assertFalse(args.text_encoder_cpu_offload)
+        self.assertFalse(args.image_encoder_cpu_offload)
+        self.assertFalse(args.vae_cpu_offload)
+
 
 class TestFSDPShardConditions(unittest.TestCase):
     def test_helpers_match_only_direct_block_entries(self):
