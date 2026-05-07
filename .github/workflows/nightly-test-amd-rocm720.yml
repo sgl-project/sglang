@@ -117,6 +117,9 @@ jobs:
         with:
           ref: ${{ inputs.ref || github.sha }}
 
+      - name: Ensure VRAM is clear
+        run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
+
       - name: Setup docker (ROCm 7.2)
         run: |
           touch github_summary.md
@@ -146,6 +149,9 @@ jobs:
         with:
           ref: ${{ inputs.ref || github.sha }}
 
+      - name: Ensure VRAM is clear
+        run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
+
       - name: Setup docker (ROCm 7.2)
         run: |
           touch github_summary.md
@@ -173,6 +179,9 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.ref || github.sha }}
+
+      - name: Ensure VRAM is clear
+        run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
 
       - name: Setup docker (ROCm 7.2)
         run: |
@@ -203,6 +212,9 @@ jobs:
         with:
           ref: ${{ inputs.ref || github.sha }}
 
+      - name: Ensure VRAM is clear
+        run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
+
       - name: Setup docker (ROCm 7.2)
         run: |
           touch github_summary.md
@@ -232,6 +244,9 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.ref || github.sha }}
+
+      - name: Ensure VRAM is clear
+        run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
 
       - name: Setup docker (ROCm 7.2)
         run: |
@@ -264,6 +279,9 @@ jobs:
         with:
           ref: ${{ inputs.ref || github.sha }}
 
+      - name: Ensure VRAM is clear
+        run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
+
       - name: Setup docker (ROCm 7.2)
         run: |
           touch github_summary.md
@@ -293,6 +311,9 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.ref || github.sha }}
+
+      - name: Ensure VRAM is clear
+        run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
 
       - name: Setup docker (ROCm 7.2)
         run: |
@@ -333,6 +354,9 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.ref || github.sha }}
+
+      - name: Ensure VRAM is clear
+        run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
 
       - name: Setup docker (ROCm 7.2)
         run: |
@@ -377,6 +401,9 @@ jobs:
         with:
           ref: ${{ inputs.ref || github.sha }}
 
+      - name: Ensure VRAM is clear
+        run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
+
       - name: Setup docker (ROCm 7.2)
         run: |
           touch github_summary.md
@@ -419,6 +446,9 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.ref || github.sha }}
+
+      - name: Ensure VRAM is clear
+        run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
 
       - name: Setup docker (ROCm 7.2)
         run: |
@@ -463,6 +493,9 @@ jobs:
         with:
           ref: ${{ inputs.ref || github.sha }}
 
+      - name: Ensure VRAM is clear
+        run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
+
       - name: Setup docker (ROCm 7.2)
         run: |
           touch github_summary.md
@@ -503,6 +536,9 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.ref || github.sha }}
+
+      - name: Ensure VRAM is clear
+        run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
 
       - name: Setup docker (ROCm 7.2)
         run: |
@@ -545,6 +581,9 @@ jobs:
         with:
           ref: ${{ inputs.ref || github.sha }}
 
+      - name: Ensure VRAM is clear
+        run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
+
       - name: Setup docker (ROCm 7.2)
         run: |
           touch github_summary.md
@@ -574,6 +613,9 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.ref || github.sha }}
+
+      - name: Ensure VRAM is clear
+        run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
 
       - name: Setup docker (ROCm 7.2)
         run: |
@@ -605,6 +647,9 @@ jobs:
         with:
           ref: ${{ inputs.ref || github.sha }}
 
+      - name: Ensure VRAM is clear
+        run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
+
       - name: Setup docker (ROCm 7.2)
         run: |
           touch github_summary.md
@@ -634,6 +679,9 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.ref || github.sha }}
+
+      - name: Ensure VRAM is clear
+        run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
 
       - name: Setup docker (ROCm 7.2)
         run: |
@@ -679,6 +727,9 @@ jobs:
         with:
           ref: ${{ inputs.ref || github.sha }}
 
+      - name: Ensure VRAM is clear
+        run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
+
       - name: Setup docker (ROCm 7.2)
         run: |
           touch github_summary.md
@@ -722,6 +773,9 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.ref || github.sha }}
+
+      - name: Ensure VRAM is clear
+        run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
 
       - name: Setup docker (ROCm 7.2)
         run: |
@@ -767,6 +821,9 @@ jobs:
         with:
           ref: ${{ inputs.ref || github.sha }}
 
+      - name: Ensure VRAM is clear
+        run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
+
       - name: Setup docker (ROCm 7.2)
         run: |
           touch github_summary.md
@@ -807,6 +864,9 @@ jobs:
         with:
           ref: ${{ inputs.ref || github.sha }}
 
+      - name: Ensure VRAM is clear
+        run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
+
       - name: Setup docker (ROCm 7.2)
         run: |
           touch github_summary.md
@@ -835,6 +895,9 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.ref || github.sha }}
+
+      - name: Ensure VRAM is clear
+        run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
 
       - name: Setup docker (ROCm 7.2)
         run: |
@@ -867,6 +930,9 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.ref || github.sha }}
+
+      - name: Ensure VRAM is clear
+        run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
 
       - name: Setup docker (ROCm 7.2)
         run: |
@@ -914,6 +980,9 @@ jobs:
         with:
           ref: ${{ inputs.ref || github.sha }}
 
+      - name: Ensure VRAM is clear
+        run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
+
       - name: Setup docker (ROCm 7.2)
         run: |
           touch github_summary.md
@@ -960,6 +1029,9 @@ jobs:
         with:
           ref: ${{ inputs.ref || github.sha }}
 
+      - name: Ensure VRAM is clear
+        run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
+
       - name: Setup docker (ROCm 7.2)
         run: |
           touch github_summary.md
@@ -1003,6 +1075,9 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.ref || github.sha }}
+
+      - name: Ensure VRAM is clear
+        run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
 
       - name: Setup docker (ROCm 7.2)
         run: |
@@ -1048,6 +1123,9 @@ jobs:
         with:
           ref: ${{ inputs.ref || github.sha }}
 
+      - name: Ensure VRAM is clear
+        run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
+
       - name: Setup docker (ROCm 7.2)
         run: |
           touch github_summary.md
@@ -1092,6 +1170,9 @@ jobs:
         with:
           ref: ${{ inputs.ref || github.sha }}
 
+      - name: Ensure VRAM is clear
+        run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
+
       - name: Setup docker (ROCm 7.2)
         run: |
           touch github_summary.md
@@ -1124,6 +1205,9 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.ref || github.sha }}
+
+      - name: Ensure VRAM is clear
+        run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
 
       - name: Setup docker (ROCm 7.2)
         run: |
@@ -1158,6 +1242,9 @@ jobs:
         with:
           ref: ${{ inputs.ref || github.sha }}
 
+      - name: Ensure VRAM is clear
+        run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
+
       - name: Setup docker (ROCm 7.2)
         run: |
           touch github_summary.md
@@ -1190,6 +1277,9 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.ref || github.sha }}
+
+      - name: Ensure VRAM is clear
+        run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
 
       - name: Setup docker (ROCm 7.2)
         run: |
@@ -1224,6 +1314,9 @@ jobs:
         with:
           ref: ${{ inputs.ref || github.sha }}
 
+      - name: Ensure VRAM is clear
+        run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
+
       - name: Setup docker (ROCm 7.2)
         run: |
           touch github_summary.md
@@ -1256,6 +1349,9 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.ref || github.sha }}
+
+      - name: Ensure VRAM is clear
+        run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
 
       - name: Setup docker (ROCm 7.2)
         run: |
@@ -1302,6 +1398,9 @@ jobs:
         with:
           ref: ${{ inputs.ref || github.sha }}
 
+      - name: Ensure VRAM is clear
+        run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
+
       - name: Setup docker (ROCm 7.2)
         run: |
           touch github_summary.md
@@ -1345,6 +1444,9 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.ref || github.sha }}
+
+      - name: Ensure VRAM is clear
+        run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
 
       - name: Setup docker (ROCm 7.2)
         run: |
@@ -1391,6 +1493,9 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.ref || github.sha }}
+
+      - name: Ensure VRAM is clear
+        run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
 
       - name: Setup docker (ROCm 7.2)
         run: |
@@ -1462,6 +1567,9 @@ jobs:
           echo "image=rocm/sgl-dev:$TAG" >> "$GITHUB_OUTPUT"
           echo "Resolved DSv4 image: rocm/sgl-dev:$TAG"
 
+      - name: Ensure VRAM is clear
+        run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
+
       - name: Setup docker (ROCm 7.2 DSv4)
         run: |
           touch github_summary.md
@@ -1527,6 +1635,9 @@ jobs:
           fi
           echo "image=rocm/sgl-dev:$TAG" >> "$GITHUB_OUTPUT"
           echo "Resolved DSv4 image: rocm/sgl-dev:$TAG"
+
+      - name: Ensure VRAM is clear
+        run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
 
       - name: Setup docker (ROCm 7.2 DSv4)
         run: |
