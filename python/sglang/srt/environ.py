@@ -610,9 +610,6 @@ class Envs:
     # Distributed
     SGLANG_DSV4_FIX_TP_ATTN_A2A_SCATTER = EnvBool(True)
 
-    # Misc fix
-    SGLANG_FIX_PD_IDLE = EnvBool(True)
-
     # Symmetric Memory
     SGLANG_SYMM_MEM_PREALLOC_GB_SIZE = EnvInt(-1)
     SGLANG_DEBUG_SYMM_MEM = EnvBool(False)

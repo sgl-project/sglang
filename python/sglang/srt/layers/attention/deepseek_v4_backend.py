@@ -786,7 +786,7 @@ class DeepseekV4AttnBackend(
         out_cache_loc = fb.out_cache_loc
         actual_forward_mode = fb.forward_mode
 
-        if actual_forward_mode == ForwardMode.IDLE and envs.SGLANG_FIX_PD_IDLE.get():
+        if actual_forward_mode == ForwardMode.IDLE:
             logger.debug(
                 f"[IDLE replay] bs={bs}, "
                 f"local_seq_lens_len={len(seq_lens)}, "
