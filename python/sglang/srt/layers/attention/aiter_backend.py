@@ -1387,8 +1387,25 @@ class AiterAttnBackend(AttentionBackend):
             max_num_blocks_per_seq = (
                 self.max_context_len + self.page_size - 1
             ) // self.page_size
+            # Defensive sizing: buffer is written per-token via
+            # create_flashinfer_kv_indices_triton (kv_indptr = cumsum(seq_lens)),
+            # but also viewed per-page as (-1, max_num_blocks_per_seq) by the
+            # unified path. Per-page sizing under-allocates by `page_size`x
+            # and OOBs once seq_lens_sum exceeds the buffer (ROCm:
+            # HSA_STATUS_ERROR_MEMORY_APERTURE_VIOLATION). max_bs *
+            # max_num_blocks_per_seq * page_size is >= max_bs * max_context_len
+            # and stays divisible by max_num_blocks_per_seq.
+            #
+            # TODO(aiter, page_size>1): root fix is to make page_size>1
+            # actually engage the attention kernel (`forward_decode` still
+            # calls paged_attention_ragged with view(-1, 1, ...) and
+            # block_size=1). That requires a per-page indices kernel + all
+            # metadata sites + paged_attention_ragged call site + FP8 KV
+            # coordination, after which this allocation can revert to
+            # per-page (gated on use_mla).
+            buffer_numel = max_bs * max_num_blocks_per_seq * self.page_size
             self.cuda_graph_kv_indices = torch.zeros(
-                (max_bs * max_num_blocks_per_seq),
+                (buffer_numel,),
                 dtype=torch.int32,
                 device=self.device,
             )
