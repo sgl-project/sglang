@@ -137,8 +137,8 @@ class ModelSlimConfig(QuantizationConfig):
             from sglang.multimodal_gen.runtime.layers.quantization.modelslim_mxfp8_scheme import (
                 ModelSlimMXFP8Scheme,
             )
-            return ModelSlimMXFP8Scheme()
 
+            return ModelSlimMXFP8Scheme()
         raise NotImplementedError("No modelslim compatible scheme was found.")
 
     def get_scheme(
