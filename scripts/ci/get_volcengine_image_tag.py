@@ -46,7 +46,17 @@ def main() -> None:
         help="Required for version mode; inserted after .byted.",
     )
     parser.add_argument("--cuda-suffix", choices=["", "cu130"], default="")
+    parser.add_argument(
+        "--variant-suffix",
+        default="",
+        help="Optional build variant suffix appended before the CUDA suffix.",
+    )
     args = parser.parse_args()
+
+    if args.variant_suffix and not re.fullmatch(
+        r"[0-9A-Za-z][0-9A-Za-z_.-]*", args.variant_suffix
+    ):
+        raise SystemExit("--variant-suffix must be a Docker tag-safe suffix")
 
     version = get_sglang_version()
     timestamp = datetime.now(ZoneInfo("Asia/Shanghai")).strftime("%Y%m%d%H%M")
@@ -59,6 +69,9 @@ def main() -> None:
         if not args.tag_value:
             raise SystemExit("--tag-value is required when --mode=version")
         tag = f"v{version}.byted.{args.tag_value}.{timestamp}"
+
+    if args.variant_suffix:
+        tag = f"{tag}-{args.variant_suffix}"
 
     if args.cuda_suffix:
         tag = f"{tag}-{args.cuda_suffix}"

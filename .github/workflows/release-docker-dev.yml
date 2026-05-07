@@ -134,12 +134,54 @@ jobs:
             platform: linux/amd64
             build_type: all
             grace_blackwell: 0
+            hopper_sbo: 0
+            w4a8_per_tensor_transfer: 0
+            image_tag_suffix: ""
             arch_tag: x86
             version: 12.9.1
           - runner: x64-docker-build-node
             platform: linux/amd64
             build_type: all
             grace_blackwell: 0
+            hopper_sbo: 1
+            w4a8_per_tensor_transfer: 0
+            image_tag_suffix: hopper-sbo
+            arch_tag: x86
+            version: 12.9.1
+          - runner: x64-docker-build-node
+            platform: linux/amd64
+            build_type: all
+            grace_blackwell: 0
+            hopper_sbo: 0
+            w4a8_per_tensor_transfer: 1
+            image_tag_suffix: w4a8-per-tensor-transfer
+            arch_tag: x86
+            version: 12.9.1
+          - runner: x64-docker-build-node
+            platform: linux/amd64
+            build_type: all
+            grace_blackwell: 0
+            hopper_sbo: 0
+            w4a8_per_tensor_transfer: 0
+            image_tag_suffix: ""
+            arch_tag: x86-cu13
+            version: 13.0.1
+          - runner: x64-docker-build-node
+            platform: linux/amd64
+            build_type: all
+            grace_blackwell: 0
+            hopper_sbo: 1
+            w4a8_per_tensor_transfer: 0
+            image_tag_suffix: hopper-sbo
+            arch_tag: x86-cu13
+            version: 13.0.1
+          - runner: x64-docker-build-node
+            platform: linux/amd64
+            build_type: all
+            grace_blackwell: 0
+            hopper_sbo: 0
+            w4a8_per_tensor_transfer: 1
+            image_tag_suffix: w4a8-per-tensor-transfer
             arch_tag: x86-cu13
             version: 13.0.1
     steps:
@@ -209,6 +251,11 @@ jobs:
           INTERNAL_ARGS="\
             --build-arg BYTED_INTERNAL_EXTRA_TOOLS_APT_URL=${BYTED_INTERNAL_EXTRA_TOOLS_APT_URL} \
             --build-arg BYTED_INTERNAL_EXTRA_TOOLS_GPG_URL=${BYTED_INTERNAL_EXTRA_TOOLS_GPG_URL}"
+          VARIANT_SUFFIX_ARG=""
+          if [ -n "${{ matrix.image_tag_suffix }}" ]; then
+            LOCAL_IMAGE="${LOCAL_IMAGE}-${{ matrix.image_tag_suffix }}"
+            VARIANT_SUFFIX_ARG="--variant-suffix ${{ matrix.image_tag_suffix }}"
+          fi
 
           CUDA_SUFFIX=""
           if [ "${{ matrix.version }}" = "13.0.1" ]; then
@@ -216,9 +263,9 @@ jobs:
           fi
 
           if [ "${{ github.event_name }}" = "schedule" ]; then
-            VOLCENGINE_TAG=$(python3 scripts/ci/get_volcengine_image_tag.py --mode nightly ${CUDA_SUFFIX})
+            VOLCENGINE_TAG=$(python3 scripts/ci/get_volcengine_image_tag.py --mode nightly ${VARIANT_SUFFIX_ARG} ${CUDA_SUFFIX})
           else
-            VOLCENGINE_TAG=$(python3 scripts/ci/get_volcengine_image_tag.py --mode manual ${CUDA_SUFFIX})
+            VOLCENGINE_TAG=$(python3 scripts/ci/get_volcengine_image_tag.py --mode manual ${VARIANT_SUFFIX_ARG} ${CUDA_SUFFIX})
           fi
 
           docker buildx build \
@@ -231,6 +278,8 @@ jobs:
             --build-arg BUILD_TYPE=${{ matrix.build_type }} \
             --build-arg CMAKE_BUILD_PARALLEL_LEVEL=$(nproc) \
             --build-arg GRACE_BLACKWELL=${{ matrix.grace_blackwell }} \
+            --build-arg HOPPER_SBO=${{ matrix.hopper_sbo }} \
+            --build-arg W4A8_PER_TENSOR_TRANSFER=${{ matrix.w4a8_per_tensor_transfer }} \
             --build-arg HTTP_PROXY=${HTTP_PROXY} \
             --build-arg HTTPS_PROXY=${HTTPS_PROXY} \
             --build-arg ALL_PROXY=${ALL_PROXY} \
