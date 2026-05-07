@@ -8,8 +8,8 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 
-from sglang.srt.environ import envs
 from sglang.srt.distributed import get_tp_group
+from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import (
     get_attention_tp_group,
     is_dp_attention_enabled,
@@ -139,8 +139,12 @@ class EagleDraftInputV2Mixin:
             # Pre-claim bonus slot here (like normal decode); resolve subtracts 1.
             r.kv_committed_len += 1
 
-        cur_kv_lens_cpu = torch.tensor(cur_kv_lens, dtype=torch.int32, device="cpu", pin_memory=)
-        nxt_kv_lens_cpu = torch.tensor(nxt_kv_lens, dtype=torch.int32, device="cpu", pin_memory=True)
+        cur_kv_lens_cpu = torch.tensor(
+            cur_kv_lens, dtype=torch.int32, device="cpu", pin_memory=True
+        )
+        nxt_kv_lens_cpu = torch.tensor(
+            nxt_kv_lens, dtype=torch.int32, device="cpu", pin_memory=True
+        )
 
         if page_size == 1:
             out_cache_loc = alloc_token_slots(batch.tree_cache, num_needed_tokens)

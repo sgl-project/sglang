@@ -366,9 +366,7 @@ class EagleDraftWorker(BaseDraftWorker):
         )
 
         if model_worker_batch.seq_lens_sum is None and tree_mask_buf is None:
-            model_worker_batch.seq_lens_sum = (
-                model_worker_batch.seq_lens.sum().item()
-            )
+            model_worker_batch.seq_lens_sum = model_worker_batch.seq_lens.sum().item()
 
         (
             tree_mask,
