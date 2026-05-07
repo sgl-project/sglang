@@ -57,7 +57,8 @@ def run(T, G):
 
     def fp8_path_sgl():
         o_fp8, o_s = sglang_per_token_group_quant_fp8(
-            o.reshape(T * G, D).contiguous(), group_size=128
+            o.reshape(T * G, D).contiguous(), group_size=128,
+            enable_v2=True
         )
         deep_gemm.fp8_einsum(
             "bhr,hdr->bhd",

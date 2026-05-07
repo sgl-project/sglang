@@ -80,10 +80,10 @@ def run_one(M: int, K: int, dtype=torch.bfloat16, seed=0, label=""):
     # the wrapper without changing it; instead just check fast's own outputs.)
 
     if M > 0:
-        q_sgl, s_sgl = sglang_per_token_group_quant_fp8(x, group_size=GROUP)
+        q_sgl, s_sgl = sglang_per_token_group_quant_fp8(x, group_size=GROUP, enable_v2=True)
     else:
         # sglang_per_token_group_quant_fp8 still allocates outputs even for M=0.
-        q_sgl, s_sgl = sglang_per_token_group_quant_fp8(x, group_size=GROUP)
+        q_sgl, s_sgl = sglang_per_token_group_quant_fp8(x, group_size=GROUP, enable_v2=True)
 
     # ---- 1. Shape + dtype check ----
     assert q_fast.shape == q_sgl.shape == (M, K), \

@@ -30,7 +30,7 @@ def main():
     x = (torch.randn(M, K, dtype=torch.bfloat16, device="cuda") * 0.1).contiguous()
 
     # Correctness
-    q_a, s_a = sglang_per_token_group_quant_fp8(x, group_size=128)
+    q_a, s_a = sglang_per_token_group_quant_fp8(x, group_size=128, enable_v2=True)
     q_b, s_b = fast_per_token_group_quant_fp8_128(x)
     # Compare in fp32: max abs diff between (q*s) reconstructions
     rec_a = q_a.float() * s_a.repeat_interleave(128, dim=-1)
@@ -40,7 +40,7 @@ def main():
     print(f"correctness: max|reconstruct(sgl) - reconstruct(fast)| = {err:.4e}")
     print(f"             max|x - reconstruct(fast)|                = {err_x:.4e}")
 
-    t_sgl = bench_graph(lambda: sglang_per_token_group_quant_fp8(x, group_size=128))
+    t_sgl = bench_graph(lambda: sglang_per_token_group_quant_fp8(x, group_size=128, enable_v2=True))
     t_fast = bench_graph(lambda: fast_per_token_group_quant_fp8_128(x))
 
     print(f"shape: M={M} K={K} group=128")

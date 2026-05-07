@@ -54,7 +54,7 @@ def main():
 
     def fp8_quant_sgl():
         return sglang_per_token_group_quant_fp8(
-            o.reshape(T * G, D).contiguous(), group_size=128
+            o.reshape(T * G, D).contiguous(), group_size=128, enable_v2=True
         )
 
     def fp8_quant_fast():

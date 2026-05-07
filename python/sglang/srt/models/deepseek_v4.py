@@ -97,6 +97,7 @@ MOE_BIT_WISE_EQUAL_MODE = False
 ATTN_BIT_WISE_EQUAL_MODE = False
 COMPRESSOR_BIT_WISE_EQUAL_MODE = False
 _FP8_WO_A_GEMM = envs.SGLANG_OPT_FP8_WO_A_GEMM.get()
+_ENABLE_QUANT_8BIT_V2 = envs.SGLANG_PER_TOKEN_GROUP_QUANT_8BIT_V2.get()
 
 
 if TYPE_CHECKING:
@@ -898,9 +899,6 @@ class MQALayer(nn.Module):
 
         if _FP8_WO_A_GEMM:
             import deep_gemm
-            from sglang.srt.layers.fast_fp8_quant import (
-                fast_per_token_group_quant_fp8_128,
-            )
 
             T, G, D = o.shape
             R = self.o_lora_rank
@@ -908,8 +906,8 @@ class MQALayer(nn.Module):
             # implementation runs at ~42% HBM peak on this shape; the triton 2D-tile
             # variant hits ~85% peak (180 µs → 70 µs at T=8192,G=4,D=4096), enough
             # to flip the FP8_WO path from net-loss to ~+27% vs the bf16 einsum.
-            o_fp8, o_s = fast_per_token_group_quant_fp8_128(
-                o.reshape(T * G, D).contiguous(),
+            o_fp8, o_s = sglang_per_token_group_quant_fp8(
+                o.reshape(T * G, D).contiguous(), group_size=128, enable_v2=_ENABLE_QUANT_8BIT_V2
             )
             output = torch.empty(T, G, R, device=o.device, dtype=torch.bfloat16)
             deep_gemm.fp8_einsum(

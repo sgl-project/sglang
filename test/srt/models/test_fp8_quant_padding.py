@@ -92,7 +92,7 @@ def t_compare_padding_with_sgl():
     M, K = 8192, 4096
     x = torch.empty(M, K, dtype=torch.bfloat16, device="cuda")
     qf, sf = fast_per_token_group_quant_fp8_128(x)
-    qs, ss = sglang_per_token_group_quant_fp8(x, group_size=GROUP)
+    qs, ss = sglang_per_token_group_quant_fp8(x, group_size=GROUP, enable_v2=True)
     qf_safe = safe_for_fp8(qf)
     qs_safe = safe_for_fp8(qs)
     report("uninit-vs-sgl: my-q-no-NaN", qf_safe)

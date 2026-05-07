@@ -184,7 +184,7 @@ def t5_varying_shapes():
             return
         # Compare to sgl on small subset of values
         if M > 0:
-            q_sgl, s_sgl = sglang_per_token_group_quant_fp8(x, group_size=GROUP)
+            q_sgl, s_sgl = sglang_per_token_group_quant_fp8(x, group_size=GROUP, enable_v2=True)
             rec_a = q_a.float() * s_a.repeat_interleave(GROUP, dim=-1)
             rec_sgl = q_sgl.float() * s_sgl.repeat_interleave(GROUP, dim=-1)
             x_err_a = (rec_a - x.float()).abs().max().item()
@@ -230,7 +230,7 @@ def t6_edge_values():
     x = torch.randn(M, K, dtype=torch.bfloat16, device="cuda") * 0.01
     x[:, 0] = 100.0
     q, s = fast_per_token_group_quant_fp8_128(x)
-    q_sgl, s_sgl = sglang_per_token_group_quant_fp8(x, group_size=GROUP)
+    q_sgl, s_sgl = sglang_per_token_group_quant_fp8(x, group_size=GROUP, enable_v2=True)
     rec_a = q.float() * s.repeat_interleave(GROUP, dim=-1)
     rec_sgl = q_sgl.float() * s_sgl.repeat_interleave(GROUP, dim=-1)
     e_a = (rec_a - x.float()).abs().max().item()
@@ -251,7 +251,7 @@ def t7_vs_sgl_dequant():
         torch.manual_seed(M)
         x = torch.randn(M, K, dtype=torch.bfloat16, device="cuda").contiguous() * 0.1
         q_a, s_a = fast_per_token_group_quant_fp8_128(x)
-        q_sgl, s_sgl = sglang_per_token_group_quant_fp8(x, group_size=GROUP)
+        q_sgl, s_sgl = sglang_per_token_group_quant_fp8(x, group_size=GROUP, enable_v2=True)
         rec_a = q_a.float() * s_a.repeat_interleave(GROUP, dim=-1)
         rec_sgl = q_sgl.float() * s_sgl.repeat_interleave(GROUP, dim=-1)
         ea = (rec_a - x.float()).abs().max().item()
