@@ -70,6 +70,18 @@ class OutlinesGrammar(BaseGrammarObject):
         vocab_mask.fill_(1)
         vocab_mask.scatter_(0, tokens, torch.zeros_like(tokens, dtype=torch.bool))
 
+    def is_vocab_mask_allowed_token(
+        self,
+        vocab_mask: torch.Tensor,
+        token_id: int,
+        vocab_size: Optional[int] = None,
+    ) -> bool:
+        if vocab_size is not None and token_id >= vocab_size:
+            return False
+        if token_id >= vocab_mask.shape[-1]:
+            return False
+        return not bool(vocab_mask[token_id].item())
+
     @staticmethod
     def apply_vocab_mask(logits: torch.Tensor, vocab_mask: torch.Tensor):
         logits.masked_fill_(vocab_mask, float("-inf"))

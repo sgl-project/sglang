@@ -74,6 +74,20 @@ class ReasonerGrammarObject(BaseGrammarObject):
         if self.tokens_after_think_end >= 0:
             self.grammar.fill_vocab_mask(vocab_mask, idx)
 
+    def is_vocab_mask_allowed_token(
+        self,
+        vocab_mask: torch.Tensor,
+        token_id: int,
+        vocab_size: Optional[int] = None,
+    ) -> bool:
+        if vocab_size is not None and token_id >= vocab_size:
+            return False
+        if self.tokens_after_think_end < 0:
+            return True
+        return self.grammar.is_vocab_mask_allowed_token(
+            vocab_mask, token_id, vocab_size=vocab_size
+        )
+
     def move_vocab_mask(self, vocab_mask: torch.Tensor, device) -> torch.Tensor:
         return self.grammar.move_vocab_mask(vocab_mask, device)
 
