@@ -168,6 +168,7 @@ class QwenImagePipelineConfig(QwenImageRolloutPipelineMixin, ImagePipelineConfig
     postprocess_text_funcs: tuple[Callable[[str], str], ...] = field(
         default_factory=lambda: (qwen_image_postprocess_text,)
     )
+
     text_encoder_extra_args: list[dict] = field(
         default_factory=lambda: [
             dict(
@@ -177,6 +178,9 @@ class QwenImagePipelineConfig(QwenImageRolloutPipelineMixin, ImagePipelineConfig
             None,
         ]
     )
+
+    def get_fsdp_cfg_auto_min_available_memory_gb(self) -> float | None:
+        return 70
 
     def prepare_sigmas(self, sigmas, num_inference_steps):
         return self._prepare_sigmas(sigmas, num_inference_steps)

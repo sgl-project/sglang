@@ -12,6 +12,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.base import (
     ModelTaskType,
     PipelineConfig,
 )
+from sglang.multimodal_gen.configs.pipeline_configs.mova import MOVAPipelineConfig
 from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
     QwenImagePipelineConfig,
 )
@@ -236,6 +237,20 @@ class TestOffloadDefaults(unittest.TestCase):
         )
 
         self.assertTrue(args.vae_cpu_offload)
+
+    def test_pipeline_configs_declare_auto_tune_hints(self):
+        qwen_config = QwenImagePipelineConfig()
+        wan_config = WanT2V480PConfig()
+        mova_config = MOVAPipelineConfig()
+
+        self.assertEqual(qwen_config.get_fsdp_cfg_auto_min_available_memory_gb(), 70)
+        self.assertFalse(qwen_config.supports_auto_dit_layerwise_offload())
+
+        self.assertEqual(wan_config.get_fsdp_cfg_auto_min_available_memory_gb(), 40)
+        self.assertTrue(wan_config.supports_auto_dit_layerwise_offload())
+
+        self.assertIsNone(mova_config.get_fsdp_cfg_auto_min_available_memory_gb())
+        self.assertTrue(mova_config.supports_auto_dit_layerwise_offload())
 
     def test_auto_wan_layerwise_offload_is_enabled_without_fsdp(self):
         args = self._from_dict_with_pipeline_config(WanT2V480PConfig())

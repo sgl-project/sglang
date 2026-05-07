@@ -52,6 +52,15 @@ class MOVAPipelineConfig(PipelineConfig):
     time_division_factor: int = 4
     time_division_remainder: int = 1
 
+    def supports_auto_dit_layerwise_offload(self) -> bool:
+        return True
+
+    def get_auto_dit_layerwise_offload_high_memory_disable_gb(
+        self,
+    ) -> float | None:
+        # Keep H200-class GPUs on the faster resident path by default.
+        return 130
+
     def _center_crop_and_resize(
         self, image: torch.Tensor | Image.Image, target_height: int, target_width: int
     ) -> torch.Tensor | Image.Image:

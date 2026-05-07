@@ -238,6 +238,20 @@ class PipelineConfig:
     # image encoding
     image_encoder_extra_args: dict = field(default_factory=lambda: {})
 
+    def supports_auto_dit_layerwise_offload(self) -> bool:
+        return False
+
+    def get_auto_dit_layerwise_offload_high_memory_disable_gb(
+        self,
+    ) -> float | None:
+        return None
+
+    def get_fsdp_cfg_auto_min_available_memory_gb(self) -> float | None:
+        return None
+
+    def supports_fsdp_cfg_auto_tune(self) -> bool:
+        return self.get_fsdp_cfg_auto_min_available_memory_gb() is not None
+
     def postprocess_image(self, image):
         return image.last_hidden_state
 
