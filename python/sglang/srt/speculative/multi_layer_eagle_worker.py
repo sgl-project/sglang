@@ -677,12 +677,19 @@ class MultiLayerEagleWorker(TpModelWorker):
         if not input_is_idle and draft_extend_input.input_ids.shape[0] == 0:
             batch = batch.copy()
             batch.prepare_for_idle()
-            hidden_size = (
-                self.model_config.hidden_size * 3
-                if self.speculative_algorithm.is_eagle3()
-                else self.model_config.hidden_size
-            )
-            draft_extend_input = EagleDraftExtendInput.create_idle_input(
+            if self.speculative_algorithm.is_eagle3():
+                eagle_config = (
+                    getattr(self.model_config.hf_config, "eagle_config", None) or {}
+                )
+                num_aux = len(
+                    eagle_config.get(
+                        "eagle_aux_hidden_state_layer_ids", [None, None, None]
+                    )
+                )
+                hidden_size = self.model_config.hidden_size * num_aux
+            else:
+                hidden_size = self.model_config.hidden_size
+            draft_extend_input = EagleDraftInput.create_idle_input(
                 device=self.device,
                 hidden_size=hidden_size,
                 dtype=self.model_config.dtype,

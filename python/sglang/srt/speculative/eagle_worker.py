@@ -1131,13 +1131,22 @@ class EAGLEWorker(TpModelWorker):
             batch = batch.copy()
             batch.prepare_for_idle()
             target_cfg = self.target_worker.model_runner.model_config
-            hidden_size = (
-                target_cfg.hidden_size * 3
-                if self.speculative_algorithm.is_eagle3()
+            if (
+                self.speculative_algorithm.is_eagle3()
                 and self.eagle_use_aux_hidden_state
-                else target_cfg.spec_hidden_size
-            )
-            draft_extend_input = EagleDraftExtendInput.create_idle_input(
+            ):
+                eagle_config = (
+                    getattr(self.model_config.hf_config, "eagle_config", None) or {}
+                )
+                num_aux = len(
+                    eagle_config.get(
+                        "eagle_aux_hidden_state_layer_ids", [None, None, None]
+                    )
+                )
+                hidden_size = target_cfg.hidden_size * num_aux
+            else:
+                hidden_size = target_cfg.spec_hidden_size
+            draft_extend_input = EagleDraftInput.create_idle_input(
                 device=self.device,
                 hidden_size=hidden_size,
                 dtype=target_cfg.dtype,
