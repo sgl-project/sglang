@@ -1386,8 +1386,10 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
             return _unwrap(tuple(p.float() for p in pred_t))
 
         if server_args.enable_cfg_parallel:
+            # perform cfg branches in parallel, following the cfg policy
             predictions = run_cfg_parallel(cfg_policy, predict_fn)
         else:
+            # perform cfg branches one-by-one locally
             predictions = [predict_fn(branch) for branch in cfg_policy.branches]
 
         return cfg_policy.combine(
