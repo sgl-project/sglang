@@ -613,6 +613,9 @@ class Scheduler(SchedulerDisaggMixin):
         """
         if not is_warmup and self.receiver is not None and identity is not None:
             if is_local_endpoint(self.server_args.scheduler_endpoint):
+                # Offline scheduler/client traffic is usually same-host.  For large
+                # returned frame arrays, replace inline numpy payloads with local
+                # file refs before pickle so ZMQ only carries response metadata.
                 start_time = time.perf_counter()
                 output_batch.output = spill_large_arrays_to_file_refs(
                     output_batch.output
@@ -623,6 +626,8 @@ class Scheduler(SchedulerDisaggMixin):
                         time.perf_counter() - start_time,
                     )
 
+            # Keep pickle/send timing visible in request metrics; these used to be
+            # hidden client-side overhead when returning decoded video frames.
             start_time = time.perf_counter()
             payload = pickle.dumps(output_batch)
             if output_batch.metrics is not None:
