@@ -72,6 +72,7 @@ class LayerwiseOffloadManager:
         self._named_parameters: Dict[str, torch.nn.Parameter] = {}
         self._named_buffers: Dict[str, torch.Tensor] = {}
         self._offload_placeholders: Dict[torch.dtype, torch.Tensor] = {}
+        self._has_dtensor_weights = False
         # Store forward hooks for removal
         self._forward_hooks: List[Any] = []
 
@@ -143,6 +144,9 @@ class LayerwiseOffloadManager:
             layer_idx = self._match_layer_idx(name)
             if layer_idx is None or layer_idx >= self.num_layers:
                 continue
+            self._has_dtensor_weights = self._has_dtensor_weights or isinstance(
+                tensor, DTensor
+            )
             local_tensor = self._to_local_tensor(tensor)
             layer_groups.setdefault(layer_idx, {}).setdefault(
                 local_tensor.dtype, []
@@ -230,7 +234,8 @@ class LayerwiseOffloadManager:
         # Keep non-layer parameters resident on GPU. Layer tensors have already
         # been replaced by tiny device placeholders, so this does not reload the
         # offloaded layer weights.
-        self.model.to(self.device)
+        if not self._has_dtensor_weights:
+            self.model.to(self.device)
 
         # prefetch the first layer for warm-up
         self.prepare_for_next_req(non_blocking=False)
