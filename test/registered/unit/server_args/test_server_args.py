@@ -34,6 +34,46 @@ class TestPrepareServerArgs(CustomTestCase):
         )
 
 
+class TestFlashInferAllReduceFusionDefaults(CustomTestCase):
+    def _make_server_args(self, enforce_disable=False):
+        server_args = ServerArgs(
+            model_path="dummy",
+            tp_size=2,
+            enforce_disable_flashinfer_allreduce_fusion=enforce_disable,
+        )
+        server_args.get_model_config = MagicMock()
+        server_args.get_model_config.return_value.hf_config.architectures = [
+            "MistralLarge3ForCausalLM"
+        ]
+        return server_args
+
+    @patch("sglang.srt.server_args.get_device_name", return_value="NVIDIA H100")
+    @patch("sglang.srt.server_args.is_sm100_supported", return_value=False)
+    @patch("sglang.srt.server_args.is_sm90_supported", return_value=True)
+    @patch("sglang.srt.configs.model_config.is_deepseek_nsa", return_value=False)
+    def test_mistral_large3_auto_enables_flashinfer_allreduce_fusion(
+        self, _mock_nsa, _mock_sm90, _mock_sm100, _mock_device
+    ):
+        server_args = self._make_server_args()
+
+        server_args._handle_model_specific_adjustments()
+
+        self.assertTrue(server_args.enable_flashinfer_allreduce_fusion)
+
+    @patch("sglang.srt.server_args.get_device_name", return_value="NVIDIA H100")
+    @patch("sglang.srt.server_args.is_sm100_supported", return_value=False)
+    @patch("sglang.srt.server_args.is_sm90_supported", return_value=True)
+    @patch("sglang.srt.configs.model_config.is_deepseek_nsa", return_value=False)
+    def test_mistral_large3_respects_enforce_disable_flashinfer_allreduce_fusion(
+        self, _mock_nsa, _mock_sm90, _mock_sm100, _mock_device
+    ):
+        server_args = self._make_server_args(enforce_disable=True)
+
+        server_args._handle_model_specific_adjustments()
+
+        self.assertFalse(server_args.enable_flashinfer_allreduce_fusion)
+
+
 class TestLoadBalanceMethod(unittest.TestCase):
     def test_non_pd_defaults_to_round_robin(self):
         server_args = ServerArgs(model_path="dummy", disaggregation_mode="null")
