@@ -56,6 +56,12 @@ runs:
           // Find jobs that failed from a real error, not from fast-fail cascade
           const rootCauseFailures = jobs.filter(j => {
             if (j.status !== 'completed' || j.conclusion !== 'failure') return false;
+            // h20 runners are flaky (dirty GPU state from prior runs); their failures
+            // should not cascade fast-fail to other stages. Exact match avoids
+            // accidentally matching the h200 job names.
+            if (j.name === 'stage-c-test-8-gpu-h20') {
+              return false;
+            }
             // If the failing step is the health check, it's a cascade — skip it
             const failedStep = (j.steps || []).find(s => s.conclusion === 'failure');
             if (failedStep && (failedStep.name.includes('check-stage-health') || failedStep.name.includes('Check stage health'))) {

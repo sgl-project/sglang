@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import List
+from typing import List, Optional
 
 from sglang.srt.entrypoints.openai.protocol import (
     TranscriptionRequest,
@@ -21,6 +21,60 @@ class TranscriptionAdapter(ABC):
     @abstractmethod
     def build_sampling_params(self, request: TranscriptionRequest) -> dict:
         """Return the ``sampling_params`` dict for ``GenerateReqInput``."""
+
+    @property
+    def supports_language_detection(self) -> bool:
+        """Whether this model supports automatic language detection.
+
+        When True, the adapter must implement the fused autodetect methods
+        and the standalone detection methods below.
+        """
+        return False
+
+    # -- Fused detect+transcribe (used by the server) ----------------------
+
+    def build_fused_autodetect_params(self, request) -> dict:
+        """Return ``sampling_params`` dict for a fused detect+transcribe request.
+
+        Uses structured generation (``regex``) to constrain the output prefix
+        to a valid language + task token sequence while allowing free
+        transcription afterwards — all in a single request.
+        """
+        raise NotImplementedError
+
+    @staticmethod
+    def parse_fused_output(
+        text: str, *, ts_variant: bool = False
+    ) -> tuple[Optional[str], Optional[str]]:
+        """Parse the fused output into ``(language_code, user_visible_text)``.
+
+        Called by both streaming and non-streaming handlers with the same
+        contract. ``ts_variant`` indicates which forced-prefix shape was
+        requested (the caller knows from ``request.timestamp_granularities``);
+        adapters use it to disambiguate variants whose detokenized prefix
+        differs in shape from their token-id prefix.
+
+        * ``(None, None)`` — the forced prefix is not yet locatable.
+          Streaming callers keep buffering; non-streaming / end-of-stream
+          callers treat this as a parse failure and fall back to
+          ``strip_special_tokens`` on the raw text.
+        * ``(lang, visible)`` — prefix parsed. ``visible`` is fully
+          user-visible (prefix removed, embedded special tokens scrubbed).
+          It must grow monotonically across cumulative streaming snapshots
+          so callers can compute deltas against it directly.
+        """
+        raise NotImplementedError
+
+    @staticmethod
+    def strip_special_tokens(text: str) -> str:
+        """Best-effort scrub of model-specific special-token strings.
+
+        Used as a fallback when ``parse_fused_output`` reports a parse
+        failure (e.g. FSM abort). Default is an identity pass-through;
+        adapters that request generation with ``skip_special_tokens=False``
+        should override to strip their special-token syntax.
+        """
+        return text
 
     @property
     def supports_chunked_streaming(self) -> bool:

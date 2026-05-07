@@ -91,10 +91,10 @@ class TorchNativeLoRABackend(BaseLoRABackend):
         output_offset_cpu: torch.Tensor,
         max_qkv_out_dim: int,
         base_output: torch.Tensor = None,
+        n_slices: int = 3,
         *args,
         **kwargs,
     ) -> torch.Tensor:
-        num_slices = 3
         lora_a_output = sgemm_lora_a_fwd(
             inputs=x,
             weights=qkv_lora_a,
@@ -102,7 +102,7 @@ class TorchNativeLoRABackend(BaseLoRABackend):
             seg_len_tensor=self.batch_info.seg_lens_cpu,
             lora_ranks=self.batch_info.lora_ranks_cpu,
             scaling_tensor=self.batch_info.scalings_cpu,
-            num_slices=num_slices,
+            num_slices=n_slices,
         )
 
         output_tensor = sgemm_lora_b_fwd(

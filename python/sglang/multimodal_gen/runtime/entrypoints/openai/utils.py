@@ -357,7 +357,12 @@ async def process_generation_batch(
             )
 
     total_time = time.perf_counter() - total_start_time
-    log_batch_completion(logger, 1, total_time)
+    if get_global_server_args().batching_max_size > 1:
+        log_batch_completion(
+            logger,
+            len(save_file_path_list),
+            total_time,
+        )
 
     if result.peak_memory_mb and result.peak_memory_mb > 0:
         logger.info(f"Peak memory usage: {result.peak_memory_mb:.2f} MB")
