@@ -44,6 +44,14 @@ def _make_model_runner(
     swa_full_tokens_ratio=0.5,
     page_size=1,
     mambaish_config=None,
+    max_running_requests=None,
+    enable_dp_attention=False,
+    dp_size=1,
+    max_mamba_cache_size=None,
+    mamba_full_memory_ratio=0.9,
+    mamba_ratio=1,
+    speculative_num_draft_tokens=None,
+    spec_is_none=True,
 ):
     """Create a mock ModelRunner with the fields configurators need."""
     mr = MagicMock()
@@ -55,6 +63,8 @@ def _make_model_runner(
     mr.end_layer = num_layers
     mr.mambaish_config = mambaish_config
     mr.is_hybrid_swa = is_hybrid_swa
+    mr.dp_size = dp_size
+    mr._calculate_mamba_ratio.return_value = mamba_ratio
 
     mc = SimpleNamespace()
     mc.head_dim = head_dim
@@ -80,17 +90,41 @@ def _make_model_runner(
     sa = SimpleNamespace()
     sa.swa_full_tokens_ratio = swa_full_tokens_ratio
     sa.page_size = page_size
+    sa.max_running_requests = max_running_requests
+    sa.enable_dp_attention = enable_dp_attention
+    sa.max_mamba_cache_size = max_mamba_cache_size
+    sa.mamba_full_memory_ratio = mamba_full_memory_ratio
+    sa.speculative_num_draft_tokens = speculative_num_draft_tokens
     mr.server_args = sa
 
     spec = MagicMock()
     spec.is_dflash.return_value = False
-    spec.is_none.return_value = True
+    spec.is_none.return_value = spec_is_none
     mr.spec_algorithm = spec
 
     return mr
 
 
 KV_SIZE = 2  # bf16
+
+
+def _make_mambaish_config(
+    *,
+    cache_per_req=1024,
+    dtype="torch.float32",
+    full_attention_layer_ids=None,
+):
+    return SimpleNamespace(
+        full_attention_layer_ids=(
+            list(range(32))
+            if full_attention_layer_ids is None
+            else full_attention_layer_ids
+        ),
+        mamba2_cache_params=SimpleNamespace(
+            mamba_cache_per_req=cache_per_req,
+            dtype=SimpleNamespace(temporal=dtype),
+        ),
+    )
 
 
 def _full_per_token(mr):
@@ -303,6 +337,154 @@ class TestAllSWAConfigurator(unittest.TestCase):
         self.assertEqual(config.swa_max_total_num_tokens, 500)
 
 
+class TestMambaPoolConfigurator(unittest.TestCase):
+    """Mamba wrapper: reserves state memory before target KV sizing."""
+
+    def _run(
+        self,
+        available_bytes,
+        *,
+        cache_per_req=1024,
+        full_attention_layer_ids=None,
+        page_size=1,
+        **kwargs,
+    ):
+        num_layers = kwargs.pop("num_layers", 8)
+        if full_attention_layer_ids is None:
+            full_attention_layer_ids = list(range(num_layers))
+        mr = _make_model_runner(
+            num_layers=num_layers,
+            page_size=page_size,
+            mambaish_config=_make_mambaish_config(
+                cache_per_req=cache_per_req,
+                full_attention_layer_ids=full_attention_layer_ids,
+            ),
+            **kwargs,
+        )
+        with mock_cpu_env():
+            from sglang.srt.model_executor.pool_configurator import (
+                create_memory_pool_configurator,
+            )
+
+            cfg = create_memory_pool_configurator(mr)
+            config = cfg.calculate_pool_sizes(available_bytes, page_size)
+        return mr, cfg, config
+
+    def _expected_tokens_after_reservation(self, mr, available_bytes, reserved_bytes):
+        full_layers = [
+            i
+            for i in mr.mambaish_config.full_attention_layer_ids
+            if mr.start_layer <= i < mr.end_layer
+        ]
+        cell_size = _full_per_token(mr) * len(full_layers)
+        page_size = mr.server_args.page_size
+        return (
+            ((available_bytes - reserved_bytes) // cell_size) // page_size * page_size
+        )
+
+    def test_known_concurrency_reserves_resident_pool(self):
+        available = 1_000_000
+        cache_per_req = 1024
+        max_running_requests = 4
+        mamba_ratio = 5
+
+        mr, _, config = self._run(
+            available,
+            cache_per_req=cache_per_req,
+            max_running_requests=max_running_requests,
+            mamba_ratio=mamba_ratio,
+        )
+
+        expected_mamba_cache_size = max_running_requests * mamba_ratio
+        reserved = (expected_mamba_cache_size + 1) * cache_per_req
+        self.assertEqual(mr.server_args.max_mamba_cache_size, expected_mamba_cache_size)
+        self.assertEqual(
+            config.max_total_num_tokens,
+            self._expected_tokens_after_reservation(mr, available, reserved),
+        )
+
+    def test_spec_intermediate_states_are_reserved(self):
+        available = 2_000_000
+        cache_per_req = 1024
+        max_running_requests = 4
+        mamba_ratio = 5
+        draft_tokens = 16
+
+        mr, _, config = self._run(
+            available,
+            cache_per_req=cache_per_req,
+            max_running_requests=max_running_requests,
+            mamba_ratio=mamba_ratio,
+            speculative_num_draft_tokens=draft_tokens,
+            spec_is_none=False,
+        )
+
+        resident_cache_size = max_running_requests * mamba_ratio
+        resident = (resident_cache_size + 1) * cache_per_req
+        spec_state_size = min(
+            max_running_requests,
+            resident_cache_size // mamba_ratio,
+        )
+        intermediate = (spec_state_size + 1) * draft_tokens * cache_per_req
+        self.assertEqual(
+            config.max_total_num_tokens,
+            self._expected_tokens_after_reservation(
+                mr, available, resident + intermediate
+            ),
+        )
+
+    def test_ratio_fallback_without_max_running_requests(self):
+        available = 1_000_000
+        cache_per_req = 1000
+
+        mr, _, config = self._run(
+            available,
+            cache_per_req=cache_per_req,
+            mamba_full_memory_ratio=1.0,
+        )
+
+        self.assertEqual(mr.server_args.max_mamba_cache_size, 499)
+        reserved = 500 * cache_per_req
+        self.assertEqual(
+            config.max_total_num_tokens,
+            self._expected_tokens_after_reservation(mr, available, reserved),
+        )
+
+    def test_explicit_max_mamba_cache_size_uses_dp_local_size_and_warns(self):
+        available = 1_000_000
+        with self.assertLogs(
+            "sglang.srt.model_executor.pool_configurator", level="WARNING"
+        ) as cm:
+            mr, _, _ = self._run(
+                available,
+                max_running_requests=8,
+                enable_dp_attention=True,
+                dp_size=2,
+                max_mamba_cache_size=6,
+                mamba_ratio=5,
+            )
+
+        self.assertEqual(mr.server_args.max_mamba_cache_size, 3)
+        self.assertTrue(
+            any("max_mamba_cache_size=3 is smaller" in msg for msg in cm.output)
+        )
+
+    def test_oom_error_mentions_mamba_tuning_knobs(self):
+        with self.assertRaises(RuntimeError) as cm:
+            self._run(
+                10_000,
+                cache_per_req=1000,
+                max_running_requests=10,
+                mamba_ratio=5,
+            )
+
+        msg = str(cm.exception)
+        self.assertIn("Not enough memory for Mamba state pools", msg)
+        self.assertIn("--max-running-requests", msg)
+        self.assertIn("--mamba-ssm-dtype", msg)
+        self.assertIn("--mem-fraction-static", msg)
+
+
 class TestFactory(unittest.TestCase):
     def test_default_for_non_swa(self):
         mr = _make_model_runner(is_hybrid_swa=False)
@@ -330,6 +512,17 @@ class TestFactory(unittest.TestCase):
 
             cfg = create_memory_pool_configurator(mr)
         self.assertIsInstance(cfg, HybridSWAPoolConfigurator)
+
+    def test_mamba_wraps_base_configurator(self):
+        mr = _make_model_runner(mambaish_config=_make_mambaish_config())
+        with mock_cpu_env():
+            from sglang.srt.model_executor.pool_configurator import (
+                MambaPoolConfigurator,
+                create_memory_pool_configurator,
+            )
+
+            cfg = create_memory_pool_configurator(mr)
+        self.assertIsInstance(cfg, MambaPoolConfigurator)
 
 
 if __name__ == "__main__":

@@ -284,11 +284,131 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
         return self._solve_pool_sizes(max_total_num_tokens, page_size)
 
 
+class MambaPoolConfigurator(MemoryPoolConfigurator):
+    """Configurator wrapper that reserves Mamba state memory before KV sizing."""
+
+    def __init__(self, mr: ModelRunner, base: MemoryPoolConfigurator):
+        self._mr = mr
+        self._base = base
+        self._mamba_reserved = False
+
+    def _reserve_mamba_bytes(self, available_bytes: int) -> int:
+        config = self._mr.mambaish_config
+        server_args = self._mr.server_args
+        assert config is not None
+        assert config.mamba2_cache_params.mamba_cache_per_req > 0
+
+        dp_size = self._mr.dp_size if server_args.enable_dp_attention else 1
+        max_running_requests = None
+        if server_args.max_running_requests is not None:
+            max_running_requests = server_args.max_running_requests // dp_size
+
+        mamba_ratio = self._mr._calculate_mamba_ratio()
+        mamba_cache_per_req = config.mamba2_cache_params.mamba_cache_per_req
+
+        if server_args.max_mamba_cache_size is not None:
+            # Use explicitly set max_mamba_cache_size.
+            server_args.max_mamba_cache_size = (
+                server_args.max_mamba_cache_size // dp_size
+            )
+            if max_running_requests is not None:
+                required_mamba_cache_size = max_running_requests * mamba_ratio
+                if server_args.max_mamba_cache_size < required_mamba_cache_size:
+                    logger.warning(
+                        "max_mamba_cache_size=%d is smaller than the estimated "
+                        "requirement %d for max_running_requests=%d and "
+                        "mamba_ratio=%d.",
+                        server_args.max_mamba_cache_size,
+                        required_mamba_cache_size,
+                        max_running_requests,
+                        mamba_ratio,
+                    )
+        elif max_running_requests is not None:
+            # When concurrency is known, Mamba state sizing is deterministic.
+            server_args.max_mamba_cache_size = max_running_requests * mamba_ratio
+        else:
+            # Preserve the legacy ratio fallback for non-spec runs where
+            # max_running_requests is inferred after KV token capacity is known.
+            mamba_state_memory_raw = (
+                available_bytes
+                * server_args.mamba_full_memory_ratio
+                / (1 + server_args.mamba_full_memory_ratio)
+            )
+            # MambaPool allocates an extra padded slot at index 0.
+            server_args.max_mamba_cache_size = max(
+                int(mamba_state_memory_raw // mamba_cache_per_req) - 1,
+                0,
+            )
+
+        resident_bytes = (server_args.max_mamba_cache_size + 1) * mamba_cache_per_req
+
+        # Reserve intermediate Mamba states used for speculative decoding.
+        intermediate_bytes = 0
+        if not self._mr.spec_algorithm.is_none():
+            assert server_args.speculative_num_draft_tokens is not None
+            assert max_running_requests is not None
+
+            mamba_spec_state_size = min(
+                max_running_requests,
+                server_args.max_mamba_cache_size // mamba_ratio,
+            )
+            intermediate_bytes = (
+                mamba_cache_per_req
+                * (mamba_spec_state_size + 1)
+                * server_args.speculative_num_draft_tokens
+            )
+
+        reserved_bytes = resident_bytes + intermediate_bytes
+        if reserved_bytes >= available_bytes:
+            dtype = config.mamba2_cache_params.dtype
+            mem_fraction_static = getattr(
+                self._mr,
+                "mem_fraction_static",
+                getattr(server_args, "mem_fraction_static", None),
+            )
+            raise RuntimeError(
+                "Not enough memory for Mamba state pools. "
+                f"available={available_bytes / (1 << 30):.2f} GiB, "
+                f"required={reserved_bytes / (1 << 30):.2f} GiB "
+                f"(resident={resident_bytes / (1 << 30):.2f} GiB, "
+                f"spec={intermediate_bytes / (1 << 30):.2f} GiB), "
+                f"max_running_requests={max_running_requests}, "
+                f"mamba_ratio={mamba_ratio}, "
+                f"mem_fraction_static={mem_fraction_static}, "
+                f"mamba_ssm_dtype={dtype.temporal}. "
+                "Try lowering --max-running-requests, changing "
+                "--mamba-ssm-dtype, or increasing --mem-fraction-static."
+            )
+
+        self._mamba_reserved = True
+        return available_bytes - reserved_bytes
+
+    def calculate_pool_sizes(
+        self, available_bytes: int, page_size: int
+    ) -> MemoryPoolConfig:
+        available_bytes = self._reserve_mamba_bytes(available_bytes)
+        return self._base.calculate_pool_sizes(available_bytes, page_size)
+
+    def calculate_pool_sizes_from_max_tokens(
+        self, max_total_num_tokens: int, page_size: int
+    ) -> MemoryPoolConfig:
+        assert self._mamba_reserved, (
+            "MambaPoolConfigurator.calculate_pool_sizes must be called before "
+            "calculate_pool_sizes_from_max_tokens."
+        )
+        return self._base.calculate_pool_sizes_from_max_tokens(
+            max_total_num_tokens, page_size
+        )
+
+
 def create_memory_pool_configurator(
     mr: ModelRunner,
 ) -> MemoryPoolConfigurator:
     """Factory: select the right configurator for the model architecture."""
     if mr.is_hybrid_swa:
-        return HybridSWAPoolConfigurator(mr)
-    # Future: MambaPoolConfigurator
-    return DefaultPoolConfigurator(mr)
+        configurator = HybridSWAPoolConfigurator(mr)
+    else:
+        configurator = DefaultPoolConfigurator(mr)
+    if mr.mambaish_config is not None:
+        return MambaPoolConfigurator(mr, configurator)
+    return configurator

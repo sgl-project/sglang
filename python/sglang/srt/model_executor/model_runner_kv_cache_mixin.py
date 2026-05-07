@@ -64,71 +64,8 @@ class ModelRunnerKVCacheMixin:
         rest_memory = post_model_load_memory - pre_model_load_memory * (
             1 - self.mem_fraction_static
         )
-        if self.mambaish_config is not None:
-            rest_memory = self.handle_max_mamba_cache(rest_memory)
 
         return int(rest_memory * (1 << 30))  # return in bytes
-
-    def handle_max_mamba_cache(self: ModelRunner, total_rest_memory):
-        config = self.mambaish_config
-        server_args = self.server_args
-        assert config is not None
-
-        # reserve the memory for the intermediate mamba states used for spec dec
-        if not self.spec_algorithm.is_none():
-            assert server_args.speculative_num_draft_tokens is not None
-            assert server_args.max_running_requests is not None
-
-            max_running_requests = server_args.max_running_requests // (
-                self.dp_size if server_args.enable_dp_attention else 1
-            )
-            mamba_state_intermediate_size = (
-                config.mamba2_cache_params.mamba_cache_per_req
-                * max_running_requests
-                * server_args.speculative_num_draft_tokens
-            )
-            total_rest_memory = total_rest_memory - (
-                mamba_state_intermediate_size / (1 << 30)
-            )
-
-        if server_args.max_mamba_cache_size is not None:
-            # Use explicitly set max_mamba_cache_size
-            server_args.max_mamba_cache_size = server_args.max_mamba_cache_size // (
-                server_args.dp_size if server_args.enable_dp_attention else 1
-            )
-        elif (
-            server_args.disable_radix_cache
-            and server_args.max_running_requests is not None
-        ):
-            # Use explicitly set max_running_requests when radix cache is disabled
-            server_args.max_mamba_cache_size = server_args.max_running_requests // (
-                server_args.dp_size if server_args.enable_dp_attention else 1
-            )
-        else:
-            # Use ratio-based calculation to auto-fit available memory
-            assert config.mamba2_cache_params.mamba_cache_per_req > 0
-
-            # allocate the memory based on the ratio between mamba state memory vs. full kv cache memory
-            # solve the equations:
-            # 1. mamba_state_memory + full_kv_cache_memory == total_rest_memory
-            # 2. mamba_state_memory / full_kv_cache_memory == server_args.mamba_full_memory_ratio
-            mamba_state_memory_raw = (
-                total_rest_memory
-                * server_args.mamba_full_memory_ratio
-                / (1 + server_args.mamba_full_memory_ratio)
-            )
-            # calculate the max_mamba_cache_size based on the given total mamba memory
-            server_args.max_mamba_cache_size = int(
-                (mamba_state_memory_raw * (1 << 30))
-                // config.mamba2_cache_params.mamba_cache_per_req
-            )
-
-        mamba_state_memory = (
-            server_args.max_mamba_cache_size
-            * config.mamba2_cache_params.mamba_cache_per_req
-            / (1 << 30)
-        )
-        return total_rest_memory - mamba_state_memory
 
     def calculate_mla_kv_cache_dim(self: ModelRunner) -> int:
         is_nsa_model = is_deepseek_nsa(self.model_config.hf_config)
@@ -711,11 +648,42 @@ class ModelRunnerKVCacheMixin:
 
         if self.mambaish_config is not None:
             ratio = self._calculate_mamba_ratio()
-            max_num_reqs = min(
-                max_num_reqs, self.server_args.max_mamba_cache_size // ratio
-            )
+            mamba_limited_reqs = self.server_args.max_mamba_cache_size // ratio
+            if mamba_limited_reqs < max_num_reqs:
+                logger.warning(
+                    "max_running_requests is clamped from %d to %d by "
+                    "max_mamba_cache_size=%d and mamba_ratio=%d.",
+                    max_num_reqs,
+                    mamba_limited_reqs,
+                    self.server_args.max_mamba_cache_size,
+                    ratio,
+                )
+                max_num_reqs = mamba_limited_reqs
 
         return max_num_reqs
+
+    def _warn_if_low_token_capacity_for_requested_concurrency(
+        self: ModelRunner, token_capacity: int, max_num_reqs: int
+    ) -> None:
+        if self.server_args.max_running_requests is None:
+            return
+
+        estimated_tokens_per_req = (
+            envs.SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION.get()
+            + 2 * self.server_args.page_size
+        )
+        estimated_required_tokens = max_num_reqs * estimated_tokens_per_req
+        if token_capacity < estimated_required_tokens:
+            logger.warning(
+                "max_total_num_tokens=%d may be too small for "
+                "max_running_requests=%d (estimated requirement=%d). "
+                "The scheduler may not reach the requested concurrency. "
+                "Consider lowering --max-running-requests or increasing "
+                "--mem-fraction-static.",
+                token_capacity,
+                max_num_reqs,
+                estimated_required_tokens,
+            )
 
     def _apply_memory_pool_config(self: ModelRunner, config: MemoryPoolConfig):
         """Apply a resolved MemoryPoolConfig and initialize pools."""
@@ -750,6 +718,9 @@ class ModelRunnerKVCacheMixin:
 
         config.max_running_requests = self._resolve_max_num_reqs(
             config.max_total_num_tokens
+        )
+        self._warn_if_low_token_capacity_for_requested_concurrency(
+            config.max_total_num_tokens, config.max_running_requests
         )
         config.mem_fraction_static = self.server_args.mem_fraction_static
         return config
