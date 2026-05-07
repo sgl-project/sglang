@@ -479,8 +479,9 @@ class DeepEPWaterfillBalancer:
             target_total=target_total,
         )
 
+    @staticmethod
     def _all_reduce_dynamic_rank_load(
-        self, local_routed_counts: Tensor, num_tokens: int
+        local_routed_counts: Tensor, num_tokens: int
     ) -> Tuple[Tensor, Tensor]:
         """Aggregate dynamic load with SGLang EP communication."""
         from sglang.srt.distributed import get_moe_ep_group
