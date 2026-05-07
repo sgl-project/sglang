@@ -88,6 +88,11 @@ def compute_split_seq_index(
     elif forward_mode.is_idle() or forward_mode.is_prebuilt():
         assert num_tokens == 0
         return 0
+    elif forward_mode.is_mixed():
+        # MIXED = decode + prefill chunk in one forward (enable_mixed_chunk).
+        # TBO is not implemented for MIXED; return None disables TBO for this
+        # batch (caller checks `local_can_run_tbo = split_seq_index is not None`).
+        return None
     else:
         raise NotImplementedError()
 
