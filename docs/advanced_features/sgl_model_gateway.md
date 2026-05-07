@@ -593,6 +593,14 @@ Response:
 
 ## Reliability and Flow Control
 
+### HTTP Client Pool
+
+Configure the idle timeout for pooled upstream HTTP connections:
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `--pool-idle-timeout-secs` | 50 | Idle timeout in seconds for pooled upstream HTTP connections. Can also be set with `SMG_POOL_IDLE_TIMEOUT_SECS`. |
+
 ### Retries
 
 Configure exponential backoff retries:

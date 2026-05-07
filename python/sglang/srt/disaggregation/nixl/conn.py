@@ -1009,9 +1009,6 @@ class NixlKVManager(CommonKVManager):
                     aux_notif,
                 )
                 handles.append(aux_xfer_handle)
-        if is_last:
-            del self.transfer_infos[bootstrap_room]
-            self.req_to_decode_prefix_len.pop(bootstrap_room, None)
         return handles
 
     def update_transfer_status(self):
@@ -1185,7 +1182,6 @@ class NixlKVSender(CommonKVSender):
         self.chunk_id += 1
         if is_last:
             self.has_sent = True
-            del self.kv_mgr.request_status[self.bootstrap_room]
 
     def poll(self) -> KVPoll:
         if self._send_failed:
