@@ -43,14 +43,6 @@ PAGE_INDEX_ALIGNED_SIZE = 64
 _HOST_INT32_KWARGS = {"dtype": torch.int32, "pin_memory": True}
 
 
-def _debug_dsv4_attn_enabled() -> bool:
-    return os.environ.get("SGLANG_DEBUG_DSV4_ATTN", "0") == "1" and (
-        not torch.distributed.is_available()
-        or not torch.distributed.is_initialized()
-        or torch.distributed.get_rank() == 0
-    )
-
-
 @dataclass
 class _DecodeCudaGraphSharedData:
     pass  # TODO fields
@@ -369,11 +361,6 @@ class DeepseekV4Backend(AttentionBackend, C4IndexerBackend, CompressorBackend):
         )
 
         backend = os.environ.get("SGLANG_HACK_FLASHMLA_BACKEND", "kernel")
-        if _debug_dsv4_attn_enabled():
-            print(
-                f"[dsv4_backend] layer_id={layer_id} mode={forward_batch.forward_mode} compress_ratio={compress_ratio} backend={backend} q={tuple(q.shape)} swa_indices={tuple(swa_page_indices.shape)} swa_topk_lengths={tuple(core_metadata.swa_topk_lengths.shape)} extra={extra_k_cache is not None} extra_indices={tuple(extra_indices.shape) if extra_indices is not None else None} extra_topk_lengths={tuple(extra_topk_lengths.shape) if extra_topk_lengths is not None else None}",
-                flush=True,
-            )
         o = flash_mla_with_kvcache_entrypoint(**input_dict, backend=backend)[0]
         o = o.squeeze(1)
 
