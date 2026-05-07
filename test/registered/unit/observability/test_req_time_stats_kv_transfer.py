@@ -14,7 +14,11 @@ from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="stage-a-test-cpu")
 
+from sglang.srt.disaggregation.base.conn import KVTransferMetric  # noqa: E402
 from sglang.srt.observability.req_time_stats import SchedulerReqTimeStats  # noqa: E402
+
+# 16 MiB of transfer data
+_TOTAL_BYTES = 16 * 1024 * 1024
 
 
 def _make_stats(
@@ -32,19 +36,19 @@ def _make_stats(
     return stats
 
 
-# Fixed call args: 16 tokens, page_size=1, 1 MB per page → 16 MB total
-_NUM_TOKENS = 16
-_PAGE_SIZE = 1
-_BYTES_PER_PAGE = 1024 * 1024  # 1 MiB
+def _make_metric(latency_s=None, total_bytes=_TOTAL_BYTES) -> KVTransferMetric:
+    """Build a KVTransferMetric for tests. latency_s=None forces timestamp path."""
+    m = KVTransferMetric()
+    m.transfer_latency_s = latency_s
+    m.transfer_total_bytes = total_bytes
+    return m
 
 
 class TestKVTransferLatencyWindow(CustomTestCase):
-    def _call(self, stats: SchedulerReqTimeStats) -> dict:
-        return stats.compute_and_observe_kv_transfer_metrics(
-            num_tokens=_NUM_TOKENS,
-            page_size=_PAGE_SIZE,
-            bytes_per_page_all_layers=_BYTES_PER_PAGE,
-        )
+    def _call(self, stats: SchedulerReqTimeStats, metric=None) -> dict:
+        if metric is None:
+            metric = _make_metric()
+        return stats.compute_and_observe_kv_transfer_metrics(transfer_metric=metric)
 
     def test_latency_uses_transfer_finish_not_completion(self):
         # Transfer takes 0.1 s; decode adds another 5 s → completion is 5.1 s after queue entry.
@@ -86,6 +90,13 @@ class TestKVTransferLatencyWindow(CustomTestCase):
         result = self._call(stats)
         self.assertIn("latency_ms", result)
         self.assertAlmostEqual(result["latency_ms"], 200.0, places=3)
+
+    def test_transfer_latency_s_takes_priority_over_timestamps(self):
+        # When KVTransferMetric supplies transfer_latency_s directly, timestamps are ignored.
+        stats = _make_stats(queue_entry=1.0, transfer_finish=1.1, completion=6.1)
+        metric = _make_metric(latency_s=0.5)  # 500 ms, not the 100 ms from timestamps
+        result = self._call(stats, metric=metric)
+        self.assertAlmostEqual(result["latency_ms"], 500.0, places=3)
 
     def test_metrics_observer_called_when_enabled(self):
         stats = _make_stats(
