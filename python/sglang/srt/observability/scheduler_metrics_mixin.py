@@ -962,3 +962,4 @@ class SchedulerMetricsMixin:
     def reset_device_timer_window(self: Scheduler):
         if ENABLE_METRICS_DEVICE_TIMER:
             self._device_timer_window_batch_count = 0
+            self.fwd_occupancy = float("nan")
