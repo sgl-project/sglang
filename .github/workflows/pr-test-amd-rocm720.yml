@@ -249,6 +249,7 @@ jobs:
         run: |
           docker exec -w /sglang-checkout/sgl-kernel/tests ci_sglang python3 -m pytest test_amd_deterministic_custom_allreduce.py
           docker exec -w /sglang-checkout/sgl-kernel/tests ci_sglang python3 -m pytest test_amd_nccl_allreduce_determinism.py
+          docker exec -w /sglang-checkout ci_sglang python3 scripts/ci/amd/test_aiter_custom_allreduce_perf.py --nproc-per-node 2 --thresholds scripts/ci/amd/aiter_allreduce_thresholds.json
 
   # =============================================== primary ====================================================
 
