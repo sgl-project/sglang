@@ -8,13 +8,9 @@ on:
         required: false
         default: ""
       tag:
-        description: "Custom tag suffix (overrides pr_number in tag). E.g. 'my-test' → dev-my-test, dev-cu13-my-test, etc."
+        description: "Custom tag suffix"
         required: false
         default: ""
-      image_repo:
-        description: "Docker Hub repo to push to. Use lmsysorg/sglang-staging for testing."
-        required: false
-        default: "lmsysorg/sglang"
       compile_kernel:
         description: "Build sgl-kernel from source"
         required: false
@@ -28,71 +24,6 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  prepare:
-    if: github.repository == 'sgl-project/sglang'
-    runs-on: ubuntu-latest
-    outputs:
-      checkout_ref: ${{ steps.config.outputs.checkout_ref }}
-      extra_build_args: ${{ steps.config.outputs.extra_build_args }}
-      tag_config: ${{ steps.config.outputs.tag_config }}
-    steps:
-      - name: Compute build configuration
-        id: config
-        run: |
-          # Determine checkout ref
-          if [ -n "${{ inputs.pr_number }}" ]; then
-            echo "checkout_ref=refs/pull/${{ inputs.pr_number }}/head" >> $GITHUB_OUTPUT
-          else
-            echo "checkout_ref=" >> $GITHUB_OUTPUT
-          fi
-
-          # Determine extra build args
-          if [ "${{ github.event_name }}" = "schedule" ]; then
-            echo "extra_build_args=--build-arg USE_LATEST_SGLANG=1 --build-arg CMAKE_BUILD_PARALLEL_LEVEL=\$(nproc)" >> $GITHUB_OUTPUT
-          else
-            echo "extra_build_args=--build-arg BRANCH_TYPE=local --build-arg CMAKE_BUILD_PARALLEL_LEVEL=\$(nproc)" >> $GITHUB_OUTPUT
-          fi
-
-          # Determine tag suffix
-          SUFFIX=""
-          if [ -n "${{ inputs.tag }}" ]; then
-            SUFFIX="-${{ inputs.tag }}"
-          elif [ -n "${{ inputs.pr_number }}" ]; then
-            SUFFIX="-pr-${{ inputs.pr_number }}"
-          fi
-
-          # Build tag config. dev-cu13 / nightly-dev-cu13 are published as
-          # aliases on the cu130 image for backwards compatibility with
-          # consumers pinned to the pre-flip names.
-          if [ -z "${SUFFIX}" ]; then
-            # Nightly: include dated tags
-            TAG_CONFIG='[{"cuda":"cu129","tags":["dev-cu12","nightly-dev-cu12-{date}-{short_sha}"]},{"cuda":"cu130","tags":["dev","dev-cu13","nightly-dev-{date}-{short_sha}","nightly-dev-cu13-{date}-{short_sha}"]}]'
-          else
-            TAG_CONFIG="[{\"cuda\":\"cu129\",\"tags\":[\"dev-cu12${SUFFIX}\"]},{\"cuda\":\"cu130\",\"tags\":[\"dev${SUFFIX}\",\"dev-cu13${SUFFIX}\"]}]"
-          fi
-          echo "tag_config=${TAG_CONFIG}" >> $GITHUB_OUTPUT
-
-  build-and-publish:
-    if: github.repository == 'sgl-project/sglang'
-    needs: prepare
-    uses: ./.github/workflows/_docker-build-and-publish.yml
-    with:
-      docker_target: framework_final
-      checkout_ref: ${{ needs.prepare.outputs.checkout_ref }}
-      extra_build_args: ${{ needs.prepare.outputs.extra_build_args }}
-      tag_config: ${{ needs.prepare.outputs.tag_config }}
-      image_repo: ${{ inputs.image_repo || 'lmsysorg/sglang' }}
-    secrets: inherit
-
-  cleanup-nightly:
-    if: ${{ github.repository == 'sgl-project/sglang' && !inputs.tag && !inputs.pr_number }}
-    needs: build-and-publish
-    uses: ./.github/workflows/_docker-cleanup-nightly.yml
-    with:
-      tag_prefixes: '["nightly-dev", "nightly-dev-cu12", "nightly-dev-cu13"]'
-      image_repo: ${{ inputs.image_repo || 'lmsysorg/sglang' }}
-    secrets: inherit
-
   build-dev-kernel-wheel:
     if: ${{ github.repository == 'bytedance-iaas/sglang' && (github.event_name == 'schedule' || inputs.compile_kernel) }}
     strategy:
@@ -112,188 +43,75 @@ jobs:
   build-dev:
     needs: [build-dev-kernel-wheel]
     if: ${{ github.repository == 'bytedance-iaas/sglang' && always() && (needs.build-dev-kernel-wheel.result == 'success' || needs.build-dev-kernel-wheel.result == 'skipped') }}
-    environment: "prod"
-    runs-on: ${{ matrix.runner }}
-    env:
-      VOLCENGINE_CR_REGISTRY: ${{ vars.VOLCENGINE_CR_REGISTRY }}
-      VOLCENGINE_CR_NAMESPACE: ${{ vars.VOLCENGINE_CR_NAMESPACE }}
-      VOLCENGINE_CR_REPOSITORY: ${{ vars.VOLCENGINE_CR_REPOSITORY || 'sglang' }}
-      VOLCENGINE_CR_USERNAME: ${{ secrets.VOLCENGINE_CR_USERNAME }}
-      VOLCENGINE_CR_PASSWORD: ${{ secrets.VOLCENGINE_CR_PASSWORD }}
-      BYTED_INTERNAL_EXTRA_TOOLS_APT_URL: ${{ vars.BYTED_INTERNAL_EXTRA_TOOLS_APT_URL || 'http://mirrors.ivolces.com/extra-tools/ubuntu' }}
-      BYTED_INTERNAL_EXTRA_TOOLS_GPG_URL: ${{ vars.BYTED_INTERNAL_EXTRA_TOOLS_GPG_URL || 'https://mirrors.ivolces.com/extra-tools/ubuntu/GPG-KEY-system' }}
-      HTTP_PROXY: http://100.68.162.211:3128
-      HTTPS_PROXY: http://100.68.162.211:3128
-      ALL_PROXY: http://100.68.162.211:3128
-      NO_PROXY: localhost,127.0.0.1,::1,mirrors.ivolces.com,.ivolces.com,.volceapi.com,.byted.org,eic-sdk-release.tos-cn-beijing.ivolces.com,scqq9isgq31i0fb8nt4eg.apigateway-cn-beijing.volceapi.com,bytedpypi.byted.org,mirrors.byted.org,iaas-gpu-cn-beijing.cr.volces.com
     strategy:
       fail-fast: false
       matrix:
         include:
-          - runner: x64-docker-build-node
-            platform: linux/amd64
-            build_type: all
-            grace_blackwell: 0
+          - cuda_key: cu129
+            cuda_version: 12.9.1
+            cuda_suffix: ""
             hopper_sbo: 0
             w4a8_per_tensor_transfer: 0
-            image_tag_suffix: ""
-            arch_tag: x86
-            version: 12.9.1
-          - runner: x64-docker-build-node
-            platform: linux/amd64
-            build_type: all
-            grace_blackwell: 0
+            variant_suffix: ""
+            artifact_name: sgl-kernel-x86
+          - cuda_key: cu129
+            cuda_version: 12.9.1
+            cuda_suffix: ""
             hopper_sbo: 1
             w4a8_per_tensor_transfer: 0
-            image_tag_suffix: hopper-sbo
-            arch_tag: x86
-            version: 12.9.1
-          - runner: x64-docker-build-node
-            platform: linux/amd64
-            build_type: all
-            grace_blackwell: 0
+            variant_suffix: hopper-sbo
+            artifact_name: sgl-kernel-x86
+          - cuda_key: cu129
+            cuda_version: 12.9.1
+            cuda_suffix: ""
             hopper_sbo: 0
             w4a8_per_tensor_transfer: 1
-            image_tag_suffix: w4a8-per-tensor-transfer
-            arch_tag: x86
-            version: 12.9.1
-          - runner: x64-docker-build-node
-            platform: linux/amd64
-            build_type: all
-            grace_blackwell: 0
+            variant_suffix: w4a8-per-tensor-transfer
+            artifact_name: sgl-kernel-x86
+          - cuda_key: cu130
+            cuda_version: 13.0.1
+            cuda_suffix: cu130
             hopper_sbo: 0
             w4a8_per_tensor_transfer: 0
-            image_tag_suffix: ""
-            arch_tag: x86-cu13
-            version: 13.0.1
-          - runner: x64-docker-build-node
-            platform: linux/amd64
-            build_type: all
-            grace_blackwell: 0
+            variant_suffix: ""
+            artifact_name: sgl-kernel-x86-cu13
+          - cuda_key: cu130
+            cuda_version: 13.0.1
+            cuda_suffix: cu130
             hopper_sbo: 1
             w4a8_per_tensor_transfer: 0
-            image_tag_suffix: hopper-sbo
-            arch_tag: x86-cu13
-            version: 13.0.1
-          - runner: x64-docker-build-node
-            platform: linux/amd64
-            build_type: all
-            grace_blackwell: 0
+            variant_suffix: hopper-sbo
+            artifact_name: sgl-kernel-x86-cu13
+          - cuda_key: cu130
+            cuda_version: 13.0.1
+            cuda_suffix: cu130
             hopper_sbo: 0
             w4a8_per_tensor_transfer: 1
-            image_tag_suffix: w4a8-per-tensor-transfer
-            arch_tag: x86-cu13
-            version: 13.0.1
-    steps:
-      - name: Delete huge unnecessary tools folder
-        run: rm -rf /opt/hostedtoolcache
-
-      - name: Checkout repository
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.pr_number && format('refs/pull/{0}/head', inputs.pr_number) || github.ref }}
-
-      - name: Fetch version tags
-        run: git fetch --force --tags origin
-
-      - name: Free disk space
-        uses: jlumbroso/free-disk-space@main
-        with:
-          tool-cache: true
-          docker-images: true
-          android: true
-          dotnet: true
-          haskell: true
-          large-packages: true
-          swap-storage: true
-
-      - name: Prune Docker to reclaim disk space
-        run: |
-          docker buildx prune --filter "until=72h" -f
-          docker system prune -af --filter "until=72h"
-          docker volume prune -af
-
-      - name: Download local sgl-kernel wheel
-        if: ${{ github.event_name == 'schedule' || inputs.compile_kernel }}
-        uses: actions/download-artifact@v4
-        with:
-          name: sgl-kernel-${{ matrix.arch_tag }}
-          path: .ci-artifacts/sgl-kernel
-
-      - name: Set up Docker Buildx with local Docker Hub mirror
-        uses: docker/setup-buildx-action@v3
-        with:
-          driver-opts: |
-            network=host
-          buildkitd-config-inline: |
-            [registry."docker.io"]
-              mirrors = ["127.0.0.1:5000"]
-
-      - name: Login to Volcengine CR
-        run: |
-          set -euo pipefail
-          echo "${VOLCENGINE_CR_PASSWORD}" | docker login "${VOLCENGINE_CR_REGISTRY}" --username "${VOLCENGINE_CR_USERNAME}" --password-stdin
-
-      - name: Build and Push Dev Image
-        run: |
-          # Nightly and manual dispatch build from checked-out source
-          SOURCE_ARG="--build-arg BRANCH_TYPE=local"
-          if [ "${{ github.event_name }}" = "schedule" ]; then
-            INSTALL_LOCAL_SGL_KERNEL_WHEEL="1"
-          elif [ "${{ inputs.compile_kernel }}" = "true" ]; then
-            INSTALL_LOCAL_SGL_KERNEL_WHEEL="1"
-          else
-            INSTALL_LOCAL_SGL_KERNEL_WHEEL="0"
-          fi
-
-          IMAGE_NAME="${VOLCENGINE_CR_REGISTRY}/${VOLCENGINE_CR_NAMESPACE}/${VOLCENGINE_CR_REPOSITORY}"
-          LOCAL_IMAGE="local/sglang-dev:${{ github.run_id }}-${{ matrix.arch_tag }}"
-          INTERNAL_ARGS="\
-            --build-arg BYTED_INTERNAL_EXTRA_TOOLS_APT_URL=${BYTED_INTERNAL_EXTRA_TOOLS_APT_URL} \
-            --build-arg BYTED_INTERNAL_EXTRA_TOOLS_GPG_URL=${BYTED_INTERNAL_EXTRA_TOOLS_GPG_URL}"
-          VARIANT_SUFFIX_ARG=""
-          if [ -n "${{ matrix.image_tag_suffix }}" ]; then
-            LOCAL_IMAGE="${LOCAL_IMAGE}-${{ matrix.image_tag_suffix }}"
-            VARIANT_SUFFIX_ARG="--variant-suffix ${{ matrix.image_tag_suffix }}"
-          fi
-
-          CUDA_SUFFIX=""
-          if [ "${{ matrix.version }}" = "13.0.1" ]; then
-            CUDA_SUFFIX="--cuda-suffix cu130"
-          fi
-
-          if [ "${{ github.event_name }}" = "schedule" ]; then
-            VOLCENGINE_TAG=$(python3 scripts/ci/get_volcengine_image_tag.py --mode nightly ${VARIANT_SUFFIX_ARG} ${CUDA_SUFFIX})
-          else
-            VOLCENGINE_TAG=$(python3 scripts/ci/get_volcengine_image_tag.py --mode manual ${VARIANT_SUFFIX_ARG} ${CUDA_SUFFIX})
-          fi
-
-          docker buildx build \
-            --platform ${{ matrix.platform }} \
-            --load \
-            -t "${LOCAL_IMAGE}" \
-            --target framework_final \
-            -f docker/Dockerfile \
-            --build-arg CUDA_VERSION=${{ matrix.version }} \
-            --build-arg BUILD_TYPE=${{ matrix.build_type }} \
-            --build-arg CMAKE_BUILD_PARALLEL_LEVEL=$(nproc) \
-            --build-arg GRACE_BLACKWELL=${{ matrix.grace_blackwell }} \
-            --build-arg HOPPER_SBO=${{ matrix.hopper_sbo }} \
-            --build-arg W4A8_PER_TENSOR_TRANSFER=${{ matrix.w4a8_per_tensor_transfer }} \
-            --build-arg HTTP_PROXY=${HTTP_PROXY} \
-            --build-arg HTTPS_PROXY=${HTTPS_PROXY} \
-            --build-arg ALL_PROXY=${ALL_PROXY} \
-            --build-arg NO_PROXY=${NO_PROXY} \
-            ${SOURCE_ARG} \
-            --build-arg INSTALL_LOCAL_SGL_KERNEL_WHEEL=${INSTALL_LOCAL_SGL_KERNEL_WHEEL} \
-            ${INTERNAL_ARGS} \
-            --build-arg INSTALL_FLASHINFER_JIT_CACHE=1 \
-            --no-cache \
-            .
-
-          docker image inspect "${LOCAL_IMAGE}" >/dev/null
-          FINAL_IMAGE="${IMAGE_NAME}:${VOLCENGINE_TAG}"
-          echo "Built local image ${LOCAL_IMAGE}"
-          echo "Pushing ${FINAL_IMAGE}"
-          docker tag "${LOCAL_IMAGE}" "${FINAL_IMAGE}"
-          docker push "${FINAL_IMAGE}"
+            variant_suffix: w4a8-per-tensor-transfer
+            artifact_name: sgl-kernel-x86-cu13
+    uses: ./.github/workflows/_docker-build-and-publish.yml
+    with:
+      docker_target: framework_final
+      checkout_ref: ${{ inputs.pr_number && format('refs/pull/{0}/head', inputs.pr_number) || github.ref }}
+      cuda_key: ${{ matrix.cuda_key }}
+      cuda_version: ${{ matrix.cuda_version }}
+      cuda_suffix: ${{ matrix.cuda_suffix }}
+      variant_suffix: ${{ matrix.variant_suffix }}
+      tag_mode: ${{ github.event_name == 'schedule' && 'nightly' || 'manual' }}
+      use_environment: prod
+      registry_host: ${{ vars.VOLCENGINE_CR_REGISTRY }}
+      image_repo: ${{ vars.VOLCENGINE_CR_REGISTRY }}/${{ vars.VOLCENGINE_CR_NAMESPACE }}/${{ vars.VOLCENGINE_CR_REPOSITORY || 'sglang' }}
+      artifact_name: ${{ (github.event_name == 'schedule' || inputs.compile_kernel) && matrix.artifact_name || '' }}
+      extra_build_args: >-
+        --build-arg BRANCH_TYPE=local
+        --build-arg CMAKE_BUILD_PARALLEL_LEVEL=$(nproc)
+        --build-arg INSTALL_LOCAL_SGL_KERNEL_WHEEL=${{ (github.event_name == 'schedule' || inputs.compile_kernel) && '1' || '0' }}
+        --build-arg HOPPER_SBO=${{ matrix.hopper_sbo }}
+        --build-arg W4A8_PER_TENSOR_TRANSFER=${{ matrix.w4a8_per_tensor_transfer }}
+        --build-arg HTTP_PROXY=http://100.68.162.211:3128
+        --build-arg HTTPS_PROXY=http://100.68.162.211:3128
+        --build-arg ALL_PROXY=http://100.68.162.211:3128
+        --build-arg NO_PROXY=localhost,127.0.0.1,::1,mirrors.ivolces.com,.ivolces.com,.volceapi.com,.byted.org,eic-sdk-release.tos-cn-beijing.ivolces.com,scqq9isgq31i0fb8nt4eg.apigateway-cn-beijing.volceapi.com,bytedpypi.byted.org,mirrors.byted.org,iaas-gpu-cn-beijing.cr.volces.com
+        --build-arg BYTED_INTERNAL_EXTRA_TOOLS_APT_URL=${{ vars.BYTED_INTERNAL_EXTRA_TOOLS_APT_URL || 'http://mirrors.ivolces.com/extra-tools/ubuntu' }}
+        --build-arg BYTED_INTERNAL_EXTRA_TOOLS_GPG_URL=${{ vars.BYTED_INTERNAL_EXTRA_TOOLS_GPG_URL || 'https://mirrors.ivolces.com/extra-tools/ubuntu/GPG-KEY-system' }}
+    secrets: inherit

@@ -14,17 +14,6 @@ on:
         description: "Version to build (without v prefix, e.g. 0.5.7)"
         required: true
 
-env:
-  VOLCENGINE_CR_REGISTRY: ${{ vars.VOLCENGINE_CR_REGISTRY }}
-  VOLCENGINE_CR_NAMESPACE: ${{ vars.VOLCENGINE_CR_NAMESPACE }}
-  VOLCENGINE_CR_REPOSITORY: ${{ vars.VOLCENGINE_CR_REPOSITORY || 'sglang' }}
-  BYTED_INTERNAL_EXTRA_TOOLS_APT_URL: ${{ vars.BYTED_INTERNAL_EXTRA_TOOLS_APT_URL || 'http://mirrors.ivolces.com/extra-tools/ubuntu' }}
-  BYTED_INTERNAL_EXTRA_TOOLS_GPG_URL: ${{ vars.BYTED_INTERNAL_EXTRA_TOOLS_GPG_URL || 'https://mirrors.ivolces.com/extra-tools/ubuntu/GPG-KEY-system' }}
-  HTTP_PROXY: http://100.68.162.211:3128
-  HTTPS_PROXY: http://100.68.162.211:3128
-  ALL_PROXY: http://100.68.162.211:3128
-  NO_PROXY: localhost,127.0.0.1,::1,mirrors.ivolces.com,.ivolces.com,.volceapi.com,.byted.org,eic-sdk-release.tos-cn-beijing.ivolces.com,scqq9isgq31i0fb8nt4eg.apigateway-cn-beijing.volceapi.com,bytedpypi.byted.org,mirrors.byted.org,iaas-gpu-cn-beijing.cr.volces.com
-
 jobs:
   validate-volcengine-version-tag:
     if: github.repository == 'bytedance-iaas/sglang'
@@ -61,53 +50,36 @@ jobs:
 
           echo "value=${RAW_TAG#v}" >> "$GITHUB_OUTPUT"
 
-  prepare-volcengine-release:
-    if: github.repository == 'bytedance-iaas/sglang'
-    needs: [validate-volcengine-version-tag]
-    runs-on: ubuntu-22.04
-    outputs:
-      extra-build-args: ${{ steps.config.outputs.extra-build-args }}
-      image-repo: ${{ steps.config.outputs.image-repo }}
-      registry-host: ${{ steps.config.outputs.registry-host }}
-      tag-config: ${{ steps.config.outputs.tag-config }}
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Build Volcengine release config
-        id: config
-        run: |
-          set -euo pipefail
-
-          IMAGE_REPO="${VOLCENGINE_CR_REGISTRY}/${VOLCENGINE_CR_NAMESPACE}/${VOLCENGINE_CR_REPOSITORY}"
-          TAG_CU129="$(python3 scripts/ci/get_volcengine_image_tag.py --mode version --tag-value "${{ needs.validate-volcengine-version-tag.outputs.git-tag-value }}")"
-          TAG_CU130="$(python3 scripts/ci/get_volcengine_image_tag.py --mode version --tag-value "${{ needs.validate-volcengine-version-tag.outputs.git-tag-value }}" --cuda-suffix cu130)"
-          TAG_CONFIG="$(TAG_CU129="${TAG_CU129}" TAG_CU130="${TAG_CU130}" python3 -c 'import json, os; print(json.dumps([{"cuda": "cu129", "tags": [os.environ["TAG_CU129"]]}, {"cuda": "cu130", "tags": [os.environ["TAG_CU130"]]}], separators=(",", ":")))')"
-          EXTRA_BUILD_ARGS="\
-          --build-arg HTTP_PROXY=${HTTP_PROXY} \
-          --build-arg HTTPS_PROXY=${HTTPS_PROXY} \
-          --build-arg ALL_PROXY=${ALL_PROXY} \
-          --build-arg NO_PROXY=${NO_PROXY} \
-          --build-arg BYTED_INTERNAL_EXTRA_TOOLS_APT_URL=${BYTED_INTERNAL_EXTRA_TOOLS_APT_URL} \
-          --build-arg BYTED_INTERNAL_EXTRA_TOOLS_GPG_URL=${BYTED_INTERNAL_EXTRA_TOOLS_GPG_URL}"
-
-          echo "registry-host=${VOLCENGINE_CR_REGISTRY}" >> "$GITHUB_OUTPUT"
-          echo "image-repo=${IMAGE_REPO}" >> "$GITHUB_OUTPUT"
-          echo "tag-config=${TAG_CONFIG}" >> "$GITHUB_OUTPUT"
-          echo "extra-build-args=${EXTRA_BUILD_ARGS}" >> "$GITHUB_OUTPUT"
-
   build-and-publish-volcengine:
     if: github.repository == 'bytedance-iaas/sglang'
-    needs: [validate-volcengine-version-tag, prepare-volcengine-release]
+    needs: [validate-volcengine-version-tag]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - cuda_key: cu129
+            cuda_version: 12.9.1
+            cuda_suffix: ""
+          - cuda_key: cu130
+            cuda_version: 13.0.1
+            cuda_suffix: cu130
     uses: ./.github/workflows/_docker-build-and-publish.yml
     with:
       docker_target: framework_final
+      cuda_key: ${{ matrix.cuda_key }}
+      cuda_version: ${{ matrix.cuda_version }}
+      cuda_suffix: ${{ matrix.cuda_suffix }}
       sgl_version: ${{ needs.validate-volcengine-version-tag.outputs.git-tag-value }}
+      tag_mode: version
+      tag_value: ${{ needs.validate-volcengine-version-tag.outputs.git-tag-value }}
       use_environment: prod
-      registry_host: ${{ needs.prepare-volcengine-release.outputs.registry-host }}
-      image_repo: ${{ needs.prepare-volcengine-release.outputs.image-repo }}
-      tag_config: ${{ needs.prepare-volcengine-release.outputs.tag-config }}
-      extra_build_args: ${{ needs.prepare-volcengine-release.outputs.extra-build-args }}
+      registry_host: ${{ vars.VOLCENGINE_CR_REGISTRY }}
+      image_repo: ${{ vars.VOLCENGINE_CR_REGISTRY }}/${{ vars.VOLCENGINE_CR_NAMESPACE }}/${{ vars.VOLCENGINE_CR_REPOSITORY || 'sglang' }}
+      extra_build_args: >-
+        --build-arg HTTP_PROXY=http://100.68.162.211:3128
+        --build-arg HTTPS_PROXY=http://100.68.162.211:3128
+        --build-arg ALL_PROXY=http://100.68.162.211:3128
+        --build-arg NO_PROXY=localhost,127.0.0.1,::1,mirrors.ivolces.com,.ivolces.com,.volceapi.com,.byted.org,eic-sdk-release.tos-cn-beijing.ivolces.com,scqq9isgq31i0fb8nt4eg.apigateway-cn-beijing.volceapi.com,bytedpypi.byted.org,mirrors.byted.org,iaas-gpu-cn-beijing.cr.volces.com
+        --build-arg BYTED_INTERNAL_EXTRA_TOOLS_APT_URL=${{ vars.BYTED_INTERNAL_EXTRA_TOOLS_APT_URL || 'http://mirrors.ivolces.com/extra-tools/ubuntu' }}
+        --build-arg BYTED_INTERNAL_EXTRA_TOOLS_GPG_URL=${{ vars.BYTED_INTERNAL_EXTRA_TOOLS_GPG_URL || 'https://mirrors.ivolces.com/extra-tools/ubuntu/GPG-KEY-system' }}
     secrets: inherit
