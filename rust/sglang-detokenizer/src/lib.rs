@@ -62,7 +62,7 @@ impl DetokenizerConfig {
 
 /// A Python module implemented in Rust.
 #[pymodule]
-mod api {
+mod sglang_detokenizer {
     use pyo3::prelude::*;
     use crate::cli;
 
