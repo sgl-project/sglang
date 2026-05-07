@@ -127,7 +127,7 @@ class GPUWorker:
         # initialize the distributed environment
         maybe_init_distributed_environment_and_model_parallel(
             tp_size=self.server_args.tp_size,
-            enable_cfg_parallel=self.server_args.enable_cfg_parallel,
+            cfg_degree=self.server_args.cfg_parallel_degree or 1,
             ulysses_degree=self.server_args.ulysses_degree,
             ring_degree=self.server_args.ring_degree,
             sp_size=self.server_args.sp_degree,

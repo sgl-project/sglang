@@ -355,6 +355,8 @@ jobs:
   # These jobs poll GitHub API to wait for previous stages to complete.
   # For PR runs: wait jobs run and enforce sequential execution via polling.
   # For scheduled runs: wait jobs are skipped, enabling parallel execution for easier retry.
+  # For PRs with the `bypass-fastfail` label: wait jobs run but return success immediately
+  # (handled inside the wait-for-jobs action), so downstream stages dispatch in parallel.
 
   wait-for-stage-a:
     needs: [check-changes, call-gate]
