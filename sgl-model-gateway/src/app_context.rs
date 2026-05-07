@@ -329,7 +329,7 @@ impl AppContextBuilder {
         let has_tls_config = config.client_identity.is_some() || !config.ca_certificates.is_empty();
 
         let mut client_builder = Client::builder()
-            .pool_idle_timeout(Some(Duration::from_secs(50)))
+            .pool_idle_timeout(Some(Duration::from_secs(config.pool_idle_timeout_secs)))
             .pool_max_idle_per_host(500)
             .timeout(Duration::from_secs(timeout_secs))
             .connect_timeout(Duration::from_secs(10))
