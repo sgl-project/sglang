@@ -2,6 +2,7 @@ import io
 import os
 import re
 import subprocess
+import tempfile
 import threading
 import time
 import unittest
@@ -791,27 +792,29 @@ class TestEPDDisaggregationOneEncoder(PDDisaggregationServerBase):
         import glob
         import json
 
-        output_path = "./logs/epd_one_encoder_mmmu"
-        self.run_mmmu_eval(self.model, output_path)
+        # Use a per-test temp dir so result-file lookup can't be confused by
+        # stale JSON left in `./logs/` by neighbouring tests in the same suite.
+        with tempfile.TemporaryDirectory(prefix="epd_one_encoder_mmmu_") as output_path:
+            self.run_mmmu_eval(self.model, output_path)
 
-        # Get the result file
-        result_files = glob.glob(f"{output_path}/**/*.json", recursive=True)
-        if not result_files:
-            result_files = glob.glob(f"{output_path}/*.json")
+            # Get the result file
+            result_files = glob.glob(f"{output_path}/**/*.json", recursive=True)
+            if not result_files:
+                result_files = glob.glob(f"{output_path}/*.json")
 
-        if not result_files:
-            self.fail(f"No JSON result files found in {output_path}")
+            if not result_files:
+                self.fail(f"No JSON result files found in {output_path}")
 
-        result_file_path = result_files[0]
-        with open(result_file_path, "r") as f:
-            result = json.load(f)
-            print(f"MMMU result: {result}")
+            result_file_path = result_files[0]
+            with open(result_file_path, "r") as f:
+                result = json.load(f)
+                print(f"MMMU result: {result}")
 
-        mmmu_accuracy = result["results"]["mmmu_val"]["mmmu_acc,none"]
-        print(f"MMMU accuracy: {mmmu_accuracy:.4f}")
+            mmmu_accuracy = result["results"]["mmmu_val"]["mmmu_acc,none"]
+            print(f"MMMU accuracy: {mmmu_accuracy:.4f}")
 
-        # for qwen2.5-vl-3b-instruct, the accuracy is 0.40
-        self.assertGreater(mmmu_accuracy, 0.40)
+            # for qwen2.5-vl-3b-instruct, the accuracy is 0.40
+            self.assertGreater(mmmu_accuracy, 0.40)
 
 
 @unittest.skipIf(
@@ -1194,26 +1197,30 @@ class TestEPDDisaggregationMultiEncoders(PDDisaggregationServerBase):
         import glob
         import json
 
-        output_path = "./logs/epd_multi_encoder_mmmu"
-        self.run_mmmu_eval(self.model, output_path)
+        # Use a per-test temp dir so result-file lookup can't be confused by
+        # stale JSON left in `./logs/` by neighbouring tests in the same suite.
+        with tempfile.TemporaryDirectory(
+            prefix="epd_multi_encoder_mmmu_"
+        ) as output_path:
+            self.run_mmmu_eval(self.model, output_path)
 
-        # Get the result file
-        result_files = glob.glob(f"{output_path}/**/*.json", recursive=True)
-        if not result_files:
-            result_files = glob.glob(f"{output_path}/*.json")
+            # Get the result file
+            result_files = glob.glob(f"{output_path}/**/*.json", recursive=True)
+            if not result_files:
+                result_files = glob.glob(f"{output_path}/*.json")
 
-        if not result_files:
-            self.fail(f"No JSON result files found in {output_path}")
+            if not result_files:
+                self.fail(f"No JSON result files found in {output_path}")
 
-        result_file_path = result_files[0]
-        with open(result_file_path, "r") as f:
-            result = json.load(f)
-            print(f"MMMU result (multi encoder): {result}")
+            result_file_path = result_files[0]
+            with open(result_file_path, "r") as f:
+                result = json.load(f)
+                print(f"MMMU result (multi encoder): {result}")
 
-        mmmu_accuracy = result["results"]["mmmu_val"]["mmmu_acc,none"]
-        print(f"MMMU accuracy (multi encoder): {mmmu_accuracy:.4f}")
-        # for qwen2.5-vl-3b-instruct, the accuracy is 0.40
-        self.assertGreater(mmmu_accuracy, 0.40)
+            mmmu_accuracy = result["results"]["mmmu_val"]["mmmu_acc,none"]
+            print(f"MMMU accuracy (multi encoder): {mmmu_accuracy:.4f}")
+            # for qwen2.5-vl-3b-instruct, the accuracy is 0.40
+            self.assertGreater(mmmu_accuracy, 0.40)
 
 
 @unittest.skipIf(is_in_ci(), "Skipping in CI to reduce multi-GPU runtime")
@@ -1410,25 +1417,29 @@ class TestEPDDisaggregationGrpcEncoderMMMU(PDDisaggregationServerBase):
         import glob
         import json
 
-        output_path = "./logs/epd_grpc_encoder_mmmu"
-        self.run_mmmu_eval(self.model, output_path)
+        # Use a per-test temp dir so result-file lookup can't be confused by
+        # stale JSON left in `./logs/` by neighbouring tests in the same suite.
+        with tempfile.TemporaryDirectory(
+            prefix="epd_grpc_encoder_mmmu_"
+        ) as output_path:
+            self.run_mmmu_eval(self.model, output_path)
 
-        result_files = glob.glob(f"{output_path}/**/*.json", recursive=True)
-        if not result_files:
-            result_files = glob.glob(f"{output_path}/*.json")
+            result_files = glob.glob(f"{output_path}/**/*.json", recursive=True)
+            if not result_files:
+                result_files = glob.glob(f"{output_path}/*.json")
 
-        if not result_files:
-            self.fail(f"No JSON result files found in {output_path}")
+            if not result_files:
+                self.fail(f"No JSON result files found in {output_path}")
 
-        result_file_path = result_files[0]
-        with open(result_file_path, "r") as f:
-            result = json.load(f)
-            print(f"MMMU result (grpc encoder): {result}")
+            result_file_path = result_files[0]
+            with open(result_file_path, "r") as f:
+                result = json.load(f)
+                print(f"MMMU result (grpc encoder): {result}")
 
-        mmmu_accuracy = result["results"]["mmmu_val"]["mmmu_acc,none"]
-        print(f"MMMU accuracy (grpc encoder): {mmmu_accuracy:.4f}")
-        # for qwen2.5-vl-3b-instruct, the accuracy is 0.40
-        self.assertGreater(mmmu_accuracy, 0.40)
+            mmmu_accuracy = result["results"]["mmmu_val"]["mmmu_acc,none"]
+            print(f"MMMU accuracy (grpc encoder): {mmmu_accuracy:.4f}")
+            # for qwen2.5-vl-3b-instruct, the accuracy is 0.40
+            self.assertGreater(mmmu_accuracy, 0.40)
 
 
 @unittest.skipIf(is_in_ci(), "Skipping in CI to reduce multi-GPU runtime")

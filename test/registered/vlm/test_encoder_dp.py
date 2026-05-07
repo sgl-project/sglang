@@ -2,6 +2,7 @@ import glob
 import json
 import os
 import random
+import tempfile
 import unittest
 from types import SimpleNamespace
 
@@ -248,8 +249,11 @@ class TestVLMEncoderDP(CustomTestCase):
         if is_in_ci():
             models_to_test = [random.choice(MODELS)]
 
+        # Use a per-call temp dir so result-file lookup can't pick up stale JSON
+        # left in a shared `./logs/` by neighbouring tests in the same suite.
         for model in models_to_test:
-            self._run_vlm_mmmu_test(model, "./logs")
+            with tempfile.TemporaryDirectory(prefix="encoder_dp_logs_") as output_path:
+                self._run_vlm_mmmu_test(model, output_path)
 
 
 if __name__ == "__main__":
