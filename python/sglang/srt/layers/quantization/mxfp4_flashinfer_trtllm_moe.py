@@ -37,7 +37,6 @@ logger = logging.getLogger(__name__)
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import CombineInput, DispatchOutput
 
-from sglang.srt.environ import envs
 from sglang.srt.utils.common import get_bool_env_var
 
 _USE_OFFICIAL_SHUFFLE = get_bool_env_var(
