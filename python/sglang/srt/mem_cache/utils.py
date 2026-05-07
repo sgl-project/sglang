@@ -436,5 +436,3 @@ def split_node_hash_value(
     child_hash = child_hash_value[split_pages:]
 
     return new_node_hash, child_hash
-
-
