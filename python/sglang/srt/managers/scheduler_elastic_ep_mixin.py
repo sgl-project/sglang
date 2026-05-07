@@ -75,7 +75,8 @@ class SchedulerElasticEPMixin:
         abort_message: str,
         err_type: str,
     ) -> tuple[int, int]:
-        self.result_queue.clear()
+        if self.enable_overlap:
+            self.result_queue.clear()
         ElasticEPStateManager.instance().clear_pending_snapshots()
         torch.cuda.synchronize()
 

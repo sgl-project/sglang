@@ -1496,6 +1496,11 @@ class Scheduler(
             # Launch the current batch
             if batch:
                 result = self.run_batch(batch)
+                if (
+                    self.server_args.elastic_ep_backend is not None
+                    and not self._handle_elastic_ep_result_boundary(result)
+                ):
+                    continue
                 self.process_batch_result(batch, result)
             else:
                 # When the server is idle, do self-check and re-init some states.
@@ -3023,17 +3028,6 @@ class Scheduler(
         # Capture prefill end time for EXTEND mode
         if batch.forward_mode == ForwardMode.EXTEND:
             set_time_batch(batch.reqs, "set_prefill_run_batch_end_time")
-
-        if (
-            self.server_args.enable_dp_attention
-            and self.server_args.elastic_ep_backend is not None
-            and not self.enable_overlap
-        ):
-            # Get the tensors indicating rank activeness
-            self.elastic_ep_status_publisher.publish_active_ranks(
-                global_device_active_ranks=self.tp_group.active_ranks,
-                global_pg_active_ranks_cpu=self.tp_group.active_ranks_cpu,
-            )
 
         return ret
 

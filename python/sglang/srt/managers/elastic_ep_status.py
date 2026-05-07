@@ -28,13 +28,6 @@ class ElasticEPStatusPublisher:
     ) -> None:
         pass
 
-    def publish_active_ranks(
-        self,
-        global_device_active_ranks: torch.Tensor,
-        global_pg_active_ranks_cpu: torch.Tensor,
-    ) -> None:
-        pass
-
 
 class ControllerElasticEPStatusPublisher(ElasticEPStatusPublisher):
     def __init__(self, send_to_controller: Any, dp_size: int):
@@ -46,22 +39,8 @@ class ControllerElasticEPStatusPublisher(ElasticEPStatusPublisher):
         self,
         committed_active_ranks: torch.Tensor,
     ) -> None:
-        self._publish_active_ranks(committed_active_ranks)
-
-    def publish_active_ranks(
-        self,
-        global_device_active_ranks: torch.Tensor,
-        global_pg_active_ranks_cpu: torch.Tensor,
-    ) -> None:
-        # DPC expects one active bit per DP worker. A DP worker is active only
-        # when all ranks in that DP group are active in both world-size masks.
-        active_ranks = global_device_active_ranks.detach().cpu().clone()
-        active_ranks &= global_pg_active_ranks_cpu.detach().cpu()
-        self._publish_active_ranks(active_ranks)
-
-    def _publish_active_ranks(self, active_ranks: torch.Tensor) -> None:
-        assert active_ranks.numel() % self.dp_size == 0
-        dp_active_ranks = active_ranks.reshape(self.dp_size, -1).prod(dim=1)
+        assert committed_active_ranks.numel() % self.dp_size == 0
+        dp_active_ranks = committed_active_ranks.reshape(self.dp_size, -1).prod(dim=1)
         status = dp_active_ranks.bool().tolist()
 
         if status == self.last_status:

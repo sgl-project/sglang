@@ -3096,7 +3096,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             )
         if elastic_ep_state is not None:
             elastic_ep_state.submit_active_snapshot(
-                global_pg_active_ranks=self.tp_group.active_ranks
+                global_pg_active_ranks=self.tp_group.active_ranks,
+                non_blocking=not self.server_args.disable_overlap_schedule,
             )
         output.expert_distribution_metrics = recorder_outputs.get("metrics")
 

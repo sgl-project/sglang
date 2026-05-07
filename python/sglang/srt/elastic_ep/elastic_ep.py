@@ -33,13 +33,17 @@ class ElasticEPState:
     pending_staging_slots: list[int] = field(default_factory=list)
 
     def submit_active_snapshot(
-        self, global_pg_active_ranks: torch.Tensor
+        self,
+        global_pg_active_ranks: torch.Tensor,
+        non_blocking: bool = True,
     ) -> None:
-        """Enqueue async copies of world-size active-rank snapshots.
+        """Enqueue copies of world-size active-rank snapshots.
 
-        No explicit event is recorded; the scheduler relies on
+        With non_blocking=True (overlap path) the scheduler relies on
         copy_done.synchronize() (same forward_stream, recorded strictly later)
-        to act as the barrier before reading the staging buffers.
+        to act as the barrier before reading the staging buffers. Non-overlap
+        callers pass non_blocking=False so the staging buffers are valid as
+        soon as this call returns.
         """
         slot = self.next_staging_slot
         self.next_staging_slot ^= 1
@@ -51,7 +55,7 @@ class ElasticEPState:
         assert len(self.pending_staging_slots) <= 2
 
         if self.active_ranks.device.type == "cuda":
-            staging_active_ranks_cpu.copy_(self.active_ranks, non_blocking=True)
+            staging_active_ranks_cpu.copy_(self.active_ranks, non_blocking=non_blocking)
         else:
             # CPU backend: fully synchronous, no stream involved.
             staging_active_ranks_cpu.copy_(self.active_ranks)
@@ -59,7 +63,7 @@ class ElasticEPState:
         assert global_pg_active_ranks.numel() == self.committed_active_ranks_cpu.numel()
         if global_pg_active_ranks.device.type == "cuda":
             staging_global_pg_active_ranks_cpu.copy_(
-                global_pg_active_ranks, non_blocking=True
+                global_pg_active_ranks, non_blocking=non_blocking
             )
         else:
             staging_global_pg_active_ranks_cpu.copy_(global_pg_active_ranks)
@@ -70,9 +74,10 @@ class ElasticEPState:
         """Commit the oldest unconsumed world-size snapshot.
 
         The committed mirror is a sticky fault latch: ranks return to active
-        only through explicit recover/reset. Caller must have already
-        synchronized the stream the submit was enqueued on (e.g. via
-        copy_done.synchronize) so staging buffers are ready.
+        only through explicit recover/reset. Caller must ensure the staging
+        buffers are ready, either by passing non_blocking=False to
+        submit_active_snapshot (non-overlap path) or by synchronizing the
+        stream after submit (e.g. via copy_done.synchronize, overlap path).
         global_pg_active_ranks_cpu is a read-only process-group observation.
         Returns True if a snapshot was committed.
         """
