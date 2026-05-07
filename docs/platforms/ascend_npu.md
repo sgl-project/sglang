@@ -18,9 +18,9 @@ You can install SGLang using any of the methods below. Please go through `System
 You can obtain the dependency of a specified version of CANN through an image.
 ```shell
 # for Atlas 800I A3 and Ubuntu OS
-docker pull quay.io/ascend/cann:9.0.0-beta.1-a3-ubuntu22.04-py3.11
+docker pull quay.io/ascend/cann:8.5.0-a3-ubuntu22.04-py3.11
 # for Atlas 800I A2 and Ubuntu OS
-docker pull quay.io/ascend/cann:9.0.0-beta.1-910b-ubuntu22.04-py3.11
+docker pull quay.io/ascend/cann:8.5.0-910b-ubuntu22.04-py3.11
 ```
 
 ## Preparing the Running Environment
@@ -38,7 +38,7 @@ conda activate sglang_npu
 
 #### CANN
 
-Prior to start work with SGLang on Ascend you need to install CANN Toolkit, Kernels operator package and NNAL version 8.3.RC2 or higher, check the [installation guide](https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/900beta1/softwareinst/instg/instg_0008.html?Mode=PmIns&InstallType=local&OS=openEuler)
+Prior to start work with SGLang on Ascend you need to install CANN Toolkit, Kernels operator package and NNAL version 8.3.RC2 or higher, check the [installation guide](https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/83RC1/softwareinst/instg/instg_0008.html?Mode=PmIns&InstallType=local&OS=openEuler&Software=cannToolKit)
 
 #### MemFabric-Hybrid
 
@@ -51,9 +51,9 @@ pip install memfabric-hybrid==1.0.5
 #### Pytorch and Pytorch Framework Adaptor on Ascend
 
 ```shell
-PYTORCH_VERSION=2.9.0
-TORCHVISION_VERSION=0.24.0
-TORCH_NPU_VERSION=2.9.0.post1
+PYTORCH_VERSION=2.8.0
+TORCHVISION_VERSION=0.23.0
+TORCH_NPU_VERSION=2.8.0
 pip install torch==$PYTORCH_VERSION torchvision==$TORCHVISION_VERSION --index-url https://download.pytorch.org/whl/cpu
 pip install torch_npu==$TORCH_NPU_VERSION
 ```
@@ -93,8 +93,8 @@ You can download the SGLang image or build an image based on Dockerfile to obtai
 dockerhub: docker.io/lmsysorg/sglang:$tag
 # Main-based tag, change main to specific version like v0.5.6,
 # you can get image for specific version
-Atlas 800I A3 : {main}-cann9.0.0-a3
-Atlas 800I A2: {main}-cann9.0.0-910b
+Atlas 800I A3 : {main}-cann8.5.0-a3
+Atlas 800I A2: {main}-cann8.5.0-910b
 ```
 2. Build an image based on Dockerfile
 ```shell
