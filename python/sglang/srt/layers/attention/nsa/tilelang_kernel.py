@@ -1,5 +1,4 @@
 import functools
-import os
 from functools import lru_cache
 from typing import Any, Optional, Tuple
 
@@ -56,14 +55,6 @@ INT32 = "int32"
 UINT8 = "uint8"
 
 
-def _debug_dsv4_attn_enabled() -> bool:
-    return os.environ.get("SGLANG_DEBUG_DSV4_ATTN", "0") == "1" and (
-        not torch.distributed.is_available()
-        or not torch.distributed.is_initialized()
-        or torch.distributed.get_rank() == 0
-    )
-
-
 def fast_log2_ceil(x):
     bits_x = T.reinterpret("uint32", x)
     exp_x = (bits_x >> 23) & 0xFF
@@ -87,47 +78,14 @@ def _pick_inner_iter(seq: int, ni: int, cu: int, block_per_cu: int) -> int:
     enough work per CU (seq * ni / inner_iter / cu >= block_per_cu), so we avoid
     under-utilization while minimizing the number of partial groups.
     """
-    # 16384, 2, 256, 2
 
-    max_it = int(seq * ni / (cu * block_per_cu)) # 16384 * 2/(256*2) = 64
-    it = ni # 2
+    max_it = int(seq * ni / (cu * block_per_cu))
+    it = ni
     while it >= 2:
         if it <= max_it and ni % it == 0:
             return it
         it //= 2
     return 1
-
-@lru_cache(maxsize=8)
-def _pick_inner_iter_combine(
-    seq: int,
-    ni_1: int,
-    ni_2: int,
-    cu: int,
-    block_per_cu: int,
-) -> Tuple[int, int]:
-    target_blocks = cu * block_per_cu
-
-    ## prevent register spills 
-    # return 2, 2
-    iter_2 = ni_2
-    while iter_2 > 4 and iter_2 % 2 == 0:
-        iter_2 //= 2
-    iter_1 = ni_1
-
-    while iter_1 > 1 or iter_2 > 1:
-        total_blocks = seq * (ni_1 // iter_1 + ni_2 // iter_2)
-        if total_blocks < target_blocks // 2: 
-            max_iter = max(iter_2, iter_1)
-            if max_iter % 2 != 0:
-                break # TODO, later optimize.
-            if iter_2 == max_iter:
-                iter_2 //= 2
-            if iter_1 == max_iter:
-                iter_1 //= 2
-        else:
-            break
-
-    return iter_1, iter_2
 
 
 @tilelang.jit(pass_configs=pass_configs)
@@ -1686,7 +1644,6 @@ def dpsk_v4_fp8_partial_kernel(
     head_kv = num_heads // kv_group
     D = dim
     D_tail = tail_dim
-    D_all = D + D_tail
     BI = block_I
     padded_H = max(tilelang.math.next_power_of_2(head_kv), 16)
     if head_kv > 64:
@@ -1706,11 +1663,11 @@ def dpsk_v4_fp8_partial_kernel(
         BS_KV_2 = block_size_kv_2
         NOPE_ROPE_U32_PER_BLOCK_2 = BS_KV_2 * PACKED_W4
 
-    q_shape = [batch, seq_len, num_heads, D_all]
+    q_shape = [batch, seq_len, num_heads, D + D_tail]
     k1_shape = [num_blocks_kv_1, block_pad_u32_1]
     indices1_shape = [batch, seq_len, topk_1]
     topk_length_shape = [batch]
-    partial_o_shape = [batch, seq_len, n_groups, num_heads, D_all]
+    partial_o_shape = [batch, seq_len, n_groups, num_heads, D + D_tail]
     partial_lse_shape = [batch, seq_len, n_groups, num_heads]
     if is_dual:
         k2_shape = [num_blocks_kv_2, block_pad_u32_2]
@@ -1741,17 +1698,17 @@ def dpsk_v4_fp8_partial_kernel(
             with T.Kernel(
                 seq_len * REPLICATE_H * n_groups, batch, kv_group, threads=threads
             ) as (bx, by, bz):
-                Q_shared = T.alloc_fragment([H_per_block, D_all], BF16)
+                Q_shared = T.alloc_fragment([H_per_block, D + D_tail], BF16)
                 K_packed_shared = T.alloc_shared([BI, PACKED_W4], "uint32")
                 K_scale_shared = T.alloc_shared([BI, SCALE_W4], "uint32")
-                KV_shared = T.alloc_shared([BI, D_all], BF16)
+                KV_shared = T.alloc_shared([BI, D + D_tail], BF16)
                 S_shared = T.alloc_shared([H_per_block, BI], BF16)
                 page_idx_shared = T.alloc_shared([BI], INT32)
 
                 mask = T.alloc_fragment([BI], "bool")
                 scale_byte_local = T.alloc_fragment([BI, NUM_TILES], "uint32")
 
-                acc_o = T.alloc_fragment([H_per_block, D_all], accum_dtype)
+                acc_o = T.alloc_fragment([H_per_block, D + D_tail], accum_dtype)
                 acc_s = T.alloc_fragment([H_per_block, BI], accum_dtype)
                 sumexp = T.alloc_fragment([H_per_block], accum_dtype)
                 sumexp_i = T.alloc_fragment([H_per_block], accum_dtype)
@@ -1780,7 +1737,7 @@ def dpsk_v4_fp8_partial_kernel(
 
                 if (group_i < n_groups_1) & (group_i < actual_n_groups_1):
                     # Phase 1 active: SWA cache work + Partial_O write.
-                    T.copy(Q[b_i, s_i, H0:H1, :D_all], Q_shared)
+                    T.copy(Q[b_i, s_i, H0:H1, :D + D_tail], Q_shared)
                     for k_i in T.Pipelined(inner_iter_1, num_stages=num_stages):
                         iter_i = group_i * inner_iter_1 + k_i
                         for bi_i in T.Parallel(BI):
@@ -1872,7 +1829,7 @@ def dpsk_v4_fp8_partial_kernel(
                         T.reduce_sum(acc_s, sumexp_i, dim=1)
                         for h_i in T.Parallel(H_per_block):
                             sumexp[h_i] = sumexp[h_i] * alpha[h_i] + sumexp_i[h_i]
-                        for h_i, d_i in T.Parallel(H_per_block, D_all):
+                        for h_i, d_i in T.Parallel(H_per_block, D + D_tail):
                             acc_o[h_i, d_i] *= alpha[h_i]
                         T.copy(acc_s, S_shared)
                         T.gemm(
@@ -1882,7 +1839,7 @@ def dpsk_v4_fp8_partial_kernel(
                             policy=T.GemmWarpPolicy.FullRow,
                         )
                     # ---- finalize phase 1 (active) ----
-                    for h_i, d_i in T.Parallel(H_per_block, D_all):
+                    for h_i, d_i in T.Parallel(H_per_block, D + D_tail):
                         acc_o[h_i, d_i] = acc_o[h_i, d_i] / T.if_then_else(
                             sumexp[h_i] == 0.0, 1.0, sumexp[h_i]
                         )
@@ -1892,7 +1849,7 @@ def dpsk_v4_fp8_partial_kernel(
                             -(2.0**30),
                             T.log2(sumexp[h_i]) + m_i[h_i] * sm_scale,
                         )
-                    T.copy(acc_o, Partial_O[b_i, s_i, group_i, H0:H1, :D+D_tail])
+                    T.copy(acc_o, Partial_O[b_i, s_i, group_i, H0:H1, :D + D_tail])
                     T.copy(m_i, Partial_LSE[b_i, s_i, group_i, H0:H1])
                 elif group_i < n_groups_1:
                     # Phase 1 skipped: m_i is still the -2^30
@@ -2497,6 +2454,7 @@ def dpsk_v4_fp8_attention_fwd(
     topk2 = extra_indices_in_kvcache.shape[-1] if has_extra else 0
     if _is_gfx95_supported:
         block_I, threads, num_stages, block_per_cu, cu = 32, 512, 0, 1, 256
+        # prevent register spills
         if seq * (topk_1 // block_I + topk2 // block_I) <= cu * block_per_cu // 2:
             block_I = 32
     else:
