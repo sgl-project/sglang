@@ -125,13 +125,6 @@ class BaseLayerWithLoRA(nn.Module):
     def _fp8_cast_merge_random_kwargs(self, data_2d: torch.Tensor) -> dict[str, int]:
         return {}
 
-    def _try_merge_lora_into_full_fp8_cast_data(
-        self,
-        data_2d: torch.Tensor,
-        lora_list: list[LoRAWeightEntry],
-    ) -> bool:
-        return False
-
     def set_lora_weights(
         self,
         A: torch.Tensor,
@@ -261,8 +254,6 @@ class BaseLayerWithLoRA(nn.Module):
         data_2d = data.reshape(-1, data.shape[-1]) if data.dim() > 2 else data
         if not data_2d.is_contiguous():
             raise ValueError("fp8-cast LoRA merge expects contiguous base weights")
-        if self._try_merge_lora_into_full_fp8_cast_data(data_2d, lora_list):
-            return
 
         deltas = torch.zeros_like(data_2d, dtype=torch.bfloat16)
         for lora_A, lora_B, _, lora_strength, lora_rank, lora_alpha in lora_list:
@@ -521,44 +512,6 @@ class ColumnParallelLinearWithLoRA(BaseLayerWithLoRA):
         )
         return {"random_offset": row_offset * data_2d.shape[-1]}
 
-    def _try_merge_lora_into_full_fp8_cast_data(
-        self,
-        data_2d: torch.Tensor,
-        lora_list: list[LoRAWeightEntry],
-    ) -> bool:
-        if (
-            os.getenv("SGLANG_DIFFUSION_TP_FP8_LORA_FULL_FUSE", "0") != "1"
-            or self.base_layer.tp_size == 1
-            or len(self.base_layer.output_partition_sizes) != 1
-        ):
-            return False
-
-        full_weight = tensor_model_parallel_all_gather(
-            data_2d, dim=0, tp_group=self.base_layer.tp_group
-        )
-        full_deltas = torch.zeros_like(full_weight, dtype=torch.bfloat16)
-        for lora_A, lora_B, _, lora_strength, lora_rank, lora_alpha in lora_list:
-            lora_A_full = lora_A.to(device=data_2d.device, dtype=torch.bfloat16)
-            lora_B_full = lora_B.to(device=data_2d.device, dtype=torch.bfloat16)
-            scale = lora_strength
-            if (
-                lora_alpha is not None
-                and lora_rank is not None
-                and lora_alpha != lora_rank
-            ):
-                scale *= lora_alpha / lora_rank
-            full_deltas.add_(lora_B_full @ lora_A_full, alpha=scale)
-
-        fused_add_round_fp8_cast_(
-            full_deltas.reshape(-1), full_weight.reshape(-1), seed=0
-        )
-        row_start = (
-            self.base_layer.tp_rank * self.base_layer.output_partition_sizes[0]
-        )
-        row_end = row_start + self.base_layer.output_partition_sizes[0]
-        data_2d.copy_(full_deltas[row_start:row_end].to(dtype=data_2d.dtype))
-        return True
-
 
 class MergedColumnParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
     def __init__(
@@ -582,13 +535,6 @@ class MergedColumnParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
 
     def _fp8_cast_merge_random_kwargs(self, data_2d: torch.Tensor) -> dict[str, int]:
         return {}
-
-    def _try_merge_lora_into_full_fp8_cast_data(
-        self,
-        data_2d: torch.Tensor,
-        lora_list: list[LoRAWeightEntry],
-    ) -> bool:
-        return False
 
 
 class QKVParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
@@ -624,13 +570,6 @@ class QKVParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
 
     def _fp8_cast_merge_random_kwargs(self, data_2d: torch.Tensor) -> dict[str, int]:
         return {}
-
-    def _try_merge_lora_into_full_fp8_cast_data(
-        self,
-        data_2d: torch.Tensor,
-        lora_list: list[LoRAWeightEntry],
-    ) -> bool:
-        return False
 
 
 class RowParallelLinearWithLoRA(BaseLayerWithLoRA):
@@ -720,45 +659,6 @@ class RowParallelLinearWithLoRA(BaseLayerWithLoRA):
             "random_col_offset": self.base_layer.tp_rank
             * self.base_layer.input_size_per_partition,
         }
-
-    def _try_merge_lora_into_full_fp8_cast_data(
-        self,
-        data_2d: torch.Tensor,
-        lora_list: list[LoRAWeightEntry],
-    ) -> bool:
-        if (
-            os.getenv("SGLANG_DIFFUSION_TP_FP8_LORA_FULL_FUSE", "0") != "1"
-            or self.base_layer.tp_size == 1
-        ):
-            return False
-
-        full_weight = tensor_model_parallel_all_gather(
-            data_2d, dim=1, tp_group=self.base_layer.tp_group
-        )
-        full_deltas = torch.zeros_like(full_weight, dtype=torch.bfloat16)
-        for lora_A, lora_B, _, lora_strength, lora_rank, lora_alpha in lora_list:
-            lora_A_full = lora_A.to(device=data_2d.device, dtype=torch.bfloat16)
-            lora_B_full = lora_B.to(device=data_2d.device, dtype=torch.bfloat16)
-            scale = lora_strength
-            if (
-                lora_alpha is not None
-                and lora_rank is not None
-                and lora_alpha != lora_rank
-            ):
-                scale *= lora_alpha / lora_rank
-            full_deltas.add_(lora_B_full @ lora_A_full, alpha=scale)
-
-        fused_add_round_fp8_cast_(
-            full_deltas.reshape(-1), full_weight.reshape(-1), seed=0
-        )
-        col_start = (
-            self.base_layer.tp_rank * self.base_layer.input_size_per_partition
-        )
-        col_end = col_start + self.base_layer.input_size_per_partition
-        data_2d.copy_(
-            full_deltas[:, col_start:col_end].contiguous().to(dtype=data_2d.dtype)
-        )
-        return True
 
 
 class LinearWithLoRA(BaseLayerWithLoRA):
