@@ -502,6 +502,7 @@ jobs:
         run: |
           CUSTOM_BUILD_SGL_KERNEL="${{ inputs.kernel_artifact_run_id != '' && 'true' || 'false' }}" \
             bash scripts/ci/cuda/ci_install_dependency.sh diffusion
+          python3 -m pip install nunchaku
 
       - name: Generate outputs
         env:

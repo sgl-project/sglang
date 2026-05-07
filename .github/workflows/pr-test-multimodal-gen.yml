@@ -326,6 +326,7 @@ jobs:
         timeout-minutes: 20
         run: |
           CUSTOM_BUILD_SGL_KERNEL=${{inputs.sgl_kernel}} bash scripts/ci/cuda/ci_install_dependency.sh diffusion
+          python3 -m pip install nunchaku
 
       - name: Run diffusion server tests
         timeout-minutes: 240

@@ -5,12 +5,12 @@ Usage:
 
 pytest python/sglang/multimodal_gen/test/server/test_server_1_gpu.py
 # for a single testcase, look for the name of the testcase in ONE_GPU_CASES,
-# ONE_GPU_MODELOPT_CASES, or TWO_GPU_CASES
+# ONE_GPU_MODELOPT_FP8_CASES, ONE_GPU_B200_CASES, or TWO_GPU_CASES
 pytest python/sglang/multimodal_gen/test/server/test_server_1_gpu.py -k qwen_image_t2i
 
 
 To add a new testcase:
-1. add your testcase with case-id: `my_new_test_case_id` to `ONE_GPU_CASES`, `ONE_GPU_MODELOPT_CASES`, or `TWO_GPU_CASES`
+1. add your testcase with case-id: `my_new_test_case_id` to `ONE_GPU_CASES`, `ONE_GPU_MODELOPT_FP8_CASES`, `ONE_GPU_B200_CASES`, or `TWO_GPU_CASES`
 2. run `SGLANG_GEN_BASELINE=1 pytest -s python/sglang/multimodal_gen/test/server/ -k my_new_test_case_id`
 3. insert or override the corresponding scenario in `scenarios` section of perf_baselines.json with the output baseline of step-2
 
@@ -455,6 +455,10 @@ MODELOPT_WAN22_NVFP4_TRANSFORMER = (
     "lmsys/wan22-t2v-a14b-modelopt-nvfp4-sglang-transformer"
 )
 MODELOPT_NVFP4_B200_ENV_VARS = {"SGLANG_DIFFUSION_FLASHINFER_FP4_GEMM_BACKEND": "cudnn"}
+NUNCHAKU_QWEN_IMAGE_LIGHTNING_FP4_WEIGHTS = (
+    "nunchaku-ai/nunchaku-qwen-image/"
+    "svdq-fp4_r32-qwen-image-lightningv1.0-4steps.safetensors"
+)
 
 
 def _make_modelopt_ci_case(

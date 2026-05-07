@@ -2,6 +2,8 @@
 This unittest is introduced in #22360, preventing duplicate transformer safetensors variants being loaded together
 """
 
+# ruff: noqa: E402
+
 import json
 import sys
 import tempfile
@@ -43,6 +45,7 @@ sys.modules.setdefault(
 )
 sys.modules.setdefault("partial_json_parser.core.options", partial_json_parser_options)
 
+from sglang.multimodal_gen.configs.quantization.nunchaku import NunchakuSVDQuantArgs
 from sglang.multimodal_gen.runtime.layers.linear import UnquantizedLinearMethod
 from sglang.multimodal_gen.runtime.layers.quantization.configs.nunchaku_config import (
     NunchakuConfig,
@@ -99,6 +102,53 @@ class TestTransformerQuantHelpers(unittest.TestCase):
             )
 
         self.assertEqual(resolved, [f.name])
+
+    @patch(
+        "sglang.multimodal_gen.configs.quantization.nunchaku.is_nunchaku_available",
+        return_value=True,
+    )
+    @patch(
+        "sglang.multimodal_gen.configs.quantization.nunchaku.torch.cuda.get_device_capability",
+        return_value=(10, 0),
+    )
+    @patch(
+        "sglang.multimodal_gen.configs.quantization.nunchaku.torch.cuda.device_count",
+        return_value=1,
+    )
+    @patch("sglang.multimodal_gen.configs.quantization.nunchaku.current_platform")
+    def test_nunchaku_validation_allows_b200_sm100(
+        self, mock_platform, _mock_device_count, _mock_capability, _mock_available
+    ):
+        mock_platform.is_cuda.return_value = True
+
+        NunchakuSVDQuantArgs(
+            enable_svdquant=True,
+            transformer_weights_path="/tmp/svdq-fp4_r32.safetensors",
+        )._validate()
+
+    @patch(
+        "sglang.multimodal_gen.configs.quantization.nunchaku.is_nunchaku_available",
+        return_value=True,
+    )
+    @patch(
+        "sglang.multimodal_gen.configs.quantization.nunchaku.torch.cuda.get_device_capability",
+        return_value=(9, 0),
+    )
+    @patch(
+        "sglang.multimodal_gen.configs.quantization.nunchaku.torch.cuda.device_count",
+        return_value=1,
+    )
+    @patch("sglang.multimodal_gen.configs.quantization.nunchaku.current_platform")
+    def test_nunchaku_validation_rejects_hopper_sm90(
+        self, mock_platform, _mock_device_count, _mock_capability, _mock_available
+    ):
+        mock_platform.is_cuda.return_value = True
+
+        with self.assertRaisesRegex(ValueError, "SM90"):
+            NunchakuSVDQuantArgs(
+                enable_svdquant=True,
+                transformer_weights_path="/tmp/svdq-fp4_r32.safetensors",
+            )._validate()
 
     @patch(
         "sglang.multimodal_gen.runtime.loader.transformer_load_utils.maybe_download_model",
