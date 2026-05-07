@@ -26,7 +26,9 @@ from sglang.multimodal_gen.runtime.layers.linear import (
 from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
     apply_flashinfer_rope_qk_inplace,
 )
-from sglang.multimodal_gen.runtime.managers.layerwise_offload import OffloadableDiTMixin
+from sglang.multimodal_gen.runtime.managers.layerwise_offload import (
+    LayerwiseOffloadableModuleMixin,
+)
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
@@ -397,7 +399,7 @@ class ConditionalCrossAttentionBlock(nn.Module):
 
 class DualTowerConditionalBridge(
     CachableDiT,
-    OffloadableDiTMixin,
+    LayerwiseOffloadableModuleMixin,
 ):
     """Dual-tower conditional bridge module v2 (SGLang optimized version).
 
@@ -476,24 +478,24 @@ class DualTowerConditionalBridge(
 
         # Audio DiT hidden states conditioning Video DiT
         for v_layer, _ in self.interaction_mapping["a2v"]:
-            self.audio_to_video_conditioners[str(v_layer)] = (
-                ConditionalCrossAttentionBlock(
-                    dim=visual_hidden_dim,
-                    kv_dim=audio_hidden_dim,
-                    num_heads=visual_hidden_dim // head_dim,
-                    pooled_adaln=False,
-                )
+            self.audio_to_video_conditioners[
+                str(v_layer)
+            ] = ConditionalCrossAttentionBlock(
+                dim=visual_hidden_dim,
+                kv_dim=audio_hidden_dim,
+                num_heads=visual_hidden_dim // head_dim,
+                pooled_adaln=False,
             )
 
         # Visual DiT hidden states conditioning Audio DiT
         for a_layer, _ in self.interaction_mapping["v2a"]:
-            self.video_to_audio_conditioners[str(a_layer)] = (
-                ConditionalCrossAttentionBlock(
-                    dim=audio_hidden_dim,
-                    kv_dim=visual_hidden_dim,
-                    num_heads=audio_hidden_dim // head_dim,
-                    pooled_adaln=self.pooled_adaln,
-                )
+            self.video_to_audio_conditioners[
+                str(a_layer)
+            ] = ConditionalCrossAttentionBlock(
+                dim=audio_hidden_dim,
+                kv_dim=visual_hidden_dim,
+                num_heads=audio_hidden_dim // head_dim,
+                pooled_adaln=self.pooled_adaln,
             )
 
         # Required attributes for CachableDiT/BaseDiT

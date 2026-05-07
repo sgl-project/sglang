@@ -45,7 +45,9 @@ from sglang.multimodal_gen.runtime.layers.quantization.configs.nunchaku_config i
 from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
     apply_flashinfer_rope_qk_inplace,
 )
-from sglang.multimodal_gen.runtime.managers.layerwise_offload import OffloadableDiTMixin
+from sglang.multimodal_gen.runtime.managers.layerwise_offload import (
+    LayerwiseOffloadableModuleMixin,
+)
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
 from sglang.multimodal_gen.runtime.platforms import (
     AttentionBackendEnum,
@@ -656,9 +658,14 @@ class QwenImageCrossAttention(nn.Module):
             "encoder_hidden_states_mask"
         )
 
-        img_query, img_key, img_value, txt_query, txt_key, txt_value = (
-            _get_qkv_projections(self, hidden_states, encoder_hidden_states)
-        )
+        (
+            img_query,
+            img_key,
+            img_value,
+            txt_query,
+            txt_key,
+            txt_value,
+        ) = _get_qkv_projections(self, hidden_states, encoder_hidden_states)
 
         # Reshape for multi-head attention
         img_query = img_query.unflatten(-1, (self.num_heads, -1))
@@ -966,22 +973,24 @@ class QwenImageTransformerBlock(nn.Module):
                         residual_x = residual_x.contiguous()
                     if not gate_x.is_contiguous():
                         gate_x = gate_x.contiguous()
-                    x, residual_out, gate_result = (
-                        fuse_residual_layernorm_scale_shift_gate_select01_kernel(
-                            x,
-                            residual=residual_x,
-                            residual_gate=gate_x,
-                            weight=getattr(norm_module.norm, "weight", None),
-                            bias=getattr(norm_module.norm, "bias", None),
-                            scale0=scale0.contiguous(),
-                            shift0=shift0.contiguous(),
-                            gate0=gate0.contiguous(),
-                            scale1=scale1.contiguous(),
-                            shift1=shift1.contiguous(),
-                            gate1=gate1.contiguous(),
-                            index=index,
-                            eps=norm_module.eps,
-                        )
+                    (
+                        x,
+                        residual_out,
+                        gate_result,
+                    ) = fuse_residual_layernorm_scale_shift_gate_select01_kernel(
+                        x,
+                        residual=residual_x,
+                        residual_gate=gate_x,
+                        weight=getattr(norm_module.norm, "weight", None),
+                        bias=getattr(norm_module.norm, "bias", None),
+                        scale0=scale0.contiguous(),
+                        shift0=shift0.contiguous(),
+                        gate0=gate0.contiguous(),
+                        scale1=scale1.contiguous(),
+                        shift1=shift1.contiguous(),
+                        gate1=gate1.contiguous(),
+                        index=index,
+                        eps=norm_module.eps,
                     )
                     return x, residual_out, gate_result
                 else:
@@ -1153,7 +1162,7 @@ def to_hashable(obj):
     return obj
 
 
-class QwenImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
+class QwenImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
     """
     The Transformer model introduced in Qwen.
 

@@ -41,7 +41,9 @@ from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
     _apply_rotary_emb,
     apply_flashinfer_rope_qk_inplace,
 )
-from sglang.multimodal_gen.runtime.managers.layerwise_offload import OffloadableDiTMixin
+from sglang.multimodal_gen.runtime.managers.layerwise_offload import (
+    LayerwiseOffloadableModuleMixin,
+)
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
@@ -589,7 +591,7 @@ class RopeEmbedder:
         return torch.cat(cos_out, dim=-1), torch.cat(sin_out, dim=-1)
 
 
-class ZImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
+class ZImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
     _supports_gradient_checkpointing = True
     _no_split_modules = ["ZImageTransformerBlock"]
     _fsdp_shard_conditions = ZImageDitConfig().arch_config._fsdp_shard_conditions
@@ -919,13 +921,7 @@ class ZImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
         device = x[0].device
         t = self.t_embedder(t)
         adaln_input = t.to(dtype=x[0].dtype)
-        (
-            x,
-            cap_feats,
-            x_size,
-            x_valid_lens,
-            cap_valid_lens,
-        ) = self.patchify_and_embed(
+        (x, cap_feats, x_size, x_valid_lens, cap_valid_lens,) = self.patchify_and_embed(
             x,
             cap_feats,
             patch_size,

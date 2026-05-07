@@ -467,7 +467,7 @@ class LayerwiseOffloadManager:
         if not self.enabled:
             return
 
-        layers = getattr(self.model, self.layers_attr_str)
+        layers = dict(self.model.named_children())[self.layers_attr_str]
 
         def make_pre_hook(i):
             def hook(module, input):
@@ -509,21 +509,19 @@ class LayerwiseOffloadManager:
         self._forward_hooks.clear()
 
 
-class OffloadableDiTMixin:
-    """
-    A mixin that registers forward hooks for a DiT to enable layerwise offload
-    """
+class LayerwiseOffloadableModuleMixin:
+    """A mixin that registers forward hooks to enable layerwise offload."""
 
-    # the list of names of a DiT's layers/blocks
+    # The list of names of this module's layer/block ModuleList attributes.
     layer_names: List[str]
     layerwise_offload_managers: list[LayerwiseOffloadManager] = []
 
     def configure_layerwise_offload(self, server_args: ServerArgs):
         self.layerwise_offload_managers = []
+        child_modules = dict(self.named_children())
         for layer_name in self.layer_names:
-            # a manager per layer-list
-            module_list = getattr(self, layer_name, None)
-            if module_list is None or not isinstance(module_list, torch.nn.ModuleList):
+            module_list = child_modules.get(layer_name)
+            if not isinstance(module_list, torch.nn.ModuleList):
                 continue
 
             num_layers = len(module_list)
@@ -583,7 +581,7 @@ def iter_materialized_weights(module: torch.nn.Module):
     the non-offloaded parameters.
     """
     offload_managers: list = []
-    if isinstance(module, OffloadableDiTMixin) and module.layerwise_offload_managers:
+    if is_layerwise_offloaded_module(module):
         offload_managers = [m for m in module.layerwise_offload_managers if m.enabled]
 
     if not offload_managers:
@@ -601,3 +599,11 @@ def iter_materialized_weights(module: torch.nn.Module):
     for name, param in module.named_parameters():
         if name not in offloaded_names:
             yield name, param
+
+
+def is_layerwise_offloaded_module(module: torch.nn.Module) -> bool:
+    return (
+        isinstance(module, LayerwiseOffloadableModuleMixin)
+        and bool(module.layerwise_offload_managers)
+        and any(manager.enabled for manager in module.layerwise_offload_managers)
+    )

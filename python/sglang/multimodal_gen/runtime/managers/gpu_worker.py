@@ -38,7 +38,7 @@ from sglang.multimodal_gen.runtime.loader.weights_updater import (
     get_updatable_modules,
 )
 from sglang.multimodal_gen.runtime.managers.layerwise_offload import (
-    OffloadableDiTMixin,
+    LayerwiseOffloadableModuleMixin,
     iter_materialized_weights,
 )
 from sglang.multimodal_gen.runtime.pipelines_core import (
@@ -170,13 +170,13 @@ class GPUWorker:
                 "video_dit_2",
                 "audio_dit",
             ]:
-                dit = self.pipeline.get_module(module_name)
-                if dit:
-                    if isinstance(dit, OffloadableDiTMixin):
-                        dit.configure_layerwise_offload(self.server_args)
+                module = self.pipeline.get_module(module_name)
+                if module:
+                    if isinstance(module, LayerwiseOffloadableModuleMixin):
+                        module.configure_layerwise_offload(self.server_args)
                     else:
                         logger.info(
-                            f"Module {type(dit).__name__} does not support layerwise offload. Skipping."
+                            f"Module {type(module).__name__} does not support layerwise offload. Skipping."
                         )
 
         logger.info(

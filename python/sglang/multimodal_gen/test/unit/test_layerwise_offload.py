@@ -9,11 +9,21 @@ from sglang.multimodal_gen.runtime.layers.quantization.modelopt_quant import (
 from sglang.multimodal_gen.runtime.loader.transformer_load_utils import (
     _ModelOptFp8OffloadAdapter,
 )
+from sglang.multimodal_gen.runtime.managers.component_manager import (
+    build_component_residency_strategy,
+)
+from sglang.multimodal_gen.runtime.managers.component_resident_strategies import (
+    LayerwiseOffloadStrategy,
+    ResidentStrategy,
+    VanillaD2HStrategy,
+)
 from sglang.multimodal_gen.runtime.managers import (
     layerwise_offload as layerwise_offload_mod,
 )
 from sglang.multimodal_gen.runtime.managers.layerwise_offload import (
+    LayerwiseOffloadableModuleMixin,
     LayerwiseOffloadManager,
+    is_layerwise_offloaded_module,
 )
 
 
@@ -63,6 +73,27 @@ class _DummyModel(torch.nn.Module):
     def __init__(self) -> None:
         super().__init__()
         self.blocks = torch.nn.ModuleList([_DummyBlock()])
+
+
+class _LayerwiseComponent(torch.nn.Module, LayerwiseOffloadableModuleMixin):
+    layer_names = ["blocks"]
+
+    def __init__(self, enabled: bool) -> None:
+        super().__init__()
+        self.blocks = torch.nn.ModuleList([_DummyBlock()])
+        self.layerwise_offload_managers = [SimpleNamespace(enabled=enabled)]
+
+
+def _server_args(**kwargs):
+    defaults = dict(
+        use_fsdp_inference=False,
+        dit_cpu_offload=False,
+        text_encoder_cpu_offload=False,
+        image_encoder_cpu_offload=False,
+        vae_cpu_offload=False,
+    )
+    defaults.update(kwargs)
+    return SimpleNamespace(**defaults)
 
 
 def test_layerwise_offload_preserves_non_contiguous_stride(monkeypatch):
@@ -117,6 +148,29 @@ def test_modelopt_fp8_adapter_keeps_layerwise_offload_enabled():
 
     assert server_args.dit_cpu_offload is False
     assert server_args.dit_layerwise_offload is True
+
+
+def test_layerwise_capability_selects_layerwise_strategy_for_any_component():
+    module = _LayerwiseComponent(enabled=True)
+
+    assert is_layerwise_offloaded_module(module)
+    strategy = build_component_residency_strategy(
+        "text_encoder", module, _server_args(text_encoder_cpu_offload=True)
+    )
+
+    assert isinstance(strategy, LayerwiseOffloadStrategy)
+
+
+def test_component_cpu_offload_strategy_remains_flag_driven():
+    strategy = build_component_residency_strategy(
+        "text_encoder", _DummyModel(), _server_args(text_encoder_cpu_offload=True)
+    )
+    assert isinstance(strategy, VanillaD2HStrategy)
+
+    strategy = build_component_residency_strategy(
+        "unknown_component", _DummyModel(), _server_args(text_encoder_cpu_offload=True)
+    )
+    assert isinstance(strategy, ResidentStrategy)
 
 
 def test_layerwise_offload_aligns_contiguous_tensor_offsets(monkeypatch):

@@ -27,7 +27,9 @@ from sglang.multimodal_gen.runtime.layers.linear import (
     RowParallelLinear,
 )
 from sglang.multimodal_gen.runtime.layers.mlp import MLP
-from sglang.multimodal_gen.runtime.managers.layerwise_offload import OffloadableDiTMixin
+from sglang.multimodal_gen.runtime.managers.layerwise_offload import (
+    LayerwiseOffloadableModuleMixin,
+)
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
@@ -453,7 +455,7 @@ class _FluxLastLayer(nn.Module):
         return x
 
 
-class Hunyuan3D2DiT(CachableDiT, OffloadableDiTMixin):
+class Hunyuan3D2DiT(CachableDiT, LayerwiseOffloadableModuleMixin):
     """Hunyuan3D DiT model (Flux-style architecture for Hunyuan3D-2.0)."""
 
     _aliases = ["hy3dgen.shapegen.models.Hunyuan3DDiT"]
@@ -560,7 +562,7 @@ class Hunyuan3D2DiT(CachableDiT, OffloadableDiTMixin):
 
         self.final_layer = _FluxLastLayer(self.hidden_size, 1, self.out_channels)
 
-        # OffloadableDiTMixin
+        # LayerwiseOffloadableModuleMixin
         self.layer_names = ["double_blocks", "single_blocks"]
 
     def forward(
@@ -1226,12 +1228,12 @@ class UNet2p5DConditionModel(torch.nn.Module):
                         attn.transformer_blocks
                     ):
                         if isinstance(transformer, BasicTransformerBlock):
-                            attn.transformer_blocks[transformer_i] = (
-                                Basic2p5DTransformerBlock(
-                                    transformer,
-                                    f"down_{down_block_i}_{attn_i}_{transformer_i}",
-                                    **block_kwargs,
-                                )
+                            attn.transformer_blocks[
+                                transformer_i
+                            ] = Basic2p5DTransformerBlock(
+                                transformer,
+                                f"down_{down_block_i}_{attn_i}_{transformer_i}",
+                                **block_kwargs,
                             )
 
         # Mid block
@@ -1242,12 +1244,12 @@ class UNet2p5DConditionModel(torch.nn.Module):
             for attn_i, attn in enumerate(unet.mid_block.attentions):
                 for transformer_i, transformer in enumerate(attn.transformer_blocks):
                     if isinstance(transformer, BasicTransformerBlock):
-                        attn.transformer_blocks[transformer_i] = (
-                            Basic2p5DTransformerBlock(
-                                transformer,
-                                f"mid_{attn_i}_{transformer_i}",
-                                **block_kwargs,
-                            )
+                        attn.transformer_blocks[
+                            transformer_i
+                        ] = Basic2p5DTransformerBlock(
+                            transformer,
+                            f"mid_{attn_i}_{transformer_i}",
+                            **block_kwargs,
                         )
 
         # Up blocks
@@ -1261,12 +1263,12 @@ class UNet2p5DConditionModel(torch.nn.Module):
                         attn.transformer_blocks
                     ):
                         if isinstance(transformer, BasicTransformerBlock):
-                            attn.transformer_blocks[transformer_i] = (
-                                Basic2p5DTransformerBlock(
-                                    transformer,
-                                    f"up_{up_block_i}_{attn_i}_{transformer_i}",
-                                    **block_kwargs,
-                                )
+                            attn.transformer_blocks[
+                                transformer_i
+                            ] = Basic2p5DTransformerBlock(
+                                transformer,
+                                f"up_{up_block_i}_{attn_i}_{transformer_i}",
+                                **block_kwargs,
                             )
 
         if use_sglang_attn and (use_ma or use_ra):
