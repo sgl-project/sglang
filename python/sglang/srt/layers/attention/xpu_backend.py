@@ -14,7 +14,6 @@ from sglang.srt.layers.attention.flashattention_backend import (
 )
 from sglang.srt.managers.schedule_batch import get_global_server_args
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
-from sglang.srt.utils import get_device_core_count
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -53,6 +52,12 @@ class XPUAttentionBackend(AttentionBackend):
         # extra metadata for handling speculative decoding topk > 1, extended draft decode and verify
         self.forward_metadata_spec_decode_expand: FlashAttentionMetadata = None
         self.max_context_len = model_runner.model_config.context_len
+        self.num_attention_heads = (
+            model_runner.model_config.hf_text_config.num_attention_heads
+        )
+        self.tp_size = model_runner.tp_size
+        assert self.num_attention_heads % self.tp_size == 0
+        self.num_local_heads = self.num_attention_heads // self.tp_size
         self.device = model_runner.device
         self.decode_cuda_graph_metadata = {}
         self.target_verify_metadata = {}
@@ -366,9 +371,10 @@ class XPUAttentionBackend(AttentionBackend):
 
         if self.use_mla:
             workspace_size = flash_mla_get_workspace_size(
-                self.max_context_len,
-                batch_size,
-                sm_count=get_device_core_count(),
+                max_seq_len=self.max_context_len,
+                num_batches=batch_size,
+                num_heads=self.num_local_heads,
+                page_size=self.page_size,
                 num_kv_splits=-1,
             )
             if (

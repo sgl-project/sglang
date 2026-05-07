@@ -726,6 +726,7 @@ Router flags map to these values:
 - `--redis-retention-days` (env: `REDIS_RETENTION_DAYS`). Set to `-1` for persistent storage (default: 30 days).
 
 ## Reliability & Flow Control
+- **HTTP Client Pool**: Upstream HTTP connection pool idle timeout defaults to 50 seconds. Configure via `--pool-idle-timeout-secs` or `SMG_POOL_IDLE_TIMEOUT_SECS`.
 - **Retries**: Default max retries = 5 with exponential backoff (`--retry-max-retries`, `--retry-initial-backoff-ms`, `--retry-max-backoff-ms`, `--retry-backoff-multiplier`, `--retry-jitter-factor`). Retries trigger on 408/429/500/502/503/504.
 - **Circuit Breakers**: Per worker thresholds (`--cb-failure-threshold`, `--cb-success-threshold`, `--cb-timeout-duration-secs`, `--cb-window-duration-secs`). Disable via `--disable-circuit-breaker`.
 - **Rate Limiting**: Token bucket driven by `--max-concurrent-requests`. Set `--rate-limit-tokens-per-second` to override refill rate. Configure request queue via `--queue-size` and `--queue-timeout-secs`; queued requests observe FIFO order and respect cancellation.
