@@ -58,6 +58,9 @@ class OutlinesGrammar(BaseGrammarObject):
     ) -> torch.Tensor:
         return torch.zeros(batch_size, vocab_size, dtype=torch.bool, device=device)
 
+    def reset_vocab_mask(self, vocab_mask: torch.Tensor) -> None:
+        vocab_mask.fill_(False)
+
     @staticmethod
     def move_vocab_mask(vocab_mask: torch.Tensor, device) -> torch.Tensor:
         return vocab_mask

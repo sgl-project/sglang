@@ -74,6 +74,9 @@ class ReasonerGrammarObject(BaseGrammarObject):
         if self.tokens_after_think_end >= 0:
             self.grammar.fill_vocab_mask(vocab_mask, idx)
 
+    def reset_vocab_mask(self, vocab_mask: torch.Tensor) -> None:
+        self.grammar.reset_vocab_mask(vocab_mask)
+
     def move_vocab_mask(self, vocab_mask: torch.Tensor, device) -> torch.Tensor:
         return self.grammar.move_vocab_mask(vocab_mask, device)
 
@@ -120,5 +123,6 @@ class ReasonerGrammarBackend(BaseGrammarBackend):
         if ret is None or isinstance(ret, InvalidGrammarObject):
             return ret
         obj = ReasonerGrammarObject(ret, self.think_end_id)
+        obj.set_reusable_vocab_mask_cache(self.reusable_vocab_mask_cache)
         obj.maybe_init_reasoning(reasoning)
         return obj

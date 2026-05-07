@@ -27,6 +27,7 @@ from xgrammar import (
     StructuralTagItem,
     TokenizerInfo,
     allocate_token_bitmask,
+    reset_token_bitmask,
 )
 
 from sglang.srt.constrained.base_grammar_backend import (
@@ -102,6 +103,9 @@ class XGrammarGrammar(BaseGrammarObject):
 
     def fill_vocab_mask(self, vocab_mask: torch.Tensor, idx: int) -> None:
         self.matcher.fill_next_token_bitmask(vocab_mask, idx)
+
+    def reset_vocab_mask(self, vocab_mask: torch.Tensor) -> None:
+        reset_token_bitmask(vocab_mask)
 
     @staticmethod
     def move_vocab_mask(vocab_mask: torch.Tensor, device) -> torch.Tensor:

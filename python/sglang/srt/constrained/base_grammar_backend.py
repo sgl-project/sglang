@@ -38,12 +38,64 @@ class GrammarStats:
     num_timeout: int = 0
 
 
+class _ReusableVocabMaskCache:
+    """Backend-shared reusable storage for grammar vocab masks."""
+
+    def __init__(self):
+        self.mask: Optional[torch.Tensor] = None
+        self.capacity = 0
+        self.vocab_size: Optional[int] = None
+        self.device_key: Optional[str] = None
+
+    def allocate(
+        self,
+        grammar: "BaseGrammarObject",
+        vocab_size: int,
+        batch_size: int,
+        device: str,
+    ) -> torch.Tensor:
+        assert isinstance(
+            device, str
+        ), f"Expected device to be a string, got {device!r}"
+        if (
+            self.mask is not None
+            and self.capacity >= batch_size
+            and self.vocab_size == vocab_size
+            and self.device_key == device
+        ):
+            prefix = self.mask[:batch_size]
+            grammar.reset_vocab_mask(prefix)
+            return prefix
+
+        new_capacity = max(batch_size, 1)
+        mask = grammar.allocate_vocab_mask(
+            vocab_size=vocab_size,
+            batch_size=new_capacity,
+            device=device,
+        )
+        assert mask.shape[0] >= batch_size
+
+        self.mask = mask
+        self.capacity = mask.shape[0]
+        self.vocab_size = vocab_size
+        self.device_key = device
+
+        return mask[:batch_size]
+
+    def clear(self) -> None:
+        self.mask = None
+        self.capacity = 0
+        self.vocab_size = None
+        self.device_key = None
+
+
 class BaseGrammarObject:
 
     def __init__(self):
         self._finished = False
         self.grammar_stats = None
         self.current_token = None
+        self._reusable_vocab_mask_cache: Optional[_ReusableVocabMaskCache] = None
 
     def maybe_init_reasoning(self, reasoning: bool):
         pass
@@ -65,7 +117,25 @@ class BaseGrammarObject:
     ) -> torch.Tensor:
         raise NotImplementedError()
 
+    def allocate_reusable_vocab_mask(
+        self, vocab_size: int, batch_size: int, device: str
+    ) -> torch.Tensor:
+        cache = self._reusable_vocab_mask_cache
+        assert cache is not None, "Reusable vocab mask cache is not attached"
+        return cache.allocate(
+            self,
+            vocab_size=vocab_size,
+            batch_size=batch_size,
+            device=device,
+        )
+
+    def set_reusable_vocab_mask_cache(self, cache: _ReusableVocabMaskCache) -> None:
+        self._reusable_vocab_mask_cache = cache
+
     def fill_vocab_mask(self, vocab_mask: torch.Tensor, idx: int) -> None:
+        raise NotImplementedError()
+
+    def reset_vocab_mask(self, vocab_mask: torch.Tensor) -> None:
         raise NotImplementedError()
 
     @staticmethod
@@ -131,6 +201,7 @@ class BaseGrammarBackend:
     def __init__(self):
         self.executor = ThreadPoolExecutor()
         self.cache: Dict[Tuple[str, str], BaseGrammarObject] = {}
+        self.reusable_vocab_mask_cache = _ReusableVocabMaskCache()
 
     def _not_supported(self, key_type: str, key_string: str) -> BaseGrammarObject:
         logger.warning(f"Skip unsupported {key_type=}, {key_string=}")
@@ -172,6 +243,8 @@ class BaseGrammarBackend:
 
         if grammar is not None and grammar.grammar_stats is not None:
             grammar.grammar_stats.compilation_time = time.perf_counter() - s
+        if grammar is not None:
+            grammar.set_reusable_vocab_mask_cache(self.reusable_vocab_mask_cache)
         return grammar
 
     def get_cached_or_future_value(
@@ -180,16 +253,19 @@ class BaseGrammarBackend:
         value = self.cache.get(key)
         if value:
             copied_value = value.copy()
+            copied_value.set_reusable_vocab_mask_cache(self.reusable_vocab_mask_cache)
             copied_value.maybe_init_reasoning(require_reasoning)
             return copied_value, True
         value = self.executor.submit(self._init_value_dispatch, key, require_reasoning)
         return value, False
 
     def set_cache(self, key: Tuple[str, str], value: BaseGrammarObject):
+        value.set_reusable_vocab_mask_cache(self.reusable_vocab_mask_cache)
         self.cache[key] = value
 
     def reset(self):
         self.cache.clear()
+        self.reusable_vocab_mask_cache.clear()
 
 
 GRAMMAR_BACKEND_REGISTRY = {}

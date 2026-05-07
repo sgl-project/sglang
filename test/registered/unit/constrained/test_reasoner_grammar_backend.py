@@ -15,6 +15,8 @@ Usage:
 import unittest
 from unittest.mock import MagicMock, call
 
+import torch
+
 from sglang.srt.constrained.base_grammar_backend import (
     BaseGrammarBackend,
     BaseGrammarObject,
@@ -256,6 +258,37 @@ class TestReasonerGrammarObjectVocabMask(unittest.TestCase):
         obj.allocate_vocab_mask(32000, 4, "cpu")
         grammar.allocate_vocab_mask.assert_called_once_with(32000, 4, "cpu")
 
+    def test_reset_delegates(self):
+        obj, grammar = self._make()
+        obj.reset_vocab_mask("mask")
+        grammar.reset_vocab_mask.assert_called_once_with("mask")
+
+    def test_allocate_reusable_uses_wrapper_cache_and_inner_reset(self):
+        backend = BaseGrammarBackend()
+        self.addCleanup(backend.executor.shutdown, wait=True)
+        obj, grammar = self._make()
+        obj.set_reusable_vocab_mask_cache(backend.reusable_vocab_mask_cache)
+
+        def allocate_vocab_mask(vocab_size, batch_size, device):
+            return torch.full(
+                (batch_size, vocab_size), -1, dtype=torch.int32, device=device
+            )
+
+        def reset_vocab_mask(vocab_mask):
+            vocab_mask.fill_(-1)
+
+        grammar.allocate_vocab_mask.side_effect = allocate_vocab_mask
+        grammar.reset_vocab_mask.side_effect = reset_vocab_mask
+
+        first = obj.allocate_reusable_vocab_mask(8, 2, "cpu")
+        first.fill_(123)
+        second = obj.allocate_reusable_vocab_mask(8, 1, "cpu")
+
+        grammar.allocate_vocab_mask.assert_called_once_with(8, 2, "cpu")
+        grammar.reset_vocab_mask.assert_called_once()
+        self.assertEqual(second.data_ptr(), first.data_ptr())
+        self.assertTrue(torch.all(second == -1))
+
     def test_move_delegates(self):
         obj, grammar = self._make()
         obj.move_vocab_mask("mask", "cuda")
@@ -374,6 +407,18 @@ class TestReasonerGrammarBackend(unittest.TestCase):
         self.assertIsInstance(result, ReasonerGrammarObject)
         self.assertIs(result.grammar, mock_grammar)
         self.assertEqual(result.think_end_id, THINK_END_ID)
+
+    def test_wrapped_grammar_receives_reasoner_reusable_mask_cache(self):
+        backend, inner = self._make()
+        mock_grammar = MagicMock(spec=BaseGrammarObject)
+        inner._init_value_dispatch.return_value = mock_grammar
+
+        result = backend._init_value_dispatch(("json", "schema"), True)
+
+        self.assertIs(
+            result._reusable_vocab_mask_cache,
+            backend.reusable_vocab_mask_cache,
+        )
 
     def test_passes_through_invalid_grammar(self):
         backend, inner = self._make()

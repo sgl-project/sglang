@@ -214,8 +214,7 @@ class SamplingBatchInfo:
         # Find a grammar from the list
         first_grammar = next(grammar for grammar in self.grammars if grammar)
 
-        # TODO(lianmin): Maybe we can reuse the existing mask?
-        self.vocab_mask = first_grammar.allocate_vocab_mask(
+        self.vocab_mask = first_grammar.allocate_reusable_vocab_mask(
             vocab_size=self.vocab_size,
             batch_size=len(self.temperatures),
             device=self.device,
