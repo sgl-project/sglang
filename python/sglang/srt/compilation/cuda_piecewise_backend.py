@@ -169,9 +169,32 @@ class CUDAPiecewiseBackend:
                     stack.enter_context(patch("torch.cuda.empty_cache", lambda: None))
                 # mind-exploding: carefully manage the reference and memory.
                 stream = get_pcg_capture_stream()
-                assert (
-                    stream is not None
-                ), "PCG capture stream is not set, please check if runtime recompilation happened"
+                if stream is None:
+                    # This typically means a dynamo recompile happened at runtime
+                    # (e.g. an Optional[Tensor] kwarg flipped from None to a real
+                    # tensor for multimodal requests). We are now outside
+                    # ``PiecewiseCudaGraphRunner.capture()`` so we cannot safely
+                    # capture a new cudagraph here. Fall back to the compiled
+                    # (non-cudagraph) path and mark this entry so we skip the
+                    # capture attempt next time.
+                    if not getattr(
+                        self, "_warned_runtime_recompile", False
+                    ):
+                        logger.warning(
+                            "PCG capture stream is not set for runtime_shape=%d. "
+                            "This usually indicates a runtime recompilation "
+                            "(e.g. an Optional[Tensor] kwarg like "
+                            "input_deepstack_embeds changed type between warmup "
+                            "and runtime). Falling back to the compiled graph "
+                            "without cudagraph replay for this shape. "
+                            "Consider aligning warmup kwargs with runtime or "
+                            "running without --enforce-piecewise-cuda-graph.",
+                            runtime_shape,
+                        )
+                        self._warned_runtime_recompile = True
+                    entry.use_cudagraph = False
+                    entry.cudagraph = None
+                    return entry.runnable(*args)
                 with torch.cuda.graph(cudagraph, pool=self.graph_pool, stream=stream):
                     # `output` is managed by pytorch's cudagraph pool
                     output = entry.runnable(*args)
