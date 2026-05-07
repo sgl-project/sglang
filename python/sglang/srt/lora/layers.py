@@ -629,7 +629,8 @@ class QKVParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
         kv_start_idx = kv_proj_shard_size * kv_shard_id
         kv_end_idx = kv_start_idx + kv_proj_shard_size
 
-        q_size, k_size, _ = base_layer.output_sizes
+        q_size = base_layer.output_sizes[0]
+        k_size = base_layer.output_sizes[1] // num_kv_head_replicas
         B_q_shard = B[q_start_idx:q_end_idx, :]
         B_k_shard = B[q_size + kv_start_idx : q_size + kv_end_idx, :]
         B_v_shard = B[q_size + k_size + kv_start_idx : q_size + k_size + kv_end_idx, :]
