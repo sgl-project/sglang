@@ -2314,14 +2314,14 @@ def clean_and_force_maintain_logits_decode_triton(
     num_pool_blocks_per_req: torch.Tensor,  # [B] i32
 ) -> torch.Tensor:
     """Decode-specific clean + force_maintain in a single kernel:
-      * positions ``>= num_pool_blocks_per_req[b]`` per row -> ``-inf``
-        (mask out logits past the per-row valid range; replaces DG's
-        ``clean_logits=True`` which is incompatible with 2D context_lens
-        on SM90)
-      * pos 0 and pos ``num_pool_blocks_per_req[b] - 1`` per row -> ``+inf``
-        (sentinel for downstream radix select). ``ks`` is implicitly 0 —
-        for paged decode, every request's pool blocks start at logical
-        index 0 in its own pool_page_table.
+    * positions ``>= num_pool_blocks_per_req[b]`` per row -> ``-inf``
+      (mask out logits past the per-row valid range; replaces DG's
+      ``clean_logits=True`` which is incompatible with 2D context_lens
+      on SM90)
+    * pos 0 and pos ``num_pool_blocks_per_req[b] - 1`` per row -> ``+inf``
+      (sentinel for downstream radix select). ``ks`` is implicitly 0 —
+      for paged decode, every request's pool blocks start at logical
+      index 0 in its own pool_page_table.
     """
     assert logits.dtype == torch.float32
     if logits.dim() == 3:

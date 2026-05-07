@@ -51,11 +51,11 @@ from sglang.srt.layers.attention.nsa.utils import (
     is_nsa_enable_prefill_cp,
     is_nsa_prefill_cp_in_seq_split,
 )
-from sglang.srt.layers.utils.cp_utils import cp_all_gather_rerange_output
 from sglang.srt.layers.communicator import ScatterMode
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.rotary_embedding import get_rope_wrapper
+from sglang.srt.layers.utils.cp_utils import cp_all_gather_rerange_output
 from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.server_args import get_global_server_args
@@ -503,9 +503,9 @@ class HisaIndexer(MultiPlatformOp):
 
         # ---- hisa kernel: paged decode through pool-K cache ----
         kv_pool = forward_batch.token_to_kv_pool
-        assert isinstance(kv_pool, HisaNSATokenToKVPool), (
-            "HisaIndexer requires HisaNSATokenToKVPool"
-        )
+        assert isinstance(
+            kv_pool, HisaNSATokenToKVPool
+        ), "HisaIndexer requires HisaNSATokenToKVPool"
         pool_k_pages = kv_pool.get_pool_k_pages(layer_id)
         pool_page_tables = kv_pool.get_pool_page_tables(
             forward_batch.req_pool_indices,
@@ -527,21 +527,19 @@ class HisaIndexer(MultiPlatformOp):
                 kv_pool.pool_page_size,
                 self.sm_count,
             )
-        block_sparse_logits, topk_block_indices = (
-            fp8_native_hierarchy_paged_mqa_logits(
-                q_fp8=q_fp8[:q_offset],
-                kv_cache_fp8=kv_cache_fp8,
-                pool_k_pages=pool_k_pages,
-                pool_page_tables=pool_page_tables[:q_offset].contiguous(),
-                weights=weights[:q_offset],
-                context_lens=seqlens_32[:q_offset],
-                block_tables=block_tables[:q_offset],
-                k_block_size=self.hisa_k_block_size,
-                pool_page_size=kv_pool.pool_page_size,
-                block_topk=self.hisa_block_topk,
-                max_seq_len=max_seq_len,
-                schedule_metadata=pool_schedule,
-            )
+        block_sparse_logits, topk_block_indices = fp8_native_hierarchy_paged_mqa_logits(
+            q_fp8=q_fp8[:q_offset],
+            kv_cache_fp8=kv_cache_fp8,
+            pool_k_pages=pool_k_pages,
+            pool_page_tables=pool_page_tables[:q_offset].contiguous(),
+            weights=weights[:q_offset],
+            context_lens=seqlens_32[:q_offset],
+            block_tables=block_tables[:q_offset],
+            k_block_size=self.hisa_k_block_size,
+            pool_page_size=kv_pool.pool_page_size,
+            block_topk=self.hisa_block_topk,
+            max_seq_len=max_seq_len,
+            schedule_metadata=pool_schedule,
         )
         # Hisa paged output has a leading next_n=1 dim; squeeze.
         block_sparse_logits = block_sparse_logits.squeeze(
@@ -745,14 +743,16 @@ class HisaIndexer(MultiPlatformOp):
             # eats ~15μs of extra Python launch overhead vs tilelang; at
             # prefill sq>=512 triton wins outright.
             with self._with_real_sm_count():
-                block_sparse_logits, topk_block_indices = fp8_native_hierarchy_mqa_logits(
-                    q_fp8[:q_offset],
-                    kv_fp8,
-                    weights[:q_offset],
-                    ks,
-                    ke,
-                    self.hisa_k_block_size,
-                    self.hisa_block_topk,
+                block_sparse_logits, topk_block_indices = (
+                    fp8_native_hierarchy_mqa_logits(
+                        q_fp8[:q_offset],
+                        kv_fp8,
+                        weights[:q_offset],
+                        ks,
+                        ke,
+                        self.hisa_k_block_size,
+                        self.hisa_block_topk,
+                    )
                 )
             # vLLM-patch-style conversion (indexers.py:435-458): radix-select
             # + gather + ks-subtract + mask in a single CUDA kernel.
@@ -791,14 +791,16 @@ class HisaIndexer(MultiPlatformOp):
             end = min(start + max_rows, q_offset)
 
             with self._with_real_sm_count():
-                block_sparse_logits, topk_block_indices = fp8_native_hierarchy_mqa_logits(
-                    q_fp8[start:end],
-                    kv_fp8,
-                    weights[start:end],
-                    ks[start:end],
-                    ke[start:end],
-                    self.hisa_k_block_size,
-                    self.hisa_block_topk,
+                block_sparse_logits, topk_block_indices = (
+                    fp8_native_hierarchy_mqa_logits(
+                        q_fp8[start:end],
+                        kv_fp8,
+                        weights[start:end],
+                        ks[start:end],
+                        ke[start:end],
+                        self.hisa_k_block_size,
+                        self.hisa_block_topk,
+                    )
                 )
             # Same conversion as the non-chunked branch, via the dispatch.
             topk_result[start:end] = hisa_topk_transform_dispatch(
@@ -1598,7 +1600,10 @@ class HisaIndexer(MultiPlatformOp):
             layer_id, forward_batch.out_cache_loc, k
         )
         if is_prefill:
-            if self.nsa_enable_prefill_cp and forward_batch.attn_cp_metadata is not None:
+            if (
+                self.nsa_enable_prefill_cp
+                and forward_batch.attn_cp_metadata is not None
+            ):
                 forward_batch.attn_backend.forward_metadata.actual_seq_lengths_q = (
                     forward_batch.attn_cp_metadata.actual_seq_q_prev_tensor,
                     forward_batch.attn_cp_metadata.actual_seq_q_next_tensor,
