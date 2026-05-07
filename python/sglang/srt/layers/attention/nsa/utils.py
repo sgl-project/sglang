@@ -9,6 +9,7 @@ from sglang.srt.layers.dp_attention import (
     get_attention_cp_rank,
     get_attention_cp_size,
     get_attention_dp_rank,
+    get_attention_tp_size,
 )
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils.common import ceil_align, ceil_div
@@ -88,6 +89,9 @@ def cal_padded_tokens(forward_batch: "ForwardBatch"):
     # calculate the actual token length after padding when attn_tp_size > 1 or in the MAX_LEN padding mode.
     global_num_tokens = forward_batch.global_num_tokens_cpu.copy()
     sync_group_size = len(global_num_tokens)
+    attn_tp_size = get_attention_tp_size()
+    for i in range(sync_group_size):
+        global_num_tokens[i] = ceil_align(global_num_tokens[i], attn_tp_size)
     attn_cp_size = get_attention_cp_size()
     for i in range(sync_group_size):
         global_num_tokens[i] = ceil_align(global_num_tokens[i], attn_cp_size)

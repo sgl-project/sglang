@@ -423,7 +423,11 @@ class NativeSparseAttnBackend(
         cache_seqlens_int32 = (forward_batch.seq_lens + draft_token_num).to(torch.int32)
         cu_seqlens_k = compute_cu_seqlens(cache_seqlens_int32)
         assert forward_batch.seq_lens_cpu is not None
-        max_seqlen_k = int(forward_batch.seq_lens_cpu.max().item() + draft_token_num)
+        max_seqlen_k = (
+            int(forward_batch.seq_lens_cpu.max().item() + draft_token_num)
+            if batch_size > 0
+            else 0
+        )
         # [b, max_seqlen_k]
         page_table = forward_batch.req_to_token_pool.req_to_token[
             forward_batch.req_pool_indices, :max_seqlen_k
@@ -640,11 +644,17 @@ class NativeSparseAttnBackend(
 
         paged_mqa_schedule_metadata = None
         # DeepGEMM paged MQA logits path needs a schedule metadata tensor.
-        # Compute it once per forward batch and reuse it across layers.
-        if is_cuda() and (
-            forward_batch.forward_mode.is_decode_or_idle()
-            or forward_batch.forward_mode.is_target_verify()
-            or forward_batch.forward_mode.is_draft_extend()
+        # Compute it once per forward batch and reuse it across layers. When
+        # the real batch is empty (e.g. a DP-padded idle rank), there is no
+        # attention work to schedule, so keeping this field as None is correct.
+        if (
+            is_cuda()
+            and seqlens_expanded.numel() > 0
+            and (
+                forward_batch.forward_mode.is_decode_or_idle()
+                or forward_batch.forward_mode.is_target_verify()
+                or forward_batch.forward_mode.is_draft_extend()
+            )
         ):
             try:
                 import deep_gemm
@@ -1673,12 +1683,42 @@ class NativeSparseAttnBackend(
         qk_rope_dim = k_rope_cache.shape[-1]
         k_rope_cache = k_rope_cache.view(-1, page_size, 1, qk_rope_dim)
         c_kv_cache = c_kv_cache.view(-1, page_size, 1, v_head_dim)
+
+        # Under DP attention, prepare_mlp_sync_batch may pad Q across DP ranks.
+        padded_num_tokens = q_rope.shape[0]
+        assert q_nope.shape[0] == padded_num_tokens, (
+            f"FA3 Q/QV mismatch: q_rope_tokens={padded_num_tokens}, "
+            f"q_nope_tokens={q_nope.shape[0]}"
+        )
+        if padded_num_tokens == 0:
+            return q_nope.new_zeros(q_nope.shape)
+
+        metadata_num_tokens = cache_seqlens.shape[0]
+        assert metadata_num_tokens == padded_num_tokens, (
+            f"FA3 metadata/Q mismatch: metadata_num_tokens={metadata_num_tokens} "
+            f"!= padded_num_tokens={padded_num_tokens}"
+        )
+        assert page_table.shape[0] >= padded_num_tokens, (
+            f"FA3 page_table has fewer rows than Q: "
+            f"page_table_rows={page_table.shape[0]}, q_tokens={padded_num_tokens}"
+        )
+
+        expected_cu_len = padded_num_tokens + 1
+        cu_q_len = None if cu_seqlens_q is None else cu_seqlens_q.shape[0]
+        cu_k_len = None if cu_seqlens_k is None else cu_seqlens_k.shape[0]
+        assert (
+            cu_q_len is None or cu_q_len == expected_cu_len
+        ), f"FA3 cu_seqlens_q mismatch: got={cu_q_len}, expected={expected_cu_len}"
+        assert (
+            cu_k_len is None or cu_k_len == expected_cu_len
+        ), f"FA3 cu_seqlens_k mismatch: got={cu_k_len}, expected={expected_cu_len}"
+
         o = flash_attn_with_kvcache(
             q=q_rope,
             k_cache=k_rope_cache,
             v_cache=c_kv_cache,
             qv=q_nope,
-            page_table=page_table,
+            page_table=page_table[:padded_num_tokens],
             cache_seqlens=cache_seqlens,
             cu_seqlens_q=cu_seqlens_q,
             cu_seqlens_k_new=cu_seqlens_k,
