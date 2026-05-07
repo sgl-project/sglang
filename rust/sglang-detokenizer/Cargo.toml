@@ -1,0 +1,20 @@
+[package]
+name = "sglang-detokenizer"
+version = "0.1.0"
+edition = "2024"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+[lib]
+name = "sglang_detokenizer"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = "0.28.2"
+zmq = "0.10"
+rmpv = "1.3"
+tokenizers = { version = "0.21", features = ["http"] }
+base64 = "0.22"
+env_logger = "0.11"
+log = "0.4"
+clap = { version = "4", features = ["derive"] }
+indexmap = "2"

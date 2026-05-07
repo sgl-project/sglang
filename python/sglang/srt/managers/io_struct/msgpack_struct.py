@@ -107,12 +107,12 @@ class BatchTokenIDOutput(msgspec.Struct, tag=True):
     # Verify count: number of verification forward passes
     spec_verify_ct: List[int]
 
-    # Accepted tokens: Number of accepted tokens during speculative decoding
-    spec_accepted_tokens: List[int]
+    # Accepted drafts tokens: Number of accepted drafts tokens during speculative decoding
+    spec_accepted_drafts: List[int]
 
     # Acceptance histogram: List of lists, where each inner list represents histogram counts.
-    # List index = number of accepted tokens in a step, List value = count of steps with that many accepted tokens.
-    # Example: histogram[0] = 5 means 5 steps with 0 accepted tokens, histogram[3] = 10 means 10 steps with 3 accepted tokens.
+    # List index = number of accepted drafts tokens in a step, List value = count of steps with that many accepted drafts tokens.
+    # Example: histogram[0] = 5 means 5 steps with 0 accepted drafts tokens, histogram[3] = 10 means 10 steps with 3 accepted drafts tokens.
     # Empty list [] when speculative decoding is disabled.
     spec_acceptance_histogram: List[List[int]]
 
@@ -195,8 +195,8 @@ class BatchStrOutput(msgspec.Struct, tag=True):
     # Verify count: number of verification forward passes
     spec_verify_ct: List[int]
 
-    # Accepted tokens: Number of accepted tokens during speculative decoding
-    spec_accepted_tokens: List[int]
+    # Accepted drafts: Number of accepted drafts tokens during speculative decoding
+    spec_accepted_drafts: List[int]
 
     # Acceptance histogram: List of lists, where each inner list represents histogram counts.
     # List index = number of accepted tokens in a step, List value = count of steps with that many accepted tokens.

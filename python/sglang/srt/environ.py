@@ -572,6 +572,7 @@ class Envs:
 
     # Msgpck IPC object support
     SGLANG_IPC_USE_MSGPACK = EnvBool(False)
+    SGLANG_RUST_DETOKENIZER = EnvBool(False)
 
 
 envs = Envs()
