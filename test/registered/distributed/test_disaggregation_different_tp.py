@@ -48,6 +48,8 @@ class TestDisaggregationMooncakePrefillLargerTP(PDDisaggregationServerBase):
             cls.bootstrap_port,
             "--tp",
             "4",
+            "--enable-metrics",
+            "--enable-request-time-stats-logging",
         ]
         prefill_args += cls.transfer_backend + cls.rdma_devices
         cls.process_prefill = popen_launch_pd_server(
@@ -69,6 +71,8 @@ class TestDisaggregationMooncakePrefillLargerTP(PDDisaggregationServerBase):
             "2",
             "--base-gpu-id",
             "4",
+            "--enable-metrics",
+            "--enable-request-time-stats-logging",
         ]
         decode_args += cls.transfer_backend + cls.rdma_devices
         cls.process_decode = popen_launch_pd_server(
@@ -123,6 +127,8 @@ class TestDisaggregationMooncakeDecodeLargerTP(PDDisaggregationServerBase):
             cls.bootstrap_port,
             "--tp",
             "2",
+            "--enable-metrics",
+            "--enable-request-time-stats-logging",
         ]
         prefill_args += cls.transfer_backend + cls.rdma_devices
         cls.process_prefill = popen_launch_pd_server(
@@ -144,6 +150,8 @@ class TestDisaggregationMooncakeDecodeLargerTP(PDDisaggregationServerBase):
             "4",
             "--base-gpu-id",
             "4",
+            "--enable-metrics",
+            "--enable-request-time-stats-logging",
         ]
         decode_args += cls.transfer_backend + cls.rdma_devices
         cls.process_decode = popen_launch_pd_server(
@@ -198,6 +206,8 @@ class TestDisaggregationMooncakeMHAPrefillLargerTP(PDDisaggregationServerBase):
             cls.bootstrap_port,
             "--tp",
             "4",
+            "--enable-metrics",
+            "--enable-request-time-stats-logging",
         ]
         prefill_args += cls.transfer_backend + cls.rdma_devices
         cls.process_prefill = popen_launch_pd_server(
@@ -219,6 +229,8 @@ class TestDisaggregationMooncakeMHAPrefillLargerTP(PDDisaggregationServerBase):
             "2",
             "--base-gpu-id",
             "4",
+            "--enable-metrics",
+            "--enable-request-time-stats-logging",
         ]
         decode_args += cls.transfer_backend + cls.rdma_devices
         cls.process_decode = popen_launch_pd_server(
@@ -273,6 +285,8 @@ class TestDisaggregationMooncakeMHADecodeLargerTP(PDDisaggregationServerBase):
             cls.bootstrap_port,
             "--tp",
             "2",
+            "--enable-metrics",
+            "--enable-request-time-stats-logging",
         ]
         prefill_args += cls.transfer_backend + cls.rdma_devices
         cls.process_prefill = popen_launch_pd_server(
@@ -294,6 +308,8 @@ class TestDisaggregationMooncakeMHADecodeLargerTP(PDDisaggregationServerBase):
             "4",
             "--base-gpu-id",
             "4",
+            "--enable-metrics",
+            "--enable-request-time-stats-logging",
         ]
         decode_args += cls.transfer_backend + cls.rdma_devices
         cls.process_decode = popen_launch_pd_server(
@@ -354,6 +370,8 @@ class TestDisaggregationStagingPrefillLargerTP(PDDisaggregationServerBase):
             cls.bootstrap_port,
             "--tp",
             "4",
+            "--enable-metrics",
+            "--enable-request-time-stats-logging",
         ]
         prefill_args += cls.transfer_backend + cls.rdma_devices
         env = {**os.environ, **STAGING_ENV}
@@ -377,6 +395,8 @@ class TestDisaggregationStagingPrefillLargerTP(PDDisaggregationServerBase):
             "2",
             "--base-gpu-id",
             "4",
+            "--enable-metrics",
+            "--enable-request-time-stats-logging",
         ]
         decode_args += cls.transfer_backend + cls.rdma_devices
         env = {**os.environ, **STAGING_ENV}
@@ -431,6 +451,8 @@ class TestDisaggregationStagingDecodeLargerTP(PDDisaggregationServerBase):
             cls.bootstrap_port,
             "--tp",
             "2",
+            "--enable-metrics",
+            "--enable-request-time-stats-logging",
         ]
         prefill_args += cls.transfer_backend + cls.rdma_devices
         env = {**os.environ, **STAGING_ENV}
@@ -454,6 +476,8 @@ class TestDisaggregationStagingDecodeLargerTP(PDDisaggregationServerBase):
             "4",
             "--base-gpu-id",
             "4",
+            "--enable-metrics",
+            "--enable-request-time-stats-logging",
         ]
         decode_args += cls.transfer_backend + cls.rdma_devices
         env = {**os.environ, **STAGING_ENV}

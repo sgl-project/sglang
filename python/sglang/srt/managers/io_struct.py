@@ -139,10 +139,6 @@ class GenerateReqInput(BaseReq):
     input_ids: Optional[Union[List[List[int]], List[int]]] = None
     # The embeddings for input_ids; one can specify either text or input_ids or input_embeds.
     input_embeds: Optional[Union[List[List[List[float]]], List[List[float]]]] = None
-    # Embedding overrides to place at specific token positions.
-    # Runtime type: Optional[Union[PositionalEmbeds, List[Optional[PositionalEmbeds]]]]
-    # Typed as Any to avoid Pydantic/FastAPI schema errors (PositionalEmbeds contains torch.Tensor).
-    positional_embed_overrides: Any = None
     # The image input. It can be an image instance, file name, URL, or base64 encoded string.
     # Can be formatted as:
     # - Single image for a single request
@@ -177,6 +173,7 @@ class GenerateReqInput(BaseReq):
     return_hidden_states: Union[List[bool], bool] = False
     # Whether to return captured routed experts
     return_routed_experts: bool = False
+    return_indexer_topk: bool = False
     # The start location in the prompt for returning routed experts.
     routed_experts_start_len: int = 0
 
@@ -194,6 +191,10 @@ class GenerateReqInput(BaseReq):
     # of `CustomLogitProcessor` in python/sglang/srt/sampling/custom_logit_processor.py
     # Use the processor's `to_str()` method to generate the serialized string.
     custom_logit_processor: Optional[Union[List[Optional[str]], str]] = None
+    # Embedding overrides to place at specific token positions.
+    # Runtime type: Optional[Union[PositionalEmbeds, List[Optional[PositionalEmbeds]]]]
+    # Typed as Any to avoid Pydantic/FastAPI schema errors (PositionalEmbeds contains torch.Tensor).
+    positional_embed_overrides: Any = None
 
     # For disaggregated inference
     bootstrap_host: Optional[Union[List[str], str]] = None
@@ -653,6 +654,7 @@ class GenerateReqInput(BaseReq):
                 else self.return_hidden_states
             ),
             return_routed_experts=self.return_routed_experts,
+            return_indexer_topk=self.return_indexer_topk,
             modalities=self.modalities[i] if self.modalities else None,
             session_params=self.session_params,
             lora_path=self.lora_path[i] if self.lora_path is not None else None,
@@ -730,6 +732,8 @@ class TokenizedGenerateReqInput(BaseReq):
     return_routed_experts: bool = False
     # The start location in the prompt for returning routed experts.
     routed_experts_start_len: int = 0
+
+    return_indexer_topk: bool = False
 
     # The input embeds
     input_embeds: Optional[Union[List[List[List[float]]], List[List[float]]]] = None
@@ -1107,6 +1111,8 @@ class BatchTokenIDOutput(BaseBatchReq, SpeculativeDecodingMetricsMixin):
     # straight to TokenizerManager, which encodes on demand.
     routed_experts: List[Optional[torch.Tensor]]
 
+    indexer_topk: List[Optional[torch.Tensor]]
+
     # The information of placeholder tokens (e.g., image token)
     # idx is the index of the token in the prompt after expansion.
     # val is the length of padded tokens after expansion.
@@ -1169,6 +1175,8 @@ class BatchStrOutput(BaseBatchReq, SpeculativeDecodingMetricsMixin):
     # tokenizer hot path. Underlying tensor shape is (token, layer, top_k);
     # see BatchTokenIDOutput.routed_experts.
     routed_experts: List[Optional[str]]
+
+    indexer_topk: List[Optional[str]]
 
     # The information of placeholder tokens (e.g., image token)
     # idx is the index of the token in the prompt after expansion.
@@ -1617,6 +1625,7 @@ class CheckWeightsReqInput(BaseReq):
 class CheckWeightsReqOutput(BaseReq):
     success: bool
     message: str
+    payload: Optional[Dict] = None
 
 
 @dataclass
@@ -1947,8 +1956,8 @@ class DisaggregationMetrics:
     """PD disaggregation metrics."""
 
     mode: str  # "prefill", "decode", or "null" - not a metric
-    prefill_prealloc_queue_reqs: int = field(
-        default=0, metadata={"metric": ("gauge", "Prefill prealloc queue requests")}
+    prefill_bootstrap_queue_reqs: int = field(
+        default=0, metadata={"metric": ("gauge", "Prefill bootstrap queue requests")}
     )
     prefill_inflight_queue_reqs: int = field(
         default=0, metadata={"metric": ("gauge", "Prefill inflight queue requests")}
