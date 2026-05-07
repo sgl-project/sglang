@@ -2566,14 +2566,6 @@ def dpsk_v4_fp8_attention_fwd(
             extra_indices_in_kvcache,
             tk_len_2,
         )
-        
-    if _debug_dsv4_attn_enabled():
-        print(
-            f"[dsv4_attn_plan] q_shape={tuple(q.shape)} {has_extra=} {seq=} {block_I=} {threads=} {topk_1=} {ni_1=} {inner_iter_1=} {topk2=} {ni_2=} {inner_iter_2=}  {bs_kv_1=} {bs_kv_2=}",
-            f"{k_cache.shape=}, {indices.shape=}, {attn_sink.shape=}, {extra_k_cache.shape=}, {extra_indices_in_kvcache.shape=}, topk_length={topk_length.shape if topk_length is not None else None},"
-            f"extra_topk_length={extra_topk_length.shape if extra_topk_length is not None else None}, {k1.shape=}, {k2.shape=}, {bs_kv_1=} {bs_kv_2=}",
-            flush=True,
-        )
 
     combine = dpsk_v4_combine_kernel(
         num_heads,
