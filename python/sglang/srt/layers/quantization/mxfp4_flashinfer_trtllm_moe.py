@@ -312,8 +312,7 @@ class Mxfp4FlashinferTrtllmMoEMethod:
             requires_grad=False,
         )
 
-        if envs.SGLANG_OPT_MXFP4_STATIC_SCALE_ONES.get():
-            self._register_static_scale_ones(layer)
+        self._register_static_scale_ones(layer)
         torch.cuda.empty_cache()
 
     def _register_static_scale_ones(self, layer: Module) -> None:
@@ -423,27 +422,9 @@ class Mxfp4FlashinferTrtllmMoEMethod:
             gemm2_weights=w2,
             gemm2_weights_scale=w2_scale,
             gemm2_bias=None,
-            output1_scale_scalar=(
-                layer.output1_scale_scalar
-                if envs.SGLANG_OPT_MXFP4_STATIC_SCALE_ONES.get()
-                else torch.ones(
-                    num_local_experts, device=x_quant.device, dtype=torch.float32
-                )
-            ),
-            output1_scale_gate_scalar=(
-                layer.output1_scale_gate_scalar
-                if envs.SGLANG_OPT_MXFP4_STATIC_SCALE_ONES.get()
-                else torch.ones(
-                    num_local_experts, device=x_quant.device, dtype=torch.float32
-                )
-            ),
-            output2_scale_scalar=(
-                layer.output2_scale_scalar
-                if envs.SGLANG_OPT_MXFP4_STATIC_SCALE_ONES.get()
-                else torch.ones(
-                    num_local_experts, device=x_quant.device, dtype=torch.float32
-                )
-            ),
+            output1_scale_scalar=layer.output1_scale_scalar,
+            output1_scale_gate_scalar=layer.output1_scale_gate_scalar,
+            output2_scale_scalar=layer.output2_scale_scalar,
             num_experts=layer.num_experts,
             top_k=packed_topk.shape[1],
             n_group=1,

@@ -577,7 +577,6 @@ class Envs:
     SGLANG_OPT_SWA_RELEASE_LEAF_LOCK_AFTER_WINDOW = EnvBool(False)
 
     # Mxfp4 experts
-    SGLANG_OPT_MXFP4_STATIC_SCALE_ONES = EnvBool(True)
     SGLANG_OPT_MXFP4_SKIP_DISPATCHER_MAPPING = EnvBool(True)
 
     # DeepGemm Mega MoE
