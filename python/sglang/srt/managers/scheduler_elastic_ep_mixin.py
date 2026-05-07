@@ -116,6 +116,10 @@ class SchedulerElasticEPMixin:
 
         self.running_batch.filter_batch(keep_indices=[])
         self.last_batch = self.cur_batch = None
+        # Clear stale pointer to a chunked-prefill req we just released; the
+        # next iteration's stash_chunked_request would otherwise dereference
+        # its now-None req_pool_idx.
+        self.chunked_req = None
         return requeued_count, aborted_count
 
     def _retract_all_and_rebalance_on_rank_fault(self: Scheduler):
