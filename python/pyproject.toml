@@ -20,6 +20,7 @@ dependencies = [
   "apache-tvm-ffi>=0.1.5,<0.2",
   "anthropic>=0.20.0",
   "blobfile==3.0.0",
+  "brotli",  # Codec transport compression: Content-Encoding: br negotiation. Pure-Python skip if missing, but ships by default so the negotiator can advertise it.
   "build",
   "compressed-tensors",
   "cuda-python>=13.0",
@@ -80,6 +81,7 @@ dependencies = [
   "xgrammar==0.2.0",
   "smg-grpc-servicer>=0.5.0",
   "kernels",
+  "zstandard",  # Codec transport compression: Content-Encoding: zstd negotiation (dict-gated per spec/PROTOCOL.md "Pre-trained ZSTD dictionaries"). Without this dep, codec_compression's negotiator silently skips zstd and falls through to gzip; including it lets operators register a dict and unlock zstd for streaming.
 ]
 
 [[tool.uv.index]]
