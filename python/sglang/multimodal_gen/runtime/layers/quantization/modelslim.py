@@ -133,6 +133,11 @@ class ModelSlimConfig(QuantizationConfig):
             return ModelSlimW8A8Int8(quant_config=self.quant_description, prefix=prefix)
         elif quant_type == "W4A4_DYNAMIC":
             return ModelSlimW4A4Int4(quant_config=self.quant_description, prefix=prefix)
+        elif quant_type == "W8A8_MXFP8":
+            from sglang.multimodal_gen.runtime.layers.quantization.modelslim_mxfp8_scheme import (
+                ModelSlimMXFP8Scheme,
+            )
+            return ModelSlimMXFP8Scheme()
         raise NotImplementedError("No modelslim compatible scheme was found.")
 
     def get_scheme(
