@@ -882,6 +882,7 @@ class MoriKVSender(CommonKVSender):
             aux_index=self.aux_index if is_last else None,
         )
         self.transfer_statuses.extend(statuses)
+        self._record_transfer_indices(kv_indices, None)
         if infos is not None:
             self.pending_infos = infos
             self.sent_last_chunk = True
@@ -958,9 +959,6 @@ class MoriKVSender(CommonKVSender):
         self._notify_decode(KVPoll.Failed, failure_reason)
         self.conclude_state = KVPoll.Failed
 
-    def clear(self) -> None:
-        self.kv_mgr.request_status.pop(self.bootstrap_room, None)
-
     def failure_exception(self):
         if self.conclude_state is None:
             self._finalize_failure()
@@ -972,10 +970,8 @@ class MoriKVSender(CommonKVSender):
         raise RuntimeError(failure_reason)
 
     def abort(self):
-        reason = "Aborted by AbortReq."
-        self.kv_mgr.record_failure(self.bootstrap_room, reason)
-        self._notify_decode(KVPoll.Failed, reason)
-        self.conclude_state = KVPoll.Failed
+        super().abort()
+        self._notify_decode(KVPoll.Failed, "Aborted by AbortReq.")
 
 
 class MoriKVReceiver(CommonKVReceiver):
@@ -985,17 +981,18 @@ class MoriKVReceiver(CommonKVReceiver):
         mgr: MoriKVManager,
         bootstrap_addr: str,
         bootstrap_room: Optional[int] = None,
-        prefill_dp_rank: Optional[int] = None,
     ):
-        super().__init__(mgr, bootstrap_addr, bootstrap_room, prefill_dp_rank)
-        self.conclude_state: Optional[KVPoll] = None
+        super().__init__(mgr, bootstrap_addr, bootstrap_room)
         self.init_time: Optional[float] = None
-        if self.bootstrap_room is None or self.bootstrap_infos is None:
+
+    def init(
+        self,
+        prefill_dp_rank: int,
+    ):
+        super().init(prefill_dp_rank)
+        if self.bootstrap_room is None:
             return
-        self.kv_mgr.addr_to_rooms_tracker[self.bootstrap_addr].add(self.bootstrap_room)
         self.kv_mgr.room_to_bootstrap_addr[self.bootstrap_room] = self.bootstrap_addr
-        self.kv_mgr.update_status(self.bootstrap_room, KVPoll.WaitingForInput)
-        self._register_kv_args()
 
     def _register_kv_args(self):
         if self.bootstrap_infos is None:
@@ -1029,11 +1026,12 @@ class MoriKVReceiver(CommonKVReceiver):
                     ]
                 )
 
-    def init(
+    def send_metadata(
         self,
         kv_indices: npt.NDArray[np.int32],
         aux_index: Optional[int] = None,
         state_indices: Optional[List[int]] = None,
+        decode_prefix_len: Optional[int] = None,
     ):
         if self.bootstrap_infos is None or self.bootstrap_room is None:
             return
@@ -1086,9 +1084,7 @@ class MoriKVReceiver(CommonKVReceiver):
     def clear(self) -> None:
         if self.bootstrap_room is None:
             return
-        self.kv_mgr.request_status.pop(self.bootstrap_room, None)
-        self.kv_mgr.required_prefill_response_num_table.pop(self.bootstrap_room, None)
-        self.kv_mgr.prefill_response_tracker.pop(self.bootstrap_room, None)
+        super().clear()
         self.kv_mgr._cleanup_room_tracking(self.bootstrap_room)
 
     def failure_exception(self):
@@ -1105,10 +1101,7 @@ class MoriKVReceiver(CommonKVReceiver):
     def abort(self):
         if self.bootstrap_room is None:
             return
-        reason = "Aborted by AbortReq."
-        self.kv_mgr.record_failure(self.bootstrap_room, reason)
-        self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
-        self.conclude_state = KVPoll.Failed
+        super().abort()
         self.clear()
 
 

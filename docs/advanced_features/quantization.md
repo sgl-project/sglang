@@ -19,31 +19,34 @@ to guard against abnormal quantization loss regressions.
 
 ## Platform Compatibility
 
-The following table summarizes quantization method support across NVIDIA and AMD GPUs.
+The following table summarizes quantization method support across NVIDIA and AMD GPUs, Ascend NPUs.
 
-| Method | NVIDIA GPUs | AMD GPUs (MI300X/MI325X/MI350X) | Notes |
-|--------|:-----------:|:-------------------------------:|-------|
-| `fp8` | Yes | Yes | Aiter or Triton backend on AMD |
-| `mxfp4` | Yes | Yes | Requires CDNA3/CDNA4 with MXFP support; uses Aiter |
-| `blockwise_int8` | Yes | Yes | Triton-based, works on both platforms |
-| `w8a8_int8` | Yes | Yes | |
-| `w8a8_fp8` | Yes | Yes | Aiter or Triton FP8 on AMD |
-| `awq` | Yes | Yes | Uses Triton dequantize on AMD (vs. optimized CUDA kernels on NVIDIA) |
-| `gptq` | Yes | Yes | Uses Triton or vLLM kernels on AMD |
-| `compressed-tensors` | Yes | Yes | Aiter paths for FP8/MoE on AMD |
-| `quark` | Yes | Yes | AMD Quark quantization; Aiter GEMM paths on AMD |
-| `auto-round` | Yes | Yes | Platform-agnostic (Intel auto-round) |
-| `quark_int4fp8_moe` | No | Yes | AMD-only; online INT4-to-FP8 MoE quantization (CDNA3/CDNA4) |
-| `awq_marlin` | Yes | No | Marlin kernels are CUDA-only |
-| `gptq_marlin` | Yes | No | Marlin kernels are CUDA-only |
-| `gguf` | Yes | No | CUDA-only kernels in sgl-kernel |
-| `modelopt` / `modelopt_fp8` | Yes (Hopper/SM90+) | No | [NVIDIA ModelOpt](https://github.com/NVIDIA/Model-Optimizer); requires NVIDIA hardware |
-| `modelopt_fp4` | Yes (Blackwell/SM100+) | No | [NVIDIA ModelOpt](https://github.com/NVIDIA/Model-Optimizer); native FP4 on Blackwell (B200, GB200) |
-| `petit_nvfp4` | No | Yes (MI250/MI300X/MI325X) | Enables NVFP4 on ROCm via [Petit](https://github.com/causalflow-ai/petit-kernel); use `modelopt_fp4` on NVIDIA Blackwell. Auto-selected when loading NVFP4 models on AMD. See [LMSYS blog](https://lmsys.org/blog/2025-09-21-petit-amdgpu/) and [AMD ROCm blog](https://rocm.blogs.amd.com/artificial-intelligence/fp4-mixed-precision/README.html). |
-| `bitsandbytes` | Yes | Experimental | Depends on bitsandbytes ROCm support |
-| `torchao` (`int4wo`, etc.) | Yes | Partial | `int4wo` not supported on AMD; other methods may work |
+| Method | NVIDIA GPUs | AMD GPUs (MI300X/MI325X/MI350X) | Ascend NPUs (A2/A3) | Notes |
+|--------|:-----------:|:-------------------------------:|:-----------------------:|-------|
+| `fp8` | Yes | Yes | WIP | Aiter or Triton backend on AMD |
+| `mxfp4` | Yes | Yes | WIP | Requires CDNA3/CDNA4 with MXFP support; uses Aiter |
+| `blockwise_int8` | Yes | Yes | No | Triton-based, works on both platforms |
+| `w8a8_int8` | Yes | Yes | No | |
+| `w8a8_fp8` | Yes | Yes | No | Aiter or Triton FP8 on AMD |
+| `awq` | Yes | Yes | Yes | Uses Triton dequantize on AMD (vs. optimized CUDA kernels on NVIDIA). Uses CANN kernels on Ascend|
+| `gptq` | Yes | Yes | Yes | Uses Triton or vLLM kernels on AMD. Uses CANN kernels on Ascend|
+| `compressed-tensors` | Yes | Yes | Partial | Aiter paths for FP8/MoE on AMD. Uses CANN kernels on Ascend, `FP8` not supported yet|
+| `quark` | Yes | Yes | No | AMD Quark quantization; Aiter GEMM paths on AMD |
+| `auto-round` | Yes | Yes | Partial | Platform-agnostic (Intel auto-round). Uses CANN kernels on Ascend|
+| `quark_int4fp8_moe` | No | Yes | No | AMD-only; online INT4-to-FP8 MoE quantization (CDNA3/CDNA4) |
+| `awq_marlin` | Yes | No | No | Marlin kernels are CUDA-only |
+| `gptq_marlin` | Yes | No | No | Marlin kernels are CUDA-only |
+| `gguf` | Yes | No | Yes | CUDA-only kernels in sgl-kernel; Pre-dequantized on Ascend |
+| `modelopt` / `modelopt_fp8` | Yes (Hopper/SM90+) | No | No | [NVIDIA ModelOpt](https://github.com/NVIDIA/Model-Optimizer); requires NVIDIA hardware |
+| `modelopt_fp4` | Yes (Blackwell/SM100+) | No | No | [NVIDIA ModelOpt](https://github.com/NVIDIA/Model-Optimizer); native FP4 on Blackwell (B200, GB200) |
+| `petit_nvfp4` | No | Yes (MI250/MI300X/MI325X) | No | Enables NVFP4 on ROCm via [Petit](https://github.com/causalflow-ai/petit-kernel); use `modelopt_fp4` on NVIDIA Blackwell. Auto-selected when loading NVFP4 models on AMD. See [LMSYS blog](https://lmsys.org/blog/2025-09-21-petit-amdgpu/) and [AMD ROCm blog](https://rocm.blogs.amd.com/artificial-intelligence/fp4-mixed-precision/README.html). |
+| `bitsandbytes` | Yes | Experimental | No | Depends on bitsandbytes ROCm support |
+| `torchao` (`int4wo`, etc.) | Yes | Partial | No | `int4wo` not supported on AMD; other methods may work |
+| `modelslim` | No | No | Yes | Ascend quantization; Uses CANN kernels |
 
 On AMD, several of these methods use [Aiter](https://github.com/ROCm/aiter) for acceleration -- set `SGLANG_USE_AITER=1` where noted. See [AMD GPU setup](../platforms/amd_gpu.md) for installation and configuration details.
+
+On Ascend, various layers quantization configurations are supported, see [Ascend NPU quantization](../platforms/ascend/ascend_npu_quantization.md) for details.
 
 ## GEMM Backends for FP4/FP8 Quantization
 
@@ -71,17 +74,18 @@ Backend selection is supported only for **blockwise FP8** and **NVFP4** GEMM. Wh
 | Backend | Hardware | Description |
 |---------|----------|-------------|
 | `auto` | SM100/120 | Auto-selects: `flashinfer_cudnn` on SM120; `flashinfer_cutlass` on SM100 |
+| `cutlass` | SM100/120 | SGLang CUTLASS kernel |
 | `flashinfer_cutlass` | SM100/120 | FlashInfer CUTLASS backend |
 | `flashinfer_cudnn` | SM100/120 (CUDA 13+, cuDNN 9.15+) | FlashInfer cuDNN backend; used on SM120 for performance |
 | `flashinfer_trtllm` | SM100 | FlashInfer TensorRT-LLM backend |
 
-When FlashInfer is unavailable for NVFP4, sgl-kernel CUTLASS is used as an automatic fallback.
+When FlashInfer is unavailable for NVFP4, the SGLang CUTLASS kernel is used as an automatic fallback.
 
 ## Offline Quantization
 
 To load already quantized models, simply load the model weights and config. **Again, if the model has been quantized offline,
 there's no need to add `--quantization` argument when starting the engine. The quantization method will be parsed from the
-downloaded Hugging Face config. For example, DeepSeek V3/R1 models are already in FP8, so do not add redundant parameters.**
+downloaded Hugging Face or msModelSlim config. For example, DeepSeek V3/R1 models are already in FP8, so do not add redundant parameters.**
 
 ```bash
 python3 -m sglang.launch_server \
@@ -319,7 +323,6 @@ For detailed usage and supported model architectures, see [NVIDIA Model Optimize
 
 SGLang includes a streamlined workflow for quantizing models with ModelOpt and automatically exporting them for deployment.
 
-
 ##### Installation
 
 First, install ModelOpt:
@@ -477,6 +480,74 @@ model_loader.load_model(model_config=model_config, device_config=DeviceConfig())
 - **Calibration-based**: Uses calibration datasets for optimal quantization quality
 - **Production Ready**: Enterprise-grade quantization with NVIDIA support
 
+#### Using [ModelSlim](https://gitcode.com/Ascend/msmodelslim)
+MindStudio-ModelSlim (msModelSlim) is a model offline quantization compression tool launched by MindStudio and optimized for Ascend hardware.
+
+- **Installation**
+
+    ```bash
+    # Clone repo and install msmodelslim:
+    git clone https://gitcode.com/Ascend/msmodelslim.git
+    cd msmodelslim
+    bash install.sh
+    ```
+
+- **LLM quantization**
+
+    Download the original floating-point weights of the large model. Taking Qwen3-32B as an example, you can go to [Qwen3-32B](https://huggingface.co/Qwen/Qwen3-32B) to obtain the original model weights. Then install other dependencies (related to the model, refer to the huggingface model card).
+    > Note: You can find pre-quantized validated models on [modelscope/Eco-Tech](https://modelscope.cn/models/Eco-Tech).
+
+    _Traditional quantification methods require the preparation of calibration data files (```.jsonl``` formats) for calibration in the quantification process._
+    ```bash
+    Qwen3-32B/      # floating-point model downloaded from official HF (or modelscope) repo
+    msmodelslim/    # msmodelslim repo
+      |----- lab_calib # calibration date folder (put your dataset here in ```.jsonl``` format or use pre-prepared ones)
+          |----- some file (such as laos_calib.jsonl)
+      |----- lab_practice # best practice folder with configs for quantization
+          |----- model folder (such as qwen3_5_moe folder) # folder with quantization configs
+              |----- quant_config (such as qwen3_5_moe_w8a8.yaml) # quantization config
+      |----- another folders
+    output_folder/   # generated by below command
+      |----- quant_model_weights-00001-of-0001.safetensors # quantized weights
+      |----- quant_model_description.json # file with description of the quantization methods for each layer (```W4A4_DYNAMIC```, etc.)
+      |----- another files (such as config.json, tokenizer.json, etc.)
+    ```
+    Run quantization using one-click quantization (recommended):
+    ```bash
+    msmodelslim quant \
+    --model_path ${MODEL_PATH} \
+    --save_path ${SAVE_PATH} \
+    --device npu:0,1 \
+    --model_type Qwen3-32B \
+    --quant_type w8a8 \
+    --trust_remote_code True
+    ```
+
+- **Usage Example**
+    ```bash
+    python3 -m sglang.launch_server \
+    --model-path $PWD/Qwen3-32B-w8a8 \
+    --port 30000 --host 0.0.0.0
+    ```
+
+- **Available Quantization Methods**:
+    - [x]  ```W4A4_DYNAMIC``` linear with online quantization of activations
+    - [x]  ```W8A8``` linear with offline quantization of activations
+    - [x]  ```W8A8_DYNAMIC``` linear with online quantization of activations
+    - [x]  ```W4A4_DYNAMIC``` MOE with online quantization of activations
+    - [x]  ```W4A8_DYNAMIC``` MOE with online quantization of activations
+    - [x]  ```W8A8_DYNAMIC``` MOE with online quantization of activations
+    - [ ]  ```W4A8``` linear TBD
+    - [ ]  ```W4A16``` linear TBD
+    - [ ]  ```W48A16``` linear TBD
+    - [ ]  ```W4A16``` MoE in progress
+    - [ ]  ```W8A16``` MoE in progress
+    - [ ]  ```KV Cache``` in progress
+    - [ ]  ```Attention``` in progress
+
+
+For more detailed examples of quantization of models, as well as information about their support, see the [examples](https://gitcode.com/Ascend/msmodelslim/blob/master/example/README.md) section in ModelSLim repo.
+
 ## Online Quantization
 
 To enable online quantization, you can simply specify `--quantization` in the command line. For example, you can launch the server with the following command to enable `FP8` quantization for model `meta-llama/Meta-Llama-3.1-8B-Instruct`:
@@ -529,3 +600,4 @@ Other layers (e.g. projections in the attention layers) have their weights quant
 - [Torchao: PyTorch Architecture Optimization](https://github.com/pytorch/ao)
 - [vLLM Quantization](https://docs.vllm.ai/en/latest/quantization/)
 - [auto-round](https://github.com/intel/auto-round)
+- [ModelSlim](https://gitcode.com/Ascend/msmodelslim)

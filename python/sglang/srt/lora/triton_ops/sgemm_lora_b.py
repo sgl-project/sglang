@@ -2,6 +2,7 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.lora.triton_ops.kernel_utils import _resolve_token_positions
 from sglang.srt.lora.utils import LoRABatchInfo
 
 
@@ -27,7 +28,9 @@ def _sgemm_lora_b_kernel(
     seg_indptr,
     weight_indices,
     lora_ranks,
+    sorted_token_ids,
     # Meta parameters
+    SORTED_BY_ADAPTER: tl.constexpr,
     BLOCK_S: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
@@ -63,6 +66,8 @@ def _sgemm_lora_b_kernel(
 
     pid = tl.program_id(axis=0)
     seg_len = tl.load(seg_lens + batch_id)
+    if seg_len == 0:
+        return
     seg_start = tl.load(seg_indptr + batch_id)
     scaling = tl.load(scalings + w_index)
     # Adjust K (rank) according to the specific LoRA adapter
@@ -72,6 +77,8 @@ def _sgemm_lora_b_kernel(
     num_pid_n = tl.cdiv(N, BLOCK_N)
     pid_s = pid // num_pid_n
     pid_n = pid % num_pid_n
+    if pid_s * BLOCK_S >= seg_len:
+        return
 
     # Create pointers for the first block of x and weights[batch_id]
     # The pointers will be advanced as we move in the K direction
@@ -79,14 +86,16 @@ def _sgemm_lora_b_kernel(
     s_offset = tl.arange(0, BLOCK_S) + pid_s * BLOCK_S
     n_offset = tl.arange(0, BLOCK_N) + pid_n * BLOCK_N
     k_offset = tl.arange(0, BLOCK_K)
-    x_ptrs = (x + seg_start * x_stride_0) + (
-        s_offset[:, None] * x_stride_0 + k_offset[None, :] * x_stride_1
+    s_physical = _resolve_token_positions(
+        sorted_token_ids, seg_start, s_offset, seg_len, SORTED_BY_ADAPTER
     )
+    x_ptrs = x + (s_physical[:, None] * x_stride_0 + k_offset[None, :] * x_stride_1)
     w_ptrs = (weights + w_index * w_stride_0) + (
         k_offset[:, None] * w_stride_2 + n_offset[None, :] * w_stride_1
     )
 
     # Iterate to compute the block in output matrix
+    n_mask = n_offset[None, :] < N
     partial_sum = tl.zeros((BLOCK_S, BLOCK_N), dtype=tl.float32)
     for k in range(0, tl.cdiv(K, BLOCK_K)):
         x_tile = tl.load(
@@ -96,7 +105,7 @@ def _sgemm_lora_b_kernel(
         )
         w_tile = tl.load(
             w_ptrs,
-            mask=(k_offset[:, None] < K - k * BLOCK_K),
+            mask=(k_offset[:, None] < K - k * BLOCK_K) & n_mask,
             other=0.0,
         )
         partial_sum += tl.dot(x_tile, w_tile)
@@ -107,11 +116,11 @@ def _sgemm_lora_b_kernel(
     # Store result to output matrix
     partial_sum *= scaling
     partial_sum = partial_sum.to(x.dtype.element_ty)
-    output_ptr = (output + seg_start * output_stride_0) + (
-        s_offset[:, None] * output_stride_0 + n_offset[None, :] * output_stride_1
+    output_ptr = output + (
+        s_physical[:, None] * output_stride_0 + n_offset[None, :] * output_stride_1
     )
-    output_mask = s_offset[:, None] < seg_len
-    partial_sum += tl.load(output_ptr, mask=output_mask)
+    output_mask = (s_offset[:, None] < seg_len) & n_mask
+    partial_sum += tl.load(output_ptr, mask=output_mask, other=0.0)
     tl.store(output_ptr, partial_sum, mask=output_mask)
 
 
@@ -151,6 +160,7 @@ def sgemm_lora_b_fwd(
     else:
         output = base_output
 
+    sorted_by_adapter = batch_info.permutation is not None
     _sgemm_lora_b_kernel[grid](
         x,
         weights,
@@ -168,6 +178,8 @@ def sgemm_lora_b_fwd(
         batch_info.seg_indptr,
         batch_info.weight_indices,
         batch_info.lora_ranks,
+        batch_info.permutation,
+        sorted_by_adapter,
         BLOCK_S,
         BLOCK_N,
         BLOCK_R,

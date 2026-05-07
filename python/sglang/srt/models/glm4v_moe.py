@@ -158,6 +158,13 @@ class Glm4vMoeForConditionalGeneration(Glm4vForConditionalGeneration):
         params_dict = dict(self.named_parameters())
         weight_names = []
         for name, loaded_weight in weights:
+            if "language_model." in name:
+                name = name.replace("language_model.", "")
+            if "model.visual." in name:
+                name = name.replace("model.visual.", "visual.")
+            if "rotary_emb.inv_freq" in name:
+                continue
+
             weight_names.append(name)
 
             if self.num_fused_shared_experts > 0 and "mlp.shared_experts" in name:
@@ -195,13 +202,6 @@ class Glm4vMoeForConditionalGeneration(Glm4vForConditionalGeneration):
                 # For decoder layer weights
                 if is_decoder:
                     name = name.replace(nextn_layer_prefix, "model.decoder")
-
-            if "language_model." in name:
-                name = name.replace("language_model.", "")
-            if "model.visual." in name:
-                name = name.replace("model.visual.", "visual.")
-            if "rotary_emb.inv_freq" in name:
-                continue
 
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 # Skip non-stacked layers and experts (experts handled below).
@@ -280,9 +280,6 @@ class Glm4vMoeForConditionalGeneration(Glm4vForConditionalGeneration):
                         weight_loader(param, loaded_weight)
                     else:
                         logger.warning(f"Parameter {name} not found in params_dict")
-
-        if not is_nextn:
-            self.visual.patch_embed.copy_conv3d_weight_to_linear()
 
 
 EntryClass = [Glm4vMoeForConditionalGeneration]

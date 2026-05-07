@@ -64,9 +64,8 @@ class RequestMetrics:
         """Records the duration of a pipeline stage"""
         self.stages[stage_name] = duration_s * 1000  # Store as milliseconds
 
-    def record_steps(self, index: int, duration_s: float):
-        """Records the duration of a denoising step"""
-        assert index == len(self.steps)
+    def record_step(self, duration_s: float):
+        """Records the duration of a denoising step in execution order."""
         self.steps.append(duration_s * 1000)
 
     def record_memory_snapshot(self, checkpoint_name: str, snapshot: MemorySnapshot):
@@ -192,6 +191,7 @@ class StageProfiler:
         log_stage_start_end: bool = False,
         perf_dump_path_provided: bool = False,
         capture_memory: bool = False,
+        record_as_step: bool = False,
     ):
         self.stage_name = stage_name
         self.metrics = metrics
@@ -200,18 +200,28 @@ class StageProfiler:
         self.log_timing = perf_dump_path_provided or envs.SGLANG_DIFFUSION_STAGE_LOGGING
         self.log_stage_start_end = log_stage_start_end
         self.capture_memory = capture_memory
+        self.record_as_step = record_as_step
+
+    def _should_record_as_step(self) -> bool:
+        return self.record_as_step or self.stage_name.startswith("denoising_step_")
 
     def __enter__(self):
         if self.log_stage_start_end:
             msg = f"[{self.stage_name}] started..."
             if self.logger.isEnabledFor(logging.DEBUG):
-                msg += f" ({round(current_platform.get_available_gpu_memory(), 2)} GB left)"
+                # This debug-only memory log runs at every stage boundary in CI.
+                # Keep it observational; cache cleanup is handled at explicit
+                # failure and component-release points.
+                available_memory = current_platform.get_available_gpu_memory(
+                    empty_cache=False
+                )
+                msg += f" ({round(available_memory, 2)} GB left)"
             self.logger.info(msg)
 
         if (self.log_timing and self.metrics) or self.log_stage_start_end:
             if (
                 os.environ.get("SGLANG_DIFFUSION_SYNC_STAGE_PROFILING", "0") == "1"
-                and self.stage_name.startswith("denoising_step_")
+                and self._should_record_as_step()
                 and torch.get_device_module().is_available()
             ):
                 torch.get_device_module().synchronize()
@@ -225,7 +235,7 @@ class StageProfiler:
 
         if (
             os.environ.get("SGLANG_DIFFUSION_SYNC_STAGE_PROFILING", "0") == "1"
-            and self.stage_name.startswith("denoising_step_")
+            and self._should_record_as_step()
             and torch.get_device_module().is_available()
         ):
             torch.get_device_module().synchronize()
@@ -247,9 +257,8 @@ class StageProfiler:
             )
 
         if self.log_timing and self.metrics:
-            if "denoising_step_" in self.stage_name:
-                index = int(self.stage_name[len("denoising_step_") :])
-                self.metrics.record_steps(index, execution_time_s)
+            if self._should_record_as_step():
+                self.metrics.record_step(execution_time_s)
             else:
                 self.metrics.record_stage(self.stage_name, execution_time_s)
 
