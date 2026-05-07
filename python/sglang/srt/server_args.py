@@ -4020,6 +4020,13 @@ class ServerArgs:
                 )
                 self.enable_aiter_allreduce_fusion = False
 
+            if self.enable_flashinfer_allreduce_fusion:
+                logger.warning(
+                    "Disable enable_flashinfer_allreduce_fusion because deterministic inference is enabled."
+                )
+                self.enable_flashinfer_allreduce_fusion = False
+            self.enforce_disable_flashinfer_allreduce_fusion = True
+
             # Check sampling backend
             self.sampling_backend = "pytorch"
             logger.warning(
