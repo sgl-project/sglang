@@ -31,6 +31,7 @@ from openai.types.responses.response import ToolChoice
 from openai.types.responses.tool import Tool
 from pydantic import (
     BaseModel,
+    ConfigDict,
     Field,
     field_validator,
     model_serializer,
@@ -1118,12 +1119,38 @@ class RerankResponse(BaseModel):
 class TokenizeRequest(BaseModel):
     """Request schema for the /tokenize endpoint."""
 
+    model_config = ConfigDict(extra="allow")
+
     model: str = DEFAULT_MODEL_NAME
-    prompt: Union[str, List[str]]
+    prompt: Optional[Union[str, List[str]]] = None
+    messages: Optional[List[ChatCompletionMessageParam]] = None
+    tools: Optional[List[Tool]] = Field(default=None, examples=[None])
+    tool_choice: Optional[Union[ToolChoice, Literal["auto", "required", "none"]]] = (
+        Field(default=None, examples=["auto"])
+    )
+    reasoning_effort: Optional[Literal["none", "low", "medium", "high"]] = None
+    continue_final_message: bool = False
+    chat_template_kwargs: Optional[Dict] = None
     add_special_tokens: bool = Field(
         default=True,
         description="whether to add model-specific special tokens (e.g. BOS/EOS) during encoding.",
     )
+
+    @model_validator(mode="after")
+    def validate_tokenize_input(self) -> "TokenizeRequest":
+        if (self.prompt is None) == (self.messages is None):
+            raise ValueError("Exactly one of 'prompt' or 'messages' must be provided.")
+        return self
+
+    def to_chat_completion_request(self) -> ChatCompletionRequest:
+        data = self.model_dump(
+            exclude={"prompt", "add_special_tokens"},
+            exclude_none=True,
+        )
+        extra = getattr(self, "__pydantic_extra__", None)
+        if extra:
+            data.update(extra)
+        return ChatCompletionRequest.model_validate(data)
 
 
 class TokenizeResponse(BaseModel):

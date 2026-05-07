@@ -491,9 +491,6 @@ class NixlKVManager(CommonKVManager):
                     time.sleep(0)
 
                 if kv_chunk.is_last:
-                    if room in self.transfer_infos:
-                        del self.transfer_infos[room]
-                    self.req_to_decode_prefix_len.pop(room, None)
                     self.update_status(room, KVPoll.Success)
                 else:
                     self.update_status(room, KVPoll.Transferring)
@@ -1273,7 +1270,7 @@ class NixlKVSender(CommonKVSender):
         return status
 
     def clear(self):
-        self.kv_mgr.request_status.pop(self.bootstrap_room, None)
+        super().clear()
 
     def failure_exception(self):
         if self._send_error is not None:
