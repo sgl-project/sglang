@@ -238,9 +238,10 @@ class DeepGemmRunnerCore(MoeRunnerCore):
                 sglang_per_token_group_quant_fp8,
             )
 
-            gateup_output = _apply_swiglu_limit(
-                gateup_output, swiglu_limit=self.swiglu_limit
-            )
+            if self.swiglu_limit is not None:
+                gateup_output = _apply_swiglu_limit(
+                    gateup_output, swiglu_limit=self.swiglu_limit
+                )
 
             down_input = torch.empty(
                 (all_tokens, N // 2),
