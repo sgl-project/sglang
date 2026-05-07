@@ -433,6 +433,14 @@ class ServerArgs:
     export_metrics_to_file: bool = False
     export_metrics_to_file_dir: Optional[str] = None
 
+    # Class-level DI for the five *MetricsCollector classes. Maps collector role
+    # (one of: "scheduler", "tokenizer", "storage", "radix_cache", "expert_dispatch")
+    # to a subclass of the matching base collector. The five instantiation sites
+    # read from this map and fall back to the base class. Class-object only (no
+    # CLI surface) since this exists for embedded use cases that pass a Python
+    # class directly. Default None preserves existing behavior.
+    stat_loggers: Optional[Dict[str, type]] = None
+
     # API related
     api_key: Optional[str] = None
     admin_api_key: Optional[str] = None

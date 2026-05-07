@@ -54,7 +54,11 @@ from sglang.srt.mem_cache.radix_cache import (
     split_node_hash_value,
 )
 from sglang.srt.mem_cache.utils import convert_to_bigram_key
-from sglang.srt.observability.metrics_collector import StorageMetricsCollector
+from sglang.srt.observability.metrics_collector import (
+    STAT_LOGGER_ROLE_STORAGE,
+    StorageMetricsCollector,
+    resolve_collector_class,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.cache_init_params import CacheInitParams
@@ -233,7 +237,14 @@ class HiRadixCache(RadixCache):
                 labels.update(extra_metric_labels)
             existing_collector = getattr(self, "storage_metrics_collector", None)
             if existing_collector is None:
-                self.storage_metrics_collector = StorageMetricsCollector(labels=labels)
+                from sglang.srt.server_args import get_global_server_args
+
+                storage_cls = resolve_collector_class(
+                    get_global_server_args(),
+                    STAT_LOGGER_ROLE_STORAGE,
+                    StorageMetricsCollector,
+                )
+                self.storage_metrics_collector = storage_cls(labels=labels)
             elif set(existing_collector.labels.keys()) == set(labels.keys()):
                 existing_collector.labels = labels
             else:

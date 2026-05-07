@@ -22,11 +22,13 @@ from sglang.srt.managers.io_struct import (
 from sglang.srt.managers.scheduler import ScheduleBatch
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.observability.metrics_collector import (
+    STAT_LOGGER_ROLE_SCHEDULER,
     DPCooperationInfo,
     QueueCount,
     SchedulerMetricsCollector,
     SchedulerStats,
     compute_routing_key_stats,
+    resolve_collector_class,
 )
 from sglang.srt.utils.device_timer import DeviceTimer, GapTimer
 from sglang.srt.utils.scheduler_status_logger import SchedulerStatusLogger
@@ -142,7 +144,12 @@ class SchedulerMetricsMixin:
                 labels["dp_rank"] = dp_rank
             if self.server_args.extra_metric_labels:
                 labels.update(self.server_args.extra_metric_labels)
-            self.metrics_collector = SchedulerMetricsCollector(
+            scheduler_collector_cls = resolve_collector_class(
+                self.server_args,
+                STAT_LOGGER_ROLE_SCHEDULER,
+                SchedulerMetricsCollector,
+            )
+            self.metrics_collector = scheduler_collector_cls(
                 labels=labels,
                 enable_lora=self.enable_lora,
                 enable_hierarchical_cache=self.enable_hierarchical_cache,
