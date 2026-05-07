@@ -56,10 +56,8 @@ from sglang.srt.mem_cache.evict_policy import (
     PriorityStrategy,
     SLRUStrategy,
 )
-from sglang.srt.mem_cache.utils import (
-    KVCacheEventMixin,
-    split_node_hash_value,
-)
+from sglang.srt.mem_cache.events import KVCacheEventMixin
+from sglang.srt.mem_cache.utils import split_node_hash_value
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
