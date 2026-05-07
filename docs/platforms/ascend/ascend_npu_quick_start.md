@@ -11,12 +11,12 @@
 
 __Notice:__ The following commands are based on Atlas 800I A3 machines. If you are using Atlas 800I A2, some changes are needed.
 
-- The image tag needs to be `main-cann8.5.0-a3` for Atlas 800I A3 and `main-cann8.5.0-910b` for Atlas 800I A2.
+- The image tag needs to be `main-cann9.0.0-a3` for Atlas 800I A3 and `main-cann9.0.0-910b` for Atlas 800I A2.
 - The device mapping in `docker run` command needs to be changed to `davinci[0-7]` for Atlas 800I A2.
 
 ```shell
 # For Atlas 800I A3
-export IMAGE=quay.io/ascend/sglang:main-cann8.5.0-a3
+export IMAGE=quay.io/ascend/sglang:main-cann9.0.0-a3
 
 docker run -it --rm --privileged --network=host --ipc=host --shm-size=16g \
     --device=/dev/davinci0 --device=/dev/davinci1 --device=/dev/davinci2 --device=/dev/davinci3 \
