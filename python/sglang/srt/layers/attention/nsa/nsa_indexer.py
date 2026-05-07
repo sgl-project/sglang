@@ -28,6 +28,24 @@ from sglang.srt.utils import (
     is_hip,
     is_npu,
 )
+from sglang.srt.distributed import (
+    get_attn_context_model_parallel_rank,
+    get_attn_context_model_parallel_world_size,
+)
+from sglang.srt.distributed.parallel_state import get_pp_group
+from sglang.srt.layers import deep_gemm_wrapper
+from sglang.srt.layers.attention.nsa.utils import (
+    is_nsa_enable_prefill_cp,
+    is_nsa_prefill_cp_in_seq_split,
+)
+from sglang.srt.layers.communicator import ScatterMode
+from sglang.srt.layers.linear import ReplicatedLinear
+from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.rotary_embedding import get_rope_wrapper
+from sglang.srt.layers.utils.cp_utils import cp_all_gather_rerange_output
+from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.server_args import get_global_server_args
 
 global _use_multi_stream
 _is_cuda = is_cuda()
@@ -48,25 +66,6 @@ if _use_aiter:
 if is_npu():
     import torch_npu
     from sglang.srt.hardware_backend.npu.utils import get_indexer_weight_stream
-
-from sglang.srt.distributed import (
-    get_attn_context_model_parallel_rank,
-    get_attn_context_model_parallel_world_size,
-)
-from sglang.srt.distributed.parallel_state import get_pp_group
-from sglang.srt.layers import deep_gemm_wrapper
-from sglang.srt.layers.attention.nsa.utils import (
-    is_nsa_enable_prefill_cp,
-    is_nsa_prefill_cp_in_seq_split,
-)
-from sglang.srt.layers.communicator import ScatterMode
-from sglang.srt.layers.linear import ReplicatedLinear
-from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.layers.rotary_embedding import get_rope_wrapper
-from sglang.srt.layers.utils.cp_utils import cp_all_gather_rerange_output
-from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.server_args import get_global_server_args
 
 _use_ag_after_qlora = envs.SGLANG_USE_AG_AFTER_QLORA.get()
 if TYPE_CHECKING:
@@ -939,10 +938,6 @@ class Indexer(MultiPlatformOp):
         assert len(weights.shape) == 3
         weights = weights.squeeze(-1)
 
-        # logits = deep_gemm.fp8_mqa_logits(q_fp8, kv_fp8, weights, ks, ke)
-        k_fp8_list = []
-        k_scale_list = []
-
         topk_indices_list = []
 
         block_tables = forward_batch.req_to_token_pool.req_to_token[
@@ -1365,7 +1360,7 @@ class Indexer(MultiPlatformOp):
                     q = self.wq_b(q_lora)[
                         0
                     ]  # [bs, 1536] @ [1536, 64 * 128] = [bs, 64 * 128]
-                    wq_b_event = self.alt_stream.record_event()
+                    self.alt_stream.record_event()
                     q = q.view(bs, self.n_heads, self.head_dim)  # [bs, 64, 128]
                     q_pe, q_nope = torch.split(
                         q,
