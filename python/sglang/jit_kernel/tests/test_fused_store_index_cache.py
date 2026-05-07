@@ -455,5 +455,51 @@ def test_reference_writes_nonzero():
     torch.testing.assert_close(deq, key.float(), rtol=0.15, atol=5e-2)
 
 
+# TEST 7: extend_num_tokens parameter
+@pytest.mark.parametrize("n", [8, 16, None])
+def test_extend_num_tokens_smaller_skips_tail(n):
+    _skip_if_unavailable()
+    device = torch.device("cuda")
+
+    num_tokens = 16
+    n_ = num_tokens if n is None else n
+    torch.manual_seed(1)
+    key = torch.randn((num_tokens, HEAD_DIM), device=device, dtype=torch.bfloat16)
+    loc = torch.arange(num_tokens, device=device, dtype=torch.int64)
+    num_pages = _num_pages(loc, PAGE_SIZE)
+
+    # Sentinel pattern (0xAA) lets us verify which slots the kernel touched.
+    SENTINEL = 0xAA
+    buf = _make_buffer(num_pages)
+    buf.fill_(SENTINEL)
+
+    extend = None if n is None else torch.tensor([n], dtype=torch.int32, device=device)
+    fused_store_index_k_cache(
+        key, buf, loc, page_size=PAGE_SIZE, extend_num_tokens=extend
+    )
+    torch.cuda.synchronize()
+
+    # Gather per-row fp8 (128 bytes) and scale (4 bytes) byte regions
+    buf_flat = buf.reshape(-1)
+    page_bytes = PAGE_SIZE * BYTES_PER_TOKEN
+    page = loc // PAGE_SIZE
+    offset = loc % PAGE_SIZE
+    val_idx = (page * page_bytes + offset * 128).unsqueeze(1) + torch.arange(
+        128, device=device, dtype=torch.int64
+    )
+    scale_idx = (page * page_bytes + 128 * PAGE_SIZE + offset * 4).unsqueeze(
+        1
+    ) + torch.arange(4, device=device, dtype=torch.int64)
+    fp8_per_row = buf_flat[val_idx]  # (num_tokens, 128)
+    scale_per_row = buf_flat[scale_idx]  # (num_tokens, 4)
+
+    # Rows [0, n_) were written => at least one byte per row differs from
+    # sentinel; rows [n_, num_tokens) untouched => both fp8 and scale bytes
+    # still all-sentinel.
+    assert (fp8_per_row[:n_] != SENTINEL).any(dim=1).all()
+    assert (fp8_per_row[n_:] == SENTINEL).all()
+    assert (scale_per_row[n_:] == SENTINEL).all()
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v", "-s"]))
