@@ -1509,8 +1509,8 @@ class ServerArgs:
                 reserved_mem = max(reserved_mem, 10 * 1024)
 
             if self.speculative_algorithm is not None:
-                if self.speculative_algorithm == "STANDALONE":
-                    # standalonedraft model and cuda graphs
+                if self.speculative_algorithm in ("STANDALONE", "TLI"):
+                    # standalone / TLI draft model and cuda graphs
                     reserved_mem += 6 * 1024
                 elif self.speculative_algorithm != "NGRAM":
                     # eagle draft models and cuda graphs
@@ -3590,6 +3590,66 @@ class ServerArgs:
                     "speculative_eagle_topk > 1 with page_size > 1 is unstable and produces incorrect results for paged attention backends. This combination is only supported for the 'flashinfer' backend."
                 )
 
+        if self.speculative_algorithm == "TLI":
+            if self.enable_dp_attention:
+                raise ValueError(
+                    "TLI speculative decoding does not support dp attention."
+                )
+
+            if self.speculative_draft_model_path is None:
+                raise ValueError(
+                    "TLI speculative decoding requires setting "
+                    "--speculative-draft-model-path to a model with a different "
+                    "but overlapping vocabulary."
+                )
+
+            if self.max_running_requests is None:
+                self.max_running_requests = 48
+                logger.warning(
+                    "Max running requests is reset to 48 for TLI speculative decoding. "
+                    "You can override this by explicitly setting --max-running-requests."
+                )
+
+            self.disable_overlap_schedule = True
+            logger.warning(
+                "Overlap scheduler is disabled when using TLI speculative decoding "
+                "(spec v2 is not supported yet)."
+            )
+
+            if self.enable_mixed_chunk:
+                self.enable_mixed_chunk = False
+                logger.warning(
+                    "Mixed chunked prefill is disabled because of using "
+                    "TLI speculative decoding."
+                )
+
+            if self.speculative_num_steps is None:
+                assert (
+                    self.speculative_eagle_topk is None
+                    and self.speculative_num_draft_tokens is None
+                )
+                (
+                    self.speculative_num_steps,
+                    self.speculative_eagle_topk,
+                    self.speculative_num_draft_tokens,
+                ) = auto_choose_speculative_params(self)
+
+            if (
+                self.speculative_eagle_topk is not None
+                and self.speculative_eagle_topk != 1
+            ):
+                raise ValueError(
+                    "TLI speculative decoding only supports speculative_eagle_topk == 1."
+                )
+            self.speculative_eagle_topk = 1
+
+            if self.speculative_num_draft_tokens != self.speculative_num_steps + 1:
+                logger.warning(
+                    "speculative_num_draft_tokens is adjusted to speculative_num_steps + 1 "
+                    "for TLI speculative decoding."
+                )
+                self.speculative_num_draft_tokens = self.speculative_num_steps + 1
+
         if self.speculative_algorithm == "NGRAM":
             if not self.device.startswith("cuda"):
                 raise ValueError(
@@ -5421,7 +5481,15 @@ class ServerArgs:
         parser.add_argument(
             "--speculative-algorithm",
             type=str,
-            choices=["DFLASH", "EAGLE", "EAGLE3", "NEXTN", "STANDALONE", "NGRAM"],
+            choices=[
+                "DFLASH",
+                "EAGLE",
+                "EAGLE3",
+                "NEXTN",
+                "STANDALONE",
+                "TLI",
+                "NGRAM",
+            ],
             help="Speculative algorithm.",
         )
         parser.add_argument(
@@ -7560,8 +7628,8 @@ def auto_choose_speculative_params(self: ServerArgs):
     """
     hf_config = self.get_model_config().hf_config
     arch = hf_config.architectures[0]
-    if self.speculative_algorithm == "STANDALONE":
-        # The default value for standalone speculative decoding
+    if self.speculative_algorithm in ("STANDALONE", "TLI"):
+        # The default value for standalone / TLI speculative decoding
         return (3, 1, 4)
     if arch in ["LlamaForCausalLM"]:
         # The default value for llama

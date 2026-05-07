@@ -1,6 +1,6 @@
 # Speculative Decoding
 
-SGLang provides several speculative decoding options, including EAGLE-2/EAGLE-3, MTP, classic draft-model decoding, and an NGRAM-based variant. Our implementation aims to maximize speed and efficiency and is considered to be among the fastest in open-source LLM engines.
+SGLang provides several speculative decoding options, including EAGLE-2/EAGLE-3, MTP, classic draft-model decoding, TLI (heterogeneous-vocabulary draft models), and an NGRAM-based variant. Our implementation aims to maximize speed and efficiency and is considered to be among the fastest in open-source LLM engines.
 
 ## Summary
 
@@ -13,6 +13,7 @@ SGLang provides several speculative decoding options, including EAGLE-2/EAGLE-3,
   - [EAGLE-3 Decoding](#eagle-3-decoding)
 - [Multi Token Prediction](#multi-token-prediction)
 - [Standalone Speculative Decoding (Small Draft Model)](#standalone-speculative-decoding-small-draft-model)
+- [TLI — Heterogeneous-Vocabulary Speculative Decoding](#tli--heterogeneous-vocabulary-speculative-decoding)
 - [Speculative Decoding V2 (Overlap Scheduler)](#speculative-decoding-v2-overlap-scheduler)
 - [Ngram Speculative Decoding](#ngram-speculative-decoding)
 - [Full Parameter Reference](#full-parameter-reference)
@@ -26,7 +27,8 @@ SGLang provides several speculative decoding options, including EAGLE-2/EAGLE-3,
 - **Workload acceptance changes over time**: Use [**Adaptive speculative decoding**](adaptive_speculative_decoding.md) on top of **EAGLE** with `--speculative-eagle-topk 1`.
 - **Lower `lm_head` overhead for EAGLE-2**: Enable **FR-Spec** with `--speculative-token-map`.
 - **Model is MTP-enabled**: Use **MTP via speculative decoding** (often with small `speculative_num_steps/topk/num_draft_tokens`, see the example section).
-- **You have a smaller draft LLM**: Use **STANDALONE** (`--speculative-algorithm STANDALONE`).
+- **You have a smaller draft LLM (same vocabulary)**: Use **STANDALONE** (`--speculative-algorithm STANDALONE`).
+- **You have a smaller draft LLM with a *different* tokenizer**: Use **TLI** (`--speculative-algorithm TLI`). Any pair of models whose vocabularies have meaningful token overlap can be used.
 - **No extra model available**: Use **NGRAM** (`--speculative-algorithm NGRAM`, CUDA-only).
 - **Want overlap scheduler (experimental)**: Enable **SpecV2** with `SGLANG_ENABLE_SPEC_V2=True` (requires `--speculative-eagle-topk 1`).
 
@@ -39,7 +41,8 @@ SGLang provides several speculative decoding options, including EAGLE-2/EAGLE-3,
 | EAGLE-2 + FR-Spec | Same as EAGLE-2 + token subset | Typically yes | Add `--speculative-token-map ...` | Reduces `lm_head` overhead with high-frequency token vocab |
 | EAGLE-3 | EAGLE3 draft model | Yes | `--speculative-algorithm EAGLE3` + `--speculative-draft-model-path ...` | Best throughput in the benchmark below |
 | MTP | Built-in multi-token heads (model-specific) | Often no | See **Multi Token Prediction** section | Uses speculative workflow; draft path may be auto-handled for some models |
-| STANDALONE | Smaller draft LLM (token-level) | Yes | `--speculative-algorithm STANDALONE` + `--speculative-draft-model-path ...` | Does **not** support `--enable-dp-attention` |
+| STANDALONE | Smaller draft LLM (token-level, **same vocabulary**) | Yes | `--speculative-algorithm STANDALONE` + `--speculative-draft-model-path ...` | Does **not** support `--enable-dp-attention` |
+| TLI | Smaller draft LLM (**heterogeneous vocabulary**, Token-Level Intersection) | Yes | `--speculative-algorithm TLI` + `--speculative-draft-model-path ...` | Lossless; requires meaningful vocab overlap; does **not** support `--enable-dp-attention` |
 | SpecV2 (experimental) | V2 workers + overlap scheduler | N/A | `SGLANG_ENABLE_SPEC_V2=True` | Only supports `--speculative-eagle-topk 1`; applies to `EAGLE`, `EAGLE3`, `STANDALONE` |
 | NGRAM | Ngram cache from previous tokens | No | `--speculative-algorithm NGRAM` | CUDA-only; no `--enable-dp-attention`; disables overlap scheduler & mixed chunked prefill |
 
@@ -331,6 +334,61 @@ print(response.choices[0].message.content)
 
 ---
 
+## TLI — Heterogeneous-Vocabulary Speculative Decoding
+
+**TLI (Token-Level Intersection)** extends STANDALONE speculative decoding to draft models whose vocabulary differs from the target model. This unlocks a much wider range of public draft models (e.g. `bigcode/tiny_starcoder_py`, `Qwen/Qwen2-0.5B-Instruct`, `double7/vicuna-68m`) without requiring tokenizer alignment.
+
+Based on the ICML 2025 oral paper [_Accelerating LLM Inference with Lossless Speculative Decoding Algorithms for Heterogeneous Vocabularies_ — Timor et al.](https://arxiv.org/abs/2502.05202).
+
+TLI is **provably lossless**: it produces the same output distribution as the target model alone.
+
+### How it works
+
+1. At startup, SGLang computes the **token intersection** between the target and draft vocabularies by normalizing BPE space-prefix characters (`Ġ`, `▁`, or detected dynamically).
+2. During drafting, logits for tokens outside the intersection are set to `−∞` and the draft LM head is pruned to the intersection size to reduce the matmul cost.
+3. Accepted draft tokens are remapped from draft vocabulary to target vocabulary before verification — no changes to the rejection-sampling step.
+
+### Constraints
+
+- Does **not** support `--enable-dp-attention`.
+- Does **not** support SpecV2 (overlap scheduler).
+- Requires the draft model vocabulary to overlap meaningfully with the target (≥70% for useful acceptance rates; ≥90% recommended).
+
+### Usage
+
+```bash
+python3 -m sglang.launch_server \
+    --model codellama/CodeLlama-13b-Instruct-hf \
+    --speculative-algorithm TLI \
+    --speculative-draft-model-path bigcode/tiny_starcoder_py \
+    --mem-fraction-static 0.7 \
+    --cuda-graph-max-bs 8 \
+    --log-level warning
+```
+
+Parameters (`--speculative-num-steps`, `--speculative-eagle-topk`, `--speculative-num-draft-tokens`) are auto-chosen when omitted.
+
+**Send a request:**
+
+```python
+import openai
+
+client = openai.Client(base_url="http://127.0.0.1:30000/v1", api_key="None")
+
+response = client.chat.completions.create(
+    model="codellama/CodeLlama-13b-Instruct-hf",
+    messages=[
+        {"role": "user", "content": "Write a Python function to compute the Fibonacci sequence."},
+    ],
+    temperature=0,
+    max_tokens=128,
+)
+
+print(response.choices[0].message.content)
+```
+
+---
+
 ## Speculative Decoding V2 (Overlap Scheduler)
 
 SGLang provides an **experimental Speculative Decoding V2** implementation that enables an overlap scheduler and uses V2 speculative workers (e.g. `StandaloneWorkerV2`, `EAGLEWorkerV2`).
@@ -443,7 +501,7 @@ Below is a comprehensive list of all speculative decoding parameters available i
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `--speculative-algorithm` | `str` | `None` | Algorithm to use: `EAGLE`, `EAGLE3`, `STANDALONE`, `NGRAM`, `NEXTN` (alias of `EAGLE`) |
+| `--speculative-algorithm` | `str` | `None` | Algorithm to use: `EAGLE`, `EAGLE3`, `STANDALONE`, `TLI`, `NGRAM`, `NEXTN` (alias of `EAGLE`) |
 | `--speculative-draft-model-path` | `str` | `None` | Path to the draft model weights |
 | `--speculative-draft-model-revision` | `str` | `None` | Specific revision/commit of the draft model (`"main"` is auto-used when draft path is set and revision is omitted) |
 | `--speculative-draft-load-format` | `str` | `None` | Load format for draft model weights |

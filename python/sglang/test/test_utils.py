@@ -119,6 +119,13 @@ DEFAULT_DRAFT_MODEL_EAGLE_DP_ATTN = "Tengyunw/qwen3_30b_moe_eagle3"
 DEFAULT_TARGET_MODEL_STANDALONE = "meta-llama/Llama-3.1-8B-Instruct"
 DEFAULT_DRAFT_MODEL_STANDALONE = "meta-llama/Llama-3.2-1B-Instruct"
 
+# TLI (Token-Level Intersection) speculative decoding models
+# Same-tokenizer pair: high vocab overlap, exercises all TLI code paths
+DEFAULT_TARGET_MODEL_TLI = "meta-llama/Llama-3.1-8B-Instruct"
+DEFAULT_DRAFT_MODEL_TLI = "meta-llama/Llama-3.2-1B-Instruct"
+# Cross-family pair: different tokenizers, exercises TLI's unique cross-family capability
+DEFAULT_CROSS_FAMILY_DRAFT_MODEL_TLI = "Qwen/Qwen2.5-0.5B-Instruct"
+
 # N-gram speculative decoding models
 DEFAULT_TARGET_MODEL_NGRAM = "Qwen/Qwen2.5-Coder-7B-Instruct"
 
