@@ -159,6 +159,7 @@ def unified_attention_with_output(
     q_rope: Optional[torch.Tensor] = None,
     k_rope: Optional[torch.Tensor] = None,
     sinks: Optional[torch.Tensor] = None,
+    topk_indices: Optional[torch.Tensor] = None,
 ) -> None:
     context = get_forward_context()
     forward_batch = context.forward_batch
@@ -177,6 +178,10 @@ def unified_attention_with_output(
         kwargs["k_rope"] = k_rope[:real_num_tokens]
     if sinks is not None:
         kwargs["sinks"] = sinks
+    if topk_indices is not None:
+        kwargs["topk_indices"] = (
+            topk_indices if topk_indices.dim() == 3 else topk_indices[:real_num_tokens]
+        )
 
     original_out_cache_loc = forward_batch.out_cache_loc
     original_out_cache_loc_swa = forward_batch.out_cache_loc_swa
