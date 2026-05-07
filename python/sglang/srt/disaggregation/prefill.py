@@ -703,6 +703,15 @@ class SchedulerDisaggregationPrefillMixin:
             result.extend_logprob_start_len_per_req,
         )
 
+        if result.copy_done is not None:
+            result.copy_done.synchronize()
+        if result.routed_experts_output is not None:
+            result.routed_experts_output.finalize()
+            result.routed_experts_output = None
+        if result.indexer_topk_output is not None:
+            result.indexer_topk_output.finalize()
+            result.indexer_topk_output = None
+
         logprob_pt = 0
         next_token_ids = result.next_token_ids.tolist()
         if batch.return_logprob:
@@ -722,7 +731,7 @@ class SchedulerDisaggregationPrefillMixin:
                 req.time_stats.set_prefill_finished_time()
 
                 req.output_ids.append(next_token_id)
-                self.tree_cache.cache_unfinished_req(req)
+                maybe_cache_unfinished_req(req, self.tree_cache)
                 self.disagg_prefill_inflight_queue.append(req)
                 if self.spec_algorithm.is_eagle() and batch.spec_info is not None:
                     req.output_topk_p = batch.spec_info.topk_p[i]
