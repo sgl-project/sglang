@@ -6009,8 +6009,9 @@ class ServerArgs:
         parser.add_argument(
             "--enable-cuda-graph-collective-break",
             action="store_true",
-            default=ServerArgs.enable_cuda_graph_collective_break,
-            help=argparse.SUPPRESS,
+            help="Run model-parallel collectives eagerly between captured CUDA graph segments "
+            "instead of recording them inside the captured graph. Auto-enabled for "
+            "multi-node Qwen3-Next / Qwen3.5 to avoid a captured-collective deadlock at replay.",
         )
         parser.add_argument(
             "--enable-cudagraph-gc",
