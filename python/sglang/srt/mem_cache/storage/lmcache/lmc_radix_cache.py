@@ -103,15 +103,15 @@ class LMCRadixCache(RadixCache):
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
     ):
         super().__init__(params)
-        from sglang.srt.server_args import get_global_server_args
-
-        global_server_args = get_global_server_args()
 
         kvcache = self.token_to_kv_pool_allocator.get_kvcache()
         connector_kwargs = dict(
             sgl_config=model_config,
             tp_size=tp_size,
             rank=rank,
+            # NOTE: The original implementation accessed private buffers via
+            # `_kvcache.k_buffer` / `.v_buffer`. We prefer public accessors when
+            # available; fall back to private fields if needed.
             k_pool=getattr(
                 kvcache,
                 "k_buffer",
@@ -124,6 +124,9 @@ class LMCRadixCache(RadixCache):
             ),
             tp_group=tp_group.device_group if tp_group is not None else None,
         )
+        from sglang.srt.server_args import get_global_server_args
+
+        global_server_args = get_global_server_args()
         self._mp_mode = global_server_args.lmcache_mp_host is not None
         if self._mp_mode:
             self.lmcache_connector = LMCacheMPConnector(
@@ -157,68 +160,6 @@ class LMCRadixCache(RadixCache):
         if hasattr(self, "_in_flight_nodes"):
             with self._node_lock:
                 self._in_flight_nodes.clear()
-
-    def match_prefix(self, params: MatchPrefixParams) -> MatchResult:  # type: ignore[override]
-        """Match cached prefix; if there's a tail miss, prefetch from LMCache.
-
-        Reuses the base matching logic to obtain (value, last_node). If there
-        remains a *page-aligned* uncached suffix and there is room (or after
-        eviction), we allocate token slots and trigger an async LMCache load
-        into those slots, then materialize a new child node for the retrieved
-        chunk.
-        """
-        key = params.key
-        if self.disable or not key:
-            return super().match_prefix(params)
-
-        if self.page_size != 1:
-            aligned_len = len(key) // self.page_size * self.page_size
-            key = key[:aligned_len]
-
-        base_res = super().match_prefix(params)
-        value: torch.Tensor = base_res.device_indices
-        last_node: TreeNode = base_res.last_device_node
-
-        # MP mode: phase 1 LOOKUP here, phase 2 RETRIEVE in init_load_back.
-        # Peek callers without a Req (e.g. schedule_policy) see radix only.
-        if self._mp_mode:
-            if params.req is None:
-                return base_res
-            return self._mp_match_prefix(key, base_res, value, last_node, params.req)
-
-        # In-process mode: single-shot start_load_kv + per-layer transfer hook.
-        if value.numel() == len(key):
-            return base_res
-        uncached_len = len(key) - value.numel()
-        if uncached_len == 0:
-            return base_res
-
-        def _load(slot_mapping: torch.Tensor, prefix_pad: int) -> int:
-            with torch.cuda.stream(self.load_stream):
-                return self.lmcache_connector.start_load_kv(
-                    LoadMetadata(
-                        token_ids=key.token_ids,
-                        slot_mapping=slot_mapping,
-                        offset=value.numel() - prefix_pad,
-                    )
-                )
-
-        result = self._alloc_and_load_chunk(
-            token_ids=key.token_ids,
-            extra_key=key.extra_key,
-            value_numel=int(value.numel()),
-            target_count=uncached_len,
-            last_node=last_node,
-            load_fn=_load,
-        )
-        if result is None:
-            return base_res
-        new_slots, new_node = result
-        return MatchResult(
-            device_indices=torch.cat([value, new_slots]),
-            last_device_node=new_node,
-            last_host_node=new_node,
-        )
 
     def _mp_match_prefix(
         self,
@@ -254,6 +195,133 @@ class LMCRadixCache(RadixCache):
             last_host_node=marker,
             host_hit_length=matched - int(value.numel()),
         )
+
+    def match_prefix(self, params: MatchPrefixParams) -> MatchResult:  # type: ignore[override]
+        """Match cached prefix; if there's a tail miss, prefetch from LMCache.
+
+        Reuses the base matching logic to obtain (value, last_node). If there
+        remains a *page-aligned* uncached suffix and there is room (or after
+        eviction), we allocate token slots and trigger an async LMCache load
+        into those slots, then materialize a new child node for the retrieved
+        chunk.
+        """
+        key = params.key
+        if self.disable or not key:
+            return super().match_prefix(params)
+
+        if self.page_size != 1:
+            aligned_len = len(key) // self.page_size * self.page_size
+            key = key[:aligned_len]
+
+        base_res = super().match_prefix(params)
+        value: torch.Tensor = base_res.device_indices
+        last_node: TreeNode = base_res.last_device_node
+
+        # MP mode: phase 1 LOOKUP here, phase 2 RETRIEVE in init_load_back.
+        # Peek callers without a Req (e.g. schedule_policy) see radix only.
+        if self._mp_mode:
+            if params.req is None:
+                return base_res
+            return self._mp_match_prefix(key, base_res, value, last_node, params.req)
+
+        # In-process mode: single-shot start_load_kv + per-layer transfer hook.
+        if value.numel() == len(key):
+            return base_res
+
+        uncached_len = len(key) - value.numel()
+        if uncached_len == 0:
+            return base_res
+
+        def _load(slot_mapping: torch.Tensor, prefix_pad: int) -> int:
+            with torch.cuda.stream(self.load_stream):
+                return self.lmcache_connector.start_load_kv(
+                    LoadMetadata(
+                        token_ids=key.token_ids,
+                        slot_mapping=slot_mapping,
+                        offset=value.numel() - prefix_pad,
+                    )
+                )
+
+        result = self._alloc_and_load_chunk(
+            key=key,
+            value_numel=int(value.numel()),
+            uncached_len=uncached_len,
+            last_node=last_node,
+            load_fn=_load,
+        )
+        if result is None:
+            return base_res
+        new_slots, new_node = result
+        return MatchResult(
+            device_indices=torch.cat([value, new_slots]),
+            last_device_node=new_node,
+            last_host_node=new_node,
+        )
+
+    def _alloc_and_load_chunk(
+        self,
+        *,
+        key: RadixKey,
+        value_numel: int,
+        uncached_len: int,
+        last_node: TreeNode,
+        load_fn,  # Callable[[torch.Tensor, int], int] — (slot_mapping, prefix_pad) -> num_retrieved
+    ) -> Optional[Tuple[torch.Tensor, TreeNode]]:
+        """Shared body for in-process ``match_prefix`` and MP ``init_load_back``.
+
+        Allocates ``uncached_len`` GPU slots (evicting if needed), builds
+        the slot_mapping with leading sentinels, calls ``load_fn`` with
+        ``(slot_mapping, prefix_pad)``, frees unused slots, and builds a
+        new ``TreeNode`` under ``last_node`` for the fetched range.
+
+        Returns ``(slots[:fetched], new_node)`` on success, ``None`` on
+        alloc failure or zero-token retrieve (in either case all
+        allocated slots have been freed).
+        """
+        chunk_size = self.lmcache_connector.chunk_size()
+        prefix_pad = value_numel % chunk_size
+
+        if self.token_to_kv_pool_allocator.available_size() < uncached_len:
+            self.evict(EvictParams(num_tokens=uncached_len))
+
+        token_slots = self.token_to_kv_pool_allocator.alloc(uncached_len)
+        if token_slots is None:
+            return None
+
+        slot_mapping = torch.cat(
+            [
+                torch.full((value_numel,), -1, dtype=torch.int64, device=self.device),
+                token_slots.detach().clone().to(torch.int64).to(self.device),
+            ]
+        )
+
+        num_retrieved = load_fn(slot_mapping, prefix_pad)
+        logger.debug("num_retrieved_tokens: %s", num_retrieved)
+
+        if num_retrieved > 0:
+            self.token_to_kv_pool_allocator.free(
+                token_slots[(num_retrieved - prefix_pad) :]
+            )
+        else:
+            self.token_to_kv_pool_allocator.free(token_slots)
+
+        if num_retrieved > 0:
+            fetched = num_retrieved - prefix_pad
+            new_node = TreeNode(priority=last_node.priority)
+            start = value_numel
+            end = start + fetched
+            new_node.key = key[start:end]
+            new_node.value = token_slots[:fetched]
+            new_node.parent = last_node
+            last_node.children[new_node.key.child_key(self.page_size)] = new_node
+            self.evictable_size_ += fetched
+
+            self._record_store_event(new_node.parent)
+            self._record_store_event(new_node)
+
+            return token_slots[:fetched], new_node
+
+        return None
 
     def init_load_back(  # type: ignore[override]
         self, params: InitLoadBackParams
@@ -296,10 +364,9 @@ class LMCRadixCache(RadixCache):
             return n
 
         result = self._alloc_and_load_chunk(
-            token_ids=marker.token_ids,
-            extra_key=marker.extra_key,
+            key=RadixKey(marker.token_ids, marker.extra_key),
             value_numel=marker.value_numel,
-            target_count=marker.matched - marker.value_numel,
+            uncached_len=marker.matched - marker.value_numel,
             last_node=last_node,
             load_fn=_load,
         )
@@ -313,66 +380,6 @@ class LMCRadixCache(RadixCache):
                 last_node,
             )
         return result
-
-    def _alloc_and_load_chunk(
-        self,
-        *,
-        token_ids: list[int],
-        extra_key: Optional[str],
-        value_numel: int,
-        target_count: int,
-        last_node: TreeNode,
-        load_fn,  # Callable[[torch.Tensor, int], int] — (slot_mapping, prefix_pad) -> num_retrieved
-    ) -> Optional[Tuple[torch.Tensor, TreeNode]]:
-        """Shared body for in-process ``match_prefix`` and MP ``init_load_back``.
-
-        Allocates ``target_count`` GPU slots (evicting if needed), builds
-        the slot_mapping with leading sentinels, calls ``load_fn`` with
-        ``(slot_mapping, prefix_pad)``, frees unused slots, and builds a
-        new ``TreeNode`` under ``last_node`` for the fetched range.
-
-        Returns ``(slots[:fetched], new_node)`` on success, ``None`` on
-        alloc failure or zero-token retrieve (in either case all
-        allocated slots have been freed).
-        """
-        if self.token_to_kv_pool_allocator.available_size() < target_count:
-            self.evict(EvictParams(num_tokens=target_count))
-        token_slots = self.token_to_kv_pool_allocator.alloc(target_count)
-        if token_slots is None:
-            return None
-
-        chunk_size = self.lmcache_connector.chunk_size()
-        prefix_pad = value_numel % chunk_size
-
-        slot_mapping = torch.cat(
-            [
-                torch.full((value_numel,), -1, dtype=torch.int64, device=self.device),
-                token_slots.detach().clone().to(torch.int64).to(self.device),
-            ]
-        )
-
-        num_retrieved = load_fn(slot_mapping, prefix_pad)
-        if num_retrieved <= 0:
-            self.token_to_kv_pool_allocator.free(token_slots)
-            return None
-
-        fetched = num_retrieved - prefix_pad
-        if fetched < target_count:
-            self.token_to_kv_pool_allocator.free(token_slots[fetched:])
-
-        new_node = TreeNode(priority=last_node.priority)
-        new_node.key = RadixKey(
-            token_ids[value_numel : value_numel + fetched], extra_key
-        )
-        new_node.value = token_slots[:fetched]
-        new_node.parent = last_node
-        last_node.children[new_node.key.child_key(self.page_size)] = new_node
-        self.evictable_size_ += fetched
-
-        self._record_store_event(new_node.parent)
-        self._record_store_event(new_node)
-
-        return token_slots[:fetched], new_node
 
     def cache_finished_req(self, req: Req, is_insert: bool = True) -> None:  # type: ignore[override]
         """On request completion, insert device KV into radix and store to LMCache."""
