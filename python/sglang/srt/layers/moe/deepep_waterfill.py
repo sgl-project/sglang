@@ -391,6 +391,10 @@ class DeepEPWaterfillBalancer:
         metadata = get_global_expert_location_metadata()
         if metadata is None or metadata.rank_load is None:
             return
+        # One-shot bind: works for --init-expert-location (live view tracks EPLB
+        # in-place rebalance updates). Without init, rank_load is None at load and
+        # later allocated by EPLB rebalance — balancer then stays on dynamic
+        # all-reduce since this is not re-invoked. Correct, small perf gap.
         if self.static_rank_load is not None:
             return
         if self.layer_id < metadata.rank_load.shape[0]:
