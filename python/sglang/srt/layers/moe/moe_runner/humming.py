@@ -368,6 +368,12 @@ class HummingRunnerCore(MoeRunnerCore):
 
     def apply_activation(self, inputs: torch.Tensor, outputs: torch.Tensor):
         if self.activation == "silu":
+            if self.swiglu_limit is not None:
+                from sglang.srt.layers.moe.moe_runner.deep_gemm import (
+                    _apply_swiglu_limit,
+                )
+
+                inputs = _apply_swiglu_limit(inputs, swiglu_limit=self.swiglu_limit)
             from sgl_kernel import silu_and_mul
 
             silu_and_mul(inputs, outputs)
