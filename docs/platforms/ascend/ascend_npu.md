@@ -6,9 +6,9 @@ You can install SGLang using any of the methods below. Please go through `System
 ## Component Version Mapping For SGLang
 | Component         | Version                 | Obtain Way                                                                                                                                                                                                                   |
 |-------------------|-------------------------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| HDK               | 25.5.2                  | [link](https://www.hiascend.com/hardware/firmware-drivers/commercial?product=7&model=33) |
+| HDK               | 26.0.RC1                 | [link]([https://www.hiascend.com/hardware/firmware-drivers/commercial?product=7&model=33](https://www.hiascend.com/hardware/firmware-drivers/community?product=1&model=30&cann=9.0.0&driver=Ascend+HDK+26.0.RC1)) |
 | CANN              | 8.5.0                     | [Obtain Images](#obtain-cann-image)                                                                                                                                                                                          |
-| Pytorch Adapter   | 7.3.0                   | [link](https://gitcode.com/Ascend/pytorch/releases)                                                                                                                                                                          |
+| Pytorch Adapter   | 26.0.0                   | [link](https://gitcode.com/Ascend/pytorch/releases)                                                                                                                                                                          |
 | MemFabric         | 1.0.5                   | `pip install memfabric-hybrid==1.0.5`                                                                                                                                                                 |
 | Triton            | 3.2.0                   | `pip install triton-ascend`|
 | SGLang NPU Kernel | NA                      | [link](https://github.com/sgl-project/sgl-kernel-npu/releases)                                                                                                                                                               |
@@ -18,9 +18,9 @@ You can install SGLang using any of the methods below. Please go through `System
 You can obtain the dependency of a specified version of CANN through an image.
 ```shell
 # for Atlas 800I A3 and Ubuntu OS
-docker pull quay.io/ascend/cann:8.5.0-a3-ubuntu22.04-py3.11
+docker pull quay.io/ascend/cann:9.0.0-a3-ubuntu22.04-py3.11
 # for Atlas 800I A2 and Ubuntu OS
-docker pull quay.io/ascend/cann:8.5.0-910b-ubuntu22.04-py3.11
+docker pull quay.io/ascend/cann:9.0.0-910b-ubuntu22.04-py3.11
 ```
 
 ## Preparing the Running Environment
@@ -38,7 +38,7 @@ conda activate sglang_npu
 
 #### CANN
 
-Prior to start work with SGLang on Ascend you need to install CANN Toolkit, Kernels operator package and NNAL version 8.5.0, check the [installation guide](https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/850/softwareinst/instg/instg_0008.html?Mode=PmIns&InstallType=local&OS=openEuler&Software=cannToolKit)
+Prior to start work with SGLang on Ascend you need to install CANN Toolkit, Kernels operator package and NNAL version 9.0.0, check the [installation guide](https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/850/softwareinst/instg/instg_0008.html?Mode=PmIns&InstallType=local&OS=openEuler&Software=cannToolKit)
 
 #### MemFabric-Hybrid
 
@@ -53,7 +53,7 @@ pip install memfabric-hybrid==1.0.5
 ```shell
 PYTORCH_VERSION=2.8.0
 TORCHVISION_VERSION=0.23.0
-TORCH_NPU_VERSION=2.8.0.post2
+TORCH_NPU_VERSION=2.8.0.post4
 pip install torch==$PYTORCH_VERSION torchvision==$TORCHVISION_VERSION --index-url https://download.pytorch.org/whl/cpu
 pip install torch_npu==$TORCH_NPU_VERSION
 ```
