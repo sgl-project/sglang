@@ -8,8 +8,13 @@ from diffusers.utils.torch_utils import randn_tensor
 from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import (
     is_ltx23_native_variant,
 )
-from sglang.multimodal_gen.runtime.distributed import get_local_torch_device, get_sp_world_size
-from sglang.multimodal_gen.runtime.distributed.cfg_parallel_utils import dispatch_branches
+from sglang.multimodal_gen.runtime.distributed import (
+    get_local_torch_device,
+    get_sp_world_size,
+)
+from sglang.multimodal_gen.runtime.distributed.cfg_parallel_utils import (
+    dispatch_branches,
+)
 from sglang.multimodal_gen.runtime.distributed.communication_op import (
     cfg_model_parallel_all_gather,
     cfg_model_parallel_all_reduce,
@@ -241,31 +246,39 @@ class LTX2DenoisingStage(DenoisingStage):
             ),
         ]
         if need_perturbed:
-            all_passes.append((
-                "perturbed",
-                self._build_ltx2_model_kwargs(
-                    ctx,
-                    base_model_kwargs,
-                    encoder_hidden_states=encoder_hidden_states,
-                    audio_encoder_hidden_states=audio_encoder_hidden_states,
-                    encoder_attention_mask=encoder_attention_mask,
-                    skip_video_self_attn_blocks=tuple(stage1_guider_params["video_stg_blocks"]),
-                    skip_audio_self_attn_blocks=tuple(stage1_guider_params["audio_stg_blocks"]),
-                ),
-            ))
+            all_passes.append(
+                (
+                    "perturbed",
+                    self._build_ltx2_model_kwargs(
+                        ctx,
+                        base_model_kwargs,
+                        encoder_hidden_states=encoder_hidden_states,
+                        audio_encoder_hidden_states=audio_encoder_hidden_states,
+                        encoder_attention_mask=encoder_attention_mask,
+                        skip_video_self_attn_blocks=tuple(
+                            stage1_guider_params["video_stg_blocks"]
+                        ),
+                        skip_audio_self_attn_blocks=tuple(
+                            stage1_guider_params["audio_stg_blocks"]
+                        ),
+                    ),
+                )
+            )
         if need_modality:
-            all_passes.append((
-                "modality",
-                self._build_ltx2_model_kwargs(
-                    ctx,
-                    base_model_kwargs,
-                    encoder_hidden_states=encoder_hidden_states,
-                    audio_encoder_hidden_states=audio_encoder_hidden_states,
-                    encoder_attention_mask=encoder_attention_mask,
-                    disable_a2v_cross_attn=True,
-                    disable_v2a_cross_attn=True,
-                ),
-            ))
+            all_passes.append(
+                (
+                    "modality",
+                    self._build_ltx2_model_kwargs(
+                        ctx,
+                        base_model_kwargs,
+                        encoder_hidden_states=encoder_hidden_states,
+                        audio_encoder_hidden_states=audio_encoder_hidden_states,
+                        encoder_attention_mask=encoder_attention_mask,
+                        disable_a2v_cross_attn=True,
+                        disable_v2a_cross_attn=True,
+                    ),
+                )
+            )
 
         pass_names = [name for name, _ in all_passes]
         n_passes = len(pass_names)
@@ -1704,9 +1717,7 @@ class LTX2DenoisingStage(DenoisingStage):
                                 prompt_attention_mask,
                             ]
                         )
-                        model_kwargs["encoder_attention_mask"] = (
-                            repeated_attention_mask
-                        )
+                        model_kwargs["encoder_attention_mask"] = repeated_attention_mask
                         model_kwargs["audio_encoder_attention_mask"] = (
                             repeated_attention_mask
                         )

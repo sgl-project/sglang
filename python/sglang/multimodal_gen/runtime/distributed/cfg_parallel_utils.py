@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import dataclasses
+from typing import TYPE_CHECKING, Callable
+
 import torch
+
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
-from sglang.multimodal_gen.runtime.distributed.cfg_policy import _wrap, _unwrap
+from sglang.multimodal_gen.runtime.distributed.cfg_policy import _unwrap, _wrap
 from sglang.multimodal_gen.runtime.distributed.communication_op import (
     cfg_model_parallel_all_gather,
 )
@@ -11,24 +14,32 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_classifier_free_guidance_rank,
     get_classifier_free_guidance_world_size,
 )
-from typing import TYPE_CHECKING, Callable
 
 if TYPE_CHECKING:
-    from sglang.multimodal_gen.runtime.distributed.cfg_policy import CFGBranch, CFGPolicy
+    from sglang.multimodal_gen.runtime.distributed.cfg_policy import (
+        CFGBranch,
+        CFGPolicy,
+    )
 
-from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 # Tracks (n_branches, cfg_world_size, cfg_rank) tuples already logged so the
 # dispatch table is printed once per unique configuration, not once per step.
 _logged_dispatch_keys: set[tuple[int, int, int]] = set()
 
-def _run(predict_fn: Callable[["CFGBranch"], "torch.Tensor | tuple[torch.Tensor, ...]"],bid: int) -> tuple[torch.Tensor, ...]:
+
+def _run(
+    predict_fn: Callable[["CFGBranch"], "torch.Tensor | tuple[torch.Tensor, ...]"],
+    bid: int,
+) -> tuple[torch.Tensor, ...]:
     branch = branches[bid]
     device = get_local_torch_device()
-    local_branch = dataclasses.replace(branch, kwargs={
-        k: v.to(device) if isinstance(v, torch.Tensor) else v
-        for k, v in branch.kwargs.items()
-    })
+    local_branch = dataclasses.replace(
+        branch,
+        kwargs={
+            k: v.to(device) if isinstance(v, torch.Tensor) else v
+            for k, v in branch.kwargs.items()
+        },
+    )
     raw = predict_fn(local_branch)
     return tuple(p.float() for p in _wrap(raw))
 
@@ -68,7 +79,11 @@ def run_cfg_parallel(
     dispatch_key = (n_branches, cfg_world_size, cfg_rank)
     if dispatch_key not in _logged_dispatch_keys:
         _logged_dispatch_keys.add(dispatch_key)
-        branch_names = [branches[i].name for i in branches_assigned_to_local_rank] if branches_assigned_to_local_rank else ["(idle)"]
+        branch_names = (
+            [branches[i].name for i in branches_assigned_to_local_rank]
+            if branches_assigned_to_local_rank
+            else ["(idle)"]
+        )
         logger.info(
             "CFG parallel dispatch: rank %d/%d -> [%s]",
             cfg_rank,
@@ -77,7 +92,9 @@ def run_cfg_parallel(
         )
 
     # perform the forward for local branches
-    predicts_from_local_branches: list[tuple[torch.Tensor, ...]] = [_run(predict_fn, bid) for bid in branches_assigned_to_local_rank]
+    predicts_from_local_branches: list[tuple[torch.Tensor, ...]] = [
+        _run(predict_fn, bid) for bid in branches_assigned_to_local_rank
+    ]
 
     if not predicts_from_local_branches:  # idle rank: run branch 0 for tensor shapes
         predicts_from_local_branches.append(_run(predict_fn, 0))
@@ -91,7 +108,10 @@ def run_cfg_parallel(
     # All-gather each slot and output element with separate_tensors=True.
     # all_slots[slot][elem] = list[Tensor] indexed by CFG rank; no reshape.
     all_slots: list[list[list[torch.Tensor]]] = [
-        [cfg_model_parallel_all_gather(p, dim=0, separate_tensors=True) for p in slot_pred]
+        [
+            cfg_model_parallel_all_gather(p, dim=0, separate_tensors=True)
+            for p in slot_pred
+        ]
         for slot_pred in predicts_from_local_branches
     ]
 

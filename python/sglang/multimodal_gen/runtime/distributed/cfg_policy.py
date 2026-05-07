@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import dataclasses
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Callable
+from typing import TYPE_CHECKING, Any
 
 import torch
 
@@ -56,9 +56,7 @@ class CFGPolicy:
         Called once before the denoising loop.  The returned policy is
         immutable for the lifetime of the run.  Override to declare N branches.
         """
-        branches = [
-            CFGBranch("conditional", True, {**image_kwargs, **pos_cond_kwargs})
-        ]
+        branches = [CFGBranch("conditional", True, {**image_kwargs, **pos_cond_kwargs})]
         if batch.do_classifier_free_guidance:
             branches.append(
                 CFGBranch("unconditional", False, {**image_kwargs, **neg_cond_kwargs})
@@ -86,11 +84,14 @@ class CFGPolicy:
         results: list[torch.Tensor] = [
             n + cfg_scale * (p - n) for p, n in zip(pos_t, neg_t)
         ]
-        results[0] = _apply_cfg_postprocess(results[0], pos_t[0], batch, pipeline_config)
+        results[0] = _apply_cfg_postprocess(
+            results[0], pos_t[0], batch, pipeline_config
+        )
         return _unwrap(tuple(results))
 
 
 # Helpers used by CFGPolicy and run_cfg_parallel.
+
 
 def _wrap(
     pred: torch.Tensor | tuple[torch.Tensor, ...],

@@ -44,8 +44,14 @@ from sglang.multimodal_gen.runtime.distributed import (
     get_world_group,
     get_world_size,
 )
-from sglang.multimodal_gen.runtime.distributed.cfg_parallel_utils import run_cfg_parallel
-from sglang.multimodal_gen.runtime.distributed.cfg_policy import CFGPolicy, _wrap, _unwrap
+from sglang.multimodal_gen.runtime.distributed.cfg_parallel_utils import (
+    run_cfg_parallel,
+)
+from sglang.multimodal_gen.runtime.distributed.cfg_policy import (
+    CFGPolicy,
+    _unwrap,
+    _wrap,
+)
 from sglang.multimodal_gen.runtime.distributed.communication_op import (
     sequence_model_parallel_all_gather,
 )
@@ -1382,7 +1388,9 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                 )
             pred_t = _wrap(raw)
             if len(pred_t) == 1:
-                pred_t = (server_args.pipeline_config.slice_noise_pred(pred_t[0], latents),)
+                pred_t = (
+                    server_args.pipeline_config.slice_noise_pred(pred_t[0], latents),
+                )
             return _unwrap(tuple(p.float() for p in pred_t))
 
         if server_args.enable_cfg_parallel:
