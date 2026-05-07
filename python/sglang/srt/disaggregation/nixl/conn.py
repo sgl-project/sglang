@@ -494,10 +494,15 @@ class NixlKVManager(CommonKVManager):
                     self.update_status(room, KVPoll.Success)
                 else:
                     self.update_status(room, KVPoll.Transferring)
+            except _NIXL_TRANSPORT_ERRORS as e:
+                logger.warning(f"NIXL transport error for room {room}: {e}")
+                self.record_failure(room, str(e))
+                self.update_status(room, KVPoll.Failed)
             except Exception as e:
-                reason = f"Prefill transfer worker error room={room}: {e}"
-                logger.exception(reason)
-                self.record_failure(room, reason)
+                logger.exception(
+                    f"Unexpected transfer worker error for room {room}: {e}"
+                )
+                self.record_failure(room, str(e))
                 self.update_status(room, KVPoll.Failed)
 
     def register_buffer_to_engine(self):
