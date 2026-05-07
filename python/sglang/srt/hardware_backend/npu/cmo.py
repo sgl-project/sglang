@@ -2,7 +2,6 @@ import torch
 
 cmo_stream = None
 share_stream = None
-CORE_NUM_FOR_SHARE = 8
 
 
 def get_cmo_stream():
@@ -64,7 +63,6 @@ def get_share_stream():
 def set_share_stream(stream):
     global share_stream
     share_stream = stream
-    torch.npu.set_stream_limit(share_stream, CORE_NUM_FOR_SHARE, CORE_NUM_FOR_SHARE * 2)
 
 
 def wait_share_stream():

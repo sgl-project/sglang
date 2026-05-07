@@ -402,7 +402,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             router_logits, _ = self.gate(hidden_states)
             if enable_dual_stream:
                 shared_output = shared_expert_on_independent_stream(
-                    hidden_states, self._forward_shared_experts
+                    hidden_states.clone(), self._forward_shared_experts
                 )
             else:
                 shared_output = self._forward_shared_experts(hidden_states)
