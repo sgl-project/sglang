@@ -488,7 +488,10 @@ class DeepseekV2MoE(nn.Module):
             prefix=add_prefix("experts", prefix),
         )
 
-        self.use_grouped_topk = config.n_group > config.topk_group
+        # Route by model: DSV4 -> ungrouped sqrtsoftplus; V3/V3.2/GLM-5
+        # GlmMoeDsa/Glm4MoeLite -> grouped noaux_tc. Do NOT revert to
+        # `n_group > topk_group` -- silently flips for GLM-5 (1==1) and breaks routing.
+        self.use_grouped_topk = not is_deepseek_v4
 
         if self.is_hash and not (is_nextn and is_deepseek_v4):
             self.topk = HashTopK(
