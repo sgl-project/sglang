@@ -57,10 +57,11 @@ class TestAdaptiveSpeculativeTopkServer(CustomTestCase):
             json.dump(
                 {
                     "candidate_steps": [2, 3],
-                    "ema_alpha": 1.0,
+                    "ema_alpha": 0.3,
                     "warmup_batches": 1,
                     "update_interval": 1,
                     "up_hysteresis": 0.0,
+                    "down_hysteresis": -0.5,
                 },
                 f,
             )
