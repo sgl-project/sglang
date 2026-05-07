@@ -122,7 +122,7 @@ def causal_conv1d_fn_npu(
                 final_states_out=conv_states[cache_indices[i]].unsqueeze(0),
                 initial_states=(
                     conv_states[cache_indices[i]].unsqueeze(0)
-                    if has_initial_state[0]
+                    if has_initial_state is not None and has_initial_state[i]
                     else None
                 ),
             )
