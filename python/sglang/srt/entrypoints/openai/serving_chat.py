@@ -191,12 +191,18 @@ class OpenAIServingChat(OpenAIServingBase):
     ):
         super().__init__(tokenizer_manager)
         self.template_manager = template_manager
-        self.tool_call_parser = self.tokenizer_manager.server_args.tool_call_parser
-        self.reasoning_parser = self.tokenizer_manager.server_args.reasoning_parser
+        if self.tokenizer_manager is not None:
+            self.tool_call_parser = self.tokenizer_manager.server_args.tool_call_parser
+            self.reasoning_parser = self.tokenizer_manager.server_args.reasoning_parser
+        else:
+            self.tool_call_parser = None
+            self.reasoning_parser = None
 
         # Get default sampling parameters from model's generation config
         self.default_sampling_params = (
             self.tokenizer_manager.model_config.get_default_sampling_params()
+            if self.tokenizer_manager is not None
+            else None
         )
         if (
             self.default_sampling_params
