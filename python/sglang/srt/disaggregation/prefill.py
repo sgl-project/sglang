@@ -438,20 +438,16 @@ class SchedulerDisaggregationPrefillMixin:
         if not envs.SGLANG_PIPELINED_KV_TRANSFER.get():
             return 0
 
-        # Multimodal guard: skip pipeline if batch has multimodal inputs AND
-        # the model's forward_split_prefill does not handle them (i.e. the VL
-        # wrapper class did not override forward_split_prefill).  Models like
-        # Qwen3.5-VL that implement multimodal-aware forward_split_prefill are
-        # allowed through.
-        if any(req.multimodal_inputs is not None for req in batch.reqs):
-            model = self.tp_worker.model_runner.model
-            if not hasattr(model, "forward_split_prefill"):
-                logger.debug(
-                    "Pipeline skip: multimodal inputs detected and model "
-                    "lacks forward_split_prefill (batch_size=%d)",
-                    len(batch.reqs),
-                )
-                return 0
+        # Universal guard: model must implement forward_split_prefill to use
+        # pipelined transfer. Models without it (e.g. Mamba-only, hybrid models
+        # that haven't added support) safely fallback to the normal path.
+        model = self.tp_worker.model_runner.model
+        if not hasattr(model, "forward_split_prefill"):
+            logger.debug(
+                "Pipeline skip: model %s lacks forward_split_prefill",
+                type(model).__name__,
+            )
+            return 0
 
         min_tokens = envs.SGLANG_PIPELINE_MIN_TOKENS.get()
         avg_tokens = sum(req.extend_input_len for req in batch.reqs) // len(batch.reqs)
