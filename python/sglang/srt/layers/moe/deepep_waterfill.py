@@ -509,7 +509,9 @@ class DeepEPWaterfillBalancer:
             return self._build_static_dispatch_plan(local_routed_counts)
 
         global_routed_counts, local_tokens_per_rank = (
-            self._all_reduce_dynamic_rank_load(local_routed_counts, num_tokens)
+            DeepEPWaterfillBalancer._all_reduce_dynamic_rank_load(
+                local_routed_counts, num_tokens
+            )
         )
         if self._is_low_batch(num_tokens):
             return None
