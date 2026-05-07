@@ -6682,9 +6682,7 @@ class ServerArgs:
         # surface and won't appear on the argparse Namespace. Skip them so the
         # dataclass default applies.
         attrs = [
-            attr.name
-            for attr in dataclasses.fields(cls)
-            if hasattr(args, attr.name)
+            attr.name for attr in dataclasses.fields(cls) if hasattr(args, attr.name)
         ]
         return cls(**{attr: getattr(args, attr) for attr in attrs})
 

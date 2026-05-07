@@ -223,12 +223,10 @@ class SchedulerMetricsCollector:
         server_args: Optional["ServerArgs"] = None,
     ) -> None:
         # We need to import prometheus_client after setting the env variable `PROMETHEUS_MULTIPROC_DIR`
-        from prometheus_client import (
-            Counter as _PromCounter,
-            Gauge as _PromGauge,
-            Histogram as _PromHistogram,
-            Summary as _PromSummary,
-        )
+        from prometheus_client import Counter as _PromCounter
+        from prometheus_client import Gauge as _PromGauge
+        from prometheus_client import Histogram as _PromHistogram
+        from prometheus_client import Summary as _PromSummary
 
         Counter = self._counter_cls or _PromCounter
         Gauge = self._gauge_cls or _PromGauge
@@ -1308,10 +1306,8 @@ class TokenizerMetricsCollector:
         bucket_e2e_request_latency: Optional[List[float]] = None,
     ) -> None:
         # We need to import prometheus_client after setting the env variable `PROMETHEUS_MULTIPROC_DIR`
-        from prometheus_client import (
-            Counter as _PromCounter,
-            Histogram as _PromHistogram,
-        )
+        from prometheus_client import Counter as _PromCounter
+        from prometheus_client import Histogram as _PromHistogram
 
         Counter = self._counter_cls or _PromCounter
         Histogram = self._histogram_cls or _PromHistogram
@@ -1616,10 +1612,8 @@ class StorageMetricsCollector:
         self,
         labels: Dict[str, str],
     ):
-        from prometheus_client import (
-            Counter as _PromCounter,
-            Histogram as _PromHistogram,
-        )
+        from prometheus_client import Counter as _PromCounter
+        from prometheus_client import Histogram as _PromHistogram
 
         Counter = self._counter_cls or _PromCounter
         Histogram = self._histogram_cls or _PromHistogram
@@ -1744,10 +1738,8 @@ class RadixCacheMetricsCollector:
         labels: Dict[str, str],
     ) -> None:
         # We need to import prometheus_client after setting the env variable `PROMETHEUS_MULTIPROC_DIR`
-        from prometheus_client import (
-            Counter as _PromCounter,
-            Histogram as _PromHistogram,
-        )
+        from prometheus_client import Counter as _PromCounter
+        from prometheus_client import Histogram as _PromHistogram
 
         Counter = self._counter_cls or _PromCounter
         Histogram = self._histogram_cls or _PromHistogram
