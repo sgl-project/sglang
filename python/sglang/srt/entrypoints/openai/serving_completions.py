@@ -207,6 +207,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
                 self._generate_binary_stream(adapted_request, request, raw_request),
                 media_type=media_type,
                 background=self.tokenizer_manager.create_abort_task(adapted_request),
+                stream_format=request.stream_format,
             )
 
         generator = self._generate_completion_stream(
