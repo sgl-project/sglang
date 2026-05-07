@@ -478,7 +478,7 @@ CUDA_SUITE_TO_RUNNER = {
     "stage-a-test-1-gpu-small": "1-gpu-5090",
     "stage-a-test-cpu": "ubuntu-latest",
     "stage-b-test-1-gpu-small": "1-gpu-5090",
-    "stage-b-test-1-gpu-large": "1-gpu-h100-h200",
+    "stage-b-test-1-gpu-large": "1-gpu-h100",
     "stage-b-test-2-gpu-large": "2-gpu-h100",
     "stage-b-test-4-gpu-b200": "4-gpu-b200",
     "stage-c-test-4-gpu-h100": "4-gpu-h100",
@@ -486,7 +486,7 @@ CUDA_SUITE_TO_RUNNER = {
     "stage-c-test-8-gpu-h20": "8-gpu-h20",
     "stage-c-test-4-gpu-b200": "4-gpu-b200",
     "stage-c-test-deepep-4-gpu-h100": "4-gpu-h100",
-    "stage-c-test-deepep-8-gpu-h200": "8-gpu-h200",
+    "stage-c-test-deepep-8-gpu-h200": "8-gpu-h200-deepep",
     # Nightly test suites (NVIDIA)
     "nightly-1-gpu": "1-gpu-h100",
     "nightly-4-gpu": "4-gpu-h100",

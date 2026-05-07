@@ -7,6 +7,8 @@ use serde::{Deserialize, Serialize};
 use super::ConfigResult;
 use crate::core::ConnectionMode;
 
+pub const DEFAULT_POOL_IDLE_TIMEOUT_SECS: u64 = 50;
+
 /// Main router configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RouterConfig {
@@ -28,6 +30,8 @@ pub struct RouterConfig {
     pub log_dir: Option<String>,
     pub log_level: Option<String>,
     pub request_id_headers: Option<Vec<String>>,
+    #[serde(default = "default_pool_idle_timeout_secs")]
+    pub pool_idle_timeout_secs: u64,
     /// Set to -1 to disable rate limiting
     pub max_concurrent_requests: i32,
     pub queue_size: usize,
@@ -117,6 +121,10 @@ fn default_enable_l1() -> bool {
 
 fn default_l1_max_memory() -> usize {
     50 * 1024 * 1024 // 50MB
+}
+
+fn default_pool_idle_timeout_secs() -> u64 {
+    DEFAULT_POOL_IDLE_TIMEOUT_SECS
 }
 
 impl TokenizerCacheConfig {
@@ -492,6 +500,7 @@ impl Default for RouterConfig {
             log_dir: None,
             log_level: None,
             request_id_headers: None,
+            pool_idle_timeout_secs: default_pool_idle_timeout_secs(),
             max_concurrent_requests: -1,
             queue_size: 100,
             queue_timeout_secs: 60,
@@ -613,6 +622,10 @@ mod tests {
         assert!(config.trace_config.is_none());
         assert!(config.log_dir.is_none());
         assert!(config.log_level.is_none());
+        assert_eq!(
+            config.pool_idle_timeout_secs,
+            DEFAULT_POOL_IDLE_TIMEOUT_SECS
+        );
     }
 
     #[test]
@@ -660,6 +673,22 @@ mod tests {
         assert!(deserialized.discovery.is_none());
         assert!(deserialized.metrics.is_none());
         assert!(deserialized.trace_config.is_none());
+    }
+
+    #[test]
+    fn test_router_config_pool_idle_timeout_deserialization_default() {
+        let config = RouterConfig::default();
+        let mut json = serde_json::to_value(&config).unwrap();
+        json.as_object_mut()
+            .unwrap()
+            .remove("pool_idle_timeout_secs");
+
+        let deserialized: RouterConfig = serde_json::from_value(json).unwrap();
+
+        assert_eq!(
+            deserialized.pool_idle_timeout_secs,
+            default_pool_idle_timeout_secs()
+        );
     }
 
     #[test]
