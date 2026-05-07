@@ -475,9 +475,7 @@ class ModelRunnerKVCacheMixin:
                     self.model_config.hf_config, "hisa_k_block_size", 128
                 )
                 pool_kwargs["k_block_size"] = k_block_size
-                pool_kwargs["max_running_requests"] = (
-                    self.server_args.max_running_requests or 2048
-                )
+                pool_kwargs["max_running_requests"] = self.max_running_requests
                 # Per-request max pages = pages to cover a single longest
                 # request. Tight bound is critical: v3 block_mqa kernel's
                 # inner pipeline iterates ``max_pool_pages_per_req`` times.

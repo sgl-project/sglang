@@ -86,12 +86,17 @@ class HisaReqToPoolPagePool:
         self.size = size
         self.max_pool_pages_per_req = max_pool_pages_per_req
         self.device = device
+        # +1 padding row at index 0 to mirror ReqToTokenPool: cuda-graph padded
+        # batches default req_pool_indices to 0, and the pooling kernel shares
+        # the same `max_running_req` dynamic symbol with ReqToToken, so
+        # shape[0] must match.
+        self._alloc_size = size + 1
         self.req_to_pool_page = torch.zeros(
-            (size, max_pool_pages_per_req),
+            (self._alloc_size, max_pool_pages_per_req),
             dtype=torch.int32,
             device=device,
         )
-        self.num_pool_pages_cpu = torch.zeros(size, dtype=torch.int32)
+        self.num_pool_pages_cpu = torch.zeros(self._alloc_size, dtype=torch.int32)
 
     def write(
         self,
