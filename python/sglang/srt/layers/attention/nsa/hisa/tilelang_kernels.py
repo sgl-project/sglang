@@ -28,7 +28,18 @@ def fp8_native_block_mean_pooling(
     num_stages=1,
     threads=256,
 ):
-    """Mean-pool with fp8 re-quantization: outputs fp8 BlockedK + f32 BlockedKScale."""
+    """Mean-pool with fp8 re-quantization: outputs fp8 BlockedK + f32 BlockedKScale.
+
+    Branches each block_N inner iter on tile fullness:
+      - Full tile (cur_tl_block_size == block_N): bulk TMA load (fast path).
+      - Partial tile: per-row T.Parallel + ``if bn_i < cur_size`` guard.
+
+    Triggered only on the last CTA's last inner iter when ``seq_len_k % block_N
+    != 0``. An unguarded bulk T.copy in that case over-reads up to block_N-1
+    rows past seq_len_k → under sustained load eventually hits an unmapped
+    page (Xid 13 / illegal memory access). See the grouped variant's
+    docstring for the original incident.
+    """
     dtype = T.float8_e4m3fn
     accum_dtype = T.float32
 
@@ -59,23 +70,28 @@ def fp8_native_block_mean_pooling(
 
             for b_i in T.serial(T.ceildiv(cur_pooling_block_size, block_N)):
                 T.fill(index_k, 0.0)
+                T.fill(scale, 0.0)
 
                 tl_block_s = k_start + b_i * block_N
                 tl_block_e = T.min(k_start + (b_i + 1) * block_N, k_end)
-                T.copy(K[tl_block_s:tl_block_s + block_N, :], index_k)
-                # 1D KScale load via T.Parallel to avoid TMA alignment issue
-                # at unaligned seq_len_k base addresses.
-                for bn_i in T.Parallel(block_N):
-                    scale[bn_i] = KScale[tl_block_s + bn_i]
+                cur_tl_block_size = tl_block_e - tl_block_s
+
+                if cur_tl_block_size == block_N:
+                    # Fast path: full tile, bulk TMA load.
+                    T.copy(K[tl_block_s:tl_block_s + block_N, :], index_k)
+                    for bn_i in T.Parallel(block_N):
+                        scale[bn_i] = KScale[tl_block_s + bn_i]
+                else:
+                    # Partial tile (last CTA's tail): row-guard, no bulk T.copy.
+                    for bn_i in T.Parallel(block_N):
+                        if bn_i < cur_tl_block_size:
+                            scale[bn_i] = KScale[tl_block_s + bn_i]
+                    for bn_i, d_i in T.Parallel(block_N, dim):
+                        if bn_i < cur_tl_block_size:
+                            index_k[bn_i, d_i] = K[tl_block_s + bn_i, d_i]
 
                 for bn_i, d_i in T.Parallel(block_N, dim):
                     index_k[bn_i, d_i] = index_k[bn_i, d_i] * scale[bn_i]
-
-                cur_tl_block_size = tl_block_e - tl_block_s
-                for n_i in T.parallel(block_N):
-                    for d_i in T.parallel(dim):
-                        if n_i >= cur_tl_block_size:
-                            index_k[n_i, d_i] = T.cast(0, accum_dtype)
 
                 T.reduce_sum(index_k, acc, dim=0, clear=False)
 

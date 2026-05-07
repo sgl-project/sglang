@@ -837,11 +837,13 @@ def _block_sparse_mqa_persistent_kernel(
         k_rows_2d = topk_block_ids[:, None] * KV_BLOCK_SIZE + b_offs[None, :]
         k_rows = tl.reshape(k_rows_2d, (GEMM_TILE,))
 
-        # Drop separate k_mask; pos_valid (>= ks_min, < ke_max) implies
-        # >= 0 AND < seq_kv since 0 <= ks_min, ke_max <= seq_kv. Use clamped
-        # safe_rows for in-bounds load — invalid lanes read garbage K but
-        # logits are masked to -inf below.
-        safe_rows = tl.maximum(k_rows, 0)
+        # Clamp safe_rows to [0, seq_kv-1] for in-bounds load. Lower clamp
+        # handles masked-off slots (topk_block_ids = -1 → k_rows < 0). Upper
+        # clamp handles seq_kv % KV_BLOCK_SIZE != 0: the last topk block's
+        # tail rows would otherwise exceed seq_kv (OOB on K/KS load — silent
+        # within an allocator block, illegal access at page boundary).
+        # Garbage from out-of-range loads is masked to -inf via pos_valid below.
+        safe_rows = tl.minimum(tl.maximum(k_rows, 0), seq_kv - 1)
 
         k = tl.load(
             K_ptr + safe_rows[:, None] * stride_k_s + d_offs[None, :]
@@ -2065,10 +2067,14 @@ def hisa_coord_transform_kernel(
     r_safe = tl.maximum(r, 0)
 
     # Gather: abs_block[i] = topk_block_indices[m, r_safe[i] // k_block_size].
-    slot = r_safe // K_BLOCK_SIZE
-    # mask guards against bogus loads when r == -1 (slot undefined). r_safe
-    # actually clamps to 0 so slot is 0 → always in range — but the mask lets
-    # the compiler skip the load and avoids any potential OOB on edge cases.
+    # slot is clamped to [0, BLOCK_TOPK-1] to keep the address computation
+    # in-bounds even on disabled lanes — predicated `tl.load` masks the
+    # *result* but the address is still computed for every lane, and an
+    # OOB address can fault. r ∈ [0, BLOCK_TOPK*K_BLOCK_SIZE) by contract,
+    # so a valid lane already lands in range; the upper clamp only matters
+    # for r==-1 lanes (slot would be 0 after r_safe → 0) and any stale-r
+    # corruption from upstream.
+    slot = tl.minimum(r_safe // K_BLOCK_SIZE, BLOCK_TOPK - 1)
     abs_block = tl.load(
         topk_block_ptr + m * BLOCK_TOPK + slot, mask=r_is_valid, other=0
     )
