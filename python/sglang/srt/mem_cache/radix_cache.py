@@ -218,8 +218,10 @@ class TreeNode:
         self.key: RadixKey = None
         self.value: Optional[torch.Tensor] = None
         self.lock_ref = 0
-        self.last_access_time = time.monotonic()
-        self.creation_time = time.monotonic()
+        # Default 0; call sites must set these via cache.get_access_time()
+        # so that PP ranks produce identical timestamps for LRU/FIFO ordering.
+        self.last_access_time: float = 0.0
+        self.creation_time: float = 0.0
 
         self.hit_count = 0
         # indicating the node is locked to protect from eviction
@@ -328,6 +330,7 @@ class RadixCache(BasePrefixCache):
         self.is_eagle = params.is_eagle
         self.disable_finished_insert = params.disable_finished_insert
         self.eviction_policy = params.eviction_policy.lower()
+        self._logical_clock: int = 0
 
         self.kv_event_queue = []
 
@@ -393,6 +396,7 @@ class RadixCache(BasePrefixCache):
         self.evictable_size_ = 0
         self.protected_size_ = 0
         self.evictable_leaves.clear()
+        self._logical_clock = 0
         self._record_all_cleared_event()
 
     def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
@@ -613,13 +617,14 @@ class RadixCache(BasePrefixCache):
         num_tokens = params.num_tokens
         leaves = list(self.evictable_leaves)
         eviction_heap = [
-            (self.eviction_strategy.get_priority(node), node) for node in leaves
+            (self.eviction_strategy.get_priority(node), node.id, node)
+            for node in leaves
         ]
         heapq.heapify(eviction_heap)
 
         num_evicted = 0
         while num_evicted < num_tokens and len(eviction_heap):
-            _priority, x = heapq.heappop(eviction_heap)
+            _priority, _id, x = heapq.heappop(eviction_heap)
 
             self.token_to_kv_pool_allocator.free(x.value)
             num_evicted += len(x.value)
@@ -627,7 +632,7 @@ class RadixCache(BasePrefixCache):
 
             if len(x.parent.children) == 0 and x.parent.lock_ref == 0:
                 new_priority = self.eviction_strategy.get_priority(x.parent)
-                heapq.heappush(eviction_heap, (new_priority, x.parent))
+                heapq.heappush(eviction_heap, (new_priority, x.parent.id, x.parent))
 
             self._record_remove_event(x)
 
@@ -688,10 +693,22 @@ class RadixCache(BasePrefixCache):
         _dfs_helper(self.root_node)
         return torch.cat(values)
 
+    def get_access_time(self) -> float:
+        """Return a monotonically increasing logical timestamp.
+
+        Uses a logical clock (post-incremented per call) so that the
+        timestamps produced are identical across PP ranks given the same
+        sequence of cache operations.  This is required for deterministic
+        LRU/FIFO eviction in PP>1 mode and is harmless for PP==1.
+        """
+        ts = self._logical_clock
+        self._logical_clock += 1
+        return float(ts)
+
     ##### Internal Helper Functions #####
 
     def _match_prefix_helper(self, node: TreeNode, key: RadixKey):
-        access_time = time.monotonic()
+        access_time = self.get_access_time()
         node.last_access_time = access_time
 
         child_key = key.child_key(self.page_size)
@@ -720,6 +737,8 @@ class RadixCache(BasePrefixCache):
         # new_node -> child
         # New node inherits child's priority (represents shared prefix)
         new_node = TreeNode(priority=child.priority)
+        new_node.last_access_time = child.last_access_time
+        new_node.creation_time = child.creation_time
         new_node.hit_count = child.hit_count
         new_node.children = {key[split_len:].child_key(self.page_size): child}
         new_node.parent = child.parent
@@ -757,7 +776,7 @@ class RadixCache(BasePrefixCache):
         # Convert None priority to 0
         if priority is None:
             priority = 0
-        access_time = time.monotonic()
+        access_time = self.get_access_time()
         node.last_access_time = access_time
         # Update priority along the path (take max to propagate higher priority)
         node.priority = max(node.priority, priority)
@@ -788,6 +807,8 @@ class RadixCache(BasePrefixCache):
 
         if len(key):
             new_node = TreeNode(priority=priority)
+            new_node.last_access_time = access_time
+            new_node.creation_time = access_time
             new_node.parent = node
             new_node.key = key
             new_node.value = value.clone()
