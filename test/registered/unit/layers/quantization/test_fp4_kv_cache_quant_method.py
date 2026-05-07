@@ -11,9 +11,13 @@ import torch
 from sglang.test.test_utils import CustomTestCase
 
 
-def skip_if_no_cuda(func):
-    """Skip test if CUDA is not available."""
-    return unittest.skipUnless(torch.cuda.is_available(), "CUDA not available")(func)
+def skip_if_no_sm120(func):
+    """Skip test if SM120 is not available."""
+    from sglang.srt.utils import is_sm120_supported
+
+    return unittest.skipUnless(
+        is_sm120_supported(), "SM120 with CUDA >= 12.8 is required"
+    )(func)
 
 
 class TestKVCacheQuantRegistry(CustomTestCase):
@@ -116,7 +120,7 @@ class TestNVFP4KVMethod(CustomTestCase):
         self.assertTrue(torch.all(m.v_scales_gpu == 1.0))
         self.assertEqual(len(m.k_scales_gpu), 4)
 
-    @skip_if_no_cuda
+    @skip_if_no_sm120
     def test_quantize_dequantize_roundtrip(self):
         """Test NVFP4 quantize→dequantize roundtrip on CUDA."""
         from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
