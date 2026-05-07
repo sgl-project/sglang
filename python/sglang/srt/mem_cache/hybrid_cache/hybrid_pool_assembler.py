@@ -74,6 +74,8 @@ def build_pool_entry(
     share_indices_with_anchor: bool = False,
     host_evict_fn: Optional[Callable[[int], Any]] = None,
     device_evict_fn: Optional[Callable[[int], Any]] = None,
+    device_alloc_fn: Optional[Callable[[int], Any]] = None,
+    device_free_fn: Optional[Callable[[Any], Any]] = None,
 ) -> PoolEntry:
     return PoolEntry(
         name=name,
@@ -84,6 +86,8 @@ def build_pool_entry(
         share_indices_with_anchor=share_indices_with_anchor,
         host_evict_fn=host_evict_fn,
         device_evict_fn=device_evict_fn,
+        device_alloc_fn=device_alloc_fn,
+        device_free_fn=device_free_fn,
     )
 
 
@@ -137,6 +141,90 @@ def build_kv_only_stack(
         load_cache_event=load_cache_event,
         attn_cp_group=attn_cp_group,
         attn_tp_group=attn_tp_group,
+        write_policy=server_args.hicache_write_policy,
+        io_backend=server_args.hicache_io_backend,
+        storage_backend=storage_backend,
+        prefetch_threshold=prefetch_threshold,
+        model_name=model_name,
+        storage_backend_extra_config=storage_backend_extra_config,
+        pp_rank=pp_rank,
+        pp_size=pp_size,
+        attn_cp_rank=attn_cp_rank,
+        attn_cp_size=attn_cp_size,
+        transfer_layer_num=transfer_layer_num,
+        enable_storage_metrics=enable_storage_metrics,
+    )
+    return host_pool_group, cache_controller
+
+
+def build_hybrid_swa_stack(
+    *,
+    params: CacheInitParams,
+    server_args: ServerArgs,
+    full_kv_pool: Any,
+    swa_kv_pool: Any,
+    full_layer_mapping: dict[int, int],
+    swa_layer_mapping: dict[int, int],
+    page_size: int,
+    tp_group,
+    load_cache_event,
+    storage_backend: Optional[str],
+    use_mla: bool,
+    host_swa_evict_fn: Optional[Callable[[int], Any]] = None,
+    device_swa_evict_fn: Optional[Callable[[int], Any]] = None,
+    prefetch_threshold: int = 256,
+    model_name: Optional[str] = None,
+    storage_backend_extra_config: Optional[dict] = None,
+    pp_rank: int = 0,
+    pp_size: int = 1,
+    attn_cp_rank: int = 0,
+    attn_cp_size: int = 1,
+    enable_storage_metrics: bool = False,
+) -> tuple[HostPoolGroup, HybridCacheController]:
+    transfer_layer_num = len(full_layer_mapping | swa_layer_mapping)
+    kv_host_pool = build_kv_host_pool(
+        kv_pool=full_kv_pool,
+        page_size=page_size,
+        server_args=server_args,
+        use_mla=use_mla,
+    )
+    swa_host_pool = build_kv_host_pool(
+        kv_pool=swa_kv_pool,
+        page_size=page_size,
+        server_args=server_args,
+        use_mla=use_mla,
+    )
+
+    # For SWA hybrid, the device alloc/free goes through the inner swa_attn_allocator
+    swa_attn_allocator = params.token_to_kv_pool_allocator.swa_attn_allocator
+    entries = [
+        build_pool_entry(
+            name=PoolName.KV,
+            host_pool=kv_host_pool,
+            device_pool=full_kv_pool,
+            layer_mapping=full_layer_mapping,
+            transfer_layer_num=transfer_layer_num,
+            is_anchor=True,
+        ),
+        build_pool_entry(
+            name=PoolName.SWA,
+            host_pool=swa_host_pool,
+            device_pool=swa_kv_pool,
+            layer_mapping=swa_layer_mapping,
+            transfer_layer_num=transfer_layer_num,
+            host_evict_fn=host_swa_evict_fn,
+            device_evict_fn=device_swa_evict_fn,
+            device_alloc_fn=swa_attn_allocator.alloc,
+            device_free_fn=swa_attn_allocator.free,
+        ),
+    ]
+    host_pool_group = HostPoolGroup(entries)
+    cache_controller = HybridCacheController(
+        params.token_to_kv_pool_allocator,
+        host_pool_group,
+        page_size,
+        tp_group,
+        load_cache_event=load_cache_event,
         write_policy=server_args.hicache_write_policy,
         io_backend=server_args.hicache_io_backend,
         storage_backend=storage_backend,
@@ -330,17 +418,29 @@ def attach_hybrid_pool_to_unified_cache(
         MLATokenToKVPool,
         NSATokenToKVPool,
     )
+    from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
     from sglang.srt.mem_cache.unified_cache_components import ComponentType
 
     try:
         kvcache = params.token_to_kv_pool_allocator.get_kvcache()
-        if isinstance(kvcache, HybridLinearKVPool):
+        swa_stack = isinstance(kvcache, SWAKVPool)
+        mamba_stack = isinstance(kvcache, HybridLinearKVPool)
+        nsa_stack = isinstance(kvcache, NSATokenToKVPool)
+
+        if mamba_stack:
             full_kv_pool = kvcache.full_kv_pool
             use_mla = kvcache.use_mla
             assert set(cache.components.keys()) == {
                 ComponentType.FULL,
                 ComponentType.MAMBA,
             }, "HybridLinearKVPool currently only supports FULL + MAMBA in UnifiedRadixCache."
+        elif swa_stack:
+            full_kv_pool = kvcache.full_kv_pool
+            use_mla = False
+            assert set(cache.components.keys()) == {
+                ComponentType.FULL,
+                ComponentType.SWA,
+            }, "SWAKVPool currently only supports FULL + SWA in UnifiedRadixCache."
         else:
             full_kv_pool = kvcache
             use_mla = isinstance(kvcache, MLATokenToKVPool)
@@ -348,8 +448,6 @@ def attach_hybrid_pool_to_unified_cache(
                 ComponentType.FULL
             }, "Non-hybrid KV pool currently only supports FULL-only UnifiedRadixCache."
 
-        mamba_stack = isinstance(kvcache, HybridLinearKVPool)
-        nsa_stack = isinstance(kvcache, NSATokenToKVPool)
         if mamba_stack:
             full_layer_mapping = dict(kvcache.full_attention_layer_id_mapping)
             mamba_layer_mapping = dict(params.req_to_token_pool.mamba_map)
@@ -386,6 +484,47 @@ def attach_hybrid_pool_to_unified_cache(
                 cache_controller.layer_done_counter
             )
             transfer_layer_num = len(full_layer_mapping | mamba_layer_mapping)
+        elif swa_stack:
+            full_layer_mapping = {
+                global_id: local_id
+                for global_id, (local_id, is_swa) in kvcache.layers_mapping.items()
+                if not is_swa
+            }
+            swa_layer_mapping = {
+                global_id: local_id
+                for global_id, (local_id, is_swa) in kvcache.layers_mapping.items()
+                if is_swa
+            }
+            host_pool_group, cache_controller = build_hybrid_swa_stack(
+                params=params,
+                server_args=server_args,
+                full_kv_pool=full_kv_pool,
+                swa_kv_pool=kvcache.swa_kv_pool,
+                full_layer_mapping=full_layer_mapping,
+                swa_layer_mapping=swa_layer_mapping,
+                page_size=cache.page_size,
+                tp_group=params.tp_cache_group,
+                load_cache_event=load_cache_event,
+                storage_backend=None,
+                use_mla=False,
+                host_swa_evict_fn=lambda n: cache.evict_host(n, ComponentType.SWA),
+                device_swa_evict_fn=lambda n: cache.evict(
+                    EvictParams(swa_num_tokens=n)
+                ),
+                pp_rank=params.pp_rank,
+                pp_size=params.pp_size,
+            )
+            cache.full_kv_pool_host = host_pool_group.get_pool(PoolName.KV)
+            cache.host_pool_group = host_pool_group
+            cache.cache_controller = cache_controller
+            cache.components[ComponentType.FULL]._full_kv_pool_host = (
+                cache.full_kv_pool_host
+            )
+            cache.swa_kv_pool_host = host_pool_group.get_pool(PoolName.SWA)
+            cache.components[ComponentType.SWA]._swa_kv_pool_host = (
+                cache.swa_kv_pool_host
+            )
+            transfer_layer_num = len(full_layer_mapping | swa_layer_mapping)
         elif nsa_stack:
             full_layer_mapping = {
                 layer_id: layer_id for layer_id in range(full_kv_pool.layer_num)
@@ -456,9 +595,17 @@ def attach_hybrid_pool_to_unified_cache(
             cache.cache_controller.layer_done_counter
         )
 
+        if mamba_stack:
+            pools_desc = "KV + MAMBA"
+        elif swa_stack:
+            pools_desc = "KV + SWA"
+        elif nsa_stack:
+            pools_desc = "KV + INDEXER"
+        else:
+            pools_desc = "KV"
         logger.info(
             "Attached hybrid pool stack to UnifiedRadixCache: pools=%s, transfer_layer_num=%s",
-            "KV + MAMBA" if mamba_stack else "KV + INDEXER" if nsa_stack else "KV",
+            pools_desc,
             transfer_layer_num,
         )
     except Exception:
