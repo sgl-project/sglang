@@ -4,8 +4,11 @@
 
 from __future__ import annotations
 
+import functools
+import math
 from typing import Any, Optional, Tuple, Union
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -87,6 +90,17 @@ def _ltx2_batched_perturbation_mask(
     if all_perturbed:
         return None, True
     return mask.view(mask.numel(), *([1] * (values.ndim - 1))), False
+
+
+@functools.lru_cache(maxsize=5)
+def _ltx2_rope_freq_grid_np(theta: float, num_pos_dims: int, dim: int) -> torch.Tensor:
+    # Official LTX uses NumPy float64 for double-precision RoPE frequencies.
+    n_elem = 2 * num_pos_dims
+    pow_indices = np.power(
+        theta,
+        np.linspace(0.0, 1.0, dim // n_elem, dtype=np.float64),
+    )
+    return torch.tensor(pow_indices * math.pi / 2.0, dtype=torch.float32)
 
 
 def apply_interleaved_rotary_emb(
@@ -331,18 +345,22 @@ class LTX2AudioVideoRotaryPosEmbed(nn.Module):
         ).to(device)
 
         num_rope_elems = num_pos_dims * 2
-        freqs_dtype = torch.float64 if self.double_precision else torch.float32
-        pow_indices = torch.pow(
-            self.theta,
-            torch.linspace(
-                start=0.0,
-                end=1.0,
-                steps=self.dim // num_rope_elems,
-                dtype=freqs_dtype,
-                device=device,
-            ),
-        )
-        freqs = (pow_indices * torch.pi / 2.0).to(dtype=torch.float32)
+        if self.double_precision:
+            freqs = _ltx2_rope_freq_grid_np(self.theta, num_pos_dims, self.dim).to(
+                device=device
+            )
+        else:
+            pow_indices = torch.pow(
+                self.theta,
+                torch.linspace(
+                    start=0.0,
+                    end=1.0,
+                    steps=self.dim // num_rope_elems,
+                    dtype=torch.float32,
+                    device=device,
+                ),
+            )
+            freqs = (pow_indices * torch.pi / 2.0).to(dtype=torch.float32)
 
         freqs = (grid.unsqueeze(-1) * 2 - 1) * freqs
         freqs = freqs.transpose(-1, -2).flatten(2)
