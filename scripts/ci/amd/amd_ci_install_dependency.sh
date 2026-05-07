@@ -203,7 +203,10 @@ fi
 # default and ROCm 7.2 paths both benefit.
 echo "[AMD CI mimo-v25-pro] applying torchcodec stub + multimodal text-only guard"
 docker exec ci_sglang pip uninstall -y torchcodec >/dev/null 2>&1 || true
-docker exec ci_sglang python3 - <<'PYALL'
+# `-i` is required so the heredoc body is forwarded to python3's stdin inside
+# the container; without it docker exec leaves stdin closed and python silently
+# exits, leaving both fixes unapplied.
+docker exec -i ci_sglang python3 - <<'PYALL'
 import os
 import site
 import sys
