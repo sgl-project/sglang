@@ -6,7 +6,7 @@ You can install SGLang using any of the methods below. Please go through `System
 ## Component Version Mapping For SGLang
 | Component         | Version                 | Obtain Way                                                                                                                                                                                                                   |
 |-------------------|-------------------------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| HDK               | 26.0.RC1                  | [link](https://www.hiascend.com/hardware/firmware-drivers/commercial?product=7&model=33) |
+| HDK               | 26.0.RC1                  | [link](https://www.hiascend.com/hardware/firmware-drivers/community?product=1&model=30&cann=9.0.0&driver=Ascend+HDK+26.0.RC1) |
 | CANN              | 9.0.0                     | [Obtain Images](#obtain-cann-image)                                                                                                                                                                                          |
 | Pytorch Adapter   | 26.0.0                   | [link](https://gitcode.com/Ascend/pytorch/releases)                                                                                                                                                                          |
 | MemFabric         | 1.0.5                   | `pip install memfabric-hybrid==1.0.5`                                                                                                                                                                 |
