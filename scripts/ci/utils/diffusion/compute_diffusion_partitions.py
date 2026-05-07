@@ -14,7 +14,6 @@ import os
 import sys
 from pathlib import Path
 
-from sglang.multimodal_gen.runtime.platforms import current_platform
 from diffusion_case_parser import (
     BASELINE_REL_PATH,
     RUN_SUITE_REL_PATH,
@@ -22,6 +21,8 @@ from diffusion_case_parser import (
     collect_diffusion_suites,
     resolve_case_config_path,
 )
+
+from sglang.multimodal_gen.runtime.utils.common import get_bool_env_var
 
 
 def _load_partitioning_helpers():
@@ -40,7 +41,9 @@ PartitionItem, partition_items_by_lpt = _load_partitioning_helpers()
 
 SUITE_OUTPUT_NAMES = {"1-gpu": "1gpu", "2-gpu": "2gpu", "1-gpu-b200": "b200"}
 
-if current_platform.is_npu():
+use_npu_conf = get_bool_env_var("USE_NPU_CONFIGS")
+
+if use_npu_conf:
     SUITE_OUTPUT_NAMES = {"1-npu": "1npu", "2-npu": "2npu", "8-npu": "8npu"}
 
 DEFAULT_STANDALONE_EST_TIME_SECONDS = 300.0
@@ -266,8 +269,11 @@ def main():
         print(f"Error: Run suite not found: {run_suite_path}")
         sys.exit(1)
     try:
-        if current_platform.is_npu():
-            case_config_path = "/root/sglang/python/sglang/multimodal_gen/test/server/ascend/testcase_configs_npu.py"
+        if use_npu_conf:
+            case_config_path = (
+                repo_root
+                / "python/sglang/multimodal_gen/test/server/ascend/testcase_configs_npu.py"
+            )
         else:
             case_config_path = resolve_case_config_path(repo_root, run_suite_path)
     except (RuntimeError, FileNotFoundError) as exc:

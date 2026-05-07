@@ -19,6 +19,7 @@ from pathlib import Path
 
 import tabulate
 
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.test.partitioning import (
     PartitionItem,
@@ -28,37 +29,34 @@ from sglang.multimodal_gen.test.server.testcase_configs import (
     BASELINE_CONFIG,
     DiffusionTestCase,
 )
-from sglang.multimodal_gen.runtime.platforms import current_platform
 
 if current_platform.is_npu():
     from sglang.multimodal_gen.test.server.ascend.testcase_configs_npu import (
-        SUITES,
-        FILE_SUITES,
-        STANDALONE_FILES,
-        PARAMETRIZED_CASE_GROUPS,
+        COMPONENT_ACCURACY_SUITES,
         DEFAULT_EST_TIME_SECONDS,
-        STARTUP_OVERHEAD_SECONDS,
         DEFAULT_STANDALONE_EST_TIME_SECONDS,
-        COMPONENT_ACCURACY_SUITES
+        FILE_SUITES,
+        PARAMETRIZED_CASE_GROUPS,
+        STANDALONE_FILES,
+        STARTUP_OVERHEAD_SECONDS,
+        SUITES,
     )
 else:
     from sglang.multimodal_gen.test.server.gpu_cases import (
-        SUITES,
-        ONE_GPU_CASES,
-        TWO_GPU_CASES,
-        FILE_SUITES,
-        PARAMETRIZED_CASE_GROUPS,
-        STANDALONE_FILES,
-        STANDALONE_FILE_EST_TIMES,
-        STRICT_SUITES,
-        COMPONENT_ACCURACY_SUITES,
-        COMPONENT_ACCURACY_FILE_NUM_GPUS,
-        DEFAULT_EST_TIME_SECONDS,
-        STARTUP_OVERHEAD_SECONDS,
-        DEFAULT_STANDALONE_EST_TIME_SECONDS,
         _UPDATE_WEIGHTS_FROM_DISK_TEST_FILE,
         _UPDATE_WEIGHTS_MODEL_PAIR_ENV,
         _UPDATE_WEIGHTS_MODEL_PAIR_IDS,
+        COMPONENT_ACCURACY_FILE_NUM_GPUS,
+        COMPONENT_ACCURACY_SUITES,
+        DEFAULT_EST_TIME_SECONDS,
+        DEFAULT_STANDALONE_EST_TIME_SECONDS,
+        FILE_SUITES,
+        PARAMETRIZED_CASE_GROUPS,
+        STANDALONE_FILE_EST_TIMES,
+        STANDALONE_FILES,
+        STARTUP_OVERHEAD_SECONDS,
+        STRICT_SUITES,
+        SUITES,
     )
 
 logger = init_logger(__name__)

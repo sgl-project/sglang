@@ -1,3 +1,5 @@
+from pathlib import Path
+
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.test.server.testcase_configs import (
     MODELOPT_FLUX1_FP8_TRANSFORMER,
@@ -765,4 +767,3 @@ _UPDATE_WEIGHTS_MODEL_PAIR_IDS = (
     "FLUX.2-klein-base-4B",
     "Qwen-Image",
 )
-
