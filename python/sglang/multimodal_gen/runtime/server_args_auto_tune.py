@@ -98,8 +98,8 @@ class ServerArgsAutoTuner:
             and current_platform.is_cuda()
             and disable_threshold_gb is not None
         ):
-            device_total_memory_gb = (
-                current_platform.get_device_total_memory() / (1 << 30)
+            device_total_memory_gb = current_platform.get_device_total_memory() / (
+                1 << 30
             )
             if device_total_memory_gb >= disable_threshold_gb:
                 logger.info(
