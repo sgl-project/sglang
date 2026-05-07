@@ -11,7 +11,7 @@ You can install SGLang using any of the methods below. Please go through `System
 | Pytorch Adapter   | 26.0.0                   | [link](https://gitcode.com/Ascend/pytorch/releases)                                                                                                                                                                          |
 | MemFabric         | 1.0.5                   | `pip install memfabric-hybrid==1.0.5`                                                                                                                                                                 |
 | Triton            | 3.2.0                   | `pip install triton-ascend`|
-| SGLang NPU Kernel | NA                      | [link](https://github.com/sgl-project/sgl-kernel-npu/releases)                                                                                                                                                               |
+| SGLang NPU Kernel | 2026.05.01                      | [link](https://github.com/sgl-project/sgl-kernel-npu/releases/tag/2026.05.01)                                                                                                                                                               |
 
 <a id="obtain-cann-image"></a>
 ### Obtain CANN Image
