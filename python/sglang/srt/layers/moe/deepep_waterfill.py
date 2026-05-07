@@ -31,6 +31,7 @@ _LOCAL_PREF_DENOM = 10
 class WaterfillDispatchPlan(NamedTuple):
     """Inputs needed by the fused DeepEP Waterfill expansion path."""
 
+    # Effective rank load consumed by the fused kernel.
     rank_load: Tensor
     allow_all_ranks: bool
     target_total: int
@@ -85,7 +86,7 @@ def _count_routed_per_rank_kernel(
 def _waterfill_expand_kernel(
     topk_ids_ptr,
     topk_weights_ptr,
-    routed_counts_ptr,
+    rank_load_ptr,
     expanded_ids_ptr,
     expanded_weights_ptr,
     num_tokens,
@@ -108,10 +109,10 @@ def _waterfill_expand_kernel(
     mask = token_idx < num_tokens
 
     r_idx = tl.arange(0, world_size)
-    routed_vec = tl.load(
-        routed_counts_ptr + r_idx, mask=r_idx < world_size, other=0
-    ).to(tl.int64)
-    total_effective_k = tl.sum(routed_vec)
+    rank_load_vec = tl.load(rank_load_ptr + r_idx, mask=r_idx < world_size, other=0).to(
+        tl.int64
+    )
+    total_effective_k = tl.sum(rank_load_vec)
     total_tokens_global_k = total_effective_k // topk
     derived_target_total = (
         total_effective_k + total_tokens_global_k + world_size - 1
@@ -123,7 +124,7 @@ def _waterfill_expand_kernel(
     )
 
     # Step 1: Select destination rank for shared expert (waterfill sampling).
-    source_count = tl.load(routed_counts_ptr + source_rank)
+    source_count = tl.load(rank_load_ptr + source_rank)
     best_count = tl.where(mask, source_count, 2**30)
     best_rank = tl.full([BLOCK_SIZE], source_rank, dtype=tl.int64)
     has_valid = tl.zeros([BLOCK_SIZE], dtype=tl.int1)
@@ -132,7 +133,7 @@ def _waterfill_expand_kernel(
     if ALLOW_ALL_RANKS:
         candidate_mask = tl.full([BLOCK_SIZE], (1 << world_size) - 1, dtype=tl.int32)
         for r in range(world_size):
-            target_count = tl.load(routed_counts_ptr + r).to(tl.int64)
+            target_count = tl.load(rank_load_ptr + r).to(tl.int64)
             better = (
                 target_count * local_pref_numer < best_count * local_pref_denom
             ) & mask
@@ -163,7 +164,7 @@ def _waterfill_expand_kernel(
             )
 
             target_count = tl.load(
-                routed_counts_ptr + target_rank, mask=mask & valid, other=2**30
+                rank_load_ptr + target_rank, mask=mask & valid, other=2**30
             )
 
             better = (
@@ -177,8 +178,10 @@ def _waterfill_expand_kernel(
     total_w = tl.zeros([BLOCK_SIZE], dtype=tl.int32)
     for r in range(world_size):
         present = ((candidate_mask >> r) & 1) == 1
-        routed_r = tl.load(routed_counts_ptr + r).to(tl.int64)
-        w = tl.where(target_total > routed_r, target_total - routed_r, 0).to(tl.int32)
+        rank_load_r = tl.load(rank_load_ptr + r).to(tl.int64)
+        w = tl.where(target_total > rank_load_r, target_total - rank_load_r, 0).to(
+            tl.int32
+        )
         w_vec = tl.full([BLOCK_SIZE], w, dtype=tl.int32)
         w_vec = tl.where(
             src_rank_i32 == r,
@@ -199,8 +202,10 @@ def _waterfill_expand_kernel(
     cum = tl.zeros([BLOCK_SIZE], dtype=tl.int32)
     for r in range(world_size):
         present = ((candidate_mask >> r) & 1) == 1
-        routed_r = tl.load(routed_counts_ptr + r).to(tl.int64)
-        w = tl.where(target_total > routed_r, target_total - routed_r, 0).to(tl.int32)
+        rank_load_r = tl.load(rank_load_ptr + r).to(tl.int64)
+        w = tl.where(target_total > rank_load_r, target_total - rank_load_r, 0).to(
+            tl.int32
+        )
         w_vec = tl.full([BLOCK_SIZE], w, dtype=tl.int32)
         w_vec = tl.where(
             src_rank_i32 == r,
@@ -424,12 +429,11 @@ class DeepEPWaterfillBalancer:
 
     def _can_skip_dispatch_plan_for_low_batch(self, num_tokens: int) -> bool:
         """Return whether static mode can skip dispatch-plan setup entirely."""
-        return (
-            self.static_rank_load is not None
-            and self._is_low_batch(num_tokens)
-        )
+        return self.static_rank_load is not None and self._is_low_batch(num_tokens)
 
-    def _build_static_dispatch_plan(self, routed_counts: Tensor) -> WaterfillDispatchPlan:
+    def _build_static_dispatch_plan(
+        self, routed_counts: Tensor
+    ) -> WaterfillDispatchPlan:
         """Build static-mode Waterfill inputs without EP all-reduce.
 
         Static Waterfill uses EPLB rank-load metadata availability to select the
@@ -449,6 +453,8 @@ class DeepEPWaterfillBalancer:
         topk: int,
     ) -> WaterfillDispatchPlan:
         """Build dynamic waterfill inputs from globally reduced routed counts."""
+        # Dynamic Waterfill balances against effective rank load: globally
+        # reduced routed counts plus each rank's active token count.
         rank_load = (
             routed_counts + local_tokens_per_rank
             if local_tokens_per_rank is not None
@@ -497,8 +503,8 @@ class DeepEPWaterfillBalancer:
         if self.static_rank_load is not None:
             return self._build_static_dispatch_plan(local_routed_counts)
 
-        global_routed_counts, local_tokens_per_rank = self._all_reduce_dynamic_rank_load(
-            local_routed_counts, num_tokens
+        global_routed_counts, local_tokens_per_rank = (
+            self._all_reduce_dynamic_rank_load(local_routed_counts, num_tokens)
         )
         if self._is_low_batch(num_tokens):
             return None
@@ -554,6 +560,19 @@ class DeepEPWaterfillBalancer:
             router_logits=topk_output.router_logits,
         )
 
+    def _expand_local_shared(
+        self, topk_output: StandardTopKOutput
+    ) -> StandardTopKOutput:
+        expanded_ids, expanded_weights = expand_topk_with_shared_expert(
+            topk_output.topk_ids,
+            topk_output.topk_weights,
+            self.num_routed_experts,
+            self.world_size,
+            self.rank,
+            self.shared_weight,
+        )
+        return self._with_expanded_topk(topk_output, expanded_ids, expanded_weights)
+
     def expand_topk(
         self, topk_output: StandardTopKOutput, num_tokens: int
     ) -> StandardTopKOutput:
@@ -562,15 +581,7 @@ class DeepEPWaterfillBalancer:
             # Static EPLB low-batch path can use local expansion without
             # communication. Dynamic mode still all-reduces before materializing
             # local expansion so all ranks participate consistently.
-            expanded_ids, expanded_weights = expand_topk_with_shared_expert(
-                topk_output.topk_ids,
-                topk_output.topk_weights,
-                self.num_routed_experts,
-                self.world_size,
-                self.rank,
-                self.shared_weight,
-            )
-            return self._with_expanded_topk(topk_output, expanded_ids, expanded_weights)
+            return self._expand_local_shared(topk_output)
 
         dispatch_plan = self._build_dispatch_plan(topk_output.topk_ids, num_tokens)
         if dispatch_plan is None:
@@ -578,16 +589,11 @@ class DeepEPWaterfillBalancer:
                 expanded_ids, expanded_weights = _empty_expanded(
                     topk_output.topk_ids, topk_output.topk_weights
                 )
-            else:
-                expanded_ids, expanded_weights = expand_topk_with_shared_expert(
-                    topk_output.topk_ids,
-                    topk_output.topk_weights,
-                    self.num_routed_experts,
-                    self.world_size,
-                    self.rank,
-                    self.shared_weight,
+                return self._with_expanded_topk(
+                    topk_output, expanded_ids, expanded_weights
                 )
-            return self._with_expanded_topk(topk_output, expanded_ids, expanded_weights)
+            else:
+                return self._expand_local_shared(topk_output)
         expanded_ids, expanded_weights = self._materialize_dispatch(
             topk_output.topk_ids,
             topk_output.topk_weights,
