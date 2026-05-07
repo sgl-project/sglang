@@ -1298,7 +1298,14 @@ class Req(ReqDllmMixin):
             if self.bootstrap_room is not None
             else ""
         )
-        prefix = f"Req Time Stats(rid={self.rid}{bootstrap_info}, input len={len(self.origin_input_ids)}, output len={len(self.output_ids)}, type={self.time_stats.disagg_mode_str()})"
+        prefix = (
+            f"ReqTimeStats("
+            f"rid={self.rid}{bootstrap_info}, "
+            f"input_len={len(self.origin_input_ids)}, "
+            f"cached_input_len={self.cached_tokens}, "
+            f"output_len={len(self.output_ids)}, "
+            f"type={self.time_stats.disagg_mode_str()})"
+        )
         logger.info(f"{prefix}: {self.time_stats.convert_to_duration()}")
         self.has_log_time_stats = True
 
@@ -1493,6 +1500,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # Metrics
     dp_cooperation_info: Optional[DPCooperationInfo] = None
     prefill_stats: Optional[PrefillStats] = None
+    forward_iter: Optional[int] = None
 
     # HiSparse
     hisparse_coordinator: Optional[HiSparseCoordinator] = None
@@ -2618,6 +2626,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             mamba_track_seqlens=self.mamba_track_seqlens,
             dp_cooperation_info=self.dp_cooperation_info,
             prefill_stats=self.prefill_stats,
+            forward_iter=self.forward_iter,
         )
 
     def maybe_evict_swa(self):
