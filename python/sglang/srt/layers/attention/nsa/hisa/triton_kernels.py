@@ -1,21 +1,9 @@
 """Triton ports of HISA kernels.
 
-Each kernel here mirrors a tilelang kernel in ``hisa/custom_ops.py`` so we
-can microbench the two implementations on identical inputs.
-
-Coverage (so far):
-  1. ``batch_pool_mqa_triton`` — triton port of
-     ``batch_decode_pool_mqa_attn_return_logits_fp8_legacy``. Contiguous blocked_k
-     input, fp8×fp8 MQA. Simpler pattern, no paged indirection.
-
-Pending (add next):
-  2. ``sparse_paged_mqa_triton`` — port of
-     ``fp8_native_paged_block_sparse_mqa_attn_return_logits``. The 80% hotspot.
-
 Notes on the fp8 path:
   - Requires ``triton >= 3.0`` for ``tl.dot`` on fp8 operands.
   - fp8 scales are per-K-block (one f32 per K-block), applied **after** the
-    GEMM as a scalar multiply — same as tilelang.
+    GEMM as a scalar multiply.
   - ``tl.dot`` needs the accumulator and one operand in ``float32``/``tf32``
     depending on arch; fp8 × fp8 → fp32 accumulator is supported on H100+.
 """
@@ -30,7 +18,6 @@ import triton.language as tl
 
 # ---------------------------------------------------------------------------
 # Kernel 1: contiguous block-MQA (fp8 Q × fp8 K + per-block-scale + weights)
-#   Mirrors: batch_decode_pool_mqa_attn_return_logits_fp8_legacy (tilelang)
 #   Shapes:
 #     Q:          [B, H, D]                fp8
 #     BlockedK:   [B, nb, D]               fp8
@@ -153,9 +140,9 @@ def batch_pool_mqa_triton(
     *,
     BLOCK_N: int | None = None,
 ) -> torch.Tensor:
-    """Triton equivalent of ``batch_pool_mqa_attn_return_logits_fp8_legacy_interface``.
-    Returns logits of shape ``[B, 1, nb]`` (unsqueezed to match the tilelang
-    wrapper's shape).
+    """Contiguous block-MQA (decode): fp8 Q × fp8 BlockedK with per-block scales.
+
+    Returns logits of shape ``[B, 1, nb]``.
     """
     assert q_fp8.ndim == 4, f"expected q_fp8 [B, 1, H, D], got {q_fp8.shape}"
     B, seq_q, H, D = q_fp8.shape
