@@ -33,6 +33,12 @@ from torch.profiler import ProfilerActivity, profile
 from sglang.srt.batch_overlap.two_batch_overlap import TboCudaGraphRunnerPlugin
 from sglang.srt.constants import GPU_MEMORY_TYPE_CUDA_GRAPH
 from sglang.srt.distributed import get_tensor_model_parallel_rank
+from sglang.srt.distributed.communication_op import (
+    set_cuda_graph_collective_break as set_communication_op_collective_break,
+)
+from sglang.srt.distributed.parallel_state import (
+    set_cuda_graph_collective_break as set_parallel_state_collective_break,
+)
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     set_graph_pool_id,
 )
@@ -945,8 +951,18 @@ class CudaGraphRunner:
         else:
             captured_fn = run_once_fn
 
-        with graph_ctx(cuda_graph=graph, pool=pool, stream=stream):
-            out = captured_fn()
+        prev_comm_collective_break = set_communication_op_collective_break(
+            self.enable_cuda_graph_collective_break
+        )
+        prev_parallel_collective_break = set_parallel_state_collective_break(
+            self.enable_cuda_graph_collective_break
+        )
+        try:
+            with graph_ctx(cuda_graph=graph, pool=pool, stream=stream):
+                out = captured_fn()
+        finally:
+            set_communication_op_collective_break(prev_comm_collective_break)
+            set_parallel_state_collective_break(prev_parallel_collective_break)
         return out
 
     def _create_device_graph(self):

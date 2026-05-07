@@ -44,6 +44,9 @@ from sglang.srt.compilation.compilation_config import register_split_op
 from sglang.srt.compilation.piecewise_context_manager import is_in_piecewise_cuda_graph
 from sglang.srt.distributed.utils import set_global_tcp_store
 from sglang.srt.environ import envs
+from sglang.srt.model_executor.breakable_cuda_graph.breakable_cuda_graph import (
+    eager_on_graph,
+)
 from sglang.srt.utils import (
     get_current_device_stream_fast,
     get_int_env_var,
@@ -192,6 +195,19 @@ def reg_reduce_scatter_tensor(
     if group is None:
         raise ValueError(f"Group {group_name} is destroyed.")
     group._reduce_scatter_tensor(output, input)
+
+
+bcg_reg_all_gather_into_tensor = eager_on_graph(True)(reg_all_gather_into_tensor)
+bcg_reg_reduce_scatter_tensor = eager_on_graph(True)(reg_reduce_scatter_tensor)
+
+_enable_cuda_graph_collective_break = False
+
+
+def set_cuda_graph_collective_break(enabled: bool) -> bool:
+    global _enable_cuda_graph_collective_break
+    prev = _enable_cuda_graph_collective_break
+    _enable_cuda_graph_collective_break = enabled
+    return prev
 
 
 class GroupCoordinator:
@@ -753,6 +769,8 @@ class GroupCoordinator:
     def reduce_scatter_tensor(self, output: torch.Tensor, input: torch.Tensor):
         if _is_npu:
             self._reduce_scatter_tensor(output, input)
+        elif _enable_cuda_graph_collective_break:
+            bcg_reg_reduce_scatter_tensor(output, input, group_name=self.unique_name)
         else:
             reg_reduce_scatter_tensor(output, input, group_name=self.unique_name)
 
@@ -816,6 +834,8 @@ class GroupCoordinator:
     def all_gather_into_tensor(self, output: torch.Tensor, input: torch.Tensor):
         if _is_npu or _is_xpu:
             self._all_gather_into_tensor(output, input)
+        elif _enable_cuda_graph_collective_break:
+            bcg_reg_all_gather_into_tensor(output, input, group_name=self.unique_name)
         else:
             reg_all_gather_into_tensor(output, input, group_name=self.unique_name)
 
