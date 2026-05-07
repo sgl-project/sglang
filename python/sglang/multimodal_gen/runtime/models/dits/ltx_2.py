@@ -861,7 +861,7 @@ class LTX2TransformerBlock(nn.Module):
             norm_eps=norm_eps,
             qk_norm=qk_norm,
             apply_gated_attention=apply_gated_attention,
-            supported_attention_backends={AttentionBackendEnum.TORCH_SDPA},
+            supported_attention_backends=supported_attention_backends,
             prefix=f"{prefix}.attn1",
             quant_config=quant_config,
         )
