@@ -1291,13 +1291,11 @@ class LTX2TransformerBlock(nn.Module):
             norm_hidden_states = rms_norm(hidden_states, self.norm_eps)
             if not skip_a2v_cross_attn:
                 mod_norm_hidden_states_for_a2v = (
-                    norm_hidden_states * (1 + video_a2v_ca_scale)
-                    + video_a2v_ca_shift
+                    norm_hidden_states * (1 + video_a2v_ca_scale) + video_a2v_ca_shift
                 )
             if not skip_v2a_cross_attn:
                 mod_norm_hidden_states_for_v2a = (
-                    norm_hidden_states * (1 + video_v2a_ca_scale)
-                    + video_v2a_ca_shift
+                    norm_hidden_states * (1 + video_v2a_ca_scale) + video_v2a_ca_shift
                 )
 
         mod_norm_audio_hidden_states = scale_shift(
@@ -1315,9 +1313,7 @@ class LTX2TransformerBlock(nn.Module):
                 skip_sequence_parallel_override=audio_replicated_for_sp,
             )
             if a2v_cross_attn_perturbation_mask is not None:
-                a2v_attn_output = (
-                    a2v_attn_output * a2v_cross_attn_perturbation_mask
-                )
+                a2v_attn_output = a2v_attn_output * a2v_cross_attn_perturbation_mask
         else:
             a2v_attn_output = None
 

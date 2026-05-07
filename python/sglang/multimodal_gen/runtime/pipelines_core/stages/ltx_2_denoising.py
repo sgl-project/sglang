@@ -1,7 +1,6 @@
 import math
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-import math
 
 import torch
 from diffusers.utils.torch_utils import randn_tensor
@@ -744,8 +743,8 @@ class LTX2DenoisingStage(DenoisingStage):
             h_value = h
         else:
             h = -torch.log(torch.clamp(sigma_next_d / sigma_d, min=1e-12))
-            h_scalar = -math.log(max(sigma_next_val / sigma_val, 1e-12))
-        a21, b1, b2 = self._ltx2_get_res2s_coefficients(h)h_value = float(h.item())
+            a21, b1, b2 = self._ltx2_get_res2s_coefficients(h)
+            h_value = float(h.item())
         sub_sigma = torch.sqrt(torch.clamp(sigma_d * sigma_next_d, min=0.0))
 
         anchor_video = ctx.latents.double()
@@ -1631,9 +1630,7 @@ class LTX2DenoisingStage(DenoisingStage):
         sigma_next_source = sigmas[step.step_index + 1]
         sigma_val = float(sigma_source.item())
         sigma_next_val = float(sigma_next_source.item())
-        sigma = sigma_source.to(
-            device=ctx.latents.device, dtype=torch.float32
-        )
+        sigma = sigma_source.to(device=ctx.latents.device, dtype=torch.float32)
         sigma_next = sigma_next_source.to(
             device=ctx.latents.device, dtype=torch.float32
         )
@@ -2381,8 +2378,8 @@ class LTX2DenoisingStage(DenoisingStage):
                     h_value = h
                 else:
                     h = -torch.log(torch.clamp(sigma_next_d / sigma_d, min=1e-12))
-                    a21, b1, b2 = self._ltx2_get_res2s_coefficients(h)h_value = float(h.item())
-                    h_value = -math.log(max(sigma_next_val / sigma_val, 1e-12))
+                    a21, b1, b2 = self._ltx2_get_res2s_coefficients(h)
+                    h_value = float(h.item())
 
                 sub_sigma = torch.sqrt(torch.clamp(sigma_d * sigma_next_d, min=0.0))
                 sub_sigma_val = math.sqrt(max(sigma_val * sigma_next_val, 0.0))
