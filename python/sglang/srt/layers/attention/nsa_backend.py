@@ -67,6 +67,17 @@ else:
     )
 
 
+def _to_2d_context_lens(seqlens_32: torch.Tensor, batch_size: int) -> torch.Tensor:
+    if seqlens_32.dim() == 2:
+        return seqlens_32
+    n = seqlens_32.numel()
+    assert (
+        n % batch_size == 0
+    ), f"seqlens_32 size {n} is not a multiple of batch_size {batch_size}"
+    next_n = n // batch_size
+    return seqlens_32.view(batch_size, next_n)
+
+
 # Reuse this workspace buffer across all NSA backend instances
 global_workspace_buffer = None
 
@@ -647,8 +658,11 @@ class NativeSparseAttnBackend(
                     )
                     else cache_seqlens_int32
                 )
+                seqlens_32_2d = _to_2d_context_lens(
+                    seqlens_32, forward_batch.batch_size
+                )
                 paged_mqa_schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
-                    seqlens_32, 64, deep_gemm.get_num_sms()
+                    seqlens_32_2d, 64, deep_gemm.get_num_sms()
                 )
             except (ImportError, ModuleNotFoundError):
                 paged_mqa_schedule_metadata = None
@@ -932,8 +946,9 @@ class NativeSparseAttnBackend(
                     )
                     else cache_seqlens_int32
                 )
+                seqlens_32_2d = _to_2d_context_lens(seqlens_32, bs)
                 paged_mqa_schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
-                    seqlens_32, 64, deep_gemm.get_num_sms()
+                    seqlens_32_2d, 64, deep_gemm.get_num_sms()
                 )
             except (ImportError, ModuleNotFoundError):
                 paged_mqa_schedule_metadata = None
@@ -1082,8 +1097,9 @@ class NativeSparseAttnBackend(
                     )
                     else metadata.cache_seqlens_int32
                 )
+                seqlens_32_2d = _to_2d_context_lens(seqlens_32, bs)
                 new_schedule = deep_gemm.get_paged_mqa_logits_metadata(
-                    seqlens_32, 64, deep_gemm.get_num_sms()
+                    seqlens_32_2d, 64, deep_gemm.get_num_sms()
                 )
                 if metadata.paged_mqa_schedule_metadata is None:
                     metadata.paged_mqa_schedule_metadata = new_schedule
