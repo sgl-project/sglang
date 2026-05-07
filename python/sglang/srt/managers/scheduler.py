@@ -2949,6 +2949,7 @@ class Scheduler(
     ) -> Union[GenerationBatchResult, EmbeddingBatchResult]:
         """Run a batch."""
         self.forward_ct += 1
+        batch.forward_iter = self.forward_ct
 
         # Whether to run the profiler
         self._profile_batch_predicate(batch)
