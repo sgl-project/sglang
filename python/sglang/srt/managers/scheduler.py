@@ -3031,8 +3031,8 @@ class Scheduler(
         ):
             # Get the tensors indicating rank activeness
             self.elastic_ep_status_publisher.publish_active_ranks(
-                tp_active_ranks=self.tp_group.active_ranks,
-                tp_active_ranks_cpu=self.tp_group.active_ranks_cpu,
+                global_device_active_ranks=self.tp_group.active_ranks,
+                global_pg_active_ranks_cpu=self.tp_group.active_ranks_cpu,
             )
 
         return ret

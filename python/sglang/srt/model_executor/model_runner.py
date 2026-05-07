@@ -1550,9 +1550,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 )
 
     def recover_ep_ranks_after_retract(self, ranks_to_recover: List[int]) -> None:
-        # NOTE: `ranks_to_recover` uses indices in `tp_group`. For the current
-        # Mooncake elastic EP implementation we assume `--pp-size=1`, so the
-        # tp-group index is the same as the global rank index.
+        # `ranks_to_recover` uses global rank indices.
         assert ranks_to_recover
         recover_ranks(ranks_to_recover)
         self.forward_pass_id = 0
@@ -3098,7 +3096,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             )
         if elastic_ep_state is not None:
             elastic_ep_state.submit_active_snapshot(
-                tp_active_ranks=self.tp_group.active_ranks
+                global_pg_active_ranks=self.tp_group.active_ranks
             )
         output.expert_distribution_metrics = recorder_outputs.get("metrics")
 

@@ -47,23 +47,20 @@ class SchedulerElasticEPMixin:
     def _publish_active_ranks_from_committed_snapshot(self: Scheduler):
         elastic_ep_state = ElasticEPStateManager.instance()
         assert elastic_ep_state is not None
-        assert elastic_ep_state.tp_active_ranks_cpu is not None
 
-        self.elastic_ep_status_publisher.publish_active_ranks(
-            tp_active_ranks=elastic_ep_state.tp_active_ranks_cpu,
-            tp_active_ranks_cpu=self.tp_group.active_ranks_cpu,
+        self.elastic_ep_status_publisher.publish_committed_active_ranks(
+            elastic_ep_state.committed_active_ranks_cpu
         )
 
     def _get_elastic_ep_ranks_to_recover_from_cpu_snapshot(
         self: Scheduler,
     ) -> List[int]:
         elastic_ep_state = ElasticEPStateManager.instance()
-        if elastic_ep_state is None or elastic_ep_state.tp_active_ranks_cpu is None:
-            return []
+        assert elastic_ep_state is not None
 
         return (
             torch.nonzero(
-                elastic_ep_state.tp_active_ranks_cpu == 0, as_tuple=False
+                elastic_ep_state.committed_active_ranks_cpu == 0, as_tuple=False
             )
             .flatten()
             .tolist()
