@@ -6,6 +6,7 @@ from sglang.multimodal_gen.test.server.testcase_configs import (
     MODELOPT_FLUX1_NVFP4_TRANSFORMER,
     MODELOPT_FLUX2_FP8_TRANSFORMER,
     MODELOPT_FLUX2_NVFP4_WEIGHTS,
+    MODELOPT_HUNYUANVIDEO_FP8_TRANSFORMER,
     MODELOPT_NVFP4_B200_ENV_VARS,
     MODELOPT_QWEN_IMAGE_EDIT_FP8_TRANSFORMER,
     MODELOPT_QWEN_IMAGE_FP8_TRANSFORMER,
@@ -406,6 +407,18 @@ else:
             extras=["--transformer-path", MODELOPT_WAN22_FP8_TRANSFORMER],
         ),
         _make_modelopt_ci_case(
+            "hunyuanvideo_modelopt_fp8_t2v",
+            model_path="hunyuanvideo-community/HunyuanVideo",
+            modality="video",
+            sampling_params=MODELOPT_T2V_CI_sampling_params,
+            extras=[
+                "--transformer-path",
+                MODELOPT_HUNYUANVIDEO_FP8_TRANSFORMER,
+                "--text-encoder-cpu-offload",
+                "--pin-cpu-memory",
+            ],
+        ),
+        _make_modelopt_ci_case(
             "qwen_image_modelopt_fp8_t2i",
             model_path=DEFAULT_QWEN_IMAGE_MODEL_NAME_FOR_TEST,
             modality="image",
@@ -553,7 +566,7 @@ TWO_GPU_CASES = [
         "ltx_2_3_two_stage_ti2v_2gpus",
         DiffusionServerArgs(
             model_path="Lightricks/LTX-2.3",
-            ulysses_degree=2,
+            cfg_parallel=True,
             extras=[
                 "--pipeline-class-name LTX2TwoStagePipeline --ltx2-two-stage-device-mode original"
             ],
@@ -573,7 +586,7 @@ TWO_GPU_CASES = [
         "ltx_2.3_two_stage_t2v_2gpus",
         DiffusionServerArgs(
             model_path="Lightricks/LTX-2.3",
-            ulysses_degree=2,
+            cfg_parallel=True,
             extras=[
                 "--pipeline-class-name LTX2TwoStagePipeline",
                 "--ltx2-two-stage-device-mode original",
@@ -713,7 +726,6 @@ STANDALONE_FILES = {
     "1-gpu": [
         "../cli/test_generate_t2i_perf.py",
         "test_update_weights_from_disk.py",
-        "test_tracing.py",
     ],
     "2-gpu": [
         "test_disagg_server.py",
@@ -727,7 +739,6 @@ STANDALONE_FILE_EST_TIMES = {
     "1-gpu": {
         "../cli/test_generate_t2i_perf.py": 240.0,
         "test_update_weights_from_disk.py": 480.0,
-        "test_tracing.py": 120.0,
     },
     "2-gpu": {
         # Two disagg clusters × (~3 min startup + ~1 min generate) ≈ 8 min.
