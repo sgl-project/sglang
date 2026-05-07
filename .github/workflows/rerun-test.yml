@@ -14,7 +14,6 @@ on:
         type: choice
         options:
           - 1-gpu-h100
-          - 1-gpu-h100-h200
           - 1-gpu-5090
           - 2-gpu-h100
           - 4-gpu-h100

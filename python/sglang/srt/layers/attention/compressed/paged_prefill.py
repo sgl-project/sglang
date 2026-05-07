@@ -4,7 +4,10 @@ from typing import TYPE_CHECKING, Any, Dict, List, Tuple
 
 import torch
 
-from sglang.jit_kernel.deepseek_v4 import tilelang_make_swa_prefill_indices
+from sglang.jit_kernel.deepseek_v4 import (
+    tilelang_make_swa_prefill_indices,
+    triton_make_swa_prefill_indices,
+)
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.nsa import index_buf_accessor_v4
 from sglang.srt.layers.attention.nsa.quant_k_cache_v4 import (
@@ -73,6 +76,21 @@ def make_swa_ring_buffer_indices(
             seq_lens_q=seq_lens_q,
             swa_indices=swa_indices,
         )
+    elif envs.SGLANG_OPT_USE_TRITON_SWA_PREPARE.get():
+        seq_lens = forward_batch.seq_lens
+        extend_lens = forward_batch.extend_seq_lens
+        assert extend_lens is not None
+        seq_lens_k = seq_lens.to(torch.int32)
+        seq_lens_q = extend_lens.to(torch.int32)
+        swa_indices = torch.empty(
+            (extend_num_tokens, SWA_WINDOW), device=device, dtype=torch.int32
+        )
+        return triton_make_swa_prefill_indices(
+            seq_lens_k=seq_lens_k,
+            seq_lens_q=seq_lens_q,
+            swa_indices=swa_indices,
+        )
+
     seq_lens = forward_batch.seq_lens_cpu
     extend_lens = forward_batch.extend_seq_lens_cpu
     assert seq_lens is not None and extend_lens is not None
