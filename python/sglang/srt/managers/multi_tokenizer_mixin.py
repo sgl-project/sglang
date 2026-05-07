@@ -288,6 +288,7 @@ def _handle_output_by_index(output, i):
         )
     else:
         new_output = output
+    new_output.load = output.load
     return new_output
 
 

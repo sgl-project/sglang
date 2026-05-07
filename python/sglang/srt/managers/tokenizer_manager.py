@@ -60,6 +60,7 @@ from sglang.srt.managers.io_struct import (
     EmbeddingReqInput,
     FreezeGCReq,
     GenerateReqInput,
+    GetLoadsReqOutput,
     HealthCheckOutput,
     LoadLoRAAdapterReqInput,
     OpenSessionReqOutput,
@@ -370,6 +371,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.server_status = ServerStatus.Starting
         self.gracefully_exit = False
         self.last_receive_tstamp = real_time()
+        self.loads_cache = {}
 
         # Session
         self.session_futures = {}  # session_id -> asyncio event
@@ -1630,6 +1632,12 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         while True:
             with self.soft_watchdog.disable():
                 recv_obj = await self.recv_from_detokenizer.recv_pyobj()
+            self.last_receive_tstamp = real_time()
+            load = (
+                recv_obj if isinstance(recv_obj, GetLoadsReqOutput) else recv_obj.load
+            )
+            if load is not None:
+                self.loads_cache[load.dp_rank] = (self.last_receive_tstamp, load)
             if isinstance(
                 recv_obj,
                 (BatchStrOutput, BatchEmbeddingOutput, BatchTokenIDOutput),
@@ -1637,7 +1645,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 await self._handle_batch_output(recv_obj)
             else:
                 self._result_dispatcher(recv_obj)
-            self.last_receive_tstamp = real_time()
             self.soft_watchdog.feed()
 
     async def _handle_batch_output(

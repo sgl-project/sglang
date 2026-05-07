@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import logging
 import time
 import uuid
@@ -79,6 +80,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromTensorReqInput,
     UpdateWeightsFromTensorReqOutput,
 )
+from sglang.srt.observability.req_time_stats import real_time
 from sglang.srt.server_args import LoRARef, ServerArgs
 from sglang.srt.utils import get_bool_env_var
 from sglang.utils import TypeBasedDispatcher
@@ -87,6 +89,7 @@ if TYPE_CHECKING:
     from sglang.srt.managers.tokenizer_manager import TokenizerManager
 
 logger = logging.getLogger(__name__)
+LOADS_CACHE_MAX_AGE_S = 5.0
 
 # Declarative spec: (attr_name_prefix, response_type[, mode])
 # Each entry creates self.{prefix}_communicator and registers
@@ -817,17 +820,36 @@ class TokenizerControlMixin:
             List of GetLoadsReqOutput, one per scheduler (filtered by dp_rank if specified)
         """
         self.auto_create_handle_loop()
-        # Always request all sections from scheduler — watching mode shares
-        # results across concurrent callers, so we fetch full data and filter here.
-        req = GetLoadsReqInput(include=["all"], dp_rank=None)
-        results = await self.get_loads_communicator(req)
+        if dp_rank is not None and (dp_rank < 0 or dp_rank >= self.server_args.dp_size):
+            return []
+
+        now = real_time()
+        if self.server_args.disable_load_piggyback:
+            refresh_loads = True
+        elif dp_rank is not None:
+            item = self.loads_cache.get(dp_rank)
+            refresh_loads = item is None or now - item[0] > LOADS_CACHE_MAX_AGE_S
+        elif len(self.loads_cache) == self.server_args.dp_size:
+            oldest_load_update = min(item[0] for item in self.loads_cache.values())
+            refresh_loads = now > oldest_load_update + LOADS_CACHE_MAX_AGE_S
+        else:
+            refresh_loads = True
+
+        if refresh_loads:
+            req = GetLoadsReqInput(include=["all"], dp_rank=None)
+            refreshed = await self.get_loads_communicator(req)
+            now = real_time()
+            self.loads_cache = {r.dp_rank: (now, r) for r in refreshed}
 
         # Filter by dp_rank if specified
         if dp_rank is not None:
-            results = [r for r in results if r.dp_rank == dp_rank]
+            results = [self.loads_cache[dp_rank][1]]
+        else:
+            results = [self.loads_cache[i][1] for i in sorted(self.loads_cache)]
 
         # Filter optional sections client-side (scheduler always returns all)
         if include and "all" not in include:
+            results = copy.deepcopy(results)
             include_set = set(include)
             _section_attrs = {
                 "memory": "memory",

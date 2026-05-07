@@ -12,7 +12,6 @@ from sglang.srt.managers.io_struct import (
     AbortReq,
     BatchEmbeddingOutput,
     BatchTokenIDOutput,
-    GetLoadsReqInput,
 )
 from sglang.srt.managers.schedule_batch import (
     BaseFinishReason,
@@ -999,7 +998,6 @@ class SchedulerOutputProcessorMixin:
         spec_acceptance_histogram = []
         retraction_counts = []
         output_hidden_states = None
-        load = self.get_loads(GetLoadsReqInput(include=["core"]))
         routed_experts = None
         indexer_topk = None
         customized_info = {}
@@ -1250,7 +1248,6 @@ class SchedulerOutputProcessorMixin:
                     placeholder_tokens_idx=None,
                     placeholder_tokens_val=None,
                     retraction_counts=retraction_counts,
-                    load=load,
                     dp_ranks=dp_ranks,
                 )
             )

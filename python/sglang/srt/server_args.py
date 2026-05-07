@@ -394,6 +394,7 @@ class ServerArgs:
     pp_async_batch_depth: int = 0
     stream_interval: int = 1
     batch_notify_size: int = 16
+    disable_load_piggyback: bool = False
     stream_response_default_include_usage: bool = False
     incremental_streaming_output: bool = False
     enable_streaming_session: bool = False
@@ -4684,6 +4685,11 @@ class ServerArgs:
             default=ServerArgs.batch_notify_size,
             help="Number of streaming notifications to batch before yielding to the event loop. "
             "Reduces asyncio wakeup overhead under high concurrency.",
+        )
+        parser.add_argument(
+            "--disable-load-piggyback",
+            action="store_true",
+            help="Disable piggybacking /v1/loads snapshots on scheduler responses.",
         )
         parser.add_argument(
             "--incremental-streaming-output",

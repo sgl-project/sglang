@@ -111,6 +111,7 @@ from sglang.srt.managers.io_struct import (
     GetInternalStateReq,
     GetInternalStateReqOutput,
     GetLoadsReqInput,
+    GetLoadsReqOutput,
     GetWeightsByNameReqInput,
     HealthCheckOutput,
     InitWeightsSendGroupForRemoteInstanceReqInput,
@@ -542,8 +543,8 @@ class Scheduler(
                     context, zmq.PUSH, port_args.detokenizer_ipc_name, False
                 )
 
-            self.send_to_tokenizer = SenderWrapper(send_to_tokenizer)
-            self.send_to_detokenizer = SenderWrapper(send_to_detokenizer)
+            self.send_to_tokenizer = SenderWrapper(send_to_tokenizer, self)
+            self.send_to_detokenizer = SenderWrapper(send_to_detokenizer, self)
 
             if self.server_args.sleep_on_idle:
                 self.idle_sleeper = IdleSleeper(
@@ -555,8 +556,8 @@ class Scheduler(
         else:
             self.recv_from_tokenizer = None
             self.recv_from_rpc = None
-            self.send_to_tokenizer = SenderWrapper(None)
-            self.send_to_detokenizer = SenderWrapper(None)
+            self.send_to_tokenizer = SenderWrapper(None, self)
+            self.send_to_detokenizer = SenderWrapper(None, self)
 
         if self.current_scheduler_metrics_enabled:
             self.send_metrics_from_scheduler = get_zmq_socket(
@@ -3811,8 +3812,9 @@ def is_work_request(recv_req):
 
 
 class SenderWrapper:
-    def __init__(self, socket: zmq.Socket):
+    def __init__(self, socket: zmq.Socket, scheduler: Scheduler):
         self.socket = socket
+        self.scheduler = scheduler
 
     def send_output(
         self,
@@ -3829,6 +3831,13 @@ class SenderWrapper:
         ):
             # handle communicator reqs for multi-http worker case
             output.http_worker_ipc = recv_obj.http_worker_ipc
+
+        if (
+            not self.scheduler.server_args.disable_load_piggyback
+            and output.load is None
+            and not isinstance(output, GetLoadsReqOutput)
+        ):
+            output.load = self.scheduler.get_loads(GetLoadsReqInput(include=["all"]))
 
         self.socket.send_pyobj(output)
 
