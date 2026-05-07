@@ -266,6 +266,7 @@ class NixlKVManager(CommonKVManager):
             self.transfer_queues: List[FastQueue] = [
                 FastQueue() for _ in range(transfer_queue_size)
             ]
+            self.exceptions: Dict[int, Exception] = {}
             for queue in self.transfer_queues:
                 threading.Thread(
                     target=self.transfer_worker, args=(queue,), daemon=True
@@ -494,14 +495,16 @@ class NixlKVManager(CommonKVManager):
                     self.update_status(room, KVPoll.Success)
                 else:
                     self.update_status(room, KVPoll.Transferring)
-            except _NIXL_TRANSPORT_ERRORS as e:
-                logger.warning(f"NIXL transport error for room {room}: {e}")
-                self.record_failure(room, str(e))
-                self.update_status(room, KVPoll.Failed)
             except Exception as e:
-                logger.exception(
-                    f"Unexpected transfer worker error for room {room}: {e}"
-                )
+                # Catch all exceptions to prevent silently killing this
+                # worker thread, but still propagate via failure_exception().
+                if isinstance(e, _NIXL_TRANSPORT_ERRORS):
+                    logger.warning(f"NIXL transport error for room {room}: {e}")
+                else:
+                    logger.exception(
+                        f"Unexpected transfer worker error for room {room}"
+                    )
+                self.exceptions[room] = e
                 self.record_failure(room, str(e))
                 self.update_status(room, KVPoll.Failed)
 
@@ -1280,6 +1283,9 @@ class NixlKVSender(CommonKVSender):
     def failure_exception(self):
         if self._send_error is not None:
             raise self._send_error
+        exc = self.kv_mgr.exceptions.pop(self.bootstrap_room, None)
+        if exc is not None:
+            raise exc
         raise RuntimeError("NIXL KVSender Exception")
 
 
