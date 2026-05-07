@@ -3563,12 +3563,14 @@ class Scheduler(
             for decode_req in self.disagg_decode_prealloc_queue.queue:
                 if recv_req.abort_all or decode_req.req.rid.startswith(recv_req.rid):
                     logger.debug(f"Abort prealloc queue request. {decode_req.req.rid=}")
+                    decode_req.req.to_finish = FINISH_ABORT()
                     decode_req.kv_receiver.abort()
 
             # Abort requests waiting for kvcache to release tree cache
             for decode_req in self.disagg_decode_transfer_queue.queue:
                 if recv_req.abort_all or decode_req.req.rid.startswith(recv_req.rid):
                     logger.debug(f"Abort transfer queue request. {decode_req.req.rid=}")
+                    decode_req.req.to_finish = FINISH_ABORT()
                     decode_req.kv_receiver.abort()
 
             # Abort requests already retracted to CPU cache

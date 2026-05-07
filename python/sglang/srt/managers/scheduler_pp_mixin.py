@@ -216,6 +216,7 @@ class SchedulerPPMixin:
 
                 recv_reqs = self.recv_requests()
                 self.process_input_requests(recv_reqs)
+                self.process_aborted_disagg_prefill_reqs()
 
                 if not self.pp_group.is_last_rank:
                     self._pp_commit_comm_work(self.send_req_work)

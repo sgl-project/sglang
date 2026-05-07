@@ -159,6 +159,7 @@ class CommonKVManager(BaseKVManager):
             self.session_pool_lock = threading.Lock()
             self.addr_to_rooms_tracker: Dict[str, Set[int]] = defaultdict(set)
             self.prefill_response_tracker: Dict[int, Set[int]] = defaultdict(set)
+            self.prefill_abort_tracker: Dict[int, Set[int]] = defaultdict(set)
             # Heartbeat interval should be at least 2 seconds
             self.heartbeat_interval = max(
                 envs.SGLANG_DISAGGREGATION_HEARTBEAT_INTERVAL.get(), 2.0
@@ -768,6 +769,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         self.app.router.add_route("*", "/route", self._handle_route)
         self.app.router.add_post("/register_dp_rank", self._handle_register_dp_rank)
         self.app.router.add_post("/query_dp_ranks", self._handle_query_dp_ranks)
+        self.app.router.add_post("/abort_room", self._handle_abort_room)
         self.app.router.add_get("/health", self._handle_health_check)
 
     async def _handle_health_check(self, request):
@@ -935,6 +937,50 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
                 if room_int in self.room_to_dp_rank:
                     result[str(room_int)] = self.room_to_dp_rank[room_int]["dp_rank"]
         return web.json_response(result, status=200)
+
+    async def _handle_abort_room(self, request: web.Request):
+        data = await request.json()
+        bootstrap_room = int(data["bootstrap_room"])
+        endpoint = str(data["endpoint"])
+        dst_port = int(data["dst_port"])
+        prefill_dp_rank = int(data["prefill_dp_rank"])
+        target_tp_ranks = [int(x) for x in data["target_tp_ranks"]]
+        target_cp_ranks = [int(x) for x in data["target_cp_ranks"]]
+        target_pp_ranks = [int(x) for x in data["target_pp_ranks"]]
+
+        payload = [
+            b"ABORT_REQ",
+            str(bootstrap_room).encode("ascii"),
+            endpoint.encode("ascii"),
+            str(dst_port).encode("ascii"),
+        ]
+        fanout_targets = []
+        async with self.lock:
+            dp_group = self.prefill_port_table.get(prefill_dp_rank, {})
+            for cp_rank in target_cp_ranks:
+                cp_group = dp_group.get(cp_rank, {})
+                for tp_rank in target_tp_ranks:
+                    tp_group = cp_group.get(tp_rank, {})
+                    for pp_rank in target_pp_ranks:
+                        rank_info = tp_group.get(pp_rank)
+                        if rank_info is not None:
+                            fanout_targets.append(
+                                (rank_info.rank_ip, rank_info.rank_port)
+                            )
+
+        for rank_ip, rank_port in fanout_targets:
+            na = NetworkAddress(rank_ip, rank_port)
+            sock, lock = CommonKVReceiver._connect(na.to_tcp(), is_ipv6=na.is_ipv6)
+            with lock:
+                sock.send_multipart(payload)
+
+        logger.info(
+            "[PD_ABORT] bootstrap fanout room=%s prefill_dp_rank=%s targets=%s",
+            bootstrap_room,
+            prefill_dp_rank,
+            fanout_targets,
+        )
+        return web.Response(text="OK", status=200)
 
     async def _cleanup_expired_entries(self):
         """Remove entries older than cleanup interval from room_to_dp_rank."""
