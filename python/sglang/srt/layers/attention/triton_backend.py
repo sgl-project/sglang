@@ -153,7 +153,10 @@ class TritonAttnBackend(AttentionBackend):
                 self.device_core_count,
                 self.max_context_len,
             )
-        self.use_pdl = is_arch_support_pdl() if _is_cuda else False
+        if _is_cuda:
+            self.use_pdl = is_arch_support_pdl()
+        else:
+            self.use_pdl = False
 
         self.allow_bidirectional_attention_in_extend = (
             model_runner.server_args.disable_cuda_graph
