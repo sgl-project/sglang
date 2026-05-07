@@ -20,7 +20,8 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolTransfer,
     PoolTransferResult,
 )
-from sglang.srt.mem_cache.memory_pool_host import HostKVCache, HostTensorAllocator
+from sglang.srt.mem_cache.host_allocator import HostTensorAllocator
+from sglang.srt.mem_cache.memory_pool_host import HostKVCache
 from sglang.srt.observability.metrics_collector import StorageMetrics
 
 DEFAULT_LOCAL_BUFFER_SIZE = 16 * 1024 * 1024  # 16 MB
