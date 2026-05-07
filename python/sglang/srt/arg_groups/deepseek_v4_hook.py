@@ -18,6 +18,9 @@ def apply_deepseek_v4_defaults(server_args: "ServerArgs", model_arch: str) -> No
         f"Use dsv4 attention backend for {model_arch}, setting page_size to 256."
     )
 
+    if not envs.SGLANG_OPT_USE_JIT_MASK_TOPK.is_set():
+        envs.SGLANG_OPT_USE_JIT_MASK_TOPK.set(True)
+
     if server_args.max_running_requests is None:
         server_args.max_running_requests = 256
         logger.warning(

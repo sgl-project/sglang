@@ -590,6 +590,11 @@ class Envs:
     SGLANG_OPT_USE_FUSED_HASH_TOPK = EnvBool(True)
     SGLANG_OPT_USE_JIT_KERNEL_FUSED_TOPK = EnvBool(True)
     SGLANG_OPT_USE_TOPK_V2 = EnvBool(False)
+    # Off by default: enabling forces a first-time NVRTC compile of the
+    # mask_topk_ids JIT kernel inside cuda graph capture for any CUDA MoE
+    # model, which on Mixtral-AWQ ballooned capture from 4 s to ~390 s.
+    # DSV4 enables this via apply_deepseek_v4_defaults.
+    SGLANG_OPT_USE_JIT_MASK_TOPK = EnvBool(False)
 
     # GEMM / kernel fusion
     SGLANG_OPT_FP8_WO_A_GEMM = EnvBool(False)
