@@ -3,7 +3,7 @@
 import os
 import unittest
 from typing import List
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import torch
 
@@ -62,6 +62,10 @@ class TestNixlUnified(unittest.TestCase):
             import shutil
 
             shutil.rmtree(self.test_dir)
+
+    @staticmethod
+    def _open_fds() -> int:
+        return len(os.listdir("/proc/self/fd"))
 
     def delete_test_file(self, file_path: str) -> bool:
         """Helper method to delete a test file.
@@ -176,15 +180,19 @@ class TestNixlUnified(unittest.TestCase):
         dst1 = torch.zeros_like(value1)
         dst2 = torch.zeros_like(value2)
 
-        # Single set/get
+        # Single set/get; baseline after first set absorbs any one-time NIXL internals
         self.assertTrue(self.hicache.set(key1, value1))
+        fds = self._open_fds()
         retrieved1 = self.hicache.get(key1, dst1)
         self.verify_tensors_equal(value1, retrieved1)
+        self.assertEqual(self._open_fds(), fds, "fd leak after get")
 
         # Batch set/get
         self.assertTrue(self.hicache.batch_set([key2], [value2]))
+        self.assertEqual(self._open_fds(), fds, "fd leak after batch_set")
         retrieved2 = self.hicache.batch_get([key2], [dst2])
         self.verify_tensors_equal(value2, retrieved2[0])
+        self.assertEqual(self._open_fds(), fds, "fd leak after batch_get")
 
     def test_data_integrity(self):
         """Test data integrity across operations."""
@@ -223,16 +231,6 @@ class TestNixlUnified(unittest.TestCase):
         self.assertTrue(self.delete_test_file(test_file))
         self.assertFalse(os.path.exists(test_file))
 
-    def test_create_nixl_tuples(self):
-        """Test creation of NIXL tuples."""
-        test_file = os.path.join(self.test_dir, "test_file.bin")
-        self.file_manager.create_file(test_file)
-
-        # Test tuple creation
-        tuples = self.file_manager.files_to_nixl_tuples([test_file])
-        self.assertIsNotNone(tuples)
-        self.assertTrue(len(tuples) > 0)
-
     def test_error_handling(self):
         """Test error handling in file operations."""
         # Test non-existent file
@@ -243,35 +241,70 @@ class TestNixlUnified(unittest.TestCase):
         # Test invalid file path
         self.assertFalse(self.file_manager.create_file(""))  # Empty path should fail
 
-    def test_register_buffers(self):
+    def test__register_buffers(self):
         """Test registration of memory buffers."""
         # Create test tensor
         tensor = torch.randn(10, 10)
 
         # Test buffer registration
-        self.assertIsNotNone(self.hicache.register_buffers(tensor))
+        self.assertIsNotNone(self.hicache._register_buffers(tensor))
 
         # Test batch registration
         tensors = [torch.randn(5, 5) for _ in range(3)]
-        self.assertIsNotNone(self.hicache.register_buffers(tensors))
+        self.assertIsNotNone(self.hicache._register_buffers(tensors))
 
     def test_register_files(self):
-        """register_files keeps fds open during registration; deregister_files closes them."""
+        """_register_files keeps fds open during registration; _deregister_files closes them."""
         files = [os.path.join(self.test_dir, f"test_file_{i}.bin") for i in range(3)]
         for file in files:
             self.file_manager.create_file(file)
 
-        result = self.hicache.register_files(files)
+        sizes = [0] * len(files)
+        result = self.hicache._register_files(files, sizes)
         self.assertIsNotNone(result)
         reg_descs, fds = result
         self.assertEqual(len(fds), len(files))
         for fd in fds:  # fds must be open and valid while registration is live
             self.assertIsNotNone(os.fstat(fd))
 
-        self.hicache.deregister_files(reg_descs, fds)
-        for fd in fds:  # deregister_files must close all fds
+        self.hicache._deregister_files(reg_descs, fds)
+        for fd in fds:  # _deregister_files must close all fds
             with self.assertRaises(OSError):
                 os.fstat(fd)
+
+    def test_nixl_api_contract_register_before_xfer(self):
+        """register_memory must be called before initialize_xfer for every transfer."""
+        key = "contract_key"
+        value = torch.randn(4, 4, device="cpu")
+
+        register_called: list = []
+        xfer_saw_registration: list = []
+
+        orig_reg = self.hicache.agent.register_memory
+
+        def spy_register(*args, **kwargs):
+            register_called.append(True)
+            return orig_reg(*args, **kwargs)
+
+        orig_init = self.hicache.agent.initialize_xfer
+
+        def spy_init(direction, local, remote, agent_name):
+            xfer_saw_registration.append(len(register_called) > 0)
+            return orig_init(direction, local, remote, agent_name)
+
+        self.hicache.agent.register_memory = spy_register
+        self.hicache.agent.initialize_xfer = spy_init
+        try:
+            self.assertTrue(self.hicache.set(key, value))
+        finally:
+            self.hicache.agent.register_memory = orig_reg
+            self.hicache.agent.initialize_xfer = orig_init
+
+        self.assertTrue(xfer_saw_registration, "no initialize_xfer call observed")
+        self.assertTrue(
+            all(xfer_saw_registration),
+            "initialize_xfer called without prior register_memory",
+        )
 
 
 if __name__ == "__main__":

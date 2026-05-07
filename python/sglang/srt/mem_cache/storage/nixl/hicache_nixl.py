@@ -86,7 +86,7 @@ class HiCacheNixl(HiCacheStorage):
     def _get_suffixed_key(self, key: str) -> str:
         return key + self.config_suffix
 
-    def register_buffers(
+    def _register_buffers(
         self, buffers: Union[torch.Tensor, List[torch.Tensor], List[tuple]]
     ) -> Optional[Any]:
         """Register tensor(s) or target locations in host memory (list of addr,len tuples) with NIXL."""
@@ -96,14 +96,46 @@ class HiCacheNixl(HiCacheStorage):
         else:
             return self.registration._register_memory(buffers)
 
-    def register_files(
-        self, file_paths: List[str], open_file: Optional[bool] = True
+    def _register_files(
+        self, file_paths: List[str], sizes: List[int]
     ) -> Optional[Any]:
-        """Register files with NIXL."""
-        tuples = self.file_manager.files_to_nixl_tuples(file_paths)
-        return self.registration._register_memory(tuples, "FILE")
+        """Open and register files with NIXL.
 
-    def register_objects(
+        Returns (reg_descs, fds).  The fds must stay open until the registration
+        is no longer needed; call _deregister_files() to release in the correct
+        order (deregister -> close fd).  Returns None on any failure.
+        """
+        fds: List[int] = []
+        tuples = []
+        for i, path in enumerate(file_paths):
+            fd = self.file_manager.open_file(path)
+            if fd is None:
+                for f in fds:
+                    self.file_manager.close_file(f)
+                return None
+            fds.append(fd)
+            tuples.append((0, sizes[i], fd, path))
+        reg_descs = self.registration._register_memory(tuples, "FILE")
+        if not reg_descs:
+            for fd in fds:
+                self.file_manager.close_file(fd)
+            return None
+        return reg_descs, fds
+
+    def _deregister_files(self, reg_descs: Any, fds: List[int]) -> None:
+        """Deregister files and close their file descriptors.
+
+        Must be called after _register_files().  Correct teardown order:
+        deregister_memory -> close fd.
+        """
+        try:
+            self.agent.deregister_memory(reg_descs)
+        except Exception as e:
+            logger.debug("deregister_memory skipped: %s", e)
+        for fd in fds:
+            self.file_manager.close_file(fd)
+
+    def _register_objects(
         self, keys: List[str], sizes: Optional[List[int]] = None
     ) -> Optional[Any]:
         """Register objects with NIXL."""
@@ -111,6 +143,116 @@ class HiCacheNixl(HiCacheStorage):
             return None
         tuples = [(0, 0, key, "") for key in keys]
         return self.registration._register_memory(tuples, "OBJ")
+
+    def _get_storage_descs(
+        self, buffers: List[torch.Tensor | tuple], keys: List[str]
+    ) -> tuple:
+        """Register storage (FILE or OBJ) and return (storage_descs, reg_descs, fds).
+
+        For FILE: opens fds, registers with actual sizes, returns xfer descs via
+        reg_descs.trim() per NIXL API contract.  Caller must call
+        _deregister_files(reg_descs, fds) when done.
+        For OBJ: builds xfer descs from buffer sizes; reg_descs and fds are None/[].
+        Returns (None, None, []) on failure.
+        """
+        if isinstance(buffers[0], torch.Tensor):
+            sizes = [b.element_size() * b.numel() for b in buffers]
+        elif isinstance(buffers[0], tuple):
+            sizes = [b[1] for b in buffers]
+        else:
+            return None, None, []
+
+        if self.backend_selector.mem_type == "FILE":
+            result = self._register_files(keys, sizes)
+            if result is None:
+                logger.error("Failed to register files for transfer")
+                return None, None, []
+            reg_descs, fds = result
+            storage_descs = self.agent.get_xfer_descs(
+                [(0, sizes[i], fds[i]) for i in range(len(fds))],
+                "FILE",
+            )
+            return storage_descs, reg_descs, fds
+        else:  # OBJ
+            if not self._register_objects(keys):
+                logger.error("Failed to register objects")
+                return None, None, []
+            storage_descs = self.agent.get_xfer_descs(
+                [(0, size, key) for size, key in zip(sizes, keys)],
+                self.backend_selector.mem_type,
+            )
+            if storage_descs is None:
+                logger.error("Failed to get storage xfer descs")
+                return None, None, []
+            return storage_descs, None, []
+
+    def _get_host_descs(
+        self,
+        buffers: List[torch.Tensor | tuple],
+        direction: str,
+    ) -> Optional[Any]:
+        """Build host xfer descs and register buffers for the transfer.
+
+        Returns host_descs or None on failure.
+        """
+        if isinstance(buffers[0], torch.Tensor):
+            host_descs = self.agent.get_xfer_descs(buffers)
+            self._register_buffers(buffers)
+        elif isinstance(buffers[0], tuple):
+            host_descs = self.agent.get_xfer_descs(
+                [(x[0], x[1], 0) for x in buffers], "DRAM"
+            )
+            self._register_buffers(buffers)
+        else:
+            return None
+
+        if host_descs is None:
+            logger.error("Failed to get host transfer descriptors")
+            return None
+        return host_descs
+
+    def _run_xfer(
+        self,
+        host_descs: Any,
+        storage_descs: Any,
+        direction: str,
+        buffers: List[torch.Tensor | tuple],
+    ) -> bool:
+        """Initialize and poll a NIXL transfer to completion."""
+        try:
+            xfer_req = self.agent.initialize_xfer(
+                direction, host_descs, storage_descs, self.agent_name
+            )
+        except Exception:
+            # Retry once after ensuring buffers are registered
+            if not self._register_buffers(buffers):
+                logger.error("Failed to register tensors/buffers")
+                return False
+            try:
+                xfer_req = self.agent.initialize_xfer(
+                    direction, host_descs, storage_descs, self.agent_name
+                )
+            except Exception as e:
+                logger.error(f"Failed to create transfer request: {e}")
+                return False
+
+        try:
+            state = self.agent.transfer(xfer_req)
+            while state != "DONE":
+                state = self.agent.check_xfer_state(xfer_req)
+                if state == "ERR":
+                    self.agent.release_xfer_handle(xfer_req)
+                    logger.error("Transfer failed")
+                    return False
+                time.sleep(0.0001)  # Can be changed to os.sched_yield() or parametrized
+            self.agent.release_xfer_handle(xfer_req)
+            return True
+        except Exception as e:
+            logger.error(f"Failed to execute transfer: {e}")
+            import traceback
+
+            logger.error(f"Traceback: {traceback.format_exc()}")
+            return False
 
     def _execute_transfer(
         self,
@@ -122,92 +264,18 @@ class HiCacheNixl(HiCacheStorage):
             logger.error("Mismatch between number of tensors/buffers and files/objects")
             return False
 
-        # Registering file and object keys per transfer, to be updated when
-        # pre-registration for file and object is added to HiCache.
-        if self.backend_selector.mem_type == "FILE":
-            tuples = self.file_manager.files_to_nixl_tuples(keys)
-            if not tuples or not self.registration._register_memory(tuples, "FILE"):
-                logger.error("Failed to prepare files for transfer")
-                return False
-        else:  # mem_type == "OBJ"
-            tuples = [(0, 0, key, "") for key in keys]
-            if not tuples or not self.registration._register_memory(tuples, "OBJ"):
-                logger.error("Failed to register objects")
-                return False
-
-        # Prepare transfer descriptors
-        if isinstance(buffers[0], torch.Tensor):
-            tensor_sizes = [
-                tensor.element_size() * tensor.numel() for tensor in buffers
-            ]
-            storage_tuples = [(x[0], s, x[2]) for x, s in zip(tuples, tensor_sizes)]
-            host_descs = self.agent.get_xfer_descs(buffers)
-
-            if direction in ("READ", "WRITE"):
-                # register buffer to avoid calling initialize_xfer twice due to missing registration
-                self.register_buffers(buffers)
-
-        elif isinstance(buffers[0], tuple):
-            storage_tuples = [(x[0], y[1], x[2]) for x, y in zip(tuples, buffers)]
-            host_descs = self.agent.get_xfer_descs(
-                [(x[0], x[1], 0) for x in buffers], "DRAM"
-            )
-
-            if direction in ("READ", "WRITE"):
-                # register buffer to avoid calling initialize_xfer twice due to missing registration
-                self.register_buffers(buffers)
-
-        else:
-            return False
-
-        storage_descs = self.agent.get_xfer_descs(
-            storage_tuples, self.backend_selector.mem_type
-        )
-
-        if (host_descs is None) or (storage_descs is None):
-            logger.error("Failed to get transfer descriptors")
-            return False
-
-        # Initialize transfer, default assumption that tensor was registered
-
+        reg_descs, fds = None, []
         try:
-            xfer_req = self.agent.initialize_xfer(
-                direction, host_descs, storage_descs, self.agent_name
-            )
-        except Exception:
-            # Check if it was due to missing pre-registration
-            if not self.register_buffers(buffers):
-                logger.error("Failed to register tensors/buffers")
+            storage_descs, reg_descs, fds = self._get_storage_descs(buffers, keys)
+            if storage_descs is None:
                 return False
-
-            try:
-                xfer_req = self.agent.initialize_xfer(
-                    direction, host_descs, storage_descs, self.agent_name
-                )
-            except Exception as e:
-                logger.error(f"Failed to create transfer request: {e}")
+            host_descs = self._get_host_descs(buffers, direction)
+            if host_descs is None:
                 return False
-
-        # Execute transfer and wait for its completion
-        try:
-            state = self.agent.transfer(xfer_req)
-            while state != "DONE":
-                state = self.agent.check_xfer_state(xfer_req)
-                if state == "ERR":
-                    self.agent.release_xfer_handle(xfer_req)
-                    logger.error("Transfer failed")
-                    return False
-                time.sleep(0.0001)  # Can be changed to os.sched_yield() or parametrized
-
-            self.agent.release_xfer_handle(xfer_req)
-            return True
-
-        except Exception as e:
-            logger.error(f"Failed to execute transfer: {e}")
-            import traceback
-
-            logger.error(f"Traceback: {traceback.format_exc()}")
-            return False
+            return self._run_xfer(host_descs, storage_descs, direction, buffers)
+        finally:
+            if reg_descs is not None:
+                self._deregister_files(reg_descs, fds)
 
     def get(
         self,
