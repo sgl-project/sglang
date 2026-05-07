@@ -485,6 +485,20 @@ class LTX2ImageEncodingStage(PipelineStage):
             safetensors_load_file(weights_path), strict=True
         )
         self._condition_image_encoder_dir = encoder_dir
+        if (
+            server_args.dit_layerwise_offload
+            and not server_args.dit_layerwise_offload_auto_enabled
+        ):
+            from sglang.multimodal_gen.runtime.managers.layerwise_offload import (
+                configure_layerwise_offload_modules,
+            )
+
+            modules = {"condition_image_encoder": self._condition_image_encoder}
+            configure_layerwise_offload_modules(
+                modules,
+                server_args,
+                module_groups=server_args.layerwise_offload_modules,
+            )
         return True
 
     # -- image preprocessing ---------------------------------------------

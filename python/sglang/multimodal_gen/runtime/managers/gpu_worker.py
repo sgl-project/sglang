@@ -73,14 +73,6 @@ OFFLOAD_DISABLE_RECOMMENDATION_ORDER = (
     "text_encoder_2",
     "transformer",
 )
-AUTO_LAYERWISE_OFFLOAD_COMPONENTS = {
-    "transformer",
-    "transformer_2",
-    "video_dit",
-    "video_dit_2",
-    "audio_dit",
-}
-
 
 @dataclass
 class _ExpandedOutputParts:
@@ -169,15 +161,10 @@ class GPUWorker:
         # apply layerwise offload after lora is applied while building LoRAPipeline
         # otherwise empty offloaded weights could fail lora converting
         if self.server_args.dit_layerwise_offload:
-            component_names = (
-                AUTO_LAYERWISE_OFFLOAD_COMPONENTS
-                if self.server_args.dit_layerwise_offload_auto_enabled
-                else None
-            )
             configure_layerwise_offload_modules(
                 self.pipeline.modules,
                 self.server_args,
-                component_names=component_names,
+                module_groups=self.server_args.layerwise_offload_modules,
             )
 
         logger.info(

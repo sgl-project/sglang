@@ -1,5 +1,5 @@
 import re
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from itertools import chain
 from typing import Any, Dict, List, Set, Tuple
 
@@ -513,6 +513,8 @@ class LayerwiseOffloadManager:
 class LayerwiseOffloadableModuleMixin:
     """A mixin that registers forward hooks to enable layerwise offload."""
 
+    # Group used by --layerwise-offload-modules; DiT is the legacy default.
+    layerwise_offload_module_group: str = "dit"
     # The list of names of this module's layer/block ModuleList or Sequential attributes.
     layer_names: List[str] = []
     layerwise_offload_managers: list[LayerwiseOffloadManager] = []
@@ -626,15 +628,19 @@ def is_layerwise_offloaded_module(module: torch.nn.Module) -> bool:
 def configure_layerwise_offload_modules(
     modules: Mapping[str, object],
     server_args: ServerArgs,
-    component_names: set[str] | None = None,
+    module_groups: Sequence[str] | None = None,
 ) -> list[str]:
     """Configure every registered pipeline component that exposes layerwise offload."""
     configured_component_names: list[str] = []
     configured_module_ids: set[int] = set()
     for component_name, module in modules.items():
-        if component_names is not None and component_name not in component_names:
-            continue
         if not isinstance(module, LayerwiseOffloadableModuleMixin):
+            continue
+        if (
+            module_groups is not None
+            and "all" not in module_groups
+            and module.layerwise_offload_module_group not in module_groups
+        ):
             continue
         if id(module) in configured_module_ids:
             continue

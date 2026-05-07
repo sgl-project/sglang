@@ -121,6 +121,58 @@ class TestServerArgsPathExpansion(unittest.TestCase):
             server_args.component_attention_backends, {"text_encoder": "torch_sdpa"}
         )
 
+    def test_layerwise_offload_modules_imply_layerwise(self):
+        args = self._from_dict_without_model_resolution(
+            {
+                "model_path": "/data/my-model",
+                "layerwise_offload_modules": ["encoder", "dit"],
+            }
+        )
+
+        self.assertTrue(args.dit_layerwise_offload)
+        self.assertEqual(args.layerwise_offload_modules, ["encoder", "dit"])
+
+    def test_dit_layerwise_offload_defaults_to_dit_group(self):
+        args = self._from_dict_without_model_resolution(
+            {
+                "model_path": "/data/my-model",
+                "dit_layerwise_offload": True,
+            }
+        )
+
+        self.assertTrue(args.dit_layerwise_offload)
+        self.assertEqual(args.layerwise_offload_modules, ["dit"])
+
+    def test_invalid_layerwise_offload_modules_raise(self):
+        with self.assertRaises(ValueError):
+            self._from_dict_without_model_resolution(
+                {
+                    "model_path": "/data/my-model",
+                    "layerwise_offload_modules": ["bad"],
+                }
+            )
+
+    def test_layerwise_offload_modules_cli_args(self):
+        parser = FlexibleArgumentParser()
+        ServerArgs.add_cli_args(parser)
+        argv = [
+            "--model-path",
+            "/fake",
+            "--layerwise-offload-modules",
+            "dit",
+            "encoder",
+        ]
+
+        with patch.object(sys, "argv", ["sglang"] + argv):
+            args, unknown_args = parser.parse_known_args(argv)
+            with patch.object(
+                PipelineConfig, "from_kwargs", return_value=QwenImagePipelineConfig()
+            ):
+                server_args = ServerArgs.from_cli_args(args, unknown_args)
+
+        self.assertTrue(server_args.dit_layerwise_offload)
+        self.assertEqual(server_args.layerwise_offload_modules, ["dit", "encoder"])
+
 
 class TestOffloadDefaults(unittest.TestCase):
     def _from_dict_with_task_type(

@@ -84,6 +84,10 @@ class _NestedDummyModel(torch.nn.Module, LayerwiseOffloadableModuleMixin):
         self.encoder = _DummyModel()
 
 
+class _NestedEncoderDummyModel(_NestedDummyModel):
+    layerwise_offload_module_group = "encoder"
+
+
 class _LayerwiseComponent(torch.nn.Module, LayerwiseOffloadableModuleMixin):
     layer_names = ["blocks"]
 
@@ -188,6 +192,30 @@ def test_layerwise_configuration_scans_all_pipeline_components(monkeypatch):
 
     assert configured == ["text_encoder"]
     assert is_layerwise_offloaded_module(layerwise_module)
+
+
+def test_layerwise_configuration_filters_by_module_group(monkeypatch):
+    monkeypatch.setattr(
+        layerwise_offload_mod.torch, "get_device_module", lambda: _FakeDeviceModule
+    )
+    monkeypatch.setattr(layerwise_offload_mod.current_platform, "device_type", "cpu")
+    text_encoder = _NestedEncoderDummyModel()
+    transformer = _NestedDummyModel()
+    vae = _NestedDummyModel()
+    modules = {
+        "custom_encoder_name": text_encoder,
+        "custom_transformer_name": transformer,
+        "custom_vae_name": vae,
+    }
+
+    configured = configure_layerwise_offload_modules(
+        modules, _server_args(), module_groups=["encoder"]
+    )
+
+    assert configured == ["custom_encoder_name"]
+    assert is_layerwise_offloaded_module(text_encoder)
+    assert not is_layerwise_offloaded_module(transformer)
+    assert not is_layerwise_offloaded_module(vae)
 
 
 def test_component_cpu_offload_strategy_remains_flag_driven():

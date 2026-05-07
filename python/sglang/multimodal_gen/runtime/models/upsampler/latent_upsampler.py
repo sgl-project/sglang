@@ -165,6 +165,7 @@ class LatentUpsampler(torch.nn.Module, LayerwiseOffloadableModuleMixin):
         rational_resampler: Whether to use rational resampler for spatial upsampling.
     """
 
+    layerwise_offload_module_group = "upsampler"
     layer_names = ["res_blocks", "post_upsample_res_blocks"]
 
     def __init__(

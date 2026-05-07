@@ -417,6 +417,7 @@ class Decoder(nn.Module):
 
 
 class DAC(nn.Module, LayerwiseOffloadableModuleMixin):
+    layerwise_offload_module_group = "vae"
     layer_names = ["encoder.block", "decoder.model"]
 
     def __init__(

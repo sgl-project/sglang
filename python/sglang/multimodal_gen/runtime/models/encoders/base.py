@@ -19,6 +19,7 @@ from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 
 
 class TextEncoder(nn.Module, ABC, LayerwiseOffloadableModuleMixin):
+    layerwise_offload_module_group = "encoder"
     layer_names = [
         "layers",
         "encoder.block",
@@ -59,6 +60,7 @@ class TextEncoder(nn.Module, ABC, LayerwiseOffloadableModuleMixin):
 
 
 class ImageEncoder(nn.Module, ABC, LayerwiseOffloadableModuleMixin):
+    layerwise_offload_module_group = "encoder"
     layer_names = [
         "layers",
         "vision_model.encoder.layers",
