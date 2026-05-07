@@ -73,8 +73,6 @@ from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 logger = logging.getLogger(__name__)
 
-ORPHAN_WRITER_GRACE_SEC = 15.0
-
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.managers.scheduler import Scheduler
@@ -234,8 +232,6 @@ class DecodeRequest:
     kv_receiver: CommonKVReceiver
     waiting_for_input: bool = False
     metadata_buffer_index: int = -1
-    dst_kv_indices: Optional[torch.Tensor] = None
-    writer_ref_released: bool = False
 
     @property
     def seqlen(self) -> int:
@@ -778,8 +774,6 @@ class DecodePreallocQueue:
             decode_req.kv_receiver.send_metadata(
                 page_indices, decode_req.metadata_buffer_index, state_indices
             )
-            decode_req.dst_kv_indices = dst_kv_indices
-            self.token_to_kv_pool_allocator.retain(dst_kv_indices)
             if (
                 self.transfer_queue.enable_staging
                 and decode_req.kv_receiver.require_staging
@@ -941,7 +935,6 @@ class DecodeTransferQueue:
         self.spec_algorithm = scheduler.spec_algorithm
         self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
         self.staging_handler = None
-        self.pending_writer_releases: List[Tuple[float, torch.Tensor]] = []
 
     def add(self, decode_req: DecodeRequest) -> None:
         self.queue.append(decode_req)
@@ -952,32 +945,6 @@ class DecodeTransferQueue:
             for dr in decode_reqs:
                 if dr.kv_receiver.require_staging:
                     self.staging_handler.register_decode_req(dr.req.bootstrap_room, dr)
-
-    def _release_writer_ref(self, decode_req: DecodeRequest) -> None:
-        if decode_req.writer_ref_released or decode_req.dst_kv_indices is None:
-            return
-        self.tree_cache.token_to_kv_pool_allocator.free(decode_req.dst_kv_indices)
-        decode_req.writer_ref_released = True
-
-    def _schedule_delayed_writer_release(self, decode_req: DecodeRequest) -> None:
-        if decode_req.writer_ref_released or decode_req.dst_kv_indices is None:
-            return
-        self.pending_writer_releases.append(
-            (time.time() + ORPHAN_WRITER_GRACE_SEC, decode_req.dst_kv_indices)
-        )
-        decode_req.writer_ref_released = True
-
-    def _reap_delayed_writer_releases(self) -> None:
-        if not self.pending_writer_releases:
-            return
-        now = time.time()
-        remaining = []
-        for deadline, dst_kv_indices in self.pending_writer_releases:
-            if deadline <= now:
-                self.tree_cache.token_to_kv_pool_allocator.free(dst_kv_indices)
-            else:
-                remaining.append((deadline, dst_kv_indices))
-        self.pending_writer_releases = remaining
 
     def _commit_transfer_to_req(self, decode_req: DecodeRequest) -> bool:
         """
@@ -1080,7 +1047,6 @@ class DecodeTransferQueue:
         kv_manager._staging_handler = self.staging_handler
 
     def pop_transferred(self, rids_to_check: Optional[List[str]] = None) -> List[Req]:
-        self._reap_delayed_writer_releases()
         if not self.queue:
             return []
 
@@ -1116,7 +1082,6 @@ class DecodeTransferQueue:
                     self.scheduler.hisparse_coordinator.request_finished(decode_req.req)
                 # release pre-allocated kv cache, but don't insert into the tree since it's failed
                 release_kv_cache(decode_req.req, self.tree_cache, is_insert=False)
-                self._schedule_delayed_writer_release(decode_req)
                 indices_to_remove.add(i)
                 if self.scheduler.enable_metrics:
                     self.scheduler.metrics_collector.increment_transfer_failed_reqs()
@@ -1124,7 +1089,6 @@ class DecodeTransferQueue:
             elif poll == KVPoll.Success:
                 should_remove = self._commit_transfer_to_req(decode_req)
                 if should_remove:
-                    self._release_writer_ref(decode_req)
                     indices_to_remove.add(i)
                     # Check if request was aborted due to corruption
                     if isinstance(decode_req.req.finished_reason, FINISH_ABORT):
@@ -1171,12 +1135,6 @@ class DecodeTransferQueue:
 
 class SchedulerDisaggregationDecodeMixin:
 
-    def _has_pending_writer_release_for_disagg_decode(self: Scheduler) -> bool:
-        transfer_queue = getattr(self, "disagg_decode_transfer_queue", None)
-        return bool(
-            transfer_queue is not None and transfer_queue.pending_writer_releases
-        )
-
     @torch.no_grad()
     def event_loop_normal_disagg_decode(self: Scheduler):
         """A normal scheduler loop for decode worker in disaggregation mode."""
@@ -1198,8 +1156,7 @@ class SchedulerDisaggregationDecodeMixin:
                 self.process_batch_result(batch, result)
             else:
                 # When the server is idle, do self-check and re-init some states
-                if not self._has_pending_writer_release_for_disagg_decode():
-                    self.self_check_during_idle()
+                self.self_check_during_idle()
 
             # Update last_batch
             self.last_batch = batch
@@ -1232,8 +1189,7 @@ class SchedulerDisaggregationDecodeMixin:
                 tmp_batch, tmp_result = self.result_queue.popleft()
                 self.process_batch_result(tmp_batch, tmp_result)
             elif batch is None:
-                if not self._has_pending_writer_release_for_disagg_decode():
-                    self.self_check_during_idle()
+                self.self_check_during_idle()
 
             # Run sample of the current batch
             # It depends on the result of the last batch (e.g., grammar), so we run it after the last batch is processed.

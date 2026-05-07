@@ -13,6 +13,7 @@ from typing import List, Optional, Tuple
 
 import numpy as np
 import numpy.typing as npt
+import requests
 
 from sglang.srt.disaggregation.base.conn import KVArgs, KVPoll
 from sglang.srt.disaggregation.common.conn import (
@@ -186,6 +187,8 @@ class AuxDataCodec:
 
 class MooncakeKVManager(CommonKVManager):
     AUX_DATA_HEADER = b"AUX_DATA"
+    ABORT_REQ_HEADER = b"ABORT_REQ"
+    ABORT_ACK_HEADER = b"ABORT_ACK"
 
     def __init__(
         self,
@@ -203,6 +206,10 @@ class MooncakeKVManager(CommonKVManager):
             self.session_failures = defaultdict(int)
             self.failed_sessions = set()
             self.session_lock = threading.Lock()
+            self.room_abort_targets: dict[int, tuple[str, int]] = {}
+            self.room_abort_ack_sent: set[int] = set()
+            self.room_active_transfers: dict[int, int] = defaultdict(int)
+            self.room_abort_lock = threading.Lock()
             # Determine the number of threads to use for kv sender
             cpu_count = os.cpu_count()
             transfer_thread_pool_size = (
@@ -256,6 +263,65 @@ class MooncakeKVManager(CommonKVManager):
 
     def init_engine(self):
         self.engine = get_mooncake_transfer_engine()
+
+    def _prefill_unique_rank(self) -> int:
+        return (
+            self.attn_tp_rank * (self.pp_size * self.attn_cp_size)
+            + self.pp_rank * self.attn_cp_size
+            + self.attn_cp_rank
+        )
+
+    def _mark_room_aborted(
+        self, room: int, endpoint: str, dst_port: int
+    ) -> None:
+        with self.room_abort_lock:
+            self.room_abort_targets[room] = (endpoint, dst_port)
+
+    def _is_room_aborted(self, room: int) -> bool:
+        with self.room_abort_lock:
+            return room in self.room_abort_targets
+
+    def _inc_room_active_transfer(self, room: int) -> None:
+        with self.room_abort_lock:
+            self.room_active_transfers[room] += 1
+
+    def _dec_room_active_transfer(self, room: int) -> None:
+        with self.room_abort_lock:
+            active = self.room_active_transfers.get(room, 0) - 1
+            if active <= 0:
+                self.room_active_transfers.pop(room, None)
+            else:
+                self.room_active_transfers[room] = active
+
+    def _maybe_send_abort_ack(self, room: int) -> None:
+        with self.room_abort_lock:
+            target = self.room_abort_targets.get(room)
+            if target is None:
+                return
+            if room in self.room_abort_ack_sent:
+                return
+            if self.room_active_transfers.get(room, 0) > 0:
+                return
+            self.room_abort_ack_sent.add(room)
+
+        endpoint, dst_port = target
+        na = NetworkAddress(endpoint, dst_port)
+        self._connect(na.to_tcp(), is_ipv6=na.is_ipv6).send_multipart(
+            [
+                self.ABORT_ACK_HEADER,
+                str(room).encode("ascii"),
+                str(self._prefill_unique_rank()).encode("ascii"),
+            ]
+        )
+        logger.info(
+            "[PD_ABORT] prefill sent ABORT_ACK room=%s endpoint=%s dst_port=%s rank=%s",
+            room,
+            endpoint,
+            dst_port,
+            self._prefill_unique_rank(),
+        )
+        self.update_status(room, KVPoll.Failed)
+        self.transfer_infos.pop(room, None)
 
     def register_buffer_to_engine(self):
         # Batch register KV data buffers
@@ -602,6 +668,12 @@ class MooncakeKVManager(CommonKVManager):
             src_kv_ptrs, dst_kv_ptrs, layers_current_pp_stage = (
                 self.get_mla_kv_ptrs_with_pp(src_data_ptrs, dst_data_ptrs)
             )
+            if layers_current_pp_stage > len(dst_kv_ptrs):
+                logger.error(
+                    "Prefill transfer kvcache error, layers_current_pp_stage is out of range: "
+                    f"layers_current_pp_stage={layers_current_pp_stage}, len(dst_kv_ptrs)={len(dst_kv_ptrs)}"
+                )
+                return -1
             layers_params = [
                 (
                     src_kv_ptrs[layer_id],
@@ -1165,14 +1237,14 @@ class MooncakeKVManager(CommonKVManager):
                     if kv_chunk.room in self.transfer_infos
                     else []
                 )
+                if self._is_room_aborted(kv_chunk.room):
+                    self.transfer_infos.pop(kv_chunk.room, None)
+                    self._maybe_send_abort_ack(kv_chunk.room)
+                    continue
                 polls = []
                 dst_ranks_infos = []
                 # Unique id per prefill sender so decode's response set size matches expected_response_num.
-                prefill_unique_rank = (
-                    self.attn_tp_rank * (self.pp_size * self.attn_cp_size)
-                    + self.pp_rank * self.attn_cp_size
-                    + self.attn_cp_rank
-                )
+                prefill_unique_rank = self._prefill_unique_rank()
                 # When staging transfer is not yet ready (watermark/allocation pending),
                 # the chunk is re-enqueued and we break out of the req loop to retry later.
                 staging_deferred = False
@@ -1216,23 +1288,29 @@ class MooncakeKVManager(CommonKVManager):
                             self.attn_tp_size
                             == target_rank_registration_info.dst_attn_tp_size
                         ):
-                            if target_rank_registration_info.enable_hisparse:
-                                ret = self.send_kvcache_hisparse(
-                                    req.mooncake_session_id,
-                                    kv_chunk.prefill_kv_indices,
-                                    target_rank_registration_info.dst_kv_ptrs,
-                                    req.dst_kv_indices,
-                                    kv_chunk.index_slice,
-                                    executor,
-                                )
-                            else:
-                                ret = self.send_kvcache(
-                                    req.mooncake_session_id,
-                                    kv_chunk.prefill_kv_indices,
-                                    target_rank_registration_info.dst_kv_ptrs,
-                                    chunked_dst_kv_indice,
-                                    executor,
-                                )
+                            self._inc_room_active_transfer(kv_chunk.room)
+                            try:
+                                if target_rank_registration_info.enable_hisparse:
+                                    ret = self.send_kvcache_hisparse(
+                                        req.mooncake_session_id,
+                                        kv_chunk.prefill_kv_indices,
+                                        target_rank_registration_info.dst_kv_ptrs,
+                                        req.dst_kv_indices,
+                                        kv_chunk.index_slice,
+                                        executor,
+                                    )
+                                else:
+                                    ret = self.send_kvcache(
+                                        req.mooncake_session_id,
+                                        kv_chunk.prefill_kv_indices,
+                                        target_rank_registration_info.dst_kv_ptrs,
+                                        chunked_dst_kv_indice,
+                                        executor,
+                                    )
+                            finally:
+                                self._dec_room_active_transfer(kv_chunk.room)
+                                if self._is_room_aborted(kv_chunk.room):
+                                    self._maybe_send_abort_ack(kv_chunk.room)
                         elif (
                             self.enable_staging
                             and staging_strategy is not None
@@ -1253,16 +1331,24 @@ class MooncakeKVManager(CommonKVManager):
                                 # Chunk re-enqueued; stop processing remaining reqs for this chunk
                                 break
                         else:
-                            ret = self.send_kvcache_slice(
-                                req.mooncake_session_id,
-                                kv_chunk.prefill_kv_indices,
-                                target_rank_registration_info.dst_kv_ptrs,
-                                chunked_dst_kv_indice,
-                                target_rank_registration_info.dst_tp_rank,
-                                target_rank_registration_info.dst_attn_tp_size,
-                                target_rank_registration_info.dst_kv_item_len,
-                                executor,
-                            )
+                            self._inc_room_active_transfer(kv_chunk.room)
+                            try:
+                                ret = self.send_kvcache_slice(
+                                    req.mooncake_session_id,
+                                    kv_chunk.prefill_kv_indices,
+                                    target_rank_registration_info.dst_kv_ptrs,
+                                    chunked_dst_kv_indice,
+                                    target_rank_registration_info.dst_tp_rank,
+                                    target_rank_registration_info.dst_attn_tp_size,
+                                    target_rank_registration_info.dst_kv_item_len,
+                                    executor,
+                                )
+                            finally:
+                                self._dec_room_active_transfer(kv_chunk.room)
+                                if self._is_room_aborted(kv_chunk.room):
+                                    self._maybe_send_abort_ack(kv_chunk.room)
+                        if self._is_room_aborted(kv_chunk.room):
+                            continue
                         if ret != 0:
                             with self.session_lock:
                                 self.session_failures[req.mooncake_session_id] += 1
@@ -1329,6 +1415,11 @@ class MooncakeKVManager(CommonKVManager):
                 if staging_deferred:
                     continue
 
+                if self._is_room_aborted(kv_chunk.room):
+                    self.transfer_infos.pop(kv_chunk.room, None)
+                    self._maybe_send_abort_ack(kv_chunk.room)
+                    continue
+
                 if (
                     kv_chunk.room not in self.request_status
                     or self.check_status(kv_chunk.room) == KVPoll.Success
@@ -1348,6 +1439,20 @@ class MooncakeKVManager(CommonKVManager):
             # KVPoll.Bootstrapping -> KVPoll.WaitingForInput
             while True:
                 waiting_req_bytes = self.server_socket.recv_multipart()
+                if waiting_req_bytes[0] == self.ABORT_REQ_HEADER:
+                    room = int(waiting_req_bytes[1].decode("ascii"))
+                    endpoint = waiting_req_bytes[2].decode("ascii")
+                    dst_port = int(waiting_req_bytes[3].decode("ascii"))
+                    logger.info(
+                        "[PD_ABORT] prefill recv ABORT_REQ room=%s endpoint=%s dst_port=%s",
+                        room,
+                        endpoint,
+                        dst_port,
+                    )
+                    self._mark_room_aborted(room, endpoint, dst_port)
+                    self.update_status(room, KVPoll.Failed)
+                    self._maybe_send_abort_ack(room)
+                    continue
                 room = waiting_req_bytes[0].decode("ascii")
                 # Staging: decode reports consumption watermark back to prefill
                 if room == "WATERMARK":
@@ -1410,6 +1515,9 @@ class MooncakeKVManager(CommonKVManager):
                 else:
                     required_dst_info_num = int(waiting_req_bytes[7].decode("ascii"))
                     room = int(room)
+                    if self._is_room_aborted(room):
+                        self._maybe_send_abort_ack(room)
+                        continue
                     if room not in self.transfer_infos:
                         self.transfer_infos[room] = {}
 
@@ -1464,6 +1572,27 @@ class MooncakeKVManager(CommonKVManager):
                 # Staging: prefill pre-requests staging allocation before forward
                 if msg[0] == b"STAGING_REQ":
                     self._handle_staging_req(msg)
+                    continue
+                if msg[0] == self.ABORT_ACK_HEADER:
+                    bootstrap_room = int(msg[1].decode("ascii"))
+                    prefill_rank = int(msg[2].decode("ascii"))
+                    logger.info(
+                        "[PD_ABORT] decode recv ABORT_ACK room=%s prefill_rank=%s",
+                        bootstrap_room,
+                        prefill_rank,
+                    )
+                    self.prefill_abort_tracker[bootstrap_room].add(prefill_rank)
+                    expected_response_num = self.required_prefill_response_num_table.get(
+                        bootstrap_room, 1
+                    )
+                    if (
+                        len(self.prefill_abort_tracker[bootstrap_room])
+                        >= expected_response_num
+                    ):
+                        self.record_failure(
+                            bootstrap_room, "Aborted by decode request."
+                        )
+                        self.update_status(bootstrap_room, KVPoll.Failed)
                     continue
 
                 bootstrap_room, status, prefill_rank = msg
@@ -1746,6 +1875,7 @@ class MooncakeKVReceiver(CommonKVReceiver):
     ):
         self.session_id = mgr.get_session_id()
         self.init_time = None
+        self.abort_requested = False
         super().__init__(mgr, bootstrap_addr, bootstrap_room)
 
     def _register_kv_args(self):
@@ -1902,6 +2032,9 @@ class MooncakeKVReceiver(CommonKVReceiver):
         if self.bootstrap_room in self.kv_mgr.prefill_response_tracker:
             self.kv_mgr.prefill_response_tracker.pop(self.bootstrap_room)
 
+        if self.bootstrap_room in self.kv_mgr.prefill_abort_tracker:
+            self.kv_mgr.prefill_abort_tracker.pop(self.bootstrap_room)
+
     def failure_exception(self):
         # Explicitly set the status to failure since this request has failed in another rank
         if self.conclude_state is None:
@@ -1916,12 +2049,53 @@ class MooncakeKVReceiver(CommonKVReceiver):
         raise KVTransferError(self.bootstrap_room, failure_reason)
 
     def abort(self):
-        self.kv_mgr.record_failure(
+        if self.abort_requested:
+            return
+        self.abort_requested = True
+        self.kv_mgr.record_failure(self.bootstrap_room, "Aborted by AbortReq.")
+        logger.info(
+            "[PD_ABORT] decode notify prefill abort start room=%s bootstrap_addr=%s",
             self.bootstrap_room,
-            "Aborted by AbortReq.",
+            self.bootstrap_addr,
         )
-        # Explicitly set the status to failure since this request has been aborted
-        self.conclude_state = KVPoll.Failed
+        if not hasattr(self, "prefill_info"):
+            logger.error(
+                "MooncakeKVReceiver.abort called before init for room=%s",
+                self.bootstrap_room,
+            )
+            return
+        try:
+            response = requests.post(
+                f"http://{self.bootstrap_addr}/abort_room",
+                json={
+                    "bootstrap_room": self.bootstrap_room,
+                    "endpoint": self.kv_mgr.local_ip,
+                    "dst_port": self.kv_mgr.rank_port,
+                    "prefill_dp_rank": self.prefill_dp_rank,
+                    "target_tp_ranks": self.target_tp_ranks,
+                    "target_cp_ranks": self.target_cp_ranks,
+                    "target_pp_ranks": self.target_pp_ranks,
+                },
+                timeout=5,
+            )
+            if response.status_code != 200:
+                logger.error(
+                    "Failed to notify prefill abort for room=%s: %s %s",
+                    self.bootstrap_room,
+                    response.status_code,
+                    response.text,
+                )
+            else:
+                logger.info(
+                    "[PD_ABORT] decode notify prefill abort ok room=%s",
+                    self.bootstrap_room,
+                )
+        except Exception as e:
+            logger.error(
+                "Failed to notify prefill abort for room=%s: %s",
+                self.bootstrap_room,
+                e,
+            )
 
 
 class MooncakeKVBootstrapServer(CommonKVBootstrapServer):

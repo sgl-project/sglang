@@ -363,6 +363,74 @@ class SchedulerDisaggregationPrefillMixin:
             if room is not None and room in kv_mgr.transfer_infos:
                 prefetch(room)
 
+    def abort_disagg_prefill_req_if_needed(self: Scheduler, req: Req) -> bool:
+        kv_mgr = self.disagg_prefill_bootstrap_queue.kv_manager
+        is_room_aborted = getattr(kv_mgr, "_is_room_aborted", None)
+        if is_room_aborted is None or not is_room_aborted(req.bootstrap_room):
+            return False
+
+        if getattr(req, "_disagg_prefill_abort_processed", False):
+            return True
+
+        req._disagg_prefill_abort_processed = True
+        error_message = (
+            f"Prefill request aborted by decode for {req.rid=} "
+            f"{req.bootstrap_room=}"
+        )
+        logger.warning(error_message)
+
+        if hasattr(req, "disagg_kv_sender") and hasattr(req.disagg_kv_sender, "abort"):
+            req.disagg_kv_sender.abort()
+
+        req.time_stats.trace_ctx.abort(abort_info={"reason": error_message})
+        if req.req_pool_idx is not None:
+            release_kv_cache(req, self.tree_cache)
+        release_req_to_metadata_buffer(req, self.req_to_metadata_buffer_idx_allocator)
+        prepare_abort(req, error_message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR)
+        req.time_stats.set_completion_time()
+        self.stream_output([req], req.return_logprob, None)
+
+        if self.chunked_req is not None and self.chunked_req.rid == req.rid:
+            self.chunked_req = None
+        if self.enable_hicache_storage:
+            self.tree_cache.release_aborted_request(req.rid)
+
+        return True
+
+    def process_aborted_disagg_prefill_reqs(self: Scheduler) -> None:
+        aborted_reqs: List[Req] = []
+
+        def collect(req: Optional[Req]) -> bool:
+            if req is None:
+                return False
+            if self.abort_disagg_prefill_req_if_needed(req):
+                aborted_reqs.append(req)
+                return True
+            return False
+
+        self.disagg_prefill_bootstrap_queue.queue = [
+            req for req in self.disagg_prefill_bootstrap_queue.queue if not collect(req)
+        ]
+        self.waiting_queue = [req for req in self.waiting_queue if not collect(req)]
+        self.disagg_prefill_inflight_queue = [
+            req for req in self.disagg_prefill_inflight_queue if not collect(req)
+        ]
+
+        collect(self.chunked_req)
+
+        batches = [self.cur_batch, self.running_batch, self.last_batch]
+        for attr in ("mbs", "running_mbs", "last_mbs"):
+            batches.extend(getattr(self, attr, []) or [])
+
+        for batch in batches:
+            if batch is None or batch.is_empty():
+                continue
+            before = batch.batch_size()
+            for req in list(batch.reqs):
+                collect(req)
+            if aborted_reqs and batch.batch_size() == before:
+                batch.filter_batch(chunked_req_to_exclude=aborted_reqs)
+
     def get_next_disagg_prefill_batch_to_run(
         self: Scheduler,
     ) -> Optional[ScheduleBatch]:
@@ -392,6 +460,7 @@ class SchedulerDisaggregationPrefillMixin:
             self.waiting_queue.extend(
                 self.disagg_prefill_bootstrap_queue.pop_bootstrapped()
             )
+            self.process_aborted_disagg_prefill_reqs()
 
             # Get the next batch to run
             batch = self.get_next_disagg_prefill_batch_to_run()
@@ -423,6 +492,7 @@ class SchedulerDisaggregationPrefillMixin:
             self.waiting_queue.extend(
                 self.disagg_prefill_bootstrap_queue.pop_bootstrapped()
             )
+            self.process_aborted_disagg_prefill_reqs()
 
             # Get the next batch to run
             batch = self.get_next_disagg_prefill_batch_to_run()
@@ -496,6 +566,9 @@ class SchedulerDisaggregationPrefillMixin:
         for i, (req, next_token_id) in enumerate(
             zip(batch.reqs, next_token_ids, strict=True)
         ):
+            if self.abort_disagg_prefill_req_if_needed(req):
+                continue
+
             if req.is_chunked <= 0:
                 req.time_stats.set_prefill_finished_time()
 
@@ -711,17 +784,20 @@ class SchedulerDisaggregationPrefillMixin:
     def process_prefill_chunk(self: Scheduler) -> None:
         chunked_req_to_exclude = set()
         if self.chunked_req:
-            chunked_req_to_exclude.add(self.chunked_req)
-            self.tree_cache.cache_unfinished_req(self.chunked_req, chunked=True)
-            if self.enable_overlap:
-                # Delay KV transfer to process_batch_result_disagg_prefill when overlap is enabled to ensure results are resolved
-                self.chunked_req.tmp_end_idx = min(
-                    len(self.chunked_req.fill_ids),
-                    len(self.chunked_req.origin_input_ids),
-                )
+            if self.abort_disagg_prefill_req_if_needed(self.chunked_req):
+                self.running_batch.batch_is_full = False
             else:
-                self.send_kv_chunk(self.chunked_req)
-            self.running_batch.batch_is_full = False
+                chunked_req_to_exclude.add(self.chunked_req)
+                self.tree_cache.cache_unfinished_req(self.chunked_req, chunked=True)
+                if self.enable_overlap:
+                    # Delay KV transfer to process_batch_result_disagg_prefill when overlap is enabled to ensure results are resolved
+                    self.chunked_req.tmp_end_idx = min(
+                        len(self.chunked_req.fill_ids),
+                        len(self.chunked_req.origin_input_ids),
+                    )
+                else:
+                    self.send_kv_chunk(self.chunked_req)
+                self.running_batch.batch_is_full = False
 
         if self.last_batch and self.last_batch.forward_mode.is_extend():
             if self.last_batch.chunked_req:
@@ -745,6 +821,16 @@ class SchedulerDisaggregationPrefillMixin:
         """
         Send a prefilled chunk to the decode server
         """
+        kv_mgr = self.disagg_prefill_bootstrap_queue.kv_manager
+        is_room_aborted = getattr(kv_mgr, "_is_room_aborted", None)
+        if is_room_aborted is not None and is_room_aborted(req.bootstrap_room):
+            logger.info(
+                "Skip sending kv chunk for aborted request %s room=%s",
+                req.rid,
+                req.bootstrap_room,
+            )
+            return
+
         page_size = self.token_to_kv_pool_allocator.page_size
         start_idx = req.start_send_idx
         end_idx = (
