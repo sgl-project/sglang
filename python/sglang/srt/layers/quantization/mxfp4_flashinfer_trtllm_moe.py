@@ -477,10 +477,14 @@ def maybe_fuse_routed_scale_and_shared_add(
     # alpha=scale)`. With no shared output, the missing scale is applied
     # in-place. Otherwise `routed` is already scale-final and we just add
     # `shared` (or pass through if there is none).
+    from sglang.srt.layers.quantization.mxfp4_marlin_moe import (
+        Mxfp4MarlinMoEMethod,
+    )
+
     fused = (
         isinstance(experts.quant_method, Mxfp4FlashinferTrtllmMoEMethod)
-        and envs.SGLANG_OPT_MXFP4_FUSE_RSF_SHARED_ADD.get()
-    )
+        or isinstance(experts.quant_method, Mxfp4MarlinMoEMethod)
+    ) and envs.SGLANG_OPT_MXFP4_FUSE_RSF_SHARED_ADD.get()
     if fused:
         if shared is not None:
             return shared.add_(routed, alpha=routed_scaling_factor)
