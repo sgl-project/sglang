@@ -874,9 +874,22 @@ class HiCacheController:
             batch_host_indices = operation.host_indices[
                 i * self.page_size : (i + len(batch_hashes)) * self.page_size
             ]
+            token_start = i * self.page_size
+            token_end = min(
+                (i + len(batch_hashes)) * self.page_size, len(operation.token_ids)
+            )
             prev_completed_tokens = operation.completed_tokens
             # Get one batch token, and update the completed_tokens if succeed
-            extra_info = HiCacheStorageExtraInfo(prefix_keys=prefix_keys)
+            extra_info = HiCacheStorageExtraInfo(
+                prefix_keys=prefix_keys,
+                extra_info={
+                    "request_id": getattr(operation, "request_id", None),
+                    "token_ids": operation.token_ids[token_start:token_end],
+                    "radix_kv_indices": batch_host_indices,
+                    "batch_page_start": i,
+                    "batch_page_count": len(batch_hashes),
+                },
+            )
             self.page_get_func(operation, batch_hashes, batch_host_indices, extra_info)
             # Check termination
             if (
@@ -937,7 +950,15 @@ class HiCacheController:
                     batch_tokens[i : i + self.page_size], last_hash
                 )
                 batch_hashes.append(last_hash)
-            extra_info = HiCacheStorageExtraInfo(prefix_keys=prefix_keys)
+            extra_info = HiCacheStorageExtraInfo(
+                prefix_keys=prefix_keys,
+                extra_info={
+                    "request_id": getattr(operation, "request_id", None),
+                    "token_ids": batch_tokens,
+                    "batch_page_start": start // self.page_size,
+                    "batch_page_count": len(batch_hashes),
+                },
+            )
             hit_page_num = self.storage_backend.batch_exists(batch_hashes, extra_info)
             hash_value.extend(batch_hashes[:hit_page_num])
             storage_query_count += hit_page_num * self.page_size
@@ -981,6 +1002,13 @@ class HiCacheController:
                     logger.debug(
                         f"Revoking prefetch for request {operation.request_id} due to insufficient hits ({storage_hit_count})."
                     )
+                    logger.info(
+                        "[HiCacheL3Trace] prefetch_revoke req_id=%s storage_hit_tokens=%s prefetch_threshold=%s requested_tokens=%s",
+                        operation.request_id,
+                        storage_hit_count,
+                        self.prefetch_threshold,
+                        len(operation.token_ids),
+                    )
                 else:
                     operation.hash_value = hash_value[
                         : (storage_hit_count // self.page_size)
@@ -992,6 +1020,13 @@ class HiCacheController:
                     operation.host_indices = operation.host_indices[:storage_hit_count]
                     logger.debug(
                         f"Prefetching {len(operation.hash_value)} pages for request {operation.request_id}."
+                    )
+                    logger.info(
+                        "[HiCacheL3Trace] prefetch_scheduled req_id=%s scheduled_pages=%s scheduled_tokens=%s requested_tokens=%s",
+                        operation.request_id,
+                        len(operation.hash_value),
+                        storage_hit_count,
+                        len(operation.token_ids),
                     )
                     self.prefetch_buffer.put(operation)
 
@@ -1036,9 +1071,22 @@ class HiCacheController:
             batch_host_indices = operation.host_indices[
                 i * self.page_size : (i + len(batch_hashes)) * self.page_size
             ]
+            token_start = i * self.page_size
+            token_end = min(
+                (i + len(batch_hashes)) * self.page_size, len(operation.token_ids)
+            )
             # Set one batch token, and record if success.
             # todo: allow partial success
-            extra_info = HiCacheStorageExtraInfo(prefix_keys=prefix_keys)
+            extra_info = HiCacheStorageExtraInfo(
+                prefix_keys=prefix_keys,
+                extra_info={
+                    "request_id": getattr(operation, "request_id", None),
+                    "token_ids": operation.token_ids[token_start:token_end],
+                    "radix_kv_indices": batch_host_indices,
+                    "batch_page_start": i,
+                    "batch_page_count": len(batch_hashes),
+                },
+            )
             success = self.page_set_func(batch_hashes, batch_host_indices, extra_info)
             if not success:
                 logger.warning(

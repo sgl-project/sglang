@@ -48,6 +48,7 @@ DEFAULT_ASCEND_MEMCACHE_PRINT_SAMPLE_KEYS = False
 DEFAULT_ASCEND_MEMCACHE_TRACE_BATCH_EXISTS_KEYS = False
 DEFAULT_ASCEND_MEMCACHE_TRACE_BATCH_EXISTS_MAX_HIT = True
 DEFAULT_ASCEND_MEMCACHE_TRACE_BATCH_PUT_KEYS = False
+DEFAULT_ASCEND_MEMCACHE_TRACE_BATCH_PUT_POST_EXIST = False
 DEFAULT_ASCEND_MEMCACHE_TRACE_BATCH_PUT_RESULT_BOOLS = False
 DEFAULT_ASCEND_MEMCACHE_SUPPRESS_HYBM_WARN = True
 DEFAULT_ASCEND_MEMCACHE_TRACE_FILE_NAME = "ascend_memcache_trace.log"
@@ -285,6 +286,10 @@ class AscendMemcacheStore(HiCacheStorage):
             "SGLANG_ASCEND_MEMCACHE_TRACE_BATCH_PUT_KEYS",
             "1" if DEFAULT_ASCEND_MEMCACHE_TRACE_BATCH_PUT_KEYS else "0",
         ).lower() in ("1", "true", "yes", "on")
+        self.trace_batch_put_post_exist = os.getenv(
+            "SGLANG_ASCEND_MEMCACHE_TRACE_BATCH_PUT_POST_EXIST",
+            "1" if DEFAULT_ASCEND_MEMCACHE_TRACE_BATCH_PUT_POST_EXIST else "0",
+        ).lower() in ("1", "true", "yes", "on")
         self.trace_batch_put_result_bools = os.getenv(
             "SGLANG_ASCEND_MEMCACHE_TRACE_BATCH_PUT_RESULT_BOOLS",
             "1" if DEFAULT_ASCEND_MEMCACHE_TRACE_BATCH_PUT_RESULT_BOOLS else "0",
@@ -298,13 +303,14 @@ class AscendMemcacheStore(HiCacheStorage):
             os.path.join(os.path.dirname(__file__), DEFAULT_ASCEND_MEMCACHE_TRACE_FILE_NAME),
         )
         logger.warning(
-            "[AscendMemcacheTraceInit] enabled=%s max_keys=%s print_sample_keys=%s batch_exists_keys=%s batch_exists_max_hit=%s batch_put_keys=%s batch_put_result_bools=%s trace_log_path=%s suppress_hybm_warn=%s",
+            "[AscendMemcacheTraceInit] enabled=%s max_keys=%s print_sample_keys=%s batch_exists_keys=%s batch_exists_max_hit=%s batch_put_keys=%s batch_put_post_exist=%s batch_put_result_bools=%s trace_log_path=%s suppress_hybm_warn=%s",
             self.enable_trace_logging,
             self.trace_max_keys,
             self.print_sample_keys,
             self.trace_batch_exists_keys,
             self.trace_batch_exists_max_hit,
             self.trace_batch_put_keys,
+            self.trace_batch_put_post_exist,
             self.trace_batch_put_result_bools,
             self.trace_log_path,
             self.suppress_hybm_warn,
@@ -843,6 +849,28 @@ class AscendMemcacheStore(HiCacheStorage):
                 }
             )
 
+            if self.trace_batch_put_post_exist:
+                post_exist = self._batch_exist(set_keys)
+                self._trace_event(
+                    {
+                        "op": "batch_set_v1_post_put_exist",
+                        "flow": "host->store->query",
+                        "total_component_keys": len(set_keys),
+                        "put_ok_keys": sum(1 for r in put_results if int(r) == 0),
+                        "post_exist_keys": sum(1 for r in post_exist if int(r) == 1),
+                        "post_missing_keys": sum(
+                            1 for r in post_exist if int(r) != 1
+                        ),
+                        "raw_put_results": self._clip_trace_list(
+                            [int(x) for x in put_results]
+                        ),
+                        "raw_post_exist_results": self._clip_trace_list(
+                            [int(x) for x in post_exist]
+                        ),
+                        "sample_keys": self._sample_keys(set_keys),
+                    }
+                )
+
             if self.enable_storage_metrics and end_time > start_time:
                 self.backup_pgs.append(len(set_keys))
                 self.backup_bandwidth.append(
@@ -949,7 +977,7 @@ class AscendMemcacheStore(HiCacheStorage):
         get_result = self._get_batch_zero_copy_impl(
             [key], [target_location], [target_sizes]
         )
-        return get_result[0] >= 0
+        return get_result[0] > 0
 
     def batch_get(
         self,
