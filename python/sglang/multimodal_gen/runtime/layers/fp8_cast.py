@@ -12,8 +12,12 @@ def _fused_add_round_fp8_cast_kernel(
     output_ptr,
     seed,
     n_elements,
+    random_offset,
     EXPONENT_BIAS,
     MANTISSA_BITS,
+    RANDOM_FULL_WIDTH: tl.constexpr,
+    RANDOM_LOCAL_WIDTH: tl.constexpr,
+    RANDOM_COL_OFFSET: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
     pid = tl.program_id(axis=0)
@@ -22,7 +26,13 @@ def _fused_add_round_fp8_cast_kernel(
     mask = offsets < n_elements
 
     x = tl.load(x_ptr + offsets, mask=mask)
-    rand_vals = tl.rand(seed, offsets) - 0.5
+    if RANDOM_FULL_WIDTH > 0:
+        row = offsets // RANDOM_LOCAL_WIDTH
+        col = offsets - row * RANDOM_LOCAL_WIDTH
+        rand_offsets = row * RANDOM_FULL_WIDTH + RANDOM_COL_OFFSET + col
+    else:
+        rand_offsets = offsets + random_offset
+    rand_vals = tl.rand(seed, rand_offsets) - 0.5
 
     x = tl.cast(x, tl.float16)
     delta = tl.load(output_ptr + offsets, mask=mask)
@@ -60,7 +70,14 @@ def is_fp8_cast_dtype(dtype: torch.dtype) -> bool:
 
 
 def fused_add_round_fp8_cast_(
-    target_weight: torch.Tensor, original_weight: torch.Tensor, seed: int = 0
+    target_weight: torch.Tensor,
+    original_weight: torch.Tensor,
+    seed: int = 0,
+    *,
+    random_offset: int = 0,
+    random_full_width: int | None = None,
+    random_local_width: int | None = None,
+    random_col_offset: int = 0,
 ) -> None:
     if not str(original_weight.device).startswith("cuda"):
         target_weight.add_(original_weight.to(dtype=target_weight.dtype))
@@ -86,8 +103,12 @@ def fused_add_round_fp8_cast_(
         target_weight,
         seed,
         n_elements,
+        random_offset,
         exponent_bias,
         mantissa_bits,
+        random_full_width or 0,
+        random_local_width or 0,
+        random_col_offset,
         FP8_CAST_BLOCK_SIZE,
     )
 
