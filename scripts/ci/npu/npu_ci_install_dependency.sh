@@ -41,7 +41,7 @@ if [ -n "$OPTIONAL_DEPS" ]; then
     ${PIP_INSTALL} ${PTA_URL}
 else
     PYTORCH_VERSION="2.8.0"
-    TORCHVISION_VERSION="0.24.0"
+    TORCHVISION_VERSION="0.23.0"
     ${PIP_INSTALL} torch==${PYTORCH_VERSION} torchvision==${TORCHVISION_VERSION} --index-url ${TORCH_CACHE_URL:="https://download.pytorch.org/whl/cpu"} --extra-index-url ${PYPI_CACHE_URL:="https://pypi.org/simple/"}
     PTA_URL="https://gitcode.com/Ascend/pytorch/releases/download/v26.0.0-pytorch2.8.0/torch_npu-2.8.0.post4-cp311-cp311-manylinux_2_28_aarch64.whl
     ${PIP_INSTALL} ${PTA_URL}
