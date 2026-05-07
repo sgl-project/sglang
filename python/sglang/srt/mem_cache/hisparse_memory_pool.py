@@ -307,6 +307,7 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             seq_lens_cpu,
             hisparse_last_loc,
             len(logical_indices),
+            num_new_pages=num_new_pages,
         )
         assert (
             hisparse_indices is not None

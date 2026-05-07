@@ -469,7 +469,63 @@ def create_num_accepted_drafts_filter(
     return num_accepted_drafts_filter
 
 
+def _select_top_k_tokens_first(
+    topk_p: torch.Tensor,
+    topk_index: torch.Tensor,
+    hidden_states: Optional[torch.Tensor],
+    topk: int,
+):
+    input_ids = topk_index.flatten()
+    if hidden_states is not None:
+        hidden_states = hidden_states.repeat_interleave(topk, dim=0)
+
+    tree_info = (
+        topk_p.unsqueeze(1),  # (b, 1, topk)
+        topk_index,  # (b, topk)
+        torch.arange(-1, topk, dtype=torch.long, device=input_ids.device).expand(
+            topk_p.shape[0], -1
+        ),  # (b, topk + 1) — expand avoids the allocation of repeat
+    )
+    return input_ids, hidden_states, topk_p, tree_info
+
+
 @torch.compile(dynamic=True, disable=_is_npu)
+def _select_top_k_tokens_later(
+    i: int,
+    topk_p: torch.Tensor,
+    topk_index: torch.Tensor,
+    hidden_states: torch.Tensor,
+    scores: torch.Tensor,
+    topk: int,
+):
+    topk_sq = topk * topk
+
+    expand_scores = scores.unsqueeze(2) * topk_p.view(-1, topk, topk)
+    # (b, topk, 1) * (b, topk, topk) -> (b, topk, topk)
+
+    topk_cs_p, topk_cs_index = fast_topk(
+        expand_scores.flatten(start_dim=1), topk, dim=-1
+    )  # (b, topk)
+
+    topk_index = topk_index.view(-1, topk_sq)
+    input_ids = torch.gather(topk_index, 1, topk_cs_index).flatten()
+
+    if hidden_states.shape[0] > 0:
+        flat_cs = topk_cs_index.flatten()
+        batch_offsets = torch.arange(
+            0, hidden_states.shape[0], step=topk, device=flat_cs.device
+        )
+        selected_input_index = flat_cs // topk + batch_offsets.repeat_interleave(topk)
+        hidden_states = hidden_states[selected_input_index]
+
+    tree_info = (
+        expand_scores,  # (b, topk, topk)
+        topk_index,  # (b, topk * topk)
+        topk_cs_index + (topk_sq * (i - 1) + topk),  # (b, topk)
+    )
+    return input_ids, hidden_states, topk_cs_p, tree_info
+
+
 def select_top_k_tokens(
     i: int,
     topk_p: torch.Tensor,
@@ -479,45 +535,10 @@ def select_top_k_tokens(
     topk: int,
 ):
     if i == 0:
-        # The first step after extend
-        input_ids = topk_index.flatten()
-        if hidden_states is not None:
-            hidden_states = hidden_states.repeat_interleave(topk, dim=0)
-        scores = topk_p  # shape: (b, topk)
-
-        tree_info = (
-            topk_p.unsqueeze(1),  # shape: (b, 1, topk)
-            topk_index,  # shape: (b, topk)
-            torch.arange(-1, topk, dtype=torch.long, device=input_ids.device)
-            .unsqueeze(0)
-            .repeat(topk_p.shape[0], 1),  # shape: (b, topk + 1)
-        )
-    else:
-        # The later decode steps
-        expand_scores = torch.mul(
-            scores.unsqueeze(2), topk_p.reshape(-1, topk, topk)
-        )  # (b, topk, 1) x (b, topk ,topk) -> (b, topk, topk)
-        topk_cs_p, topk_cs_index = fast_topk(
-            expand_scores.flatten(start_dim=1), topk, dim=-1
-        )  # (b, topk)
-        scores = topk_cs_p  # shape: (b, topk)
-
-        topk_index = topk_index.reshape(-1, topk**2)
-        input_ids = torch.gather(topk_index, index=topk_cs_index, dim=1).flatten()
-
-        if hidden_states.shape[0] > 0:
-            selected_input_index = topk_cs_index.flatten() // topk + torch.arange(
-                0, hidden_states.shape[0], step=topk, device=topk_index.device
-            ).repeat_interleave(topk)
-            hidden_states = hidden_states[selected_input_index, :]
-
-        tree_info = (
-            expand_scores,  # shape: (b, topk, topk)
-            topk_index,  # shape: (b, topk * topk)
-            topk_cs_index + (topk**2 * (i - 1) + topk),  # shape: (b, topk)
-        )
-
-    return input_ids, hidden_states, scores, tree_info
+        return _select_top_k_tokens_first(topk_p, topk_index, hidden_states, topk)
+    return _select_top_k_tokens_later(
+        i, topk_p, topk_index, hidden_states, scores, topk
+    )
 
 
 def generate_simulated_accept_index(
