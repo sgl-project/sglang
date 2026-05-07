@@ -58,7 +58,7 @@ impl LimitedCapacityDict {
 // ─────────────────────────── rmpv helpers ───────────────────────────────────
 
 /// Find the value for `key` in a msgpack map (Vec of (k,v) pairs).
-fn map_get<'a>(map: &'a [(Value, Value)], key: &str) -> Option<&'a Value> {
+pub fn map_get<'a>(map: &'a [(Value, Value)], key: &str) -> Option<&'a Value> {
     map.iter()
         .find(|(k, _)| k.as_str() == Some(key))
         .map(|(_, v)| v)
@@ -143,11 +143,9 @@ fn find_printable_text(text: &str) -> &str {
         return text;
     }
     if chars.len() > 1 && is_chinese_char(chars[chars.len() - 2]) {
-        // all but the last character
         let byte_len: usize = chars[..chars.len() - 1].iter().map(|c| c.len_utf8()).sum();
         return &text[..byte_len];
     }
-    // Up to and including the last space
     match text.rfind(' ') {
         Some(pos) => &text[..pos + 1],
         None => "",
@@ -156,7 +154,6 @@ fn find_printable_text(text: &str) -> &str {
 
 // ─────────────────────── stop-sequence trimming ──────────────────────────────
 
-/// Trim a matched stop *token* from the end of an id list (used before decode).
 fn trim_matched_stop_ids(
     ids: &[i64],
     finished_reason: Option<&Value>,
@@ -188,7 +185,6 @@ fn trim_matched_stop_ids(
     }
 }
 
-/// Trim a matched stop *string* from the end of a decoded string.
 fn trim_matched_stop_str(
     text: &str,
     finished_reason: Option<&Value>,
@@ -219,13 +215,11 @@ fn trim_matched_stop_str(
 
 // ───────────────────────── tokenizer decode ──────────────────────────────────
 
-/// Batch-decode a list of id sequences, grouping by (skip_special, spaces_between)
-/// to minimise tokenizer calls.
 fn grouped_batch_decode(
     tokenizer: &Tokenizer,
     ids_list: &[Vec<i64>],
     skip_list: &[bool],
-    _space_list: &[bool], // spaces_between_special_tokens – not supported by the Rust tokenizers crate
+    _space_list: &[bool],
     disable_batch: bool,
 ) -> Vec<String> {
     let bs = ids_list.len();
@@ -244,7 +238,6 @@ fn grouped_batch_decode(
             .collect();
     }
 
-    // Fast path: all requests share the same settings
     let first_skip = skip_list.first().copied().unwrap_or(true);
     if skip_list.iter().all(|&s| s == first_skip) {
         let sequences: Vec<Vec<u32>> = ids_list
@@ -257,7 +250,6 @@ fn grouped_batch_decode(
             .unwrap_or_else(|_| vec![String::new(); bs]);
     }
 
-    // Group indices by skip_special_tokens value
     let mut results = vec![String::new(); bs];
     let mut false_indices: Vec<usize> = vec![];
     let mut true_indices: Vec<usize> = vec![];
@@ -288,31 +280,48 @@ fn grouped_batch_decode(
     results
 }
 
-// ─────────────────────── main processing function ───────────────────────────
+// ─────────────────── three-phase incremental-decoding API ───────────────────
 
+#[derive(Clone)]
 pub struct Config {
     pub disable_batch_decode: bool,
     pub is_gpt_oss: bool,
     pub max_states: usize,
 }
 
-/// Core incremental-decoding logic. Returns the `output_strs` vector.
-pub fn compute_output_strs(
+/// Intermediate state produced by Phase 1; passed through Phase 2 and consumed by Phase 3.
+/// All fields are `Send + 'static` so this can be moved into `spawn_blocking`.
+pub struct DecodeWork {
+    pub rids: Vec<String>,
+    pub finished_reasons: Vec<Option<Value>>,
+    pub no_stop_trim: Vec<bool>,
+    pub surr_ids: Vec<Vec<i64>>,
+    pub read_ids: Vec<Vec<i64>>,
+    pub skip_special: Vec<bool>,
+    pub spaces_between: Vec<bool>,
+}
+
+/// Results of Phase 2 (CPU-bound tokenizer decode).
+pub struct DecodeResults {
+    pub surr_texts: Vec<String>,
+    pub read_texts: Vec<String>,
+}
+
+/// Phase 1: update per-request state and collect token-ID slices for batch decode.
+/// Fast; touches `state` but performs no tokenizer I/O.
+pub fn prepare_decode_work(
     rids: &[String],
-    finished_reasons: &[Option<Value>],
+    finished_reasons: Vec<Option<Value>>,
     decoded_texts: &[String],
     new_decode_ids: &[Vec<i64>],
     read_offsets: &[usize],
-    skip_special_tokens: &[bool],
-    spaces_between: &[bool],
-    no_stop_trim: &[bool],
+    skip_special: Vec<bool>,
+    spaces_between: Vec<bool>,
+    no_stop_trim: Vec<bool>,
     state: &mut LimitedCapacityDict,
-    tokenizer: &Tokenizer,
     config: &Config,
-) -> Vec<String> {
+) -> DecodeWork {
     let bs = rids.len();
-
-    // ── Phase 1: update / initialise per-request decode status ──────────────
     let mut read_ids: Vec<Vec<i64>> = Vec::with_capacity(bs);
     let mut surr_ids: Vec<Vec<i64>> = Vec::with_capacity(bs);
 
@@ -336,34 +345,55 @@ pub fn compute_output_strs(
 
         let s = state.get(rid).expect("state just inserted");
         let fr = finished_reasons[i].as_ref();
-
         let raw_read = &s.decode_ids[s.surr_offset..];
-        let trimmed_read = trim_matched_stop_ids(raw_read, fr, no_stop_trim[i], config.is_gpt_oss);
-        read_ids.push(trimmed_read);
+        let trimmed = trim_matched_stop_ids(raw_read, fr, no_stop_trim[i], config.is_gpt_oss);
+        read_ids.push(trimmed);
         surr_ids.push(s.decode_ids[s.surr_offset..s.read_offset].to_vec());
     }
 
-    // ── Phase 2: batch decode ────────────────────────────────────────────────
+    DecodeWork {
+        rids: rids.to_vec(),
+        finished_reasons,
+        no_stop_trim,
+        surr_ids,
+        read_ids,
+        skip_special,
+        spaces_between,
+    }
+}
+
+/// Phase 2: pure CPU-bound tokenizer decode. No state access; safe for `spawn_blocking`.
+pub fn execute_decode(work: &DecodeWork, tokenizer: &Tokenizer, config: &Config) -> DecodeResults {
     let surr_texts = grouped_batch_decode(
         tokenizer,
-        &surr_ids,
-        skip_special_tokens,
-        spaces_between,
+        &work.surr_ids,
+        &work.skip_special,
+        &work.spaces_between,
         config.disable_batch_decode,
     );
     let read_texts = grouped_batch_decode(
         tokenizer,
-        &read_ids,
-        skip_special_tokens,
-        spaces_between,
+        &work.read_ids,
+        &work.skip_special,
+        &work.spaces_between,
         config.disable_batch_decode,
     );
+    DecodeResults { surr_texts, read_texts }
+}
 
-    // ── Phase 3: incremental update + final output ───────────────────────────
-    let mut output_strs = Vec::with_capacity(bs);
+/// Phase 3: compute incremental output strings and advance per-request state.
+/// Fast; touches `state` but performs no tokenizer I/O.
+pub fn finalize_decode(
+    work: &DecodeWork,
+    results: &DecodeResults,
+    state: &mut LimitedCapacityDict,
+) -> Vec<String> {
+    let bs = work.rids.len();
     let capacity = state.capacity();
+    let mut output_strs = Vec::with_capacity(bs);
+
     for i in 0..bs {
-        let rid = &rids[i];
+        let rid = &work.rids[i];
         let s = state.get_mut(rid).unwrap_or_else(|| {
             panic!(
                 "Decode status not found for request {rid}. \
@@ -371,11 +401,10 @@ pub fn compute_output_strs(
             )
         });
 
-        let new_text = &read_texts[i][surr_texts[i].len()..];
-        let fr = finished_reasons[i].as_ref();
+        let new_text = &results.read_texts[i][results.surr_texts[i].len()..];
+        let fr = work.finished_reasons[i].as_ref();
 
         let new_text: String = if fr.is_none() {
-            // Streaming chunk
             if !new_text.is_empty() && !new_text.ends_with('\u{FFFD}') {
                 s.decoded_text.push_str(new_text);
                 s.surr_offset = s.read_offset;
@@ -388,15 +417,13 @@ pub fn compute_output_strs(
             new_text.to_string()
         };
 
-        // Apply stop-string trim to the full accumulated text
         let full = format!("{}{}", s.decoded_text, new_text);
-        let output_str = trim_matched_stop_str(&full, fr, no_stop_trim[i]);
+        let output_str = trim_matched_stop_str(&full, fr, work.no_stop_trim[i]);
 
         let incremental = output_str[s.sent_offset..].to_string();
         s.sent_offset = output_str.len();
         output_strs.push(incremental);
 
-        // Clean up finished requests
         if fr.is_some() {
             state.remove(rid);
         }
@@ -405,63 +432,26 @@ pub fn compute_output_strs(
     output_strs
 }
 
-// ─────────────────────── routed_experts encoding ────────────────────────────
+// ─────────────────── batch-field extraction + output building ───────────────
 
-/// Base64-encode each per-request tensor (encoded by Python as [shape, dtype, bytes]).
-/// Returns the same structure but with binary data replaced by a base64 string.
-pub fn encode_routed_experts(v: Value) -> Value {
-    match v {
-        Value::Nil => Value::Nil,
-        Value::Array(items) => Value::Array(
-            items
-                .into_iter()
-                .map(|item| match item {
-                    Value::Nil => Value::Nil,
-                    Value::Array(ref triple) if triple.len() == 3 => {
-                        // triple is [shape, dtype_str, binary_bytes]
-                        match &triple[2] {
-                            Value::Binary(bytes) => {
-                                let encoded = B64.encode(bytes);
-                                Value::String(rmpv::Utf8String::from(encoded))
-                            }
-                            _ => Value::Nil,
-                        }
-                    }
-                    _ => Value::Nil,
-                })
-                .collect(),
-        ),
-        _ => Value::Nil,
-    }
+/// Fields extracted from a `BatchTokenIDOutput` message map.
+pub struct BatchInputFields {
+    pub rids: Vec<String>,
+    pub finished_reasons: Vec<Option<Value>>,
+    pub decoded_texts: Vec<String>,
+    pub new_decode_ids: Vec<Vec<i64>>,
+    pub read_offsets: Vec<usize>,
+    pub skip_special_tokens: Vec<bool>,
+    pub spaces_between_special_tokens: Vec<bool>,
+    pub no_stop_trim: Vec<bool>,
 }
 
-// ─────────────────────── message transformation ──────────────────────────────
-
-/// Transform a `BatchTokenIDOutput` msgpack Value into a `BatchStrOutput` Value.
-///
-/// Fields consumed (not forwarded): decoded_texts, decode_ids, read_offsets,
-/// skip_special_tokens, spaces_between_special_tokens, no_stop_trim.
-/// Fields added: output_strs.
-/// Fields transformed: type tag → "BatchStrOutput", routed_experts → base64.
-/// Fields zeroed: placeholder_tokens_idx, placeholder_tokens_val.
-pub fn transform_batch_token_id(
-    val: Value,
-    state: &mut LimitedCapacityDict,
-    tokenizer: Option<&Tokenizer>,
-    config: &Config,
-) -> Value {
-    let map: Vec<(Value, Value)> = match val {
-        Value::Map(m) => m,
-        other => return other, // shouldn't happen
-    };
-
-    // ── Extract fields needed for detokenization ─────────────────────────────
-    let rids: Vec<String> = map_get(&map, "rids")
-        .map(v_string_array)
-        .unwrap_or_default();
+/// Borrow-extract the detokenization fields from a `BatchTokenIDOutput` map.
+pub fn extract_batch_input(map: &[(Value, Value)]) -> BatchInputFields {
+    let rids = map_get(map, "rids").map(v_string_array).unwrap_or_default();
     let bs = rids.len();
 
-    let finished_reasons: Vec<Option<Value>> = map_get(&map, "finished_reasons")
+    let finished_reasons = map_get(map, "finished_reasons")
         .map(|v| match v {
             Value::Array(arr) => arr
                 .iter()
@@ -474,57 +464,48 @@ pub fn transform_batch_token_id(
         })
         .unwrap_or_else(|| vec![None; bs]);
 
-    let decoded_texts: Vec<String> = map_get(&map, "decoded_texts")
+    let decoded_texts = map_get(map, "decoded_texts")
         .map(v_string_array)
         .unwrap_or_else(|| vec![String::new(); bs]);
 
-    let new_decode_ids: Vec<Vec<i64>> = map_get(&map, "decode_ids")
+    let new_decode_ids = map_get(map, "decode_ids")
         .map(|v| match v {
             Value::Array(arr) => arr.iter().map(|item| v_i64_array(item)).collect(),
             _ => vec![vec![]; bs],
         })
         .unwrap_or_else(|| vec![vec![]; bs]);
 
-    let read_offsets: Vec<usize> = map_get(&map, "read_offsets")
+    let read_offsets = map_get(map, "read_offsets")
         .map(|v| v_i64_array(v).into_iter().map(|x| x as usize).collect())
         .unwrap_or_else(|| vec![0usize; bs]);
 
-    let skip_special: Vec<bool> = map_get(&map, "skip_special_tokens")
+    let skip_special_tokens = map_get(map, "skip_special_tokens")
         .map(v_bool_array)
         .unwrap_or_else(|| vec![true; bs]);
 
-    let spaces_between: Vec<bool> = map_get(&map, "spaces_between_special_tokens")
+    let spaces_between_special_tokens = map_get(map, "spaces_between_special_tokens")
         .map(v_bool_array)
         .unwrap_or_else(|| vec![true; bs]);
 
-    let no_stop_trim: Vec<bool> = map_get(&map, "no_stop_trim")
+    let no_stop_trim = map_get(map, "no_stop_trim")
         .map(v_bool_array)
         .unwrap_or_else(|| vec![false; bs]);
 
-    // ── Compute output strings ────────────────────────────────────────────────
-    let output_strs: Vec<Value> = if bs == 0 || tokenizer.is_none() {
-        vec![Value::String(rmpv::Utf8String::from("")); bs]
-    } else {
-        let tok = tokenizer.unwrap();
-        compute_output_strs(
-            &rids,
-            &finished_reasons,
-            &decoded_texts,
-            &new_decode_ids,
-            &read_offsets,
-            &skip_special,
-            &spaces_between,
-            &no_stop_trim,
-            state,
-            tok,
-            config,
-        )
-        .into_iter()
-        .map(|s| Value::String(rmpv::Utf8String::from(s)))
-        .collect()
-    };
+    BatchInputFields {
+        rids,
+        finished_reasons,
+        decoded_texts,
+        new_decode_ids,
+        read_offsets,
+        skip_special_tokens,
+        spaces_between_special_tokens,
+        no_stop_trim,
+    }
+}
 
-    // ── Build output map ──────────────────────────────────────────────────────
+/// Build the `BatchStrOutput` map from the original message map and computed output strings.
+/// Consumes `map`; applies type-tag rename, field removal, routed_experts encoding, etc.
+pub fn build_batch_str_output(map: Vec<(Value, Value)>, output_strs: Vec<String>) -> Value {
     const SKIP: &[&str] = &[
         "type",
         "decoded_texts",
@@ -557,12 +538,40 @@ pub fn transform_batch_token_id(
         out.push((k, v));
     }
 
-    out.push((
-        Value::String("output_strs".into()),
-        Value::Array(output_strs),
-    ));
+    let strs_val = Value::Array(
+        output_strs
+            .into_iter()
+            .map(|s| Value::String(rmpv::Utf8String::from(s)))
+            .collect(),
+    );
+    out.push((Value::String("output_strs".into()), strs_val));
 
     Value::Map(out)
+}
+
+// ─────────────────────── routed_experts encoding ────────────────────────────
+
+pub fn encode_routed_experts(v: Value) -> Value {
+    match v {
+        Value::Nil => Value::Nil,
+        Value::Array(items) => Value::Array(
+            items
+                .into_iter()
+                .map(|item| match item {
+                    Value::Nil => Value::Nil,
+                    Value::Array(ref triple) if triple.len() == 3 => match &triple[2] {
+                        Value::Binary(bytes) => {
+                            let encoded = B64.encode(bytes);
+                            Value::String(rmpv::Utf8String::from(encoded))
+                        }
+                        _ => Value::Nil,
+                    },
+                    _ => Value::Nil,
+                })
+                .collect(),
+        ),
+        _ => Value::Nil,
+    }
 }
 
 // ─────────────────────── msgpack encode / decode ────────────────────────────

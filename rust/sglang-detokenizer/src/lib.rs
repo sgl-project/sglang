@@ -1,7 +1,6 @@
 use pyo3::prelude::*;
 
 mod cli;
-mod ipc;
 mod detokenizer;
 
 #[pyclass(from_py_object)]
