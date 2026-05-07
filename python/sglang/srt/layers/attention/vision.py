@@ -95,6 +95,7 @@ FLASHINFER_MAX_SEQLEN_BUCKETS = [
 ]
 
 HOPPER_TMA_ALIGN_BYTE = 16
+FA3_ENABLE_FP8_SHAPE = 2400
 
 @dataclasses.dataclass
 class SingletonCache:
@@ -436,7 +437,9 @@ class VisionFlash3Attention(nn.Module):
         4. currently dfraft version is : [1] per-tensor quantization [2] the only changed part is root(head_dim) which is now root(aligned_head_dim), we should pass the softmax scale in
         5. for best performance: should define aligned tensor, use a kernel to do per_head_quant and write in to aligned tensor directly (avoid cat(copy again))
         """
-
+        window_size = kwargs.get("window_size", (-1, -1))
+        s_aux = kwargs.get("s_aux", None)
+        
         if envs.SGLANG_VISION_ATTN_FP8.get():
             if isinstance(cu_seqlens, list):
                 cu_seqlens_tensor = cu_seqlens[0]
@@ -448,7 +451,7 @@ class VisionFlash3Attention(nn.Module):
             avg_len = q.shape[0] / num_images if num_images > 0 else q.shape[0]
 
             # Use FP8 TMA optimization for thresholds above 4800
-            use_fp8 = avg_len > 4800
+            use_fp8 = avg_len > FA3_ENABLE_FP8_SHAPE
         else:
             use_fp8 = False
 
@@ -518,50 +521,66 @@ class VisionFlash3Attention(nn.Module):
 
         if envs.SGLANG_VIT_ENABLE_CUDA_GRAPH.get() and isinstance(cu_seqlens, list):
             max_seqlen = cu_seqlens[1]
+            fa_kwargs = dict(
+                cu_seqlens_q=cu_seqlens[0],
+                cu_seqlens_k=cu_seqlens[0],
+                max_seqlen_q=max_seqlen,
+                max_seqlen_k=max_seqlen,
+                softmax_scale=attn_softmax_scale,
+                window_size=window_size,
+            )
+            
+            if s_aux is not None:
+                fa_kwargs["sinks"] = s_aux
+            
+            max_seqlen = cu_seqlens[1]
             if use_fp8:
+                fa_kwargs["q_descale"] = scale_q
+                fa_kwargs["k_descale"] = scale_k
+                fa_kwargs["v_desacle"] = scale_v
+                
                 output = flash_attn_varlen_func(
                     q_quant_pad,
                     k_quant_pad,
                     v_quant_pad,
-                    cu_seqlens_q=cu_seqlens[0],
-                    cu_seqlens_k=cu_seqlens[0],
-                    max_seqlen_q=max_seqlen,
-                    max_seqlen_k=max_seqlen,
-                    q_descale=scale_q,
-                    k_descale=scale_k,
-                    v_descale=scale_v,
-                    softmax_scale=attn_softmax_scale,
+                    **fa_kwargs
                 )
+                
                 ret = output[:, :, :ori_headsize]
             else:
                 ret = flash_attn_varlen_func(
                     q,
                     k,
                     v,
-                    cu_seqlens_q=cu_seqlens[0],
-                    cu_seqlens_k=cu_seqlens[0],
-                    max_seqlen_q=max_seqlen,
-                    max_seqlen_k=max_seqlen,
+                    **fa_kwargs
                 )
         else:
             cu_seqlens = resolve_seqlens(cu_seqlens, bsz, seq_len, device=q.device)
             cu_seqlens = cu_seqlens.to(dtype=torch.int32).to(q.device)
             seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
             max_seqlen = seq_lens.max().item()
+            
+            fa_kwargs = dict(
+                cu_seqlens_q=cu_seqlens,
+                cu_seqlens_k=cu_seqlens,
+                max_seqlen_q=max_seqlen,
+                max_seqlen_k=max_seqlen,
+                softmax_scale=attn_softmax_scale,
+                window_size=window_size,
+            )
+            
+            if s_aux is not None:
+                fa_kwargs["sinks"] = s_aux
 
             if use_fp8:
+                fa_kwargs["q_descale"] = scale_q
+                fa_kwargs["k_descale"] = scale_k
+                fa_kwargs["v_desacle"] = scale_v
                 output = flash_attn_varlen_func(
                     q_quant_pad,
                     k_quant_pad,
                     v_quant_pad,
-                    cu_seqlens_q=cu_seqlens,
-                    cu_seqlens_k=cu_seqlens,
-                    max_seqlen_q=max_seqlen,
-                    max_seqlen_k=max_seqlen,
-                    q_descale=scale_q,
-                    k_descale=scale_k,
-                    v_descale=scale_v,
-                    softmax_scale=attn_softmax_scale,
+                    **fa_kwargs,
                 )
                 ret = output[:, :, :ori_headsize]
             else:
@@ -569,10 +588,7 @@ class VisionFlash3Attention(nn.Module):
                     q,
                     k,
                     v,
-                    cu_seqlens_q=cu_seqlens,
-                    cu_seqlens_k=cu_seqlens,
-                    max_seqlen_q=max_seqlen,
-                    max_seqlen_k=max_seqlen,
+                    **fa_kwargs,
                 )
         return ret
 
