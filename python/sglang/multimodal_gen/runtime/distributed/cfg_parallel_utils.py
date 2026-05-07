@@ -44,7 +44,7 @@ def _run(
         },
     )
     raw = predict_fn(local_branch)
-    return tuple(p.float() for p in _wrap(raw))
+    return _wrap(raw)
 
 
 def run_cfg_parallel(

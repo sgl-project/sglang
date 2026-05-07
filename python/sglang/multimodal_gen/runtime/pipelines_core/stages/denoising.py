@@ -1391,7 +1391,7 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                 pred_t = (
                     server_args.pipeline_config.slice_noise_pred(pred_t[0], latents),
                 )
-            return _unwrap(tuple(p.float() for p in pred_t))
+            return _unwrap(pred_t)
 
         if server_args.enable_cfg_parallel:
             # perform cfg branches in parallel, following the cfg policy
