@@ -1935,10 +1935,21 @@ class NSATokenToKVPool(MLATokenToKVPool):
                 )
                 for _ in range(layer_num)
             ]
+            # Mark each slab's address as static for torch.compile / CUDA-graph
+            # capture: the slabs are pool-lifetime, so their data_ptr is invariant.
+            for buf in self.index_k_with_scale_buffer:
+                torch._dynamo.mark_static_address(buf)
         self._finalize_allocation_log(size)
 
     def get_index_k_with_scale_buffer(self, layer_id: int) -> torch.Tensor:
+        from sglang.srt.compilation.piecewise_context_manager import (
+            is_in_piecewise_cuda_graph,
+        )
+
         if self.layer_transfer_counter is not None:
+            # PCG should not be used together with disaggregated
+            # layer-transfer streaming.
+            assert not is_in_piecewise_cuda_graph()
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
         return self.index_k_with_scale_buffer[layer_id - self.start_layer]
 

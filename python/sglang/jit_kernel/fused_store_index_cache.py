@@ -9,7 +9,7 @@ The kernels are compiled on-demand using TVM FFI and cached for subsequent use.
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
 import torch
 
@@ -20,6 +20,7 @@ from sglang.jit_kernel.utils import (
     make_cpp_args,
 )
 from sglang.kernel_api_logging import debug_kernel_api
+from sglang.srt.utils.custom_op import register_custom_op
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
@@ -65,41 +66,69 @@ def can_use_nsa_fused_store(
         return False
 
 
+def _fused_store_index_k_cache_fake_impl(
+    key: torch.Tensor,
+    index_k_with_scale: torch.Tensor,
+    out_cache_loc: torch.Tensor,
+    page_size: int = 64,
+    extend_num_tokens: Optional[torch.Tensor] = None,
+) -> None:
+    return None
+
+
+@register_custom_op(
+    mutates_args=["index_k_with_scale"],
+    fake_impl=_fused_store_index_k_cache_fake_impl,
+)
 @debug_kernel_api
 def fused_store_index_k_cache(
     key: torch.Tensor,
     index_k_with_scale: torch.Tensor,
     out_cache_loc: torch.Tensor,
     page_size: int = 64,
+    extend_num_tokens: Optional[torch.Tensor] = None,
 ) -> None:
     """
     Fused: quantize bf16 key (N,128) -> fp8 + fp32 scale and write into NSATokenToKVPool.index_k_with_scale_buffer.
 
-    key:            (num_tokens, 128) bf16 (or reshapeable to it)
-    index_k_with_scale:  (num_pages, 64*(128+4)) uint8
-    out_cache_loc:       (num_tokens,) int64 token indices in TokenToKVPool
+    key:                 (num_tokens, 128) bf16, contiguous
+    index_k_with_scale:  (num_pages, 64*(128+4)) uint8, contiguous
+    out_cache_loc:       (num_tokens,) int64, contiguous; token indices in TokenToKVPool
+    extend_num_tokens:   optional (1,) int32 device tensor; per-replay real token count.
+                         Under piecewise CUDA graph, num_tokens (= key.shape[0]) is the
+                         bucket size baked at capture and the caller routes a stable
+                         per-replay value here so padded rows are skipped. For non-PCG
+                         callers, leave None and the kernel will be bounded by
+                         key.shape[0].
     """
-    assert key.is_cuda
-    assert index_k_with_scale.is_cuda
-    assert out_cache_loc.is_cuda
+    assert key.is_cuda and key.is_contiguous(), "key must be contiguous CUDA tensor"
+    assert (
+        index_k_with_scale.is_cuda and index_k_with_scale.is_contiguous()
+    ), "index_k_with_scale must be contiguous CUDA tensor"
+    assert (
+        out_cache_loc.is_cuda and out_cache_loc.is_contiguous()
+    ), "out_cache_loc must be contiguous CUDA tensor"
 
-    # 1) normalize shapes
-    if key.dim() != 2:
-        key = key.view(-1, key.shape[-1])
-    assert key.shape[1] == 128, f"expected key last-dim=128, got {key.shape}"
-
-    # 2) dtypes
+    assert (
+        key.dim() == 2 and key.shape[1] == 128
+    ), f"expected key shape (N,128), got {key.shape}"
     assert key.dtype == torch.bfloat16, f"{key.dtype=}"
     assert index_k_with_scale.dtype == torch.uint8, f"{index_k_with_scale.dtype=}"
     assert out_cache_loc.dtype == torch.int64, f"{out_cache_loc.dtype=}"
 
-    # 3) contiguity
-    if not key.is_contiguous():
-        key = key.contiguous()
-    if not out_cache_loc.is_contiguous():
-        out_cache_loc = out_cache_loc.contiguous()
-    if not index_k_with_scale.is_contiguous():
-        index_k_with_scale = index_k_with_scale.contiguous()
+    if extend_num_tokens is None:
+        extend_num_tokens = torch.full(
+            (1,), key.shape[0], dtype=torch.int32, device=key.device
+        )
+    else:
+        assert (
+            extend_num_tokens.is_cuda and extend_num_tokens.is_contiguous()
+        ), "extend_num_tokens must be contiguous CUDA tensor"
+        assert (
+            extend_num_tokens.dtype == torch.int32 and extend_num_tokens.numel() == 1
+        ), f"extend_num_tokens must be a 1-elem int32 tensor, got dtype={extend_num_tokens.dtype} numel={extend_num_tokens.numel()}"
 
     module = _jit_nsa_fused_store_module(key.dtype, out_cache_loc.dtype, page_size)
-    module.fused_store_index_k_cache(key, index_k_with_scale, out_cache_loc)
+    module.fused_store_index_k_cache(
+        key, index_k_with_scale, out_cache_loc, extend_num_tokens
+    )

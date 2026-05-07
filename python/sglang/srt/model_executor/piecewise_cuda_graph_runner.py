@@ -21,7 +21,7 @@ import logging
 import warnings
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Optional, Union
+from typing import TYPE_CHECKING, Any, Optional, Union
 
 import torch
 import tqdm
@@ -85,6 +85,12 @@ class PrefillInputBuffers(ForwardInputBuffers):
     positions: torch.Tensor
     input_embeds: Optional[torch.Tensor]
     mrope_positions: Optional[torch.Tensor]
+    # 1-elem int32 device tensor; refilled per replay with the real (non-padded)
+    # extend-token count. Address is stable across replays, value is dynamic.
+    extend_num_tokens_gpu: torch.Tensor
+    # NSA indexer metadata staging (PrefillNsaMetadataBuffers); None if model
+    # has no NSA indexers. See sglang.srt.layers.attention.nsa.metadata_staging.
+    nsa_metadata_buffers: Optional[Any] = None
 
 
 @contextmanager
@@ -258,6 +264,23 @@ class PiecewiseCudaGraphRunner:
                 else None
             )
             positions = torch.zeros((self.max_num_tokens,), dtype=torch.int64)
+            extend_num_tokens_gpu = torch.zeros((1,), dtype=torch.int32)
+            # NSA indexer metadata staging slots (only allocated if model uses NSA).
+            nsa_indexers = getattr(self.model_runner, "nsa_indexers", None)
+            if nsa_indexers:
+                from sglang.srt.layers.attention.nsa.metadata_staging import (
+                    allocate_prefill_nsa_metadata_buffers,
+                )
+
+                nsa_metadata_buffers = allocate_prefill_nsa_metadata_buffers(
+                    max_bs=self.max_bs,
+                    max_num_tokens=self.max_num_tokens,
+                    max_seq_len=self.max_num_tokens,
+                    index_topk=nsa_indexers[0].index_topk,
+                    device=torch.device("cuda"),
+                )
+            else:
+                nsa_metadata_buffers = None
 
             self.tbo_plugin = TboCudaGraphRunnerPlugin()
 
@@ -288,6 +311,8 @@ class PiecewiseCudaGraphRunner:
             positions=positions,
             input_embeds=input_embeds,
             mrope_positions=mrope_positions,
+            extend_num_tokens_gpu=extend_num_tokens_gpu,
+            nsa_metadata_buffers=nsa_metadata_buffers,
         )
         self.buffers.share_buffers()
 
@@ -429,6 +454,10 @@ class PiecewiseCudaGraphRunner:
         forward_batch.dp_local_start_pos = forward_batch.dp_local_num_tokens = None
         set_dp_buffer_len(None, num_tokens, forward_batch.dp_padding_mode.is_max_len())
         set_is_extend_in_batch(False)
+        # During warmup, real tokens == bucket size (no padding).
+        self.buffers.extend_num_tokens_gpu.fill_(num_tokens)
+        # Stage live NSA metadata into stable-address slots (no-op if no NSA).
+        self._stage_nsa_metadata_if_present(forward_batch, num_tokens=num_tokens)
         with set_forward_context(
             forward_batch,
             self.attention_layers,
@@ -436,12 +465,39 @@ class PiecewiseCudaGraphRunner:
             self.moe_layers,
             self.moe_fusions,
             nsa_indexers=self.nsa_indexers,
+            extend_num_tokens_gpu=self.buffers.extend_num_tokens_gpu,
+            nsa_metadata_buffers=self.buffers.nsa_metadata_buffers,
         ):
             _ = self.model_runner.model.forward(
                 forward_batch.input_ids,
                 forward_batch.positions,
                 forward_batch,
             )
+
+    def _stage_nsa_metadata_if_present(
+        self, forward_batch: ForwardBatch, num_tokens: int
+    ) -> None:
+        """Copy live NSA indexer metadata into the stable-address staging slots.
+
+        Called after `attn_backend.init_forward_metadata(forward_batch)` so the
+        live metadata is built. The first NSA layer's metadata is used; the
+        underlying tensors are shared across layers so any layer_id is fine.
+        """
+        if self.buffers.nsa_metadata_buffers is None or not self.nsa_indexers:
+            return
+        from sglang.srt.layers.attention.nsa.metadata_staging import (
+            stage_prefill_nsa_metadata_buffers,
+        )
+
+        first_layer_id = self.nsa_indexers[0].layer_id
+        metadata = forward_batch.attn_backend.get_indexer_metadata(
+            first_layer_id, forward_batch
+        )
+        stage_prefill_nsa_metadata_buffers(
+            self.buffers.nsa_metadata_buffers,
+            metadata,
+            num_tokens=num_tokens,
+        )
 
     def _cache_loc_dtype(self):
         return torch.int64 if not is_npu() else torch.int32
@@ -617,6 +673,10 @@ class PiecewiseCudaGraphRunner:
             set_is_extend_in_batch(False)
 
             kwargs = {}
+            # During capture, real tokens == bucket size (no padding region).
+            self.buffers.extend_num_tokens_gpu.fill_(num_tokens)
+            # Stage live NSA metadata into stable-address slots (no-op if no NSA).
+            self._stage_nsa_metadata_if_present(forward_batch, num_tokens=num_tokens)
             with set_forward_context(
                 forward_batch,
                 self.attention_layers,
@@ -624,6 +684,8 @@ class PiecewiseCudaGraphRunner:
                 self.moe_layers,
                 self.moe_fusions,
                 nsa_indexers=self.nsa_indexers,
+                extend_num_tokens_gpu=self.buffers.extend_num_tokens_gpu,
+                nsa_metadata_buffers=self.buffers.nsa_metadata_buffers,
             ):
                 self.model_runner.model.forward(
                     forward_batch.input_ids,
@@ -668,6 +730,9 @@ class PiecewiseCudaGraphRunner:
         buffers.input_ids[:num_tokens].copy_(forward_batch.input_ids)
         buffers.positions[:num_tokens].copy_(forward_batch.positions)
         buffers.out_cache_loc[:num_tokens].copy_(forward_batch.out_cache_loc)
+        # Stable-address scalar holding the real (non-padded) token count for this
+        # replay; bound NSA store-K kernel writes so padding slots aren't scattered.
+        buffers.extend_num_tokens_gpu.fill_(num_tokens)
         if buffers.out_cache_loc_swa is not None:
             buffers.out_cache_loc_swa[: self.raw_num_tokens].copy_(
                 self.model_runner.token_to_kv_pool_allocator.translate_loc_from_full_to_swa(
@@ -819,9 +884,15 @@ class PiecewiseCudaGraphRunner:
                 self.moe_layers,
                 self.moe_fusions,
                 nsa_indexers=self.nsa_indexers,
+                extend_num_tokens_gpu=self.buffers.extend_num_tokens_gpu,
+                nsa_metadata_buffers=self.buffers.nsa_metadata_buffers,
             ):
                 # Due to the dispatch kernel for MLA model, we init the metadata with original forward_batch
                 self.model_runner.attn_backend.init_forward_metadata(forward_batch)
+                # Stage live NSA metadata into stable-address slots (no-op if no NSA).
+                self._stage_nsa_metadata_if_present(
+                    forward_batch, num_tokens=self.raw_num_tokens
+                )
                 output = self.model_runner.model.forward(
                     static_forward_batch.input_ids,
                     static_forward_batch.positions,

@@ -86,17 +86,22 @@ if _is_cuda:
 
     @register_custom_op(mutates_args=["topk_result"])
     @register_split_op()
-    def k_cache_and_topk_result(
+    def topk_ragged_pcg(
         layer_id: int,
-        key: torch.Tensor,
         q_fp8: torch.Tensor,
         weights: torch.Tensor,
         topk_result: torch.Tensor,
     ) -> None:
+        """Opaque-op wrapper for `_get_topk_ragged` under piecewise CUDA graph.
+
+        The K-cache store is CUDA-graphable (see fused_store_index_k_cache with
+        extend_num_tokens) and runs inside the compiled region, so it is no
+        longer wrapped here. This op shields only the ragged-topk kernel, whose
+        per-batch metadata + .item() chunking is not torch.compile-traceable.
+        """
         assert (
             _is_cuda
         ), "Internal error: piecewise CUDA graph is only supported on CUDA"
-        from sglang.srt.layers.attention.nsa.triton_kernel import act_quant
 
         forward_batch = get_forward_context().forward_batch
         indexer = get_forward_context().nsa_indexers[layer_id]
@@ -107,13 +112,6 @@ if _is_cuda:
         # slice off padding from piecewise CUDA graph
         extend_num_tokens = forward_batch.extend_num_tokens
 
-        indexer._store_index_k_cache(
-            forward_batch=forward_batch,
-            layer_id=layer_id,
-            key=key[:extend_num_tokens],
-            act_quant=act_quant,
-            out_cache_loc=forward_batch.out_cache_loc[:extend_num_tokens],
-        )
         indexer._get_topk_ragged(
             False,
             forward_batch,
@@ -154,6 +152,52 @@ if _is_cuda:
         weights = out * n_heads_inv_sqrt
         weights = weights.unsqueeze(-1) * q_scale * softmax_scale
         return weights
+
+    def topk_construct_k_only_pcg(
+        method: int,
+        seqlens_expanded: torch.Tensor,
+        token_to_batch_idx: torch.Tensor,
+        page_table_1: torch.Tensor,
+        topk_result: torch.Tensor,
+    ) -> torch.Tensor:
+        """Pure-tensor topk for the PCG-inlined `_forward_cuda_k_only` path.
+
+        For zero-logit inputs the topk kernel's tiebreaker picks the first
+        `seqlens_expanded[i]` indices in position order; under PAGED that maps
+        to `topk[i, k] = page_table_1[token_to_batch_idx[i], k]` for
+        `k < seqlens_expanded[i]`, else -1.
+
+        Only PAGED is supported under PCG: RAGGED requires the
+        flashmla_sparse prefill backend (`nsa_backend.py:get_topk_transform_method`),
+        which is not in scope here. Padded rows beyond `num_tokens` have
+        `seqlens_expanded[i] == 0` (zeroed by `_stage_1d`), so the validity
+        mask collapses them to all -1.
+
+        `topk_result` is a stable-address scratch buffer owned by the runner
+        (mark_static_address). Writing into it bypasses the CUDA-graph pool's
+        per-capture lifetime tracking, which would otherwise reuse the slab
+        before FMHA reads topk_indices under TP>1 causing IMA.
+        """
+        from sglang.srt.layers.attention.nsa_backend import TopkTransformMethod
+
+        assert (
+            method == TopkTransformMethod.PAGED
+        ), f"only PAGED is supported under PCG; got method={method!r}"
+
+        device = topk_result.device
+        topk = topk_result.shape[1]
+
+        k_idx = torch.arange(topk, device=device, dtype=torch.int32)
+        valid = k_idx[None, :] < seqlens_expanded[:, None]
+
+        slots = page_table_1[token_to_batch_idx.to(torch.long), :topk]
+
+        topk_result[:] = torch.where(
+            valid,
+            slots.to(torch.int32),
+            torch.full_like(slots, -1, dtype=torch.int32),
+        )
+        return topk_result
 
 
 class BaseIndexerMetadata(ABC):
@@ -814,7 +858,7 @@ class Indexer(MultiPlatformOp):
         layer_id: int,
         act_quant,
         enable_dual_stream: bool,
-        metadata: BaseIndexerMetadata,
+        metadata: Optional[BaseIndexerMetadata],
         return_indices: bool = True,
     ) -> Optional[torch.Tensor]:
         assert forward_batch.forward_mode.is_extend_without_speculative()
@@ -823,8 +867,13 @@ class Indexer(MultiPlatformOp):
         # Fast path: only compute and store k cache, skip all q and weights ops
         key = self._get_k_bf16(x, positions, enable_dual_stream)
 
-        if not forward_batch.out_cache_loc.is_contiguous():
-            forward_batch.out_cache_loc = forward_batch.out_cache_loc.contiguous()
+        if not is_in_piecewise_cuda_graph():
+            # Under PCG, out_cache_loc is the runner's pre-allocated contiguous
+            # buffer (slicing it yields a contiguous view); the check itself is
+            # Dynamo-hostile (is_contiguous is a data-dependent tensor call).
+            if not forward_batch.out_cache_loc.is_contiguous():
+                forward_batch.out_cache_loc = forward_batch.out_cache_loc.contiguous()
+        assert forward_batch.out_cache_loc.is_contiguous()
 
         self._store_index_k_cache(
             forward_batch=forward_batch,
@@ -837,7 +886,27 @@ class Indexer(MultiPlatformOp):
         if not return_indices:
             return None
 
-        # MLA: use dummy logits with topk kernel's fast path to generate indices
+        if is_in_piecewise_cuda_graph():
+            bucket = x_meta.shape[0]
+            ctx = get_forward_context()
+            bufs = ctx.nsa_metadata_buffers
+            assert (
+                bufs is not None
+            ), "PCG inlined k-only topk requires staged NSA metadata buffers"
+            method = bufs.topk_transform_method
+            assert method is not None, (
+                "PCG inlined k-only topk requires topk_transform_method to "
+                "have been pinned by stage_prefill_nsa_metadata_buffers"
+            )
+            return topk_construct_k_only_pcg(
+                method=method,
+                seqlens_expanded=bufs.seqlens_expanded[:bucket],
+                token_to_batch_idx=bufs.token_to_batch_idx[:bucket],
+                page_table_1=bufs.page_table_1,
+                topk_result=bufs.topk_result[:bucket],
+            )
+
+        # MLA eager: use dummy logits with topk kernel's fast path to generate indices
         # When length <= 2048, naive_topk_cuda directly generates [0,1,...,length-1,-1,...]
         seq_lens_expanded = metadata.get_seqlens_expanded()
         dummy_logits = torch.zeros(
@@ -1093,19 +1162,20 @@ class Indexer(MultiPlatformOp):
         key: torch.Tensor,
         *,
         act_quant=None,  # fallback only
-        out_cache_loc: Optional[torch.Tensor] = None,
     ) -> None:
         """
         Store NSA indexer K cache for current step.
 
-        Preferred: fused_store_index_k_cache(key, cache, out_cache_loc, page_size)
+        Preferred: fused_store_index_k_cache(key, cache, out_cache_loc,
+                                             extend_num_tokens, page_size)
         Fallback : act_quant(key) + token_to_kv_pool.set_index_k_scale_buffer(...)
 
-        out_cache_loc will default to forward_batch.out_cache_loc if not provided.
+        Always reads out_cache_loc from forward_batch (PCG already plumbs the
+        per-replay value into the forward_batch buffer). Under piecewise CUDA
+        graph, the fused path is mandatory; padding-aware bound is provided by
+        forward_context.extend_num_tokens_gpu (refilled per replay).
         """
-
-        if out_cache_loc is None:
-            out_cache_loc = forward_batch.out_cache_loc
+        out_cache_loc = forward_batch.out_cache_loc
 
         if (
             _is_cuda
@@ -1116,17 +1186,25 @@ class Indexer(MultiPlatformOp):
                 forward_batch.token_to_kv_pool.page_size,
             )
         ):
-            # NOTE: wrapper already normalizes shape/contiguity and asserts dtypes.
             buf = forward_batch.token_to_kv_pool.get_index_k_with_scale_buffer(
                 layer_id=layer_id
+            )
+            ctx = get_forward_context()
+            extend_num_tokens_gpu = (
+                ctx.extend_num_tokens_gpu if ctx is not None else None
             )
             fused_store_index_k_cache(
                 key,
                 buf,
                 out_cache_loc,
                 forward_batch.token_to_kv_pool.page_size,
+                extend_num_tokens=extend_num_tokens_gpu,
             )
             return
+
+        assert (
+            not is_in_piecewise_cuda_graph()
+        ), "PCG requires the fused NSA store path; Python fallback is not supported"
 
         # Fast path: AITER fused quant + cache store (HIP, page_size=1)
         if _use_aiter:
@@ -1211,14 +1289,15 @@ class Indexer(MultiPlatformOp):
             and q_lora.shape[0] <= DUAL_STREAM_TOKEN_THRESHOLD
         )
 
-        # Determine if should skip topk based on sequence length
-        # We can only skip the logits computation if cuda graph is not involved
+        # Determine if should skip topk based on sequence length.
         skip_logits_computation = False
-        if (
-            not is_in_piecewise_cuda_graph()
-            and forward_batch.forward_mode.is_extend_without_speculative()
-        ):
-            if forward_batch.seq_lens_cpu is not None:
+        if forward_batch.forward_mode.is_extend_without_speculative():
+            if is_in_piecewise_cuda_graph():
+                # This is a heuristic. At compile-time if the input sequence
+                # is <= index_topk number of tokens, we can trivially skip
+                # logits computation.
+                skip_logits_computation = x_meta.shape[0] <= self.index_topk
+            elif forward_batch.seq_lens_cpu is not None:
                 max_kv_len = forward_batch.seq_lens_cpu.max().item()
                 skip_logits_computation = max_kv_len <= self.index_topk
 
@@ -1273,7 +1352,7 @@ class Indexer(MultiPlatformOp):
                         act_quant=act_quant,
                     )
                 current_stream.wait_stream(self.alt_stream)
-            elif not is_in_piecewise_cuda_graph():
+            else:
                 q_fp8, q_scale = act_quant(query, self.block_size, self.scale_fmt)
                 self._store_index_k_cache(
                     forward_batch=forward_batch,
@@ -1281,10 +1360,6 @@ class Indexer(MultiPlatformOp):
                     key=key,
                     act_quant=act_quant,
                 )
-            else:
-                # piecewise CUDA graph need to split graph on store_k_cache and mqa_logits,
-                # so delay store_k_cache after weights proj.
-                q_fp8, q_scale = act_quant(query, self.block_size, self.scale_fmt)
 
             # aiter (ROCm gfx95): the 3-tuple (fp8, scale, bf16) from
             # fused_rms_fp8_group_quant is passed directly to _get_logits_head_gate,
@@ -1416,9 +1491,8 @@ class Indexer(MultiPlatformOp):
                         device=q_fp8.device,
                         dtype=torch.int32,
                     )
-                    k_cache_and_topk_result(
+                    topk_ragged_pcg(
                         layer_id=layer_id,
-                        key=key,
                         q_fp8=q_fp8,
                         weights=weights,
                         topk_result=topk_result,

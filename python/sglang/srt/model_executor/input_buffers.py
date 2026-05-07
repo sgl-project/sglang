@@ -50,9 +50,13 @@ class ForwardInputBuffers:
 
             if isinstance(buffer, dict):
                 for sub_name, sub_buffer in buffer.items():
-                    assert isinstance(
-                        sub_buffer, torch.Tensor
-                    ), f"Field {name}.{sub_name} is expected to be a torch.Tensor, but got {type(sub_buffer)}."
+                    if sub_buffer is None:
+                        continue
+                    if not isinstance(sub_buffer, torch.Tensor):
+                        # Non-tensor metadata fields (e.g., enums snapshotted at
+                        # staging time on PrefillNsaMetadataBuffers) are managed
+                        # externally and have no shared-pool storage.
+                        continue
                     new_buffer = self._share_one_buffer(
                         f"{name}.{sub_name}", sub_buffer
                     )
