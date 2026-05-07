@@ -108,6 +108,7 @@ def _pick_inner_iter_combine(
     target_blocks = cu * block_per_cu
 
     ## prevent register spills 
+    # return 2, 2
     iter_2 = ni_2
     while iter_2 > 4 and iter_2 % 2 == 0:
         iter_2 //= 2
@@ -2333,7 +2334,7 @@ def dpsk_v4_fp8_attention_fwd(
     has_extra = extra_k_cache is not None # True
     topk2 = extra_indices_in_kvcache.shape[-1] if has_extra else 0 # 512||64
     if _is_gfx95_supported:
-        block_I, threads, num_stages, block_per_cu, cu = 64, 512, 0, 1, 256
+        block_I, threads, num_stages, block_per_cu, cu = 32, 512, 0, 1, 256
         if seq * (topk1 // block_I + topk2 // block_I) <= cu * block_per_cu // 2:
             block_I = 32
     # else:
@@ -2369,7 +2370,8 @@ def dpsk_v4_fp8_attention_fwd(
         inner_iter_1, inner_iter_2= _pick_inner_iter_combine(
             seq, ni_1, ni_2, cu, block_per_cu
         )
-        # inner_iter_2 = min(inner_iter_2, 4) # TODO(zty) 好像有一点点用...
+        inner_iter_1 = _pick_inner_iter(seq, ni_1, cu, block_per_cu)
+        inner_iter_2 = _pick_inner_iter(seq, ni_2, cu, block_per_cu)
 
         tk_len_2 = (
             extra_topk_length

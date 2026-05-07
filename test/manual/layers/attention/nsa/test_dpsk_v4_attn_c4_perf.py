@@ -26,8 +26,12 @@ or:
 """
 
 from __future__ import annotations
-# import os
-# os.system("rm -rf ~/.tilelang")
+import sys
+import os
+if "c" in sys.argv:
+    os.system("rm -rf ~/.tilelang")
+    os.system("rm tmp*")
+os.environ["SGLANG_DEBUG_DSV4_ATTN"] = "1"
 
 from typing import Any, Dict, Tuple
 
@@ -54,6 +58,7 @@ TOPK1 = 128
 
 EXTRA_BLOCK_SIZE = 64  # C4 page_size = 256 // 4
 TOPK2 = 512
+# TOPK2 = 512
 
 # Real dump uses 8193 SWA blocks and 1754 extra blocks; we keep that for perf
 # but can shrink for correctness.
