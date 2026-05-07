@@ -13,6 +13,9 @@ from typing import Callable, List, Optional, Tuple
 import numpy as np
 import requests
 from pydantic import BaseModel
+from tabulate import tabulate
+from transformers import AutoProcessor, PreTrainedTokenizer
+
 from sglang.benchmark.datasets import get_dataset
 from sglang.benchmark.utils import get_processor, get_tokenizer
 from sglang.profiler import run_profile
@@ -21,8 +24,6 @@ from sglang.srt.entrypoints.http_server import launch_server
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import is_blackwell, kill_process_tree
 from sglang.test.test_utils import is_in_ci, write_github_step_summary
-from tabulate import tabulate
-from transformers import AutoProcessor, PreTrainedTokenizer
 
 DEFAULT_TIMEOUT = 600
 
