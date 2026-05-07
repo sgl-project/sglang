@@ -368,7 +368,7 @@ class NixlKVManager(CommonKVManager):
             self.update_status(room, KVPoll.Failed)
 
     def check_status(self, bootstrap_room: int):
-        return self.request_status.get(bootstrap_room, KVPoll.Bootstrapping)
+        return self.request_status.get(bootstrap_room, KVPoll.WaitingForInput)
 
     def transfer_worker(self, queue: FastQueue):
         while True:
@@ -1082,9 +1082,6 @@ class NixlKVManager(CommonKVManager):
     ):
         assert self.disaggregation_mode == DisaggregationMode.PREFILL
         assert not is_last or (is_last and aux_index is not None)
-
-        if bootstrap_room not in self.request_status:
-            self.update_status(bootstrap_room, KVPoll.Bootstrapping)
 
         shard_idx = bootstrap_room % len(self.transfer_queues)
         self.transfer_queues[shard_idx].put(
