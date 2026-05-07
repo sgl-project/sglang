@@ -35,6 +35,10 @@ from sglang.multimodal_gen.runtime.entrypoints.utils import (
     ShutdownReq,
     UnmergeLoraWeightsReq,
 )
+from sglang.multimodal_gen.runtime.ipc_array import (
+    is_local_endpoint,
+    spill_large_arrays_to_file_refs,
+)
 from sglang.multimodal_gen.runtime.managers.cpu_worker import CPUWorker
 from sglang.multimodal_gen.runtime.managers.dynamic_batch_admission import (
     BatchAdmissionController,
@@ -608,7 +612,32 @@ class Scheduler(SchedulerDisaggMixin):
         replies to client, only on rank 0
         """
         if not is_warmup and self.receiver is not None and identity is not None:
-            self.receiver.send_multipart([identity, b"", pickle.dumps(output_batch)])
+            if is_local_endpoint(self.server_args.scheduler_endpoint):
+                start_time = time.perf_counter()
+                output_batch.output = spill_large_arrays_to_file_refs(
+                    output_batch.output
+                )
+                if output_batch.metrics is not None:
+                    output_batch.metrics.record_stage(
+                        "Scheduler.return_result.spill_arrays",
+                        time.perf_counter() - start_time,
+                    )
+
+            start_time = time.perf_counter()
+            payload = pickle.dumps(output_batch)
+            if output_batch.metrics is not None:
+                output_batch.metrics.record_stage(
+                    "Scheduler.return_result.pickle",
+                    time.perf_counter() - start_time,
+                )
+
+            start_time = time.perf_counter()
+            self.receiver.send_multipart([identity, b"", payload])
+            if output_batch.metrics is not None:
+                output_batch.metrics.record_stage(
+                    "Scheduler.return_result.send",
+                    time.perf_counter() - start_time,
+                )
 
     def _try_merge_generation_reqs(self, reqs: List[Req]) -> Req | None:
         """Create a batched generation request from compatible requests.
