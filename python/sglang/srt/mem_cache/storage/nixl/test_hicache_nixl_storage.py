@@ -63,6 +63,10 @@ class TestNixlUnified(unittest.TestCase):
 
             shutil.rmtree(self.test_dir)
 
+    @staticmethod
+    def _open_fds() -> int:
+        return len(os.listdir("/proc/self/fd"))
+
     def delete_test_file(self, file_path: str) -> bool:
         """Helper method to delete a test file.
 
@@ -176,15 +180,19 @@ class TestNixlUnified(unittest.TestCase):
         dst1 = torch.zeros_like(value1)
         dst2 = torch.zeros_like(value2)
 
-        # Single set/get
+        # Single set/get; baseline after first set absorbs any one-time NIXL internals
         self.assertTrue(self.hicache.set(key1, value1))
+        fds = self._open_fds()
         retrieved1 = self.hicache.get(key1, dst1)
         self.verify_tensors_equal(value1, retrieved1)
+        self.assertEqual(self._open_fds(), fds, "fd leak after get")
 
         # Batch set/get
         self.assertTrue(self.hicache.batch_set([key2], [value2]))
+        self.assertEqual(self._open_fds(), fds, "fd leak after batch_set")
         retrieved2 = self.hicache.batch_get([key2], [dst2])
         self.verify_tensors_equal(value2, retrieved2[0])
+        self.assertEqual(self._open_fds(), fds, "fd leak after batch_get")
 
     def test_data_integrity(self):
         """Test data integrity across operations."""
