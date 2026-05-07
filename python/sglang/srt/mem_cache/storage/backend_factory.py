@@ -3,14 +3,30 @@
 
 import importlib
 import logging
-from typing import TYPE_CHECKING, Any, Dict
+from typing import Any, Dict
 
 from sglang.srt.mem_cache.hicache_storage import HiCacheStorage, HiCacheStorageConfig
 
-if TYPE_CHECKING:
-    pass
-
 logger = logging.getLogger(__name__)
+
+
+_BUILTIN_BACKENDS = [
+    ("file", "sglang.srt.mem_cache.hicache_storage", "HiCacheFile"),
+    ("nixl", "sglang.srt.mem_cache.storage.nixl.hicache_nixl", "HiCacheNixl"),
+    (
+        "mooncake",
+        "sglang.srt.mem_cache.storage.mooncake_store.mooncake_store",
+        "MooncakeStore",
+    ),
+    ("hf3fs", "sglang.srt.mem_cache.storage.hf3fs.storage_hf3fs", "HiCacheHF3FS"),
+    (
+        "aibrix",
+        "sglang.srt.mem_cache.storage.aibrix_kvcache.aibrix_kvcache_storage",
+        "AibrixKVCacheStorage",
+    ),
+    ("eic", "sglang.srt.mem_cache.storage.eic.eic_storage", "EICStorage"),
+    ("simm", "sglang.srt.mem_cache.storage.simm.hicache_simm", "HiCacheSiMM"),
+]
 
 
 class StorageBackendFactory:
@@ -157,20 +173,8 @@ class StorageBackendFactory:
         storage_config: HiCacheStorageConfig,
         mem_pool_host: Any,
     ) -> HiCacheStorage:
-        """Create built-in backend with original initialization logic."""
-        if backend_name == "file":
-            return backend_class(storage_config)
-        elif backend_name == "nixl":
-            return backend_class(storage_config)
-        elif backend_name == "mooncake":
-            backend = backend_class(storage_config, mem_pool_host)
-            return backend
-        elif backend_name == "aibrix":
-            backend = backend_class(storage_config, mem_pool_host)
-            return backend
-        elif backend_name == "hf3fs":
-            # Calculate bytes_per_page based on memory pool layout
-            if mem_pool_host.layout in ["page_first", "page_first_direct"]:
+        if backend_name == "hf3fs":
+            if mem_pool_host.layout in ("page_first", "page_first_direct"):
                 bytes_per_page = (
                     mem_pool_host.get_ksize_per_token() * mem_pool_host.page_size
                 )
@@ -178,54 +182,13 @@ class StorageBackendFactory:
                 bytes_per_page = (
                     mem_pool_host.get_size_per_token() * mem_pool_host.page_size
                 )
-
-            dtype = mem_pool_host.dtype
-            return backend_class.from_env_config(bytes_per_page, dtype, storage_config)
-        elif backend_name == "eic":
-            return backend_class(storage_config, mem_pool_host)
-        elif backend_name == "simm":
-            return backend_class(storage_config, mem_pool_host)
-        else:
-            raise ValueError(f"Unknown built-in backend: {backend_name}")
+            return backend_class.from_env_config(
+                bytes_per_page, mem_pool_host.dtype, storage_config
+            )
+        if backend_name in ("file", "nixl"):
+            return backend_class(storage_config)
+        return backend_class(storage_config, mem_pool_host)
 
 
-# Register built-in storage backends
-StorageBackendFactory.register_backend(
-    "file", "sglang.srt.mem_cache.hicache_storage", "HiCacheFile"
-)
-
-StorageBackendFactory.register_backend(
-    "nixl",
-    "sglang.srt.mem_cache.storage.nixl.hicache_nixl",
-    "HiCacheNixl",
-)
-
-StorageBackendFactory.register_backend(
-    "mooncake",
-    "sglang.srt.mem_cache.storage.mooncake_store.mooncake_store",
-    "MooncakeStore",
-)
-
-StorageBackendFactory.register_backend(
-    "hf3fs",
-    "sglang.srt.mem_cache.storage.hf3fs.storage_hf3fs",
-    "HiCacheHF3FS",
-)
-
-StorageBackendFactory.register_backend(
-    "aibrix",
-    "sglang.srt.mem_cache.storage.aibrix_kvcache.aibrix_kvcache_storage",
-    "AibrixKVCacheStorage",
-)
-
-StorageBackendFactory.register_backend(
-    "eic",
-    "sglang.srt.mem_cache.storage.eic.eic_storage",
-    "EICStorage",
-)
-
-StorageBackendFactory.register_backend(
-    "simm",
-    "sglang.srt.mem_cache.storage.simm.hicache_simm",
-    "HiCacheSiMM",
-)
+for _name, _module_path, _class_name in _BUILTIN_BACKENDS:
+    StorageBackendFactory.register_backend(_name, _module_path, _class_name)
