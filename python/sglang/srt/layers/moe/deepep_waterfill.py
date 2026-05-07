@@ -382,8 +382,8 @@ class DeepEPWaterfillBalancer:
         self.static_rank_load: Optional[Tensor] = None
         self._counts_buf: Optional[Tensor] = None
 
-    def update_static_rank_load(self):
-        """Keep a live reference to EPLB rank-load metadata when available."""
+    def try_bind_static_rank_load(self):
+        """Bind a live reference to EPLB rank-load metadata when available."""
         if envs.SGLANG_DISABLE_STATIC_WATERFILL.get():
             return
         from sglang.srt.eplb.expert_location import get_global_expert_location_metadata
