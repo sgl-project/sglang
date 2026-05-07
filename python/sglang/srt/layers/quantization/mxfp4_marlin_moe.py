@@ -8,7 +8,6 @@ from torch.nn import Module
 
 from sglang.srt.layers.moe.moe_runner.marlin import MarlinMoeQuantInfo
 from sglang.srt.layers.moe.utils import MoeRunnerBackend
-from sglang.srt.environ import envs
 from sglang.srt.utils import log_info_on_rank0
 from sglang.srt.utils.common import is_sm90_supported
 
@@ -111,13 +110,5 @@ class Mxfp4MarlinMoEMethod:
             is_k_full=True,
         )
         runner_output = self.runner.run(dispatch_output, quant_info=quant_info)
-
-        # When SGLANG_OPT_MXFP4_FUSE_RSF_SHARED_ADD is OFF, apply rsf here
-        # (mirroring the Blackwell Mxfp4FlashinferTrtllmMoEMethod pattern).
-        # When ON, rsf is applied later in maybe_fuse_routed_scale_and_shared_add.
-        if not envs.SGLANG_OPT_MXFP4_FUSE_RSF_SHARED_ADD.get():
-            rsf = layer.moe_runner_config.routed_scaling_factor
-            if rsf is not None and rsf != 1.0:
-                runner_output.hidden_states.mul_(rsf)
 
         return StandardCombineInput(hidden_states=runner_output.hidden_states)

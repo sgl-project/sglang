@@ -458,11 +458,6 @@ class Mxfp4FlashinferTrtllmMoEMethod:
             output=symm_output,
         )[0]
 
-        if not envs.SGLANG_OPT_MXFP4_FUSE_RSF_SHARED_ADD.get():
-            rsf = layer.moe_runner_config.routed_scaling_factor
-            if rsf is not None and rsf != 1.0:
-                output.mul_(rsf)
-
         return StandardCombineInput(hidden_states=output)
 
 
@@ -481,10 +476,9 @@ def maybe_fuse_routed_scale_and_shared_add(
         Mxfp4MarlinMoEMethod,
     )
 
-    fused = (
-        isinstance(experts.quant_method, Mxfp4FlashinferTrtllmMoEMethod)
-        or isinstance(experts.quant_method, Mxfp4MarlinMoEMethod)
-    ) and envs.SGLANG_OPT_MXFP4_FUSE_RSF_SHARED_ADD.get()
+    fused = isinstance(
+        experts.quant_method, (Mxfp4FlashinferTrtllmMoEMethod, Mxfp4MarlinMoEMethod)
+    )
     if fused:
         if shared is not None:
             return shared.add_(routed, alpha=routed_scaling_factor)
