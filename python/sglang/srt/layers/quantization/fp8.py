@@ -28,6 +28,7 @@ from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
 from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
 from sglang.srt.layers.moe.utils import (
     RoutingMethodType,
+    get_moe_a2a_backend,
     get_moe_padding_size,
     get_moe_runner_backend,
     get_moe_weight_sizes,
@@ -97,8 +98,8 @@ from sglang.srt.utils import (
 )
 
 if TYPE_CHECKING:
+    from sglang.srt.layers.moe.moe_runner.aiter import AiterMoeQuantInfo
     from sglang.srt.layers.moe.token_dispatcher import CombineInput, DispatchOutput
-    from sglang.srt.layers.moe.topk import TopKOutput
     from sglang.srt.layers.quantization.w4afp8 import W4AFp8Config
     from sglang.srt.models.utils import WeightsMapper
 
@@ -113,8 +114,6 @@ _use_hip_int4 = get_bool_env_var("SGLANG_INT4_WEIGHT") and _is_hip
 _use_aiter = envs.SGLANG_USE_AITER.get() and _is_hip
 
 if _use_aiter or _use_hip_int4:
-    from aiter import ActivationType, QuantType
-    from aiter.fused_moe import fused_moe
     from aiter.ops.shuffle import shuffle_weight
 
 if _use_aiter:
@@ -1521,11 +1520,21 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         if moe_runner_backend.is_auto():
             if self.is_deepgemm_moe_runner_backend_enabled():
                 moe_runner_backend = MoeRunnerBackend.DEEP_GEMM
+            elif (
+                _is_hip
+                and (_use_aiter or _use_hip_int4)
+                and get_moe_a2a_backend().is_none()
+            ):
+                # *EPMoE backends bypass self.runner via run_moe_core, and the
+                # AITER fused func is only registered for ("none", "aiter").
+                moe_runner_backend = MoeRunnerBackend.AITER
             else:
                 moe_runner_backend = MoeRunnerBackend.TRITON
+
         if (
             moe_runner_backend.is_deep_gemm()
             or moe_runner_backend.is_triton()
+            or moe_runner_backend.is_aiter()
             or moe_runner_backend.is_flashinfer_trtllm()
             or moe_runner_backend.is_flashinfer_trtllm_routed()
         ):
@@ -1590,16 +1599,17 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             )
             return StandardCombineInput(hidden_states=output)
 
-        if _is_hip:
-            ret = self.maybe_apply_hip_fused_experts(
+        if (
+            _is_hip
+            and getattr(self, "runner", None) is not None
+            and self.runner.runner_backend.is_aiter()
+        ):
+            quant_info = self.maybe_get_hip_aiter_quant_info(
                 layer,
-                x,
-                dispatch_output.topk_output,
-                moe_runner_config.activation,
                 moe_runner_config.no_combine,
             )
-            if ret is not None:
-                return StandardCombineInput(hidden_states=ret)
+            if quant_info is not None:
+                return self.runner.run(dispatch_output, quant_info)
 
         if get_moe_runner_backend().is_cutlass():
             from sglang.srt.layers.moe.cutlass_moe import cutlass_fused_experts_fp8
@@ -1790,69 +1800,36 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
         self._cutlass_buffers_ready = True
 
-    def maybe_apply_hip_fused_experts(
+    def maybe_get_hip_aiter_quant_info(
         self,
         layer: torch.nn.Module,
-        x: torch.Tensor,
-        topk_output: TopKOutput,
-        activation: str = "silu",
         no_combine: bool = False,
-    ) -> Optional[torch.Tensor]:
-        topk_weights, topk_ids, _ = topk_output
-        if _use_hip_int4:
-            # TODO: add triton kernel and add check _use_aiter
-            assert not no_combine, f"{no_combine=} is not supported."
-            return fused_moe(
-                x,
-                layer.w13_weight,
-                layer.w2_weight,
-                topk_weights,
-                topk_ids,
-                quant_type=QuantType.per_Token,
-                w1_scale=layer.w13_weight_scale1,
-                w2_scale=layer.w2_weight_scale1,
-                activation=(
-                    ActivationType.Silu if activation == "silu" else ActivationType.Gelu
-                ),
-            )
+    ) -> Optional["AiterMoeQuantInfo"]:
+        if not (_use_aiter or _use_hip_int4):
+            return None
+        assert not no_combine, f"{no_combine=} is not supported."
 
-        if _use_aiter:
-            assert not no_combine, f"{no_combine=} is not supported."
-            if self.block_quant:
-                return fused_moe(
-                    x,
-                    layer.w13_weight,
-                    layer.w2_weight,
-                    topk_weights,
-                    topk_ids,
-                    w1_scale=layer.w13_weight_scale_inv,
-                    w2_scale=layer.w2_weight_scale_inv,
-                    quant_type=QuantType.per_128x128,
-                    activation=(
-                        ActivationType.Silu
-                        if activation == "silu"
-                        else ActivationType.Gelu
-                    ),
-                    expert_mask=layer.dispatcher.expert_mask_gpu,
-                )
-            else:
-                return fused_moe(
-                    x,
-                    layer.w13_weight,
-                    layer.w2_weight,
-                    topk_weights,
-                    topk_ids,
-                    quant_type=QuantType.per_Token,
-                    w1_scale=layer.w13_weight_scale1,
-                    w2_scale=layer.w2_weight_scale1,
-                    activation=(
-                        ActivationType.Silu
-                        if activation == "silu"
-                        else ActivationType.Gelu
-                    ),
-                    expert_mask=layer.dispatcher.expert_mask_gpu,
-                )
-        return None
+        from sglang.srt.layers.moe.moe_runner.aiter import (
+            AiterMoeQuantInfo,
+            AiterQuantType,
+        )
+
+        if _use_aiter and self.block_quant:
+            quant_type = AiterQuantType.PER_128X128
+            w13_scale = layer.w13_weight_scale_inv
+            w2_scale = layer.w2_weight_scale_inv
+        else:
+            quant_type = AiterQuantType.PER_TOKEN
+            w13_scale = layer.w13_weight_scale1
+            w2_scale = layer.w2_weight_scale1
+        return AiterMoeQuantInfo(
+            w13_weight=layer.w13_weight,
+            w2_weight=layer.w2_weight,
+            quant_type=quant_type,
+            w13_scale=w13_scale,
+            w2_scale=w2_scale,
+            expert_mask=layer.dispatcher.expert_mask_gpu if _use_aiter else None,
+        )
 
 
 class Fp8KVCacheMethod(BaseKVCacheMethod):
