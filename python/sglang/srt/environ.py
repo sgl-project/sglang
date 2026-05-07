@@ -611,7 +611,6 @@ class Envs:
     SGLANG_DSV4_FIX_TP_ATTN_A2A_SCATTER = EnvBool(True)
 
     # Misc fix
-    SGLANG_FIX_ATTN_BACKEND_IDLE = EnvBool(True)
     SGLANG_FIX_PD_IDLE = EnvBool(True)
 
     # Symmetric Memory
