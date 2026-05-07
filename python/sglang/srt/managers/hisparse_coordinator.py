@@ -586,6 +586,91 @@ class HiSparseCoordinator:
         self._backup_done_event.wait(device_module.current_stream())
         self._has_pending_backup = False
 
+    def naive_load_topk(
+        self,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        top_k_tokens: torch.Tensor,
+        layer_id: int,
+    ) -> torch.Tensor:
+        """Load top-k selected tokens into device memory and return their device indices.
+
+        This is a naive per-request loop implementation for debugging/validation.
+        Production code uses swap_in_selected_pages (JIT CUDA kernel) instead.
+
+        Args:
+            req_pool_indices: Pool indices for each request.  Shape: (num_reqs,)
+            seq_lens: Sequence lengths for each request.  Shape: (num_reqs,)
+            top_k_tokens: Selected token positions per request.  Shape: (num_reqs, top_k)
+            layer_id: The layer to load KV cache for.
+
+        Returns:
+            Device KV cache indices for the selected tokens.  Shape: (num_reqs, top_k)
+        """
+        num_reqs = req_pool_indices.size(0)
+        top_k_indices = torch.full(
+            (num_reqs, self.top_k), -1, dtype=torch.int32, device=self.device
+        )
+
+        for i in range(num_reqs):
+            seq_len = int(seq_lens[i].item())
+            top_n = min(seq_len, self.top_k)
+            if top_n == 0:
+                continue
+
+            req_idx = int(req_pool_indices[i].item())
+            selected_tokens = top_k_tokens[i, :top_n].to(dtype=torch.int64)
+
+            assert torch.all(
+                selected_tokens >= 0
+            ), f"Req {req_idx}: selected tokens contain negative positions"
+            assert torch.all(selected_tokens < seq_len), (
+                f"Req {req_idx}: selected tokens {selected_tokens.tolist()} "
+                f"out of range for seq_len={seq_len}"
+            )
+
+            if seq_len <= self.device_buffer_size:
+                device_indices = self.req_to_device_buffer[req_idx, selected_tokens]
+            else:
+                device_indices = torch.empty(
+                    top_n, dtype=torch.int64, device=self.device
+                )
+
+                is_latest_token = selected_tokens == (seq_len - 1)
+                needs_host_load = ~is_latest_token
+
+                device_indices[is_latest_token] = self.req_to_device_buffer[
+                    req_idx, self.device_buffer_size
+                ]
+
+                num_to_load = int(needs_host_load.sum().item())
+                if num_to_load > 0:
+                    tokens_to_load = selected_tokens[needs_host_load]
+                    host_locs = self.req_to_host_pool[req_idx, tokens_to_load]
+
+                    invalid_mask = host_locs < 0
+                    if torch.any(invalid_mask):
+                        bad_positions = tokens_to_load[invalid_mask].tolist()
+                        raise AssertionError(
+                            f"Req {req_idx} (seq_len={seq_len}, layer={layer_id}): "
+                            f"missing host backup at token positions {bad_positions}"
+                        )
+
+                    buffer_locs = self.req_to_device_buffer[req_idx, :num_to_load]
+                    device_indices[needs_host_load] = buffer_locs
+
+                    self.mem_pool_host.load_to_device_per_layer(
+                        self.mem_pool_device,
+                        host_locs,
+                        buffer_locs,
+                        layer_id,
+                        io_backend="kernel",
+                    )
+
+            top_k_indices[i, :top_n] = device_indices.to(torch.int32)
+
+        return top_k_indices
+
     def abort_staging_request(self, req: Req) -> None:
         """Remove a request from the staging queue and free its host + device resources.
 
