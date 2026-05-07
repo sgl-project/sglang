@@ -1,20 +1,4 @@
-"""
-DeepSeek W4A16 MoE quantization method (SM90 / H200).
-
-Wraps Fp8MoEMethod to reuse the FP4-expert weight creation/loading, then
-overrides process_weights_after_loading to pre-interleave FP4 weights and
-MXFP4 block scales for the SM90 mixed-input CUTLASS kernel exposed by
-flashinfer-ai/flashinfer PR #3084, and overrides apply to call
-cutlass_fused_moe(..., use_w4_group_scaling=True) directly.
-
-This is the H200 counterpart to mxfp4_deepseek.py. The two share the same
-DSv4 FP4 checkpoint (SGLANG_DSV4_MODE=2604 SGLANG_DSV4_FP4_EXPERTS=1): weight
-shapes and dtypes are identical; only the post-load layout and the kernel
-call differ.
-
-Usage: --moe-runner-backend flashinfer_cutlass_wmxfp4a16 --moe-a2a-backend none
-       with SGLANG_DSV4_MODE=2604 SGLANG_DSV4_FP4_EXPERTS=1
-"""
+"""W4A16 (BF16 x MXFP4) MoE method for SM90/H200 via flashinfer cutlass_fused_moe."""
 
 from __future__ import annotations
 
@@ -104,7 +88,7 @@ def _dequant_mxfp4(
     return (values * scale).to(torch.bfloat16)
 
 
-class Mxfp4FlashinferCutlassMoEMethod:
+class Wmxfp4A16FlashinferCutlassMoEMethod:
     """W4A16 MoE method for DeepSeek-family models with FP4 expert weights on SM90.
 
     Wraps Fp8MoEMethod for weight creation/loading, but overrides
