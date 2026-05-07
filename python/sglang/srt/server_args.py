@@ -6512,7 +6512,14 @@ class ServerArgs:
         args.dp_size = args.data_parallel_size
         args.ep_size = args.expert_parallel_size
 
-        attrs = [attr.name for attr in dataclasses.fields(cls)]
+        # Some dataclass fields (e.g. stat_loggers) intentionally have no CLI
+        # surface and won't appear on the argparse Namespace. Skip them so the
+        # dataclass default applies.
+        attrs = [
+            attr.name
+            for attr in dataclasses.fields(cls)
+            if hasattr(args, attr.name)
+        ]
         return cls(**{attr: getattr(args, attr) for attr in attrs})
 
     def url(self, port: Optional[int] = None):
