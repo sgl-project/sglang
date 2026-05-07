@@ -2,6 +2,7 @@ from typing import Any, Optional
 
 from transformers.configuration_utils import PretrainedConfig
 from sglang.srt.utils import is_npu
+_is_npu = is_npu()
 
 class Step3p5Config(PretrainedConfig):
     model_type = "step3p5"
