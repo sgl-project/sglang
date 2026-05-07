@@ -3,7 +3,6 @@ from __future__ import annotations
 import abc
 import logging
 import threading
-from collections import defaultdict
 from dataclasses import dataclass
 from functools import wraps
 from typing import TYPE_CHECKING, Any, Callable, Optional
@@ -29,6 +28,10 @@ from sglang.jit_kernel.hicache import (
 )
 from sglang.jit_kernel.hicache import (
     transfer_hicache_one_layer_mla as jit_transfer_hicache_one_layer_mla,
+)
+from sglang.srt.mem_cache.host_allocator import (
+    ALLOC_MEMORY_FUNCS,
+    get_allocator_from_storage,
 )
 from sglang.srt.mem_cache.memory_pool import (
     KVCache,
@@ -76,20 +79,6 @@ def synchronized(func):
             return func(self, *args, **kwargs)
 
     return wrapper
-
-
-class HostTensorAllocator(abc.ABC):
-    def __init__(self):
-        """Initialize the HostTensorAllocator."""
-        self.dtype = None
-        self.dims = None
-
-    def allocate(self, dims: tuple, dtype: torch.dtype, device: str) -> torch.Tensor:
-        """Allocate a tensor of given dims and dtype on the memory."""
-        self.dtype = dtype
-        self.dims = dims
-        tensor = torch.empty(dims, dtype=dtype, device=device)
-        return tensor
 
 
 class HiSparseHostPoolMixin:
@@ -153,67 +142,6 @@ class HiSparseHostPoolMixin:
         )
         host_indices = req_to_host_pool[req_pool_idx, :host_len]
         return host_indices[host_indices >= 0]
-
-
-def get_allocator_from_storage(allocator_type):
-    if allocator_type == "mooncake":
-        try:
-            from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import (
-                MooncakeHostTensorAllocator,
-            )
-
-            return MooncakeHostTensorAllocator()
-        except ImportError:
-            logger.warning(
-                "Mooncake's tensor allocator requires mooncake >= 0.3.8.post1. "
-                "Please upgrade Mooncake by 'pip install mooncake-transfer-engine --upgrade'. "
-                "Fallback to use default allocator."
-            )
-            return HostTensorAllocator()
-    else:
-        return HostTensorAllocator()
-
-
-def alloc_with_host_register(
-    dims,
-    dtype: torch.dtype,
-    device: str,
-    pin_memory: bool,
-    allocator: HostTensorAllocator,
-) -> torch.Tensor:
-    """
-    Allocate tensor and register host memory with cudaHostRegister.
-    CudaHostRegister only applies when pin_memory=True.
-    """
-    buffer = allocator.allocate(dims, dtype=dtype, device=device)
-    if pin_memory:
-        torch.cuda.cudart().cudaHostRegister(
-            buffer.data_ptr(), buffer.numel() * buffer.element_size(), 0
-        )
-    return buffer
-
-
-def alloc_with_pin_memory(
-    dims,
-    dtype: torch.dtype,
-    device: str,
-    pin_memory: bool,
-    allocator: None,
-) -> torch.Tensor:
-    """
-    Allocate tensor using PyTorch's built-in pin_memory flag.
-    """
-    buffer = torch.empty(dims, dtype=dtype, device=device, pin_memory=pin_memory)
-    return buffer
-
-
-ALLOC_MEMORY_FUNCS = defaultdict(
-    lambda: alloc_with_host_register,
-    {
-        "npu": alloc_with_pin_memory,
-        "musa": alloc_with_pin_memory,
-    },
-)
 
 
 class HostKVCache(abc.ABC):
