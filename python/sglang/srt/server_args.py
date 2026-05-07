@@ -3321,11 +3321,27 @@ class ServerArgs:
                 self.speculative_moe_runner_backend
             ).is_flashinfer_trtllm(), "Currently speculative MoE runner backend doesn't support flashinfer_trtllm, please use triton or auto backend for speculative moe runner instead."
 
+        if self.speculative_algorithm is not None:
+            self.speculative_algorithm = self.speculative_algorithm.upper()
+
         self.speculative_algorithm = _resolve_speculative_algorithm_alias(
             self.speculative_algorithm,
             self.speculative_draft_model_path,
             trust_remote_code=self.trust_remote_code,
         )
+
+        if self.speculative_algorithm is not None:
+            from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+            from sglang.srt.speculative.spec_registry import CustomSpecAlgo
+
+            algo = SpeculativeAlgorithm.from_string(self.speculative_algorithm)
+
+            # TODO: move the per-algorithm validation below into spec module hooks.
+            if (
+                isinstance(algo, CustomSpecAlgo)
+                and algo.validate_server_args is not None
+            ):
+                algo.validate_server_args(self)
 
         if self.speculative_skip_dp_mlp_sync:
             assert self.speculative_algorithm == "EAGLE", (
@@ -5421,8 +5437,11 @@ class ServerArgs:
         parser.add_argument(
             "--speculative-algorithm",
             type=str,
-            choices=["DFLASH", "EAGLE", "EAGLE3", "NEXTN", "STANDALONE", "NGRAM"],
-            help="Speculative algorithm.",
+            help=(
+                "Speculative algorithm. Builtins: EAGLE, EAGLE3, NEXTN, STANDALONE, "
+                "NGRAM, DFLASH. Or any name registered via "
+                "`SpeculativeAlgorithm.register`."
+            ),
         )
         parser.add_argument(
             "--speculative-draft-model-path",
