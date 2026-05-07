@@ -139,11 +139,13 @@ class EAGLEDraftExtendCudaGraphRunner:
                 hf_config = self.model_runner.model_config.hf_config
                 eagle_config = getattr(hf_config, "eagle_config", None) or {}
                 # EAGLE-3 uses 3 aux hidden states by default
-                num_aux = len(
-                    eagle_config.get(
-                        "eagle_aux_hidden_state_layer_ids", [None, None, None]
+                num_aux = getattr(hf_config, "num_aux_hidden_states", None)
+                if num_aux is None:
+                    num_aux = len(
+                        eagle_config.get(
+                            "eagle_aux_hidden_state_layer_ids", [None, None, None]
+                        )
                     )
-                )
                 target_hidden = (
                     hf_config.target_hidden_size
                     if hasattr(hf_config, "target_hidden_size")

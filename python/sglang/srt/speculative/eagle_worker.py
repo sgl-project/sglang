@@ -1136,14 +1136,23 @@ class EAGLEWorker(TpModelWorker):
                 and self.eagle_use_aux_hidden_state
             ):
                 eagle_config = (
-                    getattr(self.model_config.hf_config, "eagle_config", None) or {}
+                    getattr(target_cfg.hf_config, "eagle_config", None) or {}
                 )
-                num_aux = len(
-                    eagle_config.get(
-                        "eagle_aux_hidden_state_layer_ids", [None, None, None]
+                num_aux = getattr(
+                    target_cfg.hf_config, "num_aux_hidden_states", None
+                )
+                if num_aux is None:
+                    num_aux = len(
+                        eagle_config.get(
+                            "eagle_aux_hidden_state_layer_ids", [None, None, None]
+                        )
                     )
+                target_hidden = getattr(
+                    target_cfg.hf_config,
+                    "target_hidden_size",
+                    target_cfg.hidden_size,
                 )
-                hidden_size = target_cfg.hidden_size * num_aux
+                hidden_size = target_hidden * num_aux
             else:
                 hidden_size = target_cfg.spec_hidden_size
             draft_extend_input = EagleDraftInput.create_idle_input(
