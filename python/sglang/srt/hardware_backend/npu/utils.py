@@ -186,7 +186,7 @@ def get_indexer_weight_stream():
     return indexer_weight_stream
 
 
-def init_zbal(tp_size, gpu_id, tp_rank, do_check=True):
+def init_zbal(world_size, gpu_id, world_rank, do_check=True):
     """
     init zbal, if is mix alloc mode, only register for sma & comm
     """
@@ -204,14 +204,14 @@ def init_zbal(tp_size, gpu_id, tp_rank, do_check=True):
     else:
         if envs.SGLANG_ZBAL_BOOTSTRAP_URL.get():
             ret = zbal_init(
-                tp_size,
+                world_size,
                 gpu_id,
-                tp_rank,
+                world_rank,
                 zbal_mem_size * (1024**2),
                 ip_port=envs.SGLANG_ZBAL_BOOTSTRAP_URL.get(),
             )
         else:
-            ret = zbal_init(tp_size, gpu_id, tp_rank, zbal_mem_size * (1024**2))
+            ret = zbal_init(world_size, gpu_id, world_rank, zbal_mem_size * (1024**2))
 
         gva_is_inited = True
 
@@ -274,6 +274,8 @@ def lazy_init_zbal_gva_mem(
         logger.error(f"[ZBAL] zbal lazy init failed!")
         sys.exit(-1)
     return res
+
+
 share_stream = None
 routed_stream = None
 
