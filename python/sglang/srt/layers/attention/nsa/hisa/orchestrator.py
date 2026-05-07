@@ -1,18 +1,15 @@
 """Default decode/prefill orchestrators — paged pool-K cache + triton hotspots.
 
-Same control flow as the tilelang fallback
-``fp8_native_hierarchy_paged_mqa_logits_tilelang_with_pool_cache`` in
-``hisa/custom_ops.py``, but stages 2 and 4 swap to triton ports:
+Pipeline:
 
     1) tail_only       (tilelang for K>=paged_block, triton for K<paged_block)
-    2) block-MQA       (→ triton batch_decode_pool_mqa_triton, 1-3.5x faster)
-    3) torch.topk      (unchanged)
-    4) sparse-paged    (→ triton sparse_paged_mqa_triton, 6-15x faster)
+    2) block-MQA       (→ triton batch_decode_pool_mqa_triton)
+    3) fast_topk_runtime
+    4) sparse-paged    (→ triton sparse_paged_mqa_triton)
 
-Per-step on decode (B=10, ctx=65K): ~12 ms / step vs the all-tilelang
-fallback at the indexer level (steady-state ~5 ms vs ~17 ms). Correctness:
-fp8 ULP drift <= 2.6% rel, topk-2048 IoU >= 0.997 vs tilelang — within fp8
-accumulation noise, no e2e regression expected.
+Per-step on decode (B=10, ctx=65K): ~12 ms / step at the indexer level.
+Correctness: fp8 ULP drift <= 2.6% rel, topk-2048 IoU >= 0.997 vs reference
+tilelang baseline — within fp8 accumulation noise, no e2e regression expected.
 """
 
 from __future__ import annotations
@@ -185,11 +182,9 @@ def fp8_native_hierarchy_mqa_logits(
     k_block_size: int,
     block_topk: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Mixed-stage ragged prefill hierarchy MQA. Mirrors the tilelang
-    ``fp8_native_hierarchy_mqa_logits_tilelang_legacy`` but routes around its K<64 OOB by
-    using bounds-safe stage-1 variants. Stages 1-2 are tilelang at all K
-    (per A/B in test_grouped_mean_pool / test_stage2_ab); stage 4 is split
-    by K (test_stage4_full_ab at sq=8192, skv∈{8K..64K}).
+    """Mixed-stage ragged prefill hierarchy MQA. Stages 1-2 are tilelang
+    at all K (per A/B in test_grouped_mean_pool / test_stage2_ab); stage 4
+    is split by K (test_stage4_full_ab at sq=8192, skv∈{8K..64K}).
 
     Flow:
       1) ragged mean-pool — tilelang. ``..._grouped_interface`` when K<64

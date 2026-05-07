@@ -1,14 +1,11 @@
 """HISA tilelang kernels — production-active set.
 
-These three interface functions plus their prim-func bodies are the only
-tilelang kernels still on the production hot path:
+Three interface functions plus their prim-func bodies on the production
+hot path:
 
   - ``fp8_native_block_mean_pooling_interface`` (orchestrator stage 1, K>=64)
   - ``fp8_native_block_mean_pooling_grouped_interface`` (orchestrator stage 1, K<64)
   - ``fp8_native_paged_mean_pooling_completed_blocks_interface`` (pool-K cache writeback)
-
-All other tilelang code (legacy orchestrators, ablation variants, torch-ref
-impls) lives in ``tilelang_legacy.py`` and is slated for removal.
 """
 
 import tilelang

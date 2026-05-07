@@ -46,13 +46,7 @@ from sglang.srt.layers.attention.nsa.hisa.orchestrator import (
     fp8_native_hierarchy_mqa_logits,
     fp8_native_hierarchy_paged_mqa_logits,
 )
-from sglang.srt.layers.attention.nsa.hisa.orchestrator_legacy import (
-    fp8_native_hierarchy_paged_mqa_logits_no_pool_cache,
-)
 from sglang.srt.layers.attention.nsa.hisa.pool_k_cache import HisaNSATokenToKVPool
-from sglang.srt.layers.attention.nsa.hisa.tilelang_legacy import (
-    fp8_native_hierarchy_paged_mqa_logits_tilelang_legacy,
-)
 from sglang.srt.layers.attention.nsa.utils import (
     cp_all_gather_rerange_output,
     is_nsa_enable_prefill_cp,
@@ -501,84 +495,48 @@ class HisaIndexer(MultiPlatformOp):
         # and it is necessary to extract the actual q length.
         q_offset = sum(metadata.get_nsa_extend_len_cpu())
 
-        # ---- hisa kernel ----
-        # Dispatch:
-        #   cache enabled (default) + default          → fp8_native_hierarchy_paged_mqa_logits          (triton hot, default)
-        #   cache enabled (default) + DISABLE_TRITON=1 → ..._tilelang_with_pool_cache                   (tilelang fallback)
-        #   cache disabled (DISABLE_POOL_CACHE=1) + k>=64 → ..._tilelang_legacy                        (no-cache tilelang baseline)
-        #   cache disabled (DISABLE_POOL_CACHE=1) + k<64  → ..._no_pool_cache                         (no-cache all-triton, SK14)
-        # The default + cache path is k<64-capable too (tail_only + update_pool
-        # tilelang kernels can't handle k<64; routed through their triton ports
-        # in pool_k_cache.py and orchestrator.py).
+        # ---- hisa kernel: paged decode through pool-K cache ----
         kv_pool = forward_batch.token_to_kv_pool
-        use_pool_cache = isinstance(kv_pool, HisaNSATokenToKVPool)
-        small_k_block = self.hisa_k_block_size < 64
-        if small_k_block and not use_pool_cache:
-            block_sparse_logits, topk_block_indices = (
-                fp8_native_hierarchy_paged_mqa_logits_no_pool_cache(
-                    q_fp8=q_fp8[:q_offset],
-                    kv_cache_fp8=kv_cache_fp8,
-                    weights=weights[:q_offset],
-                    context_lens=seqlens_32[:q_offset],
-                    block_tables=block_tables[:q_offset],
-                    k_block_size=self.hisa_k_block_size,
-                    block_topk=self.hisa_block_topk,
-                    max_seq_len=max_seq_len,
-                )
+        assert isinstance(kv_pool, HisaNSATokenToKVPool), (
+            "HisaIndexer requires HisaNSATokenToKVPool"
+        )
+        pool_k_pages = kv_pool.get_pool_k_pages(layer_id)
+        pool_page_tables = kv_pool.get_pool_page_tables(
+            forward_batch.req_pool_indices,
+        )  # [B, max_pool_pages_per_req] int32 (full col cap)
+        # Pool-domain DG schedule_metadata. Same getattr-fallback pattern
+        # as the main paged path (nsa_indexer.py:478-483) — backend may
+        # pre-compute it once per forward; otherwise we build it here.
+        pool_schedule = getattr(
+            metadata,
+            "pool_paged_mqa_schedule_metadata",
+            None,
+        )
+        if pool_schedule is None and _is_cuda:
+            npbpr = (
+                seqlens_32[:q_offset] + self.hisa_k_block_size - 1
+            ) // self.hisa_k_block_size
+            pool_schedule = deep_gemm.get_paged_mqa_logits_metadata(
+                npbpr,
+                kv_pool.pool_page_size,
+                self.sm_count,
             )
-        elif use_pool_cache:
-            pool_k_pages = kv_pool.get_pool_k_pages(layer_id)
-            pool_page_tables = kv_pool.get_pool_page_tables(
-                forward_batch.req_pool_indices,
-            )  # [B, max_pool_pages_per_req] int32 (full col cap)
-            # Pool-domain DG schedule_metadata. Same getattr-fallback pattern
-            # as the main paged path (nsa_indexer.py:478-483) — backend may
-            # pre-compute it once per forward; otherwise we build it here.
-            pool_schedule = getattr(
-                metadata,
-                "pool_paged_mqa_schedule_metadata",
-                None,
+        block_sparse_logits, topk_block_indices = (
+            fp8_native_hierarchy_paged_mqa_logits(
+                q_fp8=q_fp8[:q_offset],
+                kv_cache_fp8=kv_cache_fp8,
+                pool_k_pages=pool_k_pages,
+                pool_page_tables=pool_page_tables[:q_offset].contiguous(),
+                weights=weights[:q_offset],
+                context_lens=seqlens_32[:q_offset],
+                block_tables=block_tables[:q_offset],
+                k_block_size=self.hisa_k_block_size,
+                pool_page_size=kv_pool.pool_page_size,
+                block_topk=self.hisa_block_topk,
+                max_seq_len=max_seq_len,
+                schedule_metadata=pool_schedule,
             )
-            if pool_schedule is None and _is_cuda:
-                npbpr = (
-                    seqlens_32[:q_offset] + self.hisa_k_block_size - 1
-                ) // self.hisa_k_block_size
-                pool_schedule = deep_gemm.get_paged_mqa_logits_metadata(
-                    npbpr,
-                    kv_pool.pool_page_size,
-                    self.sm_count,
-                )
-            block_sparse_logits, topk_block_indices = (
-                fp8_native_hierarchy_paged_mqa_logits(
-                    q_fp8=q_fp8[:q_offset],
-                    kv_cache_fp8=kv_cache_fp8,
-                    pool_k_pages=pool_k_pages,
-                    pool_page_tables=pool_page_tables[:q_offset].contiguous(),
-                    weights=weights[:q_offset],
-                    context_lens=seqlens_32[:q_offset],
-                    block_tables=block_tables[:q_offset],
-                    k_block_size=self.hisa_k_block_size,
-                    pool_page_size=kv_pool.pool_page_size,
-                    block_topk=self.hisa_block_topk,
-                    max_seq_len=max_seq_len,
-                    schedule_metadata=pool_schedule,
-                )
-            )
-        else:
-            block_sparse_logits, topk_block_indices = (
-                fp8_native_hierarchy_paged_mqa_logits_tilelang_legacy(
-                    q_fp8[:q_offset],
-                    kv_cache_fp8,
-                    weights[:q_offset],
-                    seqlens_32,
-                    block_tables,
-                    schedule_metadata,
-                    max_model_len=max_seq_len,
-                    max_seq_len=max_seq_len,
-                    k_block_size=self.hisa_k_block_size,
-                    block_topk=self.hisa_block_topk,
-                )
-            )
+        )
         # Hisa paged output has a leading next_n=1 dim; squeeze.
         block_sparse_logits = block_sparse_logits.squeeze(
             1
@@ -744,11 +702,11 @@ class HisaIndexer(MultiPlatformOp):
         else:
             k_fp8 = k_fp8.view(torch.float8_e4m3fn)
 
-        # Hisa's fp8_native_hierarchy_mqa_logits_tilelang_legacy consumes k_scale as uint8
-        # [N, 4] — which is exactly what get_index_k_scale_buffer returns
-        # ("k_scale: (seq_len, 4), uint8"). No conversion needed.
-        # (Baseline Indexer does .view(torch.float32).squeeze(-1) because
-        # deep_gemm.fp8_mqa_logits wants flat [N] float32.)
+        # Hisa consumes k_scale as uint8 [N, 4] — which is exactly what
+        # get_index_k_scale_buffer returns ("k_scale: (seq_len, 4), uint8").
+        # No conversion needed. (Baseline NSA Indexer does
+        # .view(torch.float32).squeeze(-1) because deep_gemm.fp8_mqa_logits
+        # wants flat [N] float32.)
         kv_fp8 = (k_fp8, k_scale)
 
         # Check if we need to chunk to avoid OOM
