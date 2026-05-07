@@ -428,10 +428,10 @@ class TestPrefillDelayerTokenUsageLowWatermark(CustomTestCase):
 
 
 class TestPrefillDelayerAccuracy(CustomTestCase):
-    def test_1_mgsm_en_has_prefill_delayer(self):
+    def test_1_gsm8k_has_prefill_delayer(self):
         self._run_accuracy_test(prefill_delayer=True)
 
-    def test_2_mgsm_en_no_prefill_delayer(self):
+    def test_2_gsm8k_no_prefill_delayer(self):
         self._run_accuracy_test(prefill_delayer=False)
 
     def _run_accuracy_test(self, prefill_delayer: bool):
@@ -454,14 +454,14 @@ class TestPrefillDelayerAccuracy(CustomTestCase):
             args = SimpleNamespace(
                 base_url=base_url,
                 model=model,
-                eval_name="mgsm_en",
+                eval_name="gsm8k",
                 num_examples=None,
                 num_threads=1024,
             )
             metrics = run_eval(args)
-            print(f"=== mgsm_en ({prefill_delayer=}) ===")
+            print(f"=== gsm8k ({prefill_delayer=}) ===")
             print(f"{metrics=}")
-            self.assertGreater(metrics["score"], 0.87)
+            self.assertGreater(metrics["score"], 0.57)
         finally:
             kill_process_tree(process.pid)
 

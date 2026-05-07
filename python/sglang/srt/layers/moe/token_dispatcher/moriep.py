@@ -19,7 +19,11 @@ from sglang.srt.layers.moe.utils import (
     DeepEPMode,
     is_tbo_enabled,
 )
-from sglang.srt.utils import get_bool_env_var, get_int_env_var, is_hip
+from sglang.srt.utils import (
+    get_bool_env_var,
+    get_int_env_var,
+    is_hip,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.single_batch_overlap import CombineOverlapArgs
@@ -186,6 +190,7 @@ def init_mori_op(
     instance_id=0,
     fp8_dispatch=False,
     fp4_dispatch=False,
+    enable_sdma=False,
 ):
 
     import mori
@@ -214,7 +219,7 @@ def init_mori_op(
         mori.shmem.shmem_torch_process_group_init(group_name)
 
     mode = EpMode.INTRA_NODE if world_size <= 8 else EpMode.INTER_NODE
-    async_mode = deepep_mode.enable_low_latency()
+    async_mode = deepep_mode.enable_low_latency() or enable_sdma
     if async_mode:
         mode = EpMode.LOW_LATENCY
 
@@ -261,10 +266,23 @@ def init_mori_op(
         f"{combine_quant_type=}"
     )
 
-    mori_config = mori.ops.EpDispatchCombineConfig(
+    def check_mori_compatibility(kwargs: dict) -> None:
+        """Remove kwargs not accepted by the installed mori's EpDispatchCombineConfig."""
+        import dataclasses
+
+        config_cls = mori.ops.EpDispatchCombineConfig
+        valid_kwargs = {f.name for f in dataclasses.fields(config_cls)}
+
+        invalid_kwargs = set(kwargs.keys()) - valid_kwargs
+        for arg in invalid_kwargs:
+            logger.warning(f"[MORI compat] Removing incompatible argument {arg} ")
+            del kwargs[arg]
+
+    # Definition refer to https://github.com/ROCm/mori/blob/f9be5ee2e5ac87256b9523399ae9d4d0e8a54f53/python/mori/ops/dispatch_combine.py#L66-L121
+    common_kwargs = dict(
+        data_type=data_type,
         rank=rank,
         world_size=world_size,
-        data_type=data_type,
         hidden_dim=hidden_dim,
         scale_dim=scale_dim,
         scale_type_size=scale_type_size,
@@ -274,12 +292,19 @@ def init_mori_op(
         num_experts_per_token=router_topk,
         warp_num_per_block=warp_num_per_block,
         block_num=block_num,
+        max_total_recv_tokens=get_int_env_var(
+            "SGLANG_MORI_PREALLOC_MAX_RECV_TOKENS", 0
+        ),
         kernel_type=kernel_type,
         gpu_per_node=gpu_per_node,
         rdma_block_num=rdma_block_num,
-        num_qp_per_pe=2,
+        num_qp_per_pe=2,  # Number of queue pairs per processing element
         quant_type=combine_quant_type,
     )
+
+    check_mori_compatibility(common_kwargs)
+
+    mori_config = mori.ops.EpDispatchCombineConfig(**common_kwargs)
     mori_op = mori.ops.EpDispatchCombineOp(mori_config)
     return mori_op
 
@@ -337,6 +362,8 @@ class _MoriEPDispatcherImplBase:
             "SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK", 4096
         )
 
+        self.enable_sdma = get_bool_env_var("MORI_ENABLE_SDMA", "false")
+
         self._mori_op = None
         self.fp8_dispatch = False
         self.fp4_dispatch = False
@@ -364,6 +391,7 @@ class _MoriEPDispatcherImplBase:
                 self.instance_id,
                 self.fp8_dispatch,
                 self.fp4_dispatch,
+                self.enable_sdma,
             )
         return self._mori_op
 
@@ -580,13 +608,20 @@ class _MoriEPDispatcherImplNormal(_MoriEPDispatcherImplBase):
                 else:
                     comm_stream.wait_stream(compute_stream)
 
+                dispatch_fn = (
+                    self.mori_op.dispatch_send
+                    if self.enable_sdma
+                    else self.mori_op.dispatch
+                )
                 (
                     packed_recv_hidden,
                     recv_topk_weights,
                     recv_scales,
                     recv_topk_ids,
                     packed_recv_count,
-                ) = self.mori_op.dispatch(hidden_states, topk_weights, scale, topk_ids)
+                ) = dispatch_fn(hidden_states, topk_weights, scale, topk_ids)
+                if self.enable_sdma:
+                    self.mori_op.dispatch_recv()
 
                 if self.async_finish:
                     done_event = torch.cuda.Event(blocking=False, interprocess=False)
@@ -666,9 +701,14 @@ class _MoriEPDispatcherImplNormal(_MoriEPDispatcherImplBase):
                 else:
                     comm_stream.wait_stream(compute_stream)
 
-                combined_hidden_states = self.mori_op.combine(
-                    hidden_states, None, topk_ids
-                )[0]
+                combine_fn = (
+                    self.mori_op.combine_send
+                    if self.enable_sdma
+                    else self.mori_op.combine
+                )
+                combined_hidden_states = combine_fn(hidden_states, None, topk_ids)[0]
+                if self.enable_sdma:
+                    self.mori_op.combine_recv()
 
                 if self.async_finish:
                     done_event = torch.cuda.Event(blocking=False, interprocess=False)

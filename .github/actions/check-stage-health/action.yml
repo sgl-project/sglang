@@ -1,5 +1,5 @@
 name: Check Stage Health
-description: Fail fast if any job in the current workflow run has already failed. Auto-skips for scheduled runs.
+description: Fail fast if any job in the current workflow run has already failed, or if the lint check (from lint.yml) has failed. Auto-skips for scheduled runs.
 
 inputs:
   github-token:
@@ -29,6 +29,24 @@ runs:
             return;
           }
 
+          // Check lint status from the separate Lint workflow (lint.yml).
+          // listJobsForWorkflowRun only sees jobs within the SAME run, so we use
+          // checks.listForRef which queries by commit SHA across ALL workflows.
+          const ref = context.payload.pull_request?.head?.sha || context.sha;
+          const { data } = await github.rest.checks.listForRef({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            ref: ref,
+            check_name: 'lint',
+          });
+          const lintRun = data.check_runs.find(
+            cr => cr.app?.slug === 'github-actions'
+          );
+          if (lintRun?.status === 'completed' && lintRun?.conclusion === 'failure') {
+            core.setFailed('Fast-fail: lint check failed');
+            return;
+          }
+
           const jobs = await github.paginate(github.rest.actions.listJobsForWorkflowRun, {
             owner: context.repo.owner,
             repo: context.repo.repo,
@@ -38,6 +56,12 @@ runs:
           // Find jobs that failed from a real error, not from fast-fail cascade
           const rootCauseFailures = jobs.filter(j => {
             if (j.status !== 'completed' || j.conclusion !== 'failure') return false;
+            // h20 runners are flaky (dirty GPU state from prior runs); their failures
+            // should not cascade fast-fail to other stages. Exact match avoids
+            // accidentally matching the h200 job names.
+            if (j.name === 'stage-c-test-8-gpu-h20') {
+              return false;
+            }
             // If the failing step is the health check, it's a cascade — skip it
             const failedStep = (j.steps || []).find(s => s.conclusion === 'failure');
             if (failedStep && (failedStep.name.includes('check-stage-health') || failedStep.name.includes('Check stage health'))) {

@@ -13,9 +13,7 @@ from sglang.test.ci.ci_utils import TestFile, run_unittest_files
 suites = {
     # quantization_test suite migrated to test/registered/quant/
     # All CUDA tests migrated to test/registered/
-    "__not_in_ci__": [
-        TestFile("ascend/test_embed_interpolate_unittest.py"),
-    ],
+    "__not_in_ci__": [],
 }
 
 # Add AMD tests
@@ -77,7 +75,8 @@ suite_xeon = {
 # NOTE: please sort the test cases alphabetically by the test file name
 suite_xpu = {
     "per-commit-xpu": [
-        TestFile("xpu/test_deepseek_ocr.py"),
+        TestFile("xpu/test_deepseek_ocr.py", 360),
+        TestFile("xpu/test_deepseek_ocr_triton.py", 360),
         # TestFile("xpu/test_internvl.py"),
         TestFile("xpu/test_intel_xpu_backend.py"),
     ],

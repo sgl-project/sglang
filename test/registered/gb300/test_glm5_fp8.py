@@ -8,7 +8,7 @@ from sglang.test.test_utils import ModelLaunchSettings
 
 register_cuda_ci(est_time=7200, suite="nightly-4-gpu-gb300", nightly=True)
 
-MODEL_PATH = "zai-org/GLM-5-FP8"
+MODEL_PATH = "zai-org/GLM-5.1-FP8"
 
 COMMON_ARGS = [
     "--trust-remote-code",
@@ -27,7 +27,7 @@ MTP_ARGS = [
 
 
 class TestGlm5Fp8(unittest.TestCase):
-    """GLM-5 FP8 on GB300 (4x B200 NVL4, tp=4)."""
+    """GLM-5.1 FP8 on GB300 (4x B200 NVL4, tp=4)."""
 
     def test_glm5_fp8(self):
         variants = [
@@ -56,7 +56,7 @@ class TestGlm5Fp8(unittest.TestCase):
 
         run_combined_tests(
             models=variants,
-            test_name="GLM-5-FP8",
+            test_name="GLM-5.1-FP8",
             accuracy_params=AccuracyTestParams(dataset="gsm8k", baseline_accuracy=0.92),
             performance_params=PerformanceTestParams(
                 profile_dir="performance_profiles_gb300",

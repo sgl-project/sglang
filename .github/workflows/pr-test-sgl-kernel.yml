@@ -27,7 +27,7 @@ on:
 env:
   SGLANG_IS_IN_CI: true
   SGLANG_CUDA_COREDUMP: "1"
-  SGLANG_PR_TEST_BYPASS_MAINTENANCE_ON_MAIN: ${{ github.ref == 'refs/heads/main' && 'true' || 'false' }}
+  PR_TEST_BYPASS_MAINTENANCE_ON_MAIN: ${{ github.ref == 'refs/heads/main' && 'true' || 'false' }}
   SKIP_STAGE_HEALTH_CHECK: ${{ inputs.skip_stage_health_check == true && 'true' || 'false' }}
 
 jobs:
@@ -53,7 +53,7 @@ jobs:
         with:
           path: sgl-kernel/dist/
           merge-multiple: true
-          pattern: wheel-python3.10-cuda12.9
+          pattern: wheel-python3.10-cuda*
 
       - name: Install dependencies
         timeout-minutes: 20
@@ -88,7 +88,7 @@ jobs:
         with:
           path: sgl-kernel/dist/
           merge-multiple: true
-          pattern: wheel-python3.10-cuda12.9
+          pattern: wheel-python3.10-cuda*
 
       - name: Install dependencies
         timeout-minutes: 20
@@ -123,7 +123,7 @@ jobs:
         with:
           path: sgl-kernel/dist/
           merge-multiple: true
-          pattern: wheel-python3.10-cuda12.9
+          pattern: wheel-python3.10-cuda*
 
       - name: Install dependencies
         timeout-minutes: 20
@@ -170,7 +170,7 @@ jobs:
         with:
           path: sgl-kernel/dist/
           merge-multiple: true
-          pattern: wheel-python3.10-cuda12.9
+          pattern: wheel-python3.10-cuda*
 
       - name: Install dependencies
         timeout-minutes: 20
@@ -183,9 +183,9 @@ jobs:
           cd sgl-kernel
           pytest tests/
 
-  # Adding a single CUDA13 smoke test to verify that the kernel builds and runs
+  # Adding a single CUDA13 build-and-run check for the kernel
   # TODO: Add back this test when it can pass on CI
-  # cuda13-kernel-smoke-test:
+  # cuda13-kernel-build-check:
   #   if: inputs.sgl_kernel == 'true'
   #   runs-on: x64-cu13-kernel-tests
   #   steps:
@@ -201,7 +201,7 @@ jobs:
   #       with:
   #         path: sgl-kernel/dist/
   #         merge-multiple: true
-  #         pattern: wheel-python3.10-cuda13.0
+  #         pattern: wheel-python3.10-cuda*
 
   #     - name: Install dependencies
   #       run: |
