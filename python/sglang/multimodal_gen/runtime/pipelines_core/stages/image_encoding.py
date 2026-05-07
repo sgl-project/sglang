@@ -497,7 +497,7 @@ class LTX2ImageEncodingStage(PipelineStage):
             configure_layerwise_offload_modules(
                 modules,
                 server_args,
-                module_groups=server_args.layerwise_offload_modules,
+                module_groups=server_args.layerwise_offload_module_groups,
             )
         return True
 

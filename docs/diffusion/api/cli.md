@@ -157,13 +157,13 @@ For diffusers pipelines, Cache-DiT can be enabled with `SGLANG_CACHE_DIT_ENABLED
 
 ### Layerwise Offload
 
-Use layerwise offload when a large component does not fit comfortably in GPU memory. By default, `--dit-layerwise-offload` applies only to the DiT group. Use `--layerwise-offload-modules` to select additional component groups:
+Use layerwise offload when a large component does not fit comfortably in GPU memory. By default, `--dit-layerwise-offload` applies only to the DiT group. Use `--layerwise-offload-module-groups` to select additional component groups (`--layerwise-offload-modules` is accepted as an alias):
 
 ```bash
 sglang generate \
   --model-path Wan-AI/Wan2.2-T2V-A14B-Diffusers \
   --dit-layerwise-offload \
-  --layerwise-offload-modules dit encoder \
+  --layerwise-offload-module-groups dit encoder \
   --dit-offload-prefetch-size 0 \
   --prompt "A quiet city street after rain"
 ```

@@ -1,6 +1,6 @@
 from collections.abc import Sequence
 
-LAYERWISE_OFFLOAD_MODULE_CHOICES = (
+LAYERWISE_OFFLOAD_MODULE_GROUP_CHOICES = (
     "dit",
     "encoder",
     "bridge",
@@ -9,10 +9,10 @@ LAYERWISE_OFFLOAD_MODULE_CHOICES = (
     "vocoder",
     "all",
 )
-DEFAULT_LAYERWISE_OFFLOAD_MODULES = ("dit",)
+DEFAULT_LAYERWISE_OFFLOAD_MODULE_GROUPS = ("dit",)
 
 
-def normalize_layerwise_offload_modules(
+def normalize_layerwise_offload_module_groups(
     module_groups: str | Sequence[str] | None,
 ) -> list[str] | None:
     if module_groups is None:
@@ -23,17 +23,17 @@ def normalize_layerwise_offload_modules(
     for raw_group in raw_groups:
         if not isinstance(raw_group, str):
             raise ValueError(
-                f"Invalid layerwise offload module: {raw_group}. "
-                f"Must be one of: {', '.join(LAYERWISE_OFFLOAD_MODULE_CHOICES)}"
+                f"Invalid layerwise offload module group: {raw_group}. "
+                f"Must be one of: {', '.join(LAYERWISE_OFFLOAD_MODULE_GROUP_CHOICES)}"
             )
         for group in raw_group.split(","):
             group = group.strip().replace("-", "_").lower()
             if not group:
                 continue
-            if group not in LAYERWISE_OFFLOAD_MODULE_CHOICES:
+            if group not in LAYERWISE_OFFLOAD_MODULE_GROUP_CHOICES:
                 raise ValueError(
-                    f"Invalid layerwise offload module: {group}. "
-                    f"Must be one of: {', '.join(LAYERWISE_OFFLOAD_MODULE_CHOICES)}"
+                    f"Invalid layerwise offload module group: {group}. "
+                    f"Must be one of: {', '.join(LAYERWISE_OFFLOAD_MODULE_GROUP_CHOICES)}"
                 )
             if group == "all":
                 return ["all"]

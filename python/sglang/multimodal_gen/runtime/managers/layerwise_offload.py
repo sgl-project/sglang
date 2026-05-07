@@ -513,7 +513,7 @@ class LayerwiseOffloadManager:
 class LayerwiseOffloadableModuleMixin:
     """A mixin that registers forward hooks to enable layerwise offload."""
 
-    # Group used by --layerwise-offload-modules; DiT is the legacy default.
+    # Group used by --layerwise-offload-module-groups; DiT is the legacy default.
     layerwise_offload_module_group: str = "dit"
     # The list of names of this module's layer/block ModuleList or Sequential attributes.
     layer_names: List[str] = []
