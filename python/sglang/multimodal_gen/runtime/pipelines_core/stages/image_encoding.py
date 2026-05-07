@@ -18,10 +18,9 @@ import torch
 from diffusers.models.autoencoders.vae import DiagonalGaussianDistribution
 from diffusers.models.modeling_outputs import AutoencoderKLOutput
 
-from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
-    qwen_image_postprocess_text,
-)
+from sglang.multimodal_gen.configs.pipeline_configs.base import TextConditioningOutput
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
+from sglang.multimodal_gen.runtime.managers.component_manager import ComponentUse
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.models.vaes.common import ParallelTiledVAE
 from sglang.multimodal_gen.runtime.models.vision_utils import (
@@ -118,6 +117,10 @@ class ImageEncodingStage(PipelineStage):
         "image_embeds",
         "prompt_embeds",
         "negative_prompt_embeds",
+        "prompt_embeds_mask",
+        "negative_prompt_embeds_mask",
+        "prompt_seq_lens",
+        "negative_prompt_seq_lens",
     )
 
     def __init__(
@@ -137,31 +140,50 @@ class ImageEncodingStage(PipelineStage):
         self.image_encoder = image_encoder
         self.text_encoder = text_encoder
 
-    def load_model(self):
-        if self.server_args.image_encoder_cpu_offload:
-            device = get_local_torch_device()
-            self.move_to_device(device)
+    def component_uses(
+        self, server_args: ServerArgs, stage_name: str | None = None
+    ) -> list[ComponentUse]:
+        stage_name = self._component_stage_name(stage_name)
+        uses = []
+        if self.image_encoder is not None:
+            uses.append(ComponentUse(stage_name, "image_encoder"))
+        if self.text_encoder is not None:
+            uses.append(ComponentUse(stage_name, "text_encoder"))
+        return uses
 
-    def offload_model(self):
-        if self.server_args.image_encoder_cpu_offload:
-            self.move_to_device("cpu")
+    def encoding_image_edit(self, outputs, image_inputs, pipeline_config):
+        """Encode image-edit text features via pipeline-configured postprocess hook."""
+        postprocess_funcs = getattr(pipeline_config, "postprocess_text_funcs", ())
+        if not postprocess_funcs or not callable(postprocess_funcs[0]):
+            raise ValueError(
+                "Image-edit pipeline requires a callable postprocess_text_funcs[0]."
+            )
 
-    def move_to_device(self, device):
-        if self.server_args.use_fsdp_inference:
-            return
-        fields = [
-            "image_processor",
-            "image_encoder",
-        ]
-        for field in fields:
-            processor = getattr(self, field, None)
-            if processor and hasattr(processor, "to"):
-                setattr(self, field, processor.to(device))
+        return postprocess_funcs[0](outputs, image_inputs)
 
-    def encoding_qwen_image_edit(self, outputs, image_inputs):
-        # encoder hidden state
-        prompt_embeds = qwen_image_postprocess_text(outputs, image_inputs, 64)
-        return prompt_embeds
+    @staticmethod
+    def _split_text_conditioning_output(output):
+        if isinstance(output, TextConditioningOutput):
+            return (
+                output.prompt_embeds,
+                output.prompt_embeds_mask,
+                output.prompt_seq_lens,
+            )
+        return output, None, None
+
+    @staticmethod
+    def _full_text_seq_lens(prompt_embeds: torch.Tensor) -> list[int]:
+        if prompt_embeds.ndim == 2:
+            return [int(prompt_embeds.shape[0])]
+        return [int(prompt_embeds.shape[1])] * int(prompt_embeds.shape[0])
+
+    @staticmethod
+    def _default_text_mask(prompt_embeds: torch.Tensor) -> torch.Tensor:
+        if prompt_embeds.ndim == 2:
+            shape = (1, prompt_embeds.shape[0])
+        else:
+            shape = prompt_embeds.shape[:2]
+        return torch.ones(shape, dtype=torch.bool, device=prompt_embeds.device)
 
     @torch.no_grad()
     def forward(
@@ -177,8 +199,6 @@ class ImageEncodingStage(PipelineStage):
             return batch
         cuda_device = get_local_torch_device()
 
-        self.load_model()
-
         image_processor_kwargs = (
             server_args.pipeline_config.prepare_image_processor_kwargs(batch)
         )
@@ -191,6 +211,10 @@ class ImageEncodingStage(PipelineStage):
 
         all_prompt_embeds = []
         all_neg_prompt_embeds = []
+        all_prompt_embeds_masks = []
+        all_neg_prompt_embeds_masks = []
+        all_prompt_seq_lens = []
+        all_neg_prompt_seq_lens = []
 
         image_processor_call_params = inspect.signature(
             self.image_processor.__call__
@@ -215,14 +239,20 @@ class ImageEncodingStage(PipelineStage):
 
             if self.image_encoder:
                 # if an image encoder is provided
-                with set_forward_context(current_timestep=0, attn_metadata=None):
-                    outputs = self.image_encoder(
-                        **image_inputs,
-                        **server_args.pipeline_config.image_encoder_extra_args,
-                    )
-                    image_embeds = server_args.pipeline_config.postprocess_image(
-                        outputs
-                    )
+                with self.use_declared_component(
+                    component_name="image_encoder",
+                    module=self.image_encoder,
+                ) as image_encoder:
+                    assert image_encoder is not None
+                    self.image_encoder = image_encoder
+                    with set_forward_context(current_timestep=0, attn_metadata=None):
+                        outputs = self.image_encoder(
+                            **image_inputs,
+                            **server_args.pipeline_config.image_encoder_extra_args,
+                        )
+                        image_embeds = server_args.pipeline_config.postprocess_image(
+                            outputs
+                        )
                 batch.image_embeds.append(image_embeds)
             elif self.text_encoder:
                 # if a text encoder is provided, e.g. Qwen-Image-Edit
@@ -243,37 +273,107 @@ class ImageEncodingStage(PipelineStage):
                         **neg_image_processor_kwargs,
                     ).to(cuda_device)
 
-                with set_forward_context(current_timestep=0, attn_metadata=None):
-                    outputs = self.text_encoder(
-                        input_ids=image_inputs.input_ids,
-                        attention_mask=image_inputs.attention_mask,
-                        pixel_values=image_inputs.pixel_values,
-                        image_grid_thw=image_inputs.image_grid_thw,
-                        output_hidden_states=True,
-                    )
-                    if batch.do_classifier_free_guidance:
-                        neg_outputs = self.text_encoder(
-                            input_ids=neg_image_inputs.input_ids,
-                            attention_mask=neg_image_inputs.attention_mask,
-                            pixel_values=neg_image_inputs.pixel_values,
-                            image_grid_thw=neg_image_inputs.image_grid_thw,
+                with self.use_declared_component(
+                    component_name="text_encoder",
+                    module=self.text_encoder,
+                ) as text_encoder:
+                    assert text_encoder is not None
+                    self.text_encoder = text_encoder
+                    with set_forward_context(current_timestep=0, attn_metadata=None):
+                        outputs = self.text_encoder(
+                            input_ids=image_inputs.input_ids,
+                            attention_mask=image_inputs.attention_mask,
+                            pixel_values=image_inputs.pixel_values,
+                            image_grid_thw=image_inputs.image_grid_thw,
                             output_hidden_states=True,
                         )
+                        if batch.do_classifier_free_guidance:
+                            neg_outputs = self.text_encoder(
+                                input_ids=neg_image_inputs.input_ids,
+                                attention_mask=neg_image_inputs.attention_mask,
+                                pixel_values=neg_image_inputs.pixel_values,
+                                image_grid_thw=neg_image_inputs.image_grid_thw,
+                                output_hidden_states=True,
+                            )
 
-                all_prompt_embeds.append(
-                    self.encoding_qwen_image_edit(outputs, image_inputs)
+                prompt_embeds, prompt_embeds_mask, prompt_seq_lens = (
+                    self._split_text_conditioning_output(
+                        self.encoding_image_edit(
+                            outputs, image_inputs, server_args.pipeline_config
+                        )
+                    )
+                )
+                all_prompt_embeds.append(prompt_embeds)
+                all_prompt_embeds_masks.append(prompt_embeds_mask)
+                all_prompt_seq_lens.extend(
+                    prompt_seq_lens
+                    if prompt_seq_lens is not None
+                    else self._full_text_seq_lens(prompt_embeds)
                 )
                 if batch.do_classifier_free_guidance:
-                    all_neg_prompt_embeds.append(
-                        self.encoding_qwen_image_edit(neg_outputs, neg_image_inputs)
+                    neg_prompt_embeds, neg_prompt_embeds_mask, neg_prompt_seq_lens = (
+                        self._split_text_conditioning_output(
+                            self.encoding_image_edit(
+                                neg_outputs,
+                                neg_image_inputs,
+                                server_args.pipeline_config,
+                            )
+                        )
+                    )
+                    all_neg_prompt_embeds.append(neg_prompt_embeds)
+                    all_neg_prompt_embeds_masks.append(neg_prompt_embeds_mask)
+                    all_neg_prompt_seq_lens.extend(
+                        neg_prompt_seq_lens
+                        if neg_prompt_seq_lens is not None
+                        else self._full_text_seq_lens(neg_prompt_embeds)
                     )
 
         if all_prompt_embeds:
             batch.prompt_embeds.append(torch.cat(all_prompt_embeds, dim=0))
+            if batch.prompt_embeds_mask is None:
+                batch.prompt_embeds_mask = []
+            batch.prompt_embeds_mask.append(
+                torch.cat(
+                    [
+                        (
+                            mask
+                            if mask is not None
+                            else self._default_text_mask(prompt_embeds)
+                        )
+                        for prompt_embeds, mask in zip(
+                            all_prompt_embeds, all_prompt_embeds_masks, strict=True
+                        )
+                    ],
+                    dim=0,
+                )
+            )
+            if batch.prompt_seq_lens is None:
+                batch.prompt_seq_lens = []
+            batch.prompt_seq_lens.append(all_prompt_seq_lens)
         if all_neg_prompt_embeds:
             batch.negative_prompt_embeds.append(torch.cat(all_neg_prompt_embeds, dim=0))
-
-        self.offload_model()
+            if batch.negative_prompt_embeds_mask is None:
+                batch.negative_prompt_embeds_mask = []
+            batch.negative_prompt_embeds_mask.append(
+                torch.cat(
+                    [
+                        (
+                            mask
+                            if mask is not None
+                            else self._default_text_mask(neg_prompt_embeds)
+                        )
+                        for neg_prompt_embeds, mask in zip(
+                            all_neg_prompt_embeds,
+                            all_neg_prompt_embeds_masks,
+                            strict=True,
+                        )
+                    ],
+                    dim=0,
+                )
+            )
+            if batch.negative_prompt_seq_lens is None:
+                batch.negative_prompt_seq_lens = []
+            batch.negative_prompt_seq_lens.append(all_neg_prompt_seq_lens)
 
         return batch
 
@@ -328,20 +428,22 @@ class LTX2ImageEncodingStage(PipelineStage):
         self._condition_image_encoder = None
         self._condition_image_encoder_dir = None
 
-    # -- device management (mirrors ImageVAEEncodingStage) ---------------
-
-    def load_model(self):
-        device = get_local_torch_device()
-        if self._condition_image_encoder is not None:
-            self._condition_image_encoder = self._condition_image_encoder.to(device)
-        else:
-            self.vae = self.vae.to(device)
-
-    def offload_model(self):
-        if self.server_args.vae_cpu_offload:
-            self.vae = self.vae.to("cpu")
-            if self._condition_image_encoder is not None:
-                self._condition_image_encoder = self._condition_image_encoder.to("cpu")
+    def component_uses(
+        self, server_args: ServerArgs, stage_name: str | None = None
+    ) -> list[ComponentUse]:
+        arch_config = server_args.pipeline_config.vae_config.arch_config
+        encoder_subdir = str(getattr(arch_config, "condition_encoder_subdir", ""))
+        stage_name = self._component_stage_name(stage_name)
+        if encoder_subdir:
+            return [
+                ComponentUse(
+                    stage_name,
+                    "condition_image_encoder",
+                )
+            ]
+        if self.vae is None:
+            return []
+        return [ComponentUse(stage_name, "vae")]
 
     # -- lazy condition encoder (LTX-2.3) --------------------------------
 
@@ -576,58 +678,61 @@ class LTX2ImageEncodingStage(PipelineStage):
         if len(batch.condition_image) == 1:
             batch.condition_image = batch.condition_image[0]
 
-        # 2. Load encoder(s) to device, cast to encode_dtype
+        # 2. Select encoder(s); residency manager moves it to device and dtype.
         use_condition_encoder = self._ensure_condition_image_encoder(server_args)
-        self.load_model()
 
         device = get_local_torch_device()
         encode_dtype = batch.latents.dtype
 
-        # Cast the active encoder to the latent precision (must match original
-        # behavior — running in a different dtype shifts the encoded latents).
         if use_condition_encoder:
-            self._condition_image_encoder = self._condition_image_encoder.to(
-                dtype=encode_dtype
-            )
+            component_name = "condition_image_encoder"
+            encoder = self._condition_image_encoder
         else:
-            self.vae = self.vae.to(dtype=encode_dtype)
+            component_name = "vae"
+            encoder = self.vae
 
         packed_latents = []
-        for conditioned_img in conditioned_imgs:
-            video_condition = self._pil_to_video_tensor(
-                conditioned_img,
-                width=int(batch.width),
-                height=int(batch.height),
-                device=device,
-                dtype=encode_dtype,
-            )
-
-            # 3. Encode
+        with self.use_declared_component(
+            component_name=component_name,
+            module=encoder,
+            target_dtype=encode_dtype,
+        ) as active_encoder:
+            assert active_encoder is not None
             if use_condition_encoder:
-                latent = self._condition_encode(video_condition, server_args).to(
-                    dtype=encode_dtype
-                )
+                self._condition_image_encoder = active_encoder
             else:
-                latent = self._vae_encode(video_condition, server_args, batch.generator)
+                self.vae = active_encoder
 
-            packed = server_args.pipeline_config.maybe_pack_latents(
-                latent, latent.shape[0], batch
-            )
-            if not (isinstance(packed, torch.Tensor) and packed.ndim == 3):
-                raise ValueError("Expected packed image latents [B, S0, D].")
-            if int(packed.shape[1]) != expected_tokens:
-                raise ValueError(
-                    f"LTX-2 conditioning token count mismatch: "
-                    f"{packed.shape[1]=} {expected_tokens=}."
+            for conditioned_img in conditioned_imgs:
+                video_condition = self._pil_to_video_tensor(
+                    conditioned_img,
+                    width=int(batch.width),
+                    height=int(batch.height),
+                    device=device,
+                    dtype=encode_dtype,
                 )
-            packed_latents.append(packed)
 
-        # Restore VAE to its config dtype (shared with decoding stage)
-        if not use_condition_encoder:
-            original_dtype = PRECISION_TO_TYPE[
-                server_args.pipeline_config.vae_precision
-            ]
-            self.vae = self.vae.to(dtype=original_dtype)
+                # 3. Encode
+                if use_condition_encoder:
+                    latent = self._condition_encode(video_condition, server_args).to(
+                        dtype=encode_dtype
+                    )
+                else:
+                    latent = self._vae_encode(
+                        video_condition, server_args, batch.generator
+                    )
+
+                packed = server_args.pipeline_config.maybe_pack_latents(
+                    latent, latent.shape[0], batch
+                )
+                if not (isinstance(packed, torch.Tensor) and packed.ndim == 3):
+                    raise ValueError("Expected packed image latents [B, S0, D].")
+                if int(packed.shape[1]) != expected_tokens:
+                    raise ValueError(
+                        f"LTX-2 conditioning token count mismatch: "
+                        f"{packed.shape[1]=} {expected_tokens=}."
+                    )
+                packed_latents.append(packed)
 
         batch.image_latent = (
             packed_latents[0] if len(packed_latents) == 1 else packed_latents
@@ -643,7 +748,6 @@ class LTX2ImageEncodingStage(PipelineStage):
                 batch.height,
             )
 
-        self.offload_model()
         return batch
 
     def build_dedup_fingerprint(
@@ -688,12 +792,18 @@ class ImageVAEEncodingStage(PipelineStage):
         super().__init__()
         self.vae: ParallelTiledVAE = vae
 
-    def load_model(self):
-        self.vae = self.vae.to(get_local_torch_device())
-
-    def offload_model(self):
-        if self.server_args.vae_cpu_offload:
-            self.vae = self.vae.to("cpu")
+    def component_uses(
+        self, server_args: ServerArgs, stage_name: str | None = None
+    ) -> list[ComponentUse]:
+        vae_dtype = PRECISION_TO_TYPE[server_args.pipeline_config.vae_precision]
+        stage_name = self._component_stage_name(stage_name)
+        return [
+            ComponentUse(
+                stage_name,
+                "vae",
+                target_dtype=vae_dtype,
+            )
+        ]
 
     def forward(
         self,
@@ -707,7 +817,6 @@ class ImageVAEEncodingStage(PipelineStage):
         if batch.condition_image is None:
             return batch
 
-        self.load_model()
         num_frames = batch.num_frames
 
         images = (
@@ -721,110 +830,115 @@ class ImageVAEEncodingStage(PipelineStage):
             server_args.pipeline_config, "prepare_condition_image_latent_ids", None
         )
         condition_latents = [] if callable(prepare_condition_image_latent_ids) else None
-        for image in images:
-            image = self.preprocess(
-                image,
-            ).to(get_local_torch_device(), dtype=torch.float32)
+        # Setup VAE precision
+        vae_dtype = PRECISION_TO_TYPE[server_args.pipeline_config.vae_precision]
+        vae_autocast_enabled = (
+            vae_dtype != torch.float32
+        ) and not server_args.disable_autocast
 
-            # (B, C, H, W) -> (B, C, 1, H, W)
-            image = image.unsqueeze(2)
+        with self.use_declared_component(component_name="vae", module=self.vae) as vae:
+            assert vae is not None
+            self.vae = vae
 
-            if num_frames == 1:
-                video_condition = image
-            else:
-                video_condition = torch.cat(
-                    [
-                        image,
-                        image.new_zeros(
-                            image.shape[0],
-                            image.shape[1],
-                            num_frames - 1,
-                            image.shape[3],
-                            image.shape[4],
-                        ),
-                    ],
-                    dim=2,
+            for image in images:
+                image = self.preprocess(
+                    image,
+                ).to(get_local_torch_device(), dtype=torch.float32)
+
+                # (B, C, H, W) -> (B, C, 1, H, W)
+                image = image.unsqueeze(2)
+
+                if num_frames == 1:
+                    video_condition = image
+                else:
+                    video_condition = torch.cat(
+                        [
+                            image,
+                            image.new_zeros(
+                                image.shape[0],
+                                image.shape[1],
+                                num_frames - 1,
+                                image.shape[3],
+                                image.shape[4],
+                            ),
+                        ],
+                        dim=2,
+                    )
+                video_condition = video_condition.to(
+                    device=get_local_torch_device(), dtype=torch.float32
                 )
-            video_condition = video_condition.to(
-                device=get_local_torch_device(), dtype=torch.float32
-            )
 
-            # Setup VAE precision
-            vae_dtype = PRECISION_TO_TYPE[server_args.pipeline_config.vae_precision]
-            vae_autocast_enabled = (
-                vae_dtype != torch.float32
-            ) and not server_args.disable_autocast
+                # Encode Image
+                with torch.autocast(
+                    device_type=current_platform.device_type,
+                    dtype=vae_dtype,
+                    enabled=vae_autocast_enabled,
+                ):
+                    if server_args.pipeline_config.vae_tiling:
+                        self.vae.enable_tiling()
+                    # if server_args.vae_sp:
+                    #     self.vae.enable_parallel()
+                    if not vae_autocast_enabled:
+                        video_condition = video_condition.to(vae_dtype)
+                    latent_dist: DiagonalGaussianDistribution = self.vae.encode(
+                        video_condition
+                    )
+                    # for auto_encoder from diffusers
+                    if isinstance(latent_dist, AutoencoderKLOutput):
+                        latent_dist = latent_dist.latent_dist
 
-            # Encode Image
-            with torch.autocast(
-                device_type=current_platform.device_type,
-                dtype=vae_dtype,
-                enabled=vae_autocast_enabled,
-            ):
-                if server_args.pipeline_config.vae_tiling:
-                    self.vae.enable_tiling()
-                # if server_args.vae_sp:
-                #     self.vae.enable_parallel()
-                if not vae_autocast_enabled:
-                    video_condition = video_condition.to(vae_dtype)
-                latent_dist: DiagonalGaussianDistribution = self.vae.encode(
-                    video_condition
+                generator = batch.generator
+                if generator is None:
+                    raise ValueError("Generator must be provided")
+
+                sample_mode = (
+                    server_args.pipeline_config.vae_config.encode_sample_mode()
                 )
-                # for auto_encoder from diffusers
-                if isinstance(latent_dist, AutoencoderKLOutput):
-                    latent_dist = latent_dist.latent_dist
 
-            generator = batch.generator
-            if generator is None:
-                raise ValueError("Generator must be provided")
-
-            sample_mode = server_args.pipeline_config.vae_config.encode_sample_mode()
-
-            latent_condition = self.retrieve_latents(
-                latent_dist, generator, sample_mode=sample_mode
-            )
-            latent_condition = server_args.pipeline_config.postprocess_vae_encode(
-                latent_condition, self.vae
-            )
-            normalized_latent_condition = (
-                server_args.pipeline_config.normalize_vae_encode(
+                latent_condition = self.retrieve_latents(
+                    latent_dist, generator, sample_mode=sample_mode
+                )
+                latent_condition = server_args.pipeline_config.postprocess_vae_encode(
                     latent_condition, self.vae
                 )
-            )
-            if normalized_latent_condition is None:
-                scaling_factor, shift_factor = (
-                    server_args.pipeline_config.get_decode_scale_and_shift(
-                        device=latent_condition.device,
-                        dtype=latent_condition.dtype,
-                        vae=self.vae,
+                normalized_latent_condition = (
+                    server_args.pipeline_config.normalize_vae_encode(
+                        latent_condition, self.vae
                     )
                 )
+                if normalized_latent_condition is None:
+                    scaling_factor, shift_factor = (
+                        server_args.pipeline_config.get_decode_scale_and_shift(
+                            device=latent_condition.device,
+                            dtype=latent_condition.dtype,
+                            vae=self.vae,
+                        )
+                    )
 
-                # apply shift & scale if needed
-                if isinstance(shift_factor, torch.Tensor):
-                    shift_factor = shift_factor.to(latent_condition.device)
+                    # apply shift & scale if needed
+                    if isinstance(shift_factor, torch.Tensor):
+                        shift_factor = shift_factor.to(latent_condition.device)
 
-                if isinstance(scaling_factor, torch.Tensor):
-                    scaling_factor = scaling_factor.to(latent_condition.device)
+                    if isinstance(scaling_factor, torch.Tensor):
+                        scaling_factor = scaling_factor.to(latent_condition.device)
 
-                latent_condition -= shift_factor
-                latent_condition = latent_condition * scaling_factor
-            else:
-                latent_condition = normalized_latent_condition
+                    latent_condition -= shift_factor
+                    latent_condition = latent_condition * scaling_factor
+                else:
+                    latent_condition = normalized_latent_condition
 
-            if condition_latents is not None:
-                condition_latents.append(latent_condition)
+                if condition_latents is not None:
+                    condition_latents.append(latent_condition)
 
-            image_latent = server_args.pipeline_config.postprocess_image_latent(
-                latent_condition, batch
-            )
-            all_image_latents.append(image_latent)
+                image_latent = server_args.pipeline_config.postprocess_image_latent(
+                    latent_condition, batch
+                )
+                all_image_latents.append(image_latent)
 
         batch.image_latent = torch.cat(all_image_latents, dim=1)
         if condition_latents is not None:
             prepare_condition_image_latent_ids(condition_latents, batch)
 
-        self.offload_model()
         return batch
 
     def build_dedup_fingerprint(
