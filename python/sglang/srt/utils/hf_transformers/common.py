@@ -52,6 +52,7 @@ from sglang.srt.configs import (
 from sglang.srt.configs.deepseek_ocr import DeepseekVLV2Config
 from sglang.srt.configs.internvl import InternVLChatConfig
 from sglang.srt.utils import get_bool_env_var, logger, lru_cache_frozenset
+from sglang.srt.utils.runai_utils import ObjectStorageModel, is_runai_obj_uri
 
 from ..hf_transformers_patches import normalize_rope_scaling_compat
 
@@ -100,6 +101,19 @@ _CONFIG_REGISTRY: Dict[str, Type[PretrainedConfig]] = {
     ]
 }
 
+# DeepSeek V3.2 reuses the V3 config schema. Subclass the upstream transformers
+# class with the V3.2 model_type so AutoConfig.register passes its consistency
+# check (which requires class.model_type == registered key).
+try:
+    from transformers import DeepseekV3Config as _HFDeepseekV3Config
+
+    class _DeepseekV32ConfigAlias(_HFDeepseekV3Config):
+        model_type = "deepseek_v32"
+
+    _CONFIG_REGISTRY["deepseek_v32"] = _DeepseekV32ConfigAlias
+except ImportError:
+    pass
+
 for name, cls in _CONFIG_REGISTRY.items():
     try:
         AutoConfig.register(name, cls)
@@ -125,6 +139,12 @@ def download_from_hf(
         allow_patterns = ["*.json", "*.bin", "*.model"]
 
     return snapshot_download(model_path, allow_patterns=allow_patterns)
+
+
+def resolve_runai_obj_uri(model_name_or_path: str) -> str:
+    if is_runai_obj_uri(model_name_or_path):
+        return ObjectStorageModel.get_path(model_name_or_path)
+    return model_name_or_path
 
 
 def _resolve_local_or_cached_file(model_name_or_path, filename, revision=None):
@@ -312,37 +332,6 @@ def _override_v_head_dim_if_zero(config: PretrainedConfig, patch: int = 128) -> 
         logger.warning(
             f"Overriding v_head_dim from 0 to {patch} to avoid potential issues."
         )
-
-
-def _load_deepseek_v32_model(
-    model_path: str,
-    trust_remote_code: bool = False,
-    revision: Optional[str] = None,
-    **kwargs,
-):
-    import tempfile
-
-    local_path = download_from_hf(model_path)
-    config_file = os.path.join(local_path, "config.json")
-    if not os.path.exists(config_file):
-        raise RuntimeError(f"Can't find config file in {local_path}.")
-
-    with open(config_file, "r") as f:
-        config_json = json.load(f)
-
-    config_json["architectures"] = ["DeepseekV3ForCausalLM"]
-    config_json["model_type"] = "deepseek_v3"
-
-    tmp_path = os.path.join(tempfile.gettempdir(), "_tmp_config_folder")
-    os.makedirs(tmp_path, exist_ok=True)
-
-    unique_path = os.path.join(tmp_path, f"deepseek_v32_{os.getpid()}")
-    with open(unique_path, "w") as f:
-        json.dump(config_json, f)
-
-    return AutoConfig.from_pretrained(
-        unique_path, trust_remote_code=trust_remote_code, revision=revision, **kwargs
-    )
 
 
 # ---------------------------------------------------------------------------
