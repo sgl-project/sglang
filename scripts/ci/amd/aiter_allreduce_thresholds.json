@@ -1,0 +1,18 @@
+{
+  "_comment": "Per-size upper bound (in ms) for AITER custom all-reduce, parsed by scripts/ci/amd/test_aiter_custom_allreduce_perf.py. A null value means no threshold is set yet for that size and the regression check is skipped (the value is still reported). Update with measured baseline (+ tolerance) to enable alerting.",
+  "tolerance_pct": 0.0,
+  "world_size_2": {
+    "32K": null,
+    "64K": null,
+    "128K": null,
+    "256K": null,
+    "512K": null,
+    "1M": null,
+    "2M": null,
+    "4M": null,
+    "8M": null,
+    "16M": null,
+    "32M": null,
+    "64M": null
+  }
+}
