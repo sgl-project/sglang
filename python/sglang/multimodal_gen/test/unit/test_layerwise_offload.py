@@ -84,6 +84,30 @@ class _NestedDummyModel(torch.nn.Module, LayerwiseOffloadableModuleMixin):
         self.encoder = _DummyModel()
 
 
+class _SharedBuffer(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.register_buffer(
+            "cache", torch.arange(12, dtype=torch.float32).reshape(6, 2)
+        )
+
+
+class _SharedBufferLayer(torch.nn.Module):
+    def __init__(self, shared: _SharedBuffer) -> None:
+        super().__init__()
+        self.shared = shared
+        self.weight = torch.nn.Parameter(torch.ones(2, 2, dtype=torch.float32))
+
+
+class _SharedBufferModel(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        shared = _SharedBuffer()
+        self.blocks = torch.nn.ModuleList(
+            [_SharedBufferLayer(shared), _SharedBufferLayer(shared)]
+        )
+
+
 class _NestedEncoderDummyModel(_NestedDummyModel):
     layerwise_offload_default_enabled = False
 
@@ -147,6 +171,36 @@ def test_layerwise_offload_preserves_non_contiguous_stride(monkeypatch):
     assert reloaded_weight.stride() == original_stride
     assert not reloaded_weight.is_contiguous()
     assert torch.equal(reloaded_weight, original_weight)
+
+
+def test_layerwise_offload_keeps_shared_buffers_resident(monkeypatch):
+    monkeypatch.setattr(
+        layerwise_offload_mod.torch, "get_device_module", lambda: _FakeDeviceModule
+    )
+    monkeypatch.setattr(layerwise_offload_mod.current_platform, "device_type", "cpu")
+
+    model = _SharedBufferModel()
+    original_cache = model.blocks[0].shared.cache.detach().clone()
+
+    manager = LayerwiseOffloadManager(
+        model=model,
+        layers_attr_str="blocks",
+        num_layers=2,
+        enabled=True,
+        pin_cpu_memory=False,
+        prefetch_size=1,
+    )
+
+    assert not any(
+        "cache" in name
+        for metadata in manager._weight_metadata.values()
+        for name in metadata
+    )
+    manager.release_layer(0)
+
+    cache = model.blocks[1].shared.cache
+    assert torch.equal(cache, original_cache)
+    assert torch.equal(cache.index_select(0, torch.tensor([2])), original_cache[2:3])
 
 
 def test_modelopt_fp8_adapter_keeps_layerwise_offload_enabled():

@@ -1,6 +1,5 @@
 import re
 from collections.abc import Mapping, Sequence
-from itertools import chain
 from typing import Any, Dict, List, Set, Tuple
 
 import torch
@@ -137,10 +136,10 @@ class LayerwiseOffloadManager:
         self._named_parameters = dict(self.model.named_parameters())
         self._named_buffers = dict(self.model.named_buffers())
 
-        # 1. collect and group tensors by layer and dtype
+        # 1. collect and group layer parameters by dtype. Keep buffers resident:
+        # shared buffers such as RoPE caches may be referenced by many layers.
         layer_groups: Dict[int, Dict[torch.dtype, List[Tuple[str, torch.Tensor]]]] = {}
-        all_tensors = chain(self._named_parameters.items(), self._named_buffers.items())
-        for name, tensor in all_tensors:
+        for name, tensor in self._named_parameters.items():
             layer_idx = self._match_layer_idx(name)
             if layer_idx is None or layer_idx >= self.num_layers:
                 continue
