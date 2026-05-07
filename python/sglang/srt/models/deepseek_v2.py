@@ -488,11 +488,6 @@ class DeepseekV2MoE(nn.Module):
             prefix=add_prefix("experts", prefix),
         )
 
-        # Route by model: DSV4 -> ungrouped sqrtsoftplus; V3/V3.2/GLM-5
-        # GlmMoeDsa/Glm4MoeLite -> grouped noaux_tc. Do NOT revert to
-        # `n_group > topk_group` -- silently flips for GLM-5 (1==1) and breaks routing.
-        self.use_grouped_topk = not is_deepseek_v4
-
         if self.is_hash and not (is_nextn and is_deepseek_v4):
             self.topk = HashTopK(
                 topk=config.num_experts_per_tok + self.num_fused_shared_experts,
@@ -504,28 +499,37 @@ class DeepseekV2MoE(nn.Module):
                 apply_routed_scaling_factor_on_output=self.experts.should_fuse_routed_scaling_factor_in_topk,
             )
         else:
-            self.topk = TopK(
+            # Default: grouped noaux_tc top-k. Covers V3/V3.2/GLM-5/Glm4MoeLite.
+            topk_kwargs = dict(
                 top_k=config.num_experts_per_tok + self.num_fused_shared_experts,
                 layer_id=self.layer_id,
                 renormalize=config.norm_topk_prob,
-                use_grouped_topk=self.use_grouped_topk,
+                use_grouped_topk=True,
                 num_expert_group=config.n_group,
                 num_fused_shared_experts=self.num_fused_shared_experts,
                 topk_group=config.topk_group,
-                scoring_func=config.scoring_func,
                 correction_bias=self.gate.e_score_correction_bias,
                 quant_config=quant_config,
                 routed_scaling_factor=self.routed_scaling_factor,
                 apply_routed_scaling_factor_on_output=self.experts.should_fuse_routed_scaling_factor_in_topk,
                 fused_shared_experts_scaling_factor=fused_shared_experts_scaling_factor,
+                # Some Fp4 MoE backends require the output format to be bypassed but the MTP layers are unquantized
+                # and requires the output format to be standard (except trtllm). We use quant_config to determine the output format.
                 output_format=(
                     TopKOutputFormat.STANDARD
                     if (quant_config is None)
                     and (not get_moe_runner_backend().is_flashinfer_trtllm())
                     else None
                 ),
-                is_fp4_experts=getattr(quant_config, "is_fp4_experts", False),
             )
+            # DSV4 override: ungrouped sqrtsoftplus + fp4 expert layout flag.
+            if is_deepseek_v4:
+                topk_kwargs.update(
+                    use_grouped_topk=False,
+                    scoring_func=config.scoring_func,
+                    is_fp4_experts=getattr(quant_config, "is_fp4_experts", False),
+                )
+            self.topk = TopK(**topk_kwargs)
 
         self.shared_experts_is_int8 = False
         self.shared_experts_is_fp8 = False
