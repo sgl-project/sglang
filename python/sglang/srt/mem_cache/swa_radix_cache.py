@@ -507,6 +507,34 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
         values = kv_indices[: len(radix_key)].to(dtype=torch.int64, copy=True)
         old_prefix_len = req.cache_protected_len
 
+        # Stash-redundancy detection: when stash_chunked_request was called at
+        # the start of this frame, it may already have cached the page-aligned
+        # prefix plus an unaligned tail. If this function is invoked again for
+        # the same final chunk, there is no new page-aligned content to insert.
+        if old_prefix_len > len(radix_key):
+            match_result = self.match_prefix(MatchPrefixParams(key=radix_key))
+            new_indices = match_result.device_indices
+            new_last_node = match_result.last_device_node
+
+            self.dec_lock_ref(
+                req.last_node,
+                DecLockRefParams(swa_uuid_for_lock=req.swa_uuid_for_lock),
+                skip_swa=req.swa_prefix_lock_released,
+            )
+            req.swa_prefix_lock_released = False
+            result = self.inc_lock_ref(new_last_node)
+
+            req.cache_protected_len = len(new_indices)
+            if len(new_indices) < len(kv_indices):
+                req.prefix_indices = torch.cat(
+                    [new_indices, kv_indices[len(new_indices) :]]
+                )
+            else:
+                req.prefix_indices = new_indices
+            req.last_node = new_last_node
+            req.swa_uuid_for_lock = result.swa_uuid_for_lock
+            return
+
         # Radix Cache takes one ref in memory pool
         # Note: the insert function already frees the overlapped kv_indices
         result = self.insert(
