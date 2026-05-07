@@ -38,7 +38,7 @@ conda activate sglang_npu
 
 #### CANN
 
-Prior to start work with SGLang on Ascend you need to install CANN Toolkit, Kernels operator package and NNAL version 8.5.0, check the [installation guide](https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/900/softwareinst/instg/instg_0008.html?OS=openEuler&InstallType=local)
+Prior to start work with SGLang on Ascend you need to install CANN Toolkit, Kernels operator package and NNAL version 9.0.0, check the [installation guide](https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/900/softwareinst/instg/instg_0008.html?OS=openEuler&InstallType=local)
 
 #### MemFabric-Hybrid
 
@@ -102,10 +102,10 @@ You can download the SGLang image or build an image based on Dockerfile to obtai
 1. Download SGLang image
 ```angular2html
 dockerhub: docker.io/lmsysorg/sglang:$tag
-# Main-based tag, change main to specific version like v0.5.6,
+# Main-based tag, change main to specific version like v0.5.11,
 # you can get image for specific version
-Atlas 800I A3 : {main}-cann8.5.0-a3
-Atlas 800I A2: {main}-cann8.5.0-910b
+Atlas 800I A3 : {main}-cann9.0.0-a3
+Atlas 800I A2: {main}-cann9.0.0-910b
 ```
 2. Build an image based on Dockerfile
 ```shell
