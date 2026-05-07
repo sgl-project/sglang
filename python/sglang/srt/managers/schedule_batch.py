@@ -736,6 +736,21 @@ class Req(ReqDllmMixin):
         # request's tree nodes via non_prefix_store and should NOT be freed
         # in cache_finished_req since they're not this request's own allocation.
         self.cache_fuzzy_matched_len: int = 0
+        # Donor TreeNode (in radix tree) lock_ref'd at fuzzy match time.
+        # Set by RadixCache.match_prefix on a successful fuzzy match; released
+        # by RadixCache.cache_finished_req. Without this, the donor's KV
+        # slots can be LRU-evicted while this request is still consuming
+        # them, causing the SGLang runtime pool-leak detector to fire.
+        self.fuzzy_donor_node: Any = None
+
+        # Pool slots pre-allocated by ``RadixCache.match_prefix`` for the
+        # fuzzy realization (KV copy with RoPE delta). Consumed by
+        # ``model_runner._correct_fuzzy_kv_rope``, which writes them into
+        # ``req_to_token_pool`` and clears this field. If the field is
+        # still set when ``cache_finished_req`` runs, the realization
+        # never executed (e.g. the request was aborted before forward),
+        # and the slots are freed there as a defensive cleanup.
+        self.fuzzy_realized_locs: Any = None
 
         # Whether or not if it is chunked. It increments whenever
         # it is chunked, and decrement whenever chunked request is
@@ -966,7 +981,7 @@ class Req(ReqDllmMixin):
         input_len = len(self.fill_ids)
 
         # Streaming sessions reuse committed KV from the session slot, so
-        # custom logprob_start_len is not supported — override to -1.
+        # custom logprob_start_len is not supported - override to -1.
         if (
             self.session is not None
             and self.session.streaming
@@ -1221,6 +1236,11 @@ class Req(ReqDllmMixin):
         self.routed_experts = None
         self.last_node = None
         self.swa_uuid_for_lock = None
+        # Note: fuzzy_donor_node is intentionally not reset on retraction -
+        # it's released by cache_finished_req when the request actually
+        # finishes. Retraction doesn't run cache_finished_req, so the
+        # donor remains lock_ref'd until the retracted request is finalized
+        # later (which still goes through cache_finished_req).
         self.extend_input_len = 0
         self.is_retracted = True
         self.retracted_stain = True
@@ -1672,7 +1692,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
             # If input_embeds are available, store them
             if req.input_embeds is not None:
-                # Slice to match extend_input_len — PrefillAdder truncates
+                # Slice to match extend_input_len - PrefillAdder truncates
                 # fill_ids/extend_input_len on chunk overflow but not input_embeds.
                 input_embeds.extend(
                     req.input_embeds[pre_len : pre_len + req.extend_input_len]

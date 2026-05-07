@@ -368,13 +368,24 @@ class ServerArgs:
     # Fuzzy matching
     enable_fuzzy_match: bool = False
     fuzzy_min_match_length: int = 16
-    fuzzy_semantic_threshold: float = 0.85
+    fuzzy_semantic_threshold: float = 0.60
     fuzzy_match_provider: str = "TokenBlockMatch"
     cache_fuzzy_results: bool = True
     fuzzy_eviction_policy: str = "LRU"
     fuzzy_non_prefix_max_entries: int = 10000
     fuzzy_block_size: int = 16
     embedding_model_name: str = "all-MiniLM-L6-v2"
+
+    # SemanticEmbedding-specific (ignored when fuzzy_match_provider != "SemanticEmbedding").
+    # SemanticEmbedding is process-local: in-process MiniLM embedding, numpy
+    # donor store. No remote backend.
+    embedding_use_gpu: bool = True
+    fuzzy_model_arch: Optional[str] = None
+    enable_bathtub: bool = True
+    fuzzy_top_k: int = 5
+    fuzzy_min_reuse_ratio: float = 0.50
+    quality_gate_ppl_threshold: float = 1.065
+    fuzzy_discovery_only: bool = False
     
     enable_prefill_delayer: bool = False
     prefill_delayer_max_delay_passes: int = 30
@@ -1094,7 +1105,7 @@ class ServerArgs:
                 if os.path.exists(alt):
                     return alt
 
-            # Cache miss — download from ModelScope hub
+            # Cache miss - download from ModelScope hub
             return ms_snapshot_download(
                 path,
                 cache_dir=self.download_dir,
@@ -4380,7 +4391,12 @@ class ServerArgs:
             "--fuzzy-semantic-threshold",
             type=float,
             default=ServerArgs.fuzzy_semantic_threshold,
-            help="Similarity threshold for semantic matching (0.0 - 1.0).",
+            help=(
+                "Cosine-similarity threshold for SemanticEmbedding matches "
+                "(0.0 - 1.0). Ignored by TokenBlockMatch. Higher = stricter "
+                "(fewer matches, higher precision); lower = more permissive. "
+                "Below ~0.50 alignment quality drops quickly."
+            ),
         )
         parser.add_argument(
             "--fuzzy-match-provider",
@@ -4418,6 +4434,51 @@ class ServerArgs:
             type=str,
             default=ServerArgs.embedding_model_name,
             help="Embedding model name for SemanticEmbeddingProvider.",
+        )
+        parser.add_argument(
+            "--no-embedding-gpu",
+            dest="embedding_use_gpu",
+            action="store_false",
+            help="Force the SemanticEmbeddingProvider's MiniLM embedder onto CPU.",
+        )
+        parser.add_argument(
+            "--fuzzy-model-arch",
+            type=str,
+            default=ServerArgs.fuzzy_model_arch,
+            help="Model arch tag for SemanticEmbeddingProvider's bathtub-curve "
+                 "preset selector (e.g. 'llama', 'qwen2.5-7b').",
+        )
+        parser.add_argument(
+            "--no-bathtub",
+            dest="enable_bathtub",
+            action="store_false",
+            help="Disable per-layer bathtub recomputation in SemanticEmbeddingProvider.",
+        )
+        parser.add_argument(
+            "--fuzzy-top-k",
+            type=int,
+            default=ServerArgs.fuzzy_top_k,
+            help="Top-K candidates pulled from the donor store before alignment.",
+        )
+        parser.add_argument(
+            "--fuzzy-min-reuse-ratio",
+            type=float,
+            default=ServerArgs.fuzzy_min_reuse_ratio,
+            help="Minimum reuse ratio (matched / prompt tokens) for a semantic hit.",
+        )
+        parser.add_argument(
+            "--quality-gate-ppl-threshold",
+            type=float,
+            default=ServerArgs.quality_gate_ppl_threshold,
+            help="Informational PPL guardrail (telemetry only).",
+        )
+        parser.add_argument(
+            "--fuzzy-discovery-only",
+            action="store_true",
+            help="Run the SemanticEmbedding pipeline for telemetry only -- "
+                 "do NOT inject donor KV into match_prefix's device_indices. "
+                 "Workaround for the upstream RadixCache _node_registry leak "
+                 "until the fix in _delete_leaf lands.",
         )
         parser.add_argument(
             "--enable-prefill-delayer",

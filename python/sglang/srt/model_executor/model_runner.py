@@ -2751,46 +2751,79 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         )
 
     def _correct_fuzzy_kv_rope(self, forward_batch: ForwardBatch):
-        """Correct RoPE on fuzzy-matched K values by allocating new pool slots.
+        """Realize fuzzy-matched KV into recipient-owned pool slots.
 
-        Fuzzy-matched tokens have their K values stored in the pool with RoPE
-        applied at the original cached positions. We allocate new pool slots,
-        copy V directly and K with RoPE correction (reverse old + apply new),
-        then update req_to_token_pool to point to the new slots.
-
-        This avoids mutating the original pool locations (which belong to the
-        radix tree of another request) and eliminates the need for save/restore.
+        Realization slots are pre-allocated by RadixCache.match_prefix
+        and stashed on req.fuzzy_realized_locs. This function consumes
+        that block; it never allocates. Contiguous matches go through
+        the single-segment path; scattered N:M matches use
+        forward_batch.fuzzy_segments.
         """
         num_fuzzy = forward_batch.fuzzy_matched_len
-        cached_start_pos = forward_batch.fuzzy_cached_start_pos
         if num_fuzzy <= 0:
             return
 
         pool = forward_batch.token_to_kv_pool
-        if not hasattr(pool, 'k_buffer'):
+        if not hasattr(pool, "k_buffer"):
             return
 
-        # Get the pool locations for fuzzy-matched tokens.
-        # prefix_len = exact_matched_len + fuzzy_matched_len
-        # fuzzy tokens occupy the LAST fuzzy_matched_len positions of the prefix.
+        if not (forward_batch.reqs and len(forward_batch.reqs) > 0):
+            return
+        req = forward_batch.reqs[0]
+        realized_locs = getattr(req, "fuzzy_realized_locs", None)
+
+        if forward_batch.fuzzy_segments:
+            self._correct_fuzzy_kv_rope_segments(
+                forward_batch, pool, req, realized_locs
+            )
+        else:
+            self._correct_fuzzy_kv_rope_contiguous(
+                forward_batch, pool, req, realized_locs
+            )
+
+        # Clear per-request handles so chunked-prefill re-entry, decode
+        # batches, or retraction-and-resume don't re-trigger correction.
+        req.fuzzy_realized_locs = None
+        req.cache_fuzzy_matched_len = 0
+
+    def _correct_fuzzy_kv_rope_contiguous(
+        self, forward_batch: ForwardBatch, pool, req, realized_locs
+    ):
+        num_fuzzy = forward_batch.fuzzy_matched_len
+        cached_start_pos = forward_batch.fuzzy_cached_start_pos
         req_idx = forward_batch.req_pool_indices[0].item()
         prefix_len = forward_batch.extend_prefix_lens_cpu[0]
         exact_matched_len = prefix_len - num_fuzzy
 
-        # Skip RoPE correction if positions are already correct
+        # No copy needed when donor positions already align with target.
         if cached_start_pos == exact_matched_len:
             return
+
+        if realized_locs is None:
+            # Pre-alloc contract violated; skipping is safer than
+            # allocating here (would re-introduce a partial-commit window).
+            logger.warning(
+                "[FUZZY] contiguous correction: realized_locs missing; "
+                "skipping"
+            )
+            return
+
+        new_fuzzy_locs = realized_locs
         old_fuzzy_locs = forward_batch.req_to_token_pool.req_to_token[
             req_idx, exact_matched_len:prefix_len
         ]
 
-        # Allocate new pool slots for the fuzzy tokens
-        new_fuzzy_locs = self.token_to_kv_pool_allocator.alloc(num_fuzzy)
-        if new_fuzzy_locs is None:
-            logger.warning("[FUZZY] Failed to allocate new pool slots for fuzzy tokens, skipping RoPE correction")
+        rotary_emb, cos_sin_cache, is_neox_style, rotary_dim = (
+            self._fuzzy_get_rotary_emb()
+        )
+        if rotary_emb is None:
+            self.token_to_kv_pool_allocator.free(new_fuzzy_locs)
+            logger.warning(
+                "[FUZZY] Cannot find rotary_emb on model, "
+                "skipping RoPE correction"
+            )
             return
 
-        # Compute old and new positions
         device = pool.k_buffer[0].device
         old_positions = torch.arange(
             cached_start_pos, cached_start_pos + num_fuzzy,
@@ -2801,22 +2834,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             device=device, dtype=torch.long,
         )
 
-        # Get the rotary embedding's cos_sin_cache from the model.
-        rotary_emb = None
-        if hasattr(self.model, 'model') and hasattr(self.model.model, 'layers'):
-            layer0 = self.model.model.layers[0]
-            if hasattr(layer0, 'self_attn') and hasattr(layer0.self_attn, 'rotary_emb'):
-                rotary_emb = layer0.self_attn.rotary_emb
-        if rotary_emb is None:
-            logger.warning("[FUZZY] Cannot find rotary_emb on model, skipping RoPE correction")
-            self.token_to_kv_pool_allocator.free(new_fuzzy_locs)
-            return
-
-        cos_sin_cache = rotary_emb.cos_sin_cache
-        is_neox_style = rotary_emb.is_neox_style
-        rotary_dim = rotary_emb.rotary_dim
-
-        # Get cos/sin for old and new positions
         old_cos_sin = cos_sin_cache.index_select(0, old_positions)
         new_cos_sin = cos_sin_cache.index_select(0, new_positions)
         old_cos, old_sin = old_cos_sin.chunk(2, dim=-1)
@@ -2828,34 +2845,150 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         )
 
         for layer_id in range(pool.layer_num):
-            # Copy V directly to new slots
-            pool.v_buffer[layer_id][new_fuzzy_locs] = pool.v_buffer[layer_id][old_fuzzy_locs]
-
-            # Copy K with RoPE correction to new slots
-            k = pool.k_buffer[layer_id][old_fuzzy_locs]  # [num_fuzzy, head_num, head_dim]
+            pool.v_buffer[layer_id][new_fuzzy_locs] = (
+                pool.v_buffer[layer_id][old_fuzzy_locs]
+            )
+            k = pool.k_buffer[layer_id][old_fuzzy_locs]
             k_rot = k[..., :rotary_dim]
             k_pass = k[..., rotary_dim:]
-
             k_raw = reverse_rotary_emb(k_rot, old_cos, old_sin, is_neox_style)
             k_new = apply_rotary_emb(k_raw, new_cos, new_sin, is_neox_style)
-
             pool.k_buffer[layer_id][new_fuzzy_locs] = torch.cat(
                 (k_new, k_pass), dim=-1
             )
 
-        # Update req_to_token_pool to point to new slots
+        # Point req_to_token_pool at the new recipient-owned slots.
+        # The donor's slots remain protected by its TreeNode lock_ref.
         forward_batch.req_to_token_pool.req_to_token[
             req_idx, exact_matched_len:prefix_len
         ] = new_fuzzy_locs
 
-        # Mark fuzzy tokens as realized so cache_finished_req skips the realize step
-        if forward_batch.reqs and len(forward_batch.reqs) > 0:
-            forward_batch.reqs[0].cache_fuzzy_matched_len = 0
+        logger.info(
+            f"[FUZZY] Realized {num_fuzzy} fuzzy tokens (contiguous): "
+            f"copied donor KV with RoPE correction from positions "
+            f"[{cached_start_pos}..{cached_start_pos + num_fuzzy - 1}] "
+            f"to [{exact_matched_len}..{prefix_len - 1}]"
+        )
+
+    def _correct_fuzzy_kv_rope_segments(
+        self, forward_batch: ForwardBatch, pool, req, realized_locs
+    ):
+        """N:M alignment with scattered target positions.
+
+        Each segment has its own donor_locs and target_positions. The
+        segments slice the pre-allocated realized_locs block in order.
+        Before overwriting req_to_token at the target positions we free
+        the slots that alloc_for_extend placed there, otherwise those
+        slots have no owner after the overwrite.
+        """
+        if realized_locs is None:
+            logger.warning(
+                "[FUZZY] segments correction: realized_locs missing; "
+                "skipping"
+            )
+            return
+
+        rotary_emb, cos_sin_cache, is_neox_style, rotary_dim = (
+            self._fuzzy_get_rotary_emb()
+        )
+        if rotary_emb is None:
+            self.token_to_kv_pool_allocator.free(realized_locs)
+            logger.warning(
+                "[FUZZY] Cannot find rotary_emb on model, "
+                "skipping RoPE correction (segments)"
+            )
+            return
+
+        from sglang.srt.layers.rotary_embedding.utils import (
+            apply_rotary_emb,
+            reverse_rotary_emb,
+        )
+
+        req_idx = forward_batch.req_pool_indices[0].item()
+        req_to_token = forward_batch.req_to_token_pool.req_to_token
+        device = pool.k_buffer[0].device
+
+        segments = forward_batch.fuzzy_segments
+        cursor = 0
+        total_realized = 0
+        for seg in segments:
+            target_positions = seg.target_positions.to(device).to(torch.long)
+            donor_positions = seg.donor_positions.to(device).to(torch.long)
+            seg_len = (
+                seg.length
+                if seg.length is not None
+                else target_positions.numel()
+            )
+
+            # Resolve donor pool slots. Providers set donor_kv_indices
+            # directly (single resolved tensor) or via NodeRef
+            # (donor_node_id + donor_offset) which the provider should
+            # have materialized into donor_kv_indices before reaching
+            # the model executor.
+            if seg.donor_kv_indices is None:
+                logger.warning(
+                    "[FUZZY] segment without donor_kv_indices; skipping"
+                )
+                continue
+            donor_locs = seg.donor_kv_indices.to(device).to(torch.long)
+
+            new_locs = realized_locs[cursor : cursor + seg_len].to(torch.long)
+            cursor += seg_len
+
+            # Free the extend slots the scheduler placed at these
+            # target positions before overwriting req_to_token.
+            displaced = req_to_token[req_idx, target_positions].to(torch.int64)
+            if displaced.numel() > 0:
+                self.token_to_kv_pool_allocator.free(displaced)
+
+            old_cos_sin = cos_sin_cache.index_select(0, donor_positions)
+            new_cos_sin = cos_sin_cache.index_select(0, target_positions)
+            old_cos, old_sin = old_cos_sin.chunk(2, dim=-1)
+            new_cos, new_sin = new_cos_sin.chunk(2, dim=-1)
+
+            for layer_id in range(pool.layer_num):
+                pool.v_buffer[layer_id][new_locs] = (
+                    pool.v_buffer[layer_id][donor_locs]
+                )
+                k = pool.k_buffer[layer_id][donor_locs]
+                k_rot = k[..., :rotary_dim]
+                k_pass = k[..., rotary_dim:]
+                k_raw = reverse_rotary_emb(
+                    k_rot, old_cos, old_sin, is_neox_style
+                )
+                k_new = apply_rotary_emb(
+                    k_raw, new_cos, new_sin, is_neox_style
+                )
+                pool.k_buffer[layer_id][new_locs] = torch.cat(
+                    (k_new, k_pass), dim=-1
+                )
+
+            req_to_token[req_idx, target_positions] = new_locs.to(
+                req_to_token.dtype
+            )
+            total_realized += seg_len
 
         logger.info(
-            f"[FUZZY] Realized {num_fuzzy} fuzzy tokens: allocated new pool slots, "
-            f"corrected RoPE from positions [{cached_start_pos}..{cached_start_pos + num_fuzzy - 1}] "
-            f"to [{exact_matched_len}..{prefix_len - 1}]"
+            f"[FUZZY] Realized {total_realized} fuzzy tokens "
+            f"({len(segments)} segments)"
+        )
+
+    def _fuzzy_get_rotary_emb(self):
+        """Resolve (rotary_emb, cos_sin_cache, is_neox_style, rotary_dim)."""
+        rotary_emb = None
+        if hasattr(self.model, "model") and hasattr(self.model.model, "layers"):
+            layer0 = self.model.model.layers[0]
+            if hasattr(layer0, "self_attn") and hasattr(
+                layer0.self_attn, "rotary_emb"
+            ):
+                rotary_emb = layer0.self_attn.rotary_emb
+        if rotary_emb is None:
+            return None, None, None, None
+        return (
+            rotary_emb,
+            rotary_emb.cos_sin_cache,
+            rotary_emb.is_neox_style,
+            rotary_emb.rotary_dim,
         )
 
     def forward_extend(

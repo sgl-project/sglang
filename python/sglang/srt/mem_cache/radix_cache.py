@@ -495,26 +495,93 @@ class RadixCache(BasePrefixCache):
             
             if fuzzy_result is not None:
                 fuzzy_matched_len = fuzzy_result.cached_token_count
+
+                # Reserve realization slots up front. _correct_fuzzy_kv_rope
+                # consumes from req.fuzzy_realized_locs; if we let it
+                # allocate inside the forward pass, an alloc failure would
+                # leave req_to_token_pool referencing donor slots after
+                # state has already been committed here. Allocating now
+                # makes the capacity check the first mutating step.
+                # Skip the alloc when donor positions already match the
+                # recipient's target (no copy needed); scattered N:M
+                # results always need fresh slots.
+                needs_realization = fuzzy_matched_len > 0 and (
+                    getattr(fuzzy_result, "segments", None) is not None
+                    or fuzzy_result.cached_start_pos != exact_matched_len
+                )
+                realized_locs = None
+                if params.req is not None and needs_realization:
+                    realized_locs = self.token_to_kv_pool_allocator.alloc(
+                        fuzzy_matched_len
+                    )
+                    if realized_locs is None:
+                        # No state mutated yet; safe to return exact-only.
+                        logger.info(
+                            f"[FUZZY RADIX] no pool capacity for "
+                            f"{fuzzy_matched_len} fuzzy tokens; "
+                            f"falling back to exact-only match"
+                        )
+                        return MatchResult(
+                            device_indices=value,
+                            last_device_node=last_node,
+                            last_host_node=last_node,
+                        )
+                    # Free any leftover from a prior chunked/retracted
+                    # match before stashing the new block.
+                    prev_locs = getattr(params.req, "fuzzy_realized_locs", None)
+                    if prev_locs is not None:
+                        try:
+                            self.token_to_kv_pool_allocator.free(prev_locs)
+                        except Exception:
+                            pass
+                    params.req.fuzzy_realized_locs = realized_locs
+
                 miss_len = total_len - exact_matched_len - fuzzy_matched_len
                 logger.info(
                     f"[FUZZY RADIX] match_prefix: exact={exact_matched_len}, "
                     f"fuzzy={fuzzy_matched_len}, miss={miss_len}, total={total_len}, "
-                    f"cached_start_pos={fuzzy_result.cached_start_pos}"
+                    f"cached_start_pos={fuzzy_result.cached_start_pos}, "
+                    f"realized_locs={'pre-allocated' if realized_locs is not None else 'none'}"
                 )
 
-                # Merge exact and fuzzy KV indices
-                # No repositioning here - RoPE correction is handled in
-                # model_runner._correct_fuzzy_kv_rope by allocating new pool slots.
+                # The merged value still references the donor's slots;
+                # the copy + RoPE correction into realized_locs runs in
+                # model_runner._correct_fuzzy_kv_rope.
                 fuzzy_kv_indices = torch.tensor(
                     fuzzy_result.kv_cache_indices,
                     device=value.device,
                     dtype=value.dtype,
                 )
-                
-                # Mark request as fuzzy-matched
+
                 if params.req is not None:
                     params.req.fuzzy_match_result = fuzzy_result
-                
+
+                # Lock the donor TreeNode so LRU eviction can't free the
+                # slots in fuzzy_kv_indices before _correct_fuzzy_kv_rope
+                # copies them. Released in cache_finished_req.
+                if (
+                    params.req is not None
+                    and getattr(fuzzy_result, "donor_last_node_id", None) is not None
+                ):
+                    donor_node = self._node_registry.get(
+                        fuzzy_result.donor_last_node_id
+                    )
+                    if donor_node is not None:
+                        # Release any prior donor lock before acquiring
+                        # a new one (chunked-prefill / resume case).
+                        prev_donor = getattr(params.req, "fuzzy_donor_node", None)
+                        if prev_donor is not None and prev_donor is not donor_node:
+                            self.dec_lock_ref(prev_donor)
+                        self.inc_lock_ref(donor_node)
+                        params.req.fuzzy_donor_node = donor_node
+                    else:
+                        logger.warning(
+                            f"[FUZZY RADIX] donor_last_node_id="
+                            f"{fuzzy_result.donor_last_node_id} not in "
+                            f"_node_registry; donor KV may be evicted "
+                            f"mid-request"
+                        )
+
                 merged_value = torch.cat([value, fuzzy_kv_indices])
                 return MatchResult(
                     device_indices=merged_value,
@@ -604,12 +671,17 @@ class RadixCache(BasePrefixCache):
 
         key, value = self.maybe_bigram_convert(key, value)
 
-        prefix_len = self._insert_helper(self.root_node, key, value, priority, chunked)
-        
+        prefix_len, last_node = self._insert_helper(
+            self.root_node, key, value, priority, chunked
+        )
+
         # Register the root node (always registered)
         self._register_node(self.root_node)
-        
-        return InsertResult(prefix_len=prefix_len)
+
+        return InsertResult(
+            prefix_len=prefix_len,
+            last_node_id=last_node.id if last_node is not None else None,
+        )
     
     def _register_node(self, node: TreeNode):
         """Register a TreeNode in the node registry for reference resolution by non_prefix_store."""
@@ -621,12 +693,26 @@ class RadixCache(BasePrefixCache):
         if self.disable_finished_insert:
             is_insert = False
 
+        # Reclaim any pre-allocated realization slots that the forward
+        # pass did not consume (aborted request, partial segments).
+        leftover = getattr(req, "fuzzy_realized_locs", None)
+        if leftover is not None:
+            try:
+                self.token_to_kv_pool_allocator.free(leftover)
+            except Exception:
+                pass
+            req.fuzzy_realized_locs = None
+
         kv_committed_len = req.pop_committed_kv_cache()
         if self.disable:
             kv_indices = self.req_to_token_pool.req_to_token[
                 req.req_pool_idx, :kv_committed_len
             ]
             self.token_to_kv_pool_allocator.free(kv_indices)
+            donor_node = getattr(req, "fuzzy_donor_node", None)
+            if donor_node is not None:
+                self.dec_lock_ref(donor_node)
+                req.fuzzy_donor_node = None
             return
 
         token_ids = (req.origin_input_ids + req.output_ids)[:kv_committed_len]
@@ -672,6 +758,20 @@ class RadixCache(BasePrefixCache):
                 InsertParams(key=radix_key, value=values, priority=priority)
             )
             new_prefix_len = result.prefix_len
+            # Hand the inserted node id to the fuzzy provider so
+            # subsequent donor lookups can resolve a stable NodeRef.
+            if (
+                self._fuzzy_cache_enabled
+                and result.last_node_id is not None
+                and self.fuzzy_match_provider is not None
+            ):
+                try:
+                    self.fuzzy_match_provider.on_donor_inserted(
+                        request=req,
+                        donor_last_node_id=result.last_node_id,
+                    )
+                except Exception as e:
+                    logger.debug(f"[FUZZY RADIX] on_donor_inserted failed: {e}")
             # Free the duplicates that were already in the tree
             self.token_to_kv_pool_allocator.free(
                 kv_indices[req.cache_protected_len : new_prefix_len]
@@ -683,6 +783,12 @@ class RadixCache(BasePrefixCache):
 
         # free the unaligned tail
         self.token_to_kv_pool_allocator.free(kv_indices[len(keys) :])
+
+        # Release the donor lock_ref acquired in match_prefix.
+        donor_node = getattr(req, "fuzzy_donor_node", None)
+        if donor_node is not None:
+            self.dec_lock_ref(donor_node)
+            req.fuzzy_donor_node = None
 
         # Remove req slot release the cache lock
         self.dec_lock_ref(req.last_node)
@@ -927,7 +1033,7 @@ class RadixCache(BasePrefixCache):
         # Update priority along the path (take max to propagate higher priority)
         node.priority = max(node.priority, priority)
         if len(key) == 0:
-            return 0
+            return 0, node
 
         child_key = self.get_child_key_fn(key)
 
@@ -964,7 +1070,9 @@ class RadixCache(BasePrefixCache):
             self._update_leaf_status(new_node)
             # Hash will be computed lazily during event emission
             self._record_store_event(new_node)
-        return total_prefix_length
+            node = new_node
+        # Return the deepest node touched so callers can resolve a NodeRef.
+        return total_prefix_length, node
 
     def _print_helper(self, node: TreeNode, indent: int):
         """Prints the radix tree in a human-readable format."""
@@ -992,6 +1100,8 @@ class RadixCache(BasePrefixCache):
         self.evictable_size_ -= len(node.key)
         if node in self.evictable_leaves:
             self.evictable_leaves.remove(node)
+        # Mirror _register_node: drop on eviction.
+        self._node_registry.pop(node.id, None)
         self._update_leaf_status(node.parent)
 
     def _update_leaf_status(self, node: TreeNode):
