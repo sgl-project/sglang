@@ -1134,7 +1134,7 @@ class DeepseekV4ForCausalLM(nn.Module):
         return name
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]], is_nextn=False):
-params_dict = dict(self.named_parameters())
+        params_dict = dict(self.named_parameters())
         loaded_params: Set[str] = set()
 
         if is_nextn:

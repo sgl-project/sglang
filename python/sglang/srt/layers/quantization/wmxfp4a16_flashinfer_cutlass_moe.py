@@ -69,8 +69,22 @@ def _fp32_to_ue8m0(x: torch.Tensor) -> torch.Tensor:
 # so the bf16 API path sees weights bit-equivalent to what the SM90
 # mixed-input kernel dequants inside itself.
 _MXFP4_LUT = (
-    0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
-    -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
+    0.0,
+    0.5,
+    1.0,
+    1.5,
+    2.0,
+    3.0,
+    4.0,
+    6.0,
+    -0.0,
+    -0.5,
+    -1.0,
+    -1.5,
+    -2.0,
+    -3.0,
+    -4.0,
+    -6.0,
 )
 
 
@@ -310,9 +324,9 @@ class Wmxfp4A16FlashinferCutlassMoEMethod:
 
         # --- Step C: Activations ---
         # W4A16 path: bf16 activations, no quantization needed.
-        assert hidden_states.dtype == torch.bfloat16, (
-            f"W4A16 expects bf16 activations, got {hidden_states.dtype}"
-        )
+        assert (
+            hidden_states.dtype == torch.bfloat16
+        ), f"W4A16 expects bf16 activations, got {hidden_states.dtype}"
         x = hidden_states
         origin_dim = x.shape[-1]
         if hidden_size != origin_dim:
