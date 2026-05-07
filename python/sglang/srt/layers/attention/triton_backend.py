@@ -8,6 +8,7 @@ import triton
 import triton.language as tl
 
 from sglang.srt.configs.model_config import AttentionArch
+from sglang.srt.layers.attention._attn_dump import maybe_dump_attn
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
 from sglang.srt.layers.dp_attention import get_attention_tp_size
@@ -1007,6 +1008,7 @@ class TritonAttnBackend(AttentionBackend):
             window_kv_offsets=window_kv_offsets,
             xai_temperature_len=layer.xai_temperature_len,
         )
+        maybe_dump_attn("triton", "forward_extend", layer.layer_id, q, k, v, o)
         return o
 
     def _forward_extend_unified(
@@ -1152,6 +1154,9 @@ class TritonAttnBackend(AttentionBackend):
             xai_temperature_len=layer.xai_temperature_len,
         )
 
+        maybe_dump_attn(
+            "triton", "forward_extend_unified", layer.layer_id, q, None, None, o
+        )
         return o
 
     def forward_decode(
@@ -1242,6 +1247,7 @@ class TritonAttnBackend(AttentionBackend):
             has_mla=self.use_mla,
             use_pdl=self.use_pdl,
         )
+        maybe_dump_attn("triton", "forward_decode", layer.layer_id, q, k, v, o)
         return o
 
 

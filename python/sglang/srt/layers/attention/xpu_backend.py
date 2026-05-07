@@ -23,6 +23,8 @@ if TYPE_CHECKING:
 from sgl_kernel import flash_mla_decode, flash_mla_get_workspace_size, merge_state_v2
 from sgl_kernel.flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
 
+from sglang.srt.layers.attention._attn_dump import maybe_dump_attn
+
 
 class XPUAttentionBackend(AttentionBackend):
     """XPU FlashAttention backend, currently based on FlashAttentionBackend, will be refactored later.
@@ -639,7 +641,15 @@ class XPUAttentionBackend(AttentionBackend):
                 if forward_batch.mha_return_lse:
                     output, lse, *rest = output
                     lse = torch.transpose(lse, 0, 1).contiguous()
+                    maybe_dump_attn(
+                        "intel_xpu", "forward_extend_mla_chunked_lse",
+                        layer.layer_id, q, k, v, output,
+                    )
                     return output, lse
+                maybe_dump_attn(
+                    "intel_xpu", "forward_extend_mla_chunked",
+                    layer.layer_id, q, k, v, output,
+                )
                 return output
             else:
                 # Do absorbed multi-latent attention
@@ -715,7 +725,11 @@ class XPUAttentionBackend(AttentionBackend):
                 else:
                     o = result
 
-        return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+        out = o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+        maybe_dump_attn(
+            "intel_xpu", "forward_extend", layer.layer_id, q, k, v, out
+        )
+        return out
 
     def forward_decode(
         self,
@@ -947,7 +961,11 @@ class XPUAttentionBackend(AttentionBackend):
                 layer.scaling,
             )
 
-        return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+        out = o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+        maybe_dump_attn(
+            "intel_xpu", "forward_decode", layer.layer_id, q, k, v, out
+        )
+        return out
 
     def get_cuda_graph_seq_len_fill_value(self):
         """Get the fill value for sequence length in CUDA graph."""
