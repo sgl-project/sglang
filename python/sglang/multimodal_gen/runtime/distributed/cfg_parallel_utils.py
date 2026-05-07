@@ -16,9 +16,9 @@ from sglang.multimodal_gen.runtime.distributed.communication_op import (
     cfg_model_parallel_all_reduce,
 )
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
+    get_cfg_group,
     get_classifier_free_guidance_rank,
     get_classifier_free_guidance_world_size,
-    get_cfg_group,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
@@ -161,9 +161,7 @@ def run_two_branch_cfg_parallel(
 
     results = [cfg_model_parallel_all_reduce(p) for p in partial]
     cond_t = tuple(get_cfg_group().broadcast(p, src=0) for p in cond_t)
-    results[0] = _apply_cfg_postprocess(
-        results[0], cond_t[0], batch, pipeline_config
-    )
+    results[0] = _apply_cfg_postprocess(results[0], cond_t[0], batch, pipeline_config)
     return _unwrap(tuple(results))
 
 
