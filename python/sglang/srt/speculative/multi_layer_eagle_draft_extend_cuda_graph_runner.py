@@ -209,7 +209,7 @@ class MultiLayerEagleDraftExtendCudaGraphRunner:
             ):  # llama_eagle3
                 vocab_size = self.model_runner.model_config.hf_config.hot_vocab_size
             else:
-                vocab_size = self.model_runner.model_config.vocab_size
+                vocab_size = self.model_runner.vocab_size
 
             next_token_logits_buffer = torch.zeros(
                 (

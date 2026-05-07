@@ -361,6 +361,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.moe_dp_rank = moe_dp_rank
         self.moe_dp_size = server_args.moe_dp_size
         self.model_config = model_config
+        self.vocab_size = model_config.vocab_size
         self.dist_port = nccl_port
         self.server_args = server_args
         self.is_draft_worker = is_draft_worker

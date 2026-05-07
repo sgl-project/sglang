@@ -688,7 +688,7 @@ class CudaGraphRunner:
             max_bs=self.max_bs,
             max_num_token=self.max_num_token,
             hidden_size=self.model_runner.model_config.hidden_size,
-            vocab_size=self.model_runner.model_config.vocab_size,
+            vocab_size=self.model_runner.vocab_size,
             dtype=self.model_runner.model_config.dtype,
             dp_size=self.dp_size,
             pp_size=self.pp_size,

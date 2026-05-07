@@ -446,7 +446,7 @@ class DFlashWorker:
                 f"DFLASH mask_token must be a non-empty string, got {mask_token!r}."
             )
 
-        vocab_size = int(self.target_worker.model_runner.model_config.vocab_size)
+        vocab_size = int(self.target_worker.model_runner.vocab_size)
         if mask_token_id is not None:
             resolved_id = int(mask_token_id)
             if resolved_id >= vocab_size:
