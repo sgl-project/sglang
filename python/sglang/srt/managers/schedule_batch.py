@@ -42,6 +42,7 @@ import dataclasses
 import logging
 import re
 import time
+import uuid
 from enum import Enum, auto
 from http import HTTPStatus
 from itertools import chain
@@ -584,6 +585,10 @@ class Req:
             extra_key = (
                 extra_key or ""
             ) + lora_id  # lora_id is concatenated to the extra key
+
+        # Per-request salt makes radix keys disjoint across requests → no reuse.
+        if envs.SGLANG_RADIX_DISABLE_REUSE.get():
+            extra_key = (extra_key or "") + "|noreuse:" + uuid.uuid4().hex[:16]
 
         self.extra_key = extra_key
         self.lora_id = lora_id
