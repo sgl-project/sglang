@@ -34,8 +34,97 @@ logger = logging.getLogger(__name__)
 
 SYNC_TOKEN_IDS_ACROSS_TP = get_bool_env_var("SYNC_TOKEN_IDS_ACROSS_TP")
 SGLANG_RETURN_ORIGINAL_LOGPROB = get_bool_env_var("SGLANG_RETURN_ORIGINAL_LOGPROB")
+SGLANG_SAMPLER_PROBS_GUARD = get_bool_env_var("SGLANG_SAMPLER_PROBS_GUARD")
+SGLANG_SAMPLER_PROBS_GUARD_SYNC = get_bool_env_var("SGLANG_SAMPLER_PROBS_GUARD_SYNC")
 _CUSTOM_SAMPLER_FACTORIES: Dict[str, Callable[[], "Sampler"]] = {}
 _BUILT_IN_SAMPLING_BACKENDS = {"flashinfer", "pytorch", "ascend"}
+
+
+def _validate_probs_for_multinomial(probs: torch.Tensor) -> None:
+    """Fail before torch.multinomial turns invalid probabilities into a CUDA assert."""
+    if not SGLANG_SAMPLER_PROBS_GUARD:
+        return
+
+    if SGLANG_SAMPLER_PROBS_GUARD_SYNC and probs.is_cuda:
+        torch.cuda.synchronize(probs.device)
+
+    with torch.no_grad():
+        probs_for_check = probs.detach()
+        if probs_for_check.numel() == 0:
+            raise ValueError("Invalid sampling probabilities: empty tensor.")
+
+        if probs_for_check.dim() == 0:
+            rows = probs_for_check.reshape(1, 1)
+        elif probs_for_check.dim() == 1:
+            rows = probs_for_check.unsqueeze(0)
+        else:
+            rows = probs_for_check.reshape(-1, probs_for_check.shape[-1])
+
+        finite_mask = torch.isfinite(rows)
+        negative_mask = rows < 0
+        row_sums = rows.sum(dim=-1)
+        invalid_rows = (
+            (~finite_mask).any(dim=-1)
+            | negative_mask.any(dim=-1)
+            | (~torch.isfinite(row_sums))
+            | (row_sums <= 0)
+        )
+
+        if not bool(invalid_rows.any().item()):
+            return
+
+        invalid_row_ids = invalid_rows.nonzero(as_tuple=False).flatten()
+        sample_row_ids = invalid_row_ids[:8].tolist()
+
+        rank = None
+        if dist.is_available() and dist.is_initialized():
+            rank = dist.get_rank()
+
+        diagnostics = {
+            "rank": rank,
+            "shape": tuple(probs_for_check.shape),
+            "dtype": str(probs_for_check.dtype),
+            "device": str(probs_for_check.device),
+            "nan_count": int(torch.isnan(rows).sum().item()),
+            "inf_count": int(torch.isinf(rows).sum().item()),
+            "negative_count": int(negative_mask.sum().item()),
+            "nonpositive_row_sum_count": int((row_sums <= 0).sum().item()),
+            "nonfinite_row_sum_count": int((~torch.isfinite(row_sums)).sum().item()),
+            "invalid_row_count": int(invalid_row_ids.numel()),
+            "sample_invalid_rows": sample_row_ids,
+        }
+
+        row_details = []
+        bad_value_mask = (~finite_mask) | negative_mask
+        for row_id in sample_row_ids:
+            row = rows[row_id]
+            finite_values = row[torch.isfinite(row)]
+            bad_cols = bad_value_mask[row_id].nonzero(as_tuple=False).flatten()[:8]
+            row_details.append(
+                {
+                    "row": int(row_id),
+                    "sum": float(row_sums[row_id].item()),
+                    "min_finite": (
+                        float(finite_values.min().item())
+                        if finite_values.numel() > 0
+                        else None
+                    ),
+                    "max_finite": (
+                        float(finite_values.max().item())
+                        if finite_values.numel() > 0
+                        else None
+                    ),
+                    "bad_cols": bad_cols.tolist(),
+                    "bad_values": row[bad_cols].detach().cpu().tolist(),
+                }
+            )
+
+        message = (
+            "Invalid sampling probabilities before torch.multinomial: "
+            f"{diagnostics}; row_details={row_details}"
+        )
+        logger.error(message)
+        raise ValueError(message)
 
 
 class Sampler(nn.Module):
@@ -592,6 +681,7 @@ def sampling_from_probs_torch(
 
     Note: For deterministic sampling from logprobs, use Sampler._sample_from_logprobs instead.
     """
+    _validate_probs_for_multinomial(probs)
     if sampling_seed is None:
         sampled_index = torch.multinomial(probs, num_samples=1)
     else:

@@ -11,6 +11,7 @@ from sglang.srt.layers.moe.utils import (
     initialize_moe_config,
     is_tbo_enabled,
     should_use_flashinfer_cutlass_moe_fp4_allgather,
+    should_skip_post_experts_all_reduce,
 )
 
 __all__ = [
