@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import functools
 import math
+import os
 from typing import Any, Optional, Tuple, Union
 
 import numpy as np
@@ -710,6 +711,50 @@ class LTX2Attention(nn.Module):
             q = q.view(*q.shape[:-1], self.local_heads, self.dim_head)
             k = k.view(*k.shape[:-1], self.local_heads, self.dim_head)
 
+            def _attention_call(
+                q_: torch.Tensor,
+                k_: torch.Tensor,
+                v_: torch.Tensor,
+                mask_: torch.Tensor | None,
+            ) -> torch.Tensor:
+                if self.use_local_attention:
+                    return self.attn(q_, k_, v_, attn_mask=mask_)
+                return self.attn(
+                    q_,
+                    k_,
+                    v_,
+                    attn_mask=mask_,
+                    skip_sequence_parallel_override=skip_sequence_parallel_override,
+                )
+
+            def _maybe_split_attention_batch(
+                q_: torch.Tensor,
+                k_: torch.Tensor,
+                v_: torch.Tensor,
+                mask_: torch.Tensor | None,
+            ) -> torch.Tensor:
+                split_mode = os.getenv("SGLANG_LTX2_ATTENTION_BATCH_SPLIT", "off")
+                if split_mode == "off" or int(q_.shape[0]) <= 1:
+                    return _attention_call(q_, k_, v_, mask_)
+                if split_mode == "perturbed" and perturbation_mask is None:
+                    return _attention_call(q_, k_, v_, mask_)
+                outs = []
+                for idx in range(int(q_.shape[0])):
+                    mask_i = (
+                        mask_[idx : idx + 1]
+                        if mask_ is not None and int(mask_.shape[0]) == int(q_.shape[0])
+                        else mask_
+                    )
+                    outs.append(
+                        _attention_call(
+                            q_[idx : idx + 1],
+                            k_[idx : idx + 1],
+                            v_[idx : idx + 1],
+                            mask_i,
+                        )
+                    )
+                return torch.cat(outs, dim=0)
+
             if gather_context_kv_for_sp:
                 k_full = sequence_model_parallel_all_gather(k.contiguous(), dim=1)
                 v_full = sequence_model_parallel_all_gather(v.contiguous(), dim=1)
@@ -718,7 +763,36 @@ class LTX2Attention(nn.Module):
                     gathered_mask = sequence_model_parallel_all_gather(
                         mask.contiguous(), dim=1
                     )
-                if self.use_local_attention:
+                if os.getenv("SGLANG_LTX2_ATTENTION_BATCH_SPLIT", "off") != "off":
+                    outs = []
+                    for idx in range(int(q.shape[0])):
+                        gathered_mask_i = (
+                            gathered_mask[idx : idx + 1]
+                            if gathered_mask is not None
+                            and int(gathered_mask.shape[0]) == int(q.shape[0])
+                            else gathered_mask
+                        )
+                        if self.use_local_attention:
+                            outs.append(
+                                self.attn(
+                                    q[idx : idx + 1],
+                                    k_full[idx : idx + 1],
+                                    v_full[idx : idx + 1],
+                                    attn_mask=gathered_mask_i,
+                                )
+                            )
+                        else:
+                            outs.append(
+                                self.attn(
+                                    q[idx : idx + 1],
+                                    k_full[idx : idx + 1],
+                                    v_full[idx : idx + 1],
+                                    attn_mask=gathered_mask_i,
+                                    skip_sequence_parallel_override=True,
+                                )
+                            )
+                    out = torch.cat(outs, dim=0)
+                elif self.use_local_attention:
                     out = self.attn(q, k_full, v_full, attn_mask=gathered_mask)
                 else:
                     out = self.attn(
@@ -728,16 +802,8 @@ class LTX2Attention(nn.Module):
                         attn_mask=gathered_mask,
                         skip_sequence_parallel_override=True,
                     )
-            elif self.use_local_attention:
-                out = self.attn(q, k, v, attn_mask=mask)
             else:
-                out = self.attn(
-                    q,
-                    k,
-                    v,
-                    attn_mask=mask,
-                    skip_sequence_parallel_override=skip_sequence_parallel_override,
-                )
+                out = _maybe_split_attention_batch(q, k, v, mask)
 
             if perturbation_mask is not None:
                 if perturbation_mask.ndim == out.ndim - 1:
