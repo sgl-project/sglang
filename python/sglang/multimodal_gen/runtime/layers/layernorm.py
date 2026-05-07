@@ -24,6 +24,7 @@ from sglang.jit_kernel.norm import (
     fused_inplace_qknorm_across_heads,
 )
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
+    get_sequence_parallel_world_size,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
     get_tp_group,
@@ -698,6 +699,13 @@ def _get_tensor_model_parallel_world_size_or_one() -> int:
         return 1
 
 
+def _get_sequence_parallel_world_size_or_one() -> int:
+    try:
+        return get_sequence_parallel_world_size()
+    except AssertionError:
+        return 1
+
+
 def apply_qk_norm_across_heads(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -721,6 +729,7 @@ def apply_qk_norm_across_heads(
         _is_cuda
         and allow_inplace
         and _get_tensor_model_parallel_world_size_or_one() == 1
+        and _get_sequence_parallel_world_size_or_one() == 1
         and not hasattr(q_norm, "full_hidden_size")
         and not hasattr(k_norm, "full_hidden_size")
         and q.shape == k.shape
