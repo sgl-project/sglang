@@ -14,7 +14,6 @@ ONE_NPU_CASES: list[DiffusionTestCase] = [
             model_path="/root/.cache/modelscope/hub/models/black-forest-labs/FLUX.1-dev",
         ),
         T2I_sampling_params,
-        run_consistency_check=False,
     ),
     # === Text to Video (T2V) ===
     DiffusionTestCase(
@@ -25,7 +24,6 @@ ONE_NPU_CASES: list[DiffusionTestCase] = [
         DiffusionSamplingParams(
             prompt=T2V_PROMPT,
         ),
-        run_consistency_check=False,
     ),
 ]
 
@@ -71,3 +69,35 @@ EIGHT_NPU_CASES: list[DiffusionTestCase] = [
         run_consistency_check=False,
     ),
 ]
+
+DEFAULT_EST_TIME_SECONDS = 300.0
+STARTUP_OVERHEAD_SECONDS = 120.0
+DEFAULT_STANDALONE_EST_TIME_SECONDS = 300.0
+
+SUITES = {
+    "1-npu": [
+        "ascend/test_server_1_npu.py",
+        # add new 1-npu test files here
+    ],
+    "2-npu": [
+        "ascend/test_server_2_npu.py",
+        # add new 2-npu test files here
+    ],
+    "8-npu": [
+        "ascend/test_server_8_npu.py",
+        # add new 8-npu test files here
+    ],
+}
+
+PARAMETRIZED_CASE_GROUPS = {
+    "1-npu": [
+        ("ascend/test_server_1_npu.py", ONE_NPU_CASES),
+    ],
+    "2-npu": [
+        ("ascend/test_server_2_npu.py", TWO_NPU_CASES),
+    ],
+}
+
+FILE_SUITES = {}
+STANDALONE_FILES = {}
+COMPONENT_ACCURACY_SUITES = {}

@@ -35,10 +35,14 @@ logger = init_logger(__name__)
 
 SGL_TEST_FILES_OFFICIAL_CONSISTENCY_GT_BASE = "https://raw.githubusercontent.com/sgl-project/ci-data/main/diffusion-ci/consistency_gt/official_generated"
 SGL_TEST_FILES_SGLANG_CONSISTENCY_GT_BASE = "https://raw.githubusercontent.com/sgl-project/ci-data/main/diffusion-ci/consistency_gt/sglang_generated"
+SGL_TEST_FILES_OFFICIAL_CONSISTENCY_GT_BASE_ASCEND = "https://raw.githubusercontent.com/e-martirosian/ci-data/main/diffusion-ci/consistency_gt/official_generated/ascend"
+SGL_TEST_FILES_SGLANG_CONSISTENCY_GT_BASE_ASCEND = "https://raw.githubusercontent.com/e-martirosian/ci-data/main/diffusion-ci/consistency_gt/sglang_generated/ascend"
 SGL_TEST_FILES_CONSISTENCY_GT_BASE = SGL_TEST_FILES_SGLANG_CONSISTENCY_GT_BASE
 SGL_TEST_FILES_CONSISTENCY_GT_BASES = (
     SGL_TEST_FILES_OFFICIAL_CONSISTENCY_GT_BASE,
     SGL_TEST_FILES_SGLANG_CONSISTENCY_GT_BASE,
+    SGL_TEST_FILES_OFFICIAL_CONSISTENCY_GT_BASE_ASCEND,
+    SGL_TEST_FILES_SGLANG_CONSISTENCY_GT_BASE_ASCEND
 )
 CONSISTENCY_THRESHOLD_JSON_PATH = (
     Path(__file__).resolve().parent / "server" / "consistency_threshold.json"

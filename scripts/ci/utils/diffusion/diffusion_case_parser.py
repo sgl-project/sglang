@@ -20,6 +20,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional
 
+from sglang.multimodal_gen.runtime.platforms import current_platform
+
 # Mapping from list variable names to suite names
 CASE_LIST_TO_SUITE = {
     "ONE_GPU_CASES": "1-gpu",
@@ -42,6 +44,13 @@ STARTUP_OVERHEAD_SECONDS = 120.0
 BASELINE_REL_PATH = "python/sglang/multimodal_gen/test/server/perf_baselines.json"
 RUN_SUITE_REL_PATH = "python/sglang/multimodal_gen/test/run_suite.py"
 
+if current_platform.is_npu():
+    BASELINE_REL_PATH = "python/sglang/multimodal_gen/test/server/perf_baselines_npu.json"
+    CASE_LIST_TO_SUITE = {
+        "ONE_NPU_CASES": "1-npu",
+        "TWO_NPU_CASES": "2-npu",
+        "EIGHT_NPU_CASES": "8-npu",
+    }
 
 @dataclass
 class DiffusionCaseInfo:
