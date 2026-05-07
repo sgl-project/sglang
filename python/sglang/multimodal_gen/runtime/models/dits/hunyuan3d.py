@@ -1228,12 +1228,12 @@ class UNet2p5DConditionModel(torch.nn.Module):
                         attn.transformer_blocks
                     ):
                         if isinstance(transformer, BasicTransformerBlock):
-                            attn.transformer_blocks[
-                                transformer_i
-                            ] = Basic2p5DTransformerBlock(
-                                transformer,
-                                f"down_{down_block_i}_{attn_i}_{transformer_i}",
-                                **block_kwargs,
+                            attn.transformer_blocks[transformer_i] = (
+                                Basic2p5DTransformerBlock(
+                                    transformer,
+                                    f"down_{down_block_i}_{attn_i}_{transformer_i}",
+                                    **block_kwargs,
+                                )
                             )
 
         # Mid block
@@ -1244,12 +1244,12 @@ class UNet2p5DConditionModel(torch.nn.Module):
             for attn_i, attn in enumerate(unet.mid_block.attentions):
                 for transformer_i, transformer in enumerate(attn.transformer_blocks):
                     if isinstance(transformer, BasicTransformerBlock):
-                        attn.transformer_blocks[
-                            transformer_i
-                        ] = Basic2p5DTransformerBlock(
-                            transformer,
-                            f"mid_{attn_i}_{transformer_i}",
-                            **block_kwargs,
+                        attn.transformer_blocks[transformer_i] = (
+                            Basic2p5DTransformerBlock(
+                                transformer,
+                                f"mid_{attn_i}_{transformer_i}",
+                                **block_kwargs,
+                            )
                         )
 
         # Up blocks
@@ -1263,12 +1263,12 @@ class UNet2p5DConditionModel(torch.nn.Module):
                         attn.transformer_blocks
                     ):
                         if isinstance(transformer, BasicTransformerBlock):
-                            attn.transformer_blocks[
-                                transformer_i
-                            ] = Basic2p5DTransformerBlock(
-                                transformer,
-                                f"up_{up_block_i}_{attn_i}_{transformer_i}",
-                                **block_kwargs,
+                            attn.transformer_blocks[transformer_i] = (
+                                Basic2p5DTransformerBlock(
+                                    transformer,
+                                    f"up_{up_block_i}_{attn_i}_{transformer_i}",
+                                    **block_kwargs,
+                                )
                             )
 
         if use_sglang_attn and (use_ma or use_ra):

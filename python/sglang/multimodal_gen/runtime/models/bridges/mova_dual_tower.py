@@ -478,24 +478,24 @@ class DualTowerConditionalBridge(
 
         # Audio DiT hidden states conditioning Video DiT
         for v_layer, _ in self.interaction_mapping["a2v"]:
-            self.audio_to_video_conditioners[
-                str(v_layer)
-            ] = ConditionalCrossAttentionBlock(
-                dim=visual_hidden_dim,
-                kv_dim=audio_hidden_dim,
-                num_heads=visual_hidden_dim // head_dim,
-                pooled_adaln=False,
+            self.audio_to_video_conditioners[str(v_layer)] = (
+                ConditionalCrossAttentionBlock(
+                    dim=visual_hidden_dim,
+                    kv_dim=audio_hidden_dim,
+                    num_heads=visual_hidden_dim // head_dim,
+                    pooled_adaln=False,
+                )
             )
 
         # Visual DiT hidden states conditioning Audio DiT
         for a_layer, _ in self.interaction_mapping["v2a"]:
-            self.video_to_audio_conditioners[
-                str(a_layer)
-            ] = ConditionalCrossAttentionBlock(
-                dim=audio_hidden_dim,
-                kv_dim=visual_hidden_dim,
-                num_heads=audio_hidden_dim // head_dim,
-                pooled_adaln=self.pooled_adaln,
+            self.video_to_audio_conditioners[str(a_layer)] = (
+                ConditionalCrossAttentionBlock(
+                    dim=audio_hidden_dim,
+                    kv_dim=visual_hidden_dim,
+                    num_heads=audio_hidden_dim // head_dim,
+                    pooled_adaln=self.pooled_adaln,
+                )
             )
 
         # Required attributes for CachableDiT/BaseDiT

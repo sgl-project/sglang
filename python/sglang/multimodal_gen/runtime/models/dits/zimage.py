@@ -921,7 +921,13 @@ class ZImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         device = x[0].device
         t = self.t_embedder(t)
         adaln_input = t.to(dtype=x[0].dtype)
-        (x, cap_feats, x_size, x_valid_lens, cap_valid_lens,) = self.patchify_and_embed(
+        (
+            x,
+            cap_feats,
+            x_size,
+            x_valid_lens,
+            cap_valid_lens,
+        ) = self.patchify_and_embed(
             x,
             cap_feats,
             patch_size,

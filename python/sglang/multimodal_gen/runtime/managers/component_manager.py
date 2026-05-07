@@ -78,8 +78,7 @@ class ResidencyBatch(Protocol):
 class ComponentResidencyStage(Protocol):
     def component_uses(
         self, server_args: ServerArgs, stage_name: str | None = None
-    ) -> list[ComponentUse]:
-        ...
+    ) -> list[ComponentUse]: ...
 
 
 class ComponentResidencyPipeline(Protocol):
