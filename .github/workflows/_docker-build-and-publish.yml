@@ -1,17 +1,17 @@
-name: Build and Publish Multi-Arch Docker Images
+name: Build and Publish Volcengine Docker Images
 
-# Reusable workflow: builds CUDA 12 + CUDA 13 images for amd64 and arm64,
-# then creates multi-arch manifests with caller-specified tags.
+# Reusable workflow: builds CUDA 12 + CUDA 13 amd64 images once, then publishes
+# Volcengine CR tags from the resulting digests.
 
 on:
   workflow_call:
     inputs:
       docker_target:
-        description: "Dockerfile target stage (framework or runtime)"
+        description: "Dockerfile target stage"
         required: true
         type: string
       sgl_version:
-        description: "Version string passed as SGL_VERSION build arg (empty to skip)"
+        description: "Version string passed as SGL_VERSION build arg"
         required: false
         type: string
         default: ""
@@ -21,7 +21,7 @@ on:
         type: string
         default: ""
       checkout_ref:
-        description: "Git ref to checkout (empty for default)"
+        description: "Git ref to checkout"
         required: false
         type: string
         default: ""
@@ -34,21 +34,29 @@ on:
         required: false
         type: string
         default: ""
-      image_repo:
-        description: "Docker Hub repo to push to (e.g. lmsysorg/sglang-staging for testing)"
+      registry_host:
+        description: "Volcengine CR registry host"
         required: false
         type: string
-        default: "lmsysorg/sglang"
+        default: ""
+      image_repo:
+        description: "Full Volcengine CR image repository"
+        required: false
+        type: string
+        default: ""
 
 jobs:
   build-x86:
-    if: github.repository == 'sgl-project/sglang'
+    if: github.repository == 'bytedance-iaas/sglang'
     environment: ${{ inputs.use_environment || null }}
     runs-on: x64-docker-build-node
     env:
       TAG_CONFIG: ${{ inputs.tag_config }}
       SGL_VERSION: ${{ inputs.sgl_version }}
       IMAGE_REPO: ${{ inputs.image_repo }}
+      REGISTRY_HOST: ${{ inputs.registry_host }}
+      VOLCENGINE_CR_USERNAME: ${{ secrets.VOLCENGINE_CR_USERNAME }}
+      VOLCENGINE_CR_PASSWORD: ${{ secrets.VOLCENGINE_CR_PASSWORD }}
     outputs:
       digest-cu129: ${{ steps.build-cu129.outputs.digest }}
       digest-cu130: ${{ steps.build-cu130.outputs.digest }}
@@ -83,13 +91,13 @@ jobs:
       - name: Free disk space
         uses: jlumbroso/free-disk-space@main
         with:
-          tool-cache: true
-          docker-images: true
+          tool-cache: false
+          docker-images: false
           android: true
           dotnet: true
           haskell: true
           large-packages: true
-          swap-storage: true
+          swap-storage: false
 
       - name: Prune Docker to reclaim disk space
         run: |
@@ -97,18 +105,24 @@ jobs:
           docker system prune -af --filter "until=72h"
           docker volume prune -af
 
-      - name: Set up Docker Buildx
+      - name: Set up Docker Buildx with local Docker Hub mirror
         uses: docker/setup-buildx-action@v3
-
-      - name: Login to Docker Hub
-        uses: docker/login-action@v2
         with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          driver-opts: |
+            network=host
+          buildkitd-config-inline: |
+            [registry."docker.io"]
+              mirrors = ["127.0.0.1:5000"]
+
+      - name: Login to Volcengine CR
+        run: |
+          set -euo pipefail
+          echo "${VOLCENGINE_CR_PASSWORD}" | docker login "${REGISTRY_HOST}" --username "${VOLCENGINE_CR_USERNAME}" --password-stdin
 
       - name: Build and push AMD64 image (CUDA 12)
         id: build-cu129
         run: |
+          set -euo pipefail
           VERSION_ARG=""
           if [ -n "${SGL_VERSION}" ]; then
             VERSION_ARG="--build-arg SGL_VERSION=${SGL_VERSION}"
@@ -118,7 +132,7 @@ jobs:
           docker buildx build \
             --target ${{ inputs.docker_target }} \
             --platform linux/amd64 \
-            --output type=image,name=${{ inputs.image_repo }},push-by-digest=true,name-canonical=true,push=true \
+            --output type=image,name=${IMAGE_REPO},push-by-digest=true,name-canonical=true,push=true \
             -f docker/Dockerfile \
             --build-arg CUDA_VERSION=12.9.1 \
             --build-arg BUILD_TYPE=all \
@@ -138,6 +152,7 @@ jobs:
       - name: Build and push AMD64 image (CUDA 13)
         id: build-cu130
         run: |
+          set -euo pipefail
           VERSION_ARG=""
           if [ -n "${SGL_VERSION}" ]; then
             VERSION_ARG="--build-arg SGL_VERSION=${SGL_VERSION}"
@@ -147,7 +162,7 @@ jobs:
           docker buildx build \
             --target ${{ inputs.docker_target }} \
             --platform linux/amd64 \
-            --output type=image,name=${{ inputs.image_repo }},push-by-digest=true,name-canonical=true,push=true \
+            --output type=image,name=${IMAGE_REPO},push-by-digest=true,name-canonical=true,push=true \
             -f docker/Dockerfile \
             --build-arg CUDA_VERSION=13.0.1 \
             --build-arg BUILD_TYPE=all \
@@ -164,158 +179,44 @@ jobs:
           echo "Pushed digest: ${DIGEST}"
           echo "digest=${DIGEST}" >> $GITHUB_OUTPUT
 
-  build-arm64:
-    if: github.repository == 'sgl-project/sglang'
+  create-manifests:
+    if: github.repository == 'bytedance-iaas/sglang'
+    runs-on: ubuntu-22.04
+    needs: [build-x86]
     environment: ${{ inputs.use_environment || null }}
-    runs-on: arm-docker-build-node
     env:
       TAG_CONFIG: ${{ inputs.tag_config }}
       SGL_VERSION: ${{ inputs.sgl_version }}
       IMAGE_REPO: ${{ inputs.image_repo }}
-    outputs:
-      digest-cu129: ${{ steps.build-cu129.outputs.digest }}
-      digest-cu130: ${{ steps.build-cu130.outputs.digest }}
+      REGISTRY_HOST: ${{ inputs.registry_host }}
+      X86_CU129: ${{ needs.build-x86.outputs.digest-cu129 }}
+      X86_CU130: ${{ needs.build-x86.outputs.digest-cu130 }}
+      SHORT_SHA: ${{ github.sha }}
+      VOLCENGINE_CR_USERNAME: ${{ secrets.VOLCENGINE_CR_USERNAME }}
+      VOLCENGINE_CR_PASSWORD: ${{ secrets.VOLCENGINE_CR_PASSWORD }}
     steps:
-      - name: Delete huge unnecessary tools folder
-        run: rm -rf /opt/hostedtoolcache
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
 
-      - name: Cleanup workspace (remove root-owned files from prior runs)
-        run: sudo rm -rf "$GITHUB_WORKSPACE"/* || true
-
-      - name: Checkout repository
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.checkout_ref || github.ref }}
-
-      - name: Compute Docker build metadata args
+      - name: Login to Volcengine CR
         run: |
           set -euo pipefail
-          BUILD_COMMIT="$(git rev-parse HEAD)"
-          BUILD_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
-          for CUDA_VARIANT in cu129 cu130; do
-            python3 scripts/ci/utils/docker_build_metadata_args.py \
-              --cuda "${CUDA_VARIANT}" \
-              --tag-config "${TAG_CONFIG}" \
-              --image-repo "${IMAGE_REPO}" \
-              --sgl-version "${SGL_VERSION}" \
-              --build-commit "${BUILD_COMMIT}" \
-              --build-url "${BUILD_URL}" \
-              > "/tmp/docker-metadata-${CUDA_VARIANT}.args"
-          done
+          echo "${VOLCENGINE_CR_PASSWORD}" | docker login "${REGISTRY_HOST}" --username "${VOLCENGINE_CR_USERNAME}" --password-stdin
 
-      - name: Prune Docker to reclaim disk space
+      - name: Create Volcengine image tags
         run: |
-          docker buildx prune --filter "until=72h" -f
-          docker system prune -af --filter "until=72h"
-          docker volume prune -af
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Login to Docker Hub
-        uses: docker/login-action@v2
-        with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-
-      - name: Build and push ARM64 image (CUDA 12)
-        id: build-cu129
-        run: |
-          VERSION_ARG=""
-          if [ -n "${SGL_VERSION}" ]; then
-            VERSION_ARG="--build-arg SGL_VERSION=${SGL_VERSION}"
-          fi
-          mapfile -t METADATA_ARGS < /tmp/docker-metadata-cu129.args
-
-          docker buildx build \
-            --target ${{ inputs.docker_target }} \
-            --platform linux/arm64 \
-            --output type=image,name=${{ inputs.image_repo }},push-by-digest=true,name-canonical=true,push=true \
-            -f docker/Dockerfile \
-            --build-arg CUDA_VERSION=12.9.1 \
-            --build-arg BUILD_TYPE=all \
-            --build-arg GRACE_BLACKWELL=1 \
-            --build-arg INSTALL_FLASHINFER_JIT_CACHE=1 \
-            "${METADATA_ARGS[@]}" \
-            ${VERSION_ARG} \
-            ${{ inputs.extra_build_args }} \
-            --metadata-file /tmp/metadata-cu129.json \
-            --no-cache \
-            .
-
-          DIGEST=$(python3 -c "import json; print(json.load(open('/tmp/metadata-cu129.json'))['containerimage.digest'])")
-          echo "Pushed digest: ${DIGEST}"
-          echo "digest=${DIGEST}" >> $GITHUB_OUTPUT
-
-      - name: Build and push ARM64 image (CUDA 13)
-        id: build-cu130
-        run: |
-          VERSION_ARG=""
-          if [ -n "${SGL_VERSION}" ]; then
-            VERSION_ARG="--build-arg SGL_VERSION=${SGL_VERSION}"
-          fi
-          mapfile -t METADATA_ARGS < /tmp/docker-metadata-cu130.args
-
-          docker buildx build \
-            --target ${{ inputs.docker_target }} \
-            --platform linux/arm64 \
-            --output type=image,name=${{ inputs.image_repo }},push-by-digest=true,name-canonical=true,push=true \
-            -f docker/Dockerfile \
-            --build-arg CUDA_VERSION=13.0.1 \
-            --build-arg BUILD_TYPE=all \
-            --build-arg GRACE_BLACKWELL=1 \
-            --build-arg INSTALL_FLASHINFER_JIT_CACHE=1 \
-            "${METADATA_ARGS[@]}" \
-            ${VERSION_ARG} \
-            ${{ inputs.extra_build_args }} \
-            --metadata-file /tmp/metadata-cu130.json \
-            --no-cache \
-            .
-
-          DIGEST=$(python3 -c "import json; print(json.load(open('/tmp/metadata-cu130.json'))['containerimage.digest'])")
-          echo "Pushed digest: ${DIGEST}"
-          echo "digest=${DIGEST}" >> $GITHUB_OUTPUT
-
-  create-manifests:
-    runs-on: ubuntu-latest
-    needs: [build-x86, build-arm64]
-    if: github.repository == 'sgl-project/sglang'
-    environment: ${{ inputs.use_environment || null }}
-    steps:
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Login to Docker Hub
-        uses: docker/login-action@v2
-        with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-
-      - name: Create multi-arch manifests
-        env:
-          TAG_CONFIG: ${{ inputs.tag_config }}
-          SGL_VERSION: ${{ inputs.sgl_version }}
-          IMAGE_REPO: ${{ inputs.image_repo }}
-          X86_CU129: ${{ needs.build-x86.outputs.digest-cu129 }}
-          X86_CU130: ${{ needs.build-x86.outputs.digest-cu130 }}
-          ARM64_CU129: ${{ needs.build-arm64.outputs.digest-cu129 }}
-          ARM64_CU130: ${{ needs.build-arm64.outputs.digest-cu130 }}
-          SHORT_SHA: ${{ github.sha }}
-        run: |
+          set -euo pipefail
           echo "${TAG_CONFIG}" | jq -c '.[]' | while read -r entry; do
             CUDA=$(echo "${entry}" | jq -r '.cuda')
 
             if [ "${CUDA}" = "cu129" ]; then
               X86_DIGEST="${X86_CU129}"
-              ARM64_DIGEST="${ARM64_CU129}"
             else
               X86_DIGEST="${X86_CU130}"
-              ARM64_DIGEST="${ARM64_CU130}"
             fi
 
             TAG_ARGS=""
             for tag in $(echo "${entry}" | jq -r '.tags[]'); do
-              # Substitute template variables
               tag=$(echo "${tag}" | sed "s/{version}/${SGL_VERSION}/g")
               tag=$(echo "${tag}" | sed "s/{date}/$(date +%Y%m%d)/g")
               tag=$(echo "${tag}" | sed "s/{short_sha}/${SHORT_SHA:0:8}/g")
@@ -324,8 +225,7 @@ jobs:
 
             docker buildx imagetools create \
               ${TAG_ARGS} \
-              ${IMAGE_REPO}@${X86_DIGEST} \
-              ${IMAGE_REPO}@${ARM64_DIGEST}
+              ${IMAGE_REPO}@${X86_DIGEST}
 
             echo "Published:${TAG_ARGS}"
           done
