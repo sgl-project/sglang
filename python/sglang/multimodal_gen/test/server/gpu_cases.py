@@ -588,9 +588,8 @@ TWO_GPU_CASES = [
             tp_size=2,
             extras=[
                 "--pipeline-class-name LTX2TwoStagePipeline",
-                "--ltx2-two-stage-device-mode resident",
+                "--ltx2-two-stage-device-mode original",
                 "--transformer-weight-quantization fp8-cast",
-                "--component-attention-backends transformer_2=torch_sdpa",
             ],
         ),
         DiffusionSamplingParams(prompt=T2V_PROMPT, extras={"seed": 42}),
