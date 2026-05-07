@@ -706,6 +706,21 @@ def _get_sequence_parallel_world_size_or_one() -> int:
         return 1
 
 
+def _can_use_local_hidden_stats_for_qk_norm(
+    q_norm: nn.Module, k_norm: nn.Module
+) -> bool:
+    if (
+        _get_tensor_model_parallel_world_size_or_one() != 1
+        or _get_sequence_parallel_world_size_or_one() != 1
+    ):
+        return False
+    # Norm wrappers with full_hidden_size compute RMS statistics across shards.
+    # The fused across-heads kernel only normalizes local contiguous hidden dims.
+    return not (
+        hasattr(q_norm, "full_hidden_size") or hasattr(k_norm, "full_hidden_size")
+    )
+
+
 def apply_qk_norm_across_heads(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -728,10 +743,7 @@ def apply_qk_norm_across_heads(
     if (
         _is_cuda
         and allow_inplace
-        and _get_tensor_model_parallel_world_size_or_one() == 1
-        and _get_sequence_parallel_world_size_or_one() == 1
-        and not hasattr(q_norm, "full_hidden_size")
-        and not hasattr(k_norm, "full_hidden_size")
+        and _can_use_local_hidden_stats_for_qk_norm(q_norm, k_norm)
         and q.shape == k.shape
         and hidden_size is not None
         and q.shape[-1] == hidden_size
