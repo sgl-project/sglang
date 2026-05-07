@@ -424,6 +424,8 @@ class SWAComponent(TreeComponent):
         ct = self.component_type
 
         if phase == CacheTransferPhase.BACKUP_HOST:
+            if not self.hicache_host_enabled():
+                return None
             cd = node.component_data[ct]
             if cd.value is None:
                 return None
@@ -469,6 +471,9 @@ class SWAComponent(TreeComponent):
             ]
 
         return None
+
+    def hicache_host_enabled(self) -> bool:
+        return self._swa_kv_pool_host is not None
 
     def commit_hicache_transfer(
         self,

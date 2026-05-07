@@ -342,6 +342,14 @@ class TreeComponent(ABC):
         Returns None if the component has nothing to transfer."""
         return None
 
+    def hicache_host_enabled(self) -> bool:
+        """Whether this component participates in HiCache host offload.
+
+        Components can still keep device-side cache entries when this returns
+        False; this only controls host-pool backup/load participation.
+        """
+        return True
+
     def commit_hicache_transfer(
         self,
         node: UnifiedTreeNode,
