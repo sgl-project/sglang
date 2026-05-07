@@ -2,6 +2,7 @@
 
 # SPDX-License-Identifier: Apache-2.0
 import json
+import math
 import os
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, field, fields
@@ -101,6 +102,44 @@ def postprocess_text(output: BaseEncoderOutput, _text_inputs) -> torch.tensor:
     raise NotImplementedError
 
 
+@dataclass(frozen=True)
+class TextConditioningOutput:
+    """Text embeddings and masks aligned to postprocessed sequence length.
+
+    `prompt_embeds_mask` and `prompt_seq_lens` describe real text tokens after
+    model-specific trimming or packing, not the raw tokenizer output.
+    """
+
+    prompt_embeds: torch.Tensor
+    prompt_embeds_mask: torch.Tensor | None = None
+    prompt_seq_lens: list[int] | None = None
+
+
+def pad_text_embeddings_with_mask(
+    text_embeds: list[torch.Tensor],
+) -> TextConditioningOutput:
+    """Pad variable-length text embeddings and return the valid-token mask."""
+    if not text_embeds:
+        raise ValueError("text_embeds must contain at least one tensor")
+
+    max_seq_len = max(e.size(0) for e in text_embeds)
+    prompt_embeds = torch.stack(
+        [
+            torch.cat([e, e.new_zeros(max_seq_len - e.size(0), e.size(1))])
+            for e in text_embeds
+        ]
+    )
+    seq_lens = [int(e.size(0)) for e in text_embeds]
+    seq_lens_tensor = torch.tensor(
+        seq_lens,
+        device=prompt_embeds.device,
+        dtype=torch.long,
+    )
+    positions = torch.arange(max_seq_len, device=prompt_embeds.device).unsqueeze(0)
+    prompt_embeds_mask = positions < seq_lens_tensor.unsqueeze(1)
+    return TextConditioningOutput(prompt_embeds, prompt_embeds_mask, seq_lens)
+
+
 def shard_rotary_emb_for_sp(emb):
     """
     Shard rotary embeddings [S, D] along sequence for SP.
@@ -151,7 +190,6 @@ def maybe_unpad_latents(latents, batch):
     return latents
 
 
-# config for a single pipeline
 @dataclass
 class PipelineConfig:
     """The base configuration class for a generation pipeline."""
@@ -330,6 +368,41 @@ class PipelineConfig:
     def allow_set_num_frames(self):
         return False
 
+    def supports_dynamic_batching(self):
+        """Return whether this pipeline can opt in to dynamic batching.
+
+        The scheduler still checks each request before merging it into a batch.
+        """
+        return self.task_type in (ModelTaskType.T2I, ModelTaskType.T2V)
+
+    def estimate_request_cost(self, batch) -> float:
+        """Return the relative cost used for batching admission caps.
+
+        This is compared with `max_cost` from the batching config; it is not a
+        memory estimate. The default cost is latent tokens times frames times
+        outputs; pipelines can override it for model-specific admission.
+        """
+        latent_tokens = float(batch.n_tokens or 0)
+        if latent_tokens <= 0:
+            width = int(batch.width or 0)
+            height = int(batch.height or 0)
+            if width > 0 and height > 0:
+                vae_scale = getattr(
+                    self.vae_config.arch_config, "vae_scale_factor", None
+                )
+                if vae_scale is None and hasattr(
+                    self.vae_config, "get_vae_scale_factor"
+                ):
+                    vae_scale = self.vae_config.get_vae_scale_factor()
+                vae_scale = max(1, int(vae_scale or 1))
+                latent_tokens = math.ceil(width / vae_scale) * math.ceil(
+                    height / vae_scale
+                )
+
+        num_frames = max(1, int(batch.num_frames or 1))
+        num_outputs = max(1, int(batch.num_outputs_per_prompt or 1))
+        return latent_tokens * num_frames * num_outputs
+
     def get_decode_scale_and_shift(self, device, dtype, vae):
         vae_arch_config = self.vae_config.arch_config
         scaling_factor = getattr(vae_arch_config, "scaling_factor", None)
@@ -352,22 +425,80 @@ class PipelineConfig:
     def postprocess_vae_encode(self, image_latents, vae):
         return image_latents
 
+    # called after postprocess_vae_encode, before generic scale/shift
+    def normalize_vae_encode(self, image_latents, vae):
+        return None
+
     # called after scale_and_shift, before vae decoding
     def preprocess_decoding(self, latents, server_args=None, vae=None):
         return latents
 
+    @staticmethod
+    def _gather_sp_tensor(tensor: torch.Tensor, *, dim: int) -> torch.Tensor:
+        """All-gather an SP-sharded tensor along the specified logical dimension."""
+        return sequence_model_parallel_all_gather(tensor.contiguous(), dim=dim)
+
+    @staticmethod
+    def _trim_sp_gather_padding(
+        tensor: torch.Tensor, *, orig_len: int | None, dim: int
+    ) -> torch.Tensor:
+        """Trim padding introduced before SP sharding back to the original length."""
+        if orig_len is None:
+            return tensor
+        orig_len = int(orig_len)
+        if orig_len <= 0 or tensor.shape[dim] <= orig_len:
+            return tensor
+        slices = [slice(None)] * tensor.ndim
+        slices[dim] = slice(orig_len)
+        return tensor[tuple(slices)]
+
     def gather_latents_for_sp(self, latents, batch=None):
         # For video latents [B, C, T_local, H, W], gather along time dim=2
-        latents = sequence_model_parallel_all_gather(latents, dim=2)
-        return latents
+        return self._gather_sp_tensor(latents, dim=2)
+
+    def can_shard_audio_latents_for_sp(self, audio_latents) -> bool:
+        """Return whether this pipeline uses packed audio latents that can be SP-sharded."""
+        return False
+
+    def shard_audio_latents_for_sp(self, batch, audio_latents):
+        """Shard packed audio latents for SP. Pipelines without packed audio latents should return the input unchanged."""
+        return audio_latents, False
+
+    def gather_audio_latents_for_sp(self, audio_latents, batch):
+        """Gather SP-sharded audio latents back to full sequence length."""
+        return audio_latents
+
+    def prepare_video_rope_coords_for_sp(
+        self,
+        model,
+        batch,
+        latent_model_input,
+        *,
+        num_frames,
+        height,
+        width,
+    ):
+        """Prepare model-side video RoPE coordinates for the local SP shard when the pipeline requires them."""
+        return None
+
+    def prepare_audio_rope_coords_for_sp(
+        self,
+        model,
+        batch,
+        audio_latent_model_input,
+        *,
+        num_frames,
+    ):
+        """Prepare model-side audio RoPE coordinates for the local SP shard when the pipeline requires them."""
+        return None
 
     def gather_noise_pred_for_sp(self, batch, noise_pred):
         noise_pred = self.gather_latents_for_sp(noise_pred)
         raw_latent_shape = getattr(batch, "raw_latent_shape", None)
         if raw_latent_shape is not None and noise_pred.dim() == 3:
-            orig_s = raw_latent_shape[1]
-            if noise_pred.shape[1] > orig_s:
-                noise_pred = noise_pred[:, :orig_s, :]
+            noise_pred = self._trim_sp_gather_padding(
+                noise_pred, orig_len=raw_latent_shape[1], dim=1
+            )
         return noise_pred
 
     def preprocess_vae_image(self, batch, vae_image_processor):
@@ -402,6 +533,119 @@ class PipelineConfig:
         sharded_tensor = sharded_tensor[:, :, rank_in_sp_group, :, :, :]
         return sharded_tensor, True
 
+    def get_text_encoder_attention_mask(
+        self, text_inputs: dict, encoder_index: int
+    ) -> "torch.Tensor | None":
+        """Return the attention mask for the given text encoder.
+
+        Override to suppress (return None) or modify the mask per model.
+        """
+        return text_inputs.get("attention_mask")
+
+    def build_text_conditioning_mask(
+        self,
+        text_inputs: dict,
+        text_encoder_attention_mask: "torch.Tensor | None",
+        prompt_embeds: "torch.Tensor",
+        encoder_index: int,
+    ) -> "torch.Tensor":
+        """Return a mask aligned with post-processed prompt embeddings.
+
+        True values mark valid text tokens. Dynamic batching must carry
+        post-processed semantic text lengths explicitly; if a model-specific
+        postprocessor changes the sequence length, it must return
+        TextConditioningOutput with an embedding-aligned mask.
+        """
+        if prompt_embeds.ndim < 2:
+            raise ValueError(
+                "prompt_embeds must have shape [batch, seq, ...] to build text conditioning mask"
+            )
+
+        if prompt_embeds.ndim == 2:
+            batch_size, embed_seq_len = 1, prompt_embeds.shape[0]
+        else:
+            batch_size, embed_seq_len = prompt_embeds.shape[:2]
+        device = prompt_embeds.device
+        if text_encoder_attention_mask is None:
+            return torch.ones(
+                (batch_size, embed_seq_len), dtype=torch.bool, device=device
+            )
+
+        raw_mask = text_encoder_attention_mask.to(device=device).bool()
+        if raw_mask.ndim != 2 or raw_mask.shape[0] != batch_size:
+            raise ValueError(
+                "text attention mask must have shape [batch, seq] matching prompt_embeds batch"
+            )
+
+        if raw_mask.shape[1] == embed_seq_len:
+            return raw_mask
+
+        if prompt_embeds.ndim == 2 and raw_mask.shape[0] == 1:
+            return torch.ones((1, embed_seq_len), dtype=torch.bool, device=device)
+
+        raise ValueError(
+            "text attention mask length does not match postprocessed prompt embeddings. "
+            "Postprocess functions that trim, pack, or otherwise change text sequence "
+            "length must return TextConditioningOutput with an embedding-aligned mask."
+        )
+
+    @staticmethod
+    def seq_lens_from_text_conditioning_mask(mask: "torch.Tensor") -> list[int]:
+        if mask.ndim != 2:
+            raise ValueError("text conditioning mask must have shape [batch, seq]")
+        return torch.count_nonzero(mask, dim=1).tolist()
+
+    def require_text_seq_lens(
+        self,
+        batch,
+        encoder_index: int,
+        *,
+        negative: bool = False,
+        expected_batch_size: int | None = None,
+    ) -> list[int]:
+        """Return postprocessed text lengths captured during text encoding.
+
+        Dynamic batches use these lengths for model masks, RoPE, and cache
+        sizing after text embeddings have been padded.
+        """
+        seq_lens_by_encoder = (
+            batch.negative_prompt_seq_lens if negative else batch.prompt_seq_lens
+        )
+        kind = "negative" if negative else "positive"
+        if seq_lens_by_encoder is None or encoder_index >= len(seq_lens_by_encoder):
+            raise ValueError(
+                f"Missing {kind} prompt_seq_lens for text encoder {encoder_index}; "
+                "dynamic text conditioning requires explicit sequence lengths."
+            )
+
+        seq_lens = [int(x) for x in seq_lens_by_encoder[encoder_index]]
+        if expected_batch_size is not None and len(seq_lens) != int(
+            expected_batch_size
+        ):
+            raise ValueError(
+                f"{kind} prompt_seq_lens for text encoder {encoder_index} has "
+                f"{len(seq_lens)} entries, expected {expected_batch_size}."
+            )
+        return seq_lens
+
+    def get_text_encoder_pooler_output(
+        self, outputs: "BaseEncoderOutput", encoder_index: int
+    ) -> "torch.Tensor | None":
+        """Return the pooler output for the given text encoder, or None to skip.
+
+        Override for models that need pooled embeddings (e.g. FLUX v1, SD3).
+        """
+        return None
+
+    def select_vae_weight_files(
+        self,
+        safetensors_list: list[str],
+        component_model_path: str,
+        component_name: str,
+        vae_precision: str,
+    ) -> list[str]:
+        return safetensors_list
+
     def get_pos_prompt_embeds(self, batch):
         return batch.prompt_embeds
 
@@ -423,6 +667,9 @@ class PipelineConfig:
 
     def _unpad_and_unpack_latents(self, latents, audio_latents, batch, vae, audio_vae):
         raise NotImplementedError("not yet implemented")
+
+    def gather_denoising_env_static_for_sp(self, batch, cond_kwargs: dict | None):
+        return cond_kwargs
 
     @staticmethod
     def add_cli_args(
@@ -789,6 +1036,8 @@ class ImagePipelineConfig(PipelineConfig):
     def shard_latents_for_sp(self, batch, latents):
         # latents: [B, H * W, C]
         sp_world_size, rank_in_sp_group = get_sp_world_size(), get_sp_parallel_rank()
+        if batch.enable_sequence_shard:
+            return latents, False
         seq_len = latents.shape[1]
 
         # TODO: reuse code in PipelineConfig::shard_latents_for_sp
@@ -810,8 +1059,7 @@ class ImagePipelineConfig(PipelineConfig):
 
     def gather_latents_for_sp(self, latents, batch=None):
         # For image latents [B, S_local, D], gather along sequence dim=1
-        latents = sequence_model_parallel_all_gather(latents, dim=1)
-        return latents
+        return self._gather_sp_tensor(latents, dim=1)
 
     def _unpad_and_unpack_latents(self, latents, batch):
         vae_scale_factor = self.vae_config.arch_config.vae_scale_factor
@@ -868,7 +1116,7 @@ class SpatialImagePipelineConfig(ImagePipelineConfig):
         if latents.dim() != 4:
             return super().gather_latents_for_sp(latents, batch=batch)
         # Gather along dim=2 (H') to match shard_latents_for_sp
-        return sequence_model_parallel_all_gather(latents, dim=2)
+        return self._gather_sp_tensor(latents, dim=2)
 
 
 @dataclass

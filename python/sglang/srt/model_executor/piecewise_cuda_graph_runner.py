@@ -42,6 +42,7 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 from sglang.srt.distributed.parallel_state import graph_capture
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
+    get_attention_cp_size,
     get_attention_tp_rank,
     get_attention_tp_size,
     set_dp_buffer_len,
@@ -58,7 +59,12 @@ from sglang.srt.model_executor.forward_batch_info import (
     PPProxyTensors,
 )
 from sglang.srt.model_executor.input_buffers import ForwardInputBuffers
-from sglang.srt.utils import get_available_gpu_memory, is_npu, log_info_on_rank0
+from sglang.srt.utils import (
+    get_available_gpu_memory,
+    is_npu,
+    log_info_on_rank0,
+    require_gathered_buffer,
+)
 
 # Suppress Dynamo warning about tracing through lru_cache-wrapped functions (e.g., is_arch_support_pdl).
 warnings.filterwarnings("ignore", message=".*lru_cache.*", module="torch._dynamo")
@@ -189,6 +195,21 @@ class PiecewiseCudaGraphRunner:
 
         # Batch sizes to capture
         self.capture_num_tokens = self.compile_config.get_capture_sizes()
+        # When the layer communicator scatters/gathers across the attention TP
+        # group (e.g. with --moe-dense-tp-size 1), the model's reduce_scatter
+        # requires the token count to be divisible by attn_tp_size * attn_cp_size.
+        # Drop captures that would violate this (mirrors the filter used by
+        # the regular CUDA graph runner in get_batch_sizes_to_capture).
+        if require_gathered_buffer(self.model_runner.server_args):
+            mul_base = self.attn_tp_size
+            attn_cp_size = get_attention_cp_size()
+            if mul_base % attn_cp_size != 0:
+                mul_base *= attn_cp_size
+            filtered = [n for n in self.capture_num_tokens if n % mul_base == 0]
+            assert (
+                len(filtered) > 0
+            ), f"No piecewise CUDA graph capture sizes are multiples of {mul_base}"
+            self.capture_num_tokens = filtered
         log_info_on_rank0(
             logger, f"Capture cuda graph num tokens {self.capture_num_tokens}"
         )
@@ -206,6 +227,9 @@ class PiecewiseCudaGraphRunner:
 
         self.is_multimodal = model_runner.is_multimodal
         self.mamba_track_enabled = self.is_mamba_track_enabled()
+        # Classification/reward forwards branch on return_pooled_hidden_states; piecewise
+        # CUDA graph capture must use the same flag value as replay for those models.
+        self.capture_return_pooled_hidden_states = not model_runner.is_generation
 
         # Graph inputs
         with torch.device(self.device):
@@ -280,8 +304,14 @@ class PiecewiseCudaGraphRunner:
             language_model = getattr(
                 self.model_runner.model, "language_model", self.model_runner.model
             )
+            layer_model = (
+                language_model.model
+                if hasattr(language_model, "model")
+                and hasattr(language_model.model, "layers")
+                else language_model
+            )
             with patch_model(
-                language_model.model, self.compile_config.compiler
+                layer_model, self.compile_config.compiler
             ) as patched_model:
 
                 # Dummy warmup for jit kernel
@@ -387,8 +417,10 @@ class PiecewiseCudaGraphRunner:
                 spec_info=None,
                 capture_hidden_mode=CaptureHiddenMode.NULL,
                 num_token_non_padded=None,
+                num_token_non_padded_cpu=num_tokens,
                 global_forward_mode=ForwardMode.EXTEND,
                 lora_ids=None,
+                return_pooled_hidden_states=self.capture_return_pooled_hidden_states,
             )
 
         # Attention backend
@@ -416,6 +448,16 @@ class PiecewiseCudaGraphRunner:
         # Disable piecewise cuda graph for input embeddings
         # TODO(yuwei): fix it
         if forward_batch.input_embeds is not None:
+            return False
+        # PCG graphs are captured with ForwardMode.EXTEND and spec_info=None.
+        # TARGET_VERIFY has different spec_info and capture_hidden_mode,
+        # so it must not use PCG-captured graphs.
+        if forward_batch.forward_mode.is_target_verify():
+            return False
+        # PCG graphs are captured with the runner's capture_hidden_mode.
+        # If the batch needs a different mode (e.g. FULL for speculative
+        # decoding), PCG replay would return wrong/missing hidden_states.
+        if forward_batch.capture_hidden_mode != self.capture_hidden_mode:
             return False
         # Disable for token embedding overrides (dynamic per-request)
         if forward_batch.replace_embeds is not None:
@@ -547,8 +589,10 @@ class PiecewiseCudaGraphRunner:
                 spec_info=None,
                 capture_hidden_mode=CaptureHiddenMode.NULL,
                 num_token_non_padded=None,
+                num_token_non_padded_cpu=num_tokens,
                 global_forward_mode=ForwardMode.EXTEND,
                 lora_ids=None,
+                return_pooled_hidden_states=self.capture_return_pooled_hidden_states,
             )
             self.tbo_plugin.capture_one_batch_size(forward_batch, num_tokens=num_tokens)
 
@@ -736,6 +780,7 @@ class PiecewiseCudaGraphRunner:
             spec_info=forward_batch.spec_info,
             capture_hidden_mode=forward_batch.capture_hidden_mode,
             num_token_non_padded=forward_batch.num_token_non_padded,
+            num_token_non_padded_cpu=forward_batch.num_token_non_padded_cpu,
             global_forward_mode=pcg_global_forward_mode,
             lora_ids=forward_batch.lora_ids,
             sampling_info=forward_batch.sampling_info,
@@ -745,6 +790,10 @@ class PiecewiseCudaGraphRunner:
             top_p_normalized_logprobs=forward_batch.top_p_normalized_logprobs,
             top_p=forward_batch.top_p,
             dimensions=forward_batch.dimensions,
+            return_pooled_hidden_states=(
+                self.capture_return_pooled_hidden_states
+                or forward_batch.return_pooled_hidden_states
+            ),
         )
 
         if out_cache_loc_swa is not None:
@@ -757,13 +806,7 @@ class PiecewiseCudaGraphRunner:
         forward_batch: ForwardBatch,
         **kwargs,
     ) -> Union[LogitsProcessorOutput, PPProxyTensors, EmbeddingPoolerOutput]:
-        num_tokens = len(forward_batch.input_ids)
-        index = bisect.bisect_left(self.capture_num_tokens, num_tokens)
-        static_num_tokens = self.capture_num_tokens[index]
         with enable_piecewise_cuda_graph():
-            # Prepare static buffers first so set_forward_context can carry num_tokens
-            # into call_begin_forward (via ForwardContext.num_tokens), eliminating the
-            # need for a separate global and allowing pre-calculation of dummy-page count.
             static_forward_batch = self.replay_prepare(forward_batch, **kwargs)
             # Replay
             with set_forward_context(
@@ -772,7 +815,6 @@ class PiecewiseCudaGraphRunner:
                 self.quant_config,
                 self.moe_layers,
                 self.moe_fusions,
-                num_tokens=static_num_tokens,
             ):
                 # Due to the dispatch kernel for MLA model, we init the metadata with original forward_batch
                 self.model_runner.attn_backend.init_forward_metadata(forward_batch)
@@ -783,6 +825,18 @@ class PiecewiseCudaGraphRunner:
                     **kwargs,
                 )
                 if isinstance(output, LogitsProcessorOutput):
+                    # Preserve mm_input_embeds when speculative decoding is
+                    # enabled. The speculative draft's prefill path
+                    # (eagle_worker_v2._draft_extend_for_prefill) reads
+                    # mm_input_embeds off this LogitsProcessorOutput to reuse
+                    # the target's encoder embeddings instead of re-embedding
+                    # multimodal placeholder token ids.
+                    mm_input_embeds = None
+                    if (
+                        self.model_runner.spec_algorithm.is_speculative()
+                        and output.mm_input_embeds is not None
+                    ):
+                        mm_input_embeds = output.mm_input_embeds[: self.raw_num_tokens]
                     return LogitsProcessorOutput(
                         next_token_logits=output.next_token_logits[
                             : self.raw_num_tokens
@@ -792,6 +846,7 @@ class PiecewiseCudaGraphRunner:
                             if output.hidden_states is not None
                             else None
                         ),
+                        mm_input_embeds=mm_input_embeds,
                     )
                 elif isinstance(output, EmbeddingPoolerOutput):
                     return output
@@ -817,10 +872,10 @@ class PiecewiseCudaGraphRunner:
                     draft_token=None,
                     custom_mask=self.custom_mask,
                     positions=None,
-                    retrive_index=None,
-                    retrive_next_token=None,
-                    retrive_next_sibling=None,
-                    retrive_cum_len=None,
+                    retrieve_index=None,
+                    retrieve_next_token=None,
+                    retrieve_next_sibling=None,
+                    retrieve_cum_len=None,
                     spec_steps=self.model_runner.server_args.speculative_num_steps,
                     topk=self.model_runner.server_args.speculative_eagle_topk,
                     draft_token_num=self.model_runner.server_args.speculative_num_draft_tokens,

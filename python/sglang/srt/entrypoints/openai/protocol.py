@@ -31,6 +31,7 @@ from openai.types.responses.response import ToolChoice
 from openai.types.responses.tool import Tool
 from pydantic import (
     BaseModel,
+    ConfigDict,
     Field,
     field_validator,
     model_serializer,
@@ -166,6 +167,7 @@ class LegacyStructuralTagResponseFormat(BaseModel):
     type: Literal["structural_tag"]
     structures: List[StructuresResponseFormat]
     triggers: List[str]
+    at_least_one: bool = False
 
 
 StructuralTagResponseFormat: TypeAlias = Union[
@@ -453,11 +455,23 @@ class ChatCompletionMessageContentAudioPart(BaseModel):
     audio_url: ChatCompletionMessageContentAudioURL
 
 
+class ChatCompletionMessageContentToolReferenceBlock(BaseModel):
+    # GLM-specific extension used alongside `defer_loading` tools. The chat
+    # template looks up `tools[*].function.name == tr.name` and renders the
+    # referenced tool schemas inline for the current turn. Not part of any
+    # OpenAI API; included here so Pydantic accepts the content through the
+    # Chat Completions path (the Anthropic endpoint translates its
+    # `tool_name` field to `name` before forwarding).
+    type: Literal["tool_reference"]
+    name: str
+
+
 ChatCompletionMessageContentPart = Union[
     ChatCompletionMessageContentTextPart,
     ChatCompletionMessageContentImagePart,
     ChatCompletionMessageContentVideoPart,
     ChatCompletionMessageContentAudioPart,
+    ChatCompletionMessageContentToolReferenceBlock,
 ]
 
 # Rerank content types for multimodal reranking (e.g., Qwen3-VL-Reranker)
@@ -527,6 +541,14 @@ class Function(BaseModel):
     name: str
     parameters: Optional[object] = None
     strict: bool = False
+    defer_loading: Optional[bool] = None
+
+    @model_serializer(mode="wrap")
+    def _serialize(self, handler):
+        data = handler(self)
+        if self.defer_loading is None:
+            data.pop("defer_loading", None)
+        return data
 
 
 class Tool(BaseModel):
@@ -534,6 +556,13 @@ class Tool(BaseModel):
 
     type: str = Field(default="function", examples=["function"])
     function: Function
+    defer_loading: Optional[bool] = None
+
+    @model_validator(mode="after")
+    def _propagate_defer_loading(self) -> "Tool":
+        if self.defer_loading is not None and self.function.defer_loading is None:
+            self.function.defer_loading = self.defer_loading
+        return self
 
 
 class ToolChoiceFuncName(BaseModel):
@@ -617,9 +646,10 @@ class ChatCompletionRequest(BaseModel):
     stream_reasoning: bool = True
     chat_template_kwargs: Optional[Dict] = None
 
-    # SGLang multimodal tiling controls (extensions)
+    # SGLang multimodal controls (extensions)
     max_dynamic_patch: Optional[int] = None
     min_dynamic_patch: Optional[int] = None
+    use_audio_in_video: bool = False
 
     # Custom logit processor for advanced sampling control
     custom_logit_processor: Optional[Union[List[Optional[str]], str]] = None
@@ -1015,6 +1045,7 @@ class ScoringRequest(BaseModel):
     )
     apply_softmax: bool = False
     item_first: bool = False
+    return_pooled_hidden_states: bool = False
     model: str = DEFAULT_MODEL_NAME
 
 
@@ -1022,6 +1053,7 @@ class ScoringResponse(BaseModel):
     scores: List[
         List[float]
     ]  # List of lists of probabilities, each in the order of label_token_ids
+    pooled_hidden_states: Optional[List[Optional[List[float]]]] = None
     model: str
     usage: Optional[UsageInfo] = None
     object: str = "scoring"
@@ -1087,12 +1119,38 @@ class RerankResponse(BaseModel):
 class TokenizeRequest(BaseModel):
     """Request schema for the /tokenize endpoint."""
 
+    model_config = ConfigDict(extra="allow")
+
     model: str = DEFAULT_MODEL_NAME
-    prompt: Union[str, List[str]]
+    prompt: Optional[Union[str, List[str]]] = None
+    messages: Optional[List[ChatCompletionMessageParam]] = None
+    tools: Optional[List[Tool]] = Field(default=None, examples=[None])
+    tool_choice: Optional[Union[ToolChoice, Literal["auto", "required", "none"]]] = (
+        Field(default=None, examples=["auto"])
+    )
+    reasoning_effort: Optional[Literal["none", "low", "medium", "high"]] = None
+    continue_final_message: bool = False
+    chat_template_kwargs: Optional[Dict] = None
     add_special_tokens: bool = Field(
         default=True,
         description="whether to add model-specific special tokens (e.g. BOS/EOS) during encoding.",
     )
+
+    @model_validator(mode="after")
+    def validate_tokenize_input(self) -> "TokenizeRequest":
+        if (self.prompt is None) == (self.messages is None):
+            raise ValueError("Exactly one of 'prompt' or 'messages' must be provided.")
+        return self
+
+    def to_chat_completion_request(self) -> ChatCompletionRequest:
+        data = self.model_dump(
+            exclude={"prompt", "add_special_tokens"},
+            exclude_none=True,
+        )
+        extra = getattr(self, "__pydantic_extra__", None)
+        if extra:
+            data.update(extra)
+        return ChatCompletionRequest.model_validate(data)
 
 
 class TokenizeResponse(BaseModel):

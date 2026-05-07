@@ -40,13 +40,11 @@ on:
           - nightly-8-gpu-deepseek-v32
           - nightly-8-gpu-deepseek-v32-mtp
           - nightly-8-gpu-deepseek-v3-kv-fp8
-          - nightly-8-gpu-kimi-k25
+          - nightly-8-gpu-kimi-k26
           - nightly-8-gpu-qwen3-235b
           - nightly-8-gpu-qwen35
-          - nightly-8-gpu-glm5
           - nightly-8-gpu-glm51
-          - nightly-8-gpu-glm51-mxfp4
-          - nightly-8-gpu-minimax-m25
+          - nightly-8-gpu-minimax-m27
           - nightly-1-gpu-zimage-turbo
           - nightly-test-1-gpu-mi35x
           - nightly-accuracy-8-gpu-mi35x
@@ -59,13 +57,11 @@ on:
           - nightly-accuracy-8-gpu-mi35x-deepseek-v32-mtp
           - nightly-perf-8-gpu-mi35x-deepseek-v32-basic
           - nightly-perf-8-gpu-mi35x-deepseek-v32-mtp
-          - nightly-8-gpu-mi35x-kimi-k25
+          - nightly-8-gpu-mi35x-kimi-k26
           - nightly-8-gpu-mi35x-qwen3-235b-mxfp4
           - nightly-8-gpu-mi35x-qwen35
-          - nightly-8-gpu-mi35x-glm5
           - nightly-8-gpu-mi35x-glm51
-          - nightly-8-gpu-mi35x-glm51-mxfp4
-          - nightly-8-gpu-mi35x-minimax-m25
+          - nightly-8-gpu-mi35x-glm5-mxfp4
       job_filter:
         description: 'Or type comma-separated job names (overrides dropdown if non-empty)'
         required: false
@@ -96,13 +92,16 @@ on:
 
 env:
   AITER_COMMIT_OVERRIDE: ${{ inputs.aiter_ref }}
+  DOCKERHUB_AMD_USERNAME: ${{ secrets.DOCKERHUB_AMD_USERNAME }}
+  DOCKERHUB_AMD_TOKEN: ${{ secrets.DOCKERHUB_AMD_TOKEN }}
 
 concurrency:
   # When called via workflow_call with ref set, use a unique group per caller run to avoid
   # collisions with direct schedule/push triggers. We use inputs.ref (not github.event_name)
   # to detect this, because github.event_name inherits from the caller in workflow_call.
-  group: nightly-test-amd-${{ inputs.ref && format('caller-{0}', github.run_id) || github.ref }}
-  cancel-in-progress: ${{ !inputs.ref && github.event_name != 'workflow_call' }}
+  # Manual dispatch runs also get unique groups so they never cancel each other.
+  group: nightly-test-amd-${{ github.event_name == 'workflow_dispatch' && format('manual-{0}', github.run_id) || inputs.ref && format('caller-{0}', github.run_id) || github.ref }}
+  cancel-in-progress: ${{ !inputs.ref && github.event_name != 'workflow_call' && github.event_name != 'workflow_dispatch' }}
 
 jobs:
   # ============================================== MI30x Unit Tests ==============================================
@@ -114,7 +113,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.ref || github.sha }}
 
       - name: Setup docker
         run: |
@@ -144,7 +143,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.ref || github.sha }}
 
       - name: Setup docker
         run: |
@@ -173,7 +172,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.ref || github.sha }}
 
       - name: Setup docker
         run: |
@@ -203,7 +202,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.ref || github.sha }}
 
       - name: Setup docker
         run: |
@@ -234,7 +233,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.ref || github.sha }}
 
       - name: Setup docker
         run: |
@@ -266,7 +265,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.ref || github.sha }}
 
       - name: Setup docker
         run: |
@@ -296,7 +295,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.ref || github.sha }}
 
       - name: Setup docker
         run: |
@@ -336,7 +335,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.ref || github.sha }}
 
       - name: Setup docker
         run: |
@@ -379,7 +378,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.ref || github.sha }}
 
       - name: Setup docker
         run: |
@@ -422,7 +421,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.ref || github.sha }}
 
       - name: Setup docker
         run: |
@@ -465,7 +464,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.ref || github.sha }}
 
       - name: Setup docker
         run: |
@@ -506,7 +505,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.ref || github.sha }}
 
       - name: Setup docker
         run: |
@@ -547,7 +546,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.ref || github.sha }}
 
       - name: Setup docker
         run: |
@@ -569,15 +568,15 @@ jobs:
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
           exit ${TEST_EXIT_CODE:-0}
 
-  # 8-GPU Kimi-K2.5 (Accuracy)
-  nightly-8-gpu-kimi-k25:
-    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-8-gpu-kimi-k25,'))
+  # 8-GPU Kimi-K2.6 (Accuracy)
+  nightly-8-gpu-kimi-k26:
+    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-8-gpu-kimi-k26,'))
     runs-on: linux-mi325-8gpu-sglang
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.ref || github.sha }}
 
       - name: Setup docker
         run: |
@@ -589,13 +588,13 @@ jobs:
       - name: Install dependencies
         run: bash scripts/ci/amd/amd_ci_install_dependency.sh
 
-      - name: Accuracy Test (8-GPU Kimi-K2.5)
+      - name: Accuracy Test (8-GPU Kimi-K2.6)
         timeout-minutes: 120
         run: |
           > github_summary.md  # Clear summary file
           bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
             -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
-            python3 run_suite.py --hw amd --suite nightly-amd-accuracy-8-gpu-kimi-k25 --nightly --timeout-per-file 3600 ${{ inputs.continue_on_error && '--continue-on-error' || '' }} || TEST_EXIT_CODE=$?
+            python3 run_suite.py --hw amd --suite nightly-amd-accuracy-8-gpu-kimi-k26 --nightly --timeout-per-file 3600 ${{ inputs.continue_on_error && '--continue-on-error' || '' }} || TEST_EXIT_CODE=$?
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
           exit ${TEST_EXIT_CODE:-0}
 
@@ -606,7 +605,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.ref || github.sha }}
 
       - name: Setup docker
         run: |
@@ -636,7 +635,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.ref || github.sha }}
 
       - name: Setup docker
         run: |
@@ -672,50 +671,6 @@ jobs:
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
           exit ${TEST_EXIT_CODE:-0}
 
-  # 8-GPU GLM-5 (Accuracy + Performance combined)
-  nightly-8-gpu-glm5:
-    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-8-gpu-glm5,'))
-    runs-on: linux-mi325-8gpu-sglang
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.ref || github.ref }}
-
-      - name: Setup docker
-        run: |
-          touch github_summary.md
-          bash scripts/ci/amd/amd_ci_start_container.sh
-        env:
-          GITHUB_WORKSPACE: ${{ github.workspace }}
-
-      - name: Install dependencies
-        run: |
-          bash scripts/ci/amd/amd_ci_install_dependency.sh
-          bash scripts/ci/amd/amd_ci_exec.sh pip install git+https://github.com/huggingface/transformers.git@96f807a33b75
-
-      - name: Accuracy Test (8-GPU GLM-5 NSA)
-        timeout-minutes: 120
-        run: |
-          > github_summary.md  # Clear summary file
-          bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
-            -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
-            python3 run_suite.py --hw amd --suite nightly-amd-accuracy-8-gpu-glm5 --nightly --timeout-per-file 3600 ${{ inputs.continue_on_error && '--continue-on-error' || '' }} || TEST_EXIT_CODE=$?
-          echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
-          exit ${TEST_EXIT_CODE:-0}
-
-      - name: Performance Test (8-GPU GLM-5)
-        timeout-minutes: 120
-        continue-on-error: true  # Perf test failure doesn't fail the job if accuracy passed
-        run: |
-          > github_summary.md  # Clear summary file
-          bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
-            -e SGLANG_USE_AITER=1 \
-            -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
-            python3 run_suite.py --hw amd --suite nightly-perf-8-gpu-glm5 --nightly --timeout-per-file 5400 ${{ inputs.continue_on_error && '--continue-on-error' || '' }} || TEST_EXIT_CODE=$?
-          echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
-          exit ${TEST_EXIT_CODE:-0}
-
   # 8-GPU GLM-5.1 (Accuracy + Performance combined)
   nightly-8-gpu-glm51:
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-8-gpu-glm51,'))
@@ -724,7 +679,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.ref || github.sha }}
 
       - name: Setup docker
         run: |
@@ -760,15 +715,15 @@ jobs:
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
           exit ${TEST_EXIT_CODE:-0}
 
-  # 8-GPU MiniMax-M2.5 (Accuracy + Performance combined)
-  nightly-8-gpu-minimax-m25:
-    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-8-gpu-minimax-m25,'))
+  # 8-GPU MiniMax-M2.7 (Accuracy + Performance combined, replaces M2.5)
+  nightly-8-gpu-minimax-m27:
+    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-8-gpu-minimax-m27,'))
     runs-on: linux-mi325-8gpu-sglang
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.ref || github.sha }}
 
       - name: Setup docker
         run: |
@@ -780,18 +735,18 @@ jobs:
       - name: Install dependencies
         run: bash scripts/ci/amd/amd_ci_install_dependency.sh
 
-      - name: Accuracy Test (8-GPU MiniMax-M2.5)
+      - name: Accuracy Test (8-GPU MiniMax-M2.7)
         timeout-minutes: 120
         run: |
           > github_summary.md  # Clear summary file
           bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
             -e SGLANG_USE_AITER=1 \
             -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
-            python3 run_suite.py --hw amd --suite nightly-amd-accuracy-8-gpu-minimax-m25 --nightly --timeout-per-file 3600 ${{ inputs.continue_on_error && '--continue-on-error' || '' }} || TEST_EXIT_CODE=$?
+            python3 run_suite.py --hw amd --suite nightly-amd-accuracy-8-gpu-minimax-m27 --nightly --timeout-per-file 3600 ${{ inputs.continue_on_error && '--continue-on-error' || '' }} || TEST_EXIT_CODE=$?
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
           exit ${TEST_EXIT_CODE:-0}
 
-      - name: Performance Test (8-GPU MiniMax-M2.5)
+      - name: Performance Test (8-GPU MiniMax-M2.7)
         timeout-minutes: 120
         continue-on-error: true  # Perf test failure doesn't fail the job if accuracy passed
         run: |
@@ -799,7 +754,7 @@ jobs:
           bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
             -e SGLANG_USE_AITER=1 \
             -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
-            python3 run_suite.py --hw amd --suite nightly-perf-8-gpu-minimax-m25 --nightly --timeout-per-file 5400 ${{ inputs.continue_on_error && '--continue-on-error' || '' }} || TEST_EXIT_CODE=$?
+            python3 run_suite.py --hw amd --suite nightly-perf-8-gpu-minimax-m27 --nightly --timeout-per-file 5400 ${{ inputs.continue_on_error && '--continue-on-error' || '' }} || TEST_EXIT_CODE=$?
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
           exit ${TEST_EXIT_CODE:-0}
 
@@ -812,7 +767,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.ref || github.sha }}
 
       - name: Setup docker
         run: |
@@ -852,7 +807,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.ref || github.sha }}
 
       - name: Setup docker
         run: |
@@ -884,7 +839,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.ref || github.sha }}
 
       - name: Setup docker
         run: |
@@ -916,7 +871,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.ref || github.sha }}
 
       - name: Setup docker
         run: |
@@ -962,7 +917,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.ref || github.sha }}
 
       - name: Setup docker
         run: |
@@ -1008,7 +963,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.ref || github.sha }}
 
       - name: Setup docker
         run: |
@@ -1052,7 +1007,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.ref || github.sha }}
 
       - name: Setup docker
         run: |
@@ -1096,7 +1051,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.ref || github.sha }}
 
       - name: Setup docker
         run: |
@@ -1140,7 +1095,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.ref || github.sha }}
 
       - name: Setup docker
         run: |
@@ -1173,7 +1128,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.ref || github.sha }}
 
       - name: Setup docker
         run: |
@@ -1206,7 +1161,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.ref || github.sha }}
 
       - name: Setup docker
         run: |
@@ -1231,15 +1186,15 @@ jobs:
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
           exit ${TEST_EXIT_CODE:-0}
 
-  # MI35x 8-GPU Kimi-K2.5 (Accuracy)
-  nightly-8-gpu-mi35x-kimi-k25:
-    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-8-gpu-mi35x-kimi-k25,'))
+  # MI35x 8-GPU Kimi-K2.6 (Accuracy)
+  nightly-8-gpu-mi35x-kimi-k26:
+    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-8-gpu-mi35x-kimi-k26,'))
     runs-on: linux-mi35x-gpu-8
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.ref || github.sha }}
 
       - name: Setup docker
         run: |
@@ -1254,13 +1209,13 @@ jobs:
           # Install tabulate for run_suite.py (missing in MI35x container)
           bash scripts/ci/amd/amd_ci_exec.sh pip install tabulate
 
-      - name: Accuracy Test MI35x (8-GPU Kimi-K2.5)
+      - name: Accuracy Test MI35x (8-GPU Kimi-K2.6)
         timeout-minutes: 180
         run: |
           > github_summary.md  # Clear summary file
           bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
             -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
-            python3 run_suite.py --hw amd --suite nightly-amd-accuracy-8-gpu-mi35x-kimi-k25 --nightly --timeout-per-file 7200 ${{ inputs.continue_on_error && '--continue-on-error' || '' }} || TEST_EXIT_CODE=$?
+            python3 run_suite.py --hw amd --suite nightly-amd-accuracy-8-gpu-mi35x-kimi-k26 --nightly --timeout-per-file 7200 ${{ inputs.continue_on_error && '--continue-on-error' || '' }} || TEST_EXIT_CODE=$?
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
           exit ${TEST_EXIT_CODE:-0}
 
@@ -1272,7 +1227,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.ref || github.sha }}
 
       - name: Setup docker
         run: |
@@ -1305,7 +1260,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.ref || github.sha }}
 
       - name: Setup docker
         run: |
@@ -1342,40 +1297,6 @@ jobs:
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
           exit ${TEST_EXIT_CODE:-0}
 
-  # MI35x 8-GPU GLM-5 (Accuracy only)
-  nightly-8-gpu-mi35x-glm5:
-    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-8-gpu-mi35x-glm5,'))
-    runs-on: linux-mi35x-gpu-8
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.ref || github.ref }}
-
-      - name: Setup docker
-        run: |
-          touch github_summary.md
-          bash scripts/ci/amd/amd_ci_start_container.sh
-        env:
-          GITHUB_WORKSPACE: ${{ github.workspace }}
-
-      - name: Install dependencies
-        run: |
-          bash scripts/ci/amd/amd_ci_install_dependency.sh
-          # Install tabulate for run_suite.py (missing in MI35x container)
-          bash scripts/ci/amd/amd_ci_exec.sh pip install tabulate
-          bash scripts/ci/amd/amd_ci_exec.sh pip install git+https://github.com/huggingface/transformers.git@96f807a33b75
-
-      - name: Accuracy Test MI35x (8-GPU GLM-5 NSA)
-        timeout-minutes: 180
-        run: |
-          > github_summary.md  # Clear summary file
-          bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
-            -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
-            python3 run_suite.py --hw amd --suite nightly-amd-8-gpu-mi35x-glm5 --nightly --timeout-per-file 7200 ${{ inputs.continue_on_error && '--continue-on-error' || '' }} || TEST_EXIT_CODE=$?
-          echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
-          exit ${TEST_EXIT_CODE:-0}
-
   # MI35x 8-GPU GLM-5.1 (Accuracy + Performance combined)
   nightly-8-gpu-mi35x-glm51:
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-8-gpu-mi35x-glm51,'))
@@ -1384,7 +1305,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.ref || github.sha }}
 
       - name: Setup docker
         run: |
@@ -1420,15 +1341,15 @@ jobs:
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
           exit ${TEST_EXIT_CODE:-0}
 
-  # MI35x 8-GPU MiniMax-M2.5 (Accuracy + Performance combined)
-  nightly-8-gpu-mi35x-minimax-m25:
-    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-8-gpu-mi35x-minimax-m25,'))
+  # MI35x 8-GPU GLM-5-MXFP4 (Accuracy + Performance combined)
+  nightly-8-gpu-mi35x-glm5-mxfp4:
+    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-8-gpu-mi35x-glm5-mxfp4,'))
     runs-on: linux-mi35x-gpu-8
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.ref || github.sha }}
 
       - name: Setup docker
         run: |
@@ -1441,27 +1362,28 @@ jobs:
         run: |
           bash scripts/ci/amd/amd_ci_install_dependency.sh
           bash scripts/ci/amd/amd_ci_exec.sh pip install tabulate
+          bash scripts/ci/amd/amd_ci_exec.sh pip install git+https://github.com/huggingface/transformers.git@96f807a33b75
 
-      - name: Accuracy Test MI35x (8-GPU MiniMax-M2.5)
-        timeout-minutes: 120
+      - name: Accuracy Test MI35x (8-GPU GLM-5-MXFP4)
+        timeout-minutes: 180
         run: |
-          > github_summary.md  # Clear summary file
+          > github_summary.md
           bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
             -e SGLANG_USE_AITER=1 \
             -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
-            python3 run_suite.py --hw amd --suite nightly-amd-8-gpu-mi35x-minimax-m25 --nightly --timeout-per-file 3600 ${{ inputs.continue_on_error && '--continue-on-error' || '' }} || TEST_EXIT_CODE=$?
+            python3 run_suite.py --hw amd --suite nightly-amd-8-gpu-mi35x-glm5-mxfp4 --nightly --timeout-per-file 7200 ${{ inputs.continue_on_error && '--continue-on-error' || '' }} || TEST_EXIT_CODE=$?
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
           exit ${TEST_EXIT_CODE:-0}
 
-      - name: Performance Test MI35x (8-GPU MiniMax-M2.5)
-        timeout-minutes: 120
-        continue-on-error: true  # Perf test failure doesn't fail the job if accuracy passed
+      - name: Performance Test MI35x (8-GPU GLM-5-MXFP4)
+        timeout-minutes: 300
+        continue-on-error: true
         run: |
-          > github_summary.md  # Clear summary file
+          > github_summary.md
           bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
             -e SGLANG_USE_AITER=1 \
             -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
-            python3 run_suite.py --hw amd --suite nightly-perf-8-gpu-mi35x-minimax-m25 --nightly --timeout-per-file 5400 ${{ inputs.continue_on_error && '--continue-on-error' || '' }} || TEST_EXIT_CODE=$?
+            python3 registered/amd/perf/mi35x/test_glm5_mxfp4_perf_mi35x.py || TEST_EXIT_CODE=$?
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
           exit ${TEST_EXIT_CODE:-0}
 
@@ -1473,7 +1395,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.ref || github.sha }}
 
       - name: Setup docker
         run: |
@@ -1519,12 +1441,11 @@ jobs:
       - nightly-8-gpu-deepseek-v32
       - nightly-8-gpu-deepseek-v32-mtp
       - nightly-8-gpu-deepseek-v3-kv-fp8
-      - nightly-8-gpu-kimi-k25
+      - nightly-8-gpu-kimi-k26
       - nightly-8-gpu-qwen3-235b
       - nightly-8-gpu-qwen35
-      - nightly-8-gpu-glm5
       - nightly-8-gpu-glm51
-      - nightly-8-gpu-minimax-m25
+      - nightly-8-gpu-minimax-m27
       # MI30x Diffusion Tests
       - nightly-1-gpu-zimage-turbo
       # MI35x jobs
@@ -1537,12 +1458,11 @@ jobs:
       - nightly-8-gpu-mi35x-deepseek-r1-mxfp4-ar-fusion
       - nightly-accuracy-8-gpu-mi35x-deepseek-v32
       - nightly-accuracy-8-gpu-mi35x-deepseek-v32-mtp
-      - nightly-8-gpu-mi35x-kimi-k25
+      - nightly-8-gpu-mi35x-kimi-k26
       - nightly-8-gpu-mi35x-qwen3-235b-mxfp4
       - nightly-8-gpu-mi35x-qwen35
-      - nightly-8-gpu-mi35x-glm5
       - nightly-8-gpu-mi35x-glm51
-      - nightly-8-gpu-mi35x-minimax-m25
+      - nightly-8-gpu-mi35x-glm5-mxfp4
       # MI35x perf jobs excluded from check - perf failures don't block CI
       # - nightly-perf-8-gpu-mi35x-deepseek-v32-basic
       # - nightly-perf-8-gpu-mi35x-deepseek-v32-mtp

@@ -57,8 +57,10 @@ class MiDashengLMMultimodalProcessor(BaseMultimodalProcessor):
             kwargs["videos"] = videos
         if audios:
             kwargs["audio"] = audios
-            kwargs["audio_kwargs"] = {}
+            kwargs.setdefault("audio_kwargs", {})
             kwargs["audio_kwargs"].setdefault("truncation", False)
+            if self.audio_config:
+                kwargs["audio_kwargs"].update(self.audio_config)
 
         processor = self._processor
         result = processor.__call__(

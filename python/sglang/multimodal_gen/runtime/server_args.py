@@ -22,7 +22,17 @@ import yaml
 from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.configs.models.encoders import T5Config
 from sglang.multimodal_gen.configs.pipeline_configs.base import PipelineConfig
+from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import (
+    LTX2PipelineConfig,
+    is_ltx23_native_variant,
+)
 from sglang.multimodal_gen.configs.quantization.nunchaku import NunchakuSVDQuantArgs
+from sglang.multimodal_gen.runtime.disaggregation.disagg_args import (
+    DisaggArgsMixin,
+    add_disagg_cli_args,
+    convert_disagg_role_string,
+)
+from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.layers.quantization.configs.nunchaku_config import (
     NunchakuConfig,
 )
@@ -63,6 +73,21 @@ logger = init_logger(__name__)
 # our validated Wan/MOVA workloads, so use a 130 GiB cutoff to keep H200-class
 # GPUs on the faster no-offload default while preserving some headroom.
 WAN_LAYERWISE_OFFLOAD_AUTO_DISABLE_MEM_GB = 130
+LTX2_TWO_STAGE_DEVICE_MODES = ("original", "snapshot", "resident")
+LTX2_TWO_STAGE_PIPELINE_NAMES = ("LTX2TwoStagePipeline", "LTX2TwoStageHQPipeline")
+# H200-class GPUs (>=130 GiB total) can usually keep both LTX2 DiTs resident.
+LTX2_RESIDENT_AUTO_ENABLE_MEM_GB = 130
+
+
+def _normalize_ltx2_two_stage_device_mode(mode: str | None) -> str | None:
+    if mode is None:
+        return None
+    mode = mode.lower()
+    return mode
+
+
+def is_ltx2_two_stage_pipeline_name(pipeline_class_name: str | None) -> bool:
+    return pipeline_class_name in LTX2_TWO_STAGE_PIPELINE_NAMES
 
 
 class Backend(str, Enum):
@@ -94,7 +119,7 @@ class Backend(str, Enum):
 
 
 @dataclasses.dataclass
-class ServerArgs:
+class ServerArgs(DisaggArgsMixin):
     # Model and path configuration (for convenience)
     model_path: str
 
@@ -107,6 +132,9 @@ class ServerArgs:
     # Attention
     attention_backend: str = None
     attention_backend_config: addict.Dict | None = None
+    component_attention_backends: dict[str, str] | str | None = field(
+        default_factory=dict
+    )
     cache_dit_config: str | dict[str, Any] | None = (
         None  # cache-dit config for diffusers
     )
@@ -130,8 +158,8 @@ class ServerArgs:
     dp_size: int = 1
     # number of gpu in a dp group
     dp_degree: int = 1
-    # cfg parallel
-    enable_cfg_parallel: bool = False
+    # cfg parallel (None = auto-decide based on num_gpus)
+    enable_cfg_parallel: Optional[bool] = None
 
     hsdp_replicate_dim: int = 1
     hsdp_shard_dim: Optional[int] = None
@@ -166,9 +194,10 @@ class ServerArgs:
     dit_offload_prefetch_size: float = 0.0
     text_encoder_cpu_offload: bool | None = None
     image_encoder_cpu_offload: bool | None = None
-    vae_cpu_offload: bool | None = None
+    vae_cpu_offload: bool | None = False
     use_fsdp_inference: bool = False
     pin_cpu_memory: bool = True
+    ltx2_two_stage_device_mode: str | None = None
 
     # ComfyUI integration
     comfyui_mode: bool = False
@@ -200,6 +229,11 @@ class ServerArgs:
     webui_port: int | None = 12312
 
     scheduler_port: int = 5555
+    batching_mode: str = "dynamic"
+    batching_max_size: int = 1
+    batching_delay_ms: float = 0.0
+    batching_config: str | None = None
+    enable_batching_metrics: bool = False
 
     # Strict port mode: fail if requested port is unavailable instead of auto-selecting
     strict_ports: bool = False
@@ -230,9 +264,38 @@ class ServerArgs:
     # MoE parameters used by Wan2.2
     boundary_ratio: float | None = None
 
+    # Disaggregation — fields defined here, methods in DisaggArgsMixin,
+    # CLI registration in disagg_args.add_disagg_cli_args().
+    base_gpu_id: int = 0
+    disagg_role: RoleType = RoleType.MONOLITHIC
+    disagg_timeout: int = 600
+    disagg_dispatch_policy: str = "round_robin"
+    disagg_mode: bool = False
+    disagg_server_addr: str | None = None
+    encoder_urls: str | None = None
+    denoiser_urls: str | None = None
+    decoder_urls: str | None = None
+    encoder_tp: int | None = None
+    denoiser_tp: int | None = None
+    denoiser_sp: int | None = None
+    denoiser_ulysses: int | None = None
+    denoiser_ring: int | None = None
+    decoder_tp: int | None = None
+    disagg_transfer_pool_size: int = 256 * 1024 * 1024
+    disagg_p2p_hostname: str = "127.0.0.1"
+    disagg_ib_device: str | None = None
+    pool_work_endpoint: str | None = None
+    pool_result_endpoint: str | None = None
+
     # Logging
     log_level: str = "info"
     uvicorn_access_log_exclude_prefixes: list[str] = field(default_factory=list)
+
+    # Tracing
+    enable_trace: bool = False
+    otlp_traces_endpoint: str = "localhost:4317"
+
+    # get_role_parallelism, derive_pool_*_endpoint — from DisaggArgsMixin
 
     @property
     def broker_port(self) -> int:
@@ -252,6 +315,7 @@ class ServerArgs:
     def _adjust_parameters(self):
         """set defaults and normalize values."""
         self._adjust_offload()
+        self._adjust_ltx2_two_stage_device_mode()
         self._adjust_path()
         self._adjust_quant_config()
         self._adjust_warmup()
@@ -267,8 +331,10 @@ class ServerArgs:
         """check consistency and raise errors for invalid configs"""
         self._validate_pipeline()
         self._validate_offload()
-        self._validate_parallelism()
+        if not current_platform.is_cpu():
+            self._validate_parallelism()
         self._validate_cfg_parallel()
+        self._validate_batching()
 
     def _adjust_save_paths(self):
         """Normalize empty-string save paths to None (disabled)."""
@@ -314,17 +380,21 @@ class ServerArgs:
             )
 
     def _adjust_offload(self):
+        if current_platform.is_cpu():
+            # CPU platform does not need offload
+            return
+
         # TODO: to be handled by each platform
         if current_platform.get_device_total_memory() / BYTES_PER_GB < 30:
-            logger.info("Enabling all offloading for GPU with low device memory")
+            logger.info(
+                "Enabling large component offloading for GPU with low device memory"
+            )
             if self.dit_cpu_offload is None:
                 self.dit_cpu_offload = True
             if self.text_encoder_cpu_offload is None:
                 self.text_encoder_cpu_offload = True
             if self.image_encoder_cpu_offload is None:
                 self.image_encoder_cpu_offload = True
-            if self.vae_cpu_offload is None:
-                self.vae_cpu_offload = True
         elif self.pipeline_config.task_type.is_image_gen():
             logger.info(
                 "Disabling some offloading (except dit, text_encoder) for image generation model"
@@ -335,8 +405,6 @@ class ServerArgs:
                 self.text_encoder_cpu_offload = True
             if self.image_encoder_cpu_offload is None:
                 self.image_encoder_cpu_offload = False
-            if self.vae_cpu_offload is None:
-                self.vae_cpu_offload = False
         else:
             if self.dit_cpu_offload is None:
                 self.dit_cpu_offload = True
@@ -344,12 +412,73 @@ class ServerArgs:
                 self.text_encoder_cpu_offload = True
             if self.image_encoder_cpu_offload is None:
                 self.image_encoder_cpu_offload = True
-            if self.vae_cpu_offload is None:
-                self.vae_cpu_offload = True
+
+    def _adjust_ltx2_two_stage_device_mode(self):
+        if not self._is_ltx23_two_stage_pipeline():
+            return
+
+        mode = self.ltx2_two_stage_device_mode
+        if mode is None:
+            env_mode = os.getenv("SGLANG_LTX2_TWO_STAGE_DEVICE_MODE")
+            mode = (
+                _normalize_ltx2_two_stage_device_mode(env_mode)
+                if env_mode
+                else self._resolve_default_ltx2_two_stage_device_mode()
+            )
+        else:
+            mode = _normalize_ltx2_two_stage_device_mode(mode)
+
+        if mode not in LTX2_TWO_STAGE_DEVICE_MODES:
+            raise ValueError(
+                f"Invalid ltx2_two_stage_device_mode={mode!r}. "
+                f"Expected one of {LTX2_TWO_STAGE_DEVICE_MODES}."
+            )
+
+        self.ltx2_two_stage_device_mode = mode
+
+    def _resolve_default_ltx2_two_stage_device_mode(self) -> str:
+        if not current_platform.is_cuda():
+            logger.info(
+                "Automatically set ltx2_two_stage_device_mode=snapshot on non-CUDA platform"
+            )
+            return "snapshot"
+
+        device_name = str(current_platform.get_device_name(0)).upper()
+        device_total_memory_gb = (
+            current_platform.get_device_total_memory() / BYTES_PER_GB
+        )
+        if (
+            "H200" in device_name
+            or device_total_memory_gb >= LTX2_RESIDENT_AUTO_ENABLE_MEM_GB
+        ):
+            logger.info(
+                "Automatically set ltx2_two_stage_device_mode=resident for high-memory CUDA GPU (%s, %.2f GiB total)",
+                device_name,
+                device_total_memory_gb,
+            )
+            return "resident"
+
+        logger.info(
+            "Automatically set ltx2_two_stage_device_mode=snapshot for CUDA GPU (%s, %.2f GiB total)",
+            device_name,
+            device_total_memory_gb,
+        )
+        return "snapshot"
+
+    def _is_ltx23_two_stage_pipeline(self) -> bool:
+        return is_ltx2_two_stage_pipeline_name(self.pipeline_class_name) and (
+            self._is_ltx23_model_path(self.model_path)
+            or is_ltx23_native_variant(self.pipeline_config.vae_config.arch_config)
+        )
 
     def _adjust_attention_backend(self):
         if self.attention_backend in ["fa3", "fa4"]:
             self.attention_backend = "fa"
+        self.component_attention_backends = (
+            self._normalize_component_attention_backends(
+                self.component_attention_backends
+            )
+        )
 
         # attention_backend_config
         if self.attention_backend_config is None:
@@ -358,6 +487,22 @@ class ServerArgs:
             self.attention_backend_config = addict.Dict(
                 self._parse_attention_backend_config(self.attention_backend_config)
             )
+
+        if self.backend != Backend.DIFFUSERS and isinstance(
+            self.pipeline_config, LTX2PipelineConfig
+        ):
+            text_backend = self.component_attention_backends.get("text_encoder")
+            if text_backend != "torch_sdpa":
+                if text_backend is None:
+                    logger.info(
+                        "Automatically set torch_sdpa backend for component text_encoder to preserve LTX2 official attention semantics"
+                    )
+                else:
+                    logger.warning(
+                        "Overriding %s backend with torch_sdpa for component text_encoder to preserve LTX2 official attention semantics",
+                        text_backend,
+                    )
+                self.component_attention_backends["text_encoder"] = "torch_sdpa"
 
         if self.ring_degree > 1:
             if self.attention_backend is not None and self.attention_backend not in (
@@ -375,7 +520,98 @@ class ServerArgs:
                 )
 
         if self.attention_backend is None and self.backend != Backend.DIFFUSERS:
+            if (
+                current_platform.is_cuda()
+                and self.pipeline_class_name is None
+                and self.num_gpus == 1
+                and self.tp_size == 1
+                and self.sp_degree == 1
+                and self.ulysses_degree == 1
+                and self.ring_degree == 1
+                and self._is_ltx23_model_path(self.model_path)
+            ):
+                self.attention_backend = "fa"
+                logger.info(
+                    "Automatically set attention_backend=fa for LTX-2.3 one-stage on 1 GPU to preserve precision"
+                )
+                return
             self._set_default_attention_backend()
+
+    @staticmethod
+    def _normalize_attention_backend_name(backend: str) -> str:
+        if not isinstance(backend, str):
+            raise ValueError("Attention backend name must be a string")
+        normalized = backend.strip().lower()
+        if normalized in ("fa3", "fa4"):
+            normalized = "fa"
+        try:
+            return AttentionBackendEnum[normalized.upper()].name.lower()
+        except KeyError:
+            raise ValueError(
+                f"Invalid attention backend '{backend}'. "
+                f"Available options are: {[e.name.lower() for e in AttentionBackendEnum]}"
+            ) from None
+
+    @staticmethod
+    def _parse_component_attention_backend_map(
+        value: dict[str, str] | str | None,
+    ) -> dict[str, str]:
+        if value is None or value == "":
+            return {}
+        if isinstance(value, dict):
+            return dict(value)
+        if not isinstance(value, str):
+            raise ValueError(
+                "component_attention_backends must be a dict or a comma-separated component=backend string"
+            )
+
+        try:
+            parsed = json.loads(value)
+            if not isinstance(parsed, dict):
+                raise ValueError
+            return parsed
+        except (json.JSONDecodeError, ValueError):
+            pass
+
+        result: dict[str, str] = {}
+        for pair in value.split(","):
+            pair = pair.strip()
+            if not pair:
+                continue
+            if "=" not in pair:
+                raise ValueError(
+                    "component_attention_backends must use component=backend entries"
+                )
+            component, backend = pair.split("=", 1)
+            result[component.strip()] = backend.strip()
+        return result
+
+    @classmethod
+    def _normalize_component_attention_backends(
+        cls, value: dict[str, str] | str | None
+    ) -> dict[str, str]:
+        raw = cls._parse_component_attention_backend_map(value)
+        normalized: dict[str, str] = {}
+        for component, backend in raw.items():
+            if not isinstance(component, str):
+                raise ValueError("Component attention backend key must be a string")
+            component_name = component.strip().replace("-", "_")
+            if not component_name:
+                raise ValueError("Component attention backend key must not be empty")
+            normalized[component_name] = cls._normalize_attention_backend_name(backend)
+        return normalized
+
+    def resolve_component_attention_backend(
+        self, *component_names: str | None
+    ) -> tuple[AttentionBackendEnum | None, str | None]:
+        for component_name in component_names:
+            if component_name is None:
+                continue
+            key = component_name.replace("-", "_")
+            backend = self.component_attention_backends.get(key)
+            if backend is not None:
+                return AttentionBackendEnum[backend.upper()], key
+        return None, None
 
     def _adjust_warmup(self):
         if self.warmup_resolutions is not None:
@@ -396,12 +632,22 @@ class ServerArgs:
             )
 
     def _adjust_network_ports(self):
+        # Disagg role instances (encoder/denoiser/decoder) don't serve HTTP,
+        # so skip settling the HTTP port to avoid unnecessary port collisions.
+        needs_http = self.disagg_role in (
+            RoleType.MONOLITHIC,
+            RoleType.SERVER,
+        )
+
         if self.strict_ports:
-            self._require_port(self.port, "HTTP")
+            if needs_http:
+                self._require_port(self.port, "HTTP")
             self._require_port(self.scheduler_port, "Scheduler")
-            self._require_port(self.master_port, "Master")
+            if self.master_port is not None:
+                self._require_port(self.master_port, "Master")
         else:
-            self.port = self.settle_port(self.port)
+            if needs_http:
+                self.port = self.settle_port(self.port)
             initial_scheduler_port = self.scheduler_port + (
                 random.randint(0, 100) if self.scheduler_port == 5555 else 0
             )
@@ -409,11 +655,45 @@ class ServerArgs:
             self.master_port = self.settle_port(self.master_port, 37)
 
     def _adjust_parallelism(self):
-        if self.tp_size is None:
-            self.tp_size = 1
+        tp_unspecified = self.tp_size is None
+        sp_unspecified = self.sp_degree is None
+        ulysses_unspecified = self.ulysses_degree is None
+        ring_unspecified = self.ring_degree is None
+        cfg_unspecified = self.enable_cfg_parallel is None
+
+        if current_platform.is_cpu() and self.tp_size > 1:
+            # CPU platform reuse num_gpus to represent num cpu numa nodes as devices
+            self.num_gpus = self.tp_size
 
         if self.hsdp_shard_dim is None:
             self.hsdp_shard_dim = self.num_gpus
+
+        if self.tp_size is None:
+            self.tp_size = 1
+
+        # Auto-enable CFG parallel when user hasn't set any parallelism flags
+        # and there are enough GPUs.  Only auto-enable for models whose default
+        # SamplingParams use classifier-free guidance (negative_prompt is not None),
+        # because non-CFG models (e.g. FLUX) crash when CFG parallel splits ranks.
+        if cfg_unspecified:
+            cfg_group_size = self.dp_size * self.tp_size * 2
+            if (
+                self.num_gpus >= 2
+                and self.num_gpus % cfg_group_size == 0
+                and sp_unspecified
+                and ulysses_unspecified
+                and ring_unspecified
+                and self._model_default_uses_cfg()
+            ):
+                self.enable_cfg_parallel = True
+                logger.info(
+                    "Automatically enabled CFG parallel for %d GPUs. "
+                    "Use --sp-degree / --ulysses-degree to use sequence "
+                    "parallelism instead.",
+                    self.num_gpus,
+                )
+            else:
+                self.enable_cfg_parallel = False
 
         # adjust sp_degree: allocate all remaining GPUs after TP and DP
         if self.sp_degree is None:
@@ -445,6 +725,42 @@ class ServerArgs:
         if self.ring_degree is None:
             self.ring_degree = 1
             logger.debug(f"Ring degree not set, using default value {self.ring_degree}")
+
+    def _model_default_uses_cfg(self) -> bool:
+        """
+        Check whether the model uses classifier-free guidance by default.
+
+        CFG is active when *both* ``negative_prompt is not None`` and ``guidance_scale > 1``.
+        """
+        from sglang.multimodal_gen.registry import get_model_info
+
+        model_info = get_model_info(self.model_path, self.backend, self.model_id)
+        if model_info is None:
+            return False
+        default_params = model_info.sampling_param_cls()
+
+        # for ltx2.3, cfg-parallel performs worse than ulysses-sp
+        is_ltx = "ltx" in type(default_params).__name__.lower()
+        if is_ltx:
+            return False
+        return (
+            getattr(default_params, "negative_prompt", None) is not None
+            and getattr(default_params, "guidance_scale", 0) > 1.0
+        )
+
+    @staticmethod
+    def _is_ltx23_model_path(model_path: str | None) -> bool:
+        if not model_path:
+            return False
+        normalized = model_path.lower()
+        return any(
+            token in normalized
+            for token in (
+                "lightricks/ltx-2.3",
+                "models--lightricks--ltx-2.3",
+                "lightricks__ltx-2.3",
+            )
+        )
 
     def _adjust_platform_specific(self):
         if current_platform.is_mps():
@@ -530,6 +846,9 @@ class ServerArgs:
         # configure logger before use
         configure_logger(server_args=self)
 
+        # Convert string disagg_role to enum (from CLI/config)
+        convert_disagg_role_string(self.__dict__)
+
         # 1. adjust parameters
         self._adjust_parameters()
 
@@ -591,6 +910,16 @@ class ServerArgs:
             help="Configuration for the attention backend. Can be a JSON string, a path to a JSON/YAML file, or key=value pairs.",
         )
         parser.add_argument(
+            "--component-attention-backends",
+            type=str,
+            default=None,
+            help=(
+                "Per-component attention backend overrides for native pipelines. "
+                "Use component names from model_index.json, e.g. "
+                "'text_encoder=torch_sdpa,transformer=fa'."
+            ),
+        )
+        parser.add_argument(
             "--cache-dit-config",
             type=str,
             default=ServerArgs.cache_dit_config,
@@ -618,6 +947,7 @@ class ServerArgs:
             default=ServerArgs.num_gpus,
             help="The number of GPUs to use.",
         )
+
         parser.add_argument(
             "--tp-size",
             type=int,
@@ -645,8 +975,8 @@ class ServerArgs:
         parser.add_argument(
             "--enable-cfg-parallel",
             action="store_true",
-            default=ServerArgs.enable_cfg_parallel,
-            help="Enable cfg parallel.",
+            default=None,
+            help="Enable cfg parallel. Auto-enabled when num_gpus >= 2 and no SP flags are set.",
         )
         parser.add_argument(
             "--data-parallel-size",
@@ -676,6 +1006,9 @@ class ServerArgs:
             help="Timeout for torch.distributed operations in seconds. "
             "Increase this value if you encounter 'Connection closed by peer' errors after the service is idle. ",
         )
+
+        # Disaggregated diffusion args (defined in disagg_args.py)
+        add_disagg_cli_args(parser)
 
         # Prompt text file for batch processing
         parser.add_argument(
@@ -766,6 +1099,19 @@ class ServerArgs:
             "Should be enabled in almost all cases",
         )
         parser.add_argument(
+            "--ltx2-two-stage-device-mode",
+            type=str,
+            choices=LTX2_TWO_STAGE_DEVICE_MODES,
+            default=ServerArgs.ltx2_two_stage_device_mode,
+            help=(
+                "LTX-2.3 two-stage device residency mode: "
+                "'original' keeps official two-stage semantics without premerged stage2, "
+                "'snapshot' keeps premerged stage2 with snapshot-based release, "
+                "'resident' keeps both transformers resident on GPU. "
+                "Default is auto: resident on H200/high-memory CUDA GPUs, otherwise snapshot."
+            ),
+        )
+        parser.add_argument(
             "--disable-autocast",
             action=StoreBoolean,
             help="Disable autocast for denoising loop and vae decoding in pipeline sampling",
@@ -786,6 +1132,41 @@ class ServerArgs:
             type=int,
             default=ServerArgs.scheduler_port,
             help="Port for the scheduler server.",
+        )
+        parser.add_argument(
+            "--batching-mode",
+            type=str,
+            default=ServerArgs.batching_mode,
+            choices=["dynamic"],
+            help="Request batching scheduler mode. Currently only 'dynamic' is implemented.",
+        )
+        parser.add_argument(
+            "--batching-max-size",
+            type=int,
+            default=ServerArgs.batching_max_size,
+            help="Maximum number of compatible generation requests to merge into one batch.",
+        )
+        parser.add_argument(
+            "--batching-delay-ms",
+            type=float,
+            default=ServerArgs.batching_delay_ms,
+            help="Maximum time (in ms) to wait for forming a larger batch before dispatch.",
+        )
+        parser.add_argument(
+            "--batching-config",
+            type=str,
+            default=ServerArgs.batching_config,
+            help=(
+                "Optional JSON file with {'schema_version': 1, 'rules': [...]} "
+                "batching admission rules that can cap model/resolution shapes "
+                "below --batching-max-size."
+            ),
+        )
+        parser.add_argument(
+            "--enable-batching-metrics",
+            action="store_true",
+            default=ServerArgs.enable_batching_metrics,
+            help="Log periodic batch efficiency metrics such as realized batch size and queue wait time.",
         )
         parser.add_argument(
             "--host",
@@ -865,6 +1246,20 @@ class ServerArgs:
             type=str,
             default=ServerArgs.log_level,
             help="The logging level of all loggers.",
+        )
+
+        # Tracing
+        parser.add_argument(
+            "--enable-trace",
+            action="store_true",
+            default=False,
+            help="Enable OpenTelemetry tracing.",
+        )
+        parser.add_argument(
+            "--otlp-traces-endpoint",
+            type=str,
+            default=ServerArgs.otlp_traces_endpoint,
+            help="OTLP collector endpoint when --enable-trace is set. Format: <host>:<port>",
         )
         parser.add_argument(
             "--uvicorn-access-log-exclude-prefixes",
@@ -983,6 +1378,43 @@ class ServerArgs:
             component_paths[component] = path
         return component_paths, remaining
 
+    @staticmethod
+    def _extract_component_attention_backends(
+        unknown_args: list[str],
+    ) -> tuple[dict[str, str], list[str]]:
+        component_attention_backends: dict[str, str] = {}
+        remaining: list[str] = []
+        i = 0
+        while i < len(unknown_args):
+            arg = unknown_args[i]
+            key_part = arg.split("=", 1)[0] if "=" in arg else arg
+            component = None
+            if key_part.startswith("--component-attention-backends."):
+                component = key_part[len("--component-attention-backends.") :].replace(
+                    "-", "_"
+                )
+            elif key_part.startswith("--component_attention_backends."):
+                component = key_part[len("--component_attention_backends.") :].replace(
+                    "-", "_"
+                )
+
+            if component is not None:
+                if "=" in arg:
+                    component_attention_backends[component] = arg.split("=", 1)[1]
+                elif i + 1 < len(unknown_args) and not unknown_args[i + 1].startswith(
+                    "-"
+                ):
+                    i += 1
+                    component_attention_backends[component] = unknown_args[i]
+                else:
+                    remaining.append(arg)
+                    i += 1
+                    continue
+            else:
+                remaining.append(arg)
+            i += 1
+        return component_attention_backends, remaining
+
     @classmethod
     def from_cli_args(
         cls, args: argparse.Namespace, unknown_args: list[str] | None = None
@@ -992,6 +1424,9 @@ class ServerArgs:
 
         # extract dynamic --<component>-path from unknown args
         dynamic_paths, remaining = cls._extract_component_paths(unknown_args)
+        dynamic_attention_backends, remaining = (
+            cls._extract_component_attention_backends(remaining)
+        )
         if remaining:
             raise SystemExit(f"error: unrecognized arguments: {' '.join(remaining)}")
 
@@ -1007,6 +1442,12 @@ class ServerArgs:
             existing = dict(provided_args.get("component_paths") or {})
             existing.update(dynamic_paths)
             provided_args["component_paths"] = existing
+        if dynamic_attention_backends:
+            existing = cls._parse_component_attention_backend_map(
+                provided_args.get("component_attention_backends")
+            )
+            existing.update(dynamic_attention_backends)
+            provided_args["component_attention_backends"] = existing
 
         return cls.from_dict(provided_args)
 
@@ -1057,6 +1498,9 @@ class ServerArgs:
         # Convert backend string to enum if necessary
         if "backend" in kwargs and isinstance(kwargs["backend"], str):
             kwargs["backend"] = Backend.from_string(kwargs["backend"])
+
+        # Convert disagg_role string to enum if necessary
+        convert_disagg_role_string(kwargs)
 
         kwargs["pipeline_config"] = PipelineConfig.from_kwargs(kwargs)
         return cls(**kwargs)
@@ -1210,6 +1654,14 @@ class ServerArgs:
             raise ValueError(
                 "CFG Parallelism is enabled via `--enable-cfg-parallel`, but num_gpus == 1"
             )
+
+    def _validate_batching(self):
+        if self.batching_mode != "dynamic":
+            raise ValueError("batching_mode must be one of: dynamic")
+        if self.batching_max_size < 1:
+            raise ValueError("batching_max_size must be >= 1")
+        if self.batching_delay_ms < 0:
+            raise ValueError("batching_delay_ms must be >= 0")
 
     def _set_default_attention_backend(self) -> None:
         """Configure ROCm defaults when users do not specify an attention backend."""

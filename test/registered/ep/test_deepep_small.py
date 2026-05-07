@@ -16,7 +16,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=531, suite="stage-c-test-deepep-4-gpu-h100")
+register_cuda_ci(est_time=478, suite="stage-c-test-deepep-4-gpu-h100")
 
 
 class TestPureDP(CustomTestCase):

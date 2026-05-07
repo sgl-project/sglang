@@ -5,13 +5,14 @@ import torch
 from sglang.srt.mem_cache.memory_pool import NSATokenToKVPool
 from sglang.srt.mem_cache.memory_pool_host import (
     ALLOC_MEMORY_FUNCS,
-    NSATokenToKVPoolHost,
+    MLATokenToKVPoolHost,
+    NSAIndexerPoolHost,
     alloc_with_pin_memory,
 )
 from sglang.srt.utils import is_cuda, is_hip, is_npu, is_xpu
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=10, suite="stage-b-test-1-gpu-small")
+register_cuda_ci(est_time=9, suite="stage-b-test-1-gpu-small")
 
 
 class TestNSAHiCacheTransfer(unittest.TestCase):
@@ -58,7 +59,7 @@ class TestNSAHiCacheTransfer(unittest.TestCase):
         if pin_memory:
             ALLOC_MEMORY_FUNCS["cuda"] = alloc_with_pin_memory
         try:
-            host_pool = NSATokenToKVPoolHost(
+            mla_host = MLATokenToKVPoolHost(
                 device_pool=device_pool,
                 host_to_device_ratio=2.0,
                 host_size=0,
@@ -66,6 +67,16 @@ class TestNSAHiCacheTransfer(unittest.TestCase):
                 layout="layer_first",
                 pin_memory=pin_memory,
                 device="cpu",
+                allocator_type="default",
+                override_kv_cache_dim=device_pool.kv_cache_dim,
+            )
+            indexer_host = NSAIndexerPoolHost(
+                device_pool=device_pool,
+                anchor_host=mla_host,
+                layout="layer_first",
+                pin_memory=pin_memory,
+                device="cpu",
+                allocator_type="default",
             )
         finally:
             ALLOC_MEMORY_FUNCS["cuda"] = original_alloc
@@ -97,7 +108,10 @@ class TestNSAHiCacheTransfer(unittest.TestCase):
             device="cuda" if io_backend == "kernel" else "cpu",
         )
 
-        host_pool.backup_from_device_all_layer(
+        mla_host.backup_from_device_all_layer(
+            device_pool, host_indices, device_indices, io_backend
+        )
+        indexer_host.backup_from_device_all_layer(
             device_pool, host_indices, device_indices, io_backend
         )
 
@@ -105,14 +119,14 @@ class TestNSAHiCacheTransfer(unittest.TestCase):
             for host_page, device_page in zip(
                 host_pages.tolist(), device_pages.tolist()
             ):
-                got = host_pool.index_k_with_scale_buffer[layer_id][host_page].cpu()
+                got = indexer_host.index_k_with_scale_buffer[layer_id][host_page].cpu()
                 expected = device_pool.index_k_with_scale_buffer[layer_id][
                     device_page
                 ].cpu()
                 self.assertTrue(torch.equal(got, expected))
                 host_start = host_page * page_size
                 device_start = device_page * page_size
-                got_kv = host_pool.kv_buffer[layer_id][
+                got_kv = mla_host.kv_buffer[layer_id][
                     host_start : host_start + page_size
                 ].cpu()
                 expected_kv = device_pool.kv_buffer[layer_id][

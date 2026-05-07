@@ -12,6 +12,7 @@ from sglang.srt.mem_cache.allocator import (
 )
 from sglang.srt.mem_cache.memory_pool import NSATokenToKVPool
 from sglang.srt.utils import is_cuda, is_hip
+from sglang.srt.utils.common import get_num_new_pages
 
 # sgl_kernel.kvcacheio is only available in CUDA/ROCm sgl-kernel builds (not XPU/MPS/NPU/CPU).
 _is_cuda = is_cuda()
@@ -113,10 +114,10 @@ class HiSparseNSATokenToKVPool(NSATokenToKVPool):
             num_layers=self.layer_num,
         )
 
-    def get_cpu_copy(self, indices):
+    def get_cpu_copy(self, indices, mamba_indices=None):
         raise NotImplementedError("HiSparseDevicePool does not support get_cpu_copy")
 
-    def load_cpu_copy(self, kv_cache_cpu, indices):
+    def load_cpu_copy(self, kv_cache_cpu, indices, mamba_indices=None):
         raise NotImplementedError("HiSparseDevicePool does not support load_cpu_copy")
 
 
@@ -273,9 +274,19 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         extend_num_tokens: int,
     ):
         assert self.page_size > 1
-        num_tokens = extend_num_tokens + len(seq_lens) * self.page_size
 
-        if num_tokens > self.available_size():
+        num_new_pages = get_num_new_pages(
+            seq_lens=seq_lens_cpu, page_size=self.page_size, prefix_lens=prefix_lens_cpu
+        )
+        if (
+            num_new_pages
+            > self.logical_attn_allocator.available_size() // self.page_size
+        ):
+            return None
+        if (
+            num_new_pages
+            > self.hisparse_attn_allocator.available_size() // self.page_size
+        ):
             return None
 
         logical_indices = self.logical_attn_allocator.alloc_extend(
@@ -296,6 +307,7 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             seq_lens_cpu,
             hisparse_last_loc,
             len(logical_indices),
+            num_new_pages=num_new_pages,
         )
         assert (
             hisparse_indices is not None
