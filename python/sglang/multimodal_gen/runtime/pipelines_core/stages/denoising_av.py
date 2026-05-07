@@ -7,6 +7,9 @@ from sglang.multimodal_gen.runtime.pipelines_core.diffusion_scheduler_utils impo
     clone_scheduler_runtime,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
+from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
+    StageParallelismType,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.ltx_2_denoising import (
     LTX2DenoisingStage,
 )
@@ -137,6 +140,14 @@ class LTX2RefinementStage(LTX2AVDenoisingStage):
                 memory_intensive=True,
             )
         ]
+
+    @property
+    def parallelism_type(self) -> StageParallelismType:
+        # Stage 2 is distilled and always runs with CFG disabled, so non-main
+        # CFG ranks should wait at a barrier rather than run a redundant forward.
+        if self.server_args.enable_cfg_parallel:
+            return StageParallelismType.MAIN_RANK_ONLY
+        return StageParallelismType.REPLICATED
 
     @staticmethod
     def _randn_like_with_batch_generators(
@@ -361,11 +372,9 @@ class LTX2RefinementStage(LTX2AVDenoisingStage):
             scheduler_sigmas = self.distilled_sigmas
 
         scheduler.sigmas = scheduler_sigmas
-        num_steps = len(self.distilled_sigmas) - 1
+        num_steps = len(scheduler_sigmas) - 1
         scheduler.num_inference_steps = num_steps
-        scheduler.timesteps = (self.distilled_sigmas[:num_steps] * 1000).to(
-            distilled_device
-        )
+        scheduler.timesteps = (scheduler_sigmas[:num_steps] * 1000).to(distilled_device)
         scheduler._step_index = None
         scheduler._begin_index = None
 
