@@ -5,6 +5,7 @@ import logging
 import math
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Optional
+from weakref import WeakValueDictionary
 
 import torch
 from sglang.srt.environ import envs
@@ -21,7 +22,7 @@ from sglang.srt.layers.moe.moe_runner.base import (
     register_pre_permute,
 )
 from sglang.srt.layers.moe.utils import MoeRunnerBackend
-from sglang.srt.platforms import current_platform
+from sglang.srt.utils.custom_op import register_custom_op
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher.deepep import (
@@ -55,9 +56,6 @@ def get_standard_humming_moe_gemm_type() -> HummingGemmType:
         gemm_type = HummingGemmType.GROUPED_CONTIGUOUS
     elif env_gemm_type_str == "indexed":
         gemm_type = HummingGemmType.INDEXED
-    elif current_platform.has_device_capability(90):
-        # when device supports TMA, use grouped gemm
-        gemm_type = HummingGemmType.GROUPED_CONTIGUOUS
     else:
         gemm_type = HummingGemmType.INDEXED
 
@@ -94,7 +92,45 @@ class HummingMoeQuantInfo(MoeQuantInfo):
     pass
 
 
+@register_custom_op()
+def humming_moe_runner_core_run(
+    moe_runner_id: int,
+    gemm_type: str,
+    hidden_states: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    expert_num_tokens: torch.Tensor | None = None,
+    expected_m: int | None = None,
+) -> torch.Tensor:
+    runner = HummingRunnerCore.runner_cores[moe_runner_id]
+    if gemm_type == "indexed":
+        return runner._run_indexed_gemm(
+            hidden_states=hidden_states,
+            topk_ids=topk_ids,
+            topk_weights=topk_weights,
+        )
+    elif gemm_type == "grouped_contiguous":
+        return runner._run_grouped_contiguous_gemm(
+            hidden_states=hidden_states,
+            topk_ids=topk_ids,
+            topk_weights=topk_weights,
+        )
+    elif gemm_type == "grouped_masked":
+        assert expected_m is not None and expert_num_tokens is not None
+        return runner._run_grouped_masked_gemm(
+            hidden_states=hidden_states,
+            topk_ids=topk_ids,
+            topk_weights=topk_weights,
+            expected_m=expected_m,
+            expert_num_tokens=expert_num_tokens,
+        )
+    else:
+        raise ValueError(f"Unknown gemm type: {gemm_type}")
+
+
 class HummingRunnerCore(MoeRunnerCore):
+    runner_cores: WeakValueDictionary = WeakValueDictionary()
+
     def __init__(self, config: MoeRunnerConfig):
         super().__init__(config)
         assert config.layer is not None
@@ -104,7 +140,9 @@ class HummingRunnerCore(MoeRunnerCore):
         self.num_experts = config.num_local_experts
         self.global_num_experts = config.num_experts
         self.activation = config.activation
+        self.swiglu_limit = config.swiglu_limit
         self.humming_gemm_configs = {}
+        HummingRunnerCore.runner_cores[id(self)] = self
 
     @property
     def runner_backend(self) -> MoeRunnerBackend:
@@ -160,7 +198,7 @@ class HummingRunnerCore(MoeRunnerCore):
         gemm_type: HummingGemmType,
     ):
         num_experts = self.num_experts
-        N = self.layer.intermediate_size
+        N = self.layer.intermediate_size_per_partition
         K = self.layer.hidden_size
         assert isinstance(num_experts, int)
         assert isinstance(N, int)
@@ -293,7 +331,7 @@ class HummingRunnerCore(MoeRunnerCore):
     ):
         shapes = self._workspace_shapes(hidden_states, topk_ids, gemm_type)
         workspace1_shape, workspace2_shape, output_shape = shapes
-        torch_dtype = self.layer.param_dtype
+        torch_dtype = self.layer.params_dtype
         device = hidden_states.device
         workspace1 = torch.empty(workspace1_shape, dtype=torch_dtype, device=device)
         workspace2 = torch.empty(workspace2_shape, dtype=torch_dtype, device=device)
@@ -349,27 +387,20 @@ class HummingRunnerCore(MoeRunnerCore):
         if runner_input.hidden_states.size(0) == 0:
             return torch.empty_like(runner_input.hidden_states)
 
-        if runner_input.gemm_type == HummingGemmType.INDEXED:
-            return self._run_indexed_gemm(
-                hidden_states=runner_input.hidden_states,
-                topk_weights=runner_input.topk_weights,
-                topk_ids=runner_input.topk_ids,
-            )
-        elif runner_input.gemm_type == HummingGemmType.GROUPED_CONTIGUOUS:
-            return self._run_grouped_contiguous_gemm(
-                hidden_states=runner_input.hidden_states,
-                topk_weights=runner_input.topk_weights,
-                topk_ids=runner_input.topk_ids,
-            )
-        elif runner_input.gemm_type == HummingGemmType.GROUPED_MASKED:
-            return self._run_grouped_masked_gemm(
-                hidden_states=runner_input.hidden_states,
-                topk_ids=runner_input.topk_ids,
-                expected_m=runner_input.expected_m,
-                expert_num_tokens=runner_input.expert_num_tokens,
-            )
-        else:
-            raise ValueError(f"unsupported moe gemm type: {HummingGemmType}")
+        # To make it compatible with dynamic shapes in torch.compile,
+        # we wrap the main logic inside a torch op.
+        # (the moe_block_size selection in indexed gemm would break dynamic shapes).
+        output = humming_moe_runner_core_run(
+            moe_runner_id=id(self),
+            gemm_type=runner_input.gemm_type.value,
+            hidden_states=runner_input.hidden_states,
+            topk_weights=runner_input.topk_weights,
+            topk_ids=runner_input.topk_ids,
+            expected_m=runner_input.expected_m,
+            expert_num_tokens=runner_input.expert_num_tokens,
+        )
+
+        return HummingRunnerOutput(hidden_states=output)
 
     def _prepare_indexed_gemm_kwargs(
         self, topk_ids: torch.Tensor
@@ -469,7 +500,7 @@ class HummingRunnerCore(MoeRunnerCore):
             outputs=buffers["output"],
         )
 
-        return HummingRunnerOutput(hidden_states=buffers["output"])
+        return buffers["output"]
 
     def _run_grouped_contiguous_gemm(
         self,
@@ -544,14 +575,14 @@ class HummingRunnerCore(MoeRunnerCore):
             src2dst=src2dst,
         )
 
-        return HummingRunnerOutput(hidden_states=buffers["output"])
+        return buffers["output"]
 
     def _run_grouped_masked_gemm(
         self,
         hidden_states: torch.Tensor,
         topk_ids: torch.Tensor,
-        expert_num_tokens: torch.Tensor | None,
-        expected_m: int | None = None,
+        expert_num_tokens: torch.Tensor,
+        expected_m: int,
     ):
         configs = self.get_humming_gemm_configs(HummingGemmType.GROUPED_MASKED)
         valid_shape_m = self.estimate_local_valid_shape_m(topk_ids, expected_m)
@@ -606,7 +637,7 @@ class HummingRunnerCore(MoeRunnerCore):
             sublayer_name="w2",
         )
 
-        return HummingRunnerOutput(hidden_states=buffers["down_output"])
+        return buffers["down_output"]
 
 
 @register_fused_func("none", "humming")

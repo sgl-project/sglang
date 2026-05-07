@@ -97,7 +97,7 @@ def deepep_permute_triton_kernel(
         in_data = tl.load(src_ptr + offset, mask=mask).to(OutDtype)
 
         for idx in range(topk):
-            dst_idx = tl.load(src2dst_ptr + idx)
+            dst_idx = tl.load(src2dst_ptr + idx).to(tl.int64)
             if dst_idx >= 0:
                 dst_ptr = gateup_input_ptr + dst_idx * hidden_size
                 tl.store(dst_ptr + offset, in_data, mask=mask)
@@ -127,7 +127,7 @@ def deepep_post_reorder_triton_kernel(
         mask = offset < hidden_size
         sum_vec = tl.zeros([BLOCK_SIZE], dtype=InDtype)
         for idx in range(topk):
-            dst_idx = tl.load(src2dst_ptr + idx)
+            dst_idx = tl.load(src2dst_ptr + idx).to(tl.int64)
             if dst_idx >= 0:
                 weigh_scale = tl.load(topk_weights_ptr + idx).to(InDtype)
                 load_ptr = down_output_ptr + dst_idx * hidden_size

@@ -36,7 +36,6 @@ from sglang.srt.layers.quantization.unquant import (
     UnquantizedFusedMoEMethod,
     UnquantizedLinearMethod,
 )
-from sglang.srt.model_loader.weight_utils import default_weight_loader
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import CombineInput, DispatchOutput
@@ -214,7 +213,7 @@ class HummingConfig(QuantizationConfig):
     def is_layer_skipped(self, config: dict[str, Any], prefix: str):
         keys = ["ignored_layers", "ignore", "modules_to_not_convert"]
         ignored_layers = self.get_from_keys_or(config, keys, []) or []
-        if hasattr(self, "hf_to_vllm_mapper"):
+        if hasattr(self, "hf_to_sglang_mapper"):
             ignored_layers = self.hf_to_sglang_mapper.apply_list(ignored_layers)
 
         if any(module_name in prefix for module_name in ignored_layers):
@@ -320,6 +319,7 @@ class HummingConfig(QuantizationConfig):
     ) -> "QuantizeMethodBase | None":
         layer_type = "other"
         from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+
         if isinstance(layer, FusedMoE):
             layer_type = "moe"
         elif isinstance(layer, LinearBase):
@@ -461,6 +461,8 @@ class HummingLinearMethod(LinearMethodBase):
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ):
+        from sglang.srt.model_loader.weight_utils import default_weight_loader
+
         layer.is_fallback = False
         layer.param_dtype = params_dtype
         layer.input_size = input_size
@@ -680,6 +682,8 @@ class HummingMoEMethod(FusedMoEMethodBase):
         with_bias: bool = False,
         **extra_weight_attrs,
     ):
+        from sglang.srt.model_loader.weight_utils import default_weight_loader
+
         layer.num_experts = num_experts
         layer.param_dtype = params_dtype
         layer.intermediate_size = intermediate_size_per_partition
@@ -730,7 +734,6 @@ class HummingMoEMethod(FusedMoEMethodBase):
 
         locks = torch.zeros(1024, dtype=torch.int32)
         layer.register_buffer("locks", locks)
-
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         if getattr(self, "processed", False):
