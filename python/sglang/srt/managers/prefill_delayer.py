@@ -250,7 +250,9 @@ class PrefillDelayerSinglePassExecutor:
     def negotiate_should_allow_prefill(
         self,
         local_prefillable: bool,
+        running_batch: int = 0,
         max_prefill_bs: int = 0,
+        max_running_requests: int = 0,
         new_prefill_requests_count: int = 0,
     ) -> bool:
         if not self._called:

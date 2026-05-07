@@ -385,7 +385,8 @@ class PrefillAdder:
         num_mixed_decode_tokens: int = 0,
         priority_scheduling_preemption_threshold: int = 0,
         max_prefill_bs: int = 0,
-        new_prefill_requests_count: Optional[int] = 0,
+        max_running_requests: Optional[int] = None,
+        new_prefill_requests_count: Optional[int] = None,
         prefill_max_requests: Optional[int] = None,
         prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor] = None,
         dllm_config: Optional[DllmConfig] = None,
@@ -436,6 +437,7 @@ class PrefillAdder:
             priority_scheduling_preemption_threshold
         )
         self.nsa_prefill_cp_in_seq_split = is_nsa_prefill_cp_in_seq_split()
+        self.max_running_requests = max_running_requests
         self.prefill_context_parallel_enabled = is_prefill_context_parallel_enabled()
         self.prefill_max_requests = prefill_max_requests
         self.prefill_delayer_single_pass = prefill_delayer_single_pass
@@ -770,7 +772,9 @@ class PrefillAdder:
         if (self.prefill_delayer_single_pass is not None) and (
             not self.prefill_delayer_single_pass.negotiate_should_allow_prefill(
                 local_prefillable=True,
+                running_batch=self.running_batch.batch_size(),
                 max_prefill_bs=self.max_prefill_bs,
+                max_running_requests=self.max_running_requests,
                 new_prefill_requests_count=self.new_prefill_requests_count,
             )
         ):
