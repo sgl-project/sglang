@@ -1429,7 +1429,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             # Static waterfill rank load is prepared once here, so deployments that
             # need the static path should initialize EPLB from a logical_count .pt.
             # trivial/mapping init has no rank_load and will use dynamic all-reduce.
-            module.deepep_waterfill_balancer.update_static_weights()
+            module.deepep_waterfill_balancer.update_static_rank_load()
             num_prepared += 1
         if num_prepared:
             log_info_on_rank0(

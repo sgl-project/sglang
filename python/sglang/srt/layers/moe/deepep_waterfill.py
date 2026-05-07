@@ -29,7 +29,7 @@ _LOCAL_PREF_DENOM = 10
 
 
 class WaterfillDispatchPlan(NamedTuple):
-    """Framework-neutral waterfill inputs prepared by the SGLang wrapper."""
+    """Inputs needed by the fused DeepEP Waterfill expansion path."""
 
     rank_load: Tensor
     allow_all_ranks: bool
@@ -270,12 +270,10 @@ def materialize_waterfill_dispatch_fused(
     allow_all_ranks: bool = False,
     target_total: int = 0,
 ) -> Tuple[Tensor, Tensor]:
-    """Materialize waterfill rank selection into DeepEP expanded TopK layout.
+    """Run fused Waterfill rank selection and DeepEP TopK expansion.
 
-    The Triton kernel intentionally fuses rank selection and layout writeback
-    for performance. Its boundary is still adapter-local: inputs are plain
-    tensors plus rank-load state, and no SGLang ``StandardTopKOutput`` or
-    communication API enters this function.
+    The Triton kernel intentionally selects each token's shared-expert rank and
+    writes the expanded DeepEP TopK layout in one pass.
     """
     num_tokens = topk_ids.shape[0]
     topk = topk_ids.shape[1]
@@ -379,8 +377,8 @@ class DeepEPWaterfillBalancer:
         self.static_rank_load: Optional[Tensor] = None
         self._counts_buf: Optional[Tensor] = None
 
-    def update_static_weights(self):
-        """Update static weights from EPLB metadata if layout changes."""
+    def update_static_rank_load(self):
+        """Keep a live reference to EPLB rank-load metadata when available."""
         if envs.SGLANG_DISABLE_STATIC_WATERFILL.get():
             return
         from sglang.srt.eplb.expert_location import get_global_expert_location_metadata
@@ -432,11 +430,11 @@ class DeepEPWaterfillBalancer:
         )
 
     def _build_static_dispatch_plan(self, routed_counts: Tensor) -> WaterfillDispatchPlan:
-        """Build static-mode waterfill inputs without framework communication.
+        """Build static-mode Waterfill inputs without EP all-reduce.
 
-        Static Waterfill currently uses EPLB metadata availability to choose the
-        no-all-reduce path. The rank-load tensor passed to the fused kernel keeps
-        the existing PR behavior.
+        Static Waterfill uses EPLB rank-load metadata availability to select the
+        no-all-reduce path. The fused kernel still consumes this layer's current
+        local routed counts, matching the existing PR behavior.
         """
         return WaterfillDispatchPlan(
             rank_load=routed_counts,
@@ -516,7 +514,7 @@ class DeepEPWaterfillBalancer:
         topk_weights: Tensor,
         dispatch_plan: WaterfillDispatchPlan,
     ) -> Tuple[Tensor, Tensor]:
-        """Convert a waterfill dispatch plan into DeepEP expanded TopK tensors."""
+        """Expand TopK using local expansion or fused Waterfill."""
         num_tokens = topk_ids.shape[0]
         if num_tokens == 0:
             return _empty_expanded(topk_ids, topk_weights)
