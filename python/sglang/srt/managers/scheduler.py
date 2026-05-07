@@ -3832,11 +3832,7 @@ class SenderWrapper:
             # handle communicator reqs for multi-http worker case
             output.http_worker_ipc = recv_obj.http_worker_ipc
 
-        if (
-            not self.scheduler.server_args.disable_load_piggyback
-            and output.load is None
-            and not isinstance(output, GetLoadsReqOutput)
-        ):
+        if output.load is None and not isinstance(output, GetLoadsReqOutput):
             output.load = self.scheduler.get_loads(GetLoadsReqInput(include=["all"]))
 
         self.socket.send_pyobj(output)
