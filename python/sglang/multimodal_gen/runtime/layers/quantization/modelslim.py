@@ -82,7 +82,7 @@ class ModelSlimConfig(QuantizationConfig):
 
     @classmethod
     def from_config(
-        cls, config: Dict[str, Any], reverse_param_names_mapping: dict
+        cls, config: Dict[str, Any], reverse_param_names_mapping: dict = None
     ) -> ModelSlimConfig:
         return cls(config, reverse_param_names_mapping)
 
