@@ -507,6 +507,9 @@ class Envs:
     # Tool-Call behavior
     SGLANG_TOOL_STRICT_LEVEL = EnvInt(ToolStrictLevel.OFF)
 
+    # Think tokens budget: negative means unlimited, >= 0 caps thinking tokens
+    SGLANG_MAX_THINK_TOKENS = EnvInt(-1)
+
     # Ngram
     SGLANG_NGRAM_FORCE_GREEDY_VERIFY = EnvBool(False)
 
