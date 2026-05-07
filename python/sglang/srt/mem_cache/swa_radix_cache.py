@@ -562,6 +562,51 @@ class SWARadixCache(BasePrefixCache):
             # Here we -1 to make sure the kv of the unmatched token can be freed correctly to avoid memory leak
             old_prefix_len -= 1
 
+        # Stash-redundancy detection: when stash_chunked_request was called at
+        # the start of this frame (cache_unfinished_req(chunked=True)), it set
+        # prefix_indices to length all_token_len_prev (page-aligned + tail).
+        # If add_chunked_req then returned None (last chunk fits remaining
+        # budget) and forward processed the remaining 0..few tokens, this
+        # function is invoked AGAIN via process_batch_result_prefill with the
+        # same (or barely larger) all_token_len. In that case
+        # old_prefix_len > page_aligned_token_len, the page-aligned portion is
+        # already in the tree, and no new content needs insertion. Just refresh
+        # the lock and rebuild prefix_indices using the new req_pool_idx's
+        # kv_indices. Without this branch, the assert below fires because
+        # match_prefix returns at most page_aligned_token_len indices.
+        if old_prefix_len > page_aligned_token_len:
+            match_result = self.match_prefix(
+                MatchPrefixParams(
+                    key=RadixKey(page_aligned_token_ids, req.extra_key)
+                )
+            )
+            new_indices = match_result.device_indices
+            new_last_node = match_result.last_device_node
+
+            self.dec_lock_ref(
+                req.last_node,
+                req.swa_uuid_for_lock,
+                skip_swa=req.swa_prefix_lock_released,
+            )
+            req.swa_prefix_lock_released = False
+            swa_uuid_for_lock = self.inc_lock_ref(new_last_node)
+
+            req.cache_protected_len = len(new_indices)
+            if self.page_size != 1:
+                req.prefix_indices = torch.cat(
+                    [new_indices, kv_indices[len(new_indices) :]]
+                )
+            else:
+                if self.is_eagle:
+                    req.prefix_indices = torch.cat(
+                        [new_indices, kv_indices[actual_kv_len:]]
+                    )
+                else:
+                    req.prefix_indices = new_indices
+            req.last_node = new_last_node
+            req.swa_uuid_for_lock = swa_uuid_for_lock
+            return
+
         # Radix Cache takes one ref in memory pool
         # Note: the insert function already frees the overlapped kv_indices
         result = self.insert(
