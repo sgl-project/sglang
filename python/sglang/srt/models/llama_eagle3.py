@@ -50,9 +50,15 @@ class LlamaDecoderLayer(LlamaDecoderLayer):
     ) -> None:
         super().__init__(config, layer_id, quant_config, prefix)
 
+        # EAGLE3's first layer concatenates input embeddings with hidden states, but
+        # inner layers don't need input embeddings, so only the first layer needs to
+        # adjust the qkv projection dimensions.
+        hidden_size = 2 * self.hidden_size if layer_id == 0 else self.hidden_size
+        self.layer_id = layer_id
+
         # override qkv
         self.self_attn.qkv_proj = QKVParallelLinear(
-            2 * self.hidden_size,
+            hidden_size,
             self.self_attn.head_dim,
             self.self_attn.total_num_heads,
             self.self_attn.total_num_kv_heads,
@@ -81,11 +87,16 @@ class LlamaDecoderLayer(LlamaDecoderLayer):
         residual: Optional[torch.Tensor],
     ) -> Tuple[torch.Tensor, torch.Tensor]:
 
-        residual = hidden_states
-        embeds = self.input_layernorm(embeds)
-        hidden_states = self.hidden_norm(hidden_states)
+        if self.layer_id == 0:
+            # Layer 0 receives target-model hidden states; no carried residual to fuse.
+            residual = hidden_states
+            hidden_states = self.hidden_norm(hidden_states)
+            embeds = self.input_layernorm(embeds)
+            hidden_states = torch.cat([embeds, hidden_states], dim=-1)
+        else:
+            # Fuse the previous layer's MLP residual add into hidden_norm.
+            hidden_states, residual = self.hidden_norm(hidden_states, residual)
 
-        hidden_states = torch.cat([embeds, hidden_states], dim=-1)
         # Self Attention
         hidden_states = self.self_attn(
             positions=positions,
@@ -135,15 +146,43 @@ class LlamaModel(nn.Module):
         else:
             self.hidden_size_in = config.hidden_size
 
+        # EAGLE-3 uses 3 auxiliary hidden states (low, mid, high) by default.
+        num_aux_hidden_states = 3
+        eagle_config = getattr(config, "eagle_config", None)
+        if eagle_config:
+            ids = eagle_config.get("eagle_aux_hidden_state_layer_ids", None)
+            if ids:
+                num_aux_hidden_states = len(ids)
+
+        self.num_aux_hidden_states = getattr(
+            config, "num_aux_hidden_states", num_aux_hidden_states
+        )
+
         self.fc = torch.nn.Linear(
-            self.hidden_size_in * 3,
+            self.hidden_size_in * self.num_aux_hidden_states,
             config.hidden_size,
             bias=getattr(config, "bias", False),
         )
 
-        self.midlayer = LlamaDecoderLayer(config, 0, quant_config, prefix)
+        if getattr(config, "fc_norm", False):
+            self.fc_norm = nn.ModuleList(
+                [
+                    RMSNorm(self.hidden_size_in, eps=config.rms_norm_eps)
+                    for _ in range(self.num_aux_hidden_states)
+                ]
+            )
+        else:
+            self.fc_norm = None
+
+        self.layers = nn.ModuleList(
+            [
+                LlamaDecoderLayer(config, i, quant_config, prefix)
+                for i in range(config.num_hidden_layers)
+            ]
+        )
 
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.norm_output = getattr(config, "norm_output", False)
 
     def forward(
         self,
@@ -174,6 +213,12 @@ class LlamaModel(nn.Module):
 
         hidden_states = forward_batch.spec_info.hidden_states
         if hidden_states.shape[-1] != embeds.shape[-1]:
+            if self.fc_norm is not None:
+                chunks = hidden_states.chunk(self.num_aux_hidden_states, dim=-1)
+                hidden_states = torch.cat(
+                    [norm(chunk) for norm, chunk in zip(self.fc_norm, chunks)],
+                    dim=-1,
+                )
             hidden_states = self.fc(hidden_states)
 
         # idle batch
@@ -181,20 +226,24 @@ class LlamaModel(nn.Module):
             return hidden_states, [hidden_states]
 
         residual = None
-        hidden_states, residual = self.midlayer(
-            positions,
-            embeds,
-            hidden_states,
-            forward_batch,
-            residual,
-        )
+        for layer in self.layers:
+            hidden_states, residual = layer(
+                positions,
+                embeds,
+                hidden_states,
+                forward_batch,
+                residual,
+            )
 
         hidden_states_to_logits, hidden_states_to_aux = self.norm(
             hidden_states, residual
         )
 
-        # For draft decode, we capture the hidden state before norm
-        return hidden_states_to_logits, [hidden_states_to_aux]
+        # For draft decode, we capture the hidden state before norm, but some models might prefer normed hidden states
+        draft_decode = (
+            [hidden_states] if not self.norm_output else [hidden_states_to_logits]
+        )
+        return hidden_states_to_logits, draft_decode
 
 
 class LlamaForCausalLMEagle3(LlamaForCausalLM):
@@ -208,9 +257,6 @@ class LlamaForCausalLMEagle3(LlamaForCausalLM):
         self.config = config
         self.quant_config = quant_config
         self.pp_group = get_pp_group()
-
-        if self.config.num_hidden_layers != 1:
-            raise ValueError("EAGLE3 currently only supports 1 layer")
 
         self.model = LlamaModel(
             config, quant_config=quant_config, prefix=add_prefix("model", prefix)
@@ -253,6 +299,9 @@ class LlamaForCausalLMEagle3(LlamaForCausalLM):
         ]
 
         for name, loaded_weight in weights:
+            if "midlayer" in name:
+                name = name.replace("midlayer", "layers.0")
+
             if "d2t" in name:
                 # d2t stores diffs between draft id and target id
                 self.hot_token_id = loaded_weight + torch.arange(loaded_weight.shape[0])
