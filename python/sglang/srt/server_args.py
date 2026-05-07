@@ -131,6 +131,7 @@ QUANTIZATION_CHOICES = [
     "auto-round",
     "compressed-tensors",  # for Ktransformers
     "modelslim",  # for NPU
+    "quark",  # AMD Quark quantizer (FP8 / MXFP4 / Int4FP8 etc.)
     "quark_int4fp8_moe",
     "unquant",
 ]
@@ -188,6 +189,7 @@ MOE_RUNNER_BACKEND_CHOICES = [
     "flashinfer_cutedsl",
     "cutlass",
     "aiter",
+    "marlin",
 ]
 
 MOE_A2A_BACKEND_CHOICES = [
@@ -297,6 +299,43 @@ def add_radix_eviction_policy_choices(choices):
 
 def add_rl_on_policy_target_choices(choices):
     RL_ON_POLICY_TARGET_CHOICES.extend(choices)
+
+
+def _resolve_speculative_algorithm_alias(
+    speculative_algorithm: Optional[str],
+    speculative_draft_model_path: Optional[str],
+    trust_remote_code: bool = False,
+) -> Optional[str]:
+    """Resolve CLI speculative algorithm; NEXTN/EAGLE may become FROZEN_KV_MTP for Gemma4 assistant drafts."""
+
+    is_gemma4_draft = False
+    if speculative_draft_model_path:
+        from transformers import AutoConfig
+
+        cfg = AutoConfig.from_pretrained(
+            speculative_draft_model_path, trust_remote_code=trust_remote_code
+        )
+        is_gemma4_draft = "Gemma4AssistantForCausalLM" in (
+            getattr(cfg, "architectures", None) or []
+        )
+
+    if speculative_algorithm == "EAGLE3" and is_gemma4_draft:
+        raise ValueError(
+            "Gemma4AssistantForCausalLM draft requires "
+            "--speculative-algorithm NEXTN or EAGLE; EAGLE3 is "
+            "not supported for this draft architecture."
+        )
+
+    if speculative_algorithm == "NEXTN" or speculative_algorithm == "EAGLE":
+        if is_gemma4_draft:
+            logger.info(
+                "Detected Gemma4AssistantForCausalLM draft; "
+                f"promoting --speculative-algorithm {speculative_algorithm} to FROZEN_KV_MTP."
+            )
+            return "FROZEN_KV_MTP"
+        return "EAGLE"
+
+    return speculative_algorithm
 
 
 @dataclasses.dataclass
@@ -456,6 +495,7 @@ class ServerArgs:
     enable_cache_report: bool = False
     reasoning_parser: Optional[str] = None
     strip_thinking_cache: bool = False
+    enable_strict_thinking: bool = False
     tool_call_parser: Optional[str] = None
     tool_server: Optional[str] = None
     sampling_defaults: str = "model"
@@ -691,6 +731,7 @@ class ServerArgs:
     keep_mm_feature_on_device: bool = False
     enable_return_hidden_states: bool = False
     enable_return_routed_experts: bool = False
+    enable_return_indexer_topk: bool = False
     scheduler_recv_interval: int = 1
     numa_node: Optional[List[int]] = None
     enable_deterministic_inference: bool = False
@@ -1600,15 +1641,21 @@ class ServerArgs:
         user_set_prefill = self.nsa_prefill_backend is not None
         user_set_decode = self.nsa_decode_backend is not None
 
-        # HiSparse requires flashmla_sparse for both prefill and decode
+        # HiSparse: BF16 KV -> flashmla_sparse (native BF16 sparse).
+        # FP8 KV   -> flashmla_kv (native FP8 + sparse via is_fp8_kvcache=True + indices=...).
+        # flashmla_sparse does not accept FP8, and flashmla_kv does not accept BF16 sparse,
+        # so the KV dtype determines the backend when the user does not override.
         if self.enable_hisparse:
+            hisparse_default_backend = (
+                "flashmla_kv" if kv_cache_dtype == "fp8_e4m3" else "flashmla_sparse"
+            )
             if not user_set_prefill:
-                self.nsa_prefill_backend = "flashmla_sparse"
+                self.nsa_prefill_backend = hisparse_default_backend
             if not user_set_decode:
-                self.nsa_decode_backend = "flashmla_sparse"
+                self.nsa_decode_backend = hisparse_default_backend
             logger.warning(
-                f"HiSparse enabled: using flashmla_sparse NSA backends "
-                f"(prefill={self.nsa_prefill_backend}, decode={self.nsa_decode_backend})."
+                f"HiSparse enabled ({kv_cache_dtype}): using NSA backends "
+                f"prefill={self.nsa_prefill_backend}, decode={self.nsa_decode_backend}."
             )
             return
 
@@ -1705,7 +1752,7 @@ class ServerArgs:
                     self.attention_backend = "nsa"
                     logger.info("Use nsa attention backend for DeepSeek with DSA.")
 
-                if not is_npu():  # CUDA or ROCm GPU
+                if not is_npu() and not is_xpu():  # CUDA or ROCm GPU
                     if self.enable_nsa_prefill_context_parallel:
                         logger.warning(
                             "Context parallel feature is still under experiment. It has only been verified on Hopper platform."
@@ -3274,8 +3321,11 @@ class ServerArgs:
                 self.speculative_moe_runner_backend
             ).is_flashinfer_trtllm(), "Currently speculative MoE runner backend doesn't support flashinfer_trtllm, please use triton or auto backend for speculative moe runner instead."
 
-        if self.speculative_algorithm == "NEXTN":
-            self.speculative_algorithm = "EAGLE"
+        self.speculative_algorithm = _resolve_speculative_algorithm_alias(
+            self.speculative_algorithm,
+            self.speculative_draft_model_path,
+            trust_remote_code=self.trust_remote_code,
+        )
 
         if self.speculative_skip_dp_mlp_sync:
             assert self.speculative_algorithm == "EAGLE", (
@@ -3409,6 +3459,25 @@ class ServerArgs:
                 self.enable_mixed_chunk = False
                 logger.warning(
                     "Mixed chunked prefill is disabled because of using dflash speculative decoding."
+                )
+
+        if self.speculative_algorithm == "FROZEN_KV_MTP":
+            if self.max_running_requests is None:
+                self.max_running_requests = 48
+                logger.warning(
+                    "Max running requests is reset to 48 for speculative decoding. You can override this by explicitly setting --max-running-requests."
+                )
+
+            self.disable_overlap_schedule = True
+            logger.warning(
+                "Overlap scheduler is disabled when using Frozen-KV MTP speculative decoding (spec v2 is not supported yet)."
+            )
+
+            if self.enable_mixed_chunk:
+                self.enable_mixed_chunk = False
+                logger.warning(
+                    "Mixed chunked prefill is disabled because of using "
+                    "Frozen-KV MTP speculative decoding."
                 )
 
         if self.speculative_algorithm in ("EAGLE", "EAGLE3", "STANDALONE"):
@@ -5042,12 +5111,15 @@ class ServerArgs:
             action="store_true",
             help="Return number of cached tokens in usage.prompt_tokens_details for each openai request.",
         )
+        reasoning_parser_choices = list(ReasoningParser.DetectorMap.keys())
         parser.add_argument(
             "--reasoning-parser",
             type=str,
-            choices=list(ReasoningParser.DetectorMap.keys()),
+            choices=["auto"] + reasoning_parser_choices,
             default=ServerArgs.reasoning_parser,
-            help=f"Specify the parser for reasoning models, supported parsers are: {list(ReasoningParser.DetectorMap.keys())}.",
+            help=f"Specify the parser for reasoning models. "
+            f"Use 'auto' to detect from chat template. "
+            f"Options include: {reasoning_parser_choices}.",
         )
         parser.add_argument(
             "--strip-thinking-cache",
@@ -5056,13 +5128,23 @@ class ServerArgs:
             "radix tree on finish; keep only the prompt prefix. Opt-in: changes "
             "cache contents.",
         )
+        parser.add_argument(
+            "--enable-strict-thinking",
+            action="store_true",
+            default=ServerArgs.enable_strict_thinking,
+            help="Enable strict token filtering during the thinking phase. "
+            "Blocks model-specific excluded tokens (e.g., tool call markers) "
+            "during reasoning. Requires a grammar backend that supports token filtering.",
+        )
         tool_call_parser_choices = list(FunctionCallParser.ToolCallParserEnum.keys())
         parser.add_argument(
             "--tool-call-parser",
             type=str,
-            choices=tool_call_parser_choices,
+            choices=["auto"] + tool_call_parser_choices,
             default=ServerArgs.tool_call_parser,
-            help=f"Specify the parser for handling tool-call interactions. Options include: {tool_call_parser_choices}.",
+            help=f"Specify the parser for handling tool-call interactions. "
+            f"Use 'auto' to detect from chat template. "
+            f"Options include: {tool_call_parser_choices}.",
         )
         parser.add_argument(
             "--tool-server",
@@ -6265,6 +6347,11 @@ class ServerArgs:
             help="Enable returning routed experts of each layer with responses.",
         )
         parser.add_argument(
+            "--enable-return-indexer-topk",
+            action="store_true",
+            help="Enable returning indexer topk indices of layers with indexer with responses.",
+        )
+        parser.add_argument(
             "--scheduler-recv-interval",
             type=int,
             default=ServerArgs.scheduler_recv_interval,
@@ -6868,23 +6955,31 @@ class ServerArgs:
             assert (
                 self.disable_radix_cache
             ), "Hierarchical sparse attention currently requires --disable-radix-cache."
+            if self.kv_cache_dtype not in ("bfloat16", "auto", "fp8_e4m3"):
+                raise ValueError(
+                    f"HiSparse requires bfloat16 or fp8_e4m3 KV cache, "
+                    f"but got --kv-cache-dtype={self.kv_cache_dtype}. "
+                    f"Please use --kv-cache-dtype=bfloat16 or fp8_e4m3."
+                )
+
+            # Backend/dtype pairing: flashmla_sparse only takes BF16 KV;
+            # flashmla_kv only supports FP8 (it always reads KV as FP8 via
+            # is_fp8_kvcache=True, inline-quantizing BF16 would defeat HiSparse).
+            allowed_backends_for_dtype = {
+                "bfloat16": {"flashmla_sparse"},
+                "fp8_e4m3": {"flashmla_kv"},
+            }.get(self.kv_cache_dtype, {"flashmla_sparse", "flashmla_kv"})
             for attr, label in [
                 ("nsa_prefill_backend", "prefill"),
                 ("nsa_decode_backend", "decode"),
             ]:
                 backend = getattr(self, attr)
-                if backend is not None and backend != "flashmla_sparse":
+                if backend is not None and backend not in allowed_backends_for_dtype:
                     raise ValueError(
-                        f"HiSparse requires flashmla_sparse NSA {label} backend, "
-                        f"but got --nsa-{label}-backend={backend}. "
-                        f"Please use --nsa-{label}-backend=flashmla_sparse or omit it."
+                        f"HiSparse with --kv-cache-dtype={self.kv_cache_dtype} requires "
+                        f"--nsa-{label}-backend in {sorted(allowed_backends_for_dtype)}, "
+                        f"but got {backend}."
                     )
-
-            if self.kv_cache_dtype != "bfloat16":
-                raise ValueError(
-                    f"HiSparse requires bfloat16 KV cache, but got --kv-cache-dtype={self.kv_cache_dtype}. "
-                    f"Please use --kv-cache-dtype=bfloat16."
-                )
 
         assert (
             self.schedule_conservativeness >= 0
@@ -6989,17 +7084,26 @@ class ServerArgs:
                         if "=" in lora_path:
                             name, path = lora_path.split("=", 1)
                             lora_ref = LoRARef(
-                                lora_name=name, lora_path=path, pinned=False
+                                lora_id=LoRARef.deterministic_id(name, path),
+                                lora_name=name,
+                                lora_path=path,
+                                pinned=False,
                             )
                         else:
                             lora_ref = LoRARef(
-                                lora_name=lora_path, lora_path=lora_path, pinned=False
+                                lora_id=LoRARef.deterministic_id(lora_path, lora_path),
+                                lora_name=lora_path,
+                                lora_path=lora_path,
+                                pinned=False,
                             )
                     elif isinstance(lora_path, dict):
                         assert (
                             "lora_name" in lora_path and "lora_path" in lora_path
                         ), f"When providing LoRA paths as a list of dict, each dict should contain 'lora_name' and 'lora_path' keys. Got: {lora_path}"
                         lora_ref = LoRARef(
+                            lora_id=LoRARef.deterministic_id(
+                                lora_path["lora_name"], lora_path["lora_path"]
+                            ),
                             lora_name=lora_path["lora_name"],
                             lora_path=lora_path["lora_path"],
                             pinned=lora_path.get("pinned", False),
@@ -7012,7 +7116,12 @@ class ServerArgs:
                     self.lora_paths.append(lora_ref)
             elif isinstance(self.lora_paths, dict):
                 self.lora_paths = [
-                    LoRARef(lora_name=k, lora_path=v, pinned=False)
+                    LoRARef(
+                        lora_id=LoRARef.deterministic_id(k, v),
+                        lora_name=k,
+                        lora_path=v,
+                        pinned=False,
+                    )
                     for k, v in self.lora_paths.items()
                 ]
             elif self.lora_paths is None:

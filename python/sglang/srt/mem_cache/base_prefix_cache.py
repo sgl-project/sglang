@@ -95,6 +95,10 @@ class IncLockRefResult:
     delta: Optional[int] = None
     swa_uuid_for_lock: Optional[int] = None
 
+    def to_dec_params(self) -> "DecLockRefParams":
+        """Convert to the corresponding DecLockRefParams for dec_lock_ref."""
+        return DecLockRefParams(swa_uuid_for_lock=self.swa_uuid_for_lock)
+
 
 @dataclasses.dataclass
 class DecLockRefParams:
