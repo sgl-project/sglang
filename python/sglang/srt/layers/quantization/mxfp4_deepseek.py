@@ -1,6 +1,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import logging
 from typing import TYPE_CHECKING
 
@@ -574,4 +575,3 @@ class DeepSeekMxfp4MoEMethod:
                 output.mul_(rsf)
 
         return StandardCombineInput(hidden_states=output)
-

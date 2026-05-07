@@ -8,6 +8,9 @@ from typing import TYPE_CHECKING, Any, Optional
 from weakref import WeakValueDictionary
 
 import torch
+from sglang.srt.debug_utils.deepseek_v4_debug_utils import (
+    deepseek_v4_moe_code_path_checker,
+)
 from sglang.srt.environ import envs
 from sglang.srt.layers.moe.ep_moe.kernels import moe_permute, moe_unpermute
 from sglang.srt.layers.moe.fused_moe_triton.moe_fused_mul_sum import moe_fused_mul_sum
@@ -140,6 +143,7 @@ class HummingRunnerCore(MoeRunnerCore):
         self.num_experts = config.num_local_experts
         self.global_num_experts = config.num_experts
         self.activation = config.activation
+        self.swiglu_limit = config.swiglu_limit
         self.humming_gemm_configs = {}
         HummingRunnerCore.runner_cores[id(self)] = self
 
@@ -366,6 +370,13 @@ class HummingRunnerCore(MoeRunnerCore):
 
     def apply_activation(self, inputs: torch.Tensor, outputs: torch.Tensor):
         if self.activation == "silu":
+            if envs.SGLANG_DSV4_2604_SUBMODE.get() == "2604B":
+                from sglang.srt.layers.moe.moe_runner.deep_gemm import (
+                    _apply_swiglu_limit,
+                )
+
+                inputs = _apply_swiglu_limit(inputs, swiglu_limit=self.swiglu_limit)
+                deepseek_v4_moe_code_path_checker.observed += 1
             from sgl_kernel import silu_and_mul
 
             silu_and_mul(inputs, outputs)
