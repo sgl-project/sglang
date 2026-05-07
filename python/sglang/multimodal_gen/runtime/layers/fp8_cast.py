@@ -15,6 +15,55 @@ def _fused_add_round_fp8_cast_kernel(
     random_offset,
     EXPONENT_BIAS,
     MANTISSA_BITS,
+    BLOCK_SIZE: tl.constexpr,
+):
+    pid = tl.program_id(axis=0)
+    block_start = pid * BLOCK_SIZE
+    offsets = block_start + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < n_elements
+
+    x = tl.load(x_ptr + offsets, mask=mask)
+    rand_vals = tl.rand(seed, offsets + random_offset) - 0.5
+
+    x = tl.cast(x, tl.float16)
+    delta = tl.load(output_ptr + offsets, mask=mask)
+    delta = tl.cast(delta, tl.float16)
+    x = x + delta
+
+    x_bits = tl.cast(x, tl.int16, bitcast=True)
+    fp16_exponent_bits = (x_bits & 0x7C00) >> 10
+    fp16_normals = fp16_exponent_bits > 0
+    fp16_exponent = tl.where(fp16_normals, fp16_exponent_bits - 15, -14)
+
+    exponent = fp16_exponent + EXPONENT_BIAS
+    max_exponent = 2 * EXPONENT_BIAS + 1
+    exponent = tl.where(exponent > max_exponent, max_exponent, exponent)
+    exponent = tl.where(exponent < 0, 0, exponent)
+
+    eps_exp = tl.maximum(
+        0, tl.minimum(31, exponent - EXPONENT_BIAS - MANTISSA_BITS + 15)
+    )
+    eps_normal = tl.cast(tl.cast(eps_exp << 10, tl.int16), tl.float16, bitcast=True)
+    eps_subnormal = tl.cast(
+        tl.cast((16 - EXPONENT_BIAS - MANTISSA_BITS) << 10, tl.int16),
+        tl.float16,
+        bitcast=True,
+    )
+    eps = tl.where(exponent > 0, eps_normal, eps_subnormal)
+    eps = tl.where(x == 0, 0.0, eps)
+
+    output = tl.cast(x + rand_vals * eps, tl.bfloat16)
+    tl.store(output_ptr + offsets, output, mask=mask)
+
+
+@triton.jit
+def _fused_add_round_fp8_cast_strided_random_kernel(
+    x_ptr,
+    output_ptr,
+    seed,
+    n_elements,
+    EXPONENT_BIAS,
+    MANTISSA_BITS,
     RANDOM_FULL_WIDTH: tl.constexpr,
     RANDOM_LOCAL_WIDTH: tl.constexpr,
     RANDOM_COL_OFFSET: tl.constexpr,
@@ -26,12 +75,9 @@ def _fused_add_round_fp8_cast_kernel(
     mask = offsets < n_elements
 
     x = tl.load(x_ptr + offsets, mask=mask)
-    if RANDOM_FULL_WIDTH > 0:
-        row = offsets // RANDOM_LOCAL_WIDTH
-        col = offsets - row * RANDOM_LOCAL_WIDTH
-        rand_offsets = row * RANDOM_FULL_WIDTH + RANDOM_COL_OFFSET + col
-    else:
-        rand_offsets = offsets + random_offset
+    row = offsets // RANDOM_LOCAL_WIDTH
+    col = offsets - row * RANDOM_LOCAL_WIDTH
+    rand_offsets = row * RANDOM_FULL_WIDTH + RANDOM_COL_OFFSET + col
     rand_vals = tl.rand(seed, rand_offsets) - 0.5
 
     x = tl.cast(x, tl.float16)
@@ -95,8 +141,27 @@ def fused_add_round_fp8_cast_(
     if not original_weight.is_contiguous() or not target_weight.is_contiguous():
         raise ValueError("fp8-cast fused add expects contiguous tensors")
 
-    triton, kernel = _get_fused_add_round_kernel()
     n_elements = original_weight.numel()
+    if random_full_width is not None and random_full_width > 0:
+        if random_local_width is None or random_local_width <= 0:
+            raise ValueError("random_local_width must be positive for strided random")
+        triton, kernel = _get_fused_add_round_strided_random_kernel()
+        grid = (triton.cdiv(n_elements, FP8_CAST_BLOCK_SIZE),)
+        kernel[grid](
+            original_weight,
+            target_weight,
+            seed,
+            n_elements,
+            exponent_bias,
+            mantissa_bits,
+            random_full_width,
+            random_local_width,
+            random_col_offset,
+            FP8_CAST_BLOCK_SIZE,
+        )
+        return
+
+    triton, kernel = _get_fused_add_round_kernel()
     grid = (triton.cdiv(n_elements, FP8_CAST_BLOCK_SIZE),)
     kernel[grid](
         original_weight,
@@ -106,12 +171,13 @@ def fused_add_round_fp8_cast_(
         random_offset,
         exponent_bias,
         mantissa_bits,
-        random_full_width or 0,
-        random_local_width or 0,
-        random_col_offset,
         FP8_CAST_BLOCK_SIZE,
     )
 
 
 def _get_fused_add_round_kernel():
     return triton, _fused_add_round_fp8_cast_kernel
+
+
+def _get_fused_add_round_strided_random_kernel():
+    return triton, _fused_add_round_fp8_cast_strided_random_kernel
