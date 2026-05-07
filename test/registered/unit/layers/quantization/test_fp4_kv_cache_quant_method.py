@@ -11,12 +11,12 @@ import torch
 from sglang.test.test_utils import CustomTestCase
 
 
-def skip_if_no_sm120(func):
-    """Skip test if SM120 is not available."""
-    from sglang.srt.utils import is_sm120_supported
+def skip_if_no_blackwell_nvfp4(func):
+    """Skip test if Blackwell NVFP4 is not available."""
+    from sglang.srt.utils import is_blackwell
 
     return unittest.skipUnless(
-        is_sm120_supported(), "SM120 with CUDA >= 12.8 is required"
+        is_blackwell(), "Blackwell (SM100/SM120) with CUDA >= 12.8 is required"
     )(func)
 
 
@@ -120,14 +120,17 @@ class TestNVFP4KVMethod(CustomTestCase):
         self.assertTrue(torch.all(m.v_scales_gpu == 1.0))
         self.assertEqual(len(m.k_scales_gpu), 4)
 
-    @skip_if_no_sm120
+    @skip_if_no_blackwell_nvfp4
     def test_quantize_dequantize_roundtrip(self):
         """Test NVFP4 quantize→dequantize roundtrip on CUDA."""
         from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
             NVFP4KVMethod,
         )
 
-        m = NVFP4KVMethod(num_layers=1, device="cuda", sm_version=120)
+        major, minor = torch.cuda.get_device_capability()
+        m = NVFP4KVMethod(
+            num_layers=1, device="cuda", sm_version=major * 10 + minor
+        )
         size, heads, dim = 32, 8, 128
         bufs = m.create_buffers(size, heads, dim, 1, "cuda")
 
