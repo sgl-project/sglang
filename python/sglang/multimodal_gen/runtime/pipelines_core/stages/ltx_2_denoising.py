@@ -1,4 +1,5 @@
 import math
+import os
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 
@@ -1366,6 +1367,67 @@ class LTX2DenoisingStage(DenoisingStage):
         )
 
     @staticmethod
+    def _ltx2_guidance_pass_groups(
+        pass_specs: list[LTX2GuidancePassSpec],
+        *,
+        split_all: bool,
+    ) -> list[list[LTX2GuidancePassSpec]]:
+        grouping = os.getenv("SGLANG_LTX2_STAGE1_GUIDANCE_GROUPING")
+        if grouping is None:
+            grouping = "split_all" if split_all else "batched"
+
+        if grouping == "batched":
+            return [pass_specs]
+        if grouping == "split_all":
+            return [[pass_spec] for pass_spec in pass_specs]
+        if grouping == "split_perturbed":
+            return [
+                [pass_spec]
+                for pass_spec in pass_specs
+                if pass_spec.skip_video_self_attn_blocks
+                or pass_spec.skip_audio_self_attn_blocks
+            ] + [
+                [
+                    pass_spec
+                    for pass_spec in pass_specs
+                    if not pass_spec.skip_video_self_attn_blocks
+                    and not pass_spec.skip_audio_self_attn_blocks
+                ]
+            ]
+        if grouping == "split_modality":
+            return [
+                [pass_spec]
+                for pass_spec in pass_specs
+                if pass_spec.disable_a2v_cross_attn or pass_spec.disable_v2a_cross_attn
+            ] + [
+                [
+                    pass_spec
+                    for pass_spec in pass_specs
+                    if not pass_spec.disable_a2v_cross_attn
+                    and not pass_spec.disable_v2a_cross_attn
+                ]
+            ]
+        if grouping == "split_attention_disabled":
+            return [
+                [pass_spec]
+                for pass_spec in pass_specs
+                if pass_spec.skip_video_self_attn_blocks
+                or pass_spec.skip_audio_self_attn_blocks
+                or pass_spec.disable_a2v_cross_attn
+                or pass_spec.disable_v2a_cross_attn
+            ] + [
+                [
+                    pass_spec
+                    for pass_spec in pass_specs
+                    if not pass_spec.skip_video_self_attn_blocks
+                    and not pass_spec.skip_audio_self_attn_blocks
+                    and not pass_spec.disable_a2v_cross_attn
+                    and not pass_spec.disable_v2a_cross_attn
+                ]
+            ]
+        raise ValueError(f"Unknown LTX2 guidance grouping: {grouping}")
+
+    @staticmethod
     def _apply_ltx2_guidance_pass_kwargs(
         model_kwargs: dict[str, object],
         pass_spec: LTX2GuidancePassSpec,
@@ -2083,107 +2145,72 @@ class LTX2DenoisingStage(DenoisingStage):
                         if stage1_cfg_parallel
                         else pass_specs
                     )
-                    num_execution_passes = len(execution_pass_specs)
-                    if num_execution_passes == 0:
+                    if not execution_pass_specs:
                         raise ValueError(
                             "LTX2 stage-1 CFG parallel degree exceeds guidance pass count."
                         )
-                    expanded_batch_size = batch_size_local * num_execution_passes
-                    batched_model_kwargs = self._repeat_ltx2_model_kwargs_batch(
-                        base_model_kwargs_local, expanded_batch_size
+                    pass_outputs = {}
+                    pass_groups = self._ltx2_guidance_pass_groups(
+                        execution_pass_specs,
+                        split_all=use_split_stage1_guided_passes,
                     )
-                    batched_model_kwargs = self._build_ltx2_model_kwargs(
-                        ctx,
-                        batched_model_kwargs,
-                        encoder_hidden_states=torch.cat(
-                            [
-                                pass_spec.encoder_hidden_states
-                                for pass_spec in execution_pass_specs
-                            ],
-                            dim=0,
-                        ),
-                        audio_encoder_hidden_states=torch.cat(
-                            [
-                                pass_spec.audio_encoder_hidden_states
-                                for pass_spec in execution_pass_specs
-                            ],
-                            dim=0,
-                        ),
-                        encoder_attention_mask=self._cat_or_none(
-                            [
-                                pass_spec.encoder_attention_mask
-                                for pass_spec in execution_pass_specs
-                            ]
-                        ),
-                    )
-                    if use_split_stage1_guided_passes:
-                        split_sizes = [1] * expanded_batch_size
-                        split_pass_specs = tuple(
-                            pass_spec
-                            for pass_spec in execution_pass_specs
-                            for _ in range(batch_size_local)
-                        )
-                        split_perturbation_configs = (
-                            ()
-                            if use_split_pass_kwargs
-                            else self._build_ltx2_guidance_perturbation_configs(
-                                execution_pass_specs, batch_size_local
+                    with self._ltx2_model_forward_context(ctx, step):
+                        for pass_group in pass_groups:
+                            if not pass_group:
+                                continue
+                            num_group_passes = len(pass_group)
+                            group_batch_size = batch_size_local * num_group_passes
+                            group_model_kwargs = self._repeat_ltx2_model_kwargs_batch(
+                                base_model_kwargs_local, group_batch_size
                             )
-                        )
-                        batched_video_chunks = []
-                        batched_audio_chunks = []
-                        with self._ltx2_model_forward_context(ctx, step):
-                            for index, (model_kwargs_chunk, pass_spec) in enumerate(
-                                zip(
-                                    self._split_ltx2_model_kwargs(
-                                        batched_model_kwargs, split_sizes
+                            group_model_kwargs = self._build_ltx2_model_kwargs(
+                                ctx,
+                                group_model_kwargs,
+                                encoder_hidden_states=torch.cat(
+                                    [
+                                        pass_spec.encoder_hidden_states
+                                        for pass_spec in pass_group
+                                    ],
+                                    dim=0,
+                                ),
+                                audio_encoder_hidden_states=torch.cat(
+                                    [
+                                        pass_spec.audio_encoder_hidden_states
+                                        for pass_spec in pass_group
+                                    ],
+                                    dim=0,
+                                ),
+                                encoder_attention_mask=self._cat_or_none(
+                                    [
+                                        pass_spec.encoder_attention_mask
+                                        for pass_spec in pass_group
+                                    ]
+                                ),
+                            )
+                            if num_group_passes == 1 and use_split_pass_kwargs:
+                                self._apply_ltx2_guidance_pass_kwargs(
+                                    group_model_kwargs, pass_group[0]
+                                )
+                                group_video, group_audio = step.current_model(
+                                    **group_model_kwargs
+                                )
+                            else:
+                                group_video, group_audio = step.current_model(
+                                    **group_model_kwargs,
+                                    perturbation_configs=self._build_ltx2_guidance_perturbation_configs(
+                                        pass_group, batch_size_local
                                     ),
-                                    split_pass_specs,
-                                    strict=True,
                                 )
+                            for pass_spec, video_chunk, audio_chunk in zip(
+                                pass_group,
+                                group_video.float().chunk(num_group_passes, dim=0),
+                                group_audio.float().chunk(num_group_passes, dim=0),
+                                strict=True,
                             ):
-                                if use_split_pass_kwargs:
-                                    self._apply_ltx2_guidance_pass_kwargs(
-                                        model_kwargs_chunk, pass_spec
-                                    )
-                                else:
-                                    model_kwargs_chunk["perturbation_configs"] = (
-                                        split_perturbation_configs[index],
-                                    )
-                                video_chunk, audio_chunk = step.current_model(
-                                    **model_kwargs_chunk
+                                pass_outputs[pass_spec.name] = (
+                                    video_chunk,
+                                    audio_chunk,
                                 )
-                                batched_video_chunks.append(video_chunk)
-                                batched_audio_chunks.append(audio_chunk)
-
-                        batched_video = torch.cat(batched_video_chunks, dim=0)
-                        batched_audio = torch.cat(batched_audio_chunks, dim=0)
-                    else:
-                        perturbation_configs = (
-                            self._build_ltx2_guidance_perturbation_configs(
-                                execution_pass_specs, batch_size_local
-                            )
-                        )
-                        with self._ltx2_model_forward_context(ctx, step):
-                            batched_video, batched_audio = step.current_model(
-                                **batched_model_kwargs,
-                                perturbation_configs=perturbation_configs,
-                            )
-
-                    batched_video = batched_video.float()
-                    batched_audio = batched_audio.float()
-                    pass_outputs = {
-                        pass_spec.name: (
-                            video_chunk,
-                            audio_chunk,
-                        )
-                        for pass_spec, video_chunk, audio_chunk in zip(
-                            execution_pass_specs,
-                            batched_video.chunk(num_execution_passes, dim=0),
-                            batched_audio.chunk(num_execution_passes, dim=0),
-                            strict=True,
-                        )
-                    }
                     if not stage1_cfg_parallel:
                         v_pos, a_v_pos = pass_outputs["cond"]
                         v_neg, a_v_neg = pass_outputs["neg"]
