@@ -65,6 +65,7 @@ try:
 except ImportError:
     flashinfer_cutlass_fused_moe = None
 
+
 def swiglustep_and_mul(x: torch.Tensor, limit: float = 7.0) -> torch.Tensor:
     """Out-variant of swiglustep activation.
 
@@ -77,6 +78,7 @@ def swiglustep_and_mul(x: torch.Tensor, limit: float = 7.0) -> torch.Tensor:
     up = up.clamp(min=-limit, max=limit)
     out = gate * up
     return out
+
 
 class UnquantizedEmbeddingMethod(QuantizeMethodBase):
     """Unquantized method for embeddings."""
