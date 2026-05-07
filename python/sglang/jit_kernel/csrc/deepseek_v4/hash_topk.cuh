@@ -157,6 +157,7 @@ struct HashTopKKernel {
   }
 };
 
+// TODO this may not be related to *hash* topk, thus may move
 struct MaskKernel {
   static constexpr auto kernel = mask_topk_ids_padded_region;
 
