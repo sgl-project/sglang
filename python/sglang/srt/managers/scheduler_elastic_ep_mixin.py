@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from http import HTTPStatus
 from typing import TYPE_CHECKING, List
 
@@ -16,6 +17,8 @@ from sglang.srt.managers.schedule_batch import FINISH_ABORT
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import EmbeddingBatchResult, Scheduler
     from sglang.srt.managers.utils import GenerationBatchResult
+
+logger = logging.getLogger(__name__)
 
 
 class SchedulerElasticEPMixin:
@@ -71,20 +74,30 @@ class SchedulerElasticEPMixin:
         *,
         abort_message: str,
         err_type: str,
-    ) -> None:
+    ) -> tuple[int, int]:
         self.result_queue.clear()
         ElasticEPStateManager.instance().clear_pending_snapshots()
         torch.cuda.synchronize()
 
-        if self.running_batch is not None and not self.running_batch.is_empty():
-            max_retraction = envs.SGLANG_ELASTIC_EP_MAX_RETRACTION.get()
-            abort_reason = FINISH_ABORT(
-                message=abort_message.format(max_retraction=max_retraction),
-                status_code=HTTPStatus.SERVICE_UNAVAILABLE,
-                err_type=err_type,
-            )
-            for idx, req in enumerate(list(self.running_batch.reqs)):
-                self.running_batch.release_req(idx, 0, self.server_args)
+        max_retraction = envs.SGLANG_ELASTIC_EP_MAX_RETRACTION.get()
+        abort_reason = FINISH_ABORT(
+            message=abort_message.format(max_retraction=max_retraction),
+            status_code=HTTPStatus.SERVICE_UNAVAILABLE,
+            err_type=err_type,
+        )
+
+        # In decode, cur_batch IS running_batch (same object). For a freshly
+        # launched prefill, cur_batch is a separate batch whose reqs are not
+        # yet merged into running_batch — drain both in that case.
+        batches = [self.running_batch]
+        if self.cur_batch is not None and self.cur_batch is not self.running_batch:
+            batches.append(self.cur_batch)
+
+        requeued_count = 0
+        aborted_count = 0
+        for batch in batches:
+            for idx, req in enumerate(batch.reqs):
+                batch.release_req(idx, 0, self.server_args)
                 if req.retraction_count > max_retraction:
                     req.finished_reason = abort_reason
                     self.send_to_tokenizer.send_output(
@@ -95,14 +108,18 @@ class SchedulerElasticEPMixin:
                         ),
                         req,
                     )
+                    aborted_count += 1
                 else:
                     self._add_request_to_queue(req, is_retracted=True)
-            self.running_batch.filter_batch(keep_indices=[])
+                    requeued_count += 1
+
+        self.running_batch.filter_batch(keep_indices=[])
         self.last_batch = self.cur_batch = None
+        return requeued_count, aborted_count
 
     def _retract_all_and_rebalance_on_rank_fault(self: Scheduler):
         """Rank fault: drain GPU, retract in-flight decode reqs, rebalance."""
-        self._retract_inflight_batches_for_elastic_ep(
+        requeued_count, aborted_count = self._retract_inflight_batches_for_elastic_ep(
             abort_message=(
                 "Elastic EP rank fault; aborted after {max_retraction} retractions."
             ),
@@ -118,13 +135,18 @@ class SchedulerElasticEPMixin:
                 except StopIteration:
                     break
         ElasticEPStateManager.instance().mark_snapshot_handled()
+        logger.info(
+            "Elastic EP rank fault handled. requeued=%s aborted=%s",
+            requeued_count,
+            aborted_count,
+        )
 
     def _maybe_recover_ep_ranks_from_cpu_snapshot(self: Scheduler) -> bool:
         ranks_to_recover = self._get_elastic_ep_ranks_to_recover_from_cpu_snapshot()
         if not ranks_to_recover or not can_recover_ranks(ranks_to_recover):
             return False
 
-        self._retract_inflight_batches_for_elastic_ep(
+        requeued_count, aborted_count = self._retract_inflight_batches_for_elastic_ep(
             abort_message=(
                 "Elastic EP rank recovery; aborted after "
                 "{max_retraction} retractions."
@@ -133,4 +155,10 @@ class SchedulerElasticEPMixin:
         )
         self.tp_worker.model_runner.recover_ep_ranks_after_retract(ranks_to_recover)
         self._publish_active_ranks_from_committed_snapshot()
+        logger.info(
+            "Elastic EP rank recovery handled. ranks=%s requeued=%s aborted=%s",
+            ranks_to_recover,
+            requeued_count,
+            aborted_count,
+        )
         return True

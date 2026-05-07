@@ -506,11 +506,13 @@ class DataParallelController:
                         server_args,
                         dp_rank,
                         worker_ports,
-                        controller_input_ipc_name=port_args.controller_input_ipc_name,
                     )
                     # Data parallelism reuses the tensor parallelism group,
                     # so all dp ranks should use the same nccl port.
                     rank_port_args.nccl_port = port_args.nccl_port
+                    rank_port_args.controller_input_ipc_name = (
+                        port_args.controller_input_ipc_name
+                    )
 
                 reader, writer = mp.Pipe(duplex=False)
                 gpu_id = (
@@ -596,6 +598,7 @@ class DataParallelController:
                         or self.elastic_ep_send_timeout_ms < 0
                     ):
                         raise
+                    self.status[self.round_robin_counter] = False
                     logger.warning(
                         f"Timed out sending request to DP worker "
                         f"{self.round_robin_counter} after "

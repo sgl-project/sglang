@@ -7220,7 +7220,6 @@ class PortArgs:
         server_args: ServerArgs,
         dp_rank: Optional[int] = None,
         worker_ports: Optional[List[int]] = None,
-        controller_input_ipc_name: Optional[str] = None,
     ) -> PortArgs:
         if server_args.nccl_port is None:
             nccl_port = get_free_port()
@@ -7239,8 +7238,7 @@ class PortArgs:
             return PortArgs(
                 tokenizer_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
                 scheduler_input_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
-                controller_input_ipc_name=controller_input_ipc_name
-                or f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
+                controller_input_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
                 detokenizer_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
                 nccl_port=nccl_port,
                 rpc_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
@@ -7294,8 +7292,7 @@ class PortArgs:
                 scheduler_input_ipc_name=NetworkAddress(
                     dist_init_host, scheduler_input_port
                 ).to_tcp(),
-                controller_input_ipc_name=controller_input_ipc_name
-                or default_controller_input_ipc_name,
+                controller_input_ipc_name=default_controller_input_ipc_name,
                 detokenizer_ipc_name=NetworkAddress(
                     dist_init_host, detokenizer_port
                 ).to_tcp(),
