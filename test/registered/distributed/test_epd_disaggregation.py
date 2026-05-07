@@ -1,9 +1,9 @@
+import glob
 import io
+import json
 import os
 import re
 import subprocess
-import glob
-import json
 import tempfile
 import threading
 import time
@@ -791,19 +791,14 @@ class TestEPDDisaggregationOneEncoder(PDDisaggregationServerBase):
 
     def test_mmmu(self):
         """Test MMMU evaluation with EPD disaggregation"""
-        import glob
-        import json
-
         # Use a per-test temp dir so result-file lookup can't be confused by
         # stale JSON left in `./logs/` by neighbouring tests in the same suite.
         with tempfile.TemporaryDirectory(prefix="epd_one_encoder_mmmu_") as output_path:
             self.run_mmmu_eval(self.model, output_path)
 
-            # Get the result file
+            # `**` with recursive=True already matches files at the top level
+            # of output_path, so no separate non-recursive fallback is needed.
             result_files = glob.glob(f"{output_path}/**/*.json", recursive=True)
-            if not result_files:
-                result_files = glob.glob(f"{output_path}/*.json")
-
             if not result_files:
                 self.fail(f"No JSON result files found in {output_path}")
 
@@ -1196,9 +1191,6 @@ class TestEPDDisaggregationMultiEncoders(PDDisaggregationServerBase):
 
     def test_mmmu(self):
         """Test MMMU evaluation with EPD disaggregation (multiple encoders)"""
-        import glob
-        import json
-
         # Use a per-test temp dir so result-file lookup can't be confused by
         # stale JSON left in `./logs/` by neighbouring tests in the same suite.
         with tempfile.TemporaryDirectory(
@@ -1206,11 +1198,9 @@ class TestEPDDisaggregationMultiEncoders(PDDisaggregationServerBase):
         ) as output_path:
             self.run_mmmu_eval(self.model, output_path)
 
-            # Get the result file
+            # `**` with recursive=True already matches files at the top level
+            # of output_path, so no separate non-recursive fallback is needed.
             result_files = glob.glob(f"{output_path}/**/*.json", recursive=True)
-            if not result_files:
-                result_files = glob.glob(f"{output_path}/*.json")
-
             if not result_files:
                 self.fail(f"No JSON result files found in {output_path}")
 
@@ -1416,9 +1406,6 @@ class TestEPDDisaggregationGrpcEncoderMMMU(PDDisaggregationServerBase):
         _run_lmms_eval_with_retry(cmd, timeout=3600)
 
     def test_mmmu(self):
-        import glob
-        import json
-
         # Use a per-test temp dir so result-file lookup can't be confused by
         # stale JSON left in `./logs/` by neighbouring tests in the same suite.
         with tempfile.TemporaryDirectory(
@@ -1426,10 +1413,9 @@ class TestEPDDisaggregationGrpcEncoderMMMU(PDDisaggregationServerBase):
         ) as output_path:
             self.run_mmmu_eval(self.model, output_path)
 
+            # `**` with recursive=True already matches files at the top level
+            # of output_path, so no separate non-recursive fallback is needed.
             result_files = glob.glob(f"{output_path}/**/*.json", recursive=True)
-            if not result_files:
-                result_files = glob.glob(f"{output_path}/*.json")
-
             if not result_files:
                 self.fail(f"No JSON result files found in {output_path}")
 

@@ -165,10 +165,10 @@ class TestVLMEncoderDP(CustomTestCase):
             self.run_mmmu_eval(model.model, output_path)
 
             # Get the result file
-            # Search recursively for JSON result files (lmms-eval v0.4.1+ creates subdirectories)
+            # Search recursively for JSON result files (lmms-eval v0.4.1+ creates subdirectories).
+            # `**` with recursive=True already matches files at the top level of output_path,
+            # so no separate non-recursive fallback is needed.
             result_files = glob.glob(f"{output_path}/**/*.json", recursive=True)
-            if not result_files:
-                result_files = glob.glob(f"{output_path}/*.json")
 
             if not result_files:
                 raise FileNotFoundError(f"No JSON result files found in {output_path}")
