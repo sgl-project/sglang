@@ -1,8 +1,8 @@
 name: Release Docker Images
 #
-# This workflow builds and publishes framework Docker images (full development environment):
-#   - lmsysorg/sglang:v{version}, lmsysorg/sglang:latest
-#   - lmsysorg/sglang:v{version}-cu130, lmsysorg/sglang:latest-cu130
+# Builds and publishes framework Docker images (full development environment):
+#   - lmsysorg/sglang:v{version}, lmsysorg/sglang:latest (cuda 13)
+#   - lmsysorg/sglang:v{version}-cu129, lmsysorg/sglang:latest-cu129
 #
 on:
   push:
@@ -14,7 +14,7 @@ on:
         description: "Version to build (without v prefix, e.g., 0.5.7)"
         required: true
       image_repo:
-        description: "Upstream-only Docker Hub repo. Ignored by bytedance-iaas Volcengine builds."
+        description: "Docker Hub repo to push to. Use lmsysorg/sglang-staging for testing."
         required: false
         default: "lmsysorg/sglang"
 

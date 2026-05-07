@@ -12,7 +12,7 @@ on:
         required: false
         default: ""
       image_repo:
-        description: "Upstream-only Docker Hub repo. Ignored by bytedance-iaas Volcengine builds."
+        description: "Docker Hub repo to push to. Use lmsysorg/sglang-staging for testing."
         required: false
         default: "lmsysorg/sglang"
       compile_kernel:
