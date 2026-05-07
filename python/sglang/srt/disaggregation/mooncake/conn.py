@@ -21,6 +21,12 @@ from sglang.srt.disaggregation.common.conn import (
     CommonKVReceiver,
     CommonKVSender,
 )
+from sglang.srt.disaggregation.common.staging_handler import (
+    DecodeStagingContext,
+    PrefillStagingContext,
+    StagingRegisterInfo,
+    StagingTransferInfo,
+)
 from sglang.srt.disaggregation.common.utils import (
     FastQueue,
     group_concurrent_contiguous,
@@ -61,14 +67,6 @@ class TransferKVChunk:
     state_indices: Optional[List[int]]
 
 
-from sglang.srt.disaggregation.common.staging_handler import (
-    DecodeStagingContext,
-    PrefillStagingContext,
-    StagingRegisterInfo,
-    StagingTransferInfo,
-)
-
-
 # decode
 @dataclasses.dataclass
 class TransferInfo:
@@ -81,6 +79,7 @@ class TransferInfo:
     dst_state_indices: List[int]
     required_dst_info_num: int
     is_dummy: bool
+    decode_prefix_len: Optional[int] = None
     # Note: always put the optional staging field at the final (it will be set through 'STAGING_RSP' pkg when needed)
     staging: Optional[StagingTransferInfo] = None
 
@@ -109,6 +108,9 @@ class TransferInfo:
             dst_state_indices=dst_state_indices,
             required_dst_info_num=int(msg[7].decode("ascii")),
             is_dummy=is_dummy,
+            decode_prefix_len=(
+                int(msg[8].decode("ascii")) if len(msg) > 8 and msg[8] != b"" else None
+            ),
         )
 
 
@@ -1217,7 +1219,9 @@ class MooncakeKVManager(CommonKVManager):
                         target_rank_registration_info: KVArgsRegisterInfo = (
                             self.decode_kv_args_table[req.mooncake_session_id]
                         )
-                        if self.is_mla_backend or (
+                        if len(kv_chunk.prefill_kv_indices) == 0:
+                            ret = 0
+                        elif self.is_mla_backend or (
                             self.attn_tp_size
                             == target_rank_registration_info.dst_attn_tp_size
                         ):
@@ -1340,6 +1344,7 @@ class MooncakeKVManager(CommonKVManager):
                 ):
                     if kv_chunk.room in self.transfer_infos:
                         self.transfer_infos.pop(kv_chunk.room)
+                    self.req_to_decode_prefix_len.pop(kv_chunk.room, None)
 
             except Exception as e:
                 # NOTE(shangming): Remove this when we make sure the transfer thread is bug-free
@@ -1423,6 +1428,14 @@ class MooncakeKVManager(CommonKVManager):
                     )
                     # NOTE: after bootstrapping we can mark the req as waiting for input
                     if len(self.transfer_infos[room]) == required_dst_info_num:
+                        self.req_to_decode_prefix_len[room] = next(
+                            (
+                                info.decode_prefix_len
+                                for info in self.transfer_infos[room].values()
+                                if info.decode_prefix_len is not None
+                            ),
+                            0,
+                        )
                         self.update_status(room, KVPoll.WaitingForInput)
 
         threading.Thread(target=bootstrap_thread).start()
@@ -1650,6 +1663,12 @@ class MooncakeKVSender(CommonKVSender):
         self.conclude_state = None
         self.init_time = time.time()
 
+    def pop_decode_prefix_len(self) -> int:
+        return self.kv_mgr.req_to_decode_prefix_len.pop(self.bootstrap_room, 0)
+
+    def should_send_kv_chunk(self, num_pages: int, last_chunk: bool) -> bool:
+        return num_pages > 0 or last_chunk
+
     def send(
         self,
         kv_indices: npt.NDArray[np.int32],
@@ -1689,6 +1708,7 @@ class MooncakeKVSender(CommonKVSender):
                 aux_index=self.aux_index,
                 state_indices=state_indices,
             )
+        self._record_transfer_indices(kv_indices, state_indices)
 
     def poll(self) -> KVPoll:
         if self.conclude_state is None:
@@ -1716,10 +1736,6 @@ class MooncakeKVSender(CommonKVSender):
         else:
             return self.conclude_state
 
-    def clear(self) -> None:
-        if self.bootstrap_room in self.kv_mgr.request_status:
-            self.kv_mgr.request_status.pop(self.bootstrap_room)
-
     def failure_exception(self):
         # Explicitly set the status to failure since this request has failed in another rank
         if self.conclude_state is None:
@@ -1732,14 +1748,6 @@ class MooncakeKVSender(CommonKVSender):
                 self.bootstrap_room, "Failed due to an unknown reason from another rank"
             )
         raise KVTransferError(self.bootstrap_room, failure_reason)
-
-    def abort(self):
-        self.kv_mgr.record_failure(
-            self.bootstrap_room,
-            "Aborted by AbortReq.",
-        )
-        # Explicitly set the status to failure since this request has been aborted
-        self.conclude_state = KVPoll.Failed
 
 
 class MooncakeKVReceiver(CommonKVReceiver):
@@ -1827,6 +1835,7 @@ class MooncakeKVReceiver(CommonKVReceiver):
         kv_indices: npt.NDArray[np.int32],
         aux_index: Optional[int] = None,
         state_indices: Optional[List[int]] = None,
+        decode_prefix_len: Optional[int] = None,
     ):
         if self.bootstrap_infos is None:
             self.kv_mgr.record_failure(
@@ -1867,6 +1876,7 @@ class MooncakeKVReceiver(CommonKVReceiver):
                             else b""
                         ),
                         str(self.required_dst_info_num).encode("ascii"),
+                        str(decode_prefix_len or 0).encode("ascii"),
                     ]
                 )
         self.init_time = time.time()
@@ -1897,16 +1907,6 @@ class MooncakeKVReceiver(CommonKVReceiver):
         else:
             return self.conclude_state
 
-    def clear(self) -> None:
-        if self.bootstrap_room in self.kv_mgr.request_status:
-            self.kv_mgr.request_status.pop(self.bootstrap_room)
-
-        if self.bootstrap_room in self.kv_mgr.required_prefill_response_num_table:
-            self.kv_mgr.required_prefill_response_num_table.pop(self.bootstrap_room)
-
-        if self.bootstrap_room in self.kv_mgr.prefill_response_tracker:
-            self.kv_mgr.prefill_response_tracker.pop(self.bootstrap_room)
-
     def failure_exception(self):
         # Explicitly set the status to failure since this request has failed in another rank
         if self.conclude_state is None:
@@ -1919,14 +1919,6 @@ class MooncakeKVReceiver(CommonKVReceiver):
                 self.bootstrap_room, "Failed due to an unknown reason from another rank"
             )
         raise KVTransferError(self.bootstrap_room, failure_reason)
-
-    def abort(self):
-        self.kv_mgr.record_failure(
-            self.bootstrap_room,
-            "Aborted by AbortReq.",
-        )
-        # Explicitly set the status to failure since this request has been aborted
-        self.conclude_state = KVPoll.Failed
 
 
 class MooncakeKVBootstrapServer(CommonKVBootstrapServer):

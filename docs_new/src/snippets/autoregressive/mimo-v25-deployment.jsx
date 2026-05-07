@@ -34,10 +34,12 @@ export const MiMoV25Deployment = () => {
       name: "hardware",
       title: "Hardware Platform",
       items: [
-        { id: "h200",  label: "H200",  default: true  },
-        { id: "h100",  label: "H100",  default: false },
-        { id: "b200",  label: "B200",  default: false },
-        { id: "gb300", label: "GB300", default: false },
+        { id: "h200",     label: "H200",     default: true  },
+        { id: "h100",     label: "H100",     default: false },
+        { id: "b200",     label: "B200",     default: false },
+        { id: "gb300",    label: "GB300",    default: false },
+        { id: "tpu-v7x",  label: "TPU v7x",  default: false, subtitle: "sgl-jax, Pro only" },
+        { id: "tpu-v6e",  label: "TPU v6e",  default: false, subtitle: "sgl-jax, Pro only" },
       ],
     },
     eagleMtp: {
@@ -93,15 +95,19 @@ export const MiMoV25Deployment = () => {
   // Per (variant, hardware): HF slug, tp, multinode info, Blackwell flag.
   // V2.5 (base) checkpoint has TP=4-interleaved fused qkv_proj, so attention
   // TP per DP group MUST be 4. Effective TP/DP = 4. With tp=8 → dp=2; tp=4 → dp=1.
+  // TPU rows go through the sgl-jax stack (`python -m sgl_jax.launch_server`),
+  // not the CUDA `sglang serve` binary; tp == total JAX devices across nodes.
   const HW_VARIANT_SPEC = {
-    "pro|h200":   { slug: "XiaomiMiMo/MiMo-V2.5-Pro", tp: 16, multinode: true,  nnodes: 2, blackwell: false },
-    "pro|h100":   { slug: "XiaomiMiMo/MiMo-V2.5-Pro", tp: 16, multinode: true,  nnodes: 2, blackwell: false },
-    "pro|b200":   { slug: "XiaomiMiMo/MiMo-V2.5-Pro", tp: 8,  multinode: false,            blackwell: true  },
-    "pro|gb300":  { slug: "XiaomiMiMo/MiMo-V2.5-Pro", tp: 8,  multinode: true,  nnodes: 2, blackwell: true  },
-    "base|h200":  { slug: "XiaomiMiMo/MiMo-V2.5",     tp: 8,  multinode: false,            blackwell: false, dp: 2 },
-    "base|h100":  { slug: "XiaomiMiMo/MiMo-V2.5",     tp: 8,  multinode: false,            blackwell: false, dp: 2 },
-    "base|b200":  { slug: "XiaomiMiMo/MiMo-V2.5",     tp: 4,  multinode: false,            blackwell: true,  dp: 1 },
-    "base|gb300": { slug: "XiaomiMiMo/MiMo-V2.5",     tp: 4,  multinode: false,            blackwell: true,  dp: 1 },
+    "pro|h200":     { slug: "XiaomiMiMo/MiMo-V2.5-Pro", tp: 16, multinode: true,  nnodes: 2,  blackwell: false, jax: false },
+    "pro|h100":     { slug: "XiaomiMiMo/MiMo-V2.5-Pro", tp: 16, multinode: true,  nnodes: 2,  blackwell: false, jax: false },
+    "pro|b200":     { slug: "XiaomiMiMo/MiMo-V2.5-Pro", tp: 8,  multinode: false,             blackwell: true,  jax: false },
+    "pro|gb300":    { slug: "XiaomiMiMo/MiMo-V2.5-Pro", tp: 8,  multinode: true,  nnodes: 2,  blackwell: true,  jax: false },
+    "pro|tpu-v7x":  { slug: "XiaomiMiMo/MiMo-V2.5-Pro", tp: 32, multinode: true,  nnodes: 4,  blackwell: false, jax: true  },
+    "pro|tpu-v6e":  { slug: "XiaomiMiMo/MiMo-V2.5-Pro", tp: 64, multinode: true,  nnodes: 16, blackwell: false, jax: true  },
+    "base|h200":    { slug: "XiaomiMiMo/MiMo-V2.5",     tp: 8,  multinode: false,             blackwell: false, jax: false, dp: 2 },
+    "base|h100":    { slug: "XiaomiMiMo/MiMo-V2.5",     tp: 8,  multinode: false,             blackwell: false, jax: false, dp: 2 },
+    "base|b200":    { slug: "XiaomiMiMo/MiMo-V2.5",     tp: 4,  multinode: false,             blackwell: true,  jax: false, dp: 1 },
+    "base|gb300":   { slug: "XiaomiMiMo/MiMo-V2.5",     tp: 4,  multinode: false,             blackwell: true,  jax: false, dp: 1 },
   };
 
   const multiNodeFlags = (nnodes) => [
@@ -124,6 +130,7 @@ export const MiMoV25Deployment = () => {
     const isPro = variant === "pro";
     const spec = HW_VARIANT_SPEC[`${variant}|${hardware}`];
     const blackwell = spec ? spec.blackwell : false;
+    const jax = spec ? spec.jax : false;
     const c = {};
     if (!isPro) {
       // V2.5 checkpoint is TP=4-interleaved; tp/dp must equal 4. With dp>1 we
@@ -139,15 +146,25 @@ export const MiMoV25Deployment = () => {
       // for sm_100 in sglang and the verified Blackwell stack uses flashinfer_trtllm.
       c.deepep = { force: "disabled", reason: "Blackwell uses flashinfer_trtllm; DeepEP is Hopper / Ampere only." };
     }
+    if (jax) {
+      // sgl-jax stack: only V2.5-Pro is supported on TPU today; speculative
+      // decoding and the DeepEP CUDA backend do not apply to the JAX runtime.
+      // EP is always on (both verified launch commands set --ep-size = --tp-size).
+      c.modelVariant = { force: "pro", reason: "sgl-jax TPU runtime only supports MiMo-V2.5-Pro today." };
+      c.eagleMtp = { force: "disabled", reason: "EAGLE MTP is not supported on the sgl-jax TPU runtime." };
+      c.deepep = { force: "disabled", reason: "DeepEP is a CUDA-only backend; sgl-jax uses the fused Pallas MoE kernel." };
+      c.expertParallelism = { force: "enabled", reason: "sgl-jax TPU recipes always use EP = TP." };
+    }
     return c;
   };
 
   const resolveItems = (option, constraints) => {
     const c = constraints[option.name];
     if (!c) return option.items;
-    const grayId = c.force === "enabled" ? "disabled" : "enabled";
+    // Gray out every item that doesn't match the forced choice. Works for both
+    // binary (enabled/disabled) toggles and N-way options like modelVariant.
     return option.items.map((item) =>
-      item.id === grayId ? { ...item, disabled: true, disabledReason: c.reason } : item,
+      item.id !== c.force ? { ...item, disabled: true, disabledReason: c.reason } : item,
     );
   };
 
@@ -205,9 +222,60 @@ export const MiMoV25Deployment = () => {
     const { modelVariant, hardware, eagleMtp, dpAttention, expertParallelism, deepep, reasoningParser, toolcall } = values;
     const specKey = `${modelVariant}|${hardware}`;
     const spec = HW_VARIANT_SPEC[specKey];
-    const { slug, tp, multinode, nnodes, blackwell } = spec;
+    const { slug, tp, multinode, nnodes, blackwell, jax } = spec;
     const isPro = modelVariant === "pro";
-    // Toggles. EP / DeepEP / DP-attn are gated by hardware + variant
+
+    // ---------------- sgl-jax (TPU) branch ----------------
+    if (jax) {
+      // Recipe sources:
+      //   v7x: tp=ep=32, dp=4, omits --attention-backend, mem-frac 0.95, swa 0.25
+      //   v6e: tp=ep=64, dp=8, --attention-backend fa,    mem-frac 0.92, swa 0.15
+      //
+      // sgl-jax conventions:
+      //   - `--tp-size` is always the total JAX device count; per-DP TP is
+      //     derived automatically as tp/dp.
+      //   - No `--enable-dp-attention` flag — DP attention is the default
+      //     (FFN layers auto-pick EP-split for MoE, attn-TP-split for dense).
+      const isV7x = hardware === "tpu-v7x";
+      const useEp = expertParallelism === "enabled";
+      const useDpAttn = dpAttention === "enabled";
+      const dpSize = isV7x ? 4 : 8;
+      const flags = [];
+      flags.push(`  --model-path ${slug}`);
+      flags.push("  --trust-remote-code");
+      flags.push(`  --tp-size ${tp}`);
+      if (useEp) flags.push(`  --ep-size ${tp}`);
+      if (useDpAttn) flags.push(`  --dp-size ${dpSize}`);
+      flags.push("  --moe-backend fused");
+      if (!isV7x) flags.push("  --attention-backend fa");
+      flags.push("  --host 0.0.0.0");
+      flags.push("  --port 30000");
+      flags.push("  --page-size 256");
+      flags.push("  --context-length 262144");
+      flags.push("  --chunked-prefill-size 4096");
+      flags.push("  --max-running-requests 512");
+      if (isV7x) {
+        flags.push("  --dtype bfloat16");
+        flags.push("  --mem-fraction-static 0.95");
+        flags.push("  --swa-full-tokens-ratio 0.25");
+        flags.push("  --log-level info");
+      } else {
+        flags.push("  --max-seq-len 4096");
+        flags.push("  --max-prefill-tokens 16384");
+        flags.push("  --mem-fraction-static 0.92");
+        flags.push("  --swa-full-tokens-ratio 0.15");
+      }
+      if (reasoningParser === "enabled") flags.push("  --reasoning-parser mimo");
+      if (toolcall === "enabled") flags.push("  --tool-call-parser mimo");
+      flags.push(`  --nnodes ${nnodes}`);
+      flags.push("  --node-rank <node-rank>");
+      flags.push("  --dist-init-addr <node0-ip>:20000");
+      const cmd = `JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache python -m sgl_jax.launch_server \\\n${flags.join(" \\\n")}`;
+      return prependMultiNodeNote(cmd, nnodes);
+    }
+
+    // ---------------- CUDA (sglang serve) branch ----------------
+    // Toggles. EAGLE MTP / EP / DeepEP / DP-attn are gated by hardware + variant
     // through computeConstraints; here we just read the (already-snapped) value.
     const useMtp = eagleMtp === "enabled";
     const useDeepep = !blackwell && deepep === "enabled";
