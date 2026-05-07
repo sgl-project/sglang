@@ -1253,7 +1253,6 @@ class FusedMoE(torch.nn.Module):
                             param.data.copy_(stacked)
 
 
-
 @register_custom_op(out_shape="hidden_states")
 def moe_forward_piecewise_cuda_graph_impl(
     hidden_states: torch.Tensor,
