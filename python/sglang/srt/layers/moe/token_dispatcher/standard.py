@@ -12,7 +12,6 @@ from sglang.srt.distributed import (
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
-from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import (
     get_dp_global_num_tokens,
     get_local_dp_buffer,
@@ -93,15 +92,12 @@ class StandardDispatcher(BaseDispatcher):
         self.enable_flashinfer_trtllm_routed_moe = backend.is_flashinfer_trtllm_routed()
         # Skip local expert mapping when the backend handles EP with global expert IDs:
         # - cutlass / cutedsl / trtllm_routed handle EP internally
-        # - mxfp4 opt-in via env when its dispatcher mapping is already global
+        # - mxfp4 dispatcher mapping is already global
         self.skip_local_expert_mapping = (
             backend.is_flashinfer_cutlass()
             or backend.is_flashinfer_cutedsl()
             or backend.is_flashinfer_trtllm_routed()
-            or (
-                self.enable_flashinfer_mxfp4_moe
-                and envs.SGLANG_OPT_MXFP4_SKIP_DISPATCHER_MAPPING.get()
-            )
+            or self.enable_flashinfer_mxfp4_moe
         )
         self.num_experts = moe_runner_config.num_experts
         self.num_local_experts = moe_runner_config.num_local_experts

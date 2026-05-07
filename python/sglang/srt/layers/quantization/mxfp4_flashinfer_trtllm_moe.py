@@ -363,13 +363,6 @@ class Mxfp4FlashinferTrtllmMoEMethod:
         else:
             raise ValueError(f"Unsupported topk output format: {topk_output.format}")
 
-        if not envs.SGLANG_OPT_MXFP4_SKIP_DISPATCHER_MAPPING.get():
-            local_expert_offset = layer.moe_ep_rank * layer.num_local_experts
-            topk_ids = torch.where(
-                topk_ids >= 0,
-                topk_ids + local_expert_offset,
-                topk_ids,
-            )
         packed_topk = PackTopkIds.execute(topk_ids, topk_weights)
 
         precision = self.flashinfer_mxfp4_moe_precision
