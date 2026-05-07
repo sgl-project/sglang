@@ -325,6 +325,9 @@ class Envs:
     SGLANG_ROCM_FUSED_DECODE_MLA = EnvBool(False)
     SGLANG_ROCM_DISABLE_LINEARQUANT = EnvBool(False)
     SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(4096)
+    # Enable dual-stream MoE (shared experts vs routed experts) on the
+    # ROCm/AITER path. Requires GPU_MAX_HW_QUEUES>=5 to avoid HW-queue serialization.
+    SGLANG_ROCM_USE_MULTI_STREAM = EnvBool(False)
 
     # MPS (Apple Silicon)
     SGLANG_USE_MLX = EnvBool(False)
@@ -503,6 +506,9 @@ class Envs:
 
     # Tool-Call behavior
     SGLANG_TOOL_STRICT_LEVEL = EnvInt(ToolStrictLevel.OFF)
+
+    # Think tokens budget: negative means unlimited, >= 0 caps thinking tokens
+    SGLANG_MAX_THINK_TOKENS = EnvInt(-1)
 
     # Ngram
     SGLANG_NGRAM_FORCE_GREEDY_VERIFY = EnvBool(False)

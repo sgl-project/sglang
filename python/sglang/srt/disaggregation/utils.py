@@ -243,16 +243,16 @@ class MetadataBuffers:
 
     def get_buf(self, idx: int):
         return (
-            self.output_ids[idx],
-            self.cached_tokens[idx],
-            self.output_token_logprobs_val[idx],
-            self.output_token_logprobs_idx[idx],
-            self.output_top_logprobs_val[idx],
-            self.output_top_logprobs_idx[idx],
-            self.output_topk_p[idx],
-            self.output_topk_index[idx],
-            self.output_hidden_states[idx],
-            self.bootstrap_room[idx],
+            self.output_ids[idx].clone(),
+            self.cached_tokens[idx].clone(),
+            self.output_token_logprobs_val[idx].clone(),
+            self.output_token_logprobs_idx[idx].clone(),
+            self.output_top_logprobs_val[idx].clone(),
+            self.output_top_logprobs_idx[idx].clone(),
+            self.output_topk_p[idx].clone(),
+            self.output_topk_index[idx].clone(),
+            self.output_hidden_states[idx].clone(),
+            self.bootstrap_room[idx].clone(),
         )
 
     def set_buf(self, req: Req):

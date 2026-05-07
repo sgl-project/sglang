@@ -303,6 +303,43 @@ def add_rl_on_policy_target_choices(choices):
     RL_ON_POLICY_TARGET_CHOICES.extend(choices)
 
 
+def _resolve_speculative_algorithm_alias(
+    speculative_algorithm: Optional[str],
+    speculative_draft_model_path: Optional[str],
+    trust_remote_code: bool = False,
+) -> Optional[str]:
+    """Resolve CLI speculative algorithm; NEXTN/EAGLE may become FROZEN_KV_MTP for Gemma4 assistant drafts."""
+
+    is_gemma4_draft = False
+    if speculative_draft_model_path:
+        from transformers import AutoConfig
+
+        cfg = AutoConfig.from_pretrained(
+            speculative_draft_model_path, trust_remote_code=trust_remote_code
+        )
+        is_gemma4_draft = "Gemma4AssistantForCausalLM" in (
+            getattr(cfg, "architectures", None) or []
+        )
+
+    if speculative_algorithm == "EAGLE3" and is_gemma4_draft:
+        raise ValueError(
+            "Gemma4AssistantForCausalLM draft requires "
+            "--speculative-algorithm NEXTN or EAGLE; EAGLE3 is "
+            "not supported for this draft architecture."
+        )
+
+    if speculative_algorithm == "NEXTN" or speculative_algorithm == "EAGLE":
+        if is_gemma4_draft:
+            logger.info(
+                "Detected Gemma4AssistantForCausalLM draft; "
+                f"promoting --speculative-algorithm {speculative_algorithm} to FROZEN_KV_MTP."
+            )
+            return "FROZEN_KV_MTP"
+        return "EAGLE"
+
+    return speculative_algorithm
+
+
 @dataclasses.dataclass
 class ServerArgs:
     """
@@ -460,6 +497,7 @@ class ServerArgs:
     enable_cache_report: bool = False
     reasoning_parser: Optional[str] = None
     strip_thinking_cache: bool = False
+    enable_strict_thinking: bool = False
     tool_call_parser: Optional[str] = None
     tool_server: Optional[str] = None
     sampling_defaults: str = "model"
@@ -3306,8 +3344,11 @@ class ServerArgs:
                 self.speculative_moe_runner_backend
             ).is_flashinfer_trtllm(), "Currently speculative MoE runner backend doesn't support flashinfer_trtllm, please use triton or auto backend for speculative moe runner instead."
 
-        if self.speculative_algorithm == "NEXTN":
-            self.speculative_algorithm = "EAGLE"
+        self.speculative_algorithm = _resolve_speculative_algorithm_alias(
+            self.speculative_algorithm,
+            self.speculative_draft_model_path,
+            trust_remote_code=self.trust_remote_code,
+        )
 
         if self.speculative_skip_dp_mlp_sync:
             assert self.speculative_algorithm == "EAGLE", (
@@ -3441,6 +3482,25 @@ class ServerArgs:
                 self.enable_mixed_chunk = False
                 logger.warning(
                     "Mixed chunked prefill is disabled because of using dflash speculative decoding."
+                )
+
+        if self.speculative_algorithm == "FROZEN_KV_MTP":
+            if self.max_running_requests is None:
+                self.max_running_requests = 48
+                logger.warning(
+                    "Max running requests is reset to 48 for speculative decoding. You can override this by explicitly setting --max-running-requests."
+                )
+
+            self.disable_overlap_schedule = True
+            logger.warning(
+                "Overlap scheduler is disabled when using Frozen-KV MTP speculative decoding (spec v2 is not supported yet)."
+            )
+
+            if self.enable_mixed_chunk:
+                self.enable_mixed_chunk = False
+                logger.warning(
+                    "Mixed chunked prefill is disabled because of using "
+                    "Frozen-KV MTP speculative decoding."
                 )
 
         if self.speculative_algorithm in ("EAGLE", "EAGLE3", "STANDALONE"):
@@ -5075,12 +5135,15 @@ class ServerArgs:
             action="store_true",
             help="Return number of cached tokens in usage.prompt_tokens_details for each openai request.",
         )
+        reasoning_parser_choices = list(ReasoningParser.DetectorMap.keys())
         parser.add_argument(
             "--reasoning-parser",
             type=str,
-            choices=list(ReasoningParser.DetectorMap.keys()),
+            choices=["auto"] + reasoning_parser_choices,
             default=ServerArgs.reasoning_parser,
-            help=f"Specify the parser for reasoning models, supported parsers are: {list(ReasoningParser.DetectorMap.keys())}.",
+            help=f"Specify the parser for reasoning models. "
+            f"Use 'auto' to detect from chat template. "
+            f"Options include: {reasoning_parser_choices}.",
         )
         parser.add_argument(
             "--strip-thinking-cache",
@@ -5089,13 +5152,23 @@ class ServerArgs:
             "radix tree on finish; keep only the prompt prefix. Opt-in: changes "
             "cache contents.",
         )
+        parser.add_argument(
+            "--enable-strict-thinking",
+            action="store_true",
+            default=ServerArgs.enable_strict_thinking,
+            help="Enable strict token filtering during the thinking phase. "
+            "Blocks model-specific excluded tokens (e.g., tool call markers) "
+            "during reasoning. Requires a grammar backend that supports token filtering.",
+        )
         tool_call_parser_choices = list(FunctionCallParser.ToolCallParserEnum.keys())
         parser.add_argument(
             "--tool-call-parser",
             type=str,
-            choices=tool_call_parser_choices,
+            choices=["auto"] + tool_call_parser_choices,
             default=ServerArgs.tool_call_parser,
-            help=f"Specify the parser for handling tool-call interactions. Options include: {tool_call_parser_choices}.",
+            help=f"Specify the parser for handling tool-call interactions. "
+            f"Use 'auto' to detect from chat template. "
+            f"Options include: {tool_call_parser_choices}.",
         )
         parser.add_argument(
             "--tool-server",
