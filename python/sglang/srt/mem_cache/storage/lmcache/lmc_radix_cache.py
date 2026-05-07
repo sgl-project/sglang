@@ -43,11 +43,8 @@ class _LMCacheLoadMarker:
     ``match_prefix`` call that decided a load is warranted.
     """
 
-    token_ids: list[int]  # the engine's token id sequence
-    extra_key: Optional[str]  # RadixKey extra-key (model-supplied disambiguator)
+    key: RadixKey  # page-aligned key the scheduler matched on
     value_numel: int  # number of tokens already in radix at match time
-    matched: int  # daemon-reported chunk-aligned match count from LOOKUP
-    last_device_node: TreeNode  # last on-device TreeNode at match time
 
 
 class LayerTransferCounter:
@@ -154,12 +151,15 @@ class LMCRadixCache(RadixCache):
 
         self._in_flight_nodes: list[TreeNode] = []
         self._node_lock = threading.Lock()
+        self._mp_load_markers: dict[str, _LMCacheLoadMarker] = {}
 
     def reset(self):  # type: ignore[override]
         super().reset()
         if hasattr(self, "_in_flight_nodes"):
             with self._node_lock:
                 self._in_flight_nodes.clear()
+        if hasattr(self, "_mp_load_markers"):
+            self._mp_load_markers.clear()
 
     def _mp_match_prefix(
         self,
@@ -182,17 +182,14 @@ class LMCRadixCache(RadixCache):
             self.lmcache_connector.release_pending(req.rid)
             return base_res
 
-        marker = _LMCacheLoadMarker(
-            token_ids=key.token_ids,
-            extra_key=key.extra_key,
+        self._mp_load_markers[req.rid] = _LMCacheLoadMarker(
+            key=key,
             value_numel=int(value.numel()),
-            matched=matched,
-            last_device_node=last_node,
         )
         return MatchResult(
             device_indices=value,
             last_device_node=last_node,
-            last_host_node=marker,
+            last_host_node=last_node,
             host_hit_length=matched - int(value.numel()),
         )
 
@@ -334,26 +331,15 @@ class LMCRadixCache(RadixCache):
         TreeNode into the radix tree, and returns
         ``(new_indices, new_last_node)``.
         """
-        marker = params.last_host_node
-        if not isinstance(marker, _LMCacheLoadMarker) or params.req is None:
-            # Shouldn't happen if our match_prefix produced this hit.
-            return (
-                torch.empty((0,), dtype=torch.int64, device=self.device),
-                (
-                    marker
-                    if isinstance(marker, TreeNode)
-                    else (params.req.last_node if params.req is not None else None)
-                ),
-            )
-
         req = params.req
-        last_node: TreeNode = marker.last_device_node
+        marker = self._mp_load_markers.pop(req.rid)
+        last_node: TreeNode = params.last_host_node
 
         def _load(slot_mapping: torch.Tensor, prefix_pad: int) -> int:
             with torch.cuda.stream(self.load_stream):
                 n = self.lmcache_connector.retrieve_kv(
                     LoadMetadata(
-                        token_ids=marker.token_ids,
+                        token_ids=marker.key.token_ids,
                         slot_mapping=slot_mapping,
                         offset=marker.value_numel - prefix_pad,
                         prefix_pad=prefix_pad,
@@ -364,9 +350,9 @@ class LMCRadixCache(RadixCache):
             return n
 
         result = self._alloc_and_load_chunk(
-            key=RadixKey(marker.token_ids, marker.extra_key),
+            key=marker.key,
             value_numel=marker.value_numel,
-            uncached_len=marker.matched - marker.value_numel,
+            uncached_len=params.host_hit_length,
             last_node=last_node,
             load_fn=_load,
         )
@@ -387,6 +373,7 @@ class LMCRadixCache(RadixCache):
         super().cache_finished_req(req, is_insert=is_insert)
         if not is_insert:
             if self._mp_mode:
+                self._mp_load_markers.pop(req.rid, None)
                 self.lmcache_connector.end_session(req.rid)
             return
 
@@ -426,6 +413,7 @@ class LMCRadixCache(RadixCache):
             self.lmcache_connector.store_kv(store_md)
         if self._mp_mode:
             # MP store_kv blocks until the daemon's signal event fires, so the slots are safe to evict immediately.
+            self._mp_load_markers.pop(req.rid, None)
             self.dec_lock_ref(new_last_node)
             self.lmcache_connector.end_session(req.rid)
         else:
