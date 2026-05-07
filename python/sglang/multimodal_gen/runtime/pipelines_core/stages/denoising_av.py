@@ -197,6 +197,14 @@ class LTX2RefinementStage(LTX2AVDenoisingStage):
     def _build_stage2_renoise_generator(
         batch: Req, reference_tensor: torch.Tensor
     ) -> torch.Generator:
+        generator = getattr(batch, "generator", None)
+        if isinstance(generator, list) and generator:
+            first_generator = generator[0]
+            if isinstance(first_generator, torch.Generator):
+                return first_generator
+        if isinstance(generator, torch.Generator):
+            return generator
+
         seeds = getattr(batch, "seeds", None)
         if seeds:
             seed = int(seeds[0])
