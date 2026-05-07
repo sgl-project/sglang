@@ -636,5 +636,6 @@ class DeepseekMLAForwardMixin:
         """
         return (
             _use_aiter_gfx95
-            and self.current_attention_backend not in FORWARD_ABSORB_CORE_ATTENTION_BACKENDS
+            and self.current_attention_backend
+            not in FORWARD_ABSORB_CORE_ATTENTION_BACKENDS
         )
