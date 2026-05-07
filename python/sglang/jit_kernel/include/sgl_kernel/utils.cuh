@@ -269,10 +269,14 @@ struct LaunchKernel {
   }
 
   auto enable_cluster(dim3 cluster_dim) -> LaunchKernel& {
+#ifdef USE_ROCM
+    (void)cluster_dim;
+#else
     auto& attr = m_attrs[m_config.numAttrs++];
     attr.id = cudaLaunchAttributeClusterDimension;
     attr.val.clusterDim = {cluster_dim.x, cluster_dim.y, cluster_dim.z};
     m_config.attrs = m_attrs;
+#endif
     return *this;
   }
 
