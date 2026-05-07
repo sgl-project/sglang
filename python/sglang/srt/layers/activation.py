@@ -51,7 +51,13 @@ _is_cpu = is_cpu()
 _is_hip = is_hip()
 _is_xpu = is_xpu()
 
-if _is_cuda or _is_xpu:
+if _is_cuda:
+    from sglang.jit_kernel.activation import (
+        gelu_and_mul,
+        gelu_tanh_and_mul,
+        silu_and_mul,
+    )
+elif _is_xpu:
     from sgl_kernel import gelu_and_mul, gelu_tanh_and_mul, silu_and_mul
 elif _is_hip:
     from sgl_kernel import gelu_and_mul, gelu_quick, gelu_tanh_and_mul, silu_and_mul

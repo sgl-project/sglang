@@ -18,6 +18,7 @@ if TYPE_CHECKING:
 from sglang.srt.layers.quantization.fp8_kernel import (
     fp8_dtype,
     fp8_max,
+    fp8_min,
     is_fp8_fnuz,
     mxfp8_block_scaled_matmul_triton,
     per_token_group_quant_fp8,
@@ -28,6 +29,7 @@ from sglang.srt.layers.quantization.fp8_kernel import (
     w8a8_block_fp8_matmul_deepgemm,
     w8a8_block_fp8_matmul_triton,
 )
+from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     ceil_align,
     ceil_div,
@@ -117,7 +119,6 @@ if _is_cuda:
         return mat_a.new_empty((M, N), dtype=out_dtype)
 
 
-use_vllm_cutlass_w8a8_fp8_kernel = get_bool_env_var("USE_VLLM_CUTLASS_W8A8_FP8_KERNEL")
 use_triton_w8a8_fp8_kernel = get_bool_env_var("USE_TRITON_W8A8_FP8_KERNEL")
 
 # Input scaling factors are no longer optional in _scaled_mm starting
@@ -673,13 +674,19 @@ def deepgemm_w8a8_block_fp8_linear_with_fallback(
     input_2d = input.view(-1, input.shape[-1])
     output_shape = [*input.shape[:-1], weight.shape[0]]
 
-    q_input, x_scale = sglang_per_token_group_quant_fp8(
-        input_2d,
-        block_size[1],
-        column_major_scales=True,
-        scale_tma_aligned=True,
-        scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
-    )
+    if not _is_musa:
+        q_input, x_scale = sglang_per_token_group_quant_fp8(
+            input_2d,
+            block_size[1],
+            column_major_scales=True,
+            scale_tma_aligned=True,
+            scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+        )
+    else:
+        q_input, x_scale = sglang_per_token_group_quant_fp8(
+            input_2d,
+            block_size[1],
+        )
 
     output = w8a8_block_fp8_matmul_deepgemm(
         q_input, weight, x_scale, weight_scale, block_size, output_dtype=output_dtype
@@ -1279,6 +1286,19 @@ def transform_scale_ue8m0(sf, mn, use_torch_impl: bool = False):
 
     sf = sf.index_select(-2, torch.arange(mn, device=sf.device) // 128)
     sf = get_mn_major_tma_aligned_packed_ue8m0_tensor(sf)
+
+    # In sgl-deep-gemm, the C++ deepgemm path returns through DLPack which collapses the stride
+    # of size-1 trailing dims to 1 (happens when packed_sf_k == 1, i.e.
+    # K <= block_k * 4). Restore the TMA-aligned stride so the deepgemm
+    # assertion sf.stride(-1) == get_tma_aligned_size(mn, element_size) holds.
+    if not use_torch_impl and sf.shape[-1] == 1:
+        from deep_gemm.utils import get_tma_aligned_size
+
+        aligned_mn = get_tma_aligned_size(sf.shape[-2], sf.element_size())
+        if sf.stride(-1) != aligned_mn:
+            new_stride = list(sf.stride())
+            new_stride[-1] = aligned_mn
+            sf = sf.as_strided(sf.shape, tuple(new_stride))
     return sf
 
 
@@ -1467,12 +1487,32 @@ def apply_fp8_linear(
         num_token_padding = output_padding
         if cutlass_fp8_supported and weight_scale.numel() == weight.shape[1]:
             num_token_padding = None
-        qinput, x_scale = scaled_fp8_quant(
-            input_2d,
-            input_scale,
-            num_token_padding=num_token_padding,
-            use_per_token_if_dynamic=use_per_token_if_dynamic,
-        )
+        # For static per-tensor activation scales when using inductor compiler,
+        # use pure PyTorch ops instead of the opaque sgl_kernel quant kernel.
+        # Inductor fuses these with surrounding ops (RMSNorm, residual add),
+        # eliminating a separate kernel launch per linear layer.
+        # weight_scale shape does not matter here -- it is only used in the
+        # GEMM epilogue, not in the activation quant fusion. Only activates when
+        # piecewise_cuda_graph_compiler=inductor; eager PCG and decode both
+        # use the faster custom kernel.
+        if (
+            input_scale is not None
+            and input_scale.numel() == 1
+            and get_global_server_args().piecewise_cuda_graph_compiler == "inductor"
+        ):
+            qinput = (
+                (input_2d * input_scale.reciprocal())
+                .clamp(min=fp8_min, max=fp8_max)
+                .to(fp8_dtype)
+            )
+            x_scale = input_scale
+        else:
+            qinput, x_scale = scaled_fp8_quant(
+                input_2d,
+                input_scale,
+                num_token_padding=num_token_padding,
+                use_per_token_if_dynamic=use_per_token_if_dynamic,
+            )
     else:
         # cutlass w8a8 fp8 sgl-kernel only supports per-token scale
         if input_scale is not None:

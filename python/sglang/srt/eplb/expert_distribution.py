@@ -36,7 +36,7 @@ from sglang.srt.observability.metrics_collector import (
     resolve_collector_class,
 )
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import Withable, get_int_env_var
+from sglang.srt.utils import Withable, get_device, get_int_env_var
 
 if TYPE_CHECKING:
     from sglang.srt.eplb.expert_location import ExpertLocationMetadata
@@ -479,6 +479,9 @@ def _list_sum(a: List, b: List) -> List:
 class _LayerBasedGpuSinglePassGatherer(_SinglePassGatherer):
     def __init__(self, *args, enable_global_physical_experts: bool, **kwargs):
         super().__init__(*args, **kwargs)
+
+        device = get_device()
+
         self._enable_global_physical_experts = enable_global_physical_experts
         self._data = torch.zeros(
             (
@@ -490,7 +493,7 @@ class _LayerBasedGpuSinglePassGatherer(_SinglePassGatherer):
                 ),
             ),
             dtype=torch.int,
-            device="cuda",
+            device=device,
         )
 
     def reset(self):

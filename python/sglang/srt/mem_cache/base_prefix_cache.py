@@ -78,7 +78,7 @@ class InsertResult:
 class EvictParams:
     """Unified parameters for evict across different cache types"""
 
-    num_tokens: int
+    num_tokens: int = 0
     swa_num_tokens: int = 0
     mamba_num: int = 0
 
@@ -98,6 +98,10 @@ class IncLockRefResult:
 
     delta: Optional[int] = None
     swa_uuid_for_lock: Optional[int] = None
+
+    def to_dec_params(self) -> "DecLockRefParams":
+        """Convert to the corresponding DecLockRefParams for dec_lock_ref."""
+        return DecLockRefParams(swa_uuid_for_lock=self.swa_uuid_for_lock)
 
 
 @dataclasses.dataclass
@@ -287,6 +291,9 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         return 0
 
     def session_held_req_count(self, active_pool_idxs: Optional[set] = None) -> int:
+        return 0
+
+    def session_held_mamba_slots(self, active_pool_idxs: Optional[set] = None) -> int:
         return 0
 
     def is_chunk_cache(self) -> bool:
