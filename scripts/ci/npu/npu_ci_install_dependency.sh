@@ -5,6 +5,7 @@ PIP_INSTALL="python3 -m pip install --no-cache-dir"
 DEVICE_TYPE=$1
 OPTIONAL_DEPS="${2:-}"
 
+
 # Install the required dependencies in CI.
 apt update -y && apt install -y \
     unzip \
@@ -39,10 +40,10 @@ if [ -n "$OPTIONAL_DEPS" ]; then
     PTA_URL="https://gitcode.com/Ascend/pytorch/releases/download/7.3.0.alpha002/torch_npu-2.10.0rc2-cp311-cp311-manylinux_2_28_aarch64.whl"
     ${PIP_INSTALL} ${PTA_URL}
 else
-    PYTORCH_VERSION="2.9.0.post1"
+    PYTORCH_VERSION="2.8.0"
     TORCHVISION_VERSION="0.24.0"
     ${PIP_INSTALL} torch==${PYTORCH_VERSION} torchvision==${TORCHVISION_VERSION} --index-url ${TORCH_CACHE_URL:="https://download.pytorch.org/whl/cpu"} --extra-index-url ${PYPI_CACHE_URL:="https://pypi.org/simple/"}
-    PTA_URL="https://gitcode.com/Ascend/pytorch/releases/download/v7.3.1-pytorch2.9.0/torch_npu-2.9.0.post1-cp311-cp311-manylinux_2_28_aarch64.whl"
+    PTA_URL="https://gitcode.com/Ascend/pytorch/releases/download/v26.0.0-pytorch2.8.0/torch_npu-2.8.0.post4-cp311-cp311-manylinux_2_28_aarch64.whl
     ${PIP_INSTALL} ${PTA_URL}
 fi
 
