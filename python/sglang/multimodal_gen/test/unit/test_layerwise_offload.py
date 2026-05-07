@@ -23,6 +23,7 @@ from sglang.multimodal_gen.runtime.managers.component_resident_strategies import
 from sglang.multimodal_gen.runtime.managers.layerwise_offload import (
     LayerwiseOffloadableModuleMixin,
     LayerwiseOffloadManager,
+    configure_layerwise_offload_modules,
     is_layerwise_offloaded_module,
 )
 
@@ -75,6 +76,14 @@ class _DummyModel(torch.nn.Module):
         self.blocks = torch.nn.ModuleList([_DummyBlock()])
 
 
+class _NestedDummyModel(torch.nn.Module, LayerwiseOffloadableModuleMixin):
+    layer_names = ["encoder.blocks"]
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.encoder = _DummyModel()
+
+
 class _LayerwiseComponent(torch.nn.Module, LayerwiseOffloadableModuleMixin):
     layer_names = ["blocks"]
 
@@ -91,6 +100,8 @@ def _server_args(**kwargs):
         text_encoder_cpu_offload=False,
         image_encoder_cpu_offload=False,
         vae_cpu_offload=False,
+        dit_offload_prefetch_size=1,
+        pin_cpu_memory=False,
     )
     defaults.update(kwargs)
     return SimpleNamespace(**defaults)
@@ -159,6 +170,24 @@ def test_layerwise_capability_selects_layerwise_strategy_for_any_component():
     )
 
     assert isinstance(strategy, LayerwiseOffloadStrategy)
+
+
+def test_layerwise_configuration_scans_all_pipeline_components(monkeypatch):
+    monkeypatch.setattr(
+        layerwise_offload_mod.torch, "get_device_module", lambda: _FakeDeviceModule
+    )
+    monkeypatch.setattr(layerwise_offload_mod.current_platform, "device_type", "cpu")
+    layerwise_module = _NestedDummyModel()
+    modules = {
+        "text_encoder": layerwise_module,
+        "text_encoder_alias": layerwise_module,
+        "scheduler": object(),
+    }
+
+    configured = configure_layerwise_offload_modules(modules, _server_args())
+
+    assert configured == ["text_encoder"]
+    assert is_layerwise_offloaded_module(layerwise_module)
 
 
 def test_component_cpu_offload_strategy_remains_flag_driven():

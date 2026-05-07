@@ -191,6 +191,7 @@ class ServerArgs(DisaggArgsMixin):
     # CPU offload parameters
     dit_cpu_offload: bool | None = None
     dit_layerwise_offload: bool | None = None
+    dit_layerwise_offload_auto_enabled: bool = False
     dit_offload_prefetch_size: float = 0.0
     text_encoder_cpu_offload: bool | None = None
     image_encoder_cpu_offload: bool | None = None
@@ -798,6 +799,7 @@ class ServerArgs(DisaggArgsMixin):
                         "for low memory and performance balance"
                     )
                     self.dit_layerwise_offload = True
+                    self.dit_layerwise_offload_auto_enabled = True
 
     def _adjust_autocast(self):
         if self.disable_autocast is None:
@@ -1063,8 +1065,10 @@ class ServerArgs(DisaggArgsMixin):
             "--dit-layerwise-offload",
             action=StoreBoolean,
             default=ServerArgs.dit_layerwise_offload,
-            help="Enable layerwise CPU offload with async H2D prefetch overlap for supported DiT models (e.g., Wan, MOVA). "
-            "Cannot be used together with cache-dit (SGLANG_CACHE_DIT_ENABLED), dit_cpu_offload, or use_fsdp_inference.",
+            help="Enable layerwise CPU offload with async H2D prefetch overlap for supported pipeline components. "
+            "The legacy option name is kept for compatibility; explicit use scans all layerwise-capable components, "
+            "while automatic Wan/MOVA enablement preserves the existing DiT-only scope. Cannot be used together "
+            "with cache-dit (SGLANG_CACHE_DIT_ENABLED), dit_cpu_offload, or use_fsdp_inference.",
         )
         parser.add_argument(
             "--dit-offload-prefetch-size",

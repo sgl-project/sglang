@@ -9,6 +9,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from sglang.multimodal_gen.configs.models.vocoder.ltx_vocoder import LTXVocoderConfig
+from sglang.multimodal_gen.runtime.managers.layerwise_offload import (
+    LayerwiseOffloadableModuleMixin,
+)
 
 LRELU_SLOPE = 0.1
 
@@ -531,10 +534,19 @@ class LTX23VocoderCore(nn.Module):
         return x
 
 
-class LTX2Vocoder(ABC, nn.Module):
+class LTX2Vocoder(ABC, nn.Module, LayerwiseOffloadableModuleMixin):
     r"""
     LTX 2.0 vocoder for converting generated mel spectrograms back to audio waveforms.
     """
+
+    layer_names = [
+        "upsamplers",
+        "resnets",
+        "vocoder.ups",
+        "vocoder.resblocks",
+        "bwe_generator.ups",
+        "bwe_generator.resblocks",
+    ]
 
     def __init__(
         self,

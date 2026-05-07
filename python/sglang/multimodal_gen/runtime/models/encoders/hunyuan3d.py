@@ -11,6 +11,10 @@ from transformers import (
     Dinov2Model,
 )
 
+from sglang.multimodal_gen.runtime.managers.layerwise_offload import (
+    LayerwiseOffloadableModuleMixin,
+)
+
 
 def get_1d_sincos_pos_embed_from_grid(embed_dim, pos):
 
@@ -28,7 +32,11 @@ def get_1d_sincos_pos_embed_from_grid(embed_dim, pos):
     return np.concatenate([emb_sin, emb_cos], axis=1)
 
 
-class ImageEncoder(nn.Module):
+class ImageEncoder(nn.Module, LayerwiseOffloadableModuleMixin):
+    layer_names = [
+        "model.encoder.layer",
+        "model.vision_model.encoder.layers",
+    ]
     MODEL_CLASS = None
     MODEL_CONFIG_CLASS = None
     mean = []

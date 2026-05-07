@@ -38,7 +38,7 @@ from sglang.multimodal_gen.runtime.loader.weights_updater import (
     get_updatable_modules,
 )
 from sglang.multimodal_gen.runtime.managers.layerwise_offload import (
-    LayerwiseOffloadableModuleMixin,
+    configure_layerwise_offload_modules,
     iter_materialized_weights,
 )
 from sglang.multimodal_gen.runtime.pipelines_core import (
@@ -73,6 +73,13 @@ OFFLOAD_DISABLE_RECOMMENDATION_ORDER = (
     "text_encoder_2",
     "transformer",
 )
+AUTO_LAYERWISE_OFFLOAD_COMPONENTS = {
+    "transformer",
+    "transformer_2",
+    "video_dit",
+    "video_dit_2",
+    "audio_dit",
+}
 
 
 @dataclass
@@ -162,22 +169,16 @@ class GPUWorker:
         # apply layerwise offload after lora is applied while building LoRAPipeline
         # otherwise empty offloaded weights could fail lora converting
         if self.server_args.dit_layerwise_offload:
-            # enable layerwise offload if possible
-            for module_name in [
-                "transformer",
-                "transformer_2",
-                "video_dit",
-                "video_dit_2",
-                "audio_dit",
-            ]:
-                module = self.pipeline.get_module(module_name)
-                if module:
-                    if isinstance(module, LayerwiseOffloadableModuleMixin):
-                        module.configure_layerwise_offload(self.server_args)
-                    else:
-                        logger.info(
-                            f"Module {type(module).__name__} does not support layerwise offload. Skipping."
-                        )
+            component_names = (
+                AUTO_LAYERWISE_OFFLOAD_COMPONENTS
+                if self.server_args.dit_layerwise_offload_auto_enabled
+                else None
+            )
+            configure_layerwise_offload_modules(
+                self.pipeline.modules,
+                self.server_args,
+                component_names=component_names,
+            )
 
         logger.info(
             f"Worker {self.rank}: Initialized device, model, and distributed environment."

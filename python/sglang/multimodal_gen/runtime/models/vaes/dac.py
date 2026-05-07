@@ -12,6 +12,9 @@ from einops import rearrange
 from torch import nn
 
 from sglang.multimodal_gen.configs.models.vaes.dac import DacVAEConfig
+from sglang.multimodal_gen.runtime.managers.layerwise_offload import (
+    LayerwiseOffloadableModuleMixin,
+)
 from sglang.multimodal_gen.runtime.models.vaes.common import (
     DiagonalGaussianDistribution,
 )
@@ -413,7 +416,9 @@ class Decoder(nn.Module):
         return self.model(x)
 
 
-class DAC(nn.Module):
+class DAC(nn.Module, LayerwiseOffloadableModuleMixin):
+    layer_names = ["encoder.block", "decoder.model"]
+
     def __init__(
         self,
         config: DacVAEConfig,

@@ -1,4 +1,5 @@
 import re
+from collections.abc import Mapping
 from itertools import chain
 from typing import Any, Dict, List, Set, Tuple
 
@@ -467,7 +468,7 @@ class LayerwiseOffloadManager:
         if not self.enabled:
             return
 
-        layers = dict(self.model.named_children())[self.layers_attr_str]
+        layers = dict(self.model.named_modules())[self.layers_attr_str]
 
         def make_pre_hook(i):
             def hook(module, input):
@@ -512,16 +513,19 @@ class LayerwiseOffloadManager:
 class LayerwiseOffloadableModuleMixin:
     """A mixin that registers forward hooks to enable layerwise offload."""
 
-    # The list of names of this module's layer/block ModuleList attributes.
-    layer_names: List[str]
+    # The list of names of this module's layer/block ModuleList or Sequential attributes.
+    layer_names: List[str] = []
     layerwise_offload_managers: list[LayerwiseOffloadManager] = []
 
     def configure_layerwise_offload(self, server_args: ServerArgs):
         self.layerwise_offload_managers = []
-        child_modules = dict(self.named_children())
+        named_modules = dict(self.named_modules())
+        configured_layer_names = []
         for layer_name in self.layer_names:
-            module_list = child_modules.get(layer_name)
-            if not isinstance(module_list, torch.nn.ModuleList):
+            module_list = named_modules.get(layer_name)
+            if not isinstance(module_list, (torch.nn.ModuleList, torch.nn.Sequential)):
+                continue
+            if len(module_list) == 0:
                 continue
 
             num_layers = len(module_list)
@@ -541,10 +545,20 @@ class LayerwiseOffloadableModuleMixin:
                 prefetch_size=prefetch_size,
             )
             self.layerwise_offload_managers.append(manager)
+            configured_layer_names.append(layer_name)
 
-        logger.info(
-            f"Enabled layerwise offload for {self.__class__.__name__} on modules: {self.layer_names}"
-        )
+        if configured_layer_names:
+            logger.info(
+                "Enabled layerwise offload for %s on modules: %s",
+                self.__class__.__name__,
+                configured_layer_names,
+            )
+        else:
+            logger.info(
+                "No layerwise-offloadable ModuleList found for %s. Candidates: %s",
+                self.__class__.__name__,
+                self.layer_names,
+            )
 
     def prepare_for_next_req(self):
         if self.layerwise_offload_managers is None:
@@ -607,3 +621,34 @@ def is_layerwise_offloaded_module(module: torch.nn.Module) -> bool:
         and bool(module.layerwise_offload_managers)
         and any(manager.enabled for manager in module.layerwise_offload_managers)
     )
+
+
+def configure_layerwise_offload_modules(
+    modules: Mapping[str, object],
+    server_args: ServerArgs,
+    component_names: set[str] | None = None,
+) -> list[str]:
+    """Configure every registered pipeline component that exposes layerwise offload."""
+    configured_component_names: list[str] = []
+    configured_module_ids: set[int] = set()
+    for component_name, module in modules.items():
+        if component_names is not None and component_name not in component_names:
+            continue
+        if not isinstance(module, LayerwiseOffloadableModuleMixin):
+            continue
+        if id(module) in configured_module_ids:
+            continue
+
+        configured_module_ids.add(id(module))
+        module.configure_layerwise_offload(server_args)
+        if is_layerwise_offloaded_module(module):
+            configured_component_names.append(component_name)
+
+    if configured_component_names:
+        logger.info(
+            "Enabled layerwise offload for pipeline components: %s",
+            configured_component_names,
+        )
+    else:
+        logger.info("No pipeline component supports layerwise offload.")
+    return configured_component_names
