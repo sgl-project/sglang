@@ -7011,17 +7011,26 @@ class ServerArgs:
                         if "=" in lora_path:
                             name, path = lora_path.split("=", 1)
                             lora_ref = LoRARef(
-                                lora_name=name, lora_path=path, pinned=False
+                                lora_id=LoRARef.deterministic_id(name, path),
+                                lora_name=name,
+                                lora_path=path,
+                                pinned=False,
                             )
                         else:
                             lora_ref = LoRARef(
-                                lora_name=lora_path, lora_path=lora_path, pinned=False
+                                lora_id=LoRARef.deterministic_id(lora_path, lora_path),
+                                lora_name=lora_path,
+                                lora_path=lora_path,
+                                pinned=False,
                             )
                     elif isinstance(lora_path, dict):
                         assert (
                             "lora_name" in lora_path and "lora_path" in lora_path
                         ), f"When providing LoRA paths as a list of dict, each dict should contain 'lora_name' and 'lora_path' keys. Got: {lora_path}"
                         lora_ref = LoRARef(
+                            lora_id=LoRARef.deterministic_id(
+                                lora_path["lora_name"], lora_path["lora_path"]
+                            ),
                             lora_name=lora_path["lora_name"],
                             lora_path=lora_path["lora_path"],
                             pinned=lora_path.get("pinned", False),
@@ -7034,7 +7043,12 @@ class ServerArgs:
                     self.lora_paths.append(lora_ref)
             elif isinstance(self.lora_paths, dict):
                 self.lora_paths = [
-                    LoRARef(lora_name=k, lora_path=v, pinned=False)
+                    LoRARef(
+                        lora_id=LoRARef.deterministic_id(k, v),
+                        lora_name=k,
+                        lora_path=v,
+                        pinned=False,
+                    )
                     for k, v in self.lora_paths.items()
                 ]
             elif self.lora_paths is None:
