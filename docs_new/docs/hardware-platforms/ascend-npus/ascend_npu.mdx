@@ -25,7 +25,7 @@ You can install SGLang using any of the methods below. Please go through `System
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>CANN</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>8.5.0</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>9.0.0</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><a href="#obtain-cann-image">Obtain Images</a></td>
     </tr>
     <tr>
@@ -56,9 +56,9 @@ You can install SGLang using any of the methods below. Please go through `System
 You can obtain the dependency of a specified version of CANN through an image.
 ```bash Command
 # for Atlas 800I A3 and Ubuntu OS
-docker pull quay.io/ascend/cann:8.5.0-a3-ubuntu22.04-py3.11
+docker pull quay.io/ascend/cann:9.0.0-a3-ubuntu22.04-py3.11
 # for Atlas 800I A2 and Ubuntu OS
-docker pull quay.io/ascend/cann:8.5.0-910b-ubuntu22.04-py3.11
+docker pull quay.io/ascend/cann:9.0.0-910b-ubuntu22.04-py3.11
 ```
 
 ## Preparing the Running Environment
@@ -76,7 +76,7 @@ conda activate sglang_npu
 
 #### CANN
 
-Prior to start work with SGLang on Ascend you need to install CANN Toolkit, Kernels operator package and NNAL version 8.5.0, check the [installation guide](https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/850/softwareinst/instg/instg_0008.html?Mode=PmIns&InstallType=local&OS=openEuler&Software=cannToolKit)
+Prior to start work with SGLang on Ascend you need to install CANN Toolkit, Kernels operator package and NNAL version 9.0.0, check the [installation guide](https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/850/softwareinst/instg/instg_0008.html?Mode=PmIns&InstallType=local&OS=openEuler&Software=cannToolKit)
 
 #### MemFabric-Hybrid
 
@@ -142,8 +142,8 @@ You can download the SGLang image or build an image based on Dockerfile to obtai
 dockerhub: docker.io/lmsysorg/sglang:$tag
 # Main-based tag, change main to specific version like v0.5.6,
 # you can get image for specific version
-Atlas 800I A3 : {main}-cann8.5.0-a3
-Atlas 800I A2: {main}-cann8.5.0-910b
+Atlas 800I A3 : {main}-cann9.0.0-a3
+Atlas 800I A2: {main}-cann9.0.0-910b
 ```
 2. Build an image based on Dockerfile
 ```bash Command
