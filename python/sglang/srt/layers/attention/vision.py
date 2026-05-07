@@ -526,7 +526,6 @@ class VisionFlash3Attention(nn.Module):
                 cu_seqlens_k=cu_seqlens[0],
                 max_seqlen_q=max_seqlen,
                 max_seqlen_k=max_seqlen,
-                softmax_scale=attn_softmax_scale,
                 window_size=window_size,
             )
             
@@ -538,7 +537,7 @@ class VisionFlash3Attention(nn.Module):
                 fa_kwargs["q_descale"] = scale_q
                 fa_kwargs["k_descale"] = scale_k
                 fa_kwargs["v_desacle"] = scale_v
-                
+                fa_kwargs["softmax_scale"] = attn_softmax_scale
                 output = flash_attn_varlen_func(
                     q_quant_pad,
                     k_quant_pad,
@@ -548,6 +547,7 @@ class VisionFlash3Attention(nn.Module):
                 
                 ret = output[:, :, :ori_headsize]
             else:
+                fa_kwargs["softmax_scale"] = softmax_scale
                 ret = flash_attn_varlen_func(
                     q,
                     k,
@@ -565,7 +565,6 @@ class VisionFlash3Attention(nn.Module):
                 cu_seqlens_k=cu_seqlens,
                 max_seqlen_q=max_seqlen,
                 max_seqlen_k=max_seqlen,
-                softmax_scale=attn_softmax_scale,
                 window_size=window_size,
             )
             
@@ -576,6 +575,7 @@ class VisionFlash3Attention(nn.Module):
                 fa_kwargs["q_descale"] = scale_q
                 fa_kwargs["k_descale"] = scale_k
                 fa_kwargs["v_desacle"] = scale_v
+                fa_kwargs["softmax_scale"] = attn_softmax_scale
                 output = flash_attn_varlen_func(
                     q_quant_pad,
                     k_quant_pad,
@@ -584,6 +584,7 @@ class VisionFlash3Attention(nn.Module):
                 )
                 ret = output[:, :, :ori_headsize]
             else:
+                fa_kwargs["softmax_scale"] = softmax_scale
                 ret = flash_attn_varlen_func(
                     q,
                     k,
