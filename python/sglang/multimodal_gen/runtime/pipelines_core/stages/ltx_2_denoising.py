@@ -289,14 +289,21 @@ class LTX2DenoisingStage(DenoisingStage):
         local_videos: list[torch.Tensor] = []
         local_audios: list[torch.Tensor] = []
 
+        indices_to_run = my_indices if my_indices else [0]
         with set_forward_context(
             current_timestep=step.step_index, attn_metadata=step.attn_metadata
         ):
-            for idx in my_indices:
+            for idx in indices_to_run:
                 _, kwargs = all_passes[idx]
                 v, a = step.current_model(**kwargs)
                 local_videos.append(v.float())
                 local_audios.append(a.float())
+
+        if not my_indices:
+            # This rank has no real branch, but it still needs tensor shapes for all-gather.
+            # The dummy branch above provides the shapes; zeros keep this rank from contributing.
+            local_videos = [torch.zeros_like(local_videos[0])]
+            local_audios = [torch.zeros_like(local_audios[0])]
 
         # Pad to max_local for unbalanced cases (n_passes not divisible by n_ranks).
         while len(local_videos) < max_local:
