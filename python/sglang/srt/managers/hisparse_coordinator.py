@@ -521,6 +521,7 @@ class HiSparseCoordinator:
         Returns:
             Device KV cache indices for the selected tokens.  Shape: (num_reqs, top_k)
         """
+        local_layer_id = self._to_local_layer_id(layer_id)
         num_reqs = req_pool_indices.size(0)
         top_k_indices = torch.full(
             (num_reqs, self.top_k), -1, dtype=torch.int32, device=self.device
@@ -577,7 +578,7 @@ class HiSparseCoordinator:
                         self.mem_pool_device,
                         host_locs,
                         buffer_locs,
-                        layer_id,
+                        local_layer_id,
                         io_backend="kernel",
                     )
 
@@ -646,6 +647,15 @@ class HiSparseCoordinator:
         self.lru_slots[:, req.req_pool_idx, :].copy_(self._lru_init)
         self._skip_first_backup[req.req_pool_idx] = False
 
+    def _to_local_layer_id(self, layer_id: int) -> int:
+        local_layer_id = layer_id - self.mem_pool_device.start_layer
+        if local_layer_id < 0 or local_layer_id >= self.mem_pool_device.layer_num:
+            raise ValueError(
+                f"Layer ID {layer_id} is outside valid range "
+                f"[{self.mem_pool_device.start_layer}, {self.mem_pool_device.end_layer})."
+            )
+        return local_layer_id
+
     def swap_in_selected_pages(
         self,
         req_pool_indices: torch.Tensor,
@@ -668,6 +678,8 @@ class HiSparseCoordinator:
                 f"top_k_result dtype {top_k_result.dtype} is not int32 as expected"
             )
 
+        local_layer_id = self._to_local_layer_id(layer_id)
+
         num_reqs = req_pool_indices.size(0)
         top_k_indices = self.top_k_device_locs_buffer[:num_reqs]
         top_k_indices.fill_(-1)
@@ -675,15 +687,15 @@ class HiSparseCoordinator:
         block_size = 1024
         load_cache_to_device_buffer_mla(
             top_k_tokens=top_k_result,
-            device_buffer_tokens=self.req_device_buffer_tokens[layer_id],
+            device_buffer_tokens=self.req_device_buffer_tokens[local_layer_id],
             host_cache_locs=self.req_to_host_pool,
-            device_buffer_locs=self.req_device_buffer_token_locs[layer_id],
-            host_cache=self.mem_pool_host.kv_buffer[layer_id],
-            device_buffer=self.mem_pool_device.kv_buffer[layer_id],
+            device_buffer_locs=self.req_device_buffer_token_locs[local_layer_id],
+            host_cache=self.mem_pool_host.kv_buffer[local_layer_id],
+            device_buffer=self.mem_pool_device.kv_buffer[local_layer_id],
             top_k_device_locs=top_k_indices,
             req_pool_indices=req_pool_indices,
             seq_lens=seq_lens,
-            lru_slots=self.lru_slots[layer_id],
+            lru_slots=self.lru_slots[local_layer_id],
             item_size_bytes=self.mem_pool_host.token_stride_size,
             num_top_k=self.top_k,
             hot_buffer_size=self.device_buffer_size,
