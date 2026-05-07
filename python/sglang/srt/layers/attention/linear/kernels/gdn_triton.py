@@ -149,7 +149,7 @@ class TritonGDNKernel(LinearAttnKernelBase):
         if cu_seqlens_cpu is not None:
             prefill_metadata_args["cu_seqlens_cpu"] = cu_seqlens_cpu
 
-        call_kwargs = dict(
+        return chunk_gated_delta_rule(
             q=q,
             k=k,
             v=v,
@@ -160,15 +160,8 @@ class TritonGDNKernel(LinearAttnKernelBase):
             head_first=False,
             use_qk_l2norm_in_kernel=True,
             **recurrent_state_indices_args,
+            **prefill_metadata_args,
         )
-        try:
-            return chunk_gated_delta_rule(**call_kwargs, **prefill_metadata_args)
-        except TypeError as err:
-            if not prefill_metadata_args or not any(
-                name in str(err) for name in ("prebuilt_meta", "cu_seqlens_cpu")
-            ):
-                raise
-            return chunk_gated_delta_rule(**call_kwargs)
 
     def target_verify(
         self,
