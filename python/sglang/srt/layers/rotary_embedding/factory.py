@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Any, Dict, Optional, Tuple
 
 import torch
@@ -20,11 +21,35 @@ from sglang.srt.layers.rotary_embedding.rope_variant import (
     DynamicNTKAlphaRotaryEmbedding,
     DynamicNTKScalingRotaryEmbedding,
     FourierRotaryEmbedding,
+    Gemma4RotaryEmbedding,
     Llama3RotaryEmbedding,
     Phi3LongRoPEScaledRotaryEmbedding,
 )
 from sglang.srt.layers.rotary_embedding.yarn import YaRNScalingRotaryEmbedding
 from sglang.srt.utils import get_bool_env_var, is_hip
+
+logger = logging.getLogger(__name__)
+
+
+def _get_rope_param(rope_scaling, key, default, scaling_type):
+    """Get a parameter from rope_scaling dict, warn if missing.
+
+    In transformers v5, config.rope_scaling is an alias for rope_parameters
+    which may be non-None even for models with no actual scaling (rope_type=default).
+    When a required key is missing, this logs a warning instead of silently
+    defaulting, to make config mismatches easier to debug.
+    """
+    if key in rope_scaling:
+        return rope_scaling[key]
+    logger.warning(
+        "rope_scaling (type=%s) missing key '%s', defaulting to %s. "
+        "This may indicate a v5 config issue — check model accuracy.",
+        scaling_type,
+        key,
+        default,
+    )
+    return default
+
 
 _is_hip = is_hip()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
@@ -111,10 +136,19 @@ def get_rope(
             )
 
         if scaling_type == "llama3":
-            scaling_factor = rope_scaling["factor"]
-            low_freq_factor = rope_scaling["low_freq_factor"]
-            high_freq_factor = rope_scaling["high_freq_factor"]
-            original_max_position = rope_scaling["original_max_position_embeddings"]
+            scaling_factor = _get_rope_param(rope_scaling, "factor", 1.0, scaling_type)
+            low_freq_factor = _get_rope_param(
+                rope_scaling, "low_freq_factor", 1.0, scaling_type
+            )
+            high_freq_factor = _get_rope_param(
+                rope_scaling, "high_freq_factor", 4.0, scaling_type
+            )
+            original_max_position = _get_rope_param(
+                rope_scaling,
+                "original_max_position_embeddings",
+                max_position,
+                scaling_type,
+            )
             rotary_emb = Llama3RotaryEmbedding(
                 head_size,
                 rotary_dim,
@@ -138,6 +172,9 @@ def get_rope(
                     dtype,
                     mrope_section=rope_scaling["mrope_section"],
                     mrope_interleaved=rope_scaling.get("mrope_interleaved", False),
+                    mrope_interleaved_glm=rope_scaling.get(
+                        "mrope_interleaved_glm", False
+                    ),
                 )
             elif rope_scaling.get("use_fope", False):
                 rotary_emb = FourierRotaryEmbedding(
@@ -162,7 +199,7 @@ def get_rope(
                     dtype,
                 )
         elif scaling_type == "linear":
-            scaling_factor = rope_scaling["factor"]
+            scaling_factor = _get_rope_param(rope_scaling, "factor", 1.0, scaling_type)
             rotary_emb = LinearScalingRotaryEmbedding(
                 head_size,
                 rotary_dim,
@@ -173,7 +210,7 @@ def get_rope(
                 dtype,
             )
         elif scaling_type == "dynamic":
-            scaling_factor = rope_scaling["factor"]
+            scaling_factor = _get_rope_param(rope_scaling, "factor", 1.0, scaling_type)
             if "alpha" in rope_scaling:
                 rotary_emb = DynamicNTKAlphaRotaryEmbedding(
                     head_size,
@@ -195,8 +232,13 @@ def get_rope(
                     dtype,
                 )
         elif scaling_type == "yarn":
-            scaling_factor = rope_scaling["factor"]
-            original_max_position = rope_scaling["original_max_position_embeddings"]
+            scaling_factor = _get_rope_param(rope_scaling, "factor", 1.0, scaling_type)
+            original_max_position = _get_rope_param(
+                rope_scaling,
+                "original_max_position_embeddings",
+                max_position,
+                scaling_type,
+            )
             extra_kwargs = {
                 k: v
                 for k, v in rope_scaling.items()
@@ -229,8 +271,13 @@ def get_rope(
                     **extra_kwargs,
                 )
         elif scaling_type == "deepseek_yarn":
-            scaling_factor = rope_scaling["factor"]
-            original_max_position = rope_scaling["original_max_position_embeddings"]
+            scaling_factor = _get_rope_param(rope_scaling, "factor", 1.0, scaling_type)
+            original_max_position = _get_rope_param(
+                rope_scaling,
+                "original_max_position_embeddings",
+                max_position,
+                scaling_type,
+            )
             extra_kwargs = {
                 k: v
                 for k, v in rope_scaling.items()
@@ -257,7 +304,12 @@ def get_rope(
         elif scaling_type == "longrope":
             short_factor = rope_scaling["short_factor"]
             long_factor = rope_scaling["long_factor"]
-            original_max_position = rope_scaling["original_max_position_embeddings"]
+            original_max_position = _get_rope_param(
+                rope_scaling,
+                "original_max_position_embeddings",
+                max_position,
+                scaling_type,
+            )
             extra_kwargs = {
                 k: v
                 for k, v in rope_scaling.items()
@@ -274,6 +326,15 @@ def get_rope(
                 short_factor,
                 long_factor,
                 **extra_kwargs,
+            )
+        elif scaling_type == "proportional":
+            rotary_emb = Gemma4RotaryEmbedding(
+                head_size,
+                rotary_dim,
+                max_position,
+                base,
+                is_neox_style,
+                dtype,
             )
         else:
             raise ValueError(f"Unknown RoPE scaling type {scaling_type}")
@@ -321,8 +382,10 @@ def get_rope_cpu(
         scaling_type == "deepseek_yarn"
     ), "Only deepseek_yarn is supported for CPU for now"
 
-    scaling_factor = rope_scaling["factor"]
-    original_max_position = rope_scaling["original_max_position_embeddings"]
+    scaling_factor = _get_rope_param(rope_scaling, "factor", 1.0, scaling_type)
+    original_max_position = _get_rope_param(
+        rope_scaling, "original_max_position_embeddings", max_position, scaling_type
+    )
     extra_kwargs = {
         k: v
         for k, v in rope_scaling.items()

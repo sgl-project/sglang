@@ -149,17 +149,26 @@ class RocmPlatform(Platform):
             try:
                 import flash_attn  # noqa: F401
 
+                from sglang.jit_kernel.flash_attention_v3 import _is_fa3_supported
                 from sglang.multimodal_gen.runtime.layers.attention.backends.flash_attn import (  # noqa: F401
                     FlashAttentionBackend,
                 )
 
-                supported_sizes = FlashAttentionBackend.get_supported_head_sizes()
-                if head_size not in supported_sizes:
+                if not _is_fa3_supported():
                     logger.info(
-                        "Cannot use FlashAttention-2 backend for head size %d.",
-                        head_size,
+                        "FlashAttention backend now dispatches through FA3 "
+                        "(CUDA-only). Using Torch SDPA backend on ROCm."
                     )
                     target_backend = AttentionBackendEnum.TORCH_SDPA
+
+                if target_backend == AttentionBackendEnum.FA:
+                    supported_sizes = FlashAttentionBackend.get_supported_head_sizes()
+                    if head_size not in supported_sizes:
+                        logger.info(
+                            "Cannot use FlashAttention-2 backend for head size %d.",
+                            head_size,
+                        )
+                        target_backend = AttentionBackendEnum.TORCH_SDPA
             except ImportError:
                 logger.info(
                     "Cannot use FlashAttention backend because the "
@@ -184,7 +193,19 @@ class RocmPlatform(Platform):
 
     @classmethod
     def optimize_vae(cls, vae: torch.nn.Module) -> torch.nn.Module:
-        """Replace nn.GroupNorm with AITer GroupNorm for improved ROCm VAE performance."""
+        """Apply ROCm-specific optimizations to VAE.
+
+        - Enable MIOpen benchmark mode so that the best convolution algorithm
+          is selected for each distinct input shape (benefits Conv3d-heavy VAE
+          decode).
+        - Replace nn.GroupNorm with AITer GroupNorm when available.
+        """
+        if envs.SGLANG_USE_ROCM_CUDNN_BENCHMARK and not torch.backends.cudnn.benchmark:
+            torch.backends.cudnn.benchmark = True
+            logger.info(
+                "Enabled cudnn.benchmark (MIOpen auto-tuning) for VAE conv layers"
+            )
+
         if not envs.SGLANG_USE_ROCM_VAE:
             return vae
         try:

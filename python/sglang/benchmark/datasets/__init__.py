@@ -1,11 +1,13 @@
 from typing import Dict, Type
 
+from sglang.benchmark.datasets.autobench import AutoBenchmarkDataset
 from sglang.benchmark.datasets.common import BaseDataset, DatasetRow
 from sglang.benchmark.datasets.custom import CustomDataset
 from sglang.benchmark.datasets.generated_shared_prefix import (
     GeneratedSharedPrefixDataset,
 )
 from sglang.benchmark.datasets.image import ImageDataset
+from sglang.benchmark.datasets.longbench_v2 import LongBenchV2Dataset
 from sglang.benchmark.datasets.mmmu import MMMUDataset
 from sglang.benchmark.datasets.mooncake import MooncakeDataset
 from sglang.benchmark.datasets.openai_dataset import OpenAIDataset
@@ -13,6 +15,7 @@ from sglang.benchmark.datasets.random import RandomDataset
 from sglang.benchmark.datasets.sharegpt import ShareGPTDataset
 
 DATASET_MAPPING: Dict[str, Type[BaseDataset]] = {
+    "autobench": AutoBenchmarkDataset,
     "sharegpt": ShareGPTDataset,
     "custom": CustomDataset,
     "openai": OpenAIDataset,
@@ -24,6 +27,7 @@ DATASET_MAPPING: Dict[str, Type[BaseDataset]] = {
     "mmmu": MMMUDataset,
     "image": ImageDataset,
     "mooncake": MooncakeDataset,
+    "longbench_v2": LongBenchV2Dataset,
 }
 
 

@@ -187,6 +187,11 @@ impl RouterConfigBuilder {
         self
     }
 
+    pub fn pool_idle_timeout_secs(mut self, timeout: u64) -> Self {
+        self.config.pool_idle_timeout_secs = timeout;
+        self
+    }
+
     // ==================== Rate Limiting ====================
 
     pub fn max_concurrent_requests(mut self, max: i32) -> Self {

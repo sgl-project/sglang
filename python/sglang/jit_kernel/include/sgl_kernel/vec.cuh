@@ -73,22 +73,20 @@ struct alignas(sizeof(T) * N) AlignedStorage {
 template <typename T, std::size_t N>
 struct AlignedVector {
  private:
-  /// NOTE: N must be a power of two and sizeof(T) * N <= 32 bytes (256 bits)
-  static_assert((N > 0 && (N & (N - 1)) == 0) && sizeof(T) * N <= 32, "CUDA only supports at most 256-bit vector op");
+  static_assert(
+      (N > 0 && (N & (N - 1)) == 0) && sizeof(T) * N <= kMaxVecBytes,
+      "CUDA vector size exceeds arch limit: max 16 bytes on pre-Blackwell/AMD, "
+      "32 bytes on Blackwell or greater");
   using element_t = typename details::sized_int<T>;
   using storage_t = AlignedStorage<element_t, N>;
 
  public:
   /// \brief Vectorized load from `ptr` at the given element `offset`.
-  template <typename U>
-  SGL_DEVICE void load(const U* ptr, std::size_t offset = 0) {
-    static_assert(std::is_same_v<U, T> || std::is_same_v<U, void>);
+  SGL_DEVICE void load(const void* ptr, int64_t offset = 0) {
     m_storage = reinterpret_cast<const storage_t*>(ptr)[offset];
   }
   /// \brief Vectorized store to `ptr` at the given element `offset`.
-  template <typename U>
-  SGL_DEVICE void store(U* ptr, std::size_t offset = 0) const {
-    static_assert(std::is_same_v<U, T> || std::is_same_v<U, void>);
+  SGL_DEVICE void store(void* ptr, int64_t offset = 0) const {
     reinterpret_cast<storage_t*>(ptr)[offset] = m_storage;
   }
   /// \brief Fill all N elements with the same `value`.

@@ -1,0 +1,66 @@
+name: CI Auto Bisect
+
+on:
+  workflow_run:
+    workflows: ["PR Test"]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch: {}
+
+concurrency:
+  group: ci-auto-bisect
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  auto-bisect:
+    # Only run for scheduled pr-test completions (not PR-triggered), or manual dispatch
+    if: >
+      github.repository == 'sgl-project/sglang' && (
+        github.event_name == 'workflow_dispatch' ||
+        (github.event.workflow_run.event == 'schedule' &&
+         github.event.workflow_run.conclusion != 'cancelled')
+      )
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Full history needed for git log between SHAs
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.14'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests anthropic
+
+      - name: Run Auto Bisect
+        id: bisect
+        env:
+          GITHUB_TOKEN: ${{ secrets.GH_PAT_FOR_NIGHTLY_CI_DATA }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          PYTHONUNBUFFERED: 1
+          PYTHONIOENCODING: utf-8
+        run: |
+          cd scripts/ci_monitor
+          python ci_auto_bisect.py \
+            --github-token $GITHUB_TOKEN \
+            --anthropic-api-key $ANTHROPIC_API_KEY \
+            --output bisect_results.json \
+            --max-failures 10
+
+      - name: Upload Bisect Results
+        if: always() && hashFiles('scripts/ci_monitor/bisect_results.json') != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-auto-bisect-${{ github.run_number }}
+          path: scripts/ci_monitor/bisect_results.json
+          retention-days: 14
