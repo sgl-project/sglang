@@ -159,6 +159,15 @@ class UnquantizedLinearMethod(LinearMethodBase):
         if is_fp8_cast_dtype(layer.weight.dtype):
             weight = layer.weight.to(dtype=x.dtype)
             bias = bias.to(dtype=x.dtype) if bias is not None else None
+            if (
+                x.is_cuda
+                and getattr(layer, "_fp8_cast_row_parallel_fp32_reduce", False)
+            ):
+                x_2d = x.reshape(-1, x.shape[-1])
+                output = torch.mm(x_2d, weight.t(), out_dtype=torch.float32)
+                if bias is not None:
+                    output = output + bias.to(dtype=torch.float32)
+                return output.reshape(*x.shape[:-1], weight.shape[0])
             return F.linear(x, weight, bias)
 
         output = (
@@ -1102,12 +1111,18 @@ class RowParallelLinear(LinearBase):
         # bias will not get added more than once in TP>1 case)
         bias_ = None if (self.tp_rank > 0 or self.skip_bias_add) else self.bias
         output_parallel = self.quant_method.apply(self, input_parallel, bias=bias_)
+        fp32_reduce = (
+            output_parallel.dtype == torch.float32
+            and getattr(self, "_fp8_cast_row_parallel_fp32_reduce", False)
+        )
         if self.reduce_results and self.tp_size > 1:
             output = tensor_model_parallel_all_reduce(
                 output_parallel, tp_group=self.tp_group
             )
         else:
             output = output_parallel
+        if fp32_reduce:
+            output = output.to(dtype=input_.dtype)
 
         output_bias = self.bias if self.skip_bias_add else None
 

@@ -17,7 +17,7 @@ import torch
 from torch import nn
 
 from sglang.multimodal_gen.runtime.layers.fp8_cast import is_fp8_cast_dtype
-from sglang.multimodal_gen.runtime.layers.linear import LinearBase
+from sglang.multimodal_gen.runtime.layers.linear import LinearBase, RowParallelLinear
 from sglang.multimodal_gen.runtime.layers.quantization.configs.nunchaku_config import (
     NunchakuConfig,
     _patch_nunchaku_scales,
@@ -424,6 +424,10 @@ def apply_transformer_fp8_cast(model: nn.Module) -> None:
         if _cast_parameter_data(getattr(module, "weight", None), torch.float8_e4m3fn):
             converted += 1
         _cast_parameter_data(getattr(module, "bias", None), torch.float8_e4m3fn)
+        if isinstance(module, RowParallelLinear):
+            # Match non-TP fp8-cast numerics more closely: avoid rounding each
+            # row-parallel partial before the TP all-reduce.
+            module._fp8_cast_row_parallel_fp32_reduce = True
 
     logger.info("Applied transformer fp8-cast to %d linear layers", converted)
 
