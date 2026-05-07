@@ -23,7 +23,6 @@ from sglang.srt.utils import (
     add_prefix,
     ceil_align,
     get_bool_env_var,
-    get_device_sm,
     is_cuda,
     is_gfx95_supported,
     is_hip,
@@ -33,7 +32,6 @@ from sglang.srt.utils import (
 global _use_multi_stream
 _is_cuda = is_cuda()
 _is_hip = is_hip()
-_is_sm103 = _is_cuda and get_device_sm() == 103
 _is_npu = is_npu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_fp8_fnuz = is_fp8_fnuz()
@@ -150,13 +148,12 @@ class BaseIndexerMetadata(ABC):
 
 
 def rotate_activation(x: torch.Tensor) -> torch.Tensor:
+    assert x.dtype == torch.bfloat16
+    # from sgl_kernel import hadamard_transform
     if _is_hip:
         from fast_hadamard_transform import hadamard_transform
     else:
-        try:
-            from sglang.jit_kernel.hadamard import hadamard_transform
-        except ImportError:
-            from fast_hadamard_transform import hadamard_transform
+        from sglang.jit_kernel.hadamard import hadamard_transform
 
     hidden_size = x.size(-1)
     assert (
@@ -459,12 +456,18 @@ class Indexer(MultiPlatformOp):
         # Reuse pre-computed schedule metadata if available (from init_forward_metadata),
         # otherwise fall back to computing it here.
         schedule_metadata = getattr(metadata, "paged_mqa_schedule_metadata", None)
+        # DeepGEMM release-0426 requires context_lens of shape [batch_size, next_n]
+        # to match q.shape = [batch_size, next_n, heads, head_dim]. The indexer uses
+        # next_n=1 with batch_size=N_total via q_fp8.unsqueeze(1) below, so mirror
+        # that layout here.
+        if seqlens_32.dim() == 2:
+            seqlens_32_2d = seqlens_32
+        else:
+            seqlens_32_2d = seqlens_32.unsqueeze(-1)
         if _is_cuda:
             if schedule_metadata is None:
                 schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
-                    seqlens_32.unsqueeze(-1) if seqlens_32.dim() == 1 else seqlens_32,
-                    blocksize,
-                    self.sm_count,
+                    seqlens_32_2d, blocksize, self.sm_count
                 )
 
         assert len(q_fp8.shape) == 3
@@ -513,7 +516,7 @@ class Indexer(MultiPlatformOp):
                 q_fp8[:q_offset],
                 kv_cache_fp8,
                 weights[:q_offset],
-                seqlens_32.unsqueeze(-1) if seqlens_32.dim() == 1 else seqlens_32,
+                seqlens_32_2d,
                 block_tables,
                 schedule_metadata,
                 max_seq_len,
