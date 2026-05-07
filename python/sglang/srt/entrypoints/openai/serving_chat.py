@@ -897,6 +897,11 @@ class OpenAIServingChat(OpenAIServingBase):
                     # Send any remaining tool call arguments when generation finishes
                     if finish_reason_type is not None and index in parser_dict:
                         parser = parser_dict[index]
+                        remaining_normal_chunk = self._check_for_unstreamed_normal_text(
+                            parser, content, request, index
+                        )
+                        if remaining_normal_chunk:
+                            yield remaining_normal_chunk
                         remaining_chunk = self._check_for_unstreamed_tool_args(
                             parser, content, request, index
                         )
@@ -1642,3 +1647,36 @@ class OpenAIServingChat(OpenAIServingBase):
             return f"data: {chunk.model_dump_json()}\n\n"
 
         return None
+
+    def _check_for_unstreamed_normal_text(
+        self,
+        parser: Union[FunctionCallParser, JsonArrayParser],
+        content: Dict[str, Any],
+        request: ChatCompletionRequest,
+        index: int,
+    ) -> Optional[str]:
+        """
+        Flush buffered plain content for parsers that intentionally wait to see
+        whether special markers turn into real tool calls.
+        """
+        detector = parser.detector if hasattr(parser, "detector") else parser
+        flush_remaining_text = getattr(detector, "flush_remaining_text", None)
+        if flush_remaining_text is None:
+            return None
+
+        remaining_text = flush_remaining_text()
+        if not remaining_text:
+            return None
+
+        choice_data = ChatCompletionResponseStreamChoice(
+            index=index,
+            delta=DeltaMessage(content=remaining_text),
+            finish_reason=None,
+        )
+        chunk = ChatCompletionStreamResponse(
+            id=content["meta_info"]["id"],
+            created=int(time.time()),
+            choices=[choice_data],
+            model=request.model,
+        )
+        return f"data: {chunk.model_dump_json()}\n\n"

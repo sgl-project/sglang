@@ -293,6 +293,80 @@ class TestKimiK2DetectorSpecialTokenLeakage(unittest.TestCase):
         text = "Hello world, this is normal text."
         self.assertEqual(_strip_special_tokens(text), text)
 
+    def test_non_streaming_empty_tool_section_keeps_plain_content(self):
+        """Non-stream parsing should not drop plain text wrapped by empty tool markers."""
+        detector = KimiK2FuncDetector()
+        text = "<|tool_calls_section_begin|>plain text<|tool_calls_section_end|>"
+
+        result = detector.detect_and_parse(text, self.tools)
+
+        self.assertEqual(result.calls, [])
+        self.assertEqual(result.normal_text, "plain text")
+
+    def test_non_streaming_tool_section_preserves_interleaved_plain_content(self):
+        """Non-stream parsing should preserve plain text before, between, and after tool calls."""
+        detector = KimiK2FuncDetector()
+        text = (
+            "Before "
+            "<|tool_calls_section_begin|>"
+            "first"
+            "<|tool_call_begin|>functions.ReadFile:0"
+            '<|tool_call_argument_begin|>{"path": "/a.py"}'
+            "<|tool_call_end|>"
+            " middle "
+            "<|tool_call_begin|>functions.ReadFile:1"
+            '<|tool_call_argument_begin|>{"path": "/b.py"}'
+            "<|tool_call_end|>"
+            " after"
+            "<|tool_calls_section_end|>"
+            " tail"
+        )
+
+        result = detector.detect_and_parse(text, self.tools)
+
+        self.assertEqual(len(result.calls), 2)
+        self.assertEqual(result.normal_text, "Before first middle  after tail")
+
+    def test_streaming_empty_tool_section_emits_plain_content(self):
+        """A closed tool section with no actual tool call should stream back plain content."""
+        detector = KimiK2FuncDetector()
+        result = detector.parse_streaming_increment(
+            "<|tool_calls_section_begin|>plain text<|tool_calls_section_end|>",
+            self.tools,
+        )
+
+        self.assertEqual(result.calls, [])
+        self.assertEqual(result.normal_text, "plain text")
+        self.assertEqual(detector._buffer, "")
+
+    def test_flush_remaining_text_recovers_buffered_plain_content(self):
+        """Stop-time flushing should recover buffered plain text with no tool call start."""
+        detector = KimiK2FuncDetector()
+        result = detector.parse_streaming_increment(
+            "<|tool_calls_section_begin|>plain text", self.tools
+        )
+
+        self.assertEqual(result.calls, [])
+        self.assertEqual(result.normal_text, "")
+        self.assertEqual(detector.flush_remaining_text(), "plain text")
+        self.assertEqual(detector._buffer, "")
+
+    def test_flush_remaining_text_recovers_trailing_plain_content_after_tool_call(self):
+        """Finish-time flushing should recover plain text that follows a complete tool call."""
+        detector = KimiK2FuncDetector()
+        chunks = [
+            "<|tool_calls_section_begin|>",
+            "<|tool_call_begin|>functions.ReadFile:0",
+            '<|tool_call_argument_begin|>{"path": "/test.py"}',
+            "<|tool_call_end|> trailing text<|tool_calls_section_end|>",
+        ]
+
+        for chunk in chunks:
+            detector.parse_streaming_increment(chunk, self.tools)
+
+        self.assertEqual(detector.flush_remaining_text(), " trailing text")
+        self.assertEqual(detector._buffer, "")
+
 
 # ============================================================
 # Part 2: KimiK2ReasoningDetector tests
