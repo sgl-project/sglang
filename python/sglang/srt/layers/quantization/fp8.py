@@ -264,11 +264,11 @@ class Fp8Config(QuantizationConfig):
 
                 return Mxfp4FlashinferTrtllmMoEMethod(fp8_method, prefix=prefix)
             if self.is_fp4_experts and get_moe_runner_backend().is_flashinfer_cutlass_wmxfp4a16():
-                from sglang.srt.layers.quantization.mxfp4_flashinfer_cutlass_moe import (
-                    Mxfp4FlashinferCutlassMoEMethod,
+                from sglang.srt.layers.quantization.wmxfp4a16_flashinfer_cutlass_moe import (
+                    Wmxfp4A16FlashinferCutlassMoEMethod,
                 )
 
-                return Mxfp4FlashinferCutlassMoEMethod(fp8_method, prefix=prefix)
+                return Wmxfp4A16FlashinferCutlassMoEMethod(fp8_method, prefix=prefix)
             return fp8_method
         elif isinstance(layer, RadixAttention):
             return Fp8KVCacheMethod(self)
