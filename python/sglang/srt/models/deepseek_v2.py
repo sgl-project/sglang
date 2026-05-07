@@ -1687,11 +1687,15 @@ class DeepseekV2AttentionMLA(
         self, hidden_states: torch.Tensor, forward_batch: ForwardBatch
     ):
         assert self.q_lora_rank is not None
+        # When the module is wrapped with LoRA, the fused GEMM fast-path would
+        # bypass the adapter because it reads weight.T directly.
+        lora_active = getattr(self.fused_qkv_a_proj_with_mqa, "set_lora", False)
         if (
             (not isinstance(hidden_states, tuple))
             and hidden_states.shape[0] >= 1
             and hidden_states.shape[0] <= 16
             and self.use_min_latency_fused_a_gemm
+            and not lora_active
         ):
             qkv_latent = dsv3_fused_a_gemm(
                 hidden_states, self.fused_qkv_a_proj_with_mqa.weight.T
@@ -1713,6 +1717,94 @@ class DeepseekV2AttentionMLA(
         k_nope = latent_cache_output[..., : self.kv_lora_rank].unsqueeze(1)
         k_pe = latent_cache_output[..., self.kv_lora_rank :].unsqueeze(1)
         return k_nope, k_pe
+
+    def _get_kv_b_lora_batch_info(self):
+        """Return kv_b_proj LoRA state when a kv_b adapter is active."""
+        if not getattr(self.kv_b_proj, "set_lora", False):
+            return None
+        if not hasattr(self.kv_b_proj, "A_buffer"):
+            return None
+        if not hasattr(self.kv_b_proj.lora_backend, "batch_info"):
+            return None
+        batch_info = self.kv_b_proj.lora_backend.batch_info
+        if batch_info is None:
+            return None
+        return self.kv_b_proj.A_buffer, self.kv_b_proj.B_buffer, batch_info
+
+    def _expand_wi_to_per_token(self, batch_info, num_tokens):
+        """Expand per-request weight indices to per-token adapter slots."""
+        wi = batch_info.weight_indices
+        if wi.shape[0] == num_tokens:
+            return wi
+        if batch_info.use_cuda_graph:
+            return wi[:num_tokens]
+        seg_lens = batch_info.seg_indptr[1:] - batch_info.seg_indptr[:-1]
+        return torch.repeat_interleave(wi, seg_lens)
+
+    def _compute_slot_delta_kc(self, A, B, scaling, dtype):
+        delta_W = torch.nan_to_num(scaling * (B.float() @ A.float()))
+        delta_W = delta_W.view(
+            self.num_local_heads,
+            self.qk_nope_head_dim + self.v_head_dim,
+            self.kv_lora_rank,
+        )
+        return delta_W[:, : self.qk_nope_head_dim, :].to(dtype)
+
+    def _compute_slot_delta_vc(self, A, B, scaling, dtype):
+        delta_W = torch.nan_to_num(scaling * (B.float() @ A.float()))
+        delta_W = delta_W.view(
+            self.num_local_heads,
+            self.qk_nope_head_dim + self.v_head_dim,
+            self.kv_lora_rank,
+        )
+        return (
+            delta_W[:, self.qk_nope_head_dim :, :]
+            .contiguous()
+            .transpose(1, 2)
+            .to(dtype)
+        )
+
+    def _apply_kv_b_lora_q_correction(self, q_nope, q_nope_out):
+        info = self._get_kv_b_lora_batch_info()
+        if info is None:
+            return q_nope_out
+        A_buf, B_buf, batch_info = info
+        token_wi = self._expand_wi_to_per_token(batch_info, q_nope.shape[0])
+        q_nope_ht = q_nope.transpose(0, 1)
+
+        for slot in range(A_buf.shape[0]):
+            delta_kc = self._compute_slot_delta_kc(
+                A_buf[slot],
+                B_buf[slot],
+                batch_info.scalings[slot],
+                q_nope.dtype,
+            )
+            slot_mask = (token_wi == slot).to(q_nope.dtype).unsqueeze(0).unsqueeze(2)
+            correction = torch.bmm(q_nope_ht, delta_kc)
+            q_nope_out = q_nope_out + (correction * slot_mask).transpose(0, 1)
+
+        return q_nope_out
+
+    def _apply_kv_b_lora_v_correction(self, attn_output, attn_bmm_flat):
+        info = self._get_kv_b_lora_batch_info()
+        if info is None:
+            return attn_bmm_flat
+        A_buf, B_buf, batch_info = info
+        token_wi = self._expand_wi_to_per_token(batch_info, attn_output.shape[0])
+        attn_ht = attn_output.transpose(0, 1)
+
+        for slot in range(A_buf.shape[0]):
+            delta_vc = self._compute_slot_delta_vc(
+                A_buf[slot],
+                B_buf[slot],
+                batch_info.scalings[slot],
+                attn_output.dtype,
+            )
+            slot_mask = (token_wi == slot).to(attn_output.dtype).unsqueeze(1)
+            v_delta = torch.bmm(attn_ht, delta_vc).transpose(0, 1).flatten(1, 2)
+            attn_bmm_flat = attn_bmm_flat + v_delta * slot_mask
+
+        return attn_bmm_flat
 
     @staticmethod
     def _get_q_b_proj_quant_config(quant_config):
