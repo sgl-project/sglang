@@ -180,6 +180,26 @@ class TestServerArgsPathExpansion(unittest.TestCase):
             server_args.layerwise_offload_components, ["transformer", "text_encoder"]
         )
 
+    def test_layerwise_offload_modules_alias_cli_args(self):
+        parser = FlexibleArgumentParser()
+        ServerArgs.add_cli_args(parser)
+        argv = [
+            "--model-path",
+            "/fake",
+            "--layerwise-offload-modules",
+            "transformer",
+        ]
+
+        with patch.object(sys, "argv", ["sglang"] + argv):
+            args, unknown_args = parser.parse_known_args(argv)
+            with patch.object(
+                PipelineConfig, "from_kwargs", return_value=QwenImagePipelineConfig()
+            ):
+                server_args = ServerArgs.from_cli_args(args, unknown_args)
+
+        self.assertTrue(server_args.dit_layerwise_offload)
+        self.assertEqual(server_args.layerwise_offload_components, ["transformer"])
+
 
 class TestOffloadDefaults(unittest.TestCase):
     def _from_dict_with_task_type(

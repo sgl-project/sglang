@@ -79,6 +79,9 @@ logger = init_logger(__name__)
 WAN_LAYERWISE_OFFLOAD_AUTO_DISABLE_MEM_GB = 130
 LTX2_TWO_STAGE_DEVICE_MODES = ("original", "snapshot", "resident")
 LTX2_TWO_STAGE_PIPELINE_NAMES = ("LTX2TwoStagePipeline", "LTX2TwoStageHQPipeline")
+CLI_ARG_ALIASES = {
+    "layerwise_offload_modules": "layerwise_offload_components",
+}
 # H200-class GPUs (>=130 GiB total) can usually keep both LTX2 DiTs resident.
 LTX2_RESIDENT_AUTO_ENABLE_MEM_GB = 130
 
@@ -1593,6 +1596,7 @@ class ServerArgs(DisaggArgsMixin):
             if arg.startswith("--"):
                 # For '--arg=value', this gets 'arg'; for '--arg', this also gets 'arg'.
                 arg_name = arg.split("=", 1)[0].replace("-", "_").lstrip("_")
+                arg_name = CLI_ARG_ALIASES.get(arg_name, arg_name)
                 provided_arg_names.add(arg_name)
 
         # Populate provided_args if the argument from the namespace was on the command line.
