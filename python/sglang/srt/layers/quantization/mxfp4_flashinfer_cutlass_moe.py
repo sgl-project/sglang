@@ -104,7 +104,7 @@ def _dequant_mxfp4(
     return (values * scale).to(torch.bfloat16)
 
 
-class DeepSeekW4A16MoEMethod:
+class Mxfp4FlashinferCutlassMoEMethod:
     """W4A16 MoE method for DeepSeek-family models with FP4 expert weights on SM90.
 
     Wraps Fp8MoEMethod for weight creation/loading, but overrides
