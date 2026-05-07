@@ -1,5 +1,6 @@
 import io
 import json
+import re
 import tempfile
 import unittest
 import uuid
@@ -10,6 +11,8 @@ from sglang.srt.utils.log_utils import create_log_targets, log_json
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=6, suite="stage-a-test-cpu")
+
+_LOG_PREFIX_RE = re.compile(r"^\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\] ")
 
 
 class TestLogUtils(unittest.TestCase):
@@ -23,7 +26,7 @@ class TestLogUtils(unittest.TestCase):
                     )
                     self.assertEqual(len(loggers), 1)
                     log_json(loggers[0], "test.event", {"key": "value"})
-                data = json.loads(buf.getvalue().strip())
+                data = _parse_log_json(buf.getvalue().strip())
                 self.assertIn("timestamp", data)
                 self.assertEqual(data["event"], "test.event")
                 self.assertEqual(data["key"], "value")
@@ -52,11 +55,16 @@ class TestLogUtils(unittest.TestCase):
                 self.assertEqual(len(loggers), 2)
                 log_json(loggers, "multi.event", {"x": 1})
             _flush_all(loggers)
-            stdout_data = json.loads(buf.getvalue().strip())
+            stdout_data = _parse_log_json(buf.getvalue().strip())
             file_data = _read_log_file(temp_dir)
             self.assertEqual(stdout_data["event"], "multi.event")
             self.assertEqual(file_data["event"], "multi.event")
             self.assertEqual(stdout_data["x"], file_data["x"])
+
+
+def _parse_log_json(line: str) -> dict:
+    """Strip the ``[YYYY-MM-DD HH:MM:SS] `` prefix added by the formatter."""
+    return json.loads(_LOG_PREFIX_RE.sub("", line))
 
 
 def _flush_all(loggers: list) -> None:
@@ -68,7 +76,7 @@ def _flush_all(loggers: list) -> None:
 def _read_log_file(temp_dir: str) -> dict:
     log_files = list(Path(temp_dir).glob("*.log"))
     assert len(log_files) == 1
-    return json.loads(log_files[0].read_text().strip())
+    return _parse_log_json(log_files[0].read_text().strip())
 
 
 if __name__ == "__main__":
