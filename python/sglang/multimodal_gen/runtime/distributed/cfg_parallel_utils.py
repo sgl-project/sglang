@@ -6,13 +6,19 @@ from typing import TYPE_CHECKING, Callable
 import torch
 
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
-from sglang.multimodal_gen.runtime.distributed.cfg_policy import _unwrap, _wrap
+from sglang.multimodal_gen.runtime.distributed.cfg_policy import (
+    _apply_cfg_postprocess,
+    _unwrap,
+    _wrap,
+)
 from sglang.multimodal_gen.runtime.distributed.communication_op import (
     cfg_model_parallel_all_gather,
+    cfg_model_parallel_all_reduce,
 )
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_classifier_free_guidance_rank,
     get_classifier_free_guidance_world_size,
+    get_cfg_group,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
@@ -127,6 +133,38 @@ def run_cfg_parallel(
         elems = tuple(all_slots[slot][ei][owner] for ei in range(n_elems))
         final.append(_unwrap(elems))
     return final
+
+
+def run_two_branch_cfg_parallel(
+    policy: "CFGPolicy",
+    predict_fn: Callable[["CFGBranch"], "torch.Tensor | tuple[torch.Tensor, ...]"],
+    cfg_scale: float,
+    batch,
+    pipeline_config,
+) -> "torch.Tensor | tuple[torch.Tensor, ...]":
+    """Run standard two-pass CFG with the old all-reduce combine.
+
+    This keeps the existing WAN baselines: it avoids gathering both branch
+    predictions, and it preserves the bf16 arithmetic order used before the
+    multi-branch CFG dispatcher was added.
+    """
+
+    cfg_rank = get_classifier_free_guidance_rank()
+    pred_t = _run(predict_fn, cfg_rank, policy.branches)
+
+    if cfg_rank == 0:
+        partial = tuple(cfg_scale * p for p in pred_t)
+        cond_t = pred_t
+    else:
+        partial = tuple((1 - cfg_scale) * p for p in pred_t)
+        cond_t = tuple(torch.empty_like(p) for p in pred_t)
+
+    results = [cfg_model_parallel_all_reduce(p) for p in partial]
+    cond_t = tuple(get_cfg_group().broadcast(p, src=0) for p in cond_t)
+    results[0] = _apply_cfg_postprocess(
+        results[0], cond_t[0], batch, pipeline_config
+    )
+    return _unwrap(tuple(results))
 
 
 def dispatch_branches(n_branches: int, n_ranks: int) -> list[list[int]]:

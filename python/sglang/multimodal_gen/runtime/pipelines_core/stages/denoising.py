@@ -46,6 +46,7 @@ from sglang.multimodal_gen.runtime.distributed import (
 )
 from sglang.multimodal_gen.runtime.distributed.cfg_parallel_utils import (
     run_cfg_parallel,
+    run_two_branch_cfg_parallel,
 )
 from sglang.multimodal_gen.runtime.distributed.cfg_policy import (
     CFGPolicy,
@@ -54,6 +55,9 @@ from sglang.multimodal_gen.runtime.distributed.cfg_policy import (
 )
 from sglang.multimodal_gen.runtime.distributed.communication_op import (
     sequence_model_parallel_all_gather,
+)
+from sglang.multimodal_gen.runtime.distributed.parallel_state import (
+    get_classifier_free_guidance_world_size,
 )
 from sglang.multimodal_gen.runtime.layers.attention.selector import get_attn_backend
 from sglang.multimodal_gen.runtime.layers.attention.STA_configuration import (
@@ -1394,6 +1398,17 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
             return _unwrap(pred_t)
 
         if server_args.enable_cfg_parallel:
+            if (
+                len(cfg_policy.branches) == 2
+                and get_classifier_free_guidance_world_size() == 2
+            ):
+                return run_two_branch_cfg_parallel(
+                    cfg_policy,
+                    predict_fn,
+                    cfg_scale,
+                    batch,
+                    server_args.pipeline_config,
+                )
             # perform cfg branches in parallel, following the cfg policy
             predictions = run_cfg_parallel(cfg_policy, predict_fn)
         else:
@@ -1401,7 +1416,11 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
             predictions = [predict_fn(branch) for branch in cfg_policy.branches]
 
         return cfg_policy.combine(
-            predictions, batch, cfg_scale, server_args.pipeline_config
+            predictions,
+            batch,
+            cfg_scale,
+            server_args.pipeline_config,
+            cfg_parallel=server_args.enable_cfg_parallel,
         )
 
     def _build_attn_metadata(

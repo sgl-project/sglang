@@ -69,6 +69,8 @@ class CFGPolicy:
         batch: "Req",
         cfg_scale: float,
         pipeline_config: Any,
+        *,
+        cfg_parallel: bool = False,
     ) -> torch.Tensor | tuple[torch.Tensor, ...]:
         """Combine branch predictions into the final noise estimate.
 
@@ -81,9 +83,16 @@ class CFGPolicy:
             return predictions[0]
         pos_t = _wrap(predictions[0])
         neg_t = _wrap(predictions[1])
-        results: list[torch.Tensor] = [
-            n + cfg_scale * (p - n) for p, n in zip(pos_t, neg_t)
-        ]
+        if cfg_parallel:
+            # Match the old CFG-parallel calculation: multiply the positive
+            # prediction by cfg_scale and the negative prediction by
+            # (1 - cfg_scale) before adding them. The serial CFG formula is
+            # mathematically equivalent, but bf16 rounding changes WAN outputs.
+            results = [
+                cfg_scale * p + (1 - cfg_scale) * n for p, n in zip(pos_t, neg_t)
+            ]
+        else:
+            results = [n + cfg_scale * (p - n) for p, n in zip(pos_t, neg_t)]
         results[0] = _apply_cfg_postprocess(
             results[0], pos_t[0], batch, pipeline_config
         )
