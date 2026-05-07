@@ -26,6 +26,9 @@ from sglang.srt.models.deepseek_common.utils import (
     _use_aiter_gfx95,
 )
 from sglang.srt.server_args import get_global_server_args
+from sglang.srt.state_capturer.indexer_topk import (
+    maybe_capture_indexer_topk,
+)
 from sglang.srt.utils import BumpAllocator
 
 if TYPE_CHECKING:
@@ -205,7 +208,11 @@ class DeepseekMLAForwardMixin:
                         layer_id=self.layer_id,
                     )
                 else:
-                    topk_indices = prev_topk_indices
+                    # skip_topk reuses prev layer's indices; mirror into this
+                    # layer's slot so the captured buffer matches what's used.
+                    topk_indices = maybe_capture_indexer_topk(
+                        self.layer_id, prev_topk_indices
+                    )
                 current_stream.wait_stream(self.alt_stream)
             else:
                 k_nope = k_nope.unsqueeze(1)
@@ -220,7 +227,9 @@ class DeepseekMLAForwardMixin:
                             layer_id=self.layer_id,
                         )
                     else:
-                        topk_indices = prev_topk_indices
+                        topk_indices = maybe_capture_indexer_topk(
+                            self.layer_id, prev_topk_indices
+                        )
         else:
             q = self.q_proj(hidden_states)[0].view(
                 -1, self.num_local_heads, self.qk_head_dim
