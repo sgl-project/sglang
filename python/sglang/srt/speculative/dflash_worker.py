@@ -151,10 +151,9 @@ class DFlashWorker:
             dp_rank=dp_rank,
             nccl_port=nccl_port,
             is_draft_worker=True,
-            req_to_token_pool=shared_req_to_token_pool,
-            token_to_kv_pool_allocator=target_token_to_kv_pool_allocator,
-            memory_pool_config=target_worker.model_runner.memory_pool_config,
         )
+        self._shared_req_to_token_pool = shared_req_to_token_pool
+        self._target_token_to_kv_pool_allocator = target_token_to_kv_pool_allocator
         set_global_server_args_for_scheduler(saved_server_args)
         self.draft_model_runner = self.draft_worker.model_runner
         self.draft_model = self.draft_model_runner.model
@@ -231,6 +230,22 @@ class DFlashWorker:
         self._fused_kv_helper: Optional[object] = None
         if self._use_fused_kv_materialize:
             self._init_fused_kv_helper()
+
+    def alloc_memory_pool(
+        self,
+        memory_pool_config=None,
+        req_to_token_pool=None,
+        token_to_kv_pool_allocator=None,
+    ):
+        self.draft_worker.alloc_memory_pool(
+            memory_pool_config=memory_pool_config,
+            req_to_token_pool=req_to_token_pool or self._shared_req_to_token_pool,
+            token_to_kv_pool_allocator=token_to_kv_pool_allocator
+            or self._target_token_to_kv_pool_allocator,
+        )
+
+    def init_backends(self):
+        self.draft_worker.init_backends()
 
     def _init_fused_kv_helper(self) -> None:
         """Initialize the fused KV materialization helper with pre-stacked weights."""

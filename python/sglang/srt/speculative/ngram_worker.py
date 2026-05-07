@@ -25,6 +25,13 @@ USE_FULL_MASK = True
 
 
 class NGRAMWorker:
+    def alloc_memory_pool(self, **kwargs):
+        self.max_batch_size = self.model_runner.max_running_requests
+        self._init_preallocated_tensors()
+
+    def init_backends(self):
+        pass
+
     def __init__(
         self,
         server_args: ServerArgs,
@@ -44,10 +51,7 @@ class NGRAMWorker:
         self.draft_token_num: int = server_args.speculative_num_draft_tokens
         self.max_trie_depth: int = server_args.speculative_ngram_max_trie_depth
 
-        self.max_batch_size = target_worker.max_running_requests
         self.device = f"cuda:{gpu_id}" if gpu_id >= 0 else "cuda"
-
-        self._init_preallocated_tensors()
 
         self.ngram_corpus = NgramCorpus(
             min_bfs_breadth=server_args.speculative_ngram_min_bfs_breadth,
