@@ -121,18 +121,20 @@ class TestServerArgsPathExpansion(unittest.TestCase):
             server_args.component_attention_backends, {"text_encoder": "torch_sdpa"}
         )
 
-    def test_layerwise_offload_module_groups_imply_layerwise(self):
+    def test_layerwise_offload_components_imply_layerwise(self):
         args = self._from_dict_without_model_resolution(
             {
                 "model_path": "/data/my-model",
-                "layerwise_offload_module_groups": ["encoder", "dit"],
+                "layerwise_offload_components": ["text_encoder", "transformer"],
             }
         )
 
         self.assertTrue(args.dit_layerwise_offload)
-        self.assertEqual(args.layerwise_offload_module_groups, ["encoder", "dit"])
+        self.assertEqual(
+            args.layerwise_offload_components, ["text_encoder", "transformer"]
+        )
 
-    def test_dit_layerwise_offload_defaults_to_dit_group(self):
+    def test_dit_layerwise_offload_uses_legacy_default_components(self):
         args = self._from_dict_without_model_resolution(
             {
                 "model_path": "/data/my-model",
@@ -141,26 +143,29 @@ class TestServerArgsPathExpansion(unittest.TestCase):
         )
 
         self.assertTrue(args.dit_layerwise_offload)
-        self.assertEqual(args.layerwise_offload_module_groups, ["dit"])
+        self.assertIsNone(args.layerwise_offload_components)
 
-    def test_invalid_layerwise_offload_module_groups_raise(self):
-        with self.assertRaises(ValueError):
-            self._from_dict_without_model_resolution(
-                {
-                    "model_path": "/data/my-model",
-                    "layerwise_offload_module_groups": ["bad"],
-                }
-            )
+    def test_layerwise_offload_components_normalize_commas(self):
+        args = self._from_dict_without_model_resolution(
+            {
+                "model_path": "/data/my-model",
+                "layerwise_offload_components": ["text-encoder,transformer"],
+            }
+        )
 
-    def test_layerwise_offload_module_groups_cli_args(self):
+        self.assertEqual(
+            args.layerwise_offload_components, ["text_encoder", "transformer"]
+        )
+
+    def test_layerwise_offload_components_cli_args(self):
         parser = FlexibleArgumentParser()
         ServerArgs.add_cli_args(parser)
         argv = [
             "--model-path",
             "/fake",
-            "--layerwise-offload-module-groups",
-            "dit",
-            "encoder",
+            "--layerwise-offload-components",
+            "transformer",
+            "text_encoder",
         ]
 
         with patch.object(sys, "argv", ["sglang"] + argv):
@@ -172,7 +177,7 @@ class TestServerArgsPathExpansion(unittest.TestCase):
 
         self.assertTrue(server_args.dit_layerwise_offload)
         self.assertEqual(
-            server_args.layerwise_offload_module_groups, ["dit", "encoder"]
+            server_args.layerwise_offload_components, ["transformer", "text_encoder"]
         )
 
 

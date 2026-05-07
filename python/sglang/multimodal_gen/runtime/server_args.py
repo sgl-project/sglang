@@ -37,10 +37,8 @@ from sglang.multimodal_gen.runtime.layers.quantization.configs.nunchaku_config i
     NunchakuConfig,
 )
 from sglang.multimodal_gen.runtime.loader.utils import BYTES_PER_GB
-from sglang.multimodal_gen.runtime.managers.layerwise_offload_module_groups import (
-    DEFAULT_LAYERWISE_OFFLOAD_MODULE_GROUPS,
-    LAYERWISE_OFFLOAD_MODULE_GROUP_CHOICES,
-    normalize_layerwise_offload_module_groups,
+from sglang.multimodal_gen.runtime.managers.layerwise_offload_components import (
+    normalize_layerwise_offload_components,
 )
 from sglang.multimodal_gen.runtime.platforms import (
     AttentionBackendEnum,
@@ -197,7 +195,7 @@ class ServerArgs(DisaggArgsMixin):
     dit_cpu_offload: bool | None = None
     dit_layerwise_offload: bool | None = None
     dit_layerwise_offload_auto_enabled: bool = False
-    layerwise_offload_module_groups: list[str] | None = None
+    layerwise_offload_components: list[str] | None = None
     dit_offload_prefetch_size: float = 0.0
     text_encoder_cpu_offload: bool | None = None
     image_encoder_cpu_offload: bool | None = None
@@ -331,7 +329,7 @@ class ServerArgs(DisaggArgsMixin):
         self._adjust_parallelism()
         self._adjust_attention_backend()
         self._adjust_platform_specific()
-        self._adjust_layerwise_offload_module_groups()
+        self._adjust_layerwise_offload_components()
         self._adjust_autocast()
         self.adjust_pipeline_config()
 
@@ -808,25 +806,20 @@ class ServerArgs(DisaggArgsMixin):
                     self.dit_layerwise_offload = True
                     self.dit_layerwise_offload_auto_enabled = True
 
-    def _adjust_layerwise_offload_module_groups(self):
-        module_groups = normalize_layerwise_offload_module_groups(
-            self.layerwise_offload_module_groups
+    def _adjust_layerwise_offload_components(self):
+        component_names = normalize_layerwise_offload_components(
+            self.layerwise_offload_components
         )
-        if module_groups is not None:
+        if component_names is not None:
             if self.dit_layerwise_offload is False:
                 raise ValueError(
-                    "--layerwise-offload-module-groups cannot be used when "
+                    "--layerwise-offload-components cannot be used when "
                     "--dit-layerwise-offload is false."
                 )
             self.dit_layerwise_offload = True
             self.dit_layerwise_offload_auto_enabled = False
-            self.layerwise_offload_module_groups = module_groups
+            self.layerwise_offload_components = component_names
             return
-
-        if self.dit_layerwise_offload:
-            self.layerwise_offload_module_groups = list(
-                DEFAULT_LAYERWISE_OFFLOAD_MODULE_GROUPS
-            )
 
     def _adjust_autocast(self):
         if self.disable_autocast is None:
@@ -1093,21 +1086,21 @@ class ServerArgs(DisaggArgsMixin):
             action=StoreBoolean,
             default=ServerArgs.dit_layerwise_offload,
             help="Enable layerwise CPU offload with async H2D prefetch overlap. "
-            "The legacy option name is kept for compatibility; without --layerwise-offload-module-groups, "
-            "it only enables the DiT module group. Cannot be used together with cache-dit "
+            "The legacy option name is kept for compatibility; without --layerwise-offload-components, "
+            "it only enables the legacy default DiT components. Cannot be used together with cache-dit "
             "(SGLANG_CACHE_DIT_ENABLED), dit_cpu_offload, or use_fsdp_inference.",
         )
         parser.add_argument(
-            "--layerwise-offload-module-groups",
+            "--layerwise-offload-components",
             "--layerwise-offload-modules",
             type=str,
             nargs="+",
-            default=ServerArgs.layerwise_offload_module_groups,
-            help="Restrict layerwise offload to module groups. Supported values: "
-            f"{', '.join(LAYERWISE_OFFLOAD_MODULE_GROUP_CHOICES)}. "
+            default=ServerArgs.layerwise_offload_components,
+            help="Restrict layerwise offload to pipeline component names. "
+            "Use all to select every layerwise-offloadable component. "
             "The --layerwise-offload-modules alias is accepted. "
             "This option implies --dit-layerwise-offload true. Example: "
-            "--layerwise-offload-module-groups dit encoder.",
+            "--layerwise-offload-components transformer text_encoder.",
         )
         parser.add_argument(
             "--dit-offload-prefetch-size",

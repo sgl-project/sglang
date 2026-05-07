@@ -165,7 +165,7 @@ class GPUWorker:
             configure_layerwise_offload_modules(
                 self.pipeline.modules,
                 self.server_args,
-                module_groups=self.server_args.layerwise_offload_module_groups,
+                component_names=self.server_args.layerwise_offload_components,
             )
 
         logger.info(

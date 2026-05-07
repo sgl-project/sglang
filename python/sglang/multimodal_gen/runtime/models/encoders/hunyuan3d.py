@@ -33,7 +33,7 @@ def get_1d_sincos_pos_embed_from_grid(embed_dim, pos):
 
 
 class ImageEncoder(nn.Module, LayerwiseOffloadableModuleMixin):
-    layerwise_offload_module_group = "encoder"
+    layerwise_offload_default_enabled = False
     layer_names = [
         "model.encoder.layer",
         "model.vision_model.encoder.layers",

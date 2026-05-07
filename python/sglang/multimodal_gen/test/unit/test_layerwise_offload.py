@@ -85,7 +85,7 @@ class _NestedDummyModel(torch.nn.Module, LayerwiseOffloadableModuleMixin):
 
 
 class _NestedEncoderDummyModel(_NestedDummyModel):
-    layerwise_offload_module_group = "encoder"
+    layerwise_offload_default_enabled = False
 
 
 class _LayerwiseComponent(torch.nn.Module, LayerwiseOffloadableModuleMixin):
@@ -176,7 +176,7 @@ def test_layerwise_capability_selects_layerwise_strategy_for_any_component():
     assert isinstance(strategy, LayerwiseOffloadStrategy)
 
 
-def test_layerwise_configuration_scans_all_pipeline_components(monkeypatch):
+def test_layerwise_configuration_uses_legacy_default_components(monkeypatch):
     monkeypatch.setattr(
         layerwise_offload_mod.torch, "get_device_module", lambda: _FakeDeviceModule
     )
@@ -194,7 +194,7 @@ def test_layerwise_configuration_scans_all_pipeline_components(monkeypatch):
     assert is_layerwise_offloaded_module(layerwise_module)
 
 
-def test_layerwise_configuration_filters_by_module_group(monkeypatch):
+def test_layerwise_configuration_filters_by_component_name(monkeypatch):
     monkeypatch.setattr(
         layerwise_offload_mod.torch, "get_device_module", lambda: _FakeDeviceModule
     )
@@ -209,13 +209,35 @@ def test_layerwise_configuration_filters_by_module_group(monkeypatch):
     }
 
     configured = configure_layerwise_offload_modules(
-        modules, _server_args(), module_groups=["encoder"]
+        modules, _server_args(), component_names=["custom_encoder_name"]
     )
 
     assert configured == ["custom_encoder_name"]
     assert is_layerwise_offloaded_module(text_encoder)
     assert not is_layerwise_offloaded_module(transformer)
     assert not is_layerwise_offloaded_module(vae)
+
+
+def test_layerwise_configuration_all_selects_every_capable_component(monkeypatch):
+    monkeypatch.setattr(
+        layerwise_offload_mod.torch, "get_device_module", lambda: _FakeDeviceModule
+    )
+    monkeypatch.setattr(layerwise_offload_mod.current_platform, "device_type", "cpu")
+    text_encoder = _NestedEncoderDummyModel()
+    transformer = _NestedDummyModel()
+    modules = {
+        "custom_encoder_name": text_encoder,
+        "custom_transformer_name": transformer,
+        "scheduler": object(),
+    }
+
+    configured = configure_layerwise_offload_modules(
+        modules, _server_args(), component_names=["all"]
+    )
+
+    assert configured == ["custom_encoder_name", "custom_transformer_name"]
+    assert is_layerwise_offloaded_module(text_encoder)
+    assert is_layerwise_offloaded_module(transformer)
 
 
 def test_component_cpu_offload_strategy_remains_flag_driven():

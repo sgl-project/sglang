@@ -513,8 +513,8 @@ class LayerwiseOffloadManager:
 class LayerwiseOffloadableModuleMixin:
     """A mixin that registers forward hooks to enable layerwise offload."""
 
-    # Group used by --layerwise-offload-module-groups; DiT is the legacy default.
-    layerwise_offload_module_group: str = "dit"
+    # Legacy --dit-layerwise-offload configures these modules when no component is named.
+    layerwise_offload_default_enabled: bool = True
     # The list of names of this module's layer/block ModuleList or Sequential attributes.
     layer_names: List[str] = []
     layerwise_offload_managers: list[LayerwiseOffloadManager] = []
@@ -628,19 +628,47 @@ def is_layerwise_offloaded_module(module: torch.nn.Module) -> bool:
 def configure_layerwise_offload_modules(
     modules: Mapping[str, object],
     server_args: ServerArgs,
-    module_groups: Sequence[str] | None = None,
+    component_names: Sequence[str] | None = None,
+    warn_missing: bool = True,
 ) -> list[str]:
-    """Configure every registered pipeline component that exposes layerwise offload."""
+    """Configure registered pipeline components that expose layerwise offload."""
     configured_component_names: list[str] = []
     configured_module_ids: set[int] = set()
+    selected_component_names = (
+        set(component_names) if component_names is not None else None
+    )
+    select_all = (
+        selected_component_names is not None and "all" in selected_component_names
+    )
+
+    if warn_missing and selected_component_names is not None and not select_all:
+        missing_component_names = selected_component_names - set(modules)
+        if missing_component_names:
+            logger.warning(
+                "Layerwise offload components are not currently loaded: %s. "
+                "Available pipeline components: %s",
+                sorted(missing_component_names),
+                sorted(modules),
+            )
+
+        unsupported_component_names = [
+            component_name
+            for component_name in selected_component_names & set(modules)
+            if not isinstance(modules[component_name], LayerwiseOffloadableModuleMixin)
+        ]
+        if unsupported_component_names:
+            logger.warning(
+                "Layerwise offload components do not support layerwise offload: %s",
+                sorted(unsupported_component_names),
+            )
+
     for component_name, module in modules.items():
         if not isinstance(module, LayerwiseOffloadableModuleMixin):
             continue
-        if (
-            module_groups is not None
-            and "all" not in module_groups
-            and module.layerwise_offload_module_group not in module_groups
-        ):
+        if selected_component_names is None:
+            if not module.layerwise_offload_default_enabled:
+                continue
+        elif not select_all and component_name not in selected_component_names:
             continue
         if id(module) in configured_module_ids:
             continue
