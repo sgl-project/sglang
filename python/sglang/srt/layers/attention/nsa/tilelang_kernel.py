@@ -2453,7 +2453,7 @@ def dpsk_v4_fp8_attention_fwd(
     has_extra = extra_k_cache is not None
     topk2 = extra_indices_in_kvcache.shape[-1] if has_extra else 0
     if _is_gfx95_supported:
-        block_I, threads, num_stages, block_per_cu, cu = 32, 512, 0, 1, 256
+        block_I, threads, num_stages, block_per_cu, cu = 64, 512, 0, 1, 256
         # prevent register spills
         if seq * (topk_1 // block_I + topk2 // block_I) <= cu * block_per_cu // 2:
             block_I = 32
