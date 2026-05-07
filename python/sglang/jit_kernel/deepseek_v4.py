@@ -418,6 +418,9 @@ def hash_topk(
         (num_tokens, topk_fused), dtype=torch.float32, device=router_logits.device
     )
     module = _jit_hash_topk_module()
+    # tvm_ffi hash_topk kernel expects input_ids as int64
+    if input_ids.dtype != torch.int64:
+        input_ids = input_ids.to(torch.int64)
     module.hash_topk(
         router_logits,
         input_ids,

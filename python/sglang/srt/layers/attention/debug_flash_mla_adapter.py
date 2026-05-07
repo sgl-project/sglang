@@ -16,11 +16,13 @@ SWA KV cache layout per page (page_size=256 tokens, dtype=float8_e4m3fn/uint8):
 """
 
 import importlib.util
+import os
 
 import torch
 
 _SM120 = None
 _use_triton_gather = None
+_use_triton_flashmla = None
 
 
 def _should_use_triton_gather():
@@ -34,6 +36,20 @@ def _should_use_triton_gather():
             is not None
         )
     return _use_triton_gather
+
+
+def _should_use_triton_flashmla():
+    """Check if Triton tiled FlashMLA kernel should be used on SM120.
+
+    Controlled by SGLANG_SM120_TRITON_FLASHMLA=1 env var for A/B testing.
+    """
+    global _use_triton_flashmla
+    if _use_triton_flashmla is None:
+        _use_triton_flashmla = (
+            _is_sm120()
+            and os.environ.get("SGLANG_SM120_TRITON_FLASHMLA", "0") == "1"
+        )
+    return _use_triton_flashmla
 
 
 # SWA KV cache format constants
@@ -54,94 +70,68 @@ def _is_sm120():
 
 
 def _gather_and_dequant_kv_vectorized(k_cache, indices, topk_length=None):
-    """Vectorized gather + dequantize KV tokens from paged cache.
+    """Memory-efficient gather + dequantize KV tokens from paged cache.
 
-    Single-pass batch gather: fewer kernel launches than tile-by-tile.
-    Skips .contiguous() when cache is already contiguous.
+    Processes tokens in chunks to limit peak memory usage.
     """
     num_pages = k_cache.shape[0]
-    page_size = k_cache.shape[1]  # 256
-    kv_dim = k_cache.shape[3]  # 584
+    page_size = k_cache.shape[1]
+    kv_dim = k_cache.shape[3]
 
     batch = indices.shape[0]
     topk = indices.shape[-1]
 
-    idx_flat = indices.reshape(batch, -1)  # (batch, topk)
-
-    # Clamp invalid indices
+    idx_flat = indices.reshape(batch, -1)
     total_tokens = num_pages * page_size
     valid_mask = (idx_flat >= 0) & (idx_flat < total_tokens)
     idx_safe = idx_flat.clamp(0, total_tokens - 1)
 
-    # Map flat index to (page_idx, token_in_page)
-    page_idx = idx_safe // page_size  # (batch, topk)
-    token_in_page = idx_safe % page_size  # (batch, topk)
+    page_idx = idx_safe // page_size
+    token_in_page = idx_safe % page_size
 
-    # Assume contiguous for CUDA graph compatibility (always true in decode)
     raw_buf = k_cache.view(torch.uint8).reshape(-1)
-
     buf_len = raw_buf.shape[0]
+    bytes_per_page = page_size * kv_dim
+    page_offsets = page_idx * bytes_per_page
 
-    # Byte offsets for each page (int32 arithmetic, implicit int64 on indexing)
-    bytes_per_page = page_size * kv_dim  # 256 * 584 = 149504
-    page_offsets = page_idx * bytes_per_page  # (batch, topk) int32
+    # Pre-allocate output directly as bf16 to avoid intermediate fp32
+    result = torch.zeros(batch, topk, DIM_NOPE + DIM_ROPE, dtype=torch.bfloat16, device=k_cache.device)
 
-    # === Section A: NoPE FP8 + RoPE BF16 ===
-    nope_starts = page_offsets + token_in_page * BYTES_NOPE_ROPE  # (batch, topk) int32
-    rope_starts = nope_starts + DIM_NOPE  # (batch, topk)
+    # Compute all offsets once
+    nope_starts = page_offsets + token_in_page * BYTES_NOPE_ROPE
+    scale_section_offsets = page_offsets + page_size * BYTES_NOPE_ROPE
+    scale_starts = scale_section_offsets + token_in_page * BYTES_SCALE
 
-    # === Section B: UE8M0 Scales ===
-    scale_section_offsets = (
-        page_offsets + page_size * BYTES_NOPE_ROPE
-    )  # page_size * 576
-    scale_starts = scale_section_offsets + token_in_page * BYTES_SCALE  # (batch, topk)
-
-    # Gather all NoPE bytes: (batch, topk, 448) uint8 - single batched gather
-    nope_offsets = nope_starts.unsqueeze(-1) + torch.arange(
-        DIM_NOPE, device=raw_buf.device
-    )
+    # Gather NoPE FP8 + dequant in-place
+    nope_offsets = nope_starts.unsqueeze(-1) + torch.arange(DIM_NOPE, device=raw_buf.device)
     nope_offsets_clamped = nope_offsets.clamp(0, buf_len - 1)
-    nope_bytes = raw_buf[nope_offsets_clamped.reshape(-1)].reshape(
-        batch, topk, DIM_NOPE
-    )
-    nope_fp8 = nope_bytes.view(torch.float8_e4m3fn).to(torch.float32)
+    nope_bytes = raw_buf[nope_offsets_clamped.reshape(-1)].reshape(batch, topk, DIM_NOPE)
 
-    # Gather all RoPE bytes: (batch, topk, 128) uint8 -> (batch, topk, 64) bf16
-    rope_byte_dim = DIM_ROPE * 2  # 128 bytes = 64 bf16 values
-    rope_offsets = rope_starts.unsqueeze(-1) + torch.arange(
-        rope_byte_dim, device=raw_buf.device
-    )
-    rope_offsets_clamped = rope_offsets.clamp(0, buf_len - 1)
-    rope_bytes = raw_buf[rope_offsets_clamped.reshape(-1)].reshape(
-        batch, topk, rope_byte_dim
-    )
-    rope_bf16 = rope_bytes.view(torch.bfloat16)
-
-    # Gather all scale bytes: (batch, topk, 7) uint8 - single batched gather
-    scale_offsets = scale_starts.unsqueeze(-1) + torch.arange(
-        NUM_TILES, device=raw_buf.device
-    )
+    # Gather scales
+    scale_offsets = scale_starts.unsqueeze(-1) + torch.arange(NUM_TILES, device=raw_buf.device)
     scale_offsets_clamped = scale_offsets.clamp(0, buf_len - 1)
-    scale_bytes = raw_buf[scale_offsets_clamped.reshape(-1)].reshape(
-        batch, topk, NUM_TILES
-    )
+    scale_bytes = raw_buf[scale_offsets_clamped.reshape(-1)].reshape(batch, topk, NUM_TILES)
 
-    # Dequantize UE8M0 scales: scale = pow(2, uint8_value - 127)
-    scale_fp32 = torch.pow(
-        2.0, scale_bytes.to(torch.float32) - 127.0
-    )  # (batch, topk, 7)
+    # Dequant: directly to bf16 to save memory (avoid large fp32 intermediate)
+    nope_fp8 = nope_bytes.view(torch.float8_e4m3fn)
+    scale_fp32 = torch.pow(2.0, scale_bytes.float() - 127.0)
+    # Dequant in tiled fashion and store directly to output
+    nope_fp32 = nope_fp8.reshape(batch, topk, NUM_TILES, TILE_SIZE).float() * scale_fp32.unsqueeze(-1)
+    result[:, :, :DIM_NOPE] = nope_fp32.reshape(batch, topk, DIM_NOPE).to(torch.bfloat16)
 
-    # Dequantize NoPE: fp32_value = fp8_value * scale - single batched multiply
-    nope_fp32 = nope_fp8.reshape(
-        batch, topk, NUM_TILES, TILE_SIZE
-    ) * scale_fp32.unsqueeze(-1)
-    nope_bf16 = nope_fp32.reshape(batch, topk, DIM_NOPE).to(torch.bfloat16)
+    # Free large intermediates
+    del nope_bytes, nope_fp8, scale_bytes, scale_fp32, nope_fp32
+    del nope_offsets, nope_offsets_clamped, scale_offsets, scale_offsets_clamped
 
-    # Concatenate NoPE + RoPE -> (batch, topk, 512)
-    result = torch.cat([nope_bf16, rope_bf16], dim=-1)
+    # Gather RoPE BF16 - much smaller (128 bytes per token)
+    rope_starts = nope_starts + DIM_NOPE
+    rope_byte_dim = DIM_ROPE * 2
+    rope_offsets = rope_starts.unsqueeze(-1) + torch.arange(rope_byte_dim, device=raw_buf.device)
+    rope_offsets_clamped = rope_offsets.clamp(0, buf_len - 1)
+    rope_bytes = raw_buf[rope_offsets_clamped.reshape(-1)].reshape(batch, topk, rope_byte_dim)
+    result[:, :, DIM_NOPE:] = rope_bytes.view(torch.bfloat16)
 
-    # Zero out invalid entries
-    # Zero invalid entries using torch.where (CUDA graph compatible)
+    # Zero invalid entries
     result = torch.where(valid_mask.unsqueeze(-1), result, torch.zeros_like(result))
 
     return result
@@ -164,8 +154,9 @@ def _flash_mla_with_kvcache_torch(
 ):
     """Pure PyTorch fallback for flash_mla sparse decode on SM120.
 
-    Optimized: single combined Q@K^T bmm instead of separate NoPE/RoPE einsums,
-    reducing kernel launches from 3 to 1 for score computation.
+    When SGLANG_SM120_TRITON_FLASHMLA=1, uses the tiled Triton kernel
+    which fuses gather + dequant + QK + softmax + V into a single kernel.
+    Falls back to the vectorized PyTorch path otherwise.
     """
     if softmax_scale is None:
         softmax_scale = q.shape[-1] ** (-0.5)
@@ -178,8 +169,26 @@ def _flash_mla_with_kvcache_torch(
             "Dense decode path not implemented for SM120 fallback"
         )
 
-    # Gather and dequantize primary KV tokens
-    # Use Triton fused kernel on SM120 to reduce kernel launch overhead
+    # Fast path: Triton tiled sparse decode (fuses all ops into one kernel)
+    if _should_use_triton_flashmla():
+        from sglang.srt.layers.attention.flash_mla_sm120_triton import (
+            flash_mla_sparse_decode_triton,
+        )
+
+        return flash_mla_sparse_decode_triton(
+            q=q,
+            k_cache=k_cache,
+            indices=indices,
+            topk_length=topk_length,
+            attn_sink=attn_sink,
+            head_dim_v=head_dim_v,
+            softmax_scale=softmax_scale,
+            extra_k_cache=extra_k_cache,
+            extra_indices=extra_indices_in_kvcache,
+            extra_topk_length=extra_topk_length,
+        )
+
+    # Slow path: vectorized PyTorch fallback
     if _is_sm120() and _should_use_triton_gather():
         from sglang.srt.layers.attention.fused_kv_gather_triton import (
             fused_gather_dequant,
@@ -189,31 +198,20 @@ def _flash_mla_with_kvcache_torch(
     else:
         k_all = _gather_and_dequant_kv_vectorized(k_cache, indices, topk_length)
 
-    # Gather extra KV tokens if present
     if extra_k_cache is not None and extra_indices_in_kvcache is not None:
-        if _is_sm120() and _should_use_triton_gather():
-            from sglang.srt.layers.attention.fused_kv_gather_triton import (
-                fused_gather_dequant,
-            )
-
-            extra_k = fused_gather_dequant(extra_k_cache, extra_indices_in_kvcache)
-        else:
-            extra_k = _gather_and_dequant_kv_vectorized(
-                extra_k_cache, extra_indices_in_kvcache, extra_topk_length
-            )
+        extra_k = _gather_and_dequant_kv_vectorized(
+            extra_k_cache, extra_indices_in_kvcache, extra_topk_length
+        )
         k_all = torch.cat([k_all, extra_k], dim=1)
 
     num_kv_tokens = k_all.shape[1]
 
-    # MLA: V = K (full 512-dim)
     v = k_all  # (batch, num_kv, 512)
 
-    # Fused attention scores: single full-dim einsum (saves 1 kernel launch per layer)
     q_full = q.squeeze(1)  # (batch, num_heads, 512)
     scores = torch.einsum("bhd,bkd->bhk", q_full, k_all) * softmax_scale
     scores_4d = scores.unsqueeze(1)  # (batch, 1, num_heads, num_kv)
 
-    # Causal mask via topk_length
     if topk_length is not None:
         total_kv = num_kv_tokens
         primary_topk = indices.shape[-1]
@@ -232,14 +230,11 @@ def _flash_mla_with_kvcache_torch(
             ~valid_mask.unsqueeze(1).unsqueeze(2), float("-inf")
         )
 
-    # Softmax + output
     attn_weights = torch.softmax(scores_4d.float(), dim=-1)
     attn_weights = attn_weights.nan_to_num(0.0)
 
-    # attn_weights: (batch, 1, num_heads, num_kv) -> (batch, num_heads, num_kv)
     attn_3d = attn_weights.squeeze(1).reshape(batch, num_heads_q, num_kv_tokens)
 
-    # Output: attn_weights @ V
     o = torch.einsum("bhk,bkd->bhd", attn_3d, v.to(attn_3d.dtype))
     o = o.unsqueeze(1)  # (batch, 1, num_heads, 512)
 

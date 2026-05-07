@@ -990,12 +990,24 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
         # Try to import fused FP4 GEMV kernels (Triton-based)
         use_fused_gemv = False
+        use_mxfp4_triton = False
         try:
             from sglang.srt.layers.quantization.fp4_gemv_triton import (
                 fp4_gemv_batched_multi_input,
             )
 
             use_fused_gemv = True
+        except Exception:
+            pass
+
+        # Try Triton MXFP4 MoE kernel (replaces Python for-loop for prefill)
+        try:
+            import os
+            if os.environ.get("SGLANG_SM120_TRITON_MOE", "0") == "1":
+                from sglang.srt.layers.moe.fused_moe_triton.mxfp4_moe_sm120_triton import (
+                    mxfp4_moe_forward_triton,
+                )
+                use_mxfp4_triton = True
         except Exception:
             pass
 
@@ -1047,7 +1059,22 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
             return StandardCombineInput(hidden_states=output)
 
-        # Path B: Dequant + BF16 matmul for prefill (large batch, no CUDA graph)
+        # Path B1: Triton fused MXFP4 MoE (graph-safe, no Python loop)
+        if use_mxfp4_triton:
+            output = mxfp4_moe_forward_triton(
+                hidden_states=hidden_states,
+                w13_packed=w13_weight,
+                w2_packed=w2_weight,
+                w13_scale=w13_weight_scale_inv,
+                w2_scale=w2_weight_scale_inv,
+                topk_ids=topk_ids,
+                topk_weights=topk_weights,
+                hidden_size=hidden_size,
+                intermediate_size=intermediate_half,
+            )
+            return StandardCombineInput(hidden_states=output)
+
+        # Path B2: Dequant + BF16 matmul for prefill (large batch, no CUDA graph)
         # This is faster for large batches but NOT CUDA-graph compatible.
         output = torch.zeros(
             num_tokens,
