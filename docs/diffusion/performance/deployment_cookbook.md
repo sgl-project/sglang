@@ -6,31 +6,37 @@ This page gives practical defaults for choosing CPU offload, FSDP, CFG paralleli
 
 Use the simplest setting that fits your memory target:
 
-| Goal | Recommended setting |
-|---|---|
-| Fastest single-GPU run when the model fits | Disable CPU offload and do not use FSDP. |
-| Lower single-GPU memory usage | Use component CPU offload, or layerwise DiT offload for supported Wan/MOVA models. |
-| Faster multi-GPU Qwen/Wan CFG generation | Use FSDP with CFG parallelism and disable CPU offload. |
-| Sequence length or video-shape scaling | Use SP/Ulysses/Ring when the model benefits from sequence parallelism. |
-| TP compatibility or encoder-heavy paths | Set TP explicitly; do not treat TP as the default latency optimization. |
+| Goal                                       | Recommended setting                                                                |
+|--------------------------------------------|------------------------------------------------------------------------------------|
+| Fastest single-GPU run when the model fits | Disable CPU offload and do not use FSDP.                                           |
+| Lower single-GPU memory usage              | Use component CPU offload, or layerwise DiT offload for supported Wan/MOVA models. |
+| Faster multi-GPU Qwen/Wan CFG generation   | Use FSDP with CFG parallelism and disable CPU offload.                             |
+| Sequence length or video-shape scaling     | Use SP/Ulysses/Ring when the model benefits from sequence parallelism.             |
+| TP compatibility or encoder-heavy paths    | Set TP explicitly; do not treat TP as the default latency optimization.            |
 
-Base the decision on available memory on the selected GPU(s), not only the device's total capacity. For multi-GPU runs, the least-free selected GPU is the bottleneck. A busy 80GiB GPU can behave like a much smaller GPU.
+Base the decision on available memory on the selected GPU(s).
 
-FSDP shards DiT weights across multiple GPUs. It is not useful for keeping a single-GPU deployment on one GPU; for that case use CPU offload.
+- For multi-GPU deployment: the least-free selected GPU is the bottleneck. A busy 80GiB GPU can behave like a much smaller GPU.
+- For single-GPU deployment: FSDP shards DiT weights across multiple GPUs. It is not useful for keeping a single-GPU deployment on one GPU; for that case use CPU offload.
 
 ## Performance Modes
 
 `--performance-mode` applies safe presets without overriding explicit offload, FSDP, or parallelism flags. `--mode` is a short alias.
 
-| Mode | Meaning |
-|---|---|
-| `auto` | Default. Applies only high-confidence defaults, currently multi-GPU Qwen/Wan CFG models. |
-| `throughput` | Favors GPU-resident execution. Disables CPU offload when unset; may OOM. Alias: `aggressive`. |
-| `memory` | Favors lower GPU memory. Uses component offload, or Wan/MOVA layerwise DiT offload when supported. Alias: `conservative`. |
-| `balanced` | Keeps existing single-GPU defaults; on validated multi-GPU Qwen/Wan CFG models prefers FSDP+CFG. Alias: `balance`. |
+| Mode       | Meaning                                                                                                                   |
+|------------|---------------------------------------------------------------------------------------------------------------------------|
+| `auto`     | Default. Applies only high-confidence defaults, currently multi-GPU Qwen/Wan CFG models.                                  |
+| `speed`    | Favors GPU-resident execution for lower latency and higher throughput. Disables CPU offload when unset; may OOM.           |
+| `memory`   | Favors lower GPU memory. Uses component offload, or Wan/MOVA layerwise DiT offload when supported.                         |
+| `balanced` | Keeps existing single-GPU defaults; on validated multi-GPU Qwen/Wan CFG models prefers FSDP+CFG.                          |
 
-`auto` and `balanced` check selected GPU memory before applying GPU-resident FSDP+CFG defaults. In multi-GPU runs they use the least available memory across selected GPUs. `throughput` intentionally does not check memory; it is the mode for users who prefer speed and accept OOM risk.
+Aliases: `throughput` and `aggressive` map to `speed`; `conservative` maps to `memory`; `balance` maps to `balanced`.
 
+`auto` and `balanced` check selected GPU memory before applying GPU-resident FSDP+CFG defaults. In multi-GPU runs they use the least available memory across selected GPUs. `speed` intentionally does not check memory; it is the mode for users who prefer latency/throughput and accept OOM risk.
+
+The modes tune residency for native pipeline components declared to the component residency manager. Today this covers the major DiT, text/image encoder, VAE, vocoder, and upsampler components; DiT can use layerwise offload when supported, while text encoders use either resident execution or component CPU offload. Do not assume text-encoder layerwise offload unless a model implements and validates it.
+
+NOTE:
 The preset is intentionally coarse. A future continuous value such as `0.0` to `1.0` could express the speed-memory tradeoff more precisely, but it would need model-specific memory models and clearer user expectations. Until then, use the preset plus explicit flags for overrides.
 
 Examples:
@@ -66,7 +72,7 @@ In this example, `balanced` will not re-enable FSDP. The same applies to paralle
 
 **Component CPU offload** lowers GPU memory by moving large components to CPU. It is simple and robust, but it usually trades latency for memory.
 
-**Layerwise DiT offload** lowers DiT memory further for supported Wan/MOVA models by moving DiT layers between CPU and GPU. It can be the best single-GPU memory mode, but may reduce throughput.
+**Layerwise DiT offload** lowers DiT memory further for supported Wan/MOVA models by moving DiT layers between CPU and GPU. It can be the best single-GPU memory mode, but may increase latency and lower throughput.
 
 **FSDP** shards DiT weights across multiple GPUs and all-gathers weights during forward. It can reduce CPU offload cost on multi-GPU deployments, especially when combined with CFG parallelism for Qwen/Wan.
 

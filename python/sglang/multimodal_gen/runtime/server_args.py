@@ -906,10 +906,10 @@ class ServerArgs(DisaggArgsMixin):
             help=(
                 "Preset for performance and memory defaults. "
                 "'auto' only applies high-confidence defaults; "
-                "'throughput' favors GPU-resident execution and may OOM; "
+                "'speed' favors GPU-resident execution for lower latency and higher throughput, and may OOM; "
                 "'memory' favors lower GPU memory usage; "
                 "'balanced' prefers FSDP+CFG on validated multi-GPU Qwen/Wan CFG models. "
-                "Aliases: aggressive=throughput, conservative=memory, balance=balanced. "
+                "Aliases: throughput=speed, aggressive=speed, conservative=memory, balance=balanced. "
                 "Explicit offload/FSDP/parallelism flags take precedence."
             ),
         )

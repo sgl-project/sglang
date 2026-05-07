@@ -341,22 +341,23 @@ class TestOffloadDefaults(unittest.TestCase):
         self.assertTrue(args.use_fsdp_inference)
         self.assertTrue(args.enable_cfg_parallel)
 
-    def test_throughput_mode_single_gpu_disables_offload(self):
+    def test_speed_mode_single_gpu_disables_offload(self):
         args = self._from_dict_with_pipeline_config(
             QwenImagePipelineConfig(),
             kwargs={
                 "model_path": "Qwen/Qwen-Image",
-                "performance_mode": "throughput",
+                "performance_mode": "speed",
             },
         )
 
+        self.assertEqual(args.performance_mode, "speed")
         self.assertFalse(args.use_fsdp_inference)
         self.assertFalse(args.dit_cpu_offload)
         self.assertFalse(args.dit_layerwise_offload)
         self.assertFalse(args.text_encoder_cpu_offload)
         self.assertFalse(args.image_encoder_cpu_offload)
 
-    def test_throughput_mode_preserves_explicit_offload(self):
+    def test_speed_mode_preserves_explicit_offload(self):
         args = self._from_dict_with_pipeline_config(
             QwenImagePipelineConfig(),
             kwargs={
@@ -366,7 +367,7 @@ class TestOffloadDefaults(unittest.TestCase):
             },
         )
 
-        self.assertEqual(args.performance_mode, "throughput")
+        self.assertEqual(args.performance_mode, "speed")
         self.assertTrue(args.dit_cpu_offload)
         self.assertFalse(args.text_encoder_cpu_offload)
         self.assertFalse(args.image_encoder_cpu_offload)
@@ -431,7 +432,7 @@ class TestOffloadDefaults(unittest.TestCase):
             "--model-path",
             "Qwen/Qwen-Image",
             "--mode",
-            "aggressive",
+            "throughput",
         ]
 
         with (
@@ -459,7 +460,7 @@ class TestOffloadDefaults(unittest.TestCase):
             args, unknown_args = parser.parse_known_args(argv)
             server_args = ServerArgs.from_cli_args(args, unknown_args)
 
-        self.assertEqual(server_args.performance_mode, "throughput")
+        self.assertEqual(server_args.performance_mode, "speed")
         self.assertFalse(server_args.dit_cpu_offload)
         self.assertFalse(server_args.text_encoder_cpu_offload)
 

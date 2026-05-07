@@ -11,9 +11,10 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
-PERFORMANCE_MODES = ("auto", "throughput", "memory", "balanced")
+PERFORMANCE_MODES = ("auto", "speed", "memory", "balanced")
 PERFORMANCE_MODE_ALIASES = {
-    "aggressive": "throughput",
+    "throughput": "speed",
+    "aggressive": "speed",
     "conservative": "memory",
     "balance": "balanced",
 }
@@ -30,8 +31,8 @@ class ServerArgsAutoTuner:
         if current_platform.is_cpu():
             return
 
-        if args.performance_mode == "throughput":
-            logger.info("Applying performance_mode=throughput")
+        if args.performance_mode == "speed":
+            logger.info("Applying performance_mode=speed")
             if args.num_gpus >= 2 and self._can_apply_fsdp_cfg_policy(
                 require_memory_headroom=False
             ):
