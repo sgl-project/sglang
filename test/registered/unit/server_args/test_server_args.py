@@ -35,16 +35,14 @@ class TestPrepareServerArgs(CustomTestCase):
 
 
 class TestFlashInferAllReduceFusionDefaults(CustomTestCase):
-    def _make_server_args(self, enforce_disable=False):
+    def _make_server_args(self, model_arch, enforce_disable=False):
         server_args = ServerArgs(
             model_path="dummy",
             tp_size=2,
             enforce_disable_flashinfer_allreduce_fusion=enforce_disable,
         )
         server_args.get_model_config = MagicMock()
-        server_args.get_model_config.return_value.hf_config.architectures = [
-            "MistralLarge3ForCausalLM"
-        ]
+        server_args.get_model_config.return_value.hf_config.architectures = [model_arch]
         return server_args
 
     @patch("sglang.srt.server_args.get_device_name", return_value="NVIDIA H100")
@@ -54,11 +52,16 @@ class TestFlashInferAllReduceFusionDefaults(CustomTestCase):
     def test_mistral_large3_auto_enables_flashinfer_allreduce_fusion(
         self, _mock_nsa, _mock_sm90, _mock_sm100, _mock_device
     ):
-        server_args = self._make_server_args()
+        for model_arch in [
+            "MistralLarge3ForCausalLM",
+            "PixtralForConditionalGeneration",
+        ]:
+            with self.subTest(model_arch=model_arch):
+                server_args = self._make_server_args(model_arch)
 
-        server_args._handle_model_specific_adjustments()
+                server_args._handle_model_specific_adjustments()
 
-        self.assertTrue(server_args.enable_flashinfer_allreduce_fusion)
+                self.assertTrue(server_args.enable_flashinfer_allreduce_fusion)
 
     @patch("sglang.srt.server_args.get_device_name", return_value="NVIDIA H100")
     @patch("sglang.srt.server_args.is_sm100_supported", return_value=False)
@@ -67,11 +70,18 @@ class TestFlashInferAllReduceFusionDefaults(CustomTestCase):
     def test_mistral_large3_respects_enforce_disable_flashinfer_allreduce_fusion(
         self, _mock_nsa, _mock_sm90, _mock_sm100, _mock_device
     ):
-        server_args = self._make_server_args(enforce_disable=True)
+        for model_arch in [
+            "MistralLarge3ForCausalLM",
+            "PixtralForConditionalGeneration",
+        ]:
+            with self.subTest(model_arch=model_arch):
+                server_args = self._make_server_args(
+                    model_arch, enforce_disable=True
+                )
 
-        server_args._handle_model_specific_adjustments()
+                server_args._handle_model_specific_adjustments()
 
-        self.assertFalse(server_args.enable_flashinfer_allreduce_fusion)
+                self.assertFalse(server_args.enable_flashinfer_allreduce_fusion)
 
 
 class TestLoadBalanceMethod(unittest.TestCase):
