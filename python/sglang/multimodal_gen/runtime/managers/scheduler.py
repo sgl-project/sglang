@@ -8,9 +8,10 @@ import pickle
 import tempfile
 import time
 from collections import deque
+from contextlib import contextmanager
 from copy import deepcopy
 from enum import Enum
-from typing import Any, List
+from typing import Any, Iterator, List
 
 import zmq
 
@@ -613,31 +614,31 @@ class Scheduler(SchedulerDisaggMixin):
         """
         if not is_warmup and self.receiver is not None and identity is not None:
             if is_local_endpoint(self.server_args.scheduler_endpoint):
-                start_time = time.perf_counter()
-                output_batch.output = spill_large_arrays_to_file_refs(
-                    output_batch.output
-                )
-                if output_batch.metrics is not None:
-                    output_batch.metrics.record_stage(
-                        "Scheduler.return_result.spill_arrays",
-                        time.perf_counter() - start_time,
+                with self._record_return_stage(
+                    output_batch, "Scheduler.return_result.spill_arrays"
+                ):
+                    output_batch.output = spill_large_arrays_to_file_refs(
+                        output_batch.output
                     )
 
-            start_time = time.perf_counter()
-            payload = pickle.dumps(output_batch)
-            if output_batch.metrics is not None:
-                output_batch.metrics.record_stage(
-                    "Scheduler.return_result.pickle",
-                    time.perf_counter() - start_time,
-                )
+            with self._record_return_stage(
+                output_batch, "Scheduler.return_result.pickle"
+            ):
+                payload = pickle.dumps(output_batch)
 
-            start_time = time.perf_counter()
-            self.receiver.send_multipart([identity, b"", payload])
-            if output_batch.metrics is not None:
-                output_batch.metrics.record_stage(
-                    "Scheduler.return_result.send",
-                    time.perf_counter() - start_time,
-                )
+            with self._record_return_stage(output_batch, "Scheduler.return_result.send"):
+                self.receiver.send_multipart([identity, b"", payload])
+
+    @contextmanager
+    def _record_return_stage(
+        self, output_batch: OutputBatch, stage_name: str
+    ) -> Iterator[None]:
+        start_time = time.perf_counter()
+        yield
+        if output_batch.metrics is not None:
+            output_batch.metrics.record_stage(
+                stage_name, time.perf_counter() - start_time
+            )
 
     def _try_merge_generation_reqs(self, reqs: List[Req]) -> Req | None:
         """Create a batched generation request from compatible requests.
