@@ -192,7 +192,9 @@ STAT_LOGGER_ROLE_RADIX_CACHE = "radix_cache"
 STAT_LOGGER_ROLE_EXPERT_DISPATCH = "expert_dispatch"
 
 
-def resolve_collector_class(server_args, role: str, default_cls: type) -> type:
+def resolve_collector_class(
+    server_args: Optional["ServerArgs"], role: str, default_cls: type
+) -> type:
     """Return the subclass registered for `role` on `server_args.stat_loggers`,
     or `default_cls` if none is registered. Tolerates `server_args=None` and
     `stat_loggers=None`."""
