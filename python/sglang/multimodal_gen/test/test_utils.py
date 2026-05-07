@@ -66,6 +66,14 @@ SGL_TEST_FILES_OFFICIAL_CONSISTENCY_GT_CASES = frozenset(
         "ltx_2.3_two_stage_t2v_2gpus",
     }
 )
+# Keep non-comparable LTX CI scenarios on sglang_generated rather than hiding
+# remaining semantic gaps behind very loose official thresholds.
+SGL_TEST_FILES_OFFICIAL_CONSISTENCY_GT_CASES = frozenset(
+    {
+        "ltx_2.3_one_stage_ti2v",
+        "ltx_2.3_two_stage_t2v_2gpus",
+    }
+)
 CONSISTENCY_THRESHOLD_JSON_PATH = (
     Path(__file__).resolve().parent / "server" / "consistency_threshold.json"
 )
