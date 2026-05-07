@@ -1419,7 +1419,12 @@ class OpenAIServingChat(OpenAIServingBase):
                 or request.chat_template_kwargs.get("thinking") is not False
             )
         if self.reasoning_parser in ["qwen3", "glm45", "nemotron_3", "interns1"]:
-            # Models that thinking by default, and can be disabled by setting enable_thinking=False
+            # Only enable thinking when the chat template actually supports it
+            # (i.e., has <think> in assistant preamble). Models like Qwen3.5-0.8B
+            # don't support thinking, so their output should go to content, not
+            # reasoning_content. See #20786.
+            if not self.template_manager.force_reasoning:
+                return False
             return (
                 not request.chat_template_kwargs
                 or request.chat_template_kwargs.get("enable_thinking") is not False
