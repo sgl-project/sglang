@@ -143,6 +143,8 @@ class HiMambaRadixCache(MambaRadixCache):
             prefetch_threshold=prefetch_threshold,
             load_cache_event=self.load_cache_event,
             enable_storage_metrics=self.enable_storage_metrics,
+            attn_cp_group=params.attn_cp_cache_group,
+            attn_tp_group=params.attn_tp_cache_group,
         )
         self._apply_storage_runtime_config(
             storage_backend=server_args.hicache_storage_backend,
@@ -629,6 +631,11 @@ class HiMambaRadixCache(MambaRadixCache):
             if node.parent.mamba_host_value is not None:
                 break
             if node.parent.full_lock_ref > 0 or node.parent.mamba_lock_ref > 0:
+                break
+            if (
+                node.parent.host_ref_counter > 0
+                or node.parent.host_mamba_ref_counter > 0
+            ):
                 break
 
             parent = node.parent

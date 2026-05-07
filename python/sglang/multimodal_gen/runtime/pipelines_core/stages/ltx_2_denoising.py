@@ -1,3 +1,4 @@
+import math
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 
@@ -281,9 +282,7 @@ class LTX2DenoisingStage(DenoisingStage):
         )
         if generator is None:
             raise ValueError("LTX-2 res2s noise generator was not initialized.")
-        return cls._ltx2_res2s_new_noise(reference_tensor, generator).to(
-            dtype=reference_tensor.dtype
-        )
+        return cls._ltx2_res2s_new_noise(reference_tensor, generator)
 
     @staticmethod
     def _ltx2_apply_clean_latent_mask(
@@ -320,6 +319,34 @@ class LTX2DenoisingStage(DenoisingStage):
         return a21, b1, b2
 
     @staticmethod
+    def _ltx2_phi_scalar(j: int, neg_h: float) -> float:
+        if abs(neg_h) < 1e-10:
+            return 1.0 / math.factorial(j)
+        remainder = sum(neg_h**k / math.factorial(k) for k in range(j))
+        return (math.exp(neg_h) - remainder) / (neg_h**j)
+
+    @classmethod
+    def _ltx2_get_res2s_coefficients_scalar(
+        cls, h: float, c2: float = 0.5
+    ) -> tuple[float, float, float]:
+        a21 = c2 * cls._ltx2_phi_scalar(1, -h * c2)
+        b2 = cls._ltx2_phi_scalar(2, -h) / c2
+        b1 = cls._ltx2_phi_scalar(1, -h) - b2
+        return a21, b1, b2
+
+    @staticmethod
+    def _ltx2_res2s_step_size_scalar(
+        sigma: torch.Tensor, sigma_next: torch.Tensor
+    ) -> float:
+        return float(
+            (
+                -torch.log(
+                    sigma_next.detach().double().cpu() / sigma.detach().double().cpu()
+                )
+            ).item()
+        )
+
+    @staticmethod
     def _ltx2_get_sde_coeff(
         sigma_next: torch.Tensor,
         *,
@@ -328,31 +355,29 @@ class LTX2DenoisingStage(DenoisingStage):
         sigma_max: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         if sigma_down is not None:
-            alpha_ratio = (1.0 - sigma_next) / (1.0 - sigma_down)
-            sigma_up = torch.sqrt(
-                torch.clamp(
-                    sigma_next.square() - sigma_down.square() * alpha_ratio.square(),
-                    min=0.0,
-                )
-            )
+            alpha_ratio = (1 - sigma_next) / (1 - sigma_down)
+            sigma_up = (sigma_next**2 - sigma_down**2 * alpha_ratio**2).clamp(
+                min=0
+            ) ** 0.5
         elif sigma_up is not None:
-            sigma_up = torch.minimum(sigma_up, sigma_next * 0.9999)
+            sigma_up.clamp_(max=sigma_next * 0.9999)
             sigmax = sigma_max if sigma_max is not None else torch.ones_like(sigma_next)
             sigma_signal = sigmax - sigma_next
-            sigma_residual = torch.sqrt(
-                torch.clamp(sigma_next.square() - sigma_up.square(), min=0.0)
-            )
+            sigma_residual = (sigma_next**2 - sigma_up**2).clamp(min=0) ** 0.5
             alpha_ratio = sigma_signal + sigma_residual
             sigma_down = sigma_residual / alpha_ratio
         else:
             alpha_ratio = torch.ones_like(sigma_next)
             sigma_down = sigma_next
             sigma_up = torch.zeros_like(sigma_next)
-        return (
-            torch.nan_to_num(alpha_ratio),
-            torch.nan_to_num(sigma_down),
-            torch.nan_to_num(sigma_up),
+
+        sigma_up = torch.nan_to_num(
+            sigma_up if sigma_up is not None else torch.zeros_like(sigma_next), 0.0
         )
+        nan_mask = torch.isnan(sigma_down)
+        sigma_down[nan_mask] = sigma_next[nan_mask].to(sigma_down.dtype)
+        alpha_ratio = torch.nan_to_num(alpha_ratio, 1.0)
+        return alpha_ratio, sigma_down, sigma_up
 
     @classmethod
     def _ltx2_res2s_sde_step(
@@ -364,13 +389,17 @@ class LTX2DenoisingStage(DenoisingStage):
         sigma_next: torch.Tensor,
         noise: torch.Tensor,
         eta: float = 0.5,
+        terminal: bool = False,
     ) -> torch.Tensor:
+        # The caller decides terminal steps from Python scalars before entering
+        # this helper. Keep that branch on host to avoid a CUDA bool sync in
+        # every res2s SDE update.
+        if terminal:
+            return denoised_sample.to(dtype=sample.dtype)
         alpha_ratio, sigma_down, sigma_up = cls._ltx2_get_sde_coeff(
             sigma_next,
             sigma_up=sigma_next * eta,
         )
-        if bool((sigma_up == 0).any()) or bool((sigma_next == 0).any()):
-            return denoised_sample.to(dtype=sample.dtype)
         eps_next = (sample - denoised_sample) / (sigma - sigma_next)
         denoised_next = sample - sigma * eps_next
         x_noised = (
@@ -387,6 +416,8 @@ class LTX2DenoisingStage(DenoisingStage):
         sigma_next: torch.Tensor,
         model_video_velocity: torch.Tensor,
         model_audio_velocity: torch.Tensor,
+        model_video_timestep: torch.Tensor | None,
+        model_audio_timestep: torch.Tensor | None,
         midpoint_model_call,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """res2s RK2 step for unguided stage-2 refinement (HQ pipeline).
@@ -403,10 +434,24 @@ class LTX2DenoisingStage(DenoisingStage):
             denoised_video = ctx.latents.float()
             denoised_audio = ctx.audio_latents.float()
         else:
-            denoised_video = ctx.latents.float() - sigma * model_video_velocity.float()
-            denoised_audio = (
-                ctx.audio_latents.float() - sigma * model_audio_velocity.float()
+            video_sigma_for_x0 = (
+                model_video_timestep
+                if ctx.use_ltx23_hq_timestep_semantics
+                and model_video_timestep is not None
+                else sigma
             )
+            audio_sigma_for_x0 = (
+                model_audio_timestep
+                if ctx.use_ltx23_hq_timestep_semantics
+                and model_audio_timestep is not None
+                else sigma
+            )
+            denoised_video = self._ltx2_velocity_to_x0(
+                ctx.latents, model_video_velocity, video_sigma_for_x0
+            ).float()
+            denoised_audio = self._ltx2_velocity_to_x0(
+                ctx.audio_latents, model_audio_velocity, audio_sigma_for_x0
+            ).float()
 
         if sigma_val == 0.0 or sigma_next_val == 0.0:
             next_video = denoised_video.to(dtype=ctx.latents.dtype)
@@ -416,8 +461,14 @@ class LTX2DenoisingStage(DenoisingStage):
 
         sigma_d = sigma.double()
         sigma_next_d = sigma_next.double()
-        h = -torch.log(torch.clamp(sigma_next_d / sigma_d, min=1e-12))
-        a21, b1, b2 = self._ltx2_get_res2s_coefficients(h)
+        if ctx.use_ltx23_hq_timestep_semantics:
+            h = self._ltx2_res2s_step_size_scalar(sigma_d, sigma_next_d)
+            a21, b1, b2 = self._ltx2_get_res2s_coefficients_scalar(h)
+            h_value = h
+        else:
+            h = -torch.log(torch.clamp(sigma_next_d / sigma_d, min=1e-12))
+            a21, b1, b2 = self._ltx2_get_res2s_coefficients(h)
+            h_value = float(h.item())
         sub_sigma = torch.sqrt(torch.clamp(sigma_d * sigma_next_d, min=0.0))
 
         anchor_video = ctx.latents.double()
@@ -429,12 +480,12 @@ class LTX2DenoisingStage(DenoisingStage):
         midpoint_audio_det = anchor_audio + h * a21 * eps1_audio
 
         sub_noise_video = (
-            self._ltx2_res2s_noise_like(ctx.latents, ctx, substep=True).float()
+            self._ltx2_res2s_noise_like(ctx.latents, ctx, substep=True)
             if ctx.use_native_hq_res2s_sde_noise
             else self._randn_like_with_batch_generators(ctx.latents, batch).float()
         )
         sub_noise_audio = (
-            self._ltx2_res2s_noise_like(ctx.audio_latents, ctx, substep=True).float()
+            self._ltx2_res2s_noise_like(ctx.audio_latents, ctx, substep=True)
             if ctx.use_native_hq_res2s_sde_noise
             else self._randn_like_with_batch_generators(
                 ctx.audio_latents, batch
@@ -446,6 +497,7 @@ class LTX2DenoisingStage(DenoisingStage):
             sigma=sigma_d,
             sigma_next=sub_sigma,
             noise=sub_noise_video,
+            terminal=False,
         )
         midpoint_audio_latents = self._ltx2_res2s_sde_step(
             sample=anchor_audio,
@@ -453,16 +505,17 @@ class LTX2DenoisingStage(DenoisingStage):
             sigma=sigma_d,
             sigma_next=sub_sigma,
             noise=sub_noise_audio,
+            terminal=False,
         )
-        midpoint_video_latents = self._ltx2_apply_clean_latent_mask(
+        midpoint_video_model_latents = self._ltx2_apply_clean_latent_mask(
             midpoint_video_latents.to(dtype=ctx.latents.dtype), ctx
         )
-        midpoint_audio_latents = midpoint_audio_latents.to(
+        midpoint_audio_model_latents = midpoint_audio_latents.to(
             dtype=ctx.audio_latents.dtype
         )
 
         # Bongmath anchor refinement for the first stage-2 step.
-        if float(h.item()) < 0.5 and sigma_val > 0.03:
+        if h_value < 0.5 and sigma_val > 0.03:
             x_mid_v = midpoint_video_latents.double()
             x_mid_a = midpoint_audio_latents.double()
             for _ in range(100):
@@ -471,12 +524,26 @@ class LTX2DenoisingStage(DenoisingStage):
                 anchor_audio = x_mid_a - h * a21 * eps1_audio
                 eps1_audio = denoised_audio.double() - anchor_audio
 
-        mid_v, mid_a = midpoint_model_call(
-            midpoint_video_latents, midpoint_audio_latents, sub_sigma
+        mid_v, mid_a, mid_video_timestep, mid_audio_timestep = midpoint_model_call(
+            midpoint_video_model_latents, midpoint_audio_model_latents, sub_sigma
         )
 
-        midpoint_denoised_video = midpoint_video_latents.float() - sub_sigma * mid_v
-        midpoint_denoised_audio = midpoint_audio_latents.float() - sub_sigma * mid_a
+        mid_video_sigma_for_x0 = (
+            mid_video_timestep
+            if ctx.use_ltx23_hq_timestep_semantics and mid_video_timestep is not None
+            else sub_sigma
+        )
+        mid_audio_sigma_for_x0 = (
+            mid_audio_timestep
+            if ctx.use_ltx23_hq_timestep_semantics and mid_audio_timestep is not None
+            else sub_sigma
+        )
+        midpoint_denoised_video = self._ltx2_velocity_to_x0(
+            midpoint_video_latents, mid_v, mid_video_sigma_for_x0
+        ).float()
+        midpoint_denoised_audio = self._ltx2_velocity_to_x0(
+            midpoint_audio_latents, mid_a, mid_audio_sigma_for_x0
+        ).float()
 
         eps2_video = midpoint_denoised_video.double() - anchor_video
         eps2_audio = midpoint_denoised_audio.double() - anchor_audio
@@ -485,30 +552,36 @@ class LTX2DenoisingStage(DenoisingStage):
         next_audio_det = anchor_audio + h * (b1 * eps1_audio + b2 * eps2_audio)
 
         step_noise_video = (
-            self._ltx2_res2s_noise_like(ctx.latents, ctx, substep=False).float()
+            self._ltx2_res2s_noise_like(ctx.latents, ctx, substep=False)
             if ctx.use_native_hq_res2s_sde_noise
             else self._randn_like_with_batch_generators(ctx.latents, batch).float()
         )
         step_noise_audio = (
-            self._ltx2_res2s_noise_like(ctx.audio_latents, ctx, substep=False).float()
+            self._ltx2_res2s_noise_like(ctx.audio_latents, ctx, substep=False)
             if ctx.use_native_hq_res2s_sde_noise
             else self._randn_like_with_batch_generators(
                 ctx.audio_latents, batch
             ).float()
         )
+        sde_sigma = sigma if ctx.use_ltx23_hq_timestep_semantics else sigma_d
+        sde_sigma_next = (
+            sigma_next if ctx.use_ltx23_hq_timestep_semantics else sigma_next_d
+        )
         next_video = self._ltx2_res2s_sde_step(
             sample=anchor_video,
             denoised_sample=next_video_det,
-            sigma=sigma_d,
-            sigma_next=sigma_next_d,
+            sigma=sde_sigma,
+            sigma_next=sde_sigma_next,
             noise=step_noise_video,
+            terminal=False,
         )
         next_audio = self._ltx2_res2s_sde_step(
             sample=anchor_audio,
             denoised_sample=next_audio_det,
-            sigma=sigma_d,
-            sigma_next=sigma_next_d,
+            sigma=sde_sigma,
+            sigma_next=sde_sigma_next,
             noise=step_noise_audio,
+            terminal=False,
         )
 
         next_video = self._ltx2_apply_clean_latent_mask(
@@ -977,6 +1050,48 @@ class LTX2DenoisingStage(DenoisingStage):
             kwargs["perturbation_configs"] = perturbation_configs
         return kwargs
 
+    @staticmethod
+    def _ltx2_guidance_perturbation_config(
+        pass_spec: LTX2GuidancePassSpec,
+    ) -> dict[str, object]:
+        return {
+            "skip_video_self_attn_blocks": pass_spec.skip_video_self_attn_blocks,
+            "skip_audio_self_attn_blocks": pass_spec.skip_audio_self_attn_blocks,
+            "skip_a2v_cross_attn": pass_spec.disable_a2v_cross_attn,
+            "skip_v2a_cross_attn": pass_spec.disable_v2a_cross_attn,
+        }
+
+    @classmethod
+    def _build_ltx2_guidance_perturbation_configs(
+        cls,
+        pass_specs: list[LTX2GuidancePassSpec],
+        batch_size: int,
+    ) -> tuple[dict[str, object], ...]:
+        return tuple(
+            cls._ltx2_guidance_perturbation_config(pass_spec)
+            for pass_spec in pass_specs
+            for _ in range(batch_size)
+        )
+
+    @staticmethod
+    def _apply_ltx2_guidance_pass_kwargs(
+        model_kwargs: dict[str, object],
+        pass_spec: LTX2GuidancePassSpec,
+    ) -> None:
+        """Copy disable-attention options from pass_spec into model_kwargs."""
+        if pass_spec.skip_video_self_attn_blocks:
+            model_kwargs["skip_video_self_attn_blocks"] = (
+                pass_spec.skip_video_self_attn_blocks
+            )
+        if pass_spec.skip_audio_self_attn_blocks:
+            model_kwargs["skip_audio_self_attn_blocks"] = (
+                pass_spec.skip_audio_self_attn_blocks
+            )
+        if pass_spec.disable_a2v_cross_attn:
+            model_kwargs["disable_a2v_cross_attn"] = True
+        if pass_spec.disable_v2a_cross_attn:
+            model_kwargs["disable_v2a_cross_attn"] = True
+
     @classmethod
     def _repeat_ltx2_model_kwargs_batch(
         cls,
@@ -1160,22 +1275,12 @@ class LTX2DenoisingStage(DenoisingStage):
         self, ctx: LTX2DenoisingContext, batch: Req, server_args: ServerArgs
     ) -> None:
         """Reset the mirrored audio scheduler before the shared loop begins."""
-        if ctx.stage in ("stage1", "stage2"):
+        if is_ltx2_two_stage_pipeline_name(
+            server_args.pipeline_class_name
+        ) and ctx.stage in ("stage1", "stage2"):
             pipeline = self.pipeline() if self.pipeline else None
-            switch_lora_phase = (
-                getattr(pipeline, "switch_lora_phase", None)
-                if pipeline is not None
-                else None
-            )
-            if callable(switch_lora_phase):
-                switch_lora_phase(ctx.stage, batch=batch)
-            ensure_phase_ready = (
-                getattr(pipeline, "ensure_ltx2_phase_ready", None)
-                if pipeline is not None
-                else None
-            )
-            if callable(ensure_phase_ready):
-                ensure_phase_ready(ctx.stage)
+            if pipeline is not None:
+                pipeline.switch_lora_phase(ctx.stage, batch=batch)
         super()._before_denoising_loop(ctx, batch, server_args)
         if ctx.audio_scheduler is None:
             raise ValueError("LTX-2 audio scheduler was not prepared.")
@@ -1194,7 +1299,6 @@ class LTX2DenoisingStage(DenoisingStage):
     ):
         """Preserve the legacy LTX-2 attention-metadata contract."""
         # Legacy LTX-2 paths used the plain attention-metadata builder call here.
-        del ctx, t_int, timesteps_cpu
         return self._build_attn_metadata(step_index, batch, server_args)
 
     def _run_denoising_step(
@@ -1221,6 +1325,8 @@ class LTX2DenoisingStage(DenoisingStage):
             device=ctx.latents.device, dtype=torch.float32
         )
         dt = sigma_next - sigma
+        sigma_val = float(sigma.item())
+        sigma_next_val = float(sigma_next.item())
 
         stage1_guider_params = self._get_ltx2_stage1_guider_params(
             batch, server_args, ctx.stage
@@ -1304,7 +1410,12 @@ class LTX2DenoisingStage(DenoisingStage):
                     video_latents: torch.Tensor,
                     audio_latents: torch.Tensor,
                     sigma_value: torch.Tensor,
-                ) -> tuple[torch.Tensor, torch.Tensor]:
+                ) -> tuple[
+                    torch.Tensor,
+                    torch.Tensor,
+                    torch.Tensor | None,
+                    torch.Tensor | None,
+                ]:
                     original_video_latents = ctx.latents
                     original_audio_latents = ctx.audio_latents
                     ctx.latents = video_latents
@@ -1378,7 +1489,12 @@ class LTX2DenoisingStage(DenoisingStage):
                             mid_a_u, mid_a_t = mid_a.chunk(2)
                             mid_v = mid_v_u + batch.guidance_scale * (mid_v_t - mid_v_u)
                             mid_a = mid_a_u + batch.guidance_scale * (mid_a_t - mid_a_u)
-                        return mid_v, mid_a
+                        return (
+                            mid_v,
+                            mid_a,
+                            model_inputs_local.timestep_video,
+                            model_inputs_local.timestep_audio,
+                        )
                     finally:
                         ctx.latents = original_video_latents
                         ctx.audio_latents = original_audio_latents
@@ -1390,6 +1506,8 @@ class LTX2DenoisingStage(DenoisingStage):
                     sigma_next=sigma_next,
                     model_video_velocity=model_video,
                     model_audio_velocity=model_audio,
+                    model_video_timestep=model_inputs.timestep_video,
+                    model_audio_timestep=model_inputs.timestep_audio,
                     midpoint_model_call=_stage2_midpoint_model_call,
                 )
             else:
@@ -1446,6 +1564,24 @@ class LTX2DenoisingStage(DenoisingStage):
                 and int(getattr(batch, "ltx2_num_image_tokens", 0)) > 0
             )
         )
+        # "Perturbation" means disabling selected attention paths
+        # for that item (self-attention blocks or audio/video cross-attention)
+        # to compute STG/modality guidance.
+        #
+
+        # Decide whether to use different pass kwargs for split model calls
+        # 1. HQ splits the expanded batch into one-item model calls. Since each
+        # call has only one perturbation setting, pass the disable options
+        # directly as model arguments.
+        # 2. TI2V/non-HQ may keep several expanded
+        # items with different settings in one model call, so it needs
+        # perturbation_configs: one config dict per expanded item.
+        use_split_pass_kwargs = (
+            server_args.pipeline_class_name == "LTX2TwoStageHQPipeline"
+        )
+        skip_v2a_cross_attn_for_video_gt = bool(
+            batch.extra.get("ltx2_skip_v2a_cross_attn_for_video_gt", False)
+        )
 
         def evaluate_stage1_guided_x0(
             *,
@@ -1476,6 +1612,9 @@ class LTX2DenoisingStage(DenoisingStage):
                                 encoder_hidden_states=encoder_hidden_states,
                                 audio_encoder_hidden_states=audio_encoder_hidden_states,
                                 encoder_attention_mask=encoder_attention_mask,
+                                disable_v2a_cross_attn=(
+                                    skip_v2a_cross_attn_for_video_gt
+                                ),
                             )
                         )
                         v_neg, a_v_neg = step.current_model(
@@ -1485,6 +1624,9 @@ class LTX2DenoisingStage(DenoisingStage):
                                 encoder_hidden_states=negative_encoder_hidden_states,
                                 audio_encoder_hidden_states=negative_audio_encoder_hidden_states,
                                 encoder_attention_mask=negative_encoder_attention_mask,
+                                disable_v2a_cross_attn=(
+                                    skip_v2a_cross_attn_for_video_gt
+                                ),
                             )
                         )
 
@@ -1509,6 +1651,9 @@ class LTX2DenoisingStage(DenoisingStage):
                                     ),
                                     skip_audio_self_attn_blocks=tuple(
                                         stage1_guider_params["audio_stg_blocks"]
+                                    ),
+                                    disable_v2a_cross_attn=(
+                                        skip_v2a_cross_attn_for_video_gt
                                     ),
                                 )
                             )
@@ -1539,12 +1684,14 @@ class LTX2DenoisingStage(DenoisingStage):
                             encoder_hidden_states=encoder_hidden_states,
                             audio_encoder_hidden_states=audio_encoder_hidden_states,
                             encoder_attention_mask=encoder_attention_mask,
+                            disable_v2a_cross_attn=skip_v2a_cross_attn_for_video_gt,
                         ),
                         LTX2GuidancePassSpec(
                             name="neg",
                             encoder_hidden_states=negative_encoder_hidden_states,
                             audio_encoder_hidden_states=negative_audio_encoder_hidden_states,
                             encoder_attention_mask=negative_encoder_attention_mask,
+                            disable_v2a_cross_attn=skip_v2a_cross_attn_for_video_gt,
                         ),
                     ]
                     if need_perturbed:
@@ -1560,6 +1707,7 @@ class LTX2DenoisingStage(DenoisingStage):
                                 skip_audio_self_attn_blocks=tuple(
                                     stage1_guider_params["audio_stg_blocks"]
                                 ),
+                                disable_v2a_cross_attn=skip_v2a_cross_attn_for_video_gt,
                             )
                         )
                     if need_modality:
@@ -1576,16 +1724,6 @@ class LTX2DenoisingStage(DenoisingStage):
 
                     num_passes = len(pass_specs)
                     expanded_batch_size = batch_size_local * num_passes
-                    perturbation_configs = tuple(
-                        {
-                            "skip_video_self_attn_blocks": pass_spec.skip_video_self_attn_blocks,
-                            "skip_audio_self_attn_blocks": pass_spec.skip_audio_self_attn_blocks,
-                            "skip_a2v_cross_attn": pass_spec.disable_a2v_cross_attn,
-                            "skip_v2a_cross_attn": pass_spec.disable_v2a_cross_attn,
-                        }
-                        for pass_spec in pass_specs
-                        for _ in range(batch_size_local)
-                    )
                     batched_model_kwargs = self._repeat_ltx2_model_kwargs_batch(
                         base_model_kwargs_local, expanded_batch_size
                     )
@@ -1615,19 +1753,38 @@ class LTX2DenoisingStage(DenoisingStage):
                     )
                     if use_split_stage1_guided_passes:
                         split_sizes = [1] * expanded_batch_size
+                        split_pass_specs = tuple(
+                            pass_spec
+                            for pass_spec in pass_specs
+                            for _ in range(batch_size_local)
+                        )
+                        split_perturbation_configs = (
+                            ()
+                            if use_split_pass_kwargs
+                            else self._build_ltx2_guidance_perturbation_configs(
+                                pass_specs, batch_size_local
+                            )
+                        )
                         batched_video_chunks = []
                         batched_audio_chunks = []
                         with self._ltx2_model_forward_context(ctx, step):
-                            for model_kwargs_chunk, perturbation_config in zip(
-                                self._split_ltx2_model_kwargs(
-                                    batched_model_kwargs, split_sizes
-                                ),
-                                perturbation_configs,
-                                strict=True,
-                            ):
-                                model_kwargs_chunk["perturbation_configs"] = (
-                                    perturbation_config,
+                            for index, (model_kwargs_chunk, pass_spec) in enumerate(
+                                zip(
+                                    self._split_ltx2_model_kwargs(
+                                        batched_model_kwargs, split_sizes
+                                    ),
+                                    split_pass_specs,
+                                    strict=True,
                                 )
+                            ):
+                                if use_split_pass_kwargs:
+                                    self._apply_ltx2_guidance_pass_kwargs(
+                                        model_kwargs_chunk, pass_spec
+                                    )
+                                else:
+                                    model_kwargs_chunk["perturbation_configs"] = (
+                                        split_perturbation_configs[index],
+                                    )
                                 video_chunk, audio_chunk = step.current_model(
                                     **model_kwargs_chunk
                                 )
@@ -1637,6 +1794,11 @@ class LTX2DenoisingStage(DenoisingStage):
                         batched_video = torch.cat(batched_video_chunks, dim=0)
                         batched_audio = torch.cat(batched_audio_chunks, dim=0)
                     else:
+                        perturbation_configs = (
+                            self._build_ltx2_guidance_perturbation_configs(
+                                pass_specs, batch_size_local
+                            )
+                        )
                         with self._ltx2_model_forward_context(ctx, step):
                             batched_video, batched_audio = step.current_model(
                                 **batched_model_kwargs,
@@ -1663,23 +1825,28 @@ class LTX2DenoisingStage(DenoisingStage):
                     v_mod, a_v_mod = pass_outputs.get("modality", (None, None))
 
                 sigma_value_float = float(sigma_value.item())
-                video_sigma_for_x0: float | torch.Tensor = sigma_value_float
-                if ctx.denoise_mask is not None:
+                audio_sigma_for_x0: float | torch.Tensor = sigma_value_float
+                if ctx.use_ltx23_hq_timestep_semantics:
+                    video_sigma_for_x0 = model_inputs_local.timestep_video
+                    audio_sigma_for_x0 = model_inputs_local.timestep_audio
+                elif ctx.denoise_mask is not None:
                     video_sigma_for_x0 = sigma_value.to(
                         device=video_latents.device, dtype=torch.float32
                     ) * ctx.denoise_mask.squeeze(-1)
+                else:
+                    video_sigma_for_x0 = sigma_value_float
 
                 denoised_video_local = self._ltx2_velocity_to_x0(
                     video_latents, v_pos, video_sigma_for_x0
                 )
                 denoised_audio_local = self._ltx2_velocity_to_x0(
-                    audio_latents, a_v_pos, sigma_value_float
+                    audio_latents, a_v_pos, audio_sigma_for_x0
                 )
                 denoised_video_neg = self._ltx2_velocity_to_x0(
                     video_latents, v_neg, video_sigma_for_x0
                 )
                 denoised_audio_neg = self._ltx2_velocity_to_x0(
-                    audio_latents, a_v_neg, sigma_value_float
+                    audio_latents, a_v_neg, audio_sigma_for_x0
                 )
                 denoised_video_perturbed = (
                     None
@@ -1692,7 +1859,7 @@ class LTX2DenoisingStage(DenoisingStage):
                     None
                     if a_v_ptb is None
                     else self._ltx2_velocity_to_x0(
-                        audio_latents, a_v_ptb, sigma_value_float
+                        audio_latents, a_v_ptb, audio_sigma_for_x0
                     )
                 )
                 denoised_video_modality = (
@@ -1706,7 +1873,7 @@ class LTX2DenoisingStage(DenoisingStage):
                     None
                     if a_v_mod is None
                     else self._ltx2_velocity_to_x0(
-                        audio_latents, a_v_mod, sigma_value_float
+                        audio_latents, a_v_mod, audio_sigma_for_x0
                     )
                 )
 
@@ -1768,7 +1935,6 @@ class LTX2DenoisingStage(DenoisingStage):
                 ctx.latents = original_video_latents
                 ctx.audio_latents = original_audio_latents
 
-        sigma_val = float(sigma.item())
         denoised_video, denoised_audio = evaluate_stage1_guided_x0(
             video_latents=ctx.latents,
             audio_latents=ctx.audio_latents,
@@ -1777,14 +1943,20 @@ class LTX2DenoisingStage(DenoisingStage):
         )
 
         if self.sampler_name == "res2s":
-            if sigma_val == 0.0 or float(sigma_next.item()) == 0.0:
+            if sigma_val == 0.0 or sigma_next_val == 0.0:
                 next_video_latents = denoised_video.to(dtype=ctx.latents.dtype)
                 next_audio_latents = denoised_audio.to(dtype=ctx.audio_latents.dtype)
             else:
                 sigma_d = sigma.double()
                 sigma_next_d = sigma_next.double()
-                h = -torch.log(torch.clamp(sigma_next_d / sigma_d, min=1e-12))
-                a21, b1, b2 = self._ltx2_get_res2s_coefficients(h)
+                if ctx.use_ltx23_hq_timestep_semantics:
+                    h = self._ltx2_res2s_step_size_scalar(sigma_d, sigma_next_d)
+                    a21, b1, b2 = self._ltx2_get_res2s_coefficients_scalar(h)
+                    h_value = h
+                else:
+                    h = -torch.log(torch.clamp(sigma_next_d / sigma_d, min=1e-12))
+                    a21, b1, b2 = self._ltx2_get_res2s_coefficients(h)
+                    h_value = float(h.item())
                 sub_sigma = torch.sqrt(torch.clamp(sigma_d * sigma_next_d, min=0.0))
 
                 anchor_video = ctx.latents.double()
@@ -1796,16 +1968,14 @@ class LTX2DenoisingStage(DenoisingStage):
                 midpoint_audio_deterministic = anchor_audio + h * a21 * eps1_audio
 
                 substep_video_noise = (
-                    self._ltx2_res2s_noise_like(ctx.latents, ctx, substep=True).float()
+                    self._ltx2_res2s_noise_like(ctx.latents, ctx, substep=True)
                     if ctx.use_native_hq_res2s_sde_noise
                     else self._randn_like_with_batch_generators(
                         ctx.latents, batch
                     ).float()
                 )
                 substep_audio_noise = (
-                    self._ltx2_res2s_noise_like(
-                        ctx.audio_latents, ctx, substep=True
-                    ).float()
+                    self._ltx2_res2s_noise_like(ctx.audio_latents, ctx, substep=True)
                     if ctx.use_native_hq_res2s_sde_noise
                     else self._randn_like_with_batch_generators(
                         ctx.audio_latents, batch
@@ -1818,6 +1988,7 @@ class LTX2DenoisingStage(DenoisingStage):
                     sigma=sigma_d,
                     sigma_next=sub_sigma,
                     noise=substep_video_noise,
+                    terminal=False,
                 )
                 midpoint_audio_latents = self._ltx2_res2s_sde_step(
                     sample=anchor_audio,
@@ -1825,17 +1996,18 @@ class LTX2DenoisingStage(DenoisingStage):
                     sigma=sigma_d,
                     sigma_next=sub_sigma,
                     noise=substep_audio_noise,
+                    terminal=False,
                 )
 
-                midpoint_video_latents = self._ltx2_apply_clean_latent_mask(
+                midpoint_video_model_latents = self._ltx2_apply_clean_latent_mask(
                     midpoint_video_latents.to(dtype=ctx.latents.dtype),
                     ctx,
                 )
-                midpoint_audio_latents = midpoint_audio_latents.to(
+                midpoint_audio_model_latents = midpoint_audio_latents.to(
                     dtype=ctx.audio_latents.dtype
                 )
 
-                if float(h.item()) < 0.5 and sigma_val > 0.03:
+                if h_value < 0.5 and sigma_val > 0.03:
                     x_mid_v = midpoint_video_latents.double()
                     x_mid_a = midpoint_audio_latents.double()
                     for _ in range(100):
@@ -1846,8 +2018,8 @@ class LTX2DenoisingStage(DenoisingStage):
 
                 midpoint_denoised_video, midpoint_denoised_audio = (
                     evaluate_stage1_guided_x0(
-                        video_latents=midpoint_video_latents,
-                        audio_latents=midpoint_audio_latents,
+                        video_latents=midpoint_video_model_latents,
+                        audio_latents=midpoint_audio_model_latents,
                         sigma_value=sub_sigma,
                         update_skip_cache=False,
                     )
@@ -1863,34 +2035,38 @@ class LTX2DenoisingStage(DenoisingStage):
                 )
 
                 step_video_noise = (
-                    self._ltx2_res2s_noise_like(ctx.latents, ctx, substep=False).float()
+                    self._ltx2_res2s_noise_like(ctx.latents, ctx, substep=False)
                     if ctx.use_native_hq_res2s_sde_noise
                     else self._randn_like_with_batch_generators(
                         ctx.latents, batch
                     ).float()
                 )
                 step_audio_noise = (
-                    self._ltx2_res2s_noise_like(
-                        ctx.audio_latents, ctx, substep=False
-                    ).float()
+                    self._ltx2_res2s_noise_like(ctx.audio_latents, ctx, substep=False)
                     if ctx.use_native_hq_res2s_sde_noise
                     else self._randn_like_with_batch_generators(
                         ctx.audio_latents, batch
                     ).float()
                 )
+                sde_sigma = sigma if ctx.use_ltx23_hq_timestep_semantics else sigma_d
+                sde_sigma_next = (
+                    sigma_next if ctx.use_ltx23_hq_timestep_semantics else sigma_next_d
+                )
                 next_video_latents = self._ltx2_res2s_sde_step(
                     sample=anchor_video,
                     denoised_sample=next_video_deterministic,
-                    sigma=sigma_d,
-                    sigma_next=sigma_next_d,
+                    sigma=sde_sigma,
+                    sigma_next=sde_sigma_next,
                     noise=step_video_noise,
+                    terminal=False,
                 )
                 next_audio_latents = self._ltx2_res2s_sde_step(
                     sample=anchor_audio,
                     denoised_sample=next_audio_deterministic,
-                    sigma=sigma_d,
-                    sigma_next=sigma_next_d,
+                    sigma=sde_sigma,
+                    sigma_next=sde_sigma_next,
                     noise=step_audio_noise,
+                    terminal=False,
                 )
 
                 next_video_latents = self._ltx2_apply_clean_latent_mask(
@@ -1981,7 +2157,6 @@ class LTX2DenoisingStage(DenoisingStage):
 
     def _get_prompt_embeds_validator(self, batch: Req):
         """Allow either tensor or list prompt embeddings for LTX-2 prompts."""
-        del batch
         return lambda x: V.is_tensor(x) or V.list_not_empty(x)
 
     def _get_negative_prompt_embeds_validator(self, batch: Req):

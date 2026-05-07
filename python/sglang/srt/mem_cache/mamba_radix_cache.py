@@ -664,6 +664,7 @@ class MambaRadixCache(BasePrefixCache):
                 value=page_aligned_kv_indices,
                 mamba_value=mamba_value_forked,
                 prev_prefix_len=req.cache_protected_len,
+                chunked=chunked,
             )
         )
         new_prefix_len, mamba_exist = result.prefix_len, result.mamba_exist

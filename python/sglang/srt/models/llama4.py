@@ -39,7 +39,7 @@ from sglang.srt.layers.linear import (
     ReplicatedLinear,
     RowParallelLinear,
 )
-from sglang.srt.layers.moe import should_use_dp_reduce_scatterv
+from sglang.srt.layers.moe import should_skip_post_experts_all_reduce
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -146,10 +146,9 @@ class Llama4MoE(nn.Module):
 
         out_aD = routed_out + shared_out
 
-        if (
-            self.tp_size > 1
-            and not use_reduce_scatter
-            and not should_use_dp_reduce_scatterv()
+        if self.tp_size > 1 and not should_skip_post_experts_all_reduce(
+            is_tp_path=True,
+            use_reduce_scatter=use_reduce_scatter,
         ):
             out_aD = tensor_model_parallel_all_reduce(out_aD)
 
