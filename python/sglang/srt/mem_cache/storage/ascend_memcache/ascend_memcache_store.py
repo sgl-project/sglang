@@ -45,6 +45,10 @@ DEFAULT_ASCEND_MEMCACHE_TRACE_LOGGING = True
 # <= 0 means no limit (print all keys).
 DEFAULT_ASCEND_MEMCACHE_TRACE_MAX_KEYS = 0
 DEFAULT_ASCEND_MEMCACHE_PRINT_SAMPLE_KEYS = False
+DEFAULT_ASCEND_MEMCACHE_TRACE_BATCH_EXISTS_KEYS = False
+DEFAULT_ASCEND_MEMCACHE_TRACE_BATCH_EXISTS_MAX_HIT = True
+DEFAULT_ASCEND_MEMCACHE_TRACE_BATCH_PUT_KEYS = False
+DEFAULT_ASCEND_MEMCACHE_TRACE_BATCH_PUT_RESULT_BOOLS = False
 DEFAULT_ASCEND_MEMCACHE_SUPPRESS_HYBM_WARN = True
 DEFAULT_ASCEND_MEMCACHE_TRACE_FILE_NAME = "ascend_memcache_trace.log"
 _HYBM_WARN_FRAGMENT = "HYBM hybm_va_manager.cpp:173 GetRank] No allocated spaces found."
@@ -269,6 +273,22 @@ class AscendMemcacheStore(HiCacheStorage):
             "SGLANG_ASCEND_MEMCACHE_PRINT_SAMPLE_KEYS",
             "1" if DEFAULT_ASCEND_MEMCACHE_PRINT_SAMPLE_KEYS else "0",
         ).lower() in ("1", "true", "yes", "on")
+        self.trace_batch_exists_keys = os.getenv(
+            "SGLANG_ASCEND_MEMCACHE_TRACE_BATCH_EXISTS_KEYS",
+            "1" if DEFAULT_ASCEND_MEMCACHE_TRACE_BATCH_EXISTS_KEYS else "0",
+        ).lower() in ("1", "true", "yes", "on")
+        self.trace_batch_exists_max_hit = os.getenv(
+            "SGLANG_ASCEND_MEMCACHE_TRACE_BATCH_EXISTS_MAX_HIT",
+            "1" if DEFAULT_ASCEND_MEMCACHE_TRACE_BATCH_EXISTS_MAX_HIT else "0",
+        ).lower() in ("1", "true", "yes", "on")
+        self.trace_batch_put_keys = os.getenv(
+            "SGLANG_ASCEND_MEMCACHE_TRACE_BATCH_PUT_KEYS",
+            "1" if DEFAULT_ASCEND_MEMCACHE_TRACE_BATCH_PUT_KEYS else "0",
+        ).lower() in ("1", "true", "yes", "on")
+        self.trace_batch_put_result_bools = os.getenv(
+            "SGLANG_ASCEND_MEMCACHE_TRACE_BATCH_PUT_RESULT_BOOLS",
+            "1" if DEFAULT_ASCEND_MEMCACHE_TRACE_BATCH_PUT_RESULT_BOOLS else "0",
+        ).lower() in ("1", "true", "yes", "on")
         self.suppress_hybm_warn = os.getenv(
             "SGLANG_ASCEND_MEMCACHE_SUPPRESS_HYBM_WARN",
             "1" if DEFAULT_ASCEND_MEMCACHE_SUPPRESS_HYBM_WARN else "0",
@@ -278,10 +298,14 @@ class AscendMemcacheStore(HiCacheStorage):
             os.path.join(os.path.dirname(__file__), DEFAULT_ASCEND_MEMCACHE_TRACE_FILE_NAME),
         )
         logger.warning(
-            "[AscendMemcacheTraceInit] enabled=%s max_keys=%s print_sample_keys=%s trace_log_path=%s suppress_hybm_warn=%s",
+            "[AscendMemcacheTraceInit] enabled=%s max_keys=%s print_sample_keys=%s batch_exists_keys=%s batch_exists_max_hit=%s batch_put_keys=%s batch_put_result_bools=%s trace_log_path=%s suppress_hybm_warn=%s",
             self.enable_trace_logging,
             self.trace_max_keys,
             self.print_sample_keys,
+            self.trace_batch_exists_keys,
+            self.trace_batch_exists_max_hit,
+            self.trace_batch_put_keys,
+            self.trace_batch_put_result_bools,
             self.trace_log_path,
             self.suppress_hybm_warn,
         )
@@ -295,6 +319,34 @@ class AscendMemcacheStore(HiCacheStorage):
         if self.trace_max_keys <= 0:
             return list(keys)
         return list(keys[: self.trace_max_keys])
+
+    def _clip_trace_list(self, values: List[Any]) -> List[Any]:
+        if self.trace_max_keys <= 0:
+            return list(values)
+        return list(values[: self.trace_max_keys])
+
+    def _split_component_keys(self, keys: List[str]) -> Tuple[List[str], List[str], List[str]]:
+        k_keys: List[str] = []
+        v_keys: List[str] = []
+        other_keys: List[str] = []
+        for key in keys:
+            if key.endswith("_k"):
+                k_keys.append(key)
+            elif key.endswith("_v"):
+                v_keys.append(key)
+            else:
+                other_keys.append(key)
+        return k_keys, v_keys, other_keys
+
+    def _kv_component_trace_fields(self, keys: List[str], field_prefix: str) -> dict:
+        out = {f"{field_prefix}_keys": self._clip_trace_list(keys)}
+        k_keys, v_keys, other_keys = self._split_component_keys(keys)
+        if k_keys or v_keys:
+            out[f"{field_prefix}_k_keys"] = self._clip_trace_list(k_keys)
+            out[f"{field_prefix}_v_keys"] = self._clip_trace_list(v_keys)
+            if other_keys:
+                out[f"{field_prefix}_other_keys"] = self._clip_trace_list(other_keys)
+        return out
 
     def _append_trace_file(self, payload: dict) -> None:
         try:
@@ -390,7 +442,6 @@ class AscendMemcacheStore(HiCacheStorage):
             "page_first_direct",
             "page_head",
             "page_first_kv_split",
-            "page_first_kv_spilt",
         ], (
             "ascend_memcache storage backend only supports page_first, "
             "page_first_direct, page_head and page_first_kv_split layout"
@@ -455,7 +506,7 @@ class AscendMemcacheStore(HiCacheStorage):
         extra_info: Optional[HiCacheStorageExtraInfo] = None,
     ) -> PoolTransferResult:
         qkeys = self._tag_keys(keys)
-        kv_pages = self.batch_exists(qkeys, extra_info)
+        kv_pages = self.batch_exists(keys, extra_info)
 
         hit_count: dict = {PoolName.KV: kv_pages} if kv_pages else {}
         final_pages = kv_pages
@@ -534,16 +585,21 @@ class AscendMemcacheStore(HiCacheStorage):
                 exist_result = self._batch_exist(key_strs)
                 io_results = [0 if state == 1 else -1 for state in exist_result]
                 missing_idx = [i for i, state in enumerate(exist_result) if state != 1]
-                self._trace_event(
-                    {
-                        "op": f"batch_set_v2_exist:{transfer.name}",
-                        "flow": "host->store",
-                        "total_component_keys": len(key_strs),
-                        "already_exist_keys": len(key_strs) - len(missing_idx),
-                        "missing_keys": len(missing_idx),
-                        "sample_keys": self._sample_keys(key_strs),
-                    }
-                )
+                trace_payload = {
+                    "op": f"batch_set_v2_exist:{transfer.name}",
+                    "flow": "host->store",
+                    "total_component_keys": len(key_strs),
+                    "already_exist_keys": len(key_strs) - len(missing_idx),
+                    "missing_keys": len(missing_idx),
+                    "sample_keys": self._sample_keys(key_strs),
+                }
+                if self.trace_batch_put_keys:
+                    trace_payload.update(
+                        self._kv_component_trace_fields(
+                            key_strs, "batch_put_input_component"
+                        )
+                    )
+                self._trace_event(trace_payload)
                 if missing_idx:
                     start_time = time.perf_counter()
                     put_results = self._put_batch_zero_copy_impl(
@@ -590,9 +646,21 @@ class AscendMemcacheStore(HiCacheStorage):
                         "sample_keys": self._sample_keys(key_strs),
                     }
                 )
-            results[transfer.name] = self._batch_postprocess(
+            pool_results = self._batch_postprocess(
                 io_results, is_set_operate=is_set, key_multiplier=key_multiplier
             )
+            if is_set and self.trace_batch_put_result_bools:
+                self._trace_event(
+                    {
+                        "op": f"batch_set_v2_result:{transfer.name}",
+                        "flow": "host->store",
+                        "total_pages": len(pool_results),
+                        "ok_pages": sum(1 for x in pool_results if x),
+                        "failed_pages": sum(1 for x in pool_results if not x),
+                        "result_bools": self._clip_trace_list(pool_results),
+                    }
+                )
+            results[transfer.name] = pool_results
         return results
 
     def batch_get_v2(
@@ -712,8 +780,22 @@ class AscendMemcacheStore(HiCacheStorage):
         host_indices: torch.Tensor,
         extra_info: Optional[HiCacheStorageExtraInfo] = None,
     ) -> List[bool]:
-        keys = self._tag_keys(keys)
-        key_strs, buffer_ptrs, buffer_sizes = self._batch_preprocess(keys, host_indices)
+        page_keys = self._tag_keys(keys)
+        key_strs, buffer_ptrs, buffer_sizes = self._batch_preprocess(
+            page_keys, host_indices
+        )
+        if self.trace_batch_put_keys:
+            payload = {
+                "op": "batch_set_v1_input_keys",
+                "flow": "host->store",
+                "total_page_keys": len(page_keys),
+                "total_component_keys": len(key_strs),
+            }
+            payload.update(self._kv_component_trace_fields(page_keys, "batch_put_input_page"))
+            payload.update(
+                self._kv_component_trace_fields(key_strs, "batch_put_input_component")
+            )
+            self._trace_event(payload)
         exist_result = self._batch_exist(key_strs)
         existing_keys = sum(1 for state in exist_result if state == 1)
         self._trace_event(
@@ -769,8 +851,19 @@ class AscendMemcacheStore(HiCacheStorage):
 
             for i in range(len(set_indices)):
                 set_results[set_indices[i]] = put_results[i]
-
-        return self._batch_postprocess(set_results, is_set_operate=True)
+        page_results = self._batch_postprocess(set_results, is_set_operate=True)
+        if self.trace_batch_put_result_bools:
+            self._trace_event(
+                {
+                    "op": "batch_set_v1_result",
+                    "flow": "host->store",
+                    "total_pages": len(page_results),
+                    "ok_pages": sum(1 for x in page_results if x),
+                    "failed_pages": sum(1 for x in page_results if not x),
+                    "result_bools": self._clip_trace_list(page_results),
+                }
+            )
+        return page_results
 
     def set(
         self,
@@ -910,11 +1003,11 @@ class AscendMemcacheStore(HiCacheStorage):
     def batch_exists(
         self, keys: List[str], extra_info: Optional[HiCacheStorageExtraInfo] = None
     ) -> int:
-        keys = self._tag_keys(keys)
+        page_keys = self._tag_keys(keys)
 
         if self.is_mla_backend:
             query_keys = []
-            for key in keys:
+            for key in page_keys:
                 query_keys.append(f"{key}_{self.mla_suffix}_k")
                 if self._mla_uses_kv_split():
                     query_keys.append(f"{key}_{self.mla_suffix}_v")
@@ -922,13 +1015,13 @@ class AscendMemcacheStore(HiCacheStorage):
         else:
             query_keys = []
             if self.storage_config and self.storage_config.should_split_heads:
-                for key in keys:
+                for key in page_keys:
                     for suffix in self.mha_suffix:
                         query_keys.append(f"{key}_{suffix}_k")
                         query_keys.append(f"{key}_{suffix}_v")
                 key_multiplier = 2 * self.split_factor
             else:
-                for key in keys:
+                for key in page_keys:
                     query_keys.append(f"{key}_{self.mha_suffix}_k")
                     query_keys.append(f"{key}_{self.mha_suffix}_v")
                 key_multiplier = 2
@@ -939,16 +1032,28 @@ class AscendMemcacheStore(HiCacheStorage):
             if state != 1:
                 break
             hit_component_keys += 1
-        self._trace_event(
-            {
-                "op": "batch_exists",
-                "flow": "query",
-                "total_component_keys": len(query_keys),
-                "hit_component_keys": hit_component_keys,
-                "miss_component_keys": len(query_keys) - hit_component_keys,
-                "sample_keys": self._sample_keys(query_keys),
-            }
-        )
+        longest_hit_pages = len(query_keys) // key_multiplier
+        for i in range(len(query_keys)):
+            if exist_result[i] != 1:
+                longest_hit_pages = i // key_multiplier
+                break
+        payload = {
+            "op": "batch_exists",
+            "flow": "query",
+            "total_page_keys": len(page_keys),
+            "total_component_keys": len(query_keys),
+            "hit_component_keys": hit_component_keys,
+            "miss_component_keys": len(query_keys) - hit_component_keys,
+            "sample_keys": self._sample_keys(query_keys),
+        }
+        if self.trace_batch_exists_keys:
+            payload.update(self._kv_component_trace_fields(page_keys, "batch_exists_input_page"))
+            payload.update(
+                self._kv_component_trace_fields(query_keys, "batch_exists_input_component")
+            )
+        if self.trace_batch_exists_max_hit:
+            payload["max_contiguous_hit_pages"] = longest_hit_pages
+        self._trace_event(payload)
         for i in range(len(query_keys)):
             if exist_result[i] != 1:
                 return i // key_multiplier
@@ -983,7 +1088,11 @@ class AscendMemcacheStore(HiCacheStorage):
         # positive values for success and negative values for failures.
         out: List[int] = []
         for code, sz in zip(raw, buffer_sizes):
-            out.append(int(sz) if code == 0 else int(code))
+            code = int(code)
+            if code == 0:
+                out.append(int(sz))
+            else:
+                out.append(-abs(code))  # 所有非 0 都归一成失败
         return out
 
     def _batch_exist(self, key_strs: List[str]) -> List[int]:
