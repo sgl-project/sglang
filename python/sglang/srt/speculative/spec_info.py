@@ -2,7 +2,17 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from enum import Enum, IntEnum, auto
-from typing import TYPE_CHECKING, List, Optional, Tuple, Type, Union
+from typing import TYPE_CHECKING, Callable, List, Optional, Tuple, Type, Union
+
+from sglang.srt.speculative.spec_registry import (
+    CustomSpecAlgo,
+    ServerArgsValidator,
+    WorkerFactory,
+)
+from sglang.srt.speculative.spec_registry import get_spec as _get_registered_spec
+from sglang.srt.speculative.spec_registry import (
+    register_algorithm as _register_algorithm,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import ModelWorkerBatch
@@ -13,7 +23,11 @@ if TYPE_CHECKING:
 
 
 class SpeculativeAlgorithm(Enum):
-    """Speculative decoding algorithms."""
+    """Builtin speculative decoding algorithms. Plugin-registered ones are
+    ``CustomSpecAlgo`` instances; ``from_string`` returns either type, and
+    both expose the same ``is_*()`` / ``create_worker`` interface so callers
+    dispatch uniformly without isinstance checks.
+    """
 
     DFLASH = auto()
     EAGLE = auto()
@@ -24,13 +38,46 @@ class SpeculativeAlgorithm(Enum):
     NONE = auto()
 
     @classmethod
-    def from_string(cls, name: Optional[str]) -> SpeculativeAlgorithm:
+    def from_string(
+        cls, name: Optional[str]
+    ) -> Union[SpeculativeAlgorithm, CustomSpecAlgo]:
         if name is None:
             return cls.NONE
+        upper = name.upper()
         try:
-            return cls[name.upper()]
+            return cls[upper]
         except KeyError:
-            raise ValueError(f"Unknown speculative algorithm name: {name}")
+            pass
+        spec = _get_registered_spec(upper)
+        if spec is not None:
+            return spec
+        raise ValueError(f"Unknown speculative algorithm name: {name}")
+
+    @classmethod
+    def register(
+        cls,
+        name: str,
+        *,
+        supports_overlap: bool = False,
+        validate_server_args: Optional[ServerArgsValidator] = None,
+        spec_class: Type[CustomSpecAlgo] = CustomSpecAlgo,
+    ) -> Callable[[WorkerFactory], WorkerFactory]:
+        """Decorator to register a plugin speculative algorithm. The factory
+        takes ``server_args`` and returns the worker class. Pass a
+        ``CustomSpecAlgo`` subclass via ``spec_class`` to override any
+        ``is_*()`` / ``create_worker`` method.
+
+        Example:
+            @SpeculativeAlgorithm.register("MY_SPEC", supports_overlap=False)
+            def _factory(server_args):
+                return MySpecWorker
+        """
+        return _register_algorithm(
+            name,
+            supports_overlap=supports_overlap,
+            validate_server_args=validate_server_args,
+            spec_class=spec_class,
+        )
 
     def is_none(self) -> bool:
         return self == SpeculativeAlgorithm.NONE
