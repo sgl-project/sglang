@@ -19,7 +19,6 @@ class NumpyArrayFileRef:
     path: str
 
     def materialize(self) -> np.ndarray:
-        # File refs are single-use; unlink after np.load to avoid temp-file leaks.
         try:
             return np.load(self.path, allow_pickle=False)
         finally:
@@ -30,7 +29,6 @@ class NumpyArrayFileRef:
 
 
 def is_local_endpoint(endpoint: str) -> bool:
-    # File refs require a shared local filesystem between scheduler and client.
     return endpoint.startswith(
         ("tcp://127.0.0.1:", "tcp://localhost:", "ipc://", "inproc://")
     )

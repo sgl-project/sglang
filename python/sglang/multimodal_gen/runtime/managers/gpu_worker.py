@@ -370,8 +370,7 @@ class GPUWorker:
                 if torch.cuda.is_initialized():
                     torch.cuda.empty_cache()
             else:
-                # For offline return_frames requests, doing the tensor->uint8 frame
-                # conversion here avoids sending GPU tensors through scheduler ZMQ.
+                # Keep return_frames payloads off the scheduler's tensor ZMQ path.
                 self._materialize_frame_outputs_for_return(output_batch, req)
 
             if torch.cuda.is_initialized() and output_batch.output is None:
@@ -450,7 +449,6 @@ class GPUWorker:
             and not req.enable_frame_interpolation
             and not req.enable_upscaling
         ):
-            # Match post_process_sample: C/F/H/W float tensor -> F/H/W/C uint8.
             if output.dim() == 3:
                 output = output.unsqueeze(1)
             output = (output * 255).clamp(0, 255).to(torch.uint8)

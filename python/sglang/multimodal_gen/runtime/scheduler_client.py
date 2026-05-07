@@ -215,7 +215,6 @@ def _materialize_output_batch_file_refs(output_batch: Any) -> None:
     if not isinstance(output_batch, OutputBatch):
         return
 
-    # Materialize at the first client boundary; file refs unlink themselves.
     start_time = time.perf_counter()
     output_batch.output = materialize_file_refs(output_batch.output)
     if output_batch.metrics is not None:

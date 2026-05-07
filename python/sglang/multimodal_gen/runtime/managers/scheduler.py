@@ -613,7 +613,6 @@ class Scheduler(SchedulerDisaggMixin):
         """
         if not is_warmup and self.receiver is not None and identity is not None:
             if is_local_endpoint(self.server_args.scheduler_endpoint):
-                # Same-host clients can receive large frame arrays as file refs.
                 start_time = time.perf_counter()
                 output_batch.output = spill_large_arrays_to_file_refs(
                     output_batch.output
