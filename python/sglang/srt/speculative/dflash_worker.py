@@ -778,19 +778,20 @@ class DFlashWorker:
         if draft_hidden is None:
             raise RuntimeError("DFLASH draft model returned no hidden states.")
         draft_hidden = draft_hidden.view(bs, self.block_size, -1)
-        # Always greedy-sample all (block_size - 1) candidates regardless of effective_verify_len.
-        # This preserves the full draft computation; truncation happens below.
+        # Only sample effective_verify_len-1 candidates to avoid wasted LM head compute.
+        effective_verify_len = self._effective_verify_len
         draft_next = self._greedy_sample_from_vocab_parallel_head(
-            hidden_states=draft_hidden[:, 1:, :].reshape(-1, draft_hidden.shape[-1]),
+            hidden_states=draft_hidden[:, 1:effective_verify_len, :].reshape(
+                -1, draft_hidden.shape[-1]
+            ),
             lm_head=lm_head,
-        ).view(bs, self.block_size - 1)
+        ).view(bs, effective_verify_len - 1)
         draft_tokens_full = self._draft_block_tokens_buf[:bs]  # [bs, block_size]
         draft_tokens_full[:, 0].copy_(block_ids[:, 0])
-        draft_tokens_full[:, 1:].copy_(draft_next)
+        draft_tokens_full[:, 1:effective_verify_len].copy_(draft_next)
 
         # Adaptive truncation: send only the first effective_verify_len tokens to the target verify.
         # When adaptive is disabled, effective_verify_len == block_size (no truncation).
-        effective_verify_len = self._effective_verify_len
         if effective_verify_len < self.block_size:
             # Contiguous copies are small (bs × effective_verify_len × ~8 bytes) and negligible
             # compared to the attention cost saved at the target verify side.
