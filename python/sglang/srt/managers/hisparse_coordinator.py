@@ -246,6 +246,7 @@ class HiSparseCoordinator:
           but here the buffer is empty.
         """
         if self.is_dsv4_hisparse:
+            # TODO(dsv4): wire PD direct-to-host. Needs (a) load_to_device_per_layer
             raise NotImplementedError(
                 "PD direct-to-host admission is not supported for dsv4 hisparse yet."
             )
@@ -458,7 +459,10 @@ class HiSparseCoordinator:
                 :, req_pool_indices, self.device_buffer_size
             ] = reserved_buffer_loc.to(torch.int32)
 
-            # todo, clear the prior mapping as well
+            # No need to clear prior mappings: the only consumer of the mapping
+            # for past tokens is the swap-in kernel, and it goes through
+            # top_k_device_locs returned by swap_in_selected_pages -- not via
+            # mapping[old_out_cache_loc] -- so stale entries are harmless.
             compressed_locs = self.token_to_kv_pool_allocator.get_last_loc_compressed(
                 out_cache_loc
             )
@@ -598,6 +602,10 @@ class HiSparseCoordinator:
         This is a naive per-request loop implementation for debugging/validation.
         Production code uses swap_in_selected_pages (JIT CUDA kernel) instead.
 
+        Note: dsv4 hisparse is not supported — DeepSeekV4SingleKVPoolHost has no
+        load_to_device_per_layer and indices live in compressed space. Currently
+        only used as a kernel oracle in test_hisparse_unit.py (non-dsv4 path).
+
         Args:
             req_pool_indices: Pool indices for each request.  Shape: (num_reqs,)
             seq_lens: Sequence lengths for each request.  Shape: (num_reqs,)
@@ -607,6 +615,9 @@ class HiSparseCoordinator:
         Returns:
             Device KV cache indices for the selected tokens.  Shape: (num_reqs, top_k)
         """
+        assert (
+            not self.is_dsv4_hisparse
+        ), "naive_load_topk is not implemented for dsv4 hisparse"
         num_reqs = req_pool_indices.size(0)
         top_k_indices = torch.full(
             (num_reqs, self.top_k), -1, dtype=torch.int32, device=self.device
@@ -712,7 +723,14 @@ class HiSparseCoordinator:
             device_module.current_stream().wait_stream(self.decode_producer_stream)
         self.wait_for_pending_backup()
 
-        compressed_len = req.seqlen // self.compress_ratio
+        # Use kv_allocated_len (not seqlen): under speculative decoding the
+        # allocator can over-allocate beyond the committed seqlen, and those
+        # extra slots may carry stale mapping entries pointing at buffer slots
+        # we just freed via free_hisparse_indices(all_hi). If left set, the
+        # subsequent release_kv_cache -> allocator.free -> free_hisparse path
+        # re-frees them (double-free into the page allocator's free list).
+        allocated_len = req.kv_allocated_len
+        compressed_len = allocated_len // self.compress_ratio
 
         # release memory -- only free actually-allocated buffer indices
         current_cap = int(self.req_device_buffer_size[req.req_pool_idx])
@@ -723,7 +741,7 @@ class HiSparseCoordinator:
                 self.token_to_kv_pool_allocator.free_hisparse_indices(all_hi)
 
         allocated_locs = self.req_to_token_pool.req_to_token[
-            req.req_pool_idx, : req.seqlen
+            req.req_pool_idx, :allocated_len
         ]
         compressed_locs = self.mem_pool_device.translate_loc_from_full_to_compressed(
             allocated_locs
