@@ -2,7 +2,7 @@ FROM lmsysorg/sglang:v0.5.7-cu130-runtime
 
 # need: cu13, arm docker
 RUN mkdir -p /workspace && cd /workspace && rm -rf sglang && \
-    git clone -b deepseek_v4 https://github.com/sgl-project/sglang.git
+    git clone -b deepseek_v4_dev https://github.com/sgl-project/sglang.git
 
 RUN pip install https://github.com/sgl-project/whl/releases/download/v0.3.21/sgl_kernel-0.3.21+cu130-cp310-abi3-manylinux2014_aarch64.whl
 RUN pip install cuda-python --upgrade
