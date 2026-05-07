@@ -2275,29 +2275,53 @@ def force_maintain_logits_triton(
 
 
 @triton.jit
-def _force_maintain_logits_decode_kernel(
+def _clean_and_force_maintain_logits_decode_kernel(
     LOGITS_PTR,
     CU_KE_PTR,
     stride_row,
+    L,
+    BLOCK: tl.constexpr,
 ):
     row = tl.program_id(0)
+    blk = tl.program_id(1)
     ke = tl.load(CU_KE_PTR + row)
+    base = LOGITS_PTR + row * stride_row
+
+    block_start = blk * BLOCK
+    offsets = block_start + tl.arange(0, BLOCK)
+    in_range = offsets < L
+    # Clean: positions >= ke (and within row) become -inf. Replaces what
+    # deep_gemm.fp8_paged_mqa_logits used to do via ``clean_logits=True``,
+    # which on SM90 routes to smxx_clean_logits and asserts 1D context_lens
+    # (incompatible with the 2D requirement at attention.hpp:352).
+    invalid = in_range & (offsets >= ke)
+    tl.store(base + offsets, float("-inf"), mask=invalid)
+
+    # Force-maintain +inf sentinels at pos 0 and pos ke-1. Writes happen
+    # after the clean above (program-local ordering), and only one block
+    # touches each position so no inter-block race.
+    pos_inf = float("inf")
+    if blk == 0 and ke > 0:
+        tl.store(base, pos_inf)
     if ke > 0:
-        base = LOGITS_PTR + row * stride_row
-        pos_inf = float("inf")
-        tl.store(base, pos_inf)  # ks = 0 (implicit)
-        tl.store(base + (ke - 1), pos_inf)  # last valid pool block
+        ke_last = ke - 1
+        if (ke_last >= block_start) and (ke_last < block_start + BLOCK):
+            tl.store(base + ke_last, pos_inf)
 
 
-def force_maintain_logits_decode_triton(
+def clean_and_force_maintain_logits_decode_triton(
     logits: torch.Tensor,  # [B, max_seq_len] f32 (or [B, 1, max_seq_len])
     num_pool_blocks_per_req: torch.Tensor,  # [B] i32
 ) -> torch.Tensor:
-    """Decode-specific force_maintain: writes +inf at pool block 0 and at
-    ``num_pool_blocks_per_req - 1`` per row. ``ks`` is implicitly 0 — for
-    paged decode, every request's pool blocks start at logical index 0 in
-    its own pool_page_table. Avoids the per-call cu_ks_zero alloc that
-    ``force_maintain_logits_triton`` requires.
+    """Decode-specific clean + force_maintain in a single kernel:
+      * positions ``>= num_pool_blocks_per_req[b]`` per row -> ``-inf``
+        (mask out logits past the per-row valid range; replaces DG's
+        ``clean_logits=True`` which is incompatible with 2D context_lens
+        on SM90)
+      * pos 0 and pos ``num_pool_blocks_per_req[b] - 1`` per row -> ``+inf``
+        (sentinel for downstream radix select). ``ks`` is implicitly 0 —
+        for paged decode, every request's pool blocks start at logical
+        index 0 in its own pool_page_table.
     """
     assert logits.dtype == torch.float32
     if logits.dim() == 3:
@@ -2306,13 +2330,17 @@ def force_maintain_logits_decode_triton(
     else:
         logits_2d = logits
     assert logits_2d.dim() == 2 and logits_2d.stride(1) == 1
-    seq = logits_2d.shape[0]
+    seq, L = logits_2d.shape
     if seq == 0:
         return logits
-    _force_maintain_logits_decode_kernel[(seq,)](
+    BLOCK = 256
+    grid = (seq, triton.cdiv(L, BLOCK))
+    _clean_and_force_maintain_logits_decode_kernel[grid](
         logits_2d,
         num_pool_blocks_per_req,
         logits_2d.stride(0),
+        L,
+        BLOCK=BLOCK,
     )
     return logits
 

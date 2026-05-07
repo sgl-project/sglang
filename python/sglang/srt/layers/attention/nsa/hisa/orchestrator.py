@@ -30,7 +30,7 @@ from sglang.srt.layers.attention.nsa.hisa.tilelang_kernels import (
 )
 from sglang.srt.layers.attention.nsa.hisa.triton_kernels import (
     block_sparse_mqa_triton,
-    force_maintain_logits_decode_triton,
+    clean_and_force_maintain_logits_decode_triton,
     force_maintain_logits_triton,
     sparse_paged_mqa_triton,
 )
@@ -99,11 +99,11 @@ def fp8_native_hierarchy_paged_mqa_logits(
     paged_block_size: int = 64,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     # 1) Tail-pool refresh is *skipped*. Stage 2's force_maintain at
-    # ``pool_idx == k_e - 1`` (force_maintain_logits_decode_triton below)
-    # always assigns +inf to the tail block — so the tail's actual mean-pool
-    # value never affects topk selection. Stage 4 reads raw KV cache for the
-    # selected blocks, not pool_k_pages, so a stale tail in pool_k_pages
-    # also doesn't contaminate the final logits.
+    # ``pool_idx == k_e - 1`` (clean_and_force_maintain_logits_decode_triton
+    # below) always assigns +inf to the tail block — so the tail's actual
+    # mean-pool value never affects topk selection. Stage 4 reads raw KV
+    # cache for the selected blocks, not pool_k_pages, so a stale tail in
+    # pool_k_pages also doesn't contaminate the final logits.
 
     # 2) Block-MQA via DG ``fp8_paged_mqa_logits``. pool_k_pages is page-level
     # SoA (bytes [0, ps*D) = fp8, bytes [ps*D, ps*(D+4)) = f32 scales),
@@ -116,8 +116,8 @@ def fp8_native_hierarchy_paged_mqa_logits(
     # ``schedule_metadata`` is computed once per forward by the caller
     # (HisaIndexer; mirrors nsa_indexer.py:478-483 — getattr-fallback)
     # so that all 61 layers share a stable buffer captured into the
-    # cuda graph. ``force_maintain_logits_decode_triton`` takes only ke
-    # (no cu_ks tensor) — saves the per-call zeros_like alloc.
+    # cuda graph. ``clean_and_force_maintain_logits_decode_triton`` takes
+    # only ke (no cu_ks tensor) — saves the per-call zeros_like alloc.
     #
     # Speed (test_dg_decode.py speed_compare, schedule precomputed):
     #   eager full orch: ~8% slower than triton stage-2
@@ -137,17 +137,29 @@ def fp8_native_hierarchy_paged_mqa_logits(
     # max_seq_len tokens / k_block_size, rounded up. Tighter than reading from
     # pool_page_tables.shape (which carries the pool allocator's outer padding).
     max_pool_seq_len = (max_seq_len + k_block_size - 1) // k_block_size
+    # DeepGEMM release-0426 requires context_lens of shape [batch_size, next_n];
+    # hisa paged decode uses next_n=1, so unsqueeze the 1D pool-block count.
+    num_pool_blocks_per_req_2d = (
+        num_pool_blocks_per_req
+        if num_pool_blocks_per_req.dim() == 2
+        else num_pool_blocks_per_req.unsqueeze(-1)
+    )
+    # NOTE: clean_logits=False because clean_logits=True routes to the SM90
+    # smxx_clean_logits path which asserts 1D context_lens (attention.hpp:381
+    # "not is_context_lens_2d") and is incompatible with the 2D requirement
+    # at :352. The clean_and_force_maintain triton kernel below replaces it
+    # — it writes -inf at out-of-range positions AND the +inf sentinels.
     block_k_indexer_score = deep_gemm.fp8_paged_mqa_logits(
         q_fp8,  # [B, 1, H, D]
         pool_k_view,  # [N_pp, pool_page_size, 1, D+4]
         weights_2d,  # [B, H]
-        num_pool_blocks_per_req,  # [B] i32 — pool-block "context_lens"
+        num_pool_blocks_per_req_2d,  # [B, 1] i32 — pool-block "context_lens"
         pool_page_tables,  # [B, max_pp] i32
         schedule_metadata,
         max_pool_seq_len,
-        clean_logits=True,
-    )  # [B*1, max_pool_seq_len] f32 (-inf past num_pool_blocks_per_req)
-    force_maintain_logits_decode_triton(
+        clean_logits=False,
+    )  # [B*1, max_pool_seq_len] f32 (raw, must be cleaned below)
+    clean_and_force_maintain_logits_decode_triton(
         block_k_indexer_score,
         num_pool_blocks_per_req,
     )

@@ -468,10 +468,16 @@ class HisaIndexer(MultiPlatformOp):
         # Reuse pre-computed schedule metadata if available (from init_forward_metadata),
         # otherwise fall back to computing it here.
         schedule_metadata = getattr(metadata, "paged_mqa_schedule_metadata", None)
+        # DeepGEMM release-0426 requires context_lens of shape [batch_size, next_n].
+        # Match the layout used by nsa_indexer.py.
+        if seqlens_32.dim() == 2:
+            seqlens_32_2d = seqlens_32
+        else:
+            seqlens_32_2d = seqlens_32.unsqueeze(-1)
         if _is_cuda:
             if schedule_metadata is None:
                 schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
-                    seqlens_32, blocksize, self.sm_count
+                    seqlens_32_2d, blocksize, self.sm_count
                 )
 
         assert len(q_fp8.shape) == 3
@@ -517,7 +523,7 @@ class HisaIndexer(MultiPlatformOp):
                 seqlens_32[:q_offset] + self.hisa_k_block_size - 1
             ) // self.hisa_k_block_size
             pool_schedule = deep_gemm.get_paged_mqa_logits_metadata(
-                npbpr,
+                npbpr.unsqueeze(-1) if npbpr.dim() == 1 else npbpr,
                 kv_pool.pool_page_size,
                 self.sm_count,
             )
