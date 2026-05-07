@@ -14,13 +14,15 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_classifier_free_guidance_rank,
     get_classifier_free_guidance_world_size,
 )
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+
+logger = init_logger(__name__)
 
 if TYPE_CHECKING:
     from sglang.multimodal_gen.runtime.distributed.cfg_policy import (
         CFGBranch,
         CFGPolicy,
     )
-
 
 # Tracks (n_branches, cfg_world_size, cfg_rank) tuples already logged so the
 # dispatch table is printed once per unique configuration, not once per step.
@@ -30,6 +32,7 @@ _logged_dispatch_keys: set[tuple[int, int, int]] = set()
 def _run(
     predict_fn: Callable[["CFGBranch"], "torch.Tensor | tuple[torch.Tensor, ...]"],
     bid: int,
+    branches,
 ) -> tuple[torch.Tensor, ...]:
     branch = branches[bid]
     device = get_local_torch_device()
@@ -93,11 +96,11 @@ def run_cfg_parallel(
 
     # perform the forward for local branches
     predicts_from_local_branches: list[tuple[torch.Tensor, ...]] = [
-        _run(predict_fn, bid) for bid in branches_assigned_to_local_rank
+        _run(predict_fn, bid, branches) for bid in branches_assigned_to_local_rank
     ]
 
     if not predicts_from_local_branches:  # idle rank: run branch 0 for tensor shapes
-        predicts_from_local_branches.append(_run(predict_fn, 0))
+        predicts_from_local_branches.append(_run(predict_fn, 0, branches))
 
     # pad the predicts to the length of max_num_branches_per_rank, to prepare for the all-gather later
     ref = predicts_from_local_branches[0]
