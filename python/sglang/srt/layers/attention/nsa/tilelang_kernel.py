@@ -97,6 +97,37 @@ def _pick_inner_iter(seq: int, ni: int, cu: int, block_per_cu: int) -> int:
         it //= 2
     return 1
 
+@lru_cache(maxsize=8)
+def _pick_inner_iter_combine(
+    seq: int,
+    ni_1: int,
+    ni_2: int,
+    cu: int,
+    block_per_cu: int,
+) -> Tuple[int, int]:
+    target_blocks = cu * block_per_cu
+
+    ## prevent register spills 
+    iter_2 = ni_2
+    while iter_2 > 4 and iter_2 % 2 == 0:
+        iter_2 //= 2
+    iter_1 = ni_1
+
+    while iter_1 > 1 or iter_2 > 1:
+        total_blocks = seq * (ni_1 // iter_1 + ni_2 // iter_2)
+        if total_blocks < target_blocks // 2: 
+            max_iter = max(iter_2, iter_1)
+            if max_iter % 2 != 0:
+                break # TODO, later optimize.
+            if iter_2 == max_iter:
+                iter_2 //= 2
+            if iter_1 == max_iter:
+                iter_1 //= 2
+        else:
+            break
+
+    return iter_1, iter_2
+
 
 @tilelang.jit(pass_configs=pass_configs)
 def act_quant_kernel(
@@ -1594,7 +1625,7 @@ def dpsk_v4_fp8_partial_kernel(
     topk1: int, # 128
     block_size_kv_1: int, # 128
     topk2: int = 0, # 512||64
-    block_size_kv_2: int = 0, 
+    block_size_kv_2: int = 0,
     *,
     dim: int = 448,
     tail_dim: int = 64,
@@ -2289,10 +2320,6 @@ def dpsk_v4_fp8_attention_fwd(
     """
     Follows the original `flash_mla.flash_mla_with_kvcache` signature.
     """
-    if _is_gfx95_supported:
-        block_I, threads, num_stages, block_per_cu, cu = 32, 512, 0, 2, 256
-    # else:
-    #     block_I, threads, num_stages, block_per_cu, cu = 32, 128, 1, 1, 304
 
     batch, seq_len, num_heads, _ = q.shape # [8192, 1, 128]
     # Partial grid is (seq_len * REPLICATE_H * n_groups, batch, kv_group); the
@@ -2303,6 +2330,14 @@ def dpsk_v4_fp8_attention_fwd(
 
     k1, _, bs_kv_1 = _build_fp8_combined_view(k_cache) # bs_kv_1 = 128 # k1: compbined_view kvcache.
     topk1 = indices.shape[-1] # 128
+    has_extra = extra_k_cache is not None # True
+    topk2 = extra_indices_in_kvcache.shape[-1] if has_extra else 0 # 512||64
+    if _is_gfx95_supported:
+        block_I, threads, num_stages, block_per_cu, cu = 64, 512, 0, 1, 256
+        if seq * (topk1 // block_I + topk2 // block_I) <= cu * block_per_cu // 2:
+            block_I = 32
+    # else:
+    #     block_I, threads, num_stages, block_per_cu, cu = 32, 128, 1, 1, 304
     ni_1 = topk1 // block_I # 2
     tk_len_1 = (
         topk_length # 8192
@@ -2314,7 +2349,6 @@ def dpsk_v4_fp8_attention_fwd(
             (num_heads,), float("-inf"), dtype=torch.float32, device=q.device
         )
 
-    has_extra = extra_k_cache is not None # True
     if not has_extra:
         inner_iter_1 = _pick_inner_iter(seq, ni_1, cu, block_per_cu)
         partial = dpsk_v4_fp8_partial_kernel(
@@ -2331,14 +2365,10 @@ def dpsk_v4_fp8_attention_fwd(
         n_groups = ni_1 // inner_iter_1
     else:
         k2, _, bs_kv_2 = _build_fp8_combined_view(extra_k_cache) # bs_kv_2 = 64||2
-        topk2 = extra_indices_in_kvcache.shape[-1] # 512||64
         ni_2 = topk2 // block_I # 8 || 1
-        # Each phase picks its own optimal split-K independently — kernel
-        # body uses two T.Pipelined loops with separate compile-time iter
-        # counts, no shared-divisor constraint.
-        # 16384, 8, 256, 2
-        inner_iter_1 = _pick_inner_iter(seq, ni_1, cu, block_per_cu) # 2
-        inner_iter_2 = _pick_inner_iter(seq, ni_2, cu, block_per_cu) # 8 || 1
+        inner_iter_1, inner_iter_2= _pick_inner_iter_combine(
+            seq, ni_1, ni_2, cu, block_per_cu
+        )
         # inner_iter_2 = min(inner_iter_2, 4) # TODO(zty) 好像有一点点用...
 
         tk_len_2 = (
