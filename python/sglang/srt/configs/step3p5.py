@@ -1,7 +1,7 @@
 from typing import Any, Optional
 
 from transformers.configuration_utils import PretrainedConfig
-
+from sglang.srt.utils import is_npu
 
 class Step3p5Config(PretrainedConfig):
     model_type = "step3p5"
@@ -102,5 +102,7 @@ class Step3p5Config(PretrainedConfig):
         real_num_hidden_layers = self.num_hidden_layers
         if layer_types is not None and len(layer_types) != self.num_hidden_layers:
             self.num_hidden_layers = len(layer_types)
+        if _is_npu:
+            self.hidden_act = "npu_swiglustep_and_mul"
         super().__init__(**kwargs)
         self.num_hidden_layers = real_num_hidden_layers
