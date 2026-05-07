@@ -8,8 +8,7 @@ tilelang kernels still on the production hot path:
   - ``fp8_native_paged_mean_pooling_completed_blocks_interface`` (pool-K cache writeback)
 
 All other tilelang code (legacy orchestrators, ablation variants, torch-ref
-impls) lives in ``tilelang_legacy.py`` and is slated for removal once the
-SGLANG_HISA_DISABLE_TRITON fallback is dropped.
+impls) lives in ``tilelang_legacy.py`` and is slated for removal.
 """
 
 import tilelang

@@ -12,13 +12,11 @@ Same control flow as the tilelang fallback
 Per-step on decode (B=10, ctx=65K): ~12 ms / step vs the all-tilelang
 fallback at the indexer level (steady-state ~5 ms vs ~17 ms). Correctness:
 fp8 ULP drift <= 2.6% rel, topk-2048 IoU >= 0.997 vs tilelang — within fp8
-accumulation noise, no e2e regression expected (verify with
-``SGLANG_HISA_VERIFY=1`` when flipping the default).
+accumulation noise, no e2e regression expected.
 """
 
 from __future__ import annotations
 
-import os
 
 import deep_gemm
 import torch
@@ -44,7 +42,6 @@ from sglang.srt.layers.attention.nsa.hisa.triton_kernels import (
 # to torch.topk(bf16) when topk > _FAST_TOPK_MAX (out of fast_topk's range).
 # Production block_topk = 8192//K ∈ {512, 256, 128, 64}, well within
 # fast_topk capacity. Output is i32; downstream wrappers accept i32 / i64.
-_FAST_TOPK_DISABLE = os.environ.get("SGLANG_HISA_FAST_TOPK_DISABLE", "0") == "1"
 
 
 def _stage3_topk_prefill(
@@ -59,7 +56,7 @@ def _stage3_topk_prefill(
     without per-row lengths.
     """
     topk = min(block_topk, score_2d.shape[-1])
-    if _FAST_TOPK_DISABLE or topk > _FAST_TOPK_MAX:
+    if topk > _FAST_TOPK_MAX:
         # bf16 path: ~40% faster than f32 torch.topk on long rows.
         return torch.topk(
             score_2d.bfloat16(),
@@ -83,7 +80,7 @@ def _stage3_topk_decode(
     picks correctly over the full row.
     """
     topk = min(block_topk, score_3d.shape[-1])
-    if _FAST_TOPK_DISABLE or topk > _FAST_TOPK_MAX:
+    if topk > _FAST_TOPK_MAX:
         return torch.topk(score_3d, k=topk, dim=-1, sorted=False).indices
     B, S, L = score_3d.shape
     return fast_topk_runtime(score_3d.view(B * S, L), topk).view(B, S, topk)
