@@ -721,7 +721,11 @@ class ChatCompletionRequest(BaseModel):
                 ctk = values.get("chat_template_kwargs")
                 if not isinstance(ctk, dict):
                     ctk = {}
+                # different models check different keys:
+                # - "thinking" for deepseek-v3, kimi_k2
+                # - "enable_thinking" for qwen3, glm45, nemotron_3, interns1, mimo
                 ctk.setdefault("thinking", True)
+                ctk.setdefault("enable_thinking", True)
                 values["chat_template_kwargs"] = ctk
 
         if values.get("reasoning_effort") == "none":
