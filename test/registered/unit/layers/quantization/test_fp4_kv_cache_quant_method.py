@@ -129,7 +129,7 @@ class TestNVFP4KVMethod(CustomTestCase):
 
         major, minor = torch.cuda.get_device_capability()
         m = NVFP4KVMethod(num_layers=1, device="cuda", sm_version=major * 10 + minor)
-        
+
         size, heads, dim = 32, 8, 128
         bufs = m.create_buffers(size, heads, dim, 1, "cuda")
 
