@@ -26,7 +26,7 @@ from flydsl._mlir.dialects import (
 )
 from flydsl._mlir.dialects import vector as _vector
 from flydsl.compiler.kernel_function import CompilationContext
-from flydsl.expr import arith, buffer_ops, range_constexpr
+from flydsl.expr import arith, buffer_ops, const_expr, range_constexpr
 from flydsl.expr.arith import ArithValue, CmpIPredicate
 from flydsl.expr.typing import Int32, T
 
@@ -129,7 +129,7 @@ def _build_fused_norm_module(D: int, is_rms: bool, has_gate: bool, has_weight: b
             r_f32 = arith_ops.ExtFOp(vec_f32_t, _v(r_vec)).result
             x_f32 = arith_ops.ExtFOp(vec_f32_t, _v(x_vec)).result
 
-            if has_gate:
+            if const_expr(has_gate):
                 g_off = gate_row_off + col
                 g_vec = buffer_ops.buffer_load(g_rsrc, g_off, vec_width=VEC, dtype=bf16)
                 g_f32 = arith_ops.ExtFOp(vec_f32_t, _v(g_vec)).result
@@ -142,7 +142,7 @@ def _build_fused_norm_module(D: int, is_rms: bool, has_gate: bool, has_weight: b
             buffer_ops.buffer_store(ro_bf16, ro_rsrc, off)
             _saved_ro_f32.append(ro_f32)
 
-            if not is_rms:
+            if const_expr(not is_rms):
                 v_sum = _vector.ReductionOp(
                     f32, _vector.CombiningKind.ADD, ro_f32
                 ).result
@@ -157,7 +157,7 @@ def _build_fused_norm_module(D: int, is_rms: bool, has_gate: bool, has_weight: b
         w_sq = partial_sum_sq
         for sh in [32, 16, 8, 4, 2, 1]:
             off_sh = _v(arith.constant(sh, type=i32))
-            if not is_rms:
+            if const_expr(not is_rms):
                 peer_sum = _gpu.ShuffleOp(
                     w_sum, off_sh, width_c, mode=_gpu.ShuffleMode.XOR
                 ).shuffleResult
@@ -173,7 +173,7 @@ def _build_fused_norm_module(D: int, is_rms: bool, has_gate: bool, has_weight: b
 
         _if_lane0 = scf.IfOp(lane_0)
         with ir.InsertionPoint(_if_lane0.then_block):
-            if not is_rms:
+            if const_expr(not is_rms):
                 _memref.StoreOp(w_sum, lds, [wave_idx])
             sq_slot = arith_ops.AddIOp(
                 wave_idx,
@@ -199,7 +199,7 @@ def _build_fused_norm_module(D: int, is_rms: bool, has_gate: bool, has_weight: b
             ).result,
         ).result
 
-        if is_rms:
+        if const_expr(is_rms):
             _if_active = scf.IfOp(active, [f32], has_else=True)
             with ir.InsertionPoint(_if_active.then_block):
                 sq_val = _memref.LoadOp(lds, [lane_idx_sq]).result
@@ -223,7 +223,7 @@ def _build_fused_norm_module(D: int, is_rms: bool, has_gate: bool, has_weight: b
         final_sq = loaded_sq
         for sh in [32, 16, 8, 4, 2, 1]:
             off_sh = _v(arith.constant(sh, type=i32))
-            if not is_rms:
+            if const_expr(not is_rms):
                 ps = _gpu.ShuffleOp(
                     final_sum, off_sh, width_c, mode=_gpu.ShuffleMode.XOR
                 ).shuffleResult
@@ -243,13 +243,13 @@ def _build_fused_norm_module(D: int, is_rms: bool, has_gate: bool, has_weight: b
         ).result
         _if_both = scf.IfOp(both_0)
         with ir.InsertionPoint(_if_both.then_block):
-            if not is_rms:
+            if const_expr(not is_rms):
                 _memref.StoreOp(final_sum, lds, [final_sum_slot])
             _memref.StoreOp(final_sq, lds, [final_sq_slot])
             scf.YieldOp([])
         _gpu.BarrierOp()
 
-        if not is_rms:
+        if const_expr(not is_rms):
             total_sum = _memref.LoadOp(lds, [final_sum_slot]).result
         else:
             total_sum = _v(c_zero_f32)
@@ -258,7 +258,7 @@ def _build_fused_norm_module(D: int, is_rms: bool, has_gate: bool, has_weight: b
         # Norm
         d_f = _v(D_float)
         eps_v = _v(eps_val)
-        if is_rms:
+        if const_expr(is_rms):
             var = arith_ops.DivFOp(total_sq, d_f).result
             var_eps = arith_ops.AddFOp(var, eps_v).result
             rstd = math_ops.RsqrtOp(var_eps).result
@@ -285,13 +285,13 @@ def _build_fused_norm_module(D: int, is_rms: bool, has_gate: bool, has_weight: b
 
             ro_f32 = _saved_ro_f32[it]
 
-            if is_rms:
+            if const_expr(is_rms):
                 x_hat = arith_ops.MulFOp(ro_f32, rstd_splat).result
             else:
                 centered = arith_ops.SubFOp(ro_f32, mean_splat).result
                 x_hat = arith_ops.MulFOp(centered, rstd_splat).result
 
-            if has_weight:
+            if const_expr(has_weight):
                 w_vec = buffer_ops.buffer_load(w_rsrc, col, vec_width=VEC, dtype=bf16)
                 w_f32 = arith_ops.ExtFOp(vec_f32_t, _v(w_vec)).result
                 x_hat = arith_ops.MulFOp(x_hat, w_f32).result
@@ -611,7 +611,7 @@ def _build_norm_scale_shift_module(D: int, is_rms: bool, has_weight: bool):
             x_f32 = arith_ops.ExtFOp(vec_f32_t, _v(x_vec)).result
             _saved_x_f32.append(x_f32)
 
-            if not is_rms:
+            if const_expr(not is_rms):
                 v_sum = _vector.ReductionOp(
                     f32, _vector.CombiningKind.ADD, x_f32
                 ).result
@@ -626,7 +626,7 @@ def _build_norm_scale_shift_module(D: int, is_rms: bool, has_weight: bool):
         w_sq = partial_sum_sq
         for sh in [32, 16, 8, 4, 2, 1]:
             off_sh = _v(arith.constant(sh, type=i32))
-            if not is_rms:
+            if const_expr(not is_rms):
                 peer_sum = _gpu.ShuffleOp(
                     w_sum, off_sh, width_c, mode=_gpu.ShuffleMode.XOR
                 ).shuffleResult
@@ -642,7 +642,7 @@ def _build_norm_scale_shift_module(D: int, is_rms: bool, has_weight: bool):
 
         _if_lane0 = scf.IfOp(lane_0)
         with ir.InsertionPoint(_if_lane0.then_block):
-            if not is_rms:
+            if const_expr(not is_rms):
                 _memref.StoreOp(w_sum, lds, [wave_idx])
             sq_slot = arith_ops.AddIOp(
                 wave_idx,
@@ -668,7 +668,7 @@ def _build_norm_scale_shift_module(D: int, is_rms: bool, has_weight: bool):
             ).result,
         ).result
 
-        if is_rms:
+        if const_expr(is_rms):
             _if_active = scf.IfOp(active, [f32], has_else=True)
             with ir.InsertionPoint(_if_active.then_block):
                 sq_val = _memref.LoadOp(lds, [lane_idx_sq]).result
@@ -692,7 +692,7 @@ def _build_norm_scale_shift_module(D: int, is_rms: bool, has_weight: bool):
         final_sq = loaded_sq
         for sh in [32, 16, 8, 4, 2, 1]:
             off_sh = _v(arith.constant(sh, type=i32))
-            if not is_rms:
+            if const_expr(not is_rms):
                 ps = _gpu.ShuffleOp(
                     final_sum, off_sh, width_c, mode=_gpu.ShuffleMode.XOR
                 ).shuffleResult
@@ -712,13 +712,13 @@ def _build_norm_scale_shift_module(D: int, is_rms: bool, has_weight: bool):
         ).result
         _if_both = scf.IfOp(both_0)
         with ir.InsertionPoint(_if_both.then_block):
-            if not is_rms:
+            if const_expr(not is_rms):
                 _memref.StoreOp(final_sum, lds, [final_sum_slot])
             _memref.StoreOp(final_sq, lds, [final_sq_slot])
             scf.YieldOp([])
         _gpu.BarrierOp()
 
-        if not is_rms:
+        if const_expr(not is_rms):
             total_sum = _memref.LoadOp(lds, [final_sum_slot]).result
         else:
             total_sum = _v(c_zero_f32)
@@ -726,7 +726,7 @@ def _build_norm_scale_shift_module(D: int, is_rms: bool, has_weight: bool):
 
         d_f = _v(D_float)
         eps_v = _v(eps_val)
-        if is_rms:
+        if const_expr(is_rms):
             var = arith_ops.DivFOp(total_sq, d_f).result
             var_eps = arith_ops.AddFOp(var, eps_v).result
             rstd = math_ops.RsqrtOp(var_eps).result
@@ -753,13 +753,13 @@ def _build_norm_scale_shift_module(D: int, is_rms: bool, has_weight: bool):
 
             x_f32 = _saved_x_f32[it]
 
-            if is_rms:
+            if const_expr(is_rms):
                 x_hat = arith_ops.MulFOp(x_f32, rstd_splat).result
             else:
                 centered = arith_ops.SubFOp(x_f32, mean_splat).result
                 x_hat = arith_ops.MulFOp(centered, rstd_splat).result
 
-            if has_weight:
+            if const_expr(has_weight):
                 w_vec = buffer_ops.buffer_load(w_rsrc, col, vec_width=VEC, dtype=bf16)
                 w_f32 = arith_ops.ExtFOp(vec_f32_t, _v(w_vec)).result
                 x_hat = arith_ops.MulFOp(x_hat, w_f32).result
