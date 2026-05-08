@@ -1,15 +1,15 @@
 """branch_compare CLI: record / verify phases.
 
-Usage (record):
+Usage (run from sglang-source/test/manual/):
+
     SGLANG_ENABLE_FORCED_TOKEN_IDS=1 \\
-    python -m test.manual.branch_compare.run \\
+    python -m branch_compare.run \\
         --mode record --artifact-dir DIR \\
         --model-path MODEL [--tp-size N] [...any server args...] \\
         --eval-name gpqa --num-examples 16
 
-Usage (verify):
     SGLANG_ENABLE_FORCED_TOKEN_IDS=1 \\
-    python -m test.manual.branch_compare.run \\
+    python -m branch_compare.run \\
         --mode verify --artifact-dir DIR --record-dir RECORD_DIR \\
         --model-path MODEL [--tp-size N] [...any server args...]
 
@@ -28,17 +28,15 @@ import socket
 import subprocess
 import sys
 import time
-
-# Local imports work when invoked as `python -m test.manual.branch_compare.run`.
-from test.manual.branch_compare import artifacts
-from test.manual.branch_compare import prompts as prompts_mod
 from typing import Any, Dict, List, Optional, Tuple
 
 import requests
+from branch_compare import artifacts
+from branch_compare import prompts as prompts_mod
 
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.utils import kill_process_tree
 from sglang.test.test_utils import popen_launch_server
-from sglang.utils import kill_process_tree
 
 DEFAULT_PORT = 30000
 TIMEOUT_LAUNCH = 600
@@ -63,12 +61,6 @@ def build_parser() -> argparse.ArgumentParser:
         "--record-dir",
         default=None,
         help="(verify mode) Directory containing main's record artifact.",
-    )
-    g.add_argument(
-        "--port",
-        type=int,
-        default=None,
-        help="Server port. Default: free port (or 30000 if a free port can't be found).",
     )
     g.add_argument(
         "--base-url",
@@ -155,26 +147,32 @@ def _git_sha(cwd: str = ".") -> Tuple[str, bool]:
 def _server_args_passthrough(args: argparse.Namespace) -> List[str]:
     """Reconstruct the CLI list to forward to popen_launch_server.
 
-    We use ServerArgs.from_cli_args to build a populated ServerArgs, then
-    diff against the defaults to emit only what was actually changed.
+    Walk a fresh parser populated only by ServerArgs.add_cli_args and emit
+    flags whose value on `args` differs from the parser default. We can't go
+    through ServerArgs(...) construction because __post_init__ derives fields
+    (model_config, random_seed, kt_*, ...) that don't map back to CLI flags.
     """
-    server_args = ServerArgs.from_cli_args(args)
-    defaults = ServerArgs(model_path=server_args.model_path)
+    sa_parser = argparse.ArgumentParser(add_help=False)
+    ServerArgs.add_cli_args(sa_parser)
+
     out: List[str] = []
-    for field_name in vars(server_args):
-        cur = getattr(server_args, field_name)
-        default = getattr(defaults, field_name, None)
-        if field_name == "model_path":
-            continue  # popen_launch_server passes this as positional `model`
+    for action in sa_parser._actions:
+        dest = action.dest
+        if dest in ("help", "model_path"):
+            continue  # model_path is passed positionally to popen_launch_server
+        if not action.option_strings:
+            continue
+        if not hasattr(args, dest):
+            continue
+        cur = getattr(args, dest)
+        default = action.default
         if cur == default:
             continue
-        cli = "--" + field_name.replace("_", "-")
+        cli = action.option_strings[0]
         if isinstance(cur, bool):
             if cur and not default:
                 out.append(cli)
-            elif not cur and default:
-                # rare but possible: --no-X style (not common in sglang)
-                out.append(cli + "-disable")
+            # bool flags rarely have a paired --no-X; leave it alone otherwise
         elif isinstance(cur, list):
             for item in cur:
                 out += [cli, str(item)]

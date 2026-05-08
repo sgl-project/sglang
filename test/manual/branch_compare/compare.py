@@ -1,7 +1,7 @@
 """Compute per-step divergence metrics from two branch_compare artifacts.
 
-Usage:
-    python -m test.manual.branch_compare.compare \\
+Usage (run from sglang-source/test/manual/):
+    python -m branch_compare.compare \\
         --record-dir DIR --branch-dir DIR --out-dir DIR
 
 Per (prompt, step) the comparator finds the intersection of main's top-K
@@ -21,10 +21,10 @@ from __future__ import annotations
 import argparse
 import json
 import os
-from test.manual.branch_compare import artifacts
 from typing import Any, Dict, List, Tuple
 
 import numpy as np
+from branch_compare import artifacts
 
 
 def _per_step_metrics(

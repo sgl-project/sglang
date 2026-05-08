@@ -841,6 +841,21 @@ class ServerArgs:
         Orchestrates the handling of various server arguments, ensuring proper configuration and validation.
         """
 
+        # The forced_token_ids debug feature reads `len(req.output_ids)` to
+        # pick the next forced token; in overlap-schedule mode that count
+        # lags by one round, which causes a one-step shift in the forced
+        # sequence. Force overlap off when the feature is enabled.
+        if (
+            os.environ.get("SGLANG_ENABLE_FORCED_TOKEN_IDS") == "1"
+            and not self.disable_overlap_schedule
+        ):
+            logger.warning(
+                "SGLANG_ENABLE_FORCED_TOKEN_IDS=1 forces "
+                "--disable-overlap-schedule (forced_token_ids step counter "
+                "is incompatible with overlap mode)."
+            )
+            self.disable_overlap_schedule = True
+
         self._maybe_download_model_for_runai()
 
         # Normalize load balancing defaults early (before dummy-model short-circuit).
