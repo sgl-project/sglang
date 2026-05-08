@@ -60,8 +60,8 @@ Each form has its own marker. **Never mix** (no `num_X_ct`, no `num_accept_rate`
 |---|---|---|---|
 | **Count** | `num_X` | Snapshot quantity at one point in time (often a tensor or scalar) | `num_accept_tokens`, `num_correct_drafts`, `num_proposed_drafts` |
 | **Counter** | `X_ct` | Monotonically incrementing accumulator over time | `spec_verify_ct`, `forward_ct` |
-| **Rate / ratio** | `X_rate` | Fractional value in `[0, 1]` | `accept_rate`, `correct_rate` |
-| **Token IDs / content array** | no prefix | The actual token data, not a count | `accept_tokens`, `correct_drafts`, `bonus_token` |
+| **Rate / ratio** | `X_rate` | Fractional value in `[0, 1]` | `accept_rate` |
+| **Tokens / content array** | no prefix | The actual token data, not a count | `accept_tokens`, `correct_drafts`, `bonus_token` |
 
 ## Rule 5 — Avoid `length` / `lens` internally
 
