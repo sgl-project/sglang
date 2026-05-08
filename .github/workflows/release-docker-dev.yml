@@ -99,8 +99,6 @@ jobs:
       variant_suffix: ${{ matrix.variant_suffix }}
       tag_mode: ${{ github.event_name == 'schedule' && 'nightly' || 'manual' }}
       use_environment: prod
-      registry_host: ${{ vars.VOLCENGINE_CR_REGISTRY }}
-      image_repo: ${{ vars.VOLCENGINE_CR_REGISTRY }}/${{ vars.VOLCENGINE_CR_NAMESPACE }}/${{ vars.VOLCENGINE_CR_REPOSITORY || 'sglang' }}
       artifact_name: ${{ (github.event_name == 'schedule' || inputs.compile_kernel) && matrix.artifact_name || '' }}
       extra_build_args: >-
         --build-arg BRANCH_TYPE=local

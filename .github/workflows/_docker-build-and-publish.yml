@@ -96,6 +96,9 @@ jobs:
       TAG_MODE: ${{ inputs.tag_mode }}
       TAG_VALUE: ${{ inputs.tag_value }}
       VARIANT_SUFFIX: ${{ inputs.variant_suffix }}
+      VOLCENGINE_CR_REGISTRY: ${{ vars.VOLCENGINE_CR_REGISTRY }}
+      VOLCENGINE_CR_NAMESPACE: ${{ vars.VOLCENGINE_CR_NAMESPACE }}
+      VOLCENGINE_CR_REPOSITORY: ${{ vars.VOLCENGINE_CR_REPOSITORY || 'sglang' }}
       VOLCENGINE_CR_USERNAME: ${{ secrets.VOLCENGINE_CR_USERNAME }}
       VOLCENGINE_CR_PASSWORD: ${{ secrets.VOLCENGINE_CR_PASSWORD }}
     steps:
@@ -109,6 +112,31 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.checkout_ref || github.ref }}
+
+      - name: Resolve Volcengine publish target
+        run: |
+          set -euo pipefail
+
+          if [ -z "${IMAGE_REPO}" ]; then
+            if [ -z "${VOLCENGINE_CR_REGISTRY}" ] || [ -z "${VOLCENGINE_CR_NAMESPACE}" ]; then
+              echo "::error::Volcengine CR variables are required: VOLCENGINE_CR_REGISTRY and VOLCENGINE_CR_NAMESPACE"
+              exit 1
+            fi
+            IMAGE_REPO="${VOLCENGINE_CR_REGISTRY}/${VOLCENGINE_CR_NAMESPACE}/${VOLCENGINE_CR_REPOSITORY:-sglang}"
+          fi
+
+          if [ -z "${REGISTRY_HOST}" ] && [ -n "${VOLCENGINE_CR_REGISTRY}" ] && [[ "${IMAGE_REPO}" == "${VOLCENGINE_CR_REGISTRY}/"* ]]; then
+            REGISTRY_HOST="${VOLCENGINE_CR_REGISTRY}"
+          fi
+
+          if [ -z "${IMAGE_REPO}" ] || [[ "${IMAGE_REPO}" == /* ]] || [[ "${IMAGE_REPO}" == *'//'* ]]; then
+            echo "::error::Invalid image repository: '${IMAGE_REPO}'"
+            exit 1
+          fi
+
+          echo "IMAGE_REPO=${IMAGE_REPO}" >> "${GITHUB_ENV}"
+          echo "REGISTRY_HOST=${REGISTRY_HOST}" >> "${GITHUB_ENV}"
+          echo "Resolved image repository ${IMAGE_REPO}"
 
       - name: Resolve Volcengine image tag
         id: image-tag

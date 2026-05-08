@@ -73,8 +73,6 @@ jobs:
       tag_mode: version
       tag_value: ${{ needs.validate-volcengine-version-tag.outputs.git-tag-value }}
       use_environment: prod
-      registry_host: ${{ vars.VOLCENGINE_CR_REGISTRY }}
-      image_repo: ${{ vars.VOLCENGINE_CR_REGISTRY }}/${{ vars.VOLCENGINE_CR_NAMESPACE }}/${{ vars.VOLCENGINE_CR_REPOSITORY || 'sglang' }}
       extra_build_args: >-
         --build-arg HTTP_PROXY=http://100.68.162.211:3128
         --build-arg HTTPS_PROXY=http://100.68.162.211:3128
