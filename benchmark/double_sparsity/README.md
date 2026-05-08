@@ -92,6 +92,50 @@ the gap.
   shows the always-`None` mode is materially slower for FA3.
 - Per-Q-head + per-batch union scoring (v2 path documented in the plan).
 
+## v1 results — honest record
+
+**Llama-3.1-8B-Instruct, single H200, FP16/bfloat16, page_size=1, FA3.**
+Synthetic calibration (8 samples, 2K seq_len, S=32). 4 streamed
+completions, concurrency=1, output_len=256.
+
+| context | config | decode tok/s | TBT p50 (ms) | TBT p95 (ms) |
+|---|---|---|---|---|
+| 8192 | branch_ds_off | 168.7 | 5.0 | 5.1 |
+| 8192 | branch_ds_on (vectorized selection, CUDA graphs on) | 49.5 | 19.3 | 19.5 |
+| 32768 | branch_ds_off | 93.9 | 5.8 | 5.8 |
+
+**Status: v1 ship-gate not met.** At 8K context DS is 3.4× slower than
+dense; at 32K the DS-on bench was flaky in the dev environment and was
+not landed (the server boots cleanly at 32K — only the bench harness
+flaked). The selection is correct (M6 e2e passes; numpy-oracle parity
+in M3 unit tests) and now CUDA-graph-safe (parity test green; server
+boots with `disable_cuda_graph=False`), but the per-step gather-and-
+score over `[bs, max_ctx, num_kv_heads, S]` is bandwidth-heavy enough
+that at 8K context the overhead exceeds the FA3 sparse savings.
+
+**Why the gap.** Per decode step, vectorized selection executes:
+`req_to_token` index → K_label gather `[bs, max_ctx, H_kv, S]` →
+elementwise multiply with `Q_label` → reduce → mask → topk →
+boolean-mask scatter → sort. For Llama-3.1-8B at 8K context with
+H_kv=8, S=32, that's roughly 4 MB transient per layer per step, plus
+~10 separate kernel launches. FA3 dense decode is ~2 ms; selection
+overhead is ~14 ms (TBT 19.3 vs 5.0). The math says DS wins at the
+context length where the dense FA3 attention-time growth catches up
+to ~14 ms. For an 8B model that's well past 64K.
+
+**v1.1 to close the gap (priority order).**
+1. Replace the elementwise gather-multiply-reduce with one fused
+   Triton kernel that streams `K_label` row-by-row and accumulates
+   scores in registers — cuts ~10× kernel-launch overhead and HBM
+   traffic to one read pass.
+2. Long-context bench at 64K and 128K under TP=4 / TP=8 — the v1
+   ship-gate target.
+3. Real (non-synthetic) calibration on a held-out prompt set for the
+   accuracy probe.
+
+The path to the ship-gate is well-bounded; the architecture is
+correct. v1 ships off-by-default until v1.1 closes the kernel gap.
+
 ## Memory budget reference
 
 For Llama-3.1-70B at S=32, num_kv_heads=8 (TP=8 → 1 KV head per rank),

@@ -184,9 +184,28 @@ def ds_select_tokens_torch_ref(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Pure-torch selection. Returns (selected_logical[bs, max_selected], valid_lengths[bs]).
 
-    Used as the test oracle and as the production path on CPU. The CUDA
-    fast path (`ds_select_tokens_triton`) is parity-tested against this.
+    Used as the test oracle (CPU) and dispatched-to via `ds_select_tokens_triton`
+    on CUDA. The CPU path uses a small per-request loop because the
+    fixture sizes don't justify vectorization; the CUDA path
+    (`ds_select_tokens_torch_ref_vectorized`) is fully vectorized to avoid
+    the Python loop's dominant overhead at production batch sizes.
     """
+    if queries.is_cuda:
+        return ds_select_tokens_torch_ref_vectorized(
+            queries=queries,
+            channel_idx=channel_idx,
+            k_label_layer=k_label_layer,
+            req_to_token=req_to_token,
+            req_pool_indices=req_pool_indices,
+            seq_lens=seq_lens,
+            num_kv_heads=num_kv_heads,
+            token_budget=token_budget,
+            recent_tokens=recent_tokens,
+            sink_tokens=sink_tokens,
+            min_seq_len=min_seq_len,
+            max_selected=max_selected,
+            gqa_reduction_id=gqa_reduction_id,
+        )
     bs = queries.shape[0]
     device = queries.device
 
@@ -219,6 +238,109 @@ def ds_select_tokens_torch_ref(
         out[b] = sel
         valid[b] = n
 
+    return out, valid
+
+
+def ds_select_tokens_torch_ref_vectorized(
+    *,
+    queries: torch.Tensor,
+    channel_idx: torch.Tensor,
+    k_label_layer: torch.Tensor,
+    req_to_token: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    seq_lens: torch.Tensor,
+    num_kv_heads: int,
+    token_budget: int,
+    recent_tokens: int,
+    sink_tokens: int,
+    min_seq_len: int,
+    max_selected: int,
+    gqa_reduction_id: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Fully vectorized GPU selection — no Python per-request loop, no `.item()`.
+
+    Algorithm (all batched):
+      1. Q_label = gather + GQA reduce → `[bs, H_kv, S]`.
+      2. phys_tokens = `req_to_token[req_pool_indices]` → `[bs, max_ctx]`.
+      3. K_label gather: `K_label[phys_tokens]` → `[bs, max_ctx, H_kv, S]`.
+      4. scores = einsum + sum across heads → `[bs, max_ctx]`.
+      5. Mask history: positions `>= seq_len-1` → -inf; positions
+         `< sink_tokens` → +inf (force-include); positions in
+         `[seq_len-recent, seq_len)` → +inf (force-include).
+      6. Dense fallback: rows with `seq_len < min_seq_len` get
+         their full `[0, seq_len)` range force-included via +inf.
+      7. Top-k per row, sort ascending → final selected.
+
+    The +inf trick keeps everything in a single topk while giving sink/
+    recency priority — they outrank any history score.
+
+    Memory: K_label gather is `[bs, max_ctx, H_kv, S]` bf16 = bs * max_ctx
+    * 8 * 32 * 2 B per layer per step. For bs=4, max_ctx=64K: 134 MB
+    transient — large but fits H200; smaller models allocate proportionally.
+    """
+    bs = queries.shape[0]
+    device = queries.device
+    max_ctx = req_to_token.shape[1]
+
+    q_label = _compute_q_label(
+        queries,
+        channel_idx,
+        num_kv_heads=num_kv_heads,
+        gqa_reduction_id=gqa_reduction_id,
+    )  # [bs, H_kv, S]
+
+    # phys_tokens row per request: [bs, max_ctx]
+    phys = req_to_token[req_pool_indices.to(torch.long)].to(torch.long)
+    phys = phys.clamp(0, k_label_layer.shape[0] - 1)
+    # K_label gather → [bs, max_ctx, H_kv, S]
+    kl = k_label_layer[phys]
+    # Per-position scores, summed across kv_heads: [bs, max_ctx]
+    scores = (kl * q_label.unsqueeze(1)).sum(dim=(2, 3)).float()
+
+    pos = torch.arange(max_ctx, device=device).unsqueeze(0)  # [1, max_ctx]
+    seq = seq_lens.to(device).unsqueeze(1)  # [bs, 1]
+    valid_pos_mask = pos < seq
+    history_mask = pos < (seq - 1)  # exclude current decode position
+    sink_mask = (pos < sink_tokens) & valid_pos_mask
+    rec_start = (seq - recent_tokens).clamp_min(0)
+    recent_mask = (pos >= rec_start) & valid_pos_mask
+    dense_fallback = (seq < min_seq_len).expand_as(valid_pos_mask)
+
+    NEG_INF = float("-inf")
+
+    # Step 1: per-row top-`token_budget` over history scores only.
+    hist_scores = torch.where(history_mask, scores, torch.full_like(scores, NEG_INF))
+    k_hist = min(token_budget, max_ctx)
+    hist_top = hist_scores.topk(k_hist, dim=1, sorted=False).indices  # [bs, k_hist]
+
+    # Step 2: build the selected-positions bool mask:
+    #   sink ∪ recent ∪ history-topk ∪ (dense-fallback whole row)
+    selected = torch.zeros_like(valid_pos_mask)
+    selected.scatter_(1, hist_top, True)
+    # Drop history-topk slots that landed on -inf (row had < budget history).
+    # Equivalently: only keep topk hits that are inside `history_mask`.
+    selected = selected & history_mask
+    selected = selected | sink_mask | recent_mask | (dense_fallback & valid_pos_mask)
+
+    # Step 3: compact each row's selected positions in ascending order.
+    # Trick: replace each position with its index when selected, else +inf;
+    # sort ascending → selected positions come first (real ints), unselected
+    # become +inf at the end.
+    pos_or_inf = torch.where(
+        selected,
+        pos.expand(bs, max_ctx).float(),
+        torch.full((bs, max_ctx), float("inf"), device=device),
+    )
+    sorted_marks, _ = pos_or_inf.sort(dim=1)
+    # Take the first max_selected; finite entries are valid ascending
+    # logical positions, +inf entries become -1 padding.
+    trimmed = sorted_marks[:, :max_selected]
+    out = torch.where(
+        trimmed.isfinite(),
+        trimmed.to(torch.int32),
+        torch.full_like(trimmed, -1, dtype=torch.int32),
+    )
+    valid = trimmed.isfinite().sum(dim=1).to(torch.int32)
     return out, valid
 
 
