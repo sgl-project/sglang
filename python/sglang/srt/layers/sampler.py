@@ -201,6 +201,24 @@ class Sampler(nn.Module):
                 batch_next_token_ids,
             )
 
+        # Forced-token-ids debug feature: if any request supplied a
+        # forced_token_ids list, override the chosen token at this step with
+        # the request's forced value. Logprobs above were computed from the
+        # real distribution and remain untouched. The forced_next_token_ids
+        # tensor is populated per-forward by Scheduler.run_batch via
+        # SamplingBatchInfo.prepare_forced_next_token_ids; sentinel -1 means
+        # "no forcing for this slot at this step".
+        if (
+            sampling_info.has_any_forced
+            and sampling_info.forced_next_token_ids is not None
+        ):
+            forced = sampling_info.forced_next_token_ids
+            mask = forced.ge(0)
+            if mask.any():
+                batch_next_token_ids = torch.where(
+                    mask, forced.to(batch_next_token_ids.dtype), batch_next_token_ids
+                )
+
         self._sync_token_ids_across_tp(batch_next_token_ids, sampling_info)
 
         return batch_next_token_ids

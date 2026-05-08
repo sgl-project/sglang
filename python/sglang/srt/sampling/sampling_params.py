@@ -14,6 +14,7 @@
 """Sampling parameters for text generation."""
 
 import logging
+import os
 from typing import Any, Dict, List, Optional, Union
 
 # sre_parse is deprecated in Python 3.11+, use re._parser instead
@@ -24,6 +25,11 @@ except ImportError:
 
 _SAMPLING_EPS = 1e-6
 TOP_K_ALL = 1 << 30
+
+# Env var that gates the forced-token-ids debug feature server-side.
+# Without this, the server rejects any request carrying forced_token_ids /
+# forced_token_ids_path so arbitrary clients can't trigger forced decoding.
+SGLANG_ENABLE_FORCED_TOKEN_IDS_ENV = "SGLANG_ENABLE_FORCED_TOKEN_IDS"
 
 logger = logging.getLogger(__name__)
 
@@ -64,6 +70,8 @@ class SamplingParams:
         stream_interval: Optional[int] = None,
         logit_bias: Optional[Dict[str, float]] = None,
         sampling_seed: Optional[int] = None,
+        forced_token_ids: Optional[List[int]] = None,
+        forced_token_ids_path: Optional[str] = None,
     ) -> None:
         # For non-optional params, treat None as "use default" so that callers
         # (e.g. /generate) can pass null without crashing verify().
@@ -108,6 +116,10 @@ class SamplingParams:
         self.stream_interval = stream_interval
         self.logit_bias = logit_bias
         self.sampling_seed = sampling_seed
+        self.forced_token_ids = (
+            [int(t) for t in forced_token_ids] if forced_token_ids else None
+        )
+        self.forced_token_ids_path = forced_token_ids_path
 
         # Process some special cases
         if 0 <= self.temperature < _SAMPLING_EPS:
@@ -174,6 +186,95 @@ class SamplingParams:
         ]  # since mutually exclusive, only one can be set
         if sum(x is not None for x in grammars) > 1:
             raise ValueError("Only one of regex, json_schema, or ebnf can be set.")
+
+        if self.forced_token_ids is not None and self.forced_token_ids_path is not None:
+            raise ValueError(
+                "Only one of forced_token_ids or forced_token_ids_path can be set."
+            )
+        if (
+            self.forced_token_ids is not None or self.forced_token_ids_path is not None
+        ) and os.environ.get(SGLANG_ENABLE_FORCED_TOKEN_IDS_ENV) != "1":
+            raise ValueError(
+                f"forced_token_ids requires {SGLANG_ENABLE_FORCED_TOKEN_IDS_ENV}=1 "
+                f"on the server."
+            )
+        if self.forced_token_ids is not None:
+            for tid in self.forced_token_ids:
+                if not 0 <= int(tid) < vocab_size:
+                    raise ValueError(
+                        f"forced_token_ids must be in [0, {vocab_size - 1}], got {tid}."
+                    )
+
+    # Maximum length of a forced_token_ids sequence loaded from disk. Bounds
+    # the work done at request admission. Forced sequences longer than this
+    # are rejected; raise this if your test legitimately needs more.
+    MAX_FORCED_TOKEN_IDS_LENGTH: int = 512 * 1024
+
+    def resolve_forced_token_ids_path(self):
+        """If forced_token_ids_path is set, load the tensor and populate
+        forced_token_ids. Must run before `verify()`. Validates the env-var
+        gate first so a path-only request doesn't trigger any disk I/O on
+        servers that haven't opted in.
+        """
+        if self.forced_token_ids_path is None:
+            return
+        if os.environ.get(SGLANG_ENABLE_FORCED_TOKEN_IDS_ENV) != "1":
+            raise ValueError(
+                f"forced_token_ids_path requires "
+                f"{SGLANG_ENABLE_FORCED_TOKEN_IDS_ENV}=1 on the server."
+            )
+        if self.forced_token_ids is not None:
+            raise ValueError(
+                "Only one of forced_token_ids or forced_token_ids_path can be set."
+            )
+
+        # Lazy import: torch is heavy and SamplingParams is constructed in
+        # paths that don't otherwise need it.
+        import torch
+
+        path = self.forced_token_ids_path
+        try:
+            loaded = torch.load(path, map_location="cpu", weights_only=False)
+        except Exception as e:
+            raise ValueError(
+                f"Failed to load forced_token_ids_path={path!r}: {e}"
+            ) from e
+
+        # The artifact format produced by the branch_compare test is a dict
+        # with an "output_ids" key; accept either the dict or a bare tensor.
+        if isinstance(loaded, dict):
+            if "output_ids" not in loaded:
+                raise ValueError(
+                    f"forced_token_ids_path={path!r} dict has no 'output_ids' key"
+                )
+            tensor = loaded["output_ids"]
+        else:
+            tensor = loaded
+
+        if not isinstance(tensor, torch.Tensor):
+            raise ValueError(
+                f"forced_token_ids_path={path!r} did not contain a tensor "
+                f"(got {type(tensor).__name__})"
+            )
+        if tensor.dim() != 1:
+            raise ValueError(
+                f"forced_token_ids_path={path!r} tensor must be 1-D, "
+                f"got shape {tuple(tensor.shape)}"
+            )
+        if torch.is_floating_point(tensor) or tensor.dtype == torch.bool:
+            raise ValueError(
+                f"forced_token_ids_path={path!r} tensor must be an integer "
+                f"dtype, got {tensor.dtype}"
+            )
+        if tensor.numel() > self.MAX_FORCED_TOKEN_IDS_LENGTH:
+            raise ValueError(
+                f"forced_token_ids_path={path!r} length "
+                f"{tensor.numel()} exceeds MAX_FORCED_TOKEN_IDS_LENGTH "
+                f"({self.MAX_FORCED_TOKEN_IDS_LENGTH})"
+            )
+
+        self.forced_token_ids = [int(t) for t in tensor.tolist()]
+        self.forced_token_ids_path = None
 
     def normalize(self, tokenizer):
         # Process stop strings
