@@ -36,9 +36,7 @@ logger = logging.getLogger(__name__)
 _flashinfer_comm = None
 _TorchDistBackend = None
 _mnnvl_comm_backend = None
-_AllReduceFusionPattern = None
 _create_allreduce_fusion_workspace = None
-_allreduce_fusion = None
 _flashinfer_allreduce_unavailable = False
 _posix_transport_override_logged = False
 
@@ -114,8 +112,6 @@ if is_flashinfer_available():
 
         _flashinfer_comm = comm
         _create_allreduce_fusion_workspace = comm.create_allreduce_fusion_workspace
-        _allreduce_fusion = comm.allreduce_fusion
-        _AllReduceFusionPattern = comm.AllReduceFusionPattern
     except (ImportError, AttributeError) as e:
         logger.warning(
             "flashinfer.comm allreduce_fusion API is not available (%s), "
@@ -837,26 +833,20 @@ def flashinfer_allreduce_residual_rmsnorm(
     residual_out = torch.empty_like(residual)
     norm_out = torch.empty_like(input_tensor)
 
-    if _allreduce_fusion is None or _AllReduceFusionPattern is None:
-        return None, None
-
-    try:
-        _allreduce_fusion(
-            input=input_tensor,
-            workspace=workspace_manager.workspace,
-            pattern=_AllReduceFusionPattern.kARResidualRMSNorm,
-            launch_with_pdl=trigger_completion_at_end,
-            use_oneshot=use_oneshot,
-            fp32_acc=fp32_acc,
-            residual_in=residual,
-            residual_out=residual_out,
-            norm_out=norm_out,
-            rms_gamma=weight,
-            rms_eps=eps,
-        )
-    except Exception as e:
-        logger.warning(f"FlashInfer allreduce fusion failed: {e}")
-        return None, None
+    _flashinfer_comm.allreduce_fusion(
+        input=input_tensor,
+        workspace=workspace_manager.workspace,
+        pattern=_flashinfer_comm.AllReduceFusionPattern.kARResidualRMSNorm,
+        launch_with_pdl=True,
+        trigger_completion_at_end=trigger_completion_at_end,
+        residual_out=residual_out,
+        norm_out=norm_out,
+        residual_in=residual,
+        rms_gamma=weight,
+        rms_eps=eps,
+        use_oneshot=use_oneshot,
+        fp32_acc=fp32_acc,
+    )
 
     return norm_out, residual_out
 

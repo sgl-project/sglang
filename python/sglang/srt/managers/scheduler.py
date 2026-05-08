@@ -1192,6 +1192,11 @@ class Scheduler(
 
         # todo: should we fix this when enabling mtp or it doesn't matter since we only enable mtp in decode node thus we don't transfer draft kvs between P and D?
         draft_token_to_kv_pool, model_config = self._get_draft_kv_pool()
+        # Default to the target model_config so the MetadataBuffers branches
+        # below can always access it; overridden by the draft model_config
+        # when this node runs a spec module.
+        if model_config is None:
+            model_config = self.model_config
 
         if (
             self.disaggregation_mode == DisaggregationMode.DECODE
@@ -2419,17 +2424,14 @@ class Scheduler(
         batch.seq_lens_cpu = torch.tensor(seq_lens, dtype=torch.int64)
         batch.orig_seq_lens = torch.tensor(seq_lens, dtype=torch.int32, device=device)
         batch.seq_lens_sum = sum(seq_lens)
-        # output_ids = last generated token, used as input_ids by prepare_for_decode
         batch.output_ids = torch.tensor(
             [r.output_ids[-1] for r in reqs], dtype=torch.int64, device=device
         )
 
-        # Set logprob fields if any request needs them
         if batch.return_logprob:
             batch.top_logprobs_nums = [r.top_logprobs_num for r in reqs]
             batch.token_ids_logprobs = [list(r.origin_input_ids) for r in reqs]
 
-        # Build sampling info from scratch for these requests
         batch.sampling_info = SamplingBatchInfo.from_schedule_batch(
             batch, self.model_config.vocab_size
         )
@@ -3512,8 +3514,6 @@ class Scheduler(
             self.send_to_tokenizer.send_output(AbortReq(rid=req.rid), req)
             # For disaggregation decode mode, the request in the waiting queue has KV cache allocated.
             if self.disaggregation_mode == DisaggregationMode.DECODE:
-                if self.enable_hisparse:
-                    self.hisparse_coordinator.request_finished(req)
                 release_kv_cache(req, self.tree_cache)
             # For disaggregation prefill mode, free the metadata buffer index
             if self.disaggregation_mode == DisaggregationMode.PREFILL:

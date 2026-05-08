@@ -214,6 +214,10 @@ class ServerArgs(DisaggArgsMixin):
 
     disable_autocast: bool | None = None
 
+    # Explicit quantization method override (e.g. "mxfp8", "fp8", "modelslim").
+    # When set, the transformer loader will use this instead of auto-detection.
+    quantization: str | None = None
+
     # Quantization / Nunchaku SVDQuant configuration
     nunchaku_config: NunchakuSVDQuantArgs | NunchakuConfig | None = field(
         default_factory=NunchakuSVDQuantArgs, repr=False
@@ -1136,6 +1140,14 @@ class ServerArgs(DisaggArgsMixin):
             "--disable-autocast",
             action=StoreBoolean,
             help="Disable autocast for denoising loop and vae decoding in pipeline sampling",
+        )
+
+        parser.add_argument(
+            "--quantization",
+            type=str,
+            default=None,
+            help='Quantization method override (e.g. "mxfp8", "fp8", "modelslim"). '
+            "When set, the transformer loader will use this instead of auto-detection.",
         )
 
         # Nunchaku SVDQuant quantization parameters
