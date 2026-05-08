@@ -216,13 +216,12 @@ class RequestStage:
     ANONYMOUS = RequestStageConfig("")
 
 
+#TODO: @rainj-me need to fix the metrics_collector and trace_ctx within msgpack scenario.
 @dataclass
 class ReqTimeStatsBase:
     enable_metrics: bool = False
-    metrics_collector: Optional[
-        Union[SchedulerMetricsCollector, TokenizerMetricsCollector]
-    ] = None
-    trace_ctx: Union[TraceReqContext, TraceNullContext] = field(
+    metrics_collector: Optional[Any] = None
+    trace_ctx: Union[TraceNullContext] = field(
         default_factory=TraceNullContext
     )
     disagg_mode: DisaggregationMode = DisaggregationMode.NULL

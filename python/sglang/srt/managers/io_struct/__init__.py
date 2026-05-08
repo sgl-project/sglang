@@ -17,8 +17,6 @@ from .pickle_struct import (
     BackupDramReq,
     BaseBatchReq,
     BaseReq,
-    BatchTokenizedEmbeddingReqInput,
-    BatchTokenizedGenerateReqInput,
     BlockReqInput,
     BlockReqType,
     CheckWeightsReqInput,
@@ -77,7 +75,6 @@ from .pickle_struct import (
     SendWeightsToRemoteInstanceReqInput,
     SendWeightsToRemoteInstanceReqOutput,
     SeparateReasoningReqInput,
-    SessionParams,
     SetInjectDumpMetadataReqInput,
     SetInjectDumpMetadataReqOutput,
     SetInternalStateReq,
@@ -85,8 +82,6 @@ from .pickle_struct import (
     SlowDownReqInput,
     SlowDownReqOutput,
     SpeculativeDecodingMetricsMixin,
-    TokenizedEmbeddingReqInput,
-    TokenizedGenerateReqInput,
     Tool,
     UnloadLoRAAdapterReqInput,
     UpdateExpertBackupReq,
@@ -117,6 +112,11 @@ if envs.SGLANG_IPC_USE_MSGPACK.get():
         MemoryMetrics,
         QueueMetrics,
         SpeculativeMetrics,
+        SessionParams,
+        TokenizedGenerateReqInput,
+        BatchTokenizedGenerateReqInput,
+        TokenizedEmbeddingReqInput,
+        BatchTokenizedEmbeddingReqInput,
     )
 else:
     from .pickle_struct import (
@@ -132,6 +132,11 @@ else:
         MemoryMetrics,
         QueueMetrics,
         SpeculativeMetrics,
+        SessionParams,
+        TokenizedGenerateReqInput,
+        BatchTokenizedGenerateReqInput,
+        TokenizedEmbeddingReqInput,
+        BatchTokenizedEmbeddingReqInput,
     )
 
 

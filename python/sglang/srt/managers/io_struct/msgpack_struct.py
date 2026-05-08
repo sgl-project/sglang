@@ -6,7 +6,11 @@ import torch
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.observability.req_time_stats import (
     SchedulerReqTimeStats,
+    ReqTimeStatsBase,
 )
+from sglang.srt.managers.schedule_batch import Modality
+from sglang.srt.managers.embed_types import PositionalEmbeds
+from sglang.srt.sampling.sampling_params import SamplingParams
 
 
 class LoRAMetrics(msgspec.Struct, tag=True):
@@ -118,7 +122,7 @@ class BatchTokenIDOutput(msgspec.Struct, tag=True):
 
     # From BatchTokenIDOutput dataclass
     # The finish reason
-    finished_reasons: List[Optional[Dict[str, Any]]]
+    finished_reasons: List[Optional[Dict[str, Any]]] # List[BaseFinishReason]
     # For incremental decoding
     decoded_texts: List[str]
     decode_ids: List[Union[List[int], int]]
@@ -182,7 +186,7 @@ class BatchTokenIDOutput(msgspec.Struct, tag=True):
     dp_ranks: Optional[List[Optional[int]]] = None
 
     # For observability
-    time_stats: Optional[List[Any]] = None  # Optional[List[SchedulerReqTimeStats]]
+    time_stats: Optional[List[SchedulerReqTimeStats]] = None
 
     # From BaseBatchReq dataclass
     rids: Optional[List[str]] = None
@@ -206,7 +210,7 @@ class BatchStrOutput(msgspec.Struct, tag=True):
 
     # From BatchStrOutput dataclass
     # The finish reason
-    finished_reasons: List[Optional[Dict[str, Any]]]
+    finished_reasons: List[Optional[Dict[str, Any]]] # List[BaseFinishReason]
     # The output decoded strings
     output_strs: List[str]
 
@@ -264,7 +268,7 @@ class BatchStrOutput(msgspec.Struct, tag=True):
     dp_ranks: Optional[List[Optional[int]]] = None
 
     # For observability
-    time_stats: Optional[List[Any]] = None  # Optional[List[SchedulerReqTimeStats]]
+    time_stats: Optional[List[SchedulerReqTimeStats]] = None
 
     # From BaseBatchReq dataclass
     rids: Optional[List[str]] = None
@@ -275,7 +279,7 @@ class BatchEmbeddingOutput(msgspec.Struct, tag=True):
 
     # From BatchEmbeddingOutput dataclass
     # The finish reason
-    finished_reasons: List[Optional[Dict[str, Any]]]
+    finished_reasons: List[Optional[Dict[str, Any]]] # List[BaseFinishReason]
     # The output embedding
     embeddings: List[Any]  # Union[List[List[float]], List[Dict[int, float]]]
     # Token counts
@@ -291,7 +295,7 @@ class BatchEmbeddingOutput(msgspec.Struct, tag=True):
     cached_tokens_details: Optional[List[Optional[Dict[str, Any]]]] = None
 
     # For observability
-    time_stats: Optional[List[Any]] = None  # Optional[List[SchedulerReqTimeStats]]
+    time_stats: Optional[List[SchedulerReqTimeStats]] = None
 
     # Optional pooled hidden states (pre-head transformer output).
     # Sent as a single stacked tensor to minimize pickle overhead.
@@ -304,88 +308,255 @@ class BatchEmbeddingOutput(msgspec.Struct, tag=True):
     http_worker_ipcs: Optional[List[str]] = None
 
 
-class SchedulerReqTimeStatsIPC(msgspec.Struct, tag=True):
+class SessionParams(msgspec.Struct, tag=True):
+    id: Optional[str] = None
+    rid: Optional[str] = None
+    offset: Optional[int] = None
+    replace: Optional[bool] = None
+    drop_previous_output: Optional[bool] = None
 
-    # From ReqTimeStatsBase
-    enable_metrics: bool = False
-    disagg_mode: DisaggregationMode = DisaggregationMode.NULL
-
-    # From SchedulerReqTimeStats
-    # Placeholder: not used currently
-    # propagated from tokenizer/grpc_server or dp controller
-    created_time: float = 0.0
-    api_server_dispatch_time: float = 0.0
-    dpc_dispatch_time: float = 0.0
-
-    # common, get by time.perf_counter()
-    wait_queue_entry_time: float = 0.0
-    forward_entry_time: float = 0.0
-    prefill_run_batch_start_time: float = 0.0
-    prefill_run_batch_end_time: float = 0.0
-    prefill_finished_time: float = 0.0
-    completion_time: float = 0.0
-
-    # prefill node, get by time.perf_counter()
-    prefill_bootstrap_queue_entry_time: float = 0.0
-    prefill_transfer_queue_entry_time: float = 0.0
-    prefill_kv_transfer_finish_time: float = 0.0
-
-    # decode node, get by time.perf_counter()
-    decode_prealloc_queue_entry_time: float = 0.0
-    decode_transfer_queue_entry_time: float = 0.0
-    decode_prebuilt_finish_time: float = 0.0
-
-    # bootstrap sub-phase tracking (PD disagg)
-    bootstrap_done_time: float = 0.0
-
-    # only for request tracing
-    scheduler_recv_time: float = 0.0
-    last_chunked_prefill_finish_time: float = 0.0
-    last_decode_finish_time: float = 0.0
-    decode_ct: int = 0
-    last_decode_scheduled_time: float = 0.0
-    last_forward_entry_time: float = 0.0
-    last_prefill_finished_time: float = 0.0
-
-    # speculative decoding
-    spec_draft_start_time: float = 0.0
-    spec_verify_start_time: float = 0.0
-    spec_draft_extend_start_time: float = 0.0
-
-    # other
-    transfer_speed_gb_s: float = 0.0
-    transfer_total_mb: float = 0.0
-    # Number of prefill retries for this request
-    prefill_retry_count: int = 0
+class SamplingParamsIPC(msgspec.Struct, tag=True):
+    max_new_tokens: int = 128
+    stop: Optional[Union[str, List[str]]] = None
+    stop_token_ids: Optional[List[int]] = None
+    stop_regex: Optional[Union[str, List[str]]] = None
+    temperature: float = 1.0
+    top_p: float = 1.0
+    top_k: int = -1
+    min_p: float = 0.0
+    frequency_penalty: float = 0.0
+    presence_penalty: float = 0.0
+    repetition_penalty: float = 1.0
+    min_new_tokens: int = 0
+    n: int = 1
+    json_schema: Optional[str] = None
+    regex: Optional[str] = None
+    ebnf: Optional[str] = None
+    structural_tag: Optional[str] = None
+    ignore_eos: bool = False
+    skip_special_tokens: bool = True
+    spaces_between_special_tokens: bool = True
+    no_stop_trim: bool = False
+    custom_params: Optional[Dict[str, Any]] = None
+    stream_interval: Optional[int] = None
+    logit_bias: Optional[Dict[str, float]] = None
+    sampling_seed: Optional[int] = None
+    stop_str_max_len: int = 0
+    stop_regex_max_len: int = 0
 
     @classmethod
-    def from_req_time_stats(cls, req_stats) -> "SchedulerReqTimeStatsIPC":
-        """Convert from SchedulerReqTimeStats to SchedulerReqTimeStatsIPC."""
-        if req_stats is None:
-            return cls()
+    def from_sampling_params(cls, params: SamplingParams) -> "SamplingParamsIPC":
+        return cls(
+            max_new_tokens=params.max_new_tokens,
+            stop=params.stop_strs,
+            stop_token_ids=params.stop_token_ids,
+            stop_regex=params.stop_regex_strs,
+            temperature=params.temperature,
+            top_p=params.top_p,
+            top_k=params.top_k,
+            min_p=params.min_p,
+            frequency_penalty=params.frequency_penalty,
+            presence_penalty=params.presence_penalty,
+            repetition_penalty=params.repetition_penalty,
+            min_new_tokens=params.min_new_tokens,
+            n=params.n,
+            json_schema=params.json_schema,
+            regex=params.regex,
+            ebnf=params.ebnf,
+            structural_tag=params.structural_tag,
+            ignore_eos=params.ignore_eos,
+            skip_special_tokens=params.skip_special_tokens,
+            spaces_between_special_tokens=params.spaces_between_special_tokens,
+            no_stop_trim=params.no_stop_trim,
+            custom_params=params.custom_params,
+            stream_interval=params.stream_interval,
+            logit_bias=params.logit_bias,
+            sampling_seed=params.sampling_seed,
+            stop_str_max_len=params.stop_str_max_len,
+            stop_regex_max_len=params.stop_regex_max_len,
+        )
 
-        # Create a new instance and copy all matching fields
-        ipc_stats = cls()
-        for field_name in cls.__struct_fields__:
-            if hasattr(req_stats, field_name):
-                value = getattr(req_stats, field_name)
-                setattr(ipc_stats, field_name, value)
+    def to_sampling_params(self) -> "SamplingParams":
+        param = SamplingParams(
+            max_new_tokens=self.max_new_tokens,
+            stop=self.stop,
+            stop_token_ids=self.stop_token_ids,
+            stop_regex=self.stop_regex,
+            temperature=self.temperature,
+            top_p=self.top_p,
+            top_k=self.top_k,
+            min_p=self.min_p,
+            frequency_penalty=self.frequency_penalty,
+            presence_penalty=self.presence_penalty,
+            repetition_penalty=self.repetition_penalty,
+            min_new_tokens=self.min_new_tokens,
+            n=self.n,
+            json_schema=self.json_schema,
+            regex=self.regex,
+            ebnf=self.ebnf,
+            structural_tag=self.structural_tag,
+            ignore_eos=self.ignore_eos,
+            skip_special_tokens=self.skip_special_tokens,
+            spaces_between_special_tokens=self.spaces_between_special_tokens,
+            no_stop_trim=self.no_stop_trim,
+            custom_params=self.custom_params,
+            stream_interval=self.stream_interval,
+            logit_bias=self.logit_bias,
+            sampling_seed=self.sampling_seed,
+        )
+        param.stop_str_max_len = self.stop_str_max_len
+        param.stop_regex_max_len = self.stop_regex_max_len
+        return param
 
-        return ipc_stats
 
-    def to_req_time_stats(self):
-        """Convert to SchedulerReqTimeStats instance."""
-        from sglang.srt.observability.req_time_stats import SchedulerReqTimeStats
+class TokenizedGenerateReqInput(msgspec.Struct, tag=True):
+    # The input token ids
+    input_ids: List[int]
+    # The sampling parameters
+    sampling_params: SamplingParams
+    # Whether to return the logprobs
+    return_logprob: bool
+    # If return logprobs, the start location in the prompt for returning logprobs.
+    logprob_start_len: int
+    # If return logprobs, the number of top logprobs to return at each position.
+    top_logprobs_num: int
+    # Whether to stream output
+    stream: bool
 
-        req_stats = SchedulerReqTimeStats()
+    # The input text
+    input_text: Optional[str] = None
+    # If return logprobs, the token id to return logprob for
+    token_ids_logprob: Optional[List[int]] = None
+    # The multimodal inputs
+    mm_inputs: Optional[Dict[str, Any]] = None #TODO: @rainj-me need to fix the type of mm_inputs.
+    # Whether to return hidden states
+    return_hidden_states: bool = False
 
-        # Copy all matching fields
-        for field_name in self.__struct_fields__:
-            if hasattr(req_stats, field_name):
-                value = getattr(self, field_name)
-                setattr(req_stats, field_name, value)
+    # Whether to return captured routed experts
+    return_routed_experts: bool = False
+    # The start location in the prompt for returning routed experts.
+    routed_experts_start_len: int = 0
 
-        return req_stats
+    # The input embeds
+    input_embeds: Optional[List[List[Any]]] = (
+        None  # Optional[Union[List[List[List[float]]], List[List[float]]]]
+    )
+
+    # Embedding overrides to place at specific token positions.
+    positional_embed_overrides: Optional[PositionalEmbeds] = None
+
+    # Session info for continual prompting
+    session_params: Optional[SessionParams] = None
+
+    # LoRA related
+    lora_id: Optional[str] = None  # None means just use the base model
+
+    # Custom logit processor for advanced sampling control. Must be a serialized instance
+    # of `CustomLogitProcessor` in python/sglang/srt/sampling/custom_logit_processor.py
+    # Use the processor's `to_str()` method to generate the serialized string.
+    custom_logit_processor: Optional[str] = None
+
+    # For disaggregated inference
+    bootstrap_host: Optional[str] = None
+    bootstrap_port: Optional[int] = None
+    bootstrap_room: Optional[int] = None
+    bootstrap_pair_key: Optional[str] = None
+    decode_tp_size: Optional[int] = None
+
+    # Require reasoning for the request (hybrid reasoning model only)
+    require_reasoning: bool = False
+
+    # For DP routing
+    routed_dp_rank: Optional[int] = None
+    # For PD disagg — hint telling decode which prefill DP worker has the KV cache
+    disagg_prefill_dp_rank: Optional[int] = None
+
+    # Priority for the request
+    priority: Optional[int] = None
+
+    # Extra key for classifying the request (e.g. cache_salt)
+    extra_key: Optional[str] = None
+
+    # Routing key for routing-key schedule policy
+    routing_key: Optional[str] = None
+
+    # Whether to disallow logging for this request (e.g. due to ZDR)
+    no_logs: bool = False
+
+    # (Internal) Whether to return bytes for image generation
+    return_bytes: bool = False
+
+    # Whether to return entropy
+    return_entropy: bool = False
+
+    token_type_ids: Optional[List[int]] = None
+
+    need_wait_for_mm_inputs: Optional[bool] = None
+    num_items_assigned: Optional[Dict[Modality, List[int]]] = None
+
+    # Pre-computed delimiter indices for multi-item scoring
+    multi_item_delimiter_indices: Optional[List[int]] = None
+
+    # For observability
+    time_stats: Optional[ReqTimeStatsBase] = (
+        None # Optional[Union[APIServerReqTimeStats, DPControllerReqTimeStats]] 
+    )
+
+    # From BaseReq dataclass
+    rid: Optional[str] = None
+    http_worker_ipc: Optional[str] = None
+
+
+class BatchTokenizedGenerateReqInput(msgspec.Struct, tag=True):
+    reqs: List[TokenizedGenerateReqInput]
+
+    rids: Optional[List[str]] = None
+    http_worker_ipcs: Optional[List[str]] = None
+
+
+class TokenizedEmbeddingReqInput(msgspec.Struct, tag=True):
+    # The input token ids
+    input_ids: List[int]
+    # Dummy sampling params for compatibility
+    sampling_params: SamplingParams  # SamplingParams
+
+    # The input text
+    input_text: Optional[str] = None
+    # The image inputs
+    image_inputs: Optional[dict] = None
+    # The token type ids
+    token_type_ids: Optional[List[int]] = None
+    # Embedding overrides to place at specific token positions.
+    positional_embed_overrides: Optional[PositionalEmbeds] = None
+    # For DP routing
+    routed_dp_rank: Optional[int] = None
+    # Priority for the request
+    priority: Optional[int] = None
+    # The number of dimensions the resulting output embeddings should have. It is applicable for Matryoshka Embeddings.
+    dimensions: Optional[int] = None
+
+    # LoRA related
+    lora_id: Optional[str] = None  # None means just use the base model
+    # Pre-computed delimiter indices for multi-item scoring
+    multi_item_delimiter_indices: Optional[List[int]] = None
+    # For observability
+    time_stats: Optional[ReqTimeStatsBase] = (
+        None # Optional[Union[APIServerReqTimeStats, DPControllerReqTimeStats]] 
+    )
+
+    # Whether to return pooled hidden states (pre-head transformer output)
+    return_pooled_hidden_states: bool = False
+
+    # From BaseReq dataclass
+    rid: Optional[str] = None
+    http_worker_ipc: Optional[str] = None
+
+
+class BatchTokenizedEmbeddingReqInput(msgspec.Struct, tag=True):
+    reqs: List[TokenizedEmbeddingReqInput]
+
+    rids: Optional[List[str]] = None
+    http_worker_ipcs: Optional[List[str]] = None
 
 
 def enc_hook(obj: Any) -> Any:
@@ -394,12 +565,12 @@ def enc_hook(obj: Any) -> Any:
         tensor_dtype = str(obj.dtype).split(".")[-1]  # e.g., "float32"
         raw_data = obj.flatten().cpu().contiguous().view(torch.uint8).numpy().data
         return (obj.shape, tensor_dtype, raw_data)
-    elif isinstance(obj, SchedulerReqTimeStats):
-        return SchedulerReqTimeStatsIPC.from_req_time_stats(obj)
+    elif isinstance(obj, SamplingParams):
+        return SamplingParamsIPC.from_sampling_params(obj)
     else:
         # Raise a NotImplementedError for other types
         raise NotImplementedError(
-            f"Encode objects of type {type(obj)} are not supported"
+            f"Encode objects of type {type(obj)} and value {str(obj)[:32]} are not supported"
         )
 
 
@@ -411,11 +582,14 @@ def dec_hook(type: Type, obj: Any) -> Any:
         tensor_dtype = getattr(torch, dtype)
 
         return torch.frombuffer(data, dtype=tensor_dtype).reshape(shape)
-    elif type is SchedulerReqTimeStats:
-        return SchedulerReqTimeStatsIPC(**obj).to_req_time_stats()
+    elif type is SamplingParams:
+        obj.pop("type", None)
+        return SamplingParamsIPC(**obj).to_sampling_params()
     else:
         # Raise a NotImplementedError for other types
-        raise NotImplementedError(f"Decode objects of type {type} are not supported")
+        raise NotImplementedError(
+            f"Decode objects of type {type} and value {obj} are not supported"
+        )
 
 
 _unified_struct = Union[
@@ -431,6 +605,11 @@ _unified_struct = Union[
     LoRAMetrics,
     DisaggregationMetrics,
     QueueMetrics,
+    SessionParams,
+    TokenizedGenerateReqInput,
+    BatchTokenizedGenerateReqInput,
+    TokenizedEmbeddingReqInput,
+    BatchTokenizedEmbeddingReqInput,
 ]
 
 _msgpack_encoder = msgspec.msgpack.Encoder(enc_hook=enc_hook)
