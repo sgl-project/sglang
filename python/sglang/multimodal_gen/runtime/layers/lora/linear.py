@@ -507,9 +507,7 @@ class ColumnParallelLinearWithLoRA(BaseLayerWithLoRA):
         ):
             return {}
         # Match official full-weight LoRA fuse stochastic rounding after TP sharding.
-        row_offset = (
-            self.base_layer.tp_rank * self.base_layer.output_partition_sizes[0]
-        )
+        row_offset = self.base_layer.tp_rank * self.base_layer.output_partition_sizes[0]
         return {"random_offset": row_offset * data_2d.shape[-1]}
 
 

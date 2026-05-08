@@ -1412,7 +1412,9 @@ class LTX2VideoTransformer3DModel(CachableDiT, OffloadableDiTMixin):
         rope_double_precision = (
             str(frequencies_precision) == "float64"
             if frequencies_precision is not None
-            else bool(hf_config.get("rope_double_precision", arch.double_precision_rope))
+            else bool(
+                hf_config.get("rope_double_precision", arch.double_precision_rope)
+            )
         )
         self.quantize_video_rope_coords_to_hidden_dtype = bool(
             hf_config.get("quantize_video_rope_coords_to_hidden_dtype", False)
