@@ -411,11 +411,7 @@ class GPUWorker:
     def _materialize_frame_outputs_for_return(
         self, output_batch: OutputBatch, req: Req
     ) -> None:
-        if (
-            self.rank != 0
-            or output_batch.output is None
-            or not req.return_frames
-        ):
+        if self.rank != 0 or output_batch.output is None or not req.return_frames:
             return
 
         if (

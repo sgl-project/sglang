@@ -626,7 +626,9 @@ class Scheduler(SchedulerDisaggMixin):
             ):
                 payload = pickle.dumps(output_batch)
 
-            with self._record_return_stage(output_batch, "Scheduler.return_result.send"):
+            with self._record_return_stage(
+                output_batch, "Scheduler.return_result.send"
+            ):
                 self.receiver.send_multipart([identity, b"", payload])
 
     @contextmanager
