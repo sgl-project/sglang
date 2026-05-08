@@ -1084,6 +1084,12 @@
                     "pages": [
                       "cookbook/autoregressive/Tencent/Hunyuan3-Preview"
                     ]
+                  },
+                  {
+                    "group": "Poolside",
+                    "pages": [
+                      "cookbook/autoregressive/Poolside/Laguna-XS.2"
+                    ]
                   }
                 ]
               },
