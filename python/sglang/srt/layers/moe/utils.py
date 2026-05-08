@@ -188,7 +188,7 @@ def get_deepep_output_dtype(self, quant_scheme=None) -> DeepOutputDtype:
         logger.warning_once(
             "Warning: The env variable SGLANG_DEEPEP_BF16_DISPATCH deprecated "
             "and will be removed in future releases. Please use a new "
-            "`--deepep-dispatcher-output-dtype` bf16 argument instead."
+            "`--deepep-dispatcher-output-dtype bf16` argument instead."
         )
         return DeepOutputDtype.BF16
 
@@ -196,7 +196,7 @@ def get_deepep_output_dtype(self, quant_scheme=None) -> DeepOutputDtype:
         logger.warning_once(
             "Warning: The env variable DEEP_NORMAL_MODE_USE_INT8_QUANT deprecated "
             "and will be removed in future releases. Please use a new "
-            "`--deepep-dispatcher-output-dtype` fp8 argument instead."
+            "`--deepep-dispatcher-output-dtype fp8` argument instead."
         )
         return DeepOutputDtype.FP8
 
