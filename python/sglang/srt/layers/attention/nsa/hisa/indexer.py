@@ -46,7 +46,6 @@ from sglang.srt.layers.attention.nsa.hisa.orchestrator import (
     fp8_native_hierarchy_mqa_logits,
     fp8_native_hierarchy_paged_mqa_logits,
 )
-from sglang.srt.mem_cache.hisa_memory_pool import HisaNSATokenToKVPool
 from sglang.srt.layers.attention.nsa.utils import (
     is_nsa_enable_prefill_cp,
     is_nsa_prefill_cp_in_seq_split,
@@ -56,6 +55,7 @@ from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.rotary_embedding import get_rope_wrapper
 from sglang.srt.layers.utils.cp_utils import cp_all_gather_rerange_output
+from sglang.srt.mem_cache.hisa_memory_pool import HisaNSATokenToKVPool
 from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.server_args import get_global_server_args
