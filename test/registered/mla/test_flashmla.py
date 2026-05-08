@@ -98,7 +98,7 @@ class TestFlashMLAMTP(CustomTestCase):
                 ]
             )
         # Use longer timeout for DeepGEMM JIT compilation which can take 10-20 minutes
-        with envs.SGLANG_ENABLE_SPEC_V2.override(False):
+        with envs.SGLANG_ENABLE_SPEC_V2.override(True):
             cls.process = popen_launch_server(
                 cls.model,
                 cls.base_url,
