@@ -336,18 +336,18 @@ class CustomAllreduce:
         self.close()
 
 
-def dispatch_custom_allreduce(num_nodes: int = 1):
+def dispatch_custom_allreduce():
     """Return the CustomAllreduce class to use (aiter on ROCm if enabled).
 
     On AMD with 1-stage AR enabled, use sglang's CustomAllreduce.
     Otherwise use AiterCustomAllreduce if available.
 
-    On CUDA, the JIT-compiled v2 implementation is used by default in single-node
-    setups. With ``num_nodes > 1`` we fall back to the legacy CustomAllreduce
-    (custom AR is intra-node only; v2's IPC handles can't span nodes).
-    Set SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2=0 to force the legacy path.
+    On CUDA, the JIT-compiled v2 implementation is used by default.
+    Set SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2=0 to fall back to the legacy CustomAllreduce.
+    Note: ``ServerArgs._handle_environment_variables`` forces this env to "0" when
+    ``nnodes > 1`` since custom AR is intra-node only.
     """
-    if _is_cuda and envs.SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2.get() and num_nodes == 1:
+    if _is_cuda and envs.SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2.get():
         from .custom_all_reduce_v2 import CustomAllReduceV2
 
         logger.debug("[AR] Using CustomAllReduceV2 (JIT-compiled)")

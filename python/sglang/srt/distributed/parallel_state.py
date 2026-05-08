@@ -382,8 +382,7 @@ class GroupCoordinator:
         if use_custom_allreduce and self.world_size > 1:
             # Initialize a custom fast all-reduce implementation.
             try:
-                num_nodes = self.world_size // self.local_size if self.local_size else 1
-                CAClass = dispatch_custom_allreduce(num_nodes=num_nodes)
+                CAClass = dispatch_custom_allreduce()
                 self.ca_comm = CAClass(
                     group=self.cpu_group,
                     device=self.device,
