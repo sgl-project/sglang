@@ -888,7 +888,7 @@ class Scheduler(
         self.num_paused_reqs: int = 0
         self.session_controller = SessionController(self.tree_cache)
         if self.spec_algorithm.is_decoupled_draft():
-            self.start_draft_adapter()
+            self.start_token_sync_thread()
         if (
             self.spec_algorithm.is_decoupled_verify()
             or self.spec_algorithm.is_decoupled_draft()

@@ -25,20 +25,23 @@ from sglang.srt.utils.network import get_zmq_socket
 
 DraftControlMessage = DraftSync | VerifyCommit | DraftClose
 
-ADAPTER_IDLE_WAIT_TIMEOUT_S = 0.0005 # 0.5ms
+TOKEN_SYNC_THREAD_IDLE_WAIT_TIMEOUT_S = 0.0005  # 0.5ms
 
 
 @dataclass
-class DraftAdapterThread:
-    """Drafter-side adapter thread for decoupled speculation IPC."""
+class TokenSyncThread:
+    """Drafter-side token sync thread for decoupled speculation IPC."""
 
     context: zmq.Context | None = None
     ipc_config: DraftMeshIpcConfig | None = None
     drafter_rank: int = 0
     _pending_controls: deque[DraftControlMessage] = field(default_factory=deque)
-    control_recv_socket: zmq.Socket | None = None # verifier -> drafter recv control messages
-    result_send_sockets: dict[int, zmq.Socket] = field(default_factory=dict) # drafter -> verifier send draft tokens
-    _pending_lock: threading.Lock = field(default_factory=threading.Lock) # used to protect _pending_controls
+    # verifier -> drafter controls
+    control_recv_socket: zmq.Socket | None = None
+    # drafter -> verifier draft tokens
+    result_send_sockets: dict[int, zmq.Socket] = field(default_factory=dict)
+    # protects _pending_controls
+    _pending_lock: threading.Lock = field(default_factory=threading.Lock)
     _outgoing_results: queue.SimpleQueue[DraftTailStreamOutputBatch] = field(
         default_factory=queue.SimpleQueue
     )
@@ -51,7 +54,7 @@ class DraftAdapterThread:
         if self.context is None or self.ipc_config is None:
             self._thread = threading.Thread(
                 target=self._run,
-                name="sglang-draft-adapter",
+                name="sglang-token-sync-thread",
                 daemon=True,
             )
             return
@@ -68,11 +71,13 @@ class DraftAdapterThread:
                 endpoint,
                 False,
             )
-            for verifier_rank, endpoint in sorted(self.ipc_config.result_endpoints.items())
+            for verifier_rank, endpoint in sorted(
+                self.ipc_config.result_endpoints.items()
+            )
         }
         self._thread = threading.Thread(
             target=self._run,
-            name="sglang-draft-adapter",
+            name="sglang-token-sync-thread",
             daemon=True,
         )
 
@@ -142,7 +147,7 @@ class DraftAdapterThread:
                 )
         if trace_enabled and did_work:
             self.tracer.record(
-                "draft_adapter",
+                "token_sync_thread",
                 "drain_control_socket",
                 duration_ms=(time.perf_counter_ns() - drain_start_ns) / 1_000_000,
                 drafter_rank=int(self.drafter_rank),
@@ -231,7 +236,7 @@ class DraftAdapterThread:
             self._send_draft_results(result_batch)
         if trace_enabled and did_work:
             self.tracer.record(
-                "draft_adapter",
+                "token_sync_thread",
                 "drain_outgoing_results",
                 duration_ms=(time.perf_counter_ns() - drain_start_ns) / 1_000_000,
                 drafter_rank=int(self.drafter_rank),
@@ -312,7 +317,7 @@ class DraftAdapterThread:
             fields["num_close"] = sum(
                 isinstance(message, DraftClose) for message in messages
             )
-        self.tracer.record("draft_adapter", op, **fields)
+        self.tracer.record("token_sync_thread", op, **fields)
 
     def _record_draft_results(
         self,
@@ -343,7 +348,7 @@ class DraftAdapterThread:
         }
         if op == "send_result_batch":
             fields["dst_verifier_rank"] = int(dst_verifier_rank)
-        self.tracer.record("draft_adapter", op, **fields)
+        self.tracer.record("token_sync_thread", op, **fields)
 
     def _outgoing_results_size(self) -> int:
         try:
@@ -358,7 +363,7 @@ class DraftAdapterThread:
     def _idle_wait(self) -> None:
         trace_enabled = getattr(getattr(self, "tracer", None), "enabled", False)
         if not trace_enabled:
-            self._wakeup.wait(timeout=ADAPTER_IDLE_WAIT_TIMEOUT_S)
+            self._wakeup.wait(timeout=TOKEN_SYNC_THREAD_IDLE_WAIT_TIMEOUT_S)
             self._wakeup.clear()
             return
 
@@ -366,18 +371,18 @@ class DraftAdapterThread:
         pending_controls_before = self._pending_controls_size()
         wakeup_set_before = self._wakeup.is_set()
         start_ns = time.perf_counter_ns()
-        self._wakeup.wait(timeout=ADAPTER_IDLE_WAIT_TIMEOUT_S)
+        self._wakeup.wait(timeout=TOKEN_SYNC_THREAD_IDLE_WAIT_TIMEOUT_S)
         duration_ms = (time.perf_counter_ns() - start_ns) / 1_000_000
         wakeup_set_after = self._wakeup.is_set()
         queue_size_after = self._outgoing_results_size()
         pending_controls_after = self._pending_controls_size()
         self._wakeup.clear()
         self.tracer.record(
-            "draft_adapter",
+            "token_sync_thread",
             "idle_wait",
             duration_ms=duration_ms,
             drafter_rank=int(self.drafter_rank),
-            wait_timeout_ms=ADAPTER_IDLE_WAIT_TIMEOUT_S * 1_000,
+            wait_timeout_ms=TOKEN_SYNC_THREAD_IDLE_WAIT_TIMEOUT_S * 1_000,
             wakeup_set_before_wait=wakeup_set_before,
             wakeup_set_after_wait=wakeup_set_after,
             queue_size_before_wait=queue_size_before,

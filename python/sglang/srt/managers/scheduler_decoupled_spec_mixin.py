@@ -25,9 +25,9 @@ from sglang.srt.speculative.decoupled_spec_io import (
     parse_draft_scheduler_rid,
 )
 from sglang.srt.speculative.decoupled_spec_trace import build_decoupled_spec_tracer
-from sglang.srt.speculative.draft_adapter import DraftAdapterThread
 from sglang.srt.speculative.draft_proxy import DraftProxyThread
 from sglang.srt.speculative.draft_tail_buffer import DraftTailBuffer, DraftTailSnapshot
+from sglang.srt.speculative.token_sync_thread import TokenSyncThread
 from sglang.srt.utils import broadcast_pyobj
 
 if TYPE_CHECKING:
@@ -93,8 +93,8 @@ class SchedulerDecoupledSpecMixin:
         )
         self.draft_proxy_thread.start()
 
-    def start_draft_adapter(self: Scheduler) -> None:
-        self.draft_adapter_thread = None
+    def start_token_sync_thread(self: Scheduler) -> None:
+        self.token_sync_thread = None
         if not self.is_draft_entry_rank():
             return
         ipc_config = self.port_args.draft_mesh_ipc_config
@@ -102,13 +102,13 @@ class SchedulerDecoupledSpecMixin:
             raise RuntimeError(
                 "Draft mesh IPC config is required on decoupled_draft entry rank"
             )
-        self.draft_adapter_thread = DraftAdapterThread(
+        self.token_sync_thread = TokenSyncThread(
             context=getattr(self, "zmq_context", None),
             ipc_config=ipc_config,
             drafter_rank=self.dp_rank or 0,
             tracer=self.decoupled_spec_tracer,
         )
-        self.draft_adapter_thread.start()
+        self.token_sync_thread.start()
 
     def init_draft_state_tables(self: Scheduler) -> None:
         self.draft_req_table: Dict[DraftReqKey, DraftReqState] = {}
@@ -201,7 +201,7 @@ class SchedulerDecoupledSpecMixin:
                 f"drafter_dp{dp_rank}_tp{self.tp_rank}_pp{self.pp_rank}.csv"
             ),
             "draft_proxy": f"draft_proxy_verifier{dp_rank}.csv",
-            "draft_adapter": f"draft_adapter_drafter{dp_rank}.csv",
+            "token_sync_thread": f"token_sync_thread_drafter{dp_rank}.csv",
         }
         return build_decoupled_spec_tracer(
             enabled=enabled,
@@ -309,11 +309,11 @@ class SchedulerDecoupledSpecMixin:
             )
         return list(messages or [])
 
-    def _get_draft_adapter_thread(self: Scheduler):
-        adapter = self.draft_adapter_thread
-        if adapter is None:
-            raise RuntimeError("Decoupled draft entry rank has no draft adapter thread")
-        return adapter
+    def _get_token_sync_thread(self: Scheduler):
+        token_sync_thread = self.token_sync_thread
+        if token_sync_thread is None:
+            raise RuntimeError("Decoupled draft entry rank has no token sync thread")
+        return token_sync_thread
 
     def _get_or_create_draft_state(
         self: Scheduler,
@@ -351,7 +351,7 @@ class SchedulerDecoupledSpecMixin:
             return
         if not self.is_draft_entry_rank():
             return
-        self._get_draft_adapter_thread().submit_draft_results(stream_output_batch)
+        self._get_token_sync_thread().submit_draft_results(stream_output_batch)
 
     def apply_verify_commit(
         self: Scheduler,
@@ -724,11 +724,11 @@ class SchedulerDecoupledSpecMixin:
     ) -> list[VerifyCommit | DraftClose]:
         """
         (called by decoupled drafter)
-        Drain all VerifyCommit and DraftClose messages from draft adapter thread
+        Drain all VerifyCommit and DraftClose messages from token sync thread
         """
         messages: list[DraftControlMessage] | None = None
         if self.is_draft_entry_rank():
-            messages = self._get_draft_adapter_thread().drain_post_result_messages()
+            messages = self._get_token_sync_thread().drain_post_result_messages()
 
         return [
             message
@@ -739,7 +739,7 @@ class SchedulerDecoupledSpecMixin:
     def sync_draft_requests(self: Scheduler) -> None:
         """
         (called by decoupled drafter)
-        Drain DraftSync messages from draft adapter thread, and handle them.
+        Drain DraftSync messages from token sync thread, and handle them.
         DraftSync creates a new drafter-side request from verifier state.
         """
         if not self.spec_algorithm.is_decoupled_draft():
@@ -749,7 +749,7 @@ class SchedulerDecoupledSpecMixin:
         trace_start_ns = time.perf_counter_ns() if trace_enabled else 0
         messages: list[DraftControlMessage] | None = None
         if self.is_draft_entry_rank():
-            messages = self._get_draft_adapter_thread().drain_sync_messages()
+            messages = self._get_token_sync_thread().drain_sync_messages()
 
         messages = [
             message

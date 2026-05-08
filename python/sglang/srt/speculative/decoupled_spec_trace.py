@@ -168,7 +168,7 @@ TRACE_EVENT_SCHEMAS: dict[tuple[str, str], list[str]] = {
         "tail_lens_after_by_req",
         "committed_lens_after_by_req",
     ),
-    ("draft_adapter", "recv_control_batch"): _fields(
+    ("token_sync_thread", "recv_control_batch"): _fields(
         "drafter_rank",
         "batch_size",
         "rids",
@@ -176,27 +176,27 @@ TRACE_EVENT_SCHEMAS: dict[tuple[str, str], list[str]] = {
         "num_commit",
         "num_close",
     ),
-    ("draft_adapter", "drain_sync_batch"): _fields(
+    ("token_sync_thread", "drain_sync_batch"): _fields(
         "drafter_rank",
         "batch_size",
         "rids",
         "num_sync",
     ),
-    ("draft_adapter", "drain_post_result_batch"): _fields(
+    ("token_sync_thread", "drain_post_result_batch"): _fields(
         "drafter_rank",
         "batch_size",
         "rids",
         "num_commit",
         "num_close",
     ),
-    ("draft_adapter", "enqueue_draft_result_batch"): _fields(
+    ("token_sync_thread", "enqueue_draft_result_batch"): _fields(
         "drafter_rank",
         "batch_size",
         "rids",
         "num_stream_outputs",
         "emitted_token_lens_by_req",
     ),
-    ("draft_adapter", "send_result_batch"): _fields(
+    ("token_sync_thread", "send_result_batch"): _fields(
         "drafter_rank",
         "dst_verifier_rank",
         "batch_size",
@@ -204,21 +204,21 @@ TRACE_EVENT_SCHEMAS: dict[tuple[str, str], list[str]] = {
         "num_stream_outputs",
         "emitted_token_lens_by_req",
     ),
-    ("draft_adapter", "drain_outgoing_results"): _fields(
+    ("token_sync_thread", "drain_outgoing_results"): _fields(
         "drafter_rank",
         "queue_size_before",
         "queue_size_after",
         "num_result_batches",
         "num_stream_outputs",
     ),
-    ("draft_adapter", "drain_control_socket"): _fields(
+    ("token_sync_thread", "drain_control_socket"): _fields(
         "drafter_rank",
         "pending_controls_before",
         "pending_controls_after",
         "num_control_batches",
         "num_control_messages",
     ),
-    ("draft_adapter", "idle_wait"): _fields(
+    ("token_sync_thread", "idle_wait"): _fields(
         "drafter_rank",
         "wait_timeout_ms",
         "wakeup_set_before_wait",
