@@ -57,8 +57,9 @@ class TestZeroMatchResult(unittest.TestCase):
         self.assertEqual(zeroed.device_indices.dtype, match.device_indices.dtype)
         self.assertEqual(zeroed.device_indices.device, match.device_indices.device)
 
-    def test_no_root_node_returns_unchanged(self):
-        # tree_cache without a root_node: helper must not fabricate inconsistent state.
+    def test_no_root_node_raises(self):
+        # tree_cache without a root_node: must raise loudly rather than silently
+        # leak cache hits past the gate.
         class _NoRoot:
             pass
 
@@ -68,8 +69,8 @@ class TestZeroMatchResult(unittest.TestCase):
             last_host_node="sentinel-host",
             host_hit_length=4,
         )
-        out = zero_match_result(_NoRoot(), original)
-        self.assertIs(out, original)
+        with self.assertRaisesRegex(RuntimeError, "SGLANG_RADIX_FORCE_MISS"):
+            zero_match_result(_NoRoot(), original)
 
 
 class TestMatchPrefixForReqForceMiss(unittest.TestCase):
