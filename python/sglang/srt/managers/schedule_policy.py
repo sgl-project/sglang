@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 
+from sglang.srt.environ import envs
 from sglang.srt.managers.prefill_delayer import PrefillDelayerSinglePassExecutor
 from sglang.srt.mem_cache.base_prefix_cache import DecLockRefParams
 from sglang.srt.utils import get_bool_env_var
@@ -98,6 +99,8 @@ def match_prefix_for_req(
             req=req if include_req else None,
         )
     )
+    if envs.SGLANG_RADIX_FORCE_MISS.get():
+        match_result = _zero_match_result(tree_cache, match_result)
     (
         req.prefix_indices,
         req.last_node,
@@ -114,6 +117,16 @@ def match_prefix_for_req(
     if match_result.cache_protected_len is not None:
         req.cache_protected_len = match_result.cache_protected_len
     return match_result
+
+
+def _zero_match_result(tree_cache, match_result):
+    root = getattr(tree_cache, "root_node", None)
+    return match_result._replace(
+        device_indices=match_result.device_indices[:0],
+        last_device_node=root if root is not None else match_result.last_device_node,
+        last_host_node=root if root is not None else match_result.last_host_node,
+        host_hit_length=0,
+    )
 
 
 class CacheAwarePolicy(Enum):
