@@ -20,8 +20,11 @@ from sglang.srt.utils import (
     get_bool_env_var,
     get_device_core_count,
     get_int_env_var,
+    is_hip,
     next_power_of_2,
 )
+
+_is_hip = is_hip()
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -142,7 +145,16 @@ class TritonAttnBackend(AttentionBackend):
             "SGLANG_TRITON_DECODE_ATTN_STATIC_KV_SPLITS", "false"
         )
         self.max_kv_splits = model_runner.server_args.triton_attention_num_kv_splits
-        if self.use_mla:
+        # The kv-splits cap was tuned for NVIDIA SMs (e.g. SM120) and inflates
+        # max_kv_splits up to next_power_of_2(sm_count). On AMD MI3xx that lifts
+        # it from 16 to 512, which makes the (cuda_graph_max_bs, num_head,
+        # max_kv_splits, v_head_dim) attn_logits buffer too large and triggers a
+        # "Memory access fault by GPU node" during CUDA graph capture / replay
+        # of the MLA decode kernel (reported on PR #20479 by @andyluo7 and
+        # observed in the R73 nightly Kimi-K2.6 8-GPU GSM8K run as a 300s
+        # scheduler-watchdog hang). Skip the cap on HIP to restore the
+        # pre-PR #20479 behavior.
+        if self.use_mla and not _is_hip:
             self.max_kv_splits = _mla_decode_kv_splits_cap(
                 self.max_kv_splits,
                 self.device_core_count,
