@@ -1,8 +1,22 @@
+"""Archived FA3 NGRAM speculative-decoding test.
+
+Removed from per-commit CI (and not migrated to nightly). Preserved here
+so the FA3 backend test remains runnable manually if needed.
+
+Originally lived in:
+  test/registered/spec/test_ngram_speculative_decoding.py
+
+The remaining classes from that file are split between:
+- test/registered/spec/test_ngram_speculative_decoding.py
+    -> Paged variant (per-commit, stage-b-test-1-gpu-large)
+- test/registered/spec/test_ngram_speculative_decoding_nightly.py
+    -> Triton + Flashinfer variants (nightly, tags=("speculative-decoding",))
+"""
+
 import unittest
 
 from sglang.srt.environ import envs
 from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.eval_accuracy_kit import GSM8KMixin
 from sglang.test.test_utils import (
     DEFAULT_TARGET_MODEL_NGRAM,
@@ -12,13 +26,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-# Per-commit: Paged backend only.
-# - FA3 base test archived to test/manual/spec/test_ngram_speculative_decoding_archived.py
-# - Triton + Flashinfer moved to test_ngram_speculative_decoding_nightly.py
-register_cuda_ci(est_time=70, suite="stage-b-test-1-gpu-large")
-
-
-# Default server arguments shared across all tests
+# Default server arguments shared across all NGRAM tests
 DEFAULT_SERVER_ARGS = [
     "--trust-remote-code",
     "--cuda-graph-max-bs",
@@ -32,14 +40,7 @@ DEFAULT_SERVER_ARGS = [
 ]
 
 
-class _NgramSpeculativeDecodingBase(GSM8KMixin, CustomTestCase):
-    """Non-runnable base (leading underscore so unittest skips it).
-
-    Concrete subclasses below override get_server_args. Kept private here
-    so the previous FA3-on-base test no longer runs in per-commit; the
-    archived FA3 variant lives in test/manual/spec/.
-    """
-
+class TestNgramSpeculativeDecodingBase(GSM8KMixin, CustomTestCase):
     model = DEFAULT_TARGET_MODEL_NGRAM
     base_url = DEFAULT_URL_FOR_TEST
     gsm8k_accuracy_thres = 0.79  # derived tests need to override this
@@ -67,18 +68,6 @@ class _NgramSpeculativeDecodingBase(GSM8KMixin, CustomTestCase):
     @classmethod
     def tearDownClass(cls):
         kill_process_tree(cls.process.pid)
-
-
-class TestNgramSpeculativeDecodingPaged(_NgramSpeculativeDecodingBase):
-
-    @classmethod
-    def get_server_args(cls):
-        return DEFAULT_SERVER_ARGS + [
-            "--attention-backend",
-            "flashinfer",
-            "--page-size",
-            "64",
-        ]
 
 
 if __name__ == "__main__":
