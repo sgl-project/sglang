@@ -536,11 +536,11 @@ class LogitsProcessor(nn.Module):
             if aux_pruned_states_lists is not None:
                 aux_pruned_states = [torch.cat(lst) for lst in aux_pruned_states_lists]
             sample_indices = torch.tensor(
-                sample_indices, device=pruned_states.device, dtype=torch.int64
-            )
+                sample_indices, dtype=torch.int64, pin_memory=True
+            ).to(pruned_states.device, non_blocking=True)
             input_logprob_indices = torch.tensor(
-                input_logprob_indices, device=pruned_states.device, dtype=torch.int64
-            )
+                input_logprob_indices, dtype=torch.int64, pin_memory=True
+            ).to(pruned_states.device, non_blocking=True)
 
         return (
             pruned_states,
@@ -607,19 +607,24 @@ class LogitsProcessor(nn.Module):
     def _expand_metadata_for_logprobs(
         self, logits_metadata: LogitsMetadata, device: torch.device
     ):
+        # Avoid implicit device sync inside repeat_interleave by providing output_size,
+        # which we can compute from CPU metadata.
+        total_pruned_len = sum(logits_metadata.extend_logprob_pruned_lens_cpu)
         pruned_lens = torch.tensor(
             logits_metadata.extend_logprob_pruned_lens_cpu,
-            device=device,
-        )
+            pin_memory=True,
+        ).to(device, non_blocking=True)
         if logits_metadata.temp_scaled_logprobs:
             logits_metadata.temperature = torch.repeat_interleave(
                 logits_metadata.temperature.view(-1),
                 pruned_lens,
+                output_size=total_pruned_len,
             ).view(-1, 1)
         if logits_metadata.top_p_normalized_logprobs:
             logits_metadata.top_p = torch.repeat_interleave(
                 logits_metadata.top_p,
                 pruned_lens,
+                output_size=total_pruned_len,
             )
 
     def process_input_logprobs(self, input_logits, logits_metadata: LogitsMetadata):
