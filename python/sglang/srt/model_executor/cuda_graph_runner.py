@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import bisect
+import contextlib
 import gc
 import inspect
 import logging
@@ -425,6 +426,12 @@ _capture_lora_variant: Optional[str] = None
 
 def get_is_capture_mode():
     return is_capture_mode
+
+
+def compile_in_capture_mode(func):
+    if get_is_capture_mode():
+        return torch.compile(func)
+    return func
 
 
 def get_capture_lora_variant() -> Optional[str]:
@@ -931,9 +938,10 @@ class CudaGraphRunner:
             else:
                 set_pdmux_status(False)
                 for i, sg in enumerate(self.stream_groups):
-                    with graph_capture(
-                        stream=sg[1]
-                    ) as graph_capture_context, profile_context as prof:
+                    with (
+                        graph_capture(stream=sg[1]) as graph_capture_context,
+                        profile_context as prof,
+                    ):
                         self.stream = graph_capture_context.stream
                         _capture_one_stream(i)
 
@@ -1196,11 +1204,13 @@ class CudaGraphRunner:
             self.device_module.synchronize()
             self.model_runner.tp_group.barrier()
             run_once()
+            attn_backend.on_after_cuda_graph_warmup()
 
         if get_global_graph_memory_pool() is None:
             set_global_graph_memory_pool(self.device_module.graph_pool_handle())
         # Set graph pool id globally to be able to use symmetric memory
         set_graph_pool_id(get_global_graph_memory_pool())
+
         out = self._capture_graph(
             graph, get_global_graph_memory_pool(), stream, run_once
         )
@@ -1346,24 +1356,29 @@ class CudaGraphRunner:
         # Attention backend
         attn_backend = self._get_replay_attn_backend()
         if replay_metadata is None:
-            attn_backend.init_forward_metadata_replay_cuda_graph(
-                bs,
-                buffers.req_pool_indices[:bs],
-                buffers.seq_lens[:bs],
-                forward_batch.seq_lens_sum
-                + (bs - copy_bs) * self.seq_len_fill_value,
-                buffers.encoder_lens[:bs] if self.is_encoder_decoder else None,
-                self.capture_forward_mode,
-                forward_batch.spec_info,
-                seq_lens_cpu=buffers.seq_lens_cpu[:bs],
-            )
+            # FIXME: implicit channel for backends (dsv4) that need forward_batch
+            # in replay metadata prep. Should become a real param on the interface.
+            attn_backend._replay_forward_batch = forward_batch
+            try:
+                attn_backend.init_forward_metadata_replay_cuda_graph(
+                    bs,
+                    buffers.req_pool_indices[:bs],
+                    buffers.seq_lens[:bs],
+                    forward_batch.seq_lens_sum
+                    + (bs - copy_bs) * self.seq_len_fill_value,
+                    buffers.encoder_lens[:bs] if self.is_encoder_decoder else None,
+                    self.capture_forward_mode,
+                    forward_batch.spec_info,
+                    seq_lens_cpu=buffers.seq_lens_cpu[:bs],
+                )
+            finally:
+                attn_backend._replay_forward_batch = None
         else:
             attn_backend.init_forward_metadata_replay_cuda_graph_with_metadata(
                 replay_metadata,
                 buffers.req_pool_indices,
                 buffers.seq_lens,
-                forward_batch.seq_lens_sum
-                + (bs - copy_bs) * self.seq_len_fill_value,
+                forward_batch.seq_lens_sum + (bs - copy_bs) * self.seq_len_fill_value,
                 buffers.encoder_lens if self.is_encoder_decoder else None,
                 self.capture_forward_mode,
                 forward_batch.spec_info,
@@ -1548,7 +1563,18 @@ class CudaGraphRunner:
         variant_label = self._resolve_lora_variant(forward_batch)
         stream_idx = get_current_stream_idx() if self.enable_pdmux else None
         graph_key = self._make_graph_key(self.bs, stream_idx, variant_label)
-        self.graphs[graph_key].replay()
+        ctx = (
+            self.model_runner.device_timer.wrap(
+                metadata={
+                    "category": forward_batch.forward_mode.name.lower(),
+                }
+            )
+            if self.model_runner.device_timer
+            else contextlib.nullcontext()
+        )
+        with ctx:
+            self.graphs[graph_key].replay()
+
         output = self.output_buffers[graph_key]
 
         if isinstance(output, LogitsProcessorOutput):

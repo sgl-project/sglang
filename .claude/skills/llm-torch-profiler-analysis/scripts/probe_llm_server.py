@@ -15,7 +15,7 @@ from urllib import request
 from profile_common import extract_openai_chat_text
 
 DEFAULT_PROMPTS = [
-    "用一句中文介绍上海。",
+    "Introduce Shanghai in one short sentence.",
     "What is 2+2? Answer briefly.",
     "Write one short haiku about GPUs.",
 ]

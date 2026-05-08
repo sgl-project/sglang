@@ -365,6 +365,10 @@
       "destination": "/docs/sglang-diffusion/attention_backends"
     },
     {
+      "source": "/diffusion/performance/dynamic_batching.html",
+      "destination": "/docs/sglang-diffusion/dynamic_batching"
+    },
+    {
       "source": "/diffusion/performance/cache/cache_dit.html",
       "destination": "/docs/sglang-diffusion/cache_dit"
     },
@@ -891,6 +895,7 @@
                   "docs/hardware-platforms/ascend-npus/ascend_npu_qwen3_examples",
                   "docs/hardware-platforms/ascend-npus/mindspore_backend",
                   "docs/hardware-platforms/ascend-npus/ascend_contribution_guide",
+                  "docs/hardware-platforms/ascend-npus/ascend_npu_support_new_models",
                   "docs/hardware-platforms/ascend-npus/ascend_npu_best_practice",
                   "docs/hardware-platforms/ascend-npus/ascend_npu_ring_sp_performance",
                   "docs/hardware-platforms/ascend-npus/ascend_npu_qwen3_5_examples",
@@ -1170,6 +1175,12 @@
                   "docs/sglang-diffusion/performance-optimization",
                   "docs/sglang-diffusion/ring_sp_performance",
                   "docs/sglang-diffusion/attention_backends",
+                  {
+                    "group": "Inference Batching",
+                    "pages": [
+                      "docs/sglang-diffusion/dynamic_batching"
+                    ]
+                  },
                   "docs/sglang-diffusion/profiling",
                   "docs/sglang-diffusion/ci_perf"
                 ]
