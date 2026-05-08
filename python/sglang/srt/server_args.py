@@ -51,6 +51,7 @@ from sglang.srt.utils.common import (
     is_flashinfer_available,
     is_hip,
     is_hopper_with_cuda_12_3,
+    is_host_cpu_arm64,
     is_mps,
     is_musa,
     is_no_spec_infer_or_topk_one,
@@ -144,6 +145,8 @@ ATTENTION_BACKEND_CHOICES = [
     "torch_native",
     "flex_attention",
     "nsa",
+    "dsv4",
+    "compressed",  # Deprecated alias for "dsv4"
     # NVIDIA specific
     "cutlass_mla",
     "fa3",
@@ -1076,6 +1079,20 @@ class ServerArgs:
             envs.SGLANG_SPEC_NAN_DETECTION.set(True)
             envs.SGLANG_SPEC_OOB_DETECTION.set(True)
 
+        # Deprecated attention-backend alias: "compressed" -> "dsv4".
+        for attr in (
+            "attention_backend",
+            "decode_attention_backend",
+            "prefill_attention_backend",
+            "speculative_draft_attention_backend",
+        ):
+            if getattr(self, attr, None) == "compressed":
+                logger.warning(
+                    "--%s=compressed is deprecated; use 'dsv4' instead.",
+                    attr.replace("_", "-"),
+                )
+                setattr(self, attr, "dsv4")
+
         # Native gRPC flags — env-only for now, not exposed as CLI args.
         # Set as instance attributes (not dataclass fields) to avoid
         # argparse namespace lookup in from_cli_args.
@@ -1203,7 +1220,9 @@ class ServerArgs:
     def _handle_cpu_backends(self):
         if self.device == "cpu":
             if self.attention_backend is None:
-                self.attention_backend = "intel_amx"
+                self.attention_backend = (
+                    "torch_native" if is_host_cpu_arm64() else "intel_amx"
+                )
             self.sampling_backend = "pytorch"
 
     def _handle_npu_backends(self):
@@ -1638,25 +1657,16 @@ class ServerArgs:
         ], "DeepSeek DSA only supports bf16/bfloat16 or fp8_e4m3 kv_cache_dtype"
 
     def _set_default_nsa_backends(self, kv_cache_dtype: str, major: int) -> str:
+        from sglang.srt.arg_groups.hisparse_hook import (
+            apply_hisparse_nsa_backend_defaults,
+        )
+
         user_set_prefill = self.nsa_prefill_backend is not None
         user_set_decode = self.nsa_decode_backend is not None
 
-        # HiSparse: BF16 KV -> flashmla_sparse (native BF16 sparse).
-        # FP8 KV   -> flashmla_kv (native FP8 + sparse via is_fp8_kvcache=True + indices=...).
-        # flashmla_sparse does not accept FP8, and flashmla_kv does not accept BF16 sparse,
-        # so the KV dtype determines the backend when the user does not override.
-        if self.enable_hisparse:
-            hisparse_default_backend = (
-                "flashmla_kv" if kv_cache_dtype == "fp8_e4m3" else "flashmla_sparse"
-            )
-            if not user_set_prefill:
-                self.nsa_prefill_backend = hisparse_default_backend
-            if not user_set_decode:
-                self.nsa_decode_backend = hisparse_default_backend
-            logger.warning(
-                f"HiSparse enabled ({kv_cache_dtype}): using NSA backends "
-                f"prefill={self.nsa_prefill_backend}, decode={self.nsa_decode_backend}."
-            )
+        if apply_hisparse_nsa_backend_defaults(
+            self, user_set_prefill, user_set_decode, kv_cache_dtype
+        ):
             return
 
         if not user_set_prefill and not user_set_decode and is_hip():
@@ -1719,6 +1729,15 @@ class ServerArgs:
             self.dtype = "bfloat16"
 
         if model_arch in [
+            "DeepseekV4ForCausalLM",
+        ]:
+            from sglang.srt.arg_groups.deepseek_v4_hook import (
+                apply_deepseek_v4_defaults,
+            )
+
+            apply_deepseek_v4_defaults(self, model_arch)
+
+        if model_arch in [
             "DeepseekV3ForCausalLM",
             "DeepseekV32ForCausalLM",
             "KimiK25ForConditionalGeneration",
@@ -1773,8 +1792,8 @@ class ServerArgs:
                                 self.dp_size == 1
                             ), "For round-robin split mode, dp attention is not supported."
                         assert (
-                            self.tp_size == 8
-                        ), "Current multi-machine CP support suffers from precision issues. So context parallel only support Single machine(tp_size == 8)"
+                            self.tp_size <= 8
+                        ), "Context parallel only supports single machine (tp_size <= 8). Cross-machine CP has precision issues."
                         self.attn_cp_size = self.tp_size // self.dp_size
 
                         logger.warning(
@@ -1920,6 +1939,13 @@ class ServerArgs:
                         logger.info(
                             "Use triton fused moe by default for bf16 nextn layer in deepseek fp4 checkpoint."
                         )
+
+        elif model_arch in [
+            "DeepseekV4ForCausalLM",
+        ]:
+            from sglang.srt.arg_groups.deepseek_v4_hook import validate_deepseek_v4_cp
+
+            validate_deepseek_v4_cp(self)
 
         elif model_arch in ["GptOssForCausalLM"]:
             # Set attention backend for GPT-OSS
@@ -3545,6 +3571,7 @@ class ServerArgs:
             if model_arch in [
                 "DeepseekV32ForCausalLM",
                 "DeepseekV3ForCausalLM",
+                "DeepseekV4ForCausalLM",
                 "Glm4MoeForCausalLM",
                 "Glm4MoeLiteForCausalLM",
                 "GlmMoeDsaForCausalLM",
@@ -5945,13 +5972,14 @@ class ServerArgs:
             action="store_true",
             help="Enable hierarchical sparse attention",
         )
-
         parser.add_argument(
             "--hisparse-config",
+            "--hierarchical-sparse-attention-extra-config",
+            dest="hisparse_config",
             type=str,
             default=ServerArgs.hisparse_config,
             help="A dictionary in JSON string format for hierarchical sparse attention configuration. "
-            'Example: \'{"top_k": 2048, "device_buffer_size": 4096}\'',
+            'Example: \'{"top_k": 2048, "device_buffer_size": 4096, "host_to_device_ratio": 2}\'',
         )
 
         # LMCache
@@ -6962,43 +6990,9 @@ class ServerArgs:
                 )
 
         # Check hisparse
-        if self.enable_hisparse:
-            from sglang.srt.configs.model_config import is_deepseek_nsa
+        from sglang.srt.arg_groups.hisparse_hook import validate_hisparse
 
-            hf_config = self.get_model_config().hf_config
-            assert is_deepseek_nsa(hf_config), (
-                "--enable-hisparse is only supported for DSA (DeepSeek Sparse Attention) models now"
-                "(e.g., DeepSeek V3.2, GLM-5). "
-            )
-
-            assert (
-                self.disable_radix_cache
-            ), "Hierarchical sparse attention currently requires --disable-radix-cache."
-            if self.kv_cache_dtype not in ("bfloat16", "auto", "fp8_e4m3"):
-                raise ValueError(
-                    f"HiSparse requires bfloat16 or fp8_e4m3 KV cache, "
-                    f"but got --kv-cache-dtype={self.kv_cache_dtype}. "
-                    f"Please use --kv-cache-dtype=bfloat16 or fp8_e4m3."
-                )
-
-            # Backend/dtype pairing: flashmla_sparse only takes BF16 KV;
-            # flashmla_kv only supports FP8 (it always reads KV as FP8 via
-            # is_fp8_kvcache=True, inline-quantizing BF16 would defeat HiSparse).
-            allowed_backends_for_dtype = {
-                "bfloat16": {"flashmla_sparse"},
-                "fp8_e4m3": {"flashmla_kv"},
-            }.get(self.kv_cache_dtype, {"flashmla_sparse", "flashmla_kv"})
-            for attr, label in [
-                ("nsa_prefill_backend", "prefill"),
-                ("nsa_decode_backend", "decode"),
-            ]:
-                backend = getattr(self, attr)
-                if backend is not None and backend not in allowed_backends_for_dtype:
-                    raise ValueError(
-                        f"HiSparse with --kv-cache-dtype={self.kv_cache_dtype} requires "
-                        f"--nsa-{label}-backend in {sorted(allowed_backends_for_dtype)}, "
-                        f"but got {backend}."
-                    )
+        validate_hisparse(self)
 
         assert (
             self.schedule_conservativeness >= 0

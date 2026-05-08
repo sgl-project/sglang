@@ -73,6 +73,7 @@ from sglang.srt.utils import (
     is_cuda,
     is_musa,
     is_npu,
+    log_info_on_rank0,
     next_power_of_2,
 )
 from sglang.srt.utils.patch_torch import monkey_patch_torch_reductions
@@ -278,30 +279,34 @@ class EAGLEWorker(TpModelWorker):
         if self.speculative_num_steps > 1:
             tic = time.perf_counter()
             before_mem = get_available_gpu_memory(self.device, self.gpu_id)
-            logger.info(
-                f"Capture draft cuda graph begin. This can take up to several minutes. avail mem={before_mem:.2f} GB"
+            log_info_on_rank0(
+                logger,
+                f"Capture draft cuda graph begin. This can take up to several minutes. avail mem={before_mem:.2f} GB",
             )
             self.cuda_graph_runner = Device2DraftCudaGraphRunner[
                 self.target_worker.device
             ](self)
             after_mem = get_available_gpu_memory(self.device, self.gpu_id)
-            logger.info(
-                f"Capture draft cuda graph end. Time elapsed: {time.perf_counter() - tic:.2f} s. mem usage={(before_mem - after_mem):.2f} GB. avail mem={after_mem:.2f} GB."
+            log_info_on_rank0(
+                logger,
+                f"Capture draft cuda graph end. Time elapsed: {time.perf_counter() - tic:.2f} s. mem usage={(before_mem - after_mem):.2f} GB. avail mem={after_mem:.2f} GB.",
             )
 
         # Capture extend
         if self.draft_extend_attn_backend and not _is_npu:
             tic = time.perf_counter()
             before_mem = get_available_gpu_memory(self.device, self.gpu_id)
-            logger.info(
-                f"Capture draft extend cuda graph begin. This can take up to several minutes. avail mem={before_mem:.2f} GB"
+            log_info_on_rank0(
+                logger,
+                f"Capture draft extend cuda graph begin. This can take up to several minutes. avail mem={before_mem:.2f} GB",
             )
             self.cuda_graph_runner_for_draft_extend = EAGLEDraftExtendCudaGraphRunner(
                 self
             )
             after_mem = get_available_gpu_memory(self.device, self.gpu_id)
-            logger.info(
-                f"Capture draft extend cuda graph end. Time elapsed: {time.perf_counter() - tic:.2f} s. mem usage={(before_mem - after_mem):.2f} GB. avail mem={after_mem:.2f} GB."
+            log_info_on_rank0(
+                logger,
+                f"Capture draft extend cuda graph end. Time elapsed: {time.perf_counter() - tic:.2f} s. mem usage={(before_mem - after_mem):.2f} GB. avail mem={after_mem:.2f} GB.",
             )
 
     def apply_runtime_state(self, state: SpecRuntimeState):
@@ -309,11 +314,12 @@ class EAGLEWorker(TpModelWorker):
         if self.speculative_num_steps == state.speculative_num_steps:
             return
 
-        logger.info(
+        log_info_on_rank0(
+            logger,
             "Switch adaptive runtime state: "
             f"steps {self.speculative_num_steps} -> {state.speculative_num_steps}, "
             f"draft_tokens {self.speculative_num_draft_tokens} -> "
-            f"{state.speculative_num_draft_tokens}"
+            f"{state.speculative_num_draft_tokens}",
         )
 
         self.speculative_num_steps = state.speculative_num_steps
@@ -384,10 +390,11 @@ class EAGLEWorker(TpModelWorker):
             )
 
         after_mem = get_available_gpu_memory(self.device, self.gpu_id)
-        logger.info(
+        log_info_on_rank0(
+            logger,
             f"Built adaptive runtime state steps={speculative_num_steps}: "
             f"elapsed={time.perf_counter() - tic:.2f}s, "
-            f"mem={(before_mem - after_mem):.2f}GB"
+            f"mem={(before_mem - after_mem):.2f}GB",
         )
 
         return state
@@ -403,9 +410,9 @@ class EAGLEWorker(TpModelWorker):
             self.speculative_num_draft_tokens,
             self.draft_attn_backend,
             self.draft_extend_attn_backend,
-            getattr(self.draft_model_runner, "draft_attn_backend", None),
-            getattr(self, "cuda_graph_runner", None),
-            getattr(self, "cuda_graph_runner_for_draft_extend", None),
+            self.draft_model_runner.draft_attn_backend,
+            self.cuda_graph_runner,
+            self.cuda_graph_runner_for_draft_extend,
             sa.speculative_num_steps,
             sa.speculative_num_draft_tokens,
         )
@@ -507,9 +514,8 @@ class EAGLEWorker(TpModelWorker):
                 batch.reqs, "set_spec_draft_extend_end_time", trace_only=True
             )
 
-            controller = getattr(self, "adaptive_controller", None)
-            if controller is not None:
-                controller.on_verify_complete(
+            if self.adaptive_controller is not None:
+                self.adaptive_controller.on_verify_complete(
                     verify_output.num_accepted_drafts_per_req_cpu
                 )
 
