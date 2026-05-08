@@ -430,9 +430,7 @@ class NPUW4A4Int4DynamicMoEMethod(_NPUFusedMoEMethodBase):
         # since deep_ep does not support quantization in int4
         # dispatching works in bf16
         if hasattr(layer, "dispatcher"):
-            layer.dispatcher.set_quant_config(
-                {"dispather_output_dtype": "bf16"} 
-            )
+            layer.dispatcher.set_quant_config({"dispather_output_dtype": "bf16"})
 
     def _pack_to_int32(self, weight: torch.Tensor):
         # pack 8 int4 to int32, we use a int32 to represent a int4
@@ -541,9 +539,7 @@ class NPUW8A8Int8DynamicMoEMethod(_NPUFusedMoEMethodBase):
             )
 
         if hasattr(layer, "dispatcher"):
-            layer.dispatcher.set_quant_config(
-                {"dispather_output_dtype": "fp8"} 
-            )
+            layer.dispatcher.set_quant_config({"dispather_output_dtype": "fp8"})
 
     def apply(
         self,
@@ -712,9 +708,7 @@ class NPUW4A8Int8DynamicMoEMethod(_NPUFusedMoEMethodBase):
         layer.w2_weight.data = self._pack_to_int32(layer.w2_weight.data)
 
         if hasattr(layer, "dispatcher"):
-            layer.dispatcher.set_quant_config(
-                {"dispather_output_dtype": "fp8"} 
-            )
+            layer.dispatcher.set_quant_config({"dispather_output_dtype": "fp8"})
 
     def _process_weights_without_clip(
         self, layer: torch.nn.Module, is_per_channel_weight
@@ -1021,9 +1015,7 @@ class NPUW4A16Int4DynamicMoEMethod(_NPUFusedMoEMethodBase):
         layer.w2_weight = torch.nn.Parameter(w2_weight, requires_grad=False)
 
         if hasattr(layer, "dispatcher"):
-            layer.dispatcher.set_quant_config(
-                {"dispather_output_dtype": "bf16"}
-            )
+            layer.dispatcher.set_quant_config({"dispather_output_dtype": "bf16"})
 
     def apply(
         self,
