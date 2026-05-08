@@ -19,6 +19,15 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 logger = init_logger(__name__)
 
 
+def _seq_lens_from_optional_mask(
+    prompt_embeds: torch.Tensor, prompt_embeds_mask: torch.Tensor | None
+) -> list[int]:
+    """Return real text lengths, treating a missing mask as all tokens valid."""
+    if prompt_embeds_mask is None:
+        return [int(prompt_embeds.shape[1])] * int(prompt_embeds.shape[0])
+    return [int(x) for x in prompt_embeds_mask.sum(dim=1).tolist()]
+
+
 # Copied from diffusers.pipelines.qwenimage.pipeline_qwenimage_edit_plus.calculate_dimensions
 def calculate_dimensions(target_area, ratio):
     width = math.sqrt(target_area * ratio)
@@ -521,22 +530,18 @@ the image\n<|vision_start|><|image_pad|><|vision_end|><|im_end|>\n<|im_start|>as
             mu=mu,
         )
 
-        txt_seq_lens = (
-            prompt_embeds_mask.sum(dim=1).tolist()
-            if prompt_embeds_mask is not None
-            else None
-        )
-        negative_txt_seq_lens = (
-            negative_prompt_embeds_mask.sum(dim=1).tolist()
-            if negative_prompt_embeds_mask is not None
-            else None
+        txt_seq_lens = _seq_lens_from_optional_mask(prompt_embeds, prompt_embeds_mask)
+        negative_txt_seq_lens = _seq_lens_from_optional_mask(
+            negative_prompt_embeds, negative_prompt_embeds_mask
         )
         is_rgb = torch.tensor([0]).to(device=device, dtype=torch.long)
 
         batch.prompt_embeds = [prompt_embeds]
-        batch.prompt_attention_mask = [prompt_embeds_mask]
+        batch.prompt_embeds_mask = [prompt_embeds_mask]
+        batch.prompt_seq_lens = [txt_seq_lens]
         batch.negative_prompt_embeds = [negative_prompt_embeds]
-        batch.negative_attention_mask = [negative_prompt_embeds_mask]
+        batch.negative_prompt_embeds_mask = [negative_prompt_embeds_mask]
+        batch.negative_prompt_seq_lens = [negative_txt_seq_lens]
         batch.latents = latents
         batch.image_latent = image_latents
         batch.timesteps = timesteps
