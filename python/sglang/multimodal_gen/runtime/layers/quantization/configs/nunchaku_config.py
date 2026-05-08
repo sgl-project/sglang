@@ -20,15 +20,11 @@ logger = init_logger(__name__)
 @lru_cache(maxsize=1)
 def is_nunchaku_available() -> bool:
     try:
-        from nunchaku.models.attention import NunchakuFeedForward  # noqa
-        from nunchaku.ops.gemm import svdq_gemm_w4a4_cuda  # noqa
-        from nunchaku.ops.gemv import awq_gemv_w4a16_cuda  # noqa
-        from nunchaku.ops.quantize import svdq_quantize_w4a4_act_fuse_lora_cuda  # noqa
+        import nunchaku  # noqa
 
         logger.debug("Nunchaku package detected")
         return True
-    except Exception as exc:
-        logger.debug("Nunchaku package is not available: %s", exc)
+    except Exception:
         return False
 
 
@@ -73,6 +69,7 @@ class NunchakuConfig(QuantizationConfig):
 
     @classmethod
     def from_config(cls, config: dict[str, Any]) -> "NunchakuConfig":
+
         return cls(
             precision=config.get("precision", "int4"),
             rank=int(config.get("rank", 32)),

@@ -106,7 +106,7 @@ class NunchakuSVDQuantArgs:
         if not current_platform.is_cuda():
             raise ValueError(
                 "Nunchaku SVDQuant is only supported on NVIDIA CUDA GPUs "
-                "(Ampere SM8x or Blackwell SM12x)."
+                "(Ampere SM8x or SM12x)."
             )
 
         device_count = torch.cuda.device_count()
@@ -121,8 +121,7 @@ class NunchakuSVDQuantArgs:
 
         if unsupported:
             raise ValueError(
-                "Nunchaku SVDQuant is currently only supported on Ampere (SM8x) "
-                "or Blackwell SM12x GPUs; "
+                "Nunchaku SVDQuant is currently only supported on Ampere (SM8x) or SM12x GPUs; "
                 f"Unsupported devices: {', '.join(unsupported)}. "
                 "Disable it with --enable-svdquant false."
             )

@@ -1231,23 +1231,19 @@ class QwenImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
         )
 
         self.txt_norm = RMSNorm(joint_attention_dim, eps=1e-6)
-        # Qwen-Image nunchaku checkpoints keep these IO projections unquantized.
-        io_quant_config = (
-            None if isinstance(quant_config, NunchakuConfig) else quant_config
-        )
 
         self.img_in = ReplicatedLinear(
             in_channels,
             self.inner_dim,
             bias=True,
-            quant_config=io_quant_config,
+            quant_config=quant_config,
             prefix="img_in",
         )
         self.txt_in = ReplicatedLinear(
             joint_attention_dim,
             self.inner_dim,
             bias=True,
-            quant_config=io_quant_config,
+            quant_config=quant_config,
             prefix="txt_in",
         )
 
@@ -1272,7 +1268,7 @@ class QwenImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
             self.inner_dim,
             patch_size * patch_size * self.out_channels,
             bias=True,
-            quant_config=io_quant_config,
+            quant_config=quant_config,
             prefix="proj_out",
         )
 

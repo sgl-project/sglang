@@ -2,8 +2,6 @@
 This unittest is introduced in #22360, preventing duplicate transformer safetensors variants being loaded together
 """
 
-# ruff: noqa: E402
-
 import json
 import sys
 import tempfile
@@ -45,11 +43,6 @@ sys.modules.setdefault(
 )
 sys.modules.setdefault("partial_json_parser.core.options", partial_json_parser_options)
 
-from sglang.multimodal_gen.configs.models.dits.qwenimage import (
-    QwenImageArchConfig,
-    QwenImageDitConfig,
-)
-from sglang.multimodal_gen.configs.quantization.nunchaku import NunchakuSVDQuantArgs
 from sglang.multimodal_gen.runtime.layers.linear import UnquantizedLinearMethod
 from sglang.multimodal_gen.runtime.layers.quantization.configs.nunchaku_config import (
     NunchakuConfig,
@@ -65,9 +58,6 @@ from sglang.multimodal_gen.runtime.loader.transformer_load_utils import (
     resolve_transformer_safetensors_to_load,
 )
 from sglang.multimodal_gen.runtime.models.dits.flux import FluxSingleTransformerBlock
-from sglang.multimodal_gen.runtime.models.dits.qwen_image import (
-    QwenImageTransformer2DModel,
-)
 from sglang.multimodal_gen.tools.build_modelopt_nvfp4_transformer import (
     _updated_quant_config,
 )
@@ -111,81 +101,6 @@ class TestTransformerQuantHelpers(unittest.TestCase):
         self.assertEqual(resolved, [f.name])
 
     @patch(
-        "sglang.multimodal_gen.configs.quantization.nunchaku.is_nunchaku_available",
-        return_value=True,
-    )
-    @patch(
-        "sglang.multimodal_gen.configs.quantization.nunchaku.torch.cuda.get_device_capability",
-        return_value=(10, 0),
-    )
-    @patch(
-        "sglang.multimodal_gen.configs.quantization.nunchaku.torch.cuda.device_count",
-        return_value=1,
-    )
-    @patch("sglang.multimodal_gen.configs.quantization.nunchaku.current_platform")
-    def test_nunchaku_validation_rejects_b200_sm100(
-        self, mock_platform, _mock_device_count, _mock_capability, _mock_available
-    ):
-        mock_platform.is_cuda.return_value = True
-
-        with self.assertRaisesRegex(ValueError, "SM100"):
-            NunchakuSVDQuantArgs(
-                enable_svdquant=True,
-                transformer_weights_path="/tmp/svdq-fp4_r32.safetensors",
-            ).resolve_runtime_config()
-
-    @patch(
-        "sglang.multimodal_gen.configs.quantization.nunchaku.is_nunchaku_available",
-        return_value=True,
-    )
-    @patch(
-        "sglang.multimodal_gen.configs.quantization.nunchaku.torch.cuda.get_device_capability",
-        return_value=(12, 0),
-    )
-    @patch(
-        "sglang.multimodal_gen.configs.quantization.nunchaku.torch.cuda.device_count",
-        return_value=1,
-    )
-    @patch("sglang.multimodal_gen.configs.quantization.nunchaku.current_platform")
-    def test_nunchaku_validation_allows_sm120(
-        self, mock_platform, _mock_device_count, _mock_capability, _mock_available
-    ):
-        mock_platform.is_cuda.return_value = True
-
-        resolution = NunchakuSVDQuantArgs(
-            enable_svdquant=True,
-            transformer_weights_path="/tmp/svdq-fp4_r32.safetensors",
-        ).resolve_runtime_config()
-
-        self.assertIsNotNone(resolution.nunchaku_config)
-        self.assertEqual(resolution.nunchaku_config.precision, "nvfp4")
-        self.assertEqual(resolution.nunchaku_config.rank, 32)
-
-    @patch(
-        "sglang.multimodal_gen.configs.quantization.nunchaku.is_nunchaku_available",
-        return_value=True,
-    )
-    @patch(
-        "sglang.multimodal_gen.configs.quantization.nunchaku.torch.cuda.get_device_capability",
-        return_value=(9, 0),
-    )
-    @patch(
-        "sglang.multimodal_gen.configs.quantization.nunchaku.torch.cuda.device_count",
-        return_value=1,
-    )
-    @patch("sglang.multimodal_gen.configs.quantization.nunchaku.current_platform")
-    def test_nunchaku_validation_rejects_hopper_sm90(
-        self, mock_platform, _mock_device_count, _mock_capability, _mock_available
-    ):
-        mock_platform.is_cuda.return_value = True
-
-        with self.assertRaisesRegex(ValueError, "SM90"):
-            NunchakuSVDQuantArgs(
-                enable_svdquant=True,
-                transformer_weights_path="/tmp/svdq-fp4_r32.safetensors",
-            ).resolve_runtime_config()
-
-    @patch(
         "sglang.multimodal_gen.runtime.loader.transformer_load_utils.maybe_download_model",
         side_effect=lambda path, **kw: path,
     )
@@ -204,59 +119,6 @@ class TestTransformerQuantHelpers(unittest.TestCase):
             )
 
         self.assertEqual(resolved, [mixed])
-
-    @patch(
-        "sglang.multimodal_gen.runtime.loader.transformer_load_utils.hf_hub_download"
-    )
-    def test_resolve_transformer_safetensors_to_load_downloads_hf_repo_file(
-        self, mock_hf_hub_download
-    ):
-        remote_path = (
-            "nunchaku-ai/nunchaku-qwen-image/"
-            "svdq-fp4_r32-qwen-image-lightningv1.0-4steps.safetensors"
-        )
-        with tempfile.NamedTemporaryFile(suffix=".safetensors") as f:
-            mock_hf_hub_download.return_value = f.name
-            nunchaku_config = NunchakuConfig(transformer_weights_path=remote_path)
-            server_args = self._make_server_args(
-                transformer_weights_path=remote_path,
-                nunchaku_config=nunchaku_config,
-            )
-
-            resolved = resolve_transformer_safetensors_to_load(
-                server_args, "/unused/component/path"
-            )
-
-        self.assertEqual(resolved, [f.name])
-        self.assertEqual(nunchaku_config.transformer_weights_path, f.name)
-        mock_hf_hub_download.assert_called_once_with(
-            repo_id="nunchaku-ai/nunchaku-qwen-image",
-            filename="svdq-fp4_r32-qwen-image-lightningv1.0-4steps.safetensors",
-        )
-
-    def test_qwen_image_nunchaku_keeps_io_projections_unquantized(self):
-        config = QwenImageDitConfig(
-            arch_config=QwenImageArchConfig(
-                in_channels=4,
-                out_channels=4,
-                num_layers=0,
-                attention_head_dim=4,
-                num_attention_heads=1,
-                joint_attention_dim=8,
-                axes_dims_rope=(2, 2, 4),
-            )
-        )
-
-        with torch.device("meta"):
-            model = QwenImageTransformer2DModel(
-                config=config,
-                hf_config={},
-                quant_config=NunchakuConfig(precision="nvfp4"),
-            )
-
-        self.assertIsInstance(model.img_in.quant_method, UnquantizedLinearMethod)
-        self.assertIsInstance(model.txt_in.quant_method, UnquantizedLinearMethod)
-        self.assertIsInstance(model.proj_out.quant_method, UnquantizedLinearMethod)
 
     def test_filter_transformer_precision_variants_prefers_canonical_file(self):
         files = [

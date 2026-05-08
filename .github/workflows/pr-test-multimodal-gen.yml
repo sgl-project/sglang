@@ -46,7 +46,6 @@ on:
 env:
   SGLANG_IS_IN_CI: true
   SGLANG_CUDA_COREDUMP: "1"
-  NUNCHAKU_CI_WHEEL_URL: "https://github.com/nunchaku-ai/nunchaku/releases/download/v1.2.1/nunchaku-1.2.1%2Bcu13.0torch2.11-cp310-cp310-linux_x86_64.whl"
   PR_TEST_BYPASS_MAINTENANCE_ON_MAIN: ${{ github.ref == 'refs/heads/main' && 'true' || 'false' }}
   SKIP_STAGE_HEALTH_CHECK: ${{ inputs.skip_stage_health_check == 'true' }}
 
@@ -327,7 +326,6 @@ jobs:
         timeout-minutes: 20
         run: |
           CUSTOM_BUILD_SGL_KERNEL=${{inputs.sgl_kernel}} bash scripts/ci/cuda/ci_install_dependency.sh diffusion
-          python3 -m pip install --no-deps "$NUNCHAKU_CI_WHEEL_URL"
 
       - name: Run diffusion server tests
         timeout-minutes: 240

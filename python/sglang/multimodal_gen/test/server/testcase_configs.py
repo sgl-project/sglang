@@ -455,10 +455,6 @@ MODELOPT_WAN22_NVFP4_TRANSFORMER = (
     "lmsys/wan22-t2v-a14b-modelopt-nvfp4-sglang-transformer"
 )
 MODELOPT_NVFP4_B200_ENV_VARS = {"SGLANG_DIFFUSION_FLASHINFER_FP4_GEMM_BACKEND": "cudnn"}
-NUNCHAKU_QWEN_IMAGE_LIGHTNING_FP4_WEIGHTS = (
-    "nunchaku-ai/nunchaku-qwen-image/"
-    "svdq-fp4_r32-qwen-image-lightningv1.0-4steps.safetensors"
-)
 
 
 def _make_modelopt_ci_case(

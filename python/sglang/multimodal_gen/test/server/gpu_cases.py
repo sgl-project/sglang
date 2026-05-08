@@ -384,7 +384,6 @@ if not current_platform.is_hip():
 if current_platform.is_hip():
     ONE_GPU_MODELOPT_FP8_CASES = []
     ONE_GPU_MODELOPT_NVFP4_CASES = []
-    ONE_GPU_NUNCHAKU_B200_CASES = []
 else:
     ONE_GPU_MODELOPT_FP8_CASES = [
         _make_modelopt_ci_case(
@@ -461,11 +460,8 @@ else:
             env_vars=MODELOPT_NVFP4_B200_ENV_VARS,
         ),
     ]
-    # Nunchaku v1.2.1 wheels do not ship SM100 kernels, so B200 cannot run these
-    # cases until upstream adds SM100 support.
-    ONE_GPU_NUNCHAKU_B200_CASES = []
 
-ONE_GPU_B200_CASES = ONE_GPU_MODELOPT_NVFP4_CASES + ONE_GPU_NUNCHAKU_B200_CASES
+ONE_GPU_B200_CASES = ONE_GPU_MODELOPT_NVFP4_CASES
 
 TWO_GPU_CASES = [
     DiffusionTestCase(

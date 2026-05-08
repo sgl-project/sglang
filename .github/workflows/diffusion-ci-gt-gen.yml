@@ -60,7 +60,6 @@ permissions:
 env:
   SGLANG_IS_IN_CI: true
   SGLANG_CUDA_COREDUMP: "1"
-  NUNCHAKU_CI_WHEEL_URL: "https://github.com/nunchaku-ai/nunchaku/releases/download/v1.2.1/nunchaku-1.2.1%2Bcu13.0torch2.11-cp310-cp310-linux_x86_64.whl"
   OUTPUT_NAME: ${{ inputs.output_name || 'diffusion-ci-outputs' }}
   PUBLISH_TARGET_DIR: ${{ inputs.publish_target_dir || (inputs.run_official_cases && 'diffusion-ci/consistency_gt/official_generated' || 'diffusion-ci/consistency_gt/sglang_generated') }}
 
@@ -503,7 +502,6 @@ jobs:
         run: |
           CUSTOM_BUILD_SGL_KERNEL="${{ inputs.kernel_artifact_run_id != '' && 'true' || 'false' }}" \
             bash scripts/ci/cuda/ci_install_dependency.sh diffusion
-          python3 -m pip install --no-deps "$NUNCHAKU_CI_WHEEL_URL"
 
       - name: Generate outputs
         env:
