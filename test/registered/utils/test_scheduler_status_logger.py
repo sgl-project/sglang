@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import shutil
 import tempfile
 import time
@@ -19,6 +20,9 @@ from sglang.test.test_utils import (
 
 register_cuda_ci(est_time=120, suite="nightly-1-gpu", nightly=True)
 register_amd_ci(est_time=120, suite="nightly-amd-1-gpu", nightly=True)
+
+# Strip the "[YYYY-MM-DD HH:MM:SS] " prefix added by _create_logger_with_handler.
+_LOG_PREFIX_RE = re.compile(r"^\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\] ")
 
 
 class TestSchedulerStatusLogger(CustomTestCase):
@@ -64,6 +68,7 @@ class TestSchedulerStatusLogger(CustomTestCase):
 def _find_log_events(log_dir: str, event_name: str):
     for f in Path(log_dir).glob("*.log"):
         for line in f.read_text().splitlines():
+            line = _LOG_PREFIX_RE.sub("", line)
             if line.startswith("{"):
                 data = json.loads(line)
                 if data.get("event") == event_name:
