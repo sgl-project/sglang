@@ -668,7 +668,7 @@ def load_model_from_full_model_state_dict(
             )
             if cpu_offload:
                 sharded_tensor = sharded_tensor.cpu()
-        sharded_sd[new_param_name] = nn.Parameter(sharded_tensor, requires_grad=False)
+        sharded_sd[new_param_name] = nn.Parameter(sharded_tensor)
 
     # choose `assign=True` since we cannot call `copy_` on meta tensor
     return model.load_state_dict(sharded_sd, strict=strict, assign=True)
