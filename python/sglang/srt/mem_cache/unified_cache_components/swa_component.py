@@ -10,10 +10,15 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     IncLockRefResult,
     InsertParams,
     InsertResult,
+    MatchPrefixParams,
+    MatchResult,
 )
+from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
 from sglang.srt.mem_cache.unified_cache_components.tree_component import (
     BASE_COMPONENT_TYPE,
+    CacheTransferPhase,
     ComponentType,
+    EvictLayer,
     TreeComponent,
     next_component_uuid,
 )
@@ -45,6 +50,8 @@ class SWAComponent(TreeComponent):
         ), f"SWAComponent requires SWATokenToKVPoolAllocator, got {type(cache.token_to_kv_pool_allocator)}"
         super().__init__(cache, params)
         self.sliding_window_size = params.sliding_window_size
+        # HiCache state: set to host SWA pool when HiCache enabled
+        self._swa_kv_pool_host = None
 
     component_type = ComponentType.SWA
 
@@ -53,19 +60,55 @@ class SWAComponent(TreeComponent):
             full_indices
         )
 
+    def _restore_device_value(self, node: UnifiedTreeNode, value: torch.Tensor) -> None:
+        ct = self.component_type
+        node.component_data[ct].value = value
+        host_lru = self.cache.host_lru_lists[ct]
+        if host_lru.in_list(node):
+            host_lru.remove_node(node)
+        self.cache.lru_lists[ct].insert_mru(node)
+        self.cache.component_evictable_size_[ct] += len(value)
+
     def create_match_validator(self) -> Callable[[UnifiedTreeNode], bool]:
         sliding_window_size = self.sliding_window_size
         ct = self.component_type
         state = {"len": float("inf")}
 
         def validator(node: UnifiedTreeNode) -> bool:
-            if node.component_data[ct].value is None:
+            cd = node.component_data[ct]
+            # HiCache: a host-only tombstone is a valid match boundary too
+            # — load_back will restore SWA from host before use.
+            if cd.value is None and cd.host_value is None:
                 state["len"] = 0
                 return False
             state["len"] += len(node.key)
             return state["len"] >= sliding_window_size
 
         return validator
+
+    def finalize_match_result(
+        self,
+        result: MatchResult,
+        params: MatchPrefixParams,
+        value_chunks: list[torch.Tensor],
+        best_value_len: int,
+    ) -> MatchResult:
+        ct = self.component_type
+        n_swa = 0
+        node = result.last_device_node
+        root = self.cache.root_node
+        while node is not root and n_swa < self.sliding_window_size:
+            cd = node.component_data[ct]
+            if cd.value is None and cd.host_value is not None:
+                return result._replace(host_hit_length=max(result.host_hit_length, 1))
+            if cd.value is not None:
+                n_swa += len(cd.value)
+            elif cd.host_value is not None:
+                n_swa += len(cd.host_value)
+            else:
+                break
+            node = node.parent
+        return result
 
     def update_component_on_insert_overlap(
         self,
@@ -99,9 +142,7 @@ class SWAComponent(TreeComponent):
             swa_value = self._translate_full_to_swa(
                 node.component_data[BASE_COMPONENT_TYPE].value
             )
-            node.component_data[self.component_type].value = swa_value
-            self.cache.lru_lists[self.component_type].insert_mru(node)
-            self.cache.component_evictable_size_[self.component_type] += len(swa_value)
+            self._restore_device_value(node, swa_value)
             return 0
         elif swa_evicted_seqlen < total_prefix_len + prefix_len:
             # Branch 2: value_slice[start_idx:] is within SWA window — partial recover
@@ -116,9 +157,7 @@ class SWAComponent(TreeComponent):
             swa_value = self._translate_full_to_swa(
                 node.component_data[BASE_COMPONENT_TYPE].value
             )
-            node.component_data[self.component_type].value = swa_value
-            self.cache.lru_lists[self.component_type].insert_mru(node)
-            self.cache.component_evictable_size_[self.component_type] += len(swa_value)
+            self._restore_device_value(node, swa_value)
             return start_idx
         else:
             # Branch 3: entire value_slice is outside SWA window — not consumed
@@ -128,6 +167,39 @@ class SWAComponent(TreeComponent):
         self, total_prefix_len: int, key_len: int, params: InsertParams
     ) -> bool:
         return params.swa_evicted_seqlen >= total_prefix_len + key_len
+
+    def recover_after_unevict(
+        self,
+        node: UnifiedTreeNode,
+        prefix_len: int,
+        total_prefix_len: int,
+        params: InsertParams,
+    ) -> None:
+        # _unevict_node_on_insert already wrote the request's fresh KV slice
+        # into the base value. We just need to rebuild SWA from that slice for
+        # the in-window portion. There is no old SWA slot to free here.
+        ct = self.component_type
+        if node.component_data[ct].value is not None:
+            return
+        assert (
+            node.component_data[ct].lock_ref == 0
+        ), f"tombstone {ct} lock_ref should be 0 on unevict, node {node.id}"
+        swa_evicted_seqlen = params.swa_evicted_seqlen
+        assert (
+            swa_evicted_seqlen % self.cache.page_size == 0
+        ), f"{ct}: swa_evicted_seqlen must be page-aligned, {swa_evicted_seqlen=}"
+
+        full_value = node.component_data[BASE_COMPONENT_TYPE].value
+        if swa_evicted_seqlen <= total_prefix_len:
+            swa_value = self._translate_full_to_swa(full_value)
+        elif swa_evicted_seqlen < total_prefix_len + prefix_len:
+            start_idx = swa_evicted_seqlen - total_prefix_len
+            self.cache._split_node(node.key, node, start_idx)
+            full_value = node.component_data[BASE_COMPONENT_TYPE].value
+            swa_value = self._translate_full_to_swa(full_value)
+        else:
+            return
+        self._restore_device_value(node, swa_value)
 
     def commit_insert_component_data(
         self,
@@ -180,27 +252,71 @@ class SWAComponent(TreeComponent):
         else:
             new_parent.component_data[self.component_type].value = None
 
+        child_swa_host_value = child.component_data[self.component_type].host_value
+        if child_swa_host_value is not None:
+            split_len = len(new_parent.key)
+            new_parent.component_data[self.component_type].host_value = (
+                child_swa_host_value[:split_len].clone()
+            )
+            child.component_data[self.component_type].host_value = child_swa_host_value[
+                split_len:
+            ].clone()
+            host_lru = self.cache.host_lru_lists[self.component_type]
+            if new_parent.component_data[self.component_type].value is None:
+                host_lru.insert_mru(new_parent)
+            if child.component_data[
+                self.component_type
+            ].value is None and not host_lru.in_list(child):
+                host_lru.insert_mru(child)
+
         # parent inherits the swa_uuid from child for swa lock ref
         new_parent.component_data[self.component_type].metadata["uuid"] = (
             child.component_data[self.component_type].metadata.get("uuid")
         )
         child.component_data[self.component_type].metadata.pop("uuid", None)
 
-    def evict_component(self, node: UnifiedTreeNode, is_leaf: bool) -> int:
-        swa_value = node.component_data[self.component_type].value
-        if swa_value is None:
-            return 0
-        # Direct swa_attn_allocator.free(swa_value) would double-free
-        # free_swa(full_value) has the mapping guard to avoid double-free
-        # TODO: decoupling full and swa free, need further discussion on mapping necessity
-        self.cache.token_to_kv_pool_allocator.free_swa(
-            node.component_data[BASE_COMPONENT_TYPE].value
-        )
-        freed = len(swa_value)
-        self.cache.component_evictable_size_[self.component_type] -= freed
-        if not is_leaf:
-            node.component_data[self.component_type].value = None
-        return freed
+    def evict_component(
+        self,
+        node: UnifiedTreeNode,
+        target: EvictLayer = EvictLayer.DEVICE,
+    ) -> tuple[int, int]:
+        ct = self.component_type
+        cd = node.component_data[ct]
+        freed = 0
+        host_freed = 0
+
+        # Device layer
+        if EvictLayer.DEVICE in target and cd.value is not None:
+            # Pass full indices to free_swa so slots with no SWA pair are
+            # skipped. Freeing swa_value directly would double free those
+            # entries since they all map to the same sentinel slot.
+            self.cache.token_to_kv_pool_allocator.free_swa(
+                node.component_data[BASE_COMPONENT_TYPE].value
+            )
+            freed = len(cd.value)
+            self.cache.component_evictable_size_[ct] -= freed
+            cd.value = None
+
+        # Host layer
+        host_lru = self.cache.host_lru_lists[ct]
+        if EvictLayer.HOST in target and cd.host_value is not None:
+            host_freed = len(cd.host_value)
+            if self._swa_kv_pool_host is not None:
+                self._swa_kv_pool_host.free(cd.host_value)
+            cd.host_value = None
+            if host_lru.in_list(node):
+                host_lru.remove_node(node)
+
+        # After device tombstone: if host_value remains, move into host LRU
+        if (
+            target is EvictLayer.DEVICE
+            and cd.value is None
+            and cd.host_value is not None
+        ):
+            if not host_lru.in_list(node):
+                host_lru.insert_mru(node)
+
+        return freed, host_freed
 
     def eviction_priority(self, is_leaf: bool) -> int:
         return 0 if is_leaf else 1
@@ -209,25 +325,26 @@ class SWAComponent(TreeComponent):
         self, params: EvictParams, tracker: dict[ComponentType, int]
     ) -> None:
         request = params.swa_num_tokens
-        lru = self.cache.lru_lists[self.component_type]
+        ct = self.component_type
+        lru = self.cache.lru_lists[ct]
         x = lru.get_lru_no_lock()
-        while (
-            tracker[self.component_type] < request and x is not None and lru.in_list(x)
-        ):
-            assert x.component_data[self.component_type].value is not None
-            if len(x.children) > 0:
+        while tracker[ct] < request and x is not None and lru.in_list(x):
+            assert x.component_data[ct].value is not None
+            if x in self.cache.evictable_device_leaves:
+                # D-leaf: atomic eviction of all components
+                x_next = lru.get_prev_no_lock(x)
+                self.cache._evict_device_leaf(x, tracker)
+                if not lru.in_list(x_next):
+                    x_next = lru.get_lru_no_lock()
+                x = x_next
+            else:
+                # Internal: tombstone SWA + cascade
                 x_next = lru.get_prev_no_lock(x)
                 self.cache._evict_component_and_detach_lru(
-                    x, self, is_leaf=False, tracker=tracker
+                    x, self, target=EvictLayer.DEVICE, tracker=tracker
                 )
                 self.cache._cascade_evict(x, self, tracker)
                 x = x_next
-            else:
-                self.cache._evict_component_and_detach_lru(
-                    x, self, is_leaf=True, tracker=tracker
-                )
-                self.cache._cascade_evict(x, self, tracker)
-                x = lru.get_lru_no_lock()
 
     def acquire_component_lock(
         self, node: UnifiedTreeNode, result: IncLockRefResult
@@ -238,12 +355,15 @@ class SWAComponent(TreeComponent):
         swa_lock_size = 0
         swa_uuid_for_lock = None
 
+        # Tombstoned nodes (cd.value is None) have no SWA chunk to protect
+        # skip them and keep walking up. This path is hit when HiCache
+        # backs up a FULL present internal node whose SWA was already evicted.
         cur = node
         while cur != root and swa_lock_size < sliding_window_size:
-            assert (
-                cur.component_data[ct].value is not None
-            ), f"acquire_component_lock({ct}) on tombstoned node {cur.id}"
             comp = cur.component_data[ct]
+            if comp.value is None:
+                cur = cur.parent
+                continue
             if comp.lock_ref == 0:
                 key_len = len(cur.key)
                 self.cache.component_evictable_size_[ct] -= key_len
@@ -267,15 +387,15 @@ class SWAComponent(TreeComponent):
         swa_uuid_for_lock = params.swa_uuid_for_lock if params else None
         dec_swa = True
 
+        # lock_ref == 0 means acquire_component_lock skipped this node
+        # (tombstone at acquire time) or load_back revived a tombstone between
+        # acquire and release. Either way, there is nothing for us to undo here.
         cur = node
         while cur != root and dec_swa:
-            assert (
-                cur.component_data[ct].value is not None
-            ), f"release_component_lock({ct}) on tombstoned node {cur.id}"
             comp = cur.component_data[ct]
-            assert (
-                comp.lock_ref > 0
-            ), f"release_component_lock({ct}) on node with lock_ref=0, node {cur.id}"
+            if comp.lock_ref == 0:
+                cur = cur.parent
+                continue
             if comp.lock_ref == 1:
                 key_len = len(cur.key)
                 self.cache.component_evictable_size_[ct] += key_len
@@ -295,3 +415,114 @@ class SWAComponent(TreeComponent):
         if is_finished:
             insert_params.swa_evicted_seqlen = req.swa_evicted_seqlen
         return None
+
+    # ---- HiCache Hooks ----
+
+    def build_hicache_transfers(
+        self, node: UnifiedTreeNode, phase: CacheTransferPhase, **kw
+    ) -> Optional[list[PoolTransfer]]:
+        ct = self.component_type
+
+        if phase == CacheTransferPhase.BACKUP_HOST:
+            cd = node.component_data[ct]
+            if cd.value is None:
+                return None
+            # cd.value already holds SWA-pool indices (translated at insert time).
+            # Host pool indexing wants int64.
+            return [
+                PoolTransfer(
+                    name=PoolName.SWA,
+                    device_indices=cd.value.to(torch.int64),
+                )
+            ]
+
+        if phase == CacheTransferPhase.LOAD_BACK:
+            n_swa = 0
+            backed_up: list[torch.Tensor] = []
+            nodes: list = []
+            while node is not self.cache.root_node and n_swa < self.sliding_window_size:
+                cd = node.component_data[ct]
+                assert cd.host_value is not None or cd.value is not None
+                if cd.value is not None:
+                    # device exists, skip it
+                    n_swa += len(cd.value)
+                else:
+                    # host only, collect it
+                    backed_up.append(cd.host_value)
+                    nodes.append(node)
+                    n_swa += len(cd.host_value)
+                node = node.parent
+
+            if not backed_up:
+                return None
+
+            backed_up.reverse()
+            nodes.reverse()
+
+            return [
+                PoolTransfer(
+                    name=PoolName.SWA,
+                    host_indices=torch.cat(backed_up),
+                    device_indices=None,
+                    nodes_to_load=nodes,
+                )
+            ]
+
+        return None
+
+    def commit_hicache_transfer(
+        self,
+        node: UnifiedTreeNode,
+        phase: CacheTransferPhase,
+        transfers: list[PoolTransfer] = (),
+    ) -> None:
+        ct = self.component_type
+
+        if phase == CacheTransferPhase.BACKUP_HOST:
+            if transfers and transfers[0].host_indices is not None:
+                cd = node.component_data[ct]
+                if cd.host_value is None:
+                    cd.host_value = transfers[0].host_indices.clone()
+            return
+
+        if phase == CacheTransferPhase.LOAD_BACK:
+            assert transfers and transfers[0].device_indices is not None
+            xfer = transfers[0]
+            device_indices = xfer.device_indices
+            allocator = self.cache.token_to_kv_pool_allocator
+
+            offset = 0
+            for n in xfer.nodes_to_load or []:
+                cd_n = n.component_data[ct]
+                cd_full_n = n.component_data[BASE_COMPONENT_TYPE]
+                n_tokens = len(cd_n.host_value)
+                swa_chunk = device_indices[offset : offset + n_tokens].clone()
+                self._restore_device_value(n, swa_chunk)
+                assert cd_full_n.value is not None and len(cd_full_n.value) == n_tokens
+                # rebuild the mapping for the loaded SWA chunk
+                allocator.set_full_to_swa_mapping(cd_full_n.value, swa_chunk)
+                offset += n_tokens
+            assert offset == len(xfer.host_indices)
+            return
+
+    def drive_host_eviction(
+        self, num_tokens: int, tracker: dict[ComponentType, int]
+    ) -> None:
+        """Evict SWA host resources.
+        Internal nodes: private tombstone (free SWA host only).
+        Host leaves: atomic eviction via _evict_host_leaf."""
+        ct = self.component_type
+        host_lru = self.cache.host_lru_lists[ct]
+        x = host_lru.get_lru_no_lock()
+        while tracker[ct] < num_tokens and x is not None and host_lru.in_list(x):
+            x_next = host_lru.get_prev_no_lock(x)
+            cd = x.component_data[ct]
+            if x in self.cache.evictable_host_leaves:
+                self.cache._evict_host_leaf(x, tracker)
+            else:
+                assert cd.host_value is not None
+                self.cache._evict_component_and_detach_lru(
+                    x, self, target=EvictLayer.HOST, tracker=tracker
+                )
+                self.cache._cascade_evict(x, self, tracker, target=EvictLayer.HOST)
+            x = x_next

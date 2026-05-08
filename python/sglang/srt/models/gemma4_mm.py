@@ -224,6 +224,26 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
 
         self.post_init()
 
+    @property
+    def model(self):
+        # Alias .model to .language_model so this class satisfies the piecewise
+        # CUDA graph gate (which checks `hasattr(model, "model")`). Implemented
+        # as a property to avoid registering a duplicate submodule in
+        # `_modules`, which would double state_dict keys and disturb
+        # ShardedStateLoader / CPU-offload / dummy-init paths.
+        return self.language_model
+
+    def __setattr__(self, name, value):
+        # Block writes to "model" so the runner's
+        # `self.model.model = resolve_language_model(self.model)` (which for
+        # this class returns language_model itself) is a no-op rather than a
+        # nn.Module submodule registration. Without this, nn.Module.__setattr__
+        # would bypass the @property's setter for Module values and pollute
+        # `_modules` with a duplicate alias, doubling state_dict keys.
+        if name == "model":
+            return
+        super().__setattr__(name, value)
+
     def pad_input_ids(
         self,
         input_ids: List[int],
@@ -235,6 +255,11 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
 
     def get_input_embeddings(self) -> nn.Embedding:
         return self.language_model.get_input_embeddings()
+
+    def get_embed_and_head(self) -> Tuple[torch.Tensor, torch.Tensor]:
+        # Gemma 4 multimodal ties its LM head to the text embed_tokens
+        embed = self.language_model.embed_tokens.weight
+        return embed, embed
 
     def get_attention_sliding_window_size(self):
         return getattr(self.config.text_config, "sliding_window", -1) - 1
