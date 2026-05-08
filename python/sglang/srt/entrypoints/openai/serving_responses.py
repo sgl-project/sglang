@@ -46,6 +46,7 @@ from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionMessageParam,
     ChatCompletionRequest,
     Function,
+    LogProbs,
     OutputTokenUsageInfo,
     PromptTokenUsageInfo,
     RequestResponseMetadata,
@@ -57,7 +58,10 @@ from sglang.srt.entrypoints.openai.protocol import (
 )
 from sglang.srt.entrypoints.openai.serving_chat import OpenAIServingChat
 from sglang.srt.entrypoints.openai.tool_server import MCPToolServer, ToolServer
-from sglang.srt.entrypoints.openai.utils import parse_tool_calls_from_content
+from sglang.srt.entrypoints.openai.utils import (
+    parse_tool_calls_from_content,
+    to_openai_style_logprobs,
+)
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.function_call.json_array_parser import JsonArrayParser
 from sglang.srt.function_call.utils import _is_complete_json
@@ -489,6 +493,12 @@ class OpenAIServingResponses(OpenAIServingChat):
                     else:
                         context = SimpleContext()
 
+                    should_return_logprobs = self._should_return_logprobs(request)
+                    # Extract routed_dp_rank from header (has higher priority than body)
+                    effective_routed_dp_rank = self.extract_routed_dp_rank_from_header(
+                        raw_request, request.routed_dp_rank
+                    )
+
                     # Create GenerateReqInput for SGLang
                     adapted_request = GenerateReqInput(
                         input_ids=engine_prompt,
@@ -501,7 +511,8 @@ class OpenAIServingResponses(OpenAIServingChat):
                         bootstrap_host=request.bootstrap_host,
                         bootstrap_port=request.bootstrap_port,
                         bootstrap_room=request.bootstrap_room,
-                        data_parallel_rank=request.data_parallel_rank,
+                        routed_dp_rank=effective_routed_dp_rank,
+                        disagg_prefill_dp_rank=request.disagg_prefill_dp_rank,
                         image_data=processed_messages.image_data,
                         video_data=processed_messages.video_data,
                         audio_data=processed_messages.audio_data,
@@ -509,6 +520,12 @@ class OpenAIServingResponses(OpenAIServingChat):
                         priority=request.priority,
                         routing_key=self.extract_routing_key(raw_request),
                         custom_labels=self.extract_custom_labels(raw_request),
+                        return_logprob=should_return_logprobs,
+                        logprob_start_len=-1,
+                        top_logprobs_num=(
+                            request.top_logprobs if should_return_logprobs else 0
+                        ),
+                        return_text_in_logprobs=True,
                     )
 
                     generator = self._generate_with_builtin_tools(
@@ -613,6 +630,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                 stream=request.stream,
                 tools=function_tools,
                 tool_choice=request.tool_choice,
+                parallel_tool_calls=request.parallel_tool_calls,
                 chat_template_kwargs=request.chat_template_kwargs,
                 reasoning_effort=(
                     request.reasoning.effort if request.reasoning else None
@@ -699,8 +717,12 @@ class OpenAIServingResponses(OpenAIServingChat):
             final_res = context.last_output
             assert final_res is not None
 
+            logprobs = None
+            if self._should_return_logprobs(request):
+                logprobs = self._build_response_logprobs(final_res)
+
             output = self._make_response_output_items(
-                request, final_res["text"], tokenizer
+                request, final_res["text"], logprobs, tokenizer
             )
 
             num_reasoning_tokens = 0
@@ -770,6 +792,7 @@ class OpenAIServingResponses(OpenAIServingChat):
         self,
         request: ResponsesRequest,
         final_output: Any,
+        logprobs: Optional[list[dict]],
         tokenizer: Any,
     ):
         # Handle reasoning parsing if enabled
@@ -828,7 +851,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                 text=content,
                 annotations=[],  # TODO
                 type="output_text",
-                logprobs=None,  # TODO
+                logprobs=logprobs,
             )
             message = ResponseOutputMessage(
                 id=f"msg_{random_uuid()}",
@@ -1178,6 +1201,8 @@ class OpenAIServingResponses(OpenAIServingChat):
         simple_ctx_sent_reasoning_added = False
         simple_ctx_sent_reasoning_done = False
         simple_ctx_reasoning_text = ""
+        n_prev_token = 0
+        return_logprobs = self._should_return_logprobs(request)
 
         # store function call state
         tool_call_states = {}  # tool_index -> state dict
@@ -1195,6 +1220,18 @@ class OpenAIServingResponses(OpenAIServingChat):
                         current_text = ctx.last_output.get("text", "")
                     elif hasattr(ctx.last_output, "text"):
                         current_text = ctx.last_output.text
+
+                    streaming_logprobs = None
+                    if return_logprobs:
+                        streaming_logprobs = (
+                            self._process_streaming_logprobs_for_responses(
+                                ctx.last_output,
+                                n_prev_token,
+                            )
+                        )
+                        meta_info = ctx.last_output.get("meta_info", {})
+                        if meta_info.get("output_token_logprobs_length"):
+                            n_prev_token = meta_info["output_token_logprobs_length"]
 
                     # Get new text since last iteration
                     if current_text and len(current_text) > len(simple_ctx_prev_text):
@@ -1359,9 +1396,47 @@ class OpenAIServingResponses(OpenAIServingChat):
                                             output_index=current_output_index,
                                             item_id=current_item_id,
                                             delta=normal_text,
-                                            logprobs=[],
+                                            logprobs=(
+                                                streaming_logprobs
+                                                if streaming_logprobs is not None
+                                                else []
+                                            ),
                                         )
                                     )
+                                else:
+                                    if simple_ctx_sent_message_added:
+                                        simple_ctx_sent_message_added = False
+                                        content = (
+                                            openai_responses_types.ResponseOutputText(
+                                                type="output_text",
+                                                text=simple_ctx_accumulated_text,
+                                                annotations=[],
+                                            )
+                                        )
+                                        yield _send_event(
+                                            openai_responses_types.ResponseContentPartDoneEvent(
+                                                type="response.content_part.done",
+                                                sequence_number=-1,
+                                                item_id=current_item_id,
+                                                output_index=current_output_index,
+                                                content_index=current_content_index,
+                                                part=content,
+                                            )
+                                        )
+                                        yield _send_event(
+                                            openai_responses_types.ResponseOutputItemDoneEvent(
+                                                type="response.output_item.done",
+                                                sequence_number=-1,
+                                                output_index=current_output_index,
+                                                item=openai_responses_types.ResponseOutputMessage(
+                                                    id=current_item_id,
+                                                    type="message",
+                                                    role="assistant",
+                                                    content=[content],
+                                                    status="completed",
+                                                ),
+                                            )
+                                        )
 
                                 # Emit function call events for detected tool calls
                                 for call_info in tool_calls:
@@ -1499,7 +1574,11 @@ class OpenAIServingResponses(OpenAIServingChat):
                                         output_index=current_output_index,
                                         item_id=current_item_id,
                                         delta=new_chunk,
-                                        logprobs=[],
+                                        logprobs=(
+                                            streaming_logprobs
+                                            if streaming_logprobs is not None
+                                            else []
+                                        ),
                                     )
                                 )
 
@@ -1976,7 +2055,8 @@ class OpenAIServingResponses(OpenAIServingChat):
                 bootstrap_host=adapted_request.bootstrap_host,
                 bootstrap_port=adapted_request.bootstrap_port,
                 bootstrap_room=adapted_request.bootstrap_room,
-                data_parallel_rank=adapted_request.data_parallel_rank,
+                routed_dp_rank=adapted_request.routed_dp_rank,
+                disagg_prefill_dp_rank=adapted_request.disagg_prefill_dp_rank,
                 image_data=adapted_request.image_data,
                 video_data=adapted_request.video_data,
                 audio_data=adapted_request.audio_data,
@@ -2077,3 +2157,115 @@ class OpenAIServingResponses(OpenAIServingChat):
         )
 
         return remaining_text, tool_calls
+
+    def _should_return_logprobs(self, request: ResponsesRequest) -> bool:
+        """Check if logprobs should be returned based on include parameter."""
+        return (
+            request.include is not None
+            and "message.output_text.logprobs" in request.include
+        )
+
+    def _build_response_logprobs(
+        self, ret_item: dict[str, Any]
+    ) -> Optional[list[dict]]:
+        """Convert logprobs for ResponseOutputText format."""
+
+        meta_info = ret_item.get("meta_info", {})
+        if "output_token_logprobs" not in meta_info:
+            return None
+
+        logprobs = to_openai_style_logprobs(
+            output_token_logprobs=meta_info["output_token_logprobs"],
+            output_top_logprobs=meta_info.get("output_top_logprobs", None),
+        )
+
+        # 转换为 ResponseOutputText.logprobs 所需格式
+        token_logprobs = self._parse_logprobs_tokens(logprobs, use_token_index=True)
+        return token_logprobs
+
+    def _process_streaming_logprobs_for_responses(
+        self,
+        output: dict[str, Any],
+        n_prev_token: int,
+    ) -> Optional[list[dict]]:
+        """Process logprobs for streaming response in Responses API format.
+
+        Args:
+            output: The output dict containing meta_info with logprobs data
+            n_prev_token: Number of previously processed tokens
+
+        Returns:
+            List of logprob dicts for ResponseTextDeltaEvent, or None if not available
+        """
+        meta_info = output.get("meta_info", {})
+
+        if "output_token_logprobs" not in meta_info:
+            return None
+
+        output_token_logprobs = meta_info["output_token_logprobs"]
+        output_top_logprobs = meta_info.get("output_top_logprobs", [])
+
+        # 获取已处理的总 token 数
+        total_output_logprobs = meta_info["output_token_logprobs_length"]
+
+        # 只处理新增的 tokens
+        if n_prev_token >= total_output_logprobs:
+            return None
+
+        # 切片获取新增的 logprobs
+        if not self.tokenizer_manager.server_args.incremental_streaming_output:
+            output_token_logprobs = output_token_logprobs[
+                n_prev_token:total_output_logprobs
+            ]
+            output_top_logprobs = (
+                output_top_logprobs[n_prev_token:total_output_logprobs]
+                if output_top_logprobs
+                else []
+            )
+
+        logprobs = to_openai_style_logprobs(
+            output_token_logprobs=output_token_logprobs,
+            output_top_logprobs=output_top_logprobs,
+        )
+
+        # 转换为 ResponseTextDeltaEvent.logprobs 所需格式
+        # 格式: List[Dict] 每个元素包含 token, logprob, bytes, top_logprobs
+        token_logprobs = self._parse_logprobs_tokens(logprobs, use_token_index=True)
+        return token_logprobs
+
+    def _parse_logprobs_tokens(
+        self, logprobs: LogProbs, use_token_index: bool = False
+    ) -> Optional[list[dict]]:
+        """Common helper to process logprobs tokens for both streaming and non-streaming"""
+        token_logprobs = []
+
+        for token_idx, (token, logprob) in enumerate(
+            zip(logprobs.tokens, logprobs.token_logprobs)
+        ):
+            token_bytes = list(token.encode("utf-8"))
+            top_logprobs = []
+            if logprobs.top_logprobs:
+                # - Non-streaming (use_token_index=True): uses token_idx for full data
+                # - Streaming (use_token_index=False): uses index 0 for pre-sliced data
+                top_logprobs_idx = token_idx if use_token_index else 0
+                for top_token, top_logprob in logprobs.top_logprobs[
+                    top_logprobs_idx
+                ].items():
+                    top_token_bytes = list(top_token.encode("utf-8"))
+                    top_logprobs.append(
+                        {
+                            "token": top_token,
+                            "bytes": top_token_bytes,
+                            "logprob": top_logprob,
+                        }
+                    )
+            token_logprobs.append(
+                {
+                    "token": token,
+                    "bytes": token_bytes,
+                    "logprob": logprob,
+                    "top_logprobs": top_logprobs,
+                }
+            )
+
+        return token_logprobs
