@@ -567,7 +567,6 @@ TWO_GPU_CASES = [
             tp_size=2,
             extras=[
                 "--pipeline-class-name LTX2TwoStagePipeline --ltx2-two-stage-device-mode original",
-                "--transformer-weight-quantization fp8-cast",
             ],
         ),
         TI2V_sampling_params,
@@ -589,7 +588,6 @@ TWO_GPU_CASES = [
             extras=[
                 "--pipeline-class-name LTX2TwoStagePipeline",
                 "--ltx2-two-stage-device-mode resident",
-                "--transformer-weight-quantization fp8-cast",
                 "--component-attention-backends transformer=fa",
             ],
         ),
@@ -665,7 +663,6 @@ TWO_GPU_CASES = [
         DiffusionServerArgs(
             model_path="Lightricks/LTX-2.3",
             cfg_parallel=True,
-            extras=["--transformer-weight-quantization fp8-cast"],
         ),
         TI2V_sampling_params,
         run_component_accuracy_check=False,

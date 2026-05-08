@@ -20,10 +20,6 @@ from sglang.multimodal_gen.runtime.distributed import (
     tensor_model_parallel_all_gather,
     tensor_model_parallel_all_reduce,
 )
-from sglang.multimodal_gen.runtime.layers.fp8_cast import (
-    fused_add_round_fp8_cast_,
-    is_fp8_cast_dtype,
-)
 from sglang.multimodal_gen.runtime.layers.linear import (
     ColumnParallelLinear,
     LinearBase,
@@ -122,9 +118,6 @@ class BaseLayerWithLoRA(nn.Module):
     def slice_lora_b_weights(self, B: torch.Tensor) -> torch.Tensor:
         return B
 
-    def _fp8_cast_merge_random_kwargs(self, data_2d: torch.Tensor) -> dict[str, int]:
-        return {}
-
     def set_lora_weights(
         self,
         A: torch.Tensor,
@@ -196,10 +189,6 @@ class BaseLayerWithLoRA(nn.Module):
             data: The base weight tensor to merge LoRA into (modified in-place)
             lora_list: List of (lora_A, lora_B, lora_path, lora_strength, rank, alpha) tuples
         """
-        if is_fp8_cast_dtype(data.dtype):
-            self._merge_lora_into_fp8_cast_data(data, lora_list)
-            return
-
         # Merge all LoRA adapters in order
         for lora_A, lora_B, _, lora_strength, lora_rank, lora_alpha in lora_list:
             lora_A_sliced = self.slice_lora_a_weights(lora_A.to(data))
@@ -244,46 +233,6 @@ class BaseLayerWithLoRA(nn.Module):
                 end = min(start + chunk_rows, lora_B_2d.shape[0])
                 chunk_delta = lora_B_2d[start:end] @ lora_A_sliced
                 data_2d[start:end].add_(chunk_delta, alpha=scale)
-
-    @torch.no_grad()
-    def _merge_lora_into_fp8_cast_data(
-        self,
-        data: torch.Tensor,
-        lora_list: list[LoRAWeightEntry],
-    ) -> None:
-        data_2d = data.reshape(-1, data.shape[-1]) if data.dim() > 2 else data
-        if not data_2d.is_contiguous():
-            raise ValueError("fp8-cast LoRA merge expects contiguous base weights")
-
-        deltas = torch.zeros_like(data_2d, dtype=torch.bfloat16)
-        for lora_A, lora_B, _, lora_strength, lora_rank, lora_alpha in lora_list:
-            lora_A_sliced = self.slice_lora_a_weights(
-                lora_A.to(device=data.device, dtype=torch.bfloat16)
-            )
-            lora_B_sliced = self.slice_lora_b_weights(
-                lora_B.to(device=data.device, dtype=torch.bfloat16)
-            )
-
-            scale = lora_strength
-            if (
-                lora_alpha is not None
-                and lora_rank is not None
-                and lora_alpha != lora_rank
-            ):
-                scale *= lora_alpha / lora_rank
-
-            lora_delta = lora_B_sliced @ lora_A_sliced
-            if lora_delta.dim() > 2:
-                lora_delta = lora_delta.reshape(-1, lora_delta.shape[-1])
-            deltas.add_(lora_delta, alpha=scale)
-
-        fused_add_round_fp8_cast_(
-            deltas.reshape(-1),
-            data_2d.reshape(-1),
-            seed=0,
-            **self._fp8_cast_merge_random_kwargs(data_2d),
-        )
-        data_2d.copy_(deltas.to(dtype=data.dtype))
 
     def _should_merge_in_fp32(
         self,
@@ -500,18 +449,6 @@ class ColumnParallelLinearWithLoRA(BaseLayerWithLoRA):
         B = B[start_idx:end_idx, :]
         return B
 
-    def _fp8_cast_merge_random_kwargs(self, data_2d: torch.Tensor) -> dict[str, int]:
-        if (
-            self.base_layer.tp_size == 1
-            or len(self.base_layer.output_partition_sizes) != 1
-        ):
-            return {}
-        # Match official full-weight LoRA fuse stochastic rounding after TP sharding.
-        row_offset = (
-            self.base_layer.tp_rank * self.base_layer.output_partition_sizes[0]
-        )
-        return {"random_offset": row_offset * data_2d.shape[-1]}
-
 
 class MergedColumnParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
     def __init__(
@@ -532,9 +469,6 @@ class MergedColumnParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
         start_idx = tp_rank * shard_size
         end_idx = (tp_rank + 1) * shard_size
         return B[:, start_idx:end_idx, :]
-
-    def _fp8_cast_merge_random_kwargs(self, data_2d: torch.Tensor) -> dict[str, int]:
-        return {}
 
 
 class QKVParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
@@ -567,9 +501,6 @@ class QKVParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
         kv_end_idx = kv_start_idx + kv_proj_shard_size
 
         return B_q[q_start_idx:q_end_idx, :], B_kv[:, kv_start_idx:kv_end_idx, :]
-
-    def _fp8_cast_merge_random_kwargs(self, data_2d: torch.Tensor) -> dict[str, int]:
-        return {}
 
 
 class RowParallelLinearWithLoRA(BaseLayerWithLoRA):
@@ -648,17 +579,6 @@ class RowParallelLinearWithLoRA(BaseLayerWithLoRA):
 
     def slice_lora_b_weights(self, B: torch.Tensor) -> torch.Tensor:
         return B
-
-    def _fp8_cast_merge_random_kwargs(self, data_2d: torch.Tensor) -> dict[str, int]:
-        if self.base_layer.tp_size == 1:
-            return {}
-        # Match official full-weight LoRA fuse stochastic rounding after TP sharding.
-        return {
-            "random_full_width": self.base_layer.input_size,
-            "random_local_width": data_2d.shape[-1],
-            "random_col_offset": self.base_layer.tp_rank
-            * self.base_layer.input_size_per_partition,
-        }
 
 
 class LinearWithLoRA(BaseLayerWithLoRA):
