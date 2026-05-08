@@ -379,28 +379,8 @@ class DeepEPWaterfillBalancer:
         self.shared_weight = (
             1.0 / routed_scaling_factor if routed_scaling_factor != 0 else 1.0
         )
-        self.static_rank_load: Optional[Tensor] = None
         self._counts_buf: Optional[Tensor] = None
-
-    def try_bind_static_rank_load(self):
-        """Bind a live reference to EPLB rank-load metadata when available."""
-        if envs.SGLANG_DISABLE_STATIC_WATERFILL.get():
-            return
-        from sglang.srt.eplb.expert_location import get_global_expert_location_metadata
-
-        metadata = get_global_expert_location_metadata()
-        if metadata is None or metadata.rank_load is None:
-            return
-        # One-shot bind: works for --init-expert-location (live view tracks EPLB
-        # in-place rebalance updates). Without init, rank_load is None at load and
-        # later allocated by EPLB rebalance — balancer then stays on dynamic
-        # all-reduce since this is not re-invoked. Correct, small perf gap.
-        if self.static_rank_load is not None:
-            return
-        if self.layer_id < metadata.rank_load.shape[0]:
-            layer_load = metadata.rank_load[self.layer_id]
-            if layer_load.sum() > 0:
-                self.static_rank_load = layer_load
+        self.use_static_waterfill = not envs.SGLANG_DISABLE_STATIC_WATERFILL.get()
 
     def count_local_routed(self, topk_ids: Tensor) -> Tensor:
         """Count routed tokens per rank via Triton kernel (uses original expert IDs)."""
@@ -433,17 +413,12 @@ class DeepEPWaterfillBalancer:
 
     def _can_skip_dispatch_plan_for_low_batch(self, num_tokens: int) -> bool:
         """Return whether static mode can skip dispatch-plan setup entirely."""
-        return self.static_rank_load is not None and self._is_low_batch(num_tokens)
+        return self.use_static_waterfill and self._is_low_batch(num_tokens)
 
     def _build_static_dispatch_plan(
         self, routed_counts: Tensor
     ) -> WaterfillDispatchPlan:
-        """Build static-mode Waterfill inputs without EP all-reduce.
-
-        Static Waterfill uses EPLB rank-load metadata availability to select the
-        no-all-reduce path. The fused kernel still consumes this layer's current
-        local routed counts, matching the existing PR behavior.
-        """
+        """Build static-mode Waterfill inputs from current local routed counts."""
         return WaterfillDispatchPlan(
             rank_load=routed_counts,
             allow_all_ranks=True,
@@ -503,9 +478,9 @@ class DeepEPWaterfillBalancer:
     def _build_dispatch_plan(
         self, topk_ids: Tensor, num_tokens: int
     ) -> Optional[WaterfillDispatchPlan]:
-        """Prepare rank-load state for the waterfill selection boundary."""
+        """Prepare dispatch state for the waterfill selection boundary."""
         local_routed_counts = self.count_local_routed(topk_ids)
-        if self.static_rank_load is not None:
+        if self.use_static_waterfill:
             return self._build_static_dispatch_plan(local_routed_counts)
 
         global_routed_counts, local_tokens_per_rank = (
@@ -585,9 +560,9 @@ class DeepEPWaterfillBalancer:
     ) -> StandardTopKOutput:
         """Expand topk [N, 8] -> [N, 9] with waterfill-assigned shared expert."""
         if self._can_skip_dispatch_plan_for_low_batch(num_tokens):
-            # Static EPLB low-batch path can use local expansion without
-            # communication. Dynamic mode still all-reduces before materializing
-            # local expansion so all ranks participate consistently.
+            # Static mode can use local expansion without communication for small
+            # decode-sized batches. Dynamic mode still all-reduces before local
+            # expansion so all ranks participate consistently.
             return self._expand_local_shared(topk_output)
 
         dispatch_plan = self._build_dispatch_plan(topk_output.topk_ids, num_tokens)

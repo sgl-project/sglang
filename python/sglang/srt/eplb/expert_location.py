@@ -44,8 +44,6 @@ class ExpertLocationMetadata:
     logical_to_all_physical_map_num_valid: torch.Tensor  # (layers, num_logical_experts)
     # (layers, num_logical_experts)
     logical_to_rank_dispatch_physical_map: Optional[torch.Tensor]
-    # Per-rank load derived from logical_count + physical_to_logical_map (num_layers, ep_size)
-    rank_load: Optional[torch.Tensor] = None
 
     # -------------------------------- properties ------------------------------------
 
@@ -180,7 +178,7 @@ class ExpertLocationMetadata:
             )
         )
 
-        metadata = ExpertLocationMetadata._init_raw(
+        return ExpertLocationMetadata._init_raw(
             server_args=server_args,
             ep_size=common["ep_size"],
             physical_to_logical_map=physical_to_logical_map.to(server_args.device),
@@ -188,16 +186,6 @@ class ExpertLocationMetadata:
                 server_args.device
             ),
         )
-        if metadata is not None and server_args.enable_deepep_waterfill:
-            # NOTE: Static Waterfill rank load is only available when
-            # init_expert_location provides logical_count. Mapping-only init
-            # has no token counts and falls back to dynamic Waterfill.
-            metadata.rank_load = _compute_rank_load(
-                logical_count,
-                metadata.physical_to_logical_map,
-                common["ep_size"],
-            )
-        return metadata
 
     @staticmethod
     def _init_common(server_args: ServerArgs, model_config: ModelConfig):
@@ -274,9 +262,6 @@ class ExpertLocationMetadata:
         ]:
             assert getattr(self, field) == getattr(other, field)
 
-        if self.rank_load is None and other.rank_load is not None:
-            self.rank_load = torch.zeros_like(other.rank_load)
-
         for field in [
             "physical_to_logical_map",
             "physical_to_logical_map_cpu",
@@ -284,7 +269,6 @@ class ExpertLocationMetadata:
             "logical_to_all_physical_map_cpu",
             "logical_to_all_physical_map_num_valid",
             "logical_to_rank_dispatch_physical_map",
-            "rank_load",
         ]:
             other_field = getattr(other, field)
             self_field = getattr(self, field)
@@ -545,27 +529,6 @@ class ModelConfigForExpertLocation:
             )
         else:
             return None
-
-
-def _compute_rank_load(
-    logical_count: torch.Tensor, physical_to_logical_map: torch.Tensor, ep_size: int
-):
-    """Compute per-rank load (num_layers, ep_size) from EPLB-normalized counts."""
-    from sglang.srt.eplb.expert_distribution import compute_gpu_physical_count
-
-    if logical_count.dim() != 3:
-        return None
-    logical_count = logical_count.float().mean(dim=0)
-
-    phy_map = physical_to_logical_map.long()
-    device = phy_map.device
-    lc = logical_count.to(device=device, dtype=torch.float64)
-    n_layers, n_phy = phy_map.shape
-    ones = torch.ones(n_layers, n_phy, dtype=torch.float64, device=device)
-    replicas = torch.zeros(n_layers, lc.shape[-1], dtype=torch.float64, device=device)
-    replicas.scatter_add_(1, phy_map, ones).clamp_(min=1.0)
-    phy_load = torch.gather(lc, 1, phy_map) / torch.gather(replicas, 1, phy_map)
-    return compute_gpu_physical_count(phy_load.unsqueeze(0), ep_size).squeeze(0)
 
 
 def compute_initial_expert_location_metadata(
