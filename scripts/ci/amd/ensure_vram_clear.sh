@@ -221,7 +221,11 @@ ensure_vram_clear() {
         kill_processes_holding_gpu_devices KILL
 
         # 2d. Best-effort: also kill anything `rocm-smi --showpids` reports.
-        rocm-smi --showpids 2>/dev/null | grep 'PID:' | awk '{print $2}' \
+        # Handles both the legacy "PID: <n>" line format and the modern
+        # tabular format (`<pid>\t<name>\t<gpus>\t...`); the previous
+        # `grep 'PID:'` matched nothing on ROCm 5+ tabular output.
+        rocm-smi --showpids 2>/dev/null \
+            | awk '/^PID:[[:space:]]*[0-9]+/ {print $2} /^[0-9]+/ {print $1}' \
             | xargs -r kill -9 2>/dev/null || true
 
         echo "Waiting 30 seconds for VRAM to clear..."
