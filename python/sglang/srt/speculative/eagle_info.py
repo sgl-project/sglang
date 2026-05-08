@@ -551,13 +551,9 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
             batch.seq_lens.add_(num_accepted_drafts + 1)
             batch.seq_lens_cpu.add_(num_accepted_tokens_cpu)
 
-            # NOTE: `bonus_tokens` is set to the flat accepted-token tensor
-            # here; `prepare_extend_after_decode` (below) reads it as the
-            # extend batch's `input_ids` before overwriting it with the
-            # per-req [bs] bonus token via `create_extend_after_decode_spec_info`.
             draft_input = EagleDraftInput(
                 hidden_states=batch.spec_info.hidden_states[accept_index],
-                bonus_tokens=accept_tokens,
+                accept_tokens=accept_tokens,
                 num_accepted_drafts=num_accepted_drafts,
                 num_accepted_tokens=num_accepted_drafts + 1,
                 num_accepted_drafts_cpu=num_accepted_drafts_list,
@@ -629,7 +625,7 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                     hidden_states=batch.spec_info.hidden_states[
                         unfinished_accept_index
                     ],
-                    bonus_tokens=predict[unfinished_accept_index],
+                    accept_tokens=predict[unfinished_accept_index],
                     num_accepted_drafts_cpu=draft_input_num_accepted_drafts_cpu,
                     num_accepted_tokens_cpu=draft_input_num_accepted_tokens_cpu,
                     num_accepted_drafts=unfinished_num_accepted_drafts,
@@ -674,6 +670,13 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
     # `num_accepted_tokens = num_accepted_drafts + 1` (per-req, one bonus per req).
     # Storing both avoids repeated `+ 1` at every consumer (attn backends, kernels).
     bonus_tokens: torch.Tensor = None
+    # Flat accepted-token tensor for draft-extend, shape `[sum_accepted]`.
+    # Set right after verify and consumed by `prepare_extend_after_decode` as
+    # the extend batch's `input_ids`. Dead after that method returns.
+    # TODO: drop this field and pass `accept_tokens` directly to
+    # `prepare_extend_after_decode` as a method arg. Its lifetime is bounded
+    # by verify -> prepare_extend, no need to live on the dataclass.
+    accept_tokens: torch.Tensor = None
     num_accepted_drafts: torch.Tensor = None
     num_accepted_tokens: torch.Tensor = None
     num_accepted_drafts_cpu: List[int] = None
@@ -732,6 +735,7 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
     ):
         return cls(
             bonus_tokens=torch.empty((0,), device=device, dtype=torch.int32),
+            accept_tokens=torch.empty((0,), device=device, dtype=torch.int32),
             hidden_states=torch.empty((0, hidden_size), device=device, dtype=dtype),
             topk_p=torch.empty((0, topk), device=device, dtype=torch.float32),
             topk_index=torch.empty((0, topk), device=device, dtype=torch.int64),
@@ -752,11 +756,11 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
         if batch.forward_mode.is_idle():
             return
 
-        # Before this method runs, `self.bonus_tokens` transiently holds the
-        # flat accepted-token tensor (set by `EagleVerifyInput.verify`). Use
-        # it as the extend batch's `input_ids`, then overwrite the field
-        # with the per-req [bs] bonus tokens populated by the kernel below.
-        batch.input_ids = self.bonus_tokens
+        # `self.accept_tokens` is the flat accepted-token tensor set by
+        # `EagleVerifyInput.verify`; use it as the extend batch's `input_ids`.
+        # The kernel below populates `self.bonus_tokens` ([bs] per-req) for
+        # the next decode round.
+        batch.input_ids = self.accept_tokens
         batch.extend_lens = batch.spec_info.num_accepted_tokens_cpu
         batch.extend_num_tokens = sum(batch.extend_lens)
         batch.seq_lens = batch.spec_info.seq_lens_for_draft_extend
