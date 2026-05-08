@@ -98,6 +98,27 @@ class TestOmniSRTBackend(unittest.TestCase):
         self.assertEqual("done", second.type)
         self.assertEqual(1, bridge.commit_count)
 
+    def test_append_input_segments_reuses_live_session(self):
+        bridge = _FakeBridge(pre_image_segments=[])
+        backend = SRTARBackend(bridge)
+        request = OmniRequest(
+            messages=(OmniInputSegment(type="text", text="draw"),),
+            mode="interleave",
+        )
+
+        context = backend.prepare_context(request)
+        context = backend.append_input_segments(
+            context,
+            OmniRequest(
+                messages=(OmniInputSegment(type="text", text="again"),),
+                mode="interleave",
+            ),
+        )
+        first = backend.decode_until_boundary(context, request=request)
+
+        self.assertEqual(["s0", "s0"], bridge.session_ids)
+        self.assertEqual("image", first.type)
+
     def test_image_payload_accepts_b64_json(self):
         bridge = _ImageCaptureBridge()
         backend = SRTARBackend(bridge)
@@ -153,10 +174,14 @@ class _FakeBridge:
             else pre_image_segments
         )
         self.commit_count = 0
+        self.session_ids = []
 
     def prepare_u_context_from_messages(self, **kwargs):
-        del kwargs
-        session = SimpleNamespace(session_id="s0", context_version=0)
+        self.session_ids.append(kwargs.get("session_id") or "s0")
+        session = SimpleNamespace(
+            session_id=kwargs.get("session_id") or "s0",
+            context_version=len(self.session_ids),
+        )
         full = SimpleNamespace(
             request_id="r0",
             token_count=4,

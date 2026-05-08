@@ -577,6 +577,7 @@ class U1SRTBackedUGMiddleBridge:
         think: bool = False,
         think_max_new_tokens: int | None = None,
         sampling_params: Any | None = None,
+        session_id: str | None = None,
     ) -> UGContextBundle:
         with self._temporary_generation_settings(sampling_params, think=think):
             bridge_think = (
@@ -589,6 +590,7 @@ class U1SRTBackedUGMiddleBridge:
                 think=bridge_think,
                 think_max_new_tokens=think_max_new_tokens,
                 sampling_params=sampling_params,
+                session_id=session_id,
             )
         return contexts
 

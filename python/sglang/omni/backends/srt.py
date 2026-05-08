@@ -85,17 +85,42 @@ class SRTARBackend:
         if request.mode == "vlm":
             return self._prepare_vlm_context(request)
 
+        context = self._prepare_interleave_context(request)
+        context.metadata["pending_boundaries"] = _initial_boundaries(
+            context, mode=request.mode
+        )
+        return context
+
+    def append_input_segments(
+        self,
+        context: OmniContextBundle,
+        request: OmniRequest,
+    ) -> OmniContextBundle:
+        if request.mode == "vlm":
+            raise ValueError("Persistent omni sessions do not support vlm mode")
+        if _is_vlm_backend_context(context):
+            raise ValueError("Cannot continue a vlm context as an omni session")
+        session_id = _session_id_for_context(context)
+        context = self._prepare_interleave_context(request, session_id=session_id)
+        context.metadata["pending_boundaries"] = _initial_boundaries(
+            context, mode=request.mode
+        )
+        return context
+
+    def _prepare_interleave_context(
+        self,
+        request: OmniRequest,
+        *,
+        session_id: str | None = None,
+    ) -> OmniContextBundle:
         context = self.bridge.prepare_u_context_from_messages(
             messages=[_to_legacy_message(message) for message in request.messages],
             think=request.think,
             think_max_new_tokens=request.think_max_new_tokens,
             sampling_params=request.sampling_params,
+            session_id=session_id,
         )
-        context = _coerce_context_bundle(context)
-        context.metadata["pending_boundaries"] = _initial_boundaries(
-            context, mode=request.mode
-        )
-        return context
+        return _coerce_context_bundle(context)
 
     def decode_until_boundary(
         self,
@@ -254,6 +279,16 @@ def _coerce_context_ref(ref: Any) -> OmniContextRef:
 
 def _backend_context(context: OmniContextBundle) -> Any:
     return context.backend_context if context.backend_context is not None else context
+
+
+def _session_id_for_context(context: OmniContextBundle) -> str:
+    if context.full.session_id is not None:
+        return context.full.session_id
+    session = getattr(_backend_context(context).full, "session", None)
+    session_id = getattr(session, "session_id", None)
+    if session_id is None:
+        raise ValueError("Persistent omni session requires a live SRT session")
+    return str(session_id)
 
 
 def _is_vlm_backend_context(context: OmniContextBundle) -> bool:

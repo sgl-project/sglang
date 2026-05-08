@@ -6,7 +6,12 @@ from types import SimpleNamespace
 
 from PIL import Image
 
-from sglang.omni.protocol import OmniOutputSegment, OmniResponse
+from sglang.omni.protocol import (
+    OmniContextBundle,
+    OmniContextRef,
+    OmniOutputSegment,
+    OmniResponse,
+)
 from sglang.omni.srt_transport import handle_omni_generate_from_scheduler
 from sglang.srt.managers.io_struct import OmniGenerateReqInput, OmniGenerateReqOutput
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
@@ -15,16 +20,36 @@ from sglang.srt.managers.tokenizer_manager import TokenizerManager
 class FakeOrchestrator:
     def __init__(self):
         self.requests = []
+        self.contexts = []
+        self.ar_backend = SimpleNamespace(released=[])
+        self.ar_backend.release = self.ar_backend.released.append
 
-    def generate(self, request):
+    def generate_with_context(
+        self,
+        request,
+        *,
+        context=None,
+        release_context=True,
+        stop_after_generation_limit=False,
+    ):
+        del stop_after_generation_limit
         self.requests.append(request)
-        return OmniResponse(
+        if context is None:
+            context = OmniContextBundle(
+                full=OmniContextRef(context_id="ctx0", session_id="s0")
+            )
+        self.contexts.append(context)
+        response = OmniResponse(
             segments=(
                 OmniOutputSegment(type="text", text="ok"),
                 OmniOutputSegment(type="image", image=Image.new("RGB", (1, 1))),
             ),
+            context=context.full,
             stats={"num_segments": 2},
         )
+        if release_context:
+            self.ar_backend.release(context)
+        return response, context
 
 
 class FakeSender:
@@ -76,6 +101,43 @@ class TestOmniSRTTransport(unittest.TestCase):
         self.assertEqual("draw", orchestrator.requests[0].messages[0].text)
         self.assertEqual("ok", response["segments"][0]["text"])
         self.assertIn("b64_json", response["segments"][1]["image"])
+
+    def test_scheduler_transport_keeps_and_continues_session(self):
+        orchestrator = FakeOrchestrator()
+        scheduler = SimpleNamespace(
+            _omni_orchestrators={"sensenova-u1": orchestrator},
+            server_args=SimpleNamespace(),
+        )
+
+        first = handle_omni_generate_from_scheduler(
+            scheduler=scheduler,
+            payload={
+                "model": "sensenova-u1",
+                "keep_session": True,
+                "messages": [{"type": "text", "text": "draw"}],
+            },
+        )
+        second = handle_omni_generate_from_scheduler(
+            scheduler=scheduler,
+            payload={
+                "model": "sensenova-u1",
+                "session_id": first["session"]["id"],
+                "messages": [{"type": "text", "text": "again"}],
+            },
+        )
+
+        self.assertEqual("s0", first["session"]["id"])
+        self.assertEqual(2, second["session"]["turns"])
+        self.assertIs(orchestrator.contexts[0], orchestrator.contexts[1])
+        self.assertEqual(0, len(orchestrator.ar_backend.released))
+
+        closed = handle_omni_generate_from_scheduler(
+            scheduler=scheduler,
+            payload={"action": "close_session", "session_id": "s0"},
+        )
+
+        self.assertFalse(closed["session"]["alive"])
+        self.assertEqual(1, len(orchestrator.ar_backend.released))
 
     def test_scheduler_transport_rejects_unknown_model(self):
         with self.assertRaisesRegex(ValueError, "Unsupported omni model"):

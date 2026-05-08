@@ -40,6 +40,7 @@ class UGMiddleBridge(Protocol):
         think: bool = False,
         think_max_new_tokens: int | None = None,
         sampling_params: Any | None = None,
+        session_id: str | None = None,
     ) -> UGContextBundle: ...
 
     def run_g_segment(
@@ -189,10 +190,11 @@ class SRTBackedUGMiddleBridge:
         think: bool = False,
         think_max_new_tokens: int | None = None,
         sampling_params: Any | None = None,
+        session_id: str | None = None,
     ) -> UGContextBundle:
         del sampling_params
         messages = normalize_ug_interleaved_messages(messages)
-        session = self.runtime.prefill_interleaved(messages)
+        session = self.runtime.prefill_interleaved(messages, session_id=session_id)
         pre_image_segments: list[dict[str, Any]] = []
         try:
             if think:

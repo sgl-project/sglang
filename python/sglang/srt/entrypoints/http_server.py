@@ -1470,6 +1470,26 @@ async def omni_generate_request(raw_request: Request):
     )
 
 
+@app.post("/v1/omni/sessions/{session_id}/close")
+async def omni_close_session_request(session_id: str, raw_request: Request):
+    payload = {"action": "close_session", "session_id": session_id}
+    if raw_request.headers.get("content-length") not in {None, "0"}:
+        body = await raw_request.json()
+        if isinstance(body, dict):
+            payload.update(body)
+            payload["session_id"] = session_id
+    result = await _global_state.tokenizer_manager.omni_generate(
+        OmniGenerateReqInput(payload=payload),
+        raw_request,
+    )
+    if result.success:
+        return ORJSONResponse(content=result.payload, status_code=200)
+    return ORJSONResponse(
+        content={"error": {"message": result.message}},
+        status_code=result.status_code,
+    )
+
+
 @app.post("/pause_generation")
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def pause_generation(obj: PauseGenerationReqInput, request: Request):

@@ -43,6 +43,7 @@ class _ScriptedARBackend:
         self._boundaries = list(boundaries)
         self._counter = itertools.count()
         self.appended_segments: list[GeneratedSegment] = []
+        self.appended_inputs: list[OmniRequest] = []
         self.released_contexts: list[OmniContextBundle] = []
 
     def prepare_context(self, request: OmniRequest) -> OmniContextBundle:
@@ -53,6 +54,11 @@ class _ScriptedARBackend:
                 metadata={"messages": [message.to_dict() for message in request.messages]},
             )
         )
+
+    def append_input_segments(self, context, request):
+        self.appended_inputs.append(request)
+        context.full.version += 1
+        return context
 
     def decode_until_boundary(self, context, *, request):
         del context, request
@@ -107,6 +113,40 @@ class TestOmniCoordinator(unittest.TestCase):
         self.assertEqual(1, gen_backend.calls)
         self.assertEqual(1, len(ar_backend.appended_segments))
         self.assertEqual(1, len(ar_backend.released_contexts))
+
+    def test_session_turn_keeps_context_and_stops_after_image(self):
+        ar_backend = _ScriptedARBackend(
+            [
+                OmniBoundary(type="image"),
+                OmniBoundary(type="text", text="after"),
+            ]
+        )
+        gen_backend = _ImageBackend()
+        coordinator = OmniCoordinator(ar_backend, gen_backend)
+        request = OmniRequest(
+            messages=(OmniInputSegment(type="text", text="draw"),),
+            max_images=1,
+        )
+
+        response, context = coordinator.generate_with_context(
+            request,
+            release_context=False,
+            stop_after_generation_limit=True,
+        )
+
+        self.assertEqual(["image"], [s.type for s in response.segments])
+        self.assertEqual(1, gen_backend.calls)
+        self.assertEqual(0, len(ar_backend.released_contexts))
+
+        ar_backend._boundaries = [OmniBoundary(type="text", text="next")]
+        response, _ = coordinator.generate_with_context(
+            OmniRequest(messages=(OmniInputSegment(type="text", text="again"),)),
+            context=context,
+            release_context=False,
+        )
+
+        self.assertEqual("again", ar_backend.appended_inputs[0].messages[0].text)
+        self.assertEqual(["text"], [s.type for s in response.segments])
 
 
 if __name__ == "__main__":

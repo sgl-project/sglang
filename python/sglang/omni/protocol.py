@@ -214,6 +214,12 @@ class ContextOps(Protocol):
 class ARBackend(Protocol):
     def prepare_context(self, request: OmniRequest) -> OmniContextBundle: ...
 
+    def append_input_segments(
+        self,
+        context: OmniContextBundle,
+        request: OmniRequest,
+    ) -> OmniContextBundle: ...
+
     def decode_until_boundary(
         self,
         context: OmniContextBundle,

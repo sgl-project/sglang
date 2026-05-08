@@ -22,6 +22,17 @@ class OmniCoordinator:
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def generate(self, request: OmniRequest) -> OmniResponse:
+        response, _ = self.generate_with_context(request)
+        return response
+
+    def generate_with_context(
+        self,
+        request: OmniRequest,
+        *,
+        context: Any | None = None,
+        release_context: bool = True,
+        stop_after_generation_limit: bool = False,
+    ) -> tuple[OmniResponse, Any]:
         if self.request_adapter is not None:
             request = self.request_adapter(request)
 
@@ -32,7 +43,11 @@ class OmniCoordinator:
                 f"max_text_segments must be non-negative, got {request.max_text_segments}"
             )
 
-        context = self.ar_backend.prepare_context(request)
+        if context is None:
+            context = self.ar_backend.prepare_context(request)
+        else:
+            context = self.ar_backend.append_input_segments(context, request)
+
         segments: list[OmniOutputSegment] = []
         num_text_segments = 0
         num_generated_segments = 0
@@ -77,17 +92,25 @@ class OmniCoordinator:
                     generated,
                     request=request,
                 )
+                if (
+                    stop_after_generation_limit
+                    and boundary.type == "image"
+                    and num_generated_segments >= request.max_images
+                ):
+                    break
         finally:
-            self.ar_backend.release(context)
+            if release_context:
+                self.ar_backend.release(context)
 
         stats = {
             "num_segments": len(segments),
             "num_text_segments": num_text_segments,
             "num_generated_segments": num_generated_segments,
         }
-        return OmniResponse(
+        response = OmniResponse(
             segments=tuple(segments),
             context=context.full,
             stats=stats,
             metadata=dict(self.metadata),
         )
+        return response, context
