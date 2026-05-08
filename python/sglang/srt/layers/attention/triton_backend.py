@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, Optional
 
@@ -7,6 +8,9 @@ import torch
 import triton
 import triton.language as tl
 from sgl_kernel.utils import is_arch_support_pdl
+
+logger = logging.getLogger(__name__)
+_GLUON_EXTEND_ATTENTION_ENV = "SGLANG_ENABLE_GLUON_EXTEND_ATTENTION"
 
 from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -20,6 +24,7 @@ from sglang.srt.utils import (
     get_bool_env_var,
     get_device_core_count,
     get_int_env_var,
+    is_gfx95_supported,
     next_power_of_2,
 )
 
@@ -90,7 +95,29 @@ class TritonAttnBackend(AttentionBackend):
         super().__init__()
 
         self.decode_attention_fwd = torch.compiler.disable(decode_attention_fwd)
-        self.extend_attention_fwd = torch.compiler.disable(extend_attention_fwd)
+        # Optional gfx950 Gluon extend attention.
+        self._get_gluon_extend_hints = None
+        _extend_fwd = extend_attention_fwd
+        _mla_model = model_runner.model_config.attention_arch == AttentionArch.MLA
+        if (
+            get_bool_env_var(_GLUON_EXTEND_ATTENTION_ENV)
+            and is_gfx95_supported()
+            and not _mla_model
+        ):
+            from sglang.srt.layers.attention.gluon_extend_attention import (
+                get_extend_attention_hints,
+                make_extend_attention_fwd,
+            )
+
+            _gluon_fwd = make_extend_attention_fwd(extend_attention_fwd)
+            if _gluon_fwd is not extend_attention_fwd:
+                self._get_gluon_extend_hints = get_extend_attention_hints
+                _extend_fwd = _gluon_fwd
+                logger.info(
+                    "Gluon extend attention enabled on gfx950 "
+                    f"({_GLUON_EXTEND_ATTENTION_ENV}=1)."
+                )
+        self.extend_attention_fwd = torch.compiler.disable(_extend_fwd)
         self.extend_attention_fwd_unified = torch.compiler.disable(
             extend_attention_fwd_unified
         )
@@ -976,6 +1003,11 @@ class TritonAttnBackend(AttentionBackend):
             k_descale = 1.0
             v_descale = 1.0
 
+        _gluon_hints = (
+            self._get_gluon_extend_hints(forward_batch)
+            if self._get_gluon_extend_hints is not None
+            else {}
+        )
         self.extend_attention_fwd(
             q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
             k.contiguous(),
@@ -998,6 +1030,7 @@ class TritonAttnBackend(AttentionBackend):
             sinks=sinks,
             window_kv_offsets=window_kv_offsets,
             xai_temperature_len=layer.xai_temperature_len,
+            **_gluon_hints,
         )
         return o
 
