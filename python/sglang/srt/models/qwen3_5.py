@@ -153,7 +153,9 @@ if _is_cpu:
 def _enable_qwen35_fused_ar_quant() -> bool:
     """Gate the fused AR+RMSNorm+per-group-FP8-quant path for Qwen3.5.
 
-    The feature is a ROCm/aiter-only optimization that strictly replaces the
+    The single-kernel backend is ROCm/aiter/gfx95-only. The model gate stays
+    tied to ROCm/aiter so non-gfx95 HIP can keep the existing 2-kernel fallback
+    behavior for tuple handoff when this branch is used. It replaces the
     existing ``--enable-aiter-allreduce-fusion`` 3-kernel path
     (AR → RMSNorm → per-group quant) with either a single fused kernel (when
     the fully-fused variant is eligible) or a 2-kernel path
@@ -498,10 +500,8 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         # AMD/aiter fused AR+RMSNorm+per-group-quant path ships a
         # ``(bf16, fp8, scale)`` 3-tuple so the FP8 ``in_proj_qkvz`` can
         # consume ``(fp8, scale)`` (skipping its internal quant) while the
-        # bf16 ``in_proj_ba`` consumes the unquantized bf16. The ``_use_aiter``
-        # constant is resolved at module load, so non-AMD compilations skip
-        # the ``isinstance`` check entirely and keep the original control
-        # flow below unchanged.
+        # bf16 ``in_proj_ba`` consumes the unquantized bf16. Non-aiter runs skip
+        # the tuple branch and keep the original control flow below unchanged.
         if _use_aiter and isinstance(hidden_states, tuple):
             return self._forward_input_proj_fused_quant_amd(hidden_states)
 

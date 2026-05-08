@@ -56,6 +56,7 @@ from sglang.srt.utils import (
     is_cpu,
     is_cuda,
     is_cuda_alike,
+    is_gfx95_supported,
     is_hip,
     is_musa,
     is_npu,
@@ -754,9 +755,9 @@ class GroupCoordinator:
     ) -> Optional[Tuple[torch.Tensor, ...]]:
         """Attempt fused all-reduce + RMSNorm + per-group FP8 quant.
 
-        ROCm/aiter-only entry point. Returns ``None`` on any other platform or
-        when the aiter custom-all-reduce communicator cannot service the
-        request, letting the caller fall back to the existing
+        ROCm/aiter/gfx95-only entry point. Returns ``None`` on any other
+        platform or when the aiter custom-all-reduce communicator cannot
+        service the request, letting the caller fall back to the existing
         ``fused_allreduce_rmsnorm`` + separate per-group quant path.
 
         When ``emit_bf16=True`` the fused kernel also writes the
@@ -765,7 +766,7 @@ class GroupCoordinator:
         need both an FP8 projection and a bf16 gating projection without
         launching a separate per-group quant kernel.
         """
-        if not is_hip():
+        if not (is_hip() and is_gfx95_supported()):
             return None
 
         ca_comm = self.ca_comm
