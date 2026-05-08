@@ -33,7 +33,7 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
-SGL_TEST_FILES_CI_DATA_REVISION = "437539b330592b1421d239b22d7d76b4a6d08fda"
+SGL_TEST_FILES_CI_DATA_REVISION = "3ca3bad088ecc9ef80947d85c551cd335c75b87f"
 SGL_TEST_FILES_CONSISTENCY_GT_ROOT = (
     "https://raw.githubusercontent.com/"
     f"sgl-project/ci-data/{SGL_TEST_FILES_CI_DATA_REVISION}/"
@@ -49,6 +49,14 @@ SGL_TEST_FILES_CONSISTENCY_GT_BASE = SGL_TEST_FILES_SGLANG_CONSISTENCY_GT_BASE
 SGL_TEST_FILES_CONSISTENCY_GT_BASES = (
     SGL_TEST_FILES_OFFICIAL_CONSISTENCY_GT_BASE,
     SGL_TEST_FILES_SGLANG_CONSISTENCY_GT_BASE,
+)
+# Keep non-comparable LTX CI scenarios on sglang_generated rather than hiding
+# remaining semantic gaps behind very loose official thresholds.
+SGL_TEST_FILES_OFFICIAL_CONSISTENCY_GT_CASES = frozenset(
+    {
+        "ltx_2.3_one_stage_ti2v",
+        "ltx_2.3_two_stage_t2v_2gpus",
+    }
 )
 CONSISTENCY_THRESHOLD_JSON_PATH = (
     Path(__file__).resolve().parent / "server" / "consistency_threshold.json"
@@ -955,10 +963,28 @@ def _remote_consistency_gt_candidates(
 
 
 def _remote_file_exists(url: str) -> bool:
-    try:
-        return requests.head(url, timeout=10, allow_redirects=True).status_code == 200
-    except requests.RequestException:
-        return False
+    for method in ("head", "get"):
+        try:
+            if method == "head":
+                resp = requests.head(url, timeout=10, allow_redirects=True)
+            else:
+                resp = requests.get(
+                    url,
+                    timeout=10,
+                    allow_redirects=True,
+                    headers={"Range": "bytes=0-0"},
+                    stream=True,
+                )
+            try:
+                if resp.status_code in (200, 206):
+                    return True
+                if resp.status_code not in (403, 405, 429) and resp.status_code < 500:
+                    return False
+            finally:
+                resp.close()
+        except requests.RequestException:
+            pass
+    return False
 
 
 def _find_remote_consistency_gt_files(
@@ -967,7 +993,12 @@ def _find_remote_consistency_gt_files(
     is_video: bool,
     output_format: str | None = None,
 ) -> list[tuple[str, str]]:
-    for base_url in SGL_TEST_FILES_CONSISTENCY_GT_BASES:
+    if case_id in SGL_TEST_FILES_OFFICIAL_CONSISTENCY_GT_CASES:
+        bases = SGL_TEST_FILES_CONSISTENCY_GT_BASES
+    else:
+        # Avoid accidentally comparing non-comparable CI cases against official GT.
+        bases = (SGL_TEST_FILES_SGLANG_CONSISTENCY_GT_BASE,)
+    for base_url in bases:
         candidates = _remote_consistency_gt_candidates(
             base_url, case_id, num_gpus, is_video, output_format
         )
