@@ -599,10 +599,12 @@ def send_request_vllm_omni(base_url: str, case: dict, config: dict) -> float:
             poll_resp = requests.get(poll_url, timeout=30)
             poll_resp.raise_for_status()
             poll_data = poll_resp.json()
-            status = poll_data.get("status")
-            if status == "completed":
+            status = str(poll_data.get("status") or "").lower()
+            if status in ("completed", "succeeded", "success"):
                 break
-            if status == "failed":
+            if status in ("failed", "error", "cancelled", "canceled") or poll_data.get(
+                "error"
+            ):
                 raise RuntimeError(f"vLLM-Omni video generation failed: {poll_data}")
             if time.time() - start > REQUEST_TIMEOUT:
                 raise TimeoutError(
