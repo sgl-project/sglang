@@ -309,6 +309,13 @@ class DoubleSparsityAlgorithm(BaseSparseAlgorithm):
                 "DoubleSparsity retrieve_topk requires forward_batch kwarg"
             )
         seq_lens = forward_batch.seq_lens.to(queries.device)
+        # Attention layers commonly hand us `q` as `[bs, H_q*D]` (post-projection
+        # flat view). Selection kernels need `[bs, H_q, D]`. Reshape here using
+        # the algorithm-known geometry.
+        if queries.dim() == 2:
+            queries = queries.view(
+                queries.shape[0], self.num_q_heads_local, self.head_dim
+            )
         select_fn = (
             ds_select_tokens_triton if queries.is_cuda else ds_select_tokens_torch_ref
         )

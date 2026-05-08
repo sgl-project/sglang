@@ -40,8 +40,17 @@ def _compute_q_label(
 ) -> torch.Tensor:
     """Gather S calibrated channels from Q and reduce across the GQA group.
 
-    Returns `[bs, num_kv_heads, S]` matching `K_label`'s head axis.
+    Returns `[bs, num_kv_heads, S]` matching `K_label`'s head axis. Expects
+    `queries` already in `[bs, H_q, D]` form — the wrapper in
+    `DoubleSparsityAlgorithm.retrieve_topk` reshapes from the 2D
+    `[bs, H_q*D]` form attention layers commonly produce.
     """
+    if queries.dim() != 3:
+        raise ValueError(
+            f"queries must be 3D [bs, H_q, D]; got shape {tuple(queries.shape)}. "
+            f"Use DoubleSparsityAlgorithm.retrieve_topk to reshape from "
+            f"the post-projection flat form."
+        )
     bs, h_q, d = queries.shape
     if h_q % num_kv_heads != 0:
         raise ValueError(

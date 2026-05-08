@@ -2915,6 +2915,18 @@ class ServerArgs:
                 f"({self.double_sparsity_max_selected_per_request}); otherwise dense-fallback "
                 f"rows would not fit the captured FA3 page-table."
             )
+        # v1 limitation: the selection path's per-request Python loop (with a
+        # `seq_lens[b].item()` host sync) is not stream-capture-safe. Auto-
+        # disable CUDA graph capture when DS is on; v1.1 vectorizes selection
+        # to remove this restriction. The FA3 metadata adaptor IS capture-safe
+        # (pinned by test_double_sparsity_adaptor.py::TestCudaGraphCaptureReplay).
+        if not self.disable_cuda_graph:
+            logger.warning(
+                "--enable-double-sparsity v1 requires --disable-cuda-graph "
+                "(selection path not yet vectorized; v1.1 will lift this). "
+                "Auto-setting --disable-cuda-graph=True."
+            )
+            self.disable_cuda_graph = True
 
     def _handle_amd_specifics(self):
         if is_hip():

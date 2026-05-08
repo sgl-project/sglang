@@ -101,7 +101,14 @@ class DSFlashAttentionAdaptor(FlashAttentionAdaptor):
             req_to_token,
             page_size,
         )
-        max_selected = physical.shape[1]
+        # Clamp to the captured page_table width — selected_indices is sized
+        # to `max_selected_per_request` (the static graph cap), but the
+        # page_table buffer is sized to whatever `max_seq_len_k` was when
+        # captured. They aren't always equal: FA3's metadata uses the
+        # actual max-pages-per-request seen at this step, which can be
+        # smaller than our cap.
+        max_selected = min(physical.shape[1], current_metadata.page_table.shape[1])
+        physical = physical[:, :max_selected]
 
         # Per-row mask: only update [: max_selected] for sparsified rows
         # whose entries are within their valid_length window.
