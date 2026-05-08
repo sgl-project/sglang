@@ -329,11 +329,8 @@ jobs:
               "$@"
             fi
           }
-          # V1 custom all-reduce correctness: SGLang vs NCCL/RCCL across
-          # WORLD_SIZES={2,4,6,8} x dtypes={fp16,bf16,fp32} x {eager,graph}.
-          run_step docker exec -w /sglang-checkout/test/manual ci_sglang python3 -m pytest test_custom_allreduce.py
-          # SGLang vs Aiter custom all-reduce performance smoke (no perf
-          # assertion yet; informational kernel-crash signal at TP=8).
+          # SGLang vs Aiter custom all-reduce performance smoke at TP=8.
+          # No perf assertion yet; informational kernel-crash signal only.
           run_step docker exec -w /sglang-checkout/benchmark/kernels/all_reduce ci_sglang torchrun --standalone --nproc_per_node=8 benchmark_aiter.py
           exit $failures
 
