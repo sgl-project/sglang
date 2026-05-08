@@ -42,16 +42,9 @@ from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     maybe_remap_kv_scale_name,
 )
-from sglang.srt.utils import (
-    add_prefix,
-    cpu_has_amx_support,
-    is_cpu,
-    is_npu,
-    make_layers,
-)
+from sglang.srt.utils import add_prefix, cpu_has_amx_support, is_cpu, make_layers
 
 _is_cpu = is_cpu()
-_is_npu = is_npu()
 _is_cpu_amx_available = cpu_has_amx_support()
 
 
@@ -580,17 +573,11 @@ class Gemma3TextModel(PreTrainedModel):
             local_theta = getattr(config, "rope_local_base_freq", 10000.0)
 
         global_config = copy.deepcopy(config)
-        if not _is_npu:
-            global_config.rope_parameters = {
-                "rope_type": "default",
-                "rope_theta": global_theta,
-            }
-        else:
-            global_config.rope_parameters = {
-                "rope_theta": global_theta,
-                "factor": 8,
-                "rope_type": "linear",
-            }
+        global_config.rope_parameters = {
+            "rope_theta": global_theta,
+            "factor": config.rope_parameters['full_attention']['factor'],
+            "rope_type": "linear",
+        }
         self.rotary_emb = Gemma3RotaryEmbedding(config=global_config)
         self.gradient_checkpointing = False
 
