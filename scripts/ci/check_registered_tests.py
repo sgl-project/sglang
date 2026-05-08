@@ -26,7 +26,7 @@ def main() -> int:
     files = sorted(
         f
         for f in glob.glob("test/registered/**/*.py", recursive=True)
-        if not f.endswith("/conftest.py") and not f.endswith("/__init__.py")
+        if os.path.basename(f) not in ("conftest.py", "__init__.py")
     )
     if not files:
         return 0

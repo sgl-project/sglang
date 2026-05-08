@@ -7,6 +7,9 @@ from sglang.multimodal_gen.runtime.pipelines_core.diffusion_scheduler_utils impo
     clone_scheduler_runtime,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
+from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
+    StageParallelismType,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.ltx_2_denoising import (
     LTX2DenoisingStage,
 )
@@ -137,6 +140,14 @@ class LTX2RefinementStage(LTX2AVDenoisingStage):
                 memory_intensive=True,
             )
         ]
+
+    @property
+    def parallelism_type(self) -> StageParallelismType:
+        # Stage 2 is distilled and always runs with CFG disabled, so non-main
+        # CFG ranks should wait at a barrier rather than run a redundant forward.
+        if self.server_args.enable_cfg_parallel:
+            return StageParallelismType.MAIN_RANK_ONLY
+        return StageParallelismType.REPLICATED
 
     @staticmethod
     def _randn_like_with_batch_generators(

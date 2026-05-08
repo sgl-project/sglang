@@ -19,7 +19,6 @@ from sglang.test.test_utils import (
 register_cuda_ci(
     est_time=1048,
     suite="stage-c-test-8-gpu-h200",
-    disabled="Disabled due to #24268. Should be fixed soon.",
 )
 
 FULL_DEEPSEEK_V32_MODEL_PATH = "deepseek-ai/DeepSeek-V3.2"
