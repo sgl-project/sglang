@@ -518,9 +518,10 @@ class Qwen3_5GatedDeltaNet(nn.Module):
 
     def _forward_input_proj(self, hidden_states: torch.Tensor):
         # AMD/aiter fused AR+RMSNorm+per-group-quant path ships a
-        # ``(bf16, fp8, scale)`` 3-tuple. FP8 projections can consume
-        # ``(fp8, scale)`` directly; non-FP8 projections use the bf16 side-output.
-        # Non-aiter runs skip the tuple branch and keep the original control flow.
+        # ``(bf16, fp8, scale)`` 3-tuple so the FP8 ``in_proj_qkvz`` can
+        # consume ``(fp8, scale)`` (skipping its internal quant) while the
+        # bf16 ``in_proj_ba`` consumes the unquantized bf16. Non-aiter runs skip
+        # the tuple branch and keep the original control flow below unchanged.
         if _use_aiter and isinstance(hidden_states, tuple):
             return self._forward_input_proj_fused_quant_amd(hidden_states)
 
