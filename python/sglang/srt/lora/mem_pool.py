@@ -227,6 +227,16 @@ class LoRAMemoryPool:
             or 1
         )
 
+    @staticmethod
+    def _has_moe_module(base_model: torch.nn.Module) -> bool:
+        # Config-only detection isn't reliable: some dense configs (e.g.
+        # `Qwen3_5TextConfig`) inherit `num_experts > 1` from an MoE parent.
+        # Walk the loaded model for an actual FusedMoE instance before we
+        # commit to allocating 4D per-expert LoRA buffers.
+        from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+
+        return any(isinstance(m, FusedMoE) for m in base_model.modules())
+
     def _get_num_local_experts(self, base_model: torch.nn.Module) -> int:
         """Experts owned by this rank. Equals the global count when EP is
         off, the runner keeps global IDs, or the split isn't even (all
@@ -285,7 +295,7 @@ class LoRAMemoryPool:
         input_dim, _ = get_hidden_dim(
             module_name, self.base_hf_config, base_model, layer_idx
         )
-        c = get_stacked_multiply(module_name)
+        c = get_stacked_multiply(module_name, base_model)
         if self.tp_size > 1 and module_name in ROW_PARALLELISM_LINEAR_LORA_NAMES:
             input_dim = divide(input_dim, self.tp_size)
         return (self.max_loras_per_batch, max_lora_dim * c, input_dim)
@@ -307,7 +317,7 @@ class LoRAMemoryPool:
         input_dim, _ = get_hidden_dim(
             module_name, self.base_hf_config, base_model, layer_idx
         )
-        c = get_stacked_multiply(module_name)
+        c = get_stacked_multiply(module_name, base_model)
         # MoE modules shard along `moe_tp_size`, not the outer `tp_size`.
         effective_tp_size = (
             self.moe_tp_size if self.is_moe_module(module_name) else self.tp_size
@@ -350,6 +360,41 @@ class LoRAMemoryPool:
             input_dim,
         )
 
+    def _column_parallel_lora_b_per_rank_dim(
+        self,
+        module_name: str,
+        total_output_dim: int,
+        effective_tp_size: int,
+    ) -> int:
+        """Per-rank LoRA B output dim for column-parallel modules.
+
+        For most modules this is just an even split. For ``qkv_proj`` when
+        ``effective_tp_size > num_key_value_heads``, the underlying
+        :class:`QKVParallelLinear` *replicates* each KV head across
+        ``tp_size // num_kv_heads`` ranks instead of dividing further, so
+        each rank owns ``head_dim`` of K/V (not ``head_dim * num_kv_heads
+        / tp_size``). A naive ``divide(total, tp_size)`` undersizes the
+        buffer and produces a shape mismatch when the
+        :meth:`QKVParallelLinearWithLoRA.slice_lora_b_weights` slice runs.
+        """
+        if module_name != "qkv_proj":
+            return divide(total_output_dim, effective_tp_size)
+
+        cfg = self.base_hf_config
+        if hasattr(cfg, "get_text_config"):
+            cfg = cfg.get_text_config()
+        num_kv_heads = getattr(cfg, "num_key_value_heads", None)
+        if num_kv_heads is None or num_kv_heads >= effective_tp_size:
+            return divide(total_output_dim, effective_tp_size)
+
+        head_dim = getattr(cfg, "head_dim", None) or (
+            cfg.hidden_size // cfg.num_attention_heads
+        )
+        kv_dim_total = 2 * num_kv_heads * head_dim
+        q_dim_total = total_output_dim - kv_dim_total
+        q_per_rank = divide(q_dim_total, effective_tp_size)
+        return q_per_rank + 2 * head_dim
+
     def get_lora_B_shape(
         self,
         module_name: str,
@@ -376,7 +421,9 @@ class LoRAMemoryPool:
             and module_name not in ROW_PARALLELISM_LINEAR_LORA_NAMES
             and module_name not in REPLICATED_LINEAR_LORA_NAMES
         ):
-            output_dim = divide(output_dim, effective_tp_size)
+            output_dim = self._column_parallel_lora_b_per_rank_dim(
+                module_name, output_dim, effective_tp_size
+            )
 
         # Check if MoE module and return appropriate shape
         if self.is_moe_module(module_name):
@@ -411,6 +458,7 @@ class LoRAMemoryPool:
         )
 
     def init_buffers(self, base_model: torch.nn.Module):
+        self.base_model = base_model
         device = next(base_model.parameters()).device
 
         # Cached once so the per-expert load path doesn't re-walk the HF
@@ -429,7 +477,7 @@ class LoRAMemoryPool:
                 hasattr(cfg, "shared_expert_intermediate_size")
                 and cfg.shared_expert_intermediate_size > 0
             ) or (getattr(cfg, "n_shared_experts", 0) or 0) > 0
-            has_moe = self._get_num_experts(base_model) > 1
+            has_moe = self._has_moe_module(base_model)
 
             # Shape functions automatically handle both 3D (standard) and 4D (MoE)
             target_modules = target_modules - set(EMBEDDING_NAMES)
@@ -742,6 +790,15 @@ class LoRAMemoryPool:
                     else:
                         temp_B_buffer[target_module] = weights
 
+            # Track which buffer keys correspond to a real wrapped module on
+            # this layer. `temp_A/B_buffer` is seeded with every key in the
+            # global `A/B_buffer` (union across all layer types), but a
+            # hybrid-architecture layer (e.g. Qwen3.5 linear-attn vs full-attn,
+            # or first-k-dense MoE) only owns a subset of those modules. The
+            # buffer-copy loops below skip non-owned keys to avoid the
+            # redundant zero-fills on slots no `update_lora_info` ever points
+            # a forward-time module at.
+            active_target_modules: Set[str] = set()
             cur_layer_modules = lora_modules[layer_id]
             for module_name, module in cur_layer_modules.items():
                 # TODO (Jonahcb): check if the code can be refactored to avoid the special handling for FusedMoEWithLoRA
@@ -749,13 +806,19 @@ class LoRAMemoryPool:
                 from sglang.srt.lora.layers import FusedMoEWithLoRA
 
                 if isinstance(module, FusedMoEWithLoRA):
+                    # Per-expert MoE weights are sharded along `moe_tp_size`
+                    # (= tp_size // ep_size // dp_size), so the slice index
+                    # must be `moe_tp_rank`. Passing the outer `tp_rank` here
+                    # produces an off-the-end slice when ep_size < tp_size
+                    # (e.g. tp=4 ep=2 → ranks 2,3 slice past intermediate_size).
                     moe_target_modules = ["gate_up_proj_moe", "down_proj_moe"]
                     for target_module in moe_target_modules:
+                        active_target_modules.add(target_module)
                         if temp_A_buffer.get(target_module) is not None:
                             temp_A_buffer[target_module] = (
                                 module.slice_moe_lora_a_weights(
                                     temp_A_buffer[target_module],
-                                    self.tp_rank,
+                                    self.moe_tp_rank,
                                     target_module,
                                 )
                             )
@@ -763,7 +826,7 @@ class LoRAMemoryPool:
                             temp_B_buffer[target_module] = (
                                 module.slice_moe_lora_b_weights(
                                     temp_B_buffer[target_module],
-                                    self.tp_rank,
+                                    self.moe_tp_rank,
                                     target_module,
                                 )
                             )
@@ -772,6 +835,11 @@ class LoRAMemoryPool:
 
                 # Handle regular modules
                 target_module = get_target_module_name(module_name, self.target_modules)
+                # Mark active even if the adapter has no weights for this
+                # module on this layer — the buffer still needs to be zeroed
+                # (so a previously-evicted adapter's weights don't leak into
+                # the new slot) and the wrapped layer module will read it.
+                active_target_modules.add(target_module)
 
                 if temp_A_buffer[target_module] is None:
                     # Skip weight slicing if the weight is not present in the adapter
@@ -786,7 +854,9 @@ class LoRAMemoryPool:
                 )
 
             for name, weights in temp_A_buffer.items():
-                c = get_stacked_multiply(name)
+                if name not in active_target_modules:
+                    continue
+                c = get_stacked_multiply(name, self.base_model)
                 max_r = self.max_lora_rank
                 target_buffer = self.A_buffer[name][layer_id]
 
@@ -874,6 +944,8 @@ class LoRAMemoryPool:
                     load_lora_weight_tensor(buffer_view, weights)
 
             for name, weights in temp_B_buffer.items():
+                if name not in active_target_modules:
+                    continue
                 target_buffer = self.B_buffer[name][layer_id]
 
                 if name in ["gate_up_proj_moe", "down_proj_moe"]:
