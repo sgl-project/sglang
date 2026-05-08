@@ -206,6 +206,14 @@ class Mamba2Metadata(ForwardMetadata):
         prep_initial_states = torch.any(has_initial_states[:num_prefills]).item()
 
         query_start_loc = forward_metadata.query_start_loc[: num_prefills + 1]
+        # `forward_batch.extend_num_tokens` may be padded for DP-attention
+        # collective alignment, while `query_start_loc` is built from real
+        # per-seq lengths. Mamba kernels require `cu_seqlens.last() == seq_len`
+        # (the input shape they operate on). Use the real count here so the
+        # kernel's `output_size` matches `query_start_loc.diff().sum()`.
+        num_prefill_tokens = int(
+            (query_start_loc[-1] - query_start_loc[0]).item()
+        )
         seq_idx = torch.repeat_interleave(
             torch.arange(
                 num_prefills, dtype=torch.int32, device=query_start_loc.device
