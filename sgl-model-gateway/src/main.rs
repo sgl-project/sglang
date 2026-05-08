@@ -8,7 +8,8 @@ use smg::{
         CircuitBreakerConfig, ConfigError, ConfigResult, DiscoveryConfig, HealthCheckConfig,
         HistoryBackend, ManualAssignmentMode, MetricsConfig, OracleConfig, PolicyConfig,
         PostgresConfig, RedisConfig, RetryConfig, RouterConfig, RoutingMode, TokenizerCacheConfig,
-        TraceConfig,
+        TraceConfig, DEFAULT_CONNECT_TIMEOUT_SECS, DEFAULT_POOL_IDLE_TIMEOUT_SECS,
+        DEFAULT_POOL_MAX_IDLE_PER_HOST, DEFAULT_TCP_KEEPALIVE_SECS,
     },
     core::ConnectionMode,
     observability::{
@@ -297,6 +298,43 @@ struct CliArgs {
     /// CORS allowed origins
     #[arg(long, num_args = 0.., help_heading = "Request Handling")]
     cors_allowed_origins: Vec<String>,
+
+    // ==================== HTTP Client ====================
+    /// Idle timeout in seconds for pooled upstream HTTP connections
+    #[arg(
+        long,
+        env = "SMG_POOL_IDLE_TIMEOUT_SECS",
+        default_value_t = DEFAULT_POOL_IDLE_TIMEOUT_SECS,
+        help_heading = "HTTP Client"
+    )]
+    pool_idle_timeout_secs: u64,
+
+    /// Timeout in seconds for new upstream HTTP connections
+    #[arg(
+        long,
+        env = "SMG_CONNECT_TIMEOUT_SECS",
+        default_value_t = DEFAULT_CONNECT_TIMEOUT_SECS,
+        help_heading = "HTTP Client"
+    )]
+    connect_timeout_secs: u64,
+
+    /// Maximum idle upstream HTTP connections to keep per host
+    #[arg(
+        long,
+        env = "SMG_POOL_MAX_IDLE_PER_HOST",
+        default_value_t = DEFAULT_POOL_MAX_IDLE_PER_HOST,
+        help_heading = "HTTP Client"
+    )]
+    pool_max_idle_per_host: usize,
+
+    /// TCP keepalive idle time in seconds for upstream HTTP connections
+    #[arg(
+        long,
+        env = "SMG_TCP_KEEPALIVE_SECS",
+        default_value_t = DEFAULT_TCP_KEEPALIVE_SECS,
+        help_heading = "HTTP Client"
+    )]
+    tcp_keepalive_secs: u64,
 
     // ==================== Rate Limiting ====================
     /// Maximum concurrent requests (-1 to disable)
@@ -972,6 +1010,10 @@ impl CliArgs {
             .request_timeout_secs(self.request_timeout_secs)
             .worker_startup_timeout_secs(self.worker_startup_timeout_secs)
             .worker_startup_check_interval_secs(self.worker_startup_check_interval)
+            .pool_idle_timeout_secs(self.pool_idle_timeout_secs)
+            .connect_timeout_secs(self.connect_timeout_secs)
+            .pool_max_idle_per_host(self.pool_max_idle_per_host)
+            .tcp_keepalive_secs(self.tcp_keepalive_secs)
             .max_concurrent_requests(self.max_concurrent_requests)
             .queue_size(self.queue_size)
             .queue_timeout_secs(self.queue_timeout_secs)
