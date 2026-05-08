@@ -10,6 +10,7 @@ from sglang.srt.multimodal.processors.base_processor import (
 
 class DeepseekOCRProcessor(BaseMultimodalProcessor):
     models = [DeepseekOCRForCausalLM]
+    gpu_image_decode = False
 
     def __init__(self, hf_config, server_args, _processor, *args, **kwargs):
         _processor.image_size = 640
