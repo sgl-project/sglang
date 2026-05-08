@@ -418,12 +418,20 @@ class TestPermutedPhysical(CustomTestCase):
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
-class TestTritonParity(CustomTestCase):
-    """The Triton entry point dispatches to the torch ref in v1, so parity
-    is mechanical — but the test will catch regressions when the kernel body
-    is replaced in v1.1."""
+class TestTritonRecallVsCpuRef(CustomTestCase):
+    """v1.1: ds_select_tokens_triton is the two-stage block-topk + score-
+    aware union pipeline. It is APPROXIMATE by construction (per-block
+    K_block cap), so it must NOT match the CPU exact-topk reference.
+    The block-topk-vs-exact-topk recall floors are verified per-stage in
+    test_double_sparsity_stage1.py / stage2 / union; this test only
+    pins overlap >= 50% between the CUDA pipeline and the CPU oracle on
+    a high-capacity config — a sanity floor that catches catastrophic
+    regressions without demanding exact equality."""
 
-    def test_cuda_path_matches_cpu_ref(self):
+    def test_cuda_path_overlaps_cpu_ref(self):
+        # Pick BLOCK_T and K_BLOCK so num_blocks * K_BLOCK >= token_budget
+        # (capacity-sufficient regime), then the two-stage pipeline should
+        # find most of the same top picks the CPU exact-topk does.
         bs, h_q, h_kv, d, s, max_ctx, T = 2, 8, 4, 32, 8, 64, 256
         cpu_args = _alloc(
             seed=7,
@@ -458,6 +466,7 @@ class TestTritonParity(CustomTestCase):
             seq_lens=cpu_args[5],
             **kw,
         )
+        # 16 blocks of BLOCK_T=4, K_BLOCK=4 → 64 candidates >> token_budget=8.
         out_cuda, val_cuda = ds_select_tokens_triton(
             queries=cuda_args[0],
             channel_idx=cuda_args[1],
@@ -465,15 +474,22 @@ class TestTritonParity(CustomTestCase):
             req_to_token=cuda_args[3],
             req_pool_indices=cuda_args[4],
             seq_lens=cuda_args[5],
+            block_t=4,
+            k_block=4,
             **kw,
         )
-        self.assertTrue(torch.equal(val_cpu, val_cuda.cpu()))
+        # Sanity floor — both paths find at least half the same logical tokens.
         for b in range(bs):
-            n = int(val_cpu[b])
-            self.assertEqual(
-                set(int(x) for x in out_cpu[b, :n].tolist()),
-                set(int(x) for x in out_cuda.cpu()[b, :n].tolist()),
-            )
+            cpu_set = set(int(x) for x in out_cpu[b].tolist() if int(x) >= 0)
+            cuda_set = set(int(x) for x in out_cuda[b].cpu().tolist() if int(x) >= 0)
+            if cpu_set:
+                overlap = len(cpu_set & cuda_set) / len(cpu_set)
+                self.assertGreaterEqual(
+                    overlap,
+                    0.5,
+                    f"row {b}: cuda picks overlap with cpu ref < 50%; "
+                    f"cpu={sorted(cpu_set)} cuda={sorted(cuda_set)} overlap={overlap:.2f}",
+                )
 
 
 if __name__ == "__main__":

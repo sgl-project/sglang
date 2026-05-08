@@ -182,30 +182,13 @@ def ds_select_tokens_torch_ref(
     max_selected: int,
     gqa_reduction_id: int,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Pure-torch selection. Returns (selected_logical[bs, max_selected], valid_lengths[bs]).
+    """Pure-torch CPU oracle for the full selection pipeline.
 
-    Used as the test oracle (CPU) and dispatched-to via `ds_select_tokens_triton`
-    on CUDA. The CPU path uses a small per-request loop because the
-    fixture sizes don't justify vectorization; the CUDA path
-    (`ds_select_tokens_torch_ref_vectorized`) is fully vectorized to avoid
-    the Python loop's dominant overhead at production batch sizes.
+    **NOT a perf path.** Per-request Python loop with `seq_lens[b].item()`
+    host syncs — used only by tests and CPU-only environments. The
+    production CUDA path is `ds_select_tokens_triton` (two-stage Triton
+    block-topk + score-aware union) in `select_triton.py`.
     """
-    if queries.is_cuda:
-        return ds_select_tokens_torch_ref_vectorized(
-            queries=queries,
-            channel_idx=channel_idx,
-            k_label_layer=k_label_layer,
-            req_to_token=req_to_token,
-            req_pool_indices=req_pool_indices,
-            seq_lens=seq_lens,
-            num_kv_heads=num_kv_heads,
-            token_budget=token_budget,
-            recent_tokens=recent_tokens,
-            sink_tokens=sink_tokens,
-            min_seq_len=min_seq_len,
-            max_selected=max_selected,
-            gqa_reduction_id=gqa_reduction_id,
-        )
     bs = queries.shape[0]
     device = queries.device
 
@@ -241,109 +224,6 @@ def ds_select_tokens_torch_ref(
     return out, valid
 
 
-def ds_select_tokens_torch_ref_vectorized(
-    *,
-    queries: torch.Tensor,
-    channel_idx: torch.Tensor,
-    k_label_layer: torch.Tensor,
-    req_to_token: torch.Tensor,
-    req_pool_indices: torch.Tensor,
-    seq_lens: torch.Tensor,
-    num_kv_heads: int,
-    token_budget: int,
-    recent_tokens: int,
-    sink_tokens: int,
-    min_seq_len: int,
-    max_selected: int,
-    gqa_reduction_id: int,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Fully vectorized GPU selection — no Python per-request loop, no `.item()`.
-
-    Algorithm (all batched):
-      1. Q_label = gather + GQA reduce → `[bs, H_kv, S]`.
-      2. phys_tokens = `req_to_token[req_pool_indices]` → `[bs, max_ctx]`.
-      3. K_label gather: `K_label[phys_tokens]` → `[bs, max_ctx, H_kv, S]`.
-      4. scores = einsum + sum across heads → `[bs, max_ctx]`.
-      5. Mask history: positions `>= seq_len-1` → -inf; positions
-         `< sink_tokens` → +inf (force-include); positions in
-         `[seq_len-recent, seq_len)` → +inf (force-include).
-      6. Dense fallback: rows with `seq_len < min_seq_len` get
-         their full `[0, seq_len)` range force-included via +inf.
-      7. Top-k per row, sort ascending → final selected.
-
-    The +inf trick keeps everything in a single topk while giving sink/
-    recency priority — they outrank any history score.
-
-    Memory: K_label gather is `[bs, max_ctx, H_kv, S]` bf16 = bs * max_ctx
-    * 8 * 32 * 2 B per layer per step. For bs=4, max_ctx=64K: 134 MB
-    transient — large but fits H200; smaller models allocate proportionally.
-    """
-    bs = queries.shape[0]
-    device = queries.device
-    max_ctx = req_to_token.shape[1]
-
-    q_label = _compute_q_label(
-        queries,
-        channel_idx,
-        num_kv_heads=num_kv_heads,
-        gqa_reduction_id=gqa_reduction_id,
-    )  # [bs, H_kv, S]
-
-    # phys_tokens row per request: [bs, max_ctx]
-    phys = req_to_token[req_pool_indices.to(torch.long)].to(torch.long)
-    phys = phys.clamp(0, k_label_layer.shape[0] - 1)
-    # K_label gather → [bs, max_ctx, H_kv, S]
-    kl = k_label_layer[phys]
-    # Per-position scores, summed across kv_heads: [bs, max_ctx]
-    scores = (kl * q_label.unsqueeze(1)).sum(dim=(2, 3)).float()
-
-    pos = torch.arange(max_ctx, device=device).unsqueeze(0)  # [1, max_ctx]
-    seq = seq_lens.to(device).unsqueeze(1)  # [bs, 1]
-    valid_pos_mask = pos < seq
-    history_mask = pos < (seq - 1)  # exclude current decode position
-    sink_mask = (pos < sink_tokens) & valid_pos_mask
-    rec_start = (seq - recent_tokens).clamp_min(0)
-    recent_mask = (pos >= rec_start) & valid_pos_mask
-    dense_fallback = (seq < min_seq_len).expand_as(valid_pos_mask)
-
-    NEG_INF = float("-inf")
-
-    # Step 1: per-row top-`token_budget` over history scores only.
-    hist_scores = torch.where(history_mask, scores, torch.full_like(scores, NEG_INF))
-    k_hist = min(token_budget, max_ctx)
-    hist_top = hist_scores.topk(k_hist, dim=1, sorted=False).indices  # [bs, k_hist]
-
-    # Step 2: build the selected-positions bool mask:
-    #   sink ∪ recent ∪ history-topk ∪ (dense-fallback whole row)
-    selected = torch.zeros_like(valid_pos_mask)
-    selected.scatter_(1, hist_top, True)
-    # Drop history-topk slots that landed on -inf (row had < budget history).
-    # Equivalently: only keep topk hits that are inside `history_mask`.
-    selected = selected & history_mask
-    selected = selected | sink_mask | recent_mask | (dense_fallback & valid_pos_mask)
-
-    # Step 3: compact each row's selected positions in ascending order.
-    # Trick: replace each position with its index when selected, else +inf;
-    # sort ascending → selected positions come first (real ints), unselected
-    # become +inf at the end.
-    pos_or_inf = torch.where(
-        selected,
-        pos.expand(bs, max_ctx).float(),
-        torch.full((bs, max_ctx), float("inf"), device=device),
-    )
-    sorted_marks, _ = pos_or_inf.sort(dim=1)
-    # Take the first max_selected; finite entries are valid ascending
-    # logical positions, +inf entries become -1 padding.
-    trimmed = sorted_marks[:, :max_selected]
-    out = torch.where(
-        trimmed.isfinite(),
-        trimmed.to(torch.int32),
-        torch.full_like(trimmed, -1, dtype=torch.int32),
-    )
-    valid = trimmed.isfinite().sum(dim=1).to(torch.int32)
-    return out, valid
-
-
 def ds_select_tokens_triton(
     *,
     queries: torch.Tensor,
@@ -359,30 +239,68 @@ def ds_select_tokens_triton(
     min_seq_len: int,
     max_selected: int,
     gqa_reduction_id: int,
+    block_t: int = 1024,
+    k_block: int = 64,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """CUDA fast path. v1 dispatches to the torch reference implementation
-    operating on GPU tensors. The two-stage Triton kernel decomposition
-    (block scoring + merge) is reserved for v1.1 once M8 profiling shows
-    where the bottleneck actually lives — premature kernel work would
-    obscure FA3-side wins.
+    """CUDA perf path — two-stage block-topk + score-aware union.
 
-    The interface and semantics are identical to `ds_select_tokens_torch_ref`,
-    so the v1.1 swap is a single function-body change behind this entry point.
+    Pipeline (matches the v1.1 plan):
+      1. Stage 1: per (bs, kv_head, block) Triton program scores a
+         BLOCK_T-token tile of K_label and emits local top-K_BLOCK
+         (logical, score) pairs. Bounded by per-row seq_lens.
+      2. Stage 2: per (bs, kv_head) Triton program merges
+         num_blocks * K_BLOCK candidates down to effective_budget by
+         score.
+      3. Union: per-batch torch-on-CUDA pass deduplicates across
+         kv_heads (max-score merge), drops always-keep overlaps,
+         caps to max_selected_per_request by SCORE (never logical
+         position), appends sink + recency, sorts logical-ascending.
+
+    All capture-safe: stage-1/2 are static-grid Triton; union is
+    bounded-shape torch with preallocated outputs (capacity-guarded
+    by `DoubleSparsityRuntimeConfig.warn_capacity` at startup).
     """
     if not queries.is_cuda:
         raise RuntimeError("ds_select_tokens_triton requires CUDA tensors")
-    return ds_select_tokens_torch_ref(
+
+    from sglang.srt.mem_cache.sparsity.triton_ops.select_triton import (
+        ds_select_stage1_block_topk,
+        ds_select_stage2_merge,
+        ds_union_per_batch,
+    )
+
+    max_ctx = req_to_token.shape[1]
+    num_blocks = (max_ctx + block_t - 1) // block_t
+    effective_budget = min(token_budget, num_blocks * k_block)
+
+    # Stage 1
+    block_topk_logical, block_topk_scores = ds_select_stage1_block_topk(
         queries=queries,
         channel_idx=channel_idx,
-        k_label_layer=k_label_layer,
+        k_label=k_label_layer,
         req_to_token=req_to_token,
         req_pool_indices=req_pool_indices,
         seq_lens=seq_lens,
         num_kv_heads=num_kv_heads,
-        token_budget=token_budget,
-        recent_tokens=recent_tokens,
-        sink_tokens=sink_tokens,
-        min_seq_len=min_seq_len,
-        max_selected=max_selected,
+        block_t=block_t,
+        k_block=k_block,
         gqa_reduction_id=gqa_reduction_id,
+    )
+
+    # Stage 2
+    merged_logical, merged_scores = ds_select_stage2_merge(
+        block_topk_logical=block_topk_logical,
+        block_topk_scores=block_topk_scores,
+        effective_budget=effective_budget,
+    )
+
+    # Union
+    return ds_union_per_batch(
+        merged_logical=merged_logical,
+        merged_scores=merged_scores,
+        seq_lens=seq_lens,
+        sink_tokens=sink_tokens,
+        recent_tokens=recent_tokens,
+        min_seq_len=min_seq_len,
+        max_selected_per_request=max_selected,
     )

@@ -317,11 +317,10 @@ class DoubleSparsityAlgorithm(BaseSparseAlgorithm):
         adaptor (M4) maps logical → physical via `req_to_token`, preserves
         logical order (no physical sort), and writes the FA3 page-table.
 
-        v1: per-KV-head scoring + GQA reduction → per-batch union; CUDA path
-        currently dispatches to the torch reference (correct, parity-tested).
-        v1.1 will replace the body of `ds_select_tokens_triton` with the
-        block-decomposed Triton kernel once M8 profiling identifies the
-        actual hotspot.
+        v1.1: CUDA → two-stage block-topk Triton + score-aware torch union
+        (`ds_select_tokens_triton` in select_kernels.py dispatches to the
+        select_triton.py pipeline). CPU → per-request torch reference
+        (oracle only, never on the production path).
         """
         forward_batch = kwargs.get("forward_batch")
         if forward_batch is None:
@@ -336,10 +335,27 @@ class DoubleSparsityAlgorithm(BaseSparseAlgorithm):
             queries = queries.view(
                 queries.shape[0], self.num_q_heads_local, self.head_dim
             )
-        select_fn = (
-            ds_select_tokens_triton if queries.is_cuda else ds_select_tokens_torch_ref
-        )
-        return select_fn(
+
+        if queries.is_cuda:
+            return ds_select_tokens_triton(
+                queries=queries,
+                channel_idx=self.channel_indices[layer_id],
+                k_label_layer=self.k_label[layer_id],
+                req_to_token=self.req_to_token_pool.req_to_token,
+                req_pool_indices=req_pool_indices,
+                seq_lens=seq_lens,
+                num_kv_heads=self.num_kv_heads_local,
+                token_budget=self.runtime_config.token_budget,
+                recent_tokens=self.runtime_config.recent_tokens,
+                sink_tokens=self.runtime_config.sink_tokens,
+                min_seq_len=self.runtime_config.min_seq_len,
+                max_selected=self.runtime_config.max_selected_per_request,
+                gqa_reduction_id=gqa_reduction_id(self.runtime_config.gqa_reduction),
+                block_t=self.runtime_config.block_t,
+                k_block=self.runtime_config.k_block,
+            )
+
+        return ds_select_tokens_torch_ref(
             queries=queries,
             channel_idx=self.channel_indices[layer_id],
             k_label_layer=self.k_label[layer_id],
