@@ -48,6 +48,7 @@ from sglang.srt.managers.schedule_batch import (
     Req,
     ScheduleBatch,
 )
+from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.mem_cache.common import (
     kv_to_page_indices,
     kv_to_page_num,
@@ -55,7 +56,6 @@ from sglang.srt.mem_cache.common import (
     release_kv_cache,
 )
 from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, NSATokenToKVPool
-from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.observability.req_time_stats import set_schedule_time_batch
 
 if TYPE_CHECKING:
@@ -478,6 +478,9 @@ class SchedulerDisaggregationPrefillMixin:
         if result.routed_experts_output is not None:
             result.routed_experts_output.finalize()
             result.routed_experts_output = None
+        if result.indexer_topk_output is not None:
+            result.indexer_topk_output.finalize()
+            result.indexer_topk_output = None
 
         logprob_pt = 0
         # Transfer kv for prefill completed requests and add it into disagg_prefill_inflight_queue
@@ -569,6 +572,7 @@ class SchedulerDisaggregationPrefillMixin:
 
         can_run_cuda_graph = getattr(result, "can_run_cuda_graph", False)
         self.report_prefill_stats(
+            batch=batch,
             prefill_stats=batch.prefill_stats,
             can_run_cuda_graph=can_run_cuda_graph,
             dp_cooperation_info=batch.dp_cooperation_info,
@@ -651,19 +655,16 @@ class SchedulerDisaggregationPrefillMixin:
         for req in done_reqs:
             req.time_stats.set_completion_time()
 
-        page_size = self.token_to_kv_pool_allocator.page_size
-        kv_item_lens = (
-            self.disagg_prefill_bootstrap_queue.kv_manager.kv_args.kv_item_lens
-        )
-        bytes_per_page_all_layers = sum(kv_item_lens)
-
         for req in done_reqs:
             if isinstance(req.finished_reason, FINISH_ABORT):
                 continue
+            if req.bootstrap_host == FAKE_BOOTSTRAP_HOST:
+                continue
+            kv_mgr = getattr(req.disagg_kv_sender, "kv_mgr", None)
+            if kv_mgr and getattr(kv_mgr, "is_dummy_cp_rank", False):
+                continue
             metrics = req.time_stats.compute_and_observe_kv_transfer_metrics(
-                num_tokens=len(req.origin_input_ids),
-                page_size=page_size,
-                bytes_per_page_all_layers=bytes_per_page_all_layers,
+                req.disagg_kv_sender.get_transfer_metric()
             )
             if metrics:
                 # Update last-value for REST API
@@ -786,7 +787,9 @@ class SchedulerDisaggregationPrefillMixin:
                     .cpu()
                     .numpy()
                 ]
-            elif isinstance(self.token_to_kv_pool_allocator.get_kvcache(), SWAKVPool):
+            elif isinstance(
+                self.token_to_kv_pool_allocator.get_kvcache(), BaseSWAKVPool
+            ):
                 # SWA hybrid model: send last window KV indices
                 seq_len = len(req.fill_ids)
                 window_size = self.sliding_window_size

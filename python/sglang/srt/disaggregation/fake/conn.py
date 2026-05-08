@@ -10,6 +10,7 @@ from sglang.srt.disaggregation.base.conn import (
     BaseKVSender,
     KVArgs,
     KVPoll,
+    KVTransferMetric,
 )
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.server_args import ServerArgs
@@ -53,6 +54,9 @@ class FakeKVSender(BaseKVSender):
             # Assume transfer completed instantly
             logger.debug("FakeKVSender poll success")
             return KVPoll.Success
+
+    def get_transfer_metric(self) -> KVTransferMetric:
+        return KVTransferMetric()
 
     def init(
         self,
