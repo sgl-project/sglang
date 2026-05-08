@@ -7,7 +7,7 @@ from sglang.test.server_fixtures.default_fixture import DefaultServerBase
 from sglang.test.server_fixtures.mmmu_fixture import MMMUServerBase
 
 register_cuda_ci(
-    est_time=200,
+    est_time=370,
     suite="stage-b-test-2-gpu-large",
 )
 
