@@ -129,11 +129,6 @@ class BreakableCudaGraphRunner:
             else language_model
         )
 
-        # Counters (debug). Logged periodically to verify multi-batch prefill
-        # actually stays on graph instead of falling back to eager.
-        self._replay_count = 0
-        self._can_run_reject_count = 0
-
         # Memory pool
         if get_global_graph_memory_pool() is None:
             set_global_graph_memory_pool(self.device_module.graph_pool_handle())
@@ -335,18 +330,14 @@ class BreakableCudaGraphRunner:
                 self.output_buffers[num_tokens] = output
 
     def can_run(self, forward_batch: "ForwardBatch"):
-        # Multi-req prefill is handled natively now: the captured graph covers
-        # only the token-major layer stack (logits_processor runs eagerly), so
-        # batch_size > 1 is fine — replay passes live bs-shaped tensors through
-        # set_forward_context for the attention/mamba breaks.
+        # Captured graph spans only the token-major layer stack, so bs > 1 is
+        # fine — replay passes live bs-shaped tensors via set_forward_context
+        # for the attention/mamba breaks.
         if forward_batch.forward_mode.is_target_verify():
-            self._can_run_reject_count += 1
             return False
         if forward_batch.input_embeds is not None:
-            self._can_run_reject_count += 1
             return False
         if forward_batch.replace_embeds is not None:
-            self._can_run_reject_count += 1
             return False
         num_tokens = len(forward_batch.input_ids)
         if forward_batch.return_logprob:
@@ -355,12 +346,8 @@ class BreakableCudaGraphRunner:
                 forward_batch.extend_seq_lens_cpu,
             ):
                 if start_len is not None and start_len < seq_len:
-                    self._can_run_reject_count += 1
                     return False
-        if num_tokens > self.max_num_tokens:
-            self._can_run_reject_count += 1
-            return False
-        return True
+        return num_tokens <= self.max_num_tokens
 
     def _capture_one(self, num_tokens, pool, stream):
         """Capture a breakable CUDA graph for one token size."""
@@ -386,14 +373,6 @@ class BreakableCudaGraphRunner:
         forward_batch: ForwardBatch,
         **kwargs,
     ) -> Union[LogitsProcessorOutput, PPProxyTensors, EmbeddingPoolerOutput]:
-        self._replay_count += 1
-        if self._replay_count % 100 == 0:
-            log_info_on_rank0(
-                logger,
-                f"[BCG] replays={self._replay_count} "
-                f"can_run_rejects={self._can_run_reject_count}",
-            )
-
         num_tokens = len(forward_batch.input_ids)
         index = bisect.bisect_left(self.capture_num_tokens, num_tokens)
         static_num_tokens = self.capture_num_tokens[index]
