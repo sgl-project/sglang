@@ -1,7 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import unittest
+from base64 import b64encode
+from io import BytesIO
 from types import SimpleNamespace
+
+from PIL import Image
 
 from sglang.omni.backends.srt import SRTARBackend
 from sglang.omni.protocol import GeneratedSegment, OmniInputSegment, OmniRequest
@@ -62,6 +66,25 @@ class TestOmniSRTBackend(unittest.TestCase):
         self.assertEqual("image", first.type)
         self.assertEqual("done", second.type)
         self.assertEqual(1, bridge.commit_count)
+
+    def test_image_payload_accepts_b64_json(self):
+        bridge = _ImageCaptureBridge()
+        backend = SRTARBackend(bridge)
+        request = OmniRequest(
+            messages=(
+                OmniInputSegment(type="text", text="describe"),
+                OmniInputSegment(
+                    type="image",
+                    image={"b64_json": _tiny_png_b64(), "mime_type": "image/png"},
+                ),
+            ),
+            mode="t2i",
+        )
+
+        backend.prepare_context(request)
+
+        self.assertEqual((2, 2), bridge.images[0].size)
+        self.assertEqual("RGB", bridge.images[0].mode)
 
     def test_vlm_mode_returns_text_and_releases_session(self):
         bridge = _FakeVLMBridge()
@@ -151,6 +174,25 @@ class _FakeVLMBridge:
             next_token_ids=(3, 4),
             position_ids=(5, 6),
         )
+
+
+class _ImageCaptureBridge(_FakeBridge):
+    def __init__(self):
+        super().__init__(pre_image_segments=[])
+        self.images = []
+
+    def prepare_u_context_from_messages(self, **kwargs):
+        for message in kwargs["messages"]:
+            if message["type"] == "image":
+                self.images.append(message["image"])
+        return super().prepare_u_context_from_messages(**kwargs)
+
+
+def _tiny_png_b64():
+    image = Image.new("RGB", (2, 2), (255, 0, 0))
+    buffer = BytesIO()
+    image.save(buffer, format="PNG")
+    return b64encode(buffer.getvalue()).decode("ascii")
 
 
 if __name__ == "__main__":

@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import base64
 from dataclasses import dataclass
+from io import BytesIO
 from types import SimpleNamespace
 from typing import Any
 
@@ -173,7 +175,23 @@ class SRTARBackend:
 def _to_legacy_message(message: OmniInputSegment) -> dict[str, Any]:
     if message.type == "text":
         return {"type": "text", "text": message.text or ""}
-    return {"type": message.type, message.type: getattr(message, message.type)}
+    value = getattr(message, message.type)
+    if message.type == "image":
+        value = _decode_image_payload(value)
+    return {"type": message.type, message.type: value}
+
+
+def _decode_image_payload(image: Any) -> Any:
+    if not isinstance(image, dict):
+        return image
+    b64_json = image.get("b64_json") or image.get("base64")
+    if b64_json is None:
+        return image
+    if isinstance(b64_json, str) and "," in b64_json:
+        b64_json = b64_json.split(",", 1)[1]
+    from PIL import Image
+
+    return Image.open(BytesIO(base64.b64decode(b64_json))).convert("RGB")
 
 
 def _coerce_boundary(boundary: Any) -> OmniBoundary:
