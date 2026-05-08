@@ -1,11 +1,16 @@
+"""Archived test classes split out of test/registered/mla/test_mla_flashinfer.py.
+
+Originally registered with `register_cuda_ci(...)`. Moved here as part of
+the per-commit pruning effort to keep the code reachable manually.
+Run with `python3 test/manual/mla/test_mla_flashinfer_archived.py`.
+"""
+
 import unittest
 from types import SimpleNamespace
 
-import requests
 import torch
 
 from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -14,11 +19,9 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
+
 # FlashInfer MLA backend tests with MTP speculative decoding
-register_cuda_ci(est_time=130, suite="stage-b-test-1-gpu-large")
-
-
-class TestFlashinferMLAMTP(CustomTestCase):
+class TestFlashinferMLA(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         cls.model = "lmsys/sglang-ci-dsv3-test"
@@ -27,18 +30,8 @@ class TestFlashinferMLAMTP(CustomTestCase):
         if torch.cuda.is_available() and torch.version.cuda:
             other_args.extend(
                 [
-                    "--cuda-graph-max-bs",
-                    "4",
                     "--enable-torch-compile",
-                    "--torch-compile-max-bs",
-                    "1",
-                    "--speculative-algorithm",
-                    "EAGLE",
-                    "--speculative-num-steps",
-                    "3",
-                    "--speculative-eagle-topk",
-                    "1",
-                    "--speculative-num-draft-tokens",
+                    "--cuda-graph-max-bs",
                     "4",
                     "--attention-backend",
                     "flashinfer",
@@ -56,8 +49,6 @@ class TestFlashinferMLAMTP(CustomTestCase):
         kill_process_tree(cls.process.pid)
 
     def test_gsm8k(self):
-        requests.get(self.base_url + "/flush_cache")
-
         args = SimpleNamespace(
             base_url=self.base_url,
             model=self.model,
@@ -70,14 +61,7 @@ class TestFlashinferMLAMTP(CustomTestCase):
         metrics = run_eval(args)
         print(metrics)
 
-        self.assertGreater(metrics["score"], 0.60)
-
-        server_info = requests.get(self.base_url + "/server_info").json()
-        avg_spec_accept_length = server_info["internal_states"][0][
-            "avg_spec_accept_length"
-        ]
-        print(f"{avg_spec_accept_length=}")
-        self.assertGreater(avg_spec_accept_length, 2.5)
+        self.assertGreater(metrics["score"], 0.615)
 
 
 if __name__ == "__main__":
