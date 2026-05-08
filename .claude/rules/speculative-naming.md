@@ -14,14 +14,12 @@ Use the verb form `accept` everywhere. Don't use the past-participle form `accep
 
 ## Rule 2 — The extra/bonus token is `bonus_token` / `bonus_tokens`
 
-The "+1" token that the target model always emits in addition to verifying drafts is the **bonus token**. Use the noun `bonus_token` and follow Rule 7 for shape: scalar form `bonus_token` for a single int (one request, kernel `tl.load` result), plural form `bonus_tokens` for any batched container (`[bs]` tensor, list of ints, kernel ptr argument that points to such an array).
+The "+1" token that the target model always emits in addition to verifying drafts is the **bonus token**. Use `bonus_token` / `bonus_tokens` per Rule 7.
 
 | Don't | Do |
 |---|---|
-| `verified_id` (scalar) | `bonus_token` |
-| `verified_ids` (`[bs]` tensor) | `bonus_tokens` |
-| `output_id` (when referring to the bonus, scalar) | `bonus_token` |
-| `output_ids` (when referring to the batched bonus) | `bonus_tokens` |
+| `verified_id` / `verified_ids` | `bonus_token` / `bonus_tokens` |
+| `output_id` / `output_ids` (when referring to the bonus) | `bonus_token` / `bonus_tokens` |
 
 `req.output_ids` (the full output history of a request) is unrelated and stays as is.
 
