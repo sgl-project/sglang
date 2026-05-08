@@ -330,9 +330,6 @@ class BreakableCudaGraphRunner:
                 self.output_buffers[num_tokens] = output
 
     def can_run(self, forward_batch: "ForwardBatch"):
-        # Captured graph spans only the token-major layer stack, so bs > 1 is
-        # fine — replay passes live bs-shaped tensors via set_forward_context
-        # for the attention/mamba breaks.
         if forward_batch.forward_mode.is_target_verify():
             return False
         if forward_batch.input_embeds is not None:
