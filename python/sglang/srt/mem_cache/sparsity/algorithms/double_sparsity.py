@@ -21,6 +21,10 @@ from sglang.srt.mem_cache.sparsity.algorithms.double_sparsity_config import (
     torch_dtype_for_klabel,
     validate_against_model,
 )
+from sglang.srt.mem_cache.sparsity.triton_ops.k_label_kernels import (
+    ds_compute_k_label_torch_ref,
+    ds_compute_k_label_write,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -155,14 +159,113 @@ class DoubleSparsityAlgorithm(BaseSparseAlgorithm):
         req_to_token_pool,
         states,
     ) -> None:
-        """Allocate K_label side cache. Real allocation arrives in M2."""
+        """Allocate per-layer K_label side cache.
+
+        Shape per layer: `[num_tokens_in_pool, num_kv_heads_local, S]`. Memory is
+        ~12% on top of the KV pool when `S/D ≈ 32/128` and is owned by this
+        algorithm (we deliberately do not touch `MHATokenToKVPool`).
+        """
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool = token_to_kv_pool
         self.states = states
         self.start_layer = start_layer
         self.end_layer = end_layer
-        # M2 will allocate self.k_label[layer_id] of shape
-        # [num_tokens_in_pool, num_kv_heads_local, S] with self.klabel_dtype.
+
+        num_tokens_in_pool = token_to_kv_pool.get_key_buffer(start_layer).shape[0]
+        S = self.runtime_config.heavy_channels
+        for layer_id in range(start_layer, end_layer):
+            self.k_label[layer_id] = torch.zeros(
+                (num_tokens_in_pool, self.num_kv_heads_local, S),
+                dtype=self.klabel_dtype,
+                device=self.device,
+            )
+
+        logger.info(
+            "DoubleSparsity K_label allocated: layers=%d num_tokens_in_pool=%d "
+            "kv_heads_local=%d S=%d dtype=%s mem_per_layer=%.2f MiB",
+            end_layer - start_layer,
+            num_tokens_in_pool,
+            self.num_kv_heads_local,
+            S,
+            self.klabel_dtype,
+            (
+                num_tokens_in_pool
+                * self.num_kv_heads_local
+                * S
+                * self.k_label[start_layer].element_size()
+            )
+            / (1024 * 1024),
+        )
+
+    def _write_k_label(
+        self,
+        layer_id: int,
+        k: torch.Tensor,
+        out_cache_loc: torch.Tensor,
+    ) -> None:
+        """Single entry point for K_label writes (extend or decode).
+
+        Uses the Triton kernel on CUDA; falls back to the torch reference on
+        CPU. Both paths are byte-equivalent for the test fixtures.
+        """
+        if k.numel() == 0:
+            return
+        chan = self.channel_indices[layer_id]
+        kl = self.k_label[layer_id]
+        if k.is_cuda:
+            ds_compute_k_label_write(k, chan, out_cache_loc, kl)
+        else:
+            ds_compute_k_label_torch_ref(k, chan, out_cache_loc, kl)
+
+    def construct_representations(
+        self,
+        layer_id: int,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        k_buffer: torch.Tensor,
+        forward_batch,
+    ) -> None:
+        """Write K_label for new tokens during prefill (extend phase).
+
+        SGLang's coordinator funnels both prefill and decode through
+        `attention_end -> construct_representations + update_representations`,
+        but only one of the two should fire per call. We dispatch on
+        `forward_mode` and use `forward_batch.out_cache_loc` (the same source
+        the dense backend uses) so K_label writes target exactly the physical
+        token ids that just received K writes.
+        """
+        if forward_batch.forward_mode.is_extend():
+            self._write_k_label_for_new_tokens(layer_id, k_buffer, forward_batch)
+
+    def update_representations(
+        self,
+        layer_id: int,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        k_buffer: torch.Tensor,
+        forward_batch,
+    ) -> None:
+        """Append K_label for the freshly decoded tokens (decode phase)."""
+        if forward_batch.forward_mode.is_decode_or_idle():
+            self._write_k_label_for_new_tokens(layer_id, k_buffer, forward_batch)
+
+    def _write_k_label_for_new_tokens(
+        self,
+        layer_id: int,
+        k_buffer: torch.Tensor,
+        forward_batch,
+    ) -> None:
+        """Gather K rows written this step from the KV pool and update K_label.
+
+        Skipped when `save_kv_cache=False` — otherwise the side cache desyncs
+        from the KV pool. Used by both extend and decode (the only thing that
+        differs between phases is which `forward_mode` predicate gates the call).
+        """
+        if not getattr(forward_batch, "save_kv_cache", True):
+            return
+        out_loc = forward_batch.out_cache_loc
+        k_new = k_buffer[out_loc]
+        self._write_k_label(layer_id, k_new, out_loc)
 
     def retrieve_topk(
         self,
