@@ -44,6 +44,7 @@ from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
+from sglang.srt.layers.attention._attn_dump import maybe_dump_tensor
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -338,7 +339,13 @@ class Gemma4Attention(nn.Module):
         forward_batch: ForwardBatch,
         **kwargs,
     ):
+        maybe_dump_tensor(
+            "forward_extend", self.layer_id, "attn_in", hidden_states
+        )
         qkv, _ = self.qkv_proj(hidden_states)
+        maybe_dump_tensor(
+            "forward_extend", self.layer_id, "qkv_out", qkv
+        )
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
         # Fused Q/K/V RMSNorm: replaces three separate norm kernels with one.
@@ -411,6 +418,15 @@ class Gemma4Attention(nn.Module):
             q, _ = self.rotary_emb(positions, q, dummy_k)
 
         q = q.unflatten(-1, (self.num_heads, self.head_dim))
+        maybe_dump_tensor(
+            "forward_extend", self.layer_id, "q_pre_attn", q
+        )
+        maybe_dump_tensor(
+            "forward_extend", self.layer_id, "k_pre_attn", k
+        )
+        maybe_dump_tensor(
+            "forward_extend", self.layer_id, "v_pre_attn", v
+        )
         attn_output = self.attn(
             q,
             k,
@@ -570,6 +586,9 @@ class Gemma4DecoderLayer(nn.Module):
         #   residual = h + residual (in-place)
         #   h = gemma_norm(residual)
         residual = hidden_states
+        maybe_dump_tensor(
+            "forward_extend", self.layer_id, "block_in", hidden_states
+        )
 
         # Apply input layernorm
         hidden_states = self.input_layernorm(hidden_states)
@@ -578,7 +597,13 @@ class Gemma4DecoderLayer(nn.Module):
             hidden_states=hidden_states,
             forward_batch=forward_batch,
         )
+        maybe_dump_tensor(
+            "forward_extend", self.layer_id, "attn_out_pre_norm", hidden_states
+        )
         hidden_states = self.post_attention_layernorm(hidden_states)
+        maybe_dump_tensor(
+            "forward_extend", self.layer_id, "post_attn_norm", hidden_states
+        )
 
         if self.enable_moe_block:
             # Fuse: hidden_states + residual -> residual; pre_ff_norm(residual) -> hidden_states
@@ -631,7 +656,16 @@ class Gemma4DecoderLayer(nn.Module):
             hidden_states, residual = self.pre_feedforward_layernorm(
                 hidden_states, residual
             )
+            maybe_dump_tensor(
+                "forward_extend", self.layer_id, "pre_ff_norm_out", hidden_states
+            )
+            maybe_dump_tensor(
+                "forward_extend", self.layer_id, "residual_mid", residual
+            )
             hidden_states = self.mlp(hidden_states)
+            maybe_dump_tensor(
+                "forward_extend", self.layer_id, "mlp_out", hidden_states
+            )
 
         if not self.has_ple and hidden_states.is_cuda and hidden_states.dim() == 2:
             # Fused: (post_ff_norm(h) + residual) * layer_scalar in one kernel
@@ -658,6 +692,9 @@ class Gemma4DecoderLayer(nn.Module):
                 hidden_states = hidden_states + per_layer_contribution
 
             hidden_states = hidden_states * self.layer_scalar
+        maybe_dump_tensor(
+            "forward_extend", self.layer_id, "block_out", hidden_states
+        )
         return hidden_states, None
 
 

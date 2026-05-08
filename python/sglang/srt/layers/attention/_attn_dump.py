@@ -1,12 +1,14 @@
-"""Minimal per-layer attention I/O dumper for xpu_backend vs triton_backend diffs.
+"""Minimal per-layer tensor dumper for xpu_backend vs triton_backend diffs.
 
 Activated only when SGLANG_DUMP_ATTN_DIR is set. Intended for investigation;
 not a supported public API.
 
 Env vars:
-    SGLANG_DUMP_ATTN_DIR     base directory for dumps (required to enable)
-    SGLANG_DUMP_ATTN_LAYERS  optional comma list, e.g. "0,4,8"; default = all
-    SGLANG_DUMP_ATTN_MAX     optional per-(mode,layer) cap on dumps (default 4)
+    SGLANG_DUMP_ATTN_DIR      base directory for dumps (required to enable)
+    SGLANG_DUMP_ATTN_BACKEND  backend tag for model-side dumps (default "unknown")
+                              -- backend-side calls pass the name explicitly.
+    SGLANG_DUMP_ATTN_LAYERS   optional comma list, e.g. "0,4,8"; default = all
+    SGLANG_DUMP_ATTN_MAX      optional per-(mode,layer,rank) cap (default 4)
 
 Layout:
     <dir>/<backend>/<mode>/rank<R>_layer<L>_step<S>.pt
@@ -93,5 +95,59 @@ def maybe_dump_attn(
         "k": _copy(k),
         "v": _copy(v),
         "o": _copy(o),
+    }
+    torch.save(payload, path)
+
+
+def maybe_dump_tensor(
+    mode: str,
+    layer_id: int,
+    name: str,
+    tensor: Optional[torch.Tensor],
+) -> None:
+    """Dump a single named tensor at a model-side hook site (norm out, qkv out, etc).
+
+    Uses SGLANG_DUMP_ATTN_BACKEND to tag the backend since the model doesn't
+    have backend knowledge at this call site.
+    """
+    out_dir = os.environ.get("SGLANG_DUMP_ATTN_DIR")
+    if not out_dir:
+        return
+    if tensor is None:
+        return
+
+    layer_filter = os.environ.get("SGLANG_DUMP_ATTN_LAYERS")
+    if layer_filter:
+        allowed = {int(x) for x in layer_filter.split(",") if x.strip()}
+        if layer_id not in allowed:
+            return
+
+    try:
+        max_dumps = int(os.environ.get("SGLANG_DUMP_ATTN_MAX", "4"))
+    except ValueError:
+        max_dumps = 4
+
+    backend_name = os.environ.get("SGLANG_DUMP_ATTN_BACKEND", "unknown")
+    rank = _get_rank()
+    key = (backend_name, mode, layer_id, rank, name)
+    with _LOCK:
+        step = _COUNTERS.get(key, 0)
+        if step >= max_dumps:
+            return
+        _COUNTERS[key] = step + 1
+
+    sub = os.path.join(out_dir, backend_name, mode)
+    os.makedirs(sub, exist_ok=True)
+    path = os.path.join(
+        sub, f"rank{rank}_layer{layer_id:03d}_step{step:03d}_{name}.pt"
+    )
+    payload = {
+        "backend": backend_name,
+        "mode": mode,
+        "layer_id": layer_id,
+        "step": step,
+        "rank": rank,
+        "name": name,
+        "tensor": tensor.detach().to("cpu", copy=True),
     }
     torch.save(payload, path)
