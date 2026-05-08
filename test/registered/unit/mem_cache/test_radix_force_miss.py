@@ -44,7 +44,9 @@ class TestZeroMatchResult(unittest.TestCase):
     def test_zero_replaces_indices_and_nodes(self):
         tree = RadixCache.create_simulated()
         tree.insert(InsertParams(key=RadixKey(token_ids=[1, 2, 3, 4, 5])))
-        match = tree.match_prefix(MatchPrefixParams(key=RadixKey(token_ids=[1, 2, 3, 9])))
+        match = tree.match_prefix(
+            MatchPrefixParams(key=RadixKey(token_ids=[1, 2, 3, 9]))
+        )
         self.assertGreater(len(match.device_indices), 0)
         zeroed = zero_match_result(tree, match)
         self.assertEqual(int(zeroed.device_indices.numel()), 0)
@@ -73,7 +75,9 @@ class TestZeroMatchResult(unittest.TestCase):
 class TestMatchPrefixForReqForceMiss(unittest.TestCase):
     def test_force_miss_zeros_req_prefix(self):
         tree = RadixCache.create_simulated()
-        tree.insert(InsertParams(key=RadixKey(token_ids=[10, 11, 12, 13, 14, 15, 16, 17])))
+        tree.insert(
+            InsertParams(key=RadixKey(token_ids=[10, 11, 12, 13, 14, 15, 16, 17]))
+        )
 
         # Sanity: without the flag, the same lookup hits.
         baseline_req = _StubReq([10, 11, 12, 13, 99, 100])
