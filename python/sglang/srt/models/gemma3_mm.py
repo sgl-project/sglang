@@ -1,0 +1,484 @@
+# Copyright 2025 SGLang Team
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ==============================================================================
+
+# Adapted from:
+# https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/models/gemma3_mm.py
+
+import logging
+import re
+from functools import lru_cache
+from typing import Iterable, List, Optional, Set, Tuple, TypedDict
+
+import torch
+from torch import nn
+from transformers import Gemma3Config, PreTrainedModel
+
+from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
+from sglang.srt.layers.layernorm import Gemma3RMSNorm
+from sglang.srt.layers.logits_processor import LogitsProcessor
+from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.managers.mm_utils import (
+    MultiModalityDataPaddingPatternTokenPairs,
+    general_mm_embed_routine,
+)
+from sglang.srt.managers.schedule_batch import (
+    MultimodalDataItem,
+    MultimodalInputs,
+    flatten_nested_list,
+)
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.model_loader.weight_utils import (
+    default_weight_loader,
+    maybe_remap_kv_scale_name,
+)
+from sglang.srt.models.gemma3_causal import Gemma3ForCausalLM
+from sglang.srt.models.siglip import SiglipVisionModel
+from sglang.srt.utils import add_prefix
+from sglang.srt.utils.hf_transformers_utils import get_processor
+
+logger = logging.getLogger(__name__)
+
+cached_get_processor = lru_cache(get_processor)
+
+
+class Gemma3ImagePixelInputs(TypedDict):
+    pixel_values: torch.Tensor
+    """Shape: `(batch_size * num_images, num_channels, height, width)`"""
+
+
+class Gemma3MultiModalProjector(nn.Module):
+    """Projector for Gemma3 multimodal."""
+
+    def __init__(self, config: Gemma3Config):
+        super().__init__()
+
+        self.mm_input_projection_weight = nn.Parameter(
+            torch.zeros(
+                config.vision_config.hidden_size, config.text_config.hidden_size
+            )
+        )
+
+        self.mm_soft_emb_norm = Gemma3RMSNorm(
+            config.vision_config.hidden_size, eps=config.vision_config.layer_norm_eps
+        )
+
+        self.patches_per_image = int(
+            config.vision_config.image_size // config.vision_config.patch_size
+        )
+        self.tokens_per_side = int(config.mm_tokens_per_image**0.5)
+        self.kernel_size = self.patches_per_image // self.tokens_per_side
+        self.avg_pool = nn.AvgPool2d(
+            kernel_size=self.kernel_size, stride=self.kernel_size
+        )
+
+    def forward(self, vision_outputs: torch.Tensor) -> torch.Tensor:
+        batch_size, seq_length, hidden_size = vision_outputs.shape
+
+        # Reshape for pooling
+        reshaped_vision_outputs = vision_outputs.transpose(1, 2)
+        reshaped_vision_outputs = reshaped_vision_outputs.reshape(
+            batch_size, hidden_size, self.patches_per_image, self.patches_per_image
+        )
+        reshaped_vision_outputs = reshaped_vision_outputs.contiguous()
+
+        # Apply pooling
+        pooled_vision_outputs = self.avg_pool(reshaped_vision_outputs)
+        pooled_vision_outputs = pooled_vision_outputs.flatten(2)
+        pooled_vision_outputs = pooled_vision_outputs.transpose(1, 2)
+
+        # Apply normalization
+        normed_vision_outputs = self.mm_soft_emb_norm(pooled_vision_outputs)
+
+        # Project to text embedding space
+        projected_vision_outputs = torch.matmul(
+            normed_vision_outputs, self.mm_input_projection_weight
+        )
+
+        return projected_vision_outputs.type_as(vision_outputs)
+
+
+class Gemma3ForConditionalGeneration(PreTrainedModel):
+    config_class = Gemma3Config
+    """Gemma3 multimodal model for conditional generation."""
+
+    # BitandBytes specific attributes
+    default_bitsandbytes_target_modules = [
+        ".gate_proj.",
+        ".down_proj.",
+        ".up_proj.",
+        ".q_proj.",
+        ".k_proj.",
+        ".v_proj.",
+        ".o_proj.",
+        ".out_proj.",
+    ]
+    bitsandbytes_stacked_params_mapping = {
+        # shard_name, weight_name, index
+        "q_proj": ("qkv_proj", 0),
+        "k_proj": ("qkv_proj", 1),
+        "v_proj": ("qkv_proj", 2),
+        "gate_proj": ("gate_up_proj", 0),
+        "up_proj": ("gate_up_proj", 1),
+        "out_proj": ("proj", 0),
+    }
+
+    packed_modules_mapping = {
+        "qkv_proj": [
+            "q_proj",
+            "k_proj",
+            "v_proj",
+        ],
+        "gate_up_proj": [
+            "gate_proj",
+            "up_proj",
+        ],
+    }
+
+    # LoRA specific attributes
+    supported_lora_modules = [
+        "qkv_proj",
+        "o_proj",
+        "gate_up_proj",
+        "down_proj",
+    ]
+    # Gemma does not apply LoRA to the embedding layer.
+    embedding_modules = {}
+    embedding_padding_modules = []
+    supports_lora = True
+    # Pattern to match language model layers only (skip vision_tower and multi_modal_projector)
+    lora_pattern = re.compile(
+        r"^language_model\.model\.layers\.(\d+)\.(?:self_attn|mlp)\.(?:qkv_proj|o_proj|down_proj|gate_up_proj)"
+    )
+
+    def __init__(
+        self,
+        config: Gemma3Config,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+    ) -> None:
+        super().__init__(config=config)
+        self.config = config
+        self.quant_config = quant_config
+
+        # For LoRA compatibility: expose text_config attributes at top level
+        # This allows LoRA code to work without special multimodal handling
+        if not hasattr(config, "num_hidden_layers"):
+            config.num_hidden_layers = config.text_config.num_hidden_layers
+        if not hasattr(config, "hidden_size"):
+            config.hidden_size = config.text_config.hidden_size
+
+        self.vision_tower = SiglipVisionModel(
+            config=config.vision_config,
+            quant_config=quant_config,
+            prefix=add_prefix("vision_tower", prefix),
+        )
+
+        self.multi_modal_projector = Gemma3MultiModalProjector(config)
+        self.vocab_size = config.text_config.vocab_size
+
+        # Text model
+        self.language_model = Gemma3ForCausalLM(
+            config.text_config,
+            quant_config,
+            prefix=add_prefix("language_model", prefix),
+        )
+        if self.language_model.logits_processor.logit_scale:
+            logit_scale = getattr(config, "logit_scale", 1.0)
+            self.language_model.logits_processor.logit_scale *= logit_scale
+        self.post_init()
+
+    def pad_input_ids(
+        self, input_ids: List[int], image_inputs: MultimodalInputs
+    ) -> List[int]:
+        """Pad input IDs with image tokens."""
+        # Get special token IDs
+        im_start_id: int = image_inputs.im_start_id
+        im_end_id: int = image_inputs.im_end_id
+
+        media_token_pairs = [(im_start_id, im_end_id)]
+        pattern = MultiModalityDataPaddingPatternTokenPairs(media_token_pairs)
+        ids = pattern.pad_input_tokens(input_ids, image_inputs)
+        return ids
+
+    def prepare_attn_masks(
+        self,
+        forward_batch: ForwardBatch,
+        input_ids: torch.Tensor,
+        mask_dtype: torch.dtype,
+    ):
+        """Prepare attention masks for multimodal inputs."""
+        if isinstance(forward_batch.attn_backend, TritonAttnBackend):
+            assert forward_batch.forward_mode == ForwardMode.EXTEND
+            bidirectional_attn_masks_list = []
+            bidirectional_attn_mask_indptr = torch.zeros(
+                forward_batch.batch_size + 1, dtype=torch.int32, device=input_ids.device
+            )
+
+            for i in range(forward_batch.batch_size):
+                bidirectional_attn_mask = torch.empty(
+                    forward_batch.extend_seq_lens[i],
+                    forward_batch.extend_seq_lens[i]
+                    + forward_batch.extend_prefix_lens[i],
+                    dtype=mask_dtype,
+                    device=input_ids.device,
+                )
+                bidirectional_attn_mask.fill_(1)
+                bidirectional_attn_mask = bidirectional_attn_mask.tril(
+                    diagonal=forward_batch.extend_prefix_lens[i]
+                )
+
+                # Consider bidirectional attention between image tokens
+                mm_inputs = forward_batch.mm_inputs[i]
+                for mm_item in mm_inputs.mm_items:
+                    if mm_item.is_image():
+                        for im_begin, im_end in mm_item.offsets:
+                            if (
+                                im_begin >= forward_batch.extend_prefix_lens[i]
+                            ):  # compatible with radix cache
+                                bidirectional_attn_mask[
+                                    im_begin
+                                    - forward_batch.extend_prefix_lens[i] : im_end
+                                    + 1
+                                    - forward_batch.extend_prefix_lens[i],
+                                    im_begin : im_end + 1,
+                                ] = 1
+                bidirectional_attn_masks_list.append(bidirectional_attn_mask.flatten())
+                bidirectional_attn_mask_indptr[i + 1] = (
+                    bidirectional_attn_mask_indptr[i]
+                    + bidirectional_attn_mask.nelement()
+                )
+
+            if bidirectional_attn_masks_list:
+                bidirectional_attn_masks = torch.cat(
+                    bidirectional_attn_masks_list, dim=0
+                )
+                forward_batch.attn_backend.forward_metadata.mask_indptr = (
+                    bidirectional_attn_mask_indptr
+                )
+                forward_batch.attn_backend.forward_metadata.custom_mask = (
+                    bidirectional_attn_masks
+                )
+
+    def get_input_embeddings(self) -> nn.Embedding:
+        return self.language_model.get_input_embeddings()
+
+    def get_attention_sliding_window_size(self):
+        """
+        This value is used to initialize attention backends in `ForwardBatch`.
+        """
+        return self.language_model.get_attention_sliding_window_size()
+
+    def get_image_feature(self, items: List[MultimodalDataItem]):
+        """
+        Projects the last hidden state from the vision model into language model space.
+        Supports both raw image pixel values and precomputed embeddings.
+
+        Returns:
+            image_features (`torch.Tensor`): Image feature tensor of shape `(num_images, image_length, embed_dim)`).
+        """
+        # Process images one by one to handle flatten_batch=True constraint in vision_tower
+        all_pixel_values = flatten_nested_list([item.feature for item in items])
+
+        final_features_list = []
+
+        for pixel_values_batch in all_pixel_values:
+            if (
+                pixel_values_batch.dim() == 3
+                and pixel_values_batch.shape[-1] == self.config.text_config.hidden_size
+            ):
+                final_features_list.append(
+                    pixel_values_batch.to(self.language_model.device)
+                )
+                continue
+
+            # Normalize input shape to [batch_size, channels, height, width]
+            if pixel_values_batch.dim() == 5:
+                pixel_values_batch = pixel_values_batch.squeeze(0)
+            elif pixel_values_batch.dim() == 3:
+                pixel_values_batch = pixel_values_batch.unsqueeze(0)
+            elif pixel_values_batch.dim() != 4:
+                raise ValueError(
+                    f"Unexpected pixel_values shape: {pixel_values_batch.shape}"
+                )
+
+            # Process each image in the batch through Vision Tower
+            batch_vision_outputs = []
+            batch_size = pixel_values_batch.shape[0]
+
+            for i in range(batch_size):
+                pixel_value = pixel_values_batch[i : i + 1]  # Keep batch dimension as 1
+                pixel_value = pixel_value.to(
+                    device=self.vision_tower.device, dtype=self.language_model.dtype()
+                )
+                vision_output = self.vision_tower(pixel_values=pixel_value)
+                batch_vision_outputs.append(vision_output)
+
+            if batch_vision_outputs:
+                vision_outputs_cat = torch.cat(batch_vision_outputs, dim=0)
+
+                projected_features = self.multi_modal_projector(vision_outputs_cat)
+                final_features_list.append(projected_features)
+
+        # Concatenate all features (all are now in text space)
+        if final_features_list:
+            return torch.cat(final_features_list, dim=0)
+        else:
+            return torch.tensor([], device=self.language_model.device)
+
+    @torch.no_grad()
+    def forward(
+        self,
+        input_ids: torch.LongTensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        input_embeds: torch.Tensor = None,
+        **kwargs: object,
+    ) -> LogitsProcessor:
+        r"""
+            labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
+                Labels for computing the masked language modeling loss. Indices should either be in `[0, ...,
+                config.text_config.vocab_size]` or -100 (see `input_ids` docstring). Tokens with indices set to `-100` are ignored
+                (masked), the loss is only computed for the tokens with labels in `[0, ..., config.text_config.vocab_size]`.
+
+            logits_to_keep (`int` or `torch.Tensor`, *optional*):
+                If an `int`, compute logits for the last `logits_to_keep` tokens. If `0`, calculate logits for all
+                `input_ids` (special case). Only last token logits are needed for generation, and calculating them only for that
+                token can save memory, which becomes pretty significant for long sequences or large vocabulary size.
+                If a `torch.Tensor`, must be 1D corresponding to the indices to keep in the sequence length dimension.
+                This is useful when using packed tensor format (single dimension for batch and sequence length).
+
+        Returns:
+
+        Example:
+
+        ```python
+        >>> from PIL import Image
+        >>> import requests
+        >>> from transformers import AutoProcessor, Gemma3ForConditionalGeneration
+
+        >>> model = Gemma3ForConditionalGeneration.from_pretrained("google/Gemma3-test-224px-hf")
+        >>> processor = AutoProcessor.from_pretrained("google/Gemma3-test-224px-hf")
+
+        >>> prompt = "answer en Where is the cow standing?"
+        >>> url = "https://huggingface.co/gv-hf/Gemma3-test-224px-hf/resolve/main/cow_beach_1.png"
+        >>> image = Image.open(requests.get(url, stream=True).raw)
+
+        >>> inputs = processor(images=image, text=prompt,  return_tensors="pt")
+
+        >>> # Generate
+        >>> generate_ids = model.generate(**inputs, max_length=30)
+        >>> processor.batch_decode(generate_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
+        "answer en Where is the cow standing?\nbeach"
+        ```"""
+
+        # Important: position_ids in Gemma3 are 1-indexed
+        # This really does cost me sometime
+        positions += 1
+
+        # Replace image id with PAD if the image token if OOV, to avoid index-errors
+        if input_ids is not None and self.config.image_token_index >= self.vocab_size:
+            special_image_mask = input_ids == self.config.image_token_index
+            llm_input_ids = input_ids.clone()
+            llm_input_ids[special_image_mask] = 0
+        else:
+            llm_input_ids = input_ids
+
+        # NOTE: As described in https://huggingface.co/blog/gemma3#multimodality, in the prefill stage of Gemma-3, image tokens use bidirectional attention. Currently, only the TritonAttnBackend supports bidirectional attention; other backends have not yet implemented this. Bidirectional attention is incompatible with CUDA Graph and chunked prefill.
+        if (
+            forward_batch.forward_mode
+            == ForwardMode.EXTEND  # only Extend mode is supported for now
+            and forward_batch.contains_image_inputs()  # Gemma-3 only supports image as mm inputs
+        ):
+            self.prepare_attn_masks(
+                forward_batch,
+                llm_input_ids,
+                mask_dtype=torch.bool,
+            )
+
+        hs = general_mm_embed_routine(
+            input_ids=llm_input_ids,
+            forward_batch=forward_batch,
+            language_model=self.language_model,
+            multimodal_model=self,
+            positions=positions,
+        )
+
+        return hs
+
+    def should_apply_lora(self, module_name: str) -> bool:
+        """Skip vision tower and multi_modal_projector for LoRA."""
+        return bool(self.lora_pattern.match(module_name))
+
+    def tie_weights(self, **kwargs):
+        return self.language_model.tie_weights(**kwargs)
+
+    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        stacked_params_mapping = [
+            # (param_name, shard_name, shard_id)
+            (".qkv_proj", ".q_proj", "q"),
+            (".qkv_proj", ".k_proj", "k"),
+            (".qkv_proj", ".v_proj", "v"),
+            ("gate_up_proj", "up_proj", 1),
+            ("gate_up_proj", "gate_proj", 0),
+        ]
+        """Load weights for the model."""
+        params_dict = dict(self.named_parameters())
+        loaded_params: Set[str] = set()
+
+        for name, loaded_weight in weights:
+            if "language_model" in name:
+                # Gemma3ForCausalLM.load_weights(self, [(name.replace("language_model.", ""), loaded_weight)])
+                causal_loaded_params = Gemma3ForCausalLM.load_weights(
+                    self, [(name, loaded_weight)]
+                )
+                loaded_params.update(causal_loaded_params)
+                continue
+            else:
+                for param_name, weight_name, shard_id in stacked_params_mapping:
+                    if weight_name not in name:
+                        continue
+                    name = name.replace(weight_name, param_name)
+                    # Skip loading extra bias for GPTQ models.
+                    if name.endswith(".bias") and name not in params_dict:
+                        continue
+                    param = params_dict[name]
+                    weight_loader = param.weight_loader
+                    weight_loader(param, loaded_weight, shard_id)
+                    break
+                else:
+                    if "vision_model" in name:
+                        # adapt to VisionAttention
+                        name = name.replace(".self_attn.out_proj", ".self_attn.proj")
+                    # Skip loading extra bias for GPTQ models
+                    if name.endswith(".bias") and name not in params_dict:
+                        continue
+                    # Remapping the name of FP8 kv-scale
+                    name = maybe_remap_kv_scale_name(name, params_dict)
+                    if name is None:
+                        continue
+                    param = params_dict[name]
+                    weight_loader = getattr(
+                        param, "weight_loader", default_weight_loader
+                    )
+                    weight_loader(param, loaded_weight)
+                loaded_params.add(name)
+        unloaded_params = params_dict.keys() - loaded_params
+        if unloaded_params:
+            pass
+            # raise RuntimeError(
+            #     f"Some weights are not initialized from checkpoints: {unloaded_params}")
+        return loaded_params
+
+
+EntryClass = Gemma3ForConditionalGeneration

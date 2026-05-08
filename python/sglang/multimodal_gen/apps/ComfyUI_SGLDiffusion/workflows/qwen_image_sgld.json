@@ -1,0 +1,165 @@
+{
+    "3": {
+      "inputs": {
+        "seed": 808633539418610,
+        "steps": 4,
+        "cfg": 1,
+        "sampler_name": "euler",
+        "scheduler": "simple",
+        "denoise": 1,
+        "model": [
+          "66",
+          0
+        ],
+        "positive": [
+          "6",
+          0
+        ],
+        "negative": [
+          "7",
+          0
+        ],
+        "latent_image": [
+          "58",
+          0
+        ]
+      },
+      "class_type": "KSampler",
+      "_meta": {
+        "title": "KSampler"
+      }
+    },
+    "6": {
+      "inputs": {
+        "text": "\"A vibrant, warm neon-lit street scene in Hong Kong at the afternoon, with a mix of colorful Chinese and English signs glowing brightly. The atmosphere is lively, cinematic, and rain-washed with reflections on the pavement. The colors are vivid, full of pink, blue, red, and green hues. Crowded buildings with overlapping neon signs. 1980s Hong Kong style. Signs include:\n\"龍鳳冰室\" \"金華燒臘\" \"HAPPY HAIR\" \"鴻運茶餐廳\" \"EASY BAR\" \"永發魚蛋粉\" \"添記粥麵\" \"SUNSHINE MOTEL\" \"美都餐室\" \"富記糖水\" \"太平館\" \"雅芳髮型屋\" \"STAR KTV\" \"銀河娛樂城\" \"百樂門舞廳\" \"BUBBLE CAFE\" \"萬豪麻雀館\" \"CITY LIGHTS BAR\" \"瑞祥香燭莊\" \"文記文具\" \"GOLDEN JADE HOTEL\" \"LOVELY BEAUTY\" \"合興百貨\" \"興旺電器\" And the background is warm yellow street and with all stores' lights on.",
+        "speak_and_recognation": {
+          "__value__": [
+            false,
+            true
+          ]
+        },
+        "clip": [
+          "38",
+          0
+        ]
+      },
+      "class_type": "CLIPTextEncode",
+      "_meta": {
+        "title": "CLIP Text Encode (Positive Prompt)"
+      }
+    },
+    "7": {
+      "inputs": {
+        "text": "",
+        "speak_and_recognation": {
+          "__value__": [
+            false,
+            true
+          ]
+        },
+        "clip": [
+          "38",
+          0
+        ]
+      },
+      "class_type": "CLIPTextEncode",
+      "_meta": {
+        "title": "CLIP Text Encode (Negative Prompt)"
+      }
+    },
+    "8": {
+      "inputs": {
+        "samples": [
+          "3",
+          0
+        ],
+        "vae": [
+          "39",
+          0
+        ]
+      },
+      "class_type": "VAEDecode",
+      "_meta": {
+        "title": "VAE Decode"
+      }
+    },
+    "38": {
+      "inputs": {
+        "clip_name": "qwen_2.5_vl_7b_fp8_scaled.safetensors",
+        "type": "qwen_image",
+        "device": "default"
+      },
+      "class_type": "CLIPLoader",
+      "_meta": {
+        "title": "Load CLIP"
+      }
+    },
+    "39": {
+      "inputs": {
+        "vae_name": "qwen_image_vae.safetensors"
+      },
+      "class_type": "VAELoader",
+      "_meta": {
+        "title": "Load VAE"
+      }
+    },
+    "58": {
+      "inputs": {
+        "width": 1328,
+        "height": 1328,
+        "batch_size": 1
+      },
+      "class_type": "EmptySD3LatentImage",
+      "_meta": {
+        "title": "EmptySD3LatentImage"
+      }
+    },
+    "60": {
+      "inputs": {
+        "filename_prefix": "ComfyUI"
+      },
+      "class_type": "SaveImage",
+      "_meta": {
+        "title": "Save Image"
+      }
+    },
+    "66": {
+      "inputs": {
+        "shift": 3.1000000000000005,
+        "model": [
+          "78",
+          0
+        ]
+      },
+      "class_type": "ModelSamplingAuraFlow",
+      "_meta": {
+        "title": "ModelSamplingAuraFlow"
+      }
+    },
+    "77": {
+      "inputs": {
+        "unet_name": "qwen_image_2512_bf16.safetensors",
+        "weight_dtype": "default"
+      },
+      "class_type": "SGLDUNETLoader",
+      "_meta": {
+        "title": "SGLDiffusion UNET Loader"
+      }
+    },
+    "78": {
+      "inputs": {
+        "lora_name": "Qwen-Image-2512-Lightning-4steps-V1.0-bf16.safetensors",
+        "strength_model": 1,
+        "nickname": "",
+        "target": "all",
+        "model": [
+          "77",
+          0
+        ]
+      },
+      "class_type": "SGLDLoraLoader",
+      "_meta": {
+        "title": "SGLDiffusion LoRA Loader"
+      }
+    }
+  }
