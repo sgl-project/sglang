@@ -48,6 +48,7 @@ from sglang.srt.managers.schedule_batch import (
     Req,
     ScheduleBatch,
 )
+from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.mem_cache.common import (
     kv_to_page_indices,
     kv_to_page_num,
@@ -55,7 +56,6 @@ from sglang.srt.mem_cache.common import (
     release_kv_cache,
 )
 from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, NSATokenToKVPool
-from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.observability.req_time_stats import set_schedule_time_batch
 
 if TYPE_CHECKING:
@@ -787,7 +787,9 @@ class SchedulerDisaggregationPrefillMixin:
                     .cpu()
                     .numpy()
                 ]
-            elif isinstance(self.token_to_kv_pool_allocator.get_kvcache(), SWAKVPool):
+            elif isinstance(
+                self.token_to_kv_pool_allocator.get_kvcache(), BaseSWAKVPool
+            ):
                 # SWA hybrid model: send last window KV indices
                 seq_len = len(req.fill_ids)
                 window_size = self.sliding_window_size
