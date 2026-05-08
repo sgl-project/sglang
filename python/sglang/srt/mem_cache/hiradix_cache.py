@@ -639,6 +639,7 @@ class HiRadixCache(RadixCache):
             pool = PoolTransfer(
                 name=PoolName.INDEXER,
                 hit_policy=PoolHitPolicy.ALL_PAGES,
+                indices_from_pool=PoolName.KV,
             )
             return {"extra_pools": [pool]}
         else:

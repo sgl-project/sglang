@@ -2153,9 +2153,6 @@ class PoolEntry:
     device_pool: Any
     layer_mapper: Callable[[int], Optional[int]]
     is_primary_index_anchor: bool = False
-    # When True, host_pool uses the same logical slot indices as the anchor pool
-    # (e.g. DSA indexer); HostPoolGroup.free mirrors frees to this pool.
-    share_indices_with_anchor: bool = False
     # Optional eviction callbacks for auto-alloc in HybridCacheController.
     # host_evict_fn(n): evict n slots from the host pool (used by write()).
     # device_evict_fn(n): evict n slots from the device pool (used by load()).
@@ -2168,7 +2165,6 @@ class PoolEntry:
     # When None, fall back to entry.device_pool.alloc/free.
     device_alloc_fn: Optional[Callable] = None
     device_free_fn: Optional[Callable] = None
-    derive_indices_from_pool: Optional[PoolName] = None
 
 
 class HostPoolGroup:

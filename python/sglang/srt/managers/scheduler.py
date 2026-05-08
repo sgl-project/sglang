@@ -894,10 +894,6 @@ class Scheduler(
                     tree_components.append(
                         ComponentType.SWA if self.is_hybrid_swa else ComponentType.MAMBA
                     )
-                if self.is_hybrid_swa and getattr(
-                    self.model_config, "is_deepseek_v4_arch", False
-                ):
-                    tree_components.append(ComponentType.DSV4_COMPRESSED)
                 params.tree_components = tuple(tree_components)
                 self.tree_cache = UnifiedRadixCache(params)
                 if self.enable_hierarchical_cache:

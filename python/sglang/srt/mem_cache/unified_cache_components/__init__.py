@@ -1,6 +1,3 @@
-from sglang.srt.mem_cache.unified_cache_components.dsv4_compressed_component import (
-    DeepSeekV4CompressedComponent,
-)
 from sglang.srt.mem_cache.unified_cache_components.full_component import FullComponent
 from sglang.srt.mem_cache.unified_cache_components.mamba_component import MambaComponent
 from sglang.srt.mem_cache.unified_cache_components.swa_component import SWAComponent
@@ -20,7 +17,6 @@ __all__ = [
     "BASE_COMPONENT_TYPE",
     "ComponentData",
     "ComponentType",
-    "DeepSeekV4CompressedComponent",
     "EvictLayer",
     "FullComponent",
     "CacheTransferPhase",
