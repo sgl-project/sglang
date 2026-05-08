@@ -1,6 +1,17 @@
 {
     "_comment": "Per-model comparison config. Sampling params omitted where model defaults are correct — only override resolution, seed, and params that differ from defaults.",
     "test_image_url": "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/diffusers/cat.png",
+    "benchmark_defaults": {
+        "warmup": {
+            "num_requests": 2,
+            "num_inference_steps": 3
+        },
+        "throughput": {
+            "num_requests": 4,
+            "max_concurrency": 2,
+            "request_rate": "inf"
+        }
+    },
     "cases": [
         {
             "id": "flux1_dev_t2i_1024",
@@ -47,6 +58,11 @@
                 "sglang": {
                     "serve_args": "--enable-torch-compile --warmup",
                     "extra_env": {}
+                },
+                "vllm-omni": {
+                    "num_gpus": 1,
+                    "serve_args": "",
+                    "extra_env": {}
                 }
             }
         },
@@ -63,6 +79,11 @@
             "frameworks": {
                 "sglang": {
                     "serve_args": "--enable-torch-compile --warmup",
+                    "extra_env": {}
+                },
+                "vllm-omni": {
+                    "num_gpus": 1,
+                    "serve_args": "",
                     "extra_env": {}
                 }
             }
@@ -97,6 +118,21 @@
                 "sglang": {
                     "serve_args": "--enable-torch-compile --warmup --enable-cfg-parallel --ulysses-degree 2 --text-encoder-cpu-offload --pin-cpu-memory",
                     "extra_env": {}
+                },
+                "vllm-omni": {
+                    "num_gpus": 1,
+                    "serve_args": "",
+                    "extra_env": {}
+                },
+                "lightx2v": {
+                    "model": "Wan-AI/Wan2.2-T2V-A14B",
+                    "model_cls": "wan2.2_moe",
+                    "lightx2v_task": "t2v",
+                    "serve_args": "",
+                    "extra_env": {},
+                    "lightx2v_config": {
+                        "sample_shift": 5.0
+                    }
                 }
             }
         },
@@ -114,6 +150,11 @@
             "frameworks": {
                 "sglang": {
                     "serve_args": "--enable-torch-compile --warmup",
+                    "extra_env": {}
+                },
+                "vllm-omni": {
+                    "num_gpus": 1,
+                    "serve_args": "",
                     "extra_env": {}
                 }
             }
@@ -168,6 +209,21 @@
                 "sglang": {
                     "serve_args": "--enable-torch-compile --warmup --enable-cfg-parallel --ulysses-degree 2 --text-encoder-cpu-offload --pin-cpu-memory",
                     "extra_env": {}
+                },
+                "vllm-omni": {
+                    "num_gpus": 1,
+                    "serve_args": "",
+                    "extra_env": {}
+                },
+                "lightx2v": {
+                    "model": "Wan-AI/Wan2.2-I2V-A14B",
+                    "model_cls": "wan2.2_moe",
+                    "lightx2v_task": "i2v",
+                    "serve_args": "",
+                    "extra_env": {},
+                    "lightx2v_config": {
+                        "sample_shift": 5.0
+                    }
                 }
             }
         }

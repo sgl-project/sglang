@@ -285,6 +285,31 @@ class VBenchDataset(BaseDataset):
         )
 
 
+class FixedDataset(BaseDataset):
+    def __init__(self, args, api_url: str = "", model: str = ""):
+        super().__init__(args, api_url, model)
+        self.num_prompts = args.num_prompts or 1
+        self.extra_body = json.loads(args.extra_body) if args.extra_body else {}
+
+    def __len__(self) -> int:
+        return self.num_prompts
+
+    def __getitem__(self, idx: int) -> RequestFuncInput:
+        return RequestFuncInput(
+            prompt=self.args.prompt,
+            api_url=self.api_url,
+            model=self.model,
+            num_outputs_per_prompt=self.args.num_outputs_per_prompt,
+            width=self.args.width,
+            height=self.args.height,
+            num_frames=self.args.num_frames,
+            num_inference_steps=self.args.num_inference_steps,
+            fps=self.args.fps,
+            extra_body=self.extra_body,
+            image_paths=self.args.image_path,
+        )
+
+
 class RandomDataset(BaseDataset):
     def __init__(self, args, api_url: str = "", model: str = ""):
         super().__init__(args, api_url, model)

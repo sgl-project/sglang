@@ -1,0 +1,131 @@
+name: Diffusion Benchmark
+
+on:
+  schedule:
+    - cron: '0 8 * * 1'
+    - cron: '0 8 * * 4'
+  workflow_dispatch:
+    inputs:
+      runner_label:
+        description: 'Fixed hardware runner for this run'
+        required: true
+        type: choice
+        default: '8-gpu-h200'
+        options:
+          - '4-gpu-h100'
+          - '8-gpu-h200'
+          - '8-gpu-b200'
+      case_ids:
+        description: 'Optional space-separated case ids'
+        required: false
+        type: string
+        default: ''
+      frameworks:
+        description: 'Optional space-separated frameworks'
+        required: false
+        type: string
+        default: ''
+      modes:
+        description: 'Benchmark modes'
+        required: true
+        type: choice
+        default: 'single_e2e throughput'
+        options:
+          - 'single_e2e'
+          - 'throughput'
+          - 'single_e2e throughput'
+
+concurrency:
+  group: diffusion-benchmark-${{ github.ref }}-${{ github.event.schedule || inputs.runner_label }}
+  cancel-in-progress: false
+
+env:
+  SGLANG_IS_IN_CI: true
+  HF_HUB_DOWNLOAD_TIMEOUT: 300
+  HF_HUB_ETAG_TIMEOUT: 300
+  PYTHONUNBUFFERED: "1"
+
+jobs:
+  benchmark:
+    if: github.repository == 'sgl-project/sglang'
+    runs-on: ${{ github.event_name == 'workflow_dispatch' && inputs.runner_label || (github.event.schedule == '0 8 * * 1' && '4-gpu-h100' || '8-gpu-h200') }}
+    timeout-minutes: 360
+    env:
+      RUNNER_LABELS: ${{ github.event_name == 'workflow_dispatch' && inputs.runner_label || (github.event.schedule == '0 8 * * 1' && '4-gpu-h100' || '8-gpu-h200') }}
+      GPU_CONFIG: ${{ github.event_name == 'workflow_dispatch' && inputs.runner_label || (github.event.schedule == '0 8 * * 1' && '4-gpu-h100' || '8-gpu-h200') }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Refresh to latest origin/main
+        run: |
+          git fetch origin main
+          git checkout --detach origin/main
+          echo "Benchmarking commit $(git rev-parse HEAD)"
+
+      - name: Install SGLang dependencies
+        run: |
+          bash scripts/ci/cuda/ci_install_dependency.sh diffusion
+
+      - name: Run diffusion benchmark
+        env:
+          GITHUB_SHA: ${{ github.sha }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+        timeout-minutes: 300
+        run: |
+          CASE_ARGS=()
+          if [ -n "${{ inputs.case_ids || '' }}" ]; then
+            CASE_ARGS=(--case-ids ${{ inputs.case_ids }})
+          fi
+          FRAMEWORK_ARGS=()
+          if [ -n "${{ inputs.frameworks || '' }}" ]; then
+            FRAMEWORK_ARGS=(--frameworks ${{ inputs.frameworks }})
+          fi
+          MODE_ARGS=(--modes ${{ inputs.modes || 'single_e2e throughput' }})
+          python3 -u scripts/ci/utils/diffusion/run_comparison.py \
+            "${CASE_ARGS[@]}" \
+            "${FRAMEWORK_ARGS[@]}" \
+            "${MODE_ARGS[@]}" \
+            --output comparison-results.json
+
+      - name: Generate dashboard
+        if: always()
+        env:
+          GH_PAT_FOR_NIGHTLY_CI_DATA: ${{ secrets.GH_PAT_FOR_NIGHTLY_CI_DATA }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 scripts/ci/utils/diffusion/generate_diffusion_dashboard.py \
+            --results comparison-results.json \
+            --output dashboard.md \
+            --charts-dir comparison-charts \
+            --fetch-history \
+            --step-summary
+
+      - name: Publish to sglang-ci-data
+        if: always()
+        env:
+          GH_PAT_FOR_NIGHTLY_CI_DATA: ${{ secrets.GH_PAT_FOR_NIGHTLY_CI_DATA }}
+        run: |
+          python3 scripts/ci/utils/diffusion/publish_comparison_results.py \
+            --results comparison-results.json \
+            --dashboard dashboard.md \
+            --charts-dir comparison-charts
+
+      - name: Upload benchmark artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: diffusion-benchmark-${{ github.run_id }}
+          path: |
+            comparison-results.json
+            dashboard.md
+            comparison-charts/
+            comparison-logs/
+          retention-days: 90
+          if-no-files-found: ignore
+
+      - uses: ./.github/actions/upload-cuda-coredumps
+        if: failure()

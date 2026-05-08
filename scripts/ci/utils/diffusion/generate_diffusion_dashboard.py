@@ -230,6 +230,17 @@ def _extract_case_results(run_data: dict) -> dict[str, dict[str, float | None]]:
     return mapping
 
 
+def _extract_throughput_results(run_data: dict) -> dict[str, dict[str, dict]]:
+    mapping: dict[str, dict[str, dict]] = {}
+    for r in run_data.get("throughput_results", []):
+        cid = r["case_id"]
+        fw = r["framework"]
+        if cid not in mapping:
+            mapping[cid] = {}
+        mapping[cid][fw] = r.get("metrics", {})
+    return mapping
+
+
 def _sanitize_filename(name: str) -> str:
     """Sanitize a case ID to be a safe filename."""
     return name.replace("/", "_").replace(" ", "_").replace(":", "_")
@@ -286,7 +297,7 @@ def generate_dashboard(
     # Discover all frameworks present in results
     all_frameworks = []
     seen_fw = set()
-    for r in current.get("results", []):
+    for r in current.get("results", []) + current.get("throughput_results", []):
         fw = r["framework"]
         if fw not in seen_fw:
             all_frameworks.append(fw)
@@ -344,6 +355,32 @@ def generate_dashboard(
         for ofw in other_frameworks:
             row += f" {_fmt_speedup(sg_lat, case_fws.get(ofw))} |"
         lines.append(row)
+
+    throughput_cases = _extract_throughput_results(current)
+    if throughput_cases:
+        lines.append("\n## High-Pressure Throughput\n")
+        header = "| Model |"
+        sep = "|-------|"
+        for fw in all_frameworks:
+            header += f" {fw} (req/s) | {fw} p95 (s) |"
+            sep += "---------|---------|"
+        lines.append(header)
+        lines.append(sep)
+
+        seen_cases = set()
+        for r in current.get("throughput_results", []):
+            cid = r["case_id"]
+            if cid in seen_cases:
+                continue
+            seen_cases.add(cid)
+            row = f"| {r['model'].split('/')[-1]} |"
+            case_fws = throughput_cases.get(cid, {})
+            for fw in all_frameworks:
+                metrics = case_fws.get(fw, {})
+                throughput = metrics.get("throughput_rps")
+                p95 = metrics.get("latency_p95_s")
+                row += f" {_fmt_latency(throughput)} | {_fmt_latency(p95)} |"
+            lines.append(row)
 
     # ---- Section 2: Cross-Framework Speedup Trend (only if multiple frameworks) ----
     if history and other_frameworks:

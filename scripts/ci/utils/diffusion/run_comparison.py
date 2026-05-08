@@ -1,7 +1,7 @@
 """Cross-framework comparison benchmark for diffusion serving.
 
 Launches servers (SGLang, vLLM-Omni, LightX2V) for each test case, sends a
-single request, measures end-to-end latency, and writes comparison-results.json.
+single request and/or bench_serving traffic, then writes comparison-results.json.
 
 Usage:
     # Full run (requires GPU)
@@ -15,6 +15,9 @@ Usage:
 
     # Run only specific framework(s)
     python3 scripts/ci/utils/diffusion/run_comparison.py --frameworks sglang
+
+    # Run single-request E2E plus high-pressure throughput
+    python3 scripts/ci/utils/diffusion/run_comparison.py --modes single_e2e throughput
 """
 
 import argparse
@@ -45,9 +48,16 @@ HEALTH_TIMEOUT = (
 )
 REQUEST_TIMEOUT = 1200  # seconds
 GPU_CLEAR_WAIT = 15  # seconds between framework runs
+MODE_SINGLE_E2E = "single_e2e"
+MODE_THROUGHPUT = "throughput"
+DEFAULT_BENCHMARK = {
+    "warmup": {"num_requests": 2, "num_inference_steps": 3},
+    "throughput": {"num_requests": 4, "max_concurrency": 2},
+}
 
 # Frameworks that need separate installation (conflict with sglang's deps)
 INSTALLABLE_FRAMEWORKS = {"vllm-omni", "lightx2v"}
+FRAMEWORK_ORDER = ["sglang", "vllm-omni", "lightx2v"]
 
 # Cached reference image (downloaded once)
 _cached_ref_image: bytes | None = None
@@ -107,7 +117,7 @@ def _resolve_hf_model_path(model_id: str) -> str:
         return model_id
 
 
-def _write_lightx2v_config(case: dict) -> str:
+def _write_lightx2v_config(case: dict, fw_cfg: dict) -> str:
     """Write a minimal LightX2V config JSON and return its path."""
     cfg = {
         "infer_steps": case.get("num_inference_steps", 50),
@@ -118,8 +128,11 @@ def _write_lightx2v_config(case: dict) -> str:
         cfg["target_video_length"] = case["num_frames"]
     if "height" in case:
         cfg["height"] = case["height"]
+        cfg["target_height"] = case["height"]
     if "width" in case:
         cfg["width"] = case["width"]
+        cfg["target_width"] = case["width"]
+    cfg.update(fw_cfg.get("lightx2v_config", {}))
 
     config_path = os.path.join(
         tempfile.gettempdir(), f"lightx2v_config_{case['id']}.json"
@@ -141,7 +154,7 @@ def _build_lightx2v_cmd(case: dict, fw_cfg: dict, port: int) -> list[str]:
     task = fw_cfg["lightx2v_task"]
     num_gpus = case["num_gpus"]
     model_path = _resolve_hf_model_path(case["model"])
-    config_path = _write_lightx2v_config(case)
+    config_path = _write_lightx2v_config(case, fw_cfg)
 
     server_args = [
         "--model_path",
@@ -525,7 +538,108 @@ def send_image_conditioned_request_sglang(
 
 
 def send_request_vllm_omni(base_url: str, case: dict, config: dict) -> float:
-    """Send request via vLLM-Omni's /v1/chat/completions endpoint."""
+    """Send request via vLLM-Omni's OpenAI-compatible diffusion endpoints."""
+    task = case["task"]
+    if task in ("text-to-video", "image-to-video", "text-image-to-video"):
+        data = {
+            "prompt": case["prompt"],
+            "size": f"{case['width']}x{case['height']}",
+            "width": str(case["width"]),
+            "height": str(case["height"]),
+        }
+        for key in (
+            "num_inference_steps",
+            "guidance_scale",
+            "guidance_scale_2",
+            "seed",
+            "num_frames",
+            "fps",
+            "negative_prompt",
+        ):
+            if key in case:
+                data[key] = str(case[key])
+        files = None
+        if case.get("reference_image"):
+            files = {
+                "input_reference": (
+                    "ref.png",
+                    io.BytesIO(_get_ref_image_bytes(config)),
+                    "image/png",
+                )
+            }
+
+        start = time.time()
+        resp = requests.post(
+            f"{base_url}/v1/videos",
+            data=data,
+            files=files,
+            timeout=REQUEST_TIMEOUT,
+        )
+        resp.raise_for_status()
+        job = resp.json()
+        job_id = job.get("id")
+        if not job_id:
+            raise RuntimeError(f"vLLM-Omni video submit returned no id: {job}")
+        poll_url = f"{base_url}/v1/videos/{job_id}"
+        while True:
+            time.sleep(1)
+            poll_resp = requests.get(poll_url, timeout=30)
+            poll_resp.raise_for_status()
+            poll_data = poll_resp.json()
+            status = poll_data.get("status")
+            if status == "completed":
+                break
+            if status == "failed":
+                raise RuntimeError(f"vLLM-Omni video generation failed: {poll_data}")
+            if time.time() - start > REQUEST_TIMEOUT:
+                raise TimeoutError(
+                    f"vLLM-Omni video timed out after {REQUEST_TIMEOUT}s"
+                )
+        latency = time.time() - start
+        print(f"  Generated in {latency:.2f}s (vllm-omni)")
+        return latency
+
+    if task == "text-to-image":
+        payload = _build_sglang_payload(case)
+        start = time.time()
+        resp = requests.post(
+            f"{base_url}/v1/images/generations",
+            json=payload,
+            timeout=REQUEST_TIMEOUT,
+        )
+        latency = time.time() - start
+        resp.raise_for_status()
+        return latency
+    if task in ("image-edit", "image-to-image"):
+        files = {
+            "image": ("ref.png", io.BytesIO(_get_ref_image_bytes(config)), "image/png")
+        }
+        data = {
+            "model": case["model"],
+            "prompt": case["prompt"],
+            "size": f"{case['width']}x{case['height']}",
+            "n": "1",
+            "response_format": "b64_json",
+        }
+        for key in (
+            "num_inference_steps",
+            "guidance_scale",
+            "seed",
+            "negative_prompt",
+        ):
+            if key in case:
+                data[key] = str(case[key])
+        start = time.time()
+        resp = requests.post(
+            f"{base_url}/v1/images/edits",
+            files=files,
+            data=data,
+            timeout=REQUEST_TIMEOUT,
+        )
+        latency = time.time() - start
+        resp.raise_for_status()
+        return latency
+
     extra_body = {
         "height": case["height"],
         "width": case["width"],
@@ -581,11 +695,7 @@ def send_request_vllm_omni(base_url: str, case: dict, config: dict) -> float:
 
 def send_request_lightx2v(base_url: str, case: dict, config: dict) -> float:
     """Send request via LightX2V's async task API."""
-    task = case["task"]
-    if task in ("text-to-image", "image-edit"):
-        endpoint = "/v1/tasks/image"
-    else:
-        endpoint = "/v1/tasks/video"
+    endpoint = "/v1/tasks/"
 
     payload = {
         "prompt": case["prompt"],
@@ -599,15 +709,16 @@ def send_request_lightx2v(base_url: str, case: dict, config: dict) -> float:
         payload["height"] = case["height"]
     if "width" in case:
         payload["width"] = case["width"]
+    if "height" in case and "width" in case:
+        payload["target_shape"] = [case["height"], case["width"]]
     if "guidance_scale" in case:
         payload["guidance_scale"] = case["guidance_scale"]
     if "fps" in case:
         payload["fps"] = case["fps"]
     if "negative_prompt" in case:
         payload["negative_prompt"] = case["negative_prompt"]
-    # Image-conditioned: LightX2V accepts image_path (URL or local path)
     if case.get("reference_image"):
-        payload["image_path"] = config.get("test_image_url", "")
+        payload["image_path"] = _get_ref_image_path(config)
 
     start = time.time()
 
@@ -630,7 +741,9 @@ def send_request_lightx2v(base_url: str, case: dict, config: dict) -> float:
         poll_resp = requests.get(poll_url, timeout=30)
         poll_resp.raise_for_status()
         poll_data = poll_resp.json()
-        status = poll_data.get("task_status", "").upper()
+        status = (
+            poll_data.get("task_status") or poll_data.get("status") or ""
+        ).upper()
         if status == "COMPLETED":
             break
         elif status in ("FAILED", "CANCELLED"):
@@ -679,34 +792,266 @@ def send_request(
 # ---------------------------------------------------------------------------
 
 
-def run_single(
-    case: dict,
-    framework: str,
-    fw_cfg: dict,
-    port: int,
-    log_dir: Path,
-    config: dict | None = None,
-) -> dict:
-    """Run a single (case, framework) combination. Returns result dict."""
-    result = {
+def _merge_nested(base: dict, override: dict) -> dict:
+    merged = dict(base)
+    for key, value in override.items():
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = _merge_nested(merged[key], value)
+        else:
+            merged[key] = value
+    return merged
+
+
+def _benchmark_config(config: dict | None, case: dict) -> dict:
+    cfg = _merge_nested(DEFAULT_BENCHMARK, (config or {}).get("benchmark_defaults", {}))
+    return _merge_nested(cfg, case.get("benchmark", {}))
+
+
+def _base_result(case: dict, framework: str, mode: str) -> dict:
+    return {
         "case_id": case["id"],
         "framework": framework,
+        "mode": mode,
         "model": case["model"],
         "task": case["task"],
+        "width": case.get("width"),
+        "height": case.get("height"),
+        "num_frames": case.get("num_frames"),
+        "num_gpus": case.get("num_gpus"),
         "latency_s": None,
         "error": None,
     }
 
+
+def _case_for_framework(case: dict, fw_cfg: dict) -> dict:
+    overrides = {key: fw_cfg[key] for key in ("model", "num_gpus") if key in fw_cfg}
+    if not overrides:
+        return case
+    return {**case, **overrides}
+
+
+def _current_commit_sha() -> str:
+    try:
+        ret = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if ret.returncode == 0:
+            return ret.stdout.strip()
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        pass
+    return os.environ.get("GITHUB_SHA", "unknown")
+
+
+def _collect_hardware_metadata() -> dict:
+    metadata = {
+        "runner_labels": os.environ.get("RUNNER_LABELS"),
+        "gpu_config": os.environ.get("GPU_CONFIG"),
+    }
+    try:
+        query = "name,memory.total,driver_version"
+        ret = subprocess.run(
+            [
+                "nvidia-smi",
+                f"--query-gpu={query}",
+                "--format=csv,noheader",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        if ret.returncode == 0:
+            metadata["gpus"] = [
+                line.strip() for line in ret.stdout.splitlines() if line.strip()
+            ]
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        pass
+    return metadata
+
+
+def _run_warmups(
+    base_url: str,
+    case: dict,
+    framework: str,
+    config: dict | None,
+    bench_cfg: dict,
+) -> None:
+    warmup_cfg = bench_cfg.get("warmup", {})
+    warmup_requests = int(warmup_cfg.get("num_requests", 0) or 0)
+    warmup_steps = warmup_cfg.get("num_inference_steps")
+    if warmup_requests <= 0:
+        return
+    warmup_case = dict(case)
+    if warmup_steps is not None:
+        warmup_case["num_inference_steps"] = int(warmup_steps)
+    for wi in range(1, warmup_requests + 1):
+        print(f"  Sending warmup request ({wi}/{warmup_requests})...")
+        try:
+            send_request(base_url, warmup_case, framework, config)
+        except Exception as e:
+            print(f"  Warmup request {wi} failed (non-fatal): {e}")
+
+
+def run_single_request(
+    base_url: str,
+    case: dict,
+    framework: str,
+    log_dir: Path,
+    config: dict | None = None,
+) -> dict:
+    result = _base_result(case, framework, MODE_SINGLE_E2E)
+
+    perf_dump_path = None
+    if framework == "sglang":
+        perf_dump_path = os.path.join(str(log_dir), f"perf_{case['id']}_measured.json")
+    if perf_dump_path and os.path.exists(perf_dump_path):
+        os.remove(perf_dump_path)
+    print("  Sending measured single request...")
+    latency = send_request(
+        base_url, case, framework, config, perf_dump_path=perf_dump_path
+    )
+    result["latency_s"] = round(latency, 3)
+    return result
+
+
+def _bench_serving_task(task: str) -> str:
+    return {
+        "image-edit": "image-to-image",
+        "text-image-to-video": "image-to-video",
+    }.get(task, task)
+
+
+def _bench_extra_body(case: dict) -> dict:
+    extra_body = {}
+    for key in (
+        "guidance_scale",
+        "guidance_scale_2",
+        "true_cfg_scale",
+        "negative_prompt",
+        "seed",
+    ):
+        if key in case:
+            extra_body[key] = case[key]
+    return extra_body
+
+
+def run_throughput(
+    base_url: str,
+    case: dict,
+    framework: str,
+    config: dict | None,
+    bench_cfg: dict,
+    log_dir: Path,
+) -> dict:
+    result = _base_result(case, framework, MODE_THROUGHPUT)
+    throughput_cfg = bench_cfg.get("throughput", {})
+    num_requests = int(throughput_cfg.get("num_requests", 4) or 4)
+    max_concurrency = int(throughput_cfg.get("max_concurrency", 2) or 2)
+    max_concurrency = max(1, min(max_concurrency, num_requests))
+
+    metrics_path = log_dir / f"bench_serving_{case['id']}_{framework}.json"
+    cmd = [
+        sys.executable,
+        "-m",
+        "sglang.multimodal_gen.benchmarks.bench_serving",
+        "--backend",
+        framework,
+        "--base-url",
+        base_url,
+        "--dataset",
+        "fixed",
+        "--prompt",
+        case["prompt"],
+        "--model",
+        case["model"],
+        "--task",
+        _bench_serving_task(case["task"]),
+        "--num-prompts",
+        str(num_requests),
+        "--max-concurrency",
+        str(max_concurrency),
+        "--request-rate",
+        str(throughput_cfg.get("request_rate", "inf")),
+        "--output-file",
+        str(metrics_path),
+        "--disable-tqdm",
+    ]
+    for key in ("width", "height", "num_frames", "fps", "num_inference_steps"):
+        if key in case:
+            cmd.extend([f"--{key.replace('_', '-')}", str(case[key])])
+    extra_body = _bench_extra_body(case)
+    if extra_body:
+        cmd.extend(["--extra-body", json.dumps(extra_body)])
+    if case.get("reference_image"):
+        cmd.extend(["--image-path", _get_ref_image_path(config or {})])
+
+    print(
+        f"  Running bench_serving throughput: requests={num_requests}, "
+        f"max_concurrency={max_concurrency}"
+    )
+    ret = subprocess.run(
+        cmd,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        timeout=REQUEST_TIMEOUT * max(1, num_requests),
+    )
+    bench_log_path = log_dir / f"bench_serving_{case['id']}_{framework}.log"
+    with open(bench_log_path, "w", encoding="utf-8") as f:
+        f.write(ret.stdout)
+    if ret.returncode != 0:
+        result["error"] = f"bench_serving failed (exit {ret.returncode})"
+        return result
+
+    with open(metrics_path) as f:
+        metrics = json.load(f)
+
+    result.update(
+        {
+            "latency_s": round(metrics.get("latency_p50", 0), 3),
+            "metrics": {
+                "duration_s": round(metrics.get("duration", 0), 3),
+                "num_requests": metrics.get("completed_requests", 0)
+                + metrics.get("failed_requests", 0),
+                "completed_requests": metrics.get("completed_requests", 0),
+                "failed_requests": metrics.get("failed_requests", 0),
+                "max_concurrency": max_concurrency,
+                "throughput_rps": round(metrics.get("throughput_qps", 0), 4),
+                "output_throughput_ops": round(
+                    metrics.get("output_throughput_ops", 0), 4
+                ),
+                "latency_mean_s": round(metrics.get("latency_mean", 0), 3),
+                "latency_p50_s": round(metrics.get("latency_p50", 0), 3),
+                "latency_p90_s": round(metrics.get("latency_p90", 0), 3),
+                "latency_p95_s": round(metrics.get("latency_p95", 0), 3),
+                "latency_p99_s": round(metrics.get("latency_p99", 0), 3),
+            },
+        }
+    )
+    return result
+
+
+def run_case_framework(
+    case: dict,
+    framework: str,
+    fw_cfg: dict,
+    modes: list[str],
+    port: int,
+    log_dir: Path,
+    config: dict | None = None,
+) -> tuple[dict | None, dict | None]:
+    """Run one server lifecycle and collect requested benchmark modes."""
+    case = _case_for_framework(case, fw_cfg)
+    single_result = None
+    throughput_result = None
     cmd = build_server_cmd(framework, case, fw_cfg, port)
     print(f"\n  Command: {' '.join(cmd)}")
 
     env = os.environ.copy()
     env.update(fw_cfg.get("extra_env", {}))
-
-    # perf_dump_path for SGLang server-side timing (passed in request, zero overhead when None)
-    perf_dump_path = None
-    if framework == "sglang":
-        perf_dump_path = os.path.join(str(log_dir), f"perf_{case['id']}_measured.json")
+    env = _framework_env(framework, env)
 
     log_file = log_dir / f"{case['id']}_{framework}.log"
     log_fh = open(log_file, "w", encoding="utf-8", buffering=1)
@@ -740,32 +1085,28 @@ def run_single(
 
         base_url = f"http://{DEFAULT_HOST}:{port}"
         wait_for_health(base_url, framework)
-
-        # Warmup requests (not measured, no perf dump)
-        # Use few steps to be fast — server's own warmup (warmup_steps=3) handles
-        # torch.compile compilation; these external warmups just stabilize triton
-        # kernel specializations across requests.
-        WARMUP_STEPS = 3
-        warmup_case = {**case, "num_inference_steps": WARMUP_STEPS}
-        for wi in range(1, 3):
-            print(f"  Sending warmup request ({wi}/2, {WARMUP_STEPS} steps)...")
-            try:
-                send_request(base_url, warmup_case, framework, config)
-            except Exception as e:
-                print(f"  Warmup request {wi} failed (non-fatal): {e}")
-
-        # Measured request — pass perf_dump_path for SGLang server-side timing
-        if perf_dump_path and os.path.exists(perf_dump_path):
-            os.remove(perf_dump_path)
-        print("  Sending measured request...")
-        latency = send_request(
-            base_url, case, framework, config, perf_dump_path=perf_dump_path
+        bench_cfg = _merge_nested(
+            _benchmark_config(config, case), fw_cfg.get("benchmark", {})
         )
-        result["latency_s"] = round(latency, 3)
+        _run_warmups(base_url, case, framework, config, bench_cfg)
+
+        if MODE_SINGLE_E2E in modes:
+            single_result = run_single_request(
+                base_url, case, framework, log_dir, config
+            )
+        if MODE_THROUGHPUT in modes:
+            throughput_result = run_throughput(
+                base_url, case, framework, config, bench_cfg, log_dir
+            )
 
     except Exception as e:
-        result["error"] = str(e)
         print(f"  ERROR: {e}")
+        if MODE_SINGLE_E2E in modes:
+            single_result = _base_result(case, framework, MODE_SINGLE_E2E)
+            single_result["error"] = str(e)
+        if MODE_THROUGHPUT in modes:
+            throughput_result = _base_result(case, framework, MODE_THROUGHPUT)
+            throughput_result["error"] = str(e)
     finally:
         if proc:
             kill_server(proc)
@@ -773,7 +1114,7 @@ def run_single(
             log_thread.join(timeout=5)
         log_fh.close()
 
-    return result
+    return single_result, throughput_result
 
 
 def _install_framework(fw_name: str, dry_run: bool = False) -> bool:
@@ -799,10 +1140,30 @@ def _install_framework(fw_name: str, dry_run: bool = False) -> bool:
     return True
 
 
+def _framework_venv_path(fw_name: str) -> str:
+    root = os.environ.get(
+        "SGLANG_DIFFUSION_FRAMEWORK_VENV_ROOT",
+        "/tmp/sglang-diffusion-framework-venvs",
+    )
+    return os.path.join(root, fw_name)
+
+
+def _framework_env(fw_name: str, env: dict[str, str]) -> dict[str, str]:
+    if fw_name not in INSTALLABLE_FRAMEWORKS:
+        return env
+    venv_path = _framework_venv_path(fw_name)
+    bin_path = os.path.join(venv_path, "bin")
+    framework_env = dict(env)
+    framework_env["VIRTUAL_ENV"] = venv_path
+    framework_env["PATH"] = f"{bin_path}:{framework_env.get('PATH', '')}"
+    return framework_env
+
+
 def run_comparison(
     config: dict,
     case_ids: list[str] | None = None,
     frameworks: list[str] | None = None,
+    modes: list[str] | None = None,
     port: int = DEFAULT_PORT,
     output: str = "comparison-results.json",
     dry_run: bool = False,
@@ -813,15 +1174,18 @@ def run_comparison(
     Each non-sglang framework is installed right before its cases run.
     """
     timestamp = datetime.now(timezone.utc).isoformat()
-    commit_sha = os.environ.get("GITHUB_SHA", "unknown")
+    commit_sha = _current_commit_sha()
     run_id = os.environ.get("GITHUB_RUN_ID", "local")
 
     log_dir = Path("comparison-logs")
     log_dir.mkdir(exist_ok=True)
 
-    # Collect all (case, framework) pairs, grouped by framework
-    fw_order = ["sglang", "vllm-omni", "lightx2v"]
-    fw_cases: dict[str, list[tuple[dict, dict]]] = {fw: [] for fw in fw_order}
+    modes = modes or [MODE_SINGLE_E2E]
+    invalid_modes = sorted(set(modes) - {MODE_SINGLE_E2E, MODE_THROUGHPUT})
+    if invalid_modes:
+        raise ValueError(f"Unknown benchmark mode(s): {invalid_modes}")
+
+    fw_cases: dict[str, list[tuple[dict, dict]]] = {fw: [] for fw in FRAMEWORK_ORDER}
 
     for case in config["cases"]:
         if case_ids and case["id"] not in case_ids:
@@ -834,9 +1198,10 @@ def run_comparison(
             fw_cases[fw_name].append((case, fw_cfg))
 
     results = []
+    throughput_results = []
     installed_fws: set[str] = set()
 
-    for fw_name in fw_order:
+    for fw_name in FRAMEWORK_ORDER:
         pairs = fw_cases.get(fw_name, [])
         if not pairs:
             continue
@@ -845,17 +1210,16 @@ def run_comparison(
         if fw_name not in installed_fws and fw_name in INSTALLABLE_FRAMEWORKS:
             if not _install_framework(fw_name, dry_run):
                 # Skip all cases for this framework
-                for case, _ in pairs:
-                    results.append(
-                        {
-                            "case_id": case["id"],
-                            "framework": fw_name,
-                            "model": case["model"],
-                            "task": case["task"],
-                            "latency_s": None,
-                            "error": f"{fw_name} installation failed",
-                        }
-                    )
+                for case, pair_fw_cfg in pairs:
+                    case_for_fw = _case_for_framework(case, pair_fw_cfg)
+                    if MODE_SINGLE_E2E in modes:
+                        result = _base_result(case_for_fw, fw_name, MODE_SINGLE_E2E)
+                        result["error"] = f"{fw_name} installation failed"
+                        results.append(result)
+                    if MODE_THROUGHPUT in modes:
+                        result = _base_result(case_for_fw, fw_name, MODE_THROUGHPUT)
+                        result["error"] = f"{fw_name} installation failed"
+                        throughput_results.append(result)
                 continue
             installed_fws.add(fw_name)
 
@@ -865,22 +1229,28 @@ def run_comparison(
             print(f"{'='*60}")
 
             if dry_run:
-                cmd = build_server_cmd(fw_name, case, fw_cfg, port)
+                case_for_fw = _case_for_framework(case, fw_cfg)
+                cmd = build_server_cmd(fw_name, case_for_fw, fw_cfg, port)
                 print(f"  [DRY-RUN] Would run: {' '.join(cmd)}")
-                results.append(
-                    {
-                        "case_id": case["id"],
-                        "framework": fw_name,
-                        "model": case["model"],
-                        "task": case["task"],
-                        "latency_s": None,
-                        "error": "dry-run",
-                    }
-                )
+                if fw_name in INSTALLABLE_FRAMEWORKS:
+                    print(f"  [DRY-RUN] venv: {_framework_venv_path(fw_name)}")
+                if MODE_SINGLE_E2E in modes:
+                    result = _base_result(case_for_fw, fw_name, MODE_SINGLE_E2E)
+                    result["error"] = "dry-run"
+                    results.append(result)
+                if MODE_THROUGHPUT in modes:
+                    result = _base_result(case_for_fw, fw_name, MODE_THROUGHPUT)
+                    result["error"] = "dry-run"
+                    throughput_results.append(result)
                 continue
 
-            result = run_single(case, fw_name, fw_cfg, port, log_dir, config)
-            results.append(result)
+            single_result, throughput_result = run_case_framework(
+                case, fw_name, fw_cfg, modes, port, log_dir, config
+            )
+            if single_result is not None:
+                results.append(single_result)
+            if throughput_result is not None:
+                throughput_results.append(throughput_result)
 
             # Wait for GPU memory to clear
             print(f"  Waiting {GPU_CLEAR_WAIT}s for GPU memory to clear...")
@@ -890,7 +1260,10 @@ def run_comparison(
         "timestamp": timestamp,
         "commit_sha": commit_sha,
         "run_id": run_id,
+        "hardware": _collect_hardware_metadata(),
+        "benchmark_modes": modes,
         "results": results,
+        "throughput_results": throughput_results,
     }
 
     os.makedirs(os.path.dirname(output) or ".", exist_ok=True)
@@ -905,6 +1278,17 @@ def run_comparison(
     for r in results:
         lat = f"{r['latency_s']:.2f}s" if r["latency_s"] else r.get("error", "N/A")
         print(f"  {r['case_id']:30s} | {r['framework']:12s} | {lat}")
+    if throughput_results:
+        print("\nTHROUGHPUT")
+        for r in throughput_results:
+            metrics = r.get("metrics", {})
+            throughput = metrics.get("throughput_rps")
+            value = (
+                f"{throughput:.4f} req/s"
+                if isinstance(throughput, (float, int))
+                else r.get("error", "N/A")
+            )
+            print(f"  {r['case_id']:30s} | {r['framework']:12s} | {value}")
 
     return output_data
 
@@ -936,6 +1320,13 @@ def main():
         help="Only run specific frameworks (sglang, vllm-omni, lightx2v)",
     )
     parser.add_argument(
+        "--modes",
+        nargs="+",
+        default=[MODE_SINGLE_E2E],
+        choices=[MODE_SINGLE_E2E, MODE_THROUGHPUT],
+        help="Benchmark modes to run",
+    )
+    parser.add_argument(
         "--port",
         type=int,
         default=DEFAULT_PORT,
@@ -963,13 +1354,19 @@ def main():
         config=config,
         case_ids=args.case_ids,
         frameworks=args.frameworks,
+        modes=args.modes,
         port=args.port,
         output=args.output,
         dry_run=args.dry_run,
     )
 
     # Exit with non-zero if any case had an error
-    errors = [r for r in output_data.get("results", []) if r.get("error")]
+    errors = [
+        r
+        for r in output_data.get("results", [])
+        + output_data.get("throughput_results", [])
+        if r.get("error")
+    ]
     if errors and not args.dry_run:
         print(f"\n{len(errors)} case(s) had errors:")
         for e in errors:

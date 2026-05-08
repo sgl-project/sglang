@@ -29,6 +29,7 @@ import requests
 from tqdm.asyncio import tqdm
 
 from sglang.multimodal_gen.benchmarks.datasets import (
+    FixedDataset,
     RandomDataset,
     RequestFuncInput,
     RequestFuncOutput,
@@ -261,10 +262,8 @@ async def async_request_video_sglang(
         if input.width and input.height:
             data.add_field("size", f"{input.width}x{input.height}")
 
-        # Add extra body fields to form data if possible, or assume simple key-values
-        # Note: Nested dicts in extra_body might need JSON serialization if API expects it stringified
-        if input.extra_body:
-            data.add_field("extra_body", json.dumps(input.extra_body))
+        for key, value in input.extra_body.items():
+            data.add_field(key, str(value))
 
         # Explicitly add fps/num_frames if they are not in extra_body (bench_serving logic overrides)
         if input.num_frames:
@@ -402,6 +401,174 @@ async def async_request_video_sglang(
     return output
 
 
+async def async_request_vllm_omni(
+    input: RequestFuncInput,
+    session: aiohttp.ClientSession,
+    pbar: Optional[tqdm] = None,
+) -> RequestFuncOutput:
+    output = RequestFuncOutput()
+    output.start_time = time.perf_counter()
+
+    data = aiohttp.FormData()
+    data.add_field("prompt", input.prompt)
+    if input.width and input.height:
+        data.add_field("size", f"{input.width}x{input.height}")
+        data.add_field("width", str(input.width))
+        data.add_field("height", str(input.height))
+    if input.num_frames:
+        data.add_field("num_frames", str(input.num_frames))
+    if input.num_inference_steps:
+        data.add_field("num_inference_steps", str(input.num_inference_steps))
+    if input.fps:
+        data.add_field("fps", str(input.fps))
+    for key, value in input.extra_body.items():
+        data.add_field(key, str(value))
+    if input.image_paths:
+        data.add_field(
+            "input_reference",
+            open(input.image_paths[0], "rb"),
+            filename=os.path.basename(input.image_paths[0]),
+            content_type="application/octet-stream",
+        )
+    try:
+        async with session.post(input.api_url, data=data) as response:
+            if response.status != 200:
+                output.error = (
+                    f"Submit failed HTTP {response.status}: {await response.text()}"
+                )
+                output.success = False
+                if pbar:
+                    pbar.update(1)
+                return output
+            submit_json = await response.json()
+
+        video_id = submit_json.get("id")
+        if not video_id:
+            output.error = f"No video id returned: {submit_json}"
+            output.success = False
+            if pbar:
+                pbar.update(1)
+            return output
+
+        status_url = f"{input.api_url}/{video_id}"
+        while True:
+            async with session.get(status_url) as response:
+                if response.status != 200:
+                    output.error = (
+                        f"Poll failed HTTP {response.status}: {await response.text()}"
+                    )
+                    output.success = False
+                    break
+                status_json = await response.json()
+            status = status_json.get("status")
+            if status == "completed":
+                output.success = True
+                output.response_body = status_json
+                output.output_count = 1
+                break
+            if status == "failed":
+                output.error = f"Video generation failed: {status_json}"
+                output.success = False
+                break
+            await asyncio.sleep(1.0)
+    except Exception as e:
+        output.error = str(e)
+        output.success = False
+
+    output.latency = time.perf_counter() - output.start_time
+    if input.slo_ms is not None and output.success:
+        output.slo_achieved = (output.latency * 1000.0) <= input.slo_ms
+    if pbar:
+        pbar.update(1)
+    return output
+
+
+async def async_request_lightx2v(
+    input: RequestFuncInput,
+    session: aiohttp.ClientSession,
+    pbar: Optional[tqdm] = None,
+) -> RequestFuncOutput:
+    output = RequestFuncOutput()
+    output.start_time = time.perf_counter()
+
+    payload = dict(input.extra_body)
+    payload.update(
+        {
+            "prompt": input.prompt,
+            "infer_steps": input.num_inference_steps
+            or payload.pop("num_inference_steps", None)
+            or 50,
+        }
+    )
+    if input.num_frames:
+        payload["target_video_length"] = input.num_frames
+    if input.height:
+        payload["height"] = input.height
+    if input.width:
+        payload["width"] = input.width
+    if input.height and input.width:
+        payload["target_shape"] = [input.height, input.width]
+    if input.fps:
+        payload["fps"] = input.fps
+    if input.image_paths:
+        payload["image_path"] = input.image_paths[0]
+
+    try:
+        async with session.post(input.api_url, json=payload) as response:
+            if response.status != 200:
+                output.error = (
+                    f"Submit failed HTTP {response.status}: {await response.text()}"
+                )
+                output.success = False
+                if pbar:
+                    pbar.update(1)
+                return output
+            submit_json = await response.json()
+
+        task_id = submit_json.get("task_id")
+        if not task_id:
+            output.error = f"No task_id returned: {submit_json}"
+            output.success = False
+            if pbar:
+                pbar.update(1)
+            return output
+
+        base_url = input.api_url.split("/v1/tasks/", 1)[0]
+        status_url = f"{base_url}/v1/tasks/{task_id}/status"
+        while True:
+            async with session.get(status_url) as response:
+                if response.status != 200:
+                    output.error = (
+                        f"Poll failed HTTP {response.status}: {await response.text()}"
+                    )
+                    output.success = False
+                    break
+                status_json = await response.json()
+            status = (
+                status_json.get("task_status") or status_json.get("status") or ""
+            ).upper()
+            if status == "COMPLETED":
+                output.success = True
+                output.response_body = status_json
+                output.output_count = 1
+                break
+            if status in ("FAILED", "CANCELLED"):
+                output.error = f"Task {status}: {status_json}"
+                output.success = False
+                break
+            await asyncio.sleep(1.0)
+    except Exception as e:
+        output.error = str(e)
+        output.success = False
+
+    output.latency = time.perf_counter() - output.start_time
+    if input.slo_ms is not None and output.success:
+        output.slo_achieved = (output.latency * 1000.0) <= input.slo_ms
+    if pbar:
+        pbar.update(1)
+    return output
+
+
 def calculate_metrics(
     outputs: List[RequestFuncOutput],
     total_duration: float,
@@ -468,13 +635,13 @@ def calculate_metrics(
     return metrics
 
 
-def wait_for_service(base_url: str, timeout: int = 1200) -> None:
-    logger.info(f"Waiting for service at {base_url}...")
+def wait_for_service(base_url: str, backend: str, timeout: int = 1200) -> None:
+    endpoint = "/v1/service/status" if backend == "lightx2v" else "/health"
+    logger.info(f"Waiting for service at {base_url}{endpoint}...")
     start_time = time.time()
     while True:
         try:
-            # Try /health endpoint first
-            resp = requests.get(f"{base_url}/health", timeout=1)
+            resp = requests.get(f"{base_url}{endpoint}", timeout=1)
             if resp.status_code == 200:
                 logger.info("Service is ready.")
                 break
@@ -483,7 +650,7 @@ def wait_for_service(base_url: str, timeout: int = 1200) -> None:
 
         if time.time() - start_time > timeout:
             raise TimeoutError(
-                f"Service at {base_url} did not start within {timeout} seconds."
+                f"Service at {base_url}{endpoint} did not start within {timeout} seconds."
             )
 
         time.sleep(1)
@@ -496,8 +663,10 @@ async def benchmark(args):
     if args.base_url is None:
         args.base_url = NetworkAddress(args.host, args.port).to_url()
 
+    backend = args.backend or "sglang"
+
     # Wait for service
-    wait_for_service(args.base_url)
+    wait_for_service(args.base_url, backend)
 
     # Fetch model info
     try:
@@ -516,6 +685,8 @@ async def benchmark(args):
         "video-to-video",
         "text-to-image",
         "image-to-image",
+        "image-edit",
+        "text-image-to-video",
     )
 
     # Resolve task_name with priority: args.task > local config > HF pipeline_tag
@@ -542,13 +713,37 @@ async def benchmark(args):
             f"Use --task to specify one of: {', '.join(valid_tasks)}"
         )
 
-    if task_name in ("text-to-video", "image-to-video", "video-to-video"):
+    if backend == "vllm-omni":
+        if task_name in (
+            "text-to-video",
+            "image-to-video",
+            "text-image-to-video",
+            "video-to-video",
+        ):
+            api_url = f"{args.base_url}/v1/videos"
+            request_func = async_request_vllm_omni
+        else:
+            api_url = (
+                f"{args.base_url}/v1/images/edits"
+                if task_name in ("image-to-image", "image-edit")
+                else f"{args.base_url}/v1/images/generations"
+            )
+            request_func = async_request_image_sglang
+    elif backend == "lightx2v":
+        api_url = f"{args.base_url}/v1/tasks/"
+        request_func = async_request_lightx2v
+    elif task_name in (
+        "text-to-video",
+        "image-to-video",
+        "text-image-to-video",
+        "video-to-video",
+    ):
         api_url = f"{args.base_url}/v1/videos"
         request_func = async_request_video_sglang
     else:  # text-to-image or image-to-image
         api_url = (
             f"{args.base_url}/v1/images/edits"
-            if task_name == "image-to-image"
+            if task_name in ("image-to-image", "image-edit")
             else f"{args.base_url}/v1/images/generations"
         )
         request_func = async_request_image_sglang
@@ -564,6 +759,8 @@ async def benchmark(args):
         dataset = VBenchDataset(args, api_url, args.model)
     elif args.dataset == "random":
         dataset = RandomDataset(args, api_url, args.model)
+    elif args.dataset == "fixed":
+        dataset = FixedDataset(args, api_url, args.model)
     else:
         raise ValueError(f"Unknown dataset: {args.dataset}")
 
@@ -705,8 +902,9 @@ if __name__ == "__main__":
     parser.add_argument(
         "--backend",
         type=str,
-        default=None,
-        help="DEPRECATED: --task is deprecated and will be ignored. The task will be inferred from --model.",
+        default="sglang",
+        choices=["sglang", "vllm-omni", "lightx2v"],
+        help="Serving backend API to benchmark.",
     )
     parser.add_argument(
         "--base-url",
@@ -721,7 +919,7 @@ if __name__ == "__main__":
         "--dataset",
         type=str,
         default="vbench",
-        choices=["vbench", "random"],
+        choices=["vbench", "random", "fixed"],
         help="Dataset to use.",
     )
     parser.add_argument(
@@ -732,6 +930,8 @@ if __name__ == "__main__":
             "image-to-video",
             "text-to-image",
             "image-to-image",
+            "image-edit",
+            "text-image-to-video",
             "video-to-video",
         ],
         default=None,
@@ -742,6 +942,25 @@ if __name__ == "__main__":
         type=str,
         default=None,
         help="Path to local dataset file (optional).",
+    )
+    parser.add_argument(
+        "--prompt",
+        type=str,
+        default="A cat sitting on a bench",
+        help="Prompt repeated by the fixed dataset.",
+    )
+    parser.add_argument(
+        "--image-path",
+        type=str,
+        nargs="+",
+        default=None,
+        help="Image path(s) repeated by the fixed dataset.",
+    )
+    parser.add_argument(
+        "--extra-body",
+        type=str,
+        default=None,
+        help="JSON request body fields shared by every fixed request.",
     )
     parser.add_argument(
         "--num-prompts", type=int, default=10, help="Number of prompts to benchmark."
