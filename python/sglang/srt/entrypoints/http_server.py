@@ -333,7 +333,7 @@ async def lifespan(fast_api_app: FastAPI):
         _global_state.tokenizer_manager, _global_state.template_manager
     )
     fast_api_app.state.openai_serving_tokenize = OpenAIServingTokenize(
-        _global_state.tokenizer_manager
+        _global_state.tokenizer_manager, _global_state.template_manager
     )
     fast_api_app.state.openai_serving_detokenize = OpenAIServingDetokenize(
         _global_state.tokenizer_manager
@@ -1295,11 +1295,13 @@ async def resume_memory_occupation(
 @app.post("/weights_checker")
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def check_weights(obj: CheckWeightsReqInput, request: Request):
-    success, message = await _global_state.tokenizer_manager.check_weights(obj, request)
-    return ORJSONResponse(
-        {"success": success, "message": message},
-        status_code=200 if success else HTTPStatus.BAD_REQUEST,
+    success, message, ranks = await _global_state.tokenizer_manager.check_weights(
+        obj, request
     )
+    body = {"success": success, "message": message}
+    if ranks is not None:
+        body["ranks"] = ranks
+    return ORJSONResponse(body, status_code=200 if success else HTTPStatus.BAD_REQUEST)
 
 
 @app.api_route("/slow_down", methods=["GET", "POST"])

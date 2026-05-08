@@ -3,6 +3,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 
 from sglang.multimodal_gen.configs.models.dits.base import DiTArchConfig, DiTConfig
+from sglang.multimodal_gen.configs.models.fsdp import is_blocks_or_transformer_blocks
 
 
 class LTXModelType(Enum):
@@ -47,15 +48,13 @@ class LTX2AttentionFunction(str, Enum):
     DEFAULT = "default"
 
 
-def is_blocks(n: str, m) -> bool:
-    return "blocks" in n and str.isdigit(n.split(".")[-1])
-
-
 @dataclass
 class LTX2ArchConfig(DiTArchConfig):
     """Architecture configuration for LTX-2 Video Transformer."""
 
-    _fsdp_shard_conditions: list = field(default_factory=lambda: [is_blocks])
+    _fsdp_shard_conditions: list = field(
+        default_factory=lambda: [is_blocks_or_transformer_blocks]
+    )
 
     param_names_mapping: dict = field(
         default_factory=lambda: {
