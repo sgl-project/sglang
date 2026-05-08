@@ -421,7 +421,213 @@ def ds_select_stage1_block_topk(
     return block_topk_logical, block_topk_scores
 
 
+# --------------------------------------------------------------------------- #
+# Stage 2 — merge per (bs, kv_head): top-effective_budget by score.           #
+# --------------------------------------------------------------------------- #
+
+
+def ds_select_stage2_merge_torch_ref(
+    *,
+    block_topk_logical: torch.Tensor,  # [bs, H_kv, num_blocks, K_BLOCK] int32
+    block_topk_scores: torch.Tensor,  # [bs, H_kv, num_blocks, K_BLOCK] fp32
+    effective_budget: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Reference impl for stage-2 merge.
+
+    Per (bs, kv_head): collect all `num_blocks * K_BLOCK` candidates,
+    sort by score descending, take top `effective_budget`. Slots beyond
+    the active-candidate count emit (-1, NEG_INF).
+
+    Returns:
+        merged_logical: `[bs, H_kv, effective_budget]` int32.
+        merged_scores:  `[bs, H_kv, effective_budget]` fp32.
+    """
+    bs, h_kv, num_blocks, k_block = block_topk_logical.shape
+    device = block_topk_logical.device
+
+    out_logical = torch.full(
+        (bs, h_kv, effective_budget), -1, dtype=torch.int32, device=device
+    )
+    out_scores = torch.full(
+        (bs, h_kv, effective_budget),
+        float("-inf"),
+        dtype=torch.float32,
+        device=device,
+    )
+
+    flat_log = block_topk_logical.reshape(bs, h_kv, num_blocks * k_block)
+    flat_scr = block_topk_scores.reshape(bs, h_kv, num_blocks * k_block)
+    # Sort by score descending; ties broken by smaller logical position
+    # so the result is deterministic (matches the kernel's reduction).
+    for b in range(bs):
+        for h in range(h_kv):
+            scores = flat_scr[b, h].clone()
+            logicals = flat_log[b, h].clone()
+            # Stable sort by score descending, then by logical ascending
+            # (achieved by sorting on a composite key).
+            order = torch.argsort(scores, descending=True, stable=True)
+            top = order[:effective_budget]
+            n_valid = effective_budget
+            sel_log = logicals[top]
+            sel_scr = scores[top]
+            # Mark slots beyond the count of active (score > NEG_INF and
+            # logical >= 0) candidates as sentinels.
+            valid_mask = (sel_log >= 0) & (sel_scr > -1e30)
+            out_logical[b, h, :n_valid] = torch.where(
+                valid_mask, sel_log, torch.full_like(sel_log, -1)
+            )
+            out_scores[b, h, :n_valid] = torch.where(
+                valid_mask, sel_scr, torch.full_like(sel_scr, float("-inf"))
+            )
+    return out_logical, out_scores
+
+
+@triton.jit
+def _ds_select_stage2_merge_kernel(
+    block_topk_logical_ptr,
+    block_topk_scores_ptr,
+    merged_logical_ptr,
+    merged_scores_ptr,
+    # block_topk strides ([bs, H_kv, num_blocks, K_BLOCK]; last contig)
+    btl_stride_b,
+    btl_stride_h,
+    bts_stride_b,
+    bts_stride_h,
+    # merged strides ([bs, H_kv, EFFECTIVE_BUDGET]; last contig)
+    ml_stride_b,
+    ml_stride_h,
+    ms_stride_b,
+    ms_stride_h,
+    # constexprs
+    NUM_CANDIDATES: tl.constexpr,  # num_blocks * K_BLOCK (must be <= merge_safe_threshold)
+    EFFECTIVE_BUDGET: tl.constexpr,
+):
+    """One program per (bs, kv_head). In-program iterative argmax for
+    top-EFFECTIVE_BUDGET candidates by score.
+
+    Caller guarantees `NUM_CANDIDATES <= merge_safe_threshold` (default
+    4096) — the chunked merge path is a v1.1.x escape hatch we don't
+    need until profiling demands it.
+    """
+    NEG_INF = -1e38
+
+    bs_idx = tl.program_id(0)
+    kv_idx = tl.program_id(1)
+
+    cand_offsets = tl.arange(0, NUM_CANDIDATES)  # [NUM_CANDIDATES]
+    btl_offs = bs_idx * btl_stride_b + kv_idx * btl_stride_h + cand_offsets
+    bts_offs = bs_idx * bts_stride_b + kv_idx * bts_stride_h + cand_offsets
+
+    logicals = tl.load(block_topk_logical_ptr + btl_offs)  # [NUM_CANDIDATES] int32
+    scores = tl.load(block_topk_scores_ptr + bts_offs).to(tl.float32)
+    # Drop sentinel candidates (-1 logical → unscored slot).
+    valid = logicals >= 0
+    scores = tl.where(valid, scores, NEG_INF)
+
+    out_k_range = tl.arange(0, EFFECTIVE_BUDGET).to(tl.int32)
+    out_logical = tl.zeros([EFFECTIVE_BUDGET], dtype=tl.int32) - 1
+    out_scores = tl.zeros([EFFECTIVE_BUDGET], dtype=tl.float32) + NEG_INF
+
+    for k in tl.static_range(EFFECTIVE_BUDGET):
+        max_score = tl.max(scores, axis=0)
+        # Min-position tie-break (matches torch ref's stable sort).
+        is_max = scores == max_score
+        pos_or_inf = tl.where(is_max, cand_offsets, NUM_CANDIDATES)
+        max_pos = tl.min(pos_or_inf, axis=0)
+
+        slot_active = max_score > -1.0e37
+        # Gather logical at max_pos. Triton can't do dynamic indexing into
+        # a register tensor, so use mask-and-reduce: pick the `logicals`
+        # value where position == max_pos.
+        is_picked = cand_offsets == max_pos
+        picked_logical = tl.sum(tl.where(is_picked, logicals, 0), axis=0).to(tl.int32)
+        logical = tl.where(slot_active, picked_logical, -1)
+        score_to_write = tl.where(slot_active, max_score, NEG_INF)
+
+        is_kth = out_k_range == k
+        out_logical = tl.where(is_kth, logical, out_logical)
+        out_scores = tl.where(is_kth, score_to_write, out_scores)
+
+        # Mask out the chosen position so the next iteration moves on.
+        scores = tl.where(cand_offsets == max_pos, NEG_INF, scores)
+
+    out_log_base = bs_idx * ml_stride_b + kv_idx * ml_stride_h
+    out_scr_base = bs_idx * ms_stride_b + kv_idx * ms_stride_h
+    tl.store(merged_logical_ptr + out_log_base + out_k_range, out_logical)
+    tl.store(merged_scores_ptr + out_scr_base + out_k_range, out_scores)
+
+
+def ds_select_stage2_merge(
+    *,
+    block_topk_logical: torch.Tensor,
+    block_topk_scores: torch.Tensor,
+    effective_budget: int,
+    merge_safe_threshold: int = 4096,
+    merged_logical: torch.Tensor = None,
+    merged_scores: torch.Tensor = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """CUDA wrapper for the stage-2 merge Triton kernel.
+
+    Caller (v1.1-7 wiring) must ensure `num_blocks * K_BLOCK <=
+    merge_safe_threshold` (default 4096) — this is checked by
+    `DoubleSparsityRuntimeConfig.warn_capacity` at startup. The chunked
+    merge path is a v1.1.x escape hatch when that constraint is
+    violated; until profiling demands it, we hard-error here.
+    """
+    if not block_topk_logical.is_cuda:
+        raise RuntimeError("ds_select_stage2_merge requires CUDA tensors")
+    bs, h_kv, num_blocks, k_block = block_topk_logical.shape
+    num_candidates = num_blocks * k_block
+    if num_candidates > merge_safe_threshold:
+        raise RuntimeError(
+            f"stage-2 merge candidates {num_candidates} = {num_blocks} * {k_block} "
+            f"exceeds merge_safe_threshold={merge_safe_threshold}. Lower k_block, "
+            f"raise block_t, or wire the chunked merge path (v1.1.x)."
+        )
+    if effective_budget > num_candidates:
+        raise ValueError(
+            f"effective_budget={effective_budget} > num_candidates={num_candidates}; "
+            f"caller must clamp via min(token_budget, num_blocks * k_block)"
+        )
+
+    if merged_logical is None:
+        merged_logical = torch.full(
+            (bs, h_kv, effective_budget),
+            -1,
+            dtype=torch.int32,
+            device=block_topk_logical.device,
+        )
+    if merged_scores is None:
+        merged_scores = torch.full(
+            (bs, h_kv, effective_budget),
+            float("-inf"),
+            dtype=torch.float32,
+            device=block_topk_logical.device,
+        )
+
+    grid = (bs, h_kv)
+    _ds_select_stage2_merge_kernel[grid](
+        block_topk_logical,
+        block_topk_scores,
+        merged_logical,
+        merged_scores,
+        block_topk_logical.stride(0),
+        block_topk_logical.stride(1),
+        block_topk_scores.stride(0),
+        block_topk_scores.stride(1),
+        merged_logical.stride(0),
+        merged_logical.stride(1),
+        merged_scores.stride(0),
+        merged_scores.stride(1),
+        NUM_CANDIDATES=num_candidates,
+        EFFECTIVE_BUDGET=effective_budget,
+    )
+    return merged_logical, merged_scores
+
+
 __all__ = [
     "ds_select_stage1_block_topk",
     "ds_select_stage1_block_topk_torch_ref",
+    "ds_select_stage2_merge",
+    "ds_select_stage2_merge_torch_ref",
 ]
