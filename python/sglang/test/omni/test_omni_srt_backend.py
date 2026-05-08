@@ -25,6 +25,37 @@ class TestOmniSRTBackend(unittest.TestCase):
         self.assertEqual((1, 2), first.token_ids)
         self.assertEqual("image", second.type)
 
+    def test_prepare_coalesces_pre_image_text_tokens(self):
+        backend = SRTARBackend(
+            _FakeBridge(
+                pre_image_segments=[
+                    {
+                        "type": "text",
+                        "text": "I",
+                        "metadata": {"token_ids": [1]},
+                    },
+                    {
+                        "type": "text",
+                        "text": " generated",
+                        "metadata": {"token_ids": [2]},
+                    },
+                ]
+            )
+        )
+        request = OmniRequest(
+            messages=(OmniInputSegment(type="text", text="draw"),),
+            mode="interleave",
+        )
+
+        context = backend.prepare_context(request)
+        first = backend.decode_until_boundary(context, request=request)
+        second = backend.decode_until_boundary(context, request=request)
+
+        self.assertEqual("text", first.type)
+        self.assertEqual("I generated", first.text)
+        self.assertEqual((1, 2), first.token_ids)
+        self.assertEqual("image", second.type)
+
     def test_t2i_stops_after_image_without_commit(self):
         bridge = _FakeBridge(pre_image_segments=[])
         backend = SRTARBackend(bridge)

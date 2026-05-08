@@ -306,13 +306,50 @@ def _initial_boundaries(
     *,
     mode: str,
 ) -> list[OmniBoundary]:
-    boundaries = [
-        _pre_image_segment_to_boundary(segment)
-        for segment in context.full.metadata.get("pre_image_segments", [])
-    ]
+    boundaries = _pre_image_segments_to_boundaries(
+        context.full.metadata.get("pre_image_segments", [])
+    )
     boundaries.append(OmniBoundary(type="image"))
     if mode != "interleave":
         boundaries.append(OmniBoundary(type="done"))
+    return boundaries
+
+
+def _pre_image_segments_to_boundaries(
+    segments: list[dict[str, Any]],
+) -> list[OmniBoundary]:
+    boundaries: list[OmniBoundary] = []
+    text_parts: list[str] = []
+    text_token_ids: list[int] = []
+    text_metadata: dict[str, Any] = {}
+
+    def flush_text() -> None:
+        if not text_parts and not text_token_ids:
+            return
+        boundaries.append(
+            OmniBoundary(
+                type="text",
+                text="".join(text_parts),
+                token_ids=tuple(text_token_ids),
+                metadata=dict(text_metadata),
+            )
+        )
+        text_parts.clear()
+        text_token_ids.clear()
+        text_metadata.clear()
+
+    for segment in segments:
+        if segment.get("type") != "text":
+            flush_text()
+            boundaries.append(_pre_image_segment_to_boundary(segment))
+            continue
+        boundary = _pre_image_segment_to_boundary(segment)
+        text_parts.append(boundary.text or "")
+        text_token_ids.extend(int(token_id) for token_id in boundary.token_ids)
+        if boundary.metadata:
+            text_metadata.update(boundary.metadata)
+
+    flush_text()
     return boundaries
 
 
