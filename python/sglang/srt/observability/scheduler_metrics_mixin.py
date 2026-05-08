@@ -157,11 +157,12 @@ class SchedulerMetricsMixin:
                 self._mfu_log_read_bytes = 0.0
                 self._mfu_log_write_bytes = 0.0
 
+        self.fwd_occupancy = float("nan")
+
         if ENABLE_METRICS_DEVICE_TIMER:
             self._device_timer_window_batch_count = 0
             self._device_timer_window_gpu_time = 0.0
             self._device_timer_window_start = None
-            self.fwd_occupancy = float("nan")
 
             def _wrap_execution_reporter(**kwargs):
                 self._device_timer_window_gpu_time += kwargs["t"]
@@ -351,6 +352,7 @@ class SchedulerMetricsMixin:
 
     def report_prefill_stats(
         self: Scheduler,
+        batch: Optional[ScheduleBatch],
         prefill_stats: PrefillStats,
         can_run_cuda_graph: bool,
         dp_cooperation_info: Optional[DPCooperationInfo] = None,
@@ -372,7 +374,12 @@ class SchedulerMetricsMixin:
         token_usage_msg = ", ".join(pool_stats.get_prefill_usage_msg_parts()) + ", "
 
         self.stats.new_token_ratio = prefill_stats.new_token_ratio
-        iter_msg = f" [{self.forward_ct + 1}]" if LOG_FORWARD_ITERS else ""
+        batch_iter = (
+            batch.forward_iter
+            if batch is not None and batch.forward_iter is not None
+            else self.forward_ct
+        )
+        iter_msg = f" [{batch_iter}]" if LOG_FORWARD_ITERS else ""
 
         msg = (
             f"Prefill batch{iter_msg}, "
@@ -469,6 +476,7 @@ class SchedulerMetricsMixin:
 
             # Utilization / LoRA / HiCache
             self.calculate_utilization()
+            self.stats.fwd_occupancy = self.fwd_occupancy
             self.update_lora_metrics()
             self._log_hicache_stats()
             self.metrics_collector.log_stats(self.stats)
@@ -531,7 +539,12 @@ class SchedulerMetricsMixin:
                 gap_latency / self.server_args.decode_log_interval
             )
 
-        iter_msg = f" [{self.forward_ct}]" if LOG_FORWARD_ITERS else ""
+        batch_iter = (
+            batch.forward_iter
+            if batch is not None and batch.forward_iter is not None
+            else self.forward_ct
+        )
+        iter_msg = f" [{batch_iter}]" if LOG_FORWARD_ITERS else ""
         msg = f"Decode batch{iter_msg}, #running-req: {num_running_reqs}, {token_usage_msg}"
 
         if self.spec_algorithm.is_none():
@@ -661,6 +674,7 @@ class SchedulerMetricsMixin:
 
             # Utilization / LoRA / HiCache
             self.calculate_utilization()
+            self.stats.fwd_occupancy = self.fwd_occupancy
             self.update_lora_metrics()
             self._log_hicache_stats()
             self.metrics_collector.log_stats(self.stats)
@@ -959,3 +973,4 @@ class SchedulerMetricsMixin:
     def reset_device_timer_window(self: Scheduler):
         if ENABLE_METRICS_DEVICE_TIMER:
             self._device_timer_window_batch_count = 0
+            self.fwd_occupancy = float("nan")

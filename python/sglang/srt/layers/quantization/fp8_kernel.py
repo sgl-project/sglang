@@ -547,6 +547,51 @@ def sglang_per_token_group_quant_fp8(
     return x_q, x_s
 
 
+def sglang_per_token_group_quant_fp8_ue8m0(
+    x: torch.Tensor,
+    group_size: int,
+    eps: float = 1e-10,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    assert (
+        x.shape[-1] % group_size == 0
+    ), f"hidden ({x.shape[-1]}) must be divisible by group_size ({group_size})"
+    assert x.is_contiguous(), "x must be contiguous"
+    assert enable_sgl_per_token_group_quant_8bit, (
+        "sgl_per_token_group_quant_8bit is required (v2 kernel supports "
+        "group_size in {16, 32, 64, 128})"
+    )
+
+    *x_batch, x_q_mn, x_q_k = x.shape
+    x_q = torch.empty(x.shape, device=x.device, dtype=fp8_dtype)
+
+    x_s_mn = x_q_mn
+    x_s_k = x_q_k // group_size
+    aligned_mn = ceil_align(x_s_mn, 4)
+    aligned_k = ceil_align(x_s_k, 4)
+    x_s = torch.empty(
+        (*x_batch, aligned_k // 4, aligned_mn),
+        device=x.device,
+        dtype=torch.int,
+    ).transpose(-1, -2)[..., :x_s_mn, :]
+
+    if x.shape[0] > 0:
+        sgl_per_token_group_quant_8bit(
+            x,
+            x_q,
+            x_s,
+            group_size,
+            eps,
+            fp8_min,
+            fp8_max,
+            True,  # scale_ue8m0
+            False,  # fuse_silu_and_mul
+            None,  # masked_m
+            enable_v2=True,
+        )
+
+    return x_q, x_s
+
+
 # TODO maybe unify int8 and fp8 code later
 def sglang_per_token_group_quant_8bit(
     x: torch.Tensor,
@@ -1015,8 +1060,25 @@ def get_w8a8_block_fp8_configs(
                 logger,
                 f"Using configuration from {config_file_path} for W8A8 Block FP8 kernel.",
             )
-            # If a configuration has been found, return it
-            return {int(key): val for key, val in json.load(f).items()}
+            raw = {int(key): val for key, val in json.load(f).items()}
+
+        sanitized = {}
+        clamped_ms = []
+        for m_key, cfg in raw.items():
+            if cfg["BLOCK_SIZE_K"] < block_k:
+                clamped_ms.append((m_key, cfg["BLOCK_SIZE_K"]))
+                cfg = {**cfg, "BLOCK_SIZE_K": block_k}
+            sanitized[m_key] = cfg
+        if clamped_ms:
+            logger.warning(
+                "Clamped BLOCK_SIZE_K up to %d in tuned config %s for entries %s "
+                "(scale stepping requires BLOCK_SIZE_K >= block_k).",
+                block_k,
+                json_file_name,
+                clamped_ms,
+            )
+
+        return sanitized
 
     # If no optimized configuration is available, we will use the default
     # configuration

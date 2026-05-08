@@ -191,7 +191,10 @@ class TestChatCompletionRequest(unittest.TestCase):
             },
         )
         self.assertEqual(request.reasoning_effort, "high")
-        self.assertEqual(request.chat_template_kwargs, {"thinking": True})
+        self.assertEqual(
+            request.chat_template_kwargs,
+            {"thinking": True, "enable_thinking": True},
+        )
 
     def test_chat_completion_reasoning_effort_none(self):
         """Test reasoning_effort='none' disables thinking"""
