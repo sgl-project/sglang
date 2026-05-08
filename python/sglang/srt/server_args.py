@@ -4627,6 +4627,7 @@ class ServerArgs:
                 "lof",
                 "priority",
                 "routing-key",
+                "sel",
             ],
             help="The scheduling policy of the requests.",
         )

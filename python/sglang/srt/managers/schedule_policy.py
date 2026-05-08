@@ -26,6 +26,7 @@ logger = logging.getLogger(__name__)
 
 import os
 import random
+import time
 from collections import Counter, defaultdict
 from contextlib import contextmanager
 from enum import Enum, auto
@@ -33,6 +34,7 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Set, Union
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.layers.attention.nsa.utils import is_nsa_prefill_cp_in_seq_split
 from sglang.srt.layers.utils.cp_utils import is_prefill_context_parallel_enabled
@@ -129,6 +131,7 @@ class CacheAgnosticPolicy(Enum):
     FCFS = "fcfs"  # first come first serve
     LOF = "lof"  # longest output first
     RANDOM = "random"
+    SEL = "sel"  # shortest extend length first
     ROUTING_KEY = "routing-key"  # prioritize by routing key frequency in running batch
 
 
@@ -149,6 +152,10 @@ class SchedulePolicy:
         self.enable_priority_scheduling = enable_priority_scheduling
         self.schedule_low_priority_values_first = schedule_low_priority_values_first
         self.priority_sign = 1 if schedule_low_priority_values_first else -1
+
+        # It is used by CacheAgnosticPolicy.SEL policy
+        self.sel_length_ratio = envs.SGLANG_SEL_LENGTH_RATIO.get()
+        self.sel_waiting_time_ratio = envs.SGLANG_SEL_WAITING_TIME_RATIO.get()
 
         # It is used to find the matching prefix for in-batch prefix caching.
         self.waiting_queue_radix_tree = RadixCache.create_simulated()
@@ -193,6 +200,10 @@ class SchedulePolicy:
             elif policy == CacheAgnosticPolicy.ROUTING_KEY:
                 if running_batch is not None:
                     SchedulePolicy._sort_by_routing_key(waiting_queue, running_batch)
+            elif policy == CacheAgnosticPolicy.SEL:
+                SchedulePolicy._sort_by_shortest_extend_length(
+                    waiting_queue, self.sel_length_ratio, self.sel_waiting_time_ratio
+                )
             else:
                 raise ValueError(f"Unknown CacheAgnostic Policy: {policy=}")
         return prefix_computed
@@ -264,6 +275,28 @@ class SchedulePolicy:
                         )
                     )
         return temporary_deprioritized
+
+    @staticmethod
+    def _sort_by_shortest_extend_length(
+        waiting_queue: List[Req], length_ratio: float, waiting_time_ratio: float
+    ) -> None:
+        """Sorts the waiting queue based on the shortest extend length."""
+        if not waiting_queue:
+            return
+        start_time = time.time()
+        max_length = max(req.extend_input_len for req in waiting_queue)
+        max_waiting_time = max(
+            start_time - req.time_stats.wait_queue_entry_time for req in waiting_queue
+        )
+        eps = 1e-10
+        waiting_queue.sort(
+            key=lambda r: (
+                length_ratio * (r.extend_input_len / (max_length + eps))
+                - waiting_time_ratio
+                * (start_time - r.time_stats.wait_queue_entry_time)
+                / (max_waiting_time + eps)
+            )
+        )
 
     @staticmethod
     def _sort_by_longest_prefix(

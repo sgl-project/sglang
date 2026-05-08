@@ -132,7 +132,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--prefill-max-requests` | The maximum number of requests in a prefill batch. If not specified, there is no limit. | `None` | Type: int |
 | `--enable-dynamic-chunking` | Enable dynamic chunk size adjustment for pipeline parallelism. When enabled, chunk sizes are dynamically calculated based on fitted function to maintain consistent execution time across chunks. | `False` | bool flag (set to enable) |
 | `--max-prefill-tokens` | The maximum number of tokens in a prefill batch. The real bound will be the maximum of this value and the model's maximum context length. | `16384` | Type: int |
-| `--schedule-policy` | The scheduling policy of the requests. | `fcfs` | `lpm`, `random`, `fcfs`, `dfs-weight`, `lof`, `priority`, `routing-key` |
+| `--schedule-policy` | The scheduling policy of the requests. | `fcfs` | `lpm`, `random`, `fcfs`, `dfs-weight`, `lof`, `priority`, `routing-key`, `sel` |
 | `--enable-priority-scheduling` | Enable priority scheduling. Requests with higher priority integer values will be scheduled first by default. | `False` | bool flag (set to enable) |
 | `--abort-on-priority-when-disabled` | If set, abort requests that specify a priority when priority scheduling is disabled. | `False` | bool flag (set to enable) |
 | `--schedule-low-priority-values-first` | If specified with --enable-priority-scheduling, the scheduler will schedule requests with lower priority integer values first. | `False` | bool flag (set to enable) |
