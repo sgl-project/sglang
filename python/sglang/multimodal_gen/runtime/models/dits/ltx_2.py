@@ -1222,9 +1222,7 @@ class LTX2VideoTransformer3DModel(CachableDiT, OffloadableDiTMixin):
     )
 
     @classmethod
-    def should_apply_fp8_cast_to_module(
-        cls, name: str, module: nn.Module
-    ) -> bool:
+    def should_apply_fp8_cast_to_module(cls, name: str, module: nn.Module) -> bool:
         return name.startswith("transformer_blocks.") and name.endswith(
             cls._fp8_cast_module_suffixes
         )
