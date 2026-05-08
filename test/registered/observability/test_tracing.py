@@ -46,7 +46,12 @@ from sglang.test.test_utils import (
 logger = logging.getLogger(__name__)
 
 # CI registration
-register_cuda_ci(est_time=113, suite="stage-b-test-1-gpu-small")
+register_cuda_ci(
+    est_time=113,
+    suite="nightly-1-gpu-5090",
+    nightly=True,
+    tags=(),
+)
 
 
 # ============================================================================

@@ -89,6 +89,8 @@ NIGHTLY_SUITES = {
         "nightly-perf-vlm-2-gpu",
         # GB300 (4x B200 NVL4) nightly suite
         "nightly-4-gpu-gb300",
+        # 5090 / SM12.0 nightly suite (workflow added separately)
+        "nightly-1-gpu-5090",
     ],
     HWBackend.AMD: [
         "nightly-amd",
@@ -138,11 +140,8 @@ OTHER_SUITES = {
 # this constant.
 PER_COMMIT_TO_NIGHTLY = {
     HWBackend.CUDA: {
-        # NOTE: 5090 / SM12.0 has no nightly job today; the two stage-a/b
-        # 1-gpu-small suites pull from "nightly-1-gpu" once a nightly-1-gpu-5090
-        # job is added (tracked separately).
-        "stage-a-test-1-gpu-small": [],
-        "stage-b-test-1-gpu-small": [],
+        "stage-a-test-1-gpu-small": ["nightly-1-gpu-5090"],
+        "stage-b-test-1-gpu-small": ["nightly-1-gpu-5090"],
         "stage-b-test-1-gpu-large": ["nightly-1-gpu"],
         "stage-b-test-2-gpu-large": ["nightly-2-gpu"],
         "stage-b-test-4-gpu-b200": ["nightly-4-gpu-b200"],

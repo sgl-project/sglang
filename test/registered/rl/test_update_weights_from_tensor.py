@@ -1,6 +1,11 @@
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
-register_cuda_ci(est_time=147, suite="stage-b-test-1-gpu-small")
+register_cuda_ci(
+    est_time=147,
+    suite="nightly-1-gpu-5090",
+    nightly=True,
+    tags=("rl",),
+)
 register_amd_ci(est_time=195, suite="stage-b-test-1-gpu-small-amd")
 
 import gc
