@@ -12,7 +12,6 @@ from sglang.srt.distributed import divide
 from sglang.srt.layers.dp_attention import (
     get_attention_tp_rank,
     get_attention_tp_size,
-    is_dp_attention_enabled,
 )
 from sglang.srt.layers.attention.mamba.mamba2_metadata import Mamba2Metadata
 from sglang.srt.layers.attention.mamba.mixer2_rms_norm_gated import Mixer2RMSNormGated
@@ -397,6 +396,9 @@ class MambaMixer2(torch.nn.Module):
         set_weight_attrs(self.A, {"weight_loader": a_weight_loader})
         set_weight_attrs(self.dt_bias, {"weight_loader": sharded_weight_loader(0)})
 
+        # Defer the row-parallel all-reduce to the next layer's
+        # LayerCommunicator (prepare_mlp). This matches falcon_h1 / qwen3_next
+        # and avoids a double reduce when LayerCommunicator runs.
         self.out_proj = RowParallelLinear(
             intermediate_size,
             hidden_size,
@@ -405,7 +407,7 @@ class MambaMixer2(torch.nn.Module):
             quant_config=quant_config,
             tp_size=self.tp_size,
             tp_rank=self.tp_rank,
-            use_dp_attention_reduce=is_dp_attention_enabled(),
+            reduce_results=False,
             prefix=f"{prefix}.out_proj",
         )
 
