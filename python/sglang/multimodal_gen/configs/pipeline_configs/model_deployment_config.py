@@ -1,3 +1,8 @@
+"""
+    ModelDeploymentConfig provides model-specific config on how to deploy a model optimally
+
+"""
+
 from dataclasses import dataclass
 
 
