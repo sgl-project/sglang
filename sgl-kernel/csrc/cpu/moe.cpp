@@ -833,7 +833,6 @@ static inline void check_moe_scales(
   TORCH_CHECK(w2s.size(DIM0) == div_up(K, block_size_N));     \
   TORCH_CHECK(w2s.size(DIM1) == div_up(N, block_size_K))
 
-#ifndef __aarch64__
 // hidden_states: [M, K]
 // w1: [E, 2N, K]
 // w2: [E, K, N]
@@ -1123,7 +1122,6 @@ at::Tensor fused_experts_cpu(
   });
   return out_hidden_states;
 }
-#endif  // #ifndef __aarch64__
 
 // shared expert kernel
 //

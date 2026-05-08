@@ -74,8 +74,6 @@ at::Tensor int8_scaled_mm_with_quant(
     const std::optional<at::Tensor>& bias,
     at::ScalarType out_dtype,
     bool /*is_vnni*/) {
-  RECORD_FUNCTION("sgl-kernel::int8_scaled_mm_with_quant", std::vector<c10::IValue>({mat1, mat2, scales2, bias}));
-
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(mat1);
   CHECK_INPUT(mat2);
   CHECK_INPUT(scales2);

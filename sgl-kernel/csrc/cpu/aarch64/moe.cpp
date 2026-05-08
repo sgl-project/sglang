@@ -3,28 +3,6 @@
 
 namespace {
 
-void check_moe_scales(
-    bool use_int8_w8a8,
-    bool use_fp8_w8a16,
-    const std::optional<at::Tensor>& w13_scale,
-    const std::optional<at::Tensor>& w2_scale,
-    const std::optional<std::vector<int64_t>> block_size,
-    const std::optional<at::Tensor>& a1_scale,
-    const std::optional<at::Tensor>& a2_scale) {
-  if (use_int8_w8a8) {
-    TORCH_CHECK(w13_scale.has_value(), "missing w13_scale for int8 w8a8.");
-    TORCH_CHECK(w2_scale.has_value(), "missing w2_scale for int8 w8a8.");
-    TORCH_CHECK(!a1_scale.has_value(), "static quantization for activation not supported.");
-    TORCH_CHECK(!a2_scale.has_value(), "static quantization for activation not supported.");
-  }
-  if (use_fp8_w8a16) {
-    TORCH_CHECK(w13_scale.has_value(), "missing w13_scale for fp8 w8a16.");
-    TORCH_CHECK(w2_scale.has_value(), "missing w2_scale for fp8 w8a16.");
-    TORCH_CHECK(block_size.has_value(), "missing block_size for fp8 w8a16.");
-    TORCH_CHECK(block_size.value().size() == 2, "expect block_size.size() to be 2.");
-  }
-}
-
 // key: expert id, value: input rows and weights for this expert
 using expert_to_rows_t = std::map<int, std::vector<std::tuple<int, float>>>;
 
@@ -254,17 +232,13 @@ at::Tensor fused_experts_cpu(
     at::Tensor& topk_weights,
     at::Tensor& topk_ids,
     bool inplace,
-    bool use_int8_w8a8,
-    bool use_fp8_w8a16,
+    int64_t moe_comp_method,
     const std::optional<at::Tensor>& w13_scale,
     const std::optional<at::Tensor>& w2_scale,
+    const std::optional<at::Tensor>& /*w13_zero*/,
+    const std::optional<at::Tensor>& /*w2_zero*/,
     const std::optional<std::vector<int64_t>> block_size,
-    const std::optional<at::Tensor>& a1_scale,
-    const std::optional<at::Tensor>& a2_scale,
     bool /*is_vnni*/) {
-  RECORD_FUNCTION(
-      "sgl-kernel::fused_experts_cpu", std::vector<c10::IValue>({hidden_states, w13, w2, topk_weights, topk_ids}));
-
   const auto st = hidden_states.scalar_type();
   CHECK_INPUT(hidden_states);
   CHECK_INPUT(w13);
@@ -293,9 +267,6 @@ at::Tensor fused_experts_cpu(
   CHECK_EQ(w13.size(2), K);
   CHECK_EQ(w2.size(2), N);
 
-  // check scales
-  check_moe_scales(use_int8_w8a8, use_fp8_w8a16, w13_scale, w2_scale, block_size, a1_scale, a2_scale);
-
   CHECK_EQ(inplace, false);
   at::Tensor out = at::empty_like(hidden_states);
 
@@ -314,45 +285,38 @@ at::Tensor fused_experts_cpu(
   }
 
   AT_DISPATCH_REDUCED_FLOATING_TYPES(st, "fused_experts_kernel_impl", [&] {
-    if (use_int8_w8a8) {
-      auto& w13s = w13_scale.value();
-      auto& w2s = w2_scale.value();
-      TORCH_CHECK(w13s.numel() == E * 2 * N);
-      TORCH_CHECK(w2s.numel() == E * K);
+    auto& w13s = w13_scale.value();
+    auto& w2s = w2_scale.value();
+    TORCH_CHECK(w13s.numel() == E * 2 * N);
+    TORCH_CHECK(w2s.numel() == E * K);
 
-      // quantize hidden_states
-      auto x_buffer = at::empty({M * K}, hidden_states.options().dtype(at::kChar));
-      auto x_scale_buffer = at::empty({M}, at::kFloat);
-      int8_t* x = x_buffer.data_ptr<int8_t>();
-      float* x_scale = x_scale_buffer.data_ptr<float>();
-      scalar_t* in = hidden_states.data_ptr<scalar_t>();
-      const int64_t grain = kL1Size / (K * sizeof(scalar_t));
-      at::parallel_for(0, M, grain, [&](int64_t begin, int64_t end) {
-        for (int64_t m = begin; m < end; ++m) {
-          op::quantize_row_int8(x + m * K, x_scale + m, in + m * K, K);
-        }
-      });
+    // quantize hidden_states
+    auto x_buffer = at::empty({M * K}, hidden_states.options().dtype(at::kChar));
+    auto x_scale_buffer = at::empty({M}, at::kFloat);
+    int8_t* x = x_buffer.data_ptr<int8_t>();
+    float* x_scale = x_scale_buffer.data_ptr<float>();
+    scalar_t* in = hidden_states.data_ptr<scalar_t>();
+    const int64_t grain = kL1Size / (K * sizeof(scalar_t));
+    at::parallel_for(0, M, grain, [&](int64_t begin, int64_t end) {
+      for (int64_t m = begin; m < end; ++m) {
+        op::quantize_row_int8(x + m * K, x_scale + m, in + m * K, K);
+      }
+    });
 
-      fused_experts_int8_kernel_impl<scalar_t>(
-          out.data_ptr<scalar_t>(),
-          x,
-          w13.data_ptr<int8_t>(),
-          w2.data_ptr<int8_t>(),
-          x_scale,
-          w13s.data_ptr<float>(),
-          w2s.data_ptr<float>(),
-          x_per_expert,
-          M,
-          N,
-          K,
-          E,
-          topk);
-    } else if (use_fp8_w8a16) {
-      TORCH_CHECK(false, "not implemented yet");
-    } else {
-      // bf16
-      TORCH_CHECK(false, "not implemented yet");
-    }
+    fused_experts_int8_kernel_impl<scalar_t>(
+        out.data_ptr<scalar_t>(),
+        x,
+        w13.data_ptr<int8_t>(),
+        w2.data_ptr<int8_t>(),
+        x_scale,
+        w13s.data_ptr<float>(),
+        w2s.data_ptr<float>(),
+        x_per_expert,
+        M,
+        N,
+        K,
+        E,
+        topk);
   });
 
   return out;
