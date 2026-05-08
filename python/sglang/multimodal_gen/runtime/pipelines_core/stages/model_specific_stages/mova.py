@@ -46,6 +46,7 @@ from sglang.multimodal_gen.runtime.models.dits.mova_video_dit import (
 # Create aliases for backward compatibility
 video_sinusoidal_embedding_1d = sinusoidal_embedding_1d
 audio_sinusoidal_embedding_1d = sinusoidal_embedding_1d
+from sglang.multimodal_gen.runtime.managers.component_manager import ComponentUse
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch, Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
     PipelineStage,
@@ -62,7 +63,6 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
 )
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs, get_global_server_args
-from sglang.multimodal_gen.runtime.utils.layerwise_offload import OffloadableDiTMixin
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.perf_logger import StageProfiler
 from sglang.multimodal_gen.runtime.utils.profiler import SGLDiffusionProfiler
@@ -158,6 +158,32 @@ class MOVADenoisingStage(PipelineStage):
         self._cache_dit_enabled = False
         self._cached_num_steps = None
         self._torch_compiled = False
+
+    def component_uses(
+        self, server_args: ServerArgs, stage_name: str | None = None
+    ) -> list[ComponentUse]:
+        stage_name = self._component_stage_name(stage_name)
+        uses = [
+            ComponentUse(stage_name, "audio_dit"),
+            ComponentUse(stage_name, "dual_tower_bridge"),
+            ComponentUse(
+                stage_name,
+                "video_dit",
+                phase="video_dit",
+                preferred_ready_after_request=True,
+                memory_intensive=True,
+            ),
+        ]
+        if self.video_dit_2 is not None:
+            uses.append(
+                ComponentUse(
+                    stage_name,
+                    "video_dit_2",
+                    phase="video_dit_2",
+                    memory_intensive=True,
+                )
+            )
+        return uses
 
     @property
     def parallelism_type(self) -> StageParallelismType:
@@ -329,27 +355,6 @@ class MOVADenoisingStage(PipelineStage):
     ) -> object | None:
         return None
 
-    def _manage_device_placement(
-        self,
-        model_to_use: nn.Module | None,
-        model_to_offload: nn.Module | None,
-        server_args: ServerArgs,
-    ):
-        if not server_args.dit_cpu_offload:
-            return
-
-        if (
-            model_to_offload is not None
-            and next(model_to_offload.parameters()).device.type == "cuda"
-        ):
-            model_to_offload.to("cpu")
-
-        if (
-            model_to_use is not None
-            and next(model_to_use.parameters()).device.type == "cpu"
-        ):
-            model_to_use.to(get_local_torch_device())
-
     def _select_visual_dit(
         self,
         timestep: float,
@@ -358,24 +363,52 @@ class MOVADenoisingStage(PipelineStage):
         scheduler,
     ):
         if boundary_ratio is None or self.video_dit_2 is None:
-            self._manage_device_placement(self.video_dit, None, server_args)
+            self._manage_video_dit_use(self.video_dit, "video_dit")
             return self.video_dit
 
         boundary_timestep = boundary_ratio * scheduler.num_train_timesteps
         if timestep >= boundary_timestep:
             current_model = self.video_dit
-            model_to_offload = self.video_dit_2
+            current_name = "video_dit"
         else:
             current_model = self.video_dit_2
-            model_to_offload = self.video_dit
+            current_name = "video_dit_2"
 
-        self._manage_device_placement(current_model, model_to_offload, server_args)
+        self._manage_video_dit_use(current_model, current_name)
         return current_model
+
+    def _manage_video_dit_use(
+        self, current_model: nn.Module, default_name: str
+    ) -> bool:
+        manager = self._component_residency_manager
+        if manager is None:
+            return False
+
+        component_name = manager.component_name_for_module(current_model, default_name)
+        use = ComponentUse(
+            stage_name=self._active_component_stage_name(),
+            component_name=component_name,
+            phase=component_name,
+            preferred_ready_after_request=component_name == "video_dit",
+            memory_intensive=True,
+        )
+        manager.begin_use(use, module=current_model)
+        return True
 
     def _ensure_shared_models_on_device(self, server_args: ServerArgs):
         """Ensure shared denoising modules are on the active device when cpu offload is enabled."""
-        self._manage_device_placement(self.audio_dit, None, server_args)
-        self._manage_device_placement(self.dual_tower_bridge, None, server_args)
+        manager = self._component_residency_manager
+        if manager is None:
+            return
+        stage_name = self._active_component_stage_name()
+        manager.ensure_ready(
+            ComponentUse(stage_name, "audio_dit"),
+            module=self.audio_dit,
+        )
+        manager.ensure_ready(
+            ComponentUse(stage_name, "dual_tower_bridge"),
+            module=self.dual_tower_bridge,
+        )
 
     def _apply_guidance_rescale(
         self,
@@ -598,9 +631,7 @@ class MOVADenoisingStage(PipelineStage):
                     if not is_warmup and hasattr(self, "step_profile"):
                         self.step_profile()
 
-        for dit in filter(None, [self.video_dit, self.video_dit_2, self.audio_dit]):
-            if isinstance(dit, OffloadableDiTMixin):
-                dit.prepare_for_next_req()
+        self._finish_active_component_use()
 
         return batch
 
@@ -911,6 +942,16 @@ class MOVADecodingStage(PipelineStage):
         self.video_vae = video_vae
         self.audio_vae = audio_vae
 
+    def component_uses(
+        self, server_args: ServerArgs, stage_name: str | None = None
+    ) -> list[ComponentUse]:
+        stage_name = self._component_stage_name(stage_name)
+        vae_dtype = PRECISION_TO_TYPE[server_args.pipeline_config.vae_precision]
+        return [
+            ComponentUse(stage_name, "video_vae", target_dtype=vae_dtype),
+            ComponentUse(stage_name, "audio_vae"),
+        ]
+
     @property
     def parallelism_type(self) -> StageParallelismType:
         if get_global_server_args().enable_cfg_parallel:
@@ -919,36 +960,45 @@ class MOVADecodingStage(PipelineStage):
 
     @torch.no_grad()
     def forward(self, batch: Req, server_args: ServerArgs) -> OutputBatch:
-        self.video_vae = self.video_vae.to(get_local_torch_device())
-        self.audio_vae = self.audio_vae.to(get_local_torch_device())
-
-        video_latents = server_args.pipeline_config.denormalize_video_latents(
-            batch.latents, self.video_vae
-        )
-
         vae_dtype = PRECISION_TO_TYPE[server_args.pipeline_config.vae_precision]
         vae_autocast_enabled = (
             vae_dtype != torch.float32
         ) and not server_args.disable_autocast
 
-        with torch.autocast(
-            device_type=current_platform.device_type,
-            dtype=vae_dtype,
-            enabled=vae_autocast_enabled,
-        ):
-            if server_args.pipeline_config.vae_tiling:
-                self.video_vae.enable_tiling()
-            if not vae_autocast_enabled:
-                video_latents = video_latents.to(vae_dtype)
-            decode_output = self.video_vae.decode(video_latents)
-            video = _ensure_tensor_decode_output(decode_output)
+        with self.use_declared_component(
+            component_name="video_vae",
+            module=self.video_vae,
+        ) as video_vae:
+            assert video_vae is not None
+            self.video_vae = video_vae
+            video_latents = server_args.pipeline_config.denormalize_video_latents(
+                batch.latents, self.video_vae
+            )
+
+            with torch.autocast(
+                device_type=current_platform.device_type,
+                dtype=vae_dtype,
+                enabled=vae_autocast_enabled,
+            ):
+                if server_args.pipeline_config.vae_tiling:
+                    self.video_vae.enable_tiling()
+                if not vae_autocast_enabled:
+                    video_latents = video_latents.to(vae_dtype)
+                decode_output = self.video_vae.decode(video_latents)
+                video = _ensure_tensor_decode_output(decode_output)
 
         video = (video / 2 + 0.5).clamp(0, 1)
 
-        with torch.autocast(
-            device_type=current_platform.device_type, dtype=torch.float32
-        ):
-            audio = self.audio_vae.decode(batch.audio_latents)
+        with self.use_declared_component(
+            component_name="audio_vae",
+            module=self.audio_vae,
+        ) as audio_vae:
+            assert audio_vae is not None
+            self.audio_vae = audio_vae
+            with torch.autocast(
+                device_type=current_platform.device_type, dtype=torch.float32
+            ):
+                audio = self.audio_vae.decode(batch.audio_latents)
         output_batch = OutputBatch(
             output=video,
             audio=audio,

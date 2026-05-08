@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, List, Optional
 
@@ -10,6 +11,13 @@ from sglang.srt.server_args import ServerArgs
 
 if TYPE_CHECKING:
     from sglang.srt.disaggregation.utils import DisaggregationMode
+
+
+@dataclasses.dataclass
+class KVTransferMetric:
+    # Backends that cannot isolate transfer latency can leave this as None.
+    transfer_latency_s: Optional[float] = None
+    transfer_total_bytes: Optional[int] = None
 
 
 class KVArgs:
@@ -23,7 +31,7 @@ class KVArgs:
     state_data_ptrs: List[int]
     state_data_lens: List[int]
     state_item_lens: List[int]
-    state_type: str  # "none", "mamba", "swa"
+    state_type: str  # "none", "mamba", "swa", "nsa", "dsv4"
     # for mamba state different tp slice transfer
     state_dim_per_tensor: List[int]  # dimension to slice for each state tensor
     ib_device: str
@@ -95,6 +103,17 @@ class BaseKVSender(ABC):
         """
         ...
 
+    def pop_decode_prefix_len(self) -> int:
+        return 0
+
+    def should_send_kv_chunk(self, num_pages: int, last_chunk: bool) -> bool:
+        return num_pages > 0
+
+    @abstractmethod
+    def get_transfer_metric(self) -> KVTransferMetric:
+        """Return backend-specific transfer metrics for this sender."""
+        ...
+
     @abstractmethod
     def poll(self) -> KVPoll:
         """
@@ -136,6 +155,7 @@ class BaseKVReceiver(ABC):
         kv_indices: npt.NDArray[np.int32],
         aux_index: Optional[int] = None,
         state_indices: Optional[List[int]] = None,
+        decode_prefix_len: Optional[int] = None,
     ):
         """
         Notify the prefill server about the kv indices, aux index, and state_indices.
