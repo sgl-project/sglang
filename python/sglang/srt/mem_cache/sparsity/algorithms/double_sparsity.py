@@ -156,6 +156,26 @@ class DoubleSparsityAlgorithm(BaseSparseAlgorithm):
             **kwargs,
         )
 
+    def effective_sparse_mask(
+        self,
+        forward_batch,
+        req_pool_indices: torch.Tensor,
+        default_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """Gate on current `seq_lens`, not admission-time `prompt_lens`.
+
+        The base coordinator computes `default_mask` from
+        `prompt_lens >= min_sparse_prompt_len`. For DS that's wrong:
+        a request admitted with prompt_len=100 but generating to
+        seq_len=5000 would never become sparse, even though by then
+        decode is squarely above `min_seq_len`. We recompute from
+        current seq_lens so late-crossing rows flip to sparse, and
+        the coordinator threads this same mask into both retrieve_topk
+        and the FA3 adaptor.
+        """
+        seq_lens = forward_batch.seq_lens.to(default_mask.device)
+        return seq_lens >= self.runtime_config.min_seq_len
+
     def initialize_representation_pool(
         self,
         start_layer: int,

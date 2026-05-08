@@ -242,8 +242,14 @@ class SparseCoordinator:
         **kwargs,
     ) -> Optional[torch.Tensor]:
         req_pool_indices = forward_batch.req_pool_indices
-        # Compute Topk
-        sparse_mask = self._compute_sparse_mask(req_pool_indices)
+        # Effective mask: default is prompt_lens-based, algorithms can override
+        # when their gating depends on runtime state (DS uses current seq_lens).
+        # Threaded into BOTH retrieve_topk and adapt_for_attn_metadata so the
+        # adaptor never sees a different mask than the algorithm did.
+        default_mask = self._compute_sparse_mask(req_pool_indices)
+        sparse_mask = self.algorithm.effective_sparse_mask(
+            forward_batch, req_pool_indices, default_mask
+        )
         selected_indices, valid_lengths = self.algorithm.retrieve_topk(
             queries=query,
             layer_id=layer.layer_id,
