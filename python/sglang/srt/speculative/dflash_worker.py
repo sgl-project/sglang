@@ -74,8 +74,8 @@ class DFlashWorker:
         self.model_runner = target_worker.model_runner
         self.page_size = server_args.page_size
         self.draft_window_size: Optional[int] = (
-            int(server_args.speculative_dflash_draft_window_size)
-            if server_args.speculative_dflash_draft_window_size is not None
+            int(server_args.speculative_draft_window_size)
+            if server_args.speculative_draft_window_size is not None
             else None
         )
         self.use_compact_draft_cache = self.draft_window_size is not None
