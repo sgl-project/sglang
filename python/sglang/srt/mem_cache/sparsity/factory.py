@@ -14,6 +14,9 @@ from sglang.srt.mem_cache.sparsity.backend.backend_adaptor import (
     FlashAttentionAdaptor,
     NSABackendAdaptor,
 )
+from sglang.srt.mem_cache.sparsity.backend.ds_flash_attention_adaptor import (
+    DSFlashAttentionAdaptor,
+)
 from sglang.srt.mem_cache.sparsity.core.sparse_coordinator import (
     SparseConfig,
     SparseCoordinator,
@@ -57,6 +60,16 @@ def _create_backend_adaptor(
     """Create backend adaptor."""
     if isinstance(sparse_algorithm, DeepSeekNSAAlgorithm):
         return NSABackendAdaptor(device, req_to_token_pool)
+
+    if isinstance(sparse_algorithm, DoubleSparsityAlgorithm):
+        if backend not in ("fa3", "flashattention"):
+            raise ValueError(
+                f"Double Sparsity v1 requires FA3, got backend={backend!r}"
+            )
+        return DSFlashAttentionAdaptor(
+            device,
+            max_selected_per_request=sparse_algorithm.runtime_config.max_selected_per_request,
+        )
 
     if backend in ["fa3", "flashattention"]:
         return FlashAttentionAdaptor(device)
