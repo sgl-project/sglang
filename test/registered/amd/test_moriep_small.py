@@ -62,11 +62,13 @@ common_args = [
     "--mem-fraction-static",
     "0.72",  # relax for mi300x
     "--chunked-prefill-size",
-    "32768",
+    "16384",
     "--max-running-requests",
     "128",
     "--context-length",
     "12288",
+    "--max-total-tokens",
+    "131072",
     "--attention-backend",
     "aiter",
     "--cuda-graph-max-bs",
@@ -400,6 +402,8 @@ class TestMTPwithTBONormal(CustomTestCase):
         env["SGLANG_MORI_DISPATCH_DTYPE"] = "bf16"
         env["SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK"] = "4096"
         env["MORI_SHMEM_MODE"] = "ISOLATION"  # avoid out of symmetric heap memory
+        env["SGLANG_ENABLE_SPEC_V2"] = "false"
+        env["MORI_ENABLE_SDMA"] = "true"
 
         cls.process = popen_launch_server(
             cls.model,
@@ -458,9 +462,11 @@ class TestMTPwithTBOLowLatency(CustomTestCase):
         env["SGLANG_USE_AITER"] = "1"
         env["SGLANG_MORI_DISPATCH_DTYPE"] = "bf16"
         env["SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK"] = "4096"
+        env["SGLANG_ENABLE_SPEC_V2"] = "false"
         env["MORI_SHMEM_MODE"] = "ISOLATION"  # avoid out of symmetric heap memory
         # FIXME(billishyahao): enable p2p due to no rdma devices on CI machine
         # env["MORI_DISABLE_P2P"] = "1"
+        env["MORI_ENABLE_SDMA"] = "true"
 
         cls.process = popen_launch_server(
             cls.model,

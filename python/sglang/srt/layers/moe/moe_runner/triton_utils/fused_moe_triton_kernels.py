@@ -966,6 +966,8 @@ def act_and_mul_kernel(
     expert_step: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
     ACTIVATION_TYPE: tl.constexpr,
+    SWIGLU_LIMIT: tl.constexpr = 0.0,
+    HAS_SWIGLU_LIMIT: tl.constexpr = False,
 ):
     """
     Unified activation and multiply kernel that handles both sorted and unsorted routing,
@@ -994,6 +996,10 @@ def act_and_mul_kernel(
         gate_output = tl.load(gate_output_ptr + offset, mask=mask)
         up_output = tl.load(up_output_ptr + offset, mask=mask)
 
+        if HAS_SWIGLU_LIMIT:
+            gate_output = tl.minimum(gate_output, SWIGLU_LIMIT)
+            up_output = tl.maximum(tl.minimum(up_output, SWIGLU_LIMIT), -SWIGLU_LIMIT)
+
         gate_output_activated = _apply_activation(gate_output, ACTIVATION_TYPE)
         gate_output_activated = gate_output_activated.to(InDtype)
 
@@ -1010,6 +1016,7 @@ def act_and_mul_triton(
     expert_ids: Optional[torch.Tensor] = None,
     down_moe_use_tma: bool = False,
     activation: str = "silu",
+    swiglu_limit: Optional[float] = None,
 ) -> None:
     """
     Args:
@@ -1020,11 +1027,14 @@ def act_and_mul_triton(
         expert_ids: Expert IDs for sorted routing (used when down_moe_use_tma=True)
         down_moe_use_tma: Whether to use sorted routing layout
         activation: Activation type ("silu" or "gelu")
+        swiglu_limit: if not None, clamp gate to [-inf, L] and up to [-L, L] before activation
+                      (compiles a separate kernel variant via tl.constexpr).
     """
     grid = (down_input.shape[0],)
     hidden_size = gateup_output.shape[1]
     expert_ids_row = topk_ids.view(-1) if not down_moe_use_tma else expert_ids
     expert_step = 1 if not down_moe_use_tma else config["BLOCK_SIZE_M"]
+    has_swiglu_limit = swiglu_limit is not None
     act_and_mul_kernel[grid](
         gateup_output,
         down_input,
@@ -1033,6 +1043,8 @@ def act_and_mul_triton(
         expert_step,
         BLOCK_SIZE=512,
         ACTIVATION_TYPE=activation,
+        SWIGLU_LIMIT=float(swiglu_limit) if has_swiglu_limit else 0.0,
+        HAS_SWIGLU_LIMIT=has_swiglu_limit,
     )
 
 

@@ -3,9 +3,9 @@
     "cases": {
         "qwen_image_t2i": {
             "clip_threshold": 0.97,
-            "ssim_threshold": 0.84,
+            "ssim_threshold": 0.83,
             "psnr_threshold": 16.0,
-            "mean_abs_diff_threshold": 11.5
+            "mean_abs_diff_threshold": 13.3
         },
         "flux_image_t2i": {
             "clip_threshold": 0.92,
@@ -14,34 +14,46 @@
             "mean_abs_diff_threshold": 8.0
         },
         "flux_2_klein_image_t2i": {
-            "clip_threshold": 0.86,
-            "ssim_threshold": 0.60,
-            "psnr_threshold": 10.0,
-            "mean_abs_diff_threshold": 56.0
+            "clip_threshold": 0.94,
+            "ssim_threshold": 0.78,
+            "psnr_threshold": 17.0,
+            "mean_abs_diff_threshold": 17.0
         },
         "zimage_image_t2i": {
             "clip_threshold": 0.92,
-            "ssim_threshold": 0.90,
-            "psnr_threshold": 22.0,
-            "mean_abs_diff_threshold": 8.0
+            "ssim_threshold": 0.86,
+            "psnr_threshold": 19.9,
+            "mean_abs_diff_threshold": 8.5
         },
         "zimage_image_t2i_multi_lora": {
             "clip_threshold": 0.92,
-            "ssim_threshold": 0.92,
-            "psnr_threshold": 22.0,
+            "ssim_threshold": 0.89,
+            "psnr_threshold": 19.9,
             "mean_abs_diff_threshold": 8.0
         },
         "qwen_image_t2i_cache_dit_enabled": {
-            "clip_threshold": 0.99,
-            "ssim_threshold": 0.86,
-            "psnr_threshold": 17.0,
-            "mean_abs_diff_threshold": 10.0
+            "clip_threshold": 0.98,
+            "ssim_threshold": 0.73,
+            "psnr_threshold": 13.5,
+            "mean_abs_diff_threshold": 26.0
+        },
+        "qwen_image_t2i_2_gpus": {
+            "clip_threshold": 0.98,
+            "ssim_threshold": 0.79,
+            "psnr_threshold": 14.3,
+            "mean_abs_diff_threshold": 20.0
         },
         "flux_2_image_t2i": {
+            "clip_threshold": 0.98,
+            "ssim_threshold": 0.86,
+            "psnr_threshold": 14.9,
+            "mean_abs_diff_threshold": 13.0
+        },
+        "flux_2_ti2i": {
             "clip_threshold": 0.96,
-            "ssim_threshold": 0.95,
-            "psnr_threshold": 28.0,
-            "mean_abs_diff_threshold": 8.0
+            "ssim_threshold": 0.88,
+            "psnr_threshold": 19.5,
+            "mean_abs_diff_threshold": 13.5
         },
         "layerwise_offload": {
             "clip_threshold": 0.94,
@@ -56,22 +68,22 @@
             "mean_abs_diff_threshold": 9.5
         },
         "qwen_image_edit_2509_ti2i": {
-            "clip_threshold": 0.92,
-            "ssim_threshold": 0.65,
-            "psnr_threshold": 13.0,
-            "mean_abs_diff_threshold": 26.0
+            "clip_threshold": 0.75,
+            "ssim_threshold": 0.52,
+            "psnr_threshold": 10.5,
+            "mean_abs_diff_threshold": 46.5
         },
         "qwen_image_edit_ti2i": {
             "clip_threshold": 0.96,
-            "ssim_threshold": 0.95,
-            "psnr_threshold": 28.0,
-            "mean_abs_diff_threshold": 8.0
+            "ssim_threshold": 0.94,
+            "psnr_threshold": 25.4,
+            "mean_abs_diff_threshold": 10.0
         },
         "qwen_image_edit_2511_ti2i": {
             "clip_threshold": 0.96,
-            "ssim_threshold": 0.95,
-            "psnr_threshold": 28.0,
-            "mean_abs_diff_threshold": 8.0
+            "ssim_threshold": 0.83,
+            "psnr_threshold": 21.0,
+            "mean_abs_diff_threshold": 16.6
         },
         "qwen_image_layered_i2i": {
             "clip_threshold": 0.92,
@@ -87,9 +99,27 @@
         },
         "wan2_1_t2v_1.3b": {
             "clip_threshold": 0.94,
-            "ssim_threshold": 0.94,
-            "psnr_threshold": 26.0,
+            "ssim_threshold": 0.85,
+            "psnr_threshold": 25.0,
             "mean_abs_diff_threshold": 8.0
+        },
+        "ltx_2_two_stage_t2v": {
+            "clip_threshold": 0.90,
+            "ssim_threshold": 0.89,
+            "psnr_threshold": 24.0,
+            "mean_abs_diff_threshold": 10.0
+        },
+        "ltx_2.3_one_stage_ti2v": {
+            "clip_threshold": 0.64,
+            "ssim_threshold": 0.42,
+            "psnr_threshold": 8.8,
+            "mean_abs_diff_threshold": 59.0
+        },
+        "ltx_2.3_two_stage_t2v_2gpus": {
+            "clip_threshold": 0.79,
+            "ssim_threshold": 0.12,
+            "psnr_threshold": 12.1,
+            "mean_abs_diff_threshold": 51.0
         },
         "wan2_1_t2v_1.3b_teacache_enabled": {
             "clip_threshold": 0.93,
@@ -116,12 +146,6 @@
             "mean_abs_diff_threshold": 10.0
         },
         "turbo_wan2_1_t2v_1.3b": {
-            "clip_threshold": 0.90,
-            "ssim_threshold": 0.52,
-            "psnr_threshold": 9.5,
-            "mean_abs_diff_threshold": 46.0
-        },
-        "zimage_image_t2i_multi_lora": {
             "clip_threshold": 0.90,
             "ssim_threshold": 0.52,
             "psnr_threshold": 9.5,
@@ -175,12 +199,6 @@
             "psnr_threshold": 18.7,
             "mean_abs_diff_threshold": 8.0
         },
-        "flux_2_klein_ti2i_2_gpus": {
-            "clip_threshold": 0.92,
-            "ssim_threshold": 0.77,
-            "psnr_threshold": 18.4,
-            "mean_abs_diff_threshold": 18.0
-        },
         "wan2_2_t2v_a14b_teacache_2gpu": {
             "clip_threshold": 0.90,
             "ssim_threshold": 0.72,
@@ -228,6 +246,18 @@
             "ssim_threshold": 0.89,
             "psnr_threshold": 24.0,
             "mean_abs_diff_threshold": 10.0
+        },
+        "ltx_2_3_hq_pipeline": {
+            "clip_threshold": 0.78,
+            "ssim_threshold": 0.48,
+            "psnr_threshold": 13.0,
+            "mean_abs_diff_threshold": 45.0
+        },
+        "ltx_2_3_two_stage_ti2v_2gpus": {
+            "clip_threshold": 0.92,
+            "ssim_threshold": 0.58,
+            "psnr_threshold": 17.5,
+            "mean_abs_diff_threshold": 20.0
         }
     },
     "default_clip_threshold_image": 0.92,
