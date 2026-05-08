@@ -17,6 +17,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
     QwenImagePipelineConfig,
 )
 from sglang.multimodal_gen.configs.pipeline_configs.wan import WanT2V480PConfig
+from sglang.multimodal_gen.configs.pipeline_configs.zimage import ZImagePipelineConfig
 from sglang.multimodal_gen.registry import _get_config_info
 from sglang.multimodal_gen.runtime.models.dits.qwen_image import (
     QwenImageTransformer2DModel,
@@ -242,6 +243,7 @@ class TestOffloadDefaults(unittest.TestCase):
         qwen_deployment = QwenImagePipelineConfig().get_model_deployment_config()
         wan_deployment = WanT2V480PConfig().get_model_deployment_config()
         mova_deployment = MOVAPipelineConfig().get_model_deployment_config()
+        zimage_deployment = ZImagePipelineConfig().get_model_deployment_config()
 
         self.assertEqual(qwen_deployment.fsdp_cfg_auto_min_available_memory_gb, 70)
         self.assertFalse(qwen_deployment.auto_dit_layerwise_offload)
@@ -251,6 +253,9 @@ class TestOffloadDefaults(unittest.TestCase):
 
         self.assertIsNone(mova_deployment.fsdp_cfg_auto_min_available_memory_gb)
         self.assertTrue(mova_deployment.auto_dit_layerwise_offload)
+
+        self.assertEqual(zimage_deployment.fsdp_cfg_auto_min_available_memory_gb, 40)
+        self.assertFalse(zimage_deployment.auto_dit_layerwise_offload)
 
     def test_auto_wan_layerwise_offload_is_enabled_without_fsdp(self):
         args = self._from_dict_with_pipeline_config(WanT2V480PConfig())
@@ -283,6 +288,24 @@ class TestOffloadDefaults(unittest.TestCase):
         self.assertFalse(args.dit_layerwise_offload)
         self.assertFalse(args.text_encoder_cpu_offload)
         self.assertFalse(args.image_encoder_cpu_offload)
+
+    def test_auto_multi_gpu_zimage_base_prefers_fsdp_cfg(self):
+        args = self._from_dict_with_pipeline_config(
+            ZImagePipelineConfig(),
+            kwargs={"model_path": "Tongyi-MAI/Z-Image", "num_gpus": 2},
+        )
+
+        self.assertTrue(args.use_fsdp_inference)
+        self.assertTrue(args.enable_cfg_parallel)
+
+    def test_auto_multi_gpu_zimage_turbo_skips_fsdp_cfg(self):
+        args = self._from_dict_with_pipeline_config(
+            ZImagePipelineConfig(),
+            kwargs={"model_path": "Tongyi-MAI/Z-Image-Turbo", "num_gpus": 2},
+        )
+
+        self.assertFalse(args.use_fsdp_inference)
+        self.assertFalse(args.enable_cfg_parallel)
 
     def test_auto_multi_gpu_qwen_preserves_explicit_fsdp_false(self):
         args = self._from_dict_with_pipeline_config(

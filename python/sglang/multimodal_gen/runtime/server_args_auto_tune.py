@@ -1,11 +1,17 @@
+"""
+    ServerArgsAutoTuner tunes the ServerArgs based on the desired performance mode
+"""
+
+
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from sglang.multimodal_gen import envs
-from sglang.multimodal_gen.configs.pipeline_configs.model_deployment import (
+from sglang.multimodal_gen.configs.pipeline_configs.model_deployment_config import (
     ModelDeploymentConfig,
 )
+
+from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
@@ -15,12 +21,6 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 PERFORMANCE_MODES = ("auto", "speed", "memory", "balanced")
-PERFORMANCE_MODE_ALIASES = {
-    "throughput": "speed",
-    "aggressive": "speed",
-    "conservative": "memory",
-    "balance": "balanced",
-}
 
 
 class ServerArgsAutoTuner:
@@ -31,6 +31,7 @@ class ServerArgsAutoTuner:
         return self.server_args.pipeline_config.get_model_deployment_config()
 
     def adjust(self) -> None:
+        """Adjust the server args based on the performance mode"""
         args = self.server_args
         args.performance_mode = self._normalize_performance_mode()
 
@@ -55,6 +56,7 @@ class ServerArgsAutoTuner:
                 return
             args.use_fsdp_inference = False
             if self._can_apply_dit_layerwise_offload_policy():
+                # apply dit layerwise offload to save VRAM during denoising stage
                 self._set_layerwise_offload_defaults()
             else:
                 self._set_component_offload_defaults()
@@ -126,6 +128,7 @@ class ServerArgsAutoTuner:
             args.dit_layerwise_offload = True
 
     def finalize_auto_flags(self) -> None:
+        """if some args are unset after all the adjustment, set them to defaults"""
         args = self.server_args
         if args.use_fsdp_inference is None:
             args.use_fsdp_inference = False
@@ -141,9 +144,8 @@ class ServerArgsAutoTuner:
     def _normalize_performance_mode(self) -> str:
         args = self.server_args
         mode = (args.performance_mode or "auto").lower()
-        mode = PERFORMANCE_MODE_ALIASES.get(mode, mode)
         if mode not in PERFORMANCE_MODES:
-            valid_modes = PERFORMANCE_MODES + tuple(PERFORMANCE_MODE_ALIASES)
+            valid_modes = PERFORMANCE_MODES
             raise ValueError(
                 f"Invalid performance_mode={args.performance_mode!r}. "
                 f"Expected one of {valid_modes}."
@@ -151,6 +153,7 @@ class ServerArgsAutoTuner:
         return mode
 
     def _set_gpu_resident_defaults(self, *, use_fsdp: bool) -> None:
+        """set all components to be resident"""
         args = self.server_args
         changed = []
         if args.use_fsdp_inference is None:
@@ -170,7 +173,7 @@ class ServerArgsAutoTuner:
             changed.append("image_encoder_cpu_offload=False")
 
         if changed:
-            logger.info(
+            logger.debug(
                 "Applied GPU-resident performance defaults: %s", ", ".join(changed)
             )
 
@@ -256,6 +259,7 @@ class ServerArgsAutoTuner:
             args.enable_cfg_parallel = True
 
     def _supports_high_confidence_fsdp_cfg(self) -> bool:
+        """wheter applying fsdp cfg will very-likely to bring performance gain"""
         args = self.server_args
         return (
             self._deployment_config().fsdp_cfg_auto_min_available_memory_gb is not None
@@ -268,9 +272,7 @@ class ServerArgsAutoTuner:
         if min_available_gb is None:
             return True
 
-        required_gb = (
-            self._deployment_config().fsdp_cfg_auto_min_available_memory_gb
-        )
+        required_gb = self._deployment_config().fsdp_cfg_auto_min_available_memory_gb
         if required_gb is None:
             return False
         if min_available_gb < required_gb:
