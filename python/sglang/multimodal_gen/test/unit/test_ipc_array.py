@@ -6,6 +6,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+from sglang.multimodal_gen.runtime import ipc_array
 from sglang.multimodal_gen.runtime.ipc_array import (
     NumpyArrayFileRef,
     is_local_endpoint,
@@ -14,8 +15,9 @@ from sglang.multimodal_gen.runtime.ipc_array import (
 )
 
 
-def test_spill_large_arrays_round_trips_and_removes_file():
-    array = np.arange(1024 * 1024, dtype=np.uint8).reshape(1024, 1024)
+def test_spill_large_arrays_round_trips_and_removes_file(monkeypatch, tmp_path):
+    monkeypatch.setattr(ipc_array, "_array_ipc_dir", lambda: str(tmp_path))
+    array = np.arange(ipc_array._MIN_FILE_REF_BYTES, dtype=np.uint8)
 
     spilled = spill_large_arrays_to_file_refs([array])
 
@@ -37,8 +39,18 @@ def test_small_arrays_are_kept_inline():
     assert spilled[0] is array
 
 
-def test_spill_removes_temp_file_when_save_fails(monkeypatch):
-    array = np.arange(1024 * 1024, dtype=np.uint8).reshape(1024, 1024)
+def test_large_arrays_are_kept_inline_without_shm(monkeypatch):
+    monkeypatch.setattr(ipc_array, "_array_ipc_dir", lambda: None)
+    array = np.arange(ipc_array._MIN_FILE_REF_BYTES, dtype=np.uint8)
+
+    spilled = spill_large_arrays_to_file_refs(array)
+
+    assert spilled is array
+
+
+def test_spill_removes_temp_file_when_save_fails(monkeypatch, tmp_path):
+    monkeypatch.setattr(ipc_array, "_array_ipc_dir", lambda: str(tmp_path))
+    array = np.arange(ipc_array._MIN_FILE_REF_BYTES, dtype=np.uint8)
     created_paths = []
 
     def fail_save(*args, **kwargs):
