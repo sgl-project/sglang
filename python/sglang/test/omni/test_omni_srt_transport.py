@@ -35,6 +35,28 @@ class FakeSender:
         self.obj = obj
 
 
+class FakeRawRequest:
+    def __init__(self, payload):
+        self.payload = payload
+
+    async def json(self):
+        return self.payload
+
+
+class FakeTokenizerManager:
+    def __init__(self):
+        self.obj = None
+
+    async def omni_generate(self, obj, request):
+        del request
+        self.obj = obj
+        return OmniGenerateReqOutput(
+            rid=obj.rid,
+            success=True,
+            payload={"segments": [{"type": "text", "text": "ok"}]},
+        )
+
+
 class TestOmniSRTTransport(unittest.TestCase):
     def test_scheduler_transport_uses_cached_orchestrator_and_serializes_images(self):
         orchestrator = FakeOrchestrator()
@@ -68,6 +90,9 @@ class TestOmniSRTTransport(unittest.TestCase):
     def test_tokenizer_manager_omni_generate_waits_for_scheduler_response(self):
         asyncio.run(self._run_tokenizer_manager_omni_generate())
 
+    def test_srt_http_route_forwards_payload_to_tokenizer_manager(self):
+        asyncio.run(self._run_srt_http_route())
+
     async def _run_tokenizer_manager_omni_generate(self):
         sender = FakeSender()
         tokenizer_manager = SimpleNamespace(
@@ -97,6 +122,33 @@ class TestOmniSRTTransport(unittest.TestCase):
         response = await task
         self.assertTrue(response.success)
         self.assertEqual({"segments": []}, response.payload)
+
+    async def _run_srt_http_route(self):
+        from sglang.srt.entrypoints import http_server
+
+        tokenizer_manager = FakeTokenizerManager()
+        old_state = http_server.get_global_state()
+        http_server.set_global_state(
+            http_server._GlobalState(
+                tokenizer_manager=tokenizer_manager,
+                template_manager=None,
+                scheduler_info={},
+            )
+        )
+        try:
+            response = await http_server.omni_generate_request(
+                FakeRawRequest(
+                    {
+                        "model": "sensenova-u1",
+                        "messages": [{"type": "text", "text": "draw"}],
+                    }
+                )
+            )
+        finally:
+            http_server.set_global_state(old_state)
+
+        self.assertEqual(200, response.status_code)
+        self.assertEqual("draw", tokenizer_manager.obj.payload["messages"][0]["text"])
 
 
 if __name__ == "__main__":
