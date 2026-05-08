@@ -53,6 +53,8 @@ from sglang.srt.mem_cache.radix_cache import (
     compute_node_hash_values,
     split_node_hash_value,
 )
+from sglang.srt.mem_cache.storage import StorageBackendFactory
+from sglang.srt.mem_cache.storage.backend_factory import StorageCapability
 from sglang.srt.observability.metrics_collector import StorageMetricsCollector
 
 if TYPE_CHECKING:
@@ -119,8 +121,17 @@ class HiRadixCache(RadixCache):
         self.is_prefetch_timeout = self._prefetch_timeout_check_linear_func
         self.prefetch_stop_policy = server_args.hicache_storage_prefetch_policy
 
+        should_build_hybrid_stack = isinstance(self.kv_cache, NSATokenToKVPool) and (
+            server_args.hicache_storage_backend is None
+            or StorageBackendFactory.supports(
+                StorageCapability.interface_v2,
+                server_args.hicache_storage_backend,
+                extra_config,
+            )
+        )
+
         self.load_cache_event = threading.Event()
-        if isinstance(self.kv_cache, NSATokenToKVPool):
+        if should_build_hybrid_stack:
             attach_hybrid_nsa_pool_to_hiradix_cache(
                 self,
                 params,
@@ -131,6 +142,12 @@ class HiRadixCache(RadixCache):
                 load_cache_event=self.load_cache_event,
                 attn_cp_group=self.attn_cp_group,
                 attn_tp_group=self.attn_tp_group,
+            )
+        elif isinstance(self.kv_cache, NSATokenToKVPool):
+            raise RuntimeError(
+                f"NSA hybrid stack requires storage backend "
+                f"{server_args.hicache_storage_backend!r} "
+                "to support interface_v2."
             )
         else:
             self.cache_controller = HiCacheController(

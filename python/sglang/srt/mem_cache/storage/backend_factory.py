@@ -3,6 +3,7 @@
 
 import importlib
 import logging
+from enum import Flag, auto
 from typing import TYPE_CHECKING, Any, Dict
 
 from sglang.srt.mem_cache.hicache_storage import HiCacheStorage, HiCacheStorageConfig
@@ -11,6 +12,17 @@ if TYPE_CHECKING:
     pass
 
 logger = logging.getLogger(__name__)
+
+
+class StorageCapability(Flag):
+    """Capability flags that a storage backend can declare.
+
+    Use bitwise-OR to combine.
+    """
+
+    NONE = 0
+    interface_v1 = auto()
+    interface_v2 = auto()
 
 
 class StorageBackendFactory:
@@ -41,13 +53,20 @@ class StorageBackendFactory:
             ) from e
 
     @classmethod
-    def register_backend(cls, name: str, module_path: str, class_name: str) -> None:
+    def register_backend(
+        cls,
+        name: str,
+        module_path: str,
+        class_name: str,
+        capabilities: StorageCapability = StorageCapability.NONE,
+    ) -> None:
         """Register a storage backend with lazy loading.
 
         Args:
             name: Backend identifier
             module_path: Python module path containing the backend class
             class_name: Name of the backend class
+            capabilities: Capability flags the backend supports
         """
         if name in cls._registry:
             logger.warning(f"Backend '{name}' is already registered, overwriting")
@@ -60,7 +79,40 @@ class StorageBackendFactory:
             "loader": loader,
             "module_path": module_path,
             "class_name": class_name,
+            "capabilities": capabilities,
         }
+
+    @classmethod
+    def _capabilities_from_extra_config(
+        cls, extra_config: Dict[str, Any] | None
+    ) -> StorageCapability:
+        """Build capability flags from dynamic backend extra_config."""
+        cfg = extra_config or {}
+        caps = StorageCapability.NONE
+        if cfg.get("interface_v1", 0):
+            caps |= StorageCapability.interface_v1
+        if cfg.get("interface_v2", 0):
+            caps |= StorageCapability.interface_v2
+        return caps
+
+    @classmethod
+    def supports(
+        cls,
+        capability: StorageCapability,
+        backend_name: str,
+        extra_config: Dict[str, Any] | None = None,
+    ) -> bool:
+        """Check whether *backend_name* supports the given capability.
+
+        For "dynamic" backends the capability flags are read from
+        ``extra_config["interface_v1"]`` / ``extra_config["interface_v2"]``.
+        """
+        if backend_name == "dynamic":
+            return bool(cls._capabilities_from_extra_config(extra_config) & capability)
+        registered = cls._registry.get(backend_name, {}).get(
+            "capabilities", StorageCapability.NONE
+        )
+        return bool(registered & capability)
 
     @classmethod
     def create_backend(
@@ -191,25 +243,31 @@ class StorageBackendFactory:
 
 # Register built-in storage backends
 StorageBackendFactory.register_backend(
-    "file", "sglang.srt.mem_cache.hicache_storage", "HiCacheFile"
+    "file",
+    "sglang.srt.mem_cache.hicache_storage",
+    "HiCacheFile",
+    capabilities=StorageCapability.interface_v2,
 )
 
 StorageBackendFactory.register_backend(
     "nixl",
     "sglang.srt.mem_cache.storage.nixl.hicache_nixl",
     "HiCacheNixl",
+    capabilities=StorageCapability.interface_v1,
 )
 
 StorageBackendFactory.register_backend(
     "mooncake",
     "sglang.srt.mem_cache.storage.mooncake_store.mooncake_store",
     "MooncakeStore",
+    capabilities=StorageCapability.interface_v1 | StorageCapability.interface_v2,
 )
 
 StorageBackendFactory.register_backend(
     "hf3fs",
     "sglang.srt.mem_cache.storage.hf3fs.storage_hf3fs",
     "HiCacheHF3FS",
+    capabilities=StorageCapability.interface_v1,
 )
 
 StorageBackendFactory.register_backend(
@@ -222,10 +280,12 @@ StorageBackendFactory.register_backend(
     "eic",
     "sglang.srt.mem_cache.storage.eic.eic_storage",
     "EICStorage",
+    capabilities=StorageCapability.interface_v1,
 )
 
 StorageBackendFactory.register_backend(
     "simm",
     "sglang.srt.mem_cache.storage.simm.hicache_simm",
     "HiCacheSiMM",
+    capabilities=StorageCapability.interface_v1,
 )

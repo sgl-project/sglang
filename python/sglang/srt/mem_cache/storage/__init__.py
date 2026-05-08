@@ -3,8 +3,9 @@
 
 """Storage backend module for SGLang HiCache."""
 
-from .backend_factory import StorageBackendFactory
+from .backend_factory import StorageBackendFactory, StorageCapability
 
 __all__ = [
     "StorageBackendFactory",
+    "StorageCapability",
 ]

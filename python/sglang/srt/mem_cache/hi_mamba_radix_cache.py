@@ -41,6 +41,10 @@ from sglang.srt.mem_cache.radix_cache import (
     compute_node_hash_values,
     split_node_hash_value,
 )
+from sglang.srt.mem_cache.storage.backend_factory import (
+    StorageBackendFactory,
+    StorageCapability,
+)
 from sglang.srt.observability.metrics_collector import StorageMetricsCollector
 
 if TYPE_CHECKING:
@@ -133,6 +137,19 @@ class HiMambaRadixCache(MambaRadixCache):
         )
         self.is_prefetch_timeout = self._prefetch_timeout_check_linear_func
         self.prefetch_stop_policy = server_args.hicache_storage_prefetch_policy
+
+        if server_args.hicache_storage_backend is not None and not (
+            StorageBackendFactory.supports(
+                StorageCapability.interface_v2,
+                server_args.hicache_storage_backend,
+                extra_config,
+            )
+        ):
+            raise RuntimeError(
+                f"Mamba hybrid stack requires storage backend "
+                f"{server_args.hicache_storage_backend!r} "
+                "to support interface_v2."
+            )
 
         self.load_cache_event = threading.Event()
         attach_hybrid_pool_to_mamba_cache(

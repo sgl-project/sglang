@@ -27,6 +27,10 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolTransferResult,
 )
 from sglang.srt.mem_cache.memory_pool_host import PoolEntry
+from sglang.srt.mem_cache.storage.backend_factory import (
+    StorageBackendFactory,
+    StorageCapability,
+)
 from sglang.srt.utils import get_device_module
 
 if TYPE_CHECKING:
@@ -211,6 +215,16 @@ class HybridCacheController(BaseHiCacheController):
         storage_backend_extra_config: Optional[dict] = None,
         host_pools: Optional[list[PoolEntry]] = None,
     ):
+        if not StorageBackendFactory.supports(
+            StorageCapability.interface_v2,
+            storage_backend,
+            storage_backend_extra_config,
+        ):
+            raise RuntimeError(
+                f"Storage backend {storage_backend!r} does not support "
+                f"interface_v2, which is required by HybridCacheController."
+            )
+
         super().attach_storage_backend(
             storage_backend=storage_backend,
             prefetch_threshold=prefetch_threshold,
