@@ -188,9 +188,7 @@ class DeepEPBuffer:
         # `get_combine_config` / `get_nvl_buffer_size_hint` /
         # `get_rdma_buffer_size_hint` calls). Gated behind an env var so
         # the default code path is byte-identical to V1.
-        if have_deepep_v2 and get_bool_env_var(
-            "SGLANG_DEEPEP_USE_V2", default="false"
-        ):
+        if have_deepep_v2 and get_bool_env_var("SGLANG_DEEPEP_USE_V2", default="false"):
             cls._buffer = cls._build_v2_buffer(
                 group,
                 hidden_size,
