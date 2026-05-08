@@ -46,6 +46,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
     MatchResult,
 )
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.events import KVCacheEventMixin
 from sglang.srt.mem_cache.evict_policy import (
     EvictionStrategy,
@@ -396,7 +397,7 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
         key = params.key
         key, _ = key.maybe_to_bigram_view(self.is_eagle)
 
-        if self.disable or len(key) == 0:
+        if self.disable or len(key) == 0 or envs.SGLANG_RADIX_FORCE_MISS.get():
             return self._empty_match_result
 
         key = key.page_aligned(self.page_size)
