@@ -128,6 +128,7 @@ def run_kernel_and_reference(
         torch.tensor(lora_assignments, dtype=torch.int32, device="cpu"),
         torch.tensor(seq_lengths, dtype=torch.int32, device="cpu"),
         batch_info.lora_ranks.detach().cpu(),
+        batch_info.scalings.detach().cpu(),
         vocab_size,
     )
 
