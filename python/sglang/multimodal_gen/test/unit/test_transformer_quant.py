@@ -46,6 +46,10 @@ sys.modules.setdefault(
 sys.modules.setdefault("partial_json_parser.core.options", partial_json_parser_options)
 
 from sglang.multimodal_gen.configs.quantization.nunchaku import NunchakuSVDQuantArgs
+from sglang.multimodal_gen.configs.models.dits.qwenimage import (
+    QwenImageArchConfig,
+    QwenImageDitConfig,
+)
 from sglang.multimodal_gen.runtime.layers.linear import UnquantizedLinearMethod
 from sglang.multimodal_gen.runtime.layers.quantization.configs.nunchaku_config import (
     NunchakuConfig,
@@ -61,6 +65,9 @@ from sglang.multimodal_gen.runtime.loader.transformer_load_utils import (
     resolve_transformer_safetensors_to_load,
 )
 from sglang.multimodal_gen.runtime.models.dits.flux import FluxSingleTransformerBlock
+from sglang.multimodal_gen.runtime.models.dits.qwen_image import (
+    QwenImageTransformer2DModel,
+)
 from sglang.multimodal_gen.tools.build_modelopt_nvfp4_transformer import (
     _updated_quant_config,
 )
@@ -202,6 +209,30 @@ class TestTransformerQuantHelpers(unittest.TestCase):
             repo_id="nunchaku-ai/nunchaku-qwen-image",
             filename="svdq-fp4_r32-qwen-image-lightningv1.0-4steps.safetensors",
         )
+
+    def test_qwen_image_nunchaku_keeps_io_projections_unquantized(self):
+        config = QwenImageDitConfig(
+            arch_config=QwenImageArchConfig(
+                in_channels=4,
+                out_channels=4,
+                num_layers=0,
+                attention_head_dim=4,
+                num_attention_heads=1,
+                joint_attention_dim=8,
+                axes_dims_rope=(2, 2, 4),
+            )
+        )
+
+        with torch.device("meta"):
+            model = QwenImageTransformer2DModel(
+                config=config,
+                hf_config={},
+                quant_config=NunchakuConfig(precision="nvfp4"),
+            )
+
+        self.assertIsInstance(model.img_in.quant_method, UnquantizedLinearMethod)
+        self.assertIsInstance(model.txt_in.quant_method, UnquantizedLinearMethod)
+        self.assertIsInstance(model.proj_out.quant_method, UnquantizedLinearMethod)
 
     def test_filter_transformer_precision_variants_prefers_canonical_file(self):
         files = [
