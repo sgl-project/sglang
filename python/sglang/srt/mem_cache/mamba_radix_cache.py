@@ -520,9 +520,18 @@ class MambaRadixCache(BasePrefixCache):
         ]
 
         if is_insert:
+            # When strip_thinking_cache is active and reasoning tokens exist,
+            # the mamba state covers the full sequence but we only cache the
+            # prompt prefix — the state wouldn't match the cached key.
+            # Skip mamba caching; KV cache still works fine (per-token).
+            skip_mamba_cache = (
+                get_global_server_args().strip_thinking_cache
+                and getattr(req, "reasoning_tokens", 0) > 0
+            )
+
             cache_len = (
                 req.mamba_last_track_seqlen
-                if self.enable_mamba_extra_buffer
+                if self.enable_mamba_extra_buffer and not skip_mamba_cache
                 else len(token_ids)
             )
             if cache_len is None:
@@ -548,7 +557,11 @@ class MambaRadixCache(BasePrefixCache):
 
             # Radix Cache takes one ref in memory pool
             # insert the token_ids and kv_indices into the radix tree
-            if self.enable_mamba_extra_buffer:
+            if skip_mamba_cache:
+                # Skip mamba state caching — state doesn't match cached prefix
+                mamba_value = None
+                mamba_ping_pong_track_buffer_to_keep = None
+            elif self.enable_mamba_extra_buffer:
                 mamba_ping_pong_track_buffer_to_keep = (
                     self.req_to_token_pool.get_mamba_ping_pong_other_idx(
                         req.mamba_next_track_idx
@@ -723,12 +736,14 @@ class MambaRadixCache(BasePrefixCache):
             x.full_lock_ref == 0 and x.mamba_lock_ref == 0
         ), f"evict leaf node invalid with {x.id=} {x.full_lock_ref=} {x.mamba_lock_ref=}"
 
-        assert x.mamba_value is not None, f"leaf node mamba value is not None, {x.id=}"
-        # 1. a leaf node, free full tokens and mamba
+        # Leaf nodes created with strip_thinking_cache may have mamba_value = None
+        has_mamba = x.mamba_value is not None
+        # 1. a leaf node, free full tokens and mamba (if present)
         self.token_to_kv_pool_allocator.free(x.value)
         full_num_evicted = len(x.value)
-        self.req_to_token_pool.mamba_pool.free(x.mamba_value)
-        mamba_num_evicted = len(x.mamba_value)
+        mamba_num_evicted = len(x.mamba_value) if has_mamba else 0
+        if has_mamba:
+            self.req_to_token_pool.mamba_pool.free(x.mamba_value)
 
         # 2. get the next node, update the lru lists
         if is_evict_mamba:
@@ -736,7 +751,8 @@ class MambaRadixCache(BasePrefixCache):
         else:
             x_next = self.full_lru_list.get_prev_leaf_no_lock(x)
         self.full_lru_list.remove_node(x)
-        self.mamba_lru_list.remove_node(x)
+        if has_mamba:
+            self.mamba_lru_list.remove_node(x)
 
         # 3. delete the leaf node
         self._delete_leaf(x)
@@ -1109,11 +1125,12 @@ class MambaRadixCache(BasePrefixCache):
     ) -> Tuple[int, bool]:
         # Update the last access time from root to leaf, so that
         # mamba will tombstone the node closer to root first
-        assert mamba_value is not None, "Mamba value should not be None here."
+        # mamba_value may be None when strip_thinking_cache skips mamba caching
+        skip_mamba = mamba_value is None
         node.last_access_time = get_last_access_time()
         if node != self.root_node:
             self.full_lru_list.reset_node_mru(node)
-            if node.mamba_value is not None:
+            if not skip_mamba and node.mamba_value is not None:
                 self.mamba_lru_list.reset_node_mru(node)
         if len(key) == 0:
             return 0, True
@@ -1150,22 +1167,25 @@ class MambaRadixCache(BasePrefixCache):
             new_node.parent = node
             new_node.key = key
             new_node.value = value.clone()
-            new_node.mamba_value = mamba_value
+            new_node.mamba_value = None if skip_mamba else mamba_value
             self.full_lru_list.insert_mru(new_node)
-            self.mamba_lru_list.insert_mru(new_node)
+            if not skip_mamba:
+                self.mamba_lru_list.insert_mru(new_node)
+                self.mamba_evictable_size_ += len(mamba_value)
             node.children[child_key] = new_node
             self.full_evictable_size_ += len(value)
-            self.mamba_evictable_size_ += len(mamba_value)
-        elif node.mamba_value is None:  # add for mamba tombstone
+        elif not skip_mamba and node.mamba_value is None:  # add for mamba tombstone
             node.mamba_value = mamba_value
             self.full_lru_list.reset_node_mru(node)
             self.mamba_lru_list.insert_mru(node)
             self.mamba_evictable_size_ += len(mamba_value)
             node.last_access_time = get_last_access_time()
-        else:  # mamba value already exists
-            mamba_value_exist = True
+        else:  # mamba value already exists or skip_mamba
+            if not skip_mamba:
+                mamba_value_exist = True
             self.full_lru_list.reset_node_mru(node)
-            self.mamba_lru_list.reset_node_mru(node)
+            if not skip_mamba and node.mamba_value is not None:
+                self.mamba_lru_list.reset_node_mru(node)
             node.last_access_time = get_last_access_time()
 
         return total_prefix_length, mamba_value_exist
@@ -1194,20 +1214,21 @@ class MambaRadixCache(BasePrefixCache):
         return node, full_num_evicted
 
     def _delete_leaf(self, node: TreeNode) -> None:
-        assert (
-            node.mamba_value is not None
-        ), f"Invariant violated: leaf node is a tombstone, {node.id=}"
+        # Nodes created with strip_thinking_cache may have mamba_value=None
+        has_mamba = node.mamba_value is not None
         assert len(node.children) == 0, f"leaf node has children, {node.id=}"
         key = node.key.child_key(self.page_size)
         v = node.parent.children.pop(key, None)
         assert v == node, f"parent does not have child key, {key}"
 
         self.full_evictable_size_ -= len(node.key)
-        self.mamba_evictable_size_ -= len(node.mamba_value)
+        if has_mamba:
+            self.mamba_evictable_size_ -= len(node.mamba_value)
 
     def _tombstone_internal_node(self, node: TreeNode) -> None:
         assert len(node.children) != 0, f"Cannot tombstone a leaf node, {node.id=}"
-        self.mamba_evictable_size_ -= len(node.mamba_value)
+        if node.mamba_value is not None:
+            self.mamba_evictable_size_ -= len(node.mamba_value)
         node.mamba_value = None
 
     def _delete_tombstone_leaf(self, node: TreeNode) -> None:
