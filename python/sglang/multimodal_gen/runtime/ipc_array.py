@@ -43,6 +43,7 @@ def spill_large_arrays_to_file_refs(value: Any) -> Any:
 
 def _spill_large_arrays_to_file_refs(value: Any, directory: str) -> Any:
     if isinstance(value, np.ndarray) and value.nbytes >= _MIN_FILE_REF_BYTES:
+        # only spill if the array size is above the threshold. if not, it's not worth it
         return _spill_array(value, directory)
     if isinstance(value, list):
         return [_spill_large_arrays_to_file_refs(item, directory) for item in value]
