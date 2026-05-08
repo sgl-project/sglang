@@ -7022,6 +7022,11 @@ class ServerArgs:
                 "When enabling two batch overlap, moe_a2a_backend cannot be 'none'."
             )
 
+        if self.enable_two_batch_overlap and self.enforce_shared_experts_fusion:
+            raise ValueError(
+                "--enable-two-batch-overlap and --enforce-shared-experts-fusion cannot be used together."
+            )
+
         # Check communications compression
         if self.enable_quant_communications and self.tp_size == 1:
             raise ValueError(
