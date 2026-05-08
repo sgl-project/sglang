@@ -2918,23 +2918,31 @@ class ServerArgs:
                 f"({self.double_sparsity_max_selected_per_request}); otherwise dense-fallback "
                 f"rows would not fit the captured FA3 page-table."
             )
-        # The selection path is fully vectorized (no `.item()` / Python loop)
-        # and capture-safe; the FA3 metadata adaptor is also capture-safe
-        # (test_double_sparsity_adaptor.py::TestCudaGraphCaptureReplay).
+        # The v1.1 selection path uses two Triton kernels (stage-1 block-
+        # topk, stage-2 merge) plus a bounded-shape torch-on-CUDA union
+        # pass. All scratch is preallocated; no tensor scales with
+        # `max_ctx`; no `.item()` / Python loop. This is capture-safe
+        # under full CUDA graphs (verified by
+        # test_double_sparsity_union.py::TestUnionCudaGraphCaptureReplay
+        # and test_double_sparsity_adaptor.py::TestCudaGraphCaptureReplay).
         # Full CUDA graphs stay enabled.
         #
-        # Piecewise CUDA graph (torch.compile / breakable graph), however,
-        # cannot trace through the selection's dynamic gathers
-        # (req_to_token[...], k_label[...]), in-place scatter, and sort —
-        # it triggers runtime recompilation that fails capture. Until DS
-        # selection is wrapped as a registered split op (planned v1.1
-        # alongside the fused Triton kernel), auto-disable piecewise CUDA
-        # graph when DS is on.
+        # Piecewise CUDA graph (torch.compile / breakable graph) is a
+        # separate problem: lifting the auto-disable requires the
+        # selection entry point to be registered as a split op
+        # (`register_custom_op` + `register_split_op`) so torch.compile
+        # treats it as opaque rather than tracing through the union's
+        # `sort` / `gather` / advanced indexing. Without that, compile
+        # graph-breaks mid-selection on shape changes between batches.
+        # Wrapping `ds_select_tokens_triton` as a split op is a v1.2
+        # follow-up (it requires a fake_impl + the selection signature
+        # restructured to accept preallocated outputs). Until then,
+        # auto-disable piecewise CUDA graph when DS is on.
         if not self.disable_piecewise_cuda_graph:
             logger.warning(
-                "--enable-double-sparsity v1 requires --disable-piecewise-cuda-graph "
-                "(selection kernels not yet a registered split op; v1.1 will lift). "
-                "Auto-setting --disable-piecewise-cuda-graph=True."
+                "--enable-double-sparsity requires --disable-piecewise-cuda-graph "
+                "(selection entry point not yet a registered split op; v1.2 will "
+                "lift). Auto-setting --disable-piecewise-cuda-graph=True."
             )
             self.disable_piecewise_cuda_graph = True
 
