@@ -960,16 +960,12 @@ class Qwen3_5ForCausalLM(nn.Module):
         head_dim = config.head_dim or (config.hidden_size // config.num_attention_heads)
 
         if module_name == "qkv_proj":
-            layer = self.layers[layer_idx] if 0 <= layer_idx < len(self.layers) else None
-            qkv_proj = getattr(layer, "qkv_proj", None)
-            if qkv_proj is not None:
-                qkv_base_layer = getattr(qkv_proj, "base_layer", qkv_proj)
-                output_dim = sum(qkv_base_layer.output_sizes)
-                tp_size = qkv_base_layer.tp_size
-                per_rank_output_dim = output_dim // tp_size
-                if 1000 <= per_rank_output_dim <= 1600:
-                    output_dim = 1280 * tp_size
-                return config.hidden_size, output_dim
+            attn_output_gate = getattr(config, "attn_output_gate", True)
+            q_heads = config.num_attention_heads * (2 if attn_output_gate else 1)
+            return (
+                config.hidden_size,
+                head_dim * (q_heads + config.num_key_value_heads * 2),
+            )
 
             attn_output_gate = getattr(config, "attn_output_gate", True)
             q_heads = config.num_attention_heads * (2 if attn_output_gate else 1)

@@ -359,41 +359,6 @@ class LoRAMemoryPool:
             max_lora_dim,
             input_dim,
         )
-    
-    def _column_parallel_lora_b_per_rank_dim(
-        self,
-        module_name: str,
-        total_output_dim: int,
-        effective_tp_size: int,
-    ) -> int:
-        """Per-rank LoRA B output dim for column-parallel modules.
-
-        For most modules this is just an even split. For ``qkv_proj`` when
-        ``effective_tp_size > num_key_value_heads``, the underlying
-        :class:`QKVParallelLinear` *replicates* each KV head across
-        ``tp_size // num_kv_heads`` ranks instead of dividing further, so
-        each rank owns ``head_dim`` of K/V (not ``head_dim * num_kv_heads
-        / tp_size``). A naive ``divide(total, tp_size)`` undersizes the
-        buffer and produces a shape mismatch when the
-        :meth:`QKVParallelLinearWithLoRA.slice_lora_b_weights` slice runs.
-        """
-        if module_name != "qkv_proj":
-            return divide(total_output_dim, effective_tp_size)
-
-        cfg = self.base_hf_config
-        if hasattr(cfg, "get_text_config"):
-            cfg = cfg.get_text_config()
-        num_kv_heads = getattr(cfg, "num_key_value_heads", None)
-        if num_kv_heads is None or num_kv_heads >= effective_tp_size:
-            return divide(total_output_dim, effective_tp_size)
-
-        head_dim = getattr(cfg, "head_dim", None) or (
-            cfg.hidden_size // cfg.num_attention_heads
-        )
-        kv_dim_total = 2 * num_kv_heads * head_dim
-        q_dim_total = total_output_dim - kv_dim_total
-        q_per_rank = divide(q_dim_total, effective_tp_size)
-        return q_per_rank + 2 * head_dim
 
     def get_lora_B_shape(
         self,
@@ -421,9 +386,7 @@ class LoRAMemoryPool:
             and module_name not in ROW_PARALLELISM_LINEAR_LORA_NAMES
             and module_name not in REPLICATED_LINEAR_LORA_NAMES
         ):
-            output_dim = self._column_parallel_lora_b_per_rank_dim(
-                module_name, output_dim, effective_tp_size
-            )
+            output_dim = divide(output_dim, effective_tp_size)
 
         # Check if MoE module and return appropriate shape
         if self.is_moe_module(module_name):
@@ -684,28 +647,13 @@ class LoRAMemoryPool:
         lora_lm_head_module: Optional[BaseLayerWithLoRA],
     ):
         def load_lora_weight_tensor(
-            buffer_view: torch.Tensor,
-            weight: Optional[torch.Tensor],
-            context: str = "",
+            buffer_view: torch.Tensor, weight: Optional[torch.Tensor]
         ):
             if weight is None:
                 # If the particular weight is not present in the adapter, we initialize the buffer to zero
                 # to avoid contamination from the residual weight of the evicted adapters.
                 buffer_view.zero_()
             else:
-                if buffer_view.shape != weight.shape:
-                    logger.error(
-                        "LoRA shape mismatch uid=%s context=%s buffer_shape=%s weight_shape=%s "
-                        "base_hf_hidden=%s base_model_hidden=%s base_model_config=%s target_modules=%s",
-                        uid,
-                        context,
-                        tuple(buffer_view.shape),
-                        tuple(weight.shape),
-                        getattr(self.base_hf_config, "hidden_size", None),
-                        getattr(getattr(self.base_model, "config", None), "hidden_size", None),
-                        type(getattr(self.base_model, "config", None)),
-                        sorted(self.target_modules),
-                    )
                 assert (
                     buffer_view.shape == weight.shape
                 ), f"LoRA buffer shape {buffer_view.shape} does not match weight shape {weight.shape}."
@@ -943,7 +891,7 @@ class LoRAMemoryPool:
                     if self.experts_shared_outer_loras and name == "down_proj_moe":
                         if weights is None:
                             buffer_view = target_buffer[buffer_id, 0, :, :lora_rank]
-                            load_lora_weight_tensor(buffer_view, None, f"layer={layer_id} target={name} lora_B shared_outer_empty")
+                            load_lora_weight_tensor(buffer_view, None)
                         elif isinstance(weights, torch.Tensor) and weights.dim() == 3:
                             if weights.shape[0] != 1:
                                 raise ValueError(
@@ -955,7 +903,7 @@ class LoRAMemoryPool:
                             w = weights[0]
                             if w is not None:
                                 w = w * lora_adapter.scaling
-                            load_lora_weight_tensor(buffer_view, w, f"layer={layer_id} target={name} lora_B shared_outer_tensor")
+                            load_lora_weight_tensor(buffer_view, w)
                             # Zero beyond loaded rank — MoE kernel reads full max_rank
                             target_buffer[buffer_id, 0, :, lora_rank:].zero_()
                         elif isinstance(weights, dict) and len(weights) > 0:
@@ -969,7 +917,7 @@ class LoRAMemoryPool:
                             buffer_view = target_buffer[buffer_id, 0, :, :lora_rank]
                             if rep is not None:
                                 rep = rep * lora_adapter.scaling
-                            load_lora_weight_tensor(buffer_view, rep, f"layer={layer_id} target={name} lora_B shared_outer_dict")
+                            load_lora_weight_tensor(buffer_view, rep)
                             # Zero beyond loaded rank — MoE kernel reads full max_rank
                             target_buffer[buffer_id, 0, :, lora_rank:].zero_()
                         else:
@@ -989,14 +937,10 @@ class LoRAMemoryPool:
                             buffer_view = target_buffer[
                                 buffer_id, local_eid, :, :lora_rank
                             ]
-                            load_lora_weight_tensor(
-                                buffer_view,
-                                w,
-                                f"layer={layer_id} target={name} local_eid={local_eid} lora_B moe",
-                            )
+                            load_lora_weight_tensor(buffer_view, w)
                 else:
                     buffer_view = target_buffer[buffer_id, :, :lora_rank]
-                    load_lora_weight_tensor(buffer_view, weights, f"layer={layer_id} target={name} lora_B")
+                    load_lora_weight_tensor(buffer_view, weights)
 
         if lora_adapter.embedding_layers:
             org_vocab_size = self.base_hf_config.vocab_size
