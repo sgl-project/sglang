@@ -279,6 +279,7 @@ jobs:
           }
           run_pytest docker exec -w /sglang-checkout/sgl-kernel/tests ci_sglang python3 -m pytest test_amd_deterministic_custom_allreduce.py
           run_pytest docker exec -w /sglang-checkout/sgl-kernel/tests ci_sglang python3 -m pytest test_amd_nccl_allreduce_determinism.py
+          run_pytest docker exec -w /sglang-checkout/benchmark/kernels/all_reduce ci_sglang torchrun --standalone --nproc_per_node=2 benchmark_aiter.py
           exit $failures
 
   # =============================================== primary ====================================================
