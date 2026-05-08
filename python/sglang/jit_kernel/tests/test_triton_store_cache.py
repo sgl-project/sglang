@@ -24,11 +24,16 @@ Tolerance strategy:
 """
 from __future__ import annotations
 
+import math
 import sys
 from typing import Tuple
 
 import pytest
 import torch
+
+from sglang.test.ci.ci_register import register_amd_ci
+
+register_amd_ci(est_time=60, suite="nightly-amd-1-gpu", nightly=True)
 
 # ---------------------------------------------------------------------------
 # Runtime capability flags
@@ -102,8 +107,6 @@ def _flashmla_bytes_per_page(page_size: int) -> int:
     The 584 comes from 576 (data bytes per slot) + 8 (scale bytes per slot).
     The result is rounded up to a multiple of 576 to keep alignment.
     """
-    import math
-
     return math.ceil(584 * page_size / 576) * 576
 
 
