@@ -194,6 +194,74 @@ class TestRuntimeConfig(CustomTestCase):
         with self.assertRaisesRegex(ValueError, "token_budget"):
             self._make(token_budget=0).validate()
 
+    def test_block_t_must_be_supported(self):
+        with self.assertRaisesRegex(ValueError, "block_t"):
+            self._make(block_t=999).validate()
+
+    def test_k_block_must_be_supported(self):
+        with self.assertRaisesRegex(ValueError, "k_block"):
+            self._make(k_block=7).validate()
+
+    def test_default_block_t_and_k_block(self):
+        cfg = self._make()
+        self.assertEqual(cfg.block_t, 1024)
+        self.assertEqual(cfg.k_block, 64)
+
+
+class TestRuntimeConfigCapacityWarnings(CustomTestCase):
+    def _make(self, **overrides) -> DoubleSparsityRuntimeConfig:
+        defaults = dict(
+            heavy_channels=8,
+            token_budget=1024,
+            recent_tokens=64,
+            sink_tokens=4,
+            min_seq_len=128,
+            max_selected_per_request=8192,
+            gqa_reduction="max_abs",
+            klabel_dtype="bf16",
+            block_t=1024,
+            k_block=64,
+        )
+        defaults.update(overrides)
+        return DoubleSparsityRuntimeConfig(**defaults)
+
+    def test_no_warning_when_within_thresholds(self):
+        cfg = self._make()
+        # 32K context, single KV head: num_blocks=32, k_block=64 → 2048 < 4096.
+        # union: 1*1024 + 64 + 4 = 1092 < 4096. No warnings.
+        self.assertEqual(
+            cfg.warn_capacity(max_seq_per_req=32768, num_kv_heads_local=1), []
+        )
+
+    def test_merge_warning_at_long_context(self):
+        # 256K context, k_block=128 → num_blocks=256, candidates=32768 > 4096.
+        cfg = self._make(k_block=128)
+        warnings = cfg.warn_capacity(max_seq_per_req=262144, num_kv_heads_local=1)
+        self.assertTrue(
+            any("merge" in w for w in warnings),
+            f"expected merge warning, got: {warnings}",
+        )
+
+    def test_union_warning_at_high_kv_heads_x_budget(self):
+        # 8 kv heads * effective_budget=1024 + 64 + 4 = 8260 > 4096.
+        cfg = self._make()
+        warnings = cfg.warn_capacity(max_seq_per_req=32768, num_kv_heads_local=8)
+        self.assertTrue(
+            any("union" in w for w in warnings),
+            f"expected union warning, got: {warnings}",
+        )
+
+    def test_thresholds_overridable(self):
+        cfg = self._make()
+        # Bump thresholds enough that no warning fires even at 70B/TP=1.
+        warnings = cfg.warn_capacity(
+            max_seq_per_req=32768,
+            num_kv_heads_local=8,
+            merge_safe_threshold=999_999,
+            union_safe_threshold=999_999,
+        )
+        self.assertEqual(warnings, [])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -6,7 +6,7 @@ import json
 import logging
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict
+from typing import Dict, List
 
 import torch
 
@@ -216,6 +216,16 @@ def channel_indices_for_runtime(
     }
 
 
+SUPPORTED_BLOCK_T = (256, 512, 1024, 2048)
+SUPPORTED_K_BLOCK = (16, 32, 64, 128, 256)
+
+# Single Triton program in-program-sort capacity. Below this, stage-2 merge
+# and the union pass each fit in one program; above, the implementer must
+# enable the chunked path. Empirical (v1.1 sweep tunable).
+DEFAULT_MERGE_SAFE_THRESHOLD = 4096
+DEFAULT_UNION_SAFE_THRESHOLD = 4096
+
+
 @dataclass(frozen=True)
 class DoubleSparsityRuntimeConfig:
     """Runtime knobs read from ServerArgs once at startup."""
@@ -228,6 +238,9 @@ class DoubleSparsityRuntimeConfig:
     max_selected_per_request: int
     gqa_reduction: str
     klabel_dtype: str
+    # v1.1 selection-kernel knobs (consumed by the two-stage Triton path).
+    block_t: int = 1024
+    k_block: int = 64
 
     def validate(self) -> None:
         _require(self.heavy_channels > 0, "heavy_channels must be positive")
@@ -256,6 +269,60 @@ class DoubleSparsityRuntimeConfig:
             self.klabel_dtype in ("bf16", "fp32"),
             f"klabel_dtype must be 'bf16' or 'fp32', got {self.klabel_dtype!r}",
         )
+        _require(
+            self.block_t in SUPPORTED_BLOCK_T,
+            f"block_t must be one of {SUPPORTED_BLOCK_T}, got {self.block_t}",
+        )
+        _require(
+            self.k_block in SUPPORTED_K_BLOCK,
+            f"k_block must be one of {SUPPORTED_K_BLOCK}, got {self.k_block}",
+        )
+
+    def warn_capacity(
+        self,
+        max_seq_per_req: int,
+        num_kv_heads_local: int,
+        merge_safe_threshold: int = DEFAULT_MERGE_SAFE_THRESHOLD,
+        union_safe_threshold: int = DEFAULT_UNION_SAFE_THRESHOLD,
+    ) -> List[str]:
+        """Return human-readable warnings for kernel-capacity overruns.
+
+        Stage-2 merge: a single program sorts `num_blocks * k_block`
+        candidates. Above `merge_safe_threshold` the implementer must enable
+        the chunked merge path (or the user lowers k_block / raises block_t).
+
+        Union: a single program processes `num_kv_heads_local * effective_budget`
+        + recent + sink candidates. Same shape; same threshold.
+
+        These are warnings, not hard errors — the implementer wires the
+        chunked paths. We surface the thresholds at startup so misconfigs
+        are visible.
+        """
+        warnings: List[str] = []
+        num_blocks = (max_seq_per_req + self.block_t - 1) // self.block_t
+        merge_candidates = num_blocks * self.k_block
+        if merge_candidates > merge_safe_threshold:
+            warnings.append(
+                f"DS stage-2 merge candidates = num_blocks * k_block = "
+                f"{num_blocks} * {self.k_block} = {merge_candidates} > "
+                f"merge_safe_threshold={merge_safe_threshold}. The chunked "
+                f"merge path must be enabled, or lower k_block / raise block_t."
+            )
+        effective_budget = min(self.token_budget, num_blocks * self.k_block)
+        union_candidates = (
+            num_kv_heads_local * effective_budget
+            + self.recent_tokens
+            + self.sink_tokens
+        )
+        if union_candidates > union_safe_threshold:
+            warnings.append(
+                f"DS union candidates = H_kv_local * effective_budget + "
+                f"recent + sink = {num_kv_heads_local} * {effective_budget} + "
+                f"{self.recent_tokens} + {self.sink_tokens} = "
+                f"{union_candidates} > union_safe_threshold={union_safe_threshold}. "
+                f"The chunked union path must be enabled, or lower token_budget."
+            )
+        return warnings
 
 
 def build_runtime_config(server_args) -> DoubleSparsityRuntimeConfig:
@@ -268,6 +335,8 @@ def build_runtime_config(server_args) -> DoubleSparsityRuntimeConfig:
         max_selected_per_request=server_args.double_sparsity_max_selected_per_request,
         gqa_reduction=server_args.double_sparsity_gqa_reduction,
         klabel_dtype=server_args.double_sparsity_klabel_dtype,
+        block_t=server_args.double_sparsity_block_t,
+        k_block=server_args.double_sparsity_k_block,
     )
     cfg.validate()
     return cfg

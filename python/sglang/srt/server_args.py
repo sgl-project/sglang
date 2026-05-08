@@ -656,6 +656,9 @@ class ServerArgs:
     double_sparsity_max_selected_per_request: int = 8192
     double_sparsity_gqa_reduction: str = "max_abs"
     double_sparsity_klabel_dtype: str = "bf16"
+    # v1.1 selection-kernel knobs (two-stage block-topk + merge).
+    double_sparsity_block_t: int = 1024
+    double_sparsity_k_block: int = 64
 
     # LMCache
     enable_lmcache: bool = False
@@ -6125,6 +6128,23 @@ class ServerArgs:
             choices=["bf16", "fp32"],
             default=ServerArgs.double_sparsity_klabel_dtype,
             help="dtype for the K_label side cache (default bf16).",
+        )
+        parser.add_argument(
+            "--double-sparsity-block-t",
+            type=int,
+            choices=[256, 512, 1024, 2048],
+            default=ServerArgs.double_sparsity_block_t,
+            help="Stage-1 block size (tokens scored per Triton program). "
+            "Sweep {512, 1024} to find the sweet spot.",
+        )
+        parser.add_argument(
+            "--double-sparsity-k-block",
+            type=int,
+            choices=[16, 32, 64, 128, 256],
+            default=ServerArgs.double_sparsity_k_block,
+            help="Stage-1 per-block top-k count emitted to stage-2. Sweep "
+            "{32, 64, 128}. Effective budget = min(token_budget, "
+            "num_blocks * k_block).",
         )
 
         # LMCache

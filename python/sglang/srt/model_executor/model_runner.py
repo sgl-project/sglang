@@ -2864,6 +2864,16 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             num_kv_heads_global=num_kv_heads_global,
         )
 
+        # Selection-kernel capacity check: warn when (num_blocks * k_block) or
+        # union candidates exceed the single-program in-program-sort budget.
+        # Doesn't error — the chunked merge/union paths are an implementer
+        # escape hatch (v1.1.x). At v1.1 ship time we expect users to stay
+        # under the threshold via knob tuning.
+        max_ctx = self.req_to_token_pool.req_to_token.shape[1]
+        num_kv_heads_local = num_kv_heads_global // self.tp_size
+        for warning in runtime_cfg.warn_capacity(max_ctx, num_kv_heads_local):
+            logger.warning("Double Sparsity capacity warning: %s", warning)
+
         sparse_config = parse_double_sparsity_config(self.server_args)
         # SparseCoordinator's RequestTrackers ctor requires an int.
         sparse_config.min_sparse_prompt_len = runtime_cfg.min_seq_len
