@@ -1679,6 +1679,7 @@ class ServerArgs:
         from sglang.srt.arg_groups.hisparse_hook import (
             apply_hisparse_nsa_backend_defaults,
         )
+        from sglang.srt.utils import is_sm120_supported
 
         user_set_prefill = self.nsa_prefill_backend is not None
         user_set_decode = self.nsa_decode_backend is not None
@@ -1692,7 +1693,13 @@ class ServerArgs:
             self.nsa_prefill_backend = "tilelang"
             self.nsa_decode_backend = "tilelang"
         elif kv_cache_dtype == "fp8_e4m3":
-            if major >= 10:
+            if is_sm120_supported():
+                # SM120: trtllm does not support SM120; use tilelang for both paths.
+                if not user_set_prefill:
+                    self.nsa_prefill_backend = "tilelang"
+                if not user_set_decode:
+                    self.nsa_decode_backend = "tilelang"
+            elif major >= 10:
                 if not user_set_prefill:
                     self.nsa_prefill_backend = "trtllm"
                 if not user_set_decode:
@@ -1705,7 +1712,13 @@ class ServerArgs:
                     self.nsa_decode_backend = "flashmla_kv"
         else:
             # set prefill/decode backends based on hardware architecture.
-            if major >= 10:
+            if is_sm120_supported():
+                # SM120: trtllm does not support SM120; use tilelang (portable)
+                if not user_set_prefill:
+                    self.nsa_prefill_backend = "tilelang"
+                if not user_set_decode:
+                    self.nsa_decode_backend = "tilelang"
+            elif major >= 10:
                 if not user_set_prefill:
                     self.nsa_prefill_backend = "flashmla_sparse"
                 if not user_set_decode:
@@ -1932,6 +1945,14 @@ class ServerArgs:
                         logger.info(
                             "Use flashinfer_trtllm as MoE runner backend on sm100 for DeepseekV3ForCausalLM"
                         )
+            elif is_sm120_supported():
+                # SM120: DSv4-Flash uses MXFP4 experts; marlin backend dispatches
+                # to our SM120 Triton fallback in mxfp4_marlin_moe.py
+                if self.moe_runner_backend == "auto":
+                    self.moe_runner_backend = "marlin"
+                    logger.info(
+                        "Use marlin as MoE runner backend on SM120 for DeepseekV3/V4"
+                    )
             elif is_hip():
                 if not self.enable_dp_attention and self.nnodes == 1:
                     # TODO (Hubert): Put this back later
