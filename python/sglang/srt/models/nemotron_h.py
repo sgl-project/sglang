@@ -376,8 +376,21 @@ class NemotronHMLPDecoderLayer(nn.Module):
         residual: Optional[torch.Tensor],
         forward_batch: ForwardBatch,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        # MLP/MoE layers must run on every rank to keep _TP collectives in
-        # sync across DP groups. No idle skip.
+        if not is_dp_attention_enabled():
+            # TP-only path — origin/main behavior. LayerCommunicator's
+            # prepare_mlp / postprocess_layer assume a DP-attn scatter mode
+            # contract that's not satisfied here, and using them in TP-only
+            # produces collapsed reasoning output. Verified empirically.
+            if residual is None:
+                residual = hidden_states
+                hidden_states = self.norm(hidden_states)
+            else:
+                hidden_states, residual = self.norm(hidden_states, residual)
+            hidden_states = self.mixer.forward(hidden_states)
+            return hidden_states, residual
+
+        # DP-attention path. MLP/MoE layers must run on every rank to keep
+        # _TP collectives in sync across DP groups. No idle skip.
         hidden_states, residual = self.layer_communicator.prepare_mlp(
             hidden_states, residual, forward_batch
         )
@@ -419,8 +432,18 @@ class NemotronHMoEDecoderLayer(nn.Module):
         residual: Optional[torch.Tensor],
         forward_batch: ForwardBatch,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        # MLP/MoE layers must run on every rank to keep _TP collectives in
-        # sync across DP groups. No idle skip.
+        if not is_dp_attention_enabled():
+            # TP-only path — origin/main behavior. See MLP layer comment.
+            if residual is None:
+                residual = hidden_states
+                hidden_states = self.norm(hidden_states)
+            else:
+                hidden_states, residual = self.norm(hidden_states, residual)
+            hidden_states = self.mixer.forward(hidden_states)
+            return hidden_states, residual
+
+        # DP-attention path. MLP/MoE layers must run on every rank to keep
+        # _TP collectives in sync across DP groups. No idle skip.
         hidden_states, residual = self.layer_communicator.prepare_mlp(
             hidden_states, residual, forward_batch
         )
@@ -488,6 +511,28 @@ class NemotronHMambaDecoderLayer(nn.Module):
         residual: Optional[torch.Tensor],
         forward_batch: ForwardBatch,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        if not is_dp_attention_enabled():
+            # TP-only path — origin/main behavior. See MLP layer comment.
+            if residual is None:
+                residual = hidden_states
+                hidden_states = self.norm(hidden_states)
+            else:
+                hidden_states, residual = self.norm(hidden_states, residual)
+
+            if is_in_breakable_cuda_graph():
+                output = torch.empty_like(hidden_states)
+                breakable_nemotron_mamba2_with_output(hidden_states, output, self.layer_id)
+                return output, residual
+
+            if is_in_piecewise_cuda_graph():
+                output = torch.empty_like(hidden_states)
+                nemotron_mamba2_with_output(hidden_states, output, self.layer_id)
+                return output, residual
+            else:
+                output = self._forward_mamba(hidden_states, forward_batch)
+                return output, residual
+
+        # DP-attention path.
         hidden_states, residual = self.layer_communicator.prepare_attn(
             hidden_states, residual, forward_batch
         )
@@ -555,9 +600,12 @@ class NemotronHAttention(nn.Module):
             tp_size=self.attn_tp_size,
             prefix=f"{prefix}.qkv_proj",
         )
-        # Defer row-parallel all-reduce to the next layer's
-        # LayerCommunicator.prepare_mlp; this matches falcon_h1 / qwen3_next
-        # and avoids a double reduce when LayerCommunicator runs.
+        # Reduce inside o_proj. Same reasoning as MambaMixer2.out_proj:
+        # Nemotron-H places attention layers next to mamba layers (also using
+        # prepare_attn / no-reduce path), so deferring the all-reduce to "next
+        # prepare_mlp" leaves the partial output un-reduced before the next
+        # layernorm. Reduce here; in DP-attn it fires inside _ATTN_TP, in
+        # TP-only it falls back to the full _TP group.
         self.o_proj = RowParallelLinear(
             self.total_num_heads * self.head_dim,
             config.hidden_size,
@@ -565,7 +613,7 @@ class NemotronHAttention(nn.Module):
             quant_config=quant_config,
             tp_rank=self.attn_tp_rank,
             tp_size=self.attn_tp_size,
-            reduce_results=False,
+            use_dp_attention_reduce=is_dp_attention_enabled(),
             prefix=f"{prefix}.o_proj",
         )
         # Static flag at construction time so dynamo can specialize the
@@ -664,6 +712,19 @@ class NemotronHAttentionDecoderLayer(nn.Module):
         residual: Optional[torch.Tensor],
         forward_batch: ForwardBatch,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        if not is_dp_attention_enabled():
+            # TP-only path — origin/main behavior. See MLP layer comment.
+            if residual is None:
+                residual = hidden_states
+                hidden_states = self.norm(hidden_states)
+            else:
+                hidden_states, residual = self.norm(hidden_states, residual)
+            hidden_states = self.mixer.forward(
+                hidden_states=hidden_states, forward_batch=forward_batch
+            )
+            return hidden_states, residual
+
+        # DP-attention path.
         hidden_states, residual = self.layer_communicator.prepare_attn(
             hidden_states, residual, forward_batch
         )
