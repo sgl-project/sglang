@@ -30,6 +30,7 @@ from sglang.srt.mem_cache.unified_cache_components import (
     CacheTransferPhase,
     ComponentData,
     ComponentType,
+    DeepSeekV4CompressedComponent,
     EvictLayer,
     FullComponent,
     MambaComponent,
@@ -190,6 +191,7 @@ COMPONENT_REGISTRY: dict[ComponentType, type[TreeComponent]] = {
     ComponentType.FULL: FullComponent,
     ComponentType.MAMBA: MambaComponent,
     ComponentType.SWA: SWAComponent,
+    ComponentType.DSV4_COMPRESSED: DeepSeekV4CompressedComponent,
 }
 
 logger = logging.getLogger(__name__)

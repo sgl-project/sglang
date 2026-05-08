@@ -43,6 +43,13 @@ class PoolName(str, Enum):
     MAMBA = "mamba"
     SWA = "swa"
     INDEXER = "indexer"
+    DEEPSEEK_V4_C4 = "deepseek_v4_c4"
+    DEEPSEEK_V4_C4_INDEXER = "deepseek_v4_c4_indexer"
+    DEEPSEEK_V4_INDEXER = "deepseek_v4_c4_indexer"
+    DEEPSEEK_V4_C128 = "deepseek_v4_c128"
+    DEEPSEEK_V4_C4_STATE = "deepseek_v4_c4_state"
+    DEEPSEEK_V4_INDEXER_STATE = "deepseek_v4_indexer_state"
+    DEEPSEEK_V4_C128_STATE = "deepseek_v4_c128_state"
 
     def __str__(self) -> str:
         return self.value
@@ -74,6 +81,7 @@ class PoolTransfer:
     keys: Optional[List[str]] = None
     hit_policy: PoolHitPolicy = PoolHitPolicy.ALL_PAGES
     nodes_to_load: Optional[List[Any]] = None
+    device_indices_source: Optional[PoolName] = None
 
 
 @dataclass

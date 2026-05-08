@@ -23,6 +23,7 @@ from sglang.srt.managers.cache_controller import (
 from sglang.srt.mem_cache.hicache_storage import (
     HiCacheStorageExtraInfo,
     PoolHitPolicy,
+    PoolName,
     PoolTransfer,
     PoolTransferResult,
 )
@@ -69,6 +70,8 @@ class CacheOperation(BaseCacheOperation):
                 host_indices=cat_or_none(t.host_indices for t in ts),
                 device_indices=cat_or_none(t.device_indices for t in ts),
                 keys=[k for t in ts if t.keys for k in t.keys] or None,
+                hit_policy=ts[0].hit_policy,
+                device_indices_source=ts[0].device_indices_source,
             )
             for name, ts in grouped.items()
         ]
@@ -480,6 +483,7 @@ class HybridCacheController(BaseHiCacheController):
                         device_indices=transfer_device_indices,
                         keys=transfer.keys,
                         hit_policy=transfer.hit_policy,
+                        device_indices_source=transfer.device_indices_source,
                     )
                 )
         return host_indices, device_indices, resolved_pool_transfers
@@ -543,6 +547,8 @@ class HybridCacheController(BaseHiCacheController):
             return None
         # (pool, free_fn, indices) for atomic rollback on failure.
         newly_allocated: list[tuple[PoolTransfer, Callable, torch.Tensor]] = []
+        allocated: dict[PoolName, PoolTransfer] = {}
+        deferred: list[tuple[PoolTransfer, PoolName]] = []
         for pool in extra_pools:
             entry = self.mem_pool_host.entry_map.get(pool.name)
             if entry is None:
@@ -551,6 +557,8 @@ class HybridCacheController(BaseHiCacheController):
                 pool.device_indices = kv_device_indices
                 pool.host_indices = kv_host_indices
                 continue
+            if entry.derive_indices_from_pool:
+                deferred.append((pool, entry.derive_indices_from_pool))
             if alloc_host:
                 if pool.host_indices is not None or pool.device_indices is None:
                     continue
@@ -586,4 +594,16 @@ class HybridCacheController(BaseHiCacheController):
             else:
                 pool.device_indices = indices
             newly_allocated.append((pool, free_fn, indices))
+            allocated[pool.name] = pool
+
+        # Assign indices to deferred pools from their source.
+        for pool, source_name in deferred:
+            if source_name == PoolName.KV:
+                pool.host_indices = kv_host_indices
+                pool.device_indices = kv_device_indices
+            else:
+                src_pool = allocated.get(source_name, (None))
+                if src_pool is not None:
+                    pool.host_indices = src_pool.host_indices
+                    pool.device_indices = src_pool.device_indices
         return extra_pools
