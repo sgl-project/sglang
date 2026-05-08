@@ -3930,6 +3930,8 @@ def run_scheduler_process(
         # init zbal if is set
         from sglang.srt.hardware_backend.npu.utils import init_zbal
 
+        if server_args.pp_size > 1:
+            logger.error(f"only zbal mix mode support pp_size > 1!")
         init_zbal(server_args.tp_size, gpu_id, tp_rank)
 
     # Load plugins so hooks can override Scheduler and its dependencies.

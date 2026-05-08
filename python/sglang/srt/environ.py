@@ -556,7 +556,7 @@ class Envs:
     # ZBAL, zero buffer accelerate library, currently worked only in npu
     SGLANG_ZBAL_LOCAL_MEM_SIZE = EnvInt(0)
     SGLANG_ZBAL_BOOTSTRAP_URL = EnvStr("")
-    
+
     SGLANG_DEFAULT_THINKING = EnvBool(False)
 
     # ====================================================================

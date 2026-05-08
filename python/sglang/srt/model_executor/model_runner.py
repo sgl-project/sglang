@@ -796,8 +796,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 lazy_init_zbal_gva_mem(
                     self.device,
                     self.gpu_id,
-                    self.tp_rank,
-                    self.tp_size,
+                    get_world_group().rank_in_group,
+                    get_world_group().world_size,
                     get_world_group().cpu_group,
                 )
             self.init_device_graphs()
