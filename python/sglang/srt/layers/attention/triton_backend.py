@@ -152,7 +152,7 @@ class TritonAttnBackend(AttentionBackend):
                 self.max_context_len,
             )
             if _is_hip:
-                # Bound attn_logits float32 buffer to 512 MB on ROCm (#20479's sm_cap faults at ~2 GB on MI3xx + Kimi-K2.6, R73 nightly hang).
+                # Bound attn_logits float32 buffer to 512 MB on ROCm; #20479's sm_cap faults at ~2 GB on MI3xx + Kimi-K2.6 (https://github.com/sgl-project/sglang/actions/runs/25513282022/job/74877480809).
                 bs = model_runner.server_args.cuda_graph_max_bs or 1
                 self.max_kv_splits = min(
                     self.max_kv_splits,
