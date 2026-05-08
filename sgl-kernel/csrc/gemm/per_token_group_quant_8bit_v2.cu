@@ -1,6 +1,7 @@
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/util/Float8_e4m3fn.h>
 
+#include <algorithm>
 #include <cmath>
 #include <flashinfer/vec_dtypes.cuh>
 
@@ -147,6 +148,8 @@ struct NaiveScheduler {
       int num_local_experts,
       int hidden_dim_num_groups,
       int num_groups,
+      // signature parity with MaskedLayoutScheduler
+      [[maybe_unused]] int num_tokens_per_expert,
       int& subwarps_per_block,
       dim3& grid,
       dim3& block) {
@@ -210,12 +213,14 @@ struct MaskedLayoutScheduler {
       int num_local_experts,
       int hidden_dim_num_groups,
       int num_groups,
+      int num_tokens_per_expert,
       int& subwarps_per_block,
       dim3& grid,
       dim3& block) {
     subwarps_per_block = SUBWARPS_PER_BLOCK;
     TORCH_CHECK(hidden_dim_num_groups % subwarps_per_block == 0);
-    grid = dim3(hidden_dim_num_groups / subwarps_per_block, TOKEN_DIM_BLOCK_NUM_PER_EXPERT, num_local_experts);
+    const int token_blocks = std::max(1, std::min(num_tokens_per_expert, TOKEN_DIM_BLOCK_NUM_PER_EXPERT));
+    grid = dim3(hidden_dim_num_groups / subwarps_per_block, token_blocks, num_local_experts);
     block = dim3(subwarps_per_block * threads_per_subwarp);
   }
 
@@ -236,8 +241,7 @@ struct MaskedLayoutScheduler {
 
     const int curr_expert_token_num = masked_m[expert_idx];
 
-    for (int token_idx = token_idx_start; token_idx < curr_expert_token_num;
-         token_idx += TOKEN_DIM_BLOCK_NUM_PER_EXPERT) {
+    for (int token_idx = token_idx_start; token_idx < curr_expert_token_num; token_idx += gridDim.y) {
       const int hidden_size = hidden_dim_num_groups * GROUP_SIZE;
       const int64_t input_group_start_offset = compute_input_group_start_offset<FUSE_SILU_AND_MUL>(
           expert_idx, token_idx, hidden_dim_group_idx, hidden_size, num_tokens_per_expert, GROUP_SIZE);
@@ -438,24 +442,31 @@ void sgl_per_token_group_quant_8bit_v2(
   const int scale_expert_stride = masked_layout ? static_cast<int>(output_s.stride(0)) : 0;
   const int scale_hidden_stride = static_cast<int>(output_s.stride(-1));
 
-#define LAUNCH_KERNEL_INNER(SCHEDULER, GROUP_SIZE, THREADS_PER_SUBWARP, T, DST_DTYPE, output_s_dtype, ...)           \
-  do {                                                                                                               \
-    int subwarps_per_block;                                                                                          \
-    dim3 grid, block;                                                                                                \
-    SCHEDULER::compute_exec_config(                                                                                  \
-        THREADS_PER_SUBWARP, num_local_experts, hidden_dim_num_groups, num_groups, subwarps_per_block, grid, block); \
-                                                                                                                     \
-    per_token_group_quant_8bit_kernel<SCHEDULER, GROUP_SIZE, THREADS_PER_SUBWARP, T, DST_DTYPE, __VA_ARGS__>         \
-        <<<grid, block, 0, stream>>>(                                                                                \
-            static_cast<T*>(input.data_ptr()),                                                                       \
-            static_cast<DST_DTYPE*>(output_q.data_ptr()),                                                            \
-            static_cast<output_s_dtype*>(output_s.data_ptr()),                                                       \
-            static_cast<int32_t*>(masked_m.has_value() ? masked_m->data_ptr() : 0),                                  \
-            subwarps_per_block,                                                                                      \
-            hidden_dim_num_groups,                                                                                   \
-            scale_expert_stride,                                                                                     \
-            scale_hidden_stride,                                                                                     \
-            num_tokens_per_expert);                                                                                  \
+#define LAUNCH_KERNEL_INNER(SCHEDULER, GROUP_SIZE, THREADS_PER_SUBWARP, T, DST_DTYPE, output_s_dtype, ...)   \
+  do {                                                                                                       \
+    int subwarps_per_block;                                                                                  \
+    dim3 grid, block;                                                                                        \
+    SCHEDULER::compute_exec_config(                                                                          \
+        THREADS_PER_SUBWARP,                                                                                 \
+        num_local_experts,                                                                                   \
+        hidden_dim_num_groups,                                                                               \
+        num_groups,                                                                                          \
+        num_tokens_per_expert,                                                                               \
+        subwarps_per_block,                                                                                  \
+        grid,                                                                                                \
+        block);                                                                                              \
+                                                                                                             \
+    per_token_group_quant_8bit_kernel<SCHEDULER, GROUP_SIZE, THREADS_PER_SUBWARP, T, DST_DTYPE, __VA_ARGS__> \
+        <<<grid, block, 0, stream>>>(                                                                        \
+            static_cast<T*>(input.data_ptr()),                                                               \
+            static_cast<DST_DTYPE*>(output_q.data_ptr()),                                                    \
+            static_cast<output_s_dtype*>(output_s.data_ptr()),                                               \
+            static_cast<int32_t*>(masked_m.has_value() ? masked_m->data_ptr() : 0),                          \
+            subwarps_per_block,                                                                              \
+            hidden_dim_num_groups,                                                                           \
+            scale_expert_stride,                                                                             \
+            scale_hidden_stride,                                                                             \
+            num_tokens_per_expert);                                                                          \
   } while (0)
 
 #define LAUNCH_KERNEL(GROUP_SIZE, T, DST_DTYPE)                                                                     \
