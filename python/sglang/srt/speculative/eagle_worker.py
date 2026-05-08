@@ -505,7 +505,7 @@ class EAGLEWorker(TpModelWorker):
                 # when DP attention is enabled, but it is slow. Skip it for now.
                 if (
                     self.server_args.enable_dp_attention
-                    or batch.spec_info.bonus_tokens.shape[0] > 0
+                    or batch.spec_info.accept_tokens.shape[0] > 0
                 ):
                     # decode is not finished
                     self.forward_draft_extend_after_decode(batch)
@@ -528,7 +528,7 @@ class EAGLEWorker(TpModelWorker):
             )
 
     def check_forward_draft_extend_after_decode(self, batch: ScheduleBatch):
-        local_need_forward = batch.spec_info.bonus_tokens.shape[0] > 0
+        local_need_forward = batch.spec_info.accept_tokens.shape[0] > 0
         if not self.server_args.enable_dp_attention:
             return local_need_forward
 
@@ -1116,7 +1116,7 @@ class EAGLEWorker(TpModelWorker):
 
         input_is_idle = batch.forward_mode.is_idle()
 
-        if not input_is_idle and batch.spec_info.bonus_tokens.numel() == 0:
+        if not input_is_idle and batch.spec_info.accept_tokens.numel() == 0:
             batch = batch.copy()
             batch.prepare_for_idle()
             hidden_size = (
