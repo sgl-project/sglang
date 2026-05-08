@@ -388,22 +388,20 @@ class _DeepEPDispatcherImplBase:
     def set_quant_config(self, quant_config: dict) -> None:
         self.quant_config = quant_config
 
-        quant_scheme = self.quant_config.get("quant_scheme", None)
-        if quant_scheme is not None:
-            self.deepep_output_dtype = get_deepep_output_dtype(self, quant_scheme)
-            if self.deepep_output_dtype == DeepOutputDtype.BF16:
-                self.params_bytes = 2
-                self.use_nvfp4 = self.use_fp8 = False
-            elif self.deepep_output_dtype == DeepOutputDtype.FP8:
-                self.params_bytes = 1
-                self.use_nvfp4 = False
-                self.use_fp8 = True
-                if _is_npu:
-                    os.environ["DEEP_NORMAL_MODE_USE_INT8_QUANT"] = "1"
-            elif self.deepep_output_dtype == DeepOutputDtype.NVFP4:
-                self.params_bytes = 1
-                self.use_nvfp4 = True
-                self.use_fp8 = False
+        self.deepep_output_dtype = get_deepep_output_dtype(self)
+        if self.deepep_output_dtype == DeepOutputDtype.BF16:
+            self.params_bytes = 2
+            self.use_nvfp4 = self.use_fp8 = False
+        elif self.deepep_output_dtype == DeepOutputDtype.FP8:
+            self.params_bytes = 1
+            self.use_nvfp4 = False
+            self.use_fp8 = True
+            if _is_npu:
+                os.environ["DEEP_NORMAL_MODE_USE_INT8_QUANT"] = "1"
+        elif self.deepep_output_dtype == DeepOutputDtype.NVFP4:
+            self.params_bytes = 1
+            self.use_nvfp4 = True
+            self.use_fp8 = False
 
     def set_overlap_args(
         self, combine_overlap_args: CombineOverlapArgs, meta_overlap_args: dict
