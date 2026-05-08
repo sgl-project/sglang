@@ -4,6 +4,7 @@ import torch
 
 from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.utils.common import get_device
 from sglang.test.test_utils import CustomTestCase
 
 TEST_CASES = [
@@ -131,14 +132,17 @@ def check_kv_indices(forward_batch):
         assert torch.allclose(computed_kv_indices, ref_kv_indices)
 
 
-@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
+@unittest.skipIf(
+    not (torch.cuda.is_available() or torch.xpu.is_available()),
+    "Test requires CUDA or XPU",
+)
 class TestPrefixChunkInfo(CustomTestCase):
     def setUp(self):
         # Common test parameters
         self.num_local_heads = 128
         self.kv_lora_rank = 512
         self.qk_rope_head_dim = 64
-        self.device = torch.device("cuda")
+        self.device = get_device()
         self.dtype = torch.bfloat16
         self.extend_len = 64
         self.max_bs = 4
