@@ -90,7 +90,9 @@ class SRTARBackend:
             sampling_params=request.sampling_params,
         )
         context = _coerce_context_bundle(context)
-        context.metadata["pending_boundaries"] = _initial_boundaries(context)
+        context.metadata["pending_boundaries"] = _initial_boundaries(
+            context, mode=request.mode
+        )
         return context
 
     def decode_until_boundary(
@@ -114,7 +116,8 @@ class SRTARBackend:
         *,
         request: OmniRequest,
     ) -> OmniContextBundle:
-        del request
+        if request.mode != "interleave":
+            return context
         self.bridge.commit_generated_segment(
             contexts=_backend_context(context),
             segment=segment,
@@ -280,12 +283,18 @@ def _vlm_text_metadata(result: Any) -> dict[str, Any]:
     return metadata
 
 
-def _initial_boundaries(context: OmniContextBundle) -> list[OmniBoundary]:
+def _initial_boundaries(
+    context: OmniContextBundle,
+    *,
+    mode: str,
+) -> list[OmniBoundary]:
     boundaries = [
         _pre_image_segment_to_boundary(segment)
         for segment in context.full.metadata.get("pre_image_segments", [])
     ]
     boundaries.append(OmniBoundary(type="image"))
+    if mode != "interleave":
+        boundaries.append(OmniBoundary(type="done"))
     return boundaries
 
 

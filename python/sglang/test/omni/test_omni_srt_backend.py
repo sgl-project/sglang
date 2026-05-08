@@ -4,7 +4,7 @@ import unittest
 from types import SimpleNamespace
 
 from sglang.omni.backends.srt import SRTARBackend
-from sglang.omni.protocol import OmniInputSegment, OmniRequest
+from sglang.omni.protocol import GeneratedSegment, OmniInputSegment, OmniRequest
 
 
 class TestOmniSRTBackend(unittest.TestCase):
@@ -20,6 +20,48 @@ class TestOmniSRTBackend(unittest.TestCase):
         self.assertEqual("thinking", first.text)
         self.assertEqual((1, 2), first.token_ids)
         self.assertEqual("image", second.type)
+
+    def test_t2i_stops_after_image_without_commit(self):
+        bridge = _FakeBridge(pre_image_segments=[])
+        backend = SRTARBackend(bridge)
+        request = OmniRequest(
+            messages=(OmniInputSegment(type="text", text="draw"),),
+            mode="t2i",
+        )
+
+        context = backend.prepare_context(request)
+        first = backend.decode_until_boundary(context, request=request)
+        context = backend.append_generated_segment(
+            context,
+            GeneratedSegment(type="image", image="image"),
+            request=request,
+        )
+        second = backend.decode_until_boundary(context, request=request)
+
+        self.assertEqual("image", first.type)
+        self.assertEqual("done", second.type)
+        self.assertEqual(0, bridge.commit_count)
+
+    def test_interleave_commits_before_continuing_decode(self):
+        bridge = _FakeBridge(pre_image_segments=[])
+        backend = SRTARBackend(bridge)
+        request = OmniRequest(
+            messages=(OmniInputSegment(type="text", text="draw"),),
+            mode="interleave",
+        )
+
+        context = backend.prepare_context(request)
+        first = backend.decode_until_boundary(context, request=request)
+        backend.append_generated_segment(
+            context,
+            GeneratedSegment(type="image", image="image"),
+            request=request,
+        )
+        second = backend.decode_until_boundary(context, request=request)
+
+        self.assertEqual("image", first.type)
+        self.assertEqual("done", second.type)
+        self.assertEqual(1, bridge.commit_count)
 
     def test_vlm_mode_returns_text_and_releases_session(self):
         bridge = _FakeVLMBridge()
@@ -44,6 +86,20 @@ class TestOmniSRTBackend(unittest.TestCase):
 
 
 class _FakeBridge:
+    def __init__(self, pre_image_segments=None):
+        self.pre_image_segments = (
+            [
+                {
+                    "type": "text",
+                    "text": "thinking",
+                    "metadata": {"token_ids": [1, 2]},
+                }
+            ]
+            if pre_image_segments is None
+            else pre_image_segments
+        )
+        self.commit_count = 0
+
     def prepare_u_context_from_messages(self, **kwargs):
         del kwargs
         session = SimpleNamespace(session_id="s0", context_version=0)
@@ -51,17 +107,17 @@ class _FakeBridge:
             request_id="r0",
             token_count=4,
             session=session,
-            metadata={
-                "pre_image_segments": [
-                    {
-                        "type": "text",
-                        "text": "thinking",
-                        "metadata": {"token_ids": [1, 2]},
-                    }
-                ]
-            },
+            metadata={"pre_image_segments": self.pre_image_segments},
         )
         return SimpleNamespace(full=full, text_cfg=None, image_cfg=None)
+
+    def commit_generated_segment(self, **kwargs):
+        del kwargs
+        self.commit_count += 1
+
+    def continue_u_decode(self, **kwargs):
+        del kwargs
+        return SimpleNamespace(type="done")
 
     def release(self, contexts):
         del contexts
