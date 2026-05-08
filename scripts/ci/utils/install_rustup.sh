@@ -27,8 +27,28 @@ if ! command -v curl >/dev/null 2>&1; then
     fi
 fi
 
-curl --proto '=https' --tlsv1.2 --retry 3 --retry-delay 2 -sSf https://sh.rustup.rs \
-    | sh -s -- -y --no-modify-path
+if [ -n "${RUSTUP_CACHE_URL:-}" ]; then
+    # An in-cluster HTTP mirror is available (e.g. on NPU runners).
+    # sh.rustup.rs enforces --proto '=https' and rejects plain http:// mirrors,
+    # so fetch rustup-init directly instead.
+    export RUSTUP_DIST_SERVER="${RUSTUP_CACHE_URL}/rustup"
+    export RUSTUP_UPDATE_ROOT="${RUSTUP_CACHE_URL}/rustup/rustup"
+    case "$(uname -m)" in
+        x86_64)  RUSTUP_ARCH="x86_64-unknown-linux-gnu" ;;
+        aarch64) RUSTUP_ARCH="aarch64-unknown-linux-gnu" ;;
+        *) echo "ERROR: unsupported arch $(uname -m)"; exit 1 ;;
+    esac
+    RUSTUP_TMP="$(mktemp -d)"
+    trap 'rm -rf "${RUSTUP_TMP}"' EXIT
+    curl --retry 3 --retry-delay 2 -sSfL \
+        "${RUSTUP_UPDATE_ROOT}/dist/${RUSTUP_ARCH}/rustup-init" \
+        -o "${RUSTUP_TMP}/rustup-init"
+    chmod +x "${RUSTUP_TMP}/rustup-init"
+    "${RUSTUP_TMP}/rustup-init" -y --no-modify-path --default-toolchain stable
+else
+    curl --proto '=https' --tlsv1.2 --retry 3 --retry-delay 2 -sSf https://sh.rustup.rs \
+        | sh -s -- -y --no-modify-path
+fi
 
 # Make cargo/rustc visible to the rest of this shell and to subsequent
 # GitHub Actions steps in the same job.
