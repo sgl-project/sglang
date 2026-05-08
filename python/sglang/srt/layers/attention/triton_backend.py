@@ -31,74 +31,26 @@ if TYPE_CHECKING:
 
 _MLA_DECODE_MIN_BLOCK_KV = 32
 
-# Default memory budget (in bytes) for the MLA decode `attn_logits` buffer
-# used by `_mla_decode_kv_splits_cap`. The buffer is laid out as
-# (bs, num_head, max_kv_splits, v_head_dim) float32, so naively raising
-# max_kv_splits to next_power_of_2(sm_count) — as #20479 originally did —
-# can produce multi-GB allocations for large `cuda_graph_max_bs` * large
-# `v_head_dim` configs (e.g. Kimi-K2.6 on MI325 with cuda_graph_max_bs=512
-# and v_head_dim=512 → ~2 GB persistent CUDA-graph buffer), which triggered
-# the R73 nightly-8-gpu-kimi-k26 ROCm "Memory access fault by GPU node" /
-# 300s scheduler-watchdog hang. 512 MB keeps the buffer ~8x the pre-#20479
-# size while preserving most of the SM-utilization win on long contexts.
-_MLA_ATTN_LOGITS_BUDGET_BYTES_DEFAULT = 512 * 1024 * 1024
-
-
-def _floor_power_of_2(x: int) -> int:
-    if x <= 1:
-        return 1
-    p = 1
-    while (p << 1) <= x:
-        p <<= 1
-    return p
+# Hard ceiling on MLA decode `max_kv_splits`. attn_logits is allocated as
+# (cuda_graph_max_bs, num_head, max_kv_splits, v_head_dim) float32, so the
+# original #20479 cap (next_power_of_2(sm_count)) blew the persistent
+# CUDA-graph buffer up to ~2 GB on Kimi-K2.6 + MI325 (sm_cap=512,
+# v_head_dim=512, cuda_graph_max_bs=512) and faulted ROCm during graph
+# capture/replay (R73 nightly-8-gpu-kimi-k26: scheduler watchdog 300 s +
+# MLA decode hang). 64 keeps every shipped MLA model's buffer within
+# ~512 MB while still giving full SM utilization in batched decode and
+# preserving most of #20479's long-context speedup.
+_MLA_DECODE_MAX_KV_SPLITS = 64
 
 
 def _mla_decode_kv_splits_cap(
-    base_max_kv_splits: int,
-    sm_count: int,
-    max_context_len: int,
-    num_head: int = 0,
-    v_head_dim: int = 0,
-    cuda_graph_max_bs: int = 0,
-    budget_bytes: Optional[int] = None,
+    base_max_kv_splits: int, sm_count: int, max_context_len: int
 ) -> int:
-    """Cap MLA decode `max_kv_splits` by SM count, context length, and an
-    `attn_logits` memory budget.
-
-    Pre-#20479 the value was simply `triton_attention_num_kv_splits` (default
-    16 on AMD). #20479 lifted it to `next_power_of_2(sm_count)` to keep all
-    SMs busy on long contexts, but ignored that `attn_logits` memory grows
-    linearly with this cap — which is what made the Triton MLA decode
-    kernel fault on AMD MI3xx during CUDA graph capture/replay.
-
-    The memory term is:
-        bytes(attn_logits) = bs * num_head * max_kv_splits * v_head_dim * 4
-    so we additionally clamp by `budget_bytes / (cuda_graph_max_bs *
-    num_head * v_head_dim * 4)`. We never go *below* `base_max_kv_splits` —
-    if the user explicitly asked for a high `--triton-attention-num-kv-splits`
-    we honor it.
-    """
     if sm_count <= 0:
         return base_max_kv_splits
-
     sm_cap = next_power_of_2(sm_count)
     ctx_cap = next_power_of_2(triton.cdiv(max_context_len, _MLA_DECODE_MIN_BLOCK_KV))
-    cap = min(sm_cap, ctx_cap)
-
-    # Memory-budget clamp. Skip if we don't have enough information to
-    # size the buffer (preserves prior behavior in those code paths).
-    if cuda_graph_max_bs > 0 and num_head > 0 and v_head_dim > 0:
-        budget = (
-            budget_bytes
-            if budget_bytes is not None
-            else _MLA_ATTN_LOGITS_BUDGET_BYTES_DEFAULT
-        )
-        per_split_bytes = cuda_graph_max_bs * num_head * v_head_dim * 4
-        if per_split_bytes > 0:
-            mem_cap = _floor_power_of_2(max(1, budget // per_split_bytes))
-            cap = min(cap, mem_cap)
-
-    return max(base_max_kv_splits, cap)
+    return max(base_max_kv_splits, min(sm_cap, ctx_cap, _MLA_DECODE_MAX_KV_SPLITS))
 
 
 def logit_capping_mod(logit_capping_method, logit_cap):
@@ -202,26 +154,10 @@ class TritonAttnBackend(AttentionBackend):
         )
         self.max_kv_splits = model_runner.server_args.triton_attention_num_kv_splits
         if self.use_mla:
-            # Memory-aware cap on `max_kv_splits`. See _mla_decode_kv_splits_cap
-            # for full rationale; in short, attn_logits is sized as
-            # (bs, num_head, max_kv_splits, v_head_dim) float32 and the
-            # original #20479 cap (sm_count power-of-2) ignored buffer size,
-            # producing ~2GB allocations on AMD MI3xx + Kimi-K2.6 that
-            # faulted during CUDA graph capture/replay (R73 nightly hang).
-            cuda_graph_max_bs = (
-                model_runner.server_args.cuda_graph_max_bs or 0
-            )
-            budget_mb = get_int_env_var(
-                "SGLANG_TRITON_MLA_ATTN_LOGITS_BUDGET_MB", 512
-            )
             self.max_kv_splits = _mla_decode_kv_splits_cap(
                 self.max_kv_splits,
                 self.device_core_count,
                 self.max_context_len,
-                num_head=self.num_head,
-                v_head_dim=self.v_head_dim,
-                cuda_graph_max_bs=cuda_graph_max_bs,
-                budget_bytes=budget_mb * 1024 * 1024,
             )
         self.use_pdl = is_arch_support_pdl()
 
