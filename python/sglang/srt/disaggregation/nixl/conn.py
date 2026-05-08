@@ -98,12 +98,8 @@ class KVArgsRegisterInfo:
             decode_tp_size=int(msg[8].decode("ascii")),
             decode_tp_rank=int(msg[9].decode("ascii")),
             dst_kv_item_len=int(msg[10].decode("ascii")),
-            dst_state_data_ptrs=list(
-                struct.unpack(f"{len(msg[11]) // 8}Q", msg[11])
-            ),
-            dst_state_item_lens=list(
-                struct.unpack(f"{len(msg[12]) // 4}I", msg[12])
-            ),
+            dst_state_data_ptrs=list(struct.unpack(f"{len(msg[11]) // 8}Q", msg[11])),
+            dst_state_item_lens=list(struct.unpack(f"{len(msg[12]) // 4}I", msg[12])),
         )
 
 
@@ -654,6 +650,22 @@ class NixlKVManager(CommonKVManager):
                 "not yet supported in nixl backend)"
             )
 
+        # Symmetric clipping: prefill and decode may produce slightly
+        # different state index counts due to page-alignment differences.
+        # Clip the longer side and warn, matching Mooncake behavior (PR #23323).
+        if len(prefill_state_indices) > len(dst_state_indices):
+            logger.warning(
+                f"len(prefill_state_indices) = {len(prefill_state_indices)}, "
+                f"len(dst_state_indices) = {len(dst_state_indices)}"
+            )
+            prefill_state_indices = prefill_state_indices[: len(dst_state_indices)]
+        elif len(prefill_state_indices) < len(dst_state_indices):
+            logger.warning(
+                f"len(prefill_state_indices) = {len(prefill_state_indices)}, "
+                f"len(dst_state_indices) = {len(dst_state_indices)}"
+            )
+            dst_state_indices = dst_state_indices[: len(prefill_state_indices)]
+
         src_addrs = []
         dst_addrs = []
         for i in range(len(src_state_ptrs)):
@@ -1030,8 +1042,7 @@ class NixlKVReceiver(CommonKVReceiver):
                 struct.pack("Q", ptr) for ptr in self.kv_mgr.kv_args.aux_data_ptrs
             )
             packed_state_data_ptrs = b"".join(
-                struct.pack("Q", ptr)
-                for ptr in self.kv_mgr.kv_args.state_data_ptrs
+                struct.pack("Q", ptr) for ptr in self.kv_mgr.kv_args.state_data_ptrs
             )
             packed_state_item_lens = b"".join(
                 struct.pack("I", int(length))
