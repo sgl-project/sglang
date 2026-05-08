@@ -4,6 +4,8 @@ metatags:
     description: "Deploy Kimi-K2 MoE model with SGLang - 1T total parameters, 32B active, step-by-step reasoning and tool calling capabilities."
 ---
 
+import { useUrlStatePersistence } from "/src/snippets/shared/url-state-persistence.jsx";
+
 import { KimiK2Deployment } from '/src/snippets/autoregressive/kimi-k2-deployment.jsx';
 
 ## 1. Model Introduction
@@ -30,7 +32,7 @@ This section provides a progressive guide from quick deployment to performance o
 
 **Interactive Command Generator**: Use the configuration selector below to automatically generate the appropriate deployment command for your hardware platform, model variant, deployment strategy, and capabilities.
 
-<KimiK2Deployment />
+<KimiK2Deployment urlStatePrefix="kimi-k2" />
 
 ### 3.2 Configuration Tips
 

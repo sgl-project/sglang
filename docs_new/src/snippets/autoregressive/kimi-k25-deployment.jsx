@@ -1,4 +1,5 @@
-export const KimiK25Deployment = () => {
+import { useUrlStatePersistence } from '/src/snippets/shared/url-state-persistence.jsx';
+export const KimiK25Deployment = ({ urlStatePrefix = "kimi-k25" }) => {
   // Config mirrors sgl-cookbook src/components/autoregressive/KimiK25ConfigGenerator/index.js.
   //
   // GPU requirements:
@@ -97,6 +98,8 @@ export const KimiK25Deployment = () => {
 
   const [values, setValues] = useState(getInitialState);
   const [isDark, setIsDark] = useState(false);
+
+  useUrlStatePersistence(values, setValues, { prefix: urlStatePrefix });
 
   useEffect(() => {
     const checkDarkMode = () => {

@@ -1,4 +1,5 @@
-export const Qwen36Deployment = () => {
+import { useUrlStatePersistence } from '/src/snippets/shared/url-state-persistence.jsx';
+export const Qwen36Deployment = ({ urlStatePrefix = "qwen36" }) => {
   // Config mirrors sgl-cookbook src/components/autoregressive/Qwen36ConfigGenerator/index.js.
   const options = {
     hardware: {
@@ -103,6 +104,8 @@ export const Qwen36Deployment = () => {
 
   const [values, setValues] = useState(getInitialState);
   const [isDark, setIsDark] = useState(false);
+
+  useUrlStatePersistence(values, setValues, { prefix: urlStatePrefix });
 
   useEffect(() => {
     const checkDarkMode = () => {

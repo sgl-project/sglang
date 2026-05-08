@@ -4,6 +4,8 @@ metatags:
     description: "Deploy Qwen3-Next with SGLang - hybrid attention architecture supporting 262K context, 80B MoE with 3B active parameters, and multi-token prediction."
 ---
 
+import { useUrlStatePersistence } from "/src/snippets/shared/url-state-persistence.jsx";
+
 import { Qwen3NextDeployment } from '/src/snippets/autoregressive/qwen3-next-deployment.jsx';
 
 ## 1. Model Introduction
@@ -42,7 +44,7 @@ The Qwen3-Next series comes in only one size but offers different thinking modes
 
 **Interactive Command Generator**: Use the configuration selector below to automatically generate the appropriate deployment command for your hardware platform, model size, quantization method, and thinking capabilities.
 
-<Qwen3NextDeployment />
+<Qwen3NextDeployment urlStatePrefix="qwen3-next" />
 
 ### 3.2 Configuration Tips
 

@@ -1,4 +1,5 @@
-export const QwenImageDeployment = () => {
+import { useUrlStatePersistence } from '/src/snippets/shared/url-state-persistence.jsx';
+export const QwenImageDeployment = ({ urlStatePrefix = 'qwen-image' }) => {
   const config = {
     modelFamily: 'Qwen-Image',
 
@@ -67,6 +68,8 @@ export const QwenImageDeployment = () => {
 
   const [values, setValues] = useState(getInitialState);
   const [isDark, setIsDark] = useState(false);
+
+  useUrlStatePersistence(values, setValues, { prefix: urlStatePrefix });
 
   useEffect(() => {
     const checkDarkMode = () => {

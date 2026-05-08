@@ -5,6 +5,10 @@ metatags:
 tag: NEW
 ---
 
+import { useUrlStatePersistence } from "/src/snippets/shared/url-state-persistence.jsx";
+
+import { MiMoV25Deployment } from '/src/snippets/autoregressive/mimo-v25-deployment.jsx';
+
 ## 1. Model Introduction
 
 [MiMo-V2.5-Pro](https://huggingface.co/XiaomiMiMo/MiMo-V2.5-Pro) and [MiMo-V2.5](https://huggingface.co/XiaomiMiMo/MiMo-V2.5) are next-generation Mixture-of-Experts models from the XiaomiMiMo Team.
@@ -73,9 +77,7 @@ Refer to the [official SGLang installation guide](../../../docs/get-started/inst
 
 Use the selector below to generate the deployment command for your variant and hardware.
 
-import { MiMoV25Deployment } from '/src/snippets/autoregressive/mimo-v25-deployment.jsx'
-
-<MiMoV25Deployment />
+<MiMoV25Deployment urlStatePrefix="mimo-v25" />
 
 ### 3.2 Configuration Tips
 

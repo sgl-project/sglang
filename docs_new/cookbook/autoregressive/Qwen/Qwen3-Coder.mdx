@@ -4,6 +4,8 @@ metatags:
     description: "Deploy Qwen3-Coder(480B, 30B) MoE coding model with SGLang on AMD MI300X (MI325X, MI355X)"
 ---
 
+import { useUrlStatePersistence } from "/src/snippets/shared/url-state-persistence.jsx";
+
 import { Qwen3CoderDeployment } from '/src/snippets/autoregressive/qwen3-coder-deployment.jsx';
 
 ## 1. Model Introduction
@@ -36,7 +38,7 @@ This section provides deployment configurations verified on AMD MI300X, MI325X, 
 
 **Interactive Command Generator**: Use the configuration selector below to automatically generate the appropriate deployment command for your hardware platform, model size, and quantization method.
 
-<Qwen3CoderDeployment />
+<Qwen3CoderDeployment urlStatePrefix="qwen3-coder" />
 
 ### 3.2 Configuration Tips
 

@@ -4,6 +4,10 @@ metatags:
     description: "Deploy GLM-4.5V vision-language model with SGLang - SOTA multimodal performance, 64K context, image reasoning and video understanding."
 ---
 
+import { useUrlStatePersistence } from "/src/snippets/shared/url-state-persistence.jsx";
+
+import { GLM45VDeployment } from '/src/snippets/autoregressive/glm-45v-deployment.jsx';
+
 ## 1. Model Introduction
 
 [GLM-4.5V](https://huggingface.co/zai-org/GLM-4.5V) is a state-of-the-art multimodal vision-language model from ZhipuAI, built on the next-generation flagship text foundation model GLM-4.5-Air (106B parameters, 12B active). It achieves SOTA performance among models of the same scale across 42 public vision-language benchmarks. Through efficient hybrid training, GLM-4.5V focuses on real-world usability and enables full-spectrum vision reasoning across diverse visual content types.
@@ -34,9 +38,7 @@ The GLM-4.5V offers models in various sizes and architectures, optimized for dif
 
 **Interactive Command Generator**: Use the interactive configuration generator below to customize your deployment settings. Select your hardware platform, model size, quantization method, and other options to generate the appropriate launch command.
 
-import { GLM45VDeployment } from "/src/snippets/autoregressive/glm-45v-deployment.jsx";
-
-<GLM45VDeployment />
+<GLM45VDeployment urlStatePrefix="glm-45v" />
 
 ### 3.2 Configuration Tips
 - **TTFT Optimization** : Set `SGLANG_USE_CUDA_IPC_TRANSPORT=1` to use CUDA IPC for transferring multimodal features, which significantly improves TTFT. This consumes additional memory and may require adjusting `--mem-fraction-static` and/or `--max-running-requests`. (additional memory is proportional to image size * number of images in current running requests.)

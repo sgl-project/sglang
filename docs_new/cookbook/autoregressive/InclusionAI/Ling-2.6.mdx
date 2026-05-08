@@ -4,6 +4,11 @@ metatags:
     description: "Deploy the Ling-2.6 family with SGLang - Ling-2.6-flash (104B total / 7.4B active BF16 MoE) and Ling-2.6-1T (~1T FP8 MoE) with hybrid linear attention and agentic tool calling."
 ---
 
+import { useUrlStatePersistence } from '/src/snippets/shared/url-state-persistence.jsx';
+
+import { Ling261TDeployment } from '/src/snippets/autoregressive/ling-26-1t-deployment.jsx';
+import { Ling26FlashDeployment } from '/src/snippets/autoregressive/ling-26-flash-deployment.jsx';
+
 ## 1. Model Introduction
 
 The **Ling-2.6** family from inclusionAI is the next iteration of the Ling instant-model series. Continuing the architectural direction set by Ling-2.5, Ling-2.6 doubles down on **inference efficiency**, **token efficiency**, and **agent performance** — staying competitive with frontier instant models while being faster, leaner, and better suited for production agent workloads.
@@ -34,9 +39,7 @@ Please refer to the [official SGLang installation guide](../../../docs/get-start
 
 Ling-2.6-flash is a 104B/7.4B-active MoE that runs comfortably on a single 4-GPU node. Use the selector below to generate the launch command for your hardware.
 
-import { Ling26FlashDeployment } from '/src/snippets/autoregressive/ling-26-flash-deployment.jsx'
-
-<Ling26FlashDeployment />
+<Ling26FlashDeployment urlStatePrefix="ling-26-flash"/>
 
 #### Configuration Tips
 
@@ -51,9 +54,7 @@ import { Ling26FlashDeployment } from '/src/snippets/autoregressive/ling-26-flas
 
 Ling-2.6-1T ships in **FP8 (E4M3)**, so unlike Ling-2.5-1T it fits a **single GB300 node with `--tp 4`**. On smaller GPUs (H200/B200), a 2-node deployment with `--pp-size 2` is required.
 
-import { Ling261TDeployment } from '/src/snippets/autoregressive/ling-26-1t-deployment.jsx'
-
-<Ling261TDeployment />
+<Ling261TDeployment urlStatePrefix="ling-26-1t"/>
 
 #### Configuration Tips
 

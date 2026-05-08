@@ -4,6 +4,8 @@ metatags:
     description: "Deploy Step3-VL-10B multimodal model with SGLang - compact 10B dense model with frontier-level vision understanding, complex reasoning, and tool calling capabilities."
 ---
 
+import { useUrlStatePersistence } from "/src/snippets/shared/url-state-persistence.jsx";
+
 import { Step3VL10BDeployment } from '/src/snippets/autoregressive/step-3vl-10b-deployment.jsx';
 
 ## 1. Model Introduction
@@ -35,7 +37,7 @@ Step3-VL-10B is a compact 10B dense model that can run on a single GPU. Recommen
 
 **Interactive Command Generator**: Use the configuration selector below to automatically generate the appropriate deployment command for your hardware platform and quantization method. SGLang supports serving Step3-VL-10B on NVIDIA B200, H200, H100, and AMD MI355X, MI325X, MI300X GPUs.
 
-<Step3VL10BDeployment />
+<Step3VL10BDeployment urlStatePrefix="step-3vl-10b" />
 
 ### 3.2 Configuration Tips
 

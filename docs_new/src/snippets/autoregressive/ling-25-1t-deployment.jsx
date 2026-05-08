@@ -1,4 +1,5 @@
-export const Ling251TDeployment = () => {
+import { useUrlStatePersistence } from '/src/snippets/shared/url-state-persistence.jsx';
+export const Ling251TDeployment = ({ urlStatePrefix = "ling-25-1t" }) => {
   // Config options
   const options = {
     hardware: {
@@ -45,6 +46,8 @@ export const Ling251TDeployment = () => {
 
   const [values, setValues] = useState(getInitialState);
   const [isDark, setIsDark] = useState(false);
+
+  useUrlStatePersistence(values, setValues, { prefix: urlStatePrefix });
 
   // Detect dark mode
   useEffect(() => {

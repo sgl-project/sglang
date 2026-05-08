@@ -4,6 +4,10 @@ metatags:
     description: "Deploy Devstral 2 agentic coding models with SGLang - optimized for tool use, codebase exploration, and multi-file edits with 256K context."
 ---
 
+import { useUrlStatePersistence } from "/src/snippets/shared/url-state-persistence.jsx";
+
+import { Devstral2Deployment } from '/src/snippets/autoregressive/devstral-2-deployment.jsx';
+
 ## 1. Model Introduction
 
 **Devstral 2** is an agentic LLM family for software engineering tasks. It is designed for agentic workflows such as tool use, codebase exploration, and multi-file edits, and achieves strong performance on **SWE-bench**.
@@ -63,10 +67,7 @@ pip install -U --pre "transformers>=5.0.0rc0"
 The TP size is set to the minimum required for the selected model size.
 </Note>
 
-
-import { Devstral2Deployment } from "/src/snippets/autoregressive/devstral-2-deployment.jsx";
-
-<Devstral2Deployment />
+<Devstral2Deployment urlStatePrefix="devstral-2" />
 
 ### 3.2 Configuration tips
 

@@ -1,4 +1,5 @@
-export const Nemotron3NanoOmniDeployment = () => {
+import { useUrlStatePersistence } from '/src/snippets/shared/url-state-persistence.jsx';
+export const Nemotron3NanoOmniDeployment = ({ urlStatePrefix = 'nemotron3-nano-omni' }) => {
   const MODEL_PATHS = {
     reasoning: 'nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning',
     bf16: 'nvidia/Nemotron-3-Nano-Omni-30B-A3B-BF16',
@@ -119,6 +120,8 @@ export const Nemotron3NanoOmniDeployment = () => {
 
   const [values, setValues] = useState(getInitialState);
   const [isDark, setIsDark] = useState(false);
+
+  useUrlStatePersistence(values, setValues, { prefix: urlStatePrefix });
 
   useEffect(() => {
     const checkDarkMode = () => {

@@ -4,6 +4,10 @@ metatags:
     description: "Deploy GLM-4.6V vision-language model with SGLang - native function calling, 128K context, multimodal document understanding and frontend replication."
 ---
 
+import { useUrlStatePersistence } from "/src/snippets/shared/url-state-persistence.jsx";
+
+import { GLM46VDeployment } from '/src/snippets/autoregressive/glm-46v-deployment.jsx';
+
 ## 1. Model Introduction
 
 GLM-4.6V series model includes two versions: GLM-4.6V (106B), a foundation model designed for cloud and high-performance cluster scenarios, and GLM-4.6V-Flash (9B), a lightweight model optimized for local deployment and low-latency applications. GLM-4.6V scales its context window to 128k tokens in training, and achieves SoTA performance in visual understanding among models of similar parameter scales. Crucially, GLM team integrated native Function Calling capabilities for the first time. This effectively bridges the gap between "visual perception" and "executable action" providing a unified technical foundation for multimodal agents in real-world business scenarios.
@@ -62,9 +66,7 @@ For general installation instructions, you can also refer to the [official SGLan
 
 **Interactive Command Generator**: Use the interactive configuration generator below to customize your deployment settings. Select your hardware platform, model size, quantization method, and other options to generate the appropriate launch command.
 
-import { GLM46VDeployment } from "/src/snippets/autoregressive/glm-46v-deployment.jsx";
-
-<GLM46VDeployment />
+<GLM46VDeployment urlStatePrefix="glm-46v" />
 
 ### 3.2 Configuration Tips
 - **TTFT Optimization** : Set `SGLANG_USE_CUDA_IPC_TRANSPORT=1` to use CUDA IPC for transferring multimodal features, which significantly improves TTFT. This consumes additional memory and may require adjusting `--mem-fraction-static` and/or `--max-running-requests`. (additional memory is proportional to image size * number of images in current running requests.)

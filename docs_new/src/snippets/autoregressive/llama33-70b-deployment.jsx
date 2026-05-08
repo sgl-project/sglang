@@ -1,4 +1,5 @@
-export const Llama33Deployment = () => {
+import { useUrlStatePersistence } from '/src/snippets/shared/url-state-persistence.jsx';
+export const Llama33Deployment = ({ urlStatePrefix = "llama33-70b" }) => {
   // Config options
   const options = {
     hardware: {
@@ -40,6 +41,8 @@ export const Llama33Deployment = () => {
 
   const [values, setValues] = useState(getInitialState);
   const [isDark, setIsDark] = useState(false);
+
+  useUrlStatePersistence(values, setValues, { prefix: urlStatePrefix });
 
   // Detect dark mode
   useEffect(() => {

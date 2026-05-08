@@ -4,6 +4,10 @@ metatags:
     description: "Deploy GLM-4.7-Flash 30B-A3B MoE model with SGLang - lightweight, efficient inference optimized for single-GPU deployment."
 ---
 
+import { useUrlStatePersistence } from "/src/snippets/shared/url-state-persistence.jsx";
+
+import { GLM47FlashDeployment } from '/src/snippets/autoregressive/glm-47-flash-deployment.jsx';
+
 ## 1. Model Introduction
 
 [GLM-4.7-Flash](https://huggingface.co/zai-org/GLM-4.7-Flash) is a lightweight and high-speed model in the GLM-4.7 series developed by Zhipu AI, featuring state-of-the-art capabilities in reasoning, function calling, and efficient local deployment.
@@ -47,9 +51,7 @@ This section provides deployment configurations optimized for different hardware
 
 **Interactive Command Generator**: Use the configuration selector below to automatically generate the appropriate deployment command for your hardware platform, quantization method, deployment strategy, and thinking capabilities.
 
-import { GLM47FlashDeployment } from "/src/snippets/autoregressive/glm-47-flash-deployment.jsx";
-
-<GLM47FlashDeployment />
+<GLM47FlashDeployment urlStatePrefix="glm-47-flash" />
 
 ### 3.2 Configuration Tips
 

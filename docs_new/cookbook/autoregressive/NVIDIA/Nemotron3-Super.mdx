@@ -4,6 +4,8 @@ metatags:
     description: "Deploy NVIDIA Nemotron3-Super with SGLang - 120B hybrid MoE model (12B active) with 1M context window optimized for multi-agent systems and tool use."
 ---
 
+import { useUrlStatePersistence } from "/src/snippets/shared/url-state-persistence.jsx";
+
 import { Nemotron3SuperDeployment } from '/src/snippets/autoregressive/nemotron3-super-deployment.jsx';
 
 ## 1. Model Introduction
@@ -41,7 +43,7 @@ This section provides a progressive guide from quick deployment to performance t
 
 **Interactive Command Generator**: select hardware, tensor parallelism, and common knobs to generate a launch command.
 
-<Nemotron3SuperDeployment />
+<Nemotron3SuperDeployment urlStatePrefix="nemotron3-super" />
 
 ### 3.2 Configuration Tips
 

@@ -4,6 +4,8 @@ metatags:
     description: "Deploy DeepSeek-R1 reasoning model with SGLang - advanced step-by-step reasoning with FP8/FP4 quantization for NVIDIA and AMD GPUs."
 ---
 
+import { useUrlStatePersistence } from "/src/snippets/shared/url-state-persistence.jsx";
+
 import { DeepSeekR1BasicDeployment } from '/src/snippets/autoregressive/deepseek-r1-basic-deployment.jsx';
 import { DeepSeekR1AdvancedDeployment } from '/src/snippets/autoregressive/deepseek-r1-advanced-deployment.jsx';
 
@@ -40,13 +42,13 @@ This section provides deployment configurations optimized for different hardware
 
 **Interactive Command Generator**: Use the configuration selector below to automatically generate a basic deployment command for your hardware platform, quantization method, and deployment strategy.
 
-<DeepSeekR1BasicDeployment />
+<DeepSeekR1BasicDeployment urlStatePrefix="deepseek-r1-basic" />
 
 ### 3.2 Optimal Configurations
 
 Pareto-optimal configurations for B200, H200, MI300X, MI325X, and MI355X hardware.
 
-<DeepSeekR1AdvancedDeployment />
+<DeepSeekR1AdvancedDeployment urlStatePrefix="deepseek-r1-advanced" />
 
 ### 3.3 Configuration Tips
 

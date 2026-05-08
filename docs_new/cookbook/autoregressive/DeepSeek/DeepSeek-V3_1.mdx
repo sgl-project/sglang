@@ -4,6 +4,11 @@ metatags:
     description: "Deploy DeepSeek-V3.1 MoE model with SGLang - hybrid reasoning, improved tool calling, and agentic behavior for complex multi-step tasks."
 ---
 
+import { useUrlStatePersistence } from "/src/snippets/shared/url-state-persistence.jsx";
+
+
+import { DeepSeekV31Deployment } from '/src/snippets/autoregressive/deepseek-v31-deployment.jsx';
+
 ## 1. Model Introduction
 
 [DeepSeek V3.1](https://huggingface.co/deepseek-ai/DeepSeek-V3.1) is an advanced Mixture-of-Experts (MoE) large language model developed by DeepSeek, representing a major capability and usability upgrade over DeepSeek V3. As a refined iteration in the DeepSeek V3 family, DeepSeek V3.1 introduces a hybrid reasoning paradigm that supports both fast non-thinking responses and explicit multi-step reasoning, alongside significantly improved tool calling and agentic behavior. The model demonstrates strong performance across reasoning, mathematics, coding, long-context understanding, and real-world agent workflows, benefiting from continued training, alignment optimization, and inference-time refinements. DeepSeek V3.1 is designed to serve as a robust general-purpose foundation model, well suited for conversational AI, structured tool invocation, search-augmented generation, and complex multi-step tasks, while maintaining high efficiency through its sparse MoE architecture.
@@ -26,9 +31,7 @@ This section provides a progressive guide from quick deployment to performance o
 
 **Interactive Command Generator**: Use the configuration selector below to automatically generate the appropriate deployment command for your hardware platform, model variant, deployment strategy, and thinking capabilities.
 
-import { DeepSeekV31Deployment } from "/src/snippets/autoregressive/deepseek-v31-deployment.jsx";
-
-<DeepSeekV31Deployment />
+<DeepSeekV31Deployment urlStatePrefix="deepseek-v31" />
 
 ### 3.2 Configuration Tips
 For more detailed configuration tips, please refer to [DeepSeek V3/V3.1/R1 Usage](../../../docs/basic_usage/deepseek_v3).

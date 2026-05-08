@@ -4,6 +4,10 @@ metatags:
     description: "Deploy GPT-OSS (20B/120B) with SGLang - configurable reasoning, full chain-of-thought, MXFP4 quantization for single GPU deployment."
 ---
 
+import { useUrlStatePersistence } from "/src/snippets/shared/url-state-persistence.jsx";
+
+import { GPTOSSDeployment } from '/src/snippets/autoregressive/gpt-oss-deployment.jsx';
+
 ## 1.Model Introduction
 
 [GPT-OSS](https://huggingface.co/openai/gpt-oss-20b) is an advanced large language model developed by OpenAI designed for power reasoning, agentic tasks, and versatile developer use cases. It has versions with two model sizes.
@@ -35,9 +39,7 @@ The GPT-OSS series comes in two sizes. Recommended starting configurations vary 
 
 **Interactive Command Generator**: Use the configuration selector below to automatically generate the appropriate deployment command for your hardware platform, model size, quantization method, and thinking capabilities.
 
-import { GPTOSSDeployment } from "/src/snippets/autoregressive/gpt-oss-deployment.jsx";
-
-<GPTOSSDeployment />
+<GPTOSSDeployment urlStatePrefix="gpt-oss" />
 
 ### 3.2 Configuration Tips
 

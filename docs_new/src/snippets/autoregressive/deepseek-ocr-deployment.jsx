@@ -1,4 +1,5 @@
-export const DeepSeekOCRDeployment = () => {
+import { useUrlStatePersistence } from '/src/snippets/shared/url-state-persistence.jsx';
+export const DeepSeekOCRDeployment = ({ urlStatePrefix = "deepseek-ocr" }) => {
   // Config options
   const options = {
     hardware: {
@@ -45,6 +46,8 @@ export const DeepSeekOCRDeployment = () => {
 
   const [values, setValues] = useState(getInitialState);
   const [isDark, setIsDark] = useState(false);
+
+  useUrlStatePersistence(values, setValues, { prefix: urlStatePrefix });
 
   // Detect dark mode - prioritize page theme over system preference
   useEffect(() => {

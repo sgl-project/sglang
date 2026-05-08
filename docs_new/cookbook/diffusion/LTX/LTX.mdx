@@ -5,6 +5,8 @@ metatags:
     description: "Deploy and use LTX-2 and LTX-2.3 video generation models with SGLang Diffusion, including one-stage, two-stage, HQ, TI2V, and LoRA examples."
 ---
 
+import { useUrlStatePersistence } from "/src/snippets/shared/url-state-persistence.jsx";
+
 import { LTXDeployment } from '/src/snippets/diffusion/ltx-deployment.jsx';
 
 ## 1. Model Introduction
@@ -37,7 +39,7 @@ The LTX series supports one-stage and two-stage pipelines. LTX-2.3 also supports
 
 **Interactive Command Generator**: Use the configuration selector below to generate a deployment command. The default selection targets a single NVIDIA H200 with `resident` two-stage mode, which is the fastest startup path for the specified high-memory environment.
 
-<LTXDeployment />
+<LTXDeployment urlStatePrefix="ltx" />
 
 ### 3.2 Configuration Tips
 

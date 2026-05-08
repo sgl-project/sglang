@@ -1,4 +1,5 @@
-export const MiMoV25Deployment = () => {
+import { useUrlStatePersistence } from '/src/snippets/shared/url-state-persistence.jsx';
+export const MiMoV25Deployment = ({ urlStatePrefix = "mimo-v25" }) => {
   // MiMo-V2.5 family deployment matrix:
   //   Variant × Hardware → slug, tp, multinode, blackwell
   //
@@ -181,6 +182,8 @@ export const MiMoV25Deployment = () => {
 
   const [values, setValues] = useState(getInitialState);
   const [isDark, setIsDark] = useState(false);
+
+  useUrlStatePersistence(values, setValues, { prefix: urlStatePrefix });
 
   useEffect(() => {
     const checkDarkMode = () => {

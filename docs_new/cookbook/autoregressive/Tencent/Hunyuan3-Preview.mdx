@@ -5,6 +5,10 @@ metatags:
 tag: NEW
 ---
 
+import { useUrlStatePersistence } from "/src/snippets/shared/url-state-persistence.jsx";
+
+import { Hunyuan3PreviewDeployment } from '/src/snippets/autoregressive/hunyuan3-preview-deployment.jsx';
+
 ## 1. Model Introduction
 
 Hunyuan 3 Preview (Hy3-preview) is Tencent's preview of its third-generation flagship MoE language model, featuring hybrid thinking, native tool calling, long-context reasoning, and Multi-Token Prediction (MTP) for low-latency serving.
@@ -86,9 +90,7 @@ This section provides deployment configurations optimized for different hardware
 
 **Interactive Command Generator**: Use the configuration selector below to automatically generate the appropriate deployment command for your hardware platform, quantization, and feature capabilities.
 
-import { Hunyuan3PreviewDeployment } from '/src/snippets/autoregressive/hunyuan3-preview-deployment.jsx'
-
-<Hunyuan3PreviewDeployment />
+<Hunyuan3PreviewDeployment urlStatePrefix="hunyuan3-preview" />
 
 ### 3.2 Configuration Tips
 

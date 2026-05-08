@@ -1,4 +1,5 @@
-export const Wan21Deployment = () => {
+import { useUrlStatePersistence } from '/src/snippets/shared/url-state-persistence.jsx';
+export const Wan21Deployment = ({ urlStatePrefix = 'wan21' }) => {
   const MODELSIZE_DEFS = [
     {
       id: '14b',
@@ -87,6 +88,8 @@ export const Wan21Deployment = () => {
 
   const [values, setValues] = useState(getInitialState);
   const [isDark, setIsDark] = useState(false);
+
+  useUrlStatePersistence(values, setValues, { prefix: urlStatePrefix });
 
   useEffect(() => {
     const checkDarkMode = () => {

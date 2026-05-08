@@ -4,6 +4,10 @@ metatags:
     description: "Deploy DeepSeek-V3.2 with SGLang - featuring DeepSeek Sparse Attention for efficient long-context processing and deep reasoning capabilities."
 ---
 
+import { useUrlStatePersistence } from "/src/snippets/shared/url-state-persistence.jsx";
+
+import { DeepSeekV32Deployment } from '/src/snippets/autoregressive/deepseek-v32-deployment.jsx';
+
 ## 1. Model Introduction
 
 The DeepSeek-V3.2 series includes three model variants, each optimized for different use cases:
@@ -32,9 +36,8 @@ This section provides a progressive guide from quick deployment to performance o
 
 **Interactive Command Generator**: Use the configuration selector below to automatically generate the appropriate deployment command for your hardware platform, model variant, deployment strategy, and thinking capabilities. SGLang supports serving DeepSeek V3.2 on NVIDIA H200, B200, and AMD MI300X/MI355X GPUs.
 
-import { DeepSeekV32Deployment } from "/src/snippets/autoregressive/deepseek-v32-deployment.jsx";
 
-<DeepSeekV32Deployment />
+<DeepSeekV32Deployment urlStatePrefix="deepseek-v32" />
 
 ### 3.2 Configuration Tips
 For more detailed configuration tips, please refer to [DeepSeek-V3.2 Usage](../../../docs/basic_usage/deepseek_v32).

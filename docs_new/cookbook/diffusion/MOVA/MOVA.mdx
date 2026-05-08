@@ -4,6 +4,10 @@ metatags:
     description: "Deploy MOVA with SGLang - simultaneous video and audio generation with asymmetric dual-tower architecture, precise lip-sync, and environment-aware sound effects."
 ---
 
+import { useUrlStatePersistence } from "/src/snippets/shared/url-state-persistence.jsx";
+
+import { MOVADeployment } from '/src/snippets/diffusion/mova-deployment.jsx';
+
 ## 1. Model Introduction
 
 [MOVA](https://github.com/OpenMOSS/MOVA) (MOSS Video and Audio) is a foundation model developed by the SII-OpenMOSS Team, designed to break the "silent era" of open-source video generation. Unlike cascaded pipelines that generate sound as an afterthought, MOVA synthesizes video and audio simultaneously in a single inference pass for perfect alignment. It adopts an Asymmetric Dual-Tower Architecture, fusing pre-trained video and audio towers through a bidirectional cross-attention mechanism to maintain tight synchronization between video and audio during generation.
@@ -34,10 +38,7 @@ This section provides deployment configurations optimized for different hardware
 MOVA supports both online serving and CLI generation modes. The recommended launch configurations vary by hardware and resolution.
 
 **Interactive Command Generator**: Use the configuration selector below to automatically generate the appropriate deployment command for your hardware platform.
-
-import { MOVADeployment } from '/src/snippets/diffusion/mova-deployment.jsx'
-
-<MOVADeployment />
+<MOVADeployment urlStatePrefix="mova" />
 
 ### 3.2 Configuration Tips
 

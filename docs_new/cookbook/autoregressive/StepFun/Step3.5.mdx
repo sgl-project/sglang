@@ -4,6 +4,8 @@ metatags:
     description: "Deploy Step-3.5 reasoning engine with SGLang. "
 ---
 
+import { useUrlStatePersistence } from "/src/snippets/shared/url-state-persistence.jsx";
+
 import { Step35Deployment } from '/src/snippets/autoregressive/step-35-deployment.jsx';
 
 ## 1. Model Introduction
@@ -60,7 +62,7 @@ The Step-3.5-Flash series comes in only one sizes. Recommended starting configur
 
 **Interactive Command Generator**: Use the configuration selector below to automatically generate the appropriate deployment command for your hardware platform, model size, quantization method, and thinking capabilities.
 
-<Step35Deployment />
+<Step35Deployment urlStatePrefix="step-35" />
 
 ### 3.2 Configuration Tips
 

@@ -4,6 +4,8 @@ metatags:
     description: "Deploy Mistral Small 4 with SGLang - unified hybrid model combining instruct, reasoning, and agentic capabilities with multimodal support."
 ---
 
+import { useUrlStatePersistence } from "/src/snippets/shared/url-state-persistence.jsx";
+
 import { MistralSmall4Deployment } from '/src/snippets/autoregressive/mistral-small-4-deployment.jsx';
 
 ## 1. Model Introduction
@@ -57,7 +59,7 @@ Mistral Small 4 support landed in [sgl-project/sglang#20708](https://github.com/
 
 **Interactive Command Generator**: Use the configuration selector below to generate a launch command for Mistral Small 4.
 
-<MistralSmall4Deployment />
+<MistralSmall4Deployment urlStatePrefix="mistral-small-4" />
 
 ### 3.2 Configuration Tips
 

@@ -4,6 +4,10 @@ metatags:
     description: "Deploy Kimi-K2.5 MoE model with SGLang - 1T total parameters, 32B active, step-by-step reasoning and tool calling capabilities."
 ---
 
+import { useUrlStatePersistence } from "/src/snippets/shared/url-state-persistence.jsx";
+
+import { KimiK25Deployment } from '/src/snippets/autoregressive/kimi-k25-deployment.jsx';
+
 ## 1. Model Introduction
 
 [Kimi-K2.5](https://huggingface.co/moonshotai/Kimi-K2.5) is an open-source, native multimodal agentic model by Moonshot AI, built through continual pretraining on approximately 15 trillion mixed visual and text tokens atop Kimi-K2-Base. It seamlessly integrates vision and language understanding with advanced agentic capabilities, instant and thinking modes.
@@ -31,9 +35,7 @@ Refer to the [official SGLang installation guide](../../../docs/get-started/inst
 
 **Interactive Command Generator**: Use the configuration selector below to automatically generate the appropriate deployment command for your hardware platform, deployment strategy, and capabilities.
 
-import { KimiK25Deployment } from '/src/snippets/autoregressive/kimi-k25-deployment.jsx'
-
-<KimiK25Deployment />
+<KimiK25Deployment urlStatePrefix="kimi-k25" />
 
 ### 3.2 Configuration Tips
 

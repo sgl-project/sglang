@@ -4,6 +4,10 @@ metatags:
     description: "SpecBundle usage guide - production-grade EAGLE3 speculative decoding with SGLang for faster LLM inference."
 ---
 
+import { useUrlStatePersistence } from '/src/snippets/shared/url-state-persistence.jsx';
+
+import { SpecBundleDeployment } from '/src/snippets/specbundle/specbundle-deployment.jsx';
+
 ![specbundle logo](/logo/logo.png)
 
 ## About SpecBundle
@@ -96,9 +100,7 @@ python bench_eagle3.py \
 
 **Interactive Command Generator**: Use the configuration selector below to automatically generate the appropriate test command for your model and benchmark.
 
-import { SpecBundleDeployment } from "/src/snippets/specbundle/specbundle-deployment.jsx";
-
-<SpecBundleDeployment />
+<SpecBundleDeployment urlStatePrefix="specbundle_usage" />
 
 It will generate a json file, content is listed below:
 

@@ -1,4 +1,5 @@
-export const Ernie45Deployment = () => {
+import { useUrlStatePersistence } from '/src/snippets/shared/url-state-persistence.jsx';
+export const Ernie45Deployment = ({ urlStatePrefix = "ernie-45" }) => {
   const options = {
     modelsize: {
       name: 'modelsize',
@@ -103,6 +104,8 @@ export const Ernie45Deployment = () => {
 
   const [values, setValues] = useState(getInitialState);
   const [isDark, setIsDark] = useState(false);
+
+  useUrlStatePersistence(values, setValues, { prefix: urlStatePrefix });
 
   useEffect(() => {
     const checkDarkMode = () => {

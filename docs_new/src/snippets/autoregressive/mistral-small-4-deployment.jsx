@@ -1,4 +1,5 @@
-export const MistralSmall4Deployment = () => {
+import { useUrlStatePersistence } from '/src/snippets/shared/url-state-persistence.jsx';
+export const MistralSmall4Deployment = ({ urlStatePrefix = "mistral-small-4" }) => {
   const modelId = 'mistralai/Mistral-Small-4-119B-2603';
 
   const options = {
@@ -123,6 +124,8 @@ export const MistralSmall4Deployment = () => {
 
   const [values, setValues] = useState(getInitialState);
   const [isDark, setIsDark] = useState(false);
+
+  useUrlStatePersistence(values, setValues, { prefix: urlStatePrefix });
 
   useEffect(() => {
     const checkDarkMode = () => {

@@ -4,6 +4,8 @@ metatags:
     description: "Deploy Qwen2.5-VL vision-language models with SGLang on AMD MI300X - available in 3B to 72B sizes with enhanced visual understanding."
 ---
 
+import { useUrlStatePersistence } from "/src/snippets/shared/url-state-persistence.jsx";
+
 import { Qwen25VLDeployment } from '/src/snippets/autoregressive/qwen25-vl-deployment.jsx';
 
 ## 1. Model Introduction
@@ -39,7 +41,7 @@ The Qwen2.5-VL series offers models in various sizes. The following configuratio
 
 **Interactive Command Generator**: Use the configuration selector below to automatically generate the appropriate deployment command for your hardware platform and model size.
 
-<Qwen25VLDeployment />
+<Qwen25VLDeployment urlStatePrefix="qwen25-vl" />
 
 ### 3.2 Configuration Tips
 

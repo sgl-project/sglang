@@ -1,4 +1,5 @@
-export const Llama4MaverickDeployment = () => {
+import { useUrlStatePersistence } from '/src/snippets/shared/url-state-persistence.jsx';
+export const Llama4MaverickDeployment = ({ urlStatePrefix = "llama4-maverick" }) => {
   const options = {
     hardware: {
       name: 'hardware',
@@ -105,6 +106,8 @@ export const Llama4MaverickDeployment = () => {
 
   const [values, setValues] = useState(getInitialState);
   const [isDark, setIsDark] = useState(false);
+
+  useUrlStatePersistence(values, setValues, { prefix: urlStatePrefix });
 
   useEffect(() => {
     const checkDarkMode = () => {

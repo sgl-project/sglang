@@ -6,6 +6,8 @@ tag:
     NEW
 ---
 
+import { useUrlStatePersistence } from '/src/snippets/shared/url-state-persistence.jsx';
+
 import { Nemotron3NanoOmniDeployment } from '/src/snippets/autoregressive/nemotron3-nano-omni-deployment.jsx';
 
 ## 1. Model Introduction
@@ -65,7 +67,7 @@ This section provides a progressive guide from quick deployment to performance t
 
 **Interactive Command Generator**: select hardware, model variant, and common knobs to generate a launch command.
 
-<Nemotron3NanoOmniDeployment />
+<Nemotron3NanoOmniDeployment urlStatePrefix="nemotron3-nano-omni" />
 
 ### 3.2 Configuration Tips
 

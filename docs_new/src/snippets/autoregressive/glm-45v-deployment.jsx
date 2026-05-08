@@ -1,4 +1,5 @@
-export const GLM45VDeployment = () => {
+import { useUrlStatePersistence } from '/src/snippets/shared/url-state-persistence.jsx';
+export const GLM45VDeployment = ({ urlStatePrefix = "glm-45v" }) => {
   // Config options
   const options = {
     hardware: {
@@ -51,6 +52,8 @@ export const GLM45VDeployment = () => {
 
   const [values, setValues] = useState(getInitialState);
   const [isDark, setIsDark] = useState(false);
+
+  useUrlStatePersistence(values, setValues, { prefix: urlStatePrefix });
 
   // Detect dark mode
   useEffect(() => {

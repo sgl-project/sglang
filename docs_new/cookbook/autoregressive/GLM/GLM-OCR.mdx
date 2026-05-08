@@ -4,6 +4,10 @@ metatags:
     description: "Deploy GLM-OCR with SGLang - state-of-the-art OCR performance for complex document understanding."
 ---
 
+import { useUrlStatePersistence } from "/src/snippets/shared/url-state-persistence.jsx";
+
+import { GLMOCRDeployment } from '/src/snippets/autoregressive/glm-ocr-deployment.jsx';
+
 ## 1. Model Introduction
 
 [GLM-OCR](https://huggingface.co/zai-org/GLM-OCR) is a multimodal OCR model for complex document understanding, built on the GLM-V encoder–decoder architecture. It introduces Multi-Token Prediction (MTP) loss and stable full-task reinforcement learning to improve training efficiency, recognition accuracy, and generalization.
@@ -35,9 +39,7 @@ This section provides deployment configurations optimized for different hardware
 
 **Interactive Command Generator**: Use the configuration selector below to automatically generate the appropriate deployment command for your hardware platform and deployment options. You can optionally enable MTP (Multi-Token Prediction) for faster inference using EAGLE speculative decoding.
 
-import { GLMOCRDeployment } from '/src/snippets/autoregressive/glm-ocr-deployment.jsx'
-
-<GLMOCRDeployment />
+<GLMOCRDeployment urlStatePrefix="glm-ocr" />
 
 ### 3.2 Configuration Tips
 

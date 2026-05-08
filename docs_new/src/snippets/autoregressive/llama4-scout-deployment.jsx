@@ -1,4 +1,5 @@
-export const Llama4ScoutDeployment = () => {
+import { useUrlStatePersistence } from '/src/snippets/shared/url-state-persistence.jsx';
+export const Llama4ScoutDeployment = ({ urlStatePrefix = "llama4-scout" }) => {
   const options = {
     hardware: {
       name: 'hardware',
@@ -132,6 +133,8 @@ export const Llama4ScoutDeployment = () => {
 
   const [values, setValues] = useState(getInitialState);
   const [isDark, setIsDark] = useState(false);
+
+  useUrlStatePersistence(values, setValues, { prefix: urlStatePrefix });
 
   useEffect(() => {
     const checkDarkMode = () => {

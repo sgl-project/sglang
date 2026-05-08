@@ -1,4 +1,5 @@
-export const Gemma4Deployment = () => {
+import { useUrlStatePersistence } from '/src/snippets/shared/url-state-persistence.jsx';
+export const Gemma4Deployment = ({ urlStatePrefix = "gemma4" }) => {
   const options = {
     modelSize: {
       name: 'modelSize',
@@ -156,6 +157,8 @@ export const Gemma4Deployment = () => {
 
   const [values, setValues] = useState(getInitialState);
   const [isDark, setIsDark] = useState(false);
+
+  useUrlStatePersistence(values, setValues, { prefix: urlStatePrefix });
 
   useEffect(() => {
     const checkDarkMode = () => {

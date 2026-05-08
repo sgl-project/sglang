@@ -4,6 +4,10 @@ metatags:
     description: "Deploy Ring-2.5-1T with SGLang - world's first open-source 1T parameter reasoning model with hybrid linear attention, deep reasoning, and agentic tool calling capabilities."
 ---
 
+import { useUrlStatePersistence } from "/src/snippets/shared/url-state-persistence.jsx";
+
+import { Ring251TDeployment } from '/src/snippets/autoregressive/ring-25-1t-deployment.jsx';
+
 ## 1. Model Introduction
 
 [Ring-2.5-1T](https://huggingface.co/inclusionAI/Ring-2.5-1T) is the world's first open-source trillion-parameter reasoning model based on hybrid linear attention architecture, developed by InclusionAI. Building on Ring-1T, Ring-2.5-1T demonstrates substantial improvements in generation efficiency, reasoning depth, and long-horizon task execution capabilities.
@@ -51,9 +55,7 @@ This section provides deployment configurations optimized for different hardware
 
 **Interactive Command Generator**: Use the configuration selector below to automatically generate the appropriate deployment command for your hardware platform.
 
-import { Ring251TDeployment } from '/src/snippets/autoregressive/ring-25-1t-deployment.jsx'
-
-<Ring251TDeployment />
+<Ring251TDeployment urlStatePrefix="ring-25-1t" />
 
 ### 3.2 Configuration Tips
 

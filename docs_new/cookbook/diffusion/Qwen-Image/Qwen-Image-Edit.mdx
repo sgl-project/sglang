@@ -4,6 +4,8 @@ metatags:
     description: "Deploy Qwen-Image-Edit-2511 with SGLang - 20B image editing model with text rendering, character consistency, and geometric reasoning."
 ---
 
+import { useUrlStatePersistence } from "/src/snippets/shared/url-state-persistence.jsx";
+
 import { QwenImageEditDeployment } from '/src/snippets/diffusion/qwen-image-edit-deployment.jsx';
 
 ## 1. Model Introduction
@@ -37,7 +39,7 @@ Qwen-Image-Edit-2511 is a 20B parameter model optimized for image editing tasks.
 
 **Interactive Command Generator**: Use the configuration selector below to automatically generate the appropriate deployment command for your hardware platform.
 
-<QwenImageEditDeployment />
+<QwenImageEditDeployment urlStatePrefix="qwen-image-edit" />
 
 ### 3.2 Configuration Tips
 

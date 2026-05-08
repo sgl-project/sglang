@@ -4,6 +4,8 @@ metatags:
     description: "Deploy Qwen3.5 with SGLang - flagship Qwen model with unified vision-language foundation, hybrid architecture, and scalable reasoning."
 ---
 
+import { useUrlStatePersistence } from "/src/snippets/shared/url-state-persistence.jsx";
+
 import { Qwen35Deployment } from '/src/snippets/autoregressive/qwen35-deployment.jsx'
 
 ## 1. Model Introduction
@@ -114,7 +116,7 @@ This section provides deployment configurations optimized for different hardware
 
 **Interactive Command Generator**: Use the configuration selector below to automatically generate the appropriate deployment command for your hardware platform and capabilities.
 
-<Qwen35Deployment />
+<Qwen35Deployment urlStatePrefix="qwen35" />
 
 ### 3.2 Configuration Tips
 

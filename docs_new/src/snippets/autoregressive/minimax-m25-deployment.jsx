@@ -1,4 +1,5 @@
-export const MiniMaxM25Deployment = () => {
+import { useUrlStatePersistence } from '/src/snippets/shared/url-state-persistence.jsx';
+export const MiniMaxM25Deployment = ({ urlStatePrefix = "minimax-m25" }) => {
   const modelFamily = 'MiniMaxAI';
 
   const options = {
@@ -148,6 +149,8 @@ export const MiniMaxM25Deployment = () => {
 
   const [values, setValues] = useState(getInitialState);
   const [isDark, setIsDark] = useState(false);
+
+  useUrlStatePersistence(values, setValues, { prefix: urlStatePrefix });
 
   useEffect(() => {
     const checkDarkMode = () => {

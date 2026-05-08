@@ -5,6 +5,10 @@ metatags:
 tag: NEW
 ---
 
+import { useUrlStatePersistence } from "/src/snippets/shared/url-state-persistence.jsx";
+
+import { MiniMaxM27Deployment } from '/src/snippets/autoregressive/minimax-m27-deployment.jsx';
+
 ## 1. Model Introduction
 
 [MiniMax-M2.7](https://huggingface.co/MiniMaxAI/MiniMax-M2.7) is MiniMax's first model deeply participating in its own evolution. Built for real-world productivity, M2.7 excels at building complex agent harnesses and completing highly elaborate productivity tasks, leveraging Agent Teams, complex Skills, and dynamic tool search.
@@ -63,9 +67,7 @@ This section provides deployment configurations optimized for different hardware
 
 **Interactive Command Generator**: Use the configuration selector below to automatically generate the appropriate deployment command for your hardware platform, deployment strategy, and feature capabilities.
 
-import { MiniMaxM27Deployment } from '/src/snippets/autoregressive/minimax-m27-deployment.jsx'
-
-<MiniMaxM27Deployment />
+<MiniMaxM27Deployment urlStatePrefix="minimax-m27" />
 
 ### 3.2 Configuration Tips
 

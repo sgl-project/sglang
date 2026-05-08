@@ -5,6 +5,10 @@ metatags:
 tag: NEW
 ---
 
+import { useUrlStatePersistence } from "/src/snippets/shared/url-state-persistence.jsx";
+
+import { KimiK26Deployment } from '/src/snippets/autoregressive/kimi-k26-deployment.jsx';
+
 ## 1. Model Introduction
 
 [Kimi-K2.6](https://huggingface.co/moonshotai/Kimi-K2.6) is an open-source, native multimodal agentic model by Moonshot AI, delivering industry-leading coding, long-horizon execution, and agent swarm capabilities. It matches or surpasses GPT-5.4, Claude Opus 4.6, and Gemini 3.1 Pro across key benchmarks.
@@ -80,9 +84,7 @@ Refer to the [official SGLang installation guide](../../../docs/get-started/inst
 
 **Interactive Command Generator**: Use the configuration selector below to automatically generate the appropriate deployment command for your hardware platform, deployment strategy, and capabilities.
 
-import { KimiK26Deployment } from '/src/snippets/autoregressive/kimi-k26-deployment.jsx'
-
-<KimiK26Deployment />
+<KimiK26Deployment urlStatePrefix="kimi-k26" />
 
 ### 3.2 Configuration Tips
 

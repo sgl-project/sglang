@@ -4,6 +4,8 @@ metatags:
     description: "Deploy NVIDIA Nemotron3-Nano 30B hybrid LLM with SGLang - MoE, Mamba2, and attention layers with BF16/FP8 precision options."
 ---
 
+import { useUrlStatePersistence } from "/src/snippets/shared/url-state-persistence.jsx";
+
 import { Nemotron3NanoDeployment } from '/src/snippets/autoregressive/nemotron3-nano-deployment.jsx';
 
 ## 1. Model Introduction
@@ -33,7 +35,7 @@ This section provides a progressive guide from quick deployment to performance t
 
 **Interactive Command Generator**: select hardware, model variant, and common knobs to generate a launch command.
 
-<Nemotron3NanoDeployment />
+<Nemotron3NanoDeployment urlStatePrefix="nemotron3-nano" />
 
 ### 3.2 Configuration Tips
 

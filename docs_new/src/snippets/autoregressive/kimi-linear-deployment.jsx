@@ -1,4 +1,5 @@
-export const KimiLinearDeployment = () => {
+import { useUrlStatePersistence } from '/src/snippets/shared/url-state-persistence.jsx';
+export const KimiLinearDeployment = ({ urlStatePrefix = "kimi-linear" }) => {
   const options = {
     hardware: {
       name: 'hardware',
@@ -116,6 +117,8 @@ export const KimiLinearDeployment = () => {
 
   const [values, setValues] = useState(getInitialState);
   const [isDark, setIsDark] = useState(false);
+
+  useUrlStatePersistence(values, setValues, { prefix: urlStatePrefix });
 
   useEffect(() => {
     const checkDarkMode = () => {

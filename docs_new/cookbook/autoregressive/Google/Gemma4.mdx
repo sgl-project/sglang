@@ -5,6 +5,8 @@ metatags:
 tag: NEW
 ---
 
+import { useUrlStatePersistence } from "/src/snippets/shared/url-state-persistence.jsx";
+
 import { Gemma4Deployment } from '/src/snippets/autoregressive/gemma4-deployment.jsx';
 
 ## 1. Model Introduction
@@ -88,7 +90,7 @@ For the full Docker setup and other installation methods, please refer to the [o
 
 **Interactive Command Generator**: Use the configuration selector below to automatically generate the appropriate deployment command for your hardware platform and model variant.
 
-<Gemma4Deployment />
+<Gemma4Deployment urlStatePrefix="gemma4" />
 
 ### 3.2 Configuration Tips
 

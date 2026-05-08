@@ -4,6 +4,8 @@ metatags:
     description: "Deploy Wan2.1 video generation models with SGLang - community contribution guide for Wan Video's diffusion models."
 ---
 
+import { useUrlStatePersistence } from "/src/snippets/shared/url-state-persistence.jsx";
+
 import { Wan21Deployment } from '/src/snippets/diffusion/wan21-deployment.jsx';
 
 ## 1. Model Introduction
@@ -39,7 +41,7 @@ The Wan2.1 series offers models in multiple sizes and resolutions, optimized for
 
 **Interactive Command Generator**: Use the configuration selector below to automatically generate an appropriate deployment command for your model variant and options.
 
-<Wan21Deployment />
+<Wan21Deployment urlStatePrefix="wan21" />
 
 ### 3.2 Configuration Tips
 

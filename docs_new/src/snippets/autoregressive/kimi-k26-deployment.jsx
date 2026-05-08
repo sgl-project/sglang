@@ -1,4 +1,5 @@
-export const KimiK26Deployment = () => {
+import { useUrlStatePersistence } from '/src/snippets/shared/url-state-persistence.jsx';
+export const KimiK26Deployment = ({ urlStatePrefix = "kimi-k26" }) => {
   // Config mirrors sgl-cookbook src/components/autoregressive/KimiK26ConfigGenerator/index.js.
   const options = {
     hardware: {
@@ -69,6 +70,8 @@ export const KimiK26Deployment = () => {
 
   const [values, setValues] = useState(getInitialState);
   const [isDark, setIsDark] = useState(false);
+
+  useUrlStatePersistence(values, setValues, { prefix: urlStatePrefix });
 
   useEffect(() => {
     const checkDarkMode = () => {

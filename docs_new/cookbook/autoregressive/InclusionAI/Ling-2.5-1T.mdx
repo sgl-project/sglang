@@ -4,6 +4,10 @@ metatags:
     description: "Deploy Ling-2.5-1T with SGLang - 1T parameter MoE model with 63B active parameters, trillion-scale context length up to 1M tokens, and agentic tool calling capabilities."
 ---
 
+import { useUrlStatePersistence } from "/src/snippets/shared/url-state-persistence.jsx";
+
+import { Ling251TDeployment } from '/src/snippets/autoregressive/ling-25-1t-deployment.jsx';
+
 ## 1. Model Introduction
 
 [Ling-2.5-1T](https://huggingface.co/inclusionAI/Ling-2.5-1T) is the latest flagship instant model in the Ling family. Thinking models raise the ceiling of intelligence, while instant models expand its reach by balancing efficiency and performance—making AGI not only more powerful, but also more accessible. Ling-2.5-1T delivers comprehensive upgrades across model architecture, token efficiency, and preference alignment, designed to bring universally accessible AI to a new level of quality.
@@ -42,9 +46,7 @@ Ling-2.5-1T is also supported via the **nightly PyPI builds**. See the [SGLang I
 
 Ling-2.5-1T is a trillion-parameter BF16 model that requires multi-node deployment (at least 2 nodes). Use the configuration selector below to generate the deployment command for your hardware platform.
 
-import { Ling251TDeployment } from '/src/snippets/autoregressive/ling-25-1t-deployment.jsx'
-
-<Ling251TDeployment />
+<Ling251TDeployment urlStatePrefix="ling-25-1t" />
 
 ### Configuration Tips
 

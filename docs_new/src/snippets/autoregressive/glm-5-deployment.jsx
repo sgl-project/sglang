@@ -1,4 +1,5 @@
-export const GLM5Deployment = () => {
+import { useUrlStatePersistence } from '/src/snippets/shared/url-state-persistence.jsx';
+export const GLM5Deployment = ({ urlStatePrefix = "glm-5" }) => {
   // Config mirrors sgl-cookbook src/components/autoregressive/GLM5ConfigGenerator/index.js.
   //
   // Supported quantization per hardware:
@@ -96,6 +97,8 @@ export const GLM5Deployment = () => {
 
   const [values, setValues] = useState(getInitialState);
   const [isDark, setIsDark] = useState(false);
+
+  useUrlStatePersistence(values, setValues, { prefix: urlStatePrefix });
 
   useEffect(() => {
     const checkDarkMode = () => {

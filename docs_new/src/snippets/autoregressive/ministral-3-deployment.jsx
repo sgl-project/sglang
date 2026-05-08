@@ -1,4 +1,5 @@
-export const Ministral3Deployment = () => {
+import { useUrlStatePersistence } from '/src/snippets/shared/url-state-persistence.jsx';
+export const Ministral3Deployment = ({ urlStatePrefix = "ministral-3" }) => {
   const options = {
     hardware: {
       name: 'hardware',
@@ -106,6 +107,8 @@ export const Ministral3Deployment = () => {
 
   const [values, setValues] = useState(getInitialState);
   const [isDark, setIsDark] = useState(false);
+
+  useUrlStatePersistence(values, setValues, { prefix: urlStatePrefix });
 
   useEffect(() => {
     const checkDarkMode = () => {

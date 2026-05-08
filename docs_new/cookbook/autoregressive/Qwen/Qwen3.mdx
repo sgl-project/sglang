@@ -4,6 +4,10 @@ metatags:
     description: "Deploy Qwen3 series models with SGLang - featuring advanced reasoning, 256K context, and flexible Dense/MoE architectures for edge to cloud."
 ---
 
+import { useUrlStatePersistence } from "/src/snippets/shared/url-state-persistence.jsx";
+
+
+import { Qwen3Deployment } from '/src/snippets/autoregressive/qwen3-deployment.jsx';
 
 ## 1. Model Introduction
 
@@ -36,9 +40,7 @@ The Qwen3 series offers models in various sizes and architectures, optimized for
 
 **Interactive Command Generator**: Use the configuration selector below to automatically generate the appropriate deployment command for your hardware platform, model size, quantization method, and thinking capabilities.
 
-import { Qwen3Deployment } from "/src/snippets/autoregressive/qwen3-deployment.jsx";
-
-<Qwen3Deployment />
+<Qwen3Deployment urlStatePrefix="qwen3" />
 
 ### 3.2 Configuration Tips
 

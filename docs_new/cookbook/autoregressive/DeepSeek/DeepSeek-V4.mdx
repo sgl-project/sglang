@@ -5,6 +5,11 @@ metatags:
 tag: NEW
 ---
 
+import { useUrlStatePersistence } from "/src/snippets/shared/url-state-persistence.jsx";
+
+
+import { DeepSeekV4Deployment } from '/src/snippets/autoregressive/deepseek-v4-deployment.jsx';
+
 ## 1. Model Introduction
 
 **DeepSeek-V4** is the next-generation Mixture-of-Experts model from DeepSeek, released 2026-04-24 under an **MIT License**. It ships as two Instruct repos (one per variant) plus matching Base repos:
@@ -125,9 +130,7 @@ SGLang supports three main serving recipes for DeepSeek-V4 with different latenc
 
 **Interactive Command Generator**: Use the selector below to generate the deployment command for your hardware + recipe combination.
 
-import { DeepSeekV4Deployment } from "/src/snippets/autoregressive/deepseek-v4-deployment.jsx";
-
-<DeepSeekV4Deployment />
+<DeepSeekV4Deployment urlStatePrefix="deepseek-v4" />
 
 ### 3.2 Configuration Tips
 

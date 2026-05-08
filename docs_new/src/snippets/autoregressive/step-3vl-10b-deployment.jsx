@@ -1,4 +1,5 @@
-export const Step3VL10BDeployment = () => {
+import { useUrlStatePersistence } from '/src/snippets/shared/url-state-persistence.jsx';
+export const Step3VL10BDeployment = ({ urlStatePrefix = "step-3vl-10b" }) => {
   const options = {
     hardware: {
       name: 'hardware',
@@ -141,6 +142,8 @@ export const Step3VL10BDeployment = () => {
 
   const [values, setValues] = useState(getInitialState);
   const [isDark, setIsDark] = useState(false);
+
+  useUrlStatePersistence(values, setValues, { prefix: urlStatePrefix });
 
   useEffect(() => {
     const checkDarkMode = () => {

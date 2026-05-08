@@ -1,4 +1,6 @@
-export const DeepSeekV4Deployment = () => {
+import { useUrlStatePersistence } from "/src/snippets/shared/url-state-persistence.jsx";
+
+export const DeepSeekV4Deployment = ({ urlStatePrefix = "deepseek-v4" }) => {
   // DeepSeek-V4 deployment matrix (small / real checkpoint):
   //   Hardware × Recipe → concrete launch command.
   //
@@ -97,6 +99,8 @@ export const DeepSeekV4Deployment = () => {
 
   const [values, setValues] = useState(getInitialState);
   const [isDark, setIsDark] = useState(false);
+
+  useUrlStatePersistence(values, setValues, { prefix: urlStatePrefix });
 
   useEffect(() => {
     const checkDarkMode = () => {

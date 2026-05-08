@@ -3,6 +3,10 @@ title: Llama-3.1
 metatags:
     description: "Deploy Llama 3.1 (8B/70B/405B) with SGLang - 128K context, tool use, multilingual support, and speculative decoding optimization."
 ---
+
+import { useUrlStatePersistence } from "/src/snippets/shared/url-state-persistence.jsx";
+import { Llama31Deployment } from '/src/snippets/autoregressive/llama31-deployment.jsx';
+
 ## 1. Model Introduction
 
 Llama 3.1 is a collection of pretrained and instruction tuned generative models, released in July 2024 by Meta. These models are available in 8B, 70B and 405B sizes, with the 405B variant being the most capable fully-open source model at the time.
@@ -30,9 +34,9 @@ This section provides deployment configurations optimized for different hardware
 
 **Interactive Command Generator**: Use the configuration selector below to generate a launch command for Llama 3.1 collection of models.
 
-import { Llama31Deployment } from "/src/snippets/autoregressive/llama31-deployment.jsx";
 
-<Llama31Deployment />
+<Llama31Deployment urlStatePrefix="llama31" />
+
 ### 3.2 Configuration Tips
 
 **Speculative Decoding (NVIDIA GPUs):**

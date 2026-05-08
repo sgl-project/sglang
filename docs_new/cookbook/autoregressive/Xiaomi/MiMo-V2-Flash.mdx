@@ -4,6 +4,10 @@ metatags:
     description: "Deploy MiMo-V2-Flash 309B MoE model with SGLang - hybrid attention, multi-token prediction, and 256K context for efficient inference."
 ---
 
+import { useUrlStatePersistence } from "/src/snippets/shared/url-state-persistence.jsx";
+
+import { MiMoV2FlashDeployment } from '/src/snippets/autoregressive/mimo-v2-flash-deployment.jsx';
+
 ## Introduction
 
 XiaomiMiMo/MiMo-V2-Flash, with 309B total parameters and 15B activated parameters, is a new inference-centric model designed to maximize decoding efficiency created by XiaomiMiMo Team explicitly co-designed for real-world serving workloads, enabling flexible tradeoffs between throughput and latency on different hardware.
@@ -56,9 +60,7 @@ pip install sglang==0.5.6.post2.dev8005+pr.15207.g39d5bd57a \
 
 Use the configuration selector below to automatically generate the appropriate deployment command.
 
-import { MiMoV2FlashDeployment } from "/src/snippets/autoregressive/mimo-v2-flash-deployment.jsx";
-
-<MiMoV2FlashDeployment />
+<MiMoV2FlashDeployment urlStatePrefix="mimo-v2-flash" />
 
 MI355X (ROCm) is validated in the selector above with `--tp-size 4`, Triton attention, and `--disable-custom-all-reduce`. `--tp-size 8` hit a QKV sharding error during validation. EAGLE speculative decoding is still WIP on MI355X.
 
