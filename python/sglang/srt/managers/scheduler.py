@@ -2988,6 +2988,13 @@ class Scheduler(
         if batch.forward_mode.is_prebuilt():
             return self._run_batch_prebuilt(batch)
 
+        # Refresh per-forward forced-token slots (no-op when no request has
+        # forced_token_ids set). Must run before copy_for_forward so the
+        # tensor rides through dataclasses.replace into the worker copy.
+        if batch.sampling_info is not None and batch.sampling_info.has_any_forced:
+            current_steps = [len(r.output_ids) for r in batch.reqs]
+            batch.sampling_info.prepare_forced_next_token_ids(current_steps)
+
         # Run forward
         if self.is_generation:
             if self.spec_algorithm.is_none() or self.enable_overlap:

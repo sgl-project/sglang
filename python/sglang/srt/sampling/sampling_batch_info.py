@@ -70,6 +70,20 @@ class SamplingBatchInfo:
     # Handle logit bias
     logit_bias: Optional[torch.Tensor] = None
 
+    # Forced-token-ids debug feature. When any request supplies a
+    # `forced_token_ids` sampling-param, the Sampler overrides the chosen
+    # token at each step with the request's t_step value, while leaving
+    # logits / logprobs untouched. Gated server-side by the env var
+    # SGLANG_ENABLE_FORCED_TOKEN_IDS=1 (enforced in SamplingParams.verify).
+    has_any_forced: bool = False
+    # Per-request forced-token sequence (None for unforced requests). Set in
+    # from_schedule_batch and updated by filter_batch / merge_batch.
+    forced_token_ids_lists: Optional[List[Optional[List[int]]]] = None
+    # Per-batch tensor of shape [bs] populated at forward time:
+    # forced_next_token_ids[i] = forced_token_ids_lists[i][step_i] or -1.
+    # Sentinel -1 means "no forcing for this request at this step".
+    forced_next_token_ids: Optional[torch.Tensor] = None
+
     @classmethod
     def from_schedule_batch(cls, batch: ScheduleBatch, vocab_size: int):
         global_server_args = get_global_server_args()
@@ -149,6 +163,15 @@ class SamplingBatchInfo:
             merged_custom_logit_processor = None
             custom_params = None
 
+        # Forced-token-ids storage (per-request lists, never changes after this point
+        # except via filter_batch / merge_batch). The per-forward `forced_next_token_ids`
+        # tensor is populated separately by `prepare_forced_next_token_ids` before each
+        # sampler call, since the current decode step changes each forward.
+        forced_token_ids_lists = [r.sampling_params.forced_token_ids for r in reqs]
+        has_any_forced = any(ft is not None for ft in forced_token_ids_lists)
+        if not has_any_forced:
+            forced_token_ids_lists = None
+
         # Each penalizers will do nothing if they evaluate themselves as not required by looking at
         # the sampling_params of the requests (See {_is_required()} of each penalizers). So this
         # should not add hefty computation overhead other than simple checks.
@@ -184,6 +207,8 @@ class SamplingBatchInfo:
             custom_logit_processor=merged_custom_logit_processor,
             device=device,
             logit_bias=logit_bias,
+            has_any_forced=has_any_forced,
+            forced_token_ids_lists=forced_token_ids_lists,
         )
         ret.adjusted_from_schedule_batch(batch, vocab_size)
         return ret
@@ -204,6 +229,35 @@ class SamplingBatchInfo:
 
     def __len__(self):
         return len(self.temperatures)
+
+    def prepare_forced_next_token_ids(self, current_steps: List[int]):
+        """Populate `forced_next_token_ids` for the upcoming forward.
+
+        Called per forward by the scheduler. `current_steps[i]` is the
+        decode-step index of request i (i.e. `len(req.output_ids)` immediately
+        before this forward). For each request that has a `forced_token_ids`
+        list and is still within bounds, set the slot to the forced token id;
+        otherwise set the sentinel -1.
+        """
+        if not self.has_any_forced or self.forced_token_ids_lists is None:
+            self.forced_next_token_ids = None
+            return
+
+        bs = len(self.forced_token_ids_lists)
+        assert len(current_steps) == bs, (
+            f"current_steps length {len(current_steps)} does not match "
+            f"batch size {bs}"
+        )
+        slot_values: List[int] = [-1] * bs
+        for i, forced in enumerate(self.forced_token_ids_lists):
+            if forced is None:
+                continue
+            step = current_steps[i]
+            if 0 <= step < len(forced):
+                slot_values[i] = int(forced[step])
+        self.forced_next_token_ids = torch.tensor(
+            slot_values, dtype=torch.int64, device=self.device
+        )
 
     def update_regex_vocab_mask(self):
         if not self.grammars:
@@ -287,6 +341,20 @@ class SamplingBatchInfo:
 
         if self.logit_bias is not None:
             self.logit_bias = self.logit_bias[keep_indices_device]
+
+        if self.forced_token_ids_lists is not None:
+            self.forced_token_ids_lists = [
+                self.forced_token_ids_lists[i] for i in keep_indices
+            ]
+            self.has_any_forced = any(
+                ft is not None for ft in self.forced_token_ids_lists
+            )
+            if not self.has_any_forced:
+                self.forced_token_ids_lists = None
+            # forced_next_token_ids is per-forward and rebuilt by
+            # prepare_forced_next_token_ids; clear here so a stale tensor
+            # doesn't accidentally apply to the filtered batch.
+            self.forced_next_token_ids = None
 
         self.adjusted_filter_batch(keep_indices, keep_indices_device)
 
@@ -378,6 +446,16 @@ class SamplingBatchInfo:
         self.logit_bias = merge_bias_tensor(
             self.logit_bias, other.logit_bias, len(self), len(other), self.device, 0.0
         )
+
+        # Merge forced-token lists. Must run before the temperatures merge,
+        # since `len(self)` / `len(other)` are derived from those tensors.
+        if self.has_any_forced or other.has_any_forced:
+            self_lists = self.forced_token_ids_lists or [None] * len(self)
+            other_lists = other.forced_token_ids_lists or [None] * len(other)
+            merged = self_lists + other_lists
+            self.forced_token_ids_lists = merged
+            self.has_any_forced = any(ft is not None for ft in merged)
+            self.forced_next_token_ids = None
 
         # Note: because the __len()__ operator is defined on the temperatures tensor,
         # please make sure any merge operation with len(self) or len(other) is done before
