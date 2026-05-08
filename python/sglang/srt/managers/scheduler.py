@@ -515,6 +515,7 @@ class Scheduler(
                         f"Page size now falls back to {self.dllm_config.block_size}"
                     )
                     self.page_size = self.dllm_config.block_size
+                    self.server_args.page_size = self.dllm_config.block_size
 
     def init_ipc_channels(self, port_args: PortArgs):
         context = zmq.Context(2)
