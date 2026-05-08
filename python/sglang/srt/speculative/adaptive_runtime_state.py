@@ -60,7 +60,10 @@ class AdaptiveSpecWorker(Protocol):
     speculative_num_steps: int
 
     def build_adaptive_runtime_state(
-        self, speculative_num_steps: int, speculative_num_draft_tokens: int
+        self,
+        speculative_num_steps: int,
+        speculative_num_draft_tokens: int,
+        cuda_graph_bs: List[int] | None = None,
     ) -> SpecRuntimeState: ...
 
     def apply_runtime_state(self, state: SpecRuntimeState) -> None: ...
@@ -151,14 +154,70 @@ class AdaptiveController:
         key = steps if steps is not None else state.speculative_num_steps
         self._states[key] = state
 
-    def init_states(self) -> None:
-        """Build and register runtime states for all candidate steps."""
+    def _cuda_graph_bs_for_step(
+        self, step: int, all_cuda_graph_bs: List[int]
+    ) -> List[int]:
+        """Return the cuda_graph_bs values needed to serve all batches that can use *step*.
+
+        A cuda_graph_bs entry *v* covers actual batch sizes in (prev_v, v].  We
+        include *v* for *step* when that coverage interval overlaps with at least
+        one BS slot whose candidate_steps contains *step*.
+        """
+        relevant_ranges: List[tuple] = []
+        for i, slot_key in enumerate(self._bs_list):
+            if step in self._bs_params[slot_key].candidate_steps:
+                lo = slot_key
+                hi = (
+                    self._bs_list[i + 1] if i + 1 < len(self._bs_list) else float("inf")
+                )
+                relevant_ranges.append((lo, hi))
+
+        if not relevant_ranges:
+            return []
+
+        result: List[int] = []
+        prev = 0
+        for v in sorted(all_cuda_graph_bs):
+            lo_actual = prev + 1
+            hi_actual = v
+            for r_lo, r_hi in relevant_ranges:
+                if lo_actual < r_hi and hi_actual >= r_lo:
+                    result.append(v)
+                    break
+            prev = v
+        return result
+
+    def init_states(self, cuda_graph_bs: List[int] | None = None) -> None:
+        """Build and register runtime states for all candidate steps.
+
+        Args:
+            cuda_graph_bs: Full list of batch sizes for which CUDA graphs may be
+                captured.  When provided, each step only captures graphs for the
+                batch-size values that can actually reach it, saving GPU memory.
+                When ``None``, all batch sizes are captured for every step
+                (original behaviour).
+        """
         for steps in self.candidate_steps:
             if steps in self._states:
+                pruned_bs = (
+                    self._cuda_graph_bs_for_step(steps, cuda_graph_bs)
+                    if cuda_graph_bs is not None
+                    else None
+                )
+                logger.info(
+                    f"init_states: step={steps}, cuda_graph_bs={pruned_bs} (pre-registered)"
+                )
                 continue
+            pruned_bs = (
+                self._cuda_graph_bs_for_step(steps, cuda_graph_bs)
+                if cuda_graph_bs is not None
+                else None
+            )
+            logger.info(f"init_states: step={steps}, cuda_graph_bs={pruned_bs}")
             state = self.worker.build_adaptive_runtime_state(
                 speculative_num_steps=steps,
                 speculative_num_draft_tokens=steps + 1,
+                cuda_graph_bs=pruned_bs,
             )
             self._states[steps] = state
 

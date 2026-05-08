@@ -237,7 +237,9 @@ class EAGLEWorker(TpModelWorker):
                         cuda_graph_runner_for_draft_extend=self.cuda_graph_runner_for_draft_extend,
                     )
                 )
-                self.adaptive_controller.init_states()
+                self.adaptive_controller.init_states(
+                    cuda_graph_bs=self.server_args.cuda_graph_bs,
+                )
 
         # Some dummy tensors
         self.num_new_pages_per_topk = torch.empty(
@@ -345,14 +347,19 @@ class EAGLEWorker(TpModelWorker):
         )
 
     def build_adaptive_runtime_state(
-        self, speculative_num_steps: int, speculative_num_draft_tokens: int
+        self,
+        speculative_num_steps: int,
+        speculative_num_draft_tokens: int,
+        cuda_graph_bs: list[int] | None = None,
     ) -> SpecRuntimeState:
         """Build a SpecRuntimeState for the given step configuration."""
         tic = time.perf_counter()
         before_mem = get_available_gpu_memory(self.device, self.gpu_id)
 
         with self._override_worker_state(
-            speculative_num_steps, speculative_num_draft_tokens
+            speculative_num_steps,
+            speculative_num_draft_tokens,
+            cuda_graph_bs=cuda_graph_bs,
         ):
             # Reuse existing init methods for draft attention backend and cuda graphs
             self.init_attention_backend()
@@ -403,7 +410,10 @@ class EAGLEWorker(TpModelWorker):
 
     @contextmanager
     def _override_worker_state(
-        self, speculative_num_steps: int, speculative_num_draft_tokens: int
+        self,
+        speculative_num_steps: int,
+        speculative_num_draft_tokens: int,
+        cuda_graph_bs: list[int] | None = None,
     ):
         """Temporarily override server_args and worker attributes for graph capture."""
         sa = self.server_args
@@ -417,11 +427,17 @@ class EAGLEWorker(TpModelWorker):
             self.cuda_graph_runner_for_draft_extend,
             sa.speculative_num_steps,
             sa.speculative_num_draft_tokens,
+            sa.cuda_graph_bs,
+            sa.disable_cuda_graph,
         )
         self.speculative_num_steps = speculative_num_steps
         self.speculative_num_draft_tokens = speculative_num_draft_tokens
         sa.speculative_num_steps = speculative_num_steps
         sa.speculative_num_draft_tokens = speculative_num_draft_tokens
+        if cuda_graph_bs is not None:
+            sa.cuda_graph_bs = cuda_graph_bs
+            if not cuda_graph_bs:
+                sa.disable_cuda_graph = True
         try:
             yield
         finally:
@@ -435,6 +451,8 @@ class EAGLEWorker(TpModelWorker):
                 self.cuda_graph_runner_for_draft_extend,
                 sa.speculative_num_steps,
                 sa.speculative_num_draft_tokens,
+                sa.cuda_graph_bs,
+                sa.disable_cuda_graph,
             ) = backup
 
     @property
