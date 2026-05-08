@@ -475,6 +475,7 @@ class Step3VLProcessor:
 class Step3VLImageProcessor(SGLangBaseProcessor):
     models = [Step3VLForConditionalGeneration, StepVLForConditionalGeneration]
     gpu_image_decode = False
+
     def __init__(self, hf_config, server_args, _processor, *args, **kwargs):
         # TODO, check _processor is tokenizer or processor.
         processor = Step3VLProcessor(hf_config, _processor)
