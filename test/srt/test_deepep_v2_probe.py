@@ -83,9 +83,7 @@ def _patched_deep_ep(*, with_buffer: bool, with_elastic_buffer: bool):
         for k, v in saved.items():
             sys.modules[k] = v
         if saved_deepep is not None:
-            sys.modules["sglang.srt.layers.moe.token_dispatcher.deepep"] = (
-                saved_deepep
-            )
+            sys.modules["sglang.srt.layers.moe.token_dispatcher.deepep"] = saved_deepep
 
 
 class TestDeepEPV2Probe(unittest.TestCase):
@@ -93,9 +91,7 @@ class TestDeepEPV2Probe(unittest.TestCase):
 
     def _import_probe_flags(self):
         sys.modules.pop("sglang.srt.layers.moe.token_dispatcher.deepep", None)
-        mod = importlib.import_module(
-            "sglang.srt.layers.moe.token_dispatcher.deepep"
-        )
+        mod = importlib.import_module("sglang.srt.layers.moe.token_dispatcher.deepep")
         return (
             getattr(mod, "use_deepep"),
             getattr(mod, "have_deepep_v2"),
