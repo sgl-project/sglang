@@ -1031,6 +1031,7 @@ class Req(ReqDllmMixin):
             )
             if envs.SGLANG_RADIX_FORCE_MISS.get():
                 from sglang.srt.managers.schedule_policy import _zero_match_result
+
                 match_result = _zero_match_result(tree_cache, match_result)
             (
                 self.prefix_indices,
