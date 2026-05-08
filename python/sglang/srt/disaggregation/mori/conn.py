@@ -882,6 +882,7 @@ class MoriKVSender(CommonKVSender):
             aux_index=self.aux_index if is_last else None,
         )
         self.transfer_statuses.extend(statuses)
+        self._record_transfer_indices(kv_indices, None)
         if infos is not None:
             self.pending_infos = infos
             self.sent_last_chunk = True
@@ -958,9 +959,6 @@ class MoriKVSender(CommonKVSender):
         self._notify_decode(KVPoll.Failed, failure_reason)
         self.conclude_state = KVPoll.Failed
 
-    def clear(self) -> None:
-        self.kv_mgr.request_status.pop(self.bootstrap_room, None)
-
     def failure_exception(self):
         if self.conclude_state is None:
             self._finalize_failure()
@@ -1033,6 +1031,7 @@ class MoriKVReceiver(CommonKVReceiver):
         kv_indices: npt.NDArray[np.int32],
         aux_index: Optional[int] = None,
         state_indices: Optional[List[int]] = None,
+        decode_prefix_len: Optional[int] = None,
     ):
         if self.bootstrap_infos is None or self.bootstrap_room is None:
             return
@@ -1085,9 +1084,7 @@ class MoriKVReceiver(CommonKVReceiver):
     def clear(self) -> None:
         if self.bootstrap_room is None:
             return
-        self.kv_mgr.request_status.pop(self.bootstrap_room, None)
-        self.kv_mgr.required_prefill_response_num_table.pop(self.bootstrap_room, None)
-        self.kv_mgr.prefill_response_tracker.pop(self.bootstrap_room, None)
+        super().clear()
         self.kv_mgr._cleanup_room_tracking(self.bootstrap_room)
 
     def failure_exception(self):
@@ -1105,7 +1102,6 @@ class MoriKVReceiver(CommonKVReceiver):
         if self.bootstrap_room is None:
             return
         super().abort()
-        self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
         self.clear()
 
 

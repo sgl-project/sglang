@@ -2555,7 +2555,7 @@ def launch_dummy_health_check_server(host, port, enable_metrics):
         app,
         host=host,
         port=port,
-        timeout_keep_alive=5,
+        timeout_keep_alive=envs.SGLANG_TIMEOUT_KEEP_ALIVE.get(),
         loop="auto",
         log_config=None,
         log_level="warning",
@@ -3648,6 +3648,15 @@ def check_cuda_result(raw_output):
         raise Exception(f"CUDA error: {err}")
 
     return results
+
+
+def get_cuda_driver_bindings():
+    try:
+        from cuda.bindings import driver as cuda_driver
+    except ImportError:
+        from cuda import cuda as cuda_driver
+
+    return cuda_driver
 
 
 def get_physical_device_id(pytorch_device_id: int) -> int:
