@@ -78,13 +78,17 @@ class PrefillDelayer:
         self,
         local_prefillable: bool,
         token_usage: float,
-        **kwargs,
+        running_batch: int = 0,
+        max_prefill_bs: int = 0,
+        max_running_requests: int = 0,
     ) -> _NegotiateOutput:
         out = self._negotiate_should_allow_prefill_pure(
             prev_state=self._curr_state,
             local_prefillable=local_prefillable,
             token_usage=token_usage,
-            **kwargs,
+            running_batch=running_batch,
+            max_prefill_bs=max_prefill_bs,
+            max_running_requests=max_running_requests,
         )
         self._curr_state = out.next_state
         return out
@@ -95,7 +99,9 @@ class PrefillDelayer:
         prev_state: Optional[_State],
         local_prefillable: bool,
         token_usage: float,
-        **kwargs,
+        running_batch: int = 0,
+        max_prefill_bs: int = 0,
+        max_running_requests: int = 0,
     ) -> _NegotiateOutput:
         # Compute local states
         local_token_watermark_force_allow = (
@@ -108,7 +114,8 @@ class PrefillDelayer:
         tp0_info = self._gather_info(
             local_prefillable=local_prefillable,
             local_token_watermark_force_allow=local_token_watermark_force_allow,
-            **kwargs,
+            running_batch=running_batch,
+            max_prefill_bs=max_prefill_bs,
         )
         global_prefillable = tp0_info[:, 0]
         global_token_watermark_force_allow = tp0_info[:, 1]
@@ -133,16 +140,6 @@ class PrefillDelayer:
 
         # Compute outputs
         if prefillable_status == "all":
-            if kwargs is None:
-                exist_previous_wait = prev_state is not None
-                return _NegotiateOutput(
-                    next_state=None,
-                    output_allow=True,
-                    output_reason="wait_success" if exist_previous_wait else "no_wait",
-                    **debug_info,
-                )
-
-            max_running_requests = kwargs.get("max_running_requests", 0)
             if not self.enable_dp_attention:
                 max_running_requests = (
                     max_running_requests + self.dp_size - 1
@@ -210,14 +207,18 @@ class PrefillDelayer:
             raise NotImplementedError
 
     def _gather_info(
-        self, local_prefillable: bool, local_token_watermark_force_allow: bool, **kwargs
+        self,
+        local_prefillable: bool,
+        local_token_watermark_force_allow: bool,
+        running_batch: int = 0,
+        max_prefill_bs: int = 0,
     ):
         local_info = torch.tensor(
             [
                 int(local_prefillable),
                 int(local_token_watermark_force_allow),
-                kwargs.get("running_batch", 0),
-                kwargs.get("max_prefill_bs", 0),
+                running_batch,
+                max_prefill_bs,
             ],
             device="cpu",
             dtype=torch.int64,
@@ -251,12 +252,20 @@ class PrefillDelayerSinglePassExecutor:
             metrics_collector=self._prefill_delayer._metrics_collector,
         )
 
-    def negotiate_should_allow_prefill(self, local_prefillable: bool, **kwargs) -> bool:
+    def negotiate_should_allow_prefill(
+        self,
+        local_prefillable: bool,
+        running_batch: int = 0,
+        max_prefill_bs: int = 0,
+        max_running_requests: int = 0,
+    ) -> bool:
         if not self._called:
             self._result = self._prefill_delayer._negotiate_should_allow_prefill(
                 local_prefillable=local_prefillable,
                 token_usage=self._token_usage,
-                **kwargs,
+                running_batch=running_batch,
+                max_prefill_bs=max_prefill_bs,
+                max_running_requests=max_running_requests,
             )
         return self._result.output_allow
 

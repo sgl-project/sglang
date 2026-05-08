@@ -65,6 +65,14 @@ _is_cpu = is_cpu()
 _is_amx_available = cpu_has_amx_support()
 
 
+if _is_npu:
+    from sgl_kernel_npu.fla.utils import (
+        fused_qkvzba_split_reshape_cat as fused_qkvzba_split_reshape_cat_npu,
+    )
+
+    fused_qkvzba_split_reshape_cat = fused_qkvzba_split_reshape_cat_npu
+
+
 class Qwen3GatedDeltaNet(nn.Module):
     def __init__(
         self,
@@ -223,11 +231,20 @@ class Qwen3GatedDeltaNet(nn.Module):
         ModelWeightParameter exposes weight_loader as a read-only property
         backed by _weight_loader, while plain parameters store it as a
         regular attribute.  This helper handles both cases."""
-        param = module.weight
-        if hasattr(param, "_weight_loader"):
-            param._weight_loader = new_loader
-        else:
-            param.weight_loader = new_loader
+        for attr_name in (
+            "weight",
+            "weight_scale_inv",
+            "weight_scale",
+            "input_scale",
+            "weight_offset",
+        ):
+            param = getattr(module, attr_name, None)
+            if param is None:
+                continue
+            if hasattr(param, "_weight_loader"):
+                param._weight_loader = new_loader
+            else:
+                param.weight_loader = new_loader
 
     @staticmethod
     def _make_packed_weight_loader(module):
@@ -428,6 +445,48 @@ class Qwen3GatedDeltaNet(nn.Module):
         return output
 
 
+def _apply_qwen3_next_mlp(
+    layer: nn.Module,
+    hidden_states: torch.Tensor,
+    residual: Optional[torch.Tensor],
+    forward_batch: ForwardBatch,
+) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    hidden_states, residual = layer.layer_communicator.prepare_mlp(
+        hidden_states, residual, forward_batch
+    )
+    use_reduce_scatter = layer.layer_communicator.should_use_reduce_scatter(
+        forward_batch
+    )
+    should_allreduce_fusion = (
+        layer.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
+            forward_batch
+        )
+    )
+
+    if isinstance(layer.mlp, Qwen2MoeSparseMoeBlock):
+        hidden_states = layer.mlp(
+            hidden_states,
+            forward_batch=forward_batch,
+            use_reduce_scatter=use_reduce_scatter,
+            should_allreduce_fusion=should_allreduce_fusion,
+        )
+    else:
+        hidden_states = layer.mlp(
+            hidden_states,
+            should_allreduce_fusion=should_allreduce_fusion,
+            use_reduce_scatter=use_reduce_scatter,
+        )
+
+    if should_allreduce_fusion:
+        hidden_states._sglang_needs_allreduce_fusion = True
+    else:
+        hidden_states, residual = layer.layer_communicator.postprocess_layer(
+            hidden_states, residual, forward_batch
+        )
+
+    return hidden_states, residual
+
+
 class Qwen3HybridLinearDecoderLayer(nn.Module):
 
     def __init__(
@@ -510,18 +569,8 @@ class Qwen3HybridLinearDecoderLayer(nn.Module):
                 hidden_states,
                 forward_batch,
             )
-        # Fully Connected
-        hidden_states, residual = self.layer_communicator.prepare_mlp(
-            hidden_states, residual, forward_batch
-        )
-
-        use_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
-            forward_batch
-        )
-        hidden_states = self.mlp(hidden_states, forward_batch, use_reduce_scatter)
-
-        hidden_states, residual = self.layer_communicator.postprocess_layer(
-            hidden_states, residual, forward_batch
+        hidden_states, residual = _apply_qwen3_next_mlp(
+            self, hidden_states, residual, forward_batch
         )
 
         return hidden_states, residual
@@ -750,17 +799,8 @@ class Qwen3HybridAttentionDecoderLayer(nn.Module):
                 forward_batch=forward_batch,
             )
 
-        # Fully Connected
-        hidden_states, residual = self.layer_communicator.prepare_mlp(
-            hidden_states, residual, forward_batch
-        )
-        use_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
-            forward_batch
-        )
-        hidden_states = self.mlp(hidden_states, forward_batch, use_reduce_scatter)
-
-        hidden_states, residual = self.layer_communicator.postprocess_layer(
-            hidden_states, residual, forward_batch
+        hidden_states, residual = _apply_qwen3_next_mlp(
+            self, hidden_states, residual, forward_batch
         )
 
         return hidden_states, residual

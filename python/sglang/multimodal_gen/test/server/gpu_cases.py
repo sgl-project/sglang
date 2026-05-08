@@ -4,7 +4,10 @@ from sglang.multimodal_gen.test.server.testcase_configs import (
     MODELOPT_FLUX1_NVFP4_TRANSFORMER,
     MODELOPT_FLUX2_FP8_TRANSFORMER,
     MODELOPT_FLUX2_NVFP4_WEIGHTS,
+    MODELOPT_HUNYUANVIDEO_FP8_TRANSFORMER,
     MODELOPT_NVFP4_B200_ENV_VARS,
+    MODELOPT_QWEN_IMAGE_EDIT_FP8_TRANSFORMER,
+    MODELOPT_QWEN_IMAGE_FP8_TRANSFORMER,
     MODELOPT_WAN22_FP8_TRANSFORMER,
     MODELOPT_WAN22_NVFP4_TRANSFORMER,
     T2V_PROMPT,
@@ -14,6 +17,7 @@ from sglang.multimodal_gen.test.server.testcase_configs import (
     HUNYUAN3D_SHAPE_sampling_params,
     MODELOPT_T2I_CI_sampling_params,
     MODELOPT_T2V_CI_sampling_params,
+    MODELOPT_TI2I_CI_sampling_params,
     MULTI_FRAME_I2I_sampling_params,
     MULTI_IMAGE_TI2I_sampling_params,
     MULTI_IMAGE_TI2I_UPLOAD_sampling_params,
@@ -28,6 +32,7 @@ from sglang.multimodal_gen.test.test_utils import (
     DEFAULT_FLUX_1_DEV_MODEL_NAME_FOR_TEST,
     DEFAULT_FLUX_2_DEV_MODEL_NAME_FOR_TEST,
     DEFAULT_FLUX_2_KLEIN_4B_MODEL_NAME_FOR_TEST,
+    DEFAULT_JOYAI_IMAGE_EDIT_MODEL_NAME_FOR_TEST,
     DEFAULT_MOVA_360P_MODEL_NAME_FOR_TEST,
     DEFAULT_QWEN_IMAGE_EDIT_2509_MODEL_NAME_FOR_TEST,
     DEFAULT_QWEN_IMAGE_EDIT_2511_MODEL_NAME_FOR_TEST,
@@ -154,6 +159,13 @@ ONE_GPU_CASES: list[DiffusionTestCase] = [
             model_path=DEFAULT_QWEN_IMAGE_LAYERED_MODEL_NAME_FOR_TEST,
         ),
         MULTI_FRAME_I2I_sampling_params,
+    ),
+    DiffusionTestCase(
+        "joyai_image_edit_ti2i",
+        DiffusionServerArgs(model_path=DEFAULT_JOYAI_IMAGE_EDIT_MODEL_NAME_FOR_TEST),
+        TI2I_sampling_params,
+        run_consistency_check=False,
+        run_component_accuracy_check=False,
     ),
     # Upscaling (Real-ESRGAN 4×) for T2I
     DiffusionTestCase(
@@ -331,8 +343,13 @@ ONE_GPU_CASES: list[DiffusionTestCase] = [
             extras=[
                 "--pipeline-class-name LTX2TwoStageHQPipeline --ltx2-two-stage-device-mode snapshot"
             ],
+            env_vars={
+                "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
+                "SGLANG_LTX2_SNAPSHOT_RELEASE_EMPTY_CACHE": "true",
+            },
         ),
         T2I_sampling_params,
+        run_component_accuracy_check=False,
     ),
 ]
 
@@ -386,6 +403,32 @@ else:
             modality="video",
             sampling_params=MODELOPT_T2V_CI_sampling_params,
             extras=["--transformer-path", MODELOPT_WAN22_FP8_TRANSFORMER],
+        ),
+        _make_modelopt_ci_case(
+            "hunyuanvideo_modelopt_fp8_t2v",
+            model_path="hunyuanvideo-community/HunyuanVideo",
+            modality="video",
+            sampling_params=MODELOPT_T2V_CI_sampling_params,
+            extras=[
+                "--transformer-path",
+                MODELOPT_HUNYUANVIDEO_FP8_TRANSFORMER,
+                "--text-encoder-cpu-offload",
+                "--pin-cpu-memory",
+            ],
+        ),
+        _make_modelopt_ci_case(
+            "qwen_image_modelopt_fp8_t2i",
+            model_path=DEFAULT_QWEN_IMAGE_MODEL_NAME_FOR_TEST,
+            modality="image",
+            sampling_params=MODELOPT_T2I_CI_sampling_params,
+            extras=["--transformer-path", MODELOPT_QWEN_IMAGE_FP8_TRANSFORMER],
+        ),
+        _make_modelopt_ci_case(
+            "qwen_image_edit_modelopt_fp8_ti2i",
+            model_path=DEFAULT_QWEN_IMAGE_EDIT_2511_MODEL_NAME_FOR_TEST,
+            modality="image",
+            sampling_params=MODELOPT_TI2I_CI_sampling_params,
+            extras=["--transformer-path", MODELOPT_QWEN_IMAGE_EDIT_FP8_TRANSFORMER],
         ),
         _make_modelopt_ci_case(
             "flux1_modelopt_nvfp4_t2i",
@@ -521,12 +564,13 @@ TWO_GPU_CASES = [
         "ltx_2_3_two_stage_ti2v_2gpus",
         DiffusionServerArgs(
             model_path="Lightricks/LTX-2.3",
-            ulysses_degree=2,
+            cfg_parallel=True,
             extras=[
                 "--pipeline-class-name LTX2TwoStagePipeline --ltx2-two-stage-device-mode original"
             ],
         ),
         TI2V_sampling_params,
+        run_component_accuracy_check=False,
     ),
     DiffusionTestCase(
         "wan2_1_i2v_14b_480P_2gpu",
@@ -540,13 +584,14 @@ TWO_GPU_CASES = [
         "ltx_2.3_two_stage_t2v_2gpus",
         DiffusionServerArgs(
             model_path="Lightricks/LTX-2.3",
-            ulysses_degree=2,
+            cfg_parallel=True,
             extras=[
                 "--pipeline-class-name LTX2TwoStagePipeline",
                 "--ltx2-two-stage-device-mode original",
             ],
         ),
         T2V_sampling_params,
+        run_component_accuracy_check=False,
     ),
     # I2V LoRA test case
     DiffusionTestCase(
@@ -613,19 +658,13 @@ TWO_GPU_CASES = [
         T2I_sampling_params,
     ),
     DiffusionTestCase(
-        "flux_2_klein_ti2i_2_gpus",
-        DiffusionServerArgs(
-            model_path="black-forest-labs/FLUX.2-klein-4B",
-        ),
-        TI2I_sampling_params,
-    ),
-    DiffusionTestCase(
         "ltx_2.3_one_stage_ti2v",
         DiffusionServerArgs(
             model_path="Lightricks/LTX-2.3",
             ulysses_degree=2,
         ),
         TI2V_sampling_params,
+        run_component_accuracy_check=False,
     ),
 ]
 

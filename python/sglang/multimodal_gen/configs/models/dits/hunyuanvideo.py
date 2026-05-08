@@ -6,22 +6,12 @@ from dataclasses import dataclass, field
 import torch
 
 from sglang.multimodal_gen.configs.models.dits.base import DiTArchConfig, DiTConfig
-
-
-def is_double_block(n: str, m) -> bool:
-    return "double" in n and str.isdigit(n.split(".")[-1])
-
-
-def is_single_block(n: str, m) -> bool:
-    return "single" in n and str.isdigit(n.split(".")[-1])
-
-
-def is_refiner_block(n: str, m) -> bool:
-    return "refiner" in n and str.isdigit(n.split(".")[-1])
-
-
-def is_txt_in(n: str, m) -> bool:
-    return n.split(".")[-1] == "txt_in"
+from sglang.multimodal_gen.configs.models.fsdp import (
+    is_double_block,
+    is_refiner_block,
+    is_single_block,
+    is_txt_in,
+)
 
 
 @dataclass
