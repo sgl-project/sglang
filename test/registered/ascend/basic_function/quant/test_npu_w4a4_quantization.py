@@ -6,79 +6,47 @@ python3 -m unittest test_ascend_w4a4_quantization.TestAscendW4A4.test_gsm8k
 import os
 import time
 import unittest
-from types import SimpleNamespace
-from urllib.parse import urlparse
 
 import requests
 
-from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import register_npu_ci
-from sglang.test.few_shot_gsm8k import run_eval
-from sglang.test.test_utils import (
-    DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-    DEFAULT_URL_FOR_TEST,
-    CustomTestCase,
-    is_in_ci,
-    popen_launch_server,
+from sglang.test.ascend.gsm8k_ascend_mixin import GSM8KAscendMixin
+from sglang.test.ascend.test_ascend_utils import (
+    ECO_TECH_QWEN3_32B_W4A4_LAOS_WEIGHTS_PATH,
 )
+from sglang.test.ci.ci_register import register_npu_ci
+from sglang.test.test_utils import CustomTestCase, is_in_ci, write_github_step_summary
 
 register_npu_ci(est_time=400, suite="stage-b-test-4-npu-a3", nightly=False)
 register_npu_ci(est_time=400, suite="nightly-4-npu-a3", nightly=True)
 
-if "ASCEND_RT_VISIBLE_DEVICES" not in os.environ:
-    os.environ["ASCEND_RT_VISIBLE_DEVICES"] = "0,1,2,3"
-DEFAULT_PORT_FOR_SRT_TEST_RUNNER = (
-    7000 + int(os.environ.get("ASCEND_RT_VISIBLE_DEVICES", "0")[0]) * 100
-)
-DEFAULT_URL_FOR_TEST = f"http://127.0.0.1:{DEFAULT_PORT_FOR_SRT_TEST_RUNNER + 1000}"
 
+class TestAscendW4A4(GSM8KAscendMixin, CustomTestCase):
 
-class TestAscendW4A4(CustomTestCase):
-    @classmethod
-    def setUpClass(cls):
-        cls.model = "/root/.cache/modelscope/hub/models/Eco-Tech/Qwen3-32B-w4a4-LAOS"
-        cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.process = popen_launch_server(
-            cls.model,
-            cls.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=[
-                "--trust-remote-code",
-                "--device",
-                "npu",
-                "--attention-backend",
-                "ascend",
-                "--tp-size",
-                "4",
-                "--mem-fraction-static",
-                "0.8",
-                "--cuda-graph-bs",
-                "64",
-                "--disable-radix-cache",
-            ],
-        )
+    model = ECO_TECH_QWEN3_32B_W4A4_LAOS_WEIGHTS_PATH
+    other_args = [
+        "--trust-remote-code",
+        "--device",
+        "npu",
+        "--attention-backend",
+        "ascend",
+        "--tp-size",
+        "4",
+        "--mem-fraction-static",
+        "0.8",
+        "--cuda-graph-bs",
+        "64",
+        "--disable-radix-cache",
+    ]
 
-    @classmethod
-    def tearDownClass(cls):
-        kill_process_tree(cls.process.pid)
+    env = {
+        **os.environ,
+    }
 
-    def test_gsm8k(self):
-        base_url = DEFAULT_URL_FOR_TEST
-        url = urlparse(base_url)
-        args = SimpleNamespace(
-            num_shots=5,
-            data_path=None,
-            num_questions=1319,
-            max_new_tokens=512,
-            parallel=64,
-            host=f"http://{url.hostname}",
-            port=int(url.port),
-        )
-        metrics = run_eval(args)
-        print(metrics)
-
-        self.assertGreaterEqual(metrics["accuracy"], 0.80)
-        self.assertGreaterEqual(metrics["output_throughput"], 1000)
+    # GSM8K Configs
+    accuracy = 0.80  # GSM8K accuracy ≥0.80
+    num_questions = 1319
+    gsm8k_num_shots = 5
+    output_throughput = 1000  # GSM8K output throughput ≥1000 tokens/s
 
     def run_decode(self, max_new_tokens):
         response = requests.post(
@@ -100,11 +68,12 @@ class TestAscendW4A4(CustomTestCase):
         tic = time.perf_counter()
         res = self.run_decode(max_tokens)
         tok = time.perf_counter()
-        print(res["text"])
         throughput = max_tokens / (tok - tic)
-        print(f"Throughput: {throughput} tokens/s")
+        summary = res["text"] + f"\nThroughput: {throughput} tokens/s"
+        print(summary)
 
         if is_in_ci():
+            write_github_step_summary(summary + "\nThroughput threshold: 35 tokens/s")
             self.assertGreaterEqual(throughput, 35)
 
 
