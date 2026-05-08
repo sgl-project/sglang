@@ -29,6 +29,7 @@ if TYPE_CHECKING:
     from sglang.multimodal_gen.runtime.server_args import Backend
 
 from sglang.multimodal_gen.configs.pipeline_configs import (
+    Cosmos3Config,
     FastHunyuanConfig,
     FluxPipelineConfig,
     HeliosDistilledConfig,
@@ -83,6 +84,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.wan import (
     Wan2_2_T2V_A14B_Config,
     Wan2_2_TI2V_5B_Config,
 )
+from sglang.multimodal_gen.configs.sample.cosmos3 import Cosmos3SamplingParams
 from sglang.multimodal_gen.configs.sample.ernie_image import ErnieImageSamplingParams
 from sglang.multimodal_gen.configs.sample.flux import (
     Flux2KleinSamplingParams,
@@ -927,6 +929,17 @@ def _register_configs():
         pipeline_config_cls=HeliosDistilledConfig,
         hf_model_paths=[
             "BestWishYsh/Helios-Distilled",
+        ],
+    )
+
+    # Cosmos3 — single checkpoint serves T2V, I2V, and T2I. Mode is dispatched
+    # per-request inside the pipeline from ``num_frames`` and ``image_path``.
+    # TODO: update to hf_model_paths once it is released.
+    register_configs(
+        sampling_param_cls=Cosmos3SamplingParams,
+        pipeline_config_cls=Cosmos3Config,
+        model_detectors=[
+            lambda hf_id: "cosmos3omnidiffuserspipeline" in hf_id.lower()
         ],
     )
 
