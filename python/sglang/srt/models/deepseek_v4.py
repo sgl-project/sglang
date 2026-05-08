@@ -92,6 +92,30 @@ ATTN_BIT_WISE_EQUAL_MODE = False
 COMPRESSOR_BIT_WISE_EQUAL_MODE = False
 _FP8_WO_A_GEMM = envs.SGLANG_OPT_FP8_WO_A_GEMM.get()
 
+if _is_hip:
+    from aiter import rope_rotate_activation
+
+_FREQS_CIS_TO_COS_SIN: dict[
+    Tuple[int, torch.dtype, torch.device], Tuple[torch.Tensor, torch.Tensor]
+] = {}
+
+
+def _freqs_cis_to_cos_sin(
+    freqs_cis: torch.Tensor, dtype: torch.dtype, device: torch.device
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Derive (cos, sin) bf16 contiguous tables from a complex64 `freqs_cis`,
+    cached by `(id(freqs_cis), dtype, device)` so that all layers sharing the
+    same `freqs_cis` (via `precompute_freqs_cis`'s lru_cache) reuse one pair."""
+    key = (id(freqs_cis), dtype, device)
+    cached = _FREQS_CIS_TO_COS_SIN.get(key)
+    if cached is not None:
+        return cached
+    fr = torch.view_as_real(freqs_cis)
+    cos = fr[..., 0].to(device=device, dtype=dtype).contiguous()
+    sin = fr[..., 1].to(device=device, dtype=dtype).contiguous()
+    _FREQS_CIS_TO_COS_SIN[key] = (cos, sin)
+    return cos, sin
+
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.deepseek_v4_backend import DeepseekV4Backend
@@ -1224,6 +1248,12 @@ class C4Indexer(nn.Module):
         # [bs, n_heads, head_dim]
         q, _ = self.wq_b(q_lora)
         q = q.view(-1, self.n_local_heads, self.head_dim)
+        if _is_hip:
+            cos, sin = _freqs_cis_to_cos_sin(self.freqs_cis, q.dtype, q.device)
+            if positions.dtype != torch.int64:
+                positions = positions.to(torch.int64)
+            rope_rotate_activation(q, q, cos, sin, positions, self.rope_head_dim)
+            return q
         fused_rope(
             q[..., -self.rope_head_dim :],
             None,
