@@ -947,23 +947,23 @@ void shared_expert_kernel_impl(
 // common checks
 template <CPUQuantMethod quant>
 static inline void check_moe_scales(
-  const std::optional<at::Tensor>& w1_scale,
-  const std::optional<at::Tensor>& w2_scale,
-  const std::optional<std::vector<int64_t>> block_size) {
-    if constexpr(quant == CPUQuantMethod::INT8_W8A8) {
-      TORCH_CHECK(w1_scale.has_value(), "missing w1_scale for int8 w8a8.");
-      TORCH_CHECK(w2_scale.has_value(), "missing w2_scale for int8 w8a8.");
-    } else if constexpr (quant == CPUQuantMethod::FP8_W8A16) {
-      TORCH_CHECK(w1_scale.has_value(), "missing w1_scale for fp8 w8a16.");
-      TORCH_CHECK(w2_scale.has_value(), "missing w2_scale for fp8 w8a16.");
-      TORCH_CHECK(block_size.has_value(), "missing block_size for fp8 w8a16.");
-      TORCH_CHECK(block_size.value().size() == 2, "expect block_size.size() to be 2.");
-    } else if constexpr (quant == CPUQuantMethod::MXFP4) {
-      TORCH_CHECK(w1_scale.has_value(), "missing w1_scale for mxfp4.");
-      TORCH_CHECK(w2_scale.has_value(), "missing w2_scale for mxfp4.");
-      TORCH_CHECK(w1_scale.value().scalar_type() == at::kByte, "expect w1_scale to be uint8.");
-      TORCH_CHECK(w2_scale.value().scalar_type() == at::kByte, "expect w2_scale to be uint8.");
-    }
+    const std::optional<at::Tensor>& w1_scale,
+    const std::optional<at::Tensor>& w2_scale,
+    const std::optional<std::vector<int64_t>> block_size) {
+  if constexpr (quant == CPUQuantMethod::INT8_W8A8) {
+    TORCH_CHECK(w1_scale.has_value(), "missing w1_scale for int8 w8a8.");
+    TORCH_CHECK(w2_scale.has_value(), "missing w2_scale for int8 w8a8.");
+  } else if constexpr (quant == CPUQuantMethod::FP8_W8A16) {
+    TORCH_CHECK(w1_scale.has_value(), "missing w1_scale for fp8 w8a16.");
+    TORCH_CHECK(w2_scale.has_value(), "missing w2_scale for fp8 w8a16.");
+    TORCH_CHECK(block_size.has_value(), "missing block_size for fp8 w8a16.");
+    TORCH_CHECK(block_size.value().size() == 2, "expect block_size.size() to be 2.");
+  } else if constexpr (quant == CPUQuantMethod::MXFP4) {
+    TORCH_CHECK(w1_scale.has_value(), "missing w1_scale for mxfp4.");
+    TORCH_CHECK(w2_scale.has_value(), "missing w2_scale for mxfp4.");
+    TORCH_CHECK(w1_scale.value().scalar_type() == at::kByte, "expect w1_scale to be uint8.");
+    TORCH_CHECK(w2_scale.value().scalar_type() == at::kByte, "expect w2_scale to be uint8.");
+  }
 }
 
 static inline void check_moe_scales(
