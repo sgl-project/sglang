@@ -1050,12 +1050,13 @@ class LTX2DenoisingStage(DenoisingStage):
         if valid is None:
             return None
         valid = int(valid)
-        if valid <= 0 or valid >= int(seq_len):
+        if valid <= 0:
             return None
         mask = torch.ones(
             (batch_size, int(seq_len)), device=device, dtype=torch.float32
         )
-        mask[:, valid:] = 0.0
+        if valid < int(seq_len):
+            mask[:, valid:] = 0.0
         return mask
 
     @staticmethod
