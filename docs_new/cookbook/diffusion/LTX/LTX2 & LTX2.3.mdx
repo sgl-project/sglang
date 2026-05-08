@@ -21,7 +21,7 @@ Use `Lightricks/LTX-2` or `Lightricks/LTX-2.3` as `--model-path`. For two-stage 
 
 Install SGLang with diffusion dependencies:
 
-```bash Command
+```bash title="Command"
 uv pip install "sglang[diffusion]" --prerelease=allow
 ```
 
@@ -92,7 +92,7 @@ On high-VRAM GPUs, add `--text-encoder-cpu-offload false` if text encoding laten
 
 #### 3.3.1 Two GPUs
 
-```bash Command
+```bash title="Command"
 sglang serve \
   --model-path Lightricks/LTX-2.3 \
   --pipeline-class-name LTX2TwoStagePipeline \
@@ -103,7 +103,7 @@ sglang serve \
 
 #### 3.3.2 Four GPUs
 
-```bash Command
+```bash title="Command"
 sglang serve \
   --model-path Lightricks/LTX-2.3 \
   --pipeline-class-name LTX2TwoStagePipeline \
@@ -127,7 +127,7 @@ The examples below spell out the current SGLang sampling defaults for reproducib
 
 #### 4.1.1 LTX-2 one-stage text-to-video
 
-```bash Command
+```bash title="Command"
 sglang generate \
   --model-path Lightricks/LTX-2 \
   --pipeline-class-name LTX2Pipeline \
@@ -137,7 +137,7 @@ sglang generate \
 
 #### 4.1.2 LTX-2.3 one-stage text-to-video
 
-```bash Command
+```bash title="Command"
 sglang generate \
   --model-path Lightricks/LTX-2.3 \
   --pipeline-class-name LTX2Pipeline \
@@ -147,7 +147,7 @@ sglang generate \
 
 #### 4.1.3 LTX-2 two-stage text-to-video
 
-```bash Command
+```bash title="Command"
 sglang generate \
   --model-path Lightricks/LTX-2 \
   --pipeline-class-name LTX2TwoStagePipeline \
@@ -157,7 +157,7 @@ sglang generate \
 
 #### 4.1.4 LTX-2.3 two-stage text-to-video
 
-```bash Command
+```bash title="Command"
 sglang generate \
   --model-path Lightricks/LTX-2.3 \
   --pipeline-class-name LTX2TwoStagePipeline \
@@ -167,7 +167,7 @@ sglang generate \
 
 #### 4.1.5 LTX-2.3 HQ text-to-video
 
-```bash Command
+```bash title="Command"
 sglang generate \
   --model-path Lightricks/LTX-2.3 \
   --pipeline-class-name LTX2TwoStageHQPipeline \
@@ -179,7 +179,7 @@ sglang generate \
 
 Pass one image to `--image-path` for image-conditioned generation:
 
-```bash Command
+```bash title="Command"
 sglang generate \
   --model-path Lightricks/LTX-2.3 \
   --pipeline-class-name LTX2TwoStagePipeline \
@@ -192,7 +192,7 @@ sglang generate \
 
 Pass two images to `--image-path` for transition-style TI2V. The first image is used as the starting condition and the second image is used as the ending condition.
 
-```bash Command
+```bash title="Command"
 sglang generate \
   --model-path Lightricks/LTX-2.3 \
   --pipeline-class-name LTX2TwoStagePipeline \
@@ -209,7 +209,7 @@ Use `--lora-path` to load a LoRA adapter. If the Hugging Face repo contains mult
 
 The following example uses [`valiantcat/LTX-2.3-Transition-LORA`](https://huggingface.co/valiantcat/LTX-2.3-Transition-LORA):
 
-```bash Command
+```bash title="Command"
 sglang generate \
   --model-path Lightricks/LTX-2.3 \
   --pipeline-class-name LTX2TwoStagePipeline \
@@ -221,7 +221,7 @@ sglang generate \
 
 You can combine the Transition LoRA with two reference images:
 
-```bash Command
+```bash title="Command"
 sglang generate \
   --model-path Lightricks/LTX-2.3 \
   --pipeline-class-name LTX2TwoStagePipeline \
