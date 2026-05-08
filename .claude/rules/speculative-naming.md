@@ -10,9 +10,20 @@ Use the verb form `accept` everywhere. Don't use the past-participle form `accep
 |---|---|
 | `num_accepted_tokens` | `num_accept_tokens` |
 | `accepted_indices` | `accept_indices` |
-| `accepted_token_ids` | `accept_tokens` (also see Rule 2) |
+| `accepted_token_ids` | `accept_tokens` (also see Rule 3) |
 
-## Rule 2 — `accept` includes bonus; `correct` excludes bonus
+## Rule 2 — The extra/bonus token is `bonus_token`
+
+The "+1" token that the target model always emits in addition to verifying drafts is the **bonus token**. Always call it `bonus_token`.
+
+| Don't | Do |
+|---|---|
+| `verified_id` | `bonus_token` |
+| `output_id` (when referring to the bonus) | `bonus_token` |
+
+`req.output_ids` (the full output history of a request) is unrelated and stays as is.
+
+## Rule 3 — `accept` includes bonus; `correct` excludes bonus
 
 The semantic distinction lives in the **verb**, not the noun. Don't enumerate noun pairs.
 
@@ -32,16 +43,16 @@ Pair with whatever noun fits the data (`tokens`, `drafts`, `indices`, …). No r
 
 ### Exception: `accept_rate` / `accept_length` follow paper convention
 
-These two metric names are entrenched in the spec-decoding literature and in external-facing fields (`meta_info`, Prometheus). Their semantics are paper-defined, not Rule-2-defined:
+These two metric names are entrenched in the spec-decoding literature and in external-facing fields (`meta_info`, Prometheus). Their semantics are paper-defined, not Rule-3-defined:
 
 | Name | Paper term | Bonus? | Definition |
 |---|---|---|---|
 | `accept_rate` | $\alpha$ (Leviathan 2023) | **No** | per-draft-token acceptance probability = `correct_drafts / proposed_drafts` |
 | `accept_length` | $\tau$ (EAGLE) | **Yes** | avg tokens per verify step = `completion_tokens / verify_ct` |
 
-Internal counters still follow Rule 2 strict semantics: `num_correct_drafts` (no bonus), `num_accept_tokens` (with bonus).
+Internal counters still follow Rule 3 strict semantics: `num_correct_drafts` (no bonus), `num_accept_tokens` (with bonus).
 
-## Rule 3 — `num_` for counts; `_ct` for counters; `_rate` for rates; no prefix for IDs
+## Rule 4 — `num_` for counts; `_ct` for counters; `_rate` for rates; no prefix for IDs
 
 Each form has its own marker. **Never mix** (no `num_X_ct`, no `num_accept_rate`).
 
@@ -52,22 +63,11 @@ Each form has its own marker. **Never mix** (no `num_X_ct`, no `num_accept_rate`
 | **Rate / ratio** | `X_rate` | Fractional value in `[0, 1]` | `accept_rate`, `correct_rate` |
 | **Token IDs / content array** | no prefix | The actual token data, not a count | `accept_tokens`, `correct_drafts`, `bonus_token` |
 
-## Rule 4 — The extra/bonus token is `bonus_token`
-
-The "+1" token that the target model always emits in addition to verifying drafts is the **bonus token**. Always call it `bonus_token`.
-
-| Don't | Do |
-|---|---|
-| `verified_id` | `bonus_token` |
-| `output_id` (when referring to the bonus) | `bonus_token` |
-
-`req.output_ids` (the full output history of a request) is unrelated and stays as is.
-
 ## Rule 5 — Avoid `length` / `lens` internally
 
-Internal code uses `num_X` for counts (Rule 3), not `length` / `lens`.
+Internal code uses `num_X` for counts (Rule 4), not `length` / `lens`.
 
-The only allowed `_length` name is `accept_length` (paper-aligned external metric, see Rule 2 exception). Inside the codebase, never write `accept_lens` / `accepted_length` / `commit_lens`.
+The only allowed `_length` name is `accept_length` (paper-aligned external metric, see Rule 3 exception). Inside the codebase, never write `accept_lens` / `accepted_length` / `commit_lens`.
 
 ## Rule 6 — Drop redundant `_token_id` / `_token_ids` suffix in spec scope
 
@@ -84,14 +84,14 @@ The semantic differs by scope:
 
 | Don't | Do |
 |---|---|
-| `accepted_token_ids` | `accept_tokens` (Rule 1 + 2) |
+| `accepted_token_ids` | `accept_tokens` (Rule 1 + 3) |
 | `curr_token_id` | `current_token` |
 | `out_token_ids` (dflash) | `out_tokens` |
 | `_resolve_spec_overlap_token_ids` | `_resolve_spec_overlap_tokens` |
 
 ### Singular vs plural
 
-Plural for any non-scalar tensor (`[bs]`-shaped, flat, or multi-dim); singular only for scalars (kernel `tl.load` results, single-int locals). The fixed name `bonus_token` (Rule 4) is the one singular exception even though its shape is `[bs]`.
+Plural for any non-scalar tensor (`[bs]`-shaped, flat, or multi-dim); singular only for scalars (kernel `tl.load` results, single-int locals). The fixed name `bonus_token` (Rule 2) is the one singular exception even though its shape is `[bs]`.
 
 ```python
 accept_tokens: torch.Tensor     # [total_accepted] flat - plural
