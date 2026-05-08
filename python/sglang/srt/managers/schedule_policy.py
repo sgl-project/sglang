@@ -43,6 +43,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     InitLoadBackParams,
     InsertParams,
     MatchPrefixParams,
+    zero_match_result,
 )
 from sglang.srt.mem_cache.hisparse_memory_pool import (
     DeepSeekV4HiSparseTokenToKVPoolAllocator,
@@ -100,7 +101,7 @@ def match_prefix_for_req(
         )
     )
     if envs.SGLANG_RADIX_FORCE_MISS.get():
-        match_result = _zero_match_result(tree_cache, match_result)
+        match_result = zero_match_result(tree_cache, match_result)
     (
         req.prefix_indices,
         req.last_node,
@@ -117,16 +118,6 @@ def match_prefix_for_req(
     if match_result.cache_protected_len is not None:
         req.cache_protected_len = match_result.cache_protected_len
     return match_result
-
-
-def _zero_match_result(tree_cache, match_result):
-    root = getattr(tree_cache, "root_node", None)
-    return match_result._replace(
-        device_indices=match_result.device_indices[:0],
-        last_device_node=root if root is not None else match_result.last_device_node,
-        last_host_node=root if root is not None else match_result.last_host_node,
-        host_hit_length=0,
-    )
 
 
 class CacheAwarePolicy(Enum):
@@ -262,6 +253,10 @@ class SchedulePolicy:
                         key=RadixKey(token_ids=prefix_ids, extra_key=extra_key)
                     )
                 )
+                if envs.SGLANG_RADIX_FORCE_MISS.get():
+                    match_result = zero_match_result(
+                        self.waiting_queue_radix_tree, match_result
+                    )
                 in_batch_matching_prefixes = match_result.device_indices
                 if (
                     len(in_batch_matching_prefixes)
