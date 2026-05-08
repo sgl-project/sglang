@@ -11,6 +11,7 @@ import itertools
 import json
 import logging
 import os
+import re
 import tempfile
 from collections import defaultdict
 from typing import (
@@ -70,6 +71,9 @@ except ImportError as e:
 logger = logging.getLogger(__name__)
 
 RUNAI_STREAMER_TENSOR_ATTR = "_sglang_runai_streamer_tensor"
+_SHARDED_WEIGHT_RE = re.compile(
+    r"^(?P<prefix>.+)-(?P<index>\d+)-of-(?P<total>\d+)(?P<suffix>\..+)$"
+)
 
 # Block size for sequential checkpoint prefetch reads (page cache warming).
 _PREFETCH_BLOCK_SIZE = None
@@ -333,6 +337,30 @@ def _check_index_files_exist(snapshot_dir: str) -> Tuple[bool, Optional[str]]:
     return True, None
 
 
+def _check_sharded_weight_files_complete(
+    weight_files: List[str],
+) -> Tuple[bool, Optional[str]]:
+    shard_groups = defaultdict(set)
+    for weight_file in weight_files:
+        match = _SHARDED_WEIGHT_RE.match(os.path.basename(weight_file))
+        if match is None:
+            continue
+        total = int(match.group("total"))
+        key = (match.group("prefix"), total, match.group("suffix"))
+        shard_groups[key].add(int(match.group("index")))
+
+    for (prefix, total, suffix), present in shard_groups.items():
+        if len(present) == total:
+            continue
+        missing = [idx for idx in range(1, total + 1) if idx not in present]
+        return (
+            False,
+            f"Missing {len(missing)} shard(s) for {prefix}-*-of-{total:05d}{suffix}: "
+            f"{missing[:3]}{'...' if len(missing) > 3 else ''}",
+        )
+    return True, None
+
+
 def _find_local_hf_snapshot_dir_unlocked(
     model_name_or_path: str,
     cache_dir: Optional[str],
@@ -414,9 +442,19 @@ def _find_local_hf_snapshot_dir_unlocked(
         )
         local_weight_files = []
 
-    # Check for missing files from index (lightweight, for all users)
-    # This catches incomplete downloads before they cause cryptic load errors
+    # check sharded weight files and index entries before trusting a partial cache
     if local_weight_files:
+        is_complete, error_msg = _check_sharded_weight_files_complete(
+            local_weight_files
+        )
+        if not is_complete:
+            log_info_on_rank0(
+                logger,
+                f"Local snapshot incomplete for {model_name_or_path}: {error_msg}. "
+                f"Will download missing files.",
+            )
+            return None  # Triggers snapshot_download() which handles partial downloads
+
         is_complete, error_msg = _check_index_files_exist(found_local_snapshot_dir)
         if not is_complete:
             log_info_on_rank0(
