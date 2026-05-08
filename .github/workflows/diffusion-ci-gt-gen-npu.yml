@@ -109,7 +109,6 @@ jobs:
 
       - name: Generate outputs
         env:
-          RUNAI_STREAMER_MEMORY_LIMIT: 0
           PARTITION_PLAN_JSON: ${{ needs.compute-diffusion-partitions.outputs.plan-1npu }}
           SGLANG_USE_MODELSCOPE: true
           SGLANG_IS_IN_CI: true
