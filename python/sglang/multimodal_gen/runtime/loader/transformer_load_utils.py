@@ -22,7 +22,10 @@ from sglang.multimodal_gen.runtime.layers.quantization.configs.nunchaku_config i
 )
 from sglang.multimodal_gen.runtime.loader.utils import _list_safetensors_files
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
-from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import maybe_download_model
+from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
+    hf_hub_download,
+    maybe_download_model,
+)
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.quantization_utils import (
     build_nvfp4_config_from_safetensors_list,
@@ -41,6 +44,23 @@ _PRECISION_VARIANT_SUFFIX_RE = re.compile(
     r"^(?P<stem>.+?)(?P<precision>\.(?:fp16|bf16|fp32))(?P<shard>-\d+-of-\d+)?(?P<ext>\.safetensors)$"
 )
 _MIXED_SAFETENSORS_RE = re.compile(r".*-mixed(?:-\d+-of-\d+)?\.safetensors$")
+
+
+def _maybe_download_hf_repo_safetensors_file(path: str) -> Optional[str]:
+    """Download `namespace/repo/path.safetensors` style single-file HF paths."""
+    expanded_path = os.path.expanduser(path)
+    if os.path.exists(expanded_path) or not path.endswith(".safetensors"):
+        return None
+
+    parts = path.replace("\\", "/").split("/")
+    if (
+        len(parts) < 3
+        or not all(parts[:2])
+        or any(part in (".", "..") for part in parts)
+    ):
+        return None
+
+    return hf_hub_download(repo_id="/".join(parts[:2]), filename="/".join(parts[2:]))
 
 
 def _get_quant_config_name(config: Optional[QuantizationConfig]) -> Optional[str]:
@@ -266,7 +286,16 @@ def resolve_transformer_safetensors_to_load(
     quantized_path = server_args.transformer_weights_path
 
     if quantized_path:
-        quantized_path = maybe_download_model(quantized_path)
+        original_quantized_path = quantized_path
+        quantized_path = _maybe_download_hf_repo_safetensors_file(
+            quantized_path
+        ) or maybe_download_model(quantized_path)
+        nunchaku_config = server_args.nunchaku_config
+        if (
+            isinstance(nunchaku_config, NunchakuConfig)
+            and nunchaku_config.transformer_weights_path == original_quantized_path
+        ):
+            nunchaku_config.transformer_weights_path = quantized_path
         logger.info("using quantized transformer weights from: %s", quantized_path)
         if os.path.isfile(quantized_path) and quantized_path.endswith(".safetensors"):
             safetensors_list = [quantized_path]

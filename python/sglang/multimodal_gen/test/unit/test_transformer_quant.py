@@ -121,10 +121,14 @@ class TestTransformerQuantHelpers(unittest.TestCase):
     ):
         mock_platform.is_cuda.return_value = True
 
-        NunchakuSVDQuantArgs(
+        resolution = NunchakuSVDQuantArgs(
             enable_svdquant=True,
             transformer_weights_path="/tmp/svdq-fp4_r32.safetensors",
-        )._validate()
+        ).resolve_runtime_config()
+
+        self.assertIsNotNone(resolution.nunchaku_config)
+        self.assertEqual(resolution.nunchaku_config.precision, "nvfp4")
+        self.assertEqual(resolution.nunchaku_config.rank, 32)
 
     @patch(
         "sglang.multimodal_gen.configs.quantization.nunchaku.is_nunchaku_available",
@@ -148,7 +152,7 @@ class TestTransformerQuantHelpers(unittest.TestCase):
             NunchakuSVDQuantArgs(
                 enable_svdquant=True,
                 transformer_weights_path="/tmp/svdq-fp4_r32.safetensors",
-            )._validate()
+            ).resolve_runtime_config()
 
     @patch(
         "sglang.multimodal_gen.runtime.loader.transformer_load_utils.maybe_download_model",
@@ -169,6 +173,35 @@ class TestTransformerQuantHelpers(unittest.TestCase):
             )
 
         self.assertEqual(resolved, [mixed])
+
+    @patch(
+        "sglang.multimodal_gen.runtime.loader.transformer_load_utils.hf_hub_download"
+    )
+    def test_resolve_transformer_safetensors_to_load_downloads_hf_repo_file(
+        self, mock_hf_hub_download
+    ):
+        remote_path = (
+            "nunchaku-ai/nunchaku-qwen-image/"
+            "svdq-fp4_r32-qwen-image-lightningv1.0-4steps.safetensors"
+        )
+        with tempfile.NamedTemporaryFile(suffix=".safetensors") as f:
+            mock_hf_hub_download.return_value = f.name
+            nunchaku_config = NunchakuConfig(transformer_weights_path=remote_path)
+            server_args = self._make_server_args(
+                transformer_weights_path=remote_path,
+                nunchaku_config=nunchaku_config,
+            )
+
+            resolved = resolve_transformer_safetensors_to_load(
+                server_args, "/unused/component/path"
+            )
+
+        self.assertEqual(resolved, [f.name])
+        self.assertEqual(nunchaku_config.transformer_weights_path, f.name)
+        mock_hf_hub_download.assert_called_once_with(
+            repo_id="nunchaku-ai/nunchaku-qwen-image",
+            filename="svdq-fp4_r32-qwen-image-lightningv1.0-4steps.safetensors",
+        )
 
     def test_filter_transformer_precision_variants_prefers_canonical_file(self):
         files = [
