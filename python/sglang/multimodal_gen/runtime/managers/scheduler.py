@@ -613,6 +613,7 @@ class Scheduler(SchedulerDisaggMixin):
         replies to client, only on rank 0
         """
         if not is_warmup and self.receiver is not None and identity is not None:
+            # if the server is local, use temp file to spill the frame array
             if is_local_endpoint(self.server_args.scheduler_endpoint):
                 with self._record_return_stage(
                     output_batch, "Scheduler.return_result.spill_arrays"
@@ -635,6 +636,7 @@ class Scheduler(SchedulerDisaggMixin):
     def _record_return_stage(
         self, output_batch: OutputBatch, stage_name: str
     ) -> Iterator[None]:
+        """helper function to record a stage metric"""
         start_time = time.perf_counter()
         yield
         if output_batch.metrics is not None:
