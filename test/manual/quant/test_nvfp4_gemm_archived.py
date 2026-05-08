@@ -1,9 +1,15 @@
+"""Archived test classes split out of test/registered/quant/test_nvfp4_gemm.py.
+
+Originally registered with `register_cuda_ci(...)`. Moved here as part of
+the per-commit pruning effort to keep the code reachable manually.
+Run with `python3 test/manual/quant/test_nvfp4_gemm_archived.py`.
+"""
+
 import unittest
 from types import SimpleNamespace
 from urllib.parse import urlparse
 
 from sglang.srt.utils import get_device_sm, kill_process_tree
-from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -11,8 +17,6 @@ from sglang.test.test_utils import (
     popen_launch_server,
     try_cached_model,
 )
-
-register_cuda_ci(est_time=420, suite="stage-c-test-4-gpu-b200")
 
 MODEL_PATH = "nvidia/Llama-3.1-8B-Instruct-NVFP4"
 
@@ -62,18 +66,8 @@ class FP4GemmBase:
 
 
 @unittest.skipIf(get_device_sm() < 100, "Test requires CUDA SM 100 or higher")
-class TestFP4GemmFlashinferCutlass(FP4GemmBase, unittest.TestCase):
-    backend = "flashinfer_cutlass"
-
-
-@unittest.skipIf(get_device_sm() < 100, "Test requires CUDA SM 100 or higher")
-class TestFP4GemmFlashinferCudnn(FP4GemmBase, unittest.TestCase):
-    backend = "flashinfer_cudnn"
-
-
-@unittest.skipIf(get_device_sm() < 100, "Test requires CUDA SM 100 or higher")
-class TestFP4GemmFlashinferTrtllm(FP4GemmBase, unittest.TestCase):
-    backend = "flashinfer_trtllm"
+class TestFP4GemmAuto(FP4GemmBase, unittest.TestCase):
+    backend = "auto"
 
 
 if __name__ == "__main__":
