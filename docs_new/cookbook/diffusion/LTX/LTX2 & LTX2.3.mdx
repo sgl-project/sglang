@@ -1,5 +1,5 @@
 ---
-title: LTX
+title: LTX2 & LTX2.3
 description: Run LTX-2 and LTX-2.3 video generation pipelines with SGLang Diffusion.
 metatags:
     description: "Deploy and use LTX-2 and LTX-2.3 video generation models with SGLang Diffusion, including one-stage, two-stage, HQ, TI2V, and LoRA examples."
@@ -21,7 +21,7 @@ Use `Lightricks/LTX-2` or `Lightricks/LTX-2.3` as `--model-path`. For two-stage 
 
 Install SGLang with diffusion dependencies:
 
-```bash Command
+```bash
 uv pip install "sglang[diffusion]" --prerelease=allow
 ```
 
@@ -35,7 +35,7 @@ This section provides deployment configurations optimized for different LTX pipe
 
 The LTX series supports one-stage and two-stage pipelines. LTX-2.3 also supports the HQ two-stage pipeline. The recommended launch configuration depends on whether the target GPU can keep both two-stage DiTs resident.
 
-**Interactive Command Generator**: Use the configuration selector below to generate a deployment command. The default selection targets a single NVIDIA H200 with `resident` two-stage mode, which is the fastest startup path for the specified high-memory environment.
+**Interactive Command Generator**: Use the configuration selector below to generate a deployment command. The default selection targets a single NVIDIA H200 with `resident` two-stage mode. For multi-GPU serving, start from the 2-GPU or 4-GPU presets and only change parallelism if you need more memory headroom.
 
 <LTXDeployment />
 
@@ -74,6 +74,45 @@ Other deployment flags:
 For native LTX-2.3 two-stage serving without a user LoRA, `resident` is the fastest high-VRAM path. When you pass `--lora-path`, SGLang still applies the user LoRA during the two-stage switch, so use `resident` on H200-class GPUs for enough VRAM, but do not expect the same premerged-stage2 benefit as the no-user-LoRA path.
 </Note>
 
+### 3.3 Fast multi-GPU presets
+
+For latency-oriented LTX serving, prefer CFG parallel over sequence parallelism. CFG parallel splits guidance branches across GPUs, while SP/Ulysses is mainly a memory/long-sequence tool for LTX.
+
+| Target | Recommended server flags | Notes |
+| --- | --- | --- |
+| 1 high-VRAM GPU | `--ltx2-two-stage-device-mode resident` | Fastest two-stage setup when both DiTs fit. |
+| 1 standard GPU | `--ltx2-two-stage-device-mode snapshot` | Lower VRAM than `resident`; use this when H100-class memory is tight. |
+| 2 GPUs | `--num-gpus 2 --enable-cfg-parallel --ltx2-two-stage-device-mode resident` | Fastest common 2-GPU setup. |
+| 4 GPUs | `--num-gpus 4 --tp-size 2 --enable-cfg-parallel --ltx2-two-stage-device-mode resident` | Fastest common 4-GPU layout: TP2 inside each CFG branch. |
+| Official comparison | `--ltx2-two-stage-device-mode original` | Use this only when matching the original stage-switch semantics matters. |
+
+Use `--enable-cfg-parallel` for degree-2 CFG parallel. Use `--cfg-parallel-size` only when you explicitly need a different CFG branch count. If `resident` exceeds available VRAM, keep the same parallelism preset and switch only the device mode to `snapshot`.
+
+On high-VRAM GPUs, add `--text-encoder-cpu-offload false` if text encoding latency matters and you have enough memory.
+
+#### 3.3.1 Two GPUs
+
+```bash
+sglang serve \
+  --model-path Lightricks/LTX-2.3 \
+  --pipeline-class-name LTX2TwoStagePipeline \
+  --num-gpus 2 \
+  --enable-cfg-parallel \
+  --ltx2-two-stage-device-mode resident
+```
+
+#### 3.3.2 Four GPUs
+
+```bash
+sglang serve \
+  --model-path Lightricks/LTX-2.3 \
+  --pipeline-class-name LTX2TwoStagePipeline \
+  --num-gpus 4 \
+  --tp-size 2 \
+  --enable-cfg-parallel \
+  --ltx2-two-stage-device-mode resident
+```
+
 ## 4. Model Invocation
 
 ### 4.1 Basic Usage
@@ -88,7 +127,7 @@ The examples below spell out the current SGLang sampling defaults for reproducib
 
 #### 4.1.1 LTX-2 one-stage text-to-video
 
-```bash Command
+```bash
 sglang generate \
   --model-path Lightricks/LTX-2 \
   --pipeline-class-name LTX2Pipeline \
@@ -98,7 +137,7 @@ sglang generate \
 
 #### 4.1.2 LTX-2.3 one-stage text-to-video
 
-```bash Command
+```bash
 sglang generate \
   --model-path Lightricks/LTX-2.3 \
   --pipeline-class-name LTX2Pipeline \
@@ -108,7 +147,7 @@ sglang generate \
 
 #### 4.1.3 LTX-2 two-stage text-to-video
 
-```bash Command
+```bash
 sglang generate \
   --model-path Lightricks/LTX-2 \
   --pipeline-class-name LTX2TwoStagePipeline \
@@ -118,7 +157,7 @@ sglang generate \
 
 #### 4.1.4 LTX-2.3 two-stage text-to-video
 
-```bash Command
+```bash
 sglang generate \
   --model-path Lightricks/LTX-2.3 \
   --pipeline-class-name LTX2TwoStagePipeline \
@@ -128,7 +167,7 @@ sglang generate \
 
 #### 4.1.5 LTX-2.3 HQ text-to-video
 
-```bash Command
+```bash
 sglang generate \
   --model-path Lightricks/LTX-2.3 \
   --pipeline-class-name LTX2TwoStageHQPipeline \
@@ -140,7 +179,7 @@ sglang generate \
 
 Pass one image to `--image-path` for image-conditioned generation:
 
-```bash Command
+```bash
 sglang generate \
   --model-path Lightricks/LTX-2.3 \
   --pipeline-class-name LTX2TwoStagePipeline \
@@ -153,7 +192,7 @@ sglang generate \
 
 Pass two images to `--image-path` for transition-style TI2V. The first image is used as the starting condition and the second image is used as the ending condition.
 
-```bash Command
+```bash
 sglang generate \
   --model-path Lightricks/LTX-2.3 \
   --pipeline-class-name LTX2TwoStagePipeline \
@@ -170,7 +209,7 @@ Use `--lora-path` to load a LoRA adapter. If the Hugging Face repo contains mult
 
 The following example uses [`valiantcat/LTX-2.3-Transition-LORA`](https://huggingface.co/valiantcat/LTX-2.3-Transition-LORA):
 
-```bash Command
+```bash
 sglang generate \
   --model-path Lightricks/LTX-2.3 \
   --pipeline-class-name LTX2TwoStagePipeline \
@@ -182,7 +221,7 @@ sglang generate \
 
 You can combine the Transition LoRA with two reference images:
 
-```bash Command
+```bash
 sglang generate \
   --model-path Lightricks/LTX-2.3 \
   --pipeline-class-name LTX2TwoStagePipeline \
