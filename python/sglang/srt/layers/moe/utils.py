@@ -209,7 +209,7 @@ def get_deepep_output_dtype(self) -> DeepOutputDtype:
             return DeepOutputDtype.NVFP4
 
         # 3. Parse quant config to to determine the output dtype of dispatcher
-        dispather_output_dtype = self.quant_config.get("activation_dtype", None)
+        dispather_output_dtype = self.quant_config.get("dispather_output_dtype", None)
         if dispather_output_dtype is not None:
             return DeepOutputDtype(server_args.deepep_dispatcher_output_dtype)
 
