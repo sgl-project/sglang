@@ -711,24 +711,10 @@ class LTX2DenoisingStage(DenoisingStage):
             denoised_video = ctx.latents.float()
             denoised_audio = ctx.audio_latents.float()
         else:
-            video_sigma_for_x0 = (
-                model_video_timestep
-                if ctx.use_ltx23_hq_timestep_semantics
-                and model_video_timestep is not None
-                else sigma
+            denoised_video = ctx.latents.float() - sigma * model_video_velocity.float()
+            denoised_audio = (
+                ctx.audio_latents.float() - sigma * model_audio_velocity.float()
             )
-            audio_sigma_for_x0 = (
-                model_audio_timestep
-                if ctx.use_ltx23_hq_timestep_semantics
-                and model_audio_timestep is not None
-                else sigma
-            )
-            denoised_video = self._ltx2_velocity_to_x0(
-                ctx.latents, model_video_velocity, video_sigma_for_x0
-            ).float()
-            denoised_audio = self._ltx2_velocity_to_x0(
-                ctx.audio_latents, model_audio_velocity, audio_sigma_for_x0
-            ).float()
 
         if sigma_val == 0.0 or sigma_next_val == 0.0:
             next_video = denoised_video.to(dtype=ctx.latents.dtype)
@@ -738,14 +724,9 @@ class LTX2DenoisingStage(DenoisingStage):
 
         sigma_d = sigma.double()
         sigma_next_d = sigma_next.double()
-        if ctx.use_ltx23_hq_timestep_semantics:
-            h = self._ltx2_res2s_step_size_scalar(sigma_d, sigma_next_d)
-            a21, b1, b2 = self._ltx2_get_res2s_coefficients_scalar(h)
-            h_value = h
-        else:
-            h = -torch.log(torch.clamp(sigma_next_d / sigma_d, min=1e-12))
-            a21, b1, b2 = self._ltx2_get_res2s_coefficients(h)
-            h_value = float(h.item())
+        h = -torch.log(torch.clamp(sigma_next_d / sigma_d, min=1e-12))
+        a21, b1, b2 = self._ltx2_get_res2s_coefficients(h)
+        h_value = float(h.item())
         sub_sigma = torch.sqrt(torch.clamp(sigma_d * sigma_next_d, min=0.0))
 
         anchor_video = ctx.latents.double()
@@ -809,22 +790,8 @@ class LTX2DenoisingStage(DenoisingStage):
             midpoint_video_model_latents, midpoint_audio_model_latents, sub_sigma
         )
 
-        mid_video_sigma_for_x0 = (
-            mid_video_timestep
-            if ctx.use_ltx23_hq_timestep_semantics and mid_video_timestep is not None
-            else sub_sigma
-        )
-        mid_audio_sigma_for_x0 = (
-            mid_audio_timestep
-            if ctx.use_ltx23_hq_timestep_semantics and mid_audio_timestep is not None
-            else sub_sigma
-        )
-        midpoint_denoised_video = self._ltx2_velocity_to_x0(
-            midpoint_video_latents, mid_v, mid_video_sigma_for_x0
-        ).float()
-        midpoint_denoised_audio = self._ltx2_velocity_to_x0(
-            midpoint_audio_latents, mid_a, mid_audio_sigma_for_x0
-        ).float()
+        midpoint_denoised_video = midpoint_video_latents.float() - sub_sigma * mid_v
+        midpoint_denoised_audio = midpoint_audio_latents.float() - sub_sigma * mid_a
 
         eps2_video = midpoint_denoised_video.double() - anchor_video
         eps2_audio = midpoint_denoised_audio.double() - anchor_audio
@@ -848,23 +815,19 @@ class LTX2DenoisingStage(DenoisingStage):
                 ctx.audio_latents, batch
             ).float()
         )
-        sde_sigma = sigma if ctx.use_ltx23_hq_timestep_semantics else sigma_d
-        sde_sigma_next = (
-            sigma_next if ctx.use_ltx23_hq_timestep_semantics else sigma_next_d
-        )
         next_video = self._ltx2_res2s_sde_step(
             sample=anchor_video,
             denoised_sample=next_video_det,
-            sigma=sde_sigma,
-            sigma_next=sde_sigma_next,
+            sigma=sigma_d,
+            sigma_next=sigma_next_d,
             noise=step_noise_video,
             terminal=False,
         )
         next_audio = self._ltx2_res2s_sde_step(
             sample=anchor_audio,
             denoised_sample=next_audio_det,
-            sigma=sde_sigma,
-            sigma_next=sde_sigma_next,
+            sigma=sigma_d,
+            sigma_next=sigma_next_d,
             noise=step_noise_audio,
             terminal=False,
         )
