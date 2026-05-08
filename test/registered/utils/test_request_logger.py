@@ -1,6 +1,7 @@
 import io
 import json
 import os
+import re
 import tempfile
 import time
 import unittest
@@ -25,6 +26,9 @@ TEST_ROUTING_KEY = "test-routing-key-12345"
 TEST_CUSTOM_HEADER_NAME = "X-Test-Header"
 TEST_CUSTOM_HEADER_VALUE = "test-header-value-67890"
 TEST_MODEL_NAME = "Qwen/Qwen3-0.6B"
+
+# Strip the "[YYYY-MM-DD HH:MM:SS] " prefix added by _create_logger_with_handler.
+_LOG_PREFIX_RE = re.compile(r"^\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\] ")
 
 
 class BaseTestRequestLogger:
@@ -190,6 +194,7 @@ class TestRequestLoggerJson(BaseTestRequestLogger, CustomTestCase):
         received_found = False
         finished_found = False
         for line in content.splitlines():
+            line = _LOG_PREFIX_RE.sub("", line)
             if not line.strip() or not line.startswith("{"):
                 continue
             try:
@@ -227,6 +232,7 @@ class TestRequestLoggerJson(BaseTestRequestLogger, CustomTestCase):
     def _verify_openai_logs(self, content: str, source_name: str):
         openai_received_found = False
         for line in content.splitlines():
+            line = _LOG_PREFIX_RE.sub("", line)
             if not line.strip() or not line.startswith("{"):
                 continue
             try:
