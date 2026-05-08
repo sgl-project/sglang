@@ -16,7 +16,7 @@ __all__ = [
     "ut_parse_one_file",
 ]
 
-_PARAM_ORDER = ("est_time", "suite", "nightly", "disabled")
+_PARAM_ORDER = ("est_time", "suite", "nightly", "disabled", "tags")
 _UNSET = object()
 
 
@@ -39,17 +39,29 @@ class CIRegistry:
     nightly: bool = False
     # Reason for disabling the test. None = enabled, string = disabled with reason.
     disabled: Optional[str] = None
+    # Tag set used by the per-commit pipeline to opt nightly tests into a PR
+    # run when the PR carries a matching label (see test/run_suite.py
+    # filter_tests `include_tags`). Empty tuple = nightly-only (default).
+    tags: tuple = ()
 
 
 def register_cpu_ci(
-    est_time: float, suite: str, nightly: bool = False, disabled: Optional[str] = None
+    est_time: float,
+    suite: str,
+    nightly: bool = False,
+    disabled: Optional[str] = None,
+    tags: tuple = (),
 ):
     """Marker for CPU CI registration (parsed via AST; runtime no-op)."""
     return None
 
 
 def register_cuda_ci(
-    est_time: float, suite: str, nightly: bool = False, disabled: Optional[str] = None
+    est_time: float,
+    suite: str,
+    nightly: bool = False,
+    disabled: Optional[str] = None,
+    tags: tuple = (),
 ):
     """Marker for CUDA CI registration (parsed via AST; runtime no-op)."""
     return None
@@ -60,6 +72,7 @@ def register_amd_ci(
     suite: str,
     nightly: bool = False,
     disabled: Optional[str] = None,
+    tags: tuple = (),
 ):
     """Marker for AMD CI registration (parsed via AST; runtime no-op)."""
     return None
@@ -70,6 +83,7 @@ def register_npu_ci(
     suite: str,
     nightly: bool = False,
     disabled: Optional[str] = None,
+    tags: tuple = (),
 ):
     """Marker for NPU CI registration (parsed via AST; runtime no-op)."""
     return None
@@ -96,7 +110,7 @@ class RegistryVisitor(ast.NodeVisitor):
 
     def _parse_call_args(
         self, func_call: ast.Call
-    ) -> tuple[float, str, bool, Optional[str]]:
+    ) -> tuple[float, str, bool, Optional[str], tuple]:
         args = {name: _UNSET for name in _PARAM_ORDER}
         seen = set()
 
@@ -161,7 +175,27 @@ class RegistryVisitor(ast.NodeVisitor):
                 f"{self.filename}: disabled must be a string in {func_call.func.id}()"
             )
 
-        return float(est_time), suite, nightly, disabled
+        # `tags` may be a tuple/list literal of strings — _constant_value()
+        # only handles ast.Constant, so we re-fetch the raw AST node and
+        # validate it ourselves.
+        tags: tuple = ()
+        for kw in func_call.keywords:
+            if kw.arg == "tags":
+                if not isinstance(kw.value, (ast.Tuple, ast.List)):
+                    raise ValueError(
+                        f"{self.filename}: tags must be a tuple/list literal in {func_call.func.id}()"
+                    )
+                items: list = []
+                for el in kw.value.elts:
+                    if not (isinstance(el, ast.Constant) and isinstance(el.value, str)):
+                        raise ValueError(
+                            f"{self.filename}: tags must contain only string literals in {func_call.func.id}()"
+                        )
+                    items.append(el.value)
+                tags = tuple(items)
+                break
+
+        return float(est_time), suite, nightly, disabled, tags
 
     def _collect_ci_registry(self, func_call: ast.Call):
         if not isinstance(func_call.func, ast.Name):
@@ -171,7 +205,7 @@ class RegistryVisitor(ast.NodeVisitor):
         if backend is None:
             return None
 
-        est_time, suite, nightly, disabled = self._parse_call_args(func_call)
+        est_time, suite, nightly, disabled, tags = self._parse_call_args(func_call)
         return CIRegistry(
             backend=backend,
             filename=self.filename,
@@ -179,6 +213,7 @@ class RegistryVisitor(ast.NodeVisitor):
             suite=suite,
             nightly=nightly,
             disabled=disabled,
+            tags=tags,
         )
 
     @staticmethod

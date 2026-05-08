@@ -105,6 +105,7 @@ jobs:
       b200_runner: ${{ steps.set-runner.outputs.b200_runner }}
       enable_retry: ${{ steps.set-retry.outputs.enable_retry }}
       continue_on_error: ${{ steps.set-continue-on-error.outputs.continue_on_error }}
+      include_tags: ${{ steps.set-include-tags.outputs.include_tags }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -230,49 +231,52 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          # Determine if this run gets full parallelism (scheduled / high priority)
-          FULL=false
+          # All runs now get full parallelism. The previous "low" tier
+          # (3/3/2 partitions for non-priority PRs) was a cost lever from
+          # before the per-commit pruning effort cut the suite by ~3 hours;
+          # with the smaller suite there's no need to throttle.
+          #   1-gpu-h100: 14 partitions, 1-gpu-5090: 8 partitions, 2-gpu-h100: 4 partitions
+          echo "max_parallel=14" >> $GITHUB_OUTPUT
+          echo "max_parallel_small=8" >> $GITHUB_OUTPUT
+          echo "max_parallel_2gpu=4" >> $GITHUB_OUTPUT
+          echo "parallel_level=full" >> $GITHUB_OUTPUT
+          echo "Parallelism level: full (uncapped)"
+
+      - name: Set include-tags for nightly pull-in
+        id: set-include-tags
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # Forward the labels that drive --include-tags to run_suite.py.
+          #
+          # - Scheduled cron: pass `*` so every nightly test in the
+          #   compatible-suite set is pulled in (complete CI on each cron
+          #   tick — distinct from the simplified per-commit set on PR push).
+          # - pull_request: forward the PR's labels verbatim.
+          # - workflow_dispatch /rerun-stage: look up the underlying PR's
+          #   labels via the GitHub API (same pattern as the parallelism
+          #   step above).
+          # - other events: empty (per-commit-only baseline, like today).
           if [[ "${{ github.event_name }}" == "schedule" ]]; then
-            FULL=true
-            echo "Scheduled run detected, using full parallelism"
-          elif [[ "${{ github.event_name }}" == "pull_request" && "${{ contains(github.event.pull_request.labels.*.name, 'high priority') }}" == "true" ]]; then
-            FULL=true
-            echo "High priority PR detected, using full parallelism"
+            TAGS='*'
+          elif [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            TAGS='${{ join(github.event.pull_request.labels.*.name, '','') }}'
           elif [[ -n "${{ inputs.target_stage }}" ]]; then
-            # /rerun-stage (workflow_dispatch): query PR labels via GitHub API
-            # Try SHA lookup first (fork PRs), fallback to branch name (non-fork PRs)
-            LABELS=""
+            TAGS=""
             PR_HEAD_SHA="${{ inputs.pr_head_sha }}"
             if [[ -n "$PR_HEAD_SHA" ]]; then
-              LABELS=$(gh api "repos/${{ github.repository }}/commits/${PR_HEAD_SHA}/pulls" \
-                --jq '.[0].labels[].name' 2>/dev/null || true)
+              TAGS=$(gh api "repos/${{ github.repository }}/commits/${PR_HEAD_SHA}/pulls" \
+                --jq '[.[0].labels[].name] | join(",")' 2>/dev/null || true)
             fi
-            if [[ -z "$LABELS" ]]; then
-              LABELS=$(gh pr list --head "${{ github.ref_name }}" --repo "${{ github.repository }}" \
-                --json labels --jq '.[0].labels[].name' 2>/dev/null || true)
+            if [[ -z "$TAGS" ]]; then
+              TAGS=$(gh pr list --head "${{ github.ref_name }}" --repo "${{ github.repository }}" \
+                --json labels --jq '[.[0].labels[].name] | join(",")' 2>/dev/null || true)
             fi
-            echo "PR labels: ${LABELS:-"(none)"}"
-            if echo "$LABELS" | grep -Fxq "high priority"; then
-              FULL=true
-              echo "High priority PR detected via API (/rerun-stage), using full parallelism"
-            fi
-          fi
-
-          # Set max-parallel for each runner type
-          #   1-gpu-h100: 14 partitions, 1-gpu-5090: 8 partitions, 2-gpu-h100: 4 partitions
-          if [[ "$FULL" == "true" ]]; then
-            LEVEL=full
-            echo "max_parallel=14" >> $GITHUB_OUTPUT
-            echo "max_parallel_small=8" >> $GITHUB_OUTPUT
-            echo "max_parallel_2gpu=4" >> $GITHUB_OUTPUT
           else
-            LEVEL=low
-            echo "max_parallel=3" >> $GITHUB_OUTPUT
-            echo "max_parallel_small=3" >> $GITHUB_OUTPUT
-            echo "max_parallel_2gpu=2" >> $GITHUB_OUTPUT
+            TAGS=""
           fi
-          echo "parallel_level=$LEVEL" >> $GITHUB_OUTPUT
-          echo "Parallelism level: $LEVEL"
+          echo "include_tags=$TAGS" >> $GITHUB_OUTPUT
+          echo "include_tags resolved to: ${TAGS:-(empty)}"
 
       - name: Set B200 runner tag
         id: set-runner
@@ -678,9 +682,10 @@ jobs:
         timeout-minutes: 10
         env:
           CONTINUE_ON_ERROR_FLAG: ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
+          INCLUDE_TAGS_FLAG: ${{ needs.check-changes.outputs.include_tags && format('--include-tags={0}', needs.check-changes.outputs.include_tags) || '' }}
         run: |
           cd test/
-          python3 run_suite.py --hw cuda --suite stage-a-test-1-gpu-small $CONTINUE_ON_ERROR_FLAG
+          python3 run_suite.py --hw cuda --suite stage-a-test-1-gpu-small $CONTINUE_ON_ERROR_FLAG $INCLUDE_TAGS_FLAG
 
       - uses: ./.github/actions/upload-cuda-coredumps
         if: failure()
@@ -755,9 +760,10 @@ jobs:
         timeout-minutes: 10
         env:
           CONTINUE_ON_ERROR_FLAG: ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
+          INCLUDE_TAGS_FLAG: ${{ needs.check-changes.outputs.include_tags && format('--include-tags={0}', needs.check-changes.outputs.include_tags) || '' }}
         run: |
           cd test/
-          python3 run_suite.py --hw cpu --suite stage-a-test-cpu --auto-partition-id ${{ matrix.partition }} --auto-partition-size 4 $CONTINUE_ON_ERROR_FLAG
+          python3 run_suite.py --hw cpu --suite stage-a-test-cpu --auto-partition-id ${{ matrix.partition }} --auto-partition-size 4 $CONTINUE_ON_ERROR_FLAG $INCLUDE_TAGS_FLAG
 
   # Runs on 5090 (32GB, SM120)
   stage-b-test-1-gpu-small:
@@ -806,9 +812,10 @@ jobs:
         timeout-minutes: 30
         env:
           CONTINUE_ON_ERROR_FLAG: ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
+          INCLUDE_TAGS_FLAG: ${{ needs.check-changes.outputs.include_tags && format('--include-tags={0}', needs.check-changes.outputs.include_tags) || '' }}
         run: |
           cd test/
-          python3 run_suite.py --hw cuda --suite stage-b-test-1-gpu-small --auto-partition-id ${{ matrix.partition }} --auto-partition-size 8 $CONTINUE_ON_ERROR_FLAG
+          python3 run_suite.py --hw cuda --suite stage-b-test-1-gpu-small --auto-partition-id ${{ matrix.partition }} --auto-partition-size 8 $CONTINUE_ON_ERROR_FLAG $INCLUDE_TAGS_FLAG
 
       - uses: ./.github/actions/upload-cuda-coredumps
         if: failure()
@@ -866,9 +873,10 @@ jobs:
         timeout-minutes: 30
         env:
           CONTINUE_ON_ERROR_FLAG: ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
+          INCLUDE_TAGS_FLAG: ${{ needs.check-changes.outputs.include_tags && format('--include-tags={0}', needs.check-changes.outputs.include_tags) || '' }}
         run: |
           cd test/
-          python3 run_suite.py --hw cuda --suite stage-b-test-1-gpu-large --auto-partition-id ${{ matrix.partition }} --auto-partition-size 14 --timeout-per-file 1800 $CONTINUE_ON_ERROR_FLAG
+          python3 run_suite.py --hw cuda --suite stage-b-test-1-gpu-large --auto-partition-id ${{ matrix.partition }} --auto-partition-size 14 --timeout-per-file 1800 $CONTINUE_ON_ERROR_FLAG $INCLUDE_TAGS_FLAG
 
       - uses: ./.github/actions/upload-cuda-coredumps
         if: failure()
@@ -925,9 +933,10 @@ jobs:
         timeout-minutes: 30
         env:
           CONTINUE_ON_ERROR_FLAG: ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
+          INCLUDE_TAGS_FLAG: ${{ needs.check-changes.outputs.include_tags && format('--include-tags={0}', needs.check-changes.outputs.include_tags) || '' }}
         run: |
           cd test/
-          python3 run_suite.py --hw cuda --suite stage-b-test-2-gpu-large --auto-partition-id ${{ matrix.partition }} --auto-partition-size 4 $CONTINUE_ON_ERROR_FLAG
+          python3 run_suite.py --hw cuda --suite stage-b-test-2-gpu-large --auto-partition-id ${{ matrix.partition }} --auto-partition-size 4 $CONTINUE_ON_ERROR_FLAG $INCLUDE_TAGS_FLAG
 
       - uses: ./.github/actions/upload-cuda-coredumps
         if: failure()
@@ -982,9 +991,10 @@ jobs:
         timeout-minutes: 40
         env:
           CONTINUE_ON_ERROR_FLAG: ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
+          INCLUDE_TAGS_FLAG: ${{ needs.check-changes.outputs.include_tags && format('--include-tags={0}', needs.check-changes.outputs.include_tags) || '' }}
         run: |
           cd test
-          python3 run_suite.py --hw cuda --suite stage-b-test-4-gpu-b200 $CONTINUE_ON_ERROR_FLAG
+          python3 run_suite.py --hw cuda --suite stage-b-test-4-gpu-b200 $CONTINUE_ON_ERROR_FLAG $INCLUDE_TAGS_FLAG
 
       - name: Run FA4 jit_kernel tests (SM100+)
         timeout-minutes: 10
@@ -1076,9 +1086,10 @@ jobs:
         timeout-minutes: 30
         env:
           CONTINUE_ON_ERROR_FLAG: ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
+          INCLUDE_TAGS_FLAG: ${{ needs.check-changes.outputs.include_tags && format('--include-tags={0}', needs.check-changes.outputs.include_tags) || '' }}
         run: |
           cd test
-          python3 run_suite.py --hw cuda --suite stage-c-test-4-gpu-h100 --auto-partition-id ${{ matrix.part }} --auto-partition-size 3 $CONTINUE_ON_ERROR_FLAG
+          python3 run_suite.py --hw cuda --suite stage-c-test-4-gpu-h100 --auto-partition-id ${{ matrix.part }} --auto-partition-size 3 $CONTINUE_ON_ERROR_FLAG $INCLUDE_TAGS_FLAG
 
       - uses: ./.github/actions/upload-cuda-coredumps
         if: failure()
@@ -1153,9 +1164,10 @@ jobs:
         timeout-minutes: 30
         env:
           CONTINUE_ON_ERROR_FLAG: ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
+          INCLUDE_TAGS_FLAG: ${{ needs.check-changes.outputs.include_tags && format('--include-tags={0}', needs.check-changes.outputs.include_tags) || '' }}
         run: |
           cd test
-          python3 run_suite.py --hw cuda --suite stage-c-test-8-gpu-h200 --auto-partition-id ${{ matrix.part }} --auto-partition-size 4 $CONTINUE_ON_ERROR_FLAG
+          python3 run_suite.py --hw cuda --suite stage-c-test-8-gpu-h200 --auto-partition-id ${{ matrix.part }} --auto-partition-size 4 $CONTINUE_ON_ERROR_FLAG $INCLUDE_TAGS_FLAG
 
       - uses: ./.github/actions/upload-cuda-coredumps
         if: failure()
@@ -1210,9 +1222,10 @@ jobs:
         timeout-minutes: 30
         env:
           CONTINUE_ON_ERROR_FLAG: ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
+          INCLUDE_TAGS_FLAG: ${{ needs.check-changes.outputs.include_tags && format('--include-tags={0}', needs.check-changes.outputs.include_tags) || '' }}
         run: |
           cd test
-          python3 run_suite.py --hw cuda --suite stage-c-test-8-gpu-h20 $CONTINUE_ON_ERROR_FLAG
+          python3 run_suite.py --hw cuda --suite stage-c-test-8-gpu-h20 $CONTINUE_ON_ERROR_FLAG $INCLUDE_TAGS_FLAG
 
       - uses: ./.github/actions/upload-cuda-coredumps
         if: failure()
@@ -1279,9 +1292,10 @@ jobs:
         timeout-minutes: 30
         env:
           CONTINUE_ON_ERROR_FLAG: ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
+          INCLUDE_TAGS_FLAG: ${{ needs.check-changes.outputs.include_tags && format('--include-tags={0}', needs.check-changes.outputs.include_tags) || '' }}
         run: |
           cd test
-          python3 run_suite.py --hw cuda --suite stage-c-test-deepep-4-gpu-h100 $CONTINUE_ON_ERROR_FLAG
+          python3 run_suite.py --hw cuda --suite stage-c-test-deepep-4-gpu-h100 $CONTINUE_ON_ERROR_FLAG $INCLUDE_TAGS_FLAG
 
       - uses: ./.github/actions/upload-cuda-coredumps
         if: failure()
@@ -1349,9 +1363,10 @@ jobs:
         timeout-minutes: 45
         env:
           CONTINUE_ON_ERROR_FLAG: ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
+          INCLUDE_TAGS_FLAG: ${{ needs.check-changes.outputs.include_tags && format('--include-tags={0}', needs.check-changes.outputs.include_tags) || '' }}
         run: |
           cd test
-          python3 run_suite.py --hw cuda --suite stage-c-test-deepep-8-gpu-h200 $CONTINUE_ON_ERROR_FLAG
+          python3 run_suite.py --hw cuda --suite stage-c-test-deepep-8-gpu-h200 $CONTINUE_ON_ERROR_FLAG $INCLUDE_TAGS_FLAG
 
       - uses: ./.github/actions/upload-cuda-coredumps
         if: failure()
@@ -1406,9 +1421,10 @@ jobs:
         timeout-minutes: 30
         env:
           CONTINUE_ON_ERROR_FLAG: ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
+          INCLUDE_TAGS_FLAG: ${{ needs.check-changes.outputs.include_tags && format('--include-tags={0}', needs.check-changes.outputs.include_tags) || '' }}
         run: |
           cd test
-          python3 run_suite.py --hw cuda --suite stage-c-test-4-gpu-b200 --auto-partition-id ${{ matrix.part }} --auto-partition-size 6 --timeout-per-file 1800 $CONTINUE_ON_ERROR_FLAG
+          python3 run_suite.py --hw cuda --suite stage-c-test-4-gpu-b200 --auto-partition-id ${{ matrix.part }} --auto-partition-size 6 --timeout-per-file 1800 $CONTINUE_ON_ERROR_FLAG $INCLUDE_TAGS_FLAG
 
       - uses: ./.github/actions/upload-cuda-coredumps
         if: failure()
@@ -1460,9 +1476,10 @@ jobs:
         timeout-minutes: 30
         env:
           CONTINUE_ON_ERROR_FLAG: ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
+          INCLUDE_TAGS_FLAG: ${{ needs.check-changes.outputs.include_tags && format('--include-tags={0}', needs.check-changes.outputs.include_tags) || '' }}
         run: |
           cd test
-          python3 run_suite.py --hw cuda --suite stage-c-test-dsv4-4-gpu-b200 --timeout-per-file 1800 $CONTINUE_ON_ERROR_FLAG
+          python3 run_suite.py --hw cuda --suite stage-c-test-dsv4-4-gpu-b200 --timeout-per-file 1800 $CONTINUE_ON_ERROR_FLAG $INCLUDE_TAGS_FLAG
 
       - uses: ./.github/actions/upload-cuda-coredumps
         if: failure()
@@ -1512,9 +1529,10 @@ jobs:
         timeout-minutes: 30
         env:
           CONTINUE_ON_ERROR_FLAG: ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
+          INCLUDE_TAGS_FLAG: ${{ needs.check-changes.outputs.include_tags && format('--include-tags={0}', needs.check-changes.outputs.include_tags) || '' }}
         run: |
           cd test
-          python3 run_suite.py --hw cuda --suite stage-c-test-dsv4-8-gpu-h200 --timeout-per-file 1800 $CONTINUE_ON_ERROR_FLAG
+          python3 run_suite.py --hw cuda --suite stage-c-test-dsv4-8-gpu-h200 --timeout-per-file 1800 $CONTINUE_ON_ERROR_FLAG $INCLUDE_TAGS_FLAG
 
       - uses: ./.github/actions/upload-cuda-coredumps
         if: failure()
@@ -1568,9 +1586,10 @@ jobs:
   #       timeout-minutes: 45
   #       env:
   #         CONTINUE_ON_ERROR_FLAG: ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
+  #         INCLUDE_TAGS_FLAG: ${{ needs.check-changes.outputs.include_tags && format('--include-tags={0}', needs.check-changes.outputs.include_tags) || '' }}
   #       run: |
   #         cd test
-  #         python3 run_suite.py --hw cuda --suite stage-c-test-4-gpu-gb200 --timeout-per-file 3600 $CONTINUE_ON_ERROR_FLAG
+  #         python3 run_suite.py --hw cuda --suite stage-c-test-4-gpu-gb200 --timeout-per-file 3600 $CONTINUE_ON_ERROR_FLAG $INCLUDE_TAGS_FLAG
   #
   #     - uses: ./.github/actions/upload-cuda-coredumps
   #       if: failure()

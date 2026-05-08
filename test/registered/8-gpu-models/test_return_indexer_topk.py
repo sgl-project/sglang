@@ -17,7 +17,12 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=600, suite="stage-c-test-8-gpu-h200")
+register_cuda_ci(
+    est_time=600,
+    suite="nightly-8-gpu-h200",
+    nightly=True,
+    tags=("deepseek",),
+)
 
 DEEPSEEK_V32_MODEL_PATH = "deepseek-ai/DeepSeek-V3.2"
 

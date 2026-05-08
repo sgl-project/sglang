@@ -20,7 +20,12 @@ from sglang.test.test_utils import (
     find_available_port,
 )
 
-register_cuda_ci(est_time=57, suite="stage-c-test-4-gpu-h100")
+register_cuda_ci(
+    est_time=57,
+    suite="nightly-4-gpu",
+    nightly=True,
+    tags=("rl",),
+)
 register_amd_ci(
     est_time=64,
     suite="stage-c-test-4-gpu-amd",

@@ -1,7 +1,12 @@
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 # Generation model tests (CUDA only)
-register_cuda_ci(est_time=150, suite="stage-b-test-1-gpu-large")
+register_cuda_ci(
+    est_time=150,
+    suite="nightly-1-gpu",
+    nightly=True,
+    tags=("model-coverage",),
+)
 register_amd_ci(est_time=106, suite="stage-b-test-1-gpu-small-amd")
 
 # Copyright 2023-2024 SGLang Team

@@ -36,7 +36,9 @@ from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(
     est_time=300,
-    suite="stage-c-test-4-gpu-b200",
+    suite="nightly-4-gpu-b200",
+    nightly=True,
+    tags=("blackwell", "lora", "moe"),
 )
 
 BASE_MODEL = "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16"

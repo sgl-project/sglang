@@ -128,6 +128,48 @@ OTHER_SUITES = {
 }
 
 
+# Map of per-commit suite -> compatible nightly suite name(s) for the same
+# hardware class. When a PR run carries a label that opts a nightly test in
+# (--include-tags), the test must live on a runner the per-commit suite is
+# already invoking — otherwise we'd ship it to a runner that can't host it.
+#
+# This is the source of truth for the cross-cadence pull-in. Edit here when
+# adding new suites; consumers (filter_tests, the workflow plumbing) read
+# this constant.
+PER_COMMIT_TO_NIGHTLY = {
+    HWBackend.CUDA: {
+        # NOTE: 5090 / SM12.0 has no nightly job today; the two stage-a/b
+        # 1-gpu-small suites pull from "nightly-1-gpu" once a nightly-1-gpu-5090
+        # job is added (tracked separately).
+        "stage-a-test-1-gpu-small": [],
+        "stage-b-test-1-gpu-small": [],
+        "stage-b-test-1-gpu-large": ["nightly-1-gpu"],
+        "stage-b-test-2-gpu-large": ["nightly-2-gpu"],
+        "stage-b-test-4-gpu-b200": ["nightly-4-gpu-b200"],
+        "stage-b-kernel-unit-1-gpu-large": ["nightly-kernel-1-gpu"],
+        "stage-b-kernel-unit-1-gpu-b200": [],
+        "stage-b-kernel-unit-8-gpu-h200": ["nightly-kernel-8-gpu-h200"],
+        "stage-b-kernel-benchmark-1-gpu-large": ["nightly-kernel-1-gpu"],
+        "stage-c-test-4-gpu-h100": ["nightly-4-gpu"],
+        "stage-c-test-4-gpu-b200": ["nightly-4-gpu-b200"],
+        "stage-c-test-4-gpu-gb200": [],
+        "stage-c-test-8-gpu-h20": ["nightly-8-gpu-h20"],
+        "stage-c-test-8-gpu-h200": [
+            "nightly-8-gpu-h200",
+            "nightly-8-gpu-h200-basic",
+            "nightly-8-gpu-common",
+        ],
+        "stage-c-test-8-gpu-b200": [
+            "nightly-8-gpu-b200",
+            "nightly-8-gpu-b200-basic",
+            "nightly-8-gpu-common",
+        ],
+        "stage-c-test-deepep-4-gpu-h100": ["nightly-4-gpu"],
+        "stage-c-test-deepep-8-gpu-h200": ["nightly-8-gpu-h200"],
+    },
+}
+
+
 _SUITE_CHECKED_BACKENDS = {HWBackend.CUDA, HWBackend.CPU}
 
 
@@ -159,13 +201,51 @@ def validate_all_suites(all_tests: List[CIRegistry]):
 
 
 def filter_tests(
-    ci_tests: List[CIRegistry], hw: HWBackend, suite: str, nightly: bool = False
+    ci_tests: List[CIRegistry],
+    hw: HWBackend,
+    suite: str,
+    nightly: bool = False,
+    include_tags: tuple = (),
 ) -> List[CIRegistry]:
-    ci_tests = [
+    """Filter the parsed CI registry down to the tests that should run.
+
+    `include_tags` is the per-commit pull-in mechanism: when set on a non-
+    nightly run, any nightly test whose `tags ∩ include_tags ≠ ∅` is also
+    pulled in, restricted to nightly suites that share the same hardware
+    class as the per-commit suite (per `PER_COMMIT_TO_NIGHTLY`). Empty
+    `include_tags` (the default) preserves the historical behavior — only
+    tests matching `(hw, suite, nightly)` exactly are returned.
+    """
+    base = [
         t
         for t in ci_tests
         if t.backend == hw and t.suite == suite and t.nightly == nightly
     ]
+
+    if not nightly and include_tags:
+        compatible_nightly = set(PER_COMMIT_TO_NIGHTLY.get(hw, {}).get(suite, []))
+        include_set = set(include_tags)
+        # Wildcard: `*` opts in EVERY nightly test in the compatible-suite
+        # set, regardless of tag value (or absence). The scheduled cron
+        # passes this so it always exercises the complete CI.
+        match_all = "*" in include_set
+        pulled = [
+            t
+            for t in ci_tests
+            if t.backend == hw
+            and t.nightly is True
+            and t.suite in compatible_nightly
+            and (match_all or (set(t.tags) & include_set))
+        ]
+        # Dedupe by filename (a test should never be doubled even if it
+        # somehow registered twice).
+        seen = {(t.filename, t.suite) for t in base}
+        for t in pulled:
+            key = (t.filename, t.suite)
+            if key in seen:
+                continue
+            seen.add(key)
+            base.append(t)
 
     valid_suites = (
         NIGHTLY_SUITES.get(hw, []) if nightly else PER_COMMIT_SUITES.get(hw, [])
@@ -176,8 +256,8 @@ def filter_tests(
             f"Warning: Unknown suite {suite} for backend {hw.name}, nightly={nightly}"
         )
 
-    enabled_tests = [t for t in ci_tests if t.disabled is None]
-    skipped_tests = [t for t in ci_tests if t.disabled is not None]
+    enabled_tests = [t for t in base if t.disabled is None]
+    skipped_tests = [t for t in base if t.disabled is not None]
 
     return enabled_tests, skipped_tests
 
@@ -255,7 +335,20 @@ def run_a_suite(args):
 
     all_tests = collect_tests(files, sanity_check=sanity_check)
     validate_all_suites(all_tests)
-    ci_tests, skipped_tests = filter_tests(all_tests, hw, suite, nightly)
+    # Per-commit pipeline forwards PR labels via --include-tags. Non-empty
+    # only when the workflow has labels to forward (see pr-test.yml). On
+    # nightly invocations and the scheduled cron, this is empty so every
+    # nightly test in the suite runs unconditionally.
+    include_tags = tuple(
+        t.strip() for t in (args.include_tags or "").split(",") if t.strip()
+    )
+    ci_tests, skipped_tests = filter_tests(
+        all_tests,
+        hw,
+        suite,
+        nightly,
+        include_tags=include_tags,
+    )
 
     if auto_partition_size:
         ci_tests = auto_partition(ci_tests, auto_partition_id, auto_partition_size)
@@ -293,6 +386,18 @@ def main():
         "--nightly",
         action="store_true",
         help="Run nightly tests instead of per-commit tests.",
+    )
+    parser.add_argument(
+        "--include-tags",
+        type=str,
+        default="",
+        help=(
+            "Comma-separated list of tags. On a per-commit run, additionally "
+            "pulls in any nightly test whose `tags ∩ include_tags ≠ ∅` "
+            "AND whose suite is in PER_COMMIT_TO_NIGHTLY[<this suite>] "
+            "(hardware-class compatible). Driven by the PR label set in "
+            "pr-test.yml. Ignored on --nightly runs."
+        ),
     )
     parser.add_argument(
         "--timeout-per-file",
