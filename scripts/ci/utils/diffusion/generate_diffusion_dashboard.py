@@ -1,6 +1,6 @@
 """Generate a Markdown dashboard for diffusion cross-framework comparisons.
 
-Reads current comparison results + historical data from sglang-ci-data repo
+Reads current comparison results + historical data from sgl-project/ci-data repo
 and produces a Markdown report with tables and trend charts saved as PNG files.
 
 Usage:
@@ -19,16 +19,16 @@ import sys
 from datetime import datetime, timezone
 
 # ---------------------------------------------------------------------------
-# History fetching (from sglang-ci-data repo via GitHub API)
+# History fetching (from sgl-project/ci-data repo via GitHub API)
 # ---------------------------------------------------------------------------
 
-CI_DATA_REPO_OWNER = "sglang-bot"
-CI_DATA_REPO_NAME = "sglang-ci-data"
+CI_DATA_REPO_OWNER = "sgl-project"
+CI_DATA_REPO_NAME = "ci-data"
 CI_DATA_BRANCH = "main"
 HISTORY_PREFIX = "diffusion-comparisons"
 MAX_HISTORY_RUNS = 14
 
-# Base URL for chart images pushed to sglang-ci-data
+# Base URL for chart images pushed to sgl-project/ci-data
 CHARTS_RAW_BASE_URL = (
     f"https://raw.githubusercontent.com/{CI_DATA_REPO_OWNER}/{CI_DATA_REPO_NAME}"
     f"/{CI_DATA_BRANCH}/{HISTORY_PREFIX}/charts"
@@ -58,7 +58,7 @@ def _github_get(url: str, token: str) -> dict | list | None:
 
 
 def fetch_history_from_github(token: str) -> list[dict]:
-    """Fetch recent comparison result JSONs from sglang-ci-data repo."""
+    """Fetch recent comparison result JSONs from sgl-project/ci-data repo."""
     print("Fetching historical comparison data from GitHub...")
     url = (
         f"https://api.github.com/repos/{CI_DATA_REPO_OWNER}/{CI_DATA_REPO_NAME}"
@@ -775,7 +775,7 @@ def main():
     parser.add_argument(
         "--fetch-history",
         action="store_true",
-        help="Fetch history from sglang-ci-data GitHub repo",
+        help="Fetch history from ci-data GitHub repo",
     )
     parser.add_argument(
         "--step-summary",

@@ -335,7 +335,11 @@ class RadixCache(BasePrefixCache):
             self.init_metrics_collector()
 
         if self.token_to_kv_pool_allocator:
-            self.device = self.token_to_kv_pool_allocator.device
+            dev = self.token_to_kv_pool_allocator.device
+            if isinstance(dev, (str, torch.device)):
+                self.device = torch.device(dev)
+            else:
+                self.device = torch.device("cpu")
         else:
             self.device = torch.device("cpu")
 
@@ -393,6 +397,15 @@ class RadixCache(BasePrefixCache):
         self.evictable_size_ = 0
         self.protected_size_ = 0
         self.evictable_leaves.clear()
+        self._empty_match_result = MatchResult(
+            device_indices=torch.empty(
+                (0,),
+                dtype=torch.int64,
+                device=self.device,
+            ),
+            last_device_node=self.root_node,
+            last_host_node=self.root_node,
+        )
         self._record_all_cleared_event()
 
     def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
@@ -419,8 +432,8 @@ class RadixCache(BasePrefixCache):
         Returns:
             MatchResult: ``device_indices`` is a 1-D ``torch.int64`` tensor of
             the concatenated KV cache indices corresponding to the longest
-            cached prefix (may be length 0). ``last_device_node`` and
-            ``last_host_node`` (currently the same) are the tree node objects
+            cached prefix (may be length 0).
+            ``last_device_node`` and ``last_host_node`` (currently the same) are the tree node objects
             representing the terminal node of the matched prefix. This method
             may mutate internal structure by splitting an existing node if the
             match ends inside a stored segment.
@@ -435,30 +448,19 @@ class RadixCache(BasePrefixCache):
         key = params.key
         key, _ = key.maybe_to_bigram_view(self.is_eagle)
 
-        def empty_match_result():
-            return MatchResult(
-                device_indices=torch.empty(
-                    (0,),
-                    dtype=torch.int64,
-                    device=self.device,
-                ),
-                last_device_node=self.root_node,
-                last_host_node=self.root_node,
-            )
-
         if self.disable or len(key) == 0:
-            return empty_match_result()
+            return self._empty_match_result
 
         key = key.page_aligned(self.page_size)
 
         if len(key) == 0:
-            return empty_match_result()
+            return self._empty_match_result
 
         value, last_node = self._match_prefix_helper(self.root_node, key)
         if value:
             value = torch.cat(value)
         else:
-            value = torch.empty((0,), dtype=torch.int64, device=self.device)
+            value = self._empty_match_result.device_indices
         return MatchResult(
             device_indices=value,
             last_device_node=last_node,
@@ -516,10 +518,9 @@ class RadixCache(BasePrefixCache):
             result = self.insert(
                 InsertParams(key=radix_key, value=values, priority=priority)
             )
-            new_prefix_len = result.prefix_len
             # Free the duplicates that were already in the tree
             self.token_to_kv_pool_allocator.free(
-                kv_indices[req.cache_protected_len : new_prefix_len]
+                kv_indices[req.cache_protected_len : result.prefix_len]
             )
         else:
             self.token_to_kv_pool_allocator.free(
@@ -530,7 +531,8 @@ class RadixCache(BasePrefixCache):
         self.token_to_kv_pool_allocator.free(kv_indices[key_len:])
 
         # Remove req slot release the cache lock
-        self.dec_lock_ref(req.last_node)
+        if req.last_node is not None:
+            self.dec_lock_ref(req.last_node)
 
     def cache_unfinished_req(self, req: Req, chunked=False):
         """Cache request when it is unfinished."""

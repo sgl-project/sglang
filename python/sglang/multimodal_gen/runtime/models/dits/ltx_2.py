@@ -4,8 +4,11 @@
 
 from __future__ import annotations
 
+import functools
+import math
 from typing import Any, Optional, Tuple, Union
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -31,9 +34,9 @@ from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config impor
     QuantizationConfig,
 )
 from sglang.multimodal_gen.runtime.layers.visual_embedding import timestep_embedding
+from sglang.multimodal_gen.runtime.managers.layerwise_offload import OffloadableDiTMixin
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
-from sglang.multimodal_gen.runtime.utils.layerwise_offload import OffloadableDiTMixin
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
@@ -61,32 +64,49 @@ def _ltx2_is_perturbed(
     return bool(value)
 
 
-def _ltx2_batched_perturbation_mask(
-    perturbation_configs: tuple[dict[str, object], ...] | None,
+def _ltx2_build_batched_perturbation_states(
+    perturbation_configs: tuple[dict[str, object], ...],
     key: str,
-    block_idx: int,
+    block_indices: tuple[int, ...],
     values: torch.Tensor,
-) -> tuple[torch.Tensor | None, bool]:
-    if not perturbation_configs:
-        return None, False
+) -> dict[int, tuple[torch.Tensor | None, bool]]:
+    mask_cache: dict[tuple[int, ...], torch.Tensor] = {}
+    states: dict[int, tuple[torch.Tensor | None, bool]] = {}
+    for block_idx in block_indices:
+        keep_values = []
+        any_perturbed = False
+        all_perturbed = True
+        for config in perturbation_configs:
+            perturbed = _ltx2_is_perturbed(config, key, block_idx)
+            any_perturbed = any_perturbed or perturbed
+            all_perturbed = all_perturbed and perturbed
+            keep_values.append(0 if perturbed else 1)
 
-    mask = torch.ones(
-        (len(perturbation_configs),), device=values.device, dtype=values.dtype
+        if not any_perturbed:
+            states[block_idx] = (None, False)
+        elif all_perturbed:
+            states[block_idx] = (None, True)
+        else:
+            cache_key = tuple(keep_values)
+            mask = mask_cache.get(cache_key)
+            if mask is None:
+                mask = torch.tensor(
+                    keep_values, device=values.device, dtype=values.dtype
+                ).view(len(keep_values), *([1] * (values.ndim - 1)))
+                mask_cache[cache_key] = mask
+            states[block_idx] = (mask, False)
+    return states
+
+
+@functools.lru_cache(maxsize=5)
+def _ltx2_rope_freq_grid_np(theta: float, num_pos_dims: int, dim: int) -> torch.Tensor:
+    # Official LTX uses NumPy float64 for double-precision RoPE frequencies.
+    n_elem = 2 * num_pos_dims
+    pow_indices = np.power(
+        theta,
+        np.linspace(0.0, 1.0, dim // n_elem, dtype=np.float64),
     )
-    any_perturbed = False
-    all_perturbed = True
-    for batch_idx, config in enumerate(perturbation_configs):
-        perturbed = _ltx2_is_perturbed(config, key, block_idx)
-        any_perturbed = any_perturbed or perturbed
-        all_perturbed = all_perturbed and perturbed
-        if perturbed:
-            mask[batch_idx] = 0
-
-    if not any_perturbed:
-        return None, False
-    if all_perturbed:
-        return None, True
-    return mask.view(mask.numel(), *([1] * (values.ndim - 1))), False
+    return torch.tensor(pow_indices * math.pi / 2.0, dtype=torch.float32)
 
 
 def apply_interleaved_rotary_emb(
@@ -102,6 +122,24 @@ def apply_split_rotary_emb(
     x: torch.Tensor, freqs: Tuple[torch.Tensor, torch.Tensor]
 ) -> torch.Tensor:
     cos, sin = freqs
+    if (
+        x.ndim == 3
+        and cos.ndim == 4
+        and sin.ndim == 4
+        and x.dtype == torch.bfloat16
+        and cos.dtype == torch.bfloat16
+        and sin.dtype == torch.bfloat16
+        and x.is_cuda
+        and x.is_contiguous()
+        and cos.is_cuda
+        and sin.is_cuda
+    ):
+        from sglang.jit_kernel.diffusion.triton.ltx2_rotary import (
+            apply_ltx2_split_rotary_emb,
+        )
+
+        return apply_ltx2_split_rotary_emb(x, cos, sin)
+
     x_dtype = x.dtype
     needs_reshape = False
     if x.ndim != 4 and cos.ndim == 4:
@@ -313,18 +351,22 @@ class LTX2AudioVideoRotaryPosEmbed(nn.Module):
         ).to(device)
 
         num_rope_elems = num_pos_dims * 2
-        freqs_dtype = torch.float64 if self.double_precision else torch.float32
-        pow_indices = torch.pow(
-            self.theta,
-            torch.linspace(
-                start=0.0,
-                end=1.0,
-                steps=self.dim // num_rope_elems,
-                dtype=freqs_dtype,
-                device=device,
-            ),
-        )
-        freqs = (pow_indices * torch.pi / 2.0).to(dtype=torch.float32)
+        if self.double_precision:
+            freqs = _ltx2_rope_freq_grid_np(self.theta, num_pos_dims, self.dim).to(
+                device=device
+            )
+        else:
+            pow_indices = torch.pow(
+                self.theta,
+                torch.linspace(
+                    start=0.0,
+                    end=1.0,
+                    steps=self.dim // num_rope_elems,
+                    dtype=torch.float32,
+                    device=device,
+                ),
+            )
+            freqs = (pow_indices * torch.pi / 2.0).to(dtype=torch.float32)
 
         freqs = (grid.unsqueeze(-1) * 2 - 1) * freqs
         freqs = freqs.transpose(-1, -2).flatten(2)
@@ -1450,6 +1492,7 @@ class LTX2VideoTransformer3DModel(CachableDiT, OffloadableDiTMixin):
             base_num_frames=cross_attn_pos_embed_max_pos,
             sampling_rate=16000,
             hop_length=160,
+            scale_factors=self.audio_scale_factors,
             theta=float(arch.positional_embedding_theta),
             causal_offset=causal_offset,
             modality="audio",
@@ -1774,6 +1817,46 @@ class LTX2VideoTransformer3DModel(CachableDiT, OffloadableDiTMixin):
         # 5. Run blocks
         skip_video_self_attn_blocks = set(skip_video_self_attn_blocks or ())
         skip_audio_self_attn_blocks = set(skip_audio_self_attn_blocks or ())
+        video_self_attn_perturbation_states = None
+        audio_self_attn_perturbation_states = None
+        a2v_cross_attn_perturbation_states = None
+        v2a_cross_attn_perturbation_states = None
+        if perturbation_configs is not None:
+            block_indices = tuple(
+                getattr(block, "idx", -1) for block in self.transformer_blocks
+            )
+            video_self_attn_perturbation_states = (
+                _ltx2_build_batched_perturbation_states(
+                    perturbation_configs,
+                    "skip_video_self_attn_blocks",
+                    block_indices,
+                    hidden_states,
+                )
+            )
+            audio_self_attn_perturbation_states = (
+                _ltx2_build_batched_perturbation_states(
+                    perturbation_configs,
+                    "skip_audio_self_attn_blocks",
+                    block_indices,
+                    audio_hidden_states,
+                )
+            )
+            a2v_cross_attn_perturbation_states = (
+                _ltx2_build_batched_perturbation_states(
+                    perturbation_configs,
+                    "skip_a2v_cross_attn",
+                    block_indices,
+                    hidden_states,
+                )
+            )
+            v2a_cross_attn_perturbation_states = (
+                _ltx2_build_batched_perturbation_states(
+                    perturbation_configs,
+                    "skip_v2a_cross_attn",
+                    block_indices,
+                    audio_hidden_states,
+                )
+            )
         for block in self.transformer_blocks:
             block_idx = getattr(block, "idx", -1)
             video_self_attn_perturbation_mask = None
@@ -1786,45 +1869,21 @@ class LTX2VideoTransformer3DModel(CachableDiT, OffloadableDiTMixin):
             skip_v2a_cross_attn = disable_v2a_cross_attn
             if perturbation_configs is not None:
                 if not skip_video_self_attn:
-                    (
-                        video_self_attn_perturbation_mask,
-                        skip_video_self_attn,
-                    ) = _ltx2_batched_perturbation_mask(
-                        perturbation_configs,
-                        "skip_video_self_attn_blocks",
-                        block_idx,
-                        hidden_states,
-                    )
+                    assert video_self_attn_perturbation_states is not None
+                    state = video_self_attn_perturbation_states[block_idx]
+                    video_self_attn_perturbation_mask, skip_video_self_attn = state
                 if not skip_audio_self_attn:
-                    (
-                        audio_self_attn_perturbation_mask,
-                        skip_audio_self_attn,
-                    ) = _ltx2_batched_perturbation_mask(
-                        perturbation_configs,
-                        "skip_audio_self_attn_blocks",
-                        block_idx,
-                        audio_hidden_states,
-                    )
+                    assert audio_self_attn_perturbation_states is not None
+                    state = audio_self_attn_perturbation_states[block_idx]
+                    audio_self_attn_perturbation_mask, skip_audio_self_attn = state
                 if not skip_a2v_cross_attn:
-                    (
-                        a2v_cross_attn_perturbation_mask,
-                        skip_a2v_cross_attn,
-                    ) = _ltx2_batched_perturbation_mask(
-                        perturbation_configs,
-                        "skip_a2v_cross_attn",
-                        block_idx,
-                        hidden_states,
-                    )
+                    assert a2v_cross_attn_perturbation_states is not None
+                    state = a2v_cross_attn_perturbation_states[block_idx]
+                    a2v_cross_attn_perturbation_mask, skip_a2v_cross_attn = state
                 if not skip_v2a_cross_attn:
-                    (
-                        v2a_cross_attn_perturbation_mask,
-                        skip_v2a_cross_attn,
-                    ) = _ltx2_batched_perturbation_mask(
-                        perturbation_configs,
-                        "skip_v2a_cross_attn",
-                        block_idx,
-                        audio_hidden_states,
-                    )
+                    assert v2a_cross_attn_perturbation_states is not None
+                    state = v2a_cross_attn_perturbation_states[block_idx]
+                    v2a_cross_attn_perturbation_mask, skip_v2a_cross_attn = state
             hidden_states, audio_hidden_states = block(
                 hidden_states,
                 audio_hidden_states,
