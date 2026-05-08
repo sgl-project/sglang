@@ -52,11 +52,22 @@ from typing import Dict, List, Optional
 
 
 def _free_port() -> int:
-    s = socket.socket()
-    s.bind(("", 0))
-    port = s.getsockname()[1]
-    s.close()
-    return port
+    """Find an unused TCP port in 30000-49999 — must be <= 55535 because
+    SGLang adds +10000 for the gRPC port and validates the sum <= 65535."""
+    import random
+
+    rng = random.Random()
+    for _ in range(50):
+        port = rng.randint(30000, 49999)
+        s = socket.socket()
+        try:
+            s.bind(("", port))
+        except OSError:
+            continue
+        finally:
+            s.close()
+        return port
+    raise RuntimeError("could not find a free TCP port in 30000-49999")
 
 
 @dataclass
@@ -80,6 +91,8 @@ class WorkloadResult:
 def _percentile(xs, p):
     if not xs:
         return 0.0
+    if len(xs) == 1:
+        return float(xs[0])
     return float(statistics.quantiles(sorted(xs), n=100, method="inclusive")[p - 1])
 
 

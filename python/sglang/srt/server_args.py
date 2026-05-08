@@ -2918,7 +2918,22 @@ class ServerArgs:
         # The selection path is fully vectorized (no `.item()` / Python loop)
         # and capture-safe; the FA3 metadata adaptor is also capture-safe
         # (test_double_sparsity_adaptor.py::TestCudaGraphCaptureReplay).
-        # CUDA graphs stay enabled by default.
+        # Full CUDA graphs stay enabled.
+        #
+        # Piecewise CUDA graph (torch.compile / breakable graph), however,
+        # cannot trace through the selection's dynamic gathers
+        # (req_to_token[...], k_label[...]), in-place scatter, and sort —
+        # it triggers runtime recompilation that fails capture. Until DS
+        # selection is wrapped as a registered split op (planned v1.1
+        # alongside the fused Triton kernel), auto-disable piecewise CUDA
+        # graph when DS is on.
+        if not self.disable_piecewise_cuda_graph:
+            logger.warning(
+                "--enable-double-sparsity v1 requires --disable-piecewise-cuda-graph "
+                "(selection kernels not yet a registered split op; v1.1 will lift). "
+                "Auto-setting --disable-piecewise-cuda-graph=True."
+            )
+            self.disable_piecewise_cuda_graph = True
 
     def _handle_amd_specifics(self):
         if is_hip():

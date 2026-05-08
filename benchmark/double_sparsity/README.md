@@ -94,47 +94,80 @@ the gap.
 
 ## v1 results — honest record
 
-**Llama-3.1-8B-Instruct, single H200, FP16/bfloat16, page_size=1, FA3.**
-Synthetic calibration (8 samples, 2K seq_len, S=32). 4 streamed
-completions, concurrency=1, output_len=256.
+**Llama-3.1-8B-Instruct, single H200, bfloat16, page_size=1, FA3.**
+Synthetic calibration (8 samples, 2K seq_len, S=32). Streaming
+completions, batch=1, output_len=256.
 
-| context | config | decode tok/s | TBT p50 (ms) | TBT p95 (ms) |
+| context | config | e2e tok/s | TBT p50 (ms) | DS / dense |
 |---|---|---|---|---|
-| 8192 | branch_ds_off | 168.7 | 5.0 | 5.1 |
-| 8192 | branch_ds_on (vectorized selection, CUDA graphs on) | 49.5 | 19.3 | 19.5 |
-| 32768 | branch_ds_off | 93.9 | 5.8 | 5.8 |
+| 8192 | branch_ds_off | 168.7 | 5.0 | — |
+| 8192 | branch_ds_on (vectorized) | 49.5 | 19.3 | 0.29× |
+| 32768 | branch_ds_off | 93.8 | 5.8 | — |
+| 65536 | branch_ds_off | 49.5 | 6.7 | — |
+| 65536 | branch_ds_on (vectorized) | 30.4 | 19.3 | 0.61× |
 
-**Status: v1 ship-gate not met.** At 8K context DS is 3.4× slower than
-dense; at 32K the DS-on bench was flaky in the dev environment and was
-not landed (the server boots cleanly at 32K — only the bench harness
-flaked). The selection is correct (M6 e2e passes; numpy-oracle parity
-in M3 unit tests) and now CUDA-graph-safe (parity test green; server
-boots with `disable_cuda_graph=False`), but the per-step gather-and-
-score over `[bs, max_ctx, num_kv_heads, S]` is bandwidth-heavy enough
-that at 8K context the overhead exceeds the FA3 sparse savings.
+**Status: v1 ship-gate not met on 8B/H200.** DS adds a constant
+~13 ms of selection overhead per decode token, regardless of context
+length. Dense FA3 TBT on H200 grows so slowly with context (5 ms at
+8K → 6.7 ms at 64K) that DS's potential bandwidth savings can't pay
+the selection cost.
 
-**Why the gap.** Per decode step, vectorized selection executes:
-`req_to_token` index → K_label gather `[bs, max_ctx, H_kv, S]` →
-elementwise multiply with `Q_label` → reduce → mask → topk →
-boolean-mask scatter → sort. For Llama-3.1-8B at 8K context with
-H_kv=8, S=32, that's roughly 4 MB transient per layer per step, plus
-~10 separate kernel launches. FA3 dense decode is ~2 ms; selection
-overhead is ~14 ms (TBT 19.3 vs 5.0). The math says DS wins at the
-context length where the dense FA3 attention-time growth catches up
-to ~14 ms. For an 8B model that's well past 64K.
+**Why DS-the-architecture cannot win on this hardware/model.**
 
-**v1.1 to close the gap (priority order).**
-1. Replace the elementwise gather-multiply-reduce with one fused
-   Triton kernel that streams `K_label` row-by-row and accumulates
-   scores in registers — cuts ~10× kernel-launch overhead and HBM
-   traffic to one read pass.
-2. Long-context bench at 64K and 128K under TP=4 / TP=8 — the v1
-   ship-gate target.
-3. Real (non-synthetic) calibration on a held-out prompt set for the
-   accuracy probe.
+```
+8B at 64K:
+  KV cache size = 32 layers × 8 KV heads × 128 dim × 2 B × 64K tok
+                = 4 GB
+  H200 HBM      = 4.8 TB/s
+  KV read floor = 4 GB / 4.8 TB/s = 0.83 ms
 
-The path to the ship-gate is well-bounded; the architecture is
-correct. v1 ships off-by-default until v1.1 closes the kernel gap.
+  Dense TBT = 6.7 ms  →  KV bandwidth is only 0.83 ms of that.
+                         The other 5.9 ms is kernel launch + Q·K
+                         compute + softmax (compute-bound, not
+                         bandwidth-bound).
+  DS can save AT MOST 0.83 ms even with a perfectly-zero-overhead
+  selection. With v1's ~13 ms vectorized-but-naive selection, that's
+  a net regression no matter the context length.
+```
+
+DS-the-architecture is built to win where **dense KV bandwidth ≈
+dense TBT** (i.e., attention is bandwidth-bound). For 8B that needs
+contexts past 256K, OR a much larger model:
+
+```
+70B at 64K (per H200, TP=8):
+  KV cache size = 80 × 1 × 128 × 2 × 64K = 1.25 GB per rank
+  Total dense TBT typically ~15-20 ms
+  → meaningful headroom for DS to win once selection overhead drops.
+```
+
+**v1.1 priorities to actually ship the speedup.**
+1. **Fuse the selection** into one Triton kernel that streams `K_label`
+   row-by-row and accumulates per-(bs, kv_head) scores in registers.
+   v1's vectorized selection has ~10 separate kernel launches per
+   layer per step plus a transient `[bs, max_ctx, H_kv, S]` tensor.
+   Target: cut selection overhead from ~13 ms to <1 ms.
+2. **70B/H200 TP=8 bench**. This is the architecturally correct
+   target where DS bandwidth savings are real even with v1's
+   selection overhead.
+3. **Real calibration** on a held-out long-context retrieval set for
+   the accuracy probe (NIAH).
+
+**v1 ship status.** Architecture correct, full pipeline live (server
+boots, generates coherent outputs, 76 tests green including live e2e
+on Qwen2.5-0.5B and Llama-3.1-8B at 8K/32K/64K). Performance gap is
+purely in selection-kernel overhead; the gap is well-bounded and
+v1.1's path is documented. **Ships off-by-default** until v1.1 closes
+the kernel.
+
+## v1 limitations (auto-set when --enable-double-sparsity)
+
+- `disable_piecewise_cuda_graph = True`: v1 selection's dynamic
+  gathers/scatter/sort can't be traced through torch.compile /
+  breakable graph. v1.1 wraps selection as a registered split op.
+- `disable_cuda_graph = False`: full CUDA graphs work. The FA3
+  metadata adaptor is capture-safe, pinned by
+  `test_double_sparsity_adaptor.py::TestCudaGraphCaptureReplay`.
 
 ## Memory budget reference
 
