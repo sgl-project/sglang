@@ -1,5 +1,5 @@
 name: Check Stage Health
-description: Fail fast if any job in the current workflow run has already failed, or if the lint check (from lint.yml) has failed. Auto-skips for scheduled runs.
+description: Fail fast if any job in the current workflow run has already failed, or if the lint check (from lint.yml) has failed. Auto-skips for scheduled runs. The jobs-failed check (but not the lint check) is bypassed when the PR carries the `bypass-fastfail` label.
 
 inputs:
   github-token:
@@ -44,6 +44,26 @@ runs:
           );
           if (lintRun?.status === 'completed' && lintRun?.conclusion === 'failure') {
             core.setFailed('Fast-fail: lint check failed');
+            return;
+          }
+
+          // Skip the jobs-failed check when the PR carries the bypass-fastfail label.
+          // Lint check above still runs.
+          let labels = [];
+          if (context.payload.pull_request?.labels) {
+            labels = context.payload.pull_request.labels.map(l => l.name);
+          } else {
+            const { data: prs } = await github.rest.repos.listPullRequestsAssociatedWithCommit({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              commit_sha: ref,
+            });
+            if (prs.length > 0) {
+              labels = prs[0].labels.map(l => l.name);
+            }
+          }
+          if (labels.includes('bypass-fastfail')) {
+            core.info('Skipping jobs-failed check (bypass-fastfail label present)');
             return;
           }
 
