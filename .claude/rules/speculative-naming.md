@@ -67,7 +67,11 @@ Each form has its own marker. **Never mix** (no `num_X_ct`, no `num_accept_rate`
 
 Internal code uses `num_X` for counts (Rule 4), not `length` / `lens`.
 
-The only allowed `_length` name is `accept_length` (paper-aligned external metric, see Rule 3 exception). Inside the codebase, never write `accept_lens` / `accepted_length` / `commit_lens`.
+The only allowed `_length` name is `accept_length` (paper-aligned external metric, see Rule 3 exception). Outside kernel signatures, never write `accept_lens` / `accepted_length` / `commit_lens`.
+
+### Exception: Triton kernel signatures
+
+Triton kernel parameters (and their inner scalar loads) may use `_lens` / `_len` to align with the broader PyTorch ecosystem (`seq_lens`, `cu_seqlens_q`). Example: `accept_lens` (kernel param, `[bs]`) and `accept_len = tl.load(accept_lens + pid)` (scalar inside kernel) are OK. The wrapping Python code that calls the kernel still uses `num_accept_tokens`.
 
 ## Rule 6 — Drop redundant `_token_id` / `_token_ids` suffix in spec scope
 
