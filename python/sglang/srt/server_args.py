@@ -1953,6 +1953,15 @@ class ServerArgs:
 
             validate_deepseek_v4_cp(self)
 
+            # SM120 desktop Blackwell: flashinfer_trtllm is unavailable;
+            # use Marlin runner with SM120 Triton fallback for MXFP4 experts.
+            if is_sm120_supported() and self.moe_runner_backend == "auto":
+                self.moe_runner_backend = "marlin"
+                logger.info(
+                    "SM120 detected: using marlin MoE runner backend "
+                    "with SM120 Triton MXFP4 fallback for DeepseekV4."
+                )
+
         elif model_arch in ["GptOssForCausalLM"]:
             # Set attention backend for GPT-OSS
             if self.is_attention_backend_not_set():

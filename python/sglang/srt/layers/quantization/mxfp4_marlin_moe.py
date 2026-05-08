@@ -9,7 +9,9 @@ from torch.nn import Module
 from sglang.srt.layers.moe.moe_runner.marlin import MarlinMoeQuantInfo
 from sglang.srt.layers.moe.utils import MoeRunnerBackend
 from sglang.srt.utils import log_info_on_rank0
-from sglang.srt.utils.common import is_sm90_supported
+from sglang.srt.utils.common import get_device_sm, is_cuda, is_sm90_supported
+
+_is_sm120 = is_cuda() and get_device_sm() // 10 == 12
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import CombineInput, DispatchOutput
@@ -50,18 +52,49 @@ class Mxfp4MarlinMoEMethod:
         )
 
     def process_weights_after_loading(self, layer: Module) -> None:
+        # Let the FP8 base method handle ROCm normalization, etc.
+        self._fp8.process_weights_after_loading(layer)
+
+        if getattr(layer, "_mega_moe_weights_built", False):
+            return
+
+        # SM120: skip Marlin repacking, keep original weight format
+        # for Triton MXFP4 dequant fallback (Marlin kernel produces NaN on SM120)
+        if _is_sm120:
+            from torch.nn import Parameter
+
+            log_info_on_rank0(
+                logger,
+                f"SM120 detected: using Triton MXFP4 MoE fallback "
+                f"(layer: {self.prefix})...",
+            )
+            # Normalize scales to float32 for direct use in dequant
+            w13_s = layer.w13_weight_scale_inv.data
+            w2_s = layer.w2_weight_scale_inv.data
+            if w13_s.dtype == torch.float8_e8m0fnu:
+                pass  # already in e8m0 format, will convert at runtime
+            elif w13_s.dtype in (torch.uint8, torch.int8):
+                layer.w13_weight_scale_inv = Parameter(
+                    w13_s.view(torch.uint8)
+                    .view(torch.float8_e8m0fnu)
+                    .to(torch.float32),
+                    requires_grad=False,
+                )
+                layer.w2_weight_scale_inv = Parameter(
+                    w2_s.view(torch.uint8)
+                    .view(torch.float8_e8m0fnu)
+                    .to(torch.float32),
+                    requires_grad=False,
+                )
+            layer._dsv4_mxfp4_backend = "sm120_fallback"
+            return
+
         from sglang.srt.layers.quantization.marlin_utils import (
             check_moe_marlin_supports_layer,
         )
         from sglang.srt.layers.quantization.marlin_utils_fp4 import (
             prepare_moe_mxfp4_layer_for_marlin,
         )
-
-        # Let the FP8 base method handle ROCm normalization, etc.
-        self._fp8.process_weights_after_loading(layer)
-
-        if getattr(layer, "_mega_moe_weights_built", False):
-            return
 
         if not is_sm90_supported():
             raise RuntimeError(
@@ -98,6 +131,36 @@ class Mxfp4MarlinMoEMethod:
         topk_output = dispatch_output.topk_output
         if not TopKOutputChecker.format_is_standard(topk_output):
             raise ValueError(f"Unsupported topk output format: {topk_output.format}")
+
+        # SM120 fallback: use Triton fused dequant+GEMM
+        if getattr(layer, "_dsv4_mxfp4_backend", None) == "sm120_fallback":
+            from sglang.srt.layers.moe.fused_moe_triton.mxfp4_moe_sm120_triton import (
+                mxfp4_moe_forward_triton as mxfp4_moe_forward_fallback,
+            )
+
+            hidden_states = dispatch_output.hidden_states
+            topk_weights, topk_ids, _ = topk_output
+            w13 = layer.w13_weight.data
+            w2 = layer.w2_weight.data
+            w13_scale = layer.w13_weight_scale_inv.data
+            w2_scale = layer.w2_weight_scale_inv.data
+            intermediate_size = w13.shape[1] // 2
+            hidden_size = w13.shape[2] * 2
+
+            output = mxfp4_moe_forward_fallback(
+                hidden_states=hidden_states,
+                w13_packed=w13,
+                w2_packed=w2,
+                w13_scale=w13_scale,
+                w2_scale=w2_scale,
+                topk_ids=topk_ids,
+                topk_weights=topk_weights,
+                hidden_size=hidden_size,
+                intermediate_size=intermediate_size,
+                routed_scaling_factor=self.runner.config.routed_scaling_factor,
+                clamp_limit=self.runner.config.swiglu_limit,
+            )
+            return StandardCombineInput(hidden_states=output)
 
         quant_info = MarlinMoeQuantInfo(
             w13_qweight=layer.w13_weight,
