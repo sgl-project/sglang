@@ -190,14 +190,6 @@ def get_deepep_output_dtype(self) -> DeepOutputDtype:
         )
         return DeepOutputDtype.BF16
 
-    if envs.DEEP_NORMAL_MODE_USE_INT8_QUANT.get():
-        logger.warning_once(
-            "Warning: The env variable DEEP_NORMAL_MODE_USE_INT8_QUANT deprecated "
-            "and will be removed in future releases. Please use a new "
-            "`--deepep-dispatcher-output-dtype fp8` argument instead."
-        )
-        return DeepOutputDtype.FP8
-
     # 1. Parse server argument.
     server_args = get_global_server_args()
     if server_args and server_args.deepep_dispatcher_output_dtype != "auto":
