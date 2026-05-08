@@ -45,11 +45,11 @@ sys.modules.setdefault(
 )
 sys.modules.setdefault("partial_json_parser.core.options", partial_json_parser_options)
 
-from sglang.multimodal_gen.configs.quantization.nunchaku import NunchakuSVDQuantArgs
 from sglang.multimodal_gen.configs.models.dits.qwenimage import (
     QwenImageArchConfig,
     QwenImageDitConfig,
 )
+from sglang.multimodal_gen.configs.quantization.nunchaku import NunchakuSVDQuantArgs
 from sglang.multimodal_gen.runtime.layers.linear import UnquantizedLinearMethod
 from sglang.multimodal_gen.runtime.layers.quantization.configs.nunchaku_config import (
     NunchakuConfig,
