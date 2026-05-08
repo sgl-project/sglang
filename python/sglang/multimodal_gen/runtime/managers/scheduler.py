@@ -613,7 +613,7 @@ class Scheduler(SchedulerDisaggMixin):
         replies to client, only on rank 0
         """
         if not is_warmup and self.receiver is not None and identity is not None:
-            # if the server is local, use temp file to spill the frame array
+            # if the server is local, use temp file to spill the frame array instead of leaving it in OutputBatch to be picked later
             if is_local_endpoint(self.server_args.scheduler_endpoint):
                 with self._record_return_stage(
                     output_batch, "Scheduler.return_result.spill_arrays"
