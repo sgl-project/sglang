@@ -80,6 +80,33 @@ jobs:
       - uses: ./.github/actions/upload-cuda-coredumps
         if: failure()
 
+  # General tests - 1 GPU 5090 (SM12.0)
+  nightly-test-general-1-gpu-5090:
+    if: github.repository == 'sgl-project/sglang' && (inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-test-general-1-gpu-5090')
+    runs-on: 1-gpu-5090
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+
+      - uses: ./.github/actions/check-maintenance
+
+      - name: Install dependencies
+        run: |
+          bash scripts/ci/cuda/ci_install_dependency.sh
+
+      - name: Run test
+        timeout-minutes: 60
+        env:
+          RUNAI_STREAMER_MEMORY_LIMIT: 0
+        run: |
+          cd test
+          python3 run_suite.py --hw cuda --suite nightly-1-gpu-5090 --nightly --continue-on-error
+
+      - uses: ./.github/actions/upload-cuda-coredumps
+        if: failure()
+
   # JIT kernel full unit tests (expanded parameter ranges via SGLANG_JIT_KERNEL_RUN_FULL_TESTS)
   nightly-test-kernel-1-gpu-h100:
     if: github.repository == 'sgl-project/sglang' && (inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-test-kernel-1-gpu-h100')
@@ -771,6 +798,7 @@ jobs:
     if: github.repository == 'sgl-project/sglang' && always()
     needs:
       - nightly-test-general-1-gpu-h100
+      - nightly-test-general-1-gpu-5090
       - nightly-test-general-4-gpu-h100
       - nightly-test-general-8-gpu-h200
       - nightly-test-general-8-gpu-h20
