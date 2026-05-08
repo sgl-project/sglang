@@ -115,7 +115,7 @@ export const LTXDeployment = () => {
   };
 
   const getDeviceMode = () => {
-    if (values.hardware === 'h200' || values.hardware === 'h200-2gpu' || values.hardware === 'h200-4gpu') {
+    if (values.hardware.startsWith('h200')) {
       return 'resident';
     }
     if (values.hardware === 'official') {
@@ -125,13 +125,11 @@ export const LTXDeployment = () => {
   };
 
   const getParallelFlags = () => {
-    if (values.hardware === 'h200-2gpu') {
-      return ` \\\n  --num-gpus 2 \\\n  --enable-cfg-parallel`;
-    }
-    if (values.hardware === 'h200-4gpu') {
-      return ` \\\n  --num-gpus 4 \\\n  --tp-size 2 \\\n  --enable-cfg-parallel`;
-    }
-    return '';
+    const parallelFlagsMap = {
+      'h200-2gpu': ` \\\n  --num-gpus 2 \\\n  --enable-cfg-parallel`,
+      'h200-4gpu': ` \\\n  --num-gpus 4 \\\n  --tp-size 2 \\\n  --enable-cfg-parallel`,
+    };
+    return parallelFlagsMap[values.hardware] || '';
   };
 
   const generateCommand = () => {
