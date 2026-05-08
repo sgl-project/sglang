@@ -36,16 +36,9 @@ else:
 )
 @triton.autotune(
     configs=[
-        triton.Config({"BK": BK, "BV": BV}, num_warps=num_warps, num_stages=num_stages)
+        triton.Config({"BK": BK, "BV": 64}, num_warps=num_warps)
         for BK in [32, 64]
-        for BV in [32, 64]
-        for num_warps in [2, 4, 8]
-        for num_stages in [1, 2, 3]
-    ]
-    + [
-        # Manually-tuned config kept as a candidate: maxnreg cap limits spill
-        # under heavy FUSE_DIAGONAL register pressure at small H.
-        triton.Config({"BK": 64, "BV": 64}, num_warps=4, maxnreg=128, num_stages=1),
+        for num_warps in [1, 2, 4]
     ],
     key=["H", "K", "BC", "V", "FUSE_RECOMPUTE", "FUSE_DIAGONAL"],
     **autotune_cache_kwargs,

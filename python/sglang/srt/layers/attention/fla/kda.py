@@ -1073,9 +1073,13 @@ def chunk_kda_fwd(
     # where launch overhead dominates; loses at large grid where the extra
     # register pressure spills. Gate both on the same grid heuristic.
     # Total CTAs in inter_solve_fused = NT * B * H_per_rank. For varlen,
-    # cu_seqlens[-1] already aggregates across all sequences and q.shape[0]=1.
-    _NT_pr = triton.cdiv(
-        q.shape[1] if cu_seqlens is None else int(cu_seqlens[-1]), chunk_size
+    # chunks don't cross sequence boundaries, so per-sequence ceil-divs sum to
+    # more than cdiv(total_tokens, chunk_size); use chunk_indices.shape[0] which
+    # already enumerates all (seq, chunk) pairs.
+    _NT_pr = (
+        triton.cdiv(q.shape[1], chunk_size)
+        if cu_seqlens is None
+        else chunk_indices.shape[0]
     )
     _H_pr = q.shape[-2]
     _B = q.shape[0]

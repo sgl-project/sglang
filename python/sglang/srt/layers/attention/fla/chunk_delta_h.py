@@ -23,12 +23,17 @@ CHUNK_SIZE = 64
 
 
 @triton.autotune(
-    configs=[
-        triton.Config({"BV": BV}, num_warps=num_warps, num_stages=num_stages)
-        for BV in [32]
-        for num_warps in [4]
-        for num_stages in [2]
-    ],
+    # Single hardcoded config. The kernel writes ht (final state) back into
+    # initial_state in-place; with multiple configs, triton's autotune benchmark
+    # phase invokes the kernel many times for timing and corrupts the cache pool,
+    # producing silently wrong output on the first user request. Restoring via
+    # `restore_value=["initial_state"]` works for unit tests but OOMs on
+    # production-scale models (e.g. Kimi-Linear-48B at default mem_fraction)
+    # because cloning the cache pool for each benchmark exceeds available memory.
+    # NT_BUCKET is kept in the autotune key for forward-compatibility (allows
+    # future per-bucket configs once the kernel is refactored to write final
+    # state to a separate output buffer).
+    configs=[triton.Config({"BV": 32}, num_warps=4, num_stages=2)],
     key=["H", "K", "V", "BT", "USE_GK", "NT_BUCKET"],
     **autotune_cache_kwargs,
 )
