@@ -112,6 +112,8 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.checkout_ref || github.ref }}
+          fetch-depth: 0
+          fetch-tags: true
 
       - name: Resolve Volcengine publish target
         run: |
