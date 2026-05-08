@@ -1,11 +1,12 @@
 """HISA tilelang kernels — production-active set.
 
-Three interface functions plus their prim-func bodies on the production
+Four interface functions plus their prim-func bodies on the production
 hot path:
 
   - ``fp8_native_block_mean_pooling_interface`` (orchestrator stage 1, K>=64)
   - ``fp8_native_block_mean_pooling_grouped_interface`` (orchestrator stage 1, K<64)
-  - ``fp8_native_paged_mean_pooling_completed_blocks_interface`` (pool-K cache writeback)
+  - ``fp8_native_paged_mean_pooling_completed_blocks_interface`` (pool-K cache writeback, K>=paged_block_size)
+  - ``fp8_native_paged_mean_pooling_completed_blocks_grouped_interface`` (pool-K cache writeback, K<paged_block_size)
 """
 
 import tilelang
@@ -443,6 +444,250 @@ def fp8_native_paged_mean_pooling_completed_blocks_interface(
         pool_page_size=pool_page_size,
         dim=D,
         max_pool_per_req_grid=max_pool_per_req_grid,
+    )
+    kernel(
+        kv_cache_flat.view(torch.float8_e4m3fn),
+        kv_cache_flat.view(torch.float32),
+        req_to_token,
+        pool_page_tables,
+        req_pool_indices,
+        prev_seq_lens,
+        new_seq_lens,
+        pool_k_pages.view(torch.float8_e4m3fn),
+        pool_k_pages.view(torch.float32),
+    )
+
+
+@tilelang.jit(
+    pass_configs={
+        tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True,
+    },
+)
+def fp8_native_paged_mean_pooling_completed_blocks_grouped(
+    paged_block_size: int,
+    pooling_block_size: int,
+    pool_page_size: int,
+    dim: int,
+    max_paged_per_req_grid: int,
+    num_stages=1,
+    threads=256,
+):
+    """Grouped variant for ``K < paged_block_size``: one paged block (e.g.
+    64 tokens) contains ``G = paged_block_size / K`` pool blocks. Each CTA
+    loads ONE paged block (bulk T.copy) and produces all G pool blocks
+    inside it — amortizing the load + per-CTA setup across G outputs.
+
+    Sibling of the vanilla
+    ``fp8_native_paged_mean_pooling_completed_blocks`` (K >= paged_block_size).
+    Mirrors the prefill grouped kernel
+    (``fp8_native_block_mean_pooling_grouped``) which uses the same
+    one-CTA-per-paged-block fanout for K<block_N.
+
+    Constraint: ``paged_block_size % K == 0`` — guarantees a pool block
+    never straddles two paged blocks. Use the vanilla kernel when
+    K >= paged_block_size.
+
+    Grid: ``(batch, max_paged_per_req_grid)`` — one CTA per (request,
+    paged-block-relative-index). Each CTA writes the subset of its G pool
+    blocks that fall in [prev_complete, new_complete) for the request.
+
+    Output writes mirror the vanilla kernel exactly:
+      * ``logical_pool_page = pblk_abs // pool_page_size``
+      * ``slot              = pblk_abs %  pool_page_size``
+      * ``phys              = pool_page_tables[req_idx, logical_pool_page]``
+      * ``pool_k_pages[phys, slot, :D]`` (fp8) and scale slot.
+    """
+    fp8_dtype = T.float8_e4m3fn
+    accum_dtype = T.float32
+    index_dtype = T.int32
+    req_pool_idx_dtype = T.int64
+
+    num_kv_blocks = T.dynamic("num_kv_blocks")
+    batch = T.dynamic("batch")
+    max_ctx = T.dynamic("max_ctx")
+    max_pool_pages = T.dynamic("max_pool_pages")
+    num_pool_pages_global = T.dynamic("num_pool_pages_global")
+    max_running_req = T.dynamic("max_running_req")
+
+    kv_cache_fp8_shape = [num_kv_blocks, paged_block_size * (dim + 4)]
+    kv_cache_fp32_shape = [num_kv_blocks, paged_block_size * (dim + 4) // 4]
+    req_to_token_shape = [max_running_req, max_ctx]
+    pool_page_tables_shape = [max_running_req, max_pool_pages]
+    seq_len_shape = [batch]
+    pool_k_pages_fp8_shape = [num_pool_pages_global, pool_page_size * (dim + 4)]
+    pool_k_pages_fp32_shape = [num_pool_pages_global, pool_page_size * (dim + 4) // 4]
+
+    fp8_end = paged_block_size * dim
+    scale_fp32_offset = paged_block_size * dim // 4
+    FP8_MAX_INV = 1.0 / 448.0
+    K = pooling_block_size
+
+    assert K > 0, f"K must be positive, got {K}"
+    assert K < paged_block_size, (
+        f"grouped variant requires K ({K}) < paged_block_size "
+        f"({paged_block_size}); use the vanilla kernel"
+    )
+    assert paged_block_size % K == 0, (
+        f"paged_block_size ({paged_block_size}) must be a multiple of K ({K}) "
+        f"so a pool block never straddles two paged blocks"
+    )
+
+    G = paged_block_size // K  # pool blocks per paged block
+
+    @T.prim_func
+    def kernel(
+        KvCacheFP8View: T.Tensor(kv_cache_fp8_shape, fp8_dtype),  # type: ignore
+        KvCacheFP32View: T.Tensor(kv_cache_fp32_shape, accum_dtype),  # type: ignore
+        ReqToToken: T.Tensor(req_to_token_shape, index_dtype),  # type: ignore
+        PoolPageTables: T.Tensor(pool_page_tables_shape, index_dtype),  # type: ignore
+        ReqPoolIndices: T.Tensor(seq_len_shape, req_pool_idx_dtype),  # type: ignore
+        PrevSeqLens: T.Tensor(seq_len_shape, index_dtype),  # type: ignore
+        NewSeqLens: T.Tensor(seq_len_shape, index_dtype),  # type: ignore
+        PoolKPagesFP8View: T.Tensor(pool_k_pages_fp8_shape, fp8_dtype),  # type: ignore
+        PoolKPagesFP32View: T.Tensor(pool_k_pages_fp32_shape, accum_dtype),  # type: ignore
+    ):
+        with T.Kernel(batch, max_paged_per_req_grid, threads=threads) as (bx, by):
+            b = bx
+            pg_rel = by
+
+            index_k_shared = T.alloc_fragment([paged_block_size * dim], accum_dtype)
+            index_k_reshaped = T.reshape(index_k_shared, [paged_block_size, dim])
+            scale_shared = T.alloc_fragment([paged_block_size], accum_dtype)
+            gk_view = T.alloc_fragment([G, K, dim], accum_dtype)
+            acc_per_pool = T.alloc_fragment([G, dim], accum_dtype)
+            max_abs_per_pool = T.alloc_fragment([G], accum_dtype)
+
+            prev_len = PrevSeqLens[b]
+            new_len = NewSeqLens[b]
+            prev_complete = prev_len // K
+            new_complete = new_len // K
+
+            # Pool-block range covered by this paged block: [pblk_first, pblk_last_excl).
+            pblk_first = pg_rel * G
+            pblk_last_excl = pblk_first + G
+
+            # Intersect with [prev_complete, new_complete) to find the subset
+            # of pool blocks in this paged block that need fresh writes.
+            new_lo = T.max(prev_complete, pblk_first)
+            new_hi = T.min(new_complete, pblk_last_excl)
+
+            if new_lo < new_hi:
+                req_idx = T.cast(ReqPoolIndices[b], index_dtype)
+                # All G pool blocks live in the same paged block — look up
+                # phys_page from the first token of this paged block.
+                logical_start_token = pg_rel * paged_block_size
+                buf_pos = ReqToToken[req_idx, logical_start_token]
+                phys_page = buf_pos // paged_block_size
+
+                # Bulk-load the entire paged block (TMA-friendly contiguous copy).
+                # Tilelang T.copy fp8→accum_dtype storage matches the vanilla
+                # kernel's pattern; the explicit T.cast in the dequant step
+                # below converts the byte-reinterpreted values to numeric fp32.
+                T.copy(KvCacheFP8View[phys_page, :fp8_end], index_k_shared)
+                T.copy(
+                    KvCacheFP32View[
+                        phys_page,
+                        scale_fp32_offset : scale_fp32_offset + paged_block_size,
+                    ],
+                    scale_shared,
+                )
+
+                # Dequant in-place: each row times its per-token scale.
+                for n_i, d_i in T.Parallel(paged_block_size, dim):
+                    index_k_reshaped[n_i, d_i] = (
+                        T.cast(index_k_reshaped[n_i, d_i], accum_dtype)
+                        * scale_shared[n_i]
+                    )
+
+                # Per-pool-block sum: build a [G, K, dim] view of the dequant
+                # paged block and reduce along K. Same pattern as the prefill
+                # grouped kernel — yields a clean reduction tree in the IR.
+                for g_i, k_inner, d_i in T.Parallel(G, K, dim):
+                    gk_view[g_i, k_inner, d_i] = index_k_reshaped[
+                        g_i * K + k_inner, d_i
+                    ]
+                T.reduce_sum(gk_view, acc_per_pool, dim=1, clear=True)
+
+                inv_count = T.cast(1.0, accum_dtype) / T.cast(K, accum_dtype)
+                for g_i, d_i in T.Parallel(G, dim):
+                    acc_per_pool[g_i, d_i] = acc_per_pool[g_i, d_i] * inv_count
+
+                T.reduce_absmax(acc_per_pool, max_abs_per_pool, dim=1, clear=True)
+
+                # Quantize + store. The active range [new_lo, new_hi) is per-
+                # CTA scalar; the gating predicate is hoisted by tilelang.
+                # Pool blocks outside this range may have been computed above
+                # (no-op cost; over uninitialised tail tokens in the last
+                # paged block they'd produce garbage, but we never write).
+                for g_i, d_i in T.Parallel(G, dim):
+                    pblk_abs = pblk_first + g_i
+                    if pblk_abs >= new_lo and pblk_abs < new_hi:
+                        bs = T.max(
+                            max_abs_per_pool[g_i] * T.cast(FP8_MAX_INV, accum_dtype),
+                            T.cast(1e-10, accum_dtype),
+                        )
+                        logical_pool_page = pblk_abs // pool_page_size
+                        slot = pblk_abs - logical_pool_page * pool_page_size
+                        phys = PoolPageTables[req_idx, logical_pool_page]
+                        PoolKPagesFP8View[phys, slot * dim + d_i] = T.cast(
+                            acc_per_pool[g_i, d_i] / bs, fp8_dtype
+                        )
+
+                for g_i in T.Parallel(G):
+                    pblk_abs = pblk_first + g_i
+                    if pblk_abs >= new_lo and pblk_abs < new_hi:
+                        bs = T.max(
+                            max_abs_per_pool[g_i] * T.cast(FP8_MAX_INV, accum_dtype),
+                            T.cast(1e-10, accum_dtype),
+                        )
+                        logical_pool_page = pblk_abs // pool_page_size
+                        slot = pblk_abs - logical_pool_page * pool_page_size
+                        phys = PoolPageTables[req_idx, logical_pool_page]
+                        scale_f32_idx = pool_page_size * dim // 4 + slot
+                        PoolKPagesFP32View[phys, scale_f32_idx] = bs
+
+    return kernel
+
+
+def fp8_native_paged_mean_pooling_completed_blocks_grouped_interface(
+    kv_cache_flat: torch.Tensor,  # [num_pages, page_size * (D + 4)] uint8
+    req_to_token: torch.Tensor,  # [R, T] int32
+    pool_page_tables: torch.Tensor,  # [R, max_pool_pages] int32
+    req_pool_indices: torch.Tensor,  # [B] int64
+    prev_seq_lens: torch.Tensor,  # [B] int32
+    new_seq_lens: torch.Tensor,  # [B] int32
+    pool_k_pages: torch.Tensor,  # [N_pool_pages, pool_page_size * (D+4)] uint8 IN-OUT
+    k_block_size: int,
+    paged_block_size: int,
+    pool_page_size: int,
+    max_pool_per_req_grid: int,
+):
+    """Same I/O contract as ``fp8_native_paged_mean_pooling_completed_blocks_interface``,
+    but for ``K < paged_block_size``. Asserts ``paged_block_size % K == 0``."""
+    _, DPlus4_times_P = kv_cache_flat.shape
+    D = DPlus4_times_P // paged_block_size - 4
+    assert pool_k_pages.shape[1] == pool_page_size * (D + 4)
+    assert k_block_size < paged_block_size, (
+        f"k_block_size ({k_block_size}) must be < paged_block_size "
+        f"({paged_block_size}); use the vanilla interface"
+    )
+    assert paged_block_size % k_block_size == 0, (
+        f"paged_block_size ({paged_block_size}) must be a multiple of "
+        f"k_block_size ({k_block_size})"
+    )
+
+    # Convert per-pool-block grid bound to per-paged-block grid bound.
+    # Worst case spans ceildiv(max_pool, G) paged blocks plus 1 for
+    # mid-paged-block prev_complete misalignment.
+    G = paged_block_size // k_block_size
+    max_paged_per_req_grid = (max_pool_per_req_grid + G - 1) // G + 1
+
+    kernel = fp8_native_paged_mean_pooling_completed_blocks_grouped(
+        paged_block_size=paged_block_size,
+        pooling_block_size=k_block_size,
+        pool_page_size=pool_page_size,
+        dim=D,
+        max_paged_per_req_grid=max_paged_per_req_grid,
     )
     kernel(
         kv_cache_flat.view(torch.float8_e4m3fn),

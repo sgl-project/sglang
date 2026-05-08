@@ -28,6 +28,7 @@ from typing import List, Optional
 import torch
 
 from sglang.srt.layers.attention.nsa.hisa.tilelang_kernels import (
+    fp8_native_paged_mean_pooling_completed_blocks_grouped_interface,
     fp8_native_paged_mean_pooling_completed_blocks_interface,
 )
 from sglang.srt.mem_cache.memory_pool import NSATokenToKVPool
@@ -399,18 +400,15 @@ class HisaNSATokenToKVPool(NSATokenToKVPool):
         """Mean-pool any blocks that became full during this forward and
         write them into ``pool_k_pages[phys, slot, :D]``. Graph-capturable.
 
-        Dispatch: tilelang for k>=paged_block_size (=64), triton (SK15)
-        for k<paged_block_size where tilelang would assert.
+        Dispatch: tilelang vanilla for k>=paged_block_size (=64), tilelang
+        grouped for k<paged_block_size (one pool block per CTA, K-row slice
+        of the underlying paged block). The grouped variant requires
+        ``paged_block_size % k_block_size == 0``.
         """
         kv_cache_flat = self.index_k_with_scale_buffer[layer_id - self.start_layer]
         pool_k_pages = self.pool_k_pages[layer_id - self.start_layer]
         if self.k_block_size < self.page_size:
-            # k<paged_block_size: tilelang asserts pooling % paged == 0; use SK15.
-            from sglang.srt.layers.attention.nsa.hisa.triton_kernels import (
-                update_pool_for_completed_blocks_triton,
-            )
-
-            update_pool_for_completed_blocks_triton(
+            fp8_native_paged_mean_pooling_completed_blocks_grouped_interface(
                 kv_cache_flat=kv_cache_flat,
                 req_to_token=req_to_token,
                 pool_page_tables=self.req_to_pool_page.req_to_pool_page,
@@ -423,20 +421,20 @@ class HisaNSATokenToKVPool(NSATokenToKVPool):
                 pool_page_size=self.pool_page_size,
                 max_pool_per_req_grid=max_pool_per_req_grid,
             )
-            return
-        fp8_native_paged_mean_pooling_completed_blocks_interface(
-            kv_cache_flat=kv_cache_flat,
-            req_to_token=req_to_token,
-            pool_page_tables=self.req_to_pool_page.req_to_pool_page,
-            req_pool_indices=req_pool_indices,
-            prev_seq_lens=prev_seq_lens,
-            new_seq_lens=new_seq_lens,
-            pool_k_pages=pool_k_pages,
-            k_block_size=self.k_block_size,
-            paged_block_size=self.page_size,
-            pool_page_size=self.pool_page_size,
-            max_pool_per_req_grid=max_pool_per_req_grid,
-        )
+        else:
+            fp8_native_paged_mean_pooling_completed_blocks_interface(
+                kv_cache_flat=kv_cache_flat,
+                req_to_token=req_to_token,
+                pool_page_tables=self.req_to_pool_page.req_to_pool_page,
+                req_pool_indices=req_pool_indices,
+                prev_seq_lens=prev_seq_lens,
+                new_seq_lens=new_seq_lens,
+                pool_k_pages=pool_k_pages,
+                k_block_size=self.k_block_size,
+                paged_block_size=self.page_size,
+                pool_page_size=self.pool_page_size,
+                max_pool_per_req_grid=max_pool_per_req_grid,
+            )
 
     # ------------------------------------------------------------------
     # Decode-side helpers (used by HisaIndexer._get_topk_paged)
