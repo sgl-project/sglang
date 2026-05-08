@@ -148,8 +148,14 @@ class RadixAttention(nn.Module):
 
         ret = self._forward_inner(q, k, v, forward_batch, save_kv_cache, **kwargs)
 
-        # Both phases: K_label write hook (no-op when save_kv_cache=False).
-        coordinator.attention_end(ret, self, forward_batch)
+        # K_label write hook. Skip entirely when save_kv_cache=False —
+        # otherwise the side cache desyncs from the KV pool (the inner call
+        # didn't write K, so we'd read stale rows from out_cache_loc and
+        # update K_label with garbage). The algorithm has a defensive
+        # `getattr(forward_batch, "save_kv_cache", True)` check too, but
+        # save_kv_cache lives on this function arg, not on forward_batch.
+        if save_kv_cache:
+            coordinator.attention_end(ret, self, forward_batch)
         return ret
 
     def _forward_inner(self, q, k, v, forward_batch, save_kv_cache, **kwargs):

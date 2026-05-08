@@ -253,5 +253,83 @@ class TestSaveKvCacheFalse(CustomTestCase):
         self.assertTrue(torch.equal(self.algo.k_label[0], before))
 
 
+class TestRadixAttentionSaveKvCacheRealPath(CustomTestCase):
+    """Real-path integration test: RadixAttention.forward(..., save_kv_cache=False)
+    must skip coordinator.attention_end entirely.
+
+    The existing TestSaveKvCacheFalse pins the algorithm's defensive
+    `getattr(forward_batch, 'save_kv_cache', True)` check — useful but
+    the real call site never sets that attribute, so that test misses
+    the actual code path. This test pins the RadixAttention.forward
+    integration where `save_kv_cache` is a function argument.
+    """
+
+    def _build_attn(self):
+        from sglang.srt.layers.radix_attention import RadixAttention
+
+        attn = RadixAttention(
+            num_heads=4, head_dim=16, scaling=0.25, num_kv_heads=2, layer_id=0
+        )
+        attn.ds_enabled = True
+        return attn
+
+    def _build_fb(self, mode: str):
+        # Minimal forward_batch + attn_backend for _forward_inner's "else" path.
+        attn_backend = MagicMock()
+        attn_backend.forward = MagicMock(return_value=torch.zeros(1, 4 * 16))
+        attn_backend.forward_metadata = None
+
+        class _M:
+            def __init__(self, name):
+                self.name = name
+
+            def is_extend(self):
+                return self.name == "extend"
+
+            def is_decode_or_idle(self):
+                return self.name in ("decode", "idle")
+
+        fb = MagicMock()
+        fb.forward_mode = _M(mode)
+        fb.attn_backend = attn_backend
+        return fb
+
+    def test_save_kv_cache_false_skips_attention_end_decode(self):
+        from unittest.mock import patch
+
+        attn = self._build_attn()
+        fb = self._build_fb("decode")
+        coord = MagicMock()
+        # Make get_sparse_coordinator return our stubbed coordinator.
+        with patch(
+            "sglang.srt.mem_cache.sparsity.get_sparse_coordinator", return_value=coord
+        ):
+            q = torch.zeros(1, 4 * 16)
+            k = torch.zeros(1, 2 * 16)
+            v = torch.zeros(1, 2 * 16)
+            attn.forward(q, k, v, fb, save_kv_cache=False)
+
+        coord.attention_end.assert_not_called()
+        # attention_begin still fires (it rewrites FA3 metadata before
+        # the dense kernel runs; not bound by save_kv_cache).
+        coord.attention_begin.assert_called_once()
+
+    def test_save_kv_cache_true_calls_attention_end(self):
+        from unittest.mock import patch
+
+        attn = self._build_attn()
+        fb = self._build_fb("decode")
+        coord = MagicMock()
+        with patch(
+            "sglang.srt.mem_cache.sparsity.get_sparse_coordinator", return_value=coord
+        ):
+            q = torch.zeros(1, 4 * 16)
+            k = torch.zeros(1, 2 * 16)
+            v = torch.zeros(1, 2 * 16)
+            attn.forward(q, k, v, fb, save_kv_cache=True)
+
+        coord.attention_end.assert_called_once()
+
+
 if __name__ == "__main__":
     unittest.main()
