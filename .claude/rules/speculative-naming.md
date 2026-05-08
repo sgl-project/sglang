@@ -36,8 +36,8 @@ These two metric names are entrenched in the spec-decoding literature and in ext
 
 | Name | Paper term | Bonus? | Definition |
 |---|---|---|---|
-| `accept_rate` | α (Leviathan 2023) | **No** | per-draft-token acceptance probability = `correct_drafts / proposed_drafts` |
-| `accept_length` | τ (EAGLE) | **Yes** | avg tokens per verify step = `completion_tokens / verify_ct` |
+| `accept_rate` | $\alpha$ (Leviathan 2023) | **No** | per-draft-token acceptance probability = `correct_drafts / proposed_drafts` |
+| `accept_length` | $\tau$ (EAGLE) | **Yes** | avg tokens per verify step = `completion_tokens / verify_ct` |
 
 Internal counters still follow Rule 2 strict semantics: `num_correct_drafts` (no bonus), `num_accept_tokens` (with bonus).
 
