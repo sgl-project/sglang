@@ -61,6 +61,9 @@ _RUNTIME_IMPORTS_READY = False
 def _ensure_runtime_imports() -> None:
     """Import Ray and decoupled-spec helpers after argparse handles --help."""
     global _RUNTIME_IMPORTS_READY
+    global common_launch_draft_actors
+    global create_remote_decoupled_spec_topology
+    global create_result_endpoint_from_pg
     global DraftActor
     global PlacementGroupSchedulingStrategy
     global PortActor
@@ -98,6 +101,11 @@ def _ensure_runtime_imports() -> None:
     placement_group = ray_placement_group
     remove_placement_group = ray_remove_placement_group
     PlacementGroupSchedulingStrategy = RayPlacementGroupSchedulingStrategy
+    common_launch_draft_actors = common.launch_draft_actors
+    create_remote_decoupled_spec_topology = (
+        common.create_remote_decoupled_spec_topology
+    )
+    create_result_endpoint_from_pg = common.create_result_endpoint_from_pg
     DraftActor = common.DraftActor
     PortActor = common.PortActor
     TargetActor = common.TargetActor
@@ -788,32 +796,12 @@ def derive_result_endpoint_from_pg(
     avoid_port: int | None = None,
     preferred_port: int | None = None,
 ) -> str:
-    scheduling_strategy = PlacementGroupSchedulingStrategy(
-        placement_group=pg,
-        placement_group_bundle_index=0,
+    del args
+    return create_result_endpoint_from_pg(
+        pg,
+        avoid_port=avoid_port,
+        preferred_port=preferred_port,
     )
-    for _ in range(16):
-        actor = PortActor.options(
-            num_cpus=0,
-            scheduling_strategy=scheduling_strategy,
-        ).remote()
-        try:
-            reservation = ray.get(actor.reserve_port.remote(preferred_port))
-            host = reservation["host"]
-            port = int(reservation["port"])
-            ray.get(actor.release_port.remote())
-        finally:
-            ray.kill(actor, no_restart=True)
-
-        if avoid_port is None or port != avoid_port:
-            return format_tcp_address(host, port)
-        if preferred_port is not None:
-            raise RuntimeError(
-                f"preferred result endpoint port {preferred_port} conflicts with "
-                f"avoid_port {avoid_port}"
-            )
-
-    raise RuntimeError("failed to reserve a result endpoint port")
 
 
 def init_ray(address: str, namespace: str, nnodes: int) -> None:
@@ -944,30 +932,11 @@ def launch_draft_actors(
     result_endpoint: str,
     control_port: int | None = None,
 ) -> tuple[list[Any], list[str]]:
-    actors = []
-    control_endpoints = []
-    actor_env_vars = _get_decoupled_spec_actor_env_vars(args)
-    for replica_index in range(args.num_draft_replicas):
-        actor_options: dict[str, Any] = dict(
-            num_gpus=args.draft_tp_size,
-            num_cpus=1,
-            max_concurrency=128,
-        )
-        if actor_env_vars:
-            actor_options["runtime_env"] = {"env_vars": actor_env_vars}
-        actor = DraftActor.options(**actor_options).remote(
-            model_path=args.draft_model_path,
-            tp_size=args.draft_tp_size,
-            speculative_num_steps=args.num_speculative_steps,
-            result_endpoint=result_endpoint,
-            control_port=control_port,
-            deterministic=args.deterministic,
-            decoupled_spec_trace_dir=args.decoupled_spec_trace_dir,
-        )
-        actors.append(actor)
-    ready_infos = ray.get([actor.ready.remote() for actor in actors])
-    control_endpoints.extend(info["control_endpoint"] for info in ready_infos)
-    return actors, control_endpoints
+    return common_launch_draft_actors(
+        args,
+        result_endpoint,
+        control_port=control_port,
+    )
 
 
 def create_target_placement_group(target_nnodes: int, target_gpus_per_node: int):
@@ -1536,17 +1505,14 @@ def main() -> None:
         preferred_control_port = (
             args.dist_init_port + 3 if args.dist_init_port is not None else None
         )
-        result_endpoint = derive_result_endpoint_from_pg(
+        topology = create_remote_decoupled_spec_topology(
             args,
             spec_pg,
             avoid_port=spec_dist_init_port,
-            preferred_port=preferred_result_port,
+            preferred_result_port=preferred_result_port,
+            preferred_control_port=preferred_control_port,
         )
-        draft_actors, control_endpoints = launch_draft_actors(
-            args,
-            result_endpoint,
-            control_port=preferred_control_port,
-        )
+        draft_actors = topology.draft_actors or []
         spec_metrics = run_mode(
             args=args,
             mode="decoupled_spec",
@@ -1557,8 +1523,8 @@ def main() -> None:
             target_nnodes=target_nnodes,
             target_gpus_per_node=target_gpus_per_node,
             pg=spec_pg,
-            control_endpoints=control_endpoints,
-            result_endpoints=[result_endpoint],
+            control_endpoints=topology.control_endpoints,
+            result_endpoints=topology.result_endpoints,
             include_output_text=True,
         )
         shutdown_actors(draft_actors)

@@ -8,6 +8,7 @@ import re
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 from dataclasses import dataclass
 from typing import Any
@@ -15,6 +16,7 @@ from typing import Any
 import ray
 import sglang as sgl
 import torch
+from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 from sglang.srt.speculative.decoupled_spec_io import DraftMeshIpcConfig
 from sglang.srt.utils.network import is_valid_ipv6_address
 
@@ -70,6 +72,16 @@ class DemoRayRuntime:
         except subprocess.TimeoutExpired:
             self.head_process.kill()
             self.head_process.wait(timeout=10)
+
+
+@dataclass
+class DecoupledSpecTopology:
+    """Endpoint topology and actor handles for a decoupled-spec run."""
+
+    control_endpoints: list[str]
+    result_endpoints: list[str]
+    draft_actors: list[Any] | None = None
+    cleanup_handles: list[Any] | None = None
 
 
 def _pick_free_local_port() -> int:
@@ -139,6 +151,62 @@ def init_demo_ray(namespace: str) -> DemoRayRuntime:
     raise RuntimeError(
         f"Failed to start demo Ray head at {address}: {last_error!r}"
     ) from last_error
+
+
+def _new_local_ipc_endpoint() -> str:
+    fd, path = tempfile.mkstemp()
+    os.close(fd)
+    return f"ipc://{path}"
+
+
+def create_local_decoupled_spec_ipc_config(
+    num_drafters: int = 1,
+    num_verifiers: int = 1,
+) -> DraftMeshIpcConfig:
+    """Create local IPC endpoints for a decoupled-spec topology."""
+    if num_drafters <= 0:
+        raise ValueError("num_drafters must be positive")
+    if num_verifiers <= 0:
+        raise ValueError("num_verifiers must be positive")
+    return DraftMeshIpcConfig(
+        control_endpoints={
+            rank: _new_local_ipc_endpoint() for rank in range(num_drafters)
+        },
+        result_endpoints={
+            rank: _new_local_ipc_endpoint() for rank in range(num_verifiers)
+        },
+    )
+
+
+def endpoint_lists(ipc_config: DraftMeshIpcConfig) -> tuple[list[str], list[str]]:
+    """Convert a DraftMeshIpcConfig into sorted control and result endpoint lists."""
+    return (
+        [
+            ipc_config.control_endpoints[rank]
+            for rank in sorted(ipc_config.control_endpoints)
+        ],
+        [
+            ipc_config.result_endpoints[rank]
+            for rank in sorted(ipc_config.result_endpoints)
+        ],
+    )
+
+
+def create_local_decoupled_spec_topology(
+    num_drafters: int = 1,
+    num_verifiers: int = 1,
+) -> DecoupledSpecTopology:
+    """Create local IPC endpoints and return them as engine-ready lists."""
+    control_endpoints, result_endpoints = endpoint_lists(
+        create_local_decoupled_spec_ipc_config(
+            num_drafters=num_drafters,
+            num_verifiers=num_verifiers,
+        )
+    )
+    return DecoupledSpecTopology(
+        control_endpoints=control_endpoints,
+        result_endpoints=result_endpoints,
+    )
 
 
 @ray.remote
@@ -211,7 +279,18 @@ def allocate_demo_gpus(args: argparse.Namespace) -> tuple[list[str], list[str]]:
 
 def _get_drafter_debug_env_vars() -> dict[str, str]:
     """Collect decoupled-spec debug environment variables for Ray actors."""
+    return get_decoupled_spec_actor_env_vars()
+
+
+def get_decoupled_spec_actor_env_vars(
+    args: argparse.Namespace | None = None,
+) -> dict[str, str]:
+    """Collect decoupled-spec environment variables for Ray actors."""
     env_vars: dict[str, str] = {}
+    if args is not None and hasattr(args, "decoupled_spec_allow_partial"):
+        env_vars["SGLANG_DECOUPLED_SPEC_ALLOW_PARTIAL"] = (
+            "1" if args.decoupled_spec_allow_partial else "0"
+        )
     for env_name in (
         "SGLANG_DECOUPLED_SPEC_DEBUG",
         "SGLANG_DECOUPLED_SPEC_TRACE_DIR",
@@ -223,26 +302,25 @@ def _get_drafter_debug_env_vars() -> dict[str, str]:
     return env_vars
 
 
-def _endpoint_lists(ipc_config: DraftMeshIpcConfig) -> tuple[list[str], list[str]]:
-    """Convert a DraftMeshIpcConfig into sorted control and result endpoint lists."""
-    return (
-        [
-            ipc_config.control_endpoints[rank]
-            for rank in sorted(ipc_config.control_endpoints)
-        ],
-        [
-            ipc_config.result_endpoints[rank]
-            for rank in sorted(ipc_config.result_endpoints)
-        ],
-    )
+_endpoint_lists = endpoint_lists
 
 
 def launch_drafter_actor(
     args: argparse.Namespace,
-    control_endpoints: list[str],
-    result_endpoints: list[str],
+    control_endpoints: list[str] | None = None,
+    result_endpoints: list[str] | None = None,
+    *,
+    topology: DecoupledSpecTopology | None = None,
 ) -> ray.actor.ActorHandle:
     """Launch the local draft actor and block until it reports readiness."""
+    if topology is not None:
+        control_endpoints = topology.control_endpoints
+        result_endpoints = topology.result_endpoints
+    elif control_endpoints is None or result_endpoints is None:
+        topology = create_local_decoupled_spec_topology()
+        control_endpoints = topology.control_endpoints
+        result_endpoints = topology.result_endpoints
+
     actor_options = dict(
         name=ACTOR_NAME,
         num_gpus=args.draft_tp_size,
@@ -268,11 +346,21 @@ def launch_verifier(
     target_tp_size: int,
     speculative_num_steps: int,
     speculative_num_draft_tokens: int,
-    control_endpoints: list[str],
-    result_endpoints: list[str],
+    control_endpoints: list[str] | None = None,
+    result_endpoints: list[str] | None = None,
     mamba_scheduler_strategy: str | None = None,
+    *,
+    topology: DecoupledSpecTopology | None = None,
 ) -> sgl.Engine:
     """Construct a local decoupled verify engine connected to the draft actor."""
+    if topology is not None:
+        control_endpoints = topology.control_endpoints
+        result_endpoints = topology.result_endpoints
+    elif control_endpoints is None or result_endpoints is None:
+        topology = create_local_decoupled_spec_topology()
+        control_endpoints = topology.control_endpoints
+        result_endpoints = topology.result_endpoints
+
     engine_kwargs: dict[str, Any] = dict(
         model_path=target_model_path,
         tp_size=target_tp_size,
@@ -385,6 +473,41 @@ class PortActor:
         return True
 
 
+def create_result_endpoint_from_pg(
+    pg,
+    *,
+    avoid_port: int | None = None,
+    preferred_port: int | None = None,
+) -> str:
+    """Reserve a verifier result endpoint on target placement-group rank 0."""
+    scheduling_strategy = PlacementGroupSchedulingStrategy(
+        placement_group=pg,
+        placement_group_bundle_index=0,
+    )
+    for _ in range(16):
+        actor = PortActor.options(
+            num_cpus=0,
+            scheduling_strategy=scheduling_strategy,
+        ).remote()
+        try:
+            reservation = ray.get(actor.reserve_port.remote(preferred_port))
+            host = reservation["host"]
+            port = int(reservation["port"])
+            ray.get(actor.release_port.remote())
+        finally:
+            ray.kill(actor, no_restart=True)
+
+        if avoid_port is None or port != avoid_port:
+            return format_tcp_address(host, port)
+        if preferred_port is not None:
+            raise RuntimeError(
+                f"preferred result endpoint port {preferred_port} conflicts with "
+                f"avoid_port {avoid_port}"
+            )
+
+    raise RuntimeError("failed to reserve a result endpoint port")
+
+
 @ray.remote
 class DraftActor:
     """Ray actor that hosts a draft engine for Ray/multi-node benchmark runs."""
@@ -437,6 +560,64 @@ class DraftActor:
         """Shutdown the remote draft engine owned by this actor."""
         self.engine.shutdown()
         return True
+
+
+def launch_draft_actors(
+    args: argparse.Namespace,
+    result_endpoint: str,
+    control_port: int | None = None,
+) -> tuple[list[Any], list[str]]:
+    """Launch draft actors and collect their control bind endpoints."""
+    actors = []
+    control_endpoints = []
+    actor_env_vars = get_decoupled_spec_actor_env_vars(args)
+    for replica_index in range(args.num_draft_replicas):
+        actor_options: dict[str, Any] = dict(
+            num_gpus=args.draft_tp_size,
+            num_cpus=1,
+            max_concurrency=128,
+        )
+        if actor_env_vars:
+            actor_options["runtime_env"] = {"env_vars": actor_env_vars}
+        actor = DraftActor.options(**actor_options).remote(
+            model_path=args.draft_model_path,
+            tp_size=args.draft_tp_size,
+            speculative_num_steps=args.num_speculative_steps,
+            result_endpoint=result_endpoint,
+            control_port=control_port if replica_index == 0 else None,
+            deterministic=args.deterministic,
+            decoupled_spec_trace_dir=args.decoupled_spec_trace_dir,
+        )
+        actors.append(actor)
+    ready_infos = ray.get([actor.ready.remote() for actor in actors])
+    control_endpoints.extend(info["control_endpoint"] for info in ready_infos)
+    return actors, control_endpoints
+
+
+def create_remote_decoupled_spec_topology(
+    args: argparse.Namespace,
+    pg,
+    *,
+    avoid_port: int | None = None,
+    preferred_result_port: int | None = None,
+    preferred_control_port: int | None = None,
+) -> DecoupledSpecTopology:
+    """Create Ray/multi-node decoupled-spec endpoints and draft actors."""
+    result_endpoint = create_result_endpoint_from_pg(
+        pg,
+        avoid_port=avoid_port,
+        preferred_port=preferred_result_port,
+    )
+    draft_actors, control_endpoints = launch_draft_actors(
+        args,
+        result_endpoint,
+        control_port=preferred_control_port,
+    )
+    return DecoupledSpecTopology(
+        control_endpoints=control_endpoints,
+        result_endpoints=[result_endpoint],
+        draft_actors=draft_actors,
+    )
 
 
 @ray.remote

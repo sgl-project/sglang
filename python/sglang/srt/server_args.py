@@ -1262,13 +1262,7 @@ class ServerArgs:
             # Refer to pr #15927, by default we set the piecewise cuda graph max tokens to the chunked prefill size by default.
             # For MLA backend, the introduction of piecewise cuda graph will influence the kernel dispatch difference compared to the original mode.
             # To avoid the performance regression, we set the max tokens to 2048 by default.
-            if (
-                self.speculative_algorithm == "DECOUPLED_DRAFT"
-                and self.chunked_prefill_size is not None
-                and self.chunked_prefill_size <= 0
-            ):
-                self.piecewise_cuda_graph_max_tokens = 2048
-            elif not self.use_mla_backend():
+            if not self.use_mla_backend():
                 self.piecewise_cuda_graph_max_tokens = self.chunked_prefill_size
             else:
                 self.piecewise_cuda_graph_max_tokens = 2048
@@ -2221,9 +2215,8 @@ class ServerArgs:
             else:
                 if not self.disable_radix_cache:
                     raise ValueError(
-                        f"Speculative decoding for {model_arch} is not compatible with radix cache when using --mamba-scheduler-strategy no_buffer. "
-                        "To use radix cache with speculative decoding, please use --mamba-scheduler-strategy extra_buffer. "
-                        "For overlap speculative decoding, also set SGLANG_ENABLE_SPEC_V2=1."
+                        f"Speculative decoding for {model_arch} is not compatible with radix cache when using --mamba-scheduler-strategy no_buffer."
+                        "To use radix cache with speculative decoding, please use --mamba-scheduler-strategy extra_buffer and set SGLANG_ENABLE_SPEC_V2=1."
                     )
 
     def _handle_sampling_backend(self):
@@ -6171,11 +6164,6 @@ class ServerArgs:
 
     def enable_mamba_extra_buffer(self) -> bool:
         return self.mamba_scheduler_strategy == "extra_buffer"
-
-    def get_mamba_state_slots_per_req(self) -> int:
-        if self.enable_mamba_extra_buffer():
-            return 2 if self.speculative_num_draft_tokens is not None else 3
-        return 1
 
     @property
     def mamba_cache_chunk_size(self) -> int:

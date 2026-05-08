@@ -203,8 +203,6 @@ class DraftMeshIpcConfig:
         endpoint = self.control_endpoints.get(normalized_rank)
         if endpoint is not None:
             return endpoint
-        if normalized_rank != 0 and 0 in self.control_endpoints:
-            return self.control_endpoints[0]
         raise KeyError(
             f"Draft mesh IPC config missing control endpoint for drafter_rank={normalized_rank}"
         )
@@ -214,8 +212,6 @@ class DraftMeshIpcConfig:
         endpoint = self.result_endpoints.get(normalized_rank)
         if endpoint is not None:
             return endpoint
-        if normalized_rank != 0 and 0 in self.result_endpoints:
-            return self.result_endpoints[0]
         raise KeyError(
             f"Draft mesh IPC config missing result endpoint for verifier_rank={normalized_rank}"
         )
