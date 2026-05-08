@@ -172,52 +172,19 @@ def get_deepep_output_dtype(self, quant_scheme=None) -> DeepOutputDtype:
     Automatically choose the dispatch output dtype for DeepEP.
 
     The decision follows several checks in priority order:
-    0. Parse server argument.
-    1. If quant_config contains input_global_scale → NVFP4 path.
-    2.1. If scheme is NPUW4A4Int4DynamicMoEMethod → BF16. (DeepEP does not support 4-bit quantization on NPU)
-    2.2. If scheme is NPUW8A8Int8DynamicMoEMethod → FP8.
-    2.3. If scheme is NPUW4A8Int8DynamicMoEMethod → FP8.
-    2.4. If scheme is NPUW4A16Int4DynamicMoEMethod → BF16.
-    3. If flashinfer_cutedsl backend is active → BF16 (it quantizes to NVFP4 internally).
-    4. Otherwise default for NPU or deprecated argument → BF16 (the default for NPU).
-    5. Otherwise → FP8 (the default for most models like DeepSeek-V3).
+    0. Parse deprecated enviroment variables.
+    1. Parse server argument.
+    2. If quant_config contains input_global_scale → NVFP4 path.
+    3.1. If scheme is NPUW4A4Int4DynamicMoEMethod → BF16. (DeepEP does not support 4-bit quantization on NPU)
+    3.2. If scheme is NPUW8A8Int8DynamicMoEMethod → FP8.
+    3.3. If scheme is NPUW4A8Int8DynamicMoEMethod → FP8.
+    3.4. If scheme is NPUW4A16Int4DynamicMoEMethod → BF16.
+    4. If flashinfer_cutedsl backend is active → BF16 (it quantizes to NVFP4 internally).
+    5. Otherwise default for NPU → BF16 (the default for NPU).
+    6. Otherwise → FP8 (the default for most models like DeepSeek-V3).
     """
-    # 0. Parse server argument.
-    server_args = get_global_server_args()
-    if server_args and server_args.deepep_dispatcher_output_dtype != "auto":
-        return DeepOutputDtype(server_args.deepep_dispatcher_output_dtype)
-
-    # 1. NVFP4 is detected inside dispatch_a / _dispatch_core via quant_config; no need to infer here.
-    if self.quant_config is not None:
-        input_global_scale = self.quant_config.get("input_global_scale", None)
-        if input_global_scale is not None:
-            return DeepOutputDtype.NVFP4
-
-    if quant_scheme is not None:
-        # 2.1. If scheme is NPUW4A4Int4DynamicMoEMethod → BF16.
-        if quant_scheme == "NPUW4A4Int4DynamicMoEMethod":
-            return DeepOutputDtype.BF16
-
-        # 2.2. If scheme is NPUW8A8Int8DynamicMoEMethod → FP8.
-        if quant_scheme == "NPUW8A8Int8DynamicMoEMethod":
-            return DeepOutputDtype.FP8
-
-        # 2.3. If scheme is NPUW4A8Int8DynamicMoEMethod → FP8.
-        if quant_scheme == "NPUW4A8Int8DynamicMoEMethod":
-            return DeepOutputDtype.FP8
-
-        # 2.4. If scheme is NPUW4A16Int4DynamicMoEMethod → BF16.
-        if quant_scheme == "NPUW4A16Int4DynamicMoEMethod":
-            return DeepOutputDtype.BF16
-
-    # 3. flashinfer_cutedsl expects BF16 dispatch
-    if get_moe_runner_backend().is_flashinfer_cutedsl():
-        return DeepOutputDtype.BF16
-
-    # 4. Default on NPU → BF16
-    if _is_npu:
-        return DeepOutputDtype.BF16
-    elif envs.SGLANG_DEEPEP_BF16_DISPATCH.get():
+    # 0. Parse deprecated enviroment variables.
+    if envs.SGLANG_DEEPEP_BF16_DISPATCH.get():
         logger.warning_once(
             "Warning: The env variable SGLANG_DEEPEP_BF16_DISPATCH deprecated "
             "and will be removed in future releases. Please use a new "
@@ -225,7 +192,51 @@ def get_deepep_output_dtype(self, quant_scheme=None) -> DeepOutputDtype:
         )
         return DeepOutputDtype.BF16
 
-    # 5. Default → FP8
+    if envs.DEEP_NORMAL_MODE_USE_INT8_QUANT.get():
+        logger.warning_once(
+            "Warning: The env variable DEEP_NORMAL_MODE_USE_INT8_QUANT deprecated "
+            "and will be removed in future releases. Please use a new "
+            "`--deepep-dispatcher-output-dtype` fp8 argument instead."
+        )
+        return DeepOutputDtype.FP8
+
+    # 1. Parse server argument.
+    server_args = get_global_server_args()
+    if server_args and server_args.deepep_dispatcher_output_dtype != "auto":
+        return DeepOutputDtype(server_args.deepep_dispatcher_output_dtype)
+
+    # 2. NVFP4 is detected inside dispatch_a / _dispatch_core via quant_config; no need to infer here.
+    if self.quant_config is not None:
+        input_global_scale = self.quant_config.get("input_global_scale", None)
+        if input_global_scale is not None:
+            return DeepOutputDtype.NVFP4
+
+    if quant_scheme is not None:
+        # 3.1. If scheme is NPUW4A4Int4DynamicMoEMethod → BF16.
+        if quant_scheme == "NPUW4A4Int4DynamicMoEMethod":
+            return DeepOutputDtype.BF16
+
+        # 3.2. If scheme is NPUW8A8Int8DynamicMoEMethod → FP8.
+        if quant_scheme == "NPUW8A8Int8DynamicMoEMethod":
+            return DeepOutputDtype.FP8
+
+        # 3.3. If scheme is NPUW4A8Int8DynamicMoEMethod → FP8.
+        if quant_scheme == "NPUW4A8Int8DynamicMoEMethod":
+            return DeepOutputDtype.FP8
+
+        # 3.4. If scheme is NPUW4A16Int4DynamicMoEMethod → BF16.
+        if quant_scheme == "NPUW4A16Int4DynamicMoEMethod":
+            return DeepOutputDtype.BF16
+
+    # 4. flashinfer_cutedsl expects BF16 dispatch
+    if get_moe_runner_backend().is_flashinfer_cutedsl():
+        return DeepOutputDtype.BF16
+
+    # 5. Default on NPU → BF16
+    if _is_npu:
+        return DeepOutputDtype.BF16
+
+    # 6. Default → FP8
     return DeepOutputDtype.FP8
 
 
