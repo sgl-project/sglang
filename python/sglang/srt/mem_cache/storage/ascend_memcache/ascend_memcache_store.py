@@ -460,6 +460,7 @@ class AscendMemcacheStore(HiCacheStorage):
 
         if ENABLE_ASCEND_MEMCACHE_WARMUP:
             self.warmup()
+            logger.info("Ascend memcache store warmup completed successfully.")
 
         bytes_per_page = mem_pool_host.get_ksize_per_token() * mem_pool_host.page_size
         self.gb_per_page = bytes_per_page / (1 << 30)
