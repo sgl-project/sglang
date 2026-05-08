@@ -587,6 +587,15 @@ class _MimoDetector(Qwen3Detector):
         self.reasoning_default = "explicit_enable_thinking"
 
 
+class _PoolsideV1Detector(Qwen3Detector):
+    """Poolside v1 (Laguna-XS.2) reuses Qwen3 <think> tokens but the HF chat template
+    defaults `enable_thinking=False`; reasoning is opt-in via `enable_thinking=True`."""
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.reasoning_default = "explicit_enable_thinking"
+
+
 class ReasoningParser:
     """
     Parser that handles both streaming and non-streaming scenarios for extracting
@@ -608,6 +617,7 @@ class ReasoningParser:
         "kimi": KimiDetector,
         "kimi_k2": KimiK2Detector,
         "mimo": _MimoDetector,
+        "poolside_v1": _PoolsideV1Detector,
         "qwen3": Qwen3Detector,
         "qwen3-thinking": Qwen3Detector,
         "minimax": Qwen3Detector,
