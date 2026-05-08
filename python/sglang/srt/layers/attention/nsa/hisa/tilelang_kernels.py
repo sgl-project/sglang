@@ -14,13 +14,27 @@ import torch
 from tilelang import language as T
 
 
+def _round_up_pow2(n: int) -> int:
+    """Round n up to the nearest power of 2 (>= 1).
+
+    Used to bucket grid-size compile-time arguments that depend on input
+    sequence length. Bucketing collapses the per-shape JIT compile cost
+    (~300ms for tilelang autotune) into a small fixed set (one per power
+    of 2 up to the workload's max), at the cost of launching slightly more
+    CTAs than strictly needed (each extra CTA short-circuits via the
+    in-kernel bounds check ``if pblk_rel < n_new``).
+    """
+    if n <= 1:
+        return 1
+    return 1 << (n - 1).bit_length()
+
+
 @tilelang.jit(
     pass_configs={
         tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True,
     },
 )
 def fp8_native_block_mean_pooling(
-    max_num_pooling_blocks: int,
     pooling_block_size: int,
     dim: int,
     block_N: int = 64,
@@ -43,6 +57,7 @@ def fp8_native_block_mean_pooling(
     accum_dtype = T.float32
 
     seq_len_k = T.dynamic("seq_len_k")
+    max_num_pooling_blocks = T.dynamic("max_num_pooling_blocks")
     k_size = [seq_len_k, dim]
     scale_size = [seq_len_k]
     blocked_k_size = [max_num_pooling_blocks, dim]
@@ -126,7 +141,6 @@ def fp8_native_block_mean_pooling_interface(k, k_scale, k_block_size):
         (max_num_pooling_blocks,), device=k.device, dtype=torch.float32
     )
     kernel = fp8_native_block_mean_pooling(
-        max_num_pooling_blocks=max_num_pooling_blocks,
         pooling_block_size=k_block_size,
         dim=d,
     )
@@ -145,7 +159,6 @@ def fp8_native_block_mean_pooling_interface(k, k_scale, k_block_size):
     },
 )
 def fp8_native_block_mean_pooling_grouped(
-    max_num_pooling_blocks: int,
     pooling_block_size: int,  # K, must divide block_N
     dim: int,
     block_N: int = 64,
@@ -177,6 +190,7 @@ def fp8_native_block_mean_pooling_grouped(
     dtype = T.float8_e4m3fn
     accum_dtype = T.float32
     seq_len_k = T.dynamic("seq_len_k")
+    max_num_pooling_blocks = T.dynamic("max_num_pooling_blocks")
     FP8_MAX_INV = 1.0 / 448.0
 
     @T.prim_func
@@ -282,7 +296,6 @@ def fp8_native_block_mean_pooling_grouped_interface(
         (max_num_pooling_blocks,), device=k.device, dtype=torch.float32
     )
     kernel = fp8_native_block_mean_pooling_grouped(
-        max_num_pooling_blocks=max_num_pooling_blocks,
         pooling_block_size=k_block_size,
         dim=d,
         block_N=block_N,
@@ -438,6 +451,9 @@ def fp8_native_paged_mean_pooling_completed_blocks_interface(
     D = DPlus4_times_P // paged_block_size - 4
     assert pool_k_pages.shape[1] == pool_page_size * (D + 4)
 
+    # Bucket grid Y to power-of-2 so distinct prompt lengths share a JIT
+    # compile (otherwise every new max_new_seq triggers tilelang autotune).
+    max_pool_per_req_grid = _round_up_pow2(max_pool_per_req_grid)
     kernel = fp8_native_paged_mean_pooling_completed_blocks(
         paged_block_size=paged_block_size,
         pooling_block_size=k_block_size,
@@ -681,6 +697,9 @@ def fp8_native_paged_mean_pooling_completed_blocks_grouped_interface(
     # mid-paged-block prev_complete misalignment.
     G = paged_block_size // k_block_size
     max_paged_per_req_grid = (max_pool_per_req_grid + G - 1) // G + 1
+    # Bucket grid Y to power-of-2 so distinct prompt lengths share a JIT
+    # compile (otherwise every new max_new_seq triggers tilelang autotune).
+    max_paged_per_req_grid = _round_up_pow2(max_paged_per_req_grid)
 
     kernel = fp8_native_paged_mean_pooling_completed_blocks_grouped(
         paged_block_size=paged_block_size,
