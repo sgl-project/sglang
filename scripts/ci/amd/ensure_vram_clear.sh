@@ -323,8 +323,97 @@ ensure_vram_clear() {
         fi
     done
 
-    # Failed after all retries — diagnostics for the last attempt were
-    # already dumped above; just print the actionable hint.
+    # === LAST-DITCH: try GPU-level reset before declaring fail ===
+    # If user-space cleanup (signals + container-stop + KFD-fd kills)
+    # didn't work, the only remaining option short of node reboot is to
+    # ask amdgpu to recover the GPU itself. Try the safer paths first.
+    # All paths are best-effort: failures fall through to the reboot hint.
+    #
+    # NOTE: rocm-smi --gpureset can return success while doing nothing
+    # (silent no-op on unsupported reset modes), so we *never* trust the
+    # exit code — only check_vram_clear's VRAM% verdict counts.
+    #
+    # Toggle: SGLANG_VRAM_CLEAR_TRY_GPU_RESET=0 to skip this entire block.
+    if [[ "${SGLANG_VRAM_CLEAR_TRY_GPU_RESET:-1}" != "0" ]]; then
+        echo "=== Last-ditch: attempting GPU-level reset ==="
+        echo "    (set SGLANG_VRAM_CLEAR_TRY_GPU_RESET=0 to skip this block)"
+
+        # Detect the number of GPUs from rocm-smi for the reset loops.
+        local n_gpus
+        n_gpus=$(rocm-smi --showmemuse 2>/dev/null \
+            | grep -c 'GPU Memory Allocated (VRAM%)')
+        if [ -z "$n_gpus" ] || [ "$n_gpus" -eq 0 ]; then
+            n_gpus=8   # fallback for our typical 8-GPU MI3xx runners
+        fi
+        echo "  Detected $n_gpus GPU(s) on host"
+
+        # 4a. Preferred path: rocm-smi --gpureset (uses amdgpu's recovery
+        #     API, designed for exactly this situation).
+        if rocm-smi --help 2>&1 | grep -q -- '--gpureset'; then
+            # Detect --yes support so we can suppress the interactive
+            # confirmation prompt in newer rocm-smi without erroring out
+            # on older versions that don't recognise the flag.
+            local yes_flag=""
+            if rocm-smi --help 2>&1 | grep -q -- '--yes'; then
+                yes_flag="--yes"
+            fi
+            echo "  --- Trying rocm-smi --gpureset ${yes_flag} ---"
+            local gpu
+            for gpu in $(seq 0 $((n_gpus - 1))); do
+                echo "    rocm-smi --gpureset -d $gpu ${yes_flag}"
+                # Pipe stderr+stdout through sed for indented logging.
+                # We do NOT trust the exit code (rocm-smi --gpureset can
+                # silently no-op on unsupported reset modes); the only
+                # truth is check_vram_clear after the wait.
+                rocm-smi --gpureset -d "$gpu" $yes_flag 2>&1 \
+                    | sed 's/^/      /' || true
+            done
+            echo "  Waiting 15s for amdgpu recovery to complete..."
+            sleep 15
+            if check_vram_clear; then
+                echo "✓ rocm-smi --gpureset cleared VRAM"
+                return 0
+            fi
+            echo "  rocm-smi --gpureset did NOT clear VRAM (or silently no-op'd)"
+        else
+            echo "  rocm-smi --gpureset not supported by this version; skipping"
+        fi
+
+        # 4b. Fallback path: sysfs /sys/class/drm/cardN/device/reset.
+        #     Same recovery path the kernel uses internally; may have
+        #     different permission requirements than rocm-smi.
+        echo "  --- Trying sysfs device/reset ---"
+        local tried_any=0
+        local reset_path
+        for reset_path in /sys/class/drm/card*/device/reset; do
+            [ -e "$reset_path" ] || continue
+            if [ -w "$reset_path" ]; then
+                echo "    echo 1 > $reset_path"
+                # Capture write errors loudly; -e on the script means a
+                # raw write would abort, so we route through a subshell.
+                ( echo 1 > "$reset_path" ) 2>&1 | sed 's/^/      /' || true
+                tried_any=1
+            else
+                echo "    $reset_path: not writable" \
+                     "(need root + privileged sysfs mount)"
+            fi
+        done
+        if [ "$tried_any" = "1" ]; then
+            echo "  Waiting 15s for amdgpu recovery to complete..."
+            sleep 15
+            if check_vram_clear; then
+                echo "✓ sysfs device/reset cleared VRAM"
+                return 0
+            fi
+            echo "  sysfs device/reset did NOT clear VRAM"
+        fi
+
+        echo "Last-ditch GPU reset attempts did not clear VRAM."
+    fi
+
+    # Failed after all retries (and last-ditch reset, if attempted) —
+    # diagnostics for the last cleanup attempt were already dumped above;
+    # just print the actionable hint for the operator.
     echo "=== FAILED: VRAM cleanup unsuccessful after $max_retries attempts ==="
     echo "(See diagnostics above for the final attempt.)"
     echo "=================================================================="
