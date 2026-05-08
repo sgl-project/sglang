@@ -1672,6 +1672,12 @@ class ServerArgs:
         if not user_set_prefill and not user_set_decode and is_hip():
             self.nsa_prefill_backend = "tilelang"
             self.nsa_decode_backend = "tilelang"
+        elif is_sm120_supported():
+            # SM120: trtllm_mha does not support SM120; use tilelang for both paths.
+            if not user_set_prefill:
+                self.nsa_prefill_backend = "tilelang"
+            if not user_set_decode:
+                self.nsa_decode_backend = "tilelang"
         elif kv_cache_dtype == "fp8_e4m3":
             if major >= 10:
                 if not user_set_prefill:

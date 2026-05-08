@@ -20,10 +20,14 @@ def _compute_enable_deep_gemm():
         return False
     if not (_is_cuda or _is_musa):
         return False
+    # DeepGEMM requires TMEM/tcgen05 (SM100+datacenter), not available on SM120
+    if _is_cuda and sm_version // 10 == 12:
+        return False
 
     try:
         import deep_gemm  # noqa: F401
-    except ImportError:
+    except (ImportError, AssertionError):
+        # AssertionError: deep_gemm init fails on SM120 (no CUDA_HOME / unsupported arch)
         return False
 
     return envs.SGLANG_ENABLE_JIT_DEEPGEMM.get()

@@ -309,7 +309,11 @@ def get_jit_cuda_arch() -> ArchInfo:
 def is_arch_support_pdl() -> bool:
     if is_hip_runtime():
         return False
-    return get_jit_cuda_arch().major >= 9
+    arch = get_jit_cuda_arch()
+    # PDL requires SM100+ datacenter (tcgen05/TMEM); SM120 (desktop Blackwell) lacks these
+    if arch.major == 12:
+        return False
+    return arch.major >= 9
 
 
 def _find_package_root(package: str) -> Optional[pathlib.Path]:
