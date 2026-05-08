@@ -217,6 +217,13 @@ def get_deepep_output_dtype(self, quant_scheme=None) -> DeepOutputDtype:
     # 4. Default on NPU → BF16
     if _is_npu:
         return DeepOutputDtype.BF16
+    elif envs.SGLANG_DEEPEP_BF16_DISPATCH.get():
+        logger.warning_once(
+            "Warning: The env variable SGLANG_DEEPEP_BF16_DISPATCH deprecated "
+            "and will be removed in future releases. Please use a new "
+            "`--deepep-dispatcher-output-dtype` bf16 argument instead."
+        )
+        return DeepOutputDtype.BF16
 
     # 5. Default → FP8
     return DeepOutputDtype.FP8
