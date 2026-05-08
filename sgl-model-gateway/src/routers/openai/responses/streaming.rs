@@ -74,12 +74,10 @@ pub(super) fn apply_event_transformations_inplace(
             .get("type")
             .and_then(|v| v.as_str())
             .unwrap_or("");
-        let action = if t == OutputItemEvent::ADDED || t == OutputItemEvent::DONE {
-            EventAction::AddedOrDone
-        } else if t == FunctionCallEvent::ARGUMENTS_DONE {
-            EventAction::ArgsDone
-        } else {
-            EventAction::Other
+        let action = match t {
+            OutputItemEvent::ADDED | OutputItemEvent::DONE => EventAction::AddedOrDone,
+            FunctionCallEvent::ARGUMENTS_DONE => EventAction::ArgsDone,
+            _ => EventAction::Other,
         };
         (is_response_event(t), action)
     };
