@@ -54,6 +54,18 @@ kill_processes_holding_gpu_devices() {
     local signal=${1:-TERM}
     local pids=""
 
+    # If neither tool is present we silently degrade to a no-op, which used
+    # to look identical in the log to "no holders found" and made the
+    # script's failures very confusing. Emit a loud warning so the runner
+    # owner knows why GPU device cleanup isn't happening.
+    if ! command -v fuser >/dev/null 2>&1 && ! command -v lsof >/dev/null 2>&1; then
+        echo "WARNING: neither fuser nor lsof installed on the host;" \
+             "cannot detect processes holding /dev/kfd or /dev/dri/renderD*."
+        echo "         Install psmisc (for fuser) or lsof on the runner host" \
+             "to enable device-fd-based cleanup."
+        return 0
+    fi
+
     if command -v fuser >/dev/null 2>&1; then
         # `fuser` prints PIDs to stdout, names to stderr; collect everything
         # that has any handle on KFD or render nodes.
@@ -167,41 +179,53 @@ ensure_vram_clear() {
     rocm-smi --showmemuse
     echo "=================================="
 
+    # Fast path: if the runner is already clean, skip the cleanup loop
+    # entirely so healthy jobs don't pay the ~35s/attempt cleanup cost.
+    if check_vram_clear; then
+        echo "✓ VRAM is already clear; skipping cleanup."
+        return 0
+    fi
+
     while [ $retry_count -lt $max_retries ]; do
         echo "=== Cleanup Attempt $((retry_count + 1))/$max_retries ==="
 
         # Step 1: kill SGLang-named processes on the host (cheap, fast).
+        # NOTE: host pgrep cannot see PIDs inside a container's PID
+        # namespace, so in CI this almost never matches anything; the
+        # heavy lifting is done by step 2 below. Kept as a fast early
+        # cleanup for the rare case where something runs on the host.
         echo "Killing SGLang processes..."
         pgrep -f 'sglang::|sglang\.launch_server|sglang\.bench|sglang\.data_parallel|sglang\.srt' \
             | xargs -r kill -9 2>/dev/null || true
 
-        # Step 2: from attempt 2 onward, escalate.
-        if [ $retry_count -gt 0 ]; then
-            echo "Performing aggressive cleanup..."
+        # Step 2: aggressive cleanup. Run on EVERY attempt — the previous
+        # version skipped this on attempt 1, which made attempt 1 a near
+        # no-op for the most common failure mode (a leftover container
+        # holding VRAM, invisible to host pgrep).
+        echo "Performing aggressive cleanup..."
 
-            # 2a. Stop ALL GPU-attached containers, not just ci_sglang. A
-            # leftover container from a previous job will keep VRAM held even
-            # though `pgrep` on the host shows nothing.
-            stop_all_gpu_containers
+        # 2a. Stop ALL GPU-attached containers, not just ci_sglang. A
+        # leftover container from a previous job will keep VRAM held even
+        # though `pgrep` on the host shows nothing.
+        stop_all_gpu_containers
 
-            # 2b. SIGTERM anything that has /dev/kfd or /dev/dri/renderD* open.
-            # `lsof`/`fuser` see processes that `rocm-smi --showpids` misses
-            # (notably zombies and processes outside our PID namespace).
-            echo "Sending SIGTERM to processes holding GPU device files..."
-            kill_processes_holding_gpu_devices TERM
-            sleep 5
+        # 2b. SIGTERM anything that has /dev/kfd or /dev/dri/renderD* open.
+        # `lsof`/`fuser` see processes that `rocm-smi --showpids` misses
+        # (notably zombies and processes outside our PID namespace).
+        echo "Sending SIGTERM to processes holding GPU device files..."
+        kill_processes_holding_gpu_devices TERM
+        sleep 5
 
-            # 2c. SIGKILL anything still holding GPU device files.
-            echo "Sending SIGKILL to remaining holders..."
-            kill_processes_holding_gpu_devices KILL
+        # 2c. SIGKILL anything still holding GPU device files.
+        echo "Sending SIGKILL to remaining holders..."
+        kill_processes_holding_gpu_devices KILL
 
-            # 2d. Best-effort: also kill anything `rocm-smi --showpids` reports.
-            rocm-smi --showpids 2>/dev/null | grep 'PID:' | awk '{print $2}' \
-                | xargs -r kill -9 2>/dev/null || true
+        # 2d. Best-effort: also kill anything `rocm-smi --showpids` reports.
+        rocm-smi --showpids 2>/dev/null | grep 'PID:' | awk '{print $2}' \
+            | xargs -r kill -9 2>/dev/null || true
 
-            echo "Waiting 30 seconds for VRAM to clear..."
-            sleep 30
-        fi
+        echo "Waiting 30 seconds for VRAM to clear..."
+        sleep 30
 
         # Step 3: re-check.
         echo "Checking VRAM status..."
@@ -210,15 +234,21 @@ ensure_vram_clear() {
             return 0
         else
             echo "✗ VRAM still not clear after attempt $((retry_count + 1))"
+            # Step 4: dump diagnostics on every failed attempt so the next
+            # attempt's logs already explain WHY cleanup didn't work.
+            # Without this we'd only see what's holding the GPU at the very
+            # end, which makes triage much harder.
+            echo "--- Diagnostics for failed attempt $((retry_count + 1)) ---"
+            dump_gpu_diagnostics
+            echo "--- End of diagnostics for attempt $((retry_count + 1)) ---"
             retry_count=$((retry_count + 1))
         fi
     done
 
-    # Failed after all retries — dump everything we know about who is using
-    # the GPU so the runner owner can decide whether to reboot the node.
+    # Failed after all retries — diagnostics for the last attempt were
+    # already dumped above; just print the actionable hint.
     echo "=== FAILED: VRAM cleanup unsuccessful after $max_retries attempts ==="
-    dump_gpu_diagnostics
-
+    echo "(See diagnostics above for the final attempt.)"
     echo "=================================================================="
     echo "Hint: if no host process / container holds the GPU but VRAM is"
     echo "still allocated, this is almost certainly a zombie KFD context"
