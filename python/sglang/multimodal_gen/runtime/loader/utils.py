@@ -182,11 +182,18 @@ class skip_init_modules:
         for cls in (nn.Linear, nn.Conv1d, nn.Conv2d, nn.Conv3d):
             self._orig_reset[cls] = cls.reset_parameters
             cls.reset_parameters = lambda self: None  # skip init
+        from transformers.modeling_utils import PreTrainedModel
+
+        self._orig_transformers_post_init = PreTrainedModel.post_init
+        PreTrainedModel.post_init = lambda self: None
 
     def __exit__(self, exc_type, exc_value, traceback):
         # restore originals
         for cls, orig in self._orig_reset.items():
             cls.reset_parameters = orig
+        from transformers.modeling_utils import PreTrainedModel
+
+        PreTrainedModel.post_init = self._orig_transformers_post_init
 
 
 def _normalize_component_type(module_type: str) -> str:
