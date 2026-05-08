@@ -28,6 +28,7 @@ from sglang.srt.entrypoints.openai.serving_chat import (
     normalize_tool_content,
 )
 from sglang.srt.managers.io_struct import GenerateReqInput
+from sglang.srt.managers.template_detection import ReasoningToggleConfig
 from sglang.srt.utils import get_or_create_event_loop
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -45,7 +46,7 @@ class _MockTokenizerManager:
             reasoning_parser=None,
             stream_response_default_include_usage=False,
         )
-        # Mock hf_config for _use_dpsk_v32_encoding check
+        # Mock hf_config for _resolve_chat_encoding_spec check
         mock_hf_config = Mock()
         mock_hf_config.architectures = ["LlamaForCausalLM"]
         self.model_config.hf_config = mock_hf_config
@@ -86,6 +87,8 @@ class _MockTemplateManager:
         self.chat_template_name: Optional[str] = "llama-3"
         self.jinja_template_content_format: Optional[str] = None
         self.completion_template_name: Optional[str] = None
+        self.reasoning_config = None
+        self.force_reasoning = False
 
 
 class ServingChatTestCase(unittest.TestCase):
@@ -682,21 +685,204 @@ class ServingChatTestCase(unittest.TestCase):
         mock_hf_config.architectures = ["DeepseekV32ForCausalLM"]
         tm.model_config.hf_config = mock_hf_config
 
-        # Case 1: No chat template + DeepSeek V3.2 arch -> should use dpsk encoding
+        # Case 1: No chat template + DeepSeek V3.2 arch -> should use dsv32 encoding
         tm.tokenizer.chat_template = None
         serving_chat = OpenAIServingChat(tm, TemplateManager())
-        self.assertTrue(serving_chat.use_dpsk_v32_encoding)
+        self.assertEqual(serving_chat.chat_encoding_spec, "dsv32")
 
-        # Case 2: Chat template exists -> should NOT use dpsk encoding
+        # Case 2: Chat template exists -> should NOT use dsv32 encoding
         tm.tokenizer.chat_template = "some template"
         serving_chat = OpenAIServingChat(tm, TemplateManager())
-        self.assertFalse(serving_chat.use_dpsk_v32_encoding)
+        self.assertIsNone(serving_chat.chat_encoding_spec)
 
-        # Case 3: Not DeepSeek V3.2 architecture -> should NOT use dpsk encoding
+        # Case 3: Not DeepSeek V3.2 architecture -> should NOT use dsv32 encoding
         tm.tokenizer.chat_template = None
         mock_hf_config.architectures = ["LlamaForCausalLM"]
         serving_chat = OpenAIServingChat(tm, TemplateManager())
-        self.assertFalse(serving_chat.use_dpsk_v32_encoding)
+        self.assertIsNone(serving_chat.chat_encoding_spec)
+
+        # Case 4: DeepseekV4 arch -> always dsv4, even with chat_template
+        # (release ships a stale V3 jinja we deliberately override).
+        mock_hf_config.architectures = ["DeepseekV4ForCausalLM"]
+        tm.tokenizer.chat_template = "stale v3 jinja"
+        serving_chat = OpenAIServingChat(tm, TemplateManager())
+        self.assertEqual(serving_chat.chat_encoding_spec, "dsv4")
+
+        tm.tokenizer.chat_template = None
+        serving_chat = OpenAIServingChat(tm, TemplateManager())
+        self.assertEqual(serving_chat.chat_encoding_spec, "dsv4")
+
+    # ------------- dsv4 task + latest_reminder -------------
+    def test_dsv4_task_field_schema(self):
+        """Top-level `task` accepts the 6 DS task tokens and rejects others."""
+        for valid in ("action", "query", "authority", "domain", "title", "read_url"):
+            req = ChatCompletionRequest(
+                model="x",
+                messages=[{"role": "user", "content": "hi"}],
+                task=valid,
+            )
+            self.assertEqual(req.task, valid)
+
+        # None / unset is fine
+        self.assertIsNone(self.basic_req.task)
+
+        # Bogus value rejected at validation time
+        from pydantic import ValidationError
+
+        with self.assertRaises(ValidationError):
+            ChatCompletionRequest(
+                model="x",
+                messages=[{"role": "user", "content": "hi"}],
+                task="bogus",
+            )
+
+    def test_latest_reminder_role_accepted(self):
+        """`latest_reminder` is a first-class message role on generic param."""
+        from sglang.srt.entrypoints.openai.protocol import (
+            ChatCompletionMessageGenericParam,
+        )
+
+        msg = ChatCompletionMessageGenericParam(
+            role="latest_reminder", content="Be terse."
+        )
+        self.assertEqual(msg.role, "latest_reminder")
+
+        # Full request with reminder before user parses cleanly.
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[
+                {"role": "latest_reminder", "content": "Be terse."},
+                {"role": "user", "content": "Hi"},
+            ],
+        )
+        self.assertEqual(req.messages[0].role, "latest_reminder")
+        self.assertEqual(req.messages[1].role, "user")
+
+    def test_attach_task_to_last_user_message(self):
+        """Helper attaches task to the nearest user/developer message."""
+        from sglang.srt.entrypoints.openai import encoding_dsv4
+
+        messages = [{"role": "user", "content": "Hi"}]
+        encoding_dsv4.attach_task_to_last_user_message(messages, "domain")
+        self.assertEqual(messages[0]["task"], "domain")
+
+        # Prefers the LAST user message across a multi-turn conversation.
+        messages = [
+            {"role": "user", "content": "first"},
+            {"role": "assistant", "content": "ok"},
+            {"role": "user", "content": "second"},
+        ]
+        encoding_dsv4.attach_task_to_last_user_message(messages, "query")
+        self.assertNotIn("task", messages[0])
+        self.assertEqual(messages[2]["task"], "query")
+
+        # `developer` role is treated like `user` (matches encoder semantics).
+        messages = [{"role": "developer", "content": "dev"}]
+        encoding_dsv4.attach_task_to_last_user_message(messages, "authority")
+        self.assertEqual(messages[0]["task"], "authority")
+
+        # No user/developer present -> raises.
+        with self.assertRaises(ValueError):
+            encoding_dsv4.attach_task_to_last_user_message(
+                [{"role": "system", "content": "s"}], "domain"
+            )
+
+    def test_dsv4_content_parts_list_normalized(self):
+        """OpenAI list-of-parts content flattens to text before reaching the encoder."""
+        from sglang.srt.entrypoints.openai import encoding_dsv4
+        from sglang.srt.parser.jinja_template_utils import (
+            process_content_for_template_format,
+        )
+
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[
+                {
+                    "role": "user",
+                    "content": [{"type": "text", "text": "say hi"}],
+                }
+            ],
+        )
+        messages = [m.model_dump() for m in req.messages]
+        # Mirror the boundary normalization _process_messages does for any
+        # non-None chat_encoding_spec.
+        for i, msg in enumerate(messages):
+            if isinstance(msg.get("content"), list):
+                messages[i] = process_content_for_template_format(
+                    msg, "string", [], [], [], []
+                )
+        out = encoding_dsv4.encode_messages(messages, thinking_mode="chat")
+        self.assertIn("<｜User｜>say hi", out)
+
+        # Multiple text parts concat with single space; non-text parts dropped.
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "describe"},
+                    {"type": "image_url", "image_url": {"url": "x"}},
+                ],
+            }
+        ]
+        for i, msg in enumerate(messages):
+            if isinstance(msg.get("content"), list):
+                messages[i] = process_content_for_template_format(
+                    msg, "string", [], [], [], []
+                )
+        out = encoding_dsv4.encode_messages(messages, thinking_mode="chat")
+        self.assertIn("<｜User｜>describe", out)
+        self.assertNotIn("image_url", out)
+
+    def test_dsv4_task_and_reminder_encode_end_to_end(self):
+        """Task + latest_reminder plumb through to the dsv4 encoder correctly."""
+        from sglang.srt.entrypoints.openai import encoding_dsv4
+
+        # 1) task='domain' in chat mode -> `<｜domain｜>` appended, no Assistant
+        #    prefix (this is a single-shot classification, not a chat turn).
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "What is SGLang?"}],
+            task="domain",
+        )
+        messages = [m.model_dump() for m in req.messages]
+        encoding_dsv4.attach_task_to_last_user_message(messages, req.task)
+        out = encoding_dsv4.encode_messages(messages, thinking_mode="chat")
+        self.assertIn("<｜domain｜>", out)
+        self.assertTrue(out.rstrip().endswith("<｜domain｜>"))
+        self.assertNotIn("<｜Assistant｜>", out)
+
+        # 2) task='action' in thinking mode -> Assistant + <think> + <｜action｜>
+        #    (action is the one task that still runs a reasoning pass).
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi"}],
+            task="action",
+        )
+        messages = [m.model_dump() for m in req.messages]
+        encoding_dsv4.attach_task_to_last_user_message(messages, req.task)
+        out = encoding_dsv4.encode_messages(messages, thinking_mode="thinking")
+        self.assertIn("<｜Assistant｜>", out)
+        self.assertIn("<think>", out)
+        self.assertTrue(out.rstrip().endswith("<｜action｜>"))
+
+        # 3) latest_reminder preceding user -> reminder renders before user,
+        #    Assistant prefix still comes after user.
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[
+                {"role": "latest_reminder", "content": "Be terse."},
+                {"role": "user", "content": "Hello"},
+            ],
+        )
+        messages = [m.model_dump() for m in req.messages]
+        out = encoding_dsv4.encode_messages(messages, thinking_mode="chat")
+        self.assertIn("<｜latest_reminder｜>Be terse.", out)
+        self.assertIn("<｜User｜>Hello", out)
+        self.assertLess(
+            out.index("<｜latest_reminder｜>"),
+            out.index("<｜User｜>"),
+        )
+        self.assertIn("<｜Assistant｜>", out)
 
     def test_streaming_abort_yields_error(self):
         """Test that an abort finish reason during streaming correctly yields an error and stops."""
@@ -774,6 +960,126 @@ class ServingChatTestCase(unittest.TestCase):
         # Check that there is an error chunk and a DONE chunk
         self.assertEqual(len(chunks), 2)
         self.assertIn("error", chunks[0])
+
+    def test_non_streaming_cached_tokens_details_emits_sglext(self):
+        """Test that non-streaming chat responses emit cached token details in sglext."""
+
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi?"}],
+            max_tokens=100,
+            return_cached_tokens_details=True,
+        )
+        ret = [
+            {
+                "text": "Cached response",
+                "meta_info": {
+                    "id": "chatcmpl-cache-test",
+                    "prompt_tokens": 10,
+                    "completion_tokens": 2,
+                    "cached_tokens": 6,
+                    "cached_tokens_details": {
+                        "device": 4,
+                        "host": 1,
+                        "storage": 1,
+                        "storage_backend": "file",
+                    },
+                    "finish_reason": {"type": "stop", "matched": None},
+                    "weight_version": "default",
+                },
+            }
+        ]
+
+        response = self.chat._build_chat_response(req, ret, 1234567890)
+
+        self.assertIsNotNone(response.sglext)
+        self.assertEqual(
+            response.sglext.cached_tokens_details.model_dump(exclude_none=True),
+            {
+                "device": 4,
+                "host": 1,
+                "storage": 1,
+                "storage_backend": "file",
+            },
+        )
+
+    def test_streaming_cached_tokens_details_emits_sglext(self):
+        """Test that streaming chat responses emit cached token details in sglext."""
+
+        async def _mock_generate_with_cached_tokens_details():
+            yield {
+                "text": "Cached response",
+                "meta_info": {
+                    "id": "chatcmpl-cache-test",
+                    "prompt_tokens": 10,
+                    "completion_tokens": 2,
+                    "cached_tokens": 6,
+                    "cached_tokens_details": {
+                        "device": 4,
+                        "host": 1,
+                        "storage": 1,
+                        "storage_backend": "file",
+                    },
+                    "finish_reason": {"type": "stop", "matched": None},
+                    "output_token_logprobs": None,
+                    "output_top_logprobs": None,
+                },
+                "index": 0,
+            }
+
+        self.tm.generate_request.return_value = (
+            _mock_generate_with_cached_tokens_details()
+        )
+
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi?"}],
+            max_tokens=100,
+            stream=True,
+            return_cached_tokens_details=True,
+        )
+
+        with patch(
+            "sglang.srt.entrypoints.openai.serving_chat.generate_chat_conv"
+        ) as conv_mock:
+            conv_ins = Mock()
+            conv_ins.get_prompt.return_value = "Test prompt"
+            conv_mock.return_value = conv_ins
+
+            adapted_request, _ = self.chat._convert_to_internal_request(
+                req, self.fastapi_request
+            )
+
+            async def run_stream():
+                chunks = []
+                async for chunk in self.chat._generate_chat_stream(
+                    adapted_request, req, self.fastapi_request
+                ):
+                    chunks.append(chunk)
+                return chunks
+
+        loop = get_or_create_event_loop()
+        chunks = loop.run_until_complete(run_stream())
+
+        sglext_chunks = []
+        for chunk in chunks:
+            if not chunk.startswith("data: ") or chunk.strip() == "data: [DONE]":
+                continue
+            data = json.loads(chunk[len("data: ") :])
+            if "sglext" in data:
+                sglext_chunks.append(data)
+
+        self.assertEqual(len(sglext_chunks), 1)
+        self.assertEqual(sglext_chunks[0]["choices"], [])
+        self.assertEqual(
+            sglext_chunks[0]["sglext"]["cached_tokens_details"],
+            {
+                "device": 4,
+                "host": 1,
+                "storage": 1,
+                "storage_backend": "file",
+            },
+        )
 
     # ------------- incremental streaming output tests -------------
     def test_incremental_streaming_output_delta(self):
@@ -918,6 +1224,175 @@ class ServingChatTestCase(unittest.TestCase):
             with self.subTest(effort=effort):
                 req.reasoning_effort = effort
                 self.assertEqual(chat._get_reasoning_from_request(req), expected)
+
+    # ------------- reasoning config tests -------------
+    def test_get_reasoning_from_request_default_true_toggle(self):
+        self.tm.server_args.reasoning_parser = "qwen3"
+        self.chat.reasoning_parser = "qwen3"
+        self.template_manager.reasoning_config = ReasoningToggleConfig(
+            toggle_param="enable_thinking", default_enabled=True
+        )
+
+        enabled_by_default = ChatCompletionRequest(
+            model="x", messages=[{"role": "user", "content": "Hi?"}]
+        )
+        disabled_explicitly = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi?"}],
+            chat_template_kwargs={"enable_thinking": False},
+        )
+
+        self.assertTrue(self.chat._get_reasoning_from_request(enabled_by_default))
+        self.assertFalse(self.chat._get_reasoning_from_request(disabled_explicitly))
+
+    def test_get_reasoning_from_request_default_false_toggle(self):
+        self.tm.server_args.reasoning_parser = "deepseek-v3"
+        self.chat.reasoning_parser = "deepseek-v3"
+        self.template_manager.reasoning_config = ReasoningToggleConfig(
+            toggle_param="thinking", default_enabled=False
+        )
+
+        disabled_by_default = ChatCompletionRequest(
+            model="x", messages=[{"role": "user", "content": "Hi?"}]
+        )
+        enabled_explicitly = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi?"}],
+            chat_template_kwargs={"thinking": True},
+        )
+
+        self.assertFalse(self.chat._get_reasoning_from_request(disabled_by_default))
+        self.assertTrue(self.chat._get_reasoning_from_request(enabled_explicitly))
+
+    def test_get_reasoning_from_request_special_cases(self):
+        self.tm.server_args.reasoning_parser = "mistral"
+        self.chat.reasoning_parser = "mistral"
+        req = ChatCompletionRequest(
+            model="x", messages=[{"role": "user", "content": "Hi?"}]
+        )
+
+        self.template_manager.reasoning_config = ReasoningToggleConfig(
+            special_case="always"
+        )
+        self.assertTrue(self.chat._get_reasoning_from_request(req))
+
+        self.template_manager.reasoning_config = ReasoningToggleConfig(
+            special_case="mistral"
+        )
+        self.assertFalse(self.chat._get_reasoning_from_request(req))
+        req.reasoning_effort = "medium"
+        self.assertTrue(self.chat._get_reasoning_from_request(req))
+
+    # --- fallback path tests (config=None, uses reasoning_default) ---
+
+    def _setup_fallback(self, parser_name):
+        """Set up reasoning with config=None to exercise the fallback path."""
+        self.tm.server_args.reasoning_parser = parser_name
+        self.chat = OpenAIServingChat(self.tm, self.template_manager)
+        self.chat.reasoning_parser = parser_name
+        self.template_manager.reasoning_config = None
+
+    def test_fallback_always_mode(self):
+        self._setup_fallback("deepseek-r1")
+        req = ChatCompletionRequest(
+            model="x", messages=[{"role": "user", "content": "Hi?"}]
+        )
+        self.assertTrue(self.chat._get_reasoning_from_request(req))
+
+    def test_fallback_mistral_mode(self):
+        self._setup_fallback("mistral")
+        req_no_effort = ChatCompletionRequest(
+            model="x", messages=[{"role": "user", "content": "Hi?"}]
+        )
+        self.assertFalse(self.chat._get_reasoning_from_request(req_no_effort))
+
+        req_with_effort = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi?"}],
+            reasoning_effort="high",
+        )
+        self.assertTrue(self.chat._get_reasoning_from_request(req_with_effort))
+
+    def test_fallback_enable_thinking_mode_default_on(self):
+        self._setup_fallback("qwen3")
+        req_default = ChatCompletionRequest(
+            model="x", messages=[{"role": "user", "content": "Hi?"}]
+        )
+        self.assertTrue(self.chat._get_reasoning_from_request(req_default))
+
+        req_disabled = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi?"}],
+            chat_template_kwargs={"enable_thinking": False},
+        )
+        self.assertFalse(self.chat._get_reasoning_from_request(req_disabled))
+
+    def test_fallback_explicit_thinking_mode_default_off(self):
+        self._setup_fallback("deepseek-v3")
+        req_default = ChatCompletionRequest(
+            model="x", messages=[{"role": "user", "content": "Hi?"}]
+        )
+        self.assertFalse(self.chat._get_reasoning_from_request(req_default))
+
+        req_enabled = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi?"}],
+            chat_template_kwargs={"thinking": True},
+        )
+        self.assertTrue(self.chat._get_reasoning_from_request(req_enabled))
+
+    def test_fallback_explicit_enable_thinking_mode_default_off(self):
+        self._setup_fallback("mimo")
+        req_default = ChatCompletionRequest(
+            model="x", messages=[{"role": "user", "content": "Hi?"}]
+        )
+        self.assertFalse(self.chat._get_reasoning_from_request(req_default))
+
+        req_enabled = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi?"}],
+            chat_template_kwargs={"enable_thinking": True},
+        )
+        self.assertTrue(self.chat._get_reasoning_from_request(req_enabled))
+
+    def test_fallback_no_detector_returns_false(self):
+        self.chat.reasoning_parser = "qwen3"
+        self.chat._reasoning_detector = None
+        self.template_manager.reasoning_config = None
+        req = ChatCompletionRequest(
+            model="x", messages=[{"role": "user", "content": "Hi?"}]
+        )
+        self.assertFalse(self.chat._get_reasoning_from_request(req))
+
+    def test_build_chat_response_qwen3_thinking_forces_reasoning(self):
+        self.tm.server_args.reasoning_parser = "qwen3-thinking"
+        self.chat.reasoning_parser = "qwen3-thinking"
+        self.template_manager.reasoning_config = ReasoningToggleConfig(
+            toggle_param="enable_thinking", default_enabled=True
+        )
+
+        req = ChatCompletionRequest(
+            model="Qwen/Qwen3-0.6B",
+            messages=[{"role": "user", "content": "Hi?"}],
+            separate_reasoning=True,
+            chat_template_kwargs={"enable_thinking": False},
+        )
+        ret_item = {
+            "text": "42",
+            "meta_info": {
+                "id": f"chatcmpl-{uuid.uuid4()}",
+                "prompt_tokens": 10,
+                "completion_tokens": 1,
+                "weight_version": "default",
+                "finish_reason": {"type": "stop", "matched": None},
+            },
+            "index": 0,
+        }
+
+        response = self.chat._build_chat_response(req, [ret_item], created=0)
+        msg = response.choices[0].message
+        self.assertIsNone(msg.content)
+        self.assertEqual(msg.reasoning_content, "42")
 
 
 class TestProcessToolCallsWithRequiredToolChoice(unittest.TestCase):

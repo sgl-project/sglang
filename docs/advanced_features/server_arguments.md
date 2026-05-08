@@ -119,6 +119,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--modelopt-export-path` | Path to export the quantized model in HuggingFace format after ModelOpt quantization. The exported model can then be used directly with SGLang for inference. If not provided, the model will not be exported. | `None` | Type: str |
 | `--quantize-and-serve` | Quantize the model with ModelOpt and immediately serve it without exporting. This is useful for development and prototyping. For production, it's recommended to use separate quantization and deployment steps. | `False` | bool flag (set to enable) |
 | `--rl-quant-profile` | Path to the FlashRL quantization profile. Required when using --load-format flash_rl. | `None` | Type: str |
+| `--enable-quant-communications` | Enable INT8 quantization of TP communications (Supported only for NPU for Qwen3 series). | `False` | bool flag (set to enable) |
 
 ## Memory and scheduling
 | Argument | Description | Defaults | Options |
@@ -257,6 +258,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--lora-eviction-policy` | LoRA adapter eviction policy when the GPU memory pool is full. | `lru` | `lru`, `fifo` |
 | `--lora-backend` | Choose the kernel backend for multi-LoRA serving. | `csgmv` | `triton`, `csgmv`, `ascend`, `torch_native` |
 | `--max-lora-chunk-size` | Maximum chunk size for the ChunkedSGMV LoRA backend. Only used when `--lora-backend` is `csgmv`. Larger values may improve performance. | `16` | `16`, `32`, `64`, `128` |
+| `--lora-drain-wait-threshold` | When any LoRA adapter request waits longer than this threshold (in seconds), the scheduler will selectively drain one running adapter to make room. This mitigates extreme tail latency under high or skewed workloads by preventing a small set of adapters from monopolizing batch slots. Set to 0 to disable draining (default). | `0.0` | Type: float |
 
 ## Kernel Backends (Attention, Sampling, Grammar, GEMM)
 | Argument | Description | Defaults | Options |
