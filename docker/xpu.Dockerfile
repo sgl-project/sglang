@@ -66,6 +66,8 @@ RUN --mount=type=secret,id=github_token \
     cp pyproject_xpu.toml pyproject.toml && \
     pip install . --extra-index-url https://download.pytorch.org/whl/xpu && \
     pip install --no-deps xgrammar==0.1.33 && \
+    # index will change after torch 2.12 release
+    pip install triton-xpu --index-url https://download.pytorch.org/whl/test/xpu && \
     pip install msgspec blake3 py-cpuinfo compressed_tensors gguf partial_json_parser einops tabulate --root-user-action=ignore && \
     conda install libsqlite=3.48.0 -y && \
     # Add environment setup commands to .bashrc again (in case it was overwritten)

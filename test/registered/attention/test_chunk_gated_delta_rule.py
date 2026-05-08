@@ -6,6 +6,7 @@ from sglang.srt.layers.attention.fla.chunk import chunk_gated_delta_rule
 from sglang.srt.layers.attention.fla.fused_recurrent import (
     fused_recurrent_gated_delta_rule,
 )
+from sglang.srt.utils import get_device
 from sglang.test.ci.ci_register import register_cuda_ci, register_xpu_ci
 
 register_cuda_ci(est_time=11, suite="stage-b-test-1-gpu-large")
@@ -13,7 +14,7 @@ register_xpu_ci(est_time=30, suite="xpu")
 
 
 @unittest.skipIf(
-    not torch.cuda.is_available() and not torch.xpu.is_available(),
+    not (torch.cuda.is_available() or torch.xpu.is_available()),
     "Test requires CUDA or XPU",
 )
 class TestChunkGatedDeltaRule(unittest.TestCase):
@@ -72,7 +73,7 @@ class TestChunkGatedDeltaRule(unittest.TestCase):
         self, B, T_per_seq, H, K, V, pool_size, sequential_indices=False, seed=42
     ):
         """Run correctness check for one (B, T_per_seq, H, K, V, pool_size) config."""
-        device = "cuda" if torch.cuda.is_available() else "xpu"
+        device = get_device()
         dtype = torch.bfloat16
         T = B * T_per_seq
 
