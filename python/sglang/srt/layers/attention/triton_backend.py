@@ -31,28 +31,15 @@ if TYPE_CHECKING:
 
 _MLA_DECODE_MIN_BLOCK_KV = 32
 
-# Memory budget for the MLA decode `attn_logits` buffer
-# (cuda_graph_max_bs, num_head, max_kv_splits, v_head_dim) float32.
-# The original #20479 cap (next_power_of_2(sm_count)) ignored buffer
-# size and blew this up to ~2 GB on Kimi-K2.6 + MI325, faulting ROCm
-# during CUDA graph capture/replay (R73 nightly-8-gpu-kimi-k26 hang).
-_MLA_ATTN_LOGITS_BUDGET_BYTES = 512 * 1024 * 1024
-
 
 def _mla_decode_kv_splits_cap(
-    base_max_kv_splits: int,
-    sm_count: int,
-    max_context_len: int,
-    mem_cap: Optional[int] = None,
+    base_max_kv_splits: int, sm_count: int, max_context_len: int
 ) -> int:
     if sm_count <= 0:
         return base_max_kv_splits
     sm_cap = next_power_of_2(sm_count)
     ctx_cap = next_power_of_2(triton.cdiv(max_context_len, _MLA_DECODE_MIN_BLOCK_KV))
-    cap = min(sm_cap, ctx_cap)
-    if mem_cap is not None and mem_cap > 0:
-        cap = min(cap, 1 << (mem_cap.bit_length() - 1))  # floor power of 2
-    return max(base_max_kv_splits, cap)
+    return max(base_max_kv_splits, min(sm_cap, ctx_cap))
 
 
 def logit_capping_mod(logit_capping_method, logit_cap):
@@ -156,18 +143,19 @@ class TritonAttnBackend(AttentionBackend):
         )
         self.max_kv_splits = model_runner.server_args.triton_attention_num_kv_splits
         if self.use_mla:
-            cuda_graph_max_bs = model_runner.server_args.cuda_graph_max_bs or 0
-            per_split_bytes = cuda_graph_max_bs * self.num_head * self.v_head_dim * 4
-            mem_cap = (
-                _MLA_ATTN_LOGITS_BUDGET_BYTES // per_split_bytes
-                if per_split_bytes > 0
-                else None
-            )
             self.max_kv_splits = _mla_decode_kv_splits_cap(
                 self.max_kv_splits,
                 self.device_core_count,
                 self.max_context_len,
-                mem_cap=mem_cap,
+            )
+            # Cap so the attn_logits float32 buffer stays ≤ 512 MB
+            # (bs * num_head * max_kv_splits * v_head_dim * 4); the original
+            # #20479 cap blew this to ~2 GB on Kimi-K2.6 + MI325 and faulted
+            # ROCm CUDA-graph capture/replay (R73 nightly hang).
+            bs = model_runner.server_args.cuda_graph_max_bs or 1
+            self.max_kv_splits = min(
+                self.max_kv_splits,
+                max(1, (512 << 20) // (bs * self.num_head * self.v_head_dim * 4)),
             )
         self.use_pdl = is_arch_support_pdl()
 
