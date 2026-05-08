@@ -443,7 +443,14 @@ class TestPrefillAdder(CustomTestCase):
         self.assertEqual(result3, AddReqResult.OTHER)
 
     def _build_hybrid_swa_chunked_req(
-        self, *, page_size, rem_swa, rem_chunk=2048, extend_input_len=500
+        self,
+        *,
+        page_size,
+        rem_swa,
+        rem_chunk=2048,
+        prefix_len=0,
+        cache_protected_len=None,
+        extend_input_len=500,
     ):
         self.mock_token_allocator.swa_available_size.return_value = rem_swa
         self.mock_token_allocator.full_available_size.return_value = 100_000
@@ -458,9 +465,16 @@ class TestPrefillAdder(CustomTestCase):
 
         req = self.create_mock_req("chunked", priority=0, max_new_tokens=128)
         req.extend_input_len = extend_input_len
-        req.prefix_indices = []
-        req.fill_ids = list(range(extend_input_len))
-        req.set_extend_input_len = MagicMock()
+        req.prefix_indices = list(range(prefix_len))
+        req.cache_protected_len = (
+            prefix_len if cache_protected_len is None else cache_protected_len
+        )
+        req.fill_ids = list(range(prefix_len + extend_input_len))
+
+        def set_extend_input_len(value):
+            req.extend_input_len = value
+
+        req.set_extend_input_len = MagicMock(side_effect=set_extend_input_len)
         return adder, req
 
     def test_add_chunked_req_hybrid_swa_reserves_page_for_alloc_extend(self):
@@ -484,19 +498,41 @@ class TestPrefillAdder(CustomTestCase):
 
     def test_add_chunked_req_hybrid_swa_defers_when_swa_below_page(self):
         # When rem_swa_tokens <= page_size there is no room to serve even the
-        # reservation, so the chunked req must be deferred (returned unchanged)
-        # instead of falling back to rem_chunk_tokens and bypassing SWA budget.
+        # reservation, so the chunked req must be deferred instead of falling
+        # back to rem_chunk_tokens and bypassing SWA budget.
         PAGE_SIZE = 64
         adder, req = self._build_hybrid_swa_chunked_req(
             page_size=PAGE_SIZE, rem_swa=PAGE_SIZE
         )
-        original_len = req.extend_input_len
 
         result = adder.add_chunked_req(req)
 
         self.assertIs(result, req)
-        req.set_extend_input_len.assert_not_called()
-        self.assertEqual(req.extend_input_len, original_len)
+        self.assertEqual(len(adder.can_run_list), 0)
+
+    def test_add_chunked_req_hybrid_swa_deferral_keeps_only_computed_prefix(self):
+        PAGE_SIZE = 64
+        PREFIX_LEN = PAGE_SIZE * 2
+        CACHE_PROTECTED_LEN = PAGE_SIZE
+        UNCOMPUTED_TAIL_LEN = PAGE_SIZE * 4
+        adder, req = self._build_hybrid_swa_chunked_req(
+            page_size=PAGE_SIZE,
+            rem_swa=PAGE_SIZE,
+            prefix_len=PREFIX_LEN,
+            cache_protected_len=CACHE_PROTECTED_LEN,
+            extend_input_len=UNCOMPUTED_TAIL_LEN,
+        )
+        req.fill_ids = [10_000 + i * 7 for i in range(PREFIX_LEN + UNCOMPUTED_TAIL_LEN)]
+        computed_fill_ids = req.fill_ids[:PREFIX_LEN]
+        self.assertEqual(len(req.fill_ids), PREFIX_LEN + UNCOMPUTED_TAIL_LEN)
+        self.assertLess(req.cache_protected_len, len(req.prefix_indices))
+
+        result = adder.add_chunked_req(req)
+
+        self.assertIs(result, req)
+        req.set_extend_input_len.assert_called_once_with(0)
+        self.assertEqual(req.extend_input_len, 0)
+        self.assertEqual(req.fill_ids, computed_fill_ids)
         self.assertEqual(len(adder.can_run_list), 0)
 
 

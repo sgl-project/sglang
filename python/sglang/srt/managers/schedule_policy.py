@@ -661,6 +661,11 @@ class PrefillAdder:
             # Therefore, in certain cases where _rem_tokens <= 0, it should be replaced with rem_chunk_tokens.
             if _rem_tokens <= 0:
                 if self.is_hybrid_swa:
+                    # init_next_round_input may have expanded fill_ids beyond
+                    # the committed prefix. This req will be stashed before it
+                    # is scheduled again, so keep only computed tokens here.
+                    req.fill_ids = req.fill_ids[: len(req.prefix_indices)]
+                    req.set_extend_input_len(0)
                     return req
                 _rem_tokens = self.rem_chunk_tokens
 
