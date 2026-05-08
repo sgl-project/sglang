@@ -2864,15 +2864,26 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             num_kv_heads_global=num_kv_heads_global,
         )
 
-        # Selection-kernel capacity check: warn when (num_blocks * k_block) or
-        # union candidates exceed the single-program in-program-sort budget.
-        # Doesn't error — the chunked merge/union paths are an implementer
-        # escape hatch (v1.1.x). At v1.1 ship time we expect users to stay
-        # under the threshold via knob tuning.
+        # Selection-kernel capacity check: fail at startup when
+        # (num_blocks * k_block) or union candidates exceed the single-
+        # program in-program-sort budget. The runtime path raises in
+        # `ds_select_stage2_merge` / `ds_union_per_batch` for these
+        # configs, and (separately) the kernel can hang silently inside
+        # CUDA-graph capture when violated. Either way the misconfig is
+        # always-fatal at first decode — surface it now rather than
+        # mid-serving. The chunked merge/union paths (v1.1.x) will lift
+        # this; until then, lower token_budget / k_block, or raise block_t.
         max_ctx = self.req_to_token_pool.req_to_token.shape[1]
         num_kv_heads_local = num_kv_heads_global // self.tp_size
-        for warning in runtime_cfg.warn_capacity(max_ctx, num_kv_heads_local):
-            logger.warning("Double Sparsity capacity warning: %s", warning)
+        capacity_warnings = runtime_cfg.warn_capacity(max_ctx, num_kv_heads_local)
+        if capacity_warnings:
+            raise RuntimeError(
+                "Double Sparsity capacity guard tripped at startup; the "
+                "configured (block_t, k_block, token_budget) cannot be "
+                "served by the single-program merge/union kernels (chunked "
+                "paths land in v1.1.x). Details:\n  - "
+                + "\n  - ".join(capacity_warnings)
+            )
 
         sparse_config = parse_double_sparsity_config(self.server_args)
         # SparseCoordinator's RequestTrackers ctor requires an int.
