@@ -187,6 +187,80 @@ class TestUnionScoreAware(CustomTestCase):
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
+class TestUnionDedupCorrectness(CustomTestCase):
+    """When the same logical token appears across ≥3 kv-head slots, the
+    union must emit it AT MOST ONCE, keeping the max score across heads.
+    A two-pass adjacent-neighbor mask over a sort-by-logical run fails
+    on non-monotone score sequences (e.g. [10, 5, 9]) — it leaves both
+    10 and 9 alive, FA3 gets a duplicate page-table entry, and
+    `valid_lengths` overcounts. The CUDA sort is non-stable for equal
+    keys so the failure is non-deterministic per call; fuzz with many
+    seeded inputs to expose it."""
+
+    def test_no_duplicate_logicals_under_collisions(self):
+        device = torch.device("cuda")
+        bs = 1
+        h_kv = 8
+        effective_budget = 4  # 32 slots total
+        max_selected = 32
+        sink, recent = 0, 0
+        seq_lens = torch.tensor([1000], dtype=torch.int64, device=device)
+
+        # Construct heavy-collision inputs: 32 candidate slots, but only
+        # 4 distinct logical tokens. Each token appears in 8 different
+        # (kv_head, slot) positions with random scores. After dedup,
+        # the output should contain each of the 4 logicals AT MOST ONCE.
+        n_distinct = 4
+        n_iters = 100  # enough seeds to expose any sort permutation
+        for seed in range(n_iters):
+            g = torch.Generator(device=device).manual_seed(seed)
+            slot_logicals = torch.tensor(
+                [i % n_distinct + 1 for i in range(h_kv * effective_budget)],
+                dtype=torch.int32,
+                device=device,
+            ).reshape(bs, h_kv, effective_budget)
+            slot_scores = (
+                torch.rand(
+                    (bs, h_kv, effective_budget),
+                    generator=g,
+                    device=device,
+                    dtype=torch.float32,
+                )
+                * 100.0
+            )
+
+            out_log, out_valid = ds_union_per_batch(
+                merged_logical=slot_logicals,
+                merged_scores=slot_scores,
+                seq_lens=seq_lens,
+                sink_tokens=sink,
+                recent_tokens=recent,
+                min_seq_len=16,
+                max_selected_per_request=max_selected,
+            )
+
+            # No logical may appear twice in the output.
+            nonneg = [int(x) for x in out_log[0].tolist() if int(x) >= 0]
+            counts: dict[int, int] = {}
+            for x in nonneg:
+                counts[x] = counts.get(x, 0) + 1
+            duplicates = {k: v for k, v in counts.items() if v > 1}
+            self.assertFalse(
+                duplicates,
+                f"seed={seed}: union emitted duplicate logicals "
+                f"{duplicates} (FA3 page-table corruption risk)\n"
+                f"  output: {nonneg}",
+            )
+            # valid_lengths must match the non-sentinel count exactly.
+            self.assertEqual(
+                int(out_valid[0]),
+                len(nonneg),
+                f"seed={seed}: valid_lengths={int(out_valid[0])} != "
+                f"non-sentinel count={len(nonneg)}",
+            )
+
+
+@unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
 class TestUnionCapacityGuard(CustomTestCase):
     def test_exceeding_threshold_raises(self):
         device = torch.device("cuda")

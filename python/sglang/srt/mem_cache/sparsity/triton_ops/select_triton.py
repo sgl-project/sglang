@@ -828,35 +828,29 @@ def ds_union_per_batch(
     in_always = in_sink | in_recent
     flat_scr = torch.where(in_always, torch.full_like(flat_scr, NEG_INF), flat_scr)
 
-    # Dedup by logical: keep max score per (b, logical). Achieved by
-    # sorting (logical asc, score desc) and zeroing duplicates.
-    # Implementation: pack (logical, score) for stable sort. We don't
-    # need to actually dedup tightly — the topk below will pick the max-
-    # score representative naturally if the lower-score duplicates are
-    # masked out below. But to make sure topk doesn't pick the same
-    # logical twice, we set duplicate-with-lower-score to NEG_INF.
-    # Sort by logical ascending; for adjacent equal-logical pairs, mask
-    # the lower-score one to NEG_INF.
-    sorted_log, sort_perm = flat_log.sort(dim=1)  # [bs, NUM_HIST]
-    sorted_scr = torch.gather(flat_scr, 1, sort_perm)
-    # Find adjacent duplicates of the same logical.
+    # Dedup by logical: keep ONE entry per (b, logical) with the max
+    # score across kv-heads. Achieved by a two-key stable sort —
+    # (1) by score descending (stable), (2) by logical ascending
+    # (stable). After step (2), entries with the same logical are
+    # adjacent AND the max-score representative is the FIRST in each
+    # run (because step (1) put it at the top of every score-tier
+    # before step (2) preserved that order within equal-logical groups).
+    # Then any position with `same_as_prev` is a duplicate to mask.
+    #
+    # The naive single-key sort + adjacent-pair-mask is wrong for runs
+    # of length ≥3 with non-monotone scores (e.g. logical=7 with
+    # [10, 5, 9] would leave both 10 and 9 alive — confirmed by the
+    # `TestUnionDedupCorrectness` fuzzer).
+    desc_perm = (-flat_scr).argsort(dim=1, stable=True)
+    flat_log_d = torch.gather(flat_log, 1, desc_perm)
+    flat_scr_d = torch.gather(flat_scr, 1, desc_perm)
+    asc_perm = flat_log_d.argsort(dim=1, stable=True)
+    sorted_log = torch.gather(flat_log_d, 1, asc_perm)
+    sorted_scr = torch.gather(flat_scr_d, 1, asc_perm)
     same_as_prev = torch.zeros_like(sorted_log, dtype=torch.bool)
     same_as_prev[:, 1:] = sorted_log[:, 1:] == sorted_log[:, :-1]
-    # When same_as_prev: mask the LOWER-SCORE one. For simplicity, we
-    # do a 2-pass: first set duplicates' scores to NEG_INF when the
-    # neighbour has a higher score; then again with the comparison
-    # flipped. (Two passes handle 3+ runs of same logical fairly well
-    # for typical inputs; rare ties beyond that get dropped without
-    # changing correctness.)
-    higher_neighbour = torch.zeros_like(sorted_scr, dtype=torch.bool)
-    higher_neighbour[:, 1:] = (sorted_scr[:, :-1] > sorted_scr[:, 1:]) & same_as_prev[
-        :, 1:
-    ]
-    higher_neighbour[:, :-1] |= (sorted_scr[:, 1:] > sorted_scr[:, :-1]) & same_as_prev[
-        :, 1:
-    ]
     sorted_scr = torch.where(
-        higher_neighbour, torch.full_like(sorted_scr, NEG_INF), sorted_scr
+        same_as_prev, torch.full_like(sorted_scr, NEG_INF), sorted_scr
     )
 
     # Top-`history_capacity` by score.
