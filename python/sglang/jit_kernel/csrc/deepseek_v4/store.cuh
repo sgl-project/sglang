@@ -7,6 +7,8 @@
 #include <sgl_kernel/vec.cuh>
 #include <sgl_kernel/warp.cuh>
 
+#include <sgl_kernel/deepseek_v4/fp8_utils.cuh>
+
 #include <dlpack/dlpack.h>
 #include <tvm/ffi/container/tensor.h>
 
@@ -16,36 +18,16 @@
 
 namespace {
 
+using deepseek_v4::fp8::cast_to_ue8m0;
+using deepseek_v4::fp8::inv_scale_ue8m0;
+using deepseek_v4::fp8::pack_fp8;
+
 struct FusedStoreCacheParam {
   const void* __restrict__ input;
   void* __restrict__ cache;
   const void* __restrict__ indices;
   uint32_t num_tokens;
 };
-
-[[maybe_unused]]
-SGL_DEVICE int32_t cast_to_ue8m0(float x) {
-  uint32_t u = __float_as_uint(x);
-  int32_t exp = int32_t((u >> 23) & 0xFF);
-  uint32_t mant = u & 0x7FFFFF;
-  return exp + (mant != 0);
-}
-
-[[maybe_unused]]
-SGL_DEVICE float inv_scale_ue8m0(int32_t exp) {
-  return __uint_as_float((127 + 127 - exp) << 23);
-}
-
-[[maybe_unused]]
-SGL_DEVICE float fp8_e4m3_clip(float val) {
-  namespace math = device::math;
-  return math::max(math::min(val, math::FP8_E4M3_MAX), -math::FP8_E4M3_MAX);
-}
-
-[[maybe_unused]]
-SGL_DEVICE fp8x2_e4m3_t pack_fp8(float x, float y) {
-  return fp8x2_e4m3_t{fp32x2_t{fp8_e4m3_clip(x), fp8_e4m3_clip(y)}};
-}
 
 template <typename Float, typename IndicesT, uint32_t kPageBits, bool kUsePDL>
 __global__ void fused_store_flashmla_cache(const __grid_constant__ FusedStoreCacheParam param) {

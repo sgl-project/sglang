@@ -11,8 +11,11 @@ import itertools
 import json
 import logging
 import os
+import re
+import struct
 import tempfile
 from collections import defaultdict
+from pathlib import Path
 from typing import (
     Any,
     Callable,
@@ -70,6 +73,60 @@ except ImportError as e:
 logger = logging.getLogger(__name__)
 
 RUNAI_STREAMER_TENSOR_ATTR = "_sglang_runai_streamer_tensor"
+
+# Matches routed-expert weight keys in both HF-style layouts
+# (``...mlp.experts.<N>.{gate,up,down}_proj.weight``) and DeepSeek V4
+# layouts (``...ffn.experts.<N>.w{1,2,3}.weight``). ``shared_experts`` is
+# excluded because the index segment requires a digit after ``.experts.``.
+_ROUTED_EXPERT_KEY_RE = re.compile(
+    r"\.experts\.\d+\.(?:w[123]|down_proj|up_proj|gate_proj)\.weight$"
+)
+
+
+def probe_routed_expert_weight_dtype(model_path: str) -> Optional[str]:
+    """Return the safetensors dtype string (e.g. ``F8_E4M3``, ``U8``) of one
+    routed-expert weight tensor, or ``None`` if the checkpoint is remote or has
+    no matching key. Reads only the safetensors header of the relevant shard.
+    """
+    if not os.path.isdir(model_path):
+        return None
+
+    index_file = os.path.join(model_path, "model.safetensors.index.json")
+    target_key = None
+    target_shard_path = None
+
+    if os.path.exists(index_file):
+        with open(index_file) as f:
+            index = json.load(f)
+        weight_map = index.get("weight_map", {}) or {}
+        for k, shard in weight_map.items():
+            if _ROUTED_EXPERT_KEY_RE.search(k):
+                target_key = k
+                target_shard_path = os.path.join(model_path, shard)
+                break
+        if target_key is None:
+            return None
+    else:
+        shards = sorted(Path(model_path).glob("*.safetensors"))
+        if not shards:
+            return None
+        target_shard_path = str(shards[0])
+
+    with open(target_shard_path, "rb") as f:
+        (header_len,) = struct.unpack("<Q", f.read(8))
+        header = json.loads(f.read(header_len))
+
+    if target_key is not None:
+        meta = header.get(target_key)
+        return meta.get("dtype") if meta else None
+
+    for k, meta in header.items():
+        if k == "__metadata__" or not isinstance(meta, dict):
+            continue
+        if _ROUTED_EXPERT_KEY_RE.search(k):
+            return meta.get("dtype")
+    return None
+
 
 # Block size for sequential checkpoint prefetch reads (page cache warming).
 _PREFETCH_BLOCK_SIZE = None

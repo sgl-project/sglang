@@ -4,7 +4,6 @@ from typing import Any, Optional, Tuple
 
 import torch
 
-from sglang.srt.configs.deepseek_v4 import get_fp4_experts
 from sglang.srt.environ import envs
 from sglang.srt.layers.deep_gemm_wrapper import compile_utils
 from sglang.srt.layers.deep_gemm_wrapper.configurer import (  # noqa: F401
@@ -33,6 +32,8 @@ def grouped_gemm_nt_f8f8bf16_masked(
     expected_m: int,
     overlap_args: Optional[Any] = None,
     max_block_n: int = 256,
+    recipe_a: Optional[Tuple[int, int]] = None,
+    recipe_b: Optional[Tuple[int, int]] = None,
 ):
     num_groups, _, k = lhs[0].shape
     _, n, _ = rhs[0].shape
@@ -51,9 +52,11 @@ def grouped_gemm_nt_f8f8bf16_masked(
             overlap_args.num_sms if overlap_args is not None else None
         ):
 
-            fp4_kwargs = (
-                dict(recipe_a=(1, 128), recipe_b=(1, 32)) if get_fp4_experts() else {}
-            )
+            fp4_kwargs = {}
+            if recipe_a is not None:
+                fp4_kwargs["recipe_a"] = recipe_a
+            if recipe_b is not None:
+                fp4_kwargs["recipe_b"] = recipe_b
 
             return deep_gemm.fp8_m_grouped_gemm_nt_masked(
                 lhs,
@@ -88,6 +91,8 @@ def grouped_gemm_nt_f8f8bf16_contig(
     rhs: Tuple[torch.Tensor, torch.Tensor],
     out: torch.Tensor,
     m_indices: torch.Tensor,
+    recipe_a: Optional[Tuple[int, int]] = None,
+    recipe_b: Optional[Tuple[int, int]] = None,
 ):
     m, k = lhs[0].shape
     num_groups, n, _ = rhs[0].shape
@@ -99,10 +104,11 @@ def grouped_gemm_nt_f8f8bf16_contig(
     _sanity_check_input(lhs)
     _sanity_check_input(rhs)
 
-    if envs.SGLANG_HACK_SKIP_FP4_FP8_GEMM.get():
-        out.zero_()
-        return
-    fp4_kwargs = dict(recipe_a=(1, 128), recipe_b=(1, 32)) if get_fp4_experts() else {}
+    fp4_kwargs = {}
+    if recipe_a is not None:
+        fp4_kwargs["recipe_a"] = recipe_a
+    if recipe_b is not None:
+        fp4_kwargs["recipe_b"] = recipe_b
 
     with compile_utils.deep_gemm_execution_hook(m, n, k, num_groups, kernel_type):
         deep_gemm.m_grouped_fp8_gemm_nt_contiguous(

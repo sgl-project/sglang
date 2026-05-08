@@ -1,5 +1,3 @@
-"""Inference-only DeepSeek V4 NextN Speculative Decoding."""
-
 import logging
 from typing import Iterable, Optional, Tuple
 
@@ -9,7 +7,6 @@ from torch import nn
 from transformers import PretrainedConfig
 
 from sglang.srt.distributed import get_pp_group, get_tensor_model_parallel_world_size
-from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import (
     _DpGatheredBufferWrapper,
     dp_gather_partial,
@@ -32,6 +29,8 @@ from sglang.srt.utils import add_prefix
 
 logger = logging.getLogger(__name__)
 
+COMPRESS_RATIO_NEXTN_LAYER = 0
+
 
 class DeepseekV4ModelNextN(nn.Module):
     def __init__(
@@ -42,7 +41,6 @@ class DeepseekV4ModelNextN(nn.Module):
     ) -> None:
         super().__init__()
         self.config = config
-        self.padding_id = config.pad_token_id
         self.vocab_size = config.vocab_size
 
         self.embed_tokens = VocabParallelEmbedding(
@@ -55,12 +53,6 @@ class DeepseekV4ModelNextN(nn.Module):
         self.enorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.hnorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rms_norm_eps = config.rms_norm_eps
-
-        self.layers_to_capture = []
-        if get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_mooncake():
-            self.enable_a2a_moe = True
-        else:
-            self.enable_a2a_moe = False
 
         self.hc_eps = config.hc_eps
         self.hc_mult = hc_mult = config.hc_mult
@@ -88,7 +80,6 @@ class DeepseekV4ModelNextN(nn.Module):
 
         layer_name = "decoder"
 
-        # Multi stream is disabled on MTP layer
         self.decoder = DeepseekV4DecoderLayer(
             config,
             layer_id=0,
@@ -96,12 +87,12 @@ class DeepseekV4ModelNextN(nn.Module):
             is_nextn=True,
             prefix=add_prefix(layer_name, prefix),
             alt_streams=None,
+            compress_ratio_override=COMPRESS_RATIO_NEXTN_LAYER,
         )
 
         self.shared_head = nn.Module()
         self.shared_head.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
-    # Coped from DeepSeekV4Model
     def hc_head(
         self,
         x: torch.Tensor,
@@ -130,32 +121,16 @@ class DeepseekV4ModelNextN(nn.Module):
             hidden_states = input_embeds
 
         if hidden_states.shape[0] > 0:
-            if (
-                envs.SGLANG_FIX_MTP_HC_HIDDEN.get()
-                and envs.SGLANG_DSV4_MODE.get() == "2604"
-            ):
-                n_tokens = hidden_states.shape[0]
-                d = self.config.hidden_size
-                # spec_info.hidden_states: [n, hc*d] → reshape to [n*hc, d] for 2D kernels
-                hc_flat = forward_batch.spec_info.hidden_states.view(
-                    n_tokens * self.hc_mult, d
-                )
-                # hnorm + h_proj on each hc copy independently: [n*hc, d] → [n*hc, d]
-                h_proj_out, _ = self.h_proj(self.hnorm(hc_flat))
-                # reshape back: [n*hc, d] → [n, hc, d]
-                h_proj_hidden_states = h_proj_out.view(n_tokens, self.hc_mult, d)
+            n_tokens = hidden_states.shape[0]
+            d = self.config.hidden_size
+            hc_flat = forward_batch.spec_info.hidden_states.view(
+                n_tokens * self.hc_mult, d
+            )
+            h_proj_out, _ = self.h_proj(self.hnorm(hc_flat))
+            h_proj_hidden_states = h_proj_out.view(n_tokens, self.hc_mult, d)
 
-                # embed: [n, d] → enorm → e_proj → [n, d]
-                e_proj_hidden_states, _ = self.e_proj(self.enorm(hidden_states))
-                # broadcast [n, 1, d] + [n, hc, d] → [n, hc, d]
-                hidden_states = e_proj_hidden_states[:, None, :] + h_proj_hidden_states
-            else:
-                e_proj_hidden_states, _ = self.e_proj(self.enorm(hidden_states))
-                h_proj_hidden_states, _ = self.h_proj(
-                    self.hnorm(forward_batch.spec_info.hidden_states)
-                )
-                hidden_states = e_proj_hidden_states + h_proj_hidden_states
-                hidden_states = hidden_states.unsqueeze(1).repeat(1, self.hc_mult, 1)
+            e_proj_hidden_states, _ = self.e_proj(self.enorm(hidden_states))
+            hidden_states = e_proj_hidden_states[:, None, :] + h_proj_hidden_states
         else:
             hidden_states = hidden_states.unsqueeze(1).repeat(1, self.hc_mult, 1)
 
@@ -167,7 +142,7 @@ class DeepseekV4ModelNextN(nn.Module):
             )
             dp_gather_partial(input_ids_global, input_ids[:, None], forward_batch)
             input_ids_global = input_ids_global.squeeze(-1)
-        else:  # Pure TP attention
+        else:
             input_ids_global = input_ids
 
         hidden_states = self.decoder(
@@ -178,22 +153,14 @@ class DeepseekV4ModelNextN(nn.Module):
             input_ids_global=input_ids_global,
         )
 
-        # decoder output: [n, hc, d] → flatten to [n, hc*d] for spec pipeline
-        pre_hc_head = (
-            hidden_states.flatten(1)
-            if envs.SGLANG_FIX_MTP_HC_HIDDEN.get()
-            and envs.SGLANG_DSV4_MODE.get() == "2604"
-            else None
-        )
+        pre_hc_head = hidden_states.flatten(1)
 
         hidden_states = self.hc_head(
             hidden_states, self.hc_head_fn, self.hc_head_scale, self.hc_head_base
         )
         hidden_states = self.shared_head.norm(hidden_states)
 
-        if pre_hc_head is not None:
-            return hidden_states, pre_hc_head
-        return hidden_states
+        return hidden_states, pre_hc_head
 
 
 class DeepseekV4ForCausalLMNextN(DeepseekV4ForCausalLM):
@@ -209,7 +176,6 @@ class DeepseekV4ForCausalLMNextN(DeepseekV4ForCausalLM):
         self.tp_size = get_tensor_model_parallel_world_size()
         self.pp_group = get_pp_group()
         self.quant_config = quant_config
-        # if not set, model load will be broken in DeepseekV3ForCausalLM load_weights()
         self.determine_num_fused_shared_experts()
 
         self.model = DeepseekV4ModelNextN(
@@ -231,15 +197,7 @@ class DeepseekV4ForCausalLMNextN(DeepseekV4ForCausalLM):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
-        result = self.model(input_ids, positions, forward_batch)
-        pre_hc_head = None
-        if (
-            envs.SGLANG_FIX_MTP_HC_HIDDEN.get()
-            and envs.SGLANG_DSV4_MODE.get() == "2604"
-        ):
-            hidden_states, pre_hc_head = result
-        else:
-            hidden_states = result
+        hidden_states, pre_hc_head = self.model(input_ids, positions, forward_batch)
         return self.logits_processor(
             input_ids,
             hidden_states,
@@ -250,6 +208,9 @@ class DeepseekV4ForCausalLMNextN(DeepseekV4ForCausalLM):
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         super().load_weights(weights, is_nextn=True)
+
+    def post_load_weights(self, is_nextn=False, weight_names=None):
+        super().post_load_weights(is_nextn=True, weight_names=weight_names)
 
 
 EntryClass = [DeepseekV4ForCausalLMNextN]

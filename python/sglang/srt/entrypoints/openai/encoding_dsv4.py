@@ -102,7 +102,7 @@ def to_json(value: Any) -> str:
     """Serialize a value to JSON string."""
     try:
         return json.dumps(value, ensure_ascii=False)
-    except Exception:
+    except:
         return json.dumps(value, ensure_ascii=True)
 
 
@@ -223,6 +223,16 @@ def find_last_user_index(messages: List[Dict[str, Any]]) -> int:
             last_user_index = idx
             break
     return last_user_index
+
+
+def attach_task_to_last_user_message(messages: List[Dict[str, Any]], task: str) -> None:
+    """Set `task` on the most recent user/developer message; raise if none exists."""
+    idx = find_last_user_index(messages)
+    if idx == -1:
+        raise ValueError(
+            "`task` requires at least one message with role='user' or 'developer'."
+        )
+    messages[idx]["task"] = task
 
 
 # ============================================================

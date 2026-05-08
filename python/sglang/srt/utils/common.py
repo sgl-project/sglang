@@ -2555,7 +2555,7 @@ def launch_dummy_health_check_server(host, port, enable_metrics):
         app,
         host=host,
         port=port,
-        timeout_keep_alive=5,
+        timeout_keep_alive=envs.SGLANG_TIMEOUT_KEEP_ALIVE.get(),
         loop="auto",
         log_config=None,
         log_level="warning",

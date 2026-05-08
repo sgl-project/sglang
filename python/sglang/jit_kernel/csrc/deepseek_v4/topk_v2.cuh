@@ -6,325 +6,25 @@
 #include <sgl_kernel/vec.cuh>
 #include <sgl_kernel/warp.cuh>
 
+#include <sgl_kernel/deepseek_v4/topk/cluster.cuh>
+#include <sgl_kernel/deepseek_v4/topk/register.cuh>
+#include <sgl_kernel/deepseek_v4/topk/streaming.cuh>
+
 #include <dlpack/dlpack.h>
 #include <tvm/ffi/container/tensor.h>
 #include <tvm/ffi/object.h>
 
 #include <cfloat>
 #include <cstdint>
+#include <iterator>
 
 namespace {
 
-constexpr uint32_t K = 512;
-constexpr uint32_t kBlockSize = 1024;
-constexpr uint32_t kNumWarps = kBlockSize / device::kWarpThreads;
-static_assert(K <= kBlockSize);
+#ifndef SGL_TOPK
+#define SGL_TOPK 512
+#endif
 
-// always use float4 to load from global memory
-using Vec4 = device::AlignedVector<float, 4>;
-
-// ---------------------------------------------------------------------------
-// Order-preserving FP16 key -> histogram bin
-// ---------------------------------------------------------------------------
-
-template <uint32_t kBits>
-SGL_DEVICE uint32_t extract_bin(float x) {
-  static_assert(0 < kBits && kBits < 15);
-  const auto hx = device::cast<fp16_t>(x);
-  const uint16_t bits = *reinterpret_cast<const uint16_t*>(&hx);
-  const uint16_t key = (bits & 0x8000) ? ~bits : bits | 0x8000;
-  return key >> (16 - kBits);
-}
-
-SGL_DEVICE uint32_t warp_inclusive_sum(uint32_t lane_id, uint32_t val) {
-  static_assert(device::kWarpThreads == 32);
-#pragma unroll
-  for (uint32_t offset = 1; offset < 32; offset *= 2) {
-    uint32_t n = __shfl_up_sync(0xFFFFFFFF, val, offset);
-    if (lane_id >= offset) val += n;
-  }
-  return val;
-}
-
-struct TopKProblem {
-  const float* __restrict__ scores;
-  const int32_t* __restrict__ page_table;
-  int32_t* __restrict__ indices;
-  const uint32_t length;
-  const uint32_t page_bits;
-};
-
-struct SmallTopKImpl {
-  static constexpr uint32_t kHistBits = 12;
-  static constexpr uint32_t kHistBins = 1 << kHistBits;
-  static constexpr uint32_t kVecsPerThread = 4;
-  static constexpr uint32_t kMaxTolerance = 2;
-  [[maybe_unused]]
-  static constexpr uint32_t kMaxSeqLen = kVecsPerThread * 4 * kBlockSize;
-
-  struct alignas(16) MatchBin {
-    uint32_t bin;
-    uint32_t above_count;
-    uint32_t equal_count;
-  };
-
-  struct alignas(8) Tie {
-    uint32_t idx;
-    float score;
-  };
-
-  struct Smem {
-    using HistVec = device::AlignedVector<uint32_t, kHistBins / kBlockSize>;
-    alignas(128) uint32_t counter_gt;
-    alignas(128) uint32_t counter_eq;
-    alignas(128) MatchBin match;
-    alignas(128) uint32_t warp_sum[kNumWarps];
-    alignas(16) union {
-      uint32_t histogram[kHistBins];
-      HistVec histogram_vec[kBlockSize];
-      Tie tie_buffer[kBlockSize];
-    };
-  };
-
-  SGL_DEVICE static void run(const TopKProblem problem, void* _smem) {
-    using namespace device;
-
-    const auto smem = static_cast<Smem*>(_smem);
-    const auto tx = threadIdx.x;
-    Smem::HistVec hist_vec;
-    hist_vec.fill(0);
-    smem->histogram_vec[tx] = hist_vec;
-    __syncthreads();
-
-    PDLWaitPrimary<true>();
-
-    // Load scores into registers
-    Vec4 local[kVecsPerThread];
-#pragma unroll
-    for (uint32_t v = 0; v < kVecsPerThread; ++v) {
-      const uint32_t base = (tx + v * kBlockSize) * 4;
-      if (base >= problem.length) break;
-      local[v].load(problem.scores, tx + v * kBlockSize);
-    }
-
-    // Accumulate histogram via shared-memory atomics
-#pragma unroll
-    for (uint32_t v = 0; v < kVecsPerThread; ++v) {
-#pragma unroll
-      for (uint32_t e = 0; e < 4; ++e) {
-        const uint32_t idx = (tx + v * kBlockSize) * 4 + e;
-        if (idx >= problem.length) goto LABEL_ACC_FINISH;
-        atomicAdd(&smem->histogram[extract_bin<kHistBits>(local[v][e])], 1);
-      }
-    }
-  LABEL_ACC_FINISH:
-    __syncthreads();
-
-    // Phase 2: Exclusive prefix scan -> find threshold bin
-    constexpr uint32_t kItems = kHistBins / kBlockSize;
-
-    const auto lane_id = tx % kWarpThreads;
-    const auto warp_id = tx / kWarpThreads;
-
-    {
-      smem->counter_gt = smem->counter_eq = 0;
-
-      uint32_t orig[kItems];
-      const auto hist_vec = smem->histogram_vec[tx];
-      uint32_t tmp_local_sum = 0;
-
-#pragma unroll
-      for (uint32_t i = 0; i < kItems; ++i) {
-        orig[i] = hist_vec[i];
-        tmp_local_sum += orig[i];
-      }
-
-      const auto warp_inclusive = warp_inclusive_sum(lane_id, tmp_local_sum);
-      const auto warp_exclusive = warp_inclusive - tmp_local_sum;
-      if (lane_id == device::kWarpThreads - 1) {
-        smem->warp_sum[warp_id] = warp_inclusive;
-      }
-
-      __syncthreads();
-
-      const auto tmp = smem->warp_sum[lane_id];
-      // Exactly one bin satisfies: above < K && above + count >= K
-      uint32_t prefix_sum = warp::reduce_sum(lane_id < warp_id ? tmp : 0);
-      prefix_sum += warp_exclusive;
-#pragma unroll
-      for (uint32_t i = 0; i < kItems; ++i) {
-        prefix_sum += orig[i];
-        const auto above = problem.length - prefix_sum;
-        if (above < K && above + orig[i] >= K) {
-          smem->match = {
-              .bin = tx * kItems + i,
-              .above_count = above,
-              .equal_count = orig[i],
-          };
-        }
-      }
-      __syncthreads();
-    }
-
-    const auto [thr_bin, num_above, num_equal] = smem->match;
-    const bool need_tiebreak = (num_equal + num_above > K + kMaxTolerance);
-
-    // Phase 3: Scatter
-    // Elements strictly above threshold go directly to output.
-    // Tied elements: simple path admits first-come; tiebreak path collects into tie_buffer.
-#pragma unroll
-    for (uint32_t v = 0; v < kVecsPerThread; ++v) {
-#pragma unroll
-      for (uint32_t e = 0; e < 4; ++e) {
-        const uint32_t idx = (tx + v * kBlockSize) * 4 + e;
-        if (idx >= problem.length) goto LABEL_SCATTER_DONE;
-        const uint32_t bin = extract_bin<kHistBits>(local[v][e]);
-        if (bin > thr_bin) {
-          problem.indices[atomicAdd(&smem->counter_gt, 1)] = idx;
-        } else if (bin == thr_bin) {
-          const auto pos = atomicAdd(&smem->counter_eq, 1);
-          if (need_tiebreak) {
-            if (pos < kBlockSize) {
-              smem->tie_buffer[pos] = {.idx = idx, .score = local[v][e]};
-            }
-          } else {
-            if (const auto which = pos + num_above; which < K) {
-              problem.indices[which] = idx;
-            }
-          }
-        }
-      }
-    }
-  LABEL_SCATTER_DONE:
-    if (!need_tiebreak) return;
-
-    // Phase 4: Tie-breaking within the threshold bin.
-    // Assume num_ties <= kBlockSize (at most 1 block of ties).
-    // Each thread takes one tied element, computes its rank (number of
-    // elements with strictly higher score, breaking exact float ties by
-    // original index), and writes to output if rank < topk_remain.
-    __syncthreads();
-
-    const uint32_t num_ties = num_equal < kBlockSize ? num_equal : kBlockSize;
-    const uint32_t topk_remain = K - num_above;
-
-    const auto is_greater = [](const Tie& a, const Tie& b) {
-      return (a.score > b.score) || (a.score == b.score && a.idx < b.idx);
-    };
-
-    if (num_ties <= kWarpThreads) {
-      static_assert(kWarpThreads <= kNumWarps);
-      if (lane_id >= num_ties || warp_id >= num_ties) return;  // some threads are idle
-      /// NOTE: use long long to avoid mask overflow when num_ties == 32
-      const uint32_t mask = (1ull << num_ties) - 1u;
-      const auto tie = smem->tie_buffer[lane_id];
-      const auto target_tie = smem->tie_buffer[warp_id];
-      const bool pred = is_greater(tie, target_tie);
-      const auto rank = static_cast<uint32_t>(__popc(__ballot_sync(mask, pred)));
-      if (lane_id == 0 && rank < topk_remain) {
-        problem.indices[num_above + rank] = target_tie.idx;
-      }
-    } else if (num_ties <= kWarpThreads * 2) {
-      [[unlikely]];
-      // 64 x 64 topk implementation: each thread takes 2 elements
-      const auto lane_id_1 = lane_id + kWarpThreads;
-      const auto warp_id_1 = warp_id + kWarpThreads;
-      const auto invalid = Tie{.idx = 0xFFFFFFFF, .score = -FLT_MAX};
-      const auto tie_0 = smem->tie_buffer[lane_id];
-      const auto tie_1 = lane_id_1 < num_ties ? smem->tie_buffer[lane_id_1] : invalid;
-      if (true) {
-        const auto target = smem->tie_buffer[warp_id];
-        const bool pred_0 = is_greater(tie_0, target);
-        const bool pred_1 = is_greater(tie_1, target);
-        const auto rank_0 = static_cast<uint32_t>(__popc(__ballot_sync(0xFFFFFFFF, pred_0)));
-        const auto rank_1 = static_cast<uint32_t>(__popc(__ballot_sync(0xFFFFFFFF, pred_1)));
-        const auto rank = rank_0 + rank_1;
-        if (lane_id == 0 && rank < topk_remain) {
-          problem.indices[num_above + rank] = target.idx;
-        }
-      }
-      if (warp_id_1 < num_ties) {
-        const auto target = smem->tie_buffer[warp_id_1];
-        const bool pred_0 = is_greater(tie_0, target);
-        const bool pred_1 = is_greater(tie_1, target);
-        const auto rank_0 = static_cast<uint32_t>(__popc(__ballot_sync(0xFFFFFFFF, pred_0)));
-        const auto rank_1 = static_cast<uint32_t>(__popc(__ballot_sync(0xFFFFFFFF, pred_1)));
-        const auto rank = rank_0 + rank_1;
-        if (lane_id == 0 && rank < topk_remain) {
-          problem.indices[num_above + rank] = target.idx;
-        }
-      }
-    } else {
-      [[unlikely]];
-      // Block-level: each thread reads from tie_buffer in shared memory
-      if (tx >= num_ties) return;
-      const auto target_tie = smem->tie_buffer[tx];
-      uint32_t rank = 0;
-      for (uint32_t i = 0; i < num_ties; i++) {
-        const auto tie = smem->tie_buffer[i];
-        if (is_greater(tie, target_tie)) rank++;
-      }
-      if (rank < topk_remain) {
-        problem.indices[num_above + rank] = target_tie.idx;
-      }
-    }
-  }
-};
-
-struct TopKParams {
-  const uint32_t* __restrict__ seq_lens;
-  const float* __restrict__ scores;
-  const int32_t* __restrict__ page_table;
-  int32_t* __restrict__ page_indices;
-  const int64_t score_stride;
-  const int64_t page_table_stride;
-  /// NOTE: indices stride must = K
-  uint32_t page_bits;
-};
-
-SGL_DEVICE int32_t page_to_indices(const int32_t* __restrict__ page_table, uint32_t i, uint32_t page_bits) {
-  const uint32_t mask = (1u << page_bits) - 1u;
-  return (page_table[i >> page_bits] << page_bits) | (i & mask);
-}
-
-[[maybe_unused]]
-SGL_DEVICE void naive_transform(
-    const float* __restrict__,  // unused
-    const int32_t* __restrict__ page_table,
-    int32_t* __restrict__ indices,
-    const uint32_t length,
-    const uint32_t page_bits) {
-  if (const auto tx = threadIdx.x; tx < length) {
-    indices[tx] = page_to_indices(page_table, tx, page_bits);
-  } else if (tx < K) {
-    indices[tx] = -1;  // fill invalid indices to -1
-  }
-}
-
-__global__ __launch_bounds__(kBlockSize, 2)  // optimize prefill
-    void topk_transform_v2(const __grid_constant__ TopKParams params) {
-  alignas(128) extern __shared__ uint8_t smem[];
-  const auto batch_id = blockIdx.x;
-  const auto seq_len = params.seq_lens[batch_id];
-  const auto score_ptr = params.scores + batch_id * params.score_stride;
-  const auto page_ptr = params.page_table + batch_id * params.page_table_stride;
-  const auto indices_ptr = params.page_indices + batch_id * K;
-  if (seq_len <= K) return naive_transform(score_ptr, page_ptr, indices_ptr, seq_len, params.page_bits);
-  __shared__ int32_t s_topk_indices[K];
-  const auto problem = TopKProblem{
-      .scores = score_ptr,
-      .page_table = page_ptr,
-      .indices = s_topk_indices,
-      .length = seq_len,
-      .page_bits = params.page_bits,
-  };
-  SmallTopKImpl::run(problem, smem);
-  device::PDLTriggerSecondary<true>();
-  __syncthreads();
-  if (const auto tx = threadIdx.x; tx < K) {
-    indices_ptr[tx] = page_to_indices(page_ptr, s_topk_indices[tx], params.page_bits);
-  }
-}
+inline constexpr uint32_t K = SGL_TOPK;
 
 template <auto* f, size_t kMaxDynamicSMEM>
 void setup_kernel_smem_once(host::DebugInfo where = {}) {
@@ -336,45 +36,413 @@ void setup_kernel_smem_once(host::DebugInfo where = {}) {
   host::RuntimeDeviceCheck(result, where);
 }
 
-struct TopK512Kernel {
-  static constexpr auto kSMEM = sizeof(typename SmallTopKImpl::Smem) + 128;
+namespace impl = device::top512;
+using Large = impl::ClusterTopK<K>;
+using Medium = impl::StreamingTopK<K>;
+using Small = impl::RegisterTopK<K>;
+
+using Metadata = Large::Metadata;
+constexpr uint32_t kBlockSize = impl::kBlockSize;
+constexpr uint32_t kNumClusters = 15;  // based on hardware limits
+constexpr uint32_t kClusterSize = Large::kClusterSize;
+constexpr uint32_t kMax2PassLength = Small::kMax2PassLength;
+constexpr uint32_t kMaxSupportedLength = Large::kMaxLength;
+
+/// Common metadata lives at metadata[0] (first row of the [batch_size+1, 4] tensor).
+/// Per-item metadata starts at metadata[1..batch_size]. The plan kernel writes both.
+struct alignas(16) GlobalMetadata {
+  uint32_t cluster_threshold;  // decided per-batch in plan kernel
+  uint32_t num_cluster_items;  // N = number of items routed to the cluster path
+  uint32_t reserved[2];
+};
+static_assert(sizeof(GlobalMetadata) == sizeof(Metadata), "layout: row 0 must occupy one Metadata-sized slot");
+
+// optimize occupancy for prefill
+#define SMALL_TOPK_KERNEL __global__ __launch_bounds__(kBlockSize, 2)
+// cluster at y dim
+#define LARGE_CLUSTER __cluster_dims__(1, kClusterSize, 1)
+// stage-1 is persistent cluster, and shared memory usage is huge (can not 2)
+#define LARGE_TOPK_STAGE_1 __global__ __launch_bounds__(kBlockSize, 1) LARGE_CLUSTER
+// stage-2 is non-persistent non-cluster, with less shared memory and higher occupancy
+#define LARGE_TOPK_STAGE_2 __global__ __launch_bounds__(kBlockSize, 2)
+// fused into 1 stage when batch-size <= kNumPersistentClusters
+#define FUSED_COMBINE_KERNEL __global__ __launch_bounds__(kBlockSize, 1) LARGE_CLUSTER
+// plan runs once as a single block before the combine kernels
+#define PLAN_KERNEL __global__ __launch_bounds__(kBlockSize, 1)
+
+struct TopKParams {
+  const uint32_t* __restrict__ seq_lens;
+  const float* __restrict__ scores;
+  const int32_t* __restrict__ page_table;
+  int32_t* __restrict__ page_indices;
+  int64_t score_stride;
+  int64_t page_table_stride;
+  uint8_t* __restrict__ workspace;  // [batch, kWorkspaceBytes] -- internally allocated
+  /// Pointer to the full metadata tensor: metadata[0] is GlobalMetadata, metadata[1..]
+  /// are per-item entries (at most kNumClusters * rounds of them).
+  const Metadata* __restrict__ metadata = nullptr;
+  int64_t workspace_stride;  // bytes per batch
+  uint32_t batch_size;
+  uint32_t page_bits;
+
+  SGL_DEVICE const float* get_scores(const uint32_t batch_id) const {
+    return scores + batch_id * score_stride;
+  }
+  SGL_DEVICE impl::TransformParams get_transform(const uint32_t batch_id, int32_t* indices) const {
+    return {
+        .page_table = page_table + batch_id * page_table_stride,
+        .indices_in = indices,
+        .indices_out = page_indices + batch_id * K,
+        .page_bits = page_bits,
+    };
+  }
+  SGL_DEVICE const GlobalMetadata& get_global_metadata() const {
+    return *reinterpret_cast<const GlobalMetadata*>(metadata);
+  }
+  SGL_DEVICE const Metadata& get_item_metadata(uint32_t work_id) const {
+    return metadata[1 + work_id];  // +1 to skip the GlobalMetadata row
+  }
+};
+
+SGL_DEVICE uint2 partition_work(uint32_t length, uint32_t rank) {
+  constexpr uint32_t kTMAAlign = 4;
+  const auto total_units = (length + kTMAAlign - 1) / kTMAAlign;
+  const auto base = total_units / kClusterSize;
+  const auto extra = total_units % kClusterSize;
+  const auto local_units = base + (rank < extra ? 1u : 0u);
+  const auto offset_units = rank * base + min(rank, extra);
+  const auto offset = offset_units * kTMAAlign;
+  const auto finish = min(offset + local_units * kTMAAlign, length);
+  return {offset, finish - offset};
+}
+
+/// Persistent scheduler. A single block:
+///  1. Decides a cluster_threshold from the real seq_lens distribution (or
+///     uses the caller-supplied `static_cluster_threshold` when non-zero).
+///  2. Writes that threshold + N into metadata[0] (the GlobalMetadata row).
+///  3. Compacts items with seq_len > threshold into metadata[1..N+1), laid out
+///     to match the persistent consumer's round-robin stride (kNumClusters).
+///     Entries for clusters that get no work are zero-filled.
+PLAN_KERNEL void topk_plan(
+    const uint32_t* __restrict__ seq_lens,
+    Metadata* __restrict__ metadata,
+    const uint32_t batch_size,
+    const uint32_t static_cluster_threshold) {
+  // Candidate thresholds, strictly increasing. Picked to give the auto-heuristic
+  // reasonable granularity without needing a full sort. Must all be >= kMax2PassLength.
+
+  struct Pair {
+    uint32_t threshold;
+    uint32_t max_batch_size;
+  };
+  /// NOTE: only tuned on B200
+  constexpr Pair kCandidates[] = {
+      {32768, 30},
+      {40960, 45},
+      {49152, 45},
+      {65536, 60},
+      {98304, 60},
+      {131072, 75},
+      {196608, 90},
+      {262144, 105},
+  };
+  constexpr uint32_t kNumCandidates = std::size(kCandidates);
+  constexpr uint32_t kMinBatchSize = kCandidates[0].max_batch_size;
+  static_assert(kCandidates[0].threshold == kMax2PassLength);
+  static_assert(kCandidates[kNumCandidates - 1].threshold == kMaxSupportedLength);
+
+  __shared__ uint32_t s_count;  // final N after compaction
+  __shared__ uint32_t s_counts[kNumCandidates];
+  __shared__ uint32_t s_threshold;
+
+  const auto tx = threadIdx.x;
+  if (tx == 0) s_count = 0;
+  if (tx < kNumCandidates) s_counts[tx] = 0;
+  __syncthreads();
+
+  // --- Phase 1: decide threshold ------------------------------------------
+  if (static_cluster_threshold > 0) {
+    if (tx == 0) s_threshold = static_cluster_threshold;
+  } else if (batch_size <= kMinBatchSize) {
+    if (tx == 0) s_threshold = kMax2PassLength;  // always prefer cluster
+  } else {
+    // Count items above each candidate threshold. Monotonically non-increasing in T.
+    for (uint32_t i = tx; i < batch_size; i += kBlockSize) {
+      const uint32_t sl = seq_lens[i];
+      assert(sl <= kMaxSupportedLength);
+      uint32_t count = 0;
+#pragma unroll
+      for (uint32_t j = 0; j < kNumCandidates; ++j) {
+        count += (sl > kCandidates[j].threshold ? 1 : 0);
+      }
+      if (count > 0) {
+        atomicAdd(&s_counts[count - 1], 1);
+      }
+    }
+    __syncthreads();
+    if (tx == 0) {
+      uint32_t accum = 0;
+      uint32_t chosen = kMaxSupportedLength;
+#pragma unroll
+      for (uint32_t i = 0; i < kNumCandidates; ++i) {
+        const auto j = kNumCandidates - 1 - i;
+        accum += s_counts[j];
+        /// NOTE: `accum` increasing, while `max_batch_size` decreasing
+        if (accum > kCandidates[j].max_batch_size) break;
+        chosen = kCandidates[j].threshold;
+      }
+      s_threshold = chosen;
+    }
+  }
+  __syncthreads();
+  // sanity check: below 2 pass threshold, must fits in small path
+  const auto cluster_threshold = max(s_threshold, kMax2PassLength);
+
+  // --- Phase 2: compact items with seq_len > threshold into metadata[1..] -
+  // Per-item rows live at metadata[1 + pos]; metadata[0] is the GlobalMetadata row.
+  for (uint32_t i = tx; i < batch_size; i += kBlockSize) {
+    const uint32_t sl = seq_lens[i];
+    if (sl > cluster_threshold) {
+      const auto pos = atomicAdd(&s_count, 1);
+      metadata[1 + pos] = {i, sl, false};
+    }
+  }
+  __syncthreads();
+  const auto N = s_count;
+
+  // --- Phase 3: has_next + sentinels + GlobalMetadata ---------------------
+  for (uint32_t i = tx; i < N; i += kBlockSize) {
+    if (i + kNumClusters < N) metadata[1 + i].has_next = true;
+  }
+  // Zero-fill the first kNumClusters sentinel slots that got no valid entry.
+  if (tx < kNumClusters && tx >= N) metadata[1 + tx] = {0, 0, false};
+  // Write global metadata (row 0).
+  if (tx == 0) {
+    auto* g = reinterpret_cast<GlobalMetadata*>(metadata);
+    *g = {
+        .cluster_threshold = cluster_threshold,
+        .num_cluster_items = N,
+        .reserved = {0, 0},
+    };
+  }
+}
+
+SMALL_TOPK_KERNEL void  // short context
+topk_short_transform(const __grid_constant__ TopKParams params) {
+  alignas(128) extern __shared__ uint8_t smem[];
+  __shared__ int32_t s_topk_indices[K];
+  const auto batch_id = blockIdx.x;
+  const auto seq_len = params.seq_lens[batch_id];
+  const auto transform = params.get_transform(batch_id, s_topk_indices);
+  // trivial case
+  if (seq_len <= K) {
+    impl::trivial_transform(transform, seq_len, K);
+  } else {
+    Small::run(params.get_scores(batch_id), s_topk_indices, seq_len, smem, /*use_pdl=*/true);
+    device::PDLTriggerSecondary<true>();
+    Small::transform(transform);
+  }
+}
+
+LARGE_TOPK_STAGE_1 void  // long context, middle to large batch size
+topk_combine_preprocess(const __grid_constant__ TopKParams params) {
+  alignas(128) extern __shared__ uint8_t smem[];
+  __shared__ int32_t s_topk_indices[K];
+  uint32_t work_id = blockIdx.x;
+  uint32_t batch_id;
+  uint32_t seq_len;
+  bool has_next;
+  uint32_t length;
+  uint32_t offset;
+  const auto cluster_rank = blockIdx.y;
+
+  const auto prefetch_metadata = [&] {
+    const auto metadata = params.get_item_metadata(work_id);
+    batch_id = metadata.batch_id;
+    seq_len = metadata.seq_len;
+    has_next = metadata.has_next;
+    work_id += kNumClusters;  // advance to the next item for this cluster
+  };
+  const auto launch_prologue = [&] {
+    const auto partition = partition_work(seq_len, cluster_rank);
+    offset = partition.x;
+    length = partition.y;
+    Large::stage1_prologue(params.get_scores(batch_id) + offset, length, smem);
+  };
+
+  device::PDLWaitPrimary<true>();
+  device::PDLTriggerSecondary<true>();
+
+  prefetch_metadata();
+  if (seq_len == 0) return;
+  Large::stage1_init(smem);
+  launch_prologue();
+  while (true) {
+    const auto this_length = length;
+    const auto this_offset = offset;
+    const auto need_prefetch = has_next;
+    const auto transform = params.get_transform(batch_id, s_topk_indices);
+    const auto ws = params.workspace + batch_id * params.workspace_stride;
+    if (need_prefetch) prefetch_metadata();
+    Large::stage1(s_topk_indices, this_length, smem, /*reuse=*/true);
+    if (need_prefetch) launch_prologue();
+    Large::stage1_epilogue(transform, this_offset, ws, smem);
+    if (!need_prefetch) break;
+  }
+}
+
+LARGE_TOPK_STAGE_2 void  // long context, middle to large batch size
+topk_combine_transform(const __grid_constant__ TopKParams params) {
+  alignas(128) extern __shared__ uint8_t smem[];
+  __shared__ int32_t s_topk_indices[K];
+  const auto batch_id = blockIdx.x;
+  const auto seq_len = params.seq_lens[batch_id];
+  const auto cluster_threshold = params.get_global_metadata().cluster_threshold;
+  const auto transform = params.get_transform(batch_id, s_topk_indices);
+  if (seq_len <= K) {
+    impl::trivial_transform(transform, seq_len, K);
+  } else if (seq_len <= kMax2PassLength) {
+    if (seq_len <= Small::kMax1PassLength) {
+      Small::run(params.get_scores(batch_id), s_topk_indices, seq_len, smem);
+    } else {
+      __syncwarp();
+      Small::run<true>(params.get_scores(batch_id), s_topk_indices, seq_len, smem);
+    }
+    Small::transform(transform);
+  } else if (seq_len <= cluster_threshold) {
+    Medium::run(params.get_scores(batch_id), seq_len, s_topk_indices, smem);
+    Medium::transform(transform, smem);
+  } else {
+    const auto ws = params.workspace + batch_id * params.workspace_stride;
+    device::PDLWaitPrimary<true>();
+    Large::transform(transform, ws, smem);
+  }
+}
+
+FUSED_COMBINE_KERNEL void  // long context, small batch size
+topk_fused_transform(const __grid_constant__ TopKParams params) {
+  alignas(128) extern __shared__ uint8_t smem[];
+  __shared__ int32_t s_topk_indices[K];
+  const auto batch_id = blockIdx.x;
+  const auto cluster_rank = blockIdx.y;
+  const auto seq_len = params.seq_lens[batch_id];
+  const auto transform = params.get_transform(batch_id, s_topk_indices);
+  if (seq_len <= K) {
+    if (cluster_rank != 0) return;  // only first rank work
+    impl::trivial_transform(transform, seq_len, K);
+  } else if (seq_len <= Small::kMax1PassLength) {
+    if (cluster_rank != 0) return;  // only first rank work
+    Small::run(params.get_scores(batch_id), s_topk_indices, seq_len, smem, /*use_pdl=*/true);
+    Small::transform(transform);
+  } else {
+    const auto [offset, length] = partition_work(seq_len, cluster_rank);
+    const auto ws = params.workspace + batch_id * params.workspace_stride;
+    Large::stage1_init(smem);
+    device::PDLWaitPrimary<true>();
+    Large::stage1_prologue(params.get_scores(batch_id) + offset, length, smem);
+    Large::stage1(s_topk_indices, length, smem);
+    Large::stage1_epilogue(transform, offset, ws, smem);
+    cooperative_groups::this_cluster().sync();
+    if (cluster_rank != 0) return;  // only first rank do the stage-2
+    Large::transform(transform, ws, smem);
+  }
+}
+
+struct CombinedTopKKernel {
+  static constexpr auto kStage1SMEM = sizeof(Large::Smem) + 128;
+  static constexpr auto kStage2SMEM = std::max(sizeof(Small::Smem), sizeof(Medium::Smem)) + 128;
+
+  static void plan(  //
+      const tvm::ffi::TensorView seq_lens,
+      const tvm::ffi::TensorView metadata,
+      const uint32_t static_cluster_threshold) {
+    using namespace host;
+    auto B = SymbolicSize{"batch_size"};
+    auto Bp1 = SymbolicSize{"batch_size_plus_1"};
+    auto device_ = SymbolicDevice{};
+    device_.set_options<kDLCUDA>();
+
+    TensorMatcher({B})  //
+        .with_dtype<int32_t>()
+        .with_device(device_)
+        .verify(seq_lens);
+    TensorMatcher({Bp1, 4})  //
+        .with_dtype<int32_t>()
+        .with_device(device_)
+        .verify(metadata);
+
+    const auto batch_size = static_cast<uint32_t>(B.unwrap());
+    RuntimeCheck(Bp1.unwrap() == B.unwrap() + 1);
+    if (batch_size <= kNumClusters) return;  // metadata unused in fused path
+
+    const auto device = device_.unwrap();
+    constexpr auto kernel = topk_plan;
+    LaunchKernel(1, kBlockSize, device)(  //
+        kernel,
+        static_cast<uint32_t*>(seq_lens.data_ptr()),
+        static_cast<Metadata*>(metadata.data_ptr()),
+        batch_size,
+        static_cluster_threshold);
+  }
+
   static void transform(
       const tvm::ffi::TensorView scores,
       const tvm::ffi::TensorView seq_lens,
       const tvm::ffi::TensorView page_table,
       const tvm::ffi::TensorView page_indices,
       const uint32_t page_size,
-      const tvm::ffi::Optional<tvm::ffi::TensorView> unused) {
+      const tvm::ffi::TensorView workspace,
+      const tvm::ffi::TensorView metadata) {
     using namespace host;
     auto B = SymbolicSize{"batch_size"};
+    auto Bp1 = SymbolicSize{"batch_size_plus_1"};
+    auto L = SymbolicSize{"max_seq_len"};
     auto S = SymbolicSize{"score_stride"};
     auto P = SymbolicSize{"page_table_stride"};
-    auto device = SymbolicDevice{};
-    device.set_options<kDLCUDA>();
+    auto W = SymbolicSize{"workspace_stride"};
+    constexpr auto D = Large::kWorkspaceInts;
+    auto device_ = SymbolicDevice{};
+    device_.set_options<kDLCUDA>();
 
-    TensorMatcher({B, -1})  // strided scores
+    TensorMatcher({B, L})  //
         .with_strides({S, 1})
         .with_dtype<float>()
-        .with_device(device)
+        .with_device(device_)
         .verify(scores);
-    TensorMatcher({B})  // seq_lens, must be contiguous
+    TensorMatcher({B})  //
         .with_dtype<int32_t>()
-        .with_device(device)
+        .with_device(device_)
         .verify(seq_lens);
-    TensorMatcher({B, -1})  // strided page table
+    TensorMatcher({B, -1})  //
         .with_strides({P, 1})
         .with_dtype<int32_t>()
-        .with_device(device)
+        .with_device(device_)
         .verify(page_table);
-    TensorMatcher({B, 512})  // output, must be contiguous
+    TensorMatcher({B, K})  //
         .with_dtype<int32_t>()
-        .with_device(device)
+        .with_device(device_)
         .verify(page_indices);
+    TensorMatcher({B, D})  //
+        .with_strides({W, 1})
+        .with_dtype<int32_t>()
+        .with_device(device_)
+        .verify(workspace);
+    TensorMatcher({Bp1, 4})  //
+        .with_dtype<int32_t>()
+        .with_device(device_)
+        .verify(metadata);
 
-    RuntimeCheck(!unused.has_value(), "topk_transform_v2 only accepts 5 arguments");
-    RuntimeCheck(std::has_single_bit(page_size), "page_size must be power of 2");
     const auto page_bits = static_cast<uint32_t>(std::countr_zero(page_size));
     const auto batch_size = static_cast<uint32_t>(B.unwrap());
+    const auto max_seq_len = static_cast<uint32_t>(L.unwrap());
+    const auto device = device_.unwrap();
+    RuntimeCheck(std::has_single_bit(page_size), "page_size must be power of 2");
+    RuntimeCheck(S.unwrap() % 4 == 0, "score_stride must be a multiple of 4 (TMA 16-byte alignment)");
+    RuntimeCheck(Bp1.unwrap() == B.unwrap() + 1, "invalid metadata shape");
+
+    // NOTE: this should be fixed later
+    // RuntimeCheck(max_seq_len <= kMaxSupportedLength, max_seq_len, " exceeds the maximum supported length");
+
     const auto params = TopKParams{
         .seq_lens = static_cast<uint32_t*>(seq_lens.data_ptr()),
         .scores = static_cast<float*>(scores.data_ptr()),
@@ -382,14 +450,43 @@ struct TopK512Kernel {
         .page_indices = static_cast<int32_t*>(page_indices.data_ptr()),
         .score_stride = S.unwrap(),
         .page_table_stride = P.unwrap(),
+        .workspace = static_cast<uint8_t*>(workspace.data_ptr()),
+        .metadata = static_cast<const Metadata*>(metadata.data_ptr()),
+        .workspace_stride = W.unwrap() * static_cast<int64_t>(sizeof(int32_t)),
+        .batch_size = batch_size,
         .page_bits = page_bits,
     };
-    RuntimeCheck(std::bit_cast<uintptr_t>(params.scores) % 16 == 0, "scores must be 16-byte aligned");
-    RuntimeCheck(params.score_stride % 4 == 0, "score_stride must be a multiple of 4");
-    constexpr auto kernel = topk_transform_v2;
-    setup_kernel_smem_once<kernel, kSMEM>();
-    LaunchKernel(batch_size, kBlockSize, device.unwrap(), kSMEM)  //
-        .enable_pdl(true)(kernel, params);
+
+    if (max_seq_len <= Small::kMax1PassLength) {
+      // All items fit in the short path -- no stage-1 needed
+      constexpr auto kernel = topk_short_transform;
+      setup_kernel_smem_once<kernel, kStage2SMEM>();
+      LaunchKernel(batch_size, kBlockSize, device, kStage2SMEM)  //
+          .enable_pdl(true)(kernel, params);
+    } else {
+      // Some items may be large -- launch stage-1 + main
+      if (batch_size <= kNumClusters) {
+        // can fuse into 1 stage
+        constexpr auto kernel = topk_fused_transform;
+        constexpr auto kSMEM = std::max(kStage1SMEM, kStage2SMEM);
+        setup_kernel_smem_once<kernel, kSMEM>();
+        LaunchKernel({batch_size, kClusterSize}, kBlockSize, device, kSMEM)
+            .enable_cluster({1, kClusterSize})
+            .enable_pdl(true)(kernel, params);
+      } else {
+        // stage 1 + stage 2
+        constexpr auto kernel_stage_1 = topk_combine_preprocess;
+        setup_kernel_smem_once<kernel_stage_1, kStage1SMEM>();
+        const auto num_clusters = std::min(batch_size, kNumClusters);
+        LaunchKernel({num_clusters, kClusterSize}, kBlockSize, device, kStage1SMEM)
+            .enable_cluster({1, kClusterSize})
+            .enable_pdl(true)(kernel_stage_1, params);
+        constexpr auto kernel_stage_2 = topk_combine_transform;
+        setup_kernel_smem_once<kernel_stage_2, kStage2SMEM>();
+        LaunchKernel(batch_size, kBlockSize, device, kStage2SMEM)  //
+            .enable_pdl(true)(kernel_stage_2, params);
+      }
+    }
   }
 };
 

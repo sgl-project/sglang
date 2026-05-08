@@ -8,6 +8,7 @@ import torch
 
 from sglang.jit_kernel.utils import is_arch_support_pdl
 from sglang.srt.layers.attention.nsa.utils import is_nsa_prefill_cp_round_robin_split
+from sglang.srt.layers.utils.common import strict_contiguous
 
 tilelang.set_log_level("WARNING")
 
@@ -62,7 +63,6 @@ def hc_split_sinkhorn_kernel(hc: int, sinkhorn_iters: int, eps: float):
             row_sum = T.alloc_fragment(hc, FP32)
             col_sum = T.alloc_fragment(hc, FP32)
 
-            # comb = comb.softmax(-1) + eps
             row_max = T.alloc_fragment(hc, FP32)
             T.reduce_max(comb_frag, row_max, dim=1)
             for j, k in T.Parallel(hc, hc):
@@ -71,17 +71,14 @@ def hc_split_sinkhorn_kernel(hc: int, sinkhorn_iters: int, eps: float):
             for j, k in T.Parallel(hc, hc):
                 comb_frag[j, k] = comb_frag[j, k] / row_sum[j] + eps
 
-            # comb = comb / (comb.sum(-2) + eps)
             T.reduce_sum(comb_frag, col_sum, dim=0)
             for j, k in T.Parallel(hc, hc):
                 comb_frag[j, k] = comb_frag[j, k] / (col_sum[k] + eps)
 
             for _ in T.serial(sinkhorn_iters - 1):
-                # comb = comb / (comb.sum(-1) + eps)
                 T.reduce_sum(comb_frag, row_sum, dim=1)
                 for j, k in T.Parallel(hc, hc):
                     comb_frag[j, k] = comb_frag[j, k] / (row_sum[j] + eps)
-                # comb = comb / (comb.sum(-2) + eps)
                 T.reduce_sum(comb_frag, col_sum, dim=0)
                 for j, k in T.Parallel(hc, hc):
                     comb_frag[j, k] = comb_frag[j, k] / (col_sum[k] + eps)
@@ -117,7 +114,6 @@ def hc_split_sinkhorn(
     return pre, post, comb
 
 
-# Adapted from https://github.com/tile-ai/tilelang/blob/5fe8b84313083d0a4035849c9282f06586c93d58/examples/deepseek_mhc/example_mhc_pre.py
 @tilelang.jit(
     pass_configs={
         tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
@@ -143,7 +139,6 @@ def mhc_pre_big_fuse_tilelang(
     n_splits: int = 16,
     hc_mult: int = 4,
 ):
-    """Deeply fused kernels, everything other than gemm & sqrsum in mHC pre block."""
     num_tokens = T.dynamic("num_tokens")
     hc_mult3 = hc_mult * (2 + hc_mult)
     hidden_block = math.gcd(512, hidden_size)
@@ -153,15 +148,12 @@ def mhc_pre_big_fuse_tilelang(
     hc_scale: T.Tensor[[3], T.float32]
     hc_base: T.Tensor[[hc_mult3], T.float32]
     residual: T.Tensor[[num_tokens, hc_mult, hidden_size], T.bfloat16]
-    # outputs
     post_mix: T.Tensor[[num_tokens, hc_mult], T.float32]
     comb_mix: T.Tensor[[num_tokens, hc_mult * hc_mult], T.float32]
     layer_input: T.Tensor[[num_tokens, hidden_size], T.bfloat16]
 
     ENABLE_PDL = is_arch_support_pdl()
     with T.Kernel(num_tokens, threads=96) as i:
-        ##################################################################
-        # _pre_norm_fn_fwd_norm
         rms = T.alloc_fragment(1, T.float32)
         mixes = T.alloc_fragment(hc_mult3, T.float32)
         T.clear(mixes)
@@ -182,8 +174,6 @@ def mhc_pre_big_fuse_tilelang(
         T.copy(mixes, mixes_shared)
 
         if T.get_thread_binding() < 32:
-            ##################################################################
-            # _pre_split_mixes_fwd (post & comb)
             cm = T.alloc_fragment((hc_mult, hc_mult), T.float32)
             for j in T.Parallel(hc_mult):
                 post_mix[i, j] = (
@@ -198,12 +188,9 @@ def mhc_pre_big_fuse_tilelang(
                     + hc_base[j * hc_mult + k + hc_mult * 2]
                 )
 
-            ##################################################################
-            # _sinkhorn_fwd
             row_sum = T.alloc_fragment(hc_mult, T.float32)
             col_sum = T.alloc_fragment(hc_mult, T.float32)
 
-            # comb = comb.softmax(-1) + eps
             row_max = T.alloc_fragment(hc_mult, T.float32)
             T.reduce_max(cm, row_max, dim=1)
             for j, k in T.Parallel(hc_mult, hc_mult):
@@ -212,28 +199,22 @@ def mhc_pre_big_fuse_tilelang(
             for j, k in T.Parallel(hc_mult, hc_mult):
                 cm[j, k] = cm[j, k] / row_sum[j] + hc_sinkhorn_eps
 
-            # comb = comb / (comb.sum(-2) + eps)
             T.reduce_sum(cm, col_sum, dim=0)
             for j, k in T.Parallel(hc_mult, hc_mult):
                 cm[j, k] = cm[j, k] / (col_sum[k] + hc_sinkhorn_eps)
 
             for _ in T.serial(sinkhorn_repeat - 1):
-                # comb = comb / (comb.sum(-1) + eps)
                 T.reduce_sum(cm, row_sum, dim=1)
                 for j, k in T.Parallel(hc_mult, hc_mult):
                     cm[j, k] = cm[j, k] / (row_sum[j] + hc_sinkhorn_eps)
 
-                # comb = comb / (comb.sum(-2) + eps)
                 T.reduce_sum(cm, col_sum, dim=0)
                 for j, k in T.Parallel(hc_mult, hc_mult):
                     cm[j, k] = cm[j, k] / (col_sum[k] + hc_sinkhorn_eps)
 
-            # save comb_mix to global memory
             for j, k in T.Parallel(hc_mult, hc_mult):
                 comb_mix[i, j * hc_mult + k] = cm[j, k]
         else:
-            ##################################################################
-            # _pre_split_mixes_fwd (pre)
             pre_mix_shared = T.alloc_shared(hc_mult, T.float32)
             for j in T.Parallel(hc_mult):
                 pre_mix_shared[j] = (
@@ -242,8 +223,6 @@ def mhc_pre_big_fuse_tilelang(
                     )
                     + hc_pre_eps
                 )
-            ###################################################################
-            # _pre_apply_mix_fwd
             for i0_h in T.Pipelined(hidden_size // hidden_block, num_stages=2):
                 xs = T.alloc_shared((hc_mult, hidden_block), T.float32)
                 xl = T.alloc_fragment((hc_mult, hidden_block), T.float32)
@@ -264,7 +243,6 @@ def mhc_pre_big_fuse_tilelang(
             T.pdl_trigger()
 
 
-# Adapted from https://github.com/tile-ai/tilelang/blob/5fe8b84313083d0a4035849c9282f06586c93d58/examples/deepseek_mhc/example_mhc_pre.py
 @tilelang.jit
 def mhc_pre_gemm_sqrsum_tilelang(
     x,
@@ -276,8 +254,7 @@ def mhc_pre_gemm_sqrsum_tilelang(
     token_block: int = 32,
     hidden_block: int = 256,
 ) -> tilelang.JITKernel:
-    """Not highly optimized TileLang implementation of fused gemm and sqrsum in mHC pre block."""
-    assert hc_mult3 <= 32  # should be 24 usually
+    assert hc_mult3 <= 32
     num_tokens = T.dynamic("num_tokens")
     assert hc_hidden_size % hidden_block == 0
 
@@ -314,7 +291,6 @@ def mhc_pre_gemm_sqrsum_tilelang(
                 for i, j in T.Parallel(token_block, 4):
                     sqrsum_part[i, j] += x_frag[i, jj * 4 + j] * x_frag[i, jj * 4 + j]
 
-            # should be TF32 gemm
             T.gemm(
                 x_frag,
                 fn_smem,
@@ -391,13 +367,11 @@ def mhc_pre_gemm_sqrsum_splitk_kernel(
                 x_f = T.alloc_fragment((token_block, hidden_block), T.float32)
                 T.copy(x_f16, x_f)
 
-                # partial sqrsum for this tile
                 for jj in T.serial(hidden_block // 4):
                     for i, j in T.Parallel(token_block, 4):
                         v = x_f[i, jj * 4 + j]
                         sq_part4[i, j] += v * v
 
-                # partial GEMM accumulate
                 T.gemm(
                     x_f,
                     fn_smem,
@@ -408,11 +382,9 @@ def mhc_pre_gemm_sqrsum_splitk_kernel(
                     clear_accum=False,
                 )
 
-            # reduce 4 lanes -> scalar per token
             sq_l = T.alloc_fragment((token_block,), T.float32)
             T.reduce_sum(sq_part4, sq_l)
 
-            # write to workspace (NO atomic; each (px,bz) unique)
             for i in T.Parallel(token_block):
                 t = px * token_block + i
                 if t < num_tokens:
@@ -460,13 +432,12 @@ def mhc_pre_gemm_sqrsum_splitk_kernel(
             if ENABLE_PDL:
                 T.pdl_trigger()
 
-    return (  # type: ignore
+    return (
         mhc_pre_gemm_sqrsum_splitk_stage_0,
         mhc_pre_gemm_sqrsum_splitk_stage_1,
     )
 
 
-# Adapted from https://github.com/tile-ai/tilelang/blob/5fe8b84313083d0a4035849c9282f06586c93d58/examples/deepseek_mhc/example_mhc_pre.py
 def mhc_pre(
     residual: torch.Tensor,
     fn: torch.Tensor,
@@ -480,28 +451,7 @@ def mhc_pre(
     n_splits: int = 1,
     n_splits_pre: int = 32,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """
-    Forward pass for mHC pre block.
 
-    Args:
-        residual: shape (..., hc_mult, hidden_size), dtype torch.bfloat16
-        fn: shape (hc_mult3, hc_mult * hidden_size), dtype torch.float32
-        hc_scale: shape (3,), dtype torch.float32
-        hc_base: shape (hc_mult3,), dtype torch.float32
-        rms_eps: RMS normalization epsilon
-        hc_pre_eps: pre-mix epsilon
-        hc_sinkhorn_eps: sinkhorn epsilon
-        hc_post_mult_value: post-mix multiplier value
-        sinkhorn_repeat: number of sinkhorn iterations
-        n_splits: split-k factor; TileLang version of mhc_pre_gemm_sqrsum doesn't support this
-
-    Returns:
-        post_mix: shape (..., hc_mult), dtype torch.float32
-        comb_mix: shape (..., hc_mult, hc_mult), dtype torch.float32
-        layer_input: shape (..., hidden_size), dtype torch.bfloat16
-    """
-
-    # Validate shapes
     assert residual.dtype == torch.bfloat16
     assert fn.dtype == torch.float32
     assert hc_scale.dtype == torch.float32
@@ -613,7 +563,6 @@ def mhc_pre(
     return post_mix, comb_mix, layer_input
 
 
-# Adapted from https://github.com/tile-ai/tilelang/blob/5fe8b84313083d0a4035849c9282f06586c93d58/examples/deepseek_mhc/example_mhc_post.py
 @tilelang.jit(
     pass_configs={
         tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
@@ -624,7 +573,6 @@ def mhc_pre(
 def mhc_post_tilelang(
     a, b, c, d, x, hc: int, hidden: int, n_thr: int = 128, h_blk: int = 1024
 ) -> tilelang.JITKernel:
-    # rename for shorter code
     n = T.dynamic("num_tokens")
     h = hidden
 
@@ -671,7 +619,6 @@ def mhc_post_tilelang(
             T.pdl_trigger()
 
 
-# Adapted from https://github.com/tile-ai/tilelang/blob/5fe8b84313083d0a4035849c9282f06586c93d58/examples/deepseek_mhc/example_mhc_post.py
 def mhc_post(
     x: torch.Tensor,
     residual: torch.Tensor,
@@ -679,10 +626,10 @@ def mhc_post(
     comb_res_mix: torch.Tensor,
 ) -> torch.Tensor:
     if is_nsa_prefill_cp_round_robin_split():
-        x = x.contiguous()
-        residual = residual.contiguous()
-        post_layer_mix = post_layer_mix.contiguous()
-        comb_res_mix = comb_res_mix.contiguous()
+        x = strict_contiguous(x)
+        residual = strict_contiguous(residual)
+        post_layer_mix = strict_contiguous(post_layer_mix)
+        comb_res_mix = strict_contiguous(comb_res_mix)
     out = torch.empty_like(residual)
     mhc_post_tilelang(
         comb_res_mix,

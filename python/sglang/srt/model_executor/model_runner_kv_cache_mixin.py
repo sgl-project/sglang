@@ -7,8 +7,8 @@ import torch
 
 from sglang.srt.configs.model_config import (
     get_nsa_index_head_dim,
-    is_deepseek_compressed,
     is_deepseek_nsa,
+    is_deepseek_v4,
 )
 from sglang.srt.distributed.parallel_state import get_world_group
 from sglang.srt.environ import envs
@@ -17,7 +17,9 @@ from sglang.srt.mem_cache.allocator import (
     PagedTokenToKVPoolAllocator,
     TokenToKVPoolAllocator,
 )
+from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.mem_cache.hisparse_memory_pool import (
+    DeepSeekV4HiSparseTokenToKVPoolAllocator,
     HiSparseNSATokenToKVPool,
     HiSparseTokenToKVPoolAllocator,
 )
@@ -56,7 +58,6 @@ _is_hip = is_hip()
 
 
 class ModelRunnerKVCacheMixin:
-
     def _profile_available_bytes(self: ModelRunner, pre_model_load_memory: int) -> int:
         post_model_load_memory = get_available_gpu_memory(
             self.device,
@@ -286,27 +287,27 @@ class ModelRunnerKVCacheMixin:
 
         # Initialize token_to_kv_pool
         is_nsa_model = is_deepseek_nsa(self.model_config.hf_config)
-        is_v4_model = is_deepseek_compressed(self.model_config.hf_config)
+        is_dsv4_model = is_deepseek_v4(self.model_config.hf_config)
 
-        # Check out-of-tree platform (plugin system) first
+        # Out-of-tree platform plugin system — used by elif below
         from sglang.srt.platforms import current_platform
 
-        if is_v4_model:
-            from sglang.srt.mem_cache.deepseekv4_memory_pool import (
-                DeepSeekV4TokenToKVPool,
-            )
+        if is_dsv4_model:
+            swa_page_size = self.page_size
+            assert swa_page_size == 256, "In paged swa mode, page_size must be 256."
 
-            if envs.SGLANG_OPT_DPSK_V4_RADIX.get():
-                swa_page_size = self.page_size
-                assert swa_page_size == 256, "In paged swa mode, page_size must be 256."
+            if self.is_draft_worker:
+                from sglang.srt.models.deepseek_v4_nextn import (
+                    COMPRESS_RATIO_NEXTN_LAYER,
+                )
+
+                compression_ratios = [
+                    COMPRESS_RATIO_NEXTN_LAYER
+                ] * self.num_effective_layers
             else:
-                swa_page_size = self.model_config.window_size
-                assert (
-                    swa_page_size == 128
-                ), "In ring buffer swa mode, page_size must be 128."
-
+                compression_ratios = self.model_config.compress_ratios
             self.token_to_kv_pool = DeepSeekV4TokenToKVPool(
-                max_num_reqs=self.server_args.max_running_requests,
+                max_num_reqs=self.max_running_requests,
                 swa_size=self.swa_max_total_num_tokens,
                 c4_size=self.c4_max_total_num_tokens,
                 c128_size=self.c128_max_total_num_tokens,
@@ -322,10 +323,10 @@ class ModelRunnerKVCacheMixin:
                 layer_num=self.num_effective_layers,
                 device=self.device,
                 enable_memory_saver=self.server_args.enable_memory_saver,
-                compression_ratios=self.model_config.compress_ratios,
+                compression_ratios=compression_ratios,
                 start_layer=self.start_layer,
                 end_layer=self.end_layer,
-                enable_hisparse=getattr(self, "enable_hisparse", False),
+                enable_hisparse=self.enable_hisparse,
             )
         elif current_platform.is_out_of_tree() and not self.mambaish_config:
             if self.use_mla_backend and is_nsa_model:
@@ -706,15 +707,25 @@ class ModelRunnerKVCacheMixin:
                             need_sort=need_sort,
                         )
 
+            if self.enable_hisparse and is_dsv4_model:
+                assert self.is_hybrid_swa, "DeepSeek V4 HiSparse requires SWA mode."
+                self.token_to_kv_pool_allocator = (
+                    DeepSeekV4HiSparseTokenToKVPoolAllocator(
+                        self.token_to_kv_pool_allocator
+                    )
+                )
+
         else:
             assert self.is_draft_worker
             if self.is_hybrid_swa:
-                assert (
-                    self.token_to_kv_pool_allocator.__class__
-                    == SWATokenToKVPoolAllocator
+                swa_allocator = getattr(
+                    self.token_to_kv_pool_allocator,
+                    "logical_attn_allocator",
+                    self.token_to_kv_pool_allocator,
                 )
+                assert swa_allocator.__class__ == SWATokenToKVPoolAllocator
                 self.token_to_kv_pool.full_to_swa_index_mapping = (
-                    self.token_to_kv_pool_allocator.full_to_swa_index_mapping
+                    swa_allocator.full_to_swa_index_mapping
                 )
 
     def _apply_token_constraints(self: ModelRunner, token_capacity: int) -> int:
@@ -775,12 +786,26 @@ class ModelRunnerKVCacheMixin:
             self.full_max_total_num_tokens = config.full_max_total_num_tokens
             self.swa_max_total_num_tokens = config.swa_max_total_num_tokens
 
-        if is_deepseek_compressed(self.model_config.hf_config):
-            self.c4_max_total_num_tokens = config.c4_max_total_num_tokens or 0
-            self.c128_max_total_num_tokens = config.c128_max_total_num_tokens or 0
-            self.c4_state_pool_size = config.c4_state_pool_size or 0
-            self.c128_state_pool_size = config.c128_state_pool_size or 0
-            self.state_dtype = config.state_dtype or torch.float32
+        # DSV4 compressed-attention pool sizes. Draft worker reuses target's
+        # full/swa sizes but does NOT own c4/c128/state pools (those live on
+        # the target rank only); zero them out regardless of what config holds.
+        if self.is_draft_worker:
+            self.c4_max_total_num_tokens = 0
+            self.c128_max_total_num_tokens = 0
+            self.c4_state_pool_size = 0
+            self.c128_state_pool_size = 0
+        else:
+            self.c4_max_total_num_tokens = config.c4_max_total_num_tokens
+            self.c128_max_total_num_tokens = config.c128_max_total_num_tokens
+            self.c4_state_pool_size = config.c4_state_pool_size
+            self.c128_state_pool_size = config.c128_state_pool_size
+
+        # state_dtype is a DSV4 architectural constant (fp32 for c4/c128
+        # state buffers); set unconditionally so draft workers have it before
+        # _init_pools reads it (target path also overwrites this in the
+        # configurator's resolve() for parity, harmless here).
+        if is_deepseek_v4(self.model_config.hf_config):
+            self.state_dtype = torch.float32
 
         self._init_pools()
 

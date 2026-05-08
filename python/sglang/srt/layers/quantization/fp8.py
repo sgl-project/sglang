@@ -157,8 +157,12 @@ class Fp8Config(QuantizationConfig):
         weight_block_size: List[int] = None,
         packed_modules_mapping: Optional[Dict[str, List[str]]] = None,
         use_mxfp8: bool = False,
+        is_fp4_experts: bool = False,
     ) -> None:
         super().__init__()
+        # DSV4 mxfp4-packed (True) vs converted FP8 (False); injected by
+        # model_loader from ModelConfig. Default False off the DSV4 path.
+        self.is_fp4_experts = is_fp4_experts
         self.is_checkpoint_fp8_serialized = is_checkpoint_fp8_serialized
         if is_checkpoint_fp8_serialized:
             log_info_on_rank0(logger, "Detected fp8 checkpoint.")
@@ -268,7 +272,23 @@ class Fp8Config(QuantizationConfig):
                 return UnquantizedFusedMoEMethod(
                     layer.use_triton_kernels, layer.use_flashinfer_trtllm_moe
                 )
-            return Fp8MoEMethod(self)
+
+            fp8_method = Fp8MoEMethod(self)
+
+            if self.is_fp4_experts and get_moe_runner_backend().is_marlin():
+                from sglang.srt.layers.quantization.mxfp4_marlin_moe import (
+                    Mxfp4MarlinMoEMethod,
+                )
+
+                return Mxfp4MarlinMoEMethod(fp8_method, prefix=prefix)
+
+            if self.is_fp4_experts and get_moe_runner_backend().is_flashinfer_mxfp4():
+                from sglang.srt.layers.quantization.mxfp4_flashinfer_trtllm_moe import (
+                    Mxfp4FlashinferTrtllmMoEMethod,
+                )
+
+                return Mxfp4FlashinferTrtllmMoEMethod(fp8_method, prefix=prefix)
+            return fp8_method
         elif isinstance(layer, RadixAttention):
             return Fp8KVCacheMethod(self)
         return None
@@ -817,6 +837,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         self.block_quant = (
             self.use_mxfp8 or self.quant_config.weight_block_size is not None
         )
+        self.is_fp4_expert = self.quant_config.is_fp4_experts
         self.with_bias = False
         self.is_fp4_expert = get_fp4_experts()
         if get_moe_runner_backend().is_cutlass():
@@ -896,7 +917,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
         # WEIGHTS
         if self.is_fp4_expert:
-            # FP4 E2M1 packed as uint8: 2 FP4 values per byte, K dim halved
             w13_weight = torch.nn.Parameter(
                 torch.empty(
                     num_experts,
@@ -1277,17 +1297,23 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
             if self.is_fp4_expert:
                 fp4_weight_dtype = (
-                    _require_fp4_dtype() if _use_aiter_moe() else torch.uint8
+                    _require_fp4_dtype() if _use_aiter_moe() else torch.int8
                 )
                 layer.w13_weight.data = layer.w13_weight.data.view(fp4_weight_dtype)
                 layer.w2_weight.data = layer.w2_weight.data.view(fp4_weight_dtype)
 
-                if (
-                    envs.SGLANG_OPT_DEEPGEMM_SCALE_CONVERT_AT_INIT.get()
-                    and envs.SGLANG_DSV4_MODE.get() == "2604"
-                    and deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
-                    and will_use_deepgemm
-                ):
+                if get_moe_runner_backend().is_marlin():
+                    return
+
+                if envs.SGLANG_OPT_USE_DEEPGEMM_MEGA_MOE.get():
+                    from sglang.srt.layers.moe.mega_moe import (
+                        build_mega_moe_experts_weights,
+                    )
+
+                    build_mega_moe_experts_weights(layer)
+                    return
+
+                if deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0 and will_use_deepgemm:
                     from deep_gemm import transform_sf_into_required_layout
 
                     for scale_param, weight_param in [
@@ -1300,10 +1326,8 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                             scale_param.data,
                             mn=n,
                             k=k,
-                            recipe=None,
-                            recipe_ab=(1, 32),
+                            recipe=(1, 32),
                             num_groups=num_experts,
-                            is_sfa=False,
                             disable_ue8m0_cast=False,
                         )
                     layer.w13_weight_scale_inv.format_ue8m0 = True
@@ -1890,6 +1914,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 w13_scale=w13_scale,
                 w2_scale=w2_scale,
                 block_shape=block_shape,
+                is_fp4_experts=self.is_fp4_expert,
             )
         elif (
             self.runner.runner_backend.is_flashinfer_trtllm()

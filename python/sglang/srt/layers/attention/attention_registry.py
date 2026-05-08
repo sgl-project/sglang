@@ -92,22 +92,13 @@ def create_nsa_backend(runner):
     return NativeSparseAttnBackend(runner)
 
 
-@register_attention_backend("compressed")
-def create_compressed_backend(runner):
-    from sglang.srt.environ import envs
+@register_attention_backend("dsv4")
+def create_dsv4_backend(runner):
+    from sglang.srt.layers.attention.deepseek_v4_backend import (
+        DeepseekV4AttnBackend,
+    )
 
-    if envs.SGLANG_OPT_DPSK_V4_RADIX.get():
-        from sglang.srt.layers.attention.deepseek_v4_backend_radix import (
-            DeepseekV4BackendRadix,
-        )
-
-        logger.info("Using DeepseekV4BackendRadix for compressed attention backend.")
-        return DeepseekV4BackendRadix(runner)
-    else:
-        from sglang.srt.layers.attention.deepseek_v4_backend import DeepseekV4Backend
-
-        logger.info("Using DeepseekV4Backend for compressed attention backend.")
-        return DeepseekV4Backend(runner)
+    return DeepseekV4AttnBackend(runner)
 
 
 @register_attention_backend("triton")

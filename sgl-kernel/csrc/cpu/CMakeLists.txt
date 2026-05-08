@@ -75,6 +75,23 @@ endif()
 
 file(GLOB_RECURSE SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/*.cpp")
 
+# These kernels still rely on x86-specific AMX/AVX512 implementations.
+# Keep them out of Arm64 bootstrap builds until native Arm paths land.
+set(SGLANG_CPU_X86_ONLY_SOURCES
+    ${CMAKE_CURRENT_SOURCE_DIR}/gemm_int4.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/moe.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/moe_fp8.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/moe_int4.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/moe_int8.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/qkv_proj.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/mamba/conv.cpp
+)
+
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
+    add_compile_definitions(SGLANG_CPU_ARM64_SKIP_X86_ONLY_OPS)
+    list(REMOVE_ITEM SOURCES ${SGLANG_CPU_X86_ONLY_SOURCES})
+endif()
+
 if(NOT DEFINED ENV{SGLANG_CPU_FP8_CVT_FTZ})
     set(ENV{SGLANG_CPU_FP8_CVT_FTZ} "1")
 endif()

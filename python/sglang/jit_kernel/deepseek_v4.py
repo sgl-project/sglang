@@ -9,20 +9,10 @@ import triton.language as tl
 from sglang.jit_kernel.utils import (
     cache_once,
     is_arch_support_pdl,
-    is_hip_runtime,
     load_jit,
     make_cpp_args,
 )
-from sglang.srt.debug_utils.deepseek_v4_debug_utils import (
-    deepseek_v4_moe_code_path_checker,
-)
-from sglang.srt.utils import get_bool_env_var, is_hip
-
-_is_hip = is_hip()
-_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
-
-if _use_aiter:
-    from aiter.tuned_gemm import tgemm
+from sglang.srt.environ import envs
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
@@ -35,9 +25,38 @@ def make_name(name: str) -> str:
 @cache_once
 def _jit_common_module() -> Module:
     return load_jit(
-        make_name(f"common"),
-        cuda_files=[f"deepseek_v4/common.cuh"],
+        make_name("common"),
+        cuda_files=["deepseek_v4/common.cuh"],
         cuda_wrappers=[("plan_compress_prefill", "plan_compress_prefill")],
+    )
+
+
+@cache_once
+def _jit_compress_128_online_plan_module() -> Module:
+    """Host-side plan generator for online compress 128 (no template args)."""
+    return load_jit(
+        make_name("compress_128_online_plan"),
+        cuda_files=["deepseek_v4/c128_online.cuh"],
+        cuda_wrappers=[
+            ("plan_compress_online_prefill", "plan_compress_online_prefill"),
+        ],
+    )
+
+
+@cache_once
+def _jit_compress_128_online_module(head_dim: int) -> Module:
+    """Online compress 128 kernel: ring_size=1, per-index (max, sum, kv) state."""
+    args = make_cpp_args(head_dim, is_arch_support_pdl())
+    kernel_class = f"FlashCompress128OnlineKernel<{args}>"
+    return load_jit(
+        make_name("compress_128_online"),
+        *args,
+        cuda_files=["deepseek_v4/c128_online.cuh"],
+        cuda_wrappers=[
+            ("decode", f"{kernel_class}::run_decode"),
+            ("prefill", f"{kernel_class}::run_prefill"),
+        ],
+        extra_cuda_cflags=["-use_fast_math"],
     )
 
 
@@ -53,11 +72,36 @@ def _jit_topk_module() -> Module:
 
 
 @cache_once
-def _jit_topk_v2_module() -> Module:
+def _jit_topk1024_module() -> Module:
+    args = make_cpp_args(is_arch_support_pdl())
+    return load_jit(
+        make_name("topk1024"),
+        *args,
+        cuda_files=["deepseek_v4/topk_1024.cuh"],
+        cuda_wrappers=[("topk_transform", f"TopK1024Kernel<{args}>::transform")],
+    )
+
+
+@cache_once
+def _jit_topk_v2_module(topk: int) -> Module:
     return load_jit(
         make_name("topk_v2"),
+        str(topk),
         cuda_files=["deepseek_v4/topk_v2.cuh"],
-        cuda_wrappers=[("topk_transform", "TopK512Kernel::transform")],
+        cuda_wrappers=[
+            ("topk_transform", "CombinedTopKKernel::transform"),
+            ("topk_plan", "CombinedTopKKernel::plan"),
+        ],
+        extra_cuda_cflags=[f"-DSGL_TOPK={topk}"],
+    )
+
+
+@cache_once
+def _jit_mask_topk_module() -> Module:
+    return load_jit(
+        make_name("mask_topk"),
+        cuda_files=["deepseek_v4/hash_topk.cuh"],
+        cuda_wrappers=[("run", "MaskKernel::run")],
     )
 
 
@@ -89,6 +133,19 @@ def _jit_compress_module(
             ("decode", f"{kernel_class}::run_decode"),
             ("prefill", f"{kernel_class}::run_prefill"),
         ],
+        extra_cuda_cflags=["-use_fast_math"],
+    )
+
+
+@cache_once
+def _jit_rmsnorm_head_module(head_dim: int, dtype: torch.dtype):
+    args = make_cpp_args(head_dim, dtype, is_arch_support_pdl())
+    kernel_class = f"RMSNormKernel<{args}>"
+    return load_jit(
+        make_name("rmsnorm_head"),
+        *args,
+        cuda_files=["deepseek_v4/rmsnorm.cuh"],
+        cuda_wrappers=[("run_self", f"{kernel_class}::run_self")],
     )
 
 
@@ -111,9 +168,9 @@ def _jit_norm_rope_module(
 ) -> Module:
     args = make_cpp_args(dtype, head_dim, rope_dim, is_arch_support_pdl())
     return load_jit(
-        make_name(f"fused_norm_rope"),
+        make_name("fused_norm_rope"),
         *args,
-        cuda_files=[f"deepseek_v4/fused_norm_rope.cuh"],
+        cuda_files=["deepseek_v4/fused_norm_rope.cuh"],
         cuda_wrappers=[
             ("forward", f"FusedNormRopeKernel<{args}>::forward"),
         ],
@@ -147,6 +204,94 @@ def _jit_metadata_module():
     )
 
 
+@cache_once
+def _jit_silu_mul_quant_varlen_module(
+    quant_group_size: int,
+    scale_ue8m0: bool,
+    swizzle: bool,
+    apply_swiglu_limit: bool,
+) -> Module:
+    args = make_cpp_args(
+        quant_group_size,
+        scale_ue8m0,
+        swizzle,
+        is_arch_support_pdl(),
+        apply_swiglu_limit,
+    )
+    return load_jit(
+        make_name("silu_mul_quant_varlen"),
+        *args,
+        cuda_files=["deepseek_v4/silu_and_mul_masked_post_quant.cuh"],
+        cuda_wrappers=[("run", f"SiluAndMulMaskedPostQuantKernel<{args}>::run")],
+        extra_cuda_cflags=["-use_fast_math"],
+    )
+
+
+@cache_once
+def _jit_silu_mul_quant_contig_module(
+    quant_group_size: int,
+    scale_ue8m0: bool,
+    swizzle: bool,
+    apply_swiglu_limit: bool,
+) -> Module:
+    args = make_cpp_args(
+        quant_group_size,
+        scale_ue8m0,
+        swizzle,
+        is_arch_support_pdl(),
+        apply_swiglu_limit,
+    )
+    return load_jit(
+        make_name("silu_mul_quant_contig"),
+        *args,
+        cuda_files=["deepseek_v4/silu_and_mul_masked_post_quant.cuh"],
+        cuda_wrappers=[("run", f"SiluAndMulContigPostQuantKernel<{args}>::run")],
+        extra_cuda_cflags=["-use_fast_math"],
+    )
+
+
+@cache_once
+def _jit_silu_and_mul_clamp_module(dtype: torch.dtype) -> Module:
+    args = make_cpp_args(dtype, is_arch_support_pdl())
+    return load_jit(
+        make_name("silu_and_mul_clamp"),
+        *args,
+        cuda_files=["deepseek_v4/silu_and_mul_masked_post_quant.cuh"],
+        cuda_wrappers=[("run", f"SiluAndMulClampKernel<{args}>::run")],
+        extra_cuda_cflags=["-use_fast_math"],
+    )
+
+
+@cache_once
+def _jit_mega_moe_pre_dispatch_module(quant_group_size: int) -> Module:
+    args = make_cpp_args(quant_group_size, is_arch_support_pdl())
+    return load_jit(
+        make_name("mega_moe_pre_dispatch"),
+        *args,
+        cuda_files=["deepseek_v4/mega_moe_pre_dispatch.cuh"],
+        cuda_wrappers=[("run", f"MegaMoEPreDispatchKernel<{args}>::run")],
+    )
+
+
+@cache_once
+def _jit_hisparse_transfer_module() -> Module:
+    return load_jit(
+        make_name("hisparse_transfer"),
+        cuda_files=["deepseek_v4/hisparse_transfer.cuh"],
+        cuda_wrappers=[("hisparse_transfer", "hisparse_transfer")],
+    )
+
+
+def hisparse_offload_to_host(
+    gpu_ptrs: torch.Tensor,
+    cpu_ptrs: torch.Tensor,
+    gpu_indices: torch.Tensor,
+    cpu_indices: torch.Tensor,
+) -> None:
+    module = _jit_hisparse_transfer_module()
+    module.hisparse_transfer(gpu_ptrs, cpu_ptrs, gpu_indices, cpu_indices)
+
+
 def topk_transform_512(
     scores: torch.Tensor,
     seq_lens: torch.Tensor,
@@ -154,18 +299,48 @@ def topk_transform_512(
     out_page_indices: torch.Tensor,
     page_size: int,
     out_raw_indices: Optional[torch.Tensor] = None,
-    ver: Literal[1, 2] = 1,
 ) -> None:
-    """Output to page_indices tensor, optionally also output raw abs position indices"""
-    if is_hip_runtime():
-        torch.ops.sgl_kernel.deepseek_v4_topk_transform_512(
-            scores, seq_lens, page_tables, out_page_indices, page_size, out_raw_indices
-        )
+    if out_page_indices.shape[1] == 512:
+        module = _jit_topk_module()
     else:
-        module = _jit_topk_v2_module() if ver == 2 else _jit_topk_module()
-        module.topk_transform(
-            scores, seq_lens, page_tables, out_page_indices, page_size, out_raw_indices
-        )
+        module = _jit_topk1024_module()
+    module.topk_transform(
+        scores, seq_lens, page_tables, out_page_indices, page_size, out_raw_indices
+    )
+
+
+_WORKSPACE_INTS_PER_BATCH = 2 + 1024 * 2
+_PLAN_METADATA_INTS_PER_BATCH = 4
+
+
+def plan_topk_v2(seq_lens: torch.Tensor, static_threshold: int = 0) -> torch.Tensor:
+    module = _jit_topk_v2_module(512)  # does not matter
+    bs = seq_lens.shape[0]
+    metadata = seq_lens.new_empty(bs + 1, _PLAN_METADATA_INTS_PER_BATCH)
+    module.topk_plan(seq_lens, metadata, static_threshold)
+    return metadata
+
+
+def topk_transform_512_v2(
+    scores: torch.Tensor,
+    seq_lens: torch.Tensor,
+    page_tables: torch.Tensor,
+    out_page_indices: torch.Tensor,
+    page_size: int,
+    metadata: torch.Tensor,
+) -> None:
+    module = _jit_topk_v2_module(out_page_indices.shape[1])
+    bs = scores.shape[0]
+    workspace = seq_lens.new_empty(bs, _WORKSPACE_INTS_PER_BATCH)
+    module.topk_transform(
+        scores,
+        seq_lens,
+        page_tables,
+        out_page_indices,
+        page_size,
+        workspace,
+        metadata,
+    )
 
 
 def hash_topk(
@@ -198,6 +373,10 @@ def hash_topk(
     return topk_weights, topk_ids
 
 
+def mask_topk_ids(topk_ids: torch.Tensor, num_token_non_padded: torch.Tensor):
+    return _jit_mask_topk_module().run(topk_ids, num_token_non_padded)
+
+
 class CompressorPrefillPlan(NamedTuple):
     compress_ratio: int
     compress_plan: torch.Tensor
@@ -217,6 +396,19 @@ class CompressorPrefillPlan(NamedTuple):
         device: torch.device,
         use_cuda_graph: bool = False,
     ) -> CompressorPrefillPlan:
+        from sglang.srt.environ import envs
+
+        # Online c128 keeps the same NamedTuple shape (compress_plan, write_plan)
+        # so call sites that splat `*plan[1:]` continue to work, but the C++
+        # plan struct semantics differ (last-token coords + window_len).
+        if compress_ratio == 128 and envs.SGLANG_OPT_USE_ONLINE_COMPRESS.get():
+            return CompressorPrefillPlan._generate_online(
+                num_q_tokens=num_q_tokens,
+                seq_lens=seq_lens,
+                extend_lens=extend_lens,
+                device=device,
+                use_cuda_graph=use_cuda_graph,
+            )
         assert seq_lens.device == extend_lens.device
         seq_lens = seq_lens.to(torch.int64)
         extend_lens = extend_lens.to(torch.int64)
@@ -228,8 +420,6 @@ class CompressorPrefillPlan(NamedTuple):
         )
         module = _jit_common_module()
         is_overlap = compress_ratio == 4
-        # NOTE: when seq_lens on CUDA device or use_cuda_graph = True,
-        # the C++/CUDA implementation will pad up to num_q_tokens
         plan_lens = module.plan_compress_prefill(
             extend_lens,
             seq_lens,
@@ -245,8 +435,43 @@ class CompressorPrefillPlan(NamedTuple):
             plan_tensor[1, : plan_lens[1]].to(device, non_blocking=True),
         )
 
+    @staticmethod
+    def _generate_online(
+        num_q_tokens: int,
+        seq_lens: torch.Tensor,
+        extend_lens: torch.Tensor,
+        device: torch.device,
+        use_cuda_graph: bool,
+    ) -> CompressorPrefillPlan:
+        # Online plan host-side path: only CPU/cuda-host implemented today.
+        # Move inputs to CPU pinned memory then bounce the result to device.
+        seq_lens_cpu = seq_lens.detach().to(torch.int64).cpu()
+        extend_lens_cpu = extend_lens.detach().to(torch.int64).cpu()
+        plan_tensor = torch.empty(
+            (2, num_q_tokens, 16),
+            dtype=torch.uint8,
+            device="cpu",
+            pin_memory=True,
+        )
+        module = _jit_compress_128_online_plan_module()
+        plan_lens = module.plan_compress_online_prefill(
+            extend_lens_cpu,
+            seq_lens_cpu,
+            plan_tensor[0],
+            plan_tensor[1],
+            use_cuda_graph,
+        )
+        return CompressorPrefillPlan(
+            128,
+            plan_tensor[0, : plan_lens[0]].to(device, non_blocking=True),
+            plan_tensor[1, : plan_lens[1]].to(device, non_blocking=True),
+        )
 
-# NOTE: only decode plan is compatible with cuda graph
+    @property
+    def is_decode(self) -> bool:
+        return False
+
+
 class CompressorDecodePlan(NamedTuple):
     compress_ratio: int
     seq_lens: torch.Tensor
@@ -254,6 +479,10 @@ class CompressorDecodePlan(NamedTuple):
     def copy_(self, other: CompressorDecodePlan) -> None:
         assert self.compress_ratio == other.compress_ratio
         self.seq_lens.copy_(other.seq_lens)
+
+    @property
+    def is_decode(self) -> bool:
+        return True
 
 
 def compress_plan(
@@ -291,15 +520,6 @@ def compress_forward(
     seq_lens: Optional[torch.Tensor] = None,
     extend_lens: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    # TODO(dark): support dynamic plan and dispatch for decode kernel
-    # Currently, there's no load-balancing for compression kernel
-    # In worst cases, few SM will be overloaded with most compression work.
-    # For C4, this may not be a big issue, since the compression is fast enough,
-    # and the compression is quite common (with an probability of 1/4 in average).
-    # For C128, the compression involves CTA reduction, which is relatively slow,
-    # and the compression is rare (with an probability of 1/128 in average).
-    # We may need to implement dynamic dispatch to better balance the load among SMs.
-    # We may need some interface like `module.plan(...)` to prepare before forward pass.
     assert head_dim % 128 == 0
     num_q_tokens = kv_score_input.shape[0]
     if out is None:
@@ -314,13 +534,19 @@ def compress_forward(
             kv_score_input.device,
         )
     assert plan.compress_ratio == compress_ratio, "Mismatched compress ratio in plan!"
+    # Online c128: separate JIT module, fp32 state, no compile-time dtypes.
+    if compress_ratio == 128 and envs.SGLANG_OPT_USE_ONLINE_COMPRESS.get():
+        online_module = _jit_compress_128_online_module(head_dim=head_dim)
+        F = online_module.decode if plan.is_decode else online_module.prefill
+        F(kv_score_buffer, kv_score_input, out, ape, indices, *plan[1:], extra_data)
+        return out
     module = _jit_compress_module(
         head_dim,
         kv_score_input.dtype,
         out.dtype,
         compress_ratio,
     )
-    F = module.decode if isinstance(plan, CompressorDecodePlan) else module.prefill
+    F = module.decode if plan.is_decode else module.prefill
     F(kv_score_buffer, kv_score_input, out, ape, indices, *plan[1:], extra_data)
     return out
 
@@ -337,31 +563,11 @@ def compress_fused_norm_rope_inplace(
     module.forward(
         kv,
         weight,
-        plan[1],  # decode: seq_lens, prefill: compress_plan
+        plan[1],
         freq_cis,
-        1 if isinstance(plan, CompressorDecodePlan) else 0,  # mode
+        int(plan.is_decode),
         eps,
         plan.compress_ratio,
-    )
-
-
-def fused_norm_rope_inplace(
-    kv: torch.Tensor,
-    weight: torch.Tensor,
-    eps: float,
-    freq_cis: torch.Tensor,
-    positions: torch.Tensor,
-) -> None:
-    freq_cis = torch.view_as_real(freq_cis).flatten(-2)
-    module = _jit_norm_rope_module(kv.dtype, kv.shape[-1], freq_cis.shape[-1])
-    module.forward(
-        kv,
-        weight,
-        positions,
-        freq_cis,
-        2,  # mode
-        eps,
-        0,  # compress_ratio (no use in this mode)
     )
 
 
@@ -372,202 +578,27 @@ def fused_rope(
     positions: torch.Tensor,
     inverse: bool = False,
 ) -> None:
-    """Apply rotary embeddings to both Q and K in a single fused CUDA kernel.
-
-    Args:
-        q: [batch_size, num_q_heads, rope_dim] bfloat16
-        k: [batch_size, num_k_heads, rope_dim] bfloat16 or None
-        freqs_cis: [max_seq_len, rope_dim // 2] complex64 (full table)
-        positions: [batch_size] int32 or int64, indices into freqs_cis
-        inverse: if True, apply inverse rotation (conjugate freqs)
-    """
-    from sglang.srt.utils import is_hip
-
-    if is_hip():
-        from sglang.srt.layers.deepseek_v4_rope import apply_rotary_emb_triton
-
-        apply_rotary_emb_triton(q, freqs_cis, positions=positions, inverse=inverse)
-        if k is not None:
-            apply_rotary_emb_triton(k, freqs_cis, positions=positions, inverse=inverse)
-        return
-
     freqs_real = torch.view_as_real(freqs_cis).flatten(-2).contiguous()
     module = _jit_fused_rope_module()
     module.forward(q, k, freqs_real, positions, inverse)
 
 
-@cache_once
-def _tilelang_make_swa_indices_kernel(swa_window_size: int, threads: int = 128) -> Any:
-    import tilelang
-    import tilelang.language as T
-
-    batch_size = T.dynamic("batch_size")
-    batch_size_plus_1 = T.dynamic("batch_size_plus_1")
-    num_q_tokens = T.dynamic("num_q_tokens")
-    num_warps = threads // 32
-    assert swa_window_size % 32 == 0
-
-    @tilelang.jit
-    def make_swa_prefill_indices(
-        seq_lens_k: T.Tensor[(batch_size,), T.int32],
-        seq_lens_q: T.Tensor[(batch_size,), T.int32],
-        cu_seqlens_q: T.Tensor[(batch_size_plus_1,), T.int32],
-        swa_indices: T.Tensor[(num_q_tokens, swa_window_size), T.int32],
-    ):
-        _ = batch_size_plus_1  # unused, but don't remove it
-        with T.Kernel(T.ceildiv(num_q_tokens, num_warps), threads=threads) as bx:
-            # each warp handles 1 q token
-            tx = T.get_thread_binding()
-            warp_id = tx // 32
-            lane_id = tx % 32
-            s_batch_id = T.alloc_shared((num_warps,), dtype=T.int32)
-
-            token_id = warp_id + bx * num_warps
-            if token_id >= num_q_tokens:
-                return
-            for i in T.serial(0, batch_size, step=32):
-                j = i + lane_id
-                if cu_seqlens_q[j] <= token_id < cu_seqlens_q[j + 1]:
-                    s_batch_id[warp_id] = j
-            T.sync_warp()
-
-            seq_idx = s_batch_id[warp_id]
-            kv_len = seq_lens_k[seq_idx]
-            qo_len = seq_lens_q[seq_idx]
-            cum_qo_len = cu_seqlens_q[seq_idx]
-            prefix_len = kv_len - qo_len
-            curr_seq_qo_idx = token_id - cum_qo_len
-            end_abs_pos = prefix_len + curr_seq_qo_idx + 1
-            start_abs_pos = T.max(end_abs_pos - swa_window_size, 0)
-            old_kv_start = seq_idx * swa_window_size
-            new_kv_start = batch_size * swa_window_size + cum_qo_len
-
-            for i in T.unroll(0, swa_window_size, step=32):
-                j = i + lane_id
-                abs_pos = start_abs_pos + j
-                swa_indices[token_id, j] = T.if_then_else(
-                    abs_pos < end_abs_pos,
-                    T.if_then_else(
-                        abs_pos < prefix_len,
-                        old_kv_start + abs_pos % swa_window_size,
-                        new_kv_start + (abs_pos - prefix_len),
-                    ),
-                    -1,
-                )
-
-    return make_swa_prefill_indices
-
-
-@triton.jit
-def _triton_make_swa_prefill_indices_kernel(
-    seq_lens_k_ptr,
-    seq_lens_q_ptr,
-    cu_seqlens_q_ptr,
-    swa_indices_ptr,
-    batch_size,
-    num_q_tokens,
-    stride_swa_0,
-    SWA_WINDOW_SIZE: tl.constexpr,
-    BLOCK_W: tl.constexpr,
-):
-    token_id = tl.program_id(0)
-    if token_id >= num_q_tokens:
-        return
-
-    # Binary search: find largest seq_idx where cu_seqlens_q[seq_idx] <= token_id
-    lo = 0
-    hi = batch_size
-    for _ in tl.static_range(20):
-        mid = (lo + hi) // 2
-        mid_val = tl.load(cu_seqlens_q_ptr + mid)
-        if mid_val <= token_id:
-            lo = mid + 1
-        else:
-            hi = mid
-    seq_idx = lo - 1
-
-    kv_len = tl.load(seq_lens_k_ptr + seq_idx)
-    qo_len = tl.load(seq_lens_q_ptr + seq_idx)
-    cum_qo_len = tl.load(cu_seqlens_q_ptr + seq_idx)
-
-    prefix_len = kv_len - qo_len
-    curr_seq_qo_idx = token_id - cum_qo_len
-    end_abs_pos = prefix_len + curr_seq_qo_idx + 1
-    start_abs_pos = tl.maximum(end_abs_pos - SWA_WINDOW_SIZE, 0)
-    old_kv_start = seq_idx * SWA_WINDOW_SIZE
-    new_kv_start = batch_size * SWA_WINDOW_SIZE + cum_qo_len
-
-    base_ptr = swa_indices_ptr + token_id * stride_swa_0
-    for block_start in tl.static_range(0, SWA_WINDOW_SIZE, BLOCK_W):
-        j = block_start + tl.arange(0, BLOCK_W)
-        abs_pos = start_abs_pos + j
-        old_idx = old_kv_start + abs_pos % SWA_WINDOW_SIZE
-        new_idx = new_kv_start + (abs_pos - prefix_len)
-        idx = tl.where(abs_pos < prefix_len, old_idx, new_idx)
-        idx = tl.where(abs_pos < end_abs_pos, idx, -1)
-        tl.store(base_ptr + j, idx)
-
-
-def triton_make_swa_prefill_indices(
-    seq_lens_k: torch.Tensor,
-    seq_lens_q: torch.Tensor,
-    swa_indices: torch.Tensor,
-    cu_seqlens_q: Optional[torch.Tensor] = None,
-) -> torch.Tensor:
-    if cu_seqlens_q is None:
-        cu_seqlens_q = torch.cumsum(seq_lens_q, dim=0, dtype=torch.int32)
-        cu_seqlens_q = torch.nn.functional.pad(cu_seqlens_q, (1, 0), value=0)
-    swa_window_size = swa_indices.shape[1]
-    num_q_tokens = swa_indices.shape[0]
-    batch_size = seq_lens_k.shape[0]
-    assert swa_window_size % 32 == 0
-    BLOCK_W = 32
-    grid = (num_q_tokens,)
-    _triton_make_swa_prefill_indices_kernel[grid](
-        seq_lens_k,
-        seq_lens_q,
-        cu_seqlens_q,
-        swa_indices,
-        batch_size,
-        num_q_tokens,
-        swa_indices.stride(0),
-        SWA_WINDOW_SIZE=swa_window_size,
-        BLOCK_W=BLOCK_W,
-    )
-    return swa_indices
-
-
-def tilelang_make_swa_prefill_indices(
-    seq_lens_k: torch.Tensor,
-    seq_lens_q: torch.Tensor,
-    swa_indices: torch.Tensor,
-    cu_seqlens_q: Optional[torch.Tensor] = None,
-) -> torch.Tensor:
-    if cu_seqlens_q is None:
-        cu_seqlens_q = torch.cumsum(seq_lens_q, dim=0, dtype=torch.int32)
-        cu_seqlens_q = torch.nn.functional.pad(cu_seqlens_q, (1, 0), value=0)
-    swa_window_size = swa_indices.shape[1]
-    kernel = _tilelang_make_swa_indices_kernel(swa_window_size)
-    kernel(seq_lens_k, seq_lens_q, cu_seqlens_q, swa_indices)
-    return swa_indices
-
-
 @triton.jit
 def create_paged_compress_data_kernel(
-    req_pool_indices_ptr,  # int32 [batch]
-    seq_lens_ptr,  # int32 [batch]
-    extend_seq_lens_ptr,  # int32 [batch]
-    req_to_token_ptr,  # int32 [A, B]
-    full_to_swa_index_mapping_ptr,  # int32 [C]
-    out_0_ptr,  # int32 [batch]
-    out_1_ptr,  # int32 [batch, out_dim]
+    req_pool_indices_ptr,
+    seq_lens_ptr,
+    extend_seq_lens_ptr,
+    req_to_token_ptr,
+    full_to_swa_index_mapping_ptr,
+    out_0_ptr,
+    out_1_ptr,
     batch_size,
     stride_req_to_token_0,
-    stride_req_to_token_1: tl.constexpr,  # 1
+    stride_req_to_token_1: tl.constexpr,
     stride_out_1_0,
-    stride_out_1_1: tl.constexpr,  # 1
+    stride_out_1_1: tl.constexpr,
     compress_ratio: tl.constexpr,
-    is_overlap: tl.constexpr,  # 0/1
+    is_overlap: tl.constexpr,
     swa_page_size: tl.constexpr,
     ring_size: tl.constexpr,
     BLOCK: tl.constexpr,
@@ -576,7 +607,6 @@ def create_paged_compress_data_kernel(
     offs = pid * BLOCK + tl.arange(0, BLOCK)
     mask = offs < batch_size
 
-    # load per-batch
     rid = tl.load(req_pool_indices_ptr + offs, mask=mask, other=0).to(tl.int32)
     seq_len = tl.load(seq_lens_ptr + offs, mask=mask, other=0).to(tl.int32)
     extend_len = tl.load(extend_seq_lens_ptr + offs, mask=mask, other=0).to(tl.int32)
@@ -602,11 +632,10 @@ def create_paged_compress_data_kernel(
         else:
             pos = write_overlap_pos
         pos = tl.maximum(pos, 0)
-        # req_to_token[rid, pos]
         loc = tl.load(
             req_to_token_ptr
-            + rid * stride_req_to_token_0
-            + pos * stride_req_to_token_1,
+            + rid.to(tl.int64) * stride_req_to_token_0
+            + pos.to(tl.int64) * stride_req_to_token_1,
             mask=mask,
             other=0,
         ).to(tl.int32)
@@ -665,17 +694,18 @@ def triton_create_paged_compress_data(
         full_to_swa_index_mapping,
         out_0,
         out_1,
-        batch_size=batch_size,  # type: ignore
-        stride_req_to_token_0=req_to_token.stride(0),  # type: ignore
-        stride_req_to_token_1=req_to_token.stride(1),  # type: ignore
-        stride_out_1_0=out_1.stride(0),  # type: ignore
-        stride_out_1_1=out_1.stride(1),  # type: ignore
-        compress_ratio=compress_ratio,  # type: ignore
-        is_overlap=1 if is_overlap else 0,  # type: ignore
-        swa_page_size=swa_page_size,  # type: ignore
-        ring_size=ring_size,  # type: ignore
-        BLOCK=block,  # type: ignore
+        batch_size=batch_size,
+        stride_req_to_token_0=req_to_token.stride(0),
+        stride_req_to_token_1=req_to_token.stride(1),
+        stride_out_1_0=out_1.stride(0),
+        stride_out_1_1=out_1.stride(1),
+        compress_ratio=compress_ratio,
+        is_overlap=1 if is_overlap else 0,
+        swa_page_size=swa_page_size,
+        ring_size=ring_size,
+        BLOCK=block,
     )
+
     if not is_overlap:
         out_1.squeeze_(1)
     return out_0, out_1
@@ -698,19 +728,13 @@ def fused_store_cache(
     module.run(input, cache, indices)
 
 
-@cache_once
-def _jit_silu_mul_quant_module(
-    quant_group_size: int, scale_ue8m0: bool, apply_swiglu_limit: bool
-) -> Module:
-    args = make_cpp_args(
-        quant_group_size, scale_ue8m0, is_arch_support_pdl(), apply_swiglu_limit
-    )
-    return load_jit(
-        make_name("silu_mul_quant"),
-        *args,
-        cuda_files=["deepseek_v4/silu_and_mul_masked_post_quant.cuh"],
-        cuda_wrappers=[("run", f"SiluAndMulMaskedPostQuantKernel<{args}>::run")],
-    )
+def silu_and_mul_clamp(
+    input: torch.Tensor,
+    output: torch.Tensor,
+    swiglu_limit: float,
+) -> None:
+    module = _jit_silu_and_mul_clamp_module(input.dtype)
+    module.run(input, output, float(swiglu_limit))
 
 
 def silu_and_mul_masked_post_quant(
@@ -723,24 +747,11 @@ def silu_and_mul_masked_post_quant(
     topk: int = 8,
     transposed: bool = False,
     swiglu_limit: Optional[float] = None,
+    swizzle: bool = False,
 ) -> None:
-    """
-    Fused SiLU-and-mul with per-group FP8 quantization for expert-parallel MoE.
-
-    input shape:        [expert_num, token_num_padded, hidden_dim]
-    output shape:       [expert_num, token_num_padded, hidden_dim // 2], dtype fp8_e4m3
-    output_scale shape: [expert_num, token_num_padded, hidden_dim // 2 // quant_group_size], dtype float32
-    masked_m shape:     [expert_num], dtype int32. i.e. actual token count per expert
-    topk:               max routed experts per token (grid = token_num_padded * topk blocks)
-    swiglu_limit:       Optional. When None (default), use the original fast path (no clamp).
-                        When set, JIT-compiles a separate kernel variant that clamps gate to
-                        [-inf, L] and up to [-L, L] before silu (fused).
-    """
     apply_swiglu_limit = swiglu_limit is not None
-    if apply_swiglu_limit:
-        deepseek_v4_moe_code_path_checker.observed += 1
-    module = _jit_silu_mul_quant_module(
-        quant_group_size, scale_ue8m0, apply_swiglu_limit
+    module = _jit_silu_mul_quant_varlen_module(
+        quant_group_size, scale_ue8m0, swizzle, apply_swiglu_limit
     )
     module.run(
         input,
@@ -753,13 +764,65 @@ def silu_and_mul_masked_post_quant(
     )
 
 
+def silu_and_mul_contig_post_quant(
+    input: torch.Tensor,
+    output: torch.Tensor,
+    output_scale: torch.Tensor,
+    quant_group_size: int,
+    scale_ue8m0: bool = False,
+    transposed: bool = False,
+    swiglu_limit: Optional[float] = None,
+    swizzle: bool = False,
+) -> None:
+    apply_swiglu_limit = swiglu_limit is not None
+    module = _jit_silu_mul_quant_contig_module(
+        quant_group_size, scale_ue8m0, swizzle, apply_swiglu_limit
+    )
+    module.run(
+        input,
+        output,
+        output_scale,
+        transposed,
+        float(swiglu_limit) if apply_swiglu_limit else 0.0,
+    )
+
+
+def mega_moe_pre_dispatch(
+    x: torch.Tensor,
+    topk_idx: torch.Tensor,
+    topk_weights: torch.Tensor,
+    buf_x: torch.Tensor,
+    buf_x_sf: torch.Tensor,
+    buf_topk_idx: torch.Tensor,
+    buf_topk_weights: torch.Tensor,
+    quant_group_size: int = 32,
+) -> None:
+    module = _jit_mega_moe_pre_dispatch_module(quant_group_size)
+    module.run(
+        x,
+        topk_idx,
+        topk_weights,
+        buf_x,
+        buf_x_sf,
+        buf_topk_idx,
+        buf_topk_weights,
+    )
+
+
 def get_paged_mqa_logits_metadata(seq_lens: torch.Tensor, page_size: int, num_sm: int):
     assert page_size == 64
-    seq_lens = seq_lens.to(torch.int32)
+    seq_lens = seq_lens.view(-1).to(torch.int32)
     metadata = seq_lens.new_empty(num_sm + 1, 2)
     module = _jit_metadata_module()
     module.run(seq_lens, metadata)
     return metadata
+
+
+def rmsnorm_self(q: torch.Tensor, eps: float) -> torch.Tensor:
+    module = _jit_rmsnorm_head_module(q.shape[-1], q.dtype)
+    out = q.new_empty(q.shape)
+    module.run_self(q, out, eps)
+    return out
 
 
 @cache_once
@@ -826,7 +889,12 @@ def linear_bf16_fp32(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     from sglang.srt.environ import envs
 
     algo = envs.SGLANG_OPT_BF16_FP32_GEMM_ALGO.get()
+    return _dispatch_bf16_fp32_backend(x, y, algo=algo)
 
+
+def _dispatch_bf16_fp32_backend(
+    x: torch.Tensor, y: torch.Tensor, *, algo: str
+) -> torch.Tensor:
     if algo == "cublas":
         module = _jit_torch_cublas_bf16_fp32()
         return module.linear_bf16_fp32(x, y)
@@ -836,106 +904,5 @@ def linear_bf16_fp32(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
         z = x.new_empty(x.size(0), y.size(0), dtype=torch.float32)
         deep_gemm.bf16_gemm_nt(x, y, z)
         return z
-    elif _use_aiter:
-        return tgemm.mm(x, y, otype=x.dtype).float()
-    else:  # fall back to torch fp32 GEMM
+    else:
         return torch.nn.functional.linear(x.float(), y.float())
-
-
-def _compile_one(*input_tuple) -> None:
-    name, job_fn, *args = input_tuple
-    print(f"Compiling {name}...", flush=True)
-    job_fn(*args)
-    print(f"Finished compiling {name}.", flush=True)
-
-
-def compile_aot():
-    c_dtype = torch.float32  # compress uses float32
-    jobs = [
-        ("cublas", _jit_torch_cublas_bf16_fp32),
-        ("common", _jit_common_module),
-        ("topk", _jit_topk_module),
-        ("hash_topk", _jit_hash_topk_module),
-        ("rope", _jit_fused_rope_module),
-        ("metadata", _jit_metadata_module),
-        (
-            "compress_128_4",
-            _jit_compress_module,
-            128,
-            c_dtype,
-            c_dtype,
-            4,
-        ),
-        (
-            "compress_512_4",
-            _jit_compress_module,
-            512,
-            c_dtype,
-            c_dtype,
-            4,
-        ),
-        (
-            "compress_512_128",
-            _jit_compress_module,
-            512,
-            c_dtype,
-            c_dtype,
-            128,
-        ),
-        (
-            "norm_rope_128_64",
-            _jit_norm_rope_module,
-            c_dtype,
-            128,
-            64,
-        ),
-        (
-            "norm_rope_512_64",
-            _jit_norm_rope_module,
-            c_dtype,
-            512,
-            64,
-        ),
-        (
-            "store_flashmla_bf16_swa_256",
-            _jit_fused_store_module,
-            "flashmla",
-            torch.bfloat16,
-            torch.int32,
-            256,
-        ),
-        (
-            "store_flashmla_fp32_c4_64",
-            _jit_fused_store_module,
-            "flashmla",
-            torch.float32,
-            torch.int32,
-            64,
-        ),
-        (
-            "store_flashmla_fp32_c128_2",
-            _jit_fused_store_module,
-            "flashmla",
-            torch.float32,
-            torch.int32,
-            2,
-        ),
-        (
-            "store_indexer_fp32_c4_64",
-            _jit_fused_store_module,
-            "indexer",
-            torch.float32,
-            torch.int32,
-            64,
-        ),
-    ]
-    # use multiprocess to speed up compilation
-    import multiprocessing
-
-    max_parallel_jobs = min(len(jobs), multiprocessing.cpu_count())
-    with multiprocessing.Pool(processes=max_parallel_jobs) as pool:
-        pool.starmap(_compile_one, jobs)
-
-
-if __name__ == "__main__":
-    compile_aot()
