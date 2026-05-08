@@ -49,9 +49,22 @@ class OutlinesGrammar(BaseGrammarObject):
         self.guide = guide
         self.jump_forward_map = jump_forward_map
         self.state = 0
+        self._state_history: List[int] = []
 
     def accept_token(self, token: int):
+        self._state_history.append(self.state)
         self.state = self.guide.get_next_state(self.state, token)
+
+    def rollback(self, k: int):
+        if k <= 0:
+            return
+        if k > len(self._state_history):
+            raise ValueError(
+                f"Cannot rollback {k} tokens with only {len(self._state_history)}"
+                " accepted tokens in history."
+            )
+        self.state = self._state_history[-k]
+        del self._state_history[-k:]
 
     def allocate_vocab_mask(
         self, vocab_size: int, batch_size: int, device
