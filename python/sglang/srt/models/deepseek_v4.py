@@ -898,12 +898,18 @@ class MQALayer(nn.Module):
 
         if _FP8_WO_A_GEMM:
             import deep_gemm
+            from sglang.srt.layers.fast_fp8_quant import (
+                fast_per_token_group_quant_fp8_128,
+            )
 
             T, G, D = o.shape
             R = self.o_lora_rank
-            o_fp8, o_s = sglang_per_token_group_quant_fp8(
+            # Replaces sglang_per_token_group_quant_fp8 — the upstream sgl_kernel
+            # implementation runs at ~42% HBM peak on this shape; the triton 2D-tile
+            # variant hits ~85% peak (180 µs → 70 µs at T=8192,G=4,D=4096), enough
+            # to flip the FP8_WO path from net-loss to ~+27% vs the bf16 einsum.
+            o_fp8, o_s = fast_per_token_group_quant_fp8_128(
                 o.reshape(T * G, D).contiguous(),
-                group_size=128,
             )
             output = torch.empty(T, G, R, device=o.device, dtype=torch.bfloat16)
             deep_gemm.fp8_einsum(
@@ -1006,7 +1012,14 @@ class DeepseekV4DecoderLayer(nn.Module):
         hc_fn: torch.Tensor,
         hc_scale: torch.Tensor,
         hc_base: torch.Tensor,
+        norm: Optional[nn.Module] = None,
     ):
+        """If `norm` is given, the returned hidden_states are post-norm.
+        When the TileLang path + SGLANG_OPT_FUSE_HC_PRE_NORM is on, the norm
+        is fused into mhc_pre's big_fuse kernel; otherwise we fall back to a
+        separate norm() call. Caller must NOT apply `norm` again.
+        """
+
         @maybe_torch_compile
         def hc_pre_torch_impl(x, hc_fn):
             x_flat = x.flatten(1).float()
@@ -1029,6 +1042,14 @@ class DeepseekV4DecoderLayer(nn.Module):
         if envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.get():
             from sglang.srt.layers.mhc import mhc_pre
 
+            fuse_norm = (
+                norm is not None and envs.SGLANG_OPT_FUSE_HC_PRE_NORM.get()
+            )
+            mhc_kwargs = {}
+            if fuse_norm:
+                mhc_kwargs["norm_weight"] = norm.weight.data
+                mhc_kwargs["norm_eps"] = norm.variance_epsilon
+
             post, comb, y = mhc_pre(
                 residual=x,
                 fn=hc_fn,
@@ -1039,7 +1060,10 @@ class DeepseekV4DecoderLayer(nn.Module):
                 hc_sinkhorn_eps=self.hc_eps,
                 hc_post_mult_value=2.0,
                 sinkhorn_repeat=self.hc_sinkhorn_iters,
+                **mhc_kwargs,
             )
+            if not fuse_norm and norm is not None:
+                y = norm(y)
             return y, post.squeeze(-1), comb
 
         if envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.get():
@@ -1070,7 +1094,10 @@ class DeepseekV4DecoderLayer(nn.Module):
             self.hc_eps,
         )
         y = (pre.squeeze(1).unsqueeze(-1) * x_flat.view(shape)).sum(dim=1)
-        return y.to(dtype), post.squeeze(1), comb.squeeze(1)
+        y = y.to(dtype)
+        if norm is not None:
+            y = norm(y)
+        return y, post.squeeze(1), comb.squeeze(1)
 
     def hc_post(
         self,
@@ -1116,9 +1143,12 @@ class DeepseekV4DecoderLayer(nn.Module):
 
         residual = hidden_states
         hidden_states, post, comb = self.hc_pre(
-            hidden_states, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base
+            hidden_states,
+            self.hc_attn_fn,
+            self.hc_attn_scale,
+            self.hc_attn_base,
+            norm=self.input_layernorm,
         )
-        hidden_states = self.input_layernorm(hidden_states)
 
         hidden_states = self.self_attn(
             x=hidden_states,
@@ -1129,9 +1159,12 @@ class DeepseekV4DecoderLayer(nn.Module):
         hidden_states = self.hc_post(hidden_states, residual, post, comb)
         residual = hidden_states
         hidden_states, post, comb = self.hc_pre(
-            hidden_states, self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base
+            hidden_states,
+            self.hc_ffn_fn,
+            self.hc_ffn_scale,
+            self.hc_ffn_base,
+            norm=self.post_attention_layernorm,
         )
-        hidden_states = self.post_attention_layernorm(hidden_states)
 
         _use_cp = self.nsa_enable_prefill_cp and nsa_use_prefill_cp(forward_batch)
         _use_tp_moe_gather = (
@@ -1260,6 +1293,17 @@ class DeepseekV4Model(nn.Module):
         hc_scale: torch.Tensor,
         hc_base: torch.Tensor,
     ):
+        if envs.SGLANG_OPT_USE_FUSED_HC_HEAD.get() and x.numel() > 0:
+            from sglang.srt.layers.mhc_head import fused_hc_head
+
+            return fused_hc_head(
+                x.contiguous(),
+                hc_fn,
+                hc_scale,
+                hc_base,
+                norm_eps=self.norm_eps,
+                hc_eps=self.hc_eps,
+            )
         shape, dtype = x.size(), x.dtype
         x = x.flatten(1).float()
         rsqrt = torch.rsqrt(x.square().mean(-1, keepdim=True) + self.norm_eps)

@@ -19,7 +19,7 @@ RUN pip install https://github.com/sgl-project/whl/releases/download/v0.3.21/sgl
 
 RUN pip uninstall -y deep-gemm deep_gemm 2>/dev/null; \
     cd /tmp && rm -rf DeepGEMM && \
-    git clone https://github.com/sgl-project/DeepGEMM.git -b release && \
+    git clone https://github.com/sgl-project/DeepGEMM.git && \
     cd DeepGEMM && git checkout 7f2a70 && \
     git submodule update --init --recursive && \
     ln -sf $(pwd)/third-party/cutlass/include/cutlass $(pwd)/deep_gemm/include/cutlass && \
