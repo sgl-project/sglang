@@ -16,7 +16,6 @@ from setproctitle import setproctitle
 
 from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.runtime.cancellation import (
-    CLIENT_CANCELLED_MESSAGE,
     RequestCancelledError,
     raise_if_cancelled,
 )
@@ -404,17 +403,11 @@ class GPUWorker:
             logger.info("Cancelled %s: %s", error_context, e)
             if output_batch is None:
                 output_batch = OutputBatch()
-            output_batch.error = CLIENT_CANCELLED_MESSAGE
-            output_batch.cancelled = True
-            output_batch.cancel_reason = e.reason
-            output_batch.output = None
-            output_batch.audio = None
-            output_batch.audio_sample_rate = None
-            output_batch.output_file_paths = None
-            # Preserve the compacted layout so rank 0 can map cancellation back
-            # to the original dynamic-batch request order.
-            output_batch.active_request_indices = req.extra.get(
-                "dynamic_batch_active_request_indices"
+            output_batch.set_as_cancelled(
+                reason=e.reason,
+                active_request_indices=req.extra.get(
+                    "dynamic_batch_active_request_indices"
+                ),
             )
             if output_batch.metrics is None and log_reqs:
                 output_batch.metrics = log_reqs[0].metrics

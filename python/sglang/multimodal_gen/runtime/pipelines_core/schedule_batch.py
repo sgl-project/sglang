@@ -23,6 +23,7 @@ import PIL.Image
 import torch
 
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
+from sglang.multimodal_gen.runtime.cancellation import CLIENT_CANCELLED_MESSAGE
 from sglang.multimodal_gen.runtime.post_training.rl_dataclasses import (
     RolloutTrajectoryData,
 )
@@ -391,9 +392,12 @@ class OutputBatch:
     rollout_trajectory_data: RolloutTrajectoryData | None = None
     trajectory_decoded: list[torch.Tensor] | None = None
     error: str | None = None
+    # cancellation status for expected client-side aborts
     cancelled: bool = False
+    # cancellation reason from the marker file
     cancel_reason: str | None = None
     output_file_paths: list[str] | None = None
+    # original dynamic-batch indices that survived denoising compaction
     active_request_indices: list[int] | None = None
 
     # logged metrics info, directly from Req.timings
@@ -403,3 +407,18 @@ class OutputBatch:
     # For ComfyUI integration: noise prediction from denoising stage
     noise_pred: torch.Tensor | None = None
     peak_memory_mb: float = 0.0
+
+    def set_as_cancelled(
+        self,
+        *,
+        reason: str | None = None,
+        active_request_indices: list[int] | None = None,
+    ) -> None:
+        self.error = CLIENT_CANCELLED_MESSAGE
+        self.cancelled = True
+        self.cancel_reason = reason
+        self.output = None
+        self.audio = None
+        self.audio_sample_rate = None
+        self.output_file_paths = None
+        self.active_request_indices = active_request_indices

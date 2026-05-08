@@ -322,15 +322,15 @@ def _slice_attr(obj: Any, name: str, indices: list[int], size: int) -> None:
         setattr(obj, name, slice_batch_axis(getattr(obj, name), indices, size))
 
 
-def compact_batch(
+def compact_batch_at_denoising_stage(
     batch: Req,
     ctx: Any,
     server_args: Any,
 ) -> BatchCompactionResult:
-    """Remove cancelled requests from an active batch.
+    """Remove cancelled requests from an active denoising batch.
 
-    Prompt-aligned state is sliced by request index. Output-aligned state is
-    sliced by generated-output index. Raises when no active request remains.
+    Prompt state, output state, context tensors, and scheduler buffers are
+    sliced together. Raises when no active request remains.
     """
     layout = DynamicBatchLayout.from_req(batch)
     if layout is None:

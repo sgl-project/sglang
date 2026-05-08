@@ -73,7 +73,7 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager im
     ComponentUse,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.batch_compaction import (
-    compact_batch,
+    compact_batch_at_denoising_stage,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
@@ -846,7 +846,11 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         server_args: ServerArgs,
     ) -> bool:
         """Compact cancelled members; raise if no active request remains."""
-        result = compact_batch(batch=batch, ctx=ctx, server_args=server_args)
+        result = compact_batch_at_denoising_stage(
+            batch=batch,
+            ctx=ctx,
+            server_args=server_args,
+        )
         if result.compacted:
             self.log_info(
                 "Compacted batch after cancellation: %d -> %d active request(s)",
