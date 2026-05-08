@@ -70,6 +70,22 @@ class DecodeStatus:
     read_offset: int
     # Offset that's sent to tokenizer for incremental update.
     sent_offset: int = 0
+    decoded_text_len: int = dataclasses.field(init=False)
+    decoded_text_chunks: List[str] = dataclasses.field(default_factory=list)
+
+    def __post_init__(self):
+        self.decoded_text_len = len(self.decoded_text)
+
+    def append_decoded_text(self, text: str):
+        if text:
+            self.decoded_text_chunks.append(text)
+            self.decoded_text_len += len(text)
+
+    def get_decoded_text(self) -> str:
+        if self.decoded_text_chunks:
+            self.decoded_text += "".join(self.decoded_text_chunks)
+            self.decoded_text_chunks.clear()
+        return self.decoded_text
 
 
 class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
@@ -185,6 +201,25 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
         space_list: List[bool],
     ) -> List[str]:
         """Batch decode with grouping by (skip_special_tokens, spaces_between_special_tokens)."""
+        if not ids_list:
+            return []
+
+        # Empty token spans decode to empty strings, but calling tokenizer.batch_decode
+        # on thousands of empty spans is expensive in high-concurrency streaming.
+        non_empty_indices = [idx for idx, ids in enumerate(ids_list) if ids]
+        if len(non_empty_indices) != len(ids_list):
+            if not non_empty_indices:
+                return [""] * len(ids_list)
+
+            results = [""] * len(ids_list)
+            decoded = self._grouped_batch_decode(
+                [ids_list[idx] for idx in non_empty_indices],
+                [skip_list[idx] for idx in non_empty_indices],
+                [space_list[idx] for idx in non_empty_indices],
+            )
+            for idx, text in zip(non_empty_indices, decoded):
+                results[idx] = text
+            return results
 
         # fast path
         first_skip, first_space = skip_list[0], space_list[0]
@@ -299,10 +334,17 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             if recv_obj.finished_reasons[i] is None:
                 # Streaming chunk: update the decode status
                 if new_text and not new_text.endswith("�"):
-                    s.decoded_text += new_text
+                    old_sent_offset = s.sent_offset
+                    old_decoded_text_len = s.decoded_text_len
+                    s.append_decoded_text(new_text)
                     s.surr_offset = s.read_offset
                     s.read_offset = len(s.decode_ids)
-                    new_text = ""
+                    s.sent_offset = s.decoded_text_len
+                    if old_sent_offset == old_decoded_text_len:
+                        output_strs.append(new_text)
+                    else:
+                        output_strs.append(s.get_decoded_text()[old_sent_offset:])
+                    continue
                 else:
                     new_text = find_printable_text(new_text)
             else:
@@ -310,7 +352,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
                     del self.decode_status[rid]
 
             output_str = self.trim_matched_stop(
-                s.decoded_text + new_text,
+                s.get_decoded_text() + new_text,
                 recv_obj.finished_reasons[i],
                 recv_obj.no_stop_trim[i],
             )
