@@ -484,13 +484,39 @@ class DraftTailBuffer:
         append_stats["committed_lens_after_by_req"] = committed_lens_after_by_req
         append_stats.pop("_index_by_request_id", None)
 
-    def _has_required_tail_tokens_locked(self, reqs: list) -> bool:
-        for req in reqs:
-            state = self._states.get(req.rid)
-            assert state, f"unexpected request_id={req.rid}"
-            if state.consumable_tail_len() < self.required_tail_len:
+    def _has_min_draft_tokens_locked(
+        self, rids: list[str], min_draft_tokens: int
+    ) -> bool:
+        min_draft_tokens = max(0, int(min_draft_tokens))
+        for rid in rids:
+            state = self._states.get(rid)
+            assert state, f"unexpected request_id={rid}"
+            if len(state.tail_tokens) < min_draft_tokens:
                 return False
         return True
+
+    def _wait_for_draft_tokens_locked(
+        self, rids: list[str], min_draft_tokens: int
+    ) -> None:
+        min_draft_tokens = max(0, int(min_draft_tokens))
+        if min_draft_tokens <= 0:
+            return
+        while (
+            not self._closed
+            and not self._has_min_draft_tokens_locked(rids, min_draft_tokens)
+        ):
+            self._condition.wait()
+        if self._closed:
+            raise RuntimeError(
+                "DraftTailBuffer closed while waiting for draft tail tokens."
+            )
+
+    def wait_for_draft_tokens(
+        self, rids: list[str], min_draft_tokens: int
+    ) -> None:
+        """Wait until every request has at least N raw draft tokens buffered."""
+        with self._condition:
+            self._wait_for_draft_tokens_locked(rids, min_draft_tokens)
 
     def get_draft_snapshots(
         self,
@@ -501,15 +527,14 @@ class DraftTailBuffer:
     ) -> list[DraftTailSnapshot]:
         with self._condition:
             if not allow_partial:
-                while (
-                    not self._closed
-                    and not self._has_required_tail_tokens_locked(reqs)
-                ):
-                    self._condition.wait()
-                if self._closed:
-                    raise RuntimeError(
-                        "DraftTailBuffer closed while waiting for draft tail tokens."
-                    )
+                min_raw_tail_len = (
+                    self.required_tail_len + 1
+                    if self.required_tail_len > 0
+                    else 1
+                )
+                self._wait_for_draft_tokens_locked(
+                    [req.rid for req in reqs], min_raw_tail_len
+                )
 
             snapshots: list[DraftTailSnapshot] = []
             for req in reqs:
