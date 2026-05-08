@@ -10,7 +10,6 @@ from sglang.multimodal_gen.test.server.testcase_configs import (
     MODELOPT_QWEN_IMAGE_FP8_TRANSFORMER,
     MODELOPT_WAN22_FP8_TRANSFORMER,
     MODELOPT_WAN22_NVFP4_TRANSFORMER,
-    NUNCHAKU_QWEN_IMAGE_LIGHTNING_FP4_WEIGHTS,
     T2V_PROMPT,
     DiffusionSamplingParams,
     DiffusionServerArgs,
@@ -462,28 +461,9 @@ else:
             env_vars=MODELOPT_NVFP4_B200_ENV_VARS,
         ),
     ]
-    ONE_GPU_NUNCHAKU_B200_CASES = [
-        DiffusionTestCase(
-            "qwen_image_nunchaku_fp4_lightning_t2i",
-            DiffusionServerArgs(
-                model_path=DEFAULT_QWEN_IMAGE_MODEL_NAME_FOR_TEST,
-                modality="image",
-                enable_warmup=False,
-                extras=[
-                    "--transformer-weights-path",
-                    NUNCHAKU_QWEN_IMAGE_LIGHTNING_FP4_WEIGHTS,
-                ],
-            ),
-            DiffusionSamplingParams(
-                prompt="Doraemon is eating dorayaki",
-                output_size="768x768",
-                extras={"num_inference_steps": 4, "seed": 0},
-            ),
-            run_perf_check=False,
-            run_consistency_check=False,
-            run_component_accuracy_check=False,
-        ),
-    ]
+    # Nunchaku v1.2.1 wheels do not ship SM100 kernels, so B200 cannot run these
+    # cases until upstream adds SM100 support.
+    ONE_GPU_NUNCHAKU_B200_CASES = []
 
 ONE_GPU_B200_CASES = ONE_GPU_MODELOPT_NVFP4_CASES + ONE_GPU_NUNCHAKU_B200_CASES
 

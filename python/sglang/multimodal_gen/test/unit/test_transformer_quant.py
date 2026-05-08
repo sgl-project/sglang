@@ -123,7 +123,31 @@ class TestTransformerQuantHelpers(unittest.TestCase):
         return_value=1,
     )
     @patch("sglang.multimodal_gen.configs.quantization.nunchaku.current_platform")
-    def test_nunchaku_validation_allows_b200_sm100(
+    def test_nunchaku_validation_rejects_b200_sm100(
+        self, mock_platform, _mock_device_count, _mock_capability, _mock_available
+    ):
+        mock_platform.is_cuda.return_value = True
+
+        with self.assertRaisesRegex(ValueError, "SM100"):
+            NunchakuSVDQuantArgs(
+                enable_svdquant=True,
+                transformer_weights_path="/tmp/svdq-fp4_r32.safetensors",
+            ).resolve_runtime_config()
+
+    @patch(
+        "sglang.multimodal_gen.configs.quantization.nunchaku.is_nunchaku_available",
+        return_value=True,
+    )
+    @patch(
+        "sglang.multimodal_gen.configs.quantization.nunchaku.torch.cuda.get_device_capability",
+        return_value=(12, 0),
+    )
+    @patch(
+        "sglang.multimodal_gen.configs.quantization.nunchaku.torch.cuda.device_count",
+        return_value=1,
+    )
+    @patch("sglang.multimodal_gen.configs.quantization.nunchaku.current_platform")
+    def test_nunchaku_validation_allows_sm120(
         self, mock_platform, _mock_device_count, _mock_capability, _mock_available
     ):
         mock_platform.is_cuda.return_value = True
