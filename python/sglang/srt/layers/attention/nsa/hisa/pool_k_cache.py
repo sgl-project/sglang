@@ -199,13 +199,16 @@ class HisaNSATokenToKVPool(NSATokenToKVPool):
 
         # Persistent int32 scratch for prev / new seq_lens — graph-capturable
         # dtype casts (source may be int64 in prefill path). Tiny tensors.
+        # +1 to mirror ReqToTokenPool sizing convention even though these
+        # scratches are sliced by batch position ([:B]) rather than indexed
+        # by req_pool_idx — defensive, avoids future misuse.
         self._scratch_prev_lens_i32 = torch.zeros(
-            max_running_requests,
+            max_running_requests + 1,
             dtype=torch.int32,
             device=self.device,
         )
         self._scratch_new_lens_i32 = torch.zeros(
-            max_running_requests,
+            max_running_requests + 1,
             dtype=torch.int32,
             device=self.device,
         )
@@ -213,7 +216,7 @@ class HisaNSATokenToKVPool(NSATokenToKVPool):
         # (see get_pool_page_tables): avoids a per-layer allocator hit from
         # fancy indexing. Full width; caller takes a [:B] view.
         self._scratch_pool_page_tables = torch.zeros(
-            (max_running_requests, max_pool_pages_per_req),
+            (max_running_requests + 1, max_pool_pages_per_req),
             dtype=torch.int32,
             device=self.device,
         )
@@ -228,8 +231,11 @@ class HisaNSATokenToKVPool(NSATokenToKVPool):
         # each layer's update_pool both reads and writes the watermark —
         # a shared watermark would be advanced by layer 0 and silently
         # skip layers 1..N-1.
+        # +1 padding column to mirror ReqToTokenPool: this buffer is indexed
+        # by req_pool_idx (values 1..max_running_requests; cuda-graph dummies
+        # use 0), so dim-1 must be max_running_requests + 1.
         self._pool_watermark_i32 = torch.zeros(
-            (self.layer_num, max_running_requests),
+            (self.layer_num, max_running_requests + 1),
             dtype=torch.int32,
             device=self.device,
         )
