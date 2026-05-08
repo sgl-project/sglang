@@ -585,7 +585,7 @@ TWO_GPU_CASES = [
         "ltx_2.3_two_stage_t2v_2gpus",
         DiffusionServerArgs(
             model_path="Lightricks/LTX-2.3",
-            tp_size=2,
+            cfg_parallel=True,
             extras=[
                 "--pipeline-class-name LTX2TwoStagePipeline",
                 "--ltx2-two-stage-device-mode resident",
