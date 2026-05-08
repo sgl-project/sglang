@@ -50,15 +50,9 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 if _use_aiter:
     from aiter import ActivationType, QuantType
     from aiter.fused_moe import fused_moe
-elif _is_npu:
-    pass
 
 
 logger = logging.getLogger(__name__)
-
-
-if _is_npu:
-    pass
 
 
 class DeepEPMoE(FusedMoE):
