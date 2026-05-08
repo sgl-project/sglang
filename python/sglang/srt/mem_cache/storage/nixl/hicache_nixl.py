@@ -56,7 +56,6 @@ class HiCacheNixl(HiCacheStorage):
             else None
         )
 
-        # Initialize suffix based on storage config
         tp_rank, tp_size, model_name = (
             storage_config.tp_rank,
             storage_config.tp_size,
@@ -85,6 +84,10 @@ class HiCacheNixl(HiCacheStorage):
 
     def _get_suffixed_key(self, key: str) -> str:
         return key + self.config_suffix
+
+    # ------------------------------------------------------------------
+    # Memory registration helpers
+    # ------------------------------------------------------------------
 
     def _register_buffers(
         self, buffers: Union[torch.Tensor, List[torch.Tensor], List[tuple]]
@@ -135,14 +138,28 @@ class HiCacheNixl(HiCacheStorage):
         for fd in fds:
             self.file_manager.close_file(fd)
 
-    def _register_objects(
-        self, keys: List[str], sizes: Optional[List[int]] = None
-    ) -> Optional[Any]:
+    def _register_objects(self, keys: List[str]) -> Optional[Any]:
         """Register objects with NIXL."""
-        if not keys:
-            return None
         tuples = [(0, 0, key, "") for key in keys]
         return self.registration._register_memory(tuples, "OBJ")
+
+    def _create_files_for_keys(
+        self, suffixed_keys: List[str]
+    ) -> Optional[List[str]]:
+        """Create empty files for each key; return their paths or None on first failure."""
+        # New file per set, to be updated when partial writes is added to HiCache
+        file_paths = []
+        for key in suffixed_keys:
+            file_path = self.file_manager.get_file_path(key)
+            if not self.file_manager.create_file(file_path):
+                logger.error(f"Failed to create file {file_path}")
+                return None
+            file_paths.append(file_path)
+        return file_paths
+
+    # ------------------------------------------------------------------
+    # Transfer pipeline
+    # ------------------------------------------------------------------
 
     def _get_storage_descs(
         self, buffers: List[torch.Tensor | tuple], keys: List[str]
@@ -187,9 +204,7 @@ class HiCacheNixl(HiCacheStorage):
             return storage_descs, None, []
 
     def _get_host_descs(
-        self,
-        buffers: List[torch.Tensor | tuple],
-        direction: str,
+        self, buffers: List[torch.Tensor | tuple]
     ) -> Optional[Any]:
         """Build host xfer descs and register buffers for the transfer.
 
@@ -269,7 +284,7 @@ class HiCacheNixl(HiCacheStorage):
             storage_descs, reg_descs, fds = self._get_storage_descs(buffers, keys)
             if storage_descs is None:
                 return False
-            host_descs = self._get_host_descs(buffers, direction)
+            host_descs = self._get_host_descs(buffers)
             if host_descs is None:
                 return False
             return self._run_xfer(host_descs, storage_descs, direction, buffers)
@@ -277,13 +292,16 @@ class HiCacheNixl(HiCacheStorage):
             if reg_descs is not None:
                 self._deregister_files(reg_descs, fds)
 
+    # ------------------------------------------------------------------
+    # Legacy single-item / batch API (required by HiCacheStorage ABC)
+    # ------------------------------------------------------------------
+
     def get(
         self,
         key: str,
         target_location: Optional[torch.Tensor | int] = None,
         target_sizes: Optional[int] = None,
     ) -> torch.Tensor | None:
-        # To be removed, being compatible with the current API
         if target_location is None:
             return None
         if target_sizes:
@@ -300,8 +318,6 @@ class HiCacheNixl(HiCacheStorage):
     ) -> List[torch.Tensor | None]:
         if not keys:
             return []
-
-        # To be removed, being compatible with the current API
         if not target_locations:
             return [None] * len(keys)
 
@@ -314,7 +330,6 @@ class HiCacheNixl(HiCacheStorage):
         else:
             dest = target_locations
 
-        # Add suffix to keys
         suffixed_keys = [self._get_suffixed_key(key) for key in keys]
 
         if self.backend_selector.mem_type == "FILE":
@@ -350,29 +365,15 @@ class HiCacheNixl(HiCacheStorage):
         if not values:
             values = list(zip(target_locations, target_sizes))
 
-        # Add suffix to keys
         suffixed_keys = [self._get_suffixed_key(key) for key in keys]
 
         if self.backend_selector.mem_type == "FILE":
-            file_paths = []
-            for key in suffixed_keys:
-                file_path = self.file_manager.get_file_path(key)
-                # New file per set, to be updated when partial writes is added to HiCache
-                if not self.file_manager.create_file(file_path):
-                    logger.error(f"Failed to create file {file_path}")
-                    return False
-                file_paths.append(file_path)
+            file_paths = self._create_files_for_keys(suffixed_keys)
+            if file_paths is None:
+                return False
             return self._execute_transfer(values, file_paths, "WRITE")
         else:  # mem_type == "OBJ"
             return self._execute_transfer(values, suffixed_keys, "WRITE")
-
-    ############################################################################
-    # batch_*_v1 functions
-    # zero copy + non-zero-copy version for get, set, exists, batch_exists
-    ############################################################################
-
-    def clear(self) -> None:
-        self.file_manager.clear()
 
     def register_mem_pool_host(self, mem_pool_host: HostKVCache):
         super().register_mem_pool_host(mem_pool_host)
@@ -396,18 +397,14 @@ class HiCacheNixl(HiCacheStorage):
         keys: List[str],
         extra_info: Optional[HiCacheStorageExtraInfo] = None,
     ) -> int:
-        # Add suffix to key
-
         if self.is_zero_copy:
             key_list = self._get_key_list_from_meta(keys)
-            key_denominator = (
-                1 if not self.is_mla_model else 2
-            )  # MLA model only has k buffer, no separate v buffer
+            # MLA model only has k buffer, no separate v buffer
+            key_denominator = 1 if not self.is_mla_model else 2
         else:
             key_list = [self._get_suffixed_key(key) for key in keys]
             key_denominator = 1
 
-        # obtain list of tuples by calling self.registration.create_query_tuples()
         tuples = []
         for key in key_list:
             tuples += self.registration.create_query_tuples(
@@ -427,18 +424,19 @@ class HiCacheNixl(HiCacheStorage):
                 return i // key_denominator
         return len(query_res) // key_denominator
 
+    # ------------------------------------------------------------------
+    # batch_*_v1 implementation (zero-copy + non-zero-copy)
+    # ------------------------------------------------------------------
+
     def _get_key_list_from_meta(self, keys: List[str]) -> List[str]:
-        # construct the key list for NIXL transfer based on the keys and the suffix, for each key, we will have one suffixed key for k buffer and one suffixed key for v buffer if it's not an MLA model, and only one suffixed key for k buffer if it's an MLA model, since MLA model only has k/v interleaved buffer
+        # Each key maps to a `_k` entry, plus a `_v` entry on non-MLA models
+        # (MLA stores k/v interleaved in a single buffer).
         key_list = []
-
-        for key_ in keys:
-            suffixed_key = self._get_suffixed_key(key_)
-            if self.is_mla_model:
-                key_list.append(f"{suffixed_key}_k")
-            else:
-                key_list.append(f"{suffixed_key}_k")
+        for key in keys:
+            suffixed_key = self._get_suffixed_key(key)
+            key_list.append(f"{suffixed_key}_k")
+            if not self.is_mla_model:
                 key_list.append(f"{suffixed_key}_v")
-
         return key_list
 
     def _get_location_and_size_list_from_meta(
@@ -454,47 +452,62 @@ class HiCacheNixl(HiCacheStorage):
             logger.error(
                 f"HiCacheNixl: mismatch between number of keys and number of buffer meta entries, keys: {len(keys)}, key_list: {len(key_list)}, buffer meta entries: {len(ptr_list)}"
             )
-            return [], [], [], []
+            return [], [], []
 
-        return key_list, [], ptr_list, element_size_list
+        return key_list, ptr_list, element_size_list
 
-    def _batch_get_preprocess(self, keys: List[str], host_indices: torch.Tensor):
-        page_num = len(host_indices) // self.mem_pool_host.page_size
+    def _batch_preprocess(
+        self, keys: List[str], host_indices: torch.Tensor, op: str
+    ):
+        """Build (key_list, target_tensors, ptr_list, size_list) for the v1 path.
+
+        ``op`` is "get" (allocate dummy flat target tensors) or
+        "set" (snapshot current host pages as contiguous source tensors).
+        Returns ([], [], [], []) on validation failure.
+        """
+        page_size = self.mem_pool_host.page_size
+        page_num = len(host_indices) // page_size
 
         if len(keys) == 0 or len(keys) != page_num:
             logger.warning(
-                f"HiCacheNixl: empty keys or mismatch in keys and host_indices lengths. keys: {len(keys)}, host_indices: {len(host_indices)}, page_size: {self.mem_pool_host.page_size}"
+                f"HiCacheNixl: empty keys or mismatch in keys and host_indices lengths. keys: {len(keys)}, host_indices: {len(host_indices)}, page_size: {page_size}"
             )
             return [], [], [], []
 
         if self.is_zero_copy:
-            key_list, _, ptr_list, element_size_list = (
-                self._get_location_and_size_list_from_meta(keys, host_indices)
+            key_list, ptr_list, size_list = self._get_location_and_size_list_from_meta(
+                keys, host_indices
             )
-            return key_list, [], ptr_list, element_size_list
-        else:
-            # non zero copy: create contiguous, temporary tensors
+            return key_list, [], ptr_list, size_list
+
+        # non zero copy: build contiguous tensors NIXL can transfer
+        if op == "get":
             target_tensors = [
-                self.mem_pool_host.get_dummy_flat_data_page() for i in range(page_num)
+                self.mem_pool_host.get_dummy_flat_data_page() for _ in range(page_num)
+            ]
+        else:  # "set"
+            target_tensors = [
+                self.mem_pool_host.get_data_page(
+                    host_indices[i * page_size], flat=False
+                ).contiguous()
+                for i in range(page_num)
             ]
 
-            key_list = [self._get_suffixed_key(key) for key in keys]
-            ptr_list = [tensor.data_ptr() for tensor in target_tensors]
-            element_size_list = [
-                tensor.numel() * tensor.element_size() for tensor in target_tensors
-            ]
+        key_list = [self._get_suffixed_key(key) for key in keys]
+        ptr_list = [t.data_ptr() for t in target_tensors]
+        size_list = [t.numel() * t.element_size() for t in target_tensors]
+        return key_list, target_tensors, ptr_list, size_list
 
-            return key_list, target_tensors, ptr_list, element_size_list
-
-    def _batch_get_zero_copy_impl(
+    def _batch_xfer(
         self,
         keys: List[str],
         key_strs: List[str],
         target_tensors: List[torch.Tensor],
         target_locations: List[int],
         target_sizes: List[int],
-    ) -> List[int]:
-
+        direction: str,
+    ) -> List[bool]:
+        """Run a batch READ or WRITE for the v1 path."""
         if not key_strs or not target_locations or not target_sizes:
             return [False] * len(keys)
 
@@ -507,17 +520,24 @@ class HiCacheNixl(HiCacheStorage):
             return [False] * len(keys)
 
         if self.is_zero_copy:
-            dest = list(zip(target_locations, target_sizes))
+            buffers = list(zip(target_locations, target_sizes))
         else:
-            dest = target_tensors
+            buffers = target_tensors
 
         if self.backend_selector.mem_type == "FILE":
-            file_paths = [self.file_manager.get_file_path(key) for key in key_strs]
-            success = self._execute_transfer(dest, file_paths, "READ")
-        else:
-            success = self._execute_transfer(dest, key_strs, "READ")
+            if direction == "WRITE":
+                file_paths = self._create_files_for_keys(key_strs)
+                if file_paths is None:
+                    return [False] * len(keys)
+            else:
+                file_paths = [
+                    self.file_manager.get_file_path(key) for key in key_strs
+                ]
+            success = self._execute_transfer(buffers, file_paths, direction)
+        else:  # mem_type == "OBJ"
+            success = self._execute_transfer(buffers, key_strs, direction)
 
-        return [True] * len(key_strs) if success else [False] * len(key_strs)
+        return [success] * len(keys)
 
     def _batch_get_postprocess(
         self,
@@ -525,28 +545,39 @@ class HiCacheNixl(HiCacheStorage):
         target_tensors: List[torch.Tensor],
         results: List[bool],
     ) -> List[bool]:
-
-        page_num = len(host_indices) // self.mem_pool_host.page_size
+        page_size = self.mem_pool_host.page_size
+        page_num = len(host_indices) // page_size
 
         if self.is_zero_copy:
             # zero copy: update final results based on the boolean results from NIXL transfer
             if self.is_mla_model:
                 return results
-            else:
-                results = [
-                    (results[2 * i] and results[2 * i + 1]) for i in range(page_num)
-                ]
-                return results
-        else:
-            # non zero copy: copy data from temporary tensors to mem_pool_host page by page
-            for i in range(page_num):
-                if not results[i]:
-                    break
-                self.mem_pool_host.set_from_flat_data_page(
-                    host_indices[i * self.mem_pool_host.page_size], target_tensors[i]
-                )
+            return [(results[2 * i] and results[2 * i + 1]) for i in range(page_num)]
 
-            return results
+        # non zero copy: copy data from temporary tensors to mem_pool_host page by page
+        for i in range(page_num):
+            if not results[i]:
+                break
+            self.mem_pool_host.set_from_flat_data_page(
+                host_indices[i * page_size], target_tensors[i]
+            )
+        return results
+
+    def _log_xfer_stats(
+        self,
+        op_name: str,
+        num_keys: int,
+        host_indices: torch.Tensor,
+        buffer_sizes: List[int],
+        elapsed_ms: float,
+    ) -> None:
+        total_bytes = sum(s for s in buffer_sizes if s is not None)
+        bw = total_bytes / (elapsed_ms / 1000) / (1024 * 1024) if elapsed_ms else 0.0
+        logger.debug(
+            f"HiCacheNixl {op_name} transferred: {num_keys} keys (pages), "
+            f"{host_indices.numel()} host_indices, {total_bytes} bytes, "
+            f"total time: {elapsed_ms:.3f} ms, effective bandwidth: {bw:.2f} MB/s"
+        )
 
     def batch_get_v1(
         self,
@@ -554,9 +585,8 @@ class HiCacheNixl(HiCacheStorage):
         host_indices: torch.Tensor,
         extra_info: Optional[HiCacheStorageExtraInfo] = None,
     ) -> List[bool]:
-
-        key_strs, target_tensors, buffer_ptrs, buffer_sizes = (
-            self._batch_get_preprocess(keys, host_indices)
+        key_strs, target_tensors, buffer_ptrs, buffer_sizes = self._batch_preprocess(
+            keys, host_indices, "get"
         )
 
         if not key_strs or not buffer_ptrs or not buffer_sizes:
@@ -566,94 +596,15 @@ class HiCacheNixl(HiCacheStorage):
             return [False] * len(keys)
 
         start_time = time.perf_counter()
-
-        results_get = self._batch_get_zero_copy_impl(
-            keys, key_strs, target_tensors, buffer_ptrs, buffer_sizes
+        results = self._batch_xfer(
+            keys, key_strs, target_tensors, buffer_ptrs, buffer_sizes, "READ"
+        )
+        elapsed_ms = (time.perf_counter() - start_time) * 1000
+        self._log_xfer_stats(
+            "batch_get_v1", len(keys), host_indices, buffer_sizes, elapsed_ms
         )
 
-        end_time = time.perf_counter()
-        elapsed_time_ms = (end_time - start_time) * 1000
-        total_bytes = sum(s for s in buffer_sizes if s is not None)
-
-        logger.debug(
-            f"HiCacheNixl batch_get_v1 transferred: {len(keys)} keys (pages), {host_indices.numel()} host_indices, {total_bytes} bytes, total time: {elapsed_time_ms:.3f} ms, effective bandwidth: {total_bytes / (elapsed_time_ms / 1000) / (1024 * 1024):.2f} MB/s"
-        )
-
-        return self._batch_get_postprocess(host_indices, target_tensors, results_get)
-
-    def _batch_set_preprocess(self, keys: List[str], host_indices: torch.Tensor):
-
-        page_num = len(host_indices) // self.mem_pool_host.page_size
-
-        if len(keys) == 0 or len(keys) != page_num:
-            logger.warning(
-                f"HiCacheNixl: empty keys or mismatch in keys and host_indices lengths. keys: {len(keys)}, host_indices: {len(host_indices)}, page_size: {self.mem_pool_host.page_size}"
-            )
-            return [], [], [], []
-
-        if self.is_zero_copy:
-            key_list, _, ptr_list, element_size_list = (
-                self._get_location_and_size_list_from_meta(keys, host_indices)
-            )
-            return key_list, [], ptr_list, element_size_list
-        else:
-            # non zero copy: NIXL still requires contiguous tensors for transfer
-            target_tensors = [
-                self.mem_pool_host.get_data_page(
-                    host_indices[i * self.mem_pool_host.page_size], flat=False
-                ).contiguous()
-                for i in range(page_num)
-            ]
-
-            key_list = [self._get_suffixed_key(key) for key in keys]
-            ptr_list = [tensor.data_ptr() for tensor in target_tensors]
-            element_size_list = [
-                tensor.numel() * tensor.element_size() for tensor in target_tensors
-            ]
-
-            return key_list, target_tensors, ptr_list, element_size_list
-
-    def _batch_set_zero_copy_impl(
-        self,
-        keys: List[str],
-        key_strs: List[str],
-        target_tensors: List[torch.Tensor],
-        target_locations: List[int],
-        target_sizes: List[int],
-    ) -> List[bool]:
-
-        if not key_strs or not target_locations or not target_sizes:
-            return [False] * len(keys)
-
-        if (len(key_strs) != len(target_locations)) or (
-            len(target_sizes) != len(target_locations)
-        ):
-            logger.error(
-                "Mismatch between number of key_strs, target_locations and target_sizes"
-            )
-            return [False] * len(keys)
-
-        if self.is_zero_copy:
-            src = list(zip(target_locations, target_sizes))
-        else:
-            src = target_tensors
-
-        if self.backend_selector.mem_type == "FILE":
-            file_paths = []
-            for key in key_strs:
-                file_path = self.file_manager.get_file_path(key)
-                # New file per set, to be updated when partial writes is added to HiCache
-                if not self.file_manager.create_file(file_path):
-                    logger.error(
-                        f"******** Failed to create file {file_path} *********"
-                    )
-                    return [False] * len(keys)
-                file_paths.append(file_path)
-            success = self._execute_transfer(src, file_paths, "WRITE")
-        else:  # mem_type == "OBJ"
-            success = self._execute_transfer(src, key_strs, "WRITE")
-
-        return [True] * len(keys) if success else [False] * len(keys)
+        return self._batch_get_postprocess(host_indices, target_tensors, results)
 
     def batch_set_v1(
         self,
@@ -661,12 +612,11 @@ class HiCacheNixl(HiCacheStorage):
         host_indices: torch.Tensor,
         extra_info: Optional[HiCacheStorageExtraInfo] = None,
     ) -> List[bool]:
-
         if len(keys) == 0:
             return []
 
-        key_strs, target_tensors, buffer_ptrs, buffer_sizes = (
-            self._batch_set_preprocess(keys, host_indices)
+        key_strs, target_tensors, buffer_ptrs, buffer_sizes = self._batch_preprocess(
+            keys, host_indices, "set"
         )
 
         if not key_strs or not buffer_ptrs or not buffer_sizes:
@@ -676,16 +626,12 @@ class HiCacheNixl(HiCacheStorage):
             return [False] * len(keys)
 
         start_time = time.perf_counter()
-
-        results_set = self._batch_set_zero_copy_impl(
-            keys, key_strs, target_tensors, buffer_ptrs, buffer_sizes
+        results = self._batch_xfer(
+            keys, key_strs, target_tensors, buffer_ptrs, buffer_sizes, "WRITE"
+        )
+        elapsed_ms = (time.perf_counter() - start_time) * 1000
+        self._log_xfer_stats(
+            "batch_set_v1", len(keys), host_indices, buffer_sizes, elapsed_ms
         )
 
-        end_time = time.perf_counter()
-        elapsed_time_ms = (end_time - start_time) * 1000
-        total_bytes = sum(s for s in buffer_sizes if s is not None)
-        logger.debug(
-            f"HiCacheNixl batch_set_v1 transferred: {len(keys)} keys (pages), {host_indices.numel()} host_indices, {total_bytes} bytes, total time: {elapsed_time_ms:.3f} ms, effective bandwidth: {total_bytes / (elapsed_time_ms / 1000) / (1024 * 1024):.2f} MB/s"
-        )
-
-        return results_set
+        return results

@@ -90,11 +90,6 @@ class NixlBackendSelection:
         self.mem_type = None
         self.nixlconfig = nixlconfig
 
-    def set_bucket(self, bucket_name: str) -> None:
-        """Set AWS bucket name in environment variable."""
-        os.environ["AWS_DEFAULT_BUCKET"] = bucket_name
-        logger.debug(f"Set AWS bucket name to: {bucket_name}")
-
     def create_backend(self, agent) -> bool:
         """Create the appropriate NIXL backend based on configuration."""
         try:
