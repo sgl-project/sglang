@@ -64,8 +64,15 @@ def _spill_array(array: np.ndarray) -> NumpyArrayFileRef:
         suffix=".npy",
         dir=directory,
     )
-    with os.fdopen(fd, "wb") as f:
-        np.save(f, array, allow_pickle=False)
+    try:
+        with os.fdopen(fd, "wb") as f:
+            np.save(f, array, allow_pickle=False)
+    except Exception:
+        try:
+            os.unlink(path)
+        except FileNotFoundError:
+            pass
+        raise
     return NumpyArrayFileRef(path=path)
 
 

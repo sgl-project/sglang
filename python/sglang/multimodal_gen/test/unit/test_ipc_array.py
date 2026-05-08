@@ -1,8 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 
+import tempfile
 from pathlib import Path
 
 import numpy as np
+import pytest
 
 from sglang.multimodal_gen.runtime.ipc_array import (
     NumpyArrayFileRef,
@@ -33,6 +35,30 @@ def test_small_arrays_are_kept_inline():
     spilled = spill_large_arrays_to_file_refs((array,))
 
     assert spilled[0] is array
+
+
+def test_spill_removes_temp_file_when_save_fails(monkeypatch):
+    array = np.arange(1024 * 1024, dtype=np.uint8).reshape(1024, 1024)
+    created_paths = []
+
+    def fail_save(*args, **kwargs):
+        raise OSError("simulated write failure")
+
+    original_mkstemp = tempfile.mkstemp
+
+    def tracked_mkstemp(*args, **kwargs):
+        fd, path = original_mkstemp(*args, **kwargs)
+        created_paths.append(Path(path))
+        return fd, path
+
+    monkeypatch.setattr(tempfile, "mkstemp", tracked_mkstemp)
+    monkeypatch.setattr(np, "save", fail_save)
+
+    with pytest.raises(OSError, match="simulated write failure"):
+        spill_large_arrays_to_file_refs(array)
+
+    assert created_paths
+    assert not created_paths[0].exists()
 
 
 def test_local_endpoint_detection():

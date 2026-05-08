@@ -369,9 +369,9 @@ class GPUWorker:
 
                 if torch.cuda.is_initialized():
                     torch.cuda.empty_cache()
-            else:
-                # Keep return_frames payloads off the scheduler's tensor ZMQ path.
-                self._materialize_frame_outputs_for_return(output_batch, req)
+
+            # Keep return_frames payloads off the scheduler's tensor ZMQ path.
+            self._materialize_frame_outputs_for_return(output_batch, req)
 
             if torch.cuda.is_initialized() and output_batch.output is None:
                 torch.cuda.empty_cache()
@@ -414,7 +414,6 @@ class GPUWorker:
         if (
             self.rank != 0
             or output_batch.output is None
-            or req.save_output
             or not req.return_frames
         ):
             return
