@@ -152,13 +152,7 @@ class TritonAttnBackend(AttentionBackend):
                 self.max_context_len,
             )
             if _is_hip:
-                # ROCm-only safety clamp. The #20479 cap inflates max_kv_splits
-                # to next_power_of_2(sm_count) (=512 on MI3xx), which makes the
-                # attn_logits float32 buffer
-                #   bs * num_head * max_kv_splits * v_head_dim * 4
-                # blow up to ~2 GB on Kimi-K2.6 + MI325 and faults ROCm during
-                # CUDA-graph capture/replay (R73 nightly hang). Bound the
-                # buffer to ≤ 512 MB on HIP only; NVIDIA paths are unchanged.
+                # Bound attn_logits float32 buffer to 512 MB on ROCm (#20479's sm_cap faults at ~2 GB on MI3xx + Kimi-K2.6, R73 nightly hang).
                 bs = model_runner.server_args.cuda_graph_max_bs or 1
                 self.max_kv_splits = min(
                     self.max_kv_splits,
