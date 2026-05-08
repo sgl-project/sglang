@@ -61,4 +61,6 @@ def cfg_model_parallel_all_reduce(
     op: torch._C._distributed_c10d.ReduceOp = torch._C._distributed_c10d.ReduceOp.SUM,
 ) -> torch.Tensor:
     """All-reduce the input tensor across CFG parallel group."""
+    if not input_.is_contiguous():
+        input_ = input_.contiguous()
     return get_cfg_group().all_reduce(input_, op=op)
