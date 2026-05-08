@@ -1030,6 +1030,7 @@ class DeepseekV4AttnBackend(
                 )
 
                 o = flash_mla_with_kvcache_entrypoint(
+                    "sm120_fallback",
                     q=q,
                     k_cache=swa_k_cache,
                     head_dim_v=self.head_dim_v,
