@@ -447,16 +447,26 @@ class MambaMixer2(torch.nn.Module):
 
         query_start_loc = metadata.query_start_loc
 
-        # DP attention may pad `extend_num_tokens` for collective-op alignment,
-        # so `hidden_states` can have padded rows beyond what the mamba kernel
-        # should process. Trim to the real token count so in_proj / split /
-        # kernel all operate on `num_actual_tokens`. Padded rows of the
-        # caller's `output` tensor are zeroed at the end of this forward to
-        # prevent uninitialized data from propagating to downstream layers.
-        num_decode_tokens_pre = (
-            metadata.num_decodes * metadata.draft_token_num
-            if metadata.is_target_verify
+        # DP attention may pad `extend_num_tokens` (prefill) AND `seq_lens`
+        # (decode) for collective-op alignment, so `hidden_states` can have
+        # padded rows beyond what the mamba kernel should process. The padded
+        # decode entries' `req_pool_indices` default to 0, which makes their
+        # `mamba_cache_indices` alias a real request's SSM slot — letting the
+        # kernel run over them would write garbage state into that slot and
+        # corrupt the real request's decode output. Trim to real token count
+        # so in_proj / split / kernel all operate on `num_actual_tokens`.
+        # Padded rows of the caller's `output` tensor are zeroed at the end
+        # of this forward to prevent uninitialized data from propagating to
+        # downstream layers.
+        num_actual_decodes_pre = (
+            metadata.num_actual_decodes
+            if metadata.num_actual_decodes is not None
             else metadata.num_decodes
+        )
+        num_decode_tokens_pre = (
+            num_actual_decodes_pre * metadata.draft_token_num
+            if metadata.is_target_verify
+            else num_actual_decodes_pre
         )
         num_actual_tokens_pre = (
             metadata.num_prefill_tokens + num_decode_tokens_pre
@@ -495,7 +505,15 @@ class MambaMixer2(torch.nn.Module):
         )
 
         num_prefills = metadata.num_prefills  # request count
-        num_decodes = metadata.num_decodes  # token count (=request)
+        # Use real (un-padded) decode count for splits and kernel calls below.
+        # `metadata.num_decodes` may include DP-padded dummy entries; their
+        # state_indices alias real slots and would corrupt SSM state if the
+        # kernel touched them. See note above the early trim.
+        num_decodes = (
+            metadata.num_actual_decodes
+            if metadata.num_actual_decodes is not None
+            else metadata.num_decodes
+        )
         num_decode_tokens = (
             num_decodes * metadata.draft_token_num
             if metadata.is_target_verify
@@ -520,12 +538,14 @@ class MambaMixer2(torch.nn.Module):
             [num_prefill_tokens, num_decode_tokens],
             dim=0,
         )
-        # Split along batch dimension
-        state_indices_tensor_p, state_indices_tensor_d = torch.split(
-            state_indices_tensor,
-            [num_prefills, num_decodes],
-            dim=0,
-        )
+        # Split along batch dimension. `state_indices_tensor` (a.k.a.
+        # mamba_cache_indices) is sized to the padded `num_prefills + padded
+        # num_decodes`; we deliberately drop the padded tail by slicing here
+        # rather than splitting (sums wouldn't match the padded length).
+        state_indices_tensor_p = state_indices_tensor[:num_prefills]
+        state_indices_tensor_d = state_indices_tensor[
+            num_prefills : num_prefills + num_decodes
+        ]
         query_start_loc_p = query_start_loc[: num_prefills + 1] if has_prefill else None
 
         # Preallocate output tensor to avoid memcpy cost for merging prefill
