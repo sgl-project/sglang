@@ -22,6 +22,7 @@ from typing import TYPE_CHECKING, List, NamedTuple, Optional
 import torch
 
 from sglang.srt.mem_cache.hicache_storage import (
+    STORAGE_BATCH_SIZE,
     HiCacheStorageConfig,
     HiCacheStorageExtraInfo,
 )
@@ -507,8 +508,6 @@ class HiCacheController:
             self.prefetch_capacity_limit = max(
                 0, int(0.8 * (self.mem_pool_host.size - self.mem_pool_device.size))
             )
-            # granularity of batch storage IO operations, in number of pages
-            self.storage_batch_size = 128
             # tracking the number of tokens locked in prefetching, updated by the main scheduler thread
             self.prefetch_tokens_occupied = 0
 
@@ -915,8 +914,8 @@ class HiCacheController:
     def _page_transfer(self, operation):
         # Transfer batch by batch
         prefix_keys = operation.prefix_keys
-        for i in range(0, len(operation.hash_value), self.storage_batch_size):
-            batch_hashes = operation.hash_value[i : i + self.storage_batch_size]
+        for i in range(0, len(operation.hash_value), STORAGE_BATCH_SIZE):
+            batch_hashes = operation.hash_value[i : i + STORAGE_BATCH_SIZE]
             batch_host_indices = operation.host_indices[
                 i * self.page_size : (i + len(batch_hashes)) * self.page_size
             ]
@@ -978,10 +977,10 @@ class HiCacheController:
         hash_value = []
 
         for start in range(
-            0, len(tokens_to_fetch), self.page_size * self.storage_batch_size
+            0, len(tokens_to_fetch), self.page_size * STORAGE_BATCH_SIZE
         ):
             end = min(
-                start + self.page_size * self.storage_batch_size, len(tokens_to_fetch)
+                start + self.page_size * STORAGE_BATCH_SIZE, len(tokens_to_fetch)
             )
             batch_tokens = tokens_to_fetch[start:end]
             batch_hashes = []
@@ -1120,8 +1119,8 @@ class HiCacheController:
     def _page_backup(self, operation):
         # Backup batch by batch
         prefix_keys = operation.prefix_keys
-        for i in range(0, len(operation.hash_value), self.storage_batch_size):
-            batch_hashes = operation.hash_value[i : i + self.storage_batch_size]
+        for i in range(0, len(operation.hash_value), STORAGE_BATCH_SIZE):
+            batch_hashes = operation.hash_value[i : i + STORAGE_BATCH_SIZE]
             batch_host_indices = operation.host_indices[
                 i * self.page_size : (i + len(batch_hashes)) * self.page_size
             ]

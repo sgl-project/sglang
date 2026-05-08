@@ -45,8 +45,10 @@ The main storage connector that provides:
 Consolidated utility classes:
 - **NixlBackendSelection** - Handles backend selection and creation
 - **NixlBackendConfig** - Handles backend configuration
-- **NixlRegistration** - Manages memory registration for tensors, files and objects
-- **NixlFileManager** - Handles file system operations and NIXL tuple creation
+- **NixlFileManager** - Handles file system operations
+
+### NixlRegistry (`nixl_registry.py`)
+Owns the `(agent, mem_type, file_manager)` triple and exposes `host(...)` and `storage(...)` context managers that register on entry, yield the NIXL `xfer_descs`, and deregister + close fds on exit. Internally composes two single-resource primitives (`_open_files` and `_registered`) so leak-freeness is verifiable per primitive.
 
 The current implementation performs per-transfer registration for file / object targets and explicitly closes FILE descriptors after registration / transfer setup to avoid descriptor leaks.
 
