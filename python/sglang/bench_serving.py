@@ -89,6 +89,8 @@ class RequestFuncInput:
     lora_name: str
     image_data: Optional[List[str]]
     extra_request_body: Dict[str, Any]
+    video_data: Optional[List[str]] = None
+    audio_data: Optional[List[str]] = None
     timestamp: Optional[float] = None
     routing_key: Optional[str] = None
 
@@ -236,6 +238,8 @@ async def async_request_openai_completions(
             "max_tokens": request_func_input.output_len,
             "stream": not args.disable_stream,
         }
+        if not args.disable_stream:
+            payload["stream_options"] = {"include_usage": True}
 
         # Add temperature default only if not specified in extra_request_body
         if "temperature" not in request_func_input.extra_request_body:
@@ -288,7 +292,8 @@ async def async_request_openai_completions(
                             # NOTE: Some completion API might have a last
                             # usage summary response without a token so we
                             # want to check a token was generated
-                            if data["choices"][0]["text"]:
+                            choices = data.get("choices", [])
+                            if choices and choices[0]["text"]:
                                 timestamp = time.perf_counter()
                                 # First token
                                 if ttft == 0.0:
@@ -298,12 +303,12 @@ async def async_request_openai_completions(
                                 # Decoding phase
                                 else:
                                     output.text_chunks.append(
-                                        data["choices"][0]["text"]
+                                        choices[0]["text"]
                                     )
                                     output.itl.append(timestamp - most_recent_timestamp)
 
                                 most_recent_timestamp = timestamp
-                                generated_text += data["choices"][0]["text"]
+                                generated_text += choices[0]["text"]
                                 output_len = (data.get("usage") or {}).get(
                                     "completion_tokens", output_len
                                 )
@@ -350,6 +355,7 @@ async def async_request_openai_chat_completions(
         "chat/completions"
     ), "OpenAI Chat Completions API URL must end with 'chat/completions'."
 
+    content_items = []
     # TODO put it to other functions when `pbar` logic is refactored
     if getattr(args, "print_requests", False):
         rid = str(uuid.uuid4())
@@ -378,6 +384,38 @@ async def async_request_openai_chat_completions(
                 "content": content_items,
             },
         ]
+    elif request_func_input.video_data:
+        # Build multi-video content: a list of video_url entries followed by the text
+        content_items = [
+            {
+                "type": "video_url",
+                "video_url": {"url": video_url},
+            }
+            for video_url in request_func_input.video_data
+        ]
+        content_items.append({"type": "text", "text": request_func_input.prompt})
+        messages = [
+            {
+                "role": "user",
+                "content": content_items,
+            },
+        ]
+    elif request_func_input.audio_data:
+        # Build multi-audio content: a list of audio_url entries followed by the text
+        content_items = [
+            {
+                "type": "audio_url",
+                "audio_url": {"url": audio_url},
+            }
+            for audio_url in request_func_input.audio_data
+        ]
+        content_items.append({"type": "text", "text": request_func_input.prompt})
+        messages = [
+            {
+                "role": "user",
+                "content": content_items,
+            },
+        ]
     else:
         messages = [{"role": "user", "content": request_func_input.prompt}]
 
@@ -389,6 +427,8 @@ async def async_request_openai_chat_completions(
             "max_completion_tokens": request_func_input.output_len,
             "stream": not args.disable_stream,
         }
+        if not args.disable_stream:
+            payload["stream_options"] = {"include_usage": True}
 
         # Add temperature default only if not specified in extra_request_body
         if "temperature" not in request_func_input.extra_request_body:
@@ -454,7 +494,8 @@ async def async_request_openai_chat_completions(
                                 data = json.loads(chunk)
 
                                 # Check if this chunk contains content
-                                delta = data.get("choices", [{}])[0].get("delta", {})
+                                choices = data.get("choices", [])
+                                delta = choices[0].get("delta", {}) if choices else {}
                                 content = delta.get("content", "")
 
                                 if content:
@@ -554,7 +595,8 @@ async def async_request_truss(
                             # NOTE: Some completion API might have a last
                             # usage summary response without a token so we
                             # want to check a token was generated
-                            if data["choices"][0]["text"]:
+                            choices = data.get("choices", [])
+                            if choices and choices[0]["text"]:
                                 timestamp = time.perf_counter()
                                 # First token
                                 if ttft == 0.0:
@@ -566,7 +608,7 @@ async def async_request_truss(
                                     output.itl.append(timestamp - most_recent_timestamp)
 
                                 most_recent_timestamp = timestamp
-                                generated_text += data["choices"][0]["text"]
+                                generated_text += choices[0]["text"]
 
                     output.generated_text = generated_text
                     output.success = True
@@ -885,6 +927,18 @@ def get_dataset(args, tokenizer, model_id=None):
             backend=args.backend,
             fixed_output_len=args.random_output_len,
             random_sample=True,
+        )
+    elif args.dataset_name == "multimodal":
+        from sglang.benchmark.datasets.multimodal import sample_multimodal_requests
+
+        input_requests = sample_multimodal_requests(
+            num_prompts=args.num_prompts,
+            tokenizer=tokenizer,
+            dataset_path=args.dataset_path,
+            input_len=args.random_input_len,
+            output_len=args.random_output_len,
+            range_ratio=args.random_range_ratio,
+            return_text=not tokenize_prompt,
         )
     elif args.dataset_name == "mooncake":
         # For mooncake, we don't generate the prompts here.
@@ -2475,6 +2529,8 @@ async def benchmark(
             output_len=request.output_len,
             lora_name=lora_name,
             image_data=request.image_data,
+            video_data=getattr(request, "video_data", None),
+            audio_data=getattr(request, "audio_data", None),
             extra_request_body=merged_extra_body,
             timestamp=request.timestamp,
             routing_key=request.routing_key,
@@ -3011,6 +3067,7 @@ if __name__ == "__main__":
             "mmmu",
             "image",
             "mooncake",
+            "multimodal",
         ],
         help="Name of the dataset to benchmark on.",
     )
