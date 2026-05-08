@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import functools
 import logging
+import os
 from contextlib import contextmanager
 from enum import IntEnum, auto
 from typing import TYPE_CHECKING, List, Optional, Tuple
@@ -48,6 +49,71 @@ _ENABLE_DP_ATTENTION_FLAG: bool = False
 
 _is_hip = is_hip()
 _USE_ROCM700A_WA = _is_hip and get_bool_env_var("SGLANG_USE_ROCM700A")
+
+# When enabled, route DP attention gather/reduce-scatter through flashinfer's
+# fused mixed_comm kernels (virtual-memory intra-node + nvshmem inter-node).
+_USE_MIXED_COMM = get_bool_env_var("SGLANG_USE_MIXED_COMM")
+
+if _USE_MIXED_COMM:
+    from flashinfer.comm.mixed_comm import (
+        MixedCommHandler,
+        MixedCommOp,
+        run_mixed_comm,
+    )
+
+_MIXED_COMM_HANDLER = None
+
+
+def _init_mixed_comm_handler(dtype: torch.dtype, device: torch.device):
+    """Construct the process-wide MixedCommHandler.
+
+    Must be called once per process, at a point outside any CUDA graph capture,
+    because the constructor performs collective init (new_group, broadcast,
+    barrier), nvshmem setup, and autotune. Topology maps flashinfer TP/DP to
+    sglang attention_tp/attention_dp.
+    """
+    global _MIXED_COMM_HANDLER
+    assert _USE_MIXED_COMM
+    assert _MIXED_COMM_HANDLER is None, "MixedCommHandler already initialized."
+
+    world_rank = torch.distributed.get_rank()
+    world_size = torch.distributed.get_world_size()
+    local_size = int(os.environ.get("LOCAL_WORLD_SIZE", str(torch.cuda.device_count())))
+    assert world_size % local_size == 0, (
+        f"SGLANG_USE_MIXED_COMM: world_size={world_size} is not a multiple of "
+        f"LOCAL_WORLD_SIZE={local_size}."
+    )
+    local_rank = world_rank % local_size
+    inter_size = world_size // local_size
+    inter_rank = world_rank // local_size
+
+    if device.type == "cuda" and device.index is None:
+        device = torch.device("cuda", torch.cuda.current_device())
+
+    attn_tp_size = get_attention_tp_size()
+    assert attn_tp_size % local_size == 0 or local_size % attn_tp_size == 0, (
+        f"SGLANG_USE_MIXED_COMM: the larger one of attn_tp_size={attn_tp_size} "
+        f"and LOCAL_WORLD_SIZE={local_size} must be a multiple of the smaller one."
+    )
+    local_tp_size = min(attn_tp_size, local_size)
+    local_dp_size = local_size // local_tp_size
+    inter_tp_size = attn_tp_size // local_tp_size
+    inter_dp_size = inter_size // inter_tp_size
+
+    _MIXED_COMM_HANDLER = MixedCommHandler(
+        world_rank=world_rank,
+        world_size=world_size,
+        local_rank=local_rank,
+        local_size=local_size,
+        inter_rank=inter_rank,
+        inter_size=inter_size,
+        local_tp_size=local_tp_size,
+        local_dp_size=local_dp_size,
+        inter_tp_size=inter_tp_size,
+        inter_dp_size=inter_dp_size,
+        dtype=dtype,
+        device=device,
+    )
 
 
 class DpPaddingMode(IntEnum):
@@ -310,6 +376,11 @@ def initialize_dp_attention(
         device=torch.device(server_args.device),
     )
 
+    # Construct the MixedCommHandler eagerly so its collective/nvshmem init and
+    # autotune run outside any CUDA graph capture that happens later.
+    if _USE_MIXED_COMM:
+        _init_mixed_comm_handler(model_config.dtype, torch.device(server_args.device))
+
 
 def is_dp_attention_enabled() -> bool:
     return _ENABLE_DP_ATTENTION_FLAG
@@ -501,6 +572,25 @@ def _dp_gather_via_all_gather(
     forward_batch: ForwardBatch,
     is_partial: bool,
 ):
+    if _USE_MIXED_COMM:
+        if get_attention_tp_size() == 1:
+            run_mixed_comm(
+                MixedCommOp.ALLGATHER,
+                _MIXED_COMM_HANDLER,
+                local_tokens,
+                global_tokens,
+            )
+        else:
+            if not is_partial and get_attention_tp_rank() != 0:
+                local_tokens.fill_(0)
+            run_mixed_comm(
+                MixedCommOp.ALLREDUCE_ALLGATHER,
+                _MIXED_COMM_HANDLER,
+                local_tokens,
+                global_tokens,
+            )
+        return
+
     if get_attention_tp_size() == 1:
         get_tp_group().all_gather_into_tensor(global_tokens, local_tokens)
         return
@@ -570,6 +660,20 @@ def dp_scatter(
 
 
 def dp_reduce_scatter_tensor(output: torch.Tensor, input: torch.Tensor):
+    if _USE_MIXED_COMM:
+        if get_tensor_model_parallel_world_size() == get_attention_dp_size():
+            run_mixed_comm(
+                MixedCommOp.REDUCESCATTER, _MIXED_COMM_HANDLER, input, output
+            )
+        else:
+            run_mixed_comm(
+                MixedCommOp.REDUCESCATTER_ALLREDUCE,
+                _MIXED_COMM_HANDLER,
+                input,
+                output,
+            )
+        return
+
     if get_tensor_model_parallel_world_size() == get_attention_dp_size():
         get_tp_group().reduce_scatter_tensor(output, input)
     else:

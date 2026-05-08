@@ -11,6 +11,7 @@ import torch
 from sglang.srt.distributed.parallel_state import get_moe_expert_parallel_world_size
 from sglang.srt.layers.dp_attention import (
     get_attention_dp_size,
+    get_attention_tp_size,
     is_dp_attention_enabled,
 )
 
@@ -346,6 +347,7 @@ def should_use_dp_reduce_scatterv():
         and get_moe_a2a_backend().is_none()
         and is_dp_attention_enabled()
         and get_attention_dp_size() > 1
+        and get_attention_tp_size() == 1
         and get_moe_expert_parallel_world_size() == get_attention_dp_size()
     )
 
