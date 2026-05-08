@@ -419,6 +419,30 @@ class TopK(MultiPlatformOp):
         router_logits = torch.empty((0, topk), dtype=torch.float32, device=device)
         return StandardTopKOutput(topk_weights, topk_ids, router_logits)
 
+    def forward_xpu(
+        self,
+        hidden_states: torch.Tensor,
+        router_logits: torch.Tensor,
+        *,
+        num_token_non_padded: Optional[torch.Tensor] = None,
+        expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
+    ) -> TopKOutput:
+        top_k = self.topk_config.top_k
+        num_experts = router_logits.shape[1]
+        self.topk_config.torch_native = True
+        # XPU kernels for 'topk_softmax' and 'topk_sigmoid' support up to 8 topk and 256 experts.
+        if top_k <= 8 and num_experts <= 256:
+            self.topk_config.torch_native = False
+
+        return select_experts(
+            hidden_states=hidden_states,
+            layer_id=self.layer_id,
+            router_logits=router_logits,
+            topk_config=self.topk_config,
+            num_token_non_padded=num_token_non_padded,
+            expert_location_dispatch_info=expert_location_dispatch_info,
+        )
+
 
 # ------------------------------- TopK implementation -------------------------------------
 
