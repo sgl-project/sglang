@@ -17,7 +17,7 @@ from sglang.test.test_utils import (
 )
 
 # EAGLE with DP attention on B200 (tp=2, dp=2, requires 4 B200 GPUs)
-register_cuda_ci(est_time=136, suite="stage-c-test-4-gpu-b200-small")
+register_cuda_ci(est_time=123, suite="stage-c-test-4-gpu-b200")
 
 
 def test_gsm8k(base_url: str, model: str):
@@ -65,13 +65,9 @@ class TestEagleDPAttnServerSmall(CustomTestCase):
             "--speculative-num-draft-tokens",
             "4",
         ]
-        with envs.SGLANG_ENABLE_SPEC_V2.override(
+        with envs.SGLANG_SPEC_NAN_DETECTION.override(
             True
-        ), envs.SGLANG_SPEC_NAN_DETECTION.override(
-            True
-        ), envs.SGLANG_SPEC_OOB_DETECTION.override(
-            True
-        ):
+        ), envs.SGLANG_SPEC_OOB_DETECTION.override(True):
             cls.process = popen_launch_server(
                 cls.model,
                 cls.base_url,
