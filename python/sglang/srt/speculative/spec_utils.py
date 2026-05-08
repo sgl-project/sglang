@@ -20,11 +20,12 @@ from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.mem_cache.common import get_last_loc
 from sglang.srt.server_args import ServerArgs, get_global_server_args
-from sglang.srt.utils import is_cuda, is_hip, is_npu, next_power_of_2
+from sglang.srt.utils import is_cuda, is_hip, is_musa, is_npu, next_power_of_2
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
 _is_npu = is_npu()
+_is_musa = is_musa()
 
 if TYPE_CHECKING:
     from sglang.srt.speculative.eagle_info import EagleVerifyInput
@@ -46,7 +47,9 @@ SIMULATE_ACC_LEN = envs.SGLANG_SIMULATE_ACC_LEN.get()  # turn off if < 0
 SIMULATE_ACC_METHOD = envs.SGLANG_SIMULATE_ACC_METHOD.get()
 
 TREE_TRAVERSE_TIME_THRESHOLD = 1  # TODO: set this properly
-TREE_SPEC_KERNEL_AVAILABLE = _is_cuda  # This kernel is only available for CUDA now
+TREE_SPEC_KERNEL_AVAILABLE = (
+    _is_cuda or _is_musa
+)  # This kernel is only available for CUDA and MUSA now
 
 
 def spec_need_hidden_states(server_args: Optional[ServerArgs] = None) -> bool:
@@ -69,16 +72,17 @@ def create_extend_after_decode_spec_info(
     pid = tl.program_id(axis=0)
     offsets = tl.arange(0, bs_upper)
     seq_length = tl.load(seq_lens + pid)
-    accept_length = tl.load(accept_lens + pid)
+    # `accept_lens` includes the bonus token; load this req's value.
+    accept_len = tl.load(accept_lens + pid)
 
     accept_len_cumsum = tl.sum(
         tl.load(accept_lens + offsets, mask=offsets < pid, other=0)
     )
     positions_ptr = positions + accept_len_cumsum
-    mask = offsets < accept_length
-    tl.store(positions_ptr + offsets, seq_length - accept_length + offsets, mask)
+    mask = offsets < accept_len
+    tl.store(positions_ptr + offsets, seq_length - accept_len + offsets, mask)
 
-    accept_len_cumsum += accept_length - 1
+    accept_len_cumsum += accept_len - 1
     verified_id_data = tl.load(verified_id + accept_len_cumsum)
     tl.store(new_verified_id + pid, verified_id_data)
 
@@ -357,7 +361,7 @@ def align_evict_mask_to_page_size(
 def get_target_cache_loc(
     tgt_cache_loc,
     to_free_slots,
-    accept_length,
+    num_accepted_drafts,
     to_free_num_slots,
     out_cache_loc,
     num_verify_tokens: tl.constexpr,
@@ -369,9 +373,9 @@ def get_target_cache_loc(
     bs_offset = tl.arange(0, bs_upper)
 
     # write the first part to tgt_cache_loc
-    accept_len_all = tl.load(accept_length + bs_offset, mask=bs_offset < bid)
+    accept_len_all = tl.load(num_accepted_drafts + bs_offset, mask=bs_offset < bid)
     tgt_cache_loc_start = tl.sum(accept_len_all) + bid
-    copy_len = tl.load(accept_length + bid) + 1
+    copy_len = tl.load(num_accepted_drafts + bid) + 1
     out_cache_loc_row = tl.load(
         out_cache_loc + bid * num_verify_tokens + offset, mask=offset < copy_len
     )
@@ -404,7 +408,7 @@ def get_src_tgt_cache_loc(
     seq_lens: torch.Tensor,
     out_cache_loc: torch.Tensor,
     accept_index: torch.Tensor,
-    accept_length: torch.Tensor,
+    num_accepted_drafts: torch.Tensor,
     draft_token_num: int,
     page_size: int,
 ):
@@ -412,7 +416,7 @@ def get_src_tgt_cache_loc(
     tgt_cache_loc = torch.empty_like(src_cache_loc)
     extended_len = seq_lens + draft_token_num
     keep_len = torch.minimum(
-        (seq_lens + accept_length + 1 + page_size - 1) // page_size * page_size,
+        (seq_lens + num_accepted_drafts + 1 + page_size - 1) // page_size * page_size,
         extended_len,
     )
     to_free_num_slots = extended_len - keep_len
@@ -423,23 +427,25 @@ def get_src_tgt_cache_loc(
 def filter_finished_cache_loc_kernel(
     out_cache_loc,
     tgt_cache_loc,
-    accept_length,
-    accept_length_filter,
+    num_accepted_drafts,
+    num_accepted_drafts_filter,
     bs_upper: tl.constexpr,
     num_verify_tokens_upper: tl.constexpr,
 ):
     bid = tl.program_id(0)
     bs_offset = tl.arange(0, bs_upper)
 
-    accept_length_all = tl.load(accept_length + bs_offset, mask=bs_offset < bid)
-    old_start = tl.sum(accept_length_all) + bid
-
-    accept_length_filter_all = tl.load(
-        accept_length_filter + bs_offset, mask=bs_offset < bid
+    num_accepted_drafts_all = tl.load(
+        num_accepted_drafts + bs_offset, mask=bs_offset < bid
     )
-    new_start = tl.sum(accept_length_filter_all)
+    old_start = tl.sum(num_accepted_drafts_all) + bid
 
-    copy_len = tl.load(accept_length_filter + bid)
+    num_accepted_drafts_filter_all = tl.load(
+        num_accepted_drafts_filter + bs_offset, mask=bs_offset < bid
+    )
+    new_start = tl.sum(num_accepted_drafts_filter_all)
+
+    copy_len = tl.load(num_accepted_drafts_filter + bid)
     copy_offset = tl.arange(0, num_verify_tokens_upper)
     value = tl.load(
         tgt_cache_loc + old_start + copy_offset, mask=copy_offset < copy_len
@@ -450,20 +456,76 @@ def filter_finished_cache_loc_kernel(
 
 
 @torch.compile(dynamic=True, disable=_is_npu)
-def create_accept_length_filter(
-    accept_length: torch.Tensor,
+def create_num_accepted_drafts_filter(
+    num_accepted_drafts: torch.Tensor,
     unfinished_index_device: torch.Tensor,
     seq_lens: torch.Tensor,
 ):
-    accept_length_filter = torch.zeros_like(accept_length)
-    accept_length_filter[unfinished_index_device] = (
-        accept_length[unfinished_index_device] + 1
+    num_accepted_drafts_filter = torch.zeros_like(num_accepted_drafts)
+    num_accepted_drafts_filter[unfinished_index_device] = (
+        num_accepted_drafts[unfinished_index_device] + 1
     )
-    seq_lens.add_(accept_length + 1)
-    return accept_length_filter
+    seq_lens.add_(num_accepted_drafts + 1)
+    return num_accepted_drafts_filter
+
+
+def _select_top_k_tokens_first(
+    topk_p: torch.Tensor,
+    topk_index: torch.Tensor,
+    hidden_states: Optional[torch.Tensor],
+    topk: int,
+):
+    input_ids = topk_index.flatten()
+    if hidden_states is not None:
+        hidden_states = hidden_states.repeat_interleave(topk, dim=0)
+
+    tree_info = (
+        topk_p.unsqueeze(1),  # (b, 1, topk)
+        topk_index,  # (b, topk)
+        torch.arange(-1, topk, dtype=torch.long, device=input_ids.device).expand(
+            topk_p.shape[0], -1
+        ),  # (b, topk + 1) — expand avoids the allocation of repeat
+    )
+    return input_ids, hidden_states, topk_p, tree_info
 
 
 @torch.compile(dynamic=True, disable=_is_npu)
+def _select_top_k_tokens_later(
+    i: int,
+    topk_p: torch.Tensor,
+    topk_index: torch.Tensor,
+    hidden_states: torch.Tensor,
+    scores: torch.Tensor,
+    topk: int,
+):
+    topk_sq = topk * topk
+
+    expand_scores = scores.unsqueeze(2) * topk_p.view(-1, topk, topk)
+    # (b, topk, 1) * (b, topk, topk) -> (b, topk, topk)
+
+    topk_cs_p, topk_cs_index = fast_topk(
+        expand_scores.flatten(start_dim=1), topk, dim=-1
+    )  # (b, topk)
+
+    topk_index = topk_index.view(-1, topk_sq)
+    input_ids = torch.gather(topk_index, 1, topk_cs_index).flatten()
+
+    if hidden_states.shape[0] > 0:
+        flat_cs = topk_cs_index.flatten()
+        batch_offsets = torch.arange(
+            0, hidden_states.shape[0], step=topk, device=flat_cs.device
+        )
+        selected_input_index = flat_cs // topk + batch_offsets.repeat_interleave(topk)
+        hidden_states = hidden_states[selected_input_index]
+
+    tree_info = (
+        expand_scores,  # (b, topk, topk)
+        topk_index,  # (b, topk * topk)
+        topk_cs_index + (topk_sq * (i - 1) + topk),  # (b, topk)
+    )
+    return input_ids, hidden_states, topk_cs_p, tree_info
+
+
 def select_top_k_tokens(
     i: int,
     topk_p: torch.Tensor,
@@ -473,51 +535,16 @@ def select_top_k_tokens(
     topk: int,
 ):
     if i == 0:
-        # The first step after extend
-        input_ids = topk_index.flatten()
-        if hidden_states is not None:
-            hidden_states = hidden_states.repeat_interleave(topk, dim=0)
-        scores = topk_p  # shape: (b, topk)
-
-        tree_info = (
-            topk_p.unsqueeze(1),  # shape: (b, 1, topk)
-            topk_index,  # shape: (b, topk)
-            torch.arange(-1, topk, dtype=torch.long, device=input_ids.device)
-            .unsqueeze(0)
-            .repeat(topk_p.shape[0], 1),  # shape: (b, topk + 1)
-        )
-    else:
-        # The later decode steps
-        expand_scores = torch.mul(
-            scores.unsqueeze(2), topk_p.reshape(-1, topk, topk)
-        )  # (b, topk, 1) x (b, topk ,topk) -> (b, topk, topk)
-        topk_cs_p, topk_cs_index = fast_topk(
-            expand_scores.flatten(start_dim=1), topk, dim=-1
-        )  # (b, topk)
-        scores = topk_cs_p  # shape: (b, topk)
-
-        topk_index = topk_index.reshape(-1, topk**2)
-        input_ids = torch.gather(topk_index, index=topk_cs_index, dim=1).flatten()
-
-        if hidden_states.shape[0] > 0:
-            selected_input_index = topk_cs_index.flatten() // topk + torch.arange(
-                0, hidden_states.shape[0], step=topk, device=topk_index.device
-            ).repeat_interleave(topk)
-            hidden_states = hidden_states[selected_input_index, :]
-
-        tree_info = (
-            expand_scores,  # shape: (b, topk, topk)
-            topk_index,  # shape: (b, topk * topk)
-            topk_cs_index + (topk**2 * (i - 1) + topk),  # shape: (b, topk)
-        )
-
-    return input_ids, hidden_states, scores, tree_info
+        return _select_top_k_tokens_first(topk_p, topk_index, hidden_states, topk)
+    return _select_top_k_tokens_later(
+        i, topk_p, topk_index, hidden_states, scores, topk
+    )
 
 
 def generate_simulated_accept_index(
     accept_index,
     predict,
-    accept_length,
+    num_accepted_drafts,
     bs,
     spec_steps,
     simulate_acc_len: float = SIMULATE_ACC_LEN,
@@ -562,7 +589,7 @@ def generate_simulated_accept_index(
     sim_accept_index[:, :simulate_acc_len] = accept_indx_first_col + torch.arange(
         simulate_acc_len, device=accept_index.device
     )
-    accept_length.fill_(simulate_acc_len - 1)
+    num_accepted_drafts.fill_(simulate_acc_len - 1)
     predict.fill_(100)  # some legit token id
     return sim_accept_index
 
@@ -606,14 +633,14 @@ def traverse_tree(
         if accepted:
             if curr != 0:
                 # Accept the current token
-                grammar.accept_token(draft_tokens[curr])
+                grammar.accept_token(int(draft_tokens[curr]))
             if not grammar.is_terminated():
                 # Generate the bitmask for the current token
                 grammar.fill_vocab_mask(allocate_token_bitmask, curr)
                 if retrieve_next_token[curr] != -1:
                     # Visit the child node
                     dfs(
-                        retrieve_next_token[curr],
+                        int(retrieve_next_token[curr]),
                         retrieve_next_token,
                         retrieve_next_sibling,
                         curr,
@@ -626,7 +653,7 @@ def traverse_tree(
         if retrieve_next_sibling[curr] != -1:
             # Visit the sibling node
             dfs(
-                retrieve_next_sibling[curr],
+                int(retrieve_next_sibling[curr]),
                 retrieve_next_token,
                 retrieve_next_sibling,
                 parent_pos,
