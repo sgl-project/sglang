@@ -22,7 +22,7 @@ def moe_fused_mul_sum_kernel(
     BLOCK_K: tl.constexpr,
 ):
     pid_k = tl.program_id(0)
-    pid_m = tl.program_id(1)
+    pid_m = tl.program_id(1).to(tl.int64)
 
     offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_k = pid_k * BLOCK_K + tl.arange(0, BLOCK_K)
