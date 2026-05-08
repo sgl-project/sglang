@@ -883,6 +883,12 @@ class ServerArgs:
         # Handle memory-related, chunked prefill, and CUDA graph batch size configurations.
         self._handle_gpu_memory_settings(gpu_mem)
 
+        # enforce_disable_flashinfer_allreduce_fusion must be set before
+        # _handle_model_specific_adjustments, which auto-enables the fusion
+        # for several SM90/SM100 MoE arches.
+        if self.enable_deterministic_inference:
+            self.enforce_disable_flashinfer_allreduce_fusion = True
+
         # Apply model-specific adjustments.
         self._handle_model_specific_adjustments()
 
@@ -4022,10 +4028,9 @@ class ServerArgs:
 
             if self.enable_flashinfer_allreduce_fusion:
                 logger.warning(
-                    "Disable enable_flashinfer_allreduce_fusion because deterministic inference is enabled."
+                    "Disable --enable-flashinfer-allreduce-fusion because deterministic inference is enabled."
                 )
                 self.enable_flashinfer_allreduce_fusion = False
-            self.enforce_disable_flashinfer_allreduce_fusion = True
 
             # Check sampling backend
             self.sampling_backend = "pytorch"
