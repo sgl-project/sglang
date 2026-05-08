@@ -112,34 +112,51 @@ length. Dense FA3 TBT on H200 grows so slowly with context (5 ms at
 8K → 6.7 ms at 64K) that DS's potential bandwidth savings can't pay
 the selection cost.
 
-**Why DS-the-architecture cannot win on this hardware/model.**
+**Where DS bandwidth savings can structurally show up on this
+hardware/model.** Back-of-envelope; counts both K and V (FA3 reads
+both during decode attention):
 
 ```
-8B at 64K:
-  KV cache size = 32 layers × 8 KV heads × 128 dim × 2 B × 64K tok
-                = 4 GB
+8B at 64K, bf16:
+  KV cache size = 32 layers × 8 KV heads × 128 dim × 2 (K+V) × 2 B × 64K tok
+                = 8 GB
   H200 HBM      = 4.8 TB/s
-  KV read floor = 4 GB / 4.8 TB/s = 0.83 ms
+  KV read floor ≈ 8 GB / 4.8 TB/s ≈ 1.7 ms
 
-  Dense TBT = 6.7 ms  →  KV bandwidth is only 0.83 ms of that.
-                         The other 5.9 ms is kernel launch + Q·K
-                         compute + softmax (compute-bound, not
-                         bandwidth-bound).
-  DS can save AT MOST 0.83 ms even with a perfectly-zero-overhead
-  selection. With v1's ~13 ms vectorized-but-naive selection, that's
-  a net regression no matter the context length.
+  Dense TBT measured = 6.7 ms.
+  → KV bandwidth is ~25% of dense TBT at this scale; the rest
+    is kernel launch + Q·K compute + softmax + V GEMM. DS targets
+    the bandwidth slice; the compute slice it can't help with.
+
+  DS upper-bound saving ≈ 1.7 ms × (1 - budget/seq_len).
+  At budget=1024, seq_len=64K: ≈ 1.7 × (1 - 1024/65536) ≈ 1.67 ms.
+  That's the perf-path budget DS has to fit under to start winning.
 ```
 
-DS-the-architecture is built to win where **dense KV bandwidth ≈
-dense TBT** (i.e., attention is bandwidth-bound). For 8B that needs
-contexts past 256K, OR a much larger model:
+DS-the-architecture is built to win where dense attention is more
+strongly bandwidth-bound. That's longer context, larger model, or
+both:
 
 ```
-70B at 64K (per H200, TP=8):
-  KV cache size = 80 × 1 × 128 × 2 × 64K = 1.25 GB per rank
-  Total dense TBT typically ~15-20 ms
-  → meaningful headroom for DS to win once selection overhead drops.
+70B at 64K (per H200, TP=8), bf16:
+  KV cache size per rank = 80 × 1 × 128 × 2 (K+V) × 2 B × 64K
+                         = 2.5 GB per rank
+  KV read floor          ≈ 2.5 GB / 4.8 TB/s ≈ 0.5 ms per rank
+  But 80 layers compose serially; typical total dense TBT ~15–25 ms,
+  with KV bandwidth a much larger share of that than at 8B/64K.
+  → meaningful headroom for DS to win once selection overhead drops
+    below the bandwidth slice.
+
+70B at 128K, TP=8: KV cache per rank = 5 GB → KV-bound regime is
+clearly entered. This is the real ship-gate workload.
 ```
+
+**Caveat on these numbers.** The above is a rough KV-bandwidth ceiling,
+not a prediction. Actual dense TBT depends on FA3's specific access
+pattern (K then V), kernel-launch overhead per layer, softmax, and
+non-attention work in the layer. The DS selection adds its own
+bandwidth cost too — reading K_label per step. The right way to
+settle this is measurement under the v1.1 fused kernel, not algebra.
 
 **v1.1 priorities to actually ship the speedup.**
 1. **Fuse the selection** into one Triton kernel that streams `K_label`

@@ -78,7 +78,15 @@ class WorkloadResult:
     output_len: int
     n_requests: int
     concurrency: int
+    # Steady-state decode throughput per request. Numerator: tokens emitted
+    # AFTER the first (i.e. one per inter-token interval). Denominator: per-
+    # request decode-only time (e2e - ttft). For concurrency=1 this is the
+    # most direct measurement of the selection+attention kernel speed.
     decode_tok_per_s: float
+    # Aggregate system throughput: total tokens emitted across all requests
+    # divided by wall-clock from first-request-start to last-request-end.
+    # Captures concurrency benefits the per-request metric misses.
+    aggregate_tok_per_s: float
     e2e_latency_s: float
     ttft_ms_p50: float
     ttft_ms_p95: float
@@ -186,6 +194,7 @@ def _run_workload(
         ttft = None
         tbts = []
         last_t = None
+        tokens_emitted = 0
         start = time.time()
         with requests.post(
             f"{base_url}/v1/completions",
@@ -211,20 +220,51 @@ def _run_workload(
                 else:
                     tbts.append((t - last_t) * 1000.0)
                 last_t = t
-        e2e = time.time() - start
-        return ttft, tbts, e2e
+                tokens_emitted += 1
+        end = time.time()
+        e2e = end - start
+        # Decode-only time = total wall - prefill (TTFT). Tokens emitted
+        # during this window: tokens_emitted - 1 (the first one was the
+        # TTFT-defining token; the rest came at TBT cadence).
+        decode_only_s = (e2e - (ttft or 0.0) / 1000.0) if ttft is not None else 0.0
+        return {
+            "ttft": ttft,
+            "tbts": tbts,
+            "e2e": e2e,
+            "start": start,
+            "end": end,
+            "tokens": tokens_emitted,
+            "decode_only_s": decode_only_s,
+        }
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as ex:
         results = list(ex.map(lambda _: _one(), range(n_requests)))
 
-    ttfts = [r[0] for r in results if r[0] is not None]
-    tbts = [t for r in results for t in r[1]]
-    e2es = [r[2] for r in results]
-    total_decode_tokens = sum(len(r[1]) for r in results)
-    total_decode_s = sum(r[2] for r in results)
+    ttfts = [r["ttft"] for r in results if r["ttft"] is not None]
+    tbts = [t for r in results for t in r["tbts"]]
+    e2es = [r["e2e"] for r in results]
+
+    # Per-request steady-state decode throughput: numerator counts tokens
+    # emitted after the first (one per TBT interval), denominator is decode-
+    # only time (e2e - ttft). Avoids the v1 mistake of dividing by total
+    # request latency including prefill.
+    total_decode_only_tokens = sum(max(r["tokens"] - 1, 0) for r in results)
+    total_decode_only_s = sum(r["decode_only_s"] for r in results)
     decode_tok_per_s = (
-        total_decode_tokens / total_decode_s if total_decode_s > 0 else 0.0
+        total_decode_only_tokens / total_decode_only_s
+        if total_decode_only_s > 0
+        else 0.0
     )
+
+    # Aggregate system throughput: total tokens emitted across all requests
+    # divided by wall-clock span. For concurrency>1 this captures overlap
+    # benefits the per-request metric misses; for concurrency=1 it's a
+    # full-stack number that includes prefill (lower than decode_tok_per_s).
+    total_tokens = sum(r["tokens"] for r in results)
+    wall_start = min(r["start"] for r in results) if results else 0.0
+    wall_end = max(r["end"] for r in results) if results else 0.0
+    wall_s = max(wall_end - wall_start, 1e-9)
+    aggregate_tok_per_s = total_tokens / wall_s
 
     return WorkloadResult(
         config="(set by caller)",
@@ -234,6 +274,7 @@ def _run_workload(
         n_requests=n_requests,
         concurrency=concurrency,
         decode_tok_per_s=decode_tok_per_s,
+        aggregate_tok_per_s=aggregate_tok_per_s,
         e2e_latency_s=statistics.mean(e2es) if e2es else 0.0,
         ttft_ms_p50=_percentile(ttfts, 50),
         ttft_ms_p95=_percentile(ttfts, 95),

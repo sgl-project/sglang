@@ -33,7 +33,8 @@ def main():
     on_r = _load(args.branch_on)
 
     rows = [
-        ("decode tok/s", "decode_tok_per_s", "{:.2f}"),
+        ("decode tok/s (per-req, decode-only)", "decode_tok_per_s", "{:.2f}"),
+        ("aggregate tok/s (system, wall-clock)", "aggregate_tok_per_s", "{:.2f}"),
         ("e2e latency (s)", "e2e_latency_s", "{:.2f}"),
         ("TTFT p50 (ms)", "ttft_ms_p50", "{:.1f}"),
         ("TTFT p95 (ms)", "ttft_ms_p95", "{:.1f}"),

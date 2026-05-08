@@ -112,5 +112,108 @@ class TestBaseDefaultPassthrough(CustomTestCase):
         self.assertTrue(torch.equal(out, default))
 
 
+class TestCoordinatorThreadsEffectiveMask(CustomTestCase):
+    """Pin the framework integration: the SAME effective mask reaches
+    BOTH retrieve_topk and adapt_for_attn_metadata. A regression where
+    the coordinator passes default_mask to the adaptor (the v1.1-2 bug
+    being fixed) must fail this test.
+    """
+
+    def test_late_crossing_mask_reaches_adaptor(self):
+        from sglang.srt.mem_cache.sparsity.algorithms.base_algorithm import (
+            BaseSparseAlgorithm,
+        )
+        from sglang.srt.mem_cache.sparsity.backend.backend_adaptor import BackendAdaptor
+        from sglang.srt.mem_cache.sparsity.core.sparse_coordinator import (
+            SparseCoordinator,
+        )
+
+        # Fake algorithm: returns a mask flipped from default_mask, captures the
+        # sparse_mask it receives in retrieve_topk.
+        captured = {"retrieve_topk_mask": None, "adaptor_mask": None}
+
+        class _FakeAlgo(BaseSparseAlgorithm):
+            def __init__(self):
+                self.config = SparseConfig()
+                self.device = torch.device("cpu")
+                self.req_to_token_pool = None
+                self.states = None
+
+            def initialize_representation_pool(self, *a, **k):
+                pass
+
+            def effective_sparse_mask(self, fb, rpi, default_mask):
+                # The override the coordinator must respect.
+                return ~default_mask
+
+            def retrieve_topk(self, *, sparse_mask, **kwargs):
+                captured["retrieve_topk_mask"] = sparse_mask.clone()
+                bs = sparse_mask.shape[0]
+                return (
+                    torch.full((bs, 4), -1, dtype=torch.int32),
+                    torch.zeros(bs, dtype=torch.int32),
+                )
+
+        class _FakeAdaptor(BackendAdaptor):
+            def adapt_for_attn_metadata(self, *, sparse_mask, **kwargs):
+                captured["adaptor_mask"] = sparse_mask.clone()
+                return None
+
+        # Minimal mocks for SparseCoordinator's __init__.
+        bs = 3
+        max_pool_size = 8
+        req_to_token_pool = MagicMock()
+        req_to_token_pool.req_to_token = torch.zeros(
+            max_pool_size, 16, dtype=torch.int32
+        )
+        req_to_token_pool.max_context_len = 16
+        token_to_kv_pool = MagicMock()
+        token_to_kv_pool.get_key_buffer.return_value = torch.zeros(64, 1, 16)
+
+        sc_config = SparseConfig(min_sparse_prompt_len=4096)
+        coord = SparseCoordinator(
+            config=sc_config,
+            algorithm=_FakeAlgo(),
+            backend_adaptor=_FakeAdaptor(torch.device("cpu")),
+            req_to_token_pool=req_to_token_pool,
+            token_to_kv_pool=token_to_kv_pool,
+            start_layer=0,
+            end_layer=1,
+            device=torch.device("cpu"),
+        )
+        # Default mask all-False (admission-time prompt_lens=0 < 4096).
+        coord.states.prompt_lens[:bs] = 0
+
+        layer = MagicMock()
+        layer.layer_id = 0
+        fb = MagicMock()
+        fb.req_pool_indices = torch.arange(bs)
+        fb.seq_lens = torch.tensor([100, 5000, 6000])
+
+        coord._handle_sparse_retrieve(
+            query=torch.zeros(bs, 4, 16),
+            layer=layer,
+            forward_batch=fb,
+            attn_metadata=None,
+        )
+
+        # Default mask was [F, F, F]; algorithm flipped to [T, T, T].
+        # BOTH retrieve_topk and the adaptor must have seen [T, T, T].
+        self.assertIsNotNone(captured["retrieve_topk_mask"])
+        self.assertIsNotNone(captured["adaptor_mask"])
+        self.assertTrue(
+            torch.equal(
+                captured["retrieve_topk_mask"], torch.tensor([True, True, True])
+            )
+        )
+        self.assertTrue(
+            torch.equal(captured["adaptor_mask"], torch.tensor([True, True, True]))
+        )
+        # Same tensor object — proves the coordinator threads ONE mask, not two.
+        self.assertTrue(
+            torch.equal(captured["retrieve_topk_mask"], captured["adaptor_mask"])
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
