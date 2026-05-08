@@ -1175,6 +1175,9 @@ class QwenImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
                 "embed",
                 "rotary",
                 "pos_embed",
+                "img_in",
+                "txt_in",
+                "proj_out",
             ],
             "svdq_w4a4": [
                 "attn.to_qkv",
