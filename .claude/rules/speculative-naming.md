@@ -89,20 +89,14 @@ The semantic differs by scope:
 | `out_token_ids` (dflash) | `out_tokens` |
 | `_resolve_spec_overlap_token_ids` | `_resolve_spec_overlap_tokens` |
 
-### Cardinality and shape
+### Singular vs plural
 
-Singular/plural follows actual cardinality. The name carries **what** (token vs id, single vs multiple); the **type annotation + docstring** carry the shape and per-req cardinality. Don't try to encode shape in the name.
-
-| Cardinality | Suffix | Examples |
-|---|---|---|
-| Single value (per req or scalar) | no `s` | `bonus_token`, `current_token` |
-| Multiple values | `s` | `accept_tokens`, `draft_tokens`, `output_ids` |
+Plural for any non-scalar tensor (`[bs]`-shaped, flat, or multi-dim); singular only for scalars (kernel `tl.load` results, single-int locals). The fixed name `bonus_token` (Rule 4) is the one singular exception even though its shape is `[bs]`.
 
 ```python
-bonus_token: torch.Tensor       # [bs] - one bonus per req
-accept_tokens: torch.Tensor     # [total_accepted] flat - variable per req
-draft_tokens: torch.Tensor      # [bs * num_draft_tokens] flat - fixed per req
-accept_token = tl.load(...)     # int32 scalar in a kernel iteration
+accept_tokens: torch.Tensor     # [total_accepted] flat - plural
+draft_tokens: torch.Tensor      # [bs * num_draft_tokens] flat - plural
+accept_token = tl.load(...)     # int32 scalar in a kernel iteration - singular
 ```
 
 ## Out of scope (these names stay as is)
