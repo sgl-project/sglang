@@ -20,8 +20,11 @@ from sglang.srt.utils import (
     get_bool_env_var,
     get_device_core_count,
     get_int_env_var,
+    is_hip,
     next_power_of_2,
 )
+
+_is_hip = is_hip()
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -148,15 +151,19 @@ class TritonAttnBackend(AttentionBackend):
                 self.device_core_count,
                 self.max_context_len,
             )
-            # Cap so the attn_logits float32 buffer stays ≤ 512 MB
-            # (bs * num_head * max_kv_splits * v_head_dim * 4); the original
-            # #20479 cap blew this to ~2 GB on Kimi-K2.6 + MI325 and faulted
-            # ROCm CUDA-graph capture/replay (R73 nightly hang).
-            bs = model_runner.server_args.cuda_graph_max_bs or 1
-            self.max_kv_splits = min(
-                self.max_kv_splits,
-                max(1, (512 << 20) // (bs * self.num_head * self.v_head_dim * 4)),
-            )
+            if _is_hip:
+                # ROCm-only safety clamp. The #20479 cap inflates max_kv_splits
+                # to next_power_of_2(sm_count) (=512 on MI3xx), which makes the
+                # attn_logits float32 buffer
+                #   bs * num_head * max_kv_splits * v_head_dim * 4
+                # blow up to ~2 GB on Kimi-K2.6 + MI325 and faults ROCm during
+                # CUDA-graph capture/replay (R73 nightly hang). Bound the
+                # buffer to ≤ 512 MB on HIP only; NVIDIA paths are unchanged.
+                bs = model_runner.server_args.cuda_graph_max_bs or 1
+                self.max_kv_splits = min(
+                    self.max_kv_splits,
+                    max(1, (512 << 20) // (bs * self.num_head * self.v_head_dim * 4)),
+                )
         self.use_pdl = is_arch_support_pdl()
 
         self.allow_bidirectional_attention_in_extend = (
