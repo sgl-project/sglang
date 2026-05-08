@@ -173,7 +173,7 @@ def get_deepep_output_dtype(self) -> DeepOutputDtype:
     Automatically choose the dispatch output dtype for DeepEP.
 
     The decision follows several checks in priority order:
-    0. Parse deprecated enviroment variables.
+    0. Parse deprecated environment variables.
     1. Parse server argument.
     2. If quant_config contains input_global_scale → NVFP4 path.
     3. Parse quant config
@@ -181,7 +181,7 @@ def get_deepep_output_dtype(self) -> DeepOutputDtype:
     5. Otherwise default for NPU → BF16 (the default for NPU).
     6. Otherwise → FP8 (the default for most models like DeepSeek-V3).
     """
-    # 0. Parse deprecated enviroment variables.
+    # 0. Parse deprecated environment variables.
     if envs.SGLANG_DEEPEP_BF16_DISPATCH.get():
         logger.warning_once(
             "Warning: The env variable SGLANG_DEEPEP_BF16_DISPATCH deprecated "
