@@ -557,6 +557,8 @@ class LTX2DenoisingStage(DenoisingStage):
                     )
                     sliced = torch.cat([sliced, pad], dim=1)
                 return sliced
+        # The native HQ SDE path consumes this through `.float()`; keep the
+        # original downcast boundary before that upcast to preserve the trajectory.
         return cls._ltx2_res2s_new_noise(reference_tensor, generator).to(
             dtype=reference_tensor.dtype
         )
@@ -703,6 +705,8 @@ class LTX2DenoisingStage(DenoisingStage):
         update (midpoint SDE, bongmath anchor refinement, midpoint re-eval,
         final RK2 combination with SDE noise). Mirrors the guided stage-1 res2s
         math but without CFG/STG (stage-2 HQ uses the simple CFG path).
+        Raw HQ model timesteps are only inputs to the DiT call; stage-2 res2s
+        math stays in scheduler sigma space.
         """
         sigma_val = float(sigma.item())
         sigma_next_val = float(sigma_next.item())
