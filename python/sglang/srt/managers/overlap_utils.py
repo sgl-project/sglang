@@ -86,7 +86,7 @@ class FutureMap:
         # Get a reference for each tensor
         topk_p0 = draft_input.topk_p[0]
         topk_index0 = draft_input.topk_index[0]
-        bonus_token0 = draft_input.bonus_token[0]
+        bonus_token0 = draft_input.bonus_tokens[0]
         new_seq_lens0 = draft_input.new_seq_lens[0]
 
         self.topk_p_buf = torch.empty(
@@ -99,7 +99,7 @@ class FutureMap:
             dtype=topk_index0.dtype,
             device=self.device,
         )
-        self.bonus_token_buf = torch.empty(
+        self.bonus_tokens_buf = torch.empty(
             (self.future_buffer_len, *bonus_token0.shape),
             dtype=bonus_token0.dtype,
             device=self.device,
@@ -146,7 +146,7 @@ class FutureMap:
             indices.record_stream(torch.get_device_module(self.device).current_stream())
             draft_input.topk_p = self.topk_p_buf[indices]
             draft_input.topk_index = self.topk_index_buf[indices]
-            draft_input.bonus_token = self.bonus_token_buf[indices]
+            draft_input.bonus_tokens = self.bonus_tokens_buf[indices]
             draft_input.new_seq_lens = self.new_seq_lens_buf[indices]
             if spec_need_hidden_states():
                 draft_input.hidden_states = self.hidden_states_buf[indices]
@@ -181,7 +181,7 @@ class FutureMap:
 
         self.topk_p_buf[intv] = draft_input.topk_p
         self.topk_index_buf[intv] = draft_input.topk_index
-        self.bonus_token_buf[intv] = draft_input.bonus_token
+        self.bonus_tokens_buf[intv] = draft_input.bonus_tokens
         self.new_seq_lens_buf[intv] = draft_input.new_seq_lens
         if spec_need_hidden_states():
             self.hidden_states_buf[intv] = draft_input.hidden_states

@@ -283,7 +283,7 @@ class MultiLayerEagleWorker(TpModelWorker):
                 # when DP attention is enabled, but it is slow. Skip it for now.
                 if (
                     self.server_args.enable_dp_attention
-                    or batch.spec_info.bonus_token.shape[0] > 0
+                    or batch.spec_info.bonus_tokens.shape[0] > 0
                 ):
                     # decode is not finished
                     self.forward_draft_extend_after_decode(batch)
@@ -296,7 +296,7 @@ class MultiLayerEagleWorker(TpModelWorker):
             )
 
     def check_forward_draft_extend_after_decode(self, batch: ScheduleBatch):
-        local_need_forward = batch.spec_info.bonus_token.shape[0] > 0
+        local_need_forward = batch.spec_info.bonus_tokens.shape[0] > 0
         if not self.server_args.enable_dp_attention:
             return local_need_forward
 
@@ -440,7 +440,7 @@ class MultiLayerEagleWorker(TpModelWorker):
             retrieve_next_sibling,
             draft_tokens,
         ) = build_tree_kernel_efficient(
-            spec_info.bonus_token,
+            spec_info.bonus_tokens,
             parent_list,
             top_scores_index,
             draft_tokens,
@@ -609,7 +609,7 @@ class MultiLayerEagleWorker(TpModelWorker):
         """
         batch.spec_info = EagleDraftInput(
             hidden_states=hidden_states,
-            bonus_token=next_token_ids,
+            bonus_tokens=next_token_ids,
             num_tokens_per_req=1,
             num_tokens_for_logprob_per_req=1,
         )
@@ -664,7 +664,7 @@ class MultiLayerEagleWorker(TpModelWorker):
 
         input_is_idle = batch.forward_mode.is_idle()
 
-        if not input_is_idle and batch.spec_info.bonus_token.numel() == 0:
+        if not input_is_idle and batch.spec_info.bonus_tokens.numel() == 0:
             batch = batch.copy()
             batch.prepare_for_idle()
             hidden_size = (

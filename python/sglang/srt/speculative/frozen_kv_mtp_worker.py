@@ -366,7 +366,7 @@ class FrozenKVMTPWorker(TpModelWorker):
         if draft_input is None:
             draft_input = FrozenKVMTPDraftInput()
 
-        draft_input.bonus_token = last_token_ids.to(torch.int64)
+        draft_input.bonus_tokens = last_token_ids.to(torch.int64)
         draft_input.hidden_states = last_hidden_states
         draft_input.capture_hidden_mode = CaptureHiddenMode.LAST
         draft_input.num_tokens_per_req = 1
@@ -380,7 +380,7 @@ class FrozenKVMTPWorker(TpModelWorker):
         spec_info_backup = batch.spec_info
 
         batch.forward_mode = ForwardMode.DECODE
-        batch.input_ids = draft_input.bonus_token
+        batch.input_ids = draft_input.bonus_tokens
         batch.return_hidden_states = False
         batch.return_logprob = False
         batch.spec_info = draft_input
@@ -461,7 +461,7 @@ class FrozenKVMTPWorker(TpModelWorker):
         ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
             if (
                 self.server_args.enable_dp_attention
-                or batch.spec_info.bonus_token.numel()
+                or batch.spec_info.bonus_tokens.numel()
             ):
                 self.forward_draft_extend_after_decode(batch)
         set_time_batch(batch.reqs, "set_spec_draft_extend_end_time", trace_only=True)
@@ -507,7 +507,7 @@ class FrozenKVMTPWorker(TpModelWorker):
     def forward_draft_extend_after_decode(self, batch: ScheduleBatch) -> None:
         assert isinstance(batch.spec_info, FrozenKVMTPDraftInput)
         input_is_idle = batch.forward_mode.is_idle()
-        if not input_is_idle and batch.spec_info.bonus_token.numel() == 0:
+        if not input_is_idle and batch.spec_info.bonus_tokens.numel() == 0:
             batch = batch.copy()
             batch.prepare_for_idle()
             batch.spec_info = FrozenKVMTPDraftInput.create_idle_input(
@@ -564,7 +564,7 @@ class FrozenKVMTPWorker(TpModelWorker):
 
         if batch.sampling_info.penalizer_orchestrator.is_required:
             batch.sampling_info.penalizer_orchestrator.cumulate_output_tokens(
-                spec_info.bonus_token.to(torch.int64)
+                spec_info.bonus_tokens.to(torch.int64)
             )
 
         spec_info.capture_hidden_mode = CaptureHiddenMode.LAST
@@ -603,7 +603,7 @@ class FrozenKVMTPWorker(TpModelWorker):
             retrieve_next_sibling,
             draft_tokens,
         ) = build_tree_kernel_efficient(
-            spec_info.bonus_token,
+            spec_info.bonus_tokens,
             parent_list,
             top_scores_index,
             draft_tokens,

@@ -66,7 +66,7 @@ def create_extend_after_decode_spec_info(
     seq_lens,
     accept_lens,
     positions,
-    bonus_token_ptr,
+    bonus_tokens_ptr,
     bs_upper: tl.constexpr,
 ):
     pid = tl.program_id(axis=0)
@@ -84,7 +84,7 @@ def create_extend_after_decode_spec_info(
 
     accept_len_cumsum += accept_len - 1
     bonus_token = tl.load(accept_tokens + accept_len_cumsum)
-    tl.store(bonus_token_ptr + pid, bonus_token)
+    tl.store(bonus_tokens_ptr + pid, bonus_token)
 
 
 @triton.jit

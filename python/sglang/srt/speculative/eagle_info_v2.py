@@ -473,10 +473,10 @@ class EagleVerifyInputV2Mixin:
 
 
 @triton.jit
-def fill_bonus_token(
+def fill_bonus_tokens(
     accept_tokens,
     accept_lens,
-    bonus_token_ptr,
+    bonus_tokens_ptr,
     num_draft_tokens: tl.constexpr,
 ):
     # NOTE: we cannot fuse any in-place operations of `accept_lens` inside this kernel
@@ -487,7 +487,7 @@ def fill_bonus_token(
 
     bonus_token_idx = num_draft_tokens * pid + accept_len - 1
     bonus_token = tl.load(accept_tokens + bonus_token_idx)
-    tl.store(bonus_token_ptr + pid, bonus_token)
+    tl.store(bonus_tokens_ptr + pid, bonus_token)
 
 
 @triton.jit
