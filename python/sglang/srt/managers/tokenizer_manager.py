@@ -1039,11 +1039,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 )
 
             tokenized_obj = TokenizedEmbeddingReqInput(
-                input_text,
-                input_ids,
-                mm_inputs,
-                token_type_ids,
-                sampling_params,
+                input_text=input_text,
+                input_ids=input_ids,
+                image_inputs=mm_inputs,
+                token_type_ids=token_type_ids,
+                sampling_params=sampling_params,
                 positional_embed_overrides=positional_embed_overrides,
                 rid=obj.rid,
                 priority=obj.priority,
