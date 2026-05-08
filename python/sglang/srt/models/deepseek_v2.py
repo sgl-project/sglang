@@ -600,6 +600,12 @@ class DeepseekV2MoE(nn.Module):
                 and self.num_fused_shared_experts == 0
                 and hidden_states.shape[0] > 0
                 and get_is_capture_mode()
+                and not (
+                    get_global_server_args().enable_torch_compile
+                    and hidden_states.shape[0]
+                    <= get_global_server_args().torch_compile_max_bs
+                    * (get_global_server_args().speculative_num_draft_tokens or 1)
+                )
             ):
                 return self.forward_normal_dual_stream(
                     hidden_states,
@@ -1915,7 +1921,12 @@ class DeepseekV2Model(nn.Module):
 
         self.alt_stream = (
             torch.cuda.Stream()
-            if _is_cuda or _is_musa or envs.SGLANG_NPU_USE_MULTI_STREAM.get()
+            if (
+                _is_cuda
+                or _is_musa
+                or envs.SGLANG_NPU_USE_MULTI_STREAM.get()
+                or envs.SGLANG_ROCM_USE_MULTI_STREAM.get()
+            )
             else None
         )
 

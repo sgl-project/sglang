@@ -1,6 +1,16 @@
 name: Release Docker Images Nightly ROCm7.2 (AMD)
 on:
   workflow_dispatch:
+    inputs:
+      job_select:
+        description: 'Select which release job to run'
+        required: false
+        type: choice
+        default: 'all'
+        options:
+          - 'all'
+          - publish
+          - publish_dsv4
   schedule:
     - cron: '0 12 * * *'
 
@@ -14,7 +24,7 @@ concurrency:
 
 jobs:
   publish:
-    if: github.repository == 'sgl-project/sglang'
+    if: github.repository == 'sgl-project/sglang' && (github.event_name != 'workflow_dispatch' || inputs.job_select == 'all' || inputs.job_select == 'publish')
     runs-on: amd-docker-scale
     environment: 'prod'
     strategy:
@@ -85,7 +95,9 @@ jobs:
           echo "IMAGE_TAG=${tag}-${{ env.DATE }}" >> $GITHUB_ENV
 
           # remove --build-arg NIC_BACKEND=ainic for auto detection nic support in mori
-          docker build . -f docker/rocm.Dockerfile --build-arg SGL_BRANCH=${{ github.ref_name }} --build-arg BUILD_TYPE=${{ matrix.build_type }} --build-arg GPU_ARCH=${{ matrix.gpu_arch }} --build-arg ENABLE_MORI=1 --build-arg SETUPTOOLS_SCM_PRETEND_VERSION=${pretend_version} -t rocm/sgl-dev:${tag}-${{ env.DATE }} --no-cache
+          # UBUNTU_MIRROR forces apt over HTTPS to dodge port-80 reachability flakes
+          # to Canonical's archive.ubuntu.com mirror IPs from the amd-docker-scale runner.
+          docker build . -f docker/rocm.Dockerfile --build-arg SGL_BRANCH=${{ github.ref_name }} --build-arg BUILD_TYPE=${{ matrix.build_type }} --build-arg GPU_ARCH=${{ matrix.gpu_arch }} --build-arg ENABLE_MORI=1 --build-arg SETUPTOOLS_SCM_PRETEND_VERSION=${pretend_version} --build-arg UBUNTU_MIRROR=https://archive.ubuntu.com -t rocm/sgl-dev:${tag}-${{ env.DATE }} --no-cache
           docker push rocm/sgl-dev:${tag}-${{ env.DATE }}
 
       # Persist the tag right after rocm/sgl-dev push succeeds so the local
@@ -123,7 +135,7 @@ jobs:
   # of publish failed; legs without an artifact will fail at download and be
   # the only ones marked red.
   push_local_registry:
-    if: ${{ !cancelled() && github.repository == 'sgl-project/sglang' }}
+    if: ${{ !cancelled() && github.repository == 'sgl-project/sglang' && (github.event_name != 'workflow_dispatch' || inputs.job_select == 'all' || inputs.job_select == 'publish') }}
     runs-on: linux-mi300-1gpu-sglang
     environment: 'prod'
     needs: publish
@@ -160,3 +172,93 @@ jobs:
           docker pull "${src}"
           docker tag "${src}" "${dst}"
           docker push "${dst}"
+
+  publish_dsv4:
+    if: github.repository == 'sgl-project/sglang' && (github.event_name != 'workflow_dispatch' || inputs.job_select == 'all' || inputs.job_select == 'publish_dsv4')
+    runs-on: amd-docker-scale
+    environment: 'prod'
+    strategy:
+      fail-fast: false
+      matrix:
+        gpu_arch: ['gfx942-rocm720', 'gfx950-rocm720']
+        build_type: ['all']
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: amd/deepseek_v4
+          fetch-depth: 0  # Required for git describe to find tags
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: "Set Date"
+        run: |
+          echo "DATE=$(date +%Y%m%d)" >> $GITHUB_ENV
+
+      - name: Get version from latest tag
+        id: version
+        run: |
+          # Use the shared helper so stable/post releases sort above rc tags.
+          VERSION=$(python3 python/tools/get_version_tag.py --tag-only | sed 's/^v//')
+
+          if [ -z "$VERSION" ]; then
+            echo "::error::Could not determine version from git tags"
+            exit 1
+          fi
+
+          # Get short commit hash of current HEAD
+          COMMIT_SHA=$(git rev-parse HEAD)
+          COMMIT_HASH=${COMMIT_SHA:0:7}
+
+          # Compose pretend version for setuptools_scm: e.g., 0.5.8.post1.dev20260211+g1a2b3c4
+          PRETEND_VERSION="${VERSION}.dev${{ env.DATE }}+g${COMMIT_HASH}"
+
+          echo "commit_sha=${COMMIT_SHA}" >> "$GITHUB_OUTPUT"
+          echo "commit_hash=${COMMIT_HASH}" >> "$GITHUB_OUTPUT"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "pretend_version=${PRETEND_VERSION}" >> "$GITHUB_OUTPUT"
+          echo "DeepSeek V4 commit: ${COMMIT_SHA}"
+          echo "Detected version: ${VERSION}"
+          echo "Pretend version for pip: ${PRETEND_VERSION}"
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v2
+        with:
+          username: ${{ secrets.DOCKERHUB_AMD_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_AMD_TOKEN }}
+
+      - name: Build and Push DSv4 image to rocm/sgl-dev
+        run: |
+          version=${{ steps.version.outputs.version }}
+          pretend_version=${{ steps.version.outputs.pretend_version }}
+          echo "Version: ${version}"
+          echo "Pretend version: ${pretend_version}"
+
+          if [ "${{ matrix.gpu_arch }}" = "gfx942-rocm720" ]; then
+            rocm_tag="rocm720-mi30x"
+          elif [ "${{ matrix.gpu_arch }}" = "gfx950-rocm720" ]; then
+            rocm_tag="rocm720-mi35x"
+          else
+            echo "Unsupported gfx arch"
+            exit 1
+          fi
+
+          image_tag="${rocm_tag}-${{ steps.version.outputs.commit_hash }}-${{ env.DATE }}-DSv4"
+          echo "IMAGE_TAG=${image_tag}" >> "$GITHUB_ENV"
+          echo "Building rocm/sgl-dev:${image_tag} from amd/deepseek_v4 @ ${{ steps.version.outputs.commit_sha }}"
+
+          # UBUNTU_MIRROR forces apt over HTTPS to dodge port-80 reachability flakes
+          # to Canonical's archive.ubuntu.com mirror IPs from the amd-docker-scale runner.
+          docker build . -f docker/rocm.Dockerfile \
+            --build-arg SGL_BRANCH=${{ steps.version.outputs.commit_sha }} \
+            --build-arg BUILD_TYPE=${{ matrix.build_type }} \
+            --build-arg GPU_ARCH=${{ matrix.gpu_arch }} \
+            --build-arg ENABLE_MORI=1 \
+            --build-arg SETUPTOOLS_SCM_PRETEND_VERSION=${pretend_version} \
+            --build-arg UBUNTU_MIRROR=https://archive.ubuntu.com \
+            -t rocm/sgl-dev:${image_tag} \
+            --no-cache
+          docker push rocm/sgl-dev:${image_tag}

@@ -41,6 +41,15 @@ export const Gemma4Deployment = () => {
       ],
       commandRule: (value) => value === 'enabled' ? '--tool-call-parser gemma4' : null
     },
+    speculative: {
+      name: 'speculative',
+      title: 'Speculative Decoding (MTP)',
+      condition: (values) => !['mi300x'].includes(values.hardware),
+      items: [
+        { id: 'disabled', label: 'Disabled', subtitle: 'Baseline', default: true },
+        { id: 'enabled', label: 'Enabled', subtitle: 'Lower Latency', default: false }
+      ]
+    },
   };
 
   const modelConfigs = {
@@ -68,7 +77,7 @@ export const Gemma4Deployment = () => {
     const hwConfig = modelConfigs[hardware]?.[modelSize];
     if (!hwConfig) return `# Error: Unknown hardware/model combination`;
 
-    const { tp, mem } = hwConfig;
+    let { tp, mem } = hwConfig;
 
     const modelNames = {
       'e2b': 'google/gemma-4-E2B-it',
@@ -76,6 +85,11 @@ export const Gemma4Deployment = () => {
       '31b': 'google/gemma-4-31B-it',
       '26b-a4b': 'google/gemma-4-26B-A4B-it',
     };
+
+    const mtpEnabled = values.speculative === 'enabled';
+    if (mtpEnabled && modelSize === '26b-a4b' && hardware !== 'mi300x') {
+      tp = 2;
+    }
 
     let cmd = `sglang serve --model-path ${modelNames[modelSize]}`;
     if (tp > 1) {
@@ -89,6 +103,14 @@ export const Gemma4Deployment = () => {
         if (rule) cmd += ` \\\n  ${rule}`;
       }
     });
+
+    if (mtpEnabled) {
+      cmd += ` \\\n  --speculative-algorithm NEXTN`;
+      cmd += ` \\\n  --speculative-draft-model-path ${modelNames[modelSize]}-assistant`;
+      cmd += ` \\\n  --speculative-num-steps 5`;
+      cmd += ` \\\n  --speculative-num-draft-tokens 6`;
+      cmd += ` \\\n  --speculative-eagle-topk 1`;
+    }
 
     cmd += ` \\\n  --mem-fraction-static ${mem}`;
     cmd += ` \\\n  --host 0.0.0.0 --port 30000`;
