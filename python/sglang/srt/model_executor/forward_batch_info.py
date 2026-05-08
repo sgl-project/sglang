@@ -62,7 +62,7 @@ from sglang.srt.utils import (
     is_npu,
     support_triton,
 )
-from sglang.srt.utils.common import ceil_align
+from sglang.srt.utils.common import ceil_align, is_pin_memory_available
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -492,6 +492,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             rids=[req.rid for req in batch.reqs],
         )
         device = model_runner.device
+        _pin = is_pin_memory_available(device)
 
         if batch.extend_input_logprob_token_ids is not None:
             ret.extend_input_logprob_token_ids_gpu = (
@@ -500,9 +501,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
         num_tokens = len(batch.input_ids) if batch.input_ids is not None else 0
         if enable_num_token_non_padded(model_runner.server_args):
-            ret.num_token_non_padded = torch.tensor(num_tokens, dtype=torch.int32).to(
-                device, non_blocking=True
-            )
+            ret.num_token_non_padded = torch.tensor(
+                num_tokens, dtype=torch.int32, pin_memory=_pin
+            ).to(device, non_blocking=True)
         ret.num_token_non_padded_cpu = num_tokens
 
         # For MLP sync
@@ -522,15 +523,18 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             ret.original_global_num_tokens_cpu = batch.global_num_tokens
             ret.global_num_tokens_cpu = global_num_tokens
             ret.global_num_tokens_gpu = torch.tensor(
-                global_num_tokens, dtype=torch.int64
+                global_num_tokens, dtype=torch.int64, pin_memory=_pin
             ).to(device, non_blocking=True)
 
             ret.global_num_tokens_for_logprob_cpu = global_num_tokens_for_logprob
             ret.global_num_tokens_for_logprob_gpu = torch.tensor(
-                global_num_tokens_for_logprob, dtype=torch.int64
+                global_num_tokens_for_logprob, dtype=torch.int64, pin_memory=_pin
             ).to(device, non_blocking=True)
 
         if ret.forward_mode.is_idle():
+            if _is_npu:
+                # This synchronize is necessary to prevent the system from hanging on npu.
+                torch.npu.synchronize()
             ret.positions = torch.empty((0,), dtype=torch.int64, device=device)
             return ret
 
@@ -546,6 +550,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                     for i in range(block_offset, block_offset + block_size)
                 ],
                 dtype=positions_dtype,
+                pin_memory=_pin,
             ).to(device, non_blocking=True)
         elif (
             ret.spec_info is not None
@@ -561,10 +566,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             assert isinstance(batch.extend_seq_lens, list)
             assert isinstance(batch.extend_prefix_lens, list)
             ret.extend_seq_lens = torch.tensor(
-                batch.extend_seq_lens, dtype=torch.int32
+                batch.extend_seq_lens, dtype=torch.int32, pin_memory=_pin
             ).to(device, non_blocking=True)
             ret.extend_prefix_lens = torch.tensor(
-                batch.extend_prefix_lens, dtype=torch.int32
+                batch.extend_prefix_lens, dtype=torch.int32, pin_memory=_pin
             ).to(device, non_blocking=True)
             ret.extend_num_tokens = batch.extend_num_tokens
             positions, ret.extend_start_loc = compute_position(
@@ -767,6 +772,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         # batch_size * [3 * seq_len]
         batch_size = self.seq_lens_cpu.shape[0]
         mrope_positions_list = [[]] * batch_size
+        _pin = is_pin_memory_available(model_runner.device)
         for batch_idx in range(batch_size):
             mm_input = batch.multimodal_inputs[batch_idx]
             if self.forward_mode.is_decode():
@@ -818,10 +824,20 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                         )
                 mrope_positions_list[batch_idx] = mrope_positions
 
-        self.mrope_positions = torch.cat(
-            [pos for pos in mrope_positions_list],
-            dim=1,
-        ).to(dtype=torch.int64, device=model_runner.device, non_blocking=True)
+        if _pin:
+            self.mrope_positions = (
+                torch.cat(
+                    [pos for pos in mrope_positions_list],
+                    dim=1,
+                )
+                .pin_memory()
+                .to(dtype=torch.int64, device=model_runner.device, non_blocking=True)
+            )
+        else:
+            self.mrope_positions = torch.cat(
+                [pos for pos in mrope_positions_list],
+                dim=1,
+            ).to(dtype=torch.int64, device=model_runner.device, non_blocking=True)
 
     def _pad_tensor_to_size(self, tensor: torch.Tensor, size: int, *, value: int = 0):
         if value == 0:
