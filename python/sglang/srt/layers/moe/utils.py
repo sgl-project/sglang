@@ -167,7 +167,7 @@ class DeepOutputDtype(Enum):
     NVFP4 = "nvfp4"
 
 
-def get_deepep_output_dtype(self, quant_scheme=None) -> DeepOutputDtype:
+def get_deepep_output_dtype(self) -> DeepOutputDtype:
     """
     Automatically choose the dispatch output dtype for DeepEP.
 
@@ -175,10 +175,7 @@ def get_deepep_output_dtype(self, quant_scheme=None) -> DeepOutputDtype:
     0. Parse deprecated enviroment variables.
     1. Parse server argument.
     2. If quant_config contains input_global_scale → NVFP4 path.
-    3.1. If scheme is NPUW4A4Int4DynamicMoEMethod → BF16. (DeepEP does not support 4-bit quantization on NPU)
-    3.2. If scheme is NPUW8A8Int8DynamicMoEMethod → FP8.
-    3.3. If scheme is NPUW4A8Int8DynamicMoEMethod → FP8.
-    3.4. If scheme is NPUW4A16Int4DynamicMoEMethod → BF16.
+    3. Parse quant config
     4. If flashinfer_cutedsl backend is active → BF16 (it quantizes to NVFP4 internally).
     5. Otherwise default for NPU → BF16 (the default for NPU).
     6. Otherwise → FP8 (the default for most models like DeepSeek-V3).
@@ -211,22 +208,10 @@ def get_deepep_output_dtype(self, quant_scheme=None) -> DeepOutputDtype:
         if input_global_scale is not None:
             return DeepOutputDtype.NVFP4
 
-    if quant_scheme is not None:
-        # 3.1. If scheme is NPUW4A4Int4DynamicMoEMethod → BF16.
-        if quant_scheme == "NPUW4A4Int4DynamicMoEMethod":
-            return DeepOutputDtype.BF16
-
-        # 3.2. If scheme is NPUW8A8Int8DynamicMoEMethod → FP8.
-        if quant_scheme == "NPUW8A8Int8DynamicMoEMethod":
-            return DeepOutputDtype.FP8
-
-        # 3.3. If scheme is NPUW4A8Int8DynamicMoEMethod → FP8.
-        if quant_scheme == "NPUW4A8Int8DynamicMoEMethod":
-            return DeepOutputDtype.FP8
-
-        # 3.4. If scheme is NPUW4A16Int4DynamicMoEMethod → BF16.
-        if quant_scheme == "NPUW4A16Int4DynamicMoEMethod":
-            return DeepOutputDtype.BF16
+        # 3. Parse quant config to to determine the output dtype of dispatcher
+        dispather_output_dtype = self.quant_config.get("activation_dtype", None)
+        if dispather_output_dtype is not None:
+            return DeepOutputDtype(server_args.deepep_dispatcher_output_dtype)
 
     # 4. flashinfer_cutedsl expects BF16 dispatch
     if get_moe_runner_backend().is_flashinfer_cutedsl():
