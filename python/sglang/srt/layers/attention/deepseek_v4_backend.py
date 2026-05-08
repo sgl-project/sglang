@@ -37,6 +37,10 @@ from sglang.srt.layers.attention.dsv4.metadata_kernel import (
 from sglang.srt.layers.attention.dsv4.quant_k_cache import (
     quant_to_nope_fp8_rope_bf16_pack_triton,
 )
+from sglang.srt.layers.attention.flash_mla_sm120_fallback import (
+    _is_sm120,
+    flash_mla_with_kvcache_entrypoint,
+)
 from sglang.srt.layers.dp_attention import (
     get_attention_cp_rank,
     get_attention_cp_size,
@@ -44,9 +48,10 @@ from sglang.srt.layers.dp_attention import (
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.speculative.spec_info import SpecInput
-from sglang.srt.utils import ceil_align, cpu_has_amx_support, is_cpu
+from sglang.srt.utils import ceil_align, cpu_has_amx_support, is_cpu, is_xpu
 
 _is_cpu = is_cpu()
+_is_xpu = is_xpu()
 _cpu_amx = cpu_has_amx_support()
 
 if _is_cpu and _cpu_amx:
@@ -80,6 +85,8 @@ def _pad_last_dim(x: T, multiples_of: int = PAGE_INDEX_ALIGNED_SIZE) -> T:
 
 
 def _create_flashmla_metadata():
+    if _is_sm120 or _is_xpu:
+        return None
     try:
         import flash_mla
 
@@ -1067,9 +1074,7 @@ class DeepseekV4AttnBackend(
                 )[0]
             else:
 
-                import flash_mla
-
-                o = flash_mla.flash_mla_with_kvcache(
+                input_dict = dict(
                     q=q,
                     k_cache=swa_k_cache,
                     head_dim_v=self.head_dim_v,
@@ -1084,7 +1089,10 @@ class DeepseekV4AttnBackend(
                     extra_k_cache=extra_k_cache,
                     extra_indices_in_kvcache=extra_indices,
                     extra_topk_length=extra_topk_lengths,
-                )[0]
+                )
+
+                backend = envs.SGLANG_HACK_FLASHMLA_BACKEND.get()
+                o = flash_mla_with_kvcache_entrypoint(**input_dict, backend=backend)[0]
 
             o = o.squeeze(1)
             return o

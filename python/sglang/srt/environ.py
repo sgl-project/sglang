@@ -578,6 +578,7 @@ class Envs:
     SGLANG_OPT_USE_ONLINE_COMPRESS = EnvBool(False)
     SGLANG_FP8_PAGED_MQA_LOGITS_TORCH = EnvBool(False)
     SGLANG_TOPK_TRANSFORM_512_TORCH = EnvBool(False)
+    SGLANG_HACK_FLASHMLA_BACKEND = EnvStr("kernel")
 
     # SWA radix cache
     SGLANG_OPT_CACHE_SWA_TRANSLATION = EnvBool(True)
