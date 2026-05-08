@@ -66,17 +66,6 @@ from sglang.multimodal_gen.utils import (
 
 logger = init_logger(__name__)
 
-# Derived from single-H200 benchmarking (~140.4 GiB total) at the maximum
-# supported 720p workloads with dit_layerwise_offload=False and
-# num_inference_steps=1:
-# - Wan-AI/Wan2.2-T2V-A14B-Diffusers, 1280x720, 81 frames:
-#   peak_reserved=108076 MB (~105.5 GiB), peak_allocated=97665 MB (~95.4 GiB)
-# - OpenMOSS-Team/MOVA-720p, 1280x720, 193 frames:
-#   peak_reserved=130264 MB (~127.2 GiB), peak_allocated=108819 MB (~106.3 GiB)
-# Also, on H200, enabling dit_layerwise_offload regressed latency noticeably on
-# our validated Wan/MOVA workloads, so use a 130 GiB cutoff to keep H200-class
-# GPUs on the faster no-offload default while preserving some headroom.
-WAN_LAYERWISE_OFFLOAD_AUTO_DISABLE_MEM_GB = 130
 LTX2_TWO_STAGE_DEVICE_MODES = ("original", "snapshot", "resident")
 LTX2_TWO_STAGE_PIPELINE_NAMES = ("LTX2TwoStagePipeline", "LTX2TwoStageHQPipeline")
 CLI_ARG_ALIASES = {
@@ -777,12 +766,13 @@ class ServerArgs(DisaggArgsMixin):
             self.use_fsdp_inference = False
             self.dit_layerwise_offload = False
 
-        # automatically enable dit_layerwise_offload for Wan/MOVA models if appropriate
         if not envs.SGLANG_CACHE_DIT_ENABLED:
-            pipeline_name_lower = self.pipeline_config.__class__.__name__.lower()
+            model_deployment_config = self.pipeline_config.get_model_deployment_config()
+            auto_layerwise_offload = model_deployment_config.auto_dit_layerwise_offload
             if (
-                "wan" in pipeline_name_lower or "mova" in pipeline_name_lower
-            ) and self.dit_layerwise_offload is None:
+                auto_layerwise_offload.enabled_by_default
+                and self.dit_layerwise_offload is None
+            ):
                 auto_enable_layerwise_offload = (
                     current_platform.enable_dit_layerwise_offload_for_wan_by_default()
                 )
@@ -791,8 +781,9 @@ class ServerArgs(DisaggArgsMixin):
                         current_platform.get_device_total_memory() / BYTES_PER_GB
                     )
                     if (
-                        device_total_memory_gb
-                        >= WAN_LAYERWISE_OFFLOAD_AUTO_DISABLE_MEM_GB
+                        auto_layerwise_offload.high_memory_disable_gb is not None
+                        and device_total_memory_gb
+                        >= auto_layerwise_offload.high_memory_disable_gb
                     ):
                         logger.info(
                             "Skipping automatic dit_layerwise_offload for %s on a high-memory CUDA GPU (e.g. H200/B200/B300-class, %.2f GiB total)",

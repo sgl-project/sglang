@@ -22,6 +22,9 @@ from sglang.multimodal_gen.configs.models import (
 )
 from sglang.multimodal_gen.configs.models.encoders import BaseEncoderOutput
 from sglang.multimodal_gen.configs.models.encoders.t5 import T5Config
+from sglang.multimodal_gen.configs.pipeline_configs.model_deployment import (
+    ModelDeploymentConfig,
+)
 from sglang.multimodal_gen.configs.sample.sampling_params import DataType
 from sglang.multimodal_gen.configs.utils import update_config_from_args
 from sglang.multimodal_gen.runtime.distributed.communication_op import (
@@ -257,6 +260,10 @@ class PipelineConfig:
 
     # DMD parameters
     dmd_denoising_steps: list[int] | None = field(default=None)
+
+    def get_model_deployment_config(self) -> ModelDeploymentConfig:
+        # return the model-specific config for optimal deployment setting
+        return ModelDeploymentConfig()
 
     # Wan2.2 TI2V parameters
     boundary_ratio: float | None = None
