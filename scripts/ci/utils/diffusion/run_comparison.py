@@ -211,7 +211,10 @@ HEALTH_ENDPOINTS = {
 
 
 def wait_for_health(
-    base_url: str, framework: str = "sglang", timeout: int = HEALTH_TIMEOUT
+    base_url: str,
+    framework: str = "sglang",
+    timeout: int = HEALTH_TIMEOUT,
+    proc: subprocess.Popen | None = None,
 ) -> None:
     """Poll health endpoint until 200, then verify model is loaded."""
     endpoint = HEALTH_ENDPOINTS.get(framework, "/health")
@@ -219,6 +222,11 @@ def wait_for_health(
     print(f"  Waiting for server at {health_url} ...")
     start = time.time()
     while True:
+        if proc is not None and proc.poll() is not None:
+            raise RuntimeError(
+                f"{framework} server exited before health check passed "
+                f"(exit {proc.returncode})"
+            )
         try:
             resp = requests.get(health_url, timeout=2)
             if resp.status_code == 200:
@@ -236,6 +244,11 @@ def wait_for_health(
     if framework == "sglang":
         models_url = f"{base_url}/v1/models"
         while True:
+            if proc is not None and proc.poll() is not None:
+                raise RuntimeError(
+                    f"{framework} server exited before model routes were ready "
+                    f"(exit {proc.returncode})"
+                )
             try:
                 resp = requests.get(models_url, timeout=5)
                 if resp.status_code == 200:
@@ -1084,7 +1097,7 @@ def run_case_framework(
         log_thread.start()
 
         base_url = f"http://{DEFAULT_HOST}:{port}"
-        wait_for_health(base_url, framework)
+        wait_for_health(base_url, framework, proc=proc)
         bench_cfg = _merge_nested(
             _benchmark_config(config, case), fw_cfg.get("benchmark", {})
         )
