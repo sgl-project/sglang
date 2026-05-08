@@ -409,6 +409,7 @@ class PrefillAdder:
         priority_scheduling_preemption_threshold: int = 0,
         max_prefill_bs: int = 0,
         max_running_requests: Optional[int] = None,
+        new_prefill_requests_count: Optional[int] = None,
         prefill_max_requests: Optional[int] = None,
         prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor] = None,
         dllm_config: Optional[DllmConfig] = None,
@@ -421,6 +422,7 @@ class PrefillAdder:
         self.rem_input_tokens = rem_input_tokens - num_mixed_decode_tokens
         self.rem_chunk_tokens = rem_chunk_tokens
         self.dllm_config = dllm_config
+        self.new_prefill_requests_count = new_prefill_requests_count
 
         if self.dllm_config is not None:
             self._init_dllm_meta(dllm_config)
@@ -806,6 +808,7 @@ class PrefillAdder:
                 running_batch=self.running_batch.batch_size(),
                 max_prefill_bs=self.max_prefill_bs,
                 max_running_requests=self.max_running_requests,
+                new_prefill_requests_count=self.new_prefill_requests_count,
             )
         ):
             return AddReqResult.OTHER
