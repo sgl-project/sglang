@@ -276,5 +276,63 @@ class TestStage2CapacityGuard(CustomTestCase):
             )
 
 
+@unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
+class TestStage2NonPow2Shapes(CustomTestCase):
+    """Triton's `tl.arange` requires a power-of-2 length. Real workloads
+    produce non-pow2 `num_candidates = num_blocks * k_block` (e.g. 9 * 64 =
+    576 at 9K-cap context with BLOCK_T=1024) and non-pow2 `effective_budget
+    = min(token_budget, num_candidates)` (576 < 1024). The kernel must pad
+    via mask, not crash."""
+
+    def _run(self, *, num_blocks, k_block, effective_budget):
+        device = torch.device("cuda")
+        bs, h_kv = 2, 2
+        # Build stage-1-shaped inputs with deterministic, distinct logicals
+        # so the merge has unambiguous ordering.
+        log = torch.full(
+            (bs, h_kv, num_blocks, k_block), -1, dtype=torch.int32, device=device
+        )
+        scr = torch.full(
+            (bs, h_kv, num_blocks, k_block),
+            float("-inf"),
+            dtype=torch.float32,
+            device=device,
+        )
+        n = num_blocks * k_block
+        for b in range(bs):
+            for h in range(h_kv):
+                # Place logicals 0..n-1 with score = logical (highest = top).
+                pos = torch.arange(n, dtype=torch.int32, device=device)
+                log[b, h] = pos.view(num_blocks, k_block)
+                scr[b, h] = pos.float().view(num_blocks, k_block)
+
+        out_log, out_scr = ds_select_stage2_merge(
+            block_topk_logical=log,
+            block_topk_scores=scr,
+            effective_budget=effective_budget,
+        )
+        ref_log, ref_scr = ds_select_stage2_merge_torch_ref(
+            block_topk_logical=log,
+            block_topk_scores=scr,
+            effective_budget=effective_budget,
+        )
+        # Stage-2 emits top-effective_budget by score, then sorted by score
+        # descending (the merge's internal ordering). For deterministic
+        # input both impls must agree exactly on the surviving set.
+        for b in range(bs):
+            for h in range(h_kv):
+                tri = sorted(int(x) for x in out_log[b, h].tolist() if int(x) >= 0)
+                ref = sorted(int(x) for x in ref_log[b, h].tolist() if int(x) >= 0)
+                self.assertEqual(tri, ref, f"non-pow2 mismatch at (b={b}, h={h})")
+
+    def test_non_pow2_num_candidates(self):
+        # num_blocks=9 → 9*64=576 candidates (not pow2).
+        self._run(num_blocks=9, k_block=64, effective_budget=128)
+
+    def test_non_pow2_effective_budget(self):
+        # 9*64=576; effective_budget=min(token_budget=1024, 576)=576 (not pow2).
+        self._run(num_blocks=9, k_block=64, effective_budget=576)
+
+
 if __name__ == "__main__":
     unittest.main()

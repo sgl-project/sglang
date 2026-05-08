@@ -93,6 +93,8 @@ class WorkloadResult:
     tbt_ms_p50: float
     tbt_ms_p95: float
     niah_accuracy: Optional[float] = None
+    block_t: Optional[int] = None
+    k_block: Optional[int] = None
     extra: Dict[str, float] = field(default_factory=dict)
 
 
@@ -121,7 +123,12 @@ def _build_niah_prompt(context_tokens: int, needle: str, query: str) -> str:
 
 @contextmanager
 def _launch_server(
-    model: str, port: int, ds_args: List[str], log_path: Path, timeout_s: int = 600
+    model: str,
+    port: int,
+    ds_args: List[str],
+    log_path: Path,
+    context_length: int,
+    timeout_s: int = 600,
 ):
     """Yield a live SGLang server, then tear it down."""
     cmd = [
@@ -137,6 +144,8 @@ def _launch_server(
         "--max-running-requests",
         "32",
         "--disable-radix-cache",
+        "--context-length",
+        str(context_length),
         *ds_args,
     ]
     env = dict(os.environ)
@@ -310,7 +319,11 @@ def _run_niah(base_url: str, model: str, context_tokens: int, n: int = 5) -> flo
 
 
 def _build_ds_args(
-    config: str, calibration: Optional[str], heavy_channels: int
+    config: str,
+    calibration: Optional[str],
+    heavy_channels: int,
+    block_t: int,
+    k_block: int,
 ) -> List[str]:
     if config == "branch_ds_on":
         if not calibration:
@@ -331,6 +344,10 @@ def _build_ds_args(
             "4096",
             "--double-sparsity-max-selected-per-request",
             "8192",
+            "--double-sparsity-block-t",
+            str(block_t),
+            "--double-sparsity-k-block",
+            str(k_block),
             "--page-size",
             "1",
             "--attention-backend",
@@ -362,9 +379,29 @@ def main():
     p.add_argument("--niah-context-tokens", type=int, default=32768)
     p.add_argument("--output-json", required=True)
     p.add_argument("--server-log", default=None)
+    p.add_argument(
+        "--block-t",
+        type=int,
+        default=1024,
+        choices=[256, 512, 1024, 2048],
+        help="DS stage-1 BLOCK_T (only used by branch_ds_on).",
+    )
+    p.add_argument(
+        "--k-block",
+        type=int,
+        default=64,
+        choices=[16, 32, 64, 128, 256],
+        help="DS stage-1 K_BLOCK (only used by branch_ds_on).",
+    )
     args = p.parse_args()
 
-    ds_args = _build_ds_args(args.config, args.calibration, args.heavy_channels)
+    ds_args = _build_ds_args(
+        args.config,
+        args.calibration,
+        args.heavy_channels,
+        args.block_t,
+        args.k_block,
+    )
     port = _free_port()
     log_path = (
         Path(args.server_log)
@@ -372,7 +409,11 @@ def main():
         else Path(f"./bench_{args.config}_server.log")
     )
 
-    with _launch_server(args.model, port, ds_args, log_path) as base_url:
+    # Server's max-context window. Add headroom for generation.
+    server_ctx_len = args.context_len + args.output_len + 256
+    with _launch_server(
+        args.model, port, ds_args, log_path, context_length=server_ctx_len
+    ) as base_url:
         wl = _run_workload(
             base_url,
             args.model,
@@ -382,6 +423,9 @@ def main():
             concurrency=args.concurrency,
         )
         wl.config = args.config
+        if args.config == "branch_ds_on":
+            wl.block_t = args.block_t
+            wl.k_block = args.k_block
         if args.niah:
             wl.niah_accuracy = _run_niah(base_url, args.model, args.niah_context_tokens)
 

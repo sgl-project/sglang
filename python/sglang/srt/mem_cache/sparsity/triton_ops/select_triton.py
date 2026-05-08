@@ -500,7 +500,9 @@ def _ds_select_stage2_merge_kernel(
     ms_stride_h,
     # constexprs
     NUM_CANDIDATES: tl.constexpr,  # num_blocks * K_BLOCK (must be <= merge_safe_threshold)
+    NUM_CANDIDATES_PADDED: tl.constexpr,  # next-pow2(NUM_CANDIDATES) for tl.arange
     EFFECTIVE_BUDGET: tl.constexpr,
+    EFFECTIVE_BUDGET_PADDED: tl.constexpr,  # next-pow2(EFFECTIVE_BUDGET) for tl.arange
 ):
     """One program per (bs, kv_head). In-program iterative argmax for
     top-EFFECTIVE_BUDGET candidates by score.
@@ -508,31 +510,40 @@ def _ds_select_stage2_merge_kernel(
     Caller guarantees `NUM_CANDIDATES <= merge_safe_threshold` (default
     4096) — the chunked merge path is a v1.1.x escape hatch we don't
     need until profiling demands it.
+
+    `tl.arange` requires a power-of-2 size, so the kernel works on
+    `NUM_CANDIDATES_PADDED` (next pow2) and masks the padding tail to
+    NEG_INF / -1.
     """
     NEG_INF = -1e38
 
     bs_idx = tl.program_id(0)
     kv_idx = tl.program_id(1)
 
-    cand_offsets = tl.arange(0, NUM_CANDIDATES)  # [NUM_CANDIDATES]
+    cand_offsets = tl.arange(0, NUM_CANDIDATES_PADDED)  # [NUM_CANDIDATES_PADDED]
+    in_range = cand_offsets < NUM_CANDIDATES
     btl_offs = bs_idx * btl_stride_b + kv_idx * btl_stride_h + cand_offsets
     bts_offs = bs_idx * bts_stride_b + kv_idx * bts_stride_h + cand_offsets
 
-    logicals = tl.load(block_topk_logical_ptr + btl_offs)  # [NUM_CANDIDATES] int32
-    scores = tl.load(block_topk_scores_ptr + bts_offs).to(tl.float32)
-    # Drop sentinel candidates (-1 logical → unscored slot).
-    valid = logicals >= 0
+    # Mask out-of-range tail loads; treat as sentinel.
+    logicals = tl.load(block_topk_logical_ptr + btl_offs, mask=in_range, other=-1)
+    scores = tl.load(block_topk_scores_ptr + bts_offs, mask=in_range, other=NEG_INF).to(
+        tl.float32
+    )
+    # Drop sentinel candidates (-1 logical → unscored slot, plus padding).
+    valid = (logicals >= 0) & in_range
     scores = tl.where(valid, scores, NEG_INF)
 
-    out_k_range = tl.arange(0, EFFECTIVE_BUDGET).to(tl.int32)
-    out_logical = tl.zeros([EFFECTIVE_BUDGET], dtype=tl.int32) - 1
-    out_scores = tl.zeros([EFFECTIVE_BUDGET], dtype=tl.float32) + NEG_INF
+    out_k_range = tl.arange(0, EFFECTIVE_BUDGET_PADDED).to(tl.int32)
+    out_in_range = out_k_range < EFFECTIVE_BUDGET
+    out_logical = tl.zeros([EFFECTIVE_BUDGET_PADDED], dtype=tl.int32) - 1
+    out_scores = tl.zeros([EFFECTIVE_BUDGET_PADDED], dtype=tl.float32) + NEG_INF
 
     for k in tl.static_range(EFFECTIVE_BUDGET):
         max_score = tl.max(scores, axis=0)
         # Min-position tie-break (matches torch ref's stable sort).
         is_max = scores == max_score
-        pos_or_inf = tl.where(is_max, cand_offsets, NUM_CANDIDATES)
+        pos_or_inf = tl.where(is_max, cand_offsets, NUM_CANDIDATES_PADDED)
         max_pos = tl.min(pos_or_inf, axis=0)
 
         slot_active = max_score > -1.0e37
@@ -553,8 +564,16 @@ def _ds_select_stage2_merge_kernel(
 
     out_log_base = bs_idx * ml_stride_b + kv_idx * ml_stride_h
     out_scr_base = bs_idx * ms_stride_b + kv_idx * ms_stride_h
-    tl.store(merged_logical_ptr + out_log_base + out_k_range, out_logical)
-    tl.store(merged_scores_ptr + out_scr_base + out_k_range, out_scores)
+    tl.store(
+        merged_logical_ptr + out_log_base + out_k_range,
+        out_logical,
+        mask=out_in_range,
+    )
+    tl.store(
+        merged_scores_ptr + out_scr_base + out_k_range,
+        out_scores,
+        mask=out_in_range,
+    )
 
 
 def ds_select_stage2_merge(
@@ -620,7 +639,9 @@ def ds_select_stage2_merge(
         merged_scores.stride(0),
         merged_scores.stride(1),
         NUM_CANDIDATES=num_candidates,
+        NUM_CANDIDATES_PADDED=triton.next_power_of_2(num_candidates),
         EFFECTIVE_BUDGET=effective_budget,
+        EFFECTIVE_BUDGET_PADDED=triton.next_power_of_2(effective_budget),
     )
     return merged_logical, merged_scores
 
