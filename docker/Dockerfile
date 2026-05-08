@@ -71,11 +71,12 @@ RUN chmod +x /usr/local/bin/apt-install-with-retry
 # Ubuntu 24.04 ships Python 3.12 in main, so we no longer need the deadsnakes
 # PPA. Dropping it avoids transient Launchpad 504s in `add-apt-repository`.
 RUN --mount=type=cache,target=/var/cache/apt,id=base-apt \
-    apt-install-with-retry wget software-properties-common \
+    apt-install-with-retry wget curl software-properties-common \
     && apt-install-with-retry python3.12-full python3.12-dev \
     && update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.12 2 \
     && update-alternatives --set python3 /usr/bin/python3.12 \
-    && wget -q https://bootstrap.pypa.io/get-pip.py \
+    && curl --fail --show-error --location --retry 5 --retry-all-errors --retry-delay 2 \
+        -o get-pip.py https://bootstrap.pypa.io/get-pip.py \
     && python3 get-pip.py --break-system-packages \
     && rm get-pip.py \
     # Allow pip to install packages globally (PEP 668 workaround for Ubuntu 24.04)
@@ -212,8 +213,8 @@ WORKDIR /sgl-workspace
 # Rust toolchain for setuptools-rust extensions (e.g. sglang-grpc).
 # Requires >= 1.85 (edition 2024). Inherited by framework via FROM torch_deps.
 ENV PATH="/root/.cargo/bin:${PATH}"
-RUN curl --proto '=https' --tlsv1.2 --retry 3 --retry-delay 2 -sSf https://sh.rustup.rs \
-        | sh -s -- -y --no-modify-path --profile minimal \
+RUN bash -o pipefail -c 'curl --proto "=https" --tlsv1.2 --retry 5 --retry-all-errors --retry-delay 2 -sSf https://sh.rustup.rs \
+        | sh -s -- -y --no-modify-path --profile minimal' \
     && rustc --version && cargo --version
 
 # Install sgl-kernel (from pre-built wheel)
@@ -413,9 +414,10 @@ RUN CMAKE_VERSION=3.31.1 \
     && mkdir -p /tools/share && cp -r "/tmp/${CMAKE_INSTALLER}/share/"* /tools/share/ \
     && rm -rf "/tmp/${CMAKE_INSTALLER}" "/tmp/${CMAKE_INSTALLER}.tar.gz"
 
-RUN curl --proto '=https' --tlsv1.2 --retry 3 --retry-delay 2 -sSf https://just.systems/install.sh | \
+RUN bash -o pipefail -c 'curl --proto "=https" --tlsv1.2 --retry 5 --retry-all-errors --retry-delay 2 -sSf https://just.systems/install.sh | \
     sed "s|https://github.com|https://${GITHUB_ARTIFACTORY}|g" | \
-    bash -s -- --tag 1.42.4 --to /tools
+    bash -s -- --tag 1.42.4 --to /tools' \
+    && test -x /tools/just
 
 # Install oh-my-zsh and plugins
 RUN sh -c "$(curl --retry 3 --retry-delay 2 -fsSL https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/master/tools/install.sh)" "" --unattended \
@@ -441,7 +443,7 @@ COPY sgl-model-gateway /build/sgl-model-gateway
 
 # Install Rust, build gateway binary and Python bindings, then clean up Rust toolchain
 RUN --mount=type=cache,target=/root/.cache/pip \
-    curl --proto '=https' --tlsv1.2 --retry 3 --retry-delay 2 -sSf https://sh.rustup.rs | sh -s -- -y \
+    bash -o pipefail -c 'curl --proto "=https" --tlsv1.2 --retry 5 --retry-all-errors --retry-delay 2 -sSf https://sh.rustup.rs | sh -s -- -y' \
     && export PATH="/root/.cargo/bin:${PATH}" \
     && python3 -m pip install maturin \
     && cd /build/sgl-model-gateway/bindings/python \
@@ -779,7 +781,8 @@ RUN --mount=type=cache,target=/var/cache/apt,id=runtime-apt \
     && update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.12 2 \
     && update-alternatives --set python3 /usr/bin/python3.12 \
     && ln -sf /usr/bin/python3.12 /usr/bin/python \
-    && wget -q https://bootstrap.pypa.io/get-pip.py \
+    && curl --fail --show-error --location --retry 5 --retry-all-errors --retry-delay 2 \
+        -o get-pip.py https://bootstrap.pypa.io/get-pip.py \
     && python3 get-pip.py --break-system-packages \
     && rm get-pip.py \
     # Allow pip to install packages globally (PEP 668 workaround for Ubuntu 24.04)
