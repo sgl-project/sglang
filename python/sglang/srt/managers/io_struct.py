@@ -1615,7 +1615,8 @@ class ReleaseMemoryOccupationReqInput(BaseReq):
 
 @dataclass
 class ReleaseMemoryOccupationReqOutput(BaseReq):
-    pass
+    success: bool = True
+    message: str = ""
 
 
 @dataclass
