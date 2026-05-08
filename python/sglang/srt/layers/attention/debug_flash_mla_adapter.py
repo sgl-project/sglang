@@ -20,7 +20,9 @@ import os
 
 import torch
 
-_SM120 = None
+from sglang.srt.environ import envs
+from sglang.srt.utils import is_sm120_supported
+
 _use_triton_gather = None
 _use_triton_flashmla = None
 
@@ -41,13 +43,13 @@ def _should_use_triton_gather():
 def _should_use_triton_flashmla():
     """Check if Triton tiled FlashMLA kernel should be used on SM120.
 
-    Controlled by SGLANG_SM120_TRITON_FLASHMLA=1 env var for A/B testing.
+    Auto-enabled on SM120. Set SGLANG_SM120_TRITON_FLASHMLA=0 to disable.
     """
     global _use_triton_flashmla
     if _use_triton_flashmla is None:
         _use_triton_flashmla = (
-            _is_sm120()
-            and os.environ.get("SGLANG_SM120_TRITON_FLASHMLA", "0") == "1"
+            is_sm120_supported()
+            and envs.SGLANG_SM120_TRITON_FLASHMLA.get()
         )
     return _use_triton_flashmla
 
@@ -63,10 +65,7 @@ BYTES_SCALE = NUM_TILES + SCALE_PAD  # 8
 
 
 def _is_sm120():
-    global _SM120
-    if _SM120 is None:
-        _SM120 = torch.cuda.get_device_capability()[0] >= 12
-    return _SM120
+    return is_sm120_supported()
 
 
 def _gather_and_dequant_kv_vectorized(k_cache, indices, topk_length=None):

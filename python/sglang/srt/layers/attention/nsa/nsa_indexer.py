@@ -17,19 +17,19 @@ from sglang.srt.utils import (
     is_cuda,
     is_hip,
     is_npu,
+    is_sm120_supported,
 )
 
 global _use_multi_stream
 _is_cuda = is_cuda()
 _is_hip = is_hip()
 _is_sm103 = _is_cuda and get_device_sm() == 103
-_is_sm120 = _is_cuda and get_device_sm() == 120
+_is_sm120 = _is_cuda and is_sm120_supported()
 _is_npu = is_npu()
 _is_fp8_fnuz = is_fp8_fnuz()
 if _is_cuda:
     try:
-        _sm = get_device_sm()
-        if _sm == 120:
+        if _is_sm120:
             raise ImportError("DeepGEMM unsupported on SM120")
         import deep_gemm
     except ImportError as e:

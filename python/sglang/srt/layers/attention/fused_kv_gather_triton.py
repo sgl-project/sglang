@@ -73,52 +73,6 @@ def _fused_nope_dequant_kernel(
         tl.store(output_ptr + out_offs, dequant)
 
 
-@triton.jit
-def _fused_rope_copy_kernel(
-    raw_u8_ptr,
-    indices_ptr,
-    output_ptr,
-    page_size: tl.constexpr,
-    kv_dim: tl.constexpr,
-    max_topk: tl.constexpr,
-    DIM_NOPE: tl.constexpr,
-    DIM_ROPE: tl.constexpr,
-    BYTES_NR: tl.constexpr,
-    HEAD_DIM: tl.constexpr,
-):
-    """Copy RoPE bf16 bytes from cache to output."""
-    bid = tl.program_id(0)
-    tid = tl.program_id(1)
-
-    if tid >= max_topk:
-        return
-
-    flat_idx = tl.load(indices_ptr + bid * max_topk + tid)
-
-    page_idx = flat_idx // page_size
-    tok_in_page = flat_idx % page_size
-
-    bytes_per_page = page_size * kv_dim
-    nope_base = page_idx * bytes_per_page + tok_in_page * BYTES_NR
-    rope_base = nope_base + DIM_NOPE
-
-    out_base = bid * max_topk * HEAD_DIM + tid * HEAD_DIM + DIM_NOPE
-
-    # Load RoPE bf16 values (2 bytes each = 64 values from 128 bytes)
-    for r in range(DIM_ROPE):
-        byte_off = rope_base + r * 2
-        lo = tl.load(raw_u8_ptr + byte_off).to(tl.int32)
-        hi = tl.load(raw_u8_ptr + byte_off + 1).to(tl.int32)
-        bf16_bits = (hi << 8) | lo
-        # Reinterpret bits as bf16: cast to uint16 then to bf16
-        # In Triton, we use bitwise trick:
-        # bf16 bits -> uint16 -> bf16 via pointer cast
-        # Since we can't do this directly, store the raw bits and
-        # fix up in PyTorch with view
-        out_off = out_base + r
-        tl.store(output_ptr + out_off, bf16_bits.to(tl.bfloat16))
-
-
 def fused_gather_dequant(k_cache, indices):
     """Fused KV gather+dequant using Triton + minimal PyTorch.
 

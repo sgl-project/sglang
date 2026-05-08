@@ -541,6 +541,10 @@ class Envs:
     SGLANG_TOPK_TRANSFORM_512_TORCH = EnvBool(False)
     SGLANG_FP8_PAGED_MQA_LOGITS_TORCH = EnvBool(False)
 
+    # SM120-optimized Triton kernels (auto-enabled on SM120, set to 0 to disable)
+    SGLANG_SM120_TRITON_MOE = EnvBool(True)
+    SGLANG_SM120_TRITON_FLASHMLA = EnvBool(True)
+
     # Symmetric Memory
     SGLANG_SYMM_MEM_PREALLOC_GB_SIZE = EnvInt(-1)
 

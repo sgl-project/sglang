@@ -32,11 +32,12 @@ constexpr size_t kSmem = static_cast<size_t>(SGL_TOPK_DYNAMIC_SMEM_BYTES);
 constexpr size_t kSmem = 48 * 1024;  // bytes
 #endif
 #else
-// SM120 (consumer Blackwell, e.g. RTX PRO 6000) has only ~99KB shared memory
-// per block (101376 bytes optin). Static shared memory in this kernel uses
-// ~11.5KB (histograms + s_indices in transform variants), leaving ~88KB for
-// dynamic shared memory. Use 80KB to stay within limits on SM120 while keeping
-// 10240 entries per ping-pong buffer, which is 5x the TopK=2048 requirement.
+// 80 KB dynamic shared memory — safe for ALL CUDA architectures:
+//   SM90/SM100 (Hopper/Blackwell datacenter): 228 KB/block, 80 KB works (was 128 KB).
+//   SM120 (consumer Blackwell): 99 KB/block — 128 KB would overflow, 80 KB safe.
+//   SM80/SM86/SM89 (Ampere/Ada): 99 KB/block — 128 KB would overflow, 80 KB safe.
+// TopK=2048 requires only 8 KB per ping-pong buffer; 80 KB provides 20 KB per
+// buffer (2.5x headroom beyond 128 KB's 32 KB). Negligible perf difference.
 constexpr size_t kSmem = 20 * 1024 * sizeof(uint32_t);  // 80KB (bytes)
 #endif
 

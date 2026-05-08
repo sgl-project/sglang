@@ -72,6 +72,7 @@ from sglang.srt.utils import (
     is_npu,
     is_sm90_supported,
     is_sm100_supported,
+    is_sm120_supported,
     log_info_on_rank0,
     print_warning_once,
     set_weight_attrs,
@@ -896,24 +897,8 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         high_nib = (w_fp4 >> 4) & 0x0F
         unpacked = torch.stack([low_nib, high_nib], dim=-1).reshape(N, K)
 
-        # Inline E2M1: avoid index lookup, use arithmetic
-        # E2M1 values for magnitude 0-7: [0, 0.5, 1, 1.5, 2, 3, 4, 6]
-        # Decompose: bit2=0 -> [0,0.5,1,1.5], bit2=1 -> [2,3,4,6]
-        # This avoids the gather operation that causes kernel launch overhead
         mag = unpacked & 0x07
         sign = 1 - 2 * ((unpacked >> 3) & 1).float()
-        is_high = ((mag >> 2) & 1).float()  # 1 if magnitude >= 4
-        low2 = (mag & 0x03).float()
-        # low range: [0, 0.5, 1, 1.5], high range: [2, 3, 4, 6]
-        # low: 0.5 * low2, high: 2 + low2 if low2<2 else 2*(low2+0)
-        # Actually: low=[0,0.5,1,1.5] = 0.5*[0,1,2,3], high=[2,3,4,6]
-        # Better: use conditional arithmetic
-        low_val = 0.5 * low2  # [0, 0.5, 1.0, 1.5]
-        high_val = low2 + (low2 >= 2).float() * (4.0 - low2 - 2.0)  # not clean
-        # Simpler: just compute directly
-        # mag 0->0, 1->0.5, 2->1, 3->1.5, 4->2, 5->3, 6->4, 7->6
-        # = (1 + 0.5*bit1) * 2^bit2 for mag<6, 6 for mag=7
-        # Use a small constant lookup (faster than large tensor gather)
         e2m1_lut = torch.tensor(
             [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0],
             dtype=torch.float32,
@@ -1002,8 +987,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
         # Try Triton MXFP4 MoE kernel (replaces Python for-loop for prefill)
         try:
-            import os
-            if os.environ.get("SGLANG_SM120_TRITON_MOE", "0") == "1":
+            if is_sm120_supported() and envs.SGLANG_SM120_TRITON_MOE.get():
                 from sglang.srt.layers.moe.fused_moe_triton.mxfp4_moe_sm120_triton import (
                     mxfp4_moe_forward_triton,
                 )

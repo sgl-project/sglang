@@ -169,7 +169,13 @@ def cache_once(fn: F) -> F:
 
 @cache_once
 def is_arch_support_pdl() -> bool:
+    """PDL (Programmatic Dependent Launch) is available on SM90+ datacenter GPUs.
+
+    SM120 (consumer Blackwell) lacks WGMMA/tcgen05 instructions that PDL
+    coordinates with, so PDL is disabled there.
+    """
     import torch
 
     device = torch.cuda.current_device()
-    return torch.cuda.get_device_capability(device)[0] == 9
+    major = torch.cuda.get_device_capability(device)[0]
+    return major >= 9 and major != 12
