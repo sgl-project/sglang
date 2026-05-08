@@ -18,6 +18,9 @@ from sglang.multimodal_gen.configs.pipeline_configs.base import (
     ModelTaskType,
     PipelineConfig,
 )
+from sglang.multimodal_gen.configs.pipeline_configs.model_deployment import (
+    ModelDeploymentConfig,
+)
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
@@ -91,18 +94,12 @@ class WanT2V480PConfig(PipelineConfig):
         self.vae_config.load_encoder = False
         self.vae_config.load_decoder = True
 
-    def supports_auto_dit_layerwise_offload(self) -> bool:
-        return True
-
-    def get_auto_dit_layerwise_offload_high_memory_disable_gb(
-        self,
-    ) -> float | None:
-        # H200-class GPUs can usually keep Wan DiT resident; layerwise offload
-        # is only auto-enabled below this total-memory threshold.
-        return 130
-
-    def get_fsdp_cfg_auto_min_available_memory_gb(self) -> float | None:
-        return 40
+    def get_model_deployment_config(self) -> ModelDeploymentConfig:
+        return ModelDeploymentConfig(
+            auto_dit_layerwise_offload=True,
+            auto_dit_layerwise_offload_high_memory_disable_gb=130,
+            fsdp_cfg_auto_min_available_memory_gb=40,
+        )
 
 
 @dataclass

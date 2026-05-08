@@ -3,6 +3,9 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from sglang.multimodal_gen import envs
+from sglang.multimodal_gen.configs.pipeline_configs.model_deployment import (
+    ModelDeploymentConfig,
+)
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
@@ -23,6 +26,9 @@ PERFORMANCE_MODE_ALIASES = {
 class ServerArgsAutoTuner:
     def __init__(self, server_args: "ServerArgs"):
         self.server_args = server_args
+
+    def _deployment_config(self) -> ModelDeploymentConfig:
+        return self.server_args.pipeline_config.get_model_deployment_config()
 
     def adjust(self) -> None:
         args = self.server_args
@@ -77,10 +83,11 @@ class ServerArgsAutoTuner:
 
     def adjust_auto_dit_layerwise_offload(self) -> None:
         args = self.server_args
+        deployment_config = self._deployment_config()
         if envs.SGLANG_CACHE_DIT_ENABLED:
             return
         if (
-            not args.pipeline_config.supports_auto_dit_layerwise_offload()
+            not deployment_config.auto_dit_layerwise_offload
             or args.dit_layerwise_offload is not None
         ):
             return
@@ -92,7 +99,7 @@ class ServerArgsAutoTuner:
             current_platform.enable_dit_layerwise_offload_for_wan_by_default()
         )
         disable_threshold_gb = (
-            args.pipeline_config.get_auto_dit_layerwise_offload_high_memory_disable_gb()
+            deployment_config.auto_dit_layerwise_offload_high_memory_disable_gb
         )
         if (
             auto_enable_layerwise_offload
@@ -201,9 +208,8 @@ class ServerArgsAutoTuner:
             args.image_encoder_cpu_offload = True
 
     def _can_apply_dit_layerwise_offload_policy(self) -> bool:
-        args = self.server_args
         return (
-            args.pipeline_config.supports_auto_dit_layerwise_offload()
+            self._deployment_config().auto_dit_layerwise_offload
             and not envs.SGLANG_CACHE_DIT_ENABLED
             and current_platform.enable_dit_layerwise_offload_for_wan_by_default()
         )
@@ -252,7 +258,7 @@ class ServerArgsAutoTuner:
     def _supports_high_confidence_fsdp_cfg(self) -> bool:
         args = self.server_args
         return (
-            args.pipeline_config.supports_fsdp_cfg_auto_tune()
+            self._deployment_config().fsdp_cfg_auto_min_available_memory_gb is not None
             and args._model_default_uses_cfg()
         )
 
@@ -262,7 +268,9 @@ class ServerArgsAutoTuner:
         if min_available_gb is None:
             return True
 
-        required_gb = args.pipeline_config.get_fsdp_cfg_auto_min_available_memory_gb()
+        required_gb = (
+            self._deployment_config().fsdp_cfg_auto_min_available_memory_gb
+        )
         if required_gb is None:
             return False
         if min_available_gb < required_gb:
