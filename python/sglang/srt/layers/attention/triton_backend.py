@@ -31,26 +31,28 @@ if TYPE_CHECKING:
 
 _MLA_DECODE_MIN_BLOCK_KV = 32
 
-# Hard ceiling on MLA decode `max_kv_splits`. attn_logits is allocated as
-# (cuda_graph_max_bs, num_head, max_kv_splits, v_head_dim) float32, so the
-# original #20479 cap (next_power_of_2(sm_count)) blew the persistent
-# CUDA-graph buffer up to ~2 GB on Kimi-K2.6 + MI325 (sm_cap=512,
-# v_head_dim=512, cuda_graph_max_bs=512) and faulted ROCm during graph
-# capture/replay (R73 nightly-8-gpu-kimi-k26: scheduler watchdog 300 s +
-# MLA decode hang). 64 keeps every shipped MLA model's buffer within
-# ~512 MB while still giving full SM utilization in batched decode and
-# preserving most of #20479's long-context speedup.
-_MLA_DECODE_MAX_KV_SPLITS = 64
+# Memory budget for the MLA decode `attn_logits` buffer
+# (cuda_graph_max_bs, num_head, max_kv_splits, v_head_dim) float32.
+# The original #20479 cap (next_power_of_2(sm_count)) ignored buffer
+# size and blew this up to ~2 GB on Kimi-K2.6 + MI325, faulting ROCm
+# during CUDA graph capture/replay (R73 nightly-8-gpu-kimi-k26 hang).
+_MLA_ATTN_LOGITS_BUDGET_BYTES = 512 * 1024 * 1024
 
 
 def _mla_decode_kv_splits_cap(
-    base_max_kv_splits: int, sm_count: int, max_context_len: int
+    base_max_kv_splits: int,
+    sm_count: int,
+    max_context_len: int,
+    mem_cap: Optional[int] = None,
 ) -> int:
     if sm_count <= 0:
         return base_max_kv_splits
     sm_cap = next_power_of_2(sm_count)
     ctx_cap = next_power_of_2(triton.cdiv(max_context_len, _MLA_DECODE_MIN_BLOCK_KV))
-    return max(base_max_kv_splits, min(sm_cap, ctx_cap, _MLA_DECODE_MAX_KV_SPLITS))
+    cap = min(sm_cap, ctx_cap)
+    if mem_cap is not None and mem_cap > 0:
+        cap = min(cap, 1 << (mem_cap.bit_length() - 1))  # floor power of 2
+    return max(base_max_kv_splits, cap)
 
 
 def logit_capping_mod(logit_capping_method, logit_cap):
@@ -154,10 +156,18 @@ class TritonAttnBackend(AttentionBackend):
         )
         self.max_kv_splits = model_runner.server_args.triton_attention_num_kv_splits
         if self.use_mla:
+            cuda_graph_max_bs = model_runner.server_args.cuda_graph_max_bs or 0
+            per_split_bytes = cuda_graph_max_bs * self.num_head * self.v_head_dim * 4
+            mem_cap = (
+                _MLA_ATTN_LOGITS_BUDGET_BYTES // per_split_bytes
+                if per_split_bytes > 0
+                else None
+            )
             self.max_kv_splits = _mla_decode_kv_splits_cap(
                 self.max_kv_splits,
                 self.device_core_count,
                 self.max_context_len,
+                mem_cap=mem_cap,
             )
         self.use_pdl = is_arch_support_pdl()
 
