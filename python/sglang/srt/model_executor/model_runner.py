@@ -397,6 +397,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.init_new_workspace = False
         self.draft_model_idx = draft_model_idx
         self.enable_hisparse = server_args.enable_hisparse
+        self.enable_double_sparsity = server_args.enable_double_sparsity
 
         self.remote_instance_transfer_engine = None
         self.remote_instance_transfer_engine_session_id = ""
@@ -526,6 +527,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         # For hisparse (must be set before initialize() so CUDA graph capture can see it)
         self.hisparse_coordinator = None
+        # For Double Sparsity. ds_enabled is also stamped onto every
+        # RadixAttention instance after the coordinator is constructed so
+        # the per-layer hook reads a Python-time-static attribute (see
+        # plan: decisions/2026-05-08-double-sparsity-static-vs-device-side-gating).
+        self.ds_coordinator = None
+        self.ds_enabled = False
 
         # Initialize the model runner
         self.initialize(pre_model_load_memory)
@@ -782,6 +789,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     ),
                     host_to_device_ratio=hisparse_cfg.host_to_device_ratio,
                 )
+            # Init Double Sparsity coordinator (must happen before CUDA graph capture).
+            # See decisions/2026-05-08-double-sparsity-static-vs-device-side-gating
+            # for the lifecycle invariants. Mutually exclusive with hisparse,
+            # validated at server-args parse time.
+            if self.enable_double_sparsity:
+                self._init_double_sparsity_coordinator()
             self._pre_initialize_flashinfer_allreduce_workspace()
             self.init_device_graphs()
         elif self.device in ["npu", "cpu"]:
@@ -2801,6 +2814,90 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.tp_group.barrier()
         with torch.inference_mode(), run_ctx or empty_context():
             run_once()
+
+    def _init_double_sparsity_coordinator(self):
+        """Construct DS coordinator and stamp `ds_enabled` on every RadixAttention.
+
+        Run after `init_memory_pool` (so the KV pool exists) and after the
+        attention backend is resolved (so we can validate FA3). The
+        boolean-cache pattern (Python-time `module.ds_enabled` on each
+        RadixAttention instance) is what keeps the per-layer hook
+        graph-capture-safe — it never branches on a device tensor at
+        replay. See plan §"Threading `ds_enabled` to RadixAttention".
+        """
+        from sglang.srt.layers.radix_attention import RadixAttention
+        from sglang.srt.mem_cache.sparsity import (
+            create_sparse_coordinator,
+            parse_double_sparsity_config,
+        )
+        from sglang.srt.mem_cache.sparsity.algorithms.double_sparsity_config import (
+            build_runtime_config,
+            parse_calibration_file,
+            validate_against_model,
+        )
+
+        # Resolve attention backend: DS v1 requires FA3.
+        resolved = (
+            self.server_args.decode_attention_backend
+            or self.server_args.attention_backend
+        )
+        if resolved not in ("fa3", "flashattention"):
+            raise ValueError(
+                f"--enable-double-sparsity requires the FA3 attention backend; "
+                f"resolved decode backend is {resolved!r}. Pass "
+                f"`--attention-backend fa3` or `--decode-attention-backend fa3`."
+            )
+
+        runtime_cfg = build_runtime_config(self.server_args)
+
+        # Validate calibration vs the loaded model geometry.
+        calib = parse_calibration_file(self.server_args.double_sparsity_config)
+        head_dim = self.model_config.head_dim
+        num_layers = self.model_config.num_hidden_layers
+        num_heads = self.model_config.num_attention_heads
+        num_kv_heads_global = self.model_config.num_key_value_heads
+        validate_against_model(
+            calib,
+            head_dim=head_dim,
+            num_layers=num_layers,
+            num_heads=num_heads,
+            num_kv_heads_global=num_kv_heads_global,
+        )
+
+        sparse_config = parse_double_sparsity_config(self.server_args)
+        # SparseCoordinator's RequestTrackers ctor requires an int.
+        sparse_config.min_sparse_prompt_len = runtime_cfg.min_seq_len
+
+        self.ds_coordinator = create_sparse_coordinator(
+            device=self.device,
+            req_to_token_pool=self.req_to_token_pool,
+            token_to_kv_pool=self.token_to_kv_pool,
+            start_layer=self.start_layer,
+            end_layer=self.end_layer,
+            server_args=self.server_args,
+            config=sparse_config,
+            runtime_config=runtime_cfg,
+            calibration=calib,
+            tp_size=self.tp_size,
+            tp_rank=self.tp_rank,
+            num_kv_heads_local=num_kv_heads_global // self.tp_size,
+            num_q_heads_local=num_heads // self.tp_size,
+            head_dim=head_dim,
+        )
+
+        # Stamp ds_enabled on every RadixAttention so the per-layer hook
+        # reads a Python-time-static attribute. JIT/CUDA-graph all see a
+        # constant path.
+        ds_layer_count = 0
+        for module in self.model.modules():
+            if isinstance(module, RadixAttention):
+                module.ds_enabled = True
+                ds_layer_count += 1
+        self.ds_enabled = True
+        logger.info(
+            "Double Sparsity wired: %d RadixAttention layers tagged ds_enabled=True",
+            ds_layer_count,
+        )
 
     def maybe_init_ngram_embedding(self):
         self.use_ngram_embedding = self.model_config.use_ngram_embedding

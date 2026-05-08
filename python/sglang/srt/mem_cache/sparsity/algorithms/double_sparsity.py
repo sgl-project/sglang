@@ -265,10 +265,21 @@ class DoubleSparsityAlgorithm(BaseSparseAlgorithm):
         Skipped when `save_kv_cache=False` — otherwise the side cache desyncs
         from the KV pool. Used by both extend and decode (the only thing that
         differs between phases is which `forward_mode` predicate gates the call).
+
+        In the piecewise-extend path (`unified_attention_with_output`),
+        `forward_batch.out_cache_loc` is full-padded by the time
+        `attention_end` runs (the function restores it before returning).
+        We narrow to `num_token_non_padded_cpu`, which is set on every
+        ForwardBatch and matches the actual token count.
         """
         if not getattr(forward_batch, "save_kv_cache", True):
             return
         out_loc = forward_batch.out_cache_loc
+        real = getattr(forward_batch, "num_token_non_padded_cpu", None)
+        if real is not None and out_loc.numel() > real:
+            out_loc = out_loc[:real]
+        if out_loc.numel() == 0:
+            return
         k_new = k_buffer[out_loc]
         self._write_k_label(layer_id, k_new, out_loc)
 

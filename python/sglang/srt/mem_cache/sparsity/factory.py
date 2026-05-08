@@ -168,9 +168,18 @@ def create_sparse_coordinator(
     start_layer: int,
     end_layer: int,
     server_args,
+    config: Optional[SparseConfig] = None,
     **kwargs,
 ) -> SparseCoordinator:
-    config = _parse_sparse_config(server_args)
+    """Build and register a SparseCoordinator.
+
+    `config` is parsed from `server_args.hisparse_config` if not provided.
+    Caller-supplied `config` lets distinct sparse algorithms (e.g. Double
+    Sparsity) provide their own typed configuration without going through
+    the hisparse JSON path.
+    """
+    if config is None:
+        config = _parse_sparse_config(server_args)
     algorithm = _create_sparse_algorithm(config, device, **kwargs)
     backend_adaptor = _create_backend_adaptor(
         config.backend, device, algorithm, req_to_token_pool
