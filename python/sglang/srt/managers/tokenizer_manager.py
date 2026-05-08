@@ -2357,7 +2357,14 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     def _handle_abort_req(self, recv_obj: AbortReq):
         if is_health_check_generate_req(recv_obj):
             return
-        state = self.rid_to_state[recv_obj.rid]
+        # Check if request state exists (may have been cleaned up already)
+        state = self.rid_to_state.get(recv_obj.rid, None)
+        if state is None:
+            # Request already completed and cleaned up, ignore abort
+            logger.debug(
+                f"Ignoring abort for already-completed request: {recv_obj.rid}"
+            )
+            return
         state.finished = True
         state.time_stats.set_finished_time()
 

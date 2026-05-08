@@ -9,7 +9,6 @@ from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.io_struct import (
-    AbortReq,
     BatchEmbeddingOutput,
     BatchTokenIDOutput,
     GetLoadsReqInput,
@@ -277,7 +276,13 @@ class SchedulerOutputProcessorMixin:
                             logger.error(
                                 f"Grammar accept_token failed for req {req.rid} with token {next_token_id}: {e}"
                             )
-                            self.abort_request(AbortReq(rid=req.rid))
+                            # Use to_finish instead of abort_request for running requests
+                            from sglang.srt.managers.schedule_batch import FINISH_ABORT
+
+                            req.to_finish = FINISH_ABORT(
+                                message=f"Grammar accept_token failed: {e}"
+                            )
+                            continue  # Skip corrupted grammar access
                         req.grammar.finished = req.finished()
 
                 else:
@@ -576,7 +581,13 @@ class SchedulerOutputProcessorMixin:
                     logger.error(
                         f"Grammar accept_token failed for req {req.rid} with token {next_token_id}: {e}"
                     )
-                    self.abort_request(AbortReq(rid=req.rid))
+                    # Use to_finish instead of abort_request for running requests
+                    from sglang.srt.managers.schedule_batch import FINISH_ABORT
+
+                    req.to_finish = FINISH_ABORT(
+                        message=f"Grammar accept_token failed: {e}"
+                    )
+                    continue  # Skip corrupted grammar access
                 req.grammar.finished = req.finished()
 
         self.stream_output(batch.reqs, batch.return_logprob)
