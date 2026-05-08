@@ -122,6 +122,8 @@ from sglang.srt.managers.io_struct import (
     LoadLoRAAdapterFromTensorsReqOutput,
     LoadLoRAAdapterReqInput,
     LoadLoRAAdapterReqOutput,
+    OmniGenerateReqInput,
+    OmniGenerateReqOutput,
     OpenSessionReqInput,
     PauseGenerationReqInput,
     ProfileReq,
@@ -1445,6 +1447,7 @@ class Scheduler(
                 (FreezeGCReq, self.handle_freeze_gc),
                 (GetInternalStateReq, self.get_internal_state),
                 (SetInternalStateReq, self.set_internal_state),
+                (OmniGenerateReqInput, self.handle_omni_generate_request),
                 (RpcReqInput, self.handle_rpc_request),
                 (ExpertDistributionReq, self.expert_distribution_handle),
                 (LoadLoRAAdapterReqInput, self.load_lora_adapter),
@@ -3498,6 +3501,42 @@ class Scheduler(
 
         barrier()
         return RpcReqOutput(success, "" if not exec else str(exec))
+
+    def handle_omni_generate_request(self, recv_req: OmniGenerateReqInput):
+        try:
+            from sglang.omni.srt_transport import handle_omni_generate_from_scheduler
+
+            payload = handle_omni_generate_from_scheduler(
+                scheduler=self,
+                payload=recv_req.payload,
+            )
+            return OmniGenerateReqOutput(
+                rid=recv_req.rid,
+                success=True,
+                payload=payload,
+            )
+        except ValueError as exc:
+            return OmniGenerateReqOutput(
+                rid=recv_req.rid,
+                success=False,
+                message=str(exc),
+                status_code=400,
+            )
+        except RuntimeError as exc:
+            return OmniGenerateReqOutput(
+                rid=recv_req.rid,
+                success=False,
+                message=str(exc),
+                status_code=501,
+            )
+        except Exception as exc:
+            logger.exception("Failed to handle omni generate request")
+            return OmniGenerateReqOutput(
+                rid=recv_req.rid,
+                success=False,
+                message=str(exc),
+                status_code=500,
+            )
 
     def abort_request(self, recv_req: AbortReq):
         # todo hisparse, release resources for abort requests in hisparse coordinator

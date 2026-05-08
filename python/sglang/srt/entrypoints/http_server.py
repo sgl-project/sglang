@@ -124,6 +124,7 @@ from sglang.srt.managers.io_struct import (
     InitWeightsUpdateGroupReqInput,
     LoadLoRAAdapterFromTensorsReqInput,
     LoadLoRAAdapterReqInput,
+    OmniGenerateReqInput,
     OpenSessionReqInput,
     ParseFunctionCallReq,
     PauseGenerationReqInput,
@@ -1452,6 +1453,21 @@ async def separate_reasoning_request(obj: SeparateReasoningReqInput, request: Re
     }
 
     return ORJSONResponse(content=response_data, status_code=200)
+
+
+@app.post("/v1/omni/generate", dependencies=[Depends(validate_json_request)])
+async def omni_generate_request(raw_request: Request):
+    payload = await raw_request.json()
+    result = await _global_state.tokenizer_manager.omni_generate(
+        OmniGenerateReqInput(payload=payload),
+        raw_request,
+    )
+    if result.success:
+        return ORJSONResponse(content=result.payload, status_code=200)
+    return ORJSONResponse(
+        content={"error": {"message": result.message}},
+        status_code=result.status_code,
+    )
 
 
 @app.post("/pause_generation")

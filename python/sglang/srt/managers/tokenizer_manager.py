@@ -63,6 +63,8 @@ from sglang.srt.managers.io_struct import (
     GenerateReqInput,
     HealthCheckOutput,
     LoadLoRAAdapterReqInput,
+    OmniGenerateReqInput,
+    OmniGenerateReqOutput,
     OpenSessionReqOutput,
     PauseGenerationReqInput,
     SessionParams,
@@ -374,6 +376,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
         # Session
         self.session_futures = {}  # session_id -> asyncio event
+        self.omni_futures = {}
 
         # Subprocess liveness watchdog — set by Engine or http_server after construction
         self._subprocess_watchdog = None
@@ -498,6 +501,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     UpdateWeightFromDiskReqOutput,
                     self._handle_update_weights_from_disk_req_output,
                 ),
+                (OmniGenerateReqOutput, self._handle_omni_generate_req_output),
                 (FreezeGCReq, lambda x: None),
                 # For handling case when scheduler skips detokenizer and forwards back to the tokenizer manager, we ignore it.
                 (HealthCheckOutput, lambda x: None),
@@ -555,6 +559,33 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             else:
                 async for response in self._handle_batch_request(obj, request):
                     yield response
+
+    async def omni_generate(
+        self,
+        obj: OmniGenerateReqInput,
+        request: Optional[fastapi.Request] = None,
+    ) -> OmniGenerateReqOutput:
+        self.auto_create_handle_loop()
+        if obj.rid is None:
+            obj.regenerate_rid()
+
+        future = asyncio.get_running_loop().create_future()
+        self.omni_futures[obj.rid] = future
+        self.send_to_scheduler.send_pyobj(obj)
+        try:
+            while True:
+                try:
+                    return await asyncio.wait_for(
+                        asyncio.shield(future), timeout=_REQUEST_STATE_WAIT_TIMEOUT
+                    )
+                except asyncio.TimeoutError:
+                    if request is not None and await request.is_disconnected():
+                        raise ValueError(
+                            "Request is disconnected from the client side. "
+                            f"Abort omni request {obj.rid=}"
+                        )
+        finally:
+            self.omni_futures.pop(obj.rid, None)
 
     def _detect_input_format(
         self, texts: Union[str, List[str]], is_cross_encoder: bool
@@ -2410,6 +2441,17 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             return
         if not future.done():
             future.set_result(recv_obj.session_id if recv_obj.success else None)
+
+    def _handle_omni_generate_req_output(self, recv_obj):
+        future = self.omni_futures.get(recv_obj.rid)
+        if future is None:
+            logger.warning(
+                "Omni response arrived after waiter cleanup: %s",
+                recv_obj.rid,
+            )
+            return
+        if not future.done():
+            future.set_result(recv_obj)
 
     def _handle_update_weights_from_disk_req_output(self, recv_obj):
         if self.server_args.dp_size == 1:

@@ -1822,6 +1822,19 @@ class VertexGenerateReqInput(BaseReq):
 
 
 @dataclass
+class OmniGenerateReqInput(BaseReq):
+    payload: Dict[str, Any]
+
+
+@dataclass
+class OmniGenerateReqOutput(BaseReq):
+    success: bool
+    payload: Optional[Dict[str, Any]] = None
+    message: str = ""
+    status_code: int = 200
+
+
+@dataclass
 class RpcReqInput(BaseReq):
     method: str
     parameters: Optional[Dict] = None
