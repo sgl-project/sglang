@@ -389,6 +389,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         )
         self.enable_elastic_ep = server_args.elastic_ep_backend is not None
         self.forward_pass_id = 0
+        self.session_forward_observer = None
         self.init_new_workspace = False
         self.draft_model_idx = draft_model_idx
         self.enable_hisparse = server_args.enable_hisparse
@@ -3383,7 +3384,83 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         ):
             forward_batch.post_forward_mlp_sync_batch(ret)
 
+        self._notify_session_forward_observer(forward_batch)
         return ModelRunnerOutput(logits_output=ret, can_run_graph=can_run_graph)
+
+    def set_session_forward_observer(self, observer: Callable | None) -> None:
+        self.session_forward_observer = observer
+
+    def _notify_session_forward_observer(self, forward_batch: ForwardBatch) -> None:
+        observer = self.session_forward_observer
+        if observer is None:
+            return
+        metadata_list = getattr(forward_batch, "session_forward_metadata", None)
+        if not metadata_list:
+            return
+
+        from sglang.srt.ug.context import UGSRTRequestView
+
+        for batch_index, metadata in enumerate(metadata_list):
+            if not metadata:
+                continue
+            if metadata.get("state") == "u_decode":
+                continue
+
+            session = metadata["session"]
+            token_binding = self._session_token_binding_from_forward_batch(
+                forward_batch,
+                batch_index=batch_index,
+                metadata=metadata,
+            )
+            view_metadata = dict(metadata.get("adapter_metadata", {}))
+            if token_binding is not None:
+                view_metadata["srt_kv_token_binding"] = token_binding
+            request = UGSRTRequestView(
+                session=session,
+                state=metadata["state"],
+                request_id=metadata["request_id"],
+                origin_input_len=metadata["origin_input_len"],
+                origin_input_ids=tuple(metadata["origin_input_ids"]),
+                output_ids=tuple(metadata.get("output_ids", ())),
+                max_new_tokens=metadata["max_new_tokens"],
+                input_text=metadata["input_text"],
+                mm_offsets=tuple(metadata.get("mm_offsets", ())),
+                metadata=view_metadata,
+            )
+            observer(
+                request=request,
+                messages=list(metadata.get("messages", ())),
+            )
+
+    @staticmethod
+    def _session_token_binding_from_forward_batch(
+        forward_batch: ForwardBatch,
+        *,
+        batch_index: int,
+        metadata: dict,
+    ):
+        from sglang.srt.ug.context import UGSRTKVTokenBinding
+
+        req_to_token_pool = getattr(forward_batch, "req_to_token_pool", None)
+        req_to_token = getattr(req_to_token_pool, "req_to_token", None)
+        req_pool_indices = getattr(forward_batch, "req_pool_indices", None)
+        seq_lens = getattr(forward_batch, "seq_lens", None)
+        if req_to_token is None or req_pool_indices is None or seq_lens is None:
+            return None
+        if batch_index >= len(req_pool_indices) or batch_index >= len(seq_lens):
+            return None
+
+        pool_idx = int(req_pool_indices[batch_index].item())
+        token_count = int(seq_lens[batch_index].item())
+        if token_count <= 0:
+            return None
+        token_indices = req_to_token[pool_idx, :token_count].to(dtype=torch.int64)
+        return UGSRTKVTokenBinding(
+            session_id=metadata["session"].session_id,
+            request_id=metadata["request_id"],
+            token_count=int(token_indices.numel()),
+            token_indices=token_indices.clone(),
+        )
 
     def _preprocess_logits(
         self, logits_output: LogitsProcessorOutput, sampling_info: SamplingBatchInfo

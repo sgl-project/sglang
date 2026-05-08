@@ -28,6 +28,11 @@ from sglang.srt.configs.olmo3 import Olmo3Config
 from sglang.srt.configs.qwen3_5 import Qwen3_5Config, Qwen3_5MoeConfig
 from sglang.srt.configs.qwen3_asr import Qwen3ASRConfig
 from sglang.srt.configs.qwen3_next import Qwen3NextConfig
+from sglang.srt.configs.sensenova_u1 import (
+    SenseNovaU1Config,
+    SenseNovaU1LLMConfig,
+    SenseNovaU1VisionConfig,
+)
 from sglang.srt.configs.step3_vl import (
     Step3TextConfig,
     Step3VisionEncoderConfig,
@@ -65,6 +70,9 @@ __all__ = [
     "NemotronHConfig",
     "NemotronH_Nano_VL_V2_Config",
     "NemotronH_Nano_Omni_Reasoning_V3_Config",
+    "SenseNovaU1Config",
+    "SenseNovaU1LLMConfig",
+    "SenseNovaU1VisionConfig",
     "JetNemotronConfig",
     "JetVLMConfig",
     "Step3p5Config",

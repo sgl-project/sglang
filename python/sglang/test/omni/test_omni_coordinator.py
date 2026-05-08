@@ -1,0 +1,113 @@
+# SPDX-License-Identifier: Apache-2.0
+
+import itertools
+import unittest
+from dataclasses import dataclass, field
+from typing import Any
+
+from sglang.omni.coordinator import OmniCoordinator
+from sglang.omni.protocol import (
+    GeneratedSegment,
+    OmniBoundary,
+    OmniContextBundle,
+    OmniContextRef,
+    OmniInputSegment,
+    OmniRequest,
+)
+
+
+@dataclass(slots=True)
+class _InMemoryContextOps:
+    metadata: dict[str, Any] = field(default_factory=dict)
+    g_kind: str | None = None
+    session_id: str | None = None
+
+    def get_role(self, name: str, default: str):
+        del name
+        return default
+
+    def get_model(self):
+        return None
+
+    def get_position_count(self, *, sidecar_role: str | None = None):
+        del sidecar_role
+        return 0
+
+    def build_temporary_forward_batch(self, *, prepared, g_query_embeds, timestep):
+        del prepared, g_query_embeds, timestep
+        raise RuntimeError("no temporary forward backend")
+
+
+class _ScriptedARBackend:
+    def __init__(self, boundaries: list[OmniBoundary]):
+        self._boundaries = list(boundaries)
+        self._counter = itertools.count()
+        self.appended_segments: list[GeneratedSegment] = []
+        self.released_contexts: list[OmniContextBundle] = []
+
+    def prepare_context(self, request: OmniRequest) -> OmniContextBundle:
+        context_id = f"scripted-{next(self._counter)}"
+        return OmniContextBundle(
+            full=OmniContextRef(
+                context_id=context_id,
+                metadata={"messages": [message.to_dict() for message in request.messages]},
+            )
+        )
+
+    def decode_until_boundary(self, context, *, request):
+        del context, request
+        if not self._boundaries:
+            return OmniBoundary(type="done")
+        return self._boundaries.pop(0)
+
+    def append_generated_segment(self, context, segment, *, request):
+        del request
+        self.appended_segments.append(segment)
+        context.full.version += 1
+        context.full.metadata["last_generated_type"] = segment.type
+        return context
+
+    def get_context_ops(self, context):
+        return _InMemoryContextOps(metadata=dict(context.full.metadata))
+
+    def release(self, context):
+        self.released_contexts.append(context)
+
+
+class _ImageBackend:
+    def __init__(self):
+        self.calls = 0
+
+    def generate_segment(self, request, context_ops):
+        self.calls += 1
+        return GeneratedSegment(
+            type="image",
+            image={"b64_json": "abc"},
+            metadata={"position_count": context_ops.get_position_count()},
+        )
+
+
+class TestOmniCoordinator(unittest.TestCase):
+    def test_commits_image_before_continuing_text(self):
+        ar_backend = _ScriptedARBackend(
+            [
+                OmniBoundary(type="text", text="before", token_ids=(1,)),
+                OmniBoundary(type="image"),
+                OmniBoundary(type="text", text="after", token_ids=(2,)),
+                OmniBoundary(type="done"),
+            ]
+        )
+        gen_backend = _ImageBackend()
+        coordinator = OmniCoordinator(ar_backend, gen_backend)
+        request = OmniRequest(messages=(OmniInputSegment(type="text", text="draw"),))
+
+        response = coordinator.generate(request)
+
+        self.assertEqual(["text", "image", "text"], [s.type for s in response.segments])
+        self.assertEqual(1, gen_backend.calls)
+        self.assertEqual(1, len(ar_backend.appended_segments))
+        self.assertEqual(1, len(ar_backend.released_contexts))
+
+
+if __name__ == "__main__":
+    unittest.main()

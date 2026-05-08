@@ -1460,6 +1460,7 @@ multimodal_model_archs = [
     "JetVLMForConditionalGeneration",
     "PaddleOCRVLForConditionalGeneration",
     "MiDashengLMModel",
+    "NEOChatModel",
     "StepVLForConditionalGeneration",
     "KimiK25ForConditionalGeneration",
 ]

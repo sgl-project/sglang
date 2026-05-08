@@ -35,6 +35,7 @@ from sglang.multimodal_gen.configs.pipeline_configs import (
     HeliosMidConfig,
     HeliosT2VConfig,
     HunyuanConfig,
+    SenseNovaU1PipelineConfig,
     WanI2V480PConfig,
     WanI2V720PConfig,
     WanT2V480PConfig,
@@ -122,6 +123,7 @@ from sglang.multimodal_gen.configs.sample.sana import SanaSamplingParams
 from sglang.multimodal_gen.configs.sample.stablediffusion3 import (
     StableDiffusion3SamplingParams,
 )
+from sglang.multimodal_gen.configs.sample.sensenova_u1 import SenseNovaU1SamplingParams
 from sglang.multimodal_gen.configs.sample.wan import (
     FastWanT2V480PConfig,
     Turbo_Wan2_2_I2V_A14B_SamplingParam,
@@ -621,6 +623,17 @@ def get_model_info(
 
 # Registration of model configs
 def _register_configs():
+    # SenseNova U1 unified generation model.
+    register_configs(
+        sampling_param_cls=SenseNovaU1SamplingParams,
+        pipeline_config_cls=SenseNovaU1PipelineConfig,
+        hf_model_paths=["sensenova/SenseNova-U1-8B-MoT"],
+        model_detectors=[
+            lambda hf_id: "sensenova-u1" in hf_id.lower(),
+            lambda hf_id: "sensenova_u1" in hf_id.lower(),
+        ],
+    )
+
     # LTX-2
     register_configs(
         sampling_param_cls=LTX2SamplingParams,

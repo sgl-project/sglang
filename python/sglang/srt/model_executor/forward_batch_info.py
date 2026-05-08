@@ -32,7 +32,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import IntEnum, auto
 from functools import total_ordering
-from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
 
 import torch
 import triton
@@ -324,6 +324,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
     # Position information
     positions: torch.Tensor = None
+    custom_decode_position_ids: Optional[torch.Tensor] = None
 
     # For extend
     extend_num_tokens: Optional[int] = None
@@ -440,6 +441,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # For dumper: request IDs for cross-step sequence tracking
     rids: Optional[List[str]] = None
 
+    # Optional session/request metadata threaded from SRT scheduler requests.
+    session_forward_metadata: Optional[List[Dict[str, Any]]] = None
+
     @classmethod
     def init_new(
         cls,
@@ -484,12 +488,14 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             input_embeds=batch.input_embeds,
             replace_embeds=batch.replace_embeds,
             replace_positions=batch.replace_positions,
+            custom_decode_position_ids=batch.custom_decode_position_ids,
             token_type_ids=batch.token_type_ids,
             tbo_split_seq_index=batch.tbo_split_seq_index,
             dimensions=batch.dimensions,
             return_hidden_states_before_norm=batch.return_hidden_states_before_norm,
             return_pooled_hidden_states=batch.return_pooled_hidden_states,
             rids=[req.rid for req in batch.reqs],
+            session_forward_metadata=batch.session_forward_metadata,
         )
         device = model_runner.device
 
@@ -547,6 +553,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 ],
                 dtype=positions_dtype,
             ).to(device, non_blocking=True)
+        elif batch.custom_position_ids is not None:
+            ret.positions = batch.custom_position_ids.to(device, non_blocking=True)
         elif (
             ret.spec_info is not None
             and getattr(ret.spec_info, "positions", None) is not None

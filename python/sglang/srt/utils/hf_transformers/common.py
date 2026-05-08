@@ -46,6 +46,7 @@ from sglang.srt.configs import (
     Qwen3_5Config,
     Qwen3_5MoeConfig,
     Qwen3NextConfig,
+    SenseNovaU1Config,
     Step3p5Config,
     Step3VLConfig,
 )
@@ -90,6 +91,7 @@ _CONFIG_REGISTRY: Dict[str, Type[PretrainedConfig]] = {
         NemotronH_Nano_VL_V2_Config,
         NemotronH_Nano_Omni_Reasoning_V3_Config,
         NemotronHConfig,
+        SenseNovaU1Config,
         DeepseekVLV2Config,
         Qwen3_5Config,
         Qwen3_5MoeConfig,

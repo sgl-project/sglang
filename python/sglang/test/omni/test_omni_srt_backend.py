@@ -1,0 +1,101 @@
+# SPDX-License-Identifier: Apache-2.0
+
+import unittest
+from types import SimpleNamespace
+
+from sglang.omni.backends.srt import SRTARBackend
+from sglang.omni.protocol import OmniInputSegment, OmniRequest
+
+
+class TestOmniSRTBackend(unittest.TestCase):
+    def test_prepare_exposes_pre_image_text_before_first_image_boundary(self):
+        backend = SRTARBackend(_FakeBridge())
+        request = OmniRequest(messages=(OmniInputSegment(type="text", text="draw"),))
+
+        context = backend.prepare_context(request)
+        first = backend.decode_until_boundary(context, request=request)
+        second = backend.decode_until_boundary(context, request=request)
+
+        self.assertEqual("text", first.type)
+        self.assertEqual("thinking", first.text)
+        self.assertEqual((1, 2), first.token_ids)
+        self.assertEqual("image", second.type)
+
+    def test_vlm_mode_returns_text_and_releases_session(self):
+        bridge = _FakeVLMBridge()
+        backend = SRTARBackend(bridge)
+        request = OmniRequest(
+            messages=(OmniInputSegment(type="text", text="what is this"),),
+            mode="vlm",
+            metadata={"max_new_tokens": 4},
+        )
+
+        context = backend.prepare_context(request)
+        first = backend.decode_until_boundary(context, request=request)
+        second = backend.decode_until_boundary(context, request=request)
+        backend.release(context)
+
+        self.assertEqual("text", first.type)
+        self.assertEqual("answer", first.text)
+        self.assertEqual((3, 4), first.token_ids)
+        self.assertEqual("done", second.type)
+        self.assertEqual(4, bridge.max_new_tokens)
+        self.assertEqual(["s1"], bridge.runtime.closed_sessions)
+
+
+class _FakeBridge:
+    def prepare_u_context_from_messages(self, **kwargs):
+        del kwargs
+        session = SimpleNamespace(session_id="s0", context_version=0)
+        full = SimpleNamespace(
+            request_id="r0",
+            token_count=4,
+            session=session,
+            metadata={
+                "pre_image_segments": [
+                    {
+                        "type": "text",
+                        "text": "thinking",
+                        "metadata": {"token_ids": [1, 2]},
+                    }
+                ]
+            },
+        )
+        return SimpleNamespace(full=full, text_cfg=None, image_cfg=None)
+
+    def release(self, contexts):
+        del contexts
+
+
+class _FakeRuntime:
+    def __init__(self):
+        self.closed_sessions = []
+
+    def close_session(self, session):
+        self.closed_sessions.append(session.session_id)
+
+
+class _FakeVLMBridge:
+    def __init__(self):
+        self.runtime = _FakeRuntime()
+        self.max_new_tokens = None
+
+    def generate_vlm_text(self, *, messages, max_new_tokens):
+        del messages
+        self.max_new_tokens = max_new_tokens
+        session = SimpleNamespace(
+            anchor_request_id="r1",
+            session_id="s1",
+            context_length=8,
+        )
+        return SimpleNamespace(
+            session=session,
+            text="answer",
+            token_ids=(1, 2),
+            next_token_ids=(3, 4),
+            position_ids=(5, 6),
+        )
+
+
+if __name__ == "__main__":
+    unittest.main()
