@@ -86,15 +86,16 @@ The semantic differs by scope:
 |---|---|
 | `accepted_token_ids` | `accept_tokens` (Rule 1 + 3) |
 | `curr_token_id` | `current_token` |
-| `out_token_ids` (dflash) | `out_tokens` |
+| `out_token_ids` | `out_tokens` |
 | `_resolve_spec_overlap_token_ids` | `_resolve_spec_overlap_tokens` |
 
-### Singular vs plural
+## Rule 7 — Singular vs plural
 
-Plural for any non-scalar tensor (`[bs]`-shaped, flat, or multi-dim); singular only for scalars (kernel `tl.load` results, single-int locals). The fixed name `bonus_token` (Rule 2) is the one singular exception even though its shape is `[bs]`.
+Plural for any non-scalar tensor (`[bs]`-shaped, flat, or multi-dim); singular only for scalars (kernel `tl.load` results, single-int locals). Applies to all spec-decoding tensors (tokens, indices, etc.). The fixed name `bonus_token` (Rule 2) is the one singular exception even though its shape is `[bs]`.
 
 ```python
 accept_tokens: torch.Tensor     # [total_accepted] flat - plural
+accept_indices: torch.Tensor    # [bs, num_draft_tokens] - plural
 draft_tokens: torch.Tensor      # [bs * num_draft_tokens] flat - plural
 accept_token = tl.load(...)     # int32 scalar in a kernel iteration - singular
 ```
