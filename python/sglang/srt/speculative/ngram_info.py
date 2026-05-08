@@ -206,7 +206,7 @@ class NgramVerifyInput(SpecInput):
             logits_output.hidden_states = logits_output.hidden_states[
                 self.accepted_indices
             ]
-        self.verified_id = self.predict[self.accepted_indices]
+        self.accept_tokens = self.predict[self.accepted_indices]
 
     def _free_cache(
         self,
@@ -465,7 +465,7 @@ class NgramVerifyInput(SpecInput):
         batch.seq_lens.add_(self.num_accepted_tokens)
         batch.seq_lens_cpu.add_(num_accepted_tokens_cpu)
 
-        return logits_output, self.verified_id, num_accepted_drafts
+        return logits_output, self.accept_tokens, num_accepted_drafts
 
     def filter_batch(self, new_indices: torch.Tensor, has_been_filtered: bool = True):
         pass
