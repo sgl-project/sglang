@@ -1549,6 +1549,12 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
 
         return get_moe_runner_backend().is_flashinfer_cutedsl()
 
+    @property
+    def enable_flashinfer_b12x_moe(self) -> bool:
+        from sglang.srt.layers.moe import get_moe_runner_backend
+
+        return get_moe_runner_backend().is_flashinfer_b12x()
+
     # ----- CuteDSL v1 vs v2 path helpers -----
     #
     # "v1": cutedsl + deepep low-latency.
@@ -1983,9 +1989,12 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         moe_runner_backend = get_moe_runner_backend()
 
         if moe_runner_backend.is_auto():
-            # TRTLLM is currently the most performant and tested FP4 MoE
-            # backend, so use it as the default.
-            moe_runner_backend = MoeRunnerBackend.FLASHINFER_TRTLLM
+            if is_sm120_supported():
+                moe_runner_backend = MoeRunnerBackend.FLASHINFER_B12X
+            else:
+                # TRTLLM is currently the most performant and tested FP4 MoE
+                # backend, so use it as the default.
+                moe_runner_backend = MoeRunnerBackend.FLASHINFER_TRTLLM
 
         if moe_runner_backend.is_flashinfer_cutedsl():
             import sglang.srt.layers.moe.moe_runner.flashinfer_cutedsl  # noqa: F401 – triggers @register_fused_func
@@ -1994,6 +2003,9 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             # path (flashinfer_cutedsl_moe_masked) and does not need a MoeRunner.
             if self._is_cutedsl_v1_deepep:
                 return
+
+        if moe_runner_backend.is_flashinfer_b12x():
+            import sglang.srt.layers.moe.moe_runner.flashinfer_b12x  # noqa: F401 – triggers @register_fused_func
 
         if not moe_runner_backend.is_flashinfer_cutlass():
             self.runner = MoeRunner(moe_runner_backend, moe_runner_config)
@@ -2073,6 +2085,25 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 w2_alpha=w2_alpha,
                 fc2_input_scale=fc2_input_scale,
                 input_scale=layer._cutedsl_input_scale,
+            )
+            return self.runner.run(dispatch_output, quant_info)
+
+        if self.enable_flashinfer_b12x_moe:
+            from sglang.srt.layers.moe.moe_runner.flashinfer_b12x import (
+                B12xFp4MoeQuantInfo,
+                ensure_b12x_wrapper,
+            )
+
+            ensure_b12x_wrapper(layer)
+            quant_info = B12xFp4MoeQuantInfo(
+                wrapper=layer._b12x_wrapper,
+                w13_weight=layer.w13_weight,
+                w2_weight=layer.w2_weight,
+                w13_weight_sf=layer.w13_blockscale_swizzled,
+                w2_weight_sf=layer.w2_blockscale_swizzled,
+                w1_alpha=layer.g1_alphas,
+                w2_alpha=layer.g2_alphas,
+                fc2_input_scale=layer.w2_input_scale_quant,
             )
             return self.runner.run(dispatch_output, quant_info)
 

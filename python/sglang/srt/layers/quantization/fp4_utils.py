@@ -62,18 +62,8 @@ def initialize_fp4_gemm_config(server_args: ServerArgs) -> None:
     global FP4_GEMM_RUNNER_BACKEND
 
     backend = server_args.fp4_gemm_runner_backend
-    if backend == "auto":
-        if is_sm120_supported():
-            # flashinfer_cutlass produces NaN in dense MLP layers with
-            # heterogeneous batches on SM120 (Blackwell).  cudnn is stable.
-            # See: https://github.com/sgl-project/sglang/issues/20043
-            backend = "flashinfer_cudnn"
-            logger.info(
-                "SM120 (Blackwell) detected: auto-selecting "
-                "fp4-gemm-backend=flashinfer_cudnn"
-            )
-        else:
-            backend = "flashinfer_cutlass"
+    if backend == "auto" and not is_sm120_supported():
+        backend = "flashinfer_cutlass"
 
     FP4_GEMM_RUNNER_BACKEND = Fp4GemmRunnerBackend(backend)
 
