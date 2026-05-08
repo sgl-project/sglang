@@ -1,4 +1,4 @@
-from typing import Dict, Optional, Tuple, Type
+from typing import Dict, List, Optional, Tuple, Type
 
 from sglang.srt.entrypoints.openai.protocol import ChatCompletionRequest
 from sglang.srt.parser.harmony_parser import HarmonyParser
@@ -23,17 +23,24 @@ class BaseReasoningFormatDetector:
         self,
         think_start_token: str,
         think_end_token: str,
+        think_excluded_tokens: Optional[List[str]] = None,
         force_reasoning: bool = False,
         stream_reasoning: bool = True,
         tool_start_token: Optional[str] = None,
         continue_final_message: bool = False,
         previous_content: str = "",
+        thinks_internally: bool = False,
+        reasoning_default: str = "always",
     ):
         self.think_start_token = think_start_token
         self.think_end_token = think_end_token
+        self.think_excluded_tokens = think_excluded_tokens
         self.tool_start_token = tool_start_token
+        self.force_reasoning = force_reasoning
         self._in_reasoning = force_reasoning
         self.stream_reasoning = stream_reasoning
+        self.thinks_internally = thinks_internally
+        self.reasoning_default = reasoning_default
 
         self._buffer = ""
         self.stripped_think_start = False
@@ -237,13 +244,22 @@ class Qwen3Detector(BaseReasoningFormatDetector):
         continue_final_message: bool = False,
         previous_content: str = "",
     ):
+        think_excluded_tokens = [
+            "<tool_call>",
+            "</tool_call>",
+            "<|im_end|>",
+            "<|endoftext|>",
+        ]
         super().__init__(
             "<think>",
             "</think>",
+            think_excluded_tokens=think_excluded_tokens,
             force_reasoning=force_reasoning,
             stream_reasoning=stream_reasoning,
             continue_final_message=continue_final_message,
             previous_content=previous_content,
+            thinks_internally=True,
+            reasoning_default="enable_thinking",
         )
 
 
@@ -290,14 +306,28 @@ class KimiK2Detector(BaseReasoningFormatDetector):
         continue_final_message: bool = False,
         previous_content: str = "",
     ):
+        think_excluded_tokens = [
+            "<think>",
+            "<|tool_calls_section_begin|>",
+            "<|tool_call_begin|>",
+            "<|tool_call_argument_begin|>",
+            "<|tool_call_section_end|>",
+            "<|tool_call_end|>",
+            "[EOS]",
+            "<|im_end|>",
+            "<|end_header_id|>",
+            "[EOT]",
+        ]
         super().__init__(
             "<think>",
             "</think>",
+            think_excluded_tokens=think_excluded_tokens,
             force_reasoning=force_reasoning,
             stream_reasoning=stream_reasoning,
             tool_start_token="<|tool_calls_section_begin|>",
             continue_final_message=continue_final_message,
             previous_content=previous_content,
+            reasoning_default="thinking",
         )
 
 
@@ -315,12 +345,22 @@ class Glm45Detector(BaseReasoningFormatDetector):
     """
 
     def __init__(self, stream_reasoning: bool = True, force_reasoning: bool = False):
+        think_excluded_tokens = [
+            "<tool_call>",
+            "</tool_call>",
+            "<eop>",
+            "<|user|>",
+            "<|endoftext|>",
+        ]
         super().__init__(
             "<think>",
             "</think>",
+            think_excluded_tokens=think_excluded_tokens,
             force_reasoning=force_reasoning,
             stream_reasoning=stream_reasoning,
             tool_start_token="<tool_call>",
+            thinks_internally=True,
+            reasoning_default="enable_thinking",
         )
 
 
@@ -445,6 +485,7 @@ class Nemotron3Detector(BaseReasoningFormatDetector):
             stream_reasoning=stream_reasoning,
             continue_final_message=continue_final_message,
             previous_content=previous_content,
+            reasoning_default="enable_thinking",
         )
         self._force_nonempty_content = force_nonempty_content
 
@@ -479,6 +520,7 @@ class MistralDetector(BaseReasoningFormatDetector):
             stream_reasoning=stream_reasoning,
             continue_final_message=continue_final_message,
             previous_content=previous_content,
+            reasoning_default="mistral",
         )
 
 
@@ -524,8 +566,25 @@ class Gemma4Detector(BaseReasoningFormatDetector):
             stream_reasoning=stream_reasoning,
             continue_final_message=continue_final_message,
             previous_content=previous_content,
+            reasoning_default="explicit_enable_thinking",
         )
         self.think_start_self_label = "thought\n"
+
+
+class _DeepSeekV3Detector(Qwen3Detector):
+    """DeepSeek-V3 reuses Qwen3 tokens but requires explicit thinking=True to enable."""
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.reasoning_default = "explicit_thinking"
+
+
+class _MimoDetector(Qwen3Detector):
+    """MIMO reuses Qwen3 tokens but requires explicit enable_thinking=True to enable."""
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.reasoning_default = "explicit_enable_thinking"
 
 
 class ReasoningParser:
@@ -541,13 +600,14 @@ class ReasoningParser:
 
     DetectorMap: Dict[str, Type[BaseReasoningFormatDetector]] = {
         "deepseek-r1": DeepSeekR1Detector,
-        "deepseek-v3": Qwen3Detector,
+        "deepseek-v3": _DeepSeekV3Detector,
+        "deepseek-v4": _DeepSeekV3Detector,
         "glm45": Glm45Detector,
         "hunyuan": HunyuanDetector,
         "gpt-oss": GptOssDetector,
         "kimi": KimiDetector,
         "kimi_k2": KimiK2Detector,
-        "mimo": Qwen3Detector,
+        "mimo": _MimoDetector,
         "qwen3": Qwen3Detector,
         "qwen3-thinking": Qwen3Detector,
         "minimax": Qwen3Detector,
@@ -575,7 +635,11 @@ class ReasoningParser:
             raise ValueError(f"Unsupported model type: {model_type}")
 
         # Special cases where we override force_reasoning
-        if model_type.lower() in {"qwen3-thinking", "gpt-oss", "minimax"}:
+        if model_type.lower() in {
+            "qwen3-thinking",
+            "gpt-oss",
+            "minimax",
+        }:
             force_reasoning = True
 
         # Only pass force_reasoning if explicitly set, let detectors use their defaults

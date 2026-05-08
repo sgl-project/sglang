@@ -878,6 +878,9 @@ class Gemma4ForCausalLM(PreTrainedModel):
     def get_input_embeddings(self) -> nn.Embedding:
         return self.model.embed_tokens
 
+    def get_embed_and_head(self) -> Tuple[torch.Tensor, torch.Tensor]:
+        return self.model.embed_tokens.weight, self.lm_head.weight
+
     def get_attention_sliding_window_size(self):
         return get_attention_sliding_window_size(self.config)
 

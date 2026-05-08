@@ -269,10 +269,13 @@ class TestCreateGrammarBackend(unittest.TestCase):
         GRAMMAR_BACKEND_REGISTRY.clear()
         GRAMMAR_BACKEND_REGISTRY.update(self._saved)
 
-    def _make_server_args(self, backend="none", reasoning_parser=None):
+    def _make_server_args(
+        self, backend="none", reasoning_parser=None, enable_strict_thinking=False
+    ):
         args = MagicMock()
         args.grammar_backend = backend
         args.reasoning_parser = reasoning_parser
+        args.enable_strict_thinking = enable_strict_thinking
         args.constrained_json_whitespace_pattern = None
         args.constrained_json_disable_any_whitespace = False
         return args
@@ -281,6 +284,11 @@ class TestCreateGrammarBackend(unittest.TestCase):
         args = self._make_server_args("none")
         result = create_grammar_backend(args, None, 32000)
         self.assertIsNone(result)
+
+    def test_none_backend_with_strict_thinking_raises(self):
+        args = self._make_server_args("none", enable_strict_thinking=True)
+        with self.assertRaisesRegex(ValueError, "enable-strict-thinking"):
+            create_grammar_backend(args, None, 32000)
 
     def test_invalid_backend_raises(self):
         args = self._make_server_args("nonexistent_backend")
@@ -316,7 +324,7 @@ class TestCreateGrammarBackend(unittest.TestCase):
         mock_inner = MagicMock(spec=BaseGrammarBackend)
         register_grammar_backend("inner_r", lambda *a: mock_inner)
 
-        args = self._make_server_args("inner_r", reasoning_parser="deepseek")
+        args = self._make_server_args("inner_r", reasoning_parser="deepseek-r1")
         tokenizer = MagicMock()
 
         result = create_grammar_backend(args, tokenizer, 32000)
@@ -382,13 +390,15 @@ class TestCreateGrammarBackend(unittest.TestCase):
         )
 
         mock_backend = MagicMock(spec=BaseGrammarBackend)
+        mock_backend.is_support_token_filter = False
         mock_outlines_cls.return_value = mock_backend
-        args = self._make_server_args("outlines", reasoning_parser="deepseek")
+        args = self._make_server_args("outlines", reasoning_parser="deepseek-r1")
         tokenizer = MagicMock()
+        # encode must return a single-token list for think_start/end tokens
+        tokenizer.encode.return_value = [42]
 
         result = create_grammar_backend(args, tokenizer, 32000, think_end_id=42)
         self.assertIsInstance(result, ReasonerGrammarBackend)
-        self.assertEqual(result.think_end_id, 42)
         self.assertIs(result.grammar_backend, mock_backend)
 
     @patch("sglang.srt.constrained.outlines_backend.OutlinesGrammarBackend")
@@ -396,7 +406,7 @@ class TestCreateGrammarBackend(unittest.TestCase):
         """Without think_end_id passed in, no reasoner wrapping."""
         mock_backend = MagicMock(spec=BaseGrammarBackend)
         mock_outlines_cls.return_value = mock_backend
-        args = self._make_server_args("outlines", reasoning_parser="deepseek")
+        args = self._make_server_args("outlines", reasoning_parser="deepseek-r1")
         tokenizer = MagicMock(spec=[])  # No think_end_id attribute
 
         result = create_grammar_backend(args, tokenizer, 32000, think_end_id=None)
