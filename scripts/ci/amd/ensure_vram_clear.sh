@@ -186,6 +186,80 @@ ensure_vram_clear() {
         return 0
     fi
 
+    # === EXPERIMENTAL: pre-cleanup observation phase ===
+    # Hypothesis: maybe amdgpu/KFD lazily reclaims zombie allocations and
+    # we just need to wait. Before any kill / docker stop / signal, sample
+    # VRAM and rocm-smi --showpids every OBSERVE_STEP seconds for up to
+    # OBSERVE_TOTAL seconds to see whether the host self-recovers without
+    # intervention. Stops early on success, or after two stable samples
+    # (no VRAM/PID change for OBSERVE_STEP*2 seconds) since real kernel
+    # reclaim either kicks in within a minute or never.
+    #
+    # Toggle: set SGLANG_VRAM_CLEAR_OBSERVE=0 in the environment to skip.
+    # Once we have empirical evidence that waiting alone does/doesn't
+    # recover zombie KFD, this whole block can be removed or kept off.
+    if [[ "${SGLANG_VRAM_CLEAR_OBSERVE:-1}" != "0" ]]; then
+        local OBSERVE_TOTAL="${SGLANG_VRAM_CLEAR_OBSERVE_TOTAL:-180}"
+        local OBSERVE_STEP="${SGLANG_VRAM_CLEAR_OBSERVE_STEP:-30}"
+        echo "=== Observation phase (experiment): waiting up to ${OBSERVE_TOTAL}s for self-recovery ==="
+        echo "    (set SGLANG_VRAM_CLEAR_OBSERVE=0 to skip this block)"
+        local elapsed=0
+        local last_vram=""
+        local last_kfd=""
+        local stable_count=0
+        while :; do
+            # Compact per-GPU VRAM% line (e.g. "88,89,89,89,89,88,88,88").
+            local vram_line
+            vram_line=$(rocm-smi --showmemuse 2>/dev/null \
+                | awk -F': *' '/VRAM%/ {printf "%s%s", (n++ ? "," : ""), $NF}')
+            # KFD PID count from rocm-smi (zombie + live).
+            local kfd_pid_count
+            kfd_pid_count=$(rocm-smi --showpids 2>/dev/null \
+                | awk '/^[0-9]+/ {n++} END {print n+0}')
+            # Tail of dmesg for KFD/amdgpu chatter (may be empty without
+            # CAP_SYSLOG; that's fine).
+            local kfd_dmesg
+            kfd_dmesg=$(dmesg 2>/dev/null | grep -iE 'kfd|amdgpu' | tail -2 \
+                | tr '\n' '|' | sed 's/|$//')
+
+            printf "[observe t=%3ds] VRAM%%: %s | KFD PIDs: %d | recent kfd dmesg: %s\n" \
+                "$elapsed" "${vram_line:-n/a}" "$kfd_pid_count" "${kfd_dmesg:-(none/no perm)}"
+
+            # Stop early on success.
+            if check_vram_clear >/dev/null 2>&1; then
+                echo "✓ VRAM self-cleared at t=${elapsed}s without any intervention"
+                echo "  (kernel does eventually reclaim zombie KFD on this runner)"
+                return 0
+            fi
+
+            # Short-circuit: if VRAM% string and PID count are unchanged
+            # for two consecutive samples after the first, we're not going
+            # to see reclaim — bail to active cleanup.
+            if [ -n "$last_vram" ] \
+               && [ "$vram_line" = "$last_vram" ] \
+               && [ "$kfd_pid_count" = "$last_kfd" ]; then
+                stable_count=$((stable_count + 1))
+                if [ $stable_count -ge 2 ]; then
+                    echo "  (no change for $((OBSERVE_STEP * 2))s; assuming self-recovery is not happening)"
+                    break
+                fi
+            else
+                stable_count=0
+            fi
+            last_vram="$vram_line"
+            last_kfd="$kfd_pid_count"
+
+            if [ $elapsed -ge $OBSERVE_TOTAL ]; then
+                echo "  (reached observation budget ${OBSERVE_TOTAL}s without self-recovery)"
+                break
+            fi
+            sleep "$OBSERVE_STEP"
+            elapsed=$((elapsed + OBSERVE_STEP))
+        done
+        echo "Observation phase done; proceeding to active cleanup loop."
+    fi
+    # === END EXPERIMENTAL ===
+
     while [ $retry_count -lt $max_retries ]; do
         echo "=== Cleanup Attempt $((retry_count + 1))/$max_retries ==="
 
