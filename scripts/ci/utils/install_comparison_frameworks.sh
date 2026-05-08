@@ -14,8 +14,8 @@ python3 -m pip install --upgrade pip wheel setuptools
 
 case "${FRAMEWORK}" in
   vllm-omni)
-    python3 -m pip install --upgrade --force-reinstall "${VLLM_INSTALL_SPEC:-vllm}"
-    python3 -m pip install --upgrade --force-reinstall "${VLLM_OMNI_INSTALL_SPEC:-vllm-omni}"
+    python3 -m pip install --upgrade --force-reinstall "${VLLM_INSTALL_SPEC:-vllm==0.18.0}"
+    python3 -m pip install --upgrade --force-reinstall "${VLLM_OMNI_INSTALL_SPEC:-vllm-omni==0.18.0}"
     ;;
   lightx2v)
     python3 -m pip install --upgrade --force-reinstall "${LIGHTX2V_INSTALL_SPEC:-git+https://github.com/ModelTC/LightX2V.git}"
