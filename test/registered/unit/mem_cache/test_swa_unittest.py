@@ -1,4 +1,5 @@
 import unittest
+from unittest.mock import patch
 
 import torch
 
@@ -132,6 +133,41 @@ class TestSWA(unittest.TestCase):
     @classmethod
     def tearDownClass(cls):
         pass
+
+    def test_swa_kv_pool_propagates_memory_saver(self):
+        class RecordingKVPool:
+            def __init__(self, *args, enable_memory_saver, **kwargs):
+                recorded_enable_memory_saver.append(enable_memory_saver)
+
+            def get_kv_size_bytes(self):
+                return 0, 0
+
+        for enable_memory_saver, expected in [
+            (False, [False, False]),
+            (True, [True, True]),
+        ]:
+            with self.subTest(enable_memory_saver=enable_memory_saver):
+                recorded_enable_memory_saver = []
+                with patch(
+                    "sglang.srt.mem_cache.swa_memory_pool.maybe_init_custom_mem_pool",
+                    return_value=(False, None, None),
+                ):
+                    SWAKVPool(
+                        size=8,
+                        size_swa=4,
+                        page_size=1,
+                        dtype=torch.bfloat16,
+                        head_num=1,
+                        head_dim=8,
+                        swa_attention_layer_ids=[1],
+                        full_attention_layer_ids=[0],
+                        enable_kvcache_transpose=False,
+                        device="cpu",
+                        token_to_kv_pool_class=RecordingKVPool,
+                        enable_memory_saver=enable_memory_saver,
+                    )
+
+                self.assertEqual(recorded_enable_memory_saver, expected)
 
     def test_swa_memory_pool(self):
         size = 16
