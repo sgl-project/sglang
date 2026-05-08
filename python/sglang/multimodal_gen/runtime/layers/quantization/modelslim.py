@@ -27,7 +27,6 @@ if TYPE_CHECKING:
 
 from sglang.multimodal_gen.runtime.loader.utils import get_param_names_mapping
 
-
 logger = logging.getLogger(__name__)
 
 
