@@ -664,7 +664,7 @@ TWO_GPU_CASES = [
         "ltx_2.3_one_stage_ti2v",
         DiffusionServerArgs(
             model_path="Lightricks/LTX-2.3",
-            tp_size=2,
+            cfg_parallel=True,
             extras=["--transformer-weight-quantization fp8-cast"],
         ),
         TI2V_sampling_params,
