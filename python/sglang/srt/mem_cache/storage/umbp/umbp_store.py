@@ -274,12 +274,16 @@ class UMBPStore(HiCacheStorage):
             else False
         )
 
-        master_address = extra.get("master_address", _optional_env_str("UMBP_MASTER_ADDRESS"))
+        master_address = extra.get(
+            "master_address", _optional_env_str("UMBP_MASTER_ADDRESS")
+        )
         if master_address and UMBPDistributedConfig is not None:
             dist_cfg = UMBPDistributedConfig()
             dist_cfg.master_config.master_address = str(master_address)
 
-            node_address = extra.get("node_address", _optional_env_str("UMBP_NODE_ADDRESS"))
+            node_address = extra.get(
+                "node_address", _optional_env_str("UMBP_NODE_ADDRESS")
+            )
             if node_address is None:
                 node_address = _default_node_address()
             else:
@@ -306,7 +310,9 @@ class UMBPStore(HiCacheStorage):
                 )
 
             if "auto_heartbeat" in extra:
-                dist_cfg.master_config.auto_heartbeat = _bool_from_any(extra["auto_heartbeat"])
+                dist_cfg.master_config.auto_heartbeat = _bool_from_any(
+                    extra["auto_heartbeat"]
+                )
 
             io_engine_host = extra.get(
                 "io_engine_host", _optional_env_str("UMBP_IO_ENGINE_HOST")
@@ -389,8 +395,10 @@ class UMBPStore(HiCacheStorage):
                     _, esz = mem_pool_host.get_page_buffer_meta(dummy)
                 page_byte_size = int(esz[0]) if esz else 0
 
-            if page_byte_size is not None and page_byte_size > 0 and hasattr(
-                dist_cfg, "dram_page_size"
+            if (
+                page_byte_size is not None
+                and page_byte_size > 0
+                and hasattr(dist_cfg, "dram_page_size")
             ):
                 dist_cfg.dram_page_size = int(page_byte_size)
                 logger.info(
@@ -402,11 +410,7 @@ class UMBPStore(HiCacheStorage):
                         if mem_pool_host is not None
                         else "n/a"
                     ),
-                    (
-                        mem_pool_host.page_size
-                        if mem_pool_host is not None
-                        else "n/a"
-                    ),
+                    (mem_pool_host.page_size if mem_pool_host is not None else "n/a"),
                     (
                         f" / split_factor={storage_config.tp_lcm_size // storage_config.tp_size}"
                         if (
@@ -620,7 +624,9 @@ class UMBPStore(HiCacheStorage):
         #   kv_events_endpoint — ZMQ connect address (default "tcp://localhost:5557")
         #   kv_events_topic    — topic filter matching the server's topic (default "")
         # ------------------------------------------------------------------
-        _is_dp_mode = dp_rank_hint is not None and dp_size_hint is not None and dp_size_hint > 1
+        _is_dp_mode = (
+            dp_rank_hint is not None and dp_size_hint is not None and dp_size_hint > 1
+        )
         _dp_rank = dp_rank_hint if dp_rank_hint is not None else 0
 
         self._kv_events_subscriber: Optional[KVEventsSubscriber] = None
@@ -687,6 +693,19 @@ class UMBPStore(HiCacheStorage):
             kv_buffer = mem_pool_host.kv_buffer
             host_ptr = int(kv_buffer.data_ptr())
             host_size = int(kv_buffer.numel() * kv_buffer.element_size())
+            # When the buffer is backed by hugepages the mmap region is
+            # rounded up to the hugepage boundary.  RDMA ibv_reg_mr on
+            # some NICs (AINIC / ROCm) requires the registered region to
+            # cover complete hugepages, so use the full mapped_size
+            # instead of the logical tensor size.
+            allocator = getattr(mem_pool_host, "allocator", None)
+            mapped_size_fn = getattr(allocator, "mapped_size_for", None)
+            if mapped_size_fn is not None:
+                mapped_size = mapped_size_fn(host_ptr)
+            else:
+                mapped_size = getattr(allocator, "mapped_size", 0)
+            if mapped_size > host_size:
+                host_size = mapped_size
             ok = bool(self.client.register_memory(host_ptr, host_size))
         except Exception as exc:
             logger.warning(
@@ -797,15 +816,18 @@ class UMBPStore(HiCacheStorage):
 
         total_bytes = sum(sizes)
         logger.info(
-            '[UMBPStore] batch_get_v1: calling UMBP BatchGet: '
-            'keys=%d expanded_keys=%d total_bytes=%d',
-            len(keys), len(key_strs), total_bytes,
+            "[UMBPStore] batch_get_v1: calling UMBP BatchGet: "
+            "keys=%d expanded_keys=%d total_bytes=%d",
+            len(keys),
+            len(key_strs),
+            total_bytes,
         )
         get_results = self.client.batch_get_into_ptr(key_strs, list(buffer_ptrs), sizes)
         success_count = sum(1 for r in get_results if r)
         logger.info(
-            '[UMBPStore] batch_get_v1: UMBP BatchGet done: success=%d/%d',
-            success_count, len(get_results),
+            "[UMBPStore] batch_get_v1: UMBP BatchGet done: success=%d/%d",
+            success_count,
+            len(get_results),
         )
         return self._batch_postprocess(get_results)
 
@@ -864,9 +886,12 @@ class UMBPStore(HiCacheStorage):
 
         total_bytes = sum(sizes)
         logger.info(
-            '[UMBPStore] batch_set_v1: calling UMBP BatchPut: '
-            'keys=%d expanded_keys=%d total_bytes=%d with_depth=%s',
-            len(keys), len(key_strs), total_bytes, bool(expanded_depths),
+            "[UMBPStore] batch_set_v1: calling UMBP BatchPut: "
+            "keys=%d expanded_keys=%d total_bytes=%d with_depth=%s",
+            len(keys),
+            len(key_strs),
+            total_bytes,
+            bool(expanded_depths),
         )
 
         if expanded_depths:
@@ -880,8 +905,9 @@ class UMBPStore(HiCacheStorage):
 
         success_count = sum(1 for r in put_results if r)
         logger.info(
-            '[UMBPStore] batch_set_v1: UMBP BatchPut done: success=%d/%d',
-            success_count, len(put_results),
+            "[UMBPStore] batch_set_v1: UMBP BatchPut done: success=%d/%d",
+            success_count,
+            len(put_results),
         )
         return self._batch_postprocess(put_results, is_set_operate=True)
 
@@ -1096,7 +1122,9 @@ class KVEventsSubscriber:
 
         return self._tier_hbm if medium == MEDIUM_GPU else self._tier_dram
 
-    def on_event(self, event: Any, batch_ts: float, attn_dp_rank: Optional[int]) -> None:
+    def on_event(
+        self, event: Any, batch_ts: float, attn_dp_rank: Optional[int]
+    ) -> None:
         """Called once per individual KV cache event.
 
         Translates SGLang KV cache events into UMBP external KV block
