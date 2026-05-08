@@ -19,6 +19,7 @@ case "${FRAMEWORK}" in
     ;;
   lightx2v)
     python3 -m pip install --upgrade --force-reinstall "${LIGHTX2V_INSTALL_SPEC:-git+https://github.com/ModelTC/LightX2V.git}"
+    python3 -m pip install --upgrade --force-reinstall pyzmq
     ;;
   *)
     echo "Unknown comparison framework: ${FRAMEWORK}" >&2
