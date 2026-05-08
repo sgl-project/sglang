@@ -94,14 +94,12 @@ def _read_flashmla_token(
     slot = token_idx % page_size
     flat = cache.reshape(-1)
 
-    # Data region: each slot is 576 bytes (448 FP8 nope + 128 BF16 rope).
     nope_start = page * bpp + slot * 576
     nope_fp8 = flat[nope_start : nope_start + _NOPE_DIM].view(_FP8_DTYPE).float()
 
     rope_start = page * bpp + slot * 576 + _NOPE_DIM
     rope_bf16 = flat[rope_start : rope_start + _ROPE_DIM * 2].view(torch.bfloat16)
 
-    # Scale region: starts at page_size*576 within the page; 8 bytes per slot.
     s_offset = page * bpp + page_size * 576 + slot * 8
     scale_u8 = flat[s_offset : s_offset + _NUM_NOPE_TILES].clone()
 
@@ -160,7 +158,6 @@ def _read_indexer_token(
     fp8_start = page * bpp + slot * 128
     fp8_f32 = flat[fp8_start : fp8_start + 128].view(_FP8_DTYPE).float()
 
-    # Scale region starts at byte page_size*128 within the page.
     scale_start = page * bpp + 128 * page_size + slot * 4
     scale = flat[scale_start : scale_start + 4].view(torch.float32).item()
 

@@ -92,17 +92,7 @@ def _triton_fused_store_flashmla_kernel(
     FP8_MAX: tl.constexpr,
     EPS: tl.constexpr,
 ):
-    """
-    Grid: (N, 8).  program_id(1) in [0,6] → nope tile; program_id(1)==7 → rope.
-
-    Nope byte layout (slot within page):
-      FP8 values : cache[page*BPP + slot*576 + tile*64 + lane]
-      UE8M0 scale: cache[page*BPP + S_OFFSET  + slot*8  + tile]
-
-    Rope byte layout (BF16 view):
-      BF16 offset = page*(BPP//2) + slot*288 + 224 + lane
-        288 = 576//2,  224 = 448//2 (skip nope region)
-    """
+    # Grid: (N, 8) — program_id(1) in [0,6] for nope tiles, 7 for rope copy.
     token_id = tl.program_id(0)
     tile_id = tl.program_id(1)
 
@@ -131,8 +121,7 @@ def _triton_fused_store_flashmla_kernel(
         abs_max = tl.max(tl.abs(x_fp32))
         scale = tl.maximum(abs_max, EPS) / FP8_MAX
 
-        # UE8M0: store biased ceil(log2(scale)) so the reader can recover
-        # inv_scale via a single bit-shift (2^(127 - ue8m0_byte)).
+        # UE8M0: cast scale to biased exponent format (matches cast_to_ue8m0 in store.cuh)
         log2_scale = tl.log2(scale)
         ceil_log2 = tl.math.ceil(log2_scale)
         inv_scale = tl.exp2(-ceil_log2)
@@ -217,13 +206,7 @@ def _triton_fused_store_indexer_kernel(
     FP8_MAX: tl.constexpr,
     EPS: tl.constexpr,
 ):
-    """
-    Grid: (N,).  One program per token.  FP32 scale (not UE8M0) — one per token.
-
-    Layout:
-      FP8 values: cache_fp8[page*BPP + slot*128 + lane]
-      FP32 scale: cache_f32[page*BPP_F32 + SCALE_PAGE_OFFSET_F32 + slot]
-    """
+    # Grid: (N,) — one program per token. FP32 scale (not UE8M0), one per token.
     token_id = tl.program_id(0)
     if token_id >= N:
         return
