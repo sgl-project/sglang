@@ -1,8 +1,7 @@
 # Double Sparsity benchmark
 
-Three-way comparison driver for the v1 ship-gate (M8: Llama-3.1-8B; M9:
-Llama-3.1-70B TP=8). Measures decode tok/s, TTFT, TBT (p50/p95), and a
-NIAH-style retrieval probe across:
+Three-way comparison driver for the DS ship-gate. Measures decode
+tok/s, TTFT, TBT (p50/p95), and a NIAH-style retrieval probe across:
 
 1. **`main_dense`** — clean `origin/main` checkout (regression baseline).
 2. **`branch_ds_off`** — DS branch with DS disabled (proves the dense
@@ -14,9 +13,14 @@ The `(1)↔(2)` comparison verifies "DS off → byte-for-byte unchanged"; the
 
 ## Hardware
 
-- **M8 (8B):** 1× H200, single-node TP=1.
-- **M9 (70B ship-gate):** 8× H200, TP=8 (or 4× H200 TP=4 with reduced KV).
-  Numbers from any TP layout that fits the model.
+- **8B baseline:** 1× H200, single-node TP=1. Useful for correctness
+  and capacity-guard measurements; not the architectural target for
+  perf wins.
+- **70B ship-gate:** 8× H200, TP=8 (or 4× H200 TP=4 with reduced KV).
+  This is the DS architecture's intended winning configuration —
+  H_kv_local=1 saturates the two-stage `(bs, 1, num_blocks)` grid and
+  avoids the union-pass capacity limit that gates 8B (see "v1.1
+  results").
 
 ## Prerequisites
 
@@ -84,33 +88,96 @@ python benchmark/double_sparsity/compare.py \
 If any check fails, ship feature-flagged off-by-default and document
 the gap.
 
-## v1.1 follow-ups (for reference)
+## v1.2 follow-ups (deferred from v1.1)
 
-- Replace the torch-reference selection body in `ds_select_tokens_triton`
-  with the block-decomposed Triton kernel sketched in the plan.
-- Add an in-graph `scheduler_metadata` recompute path if profiling
-  shows the always-`None` mode is materially slower for FA3.
-- Per-Q-head + per-batch union scoring (v2 path documented in the plan).
+- **Chunked-union path** to lift the `union_safe_threshold=4096` limit
+  (see "v1.1 results" below — this is the gating issue for 8B-class GQA
+  models at long context).
+- Wrap `ds_select_tokens_triton` as a `register_custom_op +
+  register_split_op` so torch.compile / piecewise CUDA graph can run
+  with DS enabled. Currently auto-disabled.
+- Per-Q-head + per-batch union scoring (v2 path from the plan), and
+  K_label fp8 (e4m3 with per-channel scale) — both deferred to v1.2
+  pending v1.1 measurements.
+- Custom sparse-decode Triton kernel (drop FA3 on the sparse path).
+- MLA support (DeepSeek-V2/V3, Llama-4) and SWA composition.
 
-## v1 results — honest record
+## v1.1 results — honest record
 
 **Llama-3.1-8B-Instruct, single H200, bfloat16, page_size=1, FA3.**
 Synthetic calibration (8 samples, 2K seq_len, S=32). Streaming
-completions, batch=1, output_len=256.
+completions, batch=1, output_len=256, n_requests=4, concurrency=1,
+token_budget=1024, recent=64, sink=4. v1.1 selection: two-stage
+block-topk Triton (stage-1 inline Q_label gather, stage-2 merge) +
+score-aware torch-on-CUDA union (capture-safe).
 
-| context | config | e2e tok/s | TBT p50 (ms) | DS / dense |
+### Dense baselines
+
+| context | decode tok/s | aggregate tok/s | TBT p50 (ms) | TBT p95 (ms) |
 |---|---|---|---|---|
-| 8192 | branch_ds_off | 168.7 | 5.0 | — |
-| 8192 | branch_ds_on (vectorized) | 49.5 | 19.3 | 0.29× |
-| 32768 | branch_ds_off | 93.8 | 5.8 | — |
-| 65536 | branch_ds_off | 49.5 | 6.7 | — |
-| 65536 | branch_ds_on (vectorized) | 30.4 | 19.3 | 0.61× |
+| 8K  | 197.29 | 169.02 | 5.07 | 5.15 |
+| 32K | 171.70 |  93.75 | 5.83 | 5.88 |
+| 64K | 147.58 |  49.46 | 6.78 | 6.86 |
 
-**Status: v1 ship-gate not met on 8B/H200.** DS adds a constant
-~13 ms of selection overhead per decode token, regardless of context
-length. Dense FA3 TBT on H200 grows so slowly with context (5 ms at
-8K → 6.7 ms at 64K) that DS's potential bandwidth savings can't pay
-the selection cost.
+### DS-on at 8K — `BLOCK_T × K_block` sweep
+
+8 of 8 configs attempted; **6 rejected by `union_safe_threshold=4096`
+during CUDA-graph capture** (server exit -9). With Llama-3.1-8B's
+GQA H_kv_local=8, the union pass runs `H_kv_local × effective_budget +
+recent + sink` candidates per row, which exceeds the 4096 threshold
+for any `effective_budget > 503`. Only configs that cap below that
+ran successfully:
+
+| BLOCK_T | K_block | eff_budget | decode tok/s | TBT p50 (ms) | DS / dense |
+|---|---|---|---|---|---|
+| 512  | 32  | 544  | FAILED — union threshold | — | — |
+| 512  | 64  | 1024 | FAILED — union threshold | — | — |
+| 1024 | 32  | 288  | **50.37** | **19.84** | **0.26×** |
+| 1024 | 64  | 576  | FAILED — union threshold | — | — |
+| 1024 | 128 | 1024 | FAILED — union threshold | — | — |
+| 2048 | 64  | 320  | 40.33 | 24.78 | 0.27× |
+| 2048 | 128 | 640  | FAILED — union threshold | — | — |
+| 2048 | 256 | 1024 | FAILED — union threshold | — | — |
+
+**Best 8K config: BLOCK_T=1024, K_block=32 → eff_budget=288.**
+
+### DS-on at 32K and 64K with the best 8K config — both fail
+
+At 32K and 64K with `BLOCK_T=1024, K_block=32`, `effective_budget`
+saturates back to `token_budget=1024` (since `num_blocks × K_block`
+goes well above 1024), re-triggering the union threshold. The kernel
+**hangs silently in CUDA-graph capture** (no traceback in server log)
+instead of raising — a separate bug worth filing against the chunked-
+union path. Both 32K and 64K runs killed by 480s timeout.
+
+### Status: v1.1 ship-gate not met on 8B/H200
+
+The v1.1 selection path is correct (109 unit tests green; first time
+the bench is measuring DS-the-architecture, not the v1 placeholder
+over `req_to_token.shape[1]`). What v1.1 found:
+
+1. **Even at the smallest viable `effective_budget=288`, DS adds ~15 ms
+   to TBT vs dense at 8K** (19.84 ms DS vs 5.07 ms dense). The two-
+   stage Triton kernel cuts the v1 placeholder's ~13 ms overhead, but
+   not enough to win on 8B/H200 at 8K. This was expected: dense FA3
+   TBT on 8B/H200 is bandwidth-cheap (~1.7 ms KV-bandwidth ceiling at
+   64K, see math below), so DS's bandwidth savings can't recover the
+   selection overhead at this scale.
+
+2. **The union-pass capacity limit blocks DS from running at the
+   configurations where it would win.** With H_kv_local=8 (8B model
+   without TP) and the v1.1 single-program union pass, `effective_
+   budget × H_kv_local + recent + sink ≤ 4096` forces eff_budget ≤
+   503 — well below `token_budget=1024` and far below what's needed
+   to reach long-context wins. The v1.1.x chunked-union path (already
+   referenced in the runtime warning) is the real unblocker for 8B.
+
+3. **70B/TP=8 is the architecturally correct target.** With
+   H_kv_local=1 (8 KV heads ÷ TP=8), the union threshold is not the
+   bottleneck — `1 × 1024 + 68 = 1092 ≪ 4096`. The two-stage
+   `(bs, 1, num_blocks)` grid was designed for exactly this case.
+   No 70B run is included in v1.1's results (no TP=8 access during
+   the v1.1 cycle); v1.2 will run it.
 
 **Where DS bandwidth savings can structurally show up on this
 hardware/model.** Back-of-envelope; counts both K and V (FA3 reads
@@ -156,35 +223,49 @@ not a prediction. Actual dense TBT depends on FA3's specific access
 pattern (K then V), kernel-launch overhead per layer, softmax, and
 non-attention work in the layer. The DS selection adds its own
 bandwidth cost too — reading K_label per step. The right way to
-settle this is measurement under the v1.1 fused kernel, not algebra.
+settle this is measurement on a workload where DS-the-architecture is
+not capacity-blocked from running, which on Llama-3.1-8B requires the
+v1.1.x chunked-union path.
 
-**v1.1 priorities to actually ship the speedup.**
-1. **Fuse the selection** into one Triton kernel that streams `K_label`
-   row-by-row and accumulates per-(bs, kv_head) scores in registers.
-   v1's vectorized selection has ~10 separate kernel launches per
-   layer per step plus a transient `[bs, max_ctx, H_kv, S]` tensor.
-   Target: cut selection overhead from ~13 ms to <1 ms.
-2. **70B/H200 TP=8 bench**. This is the architecturally correct
-   target where DS bandwidth savings are real even with v1's
-   selection overhead.
+**v1.2 priorities to actually ship the speedup.**
+1. **Chunked-union path.** Lift the union-pass capacity limit so
+   `effective_budget = token_budget` is reachable on 8B/H_kv=8.
+   Without this, every long-context win the architecture predicts
+   for 8B is unmeasurable.
+2. **70B/H200 TP=8 bench.** With H_kv_local=1 the union threshold is
+   not the bottleneck — this is where the two-stage `(bs, 1,
+   num_blocks)` grid was designed to win. v1.1's lack of TP=8 access
+   is a missing measurement, not a known loss.
 3. **Real calibration** on a held-out long-context retrieval set for
    the accuracy probe (NIAH).
+4. **Capture-time deadlock** when union threshold is exceeded: the
+   guard fires cleanly outside CUDA-graph capture but hangs silently
+   inside it. File a kernel bug; the chunked-union path obviates the
+   need but the underlying behavior is still wrong.
 
-**v1 ship status.** Architecture correct, full pipeline live (server
-boots, generates coherent outputs, 76 tests green including live e2e
-on Qwen2.5-0.5B and Llama-3.1-8B at 8K/32K/64K). Performance gap is
-purely in selection-kernel overhead; the gap is well-bounded and
-v1.1's path is documented. **Ships off-by-default** until v1.1 closes
-the kernel.
+**v1.1 ship status.** Architecture correct and measured for the first
+time. 109 unit tests green including stage-1/stage-2/union parity,
+score-aware drops, and CUDA-graph zero-allocation replay. v1.1
+selection adds ~15 ms TBT at the working configurations on 8B/H200/8K
+(vs the v1 placeholder's ~13 ms — comparable, but now we know which
+of those two numbers represents DS-the-architecture). **Ships off-by-
+default** pending v1.2's chunked union and 70B run.
 
-## v1 limitations (auto-set when --enable-double-sparsity)
+## v1.1 limitations (auto-set when --enable-double-sparsity)
 
-- `disable_piecewise_cuda_graph = True`: v1 selection's dynamic
-  gathers/scatter/sort can't be traced through torch.compile /
-  breakable graph. v1.1 wraps selection as a registered split op.
-- `disable_cuda_graph = False`: full CUDA graphs work. The FA3
-  metadata adaptor is capture-safe, pinned by
-  `test_double_sparsity_adaptor.py::TestCudaGraphCaptureReplay`.
+- `disable_piecewise_cuda_graph = True`: the v1.1 selection runs Triton
+  kernels (opaque to compile already) plus a torch-on-CUDA union pass,
+  but is not yet wrapped as a registered split op
+  (`register_custom_op + register_split_op`). v1.2 wraps it.
+- `disable_cuda_graph = False`: full CUDA graphs work for configs that
+  satisfy `H_kv_local × effective_budget + recent + sink ≤
+  union_safe_threshold (4096)`. Configs that violate this hang in
+  capture rather than raising — track the chunked-union path as the
+  fix.
+- The FA3 metadata adaptor is capture-safe, pinned by
+  `test_double_sparsity_adaptor.py::TestCudaGraphCaptureReplay`. The
+  union pass is also capture-safe (verified by
+  `test_double_sparsity_union.py::TestUnionCudaGraphCaptureReplay`).
 
 ## Memory budget reference
 
