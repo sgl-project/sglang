@@ -211,7 +211,7 @@ def get_deepep_output_dtype(self) -> DeepOutputDtype:
         # 3. Parse quant config to to determine the output dtype of dispatcher
         dispather_output_dtype = self.quant_config.get("dispather_output_dtype", None)
         if dispather_output_dtype is not None:
-            return DeepOutputDtype(server_args.deepep_dispatcher_output_dtype)
+            return DeepOutputDtype(dispather_output_dtype)
 
     # 4. flashinfer_cutedsl expects BF16 dispatch
     if get_moe_runner_backend().is_flashinfer_cutedsl():
