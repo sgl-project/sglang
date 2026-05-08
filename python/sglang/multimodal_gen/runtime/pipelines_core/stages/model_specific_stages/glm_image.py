@@ -775,22 +775,23 @@ class GlmImageBeforeDenoisingStage(PipelineStage):
         )
 
         # Prepare timesteps
+        scheduler = self.scheduler
         image_seq_len = (
             (height // self.vae_scale_factor) * (width // self.vae_scale_factor)
         ) // (self.transformer.config.patch_size**2)
         timesteps = np.linspace(
-            self.scheduler.config.num_train_timesteps, 1.0, num_inference_steps + 1
+            scheduler.config.num_train_timesteps, 1.0, num_inference_steps + 1
         )[:-1]
         timesteps = timesteps.astype(np.int64).astype(np.float32)
-        sigmas = timesteps / self.scheduler.config.num_train_timesteps
+        sigmas = timesteps / scheduler.config.num_train_timesteps
         mu = calculate_shift(
             image_seq_len,
-            self.scheduler.config.get("base_image_seq_len", 256),
-            self.scheduler.config.get("base_shift", 0.25),
-            self.scheduler.config.get("max_shift", 0.75),
+            scheduler.config.get("base_image_seq_len", 256),
+            scheduler.config.get("base_shift", 0.25),
+            scheduler.config.get("max_shift", 0.75),
         )
         timesteps, num_inference_steps = retrieve_timesteps(
-            self.scheduler, num_inference_steps, device, timesteps, sigmas, mu=mu
+            scheduler, num_inference_steps, device, timesteps, sigmas, mu=mu
         )
         self._num_timesteps = len(timesteps)
 
@@ -800,6 +801,7 @@ class GlmImageBeforeDenoisingStage(PipelineStage):
         batch.negative_prompt_embeds = [negative_prompt_embeds]
         batch.latents = latents
         batch.timesteps = timesteps
+        batch.scheduler = scheduler
         batch.num_inference_steps = num_inference_steps
         batch.sigmas = sigmas.tolist()  # Convert numpy array to list for validation
         batch.generator = generator

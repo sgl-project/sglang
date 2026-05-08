@@ -42,7 +42,6 @@ from sglang.srt.distributed.parallel_state import (
     get_moe_expert_parallel_world_size,
     get_tensor_model_parallel_world_size,
 )
-from sglang.srt.layers.attention.nsa.utils import NSAContextParallelMetadata
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
     get_attention_cp_size,
@@ -106,8 +105,8 @@ class ForwardMode(IntEnum):
     # Used in dLLM
     DLLM_EXTEND = auto()
 
-    def is_prefill(self):
-        return self.is_extend()
+    def is_prefill(self, include_draft_extend_v2: bool = False):
+        return self.is_extend(include_draft_extend_v2=include_draft_extend_v2)
 
     def is_extend(self, include_draft_extend_v2: bool = False):
         return (
@@ -352,6 +351,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     encoder_lens: Optional[torch.Tensor] = None
     encoder_lens_cpu: Optional[List[int]] = None
     encoder_out_cache_loc: Optional[torch.Tensor] = None
+    cross_attention_custom_mask: Optional[torch.Tensor] = None
 
     # For LoRA
     lora_ids: Optional[List[str]] = None
@@ -397,6 +397,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # Whether this batch is prefill-only (no token generation needed)
     is_prefill_only: bool = False
 
+    # Pre-computed delimiter indices for multi-item scoring (CPU tensors, one per request)
+    multi_item_delimiter_indices: Optional[List[torch.Tensor]] = None
+
     # Speculative decoding
     spec_info: Optional[SpecInput] = None
     spec_algorithm: SpeculativeAlgorithm = None
@@ -421,8 +424,6 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     dimensions: Optional[list[int]] = None
 
     attn_cp_metadata: Optional[ContextParallelMetadata] = None
-    # Record the split metadata of the sequence number of NSA context parallels.
-    nsa_cp_metadata: Optional[NSAContextParallelMetadata] = None
 
     # For hidden states before normal
     return_hidden_states_before_norm: bool = False
@@ -471,6 +472,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             can_run_dp_cuda_graph=batch.can_run_dp_cuda_graph,
             global_forward_mode=batch.global_forward_mode,
             is_prefill_only=batch.is_prefill_only,
+            multi_item_delimiter_indices=batch.multi_item_delimiter_indices,
             lora_ids=batch.lora_ids,
             sampling_info=batch.sampling_info,
             req_to_token_pool=model_runner.req_to_token_pool,
@@ -997,9 +999,12 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 spec_info.topk_index = self._pad_tensor_to_size(
                     spec_info.topk_index, bs
                 )
-            if spec_info.accept_length is not None:
-                spec_info.accept_length = self._pad_tensor_to_size(
-                    spec_info.accept_length, bs
+            if spec_info.num_accepted_drafts is not None:
+                spec_info.num_accepted_drafts = self._pad_tensor_to_size(
+                    spec_info.num_accepted_drafts, bs
+                )
+                spec_info.num_accepted_tokens = self._pad_tensor_to_size(
+                    spec_info.num_accepted_tokens, bs
                 )
             spec_info.hidden_states = self._pad_tensor_to_size(
                 spec_info.hidden_states, num_tokens
@@ -1043,7 +1048,12 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 ]
                 logits_output.hidden_states = logits_output.hidden_states[:num_tokens]
             elif self.forward_mode.is_draft_extend():  # draft extend
-                self.spec_info.accept_length = self.spec_info.accept_length[:bs]
+                self.spec_info.num_accepted_drafts = self.spec_info.num_accepted_drafts[
+                    :bs
+                ]
+                self.spec_info.num_accepted_tokens = self.spec_info.num_accepted_tokens[
+                    :bs
+                ]
                 logits_output.next_token_logits = logits_output.next_token_logits[:bs]
                 logits_output.hidden_states = logits_output.hidden_states[:bs]
             elif self.forward_mode.is_draft_extend_v2():  # draft extend_v2
