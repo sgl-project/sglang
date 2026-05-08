@@ -46,7 +46,7 @@ from sglang.srt.layers.attention.nsa.hisa.orchestrator import (
     fp8_native_hierarchy_mqa_logits,
     fp8_native_hierarchy_paged_mqa_logits,
 )
-from sglang.srt.layers.attention.nsa.hisa.pool_k_cache import HisaNSATokenToKVPool
+from sglang.srt.mem_cache.hisa_memory_pool import HisaNSATokenToKVPool
 from sglang.srt.layers.attention.nsa.utils import (
     is_nsa_enable_prefill_cp,
     is_nsa_prefill_cp_in_seq_split,

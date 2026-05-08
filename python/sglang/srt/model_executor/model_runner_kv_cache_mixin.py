@@ -466,7 +466,7 @@ class ModelRunnerKVCacheMixin:
                 # HISA pool-K cache (v3): paged pool_k_pages indexed by
                 # (phys_pool_page, slot_in_page), mirroring the main KV
                 # cache layout for TMA-friendly block_mqa.
-                from sglang.srt.layers.attention.nsa.hisa.pool_k_cache import (
+                from sglang.srt.mem_cache.hisa_memory_pool import (
                     POOL_PAGE_SIZE,
                     HisaNSATokenToKVPool,
                 )

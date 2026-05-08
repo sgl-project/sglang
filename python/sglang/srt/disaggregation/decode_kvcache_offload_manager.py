@@ -256,7 +256,7 @@ class DecodeKVCacheOffloadManager:
         # HISA pool-K cache is incompatible: this manager doesn't run the
         # release_kv_cache hook chain, so pool pages would leak across
         # offloaded-decode finishes.
-        from sglang.srt.layers.attention.nsa.hisa.pool_k_cache import (
+        from sglang.srt.mem_cache.hisa_memory_pool import (
             HisaNSATokenToKVPool,
         )
 

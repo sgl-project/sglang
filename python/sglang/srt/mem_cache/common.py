@@ -490,7 +490,7 @@ def alloc_for_extend(
     )
 
     # HISA pool-K cache hook: no-op unless the KV pool is a HisaNSATokenToKVPool.
-    from sglang.srt.layers.attention.nsa.hisa.pool_k_cache import (
+    from sglang.srt.mem_cache.hisa_memory_pool import (
         maybe_alloc_hisa_pool_for_extend,
     )
 
@@ -573,7 +573,7 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
     )
 
     # HISA pool-K cache hook.
-    from sglang.srt.layers.attention.nsa.hisa.pool_k_cache import (
+    from sglang.srt.mem_cache.hisa_memory_pool import (
         maybe_alloc_hisa_pool_for_decode,
     )
 
@@ -643,7 +643,7 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
         tree_cache.req_to_token_pool.free_mamba_cache(req)
     # HISA pool-K cache: release this request's pool block IDs back to the
     # allocator. No-op if the pool is not a HisaNSATokenToKVPool.
-    from sglang.srt.layers.attention.nsa.hisa.pool_k_cache import (
+    from sglang.srt.mem_cache.hisa_memory_pool import (
         maybe_free_hisa_pool_blocks,
     )
 

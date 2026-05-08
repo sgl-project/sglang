@@ -659,7 +659,7 @@ class SchedulerPPMixin:
                     ]
                     self.token_to_kv_pool_allocator.free(kv_indices)
                     # HISA pool-K cache: free the req's pool_block_ids.
-                    from sglang.srt.layers.attention.nsa.hisa.pool_k_cache import (
+                    from sglang.srt.mem_cache.hisa_memory_pool import (
                         maybe_free_hisa_pool_blocks,
                     )
 
