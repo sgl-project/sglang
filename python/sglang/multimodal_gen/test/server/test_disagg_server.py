@@ -543,10 +543,9 @@ class TestDisaggZImageTracing(_DisaggTestBase):
         # actual regression guard for this PR: it proves the W3C carrier
         # survives encoder→denoiser→decoder JSON hops (via ``_trace_state``).
         # The HTTP-level carrier extraction (root Req parented under the
-        # client's span_id) is already covered by ``test_tracing.py`` in
-        # monolithic mode and asserting it here is flaky — the server head's
-        # BatchSpanProcessor may not flush the Req span before role spans
-        # reach the collector, since the role spans close first.
+        # client's span_id) is intentionally not asserted here: the server
+        # head's BatchSpanProcessor may not flush the Req span before role
+        # spans reach the collector, since the role spans close first.
         trace_ids = {_as_hex(s.trace_id) for s in spans}
         self.assertEqual(
             trace_ids,

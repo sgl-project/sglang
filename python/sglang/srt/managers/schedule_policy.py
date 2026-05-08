@@ -43,6 +43,9 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     InsertParams,
     MatchPrefixParams,
 )
+from sglang.srt.mem_cache.hisparse_memory_pool import (
+    DeepSeekV4HiSparseTokenToKVPoolAllocator,
+)
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
 from sglang.srt.mem_cache.swa_memory_pool import SWATokenToKVPoolAllocator
 from sglang.srt.server_args import ServerArgs
@@ -444,8 +447,11 @@ class PrefillAdder:
                 ]
             )
 
+        # DeepSeek V4 HiSparse wraps an SWATokenToKVPoolAllocator internally and
+        # exposes the full SWA allocator interface.
         self.is_hybrid_swa = isinstance(
-            self.token_to_kv_pool_allocator, SWATokenToKVPoolAllocator
+            self.token_to_kv_pool_allocator,
+            (SWATokenToKVPoolAllocator, DeepSeekV4HiSparseTokenToKVPoolAllocator),
         )
         self.is_hybrid_ssm_cache = self.tree_cache.supports_mamba()
 
@@ -753,6 +759,13 @@ class PrefillAdder:
                     return AddReqResult.NO_TOKEN
                 tokens_freed += tokens_occupied
 
+        if (self.prefill_delayer_single_pass is not None) and (
+            not self.prefill_delayer_single_pass.negotiate_should_allow_prefill(
+                local_prefillable=True
+            )
+        ):
+            return AddReqResult.OTHER
+
         if self.dllm_config is not None:
             if self.rem_dllm_tokens <= 0:
                 return AddReqResult.OTHER
@@ -905,6 +918,13 @@ class PrefillAdder:
                         trunc_len = truncation_align_size * (
                             trunc_len // truncation_align_size
                         )
+
+                now_input_len = trunc_len + len(req.prefix_indices)
+                now_input_len = now_input_len // self.page_size * self.page_size
+                trunc_len = now_input_len - len(req.prefix_indices)
+
+                if trunc_len <= 0:
+                    return AddReqResult.OTHER
 
                 # Chunked prefill
                 req.set_extend_input_len(trunc_len)

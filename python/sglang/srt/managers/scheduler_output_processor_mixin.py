@@ -386,8 +386,16 @@ class SchedulerOutputProcessorMixin:
         result.num_accepted_drafts = sum(accept_lens) - len(batch.reqs)
         result.num_accepted_drafts_per_req_cpu = [x - 1 for x in accept_lens]
 
+        # Feed the adaptive controller now that accept_lens is on CPU,
+        # instead of doing a synchronous GPU→CPU copy in the worker hot path.
+        # BaseSpecWorker provides a no-op default for non-adaptive workers.
+        self.model_worker.on_verify_complete_cpu(result.num_accepted_drafts_per_req_cpu)
+
         predict_tokens = []
-        stride = self.draft_worker.speculative_num_draft_tokens
+        # In adaptive spec-v2, the worker state may already have switched when this
+        # delayed result is processed. Use the draft token count recorded on result.
+        stride = result.speculative_num_draft_tokens
+        assert stride is not None, "spec-v2 result missing speculative_num_draft_tokens"
 
         for i, req in enumerate(batch.reqs):
             # -1 because prepare_for_decode pre-claimed the bonus slot.

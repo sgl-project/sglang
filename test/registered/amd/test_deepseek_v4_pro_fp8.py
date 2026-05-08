@@ -58,7 +58,7 @@ COMMON_ENV_VARS = {
     "SGLANG_TOPK_TRANSFORM_512_TORCH": "1",
     "SGLANG_OPT_USE_TILELANG_INDEXER": "true",
     "SGLANG_HACK_FLASHMLA_BACKEND": "tilelang",
-    "SGLANG_REASONING_EFFORT": "max",
+    "SGLANG_DSV4_REASONING_EFFORT": "max",
 }
 
 # FP8 variant: dense-FP8 experts via the Triton MoE FP8 path.
@@ -84,7 +84,7 @@ class TestDeepseekV4ProFp8(CustomTestCase):
             "8",
             "--disable-radix-cache",
             "--attention-backend",
-            "compressed",
+            "dsv4",
             "--max-running-requests",
             "256",
             "--page-size",
