@@ -11,7 +11,7 @@ from typing import Any
 
 import numpy as np
 
-_MIN_FILE_REF_BYTES = 1 << 20
+_MIN_FILE_REF_BYTES = 32 << 20
 
 
 @dataclass
@@ -35,12 +35,21 @@ def is_local_endpoint(endpoint: str) -> bool:
 
 
 def spill_large_arrays_to_file_refs(value: Any) -> Any:
+    directory = _array_ipc_dir()
+    if directory is None:
+        return value
+    return _spill_large_arrays_to_file_refs(value, directory)
+
+
+def _spill_large_arrays_to_file_refs(value: Any, directory: str) -> Any:
     if isinstance(value, np.ndarray) and value.nbytes >= _MIN_FILE_REF_BYTES:
-        return _spill_array(value)
+        return _spill_array(value, directory)
     if isinstance(value, list):
-        return [spill_large_arrays_to_file_refs(item) for item in value]
+        return [_spill_large_arrays_to_file_refs(item, directory) for item in value]
     if isinstance(value, tuple):
-        return tuple(spill_large_arrays_to_file_refs(item) for item in value)
+        return tuple(
+            _spill_large_arrays_to_file_refs(item, directory) for item in value
+        )
     return value
 
 
@@ -54,11 +63,10 @@ def materialize_file_refs(value: Any) -> Any:
     return value
 
 
-def _spill_array(array: np.ndarray) -> NumpyArrayFileRef:
+def _spill_array(array: np.ndarray, directory: str) -> NumpyArrayFileRef:
     if not array.flags.c_contiguous:
         array = np.ascontiguousarray(array)
 
-    directory = _array_ipc_dir()
     fd, path = tempfile.mkstemp(
         prefix="sgldiffusion-array-",
         suffix=".npy",
