@@ -621,6 +621,17 @@ class ServerArgs(DisaggArgsMixin):
                 f"Either use a different port or disable --strict-ports."
             )
 
+    @staticmethod
+    def _require_distinct_ports(port_names: list[tuple[int, str]]) -> None:
+        seen: dict[int, str] = {}
+        for port, name in port_names:
+            if port in seen:
+                raise RuntimeError(
+                    f"{name} port {port} conflicts with {seen[port]} port and "
+                    "--strict-ports is enabled."
+                )
+            seen[port] = name
+
     def _adjust_network_ports(self):
         # Disagg role instances (encoder/denoiser/decoder) don't serve HTTP,
         # so skip settling the HTTP port to avoid unnecessary port collisions.
@@ -635,14 +646,28 @@ class ServerArgs(DisaggArgsMixin):
             self._require_port(self.scheduler_port, "Scheduler")
             if self.master_port is not None:
                 self._require_port(self.master_port, "Master")
+            port_names = []
+            if needs_http:
+                port_names.extend([(self.port, "HTTP"), (self.broker_port, "Broker")])
+            port_names.append((self.scheduler_port, "Scheduler"))
+            if self.master_port is not None:
+                port_names.append((self.master_port, "Master"))
+            self._require_distinct_ports(port_names)
         else:
+            reserved_ports: set[int] = set()
             if needs_http:
                 self.port = self.settle_port(self.port)
+                reserved_ports.update({self.port, self.broker_port})
             initial_scheduler_port = self.scheduler_port + (
                 random.randint(0, 100) if self.scheduler_port == 5555 else 0
             )
-            self.scheduler_port = self.settle_port(initial_scheduler_port)
-            self.master_port = self.settle_port(self.master_port, 37)
+            self.scheduler_port = self.settle_port(
+                initial_scheduler_port, avoid=reserved_ports
+            )
+            reserved_ports.add(self.scheduler_port)
+            self.master_port = self.settle_port(
+                self.master_port, 37, avoid=reserved_ports
+            )
 
     def _adjust_parallelism(self):
         tp_unspecified = self.tp_size is None
@@ -1320,16 +1345,22 @@ class ServerArgs(DisaggArgsMixin):
         return f"tcp://{scheduler_host}:{self.scheduler_port}"
 
     def settle_port(
-        self, port: int, port_inc: int = 42, max_attempts: int = 100
+        self,
+        port: int,
+        port_inc: int = 42,
+        max_attempts: int = 100,
+        avoid: set[int] | None = None,
     ) -> int:
         """
         Find an available port with retry logic.
         """
+        if avoid is None:
+            avoid = set()
         attempts = 0
         original_port = port
 
         while attempts < max_attempts:
-            if is_port_available(port):
+            if port not in avoid and is_port_available(port):
                 if attempts > 0:
                     logger.info(
                         f"Port {original_port} was unavailable, using port {port} instead"
