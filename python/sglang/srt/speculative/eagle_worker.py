@@ -505,10 +505,10 @@ class EAGLEWorker(TpModelWorker):
                 # when DP attention is enabled, but it is slow. Skip it for now.
                 if (
                     self.server_args.enable_dp_attention
-                    or batch.spec_info.verified_id.shape[0] > 0
+                    or verify_output.unfinished_accept_tokens.shape[0] > 0
                 ):
                     # decode is not finished
-                    self.forward_draft_extend_after_decode(batch)
+                    self.forward_draft_extend_after_decode(batch, verify_output)
 
             set_time_batch(
                 batch.reqs, "set_spec_draft_extend_end_time", trace_only=True
@@ -521,14 +521,16 @@ class EAGLEWorker(TpModelWorker):
 
             return GenerationBatchResult(
                 logits_output=logits_output,
-                next_token_ids=verify_output.verified_id,
+                next_token_ids=verify_output.accept_tokens,
                 num_accepted_drafts=sum(verify_output.num_accepted_drafts_per_req_cpu),
                 num_accepted_drafts_per_req_cpu=verify_output.num_accepted_drafts_per_req_cpu,
                 can_run_cuda_graph=can_run_cuda_graph,
             )
 
-    def check_forward_draft_extend_after_decode(self, batch: ScheduleBatch):
-        local_need_forward = batch.spec_info.verified_id.shape[0] > 0
+    def check_forward_draft_extend_after_decode(
+        self, batch: ScheduleBatch, verify_output: EagleVerifyOutput
+    ):
+        local_need_forward = verify_output.unfinished_accept_tokens.shape[0] > 0
         if not self.server_args.enable_dp_attention:
             return local_need_forward
 
@@ -588,7 +590,7 @@ class EAGLEWorker(TpModelWorker):
         if batch.sampling_info.penalizer_orchestrator.is_required:
             # This is a relaxed version of penalties for speculative decoding.
             batch.sampling_info.penalizer_orchestrator.cumulate_output_tokens(
-                spec_info.verified_id.to(torch.int64)
+                spec_info.bonus_tokens.to(torch.int64)
             )
 
         # Allocate cache locations
@@ -779,7 +781,7 @@ class EAGLEWorker(TpModelWorker):
             retrieve_next_sibling,
             draft_tokens,
         ) = build_tree_kernel_efficient(
-            spec_info.verified_id,
+            spec_info.bonus_tokens,
             parent_list,
             top_scores_index,
             draft_tokens,
@@ -977,7 +979,7 @@ class EAGLEWorker(TpModelWorker):
         batch.forward_mode = (
             ForwardMode.DECODE if not batch.forward_mode.is_idle() else ForwardMode.IDLE
         )
-        batch.spec_info = res.draft_input
+        batch.spec_info = res.next_draft_input
 
         return logits_output, res, model_worker_batch, can_run_cuda_graph
 
@@ -1082,7 +1084,7 @@ class EAGLEWorker(TpModelWorker):
         """
         batch.spec_info = EagleDraftInput(
             hidden_states=hidden_states,
-            verified_id=next_token_ids,
+            bonus_tokens=next_token_ids,
             num_tokens_per_req=1,
             num_tokens_for_logprob_per_req=1,
         )
@@ -1104,7 +1106,9 @@ class EAGLEWorker(TpModelWorker):
         assert forward_batch.spec_info is batch.spec_info
         self.capture_for_decode(logits_output, forward_batch.spec_info)
 
-    def forward_draft_extend_after_decode(self, batch: ScheduleBatch):
+    def forward_draft_extend_after_decode(
+        self, batch: ScheduleBatch, verify_output: EagleVerifyOutput
+    ):
         assert isinstance(batch.spec_info, EagleDraftInput)
         # Backup fields that will be modified in-place
         seq_lens_backup = batch.seq_lens.clone()
@@ -1116,7 +1120,7 @@ class EAGLEWorker(TpModelWorker):
 
         input_is_idle = batch.forward_mode.is_idle()
 
-        if not input_is_idle and batch.spec_info.verified_id.numel() == 0:
+        if not input_is_idle and verify_output.unfinished_accept_tokens.numel() == 0:
             batch = batch.copy()
             batch.prepare_for_idle()
             hidden_size = (
@@ -1137,7 +1141,8 @@ class EAGLEWorker(TpModelWorker):
         batch.spec_info.num_tokens_for_logprob_per_req = 1
         batch.spec_info.prepare_extend_after_decode(
             batch,
-            self.speculative_num_steps,
+            verify_output=verify_output,
+            speculative_num_steps=self.speculative_num_steps,
         )
         batch.forward_mode = (
             ForwardMode.DRAFT_EXTEND

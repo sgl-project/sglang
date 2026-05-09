@@ -148,7 +148,6 @@ class BaseIndexerMetadata(ABC):
 
 
 def rotate_activation(x: torch.Tensor) -> torch.Tensor:
-    assert x.dtype == torch.bfloat16
     # from sgl_kernel import hadamard_transform
     if _is_hip:
         from fast_hadamard_transform import hadamard_transform
@@ -299,6 +298,12 @@ class Indexer(MultiPlatformOp):
         weights = weights * self.n_heads**-0.5
         weights = weights.unsqueeze(-1) * q_scale * self.softmax_scale
         return weights
+
+    @torch.compile(dynamic=True)
+    def _apply_q_scale_and_softmax_scale(
+        self, weights: torch.Tensor, q_scale: torch.Tensor
+    ):
+        return weights.unsqueeze(-1) * q_scale * self.softmax_scale
 
     def _get_q_k_bf16(
         self,
@@ -1162,7 +1167,7 @@ class Indexer(MultiPlatformOp):
                     act_quant=act_quant,
                 )
             current_stream.wait_stream(self.alt_stream)
-            weights = weights.unsqueeze(-1) * q_scale * self.softmax_scale
+            weights = self._apply_q_scale_and_softmax_scale(weights, q_scale)
         else:
             query, key = self._get_q_k_bf16(
                 q_lora, x, positions, enable_dual_stream, forward_batch=forward_batch
