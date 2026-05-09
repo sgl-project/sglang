@@ -515,6 +515,14 @@ class EAGLEWorker(TpModelWorker):
                     batch.spec_info = draft_extend_input
                     next_draft_input = self.forward_draft_extend_after_decode(batch)
                     batch.spec_info = next_draft_input
+                else:
+                    # All reqs finished this verify and dp_attention is not
+                    # forcing the forward. Install an empty EagleDraftInput so
+                    # next iter's merge_batch short-circuits on None
+                    # hidden_states (EagleVerifyInput has no merge_batch).
+                    batch.spec_info = EagleDraftInput(
+                        capture_hidden_mode=CaptureHiddenMode.LAST,
+                    )
 
             set_time_batch(
                 batch.reqs, "set_spec_draft_extend_end_time", trace_only=True
