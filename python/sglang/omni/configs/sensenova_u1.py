@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import replace
 from typing import Any
 
-from sglang.omni.backends.multimodal_gen import MultimodalGenBackend
+from sglang.omni.backends.colocated import ColocatedPipelineBackend
 from sglang.omni.backends.srt import SRTARBackend
 from sglang.omni.coordinator import OmniCoordinator
 from sglang.omni.protocol import OmniRequest
@@ -22,6 +22,7 @@ _MODE_ALIASES = {
 _SUPPORTED_MODES = {"t2i", "edit", "interleave", "vlm"}
 _REQUEST_METADATA_FIELDS = {
     "mode",
+    "task",
     "max_new_tokens",
     "max_length",
     "max_interleave_images",
@@ -40,7 +41,7 @@ class SenseNovaU1OmniPlugin:
         )
         metadata = dict(request.metadata)
         metadata.update(request_metadata)
-        mode = normalize_mode(metadata.pop("mode", request.mode))
+        mode = normalize_mode(metadata.pop("task", metadata.pop("mode", request.mode)))
         sampling_params = build_sampling_params(
             sampling_payload,
             mode=mode,
@@ -71,19 +72,15 @@ class SenseNovaU1OmniPlugin:
 def build_sensenova_u1_orchestrator(
     *,
     srt_bridge: Any,
-    generation_executor: Any | None = None,
+    generation_backend: Any | None = None,
     server_args: Any | None = None,
 ) -> OmniCoordinator:
-    if generation_executor is None:
-        generation_executor = _load_default_generation_executor()
+    if generation_backend is None:
+        generation_backend = _build_default_generation_backend(server_args)
     plugin = SenseNovaU1OmniPlugin()
     coordinator = OmniCoordinator(
         ar_backend=SRTARBackend(srt_bridge),
-        generation_backend=MultimodalGenBackend(
-            executor=generation_executor,
-            server_args=server_args,
-            context_ops_extra_key="sensenova_u1_context_ops",
-        ),
+        generation_backend=generation_backend,
         request_adapter=plugin.normalize_request,
         metadata={"model": plugin.model_name},
     )
@@ -95,7 +92,7 @@ def build_sensenova_u1_orchestrator_from_scheduler(
     scheduler: Any,
     srt_request_executor: Any | None = None,
     srt_u_decode_max_new_tokens: int | None = None,
-    generation_executor: Any | None = None,
+    generation_backend: Any | None = None,
     server_args: Any | None = None,
 ) -> OmniCoordinator:
     from sglang.srt.omni_session.sensenova_u1 import build_sensenova_u1_middle_bridge
@@ -106,7 +103,7 @@ def build_sensenova_u1_orchestrator_from_scheduler(
             srt_request_executor=srt_request_executor,
             srt_u_decode_max_new_tokens=srt_u_decode_max_new_tokens,
         ),
-        generation_executor=generation_executor,
+        generation_backend=generation_backend,
         server_args=server_args,
     )
 
@@ -182,9 +179,41 @@ def _build_sensenova_sampling_dataclass(payload: dict[str, Any]) -> Any:
     return build_sensenova_u1_sampling_params(values)
 
 
-def _load_default_generation_executor() -> Any:
-    from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.sensenova_u1 import (
-        SenseNovaU1PixelFlowGSegmentExecutor,
+def _build_default_generation_backend(srt_server_args: Any | None) -> Any:
+    from sglang.multimodal_gen.runtime.pipelines.sensenova_u1 import (
+        SenseNovaU1Pipeline,
+    )
+    from sglang.multimodal_gen.runtime.pipelines_core.executors.sync_executor import (
+        SyncExecutor,
+    )
+    from sglang.multimodal_gen.runtime.server_args import (
+        ServerArgs as DiffusionServerArgs,
+        set_global_server_args,
     )
 
-    return SenseNovaU1PixelFlowGSegmentExecutor()
+    model_path = _resolve_model_path(srt_server_args)
+    pipeline_server_args = DiffusionServerArgs.from_kwargs(
+        model_path=model_path,
+        pipeline_class_name="SenseNovaU1Pipeline",
+    )
+    set_global_server_args(pipeline_server_args)
+    # u1 G is colocated with srt because each denoise step needs live srt session/KV
+    pipeline = SenseNovaU1Pipeline(
+        model_path,
+        pipeline_server_args,
+        executor=SyncExecutor(server_args=pipeline_server_args),
+    )
+    return ColocatedPipelineBackend(
+        pipeline=pipeline,
+        server_args=pipeline_server_args,
+        context_ops_extra_key="sensenova_u1_context_ops",
+        output_extra_key="sensenova_u1_generated_segment",
+    )
+
+
+def _resolve_model_path(server_args: Any | None) -> str:
+    if server_args is not None:
+        model_path = getattr(server_args, "model_path", None)
+        if model_path:
+            return model_path
+    return SenseNovaU1OmniPlugin.model_name

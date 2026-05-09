@@ -2,18 +2,22 @@
 
 from __future__ import annotations
 
+import copy
 from dataclasses import dataclass
-from typing import Any, Callable
+from typing import Any
 
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.omni.protocol import ContextOps, GeneratedSegment, OmniRequest
 
+# standalone diffusion serving backends can implement the same generation protocol
+
 
 @dataclass(slots=True)
-class MultimodalGenBackend:
-    executor: Callable[..., Any]
-    server_args: Any | None = None
-    context_ops_extra_key: str | None = None
+class ColocatedPipelineBackend:
+    pipeline: Any
+    server_args: Any
+    context_ops_extra_key: str
+    output_extra_key: str
 
     def generate_segment(
         self,
@@ -21,28 +25,30 @@ class MultimodalGenBackend:
         context_ops: ContextOps,
     ) -> GeneratedSegment:
         batch = self._build_batch(request, context_ops)
-        segment = self.executor(
-            context_ops=context_ops,
-            batch=batch,
-            server_args=self.server_args,
-        )
-        return _coerce_generated_segment(segment)
+        self.pipeline.forward(batch, self.server_args)
+        segment = batch.extra.get(self.output_extra_key)
+        if segment is None:
+            raise ValueError(
+                f"Colocated pipeline did not set extra[{self.output_extra_key!r}]"
+            )
+        return coerce_generated_segment(segment)
 
-    @staticmethod
-    def _base_extra(request: OmniRequest, context_ops: ContextOps) -> dict[str, Any]:
-        return {
+    def _build_batch(self, request: OmniRequest, context_ops: ContextOps) -> Req:
+        extra = {
             "omni_messages": [message.to_dict() for message in request.messages],
             "omni_context_metadata": context_ops.metadata,
+            # context_ops is an in-process srt runner capability, not serialized KV
+            self.context_ops_extra_key: context_ops,
         }
+        return Req(
+            sampling_params=_copy_sampling_params(request.sampling_params),
+            prompt=_prompt_from_request(request),
+            suppress_logs=True,
+            extra=extra,
+        )
 
-    def _build_batch(self, request: OmniRequest, context_ops: ContextOps) -> Any:
-        extra = self._base_extra(request, context_ops)
-        if self.context_ops_extra_key is not None:
-            extra[self.context_ops_extra_key] = context_ops
-        return Req(sampling_params=request.sampling_params, extra=extra)
 
-
-def _coerce_generated_segment(segment: Any) -> GeneratedSegment:
+def coerce_generated_segment(segment: Any) -> GeneratedSegment:
     if isinstance(segment, GeneratedSegment):
         return segment
     segment_type = getattr(segment, "type", None)
@@ -61,4 +67,18 @@ def _coerce_generated_segment(segment: Any) -> GeneratedSegment:
         video=getattr(segment, "video", None),
         commit_payload=commit_payload,
         metadata=dict(getattr(segment, "metadata", {}) or {}),
+    )
+
+
+def _copy_sampling_params(sampling_params: Any) -> Any:
+    if sampling_params is None:
+        return None
+    return copy.copy(sampling_params)
+
+
+def _prompt_from_request(request: OmniRequest) -> str:
+    return "\n".join(
+        message.text or ""
+        for message in request.messages
+        if message.type == "text"
     )

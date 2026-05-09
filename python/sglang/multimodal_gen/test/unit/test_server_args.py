@@ -1,5 +1,7 @@
+import json
 import os
 import sys
+import tempfile
 import unittest
 from unittest.mock import patch
 
@@ -119,6 +121,44 @@ class TestServerArgsPathExpansion(unittest.TestCase):
 
         self.assertEqual(
             server_args.component_attention_backends, {"text_encoder": "torch_sdpa"}
+        )
+
+    def test_serve_cli_preserves_config_and_dynamic_unknown_args(self):
+        from sglang.multimodal_gen.runtime.entrypoints.cli.serve import (
+            add_multimodal_gen_serve_args,
+        )
+
+        with tempfile.NamedTemporaryFile("w", suffix=".json") as config_file:
+            json.dump({"model_path": "/from/config", "num_gpus": 2}, config_file)
+            config_file.flush()
+            parser = FlexibleArgumentParser()
+            add_multimodal_gen_serve_args(parser)
+            argv = [
+                "--config",
+                config_file.name,
+                "--model-path",
+                "/from/cli",
+                "--vae-path",
+                "/custom/vae",
+                "--component-attention-backends.transformer",
+                "fa3",
+            ]
+
+            with patch.object(sys, "argv", ["sglang", "serve"] + argv):
+                args, unknown_args = parser.parse_known_args(argv)
+                with patch.object(
+                    PipelineConfig,
+                    "from_kwargs",
+                    return_value=QwenImagePipelineConfig(),
+                ):
+                    server_args = ServerArgs.from_cli_args(args, unknown_args)
+
+        self.assertEqual("/from/cli", server_args.model_path)
+        self.assertEqual(2, server_args.num_gpus)
+        self.assertEqual("/custom/vae", server_args.component_paths["vae"])
+        self.assertEqual(
+            {"transformer": "fa"},
+            server_args.component_attention_backends,
         )
 
 

@@ -1,0 +1,220 @@
+---
+title: SenseNova U1
+description: Deploy SenseNova U1 with SGLang's omni orchestrator for VLM understanding, image generation, image editing, and interleaved multi-turn conversations.
+metatags:
+    description: "Deploy SenseNova U1 with SGLang's omni HTTP API for image understanding, generation, editing, and interleaved multi-turn conversations."
+---
+
+## 1. Overview
+
+SenseNova U1 is an omni model that combines autoregressive text generation with native multimodal generation. In SGLang, U1 is served by the standard SRT server plus a thin omni orchestrator:
+
+<div style={{border: "1px solid #dbe3ef", borderRadius: "16px", overflow: "hidden", background: "linear-gradient(135deg, #ffffff 0%, #f8fafc 48%, #fff7ed 100%)", boxShadow: "0 14px 36px rgba(15, 23, 42, 0.08)", margin: "22px 0 28px 0"}}>
+  <div style={{display: "flex", alignItems: "center", justifyContent: "space-between", gap: "16px", padding: "18px 22px", borderBottom: "1px solid #e2e8f0"}}>
+    <div>
+      <div style={{fontSize: "20px", fontWeight: 750, color: "#0f172a", lineHeight: 1.2}}>SenseNova U1</div>
+      <div style={{fontSize: "13px", color: "#64748b", marginTop: "5px"}}>Omni model reference implementation in SGLang</div>
+    </div>
+    <div style={{display: "inline-flex", alignItems: "center", whiteSpace: "nowrap", border: "1px solid #99f6e4", background: "#ccfbf1", color: "#0f766e", borderRadius: "999px", padding: "8px 12px", fontSize: "13px", fontWeight: 800}}>
+      text + image &rarr; text + image
+    </div>
+  </div>
+  <div style={{display: "grid", gridTemplateColumns: "170px 1fr"}}>
+    <div style={{padding: "12px 22px", borderBottom: "1px solid #edf2f7", color: "#64748b", fontWeight: 700, background: "rgba(248, 250, 252, 0.72)"}}>Input modalities</div>
+    <div style={{padding: "12px 22px", borderBottom: "1px solid #edf2f7", color: "#1e293b"}}>
+      <span style={{display: "inline-block", marginRight: "6px", padding: "4px 9px", borderRadius: "999px", background: "#eef2ff", color: "#3730a3", fontSize: "12px", fontWeight: 750}}>text</span>
+      <span style={{display: "inline-block", marginRight: "6px", padding: "4px 9px", borderRadius: "999px", background: "#eef2ff", color: "#3730a3", fontSize: "12px", fontWeight: 750}}>image</span>
+    </div>
+    <div style={{padding: "12px 22px", borderBottom: "1px solid #edf2f7", color: "#64748b", fontWeight: 700, background: "rgba(248, 250, 252, 0.72)"}}>Output modalities</div>
+    <div style={{padding: "12px 22px", borderBottom: "1px solid #edf2f7", color: "#1e293b"}}>
+      <span style={{display: "inline-block", marginRight: "6px", padding: "4px 9px", borderRadius: "999px", background: "#eef2ff", color: "#3730a3", fontSize: "12px", fontWeight: 750}}>text</span>
+      <span style={{display: "inline-block", marginRight: "6px", padding: "4px 9px", borderRadius: "999px", background: "#eef2ff", color: "#3730a3", fontSize: "12px", fontWeight: 750}}>image</span>
+    </div>
+    <div style={{padding: "12px 22px", borderBottom: "1px solid #edf2f7", color: "#64748b", fontWeight: 700, background: "rgba(248, 250, 252, 0.72)"}}>Tasks</div>
+    <div style={{padding: "12px 22px", borderBottom: "1px solid #edf2f7", color: "#1e293b"}}>
+      <span style={{display: "inline-block", marginRight: "6px", padding: "4px 9px", borderRadius: "999px", background: "#eef2ff", color: "#3730a3", fontSize: "12px", fontWeight: 750}}>vlm</span>
+      <span style={{display: "inline-block", marginRight: "6px", padding: "4px 9px", borderRadius: "999px", background: "#eef2ff", color: "#3730a3", fontSize: "12px", fontWeight: 750}}>t2i</span>
+      <span style={{display: "inline-block", marginRight: "6px", padding: "4px 9px", borderRadius: "999px", background: "#eef2ff", color: "#3730a3", fontSize: "12px", fontWeight: 750}}>edit</span>
+      <span style={{display: "inline-block", marginRight: "6px", padding: "4px 9px", borderRadius: "999px", background: "#eef2ff", color: "#3730a3", fontSize: "12px", fontWeight: 750}}>interleave</span>
+    </div>
+    <div style={{padding: "12px 22px", color: "#64748b", fontWeight: 700, background: "rgba(248, 250, 252, 0.72)"}}>Primary APIs</div>
+    <div style={{padding: "12px 22px", color: "#1e293b"}}>
+      <code>/v1/omni/generate</code>, <code>/v1/omni/sessions/{'{'}session_id{'}'}/close</code>, standard <code>/generate</code>, and OpenAI chat
+    </div>
+  </div>
+</div>
+
+- `srt` handles chat formatting, autoregressive text decoding, sessions, and KV cache.
+- `multimodal_gen` provides the colocated stage pipeline for generated image segments.
+- `omni` coordinates the request, decides when to call each side, and commits generated media back into the conversation context.
+
+Use the ordinary SGLang HTTP APIs when U1 is acting like a VLM and only needs to return text:
+
+- `/generate`
+- OpenAI-compatible `/v1/chat/completions`
+
+Use the omni HTTP API when U1 needs to generate or edit media:
+
+- `POST /v1/omni/generate`
+- `POST /v1/omni/sessions/{session_id}/close`
+
+An interleaved request can produce multiple ordered output segments, such as text, image, then text. A multi-turn interleaved conversation keeps the same omni session alive with `keep_session: true`; the next turn passes `session_id`, so the model can refer to previous text and generated images.
+
+Supported U1 tasks:
+
+| Task | Aliases | Use case |
+| --- | --- | --- |
+| `vlm` | `chat`, `vlm_chat` | Text answer from visual input through the omni path |
+| `t2i` | `text_to_image`, `txt2img` | Text-to-image generation |
+| `edit` | `image_edit`, `img2img` | Image editing with a source image |
+| `interleave` | `interleaved` | Ordered text and image segments in one request/session |
+
+## 2. Installation
+
+Use a development build that includes native SenseNova U1 and the SGLang omni runtime.
+
+```bash Command
+git clone https://github.com/sgl-project/sglang.git
+cd sglang
+pip install -e "python[all,diffusion]"
+```
+
+Install any CUDA, PyTorch, or FlashInfer packages required by your target environment before starting the server.
+
+## 3. Model Deployment
+
+Start an omni SGLang server with the U1 model path. The omni routes are exposed from the same SRT deployment, and U1 image segments are executed colocated with the SRT model runner so they can reuse the live model/session/KV state.
+
+```bash Command
+sglang serve \
+  --model-type omni \
+  --model-path sensenova/SenseNova-U1-8B-MoT \
+  --host 0.0.0.0 \
+  --port 30000
+```
+
+`--model-type omni` is intentional. `sglang serve` also supports `--model-type diffusion` for standalone SGLang-Diffusion deployments. The default `auto` mode is a dispatch choice, not a hybrid deployment; with diffusion support installed, it may route registered generation models to a standalone `multimodal_gen` diffusion server instance. SenseNova U1 needs the SRT deployment because omni sessions, chat state, KV cache, `/generate`, `/v1/chat/completions`, and `/v1/omni/generate` all live in the SRT model execution path. For U1, `multimodal_gen` is used as a colocated pipeline/stage backend, not as a separate diffusion server.
+
+For larger GPUs, add the same runtime flags you normally use for SRT, such as `--tp-size`, memory settings, or CUDA graph settings.
+
+## 4. Usage
+
+SenseNova U1 supports familiar SGLang text/VLM APIs and the omni endpoint. Use the standard APIs when the response is text-only; use `/v1/omni/generate` when the response can include generated images or interleaved segments. The common omni request/response schema is described in the [Omni overview](/cookbook/omni/intro).
+
+| Workflow | Endpoint | Key fields | Output |
+| --- | --- | --- | --- |
+| Text-only generation | `/generate` | `text`, `sampling_params` | Text |
+| OpenAI-compatible VLM chat | `/v1/chat/completions` | `messages[].content` with `image_url` and `text` | Text |
+| Native VLM understanding | `/generate` | `text`, `image_data`, `sampling_params` | Text |
+| Text-to-image | `/v1/omni/generate` | `task: "t2i"`, text segment, image sampling params | Image segment |
+| Image editing | `/v1/omni/generate` | `task: "edit"`, image segment, text edit instruction | Image segment |
+| Interleaved multi-turn generation | `/v1/omni/generate` | `task: "interleave"`, `keep_session` or `session_id` | Ordered text/image segments |
+
+For single-turn text-to-image or image editing, only the `task` and `messages` fields change. For example, `task: "t2i"` uses a text segment as input, while `task: "edit"` uses an image segment plus a text instruction.
+
+## 5. Multi-Turn Interleave
+
+Set `keep_session: true` on the first turn. The server returns `session.id`; pass that value as `session_id` on later turns.
+
+```python Example
+import base64
+import requests
+
+url = "http://localhost:30000/v1/omni/generate"
+
+turn1 = {
+    "model": "sensenova-u1",
+    "task": "interleave",
+    "keep_session": True,
+    "messages": [
+        {
+            "type": "text",
+            "text": "Create one image of a blue cube on a white table, then describe it.",
+        }
+    ],
+    "sampling_params": {
+        "width": 512,
+        "height": 512,
+        "num_steps": 20,
+        "cfg_text_scale": 4.0,
+        "cfg_renorm_type": "none",
+    },
+    "max_images": 1,
+    "max_text_segments": 2,
+}
+
+r1 = requests.post(url, json=turn1)
+r1.raise_for_status()
+data1 = r1.json()
+session_id = data1["session"]["id"]
+
+turn2 = {
+    "model": "sensenova-u1",
+    "task": "interleave",
+    "session_id": session_id,
+    "messages": [
+        {
+            "type": "text",
+            "text": "Now edit the previous image: make the cube red and add a green sphere.",
+        }
+    ],
+    "sampling_params": {
+        "width": 512,
+        "height": 512,
+        "num_steps": 20,
+        "cfg_text_scale": 4.0,
+        "cfg_img_scale": 1.0,
+    },
+    "max_images": 1,
+    "max_text_segments": 2,
+}
+
+r2 = requests.post(url, json=turn2)
+r2.raise_for_status()
+data2 = r2.json()
+
+for index, segment in enumerate(data2["segments"]):
+    if segment["type"] == "text":
+        print(segment["text"])
+    elif segment["type"] == "image":
+        with open(f"u1_turn2_{index}.png", "wb") as f:
+            f.write(base64.b64decode(segment["image"]["b64_json"]))
+
+requests.post(f"http://localhost:30000/v1/omni/sessions/{session_id}/close")
+```
+
+This is the path that demonstrates interleave behavior: the generated image from turn 1 is committed into the live session, and turn 2 can refer to it as "the previous image".
+
+## 6. Sampling Parameters
+
+Common U1 image sampling parameters:
+
+| Parameter | Default | Notes |
+| --- | --- | --- |
+| `width` | `1024` | Image width |
+| `height` | `1024` | Image height |
+| `num_inference_steps` | `50` | Also accepts `num_steps` or `steps` |
+| `cfg_text_scale` | `1.0` | Also accepts `guidance_scale` or `text_cfg_scale` |
+| `cfg_img_scale` | `1.0` | Also accepts `img_cfg_scale` or `image_cfg_scale` |
+| `cfg_interval` | `[0.4, 1.0]` | CFG active interval |
+| `cfg_renorm_type` | `global` | One of `none`, `global`, `channel`, `text_channel` |
+| `timestep_shift` | `3.0` | Pixel-flow timestep shift |
+
+Omni control fields:
+
+| Field | Default | Notes |
+| --- | --- | --- |
+| `task` | `interleave` | Request-level task selector; can also be passed inside `sampling_params`. `mode` is accepted as a legacy alias. |
+| `max_images` | `1` | Upper bound for generated image segments |
+| `max_text_segments` | `8` | Upper bound for generated text segments |
+| `keep_session` | `false` | Keeps the SRT session/KV alive for later turns |
+| `session_id` | unset | Continue an existing session |
+| `think` | `false` | Enables model-specific thinking behavior when supported |
+| `think_max_new_tokens` | unset | Thinking token budget |
+
+## 7. Scope Notes
+
+- Standard `/generate` and `/v1/chat/completions` are intended for one-image VLM understanding and text output.
+- Image generation, editing, and interleaved text/image output should use `/v1/omni/generate`.
+- Close persistent sessions after use so the server can release the session KV cache.
+- For quick smoke tests, use smaller image sizes and fewer steps; use the model defaults or higher values for quality checks.

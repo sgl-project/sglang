@@ -12,7 +12,7 @@ class TestSenseNovaU1OmniConfig(unittest.TestCase):
         request = OmniRequest(
             messages=(OmniInputSegment(type="text", text="describe"),),
             sampling_params={
-                "mode": "vlm",
+                "task": "vlm",
                 "max_new_tokens": 4,
                 "max_interleave_images": 2,
                 "think": "true",

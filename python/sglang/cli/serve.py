@@ -24,7 +24,7 @@ def _extract_model_type_override(extra_argv):
             if i + 1 >= len(extra_argv):
                 raise Exception(
                     "Error: --model-type requires a value. "
-                    "Valid values are: auto, llm, diffusion."
+                    "Valid values are: auto, llm, diffusion, omni."
                 )
             model_type = extra_argv[i + 1]
             i += 2
@@ -38,10 +38,10 @@ def _extract_model_type_override(extra_argv):
         filtered_argv.append(arg)
         i += 1
 
-    if model_type not in ("auto", "llm", "diffusion"):
+    if model_type not in ("auto", "llm", "diffusion", "omni"):
         raise Exception(
             f"Error: invalid --model-type '{model_type}'. "
-            "Valid values are: auto, llm, diffusion."
+            "Valid values are: auto, llm, diffusion, omni."
         )
     return model_type, filtered_argv
 
@@ -53,9 +53,9 @@ def serve(args, extra_argv):
         # the help for both possible server types.
         print(
             "Usage: sglang serve --model-path <model-name-or-path> [additional-arguments]\n\n"
-            "This command can launch either a standard language model server or a diffusion model server.\n"
+            "This command can launch a standard language model server, an omni server, or a diffusion model server.\n"
             "The server type is determined by the --model-path.\n"
-            "Optional override: --model-type {auto,llm,diffusion} "
+            "Optional override: --model-type {auto,llm,diffusion,omni} "
             "(default: auto, fallback to LLM on detection failure)."
         )
 

@@ -34,6 +34,16 @@ class TestOmniProtocol(unittest.TestCase):
         self.assertEqual("draw a cup", request.messages[0].text)
         self.assertEqual("image", response.to_dict()["segments"][0]["type"])
 
+    def test_task_alias_maps_to_internal_mode(self):
+        request = OmniRequest.from_payload(
+            {
+                "task": "edit",
+                "messages": [{"type": "text", "text": "edit this image"}],
+            }
+        )
+
+        self.assertEqual("edit", request.mode)
+
     def test_public_shapes_do_not_expose_raw_kv_names(self):
         objects = [
             OmniRequest(messages=(OmniInputSegment(type="text", text="x"),)),

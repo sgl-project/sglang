@@ -72,7 +72,7 @@ class OmniRequest:
         return cls(
             messages=messages,
             model=payload.get("model"),
-            mode=str(payload.get("mode", "interleave")),
+            mode=str(payload.get("task", payload.get("mode", "interleave"))),
             sampling_params=payload.get("sampling_params") or {},
             max_images=int(payload.get("max_images", 1)),
             max_text_segments=int(payload.get("max_text_segments", 8)),
