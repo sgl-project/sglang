@@ -13,6 +13,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import contextlib
+import contextvars
 import logging
 import threading
 import time
@@ -46,6 +48,21 @@ from sglang.srt.utils import get_device_module
 logger = logging.getLogger(__name__)
 
 device_module = get_device_module()
+
+# Snapshot of HiRadixCache.evictable_host_leaves cardinality when calling EvictKVPath
+# (`cache_controller.evict_host`). Other callers leave this unset (default None).
+_radix_evictable_host_leaves: contextvars.ContextVar[Optional[int]] = (
+    contextvars.ContextVar("_radix_evictable_host_leaves", default=None)
+)
+
+
+@contextlib.contextmanager
+def radix_evict_host_leaf_context(evictable_host_leaves: int):
+    token = _radix_evictable_host_leaves.set(evictable_host_leaves)
+    try:
+        yield
+    finally:
+        _radix_evictable_host_leaves.reset(token)
 
 
 class LayerLoadingEvent:
@@ -799,6 +816,15 @@ class HiCacheController:
         n = len(host_indices)
         mp = self.mem_pool_host
         avail_before = mp.available_size()
+        radix_leaves_hint = _radix_evictable_host_leaves.get()
+        if radix_leaves_hint is not None:
+            logger.info(
+                "[HiCacheHostEvict] controller_evict_host radix_evictable_host_leaves=%s num_indices=%s pool_size=%s available_size=%s",
+                radix_leaves_hint,
+                n,
+                mp.size,
+                avail_before,
+            )
         logger.info(
             "[HiCachePrefetchHostMem] evict_host_before_free num_indices=%s pool_size=%s available_size=%s",
             n,

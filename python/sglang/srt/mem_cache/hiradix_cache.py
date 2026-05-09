@@ -13,7 +13,11 @@ from typing import TYPE_CHECKING, Dict, List, Optional
 import torch
 
 from sglang.srt.disaggregation.kv_events import StorageMedium
-from sglang.srt.managers.cache_controller import HiCacheController, PrefetchOperation
+from sglang.srt.managers.cache_controller import (
+    HiCacheController,
+    PrefetchOperation,
+    radix_evict_host_leaf_context,
+)
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
     DecLockRefResult,
@@ -839,18 +843,47 @@ class HiRadixCache(RadixCache):
 
     def _update_host_leaf_status(self, node: TreeNode):
         if not node.evicted or node.lock_ref > 0:
+            removed = False
             if node in self.evictable_host_leaves:
                 self.evictable_host_leaves.remove(node)
+                removed = True
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(
+                    "[HiCacheHostLeafStatus] action=withdraw_not_candidate node_id=%s evicted=%s lock_ref=%s removed=%s evictable_host_leaves=%s",
+                    node.id,
+                    node.evicted,
+                    node.lock_ref,
+                    removed,
+                    len(self.evictable_host_leaves),
+                )
             return
 
         for child in node.children.values():
             if child.evicted:
+                removed = False
                 if node in self.evictable_host_leaves:
                     self.evictable_host_leaves.remove(node)
+                    removed = True
+                if logger.isEnabledFor(logging.DEBUG):
+                    logger.debug(
+                        "[HiCacheHostLeafStatus] action=withdraw_blocked_by_evicted_child node_id=%s removed=%s evictable_host_leaves=%s",
+                        node.id,
+                        removed,
+                        len(self.evictable_host_leaves),
+                    )
                 return
 
+        inserted = False
         if node not in self.evictable_host_leaves:
             self.evictable_host_leaves.add(node)
+            inserted = True
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "[HiCacheHostLeafStatus] action=eligible_host_leaf node_id=%s inserted_new=%s evictable_host_leaves=%s",
+                node.id,
+                inserted,
+                len(self.evictable_host_leaves),
+            )
 
     def evict(self, params: EvictParams) -> EvictResult:
         start_time = time.perf_counter()
@@ -927,27 +960,45 @@ class HiRadixCache(RadixCache):
 
     def evict_host(self, num_tokens: int):
         leaves = list(self.evictable_host_leaves)
+        n_evictable = len(self.evictable_host_leaves)
         eviction_heap = [
             (self.eviction_strategy.get_priority(node), node) for node in leaves
         ]
         heapq.heapify(eviction_heap)
 
+        logger.info(
+            "[HiCacheHostEvict] evict_host_begin num_tokens_requested=%s evictable_host_leaves=%s heap_size=%s",
+            num_tokens,
+            n_evictable,
+            len(eviction_heap),
+        )
+
         num_evicted = 0
+        skip_hit_root_break = 0
+        skip_not_evicted = 0
+        skip_host_ref_blocked = 0
+        successful_kv_frees = 0
+
         while num_evicted < num_tokens and len(eviction_heap):
             _priority, x = heapq.heappop(eviction_heap)
             if x == self.root_node:
+                skip_hit_root_break += 1
                 break
             # only evict the host value of evicted nodes
             if not x.evicted:
+                skip_not_evicted += 1
                 continue
 
             if x.host_ref_counter > 0:
+                skip_host_ref_blocked += 1
                 continue
 
             # Block deleted entirely (GPU already evicted, now CPU freed) --
             # emit remove(CPU) so the router drops the host-tier entry.
             self._record_remove_event(x, medium=StorageMedium.CPU)
-            num_evicted += self.cache_controller.evict_host(x.host_value)
+            with radix_evict_host_leaf_context(len(self.evictable_host_leaves)):
+                num_evicted += self.cache_controller.evict_host(x.host_value)
+            successful_kv_frees += 1
 
             key = x.key.child_key(self.page_size)
             v = x.parent.children.pop(key, None)
@@ -959,6 +1010,28 @@ class HiRadixCache(RadixCache):
             if len(x.parent.children) == 0 and x.parent.evicted:
                 new_priority = self.eviction_strategy.get_priority(x.parent)
                 heapq.heappush(eviction_heap, (new_priority, x.parent))
+
+        if num_evicted >= num_tokens:
+            exit_reason = "goal_met"
+        elif skip_hit_root_break > 0:
+            exit_reason = "hit_root"
+        else:
+            exit_reason = "heap_exhausted"
+
+        logger.info(
+            "[HiCacheHostEvict] evict_host_summary exit_reason=%s num_tokens_requested=%s "
+            "num_indices_freed_total=%s evictable_host_leaves_remain=%s successful_kv_node_frees=%s "
+            "skip_hit_root_break=%s skip_not_evicted=%s skip_host_ref_blocked=%s heap_remain_size=%s",
+            exit_reason,
+            num_tokens,
+            num_evicted,
+            len(self.evictable_host_leaves),
+            successful_kv_frees,
+            skip_hit_root_break,
+            skip_not_evicted,
+            skip_host_ref_blocked,
+            len(eviction_heap),
+        )
 
     def load_back(
         self, node: TreeNode, mem_quota: Optional[int] = None
