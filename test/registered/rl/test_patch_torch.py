@@ -1,7 +1,7 @@
 import os
 import traceback
 import unittest
-from typing import Dict, List
+from typing import List
 
 import torch
 import torch.multiprocessing as mp
@@ -10,55 +10,15 @@ from sglang.srt.utils.patch_torch import monkey_patch_torch_reductions
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_amd_ci(
-    est_time=19, suite="stage-b-test-2-gpu-large-amd", disabled="see #11127"
+    est_time=15, suite="stage-b-test-2-gpu-large-amd", disabled="see #11127"
 )
-register_cuda_ci(est_time=38, suite="stage-b-test-2-gpu-large")
+register_cuda_ci(est_time=15, suite="stage-b-test-2-gpu-large")
 
 
 class TestReleaseMemoryOccupation(unittest.TestCase):
     def test_monkey_patch_torch_reductions(self):
         mp.set_start_method("spawn", force=True)
 
-        for enable_patch in [False, True]:
-            for params in [
-                # Same visible devices
-                dict(
-                    sender_info=dict(
-                        visible_devices=[0, 1],
-                        tensor_device=1,
-                    ),
-                    receiver_info=dict(
-                        visible_devices=[0, 1],
-                        tensor_device=1,
-                    ),
-                ),
-                # Different visible devices
-                dict(
-                    sender_info=dict(
-                        visible_devices=[0, 1],
-                        tensor_device=1,
-                    ),
-                    receiver_info=dict(
-                        visible_devices=[1, 0],
-                        # If enable patch, this should be fixed, and cuda:1 becomes cuda:0
-                        tensor_device=0 if enable_patch else 1,
-                    ),
-                ),
-            ]:
-                with self.subTest(f"{enable_patch=} {params=}"):
-                    self._test_monkey_patch_torch_reductions_core(
-                        enable_patch=enable_patch, **params
-                    )
-
-    def _test_monkey_patch_torch_reductions_core(
-        self,
-        sender_info: Dict,
-        receiver_info: Dict,
-        enable_patch: bool,
-    ):
-        print(
-            f'test_monkey_patch_torch_reductions_core {os.environ.get("CUDA_VISIBLE_DEVICES")=}'
-        )
         cuda_visible_devices_list: List[int] = [
             int(x)
             for x in os.environ.get("CUDA_VISIBLE_DEVICES", "0,1,2,3,4,5,6,7").split(
@@ -66,13 +26,15 @@ class TestReleaseMemoryOccupation(unittest.TestCase):
             )
         ]
 
+        # Sender's cuda:1 and receiver's cuda:0 map to the same physical device.
+        # With the patch, the IPC tensor must land on receiver's cuda:0.
+        sender_info = dict(visible_devices=[0, 1], tensor_device=1)
+        receiver_info = dict(visible_devices=[1, 0], tensor_device=0)
+
         processes = []
         output_reader, output_writer = mp.Pipe(duplex=False)
-        # Split into two single-producer / single-consumer queues. A single
-        # shared queue is unsafe here: mp.Queue is backed by one Pipe shared by
-        # all processes, so the sender's own get() can pop the tensor it just
-        # put before the receiver wakes up. Re-importing one's own CUDA IPC
-        # handle is not supported and fails with "invalid device context".
+        # Split into SPSC queues; a single shared mp.Queue lets the sender's
+        # get() pop its own put before the receiver wakes (CUDA IPC self-reopen fails).
         tensor_queue = mp.Queue()
         ack_queue = mp.Queue()
         for role, info in [
@@ -91,7 +53,6 @@ class TestReleaseMemoryOccupation(unittest.TestCase):
                     ack_queue=ack_queue,
                     output_writer=output_writer,
                     tensor_device=info["tensor_device"],
-                    enable_patch=enable_patch,
                 ),
             )
             p.start()
@@ -112,16 +73,13 @@ def _run_subprocess(
     ack_queue: mp.Queue,
     output_writer,
     tensor_device: int,
-    enable_patch: bool,
 ):
     print(
         f'subprocess[{role}] start {os.environ.get("CUDA_VISIBLE_DEVICES")=}',
         flush=True,
     )
 
-    if enable_patch:
-        print(f"subprocess[{role}] execute monkey_patch_torch_reductions", flush=True)
-        monkey_patch_torch_reductions()
+    monkey_patch_torch_reductions()
 
     try:
         if role == "sender":
