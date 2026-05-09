@@ -1268,7 +1268,6 @@ class GroupCoordinator:
         self,
         src: Optional[int] = None,
         all_gather_group: Optional["GroupCoordinator"] = None,
-        all_gather_group_resolver: Optional[Callable] = None,
     ) -> Optional[Dict[str, Union[torch.Tensor, Any]]]:
         """Recv the input tensor dictionary.
         NOTE: `src` is the local rank of the source rank.
@@ -1276,14 +1275,6 @@ class GroupCoordinator:
         # Bypass the function if we are using only 1 GPU.
         if not torch.distributed.is_initialized() or self.world_size == 1:
             return None
-
-        if src is None:
-            src = (self.rank_in_group - 1) % self.world_size
-        assert src < self.world_size, f"Invalid src rank ({src})"
-
-        recv_metadata_list = self.recv_object(src=src)
-        if all_gather_group_resolver is not None:
-            all_gather_group = all_gather_group_resolver(recv_metadata_list)
 
         all_gather_size = 1 if all_gather_group is None else all_gather_group.world_size
         all_gather_rank = (
@@ -1293,6 +1284,11 @@ class GroupCoordinator:
         group = self.device_group
         metadata_group = self.cpu_group
 
+        if src is None:
+            src = (self.rank_in_group - 1) % self.world_size
+        assert src < self.world_size, f"Invalid src rank ({src})"
+
+        recv_metadata_list = self.recv_object(src=src)
         tensor_dict: Dict[str, Any] = {}
         for key, value in recv_metadata_list:
             if isinstance(value, TensorMetadata):

@@ -981,6 +981,7 @@ class SchedulerPPMixin:
     def _pp_recv_typed_dict(
         self: Scheduler,
         expected_kind: str = "default",
+        all_gather_group: Optional = None,
     ) -> Dict[str, torch.Tensor]:
         """Receive a typed tensor dict, demultiplexing by msg_type.
 
@@ -994,7 +995,7 @@ class SchedulerPPMixin:
 
         while True:
             tensor_dict = self.pp_group.recv_tensor_dict(
-                all_gather_group_resolver=self._pp_resolve_all_gather_group_from_metadata
+                all_gather_group=all_gather_group
             )
             received_kind = tensor_dict.get("__msg_type__", "default")
             if received_kind == expected_kind:
@@ -1010,22 +1011,13 @@ class SchedulerPPMixin:
                 )
                 self._pp_tensor_dict_inbox[received_kind].append(tensor_dict)
 
-    def _pp_resolve_all_gather_group_from_metadata(
-        self: Scheduler, recv_metadata_list: List[Tuple[str, object]]
-    ) -> Optional[object]:
-        received_kind = "default"
-        for key, value in recv_metadata_list:
-            if key == "__msg_type__":
-                received_kind = value if isinstance(value, str) else "default"
-                break
-        return self._pp_get_all_gather_group(received_kind)
-
     def _pp_recv_proxy_tensors(self: Scheduler) -> Optional[PPProxyTensors]:
         pp_proxy_tensors = None
         if not self.pp_group.is_first_rank:
             pp_proxy_tensors = PPProxyTensors(
                 self._pp_recv_typed_dict(
                     expected_kind="proxy",
+                    all_gather_group=self._pp_get_all_gather_group("proxy"),
                 )
             )
         return pp_proxy_tensors
@@ -1035,6 +1027,7 @@ class SchedulerPPMixin:
     ) -> Dict[str, torch.Tensor]:
         return self._pp_recv_typed_dict(
             expected_kind="output",
+            all_gather_group=self._pp_get_all_gather_group("output"),
         )
 
     def _pp_prep_batch_result(
