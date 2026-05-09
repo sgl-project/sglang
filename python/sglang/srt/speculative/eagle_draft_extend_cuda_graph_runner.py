@@ -365,7 +365,6 @@ class EAGLEDraftExtendCudaGraphRunner:
             num_accepted_drafts=num_accepted_drafts,
             num_accepted_tokens=num_accepted_tokens,
         )
-        spec_info.positions = None
 
         self.deepep_adapter.capture(is_extend_in_batch=True)
 
