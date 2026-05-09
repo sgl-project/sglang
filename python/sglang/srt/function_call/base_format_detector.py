@@ -1,13 +1,19 @@
 import json
 import logging
 from abc import ABC, abstractmethod
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Literal, Optional, Union
 
 import orjson
 from partial_json_parser.core.exceptions import MalformedJSON
 from partial_json_parser.core.options import Allow
 
-from sglang.srt.entrypoints.openai.protocol import Tool
+try:
+    from xgrammar import StructuralTag, get_model_structural_tag
+except ImportError:
+    StructuralTag = Any
+    get_model_structural_tag = None
+
+from sglang.srt.entrypoints.openai.protocol import Tool, ToolChoice
 from sglang.srt.environ import envs
 from sglang.srt.function_call.core_types import (
     StreamingParseResult,
@@ -171,12 +177,13 @@ class BaseFormatDetector(ABC):
                 # parallel tool calls because the bot_token (e.g., '[') can also
                 # appear inside array parameters of the current tool, and we must not
                 # mistakenly identify that as the start of a new tool.
+                used_separator_branch = False
                 if self.current_tool_id > 0 and current_text.startswith(
                     self.tool_call_separator
                 ):
                     start_idx = len(self.tool_call_separator)
+                    used_separator_branch = True
                 else:
-                    # Only search for bot_token if not processing subsequent tool
                     tool_call_pos = current_text.find(self.bot_token)
                     if tool_call_pos != -1:
                         start_idx = tool_call_pos + len(self.bot_token)
@@ -186,7 +193,23 @@ class BaseFormatDetector(ABC):
                 if start_idx >= len(current_text):
                     return StreamingParseResult()
 
-                (obj, end_idx) = _partial_json_loads(current_text[start_idx:], flags)
+                try:
+                    obj, end_idx = _partial_json_loads(current_text[start_idx:], flags)
+                except (MalformedJSON, json.JSONDecodeError):
+                    # Separator landed on non-JSON markup; fall back to
+                    # bot_token which skips past all inter-object markup.
+                    # e.g. Qwen25: separator "," matches between eot/bot tags.
+                    if used_separator_branch and self.bot_token in current_text:
+                        start_idx = current_text.find(self.bot_token) + len(
+                            self.bot_token
+                        )
+                        if start_idx >= len(current_text):
+                            return StreamingParseResult()
+                        obj, end_idx = _partial_json_loads(
+                            current_text[start_idx:], flags
+                        )
+                    else:
+                        raise
 
                 is_current_complete = _is_complete_json(
                     current_text[start_idx : start_idx + end_idx]
@@ -212,7 +235,7 @@ class BaseFormatDetector(ABC):
 
                 current_tool_call = obj
 
-            except MalformedJSON:
+            except (MalformedJSON, json.JSONDecodeError):
                 return StreamingParseResult()
 
             if not current_tool_call:
@@ -253,7 +276,7 @@ class BaseFormatDetector(ABC):
                 cur_arguments = current_tool_call.get("arguments")
                 res = StreamingParseResult()
 
-                if cur_arguments:
+                if cur_arguments is not None:
                     # Calculate how much of the arguments we've already streamed
                     sent = len(self.streamed_args_for_tool[self.current_tool_id])
                     cur_args_json = json.dumps(cur_arguments, ensure_ascii=False)
@@ -344,3 +367,45 @@ class BaseFormatDetector(ABC):
             A function that takes a tool name (str) and returns StructureInfo
         """
         raise NotImplementedError()
+
+    def get_structural_tag_name(self) -> Optional[str]:
+        """Return the XGrammar model name for native structural tags, if supported."""
+        return None
+
+    def get_structural_tag(
+        self,
+        tools: Union[List[Tool], None] = None,
+        tool_choice: Union[ToolChoice, Literal["auto", "required"]] = "auto",
+        thinking_mode: bool = False,
+    ) -> Optional[StructuralTag]:
+        """
+        Return a model-native XGrammar structural tag when supported.
+
+        Args:
+            tools: List of available tools
+            tool_choice: The tool choice setting from the request
+            thinking_mode: Whether to include the model's reasoning prefix in
+                the returned structural tag. Pass False when SGLang's
+                ReasonerGrammarBackend will own the <think>...</think> prefix
+                (the typical case when --reasoning-parser is configured) so
+                only one layer constrains the reasoning section.
+
+        Returns:
+            StructuralTag if this detector supports model-native tags, otherwise None
+        """
+        structural_tag_name = self.get_structural_tag_name()
+        if not structural_tag_name or get_model_structural_tag is None:
+            return None
+
+        converted_tools = [tool.model_dump() for tool in tools or []]
+        converted_tool_choice = (
+            tool_choice.model_dump()
+            if isinstance(tool_choice, ToolChoice)
+            else tool_choice
+        )
+        return get_model_structural_tag(
+            model=structural_tag_name,
+            tools=converted_tools,
+            tool_choice=converted_tool_choice,
+            reasoning=thinking_mode,
+        )

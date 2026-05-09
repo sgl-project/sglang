@@ -1,71 +1,62 @@
+"""Simplified dump comparator — a self-contained single-file script for comparing
+two dump directories tensor-by-tensor.
+
+For advanced features (unshard, token alignment, per-dimension annotations), see the
+full ``comparator/`` package: ``python -m sglang.srt.debug_utils.comparator``.
+"""
+
 import argparse
 import functools
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Dict, List, Optional
+from typing import Callable, List, Optional
 
-import einops
-import polars as pl
 import torch
 
-from sglang.srt.debug_utils.dump_loader import find_row, read_meta
 from sglang.srt.debug_utils.dumper import get_truncated_value
 
 
 def main(args):
+    import polars as pl
+
+    from sglang.srt.debug_utils.dump_loader import find_row, read_meta
+
     df_target = read_meta(args.target_path)
     df_target = df_target.filter(
-        (pl.col("forward_pass_id") >= args.start_id)
-        & (pl.col("forward_pass_id") <= args.end_id)
+        (pl.col("step") >= args.start_step) & (pl.col("step") <= args.end_step)
     )
     if args.filter:
         df_target = df_target.filter(pl.col("filename").str.contains(args.filter))
-    assert all(
-        c in df_target.columns
-        for c in ["rank", "forward_pass_id", "dump_index", "name"]
-    )
+    assert all(c in df_target.columns for c in ["rank", "step", "dump_index", "name"])
 
     df_baseline = read_meta(args.baseline_path)
     print("df_target", df_target)
     print("df_baseline", df_baseline)
 
-    location_info_of_target_pass_id = _get_location_info_of_target_pass_id()
-    tensor_dim_descs = _get_tensor_dim_descs()
+    tensor_dim_descs: List[TensorDimDesc] = _get_tensor_dim_descs()
 
     for row in df_target.iter_rows(named=True):
         path_target = Path(args.target_path) / row["filename"]
 
-        if location_info_of_target_pass_id is not None:
-            location_info = location_info_of_target_pass_id.get(row["forward_pass_id"])
-            if location_info is None:
-                continue
-            baseline_forward_pass_id = location_info.baseline_forward_pass_id
-            baseline_token_slice = location_info.baseline_token_slice
-        else:
-            baseline_forward_pass_id = (
-                row["forward_pass_id"] - args.start_id + args.baseline_start_id
-            )
-            baseline_token_slice = None
-
-        tensor_dim_desc = None
-        if tensor_dim_descs is not None:
-            tensor_dim_descs_filtered = [
+        tensor_dim_desc: Optional[TensorDimDesc] = None
+        if tensor_dim_descs:
+            matched: list[TensorDimDesc] = [
                 desc
                 for desc in tensor_dim_descs
-                if re.search(desc["pattern"], row["filename"]) is not None
+                if re.search(desc.pattern, row["filename"]) is not None
             ]
-            if tensor_dim_descs_filtered:
-                tensor_dim_desc = tensor_dim_descs_filtered[0]
+            if matched:
+                tensor_dim_desc = matched[0]
 
         row_baseline = find_row(
             df_baseline,
             conditions=dict(
-                forward_pass_id=baseline_forward_pass_id,
+                step=row["step"],
                 **{
                     k: v
                     for k, v in row.items()
-                    if k not in ["forward_pass_id", "dump_index", "filename"]
+                    if k not in ["step", "dump_index", "filename"]
                 },
             ),
         )
@@ -88,19 +79,9 @@ def main(args):
             path_target=path_target,
             diff_threshold=args.diff_threshold,
             name=row["name"],
-            baseline_token_slice=baseline_token_slice,
             tensor_dim_desc=tensor_dim_desc,
         )
         print()
-
-
-def _split_einops_pattern(pattern):
-    return re.findall(r"\([^()]*\)|\S+", pattern)
-
-
-def _get_einops_dim_index(pattern: str, dim_name: str):
-    pattern_list = _split_einops_pattern(pattern)
-    return pattern_list.index(dim_name)
 
 
 def check_tensor_pair(
@@ -108,7 +89,6 @@ def check_tensor_pair(
     path_target,
     diff_threshold: float = 1e-3,
     name="",
-    baseline_token_slice=None,
     tensor_dim_desc: Optional["TensorDimDesc"] = None,
 ):
     x_baseline = _load_object(path_baseline)
@@ -127,18 +107,15 @@ def check_tensor_pair(
     )
 
     if tensor_dim_desc is not None:
-        if (s := baseline_token_slice) is not None:
-            dim = _get_einops_dim_index(tensor_dim_desc.baseline_desc, "num_tokens")
-            x_baseline = x_baseline.narrow(
-                dim=dim, start=s.start, length=s.stop - s.start
-            )
+        import einops
+
         x_baseline = einops.rearrange(
             x_baseline,
             tensor_dim_desc.baseline_desc + " -> " + tensor_dim_desc.target_desc,
         )
-        if (f := tensor_dim_desc.baseline_cropper) is not None:
+        if tensor_dim_desc.baseline_cropper is not None:
             print("Apply baseline_cropper")
-            x_baseline = f(x_baseline)
+            x_baseline = tensor_dim_desc.baseline_cropper(x_baseline)
 
     x_baseline, x_target = _comparison_preprocessor(x_baseline, x_target, name=name)
     x_baseline = _try_unify_shape(x_baseline, target_shape=x_target.shape)
@@ -217,16 +194,12 @@ def _compute_and_print_diff(
     mean_abs_diff = raw_abs_diff.mean().item()
     rel_diff = _calc_rel_diff(x_target, x_baseline)
 
+    rel_diff_marker: str = "❌" if rel_diff > diff_threshold else "✅"
     print(
         prefix_text
-        + "\t".join(
-            f"{'❌' if value > diff_threshold else '✅'} {name}={value}"
-            for name, value in [
-                ("rel_diff", rel_diff),
-                ("max_abs_diff", max_abs_diff),
-                ("mean_abs_diff", mean_abs_diff),
-            ]
-        )
+        + f"{rel_diff_marker} rel_diff={rel_diff}\t"
+        + f"max_abs_diff={max_abs_diff}\t"
+        + f"mean_abs_diff={mean_abs_diff}"
     )
 
     max_diff_coord = _argmax_coord(raw_abs_diff)
@@ -280,38 +253,31 @@ def _load_object(path):
         print(f"Skip load {path} since error {e}")
         return None
 
+    if isinstance(x, dict) and "value" in x:
+        x = x["value"]
+
     if not isinstance(x, torch.Tensor):
         print(f"Skip load {path} since {type(x)=} is not a Tensor ({x=})")
         return None
     return x.cuda()
 
 
-# TODO may make customization endpoints configurable via args pointing to code file
 def _comparison_preprocessor(x_baseline, x_target, name):
     """Customization endpoint. Can insert arbitrary adhoc postprocessing logic here."""
     return x_baseline, x_target
 
 
 @dataclass
-class LocationInfo:
-    baseline_forward_pass_id: int
-    baseline_token_slice: slice
-
-
-def _get_location_info_of_target_pass_id() -> Optional[Dict[int, LocationInfo]]:
-    """Customization endpoint."""
-    return None
-
-
-@dataclass
 class TensorDimDesc:
+    pattern: str
     baseline_desc: str
     target_desc: str
-    baseline_cropper: Optional[Callable[[torch.Tensor], torch.Tensor]]
+    baseline_cropper: Optional[Callable[[torch.Tensor], torch.Tensor]] = None
 
 
 def _get_tensor_dim_descs() -> List[TensorDimDesc]:
-    """Customization endpoint."""
+    """Customization endpoint. Return a list of TensorDimDesc to rearrange baseline
+    dimensions to match target layout via einops before comparison."""
     return []
 
 
@@ -320,9 +286,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--baseline-path", type=str)
     parser.add_argument("--target-path", type=str)
-    parser.add_argument("--start-id", type=int, default=0)
-    parser.add_argument("--end-id", type=int, default=1000000)
-    parser.add_argument("--baseline-start-id", type=int, default=0)
+    parser.add_argument("--start-step", type=int, default=0)
+    parser.add_argument("--end-step", type=int, default=1000000)
     parser.add_argument("--diff-threshold", type=float, default=1e-3)
     parser.add_argument(
         "--filter", type=str, default=None, help="Regex to filter filenames"

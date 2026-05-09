@@ -19,6 +19,8 @@ class MOVASamplingParams(SamplingParams):
     visual_shift: float = 5.0
     audio_shift: float = 5.0
 
+    adjust_frames: bool = False
+
     negative_prompt: str = (
         "色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，"
         "整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，"

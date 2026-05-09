@@ -10,7 +10,7 @@ use uuid::Uuid;
 
 use smg::tokenizer::create_tokenizer_from_file;
 use smg::tokenizer::traits::Tokenizer;
-use smg::grpc_client::sglang_scheduler::SglangSchedulerClient;
+use smg_grpc_client::sglang_scheduler::SglangSchedulerClient;
 use smg::protocols::chat::ChatCompletionRequest;
 use smg::routers::grpc::utils::{process_chat_messages, generate_tool_constraints};
 

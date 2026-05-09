@@ -15,6 +15,7 @@ import psutil
 import torch
 from typing_extensions import ParamSpec
 
+from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.runtime.platforms.interface import (
     AttentionBackendEnum,
     DeviceCapability,
@@ -75,6 +76,10 @@ class CudaPlatformBase(Platform):
     device_control_env_var: str = "CUDA_VISIBLE_DEVICES"
 
     @classmethod
+    def get_local_torch_device(cls) -> torch.device:
+        return torch.device(f"cuda:{envs.LOCAL_RANK}")
+
+    @classmethod
     def get_device_capability(cls, device_id: int = 0) -> DeviceCapability | None:
         raise NotImplementedError
 
@@ -97,6 +102,86 @@ class CudaPlatformBase(Platform):
             )
             return False
         return True
+
+    @classmethod
+    @lru_cache(maxsize=1)
+    def get_modelopt_fp4_quantize_op(cls) -> Callable | None:
+        try:
+            from flashinfer import fp4_quantize
+
+            return fp4_quantize
+        except ImportError:
+            pass
+
+        try:
+            from sgl_kernel import scaled_fp4_quant as fp4_quantize
+
+            return fp4_quantize
+        except ImportError:
+            return None
+
+    @classmethod
+    @lru_cache(maxsize=1)
+    def get_modelopt_flashinfer_fp4_backend(cls) -> str:
+        backend = envs.SGLANG_DIFFUSION_FLASHINFER_FP4_GEMM_BACKEND
+        default_backend = "cudnn" if cls.is_blackwell() else "auto"
+        if backend is None:
+            return default_backend
+
+        backend = backend.lower()
+        backend = {
+            "flashinfer_cudnn": "cudnn",
+            "flashinfer_cutlass": "cutlass",
+            "flashinfer_trtllm": "trtllm",
+            "trtllm": "trtllm",
+            "cudnn": "cudnn",
+            "auto": "auto",
+        }.get(backend, backend)
+        if backend not in {"auto", "cudnn", "cutlass", "trtllm"}:
+            logger.warning(
+                "Unsupported SGLANG_DIFFUSION_FLASHINFER_FP4_GEMM_BACKEND=%r. "
+                "Falling back to %r.",
+                backend,
+                default_backend,
+            )
+            return default_backend
+        return backend
+
+    @classmethod
+    @lru_cache(maxsize=1)
+    def get_modelopt_fp4_gemm_op(cls) -> tuple[Callable | None, str | None]:
+        requested_backend = envs.SGLANG_DIFFUSION_FLASHINFER_FP4_GEMM_BACKEND
+        prefer_flashinfer = requested_backend is not None
+
+        # TODO: Remove this explicit FlashInfer preference once the sm100 CUTLASS
+        # LargeM dispatch grows a validated fallback for Blackwell NVFP4 shapes
+        # such as Wan2.2's large-M attention projections.
+        if prefer_flashinfer:
+            try:
+                from flashinfer import mm_fp4 as flashinfer_mm_fp4
+
+                return flashinfer_mm_fp4, cls.get_modelopt_flashinfer_fp4_backend()
+            except ImportError:
+                logger.warning(
+                    "Requested SGLANG_DIFFUSION_FLASHINFER_FP4_GEMM_BACKEND=%r "
+                    "but flashinfer.mm_fp4 is unavailable. Falling back to "
+                    "cutlass.",
+                    requested_backend,
+                )
+
+        try:
+            from sgl_kernel import cutlass_scaled_fp4_mm as cutlass_fp4_gemm
+
+            return cutlass_fp4_gemm, None
+        except ImportError:
+            pass
+
+        try:
+            from flashinfer import mm_fp4 as flashinfer_mm_fp4
+
+            return flashinfer_mm_fp4, cls.get_modelopt_flashinfer_fp4_backend()
+        except ImportError:
+            return None, None
 
     @classmethod
     def is_full_nvlink(cls, device_ids: list[int]) -> bool:
@@ -123,6 +208,9 @@ class CudaPlatformBase(Platform):
     ) -> float:
         if empty_cache:
             torch.cuda.empty_cache()
+
+        if torch.distributed.is_initialized():
+            device_id = torch.distributed.get_rank()
 
         device_props = torch.cuda.get_device_properties(device_id)
         if device_props.is_integrated:
@@ -215,6 +303,35 @@ class CudaPlatformBase(Platform):
                 )
                 raise ImportError(
                     "Video Sparse Attention backend is not installed."
+                ) from e
+        elif selected_backend == AttentionBackendEnum.SPARSE_VIDEO_GEN_2_ATTN:
+            try:
+                from svg.kernels.triton.permute import (  # noqa: F401
+                    apply_inverse_permutation_triton,
+                    permute_tensor_by_labels_triton,
+                )
+                from svg.kmeans_utils import (  # noqa: F401
+                    batch_kmeans_Euclid,
+                    density_calculation,
+                    dynamic_block_sparse_fwd_flashinfer,
+                    identify_dynamic_map,
+                )
+
+                from sglang.multimodal_gen.runtime.layers.attention.backends.sparse_video_gen_2_attn import (  # noqa: F401
+                    SparseVideoGen2AttentionBackend,
+                )
+
+                logger.info("Using Sparse Video Gen 2 (SAP) Attention backend")
+                return "sglang.multimodal_gen.runtime.layers.attention.backends.sparse_video_gen_2_attn.SparseVideoGen2AttentionBackend"
+            except ImportError as e:
+                logger.error(
+                    "Failed to import Sparse Video Gen 2 (SAP) Attention backend: %s",
+                    str(e),
+                )
+                raise ImportError(
+                    "Sparse Video Gen 2 (SAP) Attention backend is not installed. "
+                    "Please install it by following the instructions at "
+                    "https://github.com/svg-project/Sparse-VideoGen"
                 ) from e
         elif selected_backend == AttentionBackendEnum.VMOBA_ATTN:
             try:
@@ -397,7 +514,10 @@ class NvmlCudaPlatform(CudaPlatformBase):
     def get_device_total_memory(cls, device_id: int = 0) -> int:
         physical_device_id = device_id_to_physical_device_id(device_id)
         handle = pynvml.nvmlDeviceGetHandleByIndex(physical_device_id)
-        return int(pynvml.nvmlDeviceGetMemoryInfo(handle).total)
+        try:
+            return int(pynvml.nvmlDeviceGetMemoryInfo(handle).total)
+        except pynvml.NVMLError_NotSupported:
+            return int(torch.cuda.get_device_properties(device_id).total_memory)
 
     @classmethod
     @with_nvml_context

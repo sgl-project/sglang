@@ -25,7 +25,7 @@ GPT‑OSS can call built‑in tools for web search and Python execution. You can
 
 ### Tool & Reasoning Parser
 
-- We support OpenAI Reasoning and Tool Call parser, as well as our SGLang native api for tool call and reasoning. Refer to [reasoning parser](../advanced_features/separate_reasoning.ipynb) and [tool call parser](../advanced_features/function_calling.ipynb) for more details.
+- We support OpenAI Reasoning and Tool Call parser, as well as our SGLang native api for tool call and reasoning. Refer to [reasoning parser](../advanced_features/separate_reasoning.ipynb) and [tool parser](../advanced_features/tool_parser.ipynb) for more details.
 
 
 ## Notes
@@ -105,7 +105,7 @@ print(response.output_text)
 # Test python tool
 response = client.responses.create(
     model="openai/gpt-oss-120b",
-    instructions="You are a helfpul assistant, you could use python tool to execute code.",
+    instructions="You are a helpful assistant, you could use python tool to execute code.",
     input="Use python tool to calculate the sum of 29138749187 and 29138749187", # 58,277,498,374
     tools=tools
 )
@@ -115,7 +115,7 @@ print(response.output_text)
 # Test browser tool
 response = client.responses.create(
     model="openai/gpt-oss-120b",
-    instructions="You are a helfpul assistant, you could use browser to search the web",
+    instructions="You are a helpful assistant, you could use browser to search the web",
     input="Search the web for the latest news about Nvidia stock price",
     tools=tools
 )
