@@ -1383,7 +1383,7 @@ class ContinueGenerationReqInput(BaseReq):
     # during post-weight-update processing) back to the driver before
     # inference resumes, with no race against active streams. Set to
     # False to skip the empty_cache call.
-    empty_cache: bool = True
+    torch_empty_cache: bool = True
 
 
 @dataclass

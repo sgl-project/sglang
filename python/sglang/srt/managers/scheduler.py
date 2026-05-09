@@ -3648,7 +3648,7 @@ class Scheduler(
             self.chunked_req = None
 
     def continue_generation(self, recv_req: ContinueGenerationReqInput):
-        if recv_req.empty_cache:
+        if recv_req.torch_empty_cache:
             before_mb = torch.cuda.memory_reserved() / (1024 * 1024)
             torch.cuda.empty_cache()
             after_mb = torch.cuda.memory_reserved() / (1024 * 1024)
