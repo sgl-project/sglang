@@ -478,6 +478,9 @@ class DecodePreallocQueue:
 
     def _check_if_req_exceed_kv_capacity(self, req: Req) -> bool:
         if len(req.origin_input_ids) > self.max_total_num_tokens:
+            if self.scheduler.hisparse_coordinator is not None \
+                and len(req.origin_input_ids) <= self.scheduler.hisparse_max_req_len:
+                return False
             message = f"Request {req.rid} exceeds the maximum number of tokens: {len(req.origin_input_ids)} > {self.max_total_num_tokens}"
             logger.error(message)
             prepare_abort(req, message, status_code=HTTPStatus.BAD_REQUEST)
