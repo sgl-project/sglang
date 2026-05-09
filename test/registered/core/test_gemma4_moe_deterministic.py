@@ -8,9 +8,11 @@ index space) while `SWAKVPool.set_kv_buffer` had written them at the
 SWA-translated indices. With diverse prompts the OOB never materialises;
 the repro is same-prompt × high-concurrency, which is what this test fires.
 
-Adapted from the repro script in the bug report (200 identical completions
-at concurrency 128, `--max-running-requests 16`). Pre-fix this loses
-~40-50% of requests within ~30-40s; post-fix all 200 succeed.
+Adapted from the repro script in the bug report (originally 200 identical
+completions at concurrency 128, `--max-running-requests 16`). This test
+keeps the same same-prompt, high-concurrency shape with 180 requests to
+trim runtime. Pre-fix this loses ~40-50% of requests within ~30-40s;
+post-fix all requests succeed.
 """
 
 import concurrent.futures
@@ -27,7 +29,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=420, suite="stage-b-test-2-gpu-large")
+register_cuda_ci(est_time=107, suite="stage-b-test-2-gpu-large")
 
 
 PROMPT = (
@@ -37,7 +39,7 @@ PROMPT = (
     "egg. How much in dollars does she make every day at the farmers' market?\n"
     "Answer:"
 )
-NUM_REQUESTS = 200
+NUM_REQUESTS = 180
 CONCURRENCY = 128
 MAX_TOKENS = 256
 
