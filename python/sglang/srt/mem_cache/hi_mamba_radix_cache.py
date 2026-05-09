@@ -1484,7 +1484,21 @@ class HiMambaRadixCache(MambaRadixCache):
                 host_indices_list.append(host_indices)
             if host_indices_list:
                 host_indices = torch.cat(host_indices_list, dim=0)
+                mp = cc.mem_pool_host
+                n = host_indices.numel()
+                logger.info(
+                    "[HiCachePrefetchHostMem] host_mem_release_before_free num_indices=%s pool_size=%s available_size=%s",
+                    n,
+                    mp.size,
+                    mp.available_size(),
+                )
                 cc.mem_pool_host.free(host_indices)
+                logger.info(
+                    "[HiCachePrefetchHostMem] host_mem_release_after_free num_indices=%s pool_size=%s available_size=%s",
+                    n,
+                    mp.size,
+                    mp.available_size(),
+                )
 
         _drain_revoke()
         _drain_backup()

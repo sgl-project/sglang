@@ -511,7 +511,22 @@ class HiRadixCache(RadixCache):
                 host_indices_list.append(host_indices)
             if host_indices_list:
                 host_indices = torch.cat(host_indices_list, dim=0)
+                mp = cc.mem_pool_host
+                n = host_indices.numel()
+                avail_before = mp.available_size()
+                logger.info(
+                    "[HiCachePrefetchHostMem] host_mem_release_before_free num_indices=%s pool_size=%s available_size=%s",
+                    n,
+                    mp.size,
+                    avail_before,
+                )
                 cc.mem_pool_host.free(host_indices)
+                logger.info(
+                    "[HiCachePrefetchHostMem] host_mem_release_after_free num_indices=%s pool_size=%s available_size=%s",
+                    n,
+                    mp.size,
+                    mp.available_size(),
+                )
 
         _drain_revoke()
         _drain_backup()
@@ -1323,10 +1338,33 @@ class HiRadixCache(RadixCache):
             )
             return
 
+        mp = self.cache_controller.mem_pool_host
+        logger.info(
+            "[HiCachePrefetchHostMem] prefetch_from_storage_begin req_id=%s prefetch_length=%s pool_size=%s available_size=%s",
+            req_id,
+            prefetch_length,
+            mp.size,
+            mp.available_size(),
+        )
         last_host_node.protect_host()
         host_indices = self.cache_controller.mem_pool_host.alloc(prefetch_length)
+        evict_host_for_prefetch = False
         if host_indices is None:
+            evict_host_for_prefetch = True
+            logger.info(
+                "[HiCachePrefetchHostMem] prefetch_alloc_failed_then_radix_evict_host req_id=%s prefetch_length=%s pool_size=%s available_size=%s",
+                req_id,
+                prefetch_length,
+                mp.size,
+                mp.available_size(),
+            )
             self.evict_host(prefetch_length)
+            logger.info(
+                "[HiCachePrefetchHostMem] prefetch_after_radix_evict_host req_id=%s pool_size=%s available_size=%s",
+                req_id,
+                mp.size,
+                mp.available_size(),
+            )
             host_indices = self.cache_controller.mem_pool_host.alloc(prefetch_length)
         if host_indices is None:
             last_host_node.release_host()
@@ -1336,7 +1374,22 @@ class HiRadixCache(RadixCache):
                 req_id,
                 prefetch_length,
             )
+            logger.info(
+                "[HiCachePrefetchHostMem] prefetch_from_storage_abort req_id=%s reason=host_mem_unavailable evict_host_attempted=%s pool_size=%s available_size=%s",
+                req_id,
+                evict_host_for_prefetch,
+                mp.size,
+                mp.available_size(),
+            )
             return
+        logger.info(
+            "[HiCachePrefetchHostMem] prefetch_from_storage_alloc_ok req_id=%s prefetch_length=%s evict_host_attempted=%s pool_size=%s available_size=%s",
+            req_id,
+            prefetch_length,
+            evict_host_for_prefetch,
+            mp.size,
+            mp.available_size(),
+        )
         logger.debug(
             "[prefetch_from_storage] started rid=%s tokens=%d prefetch_length=%d "
             "last_host_node_id=%s",

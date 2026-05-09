@@ -796,8 +796,23 @@ class HiCacheController:
         if not backup_only:
             raise ValueError("Other eviction policies are not supported yet.")
 
+        n = len(host_indices)
+        mp = self.mem_pool_host
+        avail_before = mp.available_size()
+        logger.info(
+            "[HiCachePrefetchHostMem] evict_host_before_free num_indices=%s pool_size=%s available_size=%s",
+            n,
+            mp.size,
+            avail_before,
+        )
         self.mem_pool_host.free(host_indices)
-        return len(host_indices)
+        logger.info(
+            "[HiCachePrefetchHostMem] evict_host_after_free num_indices=%s pool_size=%s available_size=%s",
+            n,
+            mp.size,
+            mp.available_size(),
+        )
+        return n
 
     def prefetch(
         self,
@@ -812,6 +827,14 @@ class HiCacheController:
         """
         operation = PrefetchOperation(
             request_id, host_indices, new_input_tokens, last_hash, prefix_keys
+        )
+        mp = self.mem_pool_host
+        logger.info(
+            "[HiCachePrefetchHostMem] prefetch_enqueued req_id=%s host_indices=%s pool_size=%s available_size=%s",
+            request_id,
+            host_indices.numel(),
+            mp.size,
+            mp.available_size(),
         )
         self.prefetch_queue.put(operation)
         return operation
@@ -983,6 +1006,13 @@ class HiCacheController:
                 operation = self.prefetch_queue.get(block=True, timeout=1)
                 if operation is None:
                     continue
+                logger.info(
+                    "[HiCachePrefetchHostMem] prefetch_thread_op_begin req_id=%s pool_size=%s available_size=%s prefetch_tokens_occupied=%s",
+                    operation.request_id,
+                    self.mem_pool_host.size,
+                    self.mem_pool_host.available_size(),
+                    self.prefetch_tokens_occupied,
+                )
                 hash_value, storage_hit_count = self._storage_hit_query(operation)
                 if self.tp_world_size > 1:
                     storage_hit_count_tensor = torch.tensor(

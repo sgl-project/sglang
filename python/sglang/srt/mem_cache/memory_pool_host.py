@@ -284,7 +284,16 @@ class HostKVCache(abc.ABC):
 
     @synchronized
     def free(self, indices: torch.Tensor) -> int:
+        av_before = len(self.free_slots)
         self.free_slots = torch.cat([self.free_slots, indices.cpu()])
+        av_after = len(self.free_slots)
+        logger.debug(
+            "[HiCachePrefetchHostMem] mem_pool_host.free pool=HostKVCache num_indices=%s size=%s available_before=%s available_after=%s",
+            len(indices),
+            self.size,
+            av_before,
+            av_after,
+        )
         return len(indices)
 
 
@@ -1390,7 +1399,16 @@ class MambaPoolHost(HostKVCache):
 
     @synchronized
     def free(self, indices: torch.Tensor) -> int:
+        av_before = len(self.free_slots)
         self.free_slots = torch.cat([self.free_slots, indices])
+        av_after = len(self.free_slots)
+        logger.debug(
+            "[HiCachePrefetchHostMem] mem_pool_host.free pool=MambaPoolHost num_indices=%s size=%s available_before=%s available_after=%s",
+            len(indices),
+            self.size,
+            av_before,
+            av_after,
+        )
         return len(indices)
 
     def get_size_per_token(self):

@@ -391,6 +391,14 @@ class HybridCacheController(BaseHiCacheController):
             prefix_keys=prefix_keys,
             pool_transfers=extra_pools,
         )
+        mp = self.mem_pool_host
+        logger.info(
+            "[HiCachePrefetchHostMem] prefetch_enqueued req_id=%s host_indices=%s pool_size=%s available_size=%s",
+            request_id,
+            host_indices.numel(),
+            mp.size,
+            mp.available_size(),
+        )
         self.prefetch_queue.put(operation)
         return operation
 
