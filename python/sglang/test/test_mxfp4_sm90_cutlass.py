@@ -130,11 +130,16 @@ def _build_mock_layer(num_experts, hidden, inter, w13, w2, w13_s, w2_s, w13_b, w
     layer.w2_weight_scale = torch.nn.Parameter(w2_s.clone(), requires_grad=False)
     layer.w13_weight_bias = torch.nn.Parameter(w13_b.clone(), requires_grad=False)
     layer.w2_weight_bias = torch.nn.Parameter(w2_b.clone(), requires_grad=False)
+    layer.num_local_experts = num_experts  # tests run with EP size = 1
     layer.moe_tp_size = 1
     layer.moe_tp_rank = 0
     layer.moe_ep_size = 1
     layer.moe_ep_rank = 0
     return layer
+
+
+def _round_up(x, base):
+    return ((x + base - 1) // base) * base
 
 
 def _build_method(num_experts, hidden, inter):
@@ -143,23 +148,95 @@ def _build_method(num_experts, hidden, inter):
     method = Mxfp4MoEMethod.__new__(Mxfp4MoEMethod)
     method._fi_kernel = "cutlass_sm90"
     method.num_experts = num_experts
+    # The new SM90 cutlass path tracks padded sizes in dedicated attrs;
+    # ``hidden_size`` / ``intermediate_size_per_partition`` keep the unpadded
+    # values to mirror what ``create_weights`` records.
     method.hidden_size = hidden
     method.intermediate_size_per_partition = inter
+    method._padded_hidden = _round_up(hidden, 128)
+    method._padded_intermediate = _round_up(inter, 128)
     method.use_flashinfer = True
     return method
+
+
+def _expected_w13_processed(w13_un, w13_s_un, w13_b_un, N_pad, K_pad, group_size):
+    """Replicate ``_process_weights_for_sm90_cutlass`` for w13: de-interleave
+    HF's pair-wise ``[g_0, u_0, g_1, u_1, ...]`` layout into halved
+    ``[up; gate]``, pad each half along its row dim from ``N_un -> N_pad``
+    and last dim from ``K_un -> K_pad`` with zeros, then run the FlashInfer
+    SM90 byte / scale interleave helpers."""
+    E, two_n_un, last_un_w = w13_un.shape
+    N_un = two_n_un // 2
+    K_un = last_un_w * 2  # packed 4-bit -> *2 for raw K
+
+    def _split_and_pad(unpadded, last_pad, last_un, dtype):
+        gate = unpadded[:, 0::2, :]
+        up = unpadded[:, 1::2, :]
+        out = torch.zeros(E, 2 * N_pad, last_pad, dtype=dtype, device=unpadded.device)
+        out[:, :N_un, :last_un] = up
+        out[:, N_pad : N_pad + N_un, :last_un] = gate
+        return out
+
+    w13_pad = _split_and_pad(
+        w13_un.view(torch.uint8), K_pad // 2, K_un // 2, w13_un.dtype
+    )
+    w13_s_pad = _split_and_pad(
+        w13_s_un, K_pad // group_size, K_un // group_size, w13_s_un.dtype
+    )
+
+    gate_b = w13_b_un[:, 0::2]
+    up_b = w13_b_un[:, 1::2]
+    w13_b_pad = torch.zeros(E, 2 * N_pad, dtype=w13_b_un.dtype, device=w13_b_un.device)
+    w13_b_pad[:, :N_un] = up_b
+    w13_b_pad[:, N_pad : N_pad + N_un] = gate_b
+
+    w13_il = interleave_moe_weights_for_sm90_mixed_gemm(w13_pad, "fp4")
+    w13_s_il = interleave_moe_scales_for_sm90_mixed_gemm(
+        w13_s_pad, group_size=group_size
+    )
+    return w13_il, w13_s_il, w13_b_pad
+
+
+def _expected_w2_processed(w2_un, w2_s_un, w2_b_un, N_pad, K_pad, group_size):
+    """w2 needs padding only (no halving / no de-interleave)."""
+    E, K_un, last_un_w = w2_un.shape
+    N_un = last_un_w * 2
+
+    def _pad(unpadded, last_pad, last_un):
+        out = torch.zeros(
+            E, K_pad, last_pad, dtype=unpadded.dtype, device=unpadded.device
+        )
+        out[:, :K_un, :last_un] = unpadded
+        return out
+
+    w2_pad = _pad(w2_un.view(torch.uint8), N_pad // 2, N_un // 2)
+    w2_s_pad = _pad(w2_s_un, N_pad // group_size, N_un // group_size)
+    w2_b_pad = torch.zeros(E, K_pad, dtype=w2_b_un.dtype, device=w2_b_un.device)
+    w2_b_pad[:, :K_un] = w2_b_un
+
+    w2_il = interleave_moe_weights_for_sm90_mixed_gemm(w2_pad, "fp4")
+    w2_s_il = interleave_moe_scales_for_sm90_mixed_gemm(w2_s_pad, group_size=group_size)
+    return w2_il, w2_s_il, w2_b_pad
 
 
 @pytest.mark.parametrize(
     "num_experts,hidden,inter",
     [
+        # Aligned shapes (no padding needed).
         (4, 256, 256),
         (8, 768, 384),
         (8, 1024, 1024),
+        # Non-aligned shapes (exercise the de-interleave + pad path).
+        # 192 % 128 = 64, so N_pad = K_pad = 256 (round_up(192, 128)).
+        (4, 192, 192),
+        # GPT-OSS-20B-like: hidden=2880, inter=2880 -> padded to 2944.
+        # Use smaller E to keep memory bounded.
+        (4, 2880, 2880),
     ],
 )
 def test_process_weights_matches_direct_interleave(num_experts, hidden, inter):
-    """``_process_weights_for_sm90_cutlass`` should produce exactly the same
-    interleaved bytes / scales as direct calls to the FlashInfer helpers."""
+    """``_process_weights_for_sm90_cutlass`` must produce the same bytes as
+    a manual de-interleave + pad + halved-swap + interleave reference."""
     w13, w2, w13_s, w2_s, w13_b, w2_b = _make_random_mxfp4(num_experts, hidden, inter)
 
     layer = _build_mock_layer(
@@ -168,16 +245,21 @@ def test_process_weights_matches_direct_interleave(num_experts, hidden, inter):
     method = _build_method(num_experts, hidden, inter)
     method._process_weights_for_sm90_cutlass(layer)
 
-    # Reference: drive the helpers directly on the originals.
-    ref_w13 = interleave_moe_weights_for_sm90_mixed_gemm(w13, "fp4")
-    ref_w2 = interleave_moe_weights_for_sm90_mixed_gemm(w2, "fp4")
-    ref_w13_s = interleave_moe_scales_for_sm90_mixed_gemm(w13_s, group_size=GROUP_SIZE)
-    ref_w2_s = interleave_moe_scales_for_sm90_mixed_gemm(w2_s, group_size=GROUP_SIZE)
+    N_pad = _round_up(inter, 128)
+    K_pad = _round_up(hidden, 128)
+    ref_w13, ref_w13_s, ref_w13_b = _expected_w13_processed(
+        w13, w13_s, w13_b, N_pad, K_pad, GROUP_SIZE
+    )
+    ref_w2, ref_w2_s, ref_w2_b = _expected_w2_processed(
+        w2, w2_s, w2_b, N_pad, K_pad, GROUP_SIZE
+    )
 
     assert torch.equal(layer.w13_weight.data, ref_w13)
     assert torch.equal(layer.w2_weight.data, ref_w2)
     assert torch.equal(layer.w13_weight_scale.data, ref_w13_s)
     assert torch.equal(layer.w2_weight_scale.data, ref_w2_s)
+    assert torch.equal(layer.w13_weight_bias.data, ref_w13_b)
+    assert torch.equal(layer.w2_weight_bias.data, ref_w2_b)
 
     # SwiGLU per-expert scalars seeded with GPT-OSS defaults.
     assert torch.allclose(
@@ -193,29 +275,30 @@ def test_process_weights_matches_direct_interleave(num_experts, hidden, inter):
         torch.full((num_experts,), 7.0, dtype=torch.float32, device="cuda"),
     )
 
-    # Biases are passed through unchanged.
-    assert torch.equal(layer.w13_weight_bias.data, w13_b)
-    assert torch.equal(layer.w2_weight_bias.data, w2_b)
-
 
 @pytest.mark.parametrize(
     "tokens,num_experts,hidden,inter,top_k",
     [
+        # Aligned shapes (no padding).
         (4, 4, 256, 256, 2),
         (16, 8, 768, 384, 2),
         (32, 8, 1024, 1024, 4),
+        # Non-aligned (exercises pad x + trim output).
+        (8, 4, 192, 192, 2),
     ],
 )
 def test_apply_sm90_cutlass_matches_flashinfer_direct(
     tokens, num_experts, hidden, inter, top_k, monkeypatch
 ):
     """End-to-end: SGLang's ``_apply_sm90_cutlass`` must produce the same
-    output as a direct FlashInfer ``cutlass_fused_moe`` call with the same
-    input tensors. (Both call the same SM90 kernel under the hood.)"""
+    output as a direct FlashInfer ``cutlass_fused_moe`` call fed with the
+    same processed weights / scales / biases. The processing pipeline is
+    covered separately by ``test_process_weights_matches_direct_interleave``;
+    here we just verify that ``apply`` calls the kernel with the right
+    arguments (incl. input padding + output trim)."""
     import sglang.srt.layers.quantization.mxfp4 as mxfp4_mod
 
-    # Bypass the symmetric-memory / TP-group stack: not relevant to numerics
-    # and requires distributed init we don't have here.
+    # Bypass symmetric-memory / TP-group: not relevant to numerics.
     monkeypatch.setattr(
         mxfp4_mod, "use_symmetric_memory", lambda *a, **kw: nullcontext()
     )
@@ -237,35 +320,40 @@ def test_apply_sm90_cutlass_matches_flashinfer_direct(
         layer, x.clone(), _MockTopKOutput(topk_w, topk_i)
     ).hidden_states
 
-    # ---- FlashInfer-direct reference ----
-    ref_w13 = interleave_moe_weights_for_sm90_mixed_gemm(w13, "fp4")
-    ref_w2 = interleave_moe_weights_for_sm90_mixed_gemm(w2, "fp4")
-    ref_w13_s = interleave_moe_scales_for_sm90_mixed_gemm(w13_s, group_size=GROUP_SIZE)
-    ref_w2_s = interleave_moe_scales_for_sm90_mixed_gemm(w2_s, group_size=GROUP_SIZE)
-    swiglu_alpha = torch.full((num_experts,), 1.702, dtype=torch.float32, device="cuda")
-    swiglu_beta = torch.full((num_experts,), 1.0, dtype=torch.float32, device="cuda")
-    swiglu_limit = torch.full((num_experts,), 7.0, dtype=torch.float32, device="cuda")
+    # ---- FlashInfer-direct reference using the same processed weights ----
+    K_pad = method._padded_hidden
+    if K_pad != hidden:
+        x_padded = torch.nn.functional.pad(
+            x.clone(), (0, K_pad - hidden), mode="constant", value=0.0
+        )
+    else:
+        x_padded = x.clone()
 
-    out_ref = torch.empty(tokens, hidden, dtype=torch.bfloat16, device="cuda")
+    out_ref_padded = torch.empty(tokens, K_pad, dtype=torch.bfloat16, device="cuda")
     cutlass_fused_moe(
-        input=x.clone(),
-        token_selected_experts=topk_i,
+        input=x_padded,
+        token_selected_experts=topk_i.to(torch.int),
         token_final_scales=topk_w,
-        fc1_expert_weights=ref_w13,
-        fc2_expert_weights=ref_w2,
+        fc1_expert_weights=layer.w13_weight,
+        fc2_expert_weights=layer.w2_weight,
         output_dtype=torch.bfloat16,
-        quant_scales=[ref_w13_s.view(torch.int32), ref_w2_s.view(torch.int32)],
-        fc1_expert_biases=w13_b,
-        fc2_expert_biases=w2_b,
-        swiglu_alpha=swiglu_alpha,
-        swiglu_beta=swiglu_beta,
-        swiglu_limit=swiglu_limit,
+        quant_scales=[
+            layer.w13_weight_scale.view(torch.int32),
+            layer.w2_weight_scale.view(torch.int32),
+        ],
+        fc1_expert_biases=layer.w13_weight_bias,
+        fc2_expert_biases=layer.w2_weight_bias,
+        swiglu_alpha=layer.swiglu_alpha,
+        swiglu_beta=layer.swiglu_beta,
+        swiglu_limit=layer.swiglu_limit,
         use_w4_group_scaling=True,
         activation_type=ActivationType.Swiglu,
-        output=out_ref,
+        output=out_ref_padded,
+    )
+    out_ref = (
+        out_ref_padded[:, :hidden].contiguous() if K_pad != hidden else out_ref_padded
     )
 
-    # Same kernel, same inputs => bit-exact.
     assert torch.equal(out_sglang, out_ref), (
         f"SGLang vs FlashInfer-direct mismatch; "
         f"max abs diff = {(out_sglang.float() - out_ref.float()).abs().max().item():.4g}"
@@ -444,4 +532,6 @@ class _MockDispatchOutput:
 
 
 if __name__ == "__main__":
-    pytest.main([__file__, "-v"])
+    import sys
+
+    sys.exit(pytest.main([__file__, "-v"]))

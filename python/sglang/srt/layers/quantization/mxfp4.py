@@ -392,14 +392,25 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                     intermediate_size_per_partition, triton_kernels_padding_alignment
                 )
         elif self._fi_kernel == "cutlass_sm90":
-            # cutlass mixed-input GEMM contraction dim K must be a multiple of
-            # group_size * (128 // group_size) == 128 (interleave factor for
-            # MXFP4 group_size=32 is 4). K equals hidden_size for w13 and
-            # intermediate_size for w2.
-            intermediate_size_per_partition_after_pad = round_up(
-                intermediate_size_per_partition, 128
-            )
-            hidden_size = round_up(hidden_size, 128)
+            # cutlass mixed-input GEMM contraction dim K must be % 128 == 0
+            # (interleave factor for MXFP4 group_size=32 is 4). The kernel
+            # also expects ``fc1_expert_weights`` in halved ``[up; gate]``
+            # layout, which means the padding boundary must fall on the
+            # gate / up split.
+            #
+            # The mxfp4 weight loader (FusedMoE.weight_loader fast path) does
+            # a NAIVE copy of HF's ``[2*intermediate_size, hidden_packed]``
+            # tensor into the buffer's ``[:dim1, :dim2]`` slice. Padding the
+            # buffer here would push the gate/up boundary, so HF's "up"
+            # rows would land in the buffer's "gate" half and vice versa.
+            # Marlin sidesteps this by not padding; we do the same and
+            # rebuild a properly-padded buffer in
+            # ``_process_weights_for_sm90_cutlass`` after the load completes.
+            self._padded_intermediate = round_up(intermediate_size_per_partition, 128)
+            self._padded_hidden = round_up(hidden_size, 128)
+            # create_weights below uses the *unpadded* sizes so the loader's
+            # naive-copy fast path is correct.
+            intermediate_size_per_partition_after_pad = intermediate_size_per_partition
         elif _use_aiter:
 
             intermediate_size_per_partition_after_pad = round_up(
@@ -791,51 +802,129 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         torch.cuda.empty_cache()
 
     def _process_weights_for_sm90_cutlass(self, layer):
-        """Prepare MXFP4 weights/scales/biases for FlashInfer's SM90
-        ``cutlass_fused_moe(use_w4_group_scaling=True)`` path (PR #3084).
+        """De-interleave + pad + halving-swap + byte-interleave MXFP4 weights
+        for FlashInfer's SM90 ``cutlass_fused_moe(use_w4_group_scaling=True)``
+        path (PR #3084).
 
-        The SM90 mixed-input kernel reads weights in a byte-interleaved layout
-        and scales in a reshaped layout; FlashInfer ships per-call helpers that
-        perform exactly the transform the kernel expects. We replace the
-        loaded tensors in place so subsequent ``apply`` calls are free of any
-        per-step preprocessing.
+        The cutlass kernel needs (a) K (contraction dim) % 128 == 0, and (b)
+        ``fc1_expert_weights`` in halved ``[up; gate]`` order -- the
+        ``compute_with_experts`` reference in FlashInfer's
+        ``test_trtllm_cutlass_fused_moe.py`` splits
+        ``w3, w1 = chunk(W, 2, dim=0)`` and uses w3 as up, w1 as gate.
+
+        GPT-OSS's HF layout is *interleaved* ``[g_0, u_0, g_1, u_1, ..., g_{N-1}, u_{N-1}]``
+        (each pair occupies two adjacent rows). The mxfp4 weight loader does
+        a naive copy, so our unpadded buffer is interleaved post-load. We
+        de-interleave (even rows -> gate, odd rows -> up), pad each half from
+        N_un to N_pad, concatenate as halved ``[up; gate]``, and then run
+        FlashInfer's byte / scale interleave helpers.
         """
         sf_block_size = 32  # MXFP4 group size
 
-        # Per-expert SwiGLU scalars. Hardcoded to match the SM100 trtllm-gen
-        # path in this file (alpha=1.702, beta=1.0, limit=7.0). GPT-OSS uses
-        # these defaults; if other models start using flashinfer_mxfp4 on SM90,
-        # plumb these through `moe_runner_config.gemm1_alpha` etc.
+        # Sizes from the unpadded loaded buffers.
+        N_un = layer.w13_weight.shape[1] // 2  # intermediate (unpadded)
+        K_un = (
+            layer.w13_weight.shape[2] * 2
+        )  # hidden (unpadded, *2 because packed 4-bit)
+        N_pad = self._padded_intermediate
+        K_pad = self._padded_hidden
+        # Use the local expert count (matches the existing buffer allocation in
+        # create_weights) so the SM90 cutlass path remains correct under
+        # Expert Parallelism. `self.num_experts` is the *global* count.
+        E = layer.num_local_experts
+        device = layer.w13_weight.device
+        bias_dtype = layer.w13_weight_bias.dtype
+
+        # ---- De-interleave + pad w13 weight/scale/bias to halved [up; gate]
+        # Even rows of HF = gate, odd rows = up. After splitting we pad each
+        # half along its row dim (N) from N_un to N_pad with zeros, and along
+        # its last dim (K) from K_un (or K_un / sf_block_size) to K_pad.
+
+        def _stack_up_gate_w13(unpadded_w13, last_pad, last_un):
+            # unpadded_w13: [E, 2*N_un, last_un]
+            # Returns: [E, 2*N_pad, last_pad] in [up_padded; gate_padded] order.
+            gate_rows = unpadded_w13[:, 0::2, :]  # [E, N_un, last_un]
+            up_rows = unpadded_w13[:, 1::2, :]  # [E, N_un, last_un]
+            out = torch.zeros(
+                E, 2 * N_pad, last_pad, dtype=unpadded_w13.dtype, device=device
+            )
+            # First half: up (with row + col padding zeros).
+            out[:, :N_un, :last_un] = up_rows
+            # Second half: gate.
+            out[:, N_pad : N_pad + N_un, :last_un] = gate_rows
+            return out
+
+        w13_padded = _stack_up_gate_w13(
+            layer.w13_weight.data.view(torch.uint8), K_pad // 2, K_un // 2
+        )
+        w13_scale_padded = _stack_up_gate_w13(
+            layer.w13_weight_scale.data,
+            K_pad // sf_block_size,
+            K_un // sf_block_size,
+        )
+        # Bias: same de-interleave on dim=-1.
+        w13_bias_gate = layer.w13_weight_bias.data[:, 0::2]  # [E, N_un]
+        w13_bias_up = layer.w13_weight_bias.data[:, 1::2]  # [E, N_un]
+        w13_bias_padded = torch.zeros(E, 2 * N_pad, dtype=bias_dtype, device=device)
+        w13_bias_padded[:, :N_un] = w13_bias_up
+        w13_bias_padded[:, N_pad : N_pad + N_un] = w13_bias_gate
+
+        def _pad_w2_3d(unpadded, last_pad, last_un):
+            out = torch.zeros(E, K_pad, last_pad, dtype=unpadded.dtype, device=device)
+            out[:, :K_un, :last_un] = unpadded[:, :K_un, :]
+            return out
+
+        # ---- w2 (no halving, just pad to [E, K_pad, N_pad/2]) ----------------
+        w2_padded = _pad_w2_3d(
+            layer.w2_weight.data.view(torch.uint8), N_pad // 2, N_un // 2
+        )
+        w2_scale_padded = _pad_w2_3d(
+            layer.w2_weight_scale.data,
+            N_pad // sf_block_size,
+            N_un // sf_block_size,
+        )
+        w2_bias_padded = torch.zeros(E, K_pad, dtype=bias_dtype, device=device)
+        w2_bias_padded[:, :K_un] = layer.w2_weight_bias.data
+
+        # ---- Per-expert SwiGLU scalars (GPT-OSS defaults) ------------------
         layer.swiglu_alpha = Parameter(
-            torch.full((self.num_experts,), 1.702, dtype=torch.float32, device="cuda"),
+            torch.full((E,), 1.702, dtype=torch.float32, device=device),
             requires_grad=False,
         )
         layer.swiglu_beta = Parameter(
-            torch.full((self.num_experts,), 1.0, dtype=torch.float32, device="cuda"),
+            torch.full((E,), 1.0, dtype=torch.float32, device=device),
             requires_grad=False,
         )
         layer.swiglu_limit = Parameter(
-            torch.full((self.num_experts,), 7.0, dtype=torch.float32, device="cuda"),
+            torch.full((E,), 7.0, dtype=torch.float32, device=device),
             requires_grad=False,
         )
 
-        # Byte-interleave the packed 4-bit weights (C++ kernel).
-        w13_il = interleave_moe_weights_for_sm90_mixed_gemm(
-            layer.w13_weight.data, "fp4"
+        # ---- FlashInfer SM90 byte / scale interleave -----------------------
+        # The padded buffers above are contiguous by construction (allocated
+        # via torch.zeros + slice assignment), so we feed them straight in.
+        layer.w13_weight = Parameter(
+            interleave_moe_weights_for_sm90_mixed_gemm(w13_padded, "fp4"),
+            requires_grad=False,
         )
-        w2_il = interleave_moe_weights_for_sm90_mixed_gemm(layer.w2_weight.data, "fp4")
-        # Reshape+permute the E8M0 block scales (pure PyTorch).
-        w13_s_il = interleave_moe_scales_for_sm90_mixed_gemm(
-            layer.w13_weight_scale.data, group_size=sf_block_size
+        layer.w2_weight = Parameter(
+            interleave_moe_weights_for_sm90_mixed_gemm(w2_padded, "fp4"),
+            requires_grad=False,
         )
-        w2_s_il = interleave_moe_scales_for_sm90_mixed_gemm(
-            layer.w2_weight_scale.data, group_size=sf_block_size
+        layer.w13_weight_scale = Parameter(
+            interleave_moe_scales_for_sm90_mixed_gemm(
+                w13_scale_padded, group_size=sf_block_size
+            ),
+            requires_grad=False,
         )
-
-        layer.w13_weight = Parameter(w13_il, requires_grad=False)
-        layer.w2_weight = Parameter(w2_il, requires_grad=False)
-        layer.w13_weight_scale = Parameter(w13_s_il, requires_grad=False)
-        layer.w2_weight_scale = Parameter(w2_s_il, requires_grad=False)
+        layer.w2_weight_scale = Parameter(
+            interleave_moe_scales_for_sm90_mixed_gemm(
+                w2_scale_padded, group_size=sf_block_size
+            ),
+            requires_grad=False,
+        )
+        layer.w13_weight_bias = Parameter(w13_bias_padded, requires_grad=False)
+        layer.w2_weight_bias = Parameter(w2_bias_padded, requires_grad=False)
 
         torch.cuda.empty_cache()
 
@@ -869,27 +958,39 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         path (PR #3084). The fused kernel does GEMM1 + SwiGLU + GEMM2 in one
         call; weights/scales were pre-interleaved at load time."""
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
+        from sglang.srt.layers.moe.topk import TopKOutputChecker, select_experts
 
+        # Under ``--moe-runner-backend flashinfer_mxfp4`` the SGLang TopK layer
+        # emits BypassedTopKOutput by default (the SM100 trtllm-gen kernel does
+        # routing internally). The cutlass kernel needs explicit topk_ids /
+        # topk_weights, so materialize them here when bypassed.
+        if TopKOutputChecker.format_is_bypassed(topk_output):
+            topk_output = select_experts(
+                hidden_states=x,
+                router_logits=topk_output.router_logits,
+                topk_config=topk_output.topk_config,
+            )
         topk_weights, topk_ids = topk_output.topk_weights, topk_output.topk_ids
 
         # Pad input hidden dim to the (already-padded) loaded weight width.
         origin_hidden = x.shape[-1]
-        if self.hidden_size != origin_hidden:
+        padded_hidden = self._padded_hidden
+        if padded_hidden != origin_hidden:
             x = torch.nn.functional.pad(
                 x,
-                (0, self.hidden_size - origin_hidden),
+                (0, padded_hidden - origin_hidden),
                 mode="constant",
                 value=0.0,
             )
 
         output_dtype = torch.bfloat16
-        # Output is allocated at padded width (kernel writes self.hidden_size
+        # Output is allocated at padded width (kernel writes padded_hidden
         # columns), then trimmed back to origin_hidden before returning.
         with use_symmetric_memory(
             get_tp_group(), disabled=not is_allocation_symmetric()
         ):
             out_padded = torch.empty(
-                x.shape[0], self.hidden_size, dtype=output_dtype, device=x.device
+                x.shape[0], padded_hidden, dtype=output_dtype, device=x.device
             )
 
         flashinfer_cutlass_fused_moe(
@@ -918,7 +1019,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             output=out_padded,
         )
 
-        if self.hidden_size != origin_hidden:
+        if padded_hidden != origin_hidden:
             out = out_padded[:, :origin_hidden].contiguous()
         else:
             out = out_padded
