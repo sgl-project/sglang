@@ -577,6 +577,7 @@ def mhc_pre_big_fuse_with_norm_tilelang(
             # (matches the rounding the reference path does when RMSNorm reads bf16).
             output_shared = T.alloc_shared(hidden_size, T.bfloat16)
             sumsq_per_pos = T.alloc_fragment(hidden_block, T.float32)
+            T.clear(sumsq_per_pos)
 
             for i0_h in T.Pipelined(hidden_size // hidden_block, num_stages=3):
                 xs = T.alloc_shared((hc_mult, hidden_block), T.bfloat16)
