@@ -18,6 +18,7 @@ def moe_fused_mul_sum_kernel(
     is_ep: tl.constexpr,
     top_k: tl.constexpr,
     size: tl.constexpr,
+    routed_scaling_factor: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_K: tl.constexpr,
 ):
@@ -38,6 +39,8 @@ def moe_fused_mul_sum_kernel(
 
     for n in tl.static_range(top_k):
         b_val = tl.load(b_base + n, mask=m_mask, other=0.0).to(tl.float32)
+        if routed_scaling_factor != 1.0:
+            b_val = b_val * routed_scaling_factor
         if has_expert_map:
             id_val = tl.load(top_ids_ptr + offs_m * top_k + n, mask=m_mask, other=0)
             expert_mask = tl.load(expert_map_ptr + id_val) >= 0
@@ -145,6 +148,7 @@ def moe_fused_mul_sum(
     outputs: torch.Tensor | None = None,
     topk_ids: torch.Tensor | None = None,
     expert_map: torch.Tensor | None = None,
+    routed_scaling_factor: float | None = None,
     is_ep: bool = False,
 ) -> torch.Tensor:
     """
@@ -202,6 +206,7 @@ def moe_fused_mul_sum(
             is_ep,
             top_k,
             size,
+            1.0 if routed_scaling_factor is None else routed_scaling_factor,
             BLOCK_M,
             BLOCK_K,
             num_warps=num_warps,

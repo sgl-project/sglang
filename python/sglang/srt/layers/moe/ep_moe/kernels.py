@@ -112,6 +112,7 @@ def deepep_post_reorder_triton_kernel(
     topk_weights_ptr,
     topk,
     hidden_size,
+    routed_scaling_factor: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
     InDtype = down_output_ptr.dtype.element_ty
@@ -130,6 +131,8 @@ def deepep_post_reorder_triton_kernel(
             dst_idx = tl.load(src2dst_ptr + idx).to(tl.int64)
             if dst_idx >= 0:
                 weigh_scale = tl.load(topk_weights_ptr + idx).to(InDtype)
+                if routed_scaling_factor != 1.0:
+                    weigh_scale = weigh_scale * routed_scaling_factor
                 load_ptr = down_output_ptr + dst_idx * hidden_size
                 in_data = tl.load(load_ptr + offset, mask=mask)
                 sum_vec += in_data * weigh_scale
@@ -1507,6 +1510,7 @@ def moe_unpermute(
     src2dst: torch.Tensor,
     topk_ids: torch.Tensor,
     topk_weights: torch.Tensor,
+    routed_scaling_factor: float | None = None,
     outputs: torch.Tensor | None = None,
 ) -> torch.Tensor:
     num_tokens = topk_ids.size(0)
@@ -1526,6 +1530,7 @@ def moe_unpermute(
         topk_weights,
         topk_ids.size(1),
         inputs.size(1),
+        1.0 if routed_scaling_factor is None else routed_scaling_factor,
         BLOCK_SIZE=512,
     )
 
