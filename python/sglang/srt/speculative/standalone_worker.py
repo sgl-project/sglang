@@ -9,6 +9,9 @@ from sglang.srt.layers.moe.utils import (
 )
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.speculative.adaptive_runtime_state import (
+    AdaptiveController,
+)
 from sglang.srt.speculative.eagle_worker import EAGLEWorker
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import draft_tp_context, load_token_map
@@ -47,6 +50,9 @@ class StandaloneWorker(EAGLEWorker):
         self.speculative_algorithm = SpeculativeAlgorithm.from_string(
             server_args.speculative_algorithm
         )
+
+        # TODO: Adaptive speculative
+        self.adaptive_controller: Optional[AdaptiveController] = None
 
         # Override the context length of the draft model to be the same as the target model.
         server_args.context_length = target_worker.model_runner.model_config.context_len

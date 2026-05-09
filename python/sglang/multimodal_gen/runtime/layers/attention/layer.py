@@ -478,6 +478,10 @@ class USPAttention(nn.Module):
                 k = _usp_input_all_to_all(k, head_dim=2)
                 v = _usp_input_all_to_all(v, head_dim=2)
 
+            # If NCCL timeout/deadlock occurs here, check whether
+            # attn_mask is inconsistent across SP ranks (None on some, Tensor on
+            # others), which causes all_gather participant mismatch. Upstream
+            # mask builders must ensure all ranks produce the same mask type.
             gathered_mask = sequence_model_parallel_all_gather(
                 attn_mask.contiguous(), dim=1
             )

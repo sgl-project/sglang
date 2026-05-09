@@ -15,7 +15,7 @@ from fastapi import Request
 from fastapi.responses import ORJSONResponse, StreamingResponse
 from jsonschema import Draft202012Validator, SchemaError
 
-from sglang.srt.entrypoints.openai.encoding_dsv32 import encode_messages
+from sglang.srt.entrypoints.openai import encoding_dsv4, encoding_dsv32
 from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionRequest,
     ChatCompletionResponse,
@@ -39,12 +39,14 @@ from sglang.srt.entrypoints.openai.protocol import (
 from sglang.srt.entrypoints.openai.serving_base import OpenAIServingBase
 from sglang.srt.entrypoints.openai.usage_processor import UsageProcessor
 from sglang.srt.entrypoints.openai.utils import (
+    cached_tokens_details_from_dict,
     process_cached_tokens_details_from_ret,
     process_hidden_states_from_ret,
     process_routed_experts_from_ret,
     should_include_usage,
     to_openai_style_logprobs,
 )
+from sglang.srt.environ import envs
 from sglang.srt.function_call.core_types import ToolCallItem
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.function_call.json_array_parser import JsonArrayParser
@@ -192,6 +194,19 @@ class OpenAIServingChat(OpenAIServingBase):
         self.template_manager = template_manager
         self.tool_call_parser = self.tokenizer_manager.server_args.tool_call_parser
         self.reasoning_parser = self.tokenizer_manager.server_args.reasoning_parser
+        self._reasoning_detector = None
+        if self.reasoning_parser:
+            try:
+                rp = ReasoningParser(
+                    model_type=self.reasoning_parser, stream_reasoning=True
+                )
+                self._reasoning_detector = rp.detector
+            except ValueError as e:
+                logger.warning(
+                    "Failed to initialize reasoning detector for parser '%s': %s",
+                    self.reasoning_parser,
+                    e,
+                )
 
         # Get default sampling parameters from model's generation config
         self.default_sampling_params = (
@@ -218,7 +233,9 @@ class OpenAIServingChat(OpenAIServingBase):
             and self.tokenizer_manager.model_config.hf_config.model_type == "gemma4"
         )
 
-        self.use_dpsk_v32_encoding = self._use_dpsk_v32_encoding()
+        # Which Python-based chat encoder (if any) bypasses apply_chat_template.
+        # Values: "dsv32", "dsv4", or None.
+        self.chat_encoding_spec = self._resolve_chat_encoding_spec()
 
     def _handle_last_assistant_message(
         self,
@@ -276,14 +293,25 @@ class OpenAIServingChat(OpenAIServingBase):
             encoded = encoded[1:]
         return prompt_ids + encoded
 
-    def _use_dpsk_v32_encoding(self) -> bool:
+    def _resolve_chat_encoding_spec(self) -> Optional[str]:
+        if self.tool_call_parser == "deepseekv4":
+            return "dsv4"
+        if self.tool_call_parser == "deepseekv32":
+            return "dsv32"
+
+        architectures = self.tokenizer_manager.model_config.hf_config.architectures
+        arch = architectures[0] if architectures else ""
+
+        if "DeepseekV4" in arch:
+            return "dsv4"
+
         has_chat_template = (
             self.tokenizer_manager.tokenizer is not None
             and self.tokenizer_manager.tokenizer.chat_template is not None
         )
-        architectures = self.tokenizer_manager.model_config.hf_config.architectures
-        is_dpsk_v32 = "DeepseekV3" in architectures[0] if architectures else False
-        return not has_chat_template and is_dpsk_v32
+        if "DeepseekV3" in arch and not has_chat_template:
+            return "dsv32"
+        return None
 
     def _request_id_prefix(self) -> str:
         return "chatcmpl-"
@@ -434,6 +462,13 @@ class OpenAIServingChat(OpenAIServingBase):
 
         self._patch_mistral_skip_special_tokens(request)
 
+        thinking_mode = self._get_reasoning_from_request(request)
+        # SGLang's ReasonerGrammarBackend owns the reasoning prefix
+        # when --reasoning-parser is configured, so builtin xgrammar
+        # tags must describe only the post-reasoning tool-call suffix.
+        xgrammar_reasoning = thinking_mode and (
+            self.tokenizer_manager.server_args.reasoning_parser is not None
+        )
         tool_call_constraint = None
 
         # Apply chat template and its stop strings
@@ -453,6 +488,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 tool_call_constraint = parser.get_structure_constraint(
                     request.tool_choice,
                     parallel_tool_calls=request.parallel_tool_calls,
+                    thinking_mode=xgrammar_reasoning,
                 )
             # Fallback: use generic JSON schema for required/named tool choice
             # only when no parser-specific constraint was set
@@ -493,14 +529,22 @@ class OpenAIServingChat(OpenAIServingBase):
 
         template_content_format = self.template_manager.jinja_template_content_format
 
-        if self.use_dpsk_v32_encoding:
-            thinking_mode = (
-                "thinking"
-                if (request.chat_template_kwargs or {}).get("thinking")
-                else "chat"
+        if self.chat_encoding_spec is not None:
+            # Per-request wins; env is fallback default for benchmark
+            # workflows that can't pass per-request chat_template_kwargs.
+            thinking_requested = (request.chat_template_kwargs or {}).get(
+                "thinking", envs.SGLANG_DEFAULT_THINKING.get()
             )
-            messages = request.messages
-            messages = [msg.model_dump() for msg in messages]
+            thinking_mode = "thinking" if thinking_requested else "chat"
+            messages = [msg.model_dump() for msg in request.messages]
+
+            # dsv4/dsv32 are text-only and consume string content; flatten
+            # OpenAI parts-list content here so the encoder sees a plain string.
+            for i, msg in enumerate(messages):
+                if isinstance(msg.get("content"), list):
+                    messages[i] = process_content_for_template_format(
+                        msg, "string", [], [], [], []
+                    )
 
             for msg in messages:
                 if msg.get("content") is None:
@@ -512,7 +556,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     video_data,
                     audio_data,
                     modalities,
-                    use_dpsk_v32_encoding=self.use_dpsk_v32_encoding,
+                    use_dpsk_v32_encoding=self.chat_encoding_spec == "dsv32",
                 )
                 msg.update(processed_msg)
 
@@ -526,7 +570,32 @@ class OpenAIServingChat(OpenAIServingBase):
                 messages.insert(0, {"role": "system", "content": ""})
             if request.tools:
                 messages[0]["tools"] = [tool.model_dump() for tool in request.tools]
-            real_input = encode_messages(messages, thinking_mode=thinking_mode)
+
+            if self.chat_encoding_spec == "dsv4":
+                # V4 encoder only accepts "max" / "high" / None.
+                # OpenAI protocol defaults to "medium" which V4 rejects; drop it.
+                # Fallback: if request didn't set it, try env SGLANG_DSV4_REASONING_EFFORT.
+                effort_source = request.reasoning_effort
+                if effort_source is None:
+                    env_val = envs.SGLANG_DSV4_REASONING_EFFORT.get()
+                    if env_val:
+                        effort_source = env_val
+                v4_reasoning_effort = (
+                    effort_source if effort_source in ("max", "high") else None
+                )
+                if request.task is not None:
+                    encoding_dsv4.attach_task_to_last_user_message(
+                        messages, request.task
+                    )
+                real_input = encoding_dsv4.encode_messages(
+                    messages,
+                    thinking_mode=thinking_mode,
+                    reasoning_effort=v4_reasoning_effort,
+                )
+            else:
+                real_input = encoding_dsv32.encode_messages(
+                    messages, thinking_mode=thinking_mode
+                )
             prompt_ids = self.tokenizer_manager.tokenizer.encode(real_input)
 
             # Append assistant prefix if continue_final_message is enabled
@@ -674,10 +743,11 @@ class OpenAIServingChat(OpenAIServingBase):
                 prompt = prompt[: -len(conv.sep2)]
         else:
             prompt = conv.get_prompt()
-            if self._get_reasoning_from_request(
-                request
-            ) and self.reasoning_parser not in ["qwen3", "qwen3-thinking", "glm4"]:
-                # qwen3 and glm4 think internally without a leading <think> token
+            if self._get_reasoning_from_request(request) and (
+                self._reasoning_detector is None
+                or not self._reasoning_detector.thinks_internally
+            ):
+                # Models with thinks_internally=True think without a leading <think> token
                 prompt += "<think>"  # Note(Xinyuan): hard code thinking token
 
         image_data = conv.image_data if conv.image_data else None
@@ -758,6 +828,7 @@ class OpenAIServingChat(OpenAIServingBase):
         cached_tokens = {}
         hidden_states = {}
         routed_experts = {}
+        cached_tokens_details = {}
 
         stream_started = False
         try:
@@ -781,6 +852,9 @@ class OpenAIServingChat(OpenAIServingBase):
                 cached_tokens[index] = content["meta_info"].get("cached_tokens", 0)
                 hidden_states[index] = content["meta_info"].get("hidden_states", None)
                 routed_experts[index] = content["meta_info"].get("routed_experts", None)
+                cached_tokens_details[index] = content["meta_info"].get(
+                    "cached_tokens_details", None
+                )
 
                 # Handle logprobs
                 choice_logprobs = None
@@ -955,20 +1029,32 @@ class OpenAIServingChat(OpenAIServingBase):
                         )
                         yield f"data: {hidden_states_chunk.model_dump_json()}\n\n"
 
+            sglext_routed = None
             if request.return_routed_experts and routed_experts:
-                # Get first non-None routed_experts value
-                first_routed_experts = next(
+                sglext_routed = next(
                     (v for v in routed_experts.values() if v is not None), None
                 )
-                if first_routed_experts is not None:
-                    routed_experts_chunk = ChatCompletionStreamResponse(
-                        id=content["meta_info"]["id"],
-                        created=int(time.time()),
-                        choices=[],  # sglext is at response level
-                        model=request.model,
-                        sglext=SglExt(routed_experts=first_routed_experts),
-                    )
-                    yield f"data: {routed_experts_chunk.model_dump_json()}\n\n"
+
+            sglext_details = None
+            if request.return_cached_tokens_details and cached_tokens_details:
+                first_details = next(
+                    (v for v in cached_tokens_details.values() if v is not None), None
+                )
+                if first_details is not None:
+                    sglext_details = cached_tokens_details_from_dict(first_details)
+
+            if sglext_routed is not None or sglext_details is not None:
+                sglext_chunk = ChatCompletionStreamResponse(
+                    id=content["meta_info"]["id"],
+                    created=int(time.time()),
+                    choices=[],  # sglext is at response level
+                    model=request.model,
+                    sglext=SglExt(
+                        routed_experts=sglext_routed,
+                        cached_tokens_details=sglext_details,
+                    ),
+                )
+                yield f"data: {sglext_chunk.model_dump_json()}\n\n"
 
             # Additional usage chunk
             if include_usage:
@@ -1370,54 +1456,75 @@ class OpenAIServingChat(OpenAIServingBase):
             request.skip_special_tokens = False
 
     def _get_reasoning_from_request(self, request: ChatCompletionRequest) -> bool:
-        """Judge whether the request needs reasoning for hybrid reasoning models
+        """Determine whether reasoning mode should be enabled for this request.
+
         NOTE: This is predefined based on model's chat template
         """
         if not self.reasoning_parser:
             return False
 
-        if self.reasoning_parser == "deepseek-v3":
-            # Models that require explicit enable thinking (thinking=True)
-            return (
-                request.chat_template_kwargs is not None
-                and request.chat_template_kwargs.get("thinking") is True
-            )
-        if self.reasoning_parser == "gemma4":
-            return (
-                request.chat_template_kwargs is not None
-                and request.chat_template_kwargs.get("enable_thinking") is True
-            )
-        if self.reasoning_parser in ["kimi_k2"]:
-            # Models that thinking by default, and can be disabled by setting thinking=False
-            return (
-                not request.chat_template_kwargs
-                or request.chat_template_kwargs.get("thinking") is not False
-            )
-        if self.reasoning_parser in ["qwen3", "glm45", "nemotron_3", "interns1"]:
-            # Models that thinking by default, and can be disabled by setting enable_thinking=False
-            return (
-                not request.chat_template_kwargs
-                or request.chat_template_kwargs.get("enable_thinking") is not False
-            )
-        if self.reasoning_parser in ["mimo"]:
-            # Models that require explicit enable thinking (enable_thinking=True)
-            return (
-                request.chat_template_kwargs is not None
-                and request.chat_template_kwargs.get("enable_thinking") is True
-            )
         if self.reasoning_parser == "hunyuan":
             # Hy3-preview template emits no <think> when reasoning_effort is
             # "no_think" / "none" / unset; forcing reasoning would route all
             # output into reasoning_content.
             return request.reasoning_effort not in (None, "none", "no_think")
-        if self.reasoning_parser == "mistral":
-            # Mistral only reasons when reasoning_effort is explicitly set
-            # to a non-"none" value (typically "high").
+
+        config = self.template_manager.reasoning_config
+        if config is None:
+            # Fallback to parser-level defaults when template toggle config
+            # cannot be inferred (e.g., parser-only <think> templates).
+            mode = (
+                self._reasoning_detector.reasoning_default
+                if self._reasoning_detector is not None
+                else None
+            )
+            if mode is None:
+                return False
+            if mode == "always":
+                return True
+            if mode == "mistral":
+                return (
+                    request.reasoning_effort is not None
+                    and request.reasoning_effort != "none"
+                )
+            if mode in ("thinking", "enable_thinking"):
+                return (
+                    not request.chat_template_kwargs
+                    or request.chat_template_kwargs.get(mode) is not False
+                )
+            if mode in ("explicit_thinking", "explicit_enable_thinking"):
+                toggle = mode.replace("explicit_", "")
+                return (
+                    request.chat_template_kwargs is not None
+                    and request.chat_template_kwargs.get(toggle) is True
+                )
+            logger.warning(
+                "Unknown reasoning_default mode '%s', defaulting to reasoning disabled",
+                mode,
+            )
+            return False
+
+        if config.special_case == "always":
+            return True
+
+        if config.special_case == "mistral":
             return (
                 request.reasoning_effort is not None
                 and request.reasoning_effort != "none"
             )
-        return True  # default
+
+        if config.toggle_param is None or config.default_enabled is None:
+            return False
+
+        if config.default_enabled:
+            return (
+                not request.chat_template_kwargs
+                or request.chat_template_kwargs.get(config.toggle_param) is not False
+            )
+        return (
+            request.chat_template_kwargs is not None
+            and request.chat_template_kwargs.get(config.toggle_param) is True
+        )
 
     async def _process_tool_call_stream(
         self,
