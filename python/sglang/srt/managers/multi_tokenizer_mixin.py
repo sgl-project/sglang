@@ -441,10 +441,6 @@ class TokenizerWorker(TokenizerManager):
         self.disaggregation_transfer_backend = TransferBackend(
             self.server_args.disaggregation_transfer_backend
         )
-        # Communicator
-        self.register_multi_tokenizer_communicator = FanOutCommunicator(
-            self.send_to_scheduler, 2
-        )
 
         # Register this worker with the router for pause/continue broadcasting
         reg = TokenizerWorkerRegistration(worker_ipc_name=self.tokenizer_ipc_name)
