@@ -148,7 +148,7 @@ jobs:
               - ".github/workflows/pr-test-multimodal-gen.yml"
               - "python/pyproject.toml"
               - "python/sglang/multimodal_gen/**/!(*.md|*.ipynb)"
-              - "python/sglang/jit_kernel/diffusion/**"
+              - "python/sglang/jit_kernel/**"
               - "python/sglang/jit_kernel/tests/diffusion/**"
               - "python/sglang/jit_kernel/benchmark/diffusion/**"
               - "python/sglang/cli/**"
