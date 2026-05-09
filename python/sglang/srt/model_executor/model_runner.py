@@ -1474,7 +1474,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 )
             self._publish_modelexpress_metadata()
 
-        get_offloader().post_init()
+        if not self.is_draft_worker:
+            get_offloader().post_init()
 
         # Register model for layerwise NVTX profiling if enabled
         if self.server_args.enable_layerwise_nvtx_marker:

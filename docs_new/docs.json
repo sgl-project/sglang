@@ -895,6 +895,7 @@
                   "docs/hardware-platforms/ascend-npus/ascend_npu_qwen3_examples",
                   "docs/hardware-platforms/ascend-npus/mindspore_backend",
                   "docs/hardware-platforms/ascend-npus/ascend_contribution_guide",
+                  "docs/hardware-platforms/ascend-npus/ascend_npu_support_new_models",
                   "docs/hardware-platforms/ascend-npus/ascend_npu_best_practice",
                   "docs/hardware-platforms/ascend-npus/ascend_npu_ring_sp_performance",
                   "docs/hardware-platforms/ascend-npus/ascend_npu_qwen3_5_examples",
@@ -1106,7 +1107,7 @@
                   {
                     "group": "LTX",
                     "pages": [
-                      "cookbook/diffusion/LTX/LTX"
+                      "cookbook/diffusion/LTX/LTX2 & LTX2.3"
                     ]
                   },
                   {
