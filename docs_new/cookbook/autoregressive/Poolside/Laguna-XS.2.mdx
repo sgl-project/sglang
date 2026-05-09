@@ -93,8 +93,8 @@ For details, see the [Hugging Face model card](https://huggingface.co/poolside/L
 
 ## 2. SGLang Installation
 
-<Warning title="Pending upstream merge">
-Native Laguna-XS.2 support is currently in [sgl-project/sglang#24204](https://github.com/sgl-project/sglang/pull/24204). Until that PR is merged and a tagged release is published, the install commands below pull SGLang from the PR head — the `dev-*-pr-24204` Docker tags built by the [`release-docker-dev`](https://github.com/sgl-project/sglang/blob/main/.github/workflows/release-docker-dev.yml) workflow, or a pip install of the PR ref. Once #24204 ships in a tagged release, swap the `dev-*-pr-24204` tags for `lmsysorg/sglang:v<X>` and the `git+https://...@refs/pull/24204/head` install for `pip install "sglang[all]==<X>"`.
+<Warning title="Awaiting tagged release">
+Native Laguna-XS.2 support landed on `main` in [sgl-project/sglang#24204](https://github.com/sgl-project/sglang/pull/24204) on 2026-05-08 (merge commit `096ad02b0`). A stable PyPI/Docker release containing it has not shipped yet, so the install commands below use the `dev-*-pr-24204` Docker tags published by the [`release-docker-dev`](https://github.com/sgl-project/sglang/blob/main/.github/workflows/release-docker-dev.yml) workflow and a dated nightly wheel pinned to the merge commit. Once the next stable release ships (e.g. `v0.5.12`), swap the `dev-*-pr-24204` tags for `lmsysorg/sglang:v<X>` and `sglang[all]==0.5.12.dev20260509+g096ad02b0` for `sglang[all]==<X>`.
 </Warning>
 
 Refer to the [official SGLang installation guide](../../../docs/get-started/install) for general install methods.
@@ -152,18 +152,21 @@ docker run --gpus all --shm-size 32g \
 
 ### 2.2 PyPI
 
-The PR is not yet on PyPI. Install SGLang directly from the PR head until #24204 ships in a tagged release:
+A stable PyPI release containing Laguna-XS.2 has not shipped yet. Install the dated nightly wheel pinned to the merge commit (`096ad02b0`), served from the [SGLang nightly index](https://github.com/sgl-project/whl):
 
 ```bash Command
 python3 -m pip install --upgrade pip
-python3 -m pip install "sglang[all] @ git+https://github.com/sgl-project/sglang.git@refs/pull/24204/head#subdirectory=python"
+python3 -m pip install --extra-index-url https://docs.sglang.ai/whl/cu130 \
+  "sglang[all]==0.5.12.dev20260509+g096ad02b0"
 ```
 
-After the PR is merged and released (e.g. `v0.5.11`), replace the install above with:
+For CUDA 12 hosts, swap the index URL to `https://docs.sglang.ai/whl/cu129`. The published nightly wheels are `cp310` only — install into a Python 3.10 environment (e.g. `uv venv --python 3.10`).
+
+After the next stable release ships (e.g. `v0.5.12`), replace the install above with:
 
 ```bash Command
 python3 -m pip install --upgrade pip
-python3 -m pip install "sglang[all]==0.5.11"
+python3 -m pip install "sglang[all]==0.5.12"
 ```
 
 **Launch the server (BF16):**
@@ -367,7 +370,7 @@ I'll check the current weather in Tokyo for you.
 - Hardware: NVIDIA H200 (1×H200 for TP=1, 4×H200 for TP=4)
 - Model: `poolside/Laguna-XS.2` (BF16)
 - Tensor Parallelism: 1 / 4
-- SGLang Version: `0.0.0.dev1+g3553fd032` (PR #24204 branch `model/laguna-xs2`)
+- SGLang Version: `0.5.12.dev20260509+g096ad02b0` (nightly wheel containing the #24204 merge commit; same code path as the original PR runs)
 - Reasoning Parser: `poolside_v1`
 - Tool Call Parser: `poolside_v1`
 - Sampling: `temperature=0.6`, `max_tokens=16384`, `chat_template_kwargs={"enable_thinking": true}`, `n_repeats=1`
@@ -388,7 +391,7 @@ I'll check the current weather in Tokyo for you.
 
 - Hardware: NVIDIA H200 (1×H200 for TP=1, 4×H200 for TP=4)
 - Model: `poolside/Laguna-XS.2` (BF16)
-- SGLang Version: `0.0.0.dev1+g3553fd032` (PR #24204 branch `model/laguna-xs2`)
+- SGLang Version: `0.5.12.dev20260509+g096ad02b0` (nightly wheel containing the #24204 merge commit; same code path as the original PR runs)
 - Workload: `sglang.bench_serving --backend sglang --dataset-name random` (defaults: `--random-input-len 1024 --random-output-len 1024 --random-range-ratio 0.0`)
 - Server flags identical to the accuracy runs above.
 
