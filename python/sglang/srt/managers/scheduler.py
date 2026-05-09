@@ -612,9 +612,20 @@ class Scheduler(
             reasoning_parser = ReasoningParser(
                 model_type=self.server_args.reasoning_parser, stream_reasoning=False
             )
-            self.model_config.think_end_id = self.tokenizer.encode(
+            think_end_ids = self.tokenizer.encode(
                 reasoning_parser.detector.think_end_token, add_special_tokens=False
-            )[0]
+            )
+            if not think_end_ids:
+                raise ValueError(
+                    f"think_end_token '{reasoning_parser.detector.think_end_token}' "
+                    f"could not be encoded by the tokenizer."
+                )
+            if len(think_end_ids) != 1:
+                raise ValueError(
+                    f"think_end_token '{reasoning_parser.detector.think_end_token}' "
+                    "must encode to exactly one token for constrained reasoning."
+                )
+            self.model_config.think_end_id = think_end_ids[0]
 
     def init_mamba_backend(self) -> None:
         initialize_mamba_selective_state_update_backend(self.server_args)
