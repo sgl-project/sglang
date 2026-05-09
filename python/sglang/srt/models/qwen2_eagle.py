@@ -136,11 +136,17 @@ class Qwen2ForCausalLMEagle(Qwen2ForCausalLM):
             )
         self.logits_processor = LogitsProcessor(config)
 
-    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
-        for name, loaded_weight in weights:
-            if "lm_head" not in name:
-                name = "model." + name
-                super().load_weights([(name, loaded_weight)])
+    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> set[str]:
+        # EAGLE checkpoints are flat (no leading ``model.``) and ship an
+        # ``lm_head`` tensor we always discard — the head is tied to the base
+        # model in spec decoding.
+        def remap(weights):
+            for name, w in weights:
+                if "lm_head" in name:
+                    continue
+                yield "model." + name, w
+
+        return super().load_weights(remap(weights))
 
 
 EntryClass = [Qwen2ForCausalLMEagle]

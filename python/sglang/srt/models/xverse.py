@@ -39,7 +39,11 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from sglang.srt.model_executor.model_runner import ForwardBatch
-from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.model_loader.auto_loader import (
+    STACKED_PARAMS_MAPPING_LLAMA,
+    AutoWeightsLoader,
+    default_stacked_params_load,
+)
 from sglang.srt.utils import add_prefix
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
@@ -297,6 +301,9 @@ class XverseModel(nn.Module):
         hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states
 
+    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> set[str]:
+        return default_stacked_params_load(self, weights, STACKED_PARAMS_MAPPING_LLAMA)
+
 
 class XverseForCausalLM(nn.Module):
     def __init__(
@@ -332,51 +339,14 @@ class XverseForCausalLM(nn.Module):
     def load_weights(
         self, weights: Iterable[Tuple[str, torch.Tensor]], name=None, loaded_weight=None
     ):
-        stacked_params_mapping = [
-            # (param_name, shard_name, shard_id)
-            ("qkv_proj", "q_proj", "q"),
-            ("qkv_proj", "k_proj", "k"),
-            ("qkv_proj", "v_proj", "v"),
-            ("gate_up_proj", "gate_proj", 0),
-            ("gate_up_proj", "up_proj", 1),
-        ]
-        params_dict = dict(self.named_parameters())
-
-        def load_weights_per_param(name, loaded_weight):
-            if "rotary_emb.inv_freq" in name or "projector" in name:
-                return
-            if "rotary_emb.cos_cached" in name or "rotary_emb.sin_cached" in name:
-                # Models trained using ColossalAI may include these tensors in
-                # the checkpoint. Skip them.
-                return
-            for param_name, weight_name, shard_id in stacked_params_mapping:
-                if weight_name not in name:
-                    continue
-                name = name.replace(weight_name, param_name)
-                # Skip loading extra bias for GPTQ models.
-                if name.endswith(".bias") and name not in params_dict:
-                    continue
-                if name.startswith("model.vision_tower") and name not in params_dict:
-                    continue
-                param = params_dict[name]
-                weight_loader = param.weight_loader
-                weight_loader(param, loaded_weight, shard_id)
-                break
-            else:
-                # Skip loading extra bias for GPTQ models.
-                if name.endswith(".bias") and name not in params_dict:
-                    return
-                if name.startswith("model.vision_tower") and name not in params_dict:
-                    return
-                param = params_dict[name]
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                weight_loader(param, loaded_weight)
-
-        if name is None or loaded_weight is None:
-            for name, loaded_weight in weights:
-                load_weights_per_param(name, loaded_weight)
-        else:
-            load_weights_per_param(name, loaded_weight)
+        if name is not None and loaded_weight is not None:
+            weights = [(name, loaded_weight)]
+        loader = AutoWeightsLoader(
+            self,
+            skip_substrs=["projector"],
+            ignore_unexpected_prefixes=["model.vision_tower."],
+        )
+        return loader.load_weights(weights)
 
 
 EntryClass = XverseForCausalLM

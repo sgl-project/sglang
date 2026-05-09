@@ -16,7 +16,11 @@ from sglang.srt.layers.radix_attention import AttentionType, RadixAttention
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.srt.managers.schedule_batch import MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.model_loader.auto_loader import (
+    AutoWeightsLoader,
+    WeightsMapper,
+    default_stacked_params_load,
+)
 
 
 class WhisperAttention(torch.nn.Module):
@@ -286,6 +290,17 @@ class WhisperEncoder(torch.nn.Module):
         )
         self.layer_norm = torch.nn.LayerNorm(config.d_model)
 
+    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> set[str]:
+        return default_stacked_params_load(
+            self,
+            weights,
+            [
+                (".self_attn.qkv_proj", ".self_attn.q_proj", "q"),
+                (".self_attn.qkv_proj", ".self_attn.k_proj", "k"),
+                (".self_attn.qkv_proj", ".self_attn.v_proj", "v"),
+            ],
+        )
+
     def forward(
         self,
         input_features: torch.Tensor,
@@ -336,6 +351,19 @@ class WhisperDecoder(torch.nn.Module):
 
         self.layer_norm = torch.nn.LayerNorm(config.d_model)
 
+    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> set[str]:
+        return default_stacked_params_load(
+            self,
+            weights,
+            [
+                (".self_attn.qkv_proj", ".self_attn.q_proj", "q"),
+                (".self_attn.qkv_proj", ".self_attn.k_proj", "k"),
+                (".self_attn.qkv_proj", ".self_attn.v_proj", "v"),
+                (".encoder_attn.kv_proj", ".encoder_attn.k_proj", "k"),
+                (".encoder_attn.kv_proj", ".encoder_attn.v_proj", "v"),
+            ],
+        )
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -373,15 +401,6 @@ class WhisperForConditionalGeneration(torch.nn.Module):
         self.config = config
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
-        stacked_params_mapping = [
-            (".self_attn.qkv_proj", ".self_attn.q_proj", "q"),
-            (".self_attn.qkv_proj", ".self_attn.k_proj", "k"),
-            (".self_attn.qkv_proj", ".self_attn.v_proj", "v"),
-            (".encoder_attn.kv_proj", ".encoder_attn.k_proj", "k"),
-            (".encoder_attn.kv_proj", ".encoder_attn.v_proj", "v"),
-        ]
-
-        params_dict = dict(self.named_parameters())
         weights_dict = dict(weights)
 
         # Whisper has no k_proj bias, create zeros
@@ -398,25 +417,11 @@ class WhisperForConditionalGeneration(torch.nn.Module):
             "model.decoder.embed_tokens.weight"
         ]
 
-        for name, loaded_weight in weights_dict.items():
-            name = name.replace("model.", "")
-
-            for param_name, weight_name, shard_id in stacked_params_mapping:
-                if weight_name not in name:
-                    continue
-                name = name.replace(weight_name, param_name)
-                if name not in params_dict:
-                    break
-                param = params_dict[name]
-                weight_loader = param.weight_loader
-                weight_loader(param, loaded_weight, shard_id)
-                break
-            else:
-                if name not in params_dict:
-                    continue
-                param = params_dict[name]
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                weight_loader(param, loaded_weight)
+        loader = AutoWeightsLoader(self)
+        return loader.load_weights(
+            weights_dict.items(),
+            mapper=WeightsMapper(orig_to_new_prefix={"model.": ""}),
+        )
 
     def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
         # Prepend dummy encoder tokens so that prepare_encoder_info_extend

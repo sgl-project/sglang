@@ -37,7 +37,7 @@ from sglang.srt.managers.schedule_batch import (
     MultimodalInputs,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.model_loader.auto_loader import AutoWeightsLoader, WeightsMapper
 from sglang.srt.models.idefics2 import Idefics2VisionTransformer
 from sglang.srt.models.llama import LlamaForCausalLM
 from sglang.srt.models.phi4mm_audio import AudioEmbedding
@@ -478,61 +478,39 @@ class Phi4MMForCausalLM(nn.Module):
     def should_apply_lora(self, module_name: str) -> bool:
         return bool(self.lora_pattern.match(module_name))
 
-    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
-        stacked_params_mapping = [
-            # (param_name, shard_name, shard_id)
-            (".self_attn.qkv_proj", ".self_attn.q_proj", "q"),
-            (".self_attn.qkv_proj", ".self_attn.k_proj", "k"),
-            (".self_attn.qkv_proj", ".self_attn.v_proj", "v"),
-        ]
-        prefix_mapping = {
-            "model.embed_tokens_extend.audio_embed.audio_projection.vision.": "embed_tokens_extend.audio_projection_for_vision.",
-            "model.embed_tokens_extend.audio_embed.audio_projection.speech.": "embed_tokens_extend.audio_projection.",
-            "model.embed_tokens_extend.audio_embed.": "embed_tokens_extend.",
-            "model.embed_tokens_extend.image_embed.": "vision_encoder.",
-            "model.": "language_model.model.",
-        }
-
-        skip_list = [
-            "img_processor.encoder.layers.26",
-            "img_processor.head",
-            "img_processor.post_layernorm",
-        ]
-
-        def _should_skip(name: str) -> bool:
-            return any(substr in name for substr in skip_list)
-
-        params_dict = dict(self.named_parameters())
-        for name, loaded_weight in weights:
-            # Skip the last layer
-            if _should_skip(name):
-                continue
-
-            for old_name, new_name in prefix_mapping.items():
-                if name.startswith(old_name):
-                    name = name.replace(old_name, new_name)
-                    break
-
-            # Adapt to VisionAttention
-            name = name.replace(r"self_attn.out_proj", r"self_attn.proj")
-            name = name.replace(r"base_layer.", r"")
-
-            for param_name, weight_name, shard_id in stacked_params_mapping:
-                if weight_name not in name:
-                    continue
-                name = name.replace(weight_name, param_name)
-                param = params_dict[name]
-                weight_loader = param.weight_loader
-                weight_loader(param, loaded_weight, shard_id)
-                break
-            else:
-                param = params_dict.get(name)
-                if param is None:
-                    if "lora" not in name:
-                        logger.warning(f"Warning: {name} not found in model parameters")
-                    continue
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                weight_loader(param, loaded_weight)
+    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> set[str]:
+        # Phi4MM ships extra checkpoint shards we don't materialize:
+        #   * the last vision layer (idx 26) plus head / post_layernorm — used
+        #     only at training time in the original repo.
+        #   * LoRA-adapter weights — handled separately by the LoRA loader.
+        # The checkpoint also reorders the embed-extension subtrees; rewrite
+        # them onto the runtime python attributes here. ``self_attn.out_proj``
+        # is the HF/timm name for what ``VisionAttention`` exposes as
+        # ``self_attn.proj``. ``lm_head.*`` lives under the inner
+        # ``LlamaForCausalLM``; route it there explicitly.
+        mapper = WeightsMapper(
+            orig_to_new_prefix={
+                "model.embed_tokens_extend.audio_embed.audio_projection.vision.": "embed_tokens_extend.audio_projection_for_vision.",
+                "model.embed_tokens_extend.audio_embed.audio_projection.speech.": "embed_tokens_extend.audio_projection.",
+                "model.embed_tokens_extend.audio_embed.": "embed_tokens_extend.",
+                "model.embed_tokens_extend.image_embed.": "vision_encoder.",
+                "lm_head.": "language_model.lm_head.",
+                "model.": "language_model.model.",
+            },
+            orig_to_new_substr={
+                "self_attn.out_proj": "self_attn.proj",
+                "base_layer.": "",
+            },
+        )
+        return AutoWeightsLoader(
+            self,
+            skip_substrs=[
+                "img_processor.encoder.layers.26",
+                "img_processor.head",
+                "img_processor.post_layernorm",
+                "lora",
+            ],
+        ).load_weights(weights, mapper=mapper)
 
 
 EntryClass = [Phi4MMForCausalLM]

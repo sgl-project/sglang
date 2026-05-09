@@ -24,9 +24,10 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.model_loader.weight_utils import (
-    default_weight_loader,
-    maybe_remap_kv_scale_name,
+from sglang.srt.model_loader.auto_loader import (
+    STACKED_PARAMS_MAPPING_LLAMA,
+    AutoWeightsLoader,
+    default_moe_load,
 )
 from sglang.srt.utils import add_prefix, make_layers
 
@@ -405,7 +406,6 @@ class PhiMoEModel(nn.Module):
         prefix: str = "",
     ):
         super().__init__()
-
         self.config = config
         self.quant_config = quant_config
         self.vocab_size = config.vocab_size
@@ -447,6 +447,20 @@ class PhiMoEModel(nn.Module):
 
         hidden_states = self.norm(hidden_states)
         return hidden_states
+
+    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> set[str]:
+        expert_params_mapping = FusedMoE.make_expert_params_mapping(
+            ckpt_gate_proj_name="w1",
+            ckpt_down_proj_name="w2",
+            ckpt_up_proj_name="w3",
+            num_experts=self.config.num_local_experts,
+        )
+        return default_moe_load(
+            self,
+            weights,
+            stacked_params_mapping=STACKED_PARAMS_MAPPING_LLAMA,
+            expert_params_mapping=expert_params_mapping,
+        )
 
 
 class PhiMoEForCausalLM(nn.Module):
@@ -498,62 +512,11 @@ class PhiMoEForCausalLM(nn.Module):
         else:
             return self.pooler(hidden_states, forward_batch)
 
-    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
-        stacked_params_mapping = [
-            # (param_name, shard_name, shard_id)
-            ("qkv_proj", "q_proj", "q"),
-            ("qkv_proj", "k_proj", "k"),
-            ("qkv_proj", "v_proj", "v"),
-        ]
-
-        expert_params_mapping = FusedMoE.make_expert_params_mapping(
-            ckpt_gate_proj_name="w1",
-            ckpt_down_proj_name="w2",
-            ckpt_up_proj_name="w3",
-            num_experts=self.config.num_local_experts,
+    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> set[str]:
+        skip_prefixes = ["lm_head."] if self.config.tie_word_embeddings else None
+        return AutoWeightsLoader(self, skip_prefixes=skip_prefixes).load_weights(
+            weights
         )
-
-        params_dict = dict(self.named_parameters())
-        for name, loaded_weight in weights:
-            for param_name, weight_name, shard_id in stacked_params_mapping:
-                if weight_name not in name:
-                    continue
-                name = name.replace(weight_name, param_name)
-                if name.endswith(".bias") and name not in params_dict:
-                    continue
-                param = params_dict[name]
-                weight_loader = param.weight_loader
-                weight_loader(param, loaded_weight, shard_id)
-                break
-            else:
-                for mapping in expert_params_mapping:
-                    param_name, weight_name, expert_id, shard_id = mapping
-                    if weight_name not in name:
-                        continue
-                    name = name.replace(weight_name, param_name)
-                    param = params_dict[name]
-                    weight_loader = param.weight_loader
-                    weight_loader(
-                        param,
-                        loaded_weight,
-                        name,
-                        shard_id=shard_id,
-                        expert_id=expert_id,
-                    )
-                    break
-                else:
-                    if name.endswith(".bias") and name not in params_dict:
-                        continue
-                    # Remapping the name of FP8 kv-scale.
-                    name = maybe_remap_kv_scale_name(name, params_dict)
-                    if name is None:
-                        continue
-
-                    param = params_dict[name]
-                    weight_loader = getattr(
-                        param, "weight_loader", default_weight_loader
-                    )
-                    weight_loader(param, loaded_weight)
 
 
 EntryClass = PhiMoEForCausalLM

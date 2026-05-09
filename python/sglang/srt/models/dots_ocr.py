@@ -17,7 +17,7 @@ from sglang.srt.managers.mm_utils import (
 )
 from sglang.srt.managers.schedule_batch import MultimodalDataItem, MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.model_loader.auto_loader import AutoWeightsLoader, WeightsMapper
 from sglang.srt.models.dots_vlm_vit import DotsVisionTransformer
 from sglang.srt.models.qwen2 import Qwen2ForCausalLM
 from sglang.srt.utils import add_prefix
@@ -131,38 +131,40 @@ class DotsOCRForCausalLM(nn.Module):
         )
         return hidden_states
 
-    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
-        """Load weights for the model, separating vision and language weights"""
-        weights = list(weights)
+    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> set[str]:
+        """Load weights for the model using the AutoWeightsLoader walker."""
 
-        # Separate vision tower weights and language model weights
-        vision_weights = []
-        language_weights = []
+        def _pad_vision(stream):
+            for name, w in stream:
+                if name.startswith("vision_tower."):
+                    # Pad uses the post-rename name (visual.* + qkv_proj).
+                    renamed = name.replace("vision_tower.", "visual.").replace(
+                        "attn.qkv.", "attn.qkv_proj."
+                    )
+                    yield name, self._pad_vit_attn_dummy_heads(renamed, w)
+                else:
+                    yield name, w
 
-        for name, loaded_weight in weights:
-            if name.startswith("vision_tower."):
-                vision_name = name.replace(r"attn.qkv.", r"attn.qkv_proj.")
-
-                vision_weights.append((vision_name, loaded_weight))
-            else:
-                # All other weights go to language model
-                language_weights.append((name, loaded_weight))
-
-        # Load vision tower weights
-        vision_state_dict = dict(vision_weights)
-        params_dict = dict(self.named_parameters(remove_duplicate=False))
-
-        for name, loaded_weight in vision_state_dict.items():
-            name = name.replace("vision_tower", "visual")
-            if name not in params_dict:
-                raise ValueError(f"Weight {name} not found in params_dict")
-            param = params_dict[name]
-            weight_loader = getattr(param, "weight_loader", default_weight_loader)
-            loaded_weight = self._pad_vit_attn_dummy_heads(name, loaded_weight)
-            weight_loader(param, loaded_weight)
-
-        if language_weights:
-            self.model.load_weights(language_weights)
+        # Checkpoint conventions:
+        #   * ``vision_tower.<...>`` → runtime ``self.visual``
+        #   * ``attn.qkv`` → runtime ``attn.qkv_proj`` (VisionAttention).
+        # Top-level ``model.*`` and ``lm_head.*`` are wrapped under the
+        # runtime ``self.model = Qwen2ForCausalLM(...)`` python attribute,
+        # so route them through ``model.<...>``.
+        mapper = WeightsMapper(
+            orig_to_new_substr={"attn.qkv.": "attn.qkv_proj."},
+            orig_to_new_prefix={
+                "vision_tower.": "visual.",
+                "model.": "model.model.",
+                "lm_head.": "model.lm_head.",
+            },
+        )
+        # ``self.lm_head`` is either a tied alias of ``self.model.embed_tokens``
+        # (handled by the inner ``Qwen2ForCausalLM.load_weights``) or a
+        # never-loaded duplicate; either way nothing in the checkpoint targets
+        # the outer attribute after the mapper rewrites ``lm_head.`` →
+        # ``model.lm_head.``.
+        return AutoWeightsLoader(self).load_weights(_pad_vision(weights), mapper=mapper)
 
     def get_embed_and_head(self):
         return self.model.embed_tokens.weight, self.lm_head.weight

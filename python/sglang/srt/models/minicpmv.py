@@ -57,8 +57,11 @@ from sglang.srt.managers.schedule_batch import (
     MultimodalInputs,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_loader.auto_loader import (
+    WeightsMapper,
+    default_stacked_params_load,
+)
 from sglang.srt.model_loader.utils import set_default_torch_dtype
-from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.idefics2 import Idefics2VisionTransformer
 from sglang.srt.models.llama import LlamaConfig, LlamaForCausalLM
 from sglang.srt.models.qwen2 import Qwen2Config, Qwen2ForCausalLM
@@ -1345,6 +1348,18 @@ class MiniCPMV4_5(MiniCPMBaseModel):
 _SUPPORT_VERSION = {(2, 6): MiniCPMV2_6, (4, 0): MiniCPMV4_0, (4, 5): MiniCPMV4_5}
 
 
+_MINICPMV_STACKED_PARAMS_MAPPING: list = [
+    (".qkv_proj", ".q_proj", "q"),
+    (".qkv_proj", ".k_proj", "k"),
+    (".qkv_proj", ".v_proj", "v"),
+    (".gate_up_proj", ".gate_proj", 0),
+    (".gate_up_proj", ".up_proj", 1),
+]
+_MINICPMV_NAME_MAPPER = WeightsMapper(
+    orig_to_new_substr={"self_attn.out_proj": "self_attn.proj"},
+)
+
+
 class MiniCPMV:
     """
     Different versions of MiniCPMV use different visual encoders and LLMs,
@@ -1404,55 +1419,25 @@ class MiniCPMV:
         return self.minicpmv(*args, **kwargs)
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
-        stacked_params_mapping = [
-            # (param_name, shard_name, shard_id)
-            ("qkv_proj", "q_proj", "q"),
-            ("qkv_proj", "k_proj", "k"),
-            ("qkv_proj", "v_proj", "v"),
-            ("gate_up_proj", "gate_proj", 0),
-            ("gate_up_proj", "up_proj", 1),
-        ]
+        skip_substrs = (
+            "rotary_emb.inv_freq~",
+            "projector",
+            "rotary_emb.cos_cached",
+            "rotary_emb.sin_cached",
+        )
 
-        params_dict = dict(self.minicpmv.named_parameters())
-        for name, loaded_weight in weights:
-            if "rotary_emb.inv_freq~" in name or "projector" in name:
-                continue
-            if "rotary_emb.cos_cached" in name or "rotary_emb.sin_cached" in name:
-                # Models trained using ColossalAI may include these tensors in
-                # the checkpoint. Skip them.
-                continue
-            if name.startswith("model.vision_tower") and name not in params_dict:
-                continue
-
-            # adapt to VisionAttention
-            name = name.replace(r"self_attn.out_proj", r"self_attn.proj")
-
-            if "sampler" in name:
-                param = params_dict[name]
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                weight_loader(param, loaded_weight)
-                continue
-
-            for param_name, weight_name, shard_id in stacked_params_mapping:
-                # replace the name and load with customized loader
-                if weight_name not in name:
+        def _filter(
+            ws: Iterable[Tuple[str, torch.Tensor]],
+        ) -> Iterable[Tuple[str, torch.Tensor]]:
+            for name, w in ws:
+                if any(s in name for s in skip_substrs):
                     continue
-                name = name.replace(weight_name, param_name)
-                # # Skip loading extra bias for GPTQ models.
-                if name.endswith(".bias") and name not in params_dict:
-                    continue
-                param = params_dict[name]
-                weight_loader = param.weight_loader
-                weight_loader(param, loaded_weight, shard_id)
-                break
-            else:
-                # Skip loading extra bias for GPTQ models.
-                if name.endswith(".bias") and name not in params_dict:
-                    continue
+                yield name, w
 
-                param = params_dict[name]
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                weight_loader(param, loaded_weight)
+        weights = _MINICPMV_NAME_MAPPER.apply(_filter(weights))
+        return default_stacked_params_load(
+            self.minicpmv, weights, _MINICPMV_STACKED_PARAMS_MAPPING
+        )
 
 
 EntryClass = MiniCPMV

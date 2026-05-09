@@ -37,17 +37,25 @@ from sglang.srt.layers.pooler import Pooler, PoolingType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
-from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
+from sglang.srt.layers.utils import PPMissingLayer
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
-from sglang.srt.model_loader.weight_utils import (
-    default_weight_loader,
-    kv_cache_scales_loader,
-    maybe_remap_kv_scale_name,
+from sglang.srt.model_loader.auto_loader import (
+    AutoWeightsLoader,
+    default_stacked_params_load,
 )
+from sglang.srt.model_loader.weight_utils import kv_cache_scales_loader
+
+# Arcee fuses Q/K/V into qkv_proj but does NOT fuse gate/up — its MLP is
+# unfused, so the standard Llama mapping doesn't apply.
+_ARCEE_STACKED_PARAMS_MAPPING = [
+    (".qkv_proj", ".q_proj", "q"),
+    (".qkv_proj", ".k_proj", "k"),
+    (".qkv_proj", ".v_proj", "v"),
+]
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import add_prefix, make_layers
 
@@ -368,6 +376,9 @@ class ArceeModel(nn.Module):
                     "Self attention has no KV cache scaling factor attribute!"
                 )
 
+    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> set[str]:
+        return default_stacked_params_load(self, weights, _ARCEE_STACKED_PARAMS_MAPPING)
+
 
 class ArceeForCausalLM(nn.Module):
     # BitandBytes specific attributes
@@ -475,55 +486,12 @@ class ArceeForCausalLM(nn.Module):
     def get_input_embeddings(self) -> nn.Embedding:
         return self.model.embed_tokens
 
-    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
-        params_dict = dict(self.named_parameters())
-
-        for name, loaded_weight in weights:
-            layer_id = get_layer_id(name)
-            if (
-                layer_id is not None
-                and hasattr(self.model, "start_layer")
-                and (
-                    layer_id < self.model.start_layer
-                    or layer_id >= self.model.end_layer
-                )
-            ):
-                continue
-            if "rotary_emb.inv_freq" in name or "projector" in name:
-                continue
-            if "rotary_emb.cos_cached" in name or "rotary_emb.sin_cached" in name:
-                continue
-
-            # Handle FP8 kv-scale remapping
-            if "scale" in name:
-                name = maybe_remap_kv_scale_name(name, params_dict)
-                if name is None:
-                    continue
-
-            is_stacked = False
-            for param_name, weight_name, shard_id in self.stacked_params_mapping:
-                if weight_name not in name:
-                    continue
-
-                name = name.replace(weight_name, param_name)
-                if name not in params_dict:
-                    continue
-
-                param = params_dict[name]
-                weight_loader = param.weight_loader
-                weight_loader(param, loaded_weight, shard_id)
-                is_stacked = True
-                break
-
-            if not is_stacked:
-                if name in params_dict:
-                    param = params_dict[name]
-                    weight_loader = getattr(
-                        param, "weight_loader", default_weight_loader
-                    )
-                    weight_loader(param, loaded_weight)
-                else:
-                    logger.warning(f"Parameter {name} not found in model.")
+    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> set[str]:
+        loader = AutoWeightsLoader(
+            self,
+            skip_substrs=["projector"],
+        )
+        return loader.load_weights(weights)
 
     def load_kv_cache_scales(self, quantization_param_path: str) -> None:
         self.model.load_kv_cache_scales(quantization_param_path)

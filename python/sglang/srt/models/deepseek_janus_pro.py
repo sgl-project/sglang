@@ -53,7 +53,10 @@ from sglang.srt.managers.mm_utils import (
 )
 from sglang.srt.managers.schedule_batch import MultimodalDataItem, MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.model_loader.auto_loader import (
+    WeightsMapper,
+    default_stacked_params_load,
+)
 from sglang.srt.models.llama import LlamaForCausalLM
 from sglang.utils import logger
 
@@ -1915,6 +1918,21 @@ class MultiModalityPreTrainedModel(PreTrainedModel):
     _skip_keys_device_placement = "past_key_values"
 
 
+_JANUS_STACKED_PARAMS_MAPPING: List[Tuple[str, str, object]] = [
+    (".qkv_proj", ".q_proj", "q"),
+    (".qkv_proj", ".k_proj", "k"),
+    (".qkv_proj", ".v_proj", "v"),
+    (".gate_up_proj", ".gate_proj", 0),
+    (".gate_up_proj", ".up_proj", 1),
+]
+_JANUS_NAME_MAPPER = WeightsMapper(
+    orig_to_new_substr={
+        "self_attn.out_proj": "self_attn.proj",
+        "attn.qkv.": "attn.qkv_proj.",
+    }
+)
+
+
 # Copied and adapted from:
 # https://github.com/deepseek-ai/Janus/tree/main/janus/models/modeling_vlm.py
 class MultiModalityCausalLM(MultiModalityPreTrainedModel):
@@ -2007,56 +2025,25 @@ class MultiModalityCausalLM(MultiModalityPreTrainedModel):
         return helper.pad_input_tokens(input_ids, image_inputs)
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
-        stacked_params_mapping = [
-            # (param_name, shard_name, shard_id)
-            (".qkv_proj", ".q_proj", "q"),
-            (".qkv_proj", ".k_proj", "k"),
-            (".qkv_proj", ".v_proj", "v"),
-            ("gate_up_proj", "gate_proj", 0),
-            ("gate_up_proj", "up_proj", 1),
-        ]
-
-        params_dict = dict(self.named_parameters())
-        for name, loaded_weight in weights:
-            if "rotary_emb.inv_freq~" in name or "projector" in name:
-                continue
-            if "rotary_emb.cos_cached" in name or "rotary_emb.sin_cached" in name:
-                # Models trained using ColossalAI may include these tensors in
-                # the checkpoint. Skip them.
-                continue
-            if name.startswith("model.vision_tower") and name not in params_dict:
-                continue
-
+        skip_substrs = (
+            "rotary_emb.inv_freq~",
+            "projector",
+            "rotary_emb.cos_cached",
+            "rotary_emb.sin_cached",
             # skip generation sub model
-            if "gen" in name:
-                continue
+            "gen",
+        )
 
-            # adapt to VisionAttention
-            name = name.replace(r"self_attn.out_proj", r"self_attn.proj")
-            if "vision_model.vision_tower" in name:
-                name = name.replace("attn.qkv", "attn.qkv_proj")
-
-            for param_name, weight_name, shard_id in stacked_params_mapping:
-                # replace the name and load with customized loader
-                if weight_name not in name:
+        def _filter(
+            ws: Iterable[Tuple[str, torch.Tensor]],
+        ) -> Iterable[Tuple[str, torch.Tensor]]:
+            for name, w in ws:
+                if any(s in name for s in skip_substrs):
                     continue
-                name = name.replace(weight_name, param_name)
+                yield name, w
 
-                # # Skip loading extra bias for GPTQ models.
-                if name.endswith(".bias") and name not in params_dict:
-                    continue
-                param = params_dict[name]
-                weight_loader = getattr(param, "weight_loader", None)
-                weight_loader(param, loaded_weight, shard_id)
-                break
-            else:
-                # Skip loading extra bias for GPTQ models.
-                if name.endswith(".bias") and name not in params_dict:
-                    continue
-
-                param = params_dict[name]
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                weight_loader(param, loaded_weight)
+        weights = _JANUS_NAME_MAPPER.apply(_filter(weights))
+        return default_stacked_params_load(self, weights, _JANUS_STACKED_PARAMS_MAPPING)
 
 
 AutoModel.register(config_class=MultiModalityConfig, model_class=MultiModalityCausalLM)

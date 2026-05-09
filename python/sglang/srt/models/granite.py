@@ -41,7 +41,11 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.model_loader.auto_loader import (
+    STACKED_PARAMS_MAPPING_LLAMA,
+    AutoWeightsLoader,
+    default_stacked_params_load,
+)
 from sglang.srt.utils import add_prefix
 from sglang.utils import get_exception_traceback
 
@@ -301,6 +305,9 @@ class GraniteModel(nn.Module):
         hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states
 
+    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> set[str]:
+        return default_stacked_params_load(self, weights, STACKED_PARAMS_MAPPING_LLAMA)
+
 
 class GraniteForCausalLM(nn.Module):
     def __init__(
@@ -376,57 +383,17 @@ class GraniteForCausalLM(nn.Module):
         params_dict = dict(self.named_parameters())
         return len(params_dict)
 
-    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
-        stacked_params_mapping = [
-            # (param_name, shard_name, shard_id)
-            (".qkv_proj", ".q_proj", "q"),
-            (".qkv_proj", ".k_proj", "k"),
-            (".qkv_proj", ".v_proj", "v"),
-            (".gate_up_proj", ".gate_proj", 0),
-            (".gate_up_proj", ".up_proj", 1),
-        ]
-
-        params_dict = dict(self.named_parameters())
-
-        for name, loaded_weight in weights:
-            if "rotary_emb.inv_freq" in name or "projector" in name:
-                continue
-            if "rotary_emb.cos_cached" in name or "rotary_emb.sin_cached" in name:
-                # Models trained using ColossalAI may include these tensors in
-                # the checkpoint. Skip them.
-                continue
-            if name.startswith("model.vision_tower") and name not in params_dict:
-                continue
-            if "lm_head.weight" in name and self.config.tie_word_embeddings:
-                # Input and output embeddings are tied, so the output embeddings
-                # may not be present in the checkpoint. We assume that the input
-                # embeddings are always present in the checkpoint.
-                continue
-
-            for param_name, weight_name, shard_id in stacked_params_mapping:
-                if weight_name not in name:
-                    continue
-                name = name.replace(weight_name, param_name)
-                # Skip loading extra bias for GPTQ models.
-                if name.endswith(".bias") and name not in params_dict:
-                    continue
-                param = params_dict[name]
-                weight_loader = param.weight_loader
-                weight_loader(param, loaded_weight, shard_id)
-                break
-            else:
-                # This block only runs if the preceding for loop doesn't find
-                # a match for `name` in `stacked_params_mapping`.
-
-                # Skip loading extra bias for GPTQ models.
-                if name.endswith(".bias") and name not in params_dict:
-                    continue
-                # Skip loading kv_scale from ckpts towards new design.
-                if name.endswith(".kv_scale") and name not in params_dict:
-                    continue
-                param = params_dict[name]
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                weight_loader(param, loaded_weight)
+    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> set[str]:
+        skip_prefixes: list[str] = []
+        if self.config.tie_word_embeddings:
+            skip_prefixes.append("lm_head.")
+        loader = AutoWeightsLoader(
+            self,
+            skip_prefixes=skip_prefixes,
+            skip_substrs=["projector"],
+            ignore_unexpected_prefixes=["model.vision_tower."],
+        )
+        return loader.load_weights(weights)
 
     def get_weights_by_name(
         self, name: str, truncate_size: int = 100, tp_size: int = 1

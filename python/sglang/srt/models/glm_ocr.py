@@ -40,6 +40,7 @@ from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.utils import PPMissingLayer
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
+from sglang.srt.model_loader.auto_loader import AutoWeightsLoader, WeightsMapper
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.glm4 import Glm4Model
 from sglang.srt.models.glm4v import (
@@ -311,128 +312,131 @@ class GlmOcrForConditionalGeneration(Glm4vForConditionalGeneration):
         # For EAGLE3 support
         self.capture_aux_hidden_states = False
 
-    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]], is_nextn=False):
+    def load_weights(
+        self,
+        weights: Iterable[Tuple[str, torch.Tensor]],
+        is_nextn: bool = False,
+    ) -> set[str]:
         if is_nextn:
-            if hasattr(self.config, "num_nextn_predict_layers"):
-                num_nextn_layers = self.config.num_nextn_predict_layers
-                assert num_nextn_layers == 1, "Only 1 nextn layer is supported"
-                # compatible with old design
-                nextn_layer_id = (
-                    0
-                    if self.config.num_hidden_layers == 1
-                    else self.config.num_hidden_layers
-                )
-            else:
-                raise ValueError("num_nextn_predict_layers is not in the config")
+            return self._load_nextn_weights(weights)
 
+        # Drop next-token-prediction (NextN) layers from the main weight stream
+        # — they live at layer indices >= num_hidden_layers and only get loaded
+        # when ``is_nextn=True``.
+        num_nextn_layers = getattr(self.config, "num_nextn_predict_layers", 0)
+        num_hidden_layers = self.config.num_hidden_layers
+
+        def _filter_nextn(stream):
+            for name, w in stream:
+                if num_nextn_layers > 0 and name.startswith("model.layers"):
+                    parts = name.split(".")
+                    if len(parts) >= 3 and int(parts[2]) >= num_hidden_layers:
+                        continue
+                yield name, w
+
+        # Pad vision-tower attention weights for dummy heads at the stream
+        # boundary (no-op when num_dummy_heads == 0). Pad uses the post-rename
+        # name (visual.* + qkv_proj).
+        def _pad_visual(stream):
+            for name, w in stream:
+                if "visual" in name or "model.visual" in name:
+                    renamed = name.replace("model.visual.", "visual.").replace(
+                        "attn.qkv.", "attn.qkv_proj."
+                    )
+                    yield name, vision_utils.pad_vit_attn_dummy_heads(
+                        self.config, renamed, w
+                    )
+                else:
+                    yield name, w
+
+        # Checkpoint conventions:
+        #   - transformers>=4.52: ``model.language_model.<...>`` / ``model.visual.<...>``
+        #   - original release:    ``model.<...>``                / ``visual.<...>``
+        # Map both onto runtime python attributes ``self.model`` / ``self.visual``.
+        # Vision attention uses ``attn.qkv``; runtime ``VisionAttention``
+        # exposes ``attn.qkv_proj``.
+        mapper = WeightsMapper(
+            orig_to_new_substr={"attn.qkv.": "attn.qkv_proj."},
+            orig_to_new_prefix={
+                "model.language_model.": "model.",
+                "model.visual.": "visual.",
+            },
+        )
+        return AutoWeightsLoader(self).load_weights(
+            _pad_visual(_filter_nextn(weights)), mapper=mapper
+        )
+
+    def _load_nextn_weights(
+        self, weights: Iterable[Tuple[str, torch.Tensor]]
+    ) -> set[str]:
+        """Legacy hand-rolled loader for the next-token-prediction shard.
+
+        NextN weights live at ``model.layers.{nextn_layer_id}.*`` in the
+        checkpoint and need to be remapped onto ``model.<...>`` (specific
+        names) and ``model.decoder.<...>`` (everything else). This path is
+        rare and architecture-specific, so we preserve the explicit loop.
+        """
+        if not hasattr(self.config, "num_nextn_predict_layers"):
+            raise ValueError("num_nextn_predict_layers is not in the config")
+        num_nextn_layers = self.config.num_nextn_predict_layers
+        assert num_nextn_layers == 1, "Only 1 nextn layer is supported"
+        nextn_layer_id = (
+            0 if self.config.num_hidden_layers == 1 else self.config.num_hidden_layers
+        )
+        nextn_layer_prefix = f"model.layers.{nextn_layer_id}"
+        nextn_spec_weight_names = [
+            "shared_head.norm",
+            "eh_proj",
+            "enorm",
+            "hnorm",
+        ]
         stacked_params_mapping = [
-            # (param_name, shard_name, shard_id)
             (".qkv_proj", ".q_proj", "q"),
             (".qkv_proj", ".k_proj", "k"),
             (".qkv_proj", ".v_proj", "v"),
             (".gate_up_proj", ".up_proj", 1),
             (".gate_up_proj", ".gate_proj", 0),
         ]
-
-        if is_nextn:
-            nextn_layer_prefix = f"model.layers.{nextn_layer_id}"
-            nextn_spec_weight_names = [
-                "shared_head.norm",
-                "eh_proj",
-                "enorm",
-                "hnorm",
-            ]
-
         params_dict = dict(self.named_parameters(remove_duplicate=False))
-
-        # For the PP case, we add special handling for lm_head.weight,
-        # - On non–last ranks: we continue, because this stage is supposed to
-        #   be just an empty PPMissingLayer shell.
-        # - On the last rank: params_dict is expected to contain lm_head.weight,
-        #   so it will never hit the branch "if name not in params_dict".
-        #
-        # For all other parameters, such like
-        # "model.visual.blocks.20.mlp.gate_proj.weight", the unified rule is:
-        # If this name does not exist in the current rank’s params_dict,
-        # it does not belong to this pipeline stage, thus we simply continue.
-
+        loaded: set[str] = set()
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name:
                 continue
-            if "language_model" in name:
-                name = name.replace(r"model.language_model.", r"model.")
-            if "model.visual." in name:
-                name = name.replace("model.visual.", "visual.")
-
-            if not is_nextn:
-                if hasattr(self.config, "num_nextn_predict_layers"):
-                    num_nextn_layers = self.config.num_nextn_predict_layers
-                    if num_nextn_layers > 0 and name.startswith("model.layers"):
-                        name_list = name.split(".")
-                        if (
-                            len(name_list) >= 3
-                            and int(name_list[2]) >= self.config.num_hidden_layers
-                        ):
-                            continue
-            else:
-                if not name.startswith(nextn_layer_prefix):
-                    continue
-
-                # Use shared head and embed weights from target model
-                if "shared_head.head" in name or "embed_tokens" in name:
-                    continue
-
-                is_decoder = True
-                # For nextn specific weights
-                for weight_name in nextn_spec_weight_names:
-                    if weight_name in name:
-                        name = name.replace(nextn_layer_prefix, "model")
-                        is_decoder = False
-                        break
-                # For decoder layer weights
-                if is_decoder:
-                    name = name.replace(nextn_layer_prefix, "model.decoder")
+            if not name.startswith(nextn_layer_prefix):
+                continue
+            if "shared_head.head" in name or "embed_tokens" in name:
+                continue
+            is_decoder = True
+            for weight_name in nextn_spec_weight_names:
+                if weight_name in name:
+                    name = name.replace(nextn_layer_prefix, "model")
+                    is_decoder = False
+                    break
+            if is_decoder:
+                name = name.replace(nextn_layer_prefix, "model.decoder")
 
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:
                     continue
                 name = name.replace(weight_name, param_name)
-
-                # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
                     continue
-
                 if name not in params_dict:
                     continue
-
                 param = params_dict[name]
-                weight_loader = param.weight_loader
-                weight_loader(param, loaded_weight, shard_id)
+                param.weight_loader(param, loaded_weight, shard_id)
+                loaded.add(name)
                 break
             else:
-                if "visual" in name:
-                    # adapt to VisionAttention
-                    name = name.replace(r"attn.qkv.", r"attn.qkv_proj.")
-
-                try:
-                    # Skip loading extra bias for GPTQ models.
-                    if name.endswith(".bias") and name not in params_dict:
-                        continue
-
-                    if name not in params_dict:
-                        continue
-
-                    param = params_dict[name]
-                except KeyError:
-                    print(params_dict.keys())
-                    raise
-
+                if name.endswith(".bias") and name not in params_dict:
+                    continue
+                if name not in params_dict:
+                    continue
+                param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                if "visual" in name:
-                    loaded_weight = vision_utils.pad_vit_attn_dummy_heads(
-                        self.config, name, loaded_weight
-                    )
                 weight_loader(param, loaded_weight)
+                loaded.add(name)
+        return loaded
 
 
 EntryClass = [GlmOcrForConditionalGeneration]

@@ -38,7 +38,10 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.model_loader.auto_loader import (
+    AutoWeightsLoader,
+    default_stacked_params_load,
+)
 from sglang.srt.utils import add_prefix
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
@@ -255,6 +258,19 @@ class QWenModel(nn.Module):
         hidden_states = self.ln_f(hidden_states)
         return hidden_states
 
+    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> set[str]:
+        # Qwen1's MLP fuses ``w2`` (gate) and ``w1`` (up) into ``gate_up_proj``;
+        # the attention path has no q/k/v split (checkpoint already ships
+        # ``c_attn`` as the fused QKV).
+        return default_stacked_params_load(
+            self,
+            weights,
+            [
+                ("gate_up_proj", "w2", 0),
+                ("gate_up_proj", "w1", 1),
+            ],
+        )
+
 
 class QWenLMHeadModel(nn.Module):
     def __init__(
@@ -322,34 +338,9 @@ class QWenLMHeadModel(nn.Module):
 
         return result
 
-    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
-        stacked_params_mapping = [
-            # (param_name, shard_name, shard_id)
-            ("gate_up_proj", "w2", 0),
-            ("gate_up_proj", "w1", 1),
-        ]
-        params_dict = dict(self.named_parameters())
-        for name, loaded_weight in weights:
-            if "rotary_emb.inv_freq" in name:
-                continue
-            for param_name, weight_name, shard_id in stacked_params_mapping:
-                if weight_name not in name:
-                    continue
-                name = name.replace(weight_name, param_name)
-                # Skip loading extra bias for GPTQ models.
-                if name.endswith(".bias") and name not in params_dict:
-                    continue
-                param = params_dict[name]
-                weight_loader = param.weight_loader
-                weight_loader(param, loaded_weight, shard_id)
-                break
-            else:
-                # Skip loading extra bias for GPTQ models.
-                if name.endswith(".bias") and name not in params_dict:
-                    continue
-                param = params_dict[name]
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                weight_loader(param, loaded_weight)
+    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> set[str]:
+        loader = AutoWeightsLoader(self)
+        return loader.load_weights(weights)
 
 
 EntryClass = QWenLMHeadModel

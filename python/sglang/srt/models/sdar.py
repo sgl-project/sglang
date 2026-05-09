@@ -28,15 +28,17 @@ from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import AttentionType, RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
-from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
+from sglang.srt.layers.utils import PPMissingLayer
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
-from sglang.srt.model_loader.weight_utils import (
-    default_weight_loader,
-    maybe_remap_kv_scale_name,
+from sglang.srt.model_loader.auto_loader import (
+    STACKED_PARAMS_MAPPING_LLAMA,
+    AutoWeightsLoader,
+    WeightsMapper,
+    default_stacked_params_load,
 )
 from sglang.srt.models.utils import (
     apply_qk_norm,
@@ -433,6 +435,9 @@ class SDARModel(nn.Module):
                 hidden_states, residual = self.norm(hidden_states, residual)
             return hidden_states
 
+    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> set[str]:
+        return default_stacked_params_load(self, weights, STACKED_PARAMS_MAPPING_LLAMA)
+
 
 class SDARForCausalLM(nn.Module):
     def __init__(
@@ -511,79 +516,47 @@ class SDARForCausalLM(nn.Module):
         else:
             return hidden_states
 
-    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
-        stacked_params_mapping = [
-            # (param_name, shard_name, shard_id)
-            ("qkv_proj", "q_proj", "q"),
-            ("qkv_proj", "k_proj", "k"),
-            ("qkv_proj", "v_proj", "v"),
-            ("gate_up_proj", "gate_proj", 0),
-            ("gate_up_proj", "up_proj", 1),
-        ]
-        params_dict = dict(self.named_parameters())
-        for name, loaded_weight in weights:
-            if not name.startswith("model.") and (
-                name.startswith("layers.")
-                or name.startswith("embed_tokens.")
-                or name.startswith("norm.")
-            ):
-                name = add_prefix(name, "model")
+    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> set[str]:
+        # Some checkpoints ship the inner-model tensors at the top level
+        # (``layers.*``, ``embed_tokens.*``, ``norm.*``). Re-prefix them under
+        # ``model.`` so the walker routes them into ``self.model``.
+        mapper = WeightsMapper(
+            orig_to_new_prefix={
+                "layers.": "model.layers.",
+                "embed_tokens.": "model.embed_tokens.",
+                "norm.": "model.norm.",
+            },
+        )
 
-            if name == "model.embed_tokens.weight":
-                if self.pp_group.is_last_rank and self.config.tie_word_embeddings:
-                    param = params_dict["lm_head.weight"]
-                    weight_loader = getattr(
-                        param, "weight_loader", default_weight_loader
-                    )
-                    weight_loader(param, loaded_weight)
+        # When tie_word_embeddings is set and lm_head is a separate parameter
+        # (i.e. tp_size > 1, so we have a distinct ParallelLMHead), the
+        # checkpoint only ships ``model.embed_tokens.weight``; mirror it into
+        # ``lm_head.weight`` so the tied head also loads. When lm_head IS
+        # embed_tokens (pp=1, tp=1, tied), they share storage so this is a
+        # no-op but harmless. The asserted pp=1 means is_last_rank is always
+        # true, but keep the guard for parity with other migrated models.
+        if (
+            getattr(self, "pp_group", None) is not None
+            and self.pp_group.is_last_rank
+            and self.config.tie_word_embeddings
+            and not isinstance(self.lm_head, PPMissingLayer)
+            and self.lm_head is not getattr(self.model, "embed_tokens", None)
+        ):
 
-            layer_id = get_layer_id(name)
-            if (
-                layer_id is not None
-                and hasattr(self.model, "start_layer")
-                and (
-                    layer_id < self.model.start_layer
-                    or layer_id >= self.model.end_layer
-                )
-            ):
-                continue
+            def _mirror_embed_to_lm_head(ws):
+                for name, w in ws:
+                    if name == "model.embed_tokens.weight":
+                        yield ("lm_head.weight", w)
+                    yield (name, w)
 
-            if "rotary_emb.inv_freq" in name or "projector" in name:
-                continue
-            if "rotary_emb.cos_cached" in name or "rotary_emb.sin_cached" in name:
-                # Models trained using ColossalAI may include these tensors in
-                # the checkpoint. Skip them.
-                continue
-            if name.startswith("model.vision_tower") and name not in params_dict:
-                continue
-            if "scale" in name:
-                name = maybe_remap_kv_scale_name(name, params_dict)
-                if name is None:
-                    continue
-            for param_name, weight_name, shard_id in stacked_params_mapping:
-                if weight_name not in name:
-                    continue
-                name = name.replace(weight_name, param_name)
-                # Skip loading extra bias for GPTQ models.
-                if name.endswith(".bias") and name not in params_dict:
-                    continue
-                param = params_dict[name]
-                weight_loader = param.weight_loader
-                weight_loader(param, loaded_weight, shard_id)
-                break
-            else:
-                # Skip loading extra bias for GPTQ models.
-                if name.endswith(".bias") and name not in params_dict:
-                    continue
+            weights = _mirror_embed_to_lm_head(weights)
 
-                if name in params_dict.keys():
-                    param = params_dict[name]
-                    weight_loader = getattr(
-                        param, "weight_loader", default_weight_loader
-                    )
-                    weight_loader(param, loaded_weight)
-                else:
-                    logger.warning(f"Parameter {name} not found in params_dict")
+        loader = AutoWeightsLoader(
+            self,
+            skip_substrs=["projector"],
+            ignore_unexpected_prefixes=["model.vision_tower."],
+        )
+        return loader.load_weights(weights, mapper=mapper)
 
 
 EntryClass = SDARForCausalLM

@@ -39,7 +39,7 @@ from sglang.srt.managers.schedule_batch import (
     MultimodalInputs,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.model_loader.auto_loader import AutoWeightsLoader
 from sglang.srt.models.llama import LlamaForCausalLM
 from sglang.srt.utils import add_prefix
 
@@ -124,48 +124,14 @@ class GlmAsrForConditionalGeneration(nn.Module):
 
         return hidden_states
 
-    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
-        stacked_params_mapping = [
-            # (param_name, shard_name, shard_id)
-            ("qkv_proj", "q_proj", "q"),
-            ("qkv_proj", "k_proj", "k"),
-            ("qkv_proj", "v_proj", "v"),
-            ("gate_up_proj", "gate_proj", 0),
-            ("gate_up_proj", "up_proj", 1),
-        ]
-        params_dict = dict(self.named_parameters(remove_duplicate=False))
-
-        for name, loaded_weight in weights:
-            if "rotary_emb.inv_freq" in name:
-                continue
-
-            if self.config.text_config.tie_word_embeddings and "lm_head.weight" in name:
-                continue
-
-            for param_name, weight_name, shard_id in stacked_params_mapping:
-                if weight_name not in name or "audio_tower" in name:
-                    continue
-                name_tmp = name.replace(weight_name, param_name)
-
-                # Skip loading extra bias for GPTQ models.
-                if name_tmp.endswith(".bias") and name_tmp not in params_dict:
-                    continue
-                param = params_dict[name_tmp]
-                weight_loader = param.weight_loader
-                weight_loader(param, loaded_weight, shard_id)
-                break
-            else:
-                try:
-                    # Skip loading extra bias for GPTQ models.
-                    if name.endswith(".bias") and name not in params_dict:
-                        continue
-                    param = params_dict[name]
-                except KeyError:
-                    print(params_dict.keys())
-                    raise
-
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                weight_loader(param, loaded_weight)
+    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> set[str]:
+        # The inner ``self.language_model`` (LlamaForCausalLM) owns its own
+        # AutoWeightsLoader-based ``load_weights`` and handles tie_word_embeddings
+        # / fused QKV / gate_up internally. The walker just routes
+        # ``language_model.*`` checkpoints into it. ``audio_tower.*`` and
+        # ``multi_modal_projector.*`` use HF nn.Linear params with the default
+        # loader.
+        return AutoWeightsLoader(self).load_weights(weights)
 
 
 EntryClass = GlmAsrForConditionalGeneration

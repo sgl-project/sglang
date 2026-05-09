@@ -30,7 +30,7 @@ from sglang.srt.managers.mm_utils import (
     general_mm_embed_routine,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.model_loader.auto_loader import AutoWeightsLoader, WeightsMapper
 from sglang.srt.models.llama import LlamaForCausalLM
 from sglang.srt.models.qwen2_vl import Qwen2VisionTransformer
 from sglang.srt.utils import add_prefix
@@ -174,94 +174,16 @@ class Sarashina2VisionForCausalLM(nn.Module):
             )
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
-        """Load model weights."""
-        params_dict = dict(self.named_parameters())
-        loaded_params = set()
+        """Load model weights via AutoWeightsLoader.
 
-        # Collect weights that need to be fused
-        qkv_weights = {}
-        gate_up_weights = {}
-
-        for name, loaded_weight in weights:
-            # Handle weight name mappings
-
-            # Map visual attention weights: qkv -> qkv_proj
-            if ".attn.qkv." in name:
-                mapped_name = name.replace(".attn.qkv.", ".attn.qkv_proj.")
-                if mapped_name in params_dict:
-                    param = params_dict[mapped_name]
-                    weight_loader = getattr(
-                        param, "weight_loader", default_weight_loader
-                    )
-                    weight_loader(param, loaded_weight)
-                    loaded_params.add(mapped_name)
-                    continue
-
-            # Handle Llama attention weights - need to fuse q, k, v into qkv
-            if ".self_attn.q_proj.weight" in name:
-                base = name.replace(".q_proj.weight", "")
-                qkv_weights[base] = qkv_weights.get(base, {})
-                qkv_weights[base]["q"] = loaded_weight
-                continue
-            elif ".self_attn.k_proj.weight" in name:
-                base = name.replace(".k_proj.weight", "")
-                qkv_weights[base] = qkv_weights.get(base, {})
-                qkv_weights[base]["k"] = loaded_weight
-                continue
-            elif ".self_attn.v_proj.weight" in name:
-                base = name.replace(".v_proj.weight", "")
-                qkv_weights[base] = qkv_weights.get(base, {})
-                qkv_weights[base]["v"] = loaded_weight
-                continue
-
-            # Handle Llama MLP weights - need to fuse gate and up projections
-            if ".mlp.gate_proj.weight" in name:
-                base = name.replace(".gate_proj.weight", "")
-                gate_up_weights[base] = gate_up_weights.get(base, {})
-                gate_up_weights[base]["gate"] = loaded_weight
-                continue
-            elif ".mlp.up_proj.weight" in name:
-                base = name.replace(".up_proj.weight", "")
-                gate_up_weights[base] = gate_up_weights.get(base, {})
-                gate_up_weights[base]["up"] = loaded_weight
-                continue
-
-            # Direct mapping for other weights
-            if name in params_dict:
-                param = params_dict[name]
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                weight_loader(param, loaded_weight)
-                loaded_params.add(name)
-
-        # Fuse QKV weights for Llama attention layers
-        for base, weights_dict in qkv_weights.items():
-            if "q" in weights_dict and "k" in weights_dict and "v" in weights_dict:
-                qkv_name = f"{base}.qkv_proj.weight"
-                if qkv_name in params_dict:
-                    # Concatenate q, k, v weights
-                    q, k, v = weights_dict["q"], weights_dict["k"], weights_dict["v"]
-                    qkv = torch.cat([q, k, v], dim=0)
-                    param = params_dict[qkv_name]
-                    weight_loader = getattr(
-                        param, "weight_loader", default_weight_loader
-                    )
-                    weight_loader(param, qkv)
-                    loaded_params.add(qkv_name)
-
-        # Fuse gate and up weights for Llama MLP layers
-        for base, weights_dict in gate_up_weights.items():
-            if "gate" in weights_dict and "up" in weights_dict:
-                gate_up_name = f"{base}.gate_up_proj.weight"
-                if gate_up_name in params_dict:
-                    # Concatenate gate and up weights
-                    gate, up = weights_dict["gate"], weights_dict["up"]
-                    gate_up = torch.cat([gate, up], dim=0)
-                    param = params_dict[gate_up_name]
-                    weight_loader = getattr(
-                        param, "weight_loader", default_weight_loader
-                    )
-                    weight_loader(param, gate_up)
-                    loaded_params.add(gate_up_name)
+        Vision tower checkpoint exposes ``attn.qkv``; runtime ``VisionAttention``
+        exposes ``attn.qkv_proj``. Llama text backbone fuses q/k/v and gate/up
+        through its own ``LlamaForCausalLM.load_weights``.
+        """
+        mapper = WeightsMapper(
+            orig_to_new_substr={".attn.qkv.": ".attn.qkv_proj."},
+        )
+        return AutoWeightsLoader(self).load_weights(weights, mapper=mapper)
 
 
 # Register the model

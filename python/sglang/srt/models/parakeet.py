@@ -27,7 +27,7 @@ from transformers import ParakeetFeatureExtractor, PretrainedConfig
 from sglang.srt.configs.parakeet import ExtractorConfig, ParakeetConfig
 from sglang.srt.layers.activation import ReLU2
 from sglang.srt.layers.layernorm import RMSNorm
-from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.model_loader.auto_loader import AutoWeightsLoader, WeightsMapper
 
 
 class ParakeetProjection(nn.Module):
@@ -80,36 +80,21 @@ class ProjectedParakeet(nn.Module):
         return outputs
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loaded_params: set[str] = set()
-        params_dict = dict(self.named_parameters())
-        buffers_dict = dict(self.named_buffers())
-
         if isinstance(weights, dict):
-            weights_list = list(weights.items())
-        else:
-            weights_list = list(weights)
+            weights = weights.items()
 
-        for name, weight in weights_list:
-            if name.startswith("sound_encoder.encoder.feature_extractor."):
-                continue
-            if name.startswith("sound_encoder."):
-                target_name = name[len("sound_encoder.") :]
-            elif name.startswith("sound_projection."):
-                target_name = f"projection.{name[len('sound_projection.'):]}"
-            else:
-                continue
-
-            target = params_dict.get(target_name)
-            if target is None:
-                target = buffers_dict.get(target_name)
-            if target is None:
-                continue
-            weight_loader = getattr(target, "weight_loader", default_weight_loader)
-            with torch.no_grad():
-                weight_loader(target, weight)
-            loaded_params.add(target_name)
-
-        return loaded_params
+        # Checkpoint layout: sound_encoder.* → encoder.*,
+        #                    sound_projection.* → projection.*,
+        #                    sound_encoder.encoder.feature_extractor.* → drop.
+        mapper = WeightsMapper(
+            orig_to_new_prefix={
+                "sound_encoder.encoder.feature_extractor.": None,
+                "sound_encoder.": "",
+                "sound_projection.": "projection.",
+            },
+        )
+        loader = AutoWeightsLoader(self)
+        return loader.load_weights(weights, mapper=mapper)
 
 
 class ParakeetExtractor(ParakeetFeatureExtractor):

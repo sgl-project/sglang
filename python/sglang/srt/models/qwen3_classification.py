@@ -27,7 +27,7 @@ from sglang.srt.layers.pooler import (
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.model_loader.auto_loader import AutoWeightsLoader
 from sglang.srt.models.qwen3 import Qwen3Model
 from sglang.srt.utils import add_prefix
 
@@ -75,54 +75,16 @@ class Qwen3ForPooledOutput(nn.Module):
         )
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
-        stacked_params_mapping = [
-            # (param_name, shard_name, shard_id)
-            ("qkv_proj", "q_proj", "q"),
-            ("qkv_proj", "k_proj", "k"),
-            ("qkv_proj", "v_proj", "v"),
-            ("gate_up_proj", "gate_proj", 0),
-            ("gate_up_proj", "up_proj", 1),
-        ]
-
-        params_dict = dict(self.named_parameters())
-        for name, loaded_weight in weights:
-            # Skip lm_head weights (pooled output models don't have lm_head)
-            if name.startswith("lm_head"):
-                continue
-
-            # Skip rotary embeddings and other non-parameter tensors
-            if "rotary_emb.inv_freq" in name or "projector" in name:
-                continue
-            if "rotary_emb.cos_cached" in name or "rotary_emb.sin_cached" in name:
-                continue
-
-            # Handle stacked parameters (qkv_proj, gate_up_proj)
-            for param_name, weight_name, shard_id in stacked_params_mapping:
-                if weight_name not in name:
-                    continue
-                name = name.replace(weight_name, param_name)
-                # Skip loading extra bias for GPTQ models
-                if name.endswith(".bias") and name not in params_dict:
-                    continue
-                if name not in params_dict:
-                    continue
-                param = params_dict[name]
-                weight_loader = param.weight_loader
-                weight_loader(param, loaded_weight, shard_id)
-                break
-            else:
-                # Skip loading extra bias for GPTQ models
-                if name.endswith(".bias") and name not in params_dict:
-                    continue
-
-                if name in params_dict:
-                    param = params_dict[name]
-                    weight_loader = getattr(
-                        param, "weight_loader", default_weight_loader
-                    )
-                    weight_loader(param, loaded_weight)
-                else:
-                    logger.warning(f"Parameter {name} not found in params_dict")
+        # Pooled-output checkpoints sometimes ship an unused ``lm_head`` tensor;
+        # drop it. ``projector`` stays as a skip substring for parity with the
+        # other Qwen3 loaders. Stacked QKV / gate_up are handled by the inner
+        # ``Qwen3Model.load_weights`` (inherited from ``Qwen2Model``).
+        loader = AutoWeightsLoader(
+            self,
+            skip_prefixes=["lm_head."],
+            skip_substrs=["projector"],
+        )
+        return loader.load_weights(weights)
 
 
 class Qwen3ForSequenceClassification(Qwen3ForPooledOutput):

@@ -17,8 +17,18 @@ from sglang.srt.layers.pooler import EmbeddingPoolerOutput, Pooler, PoolingType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.managers.schedule_batch import MultimodalInputs
 from sglang.srt.model_executor.model_runner import ForwardBatch
-from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.model_loader.auto_loader import (
+    WeightsMapper,
+    default_stacked_params_load,
+)
 from sglang.srt.utils import add_prefix, flatten_nested_list
+
+_CLIP_STACKED_PARAMS_MAPPING: List[Tuple[str, str, str]] = [
+    (".qkv_proj", ".q_proj", "q"),
+    (".qkv_proj", ".k_proj", "k"),
+    (".qkv_proj", ".v_proj", "v"),
+]
+_CLIP_NAME_MAPPER = WeightsMapper(orig_to_new_substr={"out_proj": "proj"})
 
 
 class CLIPVisionEmbeddings(nn.Module):
@@ -475,31 +485,10 @@ class CLIPModel(nn.Module):
         # Clip embeddings models handle text/image separately, so we don't need to pad input ids
         return input_ids
 
-    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
-        stacked_params_mapping = [
-            # (param_name, shard_name, shard_id)
-            ("qkv_proj", "q_proj", "q"),
-            ("qkv_proj", "k_proj", "k"),
-            ("qkv_proj", "v_proj", "v"),
-        ]
-        params_dict = dict(self.named_parameters())
-        for name, loaded_weight in weights:
-            if "position_ids" in name:
-                continue
-            if "out_proj" in name:
-                name = name.replace("out_proj", "proj")
-            for param_name, shard_name, shard_id in stacked_params_mapping:
-                if shard_name not in name:
-                    continue
-                name = name.replace(shard_name, param_name)
-                param = params_dict[name]
-                weight_loader = param.weight_loader
-                weight_loader(param, loaded_weight, shard_id)
-                break
-            else:
-                param = params_dict[name]
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                weight_loader(param, loaded_weight)
+    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> set[str]:
+        weights = ((name, w) for name, w in weights if "position_ids" not in name)
+        weights = _CLIP_NAME_MAPPER.apply(weights)
+        return default_stacked_params_load(self, weights, _CLIP_STACKED_PARAMS_MAPPING)
 
 
 # monkey patch weight loader to remove open_clip file

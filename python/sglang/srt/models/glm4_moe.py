@@ -83,6 +83,11 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+from sglang.srt.model_loader.auto_loader import (
+    STACKED_PARAMS_MAPPING_LLAMA,
+    AutoWeightsLoader,
+    default_moe_load,
+)
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.deepseek_v2 import DeepseekV2ForCausalLM
 from sglang.srt.models.utils import apply_qk_norm
@@ -1169,6 +1174,24 @@ class Glm4MoeModel(nn.Module):
             return hidden_states
         return hidden_states, aux_hidden_states
 
+    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> set:
+        # ``num_fused_shared_experts`` is set by the wrapping ``ForCausalLM``
+        # before calling load_weights so the FusedMoE expert table is sized
+        # correctly when shared experts are fused into the routed table.
+        num_fused = getattr(self, "num_fused_shared_experts", 0)
+        expert_params_mapping = FusedMoE.make_expert_params_mapping(
+            ckpt_gate_proj_name="gate_proj",
+            ckpt_down_proj_name="down_proj",
+            ckpt_up_proj_name="up_proj",
+            num_experts=self.config.n_routed_experts + num_fused,
+        )
+        return default_moe_load(
+            self,
+            weights,
+            stacked_params_mapping=STACKED_PARAMS_MAPPING_LLAMA,
+            expert_params_mapping=expert_params_mapping,
+        )
+
 
 class Glm4MoeForCausalLM(nn.Module):
     def __init__(
@@ -1274,177 +1297,152 @@ class Glm4MoeForCausalLM(nn.Module):
         params_dict=None,
     ):
         if is_nextn:
-            if hasattr(self.config, "num_nextn_predict_layers"):
-                num_nextn_layers = self.config.num_nextn_predict_layers
-                assert num_nextn_layers == 1, "Only 1 nextn layer is supported"
-                # compatible with old design
-                nextn_layer_id = (
-                    0
-                    if self.config.num_hidden_layers == 1
-                    else self.config.num_hidden_layers
-                )
-            else:
-                raise ValueError("num_nextn_predict_layers is not in the config")
+            return self._load_nextn_weights(weights, params_dict=params_dict)
 
+        # Drop next-token-prediction layers from the main weight stream — they
+        # live at indices >= num_hidden_layers and only get loaded when
+        # is_nextn=True.
+        num_nextn_layers = getattr(self.config, "num_nextn_predict_layers", 0)
+        num_hidden_layers = self.config.num_hidden_layers
+
+        def _filter_nextn(stream):
+            for name, w in stream:
+                if num_nextn_layers > 0 and name.startswith("model.layers"):
+                    parts = name.split(".")
+                    if len(parts) >= 3 and int(parts[2]) >= num_hidden_layers:
+                        continue
+                yield name, w
+
+        # Fused shared experts: rewrite ``mlp.shared_experts.*`` onto an extra
+        # expert slot at index ``n_routed_experts`` so the FusedMoE walker
+        # picks it up like a routed expert.
+        if self.num_fused_shared_experts > 0:
+            assert self.num_fused_shared_experts == 1
+            n_routed = self.config.n_routed_experts
+            shared_pattern = re.compile(
+                r"^model\.layers\.(\d+)\.mlp\.shared_experts\.(.+)$"
+            )
+
+            def _fuse_shared(stream):
+                for name, w in stream:
+                    m = shared_pattern.match(name)
+                    if m:
+                        name = (
+                            f"model.layers.{m.group(1)}.mlp.experts."
+                            f"{n_routed}.{m.group(2)}"
+                        )
+                    yield name, w
+
+            stream = _fuse_shared(_filter_nextn(weights))
+        else:
+            stream = _filter_nextn(weights)
+
+        # Propagate fused-shared-expert count so inner Glm4MoeModel sizes the
+        # FusedMoE expert table to include the extra slot.
+        self.model.num_fused_shared_experts = self.num_fused_shared_experts
+        return AutoWeightsLoader(self).load_weights(stream)
+
+    def _load_nextn_weights(
+        self,
+        weights: Iterable[Tuple[str, torch.Tensor]],
+        params_dict=None,
+    ) -> set:
+        """Hand-rolled loader for the GLM4 next-token-prediction shard."""
+        if not hasattr(self.config, "num_nextn_predict_layers"):
+            raise ValueError("num_nextn_predict_layers is not in the config")
+        num_nextn_layers = self.config.num_nextn_predict_layers
+        assert num_nextn_layers == 1, "Only 1 nextn layer is supported"
+        nextn_layer_id = (
+            0 if self.config.num_hidden_layers == 1 else self.config.num_hidden_layers
+        )
+        nextn_layer_prefix = f"model.layers.{nextn_layer_id}"
+        nextn_spec_weight_names = [
+            "shared_head.norm",
+            "eh_proj",
+            "enorm",
+            "hnorm",
+        ]
         stacked_params_mapping = [
-            # (param_name, shard_name, shard_id)
             ("qkv_proj", "q_proj", "q"),
             ("qkv_proj", "k_proj", "k"),
             ("qkv_proj", "v_proj", "v"),
             ("gate_up_proj", "gate_proj", 0),
             ("gate_up_proj", "up_proj", 1),
         ]
-
-        if self.num_fused_shared_experts > 0:
-            assert self.num_fused_shared_experts == 1
-
-            def iter_weights_with_fused_shared_experts(
-                weights: Iterable[Tuple[str, torch.Tensor]],
-            ) -> Iterable[Tuple[str, torch.Tensor]]:
-
-                pattern = re.compile(
-                    r"^model\.layers\.(\d+)\.mlp\.shared_experts\.(.+)$"
-                )
-                for name, weight in weights:
-                    match = pattern.match(name)
-                    if match:
-                        layer_id = int(match.group(1))
-                        suffix = match.group(2)
-                        name = f"model.layers.{layer_id}.mlp.experts.{self.config.n_routed_experts}.{suffix}"
-                    yield name, weight
-
-            weights = iter_weights_with_fused_shared_experts(weights)
-
-        # Params for weights, fp8 weight scales, fp8 activation scales
-        # (param_name, weight_name, expert_id, shard_id)
         expert_params_mapping = FusedMoE.make_expert_params_mapping(
             ckpt_gate_proj_name="gate_proj",
             ckpt_down_proj_name="down_proj",
             ckpt_up_proj_name="up_proj",
             num_experts=self.config.n_routed_experts + self.num_fused_shared_experts,
         )
-
-        if is_nextn:
-            nextn_layer_prefix = f"model.layers.{nextn_layer_id}"
-            nextn_spec_weight_names = [
-                "shared_head.norm",
-                "eh_proj",
-                "enorm",
-                "hnorm",
-            ]
-        else:
-            nextn_layer_prefix = None
-            nextn_spec_weight_names = []
-
         if params_dict is None:
             params_dict = dict(self.named_parameters())
-
-        weight_names = []
+        loaded: set = set()
         for name, loaded_weight in weights:
-            weight_names.append(name)
-
-            if not is_nextn:
-                if hasattr(self.config, "num_nextn_predict_layers"):
-                    num_nextn_layers = self.config.num_nextn_predict_layers
-                    if num_nextn_layers > 0 and name.startswith("model.layers"):
-                        name_list = name.split(".")
-                        if (
-                            len(name_list) >= 3
-                            and int(name_list[2]) >= self.config.num_hidden_layers
-                        ):
-                            continue
-            else:
-                if nextn_layer_prefix and not name.startswith(nextn_layer_prefix):
-                    continue
-
-                if nextn_layer_prefix is not None:  # mtp
-                    # Use shared head and embed weights from target model
-                    if "shared_head.head" in name or "embed_tokens" in name:
-                        continue
-
-                    is_decoder = True
-                    # For nextn specific weights
-                    for weight_name in nextn_spec_weight_names:
-                        if weight_name in name:
-                            name = name.replace(nextn_layer_prefix, "model")
-                            is_decoder = False
-                            break
-                    # For decoder layer weights
-                    if is_decoder:
-                        name = name.replace(nextn_layer_prefix, "model.decoder")
-
             if "rotary_emb.inv_freq" in name:
                 continue
+            if not name.startswith(nextn_layer_prefix):
+                continue
+            if "shared_head.head" in name or "embed_tokens" in name:
+                continue
+            is_decoder = True
+            for wn in nextn_spec_weight_names:
+                if wn in name:
+                    name = name.replace(nextn_layer_prefix, "model")
+                    is_decoder = False
+                    break
+            if is_decoder:
+                name = name.replace(nextn_layer_prefix, "model.decoder")
             for param_name, weight_name, shard_id in stacked_params_mapping:
-                # Skip non-stacked layers and experts (experts handled below).
-                if weight_name not in name:
-                    continue
-                # We have mlp.experts[0].gate_proj in the checkpoint.
-                # Since we handle the experts below in expert_params_mapping,
-                # we need to skip here BEFORE we update the name, otherwise
-                # name will be updated to mlp.experts[0].gate_up_proj, which
-                # will then be updated below in expert_params_mapping
-                # for mlp.experts[0].gate_gate_up_proj, which breaks load.
-                if "mlp.experts" in name:
+                if weight_name not in name or "mlp.experts" in name:
                     continue
                 name = name.replace(weight_name, param_name)
-                # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
                     continue
                 if name not in params_dict:
                     continue
-
                 param = params_dict[name]
-                weight_loader = param.weight_loader
-                weight_loader(param, loaded_weight, shard_id)
+                param.weight_loader(param, loaded_weight, shard_id)
+                loaded.add(name)
                 break
             else:
-                # Track if this is an expert weight to enable early skipping
                 is_expert_weight = False
-
-                for mapping in expert_params_mapping:
-                    param_name, weight_name, expert_id, shard_id = mapping
+                for (
+                    param_name,
+                    weight_name,
+                    expert_id,
+                    shard_id,
+                ) in expert_params_mapping:
                     if weight_name not in name:
                         continue
-
-                    # Mark as expert weight regardless of whether we can process it
                     is_expert_weight = True
-
-                    name = name.replace(weight_name, param_name)
-                    if name not in params_dict:
-                        # Expert weight not on this rank, will be skipped below
+                    mapped = name.replace(weight_name, param_name)
+                    if mapped not in params_dict:
                         continue
-
-                    param = params_dict[name]
-                    weight_loader = param.weight_loader
-                    weight_loader(
+                    param = params_dict[mapped]
+                    param.weight_loader(
                         param,
                         loaded_weight,
-                        name,
+                        mapped,
                         shard_id=shard_id,
                         expert_id=expert_id,
                     )
+                    loaded.add(mapped)
                     break
                 else:
                     if is_expert_weight:
-                        # This is an expert weight but not mapped to this rank, skip all remaining processing
                         continue
-
-                    # Skip loading extra bias for GPTQ models.
                     if name.endswith(".bias") and name not in params_dict:
                         continue
-
                     if name not in params_dict:
                         continue
-
-                    if name in params_dict.keys():
-                        param = params_dict[name]
-                        weight_loader = getattr(
-                            param, "weight_loader", default_weight_loader
-                        )
-                        weight_loader(param, loaded_weight)
-                    else:
-                        logger.warning(f"Parameter {name} not found in params_dict")
+                    param = params_dict[name]
+                    weight_loader = getattr(
+                        param, "weight_loader", default_weight_loader
+                    )
+                    weight_loader(param, loaded_weight)
+                    loaded.add(name)
+        return loaded
 
     def get_embed_and_head(self):
         return self.model.embed_tokens.weight, self.lm_head.weight

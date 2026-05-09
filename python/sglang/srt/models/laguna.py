@@ -47,13 +47,18 @@ from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
-from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
+from sglang.srt.layers.utils import PPMissingLayer
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
-from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.model_loader.auto_loader import (
+    STACKED_PARAMS_MAPPING_LLAMA,
+    AutoWeightsLoader,
+    WeightsMapper,
+    default_moe_load,
+)
 from sglang.srt.models.utils import apply_qk_norm
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import LazyValue, add_prefix, make_layers
@@ -577,6 +582,20 @@ class LagunaModel(nn.Module):
                 hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states
 
+    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> set[str]:
+        expert_params_mapping = FusedMoE.make_expert_params_mapping(
+            ckpt_gate_proj_name="gate_proj",
+            ckpt_down_proj_name="down_proj",
+            ckpt_up_proj_name="up_proj",
+            num_experts=self.config.num_experts,
+        )
+        return default_moe_load(
+            self,
+            weights,
+            stacked_params_mapping=STACKED_PARAMS_MAPPING_LLAMA,
+            expert_params_mapping=expert_params_mapping,
+        )
+
 
 class LagunaForCausalLM(nn.Module):
     fall_back_to_pt_during_load = False
@@ -656,121 +675,17 @@ class LagunaForCausalLM(nn.Module):
         return self.model.embed_tokens
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
-        stacked_params_mapping = [
-            ("qkv_proj", "q_proj", "q"),
-            ("qkv_proj", "k_proj", "k"),
-            ("qkv_proj", "v_proj", "v"),
-            ("gate_up_proj", "gate_proj", 0),
-            ("gate_up_proj", "up_proj", 1),
-        ]
-
-        expert_params_mapping = FusedMoE.make_expert_params_mapping(
-            ckpt_gate_proj_name="gate_proj",
-            ckpt_down_proj_name="down_proj",
-            ckpt_up_proj_name="up_proj",
-            num_experts=self.config.num_experts,
+        # HF stores the router correction bias under the experts namespace;
+        # our parameter lives on the gate. Remap before dispatch.
+        mapper = WeightsMapper(
+            orig_to_new_substr={
+                "mlp.experts.e_score_correction_bias": "mlp.gate.e_score_correction_bias",
+            },
         )
-
-        params_dict = dict(self.named_parameters())
-
-        # (layer, expert, shard) tuples that hit the per-expert loader,
-        # cross-checked against `expected` below to fail on dropped weights.
-        loaded_expert_shards: set[Tuple[int, int, str]] = set()
-        moe_layer_ids = [
-            i
-            for i, mt in enumerate(self.config.mlp_layer_types)
-            if mt == "sparse" and self.start_layer <= i < self.end_layer
-        ]
-
-        for name, loaded_weight in weights:
-            layer_id = get_layer_id(name)
-            if layer_id is not None and (
-                layer_id < self.start_layer or layer_id >= self.end_layer
-            ):
-                continue
-
-            if "rotary_emb.inv_freq" in name:
-                continue
-
-            if self.config.tie_word_embeddings and "lm_head.weight" in name:
-                continue
-
-            # HF stores the router correction bias under the experts namespace;
-            # our parameter lives on the gate. Remap before dispatch.
-            if name.endswith("mlp.experts.e_score_correction_bias"):
-                name = name.replace(
-                    "mlp.experts.e_score_correction_bias",
-                    "mlp.gate.e_score_correction_bias",
-                )
-
-            # Stacked dense (QKV / gate_up). The `mlp.experts.` guard stops
-            # `up_proj` substring from false-matching `experts.{i}.up_proj.weight`.
-            matched_stacked = False
-            for param_name, weight_name, shard_id in stacked_params_mapping:
-                if weight_name not in name:
-                    continue
-                if "mlp.experts." in name:
-                    continue
-                name_mapped = name.replace(weight_name, param_name)
-                if name_mapped.endswith(".bias") and name_mapped not in params_dict:
-                    continue
-                if name_mapped not in params_dict:
-                    continue
-                param = params_dict[name_mapped]
-                param.weight_loader(param, loaded_weight, shard_id)
-                matched_stacked = True
-                break
-            if matched_stacked:
-                continue
-
-            matched_expert = False
-            for param_name, weight_name, expert_id, shard_id in expert_params_mapping:
-                if weight_name not in name:
-                    continue
-                name_mapped = name.replace(weight_name, param_name)
-                if name_mapped not in params_dict:
-                    continue
-                param = params_dict[name_mapped]
-                param.weight_loader(
-                    param,
-                    loaded_weight,
-                    name,
-                    shard_id=shard_id,
-                    expert_id=expert_id,
-                )
-                if layer_id is not None:
-                    loaded_expert_shards.add((layer_id, expert_id, shard_id))
-                matched_expert = True
-                break
-            if matched_expert:
-                continue
-
-            if name.endswith(".bias") and name not in params_dict:
-                continue
-            if name not in params_dict:
-                logger.warning("Parameter %s not found in params_dict", name)
-                continue
-            param = params_dict[name]
-            weight_loader = getattr(param, "weight_loader", default_weight_loader)
-            weight_loader(param, loaded_weight)
-
-        # If any routed-expert tensor was silently dropped (e.g. a future
-        # checkpoint renaming `gate_proj`, or a ckpt-vs-mapping shape mismatch),
-        # fail loud here instead of generating garbage.
-        expected = {
-            (layer_id, expert_id, shard_id)
-            for layer_id in moe_layer_ids
-            for expert_id in range(self.config.num_experts)
-            for shard_id in ("w1", "w2", "w3")
-        }
-        missing = expected - loaded_expert_shards
-        if missing:
-            sample = sorted(missing)[:5]
-            raise RuntimeError(
-                f"{len(missing)} routed-expert tensors were not loaded "
-                f"(sample: {sample}). Expected {len(expected)} (layers={moe_layer_ids}, "
-                f"num_experts={self.config.num_experts}, shards=3)."
-            )
+        skip_prefixes = ["lm_head."] if self.config.tie_word_embeddings else None
+        return AutoWeightsLoader(self, skip_prefixes=skip_prefixes).load_weights(
+            weights, mapper=mapper
+        )
 
     def get_embed_and_head(self):
         return self.model.embed_tokens.weight, self.lm_head.weight

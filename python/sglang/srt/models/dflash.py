@@ -24,12 +24,21 @@ from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.radix_attention import AttentionType, RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.model_loader.auto_loader import (
+    STACKED_PARAMS_MAPPING_LLAMA,
+    WeightsMapper,
+    default_stacked_params_load,
+)
 from sglang.srt.models.utils import apply_qk_norm
 from sglang.srt.speculative.dflash_utils import (
     can_dflash_slice_qkv_weight,
     parse_dflash_draft_config,
 )
+
+# Some DFlash draft checkpoints ship inner-model keys with a leading ``model.``
+# (mirroring the HF wrapper layout); strip it so the names match the runtime
+# tree, which lives directly under ``DFlashDraftModel``.
+_DFLASH_PREFIX_MAPPER = WeightsMapper(orig_to_new_prefix={"model.": ""})
 
 logger = logging.getLogger(__name__)
 
@@ -340,60 +349,30 @@ class DFlashDraftModel(nn.Module):
         )
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
-        stacked_params_mapping = [
-            # (param_name, weight_name, shard_id)
-            ("qkv_proj", "q_proj", "q"),
-            ("qkv_proj", "k_proj", "k"),
-            ("qkv_proj", "v_proj", "v"),
-            ("gate_up_proj", "gate_proj", 0),
-            ("gate_up_proj", "up_proj", 1),
-        ]
+        # Validate ``fc.weight`` shape eagerly so the user gets a DFLASH-specific
+        # error (about num_context_features mismatch) instead of a generic
+        # ``param.size() != loaded_weight.size()`` assertion deeper in the loader.
+        expected_fc_shape = tuple(self.fc.weight.shape)
 
-        params_dict = dict(self.named_parameters())
-
-        def resolve_param_name(name: str) -> Optional[str]:
-            if name in params_dict:
-                return name
-            if name.startswith("model."):
-                stripped_name = name[len("model.") :]
-                if stripped_name in params_dict:
-                    return stripped_name
-            else:
-                prefixed_name = f"model.{name}"
-                if prefixed_name in params_dict:
-                    return prefixed_name
-            return None
-
-        for name, loaded_weight in weights:
-            for param_name, weight_name, shard_id in stacked_params_mapping:
-                if f".{weight_name}." not in name:
-                    continue
-                mapped_name = name.replace(weight_name, param_name)
-                resolved_name = resolve_param_name(mapped_name)
-                if resolved_name is None:
-                    continue
-                param = params_dict[resolved_name]
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                weight_loader(param, loaded_weight, shard_id)
-                break
-            else:
-                resolved_name = resolve_param_name(name)
-                if resolved_name is None:
-                    # Ignore unexpected weights (e.g., HF rotary caches).
-                    continue
-                param = params_dict[resolved_name]
-                if resolved_name.endswith("fc.weight") and tuple(
-                    loaded_weight.shape
-                ) != tuple(param.shape):
+        def _validate(stream):
+            for name, weight in stream:
+                if (
+                    name.endswith("fc.weight")
+                    and tuple(weight.shape) != expected_fc_shape
+                ):
                     raise ValueError(
                         "DFLASH fc.weight shape mismatch. This usually means the draft checkpoint's "
                         "number of context features (K) does not match this config. "
-                        f"Expected fc.weight.shape={tuple(param.shape)} "
+                        f"Expected fc.weight.shape={expected_fc_shape} "
                         f"(num_context_features={self.num_context_features}, hidden_size={int(self.config.hidden_size)}), "
-                        f"but got {tuple(loaded_weight.shape)} for weight '{name}'."
+                        f"but got {tuple(weight.shape)} for weight '{name}'."
                     )
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                weight_loader(param, loaded_weight)
+                yield name, weight
+
+        # Strip the optional ``model.`` prefix from incoming names (some draft
+        # checkpoints ship the inner layout, others the HF wrapper layout).
+        weights = _DFLASH_PREFIX_MAPPER.apply(_validate(weights))
+        return default_stacked_params_load(self, weights, STACKED_PARAMS_MAPPING_LLAMA)
 
 
 EntryClass = DFlashDraftModel

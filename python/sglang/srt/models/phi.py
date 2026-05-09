@@ -21,7 +21,11 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.model_loader.auto_loader import (
+    STACKED_PARAMS_MAPPING_LLAMA,
+    AutoWeightsLoader,
+    default_stacked_params_load,
+)
 from sglang.srt.utils import add_prefix, make_layers
 
 
@@ -221,6 +225,9 @@ class PhiModel(nn.Module):
         hidden_states = self.final_layernorm(hidden_states)
         return hidden_states
 
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        return default_stacked_params_load(self, weights, STACKED_PARAMS_MAPPING_LLAMA)
+
 
 class PhiForCausalLM(nn.Module):
     packed_modules_mapping = {
@@ -276,46 +283,9 @@ class PhiForCausalLM(nn.Module):
             input_ids, hidden_states, self.lm_head, forward_batch
         )
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
-        params_dict = dict(self.named_parameters())
-        weights = dict(weights)
-        loaded_keys = set()
-
-        for name, param in params_dict.items():
-            if name in loaded_keys:
-                continue
-
-            # Handle packed weights
-            is_packed = False
-            for packed_name, src_names in self.packed_modules_mapping.items():
-                if packed_name not in name:
-                    continue
-
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                for src_name in src_names:
-                    full_src_name = name.replace(packed_name, src_name)
-                    if full_src_name in weights:
-                        loaded_weight = weights[full_src_name]
-                        # The shard_id for QKVParallelLinear is 'q', 'k', 'v'.
-                        shard_id = src_name.split("_")[0]
-                        weight_loader(param, loaded_weight, shard_id)
-                        loaded_keys.add(full_src_name)
-
-                loaded_keys.add(name)
-                is_packed = True
-                break
-            if is_packed:
-                continue
-
-            # Handle non-packed weights
-            if name not in weights:
-                # Redundant with the check in the loop, but good for safety
-                continue
-
-            loaded_weight = weights[name]
-            weight_loader = getattr(param, "weight_loader", default_weight_loader)
-            weight_loader(param, loaded_weight)
-            loaded_keys.add(name)
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        loader = AutoWeightsLoader(self)
+        return loader.load_weights(weights)
 
 
 EntryClass = PhiForCausalLM

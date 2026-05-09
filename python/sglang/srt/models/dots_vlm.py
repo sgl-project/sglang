@@ -31,7 +31,7 @@ from sglang.srt.managers.mm_utils import (
 )
 from sglang.srt.managers.schedule_batch import MultimodalDataItem, MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
-from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.model_loader.auto_loader import AutoWeightsLoader, WeightsMapper
 from sglang.srt.models.deepseek_v2 import DeepseekV2ForCausalLM
 
 from .dots_vlm_vit import DotsVisionTransformer
@@ -88,37 +88,47 @@ class DotsVLMForCausalLM(nn.Module):
             loaded_weight = torch.cat([loaded_weight, padded_weight], dim=0)
         return loaded_weight
 
-    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> set[str]:
         """Load weights for the model, separating vision and language weights"""
-        weights = list(weights)
 
-        # Separate vision tower weights and language model weights
-        vision_weights = []
-        language_weights = []
+        def _pad_vision(stream):
+            for name, w in stream:
+                # Apply dummy-head padding before the walker resolves the
+                # parameter; ``_pad_vit_attn_dummy_heads`` is a no-op when
+                # num_dummy_heads == 0.
+                if name.startswith("vision_tower."):
+                    # rename matches the substr in the mapper below; pad uses
+                    # the post-rename name.
+                    renamed = name.replace("attn.qkv.", "attn.qkv_proj.")
+                    yield name, self._pad_vit_attn_dummy_heads(renamed, w)
+                else:
+                    yield name, w
 
-        for name, loaded_weight in weights:
-            if name.startswith("vision_tower."):
-                vision_name = name.replace(r"attn.qkv.", r"attn.qkv_proj.")
-                vision_weights.append((vision_name, loaded_weight))
-            else:
-                # All other weights go to language model
-                language_weights.append((name, loaded_weight))
+        # Vision attention checkpoint uses ``attn.qkv``; runtime
+        # ``VisionAttention`` exposes ``attn.qkv_proj``. The DeepseekV2
+        # checkpoint ships top-level ``model.*`` / ``lm_head.*`` — route them
+        # under the runtime ``self.language_model`` python attribute.
+        mapper = WeightsMapper(
+            orig_to_new_substr={"attn.qkv.": "attn.qkv_proj."},
+            orig_to_new_prefix={
+                "model.": "language_model.model.",
+                "lm_head.": "language_model.lm_head.",
+            },
+        )
 
-        # Load vision tower weights
-        if not self.config.language_only:
-            vision_state_dict = dict(vision_weights)
-            params_dict = dict(self.named_parameters(remove_duplicate=False))
-            for name, loaded_weight in vision_state_dict.items():
-                if name not in params_dict:
-                    raise ValueError(f"Weight {name} not found in params_dict")
-                param = params_dict[name]
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                loaded_weight = self._pad_vit_attn_dummy_heads(name, loaded_weight)
-                weight_loader(param, loaded_weight)
+        ignore_unexpected_prefixes: List[str] = []
+        if getattr(self.config, "encoder_only", False):
+            ignore_unexpected_prefixes.append("language_model.")
+            # The HF DeepseekV2 checkpoint also ships ``model.*`` / ``lm_head.*``
+            # at the top level; drop them when only the vision tower exists.
+            ignore_unexpected_prefixes.extend(["model.", "lm_head."])
+        if getattr(self.config, "language_only", False):
+            ignore_unexpected_prefixes.append("vision_tower.")
 
-        # Load language model weights
-        if not self.config.encoder_only and language_weights:
-            self.language_model.load_weights(language_weights)
+        return AutoWeightsLoader(
+            self,
+            ignore_unexpected_prefixes=ignore_unexpected_prefixes or None,
+        ).load_weights(_pad_vision(weights), mapper=mapper)
 
     @classmethod
     def get_model_config_for_expert_location(cls, config):

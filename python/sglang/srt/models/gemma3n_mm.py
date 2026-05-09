@@ -1,7 +1,7 @@
 import logging
 import re
 from functools import lru_cache
-from typing import Iterable, List, Optional, Set, Tuple, TypedDict, Union
+from typing import Iterable, List, Optional, Tuple, TypedDict, Union
 
 import torch
 from torch import nn
@@ -29,9 +29,9 @@ from sglang.srt.managers.schedule_batch import (
     flatten_nested_list,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.model_loader.weight_utils import (
-    default_weight_loader,
-    maybe_remap_kv_scale_name,
+from sglang.srt.model_loader.auto_loader import (
+    WeightsMapper,
+    default_stacked_params_load,
 )
 from sglang.srt.models.gemma3n_audio import Gemma3nAudioEncoder
 from sglang.srt.models.gemma3n_causal import Gemma3nRMSNorm, Gemma3nTextModel
@@ -139,6 +139,19 @@ class Gemma3nMultimodalEmbedder(nn.Module):
 
         emb_norm_proj, _ = self.embedding_projection(emb_norm)
         return self.embedding_post_projection_norm(emb_norm_proj)
+
+
+_GEMMA3N_MM_STACKED_PARAMS_MAPPING: List[Tuple[str, str, object]] = [
+    (".qkv_proj", ".q_proj", "q"),
+    (".qkv_proj", ".k_proj", "k"),
+    (".qkv_proj", ".v_proj", "v"),
+    (".gate_up_proj", ".up_proj", 1),
+    (".gate_up_proj", ".gate_proj", 0),
+]
+_GEMMA3N_MM_NAME_MAPPER = WeightsMapper(
+    orig_to_new_prefix={"model.": ""},
+    orig_to_new_substr={".self_attn.out_proj": ".self_attn.proj"},
+)
 
 
 class Gemma3nForConditionalGeneration(PreTrainedModel):
@@ -449,47 +462,11 @@ class Gemma3nForConditionalGeneration(PreTrainedModel):
         return self.language_model.tie_weights()
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
-        stacked_params_mapping = [
-            # (param_name, shard_name, shard_id)
-            (".qkv_proj", ".q_proj", "q"),
-            (".qkv_proj", ".k_proj", "k"),
-            (".qkv_proj", ".v_proj", "v"),
-            (".gate_up_proj", ".up_proj", 1),
-            (".gate_up_proj", ".gate_proj", 0),
-        ]
         """Load weights for the model."""
-        params_dict = dict(self.named_parameters())
-        loaded_params: Set[str] = set()
-
-        for name, loaded_weight in weights:
-            name = re.sub(r"^model\.", "", name)
-            for param_name, weight_name, shard_id in stacked_params_mapping:
-                if weight_name not in name:
-                    continue
-                name = name.replace(weight_name, param_name)
-                # Skip loading extra bias for GPTQ models
-                if name.endswith(".bias") and name not in params_dict:
-                    continue
-                param = params_dict[name]
-                weight_loader = param.weight_loader
-                weight_loader(param, loaded_weight, shard_id)
-                break
-            else:
-                if "vision_model" in name:
-                    # adapt to VisionAttention
-                    name = name.replace(".self_attn.out_proj", ".self_attn.proj")
-                # Skip loading extra bias for GPTQ models
-                if name.endswith(".bias") and name not in params_dict:
-                    continue
-                # Remapping the name of FP8 kv-scale
-                name = maybe_remap_kv_scale_name(name, params_dict)
-                if name is None:
-                    continue
-                param = params_dict[name]
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                weight_loader(param, loaded_weight)
-            loaded_params.add(name)
-        return loaded_params
+        weights = _GEMMA3N_MM_NAME_MAPPER.apply(weights)
+        return default_stacked_params_load(
+            self, weights, _GEMMA3N_MM_STACKED_PARAMS_MAPPING
+        )
 
     lora_pattern = re.compile(
         r"^language_model\.layers\.(\d+)\.(?:self_attn|mlp)\.(?:qkv_proj|o_proj|down_proj|gate_up_proj)"

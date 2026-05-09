@@ -47,7 +47,7 @@ from sglang.srt.managers.mm_utils import (
 )
 from sglang.srt.managers.schedule_batch import MultimodalDataItem, MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.model_loader.auto_loader import AutoWeightsLoader
 from sglang.srt.models.qwen2 import Qwen2Model
 from sglang.srt.models.utils import WeightsMapper, compute_cu_seqlens_from_grid_numpy
 from sglang.srt.utils import add_prefix, is_npu
@@ -570,50 +570,20 @@ class Qwen2VLForConditionalGeneration(nn.Module):
                 input_ids, hidden_states, self.lm_head, forward_batch
             )
 
-    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
-        stacked_params_mapping = [
-            # (param_name, shard_name, shard_id)
-            ("qkv_proj", "q_proj", "q"),
-            ("qkv_proj", "k_proj", "k"),
-            ("qkv_proj", "v_proj", "v"),
-            ("gate_up_proj", "up_proj", 1),
-            ("gate_up_proj", "gate_proj", 0),
-        ]
-        params_dict = dict(self.named_parameters(remove_duplicate=False))
-        for name, loaded_weight in weights:
-            if "rotary_emb.inv_freq" in name:
-                continue
-            if self.config.tie_word_embeddings and "lm_head.weight" in name:
-                continue
-
-            for param_name, weight_name, shard_id in stacked_params_mapping:
-                if weight_name not in name:
-                    continue
-                name = name.replace(weight_name, param_name)
-
-                # Skip loading extra bias for GPTQ models.
-                if name.endswith(".bias") and name not in params_dict:
-                    continue
-                param = params_dict[name]
-                weight_loader = param.weight_loader
-                weight_loader(param, loaded_weight, shard_id)
-                break
-            else:
-                if "visual" in name:
-                    # adapt to VisionAttention
-                    name = name.replace(r"attn.qkv.", r"attn.qkv_proj.")
-
-                try:
-                    # Skip loading extra bias for GPTQ models.
-                    if name.endswith(".bias") and name not in params_dict:
-                        continue
-                    param = params_dict[name]
-                except KeyError:
-                    print(params_dict.keys())
-                    raise
-
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                weight_loader(param, loaded_weight)
+    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> set[str]:
+        skip_prefixes: List[str] = []
+        if self.config.tie_word_embeddings:
+            skip_prefixes.append("lm_head.")
+        # The visual subtree's checkpoint names ``attn.qkv`` but the runtime
+        # ``VisionAttention`` exposes ``attn.qkv_proj``. Rewrite at the walker
+        # boundary so the checkpoint key resolves to the fused param.
+        mapper = WeightsMapper(
+            orig_to_new_substr={"attn.qkv.": "attn.qkv_proj."},
+        )
+        return AutoWeightsLoader(
+            self,
+            skip_prefixes=skip_prefixes,
+        ).load_weights(weights, mapper=mapper)
 
 
 EntryClass = Qwen2VLForConditionalGeneration

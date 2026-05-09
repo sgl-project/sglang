@@ -44,6 +44,7 @@ from sglang.srt.managers.mm_utils import (
     general_mm_embed_routine,
 )
 from sglang.srt.managers.schedule_batch import MultimodalDataItem, MultimodalInputs
+from sglang.srt.model_loader.auto_loader import AutoWeightsLoader
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.mistral import MistralForCausalLMMistralFormat
 from sglang.srt.models.mistral_large_3 import MistralLarge3ForCausalLM
@@ -131,72 +132,14 @@ class PixtralForConditionalGeneration(nn.Module):
         pattern = MultiModalityDataPaddingPatternMultimodalTokens()
         return pattern.pad_input_tokens(input_ids, mm_inputs)
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
-        def is_vision_encoder_weights(weight: tuple[str, torch.Tensor]):
-            return weight[0].startswith("vision_encoder")
-
-        def is_vision_lang_adapter_weights(weight: tuple[str, torch.Tensor]):
-            return weight[0].startswith("vision_language_adapter")
-
-        def is_patch_merger(weight: tuple[str, torch.Tensor]):
-            return weight[0].startswith("patch_merger")
-
-        def is_pre_mm_projector_norm(weight: tuple[str, torch.Tensor]):
-            return weight[0].startswith("pre_mm_projector_norm")
-
-        # Get references to parameters for direct loading
-        vision_encoder_dict = dict(self.vision_encoder.named_parameters())
-        patch_merger_dict = (
-            dict(self.patch_merger.named_parameters())
-            if self.vision_args.mm_projector_id == PATCH_MERGE
-            else dict()
-        )
-        pre_mm_projector_norm_dict = (
-            dict(self.pre_mm_projector_norm.named_parameters())
-            if self.vision_args.add_pre_mm_projector_layer_norm
-            else dict()
-        )
-        vision_lang_adapter_dict = dict(self.vision_language_adapter.named_parameters())
-
-        def llm_weights_generator():
-            # Single pass over weights
-            for name, w in weights:
-                if is_vision_encoder_weights((name, w)):
-                    # Load vision encoder weights directly
-                    trimmed_name = ".".join(name.split(".")[1:])
-                    # NOTE: The current nvfp4 model has extra weights that we need to ignore, called
-                    # vision_encoder.transformer.layers.*.attention.{k,v}_fake_quantizer.qscale_act
-                    # TODO: Remove this if condition once the model is fixed
-                    if "fake_quantizer.qscale_act" in trimmed_name:
-                        continue
-                    param = vision_encoder_dict[trimmed_name]
-                    with torch.no_grad():
-                        default_weight_loader(param, w)
-                elif is_patch_merger((name, w)):
-                    # Load vision patch merger weights directly
-                    trimmed_name = ".".join(name.split(".")[1:])
-                    param = patch_merger_dict[trimmed_name]
-                    with torch.no_grad():
-                        default_weight_loader(param, w)
-                elif is_pre_mm_projector_norm((name, w)):
-                    # Load vision pre_mm_projector_norm weights directly
-                    trimmed_name = ".".join(name.split(".")[1:])
-                    param = pre_mm_projector_norm_dict[trimmed_name]
-                    with torch.no_grad():
-                        default_weight_loader(param, w)
-                elif is_vision_lang_adapter_weights((name, w)):
-                    # Load vision-language adapter weights directly
-                    trimmed_name = ".".join(name.split(".")[1:])
-                    param = vision_lang_adapter_dict[trimmed_name]
-                    with torch.no_grad():
-                        default_weight_loader(param, w)
-                else:
-                    # LLM weights: yield them to be loaded
-                    # by language_model.load_weights
-                    yield (name, w)
-
-        # Now we call the language model load with the generator
-        self.language_model.load_weights(llm_weights_generator())
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        # NOTE: nvfp4 ships extra ``vision_encoder.transformer.layers.*.attention.
+        # {k,v}_fake_quantizer.qscale_act`` tensors that don't correspond to any
+        # runtime parameter; drop them via skip_substrs.
+        return AutoWeightsLoader(
+            self,
+            skip_substrs=["fake_quantizer.qscale_act"],
+        ).load_weights(weights)
 
     def get_language_model(self) -> torch.nn.Module:
         return self.language_model

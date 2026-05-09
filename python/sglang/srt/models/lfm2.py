@@ -40,10 +40,11 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.model_loader.weight_utils import (
-    default_weight_loader,
-    sharded_weight_loader,
+from sglang.srt.model_loader.auto_loader import (
+    AutoWeightsLoader,
+    default_stacked_params_load,
 )
+from sglang.srt.model_loader.weight_utils import sharded_weight_loader
 from sglang.srt.utils import add_prefix, make_layers, set_weight_attrs
 
 logger = logging.getLogger(__name__)
@@ -445,6 +446,15 @@ class Lfm2Model(nn.Module):
 
         return self.embedding_norm(hidden_states)
 
+    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> set[str]:
+        # Lfm2 only fuses QKV; the MLP uses w1/w3/w2 (no gate_up fusion).
+        stacked_params_mapping = [
+            (".qkv_proj", ".q_proj", "q"),
+            (".qkv_proj", ".k_proj", "k"),
+            (".qkv_proj", ".v_proj", "v"),
+        ]
+        return default_stacked_params_load(self, weights, stacked_params_mapping)
+
 
 class Lfm2ForCausalLM(nn.Module):
     """LFM2 for causal language modeling with hybrid attention/conv architecture."""
@@ -497,64 +507,38 @@ class Lfm2ForCausalLM(nn.Module):
     def load_weights(
         self, weights: Iterable[Tuple[str, torch.Tensor]], is_mtp: bool = False
     ) -> Set[str]:
-        stacked_params_mapping = [
-            ("qkv_proj", "q_proj", "q"),
-            ("qkv_proj", "k_proj", "k"),
-            ("qkv_proj", "v_proj", "v"),
-        ]
-
+        # The HF checkpoint stores short-conv weights as
+        # ``...conv.conv.weight`` (shape ``[D, 1, K]``) and biases as
+        # ``...conv.conv.bias``; this implementation registers them as
+        # ``conv_weight`` / ``conv_bias`` (shape ``[D, K]``). Pre-process the
+        # stream to do the rename and squeeze, and to mirror the embed
+        # tensor into ``lm_head.weight`` when the checkpoint omits it
+        # (tied embeddings).
         params_dict = dict(self.named_parameters())
-        loaded_params: Set[str] = set()
-        embed_tokens_weight = None
+        has_lm_head = "lm_head.weight" in params_dict
+        seen_lm_head = False
 
-        for name, loaded_weight in weights:
-            if "rotary_emb.inv_freq" in name:
-                continue
+        def _preprocess(ws):
+            nonlocal seen_lm_head
+            embed_tokens_weight = None
+            for name, loaded_weight in ws:
+                if name == "lm_head.weight":
+                    seen_lm_head = True
+                if "embed_tokens.weight" in name:
+                    embed_tokens_weight = loaded_weight
+                if ".conv.conv.weight" in name:
+                    name = name.replace(".conv.conv.weight", ".conv.conv_weight")
+                    loaded_weight = loaded_weight.squeeze(1)
+                elif ".conv.conv.bias" in name:
+                    name = name.replace(".conv.conv.bias", ".conv.conv_bias")
+                yield name, loaded_weight
+            # If the checkpoint omitted lm_head.weight (tied embeddings),
+            # synthesize it from embed_tokens.
+            if has_lm_head and not seen_lm_head and embed_tokens_weight is not None:
+                yield "lm_head.weight", embed_tokens_weight
 
-            if "embed_tokens.weight" in name:
-                embed_tokens_weight = loaded_weight
-
-            # Handle conv weight/bias naming: HF uses conv.conv, we use conv_weight/conv_bias
-            if ".conv.conv.weight" in name:
-                name = name.replace(".conv.conv.weight", ".conv.conv_weight")
-                loaded_weight = loaded_weight.squeeze(1)  # (D, 1, K) -> (D, K)
-            if ".conv.conv.bias" in name:
-                name = name.replace(".conv.conv.bias", ".conv.conv_bias")
-
-            # Handle QKV stacking
-            for param_name, weight_name, shard_id in stacked_params_mapping:
-                if weight_name not in name:
-                    continue
-                name = name.replace(weight_name, param_name)
-                if name.endswith(".bias") and name not in params_dict:
-                    break
-                if name not in params_dict:
-                    break
-                param = params_dict[name]
-                weight_loader = getattr(param, "weight_loader")
-                weight_loader(param, loaded_weight, shard_id)
-                loaded_params.add(name)
-                break
-            else:
-                if name.endswith(".bias") and name not in params_dict:
-                    continue
-                if name not in params_dict:
-                    continue
-
-                param = params_dict[name]
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                weight_loader(param, loaded_weight)
-                loaded_params.add(name)
-
-        # Handle tied lm_head weight
-        if "lm_head.weight" not in loaded_params and "lm_head.weight" in params_dict:
-            if embed_tokens_weight is not None:
-                param = params_dict["lm_head.weight"]
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                weight_loader(param, embed_tokens_weight)
-                loaded_params.add("lm_head.weight")
-
-        return loaded_params
+        loader = AutoWeightsLoader(self)
+        return loader.load_weights(_preprocess(weights))
 
 
 EntryClass = [Lfm2ForCausalLM]

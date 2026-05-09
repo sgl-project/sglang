@@ -63,6 +63,11 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_loader.auto_loader import (
+    STACKED_PARAMS_MAPPING_LLAMA,
+    AutoWeightsLoader,
+    default_stacked_params_load,
+)
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.utils import add_prefix
 
@@ -388,6 +393,9 @@ class LlamaModel(nn.Module):
         hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states
 
+    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> set[str]:
+        return default_stacked_params_load(self, weights, STACKED_PARAMS_MAPPING_LLAMA)
+
 
 class TorchNativeLlamaForCausalLM(nn.Module):
     def __init__(
@@ -495,9 +503,18 @@ class TorchNativeLlamaForCausalLM(nn.Module):
     def load_weights(
         self,
         weights: Iterable[Tuple[str, torch.Tensor]],
-    ):
+    ) -> set[str]:
         """Load weights onto the full model."""
-        self.load_weights_to_module("", weights)
+        skip_prefixes: list[str] = []
+        if self.config.tie_word_embeddings:
+            skip_prefixes.append("lm_head.")
+        loader = AutoWeightsLoader(
+            self,
+            skip_prefixes=skip_prefixes,
+            skip_substrs=["projector"],
+            ignore_unexpected_prefixes=["model.vision_tower."],
+        )
+        return loader.load_weights(weights)
 
 
 class TorchNativePhi3ForCausalLM(TorchNativeLlamaForCausalLM):

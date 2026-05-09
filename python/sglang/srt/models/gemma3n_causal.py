@@ -1,4 +1,4 @@
-from typing import Iterable, Optional, Set, Tuple
+from typing import Iterable, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -21,9 +21,11 @@ from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.model_loader.weight_utils import (
-    default_weight_loader,
-    maybe_remap_kv_scale_name,
+from sglang.srt.model_loader.auto_loader import (
+    STACKED_PARAMS_MAPPING_LLAMA,
+    AutoWeightsLoader,
+    WeightsMapper,
+    default_stacked_params_load,
 )
 from sglang.srt.models.gemma3_causal import Gemma3TextScaledWordEmbedding
 from sglang.srt.utils import add_prefix, make_layers
@@ -846,6 +848,9 @@ class Gemma3nTextModel(PreTrainedModel):
 
         return hidden_states
 
+    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> set[str]:
+        return default_stacked_params_load(self, weights, STACKED_PARAMS_MAPPING_LLAMA)
+
 
 class Gemma3nForCausalLM(PreTrainedModel):
     config_class = Gemma3nTextConfig
@@ -957,54 +962,15 @@ class Gemma3nForCausalLM(PreTrainedModel):
             input_ids, hidden_states, self.model.embed_tokens, forward_batch
         )
 
-    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
-        stacked_params_mapping = [
-            # (param_name, shard_name, shard_id)
-            (".qkv_proj", ".q_proj", "q"),
-            (".qkv_proj", ".k_proj", "k"),
-            (".qkv_proj", ".v_proj", "v"),
-            (".gate_up_proj", ".gate_proj", 0),
-            (".gate_up_proj", ".up_proj", 1),
-        ]
-        params_dict = dict(self.named_parameters())
-        loaded_params: Set[str] = set()
-
-        for name, loaded_weight in weights:
-            name = name.replace("model.language_model.", "model.")
-            for param_name, shard_name, shard_id in stacked_params_mapping:
-                if shard_name not in name:
-                    continue
-                name = name.replace(shard_name, param_name)
-                # Skip loading extra bias for GPTQ models
-                if name.endswith(".bias") and name not in params_dict:
-                    continue
-                if name not in params_dict:
-                    # Skip loading weights that are not in the model
-                    continue
-                param = params_dict[name]
-                weight_loader = param.weight_loader
-                weight_loader(param, loaded_weight, shard_id)
-                break
-            else:
-                # lm_head is not used in vllm as it is tied with embed_token
-                if "lm_head.weight" in name:
-                    continue
-                # Skip loading extra bias for GPTQ models
-                if name.endswith(".bias") and name not in params_dict:
-                    continue
-                # Remapping the name of FP8 kv-scale
-                name = maybe_remap_kv_scale_name(name, params_dict)
-                if name is None:
-                    continue
-                if name not in params_dict:
-                    # Skip loading weights that are not in the model
-                    continue
-
-                param = params_dict[name]
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                weight_loader(param, loaded_weight)
-            loaded_params.add(name)
-        return loaded_params
+    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> set[str]:
+        # HF checkpoints expose the trunk under ``model.language_model.*`` for
+        # the multimodal Gemma3n; we host it directly under ``model.*``.
+        mapper = WeightsMapper(orig_to_new_substr={"model.language_model.": "model."})
+        # lm_head is unconditionally skipped: when tied it aliases embed_tokens,
+        # and the legacy loader never loaded a separate lm_head.weight either.
+        return AutoWeightsLoader(self, skip_prefixes=["lm_head."]).load_weights(
+            weights, mapper=mapper
+        )
 
 
 EntryClass = Gemma3nForCausalLM

@@ -34,8 +34,18 @@ from sglang.srt.layers.linear import (
     RowParallelLinear,
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.model_loader.auto_loader import (
+    WeightsMapper,
+    default_stacked_params_load,
+)
 from sglang.srt.utils import add_prefix
+
+_SIGLIP2_STACKED_PARAMS_MAPPING: list[tuple[str, str, str]] = [
+    (".attn.qkv_proj", ".q_proj", "q"),
+    (".attn.qkv_proj", ".k_proj", "k"),
+    (".attn.qkv_proj", ".v_proj", "v"),
+]
+_SIGLIP2_NAME_MAPPER = WeightsMapper(orig_to_new_substr={"out_proj": "attn.proj"})
 
 
 class Siglip2VisionEmbeddings(nn.Module):
@@ -527,58 +537,27 @@ class Siglip2Model(nn.Module):
         )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        stacked_params_mapping = [
-            # (param_name, shard_name, shard_id)
-            # VisionAttention uses attn.qkv_proj for fused Q/K/V
-            ("attn.qkv_proj", "q_proj", "q"),
-            ("attn.qkv_proj", "k_proj", "k"),
-            ("attn.qkv_proj", "v_proj", "v"),
-        ]
-        # VisionAttention uses attn.proj instead of out_proj
-        params_rename_mapping = {
-            "out_proj": "attn.proj",
-        }
-        params_dict = dict(self.named_parameters())
-        loaded_params: set[str] = set()
         layer_count = len(self.vision_model.encoder.layers)
+        post_layernorm_present = self.vision_model.post_layernorm is not None
 
-        for name, loaded_weight in weights:
-            # post_layernorm is optional in Siglip2Model
-            if (
-                name.startswith("vision_model.post_layernorm")
-                and self.vision_model.post_layernorm is None
-            ):
-                continue
-
-            # omit layers when num_hidden_layers_override is set
-            if name.startswith("vision_model.encoder.layers"):
-                layer_idx = int(name.split(".")[3])
-                if layer_idx >= layer_count:
+        def _filter(
+            ws: Iterable[tuple[str, torch.Tensor]],
+        ) -> Iterable[tuple[str, torch.Tensor]]:
+            for name, w in ws:
+                # post_layernorm is optional in Siglip2Model
+                if (
+                    name.startswith("vision_model.post_layernorm")
+                    and not post_layernorm_present
+                ):
                     continue
+                # omit layers when num_hidden_layers_override is set
+                if name.startswith("vision_model.encoder.layers"):
+                    layer_idx = int(name.split(".")[3])
+                    if layer_idx >= layer_count:
+                        continue
+                yield name, w
 
-            for param_name, weight_name, shard_id in stacked_params_mapping:
-                if weight_name not in name:
-                    continue
-                name = name.replace(weight_name, param_name)
-
-                if name not in params_dict:
-                    continue
-
-                param = params_dict[name]
-                weight_loader = param.weight_loader
-                weight_loader(param, loaded_weight, shard_id)
-                break
-            else:
-                # Apply rename mappings (e.g., out_proj -> attn.proj)
-                for old_name, new_name in params_rename_mapping.items():
-                    if old_name in name:
-                        name = name.replace(old_name, new_name)
-                        break
-
-                if name not in params_dict:
-                    continue
-                param = params_dict[name]
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                weight_loader(param, loaded_weight)
-            loaded_params.add(name)
-        return loaded_params
+        weights = _SIGLIP2_NAME_MAPPER.apply(_filter(weights))
+        return default_stacked_params_load(
+            self, weights, _SIGLIP2_STACKED_PARAMS_MAPPING
+        )

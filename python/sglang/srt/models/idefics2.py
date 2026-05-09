@@ -18,6 +18,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from collections.abc import Iterable
 from typing import Optional
 
 import torch
@@ -29,7 +30,15 @@ from sglang.srt.layers.attention.vision import VisionAttention
 from sglang.srt.layers.conv import Conv2dLayer
 from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.model_loader.auto_loader import default_stacked_params_load
 from sglang.srt.utils import add_prefix, is_npu
+
+# QKV split → fused for the Idefics2-style siglip vision encoder.
+_IDEFICS2_VISION_STACKED = [
+    (".self_attn.qkv_proj", ".self_attn.q_proj", "q"),
+    (".self_attn.qkv_proj", ".self_attn.k_proj", "k"),
+    (".self_attn.qkv_proj", ".self_attn.v_proj", "v"),
+]
 
 
 class Idefics2VisionMLP(nn.Module):
@@ -343,3 +352,10 @@ class Idefics2VisionTransformer(nn.Module):
         )
         last_hidden_state = self.post_layernorm(encoder_outputs)
         return last_hidden_state
+
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        # ``VisionAttention`` packs ``qkv_proj`` (QKVParallelLinear); the
+        # checkpoint ships split ``q_proj`` / ``k_proj`` / ``v_proj`` siblings.
+        return default_stacked_params_load(
+            self, weights, _IDEFICS2_VISION_STACKED, skip_pp_out_of_range=False
+        )

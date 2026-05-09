@@ -21,7 +21,8 @@ from transformers import Gemma2Config
 from sglang.srt.layers.pooler import EmbeddingPoolerOutput, Pooler, PoolingType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.models.gemma2 import Gemma2ForCausalLM, Gemma2Model
+from sglang.srt.model_loader.auto_loader import AutoWeightsLoader
+from sglang.srt.models.gemma2 import Gemma2Model
 from sglang.srt.utils import add_prefix
 
 
@@ -68,8 +69,9 @@ class Gemma2ForSequenceClassification(nn.Module):
             ),
         )
 
-    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
-        Gemma2ForCausalLM.load_weights(self, weights)
+    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> set[str]:
+        loader = AutoWeightsLoader(self, skip_prefixes=["lm_head."])
+        return loader.load_weights(weights)
 
 
 EntryClass = [Gemma2ForSequenceClassification]

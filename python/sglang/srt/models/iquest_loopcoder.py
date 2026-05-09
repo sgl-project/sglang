@@ -36,7 +36,11 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.model_loader.auto_loader import (
+    STACKED_PARAMS_MAPPING_LLAMA,
+    AutoWeightsLoader,
+    default_stacked_params_load,
+)
 from sglang.srt.models.llama import LlamaMLP as LoopCoderMLP
 from sglang.srt.utils import add_prefix, make_layers
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
@@ -395,6 +399,9 @@ class IQuestLoopCoderModel(nn.Module):
         hidden_states = self.norm(hidden_states)
         return hidden_states
 
+    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> set[str]:
+        return default_stacked_params_load(self, weights, STACKED_PARAMS_MAPPING_LLAMA)
+
 
 class IQuestLoopCoderForCausalLM(nn.Module):
     def __init__(
@@ -438,60 +445,24 @@ class IQuestLoopCoderForCausalLM(nn.Module):
             input_ids, hidden_states, self.lm_head, forward_batch
         )
 
-    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
-        stacked_params_mapping = [
-            ("qkv_proj", "q_proj", "q"),
-            ("qkv_proj", "k_proj", "k"),
-            ("qkv_proj", "v_proj", "v"),
-            ("gate_up_proj", "gate_proj", 0),
-            ("gate_up_proj", "up_proj", 1),
-        ]
-        params_dict = dict(self.named_parameters())
-        for name, loaded_weight in weights:
-            if "rotary_emb.inv_freq" in name:
-                continue
+    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> set[str]:
+        # The checkpoint stores gate projections as ``gate_projections.<idx>.weight``
+        # but the runtime module nests a ``gate_proj`` submodule under
+        # ``self.model``, so redirect those keys before the walker sees them.
+        def remap(weights):
+            for name, w in weights:
+                if name.startswith("gate_projections."):
+                    if name.endswith(".weight"):
+                        yield "model." + name[
+                            : -len(".weight")
+                        ] + ".gate_proj.weight", w
+                    elif name.endswith(".bias"):
+                        yield "model." + name[: -len(".bias")] + ".gate_proj.bias", w
+                    continue
+                yield name, w
 
-            # Handle gate_projections weights
-            if name.startswith("gate_projections."):
-                if name.endswith(".weight"):
-                    sglang_name = name.replace(".weight", ".gate_proj.weight")
-                elif name.endswith(".bias"):
-                    sglang_name = name.replace(".bias", ".gate_proj.bias")
-                else:
-                    continue
-
-                if sglang_name in params_dict:
-                    param = params_dict[sglang_name]
-                    weight_loader = getattr(
-                        param, "weight_loader", default_weight_loader
-                    )
-                    weight_loader(param, loaded_weight)
-                continue
-
-            # Handle stacked parameters
-            for param_name, weight_name, shard_id in stacked_params_mapping:
-                if weight_name not in name:
-                    continue
-                name = name.replace(weight_name, param_name)
-                if name.endswith(".bias") and name not in params_dict:
-                    continue
-                if name in params_dict:
-                    param = params_dict[name]
-                    weight_loader = getattr(
-                        param, "weight_loader", default_weight_loader
-                    )
-                    weight_loader(param, loaded_weight, shard_id)
-                break
-            else:
-                # Handle regular parameters
-                if name.endswith(".bias") and name not in params_dict:
-                    continue
-                if name in params_dict:
-                    param = params_dict[name]
-                    weight_loader = getattr(
-                        param, "weight_loader", default_weight_loader
-                    )
-                    weight_loader(param, loaded_weight)
+        loader = AutoWeightsLoader(self)
+        return loader.load_weights(remap(weights))
 
 
 # Entry class for model registration

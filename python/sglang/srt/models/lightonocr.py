@@ -44,7 +44,7 @@ from sglang.srt.managers.mm_utils import (
 )
 from sglang.srt.managers.schedule_batch import MultimodalDataItem, MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.model_loader.auto_loader import AutoWeightsLoader, WeightsMapper
 from sglang.srt.models.pixtral import (
     PATCH_MERGE,
     PatchMerger,
@@ -195,104 +195,30 @@ class LightOnOCRForConditionalGeneration(nn.Module):
     def get_embed_and_head(self):
         return self.language_model.get_embed_and_head()
 
-    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
-        """Load weights from HuggingFace checkpoint.
+    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> set[str]:
+        """Load weights from HuggingFace checkpoint via AutoWeightsLoader.
 
-        HF checkpoint weight layout (after stripping ``model.`` prefix):
-        - ``vision_encoder.*`` -> self.vision_encoder
-        - ``vision_projection.norm.*`` -> self.vision_projection_norm
-        - ``vision_projection.patch_merger.*`` -> self.patch_merger
-        - ``vision_projection.linear_1.*`` -> self.vision_language_adapter.w_in
-        - ``vision_projection.linear_2.*`` -> self.vision_language_adapter.w_out
-        - ``language_model.*`` -> self.language_model (Qwen3ForCausalLM)
+        HF checkpoint weight layout (all under top-level ``model.`` prefix):
+        - ``model.vision_encoder.*`` -> self.vision_encoder (PixtralHFVisionModel
+          owns its own ``load_weights`` for QKV/gate-up fusion + o_proj→proj)
+        - ``model.vision_projection.norm.*`` -> self.vision_projection_norm
+        - ``model.vision_projection.patch_merger.*`` -> self.patch_merger
+        - ``model.vision_projection.linear_1.*`` -> self.vision_language_adapter.w_in
+        - ``model.vision_projection.linear_2.*`` -> self.vision_language_adapter.w_out
+        - ``model.language_model.*`` -> self.language_model (Qwen3ForCausalLM,
+          which expects keys under its own ``model.`` attribute).
         """
-        vision_encoder_dict = dict(self.vision_encoder.named_parameters())
-        patch_merger_dict = dict(self.patch_merger.named_parameters())
-        norm_dict = dict(self.vision_projection_norm.named_parameters())
-        adapter_dict = dict(self.vision_language_adapter.named_parameters())
-
-        # PixtralHFVisionModel uses SGLang parallel layers with stacked params
-        stacked_params_mapping = [
-            (".attention.qkv_proj", ".attention.q_proj", "q"),
-            (".attention.qkv_proj", ".attention.k_proj", "k"),
-            (".attention.qkv_proj", ".attention.v_proj", "v"),
-            (".feed_forward.gate_up_proj", ".feed_forward.gate_proj", 0),
-            (".feed_forward.gate_up_proj", ".feed_forward.up_proj", 1),
-        ]
-
-        def llm_weights_generator():
-            for name, w in weights:
-                # HF checkpoint prefixes all weights with model.
-                if name.startswith("model."):
-                    name = name[len("model.") :]
-
-                if name.startswith("vision_encoder."):
-                    trimmed = name[len("vision_encoder.") :]
-
-                    # Handle stacked params (QKV, gate/up)
-                    loaded = False
-                    for param_name, weight_name, shard_id in stacked_params_mapping:
-                        if weight_name in trimmed:
-                            transformed = trimmed.replace(weight_name, param_name)
-                            if transformed in vision_encoder_dict:
-                                param = vision_encoder_dict[transformed]
-                                weight_loader = getattr(
-                                    param, "weight_loader", default_weight_loader
-                                )
-                                with torch.no_grad():
-                                    weight_loader(param, w, shard_id)
-                                loaded = True
-                                break
-
-                    if not loaded:
-                        # Handle o_proj -> proj rename
-                        if ".attention.o_proj" in trimmed:
-                            trimmed = trimmed.replace(
-                                ".attention.o_proj", ".attention.proj"
-                            )
-                        if trimmed in vision_encoder_dict:
-                            param = vision_encoder_dict[trimmed]
-                            weight_loader = getattr(
-                                param, "weight_loader", default_weight_loader
-                            )
-                            with torch.no_grad():
-                                weight_loader(param, w)
-
-                elif name.startswith("vision_projection."):
-                    remaining = name[len("vision_projection.") :]
-
-                    if remaining.startswith("patch_merger."):
-                        trimmed = remaining[len("patch_merger.") :]
-                        if trimmed in patch_merger_dict:
-                            param = patch_merger_dict[trimmed]
-                            with torch.no_grad():
-                                default_weight_loader(param, w)
-
-                    elif remaining.startswith("norm."):
-                        trimmed = remaining[len("norm.") :]
-                        if trimmed in norm_dict:
-                            param = norm_dict[trimmed]
-                            with torch.no_grad():
-                                default_weight_loader(param, w)
-
-                    else:
-                        # linear_1 -> w_in, linear_2 -> w_out
-                        trimmed = remaining.replace("linear_1.", "w_in.").replace(
-                            "linear_2.", "w_out."
-                        )
-                        if trimmed in adapter_dict:
-                            param = adapter_dict[trimmed]
-                            with torch.no_grad():
-                                default_weight_loader(param, w)
-
-                else:
-                    # Language model weights and any other weights
-                    if name.startswith("language_model."):
-                        # Qwen3ForCausalLM expects model.* prefix
-                        name = "model." + name[len("language_model.") :]
-                    yield (name, w)
-
-        self.language_model.load_weights(llm_weights_generator())
+        mapper = WeightsMapper(
+            orig_to_new_prefix={
+                "model.vision_encoder.": "vision_encoder.",
+                "model.vision_projection.norm.": "vision_projection_norm.",
+                "model.vision_projection.patch_merger.": "patch_merger.",
+                "model.vision_projection.linear_1.": "vision_language_adapter.w_in.",
+                "model.vision_projection.linear_2.": "vision_language_adapter.w_out.",
+                "model.language_model.": "language_model.model.",
+            },
+        )
+        return AutoWeightsLoader(self).load_weights(weights, mapper=mapper)
 
 
 EntryClass = LightOnOCRForConditionalGeneration

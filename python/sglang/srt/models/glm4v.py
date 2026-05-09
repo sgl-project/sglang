@@ -54,7 +54,11 @@ from sglang.srt.managers.mm_utils import (
 )
 from sglang.srt.managers.schedule_batch import MultimodalDataItem, MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
-from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.model_loader.auto_loader import (
+    AutoWeightsLoader,
+    WeightsMapper,
+    default_stacked_params_load,
+)
 from sglang.srt.models.glm4 import Glm4Model
 from sglang.srt.multimodal.mm_utils import run_dp_sharded_mrope_vision_model
 from sglang.srt.server_args import get_global_server_args
@@ -541,6 +545,21 @@ class Glm4vVisionModel(nn.Module):
 
         return x
 
+    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> set[str]:
+        # Visual blocks pack ``gate_up_proj`` (MergedColumnParallelLinear) and
+        # ship a fused ``attn.qkv`` already, so only gate_up needs the stacked
+        # rename here. The outer ``Glm4vForConditionalGeneration.load_weights``
+        # handles the ``attn.qkv`` → ``attn.qkv_proj`` rename via mapper.
+        return default_stacked_params_load(
+            self,
+            weights,
+            [
+                (".gate_up_proj", ".gate_proj", 0),
+                (".gate_up_proj", ".up_proj", 1),
+            ],
+            skip_pp_out_of_range=False,
+        )
+
 
 class Glm4vForConditionalGeneration(nn.Module):
     def __init__(
@@ -732,75 +751,30 @@ class Glm4vForConditionalGeneration(nn.Module):
             loaded_weight = torch.cat([loaded_weight, padded_weight], dim=0)
         return loaded_weight
 
-    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
-        stacked_params_mapping = [
-            # (param_name, shard_name, shard_id)
-            (".qkv_proj", ".q_proj", "q"),
-            (".qkv_proj", ".k_proj", "k"),
-            (".qkv_proj", ".v_proj", "v"),
-            (".gate_up_proj", ".up_proj", 1),
-            (".gate_up_proj", ".gate_proj", 0),
-        ]
-        params_dict = dict(self.named_parameters(remove_duplicate=False))
-
-        # For the PP case, we add special handling for lm_head.weight,
-        # - On non–last ranks: we continue, because this stage is supposed to
-        #   be just an empty PPMissingLayer shell.
-        # - On the last rank: params_dict is expected to contain lm_head.weight,
-        #   so it will never hit the branch "if name not in params_dict".
-        #
-        # For all other parameters, such like
-        # "model.visual.blocks.20.mlp.gate_proj.weight", the unified rule is:
-        # If this name does not exist in the current rank’s params_dict,
-        # it does not belong to this pipeline stage, thus we simply continue.
-        for name, loaded_weight in weights:
-            if "rotary_emb.inv_freq" in name:
-                continue
-            if "language_model" in name:
-                name = name.replace(r"model.language_model.", r"model.")
-            if "model.visual." in name:
-                name = name.replace("model.visual.", "visual.")
-
-            for param_name, weight_name, shard_id in stacked_params_mapping:
-                if weight_name not in name:
-                    continue
-                name = name.replace(weight_name, param_name)
-
-                # Skip loading extra bias for GPTQ models.
-                if name.endswith(".bias") and name not in params_dict:
-                    continue
-
-                if name not in params_dict:
-                    continue
-
-                param = params_dict[name]
-                weight_loader = param.weight_loader
-                weight_loader(param, loaded_weight, shard_id)
-                break
-            else:
+    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> set[str]:
+        # Pad vision-tower attention weights for dummy heads at the stream
+        # boundary so the runtime ``QKVParallelLinear`` sees the right shape.
+        # ``pad_vit_attn_dummy_heads`` is a no-op when num_dummy_heads == 0.
+        def _pad_visual(stream):
+            for name, w in stream:
                 if "visual" in name:
-                    # adapt to VisionAttention
-                    name = name.replace(r"attn.qkv.", r"attn.qkv_proj.")
+                    w = vision_utils.pad_vit_attn_dummy_heads(self.config, name, w)
+                yield name, w
 
-                try:
-                    # Skip loading extra bias for GPTQ models.
-                    if name.endswith(".bias") and name not in params_dict:
-                        continue
-
-                    if name not in params_dict:
-                        continue
-
-                    param = params_dict[name]
-                except KeyError:
-                    print(params_dict.keys())
-                    raise
-
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                if "visual" in name:
-                    loaded_weight = vision_utils.pad_vit_attn_dummy_heads(
-                        self.config, name, loaded_weight
-                    )
-                weight_loader(param, loaded_weight)
+        # Checkpoint name conventions:
+        #   - transformers>=4.52: ``model.language_model.<...>`` / ``model.visual.<...>``
+        #   - original release:    ``model.<...>``                 / ``visual.<...>``
+        # Map both onto runtime python attributes ``self.model`` / ``self.visual``.
+        # Vision attention uses ``attn.qkv`` in the checkpoint; runtime
+        # ``VisionAttention`` exposes ``attn.qkv_proj``.
+        mapper = WeightsMapper(
+            orig_to_new_substr={"attn.qkv.": "attn.qkv_proj."},
+            orig_to_new_prefix={
+                "model.language_model.": "model.",
+                "model.visual.": "visual.",
+            },
+        )
+        return AutoWeightsLoader(self).load_weights(_pad_visual(weights), mapper=mapper)
 
     def get_embed_and_head(self):
         return self.model.embed_tokens.weight, self.lm_head.weight

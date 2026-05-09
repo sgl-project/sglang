@@ -38,10 +38,11 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.model_loader.weight_utils import (
-    default_weight_loader,
-    maybe_remap_kv_scale_name,
+from sglang.srt.model_loader.auto_loader import (
+    AutoWeightsLoader,
+    default_stacked_params_load,
 )
+from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.utils import add_prefix
 
 
@@ -237,6 +238,15 @@ class GPTJModel(nn.Module):
         hidden_states = self.ln_f(hidden_states)
         return hidden_states
 
+    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> set[str]:
+        # GPT-J only fuses QKV; the MLP is fc_in / fc_out (no gate_up).
+        stacked_params_mapping = [
+            (".qkv_proj", ".q_proj", "q"),
+            (".qkv_proj", ".k_proj", "k"),
+            (".qkv_proj", ".v_proj", "v"),
+        ]
+        return default_stacked_params_load(self, weights, stacked_params_mapping)
+
 
 class GPTJForCausalLM(nn.Module):
 
@@ -276,51 +286,37 @@ class GPTJForCausalLM(nn.Module):
             input_ids, hidden_states, self.lm_head, forward_batch
         )
 
-    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
-        stacked_params_mapping = [
-            # (param_name, shard_name, shard_id)
-            ("qkv_proj", "q_proj", "q"),
-            ("qkv_proj", "k_proj", "k"),
-            ("qkv_proj", "v_proj", "v"),
-        ]
+    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> set[str]:
+        # GPT-J specifics handled outside the walker:
+        #  - The HF checkpoint ships per-layer ``attn.bias`` and
+        #    ``attn.masked_bias`` causal-mask tensors that we don't reify;
+        #    they're filtered via ``skip_substrs``.
+        #  - When KV-cache quant scales come through, the quant config knows
+        #    the scale's runtime parameter name; redirect those tensors here
+        #    so the walker can route them normally.
         params_dict = dict(self.named_parameters())
-        for name, loaded_weight in weights:
-            if "attn.bias" in name or "attn.masked_bias" in name:
-                continue
 
-            if self.quant_config is not None and (
-                scale_name := self.quant_config.get_cache_scale(name)
-            ):
-                # Loading kv cache quantization scales
-                param = params_dict[scale_name]
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                loaded_weight = (
-                    loaded_weight if loaded_weight.dim() == 0 else loaded_weight[0]
-                )
-                weight_loader(param, loaded_weight)
-                continue
+        def _redirect_kv_scales(ws):
+            for name, loaded_weight in ws:
+                if self.quant_config is not None and (
+                    scale_name := self.quant_config.get_cache_scale(name)
+                ):
+                    param = params_dict[scale_name]
+                    weight_loader = getattr(
+                        param, "weight_loader", default_weight_loader
+                    )
+                    loaded_weight = (
+                        loaded_weight if loaded_weight.dim() == 0 else loaded_weight[0]
+                    )
+                    weight_loader(param, loaded_weight)
+                    continue
+                yield name, loaded_weight
 
-            for param_name, weight_name, shard_id in stacked_params_mapping:
-                if weight_name not in name:
-                    continue
-                name = name.replace(weight_name, param_name)
-                # Skip loading extra bias for GPTQ models.
-                if name.endswith(".bias") and name not in params_dict:
-                    continue
-                param = params_dict[name]
-                weight_loader = param.weight_loader
-                weight_loader(param, loaded_weight, shard_id)
-                break
-            else:
-                name = maybe_remap_kv_scale_name(name, params_dict)
-                if name is None:
-                    continue
-                # Skip loading extra bias for GPTQ models.
-                if name.endswith(".bias") and name not in params_dict:
-                    continue
-                param = params_dict[name]
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                weight_loader(param, loaded_weight)
+        loader = AutoWeightsLoader(
+            self,
+            skip_substrs=["attn.bias", "attn.masked_bias"],
+        )
+        return loader.load_weights(_redirect_kv_scales(weights))
 
 
 EntryClass = GPTJForCausalLM

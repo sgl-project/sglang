@@ -47,14 +47,17 @@ from sglang.srt.layers.moe.utils import RoutingMethodType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
-from sglang.srt.layers.utils import get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
 from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
-from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.model_loader.auto_loader import (
+    AutoWeightsLoader,
+    WeightsMapper,
+    default_moe_load,
+)
 from sglang.srt.models.bailing_moe import BailingMoEForCausalLM
 from sglang.srt.models.deepseek_common.attention_forward_methods.forward_mha import (
     DeepseekMHAForwardMixin,
@@ -1221,6 +1224,27 @@ class SarvamMLAModel(nn.Module):
 
         return hidden_states
 
+    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> set[str]:
+        # Sarvam is MLA-based: no QKV stacking, only gate_up fusion. Mutually
+        # rename ``mlp.gate.e_score_correction_bias`` -> ``mlp.e_score_correction_bias``
+        # before dispatching since the runtime parameter lives on the MoE block.
+        stacked_params_mapping = [
+            (".gate_up_proj", ".gate_proj", 0),
+            (".gate_up_proj", ".up_proj", 1),
+        ]
+        expert_params_mapping = FusedMoE.make_expert_params_mapping(
+            ckpt_gate_proj_name="gate_proj",
+            ckpt_down_proj_name="down_proj",
+            ckpt_up_proj_name="up_proj",
+            num_experts=self.config.num_experts,
+        )
+        return default_moe_load(
+            self,
+            weights,
+            stacked_params_mapping=stacked_params_mapping,
+            expert_params_mapping=expert_params_mapping,
+        )
+
 
 class SarvamMLAForCausalLM(nn.Module):
 
@@ -1347,78 +1371,12 @@ class SarvamMLAForCausalLM(nn.Module):
         is_nextn: bool = False,
     ) -> None:
         del is_nextn
-        stacked_params_mapping = [
-            (".gate_up_proj", ".gate_proj", 0),
-            (".gate_up_proj", ".up_proj", 1),
-        ]
-        expert_params_mapping = FusedMoE.make_expert_params_mapping(
-            ckpt_gate_proj_name="gate_proj",
-            ckpt_down_proj_name="down_proj",
-            ckpt_up_proj_name="up_proj",
-            num_experts=self.config.num_experts,
+        mapper = WeightsMapper(
+            orig_to_new_substr={
+                ".mlp.gate.e_score_correction_bias": ".mlp.e_score_correction_bias",
+            },
         )
-        params_dict = dict(self.named_parameters())
-
-        for name, loaded_weight in weights:
-            layer_id = get_layer_id(name)
-            if layer_id is not None and (
-                layer_id < self.start_layer or layer_id >= self.end_layer
-            ):
-                continue
-
-            if "rotary_emb.inv_freq" in name:
-                continue
-
-            if ".mlp.gate.e_score_correction_bias" in name:
-                name = name.replace(
-                    ".mlp.gate.e_score_correction_bias", ".mlp.e_score_correction_bias"
-                )
-
-            is_stacked = False
-            for param_name, weight_name, shard_id in stacked_params_mapping:
-                if weight_name not in name or "mlp.experts" in name:
-                    continue
-                mapped_name = name.replace(weight_name, param_name)
-                if mapped_name.endswith(".bias") and mapped_name not in params_dict:
-                    continue
-                if mapped_name not in params_dict:
-                    continue
-                param = params_dict[mapped_name]
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                weight_loader(param, loaded_weight, shard_id)
-                is_stacked = True
-                break
-            if is_stacked:
-                continue
-
-            is_expert = False
-            for param_name, weight_name, expert_id, shard_id in expert_params_mapping:
-                if weight_name not in name:
-                    continue
-                mapped_name = name.replace(weight_name, param_name)
-                if mapped_name not in params_dict:
-                    continue
-                param = params_dict[mapped_name]
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                weight_loader(
-                    param,
-                    loaded_weight,
-                    mapped_name,
-                    shard_id=shard_id,
-                    expert_id=expert_id,
-                )
-                is_expert = True
-                break
-            if is_expert:
-                continue
-
-            if name.endswith(".bias") and name not in params_dict:
-                continue
-            if name not in params_dict:
-                continue
-            param = params_dict[name]
-            weight_loader = getattr(param, "weight_loader", default_weight_loader)
-            weight_loader(param, loaded_weight)
+        loaded = AutoWeightsLoader(self).load_weights(weights, mapper=mapper)
 
         self._set_mla_wkc_wvc()
         if not hasattr(self, "routed_experts_weights_of_layer"):
@@ -1427,6 +1385,7 @@ class SarvamMLAForCausalLM(nn.Module):
                 for layer_id in range(self.start_layer, self.end_layer)
                 if isinstance(self.model.layers[layer_id].mlp, SarvamMoESparseMoeBlock)
             }
+        return loaded
 
     def _set_mla_wkc_wvc(self) -> None:
         for layer_id in range(self.start_layer, self.end_layer):

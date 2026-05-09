@@ -36,7 +36,7 @@ from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.model_loader.auto_loader import AutoWeightsLoader
 from sglang.srt.utils import add_prefix
 
 
@@ -258,32 +258,28 @@ class GPT2LMHeadModel(nn.Module):
             input_ids, hidden_states, self.lm_head, forward_batch
         )
 
-    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
-        params_dict = dict(self.named_parameters(remove_duplicate=False))
-        for name, loaded_weight in weights:
-            if "lm_head.weight" in name:
-                # GPT-2 ties the weights of the embedding layer and the final
-                # linear layer.
-                continue
-            if ".attn.bias" in name or ".attn.masked_bias" in name:
-                # Skip attention mask.
-                # NOTE: "c_attn.bias" should not be skipped.
-                continue
-            if not name.startswith("transformer."):
-                name = "transformer." + name
+    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> set[str]:
+        # GPT-2 uses HF Conv1D for c_attn/c_proj/c_fc (transposed wrt Linear),
+        # so the checkpoint weights need a one-time .t() before loading. Also
+        # ties lm_head to the embedding (drop the duplicate) and ships some
+        # mask tensors that have no runtime parameter. Some checkpoints omit
+        # the leading ``transformer.`` prefix.
+        def remap(weights):
+            for name, w in weights:
+                if ".attn.bias" in name or ".attn.masked_bias" in name:
+                    continue
+                if not name.startswith("transformer.") and not name.startswith(
+                    "lm_head."
+                ):
+                    name = "transformer." + name
+                if name.endswith(".weight") and any(
+                    n in name for n in ("c_attn", "c_proj", "c_fc")
+                ):
+                    w = w.t()
+                yield name, w
 
-            param = params_dict[name]
-            # The HF's GPT-2 implementation uses Conv1D instead of Linear.
-            # Because of this, we need to transpose the weights.
-            # Note(zhuohan): the logic below might break quantized models.
-            for conv1d_weight_name in ["c_attn", "c_proj", "c_fc"]:
-                if conv1d_weight_name not in name:
-                    continue
-                if not name.endswith(".weight"):
-                    continue
-                loaded_weight = loaded_weight.t()
-            weight_loader = getattr(param, "weight_loader", default_weight_loader)
-            weight_loader(param, loaded_weight)
+        loader = AutoWeightsLoader(self, skip_prefixes=["lm_head."])
+        return loader.load_weights(remap(weights))
 
 
 EntryClass = GPT2LMHeadModel

@@ -125,6 +125,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+from sglang.srt.model_loader.auto_loader import MultiInputFusion
 from sglang.srt.models.deepseek_common.attention_backend_handler import (
     AttentionBackendRegistry,
 )
@@ -1248,6 +1249,19 @@ class DeepseekV2MoE(nn.Module):
         state.hidden_states_mlp_output = final_hidden_states
 
 
+def _qkv_a_cat_dim(module: nn.Module) -> int:
+    """Concat dim for the q_a / kv_a fusion. AWQ-family quant configs pack
+    along the input dim (1) instead of the output dim (0)."""
+    quant_config = getattr(module, "quant_config", None)
+    if quant_config is not None and quant_config.get_name() in (
+        "awq",
+        "awq_marlin",
+        "moe_wna16",
+    ):
+        return 1
+    return 0
+
+
 class DeepseekV2AttentionMLA(
     nn.Module,
     DeepseekMHAForwardMixin,
@@ -1255,6 +1269,27 @@ class DeepseekV2AttentionMLA(
     DeepseekMLARocmForwardMixin,
     DeepseekMLACpuForwardMixin,
 ):
+    # Declare the multi-input fusion for q_a_proj + kv_a_proj_with_mqa.
+    # The walker silently no-ops when ``fused_qkv_a_proj_with_mqa`` is not
+    # an actual child module on this instance (i.e. when q_lora_rank is None),
+    # so it is safe to declare unconditionally as a class attribute.
+    checkpoint_fusions = [
+        MultiInputFusion(
+            inputs=("q_a_proj", "kv_a_proj_with_mqa"),
+            target="fused_qkv_a_proj_with_mqa",
+            combine=lambda module, parts: (
+                parts["q_a_proj"]
+                if (
+                    parts["q_a_proj"].shape == torch.Size([])
+                    and parts["kv_a_proj_with_mqa"].shape == torch.Size([])
+                )
+                else torch.cat(
+                    [parts["q_a_proj"], parts["kv_a_proj_with_mqa"]],
+                    dim=_qkv_a_cat_dim(module),
+                )
+            ),
+        ),
+    ]
 
     def __init__(
         self,

@@ -42,6 +42,11 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_loader.auto_loader import (
+    AutoWeightsLoader,
+    WeightsMapper,
+    default_moe_load,
+)
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     sharded_weight_loader,
@@ -517,6 +522,29 @@ class Lfm2MoeModel(nn.Module):
 
         return self.embedding_norm(hidden_states)
 
+    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> set:
+        # LFM2 uses ``w1``/``w3`` for gate/up and ``w2`` for down on dense MLPs;
+        # the runtime fuses gate_up_proj and renames w2 -> down_proj.
+        stacked_params_mapping = [
+            (".qkv_proj", ".q_proj", "q"),
+            (".qkv_proj", ".k_proj", "k"),
+            (".qkv_proj", ".v_proj", "v"),
+            (".gate_up_proj", ".w1", 0),
+            (".gate_up_proj", ".w3", 1),
+        ]
+        expert_params_mapping = FusedMoE.make_expert_params_mapping(
+            ckpt_gate_proj_name="w1",
+            ckpt_down_proj_name="w2",
+            ckpt_up_proj_name="w3",
+            num_experts=self.config.num_experts,
+        )
+        return default_moe_load(
+            self,
+            weights,
+            stacked_params_mapping=stacked_params_mapping,
+            expert_params_mapping=expert_params_mapping,
+        )
+
 
 class Lfm2MoeForCausalLM(nn.Module):
     """LFM2-MoE for causal language modeling."""
@@ -569,114 +597,48 @@ class Lfm2MoeForCausalLM(nn.Module):
         self, weights: Iterable[Tuple[str, torch.Tensor]], is_mtp: bool = False
     ) -> Set[str]:
         """Load weights with FusedMoE expert format."""
-        stacked_params_mapping = [
-            # (param_name, weight_name, shard_id)
-            ("qkv_proj", "q_proj", "q"),
-            ("qkv_proj", "k_proj", "k"),
-            ("qkv_proj", "v_proj", "v"),
-            # Dense MLP w1/w3 -> gate_up_proj
-            ("gate_up_proj", "w1", 0),
-            ("gate_up_proj", "w3", 1),
-        ]
+        # HF stores conv weights as ``conv.conv.weight`` with shape (D, 1, K);
+        # the runtime parameter is ``conv.conv_weight`` with shape (D, K). The
+        # rename and the squeeze must happen before AutoWeightsLoader walks.
+        # Also rename dense MLP ``feed_forward.w2`` (down_proj) — experts use
+        # the same ``w2`` name, so guard on ``experts``.
+        weights = list(weights)
+        embed_tokens_weight = None
+        for name, w in weights:
+            if "embed_tokens.weight" in name and embed_tokens_weight is None:
+                embed_tokens_weight = w
+                break
 
-        # FusedMoE expert params mapping
-        # HF format: experts.{expert_id}.w{1,2,3}.weight
-        # FusedMoE format: experts.w13_weight, experts.w2_weight
-        expert_params_mapping = FusedMoE.make_expert_params_mapping(
-            ckpt_gate_proj_name="w1",
-            ckpt_down_proj_name="w2",
-            ckpt_up_proj_name="w3",
-            num_experts=self.config.num_experts,
+        def _preprocess(stream):
+            for n, w in stream:
+                if ".conv.conv.weight" in n:
+                    n = n.replace(".conv.conv.weight", ".conv.conv_weight")
+                    w = w.squeeze(1)
+                elif ".conv.conv.bias" in n:
+                    n = n.replace(".conv.conv.bias", ".conv.conv_bias")
+                yield n, w
+
+        mapper = WeightsMapper(
+            orig_to_new_substr={
+                "feed_forward.w2.weight": "feed_forward.down_proj.weight",
+            },
+        )
+        loaded = AutoWeightsLoader(self).load_weights(
+            _preprocess(weights), mapper=mapper
         )
 
+        # Tied lm_head fallback: HF doesn't emit lm_head.weight when tied.
         params_dict = dict(self.named_parameters())
-        loaded_params: Set[str] = set()
-        embed_tokens_weight = None
-
-        for name, loaded_weight in weights:
-            if "rotary_emb.inv_freq" in name:
-                continue
-
-            if "embed_tokens.weight" in name:
-                embed_tokens_weight = loaded_weight
-
-            # Handle conv weight/bias naming: HF uses conv.conv, we use conv_weight/conv_bias
-            if ".conv.conv.weight" in name:
-                name = name.replace(".conv.conv.weight", ".conv.conv_weight")
-                loaded_weight = loaded_weight.squeeze(1)  # (D, 1, K) -> (D, K)
-            if ".conv.conv.bias" in name:
-                name = name.replace(".conv.conv.bias", ".conv.conv_bias")
-
-            # Handle dense MLP w2 -> down_proj
-            if "feed_forward.w2" in name and "experts" not in name:
-                name = name.replace("feed_forward.w2", "feed_forward.down_proj")
-
-            # Handle stacked params (QKV, dense MLP gate_up)
-            for param_name, weight_name, shard_id in stacked_params_mapping:
-                if weight_name not in name:
-                    continue
-                # Skip expert weights (handled below)
-                if "experts" in name:
-                    continue
-                name = name.replace(weight_name, param_name)
-                if name.endswith(".bias") and name not in params_dict:
-                    break
-                if name not in params_dict:
-                    break
-                param = params_dict[name]
-                weight_loader = getattr(param, "weight_loader")
-                weight_loader(param, loaded_weight, shard_id)
-                loaded_params.add(name)
-                break
-            else:
-                # Handle MoE expert weights using FusedMoE format
-                # HF format: model.layers.X.feed_forward.experts.Y.wZ.weight
-                # FusedMoE format: model.layers.X.feed_forward.experts.w13_weight/w2_weight
-                for (
-                    param_name,
-                    weight_name,
-                    expert_id,
-                    shard_id,
-                ) in expert_params_mapping:
-                    if weight_name not in name:
-                        continue
-                    # Build our parameter name
-                    name = name.replace(weight_name, param_name)
-                    if name not in params_dict:
-                        continue
-                    param = params_dict[name]
-                    weight_loader = param.weight_loader
-                    weight_loader(
-                        param,
-                        loaded_weight,
-                        name,
-                        shard_id=shard_id,
-                        expert_id=expert_id,
-                    )
-                    loaded_params.add(name)
-                    break
-                else:
-                    # Handle regular weights
-                    if name.endswith(".bias") and name not in params_dict:
-                        continue
-                    if name not in params_dict:
-                        continue
-                    param = params_dict[name]
-                    weight_loader = getattr(
-                        param, "weight_loader", default_weight_loader
-                    )
-                    weight_loader(param, loaded_weight)
-                    loaded_params.add(name)
-
-        # Handle tied lm_head weight
-        if "lm_head.weight" not in loaded_params and "lm_head.weight" in params_dict:
-            if embed_tokens_weight is not None:
-                param = params_dict["lm_head.weight"]
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                weight_loader(param, embed_tokens_weight)
-                loaded_params.add("lm_head.weight")
-
-        return loaded_params
+        if (
+            "lm_head.weight" not in loaded
+            and "lm_head.weight" in params_dict
+            and embed_tokens_weight is not None
+        ):
+            param = params_dict["lm_head.weight"]
+            weight_loader = getattr(param, "weight_loader", default_weight_loader)
+            weight_loader(param, embed_tokens_weight)
+            loaded.add("lm_head.weight")
+        return loaded
 
 
 EntryClass = [Lfm2MoeForCausalLM]

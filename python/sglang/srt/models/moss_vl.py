@@ -45,6 +45,12 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.managers.schedule_batch import MultimodalInputs
 from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_loader.auto_loader import (
+    STACKED_PARAMS_MAPPING_LLAMA,
+    AutoWeightsLoader,
+    WeightsMapper,
+    default_stacked_params_load,
+)
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import add_prefix
@@ -433,16 +439,22 @@ class MossVLVisionModel(nn.Module):
         x = self.merger(x, deepstack_features)
         return x
 
-    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> set:
+    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> set[str]:
+        # The runtime ``VisionAttention`` exposes ``attn.qkv_proj``; HF
+        # checkpoint may ship either a fused ``attn.qkv`` tensor or split
+        # ``attn.q`` / ``attn.k`` / ``attn.v`` siblings. Rename the fused name
+        # straight to ``attn.qkv_proj``; pack the split names per shard_id.
         stacked_params_mapping = [
-            ("attn.qkv.", "attn.q.", "q"),
-            ("attn.qkv.", "attn.k.", "k"),
-            ("attn.qkv.", "attn.v.", "v"),
+            ("attn.qkv_proj.", "attn.q.", "q"),
+            ("attn.qkv_proj.", "attn.k.", "k"),
+            ("attn.qkv_proj.", "attn.v.", "v"),
         ]
         params_dict = dict(self.named_parameters(remove_duplicate=False))
-        loaded_params: set = set()
+        loaded_params: set[str] = set()
 
         for name, loaded_weight in weights:
+            if "attn.qkv." in name:
+                name = name.replace("attn.qkv.", "attn.qkv_proj.")
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:
                     continue
@@ -1004,6 +1016,16 @@ class MossVLTextModel(nn.Module):
             hidden_states = self.norm(hidden_states)
         return hidden_states
 
+    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> set[str]:
+        # Cross-attention layers carry split ``q_proj`` / ``k_proj`` / ``v_proj``
+        # ColumnParallelLinear modules (no fused QKVParallelLinear), so the
+        # generic stacked rename to ``qkv_proj`` will simply miss them and
+        # ``default_stacked_params_load`` falls through to load each split
+        # tensor into its named param.
+        return default_stacked_params_load(
+            self, weights, STACKED_PARAMS_MAPPING_LLAMA, skip_pp_out_of_range=False
+        )
+
 
 class MossVLForCausalLM(nn.Module):
     def __init__(
@@ -1531,65 +1553,24 @@ class MossVLForConditionalGeneration(nn.Module):
 
     # ---- Weight Loading ----
 
-    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
-        stacked_params_mapping = [
-            # (param_name, shard_name, shard_id)
-            (".qkv_proj", ".q_proj", "q"),
-            (".qkv_proj", ".k_proj", "k"),
-            (".qkv_proj", ".v_proj", "v"),
-            (".gate_up_proj", ".gate_proj", 0),
-            (".gate_up_proj", ".up_proj", 1),
-        ]
-
-        params_dict = dict(self.named_parameters())
-
-        for name, loaded_weight in weights:
-            if "rotary_emb.inv_freq" in name:
-                continue
-
-            original_name = name
-
-            # Map HF names to local module names.
-            if name == "lm_head.weight":
-                name = "language_model.lm_head.weight"
-            elif name.startswith("model.language_model."):
-                name = "language_model.model." + name[len("model.language_model.") :]
-            elif name.startswith("model.visual."):
-                name = name[len("model.") :]
-            elif name.startswith("model.separator_token"):
-                name = name[len("model.") :]
-
-            # VisionAttention stores fused QKV weights under qkv_proj in SGLang.
-            if "visual." in name:
-                name = name.replace("attn.qkv.", "attn.qkv_proj.")
-
-            handled = False
-            if "visual." not in name and ".cross_attn." not in name:
-                for param_name, weight_name, shard_id in stacked_params_mapping:
-                    if weight_name not in name:
-                        continue
-                    mapped_name = name.replace(weight_name, param_name)
-                    if mapped_name.endswith(".bias") and mapped_name not in params_dict:
-                        handled = True
-                        break
-                    if mapped_name in params_dict:
-                        param = params_dict[mapped_name]
-                        param.weight_loader(param, loaded_weight, shard_id)
-                        handled = True
-                    break
-
-            if handled:
-                continue
-
-            if name.endswith(".bias") and name not in params_dict:
-                continue
-
-            if name in params_dict:
-                param = params_dict[name]
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                weight_loader(param, loaded_weight)
-            else:
-                logger.debug(f"Skipping weight: {original_name} -> {name}")
+    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> set[str]:
+        # Checkpoint name conventions (HF):
+        #   * ``lm_head.weight`` → ``self.language_model.lm_head.weight``
+        #   * ``model.language_model.<...>`` → ``self.language_model.model.<...>``
+        #   * ``model.visual.<...>`` → ``self.visual.<...>``  (the visual
+        #     tower owns its own ``load_weights`` for QKV fusion + qkv rename)
+        #   * ``model.separator_token`` → ``self.separator_token``
+        # Vision attention also packs ``attn.qkv`` → ``attn.qkv_proj``; this
+        # rename is applied by the visual tower itself, not here.
+        mapper = WeightsMapper(
+            orig_to_new_prefix={
+                "lm_head.": "language_model.lm_head.",
+                "model.language_model.": "language_model.model.",
+                "model.visual.": "visual.",
+                "model.separator_token": "separator_token",
+            },
+        )
+        return AutoWeightsLoader(self).load_weights(weights, mapper=mapper)
 
 
 EntryClass = MossVLForConditionalGeneration

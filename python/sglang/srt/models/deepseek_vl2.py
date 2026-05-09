@@ -234,21 +234,19 @@ class DeepseekVL2ForCausalLM(nn.Module):
         return hs
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
-        stacked_params_mapping = [
-            # (param_name, shard_name, shard_id)
-            ("qkv_proj", "q_proj", "q"),
-            ("qkv_proj", "k_proj", "k"),
-            ("qkv_proj", "v_proj", "v"),
-            ("gate_up_proj", "up_proj", 1),
-            ("gate_up_proj", "gate_proj", 0),
-        ]
-        params_dict = dict(self.named_parameters())
-        weights = list(weights)
+        language_weights: List[Tuple[str, torch.Tensor]] = []
+        other_weights: List[Tuple[str, torch.Tensor]] = []
         for name, loaded_weight in weights:
             if "language" in name:
-                name = name.replace("language.", "")
-                self.language_model.load_weights([(name, loaded_weight)])
+                language_weights.append((name.replace("language.", ""), loaded_weight))
             else:
+                other_weights.append((name, loaded_weight))
+
+        if language_weights:
+            self.language_model.load_weights(language_weights)
+        if other_weights:
+            params_dict = dict(self.named_parameters())
+            for name, loaded_weight in other_weights:
                 param = params_dict[name]
                 weights_loader = getattr(param, "weight_loader", default_weight_loader)
                 weights_loader(param, loaded_weight)

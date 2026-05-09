@@ -30,7 +30,10 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.model_loader.auto_loader import (
+    AutoWeightsLoader,
+    default_stacked_params_load,
+)
 from sglang.srt.models.ernie4 import Ernie4_5_ForCausalLM, Ernie4DecoderLayer
 from sglang.srt.utils import add_prefix
 
@@ -97,6 +100,11 @@ class Ernie4ModelMTP(nn.Module):
         hidden_states = residual + hidden_states
         return hidden_states
 
+    def load_weights(self, weights):
+        return default_stacked_params_load(
+            self, weights, Ernie4_5_ForCausalLM.stacked_params_mapping
+        )
+
 
 class Ernie4_5_MoeForCausalLMMTP(nn.Module):
     def __init__(
@@ -141,49 +149,33 @@ class Ernie4_5_MoeForCausalLMMTP(nn.Module):
         )
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
-        mtp_layer_found = False
         mtp_weight_patterns = [
             f"mtp_block.{self.mtp_layer_id}",
             f"mtp_emb_norm.{self.mtp_layer_id}",
             f"mtp_hidden_norm.{self.mtp_layer_id}",
             f"mtp_linear_proj.{self.mtp_layer_id}",
         ]
-        params_dict = dict(self.named_parameters())
-        for name, loaded_weight in weights:
-            # Only name matched patterns should be loaded
-            for layer_pattern in mtp_weight_patterns:
-                if layer_pattern in name:
-                    mtp_layer_found = True
-                    break
-            else:
-                continue
-            # But strip mtp_layer_id before loading, because each MTP layer is a MTP model.
-            name = name.replace(f".{self.mtp_layer_id}.", ".")
-            for (
-                param_name,
-                weight_name,
-                shard_id,
-            ) in Ernie4_5_ForCausalLM.stacked_params_mapping:
-                if weight_name not in name:
+        mtp_layer_found = False
+
+        def _filter(
+            ws: Iterable[Tuple[str, torch.Tensor]],
+        ) -> Iterable[Tuple[str, torch.Tensor]]:
+            nonlocal mtp_layer_found
+            for name, w in ws:
+                if not any(p in name for p in mtp_weight_patterns):
                     continue
-                name = name.replace(weight_name, param_name)
-                param = params_dict[name]
-                weight_loader = param.weight_loader
-                weight_loader(param, loaded_weight, shard_id)
-                break
-            else:
-                if name in params_dict.keys():
-                    param = params_dict[name]
-                    weight_loader = getattr(
-                        param, "weight_loader", default_weight_loader
-                    )
-                    weight_loader(param, loaded_weight)
-                else:
-                    raise KeyError(f"Parameter '{name}' not found in MTP model.")
+                mtp_layer_found = True
+                # Each MTP layer is its own model, so strip the layer id.
+                name = name.replace(f".{self.mtp_layer_id}.", ".")
+                yield name, w
+
+        loader = AutoWeightsLoader(self)
+        loaded = loader.load_weights(_filter(weights))
         if not mtp_layer_found:
             raise KeyError(
                 f"MTP layers 'mtp_*.{self.mtp_layer_id}.*' not found in weights."
             )
+        return loaded
 
     def get_embed_and_head(self):
         return self.model.embed_tokens.weight, self.lm_head.weight

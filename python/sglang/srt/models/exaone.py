@@ -38,9 +38,29 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.model_loader.auto_loader import (
+    AutoWeightsLoader,
+    WeightsMapper,
+    default_stacked_params_load,
+)
 from sglang.srt.utils import add_prefix
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
+
+# Exaone fuses Q/K/V into qkv_proj and gate/up into gate_up_proj, but the
+# checkpoint names the MLP halves c_fc_0 / c_fc_1 instead of gate_proj/up_proj.
+_EXAONE_STACKED_PARAMS_MAPPING = [
+    ("qkv_proj", "q_proj", "q"),
+    ("qkv_proj", "k_proj", "k"),
+    ("qkv_proj", "v_proj", "v"),
+    ("gate_up_proj", "c_fc_0", 0),
+    ("gate_up_proj", "c_fc_1", 1),
+]
+
+# Exaone names attention modules ``attn.attention`` in the checkpoint but
+# the sglang module tree uses ``self_attn``.
+_EXAONE_ATTN_MAPPER = WeightsMapper(
+    orig_to_new_substr={"attn.attention": "self_attn"},
+)
 
 
 class ExaoneGatedMLP(nn.Module):
@@ -293,6 +313,11 @@ class ExaoneModel(nn.Module):
         hidden_states, _ = self.ln_f(hidden_states, residual)
         return hidden_states
 
+    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> set[str]:
+        return default_stacked_params_load(
+            self, weights, _EXAONE_STACKED_PARAMS_MAPPING
+        )
+
 
 class ExaoneForCausalLM(nn.Module):
     def __init__(
@@ -332,46 +357,17 @@ class ExaoneForCausalLM(nn.Module):
             input_ids, hidden_states, self.lm_head, forward_batch
         )
 
-    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
-        stacked_params_mapping = [
-            # (param_name, shard_name, shard_id)
-            ("qkv_proj", "q_proj", "q"),
-            ("qkv_proj", "k_proj", "k"),
-            ("qkv_proj", "v_proj", "v"),
-            ("gate_up_proj", "c_fc_0", 0),
-            ("gate_up_proj", "c_fc_1", 1),
-        ]
-        params_dict = dict(self.named_parameters())
-
-        for name, loaded_weight in weights:
-            if "rotary_emb.inv_freq" in name or "projector" in name:
-                continue
-            if "rotary_emb.cos_cached" in name or "rotary_emb.sin_cached" in name:
-                # Models trained using ColossalAI may include these tensors in
-                # the checkpoint. Skip them.
-                continue
-            if name.startswith("model.vision_tower") and name not in params_dict:
-                continue
-
-            name = name.replace("attn.attention", "self_attn")
-            for param_name, weight_name, shard_id in stacked_params_mapping:
-                if weight_name not in name:
-                    continue
-                name = name.replace(weight_name, param_name)
-                # Skip loading extra bias for GPTQ models.
-                if name.endswith(".bias") and name not in params_dict:
-                    continue
-                param = params_dict[name]
-                weight_loader = param.weight_loader
-                weight_loader(param, loaded_weight, shard_id)
-                break
-            else:
-                # Skip loading extra bias for GPTQ models.
-                if name.endswith(".bias") and name not in params_dict:
-                    continue
-                param = params_dict[name]
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                weight_loader(param, loaded_weight)
+    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> set[str]:
+        skip_prefixes: list[str] = []
+        if self.config.tie_word_embeddings:
+            skip_prefixes.append("lm_head.")
+        loader = AutoWeightsLoader(
+            self,
+            skip_prefixes=skip_prefixes,
+            skip_substrs=["projector"],
+            ignore_unexpected_prefixes=["model.vision_tower."],
+        )
+        return loader.load_weights(weights, mapper=_EXAONE_ATTN_MAPPER)
 
 
 EntryClass = ExaoneForCausalLM

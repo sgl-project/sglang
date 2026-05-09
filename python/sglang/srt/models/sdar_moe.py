@@ -46,16 +46,19 @@ from sglang.srt.layers.moe.utils import (
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import AttentionType, RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
-from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
+from sglang.srt.layers.utils import PPMissingLayer
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
-from sglang.srt.model_loader.weight_utils import (
-    default_weight_loader,
-    maybe_remap_kv_scale_name,
+from sglang.srt.model_loader.auto_loader import (
+    STACKED_PARAMS_MAPPING_LLAMA,
+    AutoWeightsLoader,
+    WeightsMapper,
+    default_moe_load,
 )
+from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.utils import (
     apply_qk_norm,
     create_fused_set_kv_buffer_arg,
@@ -527,6 +530,20 @@ class SDARMoeModel(nn.Module):
             hidden_states, residual = self.norm(hidden_states, residual)
         return hidden_states
 
+    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> set[str]:
+        expert_params_mapping = FusedMoE.make_expert_params_mapping(
+            ckpt_gate_proj_name="gate_proj",
+            ckpt_down_proj_name="down_proj",
+            ckpt_up_proj_name="up_proj",
+            num_experts=self.config.num_experts,
+        )
+        return default_moe_load(
+            self,
+            weights,
+            stacked_params_mapping=STACKED_PARAMS_MAPPING_LLAMA,
+            expert_params_mapping=expert_params_mapping,
+        )
+
 
 class SDARMoeForCausalLM(nn.Module):
     fall_back_to_pt_during_load = False
@@ -608,120 +625,39 @@ class SDARMoeForCausalLM(nn.Module):
         return hidden_states
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
-        stacked_params_mapping = [
-            ("qkv_proj", "q_proj", "q"),
-            ("qkv_proj", "k_proj", "k"),
-            ("qkv_proj", "v_proj", "v"),
-            ("gate_up_proj", "gate_proj", 0),
-            ("gate_up_proj", "up_proj", 1),
-        ]
-
-        expert_params_mapping = FusedMoE.make_expert_params_mapping(
-            ckpt_gate_proj_name="gate_proj",
-            ckpt_down_proj_name="down_proj",
-            ckpt_up_proj_name="up_proj",
-            num_experts=self.config.num_experts,
+        # Some checkpoints ship without the ``model.`` prefix; normalize before
+        # walking. Drop the legacy ``projector.*`` shard (vision tower not used).
+        mapper = WeightsMapper(
+            orig_to_new_prefix={
+                "layers.": "model.layers.",
+                "embed_tokens.": "model.embed_tokens.",
+                "norm.": "model.norm.",
+            },
         )
+        params_dict = dict(self.named_parameters())
+        weights = list(weights)
 
-        if not hasattr(self, "_cached_params_dict"):
-            self._cached_params_dict = dict(self.named_parameters())
-        params_dict = self._cached_params_dict
-
-        for name, loaded_weight in weights:
-            if not name.startswith("model.") and (
-                name.startswith("layers.")
-                or name.startswith("embed_tokens.")
-                or name.startswith("norm.")
-            ):
-                name = add_prefix(name, "model")
-
-            if name == "model.embed_tokens.weight":
-                if self.pp_group.is_last_rank and getattr(
-                    self.config, "tie_word_embeddings", False
-                ):
-                    if "lm_head.weight" in params_dict:
-                        param = params_dict["lm_head.weight"]
-                        weight_loader = getattr(
-                            param, "weight_loader", default_weight_loader
-                        )
-                        weight_loader(param, loaded_weight)
-
-            layer_id = get_layer_id(name)
-            if (
-                layer_id is not None
-                and hasattr(self.model, "start_layer")
-                and (
-                    layer_id < self.model.start_layer
-                    or layer_id >= self.model.end_layer
-                )
-            ):
-                continue
-
-            if "rotary_emb.inv_freq" in name or "projector" in name:
-                continue
-            if "rotary_emb.cos_cached" in name or "rotary_emb.sin_cached" in name:
-                continue
-
-            if "scale" in name:
-                name = maybe_remap_kv_scale_name(name, params_dict)
-                if name is None:
-                    continue
-
-            for param_name, weight_name, shard_id in stacked_params_mapping:
-                if weight_name not in name:
-                    continue
-                if "mlp.experts" in name:
-                    continue
-
-                name2 = name.replace(weight_name, param_name)
-                if name2.endswith(".bias") and name2 not in params_dict:
-                    continue
-                if name2 not in params_dict:
-                    continue
-
-                param = params_dict[name2]
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                weight_loader(param, loaded_weight, shard_id)
-                break
-            else:
-                is_expert_weight = False
-                for mapping in expert_params_mapping:
-                    param_name, weight_name, expert_id, shard_id = mapping
-                    if weight_name not in name:
-                        continue
-                    is_expert_weight = True
-
-                    name2 = name.replace(weight_name, param_name)
-                    if name2 not in params_dict:
-                        continue
-
-                    param = params_dict[name2]
+        # Tied lm_head fallback: when tie_word_embeddings is on, mirror
+        # embed_tokens onto lm_head explicitly because the checkpoint won't
+        # contain a separate lm_head tensor.
+        if (
+            self.pp_group.is_last_rank
+            and getattr(self.config, "tie_word_embeddings", False)
+            and "lm_head.weight" in params_dict
+        ):
+            for name, w in weights:
+                if name == "model.embed_tokens.weight" or name == "embed_tokens.weight":
+                    param = params_dict["lm_head.weight"]
                     weight_loader = getattr(
                         param, "weight_loader", default_weight_loader
                     )
-                    weight_loader(
-                        param,
-                        loaded_weight,
-                        name2,
-                        shard_id=shard_id,
-                        expert_id=expert_id,
-                    )
+                    weight_loader(param, w)
                     break
-                else:
-                    if is_expert_weight:
-                        continue
 
-                    # 3) regular params
-                    if name.endswith(".bias") and name not in params_dict:
-                        continue
-                    if name not in params_dict:
-                        continue
-
-                    param = params_dict[name]
-                    weight_loader = getattr(
-                        param, "weight_loader", default_weight_loader
-                    )
-                    weight_loader(param, loaded_weight)
+        loaded = AutoWeightsLoader(
+            self,
+            skip_substrs=["projector"],
+        ).load_weights(weights, mapper=mapper)
 
         if not hasattr(self, "routed_experts_weights_of_layer"):
             self.routed_experts_weights_of_layer = LazyValue(
@@ -731,6 +667,7 @@ class SDARMoeForCausalLM(nn.Module):
                     if isinstance(self.model.layers[lid].mlp, SDARMoeSparseMoeBlock)
                 }
             )
+        return loaded
 
     @classmethod
     def get_model_config_for_expert_location(cls, config):

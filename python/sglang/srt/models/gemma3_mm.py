@@ -38,9 +38,9 @@ from sglang.srt.managers.schedule_batch import (
     flatten_nested_list,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
-from sglang.srt.model_loader.weight_utils import (
-    default_weight_loader,
-    maybe_remap_kv_scale_name,
+from sglang.srt.model_loader.auto_loader import (
+    WeightsMapper,
+    default_stacked_params_load,
 )
 from sglang.srt.models.gemma3_causal import Gemma3ForCausalLM
 from sglang.srt.models.siglip import SiglipVisionModel
@@ -106,6 +106,18 @@ class Gemma3MultiModalProjector(nn.Module):
         )
 
         return projected_vision_outputs.type_as(vision_outputs)
+
+
+_GEMMA3_MM_STACKED_PARAMS_MAPPING: List[Tuple[str, str, object]] = [
+    (".qkv_proj", ".q_proj", "q"),
+    (".qkv_proj", ".k_proj", "k"),
+    (".qkv_proj", ".v_proj", "v"),
+    (".gate_up_proj", ".up_proj", 1),
+    (".gate_up_proj", ".gate_proj", 0),
+]
+_GEMMA3_MM_NAME_MAPPER = WeightsMapper(
+    orig_to_new_substr={".self_attn.out_proj": ".self_attn.proj"}
+)
 
 
 class Gemma3ForConditionalGeneration(PreTrainedModel):
@@ -424,60 +436,25 @@ class Gemma3ForConditionalGeneration(PreTrainedModel):
         return self.language_model.tie_weights(**kwargs)
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
-        stacked_params_mapping = [
-            # (param_name, shard_name, shard_id)
-            (".qkv_proj", ".q_proj", "q"),
-            (".qkv_proj", ".k_proj", "k"),
-            (".qkv_proj", ".v_proj", "v"),
-            ("gate_up_proj", "up_proj", 1),
-            ("gate_up_proj", "gate_proj", 0),
-        ]
         """Load weights for the model."""
-        params_dict = dict(self.named_parameters())
-        loaded_params: Set[str] = set()
-
+        language_weights: List[Tuple[str, torch.Tensor]] = []
+        other_weights: List[Tuple[str, torch.Tensor]] = []
         for name, loaded_weight in weights:
             if "language_model" in name:
-                # Gemma3ForCausalLM.load_weights(self, [(name.replace("language_model.", ""), loaded_weight)])
-                causal_loaded_params = Gemma3ForCausalLM.load_weights(
-                    self, [(name, loaded_weight)]
-                )
-                loaded_params.update(causal_loaded_params)
-                continue
+                language_weights.append((name, loaded_weight))
             else:
-                for param_name, weight_name, shard_id in stacked_params_mapping:
-                    if weight_name not in name:
-                        continue
-                    name = name.replace(weight_name, param_name)
-                    # Skip loading extra bias for GPTQ models.
-                    if name.endswith(".bias") and name not in params_dict:
-                        continue
-                    param = params_dict[name]
-                    weight_loader = param.weight_loader
-                    weight_loader(param, loaded_weight, shard_id)
-                    break
-                else:
-                    if "vision_model" in name:
-                        # adapt to VisionAttention
-                        name = name.replace(".self_attn.out_proj", ".self_attn.proj")
-                    # Skip loading extra bias for GPTQ models
-                    if name.endswith(".bias") and name not in params_dict:
-                        continue
-                    # Remapping the name of FP8 kv-scale
-                    name = maybe_remap_kv_scale_name(name, params_dict)
-                    if name is None:
-                        continue
-                    param = params_dict[name]
-                    weight_loader = getattr(
-                        param, "weight_loader", default_weight_loader
-                    )
-                    weight_loader(param, loaded_weight)
-                loaded_params.add(name)
-        unloaded_params = params_dict.keys() - loaded_params
-        if unloaded_params:
-            pass
-            # raise RuntimeError(
-            #     f"Some weights are not initialized from checkpoints: {unloaded_params}")
+                other_weights.append((name, loaded_weight))
+
+        loaded_params: Set[str] = set()
+        if language_weights:
+            loaded_params.update(Gemma3ForCausalLM.load_weights(self, language_weights))
+        if other_weights:
+            other_weights = _GEMMA3_MM_NAME_MAPPER.apply(other_weights)
+            loaded_params.update(
+                default_stacked_params_load(
+                    self, other_weights, _GEMMA3_MM_STACKED_PARAMS_MAPPING
+                )
+            )
         return loaded_params
 
 

@@ -10,7 +10,6 @@ from transformers.modeling_outputs import BaseModelOutputWithPooling
 from transformers.models.siglip import SiglipVisionModel
 
 import sglang.srt.managers.mm_utils as mm_utils
-import sglang.srt.model_loader.weight_utils as weight_utils
 import sglang.srt.utils as utils
 from sglang.srt.configs.jet_vlm import JetVLMConfig
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
@@ -22,6 +21,7 @@ from sglang.srt.managers.schedule_batch import (
     MultimodalInputs,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_loader.auto_loader import AutoWeightsLoader
 from sglang.srt.models.jet_nemotron import JetNemotronForCausalLM
 
 MM_HIDDEN_SIZE = 1152
@@ -121,17 +121,9 @@ class JetVLMForConditionalGeneration(nn.Module):
         return vision_features
 
     def load_weights(self, weights: Iterable[tuple[str, Tensor]]) -> None:
-        params_dict = dict(self.named_parameters())
-
-        for name, loaded_weight in weights:
-            if name.startswith("llm."):
-                self.llm.load_weights([(name[len("llm.") :], loaded_weight)])
-            else:
-                param = params_dict[name]
-                weight_loader = getattr(
-                    param, "weight_loader", weight_utils.default_weight_loader
-                )
-                weight_loader(param, loaded_weight)
+        # ``self.llm`` (JetNemotronForCausalLM) handles its own weight fusion
+        # via its own ``load_weights``; the walker defers to it automatically.
+        AutoWeightsLoader(self).load_weights(weights)
 
     def pad_input_ids(
         self, input_ids: list[int], mm_inputs: MultimodalInputs

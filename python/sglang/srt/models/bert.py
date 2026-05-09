@@ -16,9 +16,20 @@ from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import AttentionType, RadixAttention
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.model_loader.auto_loader import (
+    AutoWeightsLoader,
+    WeightsMapper,
+    default_stacked_params_load,
+)
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import add_prefix
+
+_BERT_STACKED_PARAMS_MAPPING: list[Tuple[str, str, str]] = [
+    (".qkv_proj", ".query", "q"),
+    (".qkv_proj", ".key", "k"),
+    (".qkv_proj", ".value", "v"),
+]
+_BERT_NAME_MAPPER = WeightsMapper(orig_to_new_substr={"self": "self_attn"})
 
 BertConfig = None
 
@@ -403,37 +414,17 @@ class BertModel(nn.Module):
         return hidden_states
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> Set[str]:
-        stacked_params_mapping = [
-            # (param_name, shard_name, shard_id)
-            ("qkv_proj", "query", "q"),
-            ("qkv_proj", "key", "k"),
-            ("qkv_proj", "value", "v"),
-        ]
-
-        params_dict = dict(self.named_parameters())
-        for name, loaded_weight in weights:
-            name = name.replace("self", "self_attn")
-            if not self.use_bert_pooler and "pooler" in name:
-                continue
-            for param_name, weight_name, shard_id in stacked_params_mapping:
-
-                if weight_name not in name:
-                    continue
-                name = name.replace(weight_name, param_name)
-                # Skip loading extra bias for GPTQ models.
-                if name.endswith(".bias") and name not in params_dict:
-                    continue
-                param = params_dict[name]
-                weight_loader = param.weight_loader
-                weight_loader(param, loaded_weight, shard_id)
-                break
-            else:
-                # Skip loading extra bias for GPTQ models.
-                if name.endswith(".bias") and name not in params_dict:
-                    continue
-                param = params_dict[name]
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                weight_loader(param, loaded_weight)
+        skip_substrs: list[str] = []
+        if not self.use_bert_pooler:
+            skip_substrs.append("pooler")
+        weights = _BERT_NAME_MAPPER.apply(weights)
+        if skip_substrs:
+            weights = (
+                (name, w)
+                for name, w in weights
+                if not any(s in name for s in skip_substrs)
+            )
+        return default_stacked_params_load(self, weights, _BERT_STACKED_PARAMS_MAPPING)
 
 
 class Contriever(BertModel):
@@ -462,24 +453,8 @@ class BertForSequenceClassification(nn.Module):
         self.pooler = CrossEncodingPooler(config, self.classifier, self.bert.pooler)
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
-        self_weights = []
-
-        def weight_filter():
-            for name, weight in weights:
-                if name.startswith("bert."):
-                    yield (name[len("bert.") :], weight)
-                else:
-                    self_weights.append((name, weight))
-
-        self.bert.load_weights(weight_filter())
-
-        params_dict = dict(self.named_parameters())
-
-        for name, loaded_weight in self_weights:
-            if name.startswith("classifier"):
-                param = params_dict[name]
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                weight_loader(param, loaded_weight)
+        loader = AutoWeightsLoader(self)
+        return loader.load_weights(weights)
 
     def forward(
         self,

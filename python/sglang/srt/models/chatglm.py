@@ -40,7 +40,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.model_loader.auto_loader import AutoWeightsLoader, WeightsMapper
 from sglang.srt.utils import add_prefix
 
 LoraConfig = None
@@ -405,19 +405,16 @@ class ChatGLMForCausalLM(nn.Module):
             input_ids, hidden_states, self.lm_head, forward_batch
         )
 
-    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
-        params_dict = dict(self.named_parameters(remove_duplicate=False))
-        for name, loaded_weight in weights:
-            if "rotary_pos_emb.inv_freq" in name:
-                continue
-            if "word_embeddings" in name:
-                name = name.replace(".word_embeddings", "")
-            # Skip loading extra bias for GPTQ models.
-            if name.endswith(".bias") and name not in params_dict:
-                continue
-            param = params_dict[name]
-            weight_loader = getattr(param, "weight_loader", default_weight_loader)
-            weight_loader(param, loaded_weight)
+    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> set[str]:
+        # ChatGLM ships ``query_key_value`` and ``dense_h_to_4h`` already
+        # packed in the checkpoint, so there is no fused-linear stacking to
+        # do. The only checkpoint-key remap is dropping the
+        # ``.word_embeddings`` segment from the embedding name. GPTQ-quantized
+        # checkpoints sometimes ship extra ``.bias`` tensors for layers
+        # constructed with ``bias=False`` — silently drop them.
+        mapper = WeightsMapper(orig_to_new_substr={".word_embeddings": ""})
+        loader = AutoWeightsLoader(self, ignore_unexpected_suffixes=[".bias"])
+        return loader.load_weights(weights, mapper=mapper)
 
 
 class ChatGLMModel(ChatGLMForCausalLM):

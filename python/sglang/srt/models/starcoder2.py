@@ -46,7 +46,17 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.model_loader.auto_loader import (
+    AutoWeightsLoader,
+    default_stacked_params_load,
+)
+
+# Starcoder2 fuses Q/K/V into qkv_proj but its MLP is unfused.
+_STARCODER2_STACKED_PARAMS_MAPPING = [
+    ("qkv_proj", "q_proj", "q"),
+    ("qkv_proj", "k_proj", "k"),
+    ("qkv_proj", "v_proj", "v"),
+]
 from sglang.srt.utils import add_prefix, make_layers
 
 
@@ -273,6 +283,11 @@ class Starcoder2Model(nn.Module):
         hidden_states = self.norm(hidden_states)
         return hidden_states
 
+    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> set[str]:
+        return default_stacked_params_load(
+            self, weights, _STARCODER2_STACKED_PARAMS_MAPPING
+        )
+
 
 class Starcoder2ForCausalLM(nn.Module):
 
@@ -320,39 +335,13 @@ class Starcoder2ForCausalLM(nn.Module):
             input_ids, hidden_states, self.lm_head, forward_batch
         )
 
-    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
-        stacked_params_mapping = [
-            # (param_name, shard_name, shard_id)
-            ("qkv_proj", "q_proj", "q"),
-            ("qkv_proj", "k_proj", "k"),
-            ("qkv_proj", "v_proj", "v"),
-        ]
-        params_dict = dict(self.named_parameters())
-
-        for name, loaded_weight in weights:
-            if "rotary_emb.inv_freqs" in name:
-                continue
-
-            is_stacked = False
-            for param_name, weight_name, shard_id in stacked_params_mapping:
-                if weight_name in name:
-                    name = name.replace(weight_name, param_name)
-                    param = params_dict[name]
-                    weight_loader = getattr(
-                        param, "weight_loader", default_weight_loader
-                    )
-                    weight_loader(param, loaded_weight, shard_id)
-                    is_stacked = True
-                    break
-            if is_stacked:
-                continue
-
-            param = params_dict.get(name)
-            if param is None:
-                continue
-
-            weight_loader = getattr(param, "weight_loader", default_weight_loader)
-            weight_loader(param, loaded_weight)
+    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> set[str]:
+        skip_prefixes: list[str] = []
+        if self.config.tie_word_embeddings:
+            skip_prefixes.append("lm_head.")
+        return AutoWeightsLoader(self, skip_prefixes=skip_prefixes).load_weights(
+            weights
+        )
 
 
 EntryClass = Starcoder2ForCausalLM

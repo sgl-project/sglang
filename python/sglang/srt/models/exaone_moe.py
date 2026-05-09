@@ -65,7 +65,12 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
-from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.model_loader.auto_loader import (
+    STACKED_PARAMS_MAPPING_LLAMA,
+    AutoWeightsLoader,
+    WeightsMapper,
+    default_moe_load,
+)
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import LazyValue, add_prefix, is_cuda, make_layers
 
@@ -628,6 +633,20 @@ class ExaoneMoEModel(nn.Module):
 
         return hidden_states, aux_hidden_states
 
+    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> set[str]:
+        expert_params_mapping = FusedMoE.make_expert_params_mapping(
+            ckpt_gate_proj_name="gate_proj",
+            ckpt_down_proj_name="down_proj",
+            ckpt_up_proj_name="up_proj",
+            num_experts=self.config.num_experts,
+        )
+        return default_moe_load(
+            self,
+            weights,
+            stacked_params_mapping=STACKED_PARAMS_MAPPING_LLAMA,
+            expert_params_mapping=expert_params_mapping,
+        )
+
 
 class ExaoneMoEForCausalLM(nn.Module):
     def __init__(
@@ -768,97 +787,29 @@ class ExaoneMoEForCausalLM(nn.Module):
     def load_weights(
         self, weights: Iterable[Tuple[str, torch.Tensor]], is_mtp: bool = False
     ):
-        stacked_params_mapping = [
-            # (param_name, shard_name, shard_id)
-            ("qkv_proj", "q_proj", "q"),
-            ("qkv_proj", "k_proj", "k"),
-            ("qkv_proj", "v_proj", "v"),
-            ("gate_up_proj", "gate_proj", 0),
-            ("gate_up_proj", "up_proj", 1),
-        ]
+        if is_mtp:
+            # MTP shard: keep only ``mtp.*`` keys, then rename them onto the
+            # MTP runtime tree. The three sibling modules (``fc``,
+            # ``pre_fc_norm_embedding``, ``pre_fc_norm_hidden``) live at the
+            # top level, everything else lives under ``model``.
+            mapper = WeightsMapper(
+                orig_to_new_prefix={
+                    "mtp.fc.": "fc.",
+                    "mtp.pre_fc_norm_embedding.": "pre_fc_norm_embedding.",
+                    "mtp.pre_fc_norm_hidden.": "pre_fc_norm_hidden.",
+                    "mtp.": "model.",
+                },
+            )
+            weights = ((n, w) for n, w in weights if n.startswith("mtp."))
+        else:
+            mapper = None
+            weights = ((n, w) for n, w in weights if "mtp" not in n)
 
-        expert_params_mapping = FusedMoE.make_expert_params_mapping(
-            ckpt_gate_proj_name="gate_proj",
-            ckpt_down_proj_name="down_proj",
-            ckpt_up_proj_name="up_proj",
-            num_experts=self.config.num_experts,
-        )
-
-        params_dict = dict(self.named_parameters())
-
-        for name, loaded_weight in weights:
-            if is_mtp:
-                if "mtp" not in name:
-                    continue
-                if name in [
-                    "mtp.fc.weight",
-                    "mtp.pre_fc_norm_embedding.weight",
-                    "mtp.pre_fc_norm_hidden.weight",
-                ]:
-                    name = name.replace("mtp.", "")
-                else:
-                    name = name.replace("mtp", "model")
-
-            if not is_mtp and "mtp" in name:
-                continue
-
-            if "rotary_emb.inv_freq" in name or "projector" in name:
-                continue
-            if "rotary_emb.cos_cached" in name or "rotary_emb.sin_cached" in name:
-                # Models trained using ColossalAI may include these tensors in
-                # the checkpoint. Skip them.
-                continue
-            if name.startswith("model.vision_tower") and name not in params_dict:
-                continue
-
-            for param_name, weight_name, shard_id in stacked_params_mapping:
-                if weight_name not in name:
-                    continue
-                if "mlp.experts" in name:
-                    continue
-                name = name.replace(weight_name, param_name)
-                # Skip loading extra bias for GPTQ models.
-                if name.endswith(".bias") and name not in params_dict:
-                    continue
-                if name not in params_dict:
-                    continue
-
-                param = params_dict[name]
-                weight_loader = param.weight_loader
-                weight_loader(param, loaded_weight, shard_id)
-                break
-            else:
-                for mapping in expert_params_mapping:
-                    param_name, weight_name, expert_id, shard_id = mapping
-                    if weight_name not in name:
-                        continue
-                    name = name.replace(weight_name, param_name)
-                    param = params_dict[name]
-                    weight_loader = param.weight_loader
-                    weight_loader(
-                        param,
-                        loaded_weight,
-                        name,
-                        expert_id=expert_id,
-                        shard_id=shard_id,
-                    )
-                    break
-                else:
-                    # Skip loading extra bias for GPTQ models.
-                    if name.endswith(".bias") and name not in params_dict:
-                        continue
-
-                    if name not in params_dict:
-                        continue
-
-                    if name in params_dict.keys():
-                        param = params_dict[name]
-                        weight_loader = getattr(
-                            param, "weight_loader", default_weight_loader
-                        )
-                        weight_loader(param, loaded_weight)
-                    else:
-                        logger.warning(f"Parameter {name} not found in params_dict")
+        return AutoWeightsLoader(
+            self,
+            skip_substrs=["projector"],
+            ignore_unexpected_prefixes=["model.vision_tower"],
+        ).load_weights(weights, mapper=mapper)
 
     @classmethod
     def get_model_config_for_expert_location(cls, config):

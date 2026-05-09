@@ -36,8 +36,25 @@ from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.model_loader.auto_loader import (
+    STACKED_PARAMS_MAPPING_LLAMA,
+    AutoWeightsLoader,
+    default_stacked_params_load,
+)
 from sglang.srt.utils import add_prefix
+
+
+def _adjust_gemma_norm_weights(weights):
+    """Convert HF Gemma's RMSNorm weights to sglang's RMSNorm convention.
+
+    HF Gemma's RMSNorm multiplies by ``(1 + weight)`` whereas sglang's
+    :class:`RMSNorm` multiplies by ``weight`` directly. Pre-add 1.0 so the
+    forward pass produces identical outputs.
+    """
+    for name, w in weights:
+        if "norm.weight" in name:
+            w = w + 1.0
+        yield name, w
 
 
 class GemmaMLP(nn.Module):
@@ -266,6 +283,9 @@ class GemmaModel(nn.Module):
         hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states
 
+    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> set[str]:
+        return default_stacked_params_load(self, weights, STACKED_PARAMS_MAPPING_LLAMA)
+
 
 class GemmaForCausalLM(nn.Module):
     packed_modules_mapping = {
@@ -366,45 +386,10 @@ class GemmaForCausalLM(nn.Module):
 
         return result
 
-    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
-        stacked_params_mapping = [
-            # (param_name, shard_name, shard_id)
-            ("qkv_proj", "q_proj", "q"),
-            ("qkv_proj", "k_proj", "k"),
-            ("qkv_proj", "v_proj", "v"),
-            ("gate_up_proj", "gate_proj", 0),
-            ("gate_up_proj", "up_proj", 1),
-        ]
-        params_dict = dict(self.named_parameters())
-        loaded_params = set()
-        for name, loaded_weight in weights:
-            for param_name, shard_name, shard_id in stacked_params_mapping:
-                if shard_name not in name:
-                    continue
-                name = name.replace(shard_name, param_name)
-                # Skip loading extra bias for GPTQ models.
-                if name.endswith(".bias") and name not in params_dict:
-                    continue
-                param = params_dict[name]
-                weight_loader = param.weight_loader
-                weight_loader(param, loaded_weight, shard_id)
-                break
-            else:
-                # lm_head is not used in vllm as it is tied with embed_token.
-                # To prevent errors, skip loading lm_head.weight.
-                if "lm_head.weight" in name:
-                    continue
-                # Skip loading extra bias for GPTQ models.
-                if name.endswith(".bias") and name not in params_dict:
-                    continue
-                # GemmaRMSNorm is different from Llama's in that it multiplies
-                # (1 + weight) to the output, instead of just weight.
-                if "norm.weight" in name:
-                    loaded_weight += 1.0
-                param = params_dict[name]
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                weight_loader(param, loaded_weight)
-            loaded_params.add(name)
+    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> set[str]:
+        # Gemma is always tied; lm_head is not a real module on this class.
+        loader = AutoWeightsLoader(self, skip_prefixes=["lm_head."])
+        return loader.load_weights(_adjust_gemma_norm_weights(weights))
 
 
 EntryClass = GemmaForCausalLM

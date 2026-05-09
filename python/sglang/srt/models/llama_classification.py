@@ -26,8 +26,8 @@ from sglang.srt.layers.pooler import (
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.models.llama import LlamaForCausalLM, LlamaModel
+from sglang.srt.model_loader.auto_loader import AutoWeightsLoader
+from sglang.srt.models.llama import LlamaModel
 from sglang.srt.utils import add_prefix
 
 
@@ -72,18 +72,14 @@ class LlamaForClassification(nn.Module):
             input_ids,
         )
 
-    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
-        params_dict = dict(self.named_parameters())
-
-        for name, loaded_weight in weights:
-            if "classification_head" in name:
-                param = params_dict[name]
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                weight_loader(param, loaded_weight)
-            elif "lm_head" in name:
-                continue
-            else:
-                LlamaForCausalLM.load_weights(self, [(name, loaded_weight)])
+    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> set[str]:
+        loader = AutoWeightsLoader(
+            self,
+            skip_prefixes=["lm_head."],
+            skip_substrs=["projector"],
+            ignore_unexpected_prefixes=["model.vision_tower."],
+        )
+        return loader.load_weights(weights)
 
 
 EntryClass = LlamaForClassification

@@ -6,6 +6,10 @@ from typing import TYPE_CHECKING
 
 from torch import nn
 
+# Side-effect: register cross-architecture weight quirks with
+# WeightQuirkRegistry. Imported here so any caller that touches the
+# model_loader package picks them up before load_weights runs.
+from sglang.srt.model_loader import quirks  # noqa: F401
 from sglang.srt.model_loader.loader import BaseModelLoader, get_model_loader
 from sglang.srt.model_loader.utils import (
     get_architecture_class_name,

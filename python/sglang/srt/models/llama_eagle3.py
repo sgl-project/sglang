@@ -36,7 +36,11 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
-from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.model_loader.auto_loader import (
+    STACKED_PARAMS_MAPPING_LLAMA,
+    AutoWeightsLoader,
+    default_stacked_params_load,
+)
 from sglang.srt.models.llama import LlamaDecoderLayer, LlamaForCausalLM, LlamaMLP
 
 
@@ -196,6 +200,9 @@ class LlamaModel(nn.Module):
         # For draft decode, we capture the hidden state before norm
         return hidden_states_to_logits, [hidden_states_to_aux]
 
+    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> set[str]:
+        return default_stacked_params_load(self, weights, STACKED_PARAMS_MAPPING_LLAMA)
+
 
 class LlamaForCausalLMEagle3(LlamaForCausalLM):
     def __init__(
@@ -241,47 +248,28 @@ class LlamaForCausalLMEagle3(LlamaForCausalLM):
         self.hot_token_id = None
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> None:
-        params_dict = dict(self.named_parameters())
-        # Define the parameter mapping for stacked parameters
-        stacked_params_mapping = [
-            # (param_name, shard_name, shard_id)
-            (".qkv_proj", ".q_proj", "q"),
-            (".qkv_proj", ".k_proj", "k"),
-            (".qkv_proj", ".v_proj", "v"),
-            (".gate_up_proj", ".gate_proj", 0),
-            (".gate_up_proj", ".up_proj", 1),
-        ]
+        # Top-level children of this module — anything else gets wrapped under
+        # ``model.`` to match the eagle3 checkpoint convention of bare names
+        # like ``midlayer.self_attn.q_proj.weight``.
+        top_level = set(dict(self.named_children()).keys())
 
-        for name, loaded_weight in weights:
-            if "d2t" in name:
-                # d2t stores diffs between draft id and target id
-                self.hot_token_id = loaded_weight + torch.arange(loaded_weight.shape[0])
-                continue
-
-            if "t2d" in name:
-                continue
-
-            for param_name, weight_name, shard_id in stacked_params_mapping:
-                if weight_name not in name:
+        def _preprocess(
+            ws: Iterable[Tuple[str, torch.Tensor]],
+        ) -> Iterable[Tuple[str, torch.Tensor]]:
+            for name, w in ws:
+                if "d2t" in name:
+                    # d2t stores diffs between draft id and target id
+                    self.hot_token_id = w + torch.arange(w.shape[0])
                     continue
-                name = name.replace(weight_name, param_name)
-                param_name = f"model.{name}" if name not in params_dict else name
-                if param_name in params_dict:
-                    param = params_dict[param_name]
-                    weight_loader = getattr(
-                        param, "weight_loader", default_weight_loader
-                    )
-                    weight_loader(param, loaded_weight, shard_id)
-                break
-            else:
-                # Handle regular parameters
-                param_name = name if name in params_dict else f"model.{name}"
-                if param_name in params_dict:
-                    param = params_dict[param_name]
-                    weight_loader = getattr(
-                        param, "weight_loader", default_weight_loader
-                    )
-                    weight_loader(param, loaded_weight)
+                if "t2d" in name:
+                    continue
+                head = name.split(".", 1)[0]
+                if head not in top_level:
+                    name = f"model.{name}"
+                yield name, w
+
+        loader = AutoWeightsLoader(self)
+        return loader.load_weights(_preprocess(weights))
 
     def get_hot_token_id(self):
         return self.hot_token_id

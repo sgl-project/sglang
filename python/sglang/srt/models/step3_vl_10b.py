@@ -26,7 +26,7 @@ from sglang.srt.managers.schedule_batch import (
     MultimodalInputs,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.model_loader.auto_loader import AutoWeightsLoader, WeightsMapper
 from sglang.srt.models.qwen3 import Qwen3ForCausalLM
 from sglang.srt.utils import add_prefix
 
@@ -544,40 +544,27 @@ class StepVLForConditionalGeneration(nn.Module):
         return hidden_states
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
-        """Load weights for the model, separating vision and language weights"""
-        weights = list(weights)
+        """Load weights via AutoWeightsLoader.
 
-        # Separate vision tower weights and language model weights
-        vision_weights = []
-        language_weights = []
+        Vision-tower checkpoint uses CLIP/Whisper-style fused QKV
+        (``in_proj_weight`` / ``in_proj_bias``); the runtime VisionAttention
+        exposes ``qkv_proj``. The output projection is ``out_proj`` in the
+        checkpoint, ``proj`` at runtime. The MLP uses GPT-2-style ``c_fc`` /
+        ``c_proj`` in the checkpoint, ``fc1`` / ``fc2`` at runtime.
 
-        for name, loaded_weight in weights:
-            if "vision_model" in name or "vit_large_projector" in name:
-                name = name.replace(r".attn.in_proj_weight", r".attn.qkv_proj.weight")
-                name = name.replace(r".attn.in_proj_bias", r".attn.qkv_proj.bias")
-                name = name.replace(r".attn.out_proj.bias", r".attn.proj.bias")
-                name = name.replace(r".attn.out_proj.weight", r".attn.proj.weight")
-                name = name.replace(".mlp.c_fc", ".mlp.fc1")
-                name = name.replace(".mlp.c_proj", ".mlp.fc2")
-                vision_weights.append((name, loaded_weight))
-            else:
-                # All other weights go to language model
-                language_weights.append((name, loaded_weight))
-
-        # Load vision tower weights
-        vision_state_dict = dict(vision_weights)
-        params_dict = dict(self.named_parameters(remove_duplicate=False))
-        for name, loaded_weight in vision_state_dict.items():
-            if name not in params_dict:
-                raise ValueError(f"Weight {name} not found in params_dict")
-            param = params_dict[name]
-            weight_loader = getattr(param, "weight_loader", default_weight_loader)
-            # loaded_weight = self._pad_vit_attn_dummy_heads(name, loaded_weight)
-            weight_loader(param, loaded_weight)
-
-        # Load language model weights
-        if language_weights:
-            self.language_model.load_weights(language_weights)
+        The ``language_model`` (Qwen3ForCausalLM) handles its own q/k/v +
+        gate/up fusion via its own ``load_weights``.
+        """
+        mapper = WeightsMapper(
+            orig_to_new_substr={
+                ".attn.in_proj_weight": ".attn.qkv_proj.weight",
+                ".attn.in_proj_bias": ".attn.qkv_proj.bias",
+                ".attn.out_proj.": ".attn.proj.",
+                ".mlp.c_fc": ".mlp.fc1",
+                ".mlp.c_proj": ".mlp.fc2",
+            },
+        )
+        return AutoWeightsLoader(self).load_weights(weights, mapper=mapper)
 
 
 EntryClass = StepVLForConditionalGeneration

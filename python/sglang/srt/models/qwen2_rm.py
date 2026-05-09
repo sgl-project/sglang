@@ -26,7 +26,8 @@ from sglang.srt.layers.pooler import (
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.models.qwen2 import Qwen2ForCausalLM, Qwen2Model
+from sglang.srt.model_loader.auto_loader import AutoWeightsLoader
+from sglang.srt.models.qwen2 import Qwen2Model
 from sglang.srt.utils import add_prefix
 
 
@@ -79,12 +80,14 @@ class Qwen2ForRewardModel(nn.Module):
             pooled_hidden_states=pooled_hidden,
         )
 
-    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
-        # Filter out lm_head weights of Qwen2ForCausalLM
-        filtered_weights = [
-            (name, w) for name, w in weights if not name.startswith("lm_head")
-        ]
-        return Qwen2ForCausalLM.load_weights(self, filtered_weights)
+    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> set[str]:
+        loader = AutoWeightsLoader(
+            self,
+            skip_prefixes=["lm_head."],
+            skip_substrs=["projector"],
+            ignore_unexpected_prefixes=["model.vision_tower."],
+        )
+        return loader.load_weights(weights)
 
 
 EntryClass = [

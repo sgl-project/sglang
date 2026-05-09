@@ -23,7 +23,7 @@ from sglang.srt.managers.schedule_batch import (
     MultimodalInputs,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.model_loader.auto_loader import AutoWeightsLoader, WeightsMapper
 from sglang.srt.models.qwen2 import Qwen2ForCausalLM
 from sglang.srt.utils import add_prefix
 
@@ -606,88 +606,29 @@ class MiDashengLMModel(nn.Module):
         )
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
-        """Load model weights."""
-        params_dict = dict(self.named_parameters(remove_duplicate=False))
-        buffers_dict = dict(self.named_buffers())
-        audio_encoder_loaded = []
-        audio_projector_loaded = []
-        skipped_weights = []
-        decoder_weights = []
-        for name, loaded_weight in weights:
-            if "rotary_emb.inv_freq" in name:
-                continue
-            if "rotary_emb.cos_cached" in name or "rotary_emb.sin_cached" in name:
-                continue
-            if name.startswith("decoder"):
-                decoder_weights.append((name, loaded_weight))
-                continue
-            original_name = name
-            if "audio_encoder.front_end" in name:
-                if ".mel_scale.fb" in name:
-                    name = name.replace(".mel_scale.fb", ".melscale_fbanks")
-                elif ".spectrogram.window" in name:
-                    name = name.replace(".spectrogram.window", ".spectrogram_window")
-            if "audio_encoder" in name and ".attn.qkv." in name:
-                name = name.replace(".attn.qkv.", ".attn.attn.qkv_proj.")
-            if "audio_encoder" in name and ".attn.proj." in name:
-                name = name.replace(".attn.proj.", ".attn.attn.proj.")
-            if "audio_projector" in name:
-                name = name.replace(".net.0.", ".fc1.")
-                name = name.replace(".net.2.", ".fc2.")
-            if (
-                name.endswith(".bias")
-                and name not in params_dict
-                and name not in buffers_dict
-            ):
-                skipped_weights.append(f"{original_name} (bias not in params/buffers)")
-                continue
-            if name in params_dict:
-                param = params_dict[name]
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                weight_loader(param, loaded_weight)
-            elif name in buffers_dict:
-                buffers_dict[name].copy_(loaded_weight)
-            else:
-                if "audio_projector" in original_name:
-                    skipped_weights.append(f"{original_name} -> {name} (NOT IN MODEL)")
-                else:
-                    skipped_weights.append(f"{original_name} (not in model)")
-                continue
+        """Load model weights via AutoWeightsLoader.
 
-            if "audio_encoder" in original_name:
-                audio_encoder_loaded.append(original_name)
-            elif "audio_projector" in original_name:
-                audio_projector_loaded.append(original_name)
-        if decoder_weights:
-            logger.debug(
-                f"Passing {len(decoder_weights)} decoder weights to language_model.load_weights()"
-            )
-            decoder_weights_stripped = [
-                (name.replace("decoder.", "", 1), weight)
-                for name, weight in decoder_weights
-            ]
-            self.language_model.load_weights(decoder_weights_stripped)
-        logger.debug("=" * 80)
-        logger.debug(f"Audio encoder weights loaded: {len(audio_encoder_loaded)}")
-        logger.debug(f"Audio projector weights loaded: {len(audio_projector_loaded)}")
-        logger.debug(
-            f"Decoder weights passed to language_model: {len(decoder_weights)}"
+        HF naming for the audio subtree differs from the runtime layout:
+          - ``audio_encoder.front_end.mel_scale.fb`` → ``...melscale_fbanks``
+          - ``audio_encoder.front_end.spectrogram.window`` → ``...spectrogram_window``
+          - ``audio_encoder.<...>.attn.qkv`` → ``...attn.attn.qkv_proj`` (VisionAttention wraps the projection)
+          - ``audio_encoder.<...>.attn.proj`` → ``...attn.attn.proj``
+          - ``audio_projector.net.0`` / ``net.2`` → ``audio_projector.fc1`` / ``fc2``
+          - ``decoder.*`` → ``language_model.*``
+        Qwen2 LM handles its own q/k/v + gate/up fusion via its own load_weights.
+        """
+        mapper = WeightsMapper(
+            orig_to_new_substr={
+                ".mel_scale.fb": ".melscale_fbanks",
+                ".spectrogram.window": ".spectrogram_window",
+                ".attn.qkv.": ".attn.attn.qkv_proj.",
+                ".attn.proj.": ".attn.attn.proj.",
+                ".net.0.": ".fc1.",
+                ".net.2.": ".fc2.",
+            },
+            orig_to_new_prefix={"decoder.": "language_model."},
         )
-        logger.debug(f"Skipped weights: {len(skipped_weights)}")
-        encoder_skipped = [s for s in skipped_weights if "audio_encoder" in s]
-        projector_skipped = [s for s in skipped_weights if "audio_projector" in s]
-        if projector_skipped:
-            logger.debug("Skipped audio_projector weights:")
-            for s in projector_skipped:
-                logger.debug(f"  {s}")
-        if encoder_skipped:
-            logger.debug(f"Skipped audio_encoder weights: {len(encoder_skipped)}")
-            non_bias_skipped = [s for s in encoder_skipped if "bias" not in s]
-            if non_bias_skipped:
-                logger.debug("  First 10 non-bias skipped:")
-                for s in non_bias_skipped[:10]:
-                    logger.debug(f"    {s}")
-        logger.debug("=" * 80)
+        return AutoWeightsLoader(self).load_weights(weights, mapper=mapper)
 
     def get_embed_and_head(self):
         return (

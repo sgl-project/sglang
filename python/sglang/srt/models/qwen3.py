@@ -20,13 +20,10 @@ from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.rotary_embedding.mrope import MRotaryEmbedding
-from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
+from sglang.srt.layers.utils import PPMissingLayer
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
-from sglang.srt.model_loader.weight_utils import (
-    default_weight_loader,
-    maybe_remap_kv_scale_name,
-)
+from sglang.srt.model_loader.auto_loader import AutoWeightsLoader, WeightsMapper
 from sglang.srt.models.qwen2 import Qwen2MLP as Qwen3MLP
 from sglang.srt.models.qwen2 import Qwen2Model
 from sglang.srt.models.utils import apply_qk_norm
@@ -40,6 +37,18 @@ _is_cuda = is_cuda()
 _is_hip = is_hip()
 _is_npu = is_npu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+
+# Some Qwen3 checkpoints (e.g. EAGLE drafts) ship inner-model keys without the
+# leading ``model.`` prefix. Hoist them into the canonical layout once at the
+# top of the load.
+_QWEN3_PREFIX_MAPPER = WeightsMapper(
+    orig_to_new_prefix={
+        "layers.": "model.layers.",
+        "embed_tokens.": "model.embed_tokens.",
+        "norm.": "model.norm.",
+    }
+)
+
 
 _has_fused_qk_norm_mrope = False
 if _use_aiter:
@@ -589,81 +598,31 @@ class Qwen3ForCausalLM(nn.Module):
     def end_layer(self):
         return self.model.end_layer
 
-    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
-        stacked_params_mapping = [
-            # (param_name, shard_name, shard_id)
-            ("qkv_proj", "q_proj", "q"),
-            ("qkv_proj", "k_proj", "k"),
-            ("qkv_proj", "v_proj", "v"),
-            ("gate_up_proj", "gate_proj", 0),
-            ("gate_up_proj", "up_proj", 1),
-        ]
-
-        params_dict = dict(self.named_parameters())
-        for name, loaded_weight in weights:
-            if not name.startswith("model.") and (
-                name.startswith("layers.")
-                or name.startswith("embed_tokens.")
-                or name.startswith("norm.")
-            ):
-                name = add_prefix(name, "model")
-
-            if name == "model.embed_tokens.weight":
-                if self.pp_group.is_last_rank and self.config.tie_word_embeddings:
-                    if "lm_head.weight" in params_dict:
-                        param = params_dict["lm_head.weight"]
-                        weight_loader = getattr(
-                            param, "weight_loader", default_weight_loader
-                        )
-                        weight_loader(param, loaded_weight)
-
-            layer_id = get_layer_id(name)
-            if (
-                layer_id is not None
-                and hasattr(self.model, "start_layer")
-                and (
-                    layer_id < self.model.start_layer
-                    or layer_id >= self.model.end_layer
+    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> set[str]:
+        # On the last PP rank with tied embeddings (and PP > 1), the inner
+        # Qwen3Model's embed_tokens is a PPMissingLayer (no parameter).
+        # Redirect the checkpoint's embed_tokens tensor into lm_head so the
+        # tied weight still loads. For PP=1, lm_head IS embed_tokens.
+        if (
+            self.pp_group.is_last_rank
+            and self.pp_group.world_size > 1
+            and self.config.tie_word_embeddings
+        ):
+            weights = (
+                (
+                    ("lm_head.weight", w)
+                    if name == "model.embed_tokens.weight"
+                    else (name, w)
                 )
-            ):
-                continue
+                for name, w in weights
+            )
 
-            if "rotary_emb.inv_freq" in name or "projector" in name:
-                continue
-            if "rotary_emb.cos_cached" in name or "rotary_emb.sin_cached" in name:
-                # Models trained using ColossalAI may include these tensors in
-                # the checkpoint. Skip them.
-                continue
-            if name.startswith("model.vision_tower") and name not in params_dict:
-                continue
-            if "scale" in name:
-                name = maybe_remap_kv_scale_name(name, params_dict)
-                if name is None:
-                    continue
-            for param_name, weight_name, shard_id in stacked_params_mapping:
-                if weight_name not in name:
-                    continue
-                name = name.replace(weight_name, param_name)
-                # Skip loading extra bias for GPTQ models.
-                if name.endswith(".bias") and name not in params_dict:
-                    continue
-                param = params_dict[name]
-                weight_loader = param.weight_loader
-                weight_loader(param, loaded_weight, shard_id)
-                break
-            else:
-                # Skip loading extra bias for GPTQ models.
-                if name.endswith(".bias") and name not in params_dict:
-                    continue
-
-                if name in params_dict.keys():
-                    param = params_dict[name]
-                    weight_loader = getattr(
-                        param, "weight_loader", default_weight_loader
-                    )
-                    weight_loader(param, loaded_weight)
-                else:
-                    logger.warning(f"Parameter {name} not found in params_dict")
+        loader = AutoWeightsLoader(
+            self,
+            skip_substrs=["projector"],
+            ignore_unexpected_prefixes=["model.vision_tower."],
+        )
+        return loader.load_weights(weights, mapper=_QWEN3_PREFIX_MAPPER)
 
     def get_embed_and_head(self):
         return self.model.embed_tokens.weight, self.lm_head.weight

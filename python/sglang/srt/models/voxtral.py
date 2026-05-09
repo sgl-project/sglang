@@ -30,8 +30,19 @@ from sglang.srt.managers.schedule_batch import (
     MultimodalInputs,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.model_loader.auto_loader import (
+    AutoWeightsLoader,
+    WeightsMapper,
+    default_stacked_params_load,
+)
 from sglang.srt.models.llama import LlamaForCausalLM
+
+# QKV split → fused for the Whisper-style audio tower.
+_VOXTRAL_AUDIO_QKV_STACKED = [
+    (".qkv_proj", ".q_proj", "q"),
+    (".qkv_proj", ".k_proj", "k"),
+    (".qkv_proj", ".v_proj", "v"),
+]
 
 
 class AudioLanguageAdapter(nn.Module):
@@ -185,6 +196,14 @@ class VoxtralWhisperEncoder(nn.Module):
 
         hidden_states = self.layer_norm(hidden_states)
         return hidden_states
+
+    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> set[str]:
+        # Whisper checkpoints ship split q_proj/k_proj/v_proj; pack them into
+        # ``qkv_proj`` here so the AutoWeightsLoader walker can defer the whole
+        # audio_tower subtree to us.
+        return default_stacked_params_load(
+            self, weights, _VOXTRAL_AUDIO_QKV_STACKED, skip_pp_out_of_range=False
+        )
 
 
 class VoxtralForConditionalGeneration(nn.Module):
@@ -378,67 +397,30 @@ class VoxtralForConditionalGeneration(nn.Module):
     def get_language_model(self) -> nn.Module:
         return self.language_model
 
-    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
-        encoder_stacked = [
-            ("qkv_proj", "q_proj", "q"),
-            ("qkv_proj", "k_proj", "k"),
-            ("qkv_proj", "v_proj", "v"),
-        ]
-
-        encoder_dict = dict(self.audio_tower.named_parameters())
-        projector_dict = dict(self.multi_modal_projector.named_parameters())
-
-        # Collect all weights; synthesise missing k_proj bias as zeros.
+    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> set[str]:
+        # The HF Voxtral checkpoint omits ``audio_tower.layers.*.self_attn.k_proj.bias``
+        # (Whisper convention: no bias on k_proj), but our QKVParallelLinear
+        # expects the fused ``qkv_proj.bias`` to include the k slot. Synthesise
+        # zeros for the missing biases before the walker sees the stream.
         weights_list = list(weights)
-        extra_weights = []
+        seen_names = {n for n, _ in weights_list}
+        extra: List[Tuple[str, torch.Tensor]] = []
         for name, w in weights_list:
             if name.startswith("audio_tower.") and ".self_attn.k_proj.weight" in name:
                 bias_name = name.replace(".weight", ".bias")
-                if not any(n == bias_name for n, _ in weights_list):
-                    extra_weights.append(
-                        (bias_name, torch.zeros(w.shape[0], dtype=w.dtype))
-                    )
-        weights_list.extend(extra_weights)
+                if bias_name not in seen_names:
+                    extra.append((bias_name, torch.zeros(w.shape[0], dtype=w.dtype)))
+        weights_list.extend(extra)
 
-        def llm_weights_generator():
-            for name, w in weights_list:
-                # Encoder weights
-                if name.startswith("audio_tower."):
-                    trimmed = name[len("audio_tower.") :]
-                    loaded = False
-                    for param_name, weight_name, shard_id in encoder_stacked:
-                        if f".{weight_name}." in trimmed:
-                            stacked_name = trimmed.replace(weight_name, param_name)
-                            if stacked_name in encoder_dict:
-                                param = encoder_dict[stacked_name]
-                                param.weight_loader(param, w, shard_id)
-                                loaded = True
-                                break
-                    if not loaded and trimmed in encoder_dict:
-                        param = encoder_dict[trimmed]
-                        weight_loader = getattr(
-                            param, "weight_loader", default_weight_loader
-                        )
-                        weight_loader(param, w)
-                    continue
-
-                # Projector weights
-                if name.startswith("multi_modal_projector."):
-                    trimmed = name[len("multi_modal_projector.") :]
-                    trimmed = trimmed.replace("linear_1.", "w_in.").replace(
-                        "linear_2.", "w_out."
-                    )
-                    if trimmed in projector_dict:
-                        param = projector_dict[trimmed]
-                        default_weight_loader(param, w)
-                    continue
-
-                # LLM weights
-                if name.startswith("language_model."):
-                    name = name[len("language_model.") :]
-                yield (name, w)
-
-        self.language_model.load_weights(llm_weights_generator())
+        # HF projector names ``linear_1`` / ``linear_2``; the runtime adapter
+        # exposes ``w_in`` / ``w_out``.
+        mapper = WeightsMapper(
+            orig_to_new_substr={
+                "multi_modal_projector.linear_1.": "multi_modal_projector.w_in.",
+                "multi_modal_projector.linear_2.": "multi_modal_projector.w_out.",
+            },
+        )
+        return AutoWeightsLoader(self).load_weights(weights_list, mapper=mapper)
 
 
 EntryClass = [VoxtralForConditionalGeneration]

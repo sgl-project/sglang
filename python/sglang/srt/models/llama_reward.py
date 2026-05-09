@@ -26,7 +26,8 @@ from sglang.srt.layers.pooler import (
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.models.llama import LlamaForCausalLM, LlamaModel
+from sglang.srt.model_loader.auto_loader import AutoWeightsLoader
+from sglang.srt.models.llama import LlamaModel
 from sglang.srt.utils import add_prefix
 
 
@@ -73,8 +74,14 @@ class LlamaForSequenceClassification(nn.Module):
             ),
         )
 
-    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
-        return LlamaForCausalLM.load_weights(self, weights)
+    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> set[str]:
+        loader = AutoWeightsLoader(
+            self,
+            skip_prefixes=["lm_head."],
+            skip_substrs=["projector"],
+            ignore_unexpected_prefixes=["model.vision_tower."],
+        )
+        return loader.load_weights(weights)
 
 
 class LlamaForSequenceClassificationWithNormal_Weights(LlamaForSequenceClassification):

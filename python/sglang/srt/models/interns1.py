@@ -5,7 +5,6 @@ from torch import nn
 from transformers import PretrainedConfig
 
 from sglang.srt.layers.attention import vision_utils
-from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.managers.mm_utils import (
     MultiModalityDataPaddingPatternTokenPairs,
@@ -17,7 +16,7 @@ from sglang.srt.managers.schedule_batch import (
     MultimodalInputs,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.model_loader.auto_loader import AutoWeightsLoader, WeightsMapper
 from sglang.srt.models.internvl import InternVisionModel
 from sglang.srt.models.qwen2 import Qwen2ForCausalLM
 from sglang.srt.models.qwen3 import Qwen3ForCausalLM
@@ -164,111 +163,52 @@ class InternS1ForConditionalGeneration(nn.Module):
 
         return helper.pad_input_tokens(input_ids, mm_inputs)
 
-    def _mapping_interns1_name(self, name):
-        names_map = {
-            "lm_head.weight": "language_model.lm_head.weight",
-            "model.multi_modal_projector.layer_norm.bias": "mlp1.0.bias",
-            "model.multi_modal_projector.layer_norm.weight": "mlp1.0.weight",
-            "model.multi_modal_projector.linear_1.bias": "mlp1.1.bias",
-            "model.multi_modal_projector.linear_1.weight": "mlp1.1.weight",
-            "model.multi_modal_projector.linear_2.bias": "mlp1.3.bias",
-            "model.multi_modal_projector.linear_2.weight": "mlp1.3.weight",
-            "model.vision_tower.embeddings.cls_token": "vision_model.embeddings.class_embedding",
-            "model.vision_tower.embeddings.patch_embeddings.projection.bias": "vision_model.embeddings.patch_embedding.bias",
-            "model.vision_tower.embeddings.patch_embeddings.projection.weight": "vision_model.embeddings.patch_embedding.weight",
-            "model.vision_tower.embeddings.position_embeddings": "vision_model.embeddings.position_embedding",
-        }
-        if name in names_map:
-            name = names_map[name]
-        elif name.startswith("model.language_model."):
-            name = "language_model.model." + name[len("model.language_model.") :]
-        elif name.startswith("model.vision_tower."):
-            name = "vision_model." + name[len("model.vision_tower.") :]
-
-        if name.startswith("vision_model.encoder.layer"):
-
-            name = name.replace(r".layer.", r".layers.")
-            name = name.replace(r".attention.", r".attn.attn.")
-            name = name.replace(r".projection_layer.", r".proj.")
-            name = name.replace(r".lambda_1", r".ls1")
-            name = name.replace(r".lambda_2", r".ls2")
-            name = name.replace(r".layernorm_before.", r".norm1.")
-            name = name.replace(r".layernorm_after.", r".norm2.")
-        return name
-
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
-        stacked_params_mapping = [
-            # (param_name, shard_name, shard_id)
-            ("qkv_proj", "q_proj", "q"),
-            ("qkv_proj", "k_proj", "k"),
-            ("qkv_proj", "v_proj", "v"),
-            ("gate_up_proj", "gate_proj", 0),
-            ("gate_up_proj", "up_proj", 1),
-        ]
-        expert_params_mapping = []
-        if "Qwen3MoeForCausalLM" in self.config.text_config.architectures:
-            expert_params_mapping = FusedMoE.make_expert_params_mapping(
-                ckpt_gate_proj_name="gate_proj",
-                ckpt_down_proj_name="down_proj",
-                ckpt_up_proj_name="up_proj",
-                num_experts=self.config.num_experts,
-            )
+        # Map HF checkpoint names onto the runtime module tree before the
+        # walker sees them. Order matters: substr rewrites apply first, then
+        # prefixes. The vision tower's HF naming uses ``encoder.layer.*``,
+        # ``attention``, ``projection_layer``, ``lambda_{1,2}``,
+        # ``layernorm_{before,after}``; the runtime ``InternVisionModel``
+        # exposes ``encoder.layers.*``, ``attn.attn``, ``proj``, ``ls{1,2}``,
+        # ``norm{1,2}``. The HF projector lives under
+        # ``model.multi_modal_projector.{layer_norm,linear_1,linear_2}``;
+        # runtime exposes ``mlp1.0`` (LayerNorm), ``mlp1.1`` (Linear),
+        # ``mlp1.3`` (Linear).
+        mapper = WeightsMapper(
+            orig_to_new_substr={
+                ".attention.": ".attn.attn.",
+                ".projection_layer.": ".proj.",
+                ".lambda_1": ".ls1",
+                ".lambda_2": ".ls2",
+                ".layernorm_before.": ".norm1.",
+                ".layernorm_after.": ".norm2.",
+                ".embeddings.patch_embeddings.projection.": ".embeddings.patch_embedding.",
+                ".embeddings.position_embeddings": ".embeddings.position_embedding",
+                ".embeddings.cls_token": ".embeddings.class_embedding",
+                # Vision tower encoder layer collection rename: only the
+                # ``encoder.layer.`` segment, not generic ``layer.``.
+                "encoder.layer.": "encoder.layers.",
+            },
+            orig_to_new_prefix={
+                "model.multi_modal_projector.layer_norm.": "mlp1.0.",
+                "model.multi_modal_projector.linear_1.": "mlp1.1.",
+                "model.multi_modal_projector.linear_2.": "mlp1.3.",
+                "model.language_model.": "language_model.model.",
+                "model.vision_tower.": "vision_model.",
+                "lm_head.": "language_model.lm_head.",
+            },
+        )
 
-        params_dict = dict(self.named_parameters())
+        # Apply mapping first so ``pad_vit_attn_dummy_heads`` sees the
+        # runtime names it inspects (``attn.qkv_proj``, ``attn.proj`` etc.).
+        def _pad_vision(stream):
+            for name, w in mapper.apply(stream):
+                if "vision_model" in name:
+                    w = vision_utils.pad_vit_attn_dummy_heads(self.config, name, w)
+                yield name, w
 
-        for name, loaded_weight in weights:
-            if "rotary_emb.inv_freq" in name:
-                continue
-            name = self._mapping_interns1_name(name)
-            if "vision_model" in name:
-                loaded_weight = vision_utils.pad_vit_attn_dummy_heads(
-                    self.config, name, loaded_weight
-                )
-
-            for param_name, weight_name, shard_id in stacked_params_mapping:
-                if weight_name not in name:
-                    continue
-                # We have mlp.experts[0].gate_proj in the checkpoint.
-                # Since we handle the experts below in expert_params_mapping,
-                # we need to skip here BEFORE we update the name, otherwise
-                # name will be updated to mlp.experts[0].gate_up_proj, which
-                # will then be updated below in expert_params_mapping
-                # for mlp.experts[0].gate_gate_up_proj, which breaks load.
-                if "mlp.experts" in name:
-                    continue
-                name = name.replace(weight_name, param_name)
-                # Skip loading extra bias for GPTQ models.
-                if name.endswith(".bias") and name not in params_dict:
-                    continue
-                param = params_dict[name]
-                weight_loader = param.weight_loader
-                weight_loader(param, loaded_weight, shard_id)
-                break
-            else:
-                for mapping in expert_params_mapping:
-                    param_name, weight_name, expert_id, shard_id = mapping
-                    if weight_name not in name:
-                        continue
-                    name = name.replace(weight_name, param_name)
-                    param = params_dict[name]
-                    weight_loader = param.weight_loader
-                    weight_loader(
-                        param,
-                        loaded_weight,
-                        name,
-                        shard_id=shard_id,
-                        expert_id=expert_id,
-                    )
-                    break
-                else:
-                    # Skip loading extra bias for GPTQ models.
-                    if name.endswith(".bias") and name not in params_dict:
-                        continue
-                    param = params_dict[name]
-                    weight_loader = getattr(
-                        param, "weight_loader", default_weight_loader
-                    )
-                    weight_loader(param, loaded_weight)
+        # Mapper has already been applied; pass an empty mapper to the loader.
+        return AutoWeightsLoader(self).load_weights(_pad_vision(weights))
 
 
 EntryClass = InternS1ForConditionalGeneration
