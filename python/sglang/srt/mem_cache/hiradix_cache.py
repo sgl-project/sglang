@@ -1023,16 +1023,46 @@ class HiRadixCache(RadixCache):
     ):
         last_node = params.last_host_node
         mem_quota = params.mem_quota
+        req = params.req
+        rid = getattr(req, "rid", None) if req is not None else None
+        logger.debug(
+            "[init_load_back] enter rid=%s host_hit_length=%d last_node_id=%s "
+            "evicted=%s backuped=%s mem_quota=%s load_back_threshold=%s",
+            rid,
+            params.host_hit_length,
+            last_node.id,
+            last_node.evicted,
+            getattr(last_node, "backuped", None),
+            mem_quota,
+            self.load_back_threshold,
+        )
         if last_node.evicted:
             loading_values = self.load_back(last_node, mem_quota)
             if loading_values is not None:
                 logger.debug(
-                    f"loading back {len(loading_values)} tokens for node {last_node.id}"
+                    "[init_load_back] loaded rid=%s tokens=%d last_node_id=%s",
+                    rid,
+                    len(loading_values),
+                    last_node.id,
                 )
                 return loading_values, last_node
 
+            start_id = last_node.id
             while last_node.evicted:
                 last_node = last_node.parent
+            logger.debug(
+                "[init_load_back] load_back returned None rid=%s start_node_id=%s "
+                "resolved_node_id=%s (walked ancestors while evicted)",
+                rid,
+                start_id,
+                last_node.id,
+            )
+        else:
+            logger.debug(
+                "[init_load_back] skip rid=%s last_node_id=%s not evicted",
+                rid,
+                last_node.id,
+            )
 
         return (
             torch.empty((0,), dtype=torch.int64, device=self.device),
@@ -1269,11 +1299,28 @@ class HiRadixCache(RadixCache):
             len(new_input_tokens) % self.page_size
         )
         new_input_tokens = new_input_tokens[:prefetch_length]
-        if (
-            not self.enable_storage
-            or prefetch_length < self.prefetch_threshold
-            or self.cache_controller.prefetch_rate_limited()
-        ):
+        if not self.enable_storage:
+            logger.debug(
+                "[prefetch_from_storage] skip rid=%s prefetch_length=%d reason=storage_disabled",
+                req_id,
+                prefetch_length,
+            )
+            return
+        if prefetch_length < self.prefetch_threshold:
+            logger.debug(
+                "[prefetch_from_storage] skip rid=%s prefetch_length=%d threshold=%d "
+                "reason=below_threshold",
+                req_id,
+                prefetch_length,
+                self.prefetch_threshold,
+            )
+            return
+        if self.cache_controller.prefetch_rate_limited():
+            logger.debug(
+                "[prefetch_from_storage] skip rid=%s prefetch_length=%d reason=rate_limited",
+                req_id,
+                prefetch_length,
+            )
             return
 
         last_host_node.protect_host()
@@ -1283,8 +1330,21 @@ class HiRadixCache(RadixCache):
             host_indices = self.cache_controller.mem_pool_host.alloc(prefetch_length)
         if host_indices is None:
             last_host_node.release_host()
-            # no sufficient host memory for prefetch
+            logger.debug(
+                "[prefetch_from_storage] skip rid=%s prefetch_length=%d "
+                "reason=host_mem_unavailable",
+                req_id,
+                prefetch_length,
+            )
             return
+        logger.debug(
+            "[prefetch_from_storage] started rid=%s tokens=%d prefetch_length=%d "
+            "last_host_node_id=%s",
+            req_id,
+            len(new_input_tokens),
+            prefetch_length,
+            last_host_node.id,
+        )
         operation = self.cache_controller.prefetch(
             req_id,
             host_indices,
