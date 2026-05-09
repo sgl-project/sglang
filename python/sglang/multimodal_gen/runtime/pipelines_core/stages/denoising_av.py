@@ -2,15 +2,18 @@ import torch
 from diffusers.utils.torch_utils import randn_tensor
 
 from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import is_ltx23_native_variant
+from sglang.multimodal_gen.runtime.managers.component_manager import ComponentUse
 from sglang.multimodal_gen.runtime.pipelines_core.diffusion_scheduler_utils import (
     clone_scheduler_runtime,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
+from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
+    StageParallelismType,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.ltx_2_denoising import (
     LTX2DenoisingStage,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
-from sglang.multimodal_gen.runtime.utils.layerwise_offload import OffloadableDiTMixin
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
@@ -27,6 +30,20 @@ class LTX2AVDenoisingStage(LTX2DenoisingStage):
             transformer=transformer, scheduler=scheduler, vae=vae, **kwargs
         )
         self.audio_vae = audio_vae
+
+    def component_uses(
+        self, server_args: ServerArgs, stage_name: str | None = None
+    ) -> list[ComponentUse]:
+        stage_name = self._component_stage_name(stage_name)
+        return [
+            ComponentUse(
+                stage_name=stage_name,
+                component_name="transformer",
+                phase="stage1",
+                preferred_ready_after_request=True,
+                memory_intensive=True,
+            )
+        ]
 
     def _post_denoising_loop(
         self,
@@ -83,24 +100,6 @@ class LTX2AVDenoisingStage(LTX2DenoisingStage):
             batch.latents = latents
             batch.audio_latents = audio_latents
 
-        pipeline = self.pipeline() if self.pipeline else None
-        current_phase = (
-            str(getattr(batch, "extra", {}).get("ltx2_phase", ""))
-            if hasattr(batch, "extra")
-            else ""
-        )
-        release_phase_state = (
-            getattr(pipeline, "release_ltx2_phase_state", None)
-            if pipeline is not None
-            else None
-        )
-        if callable(release_phase_state):
-            release_phase_state(current_phase)
-
-        if isinstance(self.transformer, OffloadableDiTMixin):
-            for manager in self.transformer.layerwise_offload_managers:
-                manager.release_all()
-
 
 class LTX2RefinementStage(LTX2AVDenoisingStage):
     """Stage-2 refinement wrapper that re-noises distilled LTX latents once."""
@@ -124,6 +123,31 @@ class LTX2RefinementStage(LTX2AVDenoisingStage):
             sampler_name=sampler_name,
         )
         self.distilled_sigmas = torch.tensor(distilled_sigmas)
+
+    def component_uses(
+        self, server_args: ServerArgs, stage_name: str | None = None
+    ) -> list[ComponentUse]:
+        stage_name = self._component_stage_name(stage_name)
+        component_name = "transformer_2"
+        pipeline = self.pipeline() if self.pipeline else None
+        if pipeline is not None and "transformer_2" not in pipeline.modules:
+            component_name = "transformer"
+        return [
+            ComponentUse(
+                stage_name=stage_name,
+                component_name=component_name,
+                phase="stage2",
+                memory_intensive=True,
+            )
+        ]
+
+    @property
+    def parallelism_type(self) -> StageParallelismType:
+        # Stage 2 is distilled and always runs with CFG disabled, so non-main
+        # CFG ranks should wait at a barrier rather than run a redundant forward.
+        if self.server_args.enable_cfg_parallel:
+            return StageParallelismType.MAIN_RANK_ONLY
+        return StageParallelismType.REPLICATED
 
     @staticmethod
     def _randn_like_with_batch_generators(
@@ -218,14 +242,6 @@ class LTX2RefinementStage(LTX2AVDenoisingStage):
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
         """Run the distilled refinement schedule on top of the shared AV denoiser."""
         batch.extra["ltx2_phase"] = "stage2"
-        pipeline = self.pipeline() if self.pipeline else None
-        ensure_phase_ready = (
-            getattr(pipeline, "ensure_ltx2_phase_ready", None)
-            if pipeline is not None
-            else None
-        )
-        if callable(ensure_phase_ready):
-            ensure_phase_ready("stage2")
         original_clean_latent_background = getattr(
             batch, "ltx2_ti2v_clean_latent_background", None
         )
@@ -356,11 +372,9 @@ class LTX2RefinementStage(LTX2AVDenoisingStage):
             scheduler_sigmas = self.distilled_sigmas
 
         scheduler.sigmas = scheduler_sigmas
-        num_steps = len(self.distilled_sigmas) - 1
+        num_steps = len(scheduler_sigmas) - 1
         scheduler.num_inference_steps = num_steps
-        scheduler.timesteps = (self.distilled_sigmas[:num_steps] * 1000).to(
-            distilled_device
-        )
+        scheduler.timesteps = (scheduler_sigmas[:num_steps] * 1000).to(distilled_device)
         scheduler._step_index = None
         scheduler._begin_index = None
 

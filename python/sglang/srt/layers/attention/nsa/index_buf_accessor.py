@@ -327,6 +327,8 @@ class SetKAndS:
 
     @classmethod
     def triton(cls, pool, buf, loc, index_k, index_k_scale):
+        loc = loc.to(torch.int64)
+
         _set_k_and_s_triton(
             buf=buf,
             loc=loc,
@@ -685,7 +687,7 @@ def _get_k_and_s_triton_kernel(
     buf_numel_per_page: tl.constexpr,
     index_head_dim: tl.constexpr,
     s_offset_in_page: tl.constexpr,
-    page_indice_batch_offset: tl.constexpr,
+    page_indice_batch_offset,
     BLOCK_SIZE: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
 ):

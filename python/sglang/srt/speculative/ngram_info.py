@@ -34,9 +34,9 @@ from sglang.srt.speculative.spec_utils import (
     get_src_tgt_cache_loc,
     get_target_cache_loc,
 )
-from sglang.srt.utils import is_cuda, is_hip, next_power_of_2
+from sglang.srt.utils import is_cuda, is_hip, is_musa, next_power_of_2
 
-if is_cuda():
+if is_cuda() or is_musa():
     from sgl_kernel import (
         top_k_renorm_prob,
         top_p_renorm_prob,
@@ -106,7 +106,6 @@ class NgramVerifyInput(SpecInput):
                 last_loc,
                 len(batch.input_ids),
             )
-            self.last_loc = last_loc
 
         bs = batch.batch_size()
         assign_req_to_token_pool[(bs,)](
@@ -206,7 +205,7 @@ class NgramVerifyInput(SpecInput):
             logits_output.hidden_states = logits_output.hidden_states[
                 self.accepted_indices
             ]
-        self.verified_id = self.predict[self.accepted_indices]
+        self.accept_tokens = self.predict[self.accepted_indices]
 
     def _free_cache(
         self,
@@ -465,7 +464,7 @@ class NgramVerifyInput(SpecInput):
         batch.seq_lens.add_(self.num_accepted_tokens)
         batch.seq_lens_cpu.add_(num_accepted_tokens_cpu)
 
-        return logits_output, self.verified_id, num_accepted_drafts
+        return logits_output, self.accept_tokens, num_accepted_drafts
 
     def filter_batch(self, new_indices: torch.Tensor, has_been_filtered: bool = True):
         pass
