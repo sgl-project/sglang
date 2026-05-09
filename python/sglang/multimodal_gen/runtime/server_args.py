@@ -494,22 +494,6 @@ class ServerArgs(DisaggArgsMixin):
                 self._parse_attention_backend_config(self.attention_backend_config)
             )
 
-        if self.backend != Backend.DIFFUSERS and isinstance(
-            self.pipeline_config, LTX2PipelineConfig
-        ):
-            text_backend = self.component_attention_backends.get("text_encoder")
-            if text_backend != "torch_sdpa":
-                if text_backend is None:
-                    logger.info(
-                        "Automatically set torch_sdpa backend for component text_encoder to preserve LTX2 official attention semantics"
-                    )
-                else:
-                    logger.warning(
-                        "Overriding %s backend with torch_sdpa for component text_encoder to preserve LTX2 official attention semantics",
-                        text_backend,
-                    )
-                self.component_attention_backends["text_encoder"] = "torch_sdpa"
-
         if self.ring_degree > 1:
             if self.attention_backend is not None and self.attention_backend not in (
                 "fa",

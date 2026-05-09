@@ -98,6 +98,7 @@ def _ltx2_build_batched_perturbation_states(
     return states
 
 
+@torch.compiler.disable
 @functools.lru_cache(maxsize=5)
 def _ltx2_rope_freq_grid_np(theta: float, num_pos_dims: int, dim: int) -> torch.Tensor:
     # Official LTX uses NumPy float64 for double-precision RoPE frequencies.
