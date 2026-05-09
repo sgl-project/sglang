@@ -43,7 +43,6 @@ from sglang.srt.model_executor.pool_configurator import MemoryPoolConfig
 from sglang.srt.observability.req_time_stats import set_time_batch
 from sglang.srt.observability.trace import get_global_tracing_enabled
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.speculative.eagle_info import EagleVerifyOutput
 from sglang.srt.speculative.eagle_utils import (
     build_tree_kernel_efficient,
     organize_draft_results,
@@ -461,15 +460,16 @@ class FrozenKVMTPWorker(TpModelWorker):
         with self.draft_tp_context(
             self.draft_model_runner.tp_group
         ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
+            draft_extend_input = verify_output.draft_extend_input
             if (
                 self.server_args.enable_dp_attention
-                or verify_output.unfinished_accept_tokens.numel() > 0
+                or draft_extend_input.input_ids.numel() > 0
             ):
                 # Install draft_extend_input as `batch.spec_info` for the seed
                 # step (`_run_assistant_seed_step` replaces it with a fresh
                 # `FrozenKVMTPDraftInput` for next iter).
-                batch.spec_info = verify_output.draft_extend_input
-                self.forward_draft_extend_after_decode(batch, verify_output)
+                batch.spec_info = draft_extend_input
+                self.forward_draft_extend_after_decode(batch)
         set_time_batch(batch.reqs, "set_spec_draft_extend_end_time", trace_only=True)
 
         return GenerationBatchResult(
@@ -510,15 +510,11 @@ class FrozenKVMTPWorker(TpModelWorker):
             mm_input_embeds=mm_input_embeds,
         )
 
-    def forward_draft_extend_after_decode(
-        self, batch: ScheduleBatch, verify_output: EagleVerifyOutput
-    ) -> None:
-        # `_run_assistant_seed_step` will replace `batch.spec_info` with a fresh
-        # `FrozenKVMTPDraftInput` for the next iter's draft.
+    def forward_draft_extend_after_decode(self, batch: ScheduleBatch) -> None:
         draft_extend_input: FrozenKVMTPDraftExtendInput = batch.spec_info
         input_is_idle = batch.forward_mode.is_idle()
 
-        if not input_is_idle and verify_output.unfinished_accept_tokens.numel() == 0:
+        if not input_is_idle and draft_extend_input.input_ids.numel() == 0:
             # All reqs finished. Install an idle FrozenKVMTPDraftInput so the
             # next-iter draft sees a valid spec_info.
             batch = batch.copy()
@@ -541,10 +537,10 @@ class FrozenKVMTPWorker(TpModelWorker):
 
         try:
             # Verify may leave finished requests in ScheduleBatch; seed only
-            # the unfinished requests carried by `verify_output`.
-            batch.seq_lens = verify_output.seq_lens_for_draft_extend
-            batch.seq_lens_cpu = verify_output.seq_lens_for_draft_extend_cpu
-            batch.req_pool_indices = verify_output.req_pool_indices_for_draft_extend
+            # the unfinished reqs carried by `draft_extend_input`.
+            batch.seq_lens = draft_extend_input.seq_lens
+            batch.seq_lens_cpu = draft_extend_input.seq_lens_cpu
+            batch.req_pool_indices = draft_extend_input.req_pool_indices
 
             last_token_ids, last_hidden = self._select_last_verified_seed(
                 draft_extend_input
@@ -555,7 +551,7 @@ class FrozenKVMTPWorker(TpModelWorker):
                 batch,
                 last_token_ids,
                 last_hidden,
-                seq_lens_cpu=verify_output.seq_lens_for_draft_extend_cpu,
+                seq_lens_cpu=draft_extend_input.seq_lens_cpu,
             )
         finally:
             batch.seq_lens = seq_lens_backup
