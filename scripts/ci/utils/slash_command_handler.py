@@ -426,6 +426,8 @@ def handle_rerun_stage(
         "stage-c-test-4-gpu-gb200",
         "stage-c-test-deepep-4-gpu-h100",
         "stage-c-test-deepep-8-gpu-h200",
+        "stage-c-test-dsv4-4-gpu-b200",
+        "stage-c-test-dsv4-8-gpu-h200",
         "multimodal-gen-test-1-gpu",
         "multimodal-gen-test-2-gpu",
         "multimodal-gen-component-accuracy",
@@ -613,6 +615,8 @@ CUDA_SUITE_TO_RUNNER = {
     "stage-c-test-4-gpu-b200": "4-gpu-b200",
     "stage-c-test-deepep-4-gpu-h100": "4-gpu-h100",
     "stage-c-test-deepep-8-gpu-h200": "8-gpu-h200-deepep",
+    "stage-c-test-dsv4-4-gpu-b200": "4-gpu-b200",
+    "stage-c-test-dsv4-8-gpu-h200": "8-gpu-h200",
     # Nightly test suites (NVIDIA)
     "nightly-1-gpu": "1-gpu-h100",
     "nightly-4-gpu": "4-gpu-h100",
@@ -635,6 +639,8 @@ DEEPEP_SUITES = {
     "stage-c-test-8-gpu-h20",
     "stage-c-test-deepep-4-gpu-h100",
     "stage-c-test-deepep-8-gpu-h200",
+    "stage-c-test-dsv4-4-gpu-b200",
+    "stage-c-test-dsv4-8-gpu-h200",
 }
 
 
