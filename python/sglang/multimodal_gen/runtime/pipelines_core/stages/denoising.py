@@ -289,6 +289,7 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                 import torch._inductor.config as _inductor_cfg
 
                 _inductor_cfg.reorder_for_compute_comm_overlap = True
+                _inductor_cfg.max_autotune_prune_choices_based_on_shared_mem = True
             except ImportError:
                 pass
             mode = os.environ.get(
