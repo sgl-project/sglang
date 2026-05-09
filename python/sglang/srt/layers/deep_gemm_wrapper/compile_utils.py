@@ -1,6 +1,6 @@
 import logging
 import os
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from enum import IntEnum, auto
 from typing import Dict, List, Tuple
 
@@ -14,9 +14,11 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 from sglang.srt.environ import envs
 from sglang.srt.layers.deep_gemm_wrapper.configurer import ENABLE_JIT_DEEPGEMM
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import ceil_div, get_available_gpu_memory
+from sglang.srt.utils import ceil_div, get_available_gpu_memory, is_musa
 
 logger = logging.getLogger(__name__)
+
+_is_musa = is_musa()
 
 if ENABLE_JIT_DEEPGEMM:
     import deep_gemm
@@ -194,12 +196,18 @@ def _compile_deep_gemm_one_type_all(
             kernel_type, max_m=max_m, n=n, k=k, num_groups=num_groups
         )
 
-        old_compile_mode = deep_gemm.get_compile_mode()
-        deep_gemm.set_compile_mode(1)
+        has_compile_mode_api = hasattr(deep_gemm, "get_compile_mode") and hasattr(
+            deep_gemm, "set_compile_mode"
+        )
+        if has_compile_mode_api:
+            old_compile_mode = deep_gemm.get_compile_mode()
+            deep_gemm.set_compile_mode(1)
+
         # TODO can use multi thread
         for m in tqdm(m_list, desc=f"DeepGEMM warmup"):
             executor.execute(m=m)
-        deep_gemm.set_compile_mode(old_compile_mode)
+        if has_compile_mode_api:
+            deep_gemm.set_compile_mode(old_compile_mode)
 
         # clean up input buffers
         torch.cuda.current_stream().synchronize()
@@ -298,7 +306,7 @@ class _GroupedContWarmupExecutor(_BaseWarmupExecutor):
             (self.lhs_q[:m], self.lhs_s[:m]),
             (self.rhs_q, self.rhs_s),
             self.out[:m],
-            m_indices=self.m_indices[:m],
+            self.m_indices[:m],
         )
 
 
@@ -332,8 +340,17 @@ class _BF16F32WarmupExecutor(_BaseWarmupExecutor):
         deep_gemm.bf16_gemm_nt(self.lhs[:m], self.rhs, self.out[:m])
 
 
-@contextmanager
 def deep_gemm_execution_hook(
+    m: int, n: int, k: int, num_groups: int, kernel_type: DeepGemmKernelType
+):
+    if _is_musa:
+        return nullcontext()
+
+    return _deep_gemm_execution_hook(m, n, k, num_groups, kernel_type)
+
+
+@contextmanager
+def _deep_gemm_execution_hook(
     m: int, n: int, k: int, num_groups: int, kernel_type: DeepGemmKernelType
 ):
     if m > 0:

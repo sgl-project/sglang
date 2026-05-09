@@ -10,7 +10,7 @@ from typing import Any, Dict, Iterator, List, Optional, Tuple, Union
 import numpy as np
 import torch
 from PIL import Image
-from transformers import BaseImageProcessorFast
+from transformers import BaseImageProcessor
 
 from sglang.srt.managers.schedule_batch import (
     Modality,
@@ -254,8 +254,23 @@ class BaseMultimodalProcessor(ABC):
         skip_mm_pool = kwargs.get("skip_mm_pool", False)
 
         if SGL_USE_CUDA_IPC and not skip_mm_pool:
+            # SGLANG_MM_FEATURE_CACHE_MB is the total pool budget across all
+            # tokenizer workers. Each worker gets an equal share so that adding
+            # workers doesn't multiply the GPU-side footprint.
+            worker_num = self.server_args.tokenizer_worker_num
+            per_worker_pool_size = max(
+                MM_FEATURE_CACHE_SIZE // worker_num,
+                128 * 1024 * 1024,
+            )
+            logger.info(
+                "MmItemMemoryPool size per tokenizer worker: %.0f MiB "
+                "(budget %.0f MiB / %d worker(s))",
+                per_worker_pool_size / (1024 * 1024),
+                MM_FEATURE_CACHE_SIZE / (1024 * 1024),
+                worker_num,
+            )
             self.cudaipc_mmfeature_pool = MmItemMemoryPool(
-                MM_FEATURE_CACHE_SIZE,
+                per_worker_pool_size,
                 MM_ITEM_MEMORY_POOL_RECYCLE_INTERVAL,
             )
 
@@ -413,7 +428,7 @@ class BaseMultimodalProcessor(ABC):
         processor = self._processor
         if (
             hasattr(processor, "image_processor")
-            and isinstance(processor.image_processor, BaseImageProcessorFast)
+            and isinstance(processor.image_processor, BaseImageProcessor)
             and not self.server_args.disable_fast_image_processor
         ):
             if _is_cpu or get_global_server_args().rl_on_policy_target is not None:

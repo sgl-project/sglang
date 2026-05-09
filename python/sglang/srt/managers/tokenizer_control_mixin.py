@@ -39,8 +39,6 @@ from sglang.srt.managers.io_struct import (
     FlushCacheReqOutput,
     GetInternalStateReq,
     GetInternalStateReqOutput,
-    GetLoadReqInput,
-    GetLoadReqOutput,
     GetLoadsReqInput,
     GetLoadsReqOutput,
     GetWeightsByNameReqInput,
@@ -121,7 +119,6 @@ _COMMUNICATOR_SPECS = [
     ("set_internal_state", SetInternalStateReqOutput),
     ("expert_distribution", ExpertDistributionReqOutput),
     ("update_lora_adapter", LoRAUpdateOutput),
-    ("get_load", GetLoadReqOutput, "watching"),
     ("get_loads", GetLoadsReqOutput, "watching"),
     ("dumper_control", DumperControlReqOutput),
 ]
@@ -767,10 +764,14 @@ class TokenizerControlMixin:
         self: TokenizerManager,
         obj: CheckWeightsReqInput,
         request: Optional[fastapi.Request] = None,
-    ) -> CheckWeightsReqOutput:
+    ) -> Tuple[bool, str, Optional[List[Dict]]]:
         self.auto_create_handle_loop()
         results = await self.check_weights_communicator(obj)
-        return FanOutCommunicator.merge_results(results)
+        success, message = FanOutCommunicator.merge_results(results)
+        ranks: Optional[List[Dict]] = None
+        if any(r.payload is not None for r in results):
+            ranks = [r.payload for r in results]
+        return success, message, ranks
 
     async def slow_down(
         self: TokenizerManager,
@@ -803,11 +804,6 @@ class TokenizerControlMixin:
     ) -> List[DumperControlReqOutput]:
         self.auto_create_handle_loop()
         return await self.dumper_control_communicator(obj)
-
-    async def get_load(self: TokenizerManager) -> List[GetLoadReqOutput]:
-        self.auto_create_handle_loop()
-        req = GetLoadReqInput()
-        return await self.get_load_communicator(req)
 
     async def get_loads(
         self: TokenizerManager,

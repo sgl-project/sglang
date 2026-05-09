@@ -30,6 +30,7 @@ guide.
 
 ```bash
 ENV_PY=python/sglang/multimodal_gen/.claude/skills/sglang-diffusion-benchmark-profile/scripts/diffusion_skill_env.py
+BENCH_PY=python/sglang/multimodal_gen/.claude/skills/sglang-diffusion-benchmark-profile/scripts/bench_diffusion_denoise.py
 ROOT=$(python3 "$ENV_PY" print-root)
 cd "$ROOT"
 python3 "$ENV_PY" check-write-access >/dev/null
@@ -54,6 +55,26 @@ check "torch+CUDA" python3 -c "import torch; assert torch.cuda.is_available()"
 check "torch.profiler" python3 -c "import torch.profiler"
 ```
 
+## Native Backend Gate
+
+Every benchmark and profile result in this guide must come from the native SGLang diffusion backend.
+
+If the command log contains any of:
+- `Falling back to diffusers backend`
+- `Using diffusers backend`
+- `Loaded diffusers pipeline`
+
+then stop immediately:
+- do not record the perf dump or trace as valid benchmark evidence
+- do not compare it against other runs
+- do not continue to hotspot ranking or kernel optimization
+- first fix backend selection so the model stays on the native SGLang diffusion path
+
+The checked-in benchmark helper pins `--backend=sglang` so native presets fail
+fast instead of silently falling back through `--backend=auto`. Do the same for
+manual native profiling commands unless you are intentionally collecting a
+diffusers baseline.
+
 Environment notes:
 - all commands below assume you are inside the configured diffusion container shell
 - export `HF_TOKEN` before any gated Hugging Face model run
@@ -72,40 +93,55 @@ wget -O "${ASSET_DIR}/mova_single_person.jpg" \
 
 ## Benchmark Presets
 
-Treat
-`python/sglang/multimodal_gen/.claude/skills/sglang-diffusion-benchmark-profile/scripts/bench_diffusion_denoise.py`
-as the source of truth for preset order.
+Treat `"$BENCH_PY"` as the source of truth for preset order.
 
 Nightly diffusion comparison is server/API based (`sglang serve` plus requests).
 This skill stays on `sglang generate` for local benchmarking and profiling, but
-the first 9 presets in `bench_diffusion_denoise.py` are aligned to nightly on
-model, prompt, negative prompt, reference image, size, frames, fps, seed, GPU
-count, and any explicitly overridden sampling or parallelism flags.
+the nightly-aligned presets in `bench_diffusion_denoise.py` mirror
+`scripts/ci/utils/diffusion/comparison_configs.json` on model, task, prompt,
+reference image, size, frames, seed, GPU count, serve args, and the request
+defaults used by `run_comparison.py` when a case omits steps or guidance.
+When in doubt, re-check that JSON before trusting this reference.
 
 List the current preset order:
 
 ```bash
-PYTHONPATH=python python3 \
-  python/sglang/multimodal_gen/.claude/skills/sglang-diffusion-benchmark-profile/scripts/bench_diffusion_denoise.py \
-  --list-models
+PYTHONPATH=python python3 "$BENCH_PY" --list-models
 ```
 
 Run one preset and save a perf dump:
 
 ```bash
-PYTHONPATH=python python3 \
-  python/sglang/multimodal_gen/.claude/skills/sglang-diffusion-benchmark-profile/scripts/bench_diffusion_denoise.py \
+PYTHONPATH=python python3 "$BENCH_PY" \
   --model ltx2 \
   --label baseline \
   --output-dir "${BENCH_DIR}"
 ```
 
+Keep `torch.compile` off when the task requires it:
+
+```bash
+PYTHONPATH=python python3 "$BENCH_PY" \
+  --model flux \
+  --label baseline \
+  --output-dir "${BENCH_DIR}" \
+  --no-torch-compile
+```
+
 Run the `LTX-2.3` one-stage skill preset:
 
 ```bash
-PYTHONPATH=python python3 \
-  python/sglang/multimodal_gen/.claude/skills/sglang-diffusion-benchmark-profile/scripts/bench_diffusion_denoise.py \
+PYTHONPATH=python python3 "$BENCH_PY" \
   --model ltx23-one-stage \
+  --label baseline \
+  --output-dir "${BENCH_DIR}"
+```
+
+Run the nightly-aligned `LTX-2.3` TI2V two-stage preset:
+
+```bash
+PYTHONPATH=python python3 "$BENCH_PY" \
+  --model ltx23-ti2v-two-stage \
   --label baseline \
   --output-dir "${BENCH_DIR}"
 ```
@@ -113,8 +149,7 @@ PYTHONPATH=python python3 \
 Run the `LTX-2.3` two-stage skill preset:
 
 ```bash
-PYTHONPATH=python python3 \
-  python/sglang/multimodal_gen/.claude/skills/sglang-diffusion-benchmark-profile/scripts/bench_diffusion_denoise.py \
+PYTHONPATH=python python3 "$BENCH_PY" \
   --model ltx23-two-stage \
   --label baseline \
   --output-dir "${BENCH_DIR}"
@@ -123,8 +158,7 @@ PYTHONPATH=python python3 \
 Run the full preset sweep:
 
 ```bash
-PYTHONPATH=python python3 \
-  python/sglang/multimodal_gen/.claude/skills/sglang-diffusion-benchmark-profile/scripts/bench_diffusion_denoise.py \
+PYTHONPATH=python python3 "$BENCH_PY" \
   --all \
   --label prXXXX \
   --output-dir "${BENCH_DIR}"
@@ -141,13 +175,18 @@ Nightly-aligned presets come first; skill-only presets stay available after them
 | `zimage` | `Tongyi-MAI/Z-Image-Turbo` | Yes: `zimage_turbo_t2i_1024` | Aligned to nightly prompt and guidance 4.0 |
 | `wan-t2v` | `Wan-AI/Wan2.2-T2V-A14B-Diffusers` | Yes: `wan22_t2v_a14b_720p` | Aligned to nightly CFG-parallel 4-GPU launch |
 | `wan-ti2v` | `Wan-AI/Wan2.2-TI2V-5B-Diffusers` | Yes: `wan22_ti2v_5b_720p` | Uses the nightly cat image and motion prompt |
-| `ltx2` | `Lightricks/LTX-2` | Yes: `ltx2_twostage_t2v` | Uses `LTX2TwoStagePipeline`; nightly-aligned prompt, negative prompt, 1536x1024, 121 frames, fps 24, seed 1234 |
+| `ltx2` | `Lightricks/LTX-2` | Yes: `ltx2_twostage_t2v` | Uses `LTX2TwoStagePipeline`; 2 GPUs, CFG parallel, 768x512, 121 frames, seed 42 |
+| `ltx23-ti2v-two-stage` | `Lightricks/LTX-2.3` | Yes: `ltx2.3_twostage_ti2v_2gpus` | Uses the nightly cat image, motion prompt, `LTX2TwoStagePipeline`, 2 GPUs, 768x512, 121 frames, seed 42 |
 | `wan-i2v` | `Wan-AI/Wan2.2-I2V-A14B-Diffusers` | Yes: `wan22_i2v_a14b_720p` | Aligned to nightly CFG-parallel 4-GPU launch |
 | `ltx23-one-stage` | `Lightricks/LTX-2.3` | No | Skill-only extra preset for the native `LTX-2.3` one-stage baseline; 2 GPUs, 768x512, 121 frames, fps 24, 30 steps, guidance 3.0, seed 1234 |
-| `ltx23-two-stage` | `Lightricks/LTX-2.3` | No | Skill-only extra preset for the native `LTX-2.3` two-stage path; uses `LTX2TwoStagePipeline`, 2 GPUs, 1536x1024, 121 frames, fps 24, 30 steps, guidance 3.0, seed 1234 |
+| `ltx23-two-stage` | `Lightricks/LTX-2.3` | No | Skill-only high-resolution stress preset for the native `LTX-2.3` two-stage path; uses `LTX2TwoStagePipeline`, 2 GPUs, 1536x1024, 121 frames, fps 24, 30 steps, guidance 3.0, seed 1234 |
 | `hunyuanvideo` | `hunyuanvideo-community/HunyuanVideo` | No | Skill-only extra preset |
 | `mova-720p` | `OpenMOSS-Team/MOVA-720p` | No | Skill-only extra preset |
 | `helios` | `BestWishYsh/Helios-Base` | No | Skill-only extra preset |
+| `joyai-edit` | `jdopensource/JoyAI-Image-Edit-Diffusers` | No | Skill-only JoyAI image-edit preset; uses the cat image, 1024x1024, 40 steps, guidance 4.0, 2-GPU CFG parallel |
+| `firered-edit-1.0` | `FireRedTeam/FireRed-Image-Edit-1.0` | No | Skill-only FireRed 1.0 image-edit preset; QwenImageEditPlus native path; uses 2-GPU CFG parallel |
+| `firered-edit-1.1` | `FireRedTeam/FireRed-Image-Edit-1.1` | No | Skill-only FireRed 1.1 image-edit preset; QwenImageEditPlus native path; uses 2-GPU CFG parallel |
+| `hunyuan3d-shape` | `tencent/Hunyuan3D-2` | No | Skill-only Hunyuan3D shape-generation preset; primary metric is `Hunyuan3DShapeDenoisingStage` |
 
 For Wan2.2 video models, remember the difference between **nightly alignment**
 and **best latency tuning**:
@@ -161,17 +200,33 @@ and **best latency tuning**:
 sglang generate \
   --model-path=Lightricks/LTX-2 \
   --pipeline-class-name=LTX2TwoStagePipeline \
-  --prompt="A beautiful sunset over the ocean" \
-  --negative-prompt="shaky, glitchy, low quality, worst quality, deformed, distorted, disfigured, motion smear, motion artifacts, fused fingers, bad anatomy, weird hand, ugly, transition, static." \
-  --width=1536 --height=1024 \
-  --num-frames=121 --fps=24 \
-  --seed=1234 --num-gpus=1 \
+  --prompt="A cat and a dog baking a cake together in a kitchen." \
+  --width=768 --height=512 \
+  --num-frames=121 \
+  --num-inference-steps=50 --guidance-scale=4.0 \
+  --seed=42 --num-gpus=2 --enable-cfg-parallel \
   --save-output --enable-torch-compile --warmup
 ```
 
-After [PR #20707](https://github.com/sgl-project/sglang/pull/20707),
 `LTX2TwoStagePipeline` is a native path. The spatial upsampler and distilled
 LoRA are auto-resolved from the same model snapshot unless you override them.
+
+### Manual command example: LTX-2.3 TI2V Two-Stage
+
+```bash
+sglang generate \
+  --model-path=Lightricks/LTX-2.3 \
+  --pipeline-class-name=LTX2TwoStagePipeline \
+  --prompt="The cat starts walking slowly towards the camera." \
+  --image-path="${ASSET_DIR}/cat.png" \
+  --width=768 --height=512 \
+  --num-frames=121 \
+  --num-inference-steps=50 --guidance-scale=4.0 \
+  --seed=42 --num-gpus=2 \
+  --save-output --enable-torch-compile --warmup
+```
+
+This matches the nightly comparison case `ltx2.3_twostage_ti2v_2gpus`.
 
 ### Manual command example: LTX-2.3 One-Stage
 
@@ -190,7 +245,7 @@ sglang generate \
 Use this when you want the native `LTX2Pipeline` baseline for `LTX-2.3` at the
 validated one-stage resolution.
 
-### Manual command example: LTX-2.3 Two-Stage
+### Manual command example: LTX-2.3 Two-Stage High-Resolution Stress
 
 ```bash
 sglang generate \
@@ -205,8 +260,67 @@ sglang generate \
   --save-output --enable-torch-compile --warmup
 ```
 
-This matches the new `ltx23-two-stage` skill preset and is a good benchmark target for
-the recently merged `LTX-2.3` two-stage path.
+This matches the skill-only `ltx23-two-stage` preset. Use it as a
+high-resolution stress target, not as a nightly comparison case.
+
+### Manual command example: JoyAI Image Edit
+
+```bash
+sglang generate \
+  --backend=sglang \
+  --model-path=jdopensource/JoyAI-Image-Edit-Diffusers \
+  --prompt="Make the cat wear a red hat" \
+  --image-path="${ASSET_DIR}/cat.png" \
+  --width=1024 --height=1024 \
+  --num-inference-steps=40 --guidance-scale=4.0 \
+  --num-gpus=2 --enable-cfg-parallel --ulysses-degree=1 \
+  --dit-layerwise-offload false --dit-cpu-offload false \
+  --save-output --enable-torch-compile --warmup
+```
+
+### Manual command example: FireRed Image Edit
+
+```bash
+sglang generate \
+  --backend=sglang \
+  --model-path=FireRedTeam/FireRed-Image-Edit-1.1 \
+  --prompt="Make the cat wear a red hat" \
+  --image-path="${ASSET_DIR}/cat.png" \
+  --width=1024 --height=1024 \
+  --num-inference-steps=40 --guidance-scale=4.0 \
+  --num-gpus=2 --enable-cfg-parallel --ulysses-degree=1 \
+  --dit-layerwise-offload false --dit-cpu-offload false \
+  --save-output --enable-torch-compile --warmup
+```
+
+Use `FireRedTeam/FireRed-Image-Edit-1.0` in the same command when comparing the
+1.0 checkpoint. Both FireRed presets use the native `QwenImageEditPlusPipeline`
+path. On H100, 2-GPU CFG parallel reduced 40-step denoise latency versus the
+otherwise matching 2-GPU Ulysses command: FireRed 1.0 from 13419.15 ms to
+10955.90 ms, and FireRed 1.1 from 13414.72 ms to 10934.21 ms.
+
+### Manual command example: Hunyuan3D Shape
+
+```bash
+OUTPUT_DIR=$(python3 "$ENV_PY" print-output-dir --kind benchmarks --mkdir)
+CONFIG_DIR="${OUTPUT_DIR}/generated_configs"
+mkdir -p "${CONFIG_DIR}"
+printf '{"paint_enable": false}\n' > "${CONFIG_DIR}/hunyuan3d-shape.json"
+
+sglang generate \
+  --backend=sglang \
+  --model-path=tencent/Hunyuan3D-2 \
+  --prompt="generate 3d mesh" \
+  --image-path="${ASSET_DIR}/cat.png" \
+  --config="${CONFIG_DIR}/hunyuan3d-shape.json" \
+  --num-inference-steps=50 --guidance-scale=5.0 \
+  --dit-layerwise-offload false --dit-cpu-offload false \
+  --save-output --enable-torch-compile --warmup
+```
+
+For Hunyuan3D, compare the denoise stage separately from mesh export and paint
+stages. The benchmark helper reports `Hunyuan3DShapeDenoisingStage` as the
+primary denoise metric.
 
 ### Manual command example: Wan2.2-I2V-A14B 720P
 
@@ -224,7 +338,6 @@ sglang generate \
   --warmup --enable-torch-compile
 ```
 
-After [PR #21390](https://github.com/sgl-project/sglang/pull/21390),
 `Wan2.2-I2V-A14B` uses the 720p max-area config by default, and explicit
 `--width/--height` overrides control the target area while preserving the
 reference-image aspect ratio.
@@ -251,20 +364,22 @@ Always keep:
 - peak GPU memory
 - exact command line, model shape, dtype, and GPU topology
 
+Never keep a perf dump produced after a diffusers-backend fallback.
+
 ## `torch.profiler` Workflow
 
 ### 1. Establish the baseline
 
 ```bash
-PYTHONPATH=python python3 \
-  python/sglang/multimodal_gen/.claude/skills/sglang-diffusion-benchmark-profile/scripts/bench_diffusion_denoise.py \
+PYTHONPATH=python python3 "$BENCH_PY" \
   --model flux \
   --label baseline \
   --output-dir "${BENCH_DIR}"
 ```
 
 Keep model shape, seed, and GPU topology fixed for every comparison. Save one
-reference image or video before changing code.
+reference image or video before changing code. If the active task requires
+`torch.compile` off, add `--no-torch-compile` here too.
 
 ### 2. Capture a representative trace
 
@@ -272,7 +387,7 @@ By default SGLang profiles the denoising stage. The default sampling window is
 5 profiled timesteps after warmup.
 
 ```bash
-SGLANG_TORCH_PROFILER_DIR="${PROFILE_DIR}/torch" \
+SGLANG_DIFFUSION_TORCH_PROFILER_DIR="${PROFILE_DIR}/torch" \
 sglang generate \
   --model-path=black-forest-labs/FLUX.1-dev \
   --prompt="A futuristic cyberpunk city at night" \
@@ -285,8 +400,9 @@ Use `--profile-all-stages` only when you really need text encoder, VAE, or
 other non-denoise stages too.
 
 The generated trace path is printed in the console and also lands under
-`./logs/` or `SGLANG_TORCH_PROFILER_DIR`. Open it in Perfetto if you want a
-timeline view:
+`SGLANG_DIFFUSION_TORCH_PROFILER_DIR`. The diffusion profiler falls back to
+`SGLANG_TORCH_PROFILER_DIR` and then `./logs` when the diffusion-specific env
+var is unset. Open the trace in Perfetto if you want a timeline view:
 - https://ui.perfetto.dev/
 
 ### 3. Rank the hot CUDA kernels
@@ -300,7 +416,11 @@ import gzip
 import json
 import os
 
-log_dir = os.environ.get("SGLANG_TORCH_PROFILER_DIR", "./logs")
+log_dir = (
+    os.environ.get("SGLANG_DIFFUSION_TORCH_PROFILER_DIR")
+    or os.environ.get("SGLANG_TORCH_PROFILER_DIR")
+    or "./logs"
+)
 trace_path = sorted(
     glob.glob(f"{log_dir}/*.trace.json.gz"),
     key=os.path.getmtime,
@@ -327,18 +447,18 @@ attention, norm, modulation, MLP, or communication boundaries and re-run.
 ### 4. Classify the hotspot with `existing-fast-paths.md`
 
 Do not jump from a hot kernel straight into new code. First classify it against
-the known merged families.
+the known mainline families.
 
 | What the trace shows | First interpretation |
 | --- | --- |
 | `fused_inplace_qknorm_rope` missing, but separate qk norm plus rope show up | Check whether the fused diffusion `QK norm + RoPE` path should have engaged |
 | `to_q -> to_k -> to_v` on NVFP4 or Nunchaku FLUX-family checkpoints | Treat as a packed-QKV fast-path miss or checkpoint-format mismatch |
-| `fused_norm_tanh_mul_add*` missing on Z-Image | Treat as a missing merged modulation path, not a new fusion request |
+| `fused_norm_tanh_mul_add*` missing on Z-Image | Treat as a missing mainline modulation path, not a new fusion request |
 | `all_to_all`, ring attention, or async A2A dominate | Classify against Ulysses, USP, or turbo-layer overlap first |
 | split `fc1 -> gelu -> quant -> fc2.lora_down` on Nunchaku FLUX | Treat as a missing fused GELU MLP path |
 | attention kernels dominate | Confirm backend, topology, and shape guards before proposing a new kernel |
 
-If the hot path is already covered by a merged optimization family, fix the
+If the hot path is already covered by a mainline optimization family, fix the
 enablement, shape guard, backend choice, or checkpoint mapping first.
 
 ### 5. Hand off only real kernel work
