@@ -20,6 +20,7 @@ from sglang.srt.entrypoints.openai.protocol import (
 from sglang.srt.entrypoints.openai.serving_base import OpenAIServingBase
 from sglang.srt.entrypoints.openai.usage_processor import UsageProcessor
 from sglang.srt.entrypoints.openai.utils import (
+    cached_tokens_details_from_dict,
     process_cached_tokens_details_from_ret,
     process_hidden_states_from_ret,
     process_routed_experts_from_ret,
@@ -224,6 +225,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
         cached_tokens = {}
         hidden_states = {}
         routed_experts = {}
+        cached_tokens_details = {}
 
         stream_started = False
         try:
@@ -248,6 +250,9 @@ class OpenAIServingCompletion(OpenAIServingBase):
                 cached_tokens[index] = content["meta_info"].get("cached_tokens", 0)
                 hidden_states[index] = content["meta_info"].get("hidden_states", None)
                 routed_experts[index] = content["meta_info"].get("routed_experts", None)
+                cached_tokens_details[index] = content["meta_info"].get(
+                    "cached_tokens_details", None
+                )
 
                 is_first_chunk = index not in stream_offsets
                 offset = stream_offsets.get(index, 0)
@@ -307,11 +312,16 @@ class OpenAIServingCompletion(OpenAIServingBase):
                 finish_reason = content["meta_info"].get("finish_reason", None)
                 finish_reason_type = finish_reason["type"] if finish_reason else None
 
-                # If the abort is from scheduler.
-                if finish_reason_type == "abort":
-                    code = finish_reason.get(
-                        "status_code", HTTPStatus.INTERNAL_SERVER_ERROR
-                    )
+                # Abort with an explicit error status_code is a system error
+                # (timeout, OOM, validation): emit a streaming error chunk.
+                # A graceful abort (no status_code, e.g. user-initiated via
+                # /abort_request or session lifecycle cleanup) falls through
+                # to the normal chunk path, matching the non-stream behavior
+                # in tokenizer_manager._handle_abort_finish_reason.
+                if finish_reason_type == "abort" and isinstance(
+                    finish_reason.get("status_code"), HTTPStatus
+                ):
+                    code = finish_reason["status_code"]
                     error = self.create_streaming_error_response(
                         finish_reason.get("message", "Generation aborted."),
                         code.name,
@@ -374,21 +384,33 @@ class OpenAIServingCompletion(OpenAIServingBase):
                         )
                         yield f"data: {hidden_states_chunk.model_dump_json()}\n\n"
 
+            sglext_routed = None
             if request.return_routed_experts and routed_experts:
-                # Get first non-None routed_experts value
-                first_routed_experts = next(
+                sglext_routed = next(
                     (v for v in routed_experts.values() if v is not None), None
                 )
-                if first_routed_experts is not None:
-                    routed_experts_chunk = CompletionStreamResponse(
-                        id=content["meta_info"]["id"],
-                        created=created,
-                        object="text_completion",
-                        choices=[],  # sglext is at response level
-                        model=request.model,
-                        sglext=SglExt(routed_experts=first_routed_experts),
-                    )
-                    yield f"data: {routed_experts_chunk.model_dump_json()}\n\n"
+
+            sglext_details = None
+            if request.return_cached_tokens_details and cached_tokens_details:
+                first_details = next(
+                    (v for v in cached_tokens_details.values() if v is not None), None
+                )
+                if first_details is not None:
+                    sglext_details = cached_tokens_details_from_dict(first_details)
+
+            if sglext_routed is not None or sglext_details is not None:
+                sglext_chunk = CompletionStreamResponse(
+                    id=content["meta_info"]["id"],
+                    created=created,
+                    object="text_completion",
+                    choices=[],  # sglext is at response level
+                    model=request.model,
+                    sglext=SglExt(
+                        routed_experts=sglext_routed,
+                        cached_tokens_details=sglext_details,
+                    ),
+                )
+                yield f"data: {sglext_chunk.model_dump_json()}\n\n"
 
             # Handle final usage chunk
             if include_usage:
