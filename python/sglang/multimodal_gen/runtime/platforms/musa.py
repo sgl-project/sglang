@@ -174,7 +174,7 @@ class MusaPlatformBase(Platform):
             except ImportError as e:
                 logger.info(e)
                 logger.info(
-                    "Sage Attention backend is not installed (To install it, run `pip install sageattention==2.2.0 --no-build-isolation`). Falling back to Flash Attention."
+                    "Sage Attention backend is not installed (To install it, run `pip install sageattention>=0.1.0`). Falling back to Flash Attention."
                 )
                 target_backend = AttentionBackendEnum.FA
         elif selected_backend in [
