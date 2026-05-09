@@ -14,7 +14,7 @@ from tqdm import tqdm
 
 from sglang.srt.disaggregation.base.conn import KVPoll
 from sglang.srt.disaggregation.utils import poll_and_all_reduce_attn_cp_tp_group
-from sglang.srt.distributed.parallel_state import GroupCoordinator, P2PWork
+from sglang.srt.distributed.parallel_state import P2PWork
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import (
     get_attention_dp_rank,
@@ -948,7 +948,7 @@ class SchedulerPPMixin:
 
     def _pp_get_all_gather_group(
         self: Scheduler, msg_type: str
-    ) -> Optional[GroupCoordinator]:
+    ) -> Optional[torch.distributed.ProcessGroup]:
         if not self.require_attn_tp_allgather:
             return None
         if msg_type == "proxy" and self.proxy_disable_tp_all_gather:
