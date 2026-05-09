@@ -72,6 +72,10 @@ class DeepSeekV4SingleKVPool(KVCache):
         self.quantize_block_size = 64
         self.rope_storage_dtype = torch.bfloat16
         self.k_with_scale_buffer_dtype = torch.int8
+        # Packed layout stores raw bytes per page. KVCache may set store_dtype from the
+        # logical KV dtype (e.g. fp8); buffer allocation must use uint8.
+        self.store_dtype = torch.uint8
+
         self._create_buffers()
 
     def _create_buffers(self):
