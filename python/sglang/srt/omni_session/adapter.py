@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+"""Adapter layer between model-specific U/G code and UG session runtime."""
 
 from copy import deepcopy
 from dataclasses import dataclass, field

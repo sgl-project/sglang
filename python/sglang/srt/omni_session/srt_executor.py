@@ -1,4 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
+"""Synchronous adapter from UG session requests into an SRT scheduler.
+
+This module is the execution boundary where omni_session borrows SRT internals:
+it can enqueue small session requests and build temporary query batches that
+read committed SRT KV cache without permanently appending G query tokens.
+"""
 
 from dataclasses import dataclass
 from types import SimpleNamespace

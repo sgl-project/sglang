@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+"""Omni HTTP entrypoint exports."""
 
 from sglang.omni.entrypoints.http_server import create_app, create_sensenova_u1_app
 

@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+"""SenseNova U1 G-segment stage and executor for pixel-flow generation."""
 
 from dataclasses import dataclass
 from typing import Any

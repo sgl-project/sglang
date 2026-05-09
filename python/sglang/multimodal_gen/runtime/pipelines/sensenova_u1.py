@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+"""SenseNova U1 pixel-flow pipeline used as an omni generation backend."""
 
 from typing import Any
 

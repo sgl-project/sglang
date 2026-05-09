@@ -1,4 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
+"""SenseNova U1 bridge from omni orchestration to SRT-owned sessions.
+
+U1 keeps AR text, VLM context, and pixel-flow G inside the same SRT ModelRunner
+process for this version. The bridge is model-specific glue; generic request
+orchestration lives in `sglang.omni`.
+"""
 
 from contextlib import contextmanager
 from types import SimpleNamespace

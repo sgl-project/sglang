@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+"""SenseNova U1 wiring for the generic omni orchestrator."""
 
 from __future__ import annotations
 
@@ -33,6 +34,8 @@ _REQUEST_METADATA_FIELDS = {
 
 
 class SenseNovaU1OmniPlugin:
+    """Normalize SenseNova U1 request aliases into native sampling params."""
+
     model_name = "sensenova-u1"
 
     def normalize_request(self, request: OmniRequest) -> OmniRequest:

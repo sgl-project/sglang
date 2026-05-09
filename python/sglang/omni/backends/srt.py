@@ -1,4 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
+"""SRT-backed AR backend for omni orchestration.
+
+The backend translates generic omni requests into the lower-level
+`srt.omni_session` bridge. SRT remains the owner of sessions, tokenizer state,
+and KV cache; omni only receives context references and a narrow ContextOps
+view for G-side execution.
+"""
 
 from __future__ import annotations
 
@@ -20,6 +27,8 @@ from sglang.omni.protocol import (
 
 @dataclass(slots=True)
 class SRTBackedContextOps:
+    """Expose live SRT context operations to a colocated generation backend."""
+
     bridge: Any
     context: OmniContextBundle
 
@@ -80,6 +89,8 @@ class SRTBackedContextOps:
 
 
 class SRTARBackend:
+    """AR backend that delegates U-side work to an SRT-owned middle bridge."""
+
     def __init__(self, bridge: Any):
         self.bridge = bridge
 

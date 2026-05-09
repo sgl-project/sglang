@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+"""Prepare SenseNova U1 pixel-flow tensors from live SRT context state."""
 
 import math
 from dataclasses import dataclass
@@ -41,6 +42,8 @@ class SenseNovaU1PixelFlowPrepared:
 
 
 class SenseNovaU1PixelFlowPreparer:
+    """Build the initial noise, timesteps, and SRT query contexts for U1 G."""
+
     def __init__(self, model: Any) -> None:
         self.model = model
 
@@ -94,7 +97,7 @@ class SenseNovaU1PixelFlowPreparer:
 
         device = _model_device(self.model)
         dtype = _model_dtype(self.model)
-        seed = int(getattr(batch, "seed", None) or 0)
+        seed = _batch_seed(batch)
         generator = _session_torch_generator(
             context_metadata,
             seed=seed,
@@ -318,6 +321,20 @@ def _session_torch_generator(
         "generator": generator,
     }
     return generator
+
+
+def _batch_seed(batch: Any) -> int:
+    seeds = getattr(batch, "seeds", None)
+    if seeds:
+        return int(seeds[0])
+    seed = getattr(batch, "seed", None)
+    if isinstance(seed, list):
+        if not seed:
+            raise ValueError("SenseNova U1 seed list must not be empty")
+        return int(seed[0])
+    if seed is not None:
+        return int(seed)
+    return 0
 
 
 def _first_int(*values: Any, default: int) -> int:

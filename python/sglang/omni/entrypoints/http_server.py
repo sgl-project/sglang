@@ -1,4 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
+"""Standalone experimental omni FastAPI app.
+
+The production U1 path mounts `http_api` into SRT. This app is kept as a small
+shell for tests and future backends that do not need SRT-owned sessions.
+"""
 
 from __future__ import annotations
 

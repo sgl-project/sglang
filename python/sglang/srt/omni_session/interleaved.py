@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+"""Legacy UG request/response shapes used below the omni protocol layer."""
 
 from dataclasses import dataclass, field
 from typing import Any, Literal, cast
@@ -39,6 +40,8 @@ def normalize_ug_generation_mode(
 
 @dataclass(frozen=True, slots=True)
 class UGInputSegment:
+    """Legacy text/image input segment for SRT omni_session adapters."""
+
     type: Literal["text", "image"]
     text: str | None = None
     image: Any | None = None

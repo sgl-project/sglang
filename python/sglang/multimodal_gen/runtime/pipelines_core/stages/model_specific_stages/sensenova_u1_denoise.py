@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+"""SenseNova U1 pixel-flow denoising over temporary SRT context queries."""
 
 from typing import Any
 
@@ -12,6 +13,8 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.s
 
 
 class SenseNovaU1PixelFlowDenoiser:
+    """Run U1's G denoising loop while reading SRT-owned U-side KV."""
+
     def __init__(
         self,
         model: Any,
@@ -197,9 +200,10 @@ class SenseNovaU1PixelFlowDenoiser:
 
 
 def _should_apply_cfg(cfg: SenseNovaU1PixelFlowCFG, timestep: Any) -> bool:
-    return (float(timestep) > cfg.start and float(timestep) < cfg.end) or (
-        cfg.start == 0.0
-    )
+    timestep_value = float(timestep)
+    if cfg.start == 0.0:
+        return 0.0 <= timestep_value < cfg.end
+    return cfg.start < timestep_value < cfg.end
 
 
 def _require_forward_context(

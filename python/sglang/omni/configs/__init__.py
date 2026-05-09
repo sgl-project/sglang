@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+"""Model-specific omni wiring helpers."""
 
 from sglang.omni.configs.sensenova_u1 import (
     SenseNovaU1OmniPlugin,

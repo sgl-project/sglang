@@ -1,4 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
+"""SRT tokenizer-manager transport for `/v1/omni/*` routes.
+
+Requests enter through the SRT HTTP server and are forwarded to the scheduler
+process. The scheduler lazily builds the omni orchestrator so the colocated U1
+generation backend can access the local ModelRunner/session/KV state.
+"""
 
 from __future__ import annotations
 

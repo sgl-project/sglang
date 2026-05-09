@@ -1,4 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
+"""Thin omni orchestration loop for interleaved text and media generation.
+
+The coordinator owns only control flow: decode AR text until a modality
+boundary, call the matching generation backend, then ask the AR backend to
+commit generated media when the model/session requires it.
+"""
 
 from __future__ import annotations
 
@@ -16,6 +22,8 @@ from sglang.omni.protocol import (
 
 @dataclass(slots=True)
 class OmniCoordinator:
+    """Coordinate AR and generation backends without owning model internals."""
+
     ar_backend: ARBackend
     generation_backend: GenerationBackend
     request_adapter: Callable[[OmniRequest], OmniRequest] | None = None

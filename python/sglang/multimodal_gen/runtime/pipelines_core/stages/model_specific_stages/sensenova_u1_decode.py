@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+"""Decode SenseNova U1 pixel-flow tensors into response and commit payloads."""
 
 from dataclasses import dataclass, field
 from typing import Any
@@ -17,6 +18,8 @@ class SenseNovaU1GeneratedSegment:
 
 
 class SenseNovaU1PixelFlowDecoder:
+    """Convert final U1 pixel-flow output to PNG-visible and SRT-commit forms."""
+
     def forward(
         self,
         prepared: SenseNovaU1PixelFlowPrepared,

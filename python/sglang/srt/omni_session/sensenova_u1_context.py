@@ -1,4 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
+"""SenseNova U1 prompt, image, and commit helpers for SRT sessions.
+
+These helpers encode U1's model-specific token grammar: image markers,
+`<IMG_CONTEXT>` spans, multimodal offsets, and generated-image commits. They
+remain in `srt.omni_session` because they construct SRT session inputs.
+"""
 
 import math
 from typing import Any

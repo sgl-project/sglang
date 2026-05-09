@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+"""Backend adapters for omni orchestration."""
 
 from sglang.omni.backends.base import (
     UnsupportedARBackend,

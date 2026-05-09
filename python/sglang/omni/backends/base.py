@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+"""Fallback backends used when an omni app is not fully wired."""
 
 from __future__ import annotations
 
@@ -11,6 +12,8 @@ from sglang.omni.protocol import (
 
 
 class UnsupportedARBackend:
+    """AR backend placeholder that fails at request time."""
+
     def prepare_context(self, request: OmniRequest) -> OmniContextBundle:
         raise RuntimeError("No omni AR backend is configured")
 
@@ -39,5 +42,7 @@ class UnsupportedARBackend:
 
 
 class UnsupportedGenerationBackend:
+    """Generation backend placeholder that fails at request time."""
+
     def generate_segment(self, request: OmniRequest, context_ops) -> GeneratedSegment:
         raise RuntimeError("No omni generation backend is configured")

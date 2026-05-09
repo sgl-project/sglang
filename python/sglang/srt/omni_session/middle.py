@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+"""Middle bridge between generic UG orchestration and SRT session execution."""
 
 from collections.abc import Callable
 from types import SimpleNamespace
@@ -154,7 +155,11 @@ class SRTBackedGContextOps:
 
 
 class SRTBackedUGMiddleBridge:
-    """UG middle bridge that keeps SRT as the session/KV owner."""
+    """UG middle bridge that keeps SRT as the session/KV owner.
+
+    It asks the runtime to prefill/decode/commit U-side chunks, while G-side
+    code receives only `SRTBackedGContextOps`.
+    """
 
     def __init__(
         self,

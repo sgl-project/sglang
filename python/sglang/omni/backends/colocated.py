@@ -1,4 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
+"""Generation backend for pipelines colocated with an AR runtime.
+
+This backend adapts the generic omni generation protocol to a multimodal_gen
+pipeline call. It passes live SRT context capabilities through `Req.extra`, so
+the pipeline can borrow SRT session/KV state without serializing it.
+"""
 
 from __future__ import annotations
 
@@ -14,6 +20,8 @@ from sglang.omni.protocol import ContextOps, GeneratedSegment, OmniRequest
 
 @dataclass(slots=True)
 class ColocatedPipelineBackend:
+    """Run a multimodal_gen pipeline in the same process as the AR backend."""
+
     pipeline: Any
     server_args: Any
     context_ops_extra_key: str

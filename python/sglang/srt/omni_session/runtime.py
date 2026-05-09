@@ -1,4 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
+"""SRT-owned session runtime for U/G interleaved models.
+
+The runtime is below the generic omni orchestrator. It materializes model-
+specific U-side chunks as ordinary SRT session requests, tracks committed SRT
+KV bindings, and leaves G-side execution to a bridge/executor pair.
+"""
 
 import uuid
 from dataclasses import dataclass, field
@@ -77,6 +83,8 @@ class UGVLMTextGenerationResult:
 
 @dataclass(slots=True)
 class UGSessionRecord:
+    """Mutable server-side record for one UG conversation session."""
+
     session_id: str
     state: UGSegmentState
     anchor_request_id: str

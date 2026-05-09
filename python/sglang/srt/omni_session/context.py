@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+"""Opaque handles exchanged across SRT-owned omni_session boundaries."""
 
 from dataclasses import dataclass, field
 from typing import Any
@@ -48,6 +49,8 @@ class UGSRTKVTokenBinding:
 
 @dataclass(slots=True)
 class UGContextHandle:
+    """Reference to one prepared U-side context stream."""
+
     request_id: str
     token_count: int
     session: UGSessionHandle | None = None
@@ -56,6 +59,8 @@ class UGContextHandle:
 
 @dataclass(slots=True)
 class UGContextBundle:
+    """Main and CFG sidecar contexts prepared from the same user turn."""
+
     full: UGContextHandle
     text_cfg: UGContextHandle
     image_cfg: UGContextHandle

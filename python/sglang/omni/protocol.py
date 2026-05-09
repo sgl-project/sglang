@@ -1,4 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
+"""Shared omni contracts between orchestration and execution backends.
+
+The protocol deliberately carries modality segments and context references,
+not model-specific session objects. AR backends own token/session state, while
+generation backends own media synthesis and may choose colocated or standalone
+serving runtimes.
+"""
 
 from __future__ import annotations
 
@@ -12,6 +19,8 @@ BoundaryType = Literal["text", "image", "audio", "video", "done"]
 
 @dataclass(frozen=True, slots=True)
 class OmniInputSegment:
+    """One user-provided segment in a multimodal request."""
+
     type: InputSegmentType
     text: str | None = None
     image: Any | None = None
@@ -47,6 +56,8 @@ class OmniInputSegment:
 
 @dataclass(frozen=True, slots=True)
 class OmniRequest:
+    """Normalized request consumed by the omni coordinator."""
+
     messages: tuple[OmniInputSegment, ...]
     model: str | None = None
     mode: str = "interleave"
@@ -93,6 +104,13 @@ class OmniContextRef:
 
 @dataclass(slots=True)
 class OmniContextBundle:
+    """Coordinator-visible context plus backend-private live state.
+
+    `backend_context` is intentionally opaque: colocated SRT backends keep live
+    session handles there, while future standalone generation backends can keep
+    only serializable references.
+    """
+
     full: OmniContextRef
     text_cfg: OmniContextRef | None = None
     image_cfg: OmniContextRef | None = None
@@ -103,6 +121,8 @@ class OmniContextBundle:
 
 @dataclass(frozen=True, slots=True)
 class OmniBoundary:
+    """AR-side handoff point that tells the coordinator what to do next."""
+
     type: BoundaryType
     text: str | None = None
     token_ids: tuple[int, ...] = ()
@@ -111,6 +131,12 @@ class OmniBoundary:
 
 @dataclass(frozen=True, slots=True)
 class GeneratedSegment:
+    """Media/text segment returned by a generation backend.
+
+    `commit_payload` may differ from the user-visible segment. U1 uses this to
+    commit native pixel tensors back into SRT without re-encoding the PNG output.
+    """
+
     type: OutputSegmentType
     text: str | None = None
     image: Any | None = None
@@ -185,6 +211,8 @@ class OmniResponse:
 
 
 class ContextOps(Protocol):
+    """Narrow live-context capability exposed to generation backends."""
+
     @property
     def metadata(self) -> dict[str, Any]: ...
 
@@ -214,6 +242,8 @@ class ContextOps(Protocol):
 
 
 class ARBackend(Protocol):
+    """Autoregressive text/session backend used by omni orchestration."""
+
     def prepare_context(self, request: OmniRequest) -> OmniContextBundle: ...
 
     def append_input_segments(
@@ -243,6 +273,8 @@ class ARBackend(Protocol):
 
 
 class GenerationBackend(Protocol):
+    """Media generation backend used by omni orchestration."""
+
     def generate_segment(
         self,
         request: OmniRequest,
