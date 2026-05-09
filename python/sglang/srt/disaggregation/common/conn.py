@@ -520,16 +520,18 @@ class CommonKVSender(BaseKVSender):
     def _record_transfer_indices(
         self,
         kv_indices: npt.NDArray[np.int32],
-        state_indices: Optional[List[int]],
+        state_indices: Optional[List],
     ):
         self._transfer_num_kv_indices += len(kv_indices)
-        if state_indices is not None:
-            self._transfer_num_state_indices += len(state_indices)
+        if state_indices:
+            for component_indices in state_indices:
+                if component_indices is not None:
+                    self._transfer_num_state_indices += len(component_indices)
 
     def send(
         self,
         kv_indices: npt.NDArray[np.int32],
-        state_indices: Optional[List[int]] = None,
+        state_indices: Optional[List] = None,
     ):
         pass
 

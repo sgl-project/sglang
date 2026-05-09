@@ -105,7 +105,7 @@ class TransferKVChunk:
     is_last: bool
     chunk_id: int
     prefill_aux_index: Optional[int]
-    state_indices: Optional[List[int]]
+    state_indices: Optional[List]
 
 
 @dataclasses.dataclass
@@ -446,11 +446,16 @@ class NixlKVManager(CommonKVManager):
                         handles.append(kv_xfer_handle)
 
                     if kv_chunk.is_last:
-                        if kv_chunk.state_indices is not None:
+                        primary_state_indices = (
+                            kv_chunk.state_indices[0]
+                            if kv_chunk.state_indices
+                            else None
+                        )
+                        if primary_state_indices is not None:
                             dst_info = self.decode_kv_args_table[req.agent_name]
                             state_xfer_handle = self.maybe_send_extra(
                                 req.agent_name,
-                                kv_chunk.state_indices,
+                                primary_state_indices,
                                 dst_info.dst_state_data_ptrs,
                                 req.dst_state_indices,
                                 dst_info.gpu_id,
@@ -528,11 +533,17 @@ class NixlKVManager(CommonKVManager):
         if not self.aux_descs:
             raise Exception("NIXL memory registration failed for aux tensors")
 
-        # Register state/extra pool data buffers if present
-        if self.kv_args.state_data_ptrs and self.kv_args.state_data_lens:
+        # NIXL transfers a single state component; pick component 0.
+        primary_state_ptrs = (
+            self.kv_args.state_data_ptrs[0] if self.kv_args.state_data_ptrs else []
+        )
+        primary_state_lens = (
+            self.kv_args.state_data_lens[0] if self.kv_args.state_data_lens else []
+        )
+        if primary_state_ptrs and primary_state_lens:
             state_addrs = []
             for state_data_ptr, state_data_len in zip(
-                self.kv_args.state_data_ptrs, self.kv_args.state_data_lens
+                primary_state_ptrs, primary_state_lens
             ):
                 state_addrs.append(
                     (state_data_ptr, state_data_len, self.kv_args.gpu_id, "")
@@ -881,8 +892,12 @@ class NixlKVManager(CommonKVManager):
         src_addrs = []
         dst_addrs = []
 
-        prefill_state_data_ptrs = self.kv_args.state_data_ptrs
-        prefill_state_item_lens = self.kv_args.state_item_lens
+        prefill_state_data_ptrs = (
+            self.kv_args.state_data_ptrs[0] if self.kv_args.state_data_ptrs else []
+        )
+        prefill_state_item_lens = (
+            self.kv_args.state_item_lens[0] if self.kv_args.state_item_lens else []
+        )
 
         for i, dst_state_ptr in enumerate(dst_state_data_ptrs):
             length = prefill_state_item_lens[i]
@@ -936,9 +951,18 @@ class NixlKVManager(CommonKVManager):
         )
         assert len(prefill_state_indices) == 1, "Mamba should have single state index"
 
-        prefill_state_data_ptrs = self.kv_args.state_data_ptrs
-        prefill_state_item_lens = self.kv_args.state_item_lens
-        src_state_dim_per_tensor = getattr(self.kv_args, "state_dim_per_tensor", [])
+        prefill_state_data_ptrs = (
+            self.kv_args.state_data_ptrs[0] if self.kv_args.state_data_ptrs else []
+        )
+        prefill_state_item_lens = (
+            self.kv_args.state_item_lens[0] if self.kv_args.state_item_lens else []
+        )
+        src_state_dim_per_tensor_outer = getattr(
+            self.kv_args, "state_dim_per_tensor", []
+        )
+        src_state_dim_per_tensor = (
+            src_state_dim_per_tensor_outer[0] if src_state_dim_per_tensor_outer else []
+        )
 
         if not src_state_dim_per_tensor or not dst_state_dim_per_tensor:
             return self._send_mamba_state(
@@ -1024,7 +1048,8 @@ class NixlKVManager(CommonKVManager):
         dst_state_dim_per_tensor: list[int] | None = None,
     ):
         """Send state or extra pool data with type-specific handling."""
-        state_type = getattr(self.kv_args, "state_type", "none")
+        state_types = getattr(self.kv_args, "state_types", []) or []
+        state_type = str(state_types[0]) if state_types else "none"
 
         if state_type == "mamba":
             if self.attn_tp_size != decode_tp_size:
@@ -1060,9 +1085,17 @@ class NixlKVManager(CommonKVManager):
                 )
             return self._send_kvcache_generic(
                 peer_name=peer_name,
-                src_data_ptrs=self.kv_args.state_data_ptrs,
+                src_data_ptrs=(
+                    self.kv_args.state_data_ptrs[0]
+                    if self.kv_args.state_data_ptrs
+                    else []
+                ),
                 dst_data_ptrs=dst_state_data_ptrs,
-                item_lens=self.kv_args.state_item_lens,
+                item_lens=(
+                    self.kv_args.state_item_lens[0]
+                    if self.kv_args.state_item_lens
+                    else []
+                ),
                 prefill_data_indices=np.array(prefill_state_indices, dtype=np.int32),
                 dst_data_indices=np.array(dst_state_indices, dtype=np.int32),
                 dst_gpu_id=dst_gpu_id,
@@ -1083,7 +1116,7 @@ class NixlKVManager(CommonKVManager):
         is_last: bool,
         chunk_id: int,
         aux_index: Optional[int] = None,
-        state_indices: Optional[List[int]] = None,
+        state_indices: Optional[List] = None,
     ):
         assert self.disaggregation_mode == DisaggregationMode.PREFILL
         assert not is_last or (is_last and aux_index is not None)
@@ -1221,7 +1254,7 @@ class NixlKVSender(CommonKVSender):
     def send(
         self,
         kv_indices: npt.NDArray[np.int32],
-        state_indices: Optional[List[int]] = None,
+        state_indices: Optional[List] = None,
     ):
         if self._send_failed:
             return
@@ -1310,7 +1343,7 @@ class NixlKVReceiver(CommonKVReceiver):
         self,
         kv_indices: npt.NDArray[np.int32],
         aux_index: Optional[int] = None,
-        state_indices: Optional[List[int]] = None,
+        state_indices: Optional[List] = None,
         decode_prefix_len: Optional[int] = None,
     ):
         if self.bootstrap_infos is None:
@@ -1329,6 +1362,11 @@ class NixlKVReceiver(CommonKVReceiver):
             logger.debug(
                 f"Sending to prefill server with bootstrap room {self.bootstrap_room} {is_dummy=}"
             )
+            primary_state_indices = (
+                state_indices[0]
+                if state_indices and state_indices[0] is not None
+                else None
+            )
             with lock:
                 sock.send_multipart(
                     [
@@ -1341,8 +1379,8 @@ class NixlKVReceiver(CommonKVReceiver):
                         str(aux_index).encode("ascii"),
                         str(self.required_dst_info_num).encode("ascii"),
                         (
-                            np.array(state_indices, dtype=np.int32).tobytes()
-                            if not is_dummy and state_indices is not None
+                            np.array(primary_state_indices, dtype=np.int32).tobytes()
+                            if not is_dummy and primary_state_indices is not None
                             else b""
                         ),
                         str(decode_prefix_len or 0).encode("ascii"),
@@ -1404,19 +1442,30 @@ class NixlKVReceiver(CommonKVReceiver):
             packed_aux_data_ptrs = b"".join(
                 struct.pack("Q", ptr) for ptr in self.kv_mgr.kv_args.aux_data_ptrs
             )
-            packed_state_data_ptrs = b"".join(
-                struct.pack("Q", ptr) for ptr in self.kv_mgr.kv_args.state_data_ptrs
+            primary_state_data_ptrs = (
+                self.kv_mgr.kv_args.state_data_ptrs[0]
+                if self.kv_mgr.kv_args.state_data_ptrs
+                else []
             )
-
-            packed_state_item_lens = b"".join(
-                struct.pack("I", item_len)
-                for item_len in self.kv_mgr.kv_args.state_item_lens
+            primary_state_item_lens = (
+                self.kv_mgr.kv_args.state_item_lens[0]
+                if self.kv_mgr.kv_args.state_item_lens
+                else []
             )
-            state_dim_per_tensor = getattr(
+            state_dim_per_tensor_outer = getattr(
                 self.kv_mgr.kv_args, "state_dim_per_tensor", []
             )
+            primary_state_dim_per_tensor = (
+                state_dim_per_tensor_outer[0] if state_dim_per_tensor_outer else []
+            )
+            packed_state_data_ptrs = b"".join(
+                struct.pack("Q", ptr) for ptr in primary_state_data_ptrs
+            )
+            packed_state_item_lens = b"".join(
+                struct.pack("I", item_len) for item_len in primary_state_item_lens
+            )
             packed_state_dim_per_tensor = b"".join(
-                struct.pack("I", dim) for dim in state_dim_per_tensor
+                struct.pack("I", dim) for dim in primary_state_dim_per_tensor
             )
 
             with lock:
