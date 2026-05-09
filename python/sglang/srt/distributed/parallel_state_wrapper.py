@@ -2,8 +2,28 @@ from dataclasses import dataclass
 from typing import Optional
 
 
-@dataclass(frozen=True, slots=True, kw_only=True)
+@dataclass(frozen=True, kw_only=True)
 class ParallelState:
+    __slots__ = (
+        "tp_rank",
+        "tp_size",
+        "pp_rank",
+        "pp_size",
+        "dp_rank",
+        "dp_size",
+        "attn_tp_rank",
+        "attn_tp_size",
+        "attn_cp_rank",
+        "attn_cp_size",
+        "attn_dp_rank",
+        "attn_dp_size",
+        "moe_ep_rank",
+        "moe_ep_size",
+        "moe_dp_rank",
+        "moe_dp_size",
+        "gpu_id",
+    )
+
     tp_rank: int
     tp_size: int
     pp_rank: int
