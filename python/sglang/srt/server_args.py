@@ -2875,6 +2875,11 @@ class ServerArgs:
     def _handle_grammar_backend(self):
         if self.grammar_backend is None:
             self.grammar_backend = "xgrammar"
+        if self.enable_strict_thinking and self.grammar_backend != "xgrammar":
+            raise ValueError(
+                "--enable-strict-thinking currently requires --grammar-backend xgrammar "
+                "because strict thinking relies on token filtering support."
+            )
 
     def _handle_mamba_backend(self):
         if self.mamba_backend == "flashinfer":

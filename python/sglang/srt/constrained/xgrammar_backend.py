@@ -107,6 +107,21 @@ class XGrammarGrammar(BaseGrammarObject):
     def fill_vocab_mask(self, vocab_mask: torch.Tensor, idx: int) -> None:
         self.matcher.fill_next_token_bitmask(vocab_mask, idx)
 
+    def is_vocab_mask_allowed_token(
+        self,
+        vocab_mask: torch.Tensor,
+        token_id: int,
+        vocab_size: Optional[int] = None,
+    ) -> bool:
+        if vocab_size is not None and token_id >= vocab_size:
+            return False
+
+        packed_idx = token_id // 32
+        if packed_idx >= vocab_mask.shape[-1]:
+            return False
+        packed_value = int(vocab_mask[packed_idx].item())
+        return (packed_value & (1 << (token_id % 32))) != 0
+
     @staticmethod
     def move_vocab_mask(vocab_mask: torch.Tensor, device) -> torch.Tensor:
         return vocab_mask.to(device, non_blocking=True)
@@ -229,6 +244,21 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
     @staticmethod
     def allocate_vocab_mask(vocab_size: int, batch_size: int, device) -> torch.Tensor:
         return allocate_token_bitmask(batch_size, vocab_size)
+
+    @staticmethod
+    def is_vocab_mask_allowed_token(
+        vocab_mask: torch.Tensor,
+        token_id: int,
+        vocab_size: Optional[int] = None,
+    ) -> bool:
+        if vocab_size is not None and token_id >= vocab_size:
+            return False
+
+        packed_idx = token_id // 32
+        if packed_idx >= vocab_mask.shape[-1]:
+            return False
+        packed_value = int(vocab_mask[packed_idx].item())
+        return (packed_value & (1 << (token_id % 32))) != 0
 
     @staticmethod
     def move_vocab_mask(vocab_mask: torch.Tensor, device) -> torch.Tensor:
