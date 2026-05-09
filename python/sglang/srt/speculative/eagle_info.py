@@ -918,6 +918,10 @@ class EagleVerifyOutput:
     # Per-req accepted draft count (no bonus). V1 fills this for tracing /
     # adaptive controller; V2 leaves it None to avoid the CPU sync.
     num_accepted_drafts_per_req_cpu: Optional[List[int]] = None
+    # Whether the target verify forward ran a captured cuda graph. Set by
+    # the worker after `EagleVerifyInput.verify` returns; default kept so
+    # idle / direct constructions don't have to pass it.
+    can_run_cuda_graph: bool = False
 
     @classmethod
     def create_idle(
