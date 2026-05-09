@@ -7,12 +7,6 @@ unified extend kernel read the new tokens at `out_cache_loc` (full-pool
 index space) while `SWAKVPool.set_kv_buffer` had written them at the
 SWA-translated indices. With diverse prompts the OOB never materialises;
 the repro is same-prompt × high-concurrency, which is what this test fires.
-
-Adapted from the repro script in the bug report (originally 200 identical
-completions at concurrency 128, `--max-running-requests 16`). This test
-keeps the same same-prompt, high-concurrency shape with 180 requests to
-trim runtime. Pre-fix this loses ~40-50% of requests within ~30-40s;
-post-fix all requests succeed.
 """
 
 import concurrent.futures
