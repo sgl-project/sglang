@@ -1111,7 +1111,8 @@ class EAGLEWorker(TpModelWorker):
     ):
         # Install the draft-extend input as `batch.spec_info` for this method's
         # forward pass. Replaced with a fresh `EagleDraftInput` post-extend.
-        draft_extend_input: EagleDraftExtendInput = verify_output.draft_extend_input
+        draft_extend_input = verify_output.draft_extend_input
+        assert isinstance(draft_extend_input, EagleDraftExtendInput)
         batch.spec_info = draft_extend_input
 
         # Backup fields that will be modified in-place
