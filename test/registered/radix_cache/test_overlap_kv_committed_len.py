@@ -33,7 +33,9 @@ MODEL = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
 
 # Fixed token sequences so the test is deterministic and model-independent.
 INPUT_IDS_A = [1, 2, 3, 4]
-MAX_NEW_TOKENS_A = 2  # A will finish with seqlen = len(INPUT_IDS_A) + MAX_NEW_TOKENS_A = 6
+MAX_NEW_TOKENS_A = (
+    2  # A will finish with seqlen = len(INPUT_IDS_A) + MAX_NEW_TOKENS_A = 6
+)
 
 
 def generate(base_url, input_ids, max_new_tokens):
