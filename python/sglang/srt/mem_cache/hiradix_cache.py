@@ -887,6 +887,38 @@ class HiRadixCache(RadixCache):
             len(self.evictable_host_leaves),
         )
 
+    def _log_prefetch_from_storage_abort_root_diag(
+        self,
+        *,
+        phase: str,
+        req_id: str,
+        evict_host_attempted: bool,
+    ) -> None:
+        ev_sz = len(self.evictable_host_leaves)
+        root_child_total = len(self.root_node.children)
+        if ev_sz == 0:
+            hot_cnt = sum(
+                1
+                for c in self.root_node.children.values()
+                if c.backuped and not c.evicted
+            )
+            hot_display = str(hot_cnt)
+            diag_note = "root_children_hot_backuped_count_only_when_evictable_host_leaves_empty"
+        else:
+            hot_display = "n/a"
+            diag_note = "skip_root_children_hot_backuped_count_evictable_host_leaves_nonempty"
+        logger.info(
+            "[HiCachePrefetchAbortTrace] phase=%s req_id=%s evict_host_attempted=%s "
+            "evictable_host_leaves=%s root_children_total=%s root_children_backuped_T_evicted_F=%s diag=%s",
+            phase,
+            req_id,
+            evict_host_attempted,
+            ev_sz,
+            root_child_total,
+            hot_display,
+            diag_note,
+        )
+
     def _update_host_leaf_status(self, node: TreeNode):
         self._trace_host_leaf_node(
             caller="_update_host_leaf_status",
@@ -1606,6 +1638,11 @@ class HiRadixCache(RadixCache):
             )
             host_indices = self.cache_controller.mem_pool_host.alloc(prefetch_length)
         if host_indices is None:
+            self._log_prefetch_from_storage_abort_root_diag(
+                phase="prefetch_from_storage_abort_before",
+                req_id=req_id,
+                evict_host_attempted=evict_host_for_prefetch,
+            )
             last_host_node.release_host()
             logger.debug(
                 "[prefetch_from_storage] skip rid=%s prefetch_length=%d "
@@ -1619,6 +1656,11 @@ class HiRadixCache(RadixCache):
                 evict_host_for_prefetch,
                 mp.size,
                 mp.available_size(),
+            )
+            self._log_prefetch_from_storage_abort_root_diag(
+                phase="prefetch_from_storage_abort_after",
+                req_id=req_id,
+                evict_host_attempted=evict_host_for_prefetch,
             )
             return
         logger.info(
