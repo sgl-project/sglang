@@ -768,7 +768,7 @@ class FrozenKVMTPWorker(TpModelWorker):
         batch.forward_mode = (
             ForwardMode.DECODE if not batch.forward_mode.is_idle() else ForwardMode.IDLE
         )
-        batch.spec_info = res.draft_input
+        batch.spec_info = res.next_draft_input
 
         del seq_lens_pre_verify
         return logits_output, res, model_worker_batch, can_run_cuda_graph

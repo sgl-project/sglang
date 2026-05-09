@@ -979,7 +979,7 @@ class EAGLEWorker(TpModelWorker):
         batch.forward_mode = (
             ForwardMode.DECODE if not batch.forward_mode.is_idle() else ForwardMode.IDLE
         )
-        batch.spec_info = res.draft_input
+        batch.spec_info = res.next_draft_input
 
         return logits_output, res, model_worker_batch, can_run_cuda_graph
 

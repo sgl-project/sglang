@@ -248,7 +248,7 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                 capture_hidden_mode=CaptureHiddenMode.LAST,
             )
             return EagleVerifyOutput.create_idle(
-                draft_input=draft_input,
+                next_draft_input=draft_input,
                 logits_output=logits_output,
                 device=batch.device,
                 spec_steps=self.spec_steps,
@@ -553,7 +553,7 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
             )
 
             return EagleVerifyOutput(
-                draft_input=draft_input,
+                next_draft_input=draft_input,
                 logits_output=logits_output,
                 accept_tokens=accept_tokens,
                 next_extend_input_ids=accept_tokens,
@@ -652,7 +652,7 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                 )
 
             return EagleVerifyOutput(
-                draft_input=draft_input,
+                next_draft_input=draft_input,
                 logits_output=logits_output,
                 accept_tokens=accept_tokens,
                 next_extend_input_ids=next_extend_input_ids,
@@ -873,8 +873,8 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
 
 @dataclass
 class EagleVerifyOutput:
-    # Draft input batch (next iter's persistent draft state).
-    draft_input: EagleDraftInput
+    # Next iter's persistent draft state, ready to be installed as `batch.spec_info`.
+    next_draft_input: EagleDraftInput
     # Logit outputs from target worker.
     logits_output: LogitsProcessorOutput
     # All accepted tokens flat across all reqs incl. those that finished this
@@ -903,13 +903,13 @@ class EagleVerifyOutput:
     def create_idle(
         cls,
         *,
-        draft_input: EagleDraftInput,
+        next_draft_input: EagleDraftInput,
         logits_output: LogitsProcessorOutput,
         device: torch.device,
         spec_steps: int,
     ) -> "EagleVerifyOutput":
         return cls(
-            draft_input=draft_input,
+            next_draft_input=next_draft_input,
             logits_output=logits_output,
             accept_tokens=torch.empty(0, dtype=torch.long, device=device),
             next_extend_input_ids=torch.empty(0, dtype=torch.long, device=device),
