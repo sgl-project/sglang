@@ -42,7 +42,7 @@ logger = logging.getLogger(__name__)
 
 
 class SchedulerUpdateWeightsMixin:
-    def _flush_cache_after_weight_update(self: Scheduler, recv_req) -> None:
+    def flush_cache_after_weight_update(self: Scheduler, recv_req) -> None:
         if recv_req.flush_cache:
             flush_cache_success = self.flush_cache(
                 empty_cache=recv_req.torch_empty_cache
@@ -58,7 +58,7 @@ class SchedulerUpdateWeightsMixin:
         if success and self.draft_worker is not None:
             success, message = self.draft_worker.update_weights_from_disk(recv_req)
         if tp_success:
-            self._flush_cache_after_weight_update(recv_req)
+            self.flush_cache_after_weight_update(recv_req)
         if not success:
             logger.error(message)
         return UpdateWeightFromDiskReqOutput(success, message, 0)
@@ -84,7 +84,7 @@ class SchedulerUpdateWeightsMixin:
         """Update the online model parameter."""
         success, message = self.tp_worker.update_weights_from_distributed(recv_req)
         if success:
-            self._flush_cache_after_weight_update(recv_req)
+            self.flush_cache_after_weight_update(recv_req)
         else:
             logger.error(message)
         return UpdateWeightsFromDistributedReqOutput(success, message)
@@ -99,7 +99,7 @@ class SchedulerUpdateWeightsMixin:
             worker = self.draft_worker or self.tp_worker
         success, message = worker.update_weights_from_tensor(recv_req)
         if success:
-            self._flush_cache_after_weight_update(recv_req)
+            self.flush_cache_after_weight_update(recv_req)
         else:
             logger.error(message)
         torch.distributed.barrier(group=self.tp_cpu_group)
@@ -114,7 +114,7 @@ class SchedulerUpdateWeightsMixin:
         if success and self.draft_worker is not None:
             success, message = self.draft_worker.update_weights_from_ipc(recv_req)
         if tp_success:
-            self._flush_cache_after_weight_update(recv_req)
+            self.flush_cache_after_weight_update(recv_req)
         if not success:
             logger.error(message)
         torch.distributed.barrier(group=self.tp_cpu_group)
