@@ -885,30 +885,101 @@ class MHATokenToKVPool(KVCache):
         )
 
     def _create_buffers(self):
+        from sglang.srt.utils import get_bool_env_var
+
+        self._use_aiter_shuffle_attn = get_bool_env_var("SGLANG_USE_AITER_SHUFFLE_ATTN")
+
         with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
             with (
                 torch.cuda.use_mem_pool(self.custom_mem_pool)
                 if self.enable_custom_mem_pool
                 else nullcontext()
             ):
-                # [size, head_num, head_dim] for each layer
-                # The padded slot 0 is used for writing dummy outputs from padded tokens.
-                self.k_buffer = [
-                    torch.zeros(
-                        (self.size + self.page_size, self.head_num, self.head_dim),
-                        dtype=self.store_dtype,
-                        device=self.device,
-                    )
-                    for _ in range(self.layer_num)
-                ]
-                self.v_buffer = [
-                    torch.zeros(
-                        (self.size + self.page_size, self.head_num, self.v_head_dim),
-                        dtype=self.store_dtype,
-                        device=self.device,
-                    )
-                    for _ in range(self.layer_num)
-                ]
+                if self._use_aiter_shuffle_attn:
+                    asm_dtype = self.dtype
+                    elem_size = torch.tensor([], dtype=asm_dtype).element_size()
+                    raw_num_pages = (self.size + self.page_size) // self.page_size + 1
+                    if self.store_dtype != self.dtype:
+                        kv_bytes_per_page = (
+                            2
+                            * self.head_num
+                            * self.head_dim
+                            * self.page_size
+                            * elem_size
+                        )
+                        scale_bytes_per_page = 2 * self.head_num * self.page_size * 4
+                        shrink_ratio = kv_bytes_per_page / (
+                            kv_bytes_per_page + scale_bytes_per_page
+                        )
+                        num_pages = int(raw_num_pages * shrink_ratio)
+                    else:
+                        num_pages = raw_num_pages
+                    x = 16 // elem_size
+                    self.k_buffer = [
+                        torch.zeros(
+                            (
+                                num_pages,
+                                self.head_num,
+                                self.head_dim // x,
+                                self.page_size,
+                                x,
+                            ),
+                            dtype=asm_dtype,
+                            device=self.device,
+                        )
+                        for _ in range(self.layer_num)
+                    ]
+                    self.v_buffer = [
+                        torch.zeros(
+                            (num_pages, self.head_num, self.v_head_dim, self.page_size),
+                            dtype=asm_dtype,
+                            device=self.device,
+                        )
+                        for _ in range(self.layer_num)
+                    ]
+                    if self.store_dtype != self.dtype:
+                        self.k_scale_buffer = [
+                            torch.zeros(
+                                (num_pages, self.head_num, self.page_size),
+                                dtype=torch.float32,
+                                device=self.device,
+                            )
+                            for _ in range(self.layer_num)
+                        ]
+                        self.v_scale_buffer = [
+                            torch.zeros(
+                                (num_pages, self.head_num, self.page_size),
+                                dtype=torch.float32,
+                                device=self.device,
+                            )
+                            for _ in range(self.layer_num)
+                        ]
+                    else:
+                        self.k_scale_buffer = None
+                        self.v_scale_buffer = None
+                else:
+                    self.k_buffer = [
+                        torch.zeros(
+                            (self.size + self.page_size, self.head_num, self.head_dim),
+                            dtype=self.store_dtype,
+                            device=self.device,
+                        )
+                        for _ in range(self.layer_num)
+                    ]
+                    self.v_buffer = [
+                        torch.zeros(
+                            (
+                                self.size + self.page_size,
+                                self.head_num,
+                                self.v_head_dim,
+                            ),
+                            dtype=self.store_dtype,
+                            device=self.device,
+                        )
+                        for _ in range(self.layer_num)
+                    ]
+                    self.k_scale_buffer = None
+                    self.v_scale_buffer = None
 
         self.k_data_ptrs = torch.tensor(
             [x.data_ptr() for x in self.k_buffer],
@@ -932,6 +1003,9 @@ class MHATokenToKVPool(KVCache):
     def _clear_buffers(self):
         del self.k_buffer
         del self.v_buffer
+        if hasattr(self, "k_scale_buffer") and self.k_scale_buffer is not None:
+            del self.k_scale_buffer
+            del self.v_scale_buffer
 
     def get_kv_size_bytes(self):
         assert hasattr(self, "k_buffer")
@@ -1007,22 +1081,21 @@ class MHATokenToKVPool(KVCache):
         torch.cuda.synchronize()
 
     def _get_key_buffer(self, layer_id: int):
-        # for internal use of referencing
-        if self.store_dtype != self.dtype:
+        if self.store_dtype != self.dtype and not getattr(
+            self, "_use_aiter_shuffle_attn", False
+        ):
             return self.k_buffer[layer_id - self.start_layer].view(self.dtype)
         return self.k_buffer[layer_id - self.start_layer]
 
     def get_key_buffer(self, layer_id: int):
-        # note: get_key_buffer is hooked with synchronization for layer-wise KV cache loading
-        # it is supposed to be used only by attention backend not for information purpose
-        # same applies to get_value_buffer and get_kv_buffer
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
         return self._get_key_buffer(layer_id)
 
     def _get_value_buffer(self, layer_id: int):
-        # for internal use of referencing
-        if self.store_dtype != self.dtype:
+        if self.store_dtype != self.dtype and not getattr(
+            self, "_use_aiter_shuffle_attn", False
+        ):
             return self.v_buffer[layer_id - self.start_layer].view(self.dtype)
         return self.v_buffer[layer_id - self.start_layer]
 
@@ -1072,6 +1145,54 @@ class MHATokenToKVPool(KVCache):
             alt_stream=self.alt_stream,
             same_kv_dim=self.same_kv_dim,
         )
+
+    def set_kv_buffer_asm(
+        self,
+        layer_id: int,
+        loc: torch.Tensor,
+        cache_k: torch.Tensor,
+        cache_v: torch.Tensor,
+    ):
+        """Write KV to SHUFFLE-layout cache using aiter reshape_and_cache."""
+        from aiter import reshape_and_cache, reshape_and_cache_with_pertoken_quant
+
+        idx = layer_id - self.start_layer
+        k_buf = self._get_key_buffer(layer_id)
+        v_buf = self._get_value_buffer(layer_id)
+        slot_mapping = loc.to(torch.int64)
+        num_kv_heads = cache_k.shape[-2] if cache_k.dim() == 3 else self.head_num
+        head_dim = cache_k.shape[-1] if cache_k.dim() == 3 else self.head_dim
+        k_3d = cache_k.view(-1, num_kv_heads, head_dim)
+        v_3d = cache_v.view(-1, num_kv_heads, self.v_head_dim)
+
+        if self.k_scale_buffer is not None:
+            reshape_and_cache_with_pertoken_quant(
+                k_3d,
+                v_3d,
+                k_buf,
+                v_buf,
+                self.k_scale_buffer[idx],
+                self.v_scale_buffer[idx],
+                slot_mapping,
+                asm_layout=True,
+            )
+        else:
+            reshape_and_cache(
+                k_3d,
+                v_3d,
+                k_buf,
+                v_buf,
+                slot_mapping,
+                kv_cache_dtype="auto",
+                asm_layout=True,
+            )
+
+    def get_kv_scale_buffer(self, layer_id: int):
+        """Return per-token FP8 scale buffers for ASM attention."""
+        if self.k_scale_buffer is None:
+            return None, None
+        idx = layer_id - self.start_layer
+        return self.k_scale_buffer[idx], self.v_scale_buffer[idx]
 
     def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
         if envs.SGLANG_NATIVE_MOVE_KV_CACHE.get():

@@ -180,7 +180,12 @@ class DecodeInputBuffers(ForwardInputBuffers):
             input_embeds = torch.zeros((max_num_token, hidden_size), dtype=dtype)
             req_pool_indices = torch.zeros((max_bs,), dtype=torch.int64)
             seq_lens = torch.full((max_bs,), seq_len_fill_value, dtype=torch.int32)
-            out_cache_loc = torch.zeros((max_num_token,), dtype=cache_loc_dtype)
+            out_cache_loc = (
+                torch.full((max_num_token,), -1, dtype=cache_loc_dtype)
+                if os.environ.get("SGLANG_USE_AITER_SHUFFLE_ATTN", "").lower()
+                in ("1", "true")
+                else torch.zeros((max_num_token,), dtype=cache_loc_dtype)
+            )
             out_cache_loc_swa = (
                 torch.zeros((max_num_token,), dtype=torch.int64)
                 if is_hybrid_swa
@@ -288,7 +293,12 @@ class DecodeInputBuffers(ForwardInputBuffers):
     ):
         if bs != raw_bs:
             self.seq_lens.fill_(seq_len_fill_value)
-            self.out_cache_loc.zero_()
+            (
+                self.out_cache_loc.fill_(-1)
+                if os.environ.get("SGLANG_USE_AITER_SHUFFLE_ATTN", "").lower()
+                in ("1", "true")
+                else self.out_cache_loc.zero_()
+            )
             if self.mamba_track_indices is not None:
                 self.mamba_track_indices.zero_()
             if self.mamba_track_mask is not None:
