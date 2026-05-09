@@ -993,13 +993,19 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             spec_info = self.spec_info
             self.output_cache_loc_backup = self.out_cache_loc
             self.hidden_states_backup = spec_info.hidden_states
-            if spec_info.topk_p is not None:
+            # `topk_p` / `topk_index` only live on `EagleDraftInput` (draft phase).
+            # `EagleDraftExtendInput` (draft-extend phase) doesn't have these,
+            # so use `getattr` so the guard skips cleanly there.
+            if getattr(spec_info, "topk_p", None) is not None:
                 spec_info.topk_p = self._pad_tensor_to_size(spec_info.topk_p, bs)
-            if spec_info.topk_index is not None:
+            if getattr(spec_info, "topk_index", None) is not None:
                 spec_info.topk_index = self._pad_tensor_to_size(
                     spec_info.topk_index, bs
                 )
-            if spec_info.num_accepted_drafts is not None:
+            # `num_accepted_*` only live on `EagleDraftExtendInput` (draft-extend
+            # phase). `EagleDraftInput` (draft phase) doesn't have these fields,
+            # so use `getattr` to skip when spec_info is the latter.
+            if getattr(spec_info, "num_accepted_drafts", None) is not None:
                 spec_info.num_accepted_drafts = self._pad_tensor_to_size(
                     spec_info.num_accepted_drafts, bs
                 )
