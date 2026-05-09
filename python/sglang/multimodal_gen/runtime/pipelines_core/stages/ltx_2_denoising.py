@@ -1574,8 +1574,18 @@ class LTX2DenoisingStage(DenoisingStage):
                 ctx.denoise_mask = ctx.denoise_mask.to(device)
             if ctx.clean_latent is not None:
                 ctx.clean_latent = ctx.clean_latent.to(device)
+            self._move_ltx2_scheduler_tensors_to_device(ctx.scheduler, device)
+            self._move_ltx2_scheduler_tensors_to_device(ctx.audio_scheduler, device)
 
         return ctx
+
+    @staticmethod
+    def _move_ltx2_scheduler_tensors_to_device(scheduler: object, device) -> None:
+        # cfg-parallel batches are broadcast from rank 0; scheduler state must be local
+        for name in ("sigmas", "timesteps"):
+            value = getattr(scheduler, name, None)
+            if isinstance(value, torch.Tensor):
+                setattr(scheduler, name, value.to(device))
 
     def _before_denoising_loop(
         self, ctx: LTX2DenoisingContext, batch: Req, server_args: ServerArgs
