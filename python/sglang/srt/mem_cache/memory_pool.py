@@ -139,17 +139,16 @@ class ReqToTokenPool:
         )
 
         self.size = size
+        # +1 padding row at index 0: cuda-graph padded batches default
+        # req_pool_indices to 0, so dummy reads/writes land here harmlessly.
+        self._alloc_size = size + 1
         self.max_context_len = max_context_len
         self.device = device
         with memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
-            # +1 row for padding slot 0 (mirrors KV pool): cuda-graph padded
-            # batches default req_pool_indices to 0, so routing dummies through
-            # unowned slot 0 keeps req_to_token[0, :] zero and downstream writes
-            # harmless.
             self.req_to_token = torch.zeros(
-                (size + 1, max_context_len), dtype=torch.int32, device=device
+                (self._alloc_size, max_context_len), dtype=torch.int32, device=device
             )
-        self.free_slots = list(range(1, size + 1))
+        self.free_slots = list(range(1, self._alloc_size))
 
     def write(self, indices, values):
         self.req_to_token[indices] = values
@@ -189,7 +188,7 @@ class ReqToTokenPool:
         req.req_pool_idx = None
 
     def clear(self):
-        self.free_slots = list(range(1, self.size + 1))
+        self.free_slots = list(range(1, self._alloc_size))
 
 
 class MambaPool:
@@ -1938,6 +1937,10 @@ class NSATokenToKVPool(MLATokenToKVPool):
             ]
         self._finalize_allocation_log(size)
 
+    def _clear_buffers(self):
+        del self.kv_buffer
+        del self.index_k_with_scale_buffer
+
     def get_index_k_with_scale_buffer(self, layer_id: int) -> torch.Tensor:
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
@@ -2011,6 +2014,50 @@ class NSATokenToKVPool(MLATokenToKVPool):
         index_buf_accessor.SetKAndS.execute(
             pool=self, buf=buf, loc=loc, index_k=index_k, index_k_scale=index_k_scale
         )
+
+    def get_cpu_copy(self, indices):
+        # NSA keeps a page-indexed index_k_with_scale_buffer alongside kv_buffer.
+        # Retract frees the slots/pages and they get reused by other reqs'
+        # set_index_k_scale_buffer, so we must offload it here too -- otherwise
+        # resume restores kv_buffer but leaves foreign index/scale in place and
+        # NSA attention reads garbage at those token positions.
+        kv_cache_cpu = super().get_cpu_copy(indices)
+
+        page_indices = indices[:: self.page_size] // self.page_size
+        torch.cuda.synchronize()
+        index_k_cpu = []
+        chunk_size = self.cpu_offloading_chunk_size
+        page_chunk_size = max(1, chunk_size // self.page_size)
+        for layer_id in range(self.layer_num):
+            index_k_cpu.append([])
+            for i in range(0, len(page_indices), page_chunk_size):
+                chunk_page_indices = page_indices[i : i + page_chunk_size]
+                idx_cpu = self.index_k_with_scale_buffer[layer_id][
+                    chunk_page_indices
+                ].to("cpu", non_blocking=True)
+                index_k_cpu[-1].append(idx_cpu)
+        torch.cuda.synchronize()
+
+        return {"kv": kv_cache_cpu, "index_k": index_k_cpu}
+
+    def load_cpu_copy(self, kv_cache_cpu_dict, indices):
+        super().load_cpu_copy(kv_cache_cpu_dict["kv"], indices)
+
+        page_indices = indices[:: self.page_size] // self.page_size
+        index_k_cpu = kv_cache_cpu_dict["index_k"]
+        torch.cuda.synchronize()
+        chunk_size = self.cpu_offloading_chunk_size
+        page_chunk_size = max(1, chunk_size // self.page_size)
+        for layer_id in range(self.layer_num):
+            for i in range(0, len(page_indices), page_chunk_size):
+                chunk_page_indices = page_indices[i : i + page_chunk_size]
+                idx_cpu = index_k_cpu[layer_id][i // page_chunk_size]
+                assert idx_cpu.shape[0] == len(chunk_page_indices)
+                idx_chunk = idx_cpu.to(
+                    self.index_k_with_scale_buffer[0].device, non_blocking=True
+                )
+                self.index_k_with_scale_buffer[layer_id][chunk_page_indices] = idx_chunk
+        torch.cuda.synchronize()
 
     def get_state_buf_infos(self):
         data_ptrs = [
