@@ -113,6 +113,11 @@ class UGSRTSchedulerExecutor:
         if self.run_synchronously:
             self._run_until_request_complete(req)
 
+    def run_idle_cleanup(self) -> None:
+        """Drain finished scheduler state left by synchronous UG requests."""
+
+        self._run_idle_cleanup()
+
     def get_request_token_binding(
         self,
         *,
@@ -440,11 +445,87 @@ class UGSRTSchedulerExecutor:
         return batch
 
     def _run_idle_cleanup(self) -> None:
-        if not hasattr(self.scheduler, "last_batch"):
-            return
-        if self.scheduler.last_batch is None:
-            return
-        self._run_scheduler_step()
+        for _ in range(self.max_sync_steps):
+            if self._scheduler_fully_idle():
+                return
+            if self._scheduler_has_pending_requests():
+                return
+            if not self._scheduler_has_active_batches():
+                return
+            if self._scheduler_batches_all_finished():
+                self._clear_finished_scheduler_batches()
+                continue
+            batch = self._run_scheduler_step()
+            if batch is None:
+                continue
+
+    def _scheduler_fully_idle(self) -> bool:
+        is_fully_idle = getattr(self.scheduler, "is_fully_idle", None)
+        return bool(callable(is_fully_idle) and is_fully_idle())
+
+    def _scheduler_has_pending_requests(self) -> bool:
+        waiting_queue = getattr(self.scheduler, "waiting_queue", None)
+        if self._safe_len(waiting_queue) > 0:
+            return True
+        grammar_manager = getattr(self.scheduler, "grammar_manager", None)
+        grammar_queue = getattr(grammar_manager, "grammar_queue", None)
+        return self._safe_len(grammar_queue) > 0
+
+    def _scheduler_has_active_batches(self) -> bool:
+        for attr_name in ("last_batch", "running_batch", "cur_batch"):
+            batch = getattr(self.scheduler, attr_name, None)
+            if batch is None:
+                continue
+            if hasattr(batch, "is_empty") and batch.is_empty():
+                continue
+            reqs = getattr(batch, "reqs", None) or []
+            if not reqs:
+                continue
+            return True
+        return False
+
+    def _scheduler_batches_all_finished(self) -> bool:
+        saw_req = False
+        for attr_name in ("last_batch", "running_batch", "cur_batch"):
+            batch = getattr(self.scheduler, attr_name, None)
+            if batch is None:
+                continue
+            if hasattr(batch, "is_empty") and batch.is_empty():
+                continue
+            for req in getattr(batch, "reqs", None) or []:
+                saw_req = True
+                finished = getattr(req, "finished", None)
+                if not callable(finished) or not finished():
+                    return False
+        return saw_req
+
+    def _clear_finished_scheduler_batches(self) -> None:
+        for attr_name in ("last_batch", "cur_batch"):
+            batch = getattr(self.scheduler, attr_name, None)
+            if self._batch_all_finished(batch):
+                setattr(self.scheduler, attr_name, None)
+        running_batch = getattr(self.scheduler, "running_batch", None)
+        if self._batch_all_finished(running_batch):
+            filter_batch = getattr(running_batch, "filter_batch", None)
+            if callable(filter_batch):
+                filter_batch()
+            if hasattr(running_batch, "reqs"):
+                running_batch.reqs = []
+            if hasattr(running_batch, "batch_is_full"):
+                running_batch.batch_is_full = False
+
+    @staticmethod
+    def _batch_all_finished(batch: Any) -> bool:
+        if batch is None:
+            return False
+        reqs = getattr(batch, "reqs", None) or []
+        if not reqs:
+            return False
+        for req in reqs:
+            finished = getattr(req, "finished", None)
+            if not callable(finished) or not finished():
+                return False
+        return True
 
     def _require_scheduler_methods(self, *method_names: str) -> None:
         missing = [
@@ -461,26 +542,79 @@ class UGSRTSchedulerExecutor:
     def _check_scheduler_idle(self, req: Any) -> None:
         if not self.require_idle_scheduler:
             return
+        if self.run_synchronously:
+            self._run_idle_cleanup()
         if not hasattr(self.scheduler, "is_fully_idle"):
             return
         if self.scheduler.is_fully_idle():
             return
+        if self._scheduler_batches_all_finished():
+            self._clear_finished_scheduler_batches()
+            if self.scheduler.is_fully_idle():
+                return
+        if (
+            not self._scheduler_has_pending_requests()
+            and not self._scheduler_has_active_batches()
+        ):
+            return
         raise UGSRTSchedulerExecutorError(
             "UG synchronous scheduler execution requires an idle scheduler before "
-            f"enqueuing request {req.rid}"
+            f"enqueuing request {req.rid}; {self._scheduler_idle_debug()}"
         )
 
     def _check_scheduler_idle_for_temporary_context(self) -> None:
         if not self.require_idle_scheduler:
             return
+        if self.run_synchronously:
+            self._run_idle_cleanup()
         if not hasattr(self.scheduler, "is_fully_idle"):
             return
         if self.scheduler.is_fully_idle():
             return
+        if self._scheduler_batches_all_finished():
+            self._clear_finished_scheduler_batches()
+            if self.scheduler.is_fully_idle():
+                return
+        if (
+            not self._scheduler_has_pending_requests()
+            and not self._scheduler_has_active_batches()
+        ):
+            return
         raise UGSRTSchedulerExecutorError(
             "Temporary context forward requires an idle scheduler before borrowing "
-            "ModelRunner KV slots"
+            f"ModelRunner KV slots; {self._scheduler_idle_debug()}"
         )
+
+    def _scheduler_idle_debug(self) -> str:
+        parts = [
+            f"waiting={self._safe_len(getattr(self.scheduler, 'waiting_queue', None))}",
+            "grammar="
+            f"{self._safe_len(getattr(getattr(self.scheduler, 'grammar_manager', None), 'grammar_queue', None))}",
+        ]
+        for attr_name in ("last_batch", "running_batch", "cur_batch"):
+            batch = getattr(self.scheduler, attr_name, None)
+            if batch is None:
+                parts.append(f"{attr_name}=None")
+                continue
+            is_empty = getattr(batch, "is_empty", None)
+            reqs = getattr(batch, "reqs", None) or []
+            req_states = []
+            for req in reqs[:4]:
+                finished = getattr(req, "finished", None)
+                req_states.append(
+                    f"{getattr(req, 'rid', '<unknown>')}:{callable(finished) and finished()}"
+                )
+            parts.append(
+                f"{attr_name}(empty={callable(is_empty) and is_empty()}, reqs={req_states})"
+            )
+        return ", ".join(parts)
+
+    @staticmethod
+    def _safe_len(value: Any) -> int:
+        try:
+            return len(value) if value is not None else 0
+        except TypeError:
+            return 0
 
     def _require_model_runner(self) -> Any:
         model_runner = self._model_runner()

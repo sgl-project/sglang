@@ -440,6 +440,9 @@ class UGSessionRuntime:
         self._close_srt_session(session_id)
         for sidecar_session_id in sorted(sidecar_session_ids):
             self._close_srt_session(sidecar_session_id)
+        cleanup = getattr(self.srt_request_executor, "run_idle_cleanup", None)
+        if callable(cleanup):
+            cleanup()
 
     def get_srt_sidecar_handle(
         self,
@@ -1223,6 +1226,8 @@ class UGSessionRuntime:
             OpenSessionReqInput(
                 session_id=session_id,
                 capacity_of_str_len=self.capacity_of_str_len,
+                # ug contexts must retain KV across U/G phases for G-side reads
+                streaming=True,
             )
         )
         if not getattr(output, "success", False):

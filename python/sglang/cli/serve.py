@@ -46,6 +46,15 @@ def _extract_model_type_override(extra_argv):
     return model_type, filtered_argv
 
 
+def _enable_omni_srt_runtime_defaults(server_args, model_type):
+    if model_type != "omni":
+        return server_args
+
+    # omni sessions rely on SRT streaming-session slots to keep U KV readable by G
+    server_args.enable_streaming_session = True
+    return server_args
+
+
 def serve(args, extra_argv):
     if any(h in extra_argv for h in ("-h", "--help")):
         # Since the server type is determined by the model, and we don't have a model path,
@@ -124,6 +133,7 @@ def serve(args, extra_argv):
             from sglang.srt.server_args import prepare_server_args
 
             server_args = prepare_server_args(dispatch_argv)
+            _enable_omni_srt_runtime_defaults(server_args, model_type)
 
             run_server(server_args)
     finally:

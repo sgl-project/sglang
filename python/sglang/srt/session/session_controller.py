@@ -123,11 +123,6 @@ class Session:
             elif session_params.replace:
                 abort = True
                 abort_message = "Streaming sessions do not support replace."
-            elif session_params.drop_previous_output:
-                abort = True
-                abort_message = (
-                    "Streaming sessions do not support drop_previous_output."
-                )
             elif session_params.offset and session_params.offset != 0:
                 abort = True
                 abort_message = "Streaming sessions do not support offset."
