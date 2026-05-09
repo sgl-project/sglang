@@ -506,7 +506,9 @@ class Scheduler(
             logger.error(f"only zbal mix mode support pp_size > 1!")
         if not _is_npu:
             logger.warning("currently zbal only support npu")
-        init_zbal(self.tp_size, self.gpu_id, self.tp_rank)  # only switch allocator if is mix mode
+        init_zbal(
+            self.tp_size, self.gpu_id, self.tp_rank
+        )  # only switch allocator if is mix mode
 
     def init_model_config(self):
         self.model_config = ModelConfig.from_server_args(self.server_args)
