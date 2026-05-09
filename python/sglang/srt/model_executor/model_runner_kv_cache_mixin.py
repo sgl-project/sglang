@@ -203,10 +203,7 @@ class ModelRunnerKVCacheMixin:
         is_dsv4_model: bool,
         current_platform,
     ):
-        if (
-            not self.server_args.prefill_only_disable_kv_cache
-            or self.is_draft_worker
-        ):
+        if not self.server_args.prefill_only_disable_kv_cache or self.is_draft_worker:
             return
 
         unsupported_pool_family = None
