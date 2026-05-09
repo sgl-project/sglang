@@ -1861,7 +1861,7 @@ class Scheduler(
         )
 
     def init_req_max_new_tokens(self, req):
-        if self.enable_hisparse:
+        if self.enable_hisparse and self.disaggregation_mode == DisaggregationMode.DECODE:
             max_req_len = self.hisparse_max_req_len
         else:
             max_req_len = self.max_req_len
@@ -2136,7 +2136,7 @@ class Scheduler(
 
         max_input_len = (
             self.hisparse_max_req_len - 5
-            if self.enable_hisparse
+            if self.enable_hisparse and self.disaggregation_mode == DisaggregationMode.DECODE
             else self.max_req_input_len
         )
         # Validate prompt length
@@ -2386,7 +2386,7 @@ class Scheduler(
 
         max_input_len = (
             self.hisparse_max_req_len - 5
-            if self.enable_hisparse
+            if self.enable_hisparse and self.disaggregation_mode == DisaggregationMode.DECODE
             else self.max_req_input_len
         )
         # Validate prompt length
