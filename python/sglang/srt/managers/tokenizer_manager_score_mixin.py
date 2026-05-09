@@ -676,7 +676,7 @@ class TokenizerManagerScoreMixin:
                     "It requires a model with a task-specific head "
                     "(e.g. SequenceClassification or RewardModel)."
                 )
-            model_config = getattr(self, "model_config", None)
+            model_config = self.model_config
             if model_config is not None:
                 archs = getattr(model_config.hf_config, "architectures", []) or []
                 if is_cross_encoding_pooler_model(archs):
