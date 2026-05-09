@@ -209,6 +209,9 @@ class Qwen3CoderDetector(BaseFormatDetector):
             self.parameter_end_token,
             self.parameter_prefix,
             self.function_end_token,
+            self.tool_call_start_token,
+            self.tool_call_end_token,
+            self.tool_call_prefix,
         ]
         for tag in closing_tags:
             if tag.startswith(suffix):
