@@ -1,8 +1,10 @@
+import os
 import unittest
 from typing import Callable, Dict
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -34,6 +36,23 @@ ROW_START_SPAN = 512
 TP_SIZES = (2, 4, 8)
 
 
+def _parse_env_bool(value: str) -> bool:
+    return value.lower() in ("1", "true", "yes", "y")
+
+
+def _is_dsa_topk_broadcast_enabled() -> bool:
+    env_value = os.getenv("SGLANG_DSA_TOPK_BROADCAST")
+    if env_value is not None:
+        return _parse_env_bool(env_value)
+
+    broadcast_env = getattr(envs, "SGLANG_DSA_TOPK_BROADCAST", None)
+    return broadcast_env is not None and broadcast_env.get()
+
+
+@unittest.skipIf(
+    _is_dsa_topk_broadcast_enabled(),
+    "Raw top-k TP stability diagnostic is skipped when RK0 broadcast is enabled.",
+)
 @unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestNSATopkTPStability(CustomTestCase):
     def setUp(self):
