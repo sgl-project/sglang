@@ -17,7 +17,17 @@ import logging
 import time
 import uuid
 from dataclasses import dataclass
-from typing import Any, Dict, List, NamedTuple, Optional, Tuple, TypeAlias, Union
+from typing import (
+    Any,
+    Dict,
+    List,
+    NamedTuple,
+    Optional,
+    Tuple,
+    TypeAlias,
+    Union,
+    get_args,
+)
 
 from openai.types.responses import (
     ResponseFunctionToolCall,
@@ -500,8 +510,14 @@ class ToolCall(BaseModel):
     function: FunctionResponse
 
 
+_GenericMessageRole = Literal[
+    "system", "assistant", "tool", "function", "developer", "latest_reminder"
+]
+_GENERIC_MESSAGE_ROLES: Tuple[str, ...] = get_args(_GenericMessageRole)
+
+
 class ChatCompletionMessageGenericParam(BaseModel):
-    role: Literal["system", "assistant", "tool", "function", "developer"]
+    role: _GenericMessageRole
     content: Union[str, List[ChatCompletionMessageContentPart], None] = Field(
         default=None
     )
@@ -516,10 +532,9 @@ class ChatCompletionMessageGenericParam(BaseModel):
     def _normalize_role(cls, v):
         if isinstance(v, str):
             v_lower = v.lower()
-            if v_lower not in {"system", "assistant", "tool", "function", "developer"}:
-                raise ValueError(
-                    "'role' must be one of 'system', 'developer', 'assistant', 'tool', or 'function' (case-insensitive)."
-                )
+            if v_lower not in _GENERIC_MESSAGE_ROLES:
+                allowed = ", ".join(repr(r) for r in _GENERIC_MESSAGE_ROLES)
+                raise ValueError(f"'role' must be one of {allowed} (case-insensitive).")
             return v_lower
         raise ValueError("'role' must be a string")
 
@@ -626,6 +641,15 @@ class ChatCompletionRequest(BaseModel):
         "in a response. 'none' defaults thinking and enable_thinking to false in "
         "chat_template_kwargs (unless explicitly overridden). Not supported in the harmony path.",
     )
+    task: Optional[
+        Literal["action", "query", "authority", "domain", "title", "read_url"]
+    ] = Field(
+        default=None,
+        description="DeepSeek-V4 quick instruction task. When set, the last "
+        "user/developer message is treated as a single-shot classification prompt "
+        "and the corresponding task special token (e.g. `<｜domain｜>`) is appended "
+        "before generation. Only honored by the dsv4 chat encoder; ignored otherwise.",
+    )
 
     # Extra parameters for SRT backend only and will be ignored by OpenAI models.
     top_k: Optional[int] = None
@@ -721,7 +745,11 @@ class ChatCompletionRequest(BaseModel):
                 ctk = values.get("chat_template_kwargs")
                 if not isinstance(ctk, dict):
                     ctk = {}
+                # different models check different keys:
+                # - "thinking" for deepseek-v3, kimi_k2
+                # - "enable_thinking" for qwen3, glm45, nemotron_3, interns1, mimo
                 ctk.setdefault("thinking", True)
+                ctk.setdefault("enable_thinking", True)
                 values["chat_template_kwargs"] = ctk
 
         if values.get("reasoning_effort") == "none":

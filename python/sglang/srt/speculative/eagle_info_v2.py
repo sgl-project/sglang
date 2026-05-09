@@ -124,7 +124,12 @@ class EagleDraftInputV2Mixin:
         num_needed_tokens = 0
         for i, r in enumerate(batch.reqs):
             cur = r.kv_allocated_len
-            nxt = r.kv_committed_len + double_alloc
+            # max(cur, ...) clamps so adaptive downswitch (smaller alloc_len_per_decode)
+            # cannot make nxt < cur and corrupt allocator state. kv_committed_len lags
+            # batch.seq_lens by ~1 verify in overlap mode, so we react to adaptive
+            # switches one batch later than a seq_lens-based baseline; the 2*alloc
+            # over-allocation buffer absorbs that lag.
+            nxt = max(cur, r.kv_committed_len + double_alloc)
             cur_kv_lens[i] = cur
             nxt_kv_lens[i] = nxt
             num_needed_tokens += nxt - cur
@@ -468,10 +473,10 @@ class EagleVerifyInputV2Mixin:
 
 
 @triton.jit
-def fill_new_verified_id(
-    verified_id,
+def fill_bonus_tokens(
+    accept_tokens,
     accept_lens,
-    new_verified_id,
+    bonus_tokens_ptr,
     num_draft_tokens: tl.constexpr,
 ):
     # NOTE: we cannot fuse any in-place operations of `accept_lens` inside this kernel
@@ -480,9 +485,9 @@ def fill_new_verified_id(
     # `accept_lens` includes the bonus token; the last accepted slot is at -1.
     accept_len = tl.load(accept_lens + pid)
 
-    verified_id_idx = num_draft_tokens * pid + accept_len - 1
-    verified_id_data = tl.load(verified_id + verified_id_idx)
-    tl.store(new_verified_id + pid, verified_id_data)
+    bonus_token_idx = num_draft_tokens * pid + accept_len - 1
+    bonus_token = tl.load(accept_tokens + bonus_token_idx)
+    tl.store(bonus_tokens_ptr + pid, bonus_token)
 
 
 @triton.jit

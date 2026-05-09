@@ -151,6 +151,24 @@ class MatchResult(NamedTuple):
     cache_protected_len: Optional[int] = None
 
 
+def zero_match_result(tree_cache, match_result: "MatchResult") -> "MatchResult":
+    root = getattr(tree_cache, "root_node", None)
+    if root is None:
+        raise RuntimeError(
+            f"SGLANG_RADIX_FORCE_MISS is not supported by {type(tree_cache).__name__} "
+            "(no `root_node` attribute). Disable the flag or use a cache backend "
+            "that exposes a tree root."
+        )
+    return match_result._replace(
+        # [:0] keeps dtype and device of the original tensor (e.g. CUDA int64)
+        # without allocating a fresh empty tensor.
+        device_indices=match_result.device_indices[:0],
+        last_device_node=root,
+        last_host_node=root,
+        host_hit_length=0,
+    )
+
+
 class BasePrefixCache(ABC, PrefixCacheTrait):
     """Cache can be indexed by either rid or key."""
 
