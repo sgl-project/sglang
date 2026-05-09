@@ -49,21 +49,24 @@ jobs:
         include:
           - cuda_key: cu129
             cuda_version: 12.9.1
-            cuda_suffix: ""
+            cuda_suffix: cu129
+            publish_default_cuda_alias: false
             hopper_sbo: 0
             w4a8_per_tensor_transfer: 0
             variant_suffix: ""
             artifact_name: sgl-kernel-x86
           - cuda_key: cu129
             cuda_version: 12.9.1
-            cuda_suffix: ""
+            cuda_suffix: cu129
+            publish_default_cuda_alias: false
             hopper_sbo: 1
             w4a8_per_tensor_transfer: 0
             variant_suffix: hopper-sbo
             artifact_name: sgl-kernel-x86
           - cuda_key: cu129
             cuda_version: 12.9.1
-            cuda_suffix: ""
+            cuda_suffix: cu129
+            publish_default_cuda_alias: false
             hopper_sbo: 0
             w4a8_per_tensor_transfer: 1
             variant_suffix: w4a8-per-tensor-transfer
@@ -71,6 +74,7 @@ jobs:
           - cuda_key: cu130
             cuda_version: 13.0.1
             cuda_suffix: cu130
+            publish_default_cuda_alias: true
             hopper_sbo: 0
             w4a8_per_tensor_transfer: 0
             variant_suffix: ""
@@ -78,6 +82,7 @@ jobs:
           - cuda_key: cu130
             cuda_version: 13.0.1
             cuda_suffix: cu130
+            publish_default_cuda_alias: true
             hopper_sbo: 1
             w4a8_per_tensor_transfer: 0
             variant_suffix: hopper-sbo
@@ -85,6 +90,7 @@ jobs:
           - cuda_key: cu130
             cuda_version: 13.0.1
             cuda_suffix: cu130
+            publish_default_cuda_alias: true
             hopper_sbo: 0
             w4a8_per_tensor_transfer: 1
             variant_suffix: w4a8-per-tensor-transfer
@@ -96,6 +102,7 @@ jobs:
       cuda_key: ${{ matrix.cuda_key }}
       cuda_version: ${{ matrix.cuda_version }}
       cuda_suffix: ${{ matrix.cuda_suffix }}
+      publish_default_cuda_alias: ${{ matrix.publish_default_cuda_alias }}
       variant_suffix: ${{ matrix.variant_suffix }}
       tag_mode: ${{ github.event_name == 'schedule' && 'nightly' || 'manual' }}
       use_environment: prod

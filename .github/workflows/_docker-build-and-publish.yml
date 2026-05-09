@@ -61,6 +61,11 @@ on:
         required: false
         type: string
         default: ""
+      publish_default_cuda_alias:
+        description: "Also publish an unsuffixed default tag for this CUDA variant"
+        required: false
+        type: boolean
+        default: false
       use_environment:
         description: "GitHub environment name (e.g. prod) or empty for none"
         required: false
@@ -91,6 +96,7 @@ jobs:
       CUDA_KEY: ${{ inputs.cuda_key }}
       CUDA_SUFFIX: ${{ inputs.cuda_suffix }}
       IMAGE_REPO: ${{ inputs.image_repo }}
+      PUBLISH_DEFAULT_CUDA_ALIAS: ${{ inputs.publish_default_cuda_alias }}
       REGISTRY_HOST: ${{ inputs.registry_host }}
       SGL_VERSION: ${{ inputs.sgl_version }}
       TAG_MODE: ${{ inputs.tag_mode }}
@@ -144,25 +150,41 @@ jobs:
         id: image-tag
         run: |
           set -euo pipefail
-          TAG_CMD=(python3 scripts/ci/get_volcengine_image_tag.py --mode "${TAG_MODE}")
-          if [ -n "${TAG_VALUE}" ]; then
-            TAG_CMD+=(--tag-value "${TAG_VALUE}")
+          resolve_tag() {
+            local cuda_suffix="$1"
+            local tag_cmd=(python3 scripts/ci/get_volcengine_image_tag.py --mode "${TAG_MODE}")
+            if [ -n "${TAG_VALUE}" ]; then
+              tag_cmd+=(--tag-value "${TAG_VALUE}")
+            fi
+            if [ -n "${VARIANT_SUFFIX}" ]; then
+              tag_cmd+=(--variant-suffix "${VARIANT_SUFFIX}")
+            fi
+            if [ -n "${cuda_suffix}" ]; then
+              tag_cmd+=(--cuda-suffix "${cuda_suffix}")
+            fi
+            "${tag_cmd[@]}"
+          }
+
+          IMAGE_TAGS=()
+          if [ "${PUBLISH_DEFAULT_CUDA_ALIAS}" = "true" ]; then
+            IMAGE_TAGS+=("$(resolve_tag "")")
           fi
-          if [ -n "${VARIANT_SUFFIX}" ]; then
-            TAG_CMD+=(--variant-suffix "${VARIANT_SUFFIX}")
-          fi
-          if [ -n "${CUDA_SUFFIX}" ]; then
-            TAG_CMD+=(--cuda-suffix "${CUDA_SUFFIX}")
-          fi
-          IMAGE_TAG="$("${TAG_CMD[@]}")"
-          echo "image-tag=${IMAGE_TAG}" >> "$GITHUB_OUTPUT"
+          IMAGE_TAGS+=("$(resolve_tag "${CUDA_SUFFIX}")")
+
+          {
+            echo "image-tags<<EOF"
+            printf '%s\n' "${IMAGE_TAGS[@]}"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Compute Docker build metadata args
+        env:
+          IMAGE_TAGS: ${{ steps.image-tag.outputs.image-tags }}
         run: |
           set -euo pipefail
           BUILD_COMMIT="$(git rev-parse HEAD)"
           BUILD_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
-          TAG_CONFIG="$(CUDA_KEY="${CUDA_KEY}" IMAGE_TAG="${{ steps.image-tag.outputs.image-tag }}" python3 -c 'import json, os; print(json.dumps([{"cuda": os.environ["CUDA_KEY"], "tags": [os.environ["IMAGE_TAG"]]}], separators=(",", ":")))')"
+          TAG_CONFIG="$(CUDA_KEY="${CUDA_KEY}" IMAGE_TAGS="${IMAGE_TAGS}" python3 -c 'import json, os; tags = [tag for tag in os.environ["IMAGE_TAGS"].splitlines() if tag]; print(json.dumps([{"cuda": os.environ["CUDA_KEY"], "tags": tags}], separators=(",", ":")))')"
           python3 scripts/ci/utils/docker_build_metadata_args.py \
             --cuda "${CUDA_KEY}" \
             --tag-config "${TAG_CONFIG}" \
@@ -241,9 +263,21 @@ jobs:
           echo "digest=${DIGEST}" >> "$GITHUB_OUTPUT"
 
       - name: Create Volcengine image tag
+        env:
+          IMAGE_TAGS: ${{ steps.image-tag.outputs.image-tags }}
         run: |
           set -euo pipefail
+          mapfile -t image_tags <<< "${IMAGE_TAGS}"
+          tag_args=()
+          for image_tag in "${image_tags[@]}"; do
+            [ -n "${image_tag}" ] || continue
+            tag_args+=(-t "${IMAGE_REPO}:${image_tag}")
+          done
+
           docker buildx imagetools create \
-            -t "${IMAGE_REPO}:${{ steps.image-tag.outputs.image-tag }}" \
+            "${tag_args[@]}" \
             "${IMAGE_REPO}@${{ steps.build.outputs.digest }}"
-          echo "Published ${IMAGE_REPO}:${{ steps.image-tag.outputs.image-tag }}"
+          for image_tag in "${image_tags[@]}"; do
+            [ -n "${image_tag}" ] || continue
+            echo "Published ${IMAGE_REPO}:${image_tag}"
+          done

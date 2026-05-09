@@ -45,7 +45,7 @@ def main() -> None:
         default="",
         help="Required for version mode; inserted after .byted.",
     )
-    parser.add_argument("--cuda-suffix", choices=["", "cu130"], default="")
+    parser.add_argument("--cuda-suffix", choices=["", "cu129", "cu130"], default="")
     parser.add_argument(
         "--variant-suffix",
         default="",
