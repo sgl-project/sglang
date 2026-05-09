@@ -1,4 +1,4 @@
-from typing import Optional, Tuple, Union
+from typing import List, Tuple, Union
 
 import numpy as np
 import torch
@@ -27,7 +27,7 @@ class HierarchyBlock(DllmAlgorithm):
         model_runner: ModelRunner,
         forward_batch: ForwardBatch,
     ) -> Tuple[
-        Union[LogitsProcessorOutput, torch.Tensor], Optional[torch.Tensor], bool
+        Union[LogitsProcessorOutput, torch.Tensor], List[torch.Tensor], bool
     ]:
         total_len = len(forward_batch.input_ids)
         block_mask = forward_batch.input_ids == self.mask_id
