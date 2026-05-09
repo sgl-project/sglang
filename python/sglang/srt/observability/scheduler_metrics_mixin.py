@@ -713,7 +713,9 @@ class SchedulerMetricsMixin:
         kv_metrics.num_requests_waiting = self.stats.num_queue_reqs.total
         kv_metrics.gpu_cache_usage_perc = self.stats.token_usage
         kv_metrics.gpu_prefix_cache_hit_rate = self.stats.cache_hit_rate
-        kv_metrics.data_parallel_rank = self.ps.dp_rank if self.ps.dp_rank is not None else 0
+        kv_metrics.data_parallel_rank = (
+            self.ps.dp_rank if self.ps.dp_rank is not None else 0
+        )
 
         if not self.send_metrics_from_scheduler.closed:
             self.send_metrics_from_scheduler.send_pyobj(kv_metrics)
