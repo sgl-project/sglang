@@ -12,7 +12,7 @@ class TestOmniImportBoundaries(unittest.TestCase):
     def test_multimodal_gen_does_not_import_omni_srt_backend(self):
         violations = _find_imports(
             PYTHON_ROOT / "sglang" / "multimodal_gen",
-            forbidden_prefixes=("sglang.omni.backends.srt", "sglang.srt.ug"),
+            forbidden_prefixes=("sglang.omni.backends.srt", "sglang.srt.omni_session"),
         )
         self.assertEqual([], _format_violations(violations))
 

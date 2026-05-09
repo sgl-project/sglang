@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 from PIL import Image
 
+from sglang.omni.entrypoints.http_api import create_srt_omni_router
 from sglang.omni.protocol import (
     OmniContextBundle,
     OmniContextRef,
@@ -186,28 +187,25 @@ class TestOmniSRTTransport(unittest.TestCase):
         self.assertEqual({"segments": []}, response.payload)
 
     async def _run_srt_http_route(self):
-        from sglang.srt.entrypoints import http_server
-
         tokenizer_manager = FakeTokenizerManager()
-        old_state = http_server.get_global_state()
-        http_server.set_global_state(
-            http_server._GlobalState(
-                tokenizer_manager=tokenizer_manager,
-                template_manager=None,
-                scheduler_info={},
+        router = create_srt_omni_router(
+            get_tokenizer_manager=lambda: tokenizer_manager,
+            validate_json_request=lambda raw_request: None,
+        )
+
+        endpoint = next(
+            route.endpoint
+            for route in router.routes
+            if route.path == "/v1/omni/generate"
+        )
+        response = await endpoint(
+            FakeRawRequest(
+                {
+                    "model": "sensenova-u1",
+                    "messages": [{"type": "text", "text": "draw"}],
+                }
             )
         )
-        try:
-            response = await http_server.omni_generate_request(
-                FakeRawRequest(
-                    {
-                        "model": "sensenova-u1",
-                        "messages": [{"type": "text", "text": "draw"}],
-                    }
-                )
-            )
-        finally:
-            http_server.set_global_state(old_state)
 
         self.assertEqual(200, response.status_code)
         self.assertEqual("draw", tokenizer_manager.obj.payload["messages"][0]["text"])
