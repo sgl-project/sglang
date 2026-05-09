@@ -121,6 +121,22 @@ __global__ void UpdateTokenTableKernel(
   }
 }
 
+__global__ void UpdateTokenTableDecodeKernel(
+    int batch_size,
+    int* tokens,          // [batch_size]
+    int* ne_token_table,  // [max_running_reqs, max_context_len]
+    int max_context_len,  // max_context_len
+    long* row_indices,    // [batch_size]
+    int* column_starts    // [batch_size]
+) {
+  for (int req_id = blockIdx.x * blockDim.x + threadIdx.x; req_id < batch_size;
+       req_id += blockDim.x * gridDim.x) {
+    const int current_token_table_index =
+        row_indices[req_id] * max_context_len + column_starts[req_id];
+    ne_token_table[current_token_table_index] = tokens[req_id];
+  }
+}
+
 }  // namespace device::ngram_embedding
 
 namespace {
@@ -289,6 +305,58 @@ struct NgramEmbeddingKernel {
         static_cast<int*>(req_lens.data_ptr()),
         ignore_token_num,
         ignore_tokens_typed_ptr);
+  }
+
+  static void update_token_table_decode(
+      const tvm::ffi::TensorView tokens,
+      const tvm::ffi::TensorView ne_token_table,
+      const tvm::ffi::TensorView row_indices,
+      const tvm::ffi::TensorView column_starts) {
+    using namespace host;
+
+    auto batch_size = SymbolicSize{"batch_size"};
+    auto device_ = SymbolicDevice{};
+
+    TensorMatcher({batch_size})  // [batch_size]
+        .with_dtype<int32_t>()
+        .with_device<kDLCUDA>(device_)
+        .verify(tokens);
+
+    TensorMatcher({-1, -1})  // [max_running_reqs, max_context_len]
+        .with_dtype<int32_t>()
+        .with_device<kDLCUDA>()
+        .verify(ne_token_table);
+
+    TensorMatcher({batch_size})  // [batch_size]
+        .with_dtype<int64_t>()
+        .with_device<kDLCUDA>()
+        .verify(row_indices);
+
+    TensorMatcher({batch_size})  // [batch_size]
+        .with_dtype<int32_t>()
+        .with_device<kDLCUDA>()
+        .verify(column_starts);
+
+    const int bs = static_cast<int>(batch_size.unwrap());
+    if (bs <= 0) {
+      return;
+    }
+
+    const int max_context_len = static_cast<int>(ne_token_table.size(1));
+    const auto stream = LaunchKernel::resolve_device(device_.unwrap());
+
+    constexpr int BLOCK_THREADS = 256;
+    const int grid_size =
+        std::min(1024, static_cast<int>(host::div_ceil(bs, BLOCK_THREADS)));
+
+    LaunchKernel(grid_size, BLOCK_THREADS, stream)(
+        device::ngram_embedding::UpdateTokenTableDecodeKernel,
+        bs,
+        static_cast<int*>(tokens.data_ptr()),
+        static_cast<int*>(ne_token_table.data_ptr()),
+        max_context_len,
+        static_cast<long*>(row_indices.data_ptr()),
+        static_cast<int*>(column_starts.data_ptr()));
   }
 };
 
