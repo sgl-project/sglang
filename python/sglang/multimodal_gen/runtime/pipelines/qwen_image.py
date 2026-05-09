@@ -107,6 +107,7 @@ class QwenImageLayeredPipeline(QwenImageEditPipeline):
     pipeline_name = "QwenImageLayeredPipeline"
 
     _required_config_modules = [
+        "text_encoder",
         "vae",
         "tokenizer",
         "processor",
@@ -118,6 +119,7 @@ class QwenImageLayeredPipeline(QwenImageEditPipeline):
         self.add_stage(
             QwenImageLayeredBeforeDenoisingStage(
                 vae=self.get_module("vae"),
+                text_encoder=self.get_module("text_encoder"),
                 tokenizer=self.get_module("tokenizer"),
                 processor=self.get_module("processor"),
                 transformer=self.get_module("transformer"),
