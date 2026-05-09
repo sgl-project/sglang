@@ -291,6 +291,14 @@ class _ProfilerTorch(_ProfilerConcreteBase):
             # Build filename with only non-zero ranks to maintain backward compatibility
             filename_parts = [self.profile_id, f"TP-{self.ps.tp_rank}"]
 
+            # Only add other ranks if parallelism is enabled (size > 1)
+            if self.ps.dp_size > 1:
+                filename_parts.append(f"DP-{self.ps.dp_rank}")
+            if self.ps.pp_size > 1:
+                filename_parts.append(f"PP-{self.ps.pp_rank}")
+            if self.ps.moe_ep_size > 1:
+                filename_parts.append(f"EP-{self.ps.moe_ep_rank}")
+
             filename = (
                 (self.output_prefix + "-" if self.output_prefix else "")
                 + "-".join(filename_parts)
