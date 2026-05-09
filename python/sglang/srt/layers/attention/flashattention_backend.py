@@ -217,11 +217,17 @@ class FlashAttentionBackend(AttentionBackend):
         # In embedding mode with no chunked prefill and radix cache disabled,
         # skip KV cache write and use flash_attn_varlen_func with raw K/V
         # instead of flash_attn_with_kvcache, bypassing paged KV cache entirely.
+        # Restricted to non-MLA backends: the read-skip elif lives inside the
+        # `if not self.use_mla:` branch in forward_extend, while the write-skip
+        # guard wraps both set_kv_buffer and set_mla_kv_buffer. Without this
+        # gate, MLA + is_embedding would skip the write but still read stale
+        # cache via get_key_buffer in the absorbed-MLA path.
         server_args = model_runner.server_args
         self.fa_skip_kv_cache = (
             server_args.is_embedding
             and server_args.chunked_prefill_size == -1
             and server_args.disable_radix_cache
+            and not self.use_mla
         )
 
         # Skip the FA3 scheduler_metadata precompute (PR #21104) under DP
