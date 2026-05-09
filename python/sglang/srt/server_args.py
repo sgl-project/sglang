@@ -2689,6 +2689,17 @@ class ServerArgs:
                     "TRTLLM MHA backend for decode is only supported on Hopper (SM90), Blackwell (SM100) and (SM120) GPUs. Please use a different decode backend."
                 )
 
+            # Check trtllm_mla backend support
+            if (
+                prefill_backend == "trtllm_mla"
+                or decode_backend == "trtllm_mla"
+                or self.attention_backend == "trtllm_mla"
+            ) and not is_sm100_supported():
+                raise ValueError(
+                    "TRTLLM MLA backend is only supported on Blackwell GPUs (SM100). "
+                    "Please use a different attention backend."
+                )
+
             if self.page_size not in [16, 32, 64]:
                 logger.warning(
                     f"TensorRT-LLM MHA only supports page_size of 16, 32 or 64, changing page_size from {self.page_size} to 64."
