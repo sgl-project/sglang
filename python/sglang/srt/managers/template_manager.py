@@ -264,7 +264,7 @@ class TemplateManager:
         self, tokenizer_manager: TokenizerManager, template_path: str
     ) -> None:
         """Load a Jinja template file."""
-        with open(template_path, "r") as f:
+        with open(template_path, "r", encoding="utf-8") as f:
             chat_template = "".join(f.readlines()).strip("\n")
         tokenizer_manager.tokenizer.chat_template = chat_template.replace("\\n", "\n")
         self._chat_template_name = None
@@ -282,7 +282,7 @@ class TemplateManager:
             ".json"
         ), "unrecognized format of chat template file"
 
-        with open(template_path, "r") as filep:
+        with open(template_path, "r", encoding="utf-8") as filep:
             template = json.load(filep)
             try:
                 sep_style = SeparatorStyle[template["sep_style"]]
@@ -311,7 +311,7 @@ class TemplateManager:
             ".json"
         ), "unrecognized format of completion template file"
 
-        with open(template_path, "r") as filep:
+        with open(template_path, "r", encoding="utf-8") as filep:
             template = json.load(filep)
             try:
                 fim_position = FimPosition[template["fim_position"]]
