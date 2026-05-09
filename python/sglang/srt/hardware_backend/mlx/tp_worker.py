@@ -40,7 +40,7 @@ class MlxTpModelWorker(TpModelWorker):
     MlxModelRunner.
     """
 
-    def _init_model_runner(self):
+    def _init_model_runner(self, nccl_port: int):
         """Create MLX runner first (auto-sizes pool), then stub with matching size."""
         from sglang.srt.hardware_backend.mlx.model_runner import MlxModelRunner
         from sglang.srt.hardware_backend.mlx.model_runner_stub import (
@@ -68,7 +68,7 @@ class MlxTpModelWorker(TpModelWorker):
             moe_ep_size=self.ep_size,
             pp_rank=self.pp_rank,
             pp_size=self.pp_size,
-            nccl_port=self.nccl_port,
+            nccl_port=nccl_port,
             dp_rank=self.dp_rank,
             server_args=self.server_args,
             is_draft_worker=self.is_draft_worker,

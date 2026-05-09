@@ -245,7 +245,6 @@ class TpModelWorker(BaseTpWorker):
         self.pp_rank = pp_rank
         self.dp_rank = dp_rank
         self.gpu_id = gpu_id
-        self.nccl_port = nccl_port
         self.is_draft_worker = is_draft_worker
         self.is_multi_layer_eagle = is_multi_layer_eagle
         self.req_to_token_pool = req_to_token_pool
@@ -259,10 +258,10 @@ class TpModelWorker(BaseTpWorker):
         self.model_runner_list: List[ModelRunner] = []
 
         self._init_model_config()
-        self._init_model_runner()
+        self._init_model_runner(nccl_port)
 
         if is_multi_layer_eagle:
-            self._init_multi_layer_eagle_model_runners()
+            self._init_multi_layer_eagle_model_runners(nccl_port)
 
         self._init_dllm_algorithm()
 
@@ -341,7 +340,7 @@ class TpModelWorker(BaseTpWorker):
             is_draft_model=self.is_draft_worker,
         )
 
-    def _init_model_runner(self):
+    def _init_model_runner(self, nccl_port: int):
         from sglang.srt.model_executor.model_runner import ModelRunner
 
         self._model_runner = ModelRunner(
@@ -354,7 +353,7 @@ class TpModelWorker(BaseTpWorker):
             moe_ep_size=self.ep_size,
             pp_rank=self.pp_rank,
             pp_size=self.pp_size,
-            nccl_port=self.nccl_port,
+            nccl_port=nccl_port,
             dp_rank=self.dp_rank,
             server_args=self.server_args,
             is_draft_worker=self.is_draft_worker,
@@ -364,7 +363,7 @@ class TpModelWorker(BaseTpWorker):
             draft_model_idx=0 if self.is_multi_layer_eagle else None,
         )
 
-    def _init_multi_layer_eagle_model_runners(self):
+    def _init_multi_layer_eagle_model_runners(self, nccl_port: int):
         from sglang.srt.model_executor.model_runner import ModelRunner
 
         self.model_runner_list.append(self.model_runner)
@@ -380,7 +379,7 @@ class TpModelWorker(BaseTpWorker):
                     moe_ep_size=self.ep_size,
                     pp_rank=self.pp_rank,
                     pp_size=self.pp_size,
-                    nccl_port=self.nccl_port,
+                    nccl_port=nccl_port,
                     dp_rank=self.dp_rank,
                     server_args=self.server_args,
                     is_draft_worker=self.is_draft_worker,
