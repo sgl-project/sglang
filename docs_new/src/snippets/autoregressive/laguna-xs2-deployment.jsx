@@ -19,14 +19,11 @@ export const LagunaXS2Deployment = () => {
     quantization: {
       name: 'quantization',
       title: 'Quantization',
-      getDynamicItems: (values) => {
-        const isBlackwell = values.hardware === 'b200';
-        return [
-          { id: 'bf16',  label: 'BF16',  default: true,  disabled: false },
-          { id: 'fp8',   label: 'FP8',   default: false, disabled: false },
-          { id: 'nvfp4', label: 'NVFP4', default: false, disabled: !isBlackwell }
-        ];
-      }
+      items: [
+        { id: 'bf16',  label: 'BF16',  default: true },
+        { id: 'fp8',   label: 'FP8',   default: false },
+        { id: 'nvfp4', label: 'NVFP4', subtitle: 'B200 only', default: false }
+      ]
     },
     reasoning: {
       name: 'reasoning',
