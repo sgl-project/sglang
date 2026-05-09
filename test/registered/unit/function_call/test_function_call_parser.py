@@ -1487,6 +1487,88 @@ class TestDeepSeekV32Detector(unittest.TestCase):
         params = json.loads(params_str)
         self.assertEqual(params["city"], "San Francisco")
 
+    def test_detect_and_parse_bare_invoke_no_wrapper(self):
+        """Bare <｜DSML｜invoke> blocks (no <｜DSML｜function_calls> wrapper) must parse.
+
+        With tool_choice="required"/named, the structural_tag grammar is
+        configured with at_least_one=True and the detector's structure_info
+        only covers the inner invoke block, so the constrained model emits
+        <｜DSML｜invoke>...</｜DSML｜invoke> without the surrounding wrapper.
+        """
+        text = (
+            "I will compute that.\n"
+            '<｜DSML｜invoke name="get_favorite_tourist_spot">\n'
+            '<｜DSML｜parameter name="city" string="true">San Francisco</｜DSML｜parameter>\n'
+            "</｜DSML｜invoke>"
+        )
+
+        result = self.detector.detect_and_parse(text, self.tools)
+
+        self.assertIn("I will compute that.", result.normal_text)
+        self.assertEqual(len(result.calls), 1)
+        call = result.calls[0]
+        self.assertEqual(call.name, "get_favorite_tourist_spot")
+        params = json.loads(call.parameters)
+        self.assertEqual(params["city"], "San Francisco")
+
+    def test_detect_and_parse_bare_invoke_json_no_wrapper(self):
+        """Bare invoke with JSON parameters (no wrapper) must parse."""
+        text = (
+            '<｜DSML｜invoke name="get_favorite_tourist_spot">\n'
+            '{"city": "San Francisco"}\n'
+            "</｜DSML｜invoke>"
+        )
+
+        result = self.detector.detect_and_parse(text, self.tools)
+
+        self.assertEqual(len(result.calls), 1)
+        call = result.calls[0]
+        self.assertEqual(call.name, "get_favorite_tourist_spot")
+        params = json.loads(call.parameters)
+        self.assertEqual(params["city"], "San Francisco")
+
+    def test_detect_and_parse_bare_invoke_with_trailing_text(self):
+        """Bare invoke with trailing assistant text must not bleed into invoke content.
+
+        Realistic when the model emits a thought after a forced call.
+        """
+        text = (
+            '<｜DSML｜invoke name="get_favorite_tourist_spot">\n'
+            '<｜DSML｜parameter name="city" string="true">San Francisco</｜DSML｜parameter>\n'
+            "</｜DSML｜invoke>\n"
+            "I have queried the spot for you."
+        )
+
+        result = self.detector.detect_and_parse(text, self.tools)
+
+        self.assertEqual(len(result.calls), 1)
+        call = result.calls[0]
+        self.assertEqual(call.name, "get_favorite_tourist_spot")
+        params = json.loads(call.parameters)
+        self.assertEqual(params, {"city": "San Francisco"})
+        self.assertNotIn("queried the spot", call.parameters)
+
+    def test_detect_and_parse_multiple_bare_invokes_no_wrapper(self):
+        """Multiple bare invoke blocks (no wrapper) must all parse."""
+        text = (
+            '<｜DSML｜invoke name="get_favorite_tourist_spot">\n'
+            '<｜DSML｜parameter name="city" string="true">San Francisco</｜DSML｜parameter>\n'
+            "</｜DSML｜invoke>\n"
+            '<｜DSML｜invoke name="search">\n'
+            '<｜DSML｜parameter name="query" string="true">WebNav</｜DSML｜parameter>\n'
+            "</｜DSML｜invoke>"
+        )
+
+        result = self.detector.detect_and_parse(text, self.tools)
+
+        self.assertEqual(len(result.calls), 2)
+        self.assertEqual(result.calls[0].name, "get_favorite_tourist_spot")
+        self.assertEqual(
+            json.loads(result.calls[0].parameters)["city"], "San Francisco"
+        )
+        self.assertEqual(result.calls[1].name, "search")
+        self.assertEqual(json.loads(result.calls[1].parameters)["query"], "WebNav")
+
     def test_detect_and_parse_no_parameters(self):
         """Test parsing function calls with no parameters (non-streaming)"""
         # Add a no-parameter tool

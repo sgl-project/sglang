@@ -173,28 +173,27 @@ class DeepSeekV32Detector(BaseFormatDetector):
         :param tools: List of available tools.
         :return: ParseResult indicating success or failure, consumed text, leftover text, and parsed calls.
         """
-        idx = text.find(self.bot_token)
-        normal_text = text[:idx].strip() if idx != -1 else text
-        if self.bot_token not in text:
-            return StreamingParseResult(normal_text=normal_text, calls=[])
+        # The bare-invoke form (no <｜DSML｜function_calls> wrapper) occurs when
+        # tool_choice="required"/named installs a structural_tag with
+        # at_least_one=True, which constrains output to a single structure_info
+        # match — the invoke block alone.
+        bot_idx = text.find(self.bot_token)
+        invoke_idx = text.find("<｜DSML｜invoke")
+
+        if bot_idx == -1 and invoke_idx == -1:
+            return StreamingParseResult(normal_text=text, calls=[])
+
+        start_idx = min(i for i in (bot_idx, invoke_idx) if i != -1)
+        normal_text = text[:start_idx].strip()
+
+        function_calls_match = re.search(self.function_calls_regex, text, re.DOTALL)
+        scan_text = (
+            function_calls_match.group(1) if function_calls_match else text[start_idx:]
+        )
 
         calls = []
         try:
-            # Extract content between function_calls tags
-            function_calls_match = re.search(
-                self.function_calls_regex,
-                text,
-                re.DOTALL,
-            )
-            if not function_calls_match:
-                return StreamingParseResult(normal_text=normal_text, calls=[])
-
-            function_calls_content = function_calls_match.group(1)
-
-            # Find all invoke blocks
-            invoke_matches = re.findall(
-                self.invoke_regex, function_calls_content, re.DOTALL
-            )
+            invoke_matches = re.findall(self.invoke_regex, scan_text, re.DOTALL)
 
             for func_name, invoke_content, _ in invoke_matches:
                 # Parse parameters from XML format
