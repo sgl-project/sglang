@@ -11,7 +11,7 @@ fi
 export GDRCOPY_HOME=/usr/src/gdrdrv-2.5.1/
 export CUDA_HOME=/usr/local/cuda
 
-GRACE_BLACKWELL=${GRACE_BLACKWELL:-0}
+BLACKWELL=${BLACKWELL:-0}
 # Detect architecture
 ARCH=$(uname -m)
 if [ "$ARCH" != "x86_64" ] && [ "$ARCH" != "aarch64" ]; then
@@ -120,12 +120,12 @@ if [ "$INSTALL_DEEPEP" = "1" ]; then
     # Install DeepEP
     DEEPEP_DIR=/root/.cache/deepep
     rm -rf ${DEEPEP_DIR}
-    if [ "$GRACE_BLACKWELL" = "1" ]; then
-        # We use Tom's DeepEP fork for GB200 for now, which supports fp4 dispatch.
-        GRACE_BLACKWELL_DEEPEP_BRANCH=gb200_blog_part_2
+    if [ "$BLACKWELL" = "1" ]; then
+        # We use Tom's DeepEP fork for Blackwell for now, which supports fp4 dispatch.
+        BLACKWELL_DEEPEP_BRANCH=gb200_blog_part_2
         git clone https://github.com/fzyzcjy/DeepEP.git ${DEEPEP_DIR} && \
         pushd ${DEEPEP_DIR} && \
-        git checkout ${GRACE_BLACKWELL_DEEPEP_BRANCH} && \
+        git checkout ${BLACKWELL_DEEPEP_BRANCH} && \
         sed -i 's/#define NUM_CPU_TIMEOUT_SECS 100/#define NUM_CPU_TIMEOUT_SECS 1000/' csrc/kernels/configs.cuh && \
         popd
     else
@@ -136,7 +136,7 @@ if [ "$INSTALL_DEEPEP" = "1" ]; then
     fi
 
     cd ${DEEPEP_DIR}
-    if [ "$GRACE_BLACKWELL" = "1" ]; then
+    if [ "$BLACKWELL" = "1" ]; then
         # Resolve the toolkit CUDA version. Preference order:
         #   1. $NVCC_VER inherited from the sourced ci_install_dependency.sh
         #      (both scripts agree on the detected value, no re-detection cost).
@@ -159,7 +159,7 @@ if [ "$INSTALL_DEEPEP" = "1" ]; then
             # CUDA > 12.8 supports sm_103 (Blackwell)
             CHOSEN_TORCH_CUDA_ARCH_LIST='10.0;10.3'
         else
-            echo "Unsupported CUDA version for Grace Blackwell: $CUDA_VERSION" && exit 1
+            echo "Unsupported CUDA version for Blackwell: $CUDA_VERSION" && exit 1
         fi && \
         if [ "${CUDA_VERSION%%.*}" = "13" ]; then \
             sed -i "/^    include_dirs = \['csrc\/'\]/a\    include_dirs.append('${CUDA_HOME}/include/cccl')" setup.py; \
