@@ -81,11 +81,16 @@ class ParallelExecutor(PipelineExecutor):
                     torch.distributed.barrier()
 
                 elif paradigm == StageParallelismType.CFG_PARALLEL:
-                    obj_list = [batch] if rank == 0 else []
+                    src_rank = cfg_group.ranks[0]
+                    is_src_rank = cfg_group.rank == src_rank
+                    obj_list = [batch] if is_src_rank else []
                     broadcasted_list = broadcast_pyobj(
-                        obj_list, rank=rank, dist_group=cfg_group.cpu_group, src=0
+                        obj_list,
+                        rank=cfg_group.rank,
+                        dist_group=cfg_group.cpu_group,
+                        src=src_rank,
                     )
-                    if rank != 0:
+                    if not is_src_rank:
                         batch = broadcasted_list[0]
                     self.before_stage(stage, stage_index, batch, server_args)
                     batch = stage(batch, server_args)
