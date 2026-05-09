@@ -699,6 +699,10 @@ class Req(ReqDllmMixin):
         # the branching point seqlen to track mamba state. If set, given by prefix match,
         # it will be the tracked seqlen in the ping pong buffer for the right prefill pass.
         self.mamba_branching_seqlen: Optional[int] = None
+        # Deferred COW: source mamba pool index from radix cache node (copy on forward stream)
+        self.mamba_cow_src_index: Optional[torch.Tensor] = None
+        # Deferred clear: newly allocated mamba slot needs zeroing on forward stream
+        self.mamba_needs_clear: bool = False
 
         # Check finish
         self.tokenizer = None
@@ -1261,6 +1265,8 @@ class Req(ReqDllmMixin):
         self.mamba_next_track_idx = None
         self.mamba_last_track_seqlen = None
         self.mamba_branching_seqlen = None
+        self.mamba_cow_src_index = None
+        self.mamba_needs_clear = False
         self.already_computed = 0
         self.kv_allocated_len = 0
         self.kv_committed_len = 0
@@ -1413,9 +1419,14 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     output_ids: torch.Tensor = None  # shape: [b], int64
 
     # For hybrid GDN prefix cache
+    mamba_cache_indices: torch.Tensor = None  # shape: [b], int32
     mamba_track_indices: torch.Tensor = None  # shape: [b], int64
     mamba_track_mask: torch.Tensor = None  # shape: [b], bool
     mamba_track_seqlens: torch.Tensor = None  # shape: [b], int64
+    # Deferred mamba init ops: COW pairs and clear indices (performed on forward stream)
+    mamba_cow_src_indices: torch.Tensor = None
+    mamba_cow_dst_indices: torch.Tensor = None
+    mamba_clear_indices: torch.Tensor = None
 
     # For multimodal inputs
     multimodal_inputs: Optional[List] = None
@@ -1974,6 +1985,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 device=self.device,
             )
 
+        # Collect mamba init info for deferred ops on forward stream
+        if any(req.mamba_pool_idx is not None for req in reqs):
+            self._collect_mamba_init_info(reqs)
+
         if self.model_config.is_encoder_decoder:
             self.prepare_encoder_info_extend(input_ids, seq_lens)
 
@@ -2062,6 +2077,48 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     mamba_track_seqlen_aligned = req.mamba_branching_seqlen
             req.mamba_last_track_seqlen = mamba_track_seqlen_aligned
         mamba_track_seqlens_cpu.append(mamba_track_seqlen)
+
+    def _collect_mamba_init_info(self, reqs):
+        """Collect mamba cache indices and deferred COW/clear info from requests."""
+        _pin = is_pin_memory_available(self.device)
+        mamba_indices = []
+        cow_src = []
+        cow_dst = []
+        clear_indices = []
+        for req in reqs:
+            mamba_indices.append(req.mamba_pool_idx.item())
+            if req.mamba_cow_src_index is not None:
+                cow_src.append(req.mamba_cow_src_index.item())
+                cow_dst.append(req.mamba_pool_idx.item())
+                req.mamba_cow_src_index = None
+                req.mamba_needs_clear = False
+            elif req.mamba_needs_clear:
+                clear_indices.append(req.mamba_pool_idx.item())
+                req.mamba_needs_clear = False
+        self.mamba_cache_indices = torch.tensor(
+            mamba_indices, dtype=torch.int32, pin_memory=_pin
+        ).to(self.device, non_blocking=True)
+        self.mamba_cow_src_indices = (
+            torch.tensor(cow_src, dtype=torch.int64, pin_memory=_pin).to(
+                self.device, non_blocking=True
+            )
+            if cow_src
+            else None
+        )
+        self.mamba_cow_dst_indices = (
+            torch.tensor(cow_dst, dtype=torch.int64, pin_memory=_pin).to(
+                self.device, non_blocking=True
+            )
+            if cow_dst
+            else None
+        )
+        self.mamba_clear_indices = (
+            torch.tensor(clear_indices, dtype=torch.int64, pin_memory=_pin).to(
+                self.device, non_blocking=True
+            )
+            if clear_indices
+            else None
+        )
 
     def prepare_for_split_prefill(self):
         self.prepare_for_extend()
@@ -2385,6 +2442,15 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 .to(device=self.device, non_blocking=True)
             )
 
+        # Collect mamba cache indices for decode (no COW/clear needed)
+        if any(req.mamba_pool_idx is not None for req in self.reqs):
+            self.mamba_cache_indices = torch.stack(
+                [req.mamba_pool_idx for req in self.reqs]
+            ).to(dtype=torch.int32, device=self.device)
+            self.mamba_cow_src_indices = None
+            self.mamba_cow_dst_indices = None
+            self.mamba_clear_indices = None
+
     def maybe_wait_verify_done(self):
         if self.is_spec_v2:
             draft_input: EagleDraftInput = self.spec_info
@@ -2446,9 +2512,13 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         if self.output_ids is not None:
             self.output_ids = self.output_ids[keep_indices_device]
 
+        self.mamba_cache_indices = None
         self.mamba_track_indices = None
         self.mamba_track_mask = None
         self.mamba_track_seqlens = None
+        self.mamba_cow_src_indices = None
+        self.mamba_cow_dst_indices = None
+        self.mamba_clear_indices = None
         self.return_logprob = any(req.return_logprob for req in self.reqs)
         if self.return_logprob:
             self.top_logprobs_nums = [self.top_logprobs_nums[i] for i in keep_indices]
@@ -2501,6 +2571,15 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.seq_lens_sum += other.seq_lens_sum
         if self.output_ids is not None:
             self.output_ids = torch.cat([self.output_ids, other.output_ids])
+        if (
+            self.mamba_cache_indices is not None
+            and other.mamba_cache_indices is not None
+        ):
+            self.mamba_cache_indices = torch.cat(
+                [self.mamba_cache_indices, other.mamba_cache_indices]
+            )
+        elif other.mamba_cache_indices is not None:
+            self.mamba_cache_indices = other.mamba_cache_indices
         self.mamba_track_indices = None
         self.mamba_track_mask = None
         self.mamba_track_seqlens = None
@@ -2604,9 +2683,13 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             dllm_config=self.dllm_config,
             reqs=self.reqs,
             has_grammar=self.has_grammar,
+            mamba_cache_indices=self.mamba_cache_indices,
             mamba_track_indices=self.mamba_track_indices,
             mamba_track_mask=self.mamba_track_mask,
             mamba_track_seqlens=self.mamba_track_seqlens,
+            mamba_cow_src_indices=self.mamba_cow_src_indices,
+            mamba_cow_dst_indices=self.mamba_cow_dst_indices,
+            mamba_clear_indices=self.mamba_clear_indices,
         )
 
     def copy(self):
@@ -2631,9 +2714,13 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             is_prefill_only=self.is_prefill_only,
             seq_lens_cpu=self.seq_lens_cpu,
             enable_overlap=self.enable_overlap,
+            mamba_cache_indices=self.mamba_cache_indices,
             mamba_track_indices=self.mamba_track_indices,
             mamba_track_mask=self.mamba_track_mask,
             mamba_track_seqlens=self.mamba_track_seqlens,
+            mamba_cow_src_indices=self.mamba_cow_src_indices,
+            mamba_cow_dst_indices=self.mamba_cow_dst_indices,
+            mamba_clear_indices=self.mamba_clear_indices,
             dp_cooperation_info=self.dp_cooperation_info,
             prefill_stats=self.prefill_stats,
             forward_iter=self.forward_iter,
@@ -2838,6 +2925,11 @@ class ModelWorkerBatch:
     return_hidden_states_before_norm: bool = False
 
     # For mamba state tracking
+    mamba_cache_indices: Optional[torch.Tensor] = None  # shape: [b], int32
     mamba_track_indices: Optional[torch.Tensor] = None  # shape: [b], int64
     mamba_track_mask: Optional[torch.Tensor] = None  # shape: [b], bool
     mamba_track_seqlens: Optional[torch.Tensor] = None  # shape: [b], int64
+    # Deferred mamba init ops on forward stream
+    mamba_cow_src_indices: Optional[torch.Tensor] = None
+    mamba_cow_dst_indices: Optional[torch.Tensor] = None
+    mamba_clear_indices: Optional[torch.Tensor] = None

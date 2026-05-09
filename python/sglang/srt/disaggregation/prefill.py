@@ -780,13 +780,7 @@ class SchedulerDisaggregationPrefillMixin:
                 self.token_to_kv_pool_allocator.get_kvcache(), HybridLinearKVPool
             ):
                 # Mamba hybrid model: send single mamba state index
-                state_indices = [
-                    self.req_to_token_pool.req_index_to_mamba_index_mapping[
-                        req.req_pool_idx
-                    ]
-                    .cpu()
-                    .numpy()
-                ]
+                state_indices = [req.mamba_pool_idx.cpu().numpy()]
             elif isinstance(
                 self.token_to_kv_pool_allocator.get_kvcache(), BaseSWAKVPool
             ):

@@ -300,12 +300,18 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
     # The indices of output tokens in the token_to_kv_pool_swa
     out_cache_loc_swa: Optional[torch.Tensor] = None
+    # The mamba pool indices for each request in the batch
+    mamba_cache_indices: Optional[torch.Tensor] = None  # shape: [b], int32
     # The indices to track mamba state with
     mamba_track_indices: Optional[torch.Tensor] = None  # shape: [b], int64
     # The mask to track mamba state if needed
     mamba_track_mask: Optional[torch.Tensor] = None  # shape: [b], bool
     # The seqlens to track mamba state if masked, prefill only.
     mamba_track_seqlens: Optional[torch.Tensor] = None  # shape: [b], int64
+    # Deferred mamba init ops: COW pairs and clear indices (performed on forward stream)
+    mamba_cow_src_indices: Optional[torch.Tensor] = None
+    mamba_cow_dst_indices: Optional[torch.Tensor] = None
+    mamba_clear_indices: Optional[torch.Tensor] = None
 
     # Optional seq_lens on cpu
     seq_lens_cpu: Optional[torch.Tensor] = None
@@ -453,9 +459,13 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             req_pool_indices=batch.req_pool_indices,
             seq_lens=batch.seq_lens,
             out_cache_loc=batch.out_cache_loc,
+            mamba_cache_indices=batch.mamba_cache_indices,
             mamba_track_indices=batch.mamba_track_indices,
             mamba_track_mask=batch.mamba_track_mask,
             mamba_track_seqlens=batch.mamba_track_seqlens,
+            mamba_cow_src_indices=batch.mamba_cow_src_indices,
+            mamba_cow_dst_indices=batch.mamba_cow_dst_indices,
+            mamba_clear_indices=batch.mamba_clear_indices,
             mm_inputs=batch.multimodal_inputs,
             encoder_cached=batch.encoder_cached,
             encoder_lens=batch.encoder_lens,

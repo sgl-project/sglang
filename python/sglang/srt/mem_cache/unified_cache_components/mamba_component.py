@@ -89,15 +89,9 @@ class MambaComponent(TreeComponent):
                     dst_index = self.cache.req_to_token_pool.mamba_pool.alloc(1)
                     self.cache.dec_lock_ref(last_node)
                     assert dst_index is not None, "Can not alloc mamba cache"
-                self.cache.req_to_token_pool.mamba_pool.copy_from(
-                    mamba_value, dst_index
-                )
                 req.mamba_pool_idx = dst_index[0]
-            else:
-                dst_index = req.mamba_pool_idx.unsqueeze(0)
-                self.cache.req_to_token_pool.mamba_pool.copy_from(
-                    mamba_value, dst_index
-                )
+            req.mamba_cow_src_index = mamba_value
+            req.mamba_needs_clear = False
 
         # HiCache: if mamba was evicted from device but has host backup,
         # ensure host_hit_length >= 1 so load_back is triggered.
@@ -267,27 +261,29 @@ class MambaComponent(TreeComponent):
         else:
             if cache_len is None:
                 return 0
+            # Donate the mamba index to the radix cache instead of copying.
             if self.enable_mamba_extra_buffer:
                 keep_idx = self.cache.req_to_token_pool.get_mamba_ping_pong_other_idx(
                     req.mamba_next_track_idx
                 )
-                mamba_value = (
+                mamba_value_donated = (
                     req.mamba_ping_pong_track_buffer[keep_idx].unsqueeze(-1).clone()
                 )
+                new_track_slot = self.cache.req_to_token_pool.mamba_pool.alloc(1)
+                if new_track_slot is None:
+                    self.cache.evict(EvictParams(num_tokens=0, mamba_num=1))
+                    new_track_slot = self.cache.req_to_token_pool.mamba_pool.alloc(1)
+                    assert new_track_slot is not None, "Can not alloc mamba cache"
+                req.mamba_ping_pong_track_buffer[keep_idx] = new_track_slot[0]
             else:
-                mamba_value = self.cache.req_to_token_pool.get_mamba_indices(
-                    req.req_pool_idx
-                ).unsqueeze(-1)
-            mamba_value_forked = self.cache.req_to_token_pool.mamba_pool.fork_from(
-                mamba_value
-            )
-            if mamba_value_forked is None:
-                self.cache.evict(EvictParams(num_tokens=0, mamba_num=1))
-                mamba_value_forked = self.cache.req_to_token_pool.mamba_pool.fork_from(
-                    mamba_value
-                )
-                assert mamba_value_forked is not None, "Can not alloc mamba cache"
-            insert_params.mamba_value = mamba_value_forked
+                mamba_value_donated = req.mamba_pool_idx.unsqueeze(-1).clone()
+                new_idx = self.cache.req_to_token_pool.mamba_pool.alloc(1)
+                if new_idx is None:
+                    self.cache.evict(EvictParams(num_tokens=0, mamba_num=1))
+                    new_idx = self.cache.req_to_token_pool.mamba_pool.alloc(1)
+                    assert new_idx is not None, "Can not alloc mamba cache"
+                req.mamba_pool_idx = new_idx[0]
+            insert_params.mamba_value = mamba_value_donated
             return cache_len
 
     def cleanup_after_caching_req(
