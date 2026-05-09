@@ -65,5 +65,17 @@ class TestResolveFutureTokenIds:
         assert torch.equal(input_ids, expected)
 
 
+def test_resolve_future_token_ids_large_unaligned_int32() -> None:
+    map_size = 8192
+    future_map = torch.randint(0, 50000, (map_size,), dtype=torch.int32, device="cuda")
+    input_ids = torch.randint(
+        -map_size + 1, 50000, (1048578,), dtype=torch.int32, device="cuda"
+    )[1:]
+
+    expected = _reference_resolve(input_ids, future_map)
+    resolve_future_token_ids_cuda(input_ids, future_map)
+    assert torch.equal(input_ids, expected)
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v", "-s"]))
