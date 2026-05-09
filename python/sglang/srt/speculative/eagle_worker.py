@@ -485,8 +485,8 @@ class EAGLEWorker(TpModelWorker):
             set_time_batch(batch.reqs, "set_spec_draft_end_time", trace_only=True)
             set_time_batch(batch.reqs, "set_spec_verify_start_time", trace_only=True)
 
-            logits_output, verify_output, model_worker_batch, can_run_cuda_graph = (
-                self.verify(batch, spec_info)
+            logits_output, verify_output, can_run_cuda_graph = self.verify(
+                batch, spec_info
             )
 
             if get_global_tracing_enabled():
@@ -981,7 +981,7 @@ class EAGLEWorker(TpModelWorker):
         )
         batch.spec_info = res.next_draft_input
 
-        return logits_output, res, model_worker_batch, can_run_cuda_graph
+        return logits_output, res, can_run_cuda_graph
 
     def _mamba_verify_update(
         self,

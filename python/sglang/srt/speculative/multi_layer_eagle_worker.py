@@ -272,8 +272,8 @@ class MultiLayerEagleWorker(TpModelWorker):
                 self.mtp_model_runner(0).tp_group
             ), speculative_moe_backend_context():
                 spec_info = self.draft(batch)
-            logits_output, verify_output, model_worker_batch, can_run_cuda_graph = (
-                self.verify(batch, spec_info)
+            logits_output, verify_output, can_run_cuda_graph = self.verify(
+                batch, spec_info
             )
 
             with self.draft_tp_context(
@@ -593,7 +593,7 @@ class MultiLayerEagleWorker(TpModelWorker):
         )
         batch.spec_info = res.next_draft_input
 
-        return logits_output, res, model_worker_batch, can_run_cuda_graph
+        return logits_output, res, can_run_cuda_graph
 
     def forward_draft_extend(
         self,
