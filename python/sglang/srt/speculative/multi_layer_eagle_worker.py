@@ -295,9 +295,7 @@ class MultiLayerEagleWorker(TpModelWorker):
                 can_run_cuda_graph=can_run_cuda_graph,
             )
 
-    def check_forward_draft_extend_after_decode(
-        self, batch: ScheduleBatch, verify_output: EagleVerifyOutput
-    ):
+    def check_forward_draft_extend_after_decode(self, verify_output: EagleVerifyOutput):
         local_need_forward = verify_output.unfinished_accept_tokens.shape[0] > 0
         if not self.server_args.enable_dp_attention:
             return local_need_forward
