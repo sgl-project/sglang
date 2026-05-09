@@ -12,14 +12,14 @@ Use the verb form `accept` everywhere. Don't use the past-participle form `accep
 | `accepted_indices` | `accept_indices` |
 | `accepted_token_ids` | `accept_tokens` (also see Rule 3) |
 
-## Rule 2 — The extra/bonus token is `bonus_token`
+## Rule 2 — The extra/bonus token is `bonus_token` / `bonus_tokens`
 
-The "+1" token that the target model always emits in addition to verifying drafts is the **bonus token**. Always call it `bonus_token`.
+The "+1" token that the target model always emits in addition to verifying drafts is the **bonus token**. Use `bonus_token` / `bonus_tokens` per Rule 7.
 
 | Don't | Do |
 |---|---|
-| `verified_id` | `bonus_token` |
-| `output_id` (when referring to the bonus) | `bonus_token` |
+| `verified_id` / `verified_ids` | `bonus_token` / `bonus_tokens` |
+| `output_id` / `output_ids` (when referring to the bonus) | `bonus_token` / `bonus_tokens` |
 
 `req.output_ids` (the full output history of a request) is unrelated and stays as is.
 
@@ -95,13 +95,15 @@ The semantic differs by scope:
 
 ## Rule 7 — Singular vs plural
 
-Plural for any non-scalar tensor (`[bs]`-shaped, flat, or multi-dim); singular only for scalars (kernel `tl.load` results, single-int locals). Applies to all spec-decoding tensors (tokens, indices, etc.). The fixed name `bonus_token` (Rule 2) is the one singular exception even though its shape is `[bs]`.
+Plural for any non-scalar tensor (`[bs]`-shaped, flat, or multi-dim); singular only for scalars (kernel `tl.load` results, single-int locals). Applies to all spec-decoding tensors (tokens, indices, etc.).
 
 ```python
 accept_tokens: torch.Tensor     # [total_accepted] flat - plural
 accept_indices: torch.Tensor    # [bs, num_draft_tokens] - plural
 draft_tokens: torch.Tensor      # [bs * num_draft_tokens] flat - plural
+bonus_tokens: torch.Tensor      # [bs] - plural
 accept_token = tl.load(...)     # int32 scalar in a kernel iteration - singular
+bonus_token = tl.load(...)      # int32 scalar inside a kernel - singular
 ```
 
 ## Out of scope (these names stay as is)

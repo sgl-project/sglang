@@ -137,12 +137,12 @@ def select_last_verified_seed(
     draft_input: FrozenKVMTPDraftInput,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     if draft_input.num_accepted_tokens is None:
-        return draft_input.verified_id, draft_input.hidden_states
+        return draft_input.bonus_tokens, draft_input.hidden_states
 
     counts = draft_input.num_accepted_tokens.to(torch.long)
     last_indices = torch.cumsum(counts, dim=0) - 1
     return (
-        draft_input.verified_id[last_indices],
+        draft_input.bonus_tokens[last_indices],
         draft_input.hidden_states[last_indices],
     )
 

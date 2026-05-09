@@ -250,7 +250,7 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                     capture_hidden_mode=CaptureHiddenMode.LAST,
                 ),
                 logits_output=logits_output,
-                verified_id=torch.empty(0, dtype=torch.long, device=batch.device),
+                accept_tokens=torch.empty(0, dtype=torch.long, device=batch.device),
                 num_accepted_drafts_per_req_cpu=[],
                 accepted_indices=torch.full(
                     (0, self.spec_steps + 1),
@@ -465,7 +465,7 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
         # Free the KV cache for unaccepted tokens
         # TODO: fuse them
         accept_index = accept_index[accept_index != -1]
-        verified_id = predict[accept_index]
+        accept_tokens = predict[accept_index]
         evict_mask = torch.full_like(self.draft_token, True, dtype=torch.bool)
         evict_mask[accept_index] = False
         num_accepted_drafts_cpu = num_accepted_drafts.cpu()
@@ -553,7 +553,7 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
 
             draft_input = EagleDraftInput(
                 hidden_states=batch.spec_info.hidden_states[accept_index],
-                verified_id=verified_id,
+                accept_tokens=accept_tokens,
                 num_accepted_drafts=num_accepted_drafts,
                 num_accepted_tokens=num_accepted_drafts + 1,
                 num_accepted_drafts_cpu=num_accepted_drafts_list,
@@ -566,7 +566,7 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
             return EagleVerifyOutput(
                 draft_input=draft_input,
                 logits_output=logits_output,
-                verified_id=verified_id,
+                accept_tokens=accept_tokens,
                 num_accepted_drafts_per_req_cpu=draft_input.num_accepted_drafts_cpu,
                 accepted_indices=accept_index,
             )
@@ -625,7 +625,7 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                     hidden_states=batch.spec_info.hidden_states[
                         unfinished_accept_index
                     ],
-                    verified_id=predict[unfinished_accept_index],
+                    accept_tokens=predict[unfinished_accept_index],
                     num_accepted_drafts_cpu=draft_input_num_accepted_drafts_cpu,
                     num_accepted_tokens_cpu=draft_input_num_accepted_tokens_cpu,
                     num_accepted_drafts=unfinished_num_accepted_drafts,
@@ -648,7 +648,7 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
             return EagleVerifyOutput(
                 draft_input=draft_input,
                 logits_output=logits_output,
-                verified_id=verified_id,
+                accept_tokens=accept_tokens,
                 num_accepted_drafts_per_req_cpu=num_accepted_drafts_list,
                 accepted_indices=accept_index,
             )
@@ -669,7 +669,14 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
     # `num_accepted_drafts` and `num_accepted_tokens` are kept in sync:
     # `num_accepted_tokens = num_accepted_drafts + 1` (per-req, one bonus per req).
     # Storing both avoids repeated `+ 1` at every consumer (attn backends, kernels).
-    verified_id: torch.Tensor = None
+    bonus_tokens: torch.Tensor = None
+    # Flat accepted-token tensor for draft-extend, shape `[sum_accepted]`.
+    # Set right after verify and consumed by `prepare_extend_after_decode` as
+    # the extend batch's `input_ids`. Dead after that method returns.
+    # TODO: drop this field and pass `accept_tokens` directly to
+    # `prepare_extend_after_decode` as a method arg. Its lifetime is bounded
+    # by verify -> prepare_extend, no need to live on the dataclass.
+    accept_tokens: torch.Tensor = None
     num_accepted_drafts: torch.Tensor = None
     num_accepted_tokens: torch.Tensor = None
     num_accepted_drafts_cpu: List[int] = None
@@ -707,13 +714,13 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
             return
 
         # Prefill only generate 1 token.
-        assert len(self.verified_id) == len(batch.seq_lens)
+        assert len(self.bonus_tokens) == len(batch.seq_lens)
 
         pt = 0
         for i, extend_len in enumerate(batch.extend_lens):
             input_ids = batch.input_ids[pt : pt + extend_len]
             batch.input_ids[pt : pt + extend_len] = torch.cat(
-                (input_ids[1:], self.verified_id[i].reshape(1))
+                (input_ids[1:], self.bonus_tokens[i].reshape(1))
             )
             pt += extend_len
 
@@ -727,7 +734,8 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
         capture_hidden_mode: CaptureHiddenMode,
     ):
         return cls(
-            verified_id=torch.empty((0,), device=device, dtype=torch.int32),
+            bonus_tokens=torch.empty((0,), device=device, dtype=torch.int32),
+            accept_tokens=torch.empty((0,), device=device, dtype=torch.int32),
             hidden_states=torch.empty((0, hidden_size), device=device, dtype=dtype),
             topk_p=torch.empty((0, topk), device=device, dtype=torch.float32),
             topk_index=torch.empty((0, topk), device=device, dtype=torch.int64),
@@ -748,7 +756,11 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
         if batch.forward_mode.is_idle():
             return
 
-        batch.input_ids = self.verified_id
+        # `self.accept_tokens` is the flat accepted-token tensor set by
+        # `EagleVerifyInput.verify`; use it as the extend batch's `input_ids`.
+        # The kernel below populates `self.bonus_tokens` ([bs] per-req) for
+        # the next decode round.
+        batch.input_ids = self.accept_tokens
         batch.extend_lens = batch.spec_info.num_accepted_tokens_cpu
         batch.extend_num_tokens = sum(batch.extend_lens)
         batch.seq_lens = batch.spec_info.seq_lens_for_draft_extend
@@ -759,14 +771,16 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
 
         self.capture_hidden_mode = CaptureHiddenMode.LAST
         self.positions = torch.empty_like(batch.input_ids, dtype=torch.long)
-        self.verified_id = torch.empty_like(self.num_accepted_tokens, dtype=torch.int32)
+        self.bonus_tokens = torch.empty_like(
+            self.num_accepted_tokens, dtype=torch.int32
+        )
 
         create_extend_after_decode_spec_info[(len(batch.seq_lens),)](
             batch.input_ids,
             batch.seq_lens,
             self.num_accepted_tokens,
             self.positions,
-            self.verified_id,
+            self.bonus_tokens,
             next_power_of_2(max(speculative_num_steps + 1, len(batch.seq_lens))),
         )
 
@@ -821,13 +835,13 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
             self.topk_p = self.topk_p[: len(new_indices)]
             self.topk_index = self.topk_index[: len(new_indices)]
             self.hidden_states = self.hidden_states[: len(new_indices)]
-            self.verified_id = self.verified_id[: len(new_indices)]
+            self.bonus_tokens = self.bonus_tokens[: len(new_indices)]
         else:
             # in some cases(e.g draft_extend), we have not filtered the batch by `unfinished_index`
             self.topk_p = self.topk_p[new_indices]
             self.topk_index = self.topk_index[new_indices]
             self.hidden_states = self.hidden_states[new_indices]
-            self.verified_id = self.verified_id[new_indices]
+            self.bonus_tokens = self.bonus_tokens[new_indices]
 
     def merge_batch(self, spec_info: "EagleDraftInput"):
         if self.future_indices is not None:
@@ -841,7 +855,7 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
 
         if self.hidden_states is None:
             self.hidden_states = spec_info.hidden_states
-            self.verified_id = spec_info.verified_id
+            self.bonus_tokens = spec_info.bonus_tokens
             self.topk_p = spec_info.topk_p
             self.topk_index = spec_info.topk_index
             return
@@ -850,7 +864,9 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
         self.hidden_states = torch.cat(
             [self.hidden_states, spec_info.hidden_states], axis=0
         )
-        self.verified_id = torch.cat([self.verified_id, spec_info.verified_id], axis=0)
+        self.bonus_tokens = torch.cat(
+            [self.bonus_tokens, spec_info.bonus_tokens], axis=0
+        )
         self.topk_p = torch.cat([self.topk_p, spec_info.topk_p])
         self.topk_index = torch.cat([self.topk_index, spec_info.topk_index])
 
@@ -861,8 +877,8 @@ class EagleVerifyOutput:
     draft_input: EagleDraftInput
     # Logit outputs from target worker
     logits_output: LogitsProcessorOutput
-    # Accepted token ids including the bonus token
-    verified_id: torch.Tensor
+    # Accepted token ids including the bonus token (flat, [sum_accepted])
+    accept_tokens: torch.Tensor
     # Accepted token length per sequence in a batch in CPU.
     num_accepted_drafts_per_req_cpu: List[int]
     # Accepted indices from logits_output.next_token_logits
