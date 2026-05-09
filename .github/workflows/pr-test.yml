@@ -1454,7 +1454,7 @@ jobs:
       - name: Install dependencies
         timeout-minutes: 30
         run: |
-          CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/cuda/ci_install_flash_mla.sh
+          CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/cuda/ci_install_dsv4_dep.sh
 
       - name: Run test
         timeout-minutes: 30
@@ -1506,7 +1506,7 @@ jobs:
       - name: Install dependencies
         timeout-minutes: 30
         run: |
-          CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/cuda/ci_install_flash_mla.sh
+          CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/cuda/ci_install_dsv4_dep.sh
 
       - name: Run test
         timeout-minutes: 30

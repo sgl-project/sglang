@@ -1,14 +1,10 @@
-"""B200 nightly CI: DeepSeek-V4-Flash FP4 (Balanced + MaxThroughput recipes).
+"""H200 per-commit CI: DeepSeek-V4-Flash FP4 Marlin (LowLatency recipe).
 
-Two server configurations exercise the DeepEP all-to-all + DP-attention path
-that the per-commit LowLatency test does not cover.
+Launches TP=4 with Marlin FP4 MoE runner + EAGLE speculative decoding.
+Runs 12 ServerSanity probes (correctness, streaming, concurrency, determinism)
+plus a GSM8K accuracy gate.
 
-  Balanced:       TP=4, DP=4, DeepEP, EAGLE (1 step)
-  MaxThroughput:  TP=4, DP=4, DeepEP, no speculation
-
-Each class inherits 12 ServerSanity probes plus a GSM8K accuracy gate.
-
-Registry: nightly-4-gpu-b200
+Registry: stage-c-test-dsv4-8-gpu-h200 (per-commit, 8x H200 — only 4 used by TP=4)
 """
 
 import unittest
@@ -25,34 +21,64 @@ from sglang.test.test_utils import (
     try_cached_model,
 )
 
-register_cuda_ci(est_time=3600, suite="nightly-4-gpu-b200", nightly=True)
+register_cuda_ci(est_time=900, suite="stage-c-test-dsv4-8-gpu-h200")
 
 MODEL = "deepseek-ai/DeepSeek-V4-Flash"
+MODEL_FP8 = "sgl-project/DeepSeek-V4-Flash-FP8"
 SERVER_LAUNCH_TIMEOUT = 3600
 DEEPEP_CONFIG = '{"normal_dispatch":{"num_sms":96},"normal_combine":{"num_sms":96}}'
 
-_DEEPEP_ENV = {
-    "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "1024",
-}
+
+class TestDSV4FlashFP4H200(ServerSanityMixin, CustomTestCase):
+    """LowLatency recipe: TP=4, Marlin FP4, EAGLE spec decoding."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.model = try_cached_model(MODEL)
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=SERVER_LAUNCH_TIMEOUT,
+            other_args=[
+                "--trust-remote-code",
+                "--tp",
+                "4",
+                "--moe-runner-backend",
+                "marlin",
+                "--speculative-algorithm",
+                "EAGLE",
+                "--speculative-num-steps",
+                "3",
+                "--speculative-eagle-topk",
+                "1",
+                "--speculative-num-draft-tokens",
+                "4",
+            ],
+        )
+
+    @classmethod
+    def tearDownClass(cls):
+        if hasattr(cls, "process") and cls.process:
+            kill_process_tree(cls.process.pid)
+
+    def test_gsm8k(self):
+        args = SimpleNamespace(
+            base_url=self.base_url,
+            model=self.model,
+            eval_name="gsm8k",
+            api="completion",
+            max_tokens=512,
+            num_examples=200,
+            num_threads=128,
+        )
+        metrics = run_eval(args)
+        print(f"[DSV4 Flash FP4 Marlin H200] GSM8K {metrics=}")
+        self.assertGreater(metrics["score"], 0.93)
 
 
-def _gsm8k_check(test_case):
-    args = SimpleNamespace(
-        base_url=test_case.base_url,
-        model=test_case.model,
-        eval_name="gsm8k",
-        api="completion",
-        max_tokens=512,
-        num_examples=200,
-        num_threads=128,
-    )
-    metrics = run_eval(args)
-    print(f"[{type(test_case).__name__}] GSM8K {metrics=}")
-    test_case.assertGreater(metrics["score"], 0.93)
-
-
-class TestDSV4FlashFP4B200Balanced(ServerSanityMixin, CustomTestCase):
-    """Balanced recipe: TP=4, DP=4, DeepEP, EAGLE (1-step spec)."""
+class TestDSV4FlashFP8H200(ServerSanityMixin, CustomTestCase):
+    """LowLatency recipe: TP=4, Marlin FP4, EAGLE spec decoding."""
 
     @classmethod
     def setUpClass(cls):
@@ -79,10 +105,17 @@ class TestDSV4FlashFP4B200Balanced(ServerSanityMixin, CustomTestCase):
                 "1",
                 "--speculative-num-draft-tokens",
                 "2",
+                "--cuda-graph-max-bs",
+                "128",
+                "--max-running-requests",
+                "128",
                 "--deepep-config",
                 DEEPEP_CONFIG,
             ],
-            env=_DEEPEP_ENV,
+            env={
+                "SGLANG_DSV4_FP4_EXPERTS": "0",
+                "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "256",
+            },
         )
 
     @classmethod
@@ -91,42 +124,18 @@ class TestDSV4FlashFP4B200Balanced(ServerSanityMixin, CustomTestCase):
             kill_process_tree(cls.process.pid)
 
     def test_gsm8k(self):
-        _gsm8k_check(self)
-
-
-class TestDSV4FlashFP4B200MaxThroughput(ServerSanityMixin, CustomTestCase):
-    """MaxThroughput recipe: TP=4, DP=4, DeepEP, no speculation."""
-
-    @classmethod
-    def setUpClass(cls):
-        cls.model = try_cached_model(MODEL)
-        cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.process = popen_launch_server(
-            cls.model,
-            cls.base_url,
-            timeout=SERVER_LAUNCH_TIMEOUT,
-            other_args=[
-                "--trust-remote-code",
-                "--tp",
-                "4",
-                "--dp",
-                "4",
-                "--enable-dp-attention",
-                "--moe-a2a-backend",
-                "deepep",
-                "--deepep-config",
-                DEEPEP_CONFIG,
-            ],
-            env=_DEEPEP_ENV,
+        args = SimpleNamespace(
+            base_url=self.base_url,
+            model=self.model,
+            eval_name="gsm8k",
+            api="completion",
+            max_tokens=512,
+            num_examples=200,
+            num_threads=128,
         )
-
-    @classmethod
-    def tearDownClass(cls):
-        if hasattr(cls, "process") and cls.process:
-            kill_process_tree(cls.process.pid)
-
-    def test_gsm8k(self):
-        _gsm8k_check(self)
+        metrics = run_eval(args)
+        print(f"[DSV4 Flash FP4 Marlin H200] GSM8K {metrics=}")
+        self.assertGreater(metrics["score"], 0.93)
 
 
 if __name__ == "__main__":

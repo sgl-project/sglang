@@ -21,10 +21,30 @@ from sglang.test.test_utils import (
     try_cached_model,
 )
 
-register_cuda_ci(est_time=900, suite="stage-c-test-dsv4-4-gpu-b200")
+register_cuda_ci(est_time=1800, suite="stage-c-test-dsv4-4-gpu-b200")
 
 MODEL = "deepseek-ai/DeepSeek-V4-Flash"
 SERVER_LAUNCH_TIMEOUT = 3600
+DEEPEP_CONFIG = '{"normal_dispatch":{"num_sms":96},"normal_combine":{"num_sms":96}}'
+
+_DEEPEP_ENV = {
+    "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "1024",
+}
+
+
+def _gsm8k_check(test_case):
+    args = SimpleNamespace(
+        base_url=test_case.base_url,
+        model=test_case.model,
+        eval_name="gsm8k",
+        api="completion",
+        max_tokens=512,
+        num_examples=200,
+        num_threads=128,
+    )
+    metrics = run_eval(args)
+    print(f"[{type(test_case).__name__}] GSM8K {metrics=}")
+    test_case.assertGreater(metrics["score"], 0.93)
 
 
 class TestDSV4FlashFP4B200(ServerSanityMixin, CustomTestCase):
@@ -64,18 +84,50 @@ class TestDSV4FlashFP4B200(ServerSanityMixin, CustomTestCase):
             kill_process_tree(cls.process.pid)
 
     def test_gsm8k(self):
-        args = SimpleNamespace(
-            base_url=self.base_url,
-            model=self.model,
-            eval_name="gsm8k",
-            api="completion",
-            max_tokens=512,
-            num_examples=200,
-            num_threads=128,
+        _gsm8k_check(self)
+
+
+class TestDSV4FlashFP4B200Balanced(ServerSanityMixin, CustomTestCase):
+    """Balanced recipe: TP=4, DP=4, DeepEP, EAGLE (1-step spec)."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.model = try_cached_model(MODEL)
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=SERVER_LAUNCH_TIMEOUT,
+            other_args=[
+                "--trust-remote-code",
+                "--tp",
+                "4",
+                "--dp",
+                "4",
+                "--enable-dp-attention",
+                "--moe-a2a-backend",
+                "deepep",
+                "--speculative-algorithm",
+                "EAGLE",
+                "--speculative-num-steps",
+                "1",
+                "--speculative-eagle-topk",
+                "1",
+                "--speculative-num-draft-tokens",
+                "2",
+                "--deepep-config",
+                DEEPEP_CONFIG,
+            ],
+            env=_DEEPEP_ENV,
         )
-        metrics = run_eval(args)
-        print(f"[DSV4 Flash FP4 B200] GSM8K {metrics=}")
-        self.assertGreater(metrics["score"], 0.93)
+
+    @classmethod
+    def tearDownClass(cls):
+        if hasattr(cls, "process") and cls.process:
+            kill_process_tree(cls.process.pid)
+
+    def test_gsm8k(self):
+        _gsm8k_check(self)
 
 
 if __name__ == "__main__":
