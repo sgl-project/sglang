@@ -429,6 +429,20 @@ class ChatCompletionMessageContentImageURL(BaseModel):
     min_pixels: Optional[int] = None
     max_pixels: Optional[int] = None
 
+    @model_validator(mode="after")
+    def validate_pixel_range(self) -> "ChatCompletionMessageContentImageURL":
+        if self.min_pixels is not None and self.min_pixels <= 0:
+            raise ValueError("min_pixels must be a positive integer")
+        if self.max_pixels is not None and self.max_pixels <= 0:
+            raise ValueError("max_pixels must be a positive integer")
+        if (
+            self.min_pixels is not None
+            and self.max_pixels is not None
+            and self.min_pixels >= self.max_pixels
+        ):
+            raise ValueError("min_pixels must be less than max_pixels")
+        return self
+
 
 class ChatCompletionMessageContentVideoURL(BaseModel):
     url: str
