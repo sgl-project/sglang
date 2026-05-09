@@ -174,8 +174,10 @@ class GenerateReqInput(BaseReq):
     # Whether to return captured routed experts
     return_routed_experts: bool = False
     return_indexer_topk: bool = False
-    # The start location in the prompt for returning routed experts.
-    routed_experts_start_len: int = 0
+    # Absolute start position for returned routings; response covers
+    # `[routed_experts_start_len, seqlen - 1)`. Must be in [0, prompt_tokens].
+    # None = full sequence.
+    routed_experts_start_len: Optional[int] = None
 
     # The modalities of the image data [image, multi-images, video]
     modalities: Optional[List[str]] = None
@@ -654,6 +656,7 @@ class GenerateReqInput(BaseReq):
                 else self.return_hidden_states
             ),
             return_routed_experts=self.return_routed_experts,
+            routed_experts_start_len=self.routed_experts_start_len,
             return_indexer_topk=self.return_indexer_topk,
             modalities=self.modalities[i] if self.modalities else None,
             session_params=self.session_params,
@@ -730,8 +733,8 @@ class TokenizedGenerateReqInput(BaseReq):
 
     # Whether to return captured routed experts
     return_routed_experts: bool = False
-    # The start location in the prompt for returning routed experts.
-    routed_experts_start_len: int = 0
+    # See GenerateReqInput.routed_experts_start_len.
+    routed_experts_start_len: Optional[int] = None
 
     return_indexer_topk: bool = False
 

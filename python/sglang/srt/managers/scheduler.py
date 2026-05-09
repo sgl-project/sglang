@@ -2003,6 +2003,7 @@ class Scheduler(
                 require_reasoning=recv_req.require_reasoning,
                 return_hidden_states=recv_req.return_hidden_states,
                 return_routed_experts=recv_req.return_routed_experts,
+                routed_experts_start_len=recv_req.routed_experts_start_len,
                 return_indexer_topk=recv_req.return_indexer_topk,
                 eos_token_ids=self.model_config.hf_eos_token_id,
                 bootstrap_host=recv_req.bootstrap_host,
@@ -2156,6 +2157,20 @@ class Scheduler(
         if req.logprob_start_len > len(req.origin_input_ids):
             error_msg = f"{req.logprob_start_len=} is higher than the number of input tokens {len(req.origin_input_ids)=}. Please use a smaller logprob_start_len."
             req.logprob_start_len = -1
+            req.set_finish_with_abort(error_msg)
+            self._add_request_to_queue(req)
+            return
+
+        if (
+            recv_req.routed_experts_start_len is not None
+            and recv_req.routed_experts_start_len > len(req.origin_input_ids)
+        ):
+            error_msg = (
+                f"{recv_req.routed_experts_start_len=} is higher than the "
+                f"number of input tokens {len(req.origin_input_ids)=}. Please "
+                f"use a smaller routed_experts_start_len."
+            )
+            req.routed_experts_start_len = None
             req.set_finish_with_abort(error_msg)
             self._add_request_to_queue(req)
             return

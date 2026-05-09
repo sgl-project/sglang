@@ -147,10 +147,14 @@ class BaseTopkCapturer:
         req_pool_idx: int,
         seqlen: int,
         req_to_token_pool: ReqToTokenPool,
+        start_len: int = 0,
     ) -> torch.Tensor:
-        cache_pool_idx = req_to_token_pool.req_to_token[req_pool_idx][
-            : seqlen - 1
-        ].cpu()
+        start_len = max(0, min(start_len, seqlen - 1))
+        cache_pool_idx = (
+            req_to_token_pool.req_to_token[req_pool_idx][start_len : seqlen - 1]
+            .cpu()
+            .clone()
+        )
         return self.host_cache.buffer[cache_pool_idx]
 
     def on_forward_end(
