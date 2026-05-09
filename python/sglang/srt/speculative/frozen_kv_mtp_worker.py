@@ -450,7 +450,7 @@ class FrozenKVMTPWorker(TpModelWorker):
 
         # Install verify_input as `batch.spec_info` for the verify forward.
         batch.spec_info = verify_input
-        logits_output, verify_output, _, can_run_cuda_graph = self.verify(
+        logits_output, verify_output, can_run_cuda_graph = self.verify(
             batch, verify_input
         )
 
@@ -791,4 +791,4 @@ class FrozenKVMTPWorker(TpModelWorker):
         )
 
         del seq_lens_pre_verify
-        return logits_output, res, model_worker_batch, can_run_cuda_graph
+        return logits_output, res, can_run_cuda_graph
