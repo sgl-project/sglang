@@ -1409,7 +1409,8 @@ class LTX2VideoTransformer3DModel(CachableDiT, OffloadableDiTMixin):
         frequencies_precision = hf_config.get("frequencies_precision")
         if frequencies_precision is None:
             frequencies_precision = getattr(arch, "frequencies_precision", None)
-        # Diffusers/LTX configs use `frequencies_precision` for this RoPE switch.
+
+        # diffusers/LTX configs use `frequencies_precision` for this RoPE switch
         rope_double_precision = (
             str(frequencies_precision) == "float64"
             if frequencies_precision is not None
