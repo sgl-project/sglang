@@ -60,9 +60,11 @@ class OmniRequest:
     @classmethod
     def from_payload(cls, payload: dict[str, Any]) -> "OmniRequest":
         messages = tuple(
-            segment
-            if isinstance(segment, OmniInputSegment)
-            else OmniInputSegment.from_dict(segment)
+            (
+                segment
+                if isinstance(segment, OmniInputSegment)
+                else OmniInputSegment.from_dict(segment)
+            )
             for segment in payload.get("messages", ())
         )
         if not messages:

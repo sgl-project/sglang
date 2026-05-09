@@ -98,7 +98,7 @@ def build_sensenova_u1_orchestrator_from_scheduler(
     generation_executor: Any | None = None,
     server_args: Any | None = None,
 ) -> OmniCoordinator:
-    from sglang.srt.ug.sensenova_u1 import build_sensenova_u1_middle_bridge
+    from sglang.srt.omni_session.sensenova_u1 import build_sensenova_u1_middle_bridge
 
     return build_sensenova_u1_orchestrator(
         srt_bridge=build_sensenova_u1_middle_bridge(

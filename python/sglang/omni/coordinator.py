@@ -37,7 +37,9 @@ class OmniCoordinator:
             request = self.request_adapter(request)
 
         if request.max_images < 0:
-            raise ValueError(f"max_images must be non-negative, got {request.max_images}")
+            raise ValueError(
+                f"max_images must be non-negative, got {request.max_images}"
+            )
         if request.max_text_segments < 0:
             raise ValueError(
                 f"max_text_segments must be non-negative, got {request.max_text_segments}"
@@ -73,7 +75,10 @@ class OmniCoordinator:
                 if boundary.type not in {"image", "audio", "video"}:
                     raise ValueError(f"Unsupported omni boundary: {boundary.type!r}")
 
-                if boundary.type == "image" and num_generated_segments >= request.max_images:
+                if (
+                    boundary.type == "image"
+                    and num_generated_segments >= request.max_images
+                ):
                     break
 
                 generated = self.generation_backend.generate_segment(

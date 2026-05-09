@@ -120,10 +120,10 @@ from sglang.multimodal_gen.configs.sample.qwenimage import (
     QwenImageSamplingParams,
 )
 from sglang.multimodal_gen.configs.sample.sana import SanaSamplingParams
+from sglang.multimodal_gen.configs.sample.sensenova_u1 import SenseNovaU1SamplingParams
 from sglang.multimodal_gen.configs.sample.stablediffusion3 import (
     StableDiffusion3SamplingParams,
 )
-from sglang.multimodal_gen.configs.sample.sensenova_u1 import SenseNovaU1SamplingParams
 from sglang.multimodal_gen.configs.sample.wan import (
     FastWanT2V480PConfig,
     Turbo_Wan2_2_I2V_A14B_SamplingParam,

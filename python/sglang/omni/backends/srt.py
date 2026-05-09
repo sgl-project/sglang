@@ -50,9 +50,11 @@ class SRTBackedContextOps:
         *,
         sidecar_role: str | None = None,
     ) -> int | None:
-        return self.bridge.runtime.srt_request_executor.get_latest_session_position_count(
-            self.session_id,
-            sidecar_role=sidecar_role,
+        return (
+            self.bridge.runtime.srt_request_executor.get_latest_session_position_count(
+                self.session_id,
+                sidecar_role=sidecar_role,
+            )
         )
 
     def build_temporary_forward_batch(
@@ -184,8 +186,7 @@ class SRTARBackend:
                         type="text",
                         text=getattr(result, "text", "") or "",
                         token_ids=tuple(
-                            int(token_id)
-                            for token_id in metadata.pop("token_ids", ())
+                            int(token_id) for token_id in metadata.pop("token_ids", ())
                         ),
                         metadata=metadata,
                     ),

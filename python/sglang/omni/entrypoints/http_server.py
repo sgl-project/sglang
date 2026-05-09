@@ -21,7 +21,9 @@ from sglang.version import __version__
 async def lifespan(app: FastAPI):
     factory = getattr(app.state, "orchestrator_factory", None)
     if getattr(app.state, "orchestrator", None) is None:
-        app.state.orchestrator = factory() if callable(factory) else _default_orchestrator()
+        app.state.orchestrator = (
+            factory() if callable(factory) else _default_orchestrator()
+        )
     try:
         yield
     finally:

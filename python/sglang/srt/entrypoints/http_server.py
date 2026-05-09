@@ -59,6 +59,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import ORJSONResponse, Response, StreamingResponse
 
+from sglang.omni.entrypoints.http_api import create_srt_omni_router
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST, DisaggregationMode
 from sglang.srt.entrypoints.anthropic.protocol import (
@@ -124,7 +125,6 @@ from sglang.srt.managers.io_struct import (
     InitWeightsUpdateGroupReqInput,
     LoadLoRAAdapterFromTensorsReqInput,
     LoadLoRAAdapterReqInput,
-    OmniGenerateReqInput,
     OpenSessionReqInput,
     ParseFunctionCallReq,
     PauseGenerationReqInput,
@@ -1455,39 +1455,12 @@ async def separate_reasoning_request(obj: SeparateReasoningReqInput, request: Re
     return ORJSONResponse(content=response_data, status_code=200)
 
 
-@app.post("/v1/omni/generate", dependencies=[Depends(validate_json_request)])
-async def omni_generate_request(raw_request: Request):
-    payload = await raw_request.json()
-    result = await _global_state.tokenizer_manager.omni_generate(
-        OmniGenerateReqInput(payload=payload),
-        raw_request,
+app.include_router(
+    create_srt_omni_router(
+        get_tokenizer_manager=lambda: _global_state.tokenizer_manager,
+        validate_json_request=validate_json_request,
     )
-    if result.success:
-        return ORJSONResponse(content=result.payload, status_code=200)
-    return ORJSONResponse(
-        content={"error": {"message": result.message}},
-        status_code=result.status_code,
-    )
-
-
-@app.post("/v1/omni/sessions/{session_id}/close")
-async def omni_close_session_request(session_id: str, raw_request: Request):
-    payload = {"action": "close_session", "session_id": session_id}
-    if raw_request.headers.get("content-length") not in {None, "0"}:
-        body = await raw_request.json()
-        if isinstance(body, dict):
-            payload.update(body)
-            payload["session_id"] = session_id
-    result = await _global_state.tokenizer_manager.omni_generate(
-        OmniGenerateReqInput(payload=payload),
-        raw_request,
-    )
-    if result.success:
-        return ORJSONResponse(content=result.payload, status_code=200)
-    return ORJSONResponse(
-        content={"error": {"message": result.message}},
-        status_code=result.status_code,
-    )
+)
 
 
 @app.post("/pause_generation")

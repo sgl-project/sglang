@@ -51,7 +51,9 @@ class _ScriptedARBackend:
         return OmniContextBundle(
             full=OmniContextRef(
                 context_id=context_id,
-                metadata={"messages": [message.to_dict() for message in request.messages]},
+                metadata={
+                    "messages": [message.to_dict() for message in request.messages]
+                },
             )
         )
 

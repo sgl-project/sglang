@@ -522,6 +522,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     audio_data,
                     modalities,
                     use_dpsk_v32_encoding=self.use_dpsk_v32_encoding,
+                    extract_multimodal_for_string=is_multimodal,
                 )
                 msg.update(processed_msg)
 
@@ -557,6 +558,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     video_data,
                     audio_data,
                     modalities,
+                    extract_multimodal_for_string=is_multimodal,
                 )
 
                 processed_msg["content"] = normalize_tool_content(
