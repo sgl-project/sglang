@@ -140,7 +140,6 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                 last_loc,
                 len(batch.input_ids),
             )
-            self.last_loc = last_loc
 
         bs = batch.batch_size()
         assign_req_to_token_pool_func(
@@ -686,7 +685,10 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
     # shape: (b, topk)
     topk_p: torch.Tensor = None
     topk_index: torch.Tensor = None
-    # shape: (b, hidden_size)
+    # shape: (b, hidden_size) when consumed by `draft` forward (one hidden per req);
+    # shape: (total_accepted, hidden_size) when consumed by `draft_extend` forward
+    # (one hidden per accepted token). Workers maintain this invariant locally;
+    # there is no type-level guard. Don't add new readers without checking phase.
     hidden_states: torch.Tensor = None
     capture_hidden_mode: CaptureHiddenMode = CaptureHiddenMode.FULL
 
