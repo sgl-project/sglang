@@ -129,15 +129,20 @@ turn1 = {
     "messages": [
         {
             "type": "text",
-            "text": "Create one image of a blue cube on a white table, then describe it.",
+            "text": (
+                "Create a clean studio image of one matte cobalt-blue cube centered "
+                "on a white tabletop, with a plain light-gray background. After the "
+                "image, briefly describe the cube color and the table."
+            ),
         }
     ],
     "sampling_params": {
         "width": 512,
         "height": 512,
-        "num_steps": 20,
+        "num_steps": 50,
+        "seed": 223,
         "cfg_text_scale": 4.0,
-        "cfg_renorm_type": "none",
+        "cfg_renorm_type": "global",
     },
     "max_images": 1,
     "max_text_segments": 2,
@@ -155,15 +160,21 @@ turn2 = {
     "messages": [
         {
             "type": "text",
-            "text": "Now edit the previous image: make the cube red and add a green sphere.",
+            "text": (
+                "Using the previous generated image as the reference, edit it so the "
+                "cube becomes bright red and add one glossy green sphere to its "
+                "right. Keep the same tabletop, camera angle, and background."
+            ),
         }
     ],
     "sampling_params": {
         "width": 512,
         "height": 512,
-        "num_steps": 20,
+        "num_steps": 50,
+        "seed": 224,
         "cfg_text_scale": 4.0,
         "cfg_img_scale": 1.0,
+        "cfg_renorm_type": "global",
     },
     "max_images": 1,
     "max_text_segments": 2,
