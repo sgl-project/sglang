@@ -8,6 +8,7 @@ from typing import Callable, Dict, List, Optional
 
 import torch
 
+from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.managers.io_struct import ProfileReqOutput
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.server_args import get_global_server_args
@@ -28,14 +29,14 @@ logger = logging.getLogger(__name__)
 
 
 class ProfileManager:
-    def __init__(self, tp_rank: int, cpu_group, gpu_id: int):
+    def __init__(self, ps: ParallelState, cpu_group):
         self.stage_based_trigger = _StageBasedTrigger(
             on_start=self._do_start,
             on_stop=self._do_stop,
         )
-        self.tp_rank = tp_rank
+        self.ps = ps
         self.cpu_group = cpu_group
-        self.first_rank_in_node = gpu_id == get_global_server_args().base_gpu_id
+        self.first_rank_in_node = ps.gpu_id == get_global_server_args().base_gpu_id
         self.profiler_kwargs = None
         self.profiler = None
 
@@ -105,7 +106,7 @@ class ProfileManager:
         assert self.profiler is None
         self.profiler = _ProfilerBase.create(
             **self.profiler_kwargs,
-            tp_rank=self.tp_rank,
+            ps=self.ps,
             cpu_group=self.cpu_group,
             first_rank_in_node=self.first_rank_in_node,
             output_suffix=f"-{stage}" if stage else "",
@@ -240,7 +241,7 @@ class _ProfilerConcreteBase(_ProfilerBase):
         output_prefix: str,
         output_suffix: str,
         profile_id: str,
-        tp_rank: int,
+        ps: ParallelState,
         cpu_group,
         first_rank_in_node: bool,
     ):
@@ -248,7 +249,7 @@ class _ProfilerConcreteBase(_ProfilerBase):
         self.output_prefix = output_prefix
         self.output_suffix = output_suffix
         self.profile_id = profile_id
-        self.tp_rank = tp_rank
+        self.ps = ps
         self.cpu_group = cpu_group
         self.first_rank_in_node = first_rank_in_node
 
@@ -289,7 +290,7 @@ class _ProfilerTorch(_ProfilerConcreteBase):
         self.torch_profiler.stop()
         if not _is_npu:
             # Build filename with only non-zero ranks to maintain backward compatibility
-            filename_parts = [self.profile_id, f"TP-{self.tp_rank}"]
+            filename_parts = [self.profile_id, f"TP-{self.ps.tp_rank}"]
 
             # Only add other ranks if parallelism is enabled (size > 1)
             if getattr(self, "dp_size", 1) > 1:
@@ -324,7 +325,7 @@ class _ProfilerMemory(_ProfilerConcreteBase):
         memory_profile_path = os.path.join(
             self.output_dir,
             str(time.time())
-            + f"-TP-{self.tp_rank}-memory"
+            + f"-TP-{self.ps.tp_rank}-memory"
             + self.output_suffix
             + ".pickle",
         )
@@ -354,10 +355,10 @@ class _ProfilerRPD(_ProfilerConcreteBase):
 
         self.rpd_profile_path = os.path.join(
             self.output_dir,
-            "rpd-" + str(time.time()) + f"-TP-{self.tp_rank}" + ".trace.json.gz",
+            "rpd-" + str(time.time()) + f"-TP-{self.ps.tp_rank}" + ".trace.json.gz",
         )
 
-        if self.tp_rank == 0:
+        if self.ps.tp_rank == 0:
             import sqlite3
 
             from rocpd.schema import RocpdSchema
@@ -382,7 +383,7 @@ class _ProfilerRPD(_ProfilerConcreteBase):
         self.rpd_profiler.flush()
 
         torch.distributed.barrier(self.cpu_group)
-        if self.tp_rank == 0:
+        if self.ps.tp_rank == 0:
             from sglang.srt.utils.rpd_utils import rpd_to_chrome_trace
 
             rpd_to_chrome_trace("trace.rpd", self.rpd_profile_path)
