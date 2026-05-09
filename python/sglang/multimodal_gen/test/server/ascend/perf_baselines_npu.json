@@ -69,7 +69,7 @@
             "expected_e2e_ms": 20670.75,
             "expected_avg_denoise_ms": 399.24,
             "expected_median_denoise_ms": 413.41
-        }
+        },
         "flux_2_image_t2i_2npu": {
             "stages_ms": {
                 "InputValidationStage": 0.06,
@@ -257,7 +257,7 @@
             "expected_e2e_ms": 86719.57,
             "expected_avg_denoise_ms": 2068.43,
             "expected_median_denoise_ms": 2088.21
-        }
+        },
         "qwen_image_t2i_2npu": {
             "stages_ms": {
                 "InputValidationStage": 0.07,
