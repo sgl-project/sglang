@@ -571,15 +571,13 @@ class EagleDraftWorker(BaseDraftWorker):
     def _draft_extend_for_decode(
         self, batch: ModelWorkerBatch, batch_result: GenerationBatchResult
     ):
-        # Batch 2: Draft extend.
-        # `batch_result.accept_lens` already includes the bonus token, so use it
-        # directly for `num_accepted_tokens` and subtract 1 for `num_accepted_drafts`.
-        draft_extend_input = EagleDraftExtendInput(
-            hidden_states=batch_result.logits_output.hidden_states,
-            num_accepted_drafts=batch_result.accept_lens - 1,
-            num_accepted_tokens=batch_result.accept_lens,
-            num_tokens_per_req=self.speculative_num_steps + 1,
-            num_tokens_for_logprob_per_req=self.speculative_num_steps + 1,
+        # Batch 2: Draft extend. verify already built draft_extend_input with
+        # hidden_states / num_accepted_*; we only need to set the per-req
+        # padding info for this forward.
+        draft_extend_input = batch_result.next_draft_extend_input
+        draft_extend_input.num_tokens_per_req = self.speculative_num_steps + 1
+        draft_extend_input.num_tokens_for_logprob_per_req = (
+            self.speculative_num_steps + 1
         )
         select_index = (
             torch.arange(len(batch.seq_lens), device=self.device)
@@ -1025,11 +1023,8 @@ class EAGLEWorkerV2(BaseSpecWorker):
 
         # Sample
         maybe_detect_nan(logits_output.next_token_logits, "verify: target model logits")
-        (
-            predict,
-            accept_lens,
-            accept_index,
-        ) = verify_input.sample(batch, logits_output, vocab_mask)
+        verify_output, predict = verify_input.sample(batch, logits_output, vocab_mask)
+        accept_lens = verify_output.draft_extend_input.num_accepted_tokens
         new_seq_lens = batch.seq_lens + accept_lens
 
         # Update mamba state for hybrid GDN models after verification
@@ -1038,17 +1033,20 @@ class EAGLEWorkerV2(BaseSpecWorker):
             or self.target_worker.model_runner.mamba2_config is not None
         ):
             self._mamba_verify_update(
-                batch, verify_input, accept_lens, accept_index, bs
+                batch,
+                verify_input,
+                accept_lens,
+                verify_output.accepted_indices,
+                bs,
             )
 
         verify_done = torch.get_device_module(self.device).Event()
         verify_done.record()
 
         if not batch.forward_mode.is_idle():
-            accept_tokens = predict[accept_index]
             bonus_tokens = torch.empty_like(accept_lens, dtype=torch.int32)
             fill_bonus_tokens[(bs,)](
-                accept_tokens,
+                verify_output.accept_tokens,
                 accept_lens,
                 bonus_tokens,
                 self.speculative_num_draft_tokens,
@@ -1058,7 +1056,11 @@ class EAGLEWorkerV2(BaseSpecWorker):
 
         if batch.return_logprob and not batch.forward_mode.is_idle():
             compute_spec_v2_logprobs(
-                batch, logits_output, predict, accept_index, self.speculative_num_steps
+                batch,
+                logits_output,
+                predict,
+                verify_output.accepted_indices,
+                self.speculative_num_steps,
             )
 
         # Construct the next draft input
@@ -1074,6 +1076,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
             can_run_cuda_graph=can_run_cuda_graph,
             speculative_num_draft_tokens=self.speculative_num_draft_tokens,
             next_draft_input=next_draft_input,
+            next_draft_extend_input=verify_output.draft_extend_input,
             accept_lens=accept_lens,
             routed_experts_output=forward_batch_output.routed_experts_output,
             indexer_topk_output=forward_batch_output.indexer_topk_output,
