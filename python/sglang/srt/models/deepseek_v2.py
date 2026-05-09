@@ -62,11 +62,13 @@ from sglang.srt.layers.attention.nsa.utils import (
 from sglang.srt.layers.communicator import (
     LayerCommunicator,
     LayerScatterModes,
+    ScatterMode,
     enable_moe_dense_fully_dp,
     get_attn_tp_context,
 )
 from sglang.srt.layers.communicator_nsa_cp import NSACPLayerCommunicator
 from sglang.srt.layers.dp_attention import (
+    attn_tp_all_gather_into_tensor,
     get_attention_cp_rank,
     get_attention_cp_size,
     get_attention_tp_group,
@@ -2126,6 +2128,31 @@ class DeepseekV2Model(nn.Module):
             )
 
         if not self.pp_group.is_last_rank:
+            last_layer = self.layers[self.end_layer - 1]
+            if (
+                last_layer.layer_scatter_modes.layer_output_mode
+                == ScatterMode.SCATTERED
+            ):
+                attn_tp_size = get_attention_tp_size()
+                if attn_tp_size > 1:
+                    output = torch.empty(
+                        (
+                            hidden_states.shape[0] * attn_tp_size,
+                            *hidden_states.shape[1:],
+                        ),
+                        dtype=hidden_states.dtype,
+                        device=hidden_states.device,
+                    )
+                    attn_tp_all_gather_into_tensor(output, hidden_states)
+                    hidden_states = output
+                    if residual is not None:
+                        output = torch.empty(
+                            (residual.shape[0] * attn_tp_size, *residual.shape[1:]),
+                            dtype=residual.dtype,
+                            device=residual.device,
+                        )
+                        attn_tp_all_gather_into_tensor(output, residual)
+                        residual = output
             return PPProxyTensors(
                 {
                     "hidden_states": hidden_states,

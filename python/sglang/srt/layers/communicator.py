@@ -363,6 +363,19 @@ class LayerScatterModes:
     def _compute_layer_input_mode(cls, context: _LayerModeComputationContext):
         if context.layer_id == 0:
             return ScatterMode.model_input_output()
+
+        from sglang.srt.distributed.parallel_state import get_pp_group
+
+        pp_group = get_pp_group()
+        if not pp_group.is_first_rank:
+            from sglang.srt.distributed.utils import get_pp_indices
+
+            start_layer, _ = get_pp_indices(
+                context.num_layers, pp_group.rank_in_group, pp_group.world_size
+            )
+            if context.layer_id == start_layer:
+                return ScatterMode.model_input_output()
+
         return cls._compute_layer_output_mode(context.previous_layer())
 
     @classmethod
