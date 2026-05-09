@@ -952,6 +952,7 @@ def run_scheduler_process(
     finally:
         # Clean up resources to speed up shutdown
         if "scheduler" in locals():
+            scheduler.close()
             del scheduler
         gc.collect()
         if torch.cuda.is_initialized():

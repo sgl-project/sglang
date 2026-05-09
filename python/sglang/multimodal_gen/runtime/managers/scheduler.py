@@ -171,6 +171,18 @@ class Scheduler(SchedulerDisaggMixin):
                 _BATCH_METRICS_LOG_INTERVAL,
             )
 
+        self._closed = False
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        if self.receiver is not None:
+            self.receiver.close()
+            self.receiver = None
+        self._cleanup_disagg()
+        self.context.destroy(linger=0)
+
     def get_disagg_metrics(self) -> dict | None:
         """Return disagg role metrics snapshot, or None if not in disagg mode."""
         if self._disagg_metrics is None:
@@ -1102,7 +1114,10 @@ class Scheduler(SchedulerDisaggMixin):
         """
         # Pool mode: all roles use the pool event loop
         if self._disagg_role != RoleType.MONOLITHIC:
-            self._disagg_event_loop()
+            try:
+                self._disagg_event_loop()
+            finally:
+                self.close()
             return
 
         logger.debug(
@@ -1201,10 +1216,7 @@ class Scheduler(SchedulerDisaggMixin):
 
         self._log_batch_metrics_summary()
 
-        if self.receiver is not None:
-            self.receiver.close()
-        self._cleanup_disagg()
-        self.context.destroy(linger=0)
+        self.close()
 
     def _broadcast_task(self, payload: dict[str, Any]) -> None:
         """Broadcast a task to all slave worker processes."""

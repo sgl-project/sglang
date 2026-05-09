@@ -4,12 +4,14 @@ import dataclasses
 import logging
 import multiprocessing as mp
 import os
+import pickle
 import signal
 import sys
 import threading
 
 import psutil
 import uvicorn
+import zmq
 
 logging.getLogger("diffusers.quantizers.torchao.torchao_quantizer").setLevel(
     logging.ERROR
@@ -20,6 +22,7 @@ from sglang.multimodal_gen.runtime.disaggregation.orchestrator import (
 )
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.entrypoints.http_server import create_app
+from sglang.multimodal_gen.runtime.entrypoints.utils import ShutdownReq
 from sglang.multimodal_gen.runtime.managers.gpu_worker import run_scheduler_process
 from sglang.multimodal_gen.runtime.server_args import (
     ServerArgs,
@@ -88,7 +91,29 @@ def kill_process_tree(parent_pid, include_parent: bool = True, skip_pid: int = N
             pass
 
 
-def _join_or_stop_processes(processes: list[mp.Process]):
+def _request_scheduler_shutdown(server_args: ServerArgs, timeout_ms: int = 5000) -> bool:
+    context = zmq.Context()
+    socket = context.socket(zmq.REQ)
+    socket.setsockopt(zmq.LINGER, 0)
+    socket.setsockopt(zmq.RCVTIMEO, timeout_ms)
+    try:
+        socket.connect(server_args.scheduler_endpoint)
+        socket.send(pickle.dumps(ShutdownReq()))
+        socket.recv()
+        return True
+    except zmq.ZMQError:
+        logger.debug("Failed to request scheduler shutdown.", exc_info=True)
+        return False
+    finally:
+        socket.close(linger=0)
+        context.term()
+
+
+def _join_or_stop_processes(processes: list[mp.Process], server_args: ServerArgs):
+    if _request_scheduler_shutdown(server_args):
+        for process in processes:
+            process.join(timeout=30)
+
     for process in processes:
         if process.is_alive():
             os.kill(process.pid, signal.SIGINT)
@@ -106,6 +131,13 @@ def _join_or_stop_processes(processes: list[mp.Process]):
     for process in processes:
         if process.is_alive():
             process.kill()
+
+    for process in processes:
+        process.join(timeout=5)
+
+    for process in processes:
+        if not process.is_alive():
+            process.close()
 
 
 def launch_server(server_args: ServerArgs, launch_http_server: bool = True):
@@ -231,7 +263,7 @@ def launch_server(server_args: ServerArgs, launch_http_server: bool = True):
             try:
                 launch_http_server_only(server_args)
             finally:
-                _join_or_stop_processes(processes)
+                _join_or_stop_processes(processes, server_args)
 
     return processes
 

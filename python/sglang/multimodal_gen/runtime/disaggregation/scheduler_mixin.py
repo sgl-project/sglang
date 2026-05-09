@@ -1050,19 +1050,26 @@ class SchedulerDisaggMixin:
         # Shutdown RDMA push thread
         if self._rdma_push_queue is not None:
             self._rdma_push_queue.put(None)
+            self._rdma_push_queue = None
         if self._rdma_push_thread is not None:
             self._rdma_push_thread.join(timeout=5)
+            self._rdma_push_thread = None
         if self._rdma_push_zmq is not None:
             self._rdma_push_zmq.close()
+            self._rdma_push_zmq = None
         # Recv prefetch thread stops when self._running = False
         if self._recv_prefetch_thread is not None:
             self._recv_prefetch_thread.join(timeout=5)
+            self._recv_prefetch_thread = None
         if self._transfer_manager is not None:
             self._transfer_manager.cleanup()
+            self._transfer_manager = None
         if self._pool_work_pull is not None:
             self._pool_work_pull.close()
+            self._pool_work_pull = None
         if self._pool_result_push is not None:
             self._pool_result_push.close()
+            self._pool_result_push = None
 
     # ------------------------------------------------------------------
     # Transfer message handling
