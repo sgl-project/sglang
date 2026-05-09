@@ -32,6 +32,7 @@ from sglang.srt.multimodal.processors.base_processor import (
 from sglang.srt.multimodal.processors.base_processor import (
     MultimodalSpecialTokens,
 )
+from sglang.srt.utils import ImageData
 from sglang.srt.utils.video_decoder import VideoDecoderWrapper
 from sglang.utils import logger
 
@@ -519,6 +520,20 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
 
         preprocess_time = time.perf_counter()
 
+        # Extract per-request min_pixels/max_pixels from image_data items (Qwen-VL specific).
+        # When users pass min_pixels/max_pixels in the image_url content part, these override
+        # the server-level pixel range configured at startup.
+        image_pixel_kwargs = {}
+        if image_data:
+            for img in image_data:
+                if isinstance(img, ImageData):
+                    if img.min_pixels is not None:
+                        image_pixel_kwargs["min_pixels"] = img.min_pixels
+                    if img.max_pixels is not None:
+                        image_pixel_kwargs["max_pixels"] = img.max_pixels
+                    if image_pixel_kwargs:
+                        break
+
         # NOTE: for qwen3-vl, video_meta need to be passed in, since do_sample_frames is already done in preprocess_video
         if self.hf_config.model_type in (
             "qwen3_vl",
@@ -531,10 +546,11 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
                 self.mm_tokens,
                 video_metadata=video_metadata,
                 do_sample_frames=False,
+                **image_pixel_kwargs,
             )
         else:
             mm_items, input_ids, ret = self.process_and_combine_mm_data(
-                base_output, self.mm_tokens
+                base_output, self.mm_tokens, **image_pixel_kwargs
             )
 
         audio_feature_lengths = None

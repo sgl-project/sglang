@@ -487,5 +487,93 @@ class TestTemplateContentFormatDetection(CustomTestCase):
         self.assertEqual(result, "openai")
 
 
+class TestQwenVLPixelRangeExtraction(CustomTestCase):
+    """Test that min_pixels/max_pixels are extracted from image_url into ImageData."""
+
+    def test_image_url_with_min_max_pixels(self):
+        """min_pixels and max_pixels in image_url should be stored in ImageData."""
+        msg_dict = {
+            "role": "user",
+            "content": [
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": "http://example.com/image.jpg",
+                        "min_pixels": 100352,
+                        "max_pixels": 1003520,
+                    },
+                },
+                {"type": "text", "text": "Describe this image."},
+            ],
+        }
+
+        image_data = []
+        video_data = []
+        audio_data = []
+        modalities = []
+
+        process_content_for_template_format(
+            msg_dict, "openai", image_data, video_data, audio_data, modalities
+        )
+
+        self.assertEqual(len(image_data), 1)
+        self.assertEqual(image_data[0].url, "http://example.com/image.jpg")
+        self.assertEqual(image_data[0].min_pixels, 100352)
+        self.assertEqual(image_data[0].max_pixels, 1003520)
+
+    def test_image_url_without_pixel_params_defaults_to_none(self):
+        """When min_pixels/max_pixels are absent, ImageData fields should be None."""
+        msg_dict = {
+            "role": "user",
+            "content": [
+                {
+                    "type": "image_url",
+                    "image_url": {"url": "http://example.com/image.jpg"},
+                },
+            ],
+        }
+
+        image_data = []
+        video_data = []
+        audio_data = []
+        modalities = []
+
+        process_content_for_template_format(
+            msg_dict, "openai", image_data, video_data, audio_data, modalities
+        )
+
+        self.assertEqual(len(image_data), 1)
+        self.assertIsNone(image_data[0].min_pixels)
+        self.assertIsNone(image_data[0].max_pixels)
+
+    def test_image_url_partial_pixel_params(self):
+        """Only max_pixels specified; min_pixels should remain None."""
+        msg_dict = {
+            "role": "user",
+            "content": [
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": "http://example.com/image.jpg",
+                        "max_pixels": 512 * 512,
+                    },
+                },
+            ],
+        }
+
+        image_data = []
+        video_data = []
+        audio_data = []
+        modalities = []
+
+        process_content_for_template_format(
+            msg_dict, "openai", image_data, video_data, audio_data, modalities
+        )
+
+        self.assertEqual(len(image_data), 1)
+        self.assertIsNone(image_data[0].min_pixels)
+        self.assertEqual(image_data[0].max_pixels, 512 * 512)
+
+
 if __name__ == "__main__":
     unittest.main()

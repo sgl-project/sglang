@@ -166,6 +166,8 @@ def process_content_for_template_format(
                             url=image_obj["url"],
                             detail=image_obj.get("detail", "auto"),
                             max_dynamic_patch=mdp,
+                            min_pixels=image_obj.get("min_pixels", None),
+                            max_pixels=image_obj.get("max_pixels", None),
                         )
                     )
 
