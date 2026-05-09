@@ -11,7 +11,6 @@ fi
 export GDRCOPY_HOME=/usr/src/gdrdrv-2.5.1/
 export CUDA_HOME=/usr/local/cuda
 
-BLACKWELL=${BLACKWELL:-0}
 # Detect architecture
 ARCH=$(uname -m)
 if [ "$ARCH" != "x86_64" ] && [ "$ARCH" != "aarch64" ]; then
@@ -51,8 +50,8 @@ fi
 ###############################################################################
 # Install DeepEP
 ###############################################################################
-# Default to a forced rebuild so switching the BLACKWELL flag (or any other
-# build-time input) doesn't silently reuse a cached deep_ep from a prior run.
+# Default to a forced rebuild so changes to TORCH_CUDA_ARCH_LIST or any other
+# build-time input don't silently reuse a cached deep_ep from a prior run.
 INSTALL_DEEPEP=1
 if [ "${FORCE_REBUILD_DEEPEP:-1}" = "1" ]; then
     echo "FORCE_REBUILD_DEEPEP=1; uninstalling any cached deep_ep before rebuild."
@@ -122,65 +121,41 @@ if [ "$INSTALL_DEEPEP" = "1" ]; then
     # Install DeepEP
     DEEPEP_DIR=/root/.cache/deepep
     rm -rf ${DEEPEP_DIR}
-    if [ "$BLACKWELL" = "1" ]; then
-        # We use Tom's DeepEP fork for Blackwell for now, which supports fp4 dispatch.
-        # Also force-disable the CU_MEM_HANDLE_TYPE_FABRIC path: Blackwell GPUs report
-        # fabric capability via the device attribute, but cuMemCreate fails with
-        # CUDA_ERROR_NOT_PERMITTED on standalone B200 runners that don't have the
-        # NVIDIA fabric manager + IMEX channels set up (those are GB200 NVL72-only).
-        # The non-fabric cudaIpc* fallback in the same file is correctness-safe.
-        BLACKWELL_DEEPEP_BRANCH=gb200_blog_part_2
-        git clone https://github.com/fzyzcjy/DeepEP.git ${DEEPEP_DIR} && \
-        pushd ${DEEPEP_DIR} && \
-        git checkout ${BLACKWELL_DEEPEP_BRANCH} && \
-        sed -i 's/#define NUM_CPU_TIMEOUT_SECS 100/#define NUM_CPU_TIMEOUT_SECS 1000/' csrc/kernels/configs.cuh && \
-        sed -i 's/^bool support_fabric() {$/bool support_fabric() { return false;/' csrc/deep_ep.cpp && \
-        popd
-    else
-        git clone https://github.com/deepseek-ai/DeepEP.git ${DEEPEP_DIR} && \
-        pushd ${DEEPEP_DIR} && \
-        git checkout 9af0e0d0e74f3577af1979c9b9e1ac2cad0104ee && \
-        popd
-    fi
+    git clone https://github.com/deepseek-ai/DeepEP.git ${DEEPEP_DIR}
+    pushd ${DEEPEP_DIR}
+    git checkout 9af0e0d0e74f3577af1979c9b9e1ac2cad0104ee
+    popd
 
     cd ${DEEPEP_DIR}
-    if [ "$BLACKWELL" = "1" ]; then
-        # Resolve the toolkit CUDA version. Preference order:
-        #   1. $NVCC_VER inherited from the sourced ci_install_dependency.sh
-        #      (both scripts agree on the detected value, no re-detection cost).
-        #   2. Local `nvcc --version` (authoritative — container toolkit).
-        #   3. `nvidia-smi` (host driver; last resort).
-        if [ -n "${NVCC_VER:-}" ]; then
-            CUDA_VERSION="$NVCC_VER"
-        elif command -v nvcc >/dev/null 2>&1; then
-            CUDA_VERSION=$(nvcc --version | grep -oP 'release \K[0-9]+\.[0-9]+')
-        else
-            CUDA_VERSION=$(nvidia-smi | grep "CUDA Version" | head -n1 | awk '{print $9}' || true)
-        fi
-        if [ -z "${CUDA_VERSION:-}" ]; then
-            echo "FATAL: could not determine CUDA toolkit version (NVCC_VER unset, nvcc missing, nvidia-smi empty)"
-            exit 1
-        fi
-        if [ "$CUDA_VERSION" = "12.8" ]; then
-            CHOSEN_TORCH_CUDA_ARCH_LIST='10.0'
-        elif awk -v ver="$CUDA_VERSION" 'BEGIN {exit !(ver > 12.8)}'; then
-            # CUDA > 12.8 supports sm_103 (Blackwell)
-            CHOSEN_TORCH_CUDA_ARCH_LIST='10.0;10.3'
-        else
-            echo "Unsupported CUDA version for Blackwell: $CUDA_VERSION" && exit 1
-        fi && \
-        if [ "${CUDA_VERSION%%.*}" = "13" ]; then \
-            sed -i "/^    include_dirs = \['csrc\/'\]/a\    include_dirs.append('${CUDA_HOME}/include/cccl')" setup.py; \
-        fi
-        TORCH_CUDA_ARCH_LIST="${CHOSEN_TORCH_CUDA_ARCH_LIST}" ${PIP_CMD:-pip} install --no-build-isolation . ${PIP_INSTALL_SUFFIX:-}
-    else
-        # CUDA 13.0 puts CCCL headers in /usr/local/cuda/include/cccl/ but nvshmem
-        # includes them as <cuda/__cccl_config> expecting /usr/local/cuda/include/cuda/.
-        # Add the cccl path to setup.py include_dirs so the compiler finds them.
-        NVCC_MAJOR=$(nvcc --version 2>/dev/null | grep -oP 'release \K[0-9]+' || echo "0")
-        if [ "$NVCC_MAJOR" = "13" ]; then
-            sed -i "/^    include_dirs = \['csrc\/'\]/a\    include_dirs.append('${CUDA_HOME:-/usr/local/cuda}/include/cccl')" setup.py
-        fi
-        python3 setup.py install
+    # CUDA 13.0 puts CCCL headers in /usr/local/cuda/include/cccl/ but nvshmem
+    # includes them as <cuda/__cccl_config> expecting /usr/local/cuda/include/cuda/.
+    # Add the cccl path to setup.py include_dirs so the compiler finds them.
+    NVCC_MAJOR=$(nvcc --version 2>/dev/null | grep -oP 'release \K[0-9]+' || echo "0")
+    if [ "$NVCC_MAJOR" = "13" ]; then
+        sed -i "/^    include_dirs = \['csrc\/'\]/a\    include_dirs.append('${CUDA_HOME:-/usr/local/cuda}/include/cccl')" setup.py
     fi
+
+    # Build for both Hopper (sm_90) and Blackwell (sm_100) so the same wheel
+    # runs on H200 and B200 runners. Mirrors the CUDA-version-keyed list in
+    # docker/Dockerfile's DeepEP build stage.
+    if [ -n "${NVCC_VER:-}" ]; then
+        CUDA_VERSION="$NVCC_VER"
+    elif command -v nvcc >/dev/null 2>&1; then
+        CUDA_VERSION=$(nvcc --version | grep -oP 'release \K[0-9]+\.[0-9]+')
+    else
+        CUDA_VERSION=$(nvidia-smi | grep "CUDA Version" | head -n1 | awk '{print $9}' || true)
+    fi
+    if [ -z "${CUDA_VERSION:-}" ]; then
+        echo "FATAL: could not determine CUDA toolkit version (NVCC_VER unset, nvcc missing, nvidia-smi empty)"
+        exit 1
+    fi
+    if [ "$CUDA_VERSION" = "12.8" ]; then
+        CHOSEN_TORCH_CUDA_ARCH_LIST='9.0;10.0'
+    elif awk -v ver="$CUDA_VERSION" 'BEGIN {exit !(ver > 12.8)}'; then
+        # CUDA > 12.8 supports sm_103 (Blackwell)
+        CHOSEN_TORCH_CUDA_ARCH_LIST='9.0;10.0;10.3'
+    else
+        CHOSEN_TORCH_CUDA_ARCH_LIST='9.0'
+    fi
+    TORCH_CUDA_ARCH_LIST="${CHOSEN_TORCH_CUDA_ARCH_LIST}" python3 setup.py install
 fi
