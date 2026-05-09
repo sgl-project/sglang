@@ -475,7 +475,7 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
             output_dim=0,
             weight_loader=weight_loader,
         )
-
+        set_weight_attrs(weight_scale, {"missing_param_init": "ones"})
         layer.register_parameter("weight_scale", weight_scale)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
@@ -552,11 +552,15 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
         K_padded = round_up(K, 4)
         padded_scales = torch.zeros((B, M_padded, K_padded), dtype=scales.dtype)
         padded_scales[:B, :M, :K] = scales
-        # Blockwise interleave for CUTLASS TMA layout required by CUTLASS kernel
-        padded_scales = padded_scales.reshape(
-            B, M_padded // 128, 4, 32, K_padded // 4, 4
-        )
-        padded_scales = padded_scales.permute(0, 1, 4, 3, 2, 5)
+
+        _, flashinfer_backend = _get_fp4_gemm_op()
+        if flashinfer_backend is None:
+            # CUTLASS (sgl_kernel) path: blockwise interleave to TMA layout
+            padded_scales = padded_scales.reshape(
+                B, M_padded // 128, 4, 32, K_padded // 4, 4
+            )
+            padded_scales = padded_scales.permute(0, 1, 4, 3, 2, 5)
+
         padded_scales = padded_scales.contiguous().cuda()
         padded_scales = (
             padded_scales.reshape(M_padded, K_padded)

@@ -13,6 +13,126 @@ from github import Auth, Github
 PERMISSIONS_FILE_PATH = ".github/CI_PERMISSIONS.json"
 
 
+MAINTENANCE_ISSUE_NUMBER = 21065
+
+
+def _check_rebase_gate(gh_repo, pr, token):
+    """
+    Pre-dispatch gate mirroring `.github/actions/check-maintenance/action.yml`.
+
+    Without this, /rerun-stage and /rerun-test would dispatch a workflow_run
+    on a PR that's behind a required base, the action would catch it, and
+    every job in the run would fail at the gate — wasting runner time and
+    producing N error annotations instead of one comment. Pre-checking here
+    short-circuits the dispatch and posts a single explanatory comment.
+
+    Mirrors the action's two independent modes driven by issue #21065:
+      (1) Full-pause: maintenance issue is OPEN
+      (2) Rebase-required: issue body contains `MIN_BASE_SHA: <sha>`
+    Both bypassed by the `bypass-maintenance` PR label.
+
+    Returns (allowed: bool, message: Optional[str]). When allowed=False,
+    caller MUST post `message` to the PR and skip dispatch.
+    Fail-open on API errors (matches the action's behavior).
+    """
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    repo_full_name = gh_repo.full_name
+
+    try:
+        issue_resp = requests.get(
+            f"https://api.github.com/repos/{repo_full_name}/issues/{MAINTENANCE_ISSUE_NUMBER}",
+            headers=headers,
+            timeout=15,
+        )
+        if issue_resp.status_code != 200:
+            print(
+                f"check_rebase_gate: issue fetch returned {issue_resp.status_code}; fail-open"
+            )
+            return True, None
+        issue_data = issue_resp.json()
+    except Exception as e:
+        print(f"check_rebase_gate: issue fetch failed ({e}); fail-open")
+        return True, None
+
+    issue_state = (issue_data.get("state") or "").lower()
+    issue_body = issue_data.get("body") or ""
+
+    min_base_sha = None
+    # First MIN_BASE_SHA: <sha> line wins. Match the action's parser:
+    # tolerate optional backticks and either ':' or '=' separator.
+    for line in issue_body.replace("\r", "").split("\n"):
+        m = re.match(
+            r"^\s*`?MIN_BASE_SHA`?\s*[:=]\s*`?([A-Fa-f0-9]+)`?",
+            line,
+        )
+        if m:
+            candidate = m.group(1)
+            if 7 <= len(candidate) <= 40:
+                min_base_sha = candidate
+            break
+
+    gate_active = (issue_state == "open") or bool(min_base_sha)
+    if not gate_active:
+        return True, None
+
+    bypass = any(
+        (lbl.name if hasattr(lbl, "name") else lbl.get("name")) == "bypass-maintenance"
+        for lbl in pr.get_labels()
+    )
+    if bypass:
+        print("check_rebase_gate: PR has bypass-maintenance label; allowing dispatch")
+        return True, None
+
+    if issue_state == "open":
+        msg = (
+            "## ⚠️ CI Maintenance Mode is Active\n"
+            "The CI infrastructure is currently under maintenance. "
+            "All PR CI runs are paused until maintenance is complete. "
+            "**Merging non-CI-fix PRs is prohibited during maintenance mode.**\n\n"
+            f"Follow [issue #{MAINTENANCE_ISSUE_NUMBER}]"
+            f"(https://github.com/{repo_full_name}/issues/{MAINTENANCE_ISSUE_NUMBER}) "
+            "for status updates. Re-run was not dispatched."
+        )
+        return False, msg
+
+    # MIN_BASE_SHA set, issue not OPEN — check rebase status.
+    pr_head_sha = pr.head.sha
+    try:
+        compare_resp = requests.get(
+            f"https://api.github.com/repos/{repo_full_name}/compare/{min_base_sha}...{pr_head_sha}",
+            headers=headers,
+            timeout=15,
+        )
+        if compare_resp.status_code != 200:
+            print(
+                f"check_rebase_gate: compare API returned {compare_resp.status_code}; fail-open"
+            )
+            return True, None
+        status = compare_resp.json().get("status", "unknown")
+    except Exception as e:
+        print(f"check_rebase_gate: compare API failed ({e}); fail-open")
+        return True, None
+
+    if status in ("ahead", "identical"):
+        return True, None
+
+    msg = (
+        "## ⚠️ Rebase Required Before Re-run\n"
+        f"A major update has landed on `main`. Your PR is `{status}` relative "
+        f"to required base commit `{min_base_sha[:12]}`.\n\n"
+        "**Re-run was not dispatched.** What to do:\n"
+        "- Rebase your branch onto the latest `main` and push again\n"
+        f"- Follow [issue #{MAINTENANCE_ISSUE_NUMBER}]"
+        f"(https://github.com/{repo_full_name}/issues/{MAINTENANCE_ISSUE_NUMBER}) for context\n"
+        "- CI-fix PRs may request the `bypass-maintenance` label to skip this check"
+    )
+    return False, msg
+
+
 def find_workflow_run_url(
     gh_repo,
     workflow_id,
@@ -303,7 +423,6 @@ def handle_rerun_stage(
         "stage-c-test-8-gpu-h200",
         "stage-c-test-8-gpu-h20",
         "stage-c-test-4-gpu-b200",
-        "stage-c-test-4-gpu-b200-small",
         "stage-c-test-4-gpu-gb200",
         "stage-c-test-deepep-4-gpu-h100",
         "stage-c-test-deepep-8-gpu-h200",
@@ -344,6 +463,12 @@ def handle_rerun_stage(
             + "\n".join(f"- `{s}`" for s in amd_stages)
             + "\n\nOther stages will be added soon. For now, use `/rerun-failed-ci` for those stages."
         )
+        return False
+
+    allowed, gate_msg = _check_rebase_gate(gh_repo, pr, token)
+    if not allowed:
+        comment.create_reaction("confused")
+        pr.create_issue_comment(gate_msg)
         return False
 
     try:
@@ -486,9 +611,8 @@ CUDA_SUITE_TO_RUNNER = {
     "stage-c-test-8-gpu-h200": "8-gpu-h200",
     "stage-c-test-8-gpu-h20": "8-gpu-h20",
     "stage-c-test-4-gpu-b200": "4-gpu-b200",
-    "stage-c-test-4-gpu-b200-small": "4-gpu-b200-low-disk",
     "stage-c-test-deepep-4-gpu-h100": "4-gpu-h100",
-    "stage-c-test-deepep-8-gpu-h200": "8-gpu-h200",
+    "stage-c-test-deepep-8-gpu-h200": "8-gpu-h200-deepep",
     # Nightly test suites (NVIDIA)
     "nightly-1-gpu": "1-gpu-h100",
     "nightly-4-gpu": "4-gpu-h100",
@@ -521,6 +645,49 @@ MULTIMODAL_PATH_TO_RUNNER = {
     "2-gpu": "2-gpu-h100",
 }
 MULTIMODAL_DEFAULT_RUNNER = "1-gpu-h100"
+
+
+def _known_test_groups():
+    groups = []
+    for group_dir in glob.glob("test/registered/*"):
+        if os.path.isdir(group_dir):
+            groups.append(os.path.basename(group_dir))
+    return sorted(groups)
+
+
+def resolve_test_group_specs(group_name):
+    """
+    Resolve a test group name into /rerun-test specs.
+
+    A group maps to a directory under test/registered/. For example,
+    "hicache" maps to all test_*.py files under test/registered/hicache/.
+
+    Returns (test_specs, error_message). On success error_message is None.
+    """
+    group_name = group_name.strip().strip("/")
+    if (
+        not group_name
+        or group_name.startswith(".")
+        or "/." in group_name
+        or ".." in group_name.split("/")
+    ):
+        return [], f"Invalid test group `{group_name}`."
+
+    group_dir = os.path.join("test", "registered", group_name)
+    if not os.path.isdir(group_dir):
+        known = ", ".join(f"`{g}`" for g in _known_test_groups())
+        return (
+            [],
+            f"Unknown test group `{group_name}`.\n\nKnown groups: {known}",
+        )
+
+    test_files = sorted(
+        glob.glob(os.path.join(group_dir, "**", "test_*.py"), recursive=True)
+    )
+    if not test_files:
+        return [], f"No registered test files found in `{group_dir}`."
+
+    return [os.path.relpath(path, "test") for path in test_files], None
 
 
 def resolve_test_file(file_part):
@@ -842,23 +1009,21 @@ def _dispatch_batch(gh_repo, pr, batch, token):
         }
 
 
-def handle_rerun_test(gh_repo, pr, comment, user_perms, test_specs, token):
+def _check_rerun_test_permissions(gh_repo, pr, comment, user_perms, command_name):
     """
-    Handles the /rerun-test command. Resolves all test specs, groups them by
-    (runner_label, use_deepep, is_cpu), and dispatches one workflow per group.
+    Check permissions shared by /rerun-test and /rerun-group.
     """
-    # SECURITY: For fork PRs, only allow /rerun-test if the commenter has write+ permission.
-    # This command checks out and executes code from the PR branch on self-hosted GPU
-    # runners, so we must ensure the commenter is a trusted collaborator.
+    # SECURITY: These commands check out and execute code from the PR branch on
+    # self-hosted GPU runners, so fork PRs require a trusted collaborator.
     is_fork = pr.head.repo is None or pr.head.repo.owner.login != gh_repo.owner.login
     if is_fork:
         commenter = comment.user.login
         perm = gh_repo.get_collaborator_permission(commenter)
         if perm not in ("admin", "write"):
-            print(f"Permission denied: /rerun-test on fork PR by {commenter}.")
+            print(f"Permission denied: /{command_name} on fork PR by {commenter}.")
             comment.create_reaction("confused")
             pr.create_issue_comment(
-                "❌ `/rerun-test` is not available for fork PRs unless the commenter "
+                f"❌ `/{command_name}` is not available for fork PRs unless the commenter "
                 "has write permission on the repo.\n\n"
                 "Please ask a maintainer to run this command, or use the normal CI flow."
             )
@@ -872,6 +1037,21 @@ def handle_rerun_test(gh_repo, pr, comment, user_perms, test_specs, token):
         print("Permission denied: neither can_rerun_test nor can_rerun_stage is true.")
         return False
 
+    return True
+
+
+def handle_rerun_test(
+    gh_repo, pr, comment, user_perms, test_specs, token, skip_permission_check=False
+):
+    """
+    Handles the /rerun-test command. Resolves all test specs, groups them by
+    (runner_label, use_deepep, is_cpu), and dispatches one workflow per group.
+    """
+    if not skip_permission_check and not _check_rerun_test_permissions(
+        gh_repo, pr, comment, user_perms, "rerun-test"
+    ):
+        return False
+
     if not test_specs:
         comment.create_reaction("confused")
         pr.create_issue_comment(
@@ -882,6 +1062,12 @@ def handle_rerun_test(gh_repo, pr, comment, user_perms, test_specs, token):
             "- `/rerun-test test_srt_endpoint.py`\n"
             "- `/rerun-test test_a.py test_b.py test_c.py` (multiple tests)"
         )
+        return False
+
+    allowed, gate_msg = _check_rebase_gate(gh_repo, pr, token)
+    if not allowed:
+        comment.create_reaction("confused")
+        pr.create_issue_comment(gate_msg)
         return False
 
     # Phase 1: Resolve all specs
@@ -957,6 +1143,56 @@ def handle_rerun_test(gh_repo, pr, comment, user_perms, test_specs, token):
 
     pr.create_issue_comment(body)
     return len(successes) > 0
+
+
+def handle_rerun_group(gh_repo, pr, comment, user_perms, group_names, token):
+    """
+    Handles the /rerun-group command. Expands one or more registered test
+    groups into test file specs, then reuses /rerun-test dispatch behavior.
+    """
+    if not _check_rerun_test_permissions(
+        gh_repo, pr, comment, user_perms, "rerun-group"
+    ):
+        return False
+
+    if not group_names:
+        comment.create_reaction("confused")
+        pr.create_issue_comment(
+            "❌ Please specify a test group: `/rerun-group <group>`\n\n"
+            "Example:\n"
+            "- `/rerun-group hicache`"
+        )
+        return False
+
+    test_specs = []
+    failures = []
+    seen = set()
+    for group_name in group_names:
+        specs, err = resolve_test_group_specs(group_name)
+        if err:
+            failures.append((group_name, err))
+            continue
+
+        for spec in specs:
+            if spec not in seen:
+                test_specs.append(spec)
+                seen.add(spec)
+
+    if failures:
+        comment.create_reaction("confused")
+        lines = [f"❌ `{group}`: {err}" for group, err in failures]
+        pr.create_issue_comment("\n\n".join(lines))
+        return False
+
+    return handle_rerun_test(
+        gh_repo,
+        pr,
+        comment,
+        user_perms,
+        test_specs,
+        token,
+        skip_permission_check=True,
+    )
 
 
 def main():
@@ -1039,6 +1275,10 @@ def main():
         parts = first_line.split(maxsplit=1)
         stage_name = parts[1].strip() if len(parts) > 1 else None
         handle_rerun_stage(repo, pr, comment, user_perms, stage_name, token)
+
+    elif first_line.startswith("/rerun-group"):
+        group_names = first_line.split()[1:]
+        handle_rerun_group(repo, pr, comment, user_perms, group_names or None, token)
 
     elif first_line.startswith("/rerun-test"):
         test_specs = first_line.split()[1:]

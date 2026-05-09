@@ -224,6 +224,16 @@ class FlashAttentionBackend(AttentionBackend):
             and server_args.disable_radix_cache
         )
 
+        # Skip the FA3 scheduler_metadata precompute (PR #21104) under DP
+        # attention. The precomputed buffer can become inconsistent with the
+        # num_splits the C++ mha_fwd kernel derives from live cache_seqlens
+        # during decode, leading to an OOB read in the split-KV combine kernel
+        # (flash_fwd_combine_launch_template.h:52). Leaving scheduler_metadata
+        # unset uses the existing per-layer metadata path.
+        self._disable_scheduler_metadata_precompute = bool(
+            getattr(server_args, "enable_dp_attention", False)
+        )
+
     def _compute_scheduler_metadata(
         self, batch_size, max_seq_len_k, cache_seqlens, cu_seqlens_q
     ):
@@ -232,6 +242,8 @@ class FlashAttentionBackend(AttentionBackend):
         Returns the scheduler_metadata tensor, or None if not applicable.
         """
         if self._get_scheduler_metadata is None or self.use_mla:
+            return None
+        if self._disable_scheduler_metadata_precompute:
             return None
         # Always use window_size=(-1, -1) because scheduler_metadata is only
         # consumed by non-SWA layers (SWA layers skip it in forward_decode).
@@ -2144,14 +2156,14 @@ class FlashAttentionBackend(AttentionBackend):
             metadata.cu_seqlens_k[1:].copy_(
                 torch.cumsum(metadata.cache_seqlens_int32, dim=0, dtype=torch.int32)
             )
-            accept_length = spec_info.accept_length[:bs]
-            if spec_info.accept_length_cpu:
-                metadata.max_seq_len_q = max(spec_info.accept_length_cpu) + 1
+            extend_lens = spec_info.num_accepted_tokens[:bs]
+            if spec_info.num_accepted_tokens_cpu:
+                metadata.max_seq_len_q = max(spec_info.num_accepted_tokens_cpu)
             else:
                 metadata.max_seq_len_q = 1
 
             metadata.cu_seqlens_q[1:].copy_(
-                torch.cumsum(accept_length, dim=0, dtype=torch.int32)
+                torch.cumsum(extend_lens, dim=0, dtype=torch.int32)
             )
 
             max_seq_pages = (

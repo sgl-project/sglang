@@ -389,3 +389,50 @@ def hash_str_to_int64(hash_str: str) -> int:
     if uint64_val >= 2**63:
         return uint64_val - 2**64
     return uint64_val
+
+
+def compute_node_hash_values(node: Any, page_size: int) -> List[str]:
+    """Compute SHA256-based hash values for position-aware KV block IDs."""
+    hash_values = []
+
+    parent_hash = None
+    if node.parent is not None and node.parent.hash_value is not None:
+        if len(node.parent.key) > 0 and len(node.parent.hash_value) > 0:
+            parent_hash = node.parent.hash_value[-1]
+
+    logical_len = len(node.key)
+    for start in range(0, logical_len, page_size):
+        end = min(start + page_size, logical_len)
+        if end <= start:
+            continue
+        hash_val = node.key.hash_page(start, end, parent_hash)
+        hash_values.append(hash_val)
+        parent_hash = hash_val
+    return hash_values
+
+
+def split_node_hash_value(
+    child_hash_value: Optional[List[str]], split_len: int, page_size: int
+) -> tuple[Optional[List[str]], Optional[List[str]]]:
+    """Split hash_value between parent and child nodes during node splitting.
+
+    Args:
+        child_hash_value: The hash_value list from the child node being split
+        split_len: The length at which to split (in tokens)
+        page_size: The page size for calculating number of pages
+
+    Returns:
+        Tuple of (new_node_hash_value, updated_child_hash_value)
+    """
+    if child_hash_value is None:
+        return None, None
+
+    if page_size == 1:
+        split_pages = split_len
+    else:
+        split_pages = split_len // page_size
+
+    new_node_hash = child_hash_value[:split_pages]
+    child_hash = child_hash_value[split_pages:]
+
+    return new_node_hash, child_hash
