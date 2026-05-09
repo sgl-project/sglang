@@ -282,17 +282,16 @@ class MultiLayerEagleWorker(TpModelWorker):
             ), speculative_moe_backend_context():
                 # NOTE: We should use `check_forward_draft_extend_after_decode`
                 # when DP attention is enabled, but it is slow. Skip it for now.
+                draft_extend_input = verify_output.draft_extend_input
                 if (
                     self.server_args.enable_dp_attention
-                    or verify_output.unfinished_accept_tokens.shape[0] > 0
+                    or draft_extend_input.input_ids.shape[0] > 0
                 ):
                     # decode is not finished
                     # Install draft_extend_input for the extend forward, then
                     # install the assembled next-iter EagleDraftInput it returns.
-                    batch.spec_info = verify_output.draft_extend_input
-                    next_draft_input = self.forward_draft_extend_after_decode(
-                        batch, verify_output
-                    )
+                    batch.spec_info = draft_extend_input
+                    next_draft_input = self.forward_draft_extend_after_decode(batch)
                     batch.spec_info = next_draft_input
 
             return GenerationBatchResult(
@@ -305,7 +304,7 @@ class MultiLayerEagleWorker(TpModelWorker):
     def check_forward_draft_extend_after_decode(
         self, batch: ScheduleBatch, verify_output: EagleVerifyOutput
     ):
-        local_need_forward = verify_output.unfinished_accept_tokens.shape[0] > 0
+        local_need_forward = verify_output.draft_extend_input.input_ids.shape[0] > 0
         if not self.server_args.enable_dp_attention:
             return local_need_forward
 
@@ -661,7 +660,7 @@ class MultiLayerEagleWorker(TpModelWorker):
         forward_batch.spec_info.topk_index = torch.cat(topk_index_list, dim=1)
 
     def forward_draft_extend_after_decode(
-        self, batch: ScheduleBatch, verify_output: EagleVerifyOutput
+        self, batch: ScheduleBatch
     ) -> EagleDraftInput:
         draft_extend_input: EagleDraftExtendInput = batch.spec_info
 
@@ -673,7 +672,7 @@ class MultiLayerEagleWorker(TpModelWorker):
 
         input_is_idle = batch.forward_mode.is_idle()
 
-        if not input_is_idle and verify_output.unfinished_accept_tokens.numel() == 0:
+        if not input_is_idle and draft_extend_input.input_ids.numel() == 0:
             batch = batch.copy()
             batch.prepare_for_idle()
             hidden_size = (
@@ -694,7 +693,6 @@ class MultiLayerEagleWorker(TpModelWorker):
         draft_extend_input.num_tokens_for_logprob_per_req = 1
         draft_extend_input.prepare_extend_after_decode(
             batch,
-            verify_output=verify_output,
             speculative_num_steps=self.speculative_num_steps,
         )
         batch.forward_mode = (

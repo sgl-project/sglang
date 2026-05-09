@@ -504,17 +504,16 @@ class EAGLEWorker(TpModelWorker):
             ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
                 # NOTE: We should use `check_forward_draft_extend_after_decode`
                 # when DP attention is enabled, but it is slow. Skip it for now.
+                draft_extend_input = verify_output.draft_extend_input
                 if (
                     self.server_args.enable_dp_attention
-                    or verify_output.unfinished_accept_tokens.shape[0] > 0
+                    or draft_extend_input.input_ids.shape[0] > 0
                 ):
                     # decode is not finished
                     # Install draft_extend_input for the extend forward, then
                     # install the assembled next-iter EagleDraftInput it returns.
-                    batch.spec_info = verify_output.draft_extend_input
-                    next_draft_input = self.forward_draft_extend_after_decode(
-                        batch, verify_output
-                    )
+                    batch.spec_info = draft_extend_input
+                    next_draft_input = self.forward_draft_extend_after_decode(batch)
                     batch.spec_info = next_draft_input
 
             set_time_batch(
@@ -537,7 +536,7 @@ class EAGLEWorker(TpModelWorker):
     def check_forward_draft_extend_after_decode(
         self, batch: ScheduleBatch, verify_output: EagleVerifyOutput
     ):
-        local_need_forward = verify_output.unfinished_accept_tokens.shape[0] > 0
+        local_need_forward = verify_output.draft_extend_input.input_ids.shape[0] > 0
         if not self.server_args.enable_dp_attention:
             return local_need_forward
 
@@ -1113,7 +1112,7 @@ class EAGLEWorker(TpModelWorker):
         self.capture_for_decode(logits_output, forward_batch.spec_info)
 
     def forward_draft_extend_after_decode(
-        self, batch: ScheduleBatch, verify_output: EagleVerifyOutput
+        self, batch: ScheduleBatch
     ) -> EagleDraftInput:
         draft_extend_input: EagleDraftExtendInput = batch.spec_info
 
@@ -1125,7 +1124,7 @@ class EAGLEWorker(TpModelWorker):
 
         input_is_idle = batch.forward_mode.is_idle()
 
-        if not input_is_idle and verify_output.unfinished_accept_tokens.numel() == 0:
+        if not input_is_idle and draft_extend_input.input_ids.numel() == 0:
             # All reqs finished this verify; swap to an idle ExtendInput.
             batch = batch.copy()
             batch.prepare_for_idle()
@@ -1148,7 +1147,6 @@ class EAGLEWorker(TpModelWorker):
         draft_extend_input.num_tokens_for_logprob_per_req = 1
         draft_extend_input.prepare_extend_after_decode(
             batch,
-            verify_output=verify_output,
             speculative_num_steps=self.speculative_num_steps,
         )
         batch.forward_mode = (
@@ -1193,9 +1191,7 @@ class EAGLEWorker(TpModelWorker):
             logits_output = self.draft_model_runner.forward(
                 forward_batch, skip_attn_backend_init=True
             ).logits_output
-            # Non-cuda-graph path: compute topk_p / topk_index inline (used to be
-            # `capture_for_decode` which mutated spec_info; we instead carry the
-            # values to next-iter `EagleDraftInput` assembly below).
+            # Non-cuda-graph path: compute topk_p / topk_index inline.
             probs = torch.softmax(logits_output.next_token_logits, dim=-1)
             topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
             hidden_states = logits_output.hidden_states
