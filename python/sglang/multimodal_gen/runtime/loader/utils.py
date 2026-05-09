@@ -177,6 +177,11 @@ def hf_to_custom_state_dict(
 
 class skip_init_modules:
     def __enter__(self):
+        from transformers.initialization import no_init_weights
+
+        self._hf_no_init = no_init_weights()
+        self._hf_no_init.__enter__()
+
         # Save originals
         self._orig_reset = {}
         for cls in (nn.Linear, nn.Conv1d, nn.Conv2d, nn.Conv3d):
@@ -187,6 +192,7 @@ class skip_init_modules:
         # restore originals
         for cls, orig in self._orig_reset.items():
             cls.reset_parameters = orig
+        self._hf_no_init.__exit__(exc_type, exc_value, traceback)
 
 
 def _normalize_component_type(module_type: str) -> str:
