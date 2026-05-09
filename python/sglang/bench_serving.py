@@ -30,15 +30,6 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, AsyncGenerator, Callable, Dict, List, Optional, Tuple, Union
 
-from sglang.benchmark.datasets import DatasetRow, get_dataset
-from sglang.benchmark.datasets.mooncake import get_mooncake_request_over_time
-from sglang.benchmark.utils import (
-    get_tokenizer,
-    parse_custom_headers,
-    remove_prefix,
-    set_ulimit,
-)
-
 import aiohttp
 import numpy as np
 import requests
@@ -321,9 +312,7 @@ async def async_request_openai_completions(
 
                                 # Decoding phase
                                 else:
-                                    output.text_chunks.append(
-                                        choices[0]["text"]
-                                    )
+                                    output.text_chunks.append(choices[0]["text"])
                                     output.itl.append(timestamp - most_recent_timestamp)
 
                                 most_recent_timestamp = timestamp

@@ -85,23 +85,27 @@ def sample_multimodal_requests(
                     break
             if question is None:
                 continue
-            parsed.append((
-                question,
-                data.get("images", []),
-                data.get("audios", []),
-                data.get("videos", []),
-            ))
+            parsed.append(
+                (
+                    question,
+                    data.get("images", []),
+                    data.get("audios", []),
+                    data.get("videos", []),
+                )
+            )
         else:
             # Format: {"question": ..., "image_urls": [...], ...}
             question = data.get("question")
             if question is None:
                 continue
-            parsed.append((
-                question,
-                data.get("image_urls", []),
-                data.get("audio_urls", []),
-                data.get("video_urls", []),
-            ))
+            parsed.append(
+                (
+                    question,
+                    data.get("image_urls", []),
+                    data.get("audio_urls", []),
+                    data.get("video_urls", []),
+                )
+            )
     dataset = parsed
     if random_sample:
         random.shuffle(dataset)
@@ -143,5 +147,6 @@ def sample_multimodal_requests(
                 image_data=image_data_list,
                 audio_data=audio_data_list,
                 video_data=video_data_list,
-            ))
+            )
+        )
     return input_requests
