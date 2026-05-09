@@ -69,6 +69,54 @@ __global__ void timestep_embedding_kernel(
   }
 }
 
+template <bool kFlipSinToCos, typename TIn>
+__global__ void timestep_embedding_sincos_kernel(
+    const TIn* __restrict__ t_ptr,
+    float* __restrict__ output_ptr,
+    int dim,
+    float neg_log_max_period,
+    float scale,
+    int batch_size) {
+  int row_idx = static_cast<int>(blockIdx.x * blockDim.y + threadIdx.y);
+  if (row_idx >= batch_size) {
+    return;
+  }
+
+  float t_val = device::cast<float>(t_ptr[row_idx]);
+  float* output_batch_base_ptr = output_ptr + row_idx * dim;
+
+  int half_dim = dim / 2;
+  int thread_offset = static_cast<int>(threadIdx.x);
+  while (thread_offset * 4 < half_dim) {
+    float4* top_half;
+    float4* bottom_half;
+    if constexpr (!kFlipSinToCos) {
+      bottom_half = reinterpret_cast<float4*>(output_batch_base_ptr + thread_offset * 4);
+      top_half = reinterpret_cast<float4*>(output_batch_base_ptr + half_dim + thread_offset * 4);
+    } else {
+      top_half = reinterpret_cast<float4*>(output_batch_base_ptr + thread_offset * 4);
+      bottom_half = reinterpret_cast<float4*>(output_batch_base_ptr + half_dim + thread_offset * 4);
+    }
+
+    float4 vals;
+    vals.x = scale * t_val * device::math::exp(neg_log_max_period * __int2float_rn(thread_offset * 4 + 0));
+    vals.y = scale * t_val * device::math::exp(neg_log_max_period * __int2float_rn(thread_offset * 4 + 1));
+    vals.z = scale * t_val * device::math::exp(neg_log_max_period * __int2float_rn(thread_offset * 4 + 2));
+    vals.w = scale * t_val * device::math::exp(neg_log_max_period * __int2float_rn(thread_offset * 4 + 3));
+
+    float4 sin_vals;
+    float4 cos_vals;
+    sincosf(vals.x, &sin_vals.x, &cos_vals.x);
+    sincosf(vals.y, &sin_vals.y, &cos_vals.y);
+    sincosf(vals.z, &sin_vals.z, &cos_vals.z);
+    sincosf(vals.w, &sin_vals.w, &cos_vals.w);
+    *top_half = cos_vals;
+    *bottom_half = sin_vals;
+
+    thread_offset += static_cast<int>(blockDim.x);
+  }
+}
+
 template <typename TIn>
 inline void launch_timestep_embedding(
     const tvm::ffi::TensorView t,
@@ -97,9 +145,31 @@ inline void launch_timestep_embedding(
 
   const DLDevice device = output.device();
 
-  if (flip_sin_to_cos) {
+  // sincosf is profitable for large batches where trig work dominates launch
+  // overhead. Keep smaller and very wide cases on the original sinf/cosf path.
+  const bool use_sincos = batch_size >= 16384 && dim <= 1024;
+
+  if (flip_sin_to_cos && use_sincos) {
+    LaunchKernel(grid, block, device)(
+        timestep_embedding_sincos_kernel<true, TIn>,
+        static_cast<const TIn*>(t.data_ptr()),
+        static_cast<float*>(output.data_ptr()),
+        dim,
+        neg_log_max_period,
+        scale,
+        batch_size);
+  } else if (flip_sin_to_cos) {
     LaunchKernel(grid, block, device)(
         timestep_embedding_kernel<true, TIn>,
+        static_cast<const TIn*>(t.data_ptr()),
+        static_cast<float*>(output.data_ptr()),
+        dim,
+        neg_log_max_period,
+        scale,
+        batch_size);
+  } else if (use_sincos) {
+    LaunchKernel(grid, block, device)(
+        timestep_embedding_sincos_kernel<false, TIn>,
         static_cast<const TIn*>(t.data_ptr()),
         static_cast<float*>(output.data_ptr()),
         dim,
