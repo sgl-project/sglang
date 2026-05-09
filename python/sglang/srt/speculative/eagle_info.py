@@ -556,7 +556,7 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                 next_draft_input=next_draft_input,
                 logits_output=logits_output,
                 accept_tokens=accept_tokens,
-                next_extend_input_ids=accept_tokens,
+                unfinished_accept_tokens=accept_tokens,
                 seq_lens_for_draft_extend=batch.seq_lens,
                 seq_lens_for_draft_extend_cpu=batch.seq_lens_cpu,
                 req_pool_indices_for_draft_extend=batch.req_pool_indices,
@@ -614,7 +614,7 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                 unfinished_num_accepted_drafts = num_accepted_drafts[
                     unfinished_index_device
                 ]
-                next_extend_input_ids = predict[unfinished_accept_index]
+                unfinished_accept_tokens = predict[unfinished_accept_index]
                 seq_lens_for_draft_extend = batch.seq_lens[unfinished_index_device]
                 seq_lens_for_draft_extend_cpu = batch.seq_lens_cpu[unfinished_index]
                 req_pool_indices_for_draft_extend = batch.req_pool_indices[
@@ -629,7 +629,7 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                     num_accepted_tokens=unfinished_num_accepted_drafts + 1,
                 )
             else:
-                next_extend_input_ids = torch.empty(
+                unfinished_accept_tokens = torch.empty(
                     (0,), dtype=accept_tokens.dtype, device=accept_tokens.device
                 )
                 seq_lens_for_draft_extend = torch.empty(
@@ -655,7 +655,7 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                 next_draft_input=next_draft_input,
                 logits_output=logits_output,
                 accept_tokens=accept_tokens,
-                next_extend_input_ids=next_extend_input_ids,
+                unfinished_accept_tokens=unfinished_accept_tokens,
                 seq_lens_for_draft_extend=seq_lens_for_draft_extend,
                 seq_lens_for_draft_extend_cpu=seq_lens_for_draft_extend_cpu,
                 req_pool_indices_for_draft_extend=req_pool_indices_for_draft_extend,
@@ -760,7 +760,7 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
         # not from `self`. The kernel below populates `self.bonus_tokens`
         # ([bs] per-req) for the next decode round; that is the only state on
         # `self` that survives past this method.
-        batch.input_ids = verify_output.next_extend_input_ids
+        batch.input_ids = verify_output.unfinished_accept_tokens
         batch.extend_lens = batch.spec_info.num_accepted_tokens_cpu
         batch.extend_num_tokens = sum(batch.extend_lens)
         batch.seq_lens = verify_output.seq_lens_for_draft_extend
@@ -888,7 +888,7 @@ class EagleVerifyOutput:
     # Subset of `accept_tokens` for reqs continuing into next iter's draft-extend
     # forward (= `accept_tokens` when no req finished; flat over unfinished
     # reqs only otherwise). Becomes `batch.input_ids` for that forward pass.
-    next_extend_input_ids: torch.Tensor
+    unfinished_accept_tokens: torch.Tensor
     # `batch.seq_lens` / `batch.seq_lens_cpu` / `batch.req_pool_indices` to
     # use for the next iter's draft-extend forward; sliced to surviving reqs.
     seq_lens_for_draft_extend: torch.Tensor
@@ -912,7 +912,7 @@ class EagleVerifyOutput:
             next_draft_input=next_draft_input,
             logits_output=logits_output,
             accept_tokens=torch.empty(0, dtype=torch.long, device=device),
-            next_extend_input_ids=torch.empty(0, dtype=torch.long, device=device),
+            unfinished_accept_tokens=torch.empty(0, dtype=torch.long, device=device),
             seq_lens_for_draft_extend=torch.empty(0, dtype=torch.int32, device=device),
             seq_lens_for_draft_extend_cpu=torch.empty(0, dtype=torch.int32),
             req_pool_indices_for_draft_extend=torch.empty(
