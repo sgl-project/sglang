@@ -505,10 +505,12 @@ class EAGLEWorker(TpModelWorker):
                 # when DP attention is enabled, but it is slow. Skip it for now.
                 if (
                     self.server_args.enable_dp_attention
-                    or batch.spec_info.accept_tokens.shape[0] > 0
+                    or verify_output.next_extend_input_ids.shape[0] > 0
                 ):
                     # decode is not finished
-                    self.forward_draft_extend_after_decode(batch)
+                    self.forward_draft_extend_after_decode(
+                        batch, verify_output.next_extend_input_ids
+                    )
 
             set_time_batch(
                 batch.reqs, "set_spec_draft_extend_end_time", trace_only=True
@@ -527,8 +529,10 @@ class EAGLEWorker(TpModelWorker):
                 can_run_cuda_graph=can_run_cuda_graph,
             )
 
-    def check_forward_draft_extend_after_decode(self, batch: ScheduleBatch):
-        local_need_forward = batch.spec_info.accept_tokens.shape[0] > 0
+    def check_forward_draft_extend_after_decode(
+        self, batch: ScheduleBatch, extend_input_ids: torch.Tensor
+    ):
+        local_need_forward = extend_input_ids.shape[0] > 0
         if not self.server_args.enable_dp_attention:
             return local_need_forward
 
@@ -1104,7 +1108,9 @@ class EAGLEWorker(TpModelWorker):
         assert forward_batch.spec_info is batch.spec_info
         self.capture_for_decode(logits_output, forward_batch.spec_info)
 
-    def forward_draft_extend_after_decode(self, batch: ScheduleBatch):
+    def forward_draft_extend_after_decode(
+        self, batch: ScheduleBatch, extend_input_ids: torch.Tensor
+    ):
         assert isinstance(batch.spec_info, EagleDraftInput)
         # Backup fields that will be modified in-place
         seq_lens_backup = batch.seq_lens.clone()
@@ -1116,7 +1122,7 @@ class EAGLEWorker(TpModelWorker):
 
         input_is_idle = batch.forward_mode.is_idle()
 
-        if not input_is_idle and batch.spec_info.accept_tokens.numel() == 0:
+        if not input_is_idle and extend_input_ids.numel() == 0:
             batch = batch.copy()
             batch.prepare_for_idle()
             hidden_size = (
@@ -1137,7 +1143,8 @@ class EAGLEWorker(TpModelWorker):
         batch.spec_info.num_tokens_for_logprob_per_req = 1
         batch.spec_info.prepare_extend_after_decode(
             batch,
-            self.speculative_num_steps,
+            extend_input_ids=extend_input_ids,
+            speculative_num_steps=self.speculative_num_steps,
         )
         batch.forward_mode = (
             ForwardMode.DRAFT_EXTEND

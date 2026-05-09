@@ -251,6 +251,9 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                 ),
                 logits_output=logits_output,
                 accept_tokens=torch.empty(0, dtype=torch.long, device=batch.device),
+                next_extend_input_ids=torch.empty(
+                    0, dtype=torch.long, device=batch.device
+                ),
                 num_accepted_drafts_per_req_cpu=[],
                 accepted_indices=torch.full(
                     (0, self.spec_steps + 1),
@@ -553,7 +556,6 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
 
             draft_input = EagleDraftInput(
                 hidden_states=batch.spec_info.hidden_states[accept_index],
-                accept_tokens=accept_tokens,
                 num_accepted_drafts=num_accepted_drafts,
                 num_accepted_tokens=num_accepted_drafts + 1,
                 num_accepted_drafts_cpu=num_accepted_drafts_list,
@@ -567,6 +569,7 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                 draft_input=draft_input,
                 logits_output=logits_output,
                 accept_tokens=accept_tokens,
+                next_extend_input_ids=accept_tokens,
                 num_accepted_drafts_per_req_cpu=draft_input.num_accepted_drafts_cpu,
                 accepted_indices=accept_index,
             )
@@ -621,11 +624,11 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                 unfinished_num_accepted_drafts = num_accepted_drafts[
                     unfinished_index_device
                 ]
+                next_extend_input_ids = predict[unfinished_accept_index]
                 draft_input = EagleDraftInput(
                     hidden_states=batch.spec_info.hidden_states[
                         unfinished_accept_index
                     ],
-                    accept_tokens=predict[unfinished_accept_index],
                     num_accepted_drafts_cpu=draft_input_num_accepted_drafts_cpu,
                     num_accepted_tokens_cpu=draft_input_num_accepted_tokens_cpu,
                     num_accepted_drafts=unfinished_num_accepted_drafts,
@@ -637,6 +640,9 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                     ],
                 )
             else:
+                next_extend_input_ids = torch.empty(
+                    (0,), dtype=accept_tokens.dtype, device=accept_tokens.device
+                )
                 draft_input = EagleDraftInput.create_idle_input(
                     device=batch.device,
                     hidden_size=batch.model_config.spec_hidden_size,
@@ -649,6 +655,7 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                 draft_input=draft_input,
                 logits_output=logits_output,
                 accept_tokens=accept_tokens,
+                next_extend_input_ids=next_extend_input_ids,
                 num_accepted_drafts_per_req_cpu=num_accepted_drafts_list,
                 accepted_indices=accept_index,
             )
@@ -670,13 +677,6 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
     # `num_accepted_tokens = num_accepted_drafts + 1` (per-req, one bonus per req).
     # Storing both avoids repeated `+ 1` at every consumer (attn backends, kernels).
     bonus_tokens: torch.Tensor = None
-    # Flat accepted-token tensor for draft-extend, shape `[sum_accepted]`.
-    # Set right after verify and consumed by `prepare_extend_after_decode` as
-    # the extend batch's `input_ids`. Dead after that method returns.
-    # TODO: drop this field and pass `accept_tokens` directly to
-    # `prepare_extend_after_decode` as a method arg. Its lifetime is bounded
-    # by verify -> prepare_extend, no need to live on the dataclass.
-    accept_tokens: torch.Tensor = None
     num_accepted_drafts: torch.Tensor = None
     num_accepted_tokens: torch.Tensor = None
     num_accepted_drafts_cpu: List[int] = None
@@ -735,7 +735,6 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
     ):
         return cls(
             bonus_tokens=torch.empty((0,), device=device, dtype=torch.int32),
-            accept_tokens=torch.empty((0,), device=device, dtype=torch.int32),
             hidden_states=torch.empty((0, hidden_size), device=device, dtype=dtype),
             topk_p=torch.empty((0, topk), device=device, dtype=torch.float32),
             topk_index=torch.empty((0, topk), device=device, dtype=torch.int64),
@@ -750,17 +749,18 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
     def prepare_extend_after_decode(
         self,
         batch: ScheduleBatch,
+        extend_input_ids: torch.Tensor,
         speculative_num_steps: int,
     ):
 
         if batch.forward_mode.is_idle():
             return
 
-        # `self.accept_tokens` is the flat accepted-token tensor set by
-        # `EagleVerifyInput.verify`; use it as the extend batch's `input_ids`.
-        # The kernel below populates `self.bonus_tokens` ([bs] per-req) for
-        # the next decode round.
-        batch.input_ids = self.accept_tokens
+        # `extend_input_ids` is the flat accepted-token tensor for reqs that
+        # continue into the next iter (= `EagleVerifyOutput.next_extend_input_ids`).
+        # It becomes the extend batch's `input_ids`. The kernel below populates
+        # `self.bonus_tokens` ([bs] per-req) for the next decode round.
+        batch.input_ids = extend_input_ids
         batch.extend_lens = batch.spec_info.num_accepted_tokens_cpu
         batch.extend_num_tokens = sum(batch.extend_lens)
         batch.seq_lens = batch.spec_info.seq_lens_for_draft_extend
@@ -877,8 +877,13 @@ class EagleVerifyOutput:
     draft_input: EagleDraftInput
     # Logit outputs from target worker
     logits_output: LogitsProcessorOutput
-    # Accepted token ids including the bonus token (flat, [sum_accepted])
+    # All accepted tokens flat across all reqs incl. those that finished this
+    # step. Includes the bonus token. Used for output processing.
     accept_tokens: torch.Tensor
+    # Subset of `accept_tokens` for reqs continuing into next iter's draft-extend
+    # forward (= `accept_tokens` when no req finished; flat over unfinished
+    # reqs only otherwise). Becomes `batch.input_ids` for that forward pass.
+    next_extend_input_ids: torch.Tensor
     # Accepted token length per sequence in a batch in CPU.
     num_accepted_drafts_per_req_cpu: List[int]
     # Accepted indices from logits_output.next_token_logits
