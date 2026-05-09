@@ -1229,6 +1229,11 @@ def configure_logger(server_args, prefix: str = ""):
     for name in ("httpx", "httpcore"):
         logging.getLogger(name).setLevel(logging.WARNING)
 
+    if is_flashinfer_available():
+        from flashinfer.jit.core import logger as flashinfer_logger
+
+        flashinfer_logger.setLevel(logging.ERROR)
+
 
 # source: https://github.com/vllm-project/vllm/blob/93b38bea5dd03e1b140ca997dfaadef86f8f1855/vllm/lora/utils.py#L9
 def replace_submodule(
