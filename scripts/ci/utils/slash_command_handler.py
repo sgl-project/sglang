@@ -404,7 +404,7 @@ def handle_rerun_stage(
         print("Error: No stage name provided")
         comment.create_reaction("confused")
         pr.create_issue_comment(
-            f"❌ Please specify a stage name: `/rerun-stage <stage-name>`\n\n"
+            f"⛔ Please specify a stage name: `/rerun-stage <stage-name>`\n\n"
             f"Examples: `/rerun-stage unit-test-backend-4-gpu`, `/rerun-stage accuracy-test-1-gpu`"
         )
         return False
@@ -456,7 +456,7 @@ def handle_rerun_stage(
     if stage_name not in valid_stages:
         comment.create_reaction("confused")
         pr.create_issue_comment(
-            f"❌ Stage `{stage_name}` doesn't support isolated runs yet.\n\n"
+            f"⛔ Stage `{stage_name}` doesn't support isolated runs yet.\n\n"
             f"**NVIDIA stages:**\n"
             + "\n".join(f"- `{s}`" for s in nvidia_stages)
             + "\n\n**AMD stages:**\n"
@@ -593,7 +593,7 @@ def handle_rerun_stage(
         print(f"Error triggering workflow_dispatch: {e}")
         comment.create_reaction("confused")
         pr.create_issue_comment(
-            f"❌ Failed to trigger workflow: {str(e)}\n\n"
+            f"⛔ Failed to trigger workflow: {str(e)}\n\n"
             f"Please check the logs or contact maintainers."
         )
         return False
@@ -1023,7 +1023,7 @@ def _check_rerun_test_permissions(gh_repo, pr, comment, user_perms, command_name
             print(f"Permission denied: /{command_name} on fork PR by {commenter}.")
             comment.create_reaction("confused")
             pr.create_issue_comment(
-                f"❌ `/{command_name}` is not available for fork PRs unless the commenter "
+                f"⛔ `/{command_name}` is not available for fork PRs unless the commenter "
                 "has write permission on the repo.\n\n"
                 "Please ask a maintainer to run this command, or use the normal CI flow."
             )
@@ -1055,7 +1055,7 @@ def handle_rerun_test(
     if not test_specs:
         comment.create_reaction("confused")
         pr.create_issue_comment(
-            "❌ Please specify a test: `/rerun-test <file>::<TestClass.test_method>`\n\n"
+            "⛔ Please specify a test: `/rerun-test <file>::<TestClass.test_method>`\n\n"
             "Examples:\n"
             "- `/rerun-test test/registered/core/test_srt_endpoint.py::TestSRTEndpoint.test_simple_decode`\n"
             "- `/rerun-test registered/core/test_srt_endpoint.py::TestSRTEndpoint`\n"
@@ -1128,10 +1128,10 @@ def handle_rerun_test(
                 )
         else:
             specs_str = ", ".join(f"`{s}`" for s in dr["specs"])
-            lines.append(f"❌ {specs_str}: {dr['error']}")
+            lines.append(f"⛔ {specs_str}: {dr['error']}")
 
     for r in resolve_failures:
-        lines.append(f"❌ `{r['spec']}`: {r['error']}")
+        lines.append(f"⛔ `{r['spec']}`: {r['error']}")
 
     body = "\n\n".join(lines)
 
@@ -1158,7 +1158,7 @@ def handle_rerun_group(gh_repo, pr, comment, user_perms, group_names, token):
     if not group_names:
         comment.create_reaction("confused")
         pr.create_issue_comment(
-            "❌ Please specify a test group: `/rerun-group <group>`\n\n"
+            "⛔ Please specify a test group: `/rerun-group <group>`\n\n"
             "Example:\n"
             "- `/rerun-group hicache`"
         )
@@ -1180,7 +1180,7 @@ def handle_rerun_group(gh_repo, pr, comment, user_perms, group_names, token):
 
     if failures:
         comment.create_reaction("confused")
-        lines = [f"❌ `{group}`: {err}" for group, err in failures]
+        lines = [f"⛔ `{group}`: {err}" for group, err in failures]
         pr.create_issue_comment("\n\n".join(lines))
         return False
 
