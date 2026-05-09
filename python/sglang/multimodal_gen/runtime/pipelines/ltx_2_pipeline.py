@@ -760,6 +760,7 @@ class LTX2TwoStagePipeline(_BaseLTX2Pipeline):
             self.component_residency_strategies["transformer_2"] = (
                 self._ltx2_residency.strategy
             )
+            self._refresh_component_residency_manager()
 
     @staticmethod
     def _should_merge_stage2_distilled_lora(server_args: ServerArgs) -> bool:

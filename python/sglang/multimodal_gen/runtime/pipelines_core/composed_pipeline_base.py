@@ -146,6 +146,13 @@ class ComposedPipelineBase(ABC):
 
         logger.info("Creating pipeline stages...")
         self.create_pipeline_stages(self.server_args)
+        self._refresh_component_residency_manager()
+
+    def _refresh_component_residency_manager(self) -> None:
+        self.component_residency_manager = get_global_component_residency_manager(
+            self, self.server_args
+        )
+        self.executor.component_residency_manager = self.component_residency_manager
 
     def get_module(self, module_name: str, default_value: Any = None) -> Any:
         return self.modules.get(module_name, default_value)
@@ -490,6 +497,8 @@ class ComposedPipelineBase(ABC):
 
         self._stages.append(stage)
         self._stage_name_mapping[stage_name] = stage
+        if self.component_residency_manager is not None:
+            self._refresh_component_residency_manager()
         return self
 
     def add_stages(
@@ -761,11 +770,6 @@ class ComposedPipelineBase(ABC):
                 list(self._stage_name_mapping.keys()),
                 main_process_only=True,
             )
-
-        self.component_residency_manager = get_global_component_residency_manager(
-            self, server_args
-        )
-        self.executor.component_residency_manager = self.component_residency_manager
 
         return self.executor.execute_with_profiling(self.stages, batch, server_args)
 
