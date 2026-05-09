@@ -48,6 +48,8 @@ SenseNova U1 is an omni model that combines autoregressive text generation with 
 - `multimodal_gen` provides the colocated stage pipeline for generated image segments.
 - `omni` coordinates the request, decides when to call each side, and commits generated media back into the conversation context.
 
+For U1, `omni` is mounted into the SRT deployment. It is not a separate FastAPI server, and it does not start a complete standalone diffusion serving instance. The generation backend runs colocated with the SRT model runner so it can use the live U1 model, session state, and KV-backed context. This is the current execution boundary for sessionful interleaved models; the same orchestrator protocol can later call a standalone diffusion serving runtime for models that do not need live SRT handles.
+
 Use the ordinary SGLang HTTP APIs when U1 is acting like a VLM and only needs to return text:
 
 - `/generate`
@@ -97,6 +99,16 @@ sglang serve \
 
 For larger GPUs, add the same runtime flags you normally use for SRT, such as `--tp-size`, memory settings, or CUDA graph settings.
 
+Runtime topology for U1:
+
+| Layer | Where it runs | Role |
+| --- | --- | --- |
+| SRT HTTP/API layer | SRT deployment | Serves `/generate`, OpenAI chat, and `/v1/omni/generate` |
+| SRT scheduler/model runner | SRT deployment | Owns AR decoding, session lifecycle, and KV cache |
+| Omni orchestrator | Inside the SRT deployment | Calls SRT for text boundaries, calls generation backend for image boundaries, and returns ordered segments |
+| U1 generation backend | Colocated `multimodal_gen` pipeline/stages | Runs native pixel-flow image generation and commits generated image context back to SRT |
+| Standalone diffusion server | Not used for U1 in this path | Used by pure diffusion deployments through `--model-type diffusion` |
+
 ## 4. Usage
 
 SenseNova U1 supports familiar SGLang text/VLM APIs and the omni endpoint. Use the standard APIs when the response is text-only; use `/v1/omni/generate` when the response can include generated images or interleaved segments. The common omni request/response schema is described in the [Omni overview](/cookbook/omni/intro).
@@ -112,7 +124,22 @@ SenseNova U1 supports familiar SGLang text/VLM APIs and the omni endpoint. Use t
 
 For single-turn text-to-image or image editing, only the `task` and `messages` fields change. For example, `task: "t2i"` uses a text segment as input, while `task: "edit"` uses an image segment plus a text instruction.
 
-## 5. Multi-Turn Interleave
+## 5. Developer WebUI
+
+SGLang also includes a small local WebUI for validating interleaved omni sessions. Start the U1 server first, then run the UI against the same API base:
+
+```bash Command
+python -m sglang.omni.webui.server \
+  --host 127.0.0.1 \
+  --port 7860 \
+  --api-base http://127.0.0.1:30000
+```
+
+Open `http://127.0.0.1:7860`, click `Load turn 1`, generate, then click `Load turn 2` and generate again. The UI keeps the returned `session.id` so turn 2 can refer to and edit the image generated in turn 1.
+
+The WebUI is a local development proxy for `/v1/omni/generate`; do not expose it directly to an untrusted network.
+
+## 6. Multi-Turn Interleave
 
 Set `keep_session: true` on the first turn. The server returns `session.id`; pass that value as `session_id` on later turns.
 
@@ -196,7 +223,7 @@ requests.post(f"http://localhost:30000/v1/omni/sessions/{session_id}/close")
 
 This is the path that demonstrates interleave behavior: the generated image from turn 1 is committed into the live session, and turn 2 can refer to it as "the previous image".
 
-## 6. Sampling Parameters
+## 7. Sampling Parameters
 
 Common U1 image sampling parameters:
 
@@ -223,7 +250,7 @@ Omni control fields:
 | `think` | `false` | Enables model-specific thinking behavior when supported |
 | `think_max_new_tokens` | unset | Thinking token budget |
 
-## 7. Scope Notes
+## 8. Scope Notes
 
 - Standard `/generate` and `/v1/chat/completions` are intended for one-image VLM understanding and text output.
 - Image generation, editing, and interleaved text/image output should use `/v1/omni/generate`.

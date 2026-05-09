@@ -35,6 +35,18 @@ An interleaved response is an ordered sequence of output segments, for example t
 
 Omni models that interleave text and media should use the omni SRT deployment. The omni route is mounted into the SRT process, and `multimodal_gen` can be used as a colocated generation backend from inside the omni orchestrator. Future omni models that can run generation independently can use a standalone diffusion serving backend while keeping the same orchestrator boundary.
 
+## Engine Boundaries
+
+The omni path is a runtime composition, not a replacement for the text or diffusion engines.
+
+| Component | Process boundary | Responsibility |
+| --- | --- | --- |
+| SRT engine | SRT server process tree | HTTP serving, chat/OpenAI APIs, tokenization path, AR decoding, SRT sessions, and KV cache |
+| Omni orchestrator | Mounted inside the SRT deployment for current sessionful models | Normalize omni requests, drive the decode/generate loop, maintain ordered segments, and commit generated media back into the live session |
+| Diffusion / `multimodal_gen` engine | Colocated backend for current U1-style models, or standalone server for pure diffusion models | Image/audio/video generation stages, denoising, media decoding, and generation-specific parallel execution |
+
+For SenseNova U1 today, the diffusion-style generation path is colocated with the SRT model runner because generated image segments need live model/session/KV handles. That is different from `--model-type diffusion`, which starts a complete standalone diffusion serving instance with its own HTTP server and scheduler. The omni backend interface keeps those options separate so future models can use a remote or standalone diffusion runtime when they do not need live SRT handles.
+
 ## Omni HTTP API
 
 The omni HTTP API is shared by model cookbooks. Model-specific pages focus on supported tasks and sampling parameters, while the common request/response shape lives here.
