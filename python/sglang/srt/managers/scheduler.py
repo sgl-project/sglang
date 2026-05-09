@@ -416,6 +416,10 @@ class Scheduler(
         # Init inter-process communication
         self.init_ipc_channels(port_args)
 
+        # Init ZBAL, switch allocator should before any torch alloc action
+        if _is_npu:
+            self.init_zbal()
+
         # Init PD-multiplexing context
         if self.enable_pdmux:
             self.init_pdmux()
@@ -494,6 +498,15 @@ class Scheduler(
         self.grammar_manager = GrammarManager(self)
 
         self.is_initializing = False
+
+    def init_zbal(self):
+        from sglang.srt.hardware_backend.npu.utils import init_zbal
+
+        if self.pp_size > 1:
+            logger.error(f"only zbal mix mode support pp_size > 1!")
+        if not _is_npu:
+            logger.warning("currently zbal only support npu")
+        init_zbal(self.tp_size, self.gpu_id, self.tp_rank)  # only switch allocator if is mix mode
 
     def init_model_config(self):
         self.model_config = ModelConfig.from_server_args(self.server_args)
@@ -3926,14 +3939,6 @@ def run_scheduler_process(
     dp_rank: Optional[int],
     pipe_writer,
 ):
-    if _is_npu:
-        # init zbal if is set
-        from sglang.srt.hardware_backend.npu.utils import init_zbal
-
-        if server_args.pp_size > 1:
-            logger.error(f"only zbal mix mode support pp_size > 1!")
-        init_zbal(server_args.tp_size, gpu_id, tp_rank)
-
     # Load plugins so hooks can override Scheduler and its dependencies.
     load_plugins()
     dp_rank = configure_scheduler_process(
