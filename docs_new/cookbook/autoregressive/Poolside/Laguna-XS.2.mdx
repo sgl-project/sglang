@@ -16,73 +16,31 @@ tag: NEW
 - **Agentic coding**: Tuned for tool-using software engineering agents and long-horizon execution.
 - **Hybrid reasoning**: `<think>...</think>` segments toggled per request via `chat_template_kwargs={"enable_thinking": ...}`.
 
-**Benchmarks (from the model card):**
-
-<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
-  <colgroup>
-    <col style={{width: "60%"}} />
-    <col style={{width: "40%"}} />
-  </colgroup>
-  <thead>
-    <tr style={{borderBottom: "2px solid #d55816"}}>
-      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, backgroundColor: "rgba(255,255,255,0.02)"}}>Benchmark</th>
-      <th style={{textAlign: "right", padding: "10px 12px", fontWeight: 700, backgroundColor: "rgba(255,255,255,0.05)"}}>Score</th>
-    </tr>
-  </thead>
-  <tbody>
-    <tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>SWE-bench Verified</td>
-      <td style={{padding: "9px 12px", textAlign: "right", backgroundColor: "rgba(255,255,255,0.05)"}}><strong>68.2%</strong></td>
-    </tr>
-    <tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>SWE-bench Multilingual</td>
-      <td style={{padding: "9px 12px", textAlign: "right", backgroundColor: "rgba(255,255,255,0.05)"}}>62.4%</td>
-    </tr>
-    <tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>SWE-bench Pro</td>
-      <td style={{padding: "9px 12px", textAlign: "right", backgroundColor: "rgba(255,255,255,0.05)"}}>44.5%</td>
-    </tr>
-    <tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Terminal-Bench 2.0</td>
-      <td style={{padding: "9px 12px", textAlign: "right", backgroundColor: "rgba(255,255,255,0.05)"}}>30.1%</td>
-    </tr>
-  </tbody>
-</table>
-
-**Recommended Generation Parameters:**
-
-- `temperature=0.7`, `top_k=20`
-
 **Available Quantizations:**
 
 <table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
   <colgroup>
-    <col style={{width: "12%"}} />
-    <col style={{width: "28%"}} />
-    <col style={{width: "60%"}} />
+    <col style={{width: "20%"}} />
+    <col style={{width: "80%"}} />
   </colgroup>
   <thead>
     <tr style={{borderBottom: "2px solid #d55816"}}>
       <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, backgroundColor: "rgba(255,255,255,0.02)"}}>Variant</th>
       <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, backgroundColor: "rgba(255,255,255,0.05)"}}>Hugging Face path</th>
-      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, backgroundColor: "rgba(255,255,255,0.02)"}}>Notes</th>
     </tr>
   </thead>
   <tbody>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><strong>BF16</strong></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>[`poolside/Laguna-XS.2`](https://huggingface.co/poolside/Laguna-XS.2)</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Runs on H200 and B200.</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><strong>FP8</strong></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>[`poolside/Laguna-XS.2-FP8`](https://huggingface.co/poolside/Laguna-XS.2-FP8)</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Runs on H200 and B200. First launch triggers a multi-session DeepGEMM JIT pre-compile (~10-20 min) — pre-warm with `python3 -m sglang.compile_deep_gemm --model poolside/Laguna-XS.2-FP8`.</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><strong>NVFP4</strong></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>[`poolside/Laguna-XS.2-NVFP4`](https://huggingface.co/poolside/Laguna-XS.2-NVFP4)</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Blackwell-only — runs on B200; H200 raises `NotImplementedError: Current platform does not support w4a4 nvfp4 quantization`.</td>
     </tr>
   </tbody>
 </table>
@@ -92,8 +50,6 @@ tag: NEW
 For details, see the [Hugging Face model card](https://huggingface.co/poolside/Laguna-XS.2) and the [Laguna deeper-dive blog post](https://poolside.ai/blog/laguna-a-deeper-dive).
 
 ## 2. SGLang Installation
-
-Native Laguna-XS.2 support landed on `main` in [sgl-project/sglang#24204](https://github.com/sgl-project/sglang/pull/24204) on 2026-05-08 (merge commit `096ad02b0`). A stable PyPI/Docker release containing it has not shipped yet, so the install paths below use named-tag `dev-*-laguna-xs2` Docker images and a dated nightly wheel pinned to the merge commit. Once the next stable release ships (e.g. `v0.5.12`), swap them for `lmsysorg/sglang:v<X>` and `sglang[all]==<X>`.
 
 Refer to the [official SGLang installation guide](../../../docs/get-started/install) for general install methods.
 
@@ -118,9 +74,7 @@ Refer to the [official SGLang installation guide](../../../docs/get-started/inst
   </tbody>
 </table>
 
-> The `dev-*-laguna-xs2` tags were produced by dispatching the [`release-docker-dev`](https://github.com/sgl-project/sglang/blob/main/.github/workflows/release-docker-dev.yml) workflow with `tag=laguna-xs2` (sglang maintainers only). Pull the image matching your GPU's CUDA driver — `lmsysorg/sglang:latest` does not contain Laguna-XS.2 yet.
-
-**PyPI (without Docker):** install the dated nightly wheel from the [SGLang nightly index](https://github.com/sgl-project/whl):
+**PyPI:** install from the [SGLang nightly index](https://github.com/sgl-project/whl):
 
 ```bash Command
 python3 -m pip install --upgrade pip
@@ -128,7 +82,7 @@ python3 -m pip install --extra-index-url https://docs.sglang.ai/whl/cu130 \
   "sglang[all]==0.5.12.dev20260509+g096ad02b0"
 ```
 
-For CUDA 12 hosts, swap the index URL to `https://docs.sglang.ai/whl/cu129`. The published nightly wheels are `cp310` only — install into a Python 3.10 environment (e.g. `uv venv --python 3.10`). The deployment generator in [§3](#3-model-deployment) emits the matching `sglang serve …` launch command for both Docker and PyPI installs.
+For CUDA 12 hosts, swap the index URL to `https://docs.sglang.ai/whl/cu129`.
 
 ## 3. Model Deployment
 
