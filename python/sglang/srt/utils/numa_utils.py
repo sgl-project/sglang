@@ -5,7 +5,9 @@ import math
 import multiprocessing
 import os
 import random
+import shlex
 import shutil
+import subprocess
 import time
 from contextlib import contextmanager
 from pathlib import Path
@@ -23,24 +25,121 @@ logger = logging.getLogger(__name__)
 
 
 @contextmanager
-def configure_subprocess(server_args: ServerArgs, gpu_id: int):
+def configure_subprocess(
+    server_args: ServerArgs,
+    gpu_id: int,
+    *,
+    manual_numa_index: Optional[int] = None,
+    physical_gpu_id: Optional[int] = None,
+):
     if envs.SGLANG_NUMA_BIND_V2.get():
-        numa_node = get_numa_node_if_available(server_args, gpu_id)
+        numa_node = get_numa_node_if_available(
+            server_args,
+            gpu_id,
+            manual_numa_index=manual_numa_index,
+            physical_gpu_id=physical_gpu_id,
+        )
         if numa_node is not None:
-            numactl_args = f"--cpunodebind={numa_node} --membind={numa_node}"
-            executable, debug_str = _create_numactl_executable(
-                numactl_args=numactl_args
-            )
-            with _mp_set_executable(executable=executable, debug_str=debug_str):
-                yield
-                return
+            numactl_args = _resolve_numactl_args(numa_node)
+            if numactl_args:
+                executable, debug_str = _create_numactl_executable(
+                    numactl_args=numactl_args
+                )
+                with _mp_set_executable(executable=executable, debug_str=debug_str):
+                    yield
+                    return
     yield
 
 
-def _create_numactl_executable(numactl_args: str):
+def _parse_cpu_list(cpu_list: str):
+    cpus = set()
+    for part in cpu_list.strip().split(","):
+        if not part:
+            continue
+        if "-" in part:
+            start, end = part.split("-", 1)
+            cpus.update(range(int(start), int(end) + 1))
+        else:
+            cpus.add(int(part))
+    return cpus
+
+
+def _get_cpus_for_numa_node(numa_node: int):
+    try:
+        with open(
+            f"/sys/devices/system/node/node{numa_node}/cpulist", "r"
+        ) as cpu_list_file:
+            return _parse_cpu_list(cpu_list_file.read())
+    except Exception as e:
+        logger.debug("Failed to read CPUs for NUMA node %s: %s", numa_node, e)
+        return set()
+
+
+def _get_allowed_cpus_for_numa_node(numa_node: int):
+    node_cpus = _get_cpus_for_numa_node(numa_node)
+    if not node_cpus:
+        return []
+
+    allowed_cpus = set(psutil.Process().cpu_affinity())
+    return sorted(node_cpus.intersection(allowed_cpus))
+
+
+def _probe_numactl_args(numactl_args):
+    try:
+        result = subprocess.run(
+            ["numactl", *numactl_args, "true"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+        return result.returncode == 0
+    except FileNotFoundError:
+        logger.debug("numactl command not found, skipping NUMA node configuration")
+        return False
+    except Exception as e:
+        logger.warning("Failed to probe numactl args %s: %s", numactl_args, e)
+        return False
+
+
+def _resolve_numactl_args(numa_node: int):
+    allowed_cpus = _get_allowed_cpus_for_numa_node(numa_node)
+    cpu_arg = (
+        f"--physcpubind={','.join(map(str, allowed_cpus))}" if allowed_cpus else None
+    )
+    if not allowed_cpus:
+        logger.warning(
+            "No CPUs from NUMA node %s are allowed by current cgroup CPU set %s",
+            numa_node,
+            psutil.Process().cpu_affinity(),
+        )
+
+    for mode_arg in (f"--membind={numa_node}", f"--preferred={numa_node}"):
+        args = [arg for arg in (cpu_arg, mode_arg) if arg]
+        if _probe_numactl_args(args):
+            if mode_arg.startswith("--preferred"):
+                logger.warning(
+                    "Falling back to --preferred=%s for subprocess NUMA binding",
+                    numa_node,
+                )
+            return args
+
+    if cpu_arg is not None and _probe_numactl_args([cpu_arg]):
+        logger.warning(
+            "Failed to enable memory binding for NUMA node %s; using CPU-only binding",
+            numa_node,
+        )
+        return [cpu_arg]
+
+    return []
+
+
+def _create_numactl_executable(numactl_args):
     old_executable = os.fsdecode(multiprocessing.spawn.get_executable())
-    script = f'''#!/bin/sh
-exec numactl {numactl_args} {old_executable} "$@"'''
+    quoted_numactl_args = " ".join(shlex.quote(arg) for arg in numactl_args)
+    script = (
+        "#!/bin/sh\n"
+        f'exec numactl {quoted_numactl_args} {shlex.quote(old_executable)} "$@"'
+    )
     path = Path(
         f"/tmp/sglang_temp_file_{time.time()}_{random.randrange(0, 10000000)}.sh"
     )
@@ -67,7 +166,13 @@ def _mp_set_executable(executable: str, debug_str: str):
         logger.debug(f"mp.set_executable revert to {old_executable}")
 
 
-def get_numa_node_if_available(server_args: ServerArgs, gpu_id: int) -> Optional[int]:
+def get_numa_node_if_available(
+    server_args: ServerArgs,
+    gpu_id: int,
+    *,
+    manual_numa_index: Optional[int] = None,
+    physical_gpu_id: Optional[int] = None,
+) -> Optional[int]:
     """
     Returns the NUMA node for the given GPU id. If it is not set in the server_args, it will try to query the NUMA node for the GPU.
     If the NUMA node is not available, has already been configured externally, or the user lacks permission to set NUMA affinity, it will return None.
@@ -80,9 +185,12 @@ def get_numa_node_if_available(server_args: ServerArgs, gpu_id: int) -> Optional
         The NUMA node for the given GPU id or None if it is not available.
     """
     if server_args.numa_node is not None:
-        return server_args.numa_node[gpu_id]
+        numa_index = gpu_id if manual_numa_index is None else manual_numa_index
+        return server_args.numa_node[numa_index]
     if _is_numa_available():
-        queried_numa_node = _query_numa_node_for_gpu(gpu_id)
+        queried_numa_node = _query_numa_node_for_gpu(
+            gpu_id if physical_gpu_id is None else physical_gpu_id
+        )
         if len(queried_numa_node) == 0:
             return None
         if len(queried_numa_node) > 1:
@@ -110,6 +218,24 @@ def get_libnuma():
 
 
 def numa_bind_to_node(node: int):
+    allowed_cpus = _get_allowed_cpus_for_numa_node(node)
+    if allowed_cpus:
+        try:
+            psutil.Process().cpu_affinity(allowed_cpus)
+        except Exception as e:
+            logger.warning(
+                "Failed to bind current process to NUMA node %s CPUs %s: %s",
+                node,
+                allowed_cpus,
+                e,
+            )
+    else:
+        logger.warning(
+            "No CPUs from NUMA node %s are allowed by current cgroup CPU set %s",
+            node,
+            psutil.Process().cpu_affinity(),
+        )
+
     libnuma = get_libnuma()
 
     if libnuma is None or libnuma.numa_available() < 0:
@@ -145,17 +271,17 @@ def _is_numa_available() -> bool:
     if not os.path.isdir("/sys/devices/system/node/node1"):
         return False
 
-    # Check if affinity is already constrained
+    # A constrained affinity is expected in container/cgroup environments. Later
+    # bind steps intersect NUMA-local CPUs with the current allowed CPU set.
     pid = os.getpid()
     process = psutil.Process(pid)
     cpu_affinity = process.cpu_affinity()
     all_cpus = list(range(psutil.cpu_count()))
     constrained_affinity = cpu_affinity != all_cpus
     if constrained_affinity:
-        logger.warning(
-            "NUMA affinity is already constrained for process, skipping NUMA node configuration for GPU. Remove your constraints to allow automatic configuration."
+        logger.debug(
+            "NUMA affinity is already constrained for process; using cgroup-aware CPU binding."
         )
-        return False
 
     if not shutil.which("numactl") and envs.SGLANG_NUMA_BIND_V2.get():
         logger.debug(

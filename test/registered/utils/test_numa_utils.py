@@ -3,6 +3,7 @@ import unittest
 from unittest.mock import MagicMock, patch
 
 from sglang.srt.utils.numa_utils import (
+    _get_allowed_cpus_for_numa_node,
     _is_numa_available,
     _query_numa_node_for_gpu,
     get_numa_node_if_available,
@@ -26,16 +27,20 @@ class TestIsNumaAvailable(unittest.TestCase):
     def test_returns_false_when_no_numa_nodes(self, _mock_isdir):
         self.assertFalse(_is_numa_available())
 
+    @patch("sglang.srt.utils.numa_utils._can_set_mempolicy", return_value=True)
+    @patch("sglang.srt.utils.numa_utils.shutil.which", return_value="/usr/bin/numactl")
     @patch("sglang.srt.utils.numa_utils._is_cuda", True)
     @patch("os.path.isdir", return_value=True)
     @patch("sglang.srt.utils.numa_utils.psutil")
-    def test_returns_false_when_affinity_constrained(self, mock_psutil, _mock_isdir):
+    def test_returns_true_when_affinity_constrained(
+        self, mock_psutil, _mock_isdir, _mock_which, _mock_mempolicy
+    ):
         mock_process = MagicMock()
         mock_process.cpu_affinity.return_value = [0, 1]
         mock_psutil.Process.return_value = mock_process
         mock_psutil.cpu_count.return_value = 128
 
-        self.assertFalse(_is_numa_available())
+        self.assertTrue(_is_numa_available())
 
     @patch("sglang.srt.utils.numa_utils._can_set_mempolicy", return_value=True)
     @patch("sglang.srt.utils.numa_utils.shutil.which", return_value="/usr/bin/numactl")
@@ -208,6 +213,10 @@ class TestGetNumaNodeIfAvailable(unittest.TestCase):
         self.assertEqual(get_numa_node_if_available(args, 2), 0)
         self.assertEqual(get_numa_node_if_available(args, 3), 1)
 
+    def test_returns_explicit_numa_node_from_manual_index(self):
+        args = self._make_server_args(numa_node=[2, 3, 0, 1])
+        self.assertEqual(get_numa_node_if_available(args, 0, manual_numa_index=1), 3)
+
     @patch("sglang.srt.utils.numa_utils._is_numa_available", return_value=False)
     def test_returns_none_when_numa_not_available(self, _mock_avail):
         args = self._make_server_args(numa_node=None)
@@ -224,6 +233,13 @@ class TestGetNumaNodeIfAvailable(unittest.TestCase):
     def test_returns_queried_single_node(self, _mock_avail, _mock_gpu):
         args = self._make_server_args(numa_node=None)
         self.assertEqual(get_numa_node_if_available(args, 0), 1)
+
+    @patch("sglang.srt.utils.numa_utils._query_numa_node_for_gpu", return_value=[1])
+    @patch("sglang.srt.utils.numa_utils._is_numa_available", return_value=True)
+    def test_uses_physical_gpu_id_for_auto_detection(self, _mock_avail, mock_gpu):
+        args = self._make_server_args(numa_node=None)
+        self.assertEqual(get_numa_node_if_available(args, 0, physical_gpu_id=3), 1)
+        mock_gpu.assert_called_once_with(3)
 
     @patch("sglang.srt.utils.numa_utils._query_numa_node_for_gpu", return_value=[0, 2])
     @patch("sglang.srt.utils.numa_utils._is_numa_available", return_value=True)
@@ -247,6 +263,20 @@ class TestGetNumaNodeIfAvailable(unittest.TestCase):
         self.assertEqual(result, 5)
         _mock_avail.assert_not_called()
         _mock_gpu.assert_not_called()
+
+
+class TestCgroupCpuFiltering(unittest.TestCase):
+    @patch("sglang.srt.utils.numa_utils._get_cpus_for_numa_node")
+    @patch("sglang.srt.utils.numa_utils.psutil.Process")
+    def test_allowed_cpus_intersect_numa_node_cpus(
+        self, mock_process_cls, mock_get_cpus_for_numa_node
+    ):
+        process = MagicMock()
+        process.cpu_affinity.return_value = [1, 2, 4]
+        mock_process_cls.return_value = process
+        mock_get_cpus_for_numa_node.return_value = {0, 1, 2, 3}
+
+        self.assertEqual(_get_allowed_cpus_for_numa_node(0), [1, 2])
 
 
 def _get_gpu_name():

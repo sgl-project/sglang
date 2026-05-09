@@ -2156,6 +2156,17 @@ def set_gpu_proc_affinity(
         # HT off
         bind_cpu_ids = [id for id in range(start_cpu_id, end_cpu_id)]
 
+    cgroup_allowed_cpu_ids = set(p.cpu_affinity())
+    bind_cpu_ids = sorted(set(bind_cpu_ids).intersection(cgroup_allowed_cpu_ids))
+    if not bind_cpu_ids:
+        logger.warning(
+            "Skip CPU affinity for gpu_id=%s: target CPUs do not intersect "
+            "current cgroup CPU set %s",
+            gpu_id,
+            sorted(cgroup_allowed_cpu_ids),
+        )
+        return
+
     # set cpu_affinity to current process
     p.cpu_affinity(bind_cpu_ids)
     logger.info(f"Process {pid} gpu_id {gpu_id} is running on CPUs: {p.cpu_affinity()}")
