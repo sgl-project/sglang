@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -51,6 +51,7 @@ if TYPE_CHECKING:
         EagleDraftExtendInput,
         EagleDraftInput,
         EagleVerifyInput,
+        EagleVerifyOutput,
     )
 
 if is_cuda() or is_musa():
@@ -327,20 +328,36 @@ class EagleVerifyInputV2Mixin:
         batch: ModelWorkerBatch,
         logits_output: LogitsProcessorOutput,
         vocab_mask: torch.Tensor = None,
-    ):
+    ) -> Tuple["EagleVerifyOutput", torch.Tensor]:
         """
         Verify and find accepted tokens based on logits output and batch
         (which contains spec decoding information).
+
+        Returns `(verify_output, predict)` where `predict` is the full
+        per-position sampled tokens (V2 caller uses it as `next_token_ids`).
+        `verify_output.accept_tokens` is the V1-style flat accepted slice.
         """
+        from sglang.srt.speculative.eagle_info import (
+            EagleDraftExtendInput,
+            EagleVerifyOutput,
+        )
+
+        device = batch.input_ids.device
         if batch.forward_mode.is_idle():
-            predict = torch.empty(0, dtype=torch.int32, device=batch.input_ids.device)
-            num_accepted_drafts = torch.empty(
-                0, dtype=torch.int32, device=batch.input_ids.device
+            predict = torch.empty(0, dtype=torch.int32, device=device)
+            num_accepted_drafts = torch.empty(0, dtype=torch.int32, device=device)
+            accept_index = torch.empty(0, dtype=torch.int32, device=device)
+            verify_output = EagleVerifyOutput(
+                draft_extend_input=EagleDraftExtendInput(
+                    hidden_states=logits_output.hidden_states,
+                    num_accepted_drafts=num_accepted_drafts,
+                    num_accepted_tokens=num_accepted_drafts + 1,
+                ),
+                logits_output=logits_output,
+                accept_tokens=torch.empty(0, dtype=torch.int32, device=device),
+                accepted_indices=accept_index,
             )
-            accept_index = torch.empty(
-                0, dtype=torch.int32, device=batch.input_ids.device
-            )
-            return predict, num_accepted_drafts, accept_index
+            return verify_output, predict
 
         bs = len(batch.seq_lens)
         sampling_info = batch.sampling_info
@@ -473,10 +490,24 @@ class EagleVerifyInputV2Mixin:
                 spec_steps=self.spec_steps,
             )
 
-        # `num_accepted_drafts` stays drafts-only inside this function; the returned
-        # tensor includes the trailing/bonus token via out-of-place +1 so the
-        # name no longer flips semantics mid-function (naming doc C2).
-        return predict, num_accepted_drafts + 1, accept_index
+        # `num_accepted_drafts` is drafts-only here; bonus is added via out-of-place
+        # +1 when packaged into `EagleDraftExtendInput.num_accepted_tokens`, so the
+        # local name does not flip semantics mid-function (naming doc C2).
+        verify_output = EagleVerifyOutput(
+            draft_extend_input=EagleDraftExtendInput(
+                # V2 keeps `hidden_states` as the full target output (shape
+                # `[bs * draft_token_num, hidden]`); V1 instead stores the
+                # accept-sliced view. The downstream V2 cuda-graph runner
+                # expects the full layout.
+                hidden_states=logits_output.hidden_states,
+                num_accepted_drafts=num_accepted_drafts,
+                num_accepted_tokens=num_accepted_drafts + 1,
+            ),
+            logits_output=logits_output,
+            accept_tokens=predict[accept_index],
+            accepted_indices=accept_index,
+        )
+        return verify_output, predict
 
 
 @triton.jit
