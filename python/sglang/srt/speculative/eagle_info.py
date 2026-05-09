@@ -731,38 +731,6 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
             new_seq_lens=torch.empty((0,), device=device, dtype=torch.int32),
         )
 
-    def generate_attn_arg_prefill(
-        self,
-        req_pool_indices: torch.Tensor,
-        paged_kernel_lens: torch.Tensor,
-        paged_kernel_lens_sum: int,
-        req_to_token: torch.Tensor,
-    ):
-        device = req_pool_indices.device
-        bs = self.num_accepted_drafts.numel()
-        qo_indptr = torch.zeros((bs + 1,), dtype=torch.int32, device=device)
-        qo_indptr[1:] = torch.cumsum(self.num_accepted_tokens, dim=0)
-        cum_kv_seq_len = torch.zeros((bs + 1,), dtype=torch.int32, device=device)
-        cum_kv_seq_len[1:] = torch.cumsum(paged_kernel_lens, dim=0)
-
-        if paged_kernel_lens_sum is None:
-            paged_kernel_lens_sum = cum_kv_seq_len[-1]
-
-        kv_indices = torch.empty(
-            paged_kernel_lens_sum, dtype=torch.int32, device=device
-        )
-
-        create_flashinfer_kv_indices_triton[(bs,)](
-            req_to_token,
-            req_pool_indices,
-            paged_kernel_lens,
-            cum_kv_seq_len,
-            None,
-            kv_indices,
-            req_to_token.size(1),
-        )
-        return kv_indices, cum_kv_seq_len, qo_indptr, None
-
     def filter_batch(self, new_indices: torch.Tensor, has_been_filtered: bool = True):
         if self.future_indices is not None:
             self.future_indices.indices = self.future_indices.indices[new_indices]
@@ -913,6 +881,38 @@ class EagleDraftExtendInput(SpecInput):
             self.bonus_tokens,
             next_power_of_2(max(speculative_num_steps + 1, len(batch.seq_lens))),
         )
+
+    def generate_attn_arg_prefill(
+        self,
+        req_pool_indices: torch.Tensor,
+        paged_kernel_lens: torch.Tensor,
+        paged_kernel_lens_sum: Optional[int],
+        req_to_token: torch.Tensor,
+    ):
+        device = req_pool_indices.device
+        bs = self.num_accepted_drafts.numel()
+        qo_indptr = torch.zeros((bs + 1,), dtype=torch.int32, device=device)
+        qo_indptr[1:] = torch.cumsum(self.num_accepted_tokens, dim=0)
+        cum_kv_seq_len = torch.zeros((bs + 1,), dtype=torch.int32, device=device)
+        cum_kv_seq_len[1:] = torch.cumsum(paged_kernel_lens, dim=0)
+
+        if paged_kernel_lens_sum is None:
+            paged_kernel_lens_sum = cum_kv_seq_len[-1]
+
+        kv_indices = torch.empty(
+            paged_kernel_lens_sum, dtype=torch.int32, device=device
+        )
+
+        create_flashinfer_kv_indices_triton[(bs,)](
+            req_to_token,
+            req_pool_indices,
+            paged_kernel_lens,
+            cum_kv_seq_len,
+            None,
+            kv_indices,
+            req_to_token.size(1),
+        )
+        return kv_indices, cum_kv_seq_len, qo_indptr, None
 
 
 @dataclass
