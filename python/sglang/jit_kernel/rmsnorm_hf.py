@@ -25,7 +25,7 @@ def is_supported_rmsnorm_hf_hidden_size(hidden_size: int) -> bool:
 
     Two launch configs cover the practical range:
       - Warp kernel: ``[32, 512)`` in multiples of 32 (q/k RMSNorm head dims).
-      - CTA kernel: ``>= 512`` in multiples of 512 (token RMSNorms).
+      - Vectorized CTA kernel: ``>= 512`` in multiples of 512 (token RMSNorms).
     """
     if _WARP_SIZE <= hidden_size < _CTA_BLOCK_SIZE and hidden_size % _WARP_SIZE == 0:
         return True
@@ -33,17 +33,30 @@ def is_supported_rmsnorm_hf_hidden_size(hidden_size: int) -> bool:
 
 
 @cache_once
-def _jit_rmsnorm_hf_module(hidden_size: int, dtype: torch.dtype) -> Module:
+def _jit_rmsnorm_hf_module(
+    hidden_size: int, dtype: torch.dtype, use_vector_cta: bool
+) -> Module:
     args = make_cpp_args(hidden_size, is_arch_support_pdl(), dtype)
-    kernel_cls = (
-        "HFRMSNormWarpKernel" if hidden_size < _CTA_BLOCK_SIZE else "HFRMSNormKernel"
-    )
+    if hidden_size < _CTA_BLOCK_SIZE:
+        kernel_cls = "HFRMSNormWarpKernel"
+    elif use_vector_cta:
+        kernel_cls = "HFRMSNormHalfKernel"
+    else:
+        kernel_cls = "HFRMSNormKernel"
     return load_jit(
         "rmsnorm_hf",
         *args,
         cuda_files=["elementwise/rmsnorm_hf.cuh"],
         cuda_wrappers=[("rmsnorm_hf", f"{kernel_cls}<{args}>::run")],
     )
+
+
+def _should_use_vector_cta(hidden_size: int, num_tokens: int) -> bool:
+    if hidden_size >= 8192:
+        return True
+    if hidden_size >= 4096 and num_tokens >= 512:
+        return True
+    return num_tokens >= 2048
 
 
 def rmsnorm_hf(
@@ -74,6 +87,7 @@ def rmsnorm_hf(
         out = torch.empty_like(input)
     if input.numel() == 0:
         return out
-    module = _jit_rmsnorm_hf_module(hidden_size, input.dtype)
+    use_vector_cta = _should_use_vector_cta(hidden_size, input.size(0))
+    module = _jit_rmsnorm_hf_module(hidden_size, input.dtype, use_vector_cta)
     module.rmsnorm_hf(input, weight, out, eps)
     return out

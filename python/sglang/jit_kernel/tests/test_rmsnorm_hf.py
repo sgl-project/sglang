@@ -7,6 +7,7 @@ import pytest
 import torch
 
 from sglang.jit_kernel.rmsnorm_hf import (
+    _should_use_vector_cta,
     is_supported_rmsnorm_hf_hidden_size,
     rmsnorm_hf,
 )
@@ -130,6 +131,25 @@ def test_rmsnorm_hf_empty_input() -> None:
 )
 def test_is_supported_hidden_size(hidden_size: int, expected: bool) -> None:
     assert is_supported_rmsnorm_hf_hidden_size(hidden_size) is expected
+
+
+@pytest.mark.parametrize(
+    ("hidden_size", "num_tokens", "expected"),
+    [
+        (512, 512, False),
+        (512, 2048, True),
+        (3072, 512, False),
+        (3072, 2048, True),
+        (4096, 128, False),
+        (4096, 512, True),
+        (8192, 1, True),
+        (16384, 1, True),
+    ],
+)
+def test_should_use_vector_cta(
+    hidden_size: int, num_tokens: int, expected: bool
+) -> None:
+    assert _should_use_vector_cta(hidden_size, num_tokens) is expected
 
 
 if __name__ == "__main__":

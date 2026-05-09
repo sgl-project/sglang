@@ -9,7 +9,7 @@
  *
  * Two launch configs:
  *   - Warp kernel: 32 threads/row for small hidden sizes (q/k norms).
- *   - CTA kernel:  512-thread scalar-strided with register cache (token norms).
+ *   - CTA kernel:  vectorized 16 dtype elems/thread (token norms).
  */
 
 #include <sgl_kernel/tensor.h>  // For TensorMatcher, SymbolicSize, SymbolicDevice
@@ -17,7 +17,9 @@
 
 #include <sgl_kernel/math.cuh>     // For device::math::rsqrt
 #include <sgl_kernel/runtime.cuh>  // For runtime::get_blocks_per_sm, get_sm_count
+#include <sgl_kernel/tile.cuh>     // For tile::Memory
 #include <sgl_kernel/utils.cuh>    // For LaunchKernel, SGL_DEVICE, type aliases, PDL, cast
+#include <sgl_kernel/vec.cuh>      // For AlignedVector, packed_t
 #include <sgl_kernel/warp.cuh>     // For warp::reduce_sum
 
 #include <tvm/ffi/container/tensor.h>
@@ -142,6 +144,139 @@ __global__ __launch_bounds__(512) void rmsnorm_hf_scalar_kernel(const RMSNormHFP
 }
 
 // ---------------------------------------------------------------------------
+// Vectorized CTA kernel: one block per row, each thread owns 16 dtype elements.
+//
+// This is the HF-semantics counterpart of the standard RMSNorm half path:
+// it reduces input traffic through vectorized 16B loads and avoids launching
+// 512 threads for medium hidden sizes such as 512/1024/2048.
+// ---------------------------------------------------------------------------
+template <typename Float2>
+SGL_DEVICE Float2
+apply_hf_weight(Float2 input_vec, Float2 weight_vec, float norm_factor) {
+  using namespace device;
+  const auto [ix, iy] = cast<fp32x2_t>(input_vec);
+  const auto [wx, wy] = cast<fp32x2_t>(weight_vec);
+  const auto x_norm = cast<Float2>(fp32x2_t{ix * norm_factor, iy * norm_factor});
+  const auto [nx, ny] = cast<fp32x2_t>(x_norm);
+  return cast<Float2>(fp32x2_t{nx * wx, ny * wy});
+}
+
+template <int64_t kDim, bool kUsePDL, typename Float>
+__global__ __launch_bounds__(kDim / 16) void
+rmsnorm_hf_vector_kernel(const RMSNormHFParams __grid_constant__ params) {
+  using namespace device;
+  using Float2 = packed_t<Float>;
+  using Storage = AlignedVector<Float2, 4>;
+
+  constexpr auto kNumThreads = kDim / 16;
+  constexpr auto kNumWarps = kNumThreads / kWarpThreads;
+
+  const auto& [input, weight_ptr, output, input_stride, output_stride, num_tokens, eps] = params;
+  const auto gmem = tile::Memory<Storage>::cta(kNumThreads);
+  __shared__ float smem[32];
+
+  PDLWaitPrimary<kUsePDL>();
+
+  const auto input_ptr = pointer::offset<Float>(input, blockIdx.x * input_stride);
+  const auto output_ptr = pointer::offset<Float>(output, blockIdx.x * output_stride);
+
+  const auto input_first = gmem.load(input_ptr, 0);
+  const auto input_second = gmem.load(input_ptr, 1);
+  const auto weight_first = gmem.load(weight_ptr, 0);
+  const auto weight_second = gmem.load(weight_ptr, 1);
+
+  float sum_of_squares = 0.0f;
+#pragma unroll
+  for (auto j = 0u; j < 4u; ++j) {
+    const auto [x, y] = cast<fp32x2_t>(input_first[j]);
+    sum_of_squares += x * x + y * y;
+  }
+#pragma unroll
+  for (auto j = 0u; j < 4u; ++j) {
+    const auto [x, y] = cast<fp32x2_t>(input_second[j]);
+    sum_of_squares += x * x + y * y;
+  }
+
+  sum_of_squares = warp::reduce_sum(sum_of_squares);
+  const auto warp_id = threadIdx.x / kWarpThreads;
+  smem[warp_id] = sum_of_squares;
+  __syncthreads();
+  if (warp_id == 0) {
+    const auto tx = threadIdx.x;
+    const auto local_sum = tx < kNumWarps ? smem[tx] : 0.0f;
+    sum_of_squares = warp::reduce_sum(local_sum);
+    smem[tx] = math::rsqrt(sum_of_squares / kDim + eps);
+  }
+  __syncthreads();
+  const float norm_factor = smem[warp_id];
+
+  Storage output_first, output_second;
+#pragma unroll
+  for (auto j = 0u; j < 4u; ++j) {
+    output_first[j] = apply_hf_weight(input_first[j], weight_first[j], norm_factor);
+    output_second[j] = apply_hf_weight(input_second[j], weight_second[j], norm_factor);
+  }
+
+  gmem.store(output_ptr, output_first, 0);
+  gmem.store(output_ptr, output_second, 1);
+
+  PDLTriggerSecondary<kUsePDL>();
+}
+
+template <int64_t kDim, bool kUsePDL, typename Float>
+__global__ __launch_bounds__(kDim / 16) void rmsnorm_hf_wide_vector_kernel(
+    const RMSNormHFParams __grid_constant__ params) {
+  using namespace device;
+  using Float2 = packed_t<Float>;
+  using Storage = AlignedVector<Float2, 8>;
+
+  constexpr auto kNumThreads = kDim / 16;
+  constexpr auto kNumWarps = kNumThreads / kWarpThreads;
+
+  const auto& [input, weight_ptr, output, input_stride, output_stride, num_tokens, eps] = params;
+  const auto gmem = tile::Memory<Storage>::cta(kNumThreads);
+  __shared__ float smem[32];
+
+  PDLWaitPrimary<kUsePDL>();
+
+  const auto input_ptr = pointer::offset<Float>(input, blockIdx.x * input_stride);
+  const auto output_ptr = pointer::offset<Float>(output, blockIdx.x * output_stride);
+
+  const auto input_vec = gmem.load(input_ptr);
+  const auto weight_vec = gmem.load(weight_ptr);
+
+  float sum_of_squares = 0.0f;
+#pragma unroll
+  for (auto j = 0u; j < 8u; ++j) {
+    const auto [x, y] = cast<fp32x2_t>(input_vec[j]);
+    sum_of_squares += x * x + y * y;
+  }
+
+  sum_of_squares = warp::reduce_sum(sum_of_squares);
+  const auto warp_id = threadIdx.x / kWarpThreads;
+  smem[warp_id] = sum_of_squares;
+  __syncthreads();
+  if (warp_id == 0) {
+    const auto tx = threadIdx.x;
+    const auto local_sum = tx < kNumWarps ? smem[tx] : 0.0f;
+    sum_of_squares = warp::reduce_sum(local_sum);
+    smem[tx] = math::rsqrt(sum_of_squares / kDim + eps);
+  }
+  __syncthreads();
+  const float norm_factor = smem[warp_id];
+
+  Storage output_vec;
+#pragma unroll
+  for (auto j = 0u; j < 8u; ++j) {
+    output_vec[j] = apply_hf_weight(input_vec[j], weight_vec[j], norm_factor);
+  }
+
+  gmem.store(output_ptr, output_vec);
+
+  PDLTriggerSecondary<kUsePDL>();
+}
+
+// ---------------------------------------------------------------------------
 // Warp launcher: occupancy-sized grid, 32 threads/block, one warp per row.
 // Targets small hidden sizes (q/k RMSNorms). kDim must be a multiple of 32
 // in [32, 512).
@@ -202,6 +337,68 @@ struct HFRMSNormKernel {
   static_assert(kDim >= 512 && kDim % 512 == 0, "rmsnorm_hf: kDim must be a multiple of 512");
   static constexpr auto kernel = rmsnorm_hf_scalar_kernel<kDim, kUsePDL, DType>;
   static constexpr uint32_t kBlockSize = 512;
+
+  static void
+  run(const tvm::ffi::TensorView input,
+      const tvm::ffi::TensorView weight,
+      const tvm::ffi::TensorView output,
+      float eps) {
+    using namespace host;
+    auto N = SymbolicSize{"num_tokens"};
+    auto D = SymbolicSize{"hidden_size"};
+    auto SI = SymbolicSize{"input_stride"};
+    auto SO = SymbolicSize{"output_stride"};
+    auto device_ = SymbolicDevice{};
+    D.set_value(kDim);
+    device_.set_options<kDLCUDA>();
+
+    TensorMatcher({N, D})  // input
+        .with_strides({SI, 1})
+        .with_dtype<DType>()
+        .with_device(device_)
+        .verify(input);
+    TensorMatcher({D})  // weight
+        .with_dtype<DType>()
+        .with_device(device_)
+        .verify(weight);
+    TensorMatcher({N, D})  // output
+        .with_strides({SO, 1})
+        .with_dtype<DType>()
+        .with_device(device_)
+        .verify(output);
+
+    const auto num_tokens = static_cast<uint32_t>(N.unwrap());
+    RuntimeCheck(num_tokens > 0, "rmsnorm_hf: num_tokens must be > 0");
+
+    const auto params = RMSNormHFParams{
+        .input = input.data_ptr(),
+        .weight = weight.data_ptr(),
+        .output = output.data_ptr(),
+        .input_stride = SI.unwrap(),
+        .output_stride = SO.unwrap(),
+        .num_tokens = num_tokens,
+        .eps = eps,
+    };
+
+    LaunchKernel(num_tokens, kBlockSize, device_.unwrap())  //
+        .enable_pdl(kUsePDL)(kernel, params);
+  }
+};
+
+// ---------------------------------------------------------------------------
+// Vectorized CTA launcher: validates tensors, launches one block per row.
+// ---------------------------------------------------------------------------
+template <int64_t kDim, bool kUsePDL, typename DType>
+struct HFRMSNormHalfKernel {
+  static_assert(sizeof(DType) == 2, "rmsnorm_hf: DType must be fp16_t or bf16_t");
+  static_assert(
+      kDim >= 512 && kDim % 512 == 0, "rmsnorm_hf_half: kDim must be a multiple of 512");
+#if SGL_ARCH_BLACKWELL_OR_GREATER
+  static constexpr auto kernel = rmsnorm_hf_wide_vector_kernel<kDim, kUsePDL, DType>;
+#else
+  static constexpr auto kernel = rmsnorm_hf_vector_kernel<kDim, kUsePDL, DType>;
+#endif
+  static constexpr auto kBlockSize = static_cast<uint32_t>(kDim / 16);
 
   static void
   run(const tvm::ffi::TensorView input,
