@@ -379,6 +379,11 @@ impl WorkerRegistry {
         self.url_to_id.get(url).and_then(|id| self.get(&id))
     }
 
+    /// Get a worker ID by URL.
+    pub fn get_id_by_url(&self, url: &str) -> Option<WorkerId> {
+        self.url_to_id.get(url).map(|id| id.clone())
+    }
+
     /// Empty worker slice constant for returning when no workers found
     const EMPTY_WORKERS: &'static [Arc<dyn Worker>] = &[];
 

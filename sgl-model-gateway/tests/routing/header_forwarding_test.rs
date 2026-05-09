@@ -3,7 +3,7 @@
 //! Tests for header propagation through the router to workers.
 
 use axum::{
-    body::Body,
+    body::{to_bytes, Body},
     extract::Request,
     http::{header::CONTENT_TYPE, StatusCode},
 };
@@ -261,11 +261,136 @@ mod header_forwarding_tests {
         ctx.shutdown().await;
     }
 
+    /// Test selected worker attribution headers for non-streaming responses
+    #[tokio::test]
+    async fn test_worker_attribution_headers_non_streaming() {
+        let ctx = AppTestContext::new(vec![MockWorkerConfig {
+            port: 19406,
+            worker_type: WorkerType::Regular,
+            health_status: HealthStatus::Healthy,
+            response_delay_ms: 0,
+            fail_rate: 0.0,
+        }])
+        .await;
+
+        let app = ctx.create_app().await;
+        let worker = ctx
+            .app_context
+            .worker_registry
+            .get_all()
+            .into_iter()
+            .next()
+            .expect("test worker should be registered");
+        let worker_url = worker.url().to_string();
+        let worker_id = ctx
+            .app_context
+            .worker_registry
+            .get_id_by_url(&worker_url)
+            .expect("test worker should have a registry id");
+
+        let payload = json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "Hello"}],
+            "stream": false
+        });
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_string(&payload).unwrap()))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers()
+                .get("x-ambient-worker-id")
+                .and_then(|value| value.to_str().ok()),
+            Some(worker_id.as_str())
+        );
+        assert_eq!(
+            resp.headers()
+                .get("x-ambient-worker-url")
+                .and_then(|value| value.to_str().ok()),
+            Some(worker_url.as_str())
+        );
+        assert!(
+            resp.headers().contains_key("x-ambient-worker-model"),
+            "response should include selected worker model header"
+        );
+
+        ctx.shutdown().await;
+    }
+
+    /// Test selected worker attribution headers for streaming responses
+    #[tokio::test]
+    async fn test_worker_attribution_headers_streaming() {
+        let ctx = AppTestContext::new(vec![MockWorkerConfig {
+            port: 19407,
+            worker_type: WorkerType::Regular,
+            health_status: HealthStatus::Healthy,
+            response_delay_ms: 0,
+            fail_rate: 0.0,
+        }])
+        .await;
+
+        let app = ctx.create_app().await;
+        let worker = ctx
+            .app_context
+            .worker_registry
+            .get_all()
+            .into_iter()
+            .next()
+            .expect("test worker should be registered");
+        let worker_url = worker.url().to_string();
+        let worker_id = ctx
+            .app_context
+            .worker_registry
+            .get_id_by_url(&worker_url)
+            .expect("test worker should have a registry id");
+
+        let payload = json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "Hello"}],
+            "stream": true
+        });
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_string(&payload).unwrap()))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers()
+                .get("x-ambient-worker-id")
+                .and_then(|value| value.to_str().ok()),
+            Some(worker_id.as_str())
+        );
+        assert_eq!(
+            resp.headers()
+                .get("x-ambient-worker-url")
+                .and_then(|value| value.to_str().ok()),
+            Some(worker_url.as_str())
+        );
+        assert!(
+            resp.headers().contains_key("x-ambient-worker-model"),
+            "response should include selected worker model header"
+        );
+
+        let _ = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        ctx.shutdown().await;
+    }
+
     /// Test multiple header priorities
     #[tokio::test]
     async fn test_header_priority() {
         let ctx = AppTestContext::new(vec![MockWorkerConfig {
-            port: 19405,
+            port: 19408,
             worker_type: WorkerType::Regular,
             health_status: HealthStatus::Healthy,
             response_delay_ms: 0,

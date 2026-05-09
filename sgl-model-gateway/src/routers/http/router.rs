@@ -344,6 +344,57 @@ impl Router {
         worker_url.to_string()
     }
 
+    fn insert_response_header(headers: &mut HeaderMap, name: &'static str, value: &str) {
+        if value.is_empty() {
+            return;
+        }
+
+        match HeaderValue::from_str(value) {
+            Ok(header_value) => {
+                headers.insert(name, header_value);
+            }
+            Err(err) => {
+                debug!(
+                    "Skipping invalid response header {}={:?}: {}",
+                    name, value, err
+                );
+            }
+        }
+    }
+
+    fn add_worker_attribution_headers(
+        &self,
+        headers: &mut HeaderMap,
+        worker_url: &str,
+        worker: Option<&dyn Worker>,
+    ) {
+        let worker_id = worker
+            .and_then(|worker| {
+                worker
+                    .metadata()
+                    .labels
+                    .get("ambient_worker_id")
+                    .map(|value| value.to_string())
+            })
+            .or_else(|| {
+                self.worker_registry
+                    .get_id_by_url(worker_url)
+                    .map(|id| id.as_str().to_string())
+            });
+
+        if let Some(worker_id) = worker_id {
+            Self::insert_response_header(headers, "x-ambient-worker-id", &worker_id);
+        }
+        Self::insert_response_header(headers, "x-ambient-worker-url", worker_url);
+
+        if let Some(worker_model) = worker
+            .map(|worker| worker.model_id())
+            .filter(|model_id| !model_id.is_empty())
+        {
+            Self::insert_response_header(headers, "x-ambient-worker-model", worker_model);
+        }
+    }
+
     // Generic simple routing for GET/POST without JSON body
     async fn route_simple_request(
         &self,
@@ -579,7 +630,12 @@ impl Router {
 
         if !is_stream {
             // For non-streaming requests, preserve headers
-            let response_headers = header_utils::preserve_response_headers(res.headers());
+            let mut response_headers = header_utils::preserve_response_headers(res.headers());
+            self.add_worker_attribution_headers(
+                &mut response_headers,
+                worker_url,
+                worker.as_deref(),
+            );
 
             let response = match res.bytes().await {
                 Ok(body) => {
@@ -599,6 +655,11 @@ impl Router {
         } else {
             // Preserve headers for streaming response
             let mut response_headers = header_utils::preserve_response_headers(res.headers());
+            self.add_worker_attribution_headers(
+                &mut response_headers,
+                worker_url,
+                worker.as_deref(),
+            );
             // Ensure we set the correct content-type for SSE
             response_headers.insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
 
@@ -843,7 +904,7 @@ impl RouterTrait for Router {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::BasicWorkerBuilder;
+    use crate::core::{BasicWorkerBuilder, ModelCard};
 
     fn create_test_regular_router() -> Router {
         // Create registries
@@ -911,5 +972,44 @@ mod tests {
 
         let worker = router.worker_registry.get_by_url(&url).unwrap();
         assert!(worker.is_healthy());
+    }
+
+    #[test]
+    fn test_worker_attribution_prefers_ambient_worker_id_label() {
+        let router = create_test_regular_router();
+        let worker: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("http://worker-labeled:8080")
+                .worker_type(WorkerType::Regular)
+                .label("ambient_worker_id", "rtx-058:30000")
+                .model(ModelCard::new("kimik26small"))
+                .build(),
+        );
+        router.worker_registry.register(worker.clone());
+
+        let mut headers = HeaderMap::new();
+        router.add_worker_attribution_headers(
+            &mut headers,
+            "http://worker-labeled:8080",
+            Some(worker.as_ref()),
+        );
+
+        assert_eq!(
+            headers
+                .get("x-ambient-worker-id")
+                .and_then(|value| value.to_str().ok()),
+            Some("rtx-058:30000")
+        );
+        assert_eq!(
+            headers
+                .get("x-ambient-worker-url")
+                .and_then(|value| value.to_str().ok()),
+            Some("http://worker-labeled:8080")
+        );
+        assert_eq!(
+            headers
+                .get("x-ambient-worker-model")
+                .and_then(|value| value.to_str().ok()),
+            Some("kimik26small")
+        );
     }
 }
