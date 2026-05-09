@@ -522,17 +522,34 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
 
         # Extract per-request min_pixels/max_pixels from image_data items (Qwen-VL specific).
         # When users pass min_pixels/max_pixels in the image_url content part, these override
-        # the server-level pixel range configured at startup.
+        # the server-level pixel range configured at startup. The HF processor applies a single
+        # min_pixels/max_pixels value across all images in the call, so we take the most
+        # conservative across all images: minimum max_pixels, maximum min_pixels.
         image_pixel_kwargs = {}
         if image_data:
-            for img in image_data:
-                if isinstance(img, ImageData):
-                    if img.min_pixels is not None:
-                        image_pixel_kwargs["min_pixels"] = img.min_pixels
-                    if img.max_pixels is not None:
-                        image_pixel_kwargs["max_pixels"] = img.max_pixels
-                    if image_pixel_kwargs:
-                        break
+            min_pixels_vals = [
+                img.min_pixels
+                for img in image_data
+                if isinstance(img, ImageData) and img.min_pixels is not None
+            ]
+            max_pixels_vals = [
+                img.max_pixels
+                for img in image_data
+                if isinstance(img, ImageData) and img.max_pixels is not None
+            ]
+            agg_min = max(min_pixels_vals) if min_pixels_vals else None
+            agg_max = min(max_pixels_vals) if max_pixels_vals else None
+            if agg_min is not None and agg_max is not None and agg_min >= agg_max:
+                logger.warning(
+                    f"Per-request pixel constraints are incoherent after aggregation "
+                    f"(min_pixels={agg_min} >= max_pixels={agg_max}); "
+                    f"ignoring per-request pixel range and using server defaults."
+                )
+            else:
+                if agg_min is not None:
+                    image_pixel_kwargs["min_pixels"] = agg_min
+                if agg_max is not None:
+                    image_pixel_kwargs["max_pixels"] = agg_max
 
         # NOTE: for qwen3-vl, video_meta need to be passed in, since do_sample_frames is already done in preprocess_video
         if self.hf_config.model_type in (
