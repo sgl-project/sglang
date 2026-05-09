@@ -628,7 +628,7 @@ class UnifiedRadixCache(BasePrefixCache):
         self, key: RadixKey
     ) -> tuple[list[torch.Tensor], UnifiedTreeNode, int]:
         node = self.root_node
-        child_key = key.child_key(self.page_size)
+        child_key = key.child_key(self.page_size) if len(key) else None
         value: list[torch.Tensor] = []
         best_value_len = 0
         best_node = node
