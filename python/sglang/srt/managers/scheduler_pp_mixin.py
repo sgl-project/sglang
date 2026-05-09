@@ -541,9 +541,6 @@ class SchedulerPPMixin:
         self._pp_tensor_dict_inbox: Dict[str, deque[Dict[str, torch.Tensor]]] = (
             defaultdict(deque)
         )
-        self.proxy_disable_tp_all_gather = (
-            envs.SGLANG_PP_PROXY_DISABLE_TP_ALL_GATHER.get()
-        )
 
     def profile_and_init_predictor(self: Scheduler):
         """
@@ -946,15 +943,6 @@ class SchedulerPPMixin:
             }
         return tensor_dict
 
-    def _pp_get_all_gather_group(
-        self: Scheduler, msg_type: str
-    ) -> Optional[torch.distributed.ProcessGroup]:
-        if not self.require_attn_tp_allgather:
-            return None
-        if msg_type == "proxy" and self.proxy_disable_tp_all_gather:
-            return None
-        return self.attn_tp_group
-
     def _pp_send_dict_to_next_stage(
         self: Scheduler,
         tensor_dict: Dict[str, torch.Tensor],
@@ -972,7 +960,9 @@ class SchedulerPPMixin:
         p2p_work.extend(
             self.pp_group.send_tensor_dict(
                 tensor_dict=tensor_dict,
-                all_gather_group=self._pp_get_all_gather_group(msg_type),
+                all_gather_group=(
+                    self.attn_tp_group if self.require_attn_tp_allgather else None
+                ),
                 async_send=async_send,
             )
         )
@@ -1017,7 +1007,9 @@ class SchedulerPPMixin:
             pp_proxy_tensors = PPProxyTensors(
                 self._pp_recv_typed_dict(
                     expected_kind="proxy",
-                    all_gather_group=self._pp_get_all_gather_group("proxy"),
+                    all_gather_group=(
+                        self.attn_tp_group if self.require_attn_tp_allgather else None
+                    ),
                 )
             )
         return pp_proxy_tensors
@@ -1027,7 +1019,9 @@ class SchedulerPPMixin:
     ) -> Dict[str, torch.Tensor]:
         return self._pp_recv_typed_dict(
             expected_kind="output",
-            all_gather_group=self._pp_get_all_gather_group("output"),
+            all_gather_group=(
+                self.attn_tp_group if self.require_attn_tp_allgather else None
+            ),
         )
 
     def _pp_prep_batch_result(
