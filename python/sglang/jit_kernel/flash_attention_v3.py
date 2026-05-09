@@ -24,7 +24,6 @@ def _call_fa3_kernel(kernel, *args, out=None, **kwargs):
     except TypeError as exc:
         if "unexpected keyword argument 'out'" not in str(exc):
             raise
-        # Older FA3 varlen kernels return a tensor instead of accepting `out=`.
         return kernel(*args, **kwargs)
 
 
