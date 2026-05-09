@@ -49,6 +49,10 @@ else:
         apply_token_bitmask_inplace_triton,
     )
 
+from sglang.srt.constrained.torch_ops.token_filter_torch_ops import (
+    set_token_filter_torch,
+)
+from sglang.srt.constrained.triton_ops.token_filter_ops import set_token_filter_triton
 
 logger = logging.getLogger(__name__)
 MAX_ROLLBACK_TOKENS = 200
@@ -62,7 +66,7 @@ class XGrammarGrammar(BaseGrammarObject):
         vocab_size: int,
         ctx: CompiledGrammar,
         override_stop_tokens: Optional[Union[List[int], int]],
-        key_string: Optional[str] = None,  # TODO (sk): for debugging, remove later
+        key_string: Optional[str] = None,
         grammar_stats: Optional[GrammarStats] = GrammarStats(),
     ) -> None:
         super().__init__()
@@ -162,7 +166,14 @@ class XGrammarGrammar(BaseGrammarObject):
             self.matcher.rollback(len(old_output_ids) - k)
 
         for i in range(k, len(new_output_ids)):
-            assert self.matcher.accept_token(new_output_ids[i])
+            if not self.matcher.accept_token(new_output_ids[i]):
+                raise ValueError(
+                    f"Token not accepted during retokenization: {new_output_ids[i]} "
+                    f"at position {i}\n"
+                    f"Old output IDs: {old_output_ids}\n"
+                    f"New output IDs: {new_output_ids}\n"
+                    f"Key string: {self.key_string}"
+                )
 
     def __repr__(self):
         return f"XGrammarGrammar({self.key_string=}, {self.accepted_tokens=}, {self.current_token=})"
@@ -210,6 +221,53 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
         self.vocab_size = vocab_size
         self.override_stop_tokens = override_stop_tokens
         self.any_whitespace = any_whitespace
+
+    @property
+    def is_support_token_filter(self):
+        return True
+
+    @staticmethod
+    def allocate_vocab_mask(vocab_size: int, batch_size: int, device) -> torch.Tensor:
+        return allocate_token_bitmask(batch_size, vocab_size)
+
+    @staticmethod
+    def move_vocab_mask(vocab_mask: torch.Tensor, device) -> torch.Tensor:
+        return vocab_mask.to(device, non_blocking=True)
+
+    @staticmethod
+    def apply_vocab_mask(logits: torch.Tensor, vocab_mask: torch.Tensor) -> None:
+        if logits.device.type in {"cuda", "npu", "xpu", "musa"}:
+            if _is_hip:
+                apply_token_bitmask_inplace_cuda(logits, vocab_mask)
+            else:
+                apply_token_bitmask_inplace_triton(logits, vocab_mask)
+        else:
+            raise RuntimeError(f"Unsupported device: {logits.device.type}")
+
+    @staticmethod
+    def set_token_filter(
+        vocab_mask: torch.Tensor,
+        token_ids: List[int],
+        batch_idx: int,
+        is_allowed: bool = True,
+        reset_vocab_mask: bool = True,
+    ):
+        if _is_hip or (vocab_mask.device.type != "cuda"):
+            set_token_filter_torch(
+                vocab_mask,
+                token_ids,
+                batch_idx,
+                is_allowed=is_allowed,
+                reset_vocab_mask=reset_vocab_mask,
+            )
+        else:
+            set_token_filter_triton(
+                vocab_mask,
+                token_ids,
+                batch_idx,
+                is_allowed=is_allowed,
+                reset_vocab_mask=reset_vocab_mask,
+            )
 
     @staticmethod
     def _sanitize_structural_format(structural_format):
