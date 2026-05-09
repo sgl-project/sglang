@@ -42,7 +42,6 @@ if _is_cuda:
     except ImportError as e:
         deep_gemm = e
 
-
 if _use_aiter:
     from aiter.ops.cache import indexer_k_quant_and_cache
 
