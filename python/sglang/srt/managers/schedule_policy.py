@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 
+from sglang.srt.environ import envs
 from sglang.srt.managers.prefill_delayer import PrefillDelayerSinglePassExecutor
 from sglang.srt.mem_cache.base_prefix_cache import DecLockRefParams
 from sglang.srt.utils import get_bool_env_var
@@ -42,6 +43,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     InitLoadBackParams,
     InsertParams,
     MatchPrefixParams,
+    zero_match_result,
 )
 from sglang.srt.mem_cache.hisparse_memory_pool import (
     DeepSeekV4HiSparseTokenToKVPoolAllocator,
@@ -98,6 +100,8 @@ def match_prefix_for_req(
             req=req if include_req else None,
         )
     )
+    if envs.SGLANG_RADIX_FORCE_MISS.get():
+        match_result = zero_match_result(tree_cache, match_result)
     (
         req.prefix_indices,
         req.last_node,
@@ -249,6 +253,10 @@ class SchedulePolicy:
                         key=RadixKey(token_ids=prefix_ids, extra_key=extra_key)
                     )
                 )
+                if envs.SGLANG_RADIX_FORCE_MISS.get():
+                    match_result = zero_match_result(
+                        self.waiting_queue_radix_tree, match_result
+                    )
                 in_batch_matching_prefixes = match_result.device_indices
                 if (
                     len(in_batch_matching_prefixes)
@@ -412,6 +420,7 @@ class PrefillAdder:
         prefill_max_requests: Optional[int] = None,
         prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor] = None,
         dllm_config: Optional[DllmConfig] = None,
+        waiting_queue_len: int = 0,
     ):
         self.page_size = page_size
         self.tree_cache = tree_cache
@@ -466,6 +475,9 @@ class PrefillAdder:
         self.prefill_max_requests = prefill_max_requests
         self.prefill_delayer_single_pass = prefill_delayer_single_pass
         self.max_prefill_bs = max_prefill_bs
+        # Snapshot of scheduler waiting_queue length at the start of this
+        # prefill pass. Used by PrefillDelayer's queue-based trigger.
+        self.waiting_queue_len = waiting_queue_len
 
     def _init_dllm_meta(self, dllm_config: DllmConfig):
         self.dllm_block_size = dllm_config.block_size
@@ -806,6 +818,7 @@ class PrefillAdder:
                 running_batch=self.running_batch.batch_size(),
                 max_prefill_bs=self.max_prefill_bs,
                 max_running_requests=self.max_running_requests,
+                waiting_queue_len=self.waiting_queue_len,
             )
         ):
             return AddReqResult.OTHER

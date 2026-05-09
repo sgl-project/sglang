@@ -15,24 +15,30 @@ from sglang.srt.layers.attention.fla.index import (
 from sglang.srt.layers.attention.fla.op import exp, make_tensor_descriptor, safe_exp
 from sglang.srt.layers.attention.fla.utils import (
     _preferred_block_v,
+    autotune_cache_kwargs,
     is_intel,
-    is_nvidia_hopper,
 )
 
-NUM_WARPS = [2, 4] if is_nvidia_hopper else [2, 4, 8, 16]
+NUM_WARPS = 8 if is_intel else 4
 CHUNK_SIZE = 64
+BV = _preferred_block_v()
 
 
-# @triton.autotune(
-#     configs=[
-#         triton.Config({"BV": BV}, num_warps=num_warps, num_stages=num_stages)
-#         for num_warps in [2, 4]
-#         for num_stages in [2, 3, 4]
-#         for BV in [32, 64]
-#     ],
-#     key=["H", "K", "V", "BT", "USE_G"],
-#     use_cuda_graph=use_cuda_graph,
-# )
+@triton.autotune(
+    # Single hardcoded config. The kernel writes ht (final state) back into
+    # initial_state in-place; with multiple configs, triton's autotune benchmark
+    # phase invokes the kernel many times for timing and corrupts the cache pool,
+    # producing silently wrong output on the first user request. Restoring via
+    # `restore_value=["initial_state"]` works for unit tests but OOMs on
+    # production-scale models (e.g. Kimi-Linear-48B at default mem_fraction)
+    # because cloning the cache pool for each benchmark exceeds available memory.
+    # NT_BUCKET is kept in the autotune key for forward-compatibility (allows
+    # future per-bucket configs once the kernel is refactored to write final
+    # state to a separate output buffer).
+    configs=[triton.Config({"BV": BV}, num_warps=NUM_WARPS, num_stages=2)],
+    key=["H", "K", "V", "BT", "USE_GK", "USE_INITIAL_STATE", "NT_BUCKET"],
+    **autotune_cache_kwargs,
+)
 @triton.jit(do_not_specialize=["T"])
 def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
     k,
@@ -59,6 +65,7 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
     INPLACE_UPDATE: tl.constexpr,
     SAVE_NEW_VALUE: tl.constexpr,
     IS_VARLEN: tl.constexpr,
+    NT_BUCKET: tl.constexpr,
 ):
     i_v, i_nh = tl.program_id(0), tl.program_id(1)
     i_n, i_h = i_nh // H, i_nh % H
@@ -304,8 +311,6 @@ def chunk_gated_delta_rule_fwd_h(
 
     v_new = torch.empty_like(u) if save_new_value else None
 
-    num_warps = 8 if is_intel else 4  # to reduce register spill on Intel GPU
-
     def grid(meta):
         return (triton.cdiv(V, meta["BV"]), N * H)
 
@@ -327,14 +332,12 @@ def chunk_gated_delta_rule_fwd_h(
         K=K,
         V=V,
         BT=BT,
-        BV=_preferred_block_v(),
         USE_G=g is not None,
         USE_GK=gk is not None,
         USE_INITIAL_STATE=initial_state is not None,
         INPLACE_UPDATE=True,
         SAVE_NEW_VALUE=v_new is not None,
         IS_VARLEN=cu_seqlens is not None,
-        num_warps=num_warps,
-        num_stages=2,
+        NT_BUCKET=(0 if NT <= 32 else (1 if NT <= 128 else 2)),
     )
     return h, v_new
