@@ -3025,6 +3025,10 @@ class Scheduler(
                 batch_result = self.model_worker.forward_batch_generation(
                     worker_batch_or_batch, **kwargs
                 )
+                if batch_result.next_draft_input is not None:
+                    # V1 spec: relay this iter's draft-extend output as next
+                    # iter's draft spec_info (mirrors the V2 path above).
+                    batch.spec_info = batch_result.next_draft_input
                 future_indices_or_next_token_ids = batch_result.next_token_ids
                 self.update_cache_from_scheduler(batch, batch_result)
 

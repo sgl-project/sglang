@@ -505,16 +505,17 @@ class EAGLEWorker(TpModelWorker):
                 # NOTE: We should use `check_forward_draft_extend_after_decode`
                 # when DP attention is enabled, but it is slow. Skip it for now.
                 draft_extend_input = verify_output.draft_extend_input
+                next_draft_input = None
                 if (
                     self.server_args.enable_dp_attention
                     or draft_extend_input.input_ids.shape[0] > 0
                 ):
-                    # decode is not finished
-                    # Install draft_extend_input for the extend forward, then
-                    # install the assembled next-iter EagleDraftInput it returns.
+                    # decode is not finished. Install draft_extend_input as
+                    # batch.spec_info for the extend forward; the assembled
+                    # next-iter EagleDraftInput is returned via batch_result
+                    # and installed by the scheduler before the next draft.
                     batch.spec_info = draft_extend_input
                     next_draft_input = self.forward_draft_extend_after_decode(batch)
-                    batch.spec_info = next_draft_input
 
             set_time_batch(
                 batch.reqs, "set_spec_draft_extend_end_time", trace_only=True
@@ -531,6 +532,7 @@ class EAGLEWorker(TpModelWorker):
                 num_accepted_drafts=sum(verify_output.num_accepted_drafts_per_req_cpu),
                 num_accepted_drafts_per_req_cpu=verify_output.num_accepted_drafts_per_req_cpu,
                 can_run_cuda_graph=verify_output.can_run_cuda_graph,
+                next_draft_input=next_draft_input,
             )
 
     def check_forward_draft_extend_after_decode(
