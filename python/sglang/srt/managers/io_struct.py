@@ -1407,7 +1407,7 @@ class UpdateWeightFromDiskReqInput(BaseReq):
     weight_version: Optional[str] = None
     # Whether to update weights asynchronously
     is_async: bool = False
-    # Whether to empty torch cache
+    # Whether to release unused cached blocks from the device allocator during flush
     torch_empty_cache: bool = False
     # Whether to keep the scheduler paused after weight update
     keep_pause: bool = False
@@ -1444,7 +1444,7 @@ class UpdateWeightsFromDistributedReqInput(BaseReq):
     weight_version: Optional[str] = None
     # Optional format specification for loading
     load_format: Optional[str] = None
-    # Whether to call torch.cuda.empty_cache() during flush
+    # Whether to release unused cached blocks from the device allocator during flush
     torch_empty_cache: bool = False
 
 
@@ -1473,7 +1473,7 @@ class UpdateWeightsFromTensorReqInput(BaseReq):
     weight_version: Optional[str] = None
     # Optional: Determine whether to disable updating the draft model
     disable_draft_model: Optional[bool] = None
-    # Whether to call torch.cuda.empty_cache() during flush
+    # Whether to release unused cached blocks from the device allocator during flush
     torch_empty_cache: bool = False
 
 
@@ -1509,7 +1509,7 @@ class UpdateWeightsFromIPCReqInput(BaseReq):
     flush_cache: bool = True
     # Optional: Update weight version along with weights
     weight_version: Optional[str] = None
-    # Whether to call torch.cuda.empty_cache() during flush
+    # Whether to release unused cached blocks from the device allocator during flush
     torch_empty_cache: bool = False
 
 

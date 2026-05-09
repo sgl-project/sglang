@@ -214,6 +214,7 @@ from sglang.srt.utils import (
     broadcast_pyobj,
     configure_gc_logger,
     configure_logger,
+    empty_device_cache,
     freeze_gc,
     get_available_gpu_memory,
     get_bool_env_var,
@@ -3381,7 +3382,7 @@ class Scheduler(
         return DetachHiCacheStorageReqOutput(success=False, message=msg)
 
     def flush_cache(self, empty_cache: bool = True):
-        """Flush the memory pool and cache."""
+        """Flush SGLang caches and optionally release unused device allocator cache."""
         if self.is_fully_idle():
             self.cur_batch = None
             self.last_batch = None
@@ -3395,7 +3396,7 @@ class Scheduler(
                 self.draft_worker.clear_cache_pool()
 
             if empty_cache:
-                torch.cuda.empty_cache()
+                empty_device_cache(self.device_module)
             logger.info("Cache flushed successfully!")
             success = True
         else:
@@ -3784,7 +3785,7 @@ class IdleSleeper:
             and real_time() - self.last_empty_time > self.empty_cache_interval
         ):
             self.last_empty_time = real_time()
-            torch.cuda.empty_cache()
+            empty_device_cache()
 
 
 def is_health_check_generate_req(recv_req):
