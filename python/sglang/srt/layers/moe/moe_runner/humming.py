@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Any, Optional
 from weakref import WeakValueDictionary
 
 import torch
+
 from sglang.srt.environ import envs
 from sglang.srt.layers.moe.ep_moe.kernels import moe_permute, moe_unpermute
 from sglang.srt.layers.moe.fused_moe_triton.moe_fused_mul_sum import moe_fused_mul_sum
@@ -433,7 +434,10 @@ class HummingRunnerCore(MoeRunnerCore):
         }
 
         top_k = topk_ids.size(1)
-        moe_kwargs1 = {"top_k": top_k, "tuning_config": configs["w13_tuning_config_str"]}
+        moe_kwargs1 = {
+            "top_k": top_k,
+            "tuning_config": configs["w13_tuning_config_str"],
+        }
         moe_kwargs2 = {"top_k": 1, "tuning_config": configs["w2_tuning_config_str"]}
         moe_kwargs1.update(moe_common_kwargs)
         moe_kwargs2.update(moe_common_kwargs)

@@ -72,11 +72,8 @@ __global__ void moe_permute_prepare_kernel(
   }
 }
 
-std::vector<torch::Tensor> moe_permute_prepare(
-    torch::Tensor topk_ids,
-    int64_t num_experts,
-    bool use_int64_offset,
-    bool is_ep) {
+std::vector<torch::Tensor>
+moe_permute_prepare(torch::Tensor topk_ids, int64_t num_experts, bool use_int64_offset, bool is_ep) {
   TORCH_CHECK(topk_ids.is_cuda(), "topk_ids must be a CUDA tensor");
   TORCH_CHECK(topk_ids.scalar_type() == at::ScalarType::Int, "topk_ids must be int32");
 

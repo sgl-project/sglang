@@ -1,8 +1,9 @@
 import torch
 import triton
 import triton.language as tl
-from sglang.multimodal_gen.runtime.platforms import current_platform
 from torch._subclasses.fake_tensor import FakeTensor
+
+from sglang.multimodal_gen.runtime.platforms import current_platform
 
 
 @triton.jit

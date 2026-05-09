@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Any, List
 
 import regex as re
 import torch
+
 from sglang.srt.environ import envs
 from sglang.srt.layers.linear import LinearBase, set_weight_attrs
 from sglang.srt.layers.moe import (
@@ -419,7 +420,10 @@ class HummingLinearMethod(LinearMethodBase):
                     delattr(layer, "locks")
                     self.__class__ = UnquantizedLinearMethod  # type: ignore
                     tensor = torch.empty(
-                        (layer.output_partition_sizes_sum, layer.input_size_per_partition),
+                        (
+                            layer.output_partition_sizes_sum,
+                            layer.input_size_per_partition,
+                        ),
                         dtype=layer.param_dtype,
                         device=param.device,
                     )
