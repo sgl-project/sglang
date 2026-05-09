@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 
+from sglang.srt.environ import envs
 from sglang.srt.managers.prefill_delayer import PrefillDelayerSinglePassExecutor
 from sglang.srt.mem_cache.base_prefix_cache import DecLockRefParams
 from sglang.srt.utils import get_bool_env_var
@@ -42,6 +43,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     InitLoadBackParams,
     InsertParams,
     MatchPrefixParams,
+    zero_match_result,
 )
 from sglang.srt.mem_cache.hisparse_memory_pool import (
     DeepSeekV4HiSparseTokenToKVPoolAllocator,
@@ -98,6 +100,8 @@ def match_prefix_for_req(
             req=req if include_req else None,
         )
     )
+    if envs.SGLANG_RADIX_FORCE_MISS.get():
+        match_result = zero_match_result(tree_cache, match_result)
     (
         req.prefix_indices,
         req.last_node,
@@ -249,6 +253,10 @@ class SchedulePolicy:
                         key=RadixKey(token_ids=prefix_ids, extra_key=extra_key)
                     )
                 )
+                if envs.SGLANG_RADIX_FORCE_MISS.get():
+                    match_result = zero_match_result(
+                        self.waiting_queue_radix_tree, match_result
+                    )
                 in_batch_matching_prefixes = match_result.device_indices
                 if (
                     len(in_batch_matching_prefixes)

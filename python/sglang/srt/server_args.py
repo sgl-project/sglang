@@ -220,6 +220,7 @@ FP4_GEMM_RUNNER_BACKEND_CHOICES = [
     "auto",
     "cutlass",
     "flashinfer_cudnn",
+    "flashinfer_cutedsl",
     "flashinfer_cutlass",
     "flashinfer_trtllm",
 ]
@@ -1893,6 +1894,7 @@ class ServerArgs:
                         self.quantization
                         in ["fp8", "modelopt_fp8", "modelopt_fp4", "modelopt_mixed"]
                         or is_kimi_k2_k25_thinking_int4
+                        or self.quantization is None
                     )
                 ):
                     self.moe_runner_backend = "flashinfer_trtllm"
@@ -3332,22 +3334,8 @@ class ServerArgs:
         ):
             self.speculative_draft_model_revision = "main"
 
-        # FlashInfer trtllm moe bf16 only support RenormalizeNaive routing method and Deepseek routing method
-        # It is hard to tell the routing method in draft model, and the moe layer in draft model is not the bottleneck among
-        # end to end, so we just avoid using trtllm_moe for speculative decoding.
-        from sglang.srt.layers.moe.utils import MoeRunnerBackend
-
         if self.speculative_moe_runner_backend is None:
-            self.speculative_moe_runner_backend = (
-                "auto"
-                if self.moe_runner_backend
-                in ["flashinfer_trtllm", "flashinfer_trtllm_routed"]
-                else self.moe_runner_backend
-            )
-        else:
-            assert not MoeRunnerBackend(
-                self.speculative_moe_runner_backend
-            ).is_flashinfer_trtllm(), "Currently speculative MoE runner backend doesn't support flashinfer_trtllm, please use triton or auto backend for speculative moe runner instead."
+            self.speculative_moe_runner_backend = self.moe_runner_backend
 
         if self.speculative_algorithm is not None:
             self.speculative_algorithm = self.speculative_algorithm.upper()
@@ -4012,6 +4000,16 @@ class ServerArgs:
         envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.set(
             "1" if self.enable_deterministic_inference else "0"
         )
+        # Custom all-reduce v2 uses IPC handles and is intra-node only. Force-disable
+        # on multi-node so the dispatch falls back to the legacy CustomAllreduce path.
+        if self.nnodes > 1 and envs.SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2.get():
+            if envs.SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2.is_set():
+                logger.warning(
+                    "Disabling SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2 because nnodes=%d "
+                    "(custom all-reduce v2 is intra-node only).",
+                    self.nnodes,
+                )
+            envs.SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2.set("0")
         if self.debug_cuda_graph:
             if not is_cuda():
                 logger.warning(
@@ -5472,10 +5470,11 @@ class ServerArgs:
             default=ServerArgs.fp4_gemm_runner_backend,
             dest="fp4_gemm_runner_backend",
             help="Choose the runner backend for NVFP4 GEMM operations. "
-            "Options: 'auto' (default; selects flashinfer_cudnn on SM120, flashinfer_cutlass otherwise), "
+            "Options: 'auto' (default; selects flashinfer_cudnn on SM120, flashinfer_cutedsl on SM100, flashinfer_cutlass otherwise), "
             "'cutlass' (SGLang CUTLASS kernel), "
             "'flashinfer_cutlass' (FlashInfer CUTLASS backend), "
             "'flashinfer_cudnn' (FlashInfer cuDNN backend, optimal on CUDA 13+ with cuDNN 9.15+), "
+            "'flashinfer_cutedsl' (FlashInfer CuTe DSL backend), "
             "'flashinfer_trtllm' (FlashInfer TensorRT-LLM backend, requires different weight preparation with shuffling). ",
         )
         parser.add_argument(
