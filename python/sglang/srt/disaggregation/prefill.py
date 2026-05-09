@@ -614,7 +614,7 @@ class SchedulerDisaggregationPrefillMixin:
                     KVPoll.Failed,
                 ):
                     logger.warning(
-                        f"PP rank {self.pp_rank}: unexpected poll state {poll} for rid {req.rid} "
+                        f"PP rank {self.ps.pp_rank}: unexpected poll state {poll} for rid {req.rid} "
                         f"from consensus; treating as undone"
                     )
                     undone_reqs.append(req)
@@ -631,7 +631,7 @@ class SchedulerDisaggregationPrefillMixin:
                 done_reqs.append(req)
                 req.time_stats.set_prefill_kv_transfer_finish_time()
             elif poll == KVPoll.Failed:
-                error_message = f"Prefill transfer failed for request rank={self.tp_rank} {req.rid=} {req.bootstrap_room=}"
+                error_message = f"Prefill transfer failed for request rank={self.ps.tp_rank} {req.rid=} {req.bootstrap_room=}"
                 try:
                     req.disagg_kv_sender.failure_exception()
                 except Exception as e:
