@@ -213,7 +213,6 @@ class DFlashVerifyInput(SpecInput):
                 last_loc,
                 len(batch.input_ids),
             )
-            self.last_loc = last_loc
 
         bs = batch.batch_size()
         assign_req_to_token_pool_func(
