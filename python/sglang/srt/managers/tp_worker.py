@@ -42,6 +42,10 @@ from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_executor.pool_configurator import MemoryPoolConfig
+from sglang.srt.model_executor.weight_updater import (
+    destroy_weights_update_group,
+    init_weights_update_group,
+)
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import MultiprocessingSerializer, broadcast_pyobj, set_random_seed
 from sglang.srt.utils.hf_transformers_utils import (
@@ -102,19 +106,22 @@ class BaseTpWorker(ABC):
         return success, message
 
     def init_weights_update_group(self, recv_req: InitWeightsUpdateGroupReqInput):
-        success, message = self.model_runner.init_weights_update_group(
-            recv_req.master_address,
-            recv_req.master_port,
-            recv_req.rank_offset,
-            recv_req.world_size,
-            recv_req.group_name,
-            recv_req.backend,
+        success, message = init_weights_update_group(
+            _model_update_group=self.model_runner._model_update_group,
+            tp_rank=self.model_runner.tp_rank,
+            master_address=recv_req.master_address,
+            master_port=recv_req.master_port,
+            rank_offset=recv_req.rank_offset,
+            world_size=recv_req.world_size,
+            group_name=recv_req.group_name,
+            backend=recv_req.backend,
         )
         return success, message
 
     def destroy_weights_update_group(self, recv_req: DestroyWeightsUpdateGroupReqInput):
-        success, message = self.model_runner.destroy_weights_update_group(
-            recv_req.group_name,
+        success, message = destroy_weights_update_group(
+            _model_update_group=self.model_runner._model_update_group,
+            group_name=recv_req.group_name,
         )
         return success, message
 
