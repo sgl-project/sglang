@@ -24,7 +24,6 @@ from sglang.test.test_utils import (
 
 register_cuda_ci(est_time=900, suite="stage-c-test-dsv4-8-gpu-h200")
 
-MODEL = "deepseek-ai/DeepSeek-V4-Flash"
 MODEL_FP8 = "sgl-project/DeepSeek-V4-Flash-FP8"
 SERVER_LAUNCH_TIMEOUT = 3600
 DEEPEP_CONFIG = '{"normal_dispatch":{"num_sms":96},"normal_combine":{"num_sms":96}}'
@@ -35,7 +34,7 @@ class TestDSV4FlashFP8H200(ServerSanityMixin, CustomTestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.model = try_cached_model(MODEL)
+        cls.model = try_cached_model(MODEL_FP8)
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(
             cls.model,

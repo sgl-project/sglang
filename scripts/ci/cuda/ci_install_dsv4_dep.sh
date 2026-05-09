@@ -51,8 +51,10 @@ fi
 ###############################################################################
 # Install DeepEP
 ###############################################################################
+# Default to a forced rebuild so switching the BLACKWELL flag (or any other
+# build-time input) doesn't silently reuse a cached deep_ep from a prior run.
 INSTALL_DEEPEP=1
-if [ "${FORCE_REBUILD_DEEPEP:-0}" = "1" ]; then
+if [ "${FORCE_REBUILD_DEEPEP:-1}" = "1" ]; then
     echo "FORCE_REBUILD_DEEPEP=1; uninstalling any cached deep_ep before rebuild."
     ${PIP_UNINSTALL_CMD:-pip uninstall -y} deep_ep ${PIP_UNINSTALL_SUFFIX:-} || true
 elif python3 -c "import deep_ep" >/dev/null 2>&1; then
