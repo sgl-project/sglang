@@ -28,6 +28,7 @@ import random
 import time
 import unittest
 import unittest.mock
+from types import SimpleNamespace
 
 import torch
 
@@ -38,10 +39,51 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     InsertParams,
     MatchPrefixParams,
 )
+from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
 
 # Test constants
 DEFAULT_PAGE_SIZE = 4
+
+
+class _MockTokenAllocator:
+    def __init__(self):
+        self.device = torch.device("cpu")
+        self.freed = []
+
+    def free(self, indices):
+        self.freed.append(indices.detach().cpu().clone())
+
+
+class _MockReqToTokenPool:
+    def __init__(self, max_reqs: int = 1, max_context_len: int = 32):
+        self.req_to_token = torch.full(
+            (max_reqs, max_context_len), -1, dtype=torch.int64
+        )
+
+
+class _DummyReq:
+    def __init__(
+        self,
+        tree: RadixCache,
+        req_pool_idx: int,
+        origin_input_ids: list[int],
+        output_ids: list[int],
+        custom_params: dict | None = None,
+    ):
+        self.req_pool_idx = req_pool_idx
+        self.origin_input_ids = origin_input_ids
+        self.output_ids = output_ids
+        self.fill_ids = origin_input_ids + output_ids
+        self.extra_key = None
+        self.cache_protected_len = 0
+        self.kv_committed_len = len(self.fill_ids)
+        self.last_node = tree.root_node
+        self.priority = 0
+        self.sampling_params = SimpleNamespace(custom_params=custom_params or {})
+
+    def pop_committed_kv_cache(self):
+        return self.kv_committed_len
 
 
 class TestRadixKey(unittest.TestCase):
@@ -242,6 +284,22 @@ class TestRadixCache(unittest.TestCase):
         """Set up test fixtures."""
         TreeNode.counter = 0
 
+    def _make_cache_finished_fixture(
+        self, page_size: int = DEFAULT_PAGE_SIZE, disable_finished_insert: bool = False
+    ):
+        req_to_token_pool = _MockReqToTokenPool()
+        allocator = _MockTokenAllocator()
+        cache = RadixCache(
+            CacheInitParams(
+                disable=False,
+                req_to_token_pool=req_to_token_pool,
+                token_to_kv_pool_allocator=allocator,
+                page_size=page_size,
+                disable_finished_insert=disable_finished_insert,
+            )
+        )
+        return cache, allocator, req_to_token_pool
+
     def test_init_variations(self):
         """Test cache initialization with different parameters."""
         test_cases = [
@@ -285,6 +343,66 @@ class TestRadixCache(unittest.TestCase):
         self.assertEqual(cache.total_size(), 0)
         self.assertEqual(cache.evictable_size(), 0)
         self.assertEqual(cache.protected_size(), 0)
+
+    def test_prefix_pin_commit_inserts_prompt_only_and_pins(self):
+        """PrefixPin commits only the page-aligned prompt prefix."""
+        cache, allocator, req_to_token_pool = self._make_cache_finished_fixture(
+            disable_finished_insert=True
+        )
+        prompt_ids = [1, 2, 3, 4, 5]
+        output_ids = [100, 101, 102]
+        kv_len = len(prompt_ids) + len(output_ids)
+        req_to_token_pool.req_to_token[0, :kv_len] = torch.arange(
+            10, 10 + kv_len, dtype=torch.int64
+        )
+        req = _DummyReq(
+            cache,
+            req_pool_idx=0,
+            origin_input_ids=prompt_ids,
+            output_ids=output_ids,
+            custom_params={
+                "prefix_pin_commit": True,
+                "prefix_pin_commit_len": len(prompt_ids),
+            },
+        )
+
+        cache.cache_finished_req(req, is_insert=True)
+
+        match = cache.match_prefix(
+            MatchPrefixParams(key=RadixKey(prompt_ids + output_ids))
+        )
+        self.assertEqual(len(match.device_indices), DEFAULT_PAGE_SIZE)
+        torch.testing.assert_close(
+            match.device_indices, torch.tensor([10, 11, 12, 13])
+        )
+        self.assertEqual(cache.total_size(), DEFAULT_PAGE_SIZE)
+        self.assertEqual(cache.protected_size(), DEFAULT_PAGE_SIZE)
+        self.assertEqual(cache.evictable_size(), 0)
+
+        freed = torch.cat([x for x in allocator.freed if len(x) > 0])
+        torch.testing.assert_close(freed, torch.tensor([14, 15, 16, 17]))
+
+    def test_prefix_pin_reuse_only_skips_finished_insert(self):
+        cache, allocator, req_to_token_pool = self._make_cache_finished_fixture()
+        token_ids = [1, 2, 3, 4]
+        req_to_token_pool.req_to_token[0, : len(token_ids)] = torch.arange(
+            20, 20 + len(token_ids), dtype=torch.int64
+        )
+        req = _DummyReq(
+            cache,
+            req_pool_idx=0,
+            origin_input_ids=token_ids,
+            output_ids=[],
+            custom_params={"prefix_pin_reuse_only": True},
+        )
+
+        cache.cache_finished_req(req, is_insert=True)
+
+        match = cache.match_prefix(MatchPrefixParams(key=RadixKey(token_ids)))
+        self.assertEqual(len(match.device_indices), 0)
+        self.assertEqual(cache.total_size(), 0)
+        freed = torch.cat([x for x in allocator.freed if len(x) > 0])
+        torch.testing.assert_close(freed, torch.tensor([20, 21, 22, 23]))
 
     def test_insert_and_match_basic(self):
         """Test basic insert and match operations."""

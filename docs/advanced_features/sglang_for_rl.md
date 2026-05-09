@@ -18,6 +18,32 @@ This philosophy empowers innovation by providing SGLang as flexible tools, not r
 
 The following sections cover these aspects in detail.
 
+## PrefixPin: Reuse Long Prompt KV Across RL Scoring
+
+RL pipelines often generate multiple samples from the same prompt and then score
+those samples with actor, reference, reward, or value models. When prompts are
+long and responses are short, repeatedly prefilling the same prompt dominates
+latency. PrefixPin lets an integration commit one page-aligned prompt prefix to
+the radix cache, pin it against eviction, and mark follower requests as
+reuse-only so they do not insert duplicate finished cache entries.
+
+PrefixPin is exposed through `sampling_params.custom_params` for low-level RL
+integrations:
+
+| Field | Description | Default |
+| --- | --- | --- |
+| `prefix_pin_commit` | Commit only the prompt prefix from this request. | `False` |
+| `prefix_pin_commit_len` | Number of prompt tokens to commit. If omitted, commits `len(origin_input_ids)`. | `None` |
+| `prefix_pin_protect` | Pin the committed radix node with `inc_lock_ref`. | `True` |
+| `prefix_pin_reuse_only` | Do not insert the finished follower/scoring request into radix cache. | `False` |
+
+Typical flow:
+
+1. Send a zero-token commit request with `prefix_pin_commit=True`.
+2. Send rollout or logprob follower requests with the same `extra_key`.
+3. Set `prefix_pin_reuse_only=True` on followers that should only reuse the
+   committed prefix.
+
 ## Fine-Grained Engine Sleep and Wake Up
 
 Rollout and training are both memory-intensive, and co-locating them on the same GPUs often leads to memory pressure and slow handoffs. SGLang provides a memory-aware sleep/wake mechanism that releases KV cache and weights while keeping the server process alive, then resumes them for rollout without a full restart. This avoids repeated disk I/O and CUDA graph recapture during each RL step.
