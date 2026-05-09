@@ -33,7 +33,7 @@ def _jit_qknorm_module(head_dim: int, dtype: torch.dtype) -> Module:
 
 _RMSNORM_WARP_SIZES = frozenset({64, 128, 256})
 _RMSNORM_MAX_HIDDEN_SIZE = 16384
-_RMSNORM_HALF_BLOCK_MIN_SIZE = 2048
+_RMSNORM_HALF_BLOCK_MIN_SIZE = 512
 
 
 def _is_supported_rmsnorm_hidden_size(d: int) -> bool:
