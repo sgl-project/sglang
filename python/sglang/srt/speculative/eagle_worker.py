@@ -514,13 +514,38 @@ class EAGLEWorker(TpModelWorker):
                     # batch.spec_info for the extend forward; the assembled
                     # next-iter EagleDraftInput is returned via batch_result
                     # and installed by the scheduler before the next draft.
-                    batch.spec_info = draft_extend_input
-                    next_draft_input = self.forward_draft_extend_after_decode(batch)
+                    extend_batch = batch
+                    if (
+                        not batch.forward_mode.is_idle()
+                        and draft_extend_input.input_ids.numel() == 0
+                    ):
+                        # All reqs finished this verify (only reachable when
+                        # dp_attention forces the forward). Run the extend on
+                        # an idle batch copy + idle ExtendInput so the original
+                        # batch is not mutated.
+                        extend_batch = batch.copy()
+                        extend_batch.prepare_for_idle()
+                        hidden_size = (
+                            self.model_config.hidden_size * 3
+                            if self.speculative_algorithm.is_eagle3()
+                            and self.eagle_use_aux_hidden_state
+                            else self.model_config.spec_hidden_size
+                        )
+                        draft_extend_input = EagleDraftExtendInput.create_idle_input(
+                            device=self.device,
+                            hidden_size=hidden_size,
+                            dtype=self.model_config.dtype,
+                            capture_hidden_mode=CaptureHiddenMode.LAST,
+                        )
+                    extend_batch.spec_info = draft_extend_input
+                    next_draft_input = self.forward_draft_extend_after_decode(
+                        extend_batch
+                    )
                 else:
-                    # All reqs finished this verify and dp_attention is not
-                    # forcing the forward. Use an empty EagleDraftInput so
-                    # next iter's merge_batch short-circuits on None
-                    # hidden_states (EagleVerifyInput has no merge_batch).
+                    # All reqs finished and dp_attention is not forcing the
+                    # forward. Use an empty EagleDraftInput so next iter's
+                    # merge_batch short-circuits on None hidden_states
+                    # (EagleVerifyInput has no merge_batch).
                     next_draft_input = EagleDraftInput(
                         capture_hidden_mode=CaptureHiddenMode.LAST,
                     )
@@ -1125,6 +1150,9 @@ class EAGLEWorker(TpModelWorker):
     def forward_draft_extend_after_decode(
         self, batch: ScheduleBatch
     ) -> EagleDraftInput:
+        # Caller installs the EagleDraftExtendInput on `batch.spec_info`
+        # (using either the verify-produced one or an idle one for the
+        # all-finished + dp_attention edge case).
         draft_extend_input: EagleDraftExtendInput = batch.spec_info
 
         # Backup fields that will be modified in-place
@@ -1134,24 +1162,6 @@ class EAGLEWorker(TpModelWorker):
         return_logprob_backup = batch.return_logprob
 
         input_is_idle = batch.forward_mode.is_idle()
-
-        if not input_is_idle and draft_extend_input.input_ids.numel() == 0:
-            # All reqs finished this verify; swap to an idle ExtendInput.
-            batch = batch.copy()
-            batch.prepare_for_idle()
-            hidden_size = (
-                self.model_config.hidden_size * 3
-                if self.speculative_algorithm.is_eagle3()
-                and self.eagle_use_aux_hidden_state
-                else self.model_config.spec_hidden_size
-            )
-            draft_extend_input = EagleDraftExtendInput.create_idle_input(
-                device=self.device,
-                hidden_size=hidden_size,
-                dtype=self.model_config.dtype,
-                capture_hidden_mode=CaptureHiddenMode.LAST,
-            )
-            batch.spec_info = draft_extend_input
 
         # Phase 1: prepare extend (kernel writes draft_extend_input.{positions, bonus_tokens})
         draft_extend_input.num_tokens_per_req = self.speculative_num_steps + 1
