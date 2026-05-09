@@ -488,7 +488,7 @@ class EAGLEWorker(TpModelWorker):
 
             # Install verify_input as `batch.spec_info` for the verify forward.
             batch.spec_info = verify_input
-            logits_output, verify_output, can_run_cuda_graph = self.verify(batch)
+            verify_output = self.verify(batch)
 
             if get_global_tracing_enabled():
                 for idx, req in enumerate(batch.reqs):
@@ -534,11 +534,11 @@ class EAGLEWorker(TpModelWorker):
                 )
 
             return GenerationBatchResult(
-                logits_output=logits_output,
+                logits_output=verify_output.logits_output,
                 next_token_ids=verify_output.accept_tokens,
                 num_accepted_drafts=sum(verify_output.num_accepted_drafts_per_req_cpu),
                 num_accepted_drafts_per_req_cpu=verify_output.num_accepted_drafts_per_req_cpu,
-                can_run_cuda_graph=can_run_cuda_graph,
+                can_run_cuda_graph=verify_output.can_run_cuda_graph,
             )
 
     def check_forward_draft_extend_after_decode(
@@ -994,7 +994,8 @@ class EAGLEWorker(TpModelWorker):
             ForwardMode.DECODE if not batch.forward_mode.is_idle() else ForwardMode.IDLE
         )
 
-        return logits_output, res, can_run_cuda_graph
+        res.can_run_cuda_graph = can_run_cuda_graph
+        return res
 
     def _mamba_verify_update(
         self,
