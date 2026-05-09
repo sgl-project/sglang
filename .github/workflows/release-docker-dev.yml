@@ -61,7 +61,7 @@ jobs:
             publish_default_cuda_alias: false
             hopper_sbo: 1
             w4a8_per_tensor_transfer: 0
-            variant_suffix: hopper-sbo
+            variant_suffix: sbo
             artifact_name: sgl-kernel-x86
           - cuda_key: cu129
             cuda_version: 12.9.1
@@ -69,7 +69,7 @@ jobs:
             publish_default_cuda_alias: false
             hopper_sbo: 0
             w4a8_per_tensor_transfer: 1
-            variant_suffix: w4a8-per-tensor-transfer
+            variant_suffix: w4a8
             artifact_name: sgl-kernel-x86
           - cuda_key: cu130
             cuda_version: 13.0.1
@@ -85,7 +85,7 @@ jobs:
             publish_default_cuda_alias: true
             hopper_sbo: 1
             w4a8_per_tensor_transfer: 0
-            variant_suffix: hopper-sbo
+            variant_suffix: sbo
             artifact_name: sgl-kernel-x86-cu13
           - cuda_key: cu130
             cuda_version: 13.0.1
@@ -93,7 +93,7 @@ jobs:
             publish_default_cuda_alias: true
             hopper_sbo: 0
             w4a8_per_tensor_transfer: 1
-            variant_suffix: w4a8-per-tensor-transfer
+            variant_suffix: w4a8
             artifact_name: sgl-kernel-x86-cu13
     uses: ./.github/workflows/_docker-build-and-publish.yml
     with:
