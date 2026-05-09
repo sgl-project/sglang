@@ -283,10 +283,10 @@ class MultiLayerEagleWorker(TpModelWorker):
                 # when DP attention is enabled, but it is slow. Skip it for now.
                 if (
                     self.server_args.enable_dp_attention
-                    or batch.spec_info.accept_tokens.shape[0] > 0
+                    or verify_output.unfinished_accept_tokens.shape[0] > 0
                 ):
                     # decode is not finished
-                    self.forward_draft_extend_after_decode(batch)
+                    self.forward_draft_extend_after_decode(batch, verify_output)
 
             return GenerationBatchResult(
                 logits_output=logits_output,
@@ -295,8 +295,10 @@ class MultiLayerEagleWorker(TpModelWorker):
                 can_run_cuda_graph=can_run_cuda_graph,
             )
 
-    def check_forward_draft_extend_after_decode(self, batch: ScheduleBatch):
-        local_need_forward = batch.spec_info.accept_tokens.shape[0] > 0
+    def check_forward_draft_extend_after_decode(
+        self, batch: ScheduleBatch, verify_output: EagleVerifyOutput
+    ):
+        local_need_forward = verify_output.unfinished_accept_tokens.shape[0] > 0
         if not self.server_args.enable_dp_attention:
             return local_need_forward
 
@@ -589,7 +591,7 @@ class MultiLayerEagleWorker(TpModelWorker):
         batch.forward_mode = (
             ForwardMode.DECODE if not batch.forward_mode.is_idle() else ForwardMode.IDLE
         )
-        batch.spec_info = res.draft_input
+        batch.spec_info = res.next_draft_input
 
         return logits_output, res, model_worker_batch, can_run_cuda_graph
 
@@ -652,7 +654,9 @@ class MultiLayerEagleWorker(TpModelWorker):
         forward_batch.spec_info.topk_p = torch.cat(topk_p_list, dim=1)
         forward_batch.spec_info.topk_index = torch.cat(topk_index_list, dim=1)
 
-    def forward_draft_extend_after_decode(self, batch: ScheduleBatch):
+    def forward_draft_extend_after_decode(
+        self, batch: ScheduleBatch, verify_output: EagleVerifyOutput
+    ):
         assert isinstance(batch.spec_info, EagleDraftInput)
         # Backup fields that will be modified in-place
         seq_lens_backup = batch.seq_lens.clone()
@@ -664,7 +668,7 @@ class MultiLayerEagleWorker(TpModelWorker):
 
         input_is_idle = batch.forward_mode.is_idle()
 
-        if not input_is_idle and batch.spec_info.accept_tokens.numel() == 0:
+        if not input_is_idle and verify_output.unfinished_accept_tokens.numel() == 0:
             batch = batch.copy()
             batch.prepare_for_idle()
             hidden_size = (
@@ -684,7 +688,8 @@ class MultiLayerEagleWorker(TpModelWorker):
         batch.spec_info.num_tokens_for_logprob_per_req = 1
         batch.spec_info.prepare_extend_after_decode(
             batch,
-            self.speculative_num_steps,
+            verify_output=verify_output,
+            speculative_num_steps=self.speculative_num_steps,
         )
         batch.forward_mode = (
             ForwardMode.DRAFT_EXTEND

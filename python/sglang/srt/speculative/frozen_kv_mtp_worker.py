@@ -43,6 +43,7 @@ from sglang.srt.model_executor.pool_configurator import MemoryPoolConfig
 from sglang.srt.observability.req_time_stats import set_time_batch
 from sglang.srt.observability.trace import get_global_tracing_enabled
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.speculative.eagle_info import EagleVerifyOutput
 from sglang.srt.speculative.eagle_utils import (
     build_tree_kernel_efficient,
     organize_draft_results,
@@ -463,7 +464,7 @@ class FrozenKVMTPWorker(TpModelWorker):
                 self.server_args.enable_dp_attention
                 or batch.spec_info.bonus_tokens.numel()
             ):
-                self.forward_draft_extend_after_decode(batch)
+                self.forward_draft_extend_after_decode(batch, verify_output)
         set_time_batch(batch.reqs, "set_spec_draft_extend_end_time", trace_only=True)
 
         return GenerationBatchResult(
@@ -504,7 +505,9 @@ class FrozenKVMTPWorker(TpModelWorker):
             mm_input_embeds=mm_input_embeds,
         )
 
-    def forward_draft_extend_after_decode(self, batch: ScheduleBatch) -> None:
+    def forward_draft_extend_after_decode(
+        self, batch: ScheduleBatch, verify_output: EagleVerifyOutput
+    ) -> None:
         assert isinstance(batch.spec_info, FrozenKVMTPDraftInput)
         input_is_idle = batch.forward_mode.is_idle()
         if not input_is_idle and batch.spec_info.bonus_tokens.numel() == 0:
@@ -527,19 +530,18 @@ class FrozenKVMTPWorker(TpModelWorker):
         req_pool_indices_backup = batch.req_pool_indices
 
         try:
-            if draft_input.seq_lens_for_draft_extend is not None:
-                # Verify may leave finished requests in ScheduleBatch; seed only
-                # the unfinished requests carried by draft_input.
-                batch.seq_lens = draft_input.seq_lens_for_draft_extend
-                batch.seq_lens_cpu = draft_input.seq_lens_for_draft_extend_cpu
-                batch.req_pool_indices = draft_input.req_pool_indices_for_draft_extend
+            # Verify may leave finished requests in ScheduleBatch; seed only
+            # the unfinished requests carried by `verify_output`.
+            batch.seq_lens = verify_output.seq_lens_for_draft_extend
+            batch.seq_lens_cpu = verify_output.seq_lens_for_draft_extend_cpu
+            batch.req_pool_indices = verify_output.req_pool_indices_for_draft_extend
 
             last_token_ids, last_hidden = self._select_last_verified_seed(draft_input)
             self._run_assistant_seed_step(
                 batch,
                 last_token_ids,
                 last_hidden,
-                seq_lens_cpu=draft_input.seq_lens_for_draft_extend_cpu,
+                seq_lens_cpu=verify_output.seq_lens_for_draft_extend_cpu,
                 draft_input=draft_input,
             )
         finally:
@@ -766,7 +768,7 @@ class FrozenKVMTPWorker(TpModelWorker):
         batch.forward_mode = (
             ForwardMode.DECODE if not batch.forward_mode.is_idle() else ForwardMode.IDLE
         )
-        batch.spec_info = res.draft_input
+        batch.spec_info = res.next_draft_input
 
         del seq_lens_pre_verify
         return logits_output, res, model_worker_batch, can_run_cuda_graph
