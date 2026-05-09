@@ -439,15 +439,15 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
         """Cache request when it finishes."""
         custom_params = getattr(req.sampling_params, "custom_params", None)
         custom_params = custom_params if isinstance(custom_params, dict) else {}
-        prefix_pin_commit = bool(custom_params.get("prefix_pin_commit", False))
-        prefix_pin_reuse_only = bool(
-            custom_params.get("prefix_pin_reuse_only", False)
+        rollout_kv_commit = bool(custom_params.get("rollout_kv_commit", False))
+        rollout_kv_reuse_only = bool(
+            custom_params.get("rollout_kv_reuse_only", False)
         )
 
         # In deterministic mode, disable finished request insertion to radix cache
-        if self.disable_finished_insert and not prefix_pin_commit:
+        if self.disable_finished_insert and not rollout_kv_commit:
             is_insert = False
-        if prefix_pin_reuse_only:
+        if rollout_kv_reuse_only:
             is_insert = False
 
         kv_committed_len = req.pop_committed_kv_cache()
@@ -462,8 +462,8 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
             req.req_pool_idx, :kv_committed_len
         ]
 
-        if prefix_pin_commit:
-            requested_commit_len = custom_params.get("prefix_pin_commit_len")
+        if rollout_kv_commit:
+            requested_commit_len = custom_params.get("rollout_kv_commit_len")
             if requested_commit_len is None:
                 requested_commit_len = len(req.origin_input_ids)
             commit_len = min(
@@ -493,8 +493,8 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
                 kv_indices[req.cache_protected_len : result.prefix_len]
             )
             if (
-                prefix_pin_commit
-                and custom_params.get("prefix_pin_protect", True)
+                rollout_kv_commit
+                and custom_params.get("rollout_kv_protect", True)
                 and key_len > 0
             ):
                 match_result = self.match_prefix(MatchPrefixParams(key=radix_key))

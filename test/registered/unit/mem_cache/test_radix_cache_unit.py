@@ -432,8 +432,8 @@ class TestRadixCache(unittest.TestCase):
         self.assertEqual(cache.evictable_size(), 0)
         self.assertEqual(cache.protected_size(), 0)
 
-    def test_prefix_pin_commit_inserts_prompt_only_and_pins(self):
-        """PrefixPin commits only the page-aligned prompt prefix."""
+    def test_rollout_kv_commit_inserts_prompt_only_and_pins(self):
+        """RolloutKV commits only the page-aligned prompt prefix."""
         cache, allocator, req_to_token_pool = self._make_cache_finished_fixture(
             disable_finished_insert=True
         )
@@ -449,8 +449,8 @@ class TestRadixCache(unittest.TestCase):
             origin_input_ids=prompt_ids,
             output_ids=output_ids,
             custom_params={
-                "prefix_pin_commit": True,
-                "prefix_pin_commit_len": len(prompt_ids),
+                "rollout_kv_commit": True,
+                "rollout_kv_commit_len": len(prompt_ids),
             },
         )
 
@@ -470,7 +470,7 @@ class TestRadixCache(unittest.TestCase):
         freed = torch.cat([x for x in allocator.freed if len(x) > 0])
         torch.testing.assert_close(freed, torch.tensor([14, 15, 16, 17]))
 
-    def test_prefix_pin_reuse_only_skips_finished_insert(self):
+    def test_rollout_kv_reuse_only_skips_finished_insert(self):
         cache, allocator, req_to_token_pool = self._make_cache_finished_fixture()
         token_ids = [1, 2, 3, 4]
         req_to_token_pool.req_to_token[0, : len(token_ids)] = torch.arange(
@@ -481,7 +481,7 @@ class TestRadixCache(unittest.TestCase):
             req_pool_idx=0,
             origin_input_ids=token_ids,
             output_ids=[],
-            custom_params={"prefix_pin_reuse_only": True},
+            custom_params={"rollout_kv_reuse_only": True},
         )
 
         cache.cache_finished_req(req, is_insert=True)
