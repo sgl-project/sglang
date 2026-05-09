@@ -73,7 +73,7 @@ class MLPSyncBatchInfo:
     def all_gather(self, device, group: torch.distributed.ProcessGroup):
         local_info_tensor = self._get_local_tensor(device=device)
         global_info_tensor = torch.empty(
-            (self.dp_size, self.tp_size * self.cp_size, 6),
+            (self.ps.dp_size, self.ps.tp_size * self.cp_size, 6),
             dtype=torch.int64,
             device=device,
         )
@@ -89,7 +89,7 @@ class MLPSyncBatchInfo:
             tp_active_ranks = get_tp_group().active_ranks
 
         # Set fallback values for inactive ranks
-        tp_info = global_info_tensor.view(self.dp_size * self.tp_size * self.cp_size, 6)
+        tp_info = global_info_tensor.view(self.ps.dp_size * self.ps.tp_size * self.cp_size, 6)
         tp_info[tp_active_ranks == 0] = self._get_fallback_tensor(device=device)
 
         tp0_info = global_info_tensor[:, 0, :]
@@ -230,8 +230,8 @@ class SchedulerDPAttnMixin:
         return prepare_mlp_sync_batch_raw(
             local_batch,
             dp_size=self.server_args.dp_size,
-            attn_tp_size=self.attn_tp_size,
-            attn_cp_size=self.attn_cp_size,
+            attn_tp_size=self.ps.attn_tp_size,
+            attn_cp_size=self.ps.attn_cp_size,
             tp_group=self.tp_group,
             get_idle_batch=self.get_idle_batch,
             disable_cuda_graph=self.server_args.disable_cuda_graph,
