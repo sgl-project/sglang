@@ -3018,14 +3018,15 @@ class Scheduler(
                 future_indices_or_next_token_ids = batch_result.next_token_ids
                 self.update_cache_from_scheduler(batch, batch_result)
 
-            # Unified relay: this iter's draft-extend output becomes next
-            # iter's draft spec_info. V1 + V2 share this install.
             if batch_result.next_draft_input is not None:
                 batch.spec_info = batch_result.next_draft_input
                 if batch.is_spec_v2:
-                    # V2 overlap extras: thread future_indices into spec_info
-                    # and override batch.seq_lens with the post-verify lengths.
+                    # FIXME(lsyin): tmp code for spec v2
+                    # We only keep future indices for next draft input
                     batch.spec_info.future_indices = future_indices
+
+                    # The future value, usually for next batch preparation
+                    # Current implementation strictly synchronizes the seq_lens
                     batch.seq_lens = batch_result.next_draft_input.new_seq_lens
 
             # NOTE: future_indices_or_next_token_ids is used in ScheduleBatch,
