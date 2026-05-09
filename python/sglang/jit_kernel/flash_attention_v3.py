@@ -89,11 +89,12 @@ def _is_fa3_supported(device=None) -> bool:
     #  https://docs.nvidia.com/cuda/cuda-c-programming-guide/#shared-memory-8-x
     #  And for sgl-kernel right now, we can build fa3 on sm80/sm86/sm89/sm90a.
     #  That means if you use A100/A*0/L20/L40/L40s/4090 you can use fa3.
-    major, minor = get_device_capability()
-    if is_musa():
-        return major >= 3
     if torch.version.cuda is not None and torch.version.cuda >= "12.3":
+        major, minor = get_device_capability()
         return major == 9 or major == 8
+    if is_musa():
+        major, minor = get_device_capability()
+        return major >= 3
     return False
 
 

@@ -217,6 +217,9 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         }
         if not backends:
             return None
+        non_sdpa_backends = backends - {AttentionBackendEnum.TORCH_SDPA}
+        if non_sdpa_backends:
+            backends = non_sdpa_backends
         if len(backends) > 1:
             logger.warning(
                 "Multiple transformer attention backends detected: %s. "
