@@ -504,11 +504,18 @@ class MambaMixer2(torch.nn.Module):
             dim=-1,
         )
 
-        num_prefills = metadata.num_prefills  # request count
-        # Use real (un-padded) decode count for splits and kernel calls below.
-        # `metadata.num_decodes` may include DP-padded dummy entries; their
-        # state_indices alias real slots and would corrupt SSM state if the
-        # kernel touched them. See note above the early trim.
+        # Use real (un-padded) prefill REQ count and decode count for splits
+        # and kernel calls below. Both `metadata.num_prefills` and
+        # `metadata.num_decodes` may include DP-padded dummy entries; padded
+        # entries' `mamba_cache_indices` alias real reqs' SSM slots, and the
+        # mamba kernels would write garbage state into those slots if asked
+        # to process the padded entries. `state_indices_tensor` is sized to
+        # the padded total — slice (not split) below to drop the padded tail.
+        num_prefills = (
+            metadata.num_actual_prefills
+            if metadata.num_actual_prefills is not None
+            else metadata.num_prefills
+        )
         num_decodes = (
             metadata.num_actual_decodes
             if metadata.num_actual_decodes is not None
@@ -572,7 +579,9 @@ class MambaMixer2(torch.nn.Module):
             # 2. Convolution sequence transformation
             # - "cache_indices" updates the conv_state cache in positions
             #   pointed to by "state_indices_tensor"
-            has_initial_states_p = mixed_metadata.has_initial_states
+            # `has_initial_states` is sized to the padded prefill count;
+            # trim to real to match `state_indices_tensor_p` for broadcast.
+            has_initial_states_p = mixed_metadata.has_initial_states[:num_prefills]
             prep_initial_states = mixed_metadata.prep_initial_states
             cache_indices = state_indices_tensor_p
             x = hidden_states_B_C_p.transpose(

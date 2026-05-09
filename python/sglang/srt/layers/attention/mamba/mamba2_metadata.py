@@ -62,6 +62,15 @@ class Mamba2Metadata(ForwardMetadata):
     # decode-side tensors before kernel dispatch. Falls back to `num_decodes`
     # when None (e.g. CUDA-graph capture path where padding info is unavailable).
     num_actual_decodes: Optional[int] = None
+    # Real (non-DP-padded) prefill REQ count for THIS DP rank. Same alias-padding
+    # hazard as decode: padded `extend_seq_lens` entries inflate `num_prefills`,
+    # and `mamba_chunk_scan_combined` always returns `varlen_state` of shape
+    # `(num_prefills, ...)` even for 0-length padded sequences. Writing
+    # `ssm_state[state_indices_tensor_p] = varlen_state` with dummy slots that
+    # alias real reqs' SSM slots overwrites a real req's accumulated state with
+    # garbage from the dummy. `num_actual_prefills` lets the mixer trim state
+    # writes to real prefills only. Falls back to `num_prefills` when None.
+    num_actual_prefills: Optional[int] = None
 
     @dataclass(kw_only=True, frozen=True)
     class MixedMetadata:
@@ -272,6 +281,15 @@ class Mamba2Metadata(ForwardMetadata):
                 num_actual_decodes = real_decode_tokens // max(draft_token_num, 1)
             else:
                 num_actual_decodes = real_decode_tokens
+        # Real per-DP-rank prefill REQ count: `extend_seq_lens_cpu` is the
+        # ScheduleBatch's pre-padding list, while `forward_batch.extend_seq_lens`
+        # (GPU tensor used to derive `num_prefills`) is padded to `bs`. Padded
+        # entries are 0-length but still occupy a slot in the chunk-scan
+        # output and in `state_indices_tensor_p`, so without trimming they
+        # would write garbage into real reqs' SSM slots.
+        num_actual_prefills: Optional[int] = None
+        if forward_batch.extend_seq_lens_cpu is not None:
+            num_actual_prefills = len(forward_batch.extend_seq_lens_cpu)
         return Mamba2Metadata(
             query_start_loc=query_start_loc,
             mamba_cache_indices=forward_metadata.mamba_cache_indices,
@@ -282,6 +300,7 @@ class Mamba2Metadata(ForwardMetadata):
             num_prefill_tokens=num_prefill_tokens,
             num_decodes=num_decodes,
             num_actual_decodes=num_actual_decodes,
+            num_actual_prefills=num_actual_prefills,
             is_target_verify=forward_batch.forward_mode.is_target_verify(),
             draft_token_num=draft_token_num,
             mixed_metadata=cls.MixedMetadata(
