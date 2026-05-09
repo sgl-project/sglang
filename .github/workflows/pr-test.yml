@@ -227,21 +227,25 @@ jobs:
         id: set-include-tags
         env:
           GH_TOKEN: ${{ github.token }}
+          PR_LABELS_JOINED: "${{ join(github.event.pull_request.labels.*.name, ',') }}"
         run: |
           # Forward the labels that drive --include-tags to run_suite.py.
           #
           # - Scheduled cron: pass `*` so every nightly test in the
-          #   compatible-suite set is pulled in (complete CI on each cron
-          #   tick — distinct from the simplified per-commit set on PR push).
-          # - pull_request: forward the PR's labels verbatim.
+          #   compatible-suite set is pulled in (full CI on each cron
+          #   tick — distinct from the baseline per-commit set on PR push).
+          # - pull_request: forward the PR's labels verbatim. The join is
+          #   computed in the env: block above so YAML quoting works for
+          #   the comma separator (block-scalar `run:` would preserve the
+          #   single-quote-escape '','' literally and confuse the expr
+          #   parser into seeing 3 args).
           # - workflow_dispatch /rerun-stage: look up the underlying PR's
-          #   labels via the GitHub API (same pattern as the parallelism
-          #   step above).
+          #   labels via the GitHub API.
           # - other events: empty (per-commit-only baseline, like today).
           if [[ "${{ github.event_name }}" == "schedule" ]]; then
             TAGS='*'
           elif [[ "${{ github.event_name }}" == "pull_request" ]]; then
-            TAGS='${{ join(github.event.pull_request.labels.*.name, '','') }}'
+            TAGS="$PR_LABELS_JOINED"
           elif [[ -n "${{ inputs.target_stage }}" ]]; then
             TAGS=""
             PR_HEAD_SHA="${{ inputs.pr_head_sha }}"
