@@ -54,19 +54,6 @@ from sglang.multimodal_gen.test.test_utils import (
 
 _CACHE_DIT_CONFIG_DIR = Path(__file__).parent / "configs"
 
-CACHE_DIT_T2I_SMOKE_sampling_params = replace(
-    T2I_sampling_params,
-    output_size="512x512",
-    extras={"num_inference_steps": 8, "seed": 0},
-)
-
-CACHE_DIT_T2V_SP_SMOKE_sampling_params = replace(
-    T2V_sampling_params,
-    output_size="832x480",
-    num_frames=5,
-    extras={"num_inference_steps": 8, "seed": 0},
-)
-
 # All test cases with clean default values
 # To test different models, simply add more DiffusionCase entries
 ONE_GPU_CASES: list[DiffusionTestCase] = [
@@ -97,7 +84,11 @@ ONE_GPU_CASES: list[DiffusionTestCase] = [
                 str(_CACHE_DIT_CONFIG_DIR / "cache_dit_scm_config.yaml"),
             ],
         ),
-        CACHE_DIT_T2I_SMOKE_sampling_params,
+        replace(
+            T2I_sampling_params,
+            output_size="512x512",
+            extras={"num_inference_steps": 8, "seed": 0},
+        ),
         run_perf_check=False,
         run_consistency_check=False,
         run_component_accuracy_check=False,
@@ -565,7 +556,12 @@ TWO_GPU_CASES = [
             enable_cache_dit=True,
             env_vars={"SGLANG_CACHE_DIT_WARMUP": "2"},
         ),
-        CACHE_DIT_T2V_SP_SMOKE_sampling_params,
+        replace(
+            T2V_sampling_params,
+            output_size="832x480",
+            num_frames=5,
+            extras={"num_inference_steps": 8, "seed": 0},
+        ),
         run_perf_check=False,
         run_consistency_check=False,
         run_component_accuracy_check=False,
