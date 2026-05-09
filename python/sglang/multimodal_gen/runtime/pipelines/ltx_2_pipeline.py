@@ -265,6 +265,13 @@ def _add_ltx2_decoding_stage(pipeline: ComposedPipelineBase):
 class LTX2FlowMatchScheduler(FlowMatchEulerDiscreteScheduler):
     """Override ``_time_shift_exponential`` to use torch f32 instead of numpy f64."""
 
+    def stretch_shift_to_terminal(self, t):
+        one_minus_z = 1 - t
+        scale_factor = one_minus_z[-1] / (1 - self.config.shift_terminal)
+        if scale_factor == 0:
+            return t
+        return 1 - (one_minus_z / scale_factor)
+
     def set_timesteps(
         self,
         num_inference_steps=None,

@@ -1569,6 +1569,11 @@ class LTX2DenoisingStage(DenoisingStage):
             device = get_local_torch_device()
             ctx.latents = ctx.latents.to(device)
             ctx.timesteps = ctx.timesteps.to(device)
+            for scheduler in (ctx.scheduler, ctx.audio_scheduler):
+                for name in ("timesteps", "sigmas"):
+                    value = getattr(scheduler, name, None)
+                    if isinstance(value, torch.Tensor):
+                        setattr(scheduler, name, value.to(device))
             if ctx.audio_latents is not None:
                 ctx.audio_latents = ctx.audio_latents.to(device)
             if ctx.guidance is not None:
