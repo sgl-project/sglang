@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
 Write back the result of a Rerun Test workflow run into its parent reply
-comment, by replacing the leading rocket emoji on the marker's line with a
-success/failure icon.
+comment, by replacing the hourglass placeholder on the marker's line with
+a success/failure icon. The leading rocket on the line is preserved as a
+visual anchor that this line came from a slash-command trigger.
 
 Concurrent dispatches against the same reply comment are serialized at the
 GitHub Actions layer via job-level `concurrency`, so a simple
@@ -58,7 +59,7 @@ def main():
     new_lines = []
     for line in body.splitlines(keepends=True):
         if args.marker in line:
-            line = line.replace("🚀", icon, 1)
+            line = line.replace("⏳", icon, 1)
             line = line.replace(args.marker, done_marker)
         new_lines.append(line)
     new_body = "".join(new_lines)

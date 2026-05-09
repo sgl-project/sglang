@@ -1138,12 +1138,12 @@ def handle_rerun_test(
             if dr.get("run_url"):
                 lines.append(
                     f"🚀 `{dr['runner_label']}` ({len(dr['test_commands'])} test{'s' if len(dr['test_commands']) > 1 else ''}): "
-                    f"[View workflow run]({dr['run_url']}) {marker}\n"
+                    f"⏳ [View workflow run]({dr['run_url']}) {marker}\n"
                     f"```\n{cmds}\n```"
                 )
             else:
                 lines.append(
-                    f"🚀 `{dr['runner_label']}` ({len(dr['test_commands'])} test{'s' if len(dr['test_commands']) > 1 else ''}): {marker}\n"
+                    f"🚀 `{dr['runner_label']}` ({len(dr['test_commands'])} test{'s' if len(dr['test_commands']) > 1 else ''}): ⏳ {marker}\n"
                     f"```\n{cmds}\n```\n"
                     f"⚠️ Could not retrieve workflow run URL. "
                     f"Check the [Actions tab](https://github.com/{gh_repo.full_name}/actions) for progress."
