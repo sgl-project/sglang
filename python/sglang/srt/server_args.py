@@ -791,6 +791,7 @@ class ServerArgs:
     weight_loader_disable_mmap: bool = False
     weight_loader_prefetch_checkpoints: bool = False
     weight_loader_prefetch_num_threads: int = 4
+    weight_loader_drop_cache_after_load: bool = False
     remote_instance_weight_loader_seed_instance_ip: Optional[str] = None
     remote_instance_weight_loader_seed_instance_service_port: Optional[int] = None
     remote_instance_weight_loader_send_weights_group_ports: Optional[List[int]] = None
@@ -6657,6 +6658,11 @@ class ServerArgs:
             type=int,
             default=ServerArgs.weight_loader_prefetch_num_threads,
             help="Number of threads per rank for checkpoint prefetching (default: 4).",
+        )
+        parser.add_argument(
+            "--weight-loader-drop-cache-after-load",
+            action="store_true",
+            help="Call posix_fadvise(DONTNEED) on each safetensors shard after loading it.",
         )
         parser.add_argument(
             "--remote-instance-weight-loader-seed-instance-ip",
