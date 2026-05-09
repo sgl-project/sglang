@@ -240,7 +240,7 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
         accepted token logits.
         """
         if batch.forward_mode.is_idle():
-            draft_input = EagleDraftInput.create_idle_input(
+            next_draft_input = EagleDraftInput.create_idle_input(
                 device=batch.device,
                 hidden_size=batch.model_config.spec_hidden_size,
                 dtype=batch.model_config.dtype,
@@ -248,7 +248,7 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                 capture_hidden_mode=CaptureHiddenMode.LAST,
             )
             return EagleVerifyOutput.create_idle(
-                next_draft_input=draft_input,
+                next_draft_input=next_draft_input,
                 logits_output=logits_output,
                 device=batch.device,
                 spec_steps=self.spec_steps,
@@ -545,7 +545,7 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
             batch.seq_lens.add_(num_accepted_drafts + 1)
             batch.seq_lens_cpu.add_(num_accepted_tokens_cpu)
 
-            draft_input = EagleDraftInput(
+            next_draft_input = EagleDraftInput(
                 hidden_states=batch.spec_info.hidden_states[accept_index],
                 num_accepted_drafts=num_accepted_drafts,
                 num_accepted_tokens=num_accepted_drafts + 1,
@@ -553,7 +553,7 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
             )
 
             return EagleVerifyOutput(
-                next_draft_input=draft_input,
+                next_draft_input=next_draft_input,
                 logits_output=logits_output,
                 accept_tokens=accept_tokens,
                 next_extend_input_ids=accept_tokens,
@@ -620,7 +620,7 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                 req_pool_indices_for_draft_extend = batch.req_pool_indices[
                     unfinished_index_device
                 ]
-                draft_input = EagleDraftInput(
+                next_draft_input = EagleDraftInput(
                     hidden_states=batch.spec_info.hidden_states[
                         unfinished_accept_index
                     ],
@@ -643,7 +643,7 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                     dtype=batch.req_pool_indices.dtype,
                     device=batch.req_pool_indices.device,
                 )
-                draft_input = EagleDraftInput.create_idle_input(
+                next_draft_input = EagleDraftInput.create_idle_input(
                     device=batch.device,
                     hidden_size=batch.model_config.spec_hidden_size,
                     dtype=batch.model_config.dtype,
@@ -652,7 +652,7 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                 )
 
             return EagleVerifyOutput(
-                next_draft_input=draft_input,
+                next_draft_input=next_draft_input,
                 logits_output=logits_output,
                 accept_tokens=accept_tokens,
                 next_extend_input_ids=next_extend_input_ids,
