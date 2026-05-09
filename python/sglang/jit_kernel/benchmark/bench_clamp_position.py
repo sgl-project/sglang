@@ -16,15 +16,19 @@ from sglang.test.ci.ci_register import register_cuda_ci
 register_cuda_ci(est_time=13, suite="stage-b-kernel-benchmark-1-gpu-large")
 
 SIZE_LIST = get_benchmark_range(
-    full_range=[2**n for n in range(4, 16)],
+    full_range=[2**n for n in range(4, 16)] + [2**20, 2**22, 2**24],
     ci_range=[256, 4096],
 )
+DTYPE_LIST = get_benchmark_range(
+    full_range=[torch.int32, torch.int64],
+    ci_range=[torch.int32],
+)
 
-configs = list(itertools.product(SIZE_LIST))
+configs = list(itertools.product(SIZE_LIST, DTYPE_LIST))
 
 
 def _torch_clamp_position(seq_lens):
-    return torch.clamp(seq_lens - 1, min=0).to(torch.int64)
+    return torch.clamp(seq_lens - 1, min=0).to(seq_lens.dtype)
 
 
 _compiled_clamp_position = torch.compile(
@@ -34,7 +38,7 @@ _compiled_clamp_position = torch.compile(
 
 @triton.testing.perf_report(
     triton.testing.Benchmark(
-        x_names=["size"],
+        x_names=["size", "dtype"],
         x_vals=configs,
         line_arg="provider",
         line_vals=["jit", "torch_compile", "torch"],
@@ -45,9 +49,9 @@ _compiled_clamp_position = torch.compile(
         args={},
     )
 )
-def benchmark(size: int, provider: str):
+def benchmark(size: int, dtype: torch.dtype, provider: str):
     seq_lens = torch.randint(
-        0, 10000, (size,), dtype=torch.int64, device=DEFAULT_DEVICE
+        0, 10000, (size,), dtype=dtype, device=DEFAULT_DEVICE
     )
 
     if provider == "jit":

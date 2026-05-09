@@ -42,5 +42,13 @@ class TestClampPosition:
         assert torch.equal(result, expected)
 
 
+@pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
+def test_clamp_position_large_and_unaligned(dtype: torch.dtype) -> None:
+    seq_lens = torch.randint(0, 10000, (1048578,), dtype=dtype, device="cuda")[1:]
+    expected = _reference_clamp_position(seq_lens)
+    result = clamp_position_cuda(seq_lens)
+    assert torch.equal(result, expected)
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v", "-s"]))
