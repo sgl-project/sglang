@@ -48,6 +48,9 @@ from sglang.multimodal_gen.runtime.utils.model_overlay import (
     maybe_load_overlay_model_index,
     maybe_resolve_overlay_model_path,
 )
+from sglang.multimodal_gen.runtime.utils.quantization_utils import (
+    normalize_flat_modelopt_quant_config,
+)
 from sglang.srt.environ import envs
 from sglang.utils import is_in_ci
 
@@ -311,13 +314,50 @@ def load_dict(file_path):
         ) from e
 
 
+def prepare_diffusers_component_path_for_loading(component_path: str) -> str:
+    """Download component repos if needed and patch legacy flat ModelOpt configs."""
+    local_component_path = (
+        maybe_download_model(component_path)
+        if not os.path.exists(component_path)
+        else component_path
+    )
+    config_path = os.path.join(local_component_path, "config.json")
+    if not os.path.exists(config_path):
+        return local_component_path
+
+    with get_lock(config_path):
+        try:
+            with open(config_path, encoding="utf-8") as f:
+                config = cast(dict[str, Any], json.load(f))
+        except Exception as exc:
+            logger.warning("Failed to read component config %s: %s", config_path, exc)
+            return local_component_path
+
+        quant_config = config.get("quantization_config")
+        normalized_quant_config = normalize_flat_modelopt_quant_config(quant_config)
+        if normalized_quant_config == quant_config:
+            return local_component_path
+
+        config["quantization_config"] = normalized_quant_config
+        with open(config_path, "w", encoding="utf-8") as f:
+            json.dump(config, f, indent=2, sort_keys=True)
+            f.write("\n")
+        logger.warning(
+            "Patched legacy flat ModelOpt quantization_config at %s with quant_type=%s "
+            "for diffusers compatibility.",
+            config_path,
+            normalized_quant_config.get("quant_type"),
+        )
+
+    return local_component_path
+
+
 def get_diffusers_component_config(
     component_path: str,
 ) -> dict[str, Any]:
     """Gets a configuration of a submodule for the given diffusers model."""
     # Download from HuggingFace Hub if path doesn't exist locally
-    if not os.path.exists(component_path):
-        component_path = maybe_download_model(component_path)
+    component_path = prepare_diffusers_component_path_for_loading(component_path)
 
     config_names = ["generation_config.json"]
     # By default, we load config.json, but scheduler_config.json for scheduler
@@ -378,7 +418,10 @@ def check_gguf_file(model: str | os.PathLike) -> bool:
 
 
 def maybe_download_lora(
-    model_name_or_path: str, local_dir: str | None = None, download: bool = True
+    model_name_or_path: str,
+    local_dir: str | None = None,
+    download: bool = True,
+    weight_name: str | None = None,
 ) -> str:
     """
     Check if the model path is a Hugging Face Hub model ID and download it if needed.
@@ -386,6 +429,8 @@ def maybe_download_lora(
         model_name_or_path: Local path or Hugging Face Hub model ID
         local_dir: Local directory to save the model
         download: Whether to download the model from Hugging Face Hub
+        weight_name: Specific safetensors filename to load (pins deterministic selection
+                     for repos with multiple weight files)
 
     Returns:
         Local path to the model
@@ -403,14 +448,22 @@ def maybe_download_lora(
     if os.path.isfile(local_path):
         return local_path
 
-    weight_name = _best_guess_weight_name(local_path, file_extension=".safetensors")
+    if weight_name is not None:
+        target = os.path.join(local_path, weight_name)
+        if not os.path.isfile(target):
+            raise FileNotFoundError(
+                f"Specified lora_weight_name '{weight_name}' not found in {local_path}"
+            )
+        return target
+
+    guessed = _best_guess_weight_name(local_path, file_extension=".safetensors")
     # AMD workaround: PR 15813 changed from model_name_or_path to local_path,
     # which can return None. Fall back to original behavior on ROCm.
-    if weight_name is None and current_platform.is_rocm():
-        weight_name = _best_guess_weight_name(
+    if guessed is None and current_platform.is_rocm():
+        guessed = _best_guess_weight_name(
             model_name_or_path, file_extension=".safetensors"
         )
-    return os.path.join(local_path, weight_name)
+    return os.path.join(local_path, guessed)
 
 
 def verify_model_config_and_directory(model_path: str) -> dict[str, Any]:

@@ -18,6 +18,9 @@ from sglang.srt.distributed import (
     get_attn_tensor_model_parallel_rank,
     get_attn_tensor_model_parallel_world_size,
     get_attn_tp_group,
+)
+from sglang.srt.distributed import get_moe_dp_group as _get_moe_dp_group
+from sglang.srt.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
     get_tp_group,
@@ -399,6 +402,23 @@ def get_dp_local_info(forward_batch: ForwardBatch) -> Tuple[torch.Tensor, torch.
     return forward_batch.dp_local_start_pos, forward_batch.dp_local_num_tokens
 
 
+def get_dp_local_slice_cpu(
+    forward_batch: ForwardBatch,
+    can_run_graph: bool,
+    cuda_graph_batch: Optional[int],
+) -> Tuple[int, int]:
+    # CPU (start, length) slice for DP-local data in a rank-padded buffer.
+    # Returns Python ints (no D2H sync) and handles the cuda-graph-padded layout.
+    global_num_tokens = forward_batch.global_num_tokens_cpu
+    dp_rank = get_attention_dp_rank()
+    local_num_tokens = global_num_tokens[dp_rank]
+    if can_run_graph:
+        local_start_pos = dp_rank * cuda_graph_batch
+    else:
+        local_start_pos = sum(global_num_tokens[:dp_rank])
+    return local_start_pos, local_num_tokens
+
+
 @triton.jit
 def memcpy_triton_kernel(
     dst_ptr,
@@ -578,6 +598,31 @@ def attn_tp_all_gather_into_tensor(output: torch.Tensor, input: torch.Tensor):
 
 def attn_cp_all_gather_into_tensor(output: torch.Tensor, input: torch.Tensor):
     return get_attention_cp_group().all_gather_into_tensor(output, input)
+
+
+def get_moe_cp_group() -> GroupCoordinator:
+    """Returns the MOE_DP group, which includes CP partners when attn_cp_size > moe_dp_size."""
+    return _get_moe_dp_group()
+
+
+def get_moe_cp_rank() -> int:
+    return _get_moe_dp_group().rank_in_group
+
+
+def get_moe_cp_size() -> int:
+    return _get_moe_dp_group().world_size
+
+
+def is_enable_moe_cp_allgather() -> bool:
+    """True when moe_dp_size < attn_cp_size, requiring allgather across CP ranks before MoE."""
+    from sglang.srt.server_args import get_global_server_args
+
+    sa = get_global_server_args()
+    return sa.attn_cp_size > sa.moe_dp_size
+
+
+def moe_cp_all_gather_into_tensor(output: torch.Tensor, input: torch.Tensor):
+    return _get_moe_dp_group().all_gather_into_tensor(output, input)
 
 
 def attn_tp_all_gather(output_list: List[torch.Tensor], input: torch.Tensor):

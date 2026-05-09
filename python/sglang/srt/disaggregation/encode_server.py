@@ -23,6 +23,7 @@ from transformers import AutoProcessor
 from sglang.srt.configs.device_config import DeviceConfig
 from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.configs.model_config import ModelConfig
+from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.disaggregation.encode_receiver import EmbeddingData
 from sglang.srt.distributed.parallel_state import (
     get_default_distributed_backend,
@@ -57,6 +58,14 @@ from sglang.srt.utils.network import (
 )
 
 logger = logging.getLogger(__name__)
+
+HEALTH_CHECK_TIMEOUT = 10
+
+# Minimal 32x32 black PNG for health check dummy encode
+MINIMUM_PNG_PICTURE_BASE64 = "iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAACXBIWXMAAA7EAAAOxAGVKw4bAAAAbUlEQVRYhe3VsQ2AMAxE0Y/lIgNQULD/OqyCMgCihCKSG4yRuKuiNH6JLsoEbMACOGBcua9HOR7Y6w6swBwMy0qLTpkeI77qdEBpBFAHBBDAGH8WrwJKI4AAegUCfAKgEgpQDvh3CR3oQCuav58qlAw73kKCSgAAAABJRU5ErkJggg=="
+
+# Minimal WAV: 16kHz mono 16-bit PCM, 160 samples (0.01s) of silence
+MINIMUM_WAV_SILENCE_BASE64 = "UklGRmQBAABXQVZFZm10IBAAAAABAAEAgD4AAAB9AAACABAAZGF0YUABAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=="
 
 rid_lock = asyncio.Lock()
 rid_to_receive_endpoint: Dict[str, List[str]] = dict()
@@ -124,7 +133,8 @@ def _convert(data):
 
 
 _mm_grid_attrs = {
-    Modality.IMAGE: ["image_grid_thw", "image_grid_hws"],
+    # Kimi K2.5 HF processor uses grid_thws (see base_processor.ATTR_NAME_TO_MODALITY).
+    Modality.IMAGE: ["image_grid_thw", "image_grid_hws", "grid_thws"],
     Modality.VIDEO: ["video_grid_thw"],
     Modality.AUDIO: ["audio_feature_lens_raw"],
 }
@@ -136,9 +146,17 @@ _mm_feature_attrs = {
 }
 
 
-def _get_mm_grid_dim(mm_inputs, modality):
-    for attr in _mm_grid_attrs[modality]:
-        if attr in mm_inputs:
+def _get_mm_grid_dim(mm_inputs, modality, model_type: Optional[str] = None):
+    # Kimi K2.5 vision processor only emits `grid_thws`; prefer it over generic keys
+    # so we never pick a mis-typed or stale `image_grid_hws` field from kwargs.
+    attrs = _mm_grid_attrs[modality]
+    if (model_type or "").lower() in [
+        "kimi_k25",
+        "kimi_vl",
+    ] and modality == Modality.IMAGE:
+        attrs = ("grid_thws", "image_grid_thw", "image_grid_hws")
+    for attr in attrs:
+        if attr in mm_inputs and mm_inputs[attr] is not None:
             return mm_inputs[attr]
     raise ValueError(f"Grid dim ({_mm_grid_attrs[modality]}) not found in {mm_inputs}")
 
@@ -476,8 +494,8 @@ class MMEncoder:
         if self.model_type in ["qwen2_audio", "qwen2_5_omni"]:
             input_length = (feature_lens - 1) // 2 + 1
             return (input_length - 2) // 2 + 1
-        # qwen3_omni_moe
-        elif self.model_type == "qwen3_omni_moe":
+        # qwen3_asr / qwen3_omni_moe (same audio encoder architecture)
+        elif self.model_type in ["qwen3_asr", "qwen3_omni_moe"]:
             input_lengths_leave = feature_lens % 100
             feat_lengths = (input_lengths_leave - 1) // 2 + 1
             output_lengths = (
@@ -577,6 +595,16 @@ class MMEncoder:
         else:
             return int(grid[0] * grid[1] * grid[2])
 
+    def _kimi_tokens_from_patch_grid(self, grid: Union[torch.Tensor, List[int]]) -> int:
+        """MoonViT + tpool: output len is (h//mh)*(w//mw); temporal dim is pooled (not t*h*w/merge^2)."""
+        if isinstance(grid, torch.Tensor):
+            flat = grid.flatten()
+            _t, h, w = (int(x) for x in flat[:3].tolist())
+        else:
+            _t, h, w = int(grid[0]), int(grid[1]), int(grid[2])
+        merge_h, merge_w = self.model_config.hf_config.vision_config.merge_kernel_size
+        return (h * w) // (merge_h * merge_w)
+
     def get_num_tokens(
         self, grid: Union[torch.Tensor, List[int]], modality: Modality
     ) -> int:
@@ -585,6 +613,11 @@ class MMEncoder:
             input_length = self.get_num_patches(grid, modality)
             return self._get_feat_extract_output_lengths(input_length)
         else:
+            if (
+                self.model_type in ["kimi_k25", "kimi_vl"]
+                and modality == Modality.IMAGE
+            ):
+                return self._kimi_tokens_from_patch_grid(grid)
             merge_size = getattr(self.image_processor, "merge_size", 2)
             return self.get_num_patches(grid, modality) // (merge_size**2)
 
@@ -625,7 +658,7 @@ class MMEncoder:
         """
         GPU Task: Run ViT inference ONLY on the subset of mm items missing from the cache.
         """
-        grid_thw = _get_mm_grid_dim(mm_inputs, modality)
+        grid_thw = _get_mm_grid_dim(mm_inputs, modality, self.model_type)
 
         # 1. Slice mm_feature to get only the patches for missing mm items
         sub_feature_list = []
@@ -675,7 +708,7 @@ class MMEncoder:
     ) -> torch.Tensor:
         # mm_inputs: dict
         mm_inputs, get_feature_fn = await self._process_mm_items(mm_items, modality)
-        grid_thw = _get_mm_grid_dim(mm_inputs, modality)
+        grid_thw = _get_mm_grid_dim(mm_inputs, modality, self.model_type)
         mm_feature = _convert(_get_mm_feature(mm_inputs, modality))
         num_items = len(grid_thw)
 
@@ -849,10 +882,79 @@ class MMEncoder:
         ]
         return timestamps
 
+    @staticmethod
+    def _flatten_nested_items(items):
+        if not isinstance(items, (list, tuple)):
+            return [items]
+
+        flat = []
+        for item in items:
+            if isinstance(item, (list, tuple)):
+                flat.extend(MMEncoder._flatten_nested_items(item))
+            else:
+                flat.append(item)
+        return flat
+
+    def _normalize_kimi_encoder_images(self, images):
+        """Normalize Kimi image inputs for the image processor call."""
+        from PIL import Image as PILImage
+
+        def wrap_one(img):
+            if isinstance(img, dict) and img.get("type") in ("image", "video_chunk"):
+                return [img]
+            if isinstance(img, PILImage.Image):
+                return [{"type": "image", "image": img}]
+            return [img]
+
+        if not images:
+            return images
+
+        # Disagg may supply nested lists from grouped routing.
+        images = self._flatten_nested_items(images)
+
+        # Kimi-VL image processor expects a flat list of concrete images.
+        if self.model_type == "kimi_vl":
+            normalized = []
+            for img in images:
+                if (
+                    isinstance(img, dict)
+                    and img.get("type") == "image"
+                    and "image" in img
+                ):
+                    inner = img["image"]
+                    if isinstance(inner, (list, tuple)):
+                        normalized.extend(self._flatten_nested_items(inner))
+                    else:
+                        normalized.append(inner)
+                else:
+                    normalized.append(img)
+            return normalized
+
+        # Kimi-K2.5 vision processor expects media dicts.
+        normalized = []
+        for img in images:
+            wrapped = wrap_one(img)
+            for media in wrapped:
+                # Some pipelines may produce {"type": "image", "image": [PIL]}.
+                # Split it into one media item per concrete image object.
+                if (
+                    isinstance(media, dict)
+                    and media.get("type") == "image"
+                    and isinstance(media.get("image"), (list, tuple))
+                ):
+                    for inner in self._flatten_nested_items(media["image"]):
+                        normalized.append({**media, "image": inner})
+                else:
+                    normalized.append(media)
+
+        return normalized
+
     async def _process_mm_items(self, mm_items, modality):
         if modality == Modality.IMAGE and self.image_processor:
             images = await self._flatten_and_load_images(mm_items)
             image_config = self.vision_config.get("image", {})
+            if self.model_type in ["kimi_k25", "kimi_vl"]:
+                images = self._normalize_kimi_encoder_images(images)
             processor_input = self.image_processor(images=images, **image_config)
             if hasattr(self.model, "thinker"):  # for omni models
                 get_feature_method = self.model.thinker.get_image_feature
@@ -867,10 +969,11 @@ class MMEncoder:
             )
             # Get additional video metadata
             if (
-                self.model_type in ["qwen3_vl", "qwen3_vl_moe"]
+                self.model_type
+                in ["qwen3_vl", "qwen3_vl_moe", "qwen3_5", "qwen3_5_moe"]
                 and video_processor_kwargs.get("video_metadata", None) is not None
             ):
-                # For qwen3-vl models, we need to store the video timestamps
+                # For qwen3-vl/qwen3.5 models, we need to store the video timestamps
                 video_metadata = video_processor_kwargs["video_metadata"]
                 try:
                     merge_size = (
@@ -984,7 +1087,11 @@ class MMEncoder:
                 self.profiler.step()
 
             aux_data = _build_mm_aux_data(mm_inputs)
-            return _get_mm_grid_dim(mm_inputs, modality), mm_embedding, aux_data
+            return (
+                _get_mm_grid_dim(mm_inputs, modality, self.model_type),
+                mm_embedding,
+                aux_data,
+            )
         except BadRequestError as e:
             raise BadRequestError(f"Bad request error: {str(e)}")
         except Exception as e:
@@ -1474,11 +1581,71 @@ async def handle_scheduler_receive_url_request(request: dict):
 async def health_generate():
     """
     Health check endpoint for the encoder server.
-    Returns 200 if the encoder is initialized and ready.
+    Performs a dummy encode to verify the encoder is functional.
+    Returns 200 if the encoder is healthy, 503 otherwise.
     """
     if encoder is None:
         return Response(status_code=503)
-    return Response(status_code=200)
+
+    # Skip the dummy encode when real requests are already in flight — the
+    # ongoing traffic already proves liveness, matching the scheduler's
+    # `is_fully_idle`-based health-check skip pattern.
+    if encoder.embedding_to_send:
+        return Response(status_code=200)
+
+    # Pick the first available modality for the dummy encode
+    if encoder.image_processor is not None:
+        mm_items = [f"data:image/png;base64,{MINIMUM_PNG_PICTURE_BASE64}"]
+        modality = Modality.IMAGE
+    elif encoder.audio_processor is not None:
+        mm_items = [f"data:audio/wav;base64,{MINIMUM_WAV_SILENCE_BASE64}"]
+        modality = Modality.AUDIO
+    else:
+        # No processor available, fall back to liveness check only
+        return Response(status_code=200)
+
+    try:
+        req_id = f"{HEALTH_CHECK_RID_PREFIX}_{time.time()}"
+
+        dummy_request = {
+            "mm_items": mm_items,
+            "modality": modality.name,
+            "req_id": req_id,
+            "num_parts": 1,
+            "part_idx": 0,
+        }
+
+        # Broadcast to other TP ranks so distributed ops stay in sync
+        for socket in send_sockets:
+            socket.send_pyobj(dummy_request)
+
+        # Run encode on rank 0 with timeout
+        _, _, _, error_msg, _ = await asyncio.wait_for(
+            encoder.encode(
+                mm_items=mm_items,
+                modality=modality,
+                req_id=req_id,
+                num_parts=1,
+                part_idx=0,
+            ),
+            timeout=HEALTH_CHECK_TIMEOUT,
+        )
+
+        # Clean up stored embedding
+        encoder.embedding_to_send.pop(req_id, None)
+
+        if error_msg:
+            logger.error(f"Encoder health check failed: {error_msg}")
+            return Response(status_code=503)
+
+        return Response(status_code=200)
+
+    except asyncio.TimeoutError:
+        logger.error(f"Encoder health check timed out after {HEALTH_CHECK_TIMEOUT}s")
+        return Response(status_code=503)
+    except Exception as e:
+        logger.error(f"Encoder health check failed: {e}")
+        return Response(status_code=503)
 
 
 @app.api_route("/start_profile", methods=["GET", "POST"])
