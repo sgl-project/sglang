@@ -582,12 +582,16 @@ impl PDRouter {
             let prefill_url = prefill.url().to_string();
             tokio::spawn(async move {
                 match prefill_request.send().await {
-                    Ok(resp) if !resp.status().is_success() => {
-                        warn!(
-                            "Prefill returned error (fire-and-forget) prefill_url={} status={}",
-                            prefill_url,
-                            resp.status()
-                        );
+                    Ok(resp) => {
+                        let status = resp.status();
+                        if !status.is_success() {
+                            warn!(
+                                "Prefill returned error (fire-and-forget) prefill_url={} status={}",
+                                prefill_url, status
+                            );
+                        }
+                        // Consume body to allow connection reuse in the pool
+                        let _ = resp.bytes().await;
                     }
                     Err(e) => {
                         warn!(
@@ -595,7 +599,6 @@ impl PDRouter {
                             prefill_url, e
                         );
                     }
-                    _ => {}
                 }
             });
             (None, decode_request.send().await)
@@ -627,26 +630,16 @@ impl PDRouter {
 
                 // Process prefill response (skipped when fire-and-forget)
                 let prefill_body = if let Some(prefill_result) = prefill_result {
-                    if context.return_logprob {
-                        match self
-                            .process_prefill_response(
-                                prefill_result,
-                                prefill.url(),
-                                context.return_logprob,
-                            )
-                            .await
-                        {
-                            Ok((_, body)) => body,
-                            Err(error_response) => return error_response,
-                        }
-                    } else {
-                        match self
-                            .process_prefill_response(prefill_result, prefill.url(), false)
-                            .await
-                        {
-                            Ok((_, body)) => body,
-                            Err(error_response) => return error_response,
-                        }
+                    match self
+                        .process_prefill_response(
+                            prefill_result,
+                            prefill.url(),
+                            context.return_logprob,
+                        )
+                        .await
+                    {
+                        Ok((_, body)) => body,
+                        Err(error_response) => return error_response,
                     }
                 } else {
                     None
