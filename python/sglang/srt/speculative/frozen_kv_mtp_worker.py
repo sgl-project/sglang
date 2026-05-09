@@ -50,6 +50,7 @@ from sglang.srt.speculative.eagle_utils import (
 )
 from sglang.srt.speculative.frozen_kv_mtp_info import (
     FrozenKVMTPContext,
+    FrozenKVMTPDraftExtendInput,
     FrozenKVMTPDraftInput,
     FrozenKVMTPVerifyInput,
     FrozenKVMTPVerifyOutput,
@@ -462,7 +463,7 @@ class FrozenKVMTPWorker(TpModelWorker):
         ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
             if (
                 self.server_args.enable_dp_attention
-                or batch.spec_info.bonus_tokens.numel()
+                or verify_output.unfinished_accept_tokens.numel() > 0
             ):
                 self.forward_draft_extend_after_decode(batch, verify_output)
         set_time_batch(batch.reqs, "set_spec_draft_extend_end_time", trace_only=True)
@@ -508,9 +509,13 @@ class FrozenKVMTPWorker(TpModelWorker):
     def forward_draft_extend_after_decode(
         self, batch: ScheduleBatch, verify_output: EagleVerifyOutput
     ) -> None:
-        assert isinstance(batch.spec_info, FrozenKVMTPDraftInput)
+        assert isinstance(batch.spec_info, FrozenKVMTPDraftExtendInput)
+        extend_input: FrozenKVMTPDraftExtendInput = batch.spec_info
         input_is_idle = batch.forward_mode.is_idle()
-        if not input_is_idle and batch.spec_info.bonus_tokens.numel() == 0:
+
+        if not input_is_idle and verify_output.unfinished_accept_tokens.numel() == 0:
+            # All reqs finished. Install an idle FrozenKVMTPDraftInput so the
+            # next-iter draft sees a valid spec_info.
             batch = batch.copy()
             batch.prepare_for_idle()
             batch.spec_info = FrozenKVMTPDraftInput.create_idle_input(
@@ -520,11 +525,11 @@ class FrozenKVMTPWorker(TpModelWorker):
                 topk=self.topk,
                 capture_hidden_mode=CaptureHiddenMode.LAST,
             )
+            return
 
         if batch.forward_mode.is_idle():
             return
 
-        draft_input = batch.spec_info
         seq_lens_backup = batch.seq_lens.clone()
         seq_lens_cpu_backup = batch.seq_lens_cpu.clone()
         req_pool_indices_backup = batch.req_pool_indices
@@ -536,13 +541,14 @@ class FrozenKVMTPWorker(TpModelWorker):
             batch.seq_lens_cpu = verify_output.seq_lens_for_draft_extend_cpu
             batch.req_pool_indices = verify_output.req_pool_indices_for_draft_extend
 
-            last_token_ids, last_hidden = self._select_last_verified_seed(draft_input)
+            last_token_ids, last_hidden = self._select_last_verified_seed(extend_input)
+            # `_run_assistant_seed_step` constructs a fresh `FrozenKVMTPDraftInput`
+            # and installs it on `batch.spec_info` for next iter.
             self._run_assistant_seed_step(
                 batch,
                 last_token_ids,
                 last_hidden,
                 seq_lens_cpu=verify_output.seq_lens_for_draft_extend_cpu,
-                draft_input=draft_input,
             )
         finally:
             batch.seq_lens = seq_lens_backup
@@ -768,7 +774,7 @@ class FrozenKVMTPWorker(TpModelWorker):
         batch.forward_mode = (
             ForwardMode.DECODE if not batch.forward_mode.is_idle() else ForwardMode.IDLE
         )
-        batch.spec_info = res.next_draft_input
+        batch.spec_info = res.extend_input
 
         del seq_lens_pre_verify
         return logits_output, res, model_worker_batch, can_run_cuda_graph
