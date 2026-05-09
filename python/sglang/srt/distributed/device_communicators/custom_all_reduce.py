@@ -344,6 +344,8 @@ def dispatch_custom_allreduce():
 
     On CUDA, the JIT-compiled v2 implementation is used by default.
     Set SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2=0 to fall back to the legacy CustomAllreduce.
+    Note: ``ServerArgs._handle_environment_variables`` forces this env to "0" when
+    ``nnodes > 1`` since custom AR is intra-node only.
     """
     if _is_cuda and envs.SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2.get():
         from .custom_all_reduce_v2 import CustomAllReduceV2

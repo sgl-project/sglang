@@ -936,6 +936,16 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
         )
         self.trace_slice(stage, self.decode_prealloc_queue_entry_time, ts)
 
+        if self.enable_metrics and self.bootstrap_done_time > 0:
+            bootstrap_ms = (
+                self.bootstrap_done_time - self.decode_prealloc_queue_entry_time
+            ) * 1000
+            alloc_ms = (ts - self.bootstrap_done_time) * 1000
+            self.metrics_collector.observe_kv_transfer_bootstrap(
+                bootstrap_ms=bootstrap_ms,
+                alloc_ms=alloc_ms,
+            )
+
     def set_bootstrap_done_time(self, ts=None):
         ts = ts or time.perf_counter()
         if self.bootstrap_done_time == 0.0:
