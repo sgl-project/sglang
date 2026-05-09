@@ -68,7 +68,13 @@ class TestReleaseMemoryOccupation(unittest.TestCase):
 
         processes = []
         output_reader, output_writer = mp.Pipe(duplex=False)
-        queue = mp.Queue()
+        # Split into two single-producer / single-consumer queues. A single
+        # shared queue is unsafe here: mp.Queue is backed by one Pipe shared by
+        # all processes, so the sender's own get() can pop the tensor it just
+        # put before the receiver wakes up. Re-importing one's own CUDA IPC
+        # handle is not supported and fails with "invalid device context".
+        tensor_queue = mp.Queue()
+        ack_queue = mp.Queue()
         for role, info in [
             ("sender", sender_info),
             ("receiver", receiver_info),
@@ -81,7 +87,8 @@ class TestReleaseMemoryOccupation(unittest.TestCase):
                 target=_run_subprocess,
                 kwargs=dict(
                     role=role,
-                    queue=queue,
+                    tensor_queue=tensor_queue,
+                    ack_queue=ack_queue,
                     output_writer=output_writer,
                     tensor_device=info["tensor_device"],
                     enable_patch=enable_patch,
@@ -100,7 +107,12 @@ class TestReleaseMemoryOccupation(unittest.TestCase):
 
 
 def _run_subprocess(
-    role: str, queue: mp.Queue, output_writer, tensor_device: int, enable_patch: bool
+    role: str,
+    tensor_queue: mp.Queue,
+    ack_queue: mp.Queue,
+    output_writer,
+    tensor_device: int,
+    enable_patch: bool,
 ):
     print(
         f'subprocess[{role}] start {os.environ.get("CUDA_VISIBLE_DEVICES")=}',
@@ -114,14 +126,14 @@ def _run_subprocess(
     try:
         if role == "sender":
             tensor = torch.tensor([1.0, 2.0], device=f"cuda:{tensor_device}")
-            print(f"sender queue.put {tensor=} {tensor.device=}")
-            queue.put(tensor)
-            assert queue.get() == "done"
+            print(f"sender tensor_queue.put {tensor=} {tensor.device=}")
+            tensor_queue.put(tensor)
+            assert ack_queue.get() == "done"
         elif role == "receiver":
-            tensor = queue.get()
-            print(f"receiver queue.get {tensor=} {tensor.device=}")
+            tensor = tensor_queue.get()
+            print(f"receiver tensor_queue.get {tensor=} {tensor.device=}")
             assert str(tensor.device) == f"cuda:{tensor_device}"
-            queue.put("done")
+            ack_queue.put("done")
         else:
             raise NotImplementedError
 
