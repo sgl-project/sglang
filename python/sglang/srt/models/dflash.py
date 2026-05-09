@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from typing import Iterable, Optional, Tuple
 
 import torch
@@ -22,7 +23,7 @@ from sglang.srt.layers.linear import (
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.radix_attention import AttentionType, RadixAttention
-from sglang.srt.layers.rotary_embedding import get_rope
+from sglang.srt.layers.rotary_embedding import MRotaryEmbedding, get_rope
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.utils import apply_qk_norm
@@ -30,8 +31,28 @@ from sglang.srt.speculative.dflash_utils import (
     can_dflash_slice_qkv_weight,
     parse_dflash_draft_config,
 )
+from sglang.srt.utils import is_hip
 
 logger = logging.getLogger(__name__)
+
+# Optional ROCm fast path: AITER fused split + Q/K-norm + RoPE kernel.
+# Mirrors what Qwen3 target model uses (forward_prepare_aiter_fused_mrope) but
+# with the non-MRoPE sibling kernel and return_kv=True so K/V are returned via
+# output buffers instead of being written to a paged cache (DFlash draft attn
+# is non-causal over a per-step block; K/V are consumed locally by RadixAttention).
+_is_hip_dflash = is_hip()
+_has_aiter_fused_qk_norm_rope = False
+_aiter_fused_qk_norm_rope = None
+if _is_hip_dflash:
+    try:
+        from aiter.ops.fused_qk_norm_rope_cache_quant import (
+            fused_qk_norm_rope_cache_pts_quant_shuffle as _aiter_fused_qk_norm_rope,
+        )
+
+        _has_aiter_fused_qk_norm_rope = True
+        logger.info("aiter fused_qk_norm_rope kernel available for DFlash draft")
+    except ImportError:
+        pass
 
 
 class DFlashAttention(nn.Module):
@@ -118,16 +139,149 @@ class DFlashAttention(nn.Module):
             attn_type=AttentionType.ENCODER_ONLY,
         )
 
+        # ROCm fast path: fused split + Q/K-norm + RoPE in one HIP kernel
+        # (with return_kv=True so we don't write to a paged cache, mirroring the
+        # current eager path's behavior). Disabled on CUDA, when the AITER kernel
+        # is unavailable, when the model uses MRoPE (the kernel only supports
+        # standard RoPE), or when RoPE is non-Neox style.  Set
+        # SGLANG_DISABLE_DFLASH_FUSED_QK_ROPE=1 to opt out at runtime.
+        self.use_aiter_fused = (
+            _is_hip_dflash
+            and _has_aiter_fused_qk_norm_rope
+            and not isinstance(self.rotary_emb, MRotaryEmbedding)
+            and getattr(self.rotary_emb, "is_neox_style", True)
+            and not os.environ.get("SGLANG_DISABLE_DFLASH_FUSED_QK_ROPE")
+        )
+        if self.use_aiter_fused:
+            # Scale tensors must live on CPU: the C++ kernel calls .item<float>()
+            # which would otherwise trigger a D2H copy + sync inside CUDA graph
+            # capture. Match what Qwen3.forward_prepare_aiter_fused_mrope does.
+            self._fused_k_scale = torch.tensor(1.0, dtype=torch.float32, device="cpu")
+            self._fused_v_scale = torch.tensor(1.0, dtype=torch.float32, device="cpu")
+            # Even with return_kv=True the kernel still issues writes to
+            # k_cache/v_cache via slot_mapping (the kernel was designed for the
+            # paged-cache path; return_kv only adds extra writes to k_out/v_out).
+            # Provide *throwaway* buffers we never read: a single-slot k/v cache
+            # plus a slot_mapping that points every token at slot 0. They're
+            # allocated lazily on the first call (after we know dtype/device).
+            self._fused_dummy_k_cache = None
+            self._fused_dummy_v_cache = None
+            self._fused_dummy_slot_mapping = None
+
+    def _fused_qk_norm_rope(self, positions, hidden_states):
+        """Fused split + Q/K-RMSNorm + RoPE for ROCm/AITER (return_kv=True path).
+
+        Mirrors Qwen3Attention.forward_prepare_aiter_fused_mrope but uses the
+        non-MRoPE sibling kernel. The kernel writes the rotated K/V into the
+        supplied k_out/v_out buffers instead of a paged cache, so the result
+        feeds straight into RadixAttention.forward(q, k, v) -- preserving
+        DFlash's ENCODER_ONLY local-block semantics.
+        """
+        qkv, _ = self.qkv_proj(hidden_states)
+        num_tokens = qkv.shape[0]
+
+        cos_sin = self.rotary_emb.cos_sin_cache
+        if cos_sin.dtype != qkv.dtype:
+            cos_sin = cos_sin.to(dtype=qkv.dtype)
+
+        q_out = torch.empty(
+            num_tokens,
+            self.num_heads,
+            self.head_dim,
+            dtype=qkv.dtype,
+            device=qkv.device,
+        )
+        k_out = torch.empty(
+            num_tokens,
+            self.num_kv_heads,
+            self.head_dim,
+            dtype=qkv.dtype,
+            device=qkv.device,
+        )
+        v_out = torch.empty(
+            num_tokens,
+            self.num_kv_heads,
+            self.head_dim,
+            dtype=qkv.dtype,
+            device=qkv.device,
+        )
+
+        # Lazily allocate the throwaway k_cache/v_cache/slot_mapping. The kernel
+        # writes the rotated K/V to slot 0 every time (we never read these) AND
+        # also writes them to k_out/v_out which we DO consume. Using a single
+        # slot keeps the dummy buffer tiny and avoids per-call allocation.
+        if (
+            self._fused_dummy_k_cache is None
+            or self._fused_dummy_k_cache.dtype != qkv.dtype
+            or self._fused_dummy_k_cache.device != qkv.device
+        ):
+            self._fused_dummy_k_cache = torch.empty(
+                1, self.num_kv_heads, self.head_dim,
+                dtype=qkv.dtype, device=qkv.device,
+            )
+            self._fused_dummy_v_cache = torch.empty(
+                1, self.num_kv_heads, self.head_dim,
+                dtype=qkv.dtype, device=qkv.device,
+            )
+        # slot_mapping must match num_tokens. Reallocate if size grew.
+        if (
+            self._fused_dummy_slot_mapping is None
+            or self._fused_dummy_slot_mapping.numel() < num_tokens
+            or self._fused_dummy_slot_mapping.device != qkv.device
+        ):
+            self._fused_dummy_slot_mapping = torch.zeros(
+                num_tokens, dtype=torch.int64, device=qkv.device,
+            )
+        slot_mapping = self._fused_dummy_slot_mapping[:num_tokens]
+
+        _aiter_fused_qk_norm_rope(
+            qkv,
+            self.q_norm.weight,
+            self.k_norm.weight,
+            cos_sin,
+            positions,
+            num_tokens,
+            self.num_heads,
+            self.num_kv_heads,
+            self.num_kv_heads,
+            self.head_dim,
+            self.rotary_emb.is_neox_style,
+            self.q_norm.variance_epsilon,
+            q_out,
+            self._fused_dummy_k_cache,
+            self._fused_dummy_v_cache,
+            slot_mapping,
+            self._fused_k_scale,
+            self._fused_v_scale,
+            k_out,
+            v_out,
+            True,  # return_kv: also write to k_out/v_out
+            False,  # use_shuffle_layout
+            0,  # block_size
+            0,  # x
+            0,  # rotary_dim (0 = full head_dim)
+        )
+
+        q = q_out.view(num_tokens, self.q_size)
+        k = k_out.view(num_tokens, self.kv_size)
+        v = v_out.view(num_tokens, self.kv_size)
+        return q, k, v
+
     def forward(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
-        qkv, _ = self.qkv_proj(hidden_states)
-        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        q, k = apply_qk_norm(q, k, self.q_norm, self.k_norm, self.head_dim)
-        q, k = self.rotary_emb(positions, q, k)
+        if self.use_aiter_fused:
+            q, k, v = self._fused_qk_norm_rope(positions, hidden_states)
+        else:
+            qkv, _ = self.qkv_proj(hidden_states)
+            q, k, v = qkv.split(
+                [self.q_size, self.kv_size, self.kv_size], dim=-1
+            )
+            q, k = apply_qk_norm(q, k, self.q_norm, self.k_norm, self.head_dim)
+            q, k = self.rotary_emb(positions, q, k)
         attn_output = self.attn(q, k, v, forward_batch)
         output, _ = self.o_proj(attn_output)
         return output
