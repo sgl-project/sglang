@@ -17,10 +17,14 @@ from sglang.srt.layers.attention.fla.fused_norm_gate import layer_norm_gated_fwd
 from sglang.srt.layers.attention.fla.fused_recurrent import (
     fused_recurrent_gated_delta_rule_fwd_kernel,
 )
-from sglang.srt.layers.attention.fla.index import prepare_chunk_indices
+from sglang.srt.layers.attention.fla.index import (
+    prepare_chunk_indices,
+)
 from sglang.srt.layers.attention.fla.l2norm import l2norm_fwd
 from sglang.srt.layers.attention.fla.op import exp, log
-from sglang.srt.layers.attention.fla.utils import check_shared_mem
+from sglang.srt.layers.attention.fla.utils import (
+    check_shared_mem,
+)
 
 BS_LIST = [32, 64] if check_shared_mem() else [16, 32]
 
@@ -488,11 +492,13 @@ def chunk_kda_scaled_dot_kkt_fwd(
 
 @triton.autotune(
     configs=[
-        triton.Config({}, num_warps=num_warps, num_stages=num_stages)
+        triton.Config({"BK": BK, "BV": BV}, num_warps=num_warps, num_stages=num_stages)
+        for BK in [64, 128]
+        for BV in [64, 128]
         for num_warps in [2, 4, 8]
         for num_stages in [2, 3, 4]
     ],
-    key=["H", "K", "V", "BT", "BK", "BV", "IS_VARLEN"],
+    key=["H", "K", "V", "BT", "IS_VARLEN"],
 )
 @triton.jit(do_not_specialize=["T"])
 def recompute_w_u_fwd_kernel(
@@ -650,8 +656,6 @@ def recompute_w_u_fwd(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     B, T, H, K, V = *k.shape, v.shape[-1]
     BT = A.shape[-1]
-    BK = 64
-    BV = 64
 
     if chunk_indices is None and cu_seqlens is not None:
         chunk_indices = prepare_chunk_indices(cu_seqlens, BT)
@@ -678,12 +682,10 @@ def recompute_w_u_fwd(
         K=K,
         V=V,
         BT=BT,
-        BK=BK,
-        BV=BV,
         STORE_QG=False,
         STORE_KG=kg is not None,
         IS_VARLEN=cu_seqlens is not None,
-        DOT_PRECISION="ieee",
+        DOT_PRECISION="tf32",
     )
     return w, u, None, kg
 
@@ -691,8 +693,8 @@ def recompute_w_u_fwd(
 @triton.autotune(
     configs=[
         triton.Config({"BK": BK, "BV": BV}, num_warps=num_warps, num_stages=num_stages)
-        for BK in [32, 64]
-        for BV in [64, 128]
+        for BK in [64]
+        for BV in [64]
         for num_warps in [2, 4, 8]
         for num_stages in [2, 3, 4]
     ],
@@ -803,7 +805,7 @@ def chunk_gla_fwd_kernel_o(
     # [BT, BT]
     b_A = tl.load(p_A, boundary_check=(0, 1))
     b_A = tl.where(m_s, b_A, 0.0).to(b_v.dtype)
-    b_o += tl.dot(b_A, b_v, allow_tf32=False)
+    b_o += tl.dot(b_A, b_v)
     tl.store(p_o, b_o.to(p_o.dtype.element_ty), boundary_check=(0, 1))
 
 
@@ -1065,7 +1067,23 @@ def chunk_kda_fwd(
             chunk_indices=chunk_indices,
         )
 
-    # Fused: scaled_dot_kkt + solve_tril + recompute_w_u
+    # FUSE_DIAGONAL (fold diagonal-block compute into inter+solve) and
+    # FUSE_RECOMPUTE (also fold w/u/kg recompute) save kernel launches and HBM
+    # round-trips, but cost register footprint per CTA. Wins at small grid
+    # where launch overhead dominates; loses at large grid where the extra
+    # register pressure spills. Gate both on the same grid heuristic.
+    # Total CTAs in inter_solve_fused = NT * B * H_per_rank. For varlen,
+    # chunks don't cross sequence boundaries, so per-sequence ceil-divs sum to
+    # more than cdiv(total_tokens, chunk_size); use chunk_indices.shape[0] which
+    # already enumerates all (seq, chunk) pairs.
+    _NT_pr = (
+        triton.cdiv(q.shape[1], chunk_size)
+        if cu_seqlens is None
+        else chunk_indices.shape[0]
+    )
+    _H_pr = q.shape[-2]
+    _B = q.shape[0]
+    _small_grid = _B * _NT_pr * _H_pr <= 256
     w, u, _, kg, Aqk, _ = chunk_kda_fwd_intra(
         q=q,
         k=k,
@@ -1076,6 +1094,8 @@ def chunk_kda_fwd(
         cu_seqlens=cu_seqlens,
         chunk_size=chunk_size,
         chunk_indices=chunk_indices,
+        fuse_diagonal=_small_grid,
+        fuse_recompute=_small_grid,
     )
 
     h, v_new = chunk_gated_delta_rule_fwd_h(
@@ -1089,6 +1109,7 @@ def chunk_kda_fwd(
         chunk_indices=chunk_indices,
     )
     del w, u, kg
+
     o = chunk_gla_fwd_o_gk(
         q=q,
         v=v_new,
@@ -1097,11 +1118,12 @@ def chunk_kda_fwd(
         h=h,
         o=v,
         scale=scale,
-        cu_seqlens=cu_seqlens,
         chunk_size=chunk_size,
+        cu_seqlens=cu_seqlens,
         chunk_indices=chunk_indices,
     )
     del Aqk, v_new, h
+
     return o
 
 
