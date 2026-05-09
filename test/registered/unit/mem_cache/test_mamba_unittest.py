@@ -3,6 +3,7 @@ import unittest
 import torch
 
 from sglang.srt.configs.mamba_utils import Mamba2CacheParams, Mamba2StateShape
+from sglang.srt.disaggregation.kv_events import BlockRemoved, BlockStored
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
@@ -305,7 +306,98 @@ class TestMamba(unittest.TestCase):
         print(available_and_evictable_str(tree))
         tree.sanity_check()
 
-    def _setup_tree_and_allocator(self):
+    def test_mamba_radix_cache_kv_events(self):
+        tree, allocator, _, make_dummy_req = self._setup_tree_and_allocator(
+            enable_kv_cache_events=True
+        )
+        tree.take_events()  # Clear the reset event.
+
+        stored_hashes = []
+
+        req1 = make_dummy_req()
+        key1 = RadixKey([1, 2, 3])
+        tree.insert(
+            InsertParams(
+                key=key1,
+                value=allocator.alloc(3)[: len(key1)],
+                mamba_value=req1.mamba_pool_idx.unsqueeze(0),
+            )
+        )
+        events = tree.take_events()
+        stored_events = [e for e in events if isinstance(e, BlockStored)]
+        self.assertEqual(len(stored_events), 3)
+        self.assertEqual([e.token_ids[0] for e in stored_events], [1, 2, 3])
+        stored_hashes.extend(e.block_hashes[0] for e in stored_events)
+
+        req2 = make_dummy_req()
+        key2 = RadixKey([1, 2, 3, 4, 5])
+        tree.insert(
+            InsertParams(
+                key=key2,
+                value=allocator.alloc(5)[: len(key2)],
+                mamba_value=req2.mamba_pool_idx.unsqueeze(0),
+            )
+        )
+        events = tree.take_events()
+        stored_events = [e for e in events if isinstance(e, BlockStored)]
+        self.assertEqual(len(stored_events), 2)
+        self.assertEqual([e.token_ids[0] for e in stored_events], [4, 5])
+        stored_hashes.extend(e.block_hashes[0] for e in stored_events)
+
+        # Evicting an internal mamba state creates a tombstone but does not
+        # remove full-attention KV blocks, so it must not emit BlockRemoved.
+        result = tree.evict(EvictParams(num_tokens=0, mamba_num=1))
+        self.assertEqual(result.num_tokens_evicted, 0)
+        self.assertEqual(result.mamba_num_evicted, 1)
+        events = tree.take_events()
+        self.assertEqual([e for e in events if isinstance(e, BlockRemoved)], [])
+
+        result = tree.evict(EvictParams(num_tokens=1))
+        self.assertGreaterEqual(result.num_tokens_evicted, 1)
+        events = tree.take_events()
+        removed_hashes = [
+            e.block_hashes[0] for e in events if isinstance(e, BlockRemoved)
+        ]
+        self.assertCountEqual(removed_hashes, stored_hashes)
+
+    def test_mamba_radix_cache_kv_events_split_hash(self):
+        tree, allocator, _, make_dummy_req = self._setup_tree_and_allocator(
+            enable_kv_cache_events=True
+        )
+        tree.take_events()  # Clear the reset event.
+
+        req1 = make_dummy_req()
+        key1 = RadixKey([1, 2, 3, 4])
+        tree.insert(
+            InsertParams(
+                key=key1,
+                value=allocator.alloc(4)[: len(key1)],
+                mamba_value=req1.mamba_pool_idx.unsqueeze(0),
+            )
+        )
+        first_insert_events = [
+            e for e in tree.take_events() if isinstance(e, BlockStored)
+        ]
+        self.assertEqual(len(first_insert_events), 4)
+        split_parent_hash = first_insert_events[1].block_hashes[0]
+
+        req2 = make_dummy_req()
+        key2 = RadixKey([1, 2, 5, 6])
+        tree.insert(
+            InsertParams(
+                key=key2,
+                value=allocator.alloc(4)[: len(key2)],
+                mamba_value=req2.mamba_pool_idx.unsqueeze(0),
+            )
+        )
+        second_insert_events = [
+            e for e in tree.take_events() if isinstance(e, BlockStored)
+        ]
+        self.assertEqual(len(second_insert_events), 2)
+        self.assertEqual(second_insert_events[0].token_ids, [5])
+        self.assertEqual(second_insert_events[0].parent_block_hash, split_parent_hash)
+
+    def _setup_tree_and_allocator(self, enable_kv_cache_events=False):
         """Helper to create a MambaRadixCache with allocator for testing."""
         set_global_server_args_for_scheduler(
             ServerArgs(model_path="dummy", page_size=1)
@@ -374,6 +466,7 @@ class TestMamba(unittest.TestCase):
             token_to_kv_pool_allocator=allocator,
             page_size=1,
             disable=False,
+            enable_kv_cache_events=enable_kv_cache_events,
         )
         tree = MambaRadixCache(params=params)
 
