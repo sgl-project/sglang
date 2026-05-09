@@ -140,7 +140,11 @@ OTHER_SUITES = {
 # this constant.
 PER_COMMIT_TO_NIGHTLY = {
     HWBackend.CUDA: {
-        "stage-a-test-1-gpu-small": ["nightly-1-gpu-5090"],
+        # stage-a is the fast-fail smoke gate (10-minute step budget);
+        # intentionally empty so conditional pull-ins never land here.
+        # nightly-1-gpu-5090 tests ride on stage-b-test-1-gpu-small
+        # (same hardware, 8 partitions, 240-min budget) instead.
+        "stage-a-test-1-gpu-small": [],
         "stage-b-test-1-gpu-small": ["nightly-1-gpu-5090"],
         "stage-b-test-1-gpu-large": ["nightly-1-gpu"],
         "stage-b-test-2-gpu-large": ["nightly-2-gpu"],
