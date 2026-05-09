@@ -62,7 +62,27 @@ if is_flashinfer_available():
         nvfp4_block_scale_interleave,
         trtllm_fp4_block_scale_moe,
     )
-    from flashinfer.fused_moe.core import get_w2_permute_indices_with_cache
+    from flashinfer.fused_moe import cutlass_fused_moe as flashinfer_cutlass_fused_moe
+    from flashinfer.fused_moe.core import (
+        ActivationType,
+        get_w2_permute_indices_with_cache,
+    )
+
+    # SM90 mixed-input helpers landed in FlashInfer #3084 (post-0.6.10). Older
+    # versions don't ship them; gate at import so unrelated code paths still load.
+    try:
+        from flashinfer.fused_moe import (
+            interleave_moe_scales_for_sm90_mixed_gemm,
+            interleave_moe_weights_for_sm90_mixed_gemm,
+        )
+
+        _FI_HAS_SM90_CUTLASS_MXFP4 = True
+    except ImportError:
+        interleave_moe_scales_for_sm90_mixed_gemm = None
+        interleave_moe_weights_for_sm90_mixed_gemm = None
+        _FI_HAS_SM90_CUTLASS_MXFP4 = False
+else:
+    _FI_HAS_SM90_CUTLASS_MXFP4 = False
 
 _flashinfer_mxfp4_permute_indices_cache: dict[torch.Size, torch.Tensor] = {}
 _flashinfer_mxfp4_permute_indices_device_cache: dict[
@@ -318,6 +338,28 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         self.flashinfer_mxfp4_moe_precision = (
             get_global_server_args().flashinfer_mxfp4_moe_precision
         )
+        # When `flashinfer_mxfp4` is enabled, dispatch to one of two FlashInfer
+        # entry points depending on the GPU:
+        #   - SM100 (Blackwell)  -> trtllm_fp4_block_scale_moe (existing)
+        #   - SM90  (Hopper)     -> cutlass_fused_moe(use_w4_group_scaling=True)
+        #                           (FlashInfer PR #3084, post-0.6.10)
+        self._fi_kernel: Optional[str] = None
+        if self.use_flashinfer:
+            if is_sm100_supported():
+                self._fi_kernel = "trtllm_sm100"
+            elif is_sm90_supported():
+                if not _FI_HAS_SM90_CUTLASS_MXFP4:
+                    raise RuntimeError(
+                        "moe_runner_backend=flashinfer_mxfp4 on SM90 requires the "
+                        "interleave_moe_{weights,scales}_for_sm90_mixed_gemm helpers "
+                        "from FlashInfer PR #3084 (>= 0.6.11). Upgrade flashinfer-python "
+                        "or pick a different backend (e.g. marlin / triton_kernel)."
+                    )
+                self._fi_kernel = "cutlass_sm90"
+            else:
+                raise NotImplementedError(
+                    "moe_runner_backend=flashinfer_mxfp4 requires SM90 or SM100."
+                )
 
     def create_weights(
         self,
@@ -349,6 +391,15 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 intermediate_size_per_partition_after_pad = round_up(
                     intermediate_size_per_partition, triton_kernels_padding_alignment
                 )
+        elif self._fi_kernel == "cutlass_sm90":
+            # cutlass mixed-input GEMM contraction dim K must be a multiple of
+            # group_size * (128 // group_size) == 128 (interleave factor for
+            # MXFP4 group_size=32 is 4). K equals hidden_size for w13 and
+            # intermediate_size for w2.
+            intermediate_size_per_partition_after_pad = round_up(
+                intermediate_size_per_partition, 128
+            )
+            hidden_size = round_up(hidden_size, 128)
         elif _use_aiter:
 
             intermediate_size_per_partition_after_pad = round_up(
@@ -438,6 +489,9 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         set_weight_attrs(w2_weight_bias, extra_weight_attrs)
 
     def process_weights_after_loading(self, layer):
+        if self._fi_kernel == "cutlass_sm90":
+            self._process_weights_for_sm90_cutlass(layer)
+            return
         if self.use_flashinfer:
             # TODO: these values are hardcoded for now, we need to get them from the model
             layer.gemm1_alpha = Parameter(
@@ -736,6 +790,63 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             layer.w2_weight = Parameter(w2_weight.data, requires_grad=False)
         torch.cuda.empty_cache()
 
+    def _process_weights_for_sm90_cutlass(self, layer):
+        """Prepare MXFP4 weights/scales/biases for FlashInfer's SM90
+        ``cutlass_fused_moe(use_w4_group_scaling=True)`` path (PR #3084).
+
+        The SM90 mixed-input kernel reads weights in a byte-interleaved layout
+        and scales in a reshaped layout; FlashInfer ships per-call helpers that
+        perform exactly the transform the kernel expects. We replace the
+        loaded tensors in place so subsequent ``apply`` calls are free of any
+        per-step preprocessing.
+        """
+        sf_block_size = 32  # MXFP4 group size
+
+        # Per-expert SwiGLU scalars. Hardcoded to match the SM100 trtllm-gen
+        # path in this file (alpha=1.702, beta=1.0, limit=7.0). GPT-OSS uses
+        # these defaults; if other models start using flashinfer_mxfp4 on SM90,
+        # plumb these through `moe_runner_config.gemm1_alpha` etc.
+        layer.swiglu_alpha = Parameter(
+            torch.full(
+                (self.num_experts,), 1.702, dtype=torch.float32, device="cuda"
+            ),
+            requires_grad=False,
+        )
+        layer.swiglu_beta = Parameter(
+            torch.full(
+                (self.num_experts,), 1.0, dtype=torch.float32, device="cuda"
+            ),
+            requires_grad=False,
+        )
+        layer.swiglu_limit = Parameter(
+            torch.full(
+                (self.num_experts,), 7.0, dtype=torch.float32, device="cuda"
+            ),
+            requires_grad=False,
+        )
+
+        # Byte-interleave the packed 4-bit weights (C++ kernel).
+        w13_il = interleave_moe_weights_for_sm90_mixed_gemm(
+            layer.w13_weight.data, "fp4"
+        )
+        w2_il = interleave_moe_weights_for_sm90_mixed_gemm(
+            layer.w2_weight.data, "fp4"
+        )
+        # Reshape+permute the E8M0 block scales (pure PyTorch).
+        w13_s_il = interleave_moe_scales_for_sm90_mixed_gemm(
+            layer.w13_weight_scale.data, group_size=sf_block_size
+        )
+        w2_s_il = interleave_moe_scales_for_sm90_mixed_gemm(
+            layer.w2_weight_scale.data, group_size=sf_block_size
+        )
+
+        layer.w13_weight = Parameter(w13_il, requires_grad=False)
+        layer.w2_weight = Parameter(w2_il, requires_grad=False)
+        layer.w13_weight_scale = Parameter(w13_s_il, requires_grad=False)
+        layer.w2_weight_scale = Parameter(w2_s_il, requires_grad=False)
+
+        torch.cuda.empty_cache()
+
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
@@ -761,6 +872,66 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             # TODO(cwan): refactor other backends
             pass
 
+    def _apply_sm90_cutlass(self, layer, x, topk_output):
+        """SM90 (Hopper) MXFP4 x BF16 MoE via FlashInfer's cutlass mixed-input
+        path (PR #3084). The fused kernel does GEMM1 + SwiGLU + GEMM2 in one
+        call; weights/scales were pre-interleaved at load time."""
+        from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
+
+        topk_weights, topk_ids = topk_output.topk_weights, topk_output.topk_ids
+
+        # Pad input hidden dim to the (already-padded) loaded weight width.
+        origin_hidden = x.shape[-1]
+        if self.hidden_size != origin_hidden:
+            x = torch.nn.functional.pad(
+                x,
+                (0, self.hidden_size - origin_hidden),
+                mode="constant",
+                value=0.0,
+            )
+
+        output_dtype = torch.bfloat16
+        # Output is allocated at padded width (kernel writes self.hidden_size
+        # columns), then trimmed back to origin_hidden before returning.
+        with use_symmetric_memory(
+            get_tp_group(), disabled=not is_allocation_symmetric()
+        ):
+            out_padded = torch.empty(
+                x.shape[0], self.hidden_size, dtype=output_dtype, device=x.device
+            )
+
+        flashinfer_cutlass_fused_moe(
+            input=x,
+            token_selected_experts=topk_ids.to(torch.int),
+            token_final_scales=topk_weights,
+            fc1_expert_weights=layer.w13_weight,  # uint8 [E, 2*N, K/2] interleaved
+            fc2_expert_weights=layer.w2_weight,  # uint8 [E, K, N/2] interleaved
+            output_dtype=output_dtype,
+            quant_scales=[
+                layer.w13_weight_scale.view(torch.int32),
+                layer.w2_weight_scale.view(torch.int32),
+            ],
+            fc1_expert_biases=layer.w13_weight_bias,  # bf16 [E, 2*N]
+            fc2_expert_biases=layer.w2_weight_bias,  # bf16 [E, K]
+            swiglu_alpha=layer.swiglu_alpha,
+            swiglu_beta=layer.swiglu_beta,
+            swiglu_limit=layer.swiglu_limit,
+            tp_size=layer.moe_tp_size,
+            tp_rank=layer.moe_tp_rank,
+            ep_size=layer.moe_ep_size,
+            ep_rank=layer.moe_ep_rank,
+            use_w4_group_scaling=True,
+            activation_type=ActivationType.Swiglu,
+            tune_max_num_tokens=next_power_of_2(x.shape[0]),
+            output=out_padded,
+        )
+
+        if self.hidden_size != origin_hidden:
+            out = out_padded[:, :origin_hidden].contiguous()
+        else:
+            out = out_padded
+        return StandardCombineInput(hidden_states=out)
+
     def apply(
         self,
         layer: torch.nn.Module,
@@ -773,6 +944,8 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         x = dispatch_output.hidden_states
         topk_output = dispatch_output.topk_output
 
+        if self._fi_kernel == "cutlass_sm90":
+            return self._apply_sm90_cutlass(layer, x, topk_output)
         if self.use_flashinfer:
             # When bf16 mode is enabled, we don't need to quantize the input,
             # TRT-LLM automatically handles quantization in the kernel implementation and pipelines it with GEMM operations,
