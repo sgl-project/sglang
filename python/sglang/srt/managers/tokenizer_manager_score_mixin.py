@@ -261,7 +261,7 @@ class TokenizerManagerScoreMixin:
         has_phs = False
         prompt_tokens = 0
 
-        is_generation = getattr(self, "is_generation", True)
+        is_generation = self.is_generation
         if is_generation:
             for result in results:
                 # For single-item scoring, logprobs are in output_token_ids_logprobs
@@ -563,7 +563,7 @@ class TokenizerManagerScoreMixin:
                     return_pooled_hidden_states=True and the model supports it;
                     None otherwise.
         """
-        is_generation = getattr(self, "is_generation", True)
+        is_generation = self.is_generation
 
         if is_generation and label_token_ids is None:
             raise ValueError(
