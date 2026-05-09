@@ -37,7 +37,7 @@ dependencies = [
   "ninja",
   "easydict",  # Required by remote model code (e.g. DeepSeek-OCR) loaded via trust_remote_code; validated by transformers 5.4+ check_imports
   "numpy",
-  "nvidia-cutlass-dsl==4.4.2",
+  "nvidia-cutlass-dsl==4.5.0",
   "nvidia-ml-py",
   "openai-harmony==0.0.4",
   "openai==2.6.1",
