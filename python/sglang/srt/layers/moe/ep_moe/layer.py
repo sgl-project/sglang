@@ -95,7 +95,16 @@ class DeepEPMoE(FusedMoE):
             routed_scaling_factor=routed_scaling_factor,
             **kwargs,
         )
-        if _use_aiter or _is_npu:
+        is_humming = (
+            get_moe_runner_backend().is_humming()
+            or get_moe_runner_backend().is_auto()
+            and quant_config is not None
+            and quant_config.get_name() == "humming"
+        )
+        if is_humming:
+            envs.SGLANG_DEEPEP_BF16_DISPATCH.set(True)
+            self.deprecate_flag = True
+        elif _use_aiter or _is_npu:
             self.deprecate_flag = False
         elif deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM and isinstance(
             quant_config, Fp8Config

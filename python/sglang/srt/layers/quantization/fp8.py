@@ -192,6 +192,7 @@ class Fp8Config(QuantizationConfig):
                 and (
                     get_moe_runner_backend().is_flashinfer_mxfp4()
                     or get_moe_runner_backend().is_marlin()
+                    or get_moe_runner_backend().is_humming()
                 )
             ):
                 from sglang.srt.layers.quantization.mxfp4_deepseek import (

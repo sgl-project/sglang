@@ -93,6 +93,7 @@ from sgl_kernel.moe import (
     fused_qk_norm_rope,
     kimi_k2_moe_fused_gate,
     moe_align_block_size,
+    moe_permute_prepare,
     moe_fused_gate,
     moe_sum,
     moe_sum_reduce,
