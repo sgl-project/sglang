@@ -461,11 +461,15 @@ def apply_qk_norm(
     # so it is safe even when callers do not allow in-place updates.
     # NOTE: must use reshape (not view) because qkv.split() returns non-contiguous
     # strided views; ROCm RMSNorm kernels fault on strided inputs (see #23159).
+    # NOTE: AITER's fused kernel assumes Q and K have the SAME number of rows.
+    # For GQA models (num_heads_q > num_heads_kv) we skip this path since
+    # q.reshape(-1, head_dim) has more rows than k.reshape(-1, head_dim).
     if (
         _is_hip
         and _aiter_fused_qk_rmsnorm is not None
         and (q_eps == k_eps)
         and not envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.get()
+        and q.shape[-1] == k.shape[-1]  # MHA only (no GQA)
     ):
         q_2d = q.reshape(-1, head_dim)
         k_2d = k.reshape(-1, head_dim)
