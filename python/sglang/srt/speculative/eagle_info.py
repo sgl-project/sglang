@@ -240,7 +240,7 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
         accepted token logits.
         """
         if batch.forward_mode.is_idle():
-            return EagleVerifyOutput(
+            return EagleVerifyOutput.create_idle(
                 draft_input=EagleDraftInput.create_idle_input(
                     device=batch.device,
                     hidden_size=batch.model_config.spec_hidden_size,
@@ -249,24 +249,8 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                     capture_hidden_mode=CaptureHiddenMode.LAST,
                 ),
                 logits_output=logits_output,
-                accept_tokens=torch.empty(0, dtype=torch.long, device=batch.device),
-                next_extend_input_ids=torch.empty(
-                    0, dtype=torch.long, device=batch.device
-                ),
-                seq_lens_for_draft_extend=torch.empty(
-                    0, dtype=torch.int32, device=batch.device
-                ),
-                seq_lens_for_draft_extend_cpu=torch.empty(0, dtype=torch.int32),
-                req_pool_indices_for_draft_extend=torch.empty(
-                    0, dtype=torch.int64, device=batch.device
-                ),
-                num_accepted_drafts_per_req_cpu=[],
-                accepted_indices=torch.full(
-                    (0, self.spec_steps + 1),
-                    -1,
-                    dtype=torch.int32,
-                    device=batch.device,
-                ),
+                device=batch.device,
+                spec_steps=self.spec_steps,
             )
 
         bs = self.retrieve_index.shape[0]
@@ -913,3 +897,28 @@ class EagleVerifyOutput:
     num_accepted_drafts_per_req_cpu: List[int]
     # Accepted indices from logits_output.next_token_logits
     accepted_indices: torch.Tensor
+
+    @classmethod
+    def create_idle(
+        cls,
+        *,
+        draft_input: EagleDraftInput,
+        logits_output: LogitsProcessorOutput,
+        device: torch.device,
+        spec_steps: int,
+    ) -> "EagleVerifyOutput":
+        return cls(
+            draft_input=draft_input,
+            logits_output=logits_output,
+            accept_tokens=torch.empty(0, dtype=torch.long, device=device),
+            next_extend_input_ids=torch.empty(0, dtype=torch.long, device=device),
+            seq_lens_for_draft_extend=torch.empty(0, dtype=torch.int32, device=device),
+            seq_lens_for_draft_extend_cpu=torch.empty(0, dtype=torch.int32),
+            req_pool_indices_for_draft_extend=torch.empty(
+                0, dtype=torch.int64, device=device
+            ),
+            num_accepted_drafts_per_req_cpu=[],
+            accepted_indices=torch.full(
+                (0, spec_steps + 1), -1, dtype=torch.int32, device=device
+            ),
+        )
