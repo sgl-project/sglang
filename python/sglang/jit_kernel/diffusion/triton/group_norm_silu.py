@@ -9,9 +9,10 @@ from sglang.srt.utils.custom_op import register_custom_op
 
 _SUPPORTED_DTYPES = {torch.float16, torch.bfloat16, torch.float32}
 _LARGE_GROUP_THRESHOLD = 1 << 18
+_MEDIUM_GROUP_THRESHOLD = 1 << 20
 _BLOCK_SIZE = 4096
-_BLOCKS_PER_PROGRAM = 2
-_CHUNK_SIZE = _BLOCK_SIZE * _BLOCKS_PER_PROGRAM
+_MEDIUM_BLOCKS_PER_PROGRAM = 1
+_LARGE_BLOCKS_PER_PROGRAM = 2
 
 
 @triton.jit
@@ -298,7 +299,13 @@ def _launch_chunked(
     channels_per_group = channels // num_groups
     group_size = channels_per_group * spatial_size
     rows = batch_size * num_groups
-    chunks_per_row = triton.cdiv(group_size, _CHUNK_SIZE)
+    blocks_per_program = (
+        _MEDIUM_BLOCKS_PER_PROGRAM
+        if group_size <= _MEDIUM_GROUP_THRESHOLD
+        else _LARGE_BLOCKS_PER_PROGRAM
+    )
+    chunk_size = _BLOCK_SIZE * blocks_per_program
+    chunks_per_row = triton.cdiv(group_size, chunk_size)
 
     x_flat = x_contiguous.reshape(-1)
     y = torch.empty_like(x_contiguous)
@@ -320,7 +327,7 @@ def _launch_chunked(
         group_size,
         chunks_per_row,
         BLOCK_SIZE=_BLOCK_SIZE,
-        BLOCKS_PER_PROGRAM=_BLOCKS_PER_PROGRAM,
+        BLOCKS_PER_PROGRAM=blocks_per_program,
         num_warps=8,
         num_stages=3,
     )
@@ -338,7 +345,7 @@ def _launch_chunked(
         num_stages=2,
     )
 
-    if spatial_size % _CHUNK_SIZE == 0 and chunks_per_row >= 64:
+    if spatial_size % chunk_size == 0 and chunks_per_row >= 64:
         _group_norm_apply_scalar_affine_kernel[(rows, chunks_per_row)](
             x_flat,
             weight,
@@ -352,7 +359,7 @@ def _launch_chunked(
             group_size,
             chunks_per_row,
             BLOCK_SIZE=_BLOCK_SIZE,
-            BLOCKS_PER_PROGRAM=_BLOCKS_PER_PROGRAM,
+            BLOCKS_PER_PROGRAM=blocks_per_program,
             num_warps=4,
             num_stages=3,
         )
@@ -370,7 +377,7 @@ def _launch_chunked(
             group_size,
             chunks_per_row,
             BLOCK_SIZE=_BLOCK_SIZE,
-            BLOCKS_PER_PROGRAM=_BLOCKS_PER_PROGRAM,
+            BLOCKS_PER_PROGRAM=blocks_per_program,
             num_warps=8,
             num_stages=3,
         )

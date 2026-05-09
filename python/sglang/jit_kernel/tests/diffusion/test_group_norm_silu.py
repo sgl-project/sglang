@@ -20,6 +20,7 @@ TEST_CASES = [
     pytest.param((4, 128), 32, id="token_2d"),
 ]
 LARGE_TILE_CASE = ((1, 128, 20, 256, 256), 32)
+MEDIUM_TILE_CASE = ((1, 128, 1, 256, 256), 32)
 
 
 def _tol(dtype: torch.dtype) -> tuple[float, float]:
@@ -83,6 +84,20 @@ def test_apply_group_norm_silu(
     expected = activation(norm(hidden_states))
 
     atol, rtol = _tol(dtype)
+    torch.testing.assert_close(actual, expected, atol=atol, rtol=rtol)
+
+
+@torch.no_grad()
+def test_triton_group_norm_silu_medium_tile_bf16() -> None:
+    shape, num_groups = MEDIUM_TILE_CASE
+    x = torch.randn(shape, device=DEVICE, dtype=torch.bfloat16)
+    weight = torch.randn(shape[1], device=DEVICE, dtype=torch.bfloat16)
+    bias = torch.randn(shape[1], device=DEVICE, dtype=torch.bfloat16)
+
+    actual = triton_group_norm_silu(x, weight, bias, num_groups=num_groups)
+    expected = _reference(x, weight, bias, num_groups)
+
+    atol, rtol = _tol(torch.bfloat16)
     torch.testing.assert_close(actual, expected, atol=atol, rtol=rtol)
 
 
