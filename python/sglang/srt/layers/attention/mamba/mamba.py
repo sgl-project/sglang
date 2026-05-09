@@ -519,7 +519,7 @@ class MambaMixer2(torch.nn.Module):
             )  # this is the form that causal-conv see
             ccfn = (
                 causal_conv1d_fn
-                if not use_triton_causal_conv
+                if is_npu() or not use_triton_causal_conv
                 else causal_conv1d_fn_triton
             )
             hidden_states_B_C_p = ccfn(
@@ -618,7 +618,7 @@ class MambaMixer2(torch.nn.Module):
             else:
                 ccu = (
                     causal_conv1d_update
-                    if not use_triton_causal_conv
+                    if is_npu() or not use_triton_causal_conv
                     else causal_conv1d_update_triton
                 )
                 hidden_states_B_C_d = ccu(

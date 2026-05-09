@@ -452,7 +452,7 @@ class GraniteMoeHybridModel(nn.Module):
                 }
             )
         else:
-            hidden_states, _ = self.norm(hidden_states, residual)
+            hidden_states = self.norm(hidden_states)
 
         if len(aux_hidden_states) == 0:
             return hidden_states

@@ -284,6 +284,13 @@ class AscendAttnBackend(AttentionBackend):
                 in model_runner.model_config.hf_config.architectures
             ):
                 self.use_native_sdpa = True
+            elif (
+                "GraniteMoeHybridForCausalLM"
+                in model_runner.model_config.hf_config.architectures
+            ):
+                self.use_native_sdpa = True
+                self.use_npu_paged_attention = False
+
         self.native_attn = AscendTorchNativeAttnBackend()
         self.graph_metadata = {}
         self.max_context_len = model_runner.model_config.context_len
@@ -2016,9 +2023,13 @@ class AscendAttnBackend(AttentionBackend):
                     actual_seq_lengths_kv=actual_seq_len_kv,
                     scale=layer.scaling,
                 )
-            # there are some accuracy issues in cross attention scene to use torch_npu._npu_flash_attention_qlens
-            # forward_batch.encoder_lens is not None in cross attention scend, we add native attn to solve accuracy issues
-            elif forward_batch.encoder_lens is None and layer.logit_cap == 0:
+            # there are some accuracy issues in cross attention scene to use torch_npu._npu_paged_attention
+            # forward_batch.encoder_lens is not None in cross attention scene, we add native attn to solve accuracy issues
+            elif (
+                forward_batch.encoder_lens is None
+                and layer.logit_cap == 0
+                and getattr(self, "use_npu_paged_attention", True)
+            ):
                 query = q.reshape(-1, layer.tp_q_head_num, layer.qk_head_dim)
                 num_tokens = query.shape[0]
                 if not self.use_alibi:
