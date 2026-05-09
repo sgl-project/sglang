@@ -573,13 +573,13 @@ def handle_rerun_stage(
                 )
                 if run_url:
                     pr.create_issue_comment(
-                        f"✅ Triggered `{stage_name}` to run independently"
+                        f"🚀 Triggered `{stage_name}` to run independently"
                         f" (skipping dependencies)."
                         f" [View workflow run]({run_url})"
                     )
                 else:
                     pr.create_issue_comment(
-                        f"✅ Triggered `{stage_name}` to run independently"
+                        f"🚀 Triggered `{stage_name}` to run independently"
                         f" (skipping dependencies).\n"
                         f"⚠️ Could not retrieve workflow run URL. "
                         f"Check the [Actions tab](https://github.com/{gh_repo.full_name}/actions) for progress."
@@ -1115,13 +1115,13 @@ def handle_rerun_test(
                 )
             if dr.get("run_url"):
                 lines.append(
-                    f"✅ `{dr['runner_label']}` ({len(dr['test_commands'])} test{'s' if len(dr['test_commands']) > 1 else ''}): "
+                    f"🚀 `{dr['runner_label']}` ({len(dr['test_commands'])} test{'s' if len(dr['test_commands']) > 1 else ''}): "
                     f"[View workflow run]({dr['run_url']})\n"
                     f"```\n{cmds}\n```"
                 )
             else:
                 lines.append(
-                    f"✅ `{dr['runner_label']}` ({len(dr['test_commands'])} test{'s' if len(dr['test_commands']) > 1 else ''}):\n"
+                    f"🚀 `{dr['runner_label']}` ({len(dr['test_commands'])} test{'s' if len(dr['test_commands']) > 1 else ''}):\n"
                     f"```\n{cmds}\n```\n"
                     f"⚠️ Could not retrieve workflow run URL. "
                     f"Check the [Actions tab](https://github.com/{gh_repo.full_name}/actions) for progress."
