@@ -404,7 +404,7 @@ def handle_rerun_stage(
         print("Error: No stage name provided")
         comment.create_reaction("confused")
         pr.create_issue_comment(
-            f"❌ Please specify a stage name: `/rerun-stage <stage-name>`\n\n"
+            f"⛔ Please specify a stage name: `/rerun-stage <stage-name>`\n\n"
             f"Examples: `/rerun-stage unit-test-backend-4-gpu`, `/rerun-stage accuracy-test-1-gpu`"
         )
         return False
@@ -456,7 +456,7 @@ def handle_rerun_stage(
     if stage_name not in valid_stages:
         comment.create_reaction("confused")
         pr.create_issue_comment(
-            f"❌ Stage `{stage_name}` doesn't support isolated runs yet.\n\n"
+            f"⛔ Stage `{stage_name}` doesn't support isolated runs yet.\n\n"
             f"**NVIDIA stages:**\n"
             + "\n".join(f"- `{s}`" for s in nvidia_stages)
             + "\n\n**AMD stages:**\n"
@@ -573,13 +573,13 @@ def handle_rerun_stage(
                 )
                 if run_url:
                     pr.create_issue_comment(
-                        f"✅ Triggered `{stage_name}` to run independently"
+                        f"🚀 Triggered `{stage_name}` to run independently"
                         f" (skipping dependencies)."
                         f" [View workflow run]({run_url})"
                     )
                 else:
                     pr.create_issue_comment(
-                        f"✅ Triggered `{stage_name}` to run independently"
+                        f"🚀 Triggered `{stage_name}` to run independently"
                         f" (skipping dependencies).\n"
                         f"⚠️ Could not retrieve workflow run URL. "
                         f"Check the [Actions tab](https://github.com/{gh_repo.full_name}/actions) for progress."
@@ -593,7 +593,7 @@ def handle_rerun_stage(
         print(f"Error triggering workflow_dispatch: {e}")
         comment.create_reaction("confused")
         pr.create_issue_comment(
-            f"❌ Failed to trigger workflow: {str(e)}\n\n"
+            f"⛔ Failed to trigger workflow: {str(e)}\n\n"
             f"Please check the logs or contact maintainers."
         )
         return False
@@ -908,7 +908,7 @@ def _resolve_test_spec(test_spec):
     }
 
 
-def _dispatch_batch(gh_repo, pr, batch, token):
+def _dispatch_batch(gh_repo, pr, batch, token, reply_comment_id="", reply_marker=""):
     """
     Dispatch a single workflow run for a batch of resolved test specs
     that share the same (runner_label, use_deepep, is_cpu).
@@ -951,6 +951,8 @@ def _dispatch_batch(gh_repo, pr, batch, token):
             "use_deepep": str(use_deepep).lower(),
             "is_cpu": str(is_cpu).lower(),
             "install_diffusion": str(install_diffusion).lower(),
+            "reply_comment_id": str(reply_comment_id) if reply_comment_id else "",
+            "reply_marker": reply_marker,
         }
         if is_fork:
             ref = "main"
@@ -998,6 +1000,7 @@ def _dispatch_batch(gh_repo, pr, batch, token):
             "test_commands": test_commands,
             "runner_label": runner_label,
             "run_url": run_url,
+            "reply_marker": reply_marker,
         }
 
     except Exception as e:
@@ -1023,7 +1026,7 @@ def _check_rerun_test_permissions(gh_repo, pr, comment, user_perms, command_name
             print(f"Permission denied: /{command_name} on fork PR by {commenter}.")
             comment.create_reaction("confused")
             pr.create_issue_comment(
-                f"❌ `/{command_name}` is not available for fork PRs unless the commenter "
+                f"⛔ `/{command_name}` is not available for fork PRs unless the commenter "
                 "has write permission on the repo.\n\n"
                 "Please ask a maintainer to run this command, or use the normal CI flow."
             )
@@ -1055,7 +1058,7 @@ def handle_rerun_test(
     if not test_specs:
         comment.create_reaction("confused")
         pr.create_issue_comment(
-            "❌ Please specify a test: `/rerun-test <file>::<TestClass.test_method>`\n\n"
+            "⛔ Please specify a test: `/rerun-test <file>::<TestClass.test_method>`\n\n"
             "Examples:\n"
             "- `/rerun-test test/registered/core/test_srt_endpoint.py::TestSRTEndpoint.test_simple_decode`\n"
             "- `/rerun-test registered/core/test_srt_endpoint.py::TestSRTEndpoint`\n"
@@ -1091,12 +1094,30 @@ def handle_rerun_test(
         )
         groups.setdefault(key, []).append(r)
 
-    # Phase 3: Dispatch one workflow per group
-    dispatch_results = []
-    for batch in groups.values():
-        dispatch_results.append(_dispatch_batch(gh_repo, pr, batch, token))
+    # Phase 3a: Create placeholder reply comment so we have its ID before
+    # dispatching workflows. This lets each dispatched run write its
+    # success/failure result back to the right line in this comment.
+    reply_comment = pr.create_issue_comment("🚀 Dispatching rerun-test workflow(s)...")
 
-    # Build consolidated comment
+    # Phase 3b: Dispatch one workflow per group, with a unique per-batch
+    # marker each. The marker is an HTML comment that the writeback step
+    # uses to locate the line and replace 🚀 with ✅/❌.
+    dispatch_results = []
+    for idx, batch in enumerate(groups.values()):
+        marker = f"<!--rrt:{idx}-->"
+        dispatch_results.append(
+            _dispatch_batch(
+                gh_repo,
+                pr,
+                batch,
+                token,
+                reply_comment_id=reply_comment.id,
+                reply_marker=marker,
+            )
+        )
+
+    # Build consolidated comment body (markers placed at line ends so the
+    # writeback step can locate and update each line).
     lines = []
     for dr in dispatch_results:
         if dr["success"]:
@@ -1113,25 +1134,26 @@ def handle_rerun_test(
                 cmds = "\n".join(
                     f"cd test/ && python3 {cmd}" for cmd in dr["test_commands"]
                 )
+            marker = dr.get("reply_marker", "")
             if dr.get("run_url"):
                 lines.append(
-                    f"✅ `{dr['runner_label']}` ({len(dr['test_commands'])} test{'s' if len(dr['test_commands']) > 1 else ''}): "
-                    f"[View workflow run]({dr['run_url']})\n"
+                    f"🚀 `{dr['runner_label']}` ({len(dr['test_commands'])} test{'s' if len(dr['test_commands']) > 1 else ''}): "
+                    f"⏳ [View workflow run]({dr['run_url']}) {marker}\n"
                     f"```\n{cmds}\n```"
                 )
             else:
                 lines.append(
-                    f"✅ `{dr['runner_label']}` ({len(dr['test_commands'])} test{'s' if len(dr['test_commands']) > 1 else ''}):\n"
+                    f"🚀 `{dr['runner_label']}` ({len(dr['test_commands'])} test{'s' if len(dr['test_commands']) > 1 else ''}): ⏳ {marker}\n"
                     f"```\n{cmds}\n```\n"
                     f"⚠️ Could not retrieve workflow run URL. "
                     f"Check the [Actions tab](https://github.com/{gh_repo.full_name}/actions) for progress."
                 )
         else:
             specs_str = ", ".join(f"`{s}`" for s in dr["specs"])
-            lines.append(f"❌ {specs_str}: {dr['error']}")
+            lines.append(f"⛔ {specs_str}: {dr['error']}")
 
     for r in resolve_failures:
-        lines.append(f"❌ `{r['spec']}`: {r['error']}")
+        lines.append(f"⛔ `{r['spec']}`: {r['error']}")
 
     body = "\n\n".join(lines)
 
@@ -1141,7 +1163,7 @@ def handle_rerun_test(
     if not successes and (resolve_failures or dispatch_results):
         comment.create_reaction("confused")
 
-    pr.create_issue_comment(body)
+    reply_comment.edit(body)
     return len(successes) > 0
 
 
@@ -1158,7 +1180,7 @@ def handle_rerun_group(gh_repo, pr, comment, user_perms, group_names, token):
     if not group_names:
         comment.create_reaction("confused")
         pr.create_issue_comment(
-            "❌ Please specify a test group: `/rerun-group <group>`\n\n"
+            "⛔ Please specify a test group: `/rerun-group <group>`\n\n"
             "Example:\n"
             "- `/rerun-group hicache`"
         )
@@ -1180,7 +1202,7 @@ def handle_rerun_group(gh_repo, pr, comment, user_perms, group_names, token):
 
     if failures:
         comment.create_reaction("confused")
-        lines = [f"❌ `{group}`: {err}" for group, err in failures]
+        lines = [f"⛔ `{group}`: {err}" for group, err in failures]
         pr.create_issue_comment("\n\n".join(lines))
         return False
 

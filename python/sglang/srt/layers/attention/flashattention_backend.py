@@ -2483,10 +2483,20 @@ class FlashAttentionBackend(AttentionBackend):
             else metadata_swa.page_table
         )
 
+        page_table_a = metadata.page_table
+        page_table_b = metadata_expand.page_table
+        if self.use_sliding_window_kv_pool:
+            page_table_a = self.token_to_kv_pool.translate_loc_from_full_to_swa(
+                page_table_a
+            )
+            page_table_b = self.token_to_kv_pool.translate_loc_from_full_to_swa(
+                page_table_b
+            )
+
         prepare_swa_spec_page_table_triton(
             page_table,
-            metadata.page_table,
-            metadata_expand.page_table,
+            page_table_a,
+            page_table_b,
             metadata.cache_seqlens_int32,
             metadata_expand.cache_seqlens_int32,
             self.speculative_num_draft_tokens,
