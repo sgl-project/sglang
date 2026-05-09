@@ -18,12 +18,36 @@ tag: NEW
 
 **Benchmarks (from the model card):**
 
-| Benchmark | Score |
-| --- | --- |
-| SWE-bench Verified | 68.2% |
-| SWE-bench Multilingual | 62.4% |
-| SWE-bench Pro | 44.5% |
-| Terminal-Bench 2.0 | 30.1% |
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <colgroup>
+    <col style={{width: "60%"}} />
+    <col style={{width: "40%"}} />
+  </colgroup>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, backgroundColor: "rgba(255,255,255,0.02)"}}>Benchmark</th>
+      <th style={{textAlign: "right", padding: "10px 12px", fontWeight: 700, backgroundColor: "rgba(255,255,255,0.05)"}}>Score</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>SWE-bench Verified</td>
+      <td style={{padding: "9px 12px", textAlign: "right", backgroundColor: "rgba(255,255,255,0.05)"}}><strong>68.2%</strong></td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>SWE-bench Multilingual</td>
+      <td style={{padding: "9px 12px", textAlign: "right", backgroundColor: "rgba(255,255,255,0.05)"}}>62.4%</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>SWE-bench Pro</td>
+      <td style={{padding: "9px 12px", textAlign: "right", backgroundColor: "rgba(255,255,255,0.05)"}}>44.5%</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Terminal-Bench 2.0</td>
+      <td style={{padding: "9px 12px", textAlign: "right", backgroundColor: "rgba(255,255,255,0.05)"}}>30.1%</td>
+    </tr>
+  </tbody>
+</table>
 
 **Recommended Generation Parameters:**
 
@@ -31,11 +55,37 @@ tag: NEW
 
 **Available Quantizations:**
 
-| Variant | Hugging Face path | Notes |
-| --- | --- | --- |
-| BF16 | [`poolside/Laguna-XS.2`](https://huggingface.co/poolside/Laguna-XS.2) | Runs on H200 and B200. |
-| FP8 | [`poolside/Laguna-XS.2-FP8`](https://huggingface.co/poolside/Laguna-XS.2-FP8) | Runs on H200 and B200. First launch triggers a multi-session DeepGEMM JIT pre-compile (~10-20 min) — pre-warm with `python3 -m sglang.compile_deep_gemm --model poolside/Laguna-XS.2-FP8`. |
-| NVFP4 | [`poolside/Laguna-XS.2-NVFP4`](https://huggingface.co/poolside/Laguna-XS.2-NVFP4) | Blackwell-only — runs on B200; H200 raises `NotImplementedError: Current platform does not support w4a4 nvfp4 quantization`. |
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <colgroup>
+    <col style={{width: "12%"}} />
+    <col style={{width: "28%"}} />
+    <col style={{width: "60%"}} />
+  </colgroup>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, backgroundColor: "rgba(255,255,255,0.02)"}}>Variant</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, backgroundColor: "rgba(255,255,255,0.05)"}}>Hugging Face path</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, backgroundColor: "rgba(255,255,255,0.02)"}}>Notes</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><strong>BF16</strong></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>[`poolside/Laguna-XS.2`](https://huggingface.co/poolside/Laguna-XS.2)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Runs on H200 and B200.</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><strong>FP8</strong></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>[`poolside/Laguna-XS.2-FP8`](https://huggingface.co/poolside/Laguna-XS.2-FP8)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Runs on H200 and B200. First launch triggers a multi-session DeepGEMM JIT pre-compile (~10-20 min) — pre-warm with `python3 -m sglang.compile_deep_gemm --model poolside/Laguna-XS.2-FP8`.</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><strong>NVFP4</strong></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>[`poolside/Laguna-XS.2-NVFP4`](https://huggingface.co/poolside/Laguna-XS.2-NVFP4)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Blackwell-only — runs on B200; H200 raises `NotImplementedError: Current platform does not support w4a4 nvfp4 quantization`.</td>
+    </tr>
+  </tbody>
+</table>
 
 **License:** Apache 2.0
 
@@ -92,12 +142,12 @@ docker run --gpus all --shm-size 32g \
   -v ~/.cache/huggingface:/root/.cache/huggingface \
   --ipc=host \
   lmsysorg/sglang:dev-cu13-pr-24204 \
-  python3 -m sglang.launch_server \
+  sglang serve \
     --model-path poolside/Laguna-XS.2 \
-    --host 0.0.0.0 --port 30000 \
     --tp 8 \
     --reasoning-parser poolside_v1 \
-    --tool-call-parser poolside_v1
+    --tool-call-parser poolside_v1 \
+    --host 0.0.0.0 --port 30000
 ```
 
 ### 2.2 PyPI
@@ -119,12 +169,12 @@ python3 -m pip install "sglang[all]==0.5.11"
 **Launch the server (BF16):**
 
 ```bash Command
-python3 -m sglang.launch_server \
+sglang serve \
   --model-path poolside/Laguna-XS.2 \
-  --host 0.0.0.0 --port 30000 \
   --tp 8 \
   --reasoning-parser poolside_v1 \
-  --tool-call-parser poolside_v1
+  --tool-call-parser poolside_v1 \
+  --host 0.0.0.0 --port 30000
 ```
 
 ## 3. Model Deployment
@@ -140,8 +190,10 @@ import { LagunaXS2Deployment } from '/src/snippets/autoregressive/laguna-xs2-dep
 ### 3.2 Configuration Tips
 
 - **Quantization**: NVFP4 requires Blackwell (B200 / B300); BF16 and FP8 run on either H200 or B200. FP8's first launch triggers a multi-session DeepGEMM JIT pre-compile (~10-20 min); pre-warm with `python3 -m sglang.compile_deep_gemm --model poolside/Laguna-XS.2-FP8` to avoid that cost on every restart.
-- **DP attention**: For higher-throughput deployments, enable the DP-Attention toggle in the generator — it emits `--dp <N> --enable-dp-attention` with `--dp` matching `--tp` (tune independently if needed).
-- **Thinking default**: Thinking is **off by default**. Opt in per request with `extra_body={"chat_template_kwargs": {"enable_thinking": True}}`, or flip the server default with `--chat-template-kwargs '{"enable_thinking": true}'`.
+- **Reasoning parser** (`--reasoning-parser poolside_v1`): Splits `<think>...</think>` segments into `reasoning_content` so `content` holds only the final answer. Disable only if you want the raw `<think>` tags in `content`.
+- **Tool call parser** (`--tool-call-parser poolside_v1`): Required for OpenAI-compatible tool-call streaming. Disable only for chat-only deployments.
+- **DP attention**: For higher-throughput deployments, enable the DP-Attention toggle — it emits `--dp <N> --enable-dp-attention` with `--dp` matching `--tp` (tune independently if needed).
+- **Thinking default**: Thinking is **off by default** at the model level. Opt in per request with `extra_body={"chat_template_kwargs": {"enable_thinking": True}}`, or flip the server default by appending `--chat-template-kwargs '{"enable_thinking": true}'` to the launch command.
 
 ## 4. Model Invocation
 

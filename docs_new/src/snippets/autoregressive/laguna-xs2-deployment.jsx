@@ -28,20 +28,28 @@ export const LagunaXS2Deployment = () => {
         ];
       }
     },
+    reasoning: {
+      name: 'reasoning',
+      title: 'Reasoning Parser',
+      items: [
+        { id: 'disabled', label: 'Disabled', default: false },
+        { id: 'enabled',  label: 'Enabled',  default: true }
+      ]
+    },
+    toolcall: {
+      name: 'toolcall',
+      title: 'Tool Call Parser',
+      items: [
+        { id: 'disabled', label: 'Disabled', default: false },
+        { id: 'enabled',  label: 'Enabled',  default: true }
+      ]
+    },
     dpAttention: {
       name: 'dpAttention',
       title: 'DP Attention',
       items: [
-        { id: 'disabled', label: 'Disabled', default: true },
-        { id: 'enabled',  label: 'Enabled',  default: false }
-      ]
-    },
-    thinking: {
-      name: 'thinking',
-      title: 'Thinking (server default)',
-      items: [
-        { id: 'disabled', label: 'Disabled', default: true },
-        { id: 'enabled',  label: 'Enabled',  default: false }
+        { id: 'disabled', label: 'Disabled', subtitle: 'Low Latency',     default: true },
+        { id: 'enabled',  label: 'Enabled',  subtitle: 'High Throughput', default: false }
       ]
     }
   };
@@ -89,7 +97,6 @@ export const LagunaXS2Deployment = () => {
   const handleRadioChange = (optionName, value) => {
     setValues(prev => {
       const next = { ...prev, [optionName]: value };
-      // Re-validate dependent options whose dynamic items may now disable the current selection.
       Object.entries(options).forEach(([key, option]) => {
         if (key === optionName) return;
         const items = resolveItems(option, next);
@@ -104,7 +111,7 @@ export const LagunaXS2Deployment = () => {
   };
 
   const generateCommand = () => {
-    const { hardware, quantization, dpAttention, thinking } = values;
+    const { hardware, quantization, reasoning, toolcall, dpAttention } = values;
 
     if (hardware === 'h200' && quantization === 'nvfp4') {
       return '# Error: NVFP4 is Blackwell-only. Select B200, or pick BF16/FP8 for H200.';
@@ -113,35 +120,44 @@ export const LagunaXS2Deployment = () => {
     const modelId = modelByQuant[quantization];
     if (!modelId) return `# Error: Unknown quantization: ${quantization}`;
 
+    const tp = 8;
     const lines = [
-      'python3 -m sglang.launch_server \\',
+      'sglang serve \\',
       `  --model-path ${modelId} \\`,
-      '  --tp 8 \\',
-      '  --reasoning-parser poolside_v1 \\',
-      '  --tool-call-parser poolside_v1'
+      `  --tp ${tp}`
     ];
 
     if (dpAttention === 'enabled') {
       lines[lines.length - 1] += ' \\';
-      lines.push('  --dp 8 \\');
+      lines.push(`  --dp ${tp} \\`);
       lines.push('  --enable-dp-attention');
     }
 
-    if (thinking === 'enabled') {
+    if (reasoning === 'enabled') {
       lines[lines.length - 1] += ' \\';
-      lines.push("  --chat-template-kwargs '{\"enable_thinking\": true}'");
+      lines.push('  --reasoning-parser poolside_v1');
     }
+
+    if (toolcall === 'enabled') {
+      lines[lines.length - 1] += ' \\';
+      lines.push('  --tool-call-parser poolside_v1');
+    }
+
+    lines[lines.length - 1] += ' \\';
+    lines.push('  --host 0.0.0.0 \\');
+    lines.push('  --port 30000');
 
     return lines.join('\n');
   };
 
   const containerStyle = { maxWidth: '900px', margin: '0 auto', display: 'flex', flexDirection: 'column', gap: '4px' };
   const cardStyle = { padding: '8px 12px', border: `1px solid ${isDark ? '#374151' : '#e5e7eb'}`, borderLeft: `3px solid ${isDark ? '#E85D4D' : '#D45D44'}`, borderRadius: '4px', display: 'flex', alignItems: 'center', gap: '12px', background: isDark ? '#1f2937' : '#fff' };
-  const titleStyle = { fontSize: '13px', fontWeight: '600', minWidth: '180px', flexShrink: 0, color: isDark ? '#e5e7eb' : 'inherit' };
+  const titleStyle = { fontSize: '13px', fontWeight: '600', minWidth: '140px', flexShrink: 0, color: isDark ? '#e5e7eb' : 'inherit' };
   const itemsStyle = { display: 'flex', rowGap: '2px', columnGap: '6px', flexWrap: 'wrap', alignItems: 'center', flex: 1 };
   const labelBaseStyle = { padding: '4px 10px', border: `1px solid ${isDark ? '#9ca3af' : '#d1d5db'}`, borderRadius: '3px', cursor: 'pointer', display: 'inline-flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', fontWeight: '500', fontSize: '13px', transition: 'all 0.2s', userSelect: 'none', minWidth: '45px', textAlign: 'center', flex: 1, background: isDark ? '#374151' : '#fff', color: isDark ? '#e5e7eb' : 'inherit' };
   const checkedStyle = { background: '#D45D44', color: 'white', borderColor: '#D45D44' };
   const disabledStyle = { cursor: 'not-allowed', opacity: 0.5 };
+  const subtitleStyle = { display: 'block', fontSize: '9px', marginTop: '1px', lineHeight: '1.1', opacity: 0.7 };
   const commandDisplayStyle = { flex: 1, padding: '12px 16px', background: isDark ? '#111827' : '#f5f5f5', borderRadius: '6px', fontFamily: "'Menlo', 'Monaco', 'Courier New', monospace", fontSize: '12px', lineHeight: '1.5', color: isDark ? '#e5e7eb' : '#374151', whiteSpace: 'pre-wrap', overflowX: 'auto', margin: 0, border: `1px solid ${isDark ? '#374151' : '#e5e7eb'}` };
 
   return (
@@ -173,6 +189,7 @@ export const LagunaXS2Deployment = () => {
                       style={{ display: 'none' }}
                     />
                     {item.label}
+                    {item.subtitle && <small style={{ ...subtitleStyle, color: isChecked ? 'rgba(255,255,255,0.85)' : 'inherit' }}>{item.subtitle}</small>}
                   </label>
                 );
               })}
