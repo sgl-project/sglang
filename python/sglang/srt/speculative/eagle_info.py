@@ -240,14 +240,14 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
         accepted token logits.
         """
         if batch.forward_mode.is_idle():
-            extend_input = EagleDraftExtendInput.create_idle_input(
+            draft_extend_input = EagleDraftExtendInput.create_idle_input(
                 device=batch.device,
                 hidden_size=batch.model_config.spec_hidden_size,
                 dtype=batch.model_config.dtype,
                 capture_hidden_mode=CaptureHiddenMode.LAST,
             )
             return EagleVerifyOutput.create_idle(
-                extend_input=extend_input,
+                draft_extend_input=draft_extend_input,
                 logits_output=logits_output,
                 device=batch.device,
                 spec_steps=self.spec_steps,
@@ -544,7 +544,7 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
             batch.seq_lens.add_(num_accepted_drafts + 1)
             batch.seq_lens_cpu.add_(num_accepted_tokens_cpu)
 
-            extend_input = EagleDraftExtendInput(
+            draft_extend_input = EagleDraftExtendInput(
                 hidden_states=batch.spec_info.hidden_states[accept_index],
                 num_accepted_drafts=num_accepted_drafts,
                 num_accepted_tokens=num_accepted_drafts + 1,
@@ -552,7 +552,7 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
             )
 
             return EagleVerifyOutput(
-                extend_input=extend_input,
+                draft_extend_input=draft_extend_input,
                 logits_output=logits_output,
                 accept_tokens=accept_tokens,
                 unfinished_accept_tokens=accept_tokens,
@@ -619,7 +619,7 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                 req_pool_indices_for_draft_extend = batch.req_pool_indices[
                     unfinished_index_device
                 ]
-                extend_input = EagleDraftExtendInput(
+                draft_extend_input = EagleDraftExtendInput(
                     hidden_states=batch.spec_info.hidden_states[
                         unfinished_accept_index
                     ],
@@ -642,7 +642,7 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                     dtype=batch.req_pool_indices.dtype,
                     device=batch.req_pool_indices.device,
                 )
-                extend_input = EagleDraftExtendInput.create_idle_input(
+                draft_extend_input = EagleDraftExtendInput.create_idle_input(
                     device=batch.device,
                     hidden_size=batch.model_config.spec_hidden_size,
                     dtype=batch.model_config.dtype,
@@ -650,7 +650,7 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                 )
 
             return EagleVerifyOutput(
-                extend_input=extend_input,
+                draft_extend_input=draft_extend_input,
                 logits_output=logits_output,
                 accept_tokens=accept_tokens,
                 unfinished_accept_tokens=unfinished_accept_tokens,
@@ -920,7 +920,7 @@ class EagleDraftExtendInput(SpecInput):
 class EagleVerifyOutput:
     # Next iter's draft-extend input, ready to be installed as `batch.spec_info`
     # for the draft-extend forward.
-    extend_input: EagleDraftExtendInput
+    draft_extend_input: EagleDraftExtendInput
     # Logit outputs from target worker.
     logits_output: LogitsProcessorOutput
     # All accepted tokens flat across all reqs incl. those that finished this
@@ -949,13 +949,13 @@ class EagleVerifyOutput:
     def create_idle(
         cls,
         *,
-        extend_input: EagleDraftExtendInput,
+        draft_extend_input: EagleDraftExtendInput,
         logits_output: LogitsProcessorOutput,
         device: torch.device,
         spec_steps: int,
     ) -> "EagleVerifyOutput":
         return cls(
-            extend_input=extend_input,
+            draft_extend_input=draft_extend_input,
             logits_output=logits_output,
             accept_tokens=torch.empty(0, dtype=torch.long, device=device),
             unfinished_accept_tokens=torch.empty(0, dtype=torch.long, device=device),

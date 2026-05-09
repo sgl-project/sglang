@@ -510,7 +510,7 @@ class FrozenKVMTPWorker(TpModelWorker):
         self, batch: ScheduleBatch, verify_output: EagleVerifyOutput
     ) -> None:
         assert isinstance(batch.spec_info, FrozenKVMTPDraftExtendInput)
-        extend_input: FrozenKVMTPDraftExtendInput = batch.spec_info
+        draft_extend_input: FrozenKVMTPDraftExtendInput = batch.spec_info
         input_is_idle = batch.forward_mode.is_idle()
 
         if not input_is_idle and verify_output.unfinished_accept_tokens.numel() == 0:
@@ -541,7 +541,9 @@ class FrozenKVMTPWorker(TpModelWorker):
             batch.seq_lens_cpu = verify_output.seq_lens_for_draft_extend_cpu
             batch.req_pool_indices = verify_output.req_pool_indices_for_draft_extend
 
-            last_token_ids, last_hidden = self._select_last_verified_seed(extend_input)
+            last_token_ids, last_hidden = self._select_last_verified_seed(
+                draft_extend_input
+            )
             # `_run_assistant_seed_step` constructs a fresh `FrozenKVMTPDraftInput`
             # and installs it on `batch.spec_info` for next iter.
             self._run_assistant_seed_step(
@@ -774,7 +776,7 @@ class FrozenKVMTPWorker(TpModelWorker):
         batch.forward_mode = (
             ForwardMode.DECODE if not batch.forward_mode.is_idle() else ForwardMode.IDLE
         )
-        batch.spec_info = res.extend_input
+        batch.spec_info = res.draft_extend_input
 
         del seq_lens_pre_verify
         return logits_output, res, model_worker_batch, can_run_cuda_graph
