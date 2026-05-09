@@ -94,7 +94,7 @@ For details, see the [Hugging Face model card](https://huggingface.co/poolside/L
 ## 2. SGLang Installation
 
 <Warning title="Awaiting tagged release">
-Native Laguna-XS.2 support landed on `main` in [sgl-project/sglang#24204](https://github.com/sgl-project/sglang/pull/24204) on 2026-05-08 (merge commit `096ad02b0`). A stable PyPI/Docker release containing it has not shipped yet, so the install commands below use the `dev-*-pr-24204` Docker tags published by the [`release-docker-dev`](https://github.com/sgl-project/sglang/blob/main/.github/workflows/release-docker-dev.yml) workflow and a dated nightly wheel pinned to the merge commit. Once the next stable release ships (e.g. `v0.5.12`), swap the `dev-*-pr-24204` tags for `lmsysorg/sglang:v<X>` and `sglang[all]==0.5.12.dev20260509+g096ad02b0` for `sglang[all]==<X>`.
+Native Laguna-XS.2 support landed on `main` in [sgl-project/sglang#24204](https://github.com/sgl-project/sglang/pull/24204) on 2026-05-08 (merge commit `096ad02b0`). A stable PyPI/Docker release containing it has not shipped yet, so the install commands below use the `dev-*-laguna-xs2` Docker tags published by the [`release-docker-dev`](https://github.com/sgl-project/sglang/blob/main/.github/workflows/release-docker-dev.yml) workflow and a dated nightly wheel pinned to the merge commit. Once the next stable release ships (e.g. `v0.5.12`), swap the `dev-*-laguna-xs2` tags for `lmsysorg/sglang:v<X>` and `sglang[all]==0.5.12.dev20260509+g096ad02b0` for `sglang[all]==<X>`.
 </Warning>
 
 Refer to the [official SGLang installation guide](../../../docs/get-started/install) for general install methods.
@@ -105,33 +105,33 @@ Refer to the [official SGLang installation guide](../../../docs/get-started/inst
   <thead>
     <tr style={{borderBottom: "2px solid #d55816"}}>
       <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Hardware Platform</th>
-      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Docker Image (PR #24204 build)</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Docker Image (Laguna-XS.2 build, multi-arch amd64/arm64)</th>
     </tr>
   </thead>
   <tbody>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>NVIDIA H200 (CUDA 13)</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`lmsysorg/sglang:dev-cu13-pr-24204`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`lmsysorg/sglang:dev-cu13-laguna-xs2`</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>NVIDIA B200 (CUDA 13)</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`lmsysorg/sglang:dev-cu13-pr-24204`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`lmsysorg/sglang:dev-cu13-laguna-xs2`</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>NVIDIA H200 (CUDA 12)</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`lmsysorg/sglang:dev-cu12-pr-24204`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`lmsysorg/sglang:dev-cu12-laguna-xs2`</td>
     </tr>
   </tbody>
 </table>
 
 <Note>
-The `dev-*-pr-24204` tags are produced by dispatching the `release-docker-dev` workflow with `pr_number=24204` (sglang maintainers only). If a build for #24204 has not been published yet, request one in the PR.
+The `dev-*-laguna-xs2` tags were produced by dispatching the [`release-docker-dev`](https://github.com/sgl-project/sglang/blob/main/.github/workflows/release-docker-dev.yml) workflow with `tag=laguna-xs2` (sglang maintainers only). The cu13 image is also published as the alias `lmsysorg/sglang:dev-laguna-xs2`.
 </Note>
 
 **Pull the image:**
 
 ```bash Command
-docker pull lmsysorg/sglang:dev-cu13-pr-24204
+docker pull lmsysorg/sglang:dev-cu13-laguna-xs2
 ```
 
 **Launch the server (BF16):**
@@ -141,7 +141,7 @@ docker run --gpus all --shm-size 32g \
   -p 30000:30000 \
   -v ~/.cache/huggingface:/root/.cache/huggingface \
   --ipc=host \
-  lmsysorg/sglang:dev-cu13-pr-24204 \
+  lmsysorg/sglang:dev-cu13-laguna-xs2 \
   sglang serve \
     --model-path poolside/Laguna-XS.2 \
     --tp 8 \
