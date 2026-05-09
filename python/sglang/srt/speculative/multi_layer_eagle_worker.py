@@ -260,7 +260,7 @@ class MultiLayerEagleWorker(TpModelWorker):
             with self.draft_tp_context(
                 self.mtp_model_runner(0).tp_group
             ), speculative_moe_backend_context():
-                self.forward_draft_extend(
+                next_draft_input = self.forward_draft_extend(
                     batch, logits_output.hidden_states, next_token_ids, seq_lens_cpu
                 )
             return GenerationBatchResult(
@@ -268,6 +268,7 @@ class MultiLayerEagleWorker(TpModelWorker):
                 next_token_ids=next_token_ids,
                 num_accepted_drafts=0,
                 can_run_cuda_graph=can_run_cuda_graph,
+                next_draft_input=next_draft_input,
             )
         else:
             set_time_batch(batch.reqs, "set_spec_draft_start_time", trace_only=True)
@@ -631,58 +632,66 @@ class MultiLayerEagleWorker(TpModelWorker):
         hidden_states: torch.Tensor,
         next_token_ids: torch.Tensor,
         seq_lens_cpu: Optional[torch.Tensor],
-    ):
-        """Run draft model extend. This API modifies the states of the batch.
+    ) -> EagleDraftInput:
+        """Run draft model extend. Returns next-iter `EagleDraftInput`;
+        scheduler installs it on `batch.spec_info` via `batch_result.next_draft_input`.
 
-        Args:
-            batch: The batch to run.
-            hidden_states: Hidden states from the target model forward
-            next_token_ids: Next token ids generated from the target forward.
+        We mutate `batch.spec_info` transiently so the forward kernel can read
+        the draft input via `batch.get_model_worker_batch`, then restore on
+        return.
         """
-        batch.spec_info = EagleDraftInput(
+        next_draft_input = EagleDraftInput(
             hidden_states=hidden_states,
             bonus_tokens=next_token_ids,
             num_tokens_per_req=1,
             num_tokens_for_logprob_per_req=1,
         )
-        batch.return_hidden_states = False
-        batch.spec_info.prepare_for_extend(batch)
-        batch.spec_info.capture_hidden_mode = CaptureHiddenMode.LAST
-        model_worker_batch = batch.get_model_worker_batch(
-            seq_lens_cpu_cache=seq_lens_cpu
-        )
-        forward_batch = ForwardBatch.init_new(
-            model_worker_batch, self.mtp_model_runner(0)
-        )
-        forward_batch.return_logprob = False
-        forward_batch.return_hidden_states_before_norm = True
-        topk_p_list = []
-        topk_index_list = []
-        for step in range(self.speculative_num_steps):
-            logits_output = (
-                self.mtp_model_runner(step).forward(forward_batch).logits_output
-            )
-            maybe_detect_nan(
-                logits_output.next_token_logits,
-                f"draft_extend_for_prefill step {step}",
-            )
-            probs = torch.softmax(logits_output.next_token_logits, dim=-1)
-            topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
-            topk_p_list.append(topk_p)
-            topk_index_list.append(topk_index)
-            pt = 0
-            if forward_batch.extend_seq_lens is not None:
-                for i, extend_len in enumerate(forward_batch.extend_seq_lens):
-                    input_ids = forward_batch.input_ids[pt : pt + extend_len]
-                    forward_batch.input_ids[pt : pt + extend_len] = torch.cat(
-                        (input_ids[1:], topk_index[i].reshape(1))
-                    )
-                    pt += extend_len
+        return_hidden_states_backup = batch.return_hidden_states
+        spec_info_backup = batch.spec_info
 
-        assert isinstance(forward_batch.spec_info, EagleDraftInput)
-        assert forward_batch.spec_info is batch.spec_info
-        forward_batch.spec_info.topk_p = torch.cat(topk_p_list, dim=1)
-        forward_batch.spec_info.topk_index = torch.cat(topk_index_list, dim=1)
+        batch.spec_info = next_draft_input
+        batch.return_hidden_states = False
+        next_draft_input.prepare_for_extend(batch)
+        next_draft_input.capture_hidden_mode = CaptureHiddenMode.LAST
+        try:
+            model_worker_batch = batch.get_model_worker_batch(
+                seq_lens_cpu_cache=seq_lens_cpu
+            )
+            forward_batch = ForwardBatch.init_new(
+                model_worker_batch, self.mtp_model_runner(0)
+            )
+            forward_batch.return_logprob = False
+            forward_batch.return_hidden_states_before_norm = True
+            topk_p_list = []
+            topk_index_list = []
+            for step in range(self.speculative_num_steps):
+                logits_output = (
+                    self.mtp_model_runner(step).forward(forward_batch).logits_output
+                )
+                maybe_detect_nan(
+                    logits_output.next_token_logits,
+                    f"draft_extend_for_prefill step {step}",
+                )
+                probs = torch.softmax(logits_output.next_token_logits, dim=-1)
+                topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
+                topk_p_list.append(topk_p)
+                topk_index_list.append(topk_index)
+                pt = 0
+                if forward_batch.extend_seq_lens is not None:
+                    for i, extend_len in enumerate(forward_batch.extend_seq_lens):
+                        input_ids = forward_batch.input_ids[pt : pt + extend_len]
+                        forward_batch.input_ids[pt : pt + extend_len] = torch.cat(
+                            (input_ids[1:], topk_index[i].reshape(1))
+                        )
+                        pt += extend_len
+
+            next_draft_input.topk_p = torch.cat(topk_p_list, dim=1)
+            next_draft_input.topk_index = torch.cat(topk_index_list, dim=1)
+        finally:
+            batch.spec_info = spec_info_backup
+            batch.return_hidden_states = return_hidden_states_backup
+
+        return next_draft_input
 
     def forward_draft_extend_after_decode(
         self, batch: ScheduleBatch

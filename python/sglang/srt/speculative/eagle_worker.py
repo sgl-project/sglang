@@ -461,7 +461,7 @@ class EAGLEWorker(TpModelWorker):
             with self.draft_tp_context(
                 self.draft_model_runner.tp_group
             ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
-                self.forward_draft_extend(
+                next_draft_input = self.forward_draft_extend(
                     batch,
                     logits_output.hidden_states,
                     next_token_ids,
@@ -473,6 +473,7 @@ class EAGLEWorker(TpModelWorker):
                 next_token_ids=next_token_ids,
                 num_accepted_drafts=0,
                 can_run_cuda_graph=can_run_cuda_graph,
+                next_draft_input=next_draft_input,
             )
         else:
             set_time_batch(batch.reqs, "set_spec_draft_start_time", trace_only=True)
@@ -1084,37 +1085,47 @@ class EAGLEWorker(TpModelWorker):
         next_token_ids: torch.Tensor,
         seq_lens_cpu: Optional[torch.Tensor],
         mm_input_embeds: Optional[torch.Tensor] = None,
-    ):
-        """Run draft model extend. This API modifies the states of the batch.
+    ) -> EagleDraftInput:
+        """Run draft model extend. Returns next-iter `EagleDraftInput`;
+        scheduler installs it on `batch.spec_info` via `batch_result.next_draft_input`.
 
-        Args:
-            batch: The batch to run.
-            hidden_states: Hidden states from the target model forward
-            next_token_ids: Next token ids generated from the target forward.
+        We mutate `batch.spec_info` transiently so the forward kernel can read
+        the draft input via `batch.get_model_worker_batch`, then restore on
+        return.
         """
-        batch.spec_info = EagleDraftInput(
+        next_draft_input = EagleDraftInput(
             hidden_states=hidden_states,
             bonus_tokens=next_token_ids,
             num_tokens_per_req=1,
             num_tokens_for_logprob_per_req=1,
         )
+        return_hidden_states_backup = batch.return_hidden_states
+        spec_info_backup = batch.spec_info
+
+        batch.spec_info = next_draft_input
         batch.return_hidden_states = False
-        batch.spec_info.prepare_for_extend(batch)
-        batch.spec_info.capture_hidden_mode = CaptureHiddenMode.LAST
-        model_worker_batch = batch.get_model_worker_batch(
-            seq_lens_cpu_cache=seq_lens_cpu
-        )
-        forward_batch = ForwardBatch.init_new(
-            model_worker_batch, self.draft_model_runner
-        )
-        forward_batch.return_logprob = False
-        if mm_input_embeds is not None:
-            forward_batch.mm_input_embeds = mm_input_embeds
-        logits_output = self.draft_model_runner.forward(forward_batch).logits_output
-        maybe_detect_nan(logits_output.next_token_logits, "draft_extend_for_prefill")
-        assert isinstance(forward_batch.spec_info, EagleDraftInput)
-        assert forward_batch.spec_info is batch.spec_info
-        self.capture_for_decode(logits_output, forward_batch.spec_info)
+        next_draft_input.prepare_for_extend(batch)
+        next_draft_input.capture_hidden_mode = CaptureHiddenMode.LAST
+        try:
+            model_worker_batch = batch.get_model_worker_batch(
+                seq_lens_cpu_cache=seq_lens_cpu
+            )
+            forward_batch = ForwardBatch.init_new(
+                model_worker_batch, self.draft_model_runner
+            )
+            forward_batch.return_logprob = False
+            if mm_input_embeds is not None:
+                forward_batch.mm_input_embeds = mm_input_embeds
+            logits_output = self.draft_model_runner.forward(forward_batch).logits_output
+            maybe_detect_nan(
+                logits_output.next_token_logits, "draft_extend_for_prefill"
+            )
+            self.capture_for_decode(logits_output, next_draft_input)
+        finally:
+            batch.spec_info = spec_info_backup
+            batch.return_hidden_states = return_hidden_states_backup
+
+        return next_draft_input
 
     def forward_draft_extend_after_decode(
         self, batch: ScheduleBatch
