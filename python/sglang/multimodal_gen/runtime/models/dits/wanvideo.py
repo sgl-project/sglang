@@ -49,6 +49,7 @@ from sglang.multimodal_gen.runtime.layers.visual_embedding import (
     TimestepEmbedder,
 )
 from sglang.multimodal_gen.runtime.managers.forward_context import get_forward_context
+from sglang.multimodal_gen.runtime.managers.layerwise_offload import OffloadableDiTMixin
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
 from sglang.multimodal_gen.runtime.models.utils import (
     _use_aiter,
@@ -58,7 +59,6 @@ from sglang.multimodal_gen.runtime.platforms import (
     current_platform,
 )
 from sglang.multimodal_gen.runtime.server_args import get_global_server_args
-from sglang.multimodal_gen.runtime.utils.layerwise_offload import OffloadableDiTMixin
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.srt.utils import add_prefix
 
@@ -182,7 +182,7 @@ class WanSelfAttention(nn.Module):
             dim,
             input_is_parallel=True,
             quant_config=quant_config,
-            prefix=add_prefix("to_out.0", prefix),
+            prefix=add_prefix("to_out", prefix),
         )
         self.norm_q = RMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
         self.norm_k = RMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
@@ -366,7 +366,7 @@ class WanTransformerBlock(nn.Module):
             bias=True,
             gather_output=False,
             quant_config=quant_config,
-            prefix=add_prefix("attn1.to_q", prefix),
+            prefix=add_prefix("to_q", prefix),
         )
         self.to_k = ColumnParallelLinear(
             dim,
@@ -374,7 +374,7 @@ class WanTransformerBlock(nn.Module):
             bias=True,
             gather_output=False,
             quant_config=quant_config,
-            prefix=add_prefix("attn1.to_k", prefix),
+            prefix=add_prefix("to_k", prefix),
         )
         self.to_v = ColumnParallelLinear(
             dim,
@@ -382,7 +382,7 @@ class WanTransformerBlock(nn.Module):
             bias=True,
             gather_output=False,
             quant_config=quant_config,
-            prefix=add_prefix("attn1.to_v", prefix),
+            prefix=add_prefix("to_v", prefix),
         )
 
         self.to_out = RowParallelLinear(
@@ -391,7 +391,7 @@ class WanTransformerBlock(nn.Module):
             bias=True,
             reduce_results=True,
             quant_config=quant_config,
-            prefix=add_prefix("attn1.to_out.0", prefix),
+            prefix=add_prefix("to_out", prefix),
         )
         tp_size = get_tp_world_size()
         self.local_num_heads = divide(num_heads, tp_size)
@@ -481,7 +481,7 @@ class WanTransformerBlock(nn.Module):
             dim,
             ffn_dim,
             act_type="gelu_pytorch_tanh",
-            prefix=add_prefix("ffn.net", prefix),
+            prefix=add_prefix("ffn", prefix),
             quant_config=quant_config,
         )
         self.mlp_residual = MulAdd()
@@ -640,7 +640,7 @@ class WanTransformerBlock_VSA(nn.Module):
             bias=True,
             gather_output=True,
             quant_config=quant_config,
-            prefix=add_prefix("attn1.to_q", prefix),
+            prefix=add_prefix("to_q", prefix),
         )
         self.to_k = ColumnParallelLinear(
             dim,
@@ -648,7 +648,7 @@ class WanTransformerBlock_VSA(nn.Module):
             bias=True,
             gather_output=True,
             quant_config=quant_config,
-            prefix=add_prefix("attn1.to_k", prefix),
+            prefix=add_prefix("to_k", prefix),
         )
         self.to_v = ColumnParallelLinear(
             dim,
@@ -656,7 +656,7 @@ class WanTransformerBlock_VSA(nn.Module):
             bias=True,
             gather_output=True,
             quant_config=quant_config,
-            prefix=add_prefix("attn1.to_v", prefix),
+            prefix=add_prefix("to_v", prefix),
         )
         self.to_gate_compress = ColumnParallelLinear(
             dim,
@@ -673,7 +673,7 @@ class WanTransformerBlock_VSA(nn.Module):
             bias=True,
             gather_output=True,
             quant_config=quant_config,
-            prefix=add_prefix("attn1.to_out.0", prefix),
+            prefix=add_prefix("to_out", prefix),
         )
         self.attn1 = UlyssesAttention_VSA(
             num_heads=num_heads,
@@ -742,7 +742,7 @@ class WanTransformerBlock_VSA(nn.Module):
             dim,
             ffn_dim,
             act_type="gelu_pytorch_tanh",
-            prefix=add_prefix("ffn.net", prefix),
+            prefix=add_prefix("ffn", prefix),
             quant_config=quant_config,
         )
         self.mlp_residual = MulAdd()

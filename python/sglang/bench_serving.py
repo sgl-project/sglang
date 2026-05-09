@@ -462,10 +462,22 @@ async def async_request_openai_chat_completions(
                                 pass
                             else:
                                 data = json.loads(chunk)
+                                # Check for usage info in final chunks. OpenAI-compatible
+                                # servers may emit usage-only chunks with choices=[].
+                                output_len = (data.get("usage") or {}).get(
+                                    "completion_tokens", output_len
+                                )
 
-                                # Check if this chunk contains content
-                                delta = data.get("choices", [{}])[0].get("delta", {})
-                                content = delta.get("content", "")
+                                choices = data.get("choices") or []
+                                if not choices:
+                                    continue
+
+                                # Reasoning models stream thoughts via
+                                # `reasoning_content`; count them like content.
+                                delta = choices[0].get("delta") or {}
+                                content = (delta.get("reasoning_content") or "") + (
+                                    delta.get("content") or ""
+                                )
 
                                 if content:
                                     timestamp = time.perf_counter()
@@ -483,11 +495,6 @@ async def async_request_openai_chat_completions(
 
                                     most_recent_timestamp = timestamp
                                     generated_text += content
-
-                                # Check for usage info in final chunk
-                                output_len = (data.get("usage") or {}).get(
-                                    "completion_tokens", output_len
-                                )
 
                         output.generated_text = generated_text
                         output.success = True

@@ -663,5 +663,148 @@ class TestKimiK2EndToEnd(unittest.TestCase):
         self.assertEqual(name_calls[1].name, "ReadFile")
 
 
+# ============================================================
+# Part 3: Bare-counter tool call ID parsing
+# ============================================================
+
+
+class TestKimiK2BareCounterParsing(unittest.TestCase):
+    """Tests for bare numeric tool_call_id format (e.g., '3' instead of 'functions.ReadFile:0')."""
+
+    def setUp(self):
+        self.detector = KimiK2FuncDetector()
+        self.tools = [
+            _make_tool("ReadFile"),
+            _make_tool(
+                "get_weather",
+                {
+                    "type": "object",
+                    "properties": {
+                        "city": {"type": "string"},
+                        "unit": {"type": "string"},
+                    },
+                    "required": ["city"],
+                },
+            ),
+        ]
+
+    # --- _parse_tool_call_id ---
+
+    def test_standard_format_with_functions_prefix(self):
+        name, idx = self.detector._parse_tool_call_id(
+            "functions.ReadFile:0", self.tools
+        )
+        self.assertEqual(name, "ReadFile")
+        self.assertEqual(idx, 0)
+
+    def test_standard_format_without_functions_prefix(self):
+        name, idx = self.detector._parse_tool_call_id("ReadFile:1", self.tools)
+        self.assertEqual(name, "ReadFile")
+        self.assertEqual(idx, 1)
+
+    def test_bare_counter_single_tool(self):
+        single_tool = [_make_tool("search")]
+        name, idx = self.detector._parse_tool_call_id(
+            "3", single_tool, '{"query": "test"}'
+        )
+        self.assertEqual(name, "search")
+        self.assertEqual(idx, 3)
+
+    def test_bare_counter_infers_by_args(self):
+        name, idx = self.detector._parse_tool_call_id(
+            "0", self.tools, '{"city": "Tokyo"}'
+        )
+        self.assertEqual(name, "get_weather")
+        self.assertEqual(idx, 0)
+
+    def test_bare_counter_no_tools_returns_none(self):
+        name, idx = self.detector._parse_tool_call_id("5", [], '{"x": 1}')
+        self.assertIsNone(name)
+        self.assertEqual(idx, 5)
+
+    def test_bare_counter_no_args_multiple_tools_returns_none(self):
+        name, idx = self.detector._parse_tool_call_id("2", self.tools, None)
+        self.assertIsNone(name)
+        self.assertEqual(idx, 2)
+
+    def test_unexpected_format_returns_none(self):
+        name, idx = self.detector._parse_tool_call_id("some_garbage", self.tools)
+        self.assertIsNone(name)
+        self.assertEqual(idx, 0)
+
+    # --- _infer_tool_name ---
+
+    def test_infer_no_tools(self):
+        self.assertIsNone(self.detector._infer_tool_name([], '{"x": 1}'))
+
+    def test_infer_single_tool(self):
+        result = self.detector._infer_tool_name([_make_tool("only_one")], '{"x": 1}')
+        self.assertEqual(result, "only_one")
+
+    def test_infer_by_argument_overlap(self):
+        result = self.detector._infer_tool_name(
+            self.tools, '{"city": "Paris", "unit": "celsius"}'
+        )
+        self.assertEqual(result, "get_weather")
+
+    def test_infer_malformed_json_returns_none(self):
+        result = self.detector._infer_tool_name(self.tools, '{"city": "Par')
+        self.assertIsNone(result)
+
+    def test_infer_empty_args_returns_none(self):
+        self.assertIsNone(self.detector._infer_tool_name(self.tools, None))
+        self.assertIsNone(self.detector._infer_tool_name(self.tools, ""))
+
+    def test_infer_no_matching_props_returns_none(self):
+        tools_no_props = [
+            _make_tool("a", {"type": "object"}),
+            _make_tool("b", {"type": "object"}),
+        ]
+        result = self.detector._infer_tool_name(tools_no_props, '{"x": 1}')
+        self.assertIsNone(result)
+
+    # --- detect_and_parse with bare counter (end-to-end) ---
+
+    def test_detect_and_parse_bare_counter(self):
+        text = (
+            "<|tool_calls_section_begin|>"
+            "<|tool_call_begin|>0"
+            '<|tool_call_argument_begin|>{"city": "Tokyo"}'
+            "<|tool_call_end|>"
+            "<|tool_calls_section_end|>"
+        )
+        result = self.detector.detect_and_parse(text, self.tools)
+        self.assertEqual(len(result.calls), 1)
+        self.assertEqual(result.calls[0].name, "get_weather")
+        self.assertEqual(result.calls[0].parameters, '{"city": "Tokyo"}')
+
+    def test_detect_and_parse_bare_counter_skips_unknown(self):
+        text = (
+            "<|tool_calls_section_begin|>"
+            "<|tool_call_begin|>0"
+            '<|tool_call_argument_begin|>{"unknown_key": "value"}'
+            "<|tool_call_end|>"
+            "<|tool_calls_section_end|>"
+        )
+        result = self.detector.detect_and_parse(text, self.tools)
+        # No tool props match, _infer_tool_name returns None, call is skipped
+        self.assertEqual(len(result.calls), 0)
+
+    def test_streaming_bare_counter_single_tool(self):
+        detector = KimiK2FuncDetector()
+        single_tool = [_make_tool("search")]
+        chunks = [
+            "<|tool_calls_section_begin|>"
+            "<|tool_call_begin|>0"
+            '<|tool_call_argument_begin|>{"path',
+            '": "/test"}',
+            "<|tool_call_end|>",
+            "<|tool_calls_section_end|>",
+        ]
+        tool_calls, _ = _collect_streaming_tool_calls(detector, chunks, single_tool)
+        self.assertEqual(len(tool_calls), 1)
+        self.assertEqual(tool_calls[0]["name"], "search")
+
+
 if __name__ == "__main__":
     unittest.main()
