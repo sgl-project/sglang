@@ -254,6 +254,8 @@ In particular, for the `global segment size`, if at least one `store service` in
 
 When `enable_ssd_offload` is set to `true`, SGLang will request that Mooncake enable SSD offloading for the KV cache. This allows Mooncake to spill overflow data from DRAM to local SSDs, effectively expanding the available L3 cache capacity.
 
+If you need to explicitly control the SSD spill directory, set `ssd_offload_path` or the `MOONCAKE_OFFLOAD_FILE_STORAGE_PATH` environment variable. SGLang forwards this value to `MooncakeDistributedStore.setup(..., ssd_offload_path=...)`, while other SSD offload tuning parameters continue to be read directly by the Mooncake C++ library.
+
 You can enable it in any of the three supported configuration methods:
 
 - **Via `--hicache-storage-backend-extra-config`:**
@@ -262,14 +264,15 @@ You can enable it in any of the three supported configuration methods:
       --enable-hierarchical-cache \
       --hicache-storage-backend mooncake \
       --model-path [model_path] \
-      --hicache-storage-backend-extra-config '{"master_server_address": "127.0.0.1:50051", "enable_ssd_offload": true}'
+      --hicache-storage-backend-extra-config '{"master_server_address": "127.0.0.1:50051", "enable_ssd_offload": true, "ssd_offload_path": "/mnt/mooncake-ssd"}'
   ```
 
 - **Via JSON config file (`SGLANG_HICACHE_MOONCAKE_CONFIG_PATH`):**
   ```json
   {
       "master_server_address": "127.0.0.1:50051",
-      "enable_ssd_offload": true
+      "enable_ssd_offload": true,
+      "ssd_offload_path": "/mnt/mooncake-ssd"
   }
   ```
 
@@ -277,6 +280,7 @@ You can enable it in any of the three supported configuration methods:
   ```bash
   MOONCAKE_MASTER="127.0.0.1:50051" \
   MOONCAKE_ENABLE_SSD_OFFLOAD=1 \
+    MOONCAKE_OFFLOAD_FILE_STORAGE_PATH="/mnt/mooncake-ssd" \
   python -m sglang.launch_server \
       --enable-hierarchical-cache \
       --hicache-storage-backend mooncake \

@@ -93,6 +93,7 @@ class MooncakeStoreConfig:
     standalone_storage: bool
     client_server_address: str
     enable_ssd_offload: bool = False
+    ssd_offload_path: Optional[str] = None
 
     @staticmethod
     def from_file() -> "MooncakeStoreConfig":
@@ -146,6 +147,9 @@ class MooncakeStoreConfig:
             enable_ssd_offload=config.get(
                 "enable_ssd_offload", envs.MOONCAKE_ENABLE_SSD_OFFLOAD.default
             ),
+            ssd_offload_path=config.get(
+                "ssd_offload_path", envs.MOONCAKE_OFFLOAD_FILE_STORAGE_PATH.default
+            ),
         )
 
     @staticmethod
@@ -186,6 +190,7 @@ class MooncakeStoreConfig:
             standalone_storage=envs.MOONCAKE_STANDALONE_STORAGE.get(),
             client_server_address=envs.MOONCAKE_CLIENT.get(),
             enable_ssd_offload=envs.MOONCAKE_ENABLE_SSD_OFFLOAD.get(),
+            ssd_offload_path=envs.MOONCAKE_OFFLOAD_FILE_STORAGE_PATH.get(),
         )
 
     @staticmethod
@@ -230,6 +235,9 @@ class MooncakeStoreConfig:
             ),
             enable_ssd_offload=extra_config.get(
                 "enable_ssd_offload", envs.MOONCAKE_ENABLE_SSD_OFFLOAD.default
+            ),
+            ssd_offload_path=extra_config.get(
+                "ssd_offload_path", envs.MOONCAKE_OFFLOAD_FILE_STORAGE_PATH.default
             ),
         )
 
@@ -381,37 +389,40 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                     client_hostname = self.config.local_hostname
                     transfer_engine = None
 
-                try:
-                    ret_code = self.store.setup(
-                        client_hostname,
-                        self.config.metadata_server,
-                        per_tp_global_segment_size,
-                        DEFAULT_LOCAL_BUFFER_SIZE,  # Zero copy interface does not need local buffer
-                        self.config.protocol,
-                        device_name,
-                        self.config.master_server_address,
-                        transfer_engine,
-                        enable_ssd_offload=self.config.enable_ssd_offload,
-                    )
-                except TypeError as e:
-                    if "enable_ssd_offload" not in str(e):
-                        raise
-                    logger.warning(
-                        "The installed Mooncake version does not support the "
-                        "enable_ssd_offload parameter in setup(). "
-                        "Falling back to setup without enable_ssd_offload. "
-                        "Please upgrade Mooncake to enable SSD offload support."
-                    )
-                    ret_code = self.store.setup(
-                        client_hostname,
-                        self.config.metadata_server,
-                        per_tp_global_segment_size,
-                        DEFAULT_LOCAL_BUFFER_SIZE,  # Zero copy interface does not need local buffer
-                        self.config.protocol,
-                        device_name,
-                        self.config.master_server_address,
-                        transfer_engine,
-                    )
+                setup_kwargs = {}
+                if self.config.enable_ssd_offload:
+                    setup_kwargs["enable_ssd_offload"] = True
+                if self.config.ssd_offload_path is not None:
+                    setup_kwargs["ssd_offload_path"] = self.config.ssd_offload_path
+
+                while True:
+                    try:
+                        ret_code = self.store.setup(
+                            client_hostname,
+                            self.config.metadata_server,
+                            per_tp_global_segment_size,
+                            DEFAULT_LOCAL_BUFFER_SIZE,  # Zero copy interface does not need local buffer
+                            self.config.protocol,
+                            device_name,
+                            self.config.master_server_address,
+                            transfer_engine,
+                            **setup_kwargs,
+                        )
+                        break
+                    except TypeError as e:
+                        unsupported_kwargs = [
+                            key for key in list(setup_kwargs) if key in str(e)
+                        ]
+                        if not unsupported_kwargs:
+                            raise
+                        logger.warning(
+                            "The installed Mooncake version does not support the "
+                            f"{', '.join(unsupported_kwargs)} parameter(s) in setup(). "
+                            f"Retrying without {', '.join(unsupported_kwargs)}. "
+                            "Please upgrade Mooncake to enable SSD offload support."
+                        )
+                        for key in unsupported_kwargs:
+                            setup_kwargs.pop(key, None)
             if ret_code:
                 raise RuntimeError(
                     f"Failed to setup Mooncake store, error code: {ret_code}"

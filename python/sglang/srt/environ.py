@@ -319,6 +319,7 @@ class Envs:
     MOONCAKE_CHECK_SERVER = EnvBool(False)
     MOONCAKE_STANDALONE_STORAGE = EnvBool(False)
     MOONCAKE_ENABLE_SSD_OFFLOAD = EnvBool(False)
+    MOONCAKE_OFFLOAD_FILE_STORAGE_PATH = EnvStr(None)
 
     # AMD & ROCm
     SGLANG_USE_AITER = EnvBool(False)
