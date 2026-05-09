@@ -908,7 +908,7 @@ def _resolve_test_spec(test_spec):
     }
 
 
-def _dispatch_batch(gh_repo, pr, batch, token):
+def _dispatch_batch(gh_repo, pr, batch, token, reply_comment_id="", reply_marker=""):
     """
     Dispatch a single workflow run for a batch of resolved test specs
     that share the same (runner_label, use_deepep, is_cpu).
@@ -951,6 +951,8 @@ def _dispatch_batch(gh_repo, pr, batch, token):
             "use_deepep": str(use_deepep).lower(),
             "is_cpu": str(is_cpu).lower(),
             "install_diffusion": str(install_diffusion).lower(),
+            "reply_comment_id": str(reply_comment_id) if reply_comment_id else "",
+            "reply_marker": reply_marker,
         }
         if is_fork:
             ref = "main"
@@ -998,6 +1000,7 @@ def _dispatch_batch(gh_repo, pr, batch, token):
             "test_commands": test_commands,
             "runner_label": runner_label,
             "run_url": run_url,
+            "reply_marker": reply_marker,
         }
 
     except Exception as e:
@@ -1091,12 +1094,30 @@ def handle_rerun_test(
         )
         groups.setdefault(key, []).append(r)
 
-    # Phase 3: Dispatch one workflow per group
-    dispatch_results = []
-    for batch in groups.values():
-        dispatch_results.append(_dispatch_batch(gh_repo, pr, batch, token))
+    # Phase 3a: Create placeholder reply comment so we have its ID before
+    # dispatching workflows. This lets each dispatched run write its
+    # success/failure result back to the right line in this comment.
+    reply_comment = pr.create_issue_comment("🚀 Dispatching rerun-test workflow(s)...")
 
-    # Build consolidated comment
+    # Phase 3b: Dispatch one workflow per group, with a unique per-batch
+    # marker each. The marker is an HTML comment that the writeback step
+    # uses to locate the line and replace 🚀 with ✅/❌.
+    dispatch_results = []
+    for idx, batch in enumerate(groups.values()):
+        marker = f"<!--rrt:{idx}-->"
+        dispatch_results.append(
+            _dispatch_batch(
+                gh_repo,
+                pr,
+                batch,
+                token,
+                reply_comment_id=reply_comment.id,
+                reply_marker=marker,
+            )
+        )
+
+    # Build consolidated comment body (markers placed at line ends so the
+    # writeback step can locate and update each line).
     lines = []
     for dr in dispatch_results:
         if dr["success"]:
@@ -1113,15 +1134,16 @@ def handle_rerun_test(
                 cmds = "\n".join(
                     f"cd test/ && python3 {cmd}" for cmd in dr["test_commands"]
                 )
+            marker = dr.get("reply_marker", "")
             if dr.get("run_url"):
                 lines.append(
                     f"🚀 `{dr['runner_label']}` ({len(dr['test_commands'])} test{'s' if len(dr['test_commands']) > 1 else ''}): "
-                    f"[View workflow run]({dr['run_url']})\n"
+                    f"[View workflow run]({dr['run_url']}) {marker}\n"
                     f"```\n{cmds}\n```"
                 )
             else:
                 lines.append(
-                    f"🚀 `{dr['runner_label']}` ({len(dr['test_commands'])} test{'s' if len(dr['test_commands']) > 1 else ''}):\n"
+                    f"🚀 `{dr['runner_label']}` ({len(dr['test_commands'])} test{'s' if len(dr['test_commands']) > 1 else ''}): {marker}\n"
                     f"```\n{cmds}\n```\n"
                     f"⚠️ Could not retrieve workflow run URL. "
                     f"Check the [Actions tab](https://github.com/{gh_repo.full_name}/actions) for progress."
@@ -1141,7 +1163,7 @@ def handle_rerun_test(
     if not successes and (resolve_failures or dispatch_results):
         comment.create_reaction("confused")
 
-    pr.create_issue_comment(body)
+    reply_comment.edit(body)
     return len(successes) > 0
 
 
