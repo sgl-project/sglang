@@ -286,9 +286,7 @@ class MultiLayerEagleWorker(TpModelWorker):
                     or verify_output.next_extend_input_ids.shape[0] > 0
                 ):
                     # decode is not finished
-                    self.forward_draft_extend_after_decode(
-                        batch, verify_output.next_extend_input_ids
-                    )
+                    self.forward_draft_extend_after_decode(batch, verify_output)
 
             return GenerationBatchResult(
                 logits_output=logits_output,
@@ -298,9 +296,9 @@ class MultiLayerEagleWorker(TpModelWorker):
             )
 
     def check_forward_draft_extend_after_decode(
-        self, batch: ScheduleBatch, extend_input_ids: torch.Tensor
+        self, batch: ScheduleBatch, verify_output: EagleVerifyOutput
     ):
-        local_need_forward = extend_input_ids.shape[0] > 0
+        local_need_forward = verify_output.next_extend_input_ids.shape[0] > 0
         if not self.server_args.enable_dp_attention:
             return local_need_forward
 
@@ -657,7 +655,7 @@ class MultiLayerEagleWorker(TpModelWorker):
         forward_batch.spec_info.topk_index = torch.cat(topk_index_list, dim=1)
 
     def forward_draft_extend_after_decode(
-        self, batch: ScheduleBatch, extend_input_ids: torch.Tensor
+        self, batch: ScheduleBatch, verify_output: EagleVerifyOutput
     ):
         assert isinstance(batch.spec_info, EagleDraftInput)
         # Backup fields that will be modified in-place
@@ -670,7 +668,7 @@ class MultiLayerEagleWorker(TpModelWorker):
 
         input_is_idle = batch.forward_mode.is_idle()
 
-        if not input_is_idle and extend_input_ids.numel() == 0:
+        if not input_is_idle and verify_output.next_extend_input_ids.numel() == 0:
             batch = batch.copy()
             batch.prepare_for_idle()
             hidden_size = (
@@ -690,7 +688,7 @@ class MultiLayerEagleWorker(TpModelWorker):
         batch.spec_info.num_tokens_for_logprob_per_req = 1
         batch.spec_info.prepare_extend_after_decode(
             batch,
-            extend_input_ids=extend_input_ids,
+            verify_output=verify_output,
             speculative_num_steps=self.speculative_num_steps,
         )
         batch.forward_mode = (
