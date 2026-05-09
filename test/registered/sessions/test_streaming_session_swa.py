@@ -20,8 +20,10 @@ from test_streaming_session import (  # noqa: E402
     ABORT_REPRO_CHUNKED_PREFILL_SIZE,
     ABORT_REPRO_CONTEXT_LEN,
     ABORT_REPRO_PAGE_SIZE,
-    TestStreamingSession,
     TestStreamingSessionAbortLeakRepro,
+)
+from test_streaming_session_nightly import (  # noqa: E402
+    TestStreamingSession as _StreamingSessionBase,
 )
 
 register_cuda_ci(est_time=519, suite="stage-b-test-1-gpu-large")
@@ -37,7 +39,7 @@ SWA_COMMON_ARGS = [
 ]
 
 
-class TestStreamingSessionSWA(TestStreamingSession):
+class TestStreamingSessionSWA(_StreamingSessionBase):
     """Baseline streaming session on a hybrid-SWA model."""
 
     @classmethod
@@ -63,7 +65,7 @@ class TestStreamingSessionSWA(TestStreamingSession):
         kill_process_tree(cls.process.pid)
 
 
-class TestStreamingSessionSWARetractLargePage(TestStreamingSession):
+class TestStreamingSessionSWARetractLargePage(_StreamingSessionBase):
     """SWA under retract decode with page=256."""
 
     @classmethod
@@ -93,7 +95,7 @@ class TestStreamingSessionSWARetractLargePage(TestStreamingSession):
         kill_process_tree(cls.process.pid)
 
 
-class TestStreamingSessionSWARetractMixedChunk(TestStreamingSession):
+class TestStreamingSessionSWARetractMixedChunk(_StreamingSessionBase):
     """SWA under retract decode with --enable-mixed-chunk."""
 
     @classmethod
