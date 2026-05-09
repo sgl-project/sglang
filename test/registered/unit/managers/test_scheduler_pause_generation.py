@@ -11,7 +11,7 @@ from sglang.srt.managers.io_struct import PauseGenerationReqInput
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_runtime_checker_mixin import PoolStats
 
-register_cpu_ci(est_time=10, suite="stage-a-test-cpu")
+register_cpu_ci(est_time=15, suite="stage-a-test-cpu")
 
 
 class TestSchedulerPauseGeneration(unittest.TestCase):
