@@ -272,7 +272,7 @@ class MambaPool:
                     conv_state[0], conv_state_shape, speculative_num_draft_tokens
                 )
 
-            if _is_cpu and _cpu_has_amx_support:
+            if _is_cpu and _is_cpu_has_amx_support:
                 from sglang.srt.layers.amx_utils import _init_amx_conv_state
 
                 # CPU uses a different layout of conv_state for kernel optimization
