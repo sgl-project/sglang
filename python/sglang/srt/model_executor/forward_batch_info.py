@@ -999,7 +999,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 spec_info.topk_index = self._pad_tensor_to_size(
                     spec_info.topk_index, bs
                 )
-            if spec_info.num_accepted_drafts is not None:
+            # `num_accepted_*` only live on `EagleDraftExtendInput` (draft-extend
+            # phase). `EagleDraftInput` (draft phase) doesn't have these fields,
+            # so use `getattr` to skip when spec_info is the latter.
+            if getattr(spec_info, "num_accepted_drafts", None) is not None:
                 spec_info.num_accepted_drafts = self._pad_tensor_to_size(
                     spec_info.num_accepted_drafts, bs
                 )
