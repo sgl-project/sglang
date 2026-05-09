@@ -1012,7 +1012,7 @@ class SchedulerPPMixin:
 
     def _pp_resolve_all_gather_group_from_metadata(
         self: Scheduler, recv_metadata_list: List[Tuple[str, object]]
-    ) -> Optional[GroupCoordinator]:
+    ) -> Optional[object]:
         received_kind = "default"
         for key, value in recv_metadata_list:
             if key == "__msg_type__":
