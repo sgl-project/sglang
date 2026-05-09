@@ -18,7 +18,6 @@ from sglang.multimodal_gen.runtime.distributed import (
     tensor_model_parallel_all_gather,
     tensor_model_parallel_all_reduce,
 )
-from sglang.multimodal_gen.runtime.layers.fp8_cast import is_fp8_cast_dtype
 from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
