@@ -173,6 +173,7 @@ killall_sglang = "sglang.cli.killall:main"
 [tool.setuptools.package-data]
 "sglang" = [
   "srt/**/*",
+  "omni/webui/**/*",
   "jit_kernel/**/*"
 ]
 

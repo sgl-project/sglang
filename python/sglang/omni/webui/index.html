@@ -1,0 +1,632 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>SenseNova U1 Omni Lab</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --paper: #eef3f1;
+      --ink: #1b1d1f;
+      --muted: #5d6864;
+      --line: #c9d8d2;
+      --panel: #fcfffd;
+      --accent: #b24f35;
+      --accent-2: #1d6b6b;
+      --danger: #a13b3b;
+      --shadow: 0 18px 44px rgba(19, 48, 43, 0.12);
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      background: var(--paper);
+      color: var(--ink);
+      font: 15px/1.5 ui-serif, Georgia, "Times New Roman", serif;
+    }
+
+    button, input, textarea, select {
+      font: inherit;
+      color: inherit;
+    }
+
+    .shell {
+      display: grid;
+      grid-template-columns: minmax(340px, 420px) minmax(0, 1fr);
+      gap: clamp(18px, 3vw, 42px);
+      width: min(1440px, calc(100vw - 40px));
+      margin: 0 auto;
+      padding: 34px 0;
+    }
+
+    header {
+      border-top: 2px solid var(--ink);
+      padding-top: 16px;
+      margin-bottom: 24px;
+    }
+
+    h1 {
+      margin: 0;
+      max-width: 11ch;
+      font-size: 64px;
+      line-height: 0.9;
+      font-weight: 500;
+      letter-spacing: 0;
+    }
+
+    .subtitle {
+      margin: 14px 0 0;
+      color: var(--muted);
+      max-width: 34ch;
+      font-family: ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      font-size: 13px;
+      line-height: 1.55;
+    }
+
+    .status {
+      display: grid;
+      grid-template-columns: 1fr auto;
+      align-items: center;
+      gap: 10px;
+      margin: 22px 0;
+      padding: 13px 0;
+      border-block: 1px solid var(--line);
+      font-family: ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      font-size: 13px;
+    }
+
+    .dot {
+      width: 9px;
+      height: 9px;
+      border-radius: 50%;
+      background: var(--danger);
+      box-shadow: 0 0 0 5px rgba(161, 59, 59, 0.12);
+    }
+
+    .dot.ok {
+      background: var(--accent-2);
+      box-shadow: 0 0 0 5px rgba(35, 92, 86, 0.13);
+    }
+
+    .control {
+      display: grid;
+      gap: 8px;
+      margin-bottom: 16px;
+    }
+
+    label {
+      font-family: ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      font-size: 12px;
+      font-weight: 700;
+      color: #514c45;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+    }
+
+    textarea, input, select {
+      width: 100%;
+      border: 1px solid var(--line);
+      background: var(--panel);
+      border-radius: 6px;
+      padding: 11px 12px;
+      outline: none;
+      box-shadow: inset 0 1px 0 rgba(0, 0, 0, 0.02);
+    }
+
+    textarea {
+      min-height: 162px;
+      resize: vertical;
+    }
+
+    textarea:focus, input:focus, select:focus {
+      border-color: var(--accent);
+      box-shadow: 0 0 0 3px rgba(157, 75, 47, 0.13);
+    }
+
+    .row {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 12px;
+    }
+
+    .checkline {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      margin: 12px 0 18px;
+      color: var(--muted);
+      font-family: ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      font-size: 13px;
+    }
+
+    .checkline input {
+      width: 16px;
+      height: 16px;
+      accent-color: var(--accent-2);
+    }
+
+    .actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      margin-top: 18px;
+    }
+
+    button {
+      border: 1px solid var(--ink);
+      background: var(--ink);
+      color: var(--paper);
+      border-radius: 999px;
+      padding: 10px 15px;
+      cursor: pointer;
+      font-family: ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      font-size: 13px;
+      font-weight: 750;
+      transition: transform 160ms ease, background 160ms ease, color 160ms ease;
+    }
+
+    button:hover { transform: translateY(-1px); }
+    button:disabled { opacity: 0.55; cursor: wait; transform: none; }
+
+    button.secondary {
+      background: transparent;
+      color: var(--ink);
+    }
+
+    button.warn {
+      border-color: var(--danger);
+      background: transparent;
+      color: var(--danger);
+    }
+
+    .timeline {
+      min-height: calc(100vh - 68px);
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      box-shadow: var(--shadow);
+      overflow: hidden;
+    }
+
+    .timeline-head {
+      display: grid;
+      grid-template-columns: 1fr auto;
+      gap: 12px;
+      align-items: start;
+      padding: 20px 22px;
+      border-bottom: 1px solid var(--line);
+      background: #f5faf7;
+    }
+
+    .timeline-head h2 {
+      margin: 0;
+      font-size: 22px;
+      font-weight: 500;
+      letter-spacing: 0;
+    }
+
+    .session {
+      color: var(--muted);
+      font-family: ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      font-size: 12px;
+      word-break: break-all;
+      text-align: right;
+      max-width: 380px;
+    }
+
+    .feed {
+      display: grid;
+      gap: 0;
+      padding: 0;
+    }
+
+    .empty {
+      padding: 42px 22px;
+      color: var(--muted);
+      font-family: ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+
+    .turn {
+      display: grid;
+      grid-template-columns: 112px minmax(0, 1fr);
+      border-bottom: 1px solid var(--line);
+    }
+
+    .turn-meta {
+      padding: 18px 14px 18px 22px;
+      border-right: 1px solid var(--line);
+      color: var(--muted);
+      font-family: ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      font-size: 12px;
+    }
+
+    .turn-body {
+      padding: 18px 22px 22px;
+      display: grid;
+      gap: 16px;
+    }
+
+    .prompt {
+      white-space: pre-wrap;
+      color: #403a34;
+      font-family: ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      font-size: 13px;
+    }
+
+    .segment {
+      border-top: 1px dashed var(--line);
+      padding-top: 14px;
+    }
+
+    .segment:first-of-type {
+      border-top: 0;
+      padding-top: 0;
+    }
+
+    .tag {
+      display: inline-flex;
+      margin-bottom: 8px;
+      border: 1px solid #c9bca9;
+      border-radius: 999px;
+      padding: 3px 8px;
+      color: var(--accent-2);
+      font-family: ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      font-size: 11px;
+      font-weight: 800;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+    }
+
+    .text {
+      white-space: pre-wrap;
+      font-size: 16px;
+    }
+
+    .image {
+      display: block;
+      width: min(100%, 560px);
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: #eee6d8;
+    }
+
+    .error {
+      color: var(--danger);
+      white-space: pre-wrap;
+      font-family: ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      font-size: 13px;
+    }
+
+    .raw {
+      max-height: 240px;
+      overflow: auto;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: #f6fbf7;
+      padding: 12px;
+      font: 12px/1.45 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      color: #33403b;
+    }
+
+    @media (max-width: 900px) {
+      .shell { grid-template-columns: 1fr; }
+      h1 { font-size: 44px; }
+      .timeline { min-height: 520px; }
+      .turn { grid-template-columns: 1fr; }
+      .turn-meta { border-right: 0; border-bottom: 1px solid var(--line); }
+      .session { text-align: left; }
+    }
+  </style>
+</head>
+<body>
+  <main class="shell">
+    <section>
+      <header>
+        <h1>U1 Omni Lab</h1>
+        <p class="subtitle">Interleaved text-image conversations through SGLang /v1/omni/generate.</p>
+      </header>
+
+      <div class="status">
+        <span id="statusText">Checking backend</span>
+        <span id="statusDot" class="dot"></span>
+      </div>
+
+      <div class="control">
+        <label for="task">Task</label>
+        <select id="task">
+          <option value="interleave" selected>interleave</option>
+          <option value="t2i">t2i</option>
+          <option value="edit">edit</option>
+          <option value="vlm">vlm</option>
+        </select>
+      </div>
+
+      <div class="control">
+        <label for="prompt">Prompt</label>
+        <textarea id="prompt"></textarea>
+      </div>
+
+      <div class="actions">
+        <button class="secondary" id="turn1">Load turn 1</button>
+        <button class="secondary" id="turn2">Load turn 2</button>
+      </div>
+
+      <div class="control" style="margin-top: 16px;">
+        <label for="imageInput">Optional input image</label>
+        <input id="imageInput" type="file" accept="image/*">
+      </div>
+
+      <div class="row">
+        <div class="control">
+          <label for="width">Width</label>
+          <input id="width" type="number" value="512" min="128" max="1536" step="64">
+        </div>
+        <div class="control">
+          <label for="height">Height</label>
+          <input id="height" type="number" value="512" min="128" max="1536" step="64">
+        </div>
+      </div>
+
+      <div class="row">
+        <div class="control">
+          <label for="steps">Steps</label>
+          <input id="steps" type="number" value="12" min="1" max="80">
+        </div>
+        <div class="control">
+          <label for="seed">Seed</label>
+          <input id="seed" type="number" value="223">
+        </div>
+      </div>
+
+      <div class="row">
+        <div class="control">
+          <label for="cfgText">Text CFG</label>
+          <input id="cfgText" type="number" value="4.0" min="0" max="12" step="0.1">
+        </div>
+        <div class="control">
+          <label for="cfgImage">Image CFG</label>
+          <input id="cfgImage" type="number" value="1.0" min="0" max="12" step="0.1">
+        </div>
+      </div>
+
+      <div class="checkline">
+        <input id="keepSession" type="checkbox" checked>
+        <span>Keep omni session across turns</span>
+      </div>
+
+      <div class="actions">
+        <button id="send">Generate</button>
+        <button class="secondary" id="reset">Clear timeline</button>
+        <button class="warn" id="closeSession">Close session</button>
+      </div>
+    </section>
+
+    <section class="timeline">
+      <div class="timeline-head">
+        <h2>Conversation</h2>
+        <div id="sessionView" class="session">session: none</div>
+      </div>
+      <div id="feed" class="feed">
+        <div class="empty">Load turn 1, generate, then load turn 2 to test whether the next request edits the previous generated image.</div>
+      </div>
+    </section>
+  </main>
+
+  <script>
+    const $ = (id) => document.getElementById(id);
+    const feed = $("feed");
+    let sessionId = "";
+    let turnIndex = 0;
+
+    const prompts = {
+      turn1: "Create one clean studio image of a matte cobalt-blue cube centered on a white tabletop, with a plain light-gray background. After the image, describe the cube color and table in one short sentence.",
+      turn2: "Continue from the previous generated image. Edit it so the cube becomes bright red and add one glossy green sphere on its right. Keep the same tabletop, camera angle, and background, then explain exactly what changed."
+    };
+
+    $("prompt").value = prompts.turn1;
+
+    function setBusy(isBusy) {
+      $("send").disabled = isBusy;
+      $("closeSession").disabled = isBusy;
+    }
+
+    function setSession(id) {
+      sessionId = id || "";
+      $("sessionView").textContent = sessionId ? `session: ${sessionId}` : "session: none";
+    }
+
+    function setStatus(ok, text) {
+      $("statusText").textContent = text;
+      $("statusDot").classList.toggle("ok", ok);
+    }
+
+    async function checkHealth() {
+      try {
+        const response = await fetch("/api/health");
+        setStatus(response.ok, response.ok ? "Backend is reachable" : `Backend health ${response.status}`);
+      } catch (error) {
+        setStatus(false, `Backend offline: ${error.message}`);
+      }
+    }
+
+    function ensureFeed() {
+      const empty = feed.querySelector(".empty");
+      if (empty) empty.remove();
+    }
+
+    function makeEl(tag, className, text) {
+      const el = document.createElement(tag);
+      if (className) el.className = className;
+      if (text !== undefined) el.textContent = text;
+      return el;
+    }
+
+    function appendTurn(prompt, payload, data, error) {
+      ensureFeed();
+      turnIndex += 1;
+      const turn = makeEl("article", "turn");
+      const meta = makeEl("div", "turn-meta", `turn ${turnIndex}\n${payload.task}`);
+      const body = makeEl("div", "turn-body");
+      body.appendChild(makeEl("div", "prompt", prompt));
+
+      if (error) {
+        body.appendChild(makeEl("div", "error", error));
+      } else {
+        for (const segment of data.segments || []) {
+          body.appendChild(renderSegment(segment));
+        }
+        const raw = makeEl("pre", "raw", JSON.stringify({
+          session: data.session || null,
+          stats: data.stats || null,
+          metadata: data.metadata || null
+        }, null, 2));
+        body.appendChild(raw);
+      }
+
+      turn.append(meta, body);
+      feed.prepend(turn);
+    }
+
+    function renderSegment(segment) {
+      const wrap = makeEl("div", "segment");
+      wrap.appendChild(makeEl("span", "tag", segment.type || "unknown"));
+      if (segment.type === "text") {
+        wrap.appendChild(makeEl("div", "text", segment.text || ""));
+      } else if (segment.type === "image") {
+        const img = document.createElement("img");
+        const image = segment.image || {};
+        img.className = "image";
+        img.alt = "generated image";
+        img.src = image.url || `data:${image.mime_type || "image/png"};base64,${image.b64_json || ""}`;
+        wrap.appendChild(img);
+      } else {
+        wrap.appendChild(makeEl("pre", "raw", JSON.stringify(segment, null, 2)));
+      }
+      return wrap;
+    }
+
+    function fileAsImageSegment(file) {
+      return new Promise((resolve, reject) => {
+        if (!file) {
+          resolve(null);
+          return;
+        }
+        const reader = new FileReader();
+        reader.onload = () => {
+          const result = String(reader.result || "");
+          const comma = result.indexOf(",");
+          resolve({
+            type: "image",
+            image: {
+              b64_json: comma >= 0 ? result.slice(comma + 1) : result,
+              mime_type: file.type || "image/png"
+            }
+          });
+        };
+        reader.onerror = () => reject(reader.error);
+        reader.readAsDataURL(file);
+      });
+    }
+
+    async function buildPayload() {
+      const prompt = $("prompt").value.trim();
+      const imageSegment = await fileAsImageSegment($("imageInput").files[0]);
+      const messages = [];
+      if (imageSegment) messages.push(imageSegment);
+      messages.push({type: "text", text: prompt});
+
+      const payload = {
+        model: "sensenova-u1",
+        task: $("task").value,
+        messages,
+        sampling_params: {
+          width: Number($("width").value),
+          height: Number($("height").value),
+          num_steps: Number($("steps").value),
+          seed: Number($("seed").value),
+          cfg_text_scale: Number($("cfgText").value),
+          cfg_img_scale: Number($("cfgImage").value),
+          cfg_renorm_type: "global"
+        },
+        max_images: 1,
+        max_text_segments: 3
+      };
+
+      if (sessionId) {
+        payload.session_id = sessionId;
+      } else if ($("keepSession").checked) {
+        payload.keep_session = true;
+      }
+      return {payload, prompt};
+    }
+
+    async function send() {
+      setBusy(true);
+      const {payload, prompt} = await buildPayload();
+      try {
+        const response = await fetch("/api/omni/generate", {
+          method: "POST",
+          headers: {"content-type": "application/json"},
+          body: JSON.stringify(payload)
+        });
+        const text = await response.text();
+        let data;
+        try {
+          data = JSON.parse(text);
+        } catch {
+          data = {raw: text};
+        }
+        if (!response.ok) {
+          appendTurn(prompt, payload, data, JSON.stringify(data, null, 2));
+          return;
+        }
+        if (data.session && data.session.id) setSession(data.session.id);
+        appendTurn(prompt, payload, data, "");
+      } catch (error) {
+        appendTurn(prompt, payload, null, error.message);
+      } finally {
+        setBusy(false);
+        checkHealth();
+      }
+    }
+
+    async function closeSession() {
+      if (!sessionId) return;
+      setBusy(true);
+      try {
+        await fetch("/api/omni/close", {
+          method: "POST",
+          headers: {"content-type": "application/json"},
+          body: JSON.stringify({session_id: sessionId})
+        });
+        setSession("");
+      } finally {
+        setBusy(false);
+      }
+    }
+
+    $("send").addEventListener("click", send);
+    $("closeSession").addEventListener("click", closeSession);
+    $("reset").addEventListener("click", () => {
+      turnIndex = 0;
+      feed.innerHTML = '<div class="empty">Timeline cleared. The server session is unchanged until you close it.</div>';
+    });
+    $("turn1").addEventListener("click", () => {
+      $("task").value = "interleave";
+      $("prompt").value = prompts.turn1;
+      $("seed").value = "223";
+    });
+    $("turn2").addEventListener("click", () => {
+      $("task").value = "interleave";
+      $("prompt").value = prompts.turn2;
+      $("seed").value = "224";
+    });
+
+    checkHealth();
+    setInterval(checkHealth, 10000);
+  </script>
+</body>
+</html>
