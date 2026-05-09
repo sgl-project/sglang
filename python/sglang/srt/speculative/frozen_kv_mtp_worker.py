@@ -428,7 +428,7 @@ class FrozenKVMTPWorker(TpModelWorker):
             with self.draft_tp_context(
                 self.draft_model_runner.tp_group
             ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
-                self.forward_draft_extend(
+                next_draft_input = self.forward_draft_extend(
                     batch,
                     logits_output.hidden_states,
                     next_token_ids,
@@ -440,6 +440,7 @@ class FrozenKVMTPWorker(TpModelWorker):
                 next_token_ids=next_token_ids,
                 num_accepted_drafts=0,
                 can_run_cuda_graph=can_run_cuda_graph,
+                next_draft_input=next_draft_input,
             )
 
         set_time_batch(batch.reqs, "set_spec_draft_start_time", trace_only=True)
@@ -460,6 +461,7 @@ class FrozenKVMTPWorker(TpModelWorker):
                 req.time_stats.set_spec_verify_end_time(accepted_tokens=accepted)
 
         set_time_batch(batch.reqs, "set_spec_draft_extend_start_time", trace_only=True)
+        next_draft_input = None
         with self.draft_tp_context(
             self.draft_model_runner.tp_group
         ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
@@ -470,10 +472,10 @@ class FrozenKVMTPWorker(TpModelWorker):
             ):
                 # Install draft_extend_input as batch.spec_info for the seed
                 # step; the assembled next-iter FrozenKVMTPDraftInput is
-                # returned and installed by the executor here.
+                # returned via batch_result and installed by the scheduler
+                # before the next draft.
                 batch.spec_info = draft_extend_input
                 next_draft_input = self.forward_draft_extend_after_decode(batch)
-                batch.spec_info = next_draft_input
         set_time_batch(batch.reqs, "set_spec_draft_extend_end_time", trace_only=True)
 
         return GenerationBatchResult(
@@ -482,6 +484,7 @@ class FrozenKVMTPWorker(TpModelWorker):
             num_accepted_drafts=sum(verify_output.num_accepted_drafts_per_req_cpu),
             num_accepted_drafts_per_req_cpu=verify_output.num_accepted_drafts_per_req_cpu,
             can_run_cuda_graph=verify_output.can_run_cuda_graph,
+            next_draft_input=next_draft_input,
         )
 
     def forward_target_extend(
@@ -504,9 +507,12 @@ class FrozenKVMTPWorker(TpModelWorker):
         next_token_ids: torch.Tensor,
         seq_lens_cpu: Optional[torch.Tensor],
         mm_input_embeds: Optional[torch.Tensor] = None,
-    ) -> None:
+    ) -> FrozenKVMTPDraftInput:
+        """Run the prefill seed step. Returns next-iter `FrozenKVMTPDraftInput`;
+        scheduler installs it on `batch.spec_info` via `batch_result.next_draft_input`.
+        """
         last_hidden = self._select_last_extend_hidden(batch, hidden_states)
-        batch.spec_info = self._run_assistant_seed_step(
+        return self._run_assistant_seed_step(
             batch,
             next_token_ids,
             last_hidden,
