@@ -84,6 +84,51 @@ __global__ void ComputeNGramIdsKernel(
   }
 }
 
+__global__ void ComputeNGramIdsDecodeKernel(
+    int batch_size,
+    int ne_n,
+    int ne_k,
+    int* ne_weights,                      // [ne_n-1,ne_k,ne_n]
+    int* ne_mods,                         // [ne_n-1,ne_k]
+    int* exclusive_ne_embeder_size_sums,  // [(ne_n-1)*ne_k]
+    int* ne_token_table,                  // [max_running_reqs, max_context_len]
+    int max_context_len,                  // max_context_len
+    long* row_indices,                    // [batch_size]
+    int* column_starts,                   // [batch_size]
+    int* n_gram_ids                       // [batch_size, (ne_n-1)*ne_k]
+) {
+  const int num_configs = (ne_n - 1) * ne_k;
+  const int total_outputs = batch_size * num_configs;
+
+  for (int out_idx = blockIdx.x * blockDim.x + threadIdx.x; out_idx < total_outputs;
+       out_idx += blockDim.x * gridDim.x) {
+    const int req_id = out_idx / num_configs;
+    const int config_id = out_idx - req_id * num_configs;
+    const int k = config_id % ne_k;
+    const int n = config_id / ne_k;
+    const int ne_weight_base_idx = n * ne_k * ne_n + k * ne_n;
+    const int ne_mod = ne_mods[n * ne_k + k];
+
+    uint64_t n_gram_id = 0;
+    const int req_token_table_index = row_indices[req_id] * max_context_len;
+    const int current_token_table_index = req_token_table_index + column_starts[req_id];
+    for (int j = 0; j < n + 2; j++) {
+      if (current_token_table_index - j < req_token_table_index) {
+        break;
+      }
+      const int token = ne_token_table[current_token_table_index - j];
+      if (token < 0) {
+        break;
+      }
+      const uint64_t term = (uint64_t)token * (uint64_t)ne_weights[ne_weight_base_idx + j];
+      n_gram_id += term % ne_mod;
+    }
+    n_gram_id %= ne_mod;
+    n_gram_id += exclusive_ne_embeder_size_sums[n * ne_k + k];
+    n_gram_ids[out_idx] = (int)(n_gram_id);
+  }
+}
+
 __global__ void UpdateTokenTableKernel(
     int batch_size,
     int* tokens,           // [token_num]
@@ -206,6 +251,85 @@ struct NgramEmbeddingKernel {
         static_cast<int*>(exclusive_ne_embeder_size_sums.data_ptr()),
         static_cast<int*>(tokens.data_ptr()),
         static_cast<int*>(exclusive_req_len_sums.data_ptr()),
+        static_cast<int*>(ne_token_table.data_ptr()),
+        max_context_len,
+        static_cast<long*>(row_indices.data_ptr()),
+        static_cast<int*>(column_starts.data_ptr()),
+        static_cast<int*>(n_gram_ids.data_ptr()));
+  }
+
+  static void compute_n_gram_ids_decode(
+      const int64_t ne_n,
+      const int64_t ne_k,
+      const tvm::ffi::TensorView ne_weights,
+      const tvm::ffi::TensorView ne_mods,
+      const tvm::ffi::TensorView exclusive_ne_embeder_size_sums,
+      const tvm::ffi::TensorView ne_token_table,
+      const tvm::ffi::TensorView row_indices,
+      const tvm::ffi::TensorView column_starts,
+      const tvm::ffi::TensorView n_gram_ids) {
+    using namespace host;
+
+    auto device_ = SymbolicDevice{};
+    auto batch_size = SymbolicSize{"batch_size"};
+
+    TensorMatcher({-1, -1, -1})  // [ne_n-1, ne_k, ne_n]
+        .with_dtype<int32_t>()
+        .with_device<kDLCUDA>(device_)
+        .verify(ne_weights);
+
+    TensorMatcher({-1, -1})  // [ne_n-1, ne_k]
+        .with_dtype<int32_t>()
+        .with_device<kDLCUDA>()
+        .verify(ne_mods);
+
+    TensorMatcher({-1})  // [(ne_n-1)*ne_k + 1]
+        .with_dtype<int32_t>()
+        .with_device<kDLCUDA>()
+        .verify(exclusive_ne_embeder_size_sums);
+
+    TensorMatcher({-1, -1})  // [max_running_reqs, max_context_len]
+        .with_dtype<int32_t>()
+        .with_device<kDLCUDA>()
+        .verify(ne_token_table);
+
+    TensorMatcher({batch_size})  // [batch_size]
+        .with_dtype<int64_t>()
+        .with_device<kDLCUDA>()
+        .verify(row_indices);
+
+    TensorMatcher({batch_size})  // [batch_size]
+        .with_dtype<int32_t>()
+        .with_device<kDLCUDA>()
+        .verify(column_starts);
+
+    TensorMatcher({batch_size, -1})  // [batch_size, (ne_n-1)*ne_k]
+        .with_dtype<int32_t>()
+        .with_device<kDLCUDA>()
+        .verify(n_gram_ids);
+
+    const int bs = static_cast<int>(batch_size.unwrap());
+    if (bs <= 0) {
+      return;
+    }
+
+    const int max_context_len = static_cast<int>(ne_token_table.size(1));
+    const int num_configs = (static_cast<int>(ne_n) - 1) * static_cast<int>(ne_k);
+    const int total_outputs = bs * num_configs;
+    const auto stream = LaunchKernel::resolve_device(device_.unwrap());
+
+    constexpr int BLOCK_THREADS = 256;
+    const int grid_size =
+        std::min(65535, static_cast<int>(div_ceil(total_outputs, BLOCK_THREADS)));
+
+    LaunchKernel(grid_size, BLOCK_THREADS, stream)(
+        device::ngram_embedding::ComputeNGramIdsDecodeKernel,
+        bs,
+        static_cast<int>(ne_n),
+        static_cast<int>(ne_k),
+        static_cast<int*>(ne_weights.data_ptr()),
+        static_cast<int*>(ne_mods.data_ptr()),
+        static_cast<int*>(exclusive_ne_embeder_size_sums.data_ptr()),
         static_cast<int*>(ne_token_table.data_ptr()),
         max_context_len,
         static_cast<long*>(row_indices.data_ptr()),
