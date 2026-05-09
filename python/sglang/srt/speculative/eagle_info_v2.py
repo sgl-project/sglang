@@ -228,10 +228,11 @@ class EagleDraftExtendInputV2Mixin:
         draft_model_runner: Any,
         cuda_graph_runner: Any,
     ):
+        # Caller is responsible for `batch.spec_info = self` before calling.
+        assert batch.spec_info is self
         seq_lens_cpu_ = batch.seq_lens_cpu
         extend_num_tokens = len(batch.seq_lens) * num_draft_tokens
 
-        batch.spec_info = self
         batch.input_ids = predict
         batch.seq_lens = batch.seq_lens + num_draft_tokens
         batch.seq_lens_cpu = batch.seq_lens_cpu + num_draft_tokens
@@ -323,15 +324,18 @@ class EagleVerifyInputV2Mixin:
 
         return verify_forward_batch, can_run_cuda_graph
 
-    def sample(
+    def verify_v2(
         self: EagleVerifyInput,
         batch: ModelWorkerBatch,
         logits_output: LogitsProcessorOutput,
         vocab_mask: torch.Tensor = None,
     ) -> Tuple["EagleVerifyOutput", torch.Tensor]:
         """
-        Verify and find accepted tokens based on logits output and batch
-        (which contains spec decoding information).
+        V2 counterpart to `EagleVerifyInput.verify` (V1). Sample target tokens,
+        verify against drafts, and produce an `EagleVerifyOutput`.
+
+        Cannot be named `verify` because the V1 method is defined directly on
+        `EagleVerifyInput` and would shadow this mixin method via MRO.
 
         Returns `(verify_output, predict)` where `predict` is the full
         per-position sampled tokens (V2 caller uses it as `next_token_ids`).
