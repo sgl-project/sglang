@@ -664,11 +664,20 @@ class DeepseekV4AttnBackend(
         max_seq_len = int(seq_lens_cpu.max().item())
 
         if forward_batch.forward_mode.is_decode_or_idle():
+            out_cache_loc = forward_batch.out_cache_loc
+            if self.speculative_num_steps > 0:
+                # Per-step EAGLE draft: slice the shared `out_cache_loc` to
+                # this step's portion and advance `seq_lens` by `step_id + 1`.
+                bs = req_pool_indices.shape[0]
+                step_id = self.speculative_step_id
+                out_cache_loc = out_cache_loc[bs * step_id : bs * (step_id + 1)]
+                seq_lens = seq_lens + (step_id + 1)
+                max_seq_len = max_seq_len + (step_id + 1)
             metadata = self.init_forward_metadata_decode(
                 max_seq_len=max_seq_len,
                 req_pool_indices=req_pool_indices,
                 seq_lens=seq_lens,
-                out_cache_loc=forward_batch.out_cache_loc,
+                out_cache_loc=out_cache_loc,
             )
         elif forward_batch.forward_mode.is_target_verify():
             metadata = self.init_forward_metadata_target_verify(
@@ -813,6 +822,14 @@ class DeepseekV4AttnBackend(
         if bucket == _GraphBucket.DECODE_OR_IDLE:
             assert out_cache_loc is not None
             assert len(out_cache_loc.shape) == 1, f"{out_cache_loc.shape=}"
+            if self.speculative_num_steps > 0:
+                # Per-step EAGLE draft: take this step's slice of the
+                # shared `out_cache_loc` and advance `seq_lens` by
+                # `step_id + 1`. The captured buffer's `chosen_max_seq_len`
+                # already accommodates the spec extension.
+                step_id = self.speculative_step_id
+                out_cache_loc = out_cache_loc[bs * step_id : bs * (step_id + 1)]
+                seq_lens = seq_lens + (step_id + 1)
             out_cache_loc_padded = torch.nn.functional.pad(
                 out_cache_loc,
                 pad=(0, bs - len(out_cache_loc)),
