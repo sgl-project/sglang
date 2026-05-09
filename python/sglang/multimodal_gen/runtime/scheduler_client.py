@@ -147,7 +147,7 @@ class AsyncSchedulerClient:
         self.context = zmq.asyncio.Context()
         logger.debug("AsyncSchedulerClient initialized with zmq.asyncio.Context")
 
-    async def forward(self, batch: Any) -> Any:
+    async def forward(self, batch: Any, recv_timeout_ms: int = 6000000) -> Any:
         """Sends a batch or request to the scheduler and waits for the response."""
         if self.context is None:
             raise RuntimeError(
@@ -157,8 +157,7 @@ class AsyncSchedulerClient:
         # Create a temporary REQ socket for this request to allow concurrency
         socket = self.context.socket(zmq.REQ)
         socket.setsockopt(zmq.LINGER, 0)
-        # 100 minute timeout
-        socket.setsockopt(zmq.RCVTIMEO, 6000000)
+        socket.setsockopt(zmq.RCVTIMEO, recv_timeout_ms)
 
         endpoint = self.server_args.scheduler_endpoint
         socket.connect(endpoint)

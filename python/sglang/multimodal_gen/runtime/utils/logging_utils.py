@@ -563,6 +563,7 @@ def globally_suppress_loggers():
         "httpx",
         "httpcore",
         "flash_attn.cute.cache_utils",
+        "diffusers.quantizers.torchao.torchao_quantizer",
     ]
 
     for name in target_names:

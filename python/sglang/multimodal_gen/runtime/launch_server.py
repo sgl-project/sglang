@@ -1,6 +1,7 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 
 import dataclasses
+import logging
 import multiprocessing as mp
 import os
 import signal
@@ -9,6 +10,10 @@ import threading
 
 import psutil
 import uvicorn
+
+logging.getLogger("diffusers.quantizers.torchao.torchao_quantizer").setLevel(
+    logging.ERROR
+)
 
 from sglang.multimodal_gen.runtime.disaggregation.orchestrator import (
     DiffusionServer,
@@ -81,6 +86,22 @@ def kill_process_tree(parent_pid, include_parent: bool = True, skip_pid: int = N
             itself.send_signal(signal.SIGQUIT)
         except psutil.NoSuchProcess:
             pass
+
+
+def _join_or_stop_processes(processes: list[mp.Process]):
+    for process in processes:
+        process.join(timeout=10)
+
+    for process in processes:
+        if process.is_alive():
+            process.terminate()
+
+    for process in processes:
+        process.join(timeout=5)
+
+    for process in processes:
+        if process.is_alive():
+            process.kill()
 
 
 def launch_server(server_args: ServerArgs, launch_http_server: bool = True):
@@ -205,7 +226,10 @@ def launch_server(server_args: ServerArgs, launch_http_server: bool = True):
             )
             http_server_process.start()
         else:
-            launch_http_server_only(server_args)
+            try:
+                launch_http_server_only(server_args)
+            finally:
+                _join_or_stop_processes(processes)
 
     return processes
 

@@ -1,4 +1,6 @@
 import logging
+from contextlib import redirect_stderr, redirect_stdout
+from io import StringIO
 
 from sglang.srt.environ import envs
 from sglang.srt.utils import (
@@ -25,7 +27,9 @@ def _compute_enable_deep_gemm():
         return False
 
     try:
-        import deep_gemm  # noqa: F401
+        # deep_gemm may print optional legacy-kernel import failures during probing
+        with redirect_stdout(StringIO()), redirect_stderr(StringIO()):
+            import deep_gemm  # noqa: F401
     except Exception:
         return False
 
