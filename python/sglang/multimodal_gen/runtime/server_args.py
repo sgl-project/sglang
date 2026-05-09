@@ -1363,7 +1363,8 @@ class ServerArgs(DisaggArgsMixin):
             if port not in avoid and is_port_available(port):
                 if attempts > 0:
                     logger.info(
-                        f"Port {original_port} was unavailable, using port {port} instead"
+                        f"Port {original_port} was unavailable or reserved, "
+                        f"using port {port} instead"
                     )
                 return port
 

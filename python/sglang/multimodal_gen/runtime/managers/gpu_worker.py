@@ -890,6 +890,15 @@ def _oom_exceptions():
     return tuple(types)
 
 
+def _shutdown_torch_compile_workers() -> None:
+    try:
+        from torch._inductor.async_compile import shutdown_compile_workers
+    except ImportError:
+        return
+
+    shutdown_compile_workers()
+
+
 def run_scheduler_process(
     local_rank: int,
     rank: int,
@@ -954,6 +963,7 @@ def run_scheduler_process(
         if "scheduler" in locals():
             scheduler.close()
             del scheduler
+        _shutdown_torch_compile_workers()
         gc.collect()
         if torch.cuda.is_initialized():
             torch.cuda.empty_cache()
