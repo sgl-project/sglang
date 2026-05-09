@@ -99,9 +99,6 @@ jobs:
       sgl_kernel_raw: ${{ steps.filter-api.outputs.sgl_kernel || steps.filter.outputs.sgl_kernel }}
       jit_kernel: ${{ steps.filter-api.outputs.jit_kernel || steps.filter.outputs.jit_kernel || steps.run-mode.outputs.run_all_tests }}
       multimodal_gen: ${{ steps.filter-api.outputs.multimodal_gen || steps.filter.outputs.multimodal_gen || steps.run-mode.outputs.run_all_tests }}
-      max_parallel: ${{ steps.set-parallel.outputs.max_parallel }}
-      max_parallel_small: ${{ steps.set-parallel.outputs.max_parallel_small }}
-      max_parallel_2gpu: ${{ steps.set-parallel.outputs.max_parallel_2gpu }}
       b200_runner: ${{ steps.set-runner.outputs.b200_runner }}
       enable_retry: ${{ steps.set-retry.outputs.enable_retry }}
       continue_on_error: ${{ steps.set-continue-on-error.outputs.continue_on_error }}
@@ -226,22 +223,6 @@ jobs:
             echo "multimodal_gen=false" >> $GITHUB_OUTPUT
           fi
 
-      - name: Set max-parallel based on run type
-        id: set-parallel
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          # All runs now get full parallelism. The previous "low" tier
-          # (3/3/2 partitions for non-priority PRs) was a cost lever from
-          # before the per-commit pruning effort cut the suite by ~3 hours;
-          # with the smaller suite there's no need to throttle.
-          #   1-gpu-h100: 14 partitions, 1-gpu-5090: 8 partitions, 2-gpu-h100: 4 partitions
-          echo "max_parallel=14" >> $GITHUB_OUTPUT
-          echo "max_parallel_small=8" >> $GITHUB_OUTPUT
-          echo "max_parallel_2gpu=4" >> $GITHUB_OUTPUT
-          echo "parallel_level=full" >> $GITHUB_OUTPUT
-          echo "Parallelism level: full (uncapped)"
-
       - name: Set include-tags for nightly pull-in
         id: set-include-tags
         env:
@@ -349,7 +330,6 @@ jobs:
             echo "| multimodal_gen    | ${{ steps.filter-api.outputs.multimodal_gen || steps.filter.outputs.multimodal_gen || steps.run-mode.outputs.run_all_tests }} |"
             echo "| target_stage      | ${{ inputs.target_stage || '(none)' }} |"
             echo "| detection_method  | ${{ inputs.target_stage && 'GitHub API' || 'dorny/paths-filter' }} |"
-            echo "| max_parallel      | ${{ steps.set-parallel.outputs.parallel_level }} (h100=${{ steps.set-parallel.outputs.max_parallel }}, 5090=${{ steps.set-parallel.outputs.max_parallel_small }}, 2gpu=${{ steps.set-parallel.outputs.max_parallel_2gpu }}) |"
             echo "| b200_runner       | ${{ steps.set-runner.outputs.b200_runner }} |"
             echo "| enable_retry      | ${{ steps.set-retry.outputs.enable_retry }} |"
             echo "| continue_on_error | ${{ steps.set-continue-on-error.outputs.continue_on_error }} |"
@@ -387,37 +367,6 @@ jobs:
           jobs: '["stage-a-test-1-gpu-small", {"prefix": "stage-a-test-cpu", "expected_count": 4}]'
           max-wait-minutes: '240'
 
-  wait-for-stage-b:
-    needs: [check-changes, call-gate, wait-for-stage-a]
-    if: |
-      always() &&
-      !cancelled() &&
-      github.event_name == 'pull_request' &&
-      !inputs.target_stage &&
-      inputs.test_parallel_dispatch != true &&
-      (needs.check-changes.outputs.main_package == 'true' || needs.check-changes.outputs.sgl_kernel == 'true') &&
-      (needs.wait-for-stage-a.result == 'success' || needs.wait-for-stage-a.result == 'skipped') &&
-      (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped')
-    runs-on: ubuntu-latest
-    outputs:
-      stage_b_result: ${{ steps.wait.outputs.result }}
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: ./.github/actions/check-maintenance
-
-      - uses: ./.github/actions/wait-for-jobs
-        id: wait
-        with:
-          stage-name: stage-b
-          jobs: |
-            [
-              {"prefix": "stage-b-test-1-gpu-small", "expected_count": 8},
-              {"prefix": "stage-b-test-1-gpu-large", "expected_count": 14},
-              {"prefix": "stage-b-test-2-gpu-large", "expected_count": 4},
-              {"prefix": "stage-b-test-4-gpu-b200", "expected_count": 1}
-            ]
-          max-wait-minutes: '480'
 
   # =============================================== PR Gate ====================================================
   call-gate:
@@ -782,7 +731,6 @@ jobs:
     timeout-minutes: 240
     strategy:
       fail-fast: false
-      max-parallel: ${{ fromJson(needs.check-changes.outputs.max_parallel_small) }}
       matrix:
         partition: [0, 1, 2, 3, 4, 5, 6, 7]
     steps:
@@ -843,7 +791,6 @@ jobs:
     timeout-minutes: 240
     strategy:
       fail-fast: false
-      max-parallel: ${{ fromJson(needs.check-changes.outputs.max_parallel) }}
       matrix:
         partition: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]
     steps:
@@ -903,7 +850,6 @@ jobs:
     timeout-minutes: 240
     strategy:
       fail-fast: false
-      max-parallel: ${{ fromJson(needs.check-changes.outputs.max_parallel_2gpu) }}
       matrix:
         partition: [0, 1, 2, 3]
     steps:
@@ -1042,7 +988,7 @@ jobs:
     secrets: inherit
 
   stage-c-test-4-gpu-h100:
-    needs: [check-changes, call-gate, wait-for-stage-b, sgl-kernel-build-wheels]
+    needs: [check-changes, call-gate, wait-for-stage-a, sgl-kernel-build-wheels]
     if: |
       always() &&
       (
@@ -1101,7 +1047,7 @@ jobs:
         run: bash scripts/ci/cuda/ci_cleanup_venv.sh
 
   stage-c-test-8-gpu-h200:
-    needs: [check-changes, call-gate, wait-for-stage-b, sgl-kernel-build-wheels]
+    needs: [check-changes, call-gate, wait-for-stage-a, sgl-kernel-build-wheels]
     if: |
       always() &&
       (
@@ -1179,7 +1125,7 @@ jobs:
         run: bash scripts/ci/cuda/ci_cleanup_venv.sh
 
   stage-c-test-8-gpu-h20:
-    needs: [check-changes, call-gate, wait-for-stage-b, sgl-kernel-build-wheels]
+    needs: [check-changes, call-gate, wait-for-stage-a, sgl-kernel-build-wheels]
     if: |
       always() &&
       (
@@ -1235,7 +1181,7 @@ jobs:
         run: bash scripts/ci/cuda/ci_cleanup_venv.sh
 
   stage-c-test-deepep-4-gpu-h100:
-    needs: [check-changes, call-gate, wait-for-stage-b, sgl-kernel-build-wheels]
+    needs: [check-changes, call-gate, wait-for-stage-a, sgl-kernel-build-wheels]
     if: |
       always() &&
       (
@@ -1305,7 +1251,7 @@ jobs:
         run: bash scripts/ci/cuda/ci_cleanup_venv.sh
 
   stage-c-test-deepep-8-gpu-h200:
-    needs: [check-changes, call-gate, wait-for-stage-b, sgl-kernel-build-wheels]
+    needs: [check-changes, call-gate, wait-for-stage-a, sgl-kernel-build-wheels]
     if: |
       always() &&
       (
@@ -1376,7 +1322,7 @@ jobs:
         run: bash scripts/ci/cuda/ci_cleanup_venv.sh
 
   stage-c-test-4-gpu-b200:
-    needs: [check-changes, call-gate, wait-for-stage-b, sgl-kernel-build-wheels]
+    needs: [check-changes, call-gate, wait-for-stage-a, sgl-kernel-build-wheels]
     if: |
       always() &&
       (
@@ -1436,7 +1382,7 @@ jobs:
         run: bash scripts/ci/cuda/ci_cleanup_venv.sh
 
   stage-c-test-dsv4-4-gpu-b200:
-    needs: [check-changes, call-gate, wait-for-stage-b, sgl-kernel-build-wheels]
+    needs: [check-changes, call-gate, wait-for-stage-a, sgl-kernel-build-wheels]
     if: |
       always() &&
       (
@@ -1489,7 +1435,7 @@ jobs:
         run: bash scripts/ci/cuda/ci_cleanup_venv.sh
 
   stage-c-test-dsv4-8-gpu-h200:
-    needs: [check-changes, call-gate, wait-for-stage-b, sgl-kernel-build-wheels]
+    needs: [check-changes, call-gate, wait-for-stage-a, sgl-kernel-build-wheels]
     if: |
       always() &&
       (
@@ -1544,7 +1490,7 @@ jobs:
   # NOTE: GB200 stage temporarily disabled — no company-owned GB200 runner available yet.
   # Re-enable when a 4-gpu-gb200 runner is provisioned.
   # stage-c-test-4-gpu-gb200:
-  #   needs: [check-changes, call-gate, wait-for-stage-b, sgl-kernel-build-wheels-arm]
+  #   needs: [check-changes, call-gate, wait-for-stage-a, sgl-kernel-build-wheels-arm]
   #   if: |
   #     always() &&
   #     (
@@ -1605,7 +1551,6 @@ jobs:
         call-sgl-kernel-tests,
 
         wait-for-stage-a,
-        wait-for-stage-b,
 
         call-jit-kernel-tests,
 
