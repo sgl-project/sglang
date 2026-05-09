@@ -511,11 +511,13 @@ class EAGLEWorker(TpModelWorker):
                     or verify_output.unfinished_accept_tokens.shape[0] > 0
                 ):
                     # decode is not finished
-                    # Install draft_extend_input as `batch.spec_info` for the
-                    # draft-extend forward (replaced post-extend with a fresh
-                    # EagleDraftInput by `forward_draft_extend_after_decode`).
+                    # Install draft_extend_input for the extend forward, then
+                    # install the assembled next-iter EagleDraftInput it returns.
                     batch.spec_info = verify_output.draft_extend_input
-                    self.forward_draft_extend_after_decode(batch, verify_output)
+                    next_draft_input = self.forward_draft_extend_after_decode(
+                        batch, verify_output
+                    )
+                    batch.spec_info = next_draft_input
 
             set_time_batch(
                 batch.reqs, "set_spec_draft_extend_end_time", trace_only=True
@@ -1116,7 +1118,7 @@ class EAGLEWorker(TpModelWorker):
 
     def forward_draft_extend_after_decode(
         self, batch: ScheduleBatch, verify_output: EagleVerifyOutput
-    ):
+    ) -> EagleDraftInput:
         # Caller (forward_batch_generation) is responsible for installing
         # verify_output.draft_extend_input as batch.spec_info before calling.
         draft_extend_input = verify_output.draft_extend_input
@@ -1220,16 +1222,17 @@ class EAGLEWorker(TpModelWorker):
             capture_hidden_mode=CaptureHiddenMode.FULL,
         )
 
-        # Restore batch fields and install the new draft input.
-        # `seq_lens` etc. were modified by `prepare_extend_after_decode`.
+        # Restore batch fields. `seq_lens` etc. were modified by
+        # `prepare_extend_after_decode`. Caller installs `next_draft_input` as
+        # `batch.spec_info`.
         batch.forward_mode = (
             ForwardMode.DECODE if not input_is_idle else ForwardMode.IDLE
         )
         batch.seq_lens = seq_lens_backup
         batch.seq_lens_cpu = seq_lens_cpu_backup
         batch.req_pool_indices = req_pool_indices_backup
-        batch.spec_info = next_draft_input
         batch.return_logprob = return_logprob_backup
+        return next_draft_input
 
     def capture_for_decode(
         self, logits_output: LogitsProcessorOutput, draft_input: EagleDraftInput
