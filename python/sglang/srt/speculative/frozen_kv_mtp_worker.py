@@ -447,7 +447,6 @@ class FrozenKVMTPWorker(TpModelWorker):
         set_time_batch(batch.reqs, "set_spec_draft_end_time", trace_only=True)
         set_time_batch(batch.reqs, "set_spec_verify_start_time", trace_only=True)
 
-        # Install verify_input as `batch.spec_info` for the verify forward.
         batch.spec_info = verify_input
         logits_output, verify_output, can_run_cuda_graph = self.verify(batch)
 
@@ -465,9 +464,8 @@ class FrozenKVMTPWorker(TpModelWorker):
                 self.server_args.enable_dp_attention
                 or draft_extend_input.input_ids.numel() > 0
             ):
-                # Install draft_extend_input as `batch.spec_info` for the seed
-                # step (`_run_assistant_seed_step` replaces it with a fresh
-                # `FrozenKVMTPDraftInput` for next iter).
+                # Stash for the seed step; _run_assistant_seed_step swaps in
+                # a fresh FrozenKVMTPDraftInput for next iter.
                 batch.spec_info = draft_extend_input
                 self.forward_draft_extend_after_decode(batch)
         set_time_batch(batch.reqs, "set_spec_draft_extend_end_time", trace_only=True)
@@ -515,7 +513,7 @@ class FrozenKVMTPWorker(TpModelWorker):
         input_is_idle = batch.forward_mode.is_idle()
 
         if not input_is_idle and draft_extend_input.input_ids.numel() == 0:
-            # All reqs finished. Install an idle FrozenKVMTPDraftInput so the
+            # All reqs finished; stash an idle FrozenKVMTPDraftInput so the
             # next-iter draft sees a valid spec_info.
             batch = batch.copy()
             batch.prepare_for_idle()

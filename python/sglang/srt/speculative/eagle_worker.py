@@ -486,7 +486,6 @@ class EAGLEWorker(TpModelWorker):
             set_time_batch(batch.reqs, "set_spec_draft_end_time", trace_only=True)
             set_time_batch(batch.reqs, "set_spec_verify_start_time", trace_only=True)
 
-            # Install verify_input as `batch.spec_info` for the verify forward.
             batch.spec_info = verify_input
             logits_output, verify_output, can_run_cuda_graph = self.verify(batch)
 
@@ -509,17 +508,16 @@ class EAGLEWorker(TpModelWorker):
                     self.server_args.enable_dp_attention
                     or draft_extend_input.input_ids.shape[0] > 0
                 ):
-                    # decode is not finished
-                    # Install draft_extend_input for the extend forward, then
-                    # install the assembled next-iter EagleDraftInput it returns.
+                    # decode is not finished; stash for extend, then restash
+                    # the next-iter EagleDraftInput it returns.
                     batch.spec_info = draft_extend_input
                     next_draft_input = self.forward_draft_extend_after_decode(batch)
                     batch.spec_info = next_draft_input
                 else:
-                    # All reqs finished this verify and dp_attention is not
-                    # forcing the forward. Install an empty EagleDraftInput so
-                    # next iter's merge_batch short-circuits on None
-                    # hidden_states (EagleVerifyInput has no merge_batch).
+                    # All reqs finished and dp_attention isn't forcing extend.
+                    # Stash an empty EagleDraftInput so next iter's merge_batch
+                    # short-circuits on None hidden_states (EagleVerifyInput
+                    # has no merge_batch).
                     batch.spec_info = EagleDraftInput(
                         capture_hidden_mode=CaptureHiddenMode.LAST,
                     )
@@ -541,9 +539,7 @@ class EAGLEWorker(TpModelWorker):
                 can_run_cuda_graph=can_run_cuda_graph,
             )
 
-    def check_forward_draft_extend_after_decode(
-        self, batch: ScheduleBatch, verify_output: EagleVerifyOutput
-    ):
+    def check_forward_draft_extend_after_decode(self, verify_output: EagleVerifyOutput):
         local_need_forward = verify_output.draft_extend_input.input_ids.shape[0] > 0
         if not self.server_args.enable_dp_attention:
             return local_need_forward
