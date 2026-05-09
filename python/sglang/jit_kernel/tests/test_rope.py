@@ -162,6 +162,37 @@ def test_rope_position_dtypes(dtype: torch.dtype) -> None:
     triton.testing.assert_close(k_fi, k_jit, atol=atol, rtol=rtol)
 
 
+@pytest.mark.parametrize("is_neox", IS_NEOX_LIST)
+def test_legacy_rotary_embedding_with_key_float_cache_fast_path(
+    is_neox: bool,
+) -> None:
+    from sglang.jit_kernel.rope import apply_rope_inplace, rotary_embedding_with_key
+
+    batch_size, num_qo_heads, num_kv_heads, rope_dim = 16, 16, 2, 128
+    q = torch.randn(batch_size, num_qo_heads, rope_dim, device=DEVICE, dtype=DTYPE)
+    k = torch.randn(batch_size, num_kv_heads, rope_dim, device=DEVICE, dtype=DTYPE)
+    positions = torch.randint(0, MAX_SEQ_LEN, (batch_size,), device=DEVICE)
+    cos_sin_cache = create_cos_sin_cache(rope_dim)
+
+    q_legacy = q.clone().view(batch_size, -1)
+    k_legacy = k.clone().view(batch_size, -1)
+    q_fused = q.clone()
+    k_fused = k.clone()
+
+    rotary_embedding_with_key(
+        positions=positions,
+        query=q_legacy,
+        key=k_legacy,
+        head_size=rope_dim,
+        cos_sin_cache=cos_sin_cache,
+        is_neox=is_neox,
+    )
+    apply_rope_inplace(q_fused, k_fused, cos_sin_cache, positions, is_neox=is_neox)
+
+    triton.testing.assert_close(q_legacy.view_as(q_fused), q_fused, atol=1e-2, rtol=1e-2)
+    triton.testing.assert_close(k_legacy.view_as(k_fused), k_fused, atol=1e-2, rtol=1e-2)
+
+
 @pytest.mark.parametrize("batch_size", BS_LIST)
 @pytest.mark.parametrize("is_neox", IS_NEOX_LIST)
 @pytest.mark.parametrize("rope_dim", PARTIAL_ROPE_DIM_LIST)

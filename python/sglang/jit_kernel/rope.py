@@ -52,6 +52,10 @@ def rotary_embedding_with_key(
     cos_sin_cache: torch.Tensor,
     is_neox: bool = True,
 ) -> None:
+    if _try_fused_rope_for_legacy_api(
+        positions, query, key, head_size, cos_sin_cache, is_neox
+    ):
+        return
     module = _jit_rotary_embedding_module()
     module.rotary_embedding(positions, query, key, head_size, cos_sin_cache, is_neox)
 
@@ -69,6 +73,36 @@ def rotary_embedding_without_key(
 ) -> None:
     module = _jit_rotary_embedding_module()
     module.rotary_embedding(positions, query, None, head_size, cos_sin_cache, is_neox)
+
+
+def _try_fused_rope_for_legacy_api(
+    positions: torch.Tensor,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    head_size: int,
+    cos_sin_cache: torch.Tensor,
+    is_neox: bool,
+) -> bool:
+    if (
+        query.dim() != 2
+        or key.dim() != 2
+        or positions.dim() != 1
+        or cos_sin_cache.dim() != 2
+        or cos_sin_cache.dtype != torch.float32
+        or cos_sin_cache.size(1) != head_size
+        or query.size(0) != positions.numel()
+        or key.size(0) != positions.numel()
+        or query.size(1) % head_size != 0
+        or key.size(1) % head_size != 0
+        or not query.is_contiguous()
+        or not key.is_contiguous()
+    ):
+        return False
+
+    q = query.view(query.size(0), query.size(1) // head_size, head_size)
+    k = key.view(key.size(0), key.size(1) // head_size, head_size)
+    apply_rope_inplace(q, k, cos_sin_cache, positions, is_neox=is_neox)
+    return True
 
 
 def rotary_embedding(
