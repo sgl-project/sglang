@@ -980,7 +980,6 @@ class EAGLEWorker(TpModelWorker):
         batch.forward_mode = (
             ForwardMode.DECODE if not batch.forward_mode.is_idle() else ForwardMode.IDLE
         )
-        batch.spec_info = res.draft_extend_input
 
         return logits_output, res, model_worker_batch, can_run_cuda_graph
 
@@ -1110,8 +1109,10 @@ class EAGLEWorker(TpModelWorker):
     def forward_draft_extend_after_decode(
         self, batch: ScheduleBatch, verify_output: EagleVerifyOutput
     ):
-        assert isinstance(batch.spec_info, EagleDraftExtendInput)
-        draft_extend_input: EagleDraftExtendInput = batch.spec_info
+        # Install the draft-extend input as `batch.spec_info` for this method's
+        # forward pass. Replaced with a fresh `EagleDraftInput` post-extend.
+        draft_extend_input: EagleDraftExtendInput = verify_output.draft_extend_input
+        batch.spec_info = draft_extend_input
 
         # Backup fields that will be modified in-place
         seq_lens_backup = batch.seq_lens.clone()

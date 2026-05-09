@@ -509,8 +509,12 @@ class FrozenKVMTPWorker(TpModelWorker):
     def forward_draft_extend_after_decode(
         self, batch: ScheduleBatch, verify_output: EagleVerifyOutput
     ) -> None:
-        assert isinstance(batch.spec_info, FrozenKVMTPDraftExtendInput)
-        draft_extend_input: FrozenKVMTPDraftExtendInput = batch.spec_info
+        # Install the draft-extend input as `batch.spec_info` for the seed step.
+        # `_run_assistant_seed_step` will replace it with a fresh
+        # `FrozenKVMTPDraftInput` for the next iter's draft.
+        draft_extend_input = verify_output.draft_extend_input
+        assert isinstance(draft_extend_input, FrozenKVMTPDraftExtendInput)
+        batch.spec_info = draft_extend_input
         input_is_idle = batch.forward_mode.is_idle()
 
         if not input_is_idle and verify_output.unfinished_accept_tokens.numel() == 0:
@@ -776,7 +780,6 @@ class FrozenKVMTPWorker(TpModelWorker):
         batch.forward_mode = (
             ForwardMode.DECODE if not batch.forward_mode.is_idle() else ForwardMode.IDLE
         )
-        batch.spec_info = res.draft_extend_input
 
         del seq_lens_pre_verify
         return logits_output, res, model_worker_batch, can_run_cuda_graph
