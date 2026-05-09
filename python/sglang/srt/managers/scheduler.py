@@ -349,6 +349,9 @@ class Scheduler(
         dp_rank: Optional[int],
     ):
         self.is_initializing = True
+        # init_soft_watchdog starts a daemon thread that reads these on its first tick.
+        self.forward_ct: int = 0
+        self.cur_batch: Optional[ScheduleBatch] = None
         self.init_soft_watchdog(server_args)
 
         # Parse args
