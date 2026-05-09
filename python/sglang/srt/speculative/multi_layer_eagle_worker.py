@@ -317,20 +317,11 @@ class MultiLayerEagleWorker(TpModelWorker):
                     )
 
                 if next_draft_input is None:
-                    # Skipped the extend forward (no dp_attention + all reqs
-                    # finished). batch.spec_info is still the verify_input;
-                    # install an idle EagleDraftInput so the scheduler's unified
-                    # relay installs a mergeable spec_info next iter.
-                    hidden_size = (
-                        self.model_config.hidden_size * 3
-                        if self.speculative_algorithm.is_eagle3()
-                        else self.model_config.hidden_size
-                    )
-                    next_draft_input = EagleDraftInput.create_idle_input(
-                        device=self.device,
-                        hidden_size=hidden_size,
-                        dtype=self.model_config.dtype,
-                        topk=self.topk,
+                    # Skipped the extend forward. Empty EagleDraftInput so
+                    # merge_batch can short-circuit on None hidden_states
+                    # (avoids shape mismatch with running_batch that carries
+                    # an EAGLE3 aux-hidden-state layout).
+                    next_draft_input = EagleDraftInput(
                         capture_hidden_mode=CaptureHiddenMode.LAST,
                     )
 

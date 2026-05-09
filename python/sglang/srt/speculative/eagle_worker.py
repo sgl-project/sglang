@@ -543,20 +543,16 @@ class EAGLEWorker(TpModelWorker):
                 if next_draft_input is None:
                     # Skipped the extend forward (no dp_attention + all reqs
                     # finished). batch.spec_info is still the verify_input from
-                    # before verify; replace with an idle EagleDraftInput so
+                    # before verify; replace with an empty EagleDraftInput so
                     # the scheduler's unified relay installs a mergeable
                     # spec_info (EagleVerifyInput has no merge_batch).
-                    hidden_size = (
-                        self.model_config.hidden_size * 3
-                        if self.speculative_algorithm.is_eagle3()
-                        and self.eagle_use_aux_hidden_state
-                        else self.model_config.spec_hidden_size
-                    )
-                    next_draft_input = EagleDraftInput.create_idle_input(
-                        device=self.device,
-                        hidden_size=hidden_size,
-                        dtype=self.model_config.dtype,
-                        topk=self.topk,
+                    #
+                    # Leave hidden_states/bonus_tokens/topk_* as None so the
+                    # downstream `EagleDraftInput.merge_batch` short-circuits
+                    # at the `if spec_info.hidden_states is None: return` guard,
+                    # avoiding a hidden_states shape mismatch when running_batch
+                    # carries an EAGLE3 aux-hidden-state layout (3*hidden_size).
+                    next_draft_input = EagleDraftInput(
                         capture_hidden_mode=CaptureHiddenMode.LAST,
                     )
 
