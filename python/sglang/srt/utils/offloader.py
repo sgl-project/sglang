@@ -1,7 +1,7 @@
 import logging
 import os
 from abc import ABC
-from typing import Callable, Generator, List, Optional
+from typing import Callable, Generator, List, Optional, Set
 
 import torch
 from torch.func import functional_call
@@ -45,6 +45,45 @@ class BaseOffloader(ABC):
 
 class NoopOffloader(BaseOffloader):
     pass
+
+
+def _duplicate_state_dict_aliases(module: torch.nn.Module) -> Set[str]:
+    duplicate_names = set()
+    seen_tensors = set()
+
+    for name, tensor in module.named_parameters(remove_duplicate=False):
+        tensor_id = id(tensor)
+        if tensor_id in seen_tensors:
+            duplicate_names.add(name)
+        else:
+            seen_tensors.add(tensor_id)
+
+    try:
+        named_buffers = module.named_buffers(remove_duplicate=False)
+    except TypeError:
+        named_buffers = module.named_buffers()
+
+    for name, tensor in named_buffers:
+        tensor_id = id(tensor)
+        if tensor_id in seen_tensors:
+            duplicate_names.add(name)
+        else:
+            seen_tensors.add(tensor_id)
+
+    return duplicate_names
+
+
+def _make_functional_call_state(
+    module: torch.nn.Module, device: torch.device
+) -> dict[str, torch.Tensor]:
+    duplicate_names = _duplicate_state_dict_aliases(module)
+    return {
+        # here we blindly call `to(device)`
+        # if the parameter is already on the device, it will be a no-op
+        k: v.to(device, non_blocking=True)
+        for k, v in module.state_dict().items()
+        if k not in duplicate_names
+    }
 
 
 # For simplicity use singleton, but can surely support multi instance
@@ -135,12 +174,7 @@ class OffloaderV1(BaseOffloader):
 
             def forward(*args, **kwargs):
                 module.forward = original_forward
-                device_state = {
-                    # here we blindly call `to(device)`
-                    # if the parameter is already on the device, it will be a no-op
-                    k: v.to(device, non_blocking=True)
-                    for k, v in module.state_dict().items()
-                }
+                device_state = _make_functional_call_state(module, device)
                 output = functional_call(module, device_state, args=args, kwargs=kwargs)
                 module.forward = forward
                 return output
