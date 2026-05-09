@@ -807,21 +807,15 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         # these defaults; if other models start using flashinfer_mxfp4 on SM90,
         # plumb these through `moe_runner_config.gemm1_alpha` etc.
         layer.swiglu_alpha = Parameter(
-            torch.full(
-                (self.num_experts,), 1.702, dtype=torch.float32, device="cuda"
-            ),
+            torch.full((self.num_experts,), 1.702, dtype=torch.float32, device="cuda"),
             requires_grad=False,
         )
         layer.swiglu_beta = Parameter(
-            torch.full(
-                (self.num_experts,), 1.0, dtype=torch.float32, device="cuda"
-            ),
+            torch.full((self.num_experts,), 1.0, dtype=torch.float32, device="cuda"),
             requires_grad=False,
         )
         layer.swiglu_limit = Parameter(
-            torch.full(
-                (self.num_experts,), 7.0, dtype=torch.float32, device="cuda"
-            ),
+            torch.full((self.num_experts,), 7.0, dtype=torch.float32, device="cuda"),
             requires_grad=False,
         )
 
@@ -829,9 +823,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         w13_il = interleave_moe_weights_for_sm90_mixed_gemm(
             layer.w13_weight.data, "fp4"
         )
-        w2_il = interleave_moe_weights_for_sm90_mixed_gemm(
-            layer.w2_weight.data, "fp4"
-        )
+        w2_il = interleave_moe_weights_for_sm90_mixed_gemm(layer.w2_weight.data, "fp4")
         # Reshape+permute the E8M0 block scales (pure PyTorch).
         w13_s_il = interleave_moe_scales_for_sm90_mixed_gemm(
             layer.w13_weight_scale.data, group_size=sf_block_size

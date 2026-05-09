@@ -22,9 +22,10 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass
-from typing import Callable, List, Optional, Tuple
+from typing import Callable, List, Tuple
 
 import torch
+from flashinfer.autotuner import autotune
 
 # ---- FlashInfer ----
 from flashinfer.fused_moe import (
@@ -33,7 +34,6 @@ from flashinfer.fused_moe import (
     interleave_moe_weights_for_sm90_mixed_gemm,
 )
 from flashinfer.fused_moe.core import ActivationType
-from flashinfer.autotuner import autotune
 
 # ---- SGLang Marlin ----
 from sglang.jit_kernel.gptq_marlin_repack import gptq_marlin_repack
@@ -92,27 +92,44 @@ def _make_random_mxfp4(shape: Shape, seed: int = 0):
     )
     # Narrow E8M0 band so dequant magnitudes stay sane.
     w13_s = torch.randint(
-        125, 130, (e, 2 * n, k // GROUP_SIZE),
-        dtype=torch.uint8, device="cuda", generator=g,
+        125,
+        130,
+        (e, 2 * n, k // GROUP_SIZE),
+        dtype=torch.uint8,
+        device="cuda",
+        generator=g,
     )
     w2_s = torch.randint(
-        125, 130, (e, k, n // GROUP_SIZE),
-        dtype=torch.uint8, device="cuda", generator=g,
+        125,
+        130,
+        (e, k, n // GROUP_SIZE),
+        dtype=torch.uint8,
+        device="cuda",
+        generator=g,
     )
-    w13_b = torch.randn(
-        e, 2 * n, dtype=torch.float32, device="cuda", generator=g
-    ).to(torch.bfloat16) * 0.01
-    w2_b = torch.randn(
-        e, k, dtype=torch.float32, device="cuda", generator=g
-    ).to(torch.bfloat16) * 0.01
+    w13_b = (
+        torch.randn(e, 2 * n, dtype=torch.float32, device="cuda", generator=g).to(
+            torch.bfloat16
+        )
+        * 0.01
+    )
+    w2_b = (
+        torch.randn(e, k, dtype=torch.float32, device="cuda", generator=g).to(
+            torch.bfloat16
+        )
+        * 0.01
+    )
     return w13, w2, w13_s, w2_s, w13_b, w2_b
 
 
 def _make_topk(shape: Shape, seed: int = 1):
     g = torch.Generator(device="cuda").manual_seed(seed)
     logits = torch.randn(
-        shape.tokens, shape.num_experts,
-        dtype=torch.float32, device="cuda", generator=g,
+        shape.tokens,
+        shape.num_experts,
+        dtype=torch.float32,
+        device="cuda",
+        generator=g,
     )
     weights, ids = torch.topk(torch.softmax(logits, dim=-1), shape.top_k, dim=-1)
     weights = weights / weights.sum(dim=-1, keepdim=True)
@@ -124,9 +141,7 @@ def _make_topk(shape: Shape, seed: int = 1):
 # ---------------------------------------------------------------------------
 
 
-def build_flashinfer_inputs(
-    shape: Shape, w13, w2, w13_s, w2_s, w13_b, w2_b
-):
+def build_flashinfer_inputs(shape: Shape, w13, w2, w13_s, w2_s, w13_b, w2_b):
     w13_il = interleave_moe_weights_for_sm90_mixed_gemm(w13, "fp4")
     w2_il = interleave_moe_weights_for_sm90_mixed_gemm(w2, "fp4")
     w13_s_il = interleave_moe_scales_for_sm90_mixed_gemm(w13_s, group_size=GROUP_SIZE)
@@ -150,9 +165,7 @@ def build_flashinfer_inputs(
 def make_flashinfer_runner(
     shape: Shape, prep, x, topk_w, topk_i, autotuned: bool, with_bias: bool = True
 ):
-    out = torch.empty(
-        shape.tokens, shape.hidden, dtype=torch.bfloat16, device="cuda"
-    )
+    out = torch.empty(shape.tokens, shape.hidden, dtype=torch.bfloat16, device="cuda")
     fc1_b = prep["w13_b"] if with_bias else None
     fc2_b = prep["w2_b"] if with_bias else None
 
@@ -286,9 +299,10 @@ def run_one_shape(shape: Shape, run_marlin: bool):
     print(f"\n=== {shape.label()} ===")
     w13, w2, w13_s, w2_s, w13_b, w2_b = _make_random_mxfp4(shape, seed=0)
     router_logits, topk_w, topk_i = _make_topk(shape, seed=1)
-    x = torch.randn(
-        shape.tokens, shape.hidden, dtype=torch.bfloat16, device="cuda"
-    ) * 0.1
+    x = (
+        torch.randn(shape.tokens, shape.hidden, dtype=torch.bfloat16, device="cuda")
+        * 0.1
+    )
 
     # FlashInfer cutlass (autotune ON, with bias).
     fi_prep = build_flashinfer_inputs(shape, w13, w2, w13_s, w2_s, w13_b, w2_b)
@@ -318,7 +332,9 @@ def run_one_shape(shape: Shape, run_marlin: bool):
     if run_marlin:
         try:
             ml_prep = build_marlin_inputs(shape, w13, w2, w13_s, w2_s)
-            ml_call = make_marlin_runner(shape, ml_prep, x, router_logits, topk_w, topk_i)
+            ml_call = make_marlin_runner(
+                shape, ml_prep, x, router_logits, topk_w, topk_i
+            )
             ml_med, ml_min = time_call(ml_call)
             print(
                 f"  SGLang Marlin:                     median={ml_med:.3f} ms  "

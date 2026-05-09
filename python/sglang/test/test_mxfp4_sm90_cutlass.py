@@ -44,7 +44,6 @@ from flashinfer.fused_moe import (
 )
 from flashinfer.fused_moe.core import ActivationType
 
-
 GROUP_SIZE = 32  # MXFP4 block size
 
 
@@ -217,7 +216,9 @@ def test_apply_sm90_cutlass_matches_flashinfer_direct(
 
     # Bypass the symmetric-memory / TP-group stack: not relevant to numerics
     # and requires distributed init we don't have here.
-    monkeypatch.setattr(mxfp4_mod, "use_symmetric_memory", lambda *a, **kw: nullcontext())
+    monkeypatch.setattr(
+        mxfp4_mod, "use_symmetric_memory", lambda *a, **kw: nullcontext()
+    )
     monkeypatch.setattr(mxfp4_mod, "is_allocation_symmetric", lambda: False)
     monkeypatch.setattr(mxfp4_mod, "get_tp_group", lambda: None)
 
@@ -269,6 +270,177 @@ def test_apply_sm90_cutlass_matches_flashinfer_direct(
         f"SGLang vs FlashInfer-direct mismatch; "
         f"max abs diff = {(out_sglang.float() - out_ref.float()).abs().max().item():.4g}"
     )
+
+
+# =============================================================================
+# DeepSeek-V4 path: Mxfp4FlashinferCutlassMoEMethod (sibling of Marlin /
+# trtllm-gen). Wired into fp8.py's get_quant_method when SM90 +
+# is_flashinfer_mxfp4 + is_fp4_experts.
+# =============================================================================
+
+
+def _make_random_dsv4_mxfp4(num_experts, hidden, inter, seed=0):
+    """Mirrors the fp8 base method's allocation for fp4 experts: int8-packed
+    4-bit weights, fp32 scales (containing 2**e values, not raw E8M0 bytes)."""
+    g = torch.Generator(device="cuda").manual_seed(seed)
+    # int8 storage (signed) -- matches Fp8MoEMethod.create_weights for fp4_experts.
+    w13 = torch.randint(
+        -128,
+        128,
+        (num_experts, 2 * inter, hidden // 2),
+        dtype=torch.int8,
+        device="cuda",
+        generator=g,
+    )
+    w2 = torch.randint(
+        -128,
+        128,
+        (num_experts, hidden, inter // 2),
+        dtype=torch.int8,
+        device="cuda",
+        generator=g,
+    )
+    # fp32 scales whose bit pattern after .to(float8_e8m0fnu).view(uint8) lands
+    # in a sane E8M0 band -- generate exponents around 0 (= 2**0).
+    raw_e = torch.randint(
+        125,
+        130,
+        (num_experts, 2 * inter, hidden // GROUP_SIZE),
+        dtype=torch.uint8,
+        device="cuda",
+        generator=g,
+    )
+    raw_e2 = torch.randint(
+        125,
+        130,
+        (num_experts, hidden, inter // GROUP_SIZE),
+        dtype=torch.uint8,
+        device="cuda",
+        generator=g,
+    )
+    w13_s = raw_e.view(torch.float8_e8m0fnu).to(torch.float32)
+    w2_s = raw_e2.view(torch.float8_e8m0fnu).to(torch.float32)
+    return w13, w2, w13_s, w2_s
+
+
+@pytest.mark.parametrize(
+    "tokens,num_experts,hidden,inter,top_k",
+    [
+        (4, 4, 256, 256, 2),
+        (16, 8, 768, 384, 2),
+        (256, 8, 1024, 1024, 4),
+    ],
+)
+def test_dsv4_apply_matches_flashinfer_direct(
+    tokens, num_experts, hidden, inter, top_k, monkeypatch
+):
+    """End-to-end: SGLang's DSv4 ``Mxfp4FlashinferCutlassMoEMethod.apply``
+    output must match a direct FlashInfer ``cutlass_fused_moe`` call with
+    the equivalent reorder + scale-cast + interleave applied manually."""
+    from types import SimpleNamespace
+
+    import sglang.srt.layers.quantization.mxfp4_flashinfer_cutlass_moe as ds_mod
+    from sglang.srt.layers.quantization.utils import reorder_w1w3_to_w3w1
+
+    # Bypass symmetric-memory / TP-group stack -- not relevant to numerics.
+    monkeypatch.setattr(ds_mod, "use_symmetric_memory", lambda *a, **kw: nullcontext())
+    monkeypatch.setattr(ds_mod, "is_allocation_symmetric", lambda: False)
+    monkeypatch.setattr(ds_mod, "get_tp_group", lambda: None)
+
+    w13, w2, w13_s, w2_s = _make_random_dsv4_mxfp4(num_experts, hidden, inter)
+    x = torch.randn(tokens, hidden, dtype=torch.bfloat16, device="cuda") * 0.1
+    topk_w, topk_i = _make_topk(tokens, num_experts, top_k)
+
+    # ---- SGLang DSv4 path ----
+    method = ds_mod.Mxfp4FlashinferCutlassMoEMethod.__new__(
+        ds_mod.Mxfp4FlashinferCutlassMoEMethod
+    )
+    method._fp8 = SimpleNamespace(
+        process_weights_after_loading=lambda layer: None,
+    )
+    method.prefix = "test"
+    method._swiglu_limit_tensor = None  # plain SiLU * up
+
+    layer = _MockLayer()
+    layer.w13_weight = torch.nn.Parameter(w13.clone(), requires_grad=False)
+    layer.w2_weight = torch.nn.Parameter(w2.clone(), requires_grad=False)
+    layer.w13_weight_scale_inv = torch.nn.Parameter(w13_s.clone(), requires_grad=False)
+    layer.w2_weight_scale_inv = torch.nn.Parameter(w2_s.clone(), requires_grad=False)
+    layer.num_local_experts = num_experts
+    layer.moe_tp_size = 1
+    layer.moe_tp_rank = 0
+    layer.moe_ep_size = 1
+    layer.moe_ep_rank = 0
+
+    method.process_weights_after_loading(layer)
+
+    out_sglang = method.apply(
+        layer, _MockDispatchOutput(x.clone(), topk_w, topk_i)
+    ).hidden_states
+
+    # ---- Direct FlashInfer reference ----
+    w13_re, w13_s_re = reorder_w1w3_to_w3w1(w13, w13_s)
+    w13_s_u8 = w13_s_re.to(torch.float8_e8m0fnu).view(torch.uint8).contiguous()
+    w2_s_u8 = w2_s.to(torch.float8_e8m0fnu).view(torch.uint8).contiguous()
+    ref_w13 = interleave_moe_weights_for_sm90_mixed_gemm(
+        w13_re.view(torch.uint8).contiguous(), "fp4"
+    )
+    ref_w2 = interleave_moe_weights_for_sm90_mixed_gemm(
+        w2.view(torch.uint8).contiguous(), "fp4"
+    )
+    ref_w13_s = interleave_moe_scales_for_sm90_mixed_gemm(
+        w13_s_u8, group_size=GROUP_SIZE
+    )
+    ref_w2_s = interleave_moe_scales_for_sm90_mixed_gemm(w2_s_u8, group_size=GROUP_SIZE)
+
+    out_ref = torch.empty(tokens, hidden, dtype=torch.bfloat16, device="cuda")
+    cutlass_fused_moe(
+        input=x.clone(),
+        token_selected_experts=topk_i,
+        token_final_scales=topk_w,
+        fc1_expert_weights=ref_w13,
+        fc2_expert_weights=ref_w2,
+        output_dtype=torch.bfloat16,
+        quant_scales=[ref_w13_s.view(torch.int32), ref_w2_s.view(torch.int32)],
+        fc1_expert_biases=None,
+        fc2_expert_biases=None,
+        swiglu_alpha=None,
+        swiglu_beta=None,
+        swiglu_limit=None,
+        use_w4_group_scaling=True,
+        activation_type=ActivationType.Swiglu,
+        output=out_ref,
+    )
+
+    assert torch.equal(out_sglang, out_ref), (
+        f"DSv4 SGLang vs FlashInfer-direct mismatch; "
+        f"max abs diff = "
+        f"{(out_sglang.float() - out_ref.float()).abs().max().item():.4g}"
+    )
+
+
+class _MockDispatchOutput:
+    """Stand-in for StandardDispatchOutput. ``topk_output`` is a real
+    ``StandardTopKOutput`` so ``TopKOutputChecker.format_is_standard``
+    (an isinstance check) returns True without distributed init."""
+
+    def __init__(self, hidden_states, topk_weights, topk_ids):
+        from sglang.srt.layers.moe.topk import StandardTopKOutput
+
+        self.hidden_states = hidden_states
+        # router_logits is unused by Mxfp4FlashinferCutlassMoEMethod.apply;
+        # supply a placeholder of the right shape to keep the NamedTuple happy.
+        router_logits = torch.zeros(
+            topk_ids.shape[0],
+            int(topk_ids.max().item()) + 1 if topk_ids.numel() else 1,
+            dtype=torch.float32,
+            device=topk_ids.device,
+        )
+        self.topk_output = StandardTopKOutput(
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            router_logits=router_logits,
+        )
 
 
 if __name__ == "__main__":
