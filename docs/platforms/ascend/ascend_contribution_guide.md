@@ -90,12 +90,10 @@ Users with permission are listed in the [CI_PERMISSIONS.json](https://github.com
 
 For CI to run on a pull request, it must have the "run-ci" label. Authorized users can add the label or rerun failed tests by commenting on the PR with one of these commands:
 
-- `/tag-run-ci-label`: Adds the "run-ci" label. By itself, this only causes **future** commits to trigger CI; existing skipped workflow runs on the current commit are not retried.
-- `/rerun-failed-ci`: Reruns workflows from the latest commit that finished as **failed, flaky, or skipped**.
-- `/tag-and-rerun-ci`: A single command that performs both `/tag-run-ci-label` and `/rerun-failed-ci`. This is the standard way to kick off CI on the current commit when the PR did not have the `run-ci` label when it was pushed — adding the label alone does nothing for the current commit, but the rerun then picks up the now-skipped workflow runs and re-dispatches them with the label in place.
-- `/rerun-stage <stage-name>`: Reruns a specific test stage without waiting for its dependencies. This is useful when you want to quickly validate a fix for a specific test failure instead of waiting ~30 minutes for preceding stages to complete.
-
-> **Tip:** Just opened a fresh PR and want CI to run on the latest commit? Comment `/tag-and-rerun-ci`. `/tag-run-ci-label` alone won't run anything until you push another commit.
+- `/tag-run-ci-label`: Adds the "run-ci" label. Only **future** commits trigger CI; the current commit is unaffected.
+- `/rerun-failed-ci`: Reruns workflows from the latest commit with conclusion **failed, flaky, or skipped**.
+- `/tag-and-rerun-ci`: Runs both. Use this on a fresh PR to kick off CI on the current commit — `/tag-run-ci-label` alone won't.
+- `/rerun-stage <stage-name>`: Reruns a single test stage without waiting for its dependencies. Useful for quickly validating a specific test fix instead of waiting ~30 minutes for preceding stages.
 
 If you have permission, the [Slash Command Handler](https://github.com/sgl-project/sglang/actions/workflows/slash-command-handler.yml) will run your command and react with a 👍 to your comment. It may take up to a few minutes for the reaction to appear. Here’s a usage [example](https://github.com/sgl-project/sglang/pull/14253#issuecomment-3599509302).
 
