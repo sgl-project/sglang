@@ -124,11 +124,17 @@ if [ "$INSTALL_DEEPEP" = "1" ]; then
     rm -rf ${DEEPEP_DIR}
     if [ "$BLACKWELL" = "1" ]; then
         # We use Tom's DeepEP fork for Blackwell for now, which supports fp4 dispatch.
+        # Also force-disable the CU_MEM_HANDLE_TYPE_FABRIC path: Blackwell GPUs report
+        # fabric capability via the device attribute, but cuMemCreate fails with
+        # CUDA_ERROR_NOT_PERMITTED on standalone B200 runners that don't have the
+        # NVIDIA fabric manager + IMEX channels set up (those are GB200 NVL72-only).
+        # The non-fabric cudaIpc* fallback in the same file is correctness-safe.
         BLACKWELL_DEEPEP_BRANCH=gb200_blog_part_2
         git clone https://github.com/fzyzcjy/DeepEP.git ${DEEPEP_DIR} && \
         pushd ${DEEPEP_DIR} && \
         git checkout ${BLACKWELL_DEEPEP_BRANCH} && \
         sed -i 's/#define NUM_CPU_TIMEOUT_SECS 100/#define NUM_CPU_TIMEOUT_SECS 1000/' csrc/kernels/configs.cuh && \
+        sed -i 's/^bool support_fabric() {$/bool support_fabric() { return false;/' csrc/deep_ep.cpp && \
         popd
     else
         git clone https://github.com/deepseek-ai/DeepEP.git ${DEEPEP_DIR} && \
