@@ -1,3 +1,9 @@
+"""Nightly: TP=2 EP=2 with FP8 + DeepGEMM MoE backend.
+
+Sibling per-commit file (test_moe_ep.py) keeps the baseline TP=2 EP=2
+variant.
+"""
+
 import unittest
 from types import SimpleNamespace
 
@@ -12,12 +18,15 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-# Per-commit: TP=2 EP=2 baseline.
-# DeepGEMM/FP8 variant moved to test_moe_ep_nightly.py.
-register_cuda_ci(est_time=140, suite="stage-b-test-2-gpu-large")
+register_cuda_ci(
+    est_time=140,
+    suite="nightly-2-gpu",
+    nightly=True,
+    tags=("moe", "quant"),
+)
 
 
-class TestEp(CustomTestCase):
+class TestEpDeepGEMM(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         cls.model = DEFAULT_MODEL_NAME_FOR_TEST_MLA
@@ -32,6 +41,10 @@ class TestEp(CustomTestCase):
                 "2",
                 "--ep-size",
                 "2",
+                "--quantization",
+                "fp8",
+                "--moe-runner-backend",
+                "deep_gemm",
             ],
         )
 
