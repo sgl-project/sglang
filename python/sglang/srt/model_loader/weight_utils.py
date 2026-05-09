@@ -1035,6 +1035,7 @@ def buffered_multi_thread_safetensors_weights_iterator(
     disable_mmap: bool = False,
     prefetch: bool = False,
     prefetch_num_threads: int = 4,
+    drop_cache_after_load: bool = False,
 ) -> Generator[Tuple[str, torch.Tensor], None, None]:
     """Multi-threaded safetensor loader with bounded memory via a sliding window.
 
