@@ -138,12 +138,15 @@ def mhc_pre_big_fuse_tilelang(
     sinkhorn_repeat: int,
     n_splits: int = 16,
     hc_mult: int = 4,
+    gemm_last_dim: int = -1,
 ):
     num_tokens = T.dynamic("num_tokens")
     hc_mult3 = hc_mult * (2 + hc_mult)
+    if gemm_last_dim < 0:
+        gemm_last_dim = hc_mult3
     hidden_block = math.gcd(512, hidden_size)
 
-    gemm_out_mul: T.Tensor[[n_splits, num_tokens, hc_mult3], T.float32]
+    gemm_out_mul: T.Tensor[[n_splits, num_tokens, gemm_last_dim], T.float32]
     gemm_out_sqrsum: T.Tensor[[n_splits, num_tokens], T.float32]
     hc_scale: T.Tensor[[3], T.float32]
     hc_base: T.Tensor[[hc_mult3], T.float32]
@@ -484,13 +487,6 @@ def mhc_pre(
         num_tokens, hidden_size, dtype=torch.bfloat16, device=residual.device
     )
 
-    gemm_out_mul = torch.empty(
-        n_splits, num_tokens, hc_mult3, dtype=torch.float32, device=residual.device
-    )
-    gemm_out_sqrsum = torch.empty(
-        n_splits, num_tokens, dtype=torch.float32, device=residual.device
-    )
-
     if num_tokens <= 2048:
         assert n_splits == 1
         if hc_hidden_size == 16384:
@@ -502,29 +498,37 @@ def mhc_pre(
                 f"mhc_pre splitk kernel only supports hc_hidden_size in {{16384, 28672}}, "
                 f"got {hc_hidden_size}"
             )
-        kernel_0, kernel_1 = mhc_pre_gemm_sqrsum_splitk_kernel(
+        kernel_0, _ = mhc_pre_gemm_sqrsum_splitk_kernel(
             hc_mult3,
             hc_hidden_size,
             split_k=n_splits_pre,
             token_block=32,
             hidden_block=hidden_block,
         )
-        partial_out = gemm_out_mul.new_empty(n_splits_pre, num_tokens, 32)
-        partial_sqrsum = gemm_out_sqrsum.new_empty(n_splits_pre, num_tokens)
+        partial_out = torch.empty(
+            n_splits_pre, num_tokens, 32, dtype=torch.float32, device=residual.device
+        )
+        partial_sqrsum = torch.empty(
+            n_splits_pre, num_tokens, dtype=torch.float32, device=residual.device
+        )
         kernel_0(
             residual_flat.view(num_tokens, hc_hidden_size),
             fn_flat,
             partial_out,
             partial_sqrsum,
         )
-        kernel_1(
-            partial_out,
-            partial_sqrsum,
-            gemm_out_mul.squeeze(0),
-            gemm_out_sqrsum.squeeze(0),
-        )
-        del partial_out, partial_sqrsum
+        # Stage_1 reduction is folded into big_fuse below; skip launching it.
+        gemm_out_mul = partial_out
+        gemm_out_sqrsum = partial_sqrsum
+        gemm_last_dim = 32
+        big_fuse_n_splits = n_splits_pre
     else:
+        gemm_out_mul = torch.empty(
+            n_splits, num_tokens, hc_mult3, dtype=torch.float32, device=residual.device
+        )
+        gemm_out_sqrsum = torch.empty(
+            n_splits, num_tokens, dtype=torch.float32, device=residual.device
+        )
         assert (
             n_splits == 1
         ), "The simple TileLang version gemm_sqrsum doesn't support split-k"
@@ -536,6 +540,8 @@ def mhc_pre(
             hc_mult3,
             hc_mult * hidden_size,
         )
+        gemm_last_dim = hc_mult3
+        big_fuse_n_splits = n_splits
 
     mhc_pre_big_fuse_tilelang(
         gemm_out_mul,
@@ -552,8 +558,9 @@ def mhc_pre(
         hc_sinkhorn_eps,
         hc_post_mult_value,
         sinkhorn_repeat,
-        n_splits,
+        big_fuse_n_splits,
         hc_mult,
+        gemm_last_dim,
     )
 
     post_mix = post_mix.view(*outer_shape, hc_mult, 1)
