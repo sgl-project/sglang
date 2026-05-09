@@ -481,13 +481,15 @@ class EAGLEWorker(TpModelWorker):
             with self.draft_tp_context(
                 self.draft_model_runner.tp_group
             ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
-                spec_info = self.draft(batch)
+                verify_input = self.draft(batch)
 
             set_time_batch(batch.reqs, "set_spec_draft_end_time", trace_only=True)
             set_time_batch(batch.reqs, "set_spec_verify_start_time", trace_only=True)
 
+            # Install verify_input as `batch.spec_info` for the verify forward.
+            batch.spec_info = verify_input
             logits_output, verify_output, model_worker_batch, can_run_cuda_graph = (
-                self.verify(batch, spec_info)
+                self.verify(batch, verify_input)
             )
 
             if get_global_tracing_enabled():
@@ -509,6 +511,10 @@ class EAGLEWorker(TpModelWorker):
                     or verify_output.unfinished_accept_tokens.shape[0] > 0
                 ):
                     # decode is not finished
+                    # Install draft_extend_input as `batch.spec_info` for the
+                    # draft-extend forward (replaced post-extend with a fresh
+                    # EagleDraftInput by `forward_draft_extend_after_decode`).
+                    batch.spec_info = verify_output.draft_extend_input
                     self.forward_draft_extend_after_decode(batch, verify_output)
 
             set_time_batch(
@@ -894,6 +900,9 @@ class EAGLEWorker(TpModelWorker):
         pass
 
     def verify(self, batch: ScheduleBatch, spec_info: EagleVerifyInput):
+        # Caller (forward_batch_generation) is responsible for installing
+        # `spec_info` as `batch.spec_info` before calling.
+        assert batch.spec_info is spec_info
         seq_lens_pre_verify = batch.seq_lens.clone()
         spec_info.prepare_for_verify(batch, self.page_size)
         spec_info.num_tokens_per_req = self.speculative_num_steps + 1
@@ -903,7 +912,6 @@ class EAGLEWorker(TpModelWorker):
             if not batch.forward_mode.is_idle()
             else ForwardMode.IDLE
         )
-        batch.spec_info = spec_info
 
         model_worker_batch = batch.get_model_worker_batch(
             seq_lens_cpu_cache=spec_info.seq_lens_cpu
@@ -1109,10 +1117,11 @@ class EAGLEWorker(TpModelWorker):
     def forward_draft_extend_after_decode(
         self, batch: ScheduleBatch, verify_output: EagleVerifyOutput
     ):
-        # Install the draft-extend input as `batch.spec_info` for this method's
-        # forward pass. Replaced with a fresh `EagleDraftInput` post-extend.
-        draft_extend_input: EagleDraftExtendInput = verify_output.draft_extend_input
-        batch.spec_info = draft_extend_input
+        # Caller (forward_batch_generation) is responsible for installing
+        # verify_output.draft_extend_input as batch.spec_info before calling.
+        draft_extend_input = verify_output.draft_extend_input
+        assert isinstance(draft_extend_input, EagleDraftExtendInput)
+        assert batch.spec_info is draft_extend_input
 
         # Backup fields that will be modified in-place
         seq_lens_backup = batch.seq_lens.clone()
