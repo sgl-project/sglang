@@ -59,22 +59,36 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
+    """Inputs to the verify forward (target model verifies draft tokens).
+
+    All fields are common across V1 and V2 — the shape sits between the two
+    workers and TBO splitter.
+    """
+
+    # === common (V1 + V2) ===
+    # Tree structure consumed by the verify kernel.
     draft_token: torch.Tensor
     custom_mask: torch.Tensor
     positions: torch.Tensor
     retrieve_index: torch.Tensor
     retrieve_next_token: torch.Tensor
     retrieve_next_sibling: torch.Tensor
+    # Optional: filled by TBO `split_spec_info`; None outside TBO.
     retrieve_cum_len: torch.Tensor
+
+    # Per-step config.
     spec_steps: int
     topk: int
     draft_token_num: int
     capture_hidden_mode: CaptureHiddenMode
+
+    # Batch state (read by TBO splitter and cuda-graph runners).
     seq_lens_sum: int
     seq_lens_cpu: torch.Tensor
+
     grammar: BaseGrammarObject = None
 
-    # Shape info for padding
+    # Shape info for padding.
     num_tokens_per_req: int = -1  # -1 auto-fills from draft_token_num.
 
     def __post_init__(self):
@@ -645,29 +659,35 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
 
 @dataclass
 class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
+    """Inputs to the draft forward (proposes draft tokens for next verify)."""
+
+    # === common (V1 + V2) ===
+    # Per-req draft state, consumed by `draft` forward.
     # shape: (b, topk)
     topk_p: torch.Tensor = None
     topk_index: torch.Tensor = None
-    # shape: (b, hidden_size) - one hidden per req, consumed by `draft` forward.
+    # shape: (b, hidden_size) - one hidden per req.
     hidden_states: torch.Tensor = None
     capture_hidden_mode: CaptureHiddenMode = CaptureHiddenMode.FULL
 
     # Per-req bonus token (the "+1" target prediction at end of each accept
-    # chain). Written by `EagleDraftExtendInput.prepare_extend_after_decode`;
-    # the worker copies it here for next iter's draft.
+    # chain). V1: written by `EagleDraftExtendInput.prepare_extend_after_decode`,
+    # then the worker copies it here. V2: set directly during verify.
     bonus_tokens: torch.Tensor = None
 
-    # shape: (b + 1,)
-    kv_indptr: torch.Tensor = None
-    kv_indices: torch.Tensor = None
-
+    # Shape info for padding.
     num_tokens_per_req: int = -1
     num_tokens_for_logprob_per_req: int = -1
 
-    # V2 overlap worker only
+    # === V2 only (overlap scheduling) ===
     future_indices: Optional[FutureIndices] = None
     new_seq_lens: Optional[torch.Tensor] = None
     verify_done: Optional[torch.cuda.Event] = None
+
+    # === V1 only (filled by attention backends; V2 paths leave None) ===
+    # shape: (b + 1,) — populated by flashinfer/wave/aiter backends.
+    kv_indptr: torch.Tensor = None
+    kv_indices: torch.Tensor = None
 
     def __post_init__(self):
         super().__init__(SpecInputType.EAGLE_DRAFT)
@@ -768,44 +788,49 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
 class EagleDraftExtendInput(SpecInput, EagleDraftExtendInputV2Mixin):
     """Inputs to the draft-extend forward (the per-accepted-token pass after verify).
 
-    Produced by `EagleVerifyInput.verify`, installed on `batch.spec_info` for
-    the draft-extend forward, then replaced with a fresh `EagleDraftInput` for
-    the next iter's draft.
+    Produced by `EagleVerifyInput.verify` (V1) or `EagleVerifyInput.sample` (V2),
+    installed on `batch.spec_info` for the draft-extend forward, then replaced
+    with a fresh `EagleDraftInput` for the next iter's draft.
     """
 
-    # shape: (total_accepted, hidden_size). Sliced from verify-time hidden_states
-    # by accept_index; consumed by the draft-extend forward.
+    # === common (V1 + V2) ===
+    # V1: shape (total_accepted, hidden_size), sliced from verify-time
+    #     hidden_states by accept_index.
+    # V2: shape (bs * draft_token_num, hidden_size), full target output (V2
+    #     selects accepted positions later via `select_index`).
     hidden_states: torch.Tensor = None
 
     # Per-req accept counts. `num_accepted_tokens = num_accepted_drafts + 1`.
-    # Both kept for cuda-graph buffer indexing and the
-    # `create_extend_after_decode_spec_info` kernel.
+    # V1: feeds `create_extend_after_decode_spec_info` kernel + cuda-graph
+    #     buffer indexing. V2: feeds attn backend + cuda-graph buffer indexing.
     num_accepted_drafts: torch.Tensor = None
     num_accepted_tokens: torch.Tensor = None
-    # CPU view, read by attention backends during the extend forward.
+
+    capture_hidden_mode: CaptureHiddenMode = CaptureHiddenMode.LAST
+    num_tokens_per_req: int = -1
+    num_tokens_for_logprob_per_req: int = 1
+
+    # === V1 only (some synced via shared cuda-graph / attn backend infra) ===
+    # CPU view of `num_accepted_tokens`. V1 attn backends (flashattention,
+    # trtllm_mha) read it for `max_seq_len_q`; V2 paths leave None.
     num_accepted_tokens_cpu: List[int] = None
 
-    # Batch-state slices for the draft-extend forward. Set by verify (sliced to
-    # reqs continuing into next iter). `prepare_extend_after_decode` copies
-    # these onto `batch.{input_ids, seq_lens, seq_lens_cpu, req_pool_indices}`.
-    #   - input_ids:        accept tokens flat over surviving reqs
-    #   - seq_lens / _cpu:  per-req sequence length (post-accept)
-    #   - req_pool_indices: per-req kv-pool slot
+    # Batch-state slices for the draft-extend forward. V1 verify produces;
+    # `prepare_extend_after_decode` copies onto `batch.{input_ids, seq_lens,
+    # seq_lens_cpu, req_pool_indices}`. V2 manages batch fields directly via
+    # `prepare_for_extend_to_fill_draft_kvcache`, so leaves these None.
     input_ids: torch.Tensor = None
     seq_lens: torch.Tensor = None
     seq_lens_cpu: torch.Tensor = None
     req_pool_indices: torch.Tensor = None
 
-    # Set by `prepare_extend_after_decode`:
+    # Set by V1's `prepare_extend_after_decode` kernel; also written by the
+    # shared cuda-graph runner before replay (so V2 may see them populated).
     #   - positions: kernel-written, shape `[total_accepted]`.
-    #   - bonus_tokens: kernel-written, shape `[bs]`. The worker reads this
+    #   - bonus_tokens: kernel-written, shape `[bs]`. The V1 worker reads it
     #     post-extend to populate next iter's `EagleDraftInput.bonus_tokens`.
     positions: Optional[torch.Tensor] = None
     bonus_tokens: Optional[torch.Tensor] = None
-
-    capture_hidden_mode: CaptureHiddenMode = CaptureHiddenMode.LAST
-    num_tokens_per_req: int = -1
-    num_tokens_for_logprob_per_req: int = 1
 
     def __post_init__(self):
         super().__init__(SpecInputType.EAGLE_DRAFT_EXTEND)
