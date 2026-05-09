@@ -240,15 +240,14 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
         accepted token logits.
         """
         if batch.forward_mode.is_idle():
-            next_draft_input = EagleDraftInput.create_idle_input(
+            extend_input = EagleDraftExtendInput.create_idle_input(
                 device=batch.device,
                 hidden_size=batch.model_config.spec_hidden_size,
                 dtype=batch.model_config.dtype,
-                topk=self.topk,
                 capture_hidden_mode=CaptureHiddenMode.LAST,
             )
             return EagleVerifyOutput.create_idle(
-                next_draft_input=next_draft_input,
+                extend_input=extend_input,
                 logits_output=logits_output,
                 device=batch.device,
                 spec_steps=self.spec_steps,
@@ -545,7 +544,7 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
             batch.seq_lens.add_(num_accepted_drafts + 1)
             batch.seq_lens_cpu.add_(num_accepted_tokens_cpu)
 
-            next_draft_input = EagleDraftInput(
+            extend_input = EagleDraftExtendInput(
                 hidden_states=batch.spec_info.hidden_states[accept_index],
                 num_accepted_drafts=num_accepted_drafts,
                 num_accepted_tokens=num_accepted_drafts + 1,
@@ -553,7 +552,7 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
             )
 
             return EagleVerifyOutput(
-                next_draft_input=next_draft_input,
+                extend_input=extend_input,
                 logits_output=logits_output,
                 accept_tokens=accept_tokens,
                 unfinished_accept_tokens=accept_tokens,
@@ -620,7 +619,7 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                 req_pool_indices_for_draft_extend = batch.req_pool_indices[
                     unfinished_index_device
                 ]
-                next_draft_input = EagleDraftInput(
+                extend_input = EagleDraftExtendInput(
                     hidden_states=batch.spec_info.hidden_states[
                         unfinished_accept_index
                     ],
@@ -643,16 +642,15 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                     dtype=batch.req_pool_indices.dtype,
                     device=batch.req_pool_indices.device,
                 )
-                next_draft_input = EagleDraftInput.create_idle_input(
+                extend_input = EagleDraftExtendInput.create_idle_input(
                     device=batch.device,
                     hidden_size=batch.model_config.spec_hidden_size,
                     dtype=batch.model_config.dtype,
-                    topk=self.topk,
                     capture_hidden_mode=CaptureHiddenMode.LAST,
                 )
 
             return EagleVerifyOutput(
-                next_draft_input=next_draft_input,
+                extend_input=extend_input,
                 logits_output=logits_output,
                 accept_tokens=accept_tokens,
                 unfinished_accept_tokens=unfinished_accept_tokens,
@@ -677,17 +675,10 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
     hidden_states: torch.Tensor = None
     capture_hidden_mode: CaptureHiddenMode = CaptureHiddenMode.FULL
 
-    # Inputs for extend
-    # shape: (b,)
-    # `num_accepted_drafts` and `num_accepted_tokens` are kept in sync:
-    # `num_accepted_tokens = num_accepted_drafts + 1` (per-req, one bonus per req).
-    # Storing both avoids repeated `+ 1` at every consumer (attn backends, kernels).
+    # Per-req bonus token (the "+1" target prediction at the end of each accept
+    # chain). Set by `EagleDraftExtendInput.prepare_extend_after_decode`'s kernel
+    # via the worker's post-extend assembly.
     bonus_tokens: torch.Tensor = None
-    num_accepted_drafts: torch.Tensor = None
-    num_accepted_tokens: torch.Tensor = None
-    # Read by attention backends during draft-extend forward; kept on the
-    # dataclass because the backends access it via `forward_batch.spec_info`.
-    num_accepted_tokens_cpu: List[int] = None
 
     # Inputs for the attention backends
     # shape: (b + 1,)
@@ -741,47 +732,6 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
             topk_index=torch.empty((0, topk), device=device, dtype=torch.int64),
             capture_hidden_mode=capture_hidden_mode,
             new_seq_lens=torch.empty((0,), device=device, dtype=torch.int32),
-            num_accepted_drafts=torch.empty((0,), device=device, dtype=torch.int32),
-            num_accepted_tokens=torch.empty((0,), device=device, dtype=torch.int32),
-            num_accepted_tokens_cpu=[],
-        )
-
-    def prepare_extend_after_decode(
-        self,
-        batch: ScheduleBatch,
-        verify_output: "EagleVerifyOutput",
-        speculative_num_steps: int,
-    ):
-
-        if batch.forward_mode.is_idle():
-            return
-
-        # All transient verify->extend handoff state is read off `verify_output`,
-        # not from `self`. The kernel below populates `self.bonus_tokens`
-        # ([bs] per-req) for the next decode round; that is the only state on
-        # `self` that survives past this method.
-        batch.input_ids = verify_output.unfinished_accept_tokens
-        batch.extend_lens = batch.spec_info.num_accepted_tokens_cpu
-        batch.extend_num_tokens = sum(batch.extend_lens)
-        batch.seq_lens = verify_output.seq_lens_for_draft_extend
-        batch.seq_lens_cpu = verify_output.seq_lens_for_draft_extend_cpu
-        batch.req_pool_indices = verify_output.req_pool_indices_for_draft_extend
-        batch.return_logprob = False
-        batch.return_hidden_states = False
-
-        self.capture_hidden_mode = CaptureHiddenMode.LAST
-        self.positions = torch.empty_like(batch.input_ids, dtype=torch.long)
-        self.bonus_tokens = torch.empty_like(
-            self.num_accepted_tokens, dtype=torch.int32
-        )
-
-        create_extend_after_decode_spec_info[(len(batch.seq_lens),)](
-            batch.input_ids,
-            batch.seq_lens,
-            self.num_accepted_tokens,
-            self.positions,
-            self.bonus_tokens,
-            next_power_of_2(max(speculative_num_steps + 1, len(batch.seq_lens))),
         )
 
     def generate_attn_arg_prefill(
@@ -872,9 +822,105 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
 
 
 @dataclass
+class EagleDraftExtendInput(SpecInput):
+    """Inputs to the draft-extend forward (the per-accepted-token pass after verify).
+
+    Lives on `batch.spec_info` only during the draft-extend forward pass.
+    After draft-extend completes, the worker assembles a fresh `EagleDraftInput`
+    for next iter and replaces `batch.spec_info`.
+
+    All fields here have single shapes (no phase-shift across phases).
+    """
+
+    # shape: (total_accepted, hidden_size). Sliced from verify-time hidden_states
+    # by accept_index; consumed by the draft-extend forward.
+    hidden_states: torch.Tensor = None
+
+    # Per-req accept counts. `num_accepted_tokens = num_accepted_drafts + 1`
+    # (one bonus per req). Both retained for cuda-graph buffer indexing and
+    # the `create_extend_after_decode_spec_info` kernel.
+    num_accepted_drafts: torch.Tensor = None
+    num_accepted_tokens: torch.Tensor = None
+    # CPU view, read by attention backends during the extend forward.
+    num_accepted_tokens_cpu: List[int] = None
+
+    # Set by `prepare_extend_after_decode`:
+    #   - positions: kernel-written, shape `[total_accepted]`.
+    #   - bonus_tokens: kernel-written, shape `[bs]`. The worker reads this
+    #     post-extend to populate next iter's `EagleDraftInput.bonus_tokens`.
+    positions: Optional[torch.Tensor] = None
+    bonus_tokens: Optional[torch.Tensor] = None
+
+    # Forward-pass config (set during prepare_extend / construction).
+    capture_hidden_mode: CaptureHiddenMode = CaptureHiddenMode.LAST
+    num_tokens_per_req: int = -1
+    num_tokens_for_logprob_per_req: int = 1
+
+    def __post_init__(self):
+        super().__init__(SpecInputType.EAGLE_DRAFT_EXTEND)
+
+    def get_spec_adjust_token_coefficient(self) -> Tuple[int, int]:
+        return self.num_tokens_per_req, self.num_tokens_for_logprob_per_req
+
+    @classmethod
+    def create_idle_input(
+        cls,
+        device: torch.device,
+        hidden_size: int,
+        dtype: torch.dtype,
+        capture_hidden_mode: CaptureHiddenMode = CaptureHiddenMode.LAST,
+    ) -> "EagleDraftExtendInput":
+        return cls(
+            hidden_states=torch.empty((0, hidden_size), device=device, dtype=dtype),
+            num_accepted_drafts=torch.empty((0,), device=device, dtype=torch.int32),
+            num_accepted_tokens=torch.empty((0,), device=device, dtype=torch.int32),
+            num_accepted_tokens_cpu=[],
+            capture_hidden_mode=capture_hidden_mode,
+        )
+
+    def prepare_extend_after_decode(
+        self,
+        batch: ScheduleBatch,
+        verify_output: "EagleVerifyOutput",
+        speculative_num_steps: int,
+    ):
+        if batch.forward_mode.is_idle():
+            return
+
+        # All transient verify->extend handoff state is read off `verify_output`.
+        # The kernel below populates `self.positions` and `self.bonus_tokens`;
+        # the worker reads `self.bonus_tokens` to construct next iter's
+        # `EagleDraftInput`.
+        batch.input_ids = verify_output.unfinished_accept_tokens
+        batch.extend_lens = self.num_accepted_tokens_cpu
+        batch.extend_num_tokens = sum(batch.extend_lens)
+        batch.seq_lens = verify_output.seq_lens_for_draft_extend
+        batch.seq_lens_cpu = verify_output.seq_lens_for_draft_extend_cpu
+        batch.req_pool_indices = verify_output.req_pool_indices_for_draft_extend
+        batch.return_logprob = False
+        batch.return_hidden_states = False
+
+        self.capture_hidden_mode = CaptureHiddenMode.LAST
+        self.positions = torch.empty_like(batch.input_ids, dtype=torch.long)
+        self.bonus_tokens = torch.empty_like(
+            self.num_accepted_tokens, dtype=torch.int32
+        )
+
+        create_extend_after_decode_spec_info[(len(batch.seq_lens),)](
+            batch.input_ids,
+            batch.seq_lens,
+            self.num_accepted_tokens,
+            self.positions,
+            self.bonus_tokens,
+            next_power_of_2(max(speculative_num_steps + 1, len(batch.seq_lens))),
+        )
+
+
+@dataclass
 class EagleVerifyOutput:
-    # Next iter's persistent draft state, ready to be installed as `batch.spec_info`.
-    next_draft_input: EagleDraftInput
+    # Next iter's draft-extend input, ready to be installed as `batch.spec_info`
+    # for the draft-extend forward.
+    extend_input: EagleDraftExtendInput
     # Logit outputs from target worker.
     logits_output: LogitsProcessorOutput
     # All accepted tokens flat across all reqs incl. those that finished this
@@ -903,13 +949,13 @@ class EagleVerifyOutput:
     def create_idle(
         cls,
         *,
-        next_draft_input: EagleDraftInput,
+        extend_input: EagleDraftExtendInput,
         logits_output: LogitsProcessorOutput,
         device: torch.device,
         spec_steps: int,
     ) -> "EagleVerifyOutput":
         return cls(
-            next_draft_input=next_draft_input,
+            extend_input=extend_input,
             logits_output=logits_output,
             accept_tokens=torch.empty(0, dtype=torch.long, device=device),
             unfinished_accept_tokens=torch.empty(0, dtype=torch.long, device=device),

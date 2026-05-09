@@ -34,6 +34,7 @@ from sglang.srt.model_executor.forward_batch_info import (
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.draft_utils import DraftBackendFactory
 from sglang.srt.speculative.eagle_info import (
+    EagleDraftExtendInput,
     EagleDraftInput,
     EagleVerifyInput,
     EagleVerifyOutput,
@@ -591,7 +592,7 @@ class MultiLayerEagleWorker(TpModelWorker):
         batch.forward_mode = (
             ForwardMode.DECODE if not batch.forward_mode.is_idle() else ForwardMode.IDLE
         )
-        batch.spec_info = res.next_draft_input
+        batch.spec_info = res.extend_input
 
         return logits_output, res, model_worker_batch, can_run_cuda_graph
 
@@ -657,13 +658,13 @@ class MultiLayerEagleWorker(TpModelWorker):
     def forward_draft_extend_after_decode(
         self, batch: ScheduleBatch, verify_output: EagleVerifyOutput
     ):
-        assert isinstance(batch.spec_info, EagleDraftInput)
+        assert isinstance(batch.spec_info, EagleDraftExtendInput)
+        extend_input: EagleDraftExtendInput = batch.spec_info
+
         # Backup fields that will be modified in-place
         seq_lens_backup = batch.seq_lens.clone()
         seq_lens_cpu_backup = batch.seq_lens_cpu.clone()
         req_pool_indices_backup = batch.req_pool_indices
-        num_accepted_drafts_backup = batch.spec_info.num_accepted_drafts
-        num_accepted_tokens_backup = batch.spec_info.num_accepted_tokens
         return_logprob_backup = batch.return_logprob
 
         input_is_idle = batch.forward_mode.is_idle()
@@ -676,17 +677,18 @@ class MultiLayerEagleWorker(TpModelWorker):
                 if self.speculative_algorithm.is_eagle3()
                 else self.model_config.hidden_size
             )
-            batch.spec_info = EagleDraftInput.create_idle_input(
+            extend_input = EagleDraftExtendInput.create_idle_input(
                 device=self.device,
                 hidden_size=hidden_size,
                 dtype=self.model_config.dtype,
-                topk=self.topk,
                 capture_hidden_mode=CaptureHiddenMode.LAST,
             )
+            batch.spec_info = extend_input
 
-        batch.spec_info.num_tokens_per_req = self.speculative_num_steps + 1
-        batch.spec_info.num_tokens_for_logprob_per_req = 1
-        batch.spec_info.prepare_extend_after_decode(
+        # Phase 1: prepare extend (kernel writes extend_input.{positions, bonus_tokens})
+        extend_input.num_tokens_per_req = self.speculative_num_steps + 1
+        extend_input.num_tokens_for_logprob_per_req = 1
+        extend_input.prepare_extend_after_decode(
             batch,
             verify_output=verify_output,
             speculative_num_steps=self.speculative_num_steps,
@@ -750,17 +752,22 @@ class MultiLayerEagleWorker(TpModelWorker):
                     )
                     pt += extend_len
 
-        forward_batch.spec_info.topk_p = torch.cat(topk_p_list, dim=1)
-        forward_batch.spec_info.topk_index = torch.cat(topk_index_list, dim=1)
+        # Phase 3: assemble next-iter EagleDraftInput from extend output
+        next_draft_input = EagleDraftInput(
+            bonus_tokens=extend_input.bonus_tokens,
+            hidden_states=logits_output.hidden_states,
+            topk_p=torch.cat(topk_p_list, dim=1),
+            topk_index=torch.cat(topk_index_list, dim=1),
+            capture_hidden_mode=CaptureHiddenMode.FULL,
+        )
 
-        # Restore backup.
-        # This is because `seq_lens` can be modified in `prepare_extend_after_decode`
+        # Restore batch fields and install the new draft input.
+        # `seq_lens` etc. were modified by `prepare_extend_after_decode`.
         batch.forward_mode = (
             ForwardMode.DECODE if not input_is_idle else ForwardMode.IDLE
         )
         batch.seq_lens = seq_lens_backup
         batch.seq_lens_cpu = seq_lens_cpu_backup
         batch.req_pool_indices = req_pool_indices_backup
-        batch.spec_info.num_accepted_drafts = num_accepted_drafts_backup
-        batch.spec_info.num_accepted_tokens = num_accepted_tokens_backup
+        batch.spec_info = next_draft_input
         batch.return_logprob = return_logprob_backup

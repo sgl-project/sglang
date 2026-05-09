@@ -46,6 +46,7 @@ from sglang.srt.speculative.eagle_draft_extend_cuda_graph_runner import (
     EAGLEDraftExtendCudaGraphRunner,
 )
 from sglang.srt.speculative.eagle_info import (
+    EagleDraftExtendInput,
     EagleDraftInput,
     EagleVerifyInput,
     EagleVerifyOutput,
@@ -979,7 +980,7 @@ class EAGLEWorker(TpModelWorker):
         batch.forward_mode = (
             ForwardMode.DECODE if not batch.forward_mode.is_idle() else ForwardMode.IDLE
         )
-        batch.spec_info = res.next_draft_input
+        batch.spec_info = res.extend_input
 
         return logits_output, res, model_worker_batch, can_run_cuda_graph
 
@@ -1109,18 +1110,19 @@ class EAGLEWorker(TpModelWorker):
     def forward_draft_extend_after_decode(
         self, batch: ScheduleBatch, verify_output: EagleVerifyOutput
     ):
-        assert isinstance(batch.spec_info, EagleDraftInput)
+        assert isinstance(batch.spec_info, EagleDraftExtendInput)
+        extend_input: EagleDraftExtendInput = batch.spec_info
+
         # Backup fields that will be modified in-place
         seq_lens_backup = batch.seq_lens.clone()
         seq_lens_cpu_backup = batch.seq_lens_cpu.clone()
         req_pool_indices_backup = batch.req_pool_indices
-        num_accepted_drafts_backup = batch.spec_info.num_accepted_drafts.clone()
-        num_accepted_tokens_backup = batch.spec_info.num_accepted_tokens.clone()
         return_logprob_backup = batch.return_logprob
 
         input_is_idle = batch.forward_mode.is_idle()
 
         if not input_is_idle and verify_output.unfinished_accept_tokens.numel() == 0:
+            # All reqs finished this verify; swap to an idle ExtendInput.
             batch = batch.copy()
             batch.prepare_for_idle()
             hidden_size = (
@@ -1129,17 +1131,18 @@ class EAGLEWorker(TpModelWorker):
                 and self.eagle_use_aux_hidden_state
                 else self.model_config.spec_hidden_size
             )
-            batch.spec_info = EagleDraftInput.create_idle_input(
+            extend_input = EagleDraftExtendInput.create_idle_input(
                 device=self.device,
                 hidden_size=hidden_size,
                 dtype=self.model_config.dtype,
-                topk=self.topk,
                 capture_hidden_mode=CaptureHiddenMode.LAST,
             )
+            batch.spec_info = extend_input
 
-        batch.spec_info.num_tokens_per_req = self.speculative_num_steps + 1
-        batch.spec_info.num_tokens_for_logprob_per_req = 1
-        batch.spec_info.prepare_extend_after_decode(
+        # Phase 1: prepare extend (kernel writes extend_input.{positions, bonus_tokens})
+        extend_input.num_tokens_per_req = self.speculative_num_steps + 1
+        extend_input.num_tokens_for_logprob_per_req = 1
+        extend_input.prepare_extend_after_decode(
             batch,
             verify_output=verify_output,
             speculative_num_steps=self.speculative_num_steps,
@@ -1161,7 +1164,7 @@ class EAGLEWorker(TpModelWorker):
         else:
             forward_batch.seq_lens_sum = batch.seq_lens.sum().item()
 
-        # Run
+        # Phase 2: run draft-extend forward
         can_cuda_graph = (
             self.cuda_graph_runner_for_draft_extend
             and self.cuda_graph_runner_for_draft_extend.can_run(forward_batch)
@@ -1170,11 +1173,10 @@ class EAGLEWorker(TpModelWorker):
             logits_output = self.cuda_graph_runner_for_draft_extend.replay(
                 forward_batch
             )
-            forward_batch.spec_info.topk_p, forward_batch.spec_info.topk_index = (
-                logits_output.topk_p,
-                logits_output.topk_index,
-            )
-            forward_batch.spec_info.hidden_states = logits_output.hidden_states
+            # cuda-graph replay populates logits_output.{topk_p, topk_index, hidden_states}.
+            topk_p = logits_output.topk_p
+            topk_index = logits_output.topk_index
+            hidden_states = logits_output.hidden_states
         else:
             forward_batch.can_run_dp_cuda_graph = False
             if not forward_batch.forward_mode.is_idle():
@@ -1187,23 +1189,36 @@ class EAGLEWorker(TpModelWorker):
             logits_output = self.draft_model_runner.forward(
                 forward_batch, skip_attn_backend_init=True
             ).logits_output
-            self.capture_for_decode(logits_output, forward_batch.spec_info)
+            # Non-cuda-graph path: compute topk_p / topk_index inline (used to be
+            # `capture_for_decode` which mutated spec_info; we instead carry the
+            # values to next-iter `EagleDraftInput` assembly below).
+            probs = torch.softmax(logits_output.next_token_logits, dim=-1)
+            topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
+            hidden_states = logits_output.hidden_states
 
         maybe_detect_nan(
             logits_output.next_token_logits,
             f"draft_extend_after_decode (cuda_graph={can_cuda_graph})",
         )
 
-        # Restore backup.
-        # This is because `seq_lens` can be modified in `prepare_extend_after_decode`
+        # Phase 3: assemble next-iter EagleDraftInput from extend output
+        next_draft_input = EagleDraftInput(
+            bonus_tokens=extend_input.bonus_tokens,
+            hidden_states=hidden_states,
+            topk_p=topk_p,
+            topk_index=topk_index,
+            capture_hidden_mode=CaptureHiddenMode.FULL,
+        )
+
+        # Restore batch fields and install the new draft input.
+        # `seq_lens` etc. were modified by `prepare_extend_after_decode`.
         batch.forward_mode = (
             ForwardMode.DECODE if not input_is_idle else ForwardMode.IDLE
         )
         batch.seq_lens = seq_lens_backup
         batch.seq_lens_cpu = seq_lens_cpu_backup
         batch.req_pool_indices = req_pool_indices_backup
-        batch.spec_info.num_accepted_drafts = num_accepted_drafts_backup
-        batch.spec_info.num_accepted_tokens = num_accepted_tokens_backup
+        batch.spec_info = next_draft_input
         batch.return_logprob = return_logprob_backup
 
     def capture_for_decode(
