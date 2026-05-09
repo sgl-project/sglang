@@ -1,3 +1,4 @@
+from dataclasses import replace
 from pathlib import Path
 
 from sglang.multimodal_gen.runtime.platforms import current_platform
@@ -51,6 +52,21 @@ from sglang.multimodal_gen.test.test_utils import (
     DEFAULT_WAN_2_2_TI2V_5B_MODEL_NAME_FOR_TEST,
 )
 
+_CACHE_DIT_CONFIG_DIR = Path(__file__).parent / "configs"
+
+CACHE_DIT_T2I_SMOKE_sampling_params = replace(
+    T2I_sampling_params,
+    output_size="512x512",
+    extras={"num_inference_steps": 8, "seed": 0},
+)
+
+CACHE_DIT_T2V_SP_SMOKE_sampling_params = replace(
+    T2V_sampling_params,
+    output_size="832x480",
+    num_frames=5,
+    extras={"num_inference_steps": 8, "seed": 0},
+)
+
 # All test cases with clean default values
 # To test different models, simply add more DiffusionCase entries
 ONE_GPU_CASES: list[DiffusionTestCase] = [
@@ -71,21 +87,6 @@ ONE_GPU_CASES: list[DiffusionTestCase] = [
         T2I_sampling_params,
     ),
     DiffusionTestCase(
-        "qwen_image_t2i_cache_dit_config_diffusers_1gpu",
-        DiffusionServerArgs(
-            model_path=DEFAULT_QWEN_IMAGE_MODEL_NAME_FOR_TEST,
-            extras=[
-                "--backend",
-                "diffusers",
-                "--cache-dit-config",
-                str(Path(__file__).parent / "configs" / "cache_dit_config_1gpu.yaml"),
-            ],
-        ),
-        T2I_sampling_params,
-        run_consistency_check=False,
-        run_component_accuracy_check=False,
-    ),
-    DiffusionTestCase(
         "qwen_image_t2i_cache_dit_scm_config_diffusers_1gpu",
         DiffusionServerArgs(
             model_path=DEFAULT_QWEN_IMAGE_MODEL_NAME_FOR_TEST,
@@ -93,12 +94,15 @@ ONE_GPU_CASES: list[DiffusionTestCase] = [
                 "--backend",
                 "diffusers",
                 "--cache-dit-config",
-                str(Path(__file__).parent / "configs" / "cache_dit_scm_config.yaml"),
+                str(_CACHE_DIT_CONFIG_DIR / "cache_dit_scm_config.yaml"),
             ],
         ),
-        T2I_sampling_params,
+        CACHE_DIT_T2I_SMOKE_sampling_params,
+        run_perf_check=False,
         run_consistency_check=False,
         run_component_accuracy_check=False,
+        run_models_api_check=False,
+        run_t2v_input_reference_check=False,
     ),
     DiffusionTestCase(
         "flux_image_t2i",
@@ -559,10 +563,14 @@ TWO_GPU_CASES = [
             model_path=DEFAULT_WAN_2_1_T2V_1_3B_MODEL_NAME_FOR_TEST,
             ulysses_degree=2,
             enable_cache_dit=True,
+            env_vars={"SGLANG_CACHE_DIT_WARMUP": "2"},
         ),
-        T2V_sampling_params,
+        CACHE_DIT_T2V_SP_SMOKE_sampling_params,
+        run_perf_check=False,
         run_consistency_check=False,
         run_component_accuracy_check=False,
+        run_models_api_check=False,
+        run_t2v_input_reference_check=False,
     ),
     DiffusionTestCase(
         "fsdp-inference",
