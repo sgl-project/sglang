@@ -884,6 +884,8 @@ class EagleDraftExtendInput(SpecInput):
         verify_output: "EagleVerifyOutput",
         speculative_num_steps: int,
     ):
+        # Caller must have installed `self` as `batch.spec_info` before calling.
+        assert batch.spec_info is self
         if batch.forward_mode.is_idle():
             return
 
