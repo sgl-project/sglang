@@ -62,7 +62,7 @@ class FrozenKVMTPVerifyInput(EagleVerifyInput):
 
     def verify(self, *args, **kwargs) -> EagleVerifyOutput:
         output = super().verify(*args, **kwargs)
-        output.draft_input = _to_frozen_kv_mtp_draft_input(output.draft_input)
+        output.next_draft_input = _to_frozen_kv_mtp_draft_input(output.next_draft_input)
         return output
 
 

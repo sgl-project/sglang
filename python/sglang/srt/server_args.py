@@ -220,6 +220,7 @@ FP4_GEMM_RUNNER_BACKEND_CHOICES = [
     "auto",
     "cutlass",
     "flashinfer_cudnn",
+    "flashinfer_cutedsl",
     "flashinfer_cutlass",
     "flashinfer_trtllm",
 ]
@@ -790,6 +791,7 @@ class ServerArgs:
     weight_loader_disable_mmap: bool = False
     weight_loader_prefetch_checkpoints: bool = False
     weight_loader_prefetch_num_threads: int = 4
+    weight_loader_drop_cache_after_load: bool = False
     remote_instance_weight_loader_seed_instance_ip: Optional[str] = None
     remote_instance_weight_loader_seed_instance_service_port: Optional[int] = None
     remote_instance_weight_loader_send_weights_group_ports: Optional[List[int]] = None
@@ -1893,6 +1895,7 @@ class ServerArgs:
                         self.quantization
                         in ["fp8", "modelopt_fp8", "modelopt_fp4", "modelopt_mixed"]
                         or is_kimi_k2_k25_thinking_int4
+                        or self.quantization is None
                     )
                 ):
                     self.moe_runner_backend = "flashinfer_trtllm"
@@ -3332,22 +3335,8 @@ class ServerArgs:
         ):
             self.speculative_draft_model_revision = "main"
 
-        # FlashInfer trtllm moe bf16 only support RenormalizeNaive routing method and Deepseek routing method
-        # It is hard to tell the routing method in draft model, and the moe layer in draft model is not the bottleneck among
-        # end to end, so we just avoid using trtllm_moe for speculative decoding.
-        from sglang.srt.layers.moe.utils import MoeRunnerBackend
-
         if self.speculative_moe_runner_backend is None:
-            self.speculative_moe_runner_backend = (
-                "auto"
-                if self.moe_runner_backend
-                in ["flashinfer_trtllm", "flashinfer_trtllm_routed"]
-                else self.moe_runner_backend
-            )
-        else:
-            assert not MoeRunnerBackend(
-                self.speculative_moe_runner_backend
-            ).is_flashinfer_trtllm(), "Currently speculative MoE runner backend doesn't support flashinfer_trtllm, please use triton or auto backend for speculative moe runner instead."
+            self.speculative_moe_runner_backend = self.moe_runner_backend
 
         if self.speculative_algorithm is not None:
             self.speculative_algorithm = self.speculative_algorithm.upper()
@@ -5482,10 +5471,11 @@ class ServerArgs:
             default=ServerArgs.fp4_gemm_runner_backend,
             dest="fp4_gemm_runner_backend",
             help="Choose the runner backend for NVFP4 GEMM operations. "
-            "Options: 'auto' (default; selects flashinfer_cudnn on SM120, flashinfer_cutlass otherwise), "
+            "Options: 'auto' (default; selects flashinfer_cudnn on SM120, flashinfer_cutedsl on SM100, flashinfer_cutlass otherwise), "
             "'cutlass' (SGLang CUTLASS kernel), "
             "'flashinfer_cutlass' (FlashInfer CUTLASS backend), "
             "'flashinfer_cudnn' (FlashInfer cuDNN backend, optimal on CUDA 13+ with cuDNN 9.15+), "
+            "'flashinfer_cutedsl' (FlashInfer CuTe DSL backend), "
             "'flashinfer_trtllm' (FlashInfer TensorRT-LLM backend, requires different weight preparation with shuffling). ",
         )
         parser.add_argument(
@@ -6668,6 +6658,11 @@ class ServerArgs:
             type=int,
             default=ServerArgs.weight_loader_prefetch_num_threads,
             help="Number of threads per rank for checkpoint prefetching (default: 4).",
+        )
+        parser.add_argument(
+            "--weight-loader-drop-cache-after-load",
+            action="store_true",
+            help="Call posix_fadvise(DONTNEED) on each safetensors shard after loading it.",
         )
         parser.add_argument(
             "--remote-instance-weight-loader-seed-instance-ip",

@@ -140,7 +140,6 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                 last_loc,
                 len(batch.input_ids),
             )
-            self.last_loc = last_loc
 
         bs = batch.batch_size()
         assign_req_to_token_pool_func(
@@ -241,23 +240,18 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
         accepted token logits.
         """
         if batch.forward_mode.is_idle():
-            return EagleVerifyOutput(
-                draft_input=EagleDraftInput.create_idle_input(
-                    device=batch.device,
-                    hidden_size=batch.model_config.spec_hidden_size,
-                    dtype=batch.model_config.dtype,
-                    topk=self.topk,
-                    capture_hidden_mode=CaptureHiddenMode.LAST,
-                ),
+            next_draft_input = EagleDraftInput.create_idle_input(
+                device=batch.device,
+                hidden_size=batch.model_config.spec_hidden_size,
+                dtype=batch.model_config.dtype,
+                topk=self.topk,
+                capture_hidden_mode=CaptureHiddenMode.LAST,
+            )
+            return EagleVerifyOutput.create_idle(
+                next_draft_input=next_draft_input,
                 logits_output=logits_output,
-                accept_tokens=torch.empty(0, dtype=torch.long, device=batch.device),
-                num_accepted_drafts_per_req_cpu=[],
-                accepted_indices=torch.full(
-                    (0, self.spec_steps + 1),
-                    -1,
-                    dtype=torch.int32,
-                    device=batch.device,
-                ),
+                device=batch.device,
+                spec_steps=self.spec_steps,
             )
 
         bs = self.retrieve_index.shape[0]
@@ -551,23 +545,22 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
             batch.seq_lens.add_(num_accepted_drafts + 1)
             batch.seq_lens_cpu.add_(num_accepted_tokens_cpu)
 
-            draft_input = EagleDraftInput(
+            next_draft_input = EagleDraftInput(
                 hidden_states=batch.spec_info.hidden_states[accept_index],
-                accept_tokens=accept_tokens,
                 num_accepted_drafts=num_accepted_drafts,
                 num_accepted_tokens=num_accepted_drafts + 1,
-                num_accepted_drafts_cpu=num_accepted_drafts_list,
                 num_accepted_tokens_cpu=num_accepted_tokens_list,
-                seq_lens_for_draft_extend=batch.seq_lens,
-                seq_lens_for_draft_extend_cpu=batch.seq_lens_cpu,
-                req_pool_indices_for_draft_extend=batch.req_pool_indices,
             )
 
             return EagleVerifyOutput(
-                draft_input=draft_input,
+                next_draft_input=next_draft_input,
                 logits_output=logits_output,
                 accept_tokens=accept_tokens,
-                num_accepted_drafts_per_req_cpu=draft_input.num_accepted_drafts_cpu,
+                unfinished_accept_tokens=accept_tokens,
+                seq_lens_for_draft_extend=batch.seq_lens,
+                seq_lens_for_draft_extend_cpu=batch.seq_lens_cpu,
+                req_pool_indices_for_draft_extend=batch.req_pool_indices,
+                num_accepted_drafts_per_req_cpu=num_accepted_drafts_list,
                 accepted_indices=accept_index,
             )
         else:
@@ -621,23 +614,36 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                 unfinished_num_accepted_drafts = num_accepted_drafts[
                     unfinished_index_device
                 ]
-                draft_input = EagleDraftInput(
+                unfinished_accept_tokens = predict[unfinished_accept_index]
+                seq_lens_for_draft_extend = batch.seq_lens[unfinished_index_device]
+                seq_lens_for_draft_extend_cpu = batch.seq_lens_cpu[unfinished_index]
+                req_pool_indices_for_draft_extend = batch.req_pool_indices[
+                    unfinished_index_device
+                ]
+                next_draft_input = EagleDraftInput(
                     hidden_states=batch.spec_info.hidden_states[
                         unfinished_accept_index
                     ],
-                    accept_tokens=predict[unfinished_accept_index],
-                    num_accepted_drafts_cpu=draft_input_num_accepted_drafts_cpu,
                     num_accepted_tokens_cpu=draft_input_num_accepted_tokens_cpu,
                     num_accepted_drafts=unfinished_num_accepted_drafts,
                     num_accepted_tokens=unfinished_num_accepted_drafts + 1,
-                    seq_lens_for_draft_extend=batch.seq_lens[unfinished_index_device],
-                    seq_lens_for_draft_extend_cpu=batch.seq_lens_cpu[unfinished_index],
-                    req_pool_indices_for_draft_extend=batch.req_pool_indices[
-                        unfinished_index_device
-                    ],
                 )
             else:
-                draft_input = EagleDraftInput.create_idle_input(
+                unfinished_accept_tokens = torch.empty(
+                    (0,), dtype=accept_tokens.dtype, device=accept_tokens.device
+                )
+                seq_lens_for_draft_extend = torch.empty(
+                    (0,), dtype=batch.seq_lens.dtype, device=batch.seq_lens.device
+                )
+                seq_lens_for_draft_extend_cpu = torch.empty(
+                    (0,), dtype=batch.seq_lens_cpu.dtype
+                )
+                req_pool_indices_for_draft_extend = torch.empty(
+                    (0,),
+                    dtype=batch.req_pool_indices.dtype,
+                    device=batch.req_pool_indices.device,
+                )
+                next_draft_input = EagleDraftInput.create_idle_input(
                     device=batch.device,
                     hidden_size=batch.model_config.spec_hidden_size,
                     dtype=batch.model_config.dtype,
@@ -646,9 +652,13 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                 )
 
             return EagleVerifyOutput(
-                draft_input=draft_input,
+                next_draft_input=next_draft_input,
                 logits_output=logits_output,
                 accept_tokens=accept_tokens,
+                unfinished_accept_tokens=unfinished_accept_tokens,
+                seq_lens_for_draft_extend=seq_lens_for_draft_extend,
+                seq_lens_for_draft_extend_cpu=seq_lens_for_draft_extend_cpu,
+                req_pool_indices_for_draft_extend=req_pool_indices_for_draft_extend,
                 num_accepted_drafts_per_req_cpu=num_accepted_drafts_list,
                 accepted_indices=accept_index,
             )
@@ -660,7 +670,10 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
     # shape: (b, topk)
     topk_p: torch.Tensor = None
     topk_index: torch.Tensor = None
-    # shape: (b, hidden_size)
+    # shape: (b, hidden_size) when consumed by `draft` forward (one hidden per req);
+    # shape: (total_accepted, hidden_size) when consumed by `draft_extend` forward
+    # (one hidden per accepted token). Workers maintain this invariant locally;
+    # there is no type-level guard. Don't add new readers without checking phase.
     hidden_states: torch.Tensor = None
     capture_hidden_mode: CaptureHiddenMode = CaptureHiddenMode.FULL
 
@@ -670,16 +683,10 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
     # `num_accepted_tokens = num_accepted_drafts + 1` (per-req, one bonus per req).
     # Storing both avoids repeated `+ 1` at every consumer (attn backends, kernels).
     bonus_tokens: torch.Tensor = None
-    # Flat accepted-token tensor for draft-extend, shape `[sum_accepted]`.
-    # Set right after verify and consumed by `prepare_extend_after_decode` as
-    # the extend batch's `input_ids`. Dead after that method returns.
-    # TODO: drop this field and pass `accept_tokens` directly to
-    # `prepare_extend_after_decode` as a method arg. Its lifetime is bounded
-    # by verify -> prepare_extend, no need to live on the dataclass.
-    accept_tokens: torch.Tensor = None
     num_accepted_drafts: torch.Tensor = None
     num_accepted_tokens: torch.Tensor = None
-    num_accepted_drafts_cpu: List[int] = None
+    # Read by attention backends during draft-extend forward; kept on the
+    # dataclass because the backends access it via `forward_batch.spec_info`.
     num_accepted_tokens_cpu: List[int] = None
 
     # Inputs for the attention backends
@@ -690,12 +697,6 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
     # Shape info for padding
     num_tokens_per_req: int = -1
     num_tokens_for_logprob_per_req: int = -1
-
-    # Inputs for draft extend
-    # shape: (b,)
-    seq_lens_for_draft_extend: torch.Tensor = None
-    seq_lens_for_draft_extend_cpu: torch.Tensor = None
-    req_pool_indices_for_draft_extend: torch.Tensor = None
 
     # Inputs for V2 overlap worker
     future_indices: Optional[FutureIndices] = None
@@ -735,7 +736,6 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
     ):
         return cls(
             bonus_tokens=torch.empty((0,), device=device, dtype=torch.int32),
-            accept_tokens=torch.empty((0,), device=device, dtype=torch.int32),
             hidden_states=torch.empty((0, hidden_size), device=device, dtype=dtype),
             topk_p=torch.empty((0, topk), device=device, dtype=torch.float32),
             topk_index=torch.empty((0, topk), device=device, dtype=torch.int64),
@@ -743,29 +743,29 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
             new_seq_lens=torch.empty((0,), device=device, dtype=torch.int32),
             num_accepted_drafts=torch.empty((0,), device=device, dtype=torch.int32),
             num_accepted_tokens=torch.empty((0,), device=device, dtype=torch.int32),
-            num_accepted_drafts_cpu=[],
             num_accepted_tokens_cpu=[],
         )
 
     def prepare_extend_after_decode(
         self,
         batch: ScheduleBatch,
+        verify_output: "EagleVerifyOutput",
         speculative_num_steps: int,
     ):
 
         if batch.forward_mode.is_idle():
             return
 
-        # `self.accept_tokens` is the flat accepted-token tensor set by
-        # `EagleVerifyInput.verify`; use it as the extend batch's `input_ids`.
-        # The kernel below populates `self.bonus_tokens` ([bs] per-req) for
-        # the next decode round.
-        batch.input_ids = self.accept_tokens
+        # All transient verify->extend handoff state is read off `verify_output`,
+        # not from `self`. The kernel below populates `self.bonus_tokens`
+        # ([bs] per-req) for the next decode round; that is the only state on
+        # `self` that survives past this method.
+        batch.input_ids = verify_output.unfinished_accept_tokens
         batch.extend_lens = batch.spec_info.num_accepted_tokens_cpu
         batch.extend_num_tokens = sum(batch.extend_lens)
-        batch.seq_lens = batch.spec_info.seq_lens_for_draft_extend
-        batch.seq_lens_cpu = batch.spec_info.seq_lens_for_draft_extend_cpu
-        batch.req_pool_indices = batch.spec_info.req_pool_indices_for_draft_extend
+        batch.seq_lens = verify_output.seq_lens_for_draft_extend
+        batch.seq_lens_cpu = verify_output.seq_lens_for_draft_extend_cpu
+        batch.req_pool_indices = verify_output.req_pool_indices_for_draft_extend
         batch.return_logprob = False
         batch.return_hidden_states = False
 
@@ -873,13 +873,53 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
 
 @dataclass
 class EagleVerifyOutput:
-    # Draft input batch
-    draft_input: EagleDraftInput
-    # Logit outputs from target worker
+    # Next iter's persistent draft state, ready to be installed as `batch.spec_info`.
+    next_draft_input: EagleDraftInput
+    # Logit outputs from target worker.
     logits_output: LogitsProcessorOutput
-    # Accepted token ids including the bonus token (flat, [sum_accepted])
+    # All accepted tokens flat across all reqs incl. those that finished this
+    # step. Includes the bonus token. Used for output processing.
     accept_tokens: torch.Tensor
-    # Accepted token length per sequence in a batch in CPU.
+    # Below are transient handoff fields for the next iter's draft-extend pass.
+    # They are scoped to the verify -> prepare_extend_after_decode window only;
+    # `prepare_extend_after_decode` reads them off this object via method arg
+    # rather than smuggling them through `EagleDraftInput`.
+    #
+    # Subset of `accept_tokens` for reqs continuing into next iter's draft-extend
+    # forward (= `accept_tokens` when no req finished; flat over unfinished
+    # reqs only otherwise). Becomes `batch.input_ids` for that forward pass.
+    unfinished_accept_tokens: torch.Tensor
+    # `batch.seq_lens` / `batch.seq_lens_cpu` / `batch.req_pool_indices` to
+    # use for the next iter's draft-extend forward; sliced to surviving reqs.
+    seq_lens_for_draft_extend: torch.Tensor
+    seq_lens_for_draft_extend_cpu: torch.Tensor
+    req_pool_indices_for_draft_extend: torch.Tensor
+    # Accepted token length per sequence in a batch in CPU (full set).
     num_accepted_drafts_per_req_cpu: List[int]
     # Accepted indices from logits_output.next_token_logits
     accepted_indices: torch.Tensor
+
+    @classmethod
+    def create_idle(
+        cls,
+        *,
+        next_draft_input: EagleDraftInput,
+        logits_output: LogitsProcessorOutput,
+        device: torch.device,
+        spec_steps: int,
+    ) -> "EagleVerifyOutput":
+        return cls(
+            next_draft_input=next_draft_input,
+            logits_output=logits_output,
+            accept_tokens=torch.empty(0, dtype=torch.long, device=device),
+            unfinished_accept_tokens=torch.empty(0, dtype=torch.long, device=device),
+            seq_lens_for_draft_extend=torch.empty(0, dtype=torch.int32, device=device),
+            seq_lens_for_draft_extend_cpu=torch.empty(0, dtype=torch.int32),
+            req_pool_indices_for_draft_extend=torch.empty(
+                0, dtype=torch.int64, device=device
+            ),
+            num_accepted_drafts_per_req_cpu=[],
+            accepted_indices=torch.full(
+                (0, spec_steps + 1), -1, dtype=torch.int32, device=device
+            ),
+        )
