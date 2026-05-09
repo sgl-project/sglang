@@ -14,8 +14,18 @@ variant to make the operation idempotent against accidental reruns.
 import argparse
 import os
 import sys
+import time
 
 import requests
+
+# When the marker isn't found, retry a few times before giving up. The
+# usual cause is a brief race where the dispatched workflow finishes its
+# writeback step before the handler edits the placeholder comment with the
+# final body containing markers. If retries don't help (e.g. the handler
+# failed to edit the placeholder at all), we still return 0 — failing here
+# would amplify a single placeholder-edit failure into N noisy finalizer
+# job failures, one per dispatched batch.
+RETRY_DELAYS_SEC = [0, 5, 15]
 
 
 def main():
@@ -43,18 +53,31 @@ def main():
     }
     url = f"https://api.github.com/repos/{args.repo}/issues/comments/{args.comment_id}"
 
-    resp = requests.get(url, headers=headers, timeout=15)
-    if resp.status_code != 200:
-        print(f"GET failed: {resp.status_code} {resp.text}")
-        return 1
-    body = resp.json().get("body") or ""
-
-    if done_marker in body:
-        print(f"Marker {done_marker} already present; nothing to do.")
+    body = None
+    for attempt, delay in enumerate(RETRY_DELAYS_SEC):
+        if delay:
+            time.sleep(delay)
+        resp = requests.get(url, headers=headers, timeout=15)
+        if resp.status_code != 200:
+            print(f"GET failed: {resp.status_code} {resp.text}")
+            return 1
+        body = resp.json().get("body") or ""
+        if done_marker in body:
+            print(f"Marker {done_marker} already present; nothing to do.")
+            return 0
+        if args.marker in body:
+            break
+        print(
+            f"Marker {args.marker} not found "
+            f"(attempt {attempt + 1}/{len(RETRY_DELAYS_SEC)}); will retry."
+        )
+    else:
+        print(
+            f"WARNING: marker {args.marker} not found after "
+            f"{len(RETRY_DELAYS_SEC)} attempts; skipping writeback. "
+            f"The handler may have failed to edit the placeholder comment."
+        )
         return 0
-    if args.marker not in body:
-        print(f"ERROR: marker {args.marker} not found in comment body")
-        return 1
 
     new_lines = []
     for line in body.splitlines(keepends=True):
