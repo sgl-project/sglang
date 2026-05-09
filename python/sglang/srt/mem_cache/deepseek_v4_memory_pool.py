@@ -193,7 +193,7 @@ class DeepSeekV4SingleKVPool(KVCache):
                 k_nope_fp8=layer_cpu["k_nope_fp8"].to(self.device, non_blocking=True),
                 k_rope_bf16=layer_cpu["k_rope_bf16"].to(self.device, non_blocking=True),
                 scale_k_nope_ue8m0=layer_cpu["scale_k_nope_ue8m0"].to(
-                     self.device, non_blocking=True
+                    self.device, non_blocking=True
                 ),
             )
             dsv4_index_buf_accessor.SetKAndS.execute(
