@@ -1,4 +1,3 @@
-from functools import lru_cache
 from typing import Optional, Union
 
 import torch
@@ -12,7 +11,6 @@ except:
     )
 
 
-@lru_cache(maxsize=1)
 def is_fa3_supported(device=None) -> bool:
     #  There some fa3 FYI
     #  FA3 can fail without a enough shared memory for a some shapes, such as higher

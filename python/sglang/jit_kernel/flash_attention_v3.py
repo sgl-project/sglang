@@ -80,7 +80,6 @@ def _load_fa3_kernel_from_sgl():
     }
 
 
-@cache_once
 def _is_fa3_supported(device=None) -> bool:
     #  There some fa3 FYI
     #  FA3 can fail without a enough shared memory for a some shapes, such as higher
