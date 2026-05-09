@@ -556,6 +556,8 @@ class LTX2SnapshotResidencyStrategy(LTX2TwoStageResidencyStrategy):
         phase = self._phase(use)
         if phase != "stage1":
             return
+        if self._snapshot_low_vram_mode:
+            return
         if self.server_args.dit_cpu_offload:
             target_module = self.pipeline.get_module("transformer")
             if self._module_is_on_gpu(target_module):
@@ -626,11 +628,11 @@ class LTX2SnapshotResidencyStrategy(LTX2TwoStageResidencyStrategy):
         if not self.server_args.dit_cpu_offload:
             return True
         phase = self._phase(use)
+        if self._snapshot_low_vram_mode and state.current_use is not None:
+            return False
         if phase == "stage2":
             if self._snapshot_strategy.is_ready("transformer_2"):
                 return True
-            if self._snapshot_low_vram_mode and state.current_use is not None:
-                return False
             if self._snapshot_low_vram_mode:
                 self._release_stage1_for_low_vram()
         self._snapshot_strategy.prefetch_component(use.component_name, module)
