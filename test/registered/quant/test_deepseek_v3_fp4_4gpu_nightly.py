@@ -1,3 +1,10 @@
+"""Nightly: DeepSeek-V3 FP4 with FlashInfer Cutlass MoE backend.
+
+Sibling per-commit file (test_deepseek_v3_fp4_4gpu.py) keeps the
+SymmetricMemory variant.
+"""
+
+import os
 import unittest
 from types import SimpleNamespace
 
@@ -12,16 +19,18 @@ from sglang.test.test_utils import (
     write_github_step_summary,
 )
 
-# Per-commit: SymmetricMemory variant only.
-# - TestDeepseekV3FP4 archived to test/manual/quant/test_deepseek_v3_fp4_4gpu_archived.py
-# - TestDeepseekV3FP4CutlassMoE moved to test_deepseek_v3_fp4_4gpu_nightly.py
-register_cuda_ci(est_time=400, suite="stage-c-test-4-gpu-b200")
+register_cuda_ci(
+    est_time=400,
+    suite="nightly-4-gpu-b200",
+    nightly=True,
+    tags=("blackwell", "deepseek", "moe", "quant"),
+)
 
 FULL_DEEPSEEK_V3_FP4_MODEL_PATH = "nvidia/DeepSeek-V3-0324-FP4"
 SERVER_LAUNCH_TIMEOUT = 1200
 
 
-class TestDeepseekV3FP4SymmetricMemory(CustomTestCase):
+class TestDeepseekV3FP4CutlassMoE(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         cls.model = FULL_DEEPSEEK_V3_FP4_MODEL_PATH
@@ -29,23 +38,26 @@ class TestDeepseekV3FP4SymmetricMemory(CustomTestCase):
         other_args = [
             "--tp",
             "4",
+            "--ep",
+            "4",
             "--attention-backend",
             "trtllm_mla",
             "--moe-runner-backend",
-            "flashinfer_trtllm",
+            "flashinfer_cutlass",
             "--quantization",
             "modelopt_fp4",
-            "--kv-cache-dtype",
-            "fp8_e4m3",
             "--model-loader-extra-config",
-            '{"enable_multithread_load": true,"num_threads": 64}',
-            "--enable-symm-mem",
+            '{"enable_multithread_load": true}',
         ]
         cls.process = popen_launch_server(
             cls.model,
             cls.base_url,
             timeout=SERVER_LAUNCH_TIMEOUT,
             other_args=other_args,
+            env={
+                **os.environ,
+                "SGLANG_MOE_NVFP4_DISPATCH": "1",  # Enable nvfp4 all gather
+            },
         )
 
     @classmethod
@@ -70,10 +82,10 @@ class TestDeepseekV3FP4SymmetricMemory(CustomTestCase):
 
         if is_in_ci():
             write_github_step_summary(
-                f"### test_gsm8k (deepseek-v3-fp4)\n" f'{metrics["score"]=:.3f}\n'
+                f"### test_gsm8k (deepseek-v3-fp4-cutlass-moe)\n"
+                f'{metrics["score"]=:.3f}\n'
             )
-
-        self.assertGreater(metrics["score"], 0.93)
+            self.assertGreater(metrics["score"], 0.93)
 
 
 if __name__ == "__main__":
