@@ -947,6 +947,8 @@ def run_scheduler_process(
     except _oom_exceptions() as _e:
         logger.warning(OOM_MSG)
         raise
+    except KeyboardInterrupt:
+        logger.info(f"Worker {rank}: Shutdown requested.")
     finally:
         # Clean up resources to speed up shutdown
         if "scheduler" in locals():

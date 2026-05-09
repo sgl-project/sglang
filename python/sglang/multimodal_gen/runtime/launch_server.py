@@ -90,6 +90,10 @@ def kill_process_tree(parent_pid, include_parent: bool = True, skip_pid: int = N
 
 def _join_or_stop_processes(processes: list[mp.Process]):
     for process in processes:
+        if process.is_alive():
+            os.kill(process.pid, signal.SIGINT)
+
+    for process in processes:
         process.join(timeout=10)
 
     for process in processes:

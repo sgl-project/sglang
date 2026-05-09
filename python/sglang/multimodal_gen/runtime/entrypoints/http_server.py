@@ -21,7 +21,6 @@ from sglang.multimodal_gen.runtime.entrypoints.post_training import (
     weights_api,
 )
 from sglang.multimodal_gen.runtime.entrypoints.utils import (
-    ShutdownReq,
     prepare_request,
     save_outputs,
 )
@@ -57,10 +56,6 @@ async def lifespan(app: FastAPI):
 
     # On shutdown
     logger.info("FastAPI app is shutting down...")
-    try:
-        await async_scheduler_client.forward(ShutdownReq(), recv_timeout_ms=5000)
-    except Exception:
-        logger.debug("Scheduler shutdown request failed.", exc_info=True)
     broker_task.cancel()
     async_scheduler_client.close()
 
