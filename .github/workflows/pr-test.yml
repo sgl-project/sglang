@@ -245,7 +245,16 @@ jobs:
           if [[ "${{ github.event_name }}" == "schedule" ]]; then
             TAGS='*'
           elif [[ "${{ github.event_name }}" == "pull_request" ]]; then
-            TAGS="$PR_LABELS_JOINED"
+            # Opt-out: a `baseline-only` label short-circuits the
+            # conditional pull-in regardless of any other labels the
+            # auto-labeler applied. Useful for PRs that touch broad
+            # globs (which would otherwise auto-add 6+ tag labels) but
+            # where the author wants a baseline-only run.
+            if echo ",$PR_LABELS_JOINED," | grep -q ",baseline-only,"; then
+              TAGS=""
+            else
+              TAGS="$PR_LABELS_JOINED"
+            fi
           elif [[ -n "${{ inputs.target_stage }}" ]]; then
             TAGS=""
             PR_HEAD_SHA="${{ inputs.pr_head_sha }}"
