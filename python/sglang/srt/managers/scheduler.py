@@ -1037,10 +1037,11 @@ class Scheduler(
         self.waiting_queue: List[Req] = []
         # The running decoding batch for continuous batching
         self.running_batch: ScheduleBatch = ScheduleBatch(reqs=[], batch_is_full=False)
-        # PP-mode running micro-batches; populated by init_pp_loop_state when PP
-        # is enabled. Default to [] so non-PP code can read self.running_mbs
-        # uniformly without hasattr guards.
-        self.running_mbs: List[ScheduleBatch] = []
+        # PP-mode running micro-batches; only created in PP mode and populated
+        # by init_pp_loop_state. Non-PP scheduler instances do not have this
+        # attribute — readers must gate on self.server_args.pp_size > 1.
+        if self.server_args.pp_size > 1:
+            self.running_mbs: List[ScheduleBatch] = []
         # The current forward batch
         self.cur_batch: Optional[ScheduleBatch] = None
         # The last forward batch
