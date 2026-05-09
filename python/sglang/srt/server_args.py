@@ -834,66 +834,6 @@ class ServerArgs:
         Orchestrates the handling of various server arguments, ensuring proper configuration and validation.
         """
 
-        if self.prefill_only_disable_kv_cache:
-            # This flag is intentionally scoped to embedding mode for now. Other
-            # prefill-only paths (for example scoring and MIS) can benefit from
-            # the same idea later, but some of them still stage K/V through the
-            # paged cache today.
-            if not self.is_embedding:
-                raise ValueError(
-                    "--prefill-only-disable-kv-cache currently requires --is-embedding. "
-                    "Other prefill-only workloads may be supported in a future change once "
-                    "their attention paths stop reading or writing the paged KV cache."
-                )
-            if self.kv_cache_dtype == "fp4_e2m1":
-                raise ValueError(
-                    "--prefill-only-disable-kv-cache does not currently support "
-                    "--kv-cache-dtype=fp4_e2m1 because the FP4 pool uses a separate "
-                    "allocation path."
-                )
-
-            # Structural preconditions for the FA backend's fa_skip_kv_cache
-            # path, which is the only embedding path that doesn't read or write
-            # the pool today:
-            # - chunked_prefill_size == -1 keeps a request in a single forward,
-            #   so K/V never has to be reused across prefill chunks.
-            # - disable_radix_cache stops the prefix cache from indexing pool
-            #   slots that no longer hold real data.
-            if self.chunked_prefill_size != -1:
-                raise ValueError(
-                    "--prefill-only-disable-kv-cache requires --chunked-prefill-size=-1 so the FA backend "
-                    "takes the fa_skip_kv_cache path; otherwise the pool would be touched between prefill chunks."
-                )
-            if not self.disable_radix_cache:
-                raise ValueError(
-                    "--prefill-only-disable-kv-cache requires --disable-radix-cache because the radix cache "
-                    "indexes KV pool slots that no longer hold real data."
-                )
-
-            # Context-parallel prefill stages K/V through cp_allgather_and_save_kv_cache,
-            # which writes to the pool via set_kv_buffer. NoOpMHATokenToKVPool intentionally
-            # raises on writes, so the engine would boot fine but fail on the first request.
-            if self.attn_cp_size > 1:
-                raise ValueError(
-                    "--prefill-only-disable-kv-cache is incompatible with --attn-cp-size > 1: "
-                    "the context-parallel attention path writes K/V to the pool via set_kv_buffer, "
-                    "which the no-op pool intentionally rejects."
-                )
-            if self.enable_prefill_context_parallel:
-                raise ValueError(
-                    "--prefill-only-disable-kv-cache is incompatible with "
-                    "--enable-prefill-context-parallel: the prefill-CP path stages K/V through "
-                    "the paged cache, which the no-op pool does not support."
-                )
-
-            # HiSparse selects a different pool class (HiSparseNSATokenToKVPool /
-            # HiSparseTokenToKVPoolAllocator) that is not the no-op pool.
-            if self.enable_hisparse:
-                raise ValueError(
-                    "--prefill-only-disable-kv-cache is incompatible with --enable-hisparse: "
-                    "HiSparse uses a dedicated pool family that is not the no-op MHA pool."
-                )
-
         self._maybe_download_model_for_runai()
 
         # Normalize load balancing defaults early (before dummy-model short-circuit).
@@ -969,14 +909,7 @@ class ServerArgs:
         # the final attention backend and chunked_prefill_size are in effect.
         self._handle_multi_item_scoring()
 
-        if self.prefill_only_disable_kv_cache:
-            prefill_backend, _ = self.get_attention_backends()
-            if prefill_backend not in ("fa3", "fa4"):
-                raise ValueError(
-                    "--prefill-only-disable-kv-cache currently requires the FA prefill backend "
-                    f"(fa3/fa4), but got prefill backend {prefill_backend!r}. Other prefill-only "
-                    "workloads and backends may be supported in a future change."
-                )
+        self._handle_prefill_only_disable_kv_cache()
 
         # Handle Hicache settings.
         self._handle_hicache()
@@ -3292,6 +3225,82 @@ class ServerArgs:
             self.disable_overlap_schedule = True
             logger.warning(
                 "Pipeline parallelism is incompatible with overlap schedule."
+            )
+
+    def _handle_prefill_only_disable_kv_cache(self):
+        """Validate --prefill-only-disable-kv-cache constraints.
+
+        Must run after _handle_multi_item_scoring() so that the final attention
+        backend and chunked_prefill_size are in effect.
+        """
+        if not self.prefill_only_disable_kv_cache:
+            return
+
+        # This flag is intentionally scoped to embedding mode for now. Other
+        # prefill-only paths (for example scoring and MIS) can benefit from
+        # the same idea later, but some of them still stage K/V through the
+        # paged cache today.
+        if not self.is_embedding:
+            raise ValueError(
+                "--prefill-only-disable-kv-cache currently requires --is-embedding. "
+                "Other prefill-only workloads may be supported in a future change once "
+                "their attention paths stop reading or writing the paged KV cache."
+            )
+        if self.kv_cache_dtype == "fp4_e2m1":
+            raise ValueError(
+                "--prefill-only-disable-kv-cache does not currently support "
+                "--kv-cache-dtype=fp4_e2m1 because the FP4 pool uses a separate "
+                "allocation path."
+            )
+
+        # Structural preconditions for the FA backend's fa_skip_kv_cache path,
+        # which is the only embedding path that doesn't read or write the pool:
+        # - chunked_prefill_size == -1 keeps a request in a single forward,
+        #   so K/V never has to be reused across prefill chunks.
+        # - disable_radix_cache stops the prefix cache from indexing pool
+        #   slots that no longer hold real data.
+        if self.chunked_prefill_size != -1:
+            raise ValueError(
+                "--prefill-only-disable-kv-cache requires --chunked-prefill-size=-1 so the FA "
+                "backend takes the fa_skip_kv_cache path; otherwise the pool would be touched "
+                "between prefill chunks."
+            )
+        if not self.disable_radix_cache:
+            raise ValueError(
+                "--prefill-only-disable-kv-cache requires --disable-radix-cache because the "
+                "radix cache indexes KV pool slots that no longer hold real data."
+            )
+
+        # Context-parallel prefill stages K/V through cp_allgather_and_save_kv_cache,
+        # which writes to the pool via set_kv_buffer. NoOpMHATokenToKVPool intentionally
+        # raises on writes, so the engine would boot fine but fail on the first request.
+        if self.attn_cp_size > 1:
+            raise ValueError(
+                "--prefill-only-disable-kv-cache is incompatible with --attn-cp-size > 1: "
+                "the context-parallel attention path writes K/V to the pool via set_kv_buffer, "
+                "which the no-op pool intentionally rejects."
+            )
+        if self.enable_prefill_context_parallel:
+            raise ValueError(
+                "--prefill-only-disable-kv-cache is incompatible with "
+                "--enable-prefill-context-parallel: the prefill-CP path stages K/V through "
+                "the paged cache, which the no-op pool does not support."
+            )
+
+        # HiSparse selects a different pool class (HiSparseNSATokenToKVPool /
+        # HiSparseTokenToKVPoolAllocator) that is not the no-op pool.
+        if self.enable_hisparse:
+            raise ValueError(
+                "--prefill-only-disable-kv-cache is incompatible with --enable-hisparse: "
+                "HiSparse uses a dedicated pool family that is not the no-op MHA pool."
+            )
+
+        prefill_backend, _ = self.get_attention_backends()
+        if prefill_backend not in ("fa3", "fa4"):
+            raise ValueError(
+                "--prefill-only-disable-kv-cache currently requires the FA prefill backend "
+                f"(fa3/fa4), but got prefill backend {prefill_backend!r}. Other prefill-only "
+                "workloads and backends may be supported in a future change."
             )
 
     def _handle_hicache(self):
