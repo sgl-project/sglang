@@ -146,10 +146,16 @@ class TestServerArgsPathExpansion(unittest.TestCase):
 
             with patch.object(sys, "argv", ["sglang", "serve"] + argv):
                 args, unknown_args = parser.parse_known_args(argv)
-                with patch.object(
-                    PipelineConfig,
-                    "from_kwargs",
-                    return_value=QwenImagePipelineConfig(),
+                with (
+                    patch.object(
+                        PipelineConfig,
+                        "from_kwargs",
+                        return_value=QwenImagePipelineConfig(),
+                    ),
+                    patch(
+                        "sglang.multimodal_gen.registry.get_model_info",
+                        return_value=None,
+                    ),
                 ):
                     server_args = ServerArgs.from_cli_args(args, unknown_args)
 
