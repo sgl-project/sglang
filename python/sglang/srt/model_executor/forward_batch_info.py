@@ -444,6 +444,12 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # Optional session/request metadata threaded from SRT scheduler requests.
     session_forward_metadata: Optional[List[Dict[str, Any]]] = None
 
+    # colocated omni generation query attention is full over live SRT KV
+    temporary_context_attention_mode: Optional[str] = None
+
+    def use_temporary_full_query_attention(self) -> bool:
+        return self.temporary_context_attention_mode == "full_query"
+
     @classmethod
     def init_new(
         cls,

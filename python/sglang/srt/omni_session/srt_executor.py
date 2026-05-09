@@ -857,13 +857,15 @@ class OmniSRTSchedulerExecutor:
             global_forward_mode=ForwardMode.EXTEND,
             is_prefill_only=True,
             rids=[f"{binding.session_id}:temporary_context"],
+            # U1 pixel-flow query tokens are bidirectional while prefix KV stays read-only
+            temporary_context_attention_mode="full_query",
         )
         forward_batch.temporary_context_forward_metadata = {
             "session_id": binding.session_id,
             "request_id": binding.request_id,
             "prefix_len": prefix_len,
             "extend_num_tokens": extend_num_tokens,
-            "attention_mode": "custom_full_query",
+            "attention_mode": "full_query",
             "attention_mask_shape": (extend_num_tokens, seq_len),
         }
         forward_batch.cross_attention_custom_mask = torch.ones(

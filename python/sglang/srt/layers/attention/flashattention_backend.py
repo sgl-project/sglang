@@ -668,6 +668,8 @@ class FlashAttentionBackend(AttentionBackend):
         causal = True
         if layer.is_cross_attention or layer.attn_type == AttentionType.ENCODER_ONLY:
             causal = False
+        if forward_batch.use_temporary_full_query_attention():
+            causal = False
 
         # Check if we should use local attention
         use_local_attn = (

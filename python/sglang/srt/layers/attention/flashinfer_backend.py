@@ -810,6 +810,8 @@ class FlashInferAttnBackend(AttentionBackend):
                 not layer.is_cross_attention
                 and layer.attn_type != AttentionType.ENCODER_ONLY
             )
+            if forward_batch.use_temporary_full_query_attention():
+                causal = False
             o = prefill_wrapper_paged.forward(
                 q.view(-1, layer.tp_q_head_num, layer.head_dim),
                 forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id),
@@ -847,6 +849,8 @@ class FlashInferAttnBackend(AttentionBackend):
                 layer.is_cross_attention
                 or layer.attn_type == AttentionType.ENCODER_ONLY
             ):
+                causal = False
+            if forward_batch.use_temporary_full_query_attention():
                 causal = False
             if not self.is_dllm_model and layer.attn_type == AttentionType.ENCODER_ONLY:
                 save_kv_cache = False

@@ -447,6 +447,8 @@ class TorchNativeAttnBackend(AttentionBackend):
             or getattr(forward_batch, "cross_attention_custom_mask", None) is not None
         ):
             causal = False
+        if forward_batch.use_temporary_full_query_attention():
+            causal = False
 
         run_extend = (
             self._run_eager_forward_extend

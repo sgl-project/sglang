@@ -918,6 +918,8 @@ class TritonAttnBackend(AttentionBackend):
             )
         ):
             causal = False
+        if forward_batch.use_temporary_full_query_attention():
+            causal = False
 
         # Deterministic mode: use unified 1-stage kernel
         if self.enable_deterministic:
