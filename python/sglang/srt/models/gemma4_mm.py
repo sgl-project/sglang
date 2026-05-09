@@ -820,20 +820,6 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
                     weight_loader = param.weight_loader
                     weight_loader(param, loaded_weight, fused_name, sid, expert_id)
                     loaded_params.add(fused_name)
-                else:
-                    # The bug this branch fixes was a silent skip of every
-                    # routed-expert weight, leading to all-`<pad>` generation.
-                    # Warn loudly so a future ckpt-format drift surfaces here
-                    # instead of silently producing garbage outputs again.
-                    logger.warning(
-                        "Per-expert FP8 weight %r matched the loader regex "
-                        "but target fused param %r not found in model — "
-                        "expert %d %s will be uninitialized.",
-                        name,
-                        fused_name,
-                        expert_id,
-                        proj,
-                    )
                 continue
 
             # MoE expert weights checked first (gate_up_proj contains "up_proj"
