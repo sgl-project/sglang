@@ -190,14 +190,10 @@ class DeepSeekV4SingleKVPool(KVCache):
             if layer_cpu["k_nope_fp8"] is None:
                 continue
             pack = NopeFp8RopeBf16Pack(
-                k_nope_fp8=layer_cpu["k_nope_fp8"].to(
-                    self.device, non_blocking=True
-                ),
-                k_rope_bf16=layer_cpu["k_rope_bf16"].to(
-                    self.device, non_blocking=True
-                ),
+                k_nope_fp8=layer_cpu["k_nope_fp8"].to(self.device, non_blocking=True),
+                k_rope_bf16=layer_cpu["k_rope_bf16"].to(self.device, non_blocking=True),
                 scale_k_nope_ue8m0=layer_cpu["scale_k_nope_ue8m0"].to(
-                    self.device, non_blocking=True
+                     self.device, non_blocking=True
                 ),
             )
             dsv4_index_buf_accessor.SetKAndS.execute(
@@ -418,18 +414,18 @@ class DeepSeekV4IndexerPool(KVCache):
         loc_slot = loc_i64 % page_size
 
         flat_buf = buf.flatten()
-        k_offsets = (
-            loc_page * buf_numel_per_page + loc_slot * head_dim
-        )[:, None] + torch.arange(head_dim, dtype=torch.int64, device=device)[None, :]
+        k_offsets = (loc_page * buf_numel_per_page + loc_slot * head_dim)[
+            :, None
+        ] + torch.arange(head_dim, dtype=torch.int64, device=device)[None, :]
         index_k = flat_buf[k_offsets.flatten()].view(num_tokens, head_dim).contiguous()
 
         s_offsets = (
             loc_page * buf_numel_per_page
             + s_offset_in_page
             + loc_slot * s_bytes_per_token
-        )[:, None] + torch.arange(
-            s_bytes_per_token, dtype=torch.int64, device=device
-        )[None, :]
+        )[:, None] + torch.arange(s_bytes_per_token, dtype=torch.int64, device=device)[
+            None, :
+        ]
         index_k_scale = (
             flat_buf[s_offsets.flatten()]
             .view(num_tokens, s_bytes_per_token)
@@ -459,33 +455,30 @@ class DeepSeekV4IndexerPool(KVCache):
 
         flat_buf = buf.flatten()
 
-        k_offsets = (
-            loc_page * buf_numel_per_page + loc_slot * head_dim
-        )[:, None] + torch.arange(head_dim, dtype=torch.int64, device=device)[None, :]
+        k_offsets = (loc_page * buf_numel_per_page + loc_slot * head_dim)[
+            :, None
+        ] + torch.arange(head_dim, dtype=torch.int64, device=device)[None, :]
         flat_buf[k_offsets.flatten()] = index_k_bytes.contiguous().view(-1)
 
         s_offsets = (
             loc_page * buf_numel_per_page
             + s_offset_in_page
             + loc_slot * s_bytes_per_token
-        )[:, None] + torch.arange(
-            s_bytes_per_token, dtype=torch.int64, device=device
-        )[None, :]
+        )[:, None] + torch.arange(s_bytes_per_token, dtype=torch.int64, device=device)[
+            None, :
+        ]
         flat_buf[s_offsets.flatten()] = index_k_scale_bytes.contiguous().view(-1)
 
     def get_cpu_copy(self, indices: torch.Tensor, mamba_indices=None):
         if indices.numel() == 0:
             return [
-                {"index_k": None, "index_k_scale": None}
-                for _ in range(self.layer_num)
+                {"index_k": None, "index_k_scale": None} for _ in range(self.layer_num)
             ]
 
         loc = indices.to(self.device, dtype=torch.int64)
         layers_cpu = []
         for layer_id in range(self.layer_num):
-            index_k, index_k_scale = self._gather_per_token_index_k_scale(
-                layer_id, loc
-            )
+            index_k, index_k_scale = self._gather_per_token_index_k_scale(layer_id, loc)
             layers_cpu.append(
                 {
                     "index_k": index_k.to("cpu", non_blocking=True),
@@ -506,9 +499,7 @@ class DeepSeekV4IndexerPool(KVCache):
             index_k_scale = layer_cpu["index_k_scale"].to(
                 self.device, non_blocking=True
             )
-            self._scatter_per_token_index_k_scale(
-                layer_id, loc, index_k, index_k_scale
-            )
+            self._scatter_per_token_index_k_scale(layer_id, loc, index_k, index_k_scale)
 
 
 class DeepSeekV4LayerItem(NamedTuple):
