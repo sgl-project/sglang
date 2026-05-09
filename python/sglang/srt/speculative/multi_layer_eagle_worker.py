@@ -275,9 +275,7 @@ class MultiLayerEagleWorker(TpModelWorker):
                 verify_input = self.draft(batch)
             # Install verify_input as `batch.spec_info` for the verify forward.
             batch.spec_info = verify_input
-            logits_output, verify_output, can_run_cuda_graph = self.verify(
-                batch, verify_input
-            )
+            logits_output, verify_output, can_run_cuda_graph = self.verify(batch)
 
             with self.draft_tp_context(
                 self.mtp_model_runner(0).tp_group
@@ -482,10 +480,8 @@ class MultiLayerEagleWorker(TpModelWorker):
         # allocator and kv cache pool are shared with target worker
         pass
 
-    def verify(self, batch: ScheduleBatch, spec_info: EagleVerifyInput):
-        # Caller (forward_batch_generation) is responsible for installing
-        # `spec_info` as `batch.spec_info` before calling.
-        assert batch.spec_info is spec_info
+    def verify(self, batch: ScheduleBatch):
+        spec_info: EagleVerifyInput = batch.spec_info
         spec_info.prepare_for_verify(batch, self.page_size)
         batch.return_hidden_states = False
         batch.forward_mode = (
@@ -667,11 +663,7 @@ class MultiLayerEagleWorker(TpModelWorker):
     def forward_draft_extend_after_decode(
         self, batch: ScheduleBatch, verify_output: EagleVerifyOutput
     ) -> EagleDraftInput:
-        # Caller (forward_batch_generation) is responsible for installing
-        # verify_output.draft_extend_input as batch.spec_info before calling.
-        draft_extend_input = verify_output.draft_extend_input
-        assert isinstance(draft_extend_input, EagleDraftExtendInput)
-        assert batch.spec_info is draft_extend_input
+        draft_extend_input: EagleDraftExtendInput = batch.spec_info
 
         # Backup fields that will be modified in-place
         seq_lens_backup = batch.seq_lens.clone()

@@ -450,9 +450,7 @@ class FrozenKVMTPWorker(TpModelWorker):
 
         # Install verify_input as `batch.spec_info` for the verify forward.
         batch.spec_info = verify_input
-        logits_output, verify_output, can_run_cuda_graph = self.verify(
-            batch, verify_input
-        )
+        logits_output, verify_output, can_run_cuda_graph = self.verify(batch)
 
         if get_global_tracing_enabled():
             for idx, req in enumerate(batch.reqs):
@@ -515,13 +513,9 @@ class FrozenKVMTPWorker(TpModelWorker):
     def forward_draft_extend_after_decode(
         self, batch: ScheduleBatch, verify_output: EagleVerifyOutput
     ) -> None:
-        # Caller (forward_batch_generation) is responsible for installing
-        # verify_output.draft_extend_input as batch.spec_info before calling.
-        # `_run_assistant_seed_step` will replace it with a fresh
+        # `_run_assistant_seed_step` will replace `batch.spec_info` with a fresh
         # `FrozenKVMTPDraftInput` for the next iter's draft.
-        draft_extend_input = verify_output.draft_extend_input
-        assert isinstance(draft_extend_input, FrozenKVMTPDraftExtendInput)
-        assert batch.spec_info is draft_extend_input
+        draft_extend_input: FrozenKVMTPDraftExtendInput = batch.spec_info
         input_is_idle = batch.forward_mode.is_idle()
 
         if not input_is_idle and verify_output.unfinished_accept_tokens.numel() == 0:
@@ -708,10 +702,8 @@ class FrozenKVMTPWorker(TpModelWorker):
             score_list, token_list, parents_list, self.speculative_num_draft_tokens
         )
 
-    def verify(self, batch: ScheduleBatch, spec_info: FrozenKVMTPVerifyInput):
-        # Caller (forward_batch_generation) is responsible for installing
-        # `spec_info` as `batch.spec_info` before calling.
-        assert batch.spec_info is spec_info
+    def verify(self, batch: ScheduleBatch):
+        spec_info: FrozenKVMTPVerifyInput = batch.spec_info
         seq_lens_pre_verify = batch.seq_lens.clone()
         spec_info.prepare_for_verify(batch, self.page_size)
         spec_info.num_tokens_per_req = self.speculative_num_steps + 1
