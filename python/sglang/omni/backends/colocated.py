@@ -25,7 +25,6 @@ class ColocatedPipelineBackend:
     pipeline: Any
     server_args: Any
     context_ops_extra_key: str
-    output_extra_key: str
 
     def generate_segment(
         self,
@@ -33,12 +32,10 @@ class ColocatedPipelineBackend:
         context_ops: ContextOps,
     ) -> GeneratedSegment:
         batch = self._build_batch(request, context_ops)
-        self.pipeline.forward(batch, self.server_args)
-        segment = batch.extra.get(self.output_extra_key)
+        batch = self.pipeline.forward(batch, self.server_args)
+        segment = batch.generated_segment
         if segment is None:
-            raise ValueError(
-                f"Colocated pipeline did not set extra[{self.output_extra_key!r}]"
-            )
+            raise ValueError("Colocated pipeline did not set generated_segment")
         return coerce_generated_segment(segment)
 
     def _build_batch(self, request: OmniRequest, context_ops: ContextOps) -> Req:

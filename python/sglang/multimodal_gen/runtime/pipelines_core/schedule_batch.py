@@ -202,6 +202,7 @@ class Req:
     output: torch.Tensor | None = None
     audio: torch.Tensor | None = None
     audio_sample_rate: int | None = None
+    generated_segment: Any | None = None
 
     def __init__(self, **kwargs):
         # Initialize dataclass fields

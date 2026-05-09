@@ -9,19 +9,15 @@ from sglang.multimodal_gen.configs.sample.sensenova_u1 import (
     build_sensenova_u1_sampling_params,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
-from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.sensenova_u1_executor import (
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.sensenova_u1.pixel_flow import (
+    SenseNovaU1PixelFlowStage,
     _resolve_u1_contexts,
-)
-from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.sensenova_u1_denoise import (
     _should_apply_cfg,
-)
-from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.sensenova_u1_prepare import (
-    SenseNovaU1PixelFlowPreparer,
 )
 
 
 class TestSenseNovaU1PixelFlow(unittest.TestCase):
-    def test_preparer_keeps_position_and_timestep_baseline(self):
+    def test_stage_prepare_keeps_position_and_timestep_baseline(self):
         params = build_sensenova_u1_sampling_params(
             {
                 "width": 16,
@@ -32,9 +28,10 @@ class TestSenseNovaU1PixelFlow(unittest.TestCase):
             }
         )
         batch = Req(sampling_params=params, prompt="draw")
-        preparer = SenseNovaU1PixelFlowPreparer(_FakeModel())
+        stage = SenseNovaU1PixelFlowStage()
 
-        prepared = preparer.forward(
+        prepared = stage._prepare(
+            model=_FakeModel(),
             context_metadata={},
             batch=batch,
             u1_context=SimpleNamespace(
@@ -57,7 +54,7 @@ class TestSenseNovaU1PixelFlow(unittest.TestCase):
         self.assertEqual(7, prepared.seed)
         self.assertEqual((1, 3, 16, 16), tuple(prepared.image_prediction.shape))
 
-    def test_preparer_prefers_expanded_batch_seed(self):
+    def test_stage_prepare_prefers_expanded_batch_seed(self):
         params = build_sensenova_u1_sampling_params(
             {
                 "width": 16,
@@ -68,9 +65,10 @@ class TestSenseNovaU1PixelFlow(unittest.TestCase):
         )
         batch = Req(sampling_params=params, prompt="draw")
         batch.seeds = [19]
-        preparer = SenseNovaU1PixelFlowPreparer(_FakeModel())
+        stage = SenseNovaU1PixelFlowStage()
 
-        prepared = preparer.forward(
+        prepared = stage._prepare(
+            model=_FakeModel(),
             context_metadata={},
             batch=batch,
             u1_context=SimpleNamespace(
@@ -89,7 +87,7 @@ class TestSenseNovaU1PixelFlow(unittest.TestCase):
                 "cfg_img_scale": 1.0,
             }
         )
-        params.ug_generation_mode = "edit"
+        params.omni_generation_mode = "edit"
         batch = Req(sampling_params=params, prompt="edit")
 
         full, img_condition, uncondition = _resolve_u1_contexts(

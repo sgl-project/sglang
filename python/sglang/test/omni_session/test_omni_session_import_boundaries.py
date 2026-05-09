@@ -66,17 +66,14 @@ class TestOmniSessionImportBoundaries(unittest.TestCase):
             / "runtime"
             / "pipelines"
             / "sensenova_u1.py",
-            root / "sensenova_u1_executor.py",
-            root / "sensenova_u1_prepare.py",
-            root / "sensenova_u1_denoise.py",
-            root / "sensenova_u1_decode.py",
+            root / "sensenova_u1" / "pixel_flow.py",
         ]
         forbidden_patterns = (
             "bridge.runtime",
             "srt_request_executor",
             "sensenova_u1_bridge",
             "sensenova_u1_contexts",
-            "UGSessionRuntime",
+            "OmniSessionRuntime",
             "forward_vlm",
             "VLM",
             "vlm",

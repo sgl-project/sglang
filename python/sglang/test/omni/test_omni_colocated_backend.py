@@ -18,7 +18,6 @@ class TestOmniColocatedBackend(unittest.TestCase):
             pipeline=pipeline,
             server_args=server_args,
             context_ops_extra_key="ctx",
-            output_extra_key="generated",
         )
         context_ops = SimpleNamespace(metadata={"session": "s0"})
         request = OmniRequest(
@@ -56,7 +55,6 @@ class TestOmniColocatedBackend(unittest.TestCase):
             pipeline=_EmptyPipeline(),
             server_args=SimpleNamespace(),
             context_ops_extra_key="ctx",
-            output_extra_key="generated",
         )
         request = OmniRequest(
             messages=(OmniInputSegment(type="text", text="draw"),),
@@ -65,7 +63,7 @@ class TestOmniColocatedBackend(unittest.TestCase):
             ),
         )
 
-        with self.assertRaisesRegex(ValueError, "did not set extra"):
+        with self.assertRaisesRegex(ValueError, "did not set generated_segment"):
             backend.generate_segment(request, SimpleNamespace(metadata={}))
 
 
@@ -77,16 +75,18 @@ class _FakePipeline:
     def forward(self, batch, server_args):
         self.batch = batch
         self.server_args = server_args
-        batch.extra["generated"] = GeneratedSegment(
+        batch.generated_segment = GeneratedSegment(
             type="image",
             image="image-bytes",
             commit_payload="commit-image",
         )
+        return batch
 
 
 class _EmptyPipeline:
     def forward(self, batch, server_args):
-        del batch, server_args
+        del server_args
+        return batch
 
 
 if __name__ == "__main__":
