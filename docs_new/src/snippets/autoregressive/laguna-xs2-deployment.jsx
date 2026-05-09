@@ -22,7 +22,7 @@ export const LagunaXS2Deployment = () => {
       items: [
         { id: 'bf16',  label: 'BF16',  default: true },
         { id: 'fp8',   label: 'FP8',   default: false },
-        { id: 'nvfp4', label: 'NVFP4', subtitle: 'B200 only', default: false }
+        { id: 'nvfp4', label: 'NVFP4', default: false }
       ]
     },
     reasoning: {
