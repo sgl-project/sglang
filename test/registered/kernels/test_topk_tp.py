@@ -49,17 +49,81 @@ def _is_dsa_topk_broadcast_enabled() -> bool:
     return broadcast_env is not None and broadcast_env.get()
 
 
-@unittest.skipIf(
+skip_if_dsa_topk_broadcast = unittest.skipIf(
     _is_dsa_topk_broadcast_enabled(),
     "Raw top-k TP stability diagnostic is skipped when RK0 broadcast is enabled.",
 )
+
+
 @unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestNSATopkTPStability(CustomTestCase):
-    def setUp(self):
-        if _SGL_KERNEL_IMPORT_ERROR is not None:
-            self.skipTest(f"sgl_kernel is unavailable: {_SGL_KERNEL_IMPORT_ERROR}")
+    def test_stable_topk_reference_across_tp_partitions(self):
+        score, lengths, row_starts = self._make_tie_heavy_score()
 
+        outputs = self._run_for_tp_sizes(
+            self._stable_topk_indices,
+            score,
+            lengths,
+            row_starts,
+        )
+
+        self._assert_outputs_match_across_tps(outputs, "stable topk reference")
+
+    def test_stable_paged_transform_reference_across_tp_partitions(self):
+        score, lengths, row_starts = self._make_tie_heavy_score()
+        page_table = self._make_page_table()
+
+        def run_chunk(score_chunk, lengths_chunk, row_starts_chunk, chunk_start):
+            indices = self._stable_topk_indices(
+                score_chunk, lengths_chunk, row_starts_chunk
+            )
+            return torch.gather(
+                page_table[chunk_start : chunk_start + score_chunk.shape[0]],
+                dim=1,
+                index=indices.long(),
+            ).to(torch.int32)
+
+        outputs = self._run_for_tp_sizes(
+            run_chunk,
+            score,
+            lengths,
+            row_starts,
+            needs_chunk_start=True,
+        )
+
+        self._assert_outputs_match_across_tps(
+            outputs, "stable paged transform reference"
+        )
+
+    def test_stable_ragged_transform_reference_across_tp_partitions(self):
+        score, lengths, row_starts = self._make_tie_heavy_score()
+        topk_indices_offset = (
+            torch.arange(BATCH_SIZE, dtype=torch.int32, device="cuda") * TOPK_INPUT_LEN
+        )
+
+        def run_chunk(score_chunk, lengths_chunk, row_starts_chunk, chunk_start):
+            indices = self._stable_topk_indices(
+                score_chunk, lengths_chunk, row_starts_chunk
+            )
+            chunk_size = score_chunk.shape[0]
+            offsets = topk_indices_offset[chunk_start : chunk_start + chunk_size]
+            return indices + offsets.unsqueeze(1)
+
+        outputs = self._run_for_tp_sizes(
+            run_chunk,
+            score,
+            lengths,
+            row_starts,
+            needs_chunk_start=True,
+        )
+
+        self._assert_outputs_match_across_tps(
+            outputs, "stable ragged transform reference"
+        )
+
+    @skip_if_dsa_topk_broadcast
     def test_fast_topk_stable_across_tp_partitions(self):
+        self._skip_if_sgl_kernel_unavailable()
         score, lengths, row_starts = self._make_tie_heavy_score()
 
         outputs = self._run_for_tp_sizes(
@@ -71,7 +135,9 @@ class TestNSATopkTPStability(CustomTestCase):
 
         self._assert_outputs_match_across_tps(outputs, "fast_topk_v2")
 
+    @skip_if_dsa_topk_broadcast
     def test_paged_transform_stable_across_tp_partitions(self):
+        self._skip_if_sgl_kernel_unavailable()
         score, lengths, row_starts = self._make_tie_heavy_score()
         page_table = self._make_page_table()
 
@@ -99,7 +165,9 @@ class TestNSATopkTPStability(CustomTestCase):
 
         self._assert_outputs_match_across_tps(outputs, "paged topk transform")
 
+    @skip_if_dsa_topk_broadcast
     def test_ragged_transform_stable_across_tp_partitions(self):
+        self._skip_if_sgl_kernel_unavailable()
         score, lengths, row_starts = self._make_tie_heavy_score()
         topk_indices_offset = (
             torch.arange(BATCH_SIZE, dtype=torch.int32, device="cuda") * TOPK_INPUT_LEN
@@ -126,6 +194,10 @@ class TestNSATopkTPStability(CustomTestCase):
         )
 
         self._assert_outputs_match_across_tps(outputs, "ragged topk transform")
+
+    def _skip_if_sgl_kernel_unavailable(self):
+        if _SGL_KERNEL_IMPORT_ERROR is not None:
+            self.skipTest(f"sgl_kernel is unavailable: {_SGL_KERNEL_IMPORT_ERROR}")
 
     def _make_tie_heavy_score(self):
         device = "cuda"
@@ -167,6 +239,17 @@ class TestNSATopkTPStability(CustomTestCase):
             * TOPK_INPUT_LEN
         )
         return page_table + row_offsets
+
+    def _stable_topk_indices(
+        self, score: torch.Tensor, lengths: torch.Tensor, row_starts: torch.Tensor
+    ) -> torch.Tensor:
+        self.assertTrue(torch.all(lengths == TOPK_INPUT_LEN))
+        offsets = torch.arange(TOPK_INPUT_LEN, dtype=torch.long, device=score.device)
+        gather_indices = row_starts.long().unsqueeze(1) + offsets.unsqueeze(0)
+        score_windows = torch.gather(score, dim=1, index=gather_indices)
+        return torch.argsort(score_windows, dim=-1, descending=True, stable=True)[
+            :, :INDEX_TOPK
+        ].to(torch.int32)
 
     def _run_for_tp_sizes(
         self,
