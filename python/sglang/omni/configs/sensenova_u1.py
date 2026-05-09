@@ -3,6 +3,10 @@
 
 from __future__ import annotations
 
+import argparse
+import json
+import os
+import shlex
 from dataclasses import replace
 from typing import Any
 
@@ -94,7 +98,7 @@ def build_sensenova_u1_orchestrator_from_scheduler(
     *,
     scheduler: Any,
     srt_request_executor: Any | None = None,
-    srt_u_decode_max_new_tokens: int | None = None,
+    srt_ar_decode_max_new_tokens: int | None = None,
     generation_backend: Any | None = None,
     server_args: Any | None = None,
 ) -> OmniCoordinator:
@@ -104,7 +108,7 @@ def build_sensenova_u1_orchestrator_from_scheduler(
         srt_bridge=build_sensenova_u1_middle_bridge(
             scheduler=scheduler,
             srt_request_executor=srt_request_executor,
-            srt_u_decode_max_new_tokens=srt_u_decode_max_new_tokens,
+            srt_ar_decode_max_new_tokens=srt_ar_decode_max_new_tokens,
         ),
         generation_backend=generation_backend,
         server_args=server_args,
@@ -137,7 +141,7 @@ def build_sampling_params(
     else:
         sampling_params = _build_sensenova_sampling_dataclass(payload)
 
-    setattr(sampling_params, "ug_generation_mode", mode)
+    setattr(sampling_params, "omni_generation_mode", mode)
     setattr(sampling_params, "think_mode", bool(think))
     return sampling_params
 
@@ -194,15 +198,13 @@ def _build_default_generation_backend(srt_server_args: Any | None) -> Any:
         set_global_server_args,
     )
 
-    model_path = _resolve_model_path(srt_server_args)
-    pipeline_server_args = DiffusionServerArgs.from_kwargs(
-        model_path=model_path,
-        pipeline_class_name="SenseNovaU1Pipeline",
-    )
+    diffusion_server_kwargs = _build_diffusion_server_kwargs(srt_server_args)
+    pipeline_server_args = DiffusionServerArgs.from_kwargs(**diffusion_server_kwargs)
+    _validate_diffusion_server_args(pipeline_server_args)
     set_global_server_args(pipeline_server_args)
-    # u1 G is colocated with srt because each denoise step needs live srt session/KV
+    # pixel-flow generation stays colocated because each denoise step reads live SRT KV
     pipeline = SenseNovaU1Pipeline(
-        model_path,
+        pipeline_server_args.model_path,
         pipeline_server_args,
         executor=SyncExecutor(server_args=pipeline_server_args),
     )
@@ -210,8 +212,124 @@ def _build_default_generation_backend(srt_server_args: Any | None) -> Any:
         pipeline=pipeline,
         server_args=pipeline_server_args,
         context_ops_extra_key="sensenova_u1_context_ops",
-        output_extra_key="sensenova_u1_generated_segment",
     )
+
+
+def _build_diffusion_server_kwargs(srt_server_args: Any | None) -> dict[str, Any]:
+    kwargs = _parse_diffusion_server_args(
+        getattr(srt_server_args, "diffusion_server_args", None)
+    )
+    kwargs.setdefault("model_path", _resolve_model_path(srt_server_args))
+    kwargs["pipeline_class_name"] = "SenseNovaU1Pipeline"
+    return kwargs
+
+
+def _parse_diffusion_server_args(value: Any | None) -> dict[str, Any]:
+    if value is None or value == "":
+        return {}
+    if isinstance(value, dict):
+        return dict(value)
+    if not isinstance(value, str):
+        raise ValueError(
+            f"diffusion_server_args must be a string or dict, got {value!r}"
+        )
+
+    text = value.strip()
+    if not text:
+        return {}
+    if text.startswith("@"):
+        return _load_diffusion_server_args_file(text[1:])
+    if text.startswith("{"):
+        payload = json.loads(text)
+        if not isinstance(payload, dict):
+            raise ValueError("diffusion_server_args JSON must be an object")
+        return payload
+    if os.path.exists(text):
+        return _load_diffusion_server_args_file(text)
+    return _parse_diffusion_server_cli_args(text)
+
+
+def _parse_diffusion_server_cli_args(value: str) -> dict[str, Any]:
+    from sglang.multimodal_gen.runtime.entrypoints.cli.serve import (
+        add_multimodal_gen_serve_args,
+    )
+    from sglang.multimodal_gen.runtime.server_args import (
+        ServerArgs as DiffusionServerArgs,
+    )
+
+    argv = shlex.split(value)
+    parser = argparse.ArgumentParser(add_help=False)
+    add_multimodal_gen_serve_args(parser)
+    raw_args, unknown_args = parser.parse_known_args(argv)
+
+    dynamic_paths, remaining = DiffusionServerArgs._extract_component_paths(
+        unknown_args
+    )
+    dynamic_attention_backends, remaining = (
+        DiffusionServerArgs._extract_component_attention_backends(remaining)
+    )
+    if remaining:
+        raise ValueError(
+            "Unrecognized diffusion_server_args: " + " ".join(remaining)
+        )
+
+    provided_args = _provided_cli_args(raw_args, argv)
+    config_file = provided_args.get("config")
+    if config_file:
+        config_args = DiffusionServerArgs.load_config_file(config_file)
+        provided_args = {**config_args, **provided_args}
+
+    if dynamic_paths:
+        component_paths = dict(provided_args.get("component_paths") or {})
+        component_paths.update(dynamic_paths)
+        provided_args["component_paths"] = component_paths
+    if dynamic_attention_backends:
+        component_attention_backends = (
+            DiffusionServerArgs._parse_component_attention_backend_map(
+                provided_args.get("component_attention_backends")
+            )
+        )
+        component_attention_backends.update(dynamic_attention_backends)
+        provided_args["component_attention_backends"] = component_attention_backends
+    return provided_args
+
+
+def _provided_cli_args(args: argparse.Namespace, argv: list[str]) -> dict[str, Any]:
+    provided_names = set()
+    for arg in argv:
+        if arg.startswith("--"):
+            provided_names.add(arg.split("=", 1)[0].replace("-", "_").lstrip("_"))
+    return {key: value for key, value in vars(args).items() if key in provided_names}
+
+
+def _load_diffusion_server_args_file(path: str) -> dict[str, Any]:
+    from sglang.multimodal_gen.runtime.server_args import (
+        ServerArgs as DiffusionServerArgs,
+    )
+
+    payload = DiffusionServerArgs.load_config_file(path)
+    if not isinstance(payload, dict):
+        raise ValueError("diffusion_server_args file must contain an object")
+    return payload
+
+
+def _validate_diffusion_server_args(server_args: Any) -> None:
+    validate_runtime = getattr(server_args.pipeline_config, "validate_runtime", None)
+    if not callable(validate_runtime):
+        return
+
+    from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
+
+    unsupported = validate_runtime(
+        num_gpus=server_args.num_gpus,
+        enable_cfg_parallel=server_args.enable_cfg_parallel,
+        disagg_mode=server_args.disagg_role != RoleType.MONOLITHIC,
+    )
+    if unsupported:
+        raise ValueError(
+            "SenseNova U1 colocated diffusion engine does not support "
+            + ", ".join(unsupported)
+        )
 
 
 def _resolve_model_path(server_args: Any | None) -> str:

@@ -397,6 +397,7 @@ class ServerArgs:
     stream_response_default_include_usage: bool = False
     incremental_streaming_output: bool = False
     enable_streaming_session: bool = False
+    diffusion_server_args: Optional[str] = None
     random_seed: Optional[int] = None
     constrained_json_whitespace_pattern: Optional[str] = None
     constrained_json_disable_any_whitespace: bool = False
@@ -4714,6 +4715,13 @@ class ServerArgs:
             action="store_true",
             default=ServerArgs.enable_streaming_session,
             help="Enable streaming session mode and StreamingSession wrapper.",
+        )
+        parser.add_argument(
+            "--diffusion-server-args",
+            type=str,
+            default=ServerArgs.diffusion_server_args,
+            help="Arguments passed to the colocated diffusion source engine, as a "
+            "JSON object, @JSON/YAML file, or quoted sglang-diffusion CLI args.",
         )
         parser.add_argument(
             "--random-seed",
