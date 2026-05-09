@@ -412,6 +412,7 @@ class PrefillAdder:
         prefill_max_requests: Optional[int] = None,
         prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor] = None,
         dllm_config: Optional[DllmConfig] = None,
+        waiting_queue_len: int = 0,
     ):
         self.page_size = page_size
         self.tree_cache = tree_cache
@@ -466,6 +467,9 @@ class PrefillAdder:
         self.prefill_max_requests = prefill_max_requests
         self.prefill_delayer_single_pass = prefill_delayer_single_pass
         self.max_prefill_bs = max_prefill_bs
+        # Snapshot of scheduler waiting_queue length at the start of this
+        # prefill pass. Used by PrefillDelayer's queue-based trigger.
+        self.waiting_queue_len = waiting_queue_len
 
     def _init_dllm_meta(self, dllm_config: DllmConfig):
         self.dllm_block_size = dllm_config.block_size
@@ -806,6 +810,7 @@ class PrefillAdder:
                 running_batch=self.running_batch.batch_size(),
                 max_prefill_bs=self.max_prefill_bs,
                 max_running_requests=self.max_running_requests,
+                waiting_queue_len=self.waiting_queue_len,
             )
         ):
             return AddReqResult.OTHER
