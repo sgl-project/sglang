@@ -391,6 +391,14 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # Dumping
         self.dump_requests_folder = ""  # By default do not dump
         self.dump_requests_threshold = 1000
+        # Drop heavy meta_info entries from the dump payload by default. Both
+        # `routed_experts` (base64'd MoE routing tensor, ~KB-MB per request)
+        # and `hidden_states` blow up the pkl file size and are not used by
+        # the replay tooling. Override via /configure_logging if needed.
+        self.dump_requests_exclude_meta_keys: List[str] = [
+            "routed_experts",
+            "hidden_states",
+        ]
         self.dump_request_list: List[Tuple] = []
         self.crash_dump_request_list: deque[Tuple] = deque()
         self.crash_dump_performed = False  # Flag to ensure dump is only called once
@@ -1577,6 +1585,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             self.dump_requests_folder = obj.dump_requests_folder
         if obj.dump_requests_threshold is not None:
             self.dump_requests_threshold = obj.dump_requests_threshold
+        if obj.dump_requests_exclude_meta_keys is not None:
+            self.dump_requests_exclude_meta_keys = list(
+                obj.dump_requests_exclude_meta_keys
+            )
         if obj.crash_dump_folder is not None:
             self.crash_dump_folder = obj.crash_dump_folder
         logging.info(f"Config logging: {obj=}")
@@ -2193,6 +2205,19 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             )
 
     def dump_requests(self, state: ReqState, out_dict: dict):
+        # Strip heavy keys from `meta_info` (e.g. routed_experts, hidden_states)
+        # to keep the on-disk pkl small. Don't mutate the original dict — it
+        # may still be referenced by the response path or other observers.
+        if self.dump_requests_exclude_meta_keys and isinstance(
+            out_dict.get("meta_info"), dict
+        ):
+            exclude = self.dump_requests_exclude_meta_keys
+            if any(k in out_dict["meta_info"] for k in exclude):
+                filtered_meta = {
+                    k: v for k, v in out_dict["meta_info"].items() if k not in exclude
+                }
+                out_dict = {**out_dict, "meta_info": filtered_meta}
+
         self.dump_request_list.append(
             (
                 state.obj,
@@ -2243,7 +2268,23 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         def background_task():
             os.makedirs(os.path.dirname(filename), exist_ok=True)
             with open(filename, "wb") as f:
-                pickle.dump(to_dump_with_server_args, f)
+                try:
+                    pickle.dump(to_dump_with_server_args, f)
+                except Exception as e:
+                    # When the server is launched with --trust-remote-code,
+                    # server_args sometimes fails to pickle because the
+                    # lazily-attached ModelConfig holds an hf_config whose
+                    # class lives under the dynamic transformers_modules.*
+                    # namespace. Retry without server_args so the request
+                    # data still gets persisted.
+                    logger.error(
+                        f"Failed to pickle dump with server_args: {e!r}; "
+                        "retrying without server_args"
+                    )
+                    f.seek(0)
+                    f.truncate()
+                    to_dump_with_server_args["server_args"] = None
+                    pickle.dump(to_dump_with_server_args, f)
 
         asyncio.create_task(asyncio.to_thread(background_task))
 
@@ -2306,7 +2347,20 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             "launch_command": " ".join(sys.argv),
         }
         with open(filename, "wb") as f:
-            pickle.dump(data_to_dump_with_server_args, f)
+            try:
+                pickle.dump(data_to_dump_with_server_args, f)
+            except Exception as e:
+                # When the server is launched with --trust-remote-code,
+                # server_args sometimes fails to pickle. Retry without
+                # server_args so the request data still gets persisted.
+                logger.error(
+                    f"Failed to pickle dump with server_args: {e!r}; "
+                    "retrying without server_args"
+                )
+                f.seek(0)
+                f.truncate()
+                data_to_dump_with_server_args["server_args"] = None
+                pickle.dump(data_to_dump_with_server_args, f)
         logger.error(
             f"Dumped {len(self.crash_dump_request_list)} finished and {len(unfinished_requests)} unfinished requests before crash to {filename}"
         )

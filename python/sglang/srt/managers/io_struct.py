@@ -1758,6 +1758,11 @@ class ConfigureLoggingReq(BaseReq):
     dump_requests_folder: Optional[str] = None
     dump_requests_threshold: Optional[int] = None
     crash_dump_folder: Optional[str] = None
+    # Keys to strip from `meta_info` of every dumped request. Useful for
+    # dropping heavy blobs that bloat the dump file (e.g. "routed_experts"
+    # captured by --enable-routing-replay, "hidden_states" captured by
+    # --return-hidden-states). Pass an empty list to keep everything.
+    dump_requests_exclude_meta_keys: Optional[List[str]] = None
 
 
 @dataclass
