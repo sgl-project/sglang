@@ -71,7 +71,9 @@ class FrozenKVMTPVerifyInput(EagleVerifyInput):
 
     def verify(self, *args, **kwargs) -> EagleVerifyOutput:
         output = super().verify(*args, **kwargs)
-        output.extend_input = _to_frozen_kv_mtp_draft_extend_input(output.extend_input)
+        output.draft_extend_input = _to_frozen_kv_mtp_draft_extend_input(
+            output.draft_extend_input
+        )
         return output
 
 
@@ -79,13 +81,13 @@ FrozenKVMTPVerifyOutput = EagleVerifyOutput
 
 
 def _to_frozen_kv_mtp_draft_extend_input(
-    extend_input: EagleDraftExtendInput,
+    draft_extend_input: EagleDraftExtendInput,
 ) -> FrozenKVMTPDraftExtendInput:
-    if isinstance(extend_input, FrozenKVMTPDraftExtendInput):
-        return extend_input
+    if isinstance(draft_extend_input, FrozenKVMTPDraftExtendInput):
+        return draft_extend_input
     return FrozenKVMTPDraftExtendInput(
         **{
-            field.name: getattr(extend_input, field.name)
+            field.name: getattr(draft_extend_input, field.name)
             for field in fields(EagleDraftExtendInput)
         }
     )
