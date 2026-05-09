@@ -1131,6 +1131,18 @@
                 ]
               },
               {
+                "group": "Omni Models",
+                "pages": [
+                  "cookbook/omni/intro",
+                  {
+                    "group": "SenseNova",
+                    "pages": [
+                      "cookbook/omni/SenseNova/SenseNova-U1"
+                    ]
+                  }
+                ]
+              },
+              {
                 "group": "SpecBundle",
                 "pages": [
                   "cookbook/specbundle/supported_models",

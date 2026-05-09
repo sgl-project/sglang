@@ -1,16 +1,126 @@
 ---
 title: Overview
 mode: wide
-description: Practical guides for deploying and using omni models (TTS, audio) with SGLang.
+description: Practical guides for deploying and using omni models with SGLang.
 metatags:
-    description: "Explore SGLang omni model cookbooks for speech, audio, and multimodal deployment examples."
+    description: "Explore SGLang omni model cookbooks for interleaved text, image, audio, and video understanding and generation."
 ---
+
+Omni models can understand and generate across modalities such as text, image, audio, and video. Unlike a pure VLM or a pure diffusion model, an omni model may alternate between text reasoning and media generation in the same request or across multiple conversation turns.
+
+In SGLang, the omni runtime uses an orchestrator layer to coordinate specialized workers:
+
+- `srt` owns autoregressive text generation, chat state, and session KV cache.
+- `multimodal_gen` owns image, audio, and video generation backends.
+- `omni` owns the request/session orchestration that connects the pieces.
+
+The HTTP surface is split by task:
+
+- Use ordinary `/generate` or OpenAI-compatible `/v1/chat/completions` for VLM-style understanding when the model only needs to answer with text.
+- Use `/v1/omni/generate` for media generation, image editing, and interleaved responses.
+- Use `/v1/omni/sessions/{session_id}/close` to release a persistent omni session after multi-turn work.
+
+An interleaved response is an ordered sequence of output segments, for example text, image, then more text. With `keep_session: true`, the server returns a `session.id`; later requests can pass that `session_id` so the model can refer to previous turns and generated images.
+
+## Deployment Modes
+
+`sglang serve` can launch either the standard SRT server or the standalone diffusion server. `auto` is a dispatch choice, not a hybrid deployment: if a model is detected as diffusion, SGLang starts a separate `multimodal_gen` diffusion server instance and does not mount the SRT chat or omni session routes. Use `--model-type` when the model can match more than one deployment path.
+
+| Deployment | Command selector | Use when |
+| --- | --- | --- |
+| SRT / LLM server | `--model-type llm` | Text generation, VLM chat, and omni models that need SRT-owned chat state, sessions, and KV cache |
+| Standalone diffusion server | `--model-type diffusion` | Pure image/video generation models served directly by `multimodal_gen` |
+| Auto detection | `--model-type auto` or unset | Simple cases where the model path clearly belongs to only one server type |
+
+Omni models that interleave text and media should use the SRT / LLM deployment. The omni route is mounted into the SRT process, and `multimodal_gen` is used as an in-process generation backend from inside the omni orchestrator.
+
+## Omni HTTP API
+
+The omni HTTP API is shared by model cookbooks. Model-specific pages focus on supported tasks and sampling parameters, while the common request/response shape lives here.
+
+| Task | Endpoint |
+| --- | --- |
+| Generate or edit media, or run interleaved generation | `POST /v1/omni/generate` |
+| Close a persistent omni session | `POST /v1/omni/sessions/{session_id}/close` |
+| Text-only VLM understanding | Use ordinary `/generate` or OpenAI-compatible `/v1/chat/completions` |
+
+### Request Shape
+
+The request body is segment-based. `messages` contains ordered multimodal input segments; `sampling_params` is interpreted by the selected model plugin.
+
+```json Example
+{
+  "model": "<omni-model>",
+  "task": "interleave",
+  "messages": [
+    {"type": "text", "text": "Generate one image, then describe it."}
+  ],
+  "sampling_params": {
+    "width": 512,
+    "height": 512,
+    "num_steps": 20
+  },
+  "max_images": 1,
+  "max_text_segments": 2
+}
+```
+
+Supported input segment fields:
+
+| Segment type | Payload field | Notes |
+| --- | --- | --- |
+| `text` | `text` or `content` | User instructions, chat text, or edit prompts |
+| `image` | `image` | Data URL, base64 payload, or model-supported image object |
+| `audio` | `audio` | Reserved for audio-capable omni models |
+| `video` | `video` | Reserved for video-capable omni models |
+
+### Response Shape
+
+The response contains ordered output segments. A model can return text, media, or both in the same response.
+
+```json Output
+{
+  "segments": [
+    {"type": "text", "text": "Here is the image."},
+    {
+      "type": "image",
+      "image": {
+        "b64_json": "...",
+        "mime_type": "image/png"
+      }
+    }
+  ],
+  "stats": {},
+  "metadata": {}
+}
+```
+
+### Persistent Sessions
+
+Set `keep_session: true` to keep the SRT-owned session and KV cache alive after a response. The server returns `session.id`; later turns pass that value as `session_id`.
+
+```json Example
+{
+  "model": "<omni-model>",
+  "task": "interleave",
+  "keep_session": true,
+  "messages": [
+    {"type": "text", "text": "Create an image I can edit in the next turn."}
+  ]
+}
+```
+
+After the workflow is complete, close the session:
+
+```bash Command
+curl -X POST http://localhost:30000/v1/omni/sessions/<session_id>/close
+```
 
 <CardGroup cols={3}>
   <Card
-    title="FishAudio"
+    title="SenseNova U1"
     mode="card"
-    href="/cookbook/omni/FishAudio/S2-Pro.mdx"
-    img="/cards/logos/fishaudio.png"
+    href="/cookbook/omni/SenseNova/SenseNova-U1"
+    img="/cards/Omni-card.png"
   />
 </CardGroup>
