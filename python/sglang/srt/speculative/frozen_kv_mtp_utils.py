@@ -14,7 +14,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
-from typing import Tuple, Union
+from typing import Tuple
 
 import torch
 
@@ -135,11 +135,8 @@ def select_last_extend_hidden(
 
 
 def select_last_verified_seed(
-    draft_input: Union[FrozenKVMTPDraftInput, FrozenKVMTPDraftExtendInput],
+    draft_input: FrozenKVMTPDraftExtendInput,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    if draft_input.num_accepted_tokens is None:
-        return draft_input.bonus_tokens, draft_input.hidden_states
-
     counts = draft_input.num_accepted_tokens.to(torch.long)
     last_indices = torch.cumsum(counts, dim=0) - 1
     return (

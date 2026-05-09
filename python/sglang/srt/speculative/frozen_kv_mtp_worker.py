@@ -336,7 +336,7 @@ class FrozenKVMTPWorker(TpModelWorker):
         return select_last_extend_hidden(batch, hidden_states)
 
     def _select_last_verified_seed(
-        self, draft_input: FrozenKVMTPDraftInput
+        self, draft_input: FrozenKVMTPDraftExtendInput
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         return select_last_verified_seed(draft_input)
 
