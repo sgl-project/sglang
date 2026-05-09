@@ -114,7 +114,7 @@ def fused_hc_head(
     assert hc_fn.dtype == torch.float32
     assert x.dim() == 3, f"x must be 3D (T, hc_mult, hidden_size), got {x.shape}"
 
-    T_val, hc_mult, hidden_size = x.shape
+    T, hc_mult, hidden_size = x.shape
     assert hc_fn.shape == (hc_mult, hc_mult * hidden_size), (
         f"hc_fn shape {hc_fn.shape} does not match (hc_mult={hc_mult}, "
         f"hc_mult*hidden_size={hc_mult * hidden_size})"
@@ -122,9 +122,9 @@ def fused_hc_head(
     assert hc_base.shape == (hc_mult,)
     assert hc_scale.numel() == 1
 
-    y = torch.empty((T_val, hidden_size), dtype=x.dtype, device=x.device)
+    y = torch.empty((T, hidden_size), dtype=x.dtype, device=x.device)
 
-    if T_val == 0:
+    if T == 0:
         return y
 
     BLOCK_K = 512
@@ -132,7 +132,7 @@ def fused_hc_head(
 
     hc_mult_pow2 = max(1, triton.next_power_of_2(hc_mult))
 
-    grid = (T_val,)
+    grid = (T,)
     _hc_head_kernel[grid](
         x,
         hc_fn,
