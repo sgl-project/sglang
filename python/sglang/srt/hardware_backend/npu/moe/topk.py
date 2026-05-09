@@ -41,42 +41,33 @@ def fused_topk_npu(
             )
         topk_weights = topk_weights.to(torch.float32)
 
-    # Grouped top-k with correction bias
-    elif use_grouped_topk and correction_bias is not None:
-        topk_weights, topk_ids, _ = torch.ops.npu.npu_moe_gating_top_k(
-            router_logits.to(torch.float32),
-            k=topk_config.top_k,
-            bias=correction_bias.to(torch.float32),
-            k_group=topk_config.topk_group,
-            group_count=topk_config.num_expert_group,
-            group_select_mode=1,
-            renorm=0,
-            norm_type=1,
-            routed_scaling_factor=(
-                1 if renormalize else topk_config.routed_scaling_factor
-            ),
-            eps=float(1e-20),
-        )
-
-    # npu_moe_gating_top_k is not yet supported custom_routing_function
-    # torch native is not yet supported num_token_non_padded
+    # Support grouped top-k or correction bias or sigmoid or routed_scaling_factor
     elif (
-        topk_config.custom_routing_function is None
-        and num_token_non_padded is not None
-        and correction_bias is not None
+        correction_bias is not None
+        or topk_config.scoring_func == "sigmoid"
+        or num_token_non_padded is not None
     ):
         topk_weights, topk_ids, _ = torch.ops.npu.npu_moe_gating_top_k(
             router_logits.to(torch.float32),
             k=topk_config.top_k,
-            bias=correction_bias.to(torch.float32),
+            bias=(
+                correction_bias.to(torch.float32)
+                if correction_bias is not None
+                else None
+            ),
+            # num_expert_group and topk_group in some topk_config without group is None, (not supported by this ops)
+            k_group=topk_config.topk_group if use_grouped_topk else 1,
+            group_count=topk_config.num_expert_group if use_grouped_topk else 1,
+            group_select_mode=(1 if use_grouped_topk else 0),
             renorm=0,
-            norm_type=1,
+            norm_type=1,  # 1 for sigmoid, 0 for softmax
             routed_scaling_factor=(
                 1 if renormalize else topk_config.routed_scaling_factor
             ),
             eps=float(1e-20),
         )
 
+    # torch native is not yet supported num_token_non_padded
     # Fallback to torch native implementation
     else:
         topk_config.torch_native = True

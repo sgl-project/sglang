@@ -342,7 +342,8 @@ def dispatch_custom_allreduce():
     On AMD with 1-stage AR enabled, use sglang's CustomAllreduce.
     Otherwise use AiterCustomAllreduce if available.
 
-    Set SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2=1 to use the JIT-compiled v2 implementation.
+    On CUDA, the JIT-compiled v2 implementation is used by default.
+    Set SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2=0 to fall back to the legacy CustomAllreduce.
     """
     if _is_cuda and envs.SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2.get():
         from .custom_all_reduce_v2 import CustomAllReduceV2

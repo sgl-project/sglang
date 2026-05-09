@@ -160,6 +160,8 @@ class ServerArgs(DisaggArgsMixin):
     dp_degree: int = 1
     # cfg parallel (None = auto-decide based on num_gpus)
     enable_cfg_parallel: Optional[bool] = None
+    # number of GPUs in each CFG parallel group (None = auto, 1 = disabled, N > 1 = enabled)
+    cfg_parallel_degree: Optional[int] = None
 
     hsdp_replicate_dim: int = 1
     hsdp_shard_dim: Optional[int] = None
@@ -211,6 +213,10 @@ class ServerArgs(DisaggArgsMixin):
     warmup_steps: int = 1
 
     disable_autocast: bool | None = None
+
+    # Explicit quantization method override (e.g. "mxfp8", "fp8", "modelslim").
+    # When set, the transformer loader will use this instead of auto-detection.
+    quantization: str | None = None
 
     # Quantization / Nunchaku SVDQuant configuration
     nunchaku_config: NunchakuSVDQuantArgs | NunchakuConfig | None = field(
@@ -671,6 +677,14 @@ class ServerArgs(DisaggArgsMixin):
         if self.tp_size is None:
             self.tp_size = 1
 
+        # --cfg-parallel-size takes precedence over --enable-cfg-parallel bool.
+        if self.cfg_parallel_degree is not None:
+            if self.cfg_parallel_degree == 1:
+                self.enable_cfg_parallel = False
+            elif self.cfg_parallel_degree > 1:
+                self.enable_cfg_parallel = True
+            cfg_unspecified = False
+
         # Auto-enable CFG parallel when user hasn't set any parallelism flags
         # and there are enough GPUs.  Only auto-enable for models whose default
         # SamplingParams use classifier-free guidance (negative_prompt is not None),
@@ -695,11 +709,15 @@ class ServerArgs(DisaggArgsMixin):
             else:
                 self.enable_cfg_parallel = False
 
+        # Resolve cfg_parallel_degree to a concrete int now that enable_cfg_parallel is settled.
+        if self.cfg_parallel_degree is None:
+            self.cfg_parallel_degree = 2 if self.enable_cfg_parallel else 1
+
         # adjust sp_degree: allocate all remaining GPUs after TP and DP
         if self.sp_degree is None:
             num_gpus_per_group = self.dp_size * self.tp_size
             if self.enable_cfg_parallel:
-                num_gpus_per_group *= 2
+                num_gpus_per_group *= self.cfg_parallel_degree
             if self.num_gpus % num_gpus_per_group == 0:
                 self.sp_degree = self.num_gpus // num_gpus_per_group
             else:
@@ -739,10 +757,6 @@ class ServerArgs(DisaggArgsMixin):
             return False
         default_params = model_info.sampling_param_cls()
 
-        # for ltx2.3, cfg-parallel performs worse than ulysses-sp
-        is_ltx = "ltx" in type(default_params).__name__.lower()
-        if is_ltx:
-            return False
         return (
             getattr(default_params, "negative_prompt", None) is not None
             and getattr(default_params, "guidance_scale", 0) > 1.0
@@ -976,7 +990,18 @@ class ServerArgs(DisaggArgsMixin):
             "--enable-cfg-parallel",
             action="store_true",
             default=None,
-            help="Enable cfg parallel. Auto-enabled when num_gpus >= 2 and no SP flags are set.",
+            help="Enable cfg parallel at degree 2. Auto-enabled when num_gpus >= 2 and no SP flags are set.",
+        )
+        parser.add_argument(
+            "--cfg-parallel-size",
+            dest="cfg_parallel_degree",
+            type=int,
+            default=None,
+            help=(
+                "Number of GPUs per CFG parallel group (1 = disabled, N > 1 = enabled at degree N). "
+                "Supersedes --enable-cfg-parallel. Allows 4-branch CFG parallel (e.g., --cfg-parallel-size 4) "
+                "for models with cond + neg + perturbed + modality branches."
+            ),
         )
         parser.add_argument(
             "--data-parallel-size",
@@ -1115,6 +1140,14 @@ class ServerArgs(DisaggArgsMixin):
             "--disable-autocast",
             action=StoreBoolean,
             help="Disable autocast for denoising loop and vae decoding in pipeline sampling",
+        )
+
+        parser.add_argument(
+            "--quantization",
+            type=str,
+            default=None,
+            help='Quantization method override (e.g. "mxfp8", "fp8", "modelslim"). '
+            "When set, the transformer loader will use this instead of auto-detection.",
         )
 
         # Nunchaku SVDQuant quantization parameters
@@ -1627,11 +1660,13 @@ class ServerArgs(DisaggArgsMixin):
 
         num_gpus_per_group = self.dp_size * self.tp_size
         if self.enable_cfg_parallel:
-            num_gpus_per_group *= 2
+            num_gpus_per_group *= self.cfg_parallel_degree
 
         if self.num_gpus % num_gpus_per_group != 0:
             raise ValueError(
-                f"num_gpus ({self.num_gpus}) must be divisible by (dp_size * tp_size{' * 2' if self.enable_cfg_parallel else ''}) = {num_gpus_per_group}"
+                f"num_gpus ({self.num_gpus}) must be divisible by (dp_size * tp_size"
+                f"{f' * {self.cfg_parallel_degree}' if self.enable_cfg_parallel else ''}"
+                f") = {num_gpus_per_group}"
             )
 
         if self.sp_degree != self.ring_degree * self.ulysses_degree:
