@@ -275,7 +275,7 @@ class MultiLayerEagleWorker(TpModelWorker):
                 verify_input = self.draft(batch)
             # Install verify_input as `batch.spec_info` for the verify forward.
             batch.spec_info = verify_input
-            logits_output, verify_output, can_run_cuda_graph = self.verify(batch)
+            verify_output = self.verify(batch)
 
             with self.draft_tp_context(
                 self.mtp_model_runner(0).tp_group
@@ -295,10 +295,10 @@ class MultiLayerEagleWorker(TpModelWorker):
                     batch.spec_info = next_draft_input
 
             return GenerationBatchResult(
-                logits_output=logits_output,
+                logits_output=verify_output.logits_output,
                 next_token_ids=verify_output.accept_tokens,
                 num_accepted_drafts=sum(verify_output.num_accepted_drafts_per_req_cpu),
-                can_run_cuda_graph=can_run_cuda_graph,
+                can_run_cuda_graph=verify_output.can_run_cuda_graph,
             )
 
     def check_forward_draft_extend_after_decode(
@@ -598,7 +598,8 @@ class MultiLayerEagleWorker(TpModelWorker):
             ForwardMode.DECODE if not batch.forward_mode.is_idle() else ForwardMode.IDLE
         )
 
-        return logits_output, res, can_run_cuda_graph
+        res.can_run_cuda_graph = can_run_cuda_graph
+        return res
 
     def forward_draft_extend(
         self,

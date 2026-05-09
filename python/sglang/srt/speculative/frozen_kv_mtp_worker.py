@@ -449,7 +449,7 @@ class FrozenKVMTPWorker(TpModelWorker):
 
         # Install verify_input as `batch.spec_info` for the verify forward.
         batch.spec_info = verify_input
-        logits_output, verify_output, can_run_cuda_graph = self.verify(batch)
+        verify_output = self.verify(batch)
 
         if get_global_tracing_enabled():
             for idx, req in enumerate(batch.reqs):
@@ -473,11 +473,11 @@ class FrozenKVMTPWorker(TpModelWorker):
         set_time_batch(batch.reqs, "set_spec_draft_extend_end_time", trace_only=True)
 
         return GenerationBatchResult(
-            logits_output=logits_output,
+            logits_output=verify_output.logits_output,
             next_token_ids=verify_output.accept_tokens,
             num_accepted_drafts=sum(verify_output.num_accepted_drafts_per_req_cpu),
             num_accepted_drafts_per_req_cpu=verify_output.num_accepted_drafts_per_req_cpu,
-            can_run_cuda_graph=can_run_cuda_graph,
+            can_run_cuda_graph=verify_output.can_run_cuda_graph,
         )
 
     def forward_target_extend(
@@ -779,4 +779,5 @@ class FrozenKVMTPWorker(TpModelWorker):
         )
 
         del seq_lens_pre_verify
-        return logits_output, res, can_run_cuda_graph
+        res.can_run_cuda_graph = can_run_cuda_graph
+        return res
