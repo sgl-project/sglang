@@ -913,10 +913,11 @@ class EagleVerifyOutput:
     # All accepted tokens flat across all reqs incl. those that finished this
     # step. Includes the bonus token. Used for output processing.
     accept_tokens: torch.Tensor
-    # Accepted token length per sequence in a batch in CPU (full set).
-    num_accepted_drafts_per_req_cpu: List[int]
     # Accepted indices from logits_output.next_token_logits
     accepted_indices: torch.Tensor
+    # Per-req accepted draft count (no bonus). V1 fills this for tracing /
+    # adaptive controller; V2 leaves it None to avoid the CPU sync.
+    num_accepted_drafts_per_req_cpu: Optional[List[int]] = None
 
     @classmethod
     def create_idle(
