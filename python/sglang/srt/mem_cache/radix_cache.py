@@ -437,8 +437,17 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
 
     def cache_finished_req(self, req: Req, is_insert: bool = True):
         """Cache request when it finishes."""
+        custom_params = getattr(req.sampling_params, "custom_params", None)
+        custom_params = custom_params if isinstance(custom_params, dict) else {}
+        prefix_pin_commit = bool(custom_params.get("prefix_pin_commit", False))
+        prefix_pin_reuse_only = bool(
+            custom_params.get("prefix_pin_reuse_only", False)
+        )
+
         # In deterministic mode, disable finished request insertion to radix cache
-        if self.disable_finished_insert:
+        if self.disable_finished_insert and not prefix_pin_commit:
+            is_insert = False
+        if prefix_pin_reuse_only:
             is_insert = False
 
         kv_committed_len = req.pop_committed_kv_cache()
@@ -449,10 +458,23 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
             self.token_to_kv_pool_allocator.free(kv_indices)
             return
 
-        token_ids = (req.origin_input_ids + req.output_ids)[:kv_committed_len]
-        kv_indices = self.req_to_token_pool.req_to_token[
-            req.req_pool_idx, : len(token_ids)
+        all_kv_indices = self.req_to_token_pool.req_to_token[
+            req.req_pool_idx, :kv_committed_len
         ]
+
+        if prefix_pin_commit:
+            requested_commit_len = custom_params.get("prefix_pin_commit_len")
+            if requested_commit_len is None:
+                requested_commit_len = len(req.origin_input_ids)
+            commit_len = min(
+                int(requested_commit_len),
+                len(req.origin_input_ids),
+                kv_committed_len,
+            )
+            token_ids = req.origin_input_ids[:commit_len]
+        else:
+            token_ids = (req.origin_input_ids + req.output_ids)[:kv_committed_len]
+        kv_indices = all_kv_indices[: len(token_ids)]
 
         radix_key = RadixKey(
             token_ids, req.extra_key, is_bigram=self.is_eagle
@@ -470,13 +492,20 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
             self.token_to_kv_pool_allocator.free(
                 kv_indices[req.cache_protected_len : result.prefix_len]
             )
+            if (
+                prefix_pin_commit
+                and custom_params.get("prefix_pin_protect", True)
+                and key_len > 0
+            ):
+                match_result = self.match_prefix(MatchPrefixParams(key=radix_key))
+                self.inc_lock_ref(match_result.last_device_node)
         else:
             self.token_to_kv_pool_allocator.free(
                 kv_indices[req.cache_protected_len : key_len]
             )
 
         # free the unaligned tail
-        self.token_to_kv_pool_allocator.free(kv_indices[key_len:])
+        self.token_to_kv_pool_allocator.free(all_kv_indices[key_len:])
 
         # Remove req slot release the cache lock
         if req.last_node is not None:
