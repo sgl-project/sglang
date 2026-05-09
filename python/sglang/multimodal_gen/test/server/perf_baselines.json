@@ -1073,6 +1073,73 @@
             "expected_median_denoise_ms": 100.05,
             "estimated_full_test_time_s": 127.6
         },
+        "wan2_1_t2v_1_3b_cache_dit_sp_only_2gpu": {
+            "stages_ms": {
+                "InputValidationStage": 0.08,
+                "TextEncodingStage": 853.63,
+                "LatentPreparationStage": 0.09,
+                "TimestepPreparationStage": 1.51,
+                "DenoisingStage": 2102.64,
+                "DecodingStage": 438.71,
+                "per_frame_generation": null
+            },
+            "denoise_step_ms": {
+                "0": 107.59,
+                "1": 103.11,
+                "2": 98.13,
+                "3": 94.12,
+                "4": 45.26,
+                "5": 8.66,
+                "6": 8.87,
+                "7": 105.03,
+                "8": 17.53,
+                "9": 9.26,
+                "10": 15.2,
+                "11": 93.17,
+                "12": 27.27,
+                "13": 7.78,
+                "14": 8.8,
+                "15": 96.54,
+                "16": 24.72,
+                "17": 9.27,
+                "18": 8.53,
+                "19": 106.58,
+                "20": 13.47,
+                "21": 10.13,
+                "22": 10.23,
+                "23": 96.49,
+                "24": 21.93,
+                "25": 8.73,
+                "26": 9.72,
+                "27": 103.29,
+                "28": 14.4,
+                "29": 9.07,
+                "30": 8.71,
+                "31": 105.88,
+                "32": 16.93,
+                "33": 9.15,
+                "34": 9.83,
+                "35": 100.03,
+                "36": 21.5,
+                "37": 9.41,
+                "38": 9.18,
+                "39": 105.14,
+                "40": 12.36,
+                "41": 10.1,
+                "42": 8.29,
+                "43": 102.88,
+                "44": 18.36,
+                "45": 7.67,
+                "46": 10.27,
+                "47": 103.19,
+                "48": 25.53,
+                "49": 106.23
+            },
+            "expected_e2e_ms": 3402.6,
+            "expected_avg_denoise_ms": 41.87,
+            "expected_median_denoise_ms": 16.07,
+            "estimated_full_test_time_s": 94.0
+        },
         "turbo_wan2_1_t2v_1.3b": {
             "stages_ms": {
                 "InputValidationStage": 0.06,
@@ -2044,30 +2111,23 @@
         },
         "qwen_image_t2i_cache_dit_config_diffusers_1gpu": {
             "stages_ms": {
-                "DiffusersExecutionStage": 5070.86
+                "DiffusersExecutionStage": 64520.18
             },
             "denoise_step_ms": {},
-            "expected_e2e_ms": 5079.29,
+            "expected_e2e_ms": 64523.93,
             "expected_avg_denoise_ms": 0.0,
-            "expected_median_denoise_ms": 0.0
+            "expected_median_denoise_ms": 0.0,
+            "estimated_full_test_time_s": 142.2
         },
         "qwen_image_t2i_cache_dit_scm_config_diffusers_1gpu": {
             "stages_ms": {
-                "DiffusersExecutionStage": 6160.17
+                "DiffusersExecutionStage": 61106.66
             },
             "denoise_step_ms": {},
-            "expected_e2e_ms": 6170.56,
+            "expected_e2e_ms": 61110.0,
             "expected_avg_denoise_ms": 0.0,
-            "expected_median_denoise_ms": 0.0
-        },
-        "qwen_image_t2i_cache_dit_config_diffusers_2gpu": {
-            "stages_ms": {
-                "DiffusersExecutionStage": 6981.05
-            },
-            "denoise_step_ms": {},
-            "expected_e2e_ms": 6983.64,
-            "expected_avg_denoise_ms": 0.0,
-            "expected_median_denoise_ms": 0.0
+            "expected_median_denoise_ms": 0.0,
+            "estimated_full_test_time_s": 135.3
         },
         "hunyuan3d_shape_gen": {
             "stages_ms": {

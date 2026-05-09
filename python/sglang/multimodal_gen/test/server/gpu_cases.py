@@ -1,3 +1,5 @@
+from pathlib import Path
+
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.test.server.testcase_configs import (
     MODELOPT_FLUX1_FP8_TRANSFORMER,
@@ -67,6 +69,36 @@ ONE_GPU_CASES: list[DiffusionTestCase] = [
             enable_cache_dit=True,
         ),
         T2I_sampling_params,
+    ),
+    DiffusionTestCase(
+        "qwen_image_t2i_cache_dit_config_diffusers_1gpu",
+        DiffusionServerArgs(
+            model_path=DEFAULT_QWEN_IMAGE_MODEL_NAME_FOR_TEST,
+            extras=[
+                "--backend",
+                "diffusers",
+                "--cache-dit-config",
+                str(Path(__file__).parent / "configs" / "cache_dit_config_1gpu.yaml"),
+            ],
+        ),
+        T2I_sampling_params,
+        run_consistency_check=False,
+        run_component_accuracy_check=False,
+    ),
+    DiffusionTestCase(
+        "qwen_image_t2i_cache_dit_scm_config_diffusers_1gpu",
+        DiffusionServerArgs(
+            model_path=DEFAULT_QWEN_IMAGE_MODEL_NAME_FOR_TEST,
+            extras=[
+                "--backend",
+                "diffusers",
+                "--cache-dit-config",
+                str(Path(__file__).parent / "configs" / "cache_dit_scm_config.yaml"),
+            ],
+        ),
+        T2I_sampling_params,
+        run_consistency_check=False,
+        run_component_accuracy_check=False,
     ),
     DiffusionTestCase(
         "flux_image_t2i",
@@ -520,6 +552,17 @@ TWO_GPU_CASES = [
             cfg_parallel=True,
         ),
         T2V_sampling_params,
+    ),
+    DiffusionTestCase(
+        "wan2_1_t2v_1_3b_cache_dit_sp_only_2gpu",
+        DiffusionServerArgs(
+            model_path=DEFAULT_WAN_2_1_T2V_1_3B_MODEL_NAME_FOR_TEST,
+            ulysses_degree=2,
+            enable_cache_dit=True,
+        ),
+        T2V_sampling_params,
+        run_consistency_check=False,
+        run_component_accuracy_check=False,
     ),
     DiffusionTestCase(
         "fsdp-inference",
