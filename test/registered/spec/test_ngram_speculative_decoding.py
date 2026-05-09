@@ -32,44 +32,11 @@ DEFAULT_SERVER_ARGS = [
 ]
 
 
-class _NgramSpeculativeDecodingBase(GSM8KMixin, CustomTestCase):
-    """Non-runnable base (leading underscore so unittest skips it).
-
-    Concrete subclasses below override get_server_args. Kept private here
-    so the previous FA3-on-base test no longer runs in per-commit; the
-    archived FA3 variant lives in test/manual/spec/.
-    """
-
+class TestNgramSpeculativeDecodingPaged(GSM8KMixin, CustomTestCase):
     model = DEFAULT_TARGET_MODEL_NGRAM
     base_url = DEFAULT_URL_FOR_TEST
-    gsm8k_accuracy_thres = 0.79  # derived tests need to override this
-    gsm8k_accept_length_thres = 1.8  # derived spec decoding tests need to override this
-
-    @classmethod
-    def get_server_args(cls):
-        """Return the arguments for the server launch. Override in subclasses."""
-        return DEFAULT_SERVER_ARGS + ["--attention-backend", "fa3"]
-
-    @classmethod
-    def setUpClass(cls):
-        # disable deep gemm precompile to make launch server faster
-        # please don't do this if you want to make your inference workload faster
-        envs.SGLANG_JIT_DEEPGEMM_PRECOMPILE.set(False)
-        envs.SGLANG_ENABLE_JIT_DEEPGEMM.set(False)
-        model = cls.model
-        cls.process = popen_launch_server(
-            model,
-            cls.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=cls.get_server_args(),
-        )
-
-    @classmethod
-    def tearDownClass(cls):
-        kill_process_tree(cls.process.pid)
-
-
-class TestNgramSpeculativeDecodingPaged(_NgramSpeculativeDecodingBase):
+    gsm8k_accuracy_thres = 0.79
+    gsm8k_accept_length_thres = 1.8
 
     @classmethod
     def get_server_args(cls):
@@ -79,6 +46,23 @@ class TestNgramSpeculativeDecodingPaged(_NgramSpeculativeDecodingBase):
             "--page-size",
             "64",
         ]
+
+    @classmethod
+    def setUpClass(cls):
+        # disable deep gemm precompile to make launch server faster
+        # please don't do this if you want to make your inference workload faster
+        envs.SGLANG_JIT_DEEPGEMM_PRECOMPILE.set(False)
+        envs.SGLANG_ENABLE_JIT_DEEPGEMM.set(False)
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=cls.get_server_args(),
+        )
+
+    @classmethod
+    def tearDownClass(cls):
+        kill_process_tree(cls.process.pid)
 
 
 if __name__ == "__main__":
