@@ -12,7 +12,6 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import quote
 
-
 ROOT = Path(__file__).resolve().parent
 
 
@@ -52,7 +51,9 @@ class U1OmniUIHandler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header(
             "content-type",
-            content_type or mimetypes.guess_type(path.name)[0] or "application/octet-stream",
+            content_type
+            or mimetypes.guess_type(path.name)[0]
+            or "application/octet-stream",
         )
         self.send_header("content-length", str(len(data)))
         self.end_headers()
