@@ -27,6 +27,7 @@ from sglang.srt.mem_cache.common import (
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.speculative.eagle_info_v2 import (
+    EagleDraftExtendInputV2Mixin,
     EagleDraftInputV2Mixin,
     EagleVerifyInputV2Mixin,
 )
@@ -667,10 +668,6 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
     future_indices: Optional[FutureIndices] = None
     new_seq_lens: Optional[torch.Tensor] = None
     verify_done: Optional[torch.cuda.Event] = None
-    # V2 reuses `EagleDraftInput` across phases (V1 has a separate
-    # `EagleDraftExtendInput` for these). Set during V2's draft-extend.
-    num_accepted_drafts: Optional[torch.Tensor] = None
-    num_accepted_tokens: Optional[torch.Tensor] = None
 
     def __post_init__(self):
         super().__init__(SpecInputType.EAGLE_DRAFT)
@@ -768,7 +765,7 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
 
 
 @dataclass
-class EagleDraftExtendInput(SpecInput):
+class EagleDraftExtendInput(SpecInput, EagleDraftExtendInputV2Mixin):
     """Inputs to the draft-extend forward (the per-accepted-token pass after verify).
 
     Produced by `EagleVerifyInput.verify`, installed on `batch.spec_info` for
