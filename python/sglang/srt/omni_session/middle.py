@@ -1,34 +1,34 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Middle bridge between generic UG orchestration and SRT session execution."""
+"""Middle bridge between generic omni orchestration and SRT session execution."""
 
 from collections.abc import Callable
 from types import SimpleNamespace
 from typing import Any, Protocol
 
 from sglang.srt.omni_session.context import (
-    UGContextBundle,
-    UGContextHandle,
-    UGSessionHandle,
+    OmniContextBundle,
+    OmniContextHandle,
+    OmniSessionHandle,
 )
 from sglang.srt.omni_session.interleaved import (
-    DEFAULT_UG_TEXT_MAX_NEW_TOKENS,
-    UGGKind,
-    UGGSegmentResult,
+    DEFAULT_OMNI_TEXT_MAX_NEW_TOKENS,
+    GenerationKind,
+    GeneratedSegmentResult,
 )
 from sglang.srt.omni_session.runtime import (
-    UGDecodeResult,
-    UGInterleavedMessage,
-    UGSessionRuntime,
-    UGVLMTextGenerationResult,
+    OmniDecodeResult,
+    OmniInterleavedMessage,
+    OmniSessionRuntime,
+    OmniVLMTextGenerationResult,
 )
 
-UGGSegmentExecutor = Callable[[Any], UGGSegmentResult]
+GeneratedSegmentExecutor = Callable[[Any], GeneratedSegmentResult]
 
 
-class UGMiddleBridge(Protocol):
-    g_kind: UGGKind
+class OmniSessionBridge(Protocol):
+    generation_kind: GenerationKind
 
-    def prepare_u_context(
+    def prepare_ar_context(
         self,
         *,
         prompt: str | list[str] | None,
@@ -36,62 +36,62 @@ class UGMiddleBridge(Protocol):
         think: bool = False,
         think_max_new_tokens: int | None = None,
         sampling_params: Any | None = None,
-    ) -> UGContextBundle: ...
+    ) -> OmniContextBundle: ...
 
-    def prepare_u_context_from_messages(
+    def prepare_ar_context_from_messages(
         self,
         *,
-        messages: list[UGInterleavedMessage | dict[str, Any]],
+        messages: list[OmniInterleavedMessage | dict[str, Any]],
         think: bool = False,
         think_max_new_tokens: int | None = None,
         sampling_params: Any | None = None,
         session_id: str | None = None,
-    ) -> UGContextBundle: ...
+    ) -> OmniContextBundle: ...
 
-    def run_g_segment(
+    def run_generated_segment(
         self,
         *,
-        contexts: UGContextBundle,
-        executor: UGGSegmentExecutor,
-    ) -> UGGSegmentResult: ...
+        contexts: OmniContextBundle,
+        executor: GeneratedSegmentExecutor,
+    ) -> GeneratedSegmentResult: ...
 
     def commit_generated_segment(
-        self, *, contexts: UGContextBundle, segment: UGGSegmentResult
+        self, *, contexts: OmniContextBundle, segment: GeneratedSegmentResult
     ) -> None: ...
 
-    def release(self, contexts: UGContextBundle) -> None: ...
+    def release(self, contexts: OmniContextBundle) -> None: ...
 
-    def continue_u_decode(self, *, contexts: UGContextBundle) -> UGDecodeResult: ...
+    def continue_ar_decode(self, *, contexts: OmniContextBundle) -> OmniDecodeResult: ...
 
     def generate_vlm_text(
         self,
         *,
-        messages: list[UGInterleavedMessage | dict[str, Any]],
+        messages: list[OmniInterleavedMessage | dict[str, Any]],
         max_new_tokens: int,
-    ) -> UGVLMTextGenerationResult: ...
+    ) -> OmniVLMTextGenerationResult: ...
 
 
-class SRTBackedGContextOps:
-    """Narrow G-side view of an SRT-backed UG context.
+class SRTBackedGenerationContextOps:
+    """Narrow generation-side view of an SRT-backed omni context.
 
-    G backends consume this object instead of reaching through the UG bridge or
+    generation backends consume this object instead of reaching through the omni bridge or
     runtime. It exposes only model access, logical context positions, and
     temporary query execution.
     """
 
-    def __init__(self, bridge: Any, contexts: UGContextBundle) -> None:
+    def __init__(self, bridge: Any, contexts: OmniContextBundle) -> None:
         self._bridge = bridge
         self._contexts = contexts
 
     @property
-    def g_kind(self) -> UGGKind:
-        return self._bridge.g_kind
+    def generation_kind(self) -> GenerationKind:
+        return self._bridge.generation_kind
 
     @property
     def session_id(self) -> str:
         session = self._contexts.full.session
         if session is None:
-            raise ValueError("SRT-backed G context ops require a session handle")
+            raise ValueError("SRT-backed generation context ops require a session handle")
         return session.session_id
 
     @property
@@ -105,7 +105,7 @@ class SRTBackedGContextOps:
     def get_model(self) -> Any:
         get_srt_model = getattr(self._executor(), "get_srt_model", None)
         if not callable(get_srt_model):
-            raise RuntimeError("G context ops require model access")
+            raise RuntimeError("generation context ops require model access")
         return get_srt_model()
 
     def get_position_count(self, *, sidecar_role: str | None = None) -> int | None:
@@ -115,14 +115,14 @@ class SRTBackedGContextOps:
             None,
         )
         if not callable(get_position_count):
-            raise RuntimeError("G context ops require latest context position count")
+            raise RuntimeError("generation context ops require latest context position count")
         return get_position_count(self.session_id, sidecar_role=sidecar_role)
 
     def build_temporary_forward_batch(
         self,
         *,
         prepared: Any,
-        g_query_embeds: Any,
+        generation_query_embeds: Any,
         timestep: Any,
     ) -> Any:
         build_forward_batch = getattr(
@@ -131,10 +131,10 @@ class SRTBackedGContextOps:
             None,
         )
         if not callable(build_forward_batch):
-            raise RuntimeError("G context ops require temporary query forward batches")
+            raise RuntimeError("generation context ops require temporary query forward batches")
         return build_forward_batch(
             prepared=self._to_srt_prepared(prepared),
-            g_query_embeds=g_query_embeds,
+            generation_query_embeds=generation_query_embeds,
             timestep=timestep,
         )
 
@@ -142,7 +142,7 @@ class SRTBackedGContextOps:
         runtime = getattr(self._bridge, "runtime", None)
         executor = getattr(runtime, "srt_request_executor", None)
         if executor is None:
-            raise RuntimeError("SRT-backed G context ops require a request executor")
+            raise RuntimeError("SRT-backed generation context ops require a request executor")
         return executor
 
     def _to_srt_prepared(self, prepared: Any) -> Any:
@@ -154,16 +154,16 @@ class SRTBackedGContextOps:
         return SimpleNamespace(**data)
 
 
-class SRTBackedUGMiddleBridge:
-    """UG middle bridge that keeps SRT as the session/KV owner.
+class SRTBackedOmniSessionBridge:
+    """omni middle bridge that keeps SRT as the session/KV owner.
 
-    It asks the runtime to prefill/decode/commit U-side chunks, while G-side
-    code receives only `SRTBackedGContextOps`.
+    It asks the runtime to prefill/decode/commit AR-side chunks, while generation-side
+    code receives only `SRTBackedGenerationContextOps`.
     """
 
     def __init__(
         self,
-        runtime: UGSessionRuntime,
+        runtime: OmniSessionRuntime,
         *,
         max_pre_image_decode_steps: int = 16,
     ) -> None:
@@ -175,7 +175,7 @@ class SRTBackedUGMiddleBridge:
         self.runtime = runtime
         self.max_pre_image_decode_steps = max_pre_image_decode_steps
 
-    def prepare_u_context(
+    def prepare_ar_context(
         self,
         *,
         prompt: str | list[str] | None,
@@ -183,26 +183,26 @@ class SRTBackedUGMiddleBridge:
         think: bool = False,
         think_max_new_tokens: int | None = None,
         sampling_params: Any | None = None,
-    ) -> UGContextBundle:
+    ) -> OmniContextBundle:
         messages = self.runtime.normalize_messages(prompt=prompt, image=image)
-        return self.prepare_u_context_from_messages(
+        return self.prepare_ar_context_from_messages(
             messages=messages,
             think=think,
             think_max_new_tokens=think_max_new_tokens,
             sampling_params=sampling_params,
         )
 
-    def prepare_u_context_from_messages(
+    def prepare_ar_context_from_messages(
         self,
         *,
-        messages: list[UGInterleavedMessage | dict[str, Any]],
+        messages: list[OmniInterleavedMessage | dict[str, Any]],
         think: bool = False,
         think_max_new_tokens: int | None = None,
         sampling_params: Any | None = None,
         session_id: str | None = None,
-    ) -> UGContextBundle:
+    ) -> OmniContextBundle:
         del sampling_params
-        messages = normalize_ug_interleaved_messages(messages)
+        messages = normalize_omni_interleaved_messages(messages)
         session = self.runtime.prefill_interleaved(messages, session_id=session_id)
         pre_image_segments: list[dict[str, Any]] = []
         try:
@@ -244,7 +244,7 @@ class SRTBackedUGMiddleBridge:
                     )
                     continue
                 raise ValueError(
-                    "UG middle bridge expected U decode to request an image segment, "
+                    "omni middle bridge expected AR decode to request an image segment, "
                     f"got {segment.type}"
                 )
             else:
@@ -255,8 +255,8 @@ class SRTBackedUGMiddleBridge:
                 )
                 decoded_preview = decoded_preview[-240:]
                 raise ValueError(
-                    "UG middle bridge did not receive an image marker within "
-                    f"{self.max_pre_image_decode_steps} U decode steps"
+                    "omni middle bridge did not receive an image marker within "
+                    f"{self.max_pre_image_decode_steps} AR decode steps"
                     f"; decoded_text_preview={decoded_preview!r}"
                 )
         except Exception:
@@ -269,75 +269,75 @@ class SRTBackedUGMiddleBridge:
             if message.type == "text"
         )
         image_tokens = sum(2 for message in messages if message.type == "image")
-        return UGContextBundle(
-            full=UGContextHandle(
+        return OmniContextBundle(
+            full=OmniContextHandle(
                 session.anchor_request_id,
                 session.context_length,
                 session=session,
                 metadata={"pre_image_segments": pre_image_segments},
             ),
-            text_cfg=UGContextHandle(
+            text_cfg=OmniContextHandle(
                 f"{session.anchor_request_id}:text_cfg",
                 image_tokens,
                 session=session,
             ),
-            image_cfg=UGContextHandle(
+            image_cfg=OmniContextHandle(
                 f"{session.anchor_request_id}:image_cfg",
                 text_tokens,
                 session=session,
             ),
         )
 
-    def run_g_segment(
+    def run_generated_segment(
         self,
         *,
-        contexts: UGContextBundle,
-        executor: UGGSegmentExecutor,
-    ) -> UGGSegmentResult:
+        contexts: OmniContextBundle,
+        executor: GeneratedSegmentExecutor,
+    ) -> GeneratedSegmentResult:
         if contexts.full.session is None:
-            raise ValueError("SRT-backed UG contexts require a session handle")
-        segment = executor(SRTBackedGContextOps(self, contexts))
+            raise ValueError("SRT-backed omni contexts require a session handle")
+        segment = executor(SRTBackedGenerationContextOps(self, contexts))
         if segment.type != "image":
-            raise ValueError(f"UG G segment expected image output, got {segment.type}")
+            raise ValueError(f"omni generated segment expected image output, got {segment.type}")
         return segment
 
     def commit_generated_segment(
-        self, *, contexts: UGContextBundle, segment: UGGSegmentResult
+        self, *, contexts: OmniContextBundle, segment: GeneratedSegmentResult
     ) -> None:
         if segment.type != "image":
-            raise ValueError(f"UG commit expects image segment, got {segment.type}")
+            raise ValueError(f"omni commit expects image segment, got {segment.type}")
         image_for_commit = segment.commit_image
         if image_for_commit is None:
             image_for_commit = segment.image
         self._commit_generated_image(contexts=contexts, image=image_for_commit)
 
-    def release(self, contexts: UGContextBundle) -> None:
+    def release(self, contexts: OmniContextBundle) -> None:
         if contexts.full.session is not None:
             self.runtime.close_session(contexts.full.session)
 
-    def continue_u_decode(self, *, contexts: UGContextBundle) -> UGDecodeResult:
+    def continue_ar_decode(self, *, contexts: OmniContextBundle) -> OmniDecodeResult:
         if contexts.full.session is None:
-            raise ValueError("SRT-backed UG contexts require a session handle")
+            raise ValueError("SRT-backed omni contexts require a session handle")
         return self.runtime.decode_next_segment(contexts.full.session)
 
     def _decode_thinking_text(
         self,
-        session: UGSessionHandle,
+        session: OmniSessionHandle,
         *,
         max_new_tokens: int | None,
-    ) -> UGVLMTextGenerationResult:
+    ) -> OmniVLMTextGenerationResult:
         decode_vlm_text = getattr(self.runtime.model_runner, "decode_vlm_text", None)
         if not callable(decode_vlm_text):
             raise RuntimeError(
                 f"{self.runtime.model_runner.__class__.__name__} does not support "
-                "UG think text generation"
+                "omni think text generation"
             )
         if max_new_tokens is None:
-            max_new_tokens = DEFAULT_UG_TEXT_MAX_NEW_TOKENS
+            max_new_tokens = DEFAULT_OMNI_TEXT_MAX_NEW_TOKENS
         max_new_tokens = int(max_new_tokens)
         if max_new_tokens <= 0:
             raise ValueError(
-                f"UG think text generation requires max_new_tokens > 0, got {max_new_tokens}"
+                f"omni think text generation requires max_new_tokens > 0, got {max_new_tokens}"
             )
         return decode_vlm_text(
             runtime=self.runtime,
@@ -348,16 +348,16 @@ class SRTBackedUGMiddleBridge:
     def generate_vlm_text(
         self,
         *,
-        messages: list[UGInterleavedMessage | dict[str, Any]],
+        messages: list[OmniInterleavedMessage | dict[str, Any]],
         max_new_tokens: int,
-    ) -> UGVLMTextGenerationResult:
+    ) -> OmniVLMTextGenerationResult:
         max_new_tokens = int(max_new_tokens)
         if max_new_tokens <= 0:
             raise ValueError(
-                f"UG VLM text generation requires max_new_tokens > 0, got {max_new_tokens}"
+                f"omni VLM text generation requires max_new_tokens > 0, got {max_new_tokens}"
             )
         session = self.runtime.prefill_interleaved(
-            normalize_ug_interleaved_messages(messages)
+            normalize_omni_interleaved_messages(messages)
         )
         try:
             decode_vlm_text = getattr(
@@ -372,10 +372,10 @@ class SRTBackedUGMiddleBridge:
             segment = self.runtime.decode_next_segment(session)
             if segment.type != "text":
                 raise ValueError(
-                    "UG VLM text generation expected a text segment, "
+                    "omni VLM text generation expected a text segment, "
                     f"got {segment.type}"
                 )
-            return UGVLMTextGenerationResult(
+            return OmniVLMTextGenerationResult(
                 session=session,
                 text=segment.text or "",
             )
@@ -384,10 +384,10 @@ class SRTBackedUGMiddleBridge:
             raise
 
     def _commit_generated_image(
-        self, *, contexts: UGContextBundle, image: Any | None
+        self, *, contexts: OmniContextBundle, image: Any | None
     ) -> None:
         if contexts.full.session is None:
-            raise ValueError("SRT-backed UG contexts require a session handle")
+            raise ValueError("SRT-backed omni contexts require a session handle")
         session = self.runtime.append_generated_image(
             contexts.full.session, image=image
         )
@@ -398,17 +398,17 @@ class SRTBackedUGMiddleBridge:
         contexts.image_cfg.session = session
 
 
-def normalize_ug_interleaved_messages(
-    messages: list[UGInterleavedMessage | dict[str, Any]],
-) -> list[UGInterleavedMessage]:
-    normalized: list[UGInterleavedMessage] = []
+def normalize_omni_interleaved_messages(
+    messages: list[OmniInterleavedMessage | dict[str, Any]],
+) -> list[OmniInterleavedMessage]:
+    normalized: list[OmniInterleavedMessage] = []
     for message in messages:
-        if isinstance(message, UGInterleavedMessage):
+        if isinstance(message, OmniInterleavedMessage):
             normalized.append(message)
             continue
         if not isinstance(message, dict):
             raise TypeError(
-                f"UG message must be a dict or UGInterleavedMessage: {message!r}"
+                f"omni message must be a dict or OmniInterleavedMessage: {message!r}"
             )
         message_type = message.get("type")
         if message_type == "text":
@@ -416,10 +416,10 @@ def normalize_ug_interleaved_messages(
         elif message_type == "image":
             content = message.get("image", message.get("content"))
         else:
-            raise ValueError(f"Unsupported UG message type: {message_type!r}")
+            raise ValueError(f"Unsupported omni message type: {message_type!r}")
         if content is None:
-            raise ValueError(f"UG {message_type} message is missing content")
-        normalized.append(UGInterleavedMessage(type=message_type, content=content))
+            raise ValueError(f"omni {message_type} message is missing content")
+        normalized.append(OmniInterleavedMessage(type=message_type, content=content))
     if not normalized:
-        raise ValueError("UG interleaved messages must not be empty")
+        raise ValueError("omni interleaved messages must not be empty")
     return normalized

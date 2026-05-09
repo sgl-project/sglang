@@ -217,7 +217,7 @@ class ContextOps(Protocol):
     def metadata(self) -> dict[str, Any]: ...
 
     @property
-    def g_kind(self) -> str | None: ...
+    def generation_kind(self) -> str | None: ...
 
     @property
     def session_id(self) -> str | None: ...
@@ -236,7 +236,7 @@ class ContextOps(Protocol):
         self,
         *,
         prepared: Any,
-        g_query_embeds: Any,
+        generation_query_embeds: Any,
         timestep: Any,
     ) -> Any: ...
 

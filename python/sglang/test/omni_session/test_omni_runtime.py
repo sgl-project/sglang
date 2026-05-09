@@ -1,11 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 
-from sglang.srt.omni_session.runtime import UGSessionRuntime
+from sglang.srt.omni_session.runtime import OmniSessionRuntime
 
 
-def test_ug_runtime_opens_streaming_srt_session():
+def test_omni_session_runtime_opens_streaming_srt_session():
     controller = _FakeSessionController()
-    runtime = UGSessionRuntime(
+    runtime = OmniSessionRuntime(
         model_runner=_FakeModelRunner(),
         session_controller=controller,
         capacity_of_str_len=8192,
@@ -18,11 +18,11 @@ def test_ug_runtime_opens_streaming_srt_session():
     assert controller.opened.streaming is True
 
 
-def test_ug_runtime_drains_srt_executor_after_close():
+def test_omni_session_runtime_drains_srt_executor_after_close():
     controller = _FakeSessionController()
     controller.sessions.add("session-a")
     executor = _FakeSRTExecutor()
-    runtime = UGSessionRuntime(
+    runtime = OmniSessionRuntime(
         model_runner=_FakeModelRunner(),
         session_controller=controller,
         srt_request_executor=executor,

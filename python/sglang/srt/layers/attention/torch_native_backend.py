@@ -264,7 +264,7 @@ class TorchNativeAttnBackend(AttentionBackend):
         causal=False,
         custom_mask=None,
     ):
-        """Run U1 UG U attention with the same eager math as the reference."""
+        """Run U1 omni AR attention with the same eager math as the reference."""
 
         query = query.movedim(0, query.dim() - 2)
         scale = 1.0 if scaling is None else scaling

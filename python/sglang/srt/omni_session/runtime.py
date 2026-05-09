@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
-"""SRT-owned session runtime for U/G interleaved models.
+"""SRT-owned session runtime for AR/generation interleaved models.
 
 The runtime is below the generic omni orchestrator. It materializes model-
-specific U-side chunks as ordinary SRT session requests, tracks committed SRT
-KV bindings, and leaves G-side execution to a bridge/executor pair.
+specific AR-side chunks as ordinary SRT session requests, tracks committed SRT
+KV bindings, and leaves generation-side execution to a bridge/executor pair.
 """
 
 import uuid
@@ -14,29 +14,29 @@ from typing import Any, Literal, Protocol
 import torch
 
 from sglang.srt.omni_session.context import (
-    UGSessionHandle,
-    UGSRTKVTokenBinding,
-    UGSRTRequestView,
+    OmniSessionHandle,
+    OmniSRTKVTokenBinding,
+    OmniSRTRequestView,
 )
 
 
-class UGSegmentState(str, Enum):
-    U_PREFILL = "u_prefill"
-    U_DECODE = "u_decode"
-    G_GENERATE = "g_generate"
+class OmniSegmentState(str, Enum):
+    AR_PREFILL = "ar_prefill"
+    AR_DECODE = "ar_decode"
+    GENERATE = "generate"
     APPEND_IMAGE = "append_image"
     DONE = "done"
 
 
 @dataclass(frozen=True, slots=True)
-class UGInterleavedMessage:
+class OmniInterleavedMessage:
     type: Literal["text", "image"]
     content: Any
 
 
 @dataclass(slots=True)
-class UGSRTPreparedInput:
-    """One materialized SRT input chunk for a UG U-side segment.
+class OmniSRTPreparedInput:
+    """One materialized SRT input chunk for an omni AR-side segment.
 
     `input_embeds` and `position_ids` are relative to `input_ids`. The runtime
     shifts them to the full SRT session request after `Session.create_req`
@@ -45,7 +45,7 @@ class UGSRTPreparedInput:
 
     input_ids: list[int]
     input_text: str
-    messages: list[UGInterleavedMessage]
+    messages: list[OmniInterleavedMessage]
     input_embeds: list[list[float]] | None = None
     replace_embeds: list[list[float]] | None = None
     replace_positions: list[int] | None = None
@@ -57,15 +57,15 @@ class UGSRTPreparedInput:
 
 
 @dataclass(frozen=True, slots=True)
-class UGDecodeResult:
+class OmniDecodeResult:
     type: Literal["text", "image_marker", "done"]
     text: str | None = None
     token_ids: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
-class UGTextDecodeResult:
-    session: UGSessionHandle
+class OmniTextDecodeResult:
+    session: OmniSessionHandle
     output_ids: tuple[int, ...]
     text: str
     input_ids: tuple[int, ...] = ()
@@ -73,8 +73,8 @@ class UGTextDecodeResult:
 
 
 @dataclass(frozen=True, slots=True)
-class UGVLMTextGenerationResult:
-    session: UGSessionHandle
+class OmniVLMTextGenerationResult:
+    session: OmniSessionHandle
     text: str
     token_ids: tuple[int, ...] = ()
     next_token_ids: tuple[int, ...] = ()
@@ -82,11 +82,11 @@ class UGVLMTextGenerationResult:
 
 
 @dataclass(slots=True)
-class UGSessionRecord:
-    """Mutable server-side record for one UG conversation session."""
+class OmniSessionRecord:
+    """Mutable server-side record for one omni conversation session."""
 
     session_id: str
-    state: UGSegmentState
+    state: OmniSegmentState
     anchor_request_id: str
     context_length: int = 0
     context_version: int = 0
@@ -96,23 +96,23 @@ class UGSessionRecord:
     srt_request_count: int = 0
     srt_last_request_id: str | None = None
     srt_last_origin_input_len: int = 0
-    srt_u_decode_request_count: int = 0
-    srt_last_u_decode_request_id: str | None = None
-    srt_last_u_decode_origin_input_len: int = 0
-    srt_last_u_decode_output_ids: list[int] = field(default_factory=list)
-    srt_last_u_decode_text: str = ""
+    srt_ar_decode_request_count: int = 0
+    srt_last_ar_decode_request_id: str | None = None
+    srt_last_ar_decode_origin_input_len: int = 0
+    srt_last_ar_decode_output_ids: list[int] = field(default_factory=list)
+    srt_last_ar_decode_text: str = ""
     srt_mm_offsets: list[tuple[int, int]] = field(default_factory=list)
     srt_mm_inputs: Any | None = None
     srt_executed_request_count: int = 0
     srt_model_runner_forward_request_ids: set[str] = field(default_factory=set)
     srt_sidecar_session_ids: set[str] = field(default_factory=set)
-    srt_sidecar_records: dict[str, "UGSessionRecord"] = field(default_factory=dict)
+    srt_sidecar_records: dict[str, "OmniSessionRecord"] = field(default_factory=dict)
     srt_sidecar_request_count: int = 0
-    ug_model_state: dict[str, Any] = field(default_factory=dict)
+    omni_model_state: dict[str, Any] = field(default_factory=dict)
     closed: bool = False
 
-    def handle(self) -> UGSessionHandle:
-        return UGSessionHandle(
+    def handle(self) -> OmniSessionHandle:
+        return OmniSessionHandle(
             session_id=self.session_id,
             anchor_request_id=self.anchor_request_id,
             context_length=self.context_length,
@@ -120,61 +120,61 @@ class UGSessionRecord:
         )
 
 
-class UGModelRunnerProtocol(Protocol):
-    def prepare_srt_u_message_inputs(
+class OmniModelRunnerProtocol(Protocol):
+    def prepare_srt_ar_message_inputs(
         self,
         *,
-        record: UGSessionRecord,
-        message: UGInterleavedMessage,
-        state: UGSegmentState,
-    ) -> list[UGSRTPreparedInput] | None: ...
+        record: OmniSessionRecord,
+        message: OmniInterleavedMessage,
+        state: OmniSegmentState,
+    ) -> list[OmniSRTPreparedInput] | None: ...
 
-    def observe_srt_u_forward(
+    def observe_srt_ar_forward(
         self,
         *,
-        record: UGSessionRecord,
-        request: UGSRTRequestView,
-        messages: list[UGInterleavedMessage],
+        record: OmniSessionRecord,
+        request: OmniSRTRequestView,
+        messages: list[OmniInterleavedMessage],
     ) -> None: ...
 
     def prefill_interleaved(
-        self, *, record: UGSessionRecord, messages: list[UGInterleavedMessage]
+        self, *, record: OmniSessionRecord, messages: list[OmniInterleavedMessage]
     ) -> int: ...
 
-    def decode_next_segment(self, *, record: UGSessionRecord) -> UGDecodeResult: ...
+    def decode_next_segment(self, *, record: OmniSessionRecord) -> OmniDecodeResult: ...
 
     def append_generated_image(
-        self, *, record: UGSessionRecord, image: Any | None
+        self, *, record: OmniSessionRecord, image: Any | None
     ) -> int: ...
 
     def close_session(self, *, session_id: str) -> None: ...
 
 
-class UGSRTRequestExecutorProtocol(Protocol):
-    """Executes a UG SRT request after SessionController has materialized it."""
+class OmniSRTRequestExecutorProtocol(Protocol):
+    """Executes an omni SRT request after SessionController has materialized it."""
 
-    def execute_ug_request(
+    def execute_omni_request(
         self,
         *,
-        record: UGSessionRecord,
+        record: OmniSessionRecord,
         req: Any,
-        state: UGSegmentState,
+        state: OmniSegmentState,
     ) -> None: ...
 
 
-class UGSessionRuntime:
-    """Lightweight UG state machine layered on top of SRT sessions."""
+class OmniSessionRuntime:
+    """Lightweight omni state machine layered on top of SRT sessions."""
 
     def __init__(
         self,
         *,
-        model_runner: UGModelRunnerProtocol,
+        model_runner: OmniModelRunnerProtocol,
         session_controller: Any | None = None,
-        srt_request_executor: UGSRTRequestExecutorProtocol | None = None,
+        srt_request_executor: OmniSRTRequestExecutorProtocol | None = None,
         capacity_of_str_len: int = 4096,
         tokenizer: Any | None = None,
         vocab_size: int = 32000,
-        srt_u_decode_max_new_tokens: int = 0,
+        srt_ar_decode_max_new_tokens: int = 0,
     ) -> None:
         self.model_runner = model_runner
         self.session_controller = session_controller
@@ -182,8 +182,8 @@ class UGSessionRuntime:
         self.capacity_of_str_len = capacity_of_str_len
         self.tokenizer = tokenizer
         self.vocab_size = vocab_size
-        self.srt_u_decode_max_new_tokens = srt_u_decode_max_new_tokens
-        self._records: dict[str, UGSessionRecord] = {}
+        self.srt_ar_decode_max_new_tokens = srt_ar_decode_max_new_tokens
+        self._records: dict[str, OmniSessionRecord] = {}
         register_observer = getattr(
             self.srt_request_executor,
             "set_session_forward_observer",
@@ -192,53 +192,53 @@ class UGSessionRuntime:
         if not callable(register_observer):
             register_observer = getattr(
                 self.srt_request_executor,
-                "set_ug_u_forward_observer",
+                "set_omni_ar_forward_observer",
                 None,
             )
         if callable(register_observer):
-            register_observer(self._observe_srt_u_forward_from_model_runner)
+            register_observer(self._observe_srt_ar_forward_from_model_runner)
 
     @staticmethod
     def normalize_messages(
         *, prompt: str | list[str] | None = None, image: Any | None = None
-    ) -> list[UGInterleavedMessage]:
-        messages: list[UGInterleavedMessage] = []
+    ) -> list[OmniInterleavedMessage]:
+        messages: list[OmniInterleavedMessage] = []
         if image is not None:
-            messages.append(UGInterleavedMessage(type="image", content=image))
+            messages.append(OmniInterleavedMessage(type="image", content=image))
         if prompt is not None:
             prompt_text = " ".join(prompt) if isinstance(prompt, list) else prompt
-            messages.append(UGInterleavedMessage(type="text", content=prompt_text))
+            messages.append(OmniInterleavedMessage(type="text", content=prompt_text))
         return messages
 
     def prefill_interleaved(
         self,
-        messages: list[UGInterleavedMessage],
+        messages: list[OmniInterleavedMessage],
         *,
         session_id: str | None = None,
-    ) -> UGSessionHandle:
+    ) -> OmniSessionHandle:
         if not messages:
-            raise ValueError("UG prefill requires at least one text or image message")
+            raise ValueError("omni prefill requires at least one text or image message")
         session_id = session_id or uuid.uuid4().hex
         record = self._records.get(session_id)
         if record is None:
             self._ensure_srt_session(session_id)
-            record = UGSessionRecord(
+            record = OmniSessionRecord(
                 session_id=session_id,
-                state=UGSegmentState.U_PREFILL,
-                anchor_request_id=f"{session_id}:u0",
+                state=OmniSegmentState.AR_PREFILL,
+                anchor_request_id=f"{session_id}:ar0",
             )
             self._records[session_id] = record
         elif record.closed:
-            raise ValueError(f"UG session {session_id} is closed")
-        elif record.state not in {UGSegmentState.U_DECODE, UGSegmentState.DONE}:
+            raise ValueError(f"omni session {session_id} is closed")
+        elif record.state not in {OmniSegmentState.AR_DECODE, OmniSegmentState.DONE}:
             raise ValueError(
-                f"Cannot prefill UG session {session_id} from state {record.state}"
+                f"Cannot prefill omni session {session_id} from state {record.state}"
             )
         else:
-            record.state = UGSegmentState.U_PREFILL
+            record.state = OmniSegmentState.AR_PREFILL
 
         next_context_version = record.context_version + 1
-        next_anchor_request_id = f"{session_id}:u{next_context_version}"
+        next_anchor_request_id = f"{session_id}:ar{next_context_version}"
         record.anchor_request_id = next_anchor_request_id
         self._append_srt_session_request(
             record,
@@ -251,25 +251,25 @@ class UGSessionRuntime:
         record.context_length += added_tokens
         record.context_version = next_context_version
         record.prefill_count += 1
-        record.state = UGSegmentState.U_DECODE
+        record.state = OmniSegmentState.AR_DECODE
         return record.handle()
 
-    def begin_g_segment(self, handle: UGSessionHandle) -> UGSessionHandle:
+    def begin_generation_segment(self, handle: OmniSessionHandle) -> OmniSessionHandle:
         record = self._record_for(handle)
-        if record.state != UGSegmentState.U_DECODE:
+        if record.state != OmniSegmentState.AR_DECODE:
             raise ValueError(
-                f"Cannot enter G segment from state {record.state} "
-                f"for UG session {handle.session_id}"
+                f"Cannot enter generated segment from state {record.state} "
+                f"for omni session {handle.session_id}"
             )
-        record.state = UGSegmentState.G_GENERATE
+        record.state = OmniSegmentState.GENERATE
         return record.handle()
 
-    def decode_next_segment(self, handle: UGSessionHandle) -> UGDecodeResult:
+    def decode_next_segment(self, handle: OmniSessionHandle) -> OmniDecodeResult:
         record = self._record_for(handle)
-        if record.state != UGSegmentState.U_DECODE:
+        if record.state != OmniSegmentState.AR_DECODE:
             raise ValueError(
-                f"Cannot decode U segment from state {record.state} "
-                f"for UG session {handle.session_id}"
+                f"Cannot decode AR segment from state {record.state} "
+                f"for omni session {handle.session_id}"
             )
         decode_from_runtime = getattr(
             self.model_runner, "decode_next_segment_from_runtime", None
@@ -277,21 +277,21 @@ class UGSessionRuntime:
         if callable(decode_from_runtime):
             result = decode_from_runtime(runtime=self, record=record)
         else:
-            if self.srt_u_decode_max_new_tokens > 0:
-                self._append_srt_u_decode_request(record, greedy=True)
+            if self.srt_ar_decode_max_new_tokens > 0:
+                self._append_srt_ar_decode_request(record, greedy=True)
             result = self.model_runner.decode_next_segment(record=record)
         record.decode_count += 1
         if result.type == "image_marker":
-            record.state = UGSegmentState.G_GENERATE
+            record.state = OmniSegmentState.GENERATE
         elif result.type == "done":
-            record.state = UGSegmentState.DONE
+            record.state = OmniSegmentState.DONE
         else:
-            record.state = UGSegmentState.U_DECODE
+            record.state = OmniSegmentState.AR_DECODE
         return result
 
     def decode_text(
         self,
-        handle: UGSessionHandle,
+        handle: OmniSessionHandle,
         *,
         max_new_tokens: int | None = None,
         start_token_id: int | None = None,
@@ -300,15 +300,15 @@ class UGSessionRuntime:
         drop_previous_output: bool = False,
         greedy: bool = False,
         model_state_updates: dict[str, Any] | None = None,
-    ) -> UGTextDecodeResult:
+    ) -> OmniTextDecodeResult:
         record = self._record_for(handle)
-        if record.state != UGSegmentState.U_DECODE:
+        if record.state != OmniSegmentState.AR_DECODE:
             raise ValueError(
-                f"Cannot decode U text from state {record.state} "
-                f"for UG session {handle.session_id}"
+                f"Cannot decode AR text from state {record.state} "
+                f"for omni session {handle.session_id}"
             )
         input_ids = [] if start_token_id is None else [int(start_token_id)]
-        output_ids = self._append_srt_u_decode_request(
+        output_ids = self._append_srt_ar_decode_request(
             record,
             max_new_tokens=max_new_tokens,
             input_ids=input_ids,
@@ -318,29 +318,29 @@ class UGSessionRuntime:
             greedy=greedy,
             model_state_updates=model_state_updates,
         )
-        return UGTextDecodeResult(
+        return OmniTextDecodeResult(
             session=record.handle(),
             input_ids=tuple(input_ids),
             output_ids=tuple(output_ids),
             position_ids=tuple(int(position) for position in (position_ids or ())),
-            text=record.srt_last_u_decode_text,
+            text=record.srt_last_ar_decode_text,
         )
 
-    def commit_u_decode_input_token(
+    def commit_ar_decode_input_token(
         self,
-        handle: UGSessionHandle,
+        handle: OmniSessionHandle,
         *,
         token_id: int,
         position_id: int | None = None,
         model_state_updates: dict[str, Any] | None = None,
-    ) -> UGSessionHandle:
+    ) -> OmniSessionHandle:
         record = self._record_for(handle)
-        if record.state != UGSegmentState.U_DECODE:
+        if record.state != OmniSegmentState.AR_DECODE:
             raise ValueError(
-                f"Cannot commit U decode token from state {record.state} "
-                f"for UG session {handle.session_id}"
+                f"Cannot commit AR decode token from state {record.state} "
+                f"for omni session {handle.session_id}"
             )
-        request_id = f"{record.session_id}:d{record.srt_u_decode_request_count + 1}"
+        request_id = f"{record.session_id}:d{record.srt_ar_decode_request_count + 1}"
         req, _ = self._create_srt_session_req(
             record,
             request_id=request_id,
@@ -355,63 +355,63 @@ class UGSessionRuntime:
             prefix_len = len(req.origin_input_ids) - 1
             if prefix_len < 0:
                 raise RuntimeError(
-                    "UG SRT U decode commit requires a non-empty token input"
+                    "omni SRT AR decode commit requires a non-empty token input"
                 )
             req.custom_position_ids = list(range(prefix_len)) + [int(position_id)]
         self._record_srt_req(record, req, request_id=request_id)
         adapter_metadata = {
-            "ug_srt_added_token_count": 1,
-            "ug_srt_rope_delta": 1,
-            "ug_srt_committed_decode_token": int(token_id),
+            "omni_srt_added_token_count": 1,
+            "omni_srt_rope_delta": 1,
+            "omni_srt_committed_decode_token": int(token_id),
         }
         if position_id is not None:
-            adapter_metadata["ug_srt_decode_position_id"] = int(position_id)
+            adapter_metadata["omni_srt_decode_position_id"] = int(position_id)
         if model_state_updates is not None:
-            adapter_metadata["ug_model_state_updates"] = model_state_updates
-            self._merge_ug_model_state_updates(record, model_state_updates)
-        adapter_metadata["ug_model_state"] = self._copy_ug_model_state(
-            record.ug_model_state
+            adapter_metadata["omni_model_state_updates"] = model_state_updates
+            self._merge_omni_model_state_updates(record, model_state_updates)
+        adapter_metadata["omni_model_state"] = self._copy_omni_model_state(
+            record.omni_model_state
         )
-        self._attach_srt_u_forward_metadata(
+        self._attach_srt_ar_forward_metadata(
             record,
             req,
-            state=UGSegmentState.U_DECODE,
+            state=OmniSegmentState.AR_DECODE,
             input_text="",
             messages=[],
             adapter_metadata=adapter_metadata,
         )
-        self._execute_srt_req(record, req, state=UGSegmentState.U_DECODE)
-        record.srt_u_decode_request_count += 1
-        record.srt_last_u_decode_request_id = request_id
-        record.srt_last_u_decode_origin_input_len = len(req.origin_input_ids)
-        record.srt_last_u_decode_output_ids = []
-        record.srt_last_u_decode_text = ""
+        self._execute_srt_req(record, req, state=OmniSegmentState.AR_DECODE)
+        record.srt_ar_decode_request_count += 1
+        record.srt_last_ar_decode_request_id = request_id
+        record.srt_last_ar_decode_origin_input_len = len(req.origin_input_ids)
+        record.srt_last_ar_decode_output_ids = []
+        record.srt_last_ar_decode_text = ""
         record.context_length = len(req.origin_input_ids)
-        self._notify_srt_u_forward(
+        self._notify_srt_ar_forward(
             record,
             req,
-            state=UGSegmentState.U_DECODE,
+            state=OmniSegmentState.AR_DECODE,
             input_text="",
             messages=[],
         )
         return record.handle()
 
     def append_generated_image(
-        self, handle: UGSessionHandle, image: Any | None
-    ) -> UGSessionHandle:
+        self, handle: OmniSessionHandle, image: Any | None
+    ) -> OmniSessionHandle:
         record = self._record_for(handle)
-        if record.state != UGSegmentState.G_GENERATE:
+        if record.state != OmniSegmentState.GENERATE:
             raise ValueError(
                 f"Cannot append generated image from state {record.state} "
-                f"for UG session {handle.session_id}"
+                f"for omni session {handle.session_id}"
             )
-        record.state = UGSegmentState.APPEND_IMAGE
+        record.state = OmniSegmentState.APPEND_IMAGE
         next_context_version = record.context_version + 1
-        next_anchor_request_id = f"{record.session_id}:u{next_context_version}"
+        next_anchor_request_id = f"{record.session_id}:ar{next_context_version}"
         record.anchor_request_id = next_anchor_request_id
         self._append_srt_session_request(
             record,
-            [UGInterleavedMessage(type="image", content=image)],
+            [OmniInterleavedMessage(type="image", content=image)],
             request_id=next_anchor_request_id,
         )
         added_tokens = self.model_runner.append_generated_image(
@@ -420,19 +420,19 @@ class UGSessionRuntime:
         record.context_length += added_tokens
         record.context_version = next_context_version
         record.append_image_count += 1
-        record.state = UGSegmentState.U_DECODE
+        record.state = OmniSegmentState.AR_DECODE
         return record.handle()
 
-    def close_session(self, handle_or_session_id: UGSessionHandle | str) -> None:
+    def close_session(self, handle_or_session_id: OmniSessionHandle | str) -> None:
         session_id = (
             handle_or_session_id.session_id
-            if isinstance(handle_or_session_id, UGSessionHandle)
+            if isinstance(handle_or_session_id, OmniSessionHandle)
             else handle_or_session_id
         )
         record = self._records.get(session_id)
         if record is not None:
             record.closed = True
-            record.state = UGSegmentState.DONE
+            record.state = OmniSegmentState.DONE
             sidecar_session_ids = set(record.srt_sidecar_session_ids)
         else:
             sidecar_session_ids = set()
@@ -446,9 +446,9 @@ class UGSessionRuntime:
 
     def get_srt_sidecar_handle(
         self,
-        owner_handle: UGSessionHandle | str,
+        owner_handle: OmniSessionHandle | str,
         role: str,
-    ) -> UGSessionHandle | None:
+    ) -> OmniSessionHandle | None:
         owner_record = self._record_for(owner_handle)
         sidecar_record = owner_record.srt_sidecar_records.get(
             f"{owner_record.session_id}:{role}"
@@ -457,7 +457,7 @@ class UGSessionRuntime:
 
     def get_srt_sidecar_model_state(
         self,
-        owner_handle: UGSessionHandle | str,
+        owner_handle: OmniSessionHandle | str,
         role: str,
     ) -> dict[str, Any]:
         owner_record = self._record_for(owner_handle)
@@ -466,15 +466,15 @@ class UGSessionRuntime:
         )
         if sidecar_record is None:
             return {}
-        return self._copy_ug_model_state(sidecar_record.ug_model_state)
+        return self._copy_omni_model_state(sidecar_record.omni_model_state)
 
     def append_srt_sidecar_prepared_input(
         self,
-        owner_handle: UGSessionHandle | str,
-        prepared: UGSRTPreparedInput,
+        owner_handle: OmniSessionHandle | str,
+        prepared: OmniSRTPreparedInput,
         *,
-        state: UGSegmentState | None = None,
-    ) -> UGSessionHandle:
+        state: OmniSegmentState | None = None,
+    ) -> OmniSessionHandle:
         owner_record = self._record_for(owner_handle)
         sidecar_record = self._append_srt_sidecar_request(
             owner_record,
@@ -483,10 +483,10 @@ class UGSessionRuntime:
         )
         return sidecar_record.handle()
 
-    def get_state(self, handle_or_session_id: UGSessionHandle | str) -> UGSegmentState:
+    def get_state(self, handle_or_session_id: OmniSessionHandle | str) -> OmniSegmentState:
         return self._record_for(handle_or_session_id).state
 
-    def get_debug_counters(self, handle_or_session_id: UGSessionHandle | str) -> dict:
+    def get_debug_counters(self, handle_or_session_id: OmniSessionHandle | str) -> dict:
         record = self._record_for(handle_or_session_id, allow_closed=True)
         return {
             "session_id": record.session_id,
@@ -500,44 +500,44 @@ class UGSessionRuntime:
             "srt_request_count": record.srt_request_count,
             "srt_sidecar_request_count": record.srt_sidecar_request_count,
             "srt_sidecar_session_ids": sorted(record.srt_sidecar_session_ids),
-            "srt_sidecar_ug_model_state": {
-                session_id: self._copy_ug_model_state(sidecar_record.ug_model_state)
+            "srt_sidecar_omni_model_state": {
+                session_id: self._copy_omni_model_state(sidecar_record.omni_model_state)
                 for session_id, sidecar_record in sorted(
                     record.srt_sidecar_records.items()
                 )
             },
-            "ug_model_state": self._copy_ug_model_state(record.ug_model_state),
+            "omni_model_state": self._copy_omni_model_state(record.omni_model_state),
             "srt_last_request_id": record.srt_last_request_id,
             "srt_last_origin_input_len": record.srt_last_origin_input_len,
-            "srt_u_decode_request_count": record.srt_u_decode_request_count,
-            "srt_last_u_decode_request_id": record.srt_last_u_decode_request_id,
-            "srt_last_u_decode_origin_input_len": (
-                record.srt_last_u_decode_origin_input_len
+            "srt_ar_decode_request_count": record.srt_ar_decode_request_count,
+            "srt_last_ar_decode_request_id": record.srt_last_ar_decode_request_id,
+            "srt_last_ar_decode_origin_input_len": (
+                record.srt_last_ar_decode_origin_input_len
             ),
-            "srt_last_u_decode_output_ids": record.srt_last_u_decode_output_ids,
-            "srt_last_u_decode_text": record.srt_last_u_decode_text,
+            "srt_last_ar_decode_output_ids": record.srt_last_ar_decode_output_ids,
+            "srt_last_ar_decode_text": record.srt_last_ar_decode_text,
             "srt_mm_offsets": record.srt_mm_offsets,
             "srt_executed_request_count": record.srt_executed_request_count,
         }
 
     def _record_for(
         self,
-        handle_or_session_id: UGSessionHandle | str,
+        handle_or_session_id: OmniSessionHandle | str,
         *,
         allow_closed: bool = False,
-    ) -> UGSessionRecord:
+    ) -> OmniSessionRecord:
         session_id = (
             handle_or_session_id.session_id
-            if isinstance(handle_or_session_id, UGSessionHandle)
+            if isinstance(handle_or_session_id, OmniSessionHandle)
             else handle_or_session_id
         )
         record = self._records.get(session_id)
         if record is None or (record.closed and not allow_closed):
-            raise ValueError(f"Unknown or closed UG session: {session_id}")
-        if isinstance(handle_or_session_id, UGSessionHandle):
+            raise ValueError(f"Unknown or closed omni session: {session_id}")
+        if isinstance(handle_or_session_id, OmniSessionHandle):
             if handle_or_session_id.context_version != record.context_version:
                 raise ValueError(
-                    "Stale UG session handle: "
+                    "Stale omni session handle: "
                     f"{handle_or_session_id.context_version} != "
                     f"{record.context_version}"
                 )
@@ -545,8 +545,8 @@ class UGSessionRuntime:
 
     def _append_srt_session_request(
         self,
-        record: UGSessionRecord,
-        messages: list[UGInterleavedMessage],
+        record: OmniSessionRecord,
+        messages: list[OmniInterleavedMessage],
         *,
         request_id: str,
     ) -> None:
@@ -556,7 +556,7 @@ class UGSessionRuntime:
             return
         from sglang.srt.session.session_controller import SessionController
 
-        prepared_inputs = self._prepare_srt_u_inputs(
+        prepared_inputs = self._prepare_srt_ar_inputs(
             record,
             messages,
             state=record.state,
@@ -600,7 +600,7 @@ class UGSessionRuntime:
             )
 
             self._record_srt_req(record, req, request_id=segment_request_id)
-            self._attach_srt_u_forward_metadata(
+            self._attach_srt_ar_forward_metadata(
                 record,
                 req,
                 state=record.state,
@@ -609,7 +609,7 @@ class UGSessionRuntime:
                 adapter_metadata=adapter_metadata,
             )
             self._execute_srt_req(record, req, state=record.state)
-            self._notify_srt_u_forward(
+            self._notify_srt_ar_forward(
                 record,
                 req,
                 state=record.state,
@@ -619,14 +619,14 @@ class UGSessionRuntime:
 
     def _append_srt_sidecar_request(
         self,
-        owner_record: UGSessionRecord,
-        prepared: UGSRTPreparedInput,
+        owner_record: OmniSessionRecord,
+        prepared: OmniSRTPreparedInput,
         *,
-        state: UGSegmentState | None = None,
-    ) -> UGSessionRecord:
+        state: OmniSegmentState | None = None,
+    ) -> OmniSessionRecord:
         role = prepared.srt_sidecar_role
         if not role:
-            raise RuntimeError("UG SRT sidecar request requires a sidecar role")
+            raise RuntimeError("omni SRT sidecar request requires a sidecar role")
         sidecar_session_id = (
             prepared.srt_sidecar_session_id or f"{owner_record.session_id}:{role}"
         )
@@ -640,7 +640,7 @@ class UGSessionRuntime:
         )
         sidecar_record = owner_record.srt_sidecar_records.get(sidecar_session_id)
         if sidecar_record is None:
-            sidecar_record = UGSessionRecord(
+            sidecar_record = OmniSessionRecord(
                 session_id=sidecar_session_id,
                 state=sidecar_state,
                 anchor_request_id=request_id,
@@ -670,10 +670,10 @@ class UGSessionRuntime:
             prepared=prepared,
             is_final_segment=True,
         )
-        adapter_metadata["ug_srt_owner_session_id"] = owner_record.session_id
-        adapter_metadata["ug_srt_sidecar_role"] = role
+        adapter_metadata["omni_srt_owner_session_id"] = owner_record.session_id
+        adapter_metadata["omni_srt_sidecar_role"] = role
         self._record_srt_req(sidecar_record, req, request_id=request_id)
-        self._attach_srt_u_forward_metadata(
+        self._attach_srt_ar_forward_metadata(
             sidecar_record,
             req,
             state=sidecar_state,
@@ -683,7 +683,7 @@ class UGSessionRuntime:
         )
         self._execute_srt_req(sidecar_record, req, state=sidecar_state)
         sidecar_record.context_length = len(req.origin_input_ids)
-        self._notify_srt_u_forward(
+        self._notify_srt_ar_forward(
             sidecar_record,
             req,
             state=sidecar_state,
@@ -699,48 +699,48 @@ class UGSessionRuntime:
             return
         req.origin_input_ids = pad_input_ids(req.origin_input_ids, mm_inputs)
 
-    def _prepare_srt_u_inputs(
+    def _prepare_srt_ar_inputs(
         self,
-        record: UGSessionRecord,
-        messages: list[UGInterleavedMessage],
+        record: OmniSessionRecord,
+        messages: list[OmniInterleavedMessage],
         *,
-        state: UGSegmentState,
-    ) -> list[UGSRTPreparedInput]:
+        state: OmniSegmentState,
+    ) -> list[OmniSRTPreparedInput]:
         prepare_all = getattr(
-            self.model_runner, "prepare_srt_u_interleaved_inputs", None
+            self.model_runner, "prepare_srt_ar_interleaved_inputs", None
         )
         if callable(prepare_all):
             custom_inputs = prepare_all(record=record, messages=messages, state=state)
             if custom_inputs is not None:
                 return custom_inputs
 
-        prepare_one = getattr(self.model_runner, "prepare_srt_u_message_inputs", None)
+        prepare_one = getattr(self.model_runner, "prepare_srt_ar_message_inputs", None)
         if not callable(prepare_one):
             raise RuntimeError(
                 f"{self.model_runner.__class__.__name__} must provide explicit "
-                "UG SRT prepared inputs; runtime fallback tokenization is disabled"
+                "omni SRT prepared inputs; runtime fallback tokenization is disabled"
             )
 
-        prepared_inputs: list[UGSRTPreparedInput] = []
+        prepared_inputs: list[OmniSRTPreparedInput] = []
         for message in messages:
             custom = prepare_one(record=record, message=message, state=state)
             if custom is None:
                 raise RuntimeError(
-                    f"{self.model_runner.__class__.__name__} did not prepare UG "
+                    f"{self.model_runner.__class__.__name__} did not prepare omni "
                     f"SRT input for message type {message.type!r}"
                 )
             prepared_inputs.extend(custom)
         if not prepared_inputs:
-            raise RuntimeError("UG SRT prepared inputs must not be empty")
+            raise RuntimeError("omni SRT prepared inputs must not be empty")
         return prepared_inputs
 
     def _apply_prepared_srt_input(
         self,
         req: Any,
         *,
-        record: UGSessionRecord,
+        record: OmniSessionRecord,
         recv_req: Any,
-        prepared: UGSRTPreparedInput,
+        prepared: OmniSRTPreparedInput,
         is_final_segment: bool,
     ) -> dict[str, Any]:
         prefix_len, stripped = self._srt_prefix_and_strip_lengths(
@@ -749,14 +749,14 @@ class UGSessionRuntime:
         new_token_count = len(recv_req.input_ids)
 
         adapter_metadata = dict(prepared.adapter_metadata)
-        adapter_metadata.setdefault("ug_srt_added_token_count", new_token_count)
-        adapter_metadata["ug_srt_is_final_segment"] = bool(is_final_segment)
-        self._merge_ug_model_state_updates(
+        adapter_metadata.setdefault("omni_srt_added_token_count", new_token_count)
+        adapter_metadata["omni_srt_is_final_segment"] = bool(is_final_segment)
+        self._merge_omni_model_state_updates(
             record,
-            adapter_metadata.get("ug_model_state_updates"),
+            adapter_metadata.get("omni_model_state_updates"),
         )
-        adapter_metadata["ug_model_state"] = self._copy_ug_model_state(
-            record.ug_model_state
+        adapter_metadata["omni_model_state"] = self._copy_omni_model_state(
+            record.omni_model_state
         )
 
         if prepared.input_embeds is not None:
@@ -769,7 +769,7 @@ class UGSessionRuntime:
             replace_positions = prepared.replace_positions
             if replace_positions is None:
                 raise RuntimeError(
-                    "UG prepared SRT replace_embeds requires replace_positions"
+                    "omni prepared SRT replace_embeds requires replace_positions"
                 )
             shifted_embeds = []
             shifted_positions = []
@@ -800,13 +800,13 @@ class UGSessionRuntime:
     def _srt_prefix_and_strip_lengths(
         req: Any,
         recv_req: Any,
-        prepared: UGSRTPreparedInput,
+        prepared: OmniSRTPreparedInput,
     ) -> tuple[int, int]:
         prefix_len = len(req.origin_input_ids) - len(recv_req.input_ids)
         stripped = len(prepared.input_ids) - len(recv_req.input_ids)
         if prefix_len < 0 or stripped < 0:
             raise RuntimeError(
-                "UG prepared SRT input length is inconsistent with session request"
+                "omni prepared SRT input length is inconsistent with session request"
             )
         return prefix_len, stripped
 
@@ -844,9 +844,9 @@ class UGSessionRuntime:
             .values
         )
 
-    def _append_srt_u_decode_request(
+    def _append_srt_ar_decode_request(
         self,
-        record: UGSessionRecord,
+        record: OmniSessionRecord,
         *,
         max_new_tokens: int | None = None,
         input_ids: list[int] | None = None,
@@ -857,23 +857,23 @@ class UGSessionRuntime:
         model_state_updates: dict[str, Any] | None = None,
     ) -> list[int]:
         max_new_tokens = (
-            self.srt_u_decode_max_new_tokens
+            self.srt_ar_decode_max_new_tokens
             if max_new_tokens is None
             else int(max_new_tokens)
         )
         if max_new_tokens <= 0:
-            raise ValueError("UG SRT U decode requires max_new_tokens > 0")
+            raise ValueError("omni SRT AR decode requires max_new_tokens > 0")
         input_ids = list(input_ids or [])
         if position_ids is not None and len(position_ids) != len(input_ids):
             raise ValueError(
-                "UG SRT U decode position_ids must match input_ids length: "
+                "omni SRT AR decode position_ids must match input_ids length: "
                 f"{len(position_ids)} != {len(input_ids)}"
             )
         if decode_position_id is not None and input_ids:
             raise ValueError(
-                "UG SRT U decode_position_id is only valid for next-token decode"
+                "omni SRT AR decode_position_id is only valid for next-token decode"
             )
-        request_id = f"{record.session_id}:d{record.srt_u_decode_request_count + 1}"
+        request_id = f"{record.session_id}:d{record.srt_ar_decode_request_count + 1}"
         req, _ = self._create_srt_session_req(
             record,
             request_id=request_id,
@@ -888,7 +888,7 @@ class UGSessionRuntime:
             prefix_len = len(req.origin_input_ids) - len(input_ids)
             if prefix_len < 0:
                 raise RuntimeError(
-                    "UG SRT U decode input length is inconsistent with session request"
+                    "omni SRT AR decode input length is inconsistent with session request"
                 )
             req.custom_position_ids = list(range(prefix_len)) + [
                 int(position) for position in position_ids
@@ -898,54 +898,54 @@ class UGSessionRuntime:
             if not input_ids:
                 if not req.origin_input_ids:
                     raise RuntimeError(
-                        "UG SRT U decode_position_id requires a non-empty "
+                        "omni SRT AR decode_position_id requires a non-empty "
                         "session context"
                     )
                 req.custom_position_ids = list(range(len(req.origin_input_ids)))
                 req.custom_position_ids[-1] = int(decode_position_id)
         self._record_srt_req(record, req, request_id=request_id)
         adapter_metadata = {
-            "ug_srt_added_token_count": len(input_ids),
+            "omni_srt_added_token_count": len(input_ids),
         }
         if position_ids is not None:
-            adapter_metadata["ug_srt_rope_delta"] = len(input_ids)
+            adapter_metadata["omni_srt_rope_delta"] = len(input_ids)
         if decode_position_id is not None:
-            adapter_metadata["ug_srt_decode_position_id"] = int(decode_position_id)
+            adapter_metadata["omni_srt_decode_position_id"] = int(decode_position_id)
         if model_state_updates is not None:
-            adapter_metadata["ug_model_state_updates"] = model_state_updates
-            self._merge_ug_model_state_updates(record, model_state_updates)
-        adapter_metadata["ug_model_state"] = self._copy_ug_model_state(
-            record.ug_model_state
+            adapter_metadata["omni_model_state_updates"] = model_state_updates
+            self._merge_omni_model_state_updates(record, model_state_updates)
+        adapter_metadata["omni_model_state"] = self._copy_omni_model_state(
+            record.omni_model_state
         )
-        self._attach_srt_u_forward_metadata(
+        self._attach_srt_ar_forward_metadata(
             record,
             req,
-            state=UGSegmentState.U_DECODE,
+            state=OmniSegmentState.AR_DECODE,
             input_text="",
             messages=[],
             adapter_metadata=adapter_metadata,
         )
-        self._execute_srt_req(record, req, state=UGSegmentState.U_DECODE)
-        record.srt_u_decode_request_count += 1
-        record.srt_last_u_decode_request_id = request_id
-        record.srt_last_u_decode_origin_input_len = len(req.origin_input_ids)
-        record.srt_last_u_decode_output_ids = list(
+        self._execute_srt_req(record, req, state=OmniSegmentState.AR_DECODE)
+        record.srt_ar_decode_request_count += 1
+        record.srt_last_ar_decode_request_id = request_id
+        record.srt_last_ar_decode_origin_input_len = len(req.origin_input_ids)
+        record.srt_last_ar_decode_output_ids = list(
             req.output_ids[: req.sampling_params.max_new_tokens]
         )
-        record.srt_last_u_decode_text = self._decode_token_ids(
-            record.srt_last_u_decode_output_ids
+        record.srt_last_ar_decode_text = self._decode_token_ids(
+            record.srt_last_ar_decode_output_ids
         )
         record.context_length = len(req.origin_input_ids) + len(
-            record.srt_last_u_decode_output_ids
+            record.srt_last_ar_decode_output_ids
         )
-        self._notify_srt_u_forward(
+        self._notify_srt_ar_forward(
             record,
             req,
-            state=UGSegmentState.U_DECODE,
+            state=OmniSegmentState.AR_DECODE,
             input_text="",
             messages=[],
         )
-        return list(record.srt_last_u_decode_output_ids)
+        return list(record.srt_last_ar_decode_output_ids)
 
     def _decode_token_ids(self, token_ids: list[int] | tuple[int, ...]) -> str:
         decode = getattr(self.tokenizer, "decode", None)
@@ -955,7 +955,7 @@ class UGSessionRuntime:
 
     def _create_srt_session_req(
         self,
-        record: UGSessionRecord,
+        record: OmniSessionRecord,
         *,
         request_id: str,
         input_ids: list[int],
@@ -974,7 +974,7 @@ class UGSessionRuntime:
         session = self.session_controller.get(record.session_id)
         if session is None:
             raise RuntimeError(
-                f"SRT session {record.session_id} is not open for UG request"
+                f"SRT session {record.session_id} is not open for omni request"
             )
         sampling_params = SamplingParams(
             max_new_tokens=max_new_tokens,
@@ -1006,19 +1006,19 @@ class UGSessionRuntime:
         )
         if req.to_finish is not None:
             raise RuntimeError(
-                f"Failed to create SRT UG session request {request_id}: "
+                f"Failed to create SRT omni session request {request_id}: "
                 f"{req.to_finish.to_json()}"
             )
         return req, recv_req
 
     @staticmethod
-    def _attach_srt_u_forward_metadata(
-        record: UGSessionRecord,
+    def _attach_srt_ar_forward_metadata(
+        record: OmniSessionRecord,
         req: Any,
         *,
-        state: UGSegmentState,
+        state: OmniSegmentState,
         input_text: str,
-        messages: list[UGInterleavedMessage],
+        messages: list[OmniInterleavedMessage],
         adapter_metadata: dict[str, Any] | None = None,
     ) -> None:
         req.session_forward_metadata = {
@@ -1031,7 +1031,7 @@ class UGSessionRuntime:
             "max_new_tokens": req.sampling_params.max_new_tokens,
             "input_text": input_text,
             "mm_offsets": tuple(
-                UGSessionRuntime._collect_mm_offsets(req.multimodal_inputs)
+                OmniSessionRuntime._collect_mm_offsets(req.multimodal_inputs)
             ),
             "messages": tuple(messages),
             "adapter_metadata": dict(adapter_metadata or {}),
@@ -1039,15 +1039,15 @@ class UGSessionRuntime:
 
     def _execute_srt_req(
         self,
-        record: UGSessionRecord,
+        record: OmniSessionRecord,
         req: Any,
         *,
-        state: UGSegmentState,
+        state: OmniSegmentState,
     ) -> None:
         from sglang.srt.managers.schedule_batch import FINISH_LENGTH
 
         if self.srt_request_executor is not None:
-            self.srt_request_executor.execute_ug_request(
+            self.srt_request_executor.execute_omni_request(
                 record=record,
                 req=req,
                 state=state,
@@ -1059,7 +1059,7 @@ class UGSessionRuntime:
 
     @staticmethod
     def _record_srt_req(
-        record: UGSessionRecord,
+        record: OmniSessionRecord,
         req: Any,
         *,
         request_id: str,
@@ -1068,31 +1068,31 @@ class UGSessionRuntime:
         record.srt_last_request_id = request_id
         record.srt_last_origin_input_len = len(req.origin_input_ids)
         record.srt_mm_inputs = req.multimodal_inputs
-        record.srt_mm_offsets = UGSessionRuntime._collect_mm_offsets(
+        record.srt_mm_offsets = OmniSessionRuntime._collect_mm_offsets(
             req.multimodal_inputs
         )
 
-    def _notify_srt_u_forward(
+    def _notify_srt_ar_forward(
         self,
-        record: UGSessionRecord,
+        record: OmniSessionRecord,
         req: Any,
         *,
-        state: UGSegmentState,
+        state: OmniSegmentState,
         input_text: str,
-        messages: list[UGInterleavedMessage],
+        messages: list[OmniInterleavedMessage],
     ) -> None:
-        observe = getattr(self.model_runner, "observe_srt_u_forward", None)
+        observe = getattr(self.model_runner, "observe_srt_ar_forward", None)
         if not callable(observe):
             return
         if (
             req.rid in record.srt_model_runner_forward_request_ids
-            and state != UGSegmentState.U_DECODE
+            and state != OmniSegmentState.AR_DECODE
         ):
             return
         output_ids = tuple(req.output_ids[: req.sampling_params.max_new_tokens])
         observe(
             record=record,
-            request=UGSRTRequestView(
+            request=OmniSRTRequestView(
                 session=record.handle(),
                 state=state.value,
                 request_id=req.rid,
@@ -1107,16 +1107,16 @@ class UGSessionRuntime:
             messages=messages,
         )
 
-    def _observe_srt_u_forward_from_model_runner(
+    def _observe_srt_ar_forward_from_model_runner(
         self,
         *,
-        request: UGSRTRequestView,
-        messages: list[UGInterleavedMessage],
+        request: OmniSRTRequestView,
+        messages: list[OmniInterleavedMessage],
     ) -> None:
         record = self._records.get(request.session.session_id)
         if record is None or record.closed:
             return
-        observe = getattr(self.model_runner, "observe_srt_u_forward", None)
+        observe = getattr(self.model_runner, "observe_srt_ar_forward", None)
         if not callable(observe):
             return
         observe(record=record, request=request, messages=messages)
@@ -1124,76 +1124,76 @@ class UGSessionRuntime:
 
     def _srt_request_view_metadata(
         self,
-        record: UGSessionRecord,
+        record: OmniSessionRecord,
         req: Any,
         *,
-        state: UGSegmentState,
+        state: OmniSegmentState,
     ) -> dict[str, Any]:
         metadata = dict(
             getattr(req, "session_forward_metadata", {}).get("adapter_metadata", {})
         )
         metadata.setdefault(
-            "ug_model_state", self._copy_ug_model_state(record.ug_model_state)
+            "omni_model_state", self._copy_omni_model_state(record.omni_model_state)
         )
-        if state == UGSegmentState.U_DECODE:
-            metadata["srt_last_u_decode_text"] = record.srt_last_u_decode_text
+        if state == OmniSegmentState.AR_DECODE:
+            metadata["srt_last_ar_decode_text"] = record.srt_last_ar_decode_text
         token_binding = self._srt_kv_token_binding(record, req, state=state)
         if token_binding is not None:
             metadata["srt_kv_token_binding"] = token_binding
         return metadata
 
     @classmethod
-    def _merge_ug_model_state_updates(
+    def _merge_omni_model_state_updates(
         cls,
-        record: UGSessionRecord,
+        record: OmniSessionRecord,
         updates: dict[str, Any] | None,
     ) -> None:
         if not updates:
             return
         if not isinstance(updates, dict):
-            raise ValueError("UG model state updates must be a dict")
+            raise ValueError("omni model state updates must be a dict")
         for namespace, namespace_updates in updates.items():
             if not isinstance(namespace_updates, dict):
                 raise ValueError(
-                    "UG model state namespace updates must be dicts: " f"{namespace!r}"
+                    "omni model state namespace updates must be dicts: " f"{namespace!r}"
                 )
-            state = record.ug_model_state.setdefault(str(namespace), {})
+            state = record.omni_model_state.setdefault(str(namespace), {})
             for key, value in namespace_updates.items():
-                state[str(key)] = cls._copy_ug_model_state_value(value)
+                state[str(key)] = cls._copy_omni_model_state_value(value)
 
     @classmethod
-    def _copy_ug_model_state(cls, state: dict[str, Any]) -> dict[str, Any]:
+    def _copy_omni_model_state(cls, state: dict[str, Any]) -> dict[str, Any]:
         return {
-            str(key): cls._copy_ug_model_state_value(value)
+            str(key): cls._copy_omni_model_state_value(value)
             for key, value in state.items()
         }
 
     @classmethod
-    def _copy_ug_model_state_value(cls, value: Any) -> Any:
+    def _copy_omni_model_state_value(cls, value: Any) -> Any:
         if isinstance(value, dict):
             return {
-                str(key): cls._copy_ug_model_state_value(item)
+                str(key): cls._copy_omni_model_state_value(item)
                 for key, item in value.items()
             }
         if isinstance(value, list):
-            return [cls._copy_ug_model_state_value(item) for item in value]
+            return [cls._copy_omni_model_state_value(item) for item in value]
         if isinstance(value, tuple):
-            return tuple(cls._copy_ug_model_state_value(item) for item in value)
+            return tuple(cls._copy_omni_model_state_value(item) for item in value)
         return value
 
     def _srt_kv_token_binding(
         self,
-        record: UGSessionRecord,
+        record: OmniSessionRecord,
         req: Any,
         *,
-        state: UGSegmentState,
-    ) -> UGSRTKVTokenBinding | None:
+        state: OmniSegmentState,
+    ) -> OmniSRTKVTokenBinding | None:
         provider = getattr(
             self.srt_request_executor, "get_request_token_binding", None
         )
         if not callable(provider):
             provider = getattr(
-                self.srt_request_executor, "get_ug_request_token_binding", None
+                self.srt_request_executor, "get_omni_request_token_binding", None
             )
         if not callable(provider):
             return None
@@ -1201,10 +1201,10 @@ class UGSessionRuntime:
         binding = provider(record=record, req=req, state=state)
         if binding is None:
             return None
-        if not isinstance(binding, UGSRTKVTokenBinding):
+        if not isinstance(binding, OmniSRTKVTokenBinding):
             raise TypeError(
-                "UG SRT request token binding provider must return "
-                f"UGSRTKVTokenBinding, got {type(binding).__name__}"
+                "omni SRT request token binding provider must return "
+                f"OmniSRTKVTokenBinding, got {type(binding).__name__}"
             )
         return binding
 
@@ -1226,12 +1226,12 @@ class UGSessionRuntime:
             OpenSessionReqInput(
                 session_id=session_id,
                 capacity_of_str_len=self.capacity_of_str_len,
-                # ug contexts must retain KV across U/G phases for G-side reads
+                # ug contexts must retain KV across AR/generation phases for generation-side reads
                 streaming=True,
             )
         )
         if not getattr(output, "success", False):
-            raise RuntimeError(f"Failed to open SRT session for UG: {session_id}")
+            raise RuntimeError(f"Failed to open SRT session for omni: {session_id}")
 
     def _close_srt_session(self, session_id: str) -> None:
         if self.session_controller is None or session_id not in self.session_controller:

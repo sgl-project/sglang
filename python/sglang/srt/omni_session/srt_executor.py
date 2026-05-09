@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Synchronous adapter from UG session requests into an SRT scheduler.
+"""Synchronous adapter from omni session requests into an SRT scheduler.
 
 This module is the execution boundary where omni_session borrows SRT internals:
 it can enqueue small session requests and build temporary query batches that
-read committed SRT KV cache without permanently appending G query tokens.
+read committed SRT KV cache without permanently appending generation query tokens.
 """
 
 from dataclasses import dataclass
@@ -12,15 +12,15 @@ from typing import Any
 
 import torch
 
-from sglang.srt.omni_session.context import UGSRTKVTokenBinding
+from sglang.srt.omni_session.context import OmniSRTKVTokenBinding
 
 
-class UGSRTSchedulerExecutorError(RuntimeError):
-    """Raised when UG cannot synchronously execute an SRT scheduler request."""
+class OmniSRTSchedulerExecutorError(RuntimeError):
+    """Raised when omni cannot synchronously execute an SRT scheduler request."""
 
 
 @dataclass
-class UGSRTTemporaryForwardBatch:
+class OmniSRTTemporaryForwardBatch:
     """ForwardBatch wrapper that releases temporary context-query scheduler state."""
 
     forward_batch: Any
@@ -50,8 +50,8 @@ class UGSRTTemporaryForwardBatch:
                 self.req_to_token_pool.free(self.temp_req)
 
 
-class UGSRTSchedulerExecutor:
-    """Minimal adapter from UG materialized requests into an SRT Scheduler."""
+class OmniSRTSchedulerExecutor:
+    """Minimal adapter from omni materialized requests into an SRT Scheduler."""
 
     finish_request_after_execute = False
 
@@ -65,14 +65,14 @@ class UGSRTSchedulerExecutor:
     ) -> None:
         if not hasattr(scheduler, "session_controller"):
             raise ValueError(
-                "UGSRTSchedulerExecutor requires scheduler.session_controller"
+                "OmniSRTSchedulerExecutor requires scheduler.session_controller"
             )
         self.scheduler = scheduler
         self.run_synchronously = run_synchronously
         self.max_sync_steps = max_sync_steps
         self.require_idle_scheduler = require_idle_scheduler
-        self.token_bindings: list[UGSRTKVTokenBinding] = []
-        self._request_token_bindings: dict[str, UGSRTKVTokenBinding] = {}
+        self.token_bindings: list[OmniSRTKVTokenBinding] = []
+        self._request_token_bindings: dict[str, OmniSRTKVTokenBinding] = {}
         self.session_forward_observer = None
         self.sync_step_count = 0
         self.temporary_context_forward_count = 0
@@ -89,16 +89,16 @@ class UGSRTSchedulerExecutor:
             return
         setter = getattr(model_runner, "set_session_forward_observer", None)
         if not callable(setter):
-            setter = getattr(model_runner, "set_ug_u_forward_observer", None)
+            setter = getattr(model_runner, "set_omni_ar_forward_observer", None)
         if callable(setter):
             setter(observer)
         else:
             model_runner.session_forward_observer = observer
 
-    def set_ug_u_forward_observer(self, observer) -> None:
+    def set_omni_ar_forward_observer(self, observer) -> None:
         self.set_session_forward_observer(observer)
 
-    def execute_ug_request(self, *, record, req, state) -> None:
+    def execute_omni_request(self, *, record, req, state) -> None:
         del record, state
         if self.session_forward_observer is not None:
             self.set_session_forward_observer(self.session_forward_observer)
@@ -107,14 +107,14 @@ class UGSRTSchedulerExecutor:
             self.scheduler.init_req_max_new_tokens(req)
         if not hasattr(self.scheduler, "_add_request_to_queue"):
             raise ValueError(
-                "UGSRTSchedulerExecutor requires scheduler._add_request_to_queue"
+                "OmniSRTSchedulerExecutor requires scheduler._add_request_to_queue"
             )
         self.scheduler._add_request_to_queue(req)
         if self.run_synchronously:
             self._run_until_request_complete(req)
 
     def run_idle_cleanup(self) -> None:
-        """Drain finished scheduler state left by synchronous UG requests."""
+        """Drain finished scheduler state left by synchronous omni requests."""
 
         self._run_idle_cleanup()
 
@@ -124,7 +124,7 @@ class UGSRTSchedulerExecutor:
         record,
         req,
         state,
-    ) -> UGSRTKVTokenBinding | None:
+    ) -> OmniSRTKVTokenBinding | None:
         del state
         binding = self._request_token_bindings.get(req.rid)
         if binding is not None:
@@ -132,7 +132,7 @@ class UGSRTSchedulerExecutor:
         token_indices = self._request_token_indices(record, req)
         if token_indices is None:
             return None
-        return UGSRTKVTokenBinding(
+        return OmniSRTKVTokenBinding(
             session_id=record.session_id,
             request_id=req.rid,
             token_count=int(token_indices.numel()),
@@ -140,13 +140,13 @@ class UGSRTSchedulerExecutor:
             position_count=self._request_position_count(req),
         )
 
-    def get_ug_request_token_binding(
+    def get_omni_request_token_binding(
         self,
         *,
         record,
         req,
         state,
-    ) -> UGSRTKVTokenBinding | None:
+    ) -> OmniSRTKVTokenBinding | None:
         return self.get_request_token_binding(record=record, req=req, state=state)
 
     def get_srt_model(self) -> Any:
@@ -154,8 +154,8 @@ class UGSRTSchedulerExecutor:
         model_runner = self._require_model_runner()
         srt_model = getattr(model_runner, "model", None)
         if srt_model is None:
-            raise UGSRTSchedulerExecutorError(
-                "UG SRT executor requires model_runner.model"
+            raise OmniSRTSchedulerExecutorError(
+                "omni SRT executor requires model_runner.model"
             )
         return srt_model
 
@@ -175,7 +175,7 @@ class UGSRTSchedulerExecutor:
             return int(position_count)
         return int(getattr(binding, "token_count"))
 
-    def get_latest_ug_session_position_count(
+    def get_latest_omni_session_position_count(
         self,
         session_id: str,
         *,
@@ -189,16 +189,16 @@ class UGSRTSchedulerExecutor:
     def get_latest_session_token_binding(
         self,
         session_id: str,
-    ) -> UGSRTKVTokenBinding | None:
+    ) -> OmniSRTKVTokenBinding | None:
         for binding in reversed(self.token_bindings):
             if binding.session_id == session_id:
                 return binding
         return None
 
-    def get_latest_ug_session_token_binding(
+    def get_latest_omni_session_token_binding(
         self,
         session_id: str,
-    ) -> UGSRTKVTokenBinding | None:
+    ) -> OmniSRTKVTokenBinding | None:
         return self.get_latest_session_token_binding(session_id)
 
     def pad_input_ids(self, input_ids: list[int], mm_inputs: Any) -> list[int]:
@@ -213,19 +213,19 @@ class UGSRTSchedulerExecutor:
         self,
         *,
         prepared: Any,
-        g_query_embeds: torch.Tensor,
+        generation_query_embeds: torch.Tensor,
         timestep: torch.Tensor,
-    ) -> UGSRTTemporaryForwardBatch:
+    ) -> OmniSRTTemporaryForwardBatch:
         session_id = getattr(prepared, "srt_session_id", None)
         if session_id is None:
-            raise UGSRTSchedulerExecutorError(
+            raise OmniSRTSchedulerExecutorError(
                 "Temporary context forward requires prepared.srt_session_id"
             )
         sidecar_role = getattr(prepared, "srt_sidecar_role", None)
         binding_session_id = self._binding_session_id(session_id, sidecar_role)
         binding = self.get_latest_session_token_binding(binding_session_id)
         if binding is None:
-            raise UGSRTSchedulerExecutorError(
+            raise OmniSRTSchedulerExecutorError(
                 "Temporary context forward has no SRT KV token binding for session "
                 f"{binding_session_id}"
             )
@@ -234,20 +234,20 @@ class UGSRTSchedulerExecutor:
         prepared_with_binding = SimpleNamespace(**prepared_data)
         return self.build_temporary_context_forward_batch(
             prepared=prepared_with_binding,
-            g_query_embeds=g_query_embeds,
+            generation_query_embeds=generation_query_embeds,
             timestep=timestep,
         )
 
-    def build_ug_g_forward_batch_for_session(
+    def build_generation_forward_batch_for_session(
         self,
         *,
         prepared: Any,
-        g_query_embeds: torch.Tensor,
+        generation_query_embeds: torch.Tensor,
         timestep: torch.Tensor,
-    ) -> UGSRTTemporaryForwardBatch:
+    ) -> OmniSRTTemporaryForwardBatch:
         return self.build_temporary_context_forward_batch_for_session(
             prepared=prepared,
-            g_query_embeds=g_query_embeds,
+            generation_query_embeds=generation_query_embeds,
             timestep=timestep,
         )
 
@@ -255,9 +255,9 @@ class UGSRTSchedulerExecutor:
         self,
         *,
         prepared: Any,
-        g_query_embeds: torch.Tensor,
+        generation_query_embeds: torch.Tensor,
         timestep: torch.Tensor,
-    ) -> UGSRTTemporaryForwardBatch:
+    ) -> OmniSRTTemporaryForwardBatch:
         """Build a temporary extend batch that reads a committed SRT context.
 
         The batch reuses the session's committed KV indices as prefix context, but
@@ -265,7 +265,7 @@ class UGSRTSchedulerExecutor:
         soon as the caller returns.
         """
 
-        del g_query_embeds, timestep
+        del generation_query_embeds, timestep
         self._check_scheduler_idle_for_temporary_context()
         model_runner = self._require_model_runner()
         req_to_token_pool = self._require_attr(
@@ -286,21 +286,21 @@ class UGSRTSchedulerExecutor:
 
         binding = getattr(prepared, "srt_kv_token_binding", None)
         if binding is None:
-            raise UGSRTSchedulerExecutorError(
+            raise OmniSRTSchedulerExecutorError(
                 "Temporary context forward requires prepared.srt_kv_token_binding"
             )
         prefix_indices = getattr(binding, "token_indices", None)
         if prefix_indices is None:
-            raise UGSRTSchedulerExecutorError(
+            raise OmniSRTSchedulerExecutorError(
                 "Temporary context forward requires SRT token indices on the context binding"
             )
         prefix_len = int(getattr(binding, "token_count", 0) or 0)
         if prefix_len < 0:
-            raise UGSRTSchedulerExecutorError(
+            raise OmniSRTSchedulerExecutorError(
                 "Temporary context forward binding token_count cannot be negative"
             )
         if int(prefix_indices.numel()) < prefix_len:
-            raise UGSRTSchedulerExecutorError(
+            raise OmniSRTSchedulerExecutorError(
                 "Temporary context forward binding token_count exceeds token_indices length"
             )
 
@@ -308,16 +308,16 @@ class UGSRTSchedulerExecutor:
         packed_seqlens = generation_input.get("packed_seqlens")
         packed_position_ids = generation_input.get("packed_position_ids")
         if packed_seqlens is None or packed_position_ids is None:
-            raise UGSRTSchedulerExecutorError(
+            raise OmniSRTSchedulerExecutorError(
                 "Temporary context forward requires packed_seqlens and packed_position_ids"
             )
         if int(packed_seqlens.numel()) != 1:
-            raise UGSRTSchedulerExecutorError(
+            raise OmniSRTSchedulerExecutorError(
                 "Temporary context forward currently supports one packed query sequence"
             )
         extend_num_tokens = int(packed_seqlens.to("cpu").sum().item())
         if extend_num_tokens <= 0:
-            raise UGSRTSchedulerExecutorError(
+            raise OmniSRTSchedulerExecutorError(
                 "Temporary context forward requires at least one query token"
             )
         position_token_count = (
@@ -326,7 +326,7 @@ class UGSRTSchedulerExecutor:
             else int(packed_position_ids.numel())
         )
         if position_token_count != extend_num_tokens:
-            raise UGSRTSchedulerExecutorError(
+            raise OmniSRTSchedulerExecutorError(
                 "Temporary context forward packed_position_ids must match packed_seqlens"
             )
 
@@ -375,7 +375,7 @@ class UGSRTSchedulerExecutor:
                 binding=binding,
                 device=device,
             )
-            context = UGSRTTemporaryForwardBatch(
+            context = OmniSRTTemporaryForwardBatch(
                 forward_batch=forward_batch,
                 req_to_token_pool=req_to_token_pool,
                 token_to_kv_pool_allocator=token_to_kv_pool_allocator,
@@ -416,13 +416,13 @@ class UGSRTSchedulerExecutor:
                 return
             batch = self._run_scheduler_step()
             if batch is None and not req.finished():
-                raise UGSRTSchedulerExecutorError(
-                    f"SRT scheduler produced no batch for UG request {req.rid}"
+                raise OmniSRTSchedulerExecutorError(
+                    f"SRT scheduler produced no batch for omni request {req.rid}"
                 )
 
         if not req.finished():
-            raise UGSRTSchedulerExecutorError(
-                "SRT scheduler did not finish UG request "
+            raise OmniSRTSchedulerExecutorError(
+                "SRT scheduler did not finish omni request "
                 f"{req.rid} within {self.max_sync_steps} steps"
             )
         self._run_idle_cleanup()
@@ -534,8 +534,8 @@ class UGSRTSchedulerExecutor:
             if not hasattr(self.scheduler, method_name)
         ]
         if missing:
-            raise UGSRTSchedulerExecutorError(
-                "UGSRTSchedulerExecutor synchronous mode requires scheduler methods: "
+            raise OmniSRTSchedulerExecutorError(
+                "OmniSRTSchedulerExecutor synchronous mode requires scheduler methods: "
                 f"{missing}"
             )
 
@@ -557,8 +557,8 @@ class UGSRTSchedulerExecutor:
             and not self._scheduler_has_active_batches()
         ):
             return
-        raise UGSRTSchedulerExecutorError(
-            "UG synchronous scheduler execution requires an idle scheduler before "
+        raise OmniSRTSchedulerExecutorError(
+            "omni synchronous scheduler execution requires an idle scheduler before "
             f"enqueuing request {req.rid}; {self._scheduler_idle_debug()}"
         )
 
@@ -580,7 +580,7 @@ class UGSRTSchedulerExecutor:
             and not self._scheduler_has_active_batches()
         ):
             return
-        raise UGSRTSchedulerExecutorError(
+        raise OmniSRTSchedulerExecutorError(
             "Temporary context forward requires an idle scheduler before borrowing "
             f"ModelRunner KV slots; {self._scheduler_idle_debug()}"
         )
@@ -619,8 +619,8 @@ class UGSRTSchedulerExecutor:
     def _require_model_runner(self) -> Any:
         model_runner = self._model_runner()
         if model_runner is None:
-            raise UGSRTSchedulerExecutorError(
-                "UG native SRT execution requires a scheduler ModelRunner"
+            raise OmniSRTSchedulerExecutorError(
+                "omni native SRT execution requires a scheduler ModelRunner"
             )
         return model_runner
 
@@ -628,7 +628,7 @@ class UGSRTSchedulerExecutor:
     def _require_attr(obj: Any, attr: str, message: str) -> Any:
         value = getattr(obj, attr, None)
         if value is None:
-            raise UGSRTSchedulerExecutorError(message)
+            raise OmniSRTSchedulerExecutorError(message)
         return value
 
     @staticmethod
@@ -637,7 +637,7 @@ class UGSRTSchedulerExecutor:
         if max_context_len is None:
             return
         if seq_len > int(max_context_len):
-            raise UGSRTSchedulerExecutorError(
+            raise OmniSRTSchedulerExecutorError(
                 "Temporary context forward exceeds req_to_token_pool.max_context_len: "
                 f"{seq_len} > {max_context_len}"
             )
@@ -668,7 +668,7 @@ class UGSRTSchedulerExecutor:
         )
         req_pool_indices = req_to_token_pool.alloc([temp_req])
         if req_pool_indices is None:
-            raise UGSRTSchedulerExecutorError(
+            raise OmniSRTSchedulerExecutorError(
                 "Temporary context forward could not allocate a req_to_token slot"
             )
         if temp_req.req_pool_idx is None:
@@ -715,7 +715,7 @@ class UGSRTSchedulerExecutor:
         )
         owned_cache_loc = token_to_kv_pool_allocator.alloc(owned_num_tokens)
         if owned_cache_loc is None:
-            raise UGSRTSchedulerExecutorError(
+            raise OmniSRTSchedulerExecutorError(
                 "Temporary context forward could not allocate KV cache slots"
             )
         owned_cache_loc = owned_cache_loc.to(
@@ -790,7 +790,7 @@ class UGSRTSchedulerExecutor:
         prefix_len: int,
         seq_len: int,
         extend_num_tokens: int,
-        binding: UGSRTKVTokenBinding,
+        binding: OmniSRTKVTokenBinding,
         device: torch.device,
     ) -> Any:
         from sglang.srt.model_executor.forward_batch_info import (
@@ -905,7 +905,7 @@ class UGSRTSchedulerExecutor:
             token_indices = self._request_token_indices_for_active_req(req)
             if token_indices is None:
                 continue
-            binding = UGSRTKVTokenBinding(
+            binding = OmniSRTKVTokenBinding(
                 session_id=session_id,
                 request_id=req.rid,
                 token_count=int(token_indices.numel()),
@@ -938,7 +938,7 @@ class UGSRTSchedulerExecutor:
             token_indices = self._request_token_indices_for_session(session_id)
             if token_indices is None:
                 continue
-            binding = UGSRTKVTokenBinding(
+            binding = OmniSRTKVTokenBinding(
                 session_id=session_id,
                 request_id=request_id,
                 token_count=int(token_indices.numel()),
@@ -986,7 +986,7 @@ class UGSRTSchedulerExecutor:
 
     @staticmethod
     def _request_position_count(req: Any) -> int | None:
-        position_count = UGSRTSchedulerExecutor._position_count_from_position_ids(
+        position_count = OmniSRTSchedulerExecutor._position_count_from_position_ids(
             getattr(req, "custom_position_ids", None)
         )
         if position_count is not None:
@@ -994,7 +994,7 @@ class UGSRTSchedulerExecutor:
 
         metadata = getattr(req, "session_forward_metadata", {}) or {}
         adapter_metadata = metadata.get("adapter_metadata") or {}
-        position_count = adapter_metadata.get("ug_srt_position_count")
+        position_count = adapter_metadata.get("omni_srt_position_count")
         if position_count is not None:
             return int(position_count)
 

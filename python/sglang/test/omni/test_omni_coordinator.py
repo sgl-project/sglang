@@ -19,7 +19,7 @@ from sglang.omni.protocol import (
 @dataclass(slots=True)
 class _InMemoryContextOps:
     metadata: dict[str, Any] = field(default_factory=dict)
-    g_kind: str | None = None
+    generation_kind: str | None = None
     session_id: str | None = None
 
     def get_role(self, name: str, default: str):
@@ -33,8 +33,8 @@ class _InMemoryContextOps:
         del sidecar_role
         return 0
 
-    def build_temporary_forward_batch(self, *, prepared, g_query_embeds, timestep):
-        del prepared, g_query_embeds, timestep
+    def build_temporary_forward_batch(self, *, prepared, generation_query_embeds, timestep):
+        del prepared, generation_query_embeds, timestep
         raise RuntimeError("no temporary forward backend")
 
 

@@ -176,7 +176,7 @@ class _FakeBridge:
         self.commit_count = 0
         self.session_ids = []
 
-    def prepare_u_context_from_messages(self, **kwargs):
+    def prepare_ar_context_from_messages(self, **kwargs):
         self.session_ids.append(kwargs.get("session_id") or "s0")
         session = SimpleNamespace(
             session_id=kwargs.get("session_id") or "s0",
@@ -194,7 +194,7 @@ class _FakeBridge:
         del kwargs
         self.commit_count += 1
 
-    def continue_u_decode(self, **kwargs):
+    def continue_ar_decode(self, **kwargs):
         del kwargs
         return SimpleNamespace(type="done")
 
@@ -237,11 +237,11 @@ class _ImageCaptureBridge(_FakeBridge):
         super().__init__(pre_image_segments=[])
         self.images = []
 
-    def prepare_u_context_from_messages(self, **kwargs):
+    def prepare_ar_context_from_messages(self, **kwargs):
         for message in kwargs["messages"]:
             if message["type"] == "image":
                 self.images.append(message["image"])
-        return super().prepare_u_context_from_messages(**kwargs)
+        return super().prepare_ar_context_from_messages(**kwargs)
 
 
 def _tiny_png_b64():

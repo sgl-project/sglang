@@ -1,11 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 
-from sglang.srt.omni_session.srt_executor import UGSRTSchedulerExecutor
+from sglang.srt.omni_session.srt_executor import OmniSRTSchedulerExecutor
 
 
 def test_idle_cleanup_drains_active_batch_when_no_pending_requests():
     scheduler = _FakeScheduler()
-    executor = UGSRTSchedulerExecutor(scheduler)
+    executor = OmniSRTSchedulerExecutor(scheduler)
 
     executor.run_idle_cleanup()
 
@@ -19,7 +19,7 @@ def test_idle_cleanup_clears_finished_batch_references():
     scheduler.last_batch = _FakeBatch([finished])
     scheduler.running_batch = _FakeBatch([finished])
     scheduler.cur_batch = _FakeBatch([finished])
-    executor = UGSRTSchedulerExecutor(scheduler)
+    executor = OmniSRTSchedulerExecutor(scheduler)
 
     executor.run_idle_cleanup()
 

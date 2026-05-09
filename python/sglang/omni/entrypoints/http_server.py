@@ -73,7 +73,7 @@ def create_sensenova_u1_app(
     scheduler: Any,
     server_args: Any,
     srt_request_executor: Any | None = None,
-    srt_u_decode_max_new_tokens: int | None = None,
+    srt_ar_decode_max_new_tokens: int | None = None,
 ) -> FastAPI:
     from sglang.omni.configs.sensenova_u1 import (
         build_sensenova_u1_orchestrator_from_scheduler,
@@ -83,7 +83,7 @@ def create_sensenova_u1_app(
         orchestrator_factory=lambda: build_sensenova_u1_orchestrator_from_scheduler(
             scheduler=scheduler,
             srt_request_executor=srt_request_executor,
-            srt_u_decode_max_new_tokens=srt_u_decode_max_new_tokens,
+            srt_ar_decode_max_new_tokens=srt_ar_decode_max_new_tokens,
             server_args=server_args,
         )
     )

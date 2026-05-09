@@ -3398,12 +3398,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if not metadata_list:
             return
 
-        from sglang.srt.omni_session.context import UGSRTRequestView
+        from sglang.srt.omni_session.context import OmniSRTRequestView
 
         for batch_index, metadata in enumerate(metadata_list):
             if not metadata:
                 continue
-            if metadata.get("state") == "u_decode":
+            if metadata.get("state") == "ar_decode":
                 continue
 
             session = metadata["session"]
@@ -3415,7 +3415,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             view_metadata = dict(metadata.get("adapter_metadata", {}))
             if token_binding is not None:
                 view_metadata["srt_kv_token_binding"] = token_binding
-            request = UGSRTRequestView(
+            request = OmniSRTRequestView(
                 session=session,
                 state=metadata["state"],
                 request_id=metadata["request_id"],
@@ -3439,7 +3439,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         batch_index: int,
         metadata: dict,
     ):
-        from sglang.srt.omni_session.context import UGSRTKVTokenBinding
+        from sglang.srt.omni_session.context import OmniSRTKVTokenBinding
 
         req_to_token_pool = getattr(forward_batch, "req_to_token_pool", None)
         req_to_token = getattr(req_to_token_pool, "req_to_token", None)
@@ -3455,7 +3455,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if token_count <= 0:
             return None
         token_indices = req_to_token[pool_idx, :token_count].to(dtype=torch.int64)
-        return UGSRTKVTokenBinding(
+        return OmniSRTKVTokenBinding(
             session_id=metadata["session"].session_id,
             request_id=metadata["request_id"],
             token_count=int(token_indices.numel()),

@@ -4,7 +4,7 @@
 The backend translates generic omni requests into the lower-level
 `srt.omni_session` bridge. SRT remains the owner of sessions, tokenizer state,
 and KV cache; omni only receives context references and a narrow ContextOps
-view for G-side execution.
+view for generation-side execution.
 """
 
 from __future__ import annotations
@@ -37,8 +37,8 @@ class SRTBackedContextOps:
         return _backend_context(self.context).full.metadata
 
     @property
-    def g_kind(self) -> str | None:
-        return getattr(self.bridge, "g_kind", None)
+    def generation_kind(self) -> str | None:
+        return getattr(self.bridge, "generation_kind", None)
 
     @property
     def session_id(self) -> str:
@@ -70,12 +70,12 @@ class SRTBackedContextOps:
         self,
         *,
         prepared: Any,
-        g_query_embeds: Any,
+        generation_query_embeds: Any,
         timestep: Any,
     ) -> Any:
         return self.bridge.runtime.srt_request_executor.build_temporary_context_forward_batch_for_session(
             prepared=self._to_srt_prepared(prepared),
-            g_query_embeds=g_query_embeds,
+            generation_query_embeds=generation_query_embeds,
             timestep=timestep,
         )
 
@@ -89,7 +89,7 @@ class SRTBackedContextOps:
 
 
 class SRTARBackend:
-    """AR backend that delegates U-side work to an SRT-owned middle bridge."""
+    """AR backend that delegates AR-side work to an SRT-owned middle bridge."""
 
     def __init__(self, bridge: Any):
         self.bridge = bridge
@@ -126,7 +126,7 @@ class SRTARBackend:
         *,
         session_id: str | None = None,
     ) -> OmniContextBundle:
-        context = self.bridge.prepare_u_context_from_messages(
+        context = self.bridge.prepare_ar_context_from_messages(
             messages=[_to_legacy_message(message) for message in request.messages],
             think=request.think,
             think_max_new_tokens=request.think_max_new_tokens,
@@ -146,7 +146,7 @@ class SRTARBackend:
         if pending_boundaries:
             return pending_boundaries.pop(0)
         return _coerce_boundary(
-            self.bridge.continue_u_decode(contexts=_backend_context(context))
+            self.bridge.continue_ar_decode(contexts=_backend_context(context))
         )
 
     def append_generated_segment(

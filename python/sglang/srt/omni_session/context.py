@@ -6,8 +6,8 @@ from typing import Any
 
 
 @dataclass(frozen=True, slots=True)
-class UGSessionHandle:
-    """Opaque handle for a SRT-owned UG session.
+class OmniSessionHandle:
+    """Opaque handle for a SRT-owned omni session.
 
     This is intentionally free of KV allocator details. Diffusion-side code may
     keep the handle, but only SRT-side runtime code can resolve it to model/KV
@@ -21,10 +21,10 @@ class UGSessionHandle:
 
 
 @dataclass(frozen=True, slots=True)
-class UGSRTRequestView:
-    """Safe view of a materialized SRT request exposed to UG model adapters."""
+class OmniSRTRequestView:
+    """Safe view of a materialized SRT request exposed to omni model adapters."""
 
-    session: UGSessionHandle
+    session: OmniSessionHandle
     state: str
     request_id: str
     origin_input_len: int
@@ -37,8 +37,8 @@ class UGSRTRequestView:
 
 
 @dataclass(frozen=True, slots=True)
-class UGSRTKVTokenBinding:
-    """Opaque SRT request token locations for UG model-side cache adapters."""
+class OmniSRTKVTokenBinding:
+    """Opaque SRT request token locations for omni model-side cache adapters."""
 
     session_id: str
     request_id: str
@@ -48,19 +48,19 @@ class UGSRTKVTokenBinding:
 
 
 @dataclass(slots=True)
-class UGContextHandle:
-    """Reference to one prepared U-side context stream."""
+class OmniContextHandle:
+    """Reference to one prepared AR-side context stream."""
 
     request_id: str
     token_count: int
-    session: UGSessionHandle | None = None
+    session: OmniSessionHandle | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
-class UGContextBundle:
+class OmniContextBundle:
     """Main and CFG sidecar contexts prepared from the same user turn."""
 
-    full: UGContextHandle
-    text_cfg: UGContextHandle
-    image_cfg: UGContextHandle
+    full: OmniContextHandle
+    text_cfg: OmniContextHandle
+    image_cfg: OmniContextHandle

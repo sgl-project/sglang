@@ -10,8 +10,8 @@ import math
 from typing import Any
 
 from sglang.srt.omni_session.runtime import (
-    UGInterleavedMessage,
-    UGSRTPreparedInput,
+    OmniInterleavedMessage,
+    OmniSRTPreparedInput,
 )
 
 U1_IMG_START_TOKEN = "<img>"
@@ -106,9 +106,9 @@ def _u1_multimodal_inputs(
 def build_u1_native_vlm_prepared_input(
     *,
     tokenizer: Any,
-    messages: list[UGInterleavedMessage],
+    messages: list[OmniInterleavedMessage],
     session: Any | None = None,
-) -> UGSRTPreparedInput:
+) -> OmniSRTPreparedInput:
     image = _first_u1_image_content(messages)
     question = _u1_question_text(messages)
     pixel_values, grid_hw = load_u1_native_image(image)
@@ -123,7 +123,7 @@ def build_u1_native_vlm_prepared_input(
         grid_hw=grid_hw,
         offsets=image_offsets,
     )
-    return UGSRTPreparedInput(
+    return OmniSRTPreparedInput(
         input_ids=input_ids,
         input_text=prompt,
         messages=list(messages),
@@ -135,7 +135,7 @@ def build_u1_native_vlm_prepared_input(
                 "image_grid_hw": _u1_grid_hw_metadata(grid_hw),
                 "image_offsets": list(image_offsets),
             },
-            "ug_model_state_updates": {
+            "omni_model_state_updates": {
                 "u1": {
                     "last_segment_type": "vlm",
                     "last_source": "native_vlm_input",
@@ -150,11 +150,11 @@ def build_u1_native_vlm_prepared_input(
 def build_u1_native_interleave_prepared_input(
     *,
     tokenizer: Any,
-    messages: list[UGInterleavedMessage],
+    messages: list[OmniInterleavedMessage],
     session: Any | None = None,
     think_mode: bool = False,
     system_message: str = U1_INTERLEAVE_SYSTEM_MESSAGE,
-) -> UGSRTPreparedInput:
+) -> OmniSRTPreparedInput:
     prompt_text = _u1_prompt_with_image_placeholders(
         _u1_question_text(messages),
         image_count=len(_u1_image_contents(messages)),
@@ -187,15 +187,15 @@ def build_u1_native_interleave_prepared_input(
 def build_u1_native_interleave_text_uncondition_prepared_input(
     *,
     tokenizer: Any,
-    messages: list[UGInterleavedMessage],
+    messages: list[OmniInterleavedMessage],
     session: Any | None = None,
-) -> UGSRTPreparedInput:
+) -> OmniSRTPreparedInput:
     images = _u1_image_contents(messages)
     prompt = build_u1_t2i_plain_query(prompt=U1_IMAGE_PLACEHOLDER * len(images))
     return _build_u1_native_interleave_like_prepared_input(
         tokenizer=tokenizer,
         prompt=prompt,
-        messages=[UGInterleavedMessage(type="text", content="")],
+        messages=[OmniInterleavedMessage(type="text", content="")],
         images=images,
         session=session,
         role=U1_INTERLEAVE_TEXT_UNCONDITION_ROLE,
@@ -215,10 +215,10 @@ def build_u1_native_interleave_text_uncondition_marker_prepared_input(
     tokenizer: Any,
     session: Any | None = None,
     logical_position: int,
-) -> UGSRTPreparedInput:
+) -> OmniSRTPreparedInput:
     img_start_id = tokenizer.convert_tokens_to_ids(U1_IMG_START_TOKEN)
     next_position = int(logical_position) + 1
-    return UGSRTPreparedInput(
+    return OmniSRTPreparedInput(
         input_ids=[int(img_start_id)],
         input_text=U1_IMG_START_TOKEN,
         messages=[],
@@ -232,15 +232,15 @@ def build_u1_native_interleave_text_uncondition_marker_prepared_input(
             "u1": {
                 "segment_type": "interleave_text_uncondition_image_marker",
                 "source": "native_interleave_text_uncondition_image_marker",
-                "g_position_start": next_position,
+                "generation_position_start": next_position,
             },
-            "ug_model_state_updates": {
+            "omni_model_state_updates": {
                 "u1": {
                     "last_segment_type": "interleave_text_uncondition",
                     "last_source": "native_interleave_text_uncondition_image_marker",
                     "native_interleave_text_uncondition_prompt": True,
                     "open_image_marker": True,
-                    "g_position_start": next_position,
+                    "generation_position_start": next_position,
                     "session_id": _u1_session_id(session),
                 }
             },
@@ -252,17 +252,17 @@ def _build_u1_native_interleave_like_prepared_input(
     *,
     tokenizer: Any,
     prompt: str,
-    messages: list[UGInterleavedMessage],
+    messages: list[OmniInterleavedMessage],
     images: list[Any],
     session: Any | None,
     role: str | None,
     source: str,
     segment_type: str,
     model_state_updates: dict[str, Any] | None,
-) -> UGSRTPreparedInput:
+) -> OmniSRTPreparedInput:
     mm_inputs = None
     image_offsets: list[tuple[int, int]] = []
-    g_position_start = None
+    generation_position_start = None
     if images:
         import torch
 
@@ -306,20 +306,20 @@ def _build_u1_native_interleave_like_prepared_input(
             img_start_token_id=tokenizer.convert_tokens_to_ids(U1_IMG_START_TOKEN),
             img_context_token_id=context_id,
         )
-        g_position_start = int(positions[0].max().item()) + 1
+        generation_position_start = int(positions[0].max().item()) + 1
         mm_inputs = _u1_multimodal_inputs(
             pixel_values=pixel_values,
             grid_hw=grid_hw,
             offsets=image_offsets,
         )
     else:
-        g_position_start = len(input_ids)
+        generation_position_start = len(input_ids)
 
     session_id = _u1_session_id(session)
     u1_metadata = {
         "segment_type": segment_type,
         "source": source,
-        "g_position_start": g_position_start,
+        "generation_position_start": generation_position_start,
     }
     if image_offsets:
         u1_metadata["image_offsets"] = list(image_offsets)
@@ -327,10 +327,10 @@ def _build_u1_native_interleave_like_prepared_input(
     adapter_metadata = {"u1": u1_metadata}
     if model_state_updates is not None:
         state_updates = dict(model_state_updates)
-        state_updates["g_position_start"] = g_position_start
+        state_updates["generation_position_start"] = generation_position_start
         state_updates["session_id"] = session_id
-        adapter_metadata["ug_model_state_updates"] = {"u1": state_updates}
-    return UGSRTPreparedInput(
+        adapter_metadata["omni_model_state_updates"] = {"u1": state_updates}
+    return OmniSRTPreparedInput(
         input_ids=input_ids,
         input_text=prompt,
         messages=messages,
@@ -344,9 +344,9 @@ def _build_u1_native_interleave_like_prepared_input(
 def build_u1_native_t2i_prepared_input(
     *,
     tokenizer: Any,
-    messages: list[UGInterleavedMessage],
+    messages: list[OmniInterleavedMessage],
     session: Any | None = None,
-) -> UGSRTPreparedInput:
+) -> OmniSRTPreparedInput:
     prompt_text = _u1_question_text(messages)
     prompt = build_u1_t2i_prompt(prompt=prompt_text)
     input_ids = _u1_tokenize_to_ids(
@@ -359,7 +359,7 @@ def build_u1_native_t2i_prepared_input(
     img_start_id = tokenizer.convert_tokens_to_ids(U1_IMG_START_TOKEN)
     if img_start_id not in input_ids:
         raise RuntimeError("U1 native T2I prompt did not contain <img> token")
-    return UGSRTPreparedInput(
+    return OmniSRTPreparedInput(
         input_ids=input_ids,
         input_text=prompt,
         messages=list(messages),
@@ -369,7 +369,7 @@ def build_u1_native_t2i_prepared_input(
                 "source": "native_t2i_prompt",
                 "prompt_ends_with_image_marker": input_ids[-1] == img_start_id,
             },
-            "ug_model_state_updates": {
+            "omni_model_state_updates": {
                 "u1": {
                     "last_segment_type": "t2i",
                     "last_source": "native_t2i_prompt",
@@ -385,9 +385,9 @@ def build_u1_native_t2i_prepared_input(
 def build_u1_native_edit_prepared_input(
     *,
     tokenizer: Any,
-    messages: list[UGInterleavedMessage],
+    messages: list[OmniInterleavedMessage],
     session: Any | None = None,
-) -> UGSRTPreparedInput:
+) -> OmniSRTPreparedInput:
     image = _first_u1_image_content(messages)
     prompt_text = _u1_question_text(messages)
     if U1_IMAGE_PLACEHOLDER not in prompt_text:
@@ -422,14 +422,14 @@ def build_u1_native_edit_prepared_input(
         img_start_token_id=tokenizer.convert_tokens_to_ids(U1_IMG_START_TOKEN),
         img_context_token_id=context_id,
     )
-    g_position_start = int(positions[0].max().item()) + 1
+    generation_position_start = int(positions[0].max().item()) + 1
     image_offsets = [(selected[0], selected[-1])]
     mm_inputs = _u1_multimodal_inputs(
         pixel_values=pixel_values,
         grid_hw=grid_hw,
         offsets=image_offsets,
     )
-    return UGSRTPreparedInput(
+    return OmniSRTPreparedInput(
         input_ids=input_ids,
         input_text=prompt,
         messages=list(messages),
@@ -440,14 +440,14 @@ def build_u1_native_edit_prepared_input(
                 "source": "native_edit_prompt",
                 "image_grid_hw": _u1_grid_hw_metadata(grid_hw),
                 "image_offsets": image_offsets,
-                "g_position_start": g_position_start,
+                "generation_position_start": generation_position_start,
             },
-            "ug_model_state_updates": {
+            "omni_model_state_updates": {
                 "u1": {
                     "last_segment_type": "edit",
                     "last_source": "native_edit_prompt",
                     "native_edit_prompt": True,
-                    "g_position_start": g_position_start,
+                    "generation_position_start": generation_position_start,
                     "session_id": _u1_session_id(session),
                 }
             },
@@ -458,9 +458,9 @@ def build_u1_native_edit_prepared_input(
 def build_u1_native_edit_img_condition_prepared_input(
     *,
     tokenizer: Any,
-    messages: list[UGInterleavedMessage],
+    messages: list[OmniInterleavedMessage],
     session: Any | None = None,
-) -> UGSRTPreparedInput:
+) -> OmniSRTPreparedInput:
     image = _first_u1_image_content(messages)
     pixel_values, grid_hw = load_u1_native_image(
         image,
@@ -491,7 +491,7 @@ def build_u1_native_edit_uncondition_prepared_input(
     *,
     tokenizer: Any,
     session: Any | None = None,
-) -> UGSRTPreparedInput:
+) -> OmniSRTPreparedInput:
     return _build_u1_native_marker_sidecar_prepared_input(
         tokenizer=tokenizer,
         session=session,
@@ -512,7 +512,7 @@ def _build_u1_native_image_sidecar_prepared_input(
     source: str,
     segment_type: str,
     session: Any | None,
-) -> UGSRTPreparedInput:
+) -> OmniSRTPreparedInput:
     input_ids = _u1_tokenize_to_ids(
         tokenizer,
         prompt,
@@ -537,17 +537,17 @@ def _build_u1_native_image_sidecar_prepared_input(
         img_start_token_id=tokenizer.convert_tokens_to_ids(U1_IMG_START_TOKEN),
         img_context_token_id=context_id,
     )
-    g_position_start = int(positions[0].max().item()) + 1
+    generation_position_start = int(positions[0].max().item()) + 1
     image_offsets = [(selected[0], selected[-1])]
     mm_inputs = _u1_multimodal_inputs(
         pixel_values=pixel_values,
         grid_hw=grid_hw,
         offsets=image_offsets,
     )
-    return UGSRTPreparedInput(
+    return OmniSRTPreparedInput(
         input_ids=input_ids,
         input_text=prompt,
-        messages=[UGInterleavedMessage(type="image", content=image)],
+        messages=[OmniInterleavedMessage(type="image", content=image)],
         mm_inputs=mm_inputs,
         srt_sidecar_role=role,
         srt_sidecar_session_id=_u1_sidecar_session_id(session, role),
@@ -557,7 +557,7 @@ def _build_u1_native_image_sidecar_prepared_input(
                 "source": source,
                 "image_grid_hw": _u1_grid_hw_metadata(grid_hw),
                 "image_offsets": image_offsets,
-                "g_position_start": g_position_start,
+                "generation_position_start": generation_position_start,
             }
         },
     )
@@ -570,7 +570,7 @@ def build_u1_native_generated_image_commit_prepared_input(
     session: Any | None = None,
     patch_size: int = 16,
     downsample_ratio: float = 0.5,
-) -> UGSRTPreparedInput:
+) -> OmniSRTPreparedInput:
     precomputed_embeddings = None
     if isinstance(image, dict) and image.get("precomputed_embeddings") is not None:
         import torch
@@ -658,15 +658,15 @@ def build_u1_native_generated_image_commit_prepared_input(
         precomputed_embeddings=precomputed_embeddings,
     )
 
-    message = UGInterleavedMessage(type="image", content=image)
+    message = OmniInterleavedMessage(type="image", content=image)
     metadata = _u1_generated_image_commit_metadata(
         session=session,
         token_indices=list(range(context_start, context_end + 1)),
         grid_hw=grid_hw,
         omit_start=omit_start,
-        g_position_start=end_t + 1,
+        generation_position_start=end_t + 1,
     )
-    return UGSRTPreparedInput(
+    return OmniSRTPreparedInput(
         input_ids=input_ids,
         input_text="<u1:generated_image_commit>",
         messages=[message],
@@ -680,7 +680,7 @@ def build_u1_native_t2i_cfg_uncondition_prepared_input(
     *,
     tokenizer: Any,
     session: Any | None = None,
-) -> UGSRTPreparedInput:
+) -> OmniSRTPreparedInput:
     return _build_u1_native_marker_sidecar_prepared_input(
         tokenizer=tokenizer,
         session=session,
@@ -697,7 +697,7 @@ def _build_u1_native_marker_sidecar_prepared_input(
     role: str,
     source: str,
     segment_type: str,
-) -> UGSRTPreparedInput:
+) -> OmniSRTPreparedInput:
     prompt = build_u1_t2i_uncondition_prompt()
     input_ids = _u1_tokenize_to_ids(
         tokenizer,
@@ -709,10 +709,10 @@ def _build_u1_native_marker_sidecar_prepared_input(
     img_start_id = tokenizer.convert_tokens_to_ids(U1_IMG_START_TOKEN)
     if input_ids[-1] != img_start_id:
         raise RuntimeError(f"U1 native {segment_type} prompt must end with <img>")
-    return UGSRTPreparedInput(
+    return OmniSRTPreparedInput(
         input_ids=input_ids,
         input_text=prompt,
-        messages=[UGInterleavedMessage(type="text", content="")],
+        messages=[OmniInterleavedMessage(type="text", content="")],
         srt_sidecar_role=role,
         srt_sidecar_session_id=_u1_sidecar_session_id(session, role),
         adapter_metadata={
@@ -774,7 +774,7 @@ def build_u1_t2i_uncondition_prompt() -> str:
     return build_u1_t2i_plain_query(prompt="", append_text=U1_IMG_START_TOKEN)
 
 
-def _u1_image_contents(messages: list[UGInterleavedMessage]) -> list[Any]:
+def _u1_image_contents(messages: list[OmniInterleavedMessage]) -> list[Any]:
     return [message.content for message in messages if message.type == "image"]
 
 
@@ -1069,12 +1069,12 @@ def _u1_session_context_length(session: Any | None) -> int:
 
 def _u1_session_logical_position(session: Any | None) -> int | None:
     metadata = getattr(session, "metadata", {}) or {}
-    model_state = metadata.get("ug_model_state") or {}
+    model_state = metadata.get("omni_model_state") or {}
     u1_state = model_state.get("u1") or {}
-    g_position_start = u1_state.get("g_position_start")
-    if g_position_start is None:
+    generation_position_start = u1_state.get("generation_position_start")
+    if generation_position_start is None:
         return None
-    return int(g_position_start)
+    return int(generation_position_start)
 
 
 def _u1_merge_size_from_downsample_ratio(downsample_ratio: float) -> int:
@@ -1094,11 +1094,11 @@ def _u1_session_has_open_image_marker(
     img_start_token_id: int,
 ) -> bool:
     metadata = getattr(session, "metadata", {}) or {}
-    model_state = metadata.get("ug_model_state") or {}
+    model_state = metadata.get("omni_model_state") or {}
     u1_state = model_state.get("u1") or {}
     if bool(u1_state.get("open_image_marker")):
         return True
-    last_output_ids = metadata.get("srt_last_u_decode_output_ids") or ()
+    last_output_ids = metadata.get("srt_last_ar_decode_output_ids") or ()
     return bool(last_output_ids) and int(last_output_ids[-1]) == int(img_start_token_id)
 
 
@@ -1108,10 +1108,10 @@ def _u1_generated_image_commit_metadata(
     token_indices: list[int],
     grid_hw: Any,
     omit_start: bool,
-    g_position_start: int | None = None,
+    generation_position_start: int | None = None,
 ) -> dict[str, Any]:
     metadata = getattr(session, "metadata", {}) or {}
-    model_state = metadata.get("ug_model_state") or {}
+    model_state = metadata.get("omni_model_state") or {}
     previous_state = model_state.get("u1") or {}
     previous_segments = [
         dict(segment) for segment in previous_state.get("segments", [])
@@ -1141,11 +1141,11 @@ def _u1_generated_image_commit_metadata(
         "native_generated_image_commit": True,
         "open_image_marker": False,
     }
-    if g_position_start is not None:
-        u1_state["g_position_start"] = int(g_position_start)
+    if generation_position_start is not None:
+        u1_state["generation_position_start"] = int(generation_position_start)
     return {
         "u1": u1_segment,
-        "ug_model_state_updates": {"u1": u1_state},
+        "omni_model_state_updates": {"u1": u1_state},
     }
 
 
@@ -1230,7 +1230,7 @@ def _u1_preprocess_pixel_values(pixel_values: Any, *, patch_size: int):
     return flatten_pixel_values.to(torch.float32), grid_hw
 
 
-def _first_u1_image_content(messages: list[UGInterleavedMessage]) -> Any:
+def _first_u1_image_content(messages: list[OmniInterleavedMessage]) -> Any:
     for message in messages:
         if message.type != "image":
             continue
@@ -1238,7 +1238,7 @@ def _first_u1_image_content(messages: list[UGInterleavedMessage]) -> Any:
     raise ValueError("U1 VLM text generation requires an image message")
 
 
-def _u1_question_text(messages: list[UGInterleavedMessage]) -> str:
+def _u1_question_text(messages: list[OmniInterleavedMessage]) -> str:
     parts = [str(message.content) for message in messages if message.type == "text"]
     question = "\n".join(part for part in parts if part)
     if not question:

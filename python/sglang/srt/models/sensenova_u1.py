@@ -59,7 +59,7 @@ def build_abs_positions_from_grid_hw(
     """Return U1 row-major image patch x/y positions.
 
     This is the SGLang-owned equivalent of U1's official helper. It is kept
-    model-local because it is a U1 spatial-index rule, not a generic UG rule.
+    model-local because it is a U1 spatial-index rule, not a generic omni rule.
     """
 
     if not torch.is_tensor(grid_hw):
