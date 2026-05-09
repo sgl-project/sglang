@@ -967,6 +967,7 @@ class WanTransformer3DModel(CachableDiT, OffloadableDiTMixin):
 
         self.layer_names = ["blocks"]
 
+    @torch.compiler.disable
     @lru_cache(maxsize=1)
     def _compute_rope_for_sequence_shard(
         self,

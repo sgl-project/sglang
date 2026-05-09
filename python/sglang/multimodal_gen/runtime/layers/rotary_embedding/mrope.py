@@ -124,6 +124,7 @@ class OneDRotaryEmbedding(torch.nn.Module):
 
         return freqs_cos.float(), freqs_sin.float()
 
+    @torch.compiler.disable
     @functools.lru_cache(maxsize=16)
     def forward_from_grid(
         self, seq_len: int, start_pos: int, device_str: str
@@ -136,6 +137,7 @@ class OneDRotaryEmbedding(torch.nn.Module):
         freqs_cos, freqs_sin = self.build_freqs_outer(pos, device)
         return freqs_cos, freqs_sin
 
+    @torch.compiler.disable
     def forward(self, pos: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Calculates 1D rotary embeddings for the given positions.
@@ -228,6 +230,7 @@ class NDRotaryEmbedding(torch.nn.Module):
             gen_idx = _config_to_gen_idx[config_key]
             self.dim_idx_to_gen_idx.append(gen_idx)
 
+    @torch.compiler.disable
     def forward(self, positions: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Calculates n-d rotary embeddings for given absolute positions.
@@ -256,6 +259,7 @@ class NDRotaryEmbedding(torch.nn.Module):
         positions = torch.tensor(pos_tuple, dtype=torch.long, device=device)
         return self.forward_uncached(pos=positions)
 
+    @torch.compiler.disable
     def forward_uncached(self, pos: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """
         The core implementation that computes embeddings from a position tensor.
@@ -293,6 +297,7 @@ class NDRotaryEmbedding(torch.nn.Module):
 
         return cos.float(), sin.float()
 
+    @torch.compiler.disable
     def forward_from_grid(
         self,
         grid_size: tuple[int, ...],
