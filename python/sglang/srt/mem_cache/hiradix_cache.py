@@ -841,49 +841,120 @@ class HiRadixCache(RadixCache):
             node = node.parent
         return DecLockRefResult(delta=delta)
 
+    def _host_leaf_node_snapshot(self, node: TreeNode) -> str:
+        return (
+            f"id={node.id} evicted={node.evicted} backuped={node.backuped} "
+            f"lock_ref={node.lock_ref} host_ref_counter={node.host_ref_counter} "
+            f"in_evictable_host_leaves={node in self.evictable_host_leaves}"
+        )
+
+    def _host_leaf_children_trace(
+        self, node: TreeNode, max_children: int = 16
+    ) -> str:
+        if not node.children:
+            return "children=[]"
+        parts: List[str] = []
+        for i, ch in enumerate(node.children.values()):
+            if i >= max_children:
+                parts.append(f"...(+{len(node.children) - max_children} more)")
+                break
+            parts.append(
+                f"(id={ch.id},evicted={ch.evicted},backuped={ch.backuped},"
+                f"lock_ref={ch.lock_ref},host_ref_counter={ch.host_ref_counter})"
+            )
+        return "children=[" + ",".join(parts) + "]"
+
+    def _trace_host_leaf_node(
+        self,
+        *,
+        caller: str,
+        phase: str,
+        node: TreeNode,
+        reason: Optional[str] = None,
+        mutation: Optional[str] = None,
+    ) -> None:
+        rs = reason if reason is not None else "-"
+        mut = mutation if mutation is not None else "-"
+        logger.info(
+            "[HiCacheHostLeafTrace] caller=%s phase=%s {%s} %s reason=%s mutation=%s "
+            "evictable_host_leaves_size=%s",
+            caller,
+            phase,
+            self._host_leaf_node_snapshot(node),
+            self._host_leaf_children_trace(node),
+            rs,
+            mut,
+            len(self.evictable_host_leaves),
+        )
+
     def _update_host_leaf_status(self, node: TreeNode):
+        self._trace_host_leaf_node(
+            caller="_update_host_leaf_status",
+            phase="entry",
+            node=node,
+            mutation="observe",
+        )
         if not node.evicted or node.lock_ref > 0:
-            removed = False
+            parts: List[str] = []
+            if not node.evicted:
+                parts.append("not_evicted_still_has_device_kv")
+            if node.lock_ref > 0:
+                parts.append("lock_ref_protects_hot_path")
+            reason = "|".join(parts) if parts else "ambiguous"
             if node in self.evictable_host_leaves:
                 self.evictable_host_leaves.remove(node)
-                removed = True
-            if logger.isEnabledFor(logging.DEBUG):
-                logger.debug(
-                    "[HiCacheHostLeafStatus] action=withdraw_not_candidate node_id=%s evicted=%s lock_ref=%s removed=%s evictable_host_leaves=%s",
-                    node.id,
-                    node.evicted,
-                    node.lock_ref,
-                    removed,
-                    len(self.evictable_host_leaves),
-                )
+                mutation = "removed_from_evictable_host_leaves_was_member"
+            else:
+                mutation = "not_eligible_already_absent"
+            self._trace_host_leaf_node(
+                caller="_update_host_leaf_status",
+                phase="withdraw_not_candidate",
+                node=node,
+                reason=reason,
+                mutation=mutation,
+            )
             return
 
         for child in node.children.values():
             if child.evicted:
-                removed = False
+                blocked_id = child.id
+                reason = (
+                    f"blocked_by_evicted_child child_id={blocked_id} "
+                    f"(child backuped={child.backuped})"
+                )
                 if node in self.evictable_host_leaves:
                     self.evictable_host_leaves.remove(node)
-                    removed = True
-                if logger.isEnabledFor(logging.DEBUG):
-                    logger.debug(
-                        "[HiCacheHostLeafStatus] action=withdraw_blocked_by_evicted_child node_id=%s removed=%s evictable_host_leaves=%s",
-                        node.id,
-                        removed,
-                        len(self.evictable_host_leaves),
+                    mutation = (
+                        "removed_from_evictable_host_leaves_child_still_demoted_under_subtree"
                     )
+                else:
+                    mutation = "cannot_enter_while_demoted_children_remain"
+                self._trace_host_leaf_node(
+                    caller="_update_host_leaf_status",
+                    phase="withdraw_blocked_by_demoted_child",
+                    node=node,
+                    reason=reason,
+                    mutation=mutation,
+                )
                 return
 
-        inserted = False
-        if node not in self.evictable_host_leaves:
+        inserted = node not in self.evictable_host_leaves
+        if inserted:
             self.evictable_host_leaves.add(node)
-            inserted = True
-        if logger.isEnabledFor(logging.DEBUG):
-            logger.debug(
-                "[HiCacheHostLeafStatus] action=eligible_host_leaf node_id=%s inserted_new=%s evictable_host_leaves=%s",
-                node.id,
-                inserted,
-                len(self.evictable_host_leaves),
-            )
+            mutation = "inserted_into_evictable_host_leaves"
+        else:
+            mutation = "unchanged_already_in_evictable_host_leaves"
+        reason = (
+            "eligible_gpu_evicted_on_host subtree_has_no_demoted_children "
+            "and_no_lock_ref"
+        )
+        self._trace_host_leaf_node(
+            caller="_update_host_leaf_status",
+            phase="promote_evictable_host_leaf",
+            node=node,
+            reason=reason,
+            mutation=mutation,
+        )
 
     def evict(self, params: EvictParams) -> EvictResult:
         start_time = time.perf_counter()
@@ -937,15 +1008,51 @@ class HiRadixCache(RadixCache):
         # GPU -> CPU demotion: block moves from device to host.
         # Emit remove(GPU) so downstream indexers stop scoring it as device-local.
         # The matching store(CPU) was emitted when write_backup() copied to host.
+        self._trace_host_leaf_node(
+            caller="_evict_backuped",
+            phase="pre_demote_gpu",
+            node=node,
+            reason=(
+                "before_device_free:not_in_evictable_host_leaves_typically "
+                "because_need_gpu_evicted_plus_host_backup_for_eligibility "
+                "(evicted=F until value cleared)"
+            ),
+            mutation="observe",
+        )
         self._record_remove_event(node, medium=StorageMedium.GPU)
         num_evicted = self.cache_controller.evict_device(node.value)
         assert num_evicted > 0
         self.evictable_size_ -= num_evicted
         node.value = None
+        self._trace_host_leaf_node(
+            caller="_evict_backuped",
+            phase="gpu_value_cleared_evicted=T",
+            node=node,
+            reason="node.value_cleared_gpu_tier_removed_device_indices_freed",
+            mutation="observe",
+        )
         self._update_leaf_status(node)
         self._update_host_leaf_status(node)
         # update leaf status for the parent because the node is evicted
-        self._update_leaf_status(node.parent)
+        self._trace_host_leaf_node(
+            caller="_evict_backuped",
+            phase="after_host_leaf_updates_on_node",
+            node=node,
+            reason=(
+                "_update_leaf_status_and_update_host_leaf_status_applied;_see_above_traces "
+                "for_whether_promoted_into_evictable_host_leaves"
+            ),
+            mutation="observe",
+        )
+        parent = node.parent
+        self._trace_host_leaf_node(
+            caller="_evict_backuped",
+            phase="will_update_gpu_leaf_parent",
+            node=parent,
+            reason="parent_device_leaf bookkeeping_after_child_demoted",
+            mutation="observe",
+        )
+        self._update_leaf_status(parent)
         return num_evicted
 
     def _evict_regular(self, node: TreeNode):
@@ -981,18 +1088,56 @@ class HiRadixCache(RadixCache):
 
         while num_evicted < num_tokens and len(eviction_heap):
             _priority, x = heapq.heappop(eviction_heap)
+            self._trace_host_leaf_node(
+                caller="evict_host",
+                phase="heap_pop",
+                node=x,
+                reason="candidate_from_prior_evictable_host_leaves_snapshot",
+                mutation="-",
+            )
             if x == self.root_node:
                 skip_hit_root_break += 1
+                self._trace_host_leaf_node(
+                    caller="evict_host",
+                    phase="break_hit_root",
+                    node=x,
+                    reason="root_not_valid_host_leaf_candidate",
+                    mutation="abort_evict_host_loop_break",
+                )
                 break
             # only evict the host value of evicted nodes
             if not x.evicted:
                 skip_not_evicted += 1
+                self._trace_host_leaf_node(
+                    caller="evict_host",
+                    phase="skip_still_hot_on_gpu",
+                    node=x,
+                    reason="not_evicted_device_value_present_not_eligible_host_cpu_trim",
+                    mutation="heap_continue",
+                )
                 continue
 
             if x.host_ref_counter > 0:
                 skip_host_ref_blocked += 1
+                self._trace_host_leaf_node(
+                    caller="evict_host",
+                    phase="skip_host_protected",
+                    node=x,
+                    reason="host_ref_counter_gt_0_protects_host_kv_even_if_gpu_demoted",
+                    mutation="heap_continue",
+                )
                 continue
 
+            self._trace_host_leaf_node(
+                caller="evict_host",
+                phase="execute_cpu_kv_release",
+                node=x,
+                reason=(
+                    f"eligible_evicted_gpu_none backuped={x.backuped} "
+                    f"host_ref_counter={x.host_ref_counter} will_detach_radix_leaf"
+                ),
+                mutation="calling_cache_controller.evict_host",
+            )
             # Block deleted entirely (GPU already evicted, now CPU freed) --
             # emit remove(CPU) so the router drops the host-tier entry.
             self._record_remove_event(x, medium=StorageMedium.CPU)
@@ -1005,7 +1150,28 @@ class HiRadixCache(RadixCache):
             assert v == x, f"parent does not have child key, {key}"
             if x in self.evictable_host_leaves:
                 self.evictable_host_leaves.remove(x)
+                leaf_mut = (
+                    "removed_from_evictable_host_leaves_explicit_after_detach_from_tree"
+                )
+            else:
+                leaf_mut = (
+                    "unexpected_missing_from_evictable_host_leaves_during_explicit_evict_host"
+                )
+            self._trace_host_leaf_node(
+                caller="evict_host",
+                phase="detached_radix_leaf_after_controller_free",
+                node=x,
+                reason="radix_unlinked_child_cpu_buffers_released_above",
+                mutation=leaf_mut,
+            )
             self._update_host_leaf_status(x.parent)
+            self._trace_host_leaf_node(
+                caller="evict_host",
+                phase="after_parent_host_leaf_refresh",
+                node=x.parent,
+                mutation="observe",
+                reason="may_promote_parent_if_demoted_children_host_subtree_cleared",
+            )
 
             if len(x.parent.children) == 0 and x.parent.evicted:
                 new_priority = self.eviction_strategy.get_priority(x.parent)
