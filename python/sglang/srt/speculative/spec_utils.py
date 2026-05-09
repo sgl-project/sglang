@@ -481,7 +481,12 @@ def select_top_k_tokens(
 
         tree_info = (
             topk_p.unsqueeze(1),  # shape: (b, 1, topk)
-            topk_index,  # shape: (b, topk)
+            # Clone to break aliasing with the input `topk_index` buffer
+            # (e.g. `self.topk_index` in EAGLEDraftCudaGraphRunner). When
+            # captured by a CUDA Graph that shares a global memory pool,
+            # the input buffer's storage may be aliased by graph-internal
+            # scratch tensors and read back as garbage at `torch.cat` time.
+            topk_index.clone(),  # shape: (b, topk)
             torch.arange(-1, topk, dtype=torch.long, device=input_ids.device)
             .unsqueeze(0)
             .repeat(topk_p.shape[0], 1),  # shape: (b, topk + 1)
