@@ -61,7 +61,11 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
 from sglang.srt.managers.embed_types import PositionalEmbeds
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
-from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, MatchPrefixParams
+from sglang.srt.mem_cache.base_prefix_cache import (
+    BasePrefixCache,
+    MatchPrefixParams,
+    zero_match_result,
+)
 from sglang.srt.mem_cache.common import (
     alloc_for_decode,
     alloc_for_extend,
@@ -1029,6 +1033,8 @@ class Req(ReqDllmMixin):
                     cow_mamba=cow_mamba,
                 )
             )
+            if envs.SGLANG_RADIX_FORCE_MISS.get():
+                match_result = zero_match_result(tree_cache, match_result)
             (
                 self.prefix_indices,
                 self.last_node,
