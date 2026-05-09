@@ -170,6 +170,10 @@ def npu_format_cast(
         )
         return tensor
 
+    # Skip format cast for meta tensors (used in offloader)
+    if tensor.device.type == "meta":
+        return tensor
+
     return torch.ops.npu.npu_format_cast(tensor, acl_format.value)
 
 
