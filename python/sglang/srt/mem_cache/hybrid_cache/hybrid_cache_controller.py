@@ -161,6 +161,7 @@ class HybridCacheController(BaseHiCacheController):
         storage_backend: Optional[str] = None,
         prefetch_threshold: int = 256,
         model_name: Optional[str] = None,
+        model_identity_hash: Optional[str] = None,
         storage_backend_extra_config: Optional[dict] = None,
         pp_rank: int = 0,
         pp_size: int = 1,
@@ -183,6 +184,7 @@ class HybridCacheController(BaseHiCacheController):
             storage_backend=None,
             prefetch_threshold=prefetch_threshold,
             model_name=model_name,
+            model_identity_hash=model_identity_hash,
             storage_backend_extra_config=storage_backend_extra_config,
             pp_rank=pp_rank,
             pp_size=pp_size,
@@ -199,6 +201,7 @@ class HybridCacheController(BaseHiCacheController):
                 storage_backend=startup_storage_backend,
                 prefetch_threshold=prefetch_threshold,
                 model_name=model_name,
+                model_identity_hash=model_identity_hash,
                 storage_backend_extra_config=storage_backend_extra_config,
                 host_pools=getattr(mem_pool_host, "entries", None),
             )
@@ -208,6 +211,7 @@ class HybridCacheController(BaseHiCacheController):
         storage_backend: str,
         prefetch_threshold: int = 256,
         model_name: Optional[str] = None,
+        model_identity_hash: Optional[str] = None,
         storage_backend_extra_config: Optional[dict] = None,
         host_pools: Optional[list[PoolEntry]] = None,
     ):
@@ -215,6 +219,7 @@ class HybridCacheController(BaseHiCacheController):
             storage_backend=storage_backend,
             prefetch_threshold=prefetch_threshold,
             model_name=model_name,
+            model_identity_hash=model_identity_hash,
             storage_backend_extra_config=storage_backend_extra_config,
         )
 
