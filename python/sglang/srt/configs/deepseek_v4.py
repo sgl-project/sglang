@@ -9,6 +9,17 @@ from sglang.srt.layers.quantization.base_config import QuantizationConfig
 
 logger = logging.getLogger(__name__)
 
+_fp4_experts: Optional[bool] = None
+
+
+def set_fp4_experts(value: bool) -> None:
+    global _fp4_experts
+    _fp4_experts = value
+
+
+def get_fp4_experts() -> bool:
+    return bool(_fp4_experts)
+
 
 def try_detect_fp4_experts(model_path: str) -> Optional[bool]:
     """True = mxfp4-packed (U8/I8/F4), False = converted FP8 (F8_E4M3),

@@ -4002,3 +4002,11 @@ def get_or_create_event_loop():
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         return loop
+
+
+def maybe_torch_compile(func):
+    from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
+
+    if get_is_capture_mode():
+        return torch.compile(func)
+    return func

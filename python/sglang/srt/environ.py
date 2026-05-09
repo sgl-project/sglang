@@ -448,7 +448,7 @@ class Envs:
     # Set to 1: force enable (even without --enable-deterministic-inference)
     # Set to 0: force disable (use default Aiter AR even with --enable-deterministic-inference)
     SGLANG_USE_1STAGE_ALLREDUCE = EnvBool(False)
-    SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2 = EnvBool(True)
+    SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2 = EnvBool(False)
     SGLANG_FLASHINFER_PREFILL_SPLIT_TILE_SIZE = EnvInt(4096)
     SGLANG_FLASHINFER_DECODE_SPLIT_TILE_SIZE = EnvInt(2048)
     SGLANG_TRITON_PREFILL_TRUNCATION_ALIGN_SIZE = EnvInt(4096)
@@ -557,6 +557,15 @@ class Envs:
 
     # ====================================================================
     # DeepSeek V4
+    SGLANG_DSV4_MODE = EnvStr("2604")
+    SGLANG_DSV4_2604_SUBMODE = EnvStr("2604B")
+    SGLANG_OPT_DPSK_V4_RADIX = EnvBool(True)
+    SGLANG_OPT_USE_OLD_COMPRESSOR = EnvBool(False)
+    SGLANG_OPT_USE_TRITON_SWA_PREPARE = EnvBool(True)
+    SGLANG_OPT_USE_AITER_MHC_PRE = EnvBool(True)
+    SGLANG_OPT_USE_AITER_MHC_POST = EnvBool(True)
+    SGLANG_OPT_USE_FUSED_COMPRESS = EnvBool(False)
+    SGLANG_FIX_MTP_HC_HIDDEN = EnvBool(False)
     # ====================================================================
 
     # Set False when using FP4-to-FP8 converted DeepSeek V4 checkpoint.

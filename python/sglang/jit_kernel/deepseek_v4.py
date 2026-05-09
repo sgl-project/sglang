@@ -9,10 +9,18 @@ import triton.language as tl
 from sglang.jit_kernel.utils import (
     cache_once,
     is_arch_support_pdl,
+    is_hip_runtime,
     load_jit,
     make_cpp_args,
 )
 from sglang.srt.environ import envs
+from sglang.srt.utils import get_bool_env_var, is_hip
+
+_is_hip = is_hip()
+_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+
+if _use_aiter:
+    from aiter.tuned_gemm import tgemm
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
@@ -578,11 +586,106 @@ def fused_rope(
     positions: torch.Tensor,
     inverse: bool = False,
 ) -> None:
+    """Apply rotary embeddings to both Q and K in a single fused CUDA kernel.
+
+    Args:
+        q: [batch_size, num_q_heads, rope_dim] bfloat16
+        k: [batch_size, num_k_heads, rope_dim] bfloat16 or None
+        freqs_cis: [max_seq_len, rope_dim // 2] complex64 (full table)
+        positions: [batch_size] int32 or int64, indices into freqs_cis
+        inverse: if True, apply inverse rotation (conjugate freqs)
+    """
+    from sglang.srt.utils import is_hip
+
+    if is_hip():
+        from sglang.srt.layers.deepseek_v4_rope import apply_rotary_emb_triton
+
+        apply_rotary_emb_triton(q, freqs_cis, positions=positions, inverse=inverse)
+        if k is not None:
+            apply_rotary_emb_triton(k, freqs_cis, positions=positions, inverse=inverse)
+        return
+
     freqs_real = torch.view_as_real(freqs_cis).flatten(-2).contiguous()
     module = _jit_fused_rope_module()
     module.forward(q, k, freqs_real, positions, inverse)
 
+@triton.jit
+def _triton_make_swa_prefill_indices_kernel(
+    seq_lens_k_ptr,
+    seq_lens_q_ptr,
+    cu_seqlens_q_ptr,
+    swa_indices_ptr,
+    batch_size,
+    num_q_tokens,
+    stride_swa_0,
+    SWA_WINDOW_SIZE: tl.constexpr,
+    BLOCK_W: tl.constexpr,
+):
+    token_id = tl.program_id(0)
+    if token_id >= num_q_tokens:
+        return
 
+    # Binary search: find largest seq_idx where cu_seqlens_q[seq_idx] <= token_id
+    lo = 0
+    hi = batch_size
+    for _ in tl.static_range(20):
+        mid = (lo + hi) // 2
+        mid_val = tl.load(cu_seqlens_q_ptr + mid)
+        if mid_val <= token_id:
+            lo = mid + 1
+        else:
+            hi = mid
+    seq_idx = lo - 1
+
+    kv_len = tl.load(seq_lens_k_ptr + seq_idx)
+    qo_len = tl.load(seq_lens_q_ptr + seq_idx)
+    cum_qo_len = tl.load(cu_seqlens_q_ptr + seq_idx)
+
+    prefix_len = kv_len - qo_len
+    curr_seq_qo_idx = token_id - cum_qo_len
+    end_abs_pos = prefix_len + curr_seq_qo_idx + 1
+    start_abs_pos = tl.maximum(end_abs_pos - SWA_WINDOW_SIZE, 0)
+    old_kv_start = seq_idx * SWA_WINDOW_SIZE
+    new_kv_start = batch_size * SWA_WINDOW_SIZE + cum_qo_len
+
+    base_ptr = swa_indices_ptr + token_id * stride_swa_0
+    for block_start in tl.static_range(0, SWA_WINDOW_SIZE, BLOCK_W):
+        j = block_start + tl.arange(0, BLOCK_W)
+        abs_pos = start_abs_pos + j
+        old_idx = old_kv_start + abs_pos % SWA_WINDOW_SIZE
+        new_idx = new_kv_start + (abs_pos - prefix_len)
+        idx = tl.where(abs_pos < prefix_len, old_idx, new_idx)
+        idx = tl.where(abs_pos < end_abs_pos, idx, -1)
+        tl.store(base_ptr + j, idx)
+
+
+def triton_make_swa_prefill_indices(
+    seq_lens_k: torch.Tensor,
+    seq_lens_q: torch.Tensor,
+    swa_indices: torch.Tensor,
+    cu_seqlens_q: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    if cu_seqlens_q is None:
+        cu_seqlens_q = torch.cumsum(seq_lens_q, dim=0, dtype=torch.int32)
+        cu_seqlens_q = torch.nn.functional.pad(cu_seqlens_q, (1, 0), value=0)
+    swa_window_size = swa_indices.shape[1]
+    num_q_tokens = swa_indices.shape[0]
+    batch_size = seq_lens_k.shape[0]
+    assert swa_window_size % 32 == 0
+    BLOCK_W = 32
+    grid = (num_q_tokens,)
+    _triton_make_swa_prefill_indices_kernel[grid](
+        seq_lens_k,
+        seq_lens_q,
+        cu_seqlens_q,
+        swa_indices,
+        batch_size,
+        num_q_tokens,
+        swa_indices.stride(0),
+        SWA_WINDOW_SIZE=swa_window_size,
+        BLOCK_W=BLOCK_W,
+    )
+    return swa_indices
 @triton.jit
 def create_paged_compress_data_kernel(
     req_pool_indices_ptr,
@@ -904,5 +1007,7 @@ def _dispatch_bf16_fp32_backend(
         z = x.new_empty(x.size(0), y.size(0), dtype=torch.float32)
         deep_gemm.bf16_gemm_nt(x, y, z)
         return z
+    elif _use_aiter:
+        return tgemm.mm(x, y, otype=x.dtype).float()
     else:
         return torch.nn.functional.linear(x.float(), y.float())
