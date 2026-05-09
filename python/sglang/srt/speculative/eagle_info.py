@@ -240,14 +240,15 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
         accepted token logits.
         """
         if batch.forward_mode.is_idle():
+            draft_input = EagleDraftInput.create_idle_input(
+                device=batch.device,
+                hidden_size=batch.model_config.spec_hidden_size,
+                dtype=batch.model_config.dtype,
+                topk=self.topk,
+                capture_hidden_mode=CaptureHiddenMode.LAST,
+            )
             return EagleVerifyOutput.create_idle(
-                draft_input=EagleDraftInput.create_idle_input(
-                    device=batch.device,
-                    hidden_size=batch.model_config.spec_hidden_size,
-                    dtype=batch.model_config.dtype,
-                    topk=self.topk,
-                    capture_hidden_mode=CaptureHiddenMode.LAST,
-                ),
+                draft_input=draft_input,
                 logits_output=logits_output,
                 device=batch.device,
                 spec_steps=self.spec_steps,
