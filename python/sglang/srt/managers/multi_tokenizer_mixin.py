@@ -35,7 +35,6 @@ import zmq
 import zmq.asyncio
 
 from sglang.srt.disaggregation.utils import DisaggregationMode, TransferBackend
-from sglang.srt.managers.communicator import FanOutCommunicator
 from sglang.srt.managers.disagg_service import start_disagg_service
 from sglang.srt.managers.io_struct import (
     BaseBatchReq,
