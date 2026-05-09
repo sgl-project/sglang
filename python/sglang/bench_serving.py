@@ -366,58 +366,41 @@ async def async_request_openai_chat_completions(
             f'rid={rid} time={request_start_time} message="request start" request_func_input="{str(input_partial)}"'
         )
 
-    if isinstance(request_func_input.prompt, list):
-        messages = request_func_input.prompt
-    elif request_func_input.image_data:
-        # Build multi-image content: a list of image_url entries followed by the text
-        content_items = [
+    content_items = []
+    if request_func_input.image_data:
+        content_items += [
             {
                 "type": "image_url",
                 "image_url": {"url": img_url},
             }
             for img_url in request_func_input.image_data
         ]
-        content_items.append({"type": "text", "text": request_func_input.prompt})
-        messages = [
-            {
-                "role": "user",
-                "content": content_items,
-            },
-        ]
-    elif request_func_input.video_data:
-        # Build multi-video content: a list of video_url entries followed by the text
-        content_items = [
+    if request_func_input.video_data:
+        content_items += [
             {
                 "type": "video_url",
                 "video_url": {"url": video_url},
             }
             for video_url in request_func_input.video_data
         ]
-        content_items.append({"type": "text", "text": request_func_input.prompt})
-        messages = [
-            {
-                "role": "user",
-                "content": content_items,
-            },
-        ]
-    elif request_func_input.audio_data:
-        # Build multi-audio content: a list of audio_url entries followed by the text
-        content_items = [
+    if request_func_input.audio_data:
+        content_items += [
             {
                 "type": "audio_url",
                 "audio_url": {"url": audio_url},
             }
             for audio_url in request_func_input.audio_data
         ]
-        content_items.append({"type": "text", "text": request_func_input.prompt})
-        messages = [
-            {
-                "role": "user",
-                "content": content_items,
-            },
-        ]
-    else:
-        messages = [{"role": "user", "content": request_func_input.prompt}]
+
+    content_items.append({"type": "text", "text": request_func_input.prompt})
+    messages = [
+        {
+            "role": "user",
+            "content": content_items,
+        },
+    ]
+
+
 
     async with _create_bench_client_session() as session:
         # Build payload with defaults that can be overridden by extra_request_body
