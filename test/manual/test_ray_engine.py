@@ -516,5 +516,244 @@ class TestRayHTTPServerTP1(unittest.TestCase):
             self.assertGreater(len(data["text"]), 0, f"Empty output for: {prompt}")
 
 
+# ---------------------------------------------------------------------------
+# Tests: Custom placement_group and SGLANG_RAY_BUNDLE_INDICES
+# ---------------------------------------------------------------------------
+
+
+@unittest.skipUnless(_has_ray, "ray is not installed")
+@unittest.skipUnless(_NUM_GPUS >= 2, "requires at least 2 GPUs")
+class TestRayEnginePlacementGroup(unittest.TestCase):
+    """Test RayEngine with custom placement_group and SGLANG_RAY_BUNDLE_INDICES."""
+
+    @classmethod
+    def setUpClass(cls):
+        if not ray.is_initialized():
+            ray.init(log_to_driver=True, runtime_env=_RAY_RUNTIME_ENV)
+
+    @classmethod
+    def tearDownClass(cls):
+        ray.shutdown()
+
+    def test_custom_pg_dp1_tp2(self):
+        """Test custom placement_group with dp_size=1, tp_size=2."""
+        pg = placement_group([{"GPU": 1}] * 2, strategy="STRICT_PACK")
+        ray.get(pg.ready())
+
+        @ray.remote
+        class EngineActor:
+            def __init__(self, **kwargs):
+                from sglang.srt.ray.engine import RayEngine
+
+                self.engine = RayEngine(**kwargs)
+
+            def generate(self, prompt, sampling_params):
+                return self.engine.generate(
+                    prompt=prompt, sampling_params=sampling_params
+                )
+
+            def shutdown(self):
+                if self.engine:
+                    self.engine.shutdown()
+
+        actor = EngineActor.options(
+            num_cpus=0,
+            num_gpus=0,
+            scheduling_strategy=PlacementGroupSchedulingStrategy(
+                placement_group=pg,
+                placement_group_bundle_index=0,
+            ),
+        ).remote(
+            model_path=_MODEL,
+            tp_size=2,
+            placement_group=pg,
+            use_ray=True,
+        )
+
+        try:
+            result = ray.get(
+                actor.generate.remote("The capital of France is", _SAMPLING_PARAMS),
+                timeout=120,
+            )
+            self.assertIn("text", result)
+            self.assertGreater(len(result["text"]), 0)
+            print(f"Generated (dp=1, tp=2, custom PG): {result['text'][:200]}")
+        finally:
+            ray.get(actor.shutdown.remote(), timeout=60)
+            ray.util.remove_placement_group(pg)
+
+    def test_bundle_indices_dp1_tp2(self):
+        """Test SGLANG_RAY_BUNDLE_INDICES with dp_size=1, tp_size=2."""
+        pg = placement_group([{"GPU": 1}] * 2, strategy="STRICT_PACK")
+        ray.get(pg.ready())
+
+        @ray.remote
+        class EngineActor:
+            def __init__(self, **kwargs):
+                import os
+
+                os.environ["SGLANG_RAY_BUNDLE_INDICES"] = "0,1"
+                from sglang.srt.ray.engine import RayEngine
+
+                self.engine = RayEngine(**kwargs)
+
+            def generate(self, prompt, sampling_params):
+                return self.engine.generate(
+                    prompt=prompt, sampling_params=sampling_params
+                )
+
+            def shutdown(self):
+                if self.engine:
+                    self.engine.shutdown()
+
+        actor = EngineActor.options(
+            num_cpus=0,
+            num_gpus=0,
+            scheduling_strategy=PlacementGroupSchedulingStrategy(
+                placement_group=pg,
+                placement_group_bundle_index=0,
+            ),
+        ).remote(
+            model_path=_MODEL,
+            tp_size=2,
+            placement_group=pg,
+            use_ray=True,
+        )
+
+        try:
+            result = ray.get(
+                actor.generate.remote("The capital of France is", _SAMPLING_PARAMS),
+                timeout=120,
+            )
+            self.assertIn("text", result)
+            self.assertGreater(len(result["text"]), 0)
+            print(f"Generated (dp=1, tp=2, indices=0,1): {result['text'][:200]}")
+        finally:
+            ray.get(actor.shutdown.remote(), timeout=60)
+            ray.util.remove_placement_group(pg)
+
+    def test_custom_pg_dp2_tp1(self):
+        """Test custom placement_group with dp_size=2, tp_size=1."""
+        pg = placement_group([{"GPU": 1}] * 2, strategy="STRICT_PACK")
+        ray.get(pg.ready())
+
+        @ray.remote
+        class EngineActor:
+            def __init__(self, **kwargs):
+                from sglang.srt.ray.engine import RayEngine
+
+                self.engine = RayEngine(**kwargs)
+
+            def generate(self, prompt, sampling_params):
+                return self.engine.generate(
+                    prompt=prompt, sampling_params=sampling_params
+                )
+
+            def shutdown(self):
+                if self.engine:
+                    self.engine.shutdown()
+
+        actor = EngineActor.options(
+            num_cpus=0,
+            num_gpus=0,
+            scheduling_strategy=PlacementGroupSchedulingStrategy(
+                placement_group=pg,
+                placement_group_bundle_index=0,
+            ),
+        ).remote(
+            model_path=_MODEL,
+            tp_size=1,
+            dp_size=2,
+            placement_group=pg,
+            use_ray=True,
+        )
+
+        try:
+            result = ray.get(
+                actor.generate.remote("The capital of France is", _SAMPLING_PARAMS),
+                timeout=120,
+            )
+            self.assertIn("text", result)
+            self.assertGreater(len(result["text"]), 0)
+            print(f"Generated (dp=2, tp=1, custom PG): {result['text'][:200]}")
+        finally:
+            ray.get(actor.shutdown.remote(), timeout=60)
+            ray.util.remove_placement_group(pg)
+
+
+@unittest.skipUnless(_has_ray, "ray is not installed")
+@unittest.skipUnless(_NUM_GPUS >= 1, "requires at least 1 GPU")
+class TestRayEnginePlacementGroupErrors(unittest.TestCase):
+    """Test error handling for placement_group and bundle indices."""
+
+    @classmethod
+    def setUpClass(cls):
+        if not ray.is_initialized():
+            ray.init(log_to_driver=True, runtime_env=_RAY_RUNTIME_ENV)
+
+    @classmethod
+    def tearDownClass(cls):
+        ray.shutdown()
+
+    def test_multi_gpu_bundle_raises_error(self):
+        """Custom PG with multi-GPU bundles should raise ValueError."""
+
+        @ray.remote(num_gpus=0)
+        def _try_multi_gpu_bundle():
+            pg = placement_group([{"GPU": 2}], strategy="STRICT_PACK")
+            ray.get(pg.ready())
+
+            from sglang.srt.ray.engine import RayEngine
+
+            try:
+                RayEngine(
+                    model_path=_MODEL,
+                    tp_size=2,
+                    placement_group=pg,
+                    use_ray=True,
+                )
+                return None
+            except ValueError as e:
+                return str(e)
+            finally:
+                ray.util.remove_placement_group(pg)
+
+        error_msg = ray.get(_try_multi_gpu_bundle.remote(), timeout=120)
+        self.assertIsNotNone(error_msg)
+        self.assertIn("cannot have more than 1 GPU", error_msg)
+
+    def test_invalid_bundle_index_raises_error(self):
+        """SGLANG_RAY_BUNDLE_INDICES with invalid index should raise ValueError."""
+
+        @ray.remote(num_gpus=0)
+        def _try_invalid_bundle_index():
+            import os
+
+            os.environ["SGLANG_RAY_BUNDLE_INDICES"] = "0,10"
+
+            pg = placement_group([{"GPU": 1}] * 2, strategy="STRICT_PACK")
+            ray.get(pg.ready())
+
+            from sglang.srt.ray.engine import RayEngine
+
+            try:
+                RayEngine(
+                    model_path=_MODEL,
+                    tp_size=2,
+                    placement_group=pg,
+                    use_ray=True,
+                )
+                return None
+            except ValueError as e:
+                return str(e)
+            finally:
+                os.environ.pop("SGLANG_RAY_BUNDLE_INDICES", None)
+                ray.util.remove_placement_group(pg)
+
+        error_msg = ray.get(_try_invalid_bundle_index.remote(), timeout=120)
+        self.assertIsNotNone(error_msg)
+        self.assertIn("out of range", error_msg)
+
+
 if __name__ == "__main__":
     unittest.main()

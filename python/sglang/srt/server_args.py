@@ -435,6 +435,7 @@ class ServerArgs:
     gpu_id_step: int = 1
     sleep_on_idle: bool = False
     use_ray: bool = False
+    placement_group: Optional[Any] = None
     custom_sigquit_handler: Optional[Callable] = None
 
     # Logging
