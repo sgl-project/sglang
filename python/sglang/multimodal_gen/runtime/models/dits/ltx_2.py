@@ -337,7 +337,8 @@ class LTX2AudioVideoRotaryPosEmbed(nn.Module):
         ).to(device)
 
         num_rope_elems = num_pos_dims * 2
-        # Keep LTX-2.3 HQ on the established device-side RoPE trajectory.
+        # LTX-2.3 HQ is sensitive to RoPE rounding; keep frequency generation on
+        # the target device instead of caching a CPU/NumPy tensor.
         freqs_dtype = torch.float64 if self.double_precision else torch.float32
         pow_indices = torch.pow(
             self.theta,
@@ -1408,7 +1409,7 @@ class LTX2VideoTransformer3DModel(CachableDiT, OffloadableDiTMixin):
         frequencies_precision = hf_config.get("frequencies_precision")
         if frequencies_precision is None:
             frequencies_precision = getattr(arch, "frequencies_precision", None)
-        # Official LTX uses `frequencies_precision="float64"` for the same switch.
+        # Diffusers/LTX configs use `frequencies_precision` for this RoPE switch.
         rope_double_precision = (
             str(frequencies_precision) == "float64"
             if frequencies_precision is not None
