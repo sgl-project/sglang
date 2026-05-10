@@ -1691,23 +1691,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             "All ranks are marked as elastic_ep_rejoin."
         )
 
-    def get_weights_by_name(
-        self, name: str, truncate_size: int = 100
-    ) -> Optional[torch.Tensor]:
-        """Get the weights of the parameter by its name. Similar to `get_parameter` in Hugging Face.
-
-        Only used for unit test with an unoptimized performance.
-        For optimized performance, please use torch.save and torch.load.
-        """
-        # TODO: (chenyang) Add support for Qwen models.
-        try:
-            return self.model.get_weights_by_name(
-                name, truncate_size, tp_size=self.tp_size
-            )
-        except Exception as e:
-            logger.error(f"Error when getting parameter {name}: {e}")
-            return None
-
     def init_lora_manager(self):
         self.lora_manager = LoRAManager(
             base_model=self.model,
@@ -3001,22 +2984,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             forward_batch.top_logprobs_nums,
             forward_batch.token_ids_logprobs,
         )
-
-    def save_remote_model(self, url: str):
-        from sglang.srt.model_loader.loader import RemoteModelLoader
-
-        logger.info(f"Saving model to {url}")
-        RemoteModelLoader.save_model(self.model, self.model_config.model_path, url)
-
-    def save_sharded_model(
-        self, path: str, pattern: Optional[str] = None, max_size: Optional[int] = None
-    ):
-        from sglang.srt.model_loader.loader import ShardedStateLoader
-
-        logger.info(
-            f"Save sharded model to {path} with pattern {pattern} and max_size {max_size}"
-        )
-        ShardedStateLoader.save_model(self.model, path, pattern, max_size)
 
     def check_weights(self, action: str):
         return self._weight_checker.handle(action=action)
