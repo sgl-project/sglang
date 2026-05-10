@@ -62,6 +62,7 @@ from sglang.srt.mem_cache.common import (
     page_align_floor,
     release_kv_cache,
 )
+from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.mem_cache.memory_pool import (
     HybridLinearKVPool,
     HybridReqToTokenPool,
@@ -340,6 +341,17 @@ class DecodePreallocQueue:
             kv_data_ptrs, kv_data_lens, kv_item_lens = (
                 host_pool.get_contiguous_buf_infos()
             )
+            if isinstance(self.token_to_kv_pool, DeepSeekV4TokenToKVPool):
+                # DSV4 HiSparse writes only C4 KV to host.  The c4_indexer and
+                # c128 KV remain device-to-device transfers and are appended
+                # after the host C4 entries in Mooncake's KV pointer table.
+                device_kv_data_ptrs, device_kv_data_lens, device_kv_item_lens = (
+                    self.token_to_kv_pool.get_contiguous_buf_infos()
+                )
+                c4_layer_num = host_pool.layer_num
+                kv_data_ptrs += device_kv_data_ptrs[c4_layer_num:]
+                kv_data_lens += device_kv_data_lens[c4_layer_num:]
+                kv_item_lens += device_kv_item_lens[c4_layer_num:]
         else:
             kv_data_ptrs, kv_data_lens, kv_item_lens = (
                 self.token_to_kv_pool.get_contiguous_buf_infos()
@@ -357,7 +369,7 @@ class DecodePreallocQueue:
         kv_args.kv_data_ptrs = kv_data_ptrs
         kv_args.kv_data_lens = kv_data_lens
         kv_args.kv_item_lens = kv_item_lens
-        # HiSparse Host pool has page_size=1; use it when hisparse is enabled
+        # HiSparse Host pool has page_size=1; use it for direct-to-host mode.
         kv_args.page_size = (
             1 if self.scheduler.enable_hisparse else self.token_to_kv_pool.page_size
         )
@@ -798,6 +810,15 @@ class DecodePreallocQueue:
                     .astype(np.int32)
                 )
                 page_size = 1  # host pool page_size
+                device_kv_page_indices = None
+                if isinstance(self.token_to_kv_pool, DeepSeekV4TokenToKVPool):
+                    kv_indices_full = self.req_to_token_pool.req_to_token[
+                        decode_req.req.req_pool_idx, prefix_len:origin_input_len
+                    ]
+                    device_kv_page_indices = kv_to_page_indices(
+                        kv_indices_full.cpu().numpy(),
+                        self.token_to_kv_pool.page_size,
+                    ).astype(np.int32)
             else:
                 # Only send delta indices (beyond prefix) to prefill.
                 kv_indices = (
@@ -808,6 +829,7 @@ class DecodePreallocQueue:
                     .numpy()
                 )
                 page_size = self.token_to_kv_pool_allocator.page_size
+                device_kv_page_indices = None
 
             # Prepare extra pool indices for hybrid models
             if isinstance(self.token_to_kv_pool, HybridLinearKVPool):
@@ -819,6 +841,24 @@ class DecodePreallocQueue:
                     .cpu()
                     .numpy()
                 ]
+            elif isinstance(self.token_to_kv_pool, DeepSeekV4TokenToKVPool):
+                seq_len = len(decode_req.req.origin_input_ids)
+                window_size = self.scheduler.sliding_window_size
+                state_page_size = self.token_to_kv_pool.swa_page_size
+
+                window_start = max(0, seq_len - window_size)
+                window_start = page_align_floor(window_start, state_page_size)
+                window_kv_indices_full = self.req_to_token_pool.req_to_token[
+                    decode_req.req.req_pool_idx, window_start:seq_len
+                ]
+
+                window_kv_indices_swa = (
+                    self.token_to_kv_pool_allocator.translate_loc_from_full_to_swa(
+                        window_kv_indices_full
+                    )
+                )
+                state_indices = window_kv_indices_swa.cpu().numpy()
+                state_indices = kv_to_page_indices(state_indices, state_page_size)
             elif isinstance(self.token_to_kv_pool, BaseSWAKVPool):
                 seq_len = len(decode_req.req.origin_input_ids)
                 window_size = self.scheduler.sliding_window_size
@@ -854,12 +894,26 @@ class DecodePreallocQueue:
             )
             assert decode_req.metadata_buffer_index is not None
             page_indices = kv_to_page_indices(kv_indices, page_size)
-            decode_req.kv_receiver.send_metadata(
-                page_indices,
-                decode_req.metadata_buffer_index,
-                state_indices,
-                decode_prefix_len=prefix_len,
-            )
+            if device_kv_page_indices is not None:
+                if self.transfer_backend != TransferBackend.MOONCAKE:
+                    raise NotImplementedError(
+                        "DeepSeek V4 HiSparse PD direct-to-host currently "
+                        "requires the Mooncake transfer backend."
+                    )
+                decode_req.kv_receiver.send_metadata(
+                    page_indices,
+                    decode_req.metadata_buffer_index,
+                    state_indices,
+                    decode_prefix_len=prefix_len,
+                    device_kv_indices=device_kv_page_indices,
+                )
+            else:
+                decode_req.kv_receiver.send_metadata(
+                    page_indices,
+                    decode_req.metadata_buffer_index,
+                    state_indices,
+                    decode_prefix_len=prefix_len,
+                )
             if (
                 self.transfer_queue.enable_staging
                 and hasattr(decode_req.kv_receiver, "require_staging")
@@ -1032,15 +1086,21 @@ class DecodePreallocQueue:
                 last_loc=torch.tensor([-1], dtype=torch.int64, device=device),
                 extend_num_tokens=fill_len,
             )
-            # Allocate host indices for the RDMA transfer target.
-            host_indices = coordinator.mem_pool_host.alloc(fill_len)
+            # Allocate host indices for the RDMA transfer target. DeepSeek V4
+            # stores HiSparse host KV at c4-token granularity.
+            host_len = (
+                fill_len // coordinator.compress_ratio
+                if coordinator.is_dsv4_hisparse
+                else fill_len
+            )
+            host_indices = coordinator.mem_pool_host.alloc(host_len)
             if host_indices is None:
                 raise RuntimeError(
-                    f"HiSparse host mem pool alloc failed for {fill_len} tokens "
+                    f"HiSparse host mem pool alloc failed for {host_len} tokens "
                     f"in _pre_alloc (req {req.rid})"
                 )
             host_indices = host_indices.to(device=coordinator.device)
-            coordinator.req_to_host_pool[req.req_pool_idx, :fill_len] = host_indices
+            coordinator.req_to_host_pool[req.req_pool_idx, :host_len] = host_indices
         elif self.token_to_kv_pool_allocator.page_size == 1:
             kv_loc = self.token_to_kv_pool_allocator.alloc(delta_len)
         else:

@@ -483,6 +483,58 @@ class DeepSeekV4SingleKVPoolHost:
             cpu_indices=host_indices_i64,
         )
 
+    def get_contiguous_buf_infos(self):
+        """Return host C4 buffers as token-linear transfer targets."""
+        data_ptrs = [int(self.data_ptrs[i].item()) for i in range(self.layer_num)]
+        data_lens = [self.kv_buffer[i].nbytes for i in range(self.layer_num)]
+        item_lens = [
+            self.kv_cache_total_dim * self.dtype.itemsize
+        ] * self.layer_num
+        return data_ptrs, data_lens, item_lens
+
+    def load_to_device_per_layer(
+        self, device_pool, host_indices, device_indices, layer_id, io_backend
+    ):
+        if io_backend != "kernel":
+            raise ValueError(f"Unsupported IO backend: {io_backend}")
+        if host_indices.numel() == 0:
+            return
+
+        host_indices_cpu = host_indices.to(device="cpu", dtype=torch.int64)
+        device_indices = device_indices.to(
+            device=self.device_pool.device, dtype=torch.int64
+        )
+
+        item_bytes = self.kv_cache_total_dim * self.dtype.itemsize
+        value_bytes = item_bytes - 8
+        scale_bytes = 8
+        page_size = device_pool.page_size
+
+        host_rows = self.kv_buffer[layer_id].index_select(0, host_indices_cpu)
+        host_rows = host_rows.to(device=self.device_pool.device, non_blocking=True)
+
+        device_buf = device_pool.kv_buffer[layer_id]
+        page_indices = device_indices // page_size
+        offsets_in_page = device_indices % page_size
+
+        # DSV4 device pages are padded, so flattening the value/scale regions with
+        # reshape can materialize a copy instead of a writable view. Scatter by
+        # page and byte offset to write back to the original buffer.
+        value_offsets = (
+            offsets_in_page[:, None] * value_bytes
+            + torch.arange(value_bytes, device=self.device_pool.device)
+        )
+        device_buf[page_indices[:, None], value_offsets] = host_rows[:, :value_bytes]
+
+        scale_offsets = (
+            page_size * value_bytes
+            + offsets_in_page[:, None] * scale_bytes
+            + torch.arange(scale_bytes, device=self.device_pool.device)
+        )
+        device_buf[page_indices[:, None], scale_offsets] = host_rows[
+            :, value_bytes:item_bytes
+        ]
+
     def available_size(self):
         return len(self.free_slots)
 
@@ -607,10 +659,29 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             "use alloc_extend or alloc_decode instead."
         )
 
+    def alloc_logical_only(
+        self,
+        prefix_lens: torch.Tensor,
+        prefix_lens_cpu: torch.Tensor,
+        seq_lens: torch.Tensor,
+        seq_lens_cpu: torch.Tensor,
+        last_loc: torch.Tensor,
+        extend_num_tokens: int,
+    ):
+        return self.logical_attn_allocator.alloc_extend(
+            prefix_lens,
+            prefix_lens_cpu,
+            seq_lens,
+            seq_lens_cpu,
+            last_loc,
+            extend_num_tokens,
+        )
+
     def alloc_device_buffer(self, allocated_indices, need_size: int):
         assert need_size % self.page_size == 0
         hisparse_indices = self.full_to_hisparse_device_index_mapping[allocated_indices]
         self.full_to_hisparse_device_index_mapping[allocated_indices] = 0
+        hisparse_indices = hisparse_indices[hisparse_indices > 0]
 
         device_buffer_size = need_size - self.page_size
         P = len(hisparse_indices)

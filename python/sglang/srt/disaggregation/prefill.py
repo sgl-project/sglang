@@ -55,6 +55,7 @@ from sglang.srt.mem_cache.common import (
     maybe_cache_unfinished_req,
     release_kv_cache,
 )
+from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, NSATokenToKVPool
 from sglang.srt.observability.req_time_stats import set_schedule_time_batch
 
@@ -793,8 +794,14 @@ class SchedulerDisaggregationPrefillMixin:
                 # SWA hybrid model: send last window KV indices
                 seq_len = len(req.fill_ids)
                 window_size = self.sliding_window_size
+                kvcache = self.token_to_kv_pool_allocator.get_kvcache()
+                state_page_size = (
+                    kvcache.swa_page_size
+                    if isinstance(kvcache, DeepSeekV4TokenToKVPool)
+                    else page_size
+                )
                 window_start = max(0, seq_len - window_size)
-                window_start = (window_start // page_size) * page_size
+                window_start = (window_start // state_page_size) * state_page_size
 
                 window_kv_indices_full = self.req_to_token_pool.req_to_token[
                     req.req_pool_idx, window_start:seq_len
@@ -807,7 +814,7 @@ class SchedulerDisaggregationPrefillMixin:
                     )
                 )
                 state_indices = window_kv_indices_swa.cpu().numpy()
-                state_indices = kv_to_page_indices(state_indices, page_size)
+                state_indices = kv_to_page_indices(state_indices, state_page_size)
             elif isinstance(
                 self.token_to_kv_pool_allocator.get_kvcache(), NSATokenToKVPool
             ):
