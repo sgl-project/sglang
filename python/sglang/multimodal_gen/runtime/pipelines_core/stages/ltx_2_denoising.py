@@ -427,40 +427,52 @@ class LTX2DenoisingStage(DenoisingStage):
         *,
         latents: torch.Tensor,
         local_velocities: dict[str, torch.Tensor],
+        pass_names: tuple[str, ...],
         sigma: float | torch.Tensor,
         cfg_scale: float,
         stg_scale: float,
         rescale_scale: float,
         modality_scale: float,
     ) -> torch.Tensor:
-        """Combine stage-1 guidance passes that were split across CFG ranks.
+        """Combine split stage-1 guidance passes with the serial formula."""
+        cfg_rank = get_classifier_free_guidance_rank()
+        cfg_world_size = get_classifier_free_guidance_world_size()
+        assignments = dispatch_branches(len(pass_names), cfg_world_size)
+        local_assignment = assignments[cfg_rank]
+        max_local_passes = max(len(assignment) for assignment in assignments)
 
-        Each pass is one model forward with a different conditioning setup:
-        positive prompt, negative prompt, attention-disabled perturbation, or
-        audio/video cross-attention disabled. A rank only owns some passes, so
-        it contributes weighted x0 terms for those passes and all-reduce
-        reconstructs the full guided x0 on every rank.
-        """
-        coefficients = {
-            "cond": cfg_scale + stg_scale + modality_scale - 1.0,
-            "neg": 1.0 - cfg_scale,
-            "perturbed": -stg_scale,
-            "modality": 1.0 - modality_scale,
+        local_x0_by_name = {
+            name: cls._ltx2_velocity_to_x0(latents, velocity, sigma)
+            for name, velocity in local_velocities.items()
         }
-        first_velocity = next(iter(local_velocities.values()))
-        template = cls._ltx2_velocity_to_x0(latents, first_velocity, sigma)
-        cond_partial = torch.zeros_like(template)
-        pred_partial = torch.zeros_like(template)
+        template = next(iter(local_x0_by_name.values()))
+        local_slots = []
+        for slot in range(max_local_passes):
+            if slot < len(local_assignment):
+                local_slots.append(local_x0_by_name[pass_names[local_assignment[slot]]])
+            else:
+                local_slots.append(torch.zeros_like(template))
 
-        for name, velocity in local_velocities.items():
-            denoised = cls._ltx2_velocity_to_x0(latents, velocity, sigma)
-            if name == "cond":
-                cond_partial = cond_partial + denoised
-            pred_partial = pred_partial + denoised * coefficients[name]
+        gathered_slots = [
+            cfg_model_parallel_all_gather(slot, dim=0, separate_tensors=True)
+            for slot in local_slots
+        ]
+        gathered_x0 = {}
+        for pass_index, name in enumerate(pass_names):
+            owner_rank = pass_index % cfg_world_size
+            owner_slot = pass_index // cfg_world_size
+            gathered_x0[name] = gathered_slots[owner_slot][owner_rank]
 
-        cond = cfg_model_parallel_all_reduce(cond_partial)
-        pred = cfg_model_parallel_all_reduce(pred_partial)
-        return cls._ltx2_apply_rescale(cond, pred, rescale_scale)
+        return cls._ltx2_calculate_guided_x0(
+            cond=gathered_x0["cond"],
+            uncond_text=gathered_x0["neg"],
+            uncond_perturbed=gathered_x0.get("perturbed", 0.0),
+            uncond_modality=gathered_x0.get("modality", 0.0),
+            cfg_scale=cfg_scale,
+            stg_scale=stg_scale,
+            rescale_scale=rescale_scale,
+            modality_scale=modality_scale,
+        )
 
     @staticmethod
     def _ltx2_channelwise_normalize(noise: torch.Tensor) -> torch.Tensor:
@@ -2184,6 +2196,7 @@ class LTX2DenoisingStage(DenoisingStage):
                         local_velocities={
                             name: output[0] for name, output in pass_outputs.items()
                         },
+                        pass_names=tuple(pass_spec.name for pass_spec in pass_specs),
                         sigma=video_sigma_for_x0,
                         cfg_scale=float(stage1_guider_params["video_cfg_scale"]),
                         stg_scale=float(stage1_guider_params["video_stg_scale"]),
@@ -2206,6 +2219,7 @@ class LTX2DenoisingStage(DenoisingStage):
                         local_velocities={
                             name: output[1] for name, output in pass_outputs.items()
                         },
+                        pass_names=tuple(pass_spec.name for pass_spec in pass_specs),
                         sigma=audio_sigma_for_x0,
                         cfg_scale=float(stage1_guider_params["audio_cfg_scale"]),
                         stg_scale=float(stage1_guider_params["audio_stg_scale"]),
