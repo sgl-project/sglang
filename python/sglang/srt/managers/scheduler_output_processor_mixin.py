@@ -75,7 +75,7 @@ class SchedulerOutputProcessorMixin:
                 "host": req.cached_tokens_host,
             }
             # Only include storage fields if L3 storage is enabled
-            if getattr(self, "enable_hicache_storage", False):
+            if self.enable_hicache_storage:
                 details["storage"] = req.cached_tokens_storage
                 details["storage_backend"] = self._get_storage_backend_type()
             return details
