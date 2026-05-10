@@ -16,6 +16,8 @@ from typing import Callable, Optional
 import torch
 from torch import nn
 
+from sglang.multimodal_gen.runtime.layers.fp8_cast import is_fp8_cast_dtype
+from sglang.multimodal_gen.runtime.layers.linear import LinearBase
 from sglang.multimodal_gen.runtime.layers.quantization.configs.nunchaku_config import (
     NunchakuConfig,
     _patch_nunchaku_scales,
@@ -36,6 +38,17 @@ from sglang.srt.layers.quantization import QuantizationConfig
 logger = init_logger(__name__)
 
 PostLoadHook = Callable[[nn.Module], None]
+
+_FP8_CAST_LINEAR_SUFFIXES = (
+    ".to_q",
+    ".to_k",
+    ".to_v",
+    ".to_out.0",
+    ".ff.proj_in",
+    ".ff.proj_out",
+    ".audio_ff.proj_in",
+    ".audio_ff.proj_out",
+)
 
 _PRECISION_VARIANT_SUFFIX_RE = re.compile(
     r"^(?P<stem>.+?)(?P<precision>\.(?:fp16|bf16|fp32))(?P<shard>-\d+-of-\d+)?(?P<ext>\.safetensors)$"
@@ -400,6 +413,36 @@ def resolve_transformer_quant_load_spec(
         param_dtype=param_dtype,
         post_load_hooks=post_load_hooks,
     )
+
+
+def apply_transformer_fp8_cast(model: nn.Module) -> None:
+    converted = 0
+    for name, module in model.named_modules():
+        if not _should_fp8_cast_linear(name, module):
+            continue
+
+        if _cast_parameter_data(getattr(module, "weight", None), torch.float8_e4m3fn):
+            converted += 1
+        _cast_parameter_data(getattr(module, "bias", None), torch.float8_e4m3fn)
+
+    logger.info("Applied transformer fp8-cast to %d linear layers", converted)
+
+
+def _should_fp8_cast_linear(name: str, module: nn.Module) -> bool:
+    if not name.startswith("transformer_blocks."):
+        return False
+    if not isinstance(module, LinearBase):
+        return False
+    return any(name.endswith(suffix) for suffix in _FP8_CAST_LINEAR_SUFFIXES)
+
+
+def _cast_parameter_data(param: nn.Parameter | None, dtype: torch.dtype) -> bool:
+    if param is None or not param.is_floating_point():
+        return False
+    if is_fp8_cast_dtype(param.dtype):
+        return False
+    param.data = param.data.to(dtype=dtype)
+    return True
 
 
 def _build_transformer_quant_adapters(

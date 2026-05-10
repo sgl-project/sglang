@@ -10,6 +10,7 @@ from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader imp
 )
 from sglang.multimodal_gen.runtime.loader.fsdp_load import maybe_load_fsdp_model
 from sglang.multimodal_gen.runtime.loader.transformer_load_utils import (
+    apply_transformer_fp8_cast,
     resolve_transformer_quant_load_spec,
     resolve_transformer_safetensors_to_load,
 )
@@ -140,6 +141,9 @@ class TransformerLoader(ComponentLoader):
         # post-hooks (e.g., patch scales (nunchaku))
         for post_load_hook in quant_spec.post_load_hooks:
             post_load_hook(model)
+
+        if component_server_args.transformer_weight_quantization == "fp8-cast":
+            apply_transformer_fp8_cast(model)
 
         total_params = sum(p.numel() for p in model.parameters())
         logger.info("Loaded model with %.2fB parameters", total_params / 1e9)
