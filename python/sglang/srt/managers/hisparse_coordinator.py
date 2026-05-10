@@ -151,6 +151,23 @@ class HiSparseCoordinator:
         self._device_buffer_arange_i32 = torch.arange(
             self.device_buffer_size, dtype=torch.int32, device=device
         )
+        if self.is_dsv4_hisparse:
+            self._preload_top_k_tokens = self._device_buffer_arange_i32.view(1, -1)
+            self._preload_top_k_device_locs = torch.full(
+                (1, self.device_buffer_size), -1, dtype=torch.int32, device=device
+            )
+            self._preload_host_cache_locs = torch.zeros(
+                (1, self.device_buffer_size), dtype=torch.int64, device=device
+            )
+            self._preload_req_pool_indices = torch.zeros(
+                1, dtype=torch.int64, device=device
+            )
+            self._preload_seq_lens = torch.full(
+                (1,), self.device_buffer_size + 1, dtype=torch.int64, device=device
+            )
+            self._preload_num_real_reqs = torch.ones(
+                1, dtype=torch.int32, device=device
+            )
 
         # Pre-allocated output buffer for swap_in_selected_pages (CUDA-graph safe)
         self.top_k_device_locs_buffer = torch.full(
@@ -274,8 +291,11 @@ class HiSparseCoordinator:
         """Preload all tokens from host pool into the device buffer."""
         n = self._host_token_len(req.kv_allocated_len)
         host_indices = self.req_to_host_pool[req.req_pool_idx, :n]
-        device_locs = self.req_to_device_buffer[req.req_pool_idx, :n]
+        if self.is_dsv4_hisparse:
+            self._preload_dsv4_to_device_buffer(req, host_indices, n)
+            return
 
+        device_locs = self.req_to_device_buffer[req.req_pool_idx, :n]
         for layer_id in range(self.mem_pool_device.layer_num):
             self.mem_pool_host.load_to_device_per_layer(
                 self.mem_pool_device,
@@ -283,6 +303,53 @@ class HiSparseCoordinator:
                 device_locs,
                 layer_id,
                 io_backend="kernel",
+            )
+        # Direct PD admission runs outside the model forward stream.  The preload
+        # must be complete before the request is marked ready, otherwise decode
+        # can race the H2D copy and read a partially populated hot buffer.
+        device_module.current_stream().synchronize()
+
+    def _preload_dsv4_to_device_buffer(
+        self, req: Req, host_indices: torch.Tensor, host_len: int
+    ) -> None:
+        """Preload DSV4 host C4 KV using the existing DSV4 swap-in kernel."""
+        if host_len == 0:
+            return
+
+        self._preload_host_cache_locs.zero_()
+        self._preload_host_cache_locs[0, :host_len] = host_indices
+        preload_tokens = self._preload_top_k_tokens[:, :host_len]
+        preload_device_locs = self._preload_top_k_device_locs[:, :host_len]
+        req_idx = req.req_pool_idx
+
+        for layer_id in range(self.mem_pool_device.layer_num):
+            self.req_device_buffer_tokens[
+                layer_id, req_idx, : self.device_buffer_size
+            ].fill_(-1)
+            self.lru_slots[layer_id, req_idx].copy_(self._lru_init)
+            self._preload_top_k_device_locs.fill_(-1)
+
+            load_cache_to_device_buffer_dsv4_mla(
+                top_k_tokens=preload_tokens,
+                device_buffer_tokens=self.req_device_buffer_tokens[
+                    layer_id, req_idx : req_idx + 1, : self.device_buffer_size
+                ],
+                host_cache_locs=self._preload_host_cache_locs,
+                device_buffer_locs=self.req_device_buffer_token_locs[
+                    layer_id, req_idx : req_idx + 1, : self.device_buffer_size
+                ],
+                host_cache=self.mem_pool_host.kv_buffer[layer_id],
+                device_buffer=self.mem_pool_device.kv_buffer[layer_id],
+                top_k_device_locs=preload_device_locs,
+                req_pool_indices=self._preload_req_pool_indices,
+                seq_lens=self._preload_seq_lens,
+                lru_slots=self.lru_slots[layer_id, req_idx : req_idx + 1],
+                item_size_bytes=self.item_size_bytes,
+                num_top_k=host_len,
+                hot_buffer_size=self.device_buffer_size,
+                page_size=1,
+                block_size=1024,
+                num_real_reqs=self._preload_num_real_reqs,
             )
         # Direct PD admission runs outside the model forward stream.  The preload
         # must be complete before the request is marked ready, otherwise decode

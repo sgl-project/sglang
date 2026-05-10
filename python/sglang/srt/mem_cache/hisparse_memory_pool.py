@@ -495,45 +495,10 @@ class DeepSeekV4SingleKVPoolHost:
     def load_to_device_per_layer(
         self, device_pool, host_indices, device_indices, layer_id, io_backend
     ):
-        if io_backend != "kernel":
-            raise ValueError(f"Unsupported IO backend: {io_backend}")
-        if host_indices.numel() == 0:
-            return
-
-        host_indices_cpu = host_indices.to(device="cpu", dtype=torch.int64)
-        device_indices = device_indices.to(
-            device=self.device_pool.device, dtype=torch.int64
+        raise NotImplementedError(
+            "DeepSeek V4 host-to-device preload uses the existing DSV4 "
+            "HiSparse swap-in kernel from HiSparseCoordinator."
         )
-
-        item_bytes = self.kv_cache_total_dim * self.dtype.itemsize
-        value_bytes = item_bytes - 8
-        scale_bytes = 8
-        page_size = device_pool.page_size
-
-        host_rows = self.kv_buffer[layer_id].index_select(0, host_indices_cpu)
-        host_rows = host_rows.to(device=self.device_pool.device, non_blocking=True)
-
-        device_buf = device_pool.kv_buffer[layer_id]
-        page_indices = device_indices // page_size
-        offsets_in_page = device_indices % page_size
-
-        # DSV4 device pages are padded, so flattening the value/scale regions with
-        # reshape can materialize a copy instead of a writable view. Scatter by
-        # page and byte offset to write back to the original buffer.
-        value_offsets = (
-            offsets_in_page[:, None] * value_bytes
-            + torch.arange(value_bytes, device=self.device_pool.device)
-        )
-        device_buf[page_indices[:, None], value_offsets] = host_rows[:, :value_bytes]
-
-        scale_offsets = (
-            page_size * value_bytes
-            + offsets_in_page[:, None] * scale_bytes
-            + torch.arange(scale_bytes, device=self.device_pool.device)
-        )
-        device_buf[page_indices[:, None], scale_offsets] = host_rows[
-            :, value_bytes:item_bytes
-        ]
 
     def available_size(self):
         return len(self.free_slots)
