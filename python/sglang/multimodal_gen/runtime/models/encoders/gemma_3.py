@@ -353,15 +353,15 @@ class Gemma3Attention(nn.Module):
             enable_cudnn=True,
         ):
             attn_output = torch.nn.functional.scaled_dot_product_attention(
-                query.contiguous(),
-                key.contiguous(),
-                value.contiguous(),
+                query,
+                key,
+                value,
                 attn_mask=attn_mask,
                 dropout_p=0.0,
                 is_causal=False,
                 scale=self.scaling,
             )
-        attn_output = attn_output.transpose(1, 2).contiguous()
+        attn_output = attn_output.transpose(1, 2)
 
         attn_output = attn_output.reshape(
             batch_size, seq_len, self.num_heads * self.head_dim
