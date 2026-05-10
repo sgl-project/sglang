@@ -631,6 +631,8 @@ class LTX2Attention(nn.Module):
                 causal=False,
                 supported_attention_backends=supported_attention_backends,
                 prefix=f"{prefix}.attn",
+                # official LTX2 torch_sdpa uses cuDNN; cuda setup disables it
+                allow_cudnn_sdp=True,
             )
         else:
             self.attn = USPAttention(
@@ -642,6 +644,8 @@ class LTX2Attention(nn.Module):
                 causal=False,
                 supported_attention_backends=supported_attention_backends,
                 prefix=f"{prefix}.attn",
+                # official LTX2 torch_sdpa uses cuDNN; cuda setup disables it
+                allow_cudnn_sdp=True,
             )
 
     def forward(
