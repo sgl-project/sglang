@@ -1,5 +1,6 @@
 import functools
 import math
+from contextlib import nullcontext
 from typing import Optional, Tuple, Union
 
 import numpy as np
@@ -7,12 +8,20 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from diffusers.models.attention import FeedForward
+from torch.nn.attention import SDPBackend, sdpa_kernel
 
 from sglang.multimodal_gen.configs.models.adapter.ltx_2_connector import (
     LTX2ConnectorConfig,
 )
 from sglang.multimodal_gen.runtime.layers.attention import USPAttention
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
+
+_PYTORCH_DEFAULT_CUDA_SDP_BACKENDS = [
+    SDPBackend.CUDNN_ATTENTION,
+    SDPBackend.FLASH_ATTENTION,
+    SDPBackend.EFFICIENT_ATTENTION,
+    SDPBackend.MATH,
+]
 
 
 def apply_interleaved_rotary_emb(
@@ -208,14 +217,20 @@ class LTX2Attention(torch.nn.Module):
                 attention_mask = attention_mask[:, None, :, :]
             attention_mask = attention_mask.to(dtype=query.dtype)
 
-        hidden_states = F.scaled_dot_product_attention(
-            query,
-            key,
-            value,
-            attn_mask=attention_mask,
-            dropout_p=0.0,
-            is_causal=False,
+        sdpa_context = (
+            sdpa_kernel(_PYTORCH_DEFAULT_CUDA_SDP_BACKENDS)
+            if query.device.type == "cuda"
+            else nullcontext()
         )
+        with sdpa_context:
+            hidden_states = F.scaled_dot_product_attention(
+                query,
+                key,
+                value,
+                attn_mask=attention_mask,
+                dropout_p=0.0,
+                is_causal=False,
+            )
         hidden_states = hidden_states.transpose(1, 2).flatten(2, 3)
         hidden_states = hidden_states.to(query.dtype)
 

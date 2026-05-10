@@ -4,11 +4,14 @@
 # Adapted from sglang: python/sglang/srt/models/gemma3_causal.py
 
 import logging
+from contextlib import nullcontext
 from functools import partial
 from typing import Any, Iterable, Optional, Set, Tuple
 
 import torch
+import torch.nn.functional as F
 from torch import nn
+from torch.nn.attention import SDPBackend, sdpa_kernel
 
 from sglang.multimodal_gen.configs.models.encoders.base import BaseEncoderOutput
 from sglang.multimodal_gen.configs.models.encoders.gemma_3 import Gemma3Config
@@ -27,6 +30,13 @@ from sglang.multimodal_gen.runtime.loader.weight_utils import default_weight_loa
 from sglang.multimodal_gen.runtime.utils.common import add_prefix
 
 logger = logging.getLogger(__name__)
+
+_PYTORCH_DEFAULT_CUDA_SDP_BACKENDS = [
+    SDPBackend.CUDNN_ATTENTION,
+    SDPBackend.FLASH_ATTENTION,
+    SDPBackend.EFFICIENT_ATTENTION,
+    SDPBackend.MATH,
+]
 
 
 def get_attention_sliding_window_size(config):
@@ -211,19 +221,13 @@ class Gemma3Attention(nn.Module):
             self.sliding_window = None
             self.window_size = (-1, -1)
 
-        self.rotary_emb = get_rope(
+        self.rotary_pos_emb = get_rope(
             self.head_dim,
             rotary_dim=self.head_dim,
             max_position=config.text_config.max_position_embeddings,
             base=self.rope_theta,
             rope_scaling=rope_scaling,
             is_neox_style=True,
-        )
-
-        self.rope_scaling_factor = (
-            float(rope_scaling["factor"])
-            if rope_scaling and rope_scaling.get("factor")
-            else None
         )
 
         # Local Attention not support attention mask, we use global attention instead.
@@ -245,25 +249,18 @@ class Gemma3Attention(nn.Module):
             dim=self.head_dim, eps=config.text_config.rms_norm_eps
         )
 
-    def rotary_emb(self, positions, q, k):
-        """Apply RoPE using the same device-side inv_freq materialization as LTX."""
-        positions_flat = positions.flatten().float()
+    def _apply_rotary_pos_emb(self, positions, q, k):
+        positions_flat = positions.flatten().to(
+            device=self.rotary_pos_emb.cos_sin_cache.device, dtype=torch.long
+        )
+        cos_sin = self.rotary_pos_emb.cos_sin_cache.index_select(0, positions_flat)
+        cos, sin = cos_sin.chunk(2, dim=-1)
+        # match HF Gemma3: expand half-dim freqs to full head dim before rotate_half
+        cos = torch.cat((cos, cos), dim=-1).to(device=q.device, dtype=q.dtype)
+        sin = torch.cat((sin, sin), dim=-1).to(device=q.device, dtype=q.dtype)
+        cos = cos.unsqueeze(1)
+        sin = sin.unsqueeze(1)
         num_tokens = positions_flat.shape[0]
-
-        with torch.autocast(device_type=q.device.type, enabled=False):
-            freq_indices = (
-                torch.arange(
-                    0, self.head_dim, 2, dtype=torch.int64, device=q.device
-                ).float()
-                / self.head_dim
-            )
-            inv_freq = 1.0 / (self.rope_theta**freq_indices)
-            if self.rope_scaling_factor is not None:
-                inv_freq = inv_freq / self.rope_scaling_factor
-            freqs = torch.outer(positions_flat, inv_freq)
-            emb = freqs.repeat(1, 2)
-            cos = emb.cos().to(q.dtype).unsqueeze(1)
-            sin = emb.sin().to(q.dtype).unsqueeze(1)
 
         q = q.reshape(num_tokens, -1, self.head_dim)
         k = k.reshape(num_tokens, -1, self.head_dim)
@@ -277,8 +274,28 @@ class Gemma3Attention(nn.Module):
         hidden_states: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        qkv, _ = self.qkv_proj(hidden_states)
-        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        # match official Gemma3: q/k/v are projected by independent Linear ops
+        qkv_weight = self.qkv_proj.weight
+        qkv_bias = self.qkv_proj.bias
+        q = F.linear(
+            hidden_states,
+            qkv_weight[: self.q_size],
+            qkv_bias[: self.q_size] if qkv_bias is not None else None,
+        )
+        k = F.linear(
+            hidden_states,
+            qkv_weight[self.q_size : self.q_size + self.kv_size],
+            qkv_bias[self.q_size : self.q_size + self.kv_size]
+            if qkv_bias is not None
+            else None,
+        )
+        v = F.linear(
+            hidden_states,
+            qkv_weight[self.q_size + self.kv_size : self.q_size + 2 * self.kv_size],
+            qkv_bias[self.q_size + self.kv_size : self.q_size + 2 * self.kv_size]
+            if qkv_bias is not None
+            else None,
+        )
 
         batch_size, seq_len, _ = q.shape
         q = q.view(batch_size, seq_len, self.num_heads, self.head_dim)
@@ -290,7 +307,7 @@ class Gemma3Attention(nn.Module):
         k = self.k_norm(k)
 
         # Apply RoPE
-        q, k = self.rotary_emb(positions, q, k)
+        q, k = self._apply_rotary_pos_emb(positions, q, k)
         q = q.reshape(batch_size, seq_len, self.num_heads, self.head_dim)
         k = k.reshape(batch_size, seq_len, self.num_kv_heads, self.head_dim)
 
@@ -299,26 +316,33 @@ class Gemma3Attention(nn.Module):
         key = k.transpose(1, 2)
         value = v.transpose(1, 2)
 
-        attn_mask = torch.ones(
+        min_dtype = torch.finfo(hidden_states.dtype).min
+        cache_position = torch.arange(seq_len, device=hidden_states.device)
+        attn_mask = torch.full(
             (seq_len, seq_len),
+            fill_value=min_dtype,
             device=hidden_states.device,
-            dtype=torch.bool,
+            dtype=hidden_states.dtype,
         )
-        causal = torch.triu(
-            torch.ones(
-                (seq_len, seq_len), device=hidden_states.device, dtype=torch.bool
-            ),
-            diagonal=1,
+        if seq_len != 1:
+            attn_mask = torch.triu(attn_mask, diagonal=1)
+        attn_mask *= torch.arange(seq_len, device=hidden_states.device) > (
+            cache_position.reshape(-1, 1)
         )
-        attn_mask = attn_mask.masked_fill(causal, False)
-        if self.is_sliding and self.sliding_window is not None:
-            idx = torch.arange(seq_len, device=hidden_states.device)
-            dist = idx[:, None] - idx[None, :]
-            too_far = dist > self.sliding_window
-            attn_mask = attn_mask.masked_fill(too_far, False)
-
         attn_mask = attn_mask[None, None, :, :].expand(batch_size, 1, seq_len, seq_len)
-        attn_mask = attn_mask & attention_mask.to(torch.bool)[:, None, None, :]
+        if attention_mask is not None:
+            attn_mask = attn_mask.clone()
+            padding_mask = attn_mask + attention_mask[:, None, None, :].to(
+                attn_mask.device
+            )
+            padding_mask = padding_mask == 0
+            attn_mask = attn_mask.masked_fill(padding_mask, min_dtype)
+        if self.is_sliding and self.sliding_window is not None:
+            sliding_window_mask = torch.tril(
+                torch.ones_like(attn_mask, dtype=torch.bool),
+                diagonal=-(self.sliding_window + 1),
+            )
+            attn_mask = torch.where(sliding_window_mask, min_dtype, attn_mask)
 
         if query.shape[1] != key.shape[1]:
             num_key_value_groups = query.shape[1] // key.shape[1]
@@ -335,15 +359,24 @@ class Gemma3Attention(nn.Module):
             key = key.reshape(batch_size, query.shape[1], seq_len, self.head_dim)
             value = value.reshape(batch_size, query.shape[1], seq_len, self.head_dim)
 
-        attn_output = torch.nn.functional.scaled_dot_product_attention(
-            query,
-            key,
-            value,
-            attn_mask=attn_mask,
-            dropout_p=0.0,
-            is_causal=False,
-            scale=self.scaling,
+        query = query.contiguous()
+        key = key.contiguous()
+        value = value.contiguous()
+        sdpa_context = (
+            sdpa_kernel(_PYTORCH_DEFAULT_CUDA_SDP_BACKENDS)
+            if query.device.type == "cuda"
+            else nullcontext()
         )
+        with sdpa_context:
+            attn_output = F.scaled_dot_product_attention(
+                query,
+                key,
+                value,
+                attn_mask=attn_mask,
+                dropout_p=0.0,
+                is_causal=False,
+                scale=self.scaling,
+            )
         attn_output = attn_output.transpose(1, 2)
 
         attn_output = attn_output.reshape(
