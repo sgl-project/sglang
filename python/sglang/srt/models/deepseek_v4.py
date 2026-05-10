@@ -89,6 +89,7 @@ if TYPE_CHECKING:
         DeepseekV4AttnBackend,
     )
     from sglang.srt.layers.quantization import QuantizationConfig
+    from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
     from sglang.srt.model_executor.forward_batch_info import (
         ForwardBatch,
         PPProxyTensors,
@@ -368,7 +369,8 @@ class MQALayer(nn.Module):
         else:
             kv, _ = self.wkv(x)
         token_to_kv_pool = forward_batch.token_to_kv_pool
-        assert isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool)
+        if TYPE_CHECKING:
+            assert isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool)
         token_to_kv_pool.set_swa_key_buffer_radix_fused_norm_rope(
             layer_id=self.layer_id,
             raw_loc=forward_batch.out_cache_loc,
