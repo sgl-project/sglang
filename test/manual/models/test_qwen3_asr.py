@@ -94,33 +94,20 @@ EXPECTED_TRANSCRIPTS = {
 
 
 def _normalize_for_wer(text: str) -> list:
-    """Lowercase, strip punctuation, split on whitespace.
-
-    Used by ``_wer`` so that chunked-streaming artifacts that differ from
-    one-shot only in punctuation / casing (``—`` vs ``:``, trailing period,
-    leading capitalization) don't count as errors.
-    """
     text = text.lower()
     text = re.sub(r"[^\w\s\u0900-\u097f\u4e00-\u9fff]+", " ", text)
     return text.split()
 
 
 def _wer(hypothesis: str, reference: str) -> float:
-    """Word error rate via Levenshtein distance on normalized tokens.
-
-    Returns ``edit_distance(hyp_words, ref_words) / len(ref_words)``. For
-    CJK text where ``str.split()`` degenerates, we fall back to character
-    distance so the metric still means something.
-    """
     hyp = _normalize_for_wer(hypothesis)
     ref = _normalize_for_wer(reference)
     if len(ref) <= 1 and not any(" " in w for w in ref):
-        # CJK fallback: compare at char level
+        # CJK fallback: str.split() degenerates, compare at char level.
         hyp = list(hypothesis.replace(" ", ""))
         ref = list(reference.replace(" ", ""))
     if not ref:
         return 0.0 if not hyp else float("inf")
-    # Standard Levenshtein DP
     n, m = len(hyp), len(ref)
     dp = list(range(m + 1))
     for i in range(1, n + 1):
@@ -147,12 +134,10 @@ def download_audio(url, local_path):
     return resp.content
 
 
-def _pcm16_from_audio_bytes(audio_bytes):
-    """Decode audio bytes, resample to 16kHz mono, return (pcm_bytes, sample_rate)."""
+def _pcm16_from_audio_bytes(audio_bytes, target_sr=16000):
     data, sr = sf.read(io.BytesIO(audio_bytes), dtype="float32")
     if len(data.shape) > 1:
         data = data.mean(axis=1)
-    target_sr = 16000
     if sr != target_sr:
         num_samples = int(len(data) / sr * target_sr)
         indices = np.linspace(0, len(data) - 1, num_samples)
@@ -165,9 +150,7 @@ def _pcm16_from_audio_bytes(audio_bytes):
 async def _stream_websocket_async(
     websocket_url, pcm_bytes, sample_rate, language=None, realtime=False
 ):
-    # Drives /v1/realtime end-to-end: session.update → append × N → commit,
-    # then drains delta + committed + item.created + completed. duration_sec
-    # is computed locally because the OpenAI spec does not echo it back.
+    # duration_sec is computed locally — OpenAI Realtime spec does not echo it back.
     chunk_duration = 0.5
     chunk_bytes = int(chunk_duration * sample_rate * 2)
     duration_sec = round(len(pcm_bytes) / (sample_rate * 2), 2)
@@ -190,8 +173,9 @@ async def _stream_websocket_async(
                         "type": "transcription",
                         "audio": {
                             "input": {
-                                "format": "audio/pcm",
-                                "sample_rate": sample_rate,
+                                # OpenAI canonical: format is a nested object,
+                                # rate lives inside format.
+                                "format": {"type": "audio/pcm", "rate": sample_rate},
                                 "transcription": transcription_cfg,
                                 "noise_reduction": None,
                                 "turn_detection": None,
@@ -219,6 +203,12 @@ async def _stream_websocket_async(
                 if t == "conversation.item.input_audio_transcription.delta":
                     deltas.append(resp["delta"])
                 elif t == "conversation.item.input_audio_transcription.completed":
+                    # OpenAI canonical: usage field is REQUIRED on completed.
+                    # We emit the duration variant (server-side audio length).
+                    assert (
+                        "usage" in resp
+                    ), f"transcription.completed missing required usage field: {resp!r}"
+                    assert resp["usage"].get("type") == "duration", resp["usage"]
                     completed_msg.update(resp)
                     return
                 elif t in (
@@ -251,7 +241,13 @@ async def _stream_websocket_async(
                 await asyncio.sleep(chunk_duration)
 
         await websocket.send(json.dumps({"type": "input_audio_buffer.commit"}))
-        await receiver
+        try:
+            await asyncio.wait_for(receiver, timeout=60)
+        except asyncio.TimeoutError as e:
+            raise RuntimeError(
+                f"timed out waiting for transcription.completed; "
+                f"got {len(deltas)} deltas, last={deltas[-1] if deltas else None!r}"
+            ) from e
 
     assert completed_msg, "no transcription.completed received"
     return {
@@ -283,10 +279,6 @@ class TestQwen3ASRTranscription(CustomTestCase):
     @classmethod
     def tearDownClass(cls):
         kill_process_tree(cls.process.pid)
-
-    # ------------------------------------------------------------------
-    # HTTP path
-    # ------------------------------------------------------------------
 
     def _transcribe(self, audio_url, local_path, language=None):
         """Send an HTTP transcription request."""
@@ -320,47 +312,42 @@ class TestQwen3ASRTranscription(CustomTestCase):
         print(f"[ZH Transcription] {text}")
 
     def test_mlk_transcription(self):
-        """13s MLK speech (FLAC 22050 Hz) — HTTP non-stream ground truth."""
+        # FLAC 22050 Hz.
         result = self._transcribe(TEST_AUDIO_MLK_URL, TEST_AUDIO_MLK_LOCAL)
-        self.assertIn("text", result)
         text = result["text"]
-        self.assertTrue(len(text) > 0, "Transcription should not be empty")
+        self._assert_close_to_ref(text, "mlk", max_wer=0.05)
         print(f"[MLK Transcription] {text}")
 
     def test_librispeech_transcription(self):
-        """10s LibriSpeech-style FLAC 16 kHz — HTTP non-stream ground truth."""
+        # FLAC 16 kHz.
         result = self._transcribe(TEST_AUDIO_LIBRI_URL, TEST_AUDIO_LIBRI_LOCAL)
-        self.assertIn("text", result)
         text = result["text"]
-        self.assertTrue(len(text) > 0, "Transcription should not be empty")
+        self._assert_close_to_ref(text, "libri", max_wer=0.05)
         print(f"[LibriSpeech Transcription] {text}")
 
     def test_spanish_transcription(self):
-        """Spanish FLAC 48 kHz PCM_24 — HTTP non-stream ground truth."""
+        # FLAC 48 kHz PCM_24.
         result = self._transcribe(
             TEST_AUDIO_SPANISH_URL, TEST_AUDIO_SPANISH_LOCAL, language="es"
         )
-        self.assertIn("text", result)
         text = result["text"]
-        self.assertTrue(len(text) > 0, "Transcription should not be empty")
+        self._assert_close_to_ref(text, "spanish", max_wer=0.05)
         print(f"[Spanish Transcription] {text}")
 
     def test_hindi_transcription(self):
-        """Hindi OGG/Opus 16 kHz — HTTP non-stream ground truth."""
+        # OGG/Opus 16 kHz.
         result = self._transcribe(
             TEST_AUDIO_HINDI_URL, TEST_AUDIO_HINDI_LOCAL, language="hi"
         )
-        self.assertIn("text", result)
         text = result["text"]
-        self.assertTrue(len(text) > 0, "Transcription should not be empty")
+        self._assert_close_to_ref(text, "hindi", max_wer=0.05)
         print(f"[Hindi Transcription] {text}")
 
     def test_mp3_stereo_transcription(self):
-        """MP3 stereo 44.1 kHz — HTTP non-stream ground truth."""
+        # MP3 stereo 44.1 kHz.
         result = self._transcribe(TEST_AUDIO_MP3_URL, TEST_AUDIO_MP3_LOCAL)
-        self.assertIn("text", result)
         text = result["text"]
-        self.assertTrue(len(text) > 0, "Transcription should not be empty")
+        self._assert_close_to_ref(text, "mp3", max_wer=0.05)
         print(f"[MP3 Transcription] {text}")
 
     def test_multiple_requests_consistency(self):
@@ -378,19 +365,22 @@ class TestQwen3ASRTranscription(CustomTestCase):
             )
         print(f"[Consistency] All 3 requests match: {results[0][:80]}...")
 
-    # ------------------------------------------------------------------
-    # WebSocket path
-    # ------------------------------------------------------------------
-
     def _websocket_url(self):
         return (
             self.base_url.replace("http://", "ws://").replace("https://", "wss://")
             + "/v1/realtime"
         )
 
-    def _stream_websocket(self, audio_url, local_path, language=None, realtime=False):
+    def _stream_websocket(
+        self,
+        audio_url,
+        local_path,
+        language=None,
+        realtime=False,
+        target_sr=16000,
+    ):
         audio_bytes = download_audio(audio_url, local_path)
-        pcm, sr = _pcm16_from_audio_bytes(audio_bytes)
+        pcm, sr = _pcm16_from_audio_bytes(audio_bytes, target_sr=target_sr)
         return asyncio.run(
             _stream_websocket_async(
                 self._websocket_url(), pcm, sr, language=language, realtime=realtime
@@ -400,15 +390,8 @@ class TestQwen3ASRTranscription(CustomTestCase):
     def _assert_close_to_ref(
         self, hypothesis: str, ref_key: str, max_wer: float = 0.15
     ):
-        """Assert a streamed transcript stays within ``max_wer`` of the reference.
-
-        Chunked streaming inherits a few artifacts from #22089 that one-shot
-        does not — "Uh huh." short-context hallucination on long English
-        audio, mid-sentence punctuation drift (``—`` → ``:``), and trailing
-        periods. We accept up to 15% WER (normalized, case/punct stripped)
-        so these don't break CI, while still catching real regressions
-        like dropped words or double-emitted phrases.
-        """
+        # 15% threshold tolerates chunked-streaming artifacts inherited
+        # from #22089 (Uh huh. prefix, — → : drift) without hiding regressions.
         reference = EXPECTED_TRANSCRIPTS[ref_key]
         wer = _wer(hypothesis, reference)
         self.assertLessEqual(
@@ -420,7 +403,6 @@ class TestQwen3ASRTranscription(CustomTestCase):
 
     @unittest.skipUnless(HAS_WEBSOCKETS, "websockets package not installed")
     def test_english_websocket_streaming(self):
-        """Test English audio transcription over WebSocket (fast mode)."""
         result = self._stream_websocket(TEST_AUDIO_EN_URL, TEST_AUDIO_EN_LOCAL)
         self._assert_close_to_ref(result["text"], "en")
         self.assertGreater(len(result["deltas"]), 0)
@@ -431,7 +413,6 @@ class TestQwen3ASRTranscription(CustomTestCase):
 
     @unittest.skipUnless(HAS_WEBSOCKETS, "websockets package not installed")
     def test_chinese_websocket_streaming(self):
-        """Test Chinese audio transcription over WebSocket with audio.input.transcription.language."""
         result = self._stream_websocket(
             TEST_AUDIO_ZH_URL, TEST_AUDIO_ZH_LOCAL, language="zh"
         )
@@ -443,14 +424,12 @@ class TestQwen3ASRTranscription(CustomTestCase):
 
     @unittest.skipUnless(HAS_WEBSOCKETS, "websockets package not installed")
     def test_websocket_streaming_realtime(self):
-        """Exercise real-time pacing: sleep between chunks to simulate live audio."""
+        # Pace appends at wall-clock so multiple deltas land before commit.
         result = self._stream_websocket(
             TEST_AUDIO_EN_URL, TEST_AUDIO_EN_LOCAL, realtime=True
         )
         self._assert_close_to_ref(result["text"], "en")
-        self.assertGreaterEqual(
-            len(result["deltas"]), 2, "realtime mode should yield multiple deltas"
-        )
+        self.assertGreaterEqual(len(result["deltas"]), 2, result["deltas"])
         print(
             f"[Realtime WS] final={result['text']} "
             f"({len(result['deltas'])} deltas, {result['duration_sec']}s)"
@@ -458,7 +437,7 @@ class TestQwen3ASRTranscription(CustomTestCase):
 
     @unittest.skipUnless(HAS_WEBSOCKETS, "websockets package not installed")
     def test_mlk_speech_websocket_streaming(self):
-        """13s English MLK speech, FLAC @ 22050 Hz (exercises client-side resampling)."""
+        # FLAC 22050 Hz — exercises client-side resample to 16 kHz.
         result = self._stream_websocket(TEST_AUDIO_MLK_URL, TEST_AUDIO_MLK_LOCAL)
         self._assert_close_to_ref(result["text"], "mlk")
         print(
@@ -468,7 +447,6 @@ class TestQwen3ASRTranscription(CustomTestCase):
 
     @unittest.skipUnless(HAS_WEBSOCKETS, "websockets package not installed")
     def test_librispeech_dummy_websocket_streaming(self):
-        """10s LibriSpeech-style FLAC @ 16 kHz (no resampling needed)."""
         result = self._stream_websocket(TEST_AUDIO_LIBRI_URL, TEST_AUDIO_LIBRI_LOCAL)
         self._assert_close_to_ref(result["text"], "libri")
         print(
@@ -478,7 +456,8 @@ class TestQwen3ASRTranscription(CustomTestCase):
 
     @unittest.skipUnless(HAS_WEBSOCKETS, "websockets package not installed")
     def test_websocket_concurrent_sessions(self):
-        """3 parallel WebSocket sessions; verify state isolation and independent finals."""
+        # Verify state isolation: 3 concurrent sessions on identical audio
+        # must yield identical finals + 3 distinct session ids.
         audio_bytes = download_audio(TEST_AUDIO_EN_URL, TEST_AUDIO_EN_LOCAL)
         pcm, sr = _pcm16_from_audio_bytes(audio_bytes)
 
@@ -493,18 +472,11 @@ class TestQwen3ASRTranscription(CustomTestCase):
         results = asyncio.run(run_n_concurrent(3))
 
         session_ids = {r["session_id"] for r in results}
-        self.assertEqual(len(session_ids), 3, "each session must have a unique id")
-        for i, r in enumerate(results):
-            self.assertTrue(
-                len(r["text"]) > 0, f"session {i} should produce non-empty transcript"
-            )
-        # All sessions ran the same audio, so finals should match.
+        self.assertEqual(len(session_ids), 3)
+        for r in results:
+            self.assertTrue(len(r["text"]) > 0)
         finals = [r["text"] for r in results]
-        self.assertEqual(
-            len(set(finals)),
-            1,
-            f"3 concurrent sessions on identical audio should yield identical finals, got {finals}",
-        )
+        self.assertEqual(len(set(finals)), 1, f"finals diverged: {finals}")
         print(
             f"[Concurrent x3 WS] all finals match: {finals[0]} "
             f"(session_ids={sorted(session_ids)})"
@@ -512,9 +484,13 @@ class TestQwen3ASRTranscription(CustomTestCase):
 
     @unittest.skipUnless(HAS_WEBSOCKETS, "websockets package not installed")
     def test_spanish_websocket_streaming(self):
-        """6.6s Spanish audio, FLAC @ 48 kHz PCM_24 (resampling + high-bit-depth)."""
+        # FLAC 48 kHz PCM_24 — keep native rate so server-side resample runs.
+        # Requires _SUPPORTED_INPUT_SAMPLE_RATES on the server to include 48000.
         result = self._stream_websocket(
-            TEST_AUDIO_SPANISH_URL, TEST_AUDIO_SPANISH_LOCAL, language="es"
+            TEST_AUDIO_SPANISH_URL,
+            TEST_AUDIO_SPANISH_LOCAL,
+            language="es",
+            target_sr=48000,
         )
         self._assert_close_to_ref(result["text"], "spanish")
         print(
@@ -524,7 +500,7 @@ class TestQwen3ASRTranscription(CustomTestCase):
 
     @unittest.skipUnless(HAS_WEBSOCKETS, "websockets package not installed")
     def test_hindi_websocket_streaming(self):
-        """4s Hindi audio, OGG/Opus @ 16 kHz (multilingual + non-WAV/FLAC container)."""
+        # OGG/Opus 16 kHz.
         result = self._stream_websocket(
             TEST_AUDIO_HINDI_URL, TEST_AUDIO_HINDI_LOCAL, language="hi"
         )
@@ -536,7 +512,7 @@ class TestQwen3ASRTranscription(CustomTestCase):
 
     @unittest.skipUnless(HAS_WEBSOCKETS, "websockets package not installed")
     def test_mp3_stereo_websocket_streaming(self):
-        """4s English MP3 stereo @ 44.1 kHz (mp3 decode + stereo->mono + resample)."""
+        # MP3 stereo 44.1 kHz — exercises decode + stereo→mono + resample.
         result = self._stream_websocket(TEST_AUDIO_MP3_URL, TEST_AUDIO_MP3_LOCAL)
         self._assert_close_to_ref(result["text"], "mp3")
         print(
@@ -546,19 +522,12 @@ class TestQwen3ASRTranscription(CustomTestCase):
 
     @unittest.skipUnless(HAS_WEBSOCKETS, "websockets package not installed")
     def test_websocket_short_clip(self):
-        """Short clip (3s) where the tail is flushed by is_last=True finalize.
-
-        The client sends 3s of audio in 0.5s PCM frames. With chunk_size_sec
-        = 2.0, one intermediate inference triggers at the 2s mark;
-        input_audio_buffer.commit then has ~1s of unseen audio, so
-        ``has_new_audio`` is True and the tail is flushed via
-        ``_run_inference(is_last=True) → state.finalize``. This is the common
-        "client ended mid-chunk" path — distinct from the exact-boundary elif
-        path covered by test_websocket_chunk_boundary_flush.
-        """
+        # 3s clip → mid-chunk commit path: _run_inference(is_last=True) flushes
+        # the tail via state.finalize. Pair with test_websocket_chunk_boundary_flush
+        # which covers the exact-boundary elif path.
         audio_bytes = download_audio(TEST_AUDIO_MP3_URL, TEST_AUDIO_MP3_LOCAL)
         full_pcm, sr = _pcm16_from_audio_bytes(audio_bytes)
-        short_pcm = full_pcm[: sr * 2 * 3]  # first 3 seconds
+        short_pcm = full_pcm[: sr * 2 * 3]
         result = asyncio.run(
             _stream_websocket_async(self._websocket_url(), short_pcm, sr)
         )
@@ -570,43 +539,260 @@ class TestQwen3ASRTranscription(CustomTestCase):
 
     @unittest.skipUnless(HAS_WEBSOCKETS, "websockets package not installed")
     def test_websocket_chunk_boundary_flush(self):
-        """Audio length an exact multiple of chunk_size_bytes → elif flush path.
-
-        With chunk_size_sec = 2.0 and frames of 0.5s, sending exactly 4.0s
-        of PCM triggers inferences at the 2.0s and 4.0s marks (last_inf
-        lands on the end of the buffer). On input_audio_buffer.commit,
-        ``has_new_audio`` is False but ``state.full_transcript`` is set, so
-        the commit handler takes the elif branch and flushes the words that
-        ``state.update`` held back (``unfixed_token_num`` tail) via
-        ``state.finalize`` — without running another inference.
-
-        Uses the English clip because it has continuous speech from t=0
-        (the mp3 kungfu clip starts with silence, which could leave
-        full_transcript empty and skip elif entirely).
-        """
+        # Exact multiple of chunk_size_bytes → commit's elif branch:
+        # has_new_audio=False but state.full_transcript set, so finalize
+        # flushes the unfixed_token_num tail without another inference.
+        # EN clip used because mp3 starts with silence (would leave
+        # full_transcript empty and skip elif entirely).
         audio_bytes = download_audio(TEST_AUDIO_EN_URL, TEST_AUDIO_EN_LOCAL)
         full_pcm, sr = _pcm16_from_audio_bytes(audio_bytes)
-        # Exactly 2 × chunk_size_sec (4.0s) of PCM at 16 kHz int16 mono.
-        boundary_bytes = int(4.0 * sr * 2)
+        boundary_bytes = int(4.0 * sr * 2)  # 2 × chunk_size_sec at 16 kHz int16 mono
         boundary_pcm = full_pcm[:boundary_bytes]
-        assert (
-            len(boundary_pcm) == boundary_bytes
-        ), "audio shorter than 2 × chunk_size_sec"
+        assert len(boundary_pcm) == boundary_bytes, "audio shorter than 4s"
         result = asyncio.run(
             _stream_websocket_async(self._websocket_url(), boundary_pcm, sr)
         )
-        # Final text must be non-empty — if elif were skipped on a
-        # chunk-aligned stream, state.finalize never runs and the held-back
-        # unfixed_token_num tail words never reach session.emitted_words.
-        self.assertTrue(
-            len(result["text"]) > 0,
-            "elif branch should flush at least the held-back tail "
-            "on chunk-boundary audio",
-        )
+        self.assertTrue(len(result["text"]) > 0, result)
         print(
             f"[Chunk boundary WS] final={result['text']} "
             f"({len(result['deltas'])} deltas, {result['duration_sec']}s)"
         )
+
+    @unittest.skipUnless(HAS_WEBSOCKETS, "websockets package not installed")
+    def test_websocket_rejects_unsupported_sample_rate(self):
+        # 22050 is not in _SUPPORTED_INPUT_SAMPLE_RATES (16/24/48 kHz).
+        # Rate now lives inside the nested format object (OpenAI canonical).
+        async def run():
+            async with websockets.connect(self._websocket_url()) as ws:
+                created = json.loads(await ws.recv())
+                self.assertEqual(created.get("type"), "session.created", created)
+                await ws.send(
+                    json.dumps(
+                        {
+                            "type": "session.update",
+                            "session": {
+                                "type": "transcription",
+                                "audio": {
+                                    "input": {
+                                        "format": {
+                                            "type": "audio/pcm",
+                                            "rate": 22050,
+                                        },
+                                        "transcription": {"model": "qwen3-asr"},
+                                        "noise_reduction": None,
+                                        "turn_detection": None,
+                                    }
+                                },
+                            },
+                        }
+                    )
+                )
+                evt = json.loads(await ws.recv())
+                self.assertEqual(evt.get("type"), "error", evt)
+                err = evt.get("error", {})
+                self.assertEqual(err.get("code"), "invalid_value", err)
+                self.assertEqual(
+                    err.get("param"), "session.audio.input.format.rate", err
+                )
+
+        asyncio.run(run())
+        print("[Unsupported rate WS] 22050 rejected with invalid_value")
+
+    @unittest.skipUnless(HAS_WEBSOCKETS, "websockets package not installed")
+    def test_websocket_rejects_non_dict_transcription(self):
+        # transcription must be a JSON object; sending a string is invalid.
+        # Use a valid nested format so Pydantic surfaces the transcription
+        # error rather than the format error first.
+        async def run():
+            async with websockets.connect(self._websocket_url()) as ws:
+                created = json.loads(await ws.recv())
+                self.assertEqual(created.get("type"), "session.created", created)
+                await ws.send(
+                    json.dumps(
+                        {
+                            "type": "session.update",
+                            "session": {
+                                "type": "transcription",
+                                "audio": {
+                                    "input": {
+                                        "format": {
+                                            "type": "audio/pcm",
+                                            "rate": 16000,
+                                        },
+                                        "transcription": "qwen3-asr",
+                                        "noise_reduction": None,
+                                        "turn_detection": None,
+                                    }
+                                },
+                            },
+                        }
+                    )
+                )
+                evt = json.loads(await ws.recv())
+                self.assertEqual(evt.get("type"), "error", evt)
+                err = evt.get("error", {})
+                self.assertEqual(err.get("code"), "invalid_value", err)
+                self.assertEqual(
+                    err.get("param"), "session.audio.input.transcription", err
+                )
+
+        asyncio.run(run())
+        print("[Non-dict transcription WS] string rejected with invalid_value")
+
+    @unittest.skipUnless(HAS_WEBSOCKETS, "websockets package not installed")
+    def test_websocket_rejects_non_dict_audio(self):
+        async def run():
+            async with websockets.connect(self._websocket_url()) as ws:
+                created = json.loads(await ws.recv())
+                self.assertEqual(created.get("type"), "session.created", created)
+                await ws.send(
+                    json.dumps(
+                        {
+                            "type": "session.update",
+                            "session": {"type": "transcription", "audio": "foo"},
+                        }
+                    )
+                )
+                evt = json.loads(await ws.recv())
+                self.assertEqual(evt.get("type"), "error", evt)
+                err = evt.get("error", {})
+                self.assertEqual(err.get("code"), "invalid_value", err)
+                self.assertEqual(err.get("param"), "session.audio", err)
+
+        asyncio.run(run())
+        print("[Non-dict audio WS] string rejected with invalid_value")
+
+    @unittest.skipUnless(HAS_WEBSOCKETS, "websockets package not installed")
+    def test_websocket_rejects_non_dict_audio_input(self):
+        async def run():
+            async with websockets.connect(self._websocket_url()) as ws:
+                created = json.loads(await ws.recv())
+                self.assertEqual(created.get("type"), "session.created", created)
+                await ws.send(
+                    json.dumps(
+                        {
+                            "type": "session.update",
+                            "session": {
+                                "type": "transcription",
+                                "audio": {"input": "foo"},
+                            },
+                        }
+                    )
+                )
+                evt = json.loads(await ws.recv())
+                self.assertEqual(evt.get("type"), "error", evt)
+                err = evt.get("error", {})
+                self.assertEqual(err.get("code"), "invalid_value", err)
+                self.assertEqual(err.get("param"), "session.audio.input", err)
+
+        asyncio.run(run())
+        print("[Non-dict audio.input WS] string rejected with invalid_value")
+
+    @unittest.skipUnless(HAS_WEBSOCKETS, "websockets package not installed")
+    def test_websocket_two_commits_propagates_previous_item_id(self):
+        # Two commits in one session must (a) emit `previous_item_id: null` on
+        # the first committed event, (b) emit `previous_item_id` equal to the
+        # first item's id on the second committed event, (c) produce two
+        # distinct item_ids, (d) reset per-item state between commits so the
+        # second transcript reflects only the second audio (no leak).
+        audio_zh = download_audio(TEST_AUDIO_ZH_URL, TEST_AUDIO_ZH_LOCAL)
+        pcm_zh, sr = _pcm16_from_audio_bytes(audio_zh)
+        audio_kungfu = download_audio(TEST_AUDIO_MP3_URL, TEST_AUDIO_MP3_LOCAL)
+        pcm_kungfu, _ = _pcm16_from_audio_bytes(audio_kungfu)
+
+        async def run_one_cycle(ws, pcm, sample_rate):
+            """Send `pcm` as 0.5s base64 appends, commit, drain until completed."""
+            chunk_bytes = int(0.5 * sample_rate * 2)
+            for offset in range(0, len(pcm), chunk_bytes):
+                await ws.send(
+                    json.dumps(
+                        {
+                            "type": "input_audio_buffer.append",
+                            "audio": base64.b64encode(
+                                pcm[offset : offset + chunk_bytes]
+                            ).decode("ascii"),
+                        }
+                    )
+                )
+            await ws.send(json.dumps({"type": "input_audio_buffer.commit"}))
+            committed = None
+            while True:
+                evt = json.loads(await ws.recv())
+                t = evt.get("type")
+                if t == "input_audio_buffer.committed":
+                    committed = evt
+                elif t == "conversation.item.input_audio_transcription.completed":
+                    return committed, evt["transcript"]
+                elif t in (
+                    "error",
+                    "conversation.item.input_audio_transcription.failed",
+                ):
+                    raise RuntimeError(f"unexpected event: {evt!r}")
+
+        async def run():
+            async with websockets.connect(self._websocket_url()) as ws:
+                created = json.loads(await ws.recv())
+                self.assertEqual(created.get("type"), "session.created", created)
+                await ws.send(
+                    json.dumps(
+                        {
+                            "type": "session.update",
+                            "session": {
+                                "type": "transcription",
+                                "audio": {
+                                    "input": {
+                                        "format": {"type": "audio/pcm", "rate": sr},
+                                        "transcription": {"model": "qwen3-asr"},
+                                        "noise_reduction": None,
+                                        "turn_detection": None,
+                                    }
+                                },
+                            },
+                        }
+                    )
+                )
+                while True:
+                    evt = json.loads(await ws.recv())
+                    if evt.get("type") == "session.updated":
+                        break
+                    if evt.get("type") == "error":
+                        raise RuntimeError(f"session.update failed: {evt!r}")
+
+                # Cycle 1: Chinese audio
+                committed_1, transcript_1 = await run_one_cycle(ws, pcm_zh, sr)
+                self.assertIsNone(
+                    committed_1["previous_item_id"],
+                    f"first commit's previous_item_id must be JSON null, got {committed_1!r}",
+                )
+                first_item_id = committed_1["item_id"]
+                self.assertTrue(len(transcript_1) > 0, transcript_1)
+
+                # Cycle 2: English MP3 audio
+                committed_2, transcript_2 = await run_one_cycle(ws, pcm_kungfu, sr)
+                self.assertEqual(
+                    committed_2["previous_item_id"],
+                    first_item_id,
+                    f"second commit's previous_item_id must equal first item_id; "
+                    f"got prev={committed_2['previous_item_id']!r} "
+                    f"vs first={first_item_id!r}",
+                )
+                self.assertNotEqual(
+                    committed_2["item_id"],
+                    first_item_id,
+                    "item_ids must be distinct across commits",
+                )
+                # State reset between commits: second transcript should be the
+                # second audio's content, not a concatenation. Word-level WER
+                # against the canonical kungfu transcript catches state leaks.
+                wer = _wer(transcript_2, EXPECTED_TRANSCRIPTS["mp3"])
+                self.assertLess(
+                    wer,
+                    0.15,
+                    f"second transcript leaked first audio's content; "
+                    f"got {transcript_2!r} (WER {wer:.3f} vs canonical {EXPECTED_TRANSCRIPTS['mp3']!r})",
+                )
+
+        asyncio.run(run())
 
 
 if __name__ == "__main__":

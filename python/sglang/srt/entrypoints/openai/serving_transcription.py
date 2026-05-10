@@ -42,10 +42,10 @@ from sglang.srt.entrypoints.openai.protocol import (
     TranscriptionUsage,
     TranscriptionVerboseResponse,
 )
-from sglang.srt.entrypoints.openai.serving_base import OpenAIServingBase
-from sglang.srt.entrypoints.openai.serving_transcription_websocket import (
+from sglang.srt.entrypoints.openai.realtime import (
     handle_realtime_transcription,
 )
+from sglang.srt.entrypoints.openai.serving_base import OpenAIServingBase
 from sglang.srt.entrypoints.openai.streaming_asr import (
     StreamingASRState,
     process_asr_chunk,

@@ -1599,11 +1599,13 @@ async def openai_v1_audio_transcriptions(
 
 
 @app.websocket("/v1/realtime")
-async def openai_v1_realtime(ws: WebSocket):
-    """OpenAI Realtime transcription WebSocket endpoint.
-
-    See ``serving_transcription_websocket.py`` for the wire protocol.
-    """
+async def openai_v1_realtime_transcription(ws: WebSocket):
+    """OpenAI Realtime transcription WebSocket endpoint."""
+    # /v1/realtime is OpenAI's unified Realtime URL covering transcription +
+    # chat modes. This handler implements the transcription subset only;
+    # chat-mode session.update payloads are rejected by the
+    # `Literal["transcription"]` constraint on TranscriptionSessionConfig.type
+    # (see realtime/protocol.py).
     await ws.app.state.openai_serving_transcription.handle_websocket(ws)
 
 
