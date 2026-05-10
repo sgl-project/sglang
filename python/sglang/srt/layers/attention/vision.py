@@ -37,20 +37,16 @@ _is_xpu = is_xpu()
 if _is_cuda:
     from flashinfer.prefill import cudnn_batch_prefill_with_kv_cache
 
-    try:
-        from sgl_kernel.flash_attn import flash_attn_varlen_func
+    from sgl_kernel.flash_attn import flash_attn_varlen_func
 
-        def flash_attn_func(*args, ver: int = 3, **kwargs):
-            if ver == 4:
-                from sglang.jit_kernel.flash_attention_v4 import (
-                    flash_attn_varlen_func as flash_attn_varlen_func_fa4,
-                )
+    def flash_attn_func(*args, ver: int = 3, **kwargs):
+        if ver == 4:
+            from sglang.jit_kernel.flash_attention_v4 import (
+                flash_attn_varlen_func as flash_attn_varlen_func_fa4,
+            )
 
-                return flash_attn_varlen_func_fa4(*args, **kwargs)
-            return flash_attn_varlen_func(*args, **kwargs)
-
-    except ImportError as e:
-        raise e
+            return flash_attn_varlen_func_fa4(*args, **kwargs)
+        return flash_attn_varlen_func(*args, **kwargs)
 
 
 if _is_npu:
@@ -179,6 +175,7 @@ class VisionSdpaAttention(nn.Module):
         dropout: float = 0.0,
         flatten_batch: bool = False,
         softmax_in_single_precision: bool = False,
+        softmax_scale: Optional[float] = None,
         **kwargs,
     ):
         super().__init__()
@@ -188,7 +185,11 @@ class VisionSdpaAttention(nn.Module):
         self.flatten_batch = flatten_batch
         self.softmax_in_single_precision = softmax_in_single_precision
         self.dropout = dropout
-        self.scale = 1.0 / math.sqrt(self.head_size)
+        self.scale = (
+            softmax_scale
+            if softmax_scale is not None
+            else 1.0 / math.sqrt(self.head_size)
+        )
 
     @staticmethod
     @lru_cache(maxsize=128)
@@ -310,6 +311,7 @@ class VisionSdpaAttention(nn.Module):
                 attn_mask=attention_mask,
                 dropout_p=self.dropout,
                 is_causal=False,
+                scale=self.scale,
             )
 
         # [b, h, s, head_size] --> [b * s, h, head_size]
