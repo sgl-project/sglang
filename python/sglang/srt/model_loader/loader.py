@@ -1802,9 +1802,7 @@ class PreshardedModelLoader(DefaultModelLoader):
 
         total = 0
         for name, content_hash in verify_hashes:
-            d = hashlib.sha1(
-                (name + ":" + content_hash).encode("utf-8")
-            ).digest()
+            d = hashlib.sha1((name + ":" + content_hash).encode("utf-8")).digest()
             total = (total + int.from_bytes(d[:8], "big")) & 0xFFFFFFFFFFFFFFFF
         actual = format(total, "016x")
 
@@ -2209,8 +2207,8 @@ class PreshardedModelLoader(DefaultModelLoader):
                 keys = list(cached.keys())
                 n_workers = min(max(1, len(keys)), self._hash_num_threads)
 
-                def _hash_one(key: str) -> Tuple[str, str]:
-                    return key, self._hash_tensor(cached[key])
+                def _hash_one(key, _cached=cached):
+                    return key, self._hash_tensor(_cached[key])
 
                 if n_workers <= 1:
                     key_to_hash = dict(_hash_one(k) for k in keys)
@@ -2233,7 +2231,9 @@ class PreshardedModelLoader(DefaultModelLoader):
                         # Avoids holding old + new simultaneously across the
                         # whole load.
                         module_path, _, attr_name = r["name"].rpartition(".")
-                        module = model.get_submodule(module_path) if module_path else model
+                        module = (
+                            model.get_submodule(module_path) if module_path else model
+                        )
                         if hasattr(module, attr_name):
                             try:
                                 delattr(module, attr_name)
