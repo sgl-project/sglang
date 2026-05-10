@@ -2692,7 +2692,6 @@ class ServerArgs:
             # Check trtllm_mla backend support
             if (
                 prefill_backend == "trtllm_mla"
-                or decode_backend == "trtllm_mla"
                 or self.attention_backend == "trtllm_mla"
             ) and not is_sm100_supported():
                 raise ValueError(
