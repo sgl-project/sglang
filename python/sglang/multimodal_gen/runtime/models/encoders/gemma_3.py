@@ -299,10 +299,11 @@ class Gemma3Attention(nn.Module):
         key = k.transpose(1, 2)
         value = v.transpose(1, 2)
 
-        attn_mask = torch.ones(
+        min_dtype = torch.finfo(query.dtype).min
+        attn_mask = torch.zeros(
             (seq_len, seq_len),
             device=hidden_states.device,
-            dtype=torch.bool,
+            dtype=query.dtype,
         )
         causal = torch.triu(
             torch.ones(
@@ -310,15 +311,25 @@ class Gemma3Attention(nn.Module):
             ),
             diagonal=1,
         )
-        attn_mask = attn_mask.masked_fill(causal, False)
+        attn_mask = attn_mask.masked_fill(causal, min_dtype)
         if self.is_sliding and self.sliding_window is not None:
             idx = torch.arange(seq_len, device=hidden_states.device)
             dist = idx[:, None] - idx[None, :]
             too_far = dist > self.sliding_window
-            attn_mask = attn_mask.masked_fill(too_far, False)
+            attn_mask = attn_mask.masked_fill(too_far, min_dtype)
 
         attn_mask = attn_mask[None, None, :, :].expand(batch_size, 1, seq_len, seq_len)
-        attn_mask = attn_mask & attention_mask.to(torch.bool)[:, None, None, :]
+        if attention_mask is not None:
+            padding_mask = torch.zeros(
+                (batch_size, 1, 1, seq_len),
+                device=hidden_states.device,
+                dtype=query.dtype,
+            )
+            padding_mask = padding_mask.masked_fill(
+                ~attention_mask.to(torch.bool)[:, None, None, :],
+                min_dtype,
+            )
+            attn_mask = torch.minimum(attn_mask, padding_mask)
 
         if query.shape[1] != key.shape[1]:
             num_key_value_groups = query.shape[1] // key.shape[1]
@@ -335,15 +346,21 @@ class Gemma3Attention(nn.Module):
             key = key.reshape(batch_size, query.shape[1], seq_len, self.head_dim)
             value = value.reshape(batch_size, query.shape[1], seq_len, self.head_dim)
 
-        attn_output = torch.nn.functional.scaled_dot_product_attention(
-            query,
-            key,
-            value,
-            attn_mask=attn_mask,
-            dropout_p=0.0,
-            is_causal=False,
-            scale=self.scaling,
-        )
+        with torch.backends.cuda.sdp_kernel(
+            enable_flash=True,
+            enable_math=False,
+            enable_mem_efficient=True,
+            enable_cudnn=True,
+        ):
+            attn_output = torch.nn.functional.scaled_dot_product_attention(
+                query,
+                key,
+                value,
+                attn_mask=attn_mask,
+                dropout_p=0.0,
+                is_causal=False,
+                scale=self.scaling,
+            )
         attn_output = attn_output.transpose(1, 2)
 
         attn_output = attn_output.reshape(
