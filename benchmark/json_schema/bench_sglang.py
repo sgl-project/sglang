@@ -129,7 +129,7 @@ def _send_chat_request(args, argument: Dict[str, Any]) -> Dict[str, Any]:
         "messages": argument["chat_messages"],
         "temperature": 0,
         "max_tokens": args.max_tokens,
-        "separate_reasoning": True,
+        "separate_reasoning": args.thinking,
         "chat_template_kwargs": {"enable_thinking": args.thinking},
         "response_format": {
             "type": "json_schema",
@@ -196,6 +196,12 @@ def json_safe_raw_result(raw_result, output):
     ):
         return raw_result
     return {"json_output": output}
+
+
+def get_finish_reason(raw_result):
+    if isinstance(raw_result, dict):
+        return raw_result.get("finish_reason")
+    return None
 
 
 def validate_outputs(arguments, outputs, raw_results):
@@ -269,6 +275,11 @@ def main(args):
     num_output_tokens = sum(len(tokenizer.encode(x)) for x in outputs)
     num_valid = len(outputs) - len(failed_indexes)
     accuracy = num_valid / len(outputs) if outputs else 0.0
+    length_failed_indexes = [
+        failure["index"]
+        for failure in failures
+        if get_finish_reason(failure["raw_result"]) == "length"
+    ]
     print(f"Latency: {latency:.3f}")
     print(f"Output throughput: {num_output_tokens / latency:.3f} token/s")
     print(f"#output tokens: {num_output_tokens}")
@@ -301,6 +312,8 @@ def main(args):
         "num_failed": len(failed_indexes),
         "accuracy": round(accuracy, 6),
         "failed_indexes": failed_indexes,
+        "num_length_failures": len(length_failed_indexes),
+        "length_failed_indexes": length_failed_indexes,
         "parallel": args.parallel,
         "max_tokens": args.max_tokens,
     }
