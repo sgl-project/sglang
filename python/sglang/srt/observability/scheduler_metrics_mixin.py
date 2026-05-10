@@ -1042,7 +1042,7 @@ class SchedulerMetricsMixin:
 
         lora = None
         if include_all or "lora" in include:
-            if hasattr(self, "lora_scheduler") and self.lora_scheduler is not None:
+            if self.enable_lora:
                 lora = LoRAMetrics(
                     slots_used=self.stats.lora_pool_slots_used,
                     slots_total=self.stats.lora_pool_slots_total,
