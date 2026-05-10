@@ -1648,15 +1648,16 @@ class PreshardedModelLoader(DefaultModelLoader):
     First run loads weights normally then ranks coordinate to dump a
     deduplicated, content-hashed safetensors set. Subsequent runs with the
     same parallelism + quantization config skip the source ckpt entirely:
-    each rank reads only the files containing tensors it needs and verifies
-    every loaded tensor's SHA1 against ``checksum.json``.
+    each rank reads only the files containing tensors it needs, then
+    computes a single per-rank SHA1 over all loaded tensors (multi-threaded)
+    and compares against the per-rank checksums in ``checksum.json``.
     """
 
     DEFAULT_SUBDIR = "presharded"
     MAX_FILE_BYTES = 20 * (1024**3)
     CHECKSUM_FILENAME = "checksum.json"
     TMP_SUBDIR = "_tmp_presharding"
-    PLAN_VERSION = 1
+    PLAN_VERSION = 2
     DEFAULT_HASH_NUM_THREADS = 8
 
     def __init__(self, load_config: LoadConfig):
@@ -1776,6 +1777,45 @@ class PreshardedModelLoader(DefaultModelLoader):
             flat = cpu.reshape(-1).view(torch.uint8)
             h.update(memoryview(flat.numpy()))
         return h.hexdigest()
+
+    def _verify_rank_checksum(
+        self,
+        verify_hashes: List[Tuple[str, str]],
+        plan: Dict[str, Any],
+        rank: int,
+        presharded_dir: str,
+    ) -> None:
+        """Combine pre-computed per-tensor (name, content-SHA) pairs into the
+        rank-level aggregate checksum and compare against the dump plan. The
+        per-tensor SHAs were computed in parallel during reload; this helper
+        only does the deterministic canonical concatenation + final SHA1.
+        """
+        expected = plan.get("rank_checksums", {}).get(str(rank))
+        if expected is None:
+            raise ValueError(
+                f"Plan at {presharded_dir} has no rank_checksums entry for "
+                f"rank {rank}; cannot verify. Set "
+                f"--model-loader-extra-config '{{\"verify_on_load\": false}}' "
+                f"to skip verification, or re-dump the checkpoint."
+            )
+
+        per_tensor = sorted(verify_hashes, key=lambda x: x[0])
+        h = hashlib.sha1()
+        for name, content_hash in per_tensor:
+            h.update(name.encode("utf-8"))
+            h.update(b":")
+            h.update(content_hash.encode("ascii"))
+            h.update(b"\n")
+        actual = h.hexdigest()
+
+        if actual != expected:
+            raise ValueError(
+                f"Rank-{rank} checksum mismatch for presharded checkpoint at "
+                f"{presharded_dir}: expected {expected}, got {actual}. The "
+                f"checkpoint files may be corrupted; re-dump or skip "
+                f"verification with --model-loader-extra-config "
+                f"'{{\"verify_on_load\": false}}'."
+            )
 
     @staticmethod
     def _collect_extra_tensors(model: nn.Module) -> Dict[str, torch.Tensor]:
@@ -2003,7 +2043,6 @@ class PreshardedModelLoader(DefaultModelLoader):
                     cur_tensors.append(
                         {
                             "stored_key": rec["checksum"],
-                            "checksum": rec["checksum"],
                             "size": rec["size"],
                             "rank_to_names": rec["rank_to_names"],
                         }
@@ -2035,18 +2074,33 @@ class PreshardedModelLoader(DefaultModelLoader):
                                 "filename": f["filename"],
                                 "stored_key": t["stored_key"],
                                 "name": name,
-                                "checksum": t["checksum"],
                                 "is_extra": name_to_is_extra.get(
                                     (int(r_str), name), False
                                 ),
                             }
                         )
 
+        # Per-rank aggregate checksum: SHA1 over the canonical concatenation
+        # of per-tensor (name + content-SHA) for every tensor a rank owns.
+        # Used for end-to-end integrity check on reload; one entry per rank
+        # instead of one per tensor.
+        rank_checksums: Dict[str, str] = {}
+        for r in range(world_size):
+            h = hashlib.sha1()
+            reads = sorted(rank_to_reads.get(r, []), key=lambda x: x["name"])
+            for rec in reads:
+                h.update(rec["name"].encode("utf-8"))
+                h.update(b":")
+                h.update(rec["stored_key"].encode("ascii"))
+                h.update(b"\n")
+            rank_checksums[str(r)] = h.hexdigest()
+
         return {
             "version": cls.PLAN_VERSION,
             "world_size": world_size,
             "files": files,
             "rank_to_reads": {str(r): v for r, v in rank_to_reads.items()},
+            "rank_checksums": rank_checksums,
         }
 
     def _dump_files_for_rank(
@@ -2125,6 +2179,12 @@ class PreshardedModelLoader(DefaultModelLoader):
                 by_file[r["filename"]].append(r)
 
             loaded_param_keys: set = set()
+            # (name, content-SHA) pairs accumulated across files. Per-tensor
+            # SHAs are computed eagerly inside the per-file loop so we can
+            # release tensor references after each file (otherwise the rank
+            # would hold every loaded tensor in memory until end-of-load).
+            # Only populated when verify_on_load=True.
+            verify_hashes: List[Tuple[str, str]] = []
             for filename, items in by_file.items():
                 full_path = os.path.join(presharded_dir, filename)
                 with safe_open(full_path, framework="pt") as fh:
@@ -2136,31 +2196,24 @@ class PreshardedModelLoader(DefaultModelLoader):
                             cached[r["stored_key"]] = fh.get_tensor(r["stored_key"])
 
                 if self._verify_on_load:
-                    expected: Dict[str, str] = {}
-                    for r in items:
-                        expected[r["stored_key"]] = r["checksum"]
-
-                    def _verify(key: str) -> None:
-                        actual = self._hash_tensor(cached[key])
-                        if actual != expected[key]:
-                            raise ValueError(
-                                f"Checksum mismatch for stored_key "
-                                f"'{key}' in {filename}: expected "
-                                f"{expected[key]}, got {actual}."
-                            )
-
+                    # Hash each unique stored_key once (multi-threaded), then
+                    # map back to all (name, hash) pairs that share the key.
                     keys = list(cached.keys())
                     n_workers = min(max(1, len(keys)), self._hash_num_threads)
+
+                    def _hash_one(key: str) -> Tuple[str, str]:
+                        return key, self._hash_tensor(cached[key])
+
                     if n_workers <= 1:
-                        for k in keys:
-                            _verify(k)
+                        key_to_hash = dict(_hash_one(k) for k in keys)
                     else:
                         with concurrent.futures.ThreadPoolExecutor(
                             max_workers=n_workers,
                             thread_name_prefix="presharded-verify",
                         ) as ex:
-                            for _ in ex.map(_verify, keys):
-                                pass
+                            key_to_hash = dict(ex.map(_hash_one, keys))
+                    for r in items:
+                        verify_hashes.append((r["name"], key_to_hash[r["stored_key"]]))
 
                 for r in items:
                     tensor = cached[r["stored_key"]]
@@ -2214,6 +2267,9 @@ class PreshardedModelLoader(DefaultModelLoader):
                     f"Missing keys {tuple(sorted(missing))} in presharded "
                     f"checkpoint at {presharded_dir}."
                 )
+
+            if self._verify_on_load:
+                self._verify_rank_checksum(verify_hashes, plan, rank, presharded_dir)
 
         return model.eval()
 
