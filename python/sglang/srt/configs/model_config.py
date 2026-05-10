@@ -1014,6 +1014,43 @@ class ModelConfig:
         else:
             return None
 
+    def _is_moe_like_model(self) -> bool:
+        architectures = getattr(self.hf_config, "architectures", []) or []
+        model_type = getattr(self.hf_config, "model_type", None)
+        names = [*architectures]
+        if model_type:
+            names.append(model_type)
+        lowered_names = [name.lower() for name in names if isinstance(name, str)]
+        if any(
+            "moe" in name or "mixtral" in name or "dbrx" in name
+            for name in lowered_names
+        ):
+            return True
+
+        moe_attrs = (
+            "num_experts",
+            "n_routed_experts",
+            "num_local_experts",
+            "moe_intermediate_size",
+            "moe_layer_freq",
+            "moe_layers",
+            "num_experts_per_tok",
+            "n_shared_experts",
+        )
+        return any(
+            getattr(self.hf_config, attr, None) is not None for attr in moe_attrs
+        )
+
+    def _should_auto_select_petit_nvfp4(self, quant_cfg: dict) -> bool:
+        quant_method = quant_cfg.get("quant_method", "").lower()
+        quant_algo = quant_cfg.get("quant_algo", "").upper()
+        return (
+            is_hip()
+            and quant_method in ("modelopt", "modelopt_fp4")
+            and ("NVFP4" in quant_algo or "FP4" in quant_algo)
+            and not self._is_moe_like_model()
+        )
+
     def get_quantization_config_log_str(self) -> Optional[str]:
         """
         Get a concise string representation of the quantization config for logging.
@@ -1122,6 +1159,7 @@ class ModelConfig:
             "fbgemm_fp8",
             "w8a8_fp8",
             "petit_nvfp4",
+            "petit_mxfp4",
             "quark",
             "mxfp4",
             "auto-round",
@@ -1146,6 +1184,7 @@ class ModelConfig:
             "qoq",
             "w4afp8",
             "petit_nvfp4",
+            "petit_mxfp4",
             "quark",
             "modelslim",
         ]
@@ -1153,12 +1192,14 @@ class ModelConfig:
             "modelopt_fp8": ["modelopt"],
             "modelopt_fp4": ["modelopt"],
             "modelopt_mixed": ["modelopt"],
-            "petit_nvfp4": ["modelopt"],
+            "petit_nvfp4": ["modelopt", "modelopt_fp4"],
+            "petit_mxfp4": ["mxfp4", "quark"],
             "w8a8_int8": ["compressed-tensors", "compressed_tensors"],
             "w8a8_fp8": ["compressed-tensors", "compressed_tensors"],
         }
         if self.quantization is not None:
             self.quantization = self.quantization.lower()
+        user_quantization = self.quantization
 
         # Parse quantization method from the HF and ModelSlim model config, if available.
         # Only one function should return config, other should return None.
@@ -1191,6 +1232,17 @@ class ModelConfig:
                     quant_method = quantization_override
                     self.quantization = quantization_override
                     break
+
+            if quant_method == "modelopt_fp4":
+                if user_quantization == "petit_nvfp4" or (
+                    user_quantization is None
+                    and self._should_auto_select_petit_nvfp4(quant_cfg)
+                ):
+                    logger.info(
+                        "Using Petit NVFP4 for dense ModelOpt FP4 checkpoint on ROCm."
+                    )
+                    quant_method = "petit_nvfp4"
+                    self.quantization = "petit_nvfp4"
 
             # Verify quantization configurations.
             if self.quantization is None:

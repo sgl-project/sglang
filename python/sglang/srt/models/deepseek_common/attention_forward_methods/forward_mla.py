@@ -601,7 +601,18 @@ class DeepseekMLAForwardMixin:
 
             if self.o_proj.weight.dtype == torch.uint8:
                 attn_bmm_output = attn_bmm_output.transpose(0, 1)
-                attn_bmm_output = fused_flatten_mxfp4_quant(attn_bmm_output)
+                if not _use_aiter_gfx95 and getattr(
+                    getattr(self.o_proj, "scheme", None),
+                    "is_petit_mxfp4_linear",
+                    False,
+                ):
+                    # Keep the same [tokens, heads, dim] -> [tokens, hidden] layout
+                    # as the gfx95 path, but skip activation MXFP4 quantization when
+                    # the AFP4 helper kernels are unavailable. The Petit linear path
+                    # consumes BF16 activations directly.
+                    attn_bmm_output = attn_bmm_output.flatten(1, 2)
+                else:
+                    attn_bmm_output = fused_flatten_mxfp4_quant(attn_bmm_output)
             elif self.o_proj.weight.dtype == torch.float8_e4m3fn:
                 attn_bmm_output = attn_bmm_output.transpose(0, 1)
                 attn_bmm_output = fused_flatten_fp8_group_quant(

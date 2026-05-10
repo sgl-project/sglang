@@ -260,6 +260,10 @@ class StandardTopKOutput(NamedTuple):
     def format(self) -> TopKOutputFormat:
         return TopKOutputFormat.STANDARD
 
+    @property
+    def num_token_non_padded(self) -> Optional[torch.Tensor]:
+        return getattr(self.topk_ids, "num_token_non_padded", None)
+
 
 class TritonKernelTopKOutput(NamedTuple):
     """Triton kernel top-k output format."""
@@ -1478,6 +1482,9 @@ def select_experts(
     )
 
     get_global_expert_distribution_recorder().on_select_experts(topk_ids=topk_ids)
+
+    if num_token_non_padded is not None:
+        topk_ids.num_token_non_padded = num_token_non_padded
 
     return StandardTopKOutput(topk_weights, topk_ids, router_logits)
 

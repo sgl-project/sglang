@@ -1077,6 +1077,25 @@ class FusedMoE(torch.nn.Module):
         dispatch_output = self.dispatcher.dispatch(
             hidden_states=hidden_states, topk_output=topk_output
         )
+        needs_aiter_expert_mask = _use_aiter or getattr(
+            self.quant_method, "is_petit_mxfp4_moe", False
+        )
+        if needs_aiter_expert_mask and self.dispatcher.local_expert_mapping is not None:
+            expert_mask_gpu = getattr(self, "expert_mask_gpu", None)
+            if expert_mask_gpu is None or expert_mask_gpu.shape != (
+                self.dispatcher.local_expert_mapping.shape
+            ):
+                self.expert_mask_gpu = (
+                    (
+                        (self.dispatcher.local_expert_mapping >= 0)
+                        & (
+                            self.dispatcher.local_expert_mapping
+                            < self.num_local_experts
+                        )
+                    )
+                    .to(torch.int32)
+                    .to(device=hidden_states.device)
+                )
 
         combine_input = self.run_moe_core(
             dispatch_output=dispatch_output,
