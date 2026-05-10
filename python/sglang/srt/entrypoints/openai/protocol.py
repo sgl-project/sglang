@@ -285,7 +285,7 @@ class CompletionRequest(BaseModel):
     user: Optional[str] = None
     return_hidden_states: bool = False
     return_routed_experts: bool = False
-    routed_experts_start_len: Optional[int] = None
+    routed_experts_start_len: int = 0
     return_cached_tokens_details: bool = False
 
     # Extra parameters for SRT backend only and will be ignored by OpenAI models.
@@ -633,7 +633,7 @@ class ChatCompletionRequest(BaseModel):
     parallel_tool_calls: bool = True
     return_hidden_states: bool = False
     return_routed_experts: bool = False
-    routed_experts_start_len: Optional[int] = None
+    routed_experts_start_len: int = 0
     return_cached_tokens_details: bool = False
     reasoning_effort: Optional[Literal["none", "low", "medium", "high", "max"]] = Field(
         default=None,
