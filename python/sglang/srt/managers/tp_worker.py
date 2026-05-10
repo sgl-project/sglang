@@ -124,7 +124,7 @@ class BaseTpWorker(ABC):
         self, recv_req: InitWeightsSendGroupForRemoteInstanceReqInput
     ):
         success, message = (
-            self.model_runner.init_weights_send_group_for_remote_instance(
+            self.model_runner.weight_exporter.init_weights_send_group_for_remote_instance(
                 recv_req.master_address,
                 recv_req.ports,
                 recv_req.group_rank,
@@ -138,10 +138,12 @@ class BaseTpWorker(ABC):
     def send_weights_to_remote_instance(
         self, recv_req: SendWeightsToRemoteInstanceReqInput
     ):
-        success, message = self.model_runner.send_weights_to_remote_instance(
-            recv_req.master_address,
-            recv_req.ports,
-            recv_req.group_name,
+        success, message = (
+            self.model_runner.weight_exporter.send_weights_to_remote_instance(
+                recv_req.master_address,
+                recv_req.ports,
+                recv_req.group_name,
+            )
         )
         return success, message
 
