@@ -13,7 +13,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-from python.sglang.srt.dllm import config
 from sglang.srt.utils import add_prefix
 
 # Adapted from
@@ -165,7 +164,9 @@ class LlamaModel(nn.Module):
             bias=getattr(config, "bias", False),
         )
 
-        self.use_fc_norm = getattr(config, "fc_norm", None) or getattr(config, "use_aux_norm", False)
+        self.use_fc_norm = getattr(config, "fc_norm", None) or getattr(
+            config, "use_aux_norm", False
+        )
         if self.use_fc_norm:
             self.fc_norm = nn.ModuleList(
                 [
