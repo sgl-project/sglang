@@ -492,14 +492,6 @@ class DeepSeekV4SingleKVPoolHost:
         ] * self.layer_num
         return data_ptrs, data_lens, item_lens
 
-    def load_to_device_per_layer(
-        self, device_pool, host_indices, device_indices, layer_id, io_backend
-    ):
-        raise NotImplementedError(
-            "DeepSeek V4 host-to-device preload uses the existing DSV4 "
-            "HiSparse swap-in kernel from HiSparseCoordinator."
-        )
-
     def available_size(self):
         return len(self.free_slots)
 
