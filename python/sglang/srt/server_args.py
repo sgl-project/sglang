@@ -3184,6 +3184,21 @@ class ServerArgs:
             )
             self.moe_a2a_backend = "deepep"
 
+        # Mega MoE uses deep_gemm for its own all-to-all communication and
+        # does not depend on DeepEP.  When the user has not explicitly chosen
+        # an a2a backend, auto-configure EP so that megamoe can run without
+        # requiring the deep_ep library or the DeepEP dispatcher.
+        if (
+            envs.SGLANG_OPT_USE_DEEPGEMM_MEGA_MOE.get()
+            and self.moe_a2a_backend == "none"
+            and self.ep_size == 1
+        ):
+            self.ep_size = self.tp_size
+            logger.info(
+                f"Mega MoE is enabled. The expert parallel size is adjusted "
+                f"to be the same as the tensor parallel size[{self.tp_size}]."
+            )
+
         if self.moe_a2a_backend == "deepep":
             if self.deepep_mode == "normal":
                 logger.warning("Cuda graph is disabled because deepep_mode=`normal`")
