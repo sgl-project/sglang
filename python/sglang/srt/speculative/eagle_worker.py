@@ -515,12 +515,10 @@ class EAGLEWorker(TpModelWorker):
                     batch.spec_info = next_draft_input
                 else:
                     # All reqs finished and dp_attention isn't forcing extend.
-                    # Stash an empty EagleDraftInput so next iter's merge_batch
-                    # short-circuits on None hidden_states (EagleVerifyInput
-                    # has no merge_batch).
-                    batch.spec_info = EagleDraftInput(
-                        capture_hidden_mode=CaptureHiddenMode.LAST,
-                    )
+                    # Install an idle EagleDraftInput so next iter's scheduler
+                    # ops (merge_batch / filter_batch) see well-typed empty
+                    # tensors instead of None.
+                    self._draft_preprocess_idle(batch)
 
             set_time_batch(
                 batch.reqs, "set_spec_draft_extend_end_time", trace_only=True
@@ -1128,7 +1126,7 @@ class EAGLEWorker(TpModelWorker):
 
         input_is_idle = batch.forward_mode.is_idle()
 
-        if not input_is_idle and draft_extend_input.input_ids.numel() == 0:
+        if not input_is_idle and draft_extend_input.input_ids.shape[0] == 0:
             # All reqs finished this verify; swap to an idle ExtendInput.
             batch = batch.copy()
             batch.prepare_for_idle()
