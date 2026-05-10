@@ -29,6 +29,7 @@ from sglang.srt.layers.quantization.fpgemm_fp8 import FBGEMMFp8Config
 from sglang.srt.layers.quantization.gguf import GGUFConfig
 from sglang.srt.layers.quantization.gptq import GPTQConfig, GPTQMarlinConfig
 from sglang.srt.layers.quantization.gptq_cpu import CPUGPTQConfig
+from sglang.srt.layers.quantization.mlx import MlxQuantizationConfig
 from sglang.srt.layers.quantization.modelopt_quant import (
     ModelOptFp4Config,
     ModelOptFp8Config,
@@ -84,6 +85,13 @@ BASE_QUANTIZATION_METHODS: Dict[str, Type[QuantizationConfig]] = {
     "auto-round": AutoRoundConfig,
     "modelslim": ModelSlimConfig,
     "quark_int4fp8_moe": QuarkInt4Fp8Config,
+    # MLX backend handles its own quantization at load time (see
+    # python/sglang/srt/hardware_backend/mlx/model_runner.py). These entries
+    # register the names so the standard registry lookups accept them;
+    # MlxQuantizationConfig.from_config raises if the PyTorch path ever
+    # tries to instantiate it without SGLANG_USE_MLX=1.
+    "mlx_q4": MlxQuantizationConfig,
+    "mlx_q8": MlxQuantizationConfig,
 }
 
 
