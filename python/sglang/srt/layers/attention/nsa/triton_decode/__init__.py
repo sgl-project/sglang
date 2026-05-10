@@ -25,9 +25,12 @@ class _KVScopeAdapter:
       * ``indices_in_kvcache`` – sparse top-k page indices.
       * ``topk_length``        – valid length per batch element.
     """
+
     __slots__ = [
-        "blocked_k", "blocked_k_quantized",
-        "indices_in_kvcache", "topk_length",
+        "blocked_k",
+        "blocked_k_quantized",
+        "indices_in_kvcache",
+        "topk_length",
     ]
 
     def __init__(
@@ -74,7 +77,9 @@ def triton_fp8_attention_fwd(
     extra_kv_scope = None
     if extra_k_cache is not None:
         extra_kv_scope = _KVScopeAdapter(
-            extra_k_cache, extra_indices_in_kvcache, extra_topk_length,
+            extra_k_cache,
+            extra_indices_in_kvcache,
+            extra_topk_length,
         )
 
     output, lse = triton_sparse_attn_decode(

@@ -7,13 +7,36 @@ This module contains shared code for the DeepSeek V4 Triton decode implementatio
 - Token range computation for memory-based chunking
 """
 
+from typing import List, Tuple
+
 import torch
 import triton
 import triton.language as tl
-from typing import Optional, Tuple, List
-
 
 LOG2E = tl.constexpr(1.4426950408889634)
+
+
+# ============================================================================
+# Bucketing for autotune keys to avoid recompilation per unique batch size
+# ============================================================================
+def _bucket_total_tokens(total_tokens: int) -> int:
+    """Round total_tokens up to the nearest power of 2 for autotune key stability.
+
+    In serving, total_tokens (= batch_size * seq_len) varies with every batch.
+    Using the exact value as an autotune key causes recompilation for each unique
+    value. Bucketing to powers of 2 limits the number of unique keys to ~15,
+    dramatically reducing autotuning overhead.
+
+    Returns:
+        Power-of-2 bucket: 1, 2, 4, 8, ..., up to the next power of 2.
+    """
+    if total_tokens <= 0:
+        return 1
+    # Round up to next power of 2
+    n = 1
+    while n < total_tokens:
+        n <<= 1
+    return n
 
 
 # ============================================================================
@@ -43,6 +66,7 @@ def _get_workload_size_category(total_tokens: int, topk: int) -> int:
 # Unified Attention Kernels
 # ============================================================================
 
+
 # ============================================================================
 # CDNA4 (gfx950) Optimized: Added high-performance configs for MI355X
 # Best config for h_q=128, large topk: BLOCK_H=64, BLOCK_N=256, num_warps=8
@@ -51,45 +75,111 @@ def _get_workload_size_category(total_tokens: int, topk: int) -> int:
     configs=[
         # CDNA4-optimized configurations for MI355X (256 CUs, 8TB/s BW)
         # Best for h_q=128, large topk: maximize parallelism across CUs
-        triton.Config({"BLOCK_H": 64, "BLOCK_N": 256, "BLOCK_D": 128}, num_warps=8, num_stages=1),
-        triton.Config({"BLOCK_H": 64, "BLOCK_N": 256, "BLOCK_D": 128}, num_warps=4, num_stages=1),
-        triton.Config({"BLOCK_H": 64, "BLOCK_N": 128, "BLOCK_D": 128}, num_warps=8, num_stages=1),
-        triton.Config({"BLOCK_H": 64, "BLOCK_N": 128, "BLOCK_D": 128}, num_warps=4, num_stages=1),
-        triton.Config({"BLOCK_H": 128, "BLOCK_N": 128, "BLOCK_D": 128}, num_warps=8, num_stages=1),
-        triton.Config({"BLOCK_H": 128, "BLOCK_N": 256, "BLOCK_D": 128}, num_warps=8, num_stages=1),
-        triton.Config({"BLOCK_H": 64, "BLOCK_N": 512, "BLOCK_D": 128}, num_warps=8, num_stages=1),
-        triton.Config({"BLOCK_H": 32, "BLOCK_N": 512, "BLOCK_D": 128}, num_warps=8, num_stages=1),
-        triton.Config({"BLOCK_H": 32, "BLOCK_N": 256, "BLOCK_D": 128}, num_warps=8, num_stages=1),
-        triton.Config({"BLOCK_H": 32, "BLOCK_N": 256, "BLOCK_D": 128}, num_warps=4, num_stages=1),
+        triton.Config(
+            {"BLOCK_H": 64, "BLOCK_N": 256, "BLOCK_D": 128}, num_warps=8, num_stages=1
+        ),
+        triton.Config(
+            {"BLOCK_H": 64, "BLOCK_N": 256, "BLOCK_D": 128}, num_warps=4, num_stages=1
+        ),
+        triton.Config(
+            {"BLOCK_H": 64, "BLOCK_N": 128, "BLOCK_D": 128}, num_warps=8, num_stages=1
+        ),
+        triton.Config(
+            {"BLOCK_H": 64, "BLOCK_N": 128, "BLOCK_D": 128}, num_warps=4, num_stages=1
+        ),
+        triton.Config(
+            {"BLOCK_H": 128, "BLOCK_N": 128, "BLOCK_D": 128}, num_warps=8, num_stages=1
+        ),
+        triton.Config(
+            {"BLOCK_H": 128, "BLOCK_N": 256, "BLOCK_D": 128}, num_warps=8, num_stages=1
+        ),
+        triton.Config(
+            {"BLOCK_H": 64, "BLOCK_N": 512, "BLOCK_D": 128}, num_warps=8, num_stages=1
+        ),
+        triton.Config(
+            {"BLOCK_H": 32, "BLOCK_N": 512, "BLOCK_D": 128}, num_warps=8, num_stages=1
+        ),
+        triton.Config(
+            {"BLOCK_H": 32, "BLOCK_N": 256, "BLOCK_D": 128}, num_warps=8, num_stages=1
+        ),
+        triton.Config(
+            {"BLOCK_H": 32, "BLOCK_N": 256, "BLOCK_D": 128}, num_warps=4, num_stages=1
+        ),
         # Additional configs with num_stages=2 for better pipelining
-        triton.Config({"BLOCK_H": 64, "BLOCK_N": 256, "BLOCK_D": 128}, num_warps=8, num_stages=2),
-        triton.Config({"BLOCK_H": 64, "BLOCK_N": 128, "BLOCK_D": 128}, num_warps=8, num_stages=2),
-        triton.Config({"BLOCK_H": 32, "BLOCK_N": 256, "BLOCK_D": 128}, num_warps=8, num_stages=2),
+        triton.Config(
+            {"BLOCK_H": 64, "BLOCK_N": 256, "BLOCK_D": 128}, num_warps=8, num_stages=2
+        ),
+        triton.Config(
+            {"BLOCK_H": 64, "BLOCK_N": 128, "BLOCK_D": 128}, num_warps=8, num_stages=2
+        ),
+        triton.Config(
+            {"BLOCK_H": 32, "BLOCK_N": 256, "BLOCK_D": 128}, num_warps=8, num_stages=2
+        ),
         # Original configurations
-        triton.Config({"BLOCK_H": 16, "BLOCK_N": 64, "BLOCK_D": 128}, num_warps=4, num_stages=1),
-        triton.Config({"BLOCK_H": 16, "BLOCK_N": 128, "BLOCK_D": 128}, num_warps=4, num_stages=1),
-        triton.Config({"BLOCK_H": 16, "BLOCK_N": 256, "BLOCK_D": 128}, num_warps=4, num_stages=1),
-        triton.Config({"BLOCK_H": 16, "BLOCK_N": 512, "BLOCK_D": 128}, num_warps=4, num_stages=1),
-        triton.Config({"BLOCK_H": 16, "BLOCK_N": 128, "BLOCK_D": 128}, num_warps=8, num_stages=1),
-        triton.Config({"BLOCK_H": 16, "BLOCK_N": 256, "BLOCK_D": 128}, num_warps=8, num_stages=1),
-        triton.Config({"BLOCK_H": 16, "BLOCK_N": 512, "BLOCK_D": 128}, num_warps=8, num_stages=1),
-        triton.Config({"BLOCK_H": 32, "BLOCK_N": 128, "BLOCK_D": 128}, num_warps=4, num_stages=1),
-        triton.Config({"BLOCK_H": 32, "BLOCK_N": 512, "BLOCK_D": 128}, num_warps=4, num_stages=1),
-        triton.Config({"BLOCK_H": 8, "BLOCK_N": 256, "BLOCK_D": 128}, num_warps=8, num_stages=1),
-        triton.Config({"BLOCK_H": 8, "BLOCK_N": 512, "BLOCK_D": 128}, num_warps=8, num_stages=1),
+        triton.Config(
+            {"BLOCK_H": 16, "BLOCK_N": 64, "BLOCK_D": 128}, num_warps=4, num_stages=1
+        ),
+        triton.Config(
+            {"BLOCK_H": 16, "BLOCK_N": 128, "BLOCK_D": 128}, num_warps=4, num_stages=1
+        ),
+        triton.Config(
+            {"BLOCK_H": 16, "BLOCK_N": 256, "BLOCK_D": 128}, num_warps=4, num_stages=1
+        ),
+        triton.Config(
+            {"BLOCK_H": 16, "BLOCK_N": 512, "BLOCK_D": 128}, num_warps=4, num_stages=1
+        ),
+        triton.Config(
+            {"BLOCK_H": 16, "BLOCK_N": 128, "BLOCK_D": 128}, num_warps=8, num_stages=1
+        ),
+        triton.Config(
+            {"BLOCK_H": 16, "BLOCK_N": 256, "BLOCK_D": 128}, num_warps=8, num_stages=1
+        ),
+        triton.Config(
+            {"BLOCK_H": 16, "BLOCK_N": 512, "BLOCK_D": 128}, num_warps=8, num_stages=1
+        ),
+        triton.Config(
+            {"BLOCK_H": 32, "BLOCK_N": 128, "BLOCK_D": 128}, num_warps=4, num_stages=1
+        ),
+        triton.Config(
+            {"BLOCK_H": 32, "BLOCK_N": 512, "BLOCK_D": 128}, num_warps=4, num_stages=1
+        ),
+        triton.Config(
+            {"BLOCK_H": 8, "BLOCK_N": 256, "BLOCK_D": 128}, num_warps=8, num_stages=1
+        ),
+        triton.Config(
+            {"BLOCK_H": 8, "BLOCK_N": 512, "BLOCK_D": 128}, num_warps=8, num_stages=1
+        ),
     ],
-    key=["total_tokens", "h_q", "total_topk", "d_qk"],
+    key=["total_tokens_bucket", "h_q", "total_topk", "d_qk"],
 )
 @triton.jit
 def _unified_sparse_decode_kernel(
-    Q, KV, Mask, AttnSink,
-    Output, LSE,
-    sm_scale, total_tokens, h_q, total_topk, d_qk, d_v,
-    stride_q_t, stride_q_h, stride_q_d,
-    stride_kv_t, stride_kv_k, stride_kv_d,
-    stride_mask_t, stride_mask_k,
-    stride_o_t, stride_o_h, stride_o_d,
-    stride_lse_t, stride_lse_h,
+    Q,
+    KV,
+    Mask,
+    AttnSink,
+    Output,
+    LSE,
+    sm_scale,
+    total_tokens,
+    total_tokens_bucket,
+    h_q,
+    total_topk,
+    d_qk,
+    d_v,
+    stride_q_t,
+    stride_q_h,
+    stride_q_d,
+    stride_kv_t,
+    stride_kv_k,
+    stride_kv_d,
+    stride_mask_t,
+    stride_mask_k,
+    stride_o_t,
+    stride_o_h,
+    stride_o_d,
+    stride_lse_t,
+    stride_lse_h,
     HAS_ATTN_SINK: tl.constexpr,
     BLOCK_H: tl.constexpr,
     BLOCK_N: tl.constexpr,
@@ -135,11 +225,19 @@ def _unified_sparse_decode_kernel(
             offs_d = d_start + tl.arange(0, BLOCK_D)
             mask_d = offs_d < d_qk
 
-            q_ptrs = q_base + offs_h[:, None] * stride_q_h + offs_d[None, :] * stride_q_d
-            q_chunk = tl.load(q_ptrs, mask=mask_h[:, None] & mask_d[None, :], other=0.0).to(tl.bfloat16)
+            q_ptrs = (
+                q_base + offs_h[:, None] * stride_q_h + offs_d[None, :] * stride_q_d
+            )
+            q_chunk = tl.load(
+                q_ptrs, mask=mask_h[:, None] & mask_d[None, :], other=0.0
+            ).to(tl.bfloat16)
 
-            k_ptrs = kv_base + offs_n[:, None] * stride_kv_k + offs_d[None, :] * stride_kv_d
-            k_chunk = tl.load(k_ptrs, mask=valid[:, None] & mask_d[None, :], other=0.0).to(tl.bfloat16)
+            k_ptrs = (
+                kv_base + offs_n[:, None] * stride_kv_k + offs_d[None, :] * stride_kv_d
+            )
+            k_chunk = tl.load(
+                k_ptrs, mask=valid[:, None] & mask_d[None, :], other=0.0
+            ).to(tl.bfloat16)
 
             qk += tl.dot(q_chunk, tl.trans(k_chunk))
 
@@ -160,24 +258,30 @@ def _unified_sparse_decode_kernel(
 
         offs_v = BLOCK_D + tl.arange(0, BLOCK_D)
         v_ptrs = kv_base + offs_n[:, None] * stride_kv_k + offs_v[None, :] * stride_kv_d
-        v = tl.load(v_ptrs, mask=valid[:, None] & (offs_v[None, :] < d_v), other=0.0).to(tl.bfloat16)
+        v = tl.load(
+            v_ptrs, mask=valid[:, None] & (offs_v[None, :] < d_v), other=0.0
+        ).to(tl.bfloat16)
         acc_1 = acc_1 * alpha[:, None] + tl.dot(p_bf16, v)
 
         offs_v = 2 * BLOCK_D + tl.arange(0, BLOCK_D)
         v_ptrs = kv_base + offs_n[:, None] * stride_kv_k + offs_v[None, :] * stride_kv_d
-        v = tl.load(v_ptrs, mask=valid[:, None] & (offs_v[None, :] < d_v), other=0.0).to(tl.bfloat16)
+        v = tl.load(
+            v_ptrs, mask=valid[:, None] & (offs_v[None, :] < d_v), other=0.0
+        ).to(tl.bfloat16)
         acc_2 = acc_2 * alpha[:, None] + tl.dot(p_bf16, v)
 
         offs_v = 3 * BLOCK_D + tl.arange(0, BLOCK_D)
         v_ptrs = kv_base + offs_n[:, None] * stride_kv_k + offs_v[None, :] * stride_kv_d
-        v = tl.load(v_ptrs, mask=valid[:, None] & (offs_v[None, :] < d_v), other=0.0).to(tl.bfloat16)
+        v = tl.load(
+            v_ptrs, mask=valid[:, None] & (offs_v[None, :] < d_v), other=0.0
+        ).to(tl.bfloat16)
         acc_3 = acc_3 * alpha[:, None] + tl.dot(p_bf16, v)
 
         m_i = m_new
         l_i = l_new
 
     lse = m_i + tl.math.log2(tl.where(l_i == 0.0, 1.0, l_i)) / LOG2E
-    is_lonely_q = (l_i == 0.0)
+    is_lonely_q = l_i == 0.0
 
     if HAS_ATTN_SINK:
         attn_sink_vals = tl.load(AttnSink + offs_h, mask=mask_h, other=0.0)
@@ -209,45 +313,105 @@ def _unified_sparse_decode_kernel(
     offs_v_1 = BLOCK_D + tl.arange(0, BLOCK_D)
     offs_v_2 = 2 * BLOCK_D + tl.arange(0, BLOCK_D)
     offs_v_3 = 3 * BLOCK_D + tl.arange(0, BLOCK_D)
-    tl.store(o_base + offs_h_2d * stride_o_h + offs_v_0[None, :] * stride_o_d, acc_0.to(tl.bfloat16), mask=mask_h_2d)
-    tl.store(o_base + offs_h_2d * stride_o_h + offs_v_1[None, :] * stride_o_d, acc_1.to(tl.bfloat16), mask=mask_h_2d & (offs_v_1[None, :] < d_v))
-    tl.store(o_base + offs_h_2d * stride_o_h + offs_v_2[None, :] * stride_o_d, acc_2.to(tl.bfloat16), mask=mask_h_2d & (offs_v_2[None, :] < d_v))
-    tl.store(o_base + offs_h_2d * stride_o_h + offs_v_3[None, :] * stride_o_d, acc_3.to(tl.bfloat16), mask=mask_h_2d & (offs_v_3[None, :] < d_v))
+    tl.store(
+        o_base + offs_h_2d * stride_o_h + offs_v_0[None, :] * stride_o_d,
+        acc_0.to(tl.bfloat16),
+        mask=mask_h_2d,
+    )
+    tl.store(
+        o_base + offs_h_2d * stride_o_h + offs_v_1[None, :] * stride_o_d,
+        acc_1.to(tl.bfloat16),
+        mask=mask_h_2d & (offs_v_1[None, :] < d_v),
+    )
+    tl.store(
+        o_base + offs_h_2d * stride_o_h + offs_v_2[None, :] * stride_o_d,
+        acc_2.to(tl.bfloat16),
+        mask=mask_h_2d & (offs_v_2[None, :] < d_v),
+    )
+    tl.store(
+        o_base + offs_h_2d * stride_o_h + offs_v_3[None, :] * stride_o_d,
+        acc_3.to(tl.bfloat16),
+        mask=mask_h_2d & (offs_v_3[None, :] < d_v),
+    )
+
+
 # ============================================================================
 # Attention Runner Functions
 # ============================================================================
 
-def run_unified_attention(q_reshaped, gathered_kv, invalid_mask,
-                          d_v, sm_scale, total_tokens, h_q, total_topk, d_qk,
-                          attn_sink=None):
+
+def run_unified_attention(
+    q_reshaped,
+    gathered_kv,
+    invalid_mask,
+    d_v,
+    sm_scale,
+    total_tokens,
+    h_q,
+    total_topk,
+    d_qk,
+    attn_sink=None,
+):
     """Run unified attention with single KV buffer.
 
     Run unified sparse decode attention kernel.
     """
-    output = torch.empty((total_tokens, h_q, d_v), dtype=torch.bfloat16, device=q_reshaped.device)
-    lse = torch.empty((total_tokens, h_q), dtype=torch.float32, device=q_reshaped.device)
+    output = torch.empty(
+        (total_tokens, h_q, d_v), dtype=torch.bfloat16, device=q_reshaped.device
+    )
+    lse = torch.empty(
+        (total_tokens, h_q), dtype=torch.float32, device=q_reshaped.device
+    )
 
     HAS_ATTN_SINK = attn_sink is not None
     attn_sink_tensor = attn_sink if HAS_ATTN_SINK else lse[:1]
 
     grid = lambda meta: (total_tokens, triton.cdiv(h_q, meta["BLOCK_H"]))
     _unified_sparse_decode_kernel[grid](
-        q_reshaped, gathered_kv, invalid_mask, attn_sink_tensor,
-        output, lse,
-        sm_scale, total_tokens, h_q, total_topk, d_qk, d_v,
-        q_reshaped.stride(0), q_reshaped.stride(1), q_reshaped.stride(2),
-        gathered_kv.stride(0), gathered_kv.stride(1), gathered_kv.stride(2),
-        invalid_mask.stride(0), invalid_mask.stride(1),
-        output.stride(0), output.stride(1), output.stride(2),
-        lse.stride(0), lse.stride(1),
+        q_reshaped,
+        gathered_kv,
+        invalid_mask,
+        attn_sink_tensor,
+        output,
+        lse,
+        sm_scale,
+        total_tokens,
+        _bucket_total_tokens(total_tokens),
+        h_q,
+        total_topk,
+        d_qk,
+        d_v,
+        q_reshaped.stride(0),
+        q_reshaped.stride(1),
+        q_reshaped.stride(2),
+        gathered_kv.stride(0),
+        gathered_kv.stride(1),
+        gathered_kv.stride(2),
+        invalid_mask.stride(0),
+        invalid_mask.stride(1),
+        output.stride(0),
+        output.stride(1),
+        output.stride(2),
+        lse.stride(0),
+        lse.stride(1),
         HAS_ATTN_SINK=HAS_ATTN_SINK,
     )
     return output, lse
 
 
-def run_chunked_attention_triton(q_reshaped, gathered_kv, invalid_mask,
-                                 d_v, sm_scale, total_tokens, h_q, total_topk, d_qk,
-                                 attn_sink=None, chunk_size=8192):
+def run_chunked_attention_triton(
+    q_reshaped,
+    gathered_kv,
+    invalid_mask,
+    d_v,
+    sm_scale,
+    total_tokens,
+    h_q,
+    total_topk,
+    d_qk,
+    attn_sink=None,
+    chunk_size=8192,
+):
     """Chunked attention using Triton kernels with cross-chunk softmax merging."""
     device = q_reshaped.device
 
@@ -265,7 +429,9 @@ def run_chunked_attention_triton(q_reshaped, gathered_kv, invalid_mask,
         kv_chunks.append(gathered_kv[:, start_k:end_k, :].contiguous())
         mask_chunks.append(invalid_mask[:, start_k:end_k].contiguous())
 
-    lse_acc = torch.full((total_tokens, h_q), float('-inf'), dtype=torch.float32, device=device)
+    lse_acc = torch.full(
+        (total_tokens, h_q), float("-inf"), dtype=torch.float32, device=device
+    )
     acc = torch.zeros((total_tokens, h_q, d_v), dtype=torch.float32, device=device)
 
     for chunk_idx in range(num_chunks):
@@ -274,16 +440,23 @@ def run_chunked_attention_triton(q_reshaped, gathered_kv, invalid_mask,
         chunk_topk = chunk_sizes[chunk_idx]
 
         chunk_output, chunk_lse = run_unified_attention(
-            q_reshaped, kv_chunk, mask_chunk,
-            d_v, sm_scale, total_tokens, h_q, chunk_topk, d_qk,
-            attn_sink=None
+            q_reshaped,
+            kv_chunk,
+            mask_chunk,
+            d_v,
+            sm_scale,
+            total_tokens,
+            h_q,
+            chunk_topk,
+            d_qk,
+            attn_sink=None,
         )
 
         is_chunk_lonely = torch.isinf(chunk_lse) & (chunk_lse > 0)
 
-        chunk_lse_for_merge = torch.where(is_chunk_lonely,
-                                          torch.full_like(chunk_lse, float('-inf')),
-                                          chunk_lse)
+        chunk_lse_for_merge = torch.where(
+            is_chunk_lonely, torch.full_like(chunk_lse, float("-inf")), chunk_lse
+        )
 
         lse_max = torch.maximum(lse_acc, chunk_lse_for_merge)
 
@@ -291,42 +464,62 @@ def run_chunked_attention_triton(q_reshaped, gathered_kv, invalid_mask,
         exp_acc = torch.where(torch.isnan(exp_acc), torch.zeros_like(exp_acc), exp_acc)
 
         exp_chunk = torch.exp(chunk_lse_for_merge - lse_max)
-        exp_chunk = torch.where(torch.isnan(exp_chunk) | is_chunk_lonely,
-                                torch.zeros_like(exp_chunk), exp_chunk)
+        exp_chunk = torch.where(
+            torch.isnan(exp_chunk) | is_chunk_lonely,
+            torch.zeros_like(exp_chunk),
+            exp_chunk,
+        )
 
         sum_exp = exp_acc + exp_chunk
-        lse_new = lse_max + torch.log(torch.where(sum_exp == 0, torch.ones_like(sum_exp), sum_exp))
+        lse_new = lse_max + torch.log(
+            torch.where(sum_exp == 0, torch.ones_like(sum_exp), sum_exp)
+        )
 
-        both_empty = (lse_acc == float('-inf')) & (chunk_lse_for_merge == float('-inf'))
-        lse_new = torch.where(both_empty, torch.full_like(lse_new, float('-inf')), lse_new)
+        both_empty = (lse_acc == float("-inf")) & (chunk_lse_for_merge == float("-inf"))
+        lse_new = torch.where(
+            both_empty, torch.full_like(lse_new, float("-inf")), lse_new
+        )
 
         weight_acc = torch.exp(lse_acc - lse_new)
-        weight_acc = torch.where(torch.isnan(weight_acc) | torch.isinf(weight_acc),
-                                 torch.zeros_like(weight_acc), weight_acc)
+        weight_acc = torch.where(
+            torch.isnan(weight_acc) | torch.isinf(weight_acc),
+            torch.zeros_like(weight_acc),
+            weight_acc,
+        )
 
         weight_chunk = torch.exp(chunk_lse_for_merge - lse_new)
-        weight_chunk = torch.where(torch.isnan(weight_chunk) | torch.isinf(weight_chunk) | is_chunk_lonely,
-                                   torch.zeros_like(weight_chunk), weight_chunk)
+        weight_chunk = torch.where(
+            torch.isnan(weight_chunk) | torch.isinf(weight_chunk) | is_chunk_lonely,
+            torch.zeros_like(weight_chunk),
+            weight_chunk,
+        )
 
-        acc = weight_acc.unsqueeze(-1) * acc + weight_chunk.unsqueeze(-1) * chunk_output.float()
+        acc = (
+            weight_acc.unsqueeze(-1) * acc
+            + weight_chunk.unsqueeze(-1) * chunk_output.float()
+        )
 
         lse_acc = lse_new
 
     output = acc
     lse = lse_acc
 
-    is_lonely_final = (lse == float('-inf'))
+    is_lonely_final = lse == float("-inf")
 
-    lse = torch.where(is_lonely_final, torch.full_like(lse, float('+inf')), lse)
+    lse = torch.where(is_lonely_final, torch.full_like(lse, float("+inf")), lse)
 
     if attn_sink is not None:
         attn_sink_expanded = attn_sink.view(1, h_q)
         exp_diff = torch.exp(attn_sink_expanded - lse)
-        exp_diff = torch.where(is_lonely_final, torch.full_like(exp_diff, float('inf')), exp_diff)
+        exp_diff = torch.where(
+            is_lonely_final, torch.full_like(exp_diff, float("inf")), exp_diff
+        )
         scale = 1.0 / (1.0 + exp_diff)
         output = output * scale.unsqueeze(-1)
 
-    output = torch.where(is_lonely_final.unsqueeze(-1), torch.zeros_like(output), output)
+    output = torch.where(
+        is_lonely_final.unsqueeze(-1), torch.zeros_like(output), output
+    )
 
     return output.to(torch.bfloat16), lse
 
@@ -335,9 +528,16 @@ def run_chunked_attention_triton(q_reshaped, gathered_kv, invalid_mask,
 # Helper class and functions for token-range based chunking
 # ============================================================================
 
+
 class SlicedKVScope:
     """A sliced view of KV scope for a specific token range."""
-    __slots__ = ['blocked_k', 'blocked_k_quantized', 'indices_in_kvcache', 'topk_length']
+
+    __slots__ = [
+        "blocked_k",
+        "blocked_k_quantized",
+        "indices_in_kvcache",
+        "topk_length",
+    ]
 
     def __init__(self, blocked_k, blocked_k_quantized, indices_in_kvcache, topk_length):
         self.blocked_k = blocked_k
@@ -351,7 +551,9 @@ def slice_kv_scope_for_tokens(orig_scope, start_t: int, end_t: int, s_q: int):
     if orig_scope is None:
         return None
 
-    orig_indices = orig_scope.indices_in_kvcache.reshape(-1, orig_scope.indices_in_kvcache.size(-1))
+    orig_indices = orig_scope.indices_in_kvcache.reshape(
+        -1, orig_scope.indices_in_kvcache.size(-1)
+    )
     sliced_indices = orig_indices[start_t:end_t]
 
     sliced_topk_length = None
@@ -363,7 +565,9 @@ def slice_kv_scope_for_tokens(orig_scope, start_t: int, end_t: int, s_q: int):
             chunk_tokens = end_t - start_t
             expanded = batch_topk_length.unsqueeze(1).expand(-1, s_q).reshape(-1)
             offset_in_first_batch = start_t % s_q
-            sliced_topk_length = expanded[offset_in_first_batch:offset_in_first_batch + chunk_tokens]
+            sliced_topk_length = expanded[
+                offset_in_first_batch : offset_in_first_batch + chunk_tokens
+            ]
         else:
             sliced_topk_length = batch_topk_length
 
@@ -371,12 +575,16 @@ def slice_kv_scope_for_tokens(orig_scope, start_t: int, end_t: int, s_q: int):
         blocked_k=orig_scope.blocked_k,
         blocked_k_quantized=orig_scope.blocked_k_quantized,
         indices_in_kvcache=sliced_indices,
-        topk_length=sliced_topk_length
+        topk_length=sliced_topk_length,
     )
 
 
-def compute_token_ranges(total_tokens: int, total_topk: int, d_qk: int,
-                         max_buffer_bytes: int = 2 * 1024 * 1024 * 1024) -> List[Tuple[int, int]]:
+def compute_token_ranges(
+    total_tokens: int,
+    total_topk: int,
+    d_qk: int,
+    max_buffer_bytes: int = 2 * 1024 * 1024 * 1024,
+) -> List[Tuple[int, int]]:
     """Compute token ranges for processing, chunking if buffer would exceed limit."""
     buffer_size_bytes = total_tokens * total_topk * d_qk * 2
 
@@ -396,18 +604,35 @@ def compute_token_ranges(total_tokens: int, total_topk: int, d_qk: int,
     return token_ranges
 
 
-
-
 # ============================================================================
 # Split-K Attention for Large TopK
 # ============================================================================
-def run_splitk_unified_attention(q_reshaped, gathered_kv, invalid_mask,
-                                  d_v, sm_scale, total_tokens, h_q, total_topk, d_qk,
-                                  attn_sink=None, split_k=4):
+def run_splitk_unified_attention(
+    q_reshaped,
+    gathered_kv,
+    invalid_mask,
+    d_v,
+    sm_scale,
+    total_tokens,
+    h_q,
+    total_topk,
+    d_qk,
+    attn_sink=None,
+    split_k=4,
+):
     """Run split-K attention for large topk cases."""
     from .triton_mla_kernels_decode_splitk import run_splitk_attention
+
     return run_splitk_attention(
-        q_reshaped, gathered_kv, invalid_mask,
-        d_v, sm_scale, total_tokens, h_q, total_topk, d_qk,
-        attn_sink=attn_sink, split_k=split_k
+        q_reshaped,
+        gathered_kv,
+        invalid_mask,
+        d_v,
+        sm_scale,
+        total_tokens,
+        h_q,
+        total_topk,
+        d_qk,
+        attn_sink=attn_sink,
+        split_k=split_k,
     )
