@@ -10,7 +10,7 @@ import triton
 from sglang.jit_kernel.benchmark.bench_activation import register_cuda_ci
 from sglang.jit_kernel.dsv4 import compress_forward
 
-from .common import (
+from sglang.jit_kernel.tests.deepseek_v4.common import (
     LegacyContext,
     PagedContext,
     make_legacy_context,
