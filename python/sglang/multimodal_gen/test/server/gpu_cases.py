@@ -586,6 +586,7 @@ TWO_GPU_CASES = [
             cfg_parallel=True,
             extras=[
                 "--pipeline-class-name LTX2TwoStagePipeline",
+                "--ltx2-two-stage-device-mode resident",
                 "--component-attention-backends transformer=fa",
             ],
         ),

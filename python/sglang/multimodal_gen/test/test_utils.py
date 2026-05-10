@@ -56,6 +56,7 @@ SGL_TEST_FILES_OFFICIAL_CONSISTENCY_GT_CASES = frozenset(
     {
         "ltx_2.3_one_stage_ti2v",
         "ltx_2.3_two_stage_t2v_2gpus",
+        "ltx_2_3_two_stage_ti2v_2gpus",
     }
 )
 CONSISTENCY_THRESHOLD_JSON_PATH = (
