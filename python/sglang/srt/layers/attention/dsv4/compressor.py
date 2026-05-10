@@ -138,6 +138,9 @@ class CompressorBackendMixin:
                 cache_k=new_compressed_kv,
             )
         else:
+            valid_mask = out_loc >= 0
+            out_loc = out_loc[valid_mask]
+            new_compressed_kv = new_compressed_kv[valid_mask]
             pack = quant_to_nope_fp8_rope_bf16_pack_triton(new_compressed_kv.bfloat16())
             token_to_kv_pool.set_extra_key_buffer(layer_id, out_loc, pack)
 
@@ -156,19 +159,24 @@ class CompressorBackendMixin:
             assert isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool)
 
         new_compressed_kv = compressor(x, forward_batch)
+        core_metadata = self.forward_metadata.core_metadata
+        out_loc = core_metadata.c4_out_loc
         if envs.SGLANG_OPT_USE_FUSED_STORE_CACHE.get():
             token_to_kv_pool.set_index_k_fused(
                 layer_id=layer_id,
-                loc=self.forward_metadata.core_metadata.c4_out_loc,
+                loc=out_loc,
                 cache_k=new_compressed_kv,
             )
         else:
+            valid_mask = out_loc >= 0
+            out_loc = out_loc[valid_mask]
+            new_compressed_kv = new_compressed_kv[valid_mask]
             new_compressed_kv_fp8, new_compressed_kv_scale = act_quant(
                 new_compressed_kv
             )
             token_to_kv_pool.set_index_k_scale_buffer(
                 layer_id=layer_id,
-                loc=self.forward_metadata.core_metadata.c4_out_loc,
+                loc=out_loc,
                 index_k=new_compressed_kv_fp8,
                 index_k_scale=new_compressed_kv_scale,
             )

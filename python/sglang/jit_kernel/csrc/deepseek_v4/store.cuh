@@ -47,6 +47,10 @@ __global__ void fused_store_flashmla_cache(const __grid_constant__ FusedStoreCac
   // prefetch the index
   const auto index = static_cast<const IndicesT*>(indices)[bid];
   // always load the value from input (don't store if invalid)
+  if (static_cast<int32_t>(index) < 0) {
+    PDLTriggerSecondary<kUsePDL>();
+    return;
+  }
   using Float2 = packed_t<Float>;
   const auto elems = static_cast<const Float2*>(input)[tid + bid * 256];
   if (wid != 7) {
@@ -95,6 +99,10 @@ __global__ void fused_store_indexer_cache(const __grid_constant__ FusedStoreCach
   // prefetch the index
   const auto index = static_cast<const IndicesT*>(indices)[global_wid];
   // always load the value from input (don't store if invalid)
+  if (static_cast<int32_t>(index) < 0) {
+    PDLTriggerSecondary<kUsePDL>();
+    return;
+  }
   using Float2 = packed_t<Float>;
   using InStorage = AlignedVector<Float2, 2>;
   using OutStorage = AlignedVector<fp8x2_e4m3_t, 2>;
