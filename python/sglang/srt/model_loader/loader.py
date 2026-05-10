@@ -1500,6 +1500,15 @@ class ShardedStateLoader(BaseModelLoader):
         result: Dict[str, torch.Tensor] = {}
         for group in same_storage_groups.values():
             for k, t in group:
+                if not t.is_contiguous():
+                    # End-pointer dedup assumes a flat view; non-contiguous
+                    # tensors (e.g. produced by
+                    # ``.transpose(...).contiguous().transpose(...)`` in some
+                    # quant ``post_load_weights`` paths) cannot be flattened
+                    # via ``view(-1)``. Include them directly; downstream
+                    # writers call ``.contiguous()`` before save.
+                    result[k] = t
+                    continue
                 a, b = t.data_ptr(), get_end_ptr(t)
                 for k2, t2 in group:
                     if not t2.is_contiguous():
@@ -1802,13 +1811,15 @@ class PreshardedModelLoader(DefaultModelLoader):
         device_config: "DeviceConfig",
         presharded_dir: str,
     ) -> nn.Module:
-        # We need to capture state at the point AFTER ``model.load_weights``
-        # (which for some models like DeepSeek-V2 internally calls
-        # ``post_load_weights`` and installs auxiliary attrs) but BEFORE the
-        # layer-level ``process_weights_after_loading`` reshapes parameter
-        # storage. Reload then restores the captured state and runs only
-        # ``process_weights_after_loading``, mirroring the original load
-        # ordering.
+        # Capture state AFTER both ``model.load_weights`` (which for some
+        # models internally calls ``post_load_weights`` and installs auxiliary
+        # attrs) AND the layer-level ``process_weights_after_loading``
+        # transformation. The dumped state is in the inference-ready
+        # post-process layout, so reload only has to materialize that layout
+        # once instead of paying the pre->post transition. For some quant
+        # paths the pre-process per-rank state exceeds GPU capacity (e.g.
+        # DeepSeek-V4-Pro mxfp4: pre ~283 GB/rank, post ~223 GB/rank), in
+        # which case dumping pre-process would force reload to OOM.
         target_device = torch.device(device_config.device)
         quant_config = _get_quantization_config(model_config, self.load_config)
         with set_default_torch_dtype(model_config.dtype):
@@ -1816,18 +1827,19 @@ class PreshardedModelLoader(DefaultModelLoader):
                 model = _initialize_model(model_config, self.load_config, quant_config)
             model.load_weights(self._get_all_weights(model_config, model))
 
-            # Capture BEFORE process_weights_after_loading so reload can
-            # restore at this same point and run process_weights_after_loading
-            # afterwards, exactly mirroring the original load ordering.
-            state_dict = ShardedStateLoader._filter_subtensors(model.state_dict())
-            extras = self._collect_extra_tensors(model)
-            self._dump_state_to_disk(state_dict, extras, presharded_dir)
-
             for _, module in model.named_modules():
                 quant_method = getattr(module, "quant_method", None)
                 if quant_method is not None:
                     with device_loading_context(module, target_device):
                         quant_method.process_weights_after_loading(module)
+
+            state_dict = ShardedStateLoader._filter_subtensors(model.state_dict())
+            extras = self._collect_extra_tensors(model)
+            self._dump_state_to_disk(state_dict, extras, presharded_dir)
+            del state_dict
+            del extras
+            gc.collect()
+            torch.cuda.empty_cache()
 
         self.counter_after_loading_weights = time.perf_counter()
         return model.eval()
@@ -2082,6 +2094,18 @@ class PreshardedModelLoader(DefaultModelLoader):
             with target_device:
                 model = _initialize_model(model_config, self.load_config, quant_config)
 
+            # Bring the freshly-init'd model into the inference-ready
+            # (post-process) layout so its parameter shapes match the dumped
+            # state. ``process_weights_after_loading`` transforms parameter
+            # storage; running it on uninitialized values is fine because the
+            # transformation depends only on shape, and we overwrite the
+            # transformed params with dumped values immediately after.
+            for _, module in model.named_modules():
+                quant_method = getattr(module, "quant_method", None)
+                if quant_method is not None:
+                    with device_loading_context(module, target_device):
+                        quant_method.process_weights_after_loading(module)
+
             rank, _ = self._world_rank_and_size()
             with open(os.path.join(presharded_dir, self.CHECKSUM_FILENAME)) as f:
                 plan = json.load(f)
@@ -2091,11 +2115,8 @@ class PreshardedModelLoader(DefaultModelLoader):
                     f"at {presharded_dir}; expected {self.PLAN_VERSION}."
                 )
 
-            # State was captured BEFORE process_weights_after_loading, so we
-            # restore at that same point and run process_weights_after_loading
-            # afterwards — mirrors the original load ordering and avoids
-            # re-running model-specific post_load_weights that would
-            # double-convert the weights.
+            # State was captured AFTER process_weights_after_loading, so it
+            # matches the model layout we just produced; copy in-place.
             state_dict = ShardedStateLoader._filter_subtensors(model.state_dict())
             reads = plan.get("rank_to_reads", {}).get(str(rank), [])
 
@@ -2104,7 +2125,6 @@ class PreshardedModelLoader(DefaultModelLoader):
                 by_file[r["filename"]].append(r)
 
             loaded_param_keys: set = set()
-            extras_to_install: List[Tuple[str, torch.Tensor]] = []
             for filename, items in by_file.items():
                 full_path = os.path.join(presharded_dir, filename)
                 with safe_open(full_path, framework="pt") as fh:
@@ -2115,60 +2135,78 @@ class PreshardedModelLoader(DefaultModelLoader):
                         if r["stored_key"] not in cached:
                             cached[r["stored_key"]] = fh.get_tensor(r["stored_key"])
 
-                    if self._verify_on_load:
-                        expected: Dict[str, str] = {}
-                        for r in items:
-                            expected[r["stored_key"]] = r["checksum"]
-
-                        def _verify(key: str) -> None:
-                            actual = self._hash_tensor(cached[key])
-                            if actual != expected[key]:
-                                raise ValueError(
-                                    f"Checksum mismatch for stored_key "
-                                    f"'{key}' in {filename}: expected "
-                                    f"{expected[key]}, got {actual}."
-                                )
-
-                        keys = list(cached.keys())
-                        n_workers = min(max(1, len(keys)), self._hash_num_threads)
-                        if n_workers <= 1:
-                            for k in keys:
-                                _verify(k)
-                        else:
-                            with concurrent.futures.ThreadPoolExecutor(
-                                max_workers=n_workers,
-                                thread_name_prefix="presharded-verify",
-                            ) as ex:
-                                for _ in ex.map(_verify, keys):
-                                    pass
-
+                if self._verify_on_load:
+                    expected: Dict[str, str] = {}
                     for r in items:
-                        tensor = cached[r["stored_key"]]
-                        if r.get("is_extra"):
-                            extras_to_install.append(
-                                (r["name"], tensor.to(target_device))
+                        expected[r["stored_key"]] = r["checksum"]
+
+                    def _verify(key: str) -> None:
+                        actual = self._hash_tensor(cached[key])
+                        if actual != expected[key]:
+                            raise ValueError(
+                                f"Checksum mismatch for stored_key "
+                                f"'{key}' in {filename}: expected "
+                                f"{expected[key]}, got {actual}."
                             )
-                            continue
-                        if r["name"] not in state_dict:
-                            raise KeyError(
-                                f"Presharded ckpt has parameter '{r['name']}' "
-                                f"that is not present in the initialized model."
-                            )
-                        param_data = state_dict[r["name"]].data
-                        param_shape = state_dict[r["name"]].shape
-                        for dim, size in enumerate(tensor.shape):
-                            if size < param_shape[dim]:
-                                param_data = param_data.narrow(dim, 0, size)
-                        if tensor.shape != param_shape:
-                            logger.warning(
-                                "loading tensor of shape %s into "
-                                "parameter '%s' of shape %s",
-                                tensor.shape,
-                                r["name"],
-                                param_shape,
-                            )
-                        param_data.copy_(tensor)
-                        loaded_param_keys.add(r["name"])
+
+                    keys = list(cached.keys())
+                    n_workers = min(max(1, len(keys)), self._hash_num_threads)
+                    if n_workers <= 1:
+                        for k in keys:
+                            _verify(k)
+                    else:
+                        with concurrent.futures.ThreadPoolExecutor(
+                            max_workers=n_workers,
+                            thread_name_prefix="presharded-verify",
+                        ) as ex:
+                            for _ in ex.map(_verify, keys):
+                                pass
+
+                for r in items:
+                    tensor = cached[r["stored_key"]]
+                    if r.get("is_extra"):
+                        # Install immediately and drop the existing
+                        # placeholder so the model-init GPU tensor can be
+                        # freed before the next batch of extras allocates.
+                        # Avoids holding old + new simultaneously across the
+                        # whole load.
+                        module_path, _, attr_name = r["name"].rpartition(".")
+                        module = model.get_submodule(module_path) if module_path else model
+                        if hasattr(module, attr_name):
+                            try:
+                                delattr(module, attr_name)
+                            except AttributeError:
+                                pass
+                        setattr(module, attr_name, tensor.to(target_device))
+                        continue
+                    if r["name"] not in state_dict:
+                        raise KeyError(
+                            f"Presharded ckpt has parameter '{r['name']}' "
+                            f"that is not present in the initialized model."
+                        )
+                    param_data = state_dict[r["name"]].data
+                    param_shape = state_dict[r["name"]].shape
+                    for dim, size in enumerate(tensor.shape):
+                        if size < param_shape[dim]:
+                            param_data = param_data.narrow(dim, 0, size)
+                    if tensor.shape != param_shape:
+                        logger.warning(
+                            "loading tensor of shape %s into "
+                            "parameter '%s' of shape %s",
+                            tensor.shape,
+                            r["name"],
+                            param_shape,
+                        )
+                    param_data.copy_(tensor)
+                    loaded_param_keys.add(r["name"])
+                # Drop per-file references and drain in-flight copies before
+                # advancing to the next file; otherwise CUDA-stream pinned
+                # buffers and dropped placeholder tensors accumulate.
+                cached.clear()
+                del cached
+                torch.cuda.synchronize()
+                gc.collect()
+                torch.cuda.empty_cache()
 
             missing = set(state_dict.keys()) - loaded_param_keys
             if missing:
@@ -2176,17 +2214,6 @@ class PreshardedModelLoader(DefaultModelLoader):
                     f"Missing keys {tuple(sorted(missing))} in presharded "
                     f"checkpoint at {presharded_dir}."
                 )
-
-            for full_name, tensor in extras_to_install:
-                module_path, _, attr_name = full_name.rpartition(".")
-                module = model.get_submodule(module_path) if module_path else model
-                setattr(module, attr_name, tensor)
-
-            for _, module in model.named_modules():
-                quant_method = getattr(module, "quant_method", None)
-                if quant_method is not None:
-                    with device_loading_context(module, target_device):
-                        quant_method.process_weights_after_loading(module)
 
         return model.eval()
 
