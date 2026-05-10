@@ -320,7 +320,15 @@ class DecodePreallocQueue:
         if self.enable_staging:
             self.transfer_queue._init_staging_handler(self.kv_manager)
 
-        if self.scheduler.tp_worker.is_hybrid_swa and not self._uses_swa_tail_prealloc():
+        self._swa_tail_prealloc = (
+            isinstance(
+                self.token_to_kv_pool, (SWAKVPool, DeepSeekV4TokenToKVPool)
+            )
+            and self.token_to_kv_pool_allocator.page_size > 1
+            and hasattr(self.token_to_kv_pool_allocator, "alloc_extend_swa_tail")
+        )
+
+        if self.scheduler.tp_worker.is_hybrid_swa and not self._swa_tail_prealloc:
             # Fallback for SWA allocators that still allocate the SWA pool at
             # full prompt length.
             self.max_total_num_tokens = min(
@@ -329,11 +337,7 @@ class DecodePreallocQueue:
             )
 
     def _uses_swa_tail_prealloc(self) -> bool:
-        return isinstance(
-            self.token_to_kv_pool, (SWAKVPool, DeepSeekV4TokenToKVPool)
-        ) and self.token_to_kv_pool_allocator.page_size > 1 and hasattr(
-            self.token_to_kv_pool_allocator, "alloc_extend_swa_tail"
-        )
+        return self._swa_tail_prealloc
 
     def _swa_tail_len(self, seq_len: int) -> int:
         if not self._uses_swa_tail_prealloc() or seq_len <= 0:
@@ -742,7 +746,7 @@ class DecodePreallocQueue:
                 self._swa_retractable_len(r)
                 for r in self.scheduler.running_batch.reqs
             )
-            allocatable_tokens, swa_allocatable_tokens = (
+            full_allocatable_tokens, swa_allocatable_tokens = (
                 self._swa_aware_allocatable_token_budgets(
                     retractable_tokens=retractable_tokens,
                     retractable_swa_tokens=retractable_swa_tokens,
@@ -751,7 +755,7 @@ class DecodePreallocQueue:
             )
         else:
             retractable_swa_tokens = 0
-            allocatable_tokens = self._allocatable_token_budgets(
+            full_allocatable_tokens = self._allocatable_token_budgets(
                 retractable_tokens=retractable_tokens, count_retracted=True
             )
         # First, remove all failed requests from the queue
@@ -820,7 +824,7 @@ class DecodePreallocQueue:
                 # Matching may lock previously-evictable radix pages, so refresh
                 # the admission budget against the post-lock pool state before we
                 # decide whether this request still fits.
-                allocatable_tokens = self._allocatable_token_budgets(
+                full_allocatable_tokens = self._allocatable_token_budgets(
                     retractable_tokens=retractable_tokens,
                     count_retracted=True,
                     extra_reserved_reqs=len(preallocated_reqs),
@@ -845,12 +849,12 @@ class DecodePreallocQueue:
                     )
                     - retractable_tokens,
                 )
-                > allocatable_tokens
+                > full_allocatable_tokens
             ):
                 if prefix_len > 0:
                     self.tree_cache.dec_lock_ref(decode_req.req.last_node)
                 break
-            if required_tokens_for_request > allocatable_tokens:
+            if required_tokens_for_request > full_allocatable_tokens:
                 if prefix_len > 0:
                     self.tree_cache.dec_lock_ref(decode_req.req.last_node)
                 break
@@ -877,12 +881,14 @@ class DecodePreallocQueue:
             hisparse_req_budget -= 1
             # Recompute from actual pool state for the next queue entry.
             # This accounts for page rounding and newly locked evictable cache.
-            allocatable_tokens = self._allocatable_token_budgets(
+            full_allocatable_tokens = self._allocatable_token_budgets(
                 retractable_tokens=retractable_tokens,
                 count_retracted=True,
                 extra_reserved_reqs=len(preallocated_reqs) + 1,
             )
             if uses_swa_tail_prealloc:
+                # SWA budget uses simple decrement (no radix cache eviction in
+                # the SWA pool, so page-rounding drift is negligible).
                 swa_allocatable_tokens -= swa_required
             decode_req.req.cache_protected_len = prefix_len
 
@@ -1060,6 +1066,8 @@ class DecodePreallocQueue:
             )
         elif self._uses_swa_tail_prealloc():
             available_size = self.token_to_kv_pool_allocator.full_available_size()
+            if self.scheduler.server_args.disaggregation_decode_enable_radix_cache:
+                available_size += self.tree_cache.evictable_size()
         else:
             available_size = self.token_to_kv_pool_allocator.available_size()
             # Include evictable decode-radix cache entries in the budget -- they
@@ -1252,6 +1260,10 @@ class DecodePreallocQueue:
                 else torch.tensor([-1], dtype=torch.int64, device=device)
             )
             if self._uses_swa_tail_prealloc() and prefix_len == 0:
+                # Tail-only SWA allocation: only valid when prefix_len == 0.
+                # When prefix_len > 0 (radix cache hit), we fall back to
+                # alloc_extend which allocates SWA at full page count; the
+                # SWA budget in that case may slightly under-estimate.
                 kv_loc = self.token_to_kv_pool_allocator.alloc_extend_swa_tail(
                     prefix_lens=torch.tensor(
                         [0], dtype=torch.int64, device=device
