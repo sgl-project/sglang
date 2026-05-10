@@ -6904,6 +6904,7 @@ class ServerArgs:
         return self.mamba_scheduler_strategy == "extra_buffer"
 
     def effective_max_speculative_num_draft_tokens(self) -> Optional[int]:
+        """Return the maximum draft-token count runtime speculative decoding may use."""
         if self.speculative_num_draft_tokens is None:
             return None
         if not self.speculative_adaptive:
@@ -6913,10 +6914,13 @@ class ServerArgs:
             resolve_candidate_steps,
         )
 
-        max_draft_tokens = (
-            max(resolve_candidate_steps(self.speculative_adaptive_config)) + 1
+        candidate_steps = resolve_candidate_steps(
+            initial_steps=self.speculative_num_steps,
+            cfg_path=self.speculative_adaptive_config,
         )
-        return max(max_draft_tokens, self.speculative_num_draft_tokens)
+        # TODO: adaptive spec currently requires topk=1, so each runtime state
+        # needs steps + 1 draft-token slots. Revisit this if topk>1 is supported.
+        return max(candidate_steps) + 1
 
     @property
     def mamba_cache_chunk_size(self) -> int:

@@ -16,8 +16,6 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-_DEFAULT_CANDIDATE_STEPS: tuple[int, ...] = (1, 3, 7)
-
 
 def adaptive_unsupported_reason(server_args: ServerArgs) -> str | None:
     """Return why adaptive spec cannot run under the given server args, or None if supported."""
@@ -76,12 +74,11 @@ def load_adaptive_config(path: str | None) -> dict[str, object]:
 
 
 def resolve_candidate_steps(
-    config: dict[str, object] | str | None = None,
-    initial_steps: int | None = None,
+    initial_steps: int, cfg_path: str | None = None
 ) -> list[int]:
     """Return sorted, deduplicated candidate steps; inserts *initial_steps* when missing."""
-    cfg = config if isinstance(config, dict) else load_adaptive_config(config)
-    raw = cfg.get("candidate_steps") or _DEFAULT_CANDIDATE_STEPS
+    cfg = load_adaptive_config(cfg_path)
+    raw = cfg.get("candidate_steps") or (1, 3, 7)
     candidates: set[int] = set(raw)
 
     # Ensure the worker's initial speculative_num_steps is itself a candidate.
@@ -115,11 +112,11 @@ class AdaptiveSpeculativeParams:
     def __init__(
         self,
         initial_steps: int,
-        config: dict[str, object] | None = None,
+        cfg_path: str | None = None,
     ):
-        cfg = config or {}
+        cfg = load_adaptive_config(cfg_path)
         # TODO: Wider range of candidate_steps (once lazy init is supported).
-        self.candidate_steps = resolve_candidate_steps(cfg, initial_steps=initial_steps)
+        self.candidate_steps = resolve_candidate_steps(initial_steps, cfg_path=cfg_path)
         assert (
             len(self.candidate_steps) >= 2
         ), "candidate_steps must have at least 2 distinct values"
