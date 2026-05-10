@@ -21,6 +21,8 @@ if TYPE_CHECKING:
 
 
 CompressMetadata: TypeAlias = Union[CompressorDecodePlan, CompressorPrefillPlan]
+# NOTE: alias for backward compatibility
+FusedCompressMetadata: TypeAlias = CompressMetadata
 
 
 def _use_online_compress(compress_ratio: int) -> bool:
@@ -28,7 +30,7 @@ def _use_online_compress(compress_ratio: int) -> bool:
     return compress_ratio == 128 and envs.SGLANG_OPT_USE_ONLINE_COMPRESS.get()
 
 
-class CompressorBackend:
+class CompressorBackendMixin:
     def __init__(self):
         super().__init__()
         self.forward_metadata: DSV4Metadata

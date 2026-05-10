@@ -22,11 +22,10 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 
 if envs.SGLANG_OPT_USE_COMPRESSOR_V2.get():
+    # NOTE: should eventually be the only compressor backend
     from sglang.srt.layers.attention.dsv4.compressor_v2 import (
-        CompressMetadata as FusedCompressMetadata,
-    )
-    from sglang.srt.layers.attention.dsv4.compressor_v2 import (
-        CompressorBackend as CompressorBackendMixin,
+        CompressorBackendMixin,
+        FusedCompressMetadata,
         create_paged_compressor_data,
     )
 else:

@@ -6,6 +6,7 @@ import pytest
 import torch
 import triton
 
+from sglang.jit_kernel.benchmark.bench_activation import register_cuda_ci
 from sglang.jit_kernel.dsv4 import compress_forward
 
 from .common import (
@@ -16,6 +17,9 @@ from .common import (
     make_state_pool,
     to_seq_extend,
 )
+
+register_cuda_ci(est_time=30, suite="stage-b-kernel-unit-1-gpu-large")
+register_cuda_ci(est_time=30, suite="nightly-kernel-1-gpu", nightly=True)
 
 Context = Union[LegacyContext, PagedContext]
 
