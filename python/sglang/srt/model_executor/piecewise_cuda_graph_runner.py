@@ -782,7 +782,10 @@ class PiecewiseCudaGraphRunner:
             extend_num_tokens=forward_batch.extend_num_tokens,
             extend_input_logprob_token_ids_gpu=forward_batch.extend_input_logprob_token_ids_gpu,
             positions=positions,
+            original_global_num_tokens_cpu=forward_batch.original_global_num_tokens_cpu,
+            global_num_tokens_cpu=forward_batch.global_num_tokens_cpu,
             global_num_tokens_gpu=forward_batch.global_num_tokens_gpu,
+            global_num_tokens_for_logprob_cpu=forward_batch.global_num_tokens_for_logprob_cpu,
             global_num_tokens_for_logprob_gpu=forward_batch.global_num_tokens_for_logprob_gpu,
             dp_padding_mode=forward_batch.dp_padding_mode,
             global_dp_buffer_len=forward_batch.global_dp_buffer_len,
@@ -805,6 +808,12 @@ class PiecewiseCudaGraphRunner:
                 self.capture_return_pooled_hidden_states
                 or forward_batch.return_pooled_hidden_states
             ),
+        )
+
+        setattr(
+            static_forward_batch,
+            "_original_batch_size",
+            getattr(forward_batch, "_original_batch_size", forward_batch.batch_size),
         )
 
         if out_cache_loc_swa is not None:

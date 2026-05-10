@@ -163,6 +163,7 @@ class Mamba2Metadata(ForwardMetadata):
         *,
         is_target_verify: bool,
         draft_token_num: int,
+        num_decodes: Optional[int] = None,
     ) -> "Mamba2Metadata":
         """This path is run during CUDA graph capture, i.e. decode only, so `num_prefills` is 0"""
         return Mamba2Metadata(
@@ -171,7 +172,7 @@ class Mamba2Metadata(ForwardMetadata):
             retrieve_next_token=forward_metadata.retrieve_next_token,
             retrieve_next_sibling=forward_metadata.retrieve_next_sibling,
             retrieve_parent_token=forward_metadata.retrieve_parent_token,
-            num_decodes=len(seq_lens),
+            num_decodes=len(seq_lens) if num_decodes is None else num_decodes,
             num_prefills=0,
             num_prefill_tokens=0,
             is_target_verify=is_target_verify,
@@ -192,19 +193,39 @@ class Mamba2Metadata(ForwardMetadata):
                 if forward_batch.spec_info is not None
                 else 1
             )
+            # DP-attention pads decode batches to satisfy collective alignment.
+            # The padded rows must stay in hidden_states, but they must not be
+            # treated as real Mamba decode requests or update recurrent state.
+            num_decodes = getattr(forward_batch, "_original_batch_size", None)
+            if num_decodes is None:
+                num_decodes = len(forward_batch.seq_lens)
             return cls.prepare_decode(
                 forward_metadata,
                 forward_batch.seq_lens,
                 is_target_verify=forward_batch.forward_mode.is_target_verify(),
                 draft_token_num=draft_token_num,
+                num_decodes=num_decodes,
             )
-        num_prefills = len(forward_batch.extend_seq_lens)
-        num_prefill_tokens = forward_batch.extend_num_tokens
-        num_decodes = len(forward_batch.seq_lens) - num_prefills
+        extend_seq_lens_cpu = forward_batch.extend_seq_lens_cpu
+        if extend_seq_lens_cpu is None:
+            num_prefills = len(forward_batch.extend_seq_lens)
+        else:
+            num_prefills = len(extend_seq_lens_cpu)
+        num_prefill_tokens = int(forward_metadata.query_start_loc[num_prefills].item())
+        batch_size = getattr(
+            forward_batch, "_original_batch_size", len(forward_batch.seq_lens)
+        )
+        num_decodes = batch_size - num_prefills
         context_lens_tensor = forward_batch.extend_prefix_lens
         assert context_lens_tensor is not None
-        # precompute flag to avoid device syncs later
+        # Precompute flag to avoid device syncs later. A non-zero prefix length
+        # only means full-attention KV can be reused. Mamba recurrent state is
+        # reusable only when the scheduler provides a tracked Mamba state slot
+        # for that request; otherwise reprocess the extend chunk from zero state.
         has_initial_states = context_lens_tensor > 0
+        mamba_track_mask = getattr(forward_batch, "mamba_track_mask", None)
+        if mamba_track_mask is not None:
+            has_initial_states = has_initial_states & mamba_track_mask[: has_initial_states.shape[0]]
         prep_initial_states = torch.any(has_initial_states[:num_prefills]).item()
 
         query_start_loc = forward_metadata.query_start_loc[: num_prefills + 1]
@@ -251,6 +272,6 @@ class Mamba2Metadata(ForwardMetadata):
                 seq_idx=seq_idx,
                 chunk_indices=chunk_indices,
                 chunk_offsets=chunk_offsets,
-                extend_seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
+                extend_seq_lens_cpu=extend_seq_lens_cpu,
             ),
         )
