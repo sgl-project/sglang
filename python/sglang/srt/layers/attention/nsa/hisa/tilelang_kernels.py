@@ -578,8 +578,22 @@ def fp8_native_paged_mean_pooling_completed_blocks_grouped(
             prev_complete = prev_len // K
             new_complete = new_len // K
 
+            # Anchor the grid at the paged block holding prev_complete, NOT at
+            # absolute paged block 0. With absolute anchoring, decode (which
+            # passes max_pool_per_req_grid=2 because n_new<=1) would size the
+            # y-grid to 2 CTAs (pg_rel ∈ {0, 1}) — these only ever hit paged
+            # blocks 0 and 1, silently skipping every decode whose prev_complete
+            # lives past paged block 1. Anchoring at prev_complete // G makes
+            # by=0 always land on the paged block currently being filled.
+            #
+            # Mirrors the relative indexing the vanilla K>=paged kernel
+            # (fp8_native_paged_mean_pooling_completed_blocks) already uses:
+            # pblk_abs = prev_complete + pblk_rel.
+            pg_anchor = prev_complete // G
+            pg_abs = pg_anchor + pg_rel
+
             # Pool-block range covered by this paged block: [pblk_first, pblk_last_excl).
-            pblk_first = pg_rel * G
+            pblk_first = pg_abs * G
             pblk_last_excl = pblk_first + G
 
             # Intersect with [prev_complete, new_complete) to find the subset
@@ -591,7 +605,17 @@ def fp8_native_paged_mean_pooling_completed_blocks_grouped(
                 req_idx = T.cast(ReqPoolIndices[b], index_dtype)
                 # All G pool blocks live in the same paged block — look up
                 # phys_page from the first token of this paged block.
-                logical_start_token = pg_rel * paged_block_size
+                # The gate `new_lo < new_hi` mathematically guarantees
+                # logical_start_token < new_len <= max_ctx, but if tilelang
+                # speculatively executes the load before the branch, an
+                # excluded pg_rel could index ReqToToken at pg_abs *
+                # paged_block_size which may be == max_ctx (out of bounds).
+                # Clamp explicitly to (new_len - 1) — for valid pg_rel this
+                # is a no-op (logical_start_token < new_len already), and for
+                # excluded pg_rel it gives a safe in-bounds load whose result
+                # is discarded anyway.
+                logical_start_token_raw = pg_abs * paged_block_size
+                logical_start_token = T.min(logical_start_token_raw, new_len - 1)
                 buf_pos = ReqToToken[req_idx, logical_start_token]
                 phys_page = buf_pos // paged_block_size
 
