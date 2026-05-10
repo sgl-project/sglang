@@ -17,7 +17,7 @@ In SGLang, the omni runtime uses an orchestrator layer to coordinate specialized
 The HTTP surface is split by task:
 
 - Use ordinary `/generate` or OpenAI-compatible `/v1/chat/completions` for VLM-style understanding when the model only needs to answer with text.
-- Use `/v1/omni/generate` for media generation, image editing, and interleaved responses.
+- Use `/v1/omni/generate` for media generation, image editing, and interleaved responses. This is SGLang's native segment API, not an OpenAI Chat Completions-compatible response shape.
 - Use `/v1/omni/sessions/{session_id}/close` to release a persistent omni session after multi-turn work.
 
 An interleaved response is an ordered sequence of output segments, for example text, image, then more text. With `keep_session: true`, the server returns a `session.id`; later requests can pass that `session_id` so the model can refer to previous turns and generated images.
@@ -69,9 +69,9 @@ The request body is segment-based. `messages` contains ordered multimodal input 
     {"type": "text", "text": "Generate one image, then describe it."}
   ],
   "sampling_params": {
-    "width": 512,
-    "height": 512,
-    "num_steps": 20
+    "width": 1024,
+    "height": 1024,
+    "num_steps": 50
   },
   "max_images": 1,
   "max_text_segments": 2

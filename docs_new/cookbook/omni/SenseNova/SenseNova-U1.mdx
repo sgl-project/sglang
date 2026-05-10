@@ -60,6 +60,8 @@ Use the omni HTTP API when U1 needs to generate or edit media:
 - `POST /v1/omni/generate`
 - `POST /v1/omni/sessions/{session_id}/close`
 
+`/v1/omni/generate` is a native SGLang segment API rather than an OpenAI Chat Completions-compatible response shape. OpenAI Chat-style paths remain text-output paths; image generation and interleaved text/image output should use the omni endpoint.
+
 An interleaved request can produce multiple ordered output segments, such as text, image, then text. A multi-turn interleaved conversation keeps the same omni session alive with `keep_session: true`; the next turn passes `session_id`, so the model can refer to previous text and generated images.
 
 Supported U1 tasks:
@@ -164,8 +166,8 @@ turn1 = {
         }
     ],
     "sampling_params": {
-        "width": 512,
-        "height": 512,
+        "width": 1024,
+        "height": 1024,
         "num_steps": 50,
         "seed": 223,
         "cfg_text_scale": 4.0,
@@ -195,8 +197,8 @@ turn2 = {
         }
     ],
     "sampling_params": {
-        "width": 512,
-        "height": 512,
+        "width": 1024,
+        "height": 1024,
         "num_steps": 50,
         "seed": 224,
         "cfg_text_scale": 4.0,
@@ -229,8 +231,8 @@ Common U1 image sampling parameters:
 
 | Parameter | Default | Notes |
 | --- | --- | --- |
-| `width` | `1024` | Image width |
-| `height` | `1024` | Image height |
+| `width` | `1024` | Image width; must be divisible by 32 |
+| `height` | `1024` | Image height; must be divisible by 32 |
 | `num_inference_steps` | `50` | Also accepts `num_steps` or `steps` |
 | `cfg_text_scale` | `1.0` | Also accepts `guidance_scale` or `text_cfg_scale` |
 | `cfg_img_scale` | `1.0` | Also accepts `img_cfg_scale` or `image_cfg_scale` |
@@ -255,4 +257,4 @@ Omni control fields:
 - Standard `/generate` and `/v1/chat/completions` are intended for one-image VLM understanding and text output.
 - Image generation, editing, and interleaved text/image output should use `/v1/omni/generate`.
 - Close persistent sessions after use so the server can release the session KV cache.
-- For quick smoke tests, use smaller image sizes and fewer steps; use the model defaults or higher values for quality checks.
+- For quick smoke tests, use smaller multiples of 32 and fewer steps; use `1024x1024` or other validated model resolutions for quality checks.

@@ -50,6 +50,9 @@ Open:
 http://127.0.0.1:7860
 ```
 
+The UI defaults to `1024x1024`, matching U1's image sampling defaults. Custom
+width and height values should be multiples of 32.
+
 ## Multi-Turn Flow
 
 Use the `Message` composer for normal multi-turn refinement. Keep `Keep omni
