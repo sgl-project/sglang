@@ -1500,8 +1500,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         # Register model for layerwise NVTX profiling if enabled
         if self.server_args.enable_layerwise_nvtx_marker:
-            self.pyt_hooks = PytHooks()
-            self.pyt_hooks.register_hooks(self.model, module_prefix="model")
+            pyt_hooks = PytHooks()
+            pyt_hooks.register_hooks(self.model, module_prefix="model")
 
         if self.server_args.kv_cache_dtype == "fp8_e4m3":
             if self.server_args.quantization_param_path is not None:
@@ -2080,8 +2080,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             )
 
         # We need to get device after patch otherwise the device would be wrong
-        self.device_module = torch.get_device_module(self.device)
-        infered_device = self.device_module.current_device()
+        device_module = torch.get_device_module(self.device)
+        infered_device = device_module.current_device()
 
         named_tensors = [
             (name, _unwrap_tensor(tensor, tp_rank=self.tp_rank, device=infered_device))
