@@ -1489,6 +1489,31 @@ class ServingChatTestCase(unittest.TestCase):
         chat._apply_server_thinking_default(req)
         self.assertEqual(req.chat_template_kwargs, {"enable_thinking": True})
 
+    def test_thinking_default_skipped_when_reasoning_effort_none(self):
+        # reasoning_effort="none" is an explicit opt-out; server default
+        # must not flip the toggle back on.
+        chat = self._make_chat_with_thinking_default("qwen3", True)
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi?"}],
+            reasoning_effort="none",
+        )
+        chat._apply_server_thinking_default(req)
+        self.assertFalse(req.chat_template_kwargs.get("enable_thinking"))
+
+    def test_thinking_default_uses_template_manager_for_auto_parser(self):
+        # --reasoning-parser=auto leaves _reasoning_detector unset; toggle
+        # key must come from TemplateManager.reasoning_config instead.
+        self.template_manager.reasoning_config = ReasoningToggleConfig(
+            toggle_param="enable_thinking", default_enabled=True
+        )
+        chat = self._make_chat_with_thinking_default(None, False)
+        req = ChatCompletionRequest(
+            model="x", messages=[{"role": "user", "content": "Hi?"}]
+        )
+        chat._apply_server_thinking_default(req)
+        self.assertEqual(req.chat_template_kwargs, {"enable_thinking": False})
+
     def test_thinking_default_noop_cases(self):
         # Each early-return guard in _apply_server_thinking_default:
         # flag unset, no reasoning parser, parser without binary toggle.

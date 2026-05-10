@@ -366,6 +366,12 @@ class OpenAIServingChat(OpenAIServingBase):
         return None
 
     def _server_thinking_toggle_key(self) -> Optional[str]:
+        # template_manager.reasoning_config is set when --reasoning-parser=auto
+        # picks the parser at template-load time; prefer it over the
+        # parser-level fallback.
+        config = getattr(self.template_manager, "reasoning_config", None)
+        if config is not None:
+            return getattr(config, "toggle_param", None)
         if self._reasoning_detector is None:
             return None
         mode = getattr(self._reasoning_detector, "reasoning_default", None)
@@ -377,6 +383,8 @@ class OpenAIServingChat(OpenAIServingBase):
 
     def _apply_server_thinking_default(self, request: ChatCompletionRequest) -> None:
         if self.enable_thinking is None:
+            return
+        if request.reasoning_effort == "none":
             return
         key = self._server_thinking_toggle_key()
         if key is None:
