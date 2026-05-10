@@ -526,13 +526,19 @@ class EagleDraftWorker(BaseDraftWorker):
         """
         # Construct input_ids
         if not batch.forward_mode.is_idle():
-            pt = 0
-            for i, extend_len in enumerate(batch.extend_seq_lens):
-                input_ids = batch.input_ids[pt : pt + extend_len]
-                batch.input_ids[pt : pt + extend_len] = torch.cat(
-                    (input_ids[1:], next_token_ids[i].reshape(1))
-                )
-                pt += extend_len
+            if batch.extend_seq_lens is not None:
+                # Real prefill case.
+                pt = 0
+                for i, extend_len in enumerate(batch.extend_seq_lens):
+                    input_ids = batch.input_ids[pt : pt + extend_len]
+                    batch.input_ids[pt : pt + extend_len] = torch.cat(
+                        (input_ids[1:], next_token_ids[i].reshape(1))
+                    )
+                    pt += extend_len
+            else:
+                # Divert path: this rank is locally DECODE/IDLE but got dragged
+                # into target_prefill by is_extend_in_batch=True.
+                batch.input_ids = next_token_ids.to(batch.input_ids.dtype)
 
         # Construct spec_info
         next_draft_input = EagleDraftInput(
@@ -741,8 +747,32 @@ class EAGLEWorkerV2(BaseSpecWorker):
         ):
             # Target prefill
             model_worker_batch.capture_hidden_mode = CaptureHiddenMode.FULL
+
+            # Divert path: when this rank is locally DECODE but a peer
+            # DP rank is prefilling, we need to fill input_ids and out_cache_loc.
+            if (
+                not model_worker_batch.forward_mode.is_extend()
+                and isinstance(model_worker_batch.spec_info, EagleDraftInput)
+                and model_worker_batch.spec_info.verified_id is not None
+                and model_worker_batch.spec_info.verified_id.shape
+                == model_worker_batch.seq_lens.shape
+            ):
+                model_worker_batch.input_ids = (
+                    model_worker_batch.spec_info.verified_id.to(torch.int64)
+                )
+                model_worker_batch.out_cache_loc = self.req_to_token_pool.req_to_token[
+                    model_worker_batch.req_pool_indices,
+                    model_worker_batch.seq_lens - 1,
+                ].to(torch.int64)
+
             batch_output = self.target_worker.forward_batch_generation(
                 model_worker_batch
+            )
+
+            # Decode diverted into prefill path.
+            diverted_no_local_extend = (
+                not model_worker_batch.forward_mode.is_extend()
+                and getattr(batch_output, "accept_lens", None) is None
             )
 
             # Draft prefill
@@ -758,6 +788,38 @@ class EAGLEWorkerV2(BaseSpecWorker):
                         batch_output.logits_output.mm_input_embeds,
                     )
                 )
+
+                # for Decode diverted into prefill path, need to pad
+                # batch_output.next_token_ids with same num_draft_tokens length,
+                # synthesize accept_lens, and reshape logprob fields.
+                if diverted_no_local_extend:
+                    bs = len(model_worker_batch.seq_lens)
+                    stride = self.speculative_num_draft_tokens
+                    batch_output.accept_lens = torch.ones(
+                        bs, dtype=torch.int32, device="cpu"
+                    )
+                    next_token_ids = batch_output.next_token_ids
+                    if next_token_ids.shape[0] != bs * stride:
+                        padded = torch.zeros(
+                            bs * stride,
+                            dtype=next_token_ids.dtype,
+                            device=next_token_ids.device,
+                        )
+                        padded[::stride] = next_token_ids
+                        batch_output.next_token_ids = padded
+
+                    # process_batch_result_decode expects logprobs
+                    # to be 2D tensor which aligned with spec decode path.
+                    logits = batch_output.logits_output
+                    if (
+                        logits is not None
+                        and logits.next_token_logprobs is not None
+                        and logits.next_token_logprobs.dim() == 1
+                    ):
+                        logits.next_token_logprobs = (
+                            logits.next_token_logprobs.unsqueeze(1)
+                        )
+
                 return batch_output
         else:
             if model_worker_batch.spec_info is None:
