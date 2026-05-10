@@ -21,6 +21,7 @@ from dataclasses import dataclass
 import mlx.core as mx
 import psutil
 from mlx_lm import load as mlx_lm_load
+from mlx_lm.utils import quantize_model as mlx_lm_quantize_model
 
 from sglang.srt.hardware_backend.mlx.kv_cache import (
     BatchedDecodeContext,
@@ -211,23 +212,22 @@ class MlxModelRunner:
 
         if self._quantization in _MLX_QUANTIZATION_PRESETS:
             bits, group_size = _MLX_QUANTIZATION_PRESETS[self._quantization]
-            # Skip if the model was already loaded quantized (pre-quantized HF repo).
-            already_quantized = "quantization" in (config or {})
-            if already_quantized:
+            # Skip if the model was already loaded quantized (pre-quantized HF repo);
+            # mlx_lm.load detects the config and instantiates QuantizedLinear directly,
+            # so applying the preset on top would be redundant.
+            if "quantization" in (config or {}):
                 logger.info(
                     "MLX model is already quantized by the HF repo; "
                     f"ignoring --quantization={self._quantization}"
                 )
             else:
-                from mlx_lm.utils import quantize_model as _mlx_quantize_model
-
                 mem_before = mx.get_active_memory()
                 q_start = time.time()
                 logger.info(
                     f"Quantizing MLX model on-the-fly: bits={bits} "
                     f"group_size={group_size} (preset={self._quantization})"
                 )
-                self.model, _new_config = _mlx_quantize_model(
+                self.model, _new_config = mlx_lm_quantize_model(
                     self.model,
                     config or {},
                     group_size=group_size,
