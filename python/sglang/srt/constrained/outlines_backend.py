@@ -29,6 +29,7 @@ from sglang.srt.constrained.base_grammar_backend import (
     InvalidGrammarObject,
 )
 from sglang.srt.constrained.outlines_jump_forward import OutlinesJumpForwardMap
+from sglang.srt.constrained.utils import is_dense_bool_mask_allowed_token
 
 try:
     from outlines.fsm.json_schema import build_regex_from_schema
@@ -89,11 +90,7 @@ class OutlinesGrammar(BaseGrammarObject):
         token_id: int,
         vocab_size: Optional[int] = None,
     ) -> bool:
-        if vocab_size is not None and token_id >= vocab_size:
-            return False
-        if token_id >= vocab_mask.shape[-1]:
-            return False
-        return not bool(vocab_mask[token_id].item())
+        return is_dense_bool_mask_allowed_token(vocab_mask, token_id, vocab_size)
 
     @staticmethod
     def apply_vocab_mask(logits: torch.Tensor, vocab_mask: torch.Tensor):

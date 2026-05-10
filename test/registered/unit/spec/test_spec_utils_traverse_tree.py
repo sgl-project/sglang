@@ -11,6 +11,7 @@ from unittest.mock import MagicMock
 
 import torch
 
+from sglang.srt.constrained.utils import is_packed_bitmask_allowed_token
 from sglang.srt.speculative.spec_utils import traverse_tree
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -143,14 +144,7 @@ class TestTraverseTreePassesIntsToGrammar(unittest.TestCase):
                     f"{token_id!r}"
                 )
             allowed_calls.append((token_id, vocab_size))
-            if vocab_size is not None and token_id >= vocab_size:
-                return False
-
-            packed_idx = token_id // 32
-            if packed_idx >= vocab_mask.shape[-1]:
-                return False
-            packed_value = int(vocab_mask[packed_idx].item())
-            return (packed_value & (1 << (token_id % 32))) != 0
+            return is_packed_bitmask_allowed_token(vocab_mask, token_id, vocab_size)
 
         grammar.accept_token.side_effect = record_accept
         grammar.fill_vocab_mask.side_effect = record_fill
