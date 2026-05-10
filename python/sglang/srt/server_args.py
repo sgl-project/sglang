@@ -2280,6 +2280,16 @@ class ServerArgs:
                     sm100_default_attention_backend=sm100_default_attn_backend,
                 )
 
+        elif model_arch == "MiniCPMV4_6ForConditionalGeneration":
+            # 4.6 wraps a Qwen3.5 hybrid GDN backbone, so it needs the same
+            # mamba radix cache handling as Qwen3_5ForConditionalGeneration.
+            self._handle_mamba_radix_cache(
+                model_arch=model_arch,
+                support_mamba_cache=True,
+                support_mamba_cache_extra_buffer=True,
+                sm100_default_attention_backend="triton",
+            )
+
         elif model_arch in ["Glm4MoeForCausalLM"]:
             if is_sm100_supported():
                 quantization_config = getattr(hf_config, "quantization_config", None)
