@@ -30,6 +30,8 @@ from sglang.srt.disaggregation.common.staging_handler import (
 from sglang.srt.disaggregation.common.utils import (
     FastQueue,
     group_concurrent_contiguous,
+    pack_int_lists,
+    unpack_int_lists,
 )
 from sglang.srt.disaggregation.mooncake.utils import (
     check_mooncake_custom_mem_pool_enabled,
@@ -54,41 +56,6 @@ class KVTransferError(Exception):
 
     def __str__(self):
         return f"KVTransferError(bootstrap_room={self.bootstrap_room}): {self.failure_reason}"
-
-
-# Wire format for parallel-list-of-lists: uint32 count, uint32 length prefixes,
-# concatenated bytes. Element width follows the struct fmt char passed in.
-def _pack_list_of_buffers(buffers: List[bytes]) -> bytes:
-    if not buffers:
-        return b""
-    n = len(buffers)
-    header = struct.pack(f"<{n+1}I", n, *(len(b) for b in buffers))
-    return header + b"".join(buffers)
-
-
-def _unpack_list_of_buffers(buf: bytes) -> List[bytes]:
-    if buf == b"":
-        return []
-    (n,) = struct.unpack("<I", buf[:4])
-    lens = struct.unpack(f"<{n}I", buf[4 : 4 + 4 * n])
-    out = []
-    offset = 4 + 4 * n
-    for length in lens:
-        out.append(buf[offset : offset + length])
-        offset += length
-    return out
-
-
-def _pack_int_lists(lists, fmt: str) -> bytes:
-    return _pack_list_of_buffers([struct.pack(f"<{len(a)}{fmt}", *a) for a in lists])
-
-
-def _unpack_int_lists(buf: bytes, fmt: str) -> List[List[int]]:
-    width = struct.calcsize(fmt)
-    return [
-        list(struct.unpack(f"<{len(b)//width}{fmt}", b))
-        for b in _unpack_list_of_buffers(buf)
-    ]
 
 
 # prefill
@@ -128,7 +95,7 @@ class TransferInfo:
         else:
             dst_kv_indices = np.frombuffer(msg[4], dtype=np.int32)
             dst_aux_index = int(msg[5].decode("ascii"))
-            dst_state_indices = _unpack_int_lists(msg[6], "i")
+            dst_state_indices = unpack_int_lists(msg[6], "i")
             is_dummy = False
         return cls(
             room=int(msg[0].decode("ascii")),
@@ -176,15 +143,15 @@ class KVArgsRegisterInfo:
             mooncake_session_id=msg[3].decode("ascii"),
             dst_kv_ptrs=list(struct.unpack(f"{len(msg[4])//8}Q", msg[4])),
             dst_aux_ptrs=list(struct.unpack(f"{len(msg[5])//8}Q", msg[5])),
-            dst_state_data_ptrs=_unpack_int_lists(msg[6], "Q"),
+            dst_state_data_ptrs=unpack_int_lists(msg[6], "Q"),
             dst_tp_rank=int(msg[7].decode("ascii")),
             dst_attn_tp_size=int(msg[8].decode("ascii")),
             dst_kv_item_len=int(msg[9].decode("ascii")),
             dst_state_item_lens=(
-                _unpack_int_lists(msg[10], "I") if len(msg) > 10 else []
+                unpack_int_lists(msg[10], "I") if len(msg) > 10 else []
             ),
             dst_state_dim_per_tensor=(
-                _unpack_int_lists(msg[11], "I") if len(msg) > 11 else []
+                unpack_int_lists(msg[11], "I") if len(msg) > 11 else []
             ),
             enable_hisparse=(
                 msg[12].decode("ascii") == "1" if len(msg) > 12 else False
@@ -1840,13 +1807,13 @@ class MooncakeKVReceiver(CommonKVReceiver):
             packed_aux_data_ptrs = b"".join(
                 struct.pack("Q", ptr) for ptr in self.kv_mgr.kv_args.aux_data_ptrs
             )
-            packed_state_data_ptrs = _pack_int_lists(
+            packed_state_data_ptrs = pack_int_lists(
                 self.kv_mgr.kv_args.state_data_ptrs, "Q"
             )
-            packed_state_item_lens = _pack_int_lists(
+            packed_state_item_lens = pack_int_lists(
                 self.kv_mgr.kv_args.state_item_lens, "I"
             )
-            packed_state_dim_per_tensor = _pack_int_lists(
+            packed_state_dim_per_tensor = pack_int_lists(
                 getattr(self.kv_mgr.kv_args, "state_dim_per_tensor", []) or [], "I"
             )
             # Note(shangming): No need to add pp rank here since decode pp size should be equal to prefill pp size or 1
@@ -1934,7 +1901,7 @@ class MooncakeKVReceiver(CommonKVReceiver):
                         kv_indices.tobytes() if not is_dummy else b"",
                         str(aux_index).encode("ascii") if not is_dummy else b"",
                         (
-                            _pack_int_lists(state_indices, "i")
+                            pack_int_lists(state_indices, "i")
                             if not is_dummy and state_indices
                             else b""
                         ),

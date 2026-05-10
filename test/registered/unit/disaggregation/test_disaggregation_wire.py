@@ -2,11 +2,11 @@ import unittest
 
 import numpy as np
 
-from sglang.srt.disaggregation.mooncake.conn import (
-    _pack_int_lists,
-    _pack_list_of_buffers,
-    _unpack_int_lists,
-    _unpack_list_of_buffers,
+from sglang.srt.disaggregation.common.utils import (
+    pack_int_lists,
+    pack_list_of_buffers,
+    unpack_int_lists,
+    unpack_list_of_buffers,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -21,28 +21,28 @@ class TestDisaggregationWire(unittest.TestCase):
             ("i", [[-1, 2], [3, -4, 5]]),
         ]
         for fmt, sample in cases:
-            packed = _pack_int_lists(sample, fmt)
-            self.assertEqual(_unpack_int_lists(packed, fmt), sample, msg=fmt)
+            packed = pack_int_lists(sample, fmt)
+            self.assertEqual(unpack_int_lists(packed, fmt), sample, msg=fmt)
 
     def test_pack_accepts_ndarray(self):
         arrs = [
             np.array([1, 2, 3], dtype=np.int32),
             np.array([4, 5], dtype=np.int32),
         ]
-        packed = _pack_int_lists(arrs, "i")
-        self.assertEqual(_unpack_int_lists(packed, "i"), [[1, 2, 3], [4, 5]])
+        packed = pack_int_lists(arrs, "i")
+        self.assertEqual(unpack_int_lists(packed, "i"), [[1, 2, 3], [4, 5]])
 
     def test_empty_outer_list(self):
-        self.assertEqual(_pack_int_lists([], "Q"), b"")
-        self.assertEqual(_unpack_int_lists(b"", "Q"), [])
+        self.assertEqual(pack_int_lists([], "Q"), b"")
+        self.assertEqual(unpack_int_lists(b"", "Q"), [])
 
     def test_empty_inner_list(self):
-        packed = _pack_int_lists([[]], "I")
-        self.assertEqual(_unpack_int_lists(packed, "I"), [[]])
+        packed = pack_int_lists([[]], "I")
+        self.assertEqual(unpack_int_lists(packed, "I"), [[]])
 
     def test_list_of_buffers_roundtrip(self):
         bufs = [b"abc", b"", b"de", b"x" * 17]
-        self.assertEqual(_unpack_list_of_buffers(_pack_list_of_buffers(bufs)), bufs)
+        self.assertEqual(unpack_list_of_buffers(pack_list_of_buffers(bufs)), bufs)
 
 
 if __name__ == "__main__":
