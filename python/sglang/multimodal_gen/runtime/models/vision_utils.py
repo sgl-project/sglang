@@ -5,6 +5,7 @@
 import os
 import tempfile
 from collections.abc import Callable
+from io import BytesIO
 from urllib.parse import unquote, urlparse
 
 import imageio
@@ -14,6 +15,8 @@ import PIL.ImageOps
 import requests
 import torch
 from packaging import version
+
+from sglang.srt.utils.common import get_image_bytes as srt_get_image_bytes
 
 if version.parse(version.parse(PIL.__version__).base_version) >= version.parse("9.1.0"):
     PIL_INTERPOLATION = {
@@ -89,7 +92,7 @@ def normalize(images: np.ndarray | torch.Tensor) -> np.ndarray | torch.Tensor:
 
 # adapted from diffusers.utils import load_image
 def load_image(
-    image: str | PIL.Image.Image,
+    image: str | bytes | PIL.Image.Image,
     convert_method: Callable[[PIL.Image.Image], PIL.Image.Image] | None = None,
 ) -> PIL.Image.Image:
     """
@@ -102,20 +105,17 @@ def load_image(
             A conversion method to apply to the image after loading it. When set to `None` the image will be converted
             "RGB".
     """
-    if isinstance(image, str):
-        if image.startswith("http://") or image.startswith("https://"):
-            image = PIL.Image.open(requests.get(image, stream=True).raw)
-        elif os.path.isfile(image):
+    if isinstance(image, (str, bytes)):
+        if isinstance(image, str) and os.path.isfile(image):
             image = PIL.Image.open(image)
         else:
-            raise ValueError(
-                f"Incorrect path or URL. URLs must start with `http://` or `https://`, and {image} is not a valid path."
-            )
+            # in-memory loading path
+            image = PIL.Image.open(BytesIO(srt_get_image_bytes(image)))
     elif isinstance(image, PIL.Image.Image):
         image = image
     else:
         raise ValueError(
-            "Incorrect format used for the image. Should be a URL linking to an image, a local path, or a PIL image."
+            "Incorrect format used for the image. Should be bytes, a URL, a local path, base64/data URL, or a PIL image."
         )
 
     image = PIL.ImageOps.exif_transpose(image)

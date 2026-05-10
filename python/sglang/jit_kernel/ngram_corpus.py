@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterable, Sequence
-from typing import List, Tuple
+from typing import Dict, List, Tuple
 
 import numpy as np
 import torch
@@ -74,23 +74,6 @@ def get_ngram_corpus_cls():
             tokens_flat, offsets = _to_csr(batch_tokens)
             self.async_insert(tokens_flat, offsets)  # type: ignore
 
-        def match(
-            self,
-            batch_tokens: List[List[int]],
-        ) -> Tuple[np.ndarray, np.ndarray]:
-            tokens_flat, offsets = _to_csr(batch_tokens)
-            batch_size = len(batch_tokens)
-            d = self._draft_token_num
-
-            out_tokens = torch.zeros(batch_size * d, dtype=torch.int32)
-            out_mask = torch.zeros(batch_size * d * d, dtype=torch.uint8)
-
-            self.batch_match(tokens_flat, offsets, out_tokens, out_mask)  # type: ignore
-
-            return out_tokens.numpy().astype(np.int64), out_mask.numpy().astype(
-                np.int64
-            )
-
         def match_stateful(
             self,
             state_ids: List[int],
@@ -119,7 +102,7 @@ def get_ngram_corpus_cls():
             self.erase_match_state(state_ids_t)  # type: ignore
 
         def load_external_corpus_named(
-            self, corpus_id: str, chunks: Iterable[Sequence[int]]
+            self, corpus_id: str, chunks: Iterable[Sequence[int]], max_tokens: int
         ) -> Tuple[int, int]:
             self.start_external_corpus_load()  # type: ignore
             chunk_count = 0
@@ -127,22 +110,31 @@ def get_ngram_corpus_cls():
             try:
                 for chunk in chunks:
                     tokens_t = torch.tensor(list(chunk), dtype=torch.int32)
+                    if loaded_token_count + len(tokens_t) > max_tokens:
+                        raise ValueError(
+                            "External ngram corpus exceeds the remaining token budget "
+                            f"({max_tokens}) after loading {loaded_token_count} tokens."
+                        )
                     loaded_token_count += len(tokens_t)
                     self.append_external_corpus_tokens(tokens_t)  # type: ignore
                     chunk_count += 1
                 self.finish_external_corpus_load(corpus_id)  # type: ignore
             except Exception:
-                self.clear_external_corpus()  # type: ignore
+                self.cancel_external_corpus_load()  # type: ignore
                 raise
             return chunk_count, loaded_token_count
 
         def remove_corpus(self, corpus_id: str) -> None:
             self.remove_external_corpus(corpus_id)  # type: ignore
 
-        def list_corpora(self) -> List[str]:
+        def list_corpora(self) -> Dict[str, int]:
             result = self.list_external_corpora()  # type: ignore
             if not result:
-                return []
-            return result.split("\n")
+                return {}
+            out: Dict[str, int] = {}
+            for line in result.split("\n"):
+                corpus_id, token_count = line.split("\t", 1)
+                out[corpus_id] = int(token_count)
+            return out
 
     return NgramCorpusFFI
