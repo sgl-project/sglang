@@ -257,6 +257,7 @@ class DiffusionTestCase:
     sampling_params: DiffusionSamplingParams
     run_perf_check: bool = True
     run_consistency_check: bool = True
+    run_component_accuracy_check: bool = True
     run_models_api_check: bool = True
     run_t2v_input_reference_check: bool = True
     run_lora_basic_api_check: bool = False
@@ -367,6 +368,13 @@ MODELOPT_T2I_CI_sampling_params = DiffusionSamplingParams(
     extras={"num_inference_steps": 12, "seed": 0},
 )
 
+MODELOPT_TI2I_CI_sampling_params = DiffusionSamplingParams(
+    prompt="Convert 2D style to 3D style",
+    image_path="https://github.com/lm-sys/lm-sys.github.io/releases/download/test/TI2I_Qwen_Image_Edit_Input.jpg",
+    output_size="512x512",
+    extras={"num_inference_steps": 8, "seed": 0},
+)
+
 TI2I_sampling_params = DiffusionSamplingParams(
     prompt="Convert 2D style to 3D style",
     image_path="https://github.com/lm-sys/lm-sys.github.io/releases/download/test/TI2I_Qwen_Image_Edit_Input.jpg",
@@ -431,13 +439,20 @@ HUNYUAN3D_SHAPE_sampling_params = DiffusionSamplingParams(
     image_path="https://raw.githubusercontent.com/sgl-project/sgl-test-files/main/diffusion-ci/consistency_gt/1-gpu/hunyuan3d_2_0/hunyuan3d.png",
 )
 
-MODELOPT_FLUX1_FP8_TRANSFORMER = "BBuf/flux1-dev-modelopt-fp8-sglang-transformer"
-MODELOPT_FLUX2_FP8_TRANSFORMER = "BBuf/flux2-dev-modelopt-fp8-sglang-transformer"
-MODELOPT_WAN22_FP8_TRANSFORMER = "BBuf/wan22-t2v-a14b-modelopt-fp8-sglang-transformer"
-MODELOPT_FLUX1_NVFP4_TRANSFORMER = "BBuf/flux1-dev-modelopt-nvfp4-sglang-transformer"
+MODELOPT_FLUX1_FP8_TRANSFORMER = "lmsys/flux1-dev-modelopt-fp8-sglang-transformer"
+MODELOPT_FLUX2_FP8_TRANSFORMER = "lmsys/flux2-dev-modelopt-fp8-sglang-transformer"
+MODELOPT_WAN22_FP8_TRANSFORMER = "lmsys/wan22-t2v-a14b-modelopt-fp8-sglang-transformer"
+MODELOPT_HUNYUANVIDEO_FP8_TRANSFORMER = (
+    "lmsys/hunyuanvideo-modelopt-fp8-sglang-transformer"
+)
+MODELOPT_QWEN_IMAGE_FP8_TRANSFORMER = "lmsys/qwen-image-modelopt-fp8-sglang-transformer"
+MODELOPT_QWEN_IMAGE_EDIT_FP8_TRANSFORMER = (
+    "lmsys/qwen-image-edit-modelopt-fp8-sglang-transformer"
+)
+MODELOPT_FLUX1_NVFP4_TRANSFORMER = "lmsys/flux1-dev-modelopt-nvfp4-sglang-transformer"
 MODELOPT_FLUX2_NVFP4_WEIGHTS = "black-forest-labs/FLUX.2-dev-NVFP4"
 MODELOPT_WAN22_NVFP4_TRANSFORMER = (
-    "BBuf/wan22-t2v-a14b-modelopt-nvfp4-sglang-transformer"
+    "lmsys/wan22-t2v-a14b-modelopt-nvfp4-sglang-transformer"
 )
 MODELOPT_NVFP4_B200_ENV_VARS = {"SGLANG_DIFFUSION_FLASHINFER_FP4_GEMM_BACKEND": "cudnn"}
 
@@ -463,6 +478,7 @@ def _make_modelopt_ci_case(
         sampling_params,
         run_perf_check=False,
         run_consistency_check=False,
+        run_component_accuracy_check=False,
     )
 
 
@@ -476,6 +492,8 @@ def _with_default_num_gpus(
 
 
 # Load global configuration
-BASELINE_CONFIG = BaselineConfig.load(
-    Path(__file__).with_name("perf_baselines.json")
-).update(Path(__file__).parent / "ascend" / "perf_baselines_npu.json")
+BASELINE_CONFIG = (
+    BaselineConfig.load(Path(__file__).with_name("perf_baselines.json"))
+    .update(Path(__file__).parent / "ascend" / "perf_baselines_npu.json")
+    .update(Path(__file__).parent / "musa" / "perf_baselines_musa.json")
+)
