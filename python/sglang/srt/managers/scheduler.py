@@ -38,6 +38,7 @@ from torch.cuda import Stream as CudaStream
 from torch.distributed import barrier
 
 from sglang.jit_kernel.ngram_embedding import update_token_table
+from sglang.omni.scheduler_state import OmniSchedulerState
 from sglang.srt.configs.model_config import ModelConfig, ModelImpl
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.constrained.grammar_manager import GrammarManager
@@ -355,6 +356,7 @@ class Scheduler(
 
         # Parse args
         self.server_args = server_args
+        self.omni_scheduler_state = OmniSchedulerState()
         self.tp_rank = tp_rank
         self.moe_ep_rank = moe_ep_rank
         self.pp_rank = pp_rank
@@ -2196,6 +2198,8 @@ class Scheduler(
                 )
 
     def _add_request_to_queue(self, req: Req, is_retracted: bool = False):
+        """append the request to scheduler waiting queue"""
+        # TODO: PD scenarios need further testing
         if self.disaggregation_mode == DisaggregationMode.NULL:
             if not self._set_or_validate_priority(req):
                 return

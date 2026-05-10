@@ -8,9 +8,7 @@ shell for tests and future backends that do not need SRT-owned sessions.
 from __future__ import annotations
 
 import argparse
-import base64
 from contextlib import asynccontextmanager
-from io import BytesIO
 from typing import Any, Callable
 
 from fastapi import FastAPI, HTTPException, Request
@@ -18,7 +16,8 @@ from fastapi.responses import ORJSONResponse
 
 from sglang.omni.backends import UnsupportedARBackend, UnsupportedGenerationBackend
 from sglang.omni.coordinator import OmniCoordinator
-from sglang.omni.protocol import OmniRequest, OmniResponse
+from sglang.omni.protocol import OmniRequest
+from sglang.omni.serialization import serialize_response
 from sglang.version import __version__
 
 
@@ -59,7 +58,7 @@ def create_app(
             payload = await raw_request.json()
             request = OmniRequest.from_payload(payload)
             response = raw_request.app.state.orchestrator.generate(request)
-            return ORJSONResponse(_serialize_response(response))
+            return ORJSONResponse(serialize_response(response))
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except RuntimeError as exc:
@@ -106,35 +105,6 @@ def _default_orchestrator() -> OmniCoordinator:
         ar_backend=UnsupportedARBackend(),
         mm_generation_backend=UnsupportedGenerationBackend(),
     )
-
-
-def _serialize_response(response: OmniResponse) -> dict[str, Any]:
-    payload = response.to_dict()
-    for segment in payload["segments"]:
-        if segment["type"] == "image":
-            segment["image"] = _serialize_image(segment["image"])
-    return payload
-
-
-def _serialize_image(image: Any) -> Any:
-    if image is None:
-        return None
-    if isinstance(image, dict):
-        return image
-    if isinstance(image, bytes):
-        return {
-            "b64_json": base64.b64encode(image).decode("ascii"),
-            "mime_type": "application/octet-stream",
-        }
-    save = getattr(image, "save", None)
-    if callable(save):
-        buffer = BytesIO()
-        image.save(buffer, format="PNG")
-        return {
-            "b64_json": base64.b64encode(buffer.getvalue()).decode("ascii"),
-            "mime_type": "image/png",
-        }
-    return image
 
 
 def main() -> None:

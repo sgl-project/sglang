@@ -9,26 +9,25 @@ U1 generation backend can access local ModelRunner/session/KV state.
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-from sglang.omni.entrypoints.http_server import _serialize_response
+from sglang.omni.configs.sensenova_u1 import (
+    build_sensenova_u1_orchestrator_from_scheduler,
+)
 from sglang.omni.protocol import OmniContextBundle, OmniRequest
+from sglang.omni.scheduler_state import OmniSessionRecord
+from sglang.omni.serialization import serialize_response
+
+if TYPE_CHECKING:
+    from sglang.omni.coordinator import OmniCoordinator
+    from sglang.srt.managers.scheduler import Scheduler
 
 _SENSENOVA_U1_CACHE_KEY = "sensenova-u1"
 
 
-@dataclass(slots=True)
-class _OmniSessionRecord:
-    context: OmniContextBundle
-    turns: int
-    created_at: float
-    updated_at: float
-
-
 def handle_omni_generate_with_omni_coordinator(
     *,
-    scheduler: Any,
+    scheduler: "Scheduler",
     payload: dict[str, Any],
 ) -> dict[str, Any]:
     action = str(payload.get("action", "")).lower()
@@ -41,7 +40,7 @@ def handle_omni_generate_with_omni_coordinator(
     request = OmniRequest.from_payload(payload)
     # get global orchestrator
     orchestrator = _get_sensenova_u1_orchestrator(scheduler, request)
-    sessions = _get_omni_sessions(scheduler)
+    sessions = _scheduler_sessions(scheduler)
     session_id = _resolve_session_id(payload)
     keep_session = bool(payload.get("keep_session", False) or session_id)
     session_record = None
@@ -57,13 +56,13 @@ def handle_omni_generate_with_omni_coordinator(
         release_context=not keep_session,
         stop_after_generation_limit=keep_session,
     )
-    response_payload = _serialize_response(response)
+    response_payload = serialize_response(response)
 
     if keep_session:
         session_id = _context_session_id(context)
         now = time.time()
         if session_record is None:
-            session_record = _OmniSessionRecord(
+            session_record = OmniSessionRecord(
                 context=context,
                 turns=0,
                 created_at=now,
@@ -81,8 +80,8 @@ def handle_omni_generate_with_omni_coordinator(
     return response_payload
 
 
-def _close_omni_session(scheduler: Any, session_id: str) -> dict[str, Any]:
-    sessions = _get_omni_sessions(scheduler)
+def _close_omni_session(scheduler: "Scheduler", session_id: str) -> dict[str, Any]:
+    sessions = _scheduler_sessions(scheduler)
     session_record = sessions.pop(session_id, None)
     if session_record is None:
         raise ValueError(f"Unknown omni session: {session_id}")
@@ -94,40 +93,35 @@ def _close_omni_session(scheduler: Any, session_id: str) -> dict[str, Any]:
     return {"session": {"id": session_id, "alive": False}}
 
 
-def _get_sensenova_u1_orchestrator(scheduler: Any, request: OmniRequest) -> Any:
+def _get_sensenova_u1_orchestrator(
+    scheduler: "Scheduler",
+    request: OmniRequest,
+) -> "OmniCoordinator":
     return _get_sensenova_u1_orchestrator_by_model(
         scheduler,
         request.model or _SENSENOVA_U1_CACHE_KEY,
     )
 
 
-def _get_sensenova_u1_orchestrator_by_model(scheduler: Any, model_name: str) -> Any:
+def _get_sensenova_u1_orchestrator_by_model(
+    scheduler: "Scheduler",
+    model_name: str,
+) -> "OmniCoordinator":
     model = model_name.lower()
     if "sensenova" not in model and "u1" not in model:
         raise ValueError(f"Unsupported omni model {model_name!r}")
 
-    cache = getattr(scheduler, "_omni_orchestrators", None)
-    if cache is None:
-        cache = {}
-        setattr(scheduler, "_omni_orchestrators", cache)
+    cache = scheduler.omni_scheduler_state.orchestrators
     if _SENSENOVA_U1_CACHE_KEY not in cache:
-        from sglang.omni.configs.sensenova_u1 import (
-            build_sensenova_u1_orchestrator_from_scheduler,
-        )
-
         cache[_SENSENOVA_U1_CACHE_KEY] = build_sensenova_u1_orchestrator_from_scheduler(
             scheduler=scheduler,
-            server_args=getattr(scheduler, "server_args", None),
+            server_args=scheduler.server_args,
         )
     return cache[_SENSENOVA_U1_CACHE_KEY]
 
 
-def _get_omni_sessions(scheduler: Any) -> dict[str, _OmniSessionRecord]:
-    sessions = getattr(scheduler, "_omni_sessions", None)
-    if sessions is None:
-        sessions = {}
-        setattr(scheduler, "_omni_sessions", sessions)
-    return sessions
+def _scheduler_sessions(scheduler: "Scheduler") -> dict[str, OmniSessionRecord]:
+    return scheduler.omni_scheduler_state.sessions
 
 
 def _resolve_session_id(payload: dict[str, Any]) -> str | None:
