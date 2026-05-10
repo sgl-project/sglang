@@ -156,7 +156,9 @@ class LlamaModel(nn.Module):
             bias=getattr(config, "bias", False),
         )
 
-        self.midlayer = LlamaDecoderLayer(config, 0, quant_config, draft_window_size, prefix)
+        self.midlayer = LlamaDecoderLayer(
+            config, 0, quant_config, draft_window_size, prefix
+        )
 
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
