@@ -1656,6 +1656,7 @@ class PreshardedModelLoader(DefaultModelLoader):
     DEFAULT_SUBDIR = "presharded"
     MAX_FILE_BYTES = 20 * (1024**3)
     CHECKSUM_FILENAME = "checksum.json"
+    READY_FILENAME = "READY"
     TMP_SUBDIR = "_tmp_presharding"
     PLAN_VERSION = 1
     DEFAULT_HASH_NUM_THREADS = 8
@@ -1681,7 +1682,7 @@ class PreshardedModelLoader(DefaultModelLoader):
 
     def download_model(self, model_config: ModelConfig) -> None:
         presharded_dir = self._presharded_dir(model_config)
-        if not os.path.isfile(os.path.join(presharded_dir, self.CHECKSUM_FILENAME)):
+        if not self._presharded_ready(presharded_dir):
             super().download_model(model_config)
 
     def load_model(
@@ -1691,8 +1692,7 @@ class PreshardedModelLoader(DefaultModelLoader):
         device_config: "DeviceConfig",
     ) -> nn.Module:
         presharded_dir = self._presharded_dir(model_config)
-        checksum_path = os.path.join(presharded_dir, self.CHECKSUM_FILENAME)
-        if os.path.isfile(checksum_path):
+        if self._presharded_ready(presharded_dir):
             logger.info("Loading from presharded checkpoint at %s", presharded_dir)
             return self._load_from_presharded(
                 model_config, device_config, presharded_dir
@@ -1704,6 +1704,16 @@ class PreshardedModelLoader(DefaultModelLoader):
         return self._first_time_load_and_dump(
             model_config, device_config, presharded_dir
         )
+
+    @classmethod
+    def _presharded_ready(cls, presharded_dir: str) -> bool:
+        """A presharded ckpt is usable only after the writer process has
+        finished writing every file AND written the ``READY`` sentinel.
+        Checksum.json alone is not enough: if dump crashes between the plan
+        write and the per-rank file write, ``checksum.json`` exists but the
+        files it references are missing or partial. ``READY`` is written
+        last, after the final barrier in ``_dump_state_to_disk``."""
+        return os.path.isfile(os.path.join(presharded_dir, cls.READY_FILENAME))
 
     def _presharded_dir(self, model_config: ModelConfig) -> str:
         if self._presharded_path_override is not None:
@@ -1944,6 +1954,22 @@ class PreshardedModelLoader(DefaultModelLoader):
 
         if rank == 0:
             shutil.rmtree(tmp_dir, ignore_errors=True)
+            # Write the READY sentinel last, after every rank has finished
+            # writing its files (guaranteed by the barrier above). A reader
+            # that sees this file knows checksum.json and every safetensors
+            # file it references are fully written. An interrupted dump
+            # leaves no READY file, so the next launch redumps cleanly.
+            ready_path = os.path.join(presharded_dir, self.READY_FILENAME)
+            with open(ready_path, "w") as f:
+                json.dump(
+                    {
+                        "plan_version": self.PLAN_VERSION,
+                        "world_size": world_size,
+                        "created_at": time.time(),
+                    },
+                    f,
+                )
+        self._world_barrier()
 
     @staticmethod
     def _make_filename(
