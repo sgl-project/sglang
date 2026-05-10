@@ -27,6 +27,9 @@ from sglang.srt.mem_cache.hisparse_memory_pool import (
     HiSparseNSATokenToKVPool,
     HiSparseTokenToKVPoolAllocator,
 )
+from sglang.srt.mem_cache.kv_cache_configurator import (
+    calculate_mla_kv_cache_dim,
+)
 from sglang.srt.mem_cache.memory_pool import (
     HybridLinearKVPool,
     HybridReqToTokenPool,
@@ -354,7 +357,11 @@ class ModelRunnerKVCacheMixin:
                     qk_rope_head_dim=self.model_config.qk_rope_head_dim,
                     layer_num=self.num_effective_layers,
                     device=self.device,
-                    kv_cache_dim=self.calculate_mla_kv_cache_dim(),
+                    kv_cache_dim=calculate_mla_kv_cache_dim(
+                        model_config=self.model_config,
+                        kv_cache_dtype=self.kv_cache_dtype,
+                        server_args=self.server_args,
+                    ),
                     enable_memory_saver=self.server_args.enable_memory_saver,
                     start_layer=self.start_layer,
                     end_layer=self.end_layer,
@@ -487,7 +494,11 @@ class ModelRunnerKVCacheMixin:
                 qk_rope_head_dim=self.model_config.qk_rope_head_dim,
                 layer_num=self.num_effective_layers,
                 device=self.device,
-                kv_cache_dim=self.calculate_mla_kv_cache_dim(),
+                kv_cache_dim=calculate_mla_kv_cache_dim(
+                    model_config=self.model_config,
+                    kv_cache_dtype=self.kv_cache_dtype,
+                    server_args=self.server_args,
+                ),
                 enable_memory_saver=self.server_args.enable_memory_saver,
                 start_layer=self.start_layer,
                 end_layer=self.end_layer,
