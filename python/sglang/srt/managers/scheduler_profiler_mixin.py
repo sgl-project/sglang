@@ -38,9 +38,9 @@ class SchedulerProfilerMixin:
     def init_profiler(self: Scheduler):
         if envs.SGLANG_PROFILE_V2.get():
             self._profile_manager = ProfileManager(
-                tp_rank=self.tp_rank,
+                tp_rank=self.ps.tp_rank,
                 cpu_group=self.dp_tp_cpu_group,
-                gpu_id=self.gpu_id,
+                gpu_id=self.ps.gpu_id,
             )
             return
 
@@ -167,10 +167,10 @@ class SchedulerProfilerMixin:
 
             self.rpd_profile_path = os.path.join(
                 self.torch_profiler_output_dir,
-                "rpd-" + str(time.time()) + f"-TP-{self.tp_rank}" + ".trace.json.gz",
+                "rpd-" + str(time.time()) + f"-TP-{self.ps.tp_rank}" + ".trace.json.gz",
             )
 
-            if self.tp_rank == 0:
+            if self.ps.tp_rank == 0:
                 import sqlite3
 
                 from rocpd.schema import RocpdSchema
@@ -210,7 +210,7 @@ class SchedulerProfilerMixin:
             self.profile_in_progress = True
 
         if "CUDA_PROFILER" in activities:
-            if self.gpu_id == get_global_server_args().base_gpu_id:
+            if self.ps.gpu_id == get_global_server_args().base_gpu_id:
                 torch.cuda.cudart().cudaProfilerStart()
             self.profile_in_progress = True
 
@@ -220,13 +220,13 @@ class SchedulerProfilerMixin:
         if not self.merge_profiles:
             return ""
 
-        if self.tp_rank != 0:
+        if self.ps.tp_rank != 0:
             return ""
-        if getattr(self, "dp_size", 1) > 1 and getattr(self, "dp_rank", 0) != 0:
+        if self.ps.dp_size > 1 and self.ps.dp_rank != 0:
             return ""
-        if getattr(self, "pp_size", 1) > 1 and getattr(self, "pp_rank", 0) != 0:
+        if self.ps.pp_size > 1 and self.ps.pp_rank != 0:
             return ""
-        if getattr(self, "moe_ep_size", 1) > 1 and getattr(self, "moe_ep_rank", 0) != 0:
+        if self.ps.moe_ep_size > 1 and self.ps.moe_ep_rank != 0:
             return ""
 
         try:
@@ -273,15 +273,15 @@ class SchedulerProfilerMixin:
             self.torch_profiler.stop()
             if not _is_npu:
                 # Build filename with only non-zero ranks to maintain backward compatibility
-                filename_parts = [self.profile_id, f"TP-{self.tp_rank}"]
+                filename_parts = [self.profile_id, f"TP-{self.ps.tp_rank}"]
 
                 # Only add other ranks if parallelism is enabled (size > 1)
-                if getattr(self, "dp_size", 1) > 1:
-                    filename_parts.append(f"DP-{getattr(self, 'dp_rank', 0)}")
-                if getattr(self, "pp_size", 1) > 1:
-                    filename_parts.append(f"PP-{getattr(self, 'pp_rank', 0)}")
-                if getattr(self, "moe_ep_size", 1) > 1:
-                    filename_parts.append(f"EP-{getattr(self, 'moe_ep_rank', 0)}")
+                if self.ps.dp_size > 1:
+                    filename_parts.append(f"DP-{self.ps.dp_rank}")
+                if self.ps.pp_size > 1:
+                    filename_parts.append(f"PP-{self.ps.pp_rank}")
+                if self.ps.moe_ep_size > 1:
+                    filename_parts.append(f"EP-{self.ps.moe_ep_rank}")
 
                 filename = (
                     stage_prefix
@@ -301,7 +301,7 @@ class SchedulerProfilerMixin:
             self.rpd_profiler.flush()
 
             torch.distributed.barrier(self.dp_tp_cpu_group)
-            if self.tp_rank == 0:
+            if self.ps.tp_rank == 0:
                 from sglang.srt.utils.rpd_utils import rpd_to_chrome_trace
 
                 rpd_to_chrome_trace("trace.rpd", self.rpd_profile_path)
@@ -312,7 +312,7 @@ class SchedulerProfilerMixin:
             memory_profile_path = os.path.join(
                 self.torch_profiler_output_dir,
                 str(time.time())
-                + f"-TP-{self.tp_rank}-memory"
+                + f"-TP-{self.ps.tp_rank}-memory"
                 + stage_suffix
                 + ".pickle",
             )
@@ -320,7 +320,7 @@ class SchedulerProfilerMixin:
             torch.cuda.memory._record_memory_history(enabled=None)
 
         if "CUDA_PROFILER" in self.profiler_activities:
-            if self.gpu_id == get_global_server_args().base_gpu_id:
+            if self.ps.gpu_id == get_global_server_args().base_gpu_id:
                 torch.cuda.cudart().cudaProfilerStop()
 
         merge_message = self._merge_profile_traces()

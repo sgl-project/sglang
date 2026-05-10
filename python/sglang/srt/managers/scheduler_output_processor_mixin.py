@@ -1253,12 +1253,12 @@ class SchedulerOutputProcessorMixin:
 
             if (
                 req.finished()
-                and self.attn_tp_rank == 0
+                and self.ps.attn_tp_rank == 0
                 and self.server_args.enable_request_time_stats_logging
             ):
                 req.log_time_stats()
 
-        dp_ranks = [self.dp_rank] * len(rids) if rids else None
+        dp_ranks = [self.ps.dp_rank] * len(rids) if rids else None
 
         # Send to detokenizer
         if reqs or is_idle_batch:
