@@ -85,6 +85,32 @@ class TestLoadBalanceMethod(unittest.TestCase):
         self.assertIn("('nixl', 'mooncake')", str(context.exception))
         self.assertIn("'fake'", str(context.exception))
 
+    def test_two_batch_overlap_rejects_enforced_shared_experts_fusion(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            enable_two_batch_overlap=True,
+            enforce_shared_experts_fusion=True,
+        )
+
+        with self.assertRaises(ValueError) as context:
+            server_args.check_server_args()
+
+        self.assertIn("--enable-two-batch-overlap", str(context.exception))
+        self.assertIn("--enforce-shared-experts-fusion", str(context.exception))
+
+    def test_single_batch_overlap_rejects_enforced_shared_experts_fusion(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            enable_single_batch_overlap=True,
+            enforce_shared_experts_fusion=True,
+        )
+
+        with self.assertRaises(ValueError) as context:
+            server_args.check_server_args()
+
+        self.assertIn("--enable-single-batch-overlap", str(context.exception))
+        self.assertIn("--enforce-shared-experts-fusion", str(context.exception))
+
 
 class TestPortArgs(unittest.TestCase):
     @patch("sglang.srt.server_args.get_free_port")
