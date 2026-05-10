@@ -368,22 +368,28 @@ class OmniSRTSchedulerExecutor:
             "process_batch_result",
         )
 
-        for _ in range(self._sync_step_budget(req)):
-            if req.finished():
-                self._run_idle_cleanup()
-                return
-            batch = self._run_scheduler_step()
-            if batch is None and not req.finished():
-                raise OmniSRTSchedulerExecutorError(
-                    f"SRT scheduler produced no batch for omni request {req.rid}"
-                )
+        has_last_batch = hasattr(self.scheduler, "last_batch")
+        previous_last_batch = getattr(self.scheduler, "last_batch", None)
+        try:
+            for _ in range(self._sync_step_budget(req)):
+                if req.finished():
+                    self._run_idle_cleanup()
+                    return
+                batch = self._run_scheduler_step()
+                if batch is None and not req.finished():
+                    raise OmniSRTSchedulerExecutorError(
+                        f"SRT scheduler produced no batch for omni request {req.rid}"
+                    )
 
-        if not req.finished():
-            raise OmniSRTSchedulerExecutorError(
-                "SRT scheduler did not finish omni request "
-                f"{req.rid} within {self.max_sync_steps} steps"
-            )
-        self._run_idle_cleanup()
+            if not req.finished():
+                raise OmniSRTSchedulerExecutorError(
+                    "SRT scheduler did not finish omni request "
+                    f"{req.rid} within {self._sync_step_budget(req)} steps"
+                )
+            self._run_idle_cleanup()
+        finally:
+            if has_last_batch:
+                self.scheduler.last_batch = previous_last_batch
 
     def _run_scheduler_step(self):
         batch = self.scheduler.get_next_batch_to_run()
@@ -406,6 +412,8 @@ class OmniSRTSchedulerExecutor:
                 self.sync_step_count += 1
             elif hasattr(self.scheduler, "on_idle"):
                 self.scheduler.on_idle()
+            if hasattr(self.scheduler, "last_batch"):
+                self.scheduler.last_batch = batch
         finally:
             if has_cur_batch:
                 self.scheduler.cur_batch = previous_cur_batch

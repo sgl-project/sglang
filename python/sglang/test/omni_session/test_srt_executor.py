@@ -45,16 +45,21 @@ def test_sync_execute_budget_scales_with_request_decode_length():
     assert scheduler.sample_launches == 12
 
 
-def test_sync_step_does_not_publish_internal_batch_as_last_batch():
+def test_sync_execute_restores_outer_scheduler_batch_state():
     scheduler = _FakeSyncScheduler(finish_after_steps=1)
     executor = OmniSRTSchedulerExecutor(scheduler)
     req = _FakeReq(finished=False)
-    scheduler._add_request_to_queue(req)
+    outer_last_batch = _FakeBatch([])
+    scheduler.last_batch = outer_last_batch
 
-    executor._run_scheduler_step()
+    executor.execute_omni_request(
+        record=SimpleNamespace(session_id="s0"),
+        req=req,
+        state=None,
+    )
 
     assert req.finished()
-    assert scheduler.last_batch is None
+    assert scheduler.last_batch is outer_last_batch
     assert scheduler.cur_batch is None
 
 
