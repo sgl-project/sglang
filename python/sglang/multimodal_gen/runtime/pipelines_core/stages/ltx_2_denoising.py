@@ -433,34 +433,35 @@ class LTX2DenoisingStage(DenoisingStage):
         rescale_scale: float,
         modality_scale: float,
     ) -> torch.Tensor:
-        """Combine stage-1 guidance passes that were split across CFG ranks.
-
-        Each pass is one model forward with a different conditioning setup:
-        positive prompt, negative prompt, attention-disabled perturbation, or
-        audio/video cross-attention disabled. A rank only owns some passes, so
-        it contributes weighted x0 terms for those passes and all-reduce
-        reconstructs the full guided x0 on every rank.
-        """
-        coefficients = {
-            "cond": cfg_scale + stg_scale + modality_scale - 1.0,
-            "neg": 1.0 - cfg_scale,
-            "perturbed": -stg_scale,
-            "modality": 1.0 - modality_scale,
-        }
+        """Combine stage-1 guidance passes that were split across CFG ranks."""
         first_velocity = next(iter(local_velocities.values()))
         template = cls._ltx2_velocity_to_x0(latents, first_velocity, sigma)
-        cond_partial = torch.zeros_like(template)
-        pred_partial = torch.zeros_like(template)
+        pass_names = ["cond", "neg"]
+        if stg_scale != 0.0:
+            pass_names.append("perturbed")
+        if modality_scale != 1.0:
+            pass_names.append("modality")
 
-        for name, velocity in local_velocities.items():
-            denoised = cls._ltx2_velocity_to_x0(latents, velocity, sigma)
-            if name == "cond":
-                cond_partial = cond_partial + denoised
-            pred_partial = pred_partial + denoised * coefficients[name]
+        denoised_by_name = {}
+        for name in pass_names:
+            velocity = local_velocities.get(name)
+            if velocity is None:
+                partial = torch.zeros_like(template)
+            else:
+                partial = cls._ltx2_velocity_to_x0(latents, velocity, sigma)
+            denoised_by_name[name] = cfg_model_parallel_all_reduce(partial)
 
-        cond = cfg_model_parallel_all_reduce(cond_partial)
-        pred = cfg_model_parallel_all_reduce(pred_partial)
-        return cls._ltx2_apply_rescale(cond, pred, rescale_scale)
+        # reuse serial formula/order after materializing branches on every rank
+        return cls._ltx2_calculate_guided_x0(
+            cond=denoised_by_name["cond"],
+            uncond_text=denoised_by_name["neg"],
+            uncond_perturbed=denoised_by_name.get("perturbed", 0.0),
+            uncond_modality=denoised_by_name.get("modality", 0.0),
+            cfg_scale=cfg_scale,
+            stg_scale=stg_scale,
+            rescale_scale=rescale_scale,
+            modality_scale=modality_scale,
+        )
 
     @staticmethod
     def _ltx2_channelwise_normalize(noise: torch.Tensor) -> torch.Tensor:
