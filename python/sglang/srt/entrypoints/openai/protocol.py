@@ -1176,9 +1176,17 @@ class ResponseReasoningParam(BaseModel):
 class ResponseTool(BaseModel):
     """Tool definition for responses."""
 
-    type: Literal["web_search_preview", "code_interpreter"] = Field(
-        description="Type of tool to enable"
-    )
+    type: Literal[
+        "web_search_preview",
+        "code_interpreter",
+        "image_generation",
+    ] = Field(description="Type of tool to enable")
+    size: Optional[str] = None
+    quality: Optional[str] = None
+    output_format: Optional[str] = None
+    background: Optional[str] = None
+    action: Optional[Literal["auto", "generate", "edit"]] = None
+    partial_images: Optional[int] = None
 
 
 ResponseInputOutputItem: TypeAlias = Union[
@@ -1218,7 +1226,10 @@ class ResponsesRequest(BaseModel):
     store: Optional[bool] = True
     stream: Optional[bool] = False
     temperature: Optional[float] = None
-    tool_choice: Literal["auto", "required", "none"] = "auto"
+    tool_choice: Union[
+        Literal["auto", "required", "none"],
+        Dict[str, Any],
+    ] = "auto"
     tools: List[ResponseTool] = Field(default_factory=list)
     top_logprobs: Optional[int] = 0
     top_p: Optional[float] = None
@@ -1323,7 +1334,7 @@ class ResponsesResponse(BaseModel):
     status: Literal["queued", "in_progress", "completed", "failed", "cancelled"]
     usage: Optional[UsageInfo] = None
     parallel_tool_calls: bool = True
-    tool_choice: str = "auto"
+    tool_choice: Any = "auto"
     tools: List[ResponseTool] = Field(default_factory=list)
 
     # OpenAI compatibility fields. not all are used at the moment.

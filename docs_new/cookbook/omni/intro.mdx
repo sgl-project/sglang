@@ -18,6 +18,7 @@ The HTTP surface is split by task:
 
 - Use ordinary `/generate` or OpenAI-compatible `/v1/chat/completions` for VLM-style understanding when the model only needs to answer with text.
 - Use `/v1/omni/generate` for media generation, image editing, and interleaved responses. This is SGLang's native segment API, not an OpenAI Chat Completions-compatible response shape.
+- Use `/v1/responses` with the `image_generation` tool when you want an OpenAI-style non-streaming adapter for image-capable omni models.
 - Use `/v1/omni/sessions/{session_id}/close` to release a persistent omni session after multi-turn work.
 
 An interleaved response is an ordered sequence of output segments, for example text, image, then more text. With `keep_session: true`, the server returns a `session.id`; later requests can pass that `session_id` so the model can refer to previous turns and generated images.
@@ -54,6 +55,7 @@ The omni HTTP API is shared by model cookbooks. Model-specific pages focus on su
 | Task | Endpoint |
 | --- | --- |
 | Generate or edit media, or run interleaved generation | `POST /v1/omni/generate` |
+| OpenAI-style non-streaming image generation adapter | `POST /v1/responses` with `tools: [{"type": "image_generation"}]` |
 | Close a persistent omni session | `POST /v1/omni/sessions/{session_id}/close` |
 | Text-only VLM understanding | Use ordinary `/generate` or OpenAI-compatible `/v1/chat/completions` |
 
@@ -128,6 +130,34 @@ After the workflow is complete, close the session:
 ```bash Command
 curl -X POST http://localhost:30000/v1/omni/sessions/<session_id>/close
 ```
+
+### Responses Adapter
+
+The `/v1/responses` adapter is useful for clients that already speak the OpenAI Responses shape. The MVP is non-streaming and maps the `image_generation` tool to the native omni orchestrator.
+
+```json Example
+{
+  "model": "sensenova-u1",
+  "input": [
+    {
+      "role": "user",
+      "content": [
+        {"type": "input_text", "text": "Create one image, then describe it."}
+      ]
+    }
+  ],
+  "tools": [
+    {"type": "image_generation", "size": "1024x1024", "action": "auto"}
+  ],
+  "metadata": {
+    "sampling_params": {"num_steps": 50},
+    "max_images": 1,
+    "max_text_segments": 2
+  }
+}
+```
+
+The adapter returns standard Responses output items: `message` for text segments and `image_generation_call` for generated images. Use `previous_response_id` to continue a stored omni session in a later turn.
 
 <CardGroup cols={3}>
   <Card

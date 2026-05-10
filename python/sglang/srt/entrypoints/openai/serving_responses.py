@@ -24,6 +24,7 @@ from openai.types.responses import (
     ResponseReasoningItem,
 )
 from openai.types.responses.response_function_tool_call import ResponseFunctionToolCall
+from openai.types.responses.response_output_item import ImageGenerationCall
 from openai.types.responses.response_reasoning_item import (
     Content as ResponseReasoningTextContent,
 )
@@ -56,7 +57,7 @@ from sglang.srt.entrypoints.openai.protocol import (
 )
 from sglang.srt.entrypoints.openai.serving_chat import OpenAIServingChat
 from sglang.srt.entrypoints.openai.tool_server import MCPToolServer, ToolServer
-from sglang.srt.managers.io_struct import GenerateReqInput
+from sglang.srt.managers.io_struct import GenerateReqInput, OmniGenerateReqInput
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.utils import random_uuid
 
@@ -170,6 +171,12 @@ class OpenAIServingResponses(OpenAIServingChat):
 
         # FIXME: If the engine is dead, raise an error
         # This is required for the streaming case
+
+        if self._uses_image_generation_tool(request):
+            return await self._create_omni_image_generation_response(
+                request,
+                raw_request,
+            )
 
         # Handle the previous response ID
         prev_response_id = request.previous_response_id
@@ -812,6 +819,167 @@ class OpenAIServingResponses(OpenAIServingChat):
             param="response_id",
         )
 
+    def _uses_image_generation_tool(self, request: ResponsesRequest) -> bool:
+        return any(tool.type == "image_generation" for tool in request.tools)
+
+    async def _create_omni_image_generation_response(
+        self,
+        request: ResponsesRequest,
+        raw_request: Optional[Request],
+    ) -> Union[ResponsesResponse, ORJSONResponse]:
+        if request.stream:
+            return self.create_error_response(
+                "image_generation in /v1/responses is non-streaming only"
+            )
+        if request.background:
+            return self.create_error_response(
+                "image_generation in /v1/responses does not support background mode"
+            )
+
+        prev_response = await self._get_previous_omni_response(request)
+        if isinstance(prev_response, ORJSONResponse):
+            return prev_response
+
+        try:
+            payload = self._build_omni_payload_from_response_request(
+                request,
+                prev_response,
+            )
+        except ValueError as exc:
+            return self.create_error_response(str(exc))
+
+        result = await self.tokenizer_manager.omni_generate(
+            OmniGenerateReqInput(payload=payload),
+            raw_request,
+        )
+        if not result.success:
+            return self.create_error_response(
+                result.message,
+                status_code=result.status_code,
+            )
+
+        try:
+            response = self._build_response_from_omni_payload(
+                request,
+                result.payload or {},
+                model_name=payload["model"],
+            )
+        except ValueError as exc:
+            return self.create_error_response(str(exc))
+        if request.store is not False:
+            async with self.response_store_lock:
+                self.response_store[response.id] = response
+        return response
+
+    async def _get_previous_omni_response(
+        self,
+        request: ResponsesRequest,
+    ) -> Optional[ResponsesResponse] | ORJSONResponse:
+        prev_response_id = request.previous_response_id
+        if prev_response_id is None:
+            return None
+        if not prev_response_id.startswith("resp_"):
+            return self._make_invalid_id_error(prev_response_id)
+        async with self.response_store_lock:
+            prev_response = self.response_store.get(prev_response_id)
+        if prev_response is None:
+            return self._make_not_found_error(prev_response_id)
+        return prev_response
+
+    def _build_omni_payload_from_response_request(
+        self,
+        request: ResponsesRequest,
+        prev_response: Optional[ResponsesResponse],
+    ) -> dict[str, Any]:
+        metadata = dict(request.metadata or {})
+        image_tool = next(
+            tool for tool in request.tools if tool.type == "image_generation"
+        )
+        sampling_params = _responses_sampling_params(metadata, image_tool)
+        segments = _responses_input_to_omni_segments(request)
+        if not segments:
+            raise ValueError("Responses image_generation request requires input text")
+
+        session_id = None
+        if prev_response is not None and prev_response.metadata:
+            session_id = prev_response.metadata.get("omni_session_id")
+        task = _responses_omni_task(metadata, image_tool, session_id)
+        model_name = request.model or self.tokenizer_manager.served_model_name
+
+        payload: dict[str, Any] = {
+            "model": model_name or "sensenova-u1",
+            "task": task,
+            "messages": segments,
+            "sampling_params": sampling_params,
+            "max_images": int(metadata.get("max_images", 1)),
+            "max_text_segments": int(metadata.get("max_text_segments", 8)),
+        }
+        if session_id:
+            payload["session_id"] = session_id
+        elif request.store is not False:
+            payload["keep_session"] = True
+        return payload
+
+    def _build_response_from_omni_payload(
+        self,
+        request: ResponsesRequest,
+        payload: dict[str, Any],
+        *,
+        model_name: str,
+    ) -> ResponsesResponse:
+        output: list[Any] = []
+        for segment in payload.get("segments", []):
+            segment_type = segment.get("type")
+            if segment_type == "text":
+                text = str(segment.get("text") or "")
+                if text:
+                    output.append(
+                        ResponseOutputMessage(
+                            id=f"msg_{random_uuid()}",
+                            content=[
+                                ResponseOutputText(
+                                    annotations=[],
+                                    text=text,
+                                    type="output_text",
+                                )
+                            ],
+                            role="assistant",
+                            status="completed",
+                            type="message",
+                        )
+                    )
+            elif segment_type == "image":
+                image = segment.get("image") or {}
+                result = image.get("b64_json") or image.get("base64")
+                output.append(
+                    ImageGenerationCall(
+                        id=f"ig_{random_uuid()}",
+                        result=result,
+                        status="completed",
+                        type="image_generation_call",
+                    )
+                )
+            else:
+                raise ValueError(f"Unsupported omni response segment: {segment_type}")
+
+        metadata = dict(request.metadata or {})
+        metadata["omni_endpoint"] = "/v1/omni/generate"
+        session = payload.get("session")
+        if isinstance(session, dict) and session.get("id"):
+            metadata["omni_session_id"] = session["id"]
+
+        response = ResponsesResponse.from_request(
+            request=request,
+            sampling_params=None,
+            model_name=model_name,
+            created_time=int(time.time()),
+            output=output,
+            status="completed",
+            usage=None,
+        )
+        response.metadata = metadata
+        return response
+
     async def responses_stream_generator(
         self,
         request: ResponsesRequest,
@@ -1326,3 +1494,129 @@ class OpenAIServingResponses(OpenAIServingChat):
 
             # Slightly reduce priority for subsequent tool calls
             priority = orig_priority - 1
+
+
+def _responses_sampling_params(
+    metadata: dict[str, Any],
+    image_tool: Any,
+) -> dict[str, Any]:
+    sampling_params = dict(metadata.get("sampling_params") or {})
+    size = getattr(image_tool, "size", None)
+    if size:
+        width, height = _parse_image_size(size)
+        sampling_params.setdefault("width", width)
+        sampling_params.setdefault("height", height)
+    for source, target in (
+        ("num_steps", "num_steps"),
+        ("num_inference_steps", "num_inference_steps"),
+        ("cfg_text_scale", "cfg_text_scale"),
+        ("cfg_img_scale", "cfg_img_scale"),
+        ("cfg_renorm_type", "cfg_renorm_type"),
+        ("seed", "seed"),
+    ):
+        if source in metadata:
+            sampling_params.setdefault(target, metadata[source])
+    return sampling_params
+
+
+def _responses_omni_task(
+    metadata: dict[str, Any],
+    image_tool: Any,
+    session_id: str | None,
+) -> str:
+    if "omni_task" in metadata:
+        return str(metadata["omni_task"])
+    if "task" in metadata:
+        return str(metadata["task"])
+
+    action = getattr(image_tool, "action", None)
+    if action == "generate":
+        return "t2i"
+    if action == "edit":
+        return "edit"
+    if session_id:
+        return "interleave"
+    return "interleave"
+
+
+def _responses_input_to_omni_segments(
+    request: ResponsesRequest,
+) -> list[dict[str, Any]]:
+    segments: list[dict[str, Any]] = []
+    if request.instructions:
+        segments.append({"type": "text", "text": request.instructions})
+    if isinstance(request.input, str):
+        segments.append({"type": "text", "text": request.input})
+        return segments
+
+    for item in request.input:
+        _append_response_item_segments(_dump_response_item(item), segments)
+    return segments
+
+
+def _append_response_item_segments(
+    item: dict[str, Any],
+    segments: list[dict[str, Any]],
+) -> None:
+    item_type = item.get("type")
+    if item_type is None and "content" in item and "role" in item:
+        item_type = "message"
+    if item_type in {"input_text", "output_text", "text"}:
+        text = item.get("text")
+        if text:
+            segments.append({"type": "text", "text": str(text)})
+        return
+    if item_type in {"input_image", "image_url"}:
+        segments.append({"type": "image", "image": _responses_image_payload(item)})
+        return
+    if item_type == "image_generation_call" and item.get("result"):
+        segments.append(
+            {"type": "image", "image": {"b64_json": str(item["result"])}}
+        )
+        return
+    if item_type != "message":
+        return
+
+    content = item.get("content")
+    if isinstance(content, str):
+        segments.append({"type": "text", "text": content})
+        return
+    if not isinstance(content, list):
+        return
+    for part in content:
+        _append_response_item_segments(_dump_response_item(part), segments)
+
+
+def _responses_image_payload(item: dict[str, Any]) -> dict[str, Any]:
+    image_url = item.get("image_url")
+    if isinstance(image_url, dict):
+        image_url = image_url.get("url")
+    if not image_url:
+        raise ValueError("Responses input_image requires image_url")
+    image_url = str(image_url)
+    if image_url.startswith(("http://", "https://")):
+        raise ValueError(
+            "Responses image_generation MVP supports base64 data URLs for input images"
+        )
+    return {"b64_json": image_url}
+
+
+def _parse_image_size(size: str) -> tuple[int, int]:
+    try:
+        width_text, height_text = size.lower().split("x", 1)
+        width = int(width_text)
+        height = int(height_text)
+    except Exception as exc:
+        raise ValueError(f"Invalid image_generation size: {size!r}") from exc
+    if width <= 0 or height <= 0:
+        raise ValueError(f"Invalid image_generation size: {size!r}")
+    return width, height
+
+
+def _dump_response_item(item: Any) -> dict[str, Any]:
+    if isinstance(item, dict):
+        return item
+    model_dump = getattr(item, "model_dump", None)
+    if callable(model_dump):
+        return model_dump()
+    return dict(item)
