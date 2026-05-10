@@ -118,7 +118,7 @@ class SchedulerMetricsMixin:
 
         # Metrics
         self.enable_metrics = self.server_args.enable_metrics
-        self.is_stats_logging_rank = self.attn_tp_rank == 0
+        self.is_stats_logging_rank = self.ps.attn_tp_rank == 0
         self.current_scheduler_metrics_enabled = self.enable_metrics and (
             self.is_stats_logging_rank
             or self.server_args.enable_metrics_for_all_schedulers
@@ -135,7 +135,7 @@ class SchedulerMetricsMixin:
                 "engine_type": engine_type,
                 "tp_rank": tp_rank,
                 "pp_rank": pp_rank,
-                "moe_ep_rank": self.moe_ep_rank,
+                "moe_ep_rank": self.ps.moe_ep_rank,
             }
             if self.enable_priority_scheduling:
                 labels["priority"] = ""
@@ -196,12 +196,12 @@ class SchedulerMetricsMixin:
 
     def init_kv_events(self: Scheduler, kv_events_config: Optional[str]):
         self.enable_kv_cache_events = bool(
-            kv_events_config and self.attn_tp_rank == 0 and self.attn_cp_rank == 0
+            kv_events_config and self.ps.attn_tp_rank == 0 and self.ps.attn_cp_rank == 0
         )
 
         if self.enable_kv_cache_events:
             self.kv_event_publisher = EventPublisherFactory.create(
-                kv_events_config, self.attn_dp_rank
+                kv_events_config, self.ps.attn_dp_rank
             )
 
     def update_spec_metrics(self: Scheduler, bs: int, num_correct_drafts: int):
@@ -218,8 +218,8 @@ class SchedulerMetricsMixin:
         hidden_size = float(model_config.hidden_size)
         num_layers = float(getattr(model_config, "num_attention_layers", 0))
         head_dim = float(getattr(model_config, "head_dim", 0))
-        num_attn_heads = float(model_config.get_num_attention_heads(self.tp_size))
-        num_kv_heads = float(model_config.get_num_kv_heads(self.tp_size))
+        num_attn_heads = float(model_config.get_num_attention_heads(self.ps.tp_size))
+        num_kv_heads = float(model_config.get_num_kv_heads(self.ps.tp_size))
         intermediate_size = getattr(hf_text_config, "intermediate_size", None)
         if intermediate_size is None:
             intermediate_size = getattr(hf_text_config, "ffn_hidden_size", 0)
@@ -707,7 +707,9 @@ class SchedulerMetricsMixin:
         kv_metrics.num_requests_waiting = self.stats.num_queue_reqs.total
         kv_metrics.gpu_cache_usage_perc = self.stats.token_usage
         kv_metrics.gpu_prefix_cache_hit_rate = self.stats.cache_hit_rate
-        kv_metrics.data_parallel_rank = self.dp_rank if self.dp_rank is not None else 0
+        kv_metrics.data_parallel_rank = (
+            self.ps.dp_rank if self.ps.dp_rank is not None else 0
+        )
 
         if not self.send_metrics_from_scheduler.closed:
             self.send_metrics_from_scheduler.send_pyobj(kv_metrics)
@@ -924,7 +926,7 @@ class SchedulerMetricsMixin:
             )
 
         return GetLoadsReqOutput(
-            dp_rank=self.dp_rank,
+            dp_rank=self.ps.dp_rank,
             timestamp=time.time(),
             num_running_reqs=num_running_reqs,
             num_waiting_reqs=num_waiting_reqs,
