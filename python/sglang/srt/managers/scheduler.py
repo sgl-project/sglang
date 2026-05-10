@@ -3647,14 +3647,18 @@ class Scheduler(
 
     def continue_generation(self, recv_req: ContinueGenerationReqInput):
         if recv_req.torch_empty_cache:
-            before_mb = torch.cuda.memory_reserved() / (1024 * 1024)
-            torch.cuda.empty_cache()
-            after_mb = torch.cuda.memory_reserved() / (1024 * 1024)
-            logger.info(
-                f"[continue_generation] torch.cuda.empty_cache() called: "
-                f"reserved {before_mb:.1f} MB -> {after_mb:.1f} MB "
-                f"(freed {before_mb - after_mb:.1f} MB)"
-            )
+            mem_reserved = getattr(self.device_module, "memory_reserved", None)
+            before_mb = mem_reserved() / (1024 * 1024) if mem_reserved else None
+            empty_device_cache(self.device_module)
+            if before_mb is not None:
+                after_mb = mem_reserved() / (1024 * 1024)
+                logger.info(
+                    "[continue_generation] empty_device_cache: "
+                    f"reserved {before_mb:.1f} MB -> {after_mb:.1f} MB "
+                    f"(freed {before_mb - after_mb:.1f} MB)"
+                )
+            else:
+                logger.info("[continue_generation] empty_device_cache called")
         self._engine_paused = False
 
     def load_lora_adapter(
