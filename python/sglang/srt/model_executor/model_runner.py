@@ -122,6 +122,9 @@ from sglang.srt.model_executor.model_runner_kv_cache_mixin import (
     ModelRunnerKVCacheMixin,
 )
 from sglang.srt.model_executor.pool_configurator import MemoryPoolConfig
+from sglang.srt.model_executor.remote_instance_weight_transport import (
+    RemoteInstanceWeightTransport,
+)
 from sglang.srt.model_executor.weight_exporter import WeightExporter
 from sglang.srt.model_executor.weight_updater import WeightUpdater
 from sglang.srt.model_loader.loader import get_model_loader
@@ -349,9 +352,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.draft_model_idx = draft_model_idx
         self.enable_hisparse = server_args.enable_hisparse
 
-        self.remote_instance_transfer_engine = None
-        self.remote_instance_transfer_engine_session_id = ""
-        self.remote_instance_transfer_engine_weight_info = None
+        self.remote_instance_weight_transport = RemoteInstanceWeightTransport(
+            server_args=server_args,
+            model=None,
+            tp_rank=self.tp_rank,
+            gpu_id=self.gpu_id,
+        )
 
         self.msprobe_debugger = None
         if server_args.msprobe_dump_config is not None:
@@ -585,7 +591,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         )
 
         if self.server_args.remote_instance_weight_loader_use_transfer_engine():
-            self.remote_instance_init_transfer_engine()
+            self.remote_instance_weight_transport.remote_instance_init_transfer_engine()
 
         if not self.is_draft_worker:
             set_global_expert_location_metadata(
@@ -637,12 +643,15 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         if (
             self.server_args.remote_instance_weight_loader_use_transfer_engine()
-            and self.remote_instance_transfer_engine is not None
-            and self.remote_instance_transfer_engine_weight_info is None
+            and self.remote_instance_weight_transport.remote_instance_transfer_engine
+            is not None
+            and self.remote_instance_weight_transport.remote_instance_transfer_engine_weight_info
+            is None
         ):
             # Register memory and upstream the transfer engine info to the bootstrap server
-            self.remote_instance_transfer_engine_weight_info = register_memory_region(
-                self.model, self.remote_instance_transfer_engine
+            self.remote_instance_weight_transport.remote_instance_transfer_engine_weight_info = register_memory_region(
+                self.model,
+                self.remote_instance_weight_transport.remote_instance_transfer_engine,
             )
             self._register_to_engine_info_bootstrap()
 
@@ -902,23 +911,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 )
             self.model.set_dflash_layers_to_capture(self.dflash_target_layer_ids)
 
-    def remote_instance_init_transfer_engine(self):
-        try:
-            from mooncake.engine import TransferEngine
-        except ImportError as e:
-            logger.warning(
-                "Please install mooncake for using remote instance transfer engine: pip install mooncake"
-            )
-            return
-        self.remote_instance_transfer_engine = TransferEngine()
-        local_ip = get_local_ip_auto()
-        self.remote_instance_transfer_engine.initialize(
-            local_ip, "P2PHANDSHAKE", "rdma", envs.MOONCAKE_DEVICE.get()
-        )
-        self.remote_instance_transfer_engine_session_id = NetworkAddress(
-            local_ip, self.remote_instance_transfer_engine.get_rpc_port()
-        ).to_host_port_str()
-
     def _register_to_engine_info_bootstrap(self):
         """Register transfer engine info with the EngineInfoBootstrapServer via HTTP PUT.
 
@@ -943,8 +935,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         payload = {
             "tp_rank": self.tp_rank,
             "transfer_engine_info": {
-                "session_id": self.remote_instance_transfer_engine_session_id,
-                "weights_info_dict": self.remote_instance_transfer_engine_weight_info,
+                "session_id": self.remote_instance_weight_transport.remote_instance_transfer_engine_session_id,
+                "weights_info_dict": self.remote_instance_weight_transport.remote_instance_transfer_engine_weight_info,
             },
         }
 
@@ -1038,8 +1030,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
     def _build_transfer_engine_worker_metadata(self, p2p_pb2):
         """Build WorkerMetadata using TransferEngine session_id."""
-        session_id = self.remote_instance_transfer_engine_session_id
-        weight_info = self.remote_instance_transfer_engine_weight_info
+        session_id = (
+            self.remote_instance_weight_transport.remote_instance_transfer_engine_session_id
+        )
+        weight_info = (
+            self.remote_instance_weight_transport.remote_instance_transfer_engine_weight_info
+        )
 
         if not session_id or weight_info is None:
             logger.warning(
@@ -1110,7 +1106,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         )
 
         # Keep reference alive so NIXL agent isn't garbage collected
-        self._nixl_manager = nixl_mgr
+        self.remote_instance_weight_transport._nixl_manager = nixl_mgr
 
         return worker, len(tensors)
 
@@ -1258,7 +1254,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             remote_instance_weight_loader_seed_instance_service_port=self.server_args.remote_instance_weight_loader_seed_instance_service_port,
             remote_instance_weight_loader_send_weights_group_ports=self.server_args.remote_instance_weight_loader_send_weights_group_ports,
             remote_instance_weight_loader_backend=self.server_args.remote_instance_weight_loader_backend,
-            remote_instance_weight_loader_transfer_engine=self.remote_instance_transfer_engine,
+            remote_instance_weight_loader_transfer_engine=self.remote_instance_weight_transport.remote_instance_transfer_engine,
             modelexpress_url=self.server_args.modelexpress_url,
             modelexpress_model_name=self.server_args.modelexpress_model_name
             or self.server_args.model_path,
@@ -1314,8 +1310,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 model_config=self.model_config,
                 device_config=DeviceConfig(self.device, self.gpu_id),
             )
+            self.remote_instance_weight_transport.model = self.model
             if hasattr(self.loader, "remote_instance_transfer_engine_weight_info"):
-                self.remote_instance_transfer_engine_weight_info = (
+                self.remote_instance_weight_transport.remote_instance_transfer_engine_weight_info = (
                     self.loader.remote_instance_transfer_engine_weight_info
                 )
         # Cache needs to be cleared after loading model weights (in the self.loader.load_model function).
@@ -1329,17 +1326,18 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             # Seed loads via DefaultModelLoader (load_format=auto), which doesn't
             # call register_memory_region(). Do it here so weight_info is populated.
             if (
-                self.remote_instance_transfer_engine_weight_info is None
-                and self.remote_instance_transfer_engine is not None
+                self.remote_instance_weight_transport.remote_instance_transfer_engine_weight_info
+                is None
+                and self.remote_instance_weight_transport.remote_instance_transfer_engine
+                is not None
             ):
                 from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
                     register_memory_region,
                 )
 
-                self.remote_instance_transfer_engine_weight_info = (
-                    register_memory_region(
-                        self.model, self.remote_instance_transfer_engine
-                    )
+                self.remote_instance_weight_transport.remote_instance_transfer_engine_weight_info = register_memory_region(
+                    self.model,
+                    self.remote_instance_weight_transport.remote_instance_transfer_engine,
                 )
             self._publish_modelexpress_metadata()
 
