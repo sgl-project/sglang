@@ -77,7 +77,7 @@ class SchedulerPPMixin:
             for mb_id in range(self.pp_loop_size):
                 self.running_batch = self.running_mbs[mb_id]
                 self.last_batch = self.last_mbs[mb_id]
-                next_first_rank_mb_id = (mb_id + self.pp_size) % self.pp_loop_size
+                next_first_rank_mb_id = (mb_id + self.ps.pp_size) % self.pp_loop_size
                 next_mb_id = (mb_id + 1) % self.pp_loop_size
                 with torch.profiler.record_function("recv_requests"):
                     recv_reqs = self.recv_requests()
@@ -205,7 +205,7 @@ class SchedulerPPMixin:
             for mb_id in range(self.pp_loop_size):
                 self.running_batch = self.running_mbs[mb_id]
                 self.last_batch = self.last_mbs[mb_id]
-                next_first_rank_mb_id = (mb_id + self.pp_size) % self.pp_loop_size
+                next_first_rank_mb_id = (mb_id + self.ps.pp_size) % self.pp_loop_size
                 next_mb_id = (mb_id + 1) % self.pp_loop_size
 
                 next_pp_outputs = None
@@ -350,7 +350,7 @@ class SchedulerPPMixin:
             for mb_id in range(self.pp_loop_size):
                 self.running_batch = self.running_mbs[mb_id]
                 self.last_batch = self.last_mbs[mb_id]
-                next_first_rank_mb_id = (mb_id + self.pp_size) % self.pp_loop_size
+                next_first_rank_mb_id = (mb_id + self.ps.pp_size) % self.pp_loop_size
                 next_mb_id = (mb_id + 1) % self.pp_loop_size
 
                 next_pp_outputs = None
@@ -520,7 +520,7 @@ class SchedulerPPMixin:
                 self.on_idle()
 
     def init_pp_loop_state(self: Scheduler):
-        self.pp_loop_size: int = self.pp_size + self.server_args.pp_async_batch_depth
+        self.pp_loop_size: int = self.ps.pp_size + self.server_args.pp_async_batch_depth
         # In CP mode, attention weights are duplicated, eliminating the need for the attention TP all-gather operation.
         self.require_attn_tp_allgather = (
             not self.server_args.enable_nsa_prefill_context_parallel
@@ -665,7 +665,7 @@ class SchedulerPPMixin:
                 f"seq_lens={seq_lens}, latencies_ms={latencies}"
             )
 
-            if self.attn_tp_size > 1:
+            if self.ps.attn_tp_size > 1:
                 data_to_sync_tp = [seq_lens, latencies]
                 data_to_sync_tp = broadcast_pyobj(
                     data_to_sync_tp,
@@ -675,7 +675,7 @@ class SchedulerPPMixin:
                 )
                 seq_lens, latencies = data_to_sync_tp
 
-            if self.attn_cp_size > 1:
+            if self.ps.attn_cp_size > 1:
                 data_to_sync_tp = [seq_lens, latencies]
                 data_to_sync_tp = broadcast_pyobj(
                     data_to_sync_tp,
@@ -696,7 +696,7 @@ class SchedulerPPMixin:
         self.length_predictor.set_target_latency(self.chunked_prefill_size)
         self.length_predictor.is_ready = True
         logger.info(
-            f"[PP Dynamic Chunk] [PP{self.pp_rank}] Predictor ready (quadratic). "
+            f"[PP Dynamic Chunk] [PP{self.ps.pp_rank}] Predictor ready (quadratic). "
             f"Target latency: {self.length_predictor.target_latency:.2f}ms"
         )
 
@@ -728,7 +728,7 @@ class SchedulerPPMixin:
 
         if predicted_size is not None:
             logger.debug(
-                f"[PP Dynamic Chunk] [PP{self.pp_rank}] Predicted chunk size: "
+                f"[PP Dynamic Chunk] [PP{self.ps.pp_rank}] Predicted chunk size: "
                 f"{predicted_size} (history_len={history_len})"
             )
 
@@ -886,32 +886,32 @@ class SchedulerPPMixin:
 
     def _pp_send_pyobj_to_next_stage(self: Scheduler, data, async_send: bool = False):
         p2p_work = []
-        if self.attn_tp_rank == 0 and self.attn_cp_rank == 0:
-            dp_offset = self.attn_dp_rank * self.attn_tp_size
+        if self.ps.attn_tp_rank == 0 and self.ps.attn_cp_rank == 0:
+            dp_offset = self.ps.attn_dp_rank * self.ps.attn_tp_size
             p2p_work = point_to_point_pyobj(
                 data,
-                self.pp_rank * self.tp_size + dp_offset,
+                self.ps.pp_rank * self.ps.tp_size + dp_offset,
                 self.world_group.cpu_group,
-                self.pp_rank * self.tp_size + dp_offset,
-                ((self.pp_rank + 1) % self.pp_size) * self.tp_size + dp_offset,
+                self.ps.pp_rank * self.ps.tp_size + dp_offset,
+                ((self.ps.pp_rank + 1) % self.ps.pp_size) * self.ps.tp_size + dp_offset,
                 async_send=async_send,
             )
         return p2p_work
 
     def _pp_recv_pyobj_from_prev_stage(self: Scheduler):
-        if self.attn_tp_rank == 0 and self.attn_cp_rank == 0:
-            dp_offset = self.attn_dp_rank * self.attn_tp_size
+        if self.ps.attn_tp_rank == 0 and self.ps.attn_cp_rank == 0:
+            dp_offset = self.ps.attn_dp_rank * self.ps.attn_tp_size
             data = point_to_point_pyobj(
                 [],
-                self.pp_rank * self.tp_size + dp_offset,
+                self.ps.pp_rank * self.ps.tp_size + dp_offset,
                 self.world_group.cpu_group,
-                ((self.pp_rank - 1) % self.pp_size) * self.tp_size + dp_offset,
-                self.pp_rank * self.tp_size + dp_offset,
+                ((self.ps.pp_rank - 1) % self.ps.pp_size) * self.ps.tp_size + dp_offset,
+                self.ps.pp_rank * self.ps.tp_size + dp_offset,
             )
         else:
             data = None
 
-        if self.attn_tp_size > 1:
+        if self.ps.attn_tp_size > 1:
             data = broadcast_pyobj(
                 data,
                 self.attn_tp_group.rank,
@@ -919,7 +919,7 @@ class SchedulerPPMixin:
                 src=self.attn_tp_group.ranks[0],
             )
 
-        if self.attn_cp_size > 1:
+        if self.ps.attn_cp_size > 1:
             data = broadcast_pyobj(
                 data,
                 self.attn_cp_group.rank,
@@ -1120,7 +1120,7 @@ class SchedulerPPMixin:
 
         # CUDA: send first
         # XPU: even ranks send first, odd ranks recv first.
-        send_first = (not is_xpu()) or ((self.pp_rank % 2) == 0)
+        send_first = (not is_xpu()) or ((self.ps.pp_rank % 2) == 0)
 
         def _do_send():
             return self._pp_send_output_to_next_stage(
