@@ -82,6 +82,14 @@ rm -f python/pyproject.toml && mv python/pyproject_other.toml python/pyproject.t
 pip install -e "python[all_musa]"
 ```
 
+## Platform-Specific: Intel XPU
+
+For Intel Data Center GPU Max or Arc GPUs, follow the [XPU installation guide](../platforms/xpu.md) to set up the base environment, then install diffusion dependencies:
+
+```bash
+pip install -e "python[diffusion]"
+```
+
 ## Platform-Specific: Ascend NPU
 
 For Ascend NPU, please follow the [NPU installation guide](../platforms/ascend/ascend_npu.md).
