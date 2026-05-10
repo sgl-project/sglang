@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sys
 from typing import Tuple, Union
 
 import pytest
@@ -257,4 +258,4 @@ def test_prefill_multibatch(mode: str) -> None:
 
 
 if __name__ == "__main__":
-    pytest.main([__file__, "-v"])
+    sys.exit(pytest.main([__file__, "-v"]))
