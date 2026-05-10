@@ -121,8 +121,7 @@ from sglang.srt.model_executor.forward_batch_info import (
 )
 from sglang.srt.model_executor.hook_manager import register_forward_hooks
 from sglang.srt.model_executor.kernel_warmup import (
-    _flashinfer_autotune_cache_path,
-    _should_run_flashinfer_autotune,
+    kernel_warmup,
 )
 from sglang.srt.model_executor.model_runner_kv_cache_mixin import (
     ModelRunnerKVCacheMixin,
@@ -728,7 +727,24 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if self.device == "cuda" or self.device == "musa":
             init_cublas()
             self.init_attention_backend()
-            self.kernel_warmup()
+            kernel_warmup(
+                device=self.device,
+                server_args=self.server_args,
+                spec_algorithm=self.spec_algorithm,
+                is_draft_worker=self.is_draft_worker,
+                model_config=self.model_config,
+                dtype=self.dtype,
+                forward_stream=self.forward_stream,
+                req_to_token_pool_size=self.req_to_token_pool.size,
+                tp_rank=self.tp_rank,
+                tp_size=self.tp_size,
+                pp_rank=self.pp_rank,
+                pp_size=self.pp_size,
+                dp_rank=self.dp_rank,
+                dp_size=self.dp_size,
+                moe_ep_size=self.moe_ep_size,
+                dummy_run_callable=self._dummy_run,
+            )
             # Init hisparse coordinator (must happen before CUDA graph capture)
             if self.enable_hisparse:
                 from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
@@ -1782,21 +1798,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         full_attention_backend = ATTENTION_BACKENDS[backend_str](self)
         return attn_backend_wrapper(self, full_attention_backend)
 
-    def kernel_warmup(self):
-        """
-        Warmup and tune kernels before cuda graph capture.
-        Currently only doing FlashInfer autotune.
-        """
-        if self.device != "cuda":
-            return
-
-        if _should_run_flashinfer_autotune(
-            server_args=self.server_args,
-            spec_algorithm=self.spec_algorithm,
-            is_draft_worker=self.is_draft_worker,
-        ):
-            self._flashinfer_autotune()
-
     def _pre_initialize_flashinfer_allreduce_workspace(self):
         """Pre-initialize flashinfer allreduce fusion workspaces.
 
@@ -1817,34 +1818,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             hidden_dim=self.model_config.hidden_size,
             dtype=self.dtype,
         )
-
-    def _flashinfer_autotune(self):
-        """Run flashinfer autotune."""
-        from flashinfer.autotuner import autotune
-
-        cache_path = _flashinfer_autotune_cache_path(
-            server_args=self.server_args,
-            model_config=self.model_config,
-            dtype=self.dtype,
-            device=self.device,
-            tp_rank=self.tp_rank,
-            tp_size=self.tp_size,
-            pp_rank=self.pp_rank,
-            pp_size=self.pp_size,
-            dp_rank=self.dp_rank,
-            dp_size=self.dp_size,
-            moe_ep_size=self.moe_ep_size,
-        )
-        logger.info("Running FlashInfer autotune with cache: %s", cache_path)
-
-        # Run warmup on the non-default stream to avoid NCCL 2.29+ cudaMemcpyBatchAsync
-        # calls on default stream (unsupported by CUDA) when --enable-symm-mem is used.
-        self.forward_stream.wait_stream(torch.cuda.current_stream())
-        with torch.get_device_module(self.device).stream(self.forward_stream):
-            with torch.inference_mode(), autotune(True, cache=str(cache_path)):
-                self._dummy_run(batch_size=self.req_to_token_pool.size)
-        torch.cuda.current_stream().wait_stream(self.forward_stream)
-        logger.info("FlashInfer autotune completed.")
 
     def _dummy_run(self, batch_size: int, run_ctx=None):
         """Run a dummy forward pass for warmup/profiling."""
