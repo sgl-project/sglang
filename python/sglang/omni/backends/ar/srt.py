@@ -13,7 +13,7 @@ import base64
 from dataclasses import dataclass
 from io import BytesIO
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, Literal
 
 from sglang.omni.protocol import (
     ARBackend,
@@ -26,6 +26,19 @@ from sglang.omni.protocol import (
     OmniRequest,
 )
 from sglang.srt.omni_session.middle import SRTBackedOmniSessionBridge
+from sglang.srt.omni_session.runtime import (
+    OmniDecodeResult,
+    OmniVLMTextGenerationResult,
+)
+from sglang.srt.omni_session.runtime_protocol import (
+    OmniContextBundle as SRTOmniContextBundle,
+    OmniContextHandle as SRTOmniContextHandle,
+)
+
+
+@dataclass(slots=True)
+class _VLMBackendContext:
+    result: OmniVLMTextGenerationResult
 
 
 @dataclass(slots=True)
@@ -37,7 +50,7 @@ class SRTBackedContextOps(ContextOps):
 
     @property
     def metadata(self) -> dict[str, Any]:
-        return _backend_context(self.context).full.metadata
+        return _srt_backend_context(self.context).full.metadata
 
     @property
     def generation_kind(self) -> str | None:
@@ -45,7 +58,7 @@ class SRTBackedContextOps(ContextOps):
 
     @property
     def session_id(self) -> str:
-        session = _backend_context(self.context).full.session
+        session = _srt_backend_context(self.context).full.session
         if session is None:
             raise ValueError("SRT-backed omni context ops require a session handle")
         return session.session_id
@@ -129,14 +142,16 @@ class SRTARBackend(ARBackend):
         *,
         session_id: str | None = None,
     ) -> OmniContextBundle:
-        context = self.bridge.prepare_ar_context_from_messages(
-            messages=[_to_legacy_message(message) for message in request.messages],
-            think=request.think,
-            think_max_new_tokens=request.think_max_new_tokens,
-            sampling_params=request.sampling_params,
-            session_id=session_id,
+        context = _srt_context_bundle_to_omni(
+            self.bridge.prepare_ar_context_from_messages(
+                messages=[_to_legacy_message(message) for message in request.messages],
+                think=request.think,
+                think_max_new_tokens=request.think_max_new_tokens,
+                sampling_params=request.sampling_params,
+                session_id=session_id,
+            )
         )
-        return _coerce_context_bundle(context)
+        return context
 
     def decode_until_boundary(
         self,
@@ -148,8 +163,8 @@ class SRTARBackend(ARBackend):
         pending_boundaries = context.metadata.get("pending_boundaries")
         if pending_boundaries:
             return pending_boundaries.pop(0)
-        return _coerce_boundary(
-            self.bridge.continue_ar_decode(contexts=_backend_context(context))
+        return _decode_result_to_boundary(
+            self.bridge.continue_ar_decode(contexts=_srt_backend_context(context))
         )
 
     def append_generated_segment(
@@ -162,7 +177,7 @@ class SRTARBackend(ARBackend):
         if request.mode != "interleave":
             return context
         self.bridge.commit_generated_segment(
-            contexts=_backend_context(context),
+            contexts=_srt_backend_context(context),
             segment=segment,
         )
         return context
@@ -174,31 +189,28 @@ class SRTARBackend(ARBackend):
         if _is_vlm_backend_context(context):
             _release_vlm_context(self.bridge, context)
             return
-        self.bridge.release(_backend_context(context))
+        self.bridge.release(_srt_backend_context(context))
 
     def _prepare_vlm_context(self, request: OmniRequest) -> OmniContextBundle:
         result = self.bridge.generate_vlm_text(
             messages=[_to_legacy_message(message) for message in request.messages],
             max_new_tokens=_resolve_vlm_max_new_tokens(request),
         )
-        session = getattr(result, "session", None)
+        session = result.session
         metadata = _vlm_text_metadata(result)
         context = OmniContextBundle(
             full=OmniContextRef(
-                context_id=str(
-                    getattr(session, "anchor_request_id", None)
-                    or getattr(session, "session_id", None)
-                    or "vlm"
-                ),
-                token_count=int(getattr(session, "context_length", 0) or 0),
-                session_id=getattr(session, "session_id", None),
+                context_id=session.anchor_request_id,
+                token_count=session.context_length,
+                session_id=session.session_id,
+                version=session.context_version,
                 metadata={"mode": "vlm"},
             ),
             metadata={
                 "pending_boundaries": [
                     OmniBoundary(
                         type="text",
-                        text=getattr(result, "text", "") or "",
+                        text=result.text,
                         token_ids=tuple(
                             int(token_id) for token_id in metadata.pop("token_ids", ())
                         ),
@@ -207,7 +219,7 @@ class SRTARBackend(ARBackend):
                     OmniBoundary(type="done"),
                 ],
             },
-            backend_context=SimpleNamespace(vlm_result=result),
+            backend_context=_VLMBackendContext(result=result),
         )
         return context
 
@@ -215,10 +227,13 @@ class SRTARBackend(ARBackend):
 def _to_legacy_message(message: OmniInputSegment) -> dict[str, Any]:
     if message.type == "text":
         return {"type": "text", "text": message.text or ""}
-    value = getattr(message, message.type)
     if message.type == "image":
-        value = _decode_image_payload(value)
-    return {"type": message.type, message.type: value}
+        return {"type": "image", "image": _decode_image_payload(message.image)}
+    if message.type == "audio":
+        return {"type": "audio", "audio": message.audio}
+    if message.type == "video":
+        return {"type": "video", "video": message.video}
+    raise ValueError(f"Unsupported omni input segment type: {message.type!r}")
 
 
 def _decode_image_payload(image: Any) -> Any:
@@ -234,91 +249,62 @@ def _decode_image_payload(image: Any) -> Any:
     return Image.open(BytesIO(base64.b64decode(b64_json))).convert("RGB")
 
 
-def _coerce_boundary(boundary: Any) -> OmniBoundary:
-    if isinstance(boundary, OmniBoundary):
-        return boundary
-    boundary_type = getattr(boundary, "type")
-    if boundary_type == "image_marker":
-        boundary_type = "image"
+def _decode_result_to_boundary(boundary: OmniDecodeResult) -> OmniBoundary:
+    boundary_type: Literal["text", "image", "done"]
+    boundary_type = "image" if boundary.type == "image_marker" else boundary.type
     return OmniBoundary(
         type=boundary_type,
-        text=getattr(boundary, "text", None),
-        token_ids=tuple(getattr(boundary, "token_ids", ()) or ()),
-        metadata=dict(getattr(boundary, "metadata", {}) or {}),
+        text=boundary.text,
+        token_ids=boundary.token_ids,
     )
 
 
-def _coerce_context_bundle(context: Any) -> OmniContextBundle:
-    if isinstance(context, OmniContextBundle):
-        return context
-
-    full = getattr(context, "full", context)
-    text_cfg = getattr(context, "text_cfg", None)
-    image_cfg = getattr(context, "image_cfg", None)
+def _srt_context_bundle_to_omni(context: SRTOmniContextBundle) -> OmniContextBundle:
     return OmniContextBundle(
-        full=_coerce_context_ref(full),
-        text_cfg=_coerce_context_ref(text_cfg) if text_cfg is not None else None,
-        image_cfg=_coerce_context_ref(image_cfg) if image_cfg is not None else None,
-        metadata=dict(getattr(context, "metadata", {}) or {}),
+        full=_srt_context_handle_to_omni(context.full),
+        text_cfg=_srt_context_handle_to_omni(context.text_cfg),
+        image_cfg=_srt_context_handle_to_omni(context.image_cfg),
+        metadata={},
         backend_context=context,
     )
 
 
-def _coerce_context_ref(ref: Any) -> OmniContextRef:
-    if isinstance(ref, OmniContextRef):
-        return ref
-    session = getattr(ref, "session", None)
+def _srt_context_handle_to_omni(ref: SRTOmniContextHandle) -> OmniContextRef:
+    session = ref.session
     return OmniContextRef(
-        context_id=str(
-            getattr(ref, "context_id", None)
-            or getattr(ref, "request_id", None)
-            or getattr(session, "anchor_request_id", "")
-        ),
-        token_count=int(
-            getattr(ref, "token_count", None)
-            or getattr(ref, "context_length", None)
-            or getattr(session, "context_length", 0)
-            or 0
-        ),
-        session_id=getattr(ref, "session_id", None)
-        or getattr(session, "session_id", None),
-        version=int(
-            getattr(ref, "version", None)
-            or getattr(ref, "context_version", None)
-            or getattr(session, "context_version", 0)
-            or 0
-        ),
-        metadata=dict(getattr(ref, "metadata", {}) or {}),
+        context_id=ref.request_id,
+        token_count=ref.token_count,
+        session_id=None if session is None else session.session_id,
+        version=0 if session is None else session.context_version,
+        metadata=dict(ref.metadata),
     )
 
 
-def _backend_context(context: OmniContextBundle) -> Any:
-    return context.backend_context if context.backend_context is not None else context
+def _srt_backend_context(context: OmniContextBundle) -> SRTOmniContextBundle:
+    backend_context = context.backend_context
+    if not isinstance(backend_context, SRTOmniContextBundle):
+        raise ValueError("SRT omni context requires an SRT backend context")
+    return backend_context
 
 
 def _session_id_for_context(context: OmniContextBundle) -> str:
     if context.full.session_id is not None:
         return context.full.session_id
-    session = getattr(_backend_context(context).full, "session", None)
-    session_id = getattr(session, "session_id", None)
-    if session_id is None:
-        raise ValueError("Persistent omni session requires a live SRT session")
-    return str(session_id)
+    raise ValueError("Persistent omni session requires a live SRT session")
 
 
 def _is_vlm_backend_context(context: OmniContextBundle) -> bool:
-    return getattr(_backend_context(context), "vlm_result", None) is not None
+    return isinstance(context.backend_context, _VLMBackendContext)
 
 
-def _release_vlm_context(bridge: Any, context: OmniContextBundle) -> None:
-    result = getattr(_backend_context(context), "vlm_result", None)
-    session = getattr(result, "session", None)
-    if session is None:
+def _release_vlm_context(
+    bridge: SRTBackedOmniSessionBridge,
+    context: OmniContextBundle,
+) -> None:
+    backend_context = context.backend_context
+    if not isinstance(backend_context, _VLMBackendContext):
         return
-    runtime = getattr(bridge, "runtime", None)
-    close_session = getattr(runtime, "close_session", None)
-    if callable(close_session):
-        close_session(session)
+    bridge.runtime.close_session(backend_context.result.session)
 
 
 def _resolve_vlm_max_new_tokens(request: OmniRequest) -> int:
@@ -337,17 +323,16 @@ def _resolve_vlm_max_new_tokens(request: OmniRequest) -> int:
     return value
 
 
-def _vlm_text_metadata(result: Any) -> dict[str, Any]:
+def _vlm_text_metadata(result: OmniVLMTextGenerationResult) -> dict[str, Any]:
     metadata = {}
-    output_ids = getattr(result, "next_token_ids", ())
-    if output_ids:
-        metadata["token_ids"] = [int(token_id) for token_id in output_ids]
-    input_ids = getattr(result, "token_ids", ())
-    if input_ids:
-        metadata["input_token_ids"] = [int(token_id) for token_id in input_ids]
-    position_ids = getattr(result, "position_ids", ())
-    if position_ids:
-        metadata["position_ids"] = [int(position_id) for position_id in position_ids]
+    if result.next_token_ids:
+        metadata["token_ids"] = [int(token_id) for token_id in result.next_token_ids]
+    if result.token_ids:
+        metadata["input_token_ids"] = [int(token_id) for token_id in result.token_ids]
+    if result.position_ids:
+        metadata["position_ids"] = [
+            int(position_id) for position_id in result.position_ids
+        ]
     return metadata
 
 

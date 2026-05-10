@@ -13,14 +13,14 @@ from dataclasses import dataclass
 from typing import Any
 
 from sglang.omni.entrypoints.http_server import _serialize_response
-from sglang.omni.protocol import OmniRequest
+from sglang.omni.protocol import OmniContextBundle, OmniRequest
 
 _SENSENOVA_U1_CACHE_KEY = "sensenova-u1"
 
 
 @dataclass(slots=True)
 class _OmniSessionRecord:
-    context: Any
+    context: OmniContextBundle
     turns: int
     created_at: float
     updated_at: float
@@ -149,13 +149,7 @@ def _resolve_required_session_id(payload: dict[str, Any]) -> str:
     return session_id
 
 
-def _context_session_id(context: Any) -> str:
-    session_id = getattr(getattr(context, "full", None), "session_id", None)
-    if session_id is None:
-        backend_context = getattr(context, "backend_context", None)
-        full = getattr(backend_context, "full", None)
-        session = getattr(full, "session", None)
-        session_id = getattr(session, "session_id", None)
-    if session_id is None:
+def _context_session_id(context: OmniContextBundle) -> str:
+    if context.full.session_id is None:
         raise ValueError("Persistent omni request did not produce a session id")
-    return str(session_id)
+    return context.full.session_id
