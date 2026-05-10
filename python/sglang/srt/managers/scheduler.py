@@ -1797,6 +1797,7 @@ class Scheduler(
                 require_reasoning=recv_req.require_reasoning,
                 return_hidden_states=recv_req.return_hidden_states,
                 return_routed_experts=recv_req.return_routed_experts,
+                routed_experts_start_len=recv_req.routed_experts_start_len,
                 eos_token_ids=self.model_config.hf_eos_token_id,
                 bootstrap_host=recv_req.bootstrap_host,
                 bootstrap_port=recv_req.bootstrap_port,
@@ -1935,6 +1936,27 @@ class Scheduler(
             req.set_finish_with_abort(error_msg)
             self._add_request_to_queue(req)
             return
+
+        if recv_req.return_routed_experts:
+            error_msg = None
+            if recv_req.routed_experts_start_len < 0:
+                error_msg = (
+                    f"{recv_req.routed_experts_start_len=} is lower than 0. "
+                    "Please use a non-negative routed_experts_start_len."
+                )
+
+            if recv_req.routed_experts_start_len > len(req.origin_input_ids):
+                error_msg = (
+                    f"{recv_req.routed_experts_start_len=} is higher than the "
+                    f"number of input tokens {len(req.origin_input_ids)=}. Please "
+                    f"use a smaller routed_experts_start_len."
+                )
+
+            if error_msg is not None:
+                req.routed_experts_start_len = 0
+                req.set_finish_with_abort(error_msg)
+                self._add_request_to_queue(req)
+                return
 
         added_to_grammar_queue = self.grammar_manager.process_req_with_grammar(req)
         if not added_to_grammar_queue:

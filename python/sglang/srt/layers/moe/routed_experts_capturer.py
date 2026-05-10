@@ -164,6 +164,7 @@ class RoutedExpertsCapturer(ABC):
         req_pool_idx: int,
         seqlen: int,
         req_to_token_pool: ReqToTokenPool,
+        start_len: int = 0,
     ):
         raise NotImplementedError
 
@@ -275,9 +276,15 @@ class _RoutedExpertsCapturerReal(RoutedExpertsCapturer):
         req_pool_idx: int,
         seqlen: int,
         req_to_token_pool: ReqToTokenPool,
+        start_len: int = 0,
     ):
+        if start_len < 0:
+            raise ValueError(f"{start_len=} must be non-negative")
+        start_len = min(start_len, seqlen - 1)
         cache_pool_idx = (
-            req_to_token_pool.req_to_token[req_pool_idx][: seqlen - 1].cpu().clone()
+            req_to_token_pool.req_to_token[req_pool_idx][start_len : seqlen - 1]
+            .cpu()
+            .clone()
         )
         return self.get_host_cache().buffer[cache_pool_idx]
 
@@ -325,6 +332,7 @@ class _RoutedExpertsCapturerNoop(RoutedExpertsCapturer):
         req_pool_idx: int,
         seqlen: int,
         req_to_token_pool: ReqToTokenPool,
+        start_len: int = 0,
     ):
         pass
 
