@@ -28,7 +28,6 @@ from typing import Optional, Tuple, Union
 
 import torch
 import torch.distributed as dist
-from torch import nn
 
 from sglang.srt.configs.device_config import DeviceConfig
 from sglang.srt.configs.load_config import LoadConfig, LoadFormat
@@ -132,6 +131,7 @@ from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
     register_memory_region,
     trigger_init_weights_send_group_for_remote_instance_request,
 )
+from sglang.srt.model_loader.utils import resolve_language_model
 from sglang.srt.platforms import current_platform
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.server_args import (
@@ -237,17 +237,6 @@ UNBALANCED_MODEL_LOADING_TIMEOUT_S = 480  # leave more time for post data proces
 
 
 logger = logging.getLogger(__name__)
-
-
-def resolve_language_model(model: nn.Module) -> nn.Module:
-    model_cls_name = model.__class__.__name__
-    if model_cls_name == "Qwen3OmniMoeForConditionalGeneration":
-        return model.thinker.model
-    if hasattr(model, "model"):
-        return model.model
-    if hasattr(model, "language_model"):
-        return model.language_model
-    return model.model
 
 
 @dataclass
