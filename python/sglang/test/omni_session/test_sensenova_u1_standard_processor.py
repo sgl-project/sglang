@@ -21,7 +21,6 @@ class FakeTokenizer:
     }
 
     def __call__(self, text, return_tensors=None, add_special_tokens=True):
-        del return_tensors, add_special_tokens
         return {"input_ids": torch.tensor([[ord(ch) for ch in text]])}
 
     def convert_tokens_to_ids(self, token):

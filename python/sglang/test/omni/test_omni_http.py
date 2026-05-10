@@ -19,29 +19,25 @@ class _ScriptedARBackend:
         self._boundaries = list(boundaries)
 
     def prepare_context(self, request):
-        del request
         return OmniContextBundle(full=OmniContextRef(context_id="scripted"))
 
     def decode_until_boundary(self, context, *, request):
-        del context, request
         if not self._boundaries:
             return OmniBoundary(type="done")
         return self._boundaries.pop(0)
 
     def append_generated_segment(self, context, segment, *, request):
-        del segment, request
         return context
 
     def get_context_ops(self, context):
         return None
 
     def release(self, context):
-        del context
+        return None
 
 
 class _ImageBackend:
     def generate_segment(self, request, context_ops):
-        del request, context_ops
         return GeneratedSegment(type="image", image={"b64_json": "abc"})
 
 

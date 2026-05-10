@@ -191,15 +191,13 @@ class _FakeBridge:
         return SimpleNamespace(full=full, text_cfg=None, image_cfg=None)
 
     def commit_generated_segment(self, **kwargs):
-        del kwargs
         self.commit_count += 1
 
     def continue_ar_decode(self, **kwargs):
-        del kwargs
         return SimpleNamespace(type="done")
 
     def release(self, contexts):
-        del contexts
+        return None
 
 
 class _FakeRuntime:
@@ -216,7 +214,6 @@ class _FakeVLMBridge:
         self.max_new_tokens = None
 
     def generate_vlm_text(self, *, messages, max_new_tokens):
-        del messages
         self.max_new_tokens = max_new_tokens
         session = SimpleNamespace(
             anchor_request_id="r1",

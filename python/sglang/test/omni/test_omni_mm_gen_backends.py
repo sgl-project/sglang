@@ -12,13 +12,12 @@ from sglang.omni.protocol import GeneratedSegment, OmniInputSegment, OmniRequest
 
 
 class TestOmniMMGenBackends(unittest.TestCase):
-    def test_pipeline_backend_passes_context_ops_through_req_extra(self):
+    def test_pipeline_backend_passes_context_ops_through_req_field(self):
         pipeline = _FakePipeline()
         server_args = SimpleNamespace()
         backend = DirectPipelineForwardBackend(
             pipeline=pipeline,
             server_args=server_args,
-            context_ops_extra_key="ctx",
         )
         context_ops = SimpleNamespace(metadata={"session": "s0"})
         request = OmniRequest(
@@ -37,7 +36,7 @@ class TestOmniMMGenBackends(unittest.TestCase):
         self.assertEqual("image-bytes", segment.image)
         self.assertEqual("commit-image", segment.commit_payload)
         self.assertEqual(server_args, pipeline.server_args)
-        self.assertIs(context_ops, pipeline.batch.extra["ctx"])
+        self.assertIs(context_ops, pipeline.batch.omni_context_ops)
         self.assertEqual(
             [
                 {"type": "text", "text": "draw"},
@@ -55,7 +54,6 @@ class TestOmniMMGenBackends(unittest.TestCase):
         backend = DirectPipelineForwardBackend(
             pipeline=_EmptyPipeline(),
             server_args=SimpleNamespace(),
-            context_ops_extra_key="ctx",
         )
         request = OmniRequest(
             messages=(OmniInputSegment(type="text", text="draw"),),
@@ -75,7 +73,6 @@ class TestOmniMMGenBackends(unittest.TestCase):
             executor=executor,
             stages=stages,
             server_args=server_args,
-            context_ops_extra_key="ctx",
         )
         context_ops = SimpleNamespace(metadata={"session": "s1"})
         request = OmniRequest(
@@ -91,7 +88,7 @@ class TestOmniMMGenBackends(unittest.TestCase):
         self.assertEqual("executor-image", segment.image)
         self.assertEqual(stages, executor.stages)
         self.assertEqual(server_args, executor.server_args)
-        self.assertIs(context_ops, executor.batch.extra["ctx"])
+        self.assertIs(context_ops, executor.batch.omni_context_ops)
 
 
 class _FakePipeline:
@@ -112,7 +109,6 @@ class _FakePipeline:
 
 class _EmptyPipeline:
     def forward(self, batch, server_args):
-        del server_args
         return batch
 
 

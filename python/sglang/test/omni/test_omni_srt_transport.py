@@ -13,6 +13,7 @@ from sglang.omni.protocol import (
     OmniOutputSegment,
     OmniResponse,
 )
+from sglang.omni.scheduler_state import OmniSchedulerState
 from sglang.omni.srt_transport import handle_omni_generate_with_omni_coordinator
 from sglang.srt.managers.io_struct import OmniGenerateReqInput, OmniGenerateReqOutput
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
@@ -33,7 +34,6 @@ class FakeOrchestrator:
         release_context=True,
         stop_after_generation_limit=False,
     ):
-        del stop_after_generation_limit
         self.requests.append(request)
         if context is None:
             context = OmniContextBundle(
@@ -74,7 +74,6 @@ class FakeTokenizerManager:
         self.obj = None
 
     async def omni_generate(self, obj, request):
-        del request
         self.obj = obj
         return OmniGenerateReqOutput(
             rid=obj.rid,
@@ -87,7 +86,9 @@ class TestOmniSRTTransport(unittest.TestCase):
     def test_scheduler_transport_uses_cached_orchestrator_and_serializes_images(self):
         orchestrator = FakeOrchestrator()
         scheduler = SimpleNamespace(
-            _omni_orchestrators={"sensenova-u1": orchestrator},
+            omni_scheduler_state=OmniSchedulerState(
+                orchestrators={"sensenova-u1": orchestrator},
+            ),
             server_args=SimpleNamespace(),
         )
 
@@ -106,7 +107,9 @@ class TestOmniSRTTransport(unittest.TestCase):
     def test_scheduler_transport_keeps_and_continues_session(self):
         orchestrator = FakeOrchestrator()
         scheduler = SimpleNamespace(
-            _omni_orchestrators={"sensenova-u1": orchestrator},
+            omni_scheduler_state=OmniSchedulerState(
+                orchestrators={"sensenova-u1": orchestrator},
+            ),
             server_args=SimpleNamespace(),
         )
 
@@ -143,7 +146,10 @@ class TestOmniSRTTransport(unittest.TestCase):
     def test_scheduler_transport_rejects_unknown_model(self):
         with self.assertRaisesRegex(ValueError, "Unsupported omni model"):
             handle_omni_generate_with_omni_coordinator(
-                scheduler=SimpleNamespace(server_args=SimpleNamespace()),
+                scheduler=SimpleNamespace(
+                    omni_scheduler_state=OmniSchedulerState(),
+                    server_args=SimpleNamespace(),
+                ),
                 payload={
                     "model": "other-model",
                     "messages": [{"type": "text", "text": "draw"}],

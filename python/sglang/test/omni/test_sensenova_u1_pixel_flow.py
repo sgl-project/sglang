@@ -36,7 +36,7 @@ class TestSenseNovaU1PixelFlow(unittest.TestCase):
             batch=batch,
             u1_context=SimpleNamespace(
                 session_id="s0",
-                sidecar_role=None,
+                condition_path_role=None,
                 position_count=5,
             ),
         )
@@ -73,14 +73,14 @@ class TestSenseNovaU1PixelFlow(unittest.TestCase):
             batch=batch,
             u1_context=SimpleNamespace(
                 session_id="s0",
-                sidecar_role=None,
+                condition_path_role=None,
                 position_count=5,
             ),
         )
 
         self.assertEqual(19, prepared.seed)
 
-    def test_edit_cfg_uses_image_condition_sidecar(self):
+    def test_edit_cfg_uses_image_condition_path(self):
         params = build_sensenova_u1_sampling_params(
             {
                 "cfg_text_scale": 4.0,
@@ -97,7 +97,7 @@ class TestSenseNovaU1PixelFlow(unittest.TestCase):
 
         self.assertEqual("s0", full.session_id)
         self.assertEqual(10, full.position_count)
-        self.assertEqual("u1_edit_img_condition", img_condition.sidecar_role)
+        self.assertEqual("u1_edit_img_condition", img_condition.condition_path_role)
         self.assertEqual(8, img_condition.position_count)
         self.assertIsNone(uncondition)
 
@@ -138,15 +138,14 @@ class _FakeContextOps:
     session_id = "s0"
 
     def get_role(self, name, default):
-        del name
         return default
 
-    def get_position_count(self, *, sidecar_role=None):
+    def get_position_count(self, *, condition_path_role=None):
         counts = {
             None: 10,
             "u1_edit_img_condition": 8,
         }
-        return counts[sidecar_role]
+        return counts[condition_path_role]
 
 
 if __name__ == "__main__":

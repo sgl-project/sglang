@@ -23,20 +23,17 @@ class _InMemoryContextOps:
     session_id: str | None = None
 
     def get_role(self, name: str, default: str):
-        del name
         return default
 
     def get_model(self):
         return None
 
-    def get_position_count(self, *, sidecar_role: str | None = None):
-        del sidecar_role
+    def get_position_count(self, *, condition_path_role: str | None = None):
         return 0
 
     def build_temporary_forward_batch(
         self, *, prepared, generation_query_embeds, timestep
     ):
-        del prepared, generation_query_embeds, timestep
         raise RuntimeError("no temporary forward backend")
 
 
@@ -65,13 +62,11 @@ class _ScriptedARBackend:
         return context
 
     def decode_until_boundary(self, context, *, request):
-        del context, request
         if not self._boundaries:
             return OmniBoundary(type="done")
         return self._boundaries.pop(0)
 
     def append_generated_segment(self, context, segment, *, request):
-        del request
         self.appended_segments.append(segment)
         context.full.version += 1
         context.full.metadata["last_generated_type"] = segment.type
