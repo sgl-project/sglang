@@ -79,7 +79,7 @@ from sglang.srt.distributed import (
     set_torch_symm_mem_all_reduce,
 )
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
-    use_symmetric_memory,
+    prealloc_symmetric_memory_pool,
 )
 from sglang.srt.distributed.parallel_state import monkey_patch_vllm_parallel_state
 from sglang.srt.elastic_ep.elastic_ep import (
@@ -815,7 +815,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # Initialize piecewise CUDA graph
         self.init_piecewise_cuda_graphs()
 
-        self.prealloc_symmetric_memory_pool()
+        prealloc_symmetric_memory_pool(
+            is_draft_worker=self.is_draft_worker,
+            enable_symm_mem=self.server_args.enable_symm_mem,
+            device=self.device,
+            forward_stream=self.forward_stream,
+        )
 
     def adjust_hybrid_swa_layers_for_pp(self):
         if not self.is_hybrid_swa:
@@ -3470,27 +3475,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         except Exception as e:
             logger.error(f"IPC weight update failed: {e}")
             return False, str(e)
-
-    def prealloc_symmetric_memory_pool(self):
-        # PyTorch mempools never de-fragment memory in OOM scenarios, so we need to pre-allocate a large chunk of memory to limit fragmentation.
-        if (
-            self.is_draft_worker
-            or not self.server_args.enable_symm_mem
-            or envs.SGLANG_SYMM_MEM_PREALLOC_GB_SIZE.get() <= 0
-        ):
-            return
-
-        # Memory allocation is tied to a cuda stream, use the forward stream
-        with torch.get_device_module(self.device).stream(self.forward_stream):
-            logger.info(
-                f"Pre-allocating symmetric memory pool with {envs.SGLANG_SYMM_MEM_PREALLOC_GB_SIZE.get()} GiB"
-            )
-            with use_symmetric_memory(get_tp_group()):
-                torch.empty(
-                    (envs.SGLANG_SYMM_MEM_PREALLOC_GB_SIZE.get() * 1024 * 1024 * 1024,),
-                    dtype=torch.uint8,
-                    device=self.device,
-                )
 
     def _maybe_rebalance_after_rank_fault(
         self,
