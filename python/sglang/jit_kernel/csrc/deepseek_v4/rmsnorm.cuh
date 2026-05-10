@@ -18,8 +18,10 @@ constexpr uint32_t kNumWarps = kBlockSize / device::kWarpThreads;
 struct RMSNormSelfParams {
   const void* __restrict__ input;
   void* __restrict__ output;
-  int64_t stride_batch_bytes;
-  int64_t stride_head_bytes;
+  int64_t stride_batch_bytes_0;
+  int64_t stride_head_bytes_0;
+  int64_t stride_batch_bytes_1;
+  int64_t stride_head_bytes_1;
   uint32_t batch_size;
   uint32_t num_head;
   float eps;
@@ -42,12 +44,12 @@ __global__ __launch_bounds__(kBlockSize, 20)  //
   if (batch_id >= params.batch_size) return;
   const auto input_ptr = pointer::offset(  //
       params.input,
-      batch_id * params.stride_batch_bytes,
-      head_id * params.stride_head_bytes);
-  // use contiguous layout
+      batch_id * params.stride_batch_bytes_0,
+      head_id * params.stride_head_bytes_0);
   const auto output_ptr = pointer::offset(  //
       params.output,
-      warp_id * kHeadDim * sizeof(DType));
+      batch_id * params.stride_batch_bytes_1,
+      head_id * params.stride_head_bytes_1);
   PDLWaitPrimary<kUsePDL>();  // wait for primary kernel
 
   Vec inputs[kNumLoop];
@@ -93,31 +95,30 @@ struct RMSNormKernel {
 
     auto N = SymbolicSize{"batch_size"};
     auto H = SymbolicSize{"num_heads"};
-    auto Dn = SymbolicSize{"stride_head"};
-    auto Dh = SymbolicSize{"stride_batch"};
     constexpr auto D = kHeadDim;
     auto device = SymbolicDevice{};
     device.set_options<kDLCUDA>();
 
     TensorMatcher({N, H, D})  // input
-        .with_strides({Dh, Dn, 1})
+        .with_strides({-1, -1, 1})
         .with_dtype<DType>()
         .with_device(device)
         .verify(input);
-    TensorMatcher({N, H, D})  // output, must be contiguous
+    TensorMatcher({N, H, D})  // output
+        .with_strides({-1, -1, 1})
         .with_dtype<DType>()
         .with_device(device)
         .verify(output);
 
     const auto batch_size = static_cast<uint32_t>(N.unwrap());
     const auto num_head = static_cast<uint32_t>(H.unwrap());
-    const auto stride_head_bytes = static_cast<int64_t>(Dn.unwrap() * sizeof(DType));
-    const auto stride_batch_bytes = static_cast<int64_t>(Dh.unwrap() * sizeof(DType));
     const auto params = RMSNormSelfParams{
         .input = input.data_ptr(),
         .output = output.data_ptr(),
-        .stride_batch_bytes = stride_batch_bytes,
-        .stride_head_bytes = stride_head_bytes,
+        .stride_batch_bytes_0 = static_cast<int64_t>(input.stride(0) * sizeof(DType)),
+        .stride_head_bytes_0 = static_cast<int64_t>(input.stride(1) * sizeof(DType)),
+        .stride_batch_bytes_1 = static_cast<int64_t>(output.stride(0) * sizeof(DType)),
+        .stride_head_bytes_1 = static_cast<int64_t>(output.stride(1) * sizeof(DType)),
         .batch_size = batch_size,
         .num_head = num_head,
         .eps = eps,
