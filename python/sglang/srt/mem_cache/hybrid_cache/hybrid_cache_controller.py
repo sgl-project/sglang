@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
-from typing import TYPE_CHECKING, Any, List, Optional
+from typing import TYPE_CHECKING, Any, Callable, List, Optional
 
 import torch
 
@@ -154,6 +154,8 @@ class HybridCacheController(BaseHiCacheController):
         page_size: int,
         tp_group: torch.distributed.ProcessGroup,
         load_cache_event: threading.Event,
+        attn_cp_group: Optional[torch.distributed.ProcessGroup] = None,
+        attn_tp_group: Optional[torch.distributed.ProcessGroup] = None,
         write_policy: str = "write_through_selective",
         io_backend: str = "",
         storage_backend: Optional[str] = None,
@@ -174,6 +176,8 @@ class HybridCacheController(BaseHiCacheController):
             page_size=page_size,
             tp_group=tp_group,
             load_cache_event=load_cache_event,
+            attn_cp_group=attn_cp_group,
+            attn_tp_group=attn_tp_group,
             write_policy=write_policy,
             io_backend=io_backend,
             storage_backend=None,
@@ -182,8 +186,6 @@ class HybridCacheController(BaseHiCacheController):
             storage_backend_extra_config=storage_backend_extra_config,
             pp_rank=pp_rank,
             pp_size=pp_size,
-            attn_cp_rank=attn_cp_rank,
-            attn_cp_size=attn_cp_size,
             enable_storage_metrics=enable_storage_metrics,
         )
         # Override layer_num: hybrid models transfer all layers (For example, Linear Model (KV + Mamba)),
@@ -261,7 +263,9 @@ class HybridCacheController(BaseHiCacheController):
         if not self.write_queue:
             return
         op = CacheOperation.merge_ops(self.write_queue)
-        host_indices, device_indices = self.move_indices(op)
+        host_indices, device_indices, resolved_pool_transfers = (
+            self.move_hybrid_indices(op)
+        )
         self.write_queue.clear()
         start_event = device_module.Event()
         finish_event = device_module.Event()
@@ -273,13 +277,15 @@ class HybridCacheController(BaseHiCacheController):
                 host_indices,
                 device_indices,
                 self.io_backend,
-                pool_transfers=op.pool_transfers,
+                pool_transfers=resolved_pool_transfers,
             )
             finish_event.record()
-            if host_indices.is_cuda:
-                host_indices.record_stream(self.write_stream)
-            if device_indices.is_cuda:
-                device_indices.record_stream(self.write_stream)
+            self._record_transfer_indices_on_stream(
+                self.write_stream,
+                host_indices,
+                device_indices,
+                resolved_pool_transfers,
+            )
         self.ack_write_queue.append(HiCacheAck(start_event, finish_event, op.node_ids))
 
     def load(
@@ -290,12 +296,18 @@ class HybridCacheController(BaseHiCacheController):
         extra_pools: Optional[list[PoolTransfer]] = None,
     ) -> Optional[torch.Tensor]:
         need_load_kv = host_indices.numel() > 0
-        if need_load_kv:
-            device_indices = self.mem_pool_device_allocator.alloc(len(host_indices))
+
+        full_allocator = getattr(
+            self.mem_pool_device_allocator,
+            "full_attn_allocator",
+            self.mem_pool_device_allocator,
+        )
+        if not need_load_kv:
+            device_indices = torch.empty((0,), dtype=torch.int64, device=self.device)
+        else:
+            device_indices = full_allocator.alloc(len(host_indices))
             if device_indices is None:
                 return None
-        else:
-            device_indices = torch.empty((0,), dtype=torch.int64, device=self.device)
 
         pool_transfers = self._resolve_pool_transfers_allocation(
             extra_pools,
@@ -305,7 +317,7 @@ class HybridCacheController(BaseHiCacheController):
         )
         if pool_transfers is None and extra_pools:
             if need_load_kv:
-                self.mem_pool_device_allocator.free(device_indices)
+                full_allocator.free(device_indices)
             return None
 
         self.load_queue.append(
@@ -324,7 +336,9 @@ class HybridCacheController(BaseHiCacheController):
             return -1
         producer_id = self.layer_done_counter.update_producer()
         op = CacheOperation.merge_ops(self.load_queue)
-        host_indices, device_indices = self.move_indices(op)
+        host_indices, device_indices, resolved_pool_transfers = (
+            self.move_hybrid_indices(op)
+        )
         self.load_queue.clear()
         producer_event = self.layer_done_counter.events[producer_id]
         producer_event.start_event.record()
@@ -337,13 +351,15 @@ class HybridCacheController(BaseHiCacheController):
                     device_indices,
                     i,
                     self.io_backend,
-                    pool_transfers=op.pool_transfers,
+                    pool_transfers=resolved_pool_transfers,
                 )
                 producer_event.complete(i)
-            if host_indices.is_cuda:
-                host_indices.record_stream(self.load_stream)
-            if device_indices.is_cuda:
-                device_indices.record_stream(self.load_stream)
+            self._record_transfer_indices_on_stream(
+                self.load_stream,
+                host_indices,
+                device_indices,
+                resolved_pool_transfers,
+            )
         self.ack_load_queue.append(
             HiCacheAck(
                 producer_event.start_event,
@@ -352,6 +368,23 @@ class HybridCacheController(BaseHiCacheController):
             )
         )
         return producer_id
+
+    def _record_transfer_indices_on_stream(
+        self,
+        stream: torch.Stream,
+        host_indices: torch.Tensor,
+        device_indices: torch.Tensor,
+        pool_transfers: Optional[list[PoolTransfer]] = None,
+    ) -> None:
+        if host_indices.is_cuda:
+            host_indices.record_stream(stream)
+        if device_indices.is_cuda:
+            device_indices.record_stream(stream)
+        for transfer in pool_transfers or []:
+            if transfer.host_indices is not None and transfer.host_indices.is_cuda:
+                transfer.host_indices.record_stream(stream)
+            if transfer.device_indices is not None and transfer.device_indices.is_cuda:
+                transfer.device_indices.record_stream(stream)
 
     def prefetch(
         self,
@@ -424,6 +457,33 @@ class HybridCacheController(BaseHiCacheController):
             kv_hit_pages * self.page_size,
         )
 
+    def move_hybrid_indices(
+        self, operation: CacheOperation
+    ) -> tuple[torch.Tensor, torch.Tensor, Optional[list[PoolTransfer]]]:
+        host_indices, device_indices = self.move_indices(
+            operation.host_indices, operation.device_indices
+        )
+        resolved_pool_transfers = None
+        if operation.pool_transfers:
+            resolved_pool_transfers = []
+            for transfer in operation.pool_transfers:
+                transfer_host_indices, transfer_device_indices = self.move_indices(
+                    transfer.host_indices, transfer.device_indices
+                )
+                # Keep the original PoolTransfer unchanged because tree-owned
+                # transfers may still reference radix-tree host state. The
+                # controller only needs a normalized execution-time copy.
+                resolved_pool_transfers.append(
+                    PoolTransfer(
+                        name=transfer.name,
+                        host_indices=transfer_host_indices,
+                        device_indices=transfer_device_indices,
+                        keys=transfer.keys,
+                        hit_policy=transfer.hit_policy,
+                    )
+                )
+        return host_indices, device_indices, resolved_pool_transfers
+
     def _page_transfer(self, operation):
         # Transfer extra pools
         if operation.pool_transfers and not operation.is_terminated():
@@ -481,7 +541,8 @@ class HybridCacheController(BaseHiCacheController):
         """Auto-alloc host or device indices for PoolTransfers where they are None."""
         if not extra_pools:
             return None
-        newly_allocated: list[tuple[PoolTransfer, Any, torch.Tensor]] = []
+        # (pool, free_fn, indices) for atomic rollback on failure.
+        newly_allocated: list[tuple[PoolTransfer, Callable, torch.Tensor]] = []
         for pool in extra_pools:
             entry = self.mem_pool_host.entry_map.get(pool.name)
             if entry is None:
@@ -493,27 +554,28 @@ class HybridCacheController(BaseHiCacheController):
             if alloc_host:
                 if pool.host_indices is not None or pool.device_indices is None:
                     continue
-                entry_pool, evict_fn, size = (
-                    entry.host_pool,
-                    entry.host_evict_fn,
-                    len(pool.device_indices),
-                )
+                alloc_fn = entry.host_pool.alloc
+                free_fn = entry.host_pool.free
+                evict_fn = entry.host_evict_fn
+                size = len(pool.device_indices)
             else:
                 if pool.device_indices is not None or pool.host_indices is None:
                     continue
-                entry_pool, evict_fn, size = (
-                    entry.device_pool,
-                    entry.device_evict_fn,
-                    len(pool.host_indices),
-                )
-            indices = entry_pool.alloc(size)
+                # device_alloc_fn / device_free_fn override entry.device_pool's
+                # methods for pools whose device_pool is a raw KV pool (layout)
+                # rather than an allocator (e.g. SWA).
+                alloc_fn = entry.device_alloc_fn or entry.device_pool.alloc
+                free_fn = entry.device_free_fn or entry.device_pool.free
+                evict_fn = entry.device_evict_fn
+                size = len(pool.host_indices)
+            indices = alloc_fn(size)
             if indices is None and evict_fn:
                 evict_fn(size)
-                indices = entry_pool.alloc(size)
+                indices = alloc_fn(size)
             if indices is None:
-                # Roll back all previous allocations using each pool's own entry_pool.
-                for prev_pool, prev_entry_pool, prev_indices in newly_allocated:
-                    prev_entry_pool.free(prev_indices)
+                # Atomic rollback: free everything we successfully allocated.
+                for prev_pool, prev_free_fn, prev_indices in newly_allocated:
+                    prev_free_fn(prev_indices)
                     if alloc_host:
                         prev_pool.host_indices = None
                     else:
@@ -523,5 +585,5 @@ class HybridCacheController(BaseHiCacheController):
                 pool.host_indices = indices
             else:
                 pool.device_indices = indices
-            newly_allocated.append((pool, entry_pool, indices))
+            newly_allocated.append((pool, free_fn, indices))
         return extra_pools

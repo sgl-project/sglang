@@ -99,26 +99,37 @@ class DFlashWorker:
         draft_server_args = deepcopy(server_args)
         draft_server_args.skip_tokenizer_init = True
         draft_backend = draft_server_args.speculative_draft_attention_backend
-        supported_draft_backends = ("flashinfer", "fa3", "fa4")
+        supported_draft_backends = ("flashinfer", "fa3", "fa4", "triton")
         if draft_backend is None:
             draft_backend, _ = draft_server_args.get_attention_backends()
         if draft_backend is None:
-            draft_backend = "flashinfer"
+            # Use triton on ROCm (no FlashInfer), flashinfer on CUDA
+            import torch as _torch
+
+            draft_backend = "triton" if _torch.version.hip else "flashinfer"
         elif draft_backend == "trtllm_mha":
+            import torch as _torch
+
+            _fb = "triton" if _torch.version.hip else "flashinfer"
             logger.warning(
                 "DFLASH draft worker does not support 'trtllm_mha' because the "
                 "draft path requires non-causal attention. Falling back to "
-                "'flashinfer'."
+                "'%s'.",
+                _fb,
             )
-            draft_backend = "flashinfer"
+            draft_backend = _fb
         elif draft_backend not in supported_draft_backends:
+            import torch as _torch
+
+            _fb = "triton" if _torch.version.hip else "flashinfer"
             logger.warning(
                 "DFLASH draft worker only supports attention_backend in %s for now, "
-                "but got %r. Falling back to 'flashinfer'.",
+                "but got %r. Falling back to '%s'.",
                 supported_draft_backends,
                 draft_backend,
+                _fb,
             )
-            draft_backend = "flashinfer"
+            draft_backend = _fb
         # Make the draft worker backend explicit and self-contained (no further overrides).
         draft_server_args.speculative_draft_attention_backend = None
         draft_server_args.prefill_attention_backend = None
@@ -559,7 +570,7 @@ class DFlashWorker:
 
         block_ids = self._draft_block_ids_buf[:bs]
         block_ids.fill_(int(self._mask_token_id))
-        block_ids[:, 0].copy_(draft_input.verified_id.to(torch.long))
+        block_ids[:, 0].copy_(draft_input.bonus_tokens.to(torch.long))
 
         noise_embedding = embed_module(block_ids)
         input_embeds = noise_embedding.view(-1, noise_embedding.shape[-1])
@@ -1152,7 +1163,7 @@ class DFlashWorker:
                 model_worker_batch.extend_seq_lens
             )
             draft_input = DFlashDraftInput(
-                verified_id=next_token_ids.to(torch.int64),
+                bonus_tokens=next_token_ids.to(torch.int64),
                 target_hidden=logits_output.hidden_states,
                 ctx_lens=extend_seq_lens,
                 draft_seq_lens=(
@@ -1167,7 +1178,7 @@ class DFlashWorker:
             return GenerationBatchResult(
                 logits_output=logits_output,
                 next_token_ids=next_token_ids,
-                num_accepted_tokens=0,
+                num_accepted_drafts=0,
                 can_run_cuda_graph=batch_result.can_run_cuda_graph,
             )
 
@@ -1202,10 +1213,10 @@ class DFlashWorker:
         )
 
         (
-            new_verified_id,
+            new_bonus_tokens,
             commit_lens,
             next_target_hidden,
-            accept_length_per_req_cpu,
+            num_accepted_drafts_per_req_cpu,
         ) = verify_input.verify(
             batch=batch,
             logits_output=logits_output,
@@ -1221,25 +1232,25 @@ class DFlashWorker:
 
         # Update draft state for the next iteration. Also materialize the committed verify tokens
         # into the draft KV cache immediately so radix cache entries are safe to reuse.
-        draft_input.verified_id = new_verified_id
+        draft_input.bonus_tokens = new_bonus_tokens
         draft_input.target_hidden = next_target_hidden
         draft_input.ctx_lens = commit_lens
         self._append_target_hidden_to_draft_kv(batch, draft_input)
         batch.spec_info = draft_input
         batch.forward_mode = ForwardMode.DECODE
 
-        num_accepted_tokens = sum(accept_length_per_req_cpu)
+        num_accepted_drafts = sum(num_accepted_drafts_per_req_cpu)
         if not self._logged_first_verify and self.tp_rank == 0:
             logger.info(
-                "DFLASH verify completed. accept_length_per_req=%s",
-                accept_length_per_req_cpu,
+                "DFLASH verify completed. num_accepted_drafts_per_req=%s",
+                num_accepted_drafts_per_req_cpu,
             )
             self._logged_first_verify = True
 
         return GenerationBatchResult(
             logits_output=logits_output,
-            next_token_ids=new_verified_id,
-            num_accepted_tokens=num_accepted_tokens,
-            accept_length_per_req_cpu=accept_length_per_req_cpu,
+            next_token_ids=new_bonus_tokens,
+            num_accepted_drafts=num_accepted_drafts,
+            num_accepted_drafts_per_req_cpu=num_accepted_drafts_per_req_cpu,
             can_run_cuda_graph=can_run_cuda_graph,
         )
