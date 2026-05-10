@@ -102,10 +102,10 @@ def build_sensenova_u1_orchestrator_from_scheduler(
     generation_backend: Any | None = None,
     server_args: Any | None = None,
 ) -> OmniCoordinator:
-    from sglang.omni.bridges.sensenova_u1.bridge import build_sensenova_u1_middle_bridge
+    from sglang.omni.bridges.sensenova_u1.bridge import build_sensenova_u1_srt_bridge
 
     return build_sensenova_u1_orchestrator(
-        srt_bridge=build_sensenova_u1_middle_bridge(
+        srt_bridge=build_sensenova_u1_srt_bridge(
             scheduler=scheduler,
             srt_request_executor=srt_request_executor,
             srt_ar_decode_max_new_tokens=srt_ar_decode_max_new_tokens,
@@ -213,7 +213,6 @@ def _build_default_generation_backend(srt_server_args: Any | None) -> Any:
     return DirectPipelineForwardBackend(
         pipeline=pipeline,
         server_args=pipeline_server_args,
-        context_ops_extra_key="sensenova_u1_context_ops",
     )
 
 

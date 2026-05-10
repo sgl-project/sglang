@@ -31,14 +31,13 @@ class PipelineExecutorBackend(MultimodalGenerationBackend):
     executor: Any
     stages: Sequence[Any]
     server_args: Any
-    context_ops_extra_key: str
 
     def generate_segment(
         self,
         request: OmniRequest,
         context_ops: ContextOps,
     ) -> GeneratedSegment:
-        batch = build_pipeline_req(request, context_ops, self.context_ops_extra_key)
+        batch = build_pipeline_req(request, context_ops)
         batch = self.executor.execute_with_profiling(
             list(self.stages),
             batch,

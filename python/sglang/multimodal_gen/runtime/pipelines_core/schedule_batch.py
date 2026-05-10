@@ -178,6 +178,7 @@ class Req:
 
     # Extra parameters that might be needed by specific pipeline implementations (e.g., LTX2.3 DenoisingAVStage)
     extra: dict[str, Any] = field(default_factory=dict)
+    omni_context_ops: Any | None = None
 
     is_warmup: bool = False
 

@@ -21,22 +21,6 @@ class OmniSessionHandle:
 
 
 @dataclass(frozen=True, slots=True)
-class OmniSRTRequestView:
-    """Safe view of a materialized SRT request exposed to omni model adapters."""
-
-    session: OmniSessionHandle
-    state: str
-    request_id: str
-    origin_input_len: int
-    origin_input_ids: tuple[int, ...]
-    output_ids: tuple[int, ...] = ()
-    max_new_tokens: int = 0
-    input_text: str = ""
-    mm_offsets: tuple[tuple[int, int], ...] = ()
-    metadata: dict[str, Any] = field(default_factory=dict)
-
-
-@dataclass(frozen=True, slots=True)
 class OmniSRTKVTokenBinding:
     """Opaque SRT request token locations for omni model-side cache adapters."""
 
@@ -59,7 +43,7 @@ class OmniContextHandle:
 
 @dataclass(slots=True)
 class OmniContextBundle:
-    """Main and CFG sidecar contexts prepared from the same user turn."""
+    """Main and CFG condition path contexts prepared from the same user turn."""
 
     full: OmniContextHandle
     text_cfg: OmniContextHandle

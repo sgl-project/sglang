@@ -7,7 +7,7 @@ orchestration lives in `sglang.omni`.
 """
 
 from contextlib import contextmanager
-from types import SimpleNamespace
+from dataclasses import dataclass
 from typing import Any
 
 from sglang.srt.omni_session.adapter import (
@@ -21,12 +21,7 @@ from sglang.srt.omni_session.runtime_protocol import (
     OmniContextBundle,
     OmniSessionHandle,
 )
-from sglang.srt.omni_session.interleaved_protocol import GenerationKind
-from sglang.srt.omni_session.middle import (
-    GeneratedSegmentExecutor,
-    SRTBackedGenerationContextOps,
-    SRTBackedOmniSessionBridge,
-)
+from sglang.srt.omni_session.bridge import SRTBackedOmniSessionBridge
 from sglang.srt.omni_session.runtime import (
     OmniDecodeResult,
     OmniInterleavedMessage,
@@ -60,7 +55,13 @@ from sglang.omni.bridges.sensenova_u1.context import (
 from sglang.srt.omni_session.srt_executor import OmniSRTSchedulerExecutor
 
 
-def build_sensenova_u1_middle_bridge(
+@dataclass(frozen=True, slots=True)
+class _U1ConditionPathSessionView:
+    handle: OmniSessionHandle
+    metadata: dict[str, Any]
+
+
+def build_sensenova_u1_srt_bridge(
     *,
     scheduler: Any,
     srt_request_executor: Any | None = None,
@@ -102,7 +103,7 @@ class U1OmniModelAdapter(OmniModelAdapter):
     instead of the common omni middle layer.
     """
 
-    generation_kind: GenerationKind = "pixel_flow"
+    generation_kind: str = "pixel_flow"
 
     def __init__(
         self,
@@ -239,7 +240,6 @@ class U1OmniModelAdapter(OmniModelAdapter):
         )
 
     def decode_next_segment(self, *, session: OmniModelSessionView) -> OmniDecodeResult:
-        del session
         raise RuntimeError("SenseNova U1 decode requires the SRT-backed runtime path")
 
     def decode_next_segment_from_runtime(
@@ -412,11 +412,11 @@ class U1OmniModelAdapter(OmniModelAdapter):
     ) -> None:
         if self.native_tokenizer is None:
             return
-        sidecar_state = runtime.get_srt_sidecar_model_state(
+        condition_path_state = runtime.get_condition_path_model_state(
             session,
             U1_INTERLEAVE_TEXT_UNCONDITION_ROLE,
         )
-        u1_state = (sidecar_state or {}).get("u1") or {}
+        u1_state = (condition_path_state or {}).get("u1") or {}
         if not u1_state:
             return
         if bool(u1_state.get("open_image_marker")):
@@ -429,7 +429,7 @@ class U1OmniModelAdapter(OmniModelAdapter):
             session=session,
             logical_position=int(logical_position),
         )
-        runtime.append_srt_sidecar_prepared_input(
+        runtime.append_condition_path_prepared_input(
             session, prepared, state=OmniSegmentState.AR_DECODE
         )
 
@@ -476,13 +476,12 @@ class U1OmniModelAdapter(OmniModelAdapter):
         session: OmniModelSessionView,
         image: Any | None,
     ) -> OmniModelAppendImageResult:
-        del image
         return OmniModelAppendImageResult(
             added_tokens=self._added_tokens_from_srt_session_view(session)
         )
 
     def close_session(self, *, session_id: str) -> None:
-        del session_id
+        return None
 
     def _has_generated_image_commit(self, session: OmniModelSessionView) -> bool:
         model_state = (session.metadata or {}).get("omni_model_state") or {}
@@ -508,7 +507,7 @@ class U1OmniModelAdapter(OmniModelAdapter):
 class U1SRTBackedOmniSessionBridge(SRTBackedOmniSessionBridge):
     """Pixel-flow U1 bridge shell backed by the common SRT omni session runtime."""
 
-    generation_kind: GenerationKind = "pixel_flow"
+    generation_kind: str = "pixel_flow"
     t2i_cfg_uncondition_role = U1_T2I_CFG_UNCONDITION_ROLE
     interleave_text_uncondition_role = U1_INTERLEAVE_TEXT_UNCONDITION_ROLE
     edit_img_condition_role = U1_EDIT_IMG_CONDITION_ROLE
@@ -533,31 +532,6 @@ class U1SRTBackedOmniSessionBridge(SRTBackedOmniSessionBridge):
         ):
             return runner.adapter
         return None
-
-    def prepare_ar_context(
-        self,
-        *,
-        prompt: str | list[str] | None,
-        image: Any | None,
-        think: bool = False,
-        think_max_new_tokens: int | None = None,
-        sampling_params: Any | None = None,
-    ) -> OmniContextBundle:
-        with self._temporary_generation_settings(sampling_params, think=think):
-            bridge_think = (
-                False
-                if getattr(sampling_params, "omni_generation_mode", None)
-                == "interleave"
-                else think
-            )
-            contexts = self._bridge.prepare_ar_context(
-                prompt=prompt,
-                image=image,
-                think=bridge_think,
-                think_max_new_tokens=think_max_new_tokens,
-                sampling_params=sampling_params,
-            )
-        return contexts
 
     def prepare_ar_context_from_messages(
         self,
@@ -635,21 +609,6 @@ class U1SRTBackedOmniSessionBridge(SRTBackedOmniSessionBridge):
                 adapter.native_generation_mode = old_mode
                 adapter.native_interleave_think_mode = old_interleave_think_mode
 
-    def run_generated_segment(
-        self,
-        *,
-        contexts: OmniContextBundle,
-        executor: GeneratedSegmentExecutor,
-    ) -> Any:
-        if contexts.full.session is None:
-            raise ValueError("SRT-backed omni contexts require a session handle")
-        segment = executor(SRTBackedGenerationContextOps(self, contexts))
-        if segment.type != "image":
-            raise ValueError(
-                f"omni generated segment expected image output, got {segment.type}"
-            )
-        return segment
-
     def commit_generated_segment(
         self,
         *,
@@ -657,7 +616,7 @@ class U1SRTBackedOmniSessionBridge(SRTBackedOmniSessionBridge):
         segment: Any,
     ) -> None:
         self._bridge.commit_generated_segment(contexts=contexts, segment=segment)
-        self._commit_interleave_text_uncondition_sidecar(
+        self._commit_interleave_text_uncondition_path(
             contexts=contexts,
             segment=segment,
         )
@@ -668,7 +627,7 @@ class U1SRTBackedOmniSessionBridge(SRTBackedOmniSessionBridge):
     def continue_ar_decode(self, *, contexts: OmniContextBundle) -> OmniDecodeResult:
         return self._bridge.continue_ar_decode(contexts=contexts)
 
-    def _commit_interleave_text_uncondition_sidecar(
+    def _commit_interleave_text_uncondition_path(
         self,
         *,
         contexts: OmniContextBundle,
@@ -683,30 +642,30 @@ class U1SRTBackedOmniSessionBridge(SRTBackedOmniSessionBridge):
             image = getattr(segment, "image", None)
         if image is None:
             return
-        sidecar_handle = self.runtime.get_srt_sidecar_handle(
+        condition_path_handle = self.runtime.get_condition_path_handle(
             contexts.full.session,
             U1_INTERLEAVE_TEXT_UNCONDITION_ROLE,
         )
-        if sidecar_handle is None:
+        if condition_path_handle is None:
             return
-        sidecar_state = self.runtime.get_srt_sidecar_model_state(
+        condition_path_state = self.runtime.get_condition_path_model_state(
             contexts.full.session,
             U1_INTERLEAVE_TEXT_UNCONDITION_ROLE,
         )
-        if not ((sidecar_state or {}).get("u1") or {}).get("open_image_marker"):
+        if not ((condition_path_state or {}).get("u1") or {}).get("open_image_marker"):
             return
-        sidecar_session = SimpleNamespace(
-            handle=sidecar_handle,
-            metadata={"omni_model_state": sidecar_state},
+        condition_path_session = _U1ConditionPathSessionView(
+            handle=condition_path_handle,
+            metadata={"omni_model_state": condition_path_state},
         )
         prepared = build_u1_native_generated_image_commit_prepared_input(
             tokenizer=tokenizer,
             image=image,
-            session=sidecar_session,
+            session=condition_path_session,
         )
-        prepared.srt_sidecar_role = U1_INTERLEAVE_TEXT_UNCONDITION_ROLE
-        prepared.srt_sidecar_session_id = sidecar_handle.session_id
-        self.runtime.append_srt_sidecar_prepared_input(
+        prepared.condition_path_role = U1_INTERLEAVE_TEXT_UNCONDITION_ROLE
+        prepared.condition_path_session_id = condition_path_handle.session_id
+        self.runtime.append_condition_path_prepared_input(
             contexts.full.session,
             prepared,
             state=OmniSegmentState.APPEND_IMAGE,

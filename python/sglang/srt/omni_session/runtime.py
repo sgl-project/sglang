@@ -5,21 +5,24 @@ The runtime is below the generic omni orchestrator. It materializes model-
 specific AR-side chunks as ordinary SRT session requests, tracks committed SRT
 KV bindings, and leaves generation-side execution to a bridge/executor pair.
 """
-
 import uuid
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Literal
-
+from sglang.srt.managers.io_struct import (
+    SessionParams,
+    TokenizedGenerateReqInput,
+)
+from sglang.srt.sampling.sampling_params import SamplingParams
 import torch
 
-from sglang.srt.managers.schedule_batch import MultimodalInputs
+from sglang.srt.managers.schedule_batch import MultimodalInputs, FINISH_LENGTH
 from sglang.srt.omni_session.runtime_protocol import (
     OmniSessionHandle,
     OmniSRTKVTokenBinding,
-    OmniSRTRequestView,
 )
+from sglang.srt.session.session_controller import SessionController
 
 
 class OmniSegmentState(str, Enum):
@@ -32,13 +35,18 @@ class OmniSegmentState(str, Enum):
 
 @dataclass(frozen=True, slots=True)
 class OmniInterleavedMessage:
+    """
+        The deriviation of the message:
+           OmniRequest.messages -> OmniInterleavedMessage -> OmniSRTPreparedInput
+
+    """
     type: Literal["text", "image"]
     content: Any
 
 
 @dataclass(slots=True)
 class OmniSRTPreparedInput:
-    """One materialized SRT input chunk for an omni AR-side segment.
+    """One materialized SRT input chunk for an omni AR-side segment, consumed by OmniSRT runtime
 
     `input_embeds` and `position_ids` are relative to `input_ids`. The runtime
     shifts them to the full SRT session request after `Session.create_req`
@@ -53,8 +61,9 @@ class OmniSRTPreparedInput:
     replace_positions: list[int] | None = None
     position_ids: list[Any] | None = None
     mm_inputs: MultimodalInputs | None = None
-    srt_sidecar_role: str | None = None
-    srt_sidecar_session_id: str | None = None
+    condition_path_role: str | None = None
+    condition_path_session_id: str | None = None
+    # private hints from model adapters to the SRT omni runtime, not client metadata
     adapter_metadata: dict[str, Any] = field(default_factory=dict)
 
 
@@ -106,10 +115,10 @@ class OmniSessionRecord:
     srt_mm_offsets: list[tuple[int, int]] = field(default_factory=list)
     srt_mm_inputs: MultimodalInputs | None = None
     srt_executed_request_count: int = 0
-    srt_model_runner_forward_request_ids: set[str] = field(default_factory=set)
-    srt_sidecar_session_ids: set[str] = field(default_factory=set)
-    srt_sidecar_records: dict[str, "OmniSessionRecord"] = field(default_factory=dict)
-    srt_sidecar_request_count: int = 0
+    # condition paths hold auxiliary generation contexts and close with the owner session
+    condition_path_session_ids: set[str] = field(default_factory=set)
+    condition_path_records: dict[str, "OmniSessionRecord"] = field(default_factory=dict)
+    condition_path_request_count: int = 0
     omni_model_state: dict[str, Any] = field(default_factory=dict)
     closed: bool = False
 
@@ -138,15 +147,6 @@ class OmniModelRunner(ABC):
         message: OmniInterleavedMessage,
         state: OmniSegmentState,
     ) -> list[OmniSRTPreparedInput] | None:
-        return None
-
-    def observe_srt_ar_forward(
-        self,
-        *,
-        record: OmniSessionRecord,
-        request: OmniSRTRequestView,
-        messages: list[OmniInterleavedMessage],
-    ) -> None:
         return None
 
     def prepare_srt_ar_interleaved_inputs(
@@ -198,12 +198,6 @@ class OmniSRTRequestExecutor(ABC):
 
     finish_request_after_execute = True
 
-    def set_session_forward_observer(self, observer: Any) -> None:
-        del observer
-
-    def set_omni_ar_forward_observer(self, observer: Any) -> None:
-        self.set_session_forward_observer(observer)
-
     @abstractmethod
     def execute_omni_request(
         self,
@@ -221,7 +215,6 @@ class OmniSRTRequestExecutor(ABC):
         input_ids: list[int],
         mm_inputs: MultimodalInputs | None,
     ) -> list[int]:
-        del mm_inputs
         return list(input_ids)
 
     def get_request_token_binding(
@@ -231,17 +224,7 @@ class OmniSRTRequestExecutor(ABC):
         req: Any,
         state: OmniSegmentState,
     ) -> OmniSRTKVTokenBinding | None:
-        del record, req, state
         return None
-
-    def get_omni_request_token_binding(
-        self,
-        *,
-        record: OmniSessionRecord,
-        req: Any,
-        state: OmniSegmentState,
-    ) -> OmniSRTKVTokenBinding | None:
-        return self.get_request_token_binding(record=record, req=req, state=state)
 
     def get_srt_model(self) -> Any:
         raise RuntimeError(f"{self.__class__.__name__} does not expose an SRT model")
@@ -250,20 +233,9 @@ class OmniSRTRequestExecutor(ABC):
         self,
         session_id: str,
         *,
-        sidecar_role: str | None = None,
+        condition_path_role: str | None = None,
     ) -> int | None:
-        del session_id, sidecar_role
         return None
-
-    def get_latest_omni_session_position_count(
-        self,
-        session_id: str,
-        *,
-        sidecar_role: str | None = None,
-    ) -> int | None:
-        return self.get_latest_session_position_count(
-            session_id, sidecar_role=sidecar_role
-        )
 
     def build_temporary_context_forward_batch_for_session(
         self,
@@ -272,22 +244,8 @@ class OmniSRTRequestExecutor(ABC):
         generation_query_embeds: Any,
         timestep: Any,
     ) -> Any:
-        del prepared, generation_query_embeds, timestep
         raise RuntimeError(
             f"{self.__class__.__name__} does not support temporary forward batches"
-        )
-
-    def build_generation_forward_batch_for_session(
-        self,
-        *,
-        prepared: Any,
-        generation_query_embeds: Any,
-        timestep: Any,
-    ) -> Any:
-        return self.build_temporary_context_forward_batch_for_session(
-            prepared=prepared,
-            generation_query_embeds=generation_query_embeds,
-            timestep=timestep,
         )
 
 
@@ -313,10 +271,6 @@ class OmniSessionRuntime:
         self.vocab_size = vocab_size
         self.srt_ar_decode_max_new_tokens = srt_ar_decode_max_new_tokens
         self._records: dict[str, OmniSessionRecord] = {}
-        if self.srt_request_executor is not None:
-            self.srt_request_executor.set_session_forward_observer(
-                self._observe_srt_ar_forward_from_model_runner
-            )
 
     @staticmethod
     def normalize_messages(
@@ -360,7 +314,7 @@ class OmniSessionRuntime:
         next_context_version = record.context_version + 1
         next_anchor_request_id = f"{session_id}:ar{next_context_version}"
         record.anchor_request_id = next_anchor_request_id
-        self._append_srt_session_request(
+        self._execute_srt_session_req(
             record,
             messages,
             request_id=next_anchor_request_id,
@@ -476,13 +430,8 @@ class OmniSessionRuntime:
         adapter_metadata["omni_model_state"] = self._copy_omni_model_state(
             record.omni_model_state
         )
-        self._attach_srt_ar_forward_metadata(
-            record,
-            req,
-            state=OmniSegmentState.AR_DECODE,
-            input_text="",
-            messages=[],
-            adapter_metadata=adapter_metadata,
+        self._attach_srt_request_overrides(
+            req, srt_request_metadata=adapter_metadata
         )
         self._execute_srt_req(record, req, state=OmniSegmentState.AR_DECODE)
         record.srt_ar_decode_request_count += 1
@@ -491,13 +440,6 @@ class OmniSessionRuntime:
         record.srt_last_ar_decode_output_ids = []
         record.srt_last_ar_decode_text = ""
         record.context_length = len(req.origin_input_ids)
-        self._notify_srt_ar_forward(
-            record,
-            req,
-            state=OmniSegmentState.AR_DECODE,
-            input_text="",
-            messages=[],
-        )
         return record.handle()
 
     def append_generated_image(
@@ -513,7 +455,7 @@ class OmniSessionRuntime:
         next_context_version = record.context_version + 1
         next_anchor_request_id = f"{record.session_id}:ar{next_context_version}"
         record.anchor_request_id = next_anchor_request_id
-        self._append_srt_session_request(
+        self._execute_srt_session_req(
             record,
             [OmniInterleavedMessage(type="image", content=image)],
             request_id=next_anchor_request_id,
@@ -537,41 +479,41 @@ class OmniSessionRuntime:
         if record is not None:
             record.closed = True
             record.state = OmniSegmentState.DONE
-            sidecar_session_ids = set(record.srt_sidecar_session_ids)
+            condition_path_session_ids = set(record.condition_path_session_ids)
         else:
-            sidecar_session_ids = set()
+            condition_path_session_ids = set()
         self.model_runner.close_session(session_id=session_id)
         self._close_srt_session(session_id)
-        for sidecar_session_id in sorted(sidecar_session_ids):
-            self._close_srt_session(sidecar_session_id)
+        for condition_path_session_id in sorted(condition_path_session_ids):
+            self._close_srt_session(condition_path_session_id)
         if self.srt_request_executor is not None:
             self.srt_request_executor.run_idle_cleanup()
 
-    def get_srt_sidecar_handle(
+    def get_condition_path_handle(
         self,
         owner_handle: OmniSessionHandle | str,
         role: str,
     ) -> OmniSessionHandle | None:
         owner_record = self._record_for(owner_handle)
-        sidecar_record = owner_record.srt_sidecar_records.get(
+        condition_path_record = owner_record.condition_path_records.get(
             f"{owner_record.session_id}:{role}"
         )
-        return None if sidecar_record is None else sidecar_record.handle()
+        return None if condition_path_record is None else condition_path_record.handle()
 
-    def get_srt_sidecar_model_state(
+    def get_condition_path_model_state(
         self,
         owner_handle: OmniSessionHandle | str,
         role: str,
     ) -> dict[str, Any]:
         owner_record = self._record_for(owner_handle)
-        sidecar_record = owner_record.srt_sidecar_records.get(
+        condition_path_record = owner_record.condition_path_records.get(
             f"{owner_record.session_id}:{role}"
         )
-        if sidecar_record is None:
+        if condition_path_record is None:
             return {}
-        return self._copy_omni_model_state(sidecar_record.omni_model_state)
+        return self._copy_omni_model_state(condition_path_record.omni_model_state)
 
-    def append_srt_sidecar_prepared_input(
+    def append_condition_path_prepared_input(
         self,
         owner_handle: OmniSessionHandle | str,
         prepared: OmniSRTPreparedInput,
@@ -579,12 +521,12 @@ class OmniSessionRuntime:
         state: OmniSegmentState | None = None,
     ) -> OmniSessionHandle:
         owner_record = self._record_for(owner_handle)
-        sidecar_record = self._append_srt_sidecar_request(
+        condition_path_record = self._append_condition_path_request(
             owner_record,
             prepared,
             state=state,
         )
-        return sidecar_record.handle()
+        return condition_path_record.handle()
 
     def get_state(
         self, handle_or_session_id: OmniSessionHandle | str
@@ -603,12 +545,12 @@ class OmniSessionRuntime:
             "append_image_count": record.append_image_count,
             "decode_count": record.decode_count,
             "srt_request_count": record.srt_request_count,
-            "srt_sidecar_request_count": record.srt_sidecar_request_count,
-            "srt_sidecar_session_ids": sorted(record.srt_sidecar_session_ids),
-            "srt_sidecar_omni_model_state": {
-                session_id: self._copy_omni_model_state(sidecar_record.omni_model_state)
-                for session_id, sidecar_record in sorted(
-                    record.srt_sidecar_records.items()
+            "condition_path_request_count": record.condition_path_request_count,
+            "condition_path_session_ids": sorted(record.condition_path_session_ids),
+            "condition_path_omni_model_state": {
+                session_id: self._copy_omni_model_state(condition_path_record.omni_model_state)
+                for session_id, condition_path_record in sorted(
+                    record.condition_path_records.items()
                 )
             },
             "omni_model_state": self._copy_omni_model_state(record.omni_model_state),
@@ -661,7 +603,7 @@ class OmniSessionRuntime:
                 )
         return record
 
-    def _append_srt_session_request(
+    def _execute_srt_session_req(
         self,
         record: OmniSessionRecord,
         messages: list[OmniInterleavedMessage],
@@ -672,20 +614,20 @@ class OmniSessionRuntime:
             self.session_controller, "get"
         ):
             return
-        from sglang.srt.session.session_controller import SessionController
 
+        # prepare inputs for ar
         prepared_inputs = self._prepare_srt_ar_inputs(
             record,
             messages,
             state=record.state,
         )
         total_inputs = sum(
-            1 for prepared in prepared_inputs if prepared.srt_sidecar_role is None
+            1 for prepared in prepared_inputs if prepared.condition_path_role is None
         )
         main_input_index = 0
         for prepared in prepared_inputs:
-            if prepared.srt_sidecar_role is not None:
-                self._append_srt_sidecar_request(record, prepared)
+            if prepared.condition_path_role is not None:
+                self._append_condition_path_request(record, prepared)
                 continue
             main_input_index += 1
             segment_request_id = (
@@ -705,11 +647,12 @@ class OmniSessionRuntime:
             )
 
             if mm_inputs is not None:
+                # adjust token-ids with the multimodal_inputs
                 SessionController.adjust_mm_offsets(recv_req, req, mm_inputs)
                 self._pad_srt_multimodal_input_ids(req, mm_inputs)
                 req.extend_image_inputs(mm_inputs)
 
-            adapter_metadata = self._apply_prepared_srt_input(
+            srt_request_metadata = self._populate_srt_req_from_prepared_input(
                 req,
                 record=record,
                 recv_req=recv_req,
@@ -718,57 +661,52 @@ class OmniSessionRuntime:
             )
 
             self._record_srt_req(record, req, request_id=segment_request_id)
-            self._attach_srt_ar_forward_metadata(
-                record,
-                req,
-                state=record.state,
-                input_text=input_text,
-                messages=prepared.messages,
-                adapter_metadata=adapter_metadata,
+            self._attach_srt_request_overrides(
+                req, srt_request_metadata=srt_request_metadata
             )
             self._execute_srt_req(record, req, state=record.state)
-            self._notify_srt_ar_forward(
-                record,
-                req,
-                state=record.state,
-                input_text=input_text,
-                messages=prepared.messages,
-            )
 
-    def _append_srt_sidecar_request(
+    def _append_condition_path_request(
         self,
         owner_record: OmniSessionRecord,
         prepared: OmniSRTPreparedInput,
         *,
         state: OmniSegmentState | None = None,
     ) -> OmniSessionRecord:
-        role = prepared.srt_sidecar_role
+        role = prepared.condition_path_role
         if not role:
-            raise RuntimeError("omni SRT sidecar request requires a sidecar role")
-        sidecar_session_id = (
-            prepared.srt_sidecar_session_id or f"{owner_record.session_id}:{role}"
+            raise RuntimeError(
+                "omni condition path request requires a condition path role"
+            )
+        # each role owns an isolated SRT KV stream for one generation branch
+        condition_path_session_id = (
+            prepared.condition_path_session_id or f"{owner_record.session_id}:{role}"
         )
-        owner_record.srt_sidecar_session_ids.add(sidecar_session_id)
-        self._ensure_srt_session(sidecar_session_id)
-        sidecar_state = state or owner_record.state
+        owner_record.condition_path_session_ids.add(condition_path_session_id)
+        self._ensure_srt_session(condition_path_session_id)
+        condition_path_state = state or owner_record.state
         request_id = (
-            f"{owner_record.session_id}:sidecar:{role}:"
+            f"{owner_record.session_id}:condition_path:{role}:"
             f"{owner_record.context_version + 1}:"
-            f"{owner_record.srt_sidecar_request_count + 1}"
+            f"{owner_record.condition_path_request_count + 1}"
         )
-        sidecar_record = owner_record.srt_sidecar_records.get(sidecar_session_id)
-        if sidecar_record is None:
-            sidecar_record = OmniSessionRecord(
-                session_id=sidecar_session_id,
-                state=sidecar_state,
+        condition_path_record = owner_record.condition_path_records.get(
+            condition_path_session_id
+        )
+        if condition_path_record is None:
+            condition_path_record = OmniSessionRecord(
+                session_id=condition_path_session_id,
+                state=condition_path_state,
                 anchor_request_id=request_id,
             )
-            owner_record.srt_sidecar_records[sidecar_session_id] = sidecar_record
-        sidecar_record.state = sidecar_state
-        sidecar_record.anchor_request_id = request_id
-        sidecar_record.context_version += 1
+            owner_record.condition_path_records[condition_path_session_id] = (
+                condition_path_record
+            )
+        condition_path_record.state = condition_path_state
+        condition_path_record.anchor_request_id = request_id
+        condition_path_record.context_version += 1
         req, recv_req = self._create_srt_session_req(
-            sidecar_record,
+            condition_path_record,
             request_id=request_id,
             input_ids=prepared.input_ids,
             input_text=prepared.input_text,
@@ -781,35 +719,25 @@ class OmniSessionRuntime:
             SessionController.adjust_mm_offsets(recv_req, req, prepared.mm_inputs)
             self._pad_srt_multimodal_input_ids(req, prepared.mm_inputs)
             req.extend_image_inputs(prepared.mm_inputs)
-        adapter_metadata = self._apply_prepared_srt_input(
+        srt_request_metadata = self._populate_srt_req_from_prepared_input(
             req,
-            record=sidecar_record,
+            record=condition_path_record,
             recv_req=recv_req,
             prepared=prepared,
             is_final_segment=True,
         )
-        adapter_metadata["omni_srt_owner_session_id"] = owner_record.session_id
-        adapter_metadata["omni_srt_sidecar_role"] = role
-        self._record_srt_req(sidecar_record, req, request_id=request_id)
-        self._attach_srt_ar_forward_metadata(
-            sidecar_record,
-            req,
-            state=sidecar_state,
-            input_text=prepared.input_text,
-            messages=prepared.messages,
-            adapter_metadata=adapter_metadata,
+        srt_request_metadata["omni_condition_path_owner_session_id"] = (
+            owner_record.session_id
         )
-        self._execute_srt_req(sidecar_record, req, state=sidecar_state)
-        sidecar_record.context_length = len(req.origin_input_ids)
-        self._notify_srt_ar_forward(
-            sidecar_record,
-            req,
-            state=sidecar_state,
-            input_text=prepared.input_text,
-            messages=prepared.messages,
+        srt_request_metadata["omni_condition_path_role"] = role
+        self._record_srt_req(condition_path_record, req, request_id=request_id)
+        self._attach_srt_request_overrides(
+            req, srt_request_metadata=srt_request_metadata
         )
-        owner_record.srt_sidecar_request_count += 1
-        return sidecar_record
+        self._execute_srt_req(condition_path_record, req, state=condition_path_state)
+        condition_path_record.context_length = len(req.origin_input_ids)
+        owner_record.condition_path_request_count += 1
+        return condition_path_record
 
     def _pad_srt_multimodal_input_ids(
         self, req: Any, mm_inputs: MultimodalInputs | None
@@ -848,7 +776,7 @@ class OmniSessionRuntime:
             raise RuntimeError("omni SRT prepared inputs must not be empty")
         return prepared_inputs
 
-    def _apply_prepared_srt_input(
+    def _populate_srt_req_from_prepared_input(
         self,
         req: Any,
         *,
@@ -857,29 +785,35 @@ class OmniSessionRuntime:
         prepared: OmniSRTPreparedInput,
         is_final_segment: bool,
     ) -> dict[str, Any]:
+        """Copy model-prepared fields onto the concrete SRT request."""
+
+        # session.create_req may prepend cached context and strip append-only input
         prefix_len, stripped = self._srt_prefix_and_strip_lengths(
             req, recv_req, prepared
         )
         new_token_count = len(recv_req.input_ids)
 
-        adapter_metadata = dict(prepared.adapter_metadata)
-        adapter_metadata.setdefault("omni_srt_added_token_count", new_token_count)
-        adapter_metadata["omni_srt_is_final_segment"] = bool(is_final_segment)
+        # merge model-side state updates before exposing a request-local snapshot
+        srt_request_metadata = dict(prepared.adapter_metadata)
+        srt_request_metadata.setdefault("omni_srt_added_token_count", new_token_count)
+        srt_request_metadata["omni_srt_is_final_segment"] = bool(is_final_segment)
         self._merge_omni_model_state_updates(
             record,
-            adapter_metadata.get("omni_model_state_updates"),
+            srt_request_metadata.get("omni_model_state_updates"),
         )
-        adapter_metadata["omni_model_state"] = self._copy_omni_model_state(
+        srt_request_metadata["omni_model_state"] = self._copy_omni_model_state(
             record.omni_model_state
         )
 
         if prepared.input_embeds is not None:
+            # prepared embeds are chunk-relative; SRT req embeds must cover the prefix
             suffix_embeds = prepared.input_embeds[stripped:]
             hidden_size = len(suffix_embeds[0]) if suffix_embeds else 0
             prefix_embeds = [[0.0] * hidden_size for _ in range(prefix_len)]
             req.input_embeds = prefix_embeds + suffix_embeds
 
         if prepared.replace_embeds is not None:
+            # replace positions are chunk-relative and must be shifted into the full req
             replace_positions = prepared.replace_positions
             if replace_positions is None:
                 raise RuntimeError(
@@ -896,6 +830,7 @@ class OmniSessionRuntime:
             req.context_replace_positions = shifted_positions
 
         if prepared.position_ids is not None:
+            # position ids follow the same prefix/strip alignment as token ids
             suffix_positions = prepared.position_ids[stripped:]
             if self._uses_multidim_positions(suffix_positions):
                 req.custom_position_ids = self._full_multidim_positions(
@@ -908,7 +843,7 @@ class OmniSessionRuntime:
                     int(position) for position in suffix_positions
                 ]
 
-        return adapter_metadata
+        return srt_request_metadata
 
     @staticmethod
     def _srt_prefix_and_strip_lengths(
@@ -1031,13 +966,8 @@ class OmniSessionRuntime:
         adapter_metadata["omni_model_state"] = self._copy_omni_model_state(
             record.omni_model_state
         )
-        self._attach_srt_ar_forward_metadata(
-            record,
-            req,
-            state=OmniSegmentState.AR_DECODE,
-            input_text="",
-            messages=[],
-            adapter_metadata=adapter_metadata,
+        self._attach_srt_request_overrides(
+            req, srt_request_metadata=adapter_metadata
         )
         self._execute_srt_req(record, req, state=OmniSegmentState.AR_DECODE)
         record.srt_ar_decode_request_count += 1
@@ -1051,13 +981,6 @@ class OmniSessionRuntime:
         )
         record.context_length = len(req.origin_input_ids) + len(
             record.srt_last_ar_decode_output_ids
-        )
-        self._notify_srt_ar_forward(
-            record,
-            req,
-            state=OmniSegmentState.AR_DECODE,
-            input_text="",
-            messages=[],
         )
         return list(record.srt_last_ar_decode_output_ids)
 
@@ -1079,11 +1002,7 @@ class OmniSessionRuntime:
         drop_previous_output: bool = False,
         greedy: bool = False,
     ):
-        from sglang.srt.managers.io_struct import (
-            SessionParams,
-            TokenizedGenerateReqInput,
-        )
-        from sglang.srt.sampling.sampling_params import SamplingParams
+        """create a Req for srt scheduler"""
 
         session = self.session_controller.get(record.session_id)
         if session is None:
@@ -1126,30 +1045,18 @@ class OmniSessionRuntime:
         return req, recv_req
 
     @staticmethod
-    def _attach_srt_ar_forward_metadata(
-        record: OmniSessionRecord,
+    def _attach_srt_request_overrides(
         req: Any,
         *,
-        state: OmniSegmentState,
-        input_text: str,
-        messages: list[OmniInterleavedMessage],
-        adapter_metadata: dict[str, Any] | None = None,
+        srt_request_metadata: dict[str, Any] | None = None,
     ) -> None:
-        req.session_forward_metadata = {
-            "session": record.handle(),
-            "state": state.value,
-            "request_id": req.rid,
-            "origin_input_len": len(req.origin_input_ids),
-            "origin_input_ids": tuple(req.origin_input_ids),
-            "output_ids": tuple(req.output_ids[: req.sampling_params.max_new_tokens]),
-            "max_new_tokens": req.sampling_params.max_new_tokens,
-            "input_text": input_text,
-            "mm_offsets": tuple(
-                OmniSessionRuntime._collect_mm_offsets(req.multimodal_inputs)
-            ),
-            "messages": tuple(messages),
-            "adapter_metadata": dict(adapter_metadata or {}),
-        }
+        metadata = srt_request_metadata or {}
+        attention_math_mode = metadata.get("attention_math_mode")
+        if attention_math_mode is not None:
+            req.attention_math_mode = str(attention_math_mode)
+        position_count = metadata.get("omni_srt_position_count")
+        if position_count is not None:
+            req.omni_srt_position_count = int(position_count)
 
     def _execute_srt_req(
         self,
@@ -1158,8 +1065,7 @@ class OmniSessionRuntime:
         *,
         state: OmniSegmentState,
     ) -> None:
-        from sglang.srt.managers.schedule_batch import FINISH_LENGTH
-
+        """execute the ar request via OmniSRTRequestExecutor"""
         if self.srt_request_executor is not None:
             self.srt_request_executor.execute_omni_request(
                 record=record,
@@ -1188,72 +1094,6 @@ class OmniSessionRuntime:
         record.srt_mm_offsets = OmniSessionRuntime._collect_mm_offsets(
             req.multimodal_inputs
         )
-
-    def _notify_srt_ar_forward(
-        self,
-        record: OmniSessionRecord,
-        req: Any,
-        *,
-        state: OmniSegmentState,
-        input_text: str,
-        messages: list[OmniInterleavedMessage],
-    ) -> None:
-        if (
-            req.rid in record.srt_model_runner_forward_request_ids
-            and state != OmniSegmentState.AR_DECODE
-        ):
-            return
-        output_ids = tuple(req.output_ids[: req.sampling_params.max_new_tokens])
-        self.model_runner.observe_srt_ar_forward(
-            record=record,
-            request=OmniSRTRequestView(
-                session=record.handle(),
-                state=state.value,
-                request_id=req.rid,
-                origin_input_len=len(req.origin_input_ids),
-                origin_input_ids=tuple(req.origin_input_ids),
-                output_ids=output_ids,
-                max_new_tokens=req.sampling_params.max_new_tokens,
-                input_text=input_text,
-                mm_offsets=tuple(self._collect_mm_offsets(req.multimodal_inputs)),
-                metadata=self._srt_request_view_metadata(record, req, state=state),
-            ),
-            messages=messages,
-        )
-
-    def _observe_srt_ar_forward_from_model_runner(
-        self,
-        *,
-        request: OmniSRTRequestView,
-        messages: list[OmniInterleavedMessage],
-    ) -> None:
-        record = self._records.get(request.session.session_id)
-        if record is None or record.closed:
-            return
-        self.model_runner.observe_srt_ar_forward(
-            record=record, request=request, messages=messages
-        )
-        record.srt_model_runner_forward_request_ids.add(request.request_id)
-
-    def _srt_request_view_metadata(
-        self,
-        record: OmniSessionRecord,
-        req: Any,
-        *,
-        state: OmniSegmentState,
-    ) -> dict[str, Any]:
-        metadata = dict(
-            getattr(req, "session_forward_metadata", {}).get("adapter_metadata", {})
-        )
-        metadata.setdefault(
-            "omni_model_state", self._copy_omni_model_state(record.omni_model_state)
-        )
-        if state == OmniSegmentState.AR_DECODE:
-            metadata["srt_last_ar_decode_text"] = record.srt_last_ar_decode_text
-        token_binding = self._srt_kv_token_binding(record, req, state=state)
-        if token_binding is not None:
-            metadata["srt_kv_token_binding"] = token_binding
-        return metadata
 
     @classmethod
     def _merge_omni_model_state_updates(
@@ -1294,28 +1134,6 @@ class OmniSessionRuntime:
         if isinstance(value, tuple):
             return tuple(cls._copy_omni_model_state_value(item) for item in value)
         return value
-
-    def _srt_kv_token_binding(
-        self,
-        record: OmniSessionRecord,
-        req: Any,
-        *,
-        state: OmniSegmentState,
-    ) -> OmniSRTKVTokenBinding | None:
-        if self.srt_request_executor is None:
-            return None
-
-        binding = self.srt_request_executor.get_request_token_binding(
-            record=record, req=req, state=state
-        )
-        if binding is None:
-            return None
-        if not isinstance(binding, OmniSRTKVTokenBinding):
-            raise TypeError(
-                "omni SRT request token binding provider must return "
-                f"OmniSRTKVTokenBinding, got {type(binding).__name__}"
-            )
-        return binding
 
     @staticmethod
     def _collect_mm_offsets(

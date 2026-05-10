@@ -5,7 +5,7 @@ from copy import deepcopy
 from dataclasses import dataclass, field
 from typing import Any
 
-from sglang.srt.omni_session.runtime_protocol import OmniSessionHandle, OmniSRTRequestView
+from sglang.srt.omni_session.runtime_protocol import OmniSessionHandle
 from sglang.srt.omni_session.runtime import (
     OmniDecodeResult,
     OmniInterleavedMessage,
@@ -56,7 +56,6 @@ class OmniModelAdapter:
         message: OmniInterleavedMessage,
         state: OmniSegmentState,
     ) -> list[OmniSRTPreparedInput] | None:
-        del session, message, state
         return None
 
     def prepare_srt_ar_interleaved_inputs(
@@ -66,17 +65,7 @@ class OmniModelAdapter:
         messages: list[OmniInterleavedMessage],
         state: OmniSegmentState,
     ) -> list[OmniSRTPreparedInput] | None:
-        del session, messages, state
         return None
-
-    def observe_srt_ar_forward(
-        self,
-        *,
-        session: OmniModelSessionView,
-        request: OmniSRTRequestView,
-        messages: list[OmniInterleavedMessage],
-    ) -> None:
-        del session, request, messages
 
     def prefill_interleaved(
         self,
@@ -84,7 +73,6 @@ class OmniModelAdapter:
         session: OmniModelSessionView,
         messages: list[OmniInterleavedMessage],
     ) -> OmniModelPrefillResult:
-        del messages
         return OmniModelPrefillResult(
             added_tokens=max(
                 0,
@@ -96,7 +84,6 @@ class OmniModelAdapter:
     def decode_next_segment(
         self, *, session: OmniModelSessionView
     ) -> OmniDecodeResult:
-        del session
         raise NotImplementedError(
             f"{self.__class__.__name__} does not support segment decode"
         )
@@ -107,7 +94,6 @@ class OmniModelAdapter:
         runtime: OmniSessionRuntime,
         session: OmniModelSessionView,
     ) -> OmniDecodeResult | None:
-        del runtime, session
         return None
 
     def decode_vlm_text(
@@ -117,7 +103,6 @@ class OmniModelAdapter:
         session: OmniSessionHandle,
         max_new_tokens: int,
     ) -> OmniVLMTextGenerationResult:
-        del runtime, session, max_new_tokens
         raise NotImplementedError(
             f"{self.__class__.__name__} does not support VLM text decode"
         )
@@ -128,7 +113,6 @@ class OmniModelAdapter:
         session: OmniModelSessionView,
         image: Any | None,
     ) -> OmniModelAppendImageResult:
-        del image
         return OmniModelAppendImageResult(
             added_tokens=max(
                 0,
@@ -138,7 +122,7 @@ class OmniModelAdapter:
         )
 
     def close_session(self, *, session_id: str) -> None:
-        del session_id
+        pass
 
 
 class OmniModelRunnerAdapter(OmniModelRunner):
@@ -181,19 +165,6 @@ class OmniModelRunnerAdapter(OmniModelRunner):
             messages=messages,
         )
         return result.added_tokens
-
-    def observe_srt_ar_forward(
-        self,
-        *,
-        record: OmniSessionRecord,
-        request: OmniSRTRequestView,
-        messages: list[OmniInterleavedMessage],
-    ) -> None:
-        self.adapter.observe_srt_ar_forward(
-            session=self._session_view(record),
-            request=request,
-            messages=messages,
-        )
 
     def decode_next_segment(self, *, record: OmniSessionRecord) -> OmniDecodeResult:
         return self.adapter.decode_next_segment(session=self._session_view(record))

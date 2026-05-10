@@ -106,7 +106,7 @@ class Session:
         tokenizer,
         vocab_size: int,
         eos_token_ids=None,
-    ):
+    ) -> Req:
         assert req.session_params is not None
         self.last_active_time = time.monotonic()
         session_params = req.session_params

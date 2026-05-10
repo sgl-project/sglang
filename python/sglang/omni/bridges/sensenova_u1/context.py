@@ -23,6 +23,14 @@ U1_T2I_CFG_UNCONDITION_ROLE = "u1_t2i_cfg_uncondition"
 U1_INTERLEAVE_TEXT_UNCONDITION_ROLE = "u1_interleave_text_uncondition"
 U1_EDIT_IMG_CONDITION_ROLE = "u1_edit_img_condition"
 U1_EDIT_UNCONDITION_ROLE = "u1_edit_uncondition"
+_U1_ATTENTION_MATH_MODE = "reference_eager"
+
+
+def _u1_adapter_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
+    metadata.setdefault("attention_math_mode", _U1_ATTENTION_MATH_MODE)
+    return metadata
+
+
 U1_IMAGENET_MEAN = (0.485, 0.456, 0.406)
 U1_IMAGENET_STD = (0.229, 0.224, 0.225)
 U1_SYSTEM_MESSAGE_FOR_GEN = (
@@ -129,7 +137,7 @@ def build_u1_native_vlm_prepared_input(
         input_text=prompt,
         messages=list(messages),
         mm_inputs=mm_inputs,
-        adapter_metadata={
+        adapter_metadata=_u1_adapter_metadata({
             "u1": {
                 "segment_type": "vlm",
                 "source": "native_vlm_input",
@@ -144,7 +152,7 @@ def build_u1_native_vlm_prepared_input(
                     "session_id": _u1_session_id(session),
                 }
             },
-        },
+        }),
     )
 
 
@@ -224,12 +232,12 @@ def build_u1_native_interleave_text_uncondition_marker_prepared_input(
         input_text=U1_IMG_START_TOKEN,
         messages=[],
         position_ids=[[int(logical_position), 0, 0]],
-        srt_sidecar_role=U1_INTERLEAVE_TEXT_UNCONDITION_ROLE,
-        srt_sidecar_session_id=_u1_sidecar_session_id(
+        condition_path_role=U1_INTERLEAVE_TEXT_UNCONDITION_ROLE,
+        condition_path_session_id=_u1_condition_path_session_id(
             session,
             U1_INTERLEAVE_TEXT_UNCONDITION_ROLE,
         ),
-        adapter_metadata={
+        adapter_metadata=_u1_adapter_metadata({
             "u1": {
                 "segment_type": "interleave_text_uncondition_image_marker",
                 "source": "native_interleave_text_uncondition_image_marker",
@@ -245,7 +253,7 @@ def build_u1_native_interleave_text_uncondition_marker_prepared_input(
                     "session_id": _u1_session_id(session),
                 }
             },
-        },
+        }),
     )
 
 
@@ -325,7 +333,7 @@ def _build_u1_native_interleave_like_prepared_input(
     if image_offsets:
         u1_metadata["image_offsets"] = list(image_offsets)
         u1_metadata["image_count"] = len(images)
-    adapter_metadata = {"u1": u1_metadata}
+    adapter_metadata = _u1_adapter_metadata({"u1": u1_metadata})
     if model_state_updates is not None:
         state_updates = dict(model_state_updates)
         state_updates["generation_position_start"] = generation_position_start
@@ -336,8 +344,8 @@ def _build_u1_native_interleave_like_prepared_input(
         input_text=prompt,
         messages=messages,
         mm_inputs=mm_inputs,
-        srt_sidecar_role=role,
-        srt_sidecar_session_id=_u1_sidecar_session_id(session, role),
+        condition_path_role=role,
+        condition_path_session_id=_u1_condition_path_session_id(session, role),
         adapter_metadata=adapter_metadata,
     )
 
@@ -364,7 +372,7 @@ def build_u1_native_t2i_prepared_input(
         input_ids=input_ids,
         input_text=prompt,
         messages=list(messages),
-        adapter_metadata={
+        adapter_metadata=_u1_adapter_metadata({
             "u1": {
                 "segment_type": "t2i",
                 "source": "native_t2i_prompt",
@@ -379,7 +387,7 @@ def build_u1_native_t2i_prepared_input(
                     "session_id": _u1_session_id(session),
                 }
             },
-        },
+        }),
     )
 
 
@@ -435,7 +443,7 @@ def build_u1_native_edit_prepared_input(
         input_text=prompt,
         messages=list(messages),
         mm_inputs=mm_inputs,
-        adapter_metadata={
+        adapter_metadata=_u1_adapter_metadata({
             "u1": {
                 "segment_type": "edit",
                 "source": "native_edit_prompt",
@@ -452,7 +460,7 @@ def build_u1_native_edit_prepared_input(
                     "session_id": _u1_session_id(session),
                 }
             },
-        },
+        }),
     )
 
 
@@ -474,7 +482,7 @@ def build_u1_native_edit_img_condition_prepared_input(
         append_text=U1_IMG_START_TOKEN,
     )
     prompt = _replace_u1_image_placeholders(prompt, grid_hw)
-    prepared = _build_u1_native_image_sidecar_prepared_input(
+    prepared = _build_u1_native_image_condition_path_prepared_input(
         tokenizer=tokenizer,
         prompt=prompt,
         image=image,
@@ -493,7 +501,7 @@ def build_u1_native_edit_uncondition_prepared_input(
     tokenizer: Any,
     session: Any | None = None,
 ) -> OmniSRTPreparedInput:
-    return _build_u1_native_marker_sidecar_prepared_input(
+    return _build_u1_native_marker_condition_path_prepared_input(
         tokenizer=tokenizer,
         session=session,
         role=U1_EDIT_UNCONDITION_ROLE,
@@ -502,7 +510,7 @@ def build_u1_native_edit_uncondition_prepared_input(
     )
 
 
-def _build_u1_native_image_sidecar_prepared_input(
+def _build_u1_native_image_condition_path_prepared_input(
     *,
     tokenizer: Any,
     prompt: str,
@@ -550,9 +558,9 @@ def _build_u1_native_image_sidecar_prepared_input(
         input_text=prompt,
         messages=[OmniInterleavedMessage(type="image", content=image)],
         mm_inputs=mm_inputs,
-        srt_sidecar_role=role,
-        srt_sidecar_session_id=_u1_sidecar_session_id(session, role),
-        adapter_metadata={
+        condition_path_role=role,
+        condition_path_session_id=_u1_condition_path_session_id(session, role),
+        adapter_metadata=_u1_adapter_metadata({
             "u1": {
                 "segment_type": segment_type,
                 "source": source,
@@ -560,7 +568,7 @@ def _build_u1_native_image_sidecar_prepared_input(
                 "image_offsets": image_offsets,
                 "generation_position_start": generation_position_start,
             }
-        },
+        }),
     )
 
 
@@ -667,6 +675,7 @@ def build_u1_native_generated_image_commit_prepared_input(
         omit_start=omit_start,
         generation_position_start=end_t + 1,
     )
+    metadata = _u1_adapter_metadata(metadata)
     return OmniSRTPreparedInput(
         input_ids=input_ids,
         input_text="<u1:generated_image_commit>",
@@ -682,7 +691,7 @@ def build_u1_native_t2i_cfg_uncondition_prepared_input(
     tokenizer: Any,
     session: Any | None = None,
 ) -> OmniSRTPreparedInput:
-    return _build_u1_native_marker_sidecar_prepared_input(
+    return _build_u1_native_marker_condition_path_prepared_input(
         tokenizer=tokenizer,
         session=session,
         role=U1_T2I_CFG_UNCONDITION_ROLE,
@@ -691,7 +700,7 @@ def build_u1_native_t2i_cfg_uncondition_prepared_input(
     )
 
 
-def _build_u1_native_marker_sidecar_prepared_input(
+def _build_u1_native_marker_condition_path_prepared_input(
     *,
     tokenizer: Any,
     session: Any | None,
@@ -714,15 +723,15 @@ def _build_u1_native_marker_sidecar_prepared_input(
         input_ids=input_ids,
         input_text=prompt,
         messages=[OmniInterleavedMessage(type="text", content="")],
-        srt_sidecar_role=role,
-        srt_sidecar_session_id=_u1_sidecar_session_id(session, role),
-        adapter_metadata={
+        condition_path_role=role,
+        condition_path_session_id=_u1_condition_path_session_id(session, role),
+        adapter_metadata=_u1_adapter_metadata({
             "u1": {
                 "segment_type": segment_type,
                 "source": source,
                 "prompt_ends_with_image_marker": True,
             }
-        },
+        }),
     )
 
 
@@ -1050,10 +1059,12 @@ def _load_u1_generated_tensor_for_commit(
 
 
 def _u1_session_id(session: Any | None) -> str | None:
-    return getattr(getattr(session, "handle", None), "session_id", None)
+    if session is None or session.handle is None:
+        return None
+    return session.handle.session_id
 
 
-def _u1_sidecar_session_id(session: Any | None, role: str | None) -> str | None:
+def _u1_condition_path_session_id(session: Any | None, role: str | None) -> str | None:
     session_id = _u1_session_id(session)
     if role is None or session_id is None:
         return None
@@ -1061,15 +1072,13 @@ def _u1_sidecar_session_id(session: Any | None, role: str | None) -> str | None:
 
 
 def _u1_session_context_length(session: Any | None) -> int:
-    handle = getattr(session, "handle", None)
-    context_length = getattr(handle, "context_length", None)
-    if context_length is not None:
-        return int(context_length)
-    return int(getattr(session, "srt_last_origin_input_len", 0) or 0)
+    if session is None or session.handle is None:
+        return 0
+    return int(session.handle.context_length)
 
 
 def _u1_session_logical_position(session: Any | None) -> int | None:
-    metadata = getattr(session, "metadata", {}) or {}
+    metadata = _u1_session_metadata(session)
     model_state = metadata.get("omni_model_state") or {}
     u1_state = model_state.get("u1") or {}
     generation_position_start = u1_state.get("generation_position_start")
@@ -1094,7 +1103,7 @@ def _u1_session_has_open_image_marker(
     session: Any | None,
     img_start_token_id: int,
 ) -> bool:
-    metadata = getattr(session, "metadata", {}) or {}
+    metadata = _u1_session_metadata(session)
     model_state = metadata.get("omni_model_state") or {}
     u1_state = model_state.get("u1") or {}
     if bool(u1_state.get("open_image_marker")):
@@ -1111,7 +1120,7 @@ def _u1_generated_image_commit_metadata(
     omit_start: bool,
     generation_position_start: int | None = None,
 ) -> dict[str, Any]:
-    metadata = getattr(session, "metadata", {}) or {}
+    metadata = _u1_session_metadata(session)
     model_state = metadata.get("omni_model_state") or {}
     previous_state = model_state.get("u1") or {}
     previous_segments = [
@@ -1148,6 +1157,12 @@ def _u1_generated_image_commit_metadata(
         "u1": u1_segment,
         "omni_model_state_updates": {"u1": u1_state},
     }
+
+
+def _u1_session_metadata(session: Any | None) -> dict[str, Any]:
+    if session is None:
+        return {}
+    return session.metadata or {}
 
 
 def _u1_dynamic_preprocess_native_resolution(

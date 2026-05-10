@@ -12,7 +12,6 @@ from __future__ import annotations
 import base64
 from dataclasses import dataclass
 from io import BytesIO
-from types import SimpleNamespace
 from typing import Any, Literal
 
 from sglang.omni.protocol import (
@@ -24,8 +23,9 @@ from sglang.omni.protocol import (
     OmniContextRef,
     OmniInputSegment,
     OmniRequest,
+    TemporaryForwardPrepared,
 )
-from sglang.srt.omni_session.middle import SRTBackedOmniSessionBridge
+from sglang.srt.omni_session.bridge import SRTBackedOmniSessionBridge
 from sglang.srt.omni_session.runtime import (
     OmniDecodeResult,
     OmniVLMTextGenerationResult,
@@ -45,7 +45,7 @@ class _VLMBackendContext:
 class SRTBackedContextOps(ContextOps):
     """Expose live SRT context operations to a colocated generation backend."""
 
-    bridge: Any
+    bridge: SRTBackedOmniSessionBridge
     context: OmniContextBundle
 
     @property
@@ -54,7 +54,7 @@ class SRTBackedContextOps(ContextOps):
 
     @property
     def generation_kind(self) -> str | None:
-        return getattr(self.bridge, "generation_kind", None)
+        return self.bridge.generation_kind
 
     @property
     def session_id(self) -> str:
@@ -73,35 +73,27 @@ class SRTBackedContextOps(ContextOps):
     def get_position_count(
         self,
         *,
-        sidecar_role: str | None = None,
+        condition_path_role: str | None = None,
     ) -> int | None:
         return (
             self.bridge.runtime.srt_request_executor.get_latest_session_position_count(
                 self.session_id,
-                sidecar_role=sidecar_role,
+                condition_path_role=condition_path_role,
             )
         )
 
     def build_temporary_forward_batch(
         self,
         *,
-        prepared: Any,
+        prepared: TemporaryForwardPrepared,
         generation_query_embeds: Any,
         timestep: Any,
     ) -> Any:
         return self.bridge.runtime.srt_request_executor.build_temporary_context_forward_batch_for_session(
-            prepared=self._to_srt_prepared(prepared),
+            prepared=prepared,
             generation_query_embeds=generation_query_embeds,
             timestep=timestep,
         )
-
-    def _to_srt_prepared(self, prepared: Any) -> Any:
-        if getattr(prepared, "srt_session_id", None) is not None:
-            return prepared
-        data = dict(getattr(prepared, "__dict__", {}) or {})
-        data["srt_session_id"] = data.get("session_id", self.session_id)
-        data["srt_sidecar_role"] = data.get("sidecar_role")
-        return SimpleNamespace(**data)
 
 
 class SRTARBackend(ARBackend):
@@ -159,7 +151,6 @@ class SRTARBackend(ARBackend):
         *,
         request: OmniRequest,
     ) -> OmniBoundary:
-        del request
         pending_boundaries = context.metadata.get("pending_boundaries")
         if pending_boundaries:
             return pending_boundaries.pop(0)

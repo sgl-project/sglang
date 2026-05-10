@@ -633,6 +633,7 @@ class Req(ReqDllmMixin):
         self.input_embeds = input_embeds
         self.positional_embed_overrides = positional_embed_overrides
         self.multi_item_delimiter_indices = multi_item_delimiter_indices
+        self.attention_math_mode: Optional[str] = None
 
         # For req-level memory management
         self.kv_committed_len = 0
@@ -1355,6 +1356,13 @@ class Req(ReqDllmMixin):
         )
 
 
+def _resolve_attention_math_mode(reqs: List[Req]) -> Optional[str]:
+    modes = [req.attention_math_mode for req in reqs]
+    if "reference_eager" in modes:
+        return "reference_eager"
+    return next((mode for mode in modes if mode is not None), None)
+
+
 @dataclasses.dataclass
 class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     """Store all information of a batch on the scheduler."""
@@ -1389,6 +1397,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     replace_positions: Optional[torch.Tensor] = None
     custom_position_ids: Optional[torch.Tensor] = None
     custom_decode_position_ids: Optional[torch.Tensor] = None
+    attention_math_mode: Optional[str] = None
     ne_token_table: torch.Tensor = None
     token_type_ids: torch.Tensor = None  # shape: [b], int64
     req_pool_indices: torch.Tensor = None  # shape: [b], int64
@@ -1739,6 +1748,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         has_custom_position_ids = any(
             getattr(req, "custom_position_ids", None) is not None for req in reqs
         )
+        self.attention_math_mode = _resolve_attention_math_mode(reqs)
         input_id_pointer = 0
         input_id_lens = [len(input_id) for input_id in input_ids]
         extend_input_logprob_token_ids = []
@@ -2307,6 +2317,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.input_embeds = None
         self.custom_position_ids = None
         self.custom_decode_position_ids = None
+        self.attention_math_mode = _resolve_attention_math_mode(self.reqs)
         decode_position_ids = [
             getattr(req, "custom_decode_position_id", None) for req in self.reqs
         ]
@@ -2630,6 +2641,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             replace_positions=self.replace_positions,
             custom_position_ids=self.custom_position_ids,
             custom_decode_position_ids=self.custom_decode_position_ids,
+            attention_math_mode=self.attention_math_mode,
             ne_token_table=self.ne_token_table,
             token_type_ids=self.token_type_ids,
             spec_algorithm=self.spec_algorithm,
@@ -2654,9 +2666,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             dllm_block_offsets=[req.dllm_block_offset for req in self.reqs],
             dllm_config=self.dllm_config,
             reqs=self.reqs,
-            session_forward_metadata=[
-                getattr(req, "session_forward_metadata", None) for req in self.reqs
-            ],
             has_grammar=self.has_grammar,
             mamba_track_indices=self.mamba_track_indices,
             mamba_track_mask=self.mamba_track_mask,
@@ -2830,6 +2839,7 @@ class ModelWorkerBatch:
     replace_positions: Optional[torch.Tensor] = None
     custom_position_ids: Optional[torch.Tensor] = None
     custom_decode_position_ids: Optional[torch.Tensor] = None
+    attention_math_mode: Optional[str] = None
 
     # token table for ngram embedding
     ne_token_table: Optional[torch.Tensor] = None
@@ -2865,7 +2875,6 @@ class ModelWorkerBatch:
     # For constrained decoding
     # FIXME(lsyin): remove this after fully overlap grammar
     reqs: Optional[List[Req]] = None
-    session_forward_metadata: Optional[List[Dict[str, Any]]] = None
     has_grammar: bool = False
 
     # For hidden states before normal

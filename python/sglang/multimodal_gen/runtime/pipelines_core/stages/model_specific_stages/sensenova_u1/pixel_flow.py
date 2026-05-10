@@ -3,8 +3,11 @@
 
 import math
 from dataclasses import dataclass, field
-from types import SimpleNamespace
 from typing import Any
+
+import numpy as np
+import torch
+from PIL import Image
 
 from sglang.multimodal_gen.configs.sample.sensenova_u1 import (
     SenseNovaU1PixelFlowCFG,
@@ -14,15 +17,12 @@ from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
-import numpy as np
-import torch
-from PIL import Image
+from sglang.omni.protocol import ContextOps, TemporaryForwardPrepared
 
 _U1_T2I_CFG_UNCONDITION_ROLE = "u1_t2i_cfg_uncondition"
 _U1_INTERLEAVE_TEXT_UNCONDITION_ROLE = "u1_interleave_text_uncondition"
 _U1_EDIT_IMG_CONDITION_ROLE = "u1_edit_img_condition"
 _U1_EDIT_UNCONDITION_ROLE = "u1_edit_uncondition"
-_DEFAULT_CONTEXT_OPS_KEY = "sensenova_u1_context_ops"
 
 
 @dataclass(frozen=True, slots=True)
@@ -66,19 +66,14 @@ class SenseNovaU1GeneratedSegment:
 class _SenseNovaU1GenerationContext:
     session_id: str
     position_count: int
-    sidecar_role: str | None = None
+    condition_path_role: str | None = None
 
 
 class SenseNovaU1PixelFlowStage(PipelineStage):
     """Run U1 pixel-flow generation inside one stage-local execution boundary."""
 
-    def __init__(
-        self,
-        *,
-        context_ops_key: str = _DEFAULT_CONTEXT_OPS_KEY,
-    ) -> None:
+    def __init__(self) -> None:
         super().__init__()
-        self.context_ops_key = context_ops_key
 
     @property
     def role_affinity(self):
@@ -92,8 +87,7 @@ class SenseNovaU1PixelFlowStage(PipelineStage):
         """
             different from standard multimodal_gen pipeline, omni pipeline may return a Req, carrying some intermediate states
         """
-        del server_args
-        context_ops = _require_context_ops(batch, self.context_ops_key)
+        context_ops = _require_context_ops(batch)
         model = _require_model(context_ops)
         forward_batch_provider = _require_forward_batch_provider(context_ops)
         (
@@ -103,7 +97,7 @@ class SenseNovaU1PixelFlowStage(PipelineStage):
         ) = _resolve_u1_contexts(context_ops=context_ops, batch=batch)
         prepared = self._prepare(
             model=model,
-            context_metadata=dict(getattr(context_ops, "metadata", {}) or {}),
+            context_metadata=dict(context_ops.metadata),
             batch=batch,
             u1_context=u1_context,
             cfg_img_condition_u1_context=cfg_img_condition_u1_context,
@@ -488,19 +482,13 @@ class SenseNovaU1PixelFlowStage(PipelineStage):
 
 def _resolve_u1_contexts(
     *,
-    context_ops: Any,
-    batch: Any,
+    context_ops: ContextOps,
+    batch: Req,
 ) -> tuple[
     _SenseNovaU1GenerationContext,
     _SenseNovaU1GenerationContext | None,
     _SenseNovaU1GenerationContext | None,
 ]:
-    get_position_count = getattr(context_ops, "get_position_count", None)
-    if not callable(get_position_count):
-        raise RuntimeError(
-            "SenseNova U1 pixel-flow requires latest context position count"
-        )
-
     u1_context = _require_context(
         context_ops,
         "SenseNova U1 pixel-flow has no context position count",
@@ -528,65 +516,72 @@ def _resolve_u1_contexts(
         _U1_EDIT_UNCONDITION_ROLE,
     )
 
+    # condition path roles select the CFG branch whose SRT KV is read during denoise
     if mode == "edit":
         if cfg.needs_img_condition:
             cfg_img_condition_context = _require_context(
                 context_ops,
-                "SenseNova U1 edit image CFG requires sidecar context position count",
+                "SenseNova U1 edit image CFG requires condition path position count",
                 edit_img_condition_role,
             )
         if cfg.needs_uncondition:
             cfg_uncondition_context = _require_context(
                 context_ops,
-                "SenseNova U1 edit uncondition CFG requires sidecar context position count",
+                "SenseNova U1 edit uncondition CFG requires condition path position count",
                 edit_uncondition_role,
             )
     elif mode == "interleave":
         if cfg.needs_img_condition:
             cfg_img_condition_context = _require_context(
                 context_ops,
-                "SenseNova U1 interleave text CFG requires sidecar context position count",
+                "SenseNova U1 interleave text CFG requires condition path position count",
                 interleave_text_uncondition_role,
             )
         if cfg.needs_uncondition:
             cfg_uncondition_context = _require_context(
                 context_ops,
-                "SenseNova U1 interleave image CFG requires sidecar context position count",
+                "SenseNova U1 interleave image CFG requires condition path position count",
                 t2i_uncondition_role,
             )
     elif cfg.text_scale > 1.0:
         cfg_img_condition_context = _require_context(
             context_ops,
-            "SenseNova U1 pixel-flow CFG requires sidecar context position count",
+            "SenseNova U1 pixel-flow CFG requires condition path position count",
             t2i_uncondition_role,
         )
     return u1_context, cfg_img_condition_context, cfg_uncondition_context
 
 
 def _require_context(
-    context_ops: Any,
+    context_ops: ContextOps,
     message: str,
-    sidecar_role: str | None = None,
+    condition_path_role: str | None = None,
 ) -> _SenseNovaU1GenerationContext:
-    position_count = context_ops.get_position_count(sidecar_role=sidecar_role)
+    position_count = context_ops.get_position_count(
+        condition_path_role=condition_path_role
+    )
     if position_count is None:
-        suffix = f" sidecar {sidecar_role}" if sidecar_role is not None else ""
+        suffix = (
+            f" condition path {condition_path_role}"
+            if condition_path_role is not None
+            else ""
+        )
         raise RuntimeError(f"{message} for context {context_ops.session_id}{suffix}")
     return _SenseNovaU1GenerationContext(
         session_id=context_ops.session_id,
-        sidecar_role=sidecar_role,
+        condition_path_role=condition_path_role,
         position_count=int(position_count),
     )
 
 
-def _require_context_ops(batch: Any, key: str = _DEFAULT_CONTEXT_OPS_KEY) -> Any:
-    context_ops = batch.extra.get(key)
+def _require_context_ops(batch: Req) -> ContextOps:
+    context_ops = batch.omni_context_ops
     if context_ops is None:
-        raise RuntimeError(f"SenseNova U1 pixel-flow requires batch.extra[{key!r}]")
-    if getattr(context_ops, "generation_kind", None) != "pixel_flow":
+        raise RuntimeError("SenseNova U1 pixel-flow requires batch.omni_context_ops")
+    if context_ops.generation_kind != "pixel_flow":
         raise ValueError(
             "SenseNova U1 pixel-flow requires generation_kind='pixel_flow', got "
-            f"{getattr(context_ops, 'generation_kind', None)!r}"
+            f"{context_ops.generation_kind!r}"
         )
     return context_ops
 
@@ -606,13 +601,13 @@ def _build_forward_context(
         text_len=position_count,
         device=device,
     )
-    prepared = SimpleNamespace(
+    prepared = TemporaryForwardPrepared(
         generation_input={
             "packed_seqlens": packed_seqlens,
             "packed_position_ids": indexes_image,
         },
-        session_id=context.session_id,
-        sidecar_role=context.sidecar_role,
+        srt_session_id=context.session_id,
+        condition_path_role=context.condition_path_role,
     )
     return SenseNovaU1PixelFlowForwardContext(
         prepared=prepared,
@@ -780,18 +775,12 @@ def _model_dtype(model: Any) -> Any:
     return next(model.parameters()).dtype
 
 
-def _require_model(context_ops: Any) -> Any:
-    get_model = getattr(context_ops, "get_model", None)
-    if not callable(get_model):
-        raise RuntimeError("SenseNova U1 pixel-flow requires model access")
-    return get_model()
+def _require_model(context_ops: ContextOps) -> Any:
+    return context_ops.get_model()
 
 
-def _require_forward_batch_provider(context_ops: Any) -> Any:
-    provider = getattr(context_ops, "build_temporary_forward_batch", None)
-    if not callable(provider):
-        raise RuntimeError("SenseNova U1 pixel-flow requires temporary query batches")
-    return provider
+def _require_forward_batch_provider(context_ops: ContextOps) -> Any:
+    return context_ops.build_temporary_forward_batch
 
 
 def _should_apply_cfg(cfg: SenseNovaU1PixelFlowCFG, timestep: Any) -> bool:

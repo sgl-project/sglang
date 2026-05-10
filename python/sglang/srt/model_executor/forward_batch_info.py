@@ -441,14 +441,15 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # For dumper: request IDs for cross-step sequence tracking
     rids: Optional[List[str]] = None
 
-    # Optional session/request metadata threaded from SRT scheduler requests.
-    session_forward_metadata: Optional[List[Dict[str, Any]]] = None
-
     # colocated omni generation query attention is full over live SRT KV
     temporary_context_attention_mode: Optional[str] = None
+    attention_math_mode: Optional[str] = None
 
     def use_temporary_full_query_attention(self) -> bool:
         return self.temporary_context_attention_mode == "full_query"
+
+    def use_reference_eager_attention(self) -> bool:
+        return self.attention_math_mode == "reference_eager"
 
     @classmethod
     def init_new(
@@ -501,7 +502,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             return_hidden_states_before_norm=batch.return_hidden_states_before_norm,
             return_pooled_hidden_states=batch.return_pooled_hidden_states,
             rids=[req.rid for req in batch.reqs],
-            session_forward_metadata=batch.session_forward_metadata,
+            attention_math_mode=batch.attention_math_mode,
         )
         device = model_runner.device
 

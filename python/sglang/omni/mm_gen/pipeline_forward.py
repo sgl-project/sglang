@@ -29,14 +29,13 @@ class DirectPipelineForwardBackend(MultimodalGenerationBackend):
 
     pipeline: ComposedPipelineBase
     server_args: Any
-    context_ops_extra_key: str
 
     def generate_segment(
         self,
         request: OmniRequest,
         context_ops: ContextOps,
     ) -> GeneratedSegment:
-        batch = build_pipeline_req(request, context_ops, self.context_ops_extra_key)
+        batch = build_pipeline_req(request, context_ops)
         batch: Req = self.pipeline.forward(batch, self.server_args)
         segment = batch.generated_segment
         if segment is None:
@@ -48,21 +47,19 @@ class DirectPipelineForwardBackend(MultimodalGenerationBackend):
 def build_pipeline_req(
     request: OmniRequest,
     context_ops: ContextOps,
-    context_ops_extra_key: str,
 ) -> Req:
     """Build the multimodal_gen request envelope shared by omni mm backends."""
 
     extra = {
         "omni_messages": [message.to_dict() for message in request.messages],
         "omni_context_metadata": context_ops.metadata,
-        # context_ops is an in-process SRT capability, not serialized KV.
-        context_ops_extra_key: context_ops,
     }
     return Req(
         sampling_params=_copy_sampling_params(request.sampling_params),
         prompt=_prompt_from_request(request),
         suppress_logs=True,
         extra=extra,
+        omni_context_ops=context_ops,
     )
 
 

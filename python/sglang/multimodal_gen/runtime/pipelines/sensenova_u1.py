@@ -34,9 +34,7 @@ class SenseNovaU1Pipeline(ComposedPipelineBase):
     def create_pipeline_stages(self, server_args: ServerArgs):
         del server_args
         self.add_stage(InputValidationStage())
-        self.add_stage(
-            SenseNovaU1PixelFlowStage(context_ops_key="sensenova_u1_context_ops")
-        )
+        self.add_stage(SenseNovaU1PixelFlowStage())
 
 
 EntryClass = SenseNovaU1Pipeline

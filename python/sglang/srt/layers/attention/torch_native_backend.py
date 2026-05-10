@@ -400,19 +400,6 @@ class TorchNativeAttnBackend(AttentionBackend):
         ).to(query.dtype)
         return torch.matmul(attn_weights, value)
 
-    @staticmethod
-    def _should_use_u1_reference_eager(forward_batch: ForwardBatch) -> bool:
-        metadata = getattr(forward_batch, "session_forward_metadata", None)
-        if not metadata:
-            return False
-        for item in metadata:
-            if not isinstance(item, dict):
-                continue
-            adapter_metadata = item.get("adapter_metadata") or {}
-            if isinstance(adapter_metadata, dict) and "u1" in adapter_metadata:
-                return True
-        return False
-
     def forward_extend(
         self,
         q,
@@ -452,7 +439,7 @@ class TorchNativeAttnBackend(AttentionBackend):
 
         run_extend = (
             self._run_eager_forward_extend
-            if self._should_use_u1_reference_eager(forward_batch)
+            if forward_batch.use_reference_eager_attention()
             else self._run_sdpa_forward_extend
         )
         run_extend(
@@ -506,7 +493,7 @@ class TorchNativeAttnBackend(AttentionBackend):
 
         run_decode = (
             self._run_eager_forward_decode
-            if self._should_use_u1_reference_eager(forward_batch)
+            if forward_batch.use_reference_eager_attention()
             else self._run_sdpa_forward_decode
         )
         run_decode(

@@ -163,6 +163,15 @@ class GeneratedSegment:
 
 
 @dataclass(frozen=True, slots=True)
+class TemporaryForwardPrepared:
+    """Temporary query metadata for generation backends that read live SRT KV."""
+
+    generation_input: dict[str, Any]
+    srt_session_id: str
+    condition_path_role: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class OmniOutputSegment:
     """OmniOutputSegment is the basic element of the result of an omni request
     """
@@ -247,14 +256,14 @@ class ContextOps(ABC):
     def get_position_count(
         self,
         *,
-        sidecar_role: str | None = None,
+        condition_path_role: str | None = None,
     ) -> int | None: ...
 
     @abstractmethod
     def build_temporary_forward_batch(
         self,
         *,
-        prepared: Any,
+        prepared: TemporaryForwardPrepared,
         generation_query_embeds: Any,
         timestep: Any,
     ) -> Any: ...

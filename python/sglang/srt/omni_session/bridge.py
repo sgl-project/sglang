@@ -2,8 +2,6 @@
 """Middle bridge between generic omni orchestration and SRT session execution."""
 
 from abc import ABC, abstractmethod
-from collections.abc import Callable
-from types import SimpleNamespace
 from typing import Any
 
 from sglang.srt.omni_session.runtime_protocol import (
@@ -11,35 +9,18 @@ from sglang.srt.omni_session.runtime_protocol import (
     OmniContextHandle,
     OmniSessionHandle,
 )
-from sglang.srt.omni_session.interleaved_protocol import (
-    DEFAULT_OMNI_TEXT_MAX_NEW_TOKENS,
-    GeneratedSegmentResult,
-    GenerationKind,
-)
 from sglang.srt.omni_session.runtime import (
     OmniDecodeResult,
     OmniInterleavedMessage,
     OmniSessionRuntime,
-    OmniSRTRequestExecutor,
     OmniVLMTextGenerationResult,
 )
 
-GeneratedSegmentExecutor = Callable[[Any], GeneratedSegmentResult]
+DEFAULT_OMNI_TEXT_MAX_NEW_TOKENS = 128
 
 
 class OmniSessionBridge(ABC):
-    generation_kind: GenerationKind
-
-    @abstractmethod
-    def prepare_ar_context(
-        self,
-        *,
-        prompt: str | list[str] | None,
-        image: Any | None,
-        think: bool = False,
-        think_max_new_tokens: int | None = None,
-        sampling_params: Any | None = None,
-    ) -> OmniContextBundle: ...
+    generation_kind: str = "generic"
 
     @abstractmethod
     def prepare_ar_context_from_messages(
@@ -53,16 +34,8 @@ class OmniSessionBridge(ABC):
     ) -> OmniContextBundle: ...
 
     @abstractmethod
-    def run_generated_segment(
-        self,
-        *,
-        contexts: OmniContextBundle,
-        executor: GeneratedSegmentExecutor,
-    ) -> GeneratedSegmentResult: ...
-
-    @abstractmethod
     def commit_generated_segment(
-        self, *, contexts: OmniContextBundle, segment: GeneratedSegmentResult
+        self, *, contexts: OmniContextBundle, segment: Any
     ) -> None: ...
 
     @abstractmethod
@@ -82,83 +55,11 @@ class OmniSessionBridge(ABC):
     ) -> OmniVLMTextGenerationResult: ...
 
 
-class SRTBackedGenerationContextOps:
-    """Narrow generation-side view of an SRT-backed omni context.
-
-    generation backends consume this object instead of reaching through the omni bridge or
-    runtime. It exposes only model access, logical context positions, and
-    temporary query execution.
-    """
-
-    def __init__(self, bridge: Any, contexts: OmniContextBundle) -> None:
-        self._bridge = bridge
-        self._contexts = contexts
-
-    @property
-    def generation_kind(self) -> GenerationKind:
-        return self._bridge.generation_kind
-
-    @property
-    def session_id(self) -> str:
-        session = self._contexts.full.session
-        if session is None:
-            raise ValueError(
-                "SRT-backed generation context ops require a session handle"
-            )
-        return session.session_id
-
-    @property
-    def metadata(self) -> dict[str, Any]:
-        return self._contexts.full.metadata
-
-    def get_role(self, name: str, default: str) -> str:
-        attr_name = name if name.endswith("_role") else f"{name}_role"
-        return str(getattr(self._bridge, attr_name, default))
-
-    def get_model(self) -> Any:
-        return self._executor().get_srt_model()
-
-    def get_position_count(self, *, sidecar_role: str | None = None) -> int | None:
-        return self._executor().get_latest_session_position_count(
-            self.session_id,
-            sidecar_role=sidecar_role,
-        )
-
-    def build_temporary_forward_batch(
-        self,
-        *,
-        prepared: Any,
-        generation_query_embeds: Any,
-        timestep: Any,
-    ) -> Any:
-        return self._executor().build_temporary_context_forward_batch_for_session(
-            prepared=self._to_srt_prepared(prepared),
-            generation_query_embeds=generation_query_embeds,
-            timestep=timestep,
-        )
-
-    def _executor(self) -> OmniSRTRequestExecutor:
-        executor = self._bridge.runtime.srt_request_executor
-        if executor is None:
-            raise RuntimeError(
-                "SRT-backed generation context ops require a request executor"
-            )
-        return executor
-
-    def _to_srt_prepared(self, prepared: Any) -> Any:
-        if getattr(prepared, "srt_session_id", None) is not None:
-            return prepared
-        data = dict(getattr(prepared, "__dict__", {}) or {})
-        data["srt_session_id"] = data.get("session_id", self.session_id)
-        data["srt_sidecar_role"] = data.get("sidecar_role")
-        return SimpleNamespace(**data)
-
-
 class SRTBackedOmniSessionBridge(OmniSessionBridge):
     """omni middle bridge that keeps SRT as the session/KV owner.
 
-    It asks the runtime to prefill/decode/commit AR-side chunks, while generation-side
-    code receives only `SRTBackedGenerationContextOps`.
+    It asks the runtime to prefill/decode/commit AR-side chunks. Generation-side
+    context access is exposed by `sglang.omni.backends.ar.srt`.
     """
 
     def __init__(
@@ -175,23 +76,6 @@ class SRTBackedOmniSessionBridge(OmniSessionBridge):
         self.runtime = runtime
         self.max_pre_image_decode_steps = max_pre_image_decode_steps
 
-    def prepare_ar_context(
-        self,
-        *,
-        prompt: str | list[str] | None,
-        image: Any | None,
-        think: bool = False,
-        think_max_new_tokens: int | None = None,
-        sampling_params: Any | None = None,
-    ) -> OmniContextBundle:
-        messages = self.runtime.normalize_messages(prompt=prompt, image=image)
-        return self.prepare_ar_context_from_messages(
-            messages=messages,
-            think=think,
-            think_max_new_tokens=think_max_new_tokens,
-            sampling_params=sampling_params,
-        )
-
     def prepare_ar_context_from_messages(
         self,
         *,
@@ -201,7 +85,6 @@ class SRTBackedOmniSessionBridge(OmniSessionBridge):
         sampling_params: Any | None = None,
         session_id: str | None = None,
     ) -> OmniContextBundle:
-        del sampling_params
         messages = normalize_omni_interleaved_messages(messages)
         session = self.runtime.prefill_interleaved(messages, session_id=session_id)
         pre_image_segments: list[dict[str, Any]] = []
@@ -288,23 +171,8 @@ class SRTBackedOmniSessionBridge(OmniSessionBridge):
             ),
         )
 
-    def run_generated_segment(
-        self,
-        *,
-        contexts: OmniContextBundle,
-        executor: GeneratedSegmentExecutor,
-    ) -> GeneratedSegmentResult:
-        if contexts.full.session is None:
-            raise ValueError("SRT-backed omni contexts require a session handle")
-        segment = executor(SRTBackedGenerationContextOps(self, contexts))
-        if segment.type != "image":
-            raise ValueError(
-                f"omni generated segment expected image output, got {segment.type}"
-            )
-        return segment
-
     def commit_generated_segment(
-        self, *, contexts: OmniContextBundle, segment: GeneratedSegmentResult
+        self, *, contexts: OmniContextBundle, segment: Any
     ) -> None:
         if segment.type != "image":
             raise ValueError(f"omni commit expects image segment, got {segment.type}")
