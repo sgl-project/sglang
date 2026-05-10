@@ -18,6 +18,7 @@ from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
 
+from sglang.srt.configs.hybrid_arch import hybrid_gdn_config
 from sglang.srt.distributed import get_tp_group
 from sglang.srt.layers.dp_attention import get_attention_tp_group
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
@@ -551,7 +552,7 @@ class MultiLayerEagleWorker(TpModelWorker):
         ]
         logits_output.hidden_states = logits_output.hidden_states[res.accepted_indices]
 
-        if self.target_worker.model_runner.hybrid_gdn_config is not None:
+        if hybrid_gdn_config(self.target_worker.model_runner.model_config) is not None:
             accepted_length = (
                 torch.tensor(
                     res.num_accepted_drafts_per_req_cpu,
