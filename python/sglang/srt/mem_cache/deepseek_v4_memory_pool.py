@@ -748,7 +748,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             freqs_cis=freqs_cis,
             positions=positions,
             out_loc=swa_loc,
-            kvcache=self.swa_kv_pool.kv_buffer[self._swa_layer_id(layer_id)],
+            kvcache=self.swa_kv_pool.kv_buffer[layer_id],
             page_size=self.swa_kv_pool.page_size,
         )
 
