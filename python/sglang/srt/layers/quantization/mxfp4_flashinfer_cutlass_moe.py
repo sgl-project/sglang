@@ -19,6 +19,7 @@ keep the Marlin default.
 from __future__ import annotations
 
 import logging
+import os
 from typing import TYPE_CHECKING
 
 import torch
@@ -30,8 +31,15 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
+from sglang.srt.layers.moe.token_dispatcher.standard import StandardCombineInput
+from sglang.srt.layers.moe.topk import TopKOutputChecker
 from sglang.srt.utils import is_flashinfer_available, log_info_on_rank0
 from sglang.srt.utils.common import next_power_of_2
+
+# Silence the TRT-LLM cutlass autotune trace embedded inside FlashInfer's
+# cutlass_fused_moe. Its C++ logger reads TLLM_LOG_LEVEL on first kernel launch;
+# setdefault preserves any explicit user override.
+os.environ.setdefault("TLLM_LOG_LEVEL", "INFO")
 
 if is_flashinfer_available():
     from flashinfer.fused_moe import cutlass_fused_moe as flashinfer_cutlass_fused_moe
@@ -76,6 +84,8 @@ class Mxfp4FlashinferCutlassMoEMethod:
             )
         self._fp8 = fp8_method
         self.prefix = prefix
+        self._swiglu_alpha_tensor: torch.Tensor | None = None
+        self._swiglu_beta_tensor: torch.Tensor | None = None
         self._swiglu_limit_tensor: torch.Tensor | None = None
 
     # --- Lifecycle ---------------------------------------------------------
@@ -116,18 +126,28 @@ class Mxfp4FlashinferCutlassMoEMethod:
         self.moe_runner_config = moe_runner_config
 
         # DSv4 uses standard SwiGLU plus a config-driven activation clamp.
-        # The cutlass SwiGLU activation accepts per-expert (alpha, beta, limit);
-        # we leave alpha/beta as None (kernel defaults to 1.0 / 0.0 -> plain
-        # silu(gate) * up) and only build the per-expert clamp tensor.
+        # We pass all three (alpha, beta, limit) as explicit per-expert tensors
+        # rather than mixing tensors with None: the cutlass SwiGLU kernel
+        # branches on whether each is None, and partial-None inputs land in
+        # less-tested code paths. ``alpha=1.0``, ``beta=0.0`` reproduce plain
+        # ``silu(gate) * up``; ``limit`` enforces the activation clamp the
+        # checkpoint was trained with.
         swiglu_limit = getattr(moe_runner_config, "swiglu_limit", None)
         if swiglu_limit is not None:
+            E = layer.num_local_experts
+            device = layer.w13_weight.device
+            self._swiglu_alpha_tensor = torch.ones(
+                E, dtype=torch.float32, device=device
+            )
+            self._swiglu_beta_tensor = torch.zeros(
+                E, dtype=torch.float32, device=device
+            )
             self._swiglu_limit_tensor = torch.full(
-                (layer.num_local_experts,),
-                float(swiglu_limit),
-                dtype=torch.float32,
-                device=layer.w13_weight.device,
+                (E,), float(swiglu_limit), dtype=torch.float32, device=device
             )
         else:
+            self._swiglu_alpha_tensor = None
+            self._swiglu_beta_tensor = None
             self._swiglu_limit_tensor = None
 
     def process_weights_after_loading(self, layer: Module) -> None:
@@ -198,11 +218,6 @@ class Mxfp4FlashinferCutlassMoEMethod:
         layer: Module,
         dispatch_output: "DispatchOutput",
     ) -> "CombineInput":
-        from sglang.srt.layers.moe.token_dispatcher.standard import (
-            StandardCombineInput,
-        )
-        from sglang.srt.layers.moe.topk import TopKOutputChecker
-
         topk_output = dispatch_output.topk_output
         if not TopKOutputChecker.format_is_standard(topk_output):
             raise ValueError(f"Unsupported topk output format: {topk_output.format}")
@@ -232,8 +247,8 @@ class Mxfp4FlashinferCutlassMoEMethod:
             ],
             fc1_expert_biases=None,  # DSv4 has no MoE expert bias.
             fc2_expert_biases=None,
-            swiglu_alpha=None,  # default 1.0 -> standard SiLU gate
-            swiglu_beta=None,  # default 0.0 -> standard up
+            swiglu_alpha=self._swiglu_alpha_tensor,  # ones: standard SiLU gate
+            swiglu_beta=self._swiglu_beta_tensor,  # zeros: standard up
             swiglu_limit=self._swiglu_limit_tensor,
             tp_size=layer.moe_tp_size,
             tp_rank=layer.moe_tp_rank,

@@ -16,11 +16,17 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import replace
 from typing import TYPE_CHECKING, List, Optional
 
 import torch
 from torch.nn.parameter import Parameter
+
+# Silence the TRT-LLM cutlass autotune trace embedded inside FlashInfer's
+# cutlass_fused_moe. Its C++ logger reads TLLM_LOG_LEVEL on first kernel launch;
+# setdefault preserves any explicit user override.
+os.environ.setdefault("TLLM_LOG_LEVEL", "INFO")
 
 from sglang.srt.distributed import get_tp_group
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
@@ -958,18 +964,14 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         path (PR #3084). The fused kernel does GEMM1 + SwiGLU + GEMM2 in one
         call; weights/scales were pre-interleaved at load time."""
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
-        from sglang.srt.layers.moe.topk import TopKOutputChecker, select_experts
+        from sglang.srt.layers.moe.topk import TopKOutputChecker
 
         # Under ``--moe-runner-backend flashinfer_mxfp4`` the SGLang TopK layer
         # emits BypassedTopKOutput by default (the SM100 trtllm-gen kernel does
         # routing internally). The cutlass kernel needs explicit topk_ids /
         # topk_weights, so materialize them here when bypassed.
         if TopKOutputChecker.format_is_bypassed(topk_output):
-            topk_output = select_experts(
-                hidden_states=x,
-                router_logits=topk_output.router_logits,
-                topk_config=topk_output.topk_config,
-            )
+            topk_output = topk_output.to_standard()
         topk_weights, topk_ids = topk_output.topk_weights, topk_output.topk_ids
 
         # Pad input hidden dim to the (already-padded) loaded weight width.

@@ -8,7 +8,7 @@ so outputs must be bit-exact.
 
 Run on H100/H200:
 
-    cd python && python -m pytest sglang/test/test_mxfp4_sm90_cutlass.py -v
+    python -m pytest test/registered/unit/layers/quantization/test_mxfp4_sm90_cutlass.py -v
 """
 
 from __future__ import annotations
@@ -17,6 +17,10 @@ from contextlib import nullcontext
 
 import pytest
 import torch
+
+from sglang.test.ci.ci_register import register_cuda_ci
+
+register_cuda_ci(est_time=120, suite="stage-b-test-1-gpu-large")
 
 flashinfer_fused_moe = pytest.importorskip("flashinfer.fused_moe")
 
@@ -447,7 +451,10 @@ def test_dsv4_apply_matches_flashinfer_direct(
         process_weights_after_loading=lambda layer: None,
     )
     method.prefix = "test"
-    method._swiglu_limit_tensor = None  # plain SiLU * up
+    # plain SiLU * up — all three SwiGLU scalars None (no clamp configured).
+    method._swiglu_alpha_tensor = None
+    method._swiglu_beta_tensor = None
+    method._swiglu_limit_tensor = None
 
     layer = _MockLayer()
     layer.w13_weight = torch.nn.Parameter(w13.clone(), requires_grad=False)
