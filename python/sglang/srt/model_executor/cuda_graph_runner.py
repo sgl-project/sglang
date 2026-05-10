@@ -33,6 +33,12 @@ from torch.profiler import ProfilerActivity, profile
 from sglang.srt.batch_overlap.two_batch_overlap import TboCudaGraphRunnerPlugin
 from sglang.srt.constants import GPU_MEMORY_TYPE_CUDA_GRAPH
 from sglang.srt.distributed import get_tensor_model_parallel_rank
+from sglang.srt.distributed.communication_op import (
+    set_cuda_graph_collective_break as set_communication_op_collective_break,
+)
+from sglang.srt.distributed.parallel_state import (
+    set_cuda_graph_collective_break as set_parallel_state_collective_break,
+)
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     set_graph_pool_id,
 )
@@ -604,6 +610,9 @@ class CudaGraphRunner:
         self.enable_profile_cuda_graph = (
             model_runner.server_args.enable_profile_cuda_graph
         )
+        self.enable_cuda_graph_collective_break = (
+            model_runner.server_args.enable_cuda_graph_collective_break
+        )
         self.tp_size = model_runner.server_args.tp_size
         self.dp_size = model_runner.server_args.dp_size
         self.pp_size = model_runner.server_args.pp_size
@@ -932,7 +941,11 @@ class CudaGraphRunner:
             and get_bool_env_var("SGLANG_MEMORY_SAVER_CUDA_GRAPH")
         )
 
-        if envs.SGLANG_USE_BREAKABLE_CUDA_GRAPH.get():
+        use_breakable_cuda_graph = (
+            envs.SGLANG_USE_BREAKABLE_CUDA_GRAPH.get()
+            or self.enable_cuda_graph_collective_break
+        )
+        if use_breakable_cuda_graph:
             if memory_saver_adapter.enabled:
                 raise NotImplementedError(
                     "Breakable CUDA graph is not compatible with memory saver mode"
@@ -950,12 +963,25 @@ class CudaGraphRunner:
         else:
             captured_fn = run_once_fn
 
-        with graph_ctx(cuda_graph=graph, pool=pool, stream=stream):
-            out = captured_fn()
+        prev_comm_collective_break = set_communication_op_collective_break(
+            self.enable_cuda_graph_collective_break
+        )
+        prev_parallel_collective_break = set_parallel_state_collective_break(
+            self.enable_cuda_graph_collective_break
+        )
+        try:
+            with graph_ctx(cuda_graph=graph, pool=pool, stream=stream):
+                out = captured_fn()
+        finally:
+            set_communication_op_collective_break(prev_comm_collective_break)
+            set_parallel_state_collective_break(prev_parallel_collective_break)
         return out
 
     def _create_device_graph(self):
-        if envs.SGLANG_USE_BREAKABLE_CUDA_GRAPH.get():
+        if (
+            envs.SGLANG_USE_BREAKABLE_CUDA_GRAPH.get()
+            or self.enable_cuda_graph_collective_break
+        ):
             if _is_hip:
                 raise RuntimeError("Breakable CUDA graph is not supported on ROCm/HIP")
             return BreakableCUDAGraph()

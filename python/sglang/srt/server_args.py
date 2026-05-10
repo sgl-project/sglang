@@ -685,6 +685,7 @@ class ServerArgs:
     disable_cuda_graph_padding: bool = False
     enable_breakable_cuda_graph: bool = False
     enable_profile_cuda_graph: bool = False
+    enable_cuda_graph_collective_break: bool = False
     enable_cudagraph_gc: bool = False
     debug_cuda_graph: bool = False
     enable_layerwise_nvtx_marker: bool = False
@@ -892,6 +893,7 @@ class ServerArgs:
 
         # Apply model-specific adjustments.
         self._handle_model_specific_adjustments()
+        self._handle_cuda_graph_collective_break()
 
         # Set kernel backends.
         self._handle_sampling_backend()
@@ -1323,6 +1325,43 @@ class ServerArgs:
             self.disable_piecewise_cuda_graph = True
         # 18. CUDA Graph debug mode
         if self.debug_cuda_graph:
+            self.disable_piecewise_cuda_graph = True
+
+    def _handle_cuda_graph_collective_break(self):
+        if (
+            self.nnodes > 1
+            and not self.disable_cuda_graph
+            and not self.enable_cuda_graph_collective_break
+        ):
+            logger.info(
+                "Enable CUDA graph collective breaks for multi-node CUDA graph."
+            )
+            self.enable_cuda_graph_collective_break = True
+
+        if self.enable_cuda_graph_collective_break and self.nnodes > 1:
+            launch_order = os.environ.get("NCCL_LAUNCH_ORDER_IMPLICIT")
+            if launch_order is None:
+                os.environ["NCCL_LAUNCH_ORDER_IMPLICIT"] = "1"
+                logger.info(
+                    "Set NCCL_LAUNCH_ORDER_IMPLICIT=1 for multi-node CUDA graph "
+                    "collective breaks."
+                )
+            elif launch_order != "1":
+                logger.warning(
+                    "NCCL_LAUNCH_ORDER_IMPLICIT=%s may deadlock with multi-node "
+                    "CUDA graph collective breaks. Set it to 1 unless you have "
+                    "validated this configuration.",
+                    launch_order,
+                )
+
+        if (
+            self.enable_cuda_graph_collective_break
+            and not self.disable_piecewise_cuda_graph
+        ):
+            logger.info(
+                "Disable piecewise CUDA graph because CUDA graph collective breaks "
+                "are enabled."
+            )
             self.disable_piecewise_cuda_graph = True
 
     def _handle_multi_item_scoring(self):
@@ -2284,7 +2323,6 @@ class ServerArgs:
                     support_mamba_cache_extra_buffer=True,
                     sm100_default_attention_backend=sm100_default_attn_backend,
                 )
-
         elif model_arch in ["Glm4MoeForCausalLM"]:
             if is_sm100_supported():
                 quantization_config = getattr(hf_config, "quantization_config", None)
@@ -6143,6 +6181,13 @@ class ServerArgs:
             "--enable-profile-cuda-graph",
             action="store_true",
             help="Enable profiling of cuda graph capture.",
+        )
+        parser.add_argument(
+            "--enable-cuda-graph-collective-break",
+            action="store_true",
+            help="Run model-parallel collectives eagerly between captured CUDA graph segments "
+            "instead of recording them inside the captured graph. Auto-enabled for "
+            "multi-node CUDA graph runs to avoid captured-collective deadlocks at replay.",
         )
         parser.add_argument(
             "--enable-cudagraph-gc",
