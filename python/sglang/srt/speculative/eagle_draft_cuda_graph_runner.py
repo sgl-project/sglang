@@ -127,11 +127,9 @@ class EAGLEDraftCudaGraphRunner:
             extend_seq_lens = torch.ones((self.max_bs,), dtype=torch.int32)
             topk_p = torch.zeros((self.max_bs, self.topk), dtype=torch.float32)
             topk_index = torch.zeros((self.max_bs, self.topk), dtype=torch.int64)
-            # self.model_runner is the draft model_runner; hidden_states tensor
-            # carries the target model's hidden states (used as input to chain
-            # draft models and propagated through scheduler merges). Size and
-            # dtype must follow target's config; using draft's breaks STANDALONE
-            # when target/draft hidden sizes differ (see #24215).
+            # hidden_states carries target output and propagates via scheduler
+            # merge; use target config, not self.model_runner (= draft).
+            # STANDALONE with mismatched hidden sizes crashes otherwise.
             target_cfg = self.eagle_worker.target_worker.model_runner.model_config
             hidden_states = torch.zeros(
                 (self.max_bs, target_cfg.spec_hidden_size),

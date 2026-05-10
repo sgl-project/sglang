@@ -151,10 +151,10 @@ class EAGLEDraftExtendCudaGraphRunner:
                     dtype=self.model_runner.dtype,
                 )
             else:
-                # self.model_runner is the draft model_runner; hidden_states
-                # tensor carries the target model's hidden states. Size and
-                # dtype must follow target's config; using draft's breaks
-                # STANDALONE when target/draft hidden sizes differ (see #24215).
+                # hidden_states carries target output and propagates via
+                # scheduler merge; use target config, not self.model_runner
+                # (= draft). STANDALONE with mismatched hidden sizes crashes
+                # otherwise.
                 target_cfg = self.eagle_worker.target_worker.model_runner.model_config
                 hidden_states = torch.zeros(
                     (
