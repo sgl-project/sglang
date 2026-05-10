@@ -19,6 +19,7 @@ from sglang.srt.distributed import (
     split_tensor_along_last_dim,
     tensor_model_parallel_all_gather,
     tensor_model_parallel_all_reduce,
+    tensor_model_parallel_quant_all_reduce,
 )
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
@@ -37,6 +38,7 @@ from sglang.srt.layers.parameter import (
     _ColumnvLLMParameter,
 )
 from sglang.srt.layers.utils import pad_or_narrow_weight
+from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import get_bool_env_var, is_cpu, is_hip, is_npu, set_weight_attrs
 
 if TYPE_CHECKING:
@@ -266,7 +268,9 @@ class ReplicatedLinear(LinearBase):
                     param.dtype == loaded_weight.dtype
                 ), "init para dtype and loaded weight dtype should be the same"
 
-        assert param.size() == loaded_weight.size()
+        assert (
+            param.size() == loaded_weight.size()
+        ), f"{param.shape=} {param.dtype=} {loaded_weight.shape=} {loaded_weight.dtype=}"
         param.data.copy_(loaded_weight)
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
@@ -426,7 +430,9 @@ class ColumnParallelLinear(LinearBase):
         if len(loaded_weight.shape) == 0:
             loaded_weight = loaded_weight.reshape(1)
 
-        assert param_data.shape == loaded_weight.shape
+        assert (
+            param_data.shape == loaded_weight.shape
+        ), f"param_data.shape={param_data.shape} != loaded_weight.shape={loaded_weight.shape}"
         param_data.copy_(loaded_weight)
 
     def weight_loader_v2(self, param: Parameter, loaded_weight: torch.Tensor):
@@ -1509,7 +1515,7 @@ class RowParallelLinear(LinearBase):
                 # Fallback for parameters that don't accept additional args
                 param.load_row_parallel_weight(loaded_weight)
 
-    def forward(self, input_, skip_all_reduce=False):
+    def forward(self, input_, skip_all_reduce=False, forward_batch=None):
         if self.input_is_parallel:
             input_parallel = input_
         else:
@@ -1536,7 +1542,18 @@ class RowParallelLinear(LinearBase):
             if self.use_dp_attention_reduce:
                 output = get_attention_tp_group().all_reduce(output_parallel)
             else:
-                output = tensor_model_parallel_all_reduce(output_parallel)
+                quantize_communications = (
+                    (
+                        not forward_batch.forward_mode.is_decode_or_idle()
+                        and get_global_server_args().enable_quant_communications
+                    )
+                    if forward_batch is not None
+                    else False
+                )
+                if quantize_communications:
+                    output = tensor_model_parallel_quant_all_reduce(output_parallel)
+                else:
+                    output = tensor_model_parallel_all_reduce(output_parallel)
         else:
             output = output_parallel
 
