@@ -146,14 +146,21 @@ class Gemma3Attention(nn.Module):
             prefix=f"{prefix}.o_proj",
         )
 
-        self.layer_type = (
-            config.text_config.layer_types[layer_id]
-            if hasattr(config.text_config, "layer_types")
-            else None
-        )
-        self.is_sliding = (
-            config.text_config.layer_types[layer_id] == "sliding_attention"
-        )
+        layer_types = getattr(config.text_config, "layer_types", None)
+        if layer_types:
+            self.layer_type = layer_types[layer_id]
+            self.is_sliding = self.layer_type == "sliding_attention"
+        else:
+            # official Gemma3 uses sliding_window_pattern when layer_types is absent
+            sliding_window_pattern = getattr(
+                config.text_config, "sliding_window_pattern", None
+            )
+            self.is_sliding = (
+                bool((layer_id + 1) % sliding_window_pattern)
+                if sliding_window_pattern
+                else False
+            )
+            self.layer_type = "sliding_attention" if self.is_sliding else None
 
         rope_parameters = getattr(config.text_config, "rope_parameters", None) or {}
         layer_rope_params = {}
@@ -306,7 +313,7 @@ class Gemma3Attention(nn.Module):
         attn_mask = attn_mask.masked_fill(causal, False)
         if self.is_sliding and self.sliding_window is not None:
             idx = torch.arange(seq_len, device=hidden_states.device)
-            dist = idx[None, :] - idx[:, None]
+            dist = idx[:, None] - idx[None, :]
             too_far = dist > self.sliding_window
             attn_mask = attn_mask.masked_fill(too_far, False)
 
