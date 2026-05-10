@@ -412,7 +412,6 @@ class _MoriEPDispatcherImplBase:
         """Apply env var override to fp8_dispatch/fp4_dispatch/fp8_combine flags."""
         if "SGLANG_MORI_DISPATCH_DTYPE" in os.environ:
             dispatch_dtype = os.environ["SGLANG_MORI_DISPATCH_DTYPE"].lower()
-            logger.info(f"bill-dbg: {dispatch_dtype=}")
             if dispatch_dtype != "auto":
                 if dispatch_dtype == "bf16":
                     self.dispatch_dtype = DispatchDtype.bf16
@@ -436,7 +435,6 @@ class _MoriEPDispatcherImplBase:
 
         if "SGLANG_MORI_COMBINE_DTYPE" in os.environ:
             combine_dtype = os.environ["SGLANG_MORI_COMBINE_DTYPE"].lower()
-            logger.info(f"bill-dbg: {combine_dtype=}")
             if combine_dtype != "auto":
                 if combine_dtype == "fp8":
                     self.combine_dtype = CombineDtype.fp8
@@ -534,7 +532,7 @@ class _MoriEPDispatcherImplNormal(_MoriEPDispatcherImplBase):
         output_dtype = hidden_states.dtype
         scale = None
 
-        if self.dispatch_dtype == "fp8":
+        if self.dispatch_dtype == DispatchDtype.fp8:
             # FP8 quant
             if num_token > 0:
                 # NOTE: aiter is able to handle token=0 case in UT. But for some
@@ -552,7 +550,7 @@ class _MoriEPDispatcherImplNormal(_MoriEPDispatcherImplBase):
                     device=hidden_states.device,
                 )
 
-        elif self.dispatch_dtype == "fp4":
+        elif self.dispatch_dtype == DispatchDtype.fp4:
             # FP4 quant
             if num_token > 0:
                 hidden_states, scale = self.fp4_quant_func(hidden_states, shuffle=False)
@@ -790,7 +788,7 @@ class _MoriEPDispatcherImplLowLatency(_MoriEPDispatcherImplBase):
         output_dtype = hidden_states.dtype
         scale = None
 
-        if self.dispatch_dtype == "fp8":
+        if self.dispatch_dtype == DispatchDtype.fp8:
             # FP8 quant
             if num_tokens > 0:
                 # NOTE: aiter is able to handle token=0 case in UT. But for some
@@ -808,7 +806,7 @@ class _MoriEPDispatcherImplLowLatency(_MoriEPDispatcherImplBase):
                     device=hidden_states.device,
                 )
 
-        elif self.dispatch_dtype == "fp4":
+        elif self.dispatch_dtype == DispatchDtype.fp4:
             # FP4 quant
             if num_tokens > 0:
                 hidden_states, scale = self.fp4_quant_func(hidden_states, shuffle=False)
