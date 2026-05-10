@@ -152,7 +152,9 @@ class ViTCudaGraphRunner:
         if override_backend == "fa3":
             warmup_cu_ws = [warmup_cu_ws[0], warmup_cu_ws[2]]
 
-        warmup_kwargs = dict(cu_seqlens=warmup_cu_ws, output_ws=self.block_ws[graph_key])
+        warmup_kwargs = dict(
+            cu_seqlens=warmup_cu_ws, output_ws=self.block_ws[graph_key]
+        )
         if position_embeddings is not None:
             warmup_kwargs["position_embeddings"] = position_embeddings
         elif rotary_pos_emb_cos is not None and rotary_pos_emb_sin is not None:
