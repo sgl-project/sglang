@@ -13,7 +13,7 @@ from torch.nn.attention.flex_attention import (
     flex_attention,
 )
 
-from sglang.multimodal_gen.runtime.utils.layerwise_offload import OffloadableDiTMixin
+from sglang.multimodal_gen.runtime.managers.layerwise_offload import OffloadableDiTMixin
 
 # wan 1.3B model has a weird channel / head configurations and require max-autotune to work with flexattention
 # see https://github.com/pytorch/pytorch/issues/133254
@@ -644,9 +644,9 @@ class CausalWanTransformer3DModel(BaseDiT, OffloadableDiTMixin):
             self.num_attention_heads,
             rope_dim_list,
             dtype=(
-                torch.float32
-                if current_platform.is_mps() or current_platform.is_musa()
-                else torch.float64
+                torch.float64
+                if current_platform.is_float64_supported()
+                else torch.float32
             ),
             rope_theta=10000,
             start_frame=start_frame,  # Assume that start_frame is 0 when kv_cache is None
@@ -776,9 +776,9 @@ class CausalWanTransformer3DModel(BaseDiT, OffloadableDiTMixin):
             self.num_attention_heads,
             rope_dim_list,
             dtype=(
-                torch.float32
-                if current_platform.is_mps() or current_platform.is_musa()
-                else torch.float64
+                torch.float64
+                if current_platform.is_float64_supported()
+                else torch.float32
             ),
             rope_theta=10000,
             start_frame=start_frame,

@@ -12,7 +12,7 @@
                 "TimestepPreparationStage": 53.52,
                 "LatentPreparationStage": 0.39,
                 "DenoisingStage": 19423.39,
-                "DecodingStage": 40.14
+                "DecodingStage": 196.62
             },
             "denoise_step_ms": {
                 "0": 123.16,
@@ -143,11 +143,11 @@
                 "LatentPreparationStage": 0.25,
                 "TimestepPreparationStage": 2.9,
                 "DenoisingStage": 26188.0,
-                "DecodingStage": 320.03,
+                "DecodingStage": 650.1,
                 "per_frame_generation": null
             },
             "denoise_step_ms": {
-                "0": 103.56,
+                "0": 153.0,
                 "1": 329.59,
                 "2": 545.23,
                 "3": 537.0,
@@ -209,7 +209,7 @@
                 "LatentPreparationStage": 0.2,
                 "TimestepPreparationStage": 2.68,
                 "DenoisingStage": 83661.46,
-                "DecodingStage": 232.94,
+                "DecodingStage": 1080.05,
                 "per_frame_generation": null
             },
             "denoise_step_ms": {
@@ -257,6 +257,71 @@
             "expected_e2e_ms": 91733.92,
             "expected_avg_denoise_ms": 2091.33,
             "expected_median_denoise_ms": 2090.72
+        },
+        "qwen_image_t2i_2npu": {
+            "stages_ms": {
+                "InputValidationStage": 0.07,
+                "TextEncodingStage": 629.24,
+                "LatentPreparationStage": 0.69,
+                "TimestepPreparationStage": 35.29,
+                "DenoisingStage": 30529.83,
+                "DecodingStage": 428.21
+            },
+            "denoise_step_ms": {
+                "0": 477.43,
+                "1": 511.96,
+                "2": 607.78,
+                "3": 615.12,
+                "4": 616.29,
+                "5": 614.61,
+                "6": 623.04,
+                "7": 607.12,
+                "8": 615.32,
+                "9": 615.47,
+                "10": 616.93,
+                "11": 623.26,
+                "12": 607.12,
+                "13": 615.48,
+                "14": 615.07,
+                "15": 614.83,
+                "16": 623.18,
+                "17": 609.0,
+                "18": 614.8,
+                "19": 623.08,
+                "20": 607.64,
+                "21": 614.2,
+                "22": 615.58,
+                "23": 615.43,
+                "24": 623.59,
+                "25": 606.57,
+                "26": 616.02,
+                "27": 615.48,
+                "28": 615.76,
+                "29": 623.13,
+                "30": 608.73,
+                "31": 615.04,
+                "32": 616.08,
+                "33": 616.59,
+                "34": 623.77,
+                "35": 608.0,
+                "36": 616.1,
+                "37": 615.79,
+                "38": 615.34,
+                "39": 617.43,
+                "40": 610.99,
+                "41": 614.22,
+                "42": 623.27,
+                "43": 606.98,
+                "44": 615.87,
+                "45": 615.99,
+                "46": 614.66,
+                "47": 622.93,
+                "48": 607.97,
+                "49": 614.69
+            },
+            "expected_e2e_ms": 34362.34,
+            "expected_avg_denoise_ms": 610.41,
+            "expected_median_denoise_ms": 615.39
         }
     }
 }

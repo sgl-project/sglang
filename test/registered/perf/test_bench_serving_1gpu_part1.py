@@ -19,7 +19,7 @@ from sglang.test.test_utils import (
     write_github_step_summary,
 )
 
-register_cuda_ci(est_time=1000, suite="stage-b-test-1-gpu-large")
+register_cuda_ci(est_time=1210, suite="stage-b-test-1-gpu-large")
 register_amd_ci(est_time=1100, suite="stage-b-test-1-gpu-large-amd")
 
 
@@ -141,35 +141,37 @@ class TestBenchServing1GPUPart1(CustomTestCase):
                 self.assertLess(res["median_ttft_ms"], 86)
             self.assertLess(res["median_itl_ms"], 10)
 
-    def test_lora_online_latency(self):
-        if is_in_amd_ci():
-            pass
-
+    def test_online_lora_latency(self):
         res = self._run_lora_latency_test(enable_background_task=False)
 
         if is_in_ci():
             write_github_step_summary(
-                f"### test_lora_online_latency\n"
+                f"### test_online_lora_latency\n"
                 f"median_e2e_latency_ms: {res['median_e2e_latency_ms']:.2f} ms\n"
                 f"median_ttft_ms: {res['median_ttft_ms']:.2f} ms\n"
             )
             self.assertLess(res["median_e2e_latency_ms"], 2400)
-            self.assertLess(res["median_ttft_ms"], 58)
+            # relax for mi300x (LoRA TTFT ~2x slower than mi325)
+            if is_in_amd_ci():
+                self.assertLess(res["median_ttft_ms"], 100)
+            else:
+                self.assertLess(res["median_ttft_ms"], 58)
 
-    def test_lora_online_latency_with_concurrent_adapter_updates(self):
-        if is_in_amd_ci():
-            pass
-
+    def test_online_lora_latency_with_concurrent_adapter_updates(self):
         res = self._run_lora_latency_test(enable_background_task=True)
 
         if is_in_ci():
             write_github_step_summary(
-                f"### test_lora_online_latency\n"
+                f"### test_online_lora_latency_with_concurrent_adapter_updates\n"
                 f"median_e2e_latency_ms: {res['median_e2e_latency_ms']:.2f} ms\n"
                 f"median_ttft_ms: {res['median_ttft_ms']:.2f} ms\n"
             )
             self.assertLess(res["median_e2e_latency_ms"], 4000)
-            self.assertLess(res["median_ttft_ms"], 80)
+            # relax for mi300x (LoRA TTFT ~2x slower than mi325)
+            if is_in_amd_ci():
+                self.assertLess(res["median_ttft_ms"], 130)
+            else:
+                self.assertLess(res["median_ttft_ms"], 80)
 
     def _run_lora_latency_test(self, enable_background_task: bool):
         """
