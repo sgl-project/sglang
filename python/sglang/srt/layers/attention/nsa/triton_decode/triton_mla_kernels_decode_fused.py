@@ -2385,21 +2385,16 @@ def _combine_splitk_kernel(
 
 @triton.autotune(
     configs=[
-        triton.Config({"BLOCK_H": 64, "BLOCK_D": 64}, num_warps=4, num_stages=1),
-        triton.Config({"BLOCK_H": 64, "BLOCK_D": 128}, num_warps=4, num_stages=1),
-        triton.Config({"BLOCK_H": 64, "BLOCK_D": 256}, num_warps=4, num_stages=1),
-        triton.Config({"BLOCK_H": 32, "BLOCK_D": 64}, num_warps=4, num_stages=1),
-        triton.Config({"BLOCK_H": 32, "BLOCK_D": 128}, num_warps=4, num_stages=1),
-        triton.Config({"BLOCK_H": 32, "BLOCK_D": 256}, num_warps=4, num_stages=1),
-        triton.Config({"BLOCK_H": 16, "BLOCK_D": 64}, num_warps=4, num_stages=1),
-        triton.Config({"BLOCK_H": 16, "BLOCK_D": 128}, num_warps=4, num_stages=1),
-        triton.Config({"BLOCK_H": 16, "BLOCK_D": 256}, num_warps=4, num_stages=1),
-        triton.Config({"BLOCK_H": 128, "BLOCK_D": 64}, num_warps=4, num_stages=1),
-        triton.Config({"BLOCK_H": 128, "BLOCK_D": 128}, num_warps=4, num_stages=1),
-        triton.Config({"BLOCK_H": 128, "BLOCK_D": 256}, num_warps=4, num_stages=1),
-        triton.Config({"BLOCK_H": 64, "BLOCK_D": 512}, num_warps=8, num_stages=1),
-        triton.Config({"BLOCK_H": 32, "BLOCK_D": 512}, num_warps=8, num_stages=1),
+        # Reduced from 15 to 5 configs. This is a simple reduce kernel
+        # (weighted sum of 8 partial results), so performance is not
+        # sensitive to tile shape. BLOCK_D=512 covers d_v=512 in one
+        # pass; BLOCK_D=256 as fallback. BLOCK_H=16/32/64 covers the
+        # parallelism range for small batch sizes (split_k=8 → bs<=4).
         triton.Config({"BLOCK_H": 16, "BLOCK_D": 512}, num_warps=8, num_stages=1),
+        triton.Config({"BLOCK_H": 32, "BLOCK_D": 512}, num_warps=8, num_stages=1),
+        triton.Config({"BLOCK_H": 64, "BLOCK_D": 512}, num_warps=8, num_stages=1),
+        triton.Config({"BLOCK_H": 16, "BLOCK_D": 256}, num_warps=4, num_stages=1),
+        triton.Config({"BLOCK_H": 32, "BLOCK_D": 256}, num_warps=4, num_stages=1),
     ],
     key=["total_tokens_bucket", "h_q", "d_v"],
 )
