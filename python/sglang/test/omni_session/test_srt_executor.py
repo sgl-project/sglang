@@ -108,6 +108,7 @@ class _FakeReq:
 class _FakeSyncScheduler(_FakeScheduler):
     def __init__(self, *, finish_after_steps):
         super().__init__()
+        self.cur_batch = None
         self.finish_after_steps = finish_after_steps
         self.run_steps = 0
 
