@@ -1384,6 +1384,11 @@ class AscendAttnBackend(AttentionBackend):
                         enable_gqa=use_gqa,
                         causal=causal,
                         sliding_window_size=layer.sliding_window_size,
+                        full_to_swa_mapping=(
+                            self.full_to_swa_index_mapping
+                            if self._is_swa_layer(layer)
+                            else None
+                        ),
                         logit_cap=layer.logit_cap,
                         logit_capping_method=layer.logit_capping_method,
                     )
@@ -2354,6 +2359,11 @@ class AscendAttnBackend(AttentionBackend):
                     enable_gqa=use_gqa,
                     causal=False,
                     sliding_window_size=layer.sliding_window_size,
+                    full_to_swa_mapping=(
+                        self.full_to_swa_index_mapping
+                        if self._is_swa_layer(layer)
+                        else None
+                    ),
                     logit_cap=layer.logit_cap,
                     logit_capping_method=layer.logit_capping_method,
                 )
