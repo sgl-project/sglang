@@ -272,8 +272,8 @@ class MultiLayerEagleWorker(TpModelWorker):
                 self.mtp_model_runner(0).tp_group
             ), speculative_moe_backend_context():
                 spec_info = self.draft(batch)
-            logits_output, verify_output, model_worker_batch, can_run_cuda_graph = (
-                self.verify(batch, spec_info)
+            logits_output, verify_output, can_run_cuda_graph = self.verify(
+                batch, spec_info
             )
 
             with self.draft_tp_context(
@@ -295,9 +295,7 @@ class MultiLayerEagleWorker(TpModelWorker):
                 can_run_cuda_graph=can_run_cuda_graph,
             )
 
-    def check_forward_draft_extend_after_decode(
-        self, batch: ScheduleBatch, verify_output: EagleVerifyOutput
-    ):
+    def check_forward_draft_extend_after_decode(self, verify_output: EagleVerifyOutput):
         local_need_forward = verify_output.unfinished_accept_tokens.shape[0] > 0
         if not self.server_args.enable_dp_attention:
             return local_need_forward
@@ -593,7 +591,7 @@ class MultiLayerEagleWorker(TpModelWorker):
         )
         batch.spec_info = res.next_draft_input
 
-        return logits_output, res, model_worker_batch, can_run_cuda_graph
+        return logits_output, res, can_run_cuda_graph
 
     def forward_draft_extend(
         self,

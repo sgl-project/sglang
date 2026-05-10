@@ -499,7 +499,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             )
 
         num_tokens = len(batch.input_ids) if batch.input_ids is not None else 0
-        if enable_num_token_non_padded(model_runner.server_args):
+        if enable_num_token_non_padded():
             ret.num_token_non_padded = torch.tensor(num_tokens, dtype=torch.int32).to(
                 device, non_blocking=True
             )
@@ -1086,7 +1086,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         return self.tbo_split_seq_index is not None
 
 
-def enable_num_token_non_padded(server_args):
+def enable_num_token_non_padded():
     return get_moe_expert_parallel_world_size() > 1
 
 
