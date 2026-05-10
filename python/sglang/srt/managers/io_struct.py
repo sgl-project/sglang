@@ -1378,11 +1378,11 @@ class PauseGenerationReqInput(BaseReq):
 
 @dataclass
 class ContinueGenerationReqInput(BaseReq):
-    # Call empty_device_cache() before un-pausing. Returns blocks
-    # cached by the device allocator (left over from transient allocs
+    # Call torch.cuda.empty_cache() before un-pausing. Returns blocks
+    # cached by the PyTorch allocator (left over from transient allocs
     # during post-weight-update processing) back to the driver before
     # inference resumes, with no race against active streams. Set to
-    # False to skip the call.
+    # False to skip the empty_cache call.
     torch_empty_cache: bool = True
 
 
