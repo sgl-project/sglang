@@ -150,9 +150,13 @@ class CompressedTensorsW4A4Fp4(CompressedTensorsLinearScheme):
 
         w = layer.weight_packed
         w_blockscale = layer.weight_scale
+        # JIT cutlass_fp4_gemm and JIT cublaslt_fp4_gemm both consume the
+        # original [N, K/2] row-major weight; only flashinfer's mm_fp4 needs .T
+        _backend = get_fp4_gemm_runner_backend()
         if (
             enable_flashinfer_fp4_gemm
-            and not get_fp4_gemm_runner_backend().is_cutlass()
+            and not _backend.is_cutlass()
+            and not _backend.is_cublaslt()
         ):
             w = layer.weight_packed.T
             w_blockscale = layer.weight_scale.T

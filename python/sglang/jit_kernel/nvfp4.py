@@ -112,6 +112,21 @@ def _jit_nvfp4_scaled_mm_module() -> Module:
 
 
 @cache_once
+def _jit_cublaslt_fp4_gemm_module() -> Module:
+    """JIT cuBLASLt-backed NVFP4 GEMM. Mirrors TRT-LLM's CublasLtFP4GemmRunner
+    (TRT-LLM/cpp/tensorrt_llm/thop/cublasFp4ScaledMM.cpp); cuBLASLt fires the
+    NVIDIA-tuned `nvjet_sm100_*_Avec16UE4M3` family at runtime."""
+    with _nvfp4_arch_env():
+        return load_jit(
+            "cublaslt_fp4_gemm",
+            cuda_files=["gemm/nvfp4/cublaslt_fp4_gemm.cu"],
+            cuda_wrappers=[("cublaslt_fp4_gemm", "cublaslt_fp4_gemm")],
+            extra_cuda_cflags=_nvfp4_cuda_flags(),
+            extra_ldflags=["-lcublasLt"],
+        )
+
+
+@cache_once
 def _jit_nvfp4_blockwise_moe_module() -> Module:
     with _nvfp4_arch_env():
         return load_jit(
@@ -125,6 +140,44 @@ def _jit_nvfp4_blockwise_moe_module() -> Module:
             extra_dependencies=["cutlass"],
             extra_cuda_cflags=_nvfp4_cuda_flags(),
         )
+
+
+_CUBLASLT_WORKSPACE_BYTES = 32 * 1024 * 1024  # 32 MiB, matches TRT-LLM
+_cublaslt_workspaces: dict[torch.device, torch.Tensor] = {}
+
+
+def _get_cublaslt_workspace(device: torch.device) -> torch.Tensor:
+    """Per-device workspace, lazily allocated through PyTorch's caching
+    allocator on first call (which happens in SGL's pre-capture warmup),
+    pinned by Python reference so it stays valid through CUDA-graph replay."""
+    ws = _cublaslt_workspaces.get(device)
+    if ws is None:
+        ws = torch.empty(_CUBLASLT_WORKSPACE_BYTES, dtype=torch.uint8, device=device)
+        _cublaslt_workspaces[device] = ws
+    return ws
+
+
+@debug_kernel_api
+def cublaslt_fp4_gemm(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    block_scale_a: torch.Tensor,
+    block_scale_b: torch.Tensor,
+    alpha: torch.Tensor,
+    out_dtype: torch.dtype,
+) -> torch.Tensor:
+    """NVFP4 GEMM via cuBLASLt (NVIDIA-tuned `nvjet_*_Avec16UE4M3` kernels).
+
+    Same convention as `cutlass_scaled_fp4_mm`: row-major PyTorch tensors;
+    A/B packed FP4 in uint8 with shapes ``[M, K/2]`` / ``[N, K/2]``; scales
+    in float8_e4m3fn (16-vec swizzled); `alpha` a float32 scalar device tensor."""
+    assert a.ndim == 2 and b.ndim == 2
+    m, n = a.shape[0], b.shape[0]
+    out = torch.empty((m, n), dtype=out_dtype, device=a.device)
+    workspace = _get_cublaslt_workspace(a.device)
+    module = _jit_cublaslt_fp4_gemm_module()
+    module.cublaslt_fp4_gemm(out, a, b, block_scale_a, block_scale_b, alpha, workspace)
+    return out
 
 
 @debug_kernel_api

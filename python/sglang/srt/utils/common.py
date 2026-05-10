@@ -1037,6 +1037,11 @@ def suppress_noisy_warnings():
     for name in ("httpx", "httpcore"):
         logging.getLogger(name).setLevel(logging.WARNING)
 
+    # flash_attn.cute.cache_utils does `logger.setLevel(DEBUG)` at module import,
+    # which spams "Persistent cache disabled, using in-memory JIT cache" once
+    # per JIT cache lookup (many per layer × per rank × per replay). Silence it.
+    logging.getLogger("flash_attn").setLevel(logging.WARNING)
+
 
 def suppress_other_loggers():
     suppress_noisy_warnings()

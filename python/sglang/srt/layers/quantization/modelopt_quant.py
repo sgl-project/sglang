@@ -98,8 +98,13 @@ if is_cuda():
         from sglang.jit_kernel.nvfp4 import cutlass_scaled_fp4_mm as cutlass_fp4_gemm
     except ImportError:
         cutlass_fp4_gemm = None
+    try:
+        from sglang.jit_kernel.nvfp4 import cublaslt_fp4_gemm
+    except ImportError:
+        cublaslt_fp4_gemm = None
 else:
     cutlass_fp4_gemm = None
+    cublaslt_fp4_gemm = None
 
 try:
     from flashinfer.fused_moe import cutlass_fused_moe as flashinfer_cutlass_fused_moe
@@ -150,6 +155,12 @@ def fp4_gemm(
         if weight_sf.dtype != torch.float8_e4m3fn:
             weight_sf = weight_sf.view(torch.float8_e4m3fn)
         return cutlass_fp4_gemm(input, weight, input_sf, weight_sf, alpha, out_dtype)
+    elif fp4_backend.is_cublaslt() and cublaslt_fp4_gemm is not None:
+        if input_sf.dtype != torch.float8_e4m3fn:
+            input_sf = input_sf.view(torch.float8_e4m3fn)
+        if weight_sf.dtype != torch.float8_e4m3fn:
+            weight_sf = weight_sf.view(torch.float8_e4m3fn)
+        return cublaslt_fp4_gemm(input, weight, input_sf, weight_sf, alpha, out_dtype)
     elif enable_flashinfer_fp4_gemm:
         # Use the remapping logic to convert SGLang backend names to FlashInfer API names
         backend = fp4_backend.get_flashinfer_backend()
@@ -1489,9 +1500,14 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
 
         w = layer.weight
         w_scale_interleaved = layer.weight_scale_interleaved
+        # Flashinfer's mm_fp4 expects column-major weights (.T view); the JIT
+        # CUTLASS and cuBLASLt entries take the original [N, K/2] row-major
+        # layout. Keep weight as-is for those two; only transpose for flashinfer.
+        _backend = get_fp4_gemm_runner_backend()
         if (
             enable_flashinfer_fp4_gemm
-            and not get_fp4_gemm_runner_backend().is_cutlass()
+            and not _backend.is_cutlass()
+            and not _backend.is_cublaslt()
         ):
             w = layer.weight.T
             w_scale_interleaved = layer.weight_scale_interleaved.T

@@ -17,6 +17,7 @@ class Fp4GemmRunnerBackend(Enum):
 
     AUTO = "auto"
     CUTLASS = "cutlass"
+    CUBLASLT = "cublaslt"
     FLASHINFER_CUDNN = "flashinfer_cudnn"
     FLASHINFER_CUTEDSL = "flashinfer_cutedsl"
     FLASHINFER_CUTLASS = "flashinfer_cutlass"
@@ -27,6 +28,9 @@ class Fp4GemmRunnerBackend(Enum):
 
     def is_cutlass(self) -> bool:
         return self == Fp4GemmRunnerBackend.CUTLASS
+
+    def is_cublaslt(self) -> bool:
+        return self == Fp4GemmRunnerBackend.CUBLASLT
 
     def is_flashinfer_cudnn(self) -> bool:
         return self == Fp4GemmRunnerBackend.FLASHINFER_CUDNN
