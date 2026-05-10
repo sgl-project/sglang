@@ -214,6 +214,7 @@ from sglang.srt.utils import (
     broadcast_pyobj,
     configure_gc_logger,
     configure_logger,
+    empty_device_cache,
     freeze_gc,
     get_available_gpu_memory,
     get_bool_env_var,
@@ -1119,17 +1120,14 @@ class Scheduler(
                     dp_size=self.dp_size,
                     attn_tp_size=self.attn_tp_size,
                     cpu_group=self.tp_cpu_group,
+                    device_group=self.tp_group.device_group,
                     server_args=self.server_args,
                     metrics_collector=(
                         self.metrics_collector if self.enable_metrics else None
                     ),
                     max_delay_passes=self.server_args.prefill_delayer_max_delay_passes,
                     token_usage_low_watermark=self.server_args.prefill_delayer_token_usage_low_watermark,
-                    device=(
-                        self.tp_group.device
-                        if self.server_args.disable_overlap_schedule
-                        else "cpu"
-                    ),
+                    device=self.tp_group.device,
                 )
 
         # NOTE: preemption is enabled by default for priority scheduling.
@@ -3403,7 +3401,7 @@ class Scheduler(
         return DetachHiCacheStorageReqOutput(success=False, message=msg)
 
     def flush_cache(self, empty_cache: bool = True):
-        """Flush the memory pool and cache."""
+        """Flush memory pools (e.g., KV cache, Mamba cache) and optionally empty device allocator cache."""
         if self.is_fully_idle():
             self.cur_batch = None
             self.last_batch = None
@@ -3417,7 +3415,7 @@ class Scheduler(
                 self.draft_worker.clear_cache_pool()
 
             if empty_cache:
-                torch.cuda.empty_cache()
+                empty_device_cache(self.device_module)
             logger.info("Cache flushed successfully!")
             success = True
         else:
@@ -3670,6 +3668,15 @@ class Scheduler(
             self.chunked_req = None
 
     def continue_generation(self, recv_req: ContinueGenerationReqInput):
+        if recv_req.torch_empty_cache:
+            before_mb = torch.cuda.memory_reserved() / (1024 * 1024)
+            torch.cuda.empty_cache()
+            after_mb = torch.cuda.memory_reserved() / (1024 * 1024)
+            logger.info(
+                f"[continue_generation] torch.cuda.empty_cache() called: "
+                f"reserved {before_mb:.1f} MB -> {after_mb:.1f} MB "
+                f"(freed {before_mb - after_mb:.1f} MB)"
+            )
         self._engine_paused = False
 
     def load_lora_adapter(
@@ -3806,7 +3813,7 @@ class IdleSleeper:
             and real_time() - self.last_empty_time > self.empty_cache_interval
         ):
             self.last_empty_time = real_time()
-            torch.cuda.empty_cache()
+            empty_device_cache()
 
 
 def is_health_check_generate_req(recv_req):
