@@ -20,6 +20,7 @@ MiniCPM-V 4.6 is the next-generation multimodal model from [OpenBMB](https://hug
 - **High-resolution slicing**: Source image plus a configurable grid of slice tiles (up to 9 tiles in the open test variant) lets the model reason over fine detail in 1280×720+ images.
 - **Video**: Frame-by-frame multi-modal data items routed through the same vision encoder; any number of frames per request.
 - **Reasoning Parser**: switchable thinking mode (Qwen3.5 lineage), exposed via `chat_template_kwargs.enable_thinking` per request and SGLang's `--reasoning-parser qwen3` on the server side.
+- **Tool Calling**: Qwen 2.5–style `<tool_call>` JSON format, surfaced as OpenAI-compatible `message.tool_calls` via SGLang's `--tool-call-parser qwen`. Composes with thinking mode and with image / video inputs.
 
 **License:** TODO — verify on HuggingFace model card.
 
@@ -43,16 +44,11 @@ For the general SGLang installation guide (PyPI, source, Docker) see the [offici
 
 ### 3.1 Basic Configuration
 
-**Interactive Command Generator**: Use the configuration selector below to automatically generate the appropriate deployment command for your hardware platform and thinking mode preference.
+**Interactive Command Generator**: Use the configuration selector below to generate the appropriate deployment command. The `Reasoning Parser` and `Tool Call Parser` toggles add `--reasoning-parser qwen3` and `--tool-call-parser qwen` respectively; see §4.4 for usage details.
 
 import { MiniCPMV46Deployment } from '/src/snippets/autoregressive/minicpm-v-4_6-deployment.jsx'
 
 <MiniCPMV46Deployment />
-
-**Thinking mode** is exposed via the `Reasoning Parser` toggle above. When enabled (default), the launch command includes `--reasoning-parser qwen3`, which splits each response on the `<think>` / `</think>` boundaries: the pre-`</think>` block goes to `reasoning_content`, the post-`</think>` text to `content`. Per-request, the chat template's `enable_thinking` flag toggles whether the model actually emits reasoning:
-
-- `enable_thinking=true` (chat template default): assistant prompt ends with `<think>\n`; the model writes reasoning, closes with `</think>`, then the answer.
-- `enable_thinking=false`: chat template injects an empty `<think></think>` placeholder so the model emits no thinking tokens; `reasoning_content` ends up empty.
 
 ### 3.2 Configuration Tips
 
@@ -192,6 +188,107 @@ print(response.choices[0].message.content)
 ```text Output
 The video shows a grid of colored squares moving in a random pattern.
 ```
+
+### 4.4 Advanced Usage
+
+#### 4.4.1 Reasoning Parser
+
+Pass `--reasoning-parser qwen3` to the server (toggle "Reasoning Parser" on in §3.1, default) so SGLang splits each response on the `<think>` / `</think>` boundaries: the pre-`</think>` block goes to `reasoning_content`, the post-`</think>` text to `content`. Per-request, the chat template's `enable_thinking` flag toggles whether the model actually emits reasoning.
+
+- **Thinking mode** (default, `enable_thinking=true`): assistant prompt ends with `<think>\n`; the model writes reasoning, closes with `</think>`, then the answer. `reasoning_content` and `content` are both populated.
+- **Instruct mode** (`enable_thinking=false`): the chat template injects an empty `<think></think>` placeholder so the model emits no thinking tokens; `reasoning_content` ends up empty.
+
+```python Example (thinking mode)
+from openai import OpenAI
+
+client = OpenAI(base_url="http://localhost:30000/v1", api_key="EMPTY")
+
+response = client.chat.completions.create(
+    model="openbmb/MiniCPM-V-4_6",
+    messages=[{"role": "user", "content": "Reply with the single word 'hi'. No explanation."}],
+    max_tokens=200,
+)
+
+msg = response.choices[0].message
+print("reasoning_content:", msg.reasoning_content)
+print("content          :", msg.content)
+```
+
+```text Output
+reasoning_content: Got it, let's see. The user wants a reply with "hi" and no explanation. So I need to just say "hi" as the response. ...
+content          : hi
+```
+
+```python Example (instruct mode)
+response = client.chat.completions.create(
+    model="openbmb/MiniCPM-V-4_6",
+    messages=[{"role": "user", "content": "Reply with the single word 'hi'. No explanation."}],
+    max_tokens=200,
+    extra_body={"chat_template_kwargs": {"enable_thinking": False}},
+)
+
+msg = response.choices[0].message
+print("reasoning_content:", msg.reasoning_content)
+print("content          :", msg.content)
+```
+
+```text Output
+reasoning_content:
+content          : hi
+```
+
+#### 4.4.2 Tool Calling
+
+Pass `--tool-call-parser qwen` to the server (toggle "Tool Call Parser" on in §3.1) so SGLang extracts `<tool_call>` blocks from the model output into the OpenAI-style `message.tool_calls` field (with `finish_reason="tool_calls"`). The model speaks the Qwen 2.5 tool-call format (`<tool_call>\n{...}\n</tool_call>`); the `qwen` parser is the right one. Tool calls compose with both reasoning modes and with image / video inputs.
+
+<Warning>
+Do **not** use `--tool-call-parser qwen3_coder` for MiniCPM-V 4.6 — even though the Qwen3.5 cookbooks use it. `qwen3_coder` expects an XML-style inner format (`<function=name><parameter=k>v</parameter></function>`), but 4.6 emits Qwen2.5-style JSON (`{"name":..., "arguments":...}`) inside the same `<tool_call>` wrapper. The result is `finish_reason="tool_calls"` but an empty `tool_calls` array, with the raw markup left in `content` — broken in both directions.
+</Warning>
+
+
+```python Example
+from openai import OpenAI
+
+client = OpenAI(base_url="http://localhost:30000/v1", api_key="EMPTY")
+
+tools = [
+    {
+        "type": "function",
+        "function": {
+            "name": "get_weather",
+            "description": "Get the current weather for a city.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "location": {"type": "string"},
+                    "unit": {"type": "string", "enum": ["celsius", "fahrenheit"]},
+                },
+                "required": ["location"],
+            },
+        },
+    },
+]
+
+response = client.chat.completions.create(
+    model="openbmb/MiniCPM-V-4_6",
+    messages=[{"role": "user", "content": "What is the weather in San Francisco? Use the tool."}],
+    tools=tools,
+    max_tokens=200,
+    extra_body={"chat_template_kwargs": {"enable_thinking": False}},
+)
+
+choice = response.choices[0]
+print("finish_reason:", choice.finish_reason)
+for tc in choice.message.tool_calls or []:
+    print(f"  {tc.function.name}({tc.function.arguments})")
+```
+
+```text Output
+finish_reason: tool_calls
+  get_weather({"location": "San Francisco", "unit": "celsius"})
+```
+
+To get the final natural-language answer, feed the tool's result back as a `tool` role message and call the API again with the same `tools` list — the model emits `finish_reason="stop"` with the answer in `content`.
 
 ## 5. Benchmark
 

@@ -39,6 +39,14 @@ export const MiniCPMV46Deployment = () => {
         { id: 'disabled', label: 'disabled', default: false },
       ],
     },
+    toolcall: {
+      name: 'toolcall',
+      title: 'Tool Call Parser',
+      items: [
+        { id: 'enabled',  label: 'enabled',  default: false },
+        { id: 'disabled', label: 'disabled', default: true  },
+      ],
+    },
     mambaCache: {
       name: 'mambaCache',
       title: 'Mamba Radix Cache',
@@ -59,7 +67,7 @@ export const MiniCPMV46Deployment = () => {
   };
 
   const generateCommand = (values) => {
-    const { hardware, reasoning, mambaCache } = values;
+    const { hardware, reasoning, toolcall, mambaCache } = values;
 
     const hwConfig = modelConfigs[hardware];
     if (!hwConfig) return `# Error: Unknown hardware platform`;
@@ -79,6 +87,9 @@ export const MiniCPMV46Deployment = () => {
     cmd += ` \\\n  --mem-fraction-static ${mem}`;
     if (reasoning === 'enabled') {
       cmd += ` \\\n  --reasoning-parser qwen3`;
+    }
+    if (toolcall === 'enabled') {
+      cmd += ` \\\n  --tool-call-parser qwen`;
     }
     if (mambaCache === 'v2') {
       cmd += ` \\\n  --mamba-scheduler-strategy extra_buffer`;
