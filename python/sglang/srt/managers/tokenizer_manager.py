@@ -391,10 +391,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # Dumping
         self.dump_requests_folder = ""  # By default do not dump
         self.dump_requests_threshold = 1000
-        # Drop heavy meta_info entries from the dump payload by default. Both
-        # `routed_experts` (base64'd MoE routing tensor, ~KB-MB per request)
-        # and `hidden_states` blow up the pkl file size and are not used by
-        # the replay tooling. Override via /configure_logging if needed.
         self.dump_requests_exclude_meta_keys: List[str] = [
             "routed_experts",
             "hidden_states",
@@ -2205,9 +2201,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             )
 
     def dump_requests(self, state: ReqState, out_dict: dict):
-        # Strip heavy keys from `meta_info` (e.g. routed_experts, hidden_states)
-        # to keep the on-disk pkl small. Don't mutate the original dict — it
-        # may still be referenced by the response path or other observers.
         if self.dump_requests_exclude_meta_keys and isinstance(
             out_dict.get("meta_info"), dict
         ):
@@ -2272,11 +2265,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     pickle.dump(to_dump_with_server_args, f)
                 except Exception as e:
                     # When the server is launched with --trust-remote-code,
-                    # server_args sometimes fails to pickle because the
-                    # lazily-attached ModelConfig holds an hf_config whose
-                    # class lives under the dynamic transformers_modules.*
-                    # namespace. Retry without server_args so the request
-                    # data still gets persisted.
+                    # server_args sometimes fails to pickle. Retry without
+                    # server_args so the request data still gets persisted.
                     logger.error(
                         f"Failed to pickle dump with server_args: {e!r}; "
                         "retrying without server_args"
