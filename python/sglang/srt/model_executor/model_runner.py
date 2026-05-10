@@ -568,9 +568,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self._model_update_group = {}
         self._weights_send_group = {}
 
-        if not hasattr(self, "hisparse_coordinator"):
-            self.hisparse_coordinator = None
-
     def _build_model_config(
         self, server_args, model_path=None, model_revision=None, is_draft_model=False
     ):
