@@ -492,6 +492,33 @@ class DeepSeekV4SingleKVPoolHost:
         ] * self.layer_num
         return data_ptrs, data_lens, item_lens
 
+    def load_to_device_per_layer(
+        self, device_pool, host_indices, device_indices, layer_id, io_backend="kernel"
+    ):
+        if io_backend != "kernel":
+            raise ValueError(f"Unsupported IO backend: {io_backend}")
+
+        from sglang.jit_kernel.deepseek_v4 import hisparse_load_to_device
+
+        if host_indices.device != device_indices.device:
+            host_indices = host_indices.to(device=device_indices.device)
+        host_indices_i64 = (
+            host_indices.to(torch.int64)
+            if host_indices.dtype != torch.int64
+            else host_indices
+        )
+        device_indices_i64 = (
+            device_indices.to(torch.int64)
+            if device_indices.dtype != torch.int64
+            else device_indices
+        )
+        hisparse_load_to_device(
+            gpu_cache=device_pool.kv_buffer[layer_id],
+            cpu_cache=self.kv_buffer[layer_id],
+            gpu_indices=device_indices_i64,
+            cpu_indices=host_indices_i64,
+        )
+
     def available_size(self):
         return len(self.free_slots)
 
