@@ -4,7 +4,7 @@ import logging
 from enum import Enum
 from typing import TYPE_CHECKING
 
-from sglang.srt.utils.common import is_sm120_supported
+from sglang.srt.utils.common import is_sm100_supported, is_sm120_supported
 
 if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
@@ -18,6 +18,7 @@ class Fp4GemmRunnerBackend(Enum):
     AUTO = "auto"
     CUTLASS = "cutlass"
     FLASHINFER_CUDNN = "flashinfer_cudnn"
+    FLASHINFER_CUTEDSL = "flashinfer_cutedsl"
     FLASHINFER_CUTLASS = "flashinfer_cutlass"
     FLASHINFER_TRTLLM = "flashinfer_trtllm"
 
@@ -36,6 +37,9 @@ class Fp4GemmRunnerBackend(Enum):
     def is_flashinfer_trtllm(self) -> bool:
         return self == Fp4GemmRunnerBackend.FLASHINFER_TRTLLM
 
+    def is_flashinfer_cutedsl(self) -> bool:
+        return self == Fp4GemmRunnerBackend.FLASHINFER_CUTEDSL
+
     def is_flashinfer(self) -> bool:
         return self.value.startswith("flashinfer_")
 
@@ -47,7 +51,10 @@ class Fp4GemmRunnerBackend(Enum):
             'flashinfer_trtllm' -> 'trtllm'
             'flashinfer_cutlass' -> 'cutlass'
             'flashinfer_cudnn' -> 'cudnn'
+            'flashinfer_cutedsl' -> 'cute-dsl'
         """
+        if self == Fp4GemmRunnerBackend.FLASHINFER_CUTEDSL:
+            return "cute-dsl"
         if self.value.startswith("flashinfer_"):
             return self.value.removeprefix("flashinfer_")
         else:
@@ -68,10 +75,8 @@ def initialize_fp4_gemm_config(server_args: ServerArgs) -> None:
             # heterogeneous batches on SM120 (Blackwell).  cudnn is stable.
             # See: https://github.com/sgl-project/sglang/issues/20043
             backend = "flashinfer_cudnn"
-            logger.info(
-                "SM120 (Blackwell) detected: auto-selecting "
-                "fp4-gemm-backend=flashinfer_cudnn"
-            )
+        elif is_sm100_supported():
+            backend = "flashinfer_cutedsl"
         else:
             backend = "flashinfer_cutlass"
 

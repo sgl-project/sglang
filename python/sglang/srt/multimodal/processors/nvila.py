@@ -6,6 +6,7 @@ from transformers.processing_utils import ProcessorMixin
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
 from sglang.srt.managers.io_struct import GenerateReqInput
+from sglang.srt.managers.schedule_batch import MultimodalProcessorOutput
 from sglang.srt.models.jet_vlm import JetVLMForConditionalGeneration
 from sglang.srt.models.nvila import NVILAForConditionalGeneration
 from sglang.srt.models.nvila_lite import NVILALiteForConditionalGeneration
@@ -71,9 +72,9 @@ class NVILAMultimodalProcessor(BaseMultimodalProcessor):
             num_frames=NUM_VIDEO_FRAMES,
         )
 
-        return {
-            "input_ids": input_ids.tolist(),
-            "mm_items": mm_items,
-            "im_token_id": self.mm_tokens.image_token_id,
-            "video_token_id": self.mm_tokens.video_token_id,
-        }
+        return MultimodalProcessorOutput(
+            input_ids=input_ids.tolist(),
+            mm_items=mm_items,
+            im_token_id=self.mm_tokens.image_token_id,
+            video_token_id=self.mm_tokens.video_token_id,
+        )

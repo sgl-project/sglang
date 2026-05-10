@@ -20,10 +20,10 @@ from sglang.test.simple_eval_common import (
 def get_thinking_kwargs(args):
     thinking_mode = getattr(args, "thinking_mode", None)
     if thinking_mode in THINKING_MODE_CHOICES:
-        if thinking_mode == "deepseek-v3":
+        if thinking_mode in ["deepseek-v3", "kimi-k2"]:
             thinking_param = "thinking"
         else:
-            # Qwen3
+            # All models other than dpsk v3/kimi_k2
             thinking_param = "enable_thinking"
         return {thinking_param: True}
     return {}
@@ -62,7 +62,7 @@ def run_eval_once(args, base_url: str, eval_obj: Eval) -> dict:
             extra_body[param_name] = value
 
     common_kwargs = dict(
-        model=args.model,
+        model=getattr(args, "model", None),
         max_tokens=getattr(args, "max_tokens", 2048),
         top_p=getattr(args, "top_p", 1.0),
         base_url=base_url,
@@ -71,7 +71,12 @@ def run_eval_once(args, base_url: str, eval_obj: Eval) -> dict:
 
     api_mode = getattr(args, "api", "chat")
     if api_mode == "completion":
-        sampler = CompletionSampler(**common_kwargs)
+        # Default stop tokens for completion API (matches few_shot_gsm8k behavior)
+        stop = getattr(args, "stop", ["Question", "Assistant:", "<|separator|>"])
+        sampler = CompletionSampler(
+            **common_kwargs,
+            stop=stop,
+        )
     else:
         sampler = ChatCompletionSampler(
             **common_kwargs,
@@ -143,7 +148,7 @@ def run_eval(args):
         categories = args.categories.split(",") if args.categories else None
 
         eval_obj = LongBenchV2Eval(
-            model=args.model,
+            model=getattr(args, "model", None),
             data_source=data_source,
             num_examples=args.num_examples,
             num_threads=args.num_threads,
@@ -267,7 +272,7 @@ def run_eval(args):
     return metrics
 
 
-THINKING_MODE_CHOICES = ["deepseek-v3", "qwen3"]
+THINKING_MODE_CHOICES = ["deepseek-v3", "qwen-3", "glm-45", "kimi-k2"]
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()

@@ -30,7 +30,7 @@ from sglang.test.lora_utils import (
 from sglang.test.test_utils import CustomTestCase, is_in_ci
 
 register_cuda_ci(
-    est_time=116,
+    est_time=190,
     suite="stage-c-test-8-gpu-h200",
 )
 register_amd_ci(

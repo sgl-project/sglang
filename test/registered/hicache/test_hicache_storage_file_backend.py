@@ -19,7 +19,7 @@ import requests
 from sglang.benchmark.utils import get_tokenizer
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
-from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
+from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
     DEFAULT_MLA_MODEL_NAME_FOR_TEST,
     DEFAULT_MODEL_NAME_FOR_TEST,
@@ -31,7 +31,7 @@ from sglang.test.test_utils import (
 )
 from sglang.utils import wait_for_http_ready
 
-register_cuda_ci(est_time=200, suite="stage-b-test-2-gpu-large")
+register_cuda_ci(est_time=148, suite="stage-b-test-2-gpu-large")
 register_amd_ci(est_time=526, suite="stage-b-test-2-gpu-large-amd")
 
 
@@ -295,15 +295,14 @@ def run_eval_accuracy_test(test_instance, accuracy_threshold: float = 0.03):
     # First evaluation - populate cache
     print("Phase 1: Running initial GSM8K evaluation to populate cache...")
     args_initial = SimpleNamespace(
-        num_shots=5,
-        data_path=None,
-        num_questions=200,
-        max_new_tokens=512,
-        parallel=64,
-        host=f"http://{test_instance.base_host}",
-        port=int(test_instance.base_port),
+        base_url=f"http://{test_instance.base_host}:{test_instance.base_port}",
+        eval_name="gsm8k",
+        api="completion",
+        max_tokens=512,
+        num_examples=200,
+        num_threads=64,
     )
-    metrics_initial = run_eval_few_shot_gsm8k(args_initial)
+    metrics_initial = run_eval(args_initial)
 
     # Flush cache to force remote storage access
     print("Phase 2: Flushing device cache...")
@@ -311,18 +310,18 @@ def run_eval_accuracy_test(test_instance, accuracy_threshold: float = 0.03):
 
     # Second evaluation - should use remote cache
     print("Phase 3: Running second GSM8K evaluation using remote cache...")
-    metrics_cached = run_eval_few_shot_gsm8k(args_initial)
+    metrics_cached = run_eval(args_initial)
 
     # Verify accuracy consistency
-    accuracy_diff = abs(metrics_initial["accuracy"] - metrics_cached["accuracy"])
+    accuracy_diff = abs(metrics_initial["score"] - metrics_cached["score"])
     print(f"Accuracy difference: {accuracy_diff:.4f}")
 
     # Assertions
     test_instance.assertGreater(
-        metrics_initial["accuracy"], 0.6, "Initial accuracy should be reasonable"
+        metrics_initial["score"], 0.6, "Initial accuracy should be reasonable"
     )
     test_instance.assertGreater(
-        metrics_cached["accuracy"], 0.6, "Cached accuracy should be reasonable"
+        metrics_cached["score"], 0.6, "Cached accuracy should be reasonable"
     )
     test_instance.assertLess(
         accuracy_diff,
