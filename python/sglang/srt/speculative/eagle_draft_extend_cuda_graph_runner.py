@@ -151,10 +151,7 @@ class EAGLEDraftExtendCudaGraphRunner:
                     dtype=self.model_runner.dtype,
                 )
             else:
-                # hidden_states carries target output and propagates via
-                # scheduler merge; use target config, not self.model_runner
-                # (= draft). STANDALONE with mismatched hidden sizes crashes
-                # otherwise.
+                # Use target config: hidden_states carries target output.
                 target_cfg = self.eagle_worker.target_worker.model_runner.model_config
                 hidden_states = torch.zeros(
                     (
