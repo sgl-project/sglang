@@ -8,6 +8,7 @@ from functools import partial
 from typing import Any, Iterable, Optional, Set, Tuple
 
 import torch
+import torch.nn.functional as F
 from torch import nn
 
 from sglang.multimodal_gen.configs.models.encoders.base import BaseEncoderOutput
@@ -84,8 +85,22 @@ class Gemma3MLP(nn.Module):
         self.act_fn = GeluAndMul(approximate="tanh")
 
     def forward(self, x):
-        x, _ = self.gate_up_proj(x)
-        x = self.act_fn(x)
+        if self.gate_up_proj.quant_config is None:
+            gate_weight, up_weight = self.gate_up_proj.weight.split(
+                self.gate_up_proj.output_partition_sizes, dim=0
+            )
+            if self.gate_up_proj.bias is None:
+                gate_bias = up_bias = None
+            else:
+                gate_bias, up_bias = self.gate_up_proj.bias.split(
+                    self.gate_up_proj.output_partition_sizes, dim=0
+                )
+            x = F.gelu(
+                F.linear(x, gate_weight, gate_bias), approximate="tanh"
+            ) * F.linear(x, up_weight, up_bias)
+        else:
+            x, _ = self.gate_up_proj(x)
+            x = self.act_fn(x)
         x, _ = self.down_proj(x)
         return x
 
@@ -277,8 +292,22 @@ class Gemma3Attention(nn.Module):
         hidden_states: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        qkv, _ = self.qkv_proj(hidden_states)
-        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        if self.qkv_proj.quant_config is None:
+            q_weight, k_weight, v_weight = self.qkv_proj.weight.split(
+                [self.q_size, self.kv_size, self.kv_size], dim=0
+            )
+            if self.qkv_proj.bias is None:
+                q_bias = k_bias = v_bias = None
+            else:
+                q_bias, k_bias, v_bias = self.qkv_proj.bias.split(
+                    [self.q_size, self.kv_size, self.kv_size], dim=0
+                )
+            q = F.linear(hidden_states, q_weight, q_bias)
+            k = F.linear(hidden_states, k_weight, k_bias)
+            v = F.linear(hidden_states, v_weight, v_bias)
+        else:
+            qkv, _ = self.qkv_proj(hidden_states)
+            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
         batch_size, seq_len, _ = q.shape
         q = q.view(batch_size, seq_len, self.num_heads, self.head_dim)
