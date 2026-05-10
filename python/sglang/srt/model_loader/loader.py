@@ -1657,7 +1657,7 @@ class PreshardedModelLoader(DefaultModelLoader):
     MAX_FILE_BYTES = 20 * (1024**3)
     CHECKSUM_FILENAME = "checksum.json"
     TMP_SUBDIR = "_tmp_presharding"
-    PLAN_VERSION = 2
+    PLAN_VERSION = 1
     DEFAULT_HASH_NUM_THREADS = 8
 
     def __init__(self, load_config: LoadConfig):
@@ -1787,8 +1787,9 @@ class PreshardedModelLoader(DefaultModelLoader):
     ) -> None:
         """Combine pre-computed per-tensor (name, content-SHA) pairs into the
         rank-level aggregate checksum and compare against the dump plan. The
-        per-tensor SHAs were computed in parallel during reload; this helper
-        only does the deterministic canonical concatenation + final SHA1.
+        aggregate is a sum (mod 2^64) of per-tensor 64-bit digests; addition
+        is commutative so order doesn't matter. See ``_build_dump_plan`` for
+        the matching construction.
         """
         expected = plan.get("rank_checksums", {}).get(str(rank))
         if expected is None:
@@ -1799,14 +1800,13 @@ class PreshardedModelLoader(DefaultModelLoader):
                 f"to skip verification, or re-dump the checkpoint."
             )
 
-        per_tensor = sorted(verify_hashes, key=lambda x: x[0])
-        h = hashlib.sha1()
-        for name, content_hash in per_tensor:
-            h.update(name.encode("utf-8"))
-            h.update(b":")
-            h.update(content_hash.encode("ascii"))
-            h.update(b"\n")
-        actual = h.hexdigest()
+        total = 0
+        for name, content_hash in verify_hashes:
+            d = hashlib.sha1(
+                (name + ":" + content_hash).encode("utf-8")
+            ).digest()
+            total = (total + int.from_bytes(d[:8], "big")) & 0xFFFFFFFFFFFFFFFF
+        actual = format(total, "016x")
 
         if actual != expected:
             raise ValueError(
@@ -2080,20 +2080,22 @@ class PreshardedModelLoader(DefaultModelLoader):
                             }
                         )
 
-        # Per-rank aggregate checksum: SHA1 over the canonical concatenation
-        # of per-tensor (name + content-SHA) for every tensor a rank owns.
-        # Used for end-to-end integrity check on reload; one entry per rank
-        # instead of one per tensor.
+        # Per-rank aggregate checksum: sum (mod 2^64) of per-tensor 64-bit
+        # digests for every tensor a rank owns. Each per-tensor digest is the
+        # first 8 bytes of SHA1(name + ":" + content_sha) interpreted big-
+        # endian. The sum is commutative, so reload can accumulate
+        # concurrently without sorting. 64 bits is ample for non-adversarial
+        # corruption detection; collision probability is ~2^-64 per pair of
+        # distinct tensor sets.
         rank_checksums: Dict[str, str] = {}
         for r in range(world_size):
-            h = hashlib.sha1()
-            reads = sorted(rank_to_reads.get(r, []), key=lambda x: x["name"])
-            for rec in reads:
-                h.update(rec["name"].encode("utf-8"))
-                h.update(b":")
-                h.update(rec["stored_key"].encode("ascii"))
-                h.update(b"\n")
-            rank_checksums[str(r)] = h.hexdigest()
+            total = 0
+            for rec in rank_to_reads.get(r, []):
+                d = hashlib.sha1(
+                    (rec["name"] + ":" + rec["stored_key"]).encode("utf-8")
+                ).digest()
+                total = (total + int.from_bytes(d[:8], "big")) & 0xFFFFFFFFFFFFFFFF
+            rank_checksums[str(r)] = format(total, "016x")
 
         return {
             "version": cls.PLAN_VERSION,
