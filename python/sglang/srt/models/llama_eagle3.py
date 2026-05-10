@@ -135,6 +135,15 @@ class LlamaModel(nn.Module):
         else:
             self.hidden_size_in = config.hidden_size
 
+        # Optional per-layer RMSNorm applied to each aux hidden state before
+        # concatenation, so that all three layers contribute equally regardless
+        # of their raw scale. Enabled via config "use_aux_norm": true.
+        self.use_aux_norm = getattr(config, "use_aux_norm", False)
+        if self.use_aux_norm:
+            self.aux_norm_low = RMSNorm(self.hidden_size_in, eps=config.rms_norm_eps)
+            self.aux_norm_mid = RMSNorm(self.hidden_size_in, eps=config.rms_norm_eps)
+            self.aux_norm_high = RMSNorm(self.hidden_size_in, eps=config.rms_norm_eps)
+
         self.fc = torch.nn.Linear(
             self.hidden_size_in * 3,
             config.hidden_size,
@@ -174,6 +183,13 @@ class LlamaModel(nn.Module):
 
         hidden_states = forward_batch.spec_info.hidden_states
         if hidden_states.shape[-1] != embeds.shape[-1]:
+            if self.use_aux_norm and hidden_states.shape[-1] == self.hidden_size_in * 3:
+                # Normalize each aux layer independently before fc projection.
+                h_low, h_mid, h_high = hidden_states.split(self.hidden_size_in, dim=-1)
+                h_low = self.aux_norm_low(h_low)
+                h_mid = self.aux_norm_mid(h_mid)
+                h_high = self.aux_norm_high(h_high)
+                hidden_states = torch.cat((h_low, h_mid, h_high), dim=-1)
             hidden_states = self.fc(hidden_states)
 
         # idle batch

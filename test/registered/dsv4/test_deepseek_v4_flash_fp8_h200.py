@@ -1,6 +1,7 @@
-"""H200 per-commit CI: DeepSeek-V4-Flash FP4 Marlin (LowLatency recipe).
+"""H200 per-commit CI: DeepSeek-V4-Flash FP8 (LowLatency recipe).
 
-Launches TP=4 with Marlin FP4 MoE runner + EAGLE speculative decoding.
+Launches TP=4 with DeepEP a2a backend + EAGLE speculative decoding,
+with FP4 experts disabled via SGLANG_DSV4_FP4_EXPERTS=0.
 Runs 12 ServerSanity probes (correctness, streaming, concurrency, determinism)
 plus a GSM8K accuracy gate.
 
@@ -23,16 +24,17 @@ from sglang.test.test_utils import (
 
 register_cuda_ci(est_time=900, suite="stage-c-test-dsv4-8-gpu-h200")
 
-MODEL = "deepseek-ai/DeepSeek-V4-Flash"
+MODEL_FP8 = "sgl-project/DeepSeek-V4-Flash-FP8"
 SERVER_LAUNCH_TIMEOUT = 3600
+DEEPEP_CONFIG = '{"normal_dispatch":{"num_sms":96},"normal_combine":{"num_sms":96}}'
 
 
-class TestDSV4FlashFP4H200(ServerSanityMixin, CustomTestCase):
+class TestDSV4FlashFP8H200(ServerSanityMixin, CustomTestCase):
     """LowLatency recipe: TP=4, Marlin FP4, EAGLE spec decoding."""
 
     @classmethod
     def setUpClass(cls):
-        cls.model = try_cached_model(MODEL)
+        cls.model = try_cached_model(MODEL_FP8)
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(
             cls.model,
@@ -42,17 +44,30 @@ class TestDSV4FlashFP4H200(ServerSanityMixin, CustomTestCase):
                 "--trust-remote-code",
                 "--tp",
                 "4",
-                "--moe-runner-backend",
-                "marlin",
+                "--dp",
+                "4",
+                "--enable-dp-attention",
+                "--moe-a2a-backend",
+                "deepep",
                 "--speculative-algorithm",
                 "EAGLE",
                 "--speculative-num-steps",
-                "3",
+                "1",
                 "--speculative-eagle-topk",
                 "1",
                 "--speculative-num-draft-tokens",
-                "4",
+                "2",
+                "--cuda-graph-max-bs",
+                "128",
+                "--max-running-requests",
+                "128",
+                "--deepep-config",
+                DEEPEP_CONFIG,
             ],
+            env={
+                "SGLANG_DSV4_FP4_EXPERTS": "0",
+                "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "256",
+            },
         )
 
     @classmethod
