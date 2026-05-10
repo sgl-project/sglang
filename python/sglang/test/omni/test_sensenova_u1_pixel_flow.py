@@ -13,9 +13,14 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.s
     SenseNovaU1PixelFlowStage,
     _resolve_u1_contexts,
 )
+from sglang.multimodal_gen.runtime.server_args import ServerArgs, set_global_server_args
 
 
 class TestSenseNovaU1PixelFlow(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        set_global_server_args(ServerArgs(model_path="dummy"))
+
     def test_stage_prepare_keeps_position_and_timestep_baseline(self):
         params = build_sensenova_u1_sampling_params(
             {

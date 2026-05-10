@@ -9,6 +9,11 @@ from PIL import Image
 
 from sglang.omni.backends.ar.srt import SRTARBackend
 from sglang.omni.protocol import GeneratedSegment, OmniInputSegment, OmniRequest
+from sglang.srt.omni_session.runtime_protocol import (
+    OmniContextBundle as SRTOmniContextBundle,
+    OmniContextHandle,
+    OmniSessionHandle,
+)
 
 
 class TestOmniSRTBackend(unittest.TestCase):
@@ -110,23 +115,35 @@ class _FakeBridge:
 
     def prepare_ar_context_from_messages(self, **kwargs):
         self.session_ids.append(kwargs.get("session_id") or "s0")
-        session = SimpleNamespace(
+        session = OmniSessionHandle(
             session_id=kwargs.get("session_id") or "s0",
+            anchor_request_id="r0",
+            context_length=4,
             context_version=len(self.session_ids),
         )
-        full = SimpleNamespace(
+        full = OmniContextHandle(
             request_id="r0",
             token_count=4,
             session=session,
             metadata={"pre_image_segments": self.pre_image_segments},
         )
-        return SimpleNamespace(full=full, text_cfg=None, image_cfg=None)
+        text_cfg = OmniContextHandle(
+            request_id="r0:text_cfg",
+            token_count=4,
+            session=session,
+        )
+        image_cfg = OmniContextHandle(
+            request_id="r0:image_cfg",
+            token_count=4,
+            session=session,
+        )
+        return SRTOmniContextBundle(full=full, text_cfg=text_cfg, image_cfg=image_cfg)
 
     def commit_generated_segment(self, **kwargs):
         self.commit_count += 1
 
     def continue_ar_decode(self, **kwargs):
-        return SimpleNamespace(type="done")
+        return SimpleNamespace(type="done", text=None, token_ids=())
 
     def release(self, contexts):
         return None
@@ -147,10 +164,11 @@ class _FakeVLMBridge:
 
     def generate_vlm_text(self, *, messages, max_new_tokens):
         self.max_new_tokens = max_new_tokens
-        session = SimpleNamespace(
+        session = OmniSessionHandle(
             anchor_request_id="r1",
             session_id="s1",
             context_length=8,
+            context_version=1,
         )
         return SimpleNamespace(
             session=session,
