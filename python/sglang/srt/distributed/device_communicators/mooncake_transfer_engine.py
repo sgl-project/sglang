@@ -170,6 +170,30 @@ class MooncakeTransferEngine:
             logger.debug("Mooncake batch memory deregistration failed.")
         return ret_value
 
+    @staticmethod
+    def _is_efa_device(device_name: Optional[str]) -> bool:
+        """Check if the given ibverbs device is an AWS EFA device.
+
+        Uses the sysfs driver binding rather than the device name prefix:
+        EFA devices are bound to the ``efa`` kernel driver, so the
+        ``/sys/class/infiniband/<dev>/device/driver`` symlink resolves to
+        ``.../drivers/efa``.  This is naming-scheme independent and works
+        for all AWS EFA-capable instance types.
+
+        Args:
+            device_name: The IB device name to check.
+
+        Returns:
+            True if the device is bound to the ``efa`` driver, False otherwise.
+        """
+        if not device_name:
+            return False
+        driver_link = f"/sys/class/infiniband/{device_name}/device/driver"
+        try:
+            return os.path.basename(os.readlink(driver_link)) == "efa"
+        except OSError:
+            return False
+
     def initialize(
         self,
         hostname: str,
@@ -189,8 +213,18 @@ class MooncakeTransferEngine:
                 device_name if device_name is not None else "",
             )
         else:
+            # Auto-detect EFA devices (AWS). EFA uses "rdmap*" naming and
+            # requires the "efa" transport (libfabric SRD) instead of "rdma".
+            transport = "efa" if self._is_efa_device(device_name) else "rdma"
             ret_value = self.engine.initialize(
                 hostname,
+                "P2PHANDSHAKE",
+                transport,
+                device_name if device_name is not None else "",
+            )
+        if ret_value != 0:
+            logger.error("Mooncake Transfer Engine initialization failed.")
+            raise RuntimeError("Mooncake Transfer Engine initialization failed.")
                 "P2PHANDSHAKE",
                 "rdma",
                 device_name if device_name is not None else "",
