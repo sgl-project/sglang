@@ -86,18 +86,14 @@ class Gemma3MLP(nn.Module):
 
     def forward(self, x):
         if self.gate_up_proj.quant_config is None:
-            gate_up_sizes = [
-                size // self.gate_up_proj.tp_size
-                for size in self.gate_up_proj.output_sizes
-            ]
             gate_weight, up_weight = self.gate_up_proj.weight.split(
-                gate_up_sizes, dim=0
+                self.gate_up_proj.output_partition_sizes, dim=0
             )
             if self.gate_up_proj.bias is None:
                 gate_bias = up_bias = None
             else:
                 gate_bias, up_bias = self.gate_up_proj.bias.split(
-                    gate_up_sizes, dim=0
+                    self.gate_up_proj.output_partition_sizes, dim=0
                 )
             x = F.gelu(
                 F.linear(x, gate_weight, gate_bias), approximate="tanh"
