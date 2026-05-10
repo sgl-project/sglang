@@ -480,7 +480,7 @@ class DataParallelController:
 
                 if server_args.enable_dp_attention:
                     # dp attention has different sharding logic
-                    _, _, dp_rank = compute_dp_attention_world_info(
+                    _, _, dp_rank, _ = compute_dp_attention_world_info(
                         server_args.enable_dp_attention,
                         tp_rank,
                         server_args.tp_size,

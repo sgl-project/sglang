@@ -230,8 +230,8 @@ class SchedulerDPAttnMixin:
         return prepare_mlp_sync_batch_raw(
             local_batch,
             dp_size=self.server_args.dp_size,
-            attn_tp_size=self.attn_tp_size,
-            attn_cp_size=self.attn_cp_size,
+            attn_tp_size=self.ps.attn_tp_size,
+            attn_cp_size=self.ps.attn_cp_size,
             tp_group=self.tp_group,
             get_idle_batch=self.get_idle_batch,
             disable_cuda_graph=self.server_args.disable_cuda_graph,
