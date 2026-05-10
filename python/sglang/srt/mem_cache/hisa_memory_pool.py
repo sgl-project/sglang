@@ -23,7 +23,6 @@ alloc_for_decode/release_kv_cache) and ``scheduler_pp_mixin.py``.
 from __future__ import annotations
 
 import logging
-import os
 from typing import List, Optional
 
 import torch
@@ -38,116 +37,6 @@ logger = logging.getLogger(__name__)
 
 
 POOL_PAGE_SIZE = 64  # pool rows per pool page (matches main KV page_size)
-
-
-# ---------------------------------------------------------------------------
-# Pool-refresh kernel cross-verify (diagnostic)
-#
-# When ``SGLANG_HISA_POOL_VERIFY=1`` is set in the environment, every K<64
-# pool-refresh call runs BOTH the production tilelang grouped kernel AND
-# the triton SK15 reference on parallel clones of the layer's pool buffer,
-# compares them cell-by-cell, and logs the diff. Only the production
-# kernel's output is written back, so model behaviour is unchanged — this
-# is a measurement, not a fix.
-#
-# Skipped when the current stream is capturing a CUDA graph (decode):
-# clone()/copy_ inside a captured region would freeze the snapshot at
-# capture time and make the comparison meaningless on replay. Extend
-# (where K<64 pool-refresh actually runs in production today) is normally
-# not graph-captured, so the verify path covers the relevant calls.
-#
-# Cost: ~3-4× per-call wall time when enabled (extra clone, second kernel
-# launch, .item() sync per call). Intended only for short diagnostic runs.
-# ---------------------------------------------------------------------------
-
-
-def _hisa_pool_verify_enabled() -> bool:
-    return os.environ.get("SGLANG_HISA_POOL_VERIFY", "0").lower() in ("1", "true", "yes")
-
-
-def _hisa_pool_verify_compare(
-    pool_tilelang: torch.Tensor,
-    pool_triton: torch.Tensor,
-    *,
-    layer_id: int,
-    n_new_per_req: torch.Tensor,
-    pool_page_size: int,
-    dim: int,
-) -> None:
-    """Numeric compare two pool buffers. Both must be uint8 with identical
-    layout: ``[num_pool_pages, pool_page_size * (dim + 4)]`` SoA = fp8
-    payload then per-slot fp32 block scales.
-
-    Reports diffs SEPARATELY in the fp8 mean-K region and the fp32 scale
-    region — bytewise-distance over the whole pool is misleading because
-    a 1-ULP fp32 mantissa rounding flips the low byte 0x01↔0xFE (~254
-    byte distance) while the value itself barely moves.
-
-    fp8 metric:   max |dequant_til - dequant_tri| (in fp8 dequant space,
-                  saturating to 448, so ~1 fp8 ULP ≈ 1-32 in this scale)
-                  + sign-flip count (cells where only the sign bit
-                  differs — direct evidence of mean-K sign divergence)
-                  + NaN/-0 counts.
-    scale metric: max |Δ| absolute and max |Δ|/max(|a|,|b|) relative.
-                  Relative > 1e-5 is suspicious; <1e-6 is fp32 rounding.
-
-    Forces ``.item()`` sync — must not be invoked under CUDA-graph capture.
-    """
-    fp8_end = pool_page_size * dim  # bytes per pool page row in fp8 region
-
-    fp8_til = pool_tilelang[:, :fp8_end]
-    fp8_tri = pool_triton[:, :fp8_end]
-    sc_til = pool_tilelang[:, fp8_end:].view(torch.float32)
-    sc_tri = pool_triton[:, fp8_end:].view(torch.float32)
-
-    # ---- fp8 region ----
-    n_fp8_diff = int((fp8_til != fp8_tri).sum().item())
-    fp8_til_f = fp8_til.view(torch.float8_e4m3fn).to(torch.float32)
-    fp8_tri_f = fp8_tri.view(torch.float8_e4m3fn).to(torch.float32)
-    n_til_nan = int(fp8_til_f.isnan().sum().item())
-    n_tri_nan = int(fp8_tri_f.isnan().sum().item())
-    if n_fp8_diff == 0:
-        max_dequant_diff = 0.0
-        n_signflip = 0
-    else:
-        diff_dequant = (fp8_til_f - fp8_tri_f).abs()
-        # nan-safe max (skip NaN cells; counted separately above)
-        finite = diff_dequant.isfinite()
-        max_dequant_diff = (
-            float(diff_dequant[finite].max().item()) if bool(finite.any().item()) else 0.0
-        )
-        n_signflip = int(((fp8_til ^ fp8_tri) == 0x80).sum().item())
-
-    # ---- scale region ----
-    sc_diff_abs = (sc_til - sc_tri).abs()
-    n_scale_diff = int((sc_diff_abs > 0).sum().item())
-    if n_scale_diff == 0:
-        max_scale_abs = 0.0
-        max_scale_rel = 0.0
-    else:
-        max_scale_abs = float(sc_diff_abs.max().item())
-        denom = sc_til.abs().maximum(sc_tri.abs()).clamp(min=1e-30)
-        max_scale_rel = float((sc_diff_abs / denom).max().item())
-
-    n_new_total = int(n_new_per_req.sum().item())
-
-    if n_fp8_diff == 0 and n_scale_diff == 0:
-        logger.info(
-            "HISA pool verify [layer=%d]: identical "
-            "(fp8_cells=%d, scale_cells=%d, n_new_pool_blocks=%d)",
-            layer_id, fp8_til.numel(), sc_til.numel(), n_new_total,
-        )
-        return
-
-    logger.info(
-        "HISA pool verify [layer=%d]: "
-        "fp8 diff_cells=%d max|Δdequant|=%.4f signflip=%d nan_til/tri=%d/%d | "
-        "scale diff_cells=%d max|Δ|=%.3e max_rel=%.3e | n_new_pool_blocks=%d",
-        layer_id,
-        n_fp8_diff, max_dequant_diff, n_signflip, n_til_nan, n_tri_nan,
-        n_scale_diff, max_scale_abs, max_scale_rel,
-        n_new_total,
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -515,24 +404,10 @@ class HisaNSATokenToKVPool(NSATokenToKVPool):
         grouped for k<paged_block_size (one pool block per CTA, K-row slice
         of the underlying paged block). The grouped variant requires
         ``paged_block_size % k_block_size == 0``.
-
-        When ``SGLANG_HISA_POOL_VERIFY=1`` is set and we're not inside a
-        CUDA-graph capture, the K<64 path runs the triton SK15 reference
-        on a parallel clone of ``pool_k_pages`` and logs cell-level diffs.
-        Only the tilelang result is written back to the live buffer, so
-        downstream model behaviour is unchanged.
         """
         kv_cache_flat = self.index_k_with_scale_buffer[layer_id - self.start_layer]
         pool_k_pages = self.pool_k_pages[layer_id - self.start_layer]
         if self.k_block_size < self.page_size:
-            verify = (
-                _hisa_pool_verify_enabled()
-                and not torch.cuda.is_current_stream_capturing()
-            )
-            if verify:
-                # Snapshot, run tilelang on the live buffer, save its output,
-                # then run triton SK15 on a fresh clone of the snapshot.
-                snapshot = pool_k_pages.clone()
             fp8_native_paged_mean_pooling_completed_blocks_grouped_interface(
                 kv_cache_flat=kv_cache_flat,
                 req_to_token=req_to_token,
@@ -546,37 +421,6 @@ class HisaNSATokenToKVPool(NSATokenToKVPool):
                 pool_page_size=self.pool_page_size,
                 max_pool_per_req_grid=max_pool_per_req_grid,
             )
-            if verify:
-                from sglang.srt.layers.attention.nsa.hisa.triton_kernels import (
-                    update_pool_for_completed_blocks_triton,
-                )
-
-                pool_triton = snapshot  # reuse snapshot as the triton scratch
-                update_pool_for_completed_blocks_triton(
-                    kv_cache_flat=kv_cache_flat,
-                    req_to_token=req_to_token,
-                    pool_page_tables=self.req_to_pool_page.req_to_pool_page,
-                    req_pool_indices=req_pool_indices,
-                    prev_seq_lens=prev_seq_lens,
-                    new_seq_lens=new_seq_lens,
-                    pool_k_pages=pool_triton,
-                    k_block_size=self.k_block_size,
-                    paged_block_size=self.page_size,
-                    pool_page_size=self.pool_page_size,
-                    max_pool_per_req_grid=max_pool_per_req_grid,
-                )
-                # n_new per req for context in the log line
-                n_new_per_req = (new_seq_lens // self.k_block_size) - (
-                    prev_seq_lens // self.k_block_size
-                )
-                _hisa_pool_verify_compare(
-                    pool_k_pages,
-                    pool_triton,
-                    layer_id=layer_id,
-                    n_new_per_req=n_new_per_req,
-                    pool_page_size=self.pool_page_size,
-                    dim=self.index_head_dim,
-                )
             return
         fp8_native_paged_mean_pooling_completed_blocks_interface(
             kv_cache_flat=kv_cache_flat,
