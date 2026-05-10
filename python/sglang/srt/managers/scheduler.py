@@ -784,6 +784,7 @@ class Scheduler(
         if self.enable_metrics:
             self.metrics_collector.emit_constants(
                 max_total_num_tokens=self.max_total_num_tokens,
+                # TODO: max_running_requests_under_SLO has no setter — dead chain.
                 max_running_requests_under_SLO=getattr(
                     self, "max_running_requests_under_SLO", None
                 ),

@@ -954,6 +954,7 @@ class SchedulerMetricsMixin:
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             self.stats.utilization = -1
         else:
+            # TODO: max_running_requests_under_SLO has no setter — sglang:utilization stuck at 0 (regressed #22713).
             max_under_slo = getattr(self, "max_running_requests_under_SLO", None)
             if max_under_slo is not None and max_under_slo > 0:
                 self.stats.utilization = max(
