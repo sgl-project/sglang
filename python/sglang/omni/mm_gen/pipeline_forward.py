@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Generation backend for pipelines colocated with an AR runtime.
+"""Generation backend for in-process multimodal_gen pipeline calls.
 
 This backend adapts the generic omni generation protocol to a multimodal_gen
-pipeline call. It passes live SRT context capabilities through `Req.extra`, so
-the pipeline can borrow SRT session/KV state without serializing it.
+pipeline call. It passes live SRT context capabilities through ``Req.extra``.
+That keeps U1's current same-process KV access explicit while leaving room for
+an executor-backed backend once the diffusion runtime owns the schedule.
 """
 
 from __future__ import annotations
@@ -12,17 +13,16 @@ import copy
 from dataclasses import dataclass
 from typing import Any
 
+from sglang.multimodal_gen.runtime.pipelines_core import ComposedPipelineBase
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.omni.protocol import ContextOps, GeneratedSegment, OmniRequest
 
-# standalone diffusion serving backends can implement the same generation protocol
-
 
 @dataclass(slots=True)
-class ColocatedPipelineBackend:
-    """Run a multimodal_gen pipeline in the same process as the AR backend."""
+class DirectPipelineForwardBackend:
+    """Call ``ComposedPipelineBase.forward`` directly from omni orchestration."""
 
-    pipeline: Any
+    pipeline: ComposedPipelineBase
     server_args: Any
     context_ops_extra_key: str
 
@@ -31,26 +31,34 @@ class ColocatedPipelineBackend:
         request: OmniRequest,
         context_ops: ContextOps,
     ) -> GeneratedSegment:
-        batch = self._build_batch(request, context_ops)
-        batch = self.pipeline.forward(batch, self.server_args)
+        batch = build_pipeline_req(request, context_ops, self.context_ops_extra_key)
+        batch: Req = self.pipeline.forward(batch, self.server_args)
         segment = batch.generated_segment
         if segment is None:
-            raise ValueError("Colocated pipeline did not set generated_segment")
+            raise ValueError("Direct pipeline forward did not set generated_segment")
+
         return coerce_generated_segment(segment)
 
-    def _build_batch(self, request: OmniRequest, context_ops: ContextOps) -> Req:
-        extra = {
-            "omni_messages": [message.to_dict() for message in request.messages],
-            "omni_context_metadata": context_ops.metadata,
-            # context_ops is an in-process srt runner capability, not serialized KV
-            self.context_ops_extra_key: context_ops,
-        }
-        return Req(
-            sampling_params=_copy_sampling_params(request.sampling_params),
-            prompt=_prompt_from_request(request),
-            suppress_logs=True,
-            extra=extra,
-        )
+
+def build_pipeline_req(
+    request: OmniRequest,
+    context_ops: ContextOps,
+    context_ops_extra_key: str,
+) -> Req:
+    """Build the multimodal_gen request envelope shared by omni mm backends."""
+
+    extra = {
+        "omni_messages": [message.to_dict() for message in request.messages],
+        "omni_context_metadata": context_ops.metadata,
+        # context_ops is an in-process SRT capability, not serialized KV.
+        context_ops_extra_key: context_ops,
+    }
+    return Req(
+        sampling_params=_copy_sampling_params(request.sampling_params),
+        prompt=_prompt_from_request(request),
+        suppress_logs=True,
+        extra=extra,
+    )
 
 
 def coerce_generated_segment(segment: Any) -> GeneratedSegment:
@@ -83,7 +91,5 @@ def _copy_sampling_params(sampling_params: Any) -> Any:
 
 def _prompt_from_request(request: OmniRequest) -> str:
     return "\n".join(
-        message.text or ""
-        for message in request.messages
-        if message.type == "text"
+        message.text or "" for message in request.messages if message.type == "text"
     )

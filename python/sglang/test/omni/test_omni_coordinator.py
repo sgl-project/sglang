@@ -33,7 +33,9 @@ class _InMemoryContextOps:
         del sidecar_role
         return 0
 
-    def build_temporary_forward_batch(self, *, prepared, generation_query_embeds, timestep):
+    def build_temporary_forward_batch(
+        self, *, prepared, generation_query_embeds, timestep
+    ):
         del prepared, generation_query_embeds, timestep
         raise RuntimeError("no temporary forward backend")
 

@@ -23,6 +23,7 @@ from sglang.omni.protocol import (
     OmniInputSegment,
     OmniRequest,
 )
+from sglang.srt.omni_session.middle import SRTBackedOmniSessionBridge
 
 
 @dataclass(slots=True)
@@ -89,9 +90,9 @@ class SRTBackedContextOps:
 
 
 class SRTARBackend:
-    """AR backend that delegates AR-side work to an SRT-owned middle bridge."""
+    """AR backend in an omni pipeline, which delegates AR-side work to an SRT-owned middle bridge."""
 
-    def __init__(self, bridge: Any):
+    def __init__(self, bridge: SRTBackedOmniSessionBridge):
         self.bridge = bridge
 
     def prepare_context(self, request: OmniRequest) -> OmniContextBundle:

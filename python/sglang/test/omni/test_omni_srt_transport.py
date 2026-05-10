@@ -13,7 +13,7 @@ from sglang.omni.protocol import (
     OmniOutputSegment,
     OmniResponse,
 )
-from sglang.omni.srt_transport import handle_omni_generate_from_scheduler
+from sglang.omni.srt_transport import handle_omni_generate_with_omni_coordinator
 from sglang.srt.managers.io_struct import OmniGenerateReqInput, OmniGenerateReqOutput
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
 
@@ -91,7 +91,7 @@ class TestOmniSRTTransport(unittest.TestCase):
             server_args=SimpleNamespace(),
         )
 
-        response = handle_omni_generate_from_scheduler(
+        response = handle_omni_generate_with_omni_coordinator(
             scheduler=scheduler,
             payload={
                 "model": "sensenova-u1",
@@ -110,7 +110,7 @@ class TestOmniSRTTransport(unittest.TestCase):
             server_args=SimpleNamespace(),
         )
 
-        first = handle_omni_generate_from_scheduler(
+        first = handle_omni_generate_with_omni_coordinator(
             scheduler=scheduler,
             payload={
                 "model": "sensenova-u1",
@@ -118,7 +118,7 @@ class TestOmniSRTTransport(unittest.TestCase):
                 "messages": [{"type": "text", "text": "draw"}],
             },
         )
-        second = handle_omni_generate_from_scheduler(
+        second = handle_omni_generate_with_omni_coordinator(
             scheduler=scheduler,
             payload={
                 "model": "sensenova-u1",
@@ -132,7 +132,7 @@ class TestOmniSRTTransport(unittest.TestCase):
         self.assertIs(orchestrator.contexts[0], orchestrator.contexts[1])
         self.assertEqual(0, len(orchestrator.ar_backend.released))
 
-        closed = handle_omni_generate_from_scheduler(
+        closed = handle_omni_generate_with_omni_coordinator(
             scheduler=scheduler,
             payload={"action": "close_session", "session_id": "s0"},
         )
@@ -142,7 +142,7 @@ class TestOmniSRTTransport(unittest.TestCase):
 
     def test_scheduler_transport_rejects_unknown_model(self):
         with self.assertRaisesRegex(ValueError, "Unsupported omni model"):
-            handle_omni_generate_from_scheduler(
+            handle_omni_generate_with_omni_coordinator(
                 scheduler=SimpleNamespace(server_args=SimpleNamespace()),
                 payload={
                     "model": "other-model",

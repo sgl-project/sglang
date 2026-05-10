@@ -3,7 +3,8 @@
 
 These helpers encode U1's model-specific token grammar: image markers,
 `<IMG_CONTEXT>` spans, multimodal offsets, and generated-image commits. They
-remain in `srt.omni_session` because they construct SRT session inputs.
+live in the omni bridge package because they are model-specific glue, while
+the returned prepared inputs remain SRT-owned runtime objects.
 """
 
 import math

@@ -9,7 +9,7 @@ from sglang.srt.managers.schedule_batch import (
 )
 from sglang.srt.models.sensenova_u1 import NEOChatModel
 from sglang.srt.multimodal.processors.base_processor import BaseMultimodalProcessor
-from sglang.srt.omni_session.sensenova_u1_context import (
+from sglang.omni.bridges.sensenova_u1.context import (
     U1_IMAGE_PLACEHOLDER,
     U1_IMG_CONTEXT_TOKEN,
     U1_IMG_END_TOKEN,

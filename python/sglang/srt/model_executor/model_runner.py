@@ -3398,7 +3398,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if not metadata_list:
             return
 
-        from sglang.srt.omni_session.context import OmniSRTRequestView
+        from sglang.srt.omni_session.runtime_protocol import OmniSRTRequestView
 
         for batch_index, metadata in enumerate(metadata_list):
             if not metadata:
@@ -3439,7 +3439,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         batch_index: int,
         metadata: dict,
     ):
-        from sglang.srt.omni_session.context import OmniSRTKVTokenBinding
+        from sglang.srt.omni_session.runtime_protocol import OmniSRTKVTokenBinding
 
         req_to_token_pool = getattr(forward_batch, "req_to_token_pool", None)
         req_to_token = getattr(req_to_token_pool, "req_to_token", None)

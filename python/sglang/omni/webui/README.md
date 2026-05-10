@@ -4,9 +4,9 @@ This is a small local WebUI for testing interleaved omni models through
 SGLang's `/v1/omni/generate` API. It is intentionally a thin browser UI plus
 HTTP proxy: model serving still happens in `sglang serve --model-type omni`.
 
-The first target model is SenseNova U1. The UI keeps an omni session across
-turns and renders returned text/image segments in their original order, so it
-is useful for checking multi-turn interleaved generation and image editing.
+The first target model is SenseNova U1. The UI supports a free-form chat loop
+for repeated refinements, and also keeps a two-turn preset for quickly checking
+that a later turn can edit a previously generated image.
 
 ## Start An Omni Server
 
@@ -52,11 +52,17 @@ http://127.0.0.1:7860
 
 ## Multi-Turn Flow
 
-1. Click `Load turn 1`.
-2. Click `Generate`.
+Use the `Message` composer for normal multi-turn refinement. Keep `Keep omni
+session across turns` enabled, then click `Send` for each user turn. `New chat`
+closes the current server session and clears the thread.
+
+For the preset flow:
+
+1. Click `Preset: first image`.
+2. Click `Send`.
 3. Keep the returned session alive.
-4. Click `Load turn 2`.
-5. Click `Generate` again.
+4. Click `Preset: edit previous`.
+5. Click `Send` again.
 
 Turn 2 reuses the session returned by turn 1, so the model can refer to the
 previous generated image and edit it.

@@ -6,15 +6,16 @@ from types import SimpleNamespace
 from sglang.multimodal_gen.configs.sample.sensenova_u1 import (
     build_sensenova_u1_sampling_params,
 )
-from sglang.omni.backends.colocated import ColocatedPipelineBackend
+from sglang.omni.mm_gen.pipeline_executor import PipelineExecutorBackend
+from sglang.omni.mm_gen.pipeline_forward import DirectPipelineForwardBackend
 from sglang.omni.protocol import GeneratedSegment, OmniInputSegment, OmniRequest
 
 
-class TestOmniColocatedBackend(unittest.TestCase):
+class TestOmniMMGenBackends(unittest.TestCase):
     def test_pipeline_backend_passes_context_ops_through_req_extra(self):
         pipeline = _FakePipeline()
         server_args = SimpleNamespace()
-        backend = ColocatedPipelineBackend(
+        backend = DirectPipelineForwardBackend(
             pipeline=pipeline,
             server_args=server_args,
             context_ops_extra_key="ctx",
@@ -51,7 +52,7 @@ class TestOmniColocatedBackend(unittest.TestCase):
         self.assertEqual("draw\nthen describe", pipeline.batch.prompt)
 
     def test_pipeline_backend_rejects_missing_generated_segment(self):
-        backend = ColocatedPipelineBackend(
+        backend = DirectPipelineForwardBackend(
             pipeline=_EmptyPipeline(),
             server_args=SimpleNamespace(),
             context_ops_extra_key="ctx",
@@ -65,6 +66,32 @@ class TestOmniColocatedBackend(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "did not set generated_segment"):
             backend.generate_segment(request, SimpleNamespace(metadata={}))
+
+    def test_pipeline_executor_backend_drives_stages_directly(self):
+        executor = _FakeExecutor()
+        server_args = SimpleNamespace()
+        stages = [object()]
+        backend = PipelineExecutorBackend(
+            executor=executor,
+            stages=stages,
+            server_args=server_args,
+            context_ops_extra_key="ctx",
+        )
+        context_ops = SimpleNamespace(metadata={"session": "s1"})
+        request = OmniRequest(
+            messages=(OmniInputSegment(type="text", text="revise"),),
+            sampling_params=build_sensenova_u1_sampling_params(
+                {"num_inference_steps": 2}
+            ),
+        )
+
+        segment = backend.generate_segment(request, context_ops)
+
+        self.assertEqual("image", segment.type)
+        self.assertEqual("executor-image", segment.image)
+        self.assertEqual(stages, executor.stages)
+        self.assertEqual(server_args, executor.server_args)
+        self.assertIs(context_ops, executor.batch.extra["ctx"])
 
 
 class _FakePipeline:
@@ -86,6 +113,23 @@ class _FakePipeline:
 class _EmptyPipeline:
     def forward(self, batch, server_args):
         del server_args
+        return batch
+
+
+class _FakeExecutor:
+    def __init__(self):
+        self.stages = None
+        self.batch = None
+        self.server_args = None
+
+    def execute_with_profiling(self, stages, batch, server_args):
+        self.stages = stages
+        self.batch = batch
+        self.server_args = server_args
+        batch.generated_segment = GeneratedSegment(
+            type="image",
+            image="executor-image",
+        )
         return batch
 
 

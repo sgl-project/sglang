@@ -12,7 +12,7 @@ from typing import Any
 
 import torch
 
-from sglang.srt.omni_session.context import OmniSRTKVTokenBinding
+from sglang.srt.omni_session.runtime_protocol import OmniSRTKVTokenBinding
 
 
 class OmniSRTSchedulerExecutorError(RuntimeError):

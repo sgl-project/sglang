@@ -5,7 +5,7 @@ from copy import deepcopy
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
-from sglang.srt.omni_session.context import OmniSessionHandle, OmniSRTRequestView
+from sglang.srt.omni_session.runtime_protocol import OmniSessionHandle, OmniSRTRequestView
 from sglang.srt.omni_session.runtime import (
     OmniDecodeResult,
     OmniInterleavedMessage,
@@ -73,7 +73,9 @@ class OmniModelAdapterProtocol(Protocol):
         messages: list[OmniInterleavedMessage],
     ) -> OmniModelPrefillResult: ...
 
-    def decode_next_segment(self, *, session: OmniModelSessionView) -> OmniDecodeResult: ...
+    def decode_next_segment(
+        self, *, session: OmniModelSessionView
+    ) -> OmniDecodeResult: ...
 
     def decode_vlm_text(
         self,

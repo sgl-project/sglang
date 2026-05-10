@@ -3503,10 +3503,11 @@ class Scheduler(
         return RpcReqOutput(success, "" if not exec else str(exec))
 
     def handle_omni_generate_request(self, recv_req: OmniGenerateReqInput):
+        """handle an omni generate req by dispatching it to the omni coordinator """
         try:
-            from sglang.omni.srt_transport import handle_omni_generate_from_scheduler
+            from sglang.omni.srt_transport import handle_omni_generate_with_omni_coordinator
 
-            payload = handle_omni_generate_from_scheduler(
+            payload = handle_omni_generate_with_omni_coordinator(
                 scheduler=self,
                 payload=recv_req.payload,
             )

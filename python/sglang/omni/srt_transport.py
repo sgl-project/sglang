@@ -2,8 +2,8 @@
 """SRT tokenizer-manager transport for `/v1/omni/*` routes.
 
 Requests enter through the SRT HTTP server and are forwarded to the scheduler
-process. The scheduler lazily builds the omni orchestrator so the colocated U1
-generation backend can access the local ModelRunner/session/KV state.
+process. The scheduler lazily builds the omni orchestrator so the same-process
+U1 generation backend can access local ModelRunner/session/KV state.
 """
 
 from __future__ import annotations
@@ -26,7 +26,7 @@ class _OmniSessionRecord:
     updated_at: float
 
 
-def handle_omni_generate_from_scheduler(
+def handle_omni_generate_with_omni_coordinator(
     *,
     scheduler: Any,
     payload: dict[str, Any],
@@ -39,6 +39,7 @@ def handle_omni_generate_from_scheduler(
         )
 
     request = OmniRequest.from_payload(payload)
+    # get global orchestrator
     orchestrator = _get_sensenova_u1_orchestrator(scheduler, request)
     sessions = _get_omni_sessions(scheduler)
     session_id = _resolve_session_id(payload)
@@ -49,6 +50,7 @@ def handle_omni_generate_from_scheduler(
         if session_record is None:
             raise ValueError(f"Unknown omni session: {session_id}")
 
+    # generate with request and session context
     response, context = orchestrator.generate_with_context(
         request,
         context=None if session_record is None else session_record.context,

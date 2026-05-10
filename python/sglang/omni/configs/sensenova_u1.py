@@ -10,9 +10,9 @@ import shlex
 from dataclasses import replace
 from typing import Any
 
-from sglang.omni.backends.colocated import ColocatedPipelineBackend
-from sglang.omni.backends.srt import SRTARBackend
+from sglang.omni.backends.ar.srt import SRTARBackend
 from sglang.omni.coordinator import OmniCoordinator
+from sglang.omni.mm_gen.pipeline_forward import DirectPipelineForwardBackend
 from sglang.omni.protocol import OmniRequest
 
 _MODE_ALIASES = {
@@ -87,7 +87,7 @@ def build_sensenova_u1_orchestrator(
     plugin = SenseNovaU1OmniPlugin()
     coordinator = OmniCoordinator(
         ar_backend=SRTARBackend(srt_bridge),
-        generation_backend=generation_backend,
+        mm_generation_backend=generation_backend,
         request_adapter=plugin.normalize_request,
         metadata={"model": plugin.model_name},
     )
@@ -102,7 +102,7 @@ def build_sensenova_u1_orchestrator_from_scheduler(
     generation_backend: Any | None = None,
     server_args: Any | None = None,
 ) -> OmniCoordinator:
-    from sglang.srt.omni_session.sensenova_u1 import build_sensenova_u1_middle_bridge
+    from sglang.omni.bridges.sensenova_u1.bridge import build_sensenova_u1_middle_bridge
 
     return build_sensenova_u1_orchestrator(
         srt_bridge=build_sensenova_u1_middle_bridge(
@@ -195,6 +195,8 @@ def _build_default_generation_backend(srt_server_args: Any | None) -> Any:
     )
     from sglang.multimodal_gen.runtime.server_args import (
         ServerArgs as DiffusionServerArgs,
+    )
+    from sglang.multimodal_gen.runtime.server_args import (
         set_global_server_args,
     )
 
@@ -202,13 +204,13 @@ def _build_default_generation_backend(srt_server_args: Any | None) -> Any:
     pipeline_server_args = DiffusionServerArgs.from_kwargs(**diffusion_server_kwargs)
     _validate_diffusion_server_args(pipeline_server_args)
     set_global_server_args(pipeline_server_args)
-    # pixel-flow generation stays colocated because each denoise step reads live SRT KV
+    # U1 pixel-flow stays same-process because denoising reads live SRT KV handles.
     pipeline = SenseNovaU1Pipeline(
         pipeline_server_args.model_path,
         pipeline_server_args,
         executor=SyncExecutor(server_args=pipeline_server_args),
     )
-    return ColocatedPipelineBackend(
+    return DirectPipelineForwardBackend(
         pipeline=pipeline,
         server_args=pipeline_server_args,
         context_ops_extra_key="sensenova_u1_context_ops",
@@ -269,9 +271,7 @@ def _parse_diffusion_server_cli_args(value: str) -> dict[str, Any]:
         DiffusionServerArgs._extract_component_attention_backends(remaining)
     )
     if remaining:
-        raise ValueError(
-            "Unrecognized diffusion_server_args: " + " ".join(remaining)
-        )
+        raise ValueError("Unrecognized diffusion_server_args: " + " ".join(remaining))
 
     provided_args = _provided_cli_args(raw_args, argv)
     config_file = provided_args.get("config")
@@ -327,7 +327,7 @@ def _validate_diffusion_server_args(server_args: Any) -> None:
     )
     if unsupported:
         raise ValueError(
-            "SenseNova U1 colocated diffusion engine does not support "
+            "SenseNova U1 same-process diffusion engine does not support "
             + ", ".join(unsupported)
         )
 

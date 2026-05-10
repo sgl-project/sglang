@@ -16,7 +16,7 @@ from typing import Any, Callable
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import ORJSONResponse
 
-from sglang.omni.backends.base import UnsupportedARBackend, UnsupportedGenerationBackend
+from sglang.omni.backends import UnsupportedARBackend, UnsupportedGenerationBackend
 from sglang.omni.coordinator import OmniCoordinator
 from sglang.omni.protocol import OmniRequest, OmniResponse
 from sglang.version import __version__
@@ -104,7 +104,7 @@ def launch_server(
 def _default_orchestrator() -> OmniCoordinator:
     return OmniCoordinator(
         ar_backend=UnsupportedARBackend(),
-        generation_backend=UnsupportedGenerationBackend(),
+        mm_generation_backend=UnsupportedGenerationBackend(),
     )
 
 

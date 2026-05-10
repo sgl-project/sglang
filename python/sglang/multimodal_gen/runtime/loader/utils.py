@@ -10,6 +10,7 @@ import re
 from collections import defaultdict
 from collections.abc import Callable, Iterator
 from typing import Any, Dict, Type
+from transformers.initialization import no_init_weights
 
 import torch
 from torch import nn
@@ -177,7 +178,6 @@ def hf_to_custom_state_dict(
 
 class skip_init_modules:
     def __enter__(self):
-        from transformers.initialization import no_init_weights
 
         self._hf_no_init = no_init_weights()
         self._hf_no_init.__enter__()

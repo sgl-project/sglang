@@ -13,7 +13,7 @@ from typing import Any, Literal, Protocol
 
 import torch
 
-from sglang.srt.omni_session.context import (
+from sglang.srt.omni_session.runtime_protocol import (
     OmniSessionHandle,
     OmniSRTKVTokenBinding,
     OmniSRTRequestView,
@@ -483,7 +483,9 @@ class OmniSessionRuntime:
         )
         return sidecar_record.handle()
 
-    def get_state(self, handle_or_session_id: OmniSessionHandle | str) -> OmniSegmentState:
+    def get_state(
+        self, handle_or_session_id: OmniSessionHandle | str
+    ) -> OmniSegmentState:
         return self._record_for(handle_or_session_id).state
 
     def get_debug_counters(self, handle_or_session_id: OmniSessionHandle | str) -> dict:
@@ -1155,7 +1157,8 @@ class OmniSessionRuntime:
         for namespace, namespace_updates in updates.items():
             if not isinstance(namespace_updates, dict):
                 raise ValueError(
-                    "omni model state namespace updates must be dicts: " f"{namespace!r}"
+                    "omni model state namespace updates must be dicts: "
+                    f"{namespace!r}"
                 )
             state = record.omni_model_state.setdefault(str(namespace), {})
             for key, value in namespace_updates.items():
@@ -1188,9 +1191,7 @@ class OmniSessionRuntime:
         *,
         state: OmniSegmentState,
     ) -> OmniSRTKVTokenBinding | None:
-        provider = getattr(
-            self.srt_request_executor, "get_request_token_binding", None
-        )
+        provider = getattr(self.srt_request_executor, "get_request_token_binding", None)
         if not callable(provider):
             provider = getattr(
                 self.srt_request_executor, "get_omni_request_token_binding", None

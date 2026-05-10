@@ -28,7 +28,7 @@ class TestOmniSessionImportBoundaries(unittest.TestCase):
             PYTHON_ROOT / "sglang" / "srt",
             forbidden_prefixes=(
                 "sglang.srt.omni_session.coordinator",
-                "sglang.srt.omni_session.sensenova_u1",
+                "sglang.omni.bridges.sensenova_u1.bridge",
             ),
             skip_dirs={PYTHON_ROOT / "sglang" / "srt" / "omni_session"},
         )

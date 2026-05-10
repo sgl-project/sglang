@@ -5,15 +5,15 @@ from collections.abc import Callable
 from types import SimpleNamespace
 from typing import Any, Protocol
 
-from sglang.srt.omni_session.context import (
+from sglang.srt.omni_session.runtime_protocol import (
     OmniContextBundle,
     OmniContextHandle,
     OmniSessionHandle,
 )
-from sglang.srt.omni_session.interleaved import (
+from sglang.srt.omni_session.interleaved_protocol import (
     DEFAULT_OMNI_TEXT_MAX_NEW_TOKENS,
-    GenerationKind,
     GeneratedSegmentResult,
+    GenerationKind,
 )
 from sglang.srt.omni_session.runtime import (
     OmniDecodeResult,
@@ -61,7 +61,9 @@ class OmniSessionBridge(Protocol):
 
     def release(self, contexts: OmniContextBundle) -> None: ...
 
-    def continue_ar_decode(self, *, contexts: OmniContextBundle) -> OmniDecodeResult: ...
+    def continue_ar_decode(
+        self, *, contexts: OmniContextBundle
+    ) -> OmniDecodeResult: ...
 
     def generate_vlm_text(
         self,
@@ -91,7 +93,9 @@ class SRTBackedGenerationContextOps:
     def session_id(self) -> str:
         session = self._contexts.full.session
         if session is None:
-            raise ValueError("SRT-backed generation context ops require a session handle")
+            raise ValueError(
+                "SRT-backed generation context ops require a session handle"
+            )
         return session.session_id
 
     @property
@@ -115,7 +119,9 @@ class SRTBackedGenerationContextOps:
             None,
         )
         if not callable(get_position_count):
-            raise RuntimeError("generation context ops require latest context position count")
+            raise RuntimeError(
+                "generation context ops require latest context position count"
+            )
         return get_position_count(self.session_id, sidecar_role=sidecar_role)
 
     def build_temporary_forward_batch(
@@ -131,7 +137,9 @@ class SRTBackedGenerationContextOps:
             None,
         )
         if not callable(build_forward_batch):
-            raise RuntimeError("generation context ops require temporary query forward batches")
+            raise RuntimeError(
+                "generation context ops require temporary query forward batches"
+            )
         return build_forward_batch(
             prepared=self._to_srt_prepared(prepared),
             generation_query_embeds=generation_query_embeds,
@@ -142,7 +150,9 @@ class SRTBackedGenerationContextOps:
         runtime = getattr(self._bridge, "runtime", None)
         executor = getattr(runtime, "srt_request_executor", None)
         if executor is None:
-            raise RuntimeError("SRT-backed generation context ops require a request executor")
+            raise RuntimeError(
+                "SRT-backed generation context ops require a request executor"
+            )
         return executor
 
     def _to_srt_prepared(self, prepared: Any) -> Any:
@@ -298,7 +308,9 @@ class SRTBackedOmniSessionBridge:
             raise ValueError("SRT-backed omni contexts require a session handle")
         segment = executor(SRTBackedGenerationContextOps(self, contexts))
         if segment.type != "image":
-            raise ValueError(f"omni generated segment expected image output, got {segment.type}")
+            raise ValueError(
+                f"omni generated segment expected image output, got {segment.type}"
+            )
         return segment
 
     def commit_generated_segment(

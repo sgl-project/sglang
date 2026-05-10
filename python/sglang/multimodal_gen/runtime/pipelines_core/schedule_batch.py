@@ -202,6 +202,8 @@ class Req:
     output: torch.Tensor | None = None
     audio: torch.Tensor | None = None
     audio_sample_rate: int | None = None
+    # Segment is designed for AR consumption in an omni pipeline,
+    # it may carry Image Object (instead of decoded tensor) and metadata, depending on the needs from AR backend
     generated_segment: Any | None = None
 
     def __init__(self, **kwargs):

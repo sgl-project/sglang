@@ -14,6 +14,9 @@ from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
+import numpy as np
+import torch
+from PIL import Image
 
 _U1_T2I_CFG_UNCONDITION_ROLE = "u1_t2i_cfg_uncondition"
 _U1_INTERLEAVE_TEXT_UNCONDITION_ROLE = "u1_interleave_text_uncondition"
@@ -86,6 +89,9 @@ class SenseNovaU1PixelFlowStage(PipelineStage):
         batch: Req,
         server_args: ServerArgs,
     ) -> Req:
+        """
+            different from standard multimodal_gen pipeline, omni pipeline may return a Req, carrying some intermediate states
+        """
         del server_args
         context_ops = _require_context_ops(batch, self.context_ops_key)
         model = _require_model(context_ops)
@@ -170,9 +176,7 @@ class SenseNovaU1PixelFlowStage(PipelineStage):
             seed=seed,
             device=device,
         )
-        noise_scale = float(
-            _noise_scale_for_image(model, grid_h=grid_h, grid_w=grid_w)
-        )
+        noise_scale = float(_noise_scale_for_image(model, grid_h=grid_h, grid_w=grid_w))
         image_prediction = noise_scale * torch.randn(
             (1, 3, height, width),
             device=device,
@@ -437,9 +441,6 @@ class SenseNovaU1PixelFlowStage(PipelineStage):
         prepared: SenseNovaU1PixelFlowPrepared,
         image_prediction: Any,
     ) -> SenseNovaU1GeneratedSegment:
-        import numpy as np
-        import torch
-        from PIL import Image
 
         array = (
             (image_prediction[0].float() * 0.5 + 0.5)
@@ -860,9 +861,7 @@ def _predict_pixel_flow_from_srt(
     )
 
     t = timestep.to(device=z.device, dtype=z.dtype)
-    return (x_pred - z) / (1 - t).clamp_min(
-        float(getattr(model.config, "t_eps", 0.02))
-    )
+    return (x_pred - z) / (1 - t).clamp_min(float(getattr(model.config, "t_eps", 0.02)))
 
 
 def _forward_context_position(context: Any | None) -> int | None:

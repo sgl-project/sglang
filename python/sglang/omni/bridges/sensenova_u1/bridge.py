@@ -10,7 +10,27 @@ from contextlib import contextmanager
 from types import SimpleNamespace
 from typing import Any
 
-from sglang.srt.omni_session.sensenova_u1_context import (
+from sglang.srt.omni_session.adapter import (
+    OmniModelAppendImageResult,
+    OmniModelPrefillResult,
+    OmniModelRunnerAdapter,
+)
+from sglang.srt.omni_session.runtime_protocol import OmniContextBundle
+from sglang.srt.omni_session.interleaved_protocol import GenerationKind
+from sglang.srt.omni_session.middle import (
+    GeneratedSegmentExecutor,
+    SRTBackedGenerationContextOps,
+    SRTBackedOmniSessionBridge,
+)
+from sglang.srt.omni_session.runtime import (
+    OmniDecodeResult,
+    OmniInterleavedMessage,
+    OmniSegmentState,
+    OmniSessionRuntime,
+    OmniSRTPreparedInput,
+    OmniVLMTextGenerationResult,
+)
+from sglang.omni.bridges.sensenova_u1.context import (
     U1_EDIT_IMG_CONDITION_ROLE,
     U1_EDIT_UNCONDITION_ROLE,
     U1_IMG_START_TOKEN,
@@ -31,26 +51,6 @@ from sglang.srt.omni_session.sensenova_u1_context import (
     build_u1_native_t2i_cfg_uncondition_prepared_input,
     build_u1_native_t2i_prepared_input,
     build_u1_native_vlm_prepared_input,
-)
-from sglang.srt.omni_session.adapter import (
-    OmniModelAppendImageResult,
-    OmniModelPrefillResult,
-    OmniModelRunnerAdapter,
-)
-from sglang.srt.omni_session.context import OmniContextBundle
-from sglang.srt.omni_session.interleaved import GenerationKind
-from sglang.srt.omni_session.middle import (
-    SRTBackedGenerationContextOps,
-    SRTBackedOmniSessionBridge,
-    GeneratedSegmentExecutor,
-)
-from sglang.srt.omni_session.runtime import (
-    OmniDecodeResult,
-    OmniInterleavedMessage,
-    OmniSegmentState,
-    OmniSessionRuntime,
-    OmniSRTPreparedInput,
-    OmniVLMTextGenerationResult,
 )
 from sglang.srt.omni_session.srt_executor import OmniSRTSchedulerExecutor
 
@@ -531,7 +531,7 @@ class U1OmniModelAdapter:
         return 0
 
 
-class U1SRTBackedOmniSessionBridge:
+class U1SRTBackedOmniSessionBridge(SRTBackedOmniSessionBridge):
     """Pixel-flow U1 bridge shell backed by the common SRT omni session runtime."""
 
     generation_kind: GenerationKind = "pixel_flow"
@@ -564,7 +564,8 @@ class U1SRTBackedOmniSessionBridge:
         with self._temporary_generation_settings(sampling_params, think=think):
             bridge_think = (
                 False
-                if getattr(sampling_params, "omni_generation_mode", None) == "interleave"
+                if getattr(sampling_params, "omni_generation_mode", None)
+                == "interleave"
                 else think
             )
             contexts = self._bridge.prepare_ar_context(
@@ -588,7 +589,8 @@ class U1SRTBackedOmniSessionBridge:
         with self._temporary_generation_settings(sampling_params, think=think):
             bridge_think = (
                 False
-                if getattr(sampling_params, "omni_generation_mode", None) == "interleave"
+                if getattr(sampling_params, "omni_generation_mode", None)
+                == "interleave"
                 else think
             )
             contexts = self._bridge.prepare_ar_context_from_messages(
@@ -667,7 +669,9 @@ class U1SRTBackedOmniSessionBridge:
             raise ValueError("SRT-backed omni contexts require a session handle")
         segment = executor(SRTBackedGenerationContextOps(self, contexts))
         if segment.type != "image":
-            raise ValueError(f"omni generated segment expected image output, got {segment.type}")
+            raise ValueError(
+                f"omni generated segment expected image output, got {segment.type}"
+            )
         return segment
 
     def commit_generated_segment(

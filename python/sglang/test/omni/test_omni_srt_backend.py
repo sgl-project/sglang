@@ -7,7 +7,7 @@ from types import SimpleNamespace
 
 from PIL import Image
 
-from sglang.omni.backends.srt import SRTARBackend
+from sglang.omni.backends.ar.srt import SRTARBackend
 from sglang.omni.protocol import GeneratedSegment, OmniInputSegment, OmniRequest
 
 

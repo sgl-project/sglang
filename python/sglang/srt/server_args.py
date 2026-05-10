@@ -4720,7 +4720,7 @@ class ServerArgs:
             "--diffusion-server-args",
             type=str,
             default=ServerArgs.diffusion_server_args,
-            help="Arguments passed to the colocated diffusion source engine, as a "
+            help="Arguments passed to the diffusion source engine, as a "
             "JSON object, @JSON/YAML file, or quoted sglang-diffusion CLI args.",
         )
         parser.add_argument(

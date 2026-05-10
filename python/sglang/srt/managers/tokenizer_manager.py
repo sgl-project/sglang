@@ -376,7 +376,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
         # Session
         self.session_futures = {}  # session_id -> asyncio event
-        self.omni_futures = {}
+        self.omni_futures = {} # rid (of omni-request) -> asyncio event
 
         # Subprocess liveness watchdog — set by Engine or http_server after construction
         self._subprocess_watchdog = None
@@ -565,6 +565,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         obj: OmniGenerateReqInput,
         request: Optional[fastapi.Request] = None,
     ) -> OmniGenerateReqOutput:
+        """forward the OmniGenerateReqInput to scheduler"""
         self.auto_create_handle_loop()
         if obj.rid is None:
             obj.regenerate_rid()

@@ -59,9 +59,13 @@ class OmniRequest:
     """Normalized request consumed by the omni coordinator."""
 
     messages: tuple[OmniInputSegment, ...]
+    # vlm: image-understanding
+    # interleave: image-text -> image-text
+
     model: str | None = None
     mode: str = "interleave"
     sampling_params: Any | None = None
+    # max number of images allowed in a req
     max_images: int = 1
     max_text_segments: int = 8
     think: bool = False
@@ -104,7 +108,7 @@ class OmniContextRef:
 
 @dataclass(slots=True)
 class OmniContextBundle:
-    """Coordinator-visible context plus backend-private live state.
+    """Coordinator-visible context (for omni-gen) plus backend-private live state.
 
     `backend_context` is intentionally opaque: colocated SRT backends keep live
     session handles there, while future standalone generation backends can keep
@@ -121,7 +125,12 @@ class OmniContextBundle:
 
 @dataclass(frozen=True, slots=True)
 class OmniBoundary:
-    """AR-side handoff point that tells the coordinator what to do next."""
+    """AR-side handoff point that tells the coordinator what to do next.
+
+    'Boundary' is a common and crucial concept in interleaved (ar + multimodal_gen) generation.
+     Conceptually, it marks the boundary of continuous token of different modalities, usually decided by the AR backend
+
+    """
 
     type: BoundaryType
     text: str | None = None
@@ -154,6 +163,8 @@ class GeneratedSegment:
 
 @dataclass(frozen=True, slots=True)
 class OmniOutputSegment:
+    """OmniOutputSegment is the basic element of the result of an omni request
+    """
     type: OutputSegmentType
     text: str | None = None
     image: Any | None = None
@@ -272,7 +283,7 @@ class ARBackend(Protocol):
     def release(self, context: OmniContextBundle) -> None: ...
 
 
-class GenerationBackend(Protocol):
+class MultimodalGenerationBackend(Protocol):
     """Media generation backend used by omni orchestration."""
 
     def generate_segment(

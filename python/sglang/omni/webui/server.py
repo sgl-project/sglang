@@ -17,6 +17,7 @@ ROOT = Path(__file__).resolve().parent
 
 class U1OmniUIHandler(BaseHTTPRequestHandler):
     api_base: str
+    opener: urllib.request.OpenerDirector
 
     def do_GET(self) -> None:
         if self.path in {"/", "/index.html"}:
@@ -63,8 +64,9 @@ class U1OmniUIHandler(BaseHTTPRequestHandler):
         url = f"{self.api_base.rstrip('/')}{path}"
         headers = {"content-type": "application/json"} if body is not None else {}
         request = urllib.request.Request(url, data=body, headers=headers, method=method)
+        timeout = 5 if method == "GET" and path == "/health" else 900
         try:
-            with urllib.request.urlopen(request, timeout=900) as response:
+            with self.opener.open(request, timeout=timeout) as response:
                 data = response.read()
                 self.send_response(response.status)
                 self.send_header(
@@ -104,6 +106,9 @@ def main() -> None:
     args = parser.parse_args()
 
     U1OmniUIHandler.api_base = args.api_base
+    U1OmniUIHandler.opener = urllib.request.build_opener(
+        urllib.request.ProxyHandler({})
+    )
     server = ThreadingHTTPServer((args.host, args.port), U1OmniUIHandler)
     print(f"U1 interleaved omni UI: http://{args.host}:{args.port}")
     print(f"Proxy target: {args.api_base}")

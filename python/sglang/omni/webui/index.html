@@ -97,6 +97,18 @@
       margin-bottom: 16px;
     }
 
+    .section-label {
+      margin: 22px 0 10px;
+      padding-top: 14px;
+      border-top: 1px solid var(--line);
+      color: var(--muted);
+      font-family: ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      font-size: 12px;
+      font-weight: 800;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+    }
+
     label {
       font-family: ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
       font-size: 12px;
@@ -183,6 +195,8 @@
     }
 
     .timeline {
+      display: flex;
+      flex-direction: column;
       min-height: calc(100vh - 68px);
       background: var(--panel);
       border: 1px solid var(--line);
@@ -221,6 +235,8 @@
       display: grid;
       gap: 0;
       padding: 0;
+      overflow: auto;
+      flex: 1;
     }
 
     .empty {
@@ -241,6 +257,7 @@
       color: var(--muted);
       font-family: ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
       font-size: 12px;
+      white-space: pre-line;
     }
 
     .turn-body {
@@ -334,6 +351,8 @@
         <span id="statusDot" class="dot"></span>
       </div>
 
+      <div class="section-label">Composer</div>
+
       <div class="control">
         <label for="task">Task</label>
         <select id="task">
@@ -345,13 +364,15 @@
       </div>
 
       <div class="control">
-        <label for="prompt">Prompt</label>
-        <textarea id="prompt"></textarea>
+        <label for="prompt">Message</label>
+        <textarea id="prompt" placeholder="Ask U1 to generate, refine, or describe the current conversation."></textarea>
       </div>
 
-      <div class="actions">
-        <button class="secondary" id="turn1">Load turn 1</button>
-        <button class="secondary" id="turn2">Load turn 2</button>
+      <div class="section-label">Multi-turn preset</div>
+
+      <div class="actions" style="margin-top: 0;">
+        <button class="secondary" id="turn1">Preset: first image</button>
+        <button class="secondary" id="turn2">Preset: edit previous</button>
       </div>
 
       <div class="control" style="margin-top: 16px;">
@@ -398,7 +419,8 @@
       </div>
 
       <div class="actions">
-        <button id="send">Generate</button>
+        <button id="send">Send</button>
+        <button class="secondary" id="newChat">New chat</button>
         <button class="secondary" id="reset">Clear timeline</button>
         <button class="warn" id="closeSession">Close session</button>
       </div>
@@ -410,7 +432,7 @@
         <div id="sessionView" class="session">session: none</div>
       </div>
       <div id="feed" class="feed">
-        <div class="empty">Load turn 1, generate, then load turn 2 to test whether the next request edits the previous generated image.</div>
+        <div class="empty">No turns yet.</div>
       </div>
     </section>
   </main>
@@ -430,12 +452,21 @@
 
     function setBusy(isBusy) {
       $("send").disabled = isBusy;
+      $("newChat").disabled = isBusy;
+      $("reset").disabled = isBusy;
       $("closeSession").disabled = isBusy;
+    }
+
+    function renderSessionView() {
+      const turns = `${turnIndex} turn${turnIndex === 1 ? "" : "s"}`;
+      $("sessionView").textContent = sessionId
+        ? `session: ${sessionId}\n${turns}`
+        : `session: none\n${turns}`;
     }
 
     function setSession(id) {
       sessionId = id || "";
-      $("sessionView").textContent = sessionId ? `session: ${sessionId}` : "session: none";
+      renderSessionView();
     }
 
     function setStatus(ok, text) {
@@ -446,7 +477,18 @@
     async function checkHealth() {
       try {
         const response = await fetch("/api/health");
-        setStatus(response.ok, response.ok ? "Backend is reachable" : `Backend health ${response.status}`);
+        if (response.ok) {
+          setStatus(true, "Backend is reachable");
+          return;
+        }
+        const text = await response.text();
+        let detail = text;
+        try {
+          detail = JSON.parse(text).error || text;
+        } catch {
+          detail = text;
+        }
+        setStatus(false, detail ? `Backend offline: ${detail}` : `Backend health ${response.status}`);
       } catch (error) {
         setStatus(false, `Backend offline: ${error.message}`);
       }
@@ -467,6 +509,7 @@
     function appendTurn(prompt, payload, data, error) {
       ensureFeed();
       turnIndex += 1;
+      renderSessionView();
       const turn = makeEl("article", "turn");
       const meta = makeEl("div", "turn-meta", `turn ${turnIndex}\n${payload.task}`);
       const body = makeEl("div", "turn-body");
@@ -487,7 +530,8 @@
       }
 
       turn.append(meta, body);
-      feed.prepend(turn);
+      feed.append(turn);
+      turn.scrollIntoView({block: "end", behavior: "smooth"});
     }
 
     function renderSegment(segment) {
@@ -500,7 +544,8 @@
         const image = segment.image || {};
         img.className = "image";
         img.alt = "generated image";
-        img.src = image.url || `data:${image.mime_type || "image/png"};base64,${image.b64_json || ""}`;
+        img.src = image.url ||
+          `data:${image.mime_type || "image/png"};base64,${image.b64_json || ""}`;
         wrap.appendChild(img);
       } else {
         wrap.appendChild(makeEl("pre", "raw", JSON.stringify(segment, null, 2)));
@@ -533,6 +578,9 @@
 
     async function buildPayload() {
       const prompt = $("prompt").value.trim();
+      if (!prompt) {
+        throw new Error("Message is required");
+      }
       const imageSegment = await fileAsImageSegment($("imageInput").files[0]);
       const messages = [];
       if (imageSegment) messages.push(imageSegment);
@@ -565,8 +613,10 @@
 
     async function send() {
       setBusy(true);
-      const {payload, prompt} = await buildPayload();
+      let payload;
+      let prompt;
       try {
+        ({payload, prompt} = await buildPayload());
         const response = await fetch("/api/omni/generate", {
           method: "POST",
           headers: {"content-type": "application/json"},
@@ -586,33 +636,59 @@
         if (data.session && data.session.id) setSession(data.session.id);
         appendTurn(prompt, payload, data, "");
       } catch (error) {
-        appendTurn(prompt, payload, null, error.message);
+        appendTurn(
+          prompt || $("prompt").value.trim() || "(empty message)",
+          payload || {task: $("task").value},
+          null,
+          error.message
+        );
       } finally {
         setBusy(false);
         checkHealth();
       }
     }
 
-    async function closeSession() {
+    async function closeCurrentSession() {
       if (!sessionId) return;
+      await fetch("/api/omni/close", {
+        method: "POST",
+        headers: {"content-type": "application/json"},
+        body: JSON.stringify({session_id: sessionId})
+      });
+      setSession("");
+    }
+
+    async function closeSession() {
       setBusy(true);
       try {
-        await fetch("/api/omni/close", {
-          method: "POST",
-          headers: {"content-type": "application/json"},
-          body: JSON.stringify({session_id: sessionId})
-        });
+        await closeCurrentSession();
+      } finally {
+        setBusy(false);
+      }
+    }
+
+    async function newChat() {
+      setBusy(true);
+      try {
+        await closeCurrentSession();
         setSession("");
+        turnIndex = 0;
+        renderSessionView();
+        $("prompt").value = "";
+        $("imageInput").value = "";
+        feed.innerHTML = '<div class="empty">New chat.</div>';
       } finally {
         setBusy(false);
       }
     }
 
     $("send").addEventListener("click", send);
+    $("newChat").addEventListener("click", newChat);
     $("closeSession").addEventListener("click", closeSession);
     $("reset").addEventListener("click", () => {
       turnIndex = 0;
-      feed.innerHTML = '<div class="empty">Timeline cleared. The server session is unchanged until you close it.</div>';
+      renderSessionView();
+      feed.innerHTML = '<div class="empty">Timeline cleared.</div>';
     });
     $("turn1").addEventListener("click", () => {
       $("task").value = "interleave";
@@ -624,7 +700,14 @@
       $("prompt").value = prompts.turn2;
       $("seed").value = "224";
     });
+    $("prompt").addEventListener("keydown", (event) => {
+      if ((event.metaKey || event.ctrlKey) && event.key === "Enter") {
+        event.preventDefault();
+        if (!$("send").disabled) send();
+      }
+    });
 
+    renderSessionView();
     checkHealth();
     setInterval(checkHealth, 10000);
   </script>
