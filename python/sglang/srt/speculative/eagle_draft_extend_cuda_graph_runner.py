@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import bisect
+import contextlib
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable, Optional
 
@@ -25,7 +26,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
 )
 from sglang.srt.model_executor.input_buffers import ForwardInputBuffers
-from sglang.srt.speculative.eagle_info import EagleDraftInput
+from sglang.srt.speculative.eagle_info import EagleDraftExtendInput
 from sglang.srt.speculative.spec_utils import fast_topk
 from sglang.srt.utils import (
     require_attn_tp_gather,
@@ -284,7 +285,15 @@ class EAGLEDraftExtendCudaGraphRunner:
         return out
 
     def _replay(self, forward_batch: ForwardBatch):
-        self.graphs[self.bs].replay()
+        ctx = (
+            self.model_runner.device_timer.wrap(
+                metadata={"category": "eagle_draft_extend"}
+            )
+            if self.model_runner.device_timer
+            else contextlib.nullcontext()
+        )
+        with ctx:
+            self.graphs[self.bs].replay()
 
     def capture(self):
         CudaGraphRunner.capture(self)
@@ -353,12 +362,11 @@ class EAGLEDraftExtendCudaGraphRunner:
         else:
             global_dp_buffer_len = None
 
-        spec_info = EagleDraftInput(
+        spec_info = EagleDraftExtendInput(
             hidden_states=hidden_states,
             num_accepted_drafts=num_accepted_drafts,
             num_accepted_tokens=num_accepted_tokens,
         )
-        spec_info.positions = None
 
         self.deepep_adapter.capture(is_extend_in_batch=True)
 

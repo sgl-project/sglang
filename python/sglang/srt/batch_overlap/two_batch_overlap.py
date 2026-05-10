@@ -81,7 +81,7 @@ def compute_split_seq_index(
     extend_lens: Optional[Sequence[int]],
     token_num_per_seq: Optional[int],
 ) -> Optional[int]:
-    if forward_mode == ForwardMode.EXTEND:
+    if forward_mode == ForwardMode.EXTEND or forward_mode == ForwardMode.MIXED:
         assert extend_lens is not None
         return _split_extend_seqs(extend_lens)
     elif forward_mode.is_target_verify() or forward_mode.is_decode():
@@ -270,7 +270,7 @@ def compute_split_token_index(
     extend_seq_lens: Optional[Sequence[int]],
     token_num_per_seq: Optional[int],
 ) -> int:
-    if forward_mode == ForwardMode.EXTEND:
+    if forward_mode == ForwardMode.EXTEND or forward_mode == ForwardMode.MIXED:
         assert extend_seq_lens is not None
         if _is_two_chunk_split_enabled(extend_seq_lens):
             return sum(extend_seq_lens) // 2
