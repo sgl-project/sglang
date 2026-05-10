@@ -555,6 +555,7 @@ class ServerArgs:
     nsa_decode_backend: Optional[str] = (
         None  # auto-detect based on hardware/kv_cache_dtype
     )
+    nsa_use_cute_dsl_paged_mqa_logits: bool = False
     disable_flashinfer_autotune: bool = False
     mamba_backend: str = "triton"
 
@@ -5447,6 +5448,13 @@ class ServerArgs:
             type=str,
             choices=NSA_CHOICES,
             help="NSA decode backend. If not specified, auto-detects based on hardware and kv_cache_dtype.",
+        )
+        parser.add_argument(
+            "--nsa-use-cute-dsl-paged-mqa-logits",
+            default=ServerArgs.nsa_use_cute_dsl_paged_mqa_logits,
+            action="store_true",
+            help="Use the CuTe DSL FP8 paged MQA logits kernel inside the NSA "
+            "indexer instead of DeepGEMM. SM 100 (Blackwell) only.",
         )
         parser.add_argument(
             "--fp8-gemm-backend",
