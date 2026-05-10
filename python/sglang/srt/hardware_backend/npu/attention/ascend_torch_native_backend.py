@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from typing import Optional
 
 import torch
 from torch.nn.functional import scaled_dot_product_attention
@@ -70,6 +71,7 @@ class AscendTorchNativeAttnBackend:
         enable_gqa=False,
         causal=False,
         sliding_window_size: int = -1,
+        full_to_swa_mapping: Optional[torch.Tensor] = None,
         logit_cap: float = 0.0,
         logit_capping_method: str = "tanh",
     ):
@@ -91,6 +93,8 @@ class AscendTorchNativeAttnBackend:
             enable_gqa: bool
             causal: bool
             sliding_window_size: int, -1 means no sliding window
+            full_to_swa_mapping: mapping from full pool index to SWA pool index,
+                required for SWA layers to translate req_to_token indices
 
         Returns:
             output: [num_tokens, num_heads, head_size]
@@ -150,6 +154,10 @@ class AscendTorchNativeAttnBackend:
             # index for each token in the sequence.
             req_pool_idx = req_pool_indices[seq_idx]
             per_req_tokens = req_to_token[req_pool_idx, atten_start_kv:atten_end_kv]
+            # For SWA layers, k_cache/v_cache are from the SWA pool but
+            # req_to_token stores full pool indices. Translate before indexing.
+            if full_to_swa_mapping is not None:
+                per_req_tokens = full_to_swa_mapping[per_req_tokens]
             per_req_key = k_cache[per_req_tokens].movedim(0, query.dim() - 2)
             per_req_value = v_cache[per_req_tokens].movedim(0, query.dim() - 2)
 
@@ -207,6 +215,7 @@ class AscendTorchNativeAttnBackend:
         enable_gqa=False,
         causal=False,
         sliding_window_size: int = -1,
+        full_to_swa_mapping: Optional[torch.Tensor] = None,
         logit_cap: float = 0.0,
         logit_capping_method: str = "tanh",
     ):
@@ -266,6 +275,10 @@ class AscendTorchNativeAttnBackend:
             # index for each token in the sequence.
             req_pool_idx = req_pool_indices[seq_idx]
             per_req_tokens = req_to_token[req_pool_idx, atten_start_kv:atten_end_kv]
+            # For SWA layers, k_cache/v_cache are from the SWA pool but
+            # req_to_token stores full pool indices. Translate before indexing.
+            if full_to_swa_mapping is not None:
+                per_req_tokens = full_to_swa_mapping[per_req_tokens]
             per_req_key = k_cache[per_req_tokens].movedim(0, query.dim() - 2)
             per_req_value = v_cache[per_req_tokens].movedim(0, query.dim() - 2)
 
