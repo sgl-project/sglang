@@ -781,7 +781,7 @@ class Scheduler(
                 f"{'available_cpu_mem' if self.device == 'cpu' else 'available_gpu_mem'}={avail_mem:.2f} GB"
             )
 
-        if self.enable_metrics and hasattr(self, "metrics_collector"):
+        if self.enable_metrics:
             self.metrics_collector.emit_constants(
                 max_total_num_tokens=self.max_total_num_tokens,
                 max_running_requests_under_SLO=getattr(
