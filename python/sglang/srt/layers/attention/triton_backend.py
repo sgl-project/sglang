@@ -7,6 +7,7 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.configs import hybrid_arch
 from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
@@ -128,9 +129,9 @@ class TritonAttnBackend(AttentionBackend):
             self.v_head_dim = full_v_head_dim
             self.swa_v_head_dim = swa_v_head_dim
         elif (
-            model_runner.hybrid_gdn_config is not None
-            or model_runner.kimi_linear_config is not None
-            or model_runner.linear_attn_model_spec is not None
+            hybrid_arch.hybrid_gdn_config(model_runner.model_config) is not None
+            or hybrid_arch.kimi_linear_config(model_runner.model_config) is not None
+            or hybrid_arch.linear_attn_model_spec(model_runner.model_config) is not None
         ):
             # For hybrid linear models, layer_id = 0 may not be full attention
             self.v_head_dim = model_runner.token_to_kv_pool.get_v_head_dim()

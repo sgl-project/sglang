@@ -5,6 +5,7 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.configs import hybrid_arch
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.mamba.causal_conv1d_triton import PAD_SLOT_ID
 from sglang.srt.layers.attention.mamba.mamba import MambaMixer2
@@ -640,7 +641,9 @@ class Mamba2AttnBackend(MambaAttnBackendBase):
 
     def __init__(self, model_runner: ModelRunner):
         super().__init__(model_runner)
-        config = model_runner.mamba2_config
+        config = hybrid_arch.mamba2_config(
+            model_runner.model_config, is_draft_worker=model_runner.is_draft_worker
+        )
         assert config is not None
         self.mamba_chunk_size = config.mamba_chunk_size
 
