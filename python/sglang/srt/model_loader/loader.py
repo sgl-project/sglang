@@ -2197,23 +2197,30 @@ class PreshardedModelLoader(DefaultModelLoader):
                         if r["stored_key"] not in cached:
                             cached[r["stored_key"]] = fh.get_tensor(r["stored_key"])
 
+                # Always hash each unique stored_key in parallel (multi-
+                # threaded). The actual purpose here is to parallelize the
+                # mmap page-faults that the subsequent single-threaded
+                # ``param_data.copy_(tensor)`` would otherwise pay one tensor
+                # at a time on a network FS. SHA1 cost is fully overlapped
+                # with IO wait, so unifying the code path is effectively
+                # free and ensures verify-off is no slower than verify-on.
+                # Verification (comparison against ``plan["rank_checksums"]``)
+                # is still gated by ``verify_on_load``.
+                keys = list(cached.keys())
+                n_workers = min(max(1, len(keys)), self._hash_num_threads)
+
+                def _hash_one(key: str) -> Tuple[str, str]:
+                    return key, self._hash_tensor(cached[key])
+
+                if n_workers <= 1:
+                    key_to_hash = dict(_hash_one(k) for k in keys)
+                else:
+                    with concurrent.futures.ThreadPoolExecutor(
+                        max_workers=n_workers,
+                        thread_name_prefix="presharded-readahead",
+                    ) as ex:
+                        key_to_hash = dict(ex.map(_hash_one, keys))
                 if self._verify_on_load:
-                    # Hash each unique stored_key once (multi-threaded), then
-                    # map back to all (name, hash) pairs that share the key.
-                    keys = list(cached.keys())
-                    n_workers = min(max(1, len(keys)), self._hash_num_threads)
-
-                    def _hash_one(key: str) -> Tuple[str, str]:
-                        return key, self._hash_tensor(cached[key])
-
-                    if n_workers <= 1:
-                        key_to_hash = dict(_hash_one(k) for k in keys)
-                    else:
-                        with concurrent.futures.ThreadPoolExecutor(
-                            max_workers=n_workers,
-                            thread_name_prefix="presharded-verify",
-                        ) as ex:
-                            key_to_hash = dict(ex.map(_hash_one, keys))
                     for r in items:
                         verify_hashes.append((r["name"], key_to_hash[r["stored_key"]]))
 
