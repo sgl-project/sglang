@@ -42,6 +42,7 @@ def test_sync_execute_budget_scales_with_request_decode_length():
 
     assert req.finished()
     assert scheduler.run_steps == 12
+    assert scheduler.sample_launches == 12
 
 
 def test_sync_step_does_not_publish_internal_batch_as_last_batch():
@@ -111,6 +112,7 @@ class _FakeSyncScheduler(_FakeScheduler):
         self.cur_batch = None
         self.finish_after_steps = finish_after_steps
         self.run_steps = 0
+        self.sample_launches = 0
 
     def _add_request_to_queue(self, req):
         self.waiting_queue.append(req)
@@ -126,6 +128,9 @@ class _FakeSyncScheduler(_FakeScheduler):
     def run_batch(self, batch):
         self.run_steps += 1
         return object()
+
+    def launch_batch_sample_if_needed(self, result):
+        self.sample_launches += 1
 
     def process_batch_result(self, batch, result):
         if self.run_steps >= self.finish_after_steps:

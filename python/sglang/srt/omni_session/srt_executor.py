@@ -395,6 +395,11 @@ class OmniSRTSchedulerExecutor:
             if batch:
                 batch_sessions = self._batch_sessions(batch)
                 result = self.scheduler.run_batch(batch)
+                launch_sample = getattr(
+                    self.scheduler, "launch_batch_sample_if_needed", None
+                )
+                if callable(launch_sample):
+                    launch_sample(result)
                 self._capture_batch_token_bindings(batch)
                 self.scheduler.process_batch_result(batch, result)
                 self._capture_session_token_bindings(batch_sessions)
