@@ -421,20 +421,20 @@ class HisaNSATokenToKVPool(NSATokenToKVPool):
                 pool_page_size=self.pool_page_size,
                 max_pool_per_req_grid=max_pool_per_req_grid,
             )
-            return
-        fp8_native_paged_mean_pooling_completed_blocks_interface(
-            kv_cache_flat=kv_cache_flat,
-            req_to_token=req_to_token,
-            pool_page_tables=self.req_to_pool_page.req_to_pool_page,
-            req_pool_indices=req_pool_indices,
-            prev_seq_lens=prev_seq_lens,
-            new_seq_lens=new_seq_lens,
-            pool_k_pages=pool_k_pages,
-            k_block_size=self.k_block_size,
-            paged_block_size=self.page_size,
-            pool_page_size=self.pool_page_size,
-            max_pool_per_req_grid=max_pool_per_req_grid,
-        )
+        else:
+            fp8_native_paged_mean_pooling_completed_blocks_interface(
+                kv_cache_flat=kv_cache_flat,
+                req_to_token=req_to_token,
+                pool_page_tables=self.req_to_pool_page.req_to_pool_page,
+                req_pool_indices=req_pool_indices,
+                prev_seq_lens=prev_seq_lens,
+                new_seq_lens=new_seq_lens,
+                pool_k_pages=pool_k_pages,
+                k_block_size=self.k_block_size,
+                paged_block_size=self.page_size,
+                pool_page_size=self.pool_page_size,
+                max_pool_per_req_grid=max_pool_per_req_grid,
+            )
 
     # ------------------------------------------------------------------
     # Decode-side helpers (used by HisaIndexer._get_topk_paged)
