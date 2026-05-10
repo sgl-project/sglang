@@ -913,6 +913,11 @@ class ServerArgs:
         # the final attention backend and chunked_prefill_size are in effect.
         self._handle_multi_item_scoring()
 
+        # Backend-dependent half of --prefill-only-disable-kv-cache validation.
+        # Must stay after _handle_attention_backend_compatibility() (above) and
+        # _handle_multi_item_scoring() so the resolved prefill backend is final;
+        # the flag/precondition half runs earlier in
+        # _validate_prefill_only_disable_kv_cache_args().
         self._handle_prefill_only_disable_kv_cache()
 
         # Handle Hicache settings.
@@ -3303,11 +3308,20 @@ class ServerArgs:
     def _handle_prefill_only_disable_kv_cache(self):
         """Validate --prefill-only-disable-kv-cache backend constraint.
 
-        Must run after _handle_multi_item_scoring() so the final prefill
-        attention backend is in effect.
+        Must run after _handle_attention_backend_compatibility() (which fills
+        the default attention_backend if unset) and _handle_multi_item_scoring()
+        (which may further mutate it). The assertion below guards against
+        accidental call-site reordering: if attention_backend is still None,
+        backends haven't settled yet and get_attention_backends() would return
+        a stale (None, None).
         """
         if not self.prefill_only_disable_kv_cache:
             return
+
+        assert self.attention_backend is not None, (
+            "_handle_prefill_only_disable_kv_cache must run after "
+            "_handle_attention_backend_compatibility() so the prefill backend is resolved."
+        )
 
         prefill_backend, _ = self.get_attention_backends()
         if prefill_backend not in ("fa3", "fa4"):
