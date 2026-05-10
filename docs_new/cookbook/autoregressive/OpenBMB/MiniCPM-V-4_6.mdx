@@ -26,8 +26,16 @@ MiniCPM-V 4.6 is the next-generation multimodal model from [OpenBMB](https://hug
 ## 2. SGLang Installation
 
 <Warning>
-MiniCPM-V 4.6 support is pending upstream merge. For now, build a Docker image from the open PR; this section will be updated with the official `lmsysorg/sglang` image tag once the PR lands.
+MiniCPM-V 4.6 support is currently in preview pending upstream merge. The dedicated Docker tags below are built from the open PR and are intended for testing; once the PR is merged, use the regular nightly `lmsysorg/sglang:dev` / `lmsysorg/sglang:dev-cu12` images.
 </Warning>
+
+```bash
+# CUDA 13 (Hopper / Blackwell, default)
+docker pull lmsysorg/sglang:dev-minicpm-v-4-6
+
+# CUDA 12 (Ampere or older drivers)
+docker pull lmsysorg/sglang:dev-cu12-minicpm-v-4-6
+```
 
 For the general SGLang installation guide (PyPI, source, Docker) see the [official SGLang installation guide](../../../docs/get-started/install).
 
@@ -59,6 +67,7 @@ import { MiniCPMV46Deployment } from '/src/snippets/autoregressive/minicpm-v-4_6
 - For processing large images or videos, you may need to lower `--mem-fraction-static` to leave room for image feature tensors.
 - Multi-image and high-resolution images: the image processor produces one source patch plus per-slice tile patches; each is its own `MultimodalDataItem`. No special server-side flag needed.
 - Video: decoded frame-by-frame through the same image-style slicer. No extra flag needed; pass `video_url` in the OpenAI chat completion request.
+- **Chunked Prefill**: For high-concurrency vision benchmarking with many large/sliced images, pass `--chunked-prefill-size -1` to disable prefill chunking. The default chunked-prefill path can mis-split a request across an image boundary in `mm_utils.embed_mm_inputs` and crash the server; disabling chunking sidesteps this at the cost of higher TTFT under concurrency. For interactive serving leave the default on.
 
 ## 4. Model Invocation
 
