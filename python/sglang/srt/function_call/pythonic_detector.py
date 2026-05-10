@@ -123,10 +123,27 @@ class PythonicDetector(BaseFormatDetector):
             Position of the matching closing bracket ']', or -1 if not found
         """
         bracket_count = 0
+        in_string = False
+        string_char = ""
+        escape_next = False
         for i in range(start, len(buffer)):
-            if buffer[i] == "[":
+            ch = buffer[i]
+            if escape_next:
+                escape_next = False
+                continue
+            if in_string:
+                if ch == "\\":
+                    escape_next = True
+                elif ch == string_char:
+                    in_string = False
+                continue
+            if ch == '"' or ch == "'":
+                in_string = True
+                string_char = ch
+                continue
+            if ch == "[":
                 bracket_count += 1
-            elif buffer[i] == "]":
+            elif ch == "]":
                 bracket_count -= 1
                 if bracket_count == 0:
                     return i
