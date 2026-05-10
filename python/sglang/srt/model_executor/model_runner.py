@@ -17,7 +17,6 @@ from __future__ import annotations
 
 import contextlib
 import datetime
-import gc
 import hashlib
 import inspect
 import logging
@@ -29,7 +28,7 @@ import uuid
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, List, Optional, Tuple, Union
+from typing import Any, List, Optional, Tuple, Union
 
 import torch
 import torch.distributed as dist
@@ -155,13 +154,12 @@ from sglang.srt.model_executor.piecewise_cuda_graph_runner import (
 )
 from sglang.srt.model_executor.pool_configurator import MemoryPoolConfig
 from sglang.srt.model_executor.weight_updater import WeightUpdater
-from sglang.srt.model_loader.loader import DefaultModelLoader, get_model_loader
+from sglang.srt.model_loader.loader import get_model_loader
 from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
     RemoteInstanceWeightLoaderBackend,
     register_memory_region,
     trigger_init_weights_send_group_for_remote_instance_request,
 )
-from sglang.srt.model_loader.utils import set_default_torch_dtype
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.platforms import current_platform
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
@@ -564,7 +562,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             ), "Pipeline Parallel is not compatible with this model."
 
         # For weight updates
-        self.weight_updater = WeightUpdater(tp_rank=self.tp_rank)
+        self.weight_updater = WeightUpdater(tp_rank=self.tp_rank, model_runner_ref=self)
         self._weights_send_group = {}
 
     def _build_model_config(
@@ -1630,7 +1628,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 self.expert_backup_client.update_weights(weight_name_filter)
             else:
                 # Load the missing weights from disk
-                self.update_weights_from_disk(
+                self.weight_updater.update_weights_from_disk(
                     get_global_server_args().model_path,
                     get_global_server_args().load_format,
                     weight_name_filter=weight_name_filter,
@@ -1695,80 +1693,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             "No healthy rank found for broadcasting expert location metadata. "
             "All ranks are marked as elastic_ep_rejoin."
         )
-
-    def update_weights_from_disk(
-        self,
-        model_path: str,
-        load_format: str,
-        weight_name_filter: Optional[Callable[[str], bool]] = None,
-        recapture_cuda_graph: bool = False,
-    ) -> tuple[bool, str]:
-        """Update engine weights in-place from the disk."""
-        logger.info(
-            f"Update engine weights online from disk begin. "
-            f"avail mem={get_available_gpu_memory(self.device, self.gpu_id, empty_cache=False):.2f} GB"
-        )
-
-        target_device = torch.device(self.device)
-        self.model_config.model_path = model_path
-        load_config = LoadConfig(load_format=load_format)
-
-        # Only support DefaultModelLoader for now
-        loader = get_model_loader(load_config, self.model_config)
-        if not isinstance(loader, DefaultModelLoader):
-            message = f"Failed to get model loader: {loader}."
-            return False, message
-
-        def get_weight_iter(config):
-            iter = loader._get_weights_iterator(
-                DefaultModelLoader.Source.init_new(config, self.model)
-            )
-            if weight_name_filter is not None:
-                iter = (
-                    (name, weight) for name, weight in iter if weight_name_filter(name)
-                )
-
-            return iter
-
-        def model_load_weights(model, iter):
-            loader.load_weights_and_postprocess(model, iter, target_device)
-            return model
-
-        with set_default_torch_dtype(self.model_config.dtype):
-            try:
-                iter = get_weight_iter(self.model_config)
-            except Exception as e:
-                message = f"Failed to get weights iterator: {e}."
-                return False, message
-            try:
-                model = model_load_weights(self.model, iter)
-            except Exception as e:
-                message = (
-                    f"Failed to update weights: {e}.\nRolling back to original weights."
-                )
-                del iter
-                gc.collect()
-                iter = get_weight_iter(self.model_config)
-                self.model = model_load_weights(self.model, iter)
-                return False, message
-
-        self.model = model
-        self.server_args.model_path = model_path
-        self.server_args.load_format = load_format
-        self.load_config = load_config
-
-        if recapture_cuda_graph and (
-            self.device == "cuda"
-            or self.device == "musa"
-            or (
-                current_platform.is_out_of_tree()
-                and current_platform.support_cuda_graph()
-            )
-        ):
-            self.init_device_graphs()
-
-        logger.info("Update weights end.")
-        return True, "Succeeded to update model weights."
 
     def init_weights_send_group_for_remote_instance(
         self,
