@@ -113,9 +113,9 @@ class SchedulerOutputProcessorMixin:
         Returns immediately if `return_routed_experts` was not set on the
         request, so non-opted-in reqs don't pay the host-gather cost.
 
-        When `req.routed_experts_start_len` is set, honor the caller's
-        absolute start so the response covers `[start_len, seqlen - 1)`.
-        Otherwise the full sequence is returned (`start_len = 0`).
+        Honors the caller's absolute start so the response covers
+        `[start_len, seqlen - 1)`. The default start_len is 0, which returns
+        the full sequence.
 
         Logs a soft warning if the resulting tensor's row count differs from
         the expected `seqlen - 1 - start_len`, to catch silent regressions.
@@ -125,10 +125,7 @@ class SchedulerOutputProcessorMixin:
         capturer = get_global_experts_capturer()
         if capturer is None:
             return
-        if req.routed_experts_start_len is not None:
-            start_len = req.routed_experts_start_len
-        else:
-            start_len = 0
+        start_len = req.routed_experts_start_len
         req.routed_experts = capturer.get_topk(
             req_pool_idx=req.req_pool_idx,
             seqlen=req.seqlen,

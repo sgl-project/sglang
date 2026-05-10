@@ -272,7 +272,7 @@ def compare_baseline_w_reference(baseline, reference):
 class TestRoutedExpertsStartLen(CustomTestCase):
     """Verify the `routed_experts_start_len` parameter:
 
-    - default (None) returns the full sequence
+    - default (0) returns the full sequence
     - explicit start_len crops the response and the cropped tail matches
       the corresponding tail of the full response
     """
@@ -326,25 +326,23 @@ class TestRoutedExpertsStartLen(CustomTestCase):
         meta = resp_json["meta_info"]
         return meta["prompt_tokens"] + meta["completion_tokens"]
 
-    def test_start_len_none_is_default(self):
-        """Omitting the field must match `routed_experts_start_len=None`,
+    def test_start_len_zero_is_default(self):
+        """Omitting the field must match `routed_experts_start_len=0`,
         which returns the full sequence (start_len=0)."""
         resp_default = self._send(self._build_payload()).json()
-        resp_none = self._send(
-            self._build_payload(routed_experts_start_len=None)
-        ).json()
+        resp_zero = self._send(self._build_payload(routed_experts_start_len=0)).json()
 
         rows_default = self._routed_experts(resp_default)
-        rows_none = self._routed_experts(resp_none)
+        rows_zero = self._routed_experts(resp_zero)
 
         seqlen_default = self._seqlen(resp_default)
-        seqlen_none = self._seqlen(resp_none)
-        self.assertEqual(seqlen_default, seqlen_none)
+        seqlen_zero = self._seqlen(resp_zero)
+        self.assertEqual(seqlen_default, seqlen_zero)
         self.assertEqual(rows_default.shape[0], seqlen_default - 1)
-        self.assertEqual(rows_none.shape[0], seqlen_none - 1)
+        self.assertEqual(rows_zero.shape[0], seqlen_zero - 1)
         self.assertTrue(
-            np.array_equal(rows_default, rows_none),
-            "default and explicit None must produce identical routed experts",
+            np.array_equal(rows_default, rows_zero),
+            "default and explicit 0 must produce identical routed experts",
         )
 
     def test_start_len_controls_row_count(self):

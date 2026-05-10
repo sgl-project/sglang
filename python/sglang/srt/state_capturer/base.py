@@ -149,7 +149,9 @@ class BaseTopkCapturer:
         req_to_token_pool: ReqToTokenPool,
         start_len: int = 0,
     ) -> torch.Tensor:
-        start_len = max(0, min(start_len, seqlen - 1))
+        if start_len < 0:
+            raise ValueError(f"{start_len=} must be non-negative")
+        start_len = min(start_len, seqlen - 1)
         cache_pool_idx = (
             req_to_token_pool.req_to_token[req_pool_idx][start_len : seqlen - 1]
             .cpu()

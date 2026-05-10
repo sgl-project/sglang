@@ -599,7 +599,7 @@ class Req(ReqDllmMixin):
         require_reasoning: bool = False,
         return_hidden_states: bool = False,
         return_routed_experts: bool = False,
-        routed_experts_start_len: Optional[int] = None,
+        routed_experts_start_len: int = 0,
         return_indexer_topk: bool = False,
         eos_token_ids: Optional[Set[int]] = None,
         bootstrap_host: Optional[str] = None,
