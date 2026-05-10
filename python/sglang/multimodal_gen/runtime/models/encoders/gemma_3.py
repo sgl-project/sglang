@@ -299,11 +299,10 @@ class Gemma3Attention(nn.Module):
         key = k.transpose(1, 2)
         value = v.transpose(1, 2)
 
-        min_dtype = torch.finfo(query.dtype).min
-        attn_mask = torch.zeros(
+        attn_mask = torch.ones(
             (seq_len, seq_len),
             device=hidden_states.device,
-            dtype=query.dtype,
+            dtype=torch.bool,
         )
         causal = torch.triu(
             torch.ones(
@@ -311,25 +310,15 @@ class Gemma3Attention(nn.Module):
             ),
             diagonal=1,
         )
-        attn_mask = attn_mask.masked_fill(causal, min_dtype)
+        attn_mask = attn_mask.masked_fill(causal, False)
         if self.is_sliding and self.sliding_window is not None:
             idx = torch.arange(seq_len, device=hidden_states.device)
             dist = idx[:, None] - idx[None, :]
             too_far = dist > self.sliding_window
-            attn_mask = attn_mask.masked_fill(too_far, min_dtype)
+            attn_mask = attn_mask.masked_fill(too_far, False)
 
         attn_mask = attn_mask[None, None, :, :].expand(batch_size, 1, seq_len, seq_len)
-        if attention_mask is not None:
-            padding_mask = torch.zeros(
-                (batch_size, 1, 1, seq_len),
-                device=hidden_states.device,
-                dtype=query.dtype,
-            )
-            padding_mask = padding_mask.masked_fill(
-                ~attention_mask.to(torch.bool)[:, None, None, :],
-                min_dtype,
-            )
-            attn_mask = torch.minimum(attn_mask, padding_mask)
+        attn_mask = attn_mask & attention_mask.to(torch.bool)[:, None, None, :]
 
         if query.shape[1] != key.shape[1]:
             num_key_value_groups = query.shape[1] // key.shape[1]
@@ -347,9 +336,9 @@ class Gemma3Attention(nn.Module):
             value = value.reshape(batch_size, query.shape[1], seq_len, self.head_dim)
 
         attn_output = torch.nn.functional.scaled_dot_product_attention(
-            query.contiguous(),
-            key.contiguous(),
-            value.contiguous(),
+            query,
+            key,
+            value,
             attn_mask=attn_mask,
             dropout_p=0.0,
             is_causal=False,
