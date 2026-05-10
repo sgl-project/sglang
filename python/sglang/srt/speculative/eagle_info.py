@@ -644,6 +644,10 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
 
 @dataclass
 class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
+    # For idle stubs use `create_idle_input`, not the bare ctor: `filter_batch`
+    # / `merge_batch` slice / cat `topk_p` / `topk_index` / `hidden_states` /
+    # `bonus_tokens` unconditionally.
+
     # shape: (b, topk)
     topk_p: torch.Tensor = None
     topk_index: torch.Tensor = None

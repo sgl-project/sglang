@@ -462,7 +462,7 @@ class FrozenKVMTPWorker(TpModelWorker):
             draft_extend_input = verify_output.draft_extend_input
             if (
                 self.server_args.enable_dp_attention
-                or draft_extend_input.input_ids.numel() > 0
+                or draft_extend_input.input_ids.shape[0] > 0
             ):
                 # Stash for the seed step; _run_assistant_seed_step swaps in
                 # a fresh FrozenKVMTPDraftInput for next iter.
@@ -512,7 +512,7 @@ class FrozenKVMTPWorker(TpModelWorker):
         draft_extend_input: FrozenKVMTPDraftExtendInput = batch.spec_info
         input_is_idle = batch.forward_mode.is_idle()
 
-        if not input_is_idle and draft_extend_input.input_ids.numel() == 0:
+        if not input_is_idle and draft_extend_input.input_ids.shape[0] == 0:
             # All reqs finished; stash an idle FrozenKVMTPDraftInput so the
             # next-iter draft sees a valid spec_info.
             batch = batch.copy()
