@@ -109,7 +109,9 @@ class TestBuildDumpPlan(unittest.TestCase):
             self.assertEqual(len(reads), 1)
             self.assertEqual(reads[0]["name"], "shared.weight")
             self.assertEqual(reads[0]["filename"], plan["files"][0]["filename"])
-            self.assertEqual(reads[0]["checksum"], "deadbeef")
+            self.assertEqual(reads[0]["stored_key"], "deadbeef")
+        self.assertIn("rank_checksums", plan)
+        self.assertEqual(set(plan["rank_checksums"].keys()), {"0", "1", "2", "3"})
 
     def test_per_rank_unique_tensors(self):
         # Each rank has its own tensor (different content). 4 distinct files,
@@ -275,7 +277,7 @@ class TestBuildDumpPlan(unittest.TestCase):
                 for r in plan["rank_to_reads"]["0"]:
                     loaded = fh.get_tensor(r["stored_key"])
                     self.assertEqual(
-                        PreshardedModelLoader._hash_tensor(loaded), r["checksum"]
+                        PreshardedModelLoader._hash_tensor(loaded), r["stored_key"]
                     )
                     torch.testing.assert_close(loaded, tensors[r["name"]])
 
@@ -349,6 +351,72 @@ class TestBuildDumpPlan(unittest.TestCase):
                 PreshardedModelLoader._build_dump_plan(
                     world_size=2, tmp_dir=tmp, max_file_bytes=10**12
                 )
+
+    def test_rank_checksum_deterministic(self):
+        # rank_checksums must be reproducible from the same manifest input
+        # and depend on (name, content-SHA) pairs of every tensor a rank
+        # owns. Permuting the manifest's insertion order must not change
+        # the rank checksum.
+        with tempfile.TemporaryDirectory() as tmp_a, tempfile.TemporaryDirectory() as tmp_b:
+            base_entries = {
+                "alpha.weight": {
+                    "checksum": "h_alpha",
+                    "size": 16,
+                    "dtype": "torch.float32",
+                    "shape": [4],
+                },
+                "beta.weight": {
+                    "checksum": "h_beta",
+                    "size": 16,
+                    "dtype": "torch.float32",
+                    "shape": [4],
+                },
+            }
+            self._write_manifests(tmp_a, {0: dict(base_entries)})
+            # Insertion-order-permuted copy.
+            permuted = {k: base_entries[k] for k in reversed(list(base_entries))}
+            self._write_manifests(tmp_b, {0: permuted})
+            plan_a = PreshardedModelLoader._build_dump_plan(
+                world_size=1, tmp_dir=tmp_a, max_file_bytes=10**12
+            )
+            plan_b = PreshardedModelLoader._build_dump_plan(
+                world_size=1, tmp_dir=tmp_b, max_file_bytes=10**12
+            )
+            self.assertEqual(
+                plan_a["rank_checksums"], plan_b["rank_checksums"]
+            )
+
+    def test_rank_checksum_distinguishes_content(self):
+        # Changing one tensor's content-SHA must change the rank checksum.
+        with tempfile.TemporaryDirectory() as tmp_a, tempfile.TemporaryDirectory() as tmp_b:
+            entries_a = {
+                "x.weight": {
+                    "checksum": "ha",
+                    "size": 16,
+                    "dtype": "torch.float32",
+                    "shape": [4],
+                },
+            }
+            entries_b = {
+                "x.weight": {
+                    "checksum": "hb",  # different content
+                    "size": 16,
+                    "dtype": "torch.float32",
+                    "shape": [4],
+                },
+            }
+            self._write_manifests(tmp_a, {0: entries_a})
+            self._write_manifests(tmp_b, {0: entries_b})
+            plan_a = PreshardedModelLoader._build_dump_plan(
+                world_size=1, tmp_dir=tmp_a, max_file_bytes=10**12
+            )
+            plan_b = PreshardedModelLoader._build_dump_plan(
+                world_size=1, tmp_dir=tmp_b, max_file_bytes=10**12
+            )
+            self.assertNotEqual(
+                plan_a["rank_checksums"]["0"],
+                plan_b["rank_checksums"]["0"],
+            )
 
 
 if __name__ == "__main__":
