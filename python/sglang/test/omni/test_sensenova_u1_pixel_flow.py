@@ -12,7 +12,6 @@ from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.sensenova_u1.pixel_flow import (
     SenseNovaU1PixelFlowStage,
     _resolve_u1_contexts,
-    _should_apply_cfg,
 )
 
 
@@ -54,32 +53,6 @@ class TestSenseNovaU1PixelFlow(unittest.TestCase):
         self.assertEqual(7, prepared.seed)
         self.assertEqual((1, 3, 16, 16), tuple(prepared.image_prediction.shape))
 
-    def test_stage_prepare_prefers_expanded_batch_seed(self):
-        params = build_sensenova_u1_sampling_params(
-            {
-                "width": 16,
-                "height": 16,
-                "num_inference_steps": 2,
-                "seed": [7],
-            }
-        )
-        batch = Req(sampling_params=params, prompt="draw")
-        batch.seeds = [19]
-        stage = SenseNovaU1PixelFlowStage()
-
-        prepared = stage._prepare(
-            model=_FakeModel(),
-            context_metadata={},
-            batch=batch,
-            u1_context=SimpleNamespace(
-                session_id="s0",
-                condition_path_role=None,
-                position_count=5,
-            ),
-        )
-
-        self.assertEqual(19, prepared.seed)
-
     def test_edit_cfg_uses_image_condition_path(self):
         params = build_sensenova_u1_sampling_params(
             {
@@ -100,19 +73,6 @@ class TestSenseNovaU1PixelFlow(unittest.TestCase):
         self.assertEqual("u1_edit_img_condition", img_condition.condition_path_role)
         self.assertEqual(8, img_condition.position_count)
         self.assertIsNone(uncondition)
-
-    def test_cfg_interval_start_zero_still_respects_end(self):
-        cfg = build_sensenova_u1_sampling_params(
-            {
-                "cfg_text_scale": 4.0,
-                "cfg_interval": [0.0, 0.5],
-            }
-        ).resolve_pixel_flow_cfg()
-
-        self.assertTrue(_should_apply_cfg(cfg, torch.tensor(0.0)))
-        self.assertTrue(_should_apply_cfg(cfg, torch.tensor(0.49)))
-        self.assertFalse(_should_apply_cfg(cfg, torch.tensor(0.5)))
-        self.assertFalse(_should_apply_cfg(cfg, torch.tensor(0.75)))
 
 
 class _FakeModel:

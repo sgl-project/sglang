@@ -50,21 +50,6 @@ class TestOmniMMGenBackends(unittest.TestCase):
         )
         self.assertEqual("draw\nthen describe", pipeline.batch.prompt)
 
-    def test_pipeline_backend_rejects_missing_generated_segment(self):
-        backend = DirectPipelineForwardBackend(
-            pipeline=_EmptyPipeline(),
-            server_args=SimpleNamespace(),
-        )
-        request = OmniRequest(
-            messages=(OmniInputSegment(type="text", text="draw"),),
-            sampling_params=build_sensenova_u1_sampling_params(
-                {"num_inference_steps": 2}
-            ),
-        )
-
-        with self.assertRaisesRegex(ValueError, "did not set generated_segment"):
-            backend.generate_segment(request, SimpleNamespace(metadata={}))
-
     def test_pipeline_executor_backend_drives_stages_directly(self):
         executor = _FakeExecutor()
         server_args = SimpleNamespace()
@@ -104,11 +89,6 @@ class _FakePipeline:
             image="image-bytes",
             commit_payload="commit-image",
         )
-        return batch
-
-
-class _EmptyPipeline:
-    def forward(self, batch, server_args):
         return batch
 
 

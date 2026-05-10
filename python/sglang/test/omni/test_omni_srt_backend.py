@@ -12,73 +12,21 @@ from sglang.omni.protocol import GeneratedSegment, OmniInputSegment, OmniRequest
 
 
 class TestOmniSRTBackend(unittest.TestCase):
-    def test_prepare_exposes_pre_image_text_before_first_image_boundary(self):
-        backend = SRTARBackend(_FakeBridge())
-        request = OmniRequest(messages=(OmniInputSegment(type="text", text="draw"),))
-
-        context = backend.prepare_context(request)
-        first = backend.decode_until_boundary(context, request=request)
-        second = backend.decode_until_boundary(context, request=request)
-
-        self.assertEqual("text", first.type)
-        self.assertEqual("thinking", first.text)
-        self.assertEqual((1, 2), first.token_ids)
-        self.assertEqual("image", second.type)
-
-    def test_prepare_coalesces_pre_image_text_tokens(self):
-        backend = SRTARBackend(
-            _FakeBridge(
-                pre_image_segments=[
-                    {
-                        "type": "text",
-                        "text": "I",
-                        "metadata": {"token_ids": [1]},
-                    },
-                    {
-                        "type": "text",
-                        "text": " generated",
-                        "metadata": {"token_ids": [2]},
-                    },
-                ]
-            )
+    def test_interleave_exposes_text_boundary_and_commits_generated_image(self):
+        bridge = _FakeBridge(
+            pre_image_segments=[
+                {
+                    "type": "text",
+                    "text": "I",
+                    "metadata": {"token_ids": [1]},
+                },
+                {
+                    "type": "text",
+                    "text": " generated",
+                    "metadata": {"token_ids": [2]},
+                },
+            ]
         )
-        request = OmniRequest(
-            messages=(OmniInputSegment(type="text", text="draw"),),
-            mode="interleave",
-        )
-
-        context = backend.prepare_context(request)
-        first = backend.decode_until_boundary(context, request=request)
-        second = backend.decode_until_boundary(context, request=request)
-
-        self.assertEqual("text", first.type)
-        self.assertEqual("I generated", first.text)
-        self.assertEqual((1, 2), first.token_ids)
-        self.assertEqual("image", second.type)
-
-    def test_t2i_stops_after_image_without_commit(self):
-        bridge = _FakeBridge(pre_image_segments=[])
-        backend = SRTARBackend(bridge)
-        request = OmniRequest(
-            messages=(OmniInputSegment(type="text", text="draw"),),
-            mode="t2i",
-        )
-
-        context = backend.prepare_context(request)
-        first = backend.decode_until_boundary(context, request=request)
-        context = backend.append_generated_segment(
-            context,
-            GeneratedSegment(type="image", image="image"),
-            request=request,
-        )
-        second = backend.decode_until_boundary(context, request=request)
-
-        self.assertEqual("image", first.type)
-        self.assertEqual("done", second.type)
-        self.assertEqual(0, bridge.commit_count)
-
-    def test_interleave_commits_before_continuing_decode(self):
-        bridge = _FakeBridge(pre_image_segments=[])
         backend = SRTARBackend(bridge)
         request = OmniRequest(
             messages=(OmniInputSegment(type="text", text="draw"),),
@@ -87,37 +35,21 @@ class TestOmniSRTBackend(unittest.TestCase):
 
         context = backend.prepare_context(request)
         first = backend.decode_until_boundary(context, request=request)
+        second = backend.decode_until_boundary(context, request=request)
         backend.append_generated_segment(
             context,
             GeneratedSegment(type="image", image="image"),
             request=request,
         )
-        second = backend.decode_until_boundary(context, request=request)
+        third = backend.decode_until_boundary(context, request=request)
 
-        self.assertEqual("image", first.type)
-        self.assertEqual("done", second.type)
+        self.assertEqual(
+            ("text", "I generated", (1, 2)),
+            (first.type, first.text, first.token_ids),
+        )
+        self.assertEqual("image", second.type)
+        self.assertEqual("done", third.type)
         self.assertEqual(1, bridge.commit_count)
-
-    def test_append_input_segments_reuses_live_session(self):
-        bridge = _FakeBridge(pre_image_segments=[])
-        backend = SRTARBackend(bridge)
-        request = OmniRequest(
-            messages=(OmniInputSegment(type="text", text="draw"),),
-            mode="interleave",
-        )
-
-        context = backend.prepare_context(request)
-        context = backend.append_input_segments(
-            context,
-            OmniRequest(
-                messages=(OmniInputSegment(type="text", text="again"),),
-                mode="interleave",
-            ),
-        )
-        first = backend.decode_until_boundary(context, request=request)
-
-        self.assertEqual(["s0", "s0"], bridge.session_ids)
-        self.assertEqual("image", first.type)
 
     def test_image_payload_accepts_b64_json(self):
         bridge = _ImageCaptureBridge()

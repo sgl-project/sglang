@@ -17,7 +17,7 @@ FORBIDDEN_KV_WORDS = ("allocator", "page", "slot")
 
 
 class TestOmniProtocol(unittest.TestCase):
-    def test_request_response_shapes_are_serializable(self):
+    def test_request_response_shapes_are_serializable_and_map_task_alias(self):
         request = OmniRequest(
             messages=(OmniInputSegment(type="text", text="draw a cup"),),
             model="sensenova-u1",
@@ -33,16 +33,15 @@ class TestOmniProtocol(unittest.TestCase):
 
         self.assertEqual("draw a cup", request.messages[0].text)
         self.assertEqual("image", response.to_dict()["segments"][0]["type"])
-
-    def test_task_alias_maps_to_internal_mode(self):
-        request = OmniRequest.from_payload(
-            {
-                "task": "edit",
-                "messages": [{"type": "text", "text": "edit this image"}],
-            }
+        self.assertEqual(
+            "edit",
+            OmniRequest.from_payload(
+                {
+                    "task": "edit",
+                    "messages": [{"type": "text", "text": "edit this image"}],
+                }
+            ).mode,
         )
-
-        self.assertEqual("edit", request.mode)
 
     def test_public_shapes_do_not_expose_raw_kv_names(self):
         objects = [

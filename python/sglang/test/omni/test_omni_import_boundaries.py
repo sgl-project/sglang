@@ -9,26 +9,33 @@ PYTHON_ROOT = REPO_ROOT / "python"
 
 
 class TestOmniImportBoundaries(unittest.TestCase):
-    def test_multimodal_gen_does_not_import_omni_srt_backend(self):
-        violations = _find_imports(
-            PYTHON_ROOT / "sglang" / "multimodal_gen",
-            forbidden_prefixes=(
-                "sglang.omni.backends.ar.srt",
-                "sglang.srt.omni_session",
+    def test_runtime_layers_keep_omni_import_boundaries(self):
+        cases = [
+            (
+                PYTHON_ROOT / "sglang" / "multimodal_gen",
+                (
+                    "sglang.omni.backends.ar.srt",
+                    "sglang.srt.omni_session",
+                ),
             ),
-        )
-        self.assertEqual([], _format_violations(violations))
+            (
+                PYTHON_ROOT / "sglang" / "srt",
+                (
+                    "sglang.omni.configs",
+                    "sglang.omni.coordinator",
+                    "sglang.omni.models",
+                ),
+            ),
+        ]
 
-    def test_generic_srt_does_not_import_omni_policy(self):
-        violations = _find_imports(
-            PYTHON_ROOT / "sglang" / "srt",
-            forbidden_prefixes=(
-                "sglang.omni.configs",
-                "sglang.omni.coordinator",
-                "sglang.omni.models",
-            ),
-        )
-        self.assertEqual([], _format_violations(violations))
+        for root, forbidden_prefixes in cases:
+            with self.subTest(root=root.relative_to(REPO_ROOT)):
+                violations = _find_imports(
+                    root,
+                    forbidden_prefixes=forbidden_prefixes,
+                )
+
+                self.assertEqual([], _format_violations(violations))
 
 
 def _find_imports(root: Path, *, forbidden_prefixes: tuple[str, ...]):

@@ -12,7 +12,7 @@ from sglang.srt.entrypoints.openai.serving_responses import (
 
 
 class TestOmniResponsesAdapter(unittest.TestCase):
-    def test_image_generation_input_maps_to_omni_segments(self):
+    def test_image_generation_request_maps_to_omni_payload(self):
         request = ResponsesRequest(
             model="sensenova-u1",
             tools=[{"type": "image_generation"}],
@@ -30,6 +30,10 @@ class TestOmniResponsesAdapter(unittest.TestCase):
                 }
             ],
         )
+        params = _responses_sampling_params(
+            {"sampling_params": {"num_steps": 30}, "seed": 7},
+            SimpleNamespace(size="1024x1024"),
+        )
 
         self.assertEqual(
             _responses_input_to_omni_segments(request),
@@ -41,19 +45,10 @@ class TestOmniResponsesAdapter(unittest.TestCase):
                 },
             ],
         )
-
-    def test_image_generation_tool_size_maps_to_sampling_params(self):
-        params = _responses_sampling_params(
-            {"sampling_params": {"num_steps": 30}, "seed": 7},
-            SimpleNamespace(size="1024x1024"),
-        )
-
         self.assertEqual(
             params,
             {"num_steps": 30, "width": 1024, "height": 1024, "seed": 7},
         )
-
-    def test_image_generation_action_maps_to_omni_task(self):
         self.assertEqual(
             "t2i",
             _responses_omni_task({}, SimpleNamespace(action="generate"), None),

@@ -10,33 +10,31 @@ from sglang.cli.serve import (
 
 
 class TestOmniCLIDispatch(unittest.TestCase):
-    def test_model_type_omni_is_explicit_srt_deployment(self):
-        model_type, argv = _extract_model_type_override(
-            ["--model-type", "omni", "--model-path", "sensenova-u1"]
-        )
+    def test_model_type_override_controls_dispatch_argv(self):
+        cases = [
+            (
+                ["--model-type", "omni", "--model-path", "sensenova-u1"],
+                "omni",
+                ["--model-path", "sensenova-u1"],
+            ),
+            (["--model-path", "qwen"], "auto", ["--model-path", "qwen"]),
+        ]
 
-        self.assertEqual("omni", model_type)
-        self.assertEqual(["--model-path", "sensenova-u1"], argv)
+        for argv, expected_model_type, expected_argv in cases:
+            with self.subTest(argv=argv):
+                model_type, remaining_argv = _extract_model_type_override(argv)
 
-    def test_model_type_auto_stays_default_dispatch(self):
-        model_type, argv = _extract_model_type_override(["--model-path", "qwen"])
+                self.assertEqual(expected_model_type, model_type)
+                self.assertEqual(expected_argv, remaining_argv)
 
-        self.assertEqual("auto", model_type)
-        self.assertEqual(["--model-path", "qwen"], argv)
+    def test_omni_model_type_enables_streaming_session_default(self):
+        for model_type, expected_enabled in [("omni", True), ("llm", False)]:
+            with self.subTest(model_type=model_type):
+                server_args = SimpleNamespace(enable_streaming_session=False)
 
-    def test_model_type_omni_enables_streaming_session(self):
-        server_args = SimpleNamespace(enable_streaming_session=False)
+                _enable_omni_srt_runtime_defaults(server_args, model_type)
 
-        _enable_omni_srt_runtime_defaults(server_args, "omni")
-
-        self.assertTrue(server_args.enable_streaming_session)
-
-    def test_model_type_llm_does_not_enable_streaming_session(self):
-        server_args = SimpleNamespace(enable_streaming_session=False)
-
-        _enable_omni_srt_runtime_defaults(server_args, "llm")
-
-        self.assertFalse(server_args.enable_streaming_session)
+                self.assertEqual(expected_enabled, server_args.enable_streaming_session)
 
 
 if __name__ == "__main__":
