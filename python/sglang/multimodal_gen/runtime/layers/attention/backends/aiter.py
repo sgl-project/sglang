@@ -20,7 +20,7 @@ from sglang.srt.models.deepseek_common.utils import _use_aiter_gfx95
 
 logger = logging.getLogger(__name__)
 
-_use_fp8_attn = os.environ.get("SGLANG_AITER_FP8_ATTN", "0") == "1"
+_use_fp8_attn = os.environ.get("SGLANG_DIFFUSION_AITER_FP8_ATTN", "0") == "1"
 _fp8_dtype = torch.float8_e4m3fn
 
 # ── MLA prefill ASM kernel constraints ──────────────────────────────
@@ -47,7 +47,7 @@ _MLA_PREFILL_HEAD_TILE = 8
 
 
 if _use_fp8_attn:
-    logger.info("DiT FP8 attention enabled via SGLANG_AITER_FP8_ATTN=1")
+    logger.info("DiT FP8 attention enabled via SGLANG_DIFFUSION_AITER_FP8_ATTN=1")
 
 
 def _can_use_mla_prefill(v_head_dim: int, num_heads: int) -> bool:
@@ -335,7 +335,7 @@ class AITerImpl(AttentionImpl):
     ) -> torch.Tensor:
         """
         Performs attention using one of:
-          - _mla_prefill_ps_attention (FP8, SGLANG_AITER_FP8_ATTN=1)
+          - _mla_prefill_ps_attention (FP8, SGLANG_DIFFUSION_AITER_FP8_ATTN=1)
           - flash_attn_func (BF16, default or FP8 fallback for unsupported shapes)
 
         Args:

@@ -221,6 +221,7 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
 
         # Create logits processor for the multimodal model
         self.logits_processor = LogitsProcessor(config.text_config)
+        self.capture_aux_hidden_states = False
 
         self.post_init()
 
@@ -594,9 +595,18 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
             **kwargs,
         )
 
+        # Unpack aux_hidden_states if Eagle3 capture is active
+        aux_hidden_states = None
+        if self.capture_aux_hidden_states:
+            hidden_states, aux_hidden_states = hidden_states
+
         # Process hidden states through logits processor
         return self.logits_processor(
-            input_ids, hidden_states, self.language_model.embed_tokens, forward_batch
+            input_ids,
+            hidden_states,
+            self.language_model.embed_tokens,
+            forward_batch,
+            aux_hidden_states,
         )
 
     def tie_weights(self, recompute_mapping=False):
@@ -898,6 +908,29 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
             return self.config.intermediate_size[0], self.config.hidden_size
         else:
             raise NotImplementedError()
+
+    def get_embed(self):
+        return self.language_model.embed_tokens.weight
+
+    def get_embed_and_head(self):
+        embed = self.language_model.embed_tokens.weight
+        # Gemma4 ties word embeddings, so embed_tokens serves as lm_head
+        return embed, embed
+
+    def set_eagle3_layers_to_capture(self, layer_ids: Optional[List[int]] = None):
+        self.capture_aux_hidden_states = True
+        text_config = self.config.text_config
+        if layer_ids is None:
+            num_layers = text_config.num_hidden_layers
+            self.language_model.layers_to_capture = [
+                2,
+                num_layers // 2,
+                num_layers - 3,
+            ]
+        else:
+            # we plus 1 here because in sglang, for the ith layer, it takes the output
+            # of the (i-1)th layer as aux hidden state
+            self.language_model.layers_to_capture = [val + 1 for val in layer_ids]
 
 
 EntryClass = Gemma4ForConditionalGeneration
