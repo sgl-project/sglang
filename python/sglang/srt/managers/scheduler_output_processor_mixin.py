@@ -398,11 +398,21 @@ class SchedulerOutputProcessorMixin:
         assert stride is not None, "spec-v2 result missing speculative_num_draft_tokens"
 
         for i, req in enumerate(batch.reqs):
-            # -1 because prepare_for_decode pre-claimed the bonus slot.
-            req.kv_committed_len += accept_lens[i] - 1
             predict_tokens.append(
                 next_token_ids[i * stride : i * stride + accept_lens[i]]
             )
+
+            if req.is_retracted:
+                # reset_for_retract() already zeroes committed/allocated KV.
+                continue
+
+            if req.finished():
+                # -1 because prepare_for_decode pre-claimed the bonus slot.
+                req.kv_committed_len -= 1
+                continue
+
+            # -1 because prepare_for_decode pre-claimed the bonus slot.
+            req.kv_committed_len += accept_lens[i] - 1
             req.spec_verify_ct += 1
 
             accepted_draft_tokens = result.num_accepted_drafts_per_req_cpu[i]

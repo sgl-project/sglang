@@ -995,8 +995,13 @@ class MooncakeKVManager(CommonKVManager):
                     prefill_state_indices,
                     dst_state_data_ptrs,
                 )
-        elif state_type in ["swa", "nsa"]:
-            # SWA and NSA hybrid models do not support different TP sizes yet
+        elif state_type in ["swa", "nsa", "dsv4"]:
+            # SWA / NSA / DSv4 hybrid models do not support different TP sizes
+            # yet. (DSv4 carries a flat heterogeneous state pool of
+            # SWA + compress + indexer buffers; reusing this branch routes it
+            # through the same ``_send_kvcache_generic`` path that
+            # ``get_mla_kv_ptrs_with_pp`` already handles for compressed-MLA
+            # PP/MTP layouts.)
             if (
                 target_rank_registration_info is not None
                 and not self.is_mla_backend
