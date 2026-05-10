@@ -1018,6 +1018,7 @@ class OmniSessionRuntime:
         *,
         srt_request_metadata: dict[str, Any] | None = None,
     ) -> None:
+        req.omni_internal_request = True
         metadata = srt_request_metadata or {}
         attention_math_mode = metadata.get("attention_math_mode")
         if attention_math_mode is not None:

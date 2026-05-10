@@ -368,7 +368,7 @@ class OmniSRTSchedulerExecutor:
             "process_batch_result",
         )
 
-        for _ in range(self.max_sync_steps):
+        for _ in range(self._sync_step_budget(req)):
             if req.finished():
                 self._run_idle_cleanup()
                 return
@@ -387,22 +387,27 @@ class OmniSRTSchedulerExecutor:
 
     def _run_scheduler_step(self):
         batch = self.scheduler.get_next_batch_to_run()
-        if hasattr(self.scheduler, "cur_batch"):
+        has_cur_batch = hasattr(self.scheduler, "cur_batch")
+        previous_cur_batch = getattr(self.scheduler, "cur_batch", None)
+        if has_cur_batch:
             self.scheduler.cur_batch = batch
-        if batch:
-            batch_sessions = self._batch_sessions(batch)
-            result = self.scheduler.run_batch(batch)
-            self._capture_batch_token_bindings(batch)
-            self.scheduler.process_batch_result(batch, result)
-            self._capture_session_token_bindings(batch_sessions)
-            self.sync_step_count += 1
-        elif hasattr(self.scheduler, "on_idle"):
-            self.scheduler.on_idle()
-        if hasattr(self.scheduler, "last_batch"):
-            self.scheduler.last_batch = batch
+        try:
+            if batch:
+                batch_sessions = self._batch_sessions(batch)
+                result = self.scheduler.run_batch(batch)
+                self._capture_batch_token_bindings(batch)
+                self.scheduler.process_batch_result(batch, result)
+                self._capture_session_token_bindings(batch_sessions)
+                self.sync_step_count += 1
+            elif hasattr(self.scheduler, "on_idle"):
+                self.scheduler.on_idle()
+        finally:
+            if has_cur_batch:
+                self.scheduler.cur_batch = previous_cur_batch
         return batch
 
     def _run_idle_cleanup(self) -> None:
+        self._drain_overlap_result_queue()
         for _ in range(self.max_sync_steps):
             if self._scheduler_fully_idle():
                 return
@@ -416,6 +421,24 @@ class OmniSRTSchedulerExecutor:
             batch = self._run_scheduler_step()
             if batch is None:
                 continue
+
+    def _sync_step_budget(self, req: Any) -> int:
+        sampling_params = getattr(req, "sampling_params", None)
+        max_new_tokens = int(getattr(sampling_params, "max_new_tokens", 0) or 0)
+        return max(self.max_sync_steps, max_new_tokens + 4)
+
+    def _drain_overlap_result_queue(self) -> None:
+        result_queue = getattr(self.scheduler, "result_queue", None)
+        process_batch_result = getattr(self.scheduler, "process_batch_result", None)
+        if result_queue is None or not callable(process_batch_result):
+            return
+        drained = False
+        while self._safe_len(result_queue) > 0:
+            batch, result = result_queue.popleft()
+            process_batch_result(batch, result)
+            drained = True
+        if drained and hasattr(self.scheduler, "last_batch"):
+            self.scheduler.last_batch = None
 
     def _scheduler_fully_idle(self) -> bool:
         is_fully_idle = getattr(self.scheduler, "is_fully_idle", None)

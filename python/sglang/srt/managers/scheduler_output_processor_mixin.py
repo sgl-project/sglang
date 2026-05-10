@@ -1031,6 +1031,12 @@ class SchedulerOutputProcessorMixin:
             ) = None
 
         for req in reqs:
+            if getattr(req, "omni_internal_request", False):
+                if req.finished():
+                    req.finished_output = True
+                    if req.finished_len is None:
+                        req.finished_len = len(req.output_ids)
+                continue
             if req is skip_req:
                 continue
 

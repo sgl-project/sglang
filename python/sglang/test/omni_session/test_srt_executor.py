@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
+from types import SimpleNamespace
+
 from sglang.srt.omni_session.srt_executor import OmniSRTSchedulerExecutor
 
 
@@ -25,6 +27,34 @@ def test_idle_cleanup_clears_finished_batch_references():
 
     assert scheduler.cleanup_steps == 0
     assert scheduler.is_fully_idle()
+
+
+def test_sync_execute_budget_scales_with_request_decode_length():
+    scheduler = _FakeSyncScheduler(finish_after_steps=12)
+    executor = OmniSRTSchedulerExecutor(scheduler, max_sync_steps=8)
+    req = _FakeReq(finished=False, max_new_tokens=16)
+
+    executor.execute_omni_request(
+        record=SimpleNamespace(session_id="s0"),
+        req=req,
+        state=None,
+    )
+
+    assert req.finished()
+    assert scheduler.run_steps == 12
+
+
+def test_sync_step_does_not_publish_internal_batch_as_last_batch():
+    scheduler = _FakeSyncScheduler(finish_after_steps=1)
+    executor = OmniSRTSchedulerExecutor(scheduler)
+    req = _FakeReq(finished=False)
+    scheduler._add_request_to_queue(req)
+
+    executor._run_scheduler_step()
+
+    assert req.finished()
+    assert scheduler.last_batch is None
+    assert scheduler.cur_batch is None
 
 
 class _FakeScheduler:
@@ -66,11 +96,41 @@ class _FakeBatch:
 
 
 class _FakeReq:
-    def __init__(self, *, finished):
+    def __init__(self, *, finished, max_new_tokens=0):
         self._finished = finished
+        self.rid = "r0"
+        self.sampling_params = SimpleNamespace(max_new_tokens=max_new_tokens)
 
     def finished(self):
         return self._finished
+
+
+class _FakeSyncScheduler(_FakeScheduler):
+    def __init__(self, *, finish_after_steps):
+        super().__init__()
+        self.finish_after_steps = finish_after_steps
+        self.run_steps = 0
+
+    def _add_request_to_queue(self, req):
+        self.waiting_queue.append(req)
+
+    def get_next_batch_to_run(self):
+        if self.waiting_queue:
+            self.running_batch = _FakeBatch([self.waiting_queue.pop(0)])
+            return self.running_batch
+        if self.running_batch.is_empty():
+            return None
+        return self.running_batch
+
+    def run_batch(self, batch):
+        self.run_steps += 1
+        return object()
+
+    def process_batch_result(self, batch, result):
+        if self.run_steps >= self.finish_after_steps:
+            for req in batch.reqs:
+                req._finished = True
+            self.running_batch = _FakeBatch([])
 
 
 class _TruthyEmptyQueue:
