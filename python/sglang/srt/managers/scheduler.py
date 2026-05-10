@@ -2802,11 +2802,6 @@ class Scheduler(
         if self.chunked_req is not None:
             self.chunked_req.is_chunked += 1
 
-        # Record for logging prefill stats after forward
-        self.adder = adder
-        self.can_run_list = can_run_list
-        self.running_bs = len(self.running_batch.reqs)
-
         set_time_batch(can_run_list, "set_forward_entry_time")
 
         # Create a new batch
