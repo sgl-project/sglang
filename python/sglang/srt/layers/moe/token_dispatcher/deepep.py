@@ -618,10 +618,13 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
     ):
         use_nvfp4 = use_fp8 = False
         input_global_scale = self.quant_config.get("input_global_scale", None)
+        bf16_dispatch = self.quant_config.get("bf16_dispatch", False)
         if input_global_scale is not None:
             use_nvfp4 = True
-        elif not get_moe_runner_backend().is_flashinfer_cutedsl() and (
-            not _is_npu or not envs.SGLANG_DEEPEP_BF16_DISPATCH.get()
+        elif (
+            not bf16_dispatch
+            and not get_moe_runner_backend().is_flashinfer_cutedsl()
+            and (not _is_npu or not envs.SGLANG_DEEPEP_BF16_DISPATCH.get())
         ):
             # flashinfer_cutedsl expects BF16 dispatch when NVFP4 dispatch is
             # off; its kernel quantizes to NVFP4 internally.
