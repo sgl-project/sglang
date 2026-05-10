@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import uuid
+
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.utils.common import ceil_align, is_pin_memory_available
@@ -683,6 +685,10 @@ class Req(ReqDllmMixin):
             extra_key = (
                 extra_key or ""
             ) + lora_id  # lora_id is concatenated to the extra key
+
+        # Per-request salt makes radix keys disjoint across requests → no reuse.
+        if envs.SGLANG_RADIX_DISABLE_REUSE.get():
+            extra_key = (extra_key or "") + "|noreuse:" + uuid.uuid4().hex[:16]
 
         self.extra_key = extra_key
         self.lora_id = lora_id
