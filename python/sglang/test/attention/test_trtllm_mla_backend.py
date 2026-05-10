@@ -1308,7 +1308,7 @@ class TestTRTLLMMLA(CustomTestCase):
             device = torch.device("cuda")
 
             # Create accept lengths (varying lengths for each batch)
-            accept_lengths = torch.randint(
+            num_accepted_drafts_per_req = torch.randint(
                 1, token_per_batch + 1, (batch_size,), device=device, dtype=torch.int32
             )
 
@@ -1316,7 +1316,7 @@ class TestTRTLLMMLA(CustomTestCase):
             cum_accept_lengths = torch.zeros(
                 batch_size + 1, device=device, dtype=torch.int32
             )
-            cum_accept_lengths[1:] = torch.cumsum(accept_lengths, dim=0)
+            cum_accept_lengths[1:] = torch.cumsum(num_accepted_drafts_per_req, dim=0)
 
             # Create raw output tensor (batch format)
             raw_out = torch.randn(
@@ -1334,7 +1334,7 @@ class TestTRTLLMMLA(CustomTestCase):
                 total_tokens, tp_q_head_num, v_head_dim, device=device, dtype=dtype
             )
 
-            return raw_out, output, accept_lengths, cum_accept_lengths
+            return raw_out, output, num_accepted_drafts_per_req, cum_accept_lengths
 
         # Test 1: pad_draft_extend_query_kernel basic functionality
         with self.subTest(test="pad_kernel_basic"):
@@ -1395,7 +1395,7 @@ class TestTRTLLMMLA(CustomTestCase):
             tp_q_head_num = 16
             v_head_dim = 64
 
-            raw_out, output, accept_lengths, cum_accept_lengths = (
+            raw_out, output, num_accepted_drafts_per_req, cum_accept_lengths = (
                 _create_test_output_data(
                     self, batch_size, token_per_batch, tp_q_head_num, v_head_dim
                 )
@@ -1408,7 +1408,7 @@ class TestTRTLLMMLA(CustomTestCase):
             unpad_draft_extend_output_kernel[grid](
                 raw_out_ptr=raw_out,
                 output_ptr=output,
-                accept_length_ptr=accept_lengths,
+                accept_length_ptr=num_accepted_drafts_per_req,
                 cumsum_ptr=cum_accept_lengths,
                 batch_size=batch_size,
                 token_per_batch=token_per_batch,
@@ -1419,7 +1419,7 @@ class TestTRTLLMMLA(CustomTestCase):
 
             # Verify the unpadding worked correctly
             for i in range(batch_size):
-                accept_len = accept_lengths[i].item()
+                accept_len = num_accepted_drafts_per_req[i].item()
                 output_start = cum_accept_lengths[i].item()
 
                 # Check that valid positions are copied correctly
