@@ -90,6 +90,13 @@ class MlxPendingDecode:
     caches: list  # list[list[ContiguousKVCache]]
 
 
+_MLX_QUANTIZATION_PRESETS: dict[str, tuple[int, int]] = {
+    # name -> (bits, group_size). group_size=64 matches the mlx-community convention.
+    "mlx_q4": (4, 64),
+    "mlx_q8": (8, 64),
+}
+
+
 class MlxModelRunner:
     """MLX model runner with radix-cache prefix sharing."""
 
@@ -100,6 +107,7 @@ class MlxModelRunner:
         disable_radix_cache: bool = False,
         pool_size: int | None = None,
         mem_fraction_static: float = 0.8,
+        quantization: str | None = None,
     ):
         self.model_path = model_path
         self.trust_remote_code = trust_remote_code
@@ -108,6 +116,11 @@ class MlxModelRunner:
         self._mem_fraction_static = mem_fraction_static
         # Counter used to trigger periodic mx.clear_cache() calls.
         self._decode_step_ct: int = 0
+        # On-the-fly quantization preset (e.g. "mlx_q4"). None = no on-load quantization.
+        # Pre-quantized HF repos (e.g. mlx-community/Qwen3-0.6B-4bit) load correctly
+        # regardless of this setting — mlx_lm.load() detects the config and instantiates
+        # QuantizedLinear modules directly.
+        self._quantization: str | None = quantization
 
         self._load_model()
 
@@ -180,14 +193,55 @@ class MlxModelRunner:
         ]
 
     def _load_model(self):
-        """Load model using mlx_lm."""
+        """Load model using mlx_lm. If ``self._quantization`` requests a preset
+        (e.g. ``mlx_q4``), quantize fp16 weights in-place via
+        :func:`mlx_lm.utils.quantize_model` after load.
+        """
         logger.info(f"Loading MLX model: {self.model_path}")
         start_time = time.time()
 
-        self.model, _ = mlx_lm_load(
+        # We need the config dict to pass into quantize_model so it knows tied/embedding
+        # layout. return_config=True is cheap and ignored when no quantization is requested.
+        loaded = mlx_lm_load(
             self.model_path,
             tokenizer_config={"trust_remote_code": self.trust_remote_code},
+            return_config=True,
         )
+        self.model, _tokenizer, config = loaded
+
+        if self._quantization in _MLX_QUANTIZATION_PRESETS:
+            bits, group_size = _MLX_QUANTIZATION_PRESETS[self._quantization]
+            # Skip if the model was already loaded quantized (pre-quantized HF repo).
+            already_quantized = "quantization" in (config or {})
+            if already_quantized:
+                logger.info(
+                    "MLX model is already quantized by the HF repo; "
+                    f"ignoring --quantization={self._quantization}"
+                )
+            else:
+                from mlx_lm.utils import quantize_model as _mlx_quantize_model
+
+                mem_before = mx.get_active_memory()
+                q_start = time.time()
+                logger.info(
+                    f"Quantizing MLX model on-the-fly: bits={bits} "
+                    f"group_size={group_size} (preset={self._quantization})"
+                )
+                self.model, _new_config = _mlx_quantize_model(
+                    self.model,
+                    config or {},
+                    group_size=group_size,
+                    bits=bits,
+                )
+                mx.eval(self.model.parameters())
+                mem_after = mx.get_active_memory()
+                q_time = time.time() - q_start
+                logger.info(
+                    f"Quantization complete in {q_time:.2f}s — "
+                    f"active mem: {mem_before / 1024**3:.2f} -> {mem_after / 1024**3:.2f} GB "
+                    f"({(1 - mem_after / max(mem_before, 1)) * 100:+.1f}%)"
+                )
+
         # Force-evaluate weights so mx.get_active_memory() reflects
         # actual usage before KV pool sizing.
         mx.eval(self.model.parameters())

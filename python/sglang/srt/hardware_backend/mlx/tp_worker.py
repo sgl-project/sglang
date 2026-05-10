@@ -53,6 +53,7 @@ class MlxTpModelWorker(TpModelWorker):
             trust_remote_code=self.server_args.trust_remote_code,
             disable_radix_cache=self.server_args.disable_radix_cache,
             mem_fraction_static=self.server_args.mem_fraction_static,
+            quantization=self.server_args.quantization,
         )
         if self.server_args.max_total_tokens is not None:
             init_kwargs["pool_size"] = self.server_args.max_total_tokens
