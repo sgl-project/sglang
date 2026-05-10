@@ -40,6 +40,7 @@ from sglang.srt.configs import (
     BailingHybridConfig,
     FalconH1Config,
     GraniteMoeHybridConfig,
+    InternS2PreviewConfig,
     JetNemotronConfig,
     JetVLMConfig,
     KimiLinearConfig,
@@ -2193,6 +2194,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             Qwen3NextConfig
             | Qwen3_5Config
             | Qwen3_5MoeConfig
+            | InternS2PreviewConfig
             | JetNemotronConfig
             | JetVLMConfig,
         ):
