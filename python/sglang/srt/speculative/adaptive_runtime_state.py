@@ -162,6 +162,13 @@ class AdaptiveController:
         A cuda_graph_bs entry *v* covers actual batch sizes in (prev_v, v].  We
         include *v* for *step* when that coverage interval overlaps with at least
         one BS slot whose candidate_steps contains *step*.
+
+        The global maximum cuda_graph_bs value is always included so that every
+        step's draft runner initializes with the same max_bs.  Without this,
+        steps that are only used by low-BS slots get a smaller max_bs in
+        init_cuda_graph_state(), which has been observed to cause EMA oscillation
+        at those batch sizes even though the captured BS-8 graph itself is
+        identical.
         """
         relevant_ranges: List[tuple] = []
         for i, slot_key in enumerate(self._bs_list):
@@ -185,6 +192,14 @@ class AdaptiveController:
                     result.append(v)
                     break
             prev = v
+
+        # Always include the global max so every step gets the same max_bs in
+        # its draft attention backend, regardless of which BS slots use it.
+        global_max = max(all_cuda_graph_bs)
+        if global_max not in result:
+            result.append(global_max)
+            result.sort()
+
         return result
 
     def init_states(self, cuda_graph_bs: List[int] | None = None) -> None:
