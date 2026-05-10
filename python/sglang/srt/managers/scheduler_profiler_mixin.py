@@ -38,9 +38,8 @@ class SchedulerProfilerMixin:
     def init_profiler(self: Scheduler):
         if envs.SGLANG_PROFILE_V2.get():
             self._profile_manager = ProfileManager(
-                tp_rank=self.ps.tp_rank,
+                ps=self.ps,
                 cpu_group=self.dp_tp_cpu_group,
-                gpu_id=self.ps.gpu_id,
             )
             return
 
