@@ -10,6 +10,7 @@ from contextlib import ExitStack
 from dataclasses import dataclass, field
 from typing import Any, Callable, List, Union
 
+import numpy as np
 import torch
 from setproctitle import setproctitle
 
@@ -31,11 +32,18 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_ulysses_parallel_rank,
     get_ulysses_parallel_world_size,
 )
-from sglang.multimodal_gen.runtime.entrypoints.utils import save_outputs
+from sglang.multimodal_gen.runtime.entrypoints.utils import (
+    post_process_sample,
+    save_outputs,
+)
 from sglang.multimodal_gen.runtime.loader.weight_utils import compute_weights_checksum
 from sglang.multimodal_gen.runtime.loader.weights_updater import (
     WeightsUpdater,
     get_updatable_modules,
+)
+from sglang.multimodal_gen.runtime.managers.layerwise_offload import (
+    OffloadableDiTMixin,
+    iter_materialized_weights,
 )
 from sglang.multimodal_gen.runtime.pipelines_core import (
     ComposedPipelineBase,
@@ -47,10 +55,6 @@ from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBa
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import PortArgs, ServerArgs
 from sglang.multimodal_gen.runtime.utils.common import set_cuda_arch, set_musa_arch
-from sglang.multimodal_gen.runtime.utils.layerwise_offload import (
-    OffloadableDiTMixin,
-    iter_materialized_weights,
-)
 from sglang.multimodal_gen.runtime.utils.logging_utils import (
     configure_logger,
     globally_suppress_loggers,
@@ -65,6 +69,14 @@ from sglang.srt.observability.trace import process_tracing_init, trace_set_threa
 from sglang.srt.utils.network import NetworkAddress
 
 logger = init_logger(__name__)
+
+OFFLOAD_DISABLE_RECOMMENDATION_ORDER = (
+    "vae",
+    "image_encoder",
+    "text_encoder",
+    "text_encoder_2",
+    "transformer",
+)
 
 
 @dataclass
@@ -119,7 +131,7 @@ class GPUWorker:
         # initialize the distributed environment
         maybe_init_distributed_environment_and_model_parallel(
             tp_size=self.server_args.tp_size,
-            enable_cfg_parallel=self.server_args.enable_cfg_parallel,
+            cfg_degree=self.server_args.cfg_parallel_degree or 1,
             ulysses_degree=self.server_args.ulysses_degree,
             ring_degree=self.server_args.ring_degree,
             sp_size=self.server_args.sp_degree,
@@ -192,26 +204,7 @@ class GPUWorker:
             current_platform.get_device_total_memory() / (1024**3) - peak_reserved_gb
         )
         can_stay_resident = self.get_can_stay_resident_components(remaining_gpu_mem_gb)
-        suggested_args = set()
-        component_to_arg = {
-            "vae": "--vae-cpu-offload",
-            "text_encoder": "--text-encoder-cpu-offload",
-            "text_encoder_2": "--text-encoder-cpu-offload",
-            "image_encoder": "--image-encoder-cpu-offload",
-        }
-
-        for component in can_stay_resident:
-            if component == "transformer":
-                if self.server_args.dit_layerwise_offload:
-                    suggested_args.add("--dit-layerwise-offload")
-                elif self.server_args.dit_cpu_offload:
-                    suggested_args.add("--dit-cpu-offload")
-            elif component in component_to_arg:
-                suggested_args.add(component_to_arg[component])
-
-        suggested_args_str = (
-            ", ".join(sorted(suggested_args)) if suggested_args else "None"
-        )
+        suggested_args_str = self._format_offload_disable_suggestions(can_stay_resident)
 
         pool_overhead_gb = peak_reserved_gb - peak_allocated_gb
 
@@ -223,6 +216,34 @@ class GPUWorker:
             f"Components that could stay resident (based on the last request workload): {can_stay_resident}. "
             f"Related offload server args to disable: {suggested_args_str}"
         )
+
+    def _format_offload_disable_suggestions(self, components: List[str]) -> str:
+        component_set = set(components)
+        suggestions = []
+        seen_args = set()
+
+        for component in OFFLOAD_DISABLE_RECOMMENDATION_ORDER:
+            if component not in component_set:
+                continue
+
+            arg = None
+            if component == "vae":
+                arg = "--vae-cpu-offload"
+            elif component == "image_encoder":
+                arg = "--image-encoder-cpu-offload"
+            elif component in ("text_encoder", "text_encoder_2"):
+                arg = "--text-encoder-cpu-offload"
+            elif component == "transformer":
+                if self.server_args.dit_layerwise_offload:
+                    arg = "--dit-layerwise-offload"
+                elif self.server_args.dit_cpu_offload:
+                    arg = "--dit-cpu-offload"
+
+            if arg is not None and arg not in seen_args:
+                suggestions.append(arg)
+                seen_args.add(arg)
+
+        return ", ".join(suggestions) if suggestions else "None"
 
     def execute_forward(
         self, batch: List[Req], return_req: bool = False
@@ -241,7 +262,7 @@ class GPUWorker:
                 raise ValueError(
                     "Grouped execute_forward does not support return_req=True"
                 )
-            # batched reqs is only possible with `num_outputs_per_prompt > 1` now
+            # grouped reqs currently come only from expanded num_outputs_per_prompt
             self._validate_group_forward_reqs(batch)
             return self._execute_forward_batch(batch)
 
@@ -294,6 +315,7 @@ class GPUWorker:
 
             start_time = time.monotonic()
 
+            # capture memory baseline for each req in grouped forward on rank-0
             request_metrics = [
                 item.metrics for item in log_reqs if item.metrics is not None
             ]
@@ -311,10 +333,13 @@ class GPUWorker:
                     )
                 result = forward_fn()
 
+            # disagg roles return raw Req so callers can keep and transfer intermediate tensors
+            # before converting it to OutputBatch
             if return_req and isinstance(result, Req):
                 return result
 
             output_batch = self._to_output_batch(result)
+            self._record_output_peak_memory(output_batch)
 
             output_metrics = self._iter_output_metrics(output_batch)
             if self.rank == 0 and output_metrics and not current_platform.is_cpu():
@@ -334,6 +359,8 @@ class GPUWorker:
             for metrics in output_metrics:
                 metrics.total_duration_ms = duration_ms
 
+            # file-path-only responses avoid serializing generated tensors between
+            # scheduler_client and gpu_worker.
             if req.save_output and req.return_file_paths_only:
                 save_output_paths(output_batch)
                 output_batch.output = None
@@ -343,6 +370,9 @@ class GPUWorker:
                 if torch.cuda.is_initialized():
                     torch.cuda.empty_cache()
 
+            # Keep return_frames payloads off the scheduler's tensor ZMQ path.
+            self._materialize_frame_outputs_for_return(output_batch, req)
+
             if torch.cuda.is_initialized() and output_batch.output is None:
                 torch.cuda.empty_cache()
 
@@ -350,6 +380,7 @@ class GPUWorker:
                 if not req.is_warmup:
                     PerformanceLogger.log_request_summary(metrics=output_batch.metrics)
 
+            # dump per-request perf report to the server-mode file path.
             if (
                 req.perf_dump_path is not None
                 and not req.is_warmup
@@ -371,7 +402,83 @@ class GPUWorker:
             if output_batch is None:
                 output_batch = OutputBatch()
             output_batch.error = f"Error executing {error_context}: {e}"
+            self._record_output_peak_memory(output_batch)
+            # clean cache if OOM
+            if torch.cuda.is_initialized():
+                torch.cuda.empty_cache()
         return output_batch
+
+    def _materialize_frame_outputs_for_return(
+        self, output_batch: OutputBatch, req: Req
+    ) -> None:
+        if self.rank != 0 or output_batch.output is None or not req.return_frames:
+            return
+
+        if (
+            os.environ.get("SGLANG_DIFFUSION_SYNC_STAGE_PROFILING", "0") == "1"
+            and torch.cuda.is_initialized()
+        ):
+            torch.cuda.synchronize()
+        start_time = time.perf_counter()
+        output_batch.output = [
+            self._materialize_frame_output(output, output_batch, req)
+            for output in output_batch.output
+        ]
+        if output_batch.metrics is not None:
+            if (
+                os.environ.get("SGLANG_DIFFUSION_SYNC_STAGE_PROFILING", "0") == "1"
+                and torch.cuda.is_initialized()
+            ):
+                torch.cuda.synchronize()
+            output_batch.metrics.record_stage(
+                "GPUWorker.frame_materialize_for_return",
+                time.perf_counter() - start_time,
+            )
+
+    @staticmethod
+    def _materialize_frame_output(
+        output: Any, output_batch: OutputBatch, req: Req
+    ) -> np.ndarray:
+        if (
+            isinstance(output, torch.Tensor)
+            and not req.enable_frame_interpolation
+            and not req.enable_upscaling
+        ):
+            if output.dim() == 3:
+                output = output.unsqueeze(1)
+            output = (output * 255).clamp(0, 255).to(torch.uint8)
+            return output.permute(1, 2, 3, 0).cpu().numpy()
+
+        if (
+            isinstance(output, np.ndarray)
+            and output.dtype == np.uint8
+            and output.ndim == 4
+            and output.shape[-1] in (1, 3, 4)
+        ):
+            return output
+
+        frames = post_process_sample(
+            output,
+            req.data_type,
+            req.fps,
+            save_output=False,
+            audio_sample_rate=output_batch.audio_sample_rate,
+            output_compression=req.output_compression,
+            enable_frame_interpolation=req.enable_frame_interpolation,
+            frame_interpolation_exp=req.frame_interpolation_exp,
+            frame_interpolation_scale=req.frame_interpolation_scale,
+            frame_interpolation_model_path=req.frame_interpolation_model_path,
+            enable_upscaling=req.enable_upscaling,
+            upscaling_model_path=req.upscaling_model_path,
+            upscaling_scale=req.upscaling_scale,
+        )
+        return np.asarray(frames)
+
+    def _record_output_peak_memory(self, output_batch: OutputBatch) -> None:
+        if self.rank != 0 or current_platform.is_cpu():
+            return
+        peak_reserved_bytes = torch.get_device_module().max_memory_reserved()
+        output_batch.peak_memory_mb = peak_reserved_bytes / (1024**2)
 
     def _forward_group(self, batch: list[Req]) -> OutputBatch:
         assert self.pipeline is not None
@@ -383,12 +490,32 @@ class GPUWorker:
         if self.rank != 0 or output_batch.output is None:
             return
 
+        dynamic_output_paths = None
+        if req.extra:
+            dynamic_output_paths = req.extra.get("dynamic_batch_output_paths")
+        if dynamic_output_paths is not None and (
+            len(dynamic_output_paths) != len(output_batch.output)
+        ):
+            logger.warning(
+                "dynamic_batch_output_paths length mismatch (got=%d, expected=%d). "
+                "Falling back to merged request output file naming.",
+                len(dynamic_output_paths),
+                len(output_batch.output),
+            )
+            dynamic_output_paths = None
+
+        if dynamic_output_paths is not None:
+            build_output_path = lambda idx: dynamic_output_paths[idx]
+        else:
+            num_outputs = len(output_batch.output)
+            build_output_path = lambda idx: req.output_file_path(num_outputs, idx)
+
         output_batch.output_file_paths = save_outputs(
             output_batch.output,
             req.data_type,
             req.fps,
             True,
-            lambda idx: req.output_file_path(len(output_batch.output), idx),
+            build_output_path,
             audio=output_batch.audio,
             audio_sample_rate=output_batch.audio_sample_rate,
             output_compression=req.output_compression,
@@ -438,6 +565,7 @@ class GPUWorker:
         first_req = reqs[0]
         shared_output_fields = (
             "save_output",
+            "return_frames",
             "return_file_paths_only",
             "data_type",
             "fps",
@@ -607,9 +735,9 @@ class GPUWorker:
         if not self.pipeline:
             return can_stay_resident
 
-        # Map memory_usage keys to server_args offload flags
-        # If the flag is False, the component is ALREADY resident, so we don't suggest it.
-        # If the flag is True, it is currently offloaded, so it's a candidate to "stay resident".
+        # Map memory_usage keys to server_args offload flags.
+        # If the flag is False, the component is already resident, so we do not suggest it.
+        # If the flag is True, it is currently offloaded, so it is a candidate to stay resident.
         offload_flags = {
             "transformer": self.server_args.dit_cpu_offload
             or self.server_args.dit_layerwise_offload,
@@ -619,10 +747,14 @@ class GPUWorker:
             "image_encoder": self.server_args.image_encoder_cpu_offload,
         }
 
-        for name, usage in self.pipeline.memory_usages.items():
+        for name in OFFLOAD_DISABLE_RECOMMENDATION_ORDER:
             # Only consider components that are currently configured to be offloaded
             is_offload_configured = offload_flags.get(name, False)
             if not is_offload_configured:
+                continue
+
+            usage = self.pipeline.memory_usages.get(name)
+            if usage is None:
                 continue
 
             if usage <= remaining_gpu_mem_gb:

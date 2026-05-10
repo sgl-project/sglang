@@ -570,7 +570,7 @@ class DFlashWorker:
 
         block_ids = self._draft_block_ids_buf[:bs]
         block_ids.fill_(int(self._mask_token_id))
-        block_ids[:, 0].copy_(draft_input.verified_id.to(torch.long))
+        block_ids[:, 0].copy_(draft_input.bonus_tokens.to(torch.long))
 
         noise_embedding = embed_module(block_ids)
         input_embeds = noise_embedding.view(-1, noise_embedding.shape[-1])
@@ -1163,7 +1163,7 @@ class DFlashWorker:
                 model_worker_batch.extend_seq_lens
             )
             draft_input = DFlashDraftInput(
-                verified_id=next_token_ids.to(torch.int64),
+                bonus_tokens=next_token_ids.to(torch.int64),
                 target_hidden=logits_output.hidden_states,
                 ctx_lens=extend_seq_lens,
                 draft_seq_lens=(
@@ -1213,7 +1213,7 @@ class DFlashWorker:
         )
 
         (
-            new_verified_id,
+            new_bonus_tokens,
             commit_lens,
             next_target_hidden,
             num_accepted_drafts_per_req_cpu,
@@ -1232,7 +1232,7 @@ class DFlashWorker:
 
         # Update draft state for the next iteration. Also materialize the committed verify tokens
         # into the draft KV cache immediately so radix cache entries are safe to reuse.
-        draft_input.verified_id = new_verified_id
+        draft_input.bonus_tokens = new_bonus_tokens
         draft_input.target_hidden = next_target_hidden
         draft_input.ctx_lens = commit_lens
         self._append_target_hidden_to_draft_kv(batch, draft_input)
@@ -1249,7 +1249,7 @@ class DFlashWorker:
 
         return GenerationBatchResult(
             logits_output=logits_output,
-            next_token_ids=new_verified_id,
+            next_token_ids=new_bonus_tokens,
             num_accepted_drafts=num_accepted_drafts,
             num_accepted_drafts_per_req_cpu=num_accepted_drafts_per_req_cpu,
             can_run_cuda_graph=can_run_cuda_graph,

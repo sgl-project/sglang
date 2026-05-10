@@ -22,6 +22,7 @@ import torch
 
 from sglang.srt.distributed import (
     attention_tensor_model_parallel_all_reduce,
+    attention_tensor_model_parallel_quant_all_reduce,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
     get_tp_group,
@@ -1000,9 +1001,18 @@ class CommunicateWithAllReduceAndLayerNormFn:
                 handled = True
 
             if not handled:
-                hidden_states = attention_tensor_model_parallel_all_reduce(
-                    hidden_states
+                quantize_communications = (
+                    not forward_batch.forward_mode.is_decode_or_idle()
+                    and get_global_server_args().enable_quant_communications
                 )
+                if quantize_communications:
+                    hidden_states = attention_tensor_model_parallel_quant_all_reduce(
+                        hidden_states
+                    )
+                else:
+                    hidden_states = attention_tensor_model_parallel_all_reduce(
+                        hidden_states
+                    )
                 if _is_npu and context.cache is not None:
                     _ = prepare_weight_cache(hidden_states, context.cache)
                 hidden_states, residual = layernorm(hidden_states, residual)

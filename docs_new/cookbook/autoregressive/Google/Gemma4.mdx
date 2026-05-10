@@ -94,6 +94,7 @@ For the full Docker setup and other installation methods, please refer to the [o
 
 - SGLang automatically selects the Triton attention backend for Gemma 4 models (required for bidirectional image-token attention during prefill).
 - For the 26B-A4B MoE model, consider `--tp 2` for high-throughput workloads.
+- **Speculative Decoding (MTP)**: Each Gemma 4 variant ships with a paired `*-assistant` draft model that enables NEXTN multi-token prediction. Enable it via the selector above, or pass `--speculative-algorithm NEXTN --speculative-draft-model-path google/gemma-4-<variant>-it-assistant --speculative-num-steps 5 --speculative-num-draft-tokens 6 --speculative-eagle-topk 1`. MTP can significantly reduce latency for interactive use cases. The 26B-A4B MoE model requires `--tp 2` when MTP is enabled.
 - Hardware requirements:
 
 <table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
@@ -157,6 +158,60 @@ sglang serve --model-path google/gemma-4-26B-A4B-it \
   --reasoning-parser gemma4 \
   --tool-call-parser gemma4 \
   --host 0.0.0.0 --port 30000
+```
+
+#### Speculative Decoding (MTP) Server Commands
+
+Each Gemma 4 variant ships with a paired `*-assistant` draft model for NEXTN multi-token prediction. Use the commands below to enable MTP for the corresponding target model. These match the configuration generated when you toggle **Speculative Decoding (MTP) → Enabled** in the [interactive selector](#31-basic-configuration).
+
+```bash Command
+# Gemma 4 E2B + MTP
+sglang serve \
+  --model-path google/gemma-4-E2B-it \
+  --speculative-algorithm NEXTN \
+  --speculative-draft-model-path google/gemma-4-E2B-it-assistant \
+  --speculative-num-steps 5 \
+  --speculative-num-draft-tokens 6 \
+  --speculative-eagle-topk 1 \
+  --mem-fraction-static 0.85
+```
+
+```bash Command
+# Gemma 4 E4B + MTP
+sglang serve \
+  --model-path google/gemma-4-E4B-it \
+  --speculative-algorithm NEXTN \
+  --speculative-draft-model-path google/gemma-4-E4B-it-assistant \
+  --speculative-num-steps 5 \
+  --speculative-num-draft-tokens 6 \
+  --speculative-eagle-topk 1 \
+  --mem-fraction-static 0.85
+```
+
+```bash Command
+# Gemma 4 31B + MTP
+sglang serve \
+  --model-path google/gemma-4-31B-it \
+  --tp-size 2 \
+  --speculative-algorithm NEXTN \
+  --speculative-draft-model-path google/gemma-4-31B-it-assistant \
+  --speculative-num-steps 5 \
+  --speculative-num-draft-tokens 6 \
+  --speculative-eagle-topk 1 \
+  --mem-fraction-static 0.85
+```
+
+```bash Command
+# Gemma 4 26B-A4B + MTP
+sglang serve \
+  --model-path google/gemma-4-26B-A4B-it \
+  --tp-size 2 \
+  --speculative-algorithm NEXTN \
+  --speculative-draft-model-path google/gemma-4-26B-A4B-it-assistant \
+  --speculative-num-steps 5 \
+  --speculative-num-draft-tokens 6 \
+  --speculative-eagle-topk 1 \
+  --mem-fraction-static 0.85
 ```
 
 ### 4.1 Basic Usage
@@ -1247,12 +1302,12 @@ Median ITL (ms):                         29.31
 
 **gemma-4-E2B-it**
 ```shell Command
-$ python -m sglang.bench_one_batch --correct --model gg-hf-gg/gemma-4-E2B-it ....
+$ python -m sglang.bench_one_batch --correct --model google/gemma-4-E2B-it ....
 prefill logits (final): tensor([[-25.3063,  -2.5718, -10.3674,  ..., -25.3779, -25.5181, -25.2337]],
        device='cuda:0')
 ....
 
-$ python scripts/playground/reference_hf.py --model-path gg-hf-gg/gemma-4-E2B-it
+$ python scripts/playground/reference_hf.py --model-path google/gemma-4-E2B-it
 ....
 prefill logits (final) tensor([-25.3281,  -2.1367, -10.2266,  ..., -25.4375, -25.5000, -25.2500],
        device='cuda:0', dtype=torch.float16)
@@ -1262,12 +1317,12 @@ prefill logits (final) tensor([-25.3281,  -2.1367, -10.2266,  ..., -25.4375, -25
 **gemma-4-E4B-it**
 
 ```shell Command
-$ python -m sglang.bench_one_batch --correct --model gg-hf-gg/gemma-4-E4B-it ....
+$ python -m sglang.bench_one_batch --correct --model google/gemma-4-E4B-it ....
 prefill logits (final): tensor([[-17.6478,   7.9901,  -5.6505,  ..., -17.5658, -17.6478, -17.7293]],
        device='cuda:0')
 ....
 
-$ python scripts/playground/reference_hf.py --model-path gg-hf-gg/gemma-4-E4B-it
+$ python scripts/playground/reference_hf.py --model-path google/gemma-4-E4B-it
 ....
 prefill logits (final) tensor([-17.5625,   8.0469,  -5.5742,  ..., -17.4688, -17.5625, -17.6719],
        device='cuda:0', dtype=torch.float16)
@@ -1276,12 +1331,12 @@ prefill logits (final) tensor([-17.5625,   8.0469,  -5.5742,  ..., -17.4688, -17
 
 **gemma-4-31B-it**
 ```shell Command
-$ python -m sglang.bench_one_batch --correct --model gg-hf-gg/gemma-4-31B-it ....
+$ python -m sglang.bench_one_batch --correct --model google/gemma-4-31B-it ....
 prefill logits (final): tensor([[-2.0748,  1.1245, -7.4356,  ..., -2.1059, -2.1525, -2.2303]],
        device='cuda:0')
 ....
 
-$ python scripts/playground/reference_hf.py --model-path gg-hf-gg/gemma-4-31B-it
+$ python scripts/playground/reference_hf.py --model-path google/gemma-4-31B-it
 ....
 prefill logits (final) tensor([-2.1133,  1.2656, -7.4766,  ..., -2.1523, -2.2012, -2.2695],
        device='cuda:0', dtype=torch.float16)
