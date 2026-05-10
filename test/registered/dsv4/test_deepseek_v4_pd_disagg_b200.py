@@ -1,8 +1,11 @@
-"""B200 per-commit CI: DeepSeek-V4-Flash PD disaggregation (NIXL + Balanced).
+"""B200 per-commit CI: DeepSeek-V4-Flash PD disaggregation (NIXL + LowLatency).
 
-Launches two TP=4/DP=4 servers (prefill + decode) with DeepEP + dp-attention
-and NIXL KV transfer. Validates end-to-end accuracy via GSM8K through
-the load balancer.
+Launches two TP=4 servers (prefill + decode) with FP4 MoE (flashinfer_mxfp4)
++ EAGLE speculative decoding and NIXL KV transfer. Validates end-to-end
+accuracy via GSM8K through the load balancer.
+
+Uses LowLatency config (no DeepEP) to avoid DeepEP internode kernel
+compilation issues on CI runners.
 
 Registry: stage-c-test-dsv4-8-gpu-b200 (per-commit, 8x B200: 4 prefill + 4 decode)
 """
@@ -24,15 +27,10 @@ register_cuda_ci(est_time=1800, suite="stage-c-test-dsv4-8-gpu-b200")
 
 MODEL = "deepseek-ai/DeepSeek-V4-Flash"
 SERVER_LAUNCH_TIMEOUT = 3600
-DEEPEP_CONFIG = '{"normal_dispatch":{"num_sms":96},"normal_combine":{"num_sms":96}}'
-
-_DEEPEP_ENV = {
-    "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "1024",
-}
 
 
 class TestDSV4FlashPDDisaggB200(PDDisaggregationServerBase):
-    """PD disaggregation: TP=4, DP=4, DeepEP + dp-attention + NIXL on 8x B200."""
+    """PD disaggregation: TP=4, FP4 mxfp4 + EAGLE + NIXL on 8x B200."""
 
     @classmethod
     def setUpClass(cls):
@@ -66,27 +64,24 @@ class TestDSV4FlashPDDisaggB200(PDDisaggregationServerBase):
             "0",
             "--tp",
             "4",
-            "--dp",
+            "--moe-runner-backend",
+            "flashinfer_mxfp4",
+            "--speculative-algorithm",
+            "EAGLE",
+            "--speculative-num-steps",
+            "3",
+            "--speculative-eagle-topk",
+            "1",
+            "--speculative-num-draft-tokens",
             "4",
-            "--enable-dp-attention",
-            "--moe-a2a-backend",
-            "deepep",
-            "--deepep-config",
-            DEEPEP_CONFIG,
+            "--chunked-prefill-size",
+            "4096",
             "--cuda-graph-max-bs",
             "128",
             "--max-running-requests",
             "256",
             "--mem-fraction-static",
             "0.7",
-            "--speculative-algorithm",
-            "EAGLE",
-            "--speculative-num-steps",
-            "1",
-            "--speculative-eagle-topk",
-            "1",
-            "--speculative-num-draft-tokens",
-            "2",
             *cls.transfer_backend,
             *cls.rdma_devices,
         ]
@@ -95,7 +90,6 @@ class TestDSV4FlashPDDisaggB200(PDDisaggregationServerBase):
             cls.prefill_url,
             timeout=SERVER_LAUNCH_TIMEOUT,
             other_args=prefill_args,
-            env=_DEEPEP_ENV,
         )
 
     @classmethod
@@ -108,27 +102,24 @@ class TestDSV4FlashPDDisaggB200(PDDisaggregationServerBase):
             "4",
             "--tp",
             "4",
-            "--dp",
+            "--moe-runner-backend",
+            "flashinfer_mxfp4",
+            "--speculative-algorithm",
+            "EAGLE",
+            "--speculative-num-steps",
+            "3",
+            "--speculative-eagle-topk",
+            "1",
+            "--speculative-num-draft-tokens",
             "4",
-            "--enable-dp-attention",
-            "--moe-a2a-backend",
-            "deepep",
-            "--deepep-config",
-            DEEPEP_CONFIG,
+            "--chunked-prefill-size",
+            "4096",
             "--cuda-graph-max-bs",
             "128",
             "--max-running-requests",
             "256",
             "--mem-fraction-static",
             "0.7",
-            "--speculative-algorithm",
-            "EAGLE",
-            "--speculative-num-steps",
-            "1",
-            "--speculative-eagle-topk",
-            "1",
-            "--speculative-num-draft-tokens",
-            "2",
             *cls.transfer_backend,
             *cls.rdma_devices,
         ]
@@ -137,7 +128,6 @@ class TestDSV4FlashPDDisaggB200(PDDisaggregationServerBase):
             cls.decode_url,
             timeout=SERVER_LAUNCH_TIMEOUT,
             other_args=decode_args,
-            env=_DEEPEP_ENV,
         )
 
     def test_gsm8k(self):
