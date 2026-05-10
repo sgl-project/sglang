@@ -8,6 +8,7 @@ from sglang.srt.configs.dots_vlm import DotsVLMConfig
 from sglang.srt.configs.exaone import ExaoneConfig
 from sglang.srt.configs.falcon_h1 import FalconH1Config
 from sglang.srt.configs.granitemoehybrid import GraniteMoeHybridConfig
+from sglang.srt.configs.interns2preview import InternS2PreviewConfig
 from sglang.srt.configs.janus_pro import MultiModalityConfig
 from sglang.srt.configs.jet_nemotron import JetNemotronConfig
 from sglang.srt.configs.jet_vlm import JetVLMConfig
@@ -15,6 +16,7 @@ from sglang.srt.configs.kimi_k25 import KimiK25Config
 from sglang.srt.configs.kimi_linear import KimiLinearConfig
 from sglang.srt.configs.kimi_vl import KimiVLConfig
 from sglang.srt.configs.kimi_vl_moonvit import MoonViTConfig
+from sglang.srt.configs.laguna import LagunaConfig
 from sglang.srt.configs.lfm2 import Lfm2Config
 from sglang.srt.configs.lfm2_moe import Lfm2MoeConfig
 from sglang.srt.configs.lfm2_vl import Lfm2VlConfig
@@ -52,9 +54,11 @@ __all__ = [
     "Olmo3Config",
     "KimiLinearConfig",
     "KimiK25Config",
+    "LagunaConfig",
     "Qwen3NextConfig",
     "Qwen3_5Config",
     "Qwen3_5MoeConfig",
+    "InternS2PreviewConfig",
     "DotsVLMConfig",
     "DotsOCRConfig",
     "FalconH1Config",
