@@ -847,6 +847,10 @@ class ServerArgs:
         # Validate PD disaggregation flags early (before dummy-model short-circuit).
         self._handle_pd_disaggregation()
 
+        # Validate --prefill-only-disable-kv-cache args early (before dummy-model
+        # short-circuit). The backend check is run later after backends settle.
+        self._validate_prefill_only_disable_kv_cache_args()
+
         if self.model_path.lower() in ["none", "dummy"]:
             # Skip for dummy models
             return
@@ -3227,11 +3231,12 @@ class ServerArgs:
                 "Pipeline parallelism is incompatible with overlap schedule."
             )
 
-    def _handle_prefill_only_disable_kv_cache(self):
-        """Validate --prefill-only-disable-kv-cache constraints.
+    def _validate_prefill_only_disable_kv_cache_args(self):
+        """Validate --prefill-only-disable-kv-cache flag/precondition constraints.
 
-        Must run after _handle_multi_item_scoring() so that the final attention
-        backend and chunked_prefill_size are in effect.
+        Runs before the dummy-model short-circuit so misuse is rejected even
+        for dummy models. Backend resolution is checked separately by
+        _handle_prefill_only_disable_kv_cache after backends settle.
         """
         if not self.prefill_only_disable_kv_cache:
             return
@@ -3294,6 +3299,15 @@ class ServerArgs:
                 "--prefill-only-disable-kv-cache is incompatible with --enable-hisparse: "
                 "HiSparse uses a dedicated pool family that is not the no-op MHA pool."
             )
+
+    def _handle_prefill_only_disable_kv_cache(self):
+        """Validate --prefill-only-disable-kv-cache backend constraint.
+
+        Must run after _handle_multi_item_scoring() so the final prefill
+        attention backend is in effect.
+        """
+        if not self.prefill_only_disable_kv_cache:
+            return
 
         prefill_backend, _ = self.get_attention_backends()
         if prefill_backend not in ("fa3", "fa4"):
