@@ -674,7 +674,7 @@ class MultiLayerEagleWorker(TpModelWorker):
 
         input_is_idle = batch.forward_mode.is_idle()
 
-        if not input_is_idle and draft_extend_input.input_ids.numel() == 0:
+        if not input_is_idle and draft_extend_input.input_ids.shape[0] == 0:
             batch = batch.copy()
             batch.prepare_for_idle()
             hidden_size = (
