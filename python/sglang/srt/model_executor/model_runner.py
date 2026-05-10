@@ -17,7 +17,6 @@ from __future__ import annotations
 
 import contextlib
 import datetime
-import hashlib
 import inspect
 import logging
 import os
@@ -26,7 +25,6 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Optional, Tuple, Union
 
 import torch
@@ -122,6 +120,10 @@ from sglang.srt.model_executor.forward_batch_info import (
     PPProxyTensors,
 )
 from sglang.srt.model_executor.hook_manager import register_forward_hooks
+from sglang.srt.model_executor.kernel_warmup import (
+    _flashinfer_autotune_cache_path,
+    _should_run_flashinfer_autotune,
+)
 from sglang.srt.model_executor.model_runner_kv_cache_mixin import (
     ModelRunnerKVCacheMixin,
 )
@@ -1788,7 +1790,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if self.device != "cuda":
             return
 
-        if self._should_run_flashinfer_autotune():
+        if _should_run_flashinfer_autotune(
+            server_args=self.server_args,
+            spec_algorithm=self.spec_algorithm,
+            is_draft_worker=self.is_draft_worker,
+        ):
             self._flashinfer_autotune()
 
     def _pre_initialize_flashinfer_allreduce_workspace(self):
@@ -1812,51 +1818,23 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             dtype=self.dtype,
         )
 
-    def _should_run_flashinfer_autotune(self) -> bool:
-        """Check if flashinfer autotune should be run."""
-        if self.server_args.disable_flashinfer_autotune:
-            return False
-
-        # CuteDSL v1 (cutedsl runner + deepep a2a) bypasses MoeRunner and must not
-        # be autotuned -- its _dummy_run would dispatch more tokens per rank than
-        # SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK, tripping a DeepEP assert.
-        # Read server_args directly to avoid depending on initialize_moe_config()
-        # having already populated the MoE backend globals.
-        if (
-            self.server_args.moe_runner_backend == "flashinfer_cutedsl"
-            and self.server_args.moe_a2a_backend == "deepep"
-        ):
-            return False
-
-        backend_str = self.server_args.moe_runner_backend
-
-        # TODO smor- support other cases for flashinfer autotune, such as, mamba backend
-
-        if backend_str not in [
-            "flashinfer_trtllm",
-            # TODO: Enable for flashinfer_trtllm_routed once https://github.com/flashinfer-ai/flashinfer/issues/2749 is fixed.
-            # "flashinfer_trtllm_routed",
-            "flashinfer_mxfp4",
-            "flashinfer_cutedsl",
-            # TODO: flashinfer_cutlass will cause some flashinfer compilation errors. To be fixed.
-            # "flashinfer_cutlass",
-        ]:
-            return False
-
-        major, _ = torch.cuda.get_device_capability()
-        if major < 9:
-            return False
-
-        if self.spec_algorithm.is_speculative():
-            return not self.is_draft_worker
-
-        return True
-
     def _flashinfer_autotune(self):
         """Run flashinfer autotune."""
         from flashinfer.autotuner import autotune
 
-        cache_path = self._flashinfer_autotune_cache_path()
+        cache_path = _flashinfer_autotune_cache_path(
+            server_args=self.server_args,
+            model_config=self.model_config,
+            dtype=self.dtype,
+            device=self.device,
+            tp_rank=self.tp_rank,
+            tp_size=self.tp_size,
+            pp_rank=self.pp_rank,
+            pp_size=self.pp_size,
+            dp_rank=self.dp_rank,
+            dp_size=self.dp_size,
+            moe_ep_size=self.moe_ep_size,
+        )
         logger.info("Running FlashInfer autotune with cache: %s", cache_path)
 
         # Run warmup on the non-default stream to avoid NCCL 2.29+ cudaMemcpyBatchAsync
@@ -1867,42 +1845,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 self._dummy_run(batch_size=self.req_to_token_pool.size)
         torch.cuda.current_stream().wait_stream(self.forward_stream)
         logger.info("FlashInfer autotune completed.")
-
-    def _flashinfer_autotune_cache_path(self) -> Path:
-        import flashinfer
-
-        major, minor = torch.cuda.get_device_capability(self.device)
-        arch = f"sm{major}{minor}"
-        flashinfer_version = getattr(flashinfer, "__version__", "unknown")
-
-        server_args = self.server_args
-        model_key = "|".join(
-            [
-                str(server_args.model_path),
-                str(self.dtype),
-                str(server_args.quantization),
-                str(server_args.moe_runner_backend),
-                str(self.tp_size),
-                str(self.pp_size),
-                str(self.dp_size),
-                str(self.moe_ep_size),
-                str(self.model_config.hf_config.__class__.__name__),
-            ]
-        )
-        cache_key = hashlib.sha256(model_key.encode()).hexdigest()[:16]
-        cache_dir = (
-            Path(envs.SGLANG_CACHE_DIR.get())
-            / "flashinfer"
-            / "autotune"
-            / flashinfer_version
-            / arch
-            / cache_key
-        )
-        cache_dir.mkdir(parents=True, exist_ok=True)
-        return (
-            cache_dir
-            / f"rank_tp{self.tp_rank}_pp{self.pp_rank}_dp{self.dp_rank or 0}.json"
-        )
 
     def _dummy_run(self, batch_size: int, run_ctx=None):
         """Run a dummy forward pass for warmup/profiling."""
