@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Opaque handles exchanged across SRT-owned omni_session boundaries."""
+"""Opaque handles exchanged across SRT-owned omni_session boundaries"""
 
 from dataclasses import dataclass, field
 from typing import Any
@@ -22,7 +22,7 @@ class OmniSessionHandle:
 
 @dataclass(frozen=True, slots=True)
 class OmniSRTKVTokenBinding:
-    """Opaque SRT request token locations for omni model-side cache adapters."""
+    """Opaque SRT request token locations for omni model-side cache policies"""
 
     session_id: str
     request_id: str
@@ -33,7 +33,7 @@ class OmniSRTKVTokenBinding:
 
 @dataclass(slots=True)
 class OmniContextHandle:
-    """Reference to one prepared AR-side context stream."""
+    """Reference to one prepared AR-side context stream"""
 
     request_id: str
     token_count: int
@@ -43,7 +43,7 @@ class OmniContextHandle:
 
 @dataclass(slots=True)
 class OmniContextBundle:
-    """Main and CFG condition path contexts prepared from the same user turn."""
+    """Main and CFG condition path contexts prepared from the same user turn"""
 
     full: OmniContextHandle
     text_cfg: OmniContextHandle

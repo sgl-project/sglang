@@ -41,7 +41,8 @@ Run the WebUI locally:
 python -m sglang.omni.webui.server \
   --host 127.0.0.1 \
   --port 7860 \
-  --api-base http://127.0.0.1:30000
+  --api-base http://127.0.0.1:30000 \
+  --served-model sensenova/SenseNova-U1-8B-MoT
 ```
 
 Open:
@@ -50,8 +51,10 @@ Open:
 http://127.0.0.1:7860
 ```
 
-The UI defaults to `1024x1024`, matching U1's image sampling defaults. Custom
-width and height values should be multiples of 32.
+The UI displays the served model from `--served-model`, while requests use
+`--request-model` for the API payload. It defaults to `1024x1024`, matching
+U1's image sampling defaults. Custom width and height values should be multiples
+of 32.
 
 ## Multi-Turn Flow
 
@@ -76,6 +79,7 @@ The UI server proxies only the endpoints it needs:
 
 | Local UI endpoint | Omni server endpoint |
 | --- | --- |
+| `GET /api/config` | local UI config |
 | `GET /api/health` | `GET /health` |
 | `POST /api/omni/generate` | `POST /v1/omni/generate` |
 | `POST /api/omni/close` | `POST /v1/omni/sessions/{session_id}/close` |

@@ -10,11 +10,11 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any
 
-from sglang.srt.omni_session.adapter import (
-    OmniModelAdapter,
+from sglang.srt.omni_session.model_policy import (
+    OmniSessionModelPolicy,
     OmniModelAppendImageResult,
     OmniModelPrefillResult,
-    OmniModelRunnerAdapter,
+    OmniModelPolicyRunner,
     OmniModelSessionView,
 )
 from sglang.srt.omni_session.runtime_protocol import (
@@ -84,8 +84,10 @@ def build_sensenova_u1_srt_bridge(
     session_controller = srt_request_executor.session_controller
     model_config = getattr(scheduler, "model_config", None)
     runtime = OmniSessionRuntime(
-        model_runner=OmniModelRunnerAdapter(
-            U1OmniModelAdapter(native_tokenizer=getattr(scheduler, "tokenizer", None))
+        model_policy=OmniModelPolicyRunner(
+            U1OmniSessionModelPolicy(
+                native_tokenizer=getattr(scheduler, "tokenizer", None)
+            )
         ),
         session_controller=session_controller,
         srt_request_executor=srt_request_executor,
@@ -96,8 +98,8 @@ def build_sensenova_u1_srt_bridge(
     return U1SRTBackedOmniSessionBridge(runtime)
 
 
-class U1OmniModelAdapter(OmniModelAdapter):
-    """SenseNova U1 omni adapter shell for the omni middle protocol.
+class U1OmniSessionModelPolicy(OmniSessionModelPolicy):
+    """SenseNova U1 omni policy shell for the omni middle protocol.
 
     U1 uses pixel-flow generation mechanics; image-generation math stays in this backend
     instead of the common omni middle layer.
@@ -229,7 +231,7 @@ class U1OmniModelAdapter(OmniModelAdapter):
                 ]
         return None
 
-    def prefill_interleaved(
+    def on_prefill_finished(
         self,
         *,
         session: OmniModelSessionView,
@@ -242,7 +244,7 @@ class U1OmniModelAdapter(OmniModelAdapter):
     def decode_next_segment(self, *, session: OmniModelSessionView) -> OmniDecodeResult:
         raise RuntimeError("SenseNova U1 decode requires the SRT-backed runtime path")
 
-    def decode_next_segment_from_runtime(
+    def decode_next_segment_with_runtime(
         self, *, runtime: OmniSessionRuntime, session: OmniModelSessionView
     ) -> OmniDecodeResult | None:
         u1_state = (session.metadata or {}).get("omni_model_state", {}).get("u1", {})
@@ -455,6 +457,7 @@ class U1OmniModelAdapter(OmniModelAdapter):
         session: OmniSessionHandle,
         max_new_tokens: int,
     ) -> OmniVLMTextGenerationResult:
+        """use SRT text decode for U1 image-understanding answers"""
         if runtime is None:
             raise RuntimeError("SenseNova U1 VLM text generation requires SRT runtime")
         decoded = runtime.decode_text(
@@ -525,12 +528,12 @@ class U1SRTBackedOmniSessionBridge(SRTBackedOmniSessionBridge):
             max_pre_image_decode_steps=max_pre_image_decode_steps,
         )
 
-    def _u1_adapter(self) -> U1OmniModelAdapter | None:
-        runner = self.runtime.model_runner
-        if isinstance(runner, OmniModelRunnerAdapter) and isinstance(
-            runner.adapter, U1OmniModelAdapter
+    def _u1_policy(self) -> U1OmniSessionModelPolicy | None:
+        policy_runner = self.runtime.model_policy
+        if isinstance(policy_runner, OmniModelPolicyRunner) and isinstance(
+            policy_runner.policy, U1OmniSessionModelPolicy
         ):
-            return runner.adapter
+            return policy_runner.policy
         return None
 
     def prepare_ar_context_from_messages(
@@ -565,49 +568,49 @@ class U1SRTBackedOmniSessionBridge(SRTBackedOmniSessionBridge):
         *,
         think: bool,
     ):
-        adapter = self._u1_adapter()
+        policy = self._u1_policy()
         mode = getattr(sampling_params, "omni_generation_mode", None)
-        if adapter is not None:
-            old_cfg = adapter.include_t2i_cfg_uncondition
+        if policy is not None:
+            old_cfg = policy.include_t2i_cfg_uncondition
             old_interleave_text_uncondition = (
-                adapter.include_interleave_text_uncondition
+                policy.include_interleave_text_uncondition
             )
-            old_edit_img_condition = adapter.include_edit_img_condition
-            old_edit_uncondition = adapter.include_edit_uncondition
-            old_mode = adapter.native_generation_mode
-            old_interleave_think_mode = adapter.native_interleave_think_mode
+            old_edit_img_condition = policy.include_edit_img_condition
+            old_edit_uncondition = policy.include_edit_uncondition
+            old_mode = policy.native_generation_mode
+            old_interleave_think_mode = policy.native_interleave_think_mode
             needs_cfg = _u1_needs_any_cfg(sampling_params)
             cfg_text_scale = float(getattr(sampling_params, "cfg_text_scale", 1.0))
             cfg_img_scale = float(getattr(sampling_params, "cfg_img_scale", 1.0))
-            adapter.include_t2i_cfg_uncondition = (
+            policy.include_t2i_cfg_uncondition = (
                 _u1_needs_text_cfg(sampling_params)
                 and mode not in {"edit", "interleave"}
             ) or (mode == "interleave" and cfg_img_scale != 1.0)
-            adapter.include_interleave_text_uncondition = (
+            policy.include_interleave_text_uncondition = (
                 mode == "interleave" and _u1_needs_text_cfg(sampling_params)
             )
-            adapter.include_edit_img_condition = (
+            policy.include_edit_img_condition = (
                 mode == "edit"
                 and needs_cfg
                 and (cfg_img_scale == 1.0 or cfg_text_scale != cfg_img_scale)
             )
-            adapter.include_edit_uncondition = (
+            policy.include_edit_uncondition = (
                 mode == "edit" and needs_cfg and cfg_img_scale != 1.0
             )
-            adapter.native_generation_mode = mode
-            adapter.native_interleave_think_mode = bool(think)
+            policy.native_generation_mode = mode
+            policy.native_interleave_think_mode = bool(think)
         try:
             yield
         finally:
-            if adapter is not None:
-                adapter.include_t2i_cfg_uncondition = old_cfg
-                adapter.include_interleave_text_uncondition = (
+            if policy is not None:
+                policy.include_t2i_cfg_uncondition = old_cfg
+                policy.include_interleave_text_uncondition = (
                     old_interleave_text_uncondition
                 )
-                adapter.include_edit_img_condition = old_edit_img_condition
-                adapter.include_edit_uncondition = old_edit_uncondition
-                adapter.native_generation_mode = old_mode
-                adapter.native_interleave_think_mode = old_interleave_think_mode
+                policy.include_edit_img_condition = old_edit_img_condition
+                policy.include_edit_uncondition = old_edit_uncondition
+                policy.native_generation_mode = old_mode
+                policy.native_interleave_think_mode = old_interleave_think_mode
 
     def commit_generated_segment(
         self,
@@ -633,8 +636,8 @@ class U1SRTBackedOmniSessionBridge(SRTBackedOmniSessionBridge):
         contexts: OmniContextBundle,
         segment: Any,
     ) -> None:
-        adapter = self._u1_adapter()
-        tokenizer = None if adapter is None else adapter.native_tokenizer
+        policy = self._u1_policy()
+        tokenizer = None if policy is None else policy.native_tokenizer
         if tokenizer is None or contexts.full.session is None:
             return
         image = getattr(segment, "commit_image", None)
@@ -671,13 +674,14 @@ class U1SRTBackedOmniSessionBridge(SRTBackedOmniSessionBridge):
             state=OmniSegmentState.APPEND_IMAGE,
         )
 
-    def generate_vlm_text(
+    def generate_vlm_answer(
         self,
         *,
         messages: list[OmniInterleavedMessage | dict[str, Any]],
         max_new_tokens: int,
     ) -> OmniVLMTextGenerationResult:
-        return self._bridge.generate_vlm_text(
+        """delegate U1 VLM QA to the SRT-backed bridge"""
+        return self._bridge.generate_vlm_answer(
             messages=messages,
             max_new_tokens=max_new_tokens,
         )

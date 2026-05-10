@@ -270,7 +270,7 @@ class ContextOps(ABC):
 
 
 class ARBackend(ABC):
-    """Autoregressive text/session backend used by omni orchestration."""
+    """Autoregressive text/session backend used by omni orchestrator"""
 
     @abstractmethod
     def prepare_context(self, request: OmniRequest) -> OmniContextBundle: ...

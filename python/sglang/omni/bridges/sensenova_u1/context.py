@@ -26,7 +26,7 @@ U1_EDIT_UNCONDITION_ROLE = "u1_edit_uncondition"
 _U1_ATTENTION_MATH_MODE = "reference_eager"
 
 
-def _u1_adapter_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
+def _u1_policy_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
     metadata.setdefault("attention_math_mode", _U1_ATTENTION_MATH_MODE)
     return metadata
 
@@ -137,7 +137,7 @@ def build_u1_native_vlm_prepared_input(
         input_text=prompt,
         messages=list(messages),
         mm_inputs=mm_inputs,
-        adapter_metadata=_u1_adapter_metadata({
+        policy_metadata=_u1_policy_metadata({
             "u1": {
                 "segment_type": "vlm",
                 "source": "native_vlm_input",
@@ -237,7 +237,7 @@ def build_u1_native_interleave_text_uncondition_marker_prepared_input(
             session,
             U1_INTERLEAVE_TEXT_UNCONDITION_ROLE,
         ),
-        adapter_metadata=_u1_adapter_metadata({
+        policy_metadata=_u1_policy_metadata({
             "u1": {
                 "segment_type": "interleave_text_uncondition_image_marker",
                 "source": "native_interleave_text_uncondition_image_marker",
@@ -333,12 +333,12 @@ def _build_u1_native_interleave_like_prepared_input(
     if image_offsets:
         u1_metadata["image_offsets"] = list(image_offsets)
         u1_metadata["image_count"] = len(images)
-    adapter_metadata = _u1_adapter_metadata({"u1": u1_metadata})
+    policy_metadata = _u1_policy_metadata({"u1": u1_metadata})
     if model_state_updates is not None:
         state_updates = dict(model_state_updates)
         state_updates["generation_position_start"] = generation_position_start
         state_updates["session_id"] = session_id
-        adapter_metadata["omni_model_state_updates"] = {"u1": state_updates}
+        policy_metadata["omni_model_state_updates"] = {"u1": state_updates}
     return OmniSRTPreparedInput(
         input_ids=input_ids,
         input_text=prompt,
@@ -346,7 +346,7 @@ def _build_u1_native_interleave_like_prepared_input(
         mm_inputs=mm_inputs,
         condition_path_role=role,
         condition_path_session_id=_u1_condition_path_session_id(session, role),
-        adapter_metadata=adapter_metadata,
+        policy_metadata=policy_metadata,
     )
 
 
@@ -372,7 +372,7 @@ def build_u1_native_t2i_prepared_input(
         input_ids=input_ids,
         input_text=prompt,
         messages=list(messages),
-        adapter_metadata=_u1_adapter_metadata({
+        policy_metadata=_u1_policy_metadata({
             "u1": {
                 "segment_type": "t2i",
                 "source": "native_t2i_prompt",
@@ -443,7 +443,7 @@ def build_u1_native_edit_prepared_input(
         input_text=prompt,
         messages=list(messages),
         mm_inputs=mm_inputs,
-        adapter_metadata=_u1_adapter_metadata({
+        policy_metadata=_u1_policy_metadata({
             "u1": {
                 "segment_type": "edit",
                 "source": "native_edit_prompt",
@@ -560,7 +560,7 @@ def _build_u1_native_image_condition_path_prepared_input(
         mm_inputs=mm_inputs,
         condition_path_role=role,
         condition_path_session_id=_u1_condition_path_session_id(session, role),
-        adapter_metadata=_u1_adapter_metadata({
+        policy_metadata=_u1_policy_metadata({
             "u1": {
                 "segment_type": segment_type,
                 "source": source,
@@ -675,14 +675,14 @@ def build_u1_native_generated_image_commit_prepared_input(
         omit_start=omit_start,
         generation_position_start=end_t + 1,
     )
-    metadata = _u1_adapter_metadata(metadata)
+    metadata = _u1_policy_metadata(metadata)
     return OmniSRTPreparedInput(
         input_ids=input_ids,
         input_text="<u1:generated_image_commit>",
         messages=[message],
         position_ids=position_ids,
         mm_inputs=mm_inputs,
-        adapter_metadata=metadata,
+        policy_metadata=metadata,
     )
 
 
@@ -725,7 +725,7 @@ def _build_u1_native_marker_condition_path_prepared_input(
         messages=[OmniInterleavedMessage(type="text", content="")],
         condition_path_role=role,
         condition_path_session_id=_u1_condition_path_session_id(session, role),
-        adapter_metadata=_u1_adapter_metadata({
+        policy_metadata=_u1_policy_metadata({
             "u1": {
                 "segment_type": segment_type,
                 "source": source,

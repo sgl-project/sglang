@@ -17,11 +17,22 @@ ROOT = Path(__file__).resolve().parent
 
 class U1OmniUIHandler(BaseHTTPRequestHandler):
     api_base: str
+    request_model: str
+    served_model: str
     opener: urllib.request.OpenerDirector
 
     def do_GET(self) -> None:
         if self.path in {"/", "/index.html"}:
             self._serve_file(ROOT / "index.html", "text/html; charset=utf-8")
+        elif self.path == "/api/config":
+            self._json(
+                200,
+                {
+                    "api_base": self.api_base,
+                    "request_model": self.request_model,
+                    "served_model": self.served_model,
+                },
+            )
         elif self.path == "/api/health":
             self._proxy("GET", "/health", None)
         else:
@@ -103,15 +114,20 @@ def main() -> None:
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=7860)
     parser.add_argument("--api-base", default="http://127.0.0.1:30000")
+    parser.add_argument("--request-model", default="sensenova-u1")
+    parser.add_argument("--served-model", default="sensenova/SenseNova-U1-8B-MoT")
     args = parser.parse_args()
 
     U1OmniUIHandler.api_base = args.api_base
+    U1OmniUIHandler.request_model = args.request_model
+    U1OmniUIHandler.served_model = args.served_model
     U1OmniUIHandler.opener = urllib.request.build_opener(
         urllib.request.ProxyHandler({})
     )
     server = ThreadingHTTPServer((args.host, args.port), U1OmniUIHandler)
-    print(f"U1 interleaved omni UI: http://{args.host}:{args.port}")
+    print(f"Omni Lab: http://{args.host}:{args.port}")
     print(f"Proxy target: {args.api_base}")
+    print(f"Served model: {args.served_model}")
     server.serve_forever()
 
 

@@ -183,7 +183,7 @@ class SRTARBackend(ARBackend):
         self.bridge.release(_srt_backend_context(context))
 
     def _prepare_vlm_context(self, request: OmniRequest) -> OmniContextBundle:
-        result = self.bridge.generate_vlm_text(
+        result = self.bridge.generate_vlm_answer(
             messages=[_to_legacy_message(message) for message in request.messages],
             max_new_tokens=_resolve_vlm_max_new_tokens(request),
         )

@@ -162,7 +162,7 @@ class _FakeVLMBridge:
         self.runtime = _FakeRuntime()
         self.max_new_tokens = None
 
-    def generate_vlm_text(self, *, messages, max_new_tokens):
+    def generate_vlm_answer(self, *, messages, max_new_tokens):
         self.max_new_tokens = max_new_tokens
         session = OmniSessionHandle(
             anchor_request_id="r1",

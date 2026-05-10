@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>SenseNova U1 Omni Lab</title>
+  <title>Omni Lab</title>
   <style>
     :root {
       color-scheme: light;
@@ -76,6 +76,30 @@
       border-block: 1px solid var(--line);
       font-family: ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
       font-size: 13px;
+    }
+
+    .model-strip {
+      display: grid;
+      gap: 4px;
+      margin: -6px 0 22px;
+      padding-bottom: 16px;
+      border-bottom: 1px solid var(--line);
+      font-family: ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+
+    .model-strip span {
+      color: var(--muted);
+      font-size: 11px;
+      font-weight: 800;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+    }
+
+    .model-strip strong {
+      color: #2b3532;
+      font-size: 13px;
+      font-weight: 750;
+      word-break: break-word;
     }
 
     .dot {
@@ -167,6 +191,10 @@
       margin-top: 18px;
     }
 
+    .side-actions {
+      margin-top: 6px;
+    }
+
     button {
       border: 1px solid var(--ink);
       background: var(--ink);
@@ -237,6 +265,29 @@
       padding: 0;
       overflow: auto;
       flex: 1;
+    }
+
+    .composer {
+      border-top: 1px solid var(--line);
+      background: #f5faf7;
+      padding: 16px 18px 18px;
+    }
+
+    .composer textarea {
+      min-height: 92px;
+      max-height: 210px;
+    }
+
+    .composer-row {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 12px;
+      align-items: end;
+      margin-top: 12px;
+    }
+
+    .composer-row .control {
+      margin-bottom: 0;
     }
 
     .empty {
@@ -383,6 +434,7 @@
       .turn { grid-template-columns: 1fr; }
       .turn-meta { border-right: 0; border-bottom: 1px solid var(--line); }
       .session { text-align: left; }
+      .composer-row { grid-template-columns: 1fr; }
     }
   </style>
 </head>
@@ -390,7 +442,7 @@
   <main class="shell">
     <section>
       <header>
-        <h1>U1 Omni Lab</h1>
+        <h1>Omni Lab</h1>
         <p class="subtitle">Interleaved text-image conversations through SGLang /v1/omni/generate.</p>
       </header>
 
@@ -399,7 +451,12 @@
         <span id="statusDot" class="dot"></span>
       </div>
 
-      <div class="section-label">Composer</div>
+      <div class="model-strip">
+        <span>Model being served</span>
+        <strong id="modelView">loading</strong>
+      </div>
+
+      <div class="section-label">Request</div>
 
       <div class="control">
         <label for="task">Task</label>
@@ -411,21 +468,11 @@
         </select>
       </div>
 
-      <div class="control">
-        <label for="prompt">Message</label>
-        <textarea id="prompt" placeholder="Ask U1 to generate, refine, or describe the current conversation."></textarea>
-      </div>
-
       <div class="section-label">Multi-turn preset</div>
 
       <div class="actions" style="margin-top: 0;">
         <button class="secondary" id="turn1">Preset: first image</button>
         <button class="secondary" id="turn2">Preset: edit previous</button>
-      </div>
-
-      <div class="control" style="margin-top: 16px;">
-        <label for="imageInput">Optional input image</label>
-        <input id="imageInput" type="file" accept="image/*">
       </div>
 
       <div class="row">
@@ -466,8 +513,7 @@
         <span>Keep omni session across turns</span>
       </div>
 
-      <div class="actions">
-        <button id="send">Send</button>
+      <div class="actions side-actions">
         <button class="secondary" id="newChat">New chat</button>
         <button class="secondary" id="reset">Clear timeline</button>
         <button class="warn" id="closeSession">Close session</button>
@@ -482,12 +528,26 @@
       <div id="feed" class="feed">
         <div class="empty">No turns yet.</div>
       </div>
+      <div class="composer">
+        <div class="control">
+          <label for="prompt">Message</label>
+          <textarea id="prompt" placeholder="Ask U1 to generate, refine, or describe the current conversation."></textarea>
+        </div>
+        <div class="composer-row">
+          <div class="control">
+            <label for="imageInput">Optional input image</label>
+            <input id="imageInput" type="file" accept="image/*">
+          </div>
+          <button id="send">Send</button>
+        </div>
+      </div>
     </section>
   </main>
 
   <script>
     const $ = (id) => document.getElementById(id);
     const feed = $("feed");
+    let requestModel = "sensenova-u1";
     let sessionId = "";
     let turnIndex = 0;
 
@@ -520,6 +580,17 @@
     function setStatus(ok, text) {
       $("statusText").textContent = text;
       $("statusDot").classList.toggle("ok", ok);
+    }
+
+    async function loadConfig() {
+      try {
+        const response = await fetch("/api/config");
+        const config = await response.json();
+        requestModel = config.request_model || requestModel;
+        $("modelView").textContent = config.served_model || requestModel;
+      } catch {
+        $("modelView").textContent = requestModel;
+      }
     }
 
     async function checkHealth() {
@@ -671,7 +742,7 @@
       messages.push({type: "text", text: prompt});
 
       const payload = {
-        model: "sensenova-u1",
+        model: requestModel,
         task: $("task").value,
         messages,
         sampling_params: {
@@ -799,6 +870,7 @@
     });
 
     renderSessionView();
+    loadConfig();
     checkHealth();
     setInterval(checkHealth, 10000);
   </script>

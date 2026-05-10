@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Adapter layer between model-specific AR/generation code and omni session runtime."""
+"""Policy layer between model-specific AR/generation code and omni session runtime."""
 
 from copy import deepcopy
 from dataclasses import dataclass, field
@@ -9,7 +9,7 @@ from sglang.srt.omni_session.runtime_protocol import OmniSessionHandle
 from sglang.srt.omni_session.runtime import (
     OmniDecodeResult,
     OmniInterleavedMessage,
-    OmniModelRunner,
+    OmniModelPolicy,
     OmniSegmentState,
     OmniSessionRecord,
     OmniSessionRuntime,
@@ -20,7 +20,7 @@ from sglang.srt.omni_session.runtime import (
 
 @dataclass(frozen=True, slots=True)
 class OmniModelSessionView:
-    """Narrow SRT-owned session view exposed to omni model adapters."""
+    """Narrow SRT-owned session view exposed to omni model policies."""
 
     handle: OmniSessionHandle
     state: OmniSegmentState
@@ -41,11 +41,11 @@ class OmniModelAppendImageResult:
     added_tokens: int
 
 
-class OmniModelAdapter:
-    """Base class for model-specific omni session adapters.
+class OmniSessionModelPolicy:
+    """Base class for model-specific omni session policies.
 
-    Subclasses implement the model-native prompt formatting and decode policy.
-    The runner adapter below turns these narrow session-view hooks into the
+    Subclasses implement the model-native prompt formatting and decode rules.
+    The policy runner below turns these narrow session-view hooks into the
     record-oriented surface used by `OmniSessionRuntime`.
     """
 
@@ -67,7 +67,7 @@ class OmniModelAdapter:
     ) -> list[OmniSRTPreparedInput] | None:
         return None
 
-    def prefill_interleaved(
+    def on_prefill_finished(
         self,
         *,
         session: OmniModelSessionView,
@@ -84,16 +84,18 @@ class OmniModelAdapter:
     def decode_next_segment(
         self, *, session: OmniModelSessionView
     ) -> OmniDecodeResult:
+        """decode the next interleaved boundary: text, image marker, or done"""
         raise NotImplementedError(
             f"{self.__class__.__name__} does not support segment decode"
         )
 
-    def decode_next_segment_from_runtime(
+    def decode_next_segment_with_runtime(
         self,
         *,
         runtime: OmniSessionRuntime,
         session: OmniModelSessionView,
     ) -> OmniDecodeResult | None:
+        """override boundary decode when the model needs live SRT runtime access"""
         return None
 
     def decode_vlm_text(
@@ -103,6 +105,7 @@ class OmniModelAdapter:
         session: OmniSessionHandle,
         max_new_tokens: int,
     ) -> OmniVLMTextGenerationResult:
+        """decode a plain VLM text answer without entering generation boundaries"""
         raise NotImplementedError(
             f"{self.__class__.__name__} does not support VLM text decode"
         )
@@ -125,11 +128,11 @@ class OmniModelAdapter:
         pass
 
 
-class OmniModelRunnerAdapter(OmniModelRunner):
-    """Adapts a model-side omni adapter to OmniSessionRuntime's runner hooks."""
+class OmniModelPolicyRunner(OmniModelPolicy):
+    """Wrap a model-side omni policy for OmniSessionRuntime's record hooks."""
 
-    def __init__(self, adapter: OmniModelAdapter) -> None:
-        self.adapter = adapter
+    def __init__(self, policy: OmniSessionModelPolicy) -> None:
+        self.policy = policy
 
     def prepare_srt_ar_message_inputs(
         self,
@@ -138,7 +141,7 @@ class OmniModelRunnerAdapter(OmniModelRunner):
         message: OmniInterleavedMessage,
         state: OmniSegmentState,
     ) -> list[OmniSRTPreparedInput] | None:
-        return self.adapter.prepare_srt_ar_message_inputs(
+        return self.policy.prepare_srt_ar_message_inputs(
             session=self._session_view(record),
             message=message,
             state=state,
@@ -151,34 +154,35 @@ class OmniModelRunnerAdapter(OmniModelRunner):
         messages: list[OmniInterleavedMessage],
         state: OmniSegmentState,
     ) -> list[OmniSRTPreparedInput] | None:
-        return self.adapter.prepare_srt_ar_interleaved_inputs(
+        return self.policy.prepare_srt_ar_interleaved_inputs(
             session=self._session_view(record),
             messages=messages,
             state=state,
         )
 
-    def prefill_interleaved(
+    def on_prefill_finished(
         self, *, record: OmniSessionRecord, messages: list[OmniInterleavedMessage]
     ) -> int:
-        result = self.adapter.prefill_interleaved(
+        result = self.policy.on_prefill_finished(
             session=self._session_view(record),
             messages=messages,
         )
         return result.added_tokens
 
     def decode_next_segment(self, *, record: OmniSessionRecord) -> OmniDecodeResult:
-        return self.adapter.decode_next_segment(session=self._session_view(record))
+        return self.policy.decode_next_segment(session=self._session_view(record))
 
-    def decode_next_segment_from_runtime(
+    def decode_next_segment_with_runtime(
         self, *, runtime: OmniSessionRuntime, record: OmniSessionRecord
     ) -> OmniDecodeResult:
-        result = self.adapter.decode_next_segment_from_runtime(
+        """forward runtime-aware boundary decode to the model policy"""
+        result = self.policy.decode_next_segment_with_runtime(
             runtime=runtime,
             session=self._session_view(record),
         )
         if result is not None:
             return result
-        return super().decode_next_segment_from_runtime(runtime=runtime, record=record)
+        return super().decode_next_segment_with_runtime(runtime=runtime, record=record)
 
     def decode_vlm_text(
         self,
@@ -187,7 +191,8 @@ class OmniModelRunnerAdapter(OmniModelRunner):
         session: OmniSessionHandle,
         max_new_tokens: int,
     ) -> OmniVLMTextGenerationResult:
-        return self.adapter.decode_vlm_text(
+        """forward plain VLM answer decode to the model policy"""
+        return self.policy.decode_vlm_text(
             runtime=runtime,
             session=session,
             max_new_tokens=max_new_tokens,
@@ -196,14 +201,14 @@ class OmniModelRunnerAdapter(OmniModelRunner):
     def append_generated_image(
         self, *, record: OmniSessionRecord, image: Any | None
     ) -> int:
-        result = self.adapter.append_generated_image(
+        result = self.policy.append_generated_image(
             session=self._session_view(record),
             image=image,
         )
         return result.added_tokens
 
     def close_session(self, *, session_id: str) -> None:
-        self.adapter.close_session(session_id=session_id)
+        self.policy.close_session(session_id=session_id)
 
     @staticmethod
     def _session_view(record: OmniSessionRecord) -> OmniModelSessionView:

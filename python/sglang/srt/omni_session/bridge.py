@@ -20,6 +20,15 @@ DEFAULT_OMNI_TEXT_MAX_NEW_TOKENS = 128
 
 
 class OmniSessionBridge(ABC):
+    """bridge surface between generic omni orchestrator and SRT session runtime, translating ARBackend semantics into srt-session semantics
+
+      e.g., U1SRTBackedOmniSessionBridge breaks down the generation process into:
+       1. prefill
+       2. decode until an image marker is met
+       3. commit generated image into session
+
+    """
+
     generation_kind: str = "generic"
 
     @abstractmethod
@@ -47,12 +56,14 @@ class OmniSessionBridge(ABC):
     ) -> OmniDecodeResult: ...
 
     @abstractmethod
-    def generate_vlm_text(
+    def generate_vlm_answer(
         self,
         *,
         messages: list[OmniInterleavedMessage | dict[str, Any]],
         max_new_tokens: int,
-    ) -> OmniVLMTextGenerationResult: ...
+    ) -> OmniVLMTextGenerationResult:
+        """prefill image/text inputs and return a plain VLM text answer"""
+        ...
 
 
 class SRTBackedOmniSessionBridge(OmniSessionBridge):
@@ -186,6 +197,7 @@ class SRTBackedOmniSessionBridge(OmniSessionBridge):
             self.runtime.close_session(contexts.full.session)
 
     def continue_ar_decode(self, *, contexts: OmniContextBundle) -> OmniDecodeResult:
+        """continue interleaved AR decode from an SRT-owned context bundle"""
         if contexts.full.session is None:
             raise ValueError("SRT-backed omni contexts require a session handle")
         return self.runtime.decode_next_segment(contexts.full.session)
@@ -204,49 +216,39 @@ class SRTBackedOmniSessionBridge(OmniSessionBridge):
                 f"omni think text generation requires max_new_tokens > 0, got {max_new_tokens}"
             )
         try:
-            return self.runtime.model_runner.decode_vlm_text(
+            return self.runtime.model_policy.decode_vlm_text(
                 runtime=self.runtime,
                 session=session,
                 max_new_tokens=max_new_tokens,
             )
         except NotImplementedError as exc:
             raise RuntimeError(
-                f"{self.runtime.model_runner.__class__.__name__} does not support "
+                f"{self.runtime.model_policy.__class__.__name__} does not support "
                 "omni think text generation"
             ) from exc
 
-    def generate_vlm_text(
+    def generate_vlm_answer(
         self,
         *,
         messages: list[OmniInterleavedMessage | dict[str, Any]],
         max_new_tokens: int,
     ) -> OmniVLMTextGenerationResult:
+        """run one-shot VLM QA: prefill inputs, decode text, and return the answer"""
         max_new_tokens = int(max_new_tokens)
         if max_new_tokens <= 0:
             raise ValueError(
                 f"omni VLM text generation requires max_new_tokens > 0, got {max_new_tokens}"
             )
+
+        # start the prefill and get the session
         session = self.runtime.prefill_interleaved(
             normalize_omni_interleaved_messages(messages)
         )
         try:
-            try:
-                return self.runtime.model_runner.decode_vlm_text(
-                    runtime=self.runtime,
-                    session=session,
-                    max_new_tokens=max_new_tokens,
-                )
-            except NotImplementedError:
-                pass
-            segment = self.runtime.decode_next_segment(session)
-            if segment.type != "text":
-                raise ValueError(
-                    "omni VLM text generation expected a text segment, "
-                    f"got {segment.type}"
-                )
-            return OmniVLMTextGenerationResult(
+            return self.runtime.model_policy.decode_vlm_text(
+                runtime=self.runtime,
                 session=session,
-                text=segment.text or "",
+                max_new_tokens=max_new_tokens,
             )
         except Exception:
             self.runtime.close_session(session)

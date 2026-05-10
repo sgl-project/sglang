@@ -6,7 +6,7 @@ from sglang.srt.omni_session.runtime import OmniSessionRuntime
 def test_omni_session_runtime_opens_streaming_srt_session():
     controller = _FakeSessionController()
     runtime = OmniSessionRuntime(
-        model_runner=_FakeModelRunner(),
+        model_policy=_FakeModelPolicy(),
         session_controller=controller,
         capacity_of_str_len=8192,
     )
@@ -23,7 +23,7 @@ def test_omni_session_runtime_drains_srt_executor_after_close():
     controller.sessions.add("session-a")
     executor = _FakeSRTExecutor()
     runtime = OmniSessionRuntime(
-        model_runner=_FakeModelRunner(),
+        model_policy=_FakeModelPolicy(),
         session_controller=controller,
         srt_request_executor=executor,
     )
@@ -58,7 +58,7 @@ class _FakeOpenResult:
         self.success = success
 
 
-class _FakeModelRunner:
+class _FakeModelPolicy:
     def close_session(self, *, session_id):
         self.closed_session_id = session_id
 

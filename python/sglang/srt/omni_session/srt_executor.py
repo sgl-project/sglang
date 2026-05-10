@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Synchronous adapter from omni session requests into an SRT scheduler.
+"""Synchronous executor from omni session requests into an SRT scheduler.
 
 This module is the execution boundary where omni_session borrows SRT internals:
 it can enqueue small session requests and build temporary query batches that
@@ -12,7 +12,6 @@ from typing import Any
 import torch
 
 from sglang.omni.protocol import TemporaryForwardPrepared
-from sglang.srt.omni_session.runtime import OmniSRTRequestExecutor
 from sglang.srt.omni_session.runtime_protocol import OmniSRTKVTokenBinding
 
 
@@ -69,8 +68,13 @@ class OmniSRTBoundTemporaryForwardPrepared:
     srt_kv_token_binding: OmniSRTKVTokenBinding
 
 
-class OmniSRTSchedulerExecutor(OmniSRTRequestExecutor):
-    """Adapter that executes materialized omni session requests through SRT."""
+class OmniSRTSchedulerExecutor:
+    """Execute materialized omni session requests through the SRT scheduler.
+
+    this executor enqueues the reqs created with runtime, runs them
+    synchronously when needed, and exposes committed KV bindings for generation.
+
+    """
 
     finish_request_after_execute = False
 
@@ -87,7 +91,7 @@ class OmniSRTSchedulerExecutor(OmniSRTRequestExecutor):
                 "OmniSRTSchedulerExecutor requires scheduler.session_controller"
             )
         self.scheduler = scheduler
-        # Synchronous mode keeps omni AR/session state updated before mm-gen runs.
+        # synchronous mode keeps omni AR/session state updated before mm-gen runs.
         self.run_synchronously = run_synchronously
         self.max_sync_steps = max_sync_steps
         self.require_idle_scheduler = require_idle_scheduler
@@ -114,8 +118,7 @@ class OmniSRTSchedulerExecutor(OmniSRTRequestExecutor):
             self._run_until_request_complete(req)
 
     def run_idle_cleanup(self) -> None:
-        """Drain finished scheduler state left by synchronous omni requests."""
-
+        """drain finished scheduler state left by synchronous omni requests"""
         self._run_idle_cleanup()
 
     def get_request_token_binding(
