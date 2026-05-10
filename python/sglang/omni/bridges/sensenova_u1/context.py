@@ -14,6 +14,7 @@ from sglang.srt.omni_session.runtime import (
     OmniInterleavedMessage,
     OmniSRTPreparedInput,
 )
+from sglang.srt.omni_session.runtime_protocol import OmniSessionHandle
 
 U1_IMG_START_TOKEN = "<img>"
 U1_IMG_END_TOKEN = "</img>"
@@ -1059,9 +1060,10 @@ def _load_u1_generated_tensor_for_commit(
 
 
 def _u1_session_id(session: Any | None) -> str | None:
-    if session is None or session.handle is None:
+    handle = _u1_session_handle(session)
+    if handle is None:
         return None
-    return session.handle.session_id
+    return handle.session_id
 
 
 def _u1_condition_path_session_id(session: Any | None, role: str | None) -> str | None:
@@ -1072,9 +1074,10 @@ def _u1_condition_path_session_id(session: Any | None, role: str | None) -> str 
 
 
 def _u1_session_context_length(session: Any | None) -> int:
-    if session is None or session.handle is None:
+    handle = _u1_session_handle(session)
+    if handle is None:
         return 0
-    return int(session.handle.context_length)
+    return int(handle.context_length)
 
 
 def _u1_session_logical_position(session: Any | None) -> int | None:
@@ -1160,9 +1163,17 @@ def _u1_generated_image_commit_metadata(
 
 
 def _u1_session_metadata(session: Any | None) -> dict[str, Any]:
-    if session is None:
+    if session is None or isinstance(session, OmniSessionHandle):
         return {}
     return session.metadata or {}
+
+
+def _u1_session_handle(session: Any | None) -> OmniSessionHandle | None:
+    if session is None:
+        return None
+    if isinstance(session, OmniSessionHandle):
+        return session
+    return session.handle
 
 
 def _u1_dynamic_preprocess_native_resolution(
