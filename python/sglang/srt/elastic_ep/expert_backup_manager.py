@@ -170,6 +170,7 @@ def run_expert_backup_manager_process(
         ib_device=(
             server_args.disaggregation_ib_device or server_args.mooncake_ib_device
         ),
+        transport=server_args.disaggregation_transport,
     )
     manager = ExpertBackupManager(server_args, port_args)
 

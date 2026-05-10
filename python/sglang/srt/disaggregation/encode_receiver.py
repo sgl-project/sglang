@@ -649,6 +649,7 @@ class MMReceiverBase(ABC):
                         server_args.disaggregation_ib_device
                         or server_args.mooncake_ib_device
                     ),
+                    transport=server_args.disaggregation_transport,
                 )
             self.embeddings_buffer = dict()
         elif self.encoder_transfer_backend == "zmq_to_scheduler":

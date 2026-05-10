@@ -157,6 +157,14 @@ python -m sglang.launch_server \
   --disaggregation-transport rdma \
   --port 30000
 
+# EFA transport
+python -m sglang.launch_server \
+  --model-path meta-llama/Llama-3.1-8B-Instruct \
+  --disaggregation-mode prefill \
+  --disaggregation-transfer-backend mooncake \
+  --disaggregation-transport efa \
+  --port 30000
+
 # Intra-node NVLink transport
 python -m sglang.launch_server \
   --model-path meta-llama/Llama-3.1-8B-Instruct \
@@ -170,6 +178,7 @@ Supported transport values:
 - `nvlink`: NVLink with MNNVL (recommended for NVL72 deployments). Note that auxiliary data transfer will still use TCP as a temporary workaround.
 - `barex`: Barex-based transport
 - `rdma`: InfiniBand RDMA transport
+- `efa`: AWS EFA transport
 - `intra_node_nvlink`: Intra-node NVLink transport
 
 **Legacy: Environment Variables (Backward Compatible)**
@@ -181,7 +190,7 @@ export SGLANG_MOONCAKE_CUSTOM_MEM_POOL=NVLINK
 export MC_FORCE_MNNVL=True
 ```
 
-The `SGLANG_MOONCAKE_CUSTOM_MEM_POOL` environment variable enables the custom memory pool. Supported values are `NVLINK` (or `True`), `BAREX`, and `INTRA_NODE_NVLINK`. If both the CLI argument and environment variables are set, the CLI argument takes precedence.
+The `SGLANG_MOONCAKE_CUSTOM_MEM_POOL` environment variable enables the custom memory pool. Supported values are `NVLINK` (or `True`), `BAREX`, and `INTRA_NODE_NVLINK`. It is a legacy compatibility path for those memory-pool-based transports only; `rdma` and `efa` should be configured via `--disaggregation-transport`. If both the CLI argument and environment variables are set, the CLI argument takes precedence.
 
 #### Prefill Server Configuration
 | Variable | Description | Default |

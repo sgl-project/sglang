@@ -171,7 +171,13 @@ RADIX_SUPPORTED_DETERMINISTIC_ATTENTION_BACKEND = ["fa3", "triton"]
 
 DISAGG_TRANSFER_BACKEND_CHOICES = ["mooncake", "nixl", "ascend", "fake", "mori"]
 
-DISAGGREGATION_TRANSPORT_CHOICES = ["rdma", "barex", "nvlink", "intra_node_nvlink"]
+DISAGGREGATION_TRANSPORT_CHOICES = [
+    "rdma",
+    "efa",
+    "barex",
+    "nvlink",
+    "intra_node_nvlink",
+]
 
 GRAMMAR_BACKEND_CHOICES = ["xgrammar", "outlines", "llguidance", "none"]
 
@@ -4038,8 +4044,8 @@ class ServerArgs:
             elif transport == "intra_node_nvlink":
                 os.environ["SGLANG_MOONCAKE_CUSTOM_MEM_POOL"] = "INTRA_NODE_NVLINK"
                 os.environ["MC_FORCE_MNNVL"] = "true"
-            elif transport == "rdma":
-                # RDMA doesn't use custom mem pool
+            elif transport in ("rdma", "efa"):
+                # RDMA/EFA don't use custom mem pool.
                 os.environ.pop("SGLANG_MOONCAKE_CUSTOM_MEM_POOL", None)
                 os.environ.pop("MC_FORCE_MNNVL", None)
 
@@ -6657,7 +6663,7 @@ class ServerArgs:
             default=ServerArgs.disaggregation_transport,
             choices=DISAGGREGATION_TRANSPORT_CHOICES,
             help="Transport layer for PD disaggregation with Mooncake backend: "
-                 "'rdma' (InfiniBand RDMA), 'barex' (Barex-based), "
+                  "'rdma' (InfiniBand RDMA), 'efa' (AWS EFA), 'barex' (Barex-based), "
                  "'nvlink' (NVLink with MNNVL), 'intra_node_nvlink' (Intra-node NVLink). "
                  "If not specified, falls back to SGLANG_MOONCAKE_CUSTOM_MEM_POOL environment variable for backward compatibility.",
         )

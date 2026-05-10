@@ -487,6 +487,13 @@ class TestDisaggregationTransport(CustomTestCase):
         )
         self.assertEqual(server_args.disaggregation_transport, "rdma")
 
+    def test_cli_parsing_efa(self):
+        """Test that CLI parsing accepts efa transport."""
+        server_args = prepare_server_args(
+            ["--model-path", "dummy", "--disaggregation-transport", "efa"]
+        )
+        self.assertEqual(server_args.disaggregation_transport, "efa")
+
     def test_cli_parsing_intra_node_nvlink(self):
         """Test that CLI parsing accepts intra_node_nvlink transport."""
         server_args = prepare_server_args(
@@ -591,6 +598,20 @@ class TestDisaggregationTransport(CustomTestCase):
 
         server_args = prepare_server_args(
             ["--model-path", "dummy", "--disaggregation-transport", "rdma"]
+        )
+        self.assertIsNone(os.environ.get("SGLANG_MOONCAKE_CUSTOM_MEM_POOL"))
+        self.assertIsNone(os.environ.get("MC_FORCE_MNNVL"))
+
+    @patch.dict("os.environ", {}, clear=False)
+    def test_env_propagation_efa(self):
+        """Test that efa transport clears custom mem pool env vars."""
+        import os
+
+        os.environ["SGLANG_MOONCAKE_CUSTOM_MEM_POOL"] = "NVLINK"
+        os.environ["MC_FORCE_MNNVL"] = "true"
+
+        server_args = prepare_server_args(
+            ["--model-path", "dummy", "--disaggregation-transport", "efa"]
         )
         self.assertIsNone(os.environ.get("SGLANG_MOONCAKE_CUSTOM_MEM_POOL"))
         self.assertIsNone(os.environ.get("MC_FORCE_MNNVL"))

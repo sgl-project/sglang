@@ -108,7 +108,7 @@ SGLang supports various environment variables that can be used to configure its 
 | `SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION` | Clip max new tokens estimation for memory planning | `4096` |
 | `SGLANG_DETOKENIZER_MAX_STATES` | Maximum states for detokenizer | Default value based on system |
 | `SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK` | Enable checks for memory imbalance across Tensor Parallel ranks | `true` |
-| `SGLANG_MOONCAKE_CUSTOM_MEM_POOL` | **[Deprecated]** Configure the custom memory pool type for Mooncake. Supports `NVLINK`, `BAREX`, `INTRA_NODE_NVLINK`. If set to `true`, it defaults to `NVLINK`. **Prefer using `--disaggregation-transport` CLI argument instead.** | `None` |
+| `SGLANG_MOONCAKE_CUSTOM_MEM_POOL` | **[Deprecated]** Configure the custom memory pool type for Mooncake. Supports `NVLINK`, `BAREX`, `INTRA_NODE_NVLINK`. If set to `true`, it defaults to `NVLINK`. This legacy variable only applies to those memory-pool-based transports; use `--disaggregation-transport efa` or `--disaggregation-transport rdma` for network transports. | `None` |
 
 ## Model-Specific Options
 

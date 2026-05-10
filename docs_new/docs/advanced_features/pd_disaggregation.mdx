@@ -129,7 +129,9 @@ python -m sglang.launch_server \
 
 PD Disaggregation with Mooncake supports the following environment variables for fine-grained control over system behavior.
 
-#### NVLink Transport Configuration
+#### Transport Configuration
+Prefer configuring Mooncake transport explicitly with `--disaggregation-transport`, which now supports `rdma`, `efa`, `barex`, `nvlink`, and `intra_node_nvlink`. The environment variables below remain as a legacy compatibility path for the memory-pool-based transports (`nvlink`, `barex`, and `intra_node_nvlink`).
+
 To enable NVLink transport for KV cache transfers with the mooncake backend (recommended for NVL72 deployments), set the following environment variables. Note that auxiliary data transfer will still use TCP as a temporary workaround.
 
 ```bash Command
@@ -137,7 +139,7 @@ export SGLANG_MOONCAKE_CUSTOM_MEM_POOL=NVLINK
 export MC_FORCE_MNNVL=True
 ```
 
-The `SGLANG_MOONCAKE_CUSTOM_MEM_POOL` environment variable enables the custom memory pool. Supported values are `NVLINK` (or `True`), `BAREX`, and `INTRA_NODE_NVLINK`.
+The `SGLANG_MOONCAKE_CUSTOM_MEM_POOL` environment variable enables the custom memory pool. Supported values are `NVLINK` (or `True`), `BAREX`, and `INTRA_NODE_NVLINK`. Use `--disaggregation-transport rdma` or `--disaggregation-transport efa` for network transports.
 
 #### Prefill Server Configuration
 <table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
