@@ -717,7 +717,7 @@ class SchedulerPPMixin:
         ):
             return None
 
-        max_chunk_size = getattr(self, "max_prefill_tokens", None)
+        max_chunk_size = self.max_prefill_tokens
         predicted_size = self.length_predictor.predict_next_chunk_size(
             history_len=history_len,
             base_chunk_size=self.chunked_prefill_size,
