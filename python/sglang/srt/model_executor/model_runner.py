@@ -253,7 +253,10 @@ def add_chunked_prefix_cache_attention_backend(backend_name):
 
 
 # Detect stragger ranks in model loading
-UNBALANCED_MODEL_LOADING_TIMEOUT_S = 480  # leave more time for post data processing
+# xLLM 375B can take longer than eight minutes to load across 16 nodes under
+# Weka contention. Keep the barrier generous so one slow rank does not kill an
+# otherwise healthy bring-up.
+UNBALANCED_MODEL_LOADING_TIMEOUT_S = 3600
 
 
 logger = logging.getLogger(__name__)
