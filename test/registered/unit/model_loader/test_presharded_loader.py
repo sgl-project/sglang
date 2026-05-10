@@ -416,6 +416,25 @@ class TestBuildDumpPlan(unittest.TestCase):
                 plan_b["rank_checksums"]["0"],
             )
 
+    def test_presharded_ready_sentinel(self):
+        # Loader treats a dir as a valid presharded ckpt only when the
+        # READY sentinel exists. A bare checksum.json (or partial files)
+        # is NOT enough.
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertFalse(PreshardedModelLoader._presharded_ready(tmp))
+            # checksum.json alone is not sufficient.
+            with open(
+                os.path.join(tmp, PreshardedModelLoader.CHECKSUM_FILENAME), "w"
+            ) as f:
+                f.write("{}")
+            self.assertFalse(PreshardedModelLoader._presharded_ready(tmp))
+            # READY makes it ready.
+            with open(
+                os.path.join(tmp, PreshardedModelLoader.READY_FILENAME), "w"
+            ) as f:
+                f.write("{}")
+            self.assertTrue(PreshardedModelLoader._presharded_ready(tmp))
+
 
 if __name__ == "__main__":
     unittest.main()
