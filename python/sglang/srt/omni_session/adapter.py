@@ -3,14 +3,16 @@
 
 from copy import deepcopy
 from dataclasses import dataclass, field
-from typing import Any, Protocol
+from typing import Any
 
 from sglang.srt.omni_session.runtime_protocol import OmniSessionHandle, OmniSRTRequestView
 from sglang.srt.omni_session.runtime import (
     OmniDecodeResult,
     OmniInterleavedMessage,
+    OmniModelRunner,
     OmniSegmentState,
     OmniSessionRecord,
+    OmniSessionRuntime,
     OmniSRTPreparedInput,
     OmniVLMTextGenerationResult,
 )
@@ -39,8 +41,13 @@ class OmniModelAppendImageResult:
     added_tokens: int
 
 
-class OmniModelAdapterProtocol(Protocol):
-    """Model-side omni entrypoints implemented by each unified-generation backend."""
+class OmniModelAdapter:
+    """Base class for model-specific omni session adapters.
+
+    Subclasses implement the model-native prompt formatting and decode policy.
+    The runner adapter below turns these narrow session-view hooks into the
+    record-oriented surface used by `OmniSessionRuntime`.
+    """
 
     def prepare_srt_ar_message_inputs(
         self,
@@ -48,7 +55,9 @@ class OmniModelAdapterProtocol(Protocol):
         session: OmniModelSessionView,
         message: OmniInterleavedMessage,
         state: OmniSegmentState,
-    ) -> list[OmniSRTPreparedInput] | None: ...
+    ) -> list[OmniSRTPreparedInput] | None:
+        del session, message, state
+        return None
 
     def prepare_srt_ar_interleaved_inputs(
         self,
@@ -56,7 +65,9 @@ class OmniModelAdapterProtocol(Protocol):
         session: OmniModelSessionView,
         messages: list[OmniInterleavedMessage],
         state: OmniSegmentState,
-    ) -> list[OmniSRTPreparedInput] | None: ...
+    ) -> list[OmniSRTPreparedInput] | None:
+        del session, messages, state
+        return None
 
     def observe_srt_ar_forward(
         self,
@@ -64,41 +75,76 @@ class OmniModelAdapterProtocol(Protocol):
         session: OmniModelSessionView,
         request: OmniSRTRequestView,
         messages: list[OmniInterleavedMessage],
-    ) -> None: ...
+    ) -> None:
+        del session, request, messages
 
     def prefill_interleaved(
         self,
         *,
         session: OmniModelSessionView,
         messages: list[OmniInterleavedMessage],
-    ) -> OmniModelPrefillResult: ...
+    ) -> OmniModelPrefillResult:
+        del messages
+        return OmniModelPrefillResult(
+            added_tokens=max(
+                0,
+                int(session.srt_last_origin_input_len)
+                - int(session.handle.context_length),
+            )
+        )
 
     def decode_next_segment(
         self, *, session: OmniModelSessionView
-    ) -> OmniDecodeResult: ...
+    ) -> OmniDecodeResult:
+        del session
+        raise NotImplementedError(
+            f"{self.__class__.__name__} does not support segment decode"
+        )
+
+    def decode_next_segment_from_runtime(
+        self,
+        *,
+        runtime: OmniSessionRuntime,
+        session: OmniModelSessionView,
+    ) -> OmniDecodeResult | None:
+        del runtime, session
+        return None
 
     def decode_vlm_text(
         self,
         *,
-        runtime: Any,
+        runtime: OmniSessionRuntime,
         session: OmniSessionHandle,
         max_new_tokens: int,
-    ) -> OmniVLMTextGenerationResult: ...
+    ) -> OmniVLMTextGenerationResult:
+        del runtime, session, max_new_tokens
+        raise NotImplementedError(
+            f"{self.__class__.__name__} does not support VLM text decode"
+        )
 
     def append_generated_image(
         self,
         *,
         session: OmniModelSessionView,
         image: Any | None,
-    ) -> OmniModelAppendImageResult: ...
+    ) -> OmniModelAppendImageResult:
+        del image
+        return OmniModelAppendImageResult(
+            added_tokens=max(
+                0,
+                int(session.srt_last_origin_input_len)
+                - int(session.handle.context_length),
+            )
+        )
 
-    def close_session(self, *, session_id: str) -> None: ...
+    def close_session(self, *, session_id: str) -> None:
+        del session_id
 
 
-class OmniModelRunnerAdapter:
-    """Adapts a model-side omni adapter to OmniSessionRuntime's runner protocol."""
+class OmniModelRunnerAdapter(OmniModelRunner):
+    """Adapts a model-side omni adapter to OmniSessionRuntime's runner hooks."""
 
-    def __init__(self, adapter: OmniModelAdapterProtocol) -> None:
+    def __init__(self, adapter: OmniModelAdapter) -> None:
         self.adapter = adapter
 
     def prepare_srt_ar_message_inputs(
@@ -108,10 +154,7 @@ class OmniModelRunnerAdapter:
         message: OmniInterleavedMessage,
         state: OmniSegmentState,
     ) -> list[OmniSRTPreparedInput] | None:
-        prepare = getattr(self.adapter, "prepare_srt_ar_message_inputs", None)
-        if not callable(prepare):
-            return None
-        return prepare(
+        return self.adapter.prepare_srt_ar_message_inputs(
             session=self._session_view(record),
             message=message,
             state=state,
@@ -124,10 +167,7 @@ class OmniModelRunnerAdapter:
         messages: list[OmniInterleavedMessage],
         state: OmniSegmentState,
     ) -> list[OmniSRTPreparedInput] | None:
-        prepare = getattr(self.adapter, "prepare_srt_ar_interleaved_inputs", None)
-        if not callable(prepare):
-            return None
-        return prepare(
+        return self.adapter.prepare_srt_ar_interleaved_inputs(
             session=self._session_view(record),
             messages=messages,
             state=state,
@@ -149,10 +189,7 @@ class OmniModelRunnerAdapter:
         request: OmniSRTRequestView,
         messages: list[OmniInterleavedMessage],
     ) -> None:
-        observe = getattr(self.adapter, "observe_srt_ar_forward", None)
-        if not callable(observe):
-            return
-        observe(
+        self.adapter.observe_srt_ar_forward(
             session=self._session_view(record),
             request=request,
             messages=messages,
@@ -162,28 +199,24 @@ class OmniModelRunnerAdapter:
         return self.adapter.decode_next_segment(session=self._session_view(record))
 
     def decode_next_segment_from_runtime(
-        self, *, runtime: Any, record: OmniSessionRecord
+        self, *, runtime: OmniSessionRuntime, record: OmniSessionRecord
     ) -> OmniDecodeResult:
-        decode = getattr(self.adapter, "decode_next_segment_from_runtime", None)
-        if not callable(decode):
-            if runtime.srt_ar_decode_max_new_tokens > 0:
-                runtime._append_srt_ar_decode_request(record, greedy=True)
-            return self.decode_next_segment(record=record)
-        return decode(runtime=runtime, session=record.handle())
+        result = self.adapter.decode_next_segment_from_runtime(
+            runtime=runtime,
+            session=self._session_view(record),
+        )
+        if result is not None:
+            return result
+        return super().decode_next_segment_from_runtime(runtime=runtime, record=record)
 
     def decode_vlm_text(
         self,
         *,
-        runtime: Any,
+        runtime: OmniSessionRuntime,
         session: OmniSessionHandle,
         max_new_tokens: int,
     ) -> OmniVLMTextGenerationResult:
-        decode = getattr(self.adapter, "decode_vlm_text", None)
-        if not callable(decode):
-            raise NotImplementedError(
-                f"{self.adapter.__class__.__name__} does not support VLM text decode"
-            )
-        return decode(
+        return self.adapter.decode_vlm_text(
             runtime=runtime,
             session=session,
             max_new_tokens=max_new_tokens,

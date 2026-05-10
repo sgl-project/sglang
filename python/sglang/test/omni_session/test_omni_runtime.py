@@ -66,6 +66,10 @@ class _FakeModelRunner:
 class _FakeSRTExecutor:
     def __init__(self):
         self.idle_cleanup_count = 0
+        self.session_forward_observer = None
+
+    def set_session_forward_observer(self, observer):
+        self.session_forward_observer = observer
 
     def run_idle_cleanup(self):
         self.idle_cleanup_count += 1

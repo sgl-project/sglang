@@ -15,11 +15,16 @@ from typing import Any
 
 from sglang.multimodal_gen.runtime.pipelines_core import ComposedPipelineBase
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
-from sglang.omni.protocol import ContextOps, GeneratedSegment, OmniRequest
+from sglang.omni.protocol import (
+    ContextOps,
+    GeneratedSegment,
+    MultimodalGenerationBackend,
+    OmniRequest,
+)
 
 
 @dataclass(slots=True)
-class DirectPipelineForwardBackend:
+class DirectPipelineForwardBackend(MultimodalGenerationBackend):
     """Call ``ComposedPipelineBase.forward`` directly from omni orchestration."""
 
     pipeline: ComposedPipelineBase

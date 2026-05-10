@@ -11,11 +11,16 @@ from types import SimpleNamespace
 from typing import Any
 
 from sglang.srt.omni_session.adapter import (
+    OmniModelAdapter,
     OmniModelAppendImageResult,
     OmniModelPrefillResult,
     OmniModelRunnerAdapter,
+    OmniModelSessionView,
 )
-from sglang.srt.omni_session.runtime_protocol import OmniContextBundle
+from sglang.srt.omni_session.runtime_protocol import (
+    OmniContextBundle,
+    OmniSessionHandle,
+)
 from sglang.srt.omni_session.interleaved_protocol import GenerationKind
 from sglang.srt.omni_session.middle import (
     GeneratedSegmentExecutor,
@@ -90,7 +95,7 @@ def build_sensenova_u1_middle_bridge(
     return U1SRTBackedOmniSessionBridge(runtime)
 
 
-class U1OmniModelAdapter:
+class U1OmniModelAdapter(OmniModelAdapter):
     """SenseNova U1 omni adapter shell for the omni middle protocol.
 
     U1 uses pixel-flow generation mechanics; image-generation math stays in this backend
@@ -115,9 +120,9 @@ class U1OmniModelAdapter:
     def prepare_srt_ar_interleaved_inputs(
         self,
         *,
-        session: Any,
+        session: OmniModelSessionView,
         messages: list[OmniInterleavedMessage],
-        state: Any,
+        state: OmniSegmentState,
     ) -> list[OmniSRTPreparedInput] | None:
         if state != OmniSegmentState.AR_PREFILL or self.native_tokenizer is None:
             return None
@@ -204,9 +209,9 @@ class U1OmniModelAdapter:
     def prepare_srt_ar_message_inputs(
         self,
         *,
-        session: Any,
-        message: Any,
-        state: Any,
+        session: OmniModelSessionView,
+        message: OmniInterleavedMessage,
+        state: OmniSegmentState,
     ) -> list[OmniSRTPreparedInput] | None:
         if self.native_tokenizer is None:
             return None
@@ -226,41 +231,39 @@ class U1OmniModelAdapter:
     def prefill_interleaved(
         self,
         *,
-        session: Any,
-        messages: list[Any],
+        session: OmniModelSessionView,
+        messages: list[OmniInterleavedMessage],
     ) -> OmniModelPrefillResult:
         return OmniModelPrefillResult(
             added_tokens=self._added_tokens_from_srt_session_view(session)
         )
 
-    def decode_next_segment(self, *, session: Any) -> Any:
+    def decode_next_segment(self, *, session: OmniModelSessionView) -> OmniDecodeResult:
+        del session
         raise RuntimeError("SenseNova U1 decode requires the SRT-backed runtime path")
 
-    def decode_next_segment_from_runtime(self, *, runtime: Any, session: Any) -> Any:
-        session_view = self._runtime_session_view(runtime=runtime, session=session)
-        u1_state = (
-            (getattr(session_view, "metadata", {}) or {})
-            .get("omni_model_state", {})
-            .get("u1", {})
-        )
+    def decode_next_segment_from_runtime(
+        self, *, runtime: OmniSessionRuntime, session: OmniModelSessionView
+    ) -> OmniDecodeResult | None:
+        u1_state = (session.metadata or {}).get("omni_model_state", {}).get("u1", {})
         if bool(u1_state.get("native_interleave_prompt")):
             return self._decode_native_interleave_next_segment(
                 runtime=runtime,
-                session=session,
+                session=session.handle,
                 u1_state=u1_state,
             )
-        if not self._has_generated_image_commit(session_view):
+        if not self._has_generated_image_commit(session):
             return OmniDecodeResult(type="image_marker")
         if self.native_tokenizer is None or runtime is None:
             raise RuntimeError("SenseNova U1 decode requires a tokenizer and runtime")
-        if getattr(runtime, "srt_request_executor", None) is None:
+        if runtime.srt_request_executor is None:
             raise RuntimeError("SenseNova U1 decode requires a SRT request executor")
         max_new_tokens = max(
             1,
-            int(getattr(runtime, "srt_ar_decode_max_new_tokens", 0) or 0),
+            int(runtime.srt_ar_decode_max_new_tokens or 0),
         )
         decoded = runtime.decode_text(
-            session,
+            session.handle,
             max_new_tokens=max_new_tokens,
             greedy=True,
         )
@@ -273,8 +276,8 @@ class U1OmniModelAdapter:
     def _decode_native_interleave_next_segment(
         self,
         *,
-        runtime: Any,
-        session: Any,
+        runtime: OmniSessionRuntime,
+        session: OmniSessionHandle,
         u1_state: dict[str, Any],
     ) -> OmniDecodeResult:
         if self.native_tokenizer is None or runtime is None:
@@ -289,20 +292,20 @@ class U1OmniModelAdapter:
                 },
             )
             return OmniDecodeResult(type="image_marker")
-        if getattr(runtime, "srt_request_executor", None) is None:
+        if runtime.srt_request_executor is None:
             return OmniDecodeResult(type="done")
 
         img_start_id = _u1_token_id(self.native_tokenizer, U1_IMG_START_TOKEN)
         eos_token_ids = _u1_eos_token_ids(self.native_tokenizer)
         max_new_tokens = max(
             1,
-            int(getattr(runtime, "srt_ar_decode_max_new_tokens", 0) or 0),
+            int(runtime.srt_ar_decode_max_new_tokens or 0),
         )
         generated_text_ids: list[int] = []
         current_position = int(
             u1_state.get(
                 "generation_position_start",
-                getattr(session, "context_length", 0) or 0,
+                session.context_length,
             )
             or 0
         )
@@ -340,18 +343,12 @@ class U1OmniModelAdapter:
                     "interleave_pending_image_marker": bool(generated_text_ids),
                     "generation_position_start": current_position,
                 }
-                commit_decode_token = getattr(
-                    runtime, "commit_ar_decode_input_token", None
+                session = runtime.commit_ar_decode_input_token(
+                    session,
+                    token_id=token_id,
+                    position_id=current_position - 1,
+                    model_state_updates={"u1": state_updates},
                 )
-                if callable(commit_decode_token):
-                    session = commit_decode_token(
-                        session,
-                        token_id=token_id,
-                        position_id=current_position - 1,
-                        model_state_updates={"u1": state_updates},
-                    )
-                else:
-                    self._merge_runtime_u1_state(runtime, session, state_updates)
                 self._append_interleave_text_uncondition_marker(
                     runtime=runtime,
                     session=session,
@@ -410,16 +407,12 @@ class U1OmniModelAdapter:
     def _append_interleave_text_uncondition_marker(
         self,
         *,
-        runtime: Any,
-        session: Any,
+        runtime: OmniSessionRuntime,
+        session: OmniSessionHandle,
     ) -> None:
         if self.native_tokenizer is None:
             return
-        append_sidecar = getattr(runtime, "append_srt_sidecar_prepared_input", None)
-        get_sidecar_state = getattr(runtime, "get_srt_sidecar_model_state", None)
-        if not callable(append_sidecar) or not callable(get_sidecar_state):
-            return
-        sidecar_state = get_sidecar_state(
+        sidecar_state = runtime.get_srt_sidecar_model_state(
             session,
             U1_INTERLEAVE_TEXT_UNCONDITION_ROLE,
         )
@@ -436,49 +429,32 @@ class U1OmniModelAdapter:
             session=session,
             logical_position=int(logical_position),
         )
-        append_sidecar(session, prepared, state=OmniSegmentState.AR_DECODE)
+        runtime.append_srt_sidecar_prepared_input(
+            session, prepared, state=OmniSegmentState.AR_DECODE
+        )
 
     @staticmethod
     def _merge_runtime_u1_state(
-        runtime: Any,
-        session: Any,
+        runtime: OmniSessionRuntime,
+        session: OmniSessionHandle,
         updates: dict[str, Any],
     ) -> None:
-        record_for = getattr(runtime, "_record_for", None)
-        merge = getattr(runtime, "_merge_omni_model_state_updates", None)
-        if not callable(record_for) or not callable(merge):
-            return
         try:
-            record = record_for(session)
-        except Exception:
+            runtime.merge_model_state_updates(
+                session,
+                namespace="u1",
+                updates=updates,
+            )
+        except ValueError:
             return
-        merge(record, {"u1": dict(updates)})
-
-    @staticmethod
-    def _runtime_session_view(*, runtime: Any, session: Any) -> Any:
-        if getattr(session, "metadata", None) is not None:
-            return session
-        metadata: dict[str, Any] = {}
-        get_debug_counters = getattr(runtime, "get_debug_counters", None)
-        if callable(get_debug_counters):
-            try:
-                counters = get_debug_counters(session)
-                metadata["omni_model_state"] = counters.get("omni_model_state", {})
-                metadata["srt_last_ar_decode_output_ids"] = counters.get(
-                    "srt_last_ar_decode_output_ids",
-                    (),
-                )
-            except Exception:
-                metadata = {}
-        return SimpleNamespace(handle=session, metadata=metadata)
 
     def decode_vlm_text(
         self,
         *,
-        runtime: Any,
-        session: Any,
+        runtime: OmniSessionRuntime,
+        session: OmniSessionHandle,
         max_new_tokens: int,
-    ) -> Any:
+    ) -> OmniVLMTextGenerationResult:
         if runtime is None:
             raise RuntimeError("SenseNova U1 VLM text generation requires SRT runtime")
         decoded = runtime.decode_text(
@@ -497,7 +473,7 @@ class U1OmniModelAdapter:
     def append_generated_image(
         self,
         *,
-        session: Any,
+        session: OmniModelSessionView,
         image: Any | None,
     ) -> OmniModelAppendImageResult:
         del image
@@ -508,9 +484,8 @@ class U1OmniModelAdapter:
     def close_session(self, *, session_id: str) -> None:
         del session_id
 
-    def _has_generated_image_commit(self, session: Any) -> bool:
-        session_metadata = getattr(session, "metadata", {}) or {}
-        model_state = session_metadata.get("omni_model_state") or {}
+    def _has_generated_image_commit(self, session: OmniModelSessionView) -> bool:
+        model_state = (session.metadata or {}).get("omni_model_state") or {}
         u1_state = model_state.get("u1") or {}
         if bool(u1_state.get("last_generated_image_commit")):
             return True
@@ -521,11 +496,10 @@ class U1OmniModelAdapter:
 
     def _added_tokens_from_srt_session_view(
         self,
-        session: Any,
+        session: OmniModelSessionView,
     ) -> int:
-        handle = getattr(session, "handle", None)
-        previous_length = int(getattr(handle, "context_length", 0) or 0)
-        srt_length = int(getattr(session, "srt_last_origin_input_len", 0) or 0)
+        previous_length = int(session.handle.context_length or 0)
+        srt_length = int(session.srt_last_origin_input_len or 0)
         if srt_length > previous_length:
             return srt_length - previous_length
         return 0
@@ -551,6 +525,14 @@ class U1SRTBackedOmniSessionBridge(SRTBackedOmniSessionBridge):
             runtime,
             max_pre_image_decode_steps=max_pre_image_decode_steps,
         )
+
+    def _u1_adapter(self) -> U1OmniModelAdapter | None:
+        runner = self.runtime.model_runner
+        if isinstance(runner, OmniModelRunnerAdapter) and isinstance(
+            runner.adapter, U1OmniModelAdapter
+        ):
+            return runner.adapter
+        return None
 
     def prepare_ar_context(
         self,
@@ -609,23 +591,17 @@ class U1SRTBackedOmniSessionBridge(SRTBackedOmniSessionBridge):
         *,
         think: bool,
     ):
-        adapter = getattr(self.runtime.model_runner, "adapter", None)
-        old_cfg = getattr(adapter, "include_t2i_cfg_uncondition", False)
-        old_interleave_text_uncondition = getattr(
-            adapter,
-            "include_interleave_text_uncondition",
-            False,
-        )
-        old_edit_img_condition = getattr(adapter, "include_edit_img_condition", False)
-        old_edit_uncondition = getattr(adapter, "include_edit_uncondition", False)
-        old_mode = getattr(adapter, "native_generation_mode", None)
-        old_interleave_think_mode = getattr(
-            adapter,
-            "native_interleave_think_mode",
-            False,
-        )
+        adapter = self._u1_adapter()
         mode = getattr(sampling_params, "omni_generation_mode", None)
         if adapter is not None:
+            old_cfg = adapter.include_t2i_cfg_uncondition
+            old_interleave_text_uncondition = (
+                adapter.include_interleave_text_uncondition
+            )
+            old_edit_img_condition = adapter.include_edit_img_condition
+            old_edit_uncondition = adapter.include_edit_uncondition
+            old_mode = adapter.native_generation_mode
+            old_interleave_think_mode = adapter.native_interleave_think_mode
             needs_cfg = _u1_needs_any_cfg(sampling_params)
             cfg_text_scale = float(getattr(sampling_params, "cfg_text_scale", 1.0))
             cfg_img_scale = float(getattr(sampling_params, "cfg_img_scale", 1.0))
@@ -698,8 +674,8 @@ class U1SRTBackedOmniSessionBridge(SRTBackedOmniSessionBridge):
         contexts: OmniContextBundle,
         segment: Any,
     ) -> None:
-        adapter = getattr(self.runtime.model_runner, "adapter", None)
-        tokenizer = getattr(adapter, "native_tokenizer", None)
+        adapter = self._u1_adapter()
+        tokenizer = None if adapter is None else adapter.native_tokenizer
         if tokenizer is None or contexts.full.session is None:
             return
         image = getattr(segment, "commit_image", None)
@@ -707,24 +683,13 @@ class U1SRTBackedOmniSessionBridge(SRTBackedOmniSessionBridge):
             image = getattr(segment, "image", None)
         if image is None:
             return
-        get_handle = getattr(self.runtime, "get_srt_sidecar_handle", None)
-        get_state = getattr(self.runtime, "get_srt_sidecar_model_state", None)
-        append_sidecar = getattr(
-            self.runtime, "append_srt_sidecar_prepared_input", None
-        )
-        if (
-            not callable(get_handle)
-            or not callable(get_state)
-            or not callable(append_sidecar)
-        ):
-            return
-        sidecar_handle = get_handle(
+        sidecar_handle = self.runtime.get_srt_sidecar_handle(
             contexts.full.session,
             U1_INTERLEAVE_TEXT_UNCONDITION_ROLE,
         )
         if sidecar_handle is None:
             return
-        sidecar_state = get_state(
+        sidecar_state = self.runtime.get_srt_sidecar_model_state(
             contexts.full.session,
             U1_INTERLEAVE_TEXT_UNCONDITION_ROLE,
         )
@@ -741,7 +706,7 @@ class U1SRTBackedOmniSessionBridge(SRTBackedOmniSessionBridge):
         )
         prepared.srt_sidecar_role = U1_INTERLEAVE_TEXT_UNCONDITION_ROLE
         prepared.srt_sidecar_session_id = sidecar_handle.session_id
-        append_sidecar(
+        self.runtime.append_srt_sidecar_prepared_input(
             contexts.full.session,
             prepared,
             state=OmniSegmentState.APPEND_IMAGE,

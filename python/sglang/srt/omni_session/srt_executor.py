@@ -12,6 +12,7 @@ from typing import Any
 
 import torch
 
+from sglang.srt.omni_session.runtime import OmniSRTRequestExecutor
 from sglang.srt.omni_session.runtime_protocol import OmniSRTKVTokenBinding
 
 
@@ -50,8 +51,8 @@ class OmniSRTTemporaryForwardBatch:
                 self.req_to_token_pool.free(self.temp_req)
 
 
-class OmniSRTSchedulerExecutor:
-    """Minimal adapter from omni materialized requests into an SRT Scheduler."""
+class OmniSRTSchedulerExecutor(OmniSRTRequestExecutor):
+    """Adapter that executes materialized omni session requests through SRT."""
 
     finish_request_after_execute = False
 
@@ -68,6 +69,7 @@ class OmniSRTSchedulerExecutor:
                 "OmniSRTSchedulerExecutor requires scheduler.session_controller"
             )
         self.scheduler = scheduler
+        # Synchronous mode keeps omni AR/session state updated before mm-gen runs.
         self.run_synchronously = run_synchronously
         self.max_sync_steps = max_sync_steps
         self.require_idle_scheduler = require_idle_scheduler

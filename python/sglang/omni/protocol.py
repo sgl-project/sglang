@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Shared omni contracts between orchestration and execution backends.
 
-The protocol deliberately carries modality segments and context references,
+The contracts deliberately carry modality segments and context references,
 not model-specific session objects. AR backends own token/session state, while
 generation backends own media synthesis and may choose colocated or standalone
 serving runtimes.
@@ -9,8 +9,9 @@ serving runtimes.
 
 from __future__ import annotations
 
+from abc import ABC, abstractmethod
 from dataclasses import asdict, dataclass, field
-from typing import Any, Literal, Protocol
+from typing import Any, Literal
 
 InputSegmentType = Literal["text", "image", "audio", "video"]
 OutputSegmentType = Literal["text", "image", "audio", "video"]
@@ -221,28 +222,35 @@ class OmniResponse:
         return payload
 
 
-class ContextOps(Protocol):
+class ContextOps(ABC):
     """Narrow live-context capability exposed to generation backends."""
 
     @property
+    @abstractmethod
     def metadata(self) -> dict[str, Any]: ...
 
     @property
+    @abstractmethod
     def generation_kind(self) -> str | None: ...
 
     @property
+    @abstractmethod
     def session_id(self) -> str | None: ...
 
+    @abstractmethod
     def get_role(self, name: str, default: str) -> str: ...
 
+    @abstractmethod
     def get_model(self) -> Any: ...
 
+    @abstractmethod
     def get_position_count(
         self,
         *,
         sidecar_role: str | None = None,
     ) -> int | None: ...
 
+    @abstractmethod
     def build_temporary_forward_batch(
         self,
         *,
@@ -252,17 +260,20 @@ class ContextOps(Protocol):
     ) -> Any: ...
 
 
-class ARBackend(Protocol):
+class ARBackend(ABC):
     """Autoregressive text/session backend used by omni orchestration."""
 
+    @abstractmethod
     def prepare_context(self, request: OmniRequest) -> OmniContextBundle: ...
 
+    @abstractmethod
     def append_input_segments(
         self,
         context: OmniContextBundle,
         request: OmniRequest,
     ) -> OmniContextBundle: ...
 
+    @abstractmethod
     def decode_until_boundary(
         self,
         context: OmniContextBundle,
@@ -270,6 +281,7 @@ class ARBackend(Protocol):
         request: OmniRequest,
     ) -> OmniBoundary: ...
 
+    @abstractmethod
     def append_generated_segment(
         self,
         context: OmniContextBundle,
@@ -278,14 +290,17 @@ class ARBackend(Protocol):
         request: OmniRequest,
     ) -> OmniContextBundle: ...
 
+    @abstractmethod
     def get_context_ops(self, context: OmniContextBundle) -> ContextOps: ...
 
+    @abstractmethod
     def release(self, context: OmniContextBundle) -> None: ...
 
 
-class MultimodalGenerationBackend(Protocol):
+class MultimodalGenerationBackend(ABC):
     """Media generation backend used by omni orchestration."""
 
+    @abstractmethod
     def generate_segment(
         self,
         request: OmniRequest,

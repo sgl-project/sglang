@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """Middle bridge between generic omni orchestration and SRT session execution."""
 
+from abc import ABC, abstractmethod
 from collections.abc import Callable
 from types import SimpleNamespace
-from typing import Any, Protocol
+from typing import Any
 
 from sglang.srt.omni_session.runtime_protocol import (
     OmniContextBundle,
@@ -19,15 +20,17 @@ from sglang.srt.omni_session.runtime import (
     OmniDecodeResult,
     OmniInterleavedMessage,
     OmniSessionRuntime,
+    OmniSRTRequestExecutor,
     OmniVLMTextGenerationResult,
 )
 
 GeneratedSegmentExecutor = Callable[[Any], GeneratedSegmentResult]
 
 
-class OmniSessionBridge(Protocol):
+class OmniSessionBridge(ABC):
     generation_kind: GenerationKind
 
+    @abstractmethod
     def prepare_ar_context(
         self,
         *,
@@ -38,6 +41,7 @@ class OmniSessionBridge(Protocol):
         sampling_params: Any | None = None,
     ) -> OmniContextBundle: ...
 
+    @abstractmethod
     def prepare_ar_context_from_messages(
         self,
         *,
@@ -48,6 +52,7 @@ class OmniSessionBridge(Protocol):
         session_id: str | None = None,
     ) -> OmniContextBundle: ...
 
+    @abstractmethod
     def run_generated_segment(
         self,
         *,
@@ -55,16 +60,20 @@ class OmniSessionBridge(Protocol):
         executor: GeneratedSegmentExecutor,
     ) -> GeneratedSegmentResult: ...
 
+    @abstractmethod
     def commit_generated_segment(
         self, *, contexts: OmniContextBundle, segment: GeneratedSegmentResult
     ) -> None: ...
 
+    @abstractmethod
     def release(self, contexts: OmniContextBundle) -> None: ...
 
+    @abstractmethod
     def continue_ar_decode(
         self, *, contexts: OmniContextBundle
     ) -> OmniDecodeResult: ...
 
+    @abstractmethod
     def generate_vlm_text(
         self,
         *,
@@ -107,22 +116,13 @@ class SRTBackedGenerationContextOps:
         return str(getattr(self._bridge, attr_name, default))
 
     def get_model(self) -> Any:
-        get_srt_model = getattr(self._executor(), "get_srt_model", None)
-        if not callable(get_srt_model):
-            raise RuntimeError("generation context ops require model access")
-        return get_srt_model()
+        return self._executor().get_srt_model()
 
     def get_position_count(self, *, sidecar_role: str | None = None) -> int | None:
-        get_position_count = getattr(
-            self._executor(),
-            "get_latest_session_position_count",
-            None,
+        return self._executor().get_latest_session_position_count(
+            self.session_id,
+            sidecar_role=sidecar_role,
         )
-        if not callable(get_position_count):
-            raise RuntimeError(
-                "generation context ops require latest context position count"
-            )
-        return get_position_count(self.session_id, sidecar_role=sidecar_role)
 
     def build_temporary_forward_batch(
         self,
@@ -131,24 +131,14 @@ class SRTBackedGenerationContextOps:
         generation_query_embeds: Any,
         timestep: Any,
     ) -> Any:
-        build_forward_batch = getattr(
-            self._executor(),
-            "build_temporary_context_forward_batch_for_session",
-            None,
-        )
-        if not callable(build_forward_batch):
-            raise RuntimeError(
-                "generation context ops require temporary query forward batches"
-            )
-        return build_forward_batch(
+        return self._executor().build_temporary_context_forward_batch_for_session(
             prepared=self._to_srt_prepared(prepared),
             generation_query_embeds=generation_query_embeds,
             timestep=timestep,
         )
 
-    def _executor(self) -> Any:
-        runtime = getattr(self._bridge, "runtime", None)
-        executor = getattr(runtime, "srt_request_executor", None)
+    def _executor(self) -> OmniSRTRequestExecutor:
+        executor = self._bridge.runtime.srt_request_executor
         if executor is None:
             raise RuntimeError(
                 "SRT-backed generation context ops require a request executor"
@@ -164,7 +154,7 @@ class SRTBackedGenerationContextOps:
         return SimpleNamespace(**data)
 
 
-class SRTBackedOmniSessionBridge:
+class SRTBackedOmniSessionBridge(OmniSessionBridge):
     """omni middle bridge that keeps SRT as the session/KV owner.
 
     It asks the runtime to prefill/decode/commit AR-side chunks, while generation-side
@@ -338,12 +328,6 @@ class SRTBackedOmniSessionBridge:
         *,
         max_new_tokens: int | None,
     ) -> OmniVLMTextGenerationResult:
-        decode_vlm_text = getattr(self.runtime.model_runner, "decode_vlm_text", None)
-        if not callable(decode_vlm_text):
-            raise RuntimeError(
-                f"{self.runtime.model_runner.__class__.__name__} does not support "
-                "omni think text generation"
-            )
         if max_new_tokens is None:
             max_new_tokens = DEFAULT_OMNI_TEXT_MAX_NEW_TOKENS
         max_new_tokens = int(max_new_tokens)
@@ -351,11 +335,17 @@ class SRTBackedOmniSessionBridge:
             raise ValueError(
                 f"omni think text generation requires max_new_tokens > 0, got {max_new_tokens}"
             )
-        return decode_vlm_text(
-            runtime=self.runtime,
-            session=session,
-            max_new_tokens=max_new_tokens,
-        )
+        try:
+            return self.runtime.model_runner.decode_vlm_text(
+                runtime=self.runtime,
+                session=session,
+                max_new_tokens=max_new_tokens,
+            )
+        except NotImplementedError as exc:
+            raise RuntimeError(
+                f"{self.runtime.model_runner.__class__.__name__} does not support "
+                "omni think text generation"
+            ) from exc
 
     def generate_vlm_text(
         self,
@@ -372,15 +362,14 @@ class SRTBackedOmniSessionBridge:
             normalize_omni_interleaved_messages(messages)
         )
         try:
-            decode_vlm_text = getattr(
-                self.runtime.model_runner, "decode_vlm_text", None
-            )
-            if callable(decode_vlm_text):
-                return decode_vlm_text(
+            try:
+                return self.runtime.model_runner.decode_vlm_text(
                     runtime=self.runtime,
                     session=session,
                     max_new_tokens=max_new_tokens,
                 )
+            except NotImplementedError:
+                pass
             segment = self.runtime.decode_next_segment(session)
             if segment.type != "text":
                 raise ValueError(

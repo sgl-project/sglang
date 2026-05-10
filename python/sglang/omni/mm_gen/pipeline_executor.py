@@ -11,11 +11,16 @@ from sglang.omni.mm_gen.pipeline_forward import (
     build_pipeline_req,
     coerce_generated_segment,
 )
-from sglang.omni.protocol import ContextOps, GeneratedSegment, OmniRequest
+from sglang.omni.protocol import (
+    ContextOps,
+    GeneratedSegment,
+    MultimodalGenerationBackend,
+    OmniRequest,
+)
 
 
 @dataclass(slots=True)
-class PipelineExecutorBackend:
+class PipelineExecutorBackend(MultimodalGenerationBackend):
     """Drive multimodal_gen stages through a PipelineExecutor.
 
     This is the boundary to use when omni stops calling a full pipeline object

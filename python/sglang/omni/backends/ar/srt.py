@@ -16,6 +16,8 @@ from types import SimpleNamespace
 from typing import Any
 
 from sglang.omni.protocol import (
+    ARBackend,
+    ContextOps,
     GeneratedSegment,
     OmniBoundary,
     OmniContextBundle,
@@ -27,7 +29,7 @@ from sglang.srt.omni_session.middle import SRTBackedOmniSessionBridge
 
 
 @dataclass(slots=True)
-class SRTBackedContextOps:
+class SRTBackedContextOps(ContextOps):
     """Expose live SRT context operations to a colocated generation backend."""
 
     bridge: Any
@@ -89,7 +91,7 @@ class SRTBackedContextOps:
         return SimpleNamespace(**data)
 
 
-class SRTARBackend:
+class SRTARBackend(ARBackend):
     """AR backend in an omni pipeline, which delegates AR-side work to an SRT-owned middle bridge."""
 
     def __init__(self, bridge: SRTBackedOmniSessionBridge):
