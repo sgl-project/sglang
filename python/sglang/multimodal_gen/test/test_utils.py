@@ -50,8 +50,7 @@ SGL_TEST_FILES_CONSISTENCY_GT_BASES = (
     SGL_TEST_FILES_OFFICIAL_CONSISTENCY_GT_BASE,
     SGL_TEST_FILES_SGLANG_CONSISTENCY_GT_BASE,
 )
-# Keep non-comparable LTX CI scenarios on sglang_generated rather than hiding
-# remaining semantic gaps behind very loose official thresholds.
+# LTX cases listed here compare against official-generated GT.
 SGL_TEST_FILES_OFFICIAL_CONSISTENCY_GT_CASES = frozenset(
     {
         "ltx_2.3_one_stage_ti2v",
