@@ -1108,7 +1108,12 @@ class ModelConfig:
 
     # adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/config.py
     def _verify_quantization(self) -> None:
-        supported_quantization = [*QUANTIZATION_METHODS]
+        # MLX backend on-the-fly quantization names — see python/sglang/srt/hardware_backend/mlx/.
+        # These are NOT in QUANTIZATION_METHODS because the MLX backend handles the
+        # quantization itself via mlx_lm.utils.quantize_model rather than the standard
+        # PyTorch quantization config machinery.
+        _mlx_quantization_methods = ["mlx_q4", "mlx_q8"]
+        supported_quantization = [*QUANTIZATION_METHODS, *_mlx_quantization_methods]
         rocm_supported_quantization = [
             "awq",
             "gptq",

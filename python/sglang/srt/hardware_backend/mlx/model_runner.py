@@ -236,10 +236,11 @@ class MlxModelRunner:
                 mx.eval(self.model.parameters())
                 mem_after = mx.get_active_memory()
                 q_time = time.time() - q_start
+                pct_reduction = (1 - mem_after / max(mem_before, 1)) * 100
                 logger.info(
                     f"Quantization complete in {q_time:.2f}s — "
-                    f"active mem: {mem_before / 1024**3:.2f} -> {mem_after / 1024**3:.2f} GB "
-                    f"({(1 - mem_after / max(mem_before, 1)) * 100:+.1f}%)"
+                    f"active mem: {mem_before / 1024**3:.2f} GB -> "
+                    f"{mem_after / 1024**3:.2f} GB ({pct_reduction:.1f}% reduction)"
                 )
 
         # Force-evaluate weights so mx.get_active_memory() reflects
