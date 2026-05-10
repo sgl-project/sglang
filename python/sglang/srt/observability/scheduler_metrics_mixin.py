@@ -162,6 +162,8 @@ class SchedulerMetricsMixin:
 
         self.fwd_occupancy = float("nan")
 
+        self.forward_pass_device_timer: Optional[DeviceTimer] = None
+
         if ENABLE_METRICS_DEVICE_TIMER:
             self._device_timer_window_batch_count = 0
             self._device_timer_window_gpu_time = 0.0
@@ -185,7 +187,7 @@ class SchedulerMetricsMixin:
         )
 
     def install_device_timer_on_runners(self: Scheduler):
-        if not hasattr(self, "forward_pass_device_timer"):
+        if self.forward_pass_device_timer is None:
             return
         timer = self.forward_pass_device_timer
         self.tp_worker.model_runner.device_timer = timer
@@ -237,7 +239,7 @@ class SchedulerMetricsMixin:
             def _fpm_device_timer_reporter(t, **_kwargs):
                 self._fpm_gpu_time_acc += t
 
-            if hasattr(self, "forward_pass_device_timer"):
+            if self.forward_pass_device_timer is not None:
                 self.forward_pass_device_timer.add_reporter(_fpm_device_timer_reporter)
             else:
                 self.forward_pass_device_timer = DeviceTimer(
