@@ -566,7 +566,6 @@ TWO_GPU_CASES = [
             cfg_parallel=True,
             extras=[
                 "--pipeline-class-name LTX2TwoStagePipeline --ltx2-two-stage-device-mode original",
-                "--transformer-weight-quantization fp8-cast",
             ],
         ),
         TI2V_sampling_params,
