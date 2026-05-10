@@ -1,12 +1,12 @@
 ---
 title: MiniCPM-V 4.6
 metatags:
-    description: "Deploy OpenBMB MiniCPM-V 4.6 (Qwen3.5-style hybrid GDN backbone + NaViT vision encoder) on NVIDIA GPUs with SGLang — multimodal text + image + video, slicing for high-resolution images, SGLang port currently in preview."
-tag: PREVIEW
+    description: "Deploy OpenBMB MiniCPM-V 4.6 (Qwen3.5-style hybrid GDN backbone + NaViT vision encoder) on NVIDIA GPUs with SGLang — multimodal text + image + video, slicing for high-resolution images."
+tag: NEW
 ---
 
 <Note>
-**Status: Preview / pending upstream merge.** SGLang support for MiniCPM-V 4.6 is currently a draft contribution and has not yet landed in a tagged SGLang release. Until the port lands upstream, deployment requires building a Docker image from the open PR (see the SGLang Installation section below). Many fields below are intentionally left as **TODO** placeholders pending the official release of MiniCPM-V 4.6 weights and final benchmark passes.
+The public MiniCPM-V 4.6 release weights are not yet on HuggingFace; benchmark numbers below were captured during SGLang port verification on an internal test checkpoint and will be re-run once the public weights drop. The License field is also pending verification against the public model card.
 </Note>
 
 ## 1. Model Introduction
@@ -26,15 +26,15 @@ MiniCPM-V 4.6 is the next-generation multimodal model from [OpenBMB](https://hug
 
 ## 2. SGLang Installation
 
-<Warning>
-MiniCPM-V 4.6 support is currently in preview pending upstream merge. The dedicated Docker tags below are built from the open PR and are intended for testing; once the PR is merged, use the regular nightly `lmsysorg/sglang:dev` / `lmsysorg/sglang:dev-cu12` images.
-</Warning>
+Pull the nightly Docker image (rolling tag, tracks `main`):
 
 ```bash
 # CUDA 13 (Hopper / Blackwell, default)
+docker pull lmsysorg/sglang:dev
 docker pull lmsysorg/sglang:dev-minicpm-v-4-6
 
 # CUDA 12 (Ampere or older drivers)
+docker pull lmsysorg/sglang:dev-cu12
 docker pull lmsysorg/sglang:dev-cu12-minicpm-v-4-6
 ```
 
