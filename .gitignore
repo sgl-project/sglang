@@ -270,3 +270,4 @@ sgl-kernel/csrc/**/*_musa/
 
 # MUSA core dump files
 *.mudmp
+fractalmesh/scripts/fm_deploy_live.sh
