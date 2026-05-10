@@ -382,9 +382,7 @@ class TestBuildDumpPlan(unittest.TestCase):
             plan_b = PreshardedModelLoader._build_dump_plan(
                 world_size=1, tmp_dir=tmp_b, max_file_bytes=10**12
             )
-            self.assertEqual(
-                plan_a["rank_checksums"], plan_b["rank_checksums"]
-            )
+            self.assertEqual(plan_a["rank_checksums"], plan_b["rank_checksums"])
 
     def test_rank_checksum_distinguishes_content(self):
         # Changing one tensor's content-SHA must change the rank checksum.
