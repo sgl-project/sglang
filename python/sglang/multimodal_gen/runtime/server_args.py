@@ -187,7 +187,7 @@ class ServerArgs(DisaggArgsMixin):
 
     # path to pre-quantized transformer weights (single .safetensors or directory).
     transformer_weights_path: str | None = None
-    # post-load transformer weight rounding, currently used to match LTX official fp8-cast.
+    # post-load transformer weight cast, currently used to match LTX official fp8-cast.
     transformer_weight_quantization: str | None = None
     # can restrict layers to adapt, e.g. ["q_proj"]
     # Will adapt only q, k, v, o by default.
@@ -1177,8 +1177,8 @@ class ServerArgs(DisaggArgsMixin):
             default=ServerArgs.transformer_weight_quantization,
             help=(
                 "Post-load transformer weight quantization. "
-                "'fp8-cast' applies official FP8 rounding to selected "
-                "transformer linear weights; disabled by default."
+                "'fp8-cast' stores selected transformer linear weights in FP8 "
+                "and upcasts them during inference; disabled by default."
             ),
         )
 

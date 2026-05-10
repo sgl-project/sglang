@@ -416,16 +416,14 @@ def resolve_transformer_quant_load_spec(
 
 
 def apply_transformer_fp8_cast(model: nn.Module) -> None:
-    cast_dtype = torch.float8_e4m3fn
     converted = 0
     for name, module in model.named_modules():
         if not _should_fp8_cast_linear(name, module):
             continue
 
-        module.fp8_cast_weight_dtype = cast_dtype
-        if _round_parameter_data_to_fp8(getattr(module, "weight", None), cast_dtype):
+        if _cast_parameter_data(getattr(module, "weight", None), torch.float8_e4m3fn):
             converted += 1
-        _round_parameter_data_to_fp8(getattr(module, "bias", None), cast_dtype)
+        _cast_parameter_data(getattr(module, "bias", None), torch.float8_e4m3fn)
 
     logger.info("Applied transformer fp8-cast to %d linear layers", converted)
 
@@ -438,14 +436,12 @@ def _should_fp8_cast_linear(name: str, module: nn.Module) -> bool:
     return any(name.endswith(suffix) for suffix in _FP8_CAST_LINEAR_SUFFIXES)
 
 
-def _round_parameter_data_to_fp8(
-    param: nn.Parameter | None, dtype: torch.dtype
-) -> bool:
+def _cast_parameter_data(param: nn.Parameter | None, dtype: torch.dtype) -> bool:
     if param is None or not param.is_floating_point():
         return False
     if is_fp8_cast_dtype(param.dtype):
         return False
-    param.data = param.data.to(dtype=dtype).to(dtype=param.dtype)
+    param.data = param.data.to(dtype=dtype)
     return True
 
 

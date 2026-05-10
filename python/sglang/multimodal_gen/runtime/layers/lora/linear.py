@@ -193,9 +193,8 @@ class BaseLayerWithLoRA(nn.Module):
             data: The base weight tensor to merge LoRA into (modified in-place)
             lora_list: List of (lora_A, lora_B, lora_path, lora_strength, rank, alpha) tuples
         """
-        fp8_cast_dtype = getattr(self.base_layer, "fp8_cast_weight_dtype", None)
-        if is_fp8_cast_dtype(data.dtype) or fp8_cast_dtype is not None:
-            self._merge_lora_into_fp8_cast_data(data, lora_list, fp8_cast_dtype)
+        if is_fp8_cast_dtype(data.dtype):
+            self._merge_lora_into_fp8_cast_data(data, lora_list)
             return
 
         # Merge all LoRA adapters in order
@@ -248,7 +247,6 @@ class BaseLayerWithLoRA(nn.Module):
         self,
         data: torch.Tensor,
         lora_list: list[LoRAWeightEntry],
-        fp8_cast_dtype: torch.dtype | None = None,
     ) -> None:
         data_2d = data.reshape(-1, data.shape[-1]) if data.dim() > 2 else data
         if not data_2d.is_contiguous():
@@ -276,12 +274,7 @@ class BaseLayerWithLoRA(nn.Module):
                 lora_delta = lora_delta.reshape(-1, lora_delta.shape[-1])
             deltas.add_(lora_delta, alpha=scale)
 
-        if is_fp8_cast_dtype(data.dtype):
-            original_weight = data_2d.reshape(-1)
-        else:
-            original_weight = data_2d.to(dtype=fp8_cast_dtype).reshape(-1)
-
-        fused_add_round_fp8_cast_(deltas.reshape(-1), original_weight, seed=0)
+        fused_add_round_fp8_cast_(deltas.reshape(-1), data_2d.reshape(-1), seed=0)
         data_2d.copy_(deltas.to(dtype=data.dtype))
 
     def _should_merge_in_fp32(
