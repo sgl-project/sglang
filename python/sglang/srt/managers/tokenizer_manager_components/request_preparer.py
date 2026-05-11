@@ -56,14 +56,14 @@ class _ResolvedInput:
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class RequestPreparer:
-    raw_tokenizer_wrapper: RawTokenizerWrapper
-    multimodal_processor: MultimodalProcessor
-    request_validator: RequestValidator
-    tokenized_request_builder: TokenizedRequestBuilder
+    raw_tokenizer: RawTokenizerWrapper
+    multimodal: MultimodalProcessor
+    validator: RequestValidator
+    builder: TokenizedRequestBuilder
     rid_to_state: Dict[str, ReqState]
     config: RequestPreparerConfig
 
-    async def _tokenize_one_request(
+    async def tokenize_one(
         self,
         obj: Union[GenerateReqInput, EmbeddingReqInput],
     ):
@@ -71,8 +71,8 @@ class RequestPreparer:
         resolved = await self._resolve_input_source(obj)
         mm_inputs, resolved = await self._maybe_run_mm_processor(obj, resolved)
 
-        self.request_validator.validate_one(obj=obj, input_ids=resolved.input_ids)
-        tokenized_obj = self.tokenized_request_builder.build(
+        self.validator.validate_one(obj=obj, input_ids=resolved.input_ids)
+        tokenized_obj = self.builder.build(
             obj,
             resolved.input_text,
             resolved.input_ids,
@@ -119,10 +119,8 @@ class RequestPreparer:
                 # Use empty placeholder - multimodal processor will override
                 input_ids = []
             else:
-                input_ids, token_type_ids = (
-                    await self.raw_tokenizer_wrapper._tokenize_texts(
-                        input_text, is_cross_encoder_request
-                    )
+                input_ids, token_type_ids = await self.raw_tokenizer._tokenize_texts(
+                    input_text, is_cross_encoder_request
                 )
         return _ResolvedInput(
             input_ids=input_ids,
@@ -151,7 +149,7 @@ class RequestPreparer:
         if obj.audio_data is not None and not isinstance(obj.audio_data, list):
             obj.audio_data = [obj.audio_data]
         if contains_mm_input:
-            self.request_validator._validate_mm_limits(obj)
+            self.validator._validate_mm_limits(obj)
 
         mm_inputs = await self._dispatch_mm_processor(
             obj, resolved.input_text, resolved.input_ids
@@ -189,7 +187,7 @@ class RequestPreparer:
         ]:
             mm_inputs = None
             if self.config.language_only:
-                mm_inputs = await self.multimodal_processor.mm_receiver.recv_mm_data(
+                mm_inputs = await self.multimodal.mm_receiver.recv_mm_data(
                     request_obj=obj,
                     mm_processor=self.mm_processor,
                     prompt=(input_text or input_ids),
@@ -222,7 +220,7 @@ class RequestPreparer:
 
         return None
 
-    async def _batch_tokenize_and_process(
+    async def tokenize_batch(
         self,
         batch_size: int,
         obj: Union[GenerateReqInput, EmbeddingReqInput],
@@ -234,9 +232,9 @@ class RequestPreparer:
         # so lets construct the return object
         if not self._batch_has_text(batch_size, obj):
             # All requests already have input_ids, no need to tokenize
-            return [await self._tokenize_one_request(obj[i]) for i in range(batch_size)]
+            return [await self.tokenize_one(obj[i]) for i in range(batch_size)]
 
-        self.request_validator.validate_batch_tokenization_constraints(
+        self.validator.validate_batch_tokenization_constraints(
             batch_size=batch_size, obj=obj
         )
 
@@ -251,20 +249,18 @@ class RequestPreparer:
         )
 
         # Batch tokenize all texts using unified method
-        input_ids_list, token_type_ids_list = (
-            await self.raw_tokenizer_wrapper._tokenize_texts(
-                texts, is_cross_encoder_request
-            )
+        input_ids_list, token_type_ids_list = await self.raw_tokenizer._tokenize_texts(
+            texts, is_cross_encoder_request
         )
 
         # Process all requests
         tokenized_objs = []
         for i, req in enumerate(requests):
-            self.request_validator.validate_one(obj=obj[i], input_ids=input_ids_list[i])
+            self.validator.validate_one(obj=obj[i], input_ids=input_ids_list[i])
             token_type_ids = (
                 token_type_ids_list[i] if token_type_ids_list is not None else None
             )
-            tokenized_obj = self.tokenized_request_builder.build(
+            tokenized_obj = self.builder.build(
                 req,
                 req.text,
                 input_ids_list[i],
@@ -292,7 +288,7 @@ class RequestPreparer:
 
         return False
 
-    def _should_use_batch_tokenization(self, batch_size, requests) -> bool:
+    def should_use_batch_tokenization(self, batch_size, requests) -> bool:
         """Return True if we should run the tokenizer in batch mode.
 
         Current policy:

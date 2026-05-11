@@ -300,10 +300,10 @@ class TokenizerManager(TokenizerControlMixin):
 
         # Request preparer
         self.request_preparer = RequestPreparer(
-            raw_tokenizer_wrapper=self.raw_tokenizer_wrapper,
-            multimodal_processor=self.multimodal_processor,
-            request_validator=self.request_validator,
-            tokenized_request_builder=self.tokenized_request_builder,
+            raw_tokenizer=self.raw_tokenizer_wrapper,
+            multimodal=self.multimodal_processor,
+            validator=self.request_validator,
+            builder=self.tokenized_request_builder,
             rid_to_state=self.rid_to_state,
             config=RequestPreparerConfig(
                 skip_tokenizer_init=self.server_args.skip_tokenizer_init,
@@ -508,7 +508,7 @@ class TokenizerManager(TokenizerControlMixin):
 
             # Tokenize the request and send it to the scheduler
             if obj.is_single:
-                tokenized_obj = await self.request_preparer._tokenize_one_request(obj)
+                tokenized_obj = await self.request_preparer.tokenize_one(obj)
                 self._send_one_request(tokenized_obj)
                 async for response in self.response_emitter._wait_one_response(
                     obj, request

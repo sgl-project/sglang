@@ -55,7 +55,7 @@ class BatchRequestDispatcher:
     ) -> Tuple[List[AsyncGenerator], List[str]]:
         batch_size = obj.batch_size
         if getattr(obj, "parallel_sample_num", 1) == 1:
-            if self.request_preparer._should_use_batch_tokenization(batch_size, obj):
+            if self.request_preparer.should_use_batch_tokenization(batch_size, obj):
                 return await self._dispatch_batch_tokenized(obj, batch_size, request)
             else:
                 return await self._dispatch_sequential_tokenized(
@@ -70,9 +70,7 @@ class BatchRequestDispatcher:
         batch_size: int,
         request: Optional[fastapi.Request],
     ) -> Tuple[List[AsyncGenerator], List[str]]:
-        tokenized_objs = await self.request_preparer._batch_tokenize_and_process(
-            batch_size, obj
-        )
+        tokenized_objs = await self.request_preparer.tokenize_batch(batch_size, obj)
         self.send_batch_request(tokenized_objs)
 
         # Set up generators for each request in the batch
@@ -102,9 +100,7 @@ class BatchRequestDispatcher:
         ):
             for i in range(batch_size):
                 tmp_obj = obj[i]
-                tokenized_obj = await self.request_preparer._tokenize_one_request(
-                    tmp_obj
-                )
+                tokenized_obj = await self.request_preparer.tokenize_one(tmp_obj)
                 self.send_one_request(tokenized_obj)
                 generators.append(
                     self.response_emitter._wait_one_response(tmp_obj, request)
@@ -129,7 +125,7 @@ class BatchRequestDispatcher:
         # Tokenize all requests
         objs = [obj[i] for i in range(batch_size)]
         tokenized_objs = await asyncio.gather(
-            *(self.request_preparer._tokenize_one_request(o) for o in objs)
+            *(self.request_preparer.tokenize_one(o) for o in objs)
         )
 
         await self._cache_parallel_sample_prefix(objs, tokenized_objs, request)
