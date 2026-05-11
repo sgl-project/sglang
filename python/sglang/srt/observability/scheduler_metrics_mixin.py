@@ -372,7 +372,9 @@ class SchedulerMetricsMixin:
             prefill_stats.log_input_tokens / gap_latency if gap_latency > 0 else 0.0
         )
 
-        pool_stats = self.get_pool_stats()
+        pool_stats = self.get_pool_stats(
+            self.pool_stats_observer,
+        )
         token_usage_msg = ", ".join(pool_stats.get_prefill_usage_msg_parts()) + ", "
 
         self.stats.new_token_ratio = prefill_stats.new_token_ratio
@@ -533,7 +535,9 @@ class SchedulerMetricsMixin:
         self.num_generated_tokens = 0
         num_running_reqs = len(batch.reqs)
 
-        pool_stats = self.get_pool_stats()
+        pool_stats = self.get_pool_stats(
+            self.pool_stats_observer,
+        )
         token_usage_msg = ", ".join(pool_stats.get_decode_usage_msg_parts()) + ", "
 
         if RECORD_STEP_TIME:
@@ -658,8 +662,12 @@ class SchedulerMetricsMixin:
                 )
 
             # Streaming session metrics
-            self.stats.num_streaming_sessions = self._streaming_session_count()
-            self.stats.streaming_session_held_tokens = self._session_held_tokens()
+            self.stats.num_streaming_sessions = self.streaming_session_count(
+                self.pool_stats_observer,
+            )
+            self.stats.streaming_session_held_tokens = self.session_held_tokens(
+                self.pool_stats_observer,
+            )
 
             # Routing key metrics
             # (to reduce the overhead, we only compute this when all requests have routing_key)
@@ -849,7 +857,9 @@ class SchedulerMetricsMixin:
             waiting_queues.append(self.disagg_decode_prealloc_queue.retracted_queue)
 
         num_waiting_reqs = sum(len(queue) for queue in waiting_queues)
-        num_used_tokens, kv_token_usage = self.get_pool_stats().get_kv_token_stats()
+        num_used_tokens, kv_token_usage = self.get_pool_stats(
+            self.pool_stats_observer,
+        ).get_kv_token_stats()
         num_total_tokens = num_used_tokens + sum(
             req.seqlen for queue in waiting_queues for req in queue
         )

@@ -9,7 +9,7 @@ maybe_stub_sgl_kernel()
 
 from sglang.srt.managers.io_struct import PauseGenerationReqInput
 from sglang.srt.managers.scheduler import Scheduler
-from sglang.srt.managers.scheduler_runtime_checker_mixin import PoolStats
+from sglang.srt.managers.scheduler_components.pool_stats_observer import PoolStats
 
 register_cpu_ci(est_time=15, suite="stage-a-test-cpu")
 
