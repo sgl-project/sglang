@@ -136,17 +136,6 @@ struct HicacheKernelParams {
   uint32_t num_layers = 0;  // only used in all_layer transfer
 };
 
-struct HicacheRelayoutParams {
-  void* __restrict__ k_cache_dst;
-  void* __restrict__ v_cache_dst;
-  const void* __restrict__ indices_src;
-  const void* __restrict__ k_ptr_src;
-  const void* __restrict__ v_ptr_src;
-  uint32_t num_pages;
-  uint32_t num_layers;
-  uint32_t page_size;
-};
-
 template <
     typename T,
     int64_t kElementSize,
@@ -235,7 +224,7 @@ SGL_HICACHE_KERNEL void hicache_transfer_all_layer(const __grid_constant__ Hicac
 }
 
 template <int64_t kElementSize, uint32_t kUnroll, uint32_t kBlockQuota, uint32_t kBlockSize>
-struct HiCacheTransferKernel {
+struct HiCacheKernel {
   template <typename T>
   static constexpr auto kernel_one = hicache_transfer_per_layer<T, kElementSize, kUnroll, kBlockQuota, kBlockSize>;
   template <typename T>

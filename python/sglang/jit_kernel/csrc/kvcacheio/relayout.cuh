@@ -6,6 +6,17 @@
 
 namespace {
 
+struct HicacheRelayoutParams {
+  void* __restrict__ k_cache_dst;
+  void* __restrict__ v_cache_dst;
+  const void* __restrict__ indices_src;
+  const void* __restrict__ k_ptr_src;
+  const void* __restrict__ v_ptr_src;
+  uint32_t num_pages;
+  uint32_t num_layers;
+  uint32_t page_size;
+};
+
 template <typename IndexType, int64_t kElementSize, bool kIsMLA>
 __global__ void hicache_relayout_kernel(const __grid_constant__ HicacheRelayoutParams params) {
   using namespace device;

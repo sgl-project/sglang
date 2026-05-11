@@ -30,10 +30,10 @@ def _jit_hicache_module(*, element_size: int, unroll: int, block_quota: int) -> 
             "kvcacheio/staged_write_back.cuh",
         ],
         cuda_wrappers=[
-            ("launch_one", f"&HiCacheTransferKernel<{args}>::run_one"),
-            ("launch_all", f"&HiCacheTransferKernel<{args}>::run_all"),
-            ("launch_one_mla", f"&HiCacheTransferKernel<{args}>::run_one_mla"),
-            ("launch_all_mla", f"&HiCacheTransferKernel<{args}>::run_all_mla"),
+            ("launch_one", f"&HiCacheKernel<{args}>::run_one"),
+            ("launch_all", f"&HiCacheKernel<{args}>::run_all"),
+            ("launch_one_mla", f"&HiCacheKernel<{args}>::run_one_mla"),
+            ("launch_all_mla", f"&HiCacheKernel<{args}>::run_all_mla"),
             (
                 "launch_all_lf_pf_staged",
                 f"&HiCacheStagedWriteBackKernel<{args}>::run_all_lf_pf_staged",
