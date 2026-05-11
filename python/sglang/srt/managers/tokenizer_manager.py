@@ -78,6 +78,10 @@ from sglang.srt.managers.tokenizer_manager_components.multimodal_processor_owner
 from sglang.srt.managers.tokenizer_manager_components.raw_tokenizer_wrapper import (
     RawTokenizerWrapper,
 )
+from sglang.srt.managers.tokenizer_manager_components.request_preparer import (
+    RequestPreparer,
+    RequestPreparerConfig,
+)
 from sglang.srt.managers.tokenizer_manager_components.request_state import (
     ReqState,
     init_req,
@@ -210,6 +214,27 @@ class TokenizerManager(TokenizerControlMixin):
                 matryoshka_dimensions=self.model_config.matryoshka_dimensions,
                 hidden_size=self.model_config.hidden_size,
                 model_path=self.model_config.model_path,
+            ),
+        )
+
+        # Request preparer
+        self.request_preparer = RequestPreparer(
+            raw_tokenizer_wrapper=self.raw_tokenizer_wrapper,
+            multimodal_processor=self.multimodal_processor,
+            request_validator=self.request_validator,
+            tokenized_request_builder=self.tokenized_request_builder,
+            rid_to_state=self.rid_to_state,
+            config=RequestPreparerConfig(
+                skip_tokenizer_init=self.server_args.skip_tokenizer_init,
+                enable_dp_attention=self.server_args.enable_dp_attention,
+                enable_tokenizer_batch_encode=self.server_args.enable_tokenizer_batch_encode,
+                is_generation=self.is_generation,
+                disable_radix_cache=self.server_args.disable_radix_cache,
+                is_multimodal=self.model_config.is_multimodal,
+                architectures=self.model_config.hf_config.architectures,
+                max_req_input_len=self.max_req_input_len,
+                language_only=self.server_args.language_only,
+                encoder_transfer_backend=self.server_args.encoder_transfer_backend,
             ),
         )
 
@@ -465,7 +490,9 @@ class TokenizerManager(TokenizerControlMixin):
 
             # Tokenize the request and send it to the scheduler
             if obj.is_single:
-                tokenized_obj = await self._tokenize_one_request(obj)
+                tokenized_obj = await TokenizerManager._tokenize_one_request(
+                    self.request_preparer, obj
+                )
                 self._send_one_request(tokenized_obj)
                 async for response in self._wait_one_response(obj, request):
                     yield response
@@ -473,8 +500,9 @@ class TokenizerManager(TokenizerControlMixin):
                 async for response in self._handle_batch_request(obj, request):
                     yield response
 
+    @staticmethod
     async def _tokenize_one_request(
-        self,
+        self: "RequestPreparer",
         obj: Union[GenerateReqInput, EmbeddingReqInput],
     ):
         """Tokenize one request."""
@@ -486,7 +514,7 @@ class TokenizerManager(TokenizerControlMixin):
             isinstance(obj, EmbeddingReqInput) and obj.is_cross_encoder_request
         )
         if obj.input_embeds is not None:
-            if not self.server_args.disable_radix_cache:
+            if not self.config.disable_radix_cache:
                 raise ValueError(
                     "input_embeds is provided while disable_radix_cache is False. "
                     "Please add `--disable-radix-cache` when you launch the server "
@@ -517,10 +545,7 @@ class TokenizerManager(TokenizerControlMixin):
                 )
 
         contains_mm_input = obj.contains_mm_input()
-        is_mossvl = (
-            "MossVLForConditionalGeneration"
-            in self.model_config.hf_config.architectures
-        )
+        is_mossvl = "MossVLForConditionalGeneration" in self.config.architectures
         should_run_mm_processor = self.mm_processor is not None and (
             contains_mm_input or is_mossvl
         )
@@ -538,11 +563,11 @@ class TokenizerManager(TokenizerControlMixin):
             mm_inputs = None
 
             if (
-                not self.server_args.language_only
-                or self.server_args.encoder_transfer_backend
+                not self.config.language_only
+                or self.config.encoder_transfer_backend
                 in ["zmq_to_tokenizer", "mooncake"]
             ):
-                if self.server_args.language_only:
+                if self.config.language_only:
                     mm_inputs = (
                         await self.multimodal_processor.mm_receiver.recv_mm_data(
                             request_obj=obj,
@@ -557,11 +582,11 @@ class TokenizerManager(TokenizerControlMixin):
                         audio_data=obj.audio_data,
                         input_text=(input_text or input_ids),
                         request_obj=obj,
-                        max_req_input_len=self.max_req_input_len,
+                        max_req_input_len=self.config.max_req_input_len,
                     )
             elif (
-                self.server_args.language_only
-                and self.server_args.encoder_transfer_backend == "zmq_to_scheduler"
+                self.config.language_only
+                and self.config.encoder_transfer_backend == "zmq_to_scheduler"
                 and not obj.need_wait_for_mm_inputs
             ):
                 # In language_only mode with zmq_to_scheduler, if we didn't dispatch
@@ -571,7 +596,7 @@ class TokenizerManager(TokenizerControlMixin):
                     audio_data=obj.audio_data,
                     input_text=(input_text or input_ids),
                     request_obj=obj,
-                    max_req_input_len=self.max_req_input_len,
+                    max_req_input_len=self.config.max_req_input_len,
                 )
 
             if mm_inputs and mm_inputs.input_ids is not None:
@@ -604,17 +629,23 @@ class TokenizerManager(TokenizerControlMixin):
         self.rid_to_state[obj.rid].time_stats.set_tokenize_finish_time()
         return tokenized_obj
 
+    @staticmethod
     async def _batch_tokenize_and_process(
-        self, batch_size: int, obj: Union[GenerateReqInput, EmbeddingReqInput]
+        self: "RequestPreparer",
+        batch_size: int,
+        obj: Union[GenerateReqInput, EmbeddingReqInput],
     ) -> List[Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput]]:
         """Handle batch tokenization for text inputs only."""
         logger.debug(f"Starting batch tokenization for {batch_size} text requests")
 
         # If batch does not have text nothing to tokenize
         # so lets construct the return object
-        if not self._batch_has_text(batch_size, obj):
+        if not TokenizerManager._batch_has_text(self, batch_size, obj):
             # All requests already have input_ids, no need to tokenize
-            return [await self._tokenize_one_request(obj[i]) for i in range(batch_size)]
+            return [
+                await TokenizerManager._tokenize_one_request(self, obj[i])
+                for i in range(batch_size)
+            ]
 
         self.request_validator.validate_batch_tokenization_constraints(
             batch_size=batch_size, obj=obj
@@ -658,19 +689,25 @@ class TokenizerManager(TokenizerControlMixin):
         logger.debug(f"Completed batch processing for {batch_size} requests")
         return tokenized_objs
 
+    @staticmethod
     def _batch_has_text(
-        self, batch_size: int, obj: Union[GenerateReqInput, EmbeddingReqInput]
+        self: "RequestPreparer",
+        batch_size: int,
+        obj: Union[GenerateReqInput, EmbeddingReqInput],
     ) -> bool:
         """Check if any request in the batch contains text input."""
         for i in range(batch_size):
             if obj[i].text:
                 return True
-            elif self.is_generation and obj[i].contains_mm_input():
+            elif self.config.is_generation and obj[i].contains_mm_input():
                 return True
 
         return False
 
-    def _should_use_batch_tokenization(self, batch_size, requests) -> bool:
+    @staticmethod
+    def _should_use_batch_tokenization(
+        self: "RequestPreparer", batch_size, requests
+    ) -> bool:
         """Return True if we should run the tokenizer in batch mode.
 
         Current policy:
@@ -679,10 +716,10 @@ class TokenizerManager(TokenizerControlMixin):
         - Batch tokenization does not support DP attention yet, and it will make everything goes to the first rank currently
         """
         return batch_size > 0 and (
-            self.server_args.enable_tokenizer_batch_encode
+            self.config.enable_tokenizer_batch_encode
             or (
-                (not self.server_args.enable_dp_attention)
-                and (not self._batch_has_text(batch_size, requests))
+                (not self.config.enable_dp_attention)
+                and (not TokenizerManager._batch_has_text(self, batch_size, requests))
             )
         )
 
@@ -904,8 +941,12 @@ class TokenizerManager(TokenizerControlMixin):
         generators = []
         rids = []
         if getattr(obj, "parallel_sample_num", 1) == 1:
-            if self._should_use_batch_tokenization(batch_size, obj):
-                tokenized_objs = await self._batch_tokenize_and_process(batch_size, obj)
+            if TokenizerManager._should_use_batch_tokenization(
+                self.request_preparer, batch_size, obj
+            ):
+                tokenized_objs = await TokenizerManager._batch_tokenize_and_process(
+                    self.request_preparer, batch_size, obj
+                )
                 self._send_batch_request(tokenized_objs)
 
                 # Set up generators for each request in the batch
@@ -922,7 +963,9 @@ class TokenizerManager(TokenizerControlMixin):
                 ):
                     for i in range(batch_size):
                         tmp_obj = obj[i]
-                        tokenized_obj = await self._tokenize_one_request(tmp_obj)
+                        tokenized_obj = await TokenizerManager._tokenize_one_request(
+                            self.request_preparer, tmp_obj
+                        )
                         self._send_one_request(tokenized_obj)
                         generators.append(self._wait_one_response(tmp_obj, request))
                         rids.append(tmp_obj.rid)
@@ -938,7 +981,10 @@ class TokenizerManager(TokenizerControlMixin):
             # Tokenize all requests
             objs = [obj[i] for i in range(batch_size)]
             tokenized_objs = await asyncio.gather(
-                *(self._tokenize_one_request(obj) for obj in objs)
+                *(
+                    TokenizerManager._tokenize_one_request(self.request_preparer, obj)
+                    for obj in objs
+                )
             )
 
             # Cache the common prefix for parallel sampling
