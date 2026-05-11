@@ -6911,10 +6911,10 @@ class ServerArgs:
             return self.speculative_num_draft_tokens
 
         from sglang.srt.speculative.adaptive_spec_params import (
-            resolve_candidate_steps,
+            resolve_candidate_steps_from_config,
         )
 
-        candidate_steps = resolve_candidate_steps(
+        candidate_steps = resolve_candidate_steps_from_config(
             initial_steps=self.speculative_num_steps,
             cfg_path=self.speculative_adaptive_config,
         )

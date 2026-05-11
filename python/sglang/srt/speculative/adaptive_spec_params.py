@@ -73,11 +73,8 @@ def load_adaptive_config(path: str | None) -> dict[str, object]:
     return cfg
 
 
-def resolve_candidate_steps(
-    initial_steps: int, cfg_path: str | None = None
-) -> list[int]:
+def _resolve_candidate_steps(initial_steps: int, cfg: dict[str, object]) -> list[int]:
     """Return sorted, deduplicated candidate steps; inserts *initial_steps* when missing."""
-    cfg = load_adaptive_config(cfg_path)
     raw = cfg.get("candidate_steps") or (1, 3, 7)
     candidates: set[int] = set(raw)
 
@@ -95,6 +92,14 @@ def resolve_candidate_steps(
         candidates.add(initial_steps)
 
     return sorted(candidates)
+
+
+def resolve_candidate_steps_from_config(
+    initial_steps: int, cfg_path: str | None
+) -> list[int]:
+    """Load adaptive config and resolve candidate steps."""
+    cfg = load_adaptive_config(cfg_path)
+    return _resolve_candidate_steps(initial_steps, cfg)
 
 
 class AdaptiveSpeculativeParams:
@@ -116,7 +121,7 @@ class AdaptiveSpeculativeParams:
     ):
         cfg = load_adaptive_config(cfg_path)
         # TODO: Wider range of candidate_steps (once lazy init is supported).
-        self.candidate_steps = resolve_candidate_steps(initial_steps, cfg_path=cfg_path)
+        self.candidate_steps = _resolve_candidate_steps(initial_steps, cfg)
         assert (
             len(self.candidate_steps) >= 2
         ), "candidate_steps must have at least 2 distinct values"
