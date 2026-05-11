@@ -72,7 +72,6 @@ class TestDisaggregationDSV4(PDDisaggregationServerBase):
             cls.prefill_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=prefill_args,
-            env=DSV4_FLASH_ENV,
         )
 
     @classmethod
@@ -104,7 +103,6 @@ class TestDisaggregationDSV4(PDDisaggregationServerBase):
             cls.decode_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=decode_args,
-            env=DSV4_FLASH_ENV,
         )
 
     def test_gsm8k(self):
