@@ -175,6 +175,9 @@ from sglang.srt.managers.scheduler_components.profiler_manager import (
 from sglang.srt.managers.scheduler_components.request_receiver import (
     SchedulerRequestReceiver,
 )
+from sglang.srt.managers.scheduler_components.weight_updater import (
+    SchedulerWeightUpdaterManager,
+)
 from sglang.srt.managers.scheduler_input_blocker import SchedulerInputBlocker
 from sglang.srt.managers.scheduler_output_processor_mixin import (
     SchedulerOutputProcessorMixin,
@@ -548,7 +551,14 @@ class Scheduler(
         # Init prefill kv split size when deterministic inference is enabled with various attention backends
         self.init_deterministic_inference_config()
 
-        self.offload_tags = set()
+        self.weight_updater = SchedulerWeightUpdaterManager(
+            tp_worker=self.tp_worker,
+            draft_worker=self.draft_worker,
+            tp_cpu_group=self.tp_cpu_group,
+            memory_saver_adapter=self.memory_saver_adapter,
+            flush_cache=self.flush_cache,
+            is_fully_idle=self.is_fully_idle,
+        )
 
         # Init request dispatcher
         self.init_request_dispatcher()
@@ -596,7 +606,7 @@ class Scheduler(
             req_to_token_pool=self.req_to_token_pool,
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
             tree_cache=self.tree_cache,
-            offload_tags=self.offload_tags,
+            offload_tags=self.weight_updater.offload_tags,
             ps=self.ps,
             server_args=self.server_args,
             model_config=self.model_config,
@@ -1295,15 +1305,19 @@ class Scheduler(
                 (CloseSessionReqInput, self.close_session),
                 (
                     UpdateWeightFromDiskReqInput,
-                    lambda req: self.update_weights_from_disk(req),
+                    lambda req: self.update_weights_from_disk(self.weight_updater, req),
                 ),
                 (
                     InitWeightsUpdateGroupReqInput,
-                    lambda req: self.init_weights_update_group(req),
+                    lambda req: self.init_weights_update_group(
+                        self.weight_updater, req
+                    ),
                 ),
                 (
                     DestroyWeightsUpdateGroupReqInput,
-                    lambda req: self.destroy_weights_update_group(req),
+                    lambda req: self.destroy_weights_update_group(
+                        self.weight_updater, req
+                    ),
                 ),
                 (
                     InitWeightsSendGroupForRemoteInstanceReqInput,
@@ -1315,31 +1329,37 @@ class Scheduler(
                 ),
                 (
                     UpdateWeightsFromDistributedReqInput,
-                    lambda req: self.update_weights_from_distributed(req),
+                    lambda req: self.update_weights_from_distributed(
+                        self.weight_updater, req
+                    ),
                 ),
                 (
                     UpdateWeightsFromTensorReqInput,
-                    lambda req: self.update_weights_from_tensor(req),
+                    lambda req: self.update_weights_from_tensor(
+                        self.weight_updater, req
+                    ),
                 ),
                 (
                     UpdateWeightsFromIPCReqInput,
-                    lambda req: self.update_weights_from_ipc(req),
+                    lambda req: self.update_weights_from_ipc(self.weight_updater, req),
                 ),
                 (
                     GetWeightsByNameReqInput,
-                    lambda req: self.get_weights_by_name(req),
+                    lambda req: self.get_weights_by_name(self.weight_updater, req),
                 ),
                 (
                     ReleaseMemoryOccupationReqInput,
-                    lambda req: self.release_memory_occupation(req),
+                    lambda req: self.release_memory_occupation(
+                        self.weight_updater, req
+                    ),
                 ),
                 (
                     ResumeMemoryOccupationReqInput,
-                    lambda req: self.resume_memory_occupation(req),
+                    lambda req: self.resume_memory_occupation(self.weight_updater, req),
                 ),
                 (
                     CheckWeightsReqInput,
-                    lambda req: self.check_weights(req),
+                    lambda req: self.check_weights(self.weight_updater, req),
                 ),
                 (SlowDownReqInput, self.slow_down),
                 (
