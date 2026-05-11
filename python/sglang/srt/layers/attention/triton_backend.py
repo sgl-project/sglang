@@ -7,9 +7,11 @@ import torch
 import triton
 import triton.language as tl
 
-try:
+from sglang.srt.utils import is_npu
+
+if not is_npu():
     from sgl_kernel.utils import is_arch_support_pdl
-except ImportError:
+else:
     is_arch_support_pdl = lambda: False
 
 from sglang.srt.configs.model_config import AttentionArch
