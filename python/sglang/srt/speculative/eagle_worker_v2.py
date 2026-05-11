@@ -467,11 +467,11 @@ class EagleDraftWorker(BaseDraftWorker):
 
         model_worker_batch.forward_mode = ForwardMode.DECODE
         model_worker_batch.seq_lens = batch_result.next_draft_input.new_seq_lens
-        # To ensure accurate acceptance length, seq_lens_cpu synchronization is needed here.
-        # However, this synchronization contradicts the intent and benefit of spec_v2_zero_bubble.
-        # As a result, spec_v2_zero_bubble is ideal for architectures like DeepSeek-V3.2
-        # that don't need seq_lens_cpu. For models dependent on seq_lens_cpu,
-        # skipping this synchronization might affect the acceptance length.
+        # DSA models (e.g. DeepSeek-V3.2) no longer depend on seq_lens_cpu, so
+        # skipping the sync below does not affect acceptance rate. For other models
+        # that still rely on seq_lens_cpu, skipping it may degrade acceptance rate.
+        # To test: uncomment the line below to enable seq_lens_cpu sync, which
+        # restores accurate acceptance rate at the cost of some performance.
         # model_worker_batch.seq_lens_cpu = model_worker_batch.seq_lens.to("cpu")
 
         try:
