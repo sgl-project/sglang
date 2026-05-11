@@ -280,85 +280,25 @@ class KVCacheConfigurator:
             is_dsa_model, is_dsv4_model, current_platform
         )
 
-        if is_dsv4_model:
-            token_to_kv_pool = self._dsv4_kv_pool(
-                max_running_requests=max_running_requests,
-                swa_max_total_num_tokens=swa_max_total_num_tokens,
-                c4_max_total_num_tokens=c4_max_total_num_tokens,
-                c128_max_total_num_tokens=c128_max_total_num_tokens,
-                c4_state_pool_size=c4_state_pool_size,
-                c128_state_pool_size=c128_state_pool_size,
-                c4_state_dtype=c4_state_dtype,
-                c128_state_dtype=c128_state_dtype,
-                req_to_token_pool=req_to_token_pool,
-            )
-        elif current_platform.is_out_of_tree() and not self.mambaish_config:
-            if self.use_mla_backend and is_dsa_model:
-                token_to_kv_pool = self._oot_dsa_kv_pool(
-                    max_total_num_tokens=max_total_num_tokens,
-                )
-            elif self.use_mla_backend:
-                token_to_kv_pool = self._oot_mla_kv_pool(
-                    max_total_num_tokens=max_total_num_tokens,
-                    is_dsa_model=is_dsa_model,
-                )
-            else:
-                token_to_kv_pool = self._oot_mha_kv_pool(
-                    max_total_num_tokens=max_total_num_tokens,
-                )
-        elif (
-            self.server_args.attention_backend == "ascend" and not self.mambaish_config
-        ):
-            if self.is_hybrid_swa:
-                token_to_kv_pool = self._ascend_swa_kv_pool(
-                    full_max_total_num_tokens=full_max_total_num_tokens,
-                    swa_max_total_num_tokens=swa_max_total_num_tokens,
-                )
-            elif self.use_mla_backend:
-                token_to_kv_pool = self._ascend_mla_kv_pool(
-                    max_total_num_tokens=max_total_num_tokens,
-                    is_dsa_model=is_dsa_model,
-                )
-            else:
-                token_to_kv_pool = self._ascend_mha_kv_pool(
-                    max_total_num_tokens=max_total_num_tokens,
-                )
-        elif self.use_mla_backend and is_dsa_model:
-            token_to_kv_pool = self._dsa_kv_pool(
-                max_total_num_tokens=max_total_num_tokens,
-            )
-        elif self.use_mla_backend and not self.mambaish_config:
-            assert not is_dsa_model
-            if is_float4_e2m1fn_x2(self.kv_cache_dtype):
-                token_to_kv_pool = self._mla_fp4_kv_pool(
-                    max_total_num_tokens=max_total_num_tokens,
-                )
-            else:
-                token_to_kv_pool = self._mla_kv_pool(
-                    max_total_num_tokens=max_total_num_tokens,
-                )
-        else:
-            if self.is_hybrid_swa:
-                token_to_kv_pool = self._hybrid_swa_kv_pool(
-                    full_max_total_num_tokens=full_max_total_num_tokens,
-                    swa_max_total_num_tokens=swa_max_total_num_tokens,
-                )
-            elif self.mambaish_config:
-                token_to_kv_pool = self._hybrid_linear_kv_pool(
-                    max_total_num_tokens=max_total_num_tokens,
-                    req_to_token_pool=req_to_token_pool,
-                )
-            else:
-                if is_float4_e2m1fn_x2(self.kv_cache_dtype):
-                    token_to_kv_pool = self._mha_fp4_kv_pool(
-                        max_total_num_tokens=max_total_num_tokens,
-                    )
-                else:
-                    token_to_kv_pool = self._mha_kv_pool(
-                        max_total_num_tokens=max_total_num_tokens,
-                    )
+        token_to_kv_pool = self._build_token_to_kv_pool(
+            max_total_num_tokens=max_total_num_tokens,
+            max_running_requests=max_running_requests,
+            full_max_total_num_tokens=full_max_total_num_tokens,
+            swa_max_total_num_tokens=swa_max_total_num_tokens,
+            c4_max_total_num_tokens=c4_max_total_num_tokens,
+            c128_max_total_num_tokens=c128_max_total_num_tokens,
+            c4_state_pool_size=c4_state_pool_size,
+            c128_state_pool_size=c128_state_pool_size,
+            c4_state_dtype=c4_state_dtype,
+            c128_state_dtype=c128_state_dtype,
+            is_dsa_model=is_dsa_model,
+            is_dsv4_model=is_dsv4_model,
+            req_to_token_pool=req_to_token_pool,
+        )
 
         # Initialize token_to_kv_pool_allocator
+        from sglang.srt.platforms import current_platform
+
         need_sort = self.server_args.disaggregation_mode in ("decode", "prefill")
         if token_to_kv_pool_allocator is None:
             if current_platform.is_out_of_tree():
@@ -638,6 +578,105 @@ class KVCacheConfigurator:
             device=self.device,
             enable_memory_saver=self.server_args.enable_memory_saver,
         )
+
+    def _build_token_to_kv_pool(
+        self,
+        *,
+        max_total_num_tokens: int,
+        max_running_requests: int,
+        full_max_total_num_tokens: Optional[int],
+        swa_max_total_num_tokens: Optional[int],
+        c4_max_total_num_tokens: int,
+        c128_max_total_num_tokens: int,
+        c4_state_pool_size: int,
+        c128_state_pool_size: int,
+        c4_state_dtype: Optional[torch.dtype],
+        c128_state_dtype: Optional[torch.dtype],
+        is_dsa_model: bool,
+        is_dsv4_model: bool,
+        req_to_token_pool: ReqToTokenPool,
+    ) -> KVCache:
+        # Out-of-tree platform plugin system — used by elif below
+        from sglang.srt.platforms import current_platform
+
+        if is_dsv4_model:
+            token_to_kv_pool = self._dsv4_kv_pool(
+                max_running_requests=max_running_requests,
+                swa_max_total_num_tokens=swa_max_total_num_tokens,
+                c4_max_total_num_tokens=c4_max_total_num_tokens,
+                c128_max_total_num_tokens=c128_max_total_num_tokens,
+                c4_state_pool_size=c4_state_pool_size,
+                c128_state_pool_size=c128_state_pool_size,
+                c4_state_dtype=c4_state_dtype,
+                c128_state_dtype=c128_state_dtype,
+                req_to_token_pool=req_to_token_pool,
+            )
+        elif current_platform.is_out_of_tree() and not self.mambaish_config:
+            if self.use_mla_backend and is_dsa_model:
+                token_to_kv_pool = self._oot_dsa_kv_pool(
+                    max_total_num_tokens=max_total_num_tokens,
+                )
+            elif self.use_mla_backend:
+                token_to_kv_pool = self._oot_mla_kv_pool(
+                    max_total_num_tokens=max_total_num_tokens,
+                    is_dsa_model=is_dsa_model,
+                )
+            else:
+                token_to_kv_pool = self._oot_mha_kv_pool(
+                    max_total_num_tokens=max_total_num_tokens,
+                )
+        elif (
+            self.server_args.attention_backend == "ascend" and not self.mambaish_config
+        ):
+            if self.is_hybrid_swa:
+                token_to_kv_pool = self._ascend_swa_kv_pool(
+                    full_max_total_num_tokens=full_max_total_num_tokens,
+                    swa_max_total_num_tokens=swa_max_total_num_tokens,
+                )
+            elif self.use_mla_backend:
+                token_to_kv_pool = self._ascend_mla_kv_pool(
+                    max_total_num_tokens=max_total_num_tokens,
+                    is_dsa_model=is_dsa_model,
+                )
+            else:
+                token_to_kv_pool = self._ascend_mha_kv_pool(
+                    max_total_num_tokens=max_total_num_tokens,
+                )
+        elif self.use_mla_backend and is_dsa_model:
+            token_to_kv_pool = self._dsa_kv_pool(
+                max_total_num_tokens=max_total_num_tokens,
+            )
+        elif self.use_mla_backend and not self.mambaish_config:
+            assert not is_dsa_model
+            if is_float4_e2m1fn_x2(self.kv_cache_dtype):
+                token_to_kv_pool = self._mla_fp4_kv_pool(
+                    max_total_num_tokens=max_total_num_tokens,
+                )
+            else:
+                token_to_kv_pool = self._mla_kv_pool(
+                    max_total_num_tokens=max_total_num_tokens,
+                )
+        else:
+            if self.is_hybrid_swa:
+                token_to_kv_pool = self._hybrid_swa_kv_pool(
+                    full_max_total_num_tokens=full_max_total_num_tokens,
+                    swa_max_total_num_tokens=swa_max_total_num_tokens,
+                )
+            elif self.mambaish_config:
+                token_to_kv_pool = self._hybrid_linear_kv_pool(
+                    max_total_num_tokens=max_total_num_tokens,
+                    req_to_token_pool=req_to_token_pool,
+                )
+            else:
+                if is_float4_e2m1fn_x2(self.kv_cache_dtype):
+                    token_to_kv_pool = self._mha_fp4_kv_pool(
+                        max_total_num_tokens=max_total_num_tokens,
+                    )
+                else:
+                    token_to_kv_pool = self._mha_kv_pool(
+                        max_total_num_tokens=max_total_num_tokens,
+                    )
+        return token_to_kv_pool
 
     def _dsv4_kv_pool(
         self,
