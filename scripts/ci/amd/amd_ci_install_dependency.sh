@@ -168,10 +168,7 @@ EOF
   docker exec ci_sglang pip install --cache-dir=/sgl-data/pip-cache huggingface_hub[hf_xet]
   docker exec ci_sglang pip install --cache-dir=/sgl-data/pip-cache pytest
 
-  # Install cache-dit for qwen_image_t2i_cache_dit_enabled test (added in PR 16204).
-  # Pin to match python/pyproject.toml; --upgrade is required because the AMD CI
-  # image ships cache-dit==1.1.8, which lacks the `cache_dit.parallelism` module
-  # and `ParallelismBackend.AUTO` used by multimodal_gen/runtime/cache/cache_dit_integration.py.
+  # Install cache-dit for qwen_image_t2i_cache_dit_enabled test (added in PR 16204)
   docker exec ci_sglang pip install --cache-dir=/sgl-data/pip-cache --upgrade 'cache-dit==1.3.0' || echo "cache-dit installation failed"
 
   # Install accelerate for distributed training and inference support
