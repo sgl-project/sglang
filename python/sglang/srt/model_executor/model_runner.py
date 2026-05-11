@@ -690,8 +690,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.end_layer = pp_range.end_layer
         self.num_effective_layers = self.end_layer - self.start_layer
 
-        self.adjust_hybrid_swa_layers_for_pp()
-
         # For LoopCoder models, each loop has its own layer_id, so we need to multiply by loop_num
         loop_num = getattr(self.model_config.hf_config, "loop_num", 1)
         if loop_num > 1:
@@ -703,6 +701,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             num_effective_layers=self.num_effective_layers,
             model_num_layers=model_num_layers,
         )
+
+        self.adjust_hybrid_swa_layers_for_pp()
 
         # Apply torchao quantization
         torchao_applied = getattr(self.model, "torchao_applied", False)
