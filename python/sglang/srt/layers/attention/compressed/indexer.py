@@ -490,9 +490,9 @@ class C4IndexerBackend:
         indexer_metadata = metadata.indexer_metadata
         core_metadata = metadata.core_metadata
 
-        #from sglang.srt.layers.attention.deepseek_v4_backend_radix import (
+        # from sglang.srt.layers.attention.deepseek_v4_backend_radix import (
         #    DSV4AttnMetadataRadix,
-        #)
+        # )
 
         assert isinstance(core_metadata, PagedCoreMetadata)
         assert isinstance(indexer_metadata, PagedIndexerMetadata)

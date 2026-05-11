@@ -2,26 +2,40 @@ from __future__ import annotations
 
 import logging
 from contextlib import nullcontext
-from typing import List, Literal, NamedTuple, Optional, Tuple, Union
+from typing import List, Literal, NamedTuple, Optional, Tuple
 
 import torch
-from sgl_kernel.kvcacheio import transfer_kv_all_layer_mla
 
 from sglang.jit_kernel.deepseek_v4 import fused_store_cache
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.environ import envs
-from sglang.srt.layers.attention.nsa import index_buf_accessor, index_buf_accessor_v4
-from sglang.srt.layers.attention.nsa.index_buf_accessor_v4 import NopeFp8RopeBf16Pack
-from sglang.srt.mem_cache.compress_state import (
-    CompressStatePool,
-    DeepSeekV4CompressState,
-    KVAndScore,
-)
+from sglang.srt.layers.attention.nsa import index_buf_accessor
+from sglang.srt.utils import is_hip
+
+if is_hip():
+    from sgl_kernel.kvcacheio import transfer_kv_all_layer_mla
+
+    from sglang.srt.layers.attention.nsa import index_buf_accessor_v4
+    from sglang.srt.layers.attention.nsa.index_buf_accessor_v4 import (
+        NopeFp8RopeBf16Pack,
+    )
+    from sglang.srt.mem_cache.compress_state import (
+        CompressStatePool,
+        DeepSeekV4CompressState,
+    )
+else:
+    from sglang.srt.layers.attention.dsv4 import (
+        index_buf_accessor as dsv4_index_buf_accessor,
+    )
+    from sglang.srt.layers.attention.dsv4.index_buf_accessor import (
+        NopeFp8RopeBf16Pack,
+    )
+    from sglang.srt.mem_cache.deepseek_v4_compress_state import CompressStatePool
+
+from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.mem_cache.memory_pool import KVCache
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import ceil_div
-
-from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 
 logger = logging.getLogger(__name__)
 
@@ -42,10 +56,20 @@ def get_compress_state_ring_size(
         Ring size for the given compression ratio
     """
     assert compress_ratio in [4, 128], f"Unsupported {compress_ratio = }"
-    if is_speculative:
-        return 8 if compress_ratio == 4 else 128
+    if is_hip():
+        if is_speculative:
+            return 8 if compress_ratio == 4 else 128
+        else:
+            return 16 if compress_ratio == 4 else 256
     else:
-        return 16 if compress_ratio == 4 else 256
+        ONLINE_C128 = envs.SGLANG_OPT_USE_ONLINE_COMPRESS.get()
+        if compress_ratio == 128 and ONLINE_C128:
+            assert not is_speculative, "online c128 does not support MTP"
+            return 1
+        if is_speculative:
+            return 16 if compress_ratio == 4 else 256
+        else:
+            return 8 if compress_ratio == 4 else 128
 
 
 class DeepSeekV4SingleKVPool(KVCache):
@@ -158,7 +182,8 @@ class DeepSeekV4SingleKVPool(KVCache):
         loc: torch.Tensor,
         cache_nope_fp8_rope_bf16_pack: NopeFp8RopeBf16Pack,
     ):
-        index_buf_accessor_v4.SetKAndS.execute(
+        _accessor = index_buf_accessor_v4 if is_hip() else dsv4_index_buf_accessor
+        _accessor.SetKAndS.execute(
             pool=self,
             buf=self.kv_buffer[layer_id],
             loc=loc,
@@ -520,10 +545,10 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
 
         self._init_compressed_layer_mapping()
 
-        if envs.SGLANG_OPT_DPSK_V4_RADIX.get():
-            self._init_paged_compress_states()
-        else:
+        if is_hip() and not envs.SGLANG_OPT_DPSK_V4_RADIX.get():
             self._init_compress_states()
+        else:
+            self._init_paged_compress_states()
 
         self._should_cache_swa = envs.SGLANG_OPT_CACHE_SWA_TRANSLATION.get()
 
@@ -600,6 +625,8 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         self.compress_state_pools: List[CompressStatePool] = []
         self.indexer_compress_state_pools: List[CompressStatePool] = []
 
+        _use_hip_pool = is_hip()
+
         for ratio in self.compression_ratios:
             overlap = ratio == 4
             compress_state_pool = indexer_compress_state_pool = None
@@ -608,30 +635,56 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
 
             # NOTE: c1 layer has no compress state
             if ratio != 0:
-                compress_state_pool = CompressStatePool(
-                    size=size,
-                    swa_page_size=self.swa_page_size,
-                    ring_size=ring_size,
-                    overlap=overlap,
-                    head_dim=self.qk_nope_head_dim + self.qk_rope_head_dim,
-                    dtype=self.state_dtype,
-                    device=self.device,
-                    enable_memory_saver=False,
-                    ratio=ratio,
-                )
+                if _use_hip_pool:
+                    compress_state_pool = CompressStatePool(
+                        size=size,
+                        swa_page_size=self.swa_page_size,
+                        ring_size=ring_size,
+                        overlap=overlap,
+                        head_dim=self.qk_nope_head_dim + self.qk_rope_head_dim,
+                        dtype=self.state_dtype,
+                        device=self.device,
+                        enable_memory_saver=False,
+                        ratio=ratio,
+                    )
+                else:
+                    ONLINE_C128 = envs.SGLANG_OPT_USE_ONLINE_COMPRESS.get()
+                    compress_state_pool = CompressStatePool(
+                        size=size,
+                        ring_size=ring_size,
+                        overlap=overlap,
+                        head_dim=self.qk_nope_head_dim + self.qk_rope_head_dim,
+                        dtype=self.state_dtype,
+                        device=self.device,
+                        enable_memory_saver=False,
+                        ratio=ratio,
+                        online=(ratio == 128 and ONLINE_C128),
+                    )
 
             if ratio == 4:
-                indexer_compress_state_pool = CompressStatePool(
-                    size=size,
-                    swa_page_size=self.swa_page_size,
-                    ring_size=ring_size,
-                    overlap=overlap,
-                    head_dim=self.indexer_head_dim,
-                    device=self.device,
-                    dtype=self.state_dtype,
-                    enable_memory_saver=False,
-                    ratio=ratio,
-                )
+                if _use_hip_pool:
+                    indexer_compress_state_pool = CompressStatePool(
+                        size=size,
+                        swa_page_size=self.swa_page_size,
+                        ring_size=ring_size,
+                        overlap=overlap,
+                        head_dim=self.indexer_head_dim,
+                        device=self.device,
+                        dtype=self.state_dtype,
+                        enable_memory_saver=False,
+                        ratio=ratio,
+                    )
+                else:
+                    indexer_compress_state_pool = CompressStatePool(
+                        size=size,
+                        ring_size=ring_size,
+                        overlap=overlap,
+                        head_dim=self.indexer_head_dim,
+                        device=self.device,
+                        dtype=self.state_dtype,
+                        enable_memory_saver=False,
+                        ratio=ratio,
+                    )
 
             self.compress_state_pools.append(compress_state_pool)
             self.indexer_compress_state_pools.append(indexer_compress_state_pool)
@@ -700,33 +753,31 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             self.compress_states.append(compress_state)
             self.indexer_compress_states.append(indexer_compress_state)
 
-    def get_attention_compress_states(self, layer_id: int) -> KVAndScore:
-        if envs.SGLANG_OPT_DPSK_V4_RADIX.get():
-            compress_state_pool = self.compress_state_pools[layer_id]
-            assert (
-                compress_state_pool is not None
-            ), "Only c4/c128 layers have attention states."
-            return compress_state_pool
-        else:
+    def get_attention_compress_states(self, layer_id: int):
+        if is_hip() and not envs.SGLANG_OPT_DPSK_V4_RADIX.get():
             compress_state = self.compress_states[layer_id]
             assert (
                 compress_state is not None
             ), "Only c4/c128 layers have attention states."
             return compress_state.get_state()
+        else:
+            compress_state_pool = self.compress_state_pools[layer_id]
+            assert (
+                compress_state_pool is not None
+            ), "Only c4/c128 layers have attention states."
+            return compress_state_pool
 
-    def get_indexer_compress_states(
-        self, layer_id: int
-    ) -> Union[KVAndScore, CompressStatePool]:
-        if envs.SGLANG_OPT_DPSK_V4_RADIX.get():
+    def get_indexer_compress_states(self, layer_id: int):
+        if is_hip() and not envs.SGLANG_OPT_DPSK_V4_RADIX.get():
+            compress_state = self.indexer_compress_states[layer_id]
+            assert compress_state is not None, "Only c4 layers have indexer states."
+            return compress_state.get_state()
+        else:
             indexer_compress_state_pool = self.indexer_compress_state_pools[layer_id]
             assert (
                 indexer_compress_state_pool is not None
             ), "Only c4 layers have indexer states."
             return indexer_compress_state_pool
-        else:
-            compress_state = self.indexer_compress_states[layer_id]
-            assert compress_state is not None, "Only c4 layers have indexer states."
-            return compress_state.get_state()
 
     def get_swa_key_buffer(self, layer_id: int) -> torch.Tensor:
         return self.swa_kv_pool.get_key_buffer(layer_id)

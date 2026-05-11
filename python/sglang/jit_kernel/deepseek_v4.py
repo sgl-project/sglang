@@ -9,7 +9,6 @@ import triton.language as tl
 from sglang.jit_kernel.utils import (
     cache_once,
     is_arch_support_pdl,
-    is_hip_runtime,
     load_jit,
     make_cpp_args,
 )
@@ -609,6 +608,7 @@ def fused_rope(
     module = _jit_fused_rope_module()
     module.forward(q, k, freqs_real, positions, inverse)
 
+
 @triton.jit
 def _triton_make_swa_prefill_indices_kernel(
     seq_lens_k_ptr,
@@ -686,6 +686,8 @@ def triton_make_swa_prefill_indices(
         BLOCK_W=BLOCK_W,
     )
     return swa_indices
+
+
 @triton.jit
 def create_paged_compress_data_kernel(
     req_pool_indices_ptr,

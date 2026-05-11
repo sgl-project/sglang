@@ -93,29 +93,37 @@ def create_nsa_backend(runner):
 
 
 @register_attention_backend("dsv4")
-def create_compressed_backend(runner):
-    from sglang.srt.environ import envs
+def create_dsv4_backend(runner):
+    from sglang.srt.utils import is_hip
 
-    if envs.SGLANG_OPT_DPSK_V4_RADIX.get():
-        from sglang.srt.layers.attention.deepseek_v4_backend_radix import (
-            DeepseekV4BackendRadix,
+    if is_hip():
+        from sglang.srt.environ import envs
+
+        if envs.SGLANG_OPT_DPSK_V4_RADIX.get():
+            from sglang.srt.layers.attention.deepseek_v4_backend_radix import (
+                DeepseekV4BackendRadix,
+            )
+
+            logger.info(
+                "Using DeepseekV4BackendRadix for compressed attention backend (HIP)."
+            )
+            return DeepseekV4BackendRadix(runner)
+        else:
+            from sglang.srt.layers.attention.deepseek_v4_backend import (
+                DeepseekV4Backend,
+            )
+
+            logger.info(
+                "Using DeepseekV4Backend for compressed attention backend (HIP)."
+            )
+            return DeepseekV4Backend(runner)
+    else:
+        from sglang.srt.layers.attention.deepseek_v4_backend_original import (
+            DeepseekV4AttnBackend,
         )
 
-        logger.info("Using DeepseekV4BackendRadix for compressed attention backend.")
-        return DeepseekV4BackendRadix(runner)
-    else:
-        from sglang.srt.layers.attention.deepseek_v4_backend import DeepseekV4Backend
-
-        logger.info("Using DeepseekV4Backend for compressed attention backend.")
-        return DeepseekV4Backend(runner)
-
-#@register_attention_backend("dsv4")
-#def create_dsv4_backend(runner):
-#    from sglang.srt.layers.attention.deepseek_v4_backend import (
-#        DeepseekV4AttnBackend,
-#    )
-#
-#    return DeepseekV4AttnBackend(runner)
+        logger.info("Using DeepseekV4AttnBackend for dsv4 attention backend (CUDA).")
+        return DeepseekV4AttnBackend(runner)
 
 
 @register_attention_backend("triton")
