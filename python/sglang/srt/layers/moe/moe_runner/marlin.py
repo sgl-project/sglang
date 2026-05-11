@@ -71,6 +71,9 @@ class MarlinMoeQuantInfo(MoeQuantInfo):
 
     # Optional
     expert_map: Optional[torch.Tensor] = None
+    global_num_experts: int = -1
+    w13_global_scale: Optional[torch.Tensor] = None
+    w2_global_scale: Optional[torch.Tensor] = None
 
 
 @register_fused_func("none", "marlin")
@@ -124,6 +127,7 @@ def fused_experts_none_to_marlin(
         gating_output=topk_output.router_logits,
         topk_weights=topk_output.topk_weights,
         topk_ids=topk_output.topk_ids,
+        global_num_experts=quant_info.global_num_experts,
         expert_map=quant_info.expert_map,
         g_idx1=quant_info.w13_g_idx,
         g_idx2=quant_info.w2_g_idx,
@@ -131,6 +135,8 @@ def fused_experts_none_to_marlin(
         sort_indices2=quant_info.w2_g_idx_sort_indices,
         w1_zeros=quant_info.w13_qzeros,
         w2_zeros=quant_info.w2_qzeros,
+        w1_global_scale=quant_info.w13_global_scale,
+        w2_global_scale=quant_info.w2_global_scale,
         workspace=MARLIN_MOE_WORKSPACE,
         num_bits=quant_info.weight_bits,
         is_k_full=quant_info.is_k_full,

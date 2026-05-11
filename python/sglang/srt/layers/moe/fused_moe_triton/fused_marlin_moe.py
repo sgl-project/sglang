@@ -15,14 +15,19 @@ if _is_cuda:
     from sglang.jit_kernel.moe_wna16_marlin import moe_wna16_marlin_gemm
 
 
-def get_scalar_type(num_bits: int, has_zp: bool, scales: Optional[torch.Tensor] = None):
+def get_scalar_type(
+    num_bits: int,
+    has_zp: bool,
+    scales: Optional[torch.Tensor] = None,
+    global_scale: Optional[torch.Tensor] = None,
+):
     from sgl_kernel.scalar_type import scalar_types
 
     if (
         not has_zp
         and num_bits == 4
         and scales is not None
-        and scales.dtype == torch.float8_e8m0fnu
+        and (scales.dtype == torch.float8_e8m0fnu or global_scale is not None)
     ):
         return scalar_types.float4_e2m1f
     if has_zp:
@@ -66,6 +71,8 @@ def fused_marlin_moe(
     sort_indices2: Optional[torch.Tensor] = None,
     w1_zeros: Optional[torch.Tensor] = None,
     w2_zeros: Optional[torch.Tensor] = None,
+    w1_global_scale: Optional[torch.Tensor] = None,
+    w2_global_scale: Optional[torch.Tensor] = None,
     workspace: Optional[torch.Tensor] = None,
     num_bits: int = 8,
     is_k_full: bool = True,
@@ -118,6 +125,13 @@ def fused_marlin_moe(
         and w1_scale.dtype == torch.float8_e8m0fnu
         and w2_scale.dtype == torch.float8_e8m0fnu
     )
+    is_nvfp4_marlin = (
+        num_bits == 4
+        and w1_zeros is None
+        and w2_zeros is None
+        and w1_global_scale is not None
+        and w2_global_scale is not None
+    )
     if is_mxfp4_marlin:
         assert w1_scale.dtype == torch.float8_e8m0fnu, (
             "MXFP4 Marlin expects w1_scale to be torch.float8_e8m0fnu, "
@@ -127,7 +141,7 @@ def fused_marlin_moe(
             "MXFP4 Marlin expects w2_scale to be torch.float8_e8m0fnu, "
             f"got {w2_scale.dtype}"
         )
-    else:
+    elif not is_nvfp4_marlin:
         assert (
             hidden_states.dtype == w1_scale.dtype
         ), f"moe_wna16_marlin_gemm assumes hidden_states.dtype ({hidden_states.dtype}) == w1_scale.dtype ({w1_scale.dtype})"
@@ -164,8 +178,12 @@ def fused_marlin_moe(
             max_workspace_size, dtype=torch.int, device=device, requires_grad=False
         )
 
-    scalar_type1 = get_scalar_type(num_bits, w1_zeros is not None, w1_scale)
-    scalar_type2 = get_scalar_type(num_bits, w2_zeros is not None, w2_scale)
+    scalar_type1 = get_scalar_type(
+        num_bits, w1_zeros is not None, w1_scale, w1_global_scale
+    )
+    scalar_type2 = get_scalar_type(
+        num_bits, w2_zeros is not None, w2_scale, w2_global_scale
+    )
 
     intermediate_cache2 = torch.empty(
         (M * topk_ids.shape[1], N),
@@ -193,7 +211,7 @@ def fused_marlin_moe(
         w1,
         None,  # b_bias_or_none
         w1_scale,
-        None,  # global_scale_or_none
+        w1_global_scale,
         w1_zeros,
         g_idx1,
         sort_indices1,
@@ -234,7 +252,7 @@ def fused_marlin_moe(
         w2,
         None,  # b_bias_or_none
         w2_scale,
-        None,  # global_scale_or_none
+        w2_global_scale,
         w2_zeros,
         g_idx2,
         sort_indices2,

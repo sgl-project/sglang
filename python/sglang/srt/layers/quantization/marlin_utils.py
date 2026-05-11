@@ -54,7 +54,7 @@ GPTQ_MARLIN_MIN_THREAD_N = 64
 GPTQ_MARLIN_MIN_THREAD_K = 128
 GPTQ_MARLIN_MAX_PARALLEL = 16
 
-MARLIN_SUPPORTED_GROUP_SIZES = [-1, 32, 64, 128]
+MARLIN_SUPPORTED_GROUP_SIZES = [-1, 16, 32, 64, 128]
 
 # In case there is a performance issue with Marlin, the variable below can be
 # changed to False, which allows Marlin to perform global reductions in fp16
