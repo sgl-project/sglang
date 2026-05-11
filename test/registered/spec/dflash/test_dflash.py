@@ -154,10 +154,6 @@ class TestDFlashServerNoCudaGraph(TestDFlashServerBase):
 class TestDFlashServerSpecV2(TestDFlashServerBase):
     spec_v2 = True
 
-    @unittest.skip
-    def test_greedy_determinism(self):
-        pass
-
     def test_radix_attention(self):
         run_radix_attention_test(self.base_url)
         assert self.process.poll() is None
