@@ -81,49 +81,48 @@ from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
 _is_cpu = is_cpu()
 _cpu_amx = cpu_has_amx_support()
-if _is_cpu and _cpu_amx:
 
-    def apply_rotary_emb_cpu(
-        x: torch.Tensor,
-        freqs_cis: torch.Tensor,
-        positions: Optional[torch.Tensor] = None,
-        inverse: bool = False,
-    ) -> torch.Tensor:
-        return torch.ops.sgl_kernel.apply_rotary_emb_interleaved_cpu(
-            x, freqs_cis, inverse, positions
-        )
-
+def apply_rotary_emb_cpu(
+    x: torch.Tensor,
+    freqs_cis: torch.Tensor,
+    positions: Optional[torch.Tensor] = None,
+    inverse: bool = False,
+) -> torch.Tensor:
+    return torch.ops.sgl_kernel.apply_rotary_emb_interleaved_cpu(
+        x, freqs_cis, inverse, positions
+    )
+if (_is_cpu and _cpu_amx):
     apply_rotary_emb_triton = apply_rotary_emb_cpu
 
-    def rms_normalize_cpu(
-        x: torch.Tensor, eps: float, weight: Optional[torch.Tensor] = None
-    ) -> torch.Tensor:
-        if weight is None:
-            shape = x.shape
-            x_2d = x.reshape(-1, shape[-1])
-            if not x_2d.is_contiguous():
-                x_2d = x_2d.contiguous()
-            return torch.ops.sgl_kernel.l2norm_cpu(x_2d, eps).view(shape)
-        else:
-            shape = x.shape
-            x_2d = x.reshape(-1, shape[-1])
-            if x_2d.stride(-1) != 1:
-                x_2d = x_2d.contiguous()
+def rms_normalize_cpu(
+    x: torch.Tensor, eps: float, weight: Optional[torch.Tensor] = None
+) -> torch.Tensor:
+    if weight is None:
+        shape = x.shape
+        x_2d = x.reshape(-1, shape[-1])
+        if not x_2d.is_contiguous():
+            x_2d = x_2d.contiguous()
+        return torch.ops.sgl_kernel.l2norm_cpu(x_2d, eps).view(shape)
+    else:
+        shape = x.shape
+        x_2d = x.reshape(-1, shape[-1])
+        if x_2d.stride(-1) != 1:
+            x_2d = x_2d.contiguous()
 
-            w = weight.reshape(-1)
-            if w.dtype != x.dtype:
-                w = w.to(dtype=x.dtype)
-            if not w.is_contiguous():
-                w = w.contiguous()
+        w = weight.reshape(-1)
+        if w.dtype != x.dtype:
+            w = w.to(dtype=x.dtype)
+        if not w.is_contiguous():
+            w = w.contiguous()
 
-            out = torch.ops.sgl_kernel.rmsnorm_cpu(
-                x_2d,
-                w,
-                eps,
-            ).view(shape)
-            return out
+        out = torch.ops.sgl_kernel.rmsnorm_cpu(
+            x_2d,
+            w,
+            eps,
+        ).view(shape)
+        return out
 
-    rms_normalize_triton = rms_normalize_cpu
+
 logger = logging.getLogger(__name__)
 
 _FP8_WO_A_GEMM = envs.SGLANG_OPT_FP8_WO_A_GEMM.get()
@@ -425,7 +424,7 @@ class MQALayer(nn.Module):
         if self.use_jit_norm:
             q = rmsnorm_self(q, self.eps)
         else:
-            q = rms_normalize_triton(q, self.eps)
+            q = rms_normalize_triton(q, self.eps) if not (_is_cpu and _cpu_amx) else rms_normalize_cpu(q, self.eps) 
         if positions is not None:
             fused_rope(
                 q[..., -self.qk_rope_head_dim :],
@@ -550,7 +549,7 @@ class MQALayer(nn.Module):
         if self.use_jit_norm:
             q = rmsnorm_self(q, self.eps)
         else:
-            q = rms_normalize_triton(q, self.eps)
+            q = rms_normalize_triton(q, self.eps) if not (_is_cpu and _cpu_amx) else rms_normalize_cpu(q, self.eps) 
 
         kv = self.kv_norm(kv)
 

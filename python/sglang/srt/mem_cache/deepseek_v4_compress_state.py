@@ -35,9 +35,9 @@ class KVAndScore:
 
 
 @dataclasses.dataclass
-class KVAndScoreOld:
+class KVAndScoreSeparate:
     """Legacy layout: kv and score stored as separate tensors of equal shape.
-    (``SGLANG_CPU_COMPRESS_PATH=1``).
+    (``SGLANG_CPU_USE_COMPRESS_SEPARATE=1``).
     """
 
     kv: torch.Tensor
@@ -51,27 +51,27 @@ class KVAndScoreOld:
         return self.kv.shape
 
     @staticmethod
-    def empty_like(new_shape, old: "KVAndScoreOld") -> "KVAndScoreOld":
-        return KVAndScoreOld(
-            kv=old.kv.new_empty(new_shape),
-            score=old.score.new_empty(new_shape),
+    def empty_like(new_shape, sep: "KVAndScoreSeparate") -> "KVAndScoreSeparate":
+        return KVAndScoreSeparate(
+            kv=sep.kv.new_empty(new_shape),
+            score=sep.score.new_empty(new_shape),
         )
 
-    def new_empty(self, new_shape) -> "KVAndScoreOld":
-        return KVAndScoreOld.empty_like(new_shape, self)
+    def new_empty(self, new_shape) -> "KVAndScoreSeparate":
+        return KVAndScoreSeparate.empty_like(new_shape, self)
 
-    def __getitem__(self, index) -> "KVAndScoreOld":
-        return KVAndScoreOld(kv=self.kv[index], score=self.score[index])
+    def __getitem__(self, index) -> "KVAndScoreSeparate":
+        return KVAndScoreSeparate(kv=self.kv[index], score=self.score[index])
 
-    def __setitem__(self, index, value: "KVAndScoreOld"):
+    def __setitem__(self, index, value: "KVAndScoreSeparate"):
         self.kv[index] = value.kv
         self.score[index] = value.score
 
-    def view(self, *args) -> "KVAndScoreOld":
-        return KVAndScoreOld(kv=self.kv.view(*args), score=self.score.view(*args))
+    def view(self, *args) -> "KVAndScoreSeparate":
+        return KVAndScoreSeparate(kv=self.kv.view(*args), score=self.score.view(*args))
 
-    def clone(self) -> "KVAndScoreOld":
-        return KVAndScoreOld(kv=self.kv.clone(), score=self.score.clone())
+    def clone(self) -> "KVAndScoreSeparate":
+        return KVAndScoreSeparate(kv=self.kv.clone(), score=self.score.clone())
 
     def clear(self):
         self.kv.zero_()
@@ -105,9 +105,9 @@ class DeepSeekV4CompressState:
             self.kv_score_state = torch.empty(state_shape, dtype=dtype, device=device)
 
     def get_state(self):
-        if envs.SGLANG_CPU_COMPRESS_PATH.get():
+        if envs.SGLANG_CPU_USE_COMPRESS_SEPARATE.get():
             half_dim = self.head_dim * (1 + self.overlap)
-            return KVAndScoreOld(
+            return KVAndScoreSeparate(
                 kv=self.kv_score_state[..., :half_dim],
                 score=self.kv_score_state[..., half_dim:],
             )

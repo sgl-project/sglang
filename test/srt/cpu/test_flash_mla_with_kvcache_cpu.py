@@ -7,7 +7,7 @@ from sglang.test.test_utils import CustomTestCase
 
 try:
     from sgl_kernel.flash_mla import flash_mla_with_kvcache_cpu
-    from sglang.srt.flashmla_tests import quant as flashmla_quant
+    import quant_utils as flashmla_quant
 
     _IMPORT_ERROR = None
 except Exception as _e:  # pragma: no cover - exercised only when kernel missing
@@ -115,7 +115,9 @@ class TestFlashMLAWithKVCacheCPU(CustomTestCase):
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
-    def _make_quantized_kv_cache(self, num_blocks, page_size, d_qk, layout_enum):
+    def _make_quantized_kv_cache(
+        self, num_blocks, page_size, d_qk, layout_enum, *, as_uint8=False
+    ):
         # Generate random BF16 K cache then quantize using the project's
         # reference helper.  Shape: [num_blocks, page_size, 1, d_qk] bf16.
         k_bf16 = (
@@ -126,6 +128,8 @@ class TestFlashMLAWithKVCacheCPU(CustomTestCase):
         # one the kernel will see internally; this excludes quantization
         # error from the kernel-vs-ref comparison.
         k_dequant = flashmla_quant.dequantize_k_cache(k_quant, layout_enum)
+        if as_uint8:
+            k_quant = k_quant.view(torch.uint8)
         return k_quant.contiguous(), k_dequant
 
     def _make_bf16_kv_cache(self, num_blocks, page_size, d_qk):
@@ -175,6 +179,7 @@ class TestFlashMLAWithKVCacheCPU(CustomTestCase):
         is_fp8_kvcache=True,
         topk_length_value=None,
         extra_topk_length_value=None,
+        fp8_cache_as_uint8=False,
     ):
         d_qk, d_v = _LAYOUT_DIMS[fp8_layout]
         layout_enum = flashmla_quant.FP8KVCacheLayout(fp8_layout)
@@ -183,7 +188,11 @@ class TestFlashMLAWithKVCacheCPU(CustomTestCase):
 
         if is_fp8_kvcache:
             k_cache, k_dequant = self._make_quantized_kv_cache(
-                num_blocks, page_size, d_qk, layout_enum
+                num_blocks,
+                page_size,
+                d_qk,
+                layout_enum,
+                as_uint8=fp8_cache_as_uint8,
             )
         else:
             k_cache, k_dequant = self._make_bf16_kv_cache(
@@ -214,7 +223,11 @@ class TestFlashMLAWithKVCacheCPU(CustomTestCase):
         if have_extra:
             if is_fp8_kvcache:
                 extra_k_cache, extra_k_dequant = self._make_quantized_kv_cache(
-                    extra_num_blocks, page_size, d_qk, layout_enum
+                    extra_num_blocks,
+                    page_size,
+                    d_qk,
+                    layout_enum,
+                    as_uint8=fp8_cache_as_uint8,
                 )
             else:
                 extra_k_cache, extra_k_dequant = self._make_bf16_kv_cache(
@@ -460,6 +473,24 @@ class TestFlashMLAWithKVCacheCPU(CustomTestCase):
                         have_topk_length=have_topk_length,
                         have_extra_topk_length=have_extra_topk_length,
                     )
+
+    def test_with_uint8_fp8_kv_cache(self):
+        # Production FP8 sparse caches may be passed as raw packed bytes.
+        for fp8_layout in (1, 2):
+            with self.subTest(fp8_layout=fp8_layout):
+                self._run_one(
+                    b=2,
+                    s_q=1,
+                    h_q=16,
+                    topk=64,
+                    page_size=64,
+                    num_blocks=4,
+                    fp8_layout=fp8_layout,
+                    have_extra=True,
+                    extra_topk=32,
+                    extra_num_blocks=2,
+                    fp8_cache_as_uint8=True,
+                )
 
     def test_with_bf16_kv_cache(self):
         # Non-FP8 KV cache should skip dequantization and use BF16 cache rows

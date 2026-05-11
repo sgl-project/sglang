@@ -877,10 +877,12 @@ class DeepseekV2MoE(nn.Module):
         self,
         hidden_states: torch.Tensor,
         should_allreduce_fusion: bool = False,
+        input_ids_global: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         # router_logits: (num_tokens, n_experts)
         router_logits = self.gate(hidden_states)
-        topk_output = self.topk(hidden_states, router_logits)
+        topk_kwargs = {"input_ids": input_ids_global} if self.is_hash else {}
+        topk_output = self.topk(hidden_states, router_logits, **topk_kwargs)
         fused_experts_out = self.experts(
             hidden_states=hidden_states, topk_output=topk_output
         )
