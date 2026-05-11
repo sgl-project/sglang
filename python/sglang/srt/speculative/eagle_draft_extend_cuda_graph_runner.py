@@ -132,35 +132,13 @@ class EAGLEDraftExtendCudaGraphRunner:
             positions = torch.zeros((self.max_num_token,), dtype=torch.int64)
             mrope_positions = torch.zeros((3, self.max_num_token), dtype=torch.int64)
 
-            if (
-                self.eagle_worker.speculative_algorithm.is_eagle3()
-                and self.eagle_worker.eagle_use_aux_hidden_state
-            ):
-                hidden_states = torch.zeros(
-                    (
-                        self.max_num_token,
-                        (
-                            self.model_runner.model_config.hf_config.target_hidden_size
-                            * 3
-                            if hasattr(
-                                self.model_runner.model_config.hf_config,
-                                "target_hidden_size",
-                            )
-                            else self.model_runner.model_config.hidden_size * 3
-                        ),
-                    ),
-                    dtype=self.model_runner.dtype,
-                )
-            else:
-                # Use target config: hidden_states carries target output.
-                target_cfg = self.eagle_worker.target_worker.model_runner.model_config
-                hidden_states = torch.zeros(
-                    (
-                        self.max_num_token,
-                        target_cfg.spec_hidden_size,
-                    ),
-                    dtype=target_cfg.dtype,
-                )
+            hidden_states = torch.zeros(
+                (
+                    self.max_num_token,
+                    EagleDraftExtendInput.hidden_size_for(self.eagle_worker),
+                ),
+                dtype=EagleDraftExtendInput.dtype_for(self.eagle_worker),
+            )
             self.seq_len_fill_value = (
                 self.model_runner.attn_backend.get_cuda_graph_seq_len_fill_value()
             )
