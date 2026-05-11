@@ -1,7 +1,7 @@
 import logging
 
 from sglang.srt.server_args import ServerArgs, get_global_server_args
-from sglang.srt.utils.common import is_blackwell
+from sglang.srt.utils.common import is_blackwell, is_musa
 
 logger = logging.getLogger(__name__)
 
@@ -56,6 +56,7 @@ class DraftBackendFactory:
             "nsa": self._create_nsa_decode_backend,
             "ascend": self._create_ascend_decode_backend,
             "fa4": self._create_fa4_decode_backend,
+            "dsv4": self._create_dsv4_decode_backend,
         }
 
         return self._create_backend(
@@ -81,6 +82,7 @@ class DraftBackendFactory:
             "nsa": self._create_nsa_prefill_backend,
             "ascend": self._create_ascend_prefill_backend,
             "fa4": self._create_fa4_prefill_backend,
+            "dsv4": self._create_dsv4_prefill_backend,
         }
         backend_name = (
             "decode_attention_backend"
@@ -142,9 +144,14 @@ class DraftBackendFactory:
         )
 
     def _create_fa_decode_backend(self, fa_impl_ver: int = 3):
-        from sglang.srt.layers.attention.flashattention_backend import (
-            FlashAttentionMultiStepBackend,
-        )
+        if not is_musa():
+            from sglang.srt.layers.attention.flashattention_backend import (
+                FlashAttentionMultiStepBackend,
+            )
+        else:
+            from sglang.srt.hardware_backend.musa.attention.flashattention_backend import (
+                MusaFlashAttentionMultiStepBackend as FlashAttentionMultiStepBackend,
+            )
 
         return FlashAttentionMultiStepBackend(
             self.draft_model_runner,
@@ -200,6 +207,15 @@ class DraftBackendFactory:
             self.draft_model_runner, self.topk, self.speculative_num_steps
         )
 
+    def _create_dsv4_decode_backend(self):
+        from sglang.srt.layers.attention.deepseek_v4_backend import (
+            DeepseekV4MultiStepBackend,
+        )
+
+        return DeepseekV4MultiStepBackend(
+            self.draft_model_runner, self.topk, self.speculative_num_steps
+        )
+
     def _create_flashinfer_prefill_backend(self):
         if not get_global_server_args().use_mla_backend:
             from sglang.srt.layers.attention.flashinfer_backend import (
@@ -225,10 +241,14 @@ class DraftBackendFactory:
         return AiterAttnBackend(self.draft_model_runner, skip_prefill=False)
 
     def _create_fa_prefill_backend(self, fa_impl_ver: int = 3):
-        from sglang.srt.layers.attention.flashattention_backend import (
-            FlashAttentionBackend,
-        )
-
+        if not is_musa():
+            from sglang.srt.layers.attention.flashattention_backend import (
+                FlashAttentionBackend,
+            )
+        else:
+            from sglang.srt.hardware_backend.musa.attention.flashattention_backend import (
+                MusaFlashAttentionBackend as FlashAttentionBackend,
+            )
         return FlashAttentionBackend(
             self.draft_model_runner, skip_prefill=False, fa_impl_ver=fa_impl_ver
         )
@@ -266,3 +286,10 @@ class DraftBackendFactory:
             "flashmla prefill backend is not yet supported for draft extend."
         )
         return None
+
+    def _create_dsv4_prefill_backend(self):
+        from sglang.srt.layers.attention.deepseek_v4_backend import (
+            DeepseekV4AttnBackend,
+        )
+
+        return DeepseekV4AttnBackend(self.draft_model_runner, skip_prefill=False)
