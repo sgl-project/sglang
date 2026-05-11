@@ -30,7 +30,12 @@ from sglang.test.test_utils import (
 )
 from sglang.utils import wait_for_http_ready
 
-register_cuda_ci(est_time=200, suite="stage-b-test-1-gpu-large")
+register_cuda_ci(
+    est_time=200,
+    suite="nightly-1-gpu",
+    nightly=True,
+    tags=("hicache", "speculative-decoding"),
+)
 
 
 @unittest.skipIf(is_hip(), "HiCache + EAGLE3 file-storage loadback e2e is CUDA-only.")
