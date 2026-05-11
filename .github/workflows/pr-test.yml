@@ -643,6 +643,18 @@ jobs:
       - name: Install uv
         uses: astral-sh/setup-uv@v5
 
+      # Needed by setuptools-rust to build the bundled native gRPC extension
+      # (rust/sglang-grpc) when installing the main `sglang` wheel from source.
+      - name: Install protoc + Rust toolchain
+        timeout-minutes: 10
+        run: bash scripts/ci/utils/install_rust_protoc.sh
+
+      - name: Rust cache (sglang-grpc)
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust/sglang-grpc
+          shared-key: "sglang-grpc-cpu"
+
       # uv pip targets a venv by default; setup-python has no venv — install into that interpreter (see UV_SYSTEM_PYTHON in https://docs.astral.sh/uv/guides/integration/github/)
       - name: Install dependencies
         timeout-minutes: 20
