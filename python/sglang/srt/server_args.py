@@ -51,6 +51,7 @@ from sglang.srt.utils.common import (
     is_flashinfer_available,
     is_hip,
     is_hopper_with_cuda_12_3,
+    is_host_cpu_arm64,
     is_mps,
     is_musa,
     is_no_spec_infer_or_topk_one,
@@ -144,6 +145,8 @@ ATTENTION_BACKEND_CHOICES = [
     "torch_native",
     "flex_attention",
     "nsa",
+    "dsv4",
+    "compressed",  # Deprecated alias for "dsv4"
     # NVIDIA specific
     "cutlass_mla",
     "fa3",
@@ -217,6 +220,7 @@ FP4_GEMM_RUNNER_BACKEND_CHOICES = [
     "auto",
     "cutlass",
     "flashinfer_cudnn",
+    "flashinfer_cutedsl",
     "flashinfer_cutlass",
     "flashinfer_trtllm",
 ]
@@ -422,6 +426,8 @@ class ServerArgs:
     prefill_delayer_token_usage_low_watermark: Optional[float] = None
     prefill_delayer_forward_passes_buckets: Optional[List[float]] = None
     prefill_delayer_wait_seconds_buckets: Optional[List[float]] = None
+    prefill_delayer_queue_min_ratio: Optional[float] = None
+    prefill_delayer_max_delay_ms: Optional[float] = None
 
     # Runtime options
     device: Optional[str] = None
@@ -785,6 +791,7 @@ class ServerArgs:
     weight_loader_disable_mmap: bool = False
     weight_loader_prefetch_checkpoints: bool = False
     weight_loader_prefetch_num_threads: int = 4
+    weight_loader_drop_cache_after_load: bool = False
     remote_instance_weight_loader_seed_instance_ip: Optional[str] = None
     remote_instance_weight_loader_seed_instance_service_port: Optional[int] = None
     remote_instance_weight_loader_send_weights_group_ports: Optional[List[int]] = None
@@ -882,6 +889,12 @@ class ServerArgs:
 
         # Handle memory-related, chunked prefill, and CUDA graph batch size configurations.
         self._handle_gpu_memory_settings(gpu_mem)
+
+        # enforce_disable_flashinfer_allreduce_fusion must be set before
+        # _handle_model_specific_adjustments, which auto-enables the fusion
+        # for several SM90/SM100 MoE arches.
+        if self.enable_deterministic_inference:
+            self.enforce_disable_flashinfer_allreduce_fusion = True
 
         # Apply model-specific adjustments.
         self._handle_model_specific_adjustments()
@@ -1076,6 +1089,20 @@ class ServerArgs:
             envs.SGLANG_SPEC_NAN_DETECTION.set(True)
             envs.SGLANG_SPEC_OOB_DETECTION.set(True)
 
+        # Deprecated attention-backend alias: "compressed" -> "dsv4".
+        for attr in (
+            "attention_backend",
+            "decode_attention_backend",
+            "prefill_attention_backend",
+            "speculative_draft_attention_backend",
+        ):
+            if getattr(self, attr, None) == "compressed":
+                logger.warning(
+                    "--%s=compressed is deprecated; use 'dsv4' instead.",
+                    attr.replace("_", "-"),
+                )
+                setattr(self, attr, "dsv4")
+
         # Native gRPC flags — env-only for now, not exposed as CLI args.
         # Set as instance attributes (not dataclass fields) to avoid
         # argparse namespace lookup in from_cli_args.
@@ -1203,7 +1230,9 @@ class ServerArgs:
     def _handle_cpu_backends(self):
         if self.device == "cpu":
             if self.attention_backend is None:
-                self.attention_backend = "intel_amx"
+                self.attention_backend = (
+                    "torch_native" if is_host_cpu_arm64() else "intel_amx"
+                )
             self.sampling_backend = "pytorch"
 
     def _handle_npu_backends(self):
@@ -1638,25 +1667,16 @@ class ServerArgs:
         ], "DeepSeek DSA only supports bf16/bfloat16 or fp8_e4m3 kv_cache_dtype"
 
     def _set_default_nsa_backends(self, kv_cache_dtype: str, major: int) -> str:
+        from sglang.srt.arg_groups.hisparse_hook import (
+            apply_hisparse_nsa_backend_defaults,
+        )
+
         user_set_prefill = self.nsa_prefill_backend is not None
         user_set_decode = self.nsa_decode_backend is not None
 
-        # HiSparse: BF16 KV -> flashmla_sparse (native BF16 sparse).
-        # FP8 KV   -> flashmla_kv (native FP8 + sparse via is_fp8_kvcache=True + indices=...).
-        # flashmla_sparse does not accept FP8, and flashmla_kv does not accept BF16 sparse,
-        # so the KV dtype determines the backend when the user does not override.
-        if self.enable_hisparse:
-            hisparse_default_backend = (
-                "flashmla_kv" if kv_cache_dtype == "fp8_e4m3" else "flashmla_sparse"
-            )
-            if not user_set_prefill:
-                self.nsa_prefill_backend = hisparse_default_backend
-            if not user_set_decode:
-                self.nsa_decode_backend = hisparse_default_backend
-            logger.warning(
-                f"HiSparse enabled ({kv_cache_dtype}): using NSA backends "
-                f"prefill={self.nsa_prefill_backend}, decode={self.nsa_decode_backend}."
-            )
+        if apply_hisparse_nsa_backend_defaults(
+            self, user_set_prefill, user_set_decode, kv_cache_dtype
+        ):
             return
 
         if not user_set_prefill and not user_set_decode and is_hip():
@@ -1719,6 +1739,15 @@ class ServerArgs:
             self.dtype = "bfloat16"
 
         if model_arch in [
+            "DeepseekV4ForCausalLM",
+        ]:
+            from sglang.srt.arg_groups.deepseek_v4_hook import (
+                apply_deepseek_v4_defaults,
+            )
+
+            apply_deepseek_v4_defaults(self, model_arch)
+
+        if model_arch in [
             "DeepseekV3ForCausalLM",
             "DeepseekV32ForCausalLM",
             "KimiK25ForConditionalGeneration",
@@ -1773,8 +1802,8 @@ class ServerArgs:
                                 self.dp_size == 1
                             ), "For round-robin split mode, dp attention is not supported."
                         assert (
-                            self.tp_size == 8
-                        ), "Current multi-machine CP support suffers from precision issues. So context parallel only support Single machine(tp_size == 8)"
+                            self.tp_size <= 8
+                        ), "Context parallel only supports single machine (tp_size <= 8). Cross-machine CP has precision issues."
                         self.attn_cp_size = self.tp_size // self.dp_size
 
                         logger.warning(
@@ -1872,6 +1901,7 @@ class ServerArgs:
                         self.quantization
                         in ["fp8", "modelopt_fp8", "modelopt_fp4", "modelopt_mixed"]
                         or is_kimi_k2_k25_thinking_int4
+                        or self.quantization is None
                     )
                 ):
                     self.moe_runner_backend = "flashinfer_trtllm"
@@ -1920,6 +1950,13 @@ class ServerArgs:
                         logger.info(
                             "Use triton fused moe by default for bf16 nextn layer in deepseek fp4 checkpoint."
                         )
+
+        elif model_arch in [
+            "DeepseekV4ForCausalLM",
+        ]:
+            from sglang.srt.arg_groups.deepseek_v4_hook import validate_deepseek_v4_cp
+
+            validate_deepseek_v4_cp(self)
 
         elif model_arch in ["GptOssForCausalLM"]:
             # Set attention backend for GPT-OSS
@@ -2200,6 +2237,7 @@ class ServerArgs:
             "Qwen3VLMoeForConditionalGeneration",
             "Qwen3NextForCausalLM",
             "Qwen3_5MoeForConditionalGeneration",
+            "InternS2PreviewForConditionalGeneration",
             "Qwen3_5ForConditionalGeneration",
         ]:
             if is_sm100_supported():
@@ -2227,6 +2265,7 @@ class ServerArgs:
             if model_arch in [
                 "Qwen3NextForCausalLM",
                 "Qwen3_5MoeForConditionalGeneration",
+                "InternS2PreviewForConditionalGeneration",
                 "Qwen3_5ForConditionalGeneration",
             ]:
                 sm100_default_attn_backend = "triton"
@@ -2253,6 +2292,16 @@ class ServerArgs:
                     support_mamba_cache_extra_buffer=True,
                     sm100_default_attention_backend=sm100_default_attn_backend,
                 )
+
+        elif model_arch == "MiniCPMV4_6ForConditionalGeneration":
+            # 4.6 wraps a Qwen3.5 hybrid GDN backbone, so it needs the same
+            # mamba radix cache handling as Qwen3_5ForConditionalGeneration.
+            self._handle_mamba_radix_cache(
+                model_arch=model_arch,
+                support_mamba_cache=True,
+                support_mamba_cache_extra_buffer=True,
+                sm100_default_attention_backend="triton",
+            )
 
         elif model_arch in ["Glm4MoeForCausalLM"]:
             if is_sm100_supported():
@@ -2355,6 +2404,7 @@ class ServerArgs:
                 "Qwen3NextForCausalLM",
                 "KimiK25ForConditionalGeneration",
                 "Qwen3_5MoeForConditionalGeneration",
+                "InternS2PreviewForConditionalGeneration",
                 "Qwen3_5ForConditionalGeneration",
             ]
             and (is_sm90_supported() or is_sm100_supported())
@@ -2415,8 +2465,8 @@ class ServerArgs:
                 )
 
             assert (
-                is_cuda() or is_musa()
-            ), "Mamba extra_buffer is only supported on CUDA and MUSA devices with FLA backend"
+                is_cuda() or is_musa() or is_npu()
+            ), "Mamba extra_buffer is only supported on CUDA and MUSA and NPU devices with FLA backend"
             if self.speculative_num_draft_tokens is not None:
                 assert (
                     self.mamba_track_interval >= self.speculative_num_draft_tokens
@@ -3304,22 +3354,8 @@ class ServerArgs:
         ):
             self.speculative_draft_model_revision = "main"
 
-        # FlashInfer trtllm moe bf16 only support RenormalizeNaive routing method and Deepseek routing method
-        # It is hard to tell the routing method in draft model, and the moe layer in draft model is not the bottleneck among
-        # end to end, so we just avoid using trtllm_moe for speculative decoding.
-        from sglang.srt.layers.moe.utils import MoeRunnerBackend
-
         if self.speculative_moe_runner_backend is None:
-            self.speculative_moe_runner_backend = (
-                "auto"
-                if self.moe_runner_backend
-                in ["flashinfer_trtllm", "flashinfer_trtllm_routed"]
-                else self.moe_runner_backend
-            )
-        else:
-            assert not MoeRunnerBackend(
-                self.speculative_moe_runner_backend
-            ).is_flashinfer_trtllm(), "Currently speculative MoE runner backend doesn't support flashinfer_trtllm, please use triton or auto backend for speculative moe runner instead."
+            self.speculative_moe_runner_backend = self.moe_runner_backend
 
         if self.speculative_algorithm is not None:
             self.speculative_algorithm = self.speculative_algorithm.upper()
@@ -3545,6 +3581,7 @@ class ServerArgs:
             if model_arch in [
                 "DeepseekV32ForCausalLM",
                 "DeepseekV3ForCausalLM",
+                "DeepseekV4ForCausalLM",
                 "Glm4MoeForCausalLM",
                 "Glm4MoeLiteForCausalLM",
                 "GlmMoeDsaForCausalLM",
@@ -3883,6 +3920,7 @@ class ServerArgs:
             "Qwen3VLMoeForConditionalGeneration",
             "Qwen3_5ForConditionalGeneration",
             "Qwen3_5MoeForConditionalGeneration",
+            "InternS2PreviewForConditionalGeneration",
             "Qwen3OmniMoeForConditionalGeneration",
             "Qwen2AudioForConditionalGeneration",
             "Qwen2_5OmniForConditionalGeneration",
@@ -3983,6 +4021,16 @@ class ServerArgs:
         envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.set(
             "1" if self.enable_deterministic_inference else "0"
         )
+        # Custom all-reduce v2 uses IPC handles and is intra-node only. Force-disable
+        # on multi-node so the dispatch falls back to the legacy CustomAllreduce path.
+        if self.nnodes > 1 and envs.SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2.get():
+            if envs.SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2.is_set():
+                logger.warning(
+                    "Disabling SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2 because nnodes=%d "
+                    "(custom all-reduce v2 is intra-node only).",
+                    self.nnodes,
+                )
+            envs.SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2.set("0")
         if self.debug_cuda_graph:
             if not is_cuda():
                 logger.warning(
@@ -4035,6 +4083,12 @@ class ServerArgs:
                     "Disable --enable-aiter-allreduce-fusion because deterministic inference is enabled."
                 )
                 self.enable_aiter_allreduce_fusion = False
+
+            if self.enable_flashinfer_allreduce_fusion:
+                logger.warning(
+                    "Disable --enable-flashinfer-allreduce-fusion because deterministic inference is enabled."
+                )
+                self.enable_flashinfer_allreduce_fusion = False
 
             # Check sampling backend
             self.sampling_backend = "pytorch"
@@ -4705,6 +4759,29 @@ class ServerArgs:
             nargs="+",
             default=None,
             help="Custom buckets for prefill delayer wait seconds histogram. 0 will be auto-added.",
+        )
+        parser.add_argument(
+            "--prefill-delayer-queue-min-ratio",
+            type=float,
+            default=None,
+            help=(
+                "Opt-in to the adaptive queue-based delay trigger (independent of the "
+                "slot-based one). Delays prefill until the waiting queue reaches "
+                "min(running_req * ratio, max_prefill_bs) so small fragments batch into a "
+                "larger prefill. Unset (default) keeps the original slot-only behavior. "
+                "Typical: 0.1 ~ 0.5."
+            ),
+        )
+        parser.add_argument(
+            "--prefill-delayer-max-delay-ms",
+            type=float,
+            default=None,
+            help=(
+                "Wall-clock cap (ms) on a single queue-trigger delay; once exceeded, prefill "
+                "is force-released to bound worst-case TTFT. Only consulted when "
+                "--prefill-delayer-queue-min-ratio is set. Typical: 1000 ~ 5000; defaults to "
+                "5000 if unset."
+            ),
         )
 
         # Runtime options
@@ -5420,10 +5497,11 @@ class ServerArgs:
             default=ServerArgs.fp4_gemm_runner_backend,
             dest="fp4_gemm_runner_backend",
             help="Choose the runner backend for NVFP4 GEMM operations. "
-            "Options: 'auto' (default; selects flashinfer_cudnn on SM120, flashinfer_cutlass otherwise), "
+            "Options: 'auto' (default; selects flashinfer_cudnn on SM120, flashinfer_cutedsl on SM100, flashinfer_cutlass otherwise), "
             "'cutlass' (SGLang CUTLASS kernel), "
             "'flashinfer_cutlass' (FlashInfer CUTLASS backend), "
             "'flashinfer_cudnn' (FlashInfer cuDNN backend, optimal on CUDA 13+ with cuDNN 9.15+), "
+            "'flashinfer_cutedsl' (FlashInfer CuTe DSL backend), "
             "'flashinfer_trtllm' (FlashInfer TensorRT-LLM backend, requires different weight preparation with shuffling). ",
         )
         parser.add_argument(
@@ -5945,13 +6023,14 @@ class ServerArgs:
             action="store_true",
             help="Enable hierarchical sparse attention",
         )
-
         parser.add_argument(
             "--hisparse-config",
+            "--hierarchical-sparse-attention-extra-config",
+            dest="hisparse_config",
             type=str,
             default=ServerArgs.hisparse_config,
             help="A dictionary in JSON string format for hierarchical sparse attention configuration. "
-            'Example: \'{"top_k": 2048, "device_buffer_size": 4096}\'',
+            'Example: \'{"top_k": 2048, "device_buffer_size": 4096, "host_to_device_ratio": 2}\'',
         )
 
         # LMCache
@@ -6607,6 +6686,11 @@ class ServerArgs:
             help="Number of threads per rank for checkpoint prefetching (default: 4).",
         )
         parser.add_argument(
+            "--weight-loader-drop-cache-after-load",
+            action="store_true",
+            help="Call posix_fadvise(DONTNEED) on each safetensors shard after loading it.",
+        )
+        parser.add_argument(
             "--remote-instance-weight-loader-seed-instance-ip",
             type=str,
             default=ServerArgs.remote_instance_weight_loader_seed_instance_ip,
@@ -6962,43 +7046,9 @@ class ServerArgs:
                 )
 
         # Check hisparse
-        if self.enable_hisparse:
-            from sglang.srt.configs.model_config import is_deepseek_nsa
+        from sglang.srt.arg_groups.hisparse_hook import validate_hisparse
 
-            hf_config = self.get_model_config().hf_config
-            assert is_deepseek_nsa(hf_config), (
-                "--enable-hisparse is only supported for DSA (DeepSeek Sparse Attention) models now"
-                "(e.g., DeepSeek V3.2, GLM-5). "
-            )
-
-            assert (
-                self.disable_radix_cache
-            ), "Hierarchical sparse attention currently requires --disable-radix-cache."
-            if self.kv_cache_dtype not in ("bfloat16", "auto", "fp8_e4m3"):
-                raise ValueError(
-                    f"HiSparse requires bfloat16 or fp8_e4m3 KV cache, "
-                    f"but got --kv-cache-dtype={self.kv_cache_dtype}. "
-                    f"Please use --kv-cache-dtype=bfloat16 or fp8_e4m3."
-                )
-
-            # Backend/dtype pairing: flashmla_sparse only takes BF16 KV;
-            # flashmla_kv only supports FP8 (it always reads KV as FP8 via
-            # is_fp8_kvcache=True, inline-quantizing BF16 would defeat HiSparse).
-            allowed_backends_for_dtype = {
-                "bfloat16": {"flashmla_sparse"},
-                "fp8_e4m3": {"flashmla_kv"},
-            }.get(self.kv_cache_dtype, {"flashmla_sparse", "flashmla_kv"})
-            for attr, label in [
-                ("nsa_prefill_backend", "prefill"),
-                ("nsa_decode_backend", "decode"),
-            ]:
-                backend = getattr(self, attr)
-                if backend is not None and backend not in allowed_backends_for_dtype:
-                    raise ValueError(
-                        f"HiSparse with --kv-cache-dtype={self.kv_cache_dtype} requires "
-                        f"--nsa-{label}-backend in {sorted(allowed_backends_for_dtype)}, "
-                        f"but got {backend}."
-                    )
+        validate_hisparse(self)
 
         assert (
             self.schedule_conservativeness >= 0
@@ -7026,6 +7076,11 @@ class ServerArgs:
         if self.enable_two_batch_overlap and self.moe_a2a_backend == "none":
             raise ValueError(
                 "When enabling two batch overlap, moe_a2a_backend cannot be 'none'."
+            )
+
+        if self.enable_two_batch_overlap and self.enforce_shared_experts_fusion:
+            raise ValueError(
+                "--enable-two-batch-overlap and --enforce-shared-experts-fusion cannot be used together."
             )
 
         # Check communications compression

@@ -526,9 +526,10 @@ def filter_kv_indices_for_cp_rank(
 
 
 def is_mla_backend(target_kv_pool) -> bool:
+    from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
     from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
 
-    return isinstance(target_kv_pool, MLATokenToKVPool)
+    return isinstance(target_kv_pool, (MLATokenToKVPool, DeepSeekV4TokenToKVPool))
 
 
 def setup_state_kv_args(
@@ -541,8 +542,8 @@ def setup_state_kv_args(
     Shared by prefill and decode bootstrap paths so the state_type dispatch
     lives in one place.
     """
+    from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
     from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, NSATokenToKVPool
-    from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 
     if not hasattr(token_to_kv_pool, "get_state_buf_infos"):
         kv_args.state_data_ptrs = []
@@ -558,7 +559,9 @@ def setup_state_kv_args(
     kv_args.state_data_lens = state_data_lens
     kv_args.state_item_lens = state_item_lens
 
-    if isinstance(token_to_kv_pool, SWAKVPool):
+    # DeepSeekV4TokenToKVPool inherits BaseSWAKVPool; its heterogeneous
+    # state list is described per-entry via get_state_buf_infos.
+    if isinstance(token_to_kv_pool, BaseSWAKVPool):
         kv_args.state_type = "swa"
     elif isinstance(token_to_kv_pool, HybridLinearKVPool):
         kv_args.state_type = "mamba"

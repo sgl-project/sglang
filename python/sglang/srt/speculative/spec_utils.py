@@ -62,11 +62,11 @@ def spec_need_hidden_states(server_args: Optional[ServerArgs] = None) -> bool:
 
 @triton.jit
 def create_extend_after_decode_spec_info(
-    verified_id,
+    accept_tokens,
     seq_lens,
     accept_lens,
     positions,
-    new_verified_id,
+    bonus_tokens_ptr,
     bs_upper: tl.constexpr,
 ):
     pid = tl.program_id(axis=0)
@@ -83,8 +83,8 @@ def create_extend_after_decode_spec_info(
     tl.store(positions_ptr + offsets, seq_length - accept_len + offsets, mask)
 
     accept_len_cumsum += accept_len - 1
-    verified_id_data = tl.load(verified_id + accept_len_cumsum)
-    tl.store(new_verified_id + pid, verified_id_data)
+    bonus_token = tl.load(accept_tokens + accept_len_cumsum)
+    tl.store(bonus_tokens_ptr + pid, bonus_token)
 
 
 @triton.jit
