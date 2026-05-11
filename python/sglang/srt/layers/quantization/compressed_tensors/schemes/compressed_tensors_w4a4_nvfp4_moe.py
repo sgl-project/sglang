@@ -304,7 +304,9 @@ class CompressedTensorsW4A4Nvfp4MoE(CompressedTensorsMoEScheme):
         topk_output = dispatch_output.topk_output
 
         if self.use_flashinfer_trtllm:
-            from flashinfer import fp4_quantize, trtllm_fp4_block_scale_moe
+            from flashinfer import trtllm_fp4_block_scale_moe
+
+            from sglang.srt.layers.quantization.fp4_utils import fp4_quantize
 
             router_logits = topk_output.router_logits
             topk_config = topk_output.topk_config
