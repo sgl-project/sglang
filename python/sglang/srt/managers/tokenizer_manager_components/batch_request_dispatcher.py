@@ -10,7 +10,12 @@ from typing import Any, AsyncGenerator, Callable, Dict, List, Optional, Tuple, U
 import fastapi
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
-from sglang.srt.managers.io_struct import EmbeddingReqInput, GenerateReqInput
+from sglang.srt.managers.io_struct import (
+    EmbeddingReqInput,
+    GenerateReqInput,
+    TokenizedEmbeddingReqInput,
+    TokenizedGenerateReqInput,
+)
 from sglang.srt.managers.scheduler_input_blocker import input_blocker_guard_region
 from sglang.srt.managers.tokenizer_manager_components.request_preparer import (
     RequestPreparer,
@@ -76,24 +81,7 @@ class BatchRequestDispatcher:
                 *(self.request_preparer._tokenize_one_request(obj) for obj in objs)
             )
 
-            # Cache the common prefix for parallel sampling
-            for i in range(batch_size):
-                tmp_obj = copy.copy(objs[i])
-                tokenized_obj = copy.copy(tokenized_objs[i])
-                tokenized_obj.rid = tmp_obj.regenerate_rid()
-                tokenized_obj.sampling_params = copy.copy(tokenized_obj.sampling_params)
-                tokenized_obj.sampling_params.max_new_tokens = 0
-                tokenized_obj.stream = False
-                init_req(
-                    self.rid_to_state,
-                    obj=tmp_obj,
-                    enable_trace=self.config.enable_trace,
-                    disagg_mode=self.config.disaggregation_mode,
-                )
-                self.send_one_request(tokenized_obj)
-                await self.response_emitter._wait_one_response(
-                    tmp_obj, request
-                ).__anext__()
+            await self._cache_parallel_sample_prefix(objs, tokenized_objs, request)
 
             # Expand requests, assign new rids for them, and send them
             for i in range(batch_size):
@@ -166,3 +154,29 @@ class BatchRequestDispatcher:
                 )
                 rids.append(tmp_obj.rid)
         return generators, rids
+
+    async def _cache_parallel_sample_prefix(
+        self,
+        objs: List[Union[GenerateReqInput, EmbeddingReqInput]],
+        tokenized_objs: List[
+            Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput]
+        ],
+        request: Optional[fastapi.Request],
+    ) -> None:
+        # Cache the common prefix for parallel sampling
+        batch_size = len(objs)
+        for i in range(batch_size):
+            tmp_obj = copy.copy(objs[i])
+            tokenized_obj = copy.copy(tokenized_objs[i])
+            tokenized_obj.rid = tmp_obj.regenerate_rid()
+            tokenized_obj.sampling_params = copy.copy(tokenized_obj.sampling_params)
+            tokenized_obj.sampling_params.max_new_tokens = 0
+            tokenized_obj.stream = False
+            init_req(
+                self.rid_to_state,
+                obj=tmp_obj,
+                enable_trace=self.config.enable_trace,
+                disagg_mode=self.config.disaggregation_mode,
+            )
+            self.send_one_request(tokenized_obj)
+            await self.response_emitter._wait_one_response(tmp_obj, request).__anext__()
