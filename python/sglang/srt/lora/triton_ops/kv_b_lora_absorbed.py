@@ -15,7 +15,8 @@ where ``A: (slot, rank, kv_lora_rank)`` is the LoRA-A of ``kv_b_proj``
 is the LoRA-B; ``B_kc`` / ``B_vc`` are its K-half / V-half slices.
 
 Four kernels split the math along the factorization boundary, all using
-the SGMM idiom from ``sgemm_lora_a`` / ``qkv_lora_b``:
+the SGMM idiom from ``sgemm_lora_a`` / ``qkv_lora_b`` and the segment-indptr
+routing used by ``chunked_sgmv_*``:
 
   * ``step_a_q_fwd``: per-head per-slot SGMM, ``(S,H,qk_nope) -> (S,H,rank)``
   * ``step_b_q_fwd``: shared-A per-slot SGMM, scaled+accumulated,
@@ -29,9 +30,12 @@ Grid axes for each kernel:
   axis 1 : head_id                       -- per-head weight slice
   axis 2 : batch_id (segment / request)  -- per-slot weight routing via weight_indices
 
-Per-segment routing: each program loads ``weight_indices[batch_id]`` once
-and uses that slot's slice of the LoRA weight stack.  No Python loops over
-slots or heads.
+Per-segment routing: each program derives its segment length from
+``seg_indptr[segment_id + 1] - seg_indptr[segment_id]``, loads
+``weight_indices[segment_id]`` once, and uses that slot's slice of the LoRA
+weight stack.  When ``permutation`` is present, rows are routed through it,
+matching the csgmv backend's adapter-grouped chunks.  No Python loops over slots
+or heads.
 
 The math also stays in the input dtype (no fp32 round-trip) -- the
 contraction dim ``rank`` is small (typically 16-64), so bf16 accumulation
@@ -73,6 +77,18 @@ _STEP_B_BLOCK_K = 16  # contraction is rank
 _STEP_B_BLOCK_N = 64  # output is kv_lora_rank (~512) or v_head_dim (~128)
 
 
+def _num_segments(batch_info: LoRABatchInfo) -> int:
+    return batch_info.num_segments or batch_info.bs
+
+
+def _max_segment_len(batch_info: LoRABatchInfo) -> int:
+    if batch_info.max_len is not None:
+        return batch_info.max_len
+    if batch_info.seg_lens is not None:
+        return int(batch_info.seg_lens.max().item())
+    raise ValueError("LoRA batch_info must provide max_len or seg_lens.")
+
+
 # ---------------------------------------------------------------------------
 # Kernel 1 -- Step A_q: per-head per-slot SGMM, reads K-half of B
 #
@@ -84,7 +100,7 @@ _STEP_B_BLOCK_N = 64  # output is kv_lora_rank (~512) or v_head_dim (~128)
 # ---------------------------------------------------------------------------
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["num_segments"])
 def _step_a_q_kernel(
     x,
     w,
@@ -105,11 +121,11 @@ def _step_a_q_kernel(
     out_stride_h,
     out_stride_n,
     # batch info
-    seg_lens,
     seg_indptr,
     weight_indices,
     lora_ranks,
     sorted_token_ids,
+    num_segments,
     # meta
     FULL_K: tl.constexpr,  # per-head row stride in B (qk_nope + v_head_dim)
     SORTED_BY_ADAPTER: tl.constexpr,
@@ -121,15 +137,19 @@ def _step_a_q_kernel(
     head_id = tl.program_id(axis=1)
     pid = tl.program_id(axis=0)
 
+    if batch_id >= num_segments:
+        return
+
     w_index = tl.load(weight_indices + batch_id)
     cur_rank = tl.load(lora_ranks + w_index)
     if cur_rank == 0:
         return
 
-    seg_len = tl.load(seg_lens + batch_id)
+    seg_start = tl.load(seg_indptr + batch_id)
+    seg_end = tl.load(seg_indptr + batch_id + 1)
+    seg_len = seg_end - seg_start
     if seg_len == 0:
         return
-    seg_start = tl.load(seg_indptr + batch_id)
 
     # Truncate output N to this slot's rank (allows mixed-rank batches).
     N_eff = tl.minimum(N, cur_rank)
@@ -217,11 +237,13 @@ def step_a_q_fwd(
     S, H, qk_nope_dim = q_nope.shape
     rank = B_buf.shape[-1]
     out = torch.empty((S, H, rank), device=q_nope.device, dtype=q_nope.dtype)
+    num_segments = _num_segments(batch_info)
+    max_segment_len = _max_segment_len(batch_info)
 
     grid = (
-        triton.cdiv(batch_info.max_len, _BLOCK_S) * triton.cdiv(rank, _STEP_A_BLOCK_N),
+        triton.cdiv(max_segment_len, _BLOCK_S) * triton.cdiv(rank, _STEP_A_BLOCK_N),
         H,
-        batch_info.bs,
+        num_segments,
     )
     sorted_by_adapter = batch_info.permutation is not None
 
@@ -242,11 +264,11 @@ def step_a_q_fwd(
         out.stride(0),
         out.stride(1),
         out.stride(2),
-        batch_info.seg_lens,
         batch_info.seg_indptr,
         batch_info.weight_indices,
         batch_info.lora_ranks,
         batch_info.permutation,
+        num_segments,
         FULL_K=full_K_per_head,
         SORTED_BY_ADAPTER=sorted_by_adapter,
         BLOCK_S=_BLOCK_S,
@@ -267,7 +289,7 @@ def step_a_q_fwd(
 # ---------------------------------------------------------------------------
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["num_segments"])
 def _step_b_q_kernel(
     x,
     w,
@@ -287,12 +309,12 @@ def _step_b_q_kernel(
     b_stride_h,
     b_stride_n,
     # batch info
-    seg_lens,
     seg_indptr,
     weight_indices,
     lora_ranks,
     sorted_token_ids,
     scalings,
+    num_segments,
     # meta
     SORTED_BY_ADAPTER: tl.constexpr,
     BLOCK_S: tl.constexpr,
@@ -303,15 +325,19 @@ def _step_b_q_kernel(
     head_id = tl.program_id(axis=1)
     pid = tl.program_id(axis=0)
 
+    if batch_id >= num_segments:
+        return
+
     w_index = tl.load(weight_indices + batch_id)
     cur_rank = tl.load(lora_ranks + w_index)
     if cur_rank == 0:
         return
 
-    seg_len = tl.load(seg_lens + batch_id)
+    seg_start = tl.load(seg_indptr + batch_id)
+    seg_end = tl.load(seg_indptr + batch_id + 1)
+    seg_len = seg_end - seg_start
     if seg_len == 0:
         return
-    seg_start = tl.load(seg_indptr + batch_id)
     scaling = tl.load(scalings + w_index)
 
     # Truncate contraction K to this slot's rank.
@@ -398,12 +424,14 @@ def step_b_q_fwd(
     """
     S, H, rank = q_lora_a.shape
     kv_lora_rank = A_buf.shape[-1]
+    num_segments = _num_segments(batch_info)
+    max_segment_len = _max_segment_len(batch_info)
 
     grid = (
-        triton.cdiv(batch_info.max_len, _BLOCK_S)
+        triton.cdiv(max_segment_len, _BLOCK_S)
         * triton.cdiv(kv_lora_rank, _STEP_B_BLOCK_N),
         H,
-        batch_info.bs,
+        num_segments,
     )
     sorted_by_adapter = batch_info.permutation is not None
 
@@ -423,12 +451,12 @@ def step_b_q_fwd(
         base_output.stride(0),
         base_output.stride(1),
         base_output.stride(2),
-        batch_info.seg_lens,
         batch_info.seg_indptr,
         batch_info.weight_indices,
         batch_info.lora_ranks,
         batch_info.permutation,
         batch_info.scalings,
+        num_segments,
         SORTED_BY_ADAPTER=sorted_by_adapter,
         BLOCK_S=_BLOCK_S,
         BLOCK_N=_STEP_B_BLOCK_N,
@@ -448,7 +476,7 @@ def step_b_q_fwd(
 # ---------------------------------------------------------------------------
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["num_segments"])
 def _step_a_v_kernel(
     x,
     w,
@@ -468,11 +496,11 @@ def _step_a_v_kernel(
     out_stride_h,
     out_stride_n,
     # batch info
-    seg_lens,
     seg_indptr,
     weight_indices,
     lora_ranks,
     sorted_token_ids,
+    num_segments,
     # meta
     SORTED_BY_ADAPTER: tl.constexpr,
     BLOCK_S: tl.constexpr,
@@ -483,15 +511,19 @@ def _step_a_v_kernel(
     head_id = tl.program_id(axis=1)
     pid = tl.program_id(axis=0)
 
+    if batch_id >= num_segments:
+        return
+
     w_index = tl.load(weight_indices + batch_id)
     cur_rank = tl.load(lora_ranks + w_index)
     if cur_rank == 0:
         return
 
-    seg_len = tl.load(seg_lens + batch_id)
+    seg_start = tl.load(seg_indptr + batch_id)
+    seg_end = tl.load(seg_indptr + batch_id + 1)
+    seg_len = seg_end - seg_start
     if seg_len == 0:
         return
-    seg_start = tl.load(seg_indptr + batch_id)
 
     # Truncate output N to this slot's rank.
     N_eff = tl.minimum(N, cur_rank)
@@ -572,11 +604,13 @@ def step_a_v_fwd(
     S, H, kv_lora_rank = attn_output.shape
     rank = A_buf.shape[1]
     out = torch.empty((S, H, rank), device=attn_output.device, dtype=attn_output.dtype)
+    num_segments = _num_segments(batch_info)
+    max_segment_len = _max_segment_len(batch_info)
 
     grid = (
-        triton.cdiv(batch_info.max_len, _BLOCK_S) * triton.cdiv(rank, _STEP_A_BLOCK_N),
+        triton.cdiv(max_segment_len, _BLOCK_S) * triton.cdiv(rank, _STEP_A_BLOCK_N),
         H,
-        batch_info.bs,
+        num_segments,
     )
     sorted_by_adapter = batch_info.permutation is not None
 
@@ -596,11 +630,11 @@ def step_a_v_fwd(
         out.stride(0),
         out.stride(1),
         out.stride(2),
-        batch_info.seg_lens,
         batch_info.seg_indptr,
         batch_info.weight_indices,
         batch_info.lora_ranks,
         batch_info.permutation,
+        num_segments,
         SORTED_BY_ADAPTER=sorted_by_adapter,
         BLOCK_S=_BLOCK_S,
         BLOCK_N=_STEP_A_BLOCK_N,
@@ -621,7 +655,7 @@ def step_a_v_fwd(
 # ---------------------------------------------------------------------------
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["num_segments"])
 def _step_b_v_kernel(
     x,
     w,
@@ -641,12 +675,12 @@ def _step_b_v_kernel(
     b_stride_h,
     b_stride_n,
     # batch info
-    seg_lens,
     seg_indptr,
     weight_indices,
     lora_ranks,
     sorted_token_ids,
     scalings,
+    num_segments,
     # meta
     FULL_K: tl.constexpr,  # qk_nope + v_head_dim
     QK_NOPE_OFFSET: tl.constexpr,  # offset of V-half within each head's row block
@@ -659,15 +693,19 @@ def _step_b_v_kernel(
     head_id = tl.program_id(axis=1)
     pid = tl.program_id(axis=0)
 
+    if batch_id >= num_segments:
+        return
+
     w_index = tl.load(weight_indices + batch_id)
     cur_rank = tl.load(lora_ranks + w_index)
     if cur_rank == 0:
         return
 
-    seg_len = tl.load(seg_lens + batch_id)
+    seg_start = tl.load(seg_indptr + batch_id)
+    seg_end = tl.load(seg_indptr + batch_id + 1)
+    seg_len = seg_end - seg_start
     if seg_len == 0:
         return
-    seg_start = tl.load(seg_indptr + batch_id)
     scaling = tl.load(scalings + w_index)
 
     K_eff = tl.minimum(K, cur_rank)
@@ -760,12 +798,14 @@ def step_b_v_fwd(
     """
     S, H, rank = attn_lora_a.shape
     full_K_per_head = qk_nope_head_dim + v_head_dim
+    num_segments = _num_segments(batch_info)
+    max_segment_len = _max_segment_len(batch_info)
 
     grid = (
-        triton.cdiv(batch_info.max_len, _BLOCK_S)
+        triton.cdiv(max_segment_len, _BLOCK_S)
         * triton.cdiv(v_head_dim, _STEP_B_BLOCK_N),
         H,
-        batch_info.bs,
+        num_segments,
     )
     sorted_by_adapter = batch_info.permutation is not None
 
@@ -785,12 +825,12 @@ def step_b_v_fwd(
         base_output.stride(0),
         base_output.stride(1),
         base_output.stride(2),
-        batch_info.seg_lens,
         batch_info.seg_indptr,
         batch_info.weight_indices,
         batch_info.lora_ranks,
         batch_info.permutation,
         batch_info.scalings,
+        num_segments,
         FULL_K=full_K_per_head,
         QK_NOPE_OFFSET=qk_nope_head_dim,
         SORTED_BY_ADAPTER=sorted_by_adapter,

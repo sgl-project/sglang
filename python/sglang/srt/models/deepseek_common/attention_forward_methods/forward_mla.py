@@ -502,6 +502,7 @@ class DeepseekMLAForwardMixin:
             )
         attn_output = attn_output.view(-1, self.num_local_heads, self.kv_lora_rank)
 
+        kv_b_lora_v_corrected = False
         if self.use_deep_gemm_bmm:
             attn_output_val, attn_output_scale, masked_m, expected_m, aligned_m = (
                 per_token_group_quant_mla_deep_gemm_masked_fp8(
@@ -557,16 +558,22 @@ class DeepseekMLAForwardMixin:
                         self.w_vc.to(torch.bfloat16) * self.w_scale,
                     )
 
+            attn_bmm_output = attn_bmm_output.transpose(0, 1).flatten(1, 2)
+            attn_bmm_output = self._apply_kv_b_lora_v_correction(
+                attn_output, attn_bmm_output
+            )
+            kv_b_lora_v_corrected = True
+
             if self.o_proj.weight.dtype == torch.uint8:
-                attn_bmm_output = attn_bmm_output.transpose(0, 1)
-                attn_bmm_output = fused_flatten_mxfp4_quant(attn_bmm_output)
-            elif self.o_proj.weight.dtype == torch.float8_e4m3fn:
-                attn_bmm_output = attn_bmm_output.transpose(0, 1)
-                attn_bmm_output = fused_flatten_fp8_group_quant(
-                    attn_bmm_output, group_size=128, dtype_quant=torch.float8_e4m3fn
+                attn_bmm_output = fused_flatten_mxfp4_quant(
+                    attn_bmm_output.view(-1, self.num_local_heads, self.v_head_dim)
                 )
-            else:
-                attn_bmm_output = attn_bmm_output.transpose(0, 1).flatten(1, 2)
+            elif self.o_proj.weight.dtype == torch.float8_e4m3fn:
+                attn_bmm_output = fused_flatten_fp8_group_quant(
+                    attn_bmm_output.view(-1, self.num_local_heads, self.v_head_dim),
+                    group_size=128,
+                    dtype_quant=torch.float8_e4m3fn,
+                )
 
         elif self.w_vc.dtype == torch.float8_e4m3fn:
             if _is_cpu:
@@ -620,9 +627,10 @@ class DeepseekMLAForwardMixin:
                         -1, self.num_local_heads, self.v_head_dim
                     ).transpose(0, 1),
                 )
-        attn_bmm_output = self._apply_kv_b_lora_v_correction(
-            attn_output, attn_bmm_output
-        )
+        if not kv_b_lora_v_corrected:
+            attn_bmm_output = self._apply_kv_b_lora_v_correction(
+                attn_output, attn_bmm_output
+            )
         output, _ = self.o_proj(attn_bmm_output)
 
         if self.next_skip_topk is None:

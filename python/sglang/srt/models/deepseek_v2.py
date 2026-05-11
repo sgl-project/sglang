@@ -1738,11 +1738,16 @@ class DeepseekV2AttentionMLA(
             return None
         if not hasattr(self.kv_b_proj, "A_buffer"):
             return None
-        if not hasattr(self.kv_b_proj.lora_backend, "batch_info"):
+        lora_backend = self.kv_b_proj.lora_backend
+        if not hasattr(lora_backend, "batch_info"):
             return None
-        batch_info = self.kv_b_proj.lora_backend.batch_info
+        batch_info = lora_backend.batch_info
         if batch_info is None:
             return None
+
+        sgemm_info = getattr(lora_backend, "_sgemm_info", None)
+        if callable(sgemm_info):
+            batch_info = sgemm_info()
         return self.kv_b_proj.A_buffer, self.kv_b_proj.B_buffer, batch_info
 
     def _apply_kv_b_lora_q_correction(
