@@ -63,7 +63,7 @@ class TestMoERunner4GPU(CustomTestCase):
                 "deepep",
                 "--deepep-mode",
                 "low_latency",
-                "--deepep-dispather-output-dtype",
+                "--deepep-dispatcher-output-dtype",
                 "bf16",
                 "--attention-backend",
                 "triton",
