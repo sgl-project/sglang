@@ -10,6 +10,7 @@ from contextlib import ExitStack
 from dataclasses import dataclass, field
 from typing import Any, Callable, List, Union
 
+import numpy as np
 import torch
 from setproctitle import setproctitle
 
@@ -31,7 +32,10 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_ulysses_parallel_rank,
     get_ulysses_parallel_world_size,
 )
-from sglang.multimodal_gen.runtime.entrypoints.utils import save_outputs
+from sglang.multimodal_gen.runtime.entrypoints.utils import (
+    post_process_sample,
+    save_outputs,
+)
 from sglang.multimodal_gen.runtime.loader.weight_utils import compute_weights_checksum
 from sglang.multimodal_gen.runtime.loader.weights_updater import (
     WeightsUpdater,
@@ -127,7 +131,7 @@ class GPUWorker:
         # initialize the distributed environment
         maybe_init_distributed_environment_and_model_parallel(
             tp_size=self.server_args.tp_size,
-            enable_cfg_parallel=self.server_args.enable_cfg_parallel,
+            cfg_degree=self.server_args.cfg_parallel_degree or 1,
             ulysses_degree=self.server_args.ulysses_degree,
             ring_degree=self.server_args.ring_degree,
             sp_size=self.server_args.sp_degree,
@@ -366,6 +370,9 @@ class GPUWorker:
                 if torch.cuda.is_initialized():
                     torch.cuda.empty_cache()
 
+            # Keep return_frames payloads off the scheduler's tensor ZMQ path.
+            self._materialize_frame_outputs_for_return(output_batch, req)
+
             if torch.cuda.is_initialized() and output_batch.output is None:
                 torch.cuda.empty_cache()
 
@@ -396,7 +403,76 @@ class GPUWorker:
                 output_batch = OutputBatch()
             output_batch.error = f"Error executing {error_context}: {e}"
             self._record_output_peak_memory(output_batch)
+            # clean cache if OOM
+            if torch.cuda.is_initialized():
+                torch.cuda.empty_cache()
         return output_batch
+
+    def _materialize_frame_outputs_for_return(
+        self, output_batch: OutputBatch, req: Req
+    ) -> None:
+        if self.rank != 0 or output_batch.output is None or not req.return_frames:
+            return
+
+        if (
+            os.environ.get("SGLANG_DIFFUSION_SYNC_STAGE_PROFILING", "0") == "1"
+            and torch.cuda.is_initialized()
+        ):
+            torch.cuda.synchronize()
+        start_time = time.perf_counter()
+        output_batch.output = [
+            self._materialize_frame_output(output, output_batch, req)
+            for output in output_batch.output
+        ]
+        if output_batch.metrics is not None:
+            if (
+                os.environ.get("SGLANG_DIFFUSION_SYNC_STAGE_PROFILING", "0") == "1"
+                and torch.cuda.is_initialized()
+            ):
+                torch.cuda.synchronize()
+            output_batch.metrics.record_stage(
+                "GPUWorker.frame_materialize_for_return",
+                time.perf_counter() - start_time,
+            )
+
+    @staticmethod
+    def _materialize_frame_output(
+        output: Any, output_batch: OutputBatch, req: Req
+    ) -> np.ndarray:
+        if (
+            isinstance(output, torch.Tensor)
+            and not req.enable_frame_interpolation
+            and not req.enable_upscaling
+        ):
+            if output.dim() == 3:
+                output = output.unsqueeze(1)
+            output = (output * 255).clamp(0, 255).to(torch.uint8)
+            return output.permute(1, 2, 3, 0).cpu().numpy()
+
+        if (
+            isinstance(output, np.ndarray)
+            and output.dtype == np.uint8
+            and output.ndim == 4
+            and output.shape[-1] in (1, 3, 4)
+        ):
+            return output
+
+        frames = post_process_sample(
+            output,
+            req.data_type,
+            req.fps,
+            save_output=False,
+            audio_sample_rate=output_batch.audio_sample_rate,
+            output_compression=req.output_compression,
+            enable_frame_interpolation=req.enable_frame_interpolation,
+            frame_interpolation_exp=req.frame_interpolation_exp,
+            frame_interpolation_scale=req.frame_interpolation_scale,
+            frame_interpolation_model_path=req.frame_interpolation_model_path,
+            enable_upscaling=req.enable_upscaling,
+            upscaling_model_path=req.upscaling_model_path,
+            upscaling_scale=req.upscaling_scale,
+        )
+        return np.asarray(frames)
 
     def _record_output_peak_memory(self, output_batch: OutputBatch) -> None:
         if self.rank != 0 or current_platform.is_cpu():
@@ -489,6 +565,7 @@ class GPUWorker:
         first_req = reqs[0]
         shared_output_fields = (
             "save_output",
+            "return_frames",
             "return_file_paths_only",
             "data_type",
             "fps",

@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 import torch
 
+from sglang.srt.disaggregation.kv_events import StorageMedium
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
     DecLockRefResult,
@@ -38,9 +39,8 @@ from sglang.srt.mem_cache.mamba_radix_cache import (
 from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, HybridReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import (
     RadixKey,
-    compute_node_hash_values,
-    split_node_hash_value,
 )
+from sglang.srt.mem_cache.utils import compute_node_hash_values, split_node_hash_value
 from sglang.srt.observability.metrics_collector import StorageMetricsCollector
 
 if TYPE_CHECKING:
@@ -319,6 +319,7 @@ class HiMambaRadixCache(MambaRadixCache):
             n.value = full_device_indices[offset : offset + n_len].clone()
             offset += n_len
 
+            self._record_store_event(n, medium=StorageMedium.GPU)
             self.full_lru_list.insert_mru(n)
             self.full_evictable_size_ += n_len
             self._update_leaf_status(n)
@@ -379,6 +380,9 @@ class HiMambaRadixCache(MambaRadixCache):
                     finish_event.synchronize()
                     for ack_id in ack_list:
                         backuped_node = self.ongoing_write_through.pop(ack_id)
+                        self._record_store_event(
+                            backuped_node, medium=StorageMedium.CPU
+                        )
                         if self.enable_storage:
                             self.write_backup_storage(backuped_node)
                 self.cache_controller.ack_write_queue.clear()
@@ -408,6 +412,7 @@ class HiMambaRadixCache(MambaRadixCache):
             finish_event.synchronize()
             for ack_id in ack_list:
                 backuped_node = self.ongoing_write_through.pop(ack_id)
+                self._record_store_event(backuped_node, medium=StorageMedium.CPU)
                 self.dec_lock_ref(backuped_node)
                 if self.enable_storage:
                     self.write_backup_storage(backuped_node)
@@ -514,6 +519,7 @@ class HiMambaRadixCache(MambaRadixCache):
 
         num_full = len(node.value)
 
+        self._record_remove_event(node, medium=StorageMedium.GPU)
         self.cache_controller.evict_device(node.value)
         self.full_evictable_size_ -= num_full
         if self.full_lru_list.in_list(node):
@@ -534,6 +540,7 @@ class HiMambaRadixCache(MambaRadixCache):
 
         full_num_evicted = len(node.value)
 
+        self._record_remove_event(node, medium=StorageMedium.GPU)
         self.cache_controller.evict_device(node.value)
         self.full_evictable_size_ -= full_num_evicted
         if self.full_lru_list.in_list(node):
@@ -576,6 +583,7 @@ class HiMambaRadixCache(MambaRadixCache):
             node.host_mamba_ref_counter == 0
         ), f"host mamba in use, {node.id=} {node.host_mamba_ref_counter=}"
 
+        self._record_remove_event(node, medium=StorageMedium.CPU)
         full_num_evicted = self.cache_controller.evict_host(node.host_value)
         node.host_value = None
 
@@ -612,6 +620,7 @@ class HiMambaRadixCache(MambaRadixCache):
             and node.host_ref_counter == 0
             and node.host_mamba_ref_counter == 0
         ):
+            self._record_remove_event(node, medium=StorageMedium.CPU)
             self.cache_controller.evict_host(node.host_value)
             node.host_value = None
 
@@ -641,6 +650,7 @@ class HiMambaRadixCache(MambaRadixCache):
             parent = node.parent
 
             if not parent.evicted:
+                self._record_remove_event(parent, medium=StorageMedium.GPU)
                 full_num_evicted += len(parent.value)
                 self.full_evictable_size_ -= len(parent.value)
                 self.cache_controller.evict_device(parent.value)
@@ -808,6 +818,7 @@ class HiMambaRadixCache(MambaRadixCache):
         node.value = fresh_value.clone()
         self.full_lru_list.insert_mru(node)
         self.full_evictable_size_ += n
+        self._record_store_event(node, medium=StorageMedium.GPU)
 
         self._update_leaf_status(node)
         if node.parent is not None:
@@ -903,8 +914,9 @@ class HiMambaRadixCache(MambaRadixCache):
         parent.children[child_key] = new_node
         self.full_evictable_size_ += len(value)
         self.mamba_evictable_size_ += len(mamba_value)
-        if self.enable_storage:
+        if self.enable_storage or self.enable_kv_cache_events:
             new_node.hash_value = compute_node_hash_values(new_node, self.page_size)
+        self._record_store_event(new_node, medium=StorageMedium.GPU)
         self._update_full_device_leaf_status(new_node)
         self._update_full_device_leaf_status(parent)
         return new_node
@@ -1066,10 +1078,6 @@ class HiMambaRadixCache(MambaRadixCache):
         if child.backuped:
             new_node.host_value = child.host_value[:split_len].clone()
             child.host_value = child.host_value[split_len:].clone()
-
-        new_node.hash_value, child.hash_value = split_node_hash_value(
-            child.hash_value, split_len, self.page_size
-        )
 
         self._update_leaf_status(new_node)
         self._update_leaf_status(child)
@@ -1879,6 +1887,7 @@ class HiMambaRadixCache(MambaRadixCache):
             leaf_node = new_node
             self._update_full_host_leaf_status(new_node)
             self._update_full_host_leaf_status(node)
+            self._record_store_event(new_node, medium=StorageMedium.CPU)
 
         # Attach mamba state to the new leaf
         if leaf_node is not None and mamba_host_value is not None and mamba_loaded:

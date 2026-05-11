@@ -700,9 +700,11 @@ class LayerCommunicator:
         if (
             self._communicate_summable_tensor_pair_fn
             is CommunicateSummableTensorPairFn._scatter_hidden_states
-            and forward_batch.dp_padding_mode.is_max_len()
         ):
-            return True
+            if should_use_dp_reduce_scatterv():
+                return True
+            if forward_batch.dp_padding_mode.is_max_len():
+                return True
         if nsa_use_prefill_cp(forward_batch):
             return True
         if get_attn_tp_context().input_scattered and not self.is_last_layer:

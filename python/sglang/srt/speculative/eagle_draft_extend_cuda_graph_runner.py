@@ -26,7 +26,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
 )
 from sglang.srt.model_executor.input_buffers import ForwardInputBuffers
-from sglang.srt.speculative.eagle_info import EagleDraftInput
+from sglang.srt.speculative.eagle_info import EagleDraftExtendInput
 from sglang.srt.speculative.spec_utils import fast_topk
 from sglang.srt.utils import (
     require_attn_tp_gather,
@@ -132,33 +132,13 @@ class EAGLEDraftExtendCudaGraphRunner:
             positions = torch.zeros((self.max_num_token,), dtype=torch.int64)
             mrope_positions = torch.zeros((3, self.max_num_token), dtype=torch.int64)
 
-            if (
-                self.eagle_worker.speculative_algorithm.is_eagle3()
-                and self.eagle_worker.eagle_use_aux_hidden_state
-            ):
-                hidden_states = torch.zeros(
-                    (
-                        self.max_num_token,
-                        (
-                            self.model_runner.model_config.hf_config.target_hidden_size
-                            * 3
-                            if hasattr(
-                                self.model_runner.model_config.hf_config,
-                                "target_hidden_size",
-                            )
-                            else self.model_runner.model_config.hidden_size * 3
-                        ),
-                    ),
-                    dtype=self.model_runner.dtype,
-                )
-            else:
-                hidden_states = torch.zeros(
-                    (
-                        self.max_num_token,
-                        self.model_runner.model_config.spec_hidden_size,
-                    ),
-                    dtype=self.model_runner.dtype,
-                )
+            hidden_states = torch.zeros(
+                (
+                    self.max_num_token,
+                    EagleDraftExtendInput.hidden_size_for(self.eagle_worker),
+                ),
+                dtype=EagleDraftExtendInput.dtype_for(self.eagle_worker),
+            )
             self.seq_len_fill_value = (
                 self.model_runner.attn_backend.get_cuda_graph_seq_len_fill_value()
             )
@@ -360,12 +340,11 @@ class EAGLEDraftExtendCudaGraphRunner:
         else:
             global_dp_buffer_len = None
 
-        spec_info = EagleDraftInput(
+        spec_info = EagleDraftExtendInput(
             hidden_states=hidden_states,
             num_accepted_drafts=num_accepted_drafts,
             num_accepted_tokens=num_accepted_tokens,
         )
-        spec_info.positions = None
 
         self.deepep_adapter.capture(is_extend_in_batch=True)
 
