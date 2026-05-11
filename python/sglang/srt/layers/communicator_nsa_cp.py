@@ -174,17 +174,21 @@ class NSACPCommunicateSummableTensorPairFn(CommunicateSummableTensorPairFn):
         output_mode: ScatterMode,
         context: CommunicateContext,
     ):
-        if context.is_same_group_size(
-            hidden_states_input_mode, output_mode
-        ) and context.is_same_group_size(residual_input_mode, output_mode):
-            return NSACPCommunicateSummableTensorPairFn._trivial
-
+        # Check exact enum match first: even if group sizes happen to be equal
+        # (e.g. tp_size == attn_cp_size makes FULL and SCATTERED both size 1),
+        # FULL and SCATTERED have different data layouts under CP and require
+        # an explicit scatter operation.
         if (
             (hidden_states_input_mode == ScatterMode.FULL)
             and (residual_input_mode == ScatterMode.SCATTERED)
             and (output_mode == ScatterMode.SCATTERED)
         ):
             return NSACPCommunicateSummableTensorPairFn._scatter_hidden_states
+
+        if context.is_same_group_size(
+            hidden_states_input_mode, output_mode
+        ) and context.is_same_group_size(residual_input_mode, output_mode):
+            return NSACPCommunicateSummableTensorPairFn._trivial
 
         raise NotImplementedError(
             f"{hidden_states_input_mode=} {residual_input_mode=} {output_mode=}"

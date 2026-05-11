@@ -106,6 +106,11 @@ static_assert(
 #define SGL_ARCH_BLACKWELL_OR_GREATER 0
 #endif
 
+// Maximum vector size in bytes supported by current architecture.
+// Pre-Blackwell / AMD: 128-bit (16 bytes)
+// Blackwell or greater: 256-bit (32 bytes)
+inline constexpr std::size_t kMaxVecBytes = SGL_ARCH_BLACKWELL_OR_GREATER ? 32 : 16;
+
 /// \brief Number of threads per warp (always 32 on NVIDIA/AMD GPUs).
 inline constexpr auto kWarpThreads = 32u;
 /// \brief Full warp active mask (all 32 lanes).
@@ -140,6 +145,11 @@ SGL_DEVICE void PDLTriggerSecondary() {
     asm volatile("griddepcontrol.launch_dependents;" :::);
   }
 #endif
+}
+
+template <std::integral T, std::integral U>
+SGL_DEVICE constexpr auto div_ceil(T a, U b) {
+  return (a + b - 1) / b;
 }
 
 /**
@@ -249,13 +259,23 @@ struct LaunchKernel {
     m_config.numAttrs = 0;
 #else
     if (enabled) {
-      m_attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-      m_attrs[0].val.programmaticStreamSerializationAllowed = true;
-      m_config.numAttrs = 1;
+      auto& attr = m_attrs[m_config.numAttrs++];
+      attr.id = cudaLaunchAttributeProgrammaticStreamSerialization;
+      attr.val.programmaticStreamSerializationAllowed = true;
       m_config.attrs = m_attrs;
-    } else {
-      m_config.numAttrs = 0;
     }
+#endif
+    return *this;
+  }
+
+  auto enable_cluster(dim3 cluster_dim) -> LaunchKernel& {
+#ifdef USE_ROCM
+    (void)cluster_dim;
+#else
+    auto& attr = m_attrs[m_config.numAttrs++];
+    attr.id = cudaLaunchAttributeClusterDimension;
+    attr.val.clusterDim = {cluster_dim.x, cluster_dim.y, cluster_dim.z};
+    m_config.attrs = m_attrs;
 #endif
     return *this;
   }
@@ -293,7 +313,7 @@ struct LaunchKernel {
 
   cudaLaunchConfig_t m_config;
   const DebugInfo m_location;
-  cudaLaunchAttribute m_attrs[1];
+  cudaLaunchAttribute m_attrs[2];
 };
 
 }  // namespace host
