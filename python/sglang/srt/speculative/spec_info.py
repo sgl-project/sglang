@@ -195,8 +195,10 @@ class SpecInputType(IntEnum):
     # NOTE: introduce this to distinguish the SpecInput types of multiple algorithms when asserting in attention backends.
     # If all algorithms can share the same datastrucutre of draft_input and verify_input, consider simplify it
     EAGLE_DRAFT = auto()
+    EAGLE_DRAFT_EXTEND = auto()
     EAGLE_VERIFY = auto()
     FROZEN_KV_MTP_DRAFT = auto()
+    FROZEN_KV_MTP_DRAFT_EXTEND = auto()
     FROZEN_KV_MTP_VERIFY = auto()
     DFLASH_DRAFT = auto()
     DFLASH_VERIFY = auto()
@@ -212,7 +214,9 @@ class SpecInput(ABC):
         # or use another variable name like `draft_input` to substitute `spec_info`
         return self.spec_input_type in {
             SpecInputType.EAGLE_DRAFT,
+            SpecInputType.EAGLE_DRAFT_EXTEND,
             SpecInputType.FROZEN_KV_MTP_DRAFT,
+            SpecInputType.FROZEN_KV_MTP_DRAFT_EXTEND,
             SpecInputType.DFLASH_DRAFT,
         }
 
