@@ -15,7 +15,9 @@ from sglang.srt.utils.common import require_mlp_tp_gather
 
 if TYPE_CHECKING:
     from sglang.srt.distributed.parallel_state import GroupCoordinator
-    from sglang.srt.managers.scheduler import Scheduler
+    from sglang.srt.managers.scheduler_components.dp_attn_adapter import (
+        SchedulerDPAttnAdapter,
+    )
 
 
 _ENABLE_METRICS_DP_ATTENTION = envs.SGLANG_ENABLE_METRICS_DP_ATTENTION.get()
@@ -226,7 +228,10 @@ def prepare_mlp_sync_batch_raw(
 
 
 class SchedulerDPAttnMixin:
-    def prepare_mlp_sync_batch(self: Scheduler, local_batch: ScheduleBatch):
+    @staticmethod
+    def prepare_mlp_sync_batch(
+        self: "SchedulerDPAttnAdapter", local_batch: ScheduleBatch
+    ):
         return prepare_mlp_sync_batch_raw(
             local_batch,
             dp_size=self.server_args.dp_size,
@@ -240,8 +245,9 @@ class SchedulerDPAttnMixin:
             offload_tags=self.offload_tags,
         )
 
+    @staticmethod
     def maybe_prepare_mlp_sync_batch(
-        self: Scheduler,
+        self: "SchedulerDPAttnAdapter",
         batch: Optional[ScheduleBatch],
         need_sync: Optional[bool] = None,
     ) -> Optional[ScheduleBatch]:
@@ -257,7 +263,8 @@ class SchedulerDPAttnMixin:
             batch = self.prepare_mlp_sync_batch(batch)
         return batch
 
-    def get_idle_batch(self: Scheduler) -> ScheduleBatch:
+    @staticmethod
+    def get_idle_batch(self: "SchedulerDPAttnAdapter") -> ScheduleBatch:
         idle_batch = ScheduleBatch.init_new(
             [],
             self.req_to_token_pool,

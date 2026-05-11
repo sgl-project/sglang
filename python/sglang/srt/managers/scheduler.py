@@ -166,6 +166,9 @@ from sglang.srt.managers.schedule_policy import (
     SchedulePolicy,
 )
 from sglang.srt.managers.scheduler_components import kv_cache
+from sglang.srt.managers.scheduler_components.dp_attn_adapter import (
+    SchedulerDPAttnAdapter,
+)
 from sglang.srt.managers.scheduler_components.request_receiver import (
     SchedulerRequestReceiver,
 )
@@ -581,6 +584,20 @@ class Scheduler(
             model_config=self.model_config,
             max_recv_per_poll=self.max_recv_per_poll,
             stream_output=self.stream_output,
+        )
+
+        self.dp_attn_adapter = SchedulerDPAttnAdapter(
+            tp_group=self.tp_group,
+            req_to_token_pool=self.req_to_token_pool,
+            token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+            tree_cache=self.tree_cache,
+            offload_tags=self.offload_tags,
+            ps=self.ps,
+            server_args=self.server_args,
+            model_config=self.model_config,
+            enable_overlap=self.enable_overlap,
+            spec_algorithm=self.spec_algorithm,
+            require_mlp_sync=self.require_mlp_sync,
         )
 
         self.is_initializing = False
@@ -2216,7 +2233,9 @@ class Scheduler(
             # Before merging the new batch into running batch:
             # 1. All new batches are none -> need_mlp_sync remains true (sync is needed for decode batch).
             # 2. All new batches are some (prefill / idle) -> we do not need prepare mlp sync one more time.
-            new_batch = self.maybe_prepare_mlp_sync_batch(new_batch)
+            new_batch = self.maybe_prepare_mlp_sync_batch(
+                self.dp_attn_adapter, new_batch
+            )
             need_mlp_sync = new_batch is None
 
         if new_batch is not None:
@@ -2234,7 +2253,9 @@ class Scheduler(
                 ret = None
 
         # Handle DP attention and log stats
-        ret = self.maybe_prepare_mlp_sync_batch(ret, need_sync=need_mlp_sync)
+        ret = self.maybe_prepare_mlp_sync_batch(
+            self.dp_attn_adapter, ret, need_sync=need_mlp_sync
+        )
 
         # Handle ngram embedding
         ret = self._maybe_prepare_ngram_embedding(ret)
