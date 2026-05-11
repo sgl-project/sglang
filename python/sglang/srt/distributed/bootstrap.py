@@ -95,34 +95,22 @@ def init_torch_distributed(
             )
 
         # Only initialize the distributed environment on the target model worker.
-        init_distributed_environment(
+        _init_parallel_groups(
             backend=backend,
-            world_size=tp_size * pp_size,
-            rank=tp_size * pp_rank + tp_rank,
-            local_rank=gpu_id,
-            distributed_init_method=dist_init_method,
-            timeout=server_args.dist_timeout,
-            moe_a2a_backend=server_args.moe_a2a_backend,
-            recovered_rank=server_args.elastic_ep_rejoin,
-        )
-        initialize_model_parallel(
-            tensor_model_parallel_size=tp_size,
-            attention_data_parallel_size=dp_size,
-            pipeline_model_parallel_size=pp_size,
-            expert_model_parallel_size=moe_ep_size,
-            attention_context_model_parallel_size=attn_cp_size,
-            moe_data_model_parallel_size=moe_dp_size,
-            decode_context_parallel_size=dcp_size,
-            duplicate_tp_group=server_args.enable_pdmux,
-            enable_symm_mem=server_args.enable_symm_mem,
-            recovered_rank=server_args.elastic_ep_rejoin,
-        )
-        initialize_dp_attention(
+            dist_init_method=dist_init_method,
             server_args=server_args,
             model_config=model_config,
+            gpu_id=gpu_id,
+            tp_rank=tp_rank,
+            tp_size=tp_size,
+            pp_rank=pp_rank,
+            pp_size=pp_size,
+            dp_size=dp_size,
+            attn_cp_size=attn_cp_size,
+            moe_ep_size=moe_ep_size,
+            moe_dp_size=moe_dp_size,
+            dcp_size=dcp_size,
         )
-        if is_npu():
-            register_sgl_tp_rank(gpu_id)
 
         # Pre-warm NCCL/RCCL/HCCL to eliminate cold-start latency in first request
         # Controlled by --pre-warm-nccl flag (default: enabled on AMD GPUs)
@@ -239,3 +227,50 @@ def _init_cpu_threads_env(
         logger.warning(
             "init_cpu_threads_env and shared memory based AllReduce is disabled, only intel amx backend and arm64 are supported"
         )
+
+
+def _init_parallel_groups(
+    *,
+    backend: str,
+    dist_init_method: str,
+    server_args: ServerArgs,
+    model_config: ModelConfig,
+    gpu_id: int,
+    tp_rank: int,
+    tp_size: int,
+    pp_rank: int,
+    pp_size: int,
+    dp_size: int,
+    attn_cp_size: int,
+    moe_ep_size: int,
+    moe_dp_size: int,
+    dcp_size: int,
+) -> None:
+    init_distributed_environment(
+        backend=backend,
+        world_size=tp_size * pp_size,
+        rank=tp_size * pp_rank + tp_rank,
+        local_rank=gpu_id,
+        distributed_init_method=dist_init_method,
+        timeout=server_args.dist_timeout,
+        moe_a2a_backend=server_args.moe_a2a_backend,
+        recovered_rank=server_args.elastic_ep_rejoin,
+    )
+    initialize_model_parallel(
+        tensor_model_parallel_size=tp_size,
+        attention_data_parallel_size=dp_size,
+        pipeline_model_parallel_size=pp_size,
+        expert_model_parallel_size=moe_ep_size,
+        attention_context_model_parallel_size=attn_cp_size,
+        moe_data_model_parallel_size=moe_dp_size,
+        decode_context_parallel_size=dcp_size,
+        duplicate_tp_group=server_args.enable_pdmux,
+        enable_symm_mem=server_args.enable_symm_mem,
+        recovered_rank=server_args.elastic_ep_rejoin,
+    )
+    initialize_dp_attention(
+        server_args=server_args,
+        model_config=model_config,
+    )
+    if is_npu():
+        register_sgl_tp_rank(gpu_id)
