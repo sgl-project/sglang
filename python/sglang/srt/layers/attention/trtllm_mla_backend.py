@@ -59,7 +59,7 @@ def pad_draft_extend_query_kernel(
     q_ptr,  # Input query tensor [total_seq_len, num_heads, head_dim]
     padded_q_ptr,  # Output padded query tensor [batch_size, max_seq_len, num_heads, head_dim]
     seq_lens_q_ptr,  # Sequence lengths for each sequence [batch_size]
-    cumsum_ptr,  # Cumulative sum of accept lengths [batch_size + 1]
+    cumsum_ptr,  # Cumulative sum of sequence lengths [batch_size + 1]
     batch_size,
     max_seq_len,
     num_heads,
@@ -78,7 +78,7 @@ def pad_draft_extend_query_kernel(
     if batch_id >= batch_size:
         return
 
-    # Load accept length for this batch
+    # Load sequence length for this batch
     seq_len = tl.load(seq_lens_q_ptr + batch_id)
 
     if seq_pos >= seq_len:
