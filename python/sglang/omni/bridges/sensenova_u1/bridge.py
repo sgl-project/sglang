@@ -35,8 +35,8 @@ from sglang.omni.bridges.sensenova_u1.context import (
 from sglang.srt.omni_session.bridge import SRTBackedOmniSessionBridge
 from sglang.srt.omni_session.model_policy import (
     OmniModelAppendImageResult,
-    OmniModelPrefillResult,
     OmniModelPolicy,
+    OmniModelPrefillResult,
     OmniModelSessionView,
 )
 from sglang.srt.omni_session.runtime import (

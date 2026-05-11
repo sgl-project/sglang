@@ -34,6 +34,7 @@ class OmniSRTSchedulerExecutorError(RuntimeError):
 
 @dataclass(slots=True)
 class OmniSRTTemporaryReqSlot:
+    """A conceptual temporary Req to help with memory allocation / release"""
     req_pool_idx: int | None = None
     kv_committed_len: int = 0
     is_chunked: int = 0

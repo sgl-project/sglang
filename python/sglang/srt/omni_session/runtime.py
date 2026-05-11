@@ -200,9 +200,7 @@ class OmniSessionRuntime:
             srt_mm_offsets=tuple(record.srt_mm_offsets),
             metadata={
                 "srt_ar_decode_request_count": record.srt_ar_decode_request_count,
-                "srt_last_ar_decode_request_id": (
-                    record.srt_last_ar_decode_request_id
-                ),
+                "srt_last_ar_decode_request_id": (record.srt_last_ar_decode_request_id),
                 "srt_last_ar_decode_origin_input_len": (
                     record.srt_last_ar_decode_origin_input_len
                 ),
