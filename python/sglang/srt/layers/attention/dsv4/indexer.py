@@ -336,11 +336,6 @@ class C4IndexerBackendMixin:
         indexer_metadata = metadata.indexer_metadata
         core_metadata = metadata.core_metadata
 
-        from sglang.srt.layers.attention.deepseek_v4_backend import (
-            DSV4AttnMetadata,
-        )
-
-        assert isinstance(core_metadata, DSV4AttnMetadata)
         assert isinstance(indexer_metadata, PagedIndexerMetadata)
 
         if enable_multi_stream:
@@ -378,7 +373,7 @@ class C4IndexerBackendMixin:
         assert len(weights.shape) == 3
         weights = weights.squeeze(2)
         if envs.SGLANG_OPT_USE_TILELANG_INDEXER.get():
-            from sglang.srt.layers.attention.dsv4.tilelang_kernel import (
+            from sglang.srt.layers.attention.nsa.tilelang_kernel import (
                 tilelang_fp8_paged_mqa_logits as fn,
             )
         elif envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get():
@@ -387,7 +382,8 @@ class C4IndexerBackendMixin:
             from deep_gemm import fp8_paged_mqa_logits as fn
 
         _c4sl = indexer_metadata.c4_seq_lens
-        if _c4sl.dim() == 1:
+        _use_tilelang = envs.SGLANG_OPT_USE_TILELANG_INDEXER.get()
+        if _c4sl.dim() == 1 and not _use_tilelang:
             _c4sl = _c4sl.unsqueeze(-1)
         logits = fn(
             q_fp8,

@@ -1040,16 +1040,17 @@ class Compressor(nn.Module):
         if self.use_fused_compress:
             return self.compress_fused(kv_score, forward_batch)
 
-        if envs.SGLANG_OPT_USE_OLD_COMPRESSOR.get():
+        if envs.SGLANG_OPT_DPSK_V4_RADIX.get():
+            self.compress_decode = self.compress_decode_paged
+            self.compress_extend = self.compress_extend_paged
+            kv_and_scores = KVAndScore(kv_score)
+        elif envs.SGLANG_OPT_USE_OLD_COMPRESSOR.get():
             kv = kv_score[:, : self.coff * self.head_dim]
             score = kv_score[:, self.coff * self.head_dim :]
             kv_and_scores = KVAndScoreOld(kv=kv, score=score)
             self.compress_decode = self.compress_decode_old
             self.compress_extend = self.compress_extend_old
         else:
-            if envs.SGLANG_OPT_DPSK_V4_RADIX.get():
-                self.compress_decode = self.compress_decode_paged
-                self.compress_extend = self.compress_extend_paged
             kv_and_scores = KVAndScore(kv_score)
         if TYPE_CHECKING:
             assert isinstance(kv_and_scores, KVAndScore)

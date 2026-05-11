@@ -100,14 +100,14 @@ def create_dsv4_backend(runner):
         from sglang.srt.environ import envs
 
         if envs.SGLANG_OPT_DPSK_V4_RADIX.get():
-            from sglang.srt.layers.attention.deepseek_v4_backend_radix import (
-                DeepseekV4BackendRadix,
+            from sglang.srt.layers.attention.deepseek_v4_backend_hip_radix import (
+                DeepseekV4HipRadixBackend,
             )
 
             logger.info(
-                "Using DeepseekV4BackendRadix for compressed attention backend (HIP)."
+                "Using DeepseekV4HipRadixBackend for compressed attention backend (HIP)."
             )
-            return DeepseekV4BackendRadix(runner)
+            return DeepseekV4HipRadixBackend(runner)
         else:
             from sglang.srt.layers.attention.deepseek_v4_backend_hip import (
                 DeepseekV4Backend,
