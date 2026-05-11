@@ -132,6 +132,9 @@ class EagleDraftWorker(BaseDraftWorker):
             server_args.speculative_algorithm
         )
         self.enable_spec_v2_zero_bubble = envs.SGLANG_SPEC_V2_ZERO_BUBBLE.get()
+        print(
+            f"----- debug enable_spec_v2_zero_bubble: {self.enable_spec_v2_zero_bubble} -----"
+        )
 
         # Do not capture cuda graph in `TpModelWorker` init,
         # will capture later with init_cuda_graphs()
@@ -410,6 +413,7 @@ class EagleDraftWorker(BaseDraftWorker):
 
     @draft_wrapper
     def draft(self, model_worker_batch):
+        # print(f"------ debug non zero_bubble -------")
         draft_input: EagleDraftInput = model_worker_batch.spec_info
         forward_batch, can_cuda_graph = draft_input.prepare_for_v2_draft(
             self.req_to_token_pool,
@@ -445,22 +449,18 @@ class EagleDraftWorker(BaseDraftWorker):
         batch_result: GenerationBatchResult,
         draft_input: EagleDraftInput,
     ):
-        assert (
-            self.speculative_num_steps is not None
-        ), "speculative_num_steps should not be None"
         if self.speculative_num_steps <= 1:
             return
-        if model_worker_batch.forward_mode.is_idle():
+        if model_worker_batch.forward_mode.is_idle():  # <-- 新增
             return
 
-        model_worker_batch.forward_mode = (
-            ForwardMode.IDLE
-            if model_worker_batch.forward_mode.is_idle()
-            else ForwardMode.DECODE
-        )
-        assert (
-            batch_result.next_draft_input is not None
-        ), "next_draft_input should not be None"
+        # Save original batch state to restore after draft, avoiding side effects
+        # on the caller's model_worker_batch (consistent with the non-zero-bubble
+        # `draft` method which does not mutate the batch).
+        original_forward_mode = model_worker_batch.forward_mode
+        original_seq_lens = model_worker_batch.seq_lens
+
+        model_worker_batch.forward_mode = ForwardMode.DECODE
         model_worker_batch.seq_lens = batch_result.next_draft_input.new_seq_lens
         # To ensure accurate acceptance length, seq_lens_cpu synchronization is needed here.
         # However, this synchronization contradicts the intent and benefit of spec_v2_zero_bubble.
@@ -469,50 +469,62 @@ class EagleDraftWorker(BaseDraftWorker):
         # skipping this synchronization might affect the acceptance length.
         # model_worker_batch.seq_lens_cpu = model_worker_batch.seq_lens.to("cpu")
 
-        forward_batch, can_cuda_graph = draft_input.prepare_for_v2_draft(
-            self.req_to_token_pool,
-            model_worker_batch,
-            self.cuda_graph_runner,
-            self.draft_runner,
-            self.topk,
-            self.speculative_num_steps,
-        )
-
-        forward_batch.spec_info.hidden_states = (
-            batch_result.next_draft_input.hidden_states
-        )
-        forward_batch.spec_info.topk_p = batch_result.next_draft_input.topk_p
-        forward_batch.spec_info.topk_index = batch_result.next_draft_input.topk_index
-
-        # Run draft
-        if can_cuda_graph:
-            ret_topk_p, ret_topk_index = self.cuda_graph_runner.replay(
-                forward_batch,
+        try:
+            forward_batch, can_cuda_graph = draft_input.prepare_for_v2_draft(
+                self.req_to_token_pool,
+                model_worker_batch,
+                self.cuda_graph_runner,
+                self.draft_runner,
+                self.topk,
+                self.speculative_num_steps,
             )
-        else:
-            if not forward_batch.forward_mode.is_idle():
-                self.draft_attn_backend.init_forward_metadata(forward_batch)
-            ret_topk_p, ret_topk_index = self.draft_forward_zero_bubble(forward_batch)
 
-        assert isinstance(ret_topk_p, torch.Tensor) and isinstance(
-            ret_topk_index, torch.Tensor
-        )
-        next_draft_input = batch_result.next_draft_input
-        ret_topk_p = ret_topk_p.reshape(next_draft_input.topk_p.shape[0], -1)
-        ret_topk_index = ret_topk_index.reshape(
-            next_draft_input.topk_index.shape[0], -1
-        )
-        ret_topk_p_list = [next_draft_input.topk_p, ret_topk_p]
-        ret_topk_index_list = [next_draft_input.topk_index, ret_topk_index]
-        (
-            next_draft_input.topk_p,
-            next_draft_input.topk_index,
-            next_draft_input.hidden_states,
-        ) = (
-            torch.cat(ret_topk_p_list, dim=1).clone(),
-            torch.cat(ret_topk_index_list, dim=1).clone(),
-            None,  # When enable `spec_v2_zero_bubble` feature, we don't need to save hidden_states for next step
-        )
+            forward_batch.spec_info.hidden_states = (
+                batch_result.next_draft_input.hidden_states
+            )
+            forward_batch.spec_info.topk_p = batch_result.next_draft_input.topk_p
+            forward_batch.spec_info.topk_index = (
+                batch_result.next_draft_input.topk_index
+            )
+
+            # Run draft
+            if can_cuda_graph:
+                ret_topk_p, ret_topk_index = self.cuda_graph_runner.replay(
+                    forward_batch,
+                )
+            else:
+                if not forward_batch.forward_mode.is_idle():
+                    self.draft_attn_backend.init_forward_metadata(forward_batch)
+                ret_topk_p, ret_topk_index = self.draft_forward_zero_bubble(
+                    forward_batch
+                )
+
+            if not isinstance(ret_topk_p, torch.Tensor) or not isinstance(
+                ret_topk_index, torch.Tensor
+            ):
+                raise TypeError(
+                    f"draft_zero_bubble: expected torch.Tensor, got "
+                    f"{type(ret_topk_p)} and {type(ret_topk_index)}"
+                )
+            next_draft_input = batch_result.next_draft_input
+            ret_topk_p = ret_topk_p.reshape(next_draft_input.topk_p.shape[0], -1)
+            ret_topk_index = ret_topk_index.reshape(
+                next_draft_input.topk_index.shape[0], -1
+            )
+            ret_topk_p_list = [next_draft_input.topk_p, ret_topk_p]
+            ret_topk_index_list = [next_draft_input.topk_index, ret_topk_index]
+            (
+                next_draft_input.topk_p,
+                next_draft_input.topk_index,
+                next_draft_input.hidden_states,
+            ) = (
+                torch.cat(ret_topk_p_list, dim=1).clone(),
+                torch.cat(ret_topk_index_list, dim=1).clone(),
+                None,  # When enable `spec_v2_zero_bubble` feature, we don't need to save hidden_states for next step
+            )
+        finally:
+            model_worker_batch.forward_mode = original_forward_mode
+            model_worker_batch.seq_lens = original_seq_lens
 
     def draft_forward_for_prepare(self, spec_info):
         topk_p, topk_index, hidden_states = (
