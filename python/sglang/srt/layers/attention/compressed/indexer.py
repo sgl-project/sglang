@@ -13,11 +13,11 @@ from sglang.srt.layers.attention.compressed.metadata import (
     PagedCoreMetadata,
     PagedIndexerMetadata,
 )
-from sglang.srt.layers.attention.indexer_topk_capturer import (
-    get_global_indexer_capturer,
-)
 from sglang.srt.layers.attention.nsa.triton_kernel import act_quant
 from sglang.srt.layers.attention.nsa.utils import is_nsa_enable_prefill_cp
+from sglang.srt.state_capturer.indexer_topk import (
+    get_global_indexer_capturer,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.compressed.compressor import CompressorBackend
@@ -571,7 +571,7 @@ class C4IndexerBackend:
             return  # skip updating page indices
 
         indexer_capturer = get_global_indexer_capturer()
-        capture_enabled = indexer_capturer.is_enabled()
+        capture_enabled = indexer_capturer is not None
 
         raw_indices = None
         if capture_enabled or forward_batch.hisparse_coordinator is not None:
