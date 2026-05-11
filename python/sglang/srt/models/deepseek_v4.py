@@ -244,6 +244,31 @@ class MQALayer(nn.Module):
                 )
 
         self.attn_sink = nn.Parameter(torch.empty(self.n_heads, dtype=torch.float32))
+
+        # Reuse the CPU-TP padding-aware helper to copy the checkpoint's
+        # (original_n_heads,) into the (possibly padded) param and zero any
+        # tail entries from CPU-TP head padding. shard_size = full param length
+        # since attn_sink is replicated, not sharded.
+        def _attn_sink_weight_loader(
+            param: torch.Tensor, loaded_weight: torch.Tensor
+        ) -> None:
+            from sglang.srt.model_loader.weight_utils import (
+                narrow_padded_param_and_loaded_weight,
+            )
+
+            # for attn_sink, we can set padded place to any finite value. just leverage
+            # the pad to zero path for simplicity
+            param_view, loaded_view = narrow_padded_param_and_loaded_weight(
+                param.data,
+                loaded_weight,
+                param_data_start=0,
+                weight_start=0,
+                dim=0,
+                shard_size=param.data.shape[0],
+            )
+            param_view.copy_(loaded_view)
+
+        self.attn_sink.weight_loader = _attn_sink_weight_loader
         self.fuse_wqa_wkv = envs.SGLANG_OPT_FUSE_WQA_WKV.get()
         if self.fuse_wqa_wkv:
             self.wqkv_a = ReplicatedLinear(
