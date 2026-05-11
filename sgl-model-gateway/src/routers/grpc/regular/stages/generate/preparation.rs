@@ -57,13 +57,16 @@ impl GeneratePreparationStage {
         };
 
         // Create stop sequence decoder for generate requests
-        let params = request.sampling_params.as_ref();
+        let sampling = request.sampling_params.as_ref();
         let stop_decoder = utils::create_stop_decoder(
             &tokenizer,
-            params.and_then(|p| p.stop.as_ref()),
-            params.and_then(|p| p.stop_token_ids.as_ref()),
-            params.and_then(|p| p.skip_special_tokens).unwrap_or(true),
-            params.and_then(|p| p.no_stop_trim).unwrap_or(false),
+            &utils::StopParams {
+                stop: sampling.and_then(|p| p.stop.clone()),
+                stop_token_ids: sampling.and_then(|p| p.stop_token_ids.clone()),
+                skip_special_tokens: sampling.and_then(|p| p.skip_special_tokens).unwrap_or(true),
+                no_stop_trim: sampling.and_then(|p| p.no_stop_trim).unwrap_or(false),
+                ignore_eos: sampling.and_then(|p| p.ignore_eos).unwrap_or(false),
+            },
         );
 
         ctx.state.preparation = Some(PreparationOutput {

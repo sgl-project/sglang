@@ -19,10 +19,7 @@ use crate::{
     observability::metrics::{metrics_labels, Metrics, StreamingMetricsParams},
     protocols::{
         chat::{ChatCompletionRequest, ChatCompletionStreamResponse},
-        common::{
-            FunctionCallDelta, StringOrArray, Tool, ToolCallDelta, ToolChoice, ToolChoiceValue,
-            Usage,
-        },
+        common::{FunctionCallDelta, Tool, ToolCallDelta, ToolChoice, ToolChoiceValue, Usage},
         generate::GenerateRequest,
     },
     reasoning_parser::{ParserFactory as ReasoningParserFactory, ParserResult, ReasoningParser},
@@ -93,12 +90,13 @@ impl StreamingProcessor {
         use bytes::Bytes;
         use tokio::sync::mpsc;
 
-        let stop_params = (
-            chat_request.stop.clone(),
-            chat_request.stop_token_ids.clone(),
-            chat_request.skip_special_tokens,
-            chat_request.no_stop_trim,
-        );
+        let stop_params = utils::StopParams {
+            stop: chat_request.stop.clone(),
+            stop_token_ids: chat_request.stop_token_ids.clone(),
+            skip_special_tokens: chat_request.skip_special_tokens,
+            no_stop_trim: chat_request.no_stop_trim,
+            ignore_eos: chat_request.ignore_eos,
+        };
 
         // Create SSE channel
         let (tx, rx) = mpsc::unbounded_channel::<Result<Bytes, io::Error>>();
@@ -193,7 +191,7 @@ impl StreamingProcessor {
         mut grpc_stream: ProtoStream,
         dispatch: context::DispatchMetadata,
         tokenizer: Arc<dyn Tokenizer>,
-        stop_params: (Option<StringOrArray>, Option<Vec<u32>>, bool, bool),
+        stop_params: utils::StopParams,
         original_request: Arc<ChatCompletionRequest>,
         tx: &UnboundedSender<Result<Bytes, io::Error>>,
     ) -> Result<(), String> {
@@ -298,17 +296,9 @@ impl StreamingProcessor {
                     }
 
                     // Get or create stop decoder for this index
-                    let stop_decoder = stop_decoders.entry(index).or_insert_with(|| {
-                        let (ref stop, ref stop_token_ids, skip_special_tokens, no_stop_trim) =
-                            stop_params;
-                        utils::create_stop_decoder(
-                            &tokenizer,
-                            stop.as_ref(),
-                            stop_token_ids.as_ref(),
-                            skip_special_tokens,
-                            no_stop_trim,
-                        )
-                    });
+                    let stop_decoder = stop_decoders
+                        .entry(index)
+                        .or_insert_with(|| utils::create_stop_decoder(&tokenizer, &stop_params));
 
                     // Process tokens through stop decoder
                     let (chunk_text, _should_stop) =
@@ -612,7 +602,7 @@ impl StreamingProcessor {
         decode_stream: ProtoStream,
         dispatch: context::DispatchMetadata,
         tokenizer: Arc<dyn Tokenizer>,
-        stop_params: (Option<StringOrArray>, Option<Vec<u32>>, bool, bool),
+        stop_params: utils::StopParams,
         original_request: Arc<ChatCompletionRequest>,
         tx: &UnboundedSender<Result<Bytes, io::Error>>,
     ) -> Result<(), String> {

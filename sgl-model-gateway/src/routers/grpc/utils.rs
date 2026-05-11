@@ -516,43 +516,76 @@ pub(crate) fn process_chat_messages(
     })
 }
 
-/// Create a StopSequenceDecoder from stop parameters
+/// Stop-decoder configuration bundle.
+///
+/// Three trailing booleans (`skip_special_tokens`, `no_stop_trim`,
+/// `ignore_eos`) in a positional signature are a silent-reorder footgun:
+/// a typo would compile cleanly and cause subtle decoding bugs. Construct
+/// via named fields instead.
+#[derive(Debug, Clone)]
+pub(crate) struct StopParams {
+    pub(crate) stop: Option<StringOrArray>,
+    pub(crate) stop_token_ids: Option<Vec<u32>>,
+    pub(crate) skip_special_tokens: bool,
+    pub(crate) no_stop_trim: bool,
+    pub(crate) ignore_eos: bool,
+}
+
+/// Create a StopSequenceDecoder from stop parameters.
+///
+/// EOS token IDs come from the tokenizer (`config.json` +
+/// `generation_config.json`) and are added as stop tokens unless
+/// `ignore_eos = true`. With `no_stop_trim = false` (default), EOS is
+/// hidden — stripped before decoding so it never reaches output text.
+/// Direction matches sglang's `no_stop_trim` (off by default, opt-in to
+/// keep EOS visible) and is the inverse polarity of vllm's
+/// `include_stop_str_in_output`.
 pub(crate) fn create_stop_decoder(
     tokenizer: &Arc<dyn Tokenizer>,
-    stop: Option<&StringOrArray>,
-    stop_token_ids: Option<&Vec<u32>>,
-    skip_special_tokens: bool,
-    no_stop_trim: bool,
+    params: &StopParams,
 ) -> StopSequenceDecoder {
-    // Extract stop sequences
-    let stop_sequences: Vec<String> = match stop {
+    let stop_sequences: Vec<String> = match params.stop.as_ref() {
         Some(StringOrArray::String(s)) => vec![s.clone()],
         Some(StringOrArray::Array(arr)) => arr.clone(),
         None => vec![],
     };
 
-    // Build stop sequence decoder
-    let mut builder =
-        StopSequenceDecoderBuilder::new(tokenizer.clone()).skip_special_tokens(skip_special_tokens);
+    let mut builder = StopSequenceDecoderBuilder::new(tokenizer.clone())
+        .skip_special_tokens(params.skip_special_tokens);
 
-    // Add stop sequences (visible if no_stop_trim is true, hidden otherwise)
     for seq in stop_sequences {
-        builder = if no_stop_trim {
+        builder = if params.no_stop_trim {
             builder.visible_stop_sequence(seq)
         } else {
             builder.stop_sequence(seq)
         };
     }
 
-    // Add stop token IDs (visible if no_stop_trim is true, hidden otherwise)
-    if let Some(token_ids) = stop_token_ids {
-        for &token_id in token_ids {
-            builder = if no_stop_trim {
-                builder.visible_stop_token(token_id)
-            } else {
-                builder.stop_token(token_id)
-            };
-        }
+    let eos_ids: &[u32] = if params.ignore_eos {
+        &[]
+    } else {
+        tokenizer.eos_token_ids()
+    };
+    let user_stops = params.stop_token_ids.as_deref().unwrap_or_default();
+
+    // Misconfigured tokenizers silently default `eos_token_ids()` to `&[]`
+    // (see llm-tokenizer's default trait impl). Without any stop token IDs
+    // or stop sequences, generation can only terminate via `max_tokens` —
+    // surface this so a regressed tokenizer registration is visible.
+    if !params.ignore_eos && eos_ids.is_empty() && user_stops.is_empty() {
+        warn!(
+            "create_stop_decoder: tokenizer reported no EOS ids and no \
+             stop_token_ids were provided; generation will rely on stop \
+             sequences or max_tokens to terminate"
+        );
+    }
+
+    for &token_id in eos_ids.iter().chain(user_stops.iter()) {
+        builder = if params.no_stop_trim {
+            builder.visible_stop_token(token_id)
+        } else {
+            builder.stop_token(token_id)
+        };
     }
 
     builder.build()
@@ -1237,5 +1270,188 @@ mod tests {
         assert_eq!(content_array.len(), 2);
         assert_eq!(content_array[0]["type"], "text");
         assert_eq!(content_array[1], json!({"type": "image"}));
+    }
+
+    // ---- create_stop_decoder — EOS handling ----
+
+    use crate::tokenizer::{
+        stop::SequenceDecoderOutput,
+        traits::{Decoder, Encoder, Encoding, SpecialTokens, TokenIdType, Tokenizer},
+    };
+    use anyhow::Result;
+
+    /// Test-only tokenizer with caller-controlled EOS IDs. `decode` renders
+    /// each token id as `<id:N>` so a leaked EOS surfaces in the decoder's
+    /// output text — no real vocabulary required.
+    struct EosFakeTokenizer {
+        eos_ids: Vec<TokenIdType>,
+        special_tokens: SpecialTokens,
+    }
+
+    impl EosFakeTokenizer {
+        fn new(eos_ids: Vec<TokenIdType>) -> Self {
+            Self {
+                eos_ids,
+                special_tokens: SpecialTokens::default(),
+            }
+        }
+    }
+
+    impl Encoder for EosFakeTokenizer {
+        fn encode(&self, _: &str, _: bool) -> Result<Encoding> {
+            Ok(Encoding::Plain(vec![]))
+        }
+        fn encode_batch(&self, inputs: &[&str], _: bool) -> Result<Vec<Encoding>> {
+            Ok(inputs.iter().map(|_| Encoding::Plain(vec![])).collect())
+        }
+    }
+
+    impl Decoder for EosFakeTokenizer {
+        fn decode(&self, ids: &[TokenIdType], _: bool) -> Result<String> {
+            Ok(ids.iter().map(|id| format!("<id:{id}>")).collect())
+        }
+    }
+
+    impl Tokenizer for EosFakeTokenizer {
+        fn vocab_size(&self) -> usize {
+            1024
+        }
+        fn get_special_tokens(&self) -> &SpecialTokens {
+            &self.special_tokens
+        }
+        fn token_to_id(&self, _: &str) -> Option<TokenIdType> {
+            None
+        }
+        fn id_to_token(&self, _: TokenIdType) -> Option<String> {
+            None
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+        fn eos_token_ids(&self) -> &[TokenIdType] {
+            &self.eos_ids
+        }
+    }
+
+    fn fake_tokenizer(eos: &[u32]) -> Arc<dyn Tokenizer> {
+        Arc::new(EosFakeTokenizer::new(eos.to_vec()))
+    }
+
+    fn params_for_test(stop_token_ids: Option<Vec<u32>>) -> StopParams {
+        StopParams {
+            stop: None,
+            stop_token_ids,
+            skip_special_tokens: true,
+            no_stop_trim: false,
+            ignore_eos: false,
+        }
+    }
+
+    /// Default arms (`ignore_eos=false`, `no_stop_trim=false`): every EOS the
+    /// tokenizer reports must be registered as a hidden stop, so feeding any
+    /// EOS id stops the decoder with no visible text.
+    #[test]
+    fn create_stop_decoder_strips_each_eos_id_by_default() {
+        let tok = fake_tokenizer(&[100, 200, 300]);
+        for &eos in &[100u32, 200, 300] {
+            let mut d = create_stop_decoder(&tok, &params_for_test(None));
+            assert_eq!(
+                d.process_token(eos).unwrap(),
+                SequenceDecoderOutput::Stopped,
+                "EOS id {eos} must trigger hidden stop"
+            );
+        }
+    }
+
+    /// `ignore_eos=true`: EOS ids must NOT be registered as stop tokens, so
+    /// feeding one passes through as text and lets the backend keep
+    /// generating.
+    #[test]
+    fn create_stop_decoder_skips_eos_when_ignore_eos_true() {
+        let tok = fake_tokenizer(&[100, 200]);
+        let params = StopParams {
+            skip_special_tokens: false,
+            ignore_eos: true,
+            ..params_for_test(None)
+        };
+        let mut d = create_stop_decoder(&tok, &params);
+        match d.process_token(100).unwrap() {
+            SequenceDecoderOutput::Text(_) | SequenceDecoderOutput::Held => {}
+            other => panic!("EOS must not stop when ignore_eos=true, got {other:?}"),
+        }
+        assert!(!d.is_stopped());
+    }
+
+    /// `no_stop_trim=true`: EOS ids must be registered as VISIBLE stops, so
+    /// the EOS string is decoded into the final output (matches sglang's
+    /// `no_stop_trim` semantic).
+    #[test]
+    fn create_stop_decoder_makes_eos_visible_when_no_stop_trim() {
+        let tok = fake_tokenizer(&[100]);
+        let params = StopParams {
+            skip_special_tokens: false,
+            no_stop_trim: true,
+            ..params_for_test(None)
+        };
+        let mut d = create_stop_decoder(&tok, &params);
+        match d.process_token(100).unwrap() {
+            SequenceDecoderOutput::StoppedWithText(text) => {
+                assert!(
+                    text.contains("<id:100>"),
+                    "visible stop must surface EOS in text, got {text:?}"
+                );
+            }
+            other => panic!("EOS must visibly stop with no_stop_trim=true, got {other:?}"),
+        }
+    }
+
+    /// `ignore_eos=true` + `no_stop_trim=true`: EOS ids are still NOT
+    /// registered (ignore_eos wins), so even the visible-stop builder path
+    /// shouldn't fire on an EOS id.
+    #[test]
+    fn create_stop_decoder_ignore_eos_wins_over_no_stop_trim() {
+        let tok = fake_tokenizer(&[100]);
+        let params = StopParams {
+            no_stop_trim: true,
+            ignore_eos: true,
+            ..params_for_test(None)
+        };
+        let mut d = create_stop_decoder(&tok, &params);
+        match d.process_token(100).unwrap() {
+            SequenceDecoderOutput::Text(_) | SequenceDecoderOutput::Held => {}
+            other => panic!("ignore_eos=true must suppress visible EOS stop, got {other:?}"),
+        }
+        assert!(!d.is_stopped());
+    }
+
+    /// User-provided `stop_token_ids` are still honored alongside the EOS ids
+    /// — the chain we build in `create_stop_decoder` mustn't drop them.
+    #[test]
+    fn create_stop_decoder_preserves_user_stop_token_ids() {
+        let tok = fake_tokenizer(&[]);
+        let mut d = create_stop_decoder(&tok, &params_for_test(Some(vec![777])));
+        assert_eq!(
+            d.process_token(777).unwrap(),
+            SequenceDecoderOutput::Stopped
+        );
+    }
+
+    /// Tokenizer with no EOS configured + no user stops + `ignore_eos=false`:
+    /// no stop tokens are registered, so an arbitrary token id passes
+    /// through as text. (The decoder also emits a `tracing::warn!`; we don't
+    /// assert on log output here.)
+    #[test]
+    fn create_stop_decoder_no_eos_no_stops_passes_through() {
+        let tok = fake_tokenizer(&[]);
+        let params = StopParams {
+            skip_special_tokens: false,
+            ..params_for_test(None)
+        };
+        let mut d = create_stop_decoder(&tok, &params);
+        match d.process_token(42).unwrap() {
+            SequenceDecoderOutput::Text(_) | SequenceDecoderOutput::Held => {}
+            other => panic!("no stops registered, decoder must not stop, got {other:?}"),
+        }
+        assert!(!d.is_stopped());
     }
 }

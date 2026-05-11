@@ -87,10 +87,13 @@ impl ChatPreparationStage {
         // Step 5: Create stop sequence decoder (build once, reuse in non-stream)
         let stop_decoder = utils::create_stop_decoder(
             &tokenizer,
-            request.stop.as_ref(),
-            request.stop_token_ids.as_ref(),
-            request.skip_special_tokens,
-            request.no_stop_trim,
+            &utils::StopParams {
+                stop: request.stop.clone(),
+                stop_token_ids: request.stop_token_ids.clone(),
+                skip_special_tokens: request.skip_special_tokens,
+                no_stop_trim: request.no_stop_trim,
+                ignore_eos: request.ignore_eos,
+            },
         );
 
         // Store results in context
