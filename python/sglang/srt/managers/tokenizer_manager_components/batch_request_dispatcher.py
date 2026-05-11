@@ -82,28 +82,9 @@ class BatchRequestDispatcher:
             )
 
             await self._cache_parallel_sample_prefix(objs, tokenized_objs, request)
-
-            # Expand requests, assign new rids for them, and send them
-            for i in range(batch_size):
-                for _ in range(obj.parallel_sample_num):
-                    tmp_obj = copy.copy(objs[i])
-                    tokenized_obj = copy.copy(tokenized_objs[i])
-                    tokenized_obj.rid = tmp_obj.regenerate_rid()
-                    init_req(
-                        self.rid_to_state,
-                        obj=tmp_obj,
-                        enable_trace=self.config.enable_trace,
-                        disagg_mode=self.config.disaggregation_mode,
-                    )
-                    tokenized_obj.time_stats = self.rid_to_state[tmp_obj.rid].time_stats
-                    self.send_one_request(tokenized_obj)
-                    generators.append(
-                        self.response_emitter._wait_one_response(tmp_obj, request)
-                    )
-                    rids.append(tmp_obj.rid)
-
-                self.rid_to_state[objs[i].rid].time_stats.set_finished_time()
-                del self.rid_to_state[objs[i].rid]
+            generators, rids = self._expand_parallel_sample_requests(
+                objs, tokenized_objs, obj.parallel_sample_num, request
+            )
 
         return generators, rids
 
@@ -180,3 +161,38 @@ class BatchRequestDispatcher:
             )
             self.send_one_request(tokenized_obj)
             await self.response_emitter._wait_one_response(tmp_obj, request).__anext__()
+
+    def _expand_parallel_sample_requests(
+        self,
+        objs: List[Union[GenerateReqInput, EmbeddingReqInput]],
+        tokenized_objs: List[
+            Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput]
+        ],
+        parallel_sample_num: int,
+        request: Optional[fastapi.Request],
+    ) -> Tuple[List[AsyncGenerator], List[str]]:
+        # Expand requests, assign new rids for them, and send them
+        generators: List[AsyncGenerator] = []
+        rids: List[str] = []
+        batch_size = len(objs)
+        for i in range(batch_size):
+            for _ in range(parallel_sample_num):
+                tmp_obj = copy.copy(objs[i])
+                tokenized_obj = copy.copy(tokenized_objs[i])
+                tokenized_obj.rid = tmp_obj.regenerate_rid()
+                init_req(
+                    self.rid_to_state,
+                    obj=tmp_obj,
+                    enable_trace=self.config.enable_trace,
+                    disagg_mode=self.config.disaggregation_mode,
+                )
+                tokenized_obj.time_stats = self.rid_to_state[tmp_obj.rid].time_stats
+                self.send_one_request(tokenized_obj)
+                generators.append(
+                    self.response_emitter._wait_one_response(tmp_obj, request)
+                )
+                rids.append(tmp_obj.rid)
+
+            self.rid_to_state[objs[i].rid].time_stats.set_finished_time()
+            del self.rid_to_state[objs[i].rid]
+        return generators, rids
