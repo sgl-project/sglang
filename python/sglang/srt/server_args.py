@@ -220,6 +220,7 @@ FP4_GEMM_RUNNER_BACKEND_CHOICES = [
     "auto",
     "cutlass",
     "flashinfer_cudnn",
+    "flashinfer_cutedsl",
     "flashinfer_cutlass",
     "flashinfer_trtllm",
 ]
@@ -425,6 +426,8 @@ class ServerArgs:
     prefill_delayer_token_usage_low_watermark: Optional[float] = None
     prefill_delayer_forward_passes_buckets: Optional[List[float]] = None
     prefill_delayer_wait_seconds_buckets: Optional[List[float]] = None
+    prefill_delayer_queue_min_ratio: Optional[float] = None
+    prefill_delayer_max_delay_ms: Optional[float] = None
 
     # Runtime options
     device: Optional[str] = None
@@ -788,6 +791,7 @@ class ServerArgs:
     weight_loader_disable_mmap: bool = False
     weight_loader_prefetch_checkpoints: bool = False
     weight_loader_prefetch_num_threads: int = 4
+    weight_loader_drop_cache_after_load: bool = False
     remote_instance_weight_loader_seed_instance_ip: Optional[str] = None
     remote_instance_weight_loader_seed_instance_service_port: Optional[int] = None
     remote_instance_weight_loader_send_weights_group_ports: Optional[List[int]] = None
@@ -885,6 +889,12 @@ class ServerArgs:
 
         # Handle memory-related, chunked prefill, and CUDA graph batch size configurations.
         self._handle_gpu_memory_settings(gpu_mem)
+
+        # enforce_disable_flashinfer_allreduce_fusion must be set before
+        # _handle_model_specific_adjustments, which auto-enables the fusion
+        # for several SM90/SM100 MoE arches.
+        if self.enable_deterministic_inference:
+            self.enforce_disable_flashinfer_allreduce_fusion = True
 
         # Apply model-specific adjustments.
         self._handle_model_specific_adjustments()
@@ -1891,6 +1901,7 @@ class ServerArgs:
                         self.quantization
                         in ["fp8", "modelopt_fp8", "modelopt_fp4", "modelopt_mixed"]
                         or is_kimi_k2_k25_thinking_int4
+                        or self.quantization is None
                     )
                 ):
                     self.moe_runner_backend = "flashinfer_trtllm"
@@ -2226,6 +2237,7 @@ class ServerArgs:
             "Qwen3VLMoeForConditionalGeneration",
             "Qwen3NextForCausalLM",
             "Qwen3_5MoeForConditionalGeneration",
+            "InternS2PreviewForConditionalGeneration",
             "Qwen3_5ForConditionalGeneration",
         ]:
             if is_sm100_supported():
@@ -2253,6 +2265,7 @@ class ServerArgs:
             if model_arch in [
                 "Qwen3NextForCausalLM",
                 "Qwen3_5MoeForConditionalGeneration",
+                "InternS2PreviewForConditionalGeneration",
                 "Qwen3_5ForConditionalGeneration",
             ]:
                 sm100_default_attn_backend = "triton"
@@ -2279,6 +2292,16 @@ class ServerArgs:
                     support_mamba_cache_extra_buffer=True,
                     sm100_default_attention_backend=sm100_default_attn_backend,
                 )
+
+        elif model_arch == "MiniCPMV4_6ForConditionalGeneration":
+            # 4.6 wraps a Qwen3.5 hybrid GDN backbone, so it needs the same
+            # mamba radix cache handling as Qwen3_5ForConditionalGeneration.
+            self._handle_mamba_radix_cache(
+                model_arch=model_arch,
+                support_mamba_cache=True,
+                support_mamba_cache_extra_buffer=True,
+                sm100_default_attention_backend="triton",
+            )
 
         elif model_arch in ["Glm4MoeForCausalLM"]:
             if is_sm100_supported():
@@ -2381,6 +2404,7 @@ class ServerArgs:
                 "Qwen3NextForCausalLM",
                 "KimiK25ForConditionalGeneration",
                 "Qwen3_5MoeForConditionalGeneration",
+                "InternS2PreviewForConditionalGeneration",
                 "Qwen3_5ForConditionalGeneration",
             ]
             and (is_sm90_supported() or is_sm100_supported())
@@ -2441,8 +2465,8 @@ class ServerArgs:
                 )
 
             assert (
-                is_cuda() or is_musa()
-            ), "Mamba extra_buffer is only supported on CUDA and MUSA devices with FLA backend"
+                is_cuda() or is_musa() or is_npu()
+            ), "Mamba extra_buffer is only supported on CUDA and MUSA and NPU devices with FLA backend"
             if self.speculative_num_draft_tokens is not None:
                 assert (
                     self.mamba_track_interval >= self.speculative_num_draft_tokens
@@ -3330,22 +3354,8 @@ class ServerArgs:
         ):
             self.speculative_draft_model_revision = "main"
 
-        # FlashInfer trtllm moe bf16 only support RenormalizeNaive routing method and Deepseek routing method
-        # It is hard to tell the routing method in draft model, and the moe layer in draft model is not the bottleneck among
-        # end to end, so we just avoid using trtllm_moe for speculative decoding.
-        from sglang.srt.layers.moe.utils import MoeRunnerBackend
-
         if self.speculative_moe_runner_backend is None:
-            self.speculative_moe_runner_backend = (
-                "auto"
-                if self.moe_runner_backend
-                in ["flashinfer_trtllm", "flashinfer_trtllm_routed"]
-                else self.moe_runner_backend
-            )
-        else:
-            assert not MoeRunnerBackend(
-                self.speculative_moe_runner_backend
-            ).is_flashinfer_trtllm(), "Currently speculative MoE runner backend doesn't support flashinfer_trtllm, please use triton or auto backend for speculative moe runner instead."
+            self.speculative_moe_runner_backend = self.moe_runner_backend
 
         if self.speculative_algorithm is not None:
             self.speculative_algorithm = self.speculative_algorithm.upper()
@@ -3910,6 +3920,7 @@ class ServerArgs:
             "Qwen3VLMoeForConditionalGeneration",
             "Qwen3_5ForConditionalGeneration",
             "Qwen3_5MoeForConditionalGeneration",
+            "InternS2PreviewForConditionalGeneration",
             "Qwen3OmniMoeForConditionalGeneration",
             "Qwen2AudioForConditionalGeneration",
             "Qwen2_5OmniForConditionalGeneration",
@@ -4010,6 +4021,16 @@ class ServerArgs:
         envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.set(
             "1" if self.enable_deterministic_inference else "0"
         )
+        # Custom all-reduce v2 uses IPC handles and is intra-node only. Force-disable
+        # on multi-node so the dispatch falls back to the legacy CustomAllreduce path.
+        if self.nnodes > 1 and envs.SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2.get():
+            if envs.SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2.is_set():
+                logger.warning(
+                    "Disabling SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2 because nnodes=%d "
+                    "(custom all-reduce v2 is intra-node only).",
+                    self.nnodes,
+                )
+            envs.SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2.set("0")
         if self.debug_cuda_graph:
             if not is_cuda():
                 logger.warning(
@@ -4062,6 +4083,12 @@ class ServerArgs:
                     "Disable --enable-aiter-allreduce-fusion because deterministic inference is enabled."
                 )
                 self.enable_aiter_allreduce_fusion = False
+
+            if self.enable_flashinfer_allreduce_fusion:
+                logger.warning(
+                    "Disable --enable-flashinfer-allreduce-fusion because deterministic inference is enabled."
+                )
+                self.enable_flashinfer_allreduce_fusion = False
 
             # Check sampling backend
             self.sampling_backend = "pytorch"
@@ -4732,6 +4759,29 @@ class ServerArgs:
             nargs="+",
             default=None,
             help="Custom buckets for prefill delayer wait seconds histogram. 0 will be auto-added.",
+        )
+        parser.add_argument(
+            "--prefill-delayer-queue-min-ratio",
+            type=float,
+            default=None,
+            help=(
+                "Opt-in to the adaptive queue-based delay trigger (independent of the "
+                "slot-based one). Delays prefill until the waiting queue reaches "
+                "min(running_req * ratio, max_prefill_bs) so small fragments batch into a "
+                "larger prefill. Unset (default) keeps the original slot-only behavior. "
+                "Typical: 0.1 ~ 0.5."
+            ),
+        )
+        parser.add_argument(
+            "--prefill-delayer-max-delay-ms",
+            type=float,
+            default=None,
+            help=(
+                "Wall-clock cap (ms) on a single queue-trigger delay; once exceeded, prefill "
+                "is force-released to bound worst-case TTFT. Only consulted when "
+                "--prefill-delayer-queue-min-ratio is set. Typical: 1000 ~ 5000; defaults to "
+                "5000 if unset."
+            ),
         )
 
         # Runtime options
@@ -5447,10 +5497,11 @@ class ServerArgs:
             default=ServerArgs.fp4_gemm_runner_backend,
             dest="fp4_gemm_runner_backend",
             help="Choose the runner backend for NVFP4 GEMM operations. "
-            "Options: 'auto' (default; selects flashinfer_cudnn on SM120, flashinfer_cutlass otherwise), "
+            "Options: 'auto' (default; selects flashinfer_cudnn on SM120, flashinfer_cutedsl on SM100, flashinfer_cutlass otherwise), "
             "'cutlass' (SGLang CUTLASS kernel), "
             "'flashinfer_cutlass' (FlashInfer CUTLASS backend), "
             "'flashinfer_cudnn' (FlashInfer cuDNN backend, optimal on CUDA 13+ with cuDNN 9.15+), "
+            "'flashinfer_cutedsl' (FlashInfer CuTe DSL backend), "
             "'flashinfer_trtllm' (FlashInfer TensorRT-LLM backend, requires different weight preparation with shuffling). ",
         )
         parser.add_argument(
@@ -6635,6 +6686,11 @@ class ServerArgs:
             help="Number of threads per rank for checkpoint prefetching (default: 4).",
         )
         parser.add_argument(
+            "--weight-loader-drop-cache-after-load",
+            action="store_true",
+            help="Call posix_fadvise(DONTNEED) on each safetensors shard after loading it.",
+        )
+        parser.add_argument(
             "--remote-instance-weight-loader-seed-instance-ip",
             type=str,
             default=ServerArgs.remote_instance_weight_loader_seed_instance_ip,
@@ -7020,6 +7076,11 @@ class ServerArgs:
         if self.enable_two_batch_overlap and self.moe_a2a_backend == "none":
             raise ValueError(
                 "When enabling two batch overlap, moe_a2a_backend cannot be 'none'."
+            )
+
+        if self.enable_two_batch_overlap and self.enforce_shared_experts_fusion:
+            raise ValueError(
+                "--enable-two-batch-overlap and --enforce-shared-experts-fusion cannot be used together."
             )
 
         # Check communications compression
