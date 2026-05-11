@@ -694,6 +694,8 @@ class Req(ReqDllmMixin):
         self.pending_radix_mamba_slot: Optional[torch.Tensor] = (
             None  # shape (1), pre-allocated radix target slot
         )
+        self.radix_mamba_backup_slot: Optional[torch.Tensor] = None  # shape (1)
+        self.radix_mamba_backup_seqlen: Optional[int] = None
         self.mamba_last_track_seqlen: Optional[int] = (
             None  # seq len of the last cached mamba state
         )
@@ -1259,6 +1261,7 @@ class Req(ReqDllmMixin):
         self.is_chunked = 0
         self.mamba_pool_idx = None
         self.pending_radix_mamba_slot = None
+        self.radix_mamba_backup_slot = self.radix_mamba_backup_seqlen = None
         self.mamba_last_track_seqlen = None
         self.mamba_branching_seqlen = None
         self.already_computed = 0
@@ -2369,11 +2372,16 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     (0,), dtype=torch.bool, device=self.device
                 )
             else:
-                # Vectorized: no per-request .item() or GPU sync
-                interval_mask = (
-                    (self.seq_lens_cpu % mamba_track_interval == 0)
-                    .pin_memory()
-                    .to(device=self.device, non_blocking=True)
+                interval_mask_cpu = self.seq_lens_cpu % mamba_track_interval == 0
+                can_track_cpu = [
+                    (
+                        (not in_interval)
+                        or self._maybe_backup_pending_radix_mamba_slot(req)
+                    )
+                    for req, in_interval in zip(self.reqs, interval_mask_cpu.tolist())
+                ]
+                interval_mask = interval_mask_cpu.pin_memory().to(
+                    device=self.device, non_blocking=True
                 )
                 _zero = torch.zeros(1, dtype=torch.int64, device=self.device)
                 slot_indices = (
@@ -2395,10 +2403,34 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     dtype=torch.bool,
                     pin_memory=True,
                 ).to(device=self.device, non_blocking=True)
-                self.mamba_track_mask = interval_mask & has_slot
+                can_track = torch.tensor(
+                    can_track_cpu,
+                    dtype=torch.bool,
+                    pin_memory=True,
+                ).to(device=self.device, non_blocking=True)
+                self.mamba_track_mask = interval_mask & has_slot & can_track
                 self.mamba_track_indices = torch.where(
                     self.mamba_track_mask, slot_indices, torch.zeros_like(slot_indices)
                 )
+
+    def _maybe_backup_pending_radix_mamba_slot(self, req: Req) -> bool:
+        if (
+            not self.enable_overlap
+            or req.pending_radix_mamba_slot is None
+            or req.mamba_last_track_seqlen is None
+            or req.radix_mamba_backup_slot is not None
+        ):
+            return True
+
+        backup = self.req_to_token_pool.mamba_pool.fork_from(
+            req.pending_radix_mamba_slot
+        )
+        if backup is None:
+            return False
+
+        req.radix_mamba_backup_slot = backup
+        req.radix_mamba_backup_seqlen = req.mamba_last_track_seqlen
+        return True
 
     def maybe_wait_verify_done(self):
         if self.is_spec_v2:
