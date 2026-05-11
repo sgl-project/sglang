@@ -222,41 +222,7 @@ class KVCacheConfigurator:
 
         # Initialize req_to_token_pool
         if req_to_token_pool is None:
-            # FIXME(lsyin): this is the temporary fix for the context length issue when using speculative decoding
-            extra_max_context_len = 4
-            if self.server_args.speculative_num_draft_tokens is not None:
-                extra_max_context_len += self.server_args.speculative_num_draft_tokens
-
-            if self.server_args.disaggregation_mode == "decode":
-                # subscribe memory for pre-allocated requests
-                # if max_num_reqs <= 32, we pre-allocate 2x requests
-
-                pre_alloc_size = envs.SGLANG_DISAGGREGATION_NUM_PRE_ALLOCATE_REQS.get()
-                pre_alloc_size = (
-                    max_num_reqs * 2 if max_num_reqs <= 32 else pre_alloc_size
-                )
-                if self.mambaish_config:
-                    req_to_token_pool = self._hybrid_mamba_decode_req_pool(
-                        max_num_reqs=max_num_reqs,
-                        extra_max_context_len=extra_max_context_len,
-                        pre_alloc_size=pre_alloc_size,
-                    )
-                else:
-                    req_to_token_pool = self._decode_req_pool(
-                        max_num_reqs=max_num_reqs,
-                        extra_max_context_len=extra_max_context_len,
-                        pre_alloc_size=pre_alloc_size,
-                    )
-            elif self.mambaish_config:
-                req_to_token_pool = self._hybrid_req_pool(
-                    max_num_reqs=max_num_reqs,
-                    extra_max_context_len=extra_max_context_len,
-                )
-            else:
-                req_to_token_pool = self._default_req_pool(
-                    max_num_reqs=max_num_reqs,
-                    extra_max_context_len=extra_max_context_len,
-                )
+            req_to_token_pool = self._build_req_to_token_pool(max_num_reqs=max_num_reqs)
         else:
             # Draft worker shares req_to_token_pool with the target worker.
             assert self.is_draft_worker
@@ -386,6 +352,42 @@ class KVCacheConfigurator:
                     swa_allocator.full_to_swa_index_mapping
                 )
         return req_to_token_pool, token_to_kv_pool, token_to_kv_pool_allocator
+
+    def _build_req_to_token_pool(self, *, max_num_reqs: int) -> ReqToTokenPool:
+        # FIXME(lsyin): this is the temporary fix for the context length issue when using speculative decoding
+        extra_max_context_len = 4
+        if self.server_args.speculative_num_draft_tokens is not None:
+            extra_max_context_len += self.server_args.speculative_num_draft_tokens
+
+        if self.server_args.disaggregation_mode == "decode":
+            # subscribe memory for pre-allocated requests
+            # if max_num_reqs <= 32, we pre-allocate 2x requests
+
+            pre_alloc_size = envs.SGLANG_DISAGGREGATION_NUM_PRE_ALLOCATE_REQS.get()
+            pre_alloc_size = max_num_reqs * 2 if max_num_reqs <= 32 else pre_alloc_size
+            if self.mambaish_config:
+                req_to_token_pool = self._hybrid_mamba_decode_req_pool(
+                    max_num_reqs=max_num_reqs,
+                    extra_max_context_len=extra_max_context_len,
+                    pre_alloc_size=pre_alloc_size,
+                )
+            else:
+                req_to_token_pool = self._decode_req_pool(
+                    max_num_reqs=max_num_reqs,
+                    extra_max_context_len=extra_max_context_len,
+                    pre_alloc_size=pre_alloc_size,
+                )
+        elif self.mambaish_config:
+            req_to_token_pool = self._hybrid_req_pool(
+                max_num_reqs=max_num_reqs,
+                extra_max_context_len=extra_max_context_len,
+            )
+        else:
+            req_to_token_pool = self._default_req_pool(
+                max_num_reqs=max_num_reqs,
+                extra_max_context_len=extra_max_context_len,
+            )
+        return req_to_token_pool
 
     def _hybrid_mamba_decode_req_pool(
         self,
