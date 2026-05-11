@@ -132,13 +132,10 @@ def init_torch_distributed(
     # Check memory for tensor parallelism
     local_gpu_memory = get_available_gpu_memory(device, gpu_id)
     if tp_size > 1 and not is_draft_worker:
-        if pre_model_load_memory < local_gpu_memory * 0.9:
-            msg = "The memory capacity is unbalanced. Some GPUs may be occupied by other processes. "
-            msg += f"{pre_model_load_memory=}, {local_gpu_memory=}, {local_gpu_memory * 0.9=}"
-            if envs.SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK.get():
-                raise RuntimeError(msg)
-            else:
-                logger.warning(msg)
+        _check_tp_memory_balance(
+            pre_model_load_memory=pre_model_load_memory,
+            local_gpu_memory=local_gpu_memory,
+        )
 
     logger.info(
         f"Init torch distributed ends. elapsed={time.perf_counter() - tic:.2f} s, "
@@ -278,3 +275,17 @@ def _prewarm_nccl(*, tp_size: int, pp_size: int, moe_ep_size: int) -> None:
         f"NCCL/RCCL/HCCL warmup completed in {warmup_elapsed:.3f}s "
         f"(tp_size={tp_size}, pp_size={pp_size}, ep_size={moe_ep_size})"
     )
+
+
+def _check_tp_memory_balance(
+    *, pre_model_load_memory: float, local_gpu_memory: float
+) -> None:
+    if pre_model_load_memory < local_gpu_memory * 0.9:
+        msg = "The memory capacity is unbalanced. Some GPUs may be occupied by other processes. "
+        msg += (
+            f"{pre_model_load_memory=}, {local_gpu_memory=}, {local_gpu_memory * 0.9=}"
+        )
+        if envs.SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK.get():
+            raise RuntimeError(msg)
+        else:
+            logger.warning(msg)
