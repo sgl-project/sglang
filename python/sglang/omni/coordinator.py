@@ -11,6 +11,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
+from sglang.omni import OmniContextBundle
 from sglang.omni.protocol import (
     ARBackend,
     MultimodalGenerationBackend,
@@ -41,6 +42,7 @@ class OmniCoordinator:
         release_context: bool = True,
         stop_after_generation_limit: bool = False,
     ) -> tuple[OmniResponse, Any]:
+        """Generate a response for an omni request"""
         if self.request_adapter is not None:
             request = self.request_adapter(request)
 
@@ -54,16 +56,20 @@ class OmniCoordinator:
             )
 
         if context is None:
-            context = self.ar_backend.prepare_context(request)
+            # prepare for the decode loop, usually includes prefill and decode to the first segment
+            context: OmniContextBundle = self.ar_backend.begin_request_context(request)
         else:
-            context = self.ar_backend.append_input_segments(context, request)
+            context: OmniContextBundle = self.ar_backend.append_input_segments(
+                context, request
+            )
 
         segments: list[OmniOutputSegment] = []
         num_text_segments = 0
         num_multimodal_generated_segments = 0
 
         try:
-            # orchestrator owns modality handoff; backends own token and pixel internals
+            # the main loop: orchestrator owns modality handoff; backends own token and pixel internals
+            # each round generates a text segment and an optional image segment
             while True:
                 # 1. decode until a boundary is met
                 boundary = self.ar_backend.decode_until_boundary(
@@ -72,12 +78,13 @@ class OmniCoordinator:
                 )
 
                 if boundary.type == "done":
+                    # eos
                     break
 
                 if boundary.type == "text":
                     if num_text_segments >= request.max_text_segments:
                         break
-                    # text boundary: append and continue ar gen
+                    # text boundary: append and continue text gen
                     segments.append(OmniOutputSegment.from_boundary(boundary))
                     num_text_segments += 1
                     continue
@@ -91,7 +98,7 @@ class OmniCoordinator:
                 ):
                     break
 
-                # image boundary: switch to multimodal gen
+                # 2. image boundary: switch to multimodal gen and generate a image segment
                 generated_segment = self.mm_generation_backend.generate_segment(
                     request,
                     self.ar_backend.get_context_ops(context),
@@ -102,11 +109,11 @@ class OmniCoordinator:
                         f"expected {boundary.type!r}, got {generated_segment.type!r}"
                     )
 
-                # build and append the OmniOutputSegment to result list
+                # 3. build and append the OmniOutputSegment to result list
                 segments.append(OmniOutputSegment.from_generated(generated_segment))
                 num_multimodal_generated_segments += 1
 
-                # update the context with ar_backend
+                # 4. update the context with ar_backend, get prepared for the next round
                 context = self.ar_backend.append_generated_segment(
                     context,
                     generated_segment,

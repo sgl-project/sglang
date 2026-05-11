@@ -102,11 +102,11 @@ class SRTARBackend(ARBackend):
     def __init__(self, bridge: SRTBackedOmniSessionBridge):
         self.bridge = bridge
 
-    def prepare_context(self, request: OmniRequest) -> OmniContextBundle:
+    def begin_request_context(self, request: OmniRequest) -> OmniContextBundle:
         if request.mode == "vlm":
-            return self._prepare_vlm_context(request)
+            return self._prefill_and_decode_vlm_answer(request)
 
-        context = self._prepare_interleave_context(request)
+        context = self._prefill_and_decode_to_image_boundary(request)
         context.metadata["pending_boundaries"] = _initial_boundaries(
             context, mode=request.mode
         )
@@ -122,20 +122,22 @@ class SRTARBackend(ARBackend):
         if _is_vlm_backend_context(context):
             raise ValueError("Cannot continue a vlm context as an omni session")
         session_id = _session_id_for_context(context)
-        context = self._prepare_interleave_context(request, session_id=session_id)
+        context = self._prefill_and_decode_to_image_boundary(
+            request, session_id=session_id
+        )
         context.metadata["pending_boundaries"] = _initial_boundaries(
             context, mode=request.mode
         )
         return context
 
-    def _prepare_interleave_context(
+    def _prefill_and_decode_to_image_boundary(
         self,
         request: OmniRequest,
         *,
         session_id: str | None = None,
     ) -> OmniContextBundle:
         context = _srt_context_bundle_to_omni(
-            self.bridge.prepare_ar_context_from_messages(
+            self.bridge.prefill_and_decode_to_image_boundary(
                 messages=[_to_legacy_message(message) for message in request.messages],
                 think=request.think,
                 think_max_new_tokens=request.think_max_new_tokens,
@@ -182,7 +184,7 @@ class SRTARBackend(ARBackend):
             return
         self.bridge.release(_srt_backend_context(context))
 
-    def _prepare_vlm_context(self, request: OmniRequest) -> OmniContextBundle:
+    def _prefill_and_decode_vlm_answer(self, request: OmniRequest) -> OmniContextBundle:
         result = self.bridge.generate_vlm_answer(
             messages=[_to_legacy_message(message) for message in request.messages],
             max_new_tokens=_resolve_vlm_max_new_tokens(request),

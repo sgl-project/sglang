@@ -45,7 +45,7 @@ class _ScriptedARBackend:
         self.appended_inputs: list[OmniRequest] = []
         self.released_contexts: list[OmniContextBundle] = []
 
-    def prepare_context(self, request: OmniRequest) -> OmniContextBundle:
+    def begin_request_context(self, request: OmniRequest) -> OmniContextBundle:
         context_id = f"scripted-{next(self._counter)}"
         return OmniContextBundle(
             full=OmniContextRef(

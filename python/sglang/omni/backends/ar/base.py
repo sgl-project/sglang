@@ -13,7 +13,7 @@ from sglang.omni.protocol import (
 class UnsupportedARBackend(ARBackend):
     """AR backend placeholder that fails at request time."""
 
-    def prepare_context(self, request: OmniRequest) -> OmniContextBundle:
+    def begin_request_context(self, request: OmniRequest) -> OmniContextBundle:
         raise RuntimeError("No omni AR backend is configured")
 
     def append_input_segments(

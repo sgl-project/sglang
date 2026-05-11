@@ -40,7 +40,7 @@ class TestOmniSRTBackend(unittest.TestCase):
             mode="interleave",
         )
 
-        context = backend.prepare_context(request)
+        context = backend.begin_request_context(request)
         first = backend.decode_until_boundary(context, request=request)
         second = backend.decode_until_boundary(context, request=request)
         backend.append_generated_segment(
@@ -72,7 +72,7 @@ class TestOmniSRTBackend(unittest.TestCase):
             mode="t2i",
         )
 
-        backend.prepare_context(request)
+        backend.begin_request_context(request)
 
         self.assertEqual((2, 2), bridge.images[0].size)
         self.assertEqual("RGB", bridge.images[0].mode)
@@ -86,7 +86,7 @@ class TestOmniSRTBackend(unittest.TestCase):
             metadata={"max_new_tokens": 4},
         )
 
-        context = backend.prepare_context(request)
+        context = backend.begin_request_context(request)
         first = backend.decode_until_boundary(context, request=request)
         second = backend.decode_until_boundary(context, request=request)
         backend.release(context)
@@ -115,7 +115,7 @@ class _FakeBridge:
         self.commit_count = 0
         self.session_ids = []
 
-    def prepare_ar_context_from_messages(self, **kwargs):
+    def prefill_and_decode_to_image_boundary(self, **kwargs):
         self.session_ids.append(kwargs.get("session_id") or "s0")
         session = OmniSessionHandle(
             session_id=kwargs.get("session_id") or "s0",
@@ -186,11 +186,11 @@ class _ImageCaptureBridge(_FakeBridge):
         super().__init__(pre_image_segments=[])
         self.images = []
 
-    def prepare_ar_context_from_messages(self, **kwargs):
+    def prefill_and_decode_to_image_boundary(self, **kwargs):
         for message in kwargs["messages"]:
             if message["type"] == "image":
                 self.images.append(message["image"])
-        return super().prepare_ar_context_from_messages(**kwargs)
+        return super().prefill_and_decode_to_image_boundary(**kwargs)
 
 
 def _tiny_png_b64():

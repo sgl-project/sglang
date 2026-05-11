@@ -285,6 +285,7 @@ class U1OmniSessionModelPolicy(OmniSessionModelPolicy):
         session: OmniSessionHandle,
         u1_state: dict[str, Any],
     ) -> OmniDecodeResult:
+        """decode until a boundary / marker / eos is met"""
         if self.native_tokenizer is None or runtime is None:
             return OmniDecodeResult(type="done")
         if bool(u1_state.get("interleave_pending_image_marker")):
@@ -315,6 +316,7 @@ class U1OmniSessionModelPolicy(OmniSessionModelPolicy):
             or 0
         )
 
+        # iteratively decode
         for _ in range(max_new_tokens):
             decoded = runtime.decode_text(
                 session,
@@ -340,6 +342,7 @@ class U1OmniSessionModelPolicy(OmniSessionModelPolicy):
             token_id = int(decoded.output_ids[-1])
             current_position += 1
             if token_id == img_start_id:
+                # switch to image-generation, return a new segment
                 state_updates = {
                     "last_segment_type": "interleave",
                     "last_source": "native_interleave_image_marker",
@@ -539,7 +542,7 @@ class U1SRTBackedOmniSessionBridge(SRTBackedOmniSessionBridge):
             return policy_runner.policy
         return None
 
-    def prepare_ar_context_from_messages(
+    def prefill_and_decode_to_image_boundary(
         self,
         *,
         messages: list[OmniInterleavedMessage | dict[str, Any]],
@@ -555,7 +558,7 @@ class U1SRTBackedOmniSessionBridge(SRTBackedOmniSessionBridge):
                 == "interleave"
                 else think
             )
-            contexts = self._bridge.prepare_ar_context_from_messages(
+            contexts = self._bridge.prefill_and_decode_to_image_boundary(
                 messages=messages,
                 think=bridge_think,
                 think_max_new_tokens=think_max_new_tokens,

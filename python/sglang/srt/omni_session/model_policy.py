@@ -45,8 +45,10 @@ class OmniSessionModelPolicy:
     """Base class for model-specific omni session policies.
 
     Subclasses implement the model-native prompt formatting and decode rules.
-    The policy runner below turns these narrow session-view hooks into the
-    record-oriented surface used by `OmniSessionRuntime`.
+    Most hooks receive only a narrow session view; runtime-aware hooks are
+    reserved for model rules that must run SRT decode or update condition paths.
+    The policy runner below turns these hooks into the record-oriented surface
+    used by `OmniSessionRuntime`.
     """
 
     def prepare_srt_ar_message_inputs(
@@ -93,7 +95,8 @@ class OmniSessionModelPolicy:
         runtime: OmniSessionRuntime,
         session: OmniModelSessionView,
     ) -> OmniDecodeResult | None:
-        """override boundary decode when the model needs live SRT runtime access"""
+        """decode until a new segment is generated
+        override boundary decode when the model needs live SRT runtime access"""
         return None
 
     def decode_vlm_text(

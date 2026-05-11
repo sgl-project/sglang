@@ -18,7 +18,7 @@ class _ScriptedARBackend:
     def __init__(self, boundaries):
         self._boundaries = list(boundaries)
 
-    def prepare_context(self, request):
+    def begin_request_context(self, request):
         return OmniContextBundle(full=OmniContextRef(context_id="scripted"))
 
     def decode_until_boundary(self, context, *, request):

@@ -282,7 +282,7 @@ class ARBackend(ABC):
     """Autoregressive text/session backend used by omni orchestrator"""
 
     @abstractmethod
-    def prepare_context(self, request: OmniRequest) -> OmniContextBundle: ...
+    def begin_request_context(self, request: OmniRequest) -> OmniContextBundle: ...
 
     @abstractmethod
     def append_input_segments(

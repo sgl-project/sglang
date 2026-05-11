@@ -32,7 +32,7 @@ class OmniSessionBridge(ABC):
     generation_kind: str = "generic"
 
     @abstractmethod
-    def prepare_ar_context_from_messages(
+    def prefill_and_decode_to_image_boundary(
         self,
         *,
         messages: list[OmniInterleavedMessage | dict[str, Any]],
@@ -40,7 +40,9 @@ class OmniSessionBridge(ABC):
         think_max_new_tokens: int | None = None,
         sampling_params: Any | None = None,
         session_id: str | None = None,
-    ) -> OmniContextBundle: ...
+    ) -> OmniContextBundle:
+        """prefill and decode for a request, until the first image segment is reached"""
+        ...
 
     @abstractmethod
     def commit_generated_segment(
@@ -87,7 +89,7 @@ class SRTBackedOmniSessionBridge(OmniSessionBridge):
         self.runtime = runtime
         self.max_pre_image_decode_steps = max_pre_image_decode_steps
 
-    def prepare_ar_context_from_messages(
+    def prefill_and_decode_to_image_boundary(
         self,
         *,
         messages: list[OmniInterleavedMessage | dict[str, Any]],
@@ -120,6 +122,8 @@ class SRTBackedOmniSessionBridge(OmniSessionBridge):
                             },
                         }
                     )
+
+            # decode for the first segment
             for _ in range(self.max_pre_image_decode_steps):
                 segment = self.runtime.decode_next_segment(session)
                 if segment.type == "image_marker":

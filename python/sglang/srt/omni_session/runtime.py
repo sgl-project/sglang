@@ -3,7 +3,7 @@
 
 The runtime is below the generic omni orchestrator. It materializes model-
 specific AR-side chunks as ordinary SRT session requests, tracks committed SRT
-KV bindings, and leaves generation-side execution to a bridge/executor pair.
+KV bindings, and owns the scheduler executor used by runtime-aware policy hooks.
 """
 
 import uuid
@@ -211,8 +211,9 @@ class OmniSessionRuntime:
     """Lightweight omni state machine layered on top of SRT sessions.
 
     The runtime owns session state, asks `model_policy` for model-specific
-    prompt/decode rules, and asks the SRT scheduler executor to run concrete
-    SRT `Req` objects.
+    prompt/decode rules, and owns the SRT scheduler executor that runs concrete
+    SRT `Req` objects. Most policy hooks receive only a session view; hooks that
+    need live SRT decode or condition-path mutation receive this runtime.
     """
 
     def __init__(
@@ -322,7 +323,7 @@ class OmniSessionRuntime:
         greedy: bool = False,
         model_state_updates: dict[str, Any] | None = None,
     ) -> OmniTextDecodeResult:
-        """start ar decoding until finished or a boundary is met"""
+        """performs a single decode"""
         record = self._record_for(handle)
         if record.state != OmniSegmentState.AR_DECODE:
             raise ValueError(
@@ -873,6 +874,7 @@ class OmniSessionRuntime:
         greedy: bool = False,
         model_state_updates: dict[str, Any] | None = None,
     ) -> list[int]:
+        """decode with the srt scheduler executor"""
         max_new_tokens = (
             self.srt_ar_decode_max_new_tokens
             if max_new_tokens is None
