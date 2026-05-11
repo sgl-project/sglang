@@ -225,7 +225,7 @@ async def edits(
     size: Optional[str] = Form(None),
     output_format: Optional[str] = Form(None),
     background: Optional[str] = Form("auto"),
-    seed: Optional[int] = Form(1024),
+    seed: Optional[int] = Form(None),
     generator_device: Optional[str] = Form("cuda"),
     user: Optional[str] = Form(None),
     negative_prompt: Optional[str] = Form(None),
