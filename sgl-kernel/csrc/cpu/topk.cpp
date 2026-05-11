@@ -1,12 +1,12 @@
-#include "common.h"
-#include "vec.h"
-
 #include <algorithm>
 #include <cmath>
 #include <limits>
 #include <type_traits>
 #include <utility>
 #include <vector>
+
+#include "common.h"
+#include "vec.h"
 
 namespace {
 
@@ -861,7 +861,6 @@ std::tuple<at::Tensor, at::Tensor> biased_topk_cpu(
     int64_t num_fused_shared_experts,
     std::optional<double> routed_scaling_factor,
     bool apply_routed_scaling_factor_on_output) {
-
   CHECK_INPUT(gating_output);
   CHECK_INPUT(correction_bias);
 
@@ -1040,7 +1039,7 @@ std::tuple<at::Tensor, at::Tensor> hash_topk_cpu(
             TORCH_CHECK(false, "Unexpected routed_topk: ", routed_topk, " for num_experts=256");
         }
         break;
-       case 384:
+      case 384:
         switch (routed_topk) {
           case 6:
             LAUNCH_HASH_TOPK_KERNEL(384, 6);
@@ -1147,7 +1146,6 @@ void topk_transform_512_cpu(
     TORCH_CHECK(false, "seq_lens must be int32 or int64");
   }
 }
-
 
 std::tuple<at::Tensor, at::Tensor>
 topk_sigmoid_cpu(at::Tensor& hidden_states, at::Tensor& gating_output, int64_t topk, bool renormalize) {

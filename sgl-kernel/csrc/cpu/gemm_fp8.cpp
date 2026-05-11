@@ -1048,7 +1048,6 @@ void tinygemm_kernel(
       A, B, C, Btmp, scale, nullptr, M, N, K, lda, ldb, ldc, brg, block_size_K, do_unpack);
 }
 
-
 #define INSTANTIATE_TINYGEMM_TEMPLATE(TYPE_A, TYPE_B, TYPE_S) \
   template void tinygemm_kernel<TYPE_A>(                      \
       const TYPE_A* __restrict__ A,                           \

@@ -918,7 +918,10 @@ class DeepseekV4AttnBackend(
                 from sglang.srt.layers.attention.dsv4.index_buf_accessor import (
                     NopeFp8RopeBf16Pack,
                 )
-                swa_k_pack = NopeFp8RopeBf16Pack(*torch.ops.sgl_kernel.quant_to_nope_fp8_rope_bf16_pack_cpu(swa_k))
+
+                swa_k_pack = NopeFp8RopeBf16Pack(
+                    *torch.ops.sgl_kernel.quant_to_nope_fp8_rope_bf16_pack_cpu(swa_k)
+                )
             else:
                 swa_k_pack = quant_to_nope_fp8_rope_bf16_pack_triton(swa_k)
             self.token_to_kv_pool.set_swa_key_buffer_radix(
@@ -1040,6 +1043,7 @@ class DeepseekV4AttnBackend(
                 ), f"{extra_indices.shape=}'s last dimension is not aligned to 64"
             if _is_cpu and _cpu_amx:
                 from sgl_kernel.flash_mla import flash_mla_with_kvcache_cpu
+
                 o = flash_mla_with_kvcache_cpu(
                     q=q,
                     k_cache=swa_k_cache,

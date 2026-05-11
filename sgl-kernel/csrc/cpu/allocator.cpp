@@ -159,7 +159,7 @@ inline void copy_back_if_needed(at::Tensor& out_indices, const at::Tensor& buf) 
   }
 }
 
-} // anonymous namespace
+}  // anonymous namespace
 
 // ============================================================================
 // alloc_extend_kernel_cpu
@@ -180,18 +180,26 @@ void alloc_extend_kernel_cpu(
     auto ll = as_dtype(last_loc, at::kInt);
     auto fp = as_dtype(free_pages, at::kInt);
     alloc_extend_kernel_impl<int32_t>(
-        pl.data_ptr<int32_t>(), sl.data_ptr<int32_t>(),
-        ll.data_ptr<int32_t>(), fp.data_ptr<int32_t>(),
-        out_ptr, bs, page_size);
+        pl.data_ptr<int32_t>(),
+        sl.data_ptr<int32_t>(),
+        ll.data_ptr<int32_t>(),
+        fp.data_ptr<int32_t>(),
+        out_ptr,
+        bs,
+        page_size);
   } else {
     auto pl = as_dtype(pre_lens, at::kLong);
     auto sl = as_dtype(seq_lens, at::kLong);
     auto ll = as_dtype(last_loc, at::kLong);
     auto fp = as_dtype(free_pages, at::kLong);
     alloc_extend_kernel_impl<int64_t>(
-        pl.data_ptr<int64_t>(), sl.data_ptr<int64_t>(),
-        ll.data_ptr<int64_t>(), fp.data_ptr<int64_t>(),
-        out_ptr, bs, page_size);
+        pl.data_ptr<int64_t>(),
+        sl.data_ptr<int64_t>(),
+        ll.data_ptr<int64_t>(),
+        fp.data_ptr<int64_t>(),
+        out_ptr,
+        bs,
+        page_size);
   }
 
   copy_back_if_needed(out_indices, out_buf);
@@ -201,11 +209,7 @@ void alloc_extend_kernel_cpu(
 // alloc_decode_kernel_cpu
 // ============================================================================
 void alloc_decode_kernel_cpu(
-    at::Tensor& seq_lens,
-    at::Tensor& last_loc,
-    at::Tensor& free_pages,
-    at::Tensor& out_indices,
-    int64_t page_size) {
+    at::Tensor& seq_lens, at::Tensor& last_loc, at::Tensor& free_pages, at::Tensor& out_indices, int64_t page_size) {
   const int64_t bs = seq_lens.size(0);
   auto [out_ptr, out_buf] = prepare_out_i64(out_indices);
 
@@ -214,15 +218,13 @@ void alloc_decode_kernel_cpu(
     auto ll = as_dtype(last_loc, at::kInt);
     auto fp = as_dtype(free_pages, at::kInt);
     alloc_decode_kernel_impl<int32_t>(
-        sl.data_ptr<int32_t>(), ll.data_ptr<int32_t>(),
-        fp.data_ptr<int32_t>(), out_ptr, bs, page_size);
+        sl.data_ptr<int32_t>(), ll.data_ptr<int32_t>(), fp.data_ptr<int32_t>(), out_ptr, bs, page_size);
   } else {
     auto sl = as_dtype(seq_lens, at::kLong);
     auto ll = as_dtype(last_loc, at::kLong);
     auto fp = as_dtype(free_pages, at::kLong);
     alloc_decode_kernel_impl<int64_t>(
-        sl.data_ptr<int64_t>(), ll.data_ptr<int64_t>(),
-        fp.data_ptr<int64_t>(), out_ptr, bs, page_size);
+        sl.data_ptr<int64_t>(), ll.data_ptr<int64_t>(), fp.data_ptr<int64_t>(), out_ptr, bs, page_size);
   }
 
   copy_back_if_needed(out_indices, out_buf);

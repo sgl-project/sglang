@@ -161,8 +161,8 @@ inline void copy_add_stub(
   }
 }
 
-inline void copy_add_stub(
-    float* __restrict__ out, const float* __restrict__ input, const float* __restrict__ bias, int64_t size) {
+inline void
+copy_add_stub(float* __restrict__ out, const float* __restrict__ input, const float* __restrict__ bias, int64_t size) {
   using fVec = at::vec::Vectorized<float>;
 
   int64_t d;
@@ -625,8 +625,12 @@ void weight_packed_linear_fp32_out_kernel_impl(
 
         // bf16 * bf16 -> fp32 accumulation via brgemm
         at::native::cpublas::brgemm(
-            mb_size, nb_size, K,
-            mat1_strideM, nb_size, BLOCK_N,
+            mb_size,
+            nb_size,
+            K,
+            mat1_strideM,
+            nb_size,
+            BLOCK_N,
             /* add_C */ false,
             mat1 + mb_start * mat1_strideM,
             mat2 + nb_start * K,
@@ -637,12 +641,12 @@ void weight_packed_linear_fp32_out_kernel_impl(
           if constexpr (has_bias) {
             copy_add_stub(
                 out + mb_start * out_strideM + nb_start + m * out_strideM,
-                Ctmp + m * BLOCK_N, bias + nb_start, nb_size);
+                Ctmp + m * BLOCK_N,
+                bias + nb_start,
+                nb_size);
           } else {
             std::memcpy(
-                out + mb_start * out_strideM + nb_start + m * out_strideM,
-                Ctmp + m * BLOCK_N,
-                nb_size * sizeof(float));
+                out + mb_start * out_strideM + nb_start + m * out_strideM, Ctmp + m * BLOCK_N, nb_size * sizeof(float));
           }
         }
       });
@@ -798,8 +802,7 @@ at::Tensor convert_scale_packed(at::Tensor& scale) {
 // bias : [N]
 // out  : [M, N]
 //
-at::Tensor
-weight_packed_linear(
+at::Tensor weight_packed_linear(
     at::Tensor& mat1,
     at::Tensor& mat2,
     const std::optional<at::Tensor>& bias,

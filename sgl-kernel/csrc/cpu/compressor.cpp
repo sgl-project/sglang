@@ -1,9 +1,9 @@
+#include <algorithm>
+#include <cmath>
+#include <vector>
+
 #include "common.h"
 #include "vec.h"
-
-#include <cmath>
-#include <algorithm>
-#include <vector>
 
 namespace {
 
@@ -53,27 +53,48 @@ static inline void rmsnorm_row(
 
 // In-place interleaved rotary embedding on a single row.
 // freqs is [rope_dim] float, x is [rope_dim] float.
-static inline void apply_rotary_emb_row_f32(
-    float* __restrict__ x,
-    const float* __restrict__ freqs,
-    int64_t rope_dim,
-    bool inverse) {
+static inline void
+apply_rotary_emb_row_f32(float* __restrict__ x, const float* __restrict__ freqs, int64_t rope_dim, bool inverse) {
   int64_t k = 0;
 #if defined(CPU_CAPABILITY_AVX512)
   // Build sign mask for complex multiply
   __m512 sign_mask;
   if (inverse) {
     sign_mask = _mm512_castsi512_ps(_mm512_set_epi32(
-        (int)0x80000000, 0, (int)0x80000000, 0,
-        (int)0x80000000, 0, (int)0x80000000, 0,
-        (int)0x80000000, 0, (int)0x80000000, 0,
-        (int)0x80000000, 0, (int)0x80000000, 0));
+        (int)0x80000000,
+        0,
+        (int)0x80000000,
+        0,
+        (int)0x80000000,
+        0,
+        (int)0x80000000,
+        0,
+        (int)0x80000000,
+        0,
+        (int)0x80000000,
+        0,
+        (int)0x80000000,
+        0,
+        (int)0x80000000,
+        0));
   } else {
     sign_mask = _mm512_castsi512_ps(_mm512_set_epi32(
-        0, (int)0x80000000, 0, (int)0x80000000,
-        0, (int)0x80000000, 0, (int)0x80000000,
-        0, (int)0x80000000, 0, (int)0x80000000,
-        0, (int)0x80000000, 0, (int)0x80000000));
+        0,
+        (int)0x80000000,
+        0,
+        (int)0x80000000,
+        0,
+        (int)0x80000000,
+        0,
+        (int)0x80000000,
+        0,
+        (int)0x80000000,
+        0,
+        (int)0x80000000,
+        0,
+        (int)0x80000000,
+        0,
+        (int)0x80000000));
   }
   for (; k <= rope_dim - 16; k += 16) {
     __m512 xv = _mm512_loadu_ps(x + k);
@@ -81,9 +102,7 @@ static inline void apply_rotary_emb_row_f32(
     __m512 out = _mm512_fmadd_ps(
         xv,
         _mm512_permute_ps(fv, 0xA0),
-        _mm512_mul_ps(
-            _mm512_permute_ps(xv, 0xB1),
-            _mm512_xor_ps(_mm512_permute_ps(fv, 0xF5), sign_mask)));
+        _mm512_mul_ps(_mm512_permute_ps(xv, 0xB1), _mm512_xor_ps(_mm512_permute_ps(fv, 0xF5), sign_mask)));
     _mm512_storeu_ps(x + k, out);
   }
 #endif
@@ -91,10 +110,10 @@ static inline void apply_rotary_emb_row_f32(
     float xr = x[k], xi = x[k + 1];
     float cr = freqs[k], ci = freqs[k + 1];
     if (inverse) {
-      x[k]     = xr * cr + xi * ci;
+      x[k] = xr * cr + xi * ci;
       x[k + 1] = xi * cr - xr * ci;
     } else {
-      x[k]     = xr * cr - xi * ci;
+      x[k] = xr * cr - xi * ci;
       x[k + 1] = xr * ci + xi * cr;
     }
   }
@@ -115,21 +134,23 @@ static void hadamard_transform_row(float* __restrict__ data, int64_t n, float sc
       __m512 p, s, d;
       // h=1
       p = _mm512_permute_ps(v, 0b10'11'00'01);
-      s = _mm512_add_ps(v, p); d = _mm512_sub_ps(p, v);
+      s = _mm512_add_ps(v, p);
+      d = _mm512_sub_ps(p, v);
       v = _mm512_mask_blend_ps((__mmask16)0xAAAA, s, d);
       // h=2
       p = _mm512_permute_ps(v, 0b01'00'11'10);
-      s = _mm512_add_ps(v, p); d = _mm512_sub_ps(p, v);
+      s = _mm512_add_ps(v, p);
+      d = _mm512_sub_ps(p, v);
       v = _mm512_mask_blend_ps((__mmask16)0xCCCC, s, d);
       // h=4
-      p = _mm512_permutexvar_ps(
-          _mm512_set_epi32(11,10,9,8, 15,14,13,12, 3,2,1,0, 7,6,5,4), v);
-      s = _mm512_add_ps(v, p); d = _mm512_sub_ps(p, v);
+      p = _mm512_permutexvar_ps(_mm512_set_epi32(11, 10, 9, 8, 15, 14, 13, 12, 3, 2, 1, 0, 7, 6, 5, 4), v);
+      s = _mm512_add_ps(v, p);
+      d = _mm512_sub_ps(p, v);
       v = _mm512_mask_blend_ps((__mmask16)0xF0F0, s, d);
       // h=8
-      p = _mm512_permutexvar_ps(
-          _mm512_set_epi32(7,6,5,4, 3,2,1,0, 15,14,13,12, 11,10,9,8), v);
-      s = _mm512_add_ps(v, p); d = _mm512_sub_ps(p, v);
+      p = _mm512_permutexvar_ps(_mm512_set_epi32(7, 6, 5, 4, 3, 2, 1, 0, 15, 14, 13, 12, 11, 10, 9, 8), v);
+      s = _mm512_add_ps(v, p);
+      d = _mm512_sub_ps(p, v);
       v = _mm512_mask_blend_ps((__mmask16)0xFF00, s, d);
       _mm512_storeu_ps(data + j, v);
     }
@@ -159,7 +180,7 @@ static void hadamard_transform_row(float* __restrict__ data, int64_t n, float sc
     for (int64_t j = 0; j < n; j += 2 * h) {
       for (int64_t k = 0; k < h; ++k) {
         float a = data[j + k], b = data[j + k + h];
-        data[j + k]     = a + b;
+        data[j + k] = a + b;
         data[j + k + h] = a - b;
       }
     }
@@ -175,7 +196,7 @@ static void hadamard_transform_row(float* __restrict__ data, int64_t n, float sc
 // ret[:, r:, :] = tensor[:, r:, d:]
 // where r = ratio, d = head_dim
 static void overlap_transform_decode_inplace(
-    float* __restrict__ out,  // [n_items, head_dim]
+    float* __restrict__ out,       // [n_items, head_dim]
     const float* __restrict__ in,  // [n_items, 2*head_dim]
     int64_t ratio,
     int64_t head_dim) {
@@ -226,7 +247,6 @@ void compress_decode_cpu_impl(
     bool rotate,
     float norm_eps,
     int64_t freqs_stride) {
-
   int64_t coff_hd = coff * head_dim;
 
   at::parallel_for(0, bs, 1, [&](int64_t begin, int64_t end) {
@@ -260,12 +280,12 @@ void compress_decode_cpu_impl(
       if (overlap && (seq_len % ratio == 0)) {
         // Shift: pool[:ratio] = pool[ratio:2*ratio]
         for (int64_t r = 0; r < ratio; ++r) {
-          std::memcpy(pool_kv_req + r * pool_row_stride,
-                      pool_kv_req + (ratio + r) * pool_row_stride,
-                      coff_hd * sizeof(float));
-          std::memcpy(pool_score_req + r * pool_row_stride,
-                      pool_score_req + (ratio + r) * pool_row_stride,
-                      coff_hd * sizeof(float));
+          std::memcpy(
+              pool_kv_req + r * pool_row_stride, pool_kv_req + (ratio + r) * pool_row_stride, coff_hd * sizeof(float));
+          std::memcpy(
+              pool_score_req + r * pool_row_stride,
+              pool_score_req + (ratio + r) * pool_row_stride,
+              coff_hd * sizeof(float));
         }
       }
 
@@ -383,11 +403,7 @@ void compress_decode_cpu_impl(
       // Apply rotary embedding to last rope_head_dim elements
       int64_t freq_pos = (seq_len - 1) / ratio * ratio;
       const float* freq_ptr = freqs_cis + freq_pos * freqs_stride;
-      apply_rotary_emb_row_f32(
-          output + b * head_dim + (head_dim - rope_head_dim),
-          freq_ptr,
-          rope_head_dim,
-          false);
+      apply_rotary_emb_row_f32(output + b * head_dim + (head_dim - rope_head_dim), freq_ptr, rope_head_dim, false);
 
       // Optional rotate (Hadamard transform)
       if (rotate) {

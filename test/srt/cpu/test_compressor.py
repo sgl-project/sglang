@@ -1,5 +1,3 @@
-import itertools
-import time
 import unittest
 
 import torch
@@ -67,9 +65,21 @@ def hadamard_transform_ref(x, scale):
 
 
 def compress_decode_ref(
-    pool_kv, pool_score, kv, score, seq_lens, req_pool_indices,
-    ape, norm_weight, freqs_cis, ratio, head_dim, rope_head_dim,
-    overlap, rotate, norm_eps
+    pool_kv,
+    pool_score,
+    kv,
+    score,
+    seq_lens,
+    req_pool_indices,
+    ape,
+    norm_weight,
+    freqs_cis,
+    ratio,
+    head_dim,
+    rope_head_dim,
+    overlap,
+    rotate,
+    norm_eps,
 ):
     """Pure Python reference matching compress_decode_old."""
     bs = kv.size(0)
@@ -118,7 +128,7 @@ def compress_decode_ref(
         normed[-rope_head_dim:] = apply_rotary_emb_ref(normed[-rope_head_dim:], freq)
 
         if rotate:
-            normed = hadamard_transform_ref(normed, head_dim ** -0.5)
+            normed = hadamard_transform_ref(normed, head_dim**-0.5)
 
         output[b] = normed
 
@@ -127,7 +137,9 @@ def compress_decode_ref(
 
 class TestCompressDecodeKernel(CustomTestCase):
 
-    def _make_inputs(self, bs, ratio, head_dim, rope_head_dim, overlap, max_reqs=4, max_seq=256):
+    def _make_inputs(
+        self, bs, ratio, head_dim, rope_head_dim, overlap, max_reqs=4, max_seq=256
+    ):
         coff = 1 + (1 if overlap else 0)
         coff_hd = coff * head_dim
         state_len = ratio * coff
@@ -146,8 +158,17 @@ class TestCompressDecodeKernel(CustomTestCase):
         # freqs_cis: [max_seq, rope_head_dim] interleaved cos/sin
         freqs_cis = torch.randn(max_seq, rope_head_dim, dtype=torch.float32)
 
-        return (pool_kv, pool_score, kv, score, seq_lens, req_pool_indices,
-                ape, norm_weight, freqs_cis)
+        return (
+            pool_kv,
+            pool_score,
+            kv,
+            score,
+            seq_lens,
+            req_pool_indices,
+            ape,
+            norm_weight,
+            freqs_cis,
+        )
 
     def test_decode_no_overlap(self):
         bs, ratio, head_dim, rope_head_dim = 4, 128, 256, 64
@@ -155,23 +176,59 @@ class TestCompressDecodeKernel(CustomTestCase):
         norm_eps = 1e-6
 
         inputs = self._make_inputs(bs, ratio, head_dim, rope_head_dim, overlap)
-        pool_kv, pool_score, kv, score, seq_lens, req_pool_indices, ape, norm_weight, freqs_cis = inputs
+        (
+            pool_kv,
+            pool_score,
+            kv,
+            score,
+            seq_lens,
+            req_pool_indices,
+            ape,
+            norm_weight,
+            freqs_cis,
+        ) = inputs
 
         # Reference
         pool_kv_ref = pool_kv.clone()
         pool_score_ref = pool_score.clone()
         ref = compress_decode_ref(
-            pool_kv_ref, pool_score_ref, kv, score, seq_lens, req_pool_indices,
-            ape, norm_weight, freqs_cis, ratio, head_dim, rope_head_dim,
-            overlap, rotate, norm_eps)
+            pool_kv_ref,
+            pool_score_ref,
+            kv,
+            score,
+            seq_lens,
+            req_pool_indices,
+            ape,
+            norm_weight,
+            freqs_cis,
+            ratio,
+            head_dim,
+            rope_head_dim,
+            overlap,
+            rotate,
+            norm_eps,
+        )
 
         # Kernel
         pool_kv_kern = pool_kv.clone()
         pool_score_kern = pool_score.clone()
         out = torch.ops.sgl_kernel.compress_decode_cpu(
-            pool_kv_kern, pool_score_kern, kv, score, seq_lens, req_pool_indices,
-            ape, norm_weight, freqs_cis, ratio, head_dim, rope_head_dim,
-            overlap, rotate, norm_eps)
+            pool_kv_kern,
+            pool_score_kern,
+            kv,
+            score,
+            seq_lens,
+            req_pool_indices,
+            ape,
+            norm_weight,
+            freqs_cis,
+            ratio,
+            head_dim,
+            rope_head_dim,
+            overlap,
+            rotate,
+            norm_eps,
+        )
 
         torch.testing.assert_close(ref, out, atol=1e-4, rtol=1e-4)
 
@@ -181,21 +238,57 @@ class TestCompressDecodeKernel(CustomTestCase):
         norm_eps = 1e-6
 
         inputs = self._make_inputs(bs, ratio, head_dim, rope_head_dim, overlap)
-        pool_kv, pool_score, kv, score, seq_lens, req_pool_indices, ape, norm_weight, freqs_cis = inputs
+        (
+            pool_kv,
+            pool_score,
+            kv,
+            score,
+            seq_lens,
+            req_pool_indices,
+            ape,
+            norm_weight,
+            freqs_cis,
+        ) = inputs
 
         pool_kv_ref = pool_kv.clone()
         pool_score_ref = pool_score.clone()
         ref = compress_decode_ref(
-            pool_kv_ref, pool_score_ref, kv, score, seq_lens, req_pool_indices,
-            ape, norm_weight, freqs_cis, ratio, head_dim, rope_head_dim,
-            overlap, rotate, norm_eps)
+            pool_kv_ref,
+            pool_score_ref,
+            kv,
+            score,
+            seq_lens,
+            req_pool_indices,
+            ape,
+            norm_weight,
+            freqs_cis,
+            ratio,
+            head_dim,
+            rope_head_dim,
+            overlap,
+            rotate,
+            norm_eps,
+        )
 
         pool_kv_kern = pool_kv.clone()
         pool_score_kern = pool_score.clone()
         out = torch.ops.sgl_kernel.compress_decode_cpu(
-            pool_kv_kern, pool_score_kern, kv, score, seq_lens, req_pool_indices,
-            ape, norm_weight, freqs_cis, ratio, head_dim, rope_head_dim,
-            overlap, rotate, norm_eps)
+            pool_kv_kern,
+            pool_score_kern,
+            kv,
+            score,
+            seq_lens,
+            req_pool_indices,
+            ape,
+            norm_weight,
+            freqs_cis,
+            ratio,
+            head_dim,
+            rope_head_dim,
+            overlap,
+            rotate,
+            norm_eps,
+        )
 
         torch.testing.assert_close(ref, out, atol=1e-4, rtol=1e-4)
 
@@ -205,21 +298,57 @@ class TestCompressDecodeKernel(CustomTestCase):
         norm_eps = 1e-6
 
         inputs = self._make_inputs(bs, ratio, head_dim, rope_head_dim, overlap)
-        pool_kv, pool_score, kv, score, seq_lens, req_pool_indices, ape, norm_weight, freqs_cis = inputs
+        (
+            pool_kv,
+            pool_score,
+            kv,
+            score,
+            seq_lens,
+            req_pool_indices,
+            ape,
+            norm_weight,
+            freqs_cis,
+        ) = inputs
 
         pool_kv_ref = pool_kv.clone()
         pool_score_ref = pool_score.clone()
         ref = compress_decode_ref(
-            pool_kv_ref, pool_score_ref, kv, score, seq_lens, req_pool_indices,
-            ape, norm_weight, freqs_cis, ratio, head_dim, rope_head_dim,
-            overlap, rotate, norm_eps)
+            pool_kv_ref,
+            pool_score_ref,
+            kv,
+            score,
+            seq_lens,
+            req_pool_indices,
+            ape,
+            norm_weight,
+            freqs_cis,
+            ratio,
+            head_dim,
+            rope_head_dim,
+            overlap,
+            rotate,
+            norm_eps,
+        )
 
         pool_kv_kern = pool_kv.clone()
         pool_score_kern = pool_score.clone()
         out = torch.ops.sgl_kernel.compress_decode_cpu(
-            pool_kv_kern, pool_score_kern, kv, score, seq_lens, req_pool_indices,
-            ape, norm_weight, freqs_cis, ratio, head_dim, rope_head_dim,
-            overlap, rotate, norm_eps)
+            pool_kv_kern,
+            pool_score_kern,
+            kv,
+            score,
+            seq_lens,
+            req_pool_indices,
+            ape,
+            norm_weight,
+            freqs_cis,
+            ratio,
+            head_dim,
+            rope_head_dim,
+            overlap,
+            rotate,
+            norm_eps,
+        )
 
         torch.testing.assert_close(ref, out, atol=1e-3, rtol=1e-3)
 

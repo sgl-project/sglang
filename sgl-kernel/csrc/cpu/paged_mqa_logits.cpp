@@ -1,10 +1,10 @@
 #include <c10/util/Float8_e4m3fn.h>
 
-#include "common.h"
-#include "vec.h"
-
 #include <algorithm>
 #include <cstdint>
+
+#include "common.h"
+#include "vec.h"
 
 namespace {
 

@@ -1,9 +1,11 @@
 import itertools
 import unittest
+from typing import Optional, Tuple
 
 import torch
-from typing import Optional, Tuple
+
 from sglang.test.test_utils import CustomTestCase
+
 
 def act_quant_pytorch(
     x: torch.Tensor, block_size: int = 128, scale_fmt: Optional[str] = None
@@ -74,7 +76,9 @@ def act_quant_pytorch(
 def _assert_fp8_equal(ref: torch.Tensor, out: torch.Tensor) -> None:
     assert ref.dtype == torch.float8_e4m3fn
     assert out.dtype == torch.float8_e4m3fn
-    torch.testing.assert_close(ref.view(torch.uint8), out.view(torch.uint8), atol=0, rtol=0)
+    torch.testing.assert_close(
+        ref.view(torch.uint8), out.view(torch.uint8), atol=0, rtol=0
+    )
 
 
 class TestActQuantCPU(CustomTestCase):
@@ -87,9 +91,7 @@ class TestActQuantCPU(CustomTestCase):
         x = (torch.randn(shape, dtype=torch.float32) * 3.0).to(dtype).contiguous()
 
         ref_y, ref_scale = act_quant_pytorch(x, block_size=128, scale_fmt=scale_fmt)
-        out_y, out_scale = torch.ops.sgl_kernel.act_quant_cpu(
-            x, 128, scale_fmt
-        )
+        out_y, out_scale = torch.ops.sgl_kernel.act_quant_cpu(x, 128, scale_fmt)
 
         _assert_fp8_equal(ref_y, out_y)
         torch.testing.assert_close(ref_scale, out_scale, atol=0, rtol=0)
@@ -111,7 +113,9 @@ class TestActQuantCPU(CustomTestCase):
 
     def test_invalid_block_size(self):
         x = torch.randn((2, 129), dtype=torch.float32)
-        with self.assertRaisesRegex(RuntimeError, "Last dimension size must be divisible"):
+        with self.assertRaisesRegex(
+            RuntimeError, "Last dimension size must be divisible"
+        ):
             torch.ops.sgl_kernel.act_quant_cpu(x, 128, None)
 
 

@@ -399,15 +399,23 @@ class TestFusedExperts(CustomTestCase):
         w2s = kernel.convert_scale_packed(w2s)
 
         out = kernel.fused_experts_cpu(
-            a, w1, w2, topk_weight, topk_ids.to(torch.int32),
-            False,                   # inplace
+            a,
+            w1,
+            w2,
+            topk_weight,
+            topk_ids.to(torch.int32),
+            False,  # inplace
             CPUQuantMethod.MXFP4,
-            w1s, w2s,
-            None, None, None,        # w1_zp, w2_zp, block_size
-            None, None,              # w1_bias, w2_bias  (DSV4 has no bias)
-            None,                    # gemm1_alpha       (2604B has no alpha)
-            limit,                   # gemm1_clamp_limit (None for 2604; float for 2604B)
-            True,                    # is_vnni
+            w1s,
+            w2s,
+            None,
+            None,
+            None,  # w1_zp, w2_zp, block_size
+            None,
+            None,  # w1_bias, w2_bias  (DSV4 has no bias)
+            None,  # gemm1_alpha       (2604B has no alpha)
+            limit,  # gemm1_clamp_limit (None for 2604; float for 2604B)
+            True,  # is_vnni
         )
 
         atol = rtol = precision[dtype]

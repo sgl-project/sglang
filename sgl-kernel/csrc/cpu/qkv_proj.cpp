@@ -386,8 +386,7 @@ void rotary_emb_kernel_impl(
 
 }  // anonymous namespace
 
-extern at::Tensor
-weight_packed_linear(
+extern at::Tensor weight_packed_linear(
     at::Tensor& mat1,
     at::Tensor& mat2,
     const std::optional<at::Tensor>& bias,

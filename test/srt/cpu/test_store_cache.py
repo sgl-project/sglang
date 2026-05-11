@@ -10,6 +10,7 @@ torch.manual_seed(42)
 
 fp8_dtype = torch.float8_e4m3fnuz if is_fp8_fnuz() else torch.float8_e4m3fn
 
+
 # Reference implementation (from index_buf_accessor_v4.py)
 def _set_k_and_s_torch(buf, loc, k_nope, k_rope, scale_k_nope, page_size):
     num_pages, buf_numel_per_page = buf.shape
@@ -49,11 +50,15 @@ def _set_k_and_s_torch(buf, loc, k_nope, k_rope, scale_k_nope, page_size):
         buf_scale[s_offset[i] : s_offset[i] + scale_dim] = scale_k_nope[i]
 
 
-def make_test_data(num_pages, page_size, num_tokens, nope_dim=448, rope_dim=64, scale_dim=7):
+def make_test_data(
+    num_pages, page_size, num_tokens, nope_dim=448, rope_dim=64, scale_dim=7
+):
     """Create test data matching the buffer layout."""
     nope_rope_bytes_per_token = nope_dim + rope_dim * 2
     s_bytes_per_token = scale_dim + 1
-    buf_numel_per_page = page_size * nope_rope_bytes_per_token + page_size * s_bytes_per_token
+    buf_numel_per_page = (
+        page_size * nope_rope_bytes_per_token + page_size * s_bytes_per_token
+    )
 
     buf = torch.zeros(num_pages, buf_numel_per_page, dtype=torch.uint8)
 
@@ -63,7 +68,9 @@ def make_test_data(num_pages, page_size, num_tokens, nope_dim=448, rope_dim=64, 
     perm = torch.randperm(total_slots)[:num_tokens]
     loc = perm.to(torch.int64)
 
-    k_nope = torch.randint(0, 256, (num_tokens, nope_dim), dtype=torch.uint8).view(fp8_dtype)
+    k_nope = torch.randint(0, 256, (num_tokens, nope_dim), dtype=torch.uint8).view(
+        fp8_dtype
+    )
     k_rope = torch.randn(num_tokens, rope_dim, dtype=torch.bfloat16)
     scale_k_nope = torch.randint(0, 256, (num_tokens, scale_dim), dtype=torch.uint8)
 
@@ -141,6 +148,7 @@ class TestSetKAndS(CustomTestCase):
 # ===========================================================================
 # Reference for quant_to_nope_fp8_rope_bf16_pack
 # ===========================================================================
+
 
 def _cast_scale_inv_to_ue8m0(scales_inv, out_dtype=torch.float32):
     return torch.pow(2, torch.clamp_min(scales_inv, 1e-4).log2().ceil()).to(out_dtype)
@@ -252,6 +260,7 @@ class TestQuantToNopeFp8RopeBf16Pack(CustomTestCase):
 # Reference for set_k (from index_buf_accessor.py SetK.torch_fast)
 # ===========================================================================
 
+
 def _set_k_torch(buf, loc, index_k, page_size, index_head_dim):
     """Reference implementation matching SetK.torch_fast."""
     (num_tokens_to_write,) = loc.shape
@@ -282,7 +291,9 @@ def make_set_k_test_data(num_pages, page_size, num_tokens, index_head_dim=128):
     perm = torch.randperm(total_slots)[:num_tokens]
     loc = perm.to(torch.int64)
 
-    index_k = torch.randint(0, 256, (num_tokens, index_head_dim), dtype=torch.uint8).view(fp8_dtype)
+    index_k = torch.randint(
+        0, 256, (num_tokens, index_head_dim), dtype=torch.uint8
+    ).view(fp8_dtype)
 
     return buf, loc, index_k
 
@@ -338,9 +349,7 @@ class TestSetK(CustomTestCase):
     def test_set_k_large(self):
         """Larger stress test."""
         num_pages, page_size, num_tokens = 64, 64, 2048
-        buf, loc, index_k = make_set_k_test_data(
-            num_pages, page_size, num_tokens
-        )
+        buf, loc, index_k = make_set_k_test_data(num_pages, page_size, num_tokens)
 
         buf_ref = buf.clone()
         _set_k_torch(buf_ref, loc, index_k, page_size, 128)
@@ -354,6 +363,7 @@ class TestSetK(CustomTestCase):
 # ===========================================================================
 # Reference for set_s (from index_buf_accessor.py SetS.torch_fast)
 # ===========================================================================
+
 
 def _set_s_torch(buf, loc, index_k_scale, page_size, index_head_dim):
     """Reference implementation matching SetS.torch_fast."""
@@ -443,9 +453,7 @@ class TestSetS(CustomTestCase):
     def test_set_s_large(self):
         """Larger stress test."""
         num_pages, page_size, num_tokens = 64, 64, 2048
-        buf, loc, index_k_scale = make_set_s_test_data(
-            num_pages, page_size, num_tokens
-        )
+        buf, loc, index_k_scale = make_set_s_test_data(num_pages, page_size, num_tokens)
 
         buf_ref = buf.clone()
         _set_s_torch(buf_ref, loc, index_k_scale, page_size, 128)

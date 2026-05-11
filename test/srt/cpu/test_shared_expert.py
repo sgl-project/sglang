@@ -5,8 +5,6 @@ import torch
 
 kernel = torch.ops.sgl_kernel
 
-from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
-from sglang.test.test_utils import CustomTestCase
 from utils import (
     BLOCK_K,
     BLOCK_N,
@@ -23,6 +21,9 @@ from utils import (
     torch_naive_moe,
     torch_w8a8_per_column_moe,
 )
+
+from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
+from sglang.test.test_utils import CustomTestCase
 
 torch.manual_seed(1234)
 

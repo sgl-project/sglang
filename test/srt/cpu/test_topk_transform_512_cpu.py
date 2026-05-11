@@ -1,11 +1,10 @@
 import unittest
 from typing import Optional
 
+import sgl_kernel  # noqa: F401
 import torch
 
-import sgl_kernel  # noqa: F401
 from sglang.test.test_utils import CustomTestCase
-
 
 TOPK = 512
 

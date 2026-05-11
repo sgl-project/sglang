@@ -172,7 +172,6 @@ inline void silu_and_mul_stub(
   }
 }
 
-
 template <typename scalar_t>
 inline void clamped_silu_and_mul_stub(
     scalar_t* __restrict__ out,
@@ -209,7 +208,6 @@ inline void clamped_silu_and_mul_stub(
     out_vec.store(out + d);
   }
 }
-
 
 template <typename scalar_t>
 inline void copy_mul_stub(scalar_t* __restrict__ out, const float* __restrict__ input, float weight, int64_t size) {

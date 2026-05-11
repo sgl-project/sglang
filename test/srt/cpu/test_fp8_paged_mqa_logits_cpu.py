@@ -1,14 +1,12 @@
 import unittest
 from typing import Any
 
+import sgl_kernel  # noqa: F401
 import torch
 import torch.nn.functional as F
-
-import sgl_kernel  # noqa: F401
-from sglang.test.test_utils import CustomTestCase
-
 from utils import precision
 
+from sglang.test.test_utils import CustomTestCase
 
 BLOCK_SIZE = 64
 HEAD_DIM = 128
@@ -91,12 +89,18 @@ class TestFp8PagedMqaLogitsCPU(CustomTestCase):
         k_bytes = k_fp8.view(num_blocks, BLOCK_SIZE * HEAD_DIM).view(dtype=torch.uint8)
 
         scales = torch.rand(num_blocks, BLOCK_SIZE, dtype=torch.float32) * 0.5 + 0.75
-        scale_bytes = scales.contiguous().view(num_blocks, BLOCK_SIZE).view(dtype=torch.uint8)
+        scale_bytes = (
+            scales.contiguous().view(num_blocks, BLOCK_SIZE).view(dtype=torch.uint8)
+        )
 
         kvcache = torch.cat([k_bytes, scale_bytes], dim=1).contiguous()
         kvcache = kvcache.view(num_blocks, BLOCK_SIZE, 1, HEAD_DIM_WITH_SCALE_BYTES)
 
-        weight = torch.randn(batch_size, num_heads, dtype=torch.float32).to(weight_dtype).contiguous()
+        weight = (
+            torch.randn(batch_size, num_heads, dtype=torch.float32)
+            .to(weight_dtype)
+            .contiguous()
+        )
         seq_lens = torch.tensor([0, 65, max_seq_len - 1], dtype=index_dtype)
 
         pages_per_batch = (max_seq_len + BLOCK_SIZE - 1) // BLOCK_SIZE

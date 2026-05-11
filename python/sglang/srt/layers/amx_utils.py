@@ -190,9 +190,7 @@ class PackWeightMethodBMM:
         device = weight.device
 
         # Reshape [G*R, D] → [G, R, D] for batched GEMM
-        weight_3d = weight.data.view(
-            self.n_groups, self.group_size, -1
-        ).contiguous()
+        weight_3d = weight.data.view(self.n_groups, self.group_size, -1).contiguous()
 
         if not dim_is_supported(weight_3d):
             logger.warning(

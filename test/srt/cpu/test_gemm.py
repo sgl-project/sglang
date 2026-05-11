@@ -332,9 +332,7 @@ class TestGemm(CustomTestCase):
         mat2 = torch.randn(N, K, dtype=torch.bfloat16)
         bias = torch.randn(N, dtype=torch.float32) if has_bias else None
 
-        ref = torch.nn.functional.linear(
-            mat1.float(), mat2.float(), bias
-        )
+        ref = torch.nn.functional.linear(mat1.float(), mat2.float(), bias)
 
         out = torch.ops.sgl_kernel.weight_packed_linear(
             mat1, mat2, bias, False, torch.float32
@@ -351,9 +349,7 @@ class TestGemm(CustomTestCase):
         torch.testing.assert_close(ref, out2, atol=atol, rtol=rtol)
 
     def test_bf16_fp32_gemm(self):
-        for params in itertools.product(
-            self.M, self.N, self.K, self.has_bias
-                    ):
+        for params in itertools.product(self.M, self.N, self.K, self.has_bias):
             with self.subTest(
                 M=params[0],
                 N=params[1],
@@ -361,7 +357,6 @@ class TestGemm(CustomTestCase):
                 has_bias=params[3],
             ):
                 self._bf16_fp32_gemm(*params)
-
 
 
 if __name__ == "__main__":

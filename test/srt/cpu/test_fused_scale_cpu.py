@@ -2,7 +2,9 @@ import itertools
 import unittest
 
 import torch
+
 from sglang.test.test_utils import CustomTestCase
+
 
 def fused_scale_torch(
     weight: torch.Tensor,
@@ -15,6 +17,7 @@ def fused_scale_torch(
     acc = weight.reshape(-1).float() * out_scale * q_scale.reshape(-1).float()
     out = acc.to(out_dtype).reshape(B, H, 1)
     return out
+
 
 class TestFusedScaleCPU(CustomTestCase):
     shapes = [(1, 1), (2, 8), (3, 128)]
