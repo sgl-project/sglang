@@ -1,7 +1,117 @@
 #include "common.h"
 #include "vec.h"
 
+#include <algorithm>
+#include <cmath>
+#include <limits>
+#include <type_traits>
+#include <utility>
+#include <vector>
+
 namespace {
+
+constexpr int C4_TOPK = 512;
+
+template <typename T>
+inline int64_t load_index_value(const T* __restrict__ ptr, int64_t idx) {
+  return static_cast<int64_t>(ptr[idx]);
+}
+
+struct TopKTransformElem {
+  float score;
+  int32_t index;
+};
+
+struct TopKTransformMinHeapCmp {
+  bool operator()(const TopKTransformElem& lhs, const TopKTransformElem& rhs) const {
+    if (lhs.score == rhs.score) {
+      return lhs.index > rhs.index;
+    }
+    return lhs.score > rhs.score;
+  }
+};
+
+template <typename seq_t, typename page_t>
+void topk_transform_512_cpu_kernel_impl(
+    const float* __restrict__ scores,
+    const seq_t* __restrict__ seq_lens,
+    const page_t* __restrict__ page_tables,
+    int32_t* __restrict__ out_page_indices,
+    int32_t* __restrict__ out_raw_indices,
+    int64_t batch_size,
+    int64_t max_seq_len,
+    int64_t page_table_stride,
+    int64_t out_stride,
+    int64_t page_size) {
+  TORCH_CHECK(page_size > 0, "page_size must be positive");
+  TORCH_CHECK((page_size & (page_size - 1)) == 0, "page_size must be a power of 2");
+  const int page_bits = page_size > 1 ? static_cast<int>(std::log2(static_cast<double>(page_size))) : 0;
+  const int64_t page_mask = page_size - 1;
+
+  at::parallel_for(0, batch_size, 0, [&](int64_t begin, int64_t end) {
+    std::vector<TopKTransformElem> heap;
+    heap.reserve(C4_TOPK);
+
+    for (int64_t b = begin; b < end; ++b) {
+      const float* __restrict__ scores_row = scores + b * max_seq_len;
+      const page_t* __restrict__ page_table_row = page_tables + b * page_table_stride;
+      int32_t* __restrict__ out_page_row = out_page_indices + b * out_stride;
+      int32_t* __restrict__ out_raw_row = out_raw_indices == nullptr ? nullptr : out_raw_indices + b * out_stride;
+
+      int64_t seq_len = load_index_value(seq_lens, b);
+      seq_len = std::max<int64_t>(0, std::min<int64_t>(seq_len, max_seq_len));
+      const int64_t valid_topk = std::min<int64_t>(seq_len, C4_TOPK);
+
+      auto store_slot = [&](int64_t slot, int32_t raw_index) {
+        if (raw_index < 0) {
+          out_page_row[slot] = -1;
+          if (out_raw_row != nullptr) {
+            out_raw_row[slot] = -1;
+          }
+          return;
+        }
+
+        const int64_t page_idx = static_cast<int64_t>(raw_index) >> page_bits;
+        const int64_t offset_in_page = static_cast<int64_t>(raw_index) & page_mask;
+        const int64_t physical_page = load_index_value(page_table_row, page_idx);
+        out_page_row[slot] = static_cast<int32_t>((physical_page << page_bits) | offset_in_page);
+        if (out_raw_row != nullptr) {
+          out_raw_row[slot] = raw_index;
+        }
+      };
+
+      if (seq_len <= C4_TOPK) {
+        for (int64_t i = 0; i < valid_topk; ++i) {
+          store_slot(i, static_cast<int32_t>(i));
+        }
+        for (int64_t i = valid_topk; i < C4_TOPK; ++i) {
+          store_slot(i, -1);
+        }
+        continue;
+      }
+
+      heap.clear();
+      for (int64_t i = 0; i < C4_TOPK; ++i) {
+        heap.push_back({scores_row[i], static_cast<int32_t>(i)});
+      }
+      std::make_heap(heap.begin(), heap.end(), TopKTransformMinHeapCmp());
+
+      for (int64_t i = C4_TOPK; i < seq_len; ++i) {
+        const float score = scores_row[i];
+        const TopKTransformElem& current_min = heap.front();
+        if (score > current_min.score || (score == current_min.score && static_cast<int32_t>(i) < current_min.index)) {
+          std::pop_heap(heap.begin(), heap.end(), TopKTransformMinHeapCmp());
+          heap.back() = {score, static_cast<int32_t>(i)};
+          std::push_heap(heap.begin(), heap.end(), TopKTransformMinHeapCmp());
+        }
+      }
+
+      for (int64_t i = 0; i < C4_TOPK; ++i) {
+        store_slot(i, heap[i].index);
+      }
+    }
+  });
+}
 
 template <typename scalar_t, int SIZE>
 inline void softmax(float* __restrict__ out, const scalar_t* __restrict__ input) {
@@ -446,6 +556,82 @@ void biased_grouped_topk_kernel_impl(
       renormalize);
 
 }  // anonymous namespace
+
+void topk_transform_512_cpu(
+    at::Tensor& scores,
+    at::Tensor& seq_lens,
+    at::Tensor& page_tables,
+    at::Tensor& out_page_indices,
+    int64_t page_size,
+    const std::optional<at::Tensor>& out_raw_indices) {
+  CHECK_INPUT(scores);
+  CHECK_INPUT(seq_lens);
+  CHECK_INPUT(page_tables);
+  CHECK_INPUT(out_page_indices);
+
+  TORCH_CHECK(scores.scalar_type() == at::kFloat, "scores must be float32");
+  TORCH_CHECK(out_page_indices.scalar_type() == at::kInt, "out_page_indices must be int32");
+  TORCH_CHECK(scores.dim() == 2, "scores must be a 2D tensor");
+  TORCH_CHECK(seq_lens.dim() == 1, "seq_lens must be a 1D tensor");
+  TORCH_CHECK(page_tables.dim() == 2, "page_tables must be a 2D tensor");
+  TORCH_CHECK(out_page_indices.dim() == 2, "out_page_indices must be a 2D tensor");
+
+  const int64_t batch_size = scores.size(0);
+  const int64_t max_seq_len = scores.size(1);
+  TORCH_CHECK(seq_lens.size(0) == batch_size, "seq_lens row count must match scores");
+  TORCH_CHECK(page_tables.size(0) == batch_size, "page_tables row count must match scores");
+  TORCH_CHECK(out_page_indices.size(0) == batch_size, "out_page_indices row count must match scores");
+  TORCH_CHECK(out_page_indices.size(1) >= C4_TOPK, "out_page_indices must have at least 512 columns");
+
+  int32_t* raw_ptr = nullptr;
+  if (out_raw_indices.has_value()) {
+    at::Tensor raw = out_raw_indices.value();
+    CHECK_INPUT(raw);
+    TORCH_CHECK(raw.scalar_type() == at::kInt, "out_raw_indices must be int32");
+    TORCH_CHECK(raw.dim() == 2, "out_raw_indices must be a 2D tensor");
+    TORCH_CHECK(raw.sizes() == out_page_indices.sizes(), "out_raw_indices shape must match out_page_indices");
+    raw_ptr = raw.data_ptr<int32_t>();
+  }
+
+  auto launch_with_page_type = [&]<typename seq_t>() {
+    if (page_tables.scalar_type() == at::kInt) {
+      topk_transform_512_cpu_kernel_impl<seq_t, int32_t>(
+          scores.data_ptr<float>(),
+          seq_lens.data_ptr<seq_t>(),
+          page_tables.data_ptr<int32_t>(),
+          out_page_indices.data_ptr<int32_t>(),
+          raw_ptr,
+          batch_size,
+          max_seq_len,
+          page_tables.stride(0),
+          out_page_indices.stride(0),
+          page_size);
+    } else if (page_tables.scalar_type() == at::kLong) {
+      topk_transform_512_cpu_kernel_impl<seq_t, int64_t>(
+          scores.data_ptr<float>(),
+          seq_lens.data_ptr<seq_t>(),
+          page_tables.data_ptr<int64_t>(),
+          out_page_indices.data_ptr<int32_t>(),
+          raw_ptr,
+          batch_size,
+          max_seq_len,
+          page_tables.stride(0),
+          out_page_indices.stride(0),
+          page_size);
+    } else {
+      TORCH_CHECK(false, "page_tables must be int32 or int64");
+    }
+  };
+
+  if (seq_lens.scalar_type() == at::kInt) {
+    launch_with_page_type.template operator()<int32_t>();
+  } else if (seq_lens.scalar_type() == at::kLong) {
+    launch_with_page_type.template operator()<int64_t>();
+  } else {
+    TORCH_CHECK(false, "seq_lens must be int32 or int64");
+  }
+}
+
 
 std::tuple<at::Tensor, at::Tensor>
 topk_sigmoid_cpu(at::Tensor& hidden_states, at::Tensor& gating_output, int64_t topk, bool renormalize) {
