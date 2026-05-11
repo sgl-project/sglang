@@ -556,16 +556,6 @@ class FlashInferTrtllmFp8MoeQuantInfo(MoeQuantInfo):
     activation_type: int | None = None
 
 
-def _pack_topk_for_flashinfer_routed(
-    topk_ids: torch.Tensor, topk_weights: torch.Tensor
-) -> torch.Tensor:
-    """Pack routed top-k tensors into FlashInfer's int32 format."""
-    packed_ids = topk_ids.to(torch.int32)
-    packed_weights = topk_weights.to(torch.bfloat16)
-    packed = (packed_ids << 16) | packed_weights.view(torch.int16).to(torch.int32)
-    return packed
-
-
 def fused_experts_none_to_flashinfer_trtllm_fp8(
     dispatch_output: StandardDispatchOutput,
     quant_info: FlashInferTrtllmFp8MoeQuantInfo,
@@ -645,14 +635,10 @@ def fused_experts_none_to_flashinfer_trtllm_fp8(
             assert (
                 runner_config.top_k is not None
             ), "runner_config.top_k is required for flashinfer_trtllm_routed."
-            assert TopKOutputChecker.format_is_standard(topk_output)
-            packed_topk_ids = _pack_topk_for_flashinfer_routed(
-                topk_ids=topk_output.topk_ids,
-                topk_weights=topk_output.topk_weights,
-            )
+            assert TopKOutputChecker.format_is_packed(topk_output)
 
             output = trtllm_fp8_block_scale_routed_moe_wrapper(
-                topk_ids=packed_topk_ids,
+                topk_ids=topk_output.packed_topk_ids,
                 routing_bias=None,
                 hidden_states=a_q,
                 hidden_states_scale=a_sf_t,
@@ -887,11 +873,8 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
         )
 
     if use_routed_topk:
-        assert TopKOutputChecker.format_is_standard(topk_output)
-
-        packed_topk_ids = _pack_topk_for_flashinfer_routed(
-            topk_output.topk_ids, topk_output.topk_weights
-        )
+        assert TopKOutputChecker.format_is_packed(topk_output)
+        packed_topk_ids = topk_output.packed_topk_ids
         result = trtllm_fp4_block_scale_routed_moe(
             topk_ids=packed_topk_ids,
             routing_bias=None,
@@ -910,7 +893,7 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
             output1_scale_gate_scalar=quant_info.g1_alphas,
             output2_scale_scalar=quant_info.g2_alphas,
             num_experts=quant_info.global_num_experts,
-            top_k=topk_output.topk_ids.shape[1],
+            top_k=packed_topk_ids.shape[1],
             n_group=0,
             topk_group=0,
             intermediate_size=quant_info.intermediate_size_per_partition,
@@ -1042,19 +1025,15 @@ def fused_experts_none_to_flashinfer_trtllm_bf16(
             assert (
                 runner_config.top_k is not None
             ), "runner_config.top_k is required for flashinfer_trtllm_routed."
-            assert TopKOutputChecker.format_is_standard(topk_output)
             routing_method_type = runner_config.routing_method_type
             if routing_method_type is None:
                 routing_method_type = RoutingMethodType.Default
             elif routing_method_type == RoutingMethodType.DeepSeekV3:
                 routing_method_type = RoutingMethodType.TopK
 
-            packed_topk_ids = _pack_topk_for_flashinfer_routed(
-                topk_ids=topk_output.topk_ids,
-                topk_weights=topk_output.topk_weights,
-            )
+            assert TopKOutputChecker.format_is_packed(topk_output)
             final_hidden_states = trtllm_bf16_routed_moe(
-                topk_ids=packed_topk_ids,
+                topk_ids=topk_output.packed_topk_ids,
                 hidden_states=hidden_states,
                 gemm1_weights=quant_info.gemm1_weights,
                 gemm2_weights=quant_info.gemm2_weights,
