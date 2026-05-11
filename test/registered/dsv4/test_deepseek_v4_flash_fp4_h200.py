@@ -1,10 +1,10 @@
-"""B200 per-commit CI: DeepSeek-V4-Flash FP4 (LowLatency recipe).
+"""H200 per-commit CI: DeepSeek-V4-Flash FP4 Marlin (LowLatency recipe).
 
-Launches TP=4 with flashinfer_mxfp4 MoE runner + EAGLE speculative decoding.
+Launches TP=4 with Marlin FP4 MoE runner + EAGLE speculative decoding.
 Runs 12 ServerSanity probes (correctness, streaming, concurrency, determinism)
 plus a GSM8K accuracy gate.
 
-Registry: stage-c-test-dsv4-4-gpu-b200 (per-commit, 4x B200)
+Registry: stage-c-test-dsv4-8-gpu-h200 (per-commit, 8x H200 — only 4 used by TP=4)
 """
 
 import unittest
@@ -21,14 +21,16 @@ from sglang.test.test_utils import (
     try_cached_model,
 )
 
-register_cuda_ci(est_time=900, suite="stage-c-test-dsv4-4-gpu-b200")
+register_cuda_ci(est_time=900, suite="stage-c-test-dsv4-8-gpu-h200")
 
 MODEL = "deepseek-ai/DeepSeek-V4-Flash"
+MODEL_FP8 = "sgl-project/DeepSeek-V4-Flash-FP8"
 SERVER_LAUNCH_TIMEOUT = 3600
+DEEPEP_CONFIG = '{"normal_dispatch":{"num_sms":96},"normal_combine":{"num_sms":96}}'
 
 
-class TestDSV4FlashFP4B200(ServerSanityMixin, CustomTestCase):
-    """LowLatency recipe: TP=4, FP4 (mxfp4), EAGLE spec decoding."""
+class TestDSV4FlashFP4H200(ServerSanityMixin, CustomTestCase):
+    """LowLatency recipe: TP=4, Marlin FP4, EAGLE spec decoding."""
 
     @classmethod
     def setUpClass(cls):
@@ -43,7 +45,7 @@ class TestDSV4FlashFP4B200(ServerSanityMixin, CustomTestCase):
                 "--tp",
                 "4",
                 "--moe-runner-backend",
-                "flashinfer_mxfp4",
+                "marlin",
                 "--speculative-algorithm",
                 "EAGLE",
                 "--speculative-num-steps",
@@ -52,9 +54,6 @@ class TestDSV4FlashFP4B200(ServerSanityMixin, CustomTestCase):
                 "1",
                 "--speculative-num-draft-tokens",
                 "4",
-                "--chunked-prefill-size",
-                "4096",
-                "--disable-flashinfer-autotune",
             ],
         )
 
@@ -74,7 +73,7 @@ class TestDSV4FlashFP4B200(ServerSanityMixin, CustomTestCase):
             num_threads=128,
         )
         metrics = run_eval(args)
-        print(f"[DSV4 Flash FP4 B200] GSM8K {metrics=}")
+        print(f"[DSV4 Flash FP4 Marlin H200] GSM8K {metrics=}")
         self.assertGreater(metrics["score"], 0.93)
 
 
