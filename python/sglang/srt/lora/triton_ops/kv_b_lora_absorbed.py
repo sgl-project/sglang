@@ -89,6 +89,10 @@ def _max_segment_len(batch_info: LoRABatchInfo) -> int:
     raise ValueError("LoRA batch_info must provide max_len or seg_lens.")
 
 
+def _segment_grid_size(batch_info: LoRABatchInfo, num_segments: int) -> int:
+    return batch_info.bs if batch_info.use_cuda_graph else num_segments
+
+
 # ---------------------------------------------------------------------------
 # Kernel 1 -- Step A_q: per-head per-slot SGMM, reads K-half of B
 #
@@ -239,11 +243,12 @@ def step_a_q_fwd(
     out = torch.empty((S, H, rank), device=q_nope.device, dtype=q_nope.dtype)
     num_segments = _num_segments(batch_info)
     max_segment_len = _max_segment_len(batch_info)
+    segment_grid = _segment_grid_size(batch_info, num_segments)
 
     grid = (
         triton.cdiv(max_segment_len, _BLOCK_S) * triton.cdiv(rank, _STEP_A_BLOCK_N),
         H,
-        num_segments,
+        segment_grid,
     )
     sorted_by_adapter = batch_info.permutation is not None
 
@@ -426,12 +431,13 @@ def step_b_q_fwd(
     kv_lora_rank = A_buf.shape[-1]
     num_segments = _num_segments(batch_info)
     max_segment_len = _max_segment_len(batch_info)
+    segment_grid = _segment_grid_size(batch_info, num_segments)
 
     grid = (
         triton.cdiv(max_segment_len, _BLOCK_S)
         * triton.cdiv(kv_lora_rank, _STEP_B_BLOCK_N),
         H,
-        num_segments,
+        segment_grid,
     )
     sorted_by_adapter = batch_info.permutation is not None
 
@@ -606,11 +612,12 @@ def step_a_v_fwd(
     out = torch.empty((S, H, rank), device=attn_output.device, dtype=attn_output.dtype)
     num_segments = _num_segments(batch_info)
     max_segment_len = _max_segment_len(batch_info)
+    segment_grid = _segment_grid_size(batch_info, num_segments)
 
     grid = (
         triton.cdiv(max_segment_len, _BLOCK_S) * triton.cdiv(rank, _STEP_A_BLOCK_N),
         H,
-        num_segments,
+        segment_grid,
     )
     sorted_by_adapter = batch_info.permutation is not None
 
@@ -800,12 +807,13 @@ def step_b_v_fwd(
     full_K_per_head = qk_nope_head_dim + v_head_dim
     num_segments = _num_segments(batch_info)
     max_segment_len = _max_segment_len(batch_info)
+    segment_grid = _segment_grid_size(batch_info, num_segments)
 
     grid = (
         triton.cdiv(max_segment_len, _BLOCK_S)
         * triton.cdiv(v_head_dim, _STEP_B_BLOCK_N),
         H,
-        num_segments,
+        segment_grid,
     )
     sorted_by_adapter = batch_info.permutation is not None
 

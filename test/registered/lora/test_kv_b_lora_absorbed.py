@@ -36,7 +36,14 @@ class TestKvBLoRAAbsorbed(CustomTestCase):
         self.lora_ranks = [4, 2, 0]
         self.scalings = [0.5, 1.25, 0.0]
 
-    def _batch_info(self, seg_indptr, weight_indices, permutation=None):
+    def _batch_info(
+        self,
+        seg_indptr,
+        weight_indices,
+        permutation=None,
+        use_cuda_graph=False,
+        bs=None,
+    ):
         seg_indptr_t = torch.tensor(seg_indptr, dtype=torch.int32, device=self.device)
         weight_indices_t = torch.tensor(
             weight_indices, dtype=torch.int32, device=self.device
@@ -50,8 +57,8 @@ class TestKvBLoRAAbsorbed(CustomTestCase):
             seg_indptr[i + 1] - seg_indptr[i] for i in range(len(seg_indptr) - 1)
         ]
         return LoRABatchInfo(
-            use_cuda_graph=False,
-            bs=len(weight_indices),
+            use_cuda_graph=use_cuda_graph,
+            bs=bs if bs is not None else len(weight_indices),
             num_segments=len(weight_indices),
             seg_indptr=seg_indptr_t,
             weight_indices=weight_indices_t,
@@ -258,6 +265,19 @@ class TestKvBLoRAAbsorbed(CustomTestCase):
             permutation=[0, 2, 5, 1, 3, 4, 6],
         )
         self._run_case("csgmv permutation mixed", batch_info, num_tokens=7)
+
+    def test_cuda_graph_padded_segments(self):
+        # use_cuda_graph=True + bs > num_segments: grid axis-2 is sized to bs,
+        # so the extra programs (batch_id >= num_segments) must early-return
+        # without touching weight_indices/seg_indptr out of range. Output for
+        # the real segments must match the non-padded case.
+        batch_info = self._batch_info(
+            seg_indptr=[0, 2, 3],
+            weight_indices=[0, 1],
+            use_cuda_graph=True,
+            bs=4,  # 2 padded slots beyond num_segments=2
+        )
+        self._run_case("cuda graph padded", batch_info, num_tokens=3)
 
 
 class TestKvBLoRAAbsorbedBF16(TestKvBLoRAAbsorbed):
