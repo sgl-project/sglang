@@ -43,6 +43,8 @@ logger = logging.getLogger(__name__)
 _is_hip_dflash = is_hip()
 _has_aiter_fused_qk_norm_rope = False
 _aiter_fused_qk_norm_rope = None
+_has_aiter_mha_batch_prefill = False
+_aiter_mha_batch_prefill = None
 if _is_hip_dflash:
     try:
         from aiter.ops.fused_qk_norm_rope_cache_quant import (
@@ -53,6 +55,30 @@ if _is_hip_dflash:
         logger.info("aiter fused_qk_norm_rope kernel available for DFlash draft")
     except ImportError:
         pass
+
+    try:
+        # mha_batch_prefill_func is the paged-attention varlen prefill API
+        # (kernel reads K/V via kv_page_indices, no explicit gather). Supports
+        # causal=False, GQA, page_size=1 (3D K/V buffer), and graph capture
+        # because all per-call work is in-place on pre-allocated buffers.
+        from aiter.ops.mha import mha_batch_prefill_func as _aiter_mha_batch_prefill
+
+        _has_aiter_mha_batch_prefill = True
+        logger.info("aiter mha_batch_prefill_func available for DFlash draft")
+    except ImportError:
+        pass
+
+# create_flashinfer_kv_indices_triton populates kv_page_indices for the
+# prefix+current K range. Imported lazily to avoid forcing triton dep on
+# non-aiter paths.
+_create_flashinfer_kv_indices_triton = None
+if _is_hip_dflash and _has_aiter_mha_batch_prefill:
+    try:
+        from sglang.srt.layers.attention.utils import (
+            create_flashinfer_kv_indices_triton as _create_flashinfer_kv_indices_triton,
+        )
+    except ImportError:
+        _has_aiter_mha_batch_prefill = False
 
 
 class DFlashAttention(nn.Module):
@@ -168,6 +194,140 @@ class DFlashAttention(nn.Module):
             self._fused_dummy_v_cache = None
             self._fused_dummy_slot_mapping = None
 
+        # ROCm fast path: bypass RadixAttention(ENCODER_ONLY) and call AITER's
+        # `mha_batch_prefill_func(causal=False)` directly. Reads prefix+current
+        # K/V straight from the paged draft cache via kv_page_indices (no
+        # explicit gather). Mirrors aiter_backend.py:2501 (MLA prefill with
+        # prefix) but with causal=False for ENCODER_ONLY.
+        #
+        # CUDA-graph compatibility: per-call work is all in-place on
+        # pre-allocated buffers (registered below) -- buffer pointers are
+        # stable across replays, no allocation inside the captured region.
+        #
+        # Set SGLANG_DISABLE_DFLASH_AITER_ATTN=1 to opt out at runtime.
+        self.use_aiter_attn = (
+            _is_hip_dflash
+            and _has_aiter_mha_batch_prefill
+            and not os.environ.get("SGLANG_DISABLE_DFLASH_AITER_ATTN")
+        )
+        if self.use_aiter_attn:
+            # Pre-allocate MAX-size buffers via register_buffer so they (a) move
+            # with the module on .to(device) and (b) keep stable pointers across
+            # CUDA graph replays. mha_batch_prefill_func only reads prefix
+            # entries (bounded by kv_indptr[-1]), so over-sizing is safe.
+            #
+            # max_bs_cap=256 covers typical cuda_graph_max_bs ceilings; if a
+            # user pushes beyond it, _aiter_attn raises before scribbling past
+            # the buffer end. max_pos comes from the model config (page_size=1
+            # for DFlash, so pages_per_seq == tokens_per_seq).
+            max_bs_cap = 256
+            max_pages_per_seq = max_position_embeddings
+            self.register_buffer(
+                "_aiter_kv_indptr_buf",
+                torch.zeros(max_bs_cap + 1, dtype=torch.int32),
+                persistent=False,
+            )
+            self.register_buffer(
+                "_aiter_kv_page_indices_buf",
+                torch.zeros(max_bs_cap * max_pages_per_seq, dtype=torch.int32),
+                persistent=False,
+            )
+            # page_size=1 -> last page always has 1 valid token. Pre-fill once.
+            self.register_buffer(
+                "_aiter_kv_last_page_lens_buf",
+                torch.ones(max_bs_cap, dtype=torch.int32),
+                persistent=False,
+            )
+            self._aiter_max_bs_cap = max_bs_cap
+            self._aiter_max_pages_per_seq = max_pages_per_seq
+
+    def _aiter_attn(self, q, k, v, forward_batch):
+        """Paged-cache non-causal attention via mha_batch_prefill_func.
+
+        DFlash draft attention attends to prefix tokens (in cache) AND the
+        current bs*block_size draft tokens, non-causally. Workflow:
+          1. Save current K/V to the slots pre-allocated by the worker.
+          2. Compute extended kv_indptr (cumsum of seq_lens + block_size)
+             into the pre-allocated buffer (in-place).
+          3. Triton kernel writes per-batch slot indices into the prefix of
+             the pre-allocated kv_page_indices buffer (in-place).
+          4. View cache buffers as 3D paged (page_size=1) and call
+             mha_batch_prefill_func(causal=False) -- kernel reads K/V via
+             kv_page_indices, no explicit gather.
+
+        All per-call ops are in-place on pre-allocated buffers, so buffer
+        pointers stay stable across CUDA graph replays.
+        """
+        bs = forward_batch.batch_size
+        block_size = q.shape[0] // bs
+
+        # Defensive: ensure pre-allocated buffer is large enough (caught at
+        # capture time, before scribbling past the buffer end).
+        assert bs <= self._aiter_max_bs_cap, (
+            f"DFlash AITER attn: bs={bs} exceeds buffer cap {self._aiter_max_bs_cap}; "
+            f"raise max_bs_cap in DFlashAttention.__init__ or set SGLANG_DISABLE_DFLASH_AITER_ATTN=1."
+        )
+
+        # 1. Save current K/V into cache.
+        forward_batch.token_to_kv_pool.set_kv_buffer(
+            self.attn,
+            forward_batch.out_cache_loc,
+            k,
+            v,
+        )
+
+        # 2. Build extended kv_lens / kv_indptr in-place into pre-allocated
+        # buffer. Slice views share storage, pointer stays stable.
+        # kv_indptr[0] is permanently 0 (set at __init__ via torch.zeros, and
+        # only kv_indptr[1:bs+1] is overwritten below). A scalar `kv_indptr[0]
+        # = 0` would do a host->device write that is NOT allowed during CUDA
+        # graph capture.
+        seq_lens = forward_batch.seq_lens
+        kv_lens = seq_lens + block_size  # int32 [bs]
+        kv_indptr = self._aiter_kv_indptr_buf[: bs + 1]
+        kv_indptr[1:] = torch.cumsum(kv_lens, dim=0)
+
+        # 3. Triton kernel writes per-batch slot indices into the prefix of the
+        # pre-allocated kv_page_indices buffer. Tail entries past kv_indptr[-1]
+        # are unused (kernel only reads [0 : kv_indptr[-1]]).
+        _create_flashinfer_kv_indices_triton[(bs,)](
+            forward_batch.req_to_token_pool.req_to_token,
+            forward_batch.req_pool_indices,
+            kv_lens,
+            kv_indptr,
+            None,
+            self._aiter_kv_page_indices_buf,
+            forward_batch.req_to_token_pool.req_to_token.stride(0),
+        )
+
+        # 4. View cache buffers as 3D paged (page_size=1). No data copy.
+        k_buffer = forward_batch.token_to_kv_pool.get_key_buffer(self.attn.layer_id)
+        v_buffer = forward_batch.token_to_kv_pool.get_value_buffer(self.attn.layer_id)
+        # SGLang K/V cache buffers are [num_slots, num_kv_heads, head_dim] (3D)
+        # for page_size=1. mha_batch_prefill_func accepts 3D K/V directly when
+        # page_size=1 (see is_linear branch in mha_batch_prefill_fake_tensors).
+
+        # max_kv_len upper bound from req_to_token's static row width.
+        max_kv_len = forward_batch.req_to_token_pool.req_to_token.size(1)
+
+        qo_indptr = forward_batch.attn_backend.forward_metadata.qo_indptr
+        kv_last_page_lens = self._aiter_kv_last_page_lens_buf[:bs]
+
+        out = _aiter_mha_batch_prefill(
+            q.view(-1, self.num_heads, self.head_dim),
+            k_buffer,
+            v_buffer,
+            qo_indptr,
+            kv_indptr,
+            self._aiter_kv_page_indices_buf,
+            block_size,
+            max_kv_len,
+            softmax_scale=self.scaling,
+            causal=False,
+            kv_last_page_lens=kv_last_page_lens,
+        )
+        return out.view(-1, self.num_heads * self.head_dim)
+
     def _fused_qk_norm_rope(self, positions, hidden_states):
         """Fused split + Q/K-RMSNorm + RoPE for ROCm/AITER (return_kv=True path).
 
@@ -282,7 +442,10 @@ class DFlashAttention(nn.Module):
             )
             q, k = apply_qk_norm(q, k, self.q_norm, self.k_norm, self.head_dim)
             q, k = self.rotary_emb(positions, q, k)
-        attn_output = self.attn(q, k, v, forward_batch)
+        if self.use_aiter_attn:
+            attn_output = self._aiter_attn(q, k, v, forward_batch)
+        else:
+            attn_output = self.attn(q, k, v, forward_batch)
         output, _ = self.o_proj(attn_output)
         return output
 
