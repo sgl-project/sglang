@@ -1119,34 +1119,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         set_cuda_arch()
 
-        # Prepare the model config
-        from sglang.srt.configs.modelopt_config import ModelOptConfig
-
-        modelopt_config = ModelOptConfig(
-            quant=self.server_args.modelopt_quant,
-            checkpoint_restore_path=self.server_args.modelopt_checkpoint_restore_path,
-            checkpoint_save_path=self.server_args.modelopt_checkpoint_save_path,
-            export_path=self.server_args.modelopt_export_path,
-            quantize_and_serve=self.server_args.quantize_and_serve,
-        )
-
-        self.load_config = LoadConfig(
-            load_format=self.server_args.load_format,
-            download_dir=self.server_args.download_dir,
-            model_loader_extra_config=self.server_args.model_loader_extra_config,
-            tp_rank=self.tp_rank,
-            remote_instance_weight_loader_seed_instance_ip=self.server_args.remote_instance_weight_loader_seed_instance_ip,
-            remote_instance_weight_loader_seed_instance_service_port=self.server_args.remote_instance_weight_loader_seed_instance_service_port,
-            remote_instance_weight_loader_send_weights_group_ports=self.server_args.remote_instance_weight_loader_send_weights_group_ports,
-            remote_instance_weight_loader_backend=self.server_args.remote_instance_weight_loader_backend,
-            remote_instance_weight_loader_transfer_engine=self.remote_instance_weight_transporter.engine,
-            remote_instance_weight_loader_transfer_engine_session_id=self.remote_instance_weight_transporter.session_id,
-            modelexpress_url=self.server_args.modelexpress_url,
-            modelexpress_transport=self.server_args.modelexpress_transport,
-            modelopt_config=modelopt_config,
-            rl_quant_profile=self.server_args.rl_quant_profile,
-            draft_model_idx=self.draft_model_idx,
-        )
+        self.load_config = self._build_load_config()
         if self.device == "cpu":
             self.model_config = adjust_config_with_unaligned_cpu_tp(
                 self.model_config, self.load_config, self.tp_size
@@ -1417,6 +1390,36 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             self.model_config.dtype = torch.float16
             if torch.cuda.get_device_capability()[1] < 5:
                 raise RuntimeError("SGLang only supports sm75 and above.")
+
+    def _build_load_config(self) -> LoadConfig:
+        # Prepare the model config
+        from sglang.srt.configs.modelopt_config import ModelOptConfig
+
+        modelopt_config = ModelOptConfig(
+            quant=self.server_args.modelopt_quant,
+            checkpoint_restore_path=self.server_args.modelopt_checkpoint_restore_path,
+            checkpoint_save_path=self.server_args.modelopt_checkpoint_save_path,
+            export_path=self.server_args.modelopt_export_path,
+            quantize_and_serve=self.server_args.quantize_and_serve,
+        )
+
+        return LoadConfig(
+            load_format=self.server_args.load_format,
+            download_dir=self.server_args.download_dir,
+            model_loader_extra_config=self.server_args.model_loader_extra_config,
+            tp_rank=self.tp_rank,
+            remote_instance_weight_loader_seed_instance_ip=self.server_args.remote_instance_weight_loader_seed_instance_ip,
+            remote_instance_weight_loader_seed_instance_service_port=self.server_args.remote_instance_weight_loader_seed_instance_service_port,
+            remote_instance_weight_loader_send_weights_group_ports=self.server_args.remote_instance_weight_loader_send_weights_group_ports,
+            remote_instance_weight_loader_backend=self.server_args.remote_instance_weight_loader_backend,
+            remote_instance_weight_loader_transfer_engine=self.remote_instance_weight_transporter.engine,
+            remote_instance_weight_loader_transfer_engine_session_id=self.remote_instance_weight_transporter.session_id,
+            modelexpress_url=self.server_args.modelexpress_url,
+            modelexpress_transport=self.server_args.modelexpress_transport,
+            modelopt_config=modelopt_config,
+            rl_quant_profile=self.server_args.rl_quant_profile,
+            draft_model_idx=self.draft_model_idx,
+        )
 
     def maybe_recover_ep_ranks(self):
         # TODO(perf): `active_ranks.all()` on a CUDA tensor triggers host-device
