@@ -96,16 +96,16 @@ def _torch_sparse_attention_ref(
     not _sm90_available(), reason="Q8KV8 sparse prefill requires SM90 CUDA"
 )
 @pytest.mark.parametrize("d_qk,with_sink", [(512, False), (576, True)])
-def test_flashmla_q8kv8_sparse_prefill_matches_reference(d_qk: int, with_sink: bool):
-    from sglang.jit_kernel.flashmla_q8kv8_sparse_prefill import (
-        flash_mla_sparse_q8kv8_fwd,
+def test_sparse_mla_q8kv8_prefill_matches_reference(d_qk: int, with_sink: bool):
+    from sglang.jit_kernel.sparse_mla_q8kv8_prefill_sm90 import (
+        sparse_mla_q8kv8_prefill_fwd,
     )
 
     q, kv, indices, sm_scale, q_scale, kv_scale, attn_sink, topk_length = _make_case(
         d_qk, with_sink
     )
 
-    out, max_logits, lse = flash_mla_sparse_q8kv8_fwd(
+    out, max_logits, lse = sparse_mla_q8kv8_prefill_fwd(
         q=q,
         kv=kv,
         indices=indices,

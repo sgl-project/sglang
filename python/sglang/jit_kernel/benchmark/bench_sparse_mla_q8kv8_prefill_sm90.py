@@ -7,7 +7,7 @@ import triton
 import triton.testing
 
 from sglang.jit_kernel.benchmark.utils import run_benchmark_no_cudagraph
-from sglang.jit_kernel.flashmla_q8kv8_sparse_prefill import flash_mla_sparse_q8kv8_fwd
+from sglang.jit_kernel.sparse_mla_q8kv8_prefill_sm90 import sparse_mla_q8kv8_prefill_fwd
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.utils import is_in_ci
 
@@ -106,11 +106,11 @@ def _make_q8_inputs(s_q: int, s_kv: int, h_q: int, d_qk: int, topk: int):
         line_names=LINE_NAMES,
         styles=STYLES,
         ylabel="us",
-        plot_name="flashmla-q8kv8-sparse-prefill-performance",
+        plot_name="sparse-mla-q8kv8-prefill-sm90-performance",
         args={},
     )
 )
-def bench_flashmla_q8kv8_sparse_prefill(
+def bench_sparse_mla_q8kv8_prefill_sm90(
     s_q: int, s_kv: int, h_q: int, d_qk: int, topk: int, provider: str
 ):
     if provider == "q16_bf16_flashmla":
@@ -126,7 +126,7 @@ def bench_flashmla_q8kv8_sparse_prefill(
         q, kv, indices, sm_scale, q_scale, kv_scale = _make_q8_inputs(
             s_q, s_kv, h_q, d_qk, topk
         )
-        fn = lambda: flash_mla_sparse_q8kv8_fwd(
+        fn = lambda: sparse_mla_q8kv8_prefill_fwd(
             q, kv, indices, sm_scale, q_scale, kv_scale, D_V
         )
     else:
@@ -136,4 +136,4 @@ def bench_flashmla_q8kv8_sparse_prefill(
 
 
 if __name__ == "__main__":
-    bench_flashmla_q8kv8_sparse_prefill.run(print_data=True)
+    bench_sparse_mla_q8kv8_prefill_sm90.run(print_data=True)

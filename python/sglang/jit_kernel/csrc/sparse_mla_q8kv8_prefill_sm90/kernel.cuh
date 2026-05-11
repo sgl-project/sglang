@@ -1,5 +1,5 @@
 // Copyright (c) 2025, FlashMLA.
-// SM90 FP8 Native Sparse Prefill Attention - phase1_new.cuh
+// SM90 FP8 native sparse MLA prefill kernel.
 // Design: Native fp8 GMMA path
 //   QK GEMM: fp8 SS (E4M3 x E4M3 -> F32, k=32, 2x throughput vs bf16)
 //   PV GEMM: fp8 RS/SS (E4M3 x E4M3 -> F32, V physically transposed in smem)
@@ -17,19 +17,19 @@
 using namespace cute;
 
 // Include the fp8 transpose utility
-#include "dense_fp8/fp8_transpose_v.h"
+#include "dense_fp8_transpose_v.h"
 // Include the dense_fp8 utils for permute_Cregs_fp8, convert_layout_acc_Aregs, convert_type_out
-#include "dense_fp8/utils.h"
+#include "dense_fp8_utils.h"
 
 namespace sm90 {
 namespace fwd {
 
 template <typename Kernel, typename TMAParamsT>
-__global__ void sparse_attn_fwd_q8_new_kernel(
-    __grid_constant__ const SparseAttnFwdQ8SM90NewParams params, __grid_constant__ const TMAParamsT tma_params);
+__global__ void sparse_mla_q8kv8_prefill_kernel(
+    __grid_constant__ const SparseMlaQ8Kv8PrefillParams params, __grid_constant__ const TMAParamsT tma_params);
 
 template <int D_QK, bool HAVE_TOPK_LENGTH, bool HAVE_ATTN_SINK>
-struct KernelTemplateQ8New {
+struct SparseMlaQ8Kv8PrefillKernel {
   static constexpr int D_Q = D_QK;
   static constexpr int D_K = D_QK;
   static constexpr int D_V = 512;
@@ -142,7 +142,7 @@ struct KernelTemplateQ8New {
   // ========================================================================
   template <typename TMAParamType>
   static __device__ __forceinline__ void
-  devfunc(const SparseAttnFwdQ8SM90NewParams& params, const TMAParamType& tma_params) {
+  devfunc(const SparseMlaQ8Kv8PrefillParams& params, const TMAParamType& tma_params) {
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 900)) || (defined(__CLION_IDE__) || defined(__VSCODE_IDE__))
     const int q_h_idx = blockIdx.x % (params.h_q / B_H);
     const int s_q_idx = blockIdx.x / (params.h_q / B_H);
@@ -884,7 +884,7 @@ struct KernelTemplateQ8New {
   // ========================================================================
   // run() -- host-side launch
   // ========================================================================
-  static void run(const SparseAttnFwdQ8SM90NewParams& params) {
+  static void run(const SparseMlaQ8Kv8PrefillParams& params) {
     KU_ASSERT(params.h_kv == 1);
     KU_ASSERT(params.topk % (2 * B_TOPK) == 0);
     KU_ASSERT(params.topk > 0);
@@ -914,8 +914,9 @@ struct KernelTemplateQ8New {
 
     TmaParams_t tma_p = {tensor_map_O};
 
-    auto kernel =
-        &sparse_attn_fwd_q8_new_kernel<KernelTemplateQ8New<D_QK, HAVE_TOPK_LENGTH, HAVE_ATTN_SINK>, TmaParams_t>;
+    auto kernel = &sparse_mla_q8kv8_prefill_kernel<
+        SparseMlaQ8Kv8PrefillKernel<D_QK, HAVE_TOPK_LENGTH, HAVE_ATTN_SINK>,
+        TmaParams_t>;
 
     constexpr size_t smem_size = sizeof(SharedMemoryPlan);
     KU_CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
@@ -931,8 +932,8 @@ struct KernelTemplateQ8New {
 // Global kernel entry point
 // ============================================================================
 template <typename Kernel, typename TMAParamsT>
-__global__ void __launch_bounds__(Kernel::NUM_THREADS, 1, 1) sparse_attn_fwd_q8_new_kernel(
-    __grid_constant__ const SparseAttnFwdQ8SM90NewParams params, __grid_constant__ const TMAParamsT tma_params) {
+__global__ void __launch_bounds__(Kernel::NUM_THREADS, 1, 1) sparse_mla_q8kv8_prefill_kernel(
+    __grid_constant__ const SparseMlaQ8Kv8PrefillParams params, __grid_constant__ const TMAParamsT tma_params) {
   Kernel::devfunc(params, tma_params);
 }
 
@@ -940,8 +941,8 @@ __global__ void __launch_bounds__(Kernel::NUM_THREADS, 1, 1) sparse_attn_fwd_q8_
 // External dispatch function
 // ============================================================================
 template <int D_QK, bool HAVE_TOPK_LENGTH, bool HAVE_ATTN_SINK>
-void run_fwd_phase1_q8_sm90_new_kernel(const SparseAttnFwdQ8SM90NewParams& params) {
-  KernelTemplateQ8New<D_QK, HAVE_TOPK_LENGTH, HAVE_ATTN_SINK>::run(params);
+void run_sparse_mla_q8kv8_prefill_kernel(const SparseMlaQ8Kv8PrefillParams& params) {
+  SparseMlaQ8Kv8PrefillKernel<D_QK, HAVE_TOPK_LENGTH, HAVE_ATTN_SINK>::run(params);
 }
 
 }  // namespace fwd

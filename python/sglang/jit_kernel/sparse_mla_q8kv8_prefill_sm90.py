@@ -113,7 +113,7 @@ def _q8kv8_cuda_flags() -> list[str]:
 
 
 @cache_once
-def _jit_flashmla_q8kv8_module() -> Module:
+def _jit_sparse_mla_q8kv8_prefill_module() -> Module:
     extra_include_paths = _resolve_cutlass_include_paths()
     if not extra_include_paths:
         raise RuntimeError(
@@ -123,9 +123,9 @@ def _jit_flashmla_q8kv8_module() -> Module:
 
     with override_jit_cuda_arch(9, 0, "a"):
         return load_jit(
-            "flashmla_q8kv8_sparse_prefill",
+            "sparse_mla_q8kv8_prefill_sm90",
             cuda_files=[
-                "flashmla_q8kv8_sparse_prefill/entry.cuh",
+                "sparse_mla_q8kv8_prefill_sm90/entry.cuh",
             ],
             cuda_wrappers=[
                 ("dispatch", "sparse_prefill_q8kv8_dispatch"),
@@ -144,7 +144,7 @@ _resolved_entries: Optional[tuple] = None
 def _get_entries() -> tuple:
     global _resolved_entries
     if _resolved_entries is None:
-        m = _jit_flashmla_q8kv8_module()
+        m = _jit_sparse_mla_q8kv8_prefill_module()
         _resolved_entries = (
             m["dispatch"],
             m["dispatch_full"],
@@ -180,7 +180,7 @@ def _q8kv8_get_outbufs(s_q: int, h_q: int, d_v: int, device: torch.device):
     return out[:s_q], max_logits[:s_q], lse[:s_q]
 
 
-def flash_mla_sparse_q8kv8_fwd(
+def sparse_mla_q8kv8_prefill_fwd(
     q: torch.Tensor,  # [s_q, h_q, d_qk], float8_e4m3fn
     kv: torch.Tensor,  # [s_kv, h_kv, d_qk], float8_e4m3fn
     indices: torch.Tensor,  # [s_q, h_kv, topk], int32

@@ -4,7 +4,7 @@
 #include <cstdint>
 #include <cuda_runtime.h>
 
-struct SparseAttnFwdQ8SM90NewParams {
+struct SparseMlaQ8Kv8PrefillParams {
   int s_q, s_kv, h_q, h_kv, d_qk, d_v, topk;
   float sm_scale_div_log2;
 
