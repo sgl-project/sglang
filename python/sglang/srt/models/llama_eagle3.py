@@ -50,11 +50,11 @@ class LlamaDecoderLayer(LlamaDecoderLayer):
     ) -> None:
         super().__init__(config, layer_id, quant_config, prefix)
 
-        # EAGLE3's first layer concatenates input embeddings with hidden states, but
-        # inner layers don't need input embeddings, so only the first layer needs to
-        # adjust the qkv projection dimensions.
-        hidden_size = 2 * self.hidden_size if layer_id == 0 else self.hidden_size
-        self.layer_id = layer_id
+        # The input layer consumes concat(embeds, target_hidden_states); inner
+        # layers take only the previous layer's output. Adjust qkv input dim
+        # accordingly.
+        self.is_input_layer = layer_id == 0
+        hidden_size = 2 * self.hidden_size if self.is_input_layer else self.hidden_size
 
         # override qkv
         self.self_attn.qkv_proj = QKVParallelLinear(
@@ -87,8 +87,8 @@ class LlamaDecoderLayer(LlamaDecoderLayer):
         residual: Optional[torch.Tensor],
     ) -> Tuple[torch.Tensor, torch.Tensor]:
 
-        if self.layer_id == 0:
-            # Layer 0 receives target-model hidden states; no carried residual to fuse.
+        if self.is_input_layer:
+            # Input layer consumes target hidden states; no carried residual to fuse.
             residual = hidden_states
             hidden_states = self.hidden_norm(hidden_states)
             embeds = self.input_layernorm(embeds)
