@@ -881,6 +881,13 @@
         "cooldown_interval_minutes": 60,
         "reason": "custom override"
     },
+    "minosfuture": {
+        "can_tag_run_ci_label": true,
+        "can_rerun_failed_ci": true,
+        "can_rerun_stage": true,
+        "cooldown_interval_minutes": 60,
+        "reason": "custom override"
+    },
     "mmangkad": {
         "can_tag_run_ci_label": true,
         "can_rerun_failed_ci": true,
