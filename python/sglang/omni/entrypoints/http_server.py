@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import argparse
 from contextlib import asynccontextmanager
-from typing import Any, Callable
+from typing import TYPE_CHECKING, Any, Callable
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import ORJSONResponse
@@ -19,6 +19,9 @@ from sglang.omni.coordinator import OmniCoordinator
 from sglang.omni.protocol import OmniRequest
 from sglang.omni.serialization import serialize_response
 from sglang.version import __version__
+
+if TYPE_CHECKING:
+    from sglang.srt.managers.scheduler import Scheduler
 
 
 @asynccontextmanager
@@ -69,7 +72,7 @@ def create_app(
 
 def create_sensenova_u1_app(
     *,
-    scheduler: Any,
+    scheduler: "Scheduler",
     server_args: Any,
     srt_request_executor: Any | None = None,
     srt_ar_decode_max_new_tokens: int | None = None,

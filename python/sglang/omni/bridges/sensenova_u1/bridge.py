@@ -8,7 +8,7 @@ orchestration lives in `sglang.omni`.
 
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from sglang.srt.omni_session.model_policy import (
     OmniSessionModelPolicy,
@@ -54,6 +54,9 @@ from sglang.omni.bridges.sensenova_u1.context import (
 )
 from sglang.srt.omni_session.srt_executor import OmniSRTSchedulerExecutor
 
+if TYPE_CHECKING:
+    from sglang.srt.managers.scheduler import Scheduler
+
 
 @dataclass(frozen=True, slots=True)
 class _U1ConditionPathSessionView:
@@ -63,7 +66,7 @@ class _U1ConditionPathSessionView:
 
 def build_sensenova_u1_srt_bridge(
     *,
-    scheduler: Any,
+    scheduler: "Scheduler",
     srt_request_executor: Any | None = None,
     srt_ar_decode_max_new_tokens: int | None = None,
 ) -> "U1SRTBackedOmniSessionBridge":

@@ -89,10 +89,8 @@ class SRTBackedContextOps(ContextOps):
         generation_query_embeds: Any,
         timestep: Any,
     ) -> Any:
-        return self.bridge.runtime.srt_request_executor.build_temporary_context_forward_batch_for_session(
-            prepared=prepared,
-            generation_query_embeds=generation_query_embeds,
-            timestep=timestep,
+        return self.bridge.runtime.srt_request_executor.build_temporary_context_forward_batch(
+            prepared=prepared
         )
 
 

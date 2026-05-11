@@ -49,6 +49,7 @@ class SenseNovaU1PixelFlowPrepared:
     gen_grid_hw: Any
     timesteps: Any
     cfg: SenseNovaU1PixelFlowCFG
+    commit_generated_image: bool
     condition: SenseNovaU1PixelFlowForwardContext
     img_condition: SenseNovaU1PixelFlowForwardContext | None
     uncondition: SenseNovaU1PixelFlowForwardContext | None
@@ -161,6 +162,9 @@ class SenseNovaU1PixelFlowStage(PipelineStage):
         steps = int(getattr(sampling_params, "num_inference_steps", None) or 0)
         if steps <= 0:
             raise ValueError(f"num_inference_steps must be positive, got {steps}")
+        commit_generated_image = (
+            getattr(sampling_params, "omni_generation_mode", None) == "interleave"
+        )
 
         device = _model_device(model)
         dtype = _model_dtype(model)
@@ -230,6 +234,7 @@ class SenseNovaU1PixelFlowStage(PipelineStage):
             gen_grid_hw=gen_grid_hw,
             timesteps=timesteps,
             cfg=cfg,
+            commit_generated_image=commit_generated_image,
             condition=condition,
             img_condition=img_condition,
             uncondition=uncondition,
@@ -445,11 +450,13 @@ class SenseNovaU1PixelFlowStage(PipelineStage):
             .numpy()
         )
         image = Image.fromarray((array * 255.0).round().astype(np.uint8), "RGB")
-        commit_image = {
-            "pixel_values": image_prediction.detach().to(torch.bfloat16).cpu(),
-            "value_range": "minus_one_to_one",
-            "grid_hw": prepared.gen_grid_hw[:1].detach().cpu(),
-        }
+        commit_image = None
+        if prepared.commit_generated_image:
+            commit_image = {
+                "pixel_values": image_prediction.detach().to(torch.bfloat16).cpu(),
+                "value_range": "minus_one_to_one",
+                "grid_hw": prepared.gen_grid_hw[:1].detach().cpu(),
+            }
         cfg = prepared.cfg
         return SenseNovaU1GeneratedSegment(
             type="image",
@@ -595,16 +602,24 @@ def _build_forward_context(
     device: Any,
 ) -> SenseNovaU1PixelFlowForwardContext:
     position_count = int(context.position_count)
+    extend_num_tokens = token_h * token_w
     indexes_image = _build_t2i_image_indexes(
         token_h=token_h,
         token_w=token_w,
         text_len=position_count,
         device=device,
     )
+    # temporary-context attention shape is stable for all denoise steps in one branch
+    cross_attention_custom_mask = torch.ones(
+        extend_num_tokens * (position_count + extend_num_tokens),
+        dtype=torch.bool,
+        device=device,
+    )
     prepared = TemporaryForwardPrepared(
         generation_input={
             "packed_seqlens": packed_seqlens,
             "packed_position_ids": indexes_image,
+            "cross_attention_custom_mask": cross_attention_custom_mask,
         },
         srt_session_id=context.session_id,
         condition_path_role=context.condition_path_role,

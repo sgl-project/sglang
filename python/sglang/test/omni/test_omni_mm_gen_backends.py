@@ -6,8 +6,12 @@ from types import SimpleNamespace
 from sglang.multimodal_gen.configs.sample.sensenova_u1 import (
     build_sensenova_u1_sampling_params,
 )
-from sglang.omni.mm_gen.pipeline_executor import PipelineExecutorBackend
-from sglang.omni.mm_gen.pipeline_forward import DirectPipelineForwardBackend
+from sglang.omni.backends.mm_gen.pipeline_executor_backend import (
+    PipelineExecutorBackend,
+)
+from sglang.omni.backends.mm_gen.pipeline_forward_backend import (
+    DirectPipelineForwardBackend,
+)
 from sglang.omni.protocol import GeneratedSegment, OmniInputSegment, OmniRequest
 
 

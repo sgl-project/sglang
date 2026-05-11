@@ -7,7 +7,10 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any
 
-from sglang.omni.mm_gen.pipeline_forward import (
+from sglang.multimodal_gen.runtime.pipelines_core.executors.pipeline_executor import (
+    PipelineExecutor,
+)
+from sglang.omni.backends.mm_gen.pipeline_forward_backend import (
     build_pipeline_req,
     coerce_generated_segment,
 )
@@ -21,14 +24,14 @@ from sglang.omni.protocol import (
 
 @dataclass(slots=True)
 class PipelineExecutorBackend(MultimodalGenerationBackend):
-    """Drive multimodal_gen stages through a PipelineExecutor.
+    """A backend that drives multimodal_gen stages through a multimodal_gen.PipelineExecutor.
 
     This is the boundary to use when omni stops calling a full pipeline object
     directly and lets a diffusion-serving runtime own stage scheduling,
     parallelism, and component residency.
     """
 
-    executor: Any
+    executor: PipelineExecutor
     stages: Sequence[Any]
     server_args: Any
 

@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
+from collections import deque
 from types import SimpleNamespace
 
 from sglang.srt.omni_session.srt_executor import OmniSRTSchedulerExecutor
@@ -63,6 +64,16 @@ def test_sync_execute_restores_outer_scheduler_batch_state():
     assert scheduler.cur_batch is None
 
 
+def test_temporary_context_idle_check_skips_cleanup_when_already_idle():
+    scheduler = _FakeScheduler()
+    scheduler.cur_batch = _FakeBatch([])
+    executor = OmniSRTSchedulerExecutor(scheduler)
+
+    executor._check_scheduler_idle_for_temporary_context()
+
+    assert scheduler.cleanup_steps == 0
+
+
 class _FakeScheduler:
     def __init__(self):
         self.session_controller = object()
@@ -71,7 +82,11 @@ class _FakeScheduler:
         self.cur_batch = _FakeBatch([_FakeReq(finished=False)])
         self.waiting_queue = []
         self.grammar_manager = _FakeGrammarManager()
+        self.result_queue = deque()
         self.cleanup_steps = 0
+
+    def init_req_max_new_tokens(self, req):
+        pass
 
     def is_fully_idle(self):
         return (
@@ -89,10 +104,14 @@ class _FakeScheduler:
     def on_idle(self):
         pass
 
+    def process_batch_result(self, batch, result):
+        pass
+
 
 class _FakeBatch:
     def __init__(self, reqs):
         self.reqs = reqs
+        self.batch_is_full = False
 
     def is_empty(self):
         return not self.reqs
@@ -106,6 +125,12 @@ class _FakeReq:
         self._finished = finished
         self.rid = "r0"
         self.sampling_params = SimpleNamespace(max_new_tokens=max_new_tokens)
+        self.session = None
+        self.req_pool_idx = None
+        self.kv_committed_len = 0
+        self.custom_position_ids = None
+        self.custom_decode_position_id = None
+        self.omni_srt_position_count = None
 
     def finished(self):
         return self._finished

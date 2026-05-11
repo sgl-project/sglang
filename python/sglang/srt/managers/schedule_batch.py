@@ -634,6 +634,9 @@ class Req(ReqDllmMixin):
         self.positional_embed_overrides = positional_embed_overrides
         self.multi_item_delimiter_indices = multi_item_delimiter_indices
         self.attention_math_mode: Optional[str] = None
+        self.custom_position_ids: Any | None = None
+        self.custom_decode_position_id: Optional[int] = None
+        self.omni_srt_position_count: Optional[int] = None
 
         # For req-level memory management
         self.kv_committed_len = 0
@@ -1746,7 +1749,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         has_replace_embeds = False
         custom_position_ids = []
         has_custom_position_ids = any(
-            getattr(req, "custom_position_ids", None) is not None for req in reqs
+            req.custom_position_ids is not None for req in reqs
         )
         self.attention_math_mode = _resolve_attention_math_mode(reqs)
         input_id_pointer = 0
@@ -1814,7 +1817,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     )
                     all_replace_positions.extend(positions)
 
-            req_custom_position_ids = getattr(req, "custom_position_ids", None)
+            req_custom_position_ids = req.custom_position_ids
             if req_custom_position_ids is not None:
                 custom_position_ids.extend(
                     req_custom_position_ids[pre_len : pre_len + req.extend_input_len]
@@ -2318,17 +2321,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.custom_position_ids = None
         self.custom_decode_position_ids = None
         self.attention_math_mode = _resolve_attention_math_mode(self.reqs)
-        decode_position_ids = [
-            getattr(req, "custom_decode_position_id", None) for req in self.reqs
-        ]
+        decode_position_ids = [req.custom_decode_position_id for req in self.reqs]
         if any(position is not None for position in decode_position_ids):
             if self.seq_lens_cpu is not None:
                 fallback_positions = [int(seq_len) - 1 for seq_len in self.seq_lens_cpu]
             else:
-                fallback_positions = [
-                    int(getattr(req, "seqlen", len(req.origin_input_ids))) - 1
-                    for req in self.reqs
-                ]
+                fallback_positions = [int(req.seqlen) - 1 for req in self.reqs]
             self.custom_decode_position_ids = torch.tensor(
                 [
                     int(position) if position is not None else fallback_position

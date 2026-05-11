@@ -25,7 +25,7 @@ from sglang.omni.protocol import (
 
 @dataclass(slots=True)
 class DirectPipelineForwardBackend(MultimodalGenerationBackend):
-    """Call ``ComposedPipelineBase.forward`` directly from omni orchestration."""
+    """A backend that calls ``ComposedPipelineBase.forward`` directly from omni orchestration."""
 
     pipeline: ComposedPipelineBase
     server_args: Any

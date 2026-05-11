@@ -8,12 +8,17 @@ import json
 import os
 import shlex
 from dataclasses import replace
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from sglang.omni.backends.ar.srt import SRTARBackend
 from sglang.omni.coordinator import OmniCoordinator
-from sglang.omni.mm_gen.pipeline_forward import DirectPipelineForwardBackend
+from sglang.omni.backends.mm_gen.pipeline_forward_backend import (
+    DirectPipelineForwardBackend,
+)
 from sglang.omni.protocol import OmniRequest
+
+if TYPE_CHECKING:
+    from sglang.srt.managers.scheduler import Scheduler
 
 _MODE_ALIASES = {
     "text_to_image": "t2i",
@@ -96,7 +101,7 @@ def build_sensenova_u1_orchestrator(
 
 def build_sensenova_u1_orchestrator_from_scheduler(
     *,
-    scheduler: Any,
+    scheduler: "Scheduler",
     srt_request_executor: Any | None = None,
     srt_ar_decode_max_new_tokens: int | None = None,
     generation_backend: Any | None = None,

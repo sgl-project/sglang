@@ -57,6 +57,13 @@ class TestSenseNovaU1PixelFlow(unittest.TestCase):
         )
         self.assertEqual(7, prepared.seed)
         self.assertEqual((1, 3, 16, 16), tuple(prepared.image_prediction.shape))
+        self.assertFalse(prepared.commit_generated_image)
+        mask = prepared.condition.prepared.generation_input[
+            "cross_attention_custom_mask"
+        ]
+        self.assertEqual(torch.bool, mask.dtype)
+        self.assertEqual(16 * (5 + 16), int(mask.numel()))
+        self.assertTrue(bool(mask.all()))
 
     def test_edit_cfg_uses_image_condition_path(self):
         params = build_sensenova_u1_sampling_params(
@@ -78,6 +85,31 @@ class TestSenseNovaU1PixelFlow(unittest.TestCase):
         self.assertEqual("u1_edit_img_condition", img_condition.condition_path_role)
         self.assertEqual(8, img_condition.position_count)
         self.assertIsNone(uncondition)
+
+    def test_interleave_prepare_keeps_generated_image_commit(self):
+        params = build_sensenova_u1_sampling_params(
+            {
+                "width": 16,
+                "height": 16,
+                "num_inference_steps": 1,
+            }
+        )
+        params.omni_generation_mode = "interleave"
+        batch = Req(sampling_params=params, prompt="draw")
+        stage = SenseNovaU1PixelFlowStage()
+
+        prepared = stage._prepare(
+            model=_FakeModel(),
+            context_metadata={},
+            batch=batch,
+            u1_context=SimpleNamespace(
+                session_id="s0",
+                condition_path_role=None,
+                position_count=5,
+            ),
+        )
+
+        self.assertTrue(prepared.commit_generated_image)
 
 
 class _FakeModel:

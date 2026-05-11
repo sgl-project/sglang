@@ -5,14 +5,27 @@ This module is the execution boundary where omni_session borrows SRT internals:
 it can enqueue small session requests and build temporary query batches that
 read committed SRT KV cache without permanently appending generation query tokens.
 """
+from sglang.srt.mem_cache.common import evict_from_tree_cache
 
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 
 from sglang.omni.protocol import TemporaryForwardPrepared
 from sglang.srt.omni_session.runtime_protocol import OmniSRTKVTokenBinding
+
+if TYPE_CHECKING:
+    from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+    from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
+    from sglang.srt.managers.scheduler import Scheduler
+    from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
+    from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
+    from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+    from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+    from sglang.srt.model_executor.model_runner import ModelRunner
+    from sglang.srt.omni_session.runtime import OmniSessionRecord
+    from sglang.srt.session.streaming_session import SessionSlot
 
 
 class OmniSRTSchedulerExecutorError(RuntimeError):
@@ -24,18 +37,18 @@ class OmniSRTTemporaryReqSlot:
     req_pool_idx: int | None = None
     kv_committed_len: int = 0
     is_chunked: int = 0
-    mamba_pool_idx: Any | None = None
-    mamba_ping_pong_track_buffer: Any | None = None
-    mamba_next_track_idx: Any | None = None
+    mamba_pool_idx: torch.Tensor | None = None
+    mamba_ping_pong_track_buffer: torch.Tensor | None = None
+    mamba_next_track_idx: int | None = None
 
 
 @dataclass
 class OmniSRTTemporaryForwardBatch:
     """ForwardBatch wrapper that releases temporary context-query scheduler state."""
 
-    forward_batch: Any
-    req_to_token_pool: Any
-    token_to_kv_pool_allocator: Any
+    forward_batch: "ForwardBatch"
+    req_to_token_pool: "ReqToTokenPool"
+    token_to_kv_pool_allocator: "BaseTokenToKVPoolAllocator"
     temp_req: OmniSRTTemporaryReqSlot
     out_cache_loc: torch.Tensor
     owned_cache_loc: torch.Tensor | None = None
@@ -46,6 +59,7 @@ class OmniSRTTemporaryForwardBatch:
             return
         self.released = True
         try:
+            # 4. release temporary query KV after the denoise forward
             if self.owned_cache_loc is not None:
                 self.token_to_kv_pool_allocator.free(self.owned_cache_loc)
         finally:
@@ -60,14 +74,6 @@ class OmniSRTTemporaryForwardBatch:
                 self.req_to_token_pool.free(self.temp_req)
 
 
-@dataclass(frozen=True, slots=True)
-class OmniSRTBoundTemporaryForwardPrepared:
-    generation_input: dict[str, Any]
-    srt_session_id: str
-    condition_path_role: str | None
-    srt_kv_token_binding: OmniSRTKVTokenBinding
-
-
 class OmniSRTSchedulerExecutor:
     """Execute materialized omni session requests through the SRT scheduler.
 
@@ -80,17 +86,17 @@ class OmniSRTSchedulerExecutor:
 
     def __init__(
         self,
-        scheduler: Any,
+        scheduler: "Scheduler",
         *,
         run_synchronously: bool = True,
         max_sync_steps: int = 8,
         require_idle_scheduler: bool = True,
     ) -> None:
-        if not hasattr(scheduler, "session_controller"):
+        if scheduler.session_controller is None:
             raise ValueError(
                 "OmniSRTSchedulerExecutor requires scheduler.session_controller"
             )
-        self.scheduler = scheduler
+        self.scheduler: Scheduler = scheduler
         # synchronous mode keeps omni AR/session state updated before mm-gen runs.
         self.run_synchronously = run_synchronously
         self.max_sync_steps = max_sync_steps
@@ -105,14 +111,11 @@ class OmniSRTSchedulerExecutor:
     def session_controller(self):
         return self.scheduler.session_controller
 
-    def execute_omni_request(self, *, record, req, state) -> None:
+    def execute_omni_request(
+        self, *, record: "OmniSessionRecord", req: "Req", state: object | None
+    ) -> None:
         self._check_scheduler_idle(req)
-        if hasattr(self.scheduler, "init_req_max_new_tokens"):
-            self.scheduler.init_req_max_new_tokens(req)
-        if not hasattr(self.scheduler, "_add_request_to_queue"):
-            raise ValueError(
-                "OmniSRTSchedulerExecutor requires scheduler._add_request_to_queue"
-            )
+        self.scheduler.init_req_max_new_tokens(req)
         self.scheduler._add_request_to_queue(req)
         if self.run_synchronously:
             self._run_until_request_complete(req)
@@ -124,9 +127,9 @@ class OmniSRTSchedulerExecutor:
     def get_request_token_binding(
         self,
         *,
-        record,
-        req,
-        state,
+        record: "OmniSessionRecord",
+        req: "Req",
+        state: object | None,
     ) -> OmniSRTKVTokenBinding | None:
         binding = self._request_token_bindings.get(req.rid)
         if binding is not None:
@@ -145,7 +148,7 @@ class OmniSRTSchedulerExecutor:
     def get_srt_model(self) -> Any:
         """Return the SRT model owned by the attached scheduler's ModelRunner."""
         model_runner = self._require_model_runner()
-        srt_model = getattr(model_runner, "model", None)
+        srt_model = model_runner.model
         if srt_model is None:
             raise OmniSRTSchedulerExecutorError(
                 "omni SRT executor requires model_runner.model"
@@ -163,10 +166,9 @@ class OmniSRTSchedulerExecutor:
         )
         if binding is None:
             return None
-        position_count = getattr(binding, "position_count", None)
-        if position_count is not None:
-            return int(position_count)
-        return int(getattr(binding, "token_count"))
+        if binding.position_count is not None:
+            return int(binding.position_count)
+        return int(binding.token_count)
 
     def get_latest_session_token_binding(
         self,
@@ -179,19 +181,37 @@ class OmniSRTSchedulerExecutor:
 
     def pad_input_ids(self, input_ids: list[int], mm_inputs: Any) -> list[int]:
         model_runner = self._require_model_runner()
-        srt_model = getattr(model_runner, "model", None)
+        srt_model = model_runner.model
         pad_input_ids = getattr(srt_model, "pad_input_ids", None)
         if not callable(pad_input_ids):
             return list(input_ids)
         return pad_input_ids(list(input_ids), mm_inputs)
 
-    def build_temporary_context_forward_batch_for_session(
+    def build_temporary_context_forward_batch(
         self,
         *,
         prepared: TemporaryForwardPrepared,
-        generation_query_embeds: torch.Tensor,
-        timestep: torch.Tensor,
     ) -> OmniSRTTemporaryForwardBatch:
+        """build a temporary extend batch that reads a committed SRT context
+
+        This is required by cocolated omni model (like U1) which needs to access KV cache from srt seesion
+        """
+
+        self._check_scheduler_idle_for_temporary_context()
+        model_runner: ModelRunner = self._require_model_runner()
+        req_to_token_pool = model_runner.req_to_token_pool
+        if req_to_token_pool is None:
+            raise OmniSRTSchedulerExecutorError(
+                "Temporary context forward requires model_runner.req_to_token_pool"
+            )
+        token_to_kv_pool_allocator = model_runner.token_to_kv_pool_allocator
+        if token_to_kv_pool_allocator is None:
+            raise OmniSRTSchedulerExecutorError(
+                "Temporary context forward requires model_runner.token_to_kv_pool_allocator"
+            )
+        attn_backend = model_runner.attn_backend
+
+        # 2. borrow committed context KV as prefix for a denoise query
         binding_session_id = self._binding_session_id(
             prepared.srt_session_id,
             prepared.condition_path_role,
@@ -202,51 +222,6 @@ class OmniSRTSchedulerExecutor:
                 "Temporary context forward has no SRT KV token binding for session "
                 f"{binding_session_id}"
             )
-        prepared_with_binding = OmniSRTBoundTemporaryForwardPrepared(
-            generation_input=prepared.generation_input,
-            srt_session_id=prepared.srt_session_id,
-            condition_path_role=prepared.condition_path_role,
-            srt_kv_token_binding=binding,
-        )
-        return self.build_temporary_context_forward_batch(
-            prepared=prepared_with_binding,
-            generation_query_embeds=generation_query_embeds,
-            timestep=timestep,
-        )
-
-    def build_temporary_context_forward_batch(
-        self,
-        *,
-        prepared: OmniSRTBoundTemporaryForwardPrepared,
-        generation_query_embeds: torch.Tensor,
-        timestep: torch.Tensor,
-    ) -> OmniSRTTemporaryForwardBatch:
-        """Build a temporary extend batch that reads a committed SRT context.
-
-        The batch reuses the session's committed KV indices as prefix context, but
-        allocates fresh request/query KV slots for this query and releases them as
-        soon as the caller returns.
-        """
-
-        self._check_scheduler_idle_for_temporary_context()
-        model_runner = self._require_model_runner()
-        req_to_token_pool = self._require_attr(
-            model_runner,
-            "req_to_token_pool",
-            "Temporary context forward requires model_runner.req_to_token_pool",
-        )
-        token_to_kv_pool_allocator = self._require_attr(
-            model_runner,
-            "token_to_kv_pool_allocator",
-            "Temporary context forward requires model_runner.token_to_kv_pool_allocator",
-        )
-        attn_backend = self._require_attr(
-            model_runner,
-            "attn_backend",
-            "Temporary context forward requires model_runner.attn_backend",
-        )
-
-        binding = prepared.srt_kv_token_binding
         prefix_indices = binding.token_indices
         if prefix_indices is None:
             raise OmniSRTSchedulerExecutorError(
@@ -265,6 +240,9 @@ class OmniSRTSchedulerExecutor:
         generation_input = prepared.generation_input
         packed_seqlens = generation_input.get("packed_seqlens")
         packed_position_ids = generation_input.get("packed_position_ids")
+        cross_attention_custom_mask = generation_input.get(
+            "cross_attention_custom_mask"
+        )
         if packed_seqlens is None or packed_position_ids is None:
             raise OmniSRTSchedulerExecutorError(
                 "Temporary context forward requires packed_seqlens and packed_position_ids"
@@ -288,7 +266,7 @@ class OmniSRTSchedulerExecutor:
                 "Temporary context forward packed_position_ids must match packed_seqlens"
             )
 
-        device = torch.device(getattr(model_runner, "device", req_to_token_pool.device))
+        device = torch.device(model_runner.device)
         prefix_indices = prefix_indices[:prefix_len].to(
             device=device,
             dtype=torch.int64,
@@ -297,13 +275,13 @@ class OmniSRTSchedulerExecutor:
         seq_len = prefix_len + extend_num_tokens
         self._check_context_capacity(req_to_token_pool, seq_len)
 
+        # 3. allocate temporary query KV without committing it to the session
         temp_req = self._alloc_temp_req_slot(req_to_token_pool)
         out_cache_loc = None
         owned_cache_loc = None
         context = None
         try:
             out_cache_loc, owned_cache_loc = self._alloc_temporary_context_cache(
-                model_runner=model_runner,
                 token_to_kv_pool_allocator=token_to_kv_pool_allocator,
                 prefix_indices=prefix_indices,
                 prefix_len=prefix_len,
@@ -331,6 +309,7 @@ class OmniSRTSchedulerExecutor:
                 seq_len=seq_len,
                 extend_num_tokens=extend_num_tokens,
                 binding=binding,
+                cross_attention_custom_mask=cross_attention_custom_mask,
                 device=device,
             )
             context = OmniSRTTemporaryForwardBatch(
@@ -342,9 +321,7 @@ class OmniSRTSchedulerExecutor:
                 owned_cache_loc=owned_cache_loc,
             )
             prepare_forward_batch = getattr(
-                getattr(model_runner, "model", None),
-                "prepare_forward_batch",
-                None,
+                model_runner.model, "prepare_forward_batch", None
             )
             if callable(prepare_forward_batch):
                 prepare_forward_batch(forward_batch)
@@ -361,15 +338,8 @@ class OmniSRTSchedulerExecutor:
                 self._free_temp_req_slot(req_to_token_pool, temp_req)
             raise
 
-    def _run_until_request_complete(self, req: Any) -> None:
-        self._require_scheduler_methods(
-            "get_next_batch_to_run",
-            "run_batch",
-            "process_batch_result",
-        )
-
-        has_last_batch = hasattr(self.scheduler, "last_batch")
-        previous_last_batch = getattr(self.scheduler, "last_batch", None)
+    def _run_until_request_complete(self, req: "Req") -> None:
+        previous_last_batch = self.scheduler.last_batch
         try:
             for _ in range(self._sync_step_budget(req)):
                 if req.finished():
@@ -388,35 +358,27 @@ class OmniSRTSchedulerExecutor:
                 )
             self._run_idle_cleanup()
         finally:
-            if has_last_batch:
-                self.scheduler.last_batch = previous_last_batch
+            self.scheduler.last_batch = previous_last_batch
 
-    def _run_scheduler_step(self):
+    def _run_scheduler_step(self) -> "ScheduleBatch | None":
         batch = self.scheduler.get_next_batch_to_run()
-        has_cur_batch = hasattr(self.scheduler, "cur_batch")
-        previous_cur_batch = getattr(self.scheduler, "cur_batch", None)
-        if has_cur_batch:
-            self.scheduler.cur_batch = batch
+        previous_cur_batch = self.scheduler.cur_batch
+        self.scheduler.cur_batch = batch
         try:
             if batch:
                 batch_sessions = self._batch_sessions(batch)
                 result = self.scheduler.run_batch(batch)
-                launch_sample = getattr(
-                    self.scheduler, "launch_batch_sample_if_needed", None
-                )
-                if callable(launch_sample):
-                    launch_sample(result)
+                self.scheduler.launch_batch_sample_if_needed(result)
                 self._capture_batch_token_bindings(batch)
+                # 1. submit context KV while processing a req
                 self.scheduler.process_batch_result(batch, result)
                 self._capture_session_token_bindings(batch_sessions)
                 self.sync_step_count += 1
-            elif hasattr(self.scheduler, "on_idle"):
+            else:
                 self.scheduler.on_idle()
-            if hasattr(self.scheduler, "last_batch"):
-                self.scheduler.last_batch = batch
+            self.scheduler.last_batch = batch
         finally:
-            if has_cur_batch:
-                self.scheduler.cur_batch = previous_cur_batch
+            self.scheduler.cur_batch = previous_cur_batch
         return batch
 
     def _run_idle_cleanup(self) -> None:
@@ -435,111 +397,86 @@ class OmniSRTSchedulerExecutor:
             if batch is None:
                 continue
 
-    def _sync_step_budget(self, req: Any) -> int:
-        sampling_params = getattr(req, "sampling_params", None)
-        max_new_tokens = int(getattr(sampling_params, "max_new_tokens", 0) or 0)
+    def _sync_step_budget(self, req: "Req") -> int:
+        max_new_tokens = int(req.sampling_params.max_new_tokens or 0)
         return max(self.max_sync_steps, max_new_tokens + 4)
 
     def _drain_overlap_result_queue(self) -> None:
-        result_queue = getattr(self.scheduler, "result_queue", None)
-        process_batch_result = getattr(self.scheduler, "process_batch_result", None)
-        if result_queue is None or not callable(process_batch_result):
-            return
         drained = False
-        while self._safe_len(result_queue) > 0:
-            batch, result = result_queue.popleft()
-            process_batch_result(batch, result)
+        while len(self.scheduler.result_queue) > 0:
+            batch, result = self.scheduler.result_queue.popleft()
+            self.scheduler.process_batch_result(batch, result)
             drained = True
-        if drained and hasattr(self.scheduler, "last_batch"):
+        if drained:
             self.scheduler.last_batch = None
 
     def _scheduler_fully_idle(self) -> bool:
-        is_fully_idle = getattr(self.scheduler, "is_fully_idle", None)
-        return bool(callable(is_fully_idle) and is_fully_idle())
+        return self.scheduler.is_fully_idle()
 
     def _scheduler_has_pending_requests(self) -> bool:
-        waiting_queue = getattr(self.scheduler, "waiting_queue", None)
-        if self._safe_len(waiting_queue) > 0:
+        if len(self.scheduler.waiting_queue) > 0:
             return True
-        grammar_manager = getattr(self.scheduler, "grammar_manager", None)
-        grammar_queue = getattr(grammar_manager, "grammar_queue", None)
-        return self._safe_len(grammar_queue) > 0
+        return len(self.scheduler.grammar_manager.grammar_queue) > 0
 
     def _scheduler_has_active_batches(self) -> bool:
-        for attr_name in ("last_batch", "running_batch", "cur_batch"):
-            batch = getattr(self.scheduler, attr_name, None)
+        for batch in (
+                self.scheduler.last_batch,
+                self.scheduler.running_batch,
+                self.scheduler.cur_batch,
+        ):
             if batch is None:
                 continue
-            if hasattr(batch, "is_empty") and batch.is_empty():
-                continue
-            reqs = getattr(batch, "reqs", None) or []
-            if not reqs:
+            if batch.is_empty():
                 continue
             return True
         return False
 
     def _scheduler_batches_all_finished(self) -> bool:
         saw_req = False
-        for attr_name in ("last_batch", "running_batch", "cur_batch"):
-            batch = getattr(self.scheduler, attr_name, None)
+        for batch in (
+                self.scheduler.last_batch,
+                self.scheduler.running_batch,
+                self.scheduler.cur_batch,
+        ):
             if batch is None:
                 continue
-            if hasattr(batch, "is_empty") and batch.is_empty():
+            if batch.is_empty():
                 continue
-            for req in getattr(batch, "reqs", None) or []:
+            for req in batch.reqs:
                 saw_req = True
-                finished = getattr(req, "finished", None)
-                if not callable(finished) or not finished():
+                if not req.finished():
                     return False
         return saw_req
 
     def _clear_finished_scheduler_batches(self) -> None:
-        for attr_name in ("last_batch", "cur_batch"):
-            batch = getattr(self.scheduler, attr_name, None)
-            if self._batch_all_finished(batch):
-                setattr(self.scheduler, attr_name, None)
-        running_batch = getattr(self.scheduler, "running_batch", None)
+        if self._batch_all_finished(self.scheduler.last_batch):
+            self.scheduler.last_batch = None
+        if self._batch_all_finished(self.scheduler.cur_batch):
+            self.scheduler.cur_batch = None
+        running_batch = self.scheduler.running_batch
         if self._batch_all_finished(running_batch):
-            filter_batch = getattr(running_batch, "filter_batch", None)
-            if callable(filter_batch):
-                filter_batch()
-            if hasattr(running_batch, "reqs"):
-                running_batch.reqs = []
-            if hasattr(running_batch, "batch_is_full"):
-                running_batch.batch_is_full = False
+            running_batch.filter_batch()
+            running_batch.reqs = []
+            running_batch.batch_is_full = False
 
     @staticmethod
-    def _batch_all_finished(batch: Any) -> bool:
+    def _batch_all_finished(batch: "ScheduleBatch | None") -> bool:
         if batch is None:
             return False
-        reqs = getattr(batch, "reqs", None) or []
-        if not reqs:
+        if not batch.reqs:
             return False
-        for req in reqs:
-            finished = getattr(req, "finished", None)
-            if not callable(finished) or not finished():
+        for req in batch.reqs:
+            if not req.finished():
                 return False
         return True
 
-    def _require_scheduler_methods(self, *method_names: str) -> None:
-        missing = [
-            method_name
-            for method_name in method_names
-            if not hasattr(self.scheduler, method_name)
-        ]
-        if missing:
-            raise OmniSRTSchedulerExecutorError(
-                "OmniSRTSchedulerExecutor synchronous mode requires scheduler methods: "
-                f"{missing}"
-            )
-
-    def _check_scheduler_idle(self, req: Any) -> None:
+    def _check_scheduler_idle(self, req: "Req") -> None:
         if not self.require_idle_scheduler:
+            return
+        if self.scheduler.is_fully_idle():
             return
         if self.run_synchronously:
             self._run_idle_cleanup()
-        if not hasattr(self.scheduler, "is_fully_idle"):
-            return
         if self.scheduler.is_fully_idle():
             return
         if self._scheduler_batches_all_finished():
@@ -559,10 +496,10 @@ class OmniSRTSchedulerExecutor:
     def _check_scheduler_idle_for_temporary_context(self) -> None:
         if not self.require_idle_scheduler:
             return
+        if self.scheduler.is_fully_idle():
+            return
         if self.run_synchronously:
             self._run_idle_cleanup()
-        if not hasattr(self.scheduler, "is_fully_idle"):
-            return
         if self.scheduler.is_fully_idle():
             return
         if self._scheduler_batches_all_finished():
@@ -581,36 +518,26 @@ class OmniSRTSchedulerExecutor:
 
     def _scheduler_idle_debug(self) -> str:
         parts = [
-            f"waiting={self._safe_len(getattr(self.scheduler, 'waiting_queue', None))}",
-            "grammar="
-            f"{self._safe_len(getattr(getattr(self.scheduler, 'grammar_manager', None), 'grammar_queue', None))}",
+            f"waiting={len(self.scheduler.waiting_queue)}",
+            f"grammar={len(self.scheduler.grammar_manager.grammar_queue)}",
         ]
-        for attr_name in ("last_batch", "running_batch", "cur_batch"):
-            batch = getattr(self.scheduler, attr_name, None)
+        for attr_name, batch in (
+                ("last_batch", self.scheduler.last_batch),
+                ("running_batch", self.scheduler.running_batch),
+                ("cur_batch", self.scheduler.cur_batch),
+        ):
             if batch is None:
                 parts.append(f"{attr_name}=None")
                 continue
-            is_empty = getattr(batch, "is_empty", None)
-            reqs = getattr(batch, "reqs", None) or []
             req_states = []
-            for req in reqs[:4]:
-                finished = getattr(req, "finished", None)
-                req_states.append(
-                    f"{getattr(req, 'rid', '<unknown>')}:{callable(finished) and finished()}"
-                )
+            for req in batch.reqs[:4]:
+                req_states.append(f"{req.rid}:{req.finished()}")
             parts.append(
-                f"{attr_name}(empty={callable(is_empty) and is_empty()}, reqs={req_states})"
+                f"{attr_name}(empty={batch.is_empty()}, reqs={req_states})"
             )
         return ", ".join(parts)
 
-    @staticmethod
-    def _safe_len(value: Any) -> int:
-        try:
-            return len(value) if value is not None else 0
-        except TypeError:
-            return 0
-
-    def _require_model_runner(self) -> Any:
+    def _require_model_runner(self) -> "ModelRunner":
         model_runner = self._model_runner()
         if model_runner is None:
             raise OmniSRTSchedulerExecutorError(
@@ -619,39 +546,33 @@ class OmniSRTSchedulerExecutor:
         return model_runner
 
     @staticmethod
-    def _require_attr(obj: Any, attr: str, message: str) -> Any:
-        value = getattr(obj, attr, None)
-        if value is None:
-            raise OmniSRTSchedulerExecutorError(message)
-        return value
-
-    @staticmethod
-    def _check_context_capacity(req_to_token_pool: Any, seq_len: int) -> None:
-        max_context_len = getattr(req_to_token_pool, "max_context_len", None)
-        if max_context_len is None:
-            return
-        if seq_len > int(max_context_len):
+    def _check_context_capacity(
+        req_to_token_pool: "ReqToTokenPool", seq_len: int
+    ) -> None:
+        if seq_len > int(req_to_token_pool.max_context_len):
             raise OmniSRTSchedulerExecutorError(
                 "Temporary context forward exceeds req_to_token_pool.max_context_len: "
-                f"{seq_len} > {max_context_len}"
+                f"{seq_len} > {req_to_token_pool.max_context_len}"
             )
 
-    def _model_runner(self) -> Any | None:
-        model_worker = getattr(self.scheduler, "model_worker", None)
-        model_runner = getattr(model_worker, "model_runner", None)
+    def _model_runner(self) -> "ModelRunner | None":
+        model_runner = self.scheduler.model_worker.model_runner
         if model_runner is not None:
             return model_runner
-        tp_worker = getattr(self.scheduler, "tp_worker", None)
-        return getattr(tp_worker, "model_runner", None)
+        return self.scheduler.tp_worker.model_runner
 
     @staticmethod
-    def _binding_session_id(session_id: str, condition_path_role: str | None = None) -> str:
+    def _binding_session_id(
+        session_id: str, condition_path_role: str | None = None
+    ) -> str:
         if condition_path_role is None:
             return session_id
         return f"{session_id}:{condition_path_role}"
 
     @staticmethod
-    def _alloc_temp_req_slot(req_to_token_pool: Any) -> OmniSRTTemporaryReqSlot:
+    def _alloc_temp_req_slot(
+        req_to_token_pool: "ReqToTokenPool",
+    ) -> OmniSRTTemporaryReqSlot:
         temp_req = OmniSRTTemporaryReqSlot()
         req_pool_indices = req_to_token_pool.alloc([temp_req])
         if req_pool_indices is None:
@@ -664,7 +585,7 @@ class OmniSRTSchedulerExecutor:
 
     @staticmethod
     def _free_temp_req_slot(
-        req_to_token_pool: Any,
+        req_to_token_pool: "ReqToTokenPool",
         temp_req: OmniSRTTemporaryReqSlot,
     ) -> None:
         free_mamba_cache = getattr(req_to_token_pool, "free_mamba_cache", None)
@@ -678,23 +599,23 @@ class OmniSRTSchedulerExecutor:
     def _alloc_temporary_context_cache(
         self,
         *,
-        model_runner: Any,
-        token_to_kv_pool_allocator: Any,
+        token_to_kv_pool_allocator: "BaseTokenToKVPoolAllocator",
         prefix_indices: torch.Tensor,
         prefix_len: int,
         seq_len: int,
         extend_num_tokens: int,
         device: torch.device,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        tree_cache = getattr(self.scheduler, "tree_cache", None)
-        page_size = int(
-            getattr(
-                tree_cache,
-                "page_size",
-                getattr(token_to_kv_pool_allocator, "page_size", 1),
-            )
-        )
+        """
+            extend_num_tokens: number of KV token required by the denoise query
+        """
+        tree_cache = self.scheduler.tree_cache
+        page_size = int(tree_cache.page_size)
+
+        # number of tokens after aligned with page size
         owned_num_tokens = self._ceil_to_page(extend_num_tokens, page_size)
+
+        # evict cache to make enough headroom for temporary query
         self._evict_for_temporary_context(
             tree_cache,
             extend_num_tokens=owned_num_tokens,
@@ -721,17 +642,11 @@ class OmniSRTSchedulerExecutor:
 
     @staticmethod
     def _evict_for_temporary_context(
-        tree_cache: Any,
+        tree_cache: "BasePrefixCache",
         *,
         extend_num_tokens: int,
         page_size: int,
     ) -> None:
-        if tree_cache is None:
-            return
-        if not hasattr(tree_cache, "evict"):
-            return
-        from sglang.srt.mem_cache.common import evict_from_tree_cache
-
         evict_from_tree_cache(
             tree_cache,
             extend_num_tokens + max(1, page_size),
@@ -740,7 +655,7 @@ class OmniSRTSchedulerExecutor:
     @staticmethod
     def _write_temp_req_token_mapping(
         *,
-        req_to_token_pool: Any,
+        req_to_token_pool: "ReqToTokenPool",
         req_pool_idx: int,
         prefix_indices: torch.Tensor,
         out_cache_loc: torch.Tensor,
@@ -750,6 +665,7 @@ class OmniSRTSchedulerExecutor:
         req_to_token = req_to_token_pool.req_to_token
         pool_device = req_to_token.device
         pool_dtype = req_to_token.dtype
+        # 2. expose committed context KV through req_to_token
         if prefix_len > 0:
             req_to_token_pool.write(
                 (req_pool_idx, slice(0, prefix_len)),
@@ -759,6 +675,7 @@ class OmniSRTSchedulerExecutor:
                     non_blocking=True,
                 ),
             )
+        # 3. expose temporary query KV through req_to_token
         req_to_token_pool.write(
             (req_pool_idx, slice(prefix_len, seq_len)),
             out_cache_loc.to(device=pool_device, dtype=pool_dtype, non_blocking=True),
@@ -767,10 +684,10 @@ class OmniSRTSchedulerExecutor:
     @staticmethod
     def _make_temporary_context_forward_batch(
         *,
-        model_runner: Any,
-        req_to_token_pool: Any,
-        token_to_kv_pool_allocator: Any,
-        attn_backend: Any,
+        model_runner: "ModelRunner",
+        req_to_token_pool: "ReqToTokenPool",
+        token_to_kv_pool_allocator: "BaseTokenToKVPoolAllocator",
+        attn_backend: "AttentionBackend",
         req_pool_idx: int,
         out_cache_loc: torch.Tensor,
         packed_position_ids: torch.Tensor,
@@ -778,8 +695,10 @@ class OmniSRTSchedulerExecutor:
         seq_len: int,
         extend_num_tokens: int,
         binding: OmniSRTKVTokenBinding,
+        cross_attention_custom_mask: torch.Tensor | None,
         device: torch.device,
-    ) -> Any:
+    ) -> "ForwardBatch":
+        """adapt a diffusion denoise query into an SRT ForwardBatch"""
         from sglang.srt.model_executor.forward_batch_info import (
             CaptureHiddenMode,
             ForwardBatch,
@@ -805,10 +724,10 @@ class OmniSRTSchedulerExecutor:
             dtype=torch.int64,
             non_blocking=True,
         )
-        token_to_kv_pool = getattr(model_runner, "token_to_kv_pool", None)
+        token_to_kv_pool = model_runner.token_to_kv_pool
         if token_to_kv_pool is None:
-            get_kvcache = getattr(token_to_kv_pool_allocator, "get_kvcache", None)
-            token_to_kv_pool = get_kvcache() if callable(get_kvcache) else None
+            token_to_kv_pool = token_to_kv_pool_allocator.get_kvcache()
+        # 3. reuse SRT cache pool, attention backend, and position/mask semantics
         forward_batch = ForwardBatch(
             forward_mode=ForwardMode.EXTEND,
             batch_size=1,
@@ -830,7 +749,7 @@ class OmniSRTSchedulerExecutor:
             req_to_token_pool=req_to_token_pool,
             token_to_kv_pool=token_to_kv_pool,
             attn_backend=attn_backend,
-            spec_algorithm=getattr(model_runner, "spec_algorithm", None),
+            spec_algorithm=model_runner.spec_algorithm,
             spec_info=None,
             capture_hidden_mode=CaptureHiddenMode.NULL,
             num_token_non_padded=torch.tensor(
@@ -855,39 +774,48 @@ class OmniSRTSchedulerExecutor:
             "attention_mode": "full_query",
             "attention_mask_shape": (extend_num_tokens, seq_len),
         }
-        forward_batch.cross_attention_custom_mask = torch.ones(
-            extend_num_tokens * seq_len,
-            dtype=torch.bool,
+        if cross_attention_custom_mask is None:
+            cross_attention_custom_mask = torch.ones(
+                extend_num_tokens * seq_len,
+                dtype=torch.bool,
+                device=device,
+            )
+        elif int(cross_attention_custom_mask.numel()) != extend_num_tokens * seq_len:
+            raise OmniSRTSchedulerExecutorError(
+                "Temporary context forward custom mask has inconsistent size: "
+                f"{int(cross_attention_custom_mask.numel())} != "
+                f"{extend_num_tokens * seq_len}"
+            )
+        forward_batch.cross_attention_custom_mask = cross_attention_custom_mask.to(
             device=device,
+            dtype=torch.bool,
+            non_blocking=True,
         )
         return forward_batch
 
-    def _request_token_indices(self, record: Any, req: Any) -> torch.Tensor | None:
-        tree_cache = getattr(self.scheduler, "tree_cache", None)
-        if tree_cache is None:
-            return None
-        req_to_token_pool = getattr(tree_cache, "req_to_token_pool", None)
-        req_to_token = getattr(req_to_token_pool, "req_to_token", None)
-        if req_to_token is None:
-            return None
+    def _request_token_indices(
+        self, record: "OmniSessionRecord", req: "Req"
+    ) -> torch.Tensor | None:
+        tree_cache = self.scheduler.tree_cache
+        req_to_token = tree_cache.req_to_token_pool.req_to_token
 
-        pool_idx = getattr(req, "req_pool_idx", None)
-        token_count = int(getattr(req, "kv_committed_len", 0) or 0)
+        pool_idx = req.req_pool_idx
+        token_count = int(req.kv_committed_len or 0)
         if pool_idx is None or token_count <= 0:
             slot = self._streaming_session_slot(tree_cache, record.session_id)
             if slot is None:
                 return None
-            pool_idx = getattr(slot, "req_pool_idx", None)
-            token_count = int(getattr(slot, "kv_committed_len", 0) or 0)
+            pool_idx = slot.req_pool_idx
+            token_count = int(slot.kv_committed_len or 0)
         if pool_idx is None or token_count <= 0:
             return None
 
         token_indices = req_to_token[pool_idx, :token_count].to(dtype=torch.int64)
         return token_indices.clone()
 
-    def _capture_batch_token_bindings(self, batch: Any) -> None:
-        for req in getattr(batch, "reqs", []) or []:
-            session = getattr(req, "session", None)
+    def _capture_batch_token_bindings(self, batch: "ScheduleBatch") -> None:
+        for req in batch.reqs:
+            session = req.session
             if session is None:
                 continue
             session_id = session.session_id
@@ -904,17 +832,19 @@ class OmniSRTSchedulerExecutor:
             self._request_token_bindings[req.rid] = binding
             self.token_bindings.append(binding)
 
-    def _batch_sessions(self, batch: Any) -> list[tuple[str, str, int | None]]:
+    def _batch_sessions(
+        self, batch: "ScheduleBatch"
+    ) -> list[tuple[str, str, int | None]]:
         sessions: list[tuple[str, str, int | None]] = []
-        for req in getattr(batch, "reqs", []) or []:
-            session = getattr(req, "session", None)
+        for req in batch.reqs:
+            session = req.session
             if session is None:
                 continue
             session_id = session.session_id
             sessions.append(
                 (
                     str(session_id),
-                    str(getattr(req, "rid", "")),
+                    str(req.rid),
                     self._request_position_count(req),
                 )
             )
@@ -941,60 +871,55 @@ class OmniSRTSchedulerExecutor:
     def _request_token_indices_for_session(
         self, session_id: str
     ) -> torch.Tensor | None:
-        tree_cache = getattr(self.scheduler, "tree_cache", None)
-        if tree_cache is None:
-            return None
-        req_to_token_pool = getattr(tree_cache, "req_to_token_pool", None)
-        req_to_token = getattr(req_to_token_pool, "req_to_token", None)
+        tree_cache = self.scheduler.tree_cache
+        req_to_token = tree_cache.req_to_token_pool.req_to_token
         slot = self._streaming_session_slot(tree_cache, session_id)
-        if req_to_token is None or slot is None:
+        if slot is None:
             return None
-        pool_idx = getattr(slot, "req_pool_idx", None)
-        token_count = int(getattr(slot, "kv_committed_len", 0) or 0)
+        pool_idx = slot.req_pool_idx
+        token_count = int(slot.kv_committed_len or 0)
         if pool_idx is None or token_count <= 0:
             return None
         return req_to_token[pool_idx, :token_count].to(dtype=torch.int64).clone()
 
-    def _request_token_indices_for_active_req(self, req: Any) -> torch.Tensor | None:
-        tree_cache = getattr(self.scheduler, "tree_cache", None)
-        if tree_cache is None:
-            return None
-        req_to_token_pool = getattr(tree_cache, "req_to_token_pool", None)
-        req_to_token = getattr(req_to_token_pool, "req_to_token", None)
-        pool_idx = getattr(req, "req_pool_idx", None)
-        token_count = int(getattr(req, "kv_committed_len", 0) or 0)
-        if (pool_idx is None or token_count <= 0) and getattr(req, "session", None):
-            session_id = getattr(req.session, "session_id", None)
-            slot = self._streaming_session_slot(tree_cache, session_id)
+    def _request_token_indices_for_active_req(
+        self, req: "Req"
+    ) -> torch.Tensor | None:
+        tree_cache = self.scheduler.tree_cache
+        req_to_token = tree_cache.req_to_token_pool.req_to_token
+        pool_idx = req.req_pool_idx
+        token_count = int(req.kv_committed_len or 0)
+        if (pool_idx is None or token_count <= 0) and req.session is not None:
+            slot = self._streaming_session_slot(tree_cache, req.session.session_id)
             if slot is not None:
-                pool_idx = getattr(slot, "req_pool_idx", None)
-                token_count = int(getattr(slot, "kv_committed_len", 0) or 0)
-        if req_to_token is None or pool_idx is None or token_count <= 0:
+                pool_idx = slot.req_pool_idx
+                token_count = int(slot.kv_committed_len or 0)
+        if pool_idx is None or token_count <= 0:
             return None
         return req_to_token[pool_idx, :token_count].to(dtype=torch.int64).clone()
 
     @staticmethod
-    def _request_position_count(req: Any) -> int | None:
+    def _request_position_count(req: "Req") -> int | None:
         position_count = OmniSRTSchedulerExecutor._position_count_from_position_ids(
-            getattr(req, "custom_position_ids", None)
+            req.custom_position_ids
         )
         if position_count is not None:
             return position_count
 
-        position_count = getattr(req, "omni_srt_position_count", None)
-        if position_count is not None:
-            return int(position_count)
+        if req.omni_srt_position_count is not None:
+            return int(req.omni_srt_position_count)
 
-        decode_position_id = getattr(req, "custom_decode_position_id", None)
-        if decode_position_id is not None:
-            return int(decode_position_id) + 1
+        if req.custom_decode_position_id is not None:
+            return int(req.custom_decode_position_id) + 1
         return None
 
     @staticmethod
-    def _position_count_from_position_ids(positions: Any) -> int | None:
+    def _position_count_from_position_ids(
+        positions: torch.Tensor | list[int] | list[list[int]] | None,
+    ) -> int | None:
         if positions is None:
             return None
-        if hasattr(positions, "detach"):
+        if isinstance(positions, torch.Tensor):
             positions = positions.detach().cpu().tolist()
         if not positions:
             return None
@@ -1004,7 +929,9 @@ class OmniSRTSchedulerExecutor:
         return max(int(position) for position in positions) + 1
 
     @staticmethod
-    def _streaming_session_slot(tree_cache: Any, session_id: str) -> Any | None:
+    def _streaming_session_slot(
+        tree_cache: object, session_id: str
+    ) -> "SessionSlot | None":
         slots = getattr(tree_cache, "slots", None)
         if isinstance(slots, dict) and session_id in slots:
             return slots[session_id]
