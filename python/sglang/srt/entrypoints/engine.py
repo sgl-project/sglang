@@ -683,7 +683,7 @@ class Engine(EngineScoreMixin, EngineBase):
         server_args: ServerArgs,
         port_args: PortArgs,
         run_detokenizer_process_func: Callable,
-    ) -> None:
+    ) -> Tuple[List[mp.Process], List[str]]:
         """Launch detokenizer worker(s).
 
         - When ``detokenizer_worker_num == 1``: a single detokenizer process listens on
@@ -691,34 +691,48 @@ class Engine(EngineScoreMixin, EngineBase):
         - When ``detokenizer_worker_num > 1``: each detokenizer worker gets its own
           private IPC socket, and a ``MultiDetokenizerRouter`` process owns the
           original ``port_args.detokenizer_ipc_name`` and fans out to them.
+
+        Returns (processes, names) for SubprocessWatchdog.
         """
+        processes: List[mp.Process] = []
+        names: List[str] = []
+
         if server_args.detokenizer_worker_num <= 1:
-            mp.Process(
+            proc = mp.Process(
                 target=run_detokenizer_process_func,
                 args=(server_args, port_args),
-            ).start()
-            return
+            )
+            proc.start()
+            processes.append(proc)
+            names.append("detokenizer")
+            return processes, names
 
         router_ipc_name = port_args.detokenizer_ipc_name
         worker_ipc_names: List[str] = []
         try:
-            for _ in range(server_args.detokenizer_worker_num):
+            for i in range(server_args.detokenizer_worker_num):
                 worker_ipc = f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}"
                 port_args.detokenizer_ipc_name = worker_ipc
-                mp.Process(
+                proc = mp.Process(
                     target=run_detokenizer_process_func,
                     args=(server_args, port_args),
-                ).start()
+                )
+                proc.start()
+                processes.append(proc)
+                names.append(f"detokenizer_{i}")
                 worker_ipc_names.append(worker_ipc)
         finally:
-            # Restore the public IPC name so downstream code (and the router) keeps
-            # using it.
             port_args.detokenizer_ipc_name = router_ipc_name
 
-        mp.Process(
+        router_proc = mp.Process(
             target=run_multi_detokenizer_router_process,
             args=(worker_ipc_names, server_args, port_args),
-        ).start()
+        )
+        router_proc.start()
+        processes.append(router_proc)
+        names.append("detokenizer_router")
+
+        return processes, names
 
     @classmethod
     def _launch_subprocesses(
@@ -823,11 +837,13 @@ class Engine(EngineScoreMixin, EngineBase):
 
         # Launch detokenizer process(es) — optionally fronted by a router when
         # detokenizer_worker_num > 1.
-        cls._launch_detokenizer_subprocesses(
+        detoken_procs, detoken_names = cls._launch_detokenizer_subprocesses(
             server_args=server_args,
             port_args=port_args,
             run_detokenizer_process_func=run_detokenizer_process_func,
         )
+        for p in detoken_procs:
+            scheduler_init_result.all_child_pids.append(p.pid)
 
         # Init tokenizer manager first, as the bootstrap server is initialized here
         if server_args.tokenizer_worker_num == 1:
@@ -851,6 +867,8 @@ class Engine(EngineScoreMixin, EngineBase):
         # Note: RayEngine returns scheduler_procs=None as it uses Ray actors instead of mp.Process
         processes = list(scheduler_procs or [])
         names = [f"scheduler_{i}" for i in range(len(processes))]
+        processes.extend(detoken_procs)
+        names.extend(detoken_names)
         subprocess_watchdog = SubprocessWatchdog(
             processes=processes, process_names=names
         )

@@ -21,7 +21,7 @@ register_cuda_ci(est_time=211, suite="stage-b-test-1-gpu-large")
 register_amd_ci(est_time=345, suite="stage-b-test-1-gpu-small-amd")
 
 
-class TestMultiTokenizer(CustomTestCase, MMLUMixin):
+class TestMultiDetokenizer(CustomTestCase, MMLUMixin):
     mmlu_score_threshold = 0.65
     mmlu_num_examples = 64
     mmlu_num_threads = 32
@@ -37,6 +37,8 @@ class TestMultiTokenizer(CustomTestCase, MMLUMixin):
             other_args=[
                 "--tokenizer-worker-num",
                 8,
+                "--detokenizer-worker-num",
+                4,
                 "--mem-fraction-static",
                 0.7,
             ],
@@ -46,8 +48,7 @@ class TestMultiTokenizer(CustomTestCase, MMLUMixin):
     def tearDownClass(cls):
         kill_process_tree(cls.process.pid)
 
-    def test_multi_tokenizer_ttft(self):
-        # from test_bench_serving.py run_bench_serving
+    def test_multi_detokenizer_ttft(self):
         args = get_benchmark_args(
             base_url=self.base_url,
             dataset_name="random",
@@ -67,11 +68,10 @@ class TestMultiTokenizer(CustomTestCase, MMLUMixin):
         res = run_benchmark(args)
         if is_in_ci():
             write_github_step_summary(
-                f"### test_multi_tokenizer_ttft\n"
+                f"### test_multi_detokenizer_ttft\n"
                 f"median_e2e_latency_ms: {res['median_e2e_latency_ms']:.2f} ms\n"
             )
             self.assertLess(res["median_e2e_latency_ms"], 11000)
-            # relax for mi300x
             self.assertLess(res["median_ttft_ms"], 130 if is_in_amd_ci() else 86)
             self.assertLess(res["median_itl_ms"], 10)
 

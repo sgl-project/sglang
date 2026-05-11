@@ -481,9 +481,10 @@ class MultiDetokenizerRouter:
 
             # Batch request.
             if isinstance(recv_obj, BaseBatchReq):
-                # Idle/no-op batch (rids=[]): keep whole, send to one detokenizer
+                # Idle/no-op batch (rids=[]): broadcast to all detokenizers
                 if not recv_obj.rids:
-                    self._send(self.ipc_name_list[0], recv_obj)
+                    for ipc in self.ipc_name_list:
+                        self._send(ipc, recv_obj)
                     continue
 
                 ipcs = recv_obj.http_worker_ipcs

@@ -4343,8 +4343,7 @@ class ServerArgs:
             "--detokenizer-worker-num",
             type=int,
             default=ServerArgs.detokenizer_worker_num,
-            help="The worker num of the detokenizer manager. "
-            "tokenizer_worker_num must be a multiple of detokenizer_worker_num.",
+            help="The worker num of the detokenizer manager.",
         )
         parser.add_argument(
             "--skip-tokenizer-init",
@@ -7031,10 +7030,6 @@ class ServerArgs:
 
         assert self.tokenizer_worker_num > 0, "Tokenizer worker num must >= 1"
         assert self.detokenizer_worker_num > 0, "Detokenizer worker num must >= 1"
-        assert self.tokenizer_worker_num % self.detokenizer_worker_num == 0, (
-            f"tokenizer_worker_num ({self.tokenizer_worker_num}) must be a multiple of "
-            f"detokenizer_worker_num ({self.detokenizer_worker_num})."
-        )
         self.validate_buckets_rule(
             "--prompt-tokens-buckets", self.prompt_tokens_buckets
         )
