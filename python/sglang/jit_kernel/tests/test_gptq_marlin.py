@@ -1,4 +1,5 @@
 import sys
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -10,8 +11,10 @@ from sglang.srt.layers.quantization.marlin_utils import (
     marlin_make_workspace,
 )
 from sglang.srt.layers.quantization.marlin_utils_fp4 import (
+    apply_fp4_marlin_linear,
     nvfp4_marlin_process_global_scale,
     nvfp4_marlin_process_scales,
+    prepare_fp4_layer_for_marlin,
 )
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_marlin_utils import awq_marlin_quantize, marlin_quantize
@@ -153,6 +156,82 @@ def test_nvfp4_marlin_support_and_scale_transforms_sm80_sm90(dtype):
         assert actual_global_scale.item() == 128.0
     else:
         assert actual_global_scale.item() == 2.0**119
+
+
+@pytest.mark.skipif(
+    not _is_sm80_sm90_cuda(),
+    reason="NVFP4 Marlin dense numeric test requires CUDA SM80, SM86, or SM90",
+)
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_nvfp4_marlin_dense_matches_dequant_reference(dtype):
+    torch.manual_seed(0)
+
+    size_m = 17
+    size_k = 256
+    size_n = 192
+    group_size = 16
+
+    a_input = torch.randn((size_m, size_k), dtype=dtype, device="cuda") / 10
+    fp4_weight = torch.randint(
+        0, 256, (size_n, size_k // 2), dtype=torch.uint8, device="cuda"
+    )
+    scale_source = torch.randn((size_n, size_k), dtype=dtype, device="cuda")
+    scales = scale_source.view(size_n, -1, group_size).abs().max(-1)[0] / 6
+    global_scale = scales.max() / 448
+    scales = (scales / global_scale).to(torch.float8_e4m3fn)
+
+    fp4_weight_part_1 = (fp4_weight & 0b10000000) | (
+        (fp4_weight & 0b01110000) >> 2
+    )
+    fp4_weight_part_1 = fp4_weight_part_1.view(torch.float8_e4m3fn)
+    fp4_weight_part_1 = fp4_weight_part_1.to(dtype) * (2**6)
+
+    fp4_weight2 = fp4_weight << 4
+    fp4_weight_part_2 = (fp4_weight2 & 0b10000000) | (
+        (fp4_weight2 & 0b01110000) >> 2
+    )
+    fp4_weight_part_2 = fp4_weight_part_2.view(torch.float8_e4m3fn)
+    fp4_weight_part_2 = fp4_weight_part_2.to(dtype) * (2**6)
+
+    weight_ref = torch.cat(
+        [fp4_weight_part_2.unsqueeze(2), fp4_weight_part_1.unsqueeze(2)], 2
+    ).view(size_n, size_k)
+    weight_ref = (
+        weight_ref
+        * global_scale.to(dtype)
+        * scales.repeat_interleave(group_size, 1).to(dtype)
+    )
+
+    layer = torch.nn.Module()
+    layer.quant_config = SimpleNamespace(group_size=group_size)
+    layer.output_size_per_partition = size_n
+    layer.input_size_per_partition = size_k
+    layer.params_dtype = dtype
+    layer.weight = torch.nn.Parameter(fp4_weight, requires_grad=False)
+    layer.weight_scale = torch.nn.Parameter(scales, requires_grad=False)
+    layer.weight_global_scale = torch.nn.Parameter(
+        global_scale.reshape(1), requires_grad=False
+    )
+    prepare_fp4_layer_for_marlin(layer)
+
+    output = apply_fp4_marlin_linear(
+        a_input,
+        layer.weight,
+        layer.weight_scale,
+        layer.weight_global_scale,
+        layer.workspace,
+        size_n,
+        size_k,
+        use_fp32_reduce=True,
+    )
+
+    output_ref = torch.matmul(a_input, weight_ref.T)
+    torch.cuda.synchronize()
+
+    rel_diff = torch.mean(torch.abs(output - output_ref)) / torch.mean(
+        torch.abs(output_ref)
+    )
+    assert rel_diff < 0.04
 
 
 if __name__ == "__main__":

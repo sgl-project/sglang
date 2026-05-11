@@ -16,8 +16,8 @@ from sglang.srt.utils.custom_op import register_custom_op
 _is_cuda = is_cuda()
 
 if _is_cuda:
-    from sglang.jit_kernel.gptq_marlin import gptq_marlin_gemm
     from sglang.jit_kernel.gptq_marlin_repack import gptq_marlin_repack
+    from sglang.jit_kernel.moe_wna16_marlin import moe_wna16_marlin_gemm
 
 ScalarType, scalar_types = get_scalar_types()
 
@@ -85,6 +85,8 @@ def apply_fp4_marlin_linear(
     bias: torch.Tensor | None = None,
     use_fp32_reduce: bool = USE_FP32_REDUCE_DEFAULT,
 ) -> torch.Tensor:
+    from sglang.srt.layers.moe.fused_moe_triton import moe_align_block_size
+
     if input.dtype not in (torch.float16, torch.bfloat16):
         raise RuntimeError("NVFP4 Marlin requires FP16 or BF16 activations.")
 
@@ -99,26 +101,62 @@ def apply_fp4_marlin_linear(
         dtype=input.dtype,
     )
 
-    output = gptq_marlin_gemm(
-        a=reshaped_x,
-        c=None,
-        b_q_weight=weight,
-        b_scales=weight_scale,
-        global_scale=weight_global_scale,
-        b_zeros=None,
-        g_idx=None,
-        perm=None,
-        workspace=workspace,
+    block_size_m = 8
+    for candidate in [8, 16, 32, 48, 64]:
+        if reshaped_x.size(0) / candidate < 0.9:
+            block_size_m = candidate
+            break
+
+    topk_ids = torch.zeros(
+        (reshaped_x.size(0), 1), dtype=torch.int64, device=input.device
+    )
+    topk_weights = torch.ones(
+        (reshaped_x.size(0), 1), dtype=torch.float32, device=input.device
+    )
+    sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
+        topk_ids, block_size_m, 1
+    )
+
+    output = torch.empty(
+        (reshaped_x.size(0), (weight.shape[1] // 16) * 8),
+        dtype=input.dtype,
+        device=input.device,
+    )
+    marlin_size_n = output.shape[1]
+    output = moe_wna16_marlin_gemm(
+        reshaped_x,
+        output,
+        weight.unsqueeze(0),
+        None,
+        weight_scale.unsqueeze(0),
+        weight_global_scale.reshape(1),
+        None,
+        None,
+        None,
+        workspace,
+        sorted_token_ids,
+        expert_ids,
+        num_tokens_post_padded,
+        topk_weights,
+        moe_block_size=block_size_m,
+        top_k=1,
+        mul_topk_weights=False,
+        is_ep=False,
         b_q_type=scalar_types.float4_e2m1f,
         size_m=reshaped_x.size(0),
-        size_n=size_n,
+        size_n=marlin_size_n,
         size_k=size_k,
+        is_k_full=True,
         use_atomic_add=use_atomic_add,
         use_fp32_reduce=use_fp32_reduce,
+        is_zp_float=False,
     )
 
     if bias is not None:
         output.add_(bias)
+
+    if marlin_size_n != size_n:
+        output = output[:, :size_n]
 
     return output.reshape(out_shape)
 
@@ -138,9 +176,23 @@ def prepare_fp4_layer_for_marlin(layer: torch.nn.Module) -> None:
     assert layer.weight.shape == (part_size_n, part_size_k // 2)
 
     device = layer.weight.device
-    layer.workspace = marlin_make_workspace(device)
+    layer.workspace = marlin_make_workspace(device, 4)
 
     perm = torch.empty(0, dtype=torch.int, device=device)
+    output_size_pad = (-part_size_n) % 128
+    if output_size_pad:
+        layer.weight = torch.nn.Parameter(
+            torch.nn.functional.pad(layer.weight.data, (0, 0, 0, output_size_pad)),
+            requires_grad=False,
+        )
+        layer.weight_scale = torch.nn.Parameter(
+            torch.nn.functional.pad(
+                layer.weight_scale.data, (0, 0, 0, output_size_pad)
+            ),
+            requires_grad=False,
+        )
+        part_size_n += output_size_pad
+
     qweight = layer.weight.view(torch.int32).T.contiguous()
     marlin_qweight = gptq_marlin_repack(
         b_q_weight=qweight,
@@ -168,6 +220,9 @@ def prepare_fp4_layer_for_marlin(layer: torch.nn.Module) -> None:
     )
 
     if hasattr(layer, "bias") and layer.bias is not None:
+        if output_size_pad:
+            bias_data = torch.nn.functional.pad(layer.bias.data, (0, output_size_pad))
+            layer.bias = torch.nn.Parameter(bias_data, requires_grad=False)
         assert layer.bias.shape == (part_size_n,)
         bias = marlin_permute_bias(layer.bias)
         layer.bias = torch.nn.Parameter(bias, requires_grad=False)

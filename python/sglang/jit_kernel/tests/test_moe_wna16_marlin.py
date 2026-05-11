@@ -515,5 +515,142 @@ def test_fused_marlin_moe_nvfp4_non_gated_padded_intermediate_launches():
     assert out.shape == (m, hidden_size)
 
 
+@pytest.mark.skipif(
+    not _is_sm80_sm90_cuda(),
+    reason="NVFP4 Marlin MoE numeric test requires CUDA SM80, SM86, or SM90",
+)
+def test_fused_marlin_moe_nvfp4_non_gated_matches_dequant_reference():
+    from types import SimpleNamespace
+
+    from sglang.srt.layers.quantization.marlin_utils_fp4 import (
+        prepare_moe_nvfp4_layer_for_marlin,
+    )
+
+    torch.manual_seed(0)
+
+    m = 17
+    intermediate_size = 192
+    hidden_size = 256
+    e = 4
+    topk = 2
+    dtype = torch.bfloat16
+    group_size = 16
+    routed_scaling_factor = 2.5
+
+    def make_nvfp4_weight(size_n: int, size_k: int):
+        fp4_weight = torch.randint(
+            0, 256, (size_n, size_k // 2), dtype=torch.uint8, device="cuda"
+        )
+        scale_source = torch.randn((size_n, size_k), dtype=dtype, device="cuda")
+        scales = scale_source.view(size_n, -1, group_size).abs().max(-1)[0] / 6
+        global_scale = scales.max() / 448
+        scales = (scales / global_scale).to(torch.float8_e4m3fn)
+
+        fp4_weight_part_1 = (fp4_weight & 0b10000000) | (
+            (fp4_weight & 0b01110000) >> 2
+        )
+        fp4_weight_part_1 = fp4_weight_part_1.view(torch.float8_e4m3fn)
+        fp4_weight_part_1 = fp4_weight_part_1.to(dtype) * (2**6)
+
+        fp4_weight2 = fp4_weight << 4
+        fp4_weight_part_2 = (fp4_weight2 & 0b10000000) | (
+            (fp4_weight2 & 0b01110000) >> 2
+        )
+        fp4_weight_part_2 = fp4_weight_part_2.view(torch.float8_e4m3fn)
+        fp4_weight_part_2 = fp4_weight_part_2.to(dtype) * (2**6)
+
+        weight_ref = torch.cat(
+            [fp4_weight_part_2.unsqueeze(2), fp4_weight_part_1.unsqueeze(2)], 2
+        ).view(size_n, size_k)
+        weight_ref = (
+            weight_ref
+            * global_scale.to(dtype)
+            * scales.repeat_interleave(group_size, 1).to(dtype)
+        )
+        return fp4_weight, scales, global_scale, weight_ref
+
+    w13_packed_l, w13_scales_l, w13_gscale_l, w13_ref_l = [], [], [], []
+    w2_packed_l, w2_scales_l, w2_gscale_l, w2_ref_l = [], [], [], []
+    for _ in range(e):
+        packed, scales, gscale, ref = make_nvfp4_weight(
+            intermediate_size, hidden_size
+        )
+        w13_packed_l.append(packed)
+        w13_scales_l.append(scales)
+        w13_gscale_l.append(gscale)
+        w13_ref_l.append(ref)
+
+        packed, scales, gscale, ref = make_nvfp4_weight(
+            hidden_size, intermediate_size
+        )
+        w2_packed_l.append(packed)
+        w2_scales_l.append(scales)
+        w2_gscale_l.append(gscale)
+        w2_ref_l.append(ref)
+
+    layer = torch.nn.Module()
+    layer.quant_config = SimpleNamespace(group_size=group_size)
+    layer.moe_runner_config = SimpleNamespace(is_gated=False)
+    layer.params_dtype = dtype
+    layer.intermediate_size_per_partition = intermediate_size
+    layer.w13_weight = torch.nn.Parameter(torch.stack(w13_packed_l), requires_grad=False)
+    layer.w2_weight = torch.nn.Parameter(torch.stack(w2_packed_l), requires_grad=False)
+    layer.w13_weight_scale = torch.nn.Parameter(
+        torch.stack(w13_scales_l), requires_grad=False
+    )
+    layer.w2_weight_scale = torch.nn.Parameter(
+        torch.stack(w2_scales_l), requires_grad=False
+    )
+    layer.w13_weight_scale_2 = torch.nn.Parameter(
+        torch.stack(w13_gscale_l), requires_grad=False
+    )
+    layer.w2_weight_scale_2 = torch.nn.Parameter(
+        torch.stack(w2_gscale_l), requires_grad=False
+    )
+    prepare_moe_nvfp4_layer_for_marlin(layer)
+
+    hidden_states = torch.randn((m, hidden_size), device="cuda", dtype=dtype) / 10
+    router_logits = torch.randn((m, e), device="cuda", dtype=dtype)
+    score_softmax = torch.softmax(router_logits, dim=-1, dtype=torch.float32)
+    topk_weights, topk_ids = torch.topk(score_softmax, topk)
+
+    output = fused_marlin_moe(
+        hidden_states=hidden_states,
+        w1=layer.w13_weight,
+        w2=layer.w2_weight,
+        w1_scale=layer.w13_weight_scale,
+        w2_scale=layer.w2_weight_scale,
+        gating_output=router_logits,
+        topk_weights=topk_weights,
+        topk_ids=topk_ids,
+        w1_global_scale=layer.w13_weight_scale_2,
+        w2_global_scale=layer.w2_weight_scale_2,
+        workspace=layer.workspace,
+        num_bits=4,
+        is_k_full=True,
+        routed_scaling_factor=routed_scaling_factor,
+        activation="relu2",
+        is_gated=False,
+    )
+
+    w13_ref = torch.stack(w13_ref_l)
+    w2_ref = torch.stack(w2_ref_l)
+    output_ref = torch.zeros_like(hidden_states)
+    for token_idx in range(m):
+        for route_idx in range(topk):
+            expert_id = topk_ids[token_idx, route_idx]
+            intermediate = hidden_states[token_idx] @ w13_ref[expert_id].T
+            intermediate = torch.square(torch.relu(intermediate))
+            routed = intermediate @ w2_ref[expert_id].T
+            output_ref[token_idx] += routed * topk_weights[token_idx, route_idx]
+    output_ref *= routed_scaling_factor
+
+    torch.cuda.synchronize()
+    rel_diff = torch.mean(torch.abs(output - output_ref)) / torch.mean(
+        torch.abs(output_ref)
+    )
+    assert rel_diff < 0.08
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v", "-s"]))
