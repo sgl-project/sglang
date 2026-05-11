@@ -144,9 +144,6 @@ def create_piecewise_cuda_graphs(model_runner: "ModelRunner"):
         return None
 
     probes = _collect_pcg_layer_probes(layer_model)
-    model_runner.attention_layers = probes.attention_layers
-    model_runner.moe_layers = probes.moe_layers
-    model_runner.moe_fusions = probes.moe_fusions
 
     if len(probes.attention_layers) < model_runner.model_config.num_hidden_layers:
         # TODO(yuwei): support Non-Standard GQA
@@ -162,9 +159,13 @@ def create_piecewise_cuda_graphs(model_runner: "ModelRunner"):
 
     if model_runner.server_args.enable_breakable_cuda_graph:
         # Experimental feature
-        piecewise_cuda_graph_runner = BreakableCudaGraphRunner(model_runner)
+        piecewise_cuda_graph_runner = BreakableCudaGraphRunner(
+            model_runner, layer_probes=probes
+        )
     else:
-        piecewise_cuda_graph_runner = PiecewiseCudaGraphRunner(model_runner)
+        piecewise_cuda_graph_runner = PiecewiseCudaGraphRunner(
+            model_runner, layer_probes=probes
+        )
 
     after_mem = get_available_gpu_memory(model_runner.device, model_runner.gpu_id)
     mem_usage = before_mem - after_mem
