@@ -146,6 +146,7 @@ class LongcatFlashDenseDecoderLayer(nn.Module):
             prefix=add_prefix(f"self_attn", prefix),
             alt_stream=self.alt_stream,
         )
+        self.self_attn.use_explicit_npu_interleaved_rope = True
 
         self.mlp = LongcatFlashMLP(
             hidden_size=config.hidden_size,

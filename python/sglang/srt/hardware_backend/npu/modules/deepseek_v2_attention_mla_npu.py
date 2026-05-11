@@ -27,8 +27,7 @@ _use_ag_after_qlora = envs.SGLANG_USE_AG_AFTER_QLORA.get()
 def _use_explicit_npu_interleaved_rope(m: "DeepseekV2AttentionMLA") -> bool:
     return (
         m.rotary_emb is not None
-        and m.qk_rope_head_dim == 64
-        and not m.rotary_emb.is_neox_style
+        and getattr(m, "use_explicit_npu_interleaved_rope", False)
     )
 
 

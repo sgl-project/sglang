@@ -350,6 +350,8 @@ class LongcatFlashDecoderLayer(nn.Module):
                 for i in range(2)
             ]
         )
+        for attn in self.self_attn:
+            attn.use_explicit_npu_interleaved_rope = True
 
         self.input_layernorm = nn.ModuleList(
             [RMSNorm(config.hidden_size, eps=config.rms_norm_eps) for i in range(2)]
