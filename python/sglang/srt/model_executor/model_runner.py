@@ -2923,3 +2923,16 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 split_forward_count,
             )
         return output
+
+    def update_model_fields(
+        self,
+        new_model: torch.nn.Module,
+        *,
+        model_path: str,
+        load_format: str,
+        load_config: LoadConfig,
+    ) -> None:
+        self.model = new_model
+        self.server_args.model_path = model_path
+        self.server_args.load_format = load_format
+        self.load_config = load_config
