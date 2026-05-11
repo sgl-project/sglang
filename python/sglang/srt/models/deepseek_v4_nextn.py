@@ -7,7 +7,6 @@ from torch import nn
 from transformers import PretrainedConfig
 
 from sglang.srt.distributed import get_pp_group, get_tensor_model_parallel_world_size
-from sglang.srt.environ import envs
 from sglang.srt.layers.attention.nsa.utils import (
     can_cp_split,
     cp_all_gather_rerange_output,
@@ -20,9 +19,9 @@ from sglang.srt.layers.attention.nsa.utils import (
 from sglang.srt.layers.dp_attention import (
     _DpGatheredBufferWrapper,
     dp_gather_partial,
+    get_attention_cp_rank,
+    get_attention_cp_size,
     get_attention_dp_size,
-    get_attention_tp_rank,
-    get_attention_tp_size,
     is_dp_attention_enabled,
 )
 from sglang.srt.layers.layernorm import RMSNorm
@@ -104,7 +103,7 @@ class DeepseekV4ModelNextN(nn.Module):
 
         self.nsa_enable_prefill_cp = is_nsa_enable_prefill_cp()
         if self.nsa_enable_prefill_cp:
-            self.cp_size = get_attention_tp_size()
+            self.cp_size = get_attention_cp_size()
         else:
             self.cp_size = None
 
@@ -164,36 +163,8 @@ class DeepseekV4ModelNextN(nn.Module):
             input_ids_global = input_ids
 
         if nsa_use_prefill_cp(forward_batch):
-            _check_rank_consistency = (
-                envs.SGLANG_DEBUG_HACK_CP_CHECK_RANK_CONSISTENCY.get()
-            )
-            if _check_rank_consistency:
-                _pre_split_hidden_states = hidden_states.clone()
-                _pre_split_positions = positions.clone()
             hidden_states = cp_split_and_rebuild_data(forward_batch, hidden_states)
             positions = cp_split_and_rebuild_position(forward_batch, positions)
-            if _check_rank_consistency:
-                _gathered_hidden = cp_all_gather_rerange_output(
-                    hidden_states,
-                    self.cp_size,
-                    forward_batch,
-                    torch.cuda.current_stream(),
-                )
-                assert torch.equal(_gathered_hidden, _pre_split_hidden_states), (
-                    "SGLANG_DEBUG_HACK_CP_CHECK_RANK_CONSISTENCY: "
-                    "cp_split_and_rebuild_data ∘ cp_all_gather_rerange_output is not identity on hidden_states. "
-                    "Round-robin split/gather helpers are inconsistent."
-                )
-                _gathered_positions = cp_all_gather_rerange_output(
-                    positions.unsqueeze(-1),
-                    self.cp_size,
-                    forward_batch,
-                    torch.cuda.current_stream(),
-                ).squeeze(-1)
-                assert torch.equal(_gathered_positions, _pre_split_positions), (
-                    "SGLANG_DEBUG_HACK_CP_CHECK_RANK_CONSISTENCY: "
-                    "cp_split_and_rebuild_position ∘ cp_all_gather_rerange_output is not identity on positions."
-                )
 
         hidden_states = self.decoder(
             positions=positions,
@@ -237,8 +208,8 @@ class DeepseekV4ForCausalLMNextN(DeepseekV4ForCausalLM):
         self.determine_num_fused_shared_experts()
         self.nsa_enable_prefill_cp = is_nsa_enable_prefill_cp()
         if self.nsa_enable_prefill_cp:
-            self.cp_rank = get_attention_tp_rank()
-            self.cp_size = get_attention_tp_size()
+            self.cp_rank = get_attention_cp_rank()
+            self.cp_size = get_attention_cp_size()
         else:
             self.cp_rank = None
             self.cp_size = None
