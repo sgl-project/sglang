@@ -172,7 +172,6 @@ class DecodeInputBuffers(ForwardInputBuffers):
         num_tokens_per_bs: int,
         cache_loc_dtype: torch.dtype,
         enable_mamba_track: bool,
-        hc_hidden_size: Optional[int] = None,
         ne_token_table: Optional[torch.Tensor] = None,
         is_hybrid_swa: bool = False,
     ) -> "DecodeInputBuffers":
@@ -208,17 +207,10 @@ class DecodeInputBuffers(ForwardInputBuffers):
             )
 
             if pp_size > 1:
-                # For mHC models (e.g. DeepSeek-V4), hc_hidden_size =
-                # hc_mult * hidden_size, as hidden_states are flattened for PP.
-                is_mhc = hc_hidden_size is not None
-                hs = hc_hidden_size if is_mhc else hidden_size
                 pp_proxy_tensors = {
-                    "hidden_states": torch.zeros((max_bs, hs), dtype=dtype),
+                    "hidden_states": torch.zeros((max_bs, hidden_size), dtype=dtype),
+                    "residual": torch.zeros((max_bs, hidden_size), dtype=dtype),
                 }
-                if not is_mhc:
-                    pp_proxy_tensors["residual"] = torch.zeros(
-                        (max_bs, hidden_size), dtype=dtype
-                    )
             else:
                 pp_proxy_tensors = None
 
@@ -719,7 +711,6 @@ class CudaGraphRunner:
             num_tokens_per_bs=self.num_tokens_per_bs,
             cache_loc_dtype=self._cache_loc_dtype(),
             enable_mamba_track=enable_mamba_track,
-            hc_hidden_size=getattr(self.model_runner.model_config, "hc_hidden_size", None),
             ne_token_table=(
                 model_runner.token_table if self.use_ngram_embedding else None
             ),
