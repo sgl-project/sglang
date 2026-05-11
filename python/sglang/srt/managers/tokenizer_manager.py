@@ -77,14 +77,16 @@ from sglang.srt.managers.schedule_batch import MultimodalDataItem
 from sglang.srt.managers.scheduler import is_health_check_generate_req
 from sglang.srt.managers.scheduler_input_blocker import input_blocker_guard_region
 from sglang.srt.managers.tokenizer_control_mixin import TokenizerControlMixin
-from sglang.srt.managers.tokenizer_manager_components.request_state import ReqState
+from sglang.srt.managers.tokenizer_manager_components.request_state import (
+    ReqState,
+    init_req,
+)
 from sglang.srt.managers.tokenizer_manager_score_mixin import (
     TokenizerManagerScoreMixin,
 )
 from sglang.srt.observability.cpu_monitor import start_cpu_monitor_thread
 from sglang.srt.observability.metrics_collector import TokenizerMetricsCollector
 from sglang.srt.observability.req_time_stats import (
-    APIServerReqTimeStats,
     convert_time_to_realtime,
     real_time,
     set_time_batch,
@@ -92,7 +94,7 @@ from sglang.srt.observability.req_time_stats import (
 from sglang.srt.observability.request_metrics_exporter import (
     RequestMetricsExporterManager,
 )
-from sglang.srt.observability.trace import SpanAttributes, extract_trace_headers
+from sglang.srt.observability.trace import SpanAttributes
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import (
     PortArgs,
@@ -469,7 +471,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     f"routed_dp_rank={obj.routed_dp_rank} out of range [0, {dp_size})"
                 )
 
-        TokenizerManager._init_req_state(
+        init_req(
             self.rid_to_state,
             obj=obj,
             request=request,
@@ -1376,7 +1378,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 tokenized_obj.sampling_params = copy.copy(tokenized_obj.sampling_params)
                 tokenized_obj.sampling_params.max_new_tokens = 0
                 tokenized_obj.stream = False
-                TokenizerManager._init_req_state(
+                init_req(
                     self.rid_to_state,
                     obj=tmp_obj,
                     enable_trace=self.server_args.enable_trace,
@@ -1391,7 +1393,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     tmp_obj = copy.copy(objs[i])
                     tokenized_obj = copy.copy(tokenized_objs[i])
                     tokenized_obj.rid = tmp_obj.regenerate_rid()
-                    TokenizerManager._init_req_state(
+                    init_req(
                         self.rid_to_state,
                         obj=tmp_obj,
                         enable_trace=self.server_args.enable_trace,
@@ -2489,55 +2491,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             sub_obj.lora_id = (
                 obj.lora_id[i] if isinstance(obj.lora_id, list) else obj.lora_id
             )
-
-    @staticmethod
-    def _init_req_state(
-        rid_to_state: Dict[str, ReqState],
-        *,
-        obj: Union[GenerateReqInput, EmbeddingReqInput],
-        request: Optional[fastapi.Request] = None,
-        enable_trace: bool,
-        disagg_mode: DisaggregationMode,
-    ) -> None:
-        created_time = obj.received_time
-
-        external_trace_header = None
-        if enable_trace:
-            if obj.external_trace_header:
-                # When the request comes from the rust grpc server or Engine there isn't a
-                # real request object but we still need to propagate the trace context from
-                # the trace context that is explicitly passed in
-                external_trace_header = obj.external_trace_header
-            elif request:
-                external_trace_header = extract_trace_headers(request.headers)
-                obj.external_trace_header = external_trace_header
-
-        # Normalize single/batch into a uniform list of (rid, sub_obj, bootstrap_room)
-        if not hasattr(obj, "is_single") or obj.is_single:
-            items = [(obj.rid, obj, getattr(obj, "bootstrap_room", None))]
-        else:
-            items = [
-                (
-                    obj.rid[i],
-                    obj[i],
-                    (
-                        obj.bootstrap_room[i]
-                        if hasattr(obj, "bootstrap_room") and obj.bootstrap_room
-                        else None
-                    ),
-                )
-                for i in range(len(obj.rid))
-            ]
-
-        for rid, sub_obj, bootstrap_room in items:
-            if rid in rid_to_state:
-                raise ValueError(f"Duplicate request ID detected: {rid}")
-            time_stats = APIServerReqTimeStats(disagg_mode=disagg_mode)
-            state = ReqState([], False, asyncio.Event(), sub_obj, time_stats)
-            rid_to_state[rid] = state
-            if enable_trace:
-                time_stats.init_trace_ctx(rid, bootstrap_room, external_trace_header)
-            time_stats.set_created_time(created_time)
 
     def _should_dispatch_to_encoder(
         self, obj: Union[GenerateReqInput, EmbeddingReqInput]
