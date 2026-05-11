@@ -268,11 +268,11 @@ class ContextOps(ABC):
         timestep: Any,
     ) -> Any:
         """
-            Build a temporary forward batch for the forward-process using language model in image generation process
+        Build a temporary forward batch for the forward-process using language model in image generation process
 
-            For some models (U1), the image generation process includes calling forward of the language (AR) model.
+        For some models (U1), the image generation process includes calling forward of the language (AR) model.
 
-            Since the kv tokens of the image tokens are useless once after denoising, it is temporary and should be released.
+        Since the kv tokens of the image tokens are useless once after denoising, it is temporary and should be released.
         """
 
         ...

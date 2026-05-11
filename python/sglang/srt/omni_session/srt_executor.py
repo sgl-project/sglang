@@ -56,7 +56,7 @@ class OmniSRTTemporaryForwardBatch:
 
     def release(self) -> None:
         """
-            release the temporary kv slots allocated for denoise
+        release the temporary kv slots allocated for denoise
         """
         if self.released:
             return
@@ -608,10 +608,10 @@ class OmniSRTSchedulerExecutor:
         device: torch.device,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
-            Allocate the temporary kv tokens in the kv-cache
-            extend_num_tokens: number of KV token required by the denoise query
+        Allocate the temporary kv tokens in the kv-cache
+        extend_num_tokens: number of KV token required by the denoise query
 
-            Returns a tuple of: tokens actually needed, and tokens allocated
+        Returns a tuple of: tokens actually needed, and tokens allocated
         """
         tree_cache = self.scheduler.tree_cache
         page_size = int(tree_cache.page_size)
