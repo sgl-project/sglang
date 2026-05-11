@@ -54,37 +54,13 @@ class BatchRequestDispatcher:
         rids = []
         if getattr(obj, "parallel_sample_num", 1) == 1:
             if self.request_preparer._should_use_batch_tokenization(batch_size, obj):
-                tokenized_objs = (
-                    await self.request_preparer._batch_tokenize_and_process(
-                        batch_size, obj
-                    )
+                generators, rids = await self._dispatch_batch_tokenized(
+                    obj, batch_size, request
                 )
-                self.send_batch_request(tokenized_objs)
-
-                # Set up generators for each request in the batch
-                for i in range(batch_size):
-                    tmp_obj = obj[i]
-                    generators.append(
-                        self.response_emitter._wait_one_response(tmp_obj, request)
-                    )
-                    rids.append(tmp_obj.rid)
             else:
-                # Sequential tokenization and processing
-                with (
-                    input_blocker_guard_region(send_to_scheduler=self.send_to_scheduler)
-                    if get_bool_env_var("SGLANG_ENABLE_COLOCATED_BATCH_GEN")
-                    else nullcontext()
-                ):
-                    for i in range(batch_size):
-                        tmp_obj = obj[i]
-                        tokenized_obj = (
-                            await self.request_preparer._tokenize_one_request(tmp_obj)
-                        )
-                        self.send_one_request(tokenized_obj)
-                        generators.append(
-                            self.response_emitter._wait_one_response(tmp_obj, request)
-                        )
-                        rids.append(tmp_obj.rid)
+                generators, rids = await self._dispatch_sequential_tokenized(
+                    obj, batch_size, request
+                )
         else:
             # FIXME: When using batch and parallel_sample_num together, the perf is not optimal.
             if batch_size > 128:
@@ -141,4 +117,52 @@ class BatchRequestDispatcher:
                 self.rid_to_state[objs[i].rid].time_stats.set_finished_time()
                 del self.rid_to_state[objs[i].rid]
 
+        return generators, rids
+
+    async def _dispatch_batch_tokenized(
+        self,
+        obj: Union[GenerateReqInput, EmbeddingReqInput],
+        batch_size: int,
+        request: Optional[fastapi.Request],
+    ) -> Tuple[List[AsyncGenerator], List[str]]:
+        tokenized_objs = await self.request_preparer._batch_tokenize_and_process(
+            batch_size, obj
+        )
+        self.send_batch_request(tokenized_objs)
+
+        # Set up generators for each request in the batch
+        generators: List[AsyncGenerator] = []
+        rids: List[str] = []
+        for i in range(batch_size):
+            tmp_obj = obj[i]
+            generators.append(
+                self.response_emitter._wait_one_response(tmp_obj, request)
+            )
+            rids.append(tmp_obj.rid)
+        return generators, rids
+
+    async def _dispatch_sequential_tokenized(
+        self,
+        obj: Union[GenerateReqInput, EmbeddingReqInput],
+        batch_size: int,
+        request: Optional[fastapi.Request],
+    ) -> Tuple[List[AsyncGenerator], List[str]]:
+        # Sequential tokenization and processing
+        generators: List[AsyncGenerator] = []
+        rids: List[str] = []
+        with (
+            input_blocker_guard_region(send_to_scheduler=self.send_to_scheduler)
+            if get_bool_env_var("SGLANG_ENABLE_COLOCATED_BATCH_GEN")
+            else nullcontext()
+        ):
+            for i in range(batch_size):
+                tmp_obj = obj[i]
+                tokenized_obj = await self.request_preparer._tokenize_one_request(
+                    tmp_obj
+                )
+                self.send_one_request(tokenized_obj)
+                generators.append(
+                    self.response_emitter._wait_one_response(tmp_obj, request)
+                )
+                rids.append(tmp_obj.rid)
         return generators, rids
