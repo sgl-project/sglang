@@ -19,9 +19,12 @@ from sglang.srt.layers.attention.nsa.triton_kernel import act_quant
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.compressed.metadata import DeepseekV4Metadata
+    from sglang.srt.layers.attention.dsv4.compressor import (
+        Compressor,
+        DeepseekRefRMSNorm,
+    )
     from sglang.srt.mem_cache.deepseekv4_memory_pool import DeepSeekV4TokenToKVPool
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-    from sglang.srt.models.deepseek_v4 import Compressor, DeepseekRefRMSNorm
 
 
 class FusedCompressMetadata(NamedTuple):

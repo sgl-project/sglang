@@ -484,7 +484,6 @@ class C4Indexer(nn.Module):
         prefix: str = "",
         alt_streams: Optional[List[torch.cuda.Stream]] = None,
         rotary_emb=None,
-        compressor_cls=None,
     ):
         super().__init__()
         self.layer_id = layer_id
@@ -512,30 +511,17 @@ class C4Indexer(nn.Module):
             params_dtype=torch.bfloat16,
             prefix=add_prefix("weights_proj", prefix),
         )
-        _compressor_cls = compressor_cls if compressor_cls is not None else Compressor
-        if rotary_emb is not None and compressor_cls is not None:
-            self.compressor = _compressor_cls(
-                config,
-                self.layer_id,
-                True,
-                rotary_emb,
-                freqs_cis,
-                compress_ratio=4,
-                head_dim=self.head_dim,
-                rotate=True,
-                prefix=add_prefix("compressor", prefix),
-            )
-        else:
-            self.compressor = _compressor_cls(
-                config,
-                self.layer_id,
-                True,
-                freqs_cis,
-                compress_ratio=4,
-                head_dim=self.head_dim,
-                rotate=True,
-                prefix=add_prefix("compressor", prefix),
-            )
+        self.compressor = Compressor(
+            config,
+            self.layer_id,
+            True,
+            freqs_cis,
+            compress_ratio=4,
+            head_dim=self.head_dim,
+            rotate=True,
+            prefix=add_prefix("compressor", prefix),
+            rotary_emb=rotary_emb,
+        )
         self.rotary_emb = rotary_emb
         self.freqs_cis = freqs_cis
         self.weight_scale: float = self.softmax_scale * self.n_heads**-0.5
