@@ -725,11 +725,10 @@ class EAGLEWorker(TpModelWorker):
         self.token_to_kv_pool_allocator.restore_state(token_to_kv_pool_state_backup)
 
     def _draft_preprocess_idle(self, batch: ScheduleBatch):
-        target_cfg = self.target_worker.model_runner.model_config
         batch.spec_info = EagleDraftInput.create_idle_input(
             device=self.device,
-            hidden_size=target_cfg.spec_hidden_size,
-            dtype=target_cfg.dtype,
+            hidden_size=self.model_config.spec_hidden_size,
+            dtype=self.model_config.dtype,
             topk=self.topk,
             capture_hidden_mode=CaptureHiddenMode.LAST,
         )
