@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING, Optional
 import torch
 
 from sglang.jit_kernel.utils import cache_once, load_jit, override_jit_cuda_arch
+from sglang.kernel_api_logging import debug_kernel_api
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
@@ -180,6 +181,7 @@ def _q8kv8_get_outbufs(s_q: int, h_q: int, d_v: int, device: torch.device):
     return out[:s_q], max_logits[:s_q], lse[:s_q]
 
 
+@debug_kernel_api
 def sparse_mla_q8kv8_prefill_fwd(
     q: torch.Tensor,  # [s_q, h_q, d_qk], float8_e4m3fn
     kv: torch.Tensor,  # [s_kv, h_kv, d_qk], float8_e4m3fn
