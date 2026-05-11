@@ -172,7 +172,6 @@ from sglang.srt.managers.scheduler_components.dp_attn_adapter import (
 from sglang.srt.managers.scheduler_components.request_receiver import (
     SchedulerRequestReceiver,
 )
-from sglang.srt.managers.scheduler_dp_attn_mixin import SchedulerDPAttnMixin
 from sglang.srt.managers.scheduler_input_blocker import SchedulerInputBlocker
 from sglang.srt.managers.scheduler_output_processor_mixin import (
     SchedulerOutputProcessorMixin,
@@ -329,7 +328,6 @@ class Scheduler(
     SchedulerMultiplexMixin,
     SchedulerRuntimeCheckerMixin,
     SchedulerPPMixin,
-    SchedulerDPAttnMixin,
     SchedulerDllmMixin,
     SchedulerMlxOverlapMixin,
 ):
@@ -2233,9 +2231,7 @@ class Scheduler(
             # Before merging the new batch into running batch:
             # 1. All new batches are none -> need_mlp_sync remains true (sync is needed for decode batch).
             # 2. All new batches are some (prefill / idle) -> we do not need prepare mlp sync one more time.
-            new_batch = self.maybe_prepare_mlp_sync_batch(
-                self.dp_attn_adapter, new_batch
-            )
+            new_batch = self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(new_batch)
             need_mlp_sync = new_batch is None
 
         if new_batch is not None:
@@ -2253,8 +2249,8 @@ class Scheduler(
                 ret = None
 
         # Handle DP attention and log stats
-        ret = self.maybe_prepare_mlp_sync_batch(
-            self.dp_attn_adapter, ret, need_sync=need_mlp_sync
+        ret = self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(
+            ret, need_sync=need_mlp_sync
         )
 
         # Handle ngram embedding
