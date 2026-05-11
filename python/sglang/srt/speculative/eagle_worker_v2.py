@@ -418,7 +418,6 @@ class EagleDraftWorker(BaseDraftWorker):
 
     @draft_wrapper
     def draft(self, model_worker_batch):
-        # print(f"------ debug non zero_bubble -------")
         draft_input: EagleDraftInput = model_worker_batch.spec_info
         forward_batch, can_cuda_graph = draft_input.prepare_for_v2_draft(
             self.req_to_token_pool,
@@ -464,6 +463,7 @@ class EagleDraftWorker(BaseDraftWorker):
         # `draft` method which does not mutate the batch).
         original_forward_mode = model_worker_batch.forward_mode
         original_seq_lens = model_worker_batch.seq_lens
+        original_seq_lens_cpu = model_worker_batch.seq_lens_cpu
 
         model_worker_batch.forward_mode = ForwardMode.DECODE
         model_worker_batch.seq_lens = batch_result.next_draft_input.new_seq_lens
@@ -530,6 +530,7 @@ class EagleDraftWorker(BaseDraftWorker):
         finally:
             model_worker_batch.forward_mode = original_forward_mode
             model_worker_batch.seq_lens = original_seq_lens
+            model_worker_batch.seq_lens_cpu = original_seq_lens_cpu
 
     def draft_forward_for_prepare(self, spec_info):
         topk_p, topk_index, hidden_states = (
@@ -572,7 +573,7 @@ class EagleDraftWorker(BaseDraftWorker):
                         (tree_info[2].size(0), self.topk),
                         i,
                         dtype=torch.long,
-                        device="cuda",
+                        device=self.device,
                     )
                 )
             offset += step_size
@@ -763,13 +764,17 @@ class EagleDraftWorker(BaseDraftWorker):
         # Update spec_info for the next draft step
         probs = torch.softmax(logits_output.next_token_logits, dim=-1)
         topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
+        topk_p, topk_index = self._pad_topk_for_zero_bubble(topk_p, topk_index)
+        next_draft_input.topk_p, next_draft_input.topk_index = topk_p, topk_index
+        next_draft_input.hidden_states = logits_output.hidden_states
+        return next_draft_input
+
+    def _pad_topk_for_zero_bubble(self, topk_p, topk_index):
         if self.enable_spec_v2_zero_bubble and self.speculative_num_steps > 1:
             topk_pad_size = self.speculative_num_steps * self.topk - topk_p.shape[-1]
             topk_p = F.pad(topk_p, (0, topk_pad_size))
             topk_index = F.pad(topk_index, (0, topk_pad_size))
-        next_draft_input.topk_p, next_draft_input.topk_index = topk_p, topk_index
-        next_draft_input.hidden_states = logits_output.hidden_states
-        return next_draft_input
+        return topk_p, topk_index
 
     def _draft_extend_for_decode(
         self, batch: ModelWorkerBatch, batch_result: GenerationBatchResult
