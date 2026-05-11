@@ -544,9 +544,9 @@ class DeepseekV2MoE(nn.Module):
             and not _is_deepep_fusion
         ):
             intermediate_size = config.moe_intermediate_size * config.n_shared_experts
-            # disable tp for shared experts when enable deepep moe, or with fp4 allgather,
-            # or when DSV4 FP4 experts are used (shared experts remain FP8 whose scale
-            # shape may not be divisible by tp_size, e.g. scale [24,56] vs tp=16).
+            # Disable TP for shared experts for A2A/FP4 allgather paths, or when
+            # explicitly requested for DSV4 checkpoints whose shared scales are
+            # not divisible by the global TP size.
             _shared_expert_use_tp1 = (
                 get_moe_a2a_backend().is_deepep()
                 or get_moe_a2a_backend().is_mooncake()
@@ -748,7 +748,7 @@ class DeepseekV2MoE(nn.Module):
         final_hidden_states = maybe_fuse_routed_scale_and_shared_add(
             self.experts,
             final_hidden_states,
-            shared_output,
+            None if self._shared_expert_tp1 else shared_output,
             self.routed_scaling_factor,
         )
 
@@ -758,8 +758,8 @@ class DeepseekV2MoE(nn.Module):
             should_allreduce_fusion=should_allreduce_fusion,
         ):
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
-        # When shared expert uses TP1 (replicated weights), its output is already
-        # complete and must be added AFTER all-reduce to avoid being summed tp_size times.
+        # TP1 shared experts are replicated, so add them after all-reduce to
+        # avoid summing the same shared output once per TP rank.
         if self._shared_expert_tp1:
             final_hidden_states += shared_output
         return final_hidden_states
@@ -854,7 +854,7 @@ class DeepseekV2MoE(nn.Module):
         final_hidden_states = maybe_fuse_routed_scale_and_shared_add(
             self.experts,
             final_hidden_states,
-            shared_output,
+            None if self._shared_expert_tp1 else shared_output,
             self.routed_scaling_factor,
         )
 
@@ -864,6 +864,10 @@ class DeepseekV2MoE(nn.Module):
             should_allreduce_fusion=should_allreduce_fusion,
         ):
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+        # TP1 shared experts are replicated, so add them after all-reduce to
+        # avoid summing the same shared output once per TP rank.
+        if shared_output is not None and self._shared_expert_tp1:
+            final_hidden_states += shared_output
         return final_hidden_states
 
     def forward_cpu(
