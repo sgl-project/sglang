@@ -50,6 +50,7 @@ class LlamaDecoderLayer(LlamaDecoderLayer):
     ) -> None:
         super().__init__(config, layer_id, quant_config, prefix)
 
+        self.norm_before_residual = getattr(config, "norm_before_residual", False)
         # override qkv
         self.self_attn.qkv_proj = QKVParallelLinear(
             2 * self.hidden_size,
@@ -84,6 +85,9 @@ class LlamaDecoderLayer(LlamaDecoderLayer):
         residual = hidden_states
         embeds = self.input_layernorm(embeds)
         hidden_states = self.hidden_norm(hidden_states)
+
+        if self.norm_before_residual:
+            residual = hidden_states
 
         hidden_states = torch.cat([embeds, hidden_states], dim=-1)
         # Self Attention
