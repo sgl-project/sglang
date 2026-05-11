@@ -142,13 +142,7 @@ class SchedulerOutputStreamer:
                 continue
 
             acc.accept(req=req)
-
-            if (
-                req.finished()
-                and self.ps.attn_tp_rank == 0
-                and self.server_args.enable_request_time_stats_logging
-            ):
-                req.log_time_stats()
+            self._maybe_log_time_stats(req=req)
 
         dp_ranks = [self.ps.dp_rank] * len(acc.rids) if acc.rids else None
 
@@ -199,6 +193,14 @@ class SchedulerOutputStreamer:
                     dp_ranks=dp_ranks,
                 )
             )
+
+    def _maybe_log_time_stats(self, *, req: Req) -> None:
+        if (
+            req.finished()
+            and self.ps.attn_tp_rank == 0
+            and self.server_args.enable_request_time_stats_logging
+        ):
+            req.log_time_stats()
 
     def _stream_output_embedding(self, reqs: List[Req]):
         rids = []
