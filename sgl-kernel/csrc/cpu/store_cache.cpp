@@ -1,8 +1,9 @@
-#include "common.h"
-#include <cmath>
-#include <cstring>
 #include <immintrin.h>
 
+#include <cmath>
+#include <cstring>
+
+#include "common.h"
 
 // ============================================================================
 // quant_to_nope_fp8_rope_bf16_pack_cpu
@@ -67,8 +68,7 @@ inline __m128i cvt_fp32x16_to_fp8x16(__m512 input) {
 
   // Round up if round_bit AND (sticky OR lsb_of_mant3)
   __m512i lsb = _mm512_and_si512(mant3, _mm512_set1_epi32(1));
-  __m512i sticky_or_lsb = _mm512_or_si512(
-      _mm512_maskz_mov_epi32(has_sticky, _mm512_set1_epi32(1)), lsb);
+  __m512i sticky_or_lsb = _mm512_or_si512(_mm512_maskz_mov_epi32(has_sticky, _mm512_set1_epi32(1)), lsb);
   __m512i do_round = _mm512_and_si512(round_bit, sticky_or_lsb);
   mant3 = _mm512_add_epi32(mant3, do_round);
 
@@ -95,10 +95,7 @@ inline __m128i cvt_fp32x16_to_fp8x16(__m512 input) {
 }
 
 // Process one tile (64 bf16 values): find amax, compute scale, quantize to fp8
-inline uint8_t quantize_tile_avx512(
-    const at::BFloat16* __restrict__ src,
-    uint8_t* __restrict__ dst) {
-
+inline uint8_t quantize_tile_avx512(const at::BFloat16* __restrict__ src, uint8_t* __restrict__ dst) {
   // Load 64 bf16 -> 4 x 16 floats
   __m256i bf16_0 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(src));
   __m256i bf16_1 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(src + 16));
@@ -163,10 +160,7 @@ inline uint8_t quantize_tile_avx512(
 
 #endif  // CPU_CAPABILITY_AVX512
 
-inline uint8_t quantize_tile_scalar(
-    const at::BFloat16* __restrict__ src,
-    uint8_t* __restrict__ dst) {
-
+inline uint8_t quantize_tile_scalar(const at::BFloat16* __restrict__ src, uint8_t* __restrict__ dst) {
   float amax = 0.0f;
   for (int j = 0; j < QUANT_TILE_SIZE; ++j) {
     float v = std::abs(static_cast<float>(src[j]));
@@ -202,17 +196,17 @@ inline uint8_t quantize_tile_scalar(
 //     Per token: [scale_dim bytes | 1 byte padding]
 //
 void set_k_and_s_cpu(
-    at::Tensor& buf,         // [num_pages, buf_numel_per_page], uint8
-    at::Tensor& loc,         // [num_tokens], int32 or int64
-    at::Tensor& k_nope,      // [num_tokens, nope_dim], fp8 (viewed as uint8)
-    at::Tensor& k_rope,      // [num_tokens, rope_dim], bf16 (viewed as uint8, rope_dim*2 bytes)
-    at::Tensor& scale_k_nope,// [num_tokens, scale_dim], uint8
+    at::Tensor& buf,           // [num_pages, buf_numel_per_page], uint8
+    at::Tensor& loc,           // [num_tokens], int32 or int64
+    at::Tensor& k_nope,        // [num_tokens, nope_dim], fp8 (viewed as uint8)
+    at::Tensor& k_rope,        // [num_tokens, rope_dim], bf16 (viewed as uint8, rope_dim*2 bytes)
+    at::Tensor& scale_k_nope,  // [num_tokens, scale_dim], uint8
     int64_t page_size) {
   const int64_t num_tokens = loc.size(0);
   const int64_t buf_numel_per_page = buf.size(1);
-  const int64_t nope_dim = k_nope.size(1);       // 448 (bytes, fp8 elements)
-  const int64_t rope_dim = k_rope.size(1);        // 64 (bf16 elements, 128 bytes)
-  const int64_t scale_dim = scale_k_nope.size(1); // 7
+  const int64_t nope_dim = k_nope.size(1);         // 448 (bytes, fp8 elements)
+  const int64_t rope_dim = k_rope.size(1);         // 64 (bf16 elements, 128 bytes)
+  const int64_t scale_dim = scale_k_nope.size(1);  // 7
 
   const int64_t nope_rope_bytes = nope_dim + rope_dim * 2;
   const int64_t s_offset_nbytes_in_page = page_size * nope_rope_bytes;
@@ -235,8 +229,7 @@ void set_k_and_s_cpu(
       const int64_t token_off = token_loc % page_size;
 
       // --- nope: copy nope_dim bytes (fp8) ---
-      const int64_t nope_byte_offset =
-          page_idx * buf_numel_per_page + token_off * nope_rope_bytes;
+      const int64_t nope_byte_offset = page_idx * buf_numel_per_page + token_off * nope_rope_bytes;
       uint8_t* dst_nope = buf_ptr + nope_byte_offset;
       const uint8_t* src_nope = k_nope_ptr + i * nope_dim;
 
@@ -258,8 +251,7 @@ void set_k_and_s_cpu(
 #endif
 
       // --- rope: copy rope_dim bf16 values = rope_dim*2 bytes ---
-      const int64_t rope_byte_offset =
-          page_idx * buf_numel_per_page + token_off * nope_rope_bytes + nope_dim;
+      const int64_t rope_byte_offset = page_idx * buf_numel_per_page + token_off * nope_rope_bytes + nope_dim;
       uint8_t* dst_rope = buf_ptr + rope_byte_offset;
       const uint8_t* src_rope = k_rope_ptr + i * rope_dim * 2;
       const int64_t rope_bytes = rope_dim * 2;
@@ -282,15 +274,13 @@ void set_k_and_s_cpu(
 
       // --- scale: copy scale_dim bytes ---
       const int64_t s_byte_offset =
-          page_idx * buf_numel_per_page + s_offset_nbytes_in_page
-          + token_off * padded_scale_per_token;
+          page_idx * buf_numel_per_page + s_offset_nbytes_in_page + token_off * padded_scale_per_token;
       uint8_t* dst_scale = buf_ptr + s_byte_offset;
       const uint8_t* src_scale = scale_ptr + i * scale_dim;
       std::memcpy(dst_scale, src_scale, scale_dim);
     }
   });
 }
-
 
 // set_k_cpu: scatter-copy index key data (fp8, viewed as uint8) into
 // a paged buffer for NSA (non-sparse attention) index cache.
@@ -302,9 +292,9 @@ void set_k_and_s_cpu(
 // index_k is fp8 (index_head_dim elements per token), stored as raw bytes.
 //
 void set_k_cpu(
-    at::Tensor& buf,       // [num_pages, buf_numel_per_page], uint8
-    at::Tensor& loc,       // [num_tokens], int32 or int64
-    at::Tensor& index_k,   // [num_tokens, index_head_dim], fp8 (viewed as uint8)
+    at::Tensor& buf,      // [num_pages, buf_numel_per_page], uint8
+    at::Tensor& loc,      // [num_tokens], int32 or int64
+    at::Tensor& index_k,  // [num_tokens, index_head_dim], fp8 (viewed as uint8)
     int64_t page_size,
     int64_t index_head_dim) {
   const int64_t num_tokens = loc.size(0);
@@ -324,8 +314,7 @@ void set_k_cpu(
       const int64_t page_idx = token_loc / page_size;
       const int64_t token_off = token_loc % page_size;
 
-      const int64_t dst_offset =
-          page_idx * buf_numel_per_page + token_off * num_k_bytes_per_token;
+      const int64_t dst_offset = page_idx * buf_numel_per_page + token_off * num_k_bytes_per_token;
 
       uint8_t* dst = buf_ptr + dst_offset;
       const uint8_t* src = k_ptr + i * num_k_bytes_per_token;
@@ -348,7 +337,6 @@ void set_k_cpu(
     }
   });
 }
-
 
 // set_s_cpu: scatter-copy scale values (fp32, viewed as 4 bytes uint8)
 // into a paged buffer for NSA (non-sparse attention) index cache.
@@ -386,10 +374,7 @@ void set_s_cpu(
       const int64_t page_idx = token_loc / page_size;
       const int64_t token_off = token_loc % page_size;
 
-      const int64_t dst_offset =
-          page_idx * buf_numel_per_page
-          + s_offset_in_page
-          + token_off * num_s_bytes_per_token;
+      const int64_t dst_offset = page_idx * buf_numel_per_page + s_offset_in_page + token_off * num_s_bytes_per_token;
 
       uint8_t* dst = buf_ptr + dst_offset;
       const uint8_t* src = scale_ptr + i * num_s_bytes_per_token;
@@ -400,24 +385,18 @@ void set_s_cpu(
   });
 }
 
-
-std::tuple<at::Tensor, at::Tensor, at::Tensor>
-quant_to_nope_fp8_rope_bf16_pack_cpu(at::Tensor& k_bf16) {
-  TORCH_CHECK(k_bf16.dtype() == at::kBFloat16,
-      "quant_to_nope_fp8_rope_bf16_pack_cpu: expect bf16 input, got ", k_bf16.dtype());
-  TORCH_CHECK(k_bf16.dim() == 2 && k_bf16.size(1) == 512,
-      "quant_to_nope_fp8_rope_bf16_pack_cpu: expect input shape [N, 512]");
-  TORCH_CHECK(k_bf16.is_contiguous(),
-      "quant_to_nope_fp8_rope_bf16_pack_cpu: expect contiguous input");
+std::tuple<at::Tensor, at::Tensor, at::Tensor> quant_to_nope_fp8_rope_bf16_pack_cpu(at::Tensor& k_bf16) {
+  TORCH_CHECK(
+      k_bf16.dtype() == at::kBFloat16, "quant_to_nope_fp8_rope_bf16_pack_cpu: expect bf16 input, got ", k_bf16.dtype());
+  TORCH_CHECK(
+      k_bf16.dim() == 2 && k_bf16.size(1) == 512, "quant_to_nope_fp8_rope_bf16_pack_cpu: expect input shape [N, 512]");
+  TORCH_CHECK(k_bf16.is_contiguous(), "quant_to_nope_fp8_rope_bf16_pack_cpu: expect contiguous input");
 
   const int64_t num_tokens = k_bf16.size(0);
 
-  auto k_nope_fp8 = at::empty({num_tokens, QUANT_DIM_NOPE},
-      k_bf16.options().dtype(at::kFloat8_e4m3fn));
-  auto k_rope_bf16 = at::empty({num_tokens, QUANT_DIM_ROPE},
-      k_bf16.options().dtype(at::kBFloat16));
-  auto scale_out = at::empty({num_tokens, QUANT_NUM_TILES},
-      k_bf16.options().dtype(at::kByte));
+  auto k_nope_fp8 = at::empty({num_tokens, QUANT_DIM_NOPE}, k_bf16.options().dtype(at::kFloat8_e4m3fn));
+  auto k_rope_bf16 = at::empty({num_tokens, QUANT_DIM_ROPE}, k_bf16.options().dtype(at::kBFloat16));
+  auto scale_out = at::empty({num_tokens, QUANT_NUM_TILES}, k_bf16.options().dtype(at::kByte));
 
   const at::BFloat16* input_ptr = k_bf16.data_ptr<at::BFloat16>();
   uint8_t* nope_ptr = reinterpret_cast<uint8_t*>(k_nope_fp8.data_ptr());
@@ -429,9 +408,7 @@ quant_to_nope_fp8_rope_bf16_pack_cpu(at::Tensor& k_bf16) {
       const at::BFloat16* src_token = input_ptr + t * 512;
 
       // Copy rope portion (last 64 bf16 values = 128 bytes)
-      std::memcpy(rope_ptr + t * QUANT_DIM_ROPE,
-                  src_token + QUANT_DIM_NOPE,
-                  QUANT_DIM_ROPE * sizeof(at::BFloat16));
+      std::memcpy(rope_ptr + t * QUANT_DIM_ROPE, src_token + QUANT_DIM_NOPE, QUANT_DIM_ROPE * sizeof(at::BFloat16));
 
       // Quantize each nope tile
       for (int64_t tile = 0; tile < QUANT_NUM_TILES; ++tile) {

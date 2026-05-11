@@ -6,8 +6,8 @@ import torch
 from sglang.test.test_utils import CustomTestCase
 
 try:
-    from sgl_kernel.flash_mla import flash_mla_with_kvcache_cpu
     import quant_utils as flashmla_quant
+    from sgl_kernel.flash_mla import flash_mla_with_kvcache_cpu
 
     _IMPORT_ERROR = None
 except Exception as _e:  # pragma: no cover - exercised only when kernel missing
@@ -25,9 +25,9 @@ _LAYOUT_DIMS = {
 
 
 def _ref_sparse_attn_decode(
-    q: torch.Tensor,                            # [B, S_q, H_q, D_qk] bf16
-    k_dequant: torch.Tensor,                    # [num_blocks, page_size, 1, D_qk] bf16
-    indices: torch.Tensor,                      # [B, S_q, topk] int32/int64
+    q: torch.Tensor,  # [B, S_q, H_q, D_qk] bf16
+    k_dequant: torch.Tensor,  # [num_blocks, page_size, 1, D_qk] bf16
+    indices: torch.Tensor,  # [B, S_q, topk] int32/int64
     topk_length,
     attn_sink,
     extra_k_dequant,
@@ -47,15 +47,14 @@ def _ref_sparse_attn_decode(
         topk = idxs.size(-1)
         idxs_fixed = torch.clamp_min(idxs, 0).to(torch.int64)
         flat_k = k_dq.reshape(-1, d_qk)
-        gathered = (
-            flat_k.index_select(0, idxs_fixed.reshape(-1))
-            .reshape(b, s_q, topk, d_qk)
+        gathered = flat_k.index_select(0, idxs_fixed.reshape(-1)).reshape(
+            b, s_q, topk, d_qk
         )
         invalid = idxs == -1
         if tl is not None:
-            tl_mask = torch.arange(topk, device=invalid.device).view(
-                1, 1, topk
-            ).expand(b, s_q, topk) >= tl.view(b, 1, 1)
+            tl_mask = torch.arange(topk, device=invalid.device).view(1, 1, topk).expand(
+                b, s_q, topk
+            ) >= tl.view(b, 1, 1)
             invalid = invalid | tl_mask
         return gathered, invalid
 
@@ -120,9 +119,7 @@ class TestFlashMLAWithKVCacheCPU(CustomTestCase):
     ):
         # Generate random BF16 K cache then quantize using the project's
         # reference helper.  Shape: [num_blocks, page_size, 1, d_qk] bf16.
-        k_bf16 = (
-            torch.randn(num_blocks, page_size, 1, d_qk, dtype=torch.bfloat16) * 0.5
-        )
+        k_bf16 = torch.randn(num_blocks, page_size, 1, d_qk, dtype=torch.bfloat16) * 0.5
         k_quant = flashmla_quant.quantize_k_cache(k_bf16, layout_enum)
         # Re-dequantize so the BF16 K used by the reference path matches the
         # one the kernel will see internally; this excludes quantization
@@ -133,9 +130,7 @@ class TestFlashMLAWithKVCacheCPU(CustomTestCase):
         return k_quant.contiguous(), k_dequant
 
     def _make_bf16_kv_cache(self, num_blocks, page_size, d_qk):
-        k_bf16 = (
-            torch.randn(num_blocks, page_size, 1, d_qk, dtype=torch.bfloat16) * 0.5
-        )
+        k_bf16 = torch.randn(num_blocks, page_size, 1, d_qk, dtype=torch.bfloat16) * 0.5
         k_bf16 = k_bf16.contiguous()
         return k_bf16, k_bf16
 
@@ -195,17 +190,15 @@ class TestFlashMLAWithKVCacheCPU(CustomTestCase):
                 as_uint8=fp8_cache_as_uint8,
             )
         else:
-            k_cache, k_dequant = self._make_bf16_kv_cache(
-                num_blocks, page_size, d_qk
-            )
-        total_tokens = valid_tokens if valid_tokens is not None else (num_blocks * page_size)
+            k_cache, k_dequant = self._make_bf16_kv_cache(num_blocks, page_size, d_qk)
+        total_tokens = (
+            valid_tokens if valid_tokens is not None else (num_blocks * page_size)
+        )
         indices = self._make_indices(
             b, s_q, topk, total_tokens, dtype=idx_dtype, invalid_ratio=invalid_ratio
         )
 
-        attn_sink = (
-            torch.randn(h_q, dtype=torch.float32) if have_attn_sink else None
-        )
+        attn_sink = torch.randn(h_q, dtype=torch.float32) if have_attn_sink else None
         topk_length = None
         if have_topk_length:
             if topk_length_value is None:
@@ -252,7 +245,7 @@ class TestFlashMLAWithKVCacheCPU(CustomTestCase):
                         (b,), extra_topk_length_value, dtype=torch.int32
                     )
 
-        sm_scale = d_qk ** -0.5
+        sm_scale = d_qk**-0.5
 
         out_cpu, lse_cpu = flash_mla_with_kvcache_cpu(
             q=q,
@@ -310,9 +303,9 @@ class TestFlashMLAWithKVCacheCPU(CustomTestCase):
     def test_basic_layouts_page_sizes_and_idx_dtypes(self):
         configs = list(
             itertools.product(
-                [64, 128, 256],                  # page_size
-                [1, 2],                     # fp8_layout (V32 / MODEL1)
-                [torch.int32, torch.int64], # idx_dtype
+                [64, 128, 256],  # page_size
+                [1, 2],  # fp8_layout (V32 / MODEL1)
+                [torch.int32, torch.int64],  # idx_dtype
             )
         )
         for page_size, fp8_layout, idx_dtype in configs:
@@ -337,11 +330,11 @@ class TestFlashMLAWithKVCacheCPU(CustomTestCase):
         # exact multiples of the kernel's BLOCK_N (128).
         configs = [
             # (b, s_q, h_q, topk, page_size, num_blocks, fp8_layout)
-            (1, 1, 16,  64,  64, 4, 1),
-            (1, 2, 32, 100,  64, 4, 2),
+            (1, 1, 16, 64, 64, 4, 1),
+            (1, 2, 32, 100, 64, 4, 2),
             (3, 1, 16, 200, 128, 3, 1),
             (2, 2, 16, 256, 128, 4, 2),
-            (1, 1, 64,  32,  64, 2, 2),
+            (1, 1, 64, 32, 64, 2, 2),
         ]
         for b, s_q, h_q, topk, page_size, num_blocks, layout in configs:
             with self.subTest(

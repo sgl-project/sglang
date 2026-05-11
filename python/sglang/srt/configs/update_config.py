@@ -135,6 +135,8 @@ def adjust_tp_num_heads_if_necessary(model_config, tp_size, is_post_update):
                     "linear_num_value_heads_cpu",
                     model_config.linear_num_value_heads,
                 )
+
+
 def _set_padded_attr(model_config, attr_name, value):
     if hasattr(model_config, attr_name):
         update_config(model_config, attr_name, value)
@@ -216,10 +218,7 @@ def adjust_config_with_unaligned_cpu_tp(
         and isinstance(o_groups, int)
         and o_groups > 0
         and model_config.num_attention_heads % o_groups == 0
-        and (
-            o_groups % tp_size != 0
-            or model_config.num_attention_heads % tp_size != 0
-        )
+        and (o_groups % tp_size != 0 or model_config.num_attention_heads % tp_size != 0)
     ):
         _set_padded_attr(model_config, "original_o_groups", o_groups)
 

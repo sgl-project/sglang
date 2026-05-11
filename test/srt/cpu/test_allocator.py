@@ -300,9 +300,12 @@ class TestAllocExtendKernel(CustomTestCase):
         # Reference (use int64 for reference)
         out_ref = torch.empty(extend_num_tokens, dtype=torch.int64)
         alloc_extend_kernel_pytorch(
-            pre_lens.to(torch.int64), seq_lens.to(torch.int64),
-            last_loc.to(torch.int64), free_pages.to(torch.int64),
-            out_ref, page_size
+            pre_lens.to(torch.int64),
+            seq_lens.to(torch.int64),
+            last_loc.to(torch.int64),
+            free_pages.to(torch.int64),
+            out_ref,
+            page_size,
         )
 
         # CPU kernel with int32
@@ -367,7 +370,9 @@ class TestAllocExtendKernel(CustomTestCase):
             last_loc[i] = last_page * page_size + in_page_offset
             page_counter += num_pages
 
-        free_pages = torch.arange(page_counter, page_counter + bs + 10, dtype=torch.int64)
+        free_pages = torch.arange(
+            page_counter, page_counter + bs + 10, dtype=torch.int64
+        )
 
         out_ref = torch.empty(bs, dtype=torch.int64)
         alloc_decode_kernel_pytorch(seq_lens, last_loc, free_pages, out_ref, page_size)
@@ -416,8 +421,11 @@ class TestAllocExtendKernel(CustomTestCase):
         # Reference
         out_ref = torch.empty(bs, dtype=torch.int64)
         alloc_decode_kernel_pytorch(
-            seq_lens.to(torch.int64), last_loc.to(torch.int64),
-            free_pages.to(torch.int64), out_ref, page_size
+            seq_lens.to(torch.int64),
+            last_loc.to(torch.int64),
+            free_pages.to(torch.int64),
+            out_ref,
+            page_size,
         )
 
         # CPU kernel with int32
@@ -434,10 +442,10 @@ class TestAllocExtendKernel(CustomTestCase):
     def test_int32_large_batch(self):
         self._run_test_int32(bs=256, page_size=16)
 
-
     @staticmethod
-    def bench_alloc_extend(bs, page_size, max_pre_len=512, max_extend_len=256,
-                           warmup=10, iters=100):
+    def bench_alloc_extend(
+        bs, page_size, max_pre_len=512, max_extend_len=256, warmup=10, iters=100
+    ):
         pre_lens, seq_lens, last_loc, free_pages, extend_num_tokens = (
             _gen_extend_test_data(bs, page_size, max_pre_len, max_extend_len)
         )
@@ -485,15 +493,11 @@ class TestAllocExtendKernel(CustomTestCase):
         # Benchmark reference (PyTorch)
         for _ in range(warmup):
             out = torch.empty(bs, dtype=torch.int64)
-            alloc_decode_kernel_pytorch(
-                seq_lens, last_loc, free_pages, out, page_size
-            )
+            alloc_decode_kernel_pytorch(seq_lens, last_loc, free_pages, out, page_size)
         t0 = time.perf_counter()
         for _ in range(iters):
             out = torch.empty(bs, dtype=torch.int64)
-            alloc_decode_kernel_pytorch(
-                seq_lens, last_loc, free_pages, out, page_size
-            )
+            alloc_decode_kernel_pytorch(seq_lens, last_loc, free_pages, out, page_size)
         ref_time = (time.perf_counter() - t0) / iters * 1e6  # us
 
         # Benchmark CPU kernel

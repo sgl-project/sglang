@@ -68,11 +68,12 @@ from sglang.srt.models.deepseek_v2 import (
     _is_hip,
     _is_npu,
 )
-from sglang.srt.utils import cpu_has_amx_support, is_cpu
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     LazyValue,
     add_prefix,
+    cpu_has_amx_support,
+    is_cpu,
     log_info_on_rank0,
     make_layers,
     use_intel_amx_backend,
@@ -81,6 +82,7 @@ from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
 _is_cpu = is_cpu()
 _cpu_amx = cpu_has_amx_support()
+
 
 def apply_rotary_emb_cpu(
     x: torch.Tensor,
@@ -91,8 +93,11 @@ def apply_rotary_emb_cpu(
     return torch.ops.sgl_kernel.apply_rotary_emb_interleaved_cpu(
         x, freqs_cis, inverse, positions
     )
-if (_is_cpu and _cpu_amx):
+
+
+if _is_cpu and _cpu_amx:
     apply_rotary_emb_triton = apply_rotary_emb_cpu
+
 
 def rms_normalize_cpu(
     x: torch.Tensor, eps: float, weight: Optional[torch.Tensor] = None
@@ -424,7 +429,11 @@ class MQALayer(nn.Module):
         if self.use_jit_norm:
             q = rmsnorm_self(q, self.eps)
         else:
-            q = rms_normalize_triton(q, self.eps) if not (_is_cpu and _cpu_amx) else rms_normalize_cpu(q, self.eps) 
+            q = (
+                rms_normalize_triton(q, self.eps)
+                if not (_is_cpu and _cpu_amx)
+                else rms_normalize_cpu(q, self.eps)
+            )
         if positions is not None:
             fused_rope(
                 q[..., -self.qk_rope_head_dim :],
@@ -549,7 +558,11 @@ class MQALayer(nn.Module):
         if self.use_jit_norm:
             q = rmsnorm_self(q, self.eps)
         else:
-            q = rms_normalize_triton(q, self.eps) if not (_is_cpu and _cpu_amx) else rms_normalize_cpu(q, self.eps) 
+            q = (
+                rms_normalize_triton(q, self.eps)
+                if not (_is_cpu and _cpu_amx)
+                else rms_normalize_cpu(q, self.eps)
+            )
 
         kv = self.kv_norm(kv)
 

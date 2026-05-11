@@ -405,6 +405,7 @@ class Compressor(nn.Module):
         ret = self._get_states(forward_batch)
         assert isinstance(ret, CompressStatePool)
         return ret
+
     def overlap_transform(self, tensor: torch.Tensor, fill_value: Any) -> torch.Tensor:
         assert tensor.dim() == 3
         assert tensor.shape[1:] == (self.ratio, 2 * self.head_dim)
@@ -474,7 +475,7 @@ class Compressor(nn.Module):
         """
         Reads from non-paged ``DeepSeekV4CompressState`` buffers.
         """
-        
+
         assert self.ape_converted
         seq_lens = forward_batch.seq_lens
         pool = self._get_states(forward_batch)
@@ -560,7 +561,9 @@ class Compressor(nn.Module):
 
         max_buffer_size = 2 * kv_and_score_states.shape[1] + kv_and_scores.shape[0]
         temp_buffer_shape = [max_buffer_size, head_dim_times_coff]
-        temp_buffer = KVAndScoreSeparate.empty_like(temp_buffer_shape, sep=kv_and_scores)
+        temp_buffer = KVAndScoreSeparate.empty_like(
+            temp_buffer_shape, sep=kv_and_scores
+        )
 
         assert kv_and_scores.kv.shape[-1] == self.head_dim * self.coff
         compressed_kv_output = torch.full(
@@ -653,17 +656,19 @@ class Compressor(nn.Module):
             pt += extend_lens[i]
 
         return compressed_kv_output
+
     def _get_freqs_cis_real(self):
         """Return freqs_cis as real float32 [N, rope_dim] for CPU kernel."""
         if not hasattr(self, "_freqs_cis_real"):
             fc = self.freqs_cis
             if fc.is_complex():
-                self._freqs_cis_real = torch.view_as_real(fc).contiguous().reshape(
-                    fc.size(0), -1
+                self._freqs_cis_real = (
+                    torch.view_as_real(fc).contiguous().reshape(fc.size(0), -1)
                 )
             else:
                 self._freqs_cis_real = fc.contiguous()
         return self._freqs_cis_real
+
     def compress_dispatch(
         self,
         kv_score: torch.Tensor,
@@ -686,22 +691,22 @@ class Compressor(nn.Module):
 
                 forward_mode = forward_batch.forward_mode
                 return torch.ops.sgl_kernel.compress_decode_cpu(
-                        pool.kv,
-                        pool.score,
-                        kv,
-                        score,
-                        forward_batch.seq_lens.to(torch.int64),
-                        forward_batch.req_pool_indices.to(torch.int64),
-                        self.ape,
-                        norm_weight,
-                        freqs_real,
-                        self.ratio,
-                        self.head_dim,
-                        self.rope_head_dim,
-                        self.overlap,
-                        self.rotate,
-                        self.norm.variance_epsilon,
-                    )
+                    pool.kv,
+                    pool.score,
+                    kv,
+                    score,
+                    forward_batch.seq_lens.to(torch.int64),
+                    forward_batch.req_pool_indices.to(torch.int64),
+                    self.ape,
+                    norm_weight,
+                    freqs_real,
+                    self.ratio,
+                    self.head_dim,
+                    self.rope_head_dim,
+                    self.overlap,
+                    self.rotate,
+                    self.norm.variance_epsilon,
+                )
             return self.compress_decode(kv_and_scores, forward_batch)
         if forward_mode.is_extend():
             return self.compress_extend(kv_and_scores, forward_batch)

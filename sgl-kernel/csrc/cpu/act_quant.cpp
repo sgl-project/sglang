@@ -27,7 +27,6 @@ void act_quant_cpu_impl(
     int64_t M,
     int64_t N,
     int64_t num_groups) {
-
   const int64_t total_blocks = M * num_groups;
   at::parallel_for(0, total_blocks, 0, [&](int64_t begin, int64_t end) {
     int64_t m = 0;
@@ -154,8 +153,8 @@ void act_quant_cpu_impl(
 
 }  // namespace
 
-std::tuple<at::Tensor, at::Tensor> act_quant_cpu(
-    at::Tensor& x, int64_t block_size, const std::optional<std::string>& scale_fmt) {
+std::tuple<at::Tensor, at::Tensor>
+act_quant_cpu(at::Tensor& x, int64_t block_size, const std::optional<std::string>& scale_fmt) {
   CHECK_INPUT(x);
   TORCH_CHECK(x.dim() >= 1, "x must have at least 1 dimension");
   TORCH_CHECK(block_size > 0, "block_size must be positive");
@@ -175,9 +174,23 @@ std::tuple<at::Tensor, at::Tensor> act_quant_cpu(
   const bool round_scale = scale_fmt.has_value();
   CPU_DISPATCH_FLOATING_TYPES(x.scalar_type(), "act_quant_cpu", [&] {
     if (round_scale) {
-      act_quant_cpu_impl<true>(y.data_ptr<at::Float8_e4m3fn>(), scale.data_ptr<float>(), x.data_ptr<scalar_t>(), block_size, M, N, num_groups);
+      act_quant_cpu_impl<true>(
+          y.data_ptr<at::Float8_e4m3fn>(),
+          scale.data_ptr<float>(),
+          x.data_ptr<scalar_t>(),
+          block_size,
+          M,
+          N,
+          num_groups);
     } else {
-      act_quant_cpu_impl<false>(y.data_ptr<at::Float8_e4m3fn>(), scale.data_ptr<float>(), x.data_ptr<scalar_t>(), block_size, M, N, num_groups);
+      act_quant_cpu_impl<false>(
+          y.data_ptr<at::Float8_e4m3fn>(),
+          scale.data_ptr<float>(),
+          x.data_ptr<scalar_t>(),
+          block_size,
+          M,
+          N,
+          num_groups);
     }
   });
 

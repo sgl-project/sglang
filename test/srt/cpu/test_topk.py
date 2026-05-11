@@ -1,14 +1,17 @@
 import unittest
+from typing import Optional
 
 import torch
-from typing import Optional
-from sglang.srt.layers.moe.topk import (
-    _mask_topk_ids_padded_region,
-    biased_grouped_topk_impl as native_biased_grouped_topk,
-)
+
 from sglang.srt.eplb.expert_location_dispatch import (
     ExpertLocationDispatchInfo,
     topk_ids_logical_to_physical,
+)
+from sglang.srt.layers.moe.topk import (
+    _mask_topk_ids_padded_region,
+)
+from sglang.srt.layers.moe.topk import (
+    biased_grouped_topk_impl as native_biased_grouped_topk,
 )
 from sglang.srt.layers.moe.topk import fused_topk_torch_native as native_fused_topk
 from sglang.srt.layers.moe.topk import grouped_topk_gpu as native_grouped_topk
