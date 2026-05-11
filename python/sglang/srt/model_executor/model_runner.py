@@ -1105,24 +1105,7 @@ class ModelRunner:
 
         self._load_model_with_memory_saver()
 
-        # Publish metadata to ModelExpress if running as seed source
-        if self.server_args.modelexpress_source:
-            # Seed loads via DefaultModelLoader (load_format=auto), which doesn't
-            # call register_memory_region(). Do it here so weight_info is populated.
-            if (
-                self.remote_instance_weight_transport.weight_info is None
-                and self.remote_instance_weight_transport.engine is not None
-            ):
-                from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
-                    register_memory_region,
-                )
-
-                self.remote_instance_weight_transport.weight_info = (
-                    register_memory_region(
-                        self.model, self.remote_instance_weight_transport.engine
-                    )
-                )
-            self.remote_instance_weight_transport._publish_modelexpress_metadata()
+        self._maybe_publish_modelexpress_metadata()
 
         if not self.is_draft_worker:
             get_offloader().post_init()
@@ -1325,6 +1308,26 @@ class ModelRunner:
         if _is_npu:
             torch.npu.empty_cache()
         monkey_patch_vllm_parallel_state(reverse=True)
+
+    def _maybe_publish_modelexpress_metadata(self) -> None:
+        # Publish metadata to ModelExpress if running as seed source
+        if self.server_args.modelexpress_source:
+            # Seed loads via DefaultModelLoader (load_format=auto), which doesn't
+            # call register_memory_region(). Do it here so weight_info is populated.
+            if (
+                self.remote_instance_weight_transport.weight_info is None
+                and self.remote_instance_weight_transport.engine is not None
+            ):
+                from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
+                    register_memory_region,
+                )
+
+                self.remote_instance_weight_transport.weight_info = (
+                    register_memory_region(
+                        self.model, self.remote_instance_weight_transport.engine
+                    )
+                )
+            self.remote_instance_weight_transport._publish_modelexpress_metadata()
 
     def maybe_recover_ep_ranks(self):
         # TODO(perf): `active_ranks.all()` on a CUDA tensor triggers host-device
