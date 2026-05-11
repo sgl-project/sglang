@@ -59,7 +59,7 @@ from sglang.srt.layers.attention.compressed.metadata import (
 from sglang.srt.layers.attention.debug_flash_mla_adapter import (
     flash_mla_with_kvcache_entrypoint,
 )
-from sglang.srt.layers.attention.deepseek_v4_backend import _pad_last_dim
+from sglang.srt.layers.attention.deepseek_v4_backend_hip import _pad_last_dim
 from sglang.srt.layers.attention.nsa.quant_k_cache_v4 import (
     quant_to_nope_fp8_rope_bf16_pack_triton,
 )

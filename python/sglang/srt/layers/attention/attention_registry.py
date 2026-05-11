@@ -109,7 +109,7 @@ def create_dsv4_backend(runner):
             )
             return DeepseekV4BackendRadix(runner)
         else:
-            from sglang.srt.layers.attention.deepseek_v4_backend import (
+            from sglang.srt.layers.attention.deepseek_v4_backend_hip import (
                 DeepseekV4Backend,
             )
 
@@ -118,7 +118,7 @@ def create_dsv4_backend(runner):
             )
             return DeepseekV4Backend(runner)
     else:
-        from sglang.srt.layers.attention.deepseek_v4_backend_original import (
+        from sglang.srt.layers.attention.deepseek_v4_backend import (
             DeepseekV4AttnBackend,
         )
 

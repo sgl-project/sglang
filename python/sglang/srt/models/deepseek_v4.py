@@ -111,7 +111,7 @@ _FP8_WO_A_GEMM = envs.SGLANG_OPT_FP8_WO_A_GEMM.get()
 
 
 if TYPE_CHECKING:
-    from sglang.srt.layers.attention.deepseek_v4_backend import DeepseekV4Backend
+    from sglang.srt.layers.attention.deepseek_v4_backend_hip import DeepseekV4Backend
     from sglang.srt.layers.quantization import QuantizationConfig
     from sglang.srt.layers.rotary_embedding import RotaryEmbedding
     from sglang.srt.model_executor.forward_batch_info import (
