@@ -84,6 +84,11 @@ def create_device_graphs(model_runner: "ModelRunner") -> tuple[object, float]:
 
 
 def create_piecewise_cuda_graphs(model_runner: "ModelRunner"):
+    # TODO: split this function into smaller helpers (skip-bail / resolve_layer_model
+    # / collect_attention_layer / collect_moe_block / return _LayerProbes dataclass).
+    # Hold off until @ch-wan's refactor of the surrounding piecewise CUDA graph code
+    # lands — splitting now would conflict with their in-flight changes to the layer
+    # walking logic.
     """Initialize piecewise CUDA graph runner."""
     piecewise_cuda_graph_runner = None
 
