@@ -189,7 +189,6 @@ from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
 from sglang.srt.managers.scheduler_recv_skipper import SchedulerRecvSkipper
 from sglang.srt.managers.scheduler_runtime_checker_mixin import (
     SchedulerRuntimeCheckerMixin,
-    create_scheduler_watchdog,
 )
 from sglang.srt.managers.utils import GenerationBatchResult, validate_input_length
 from sglang.srt.mem_cache.common import maybe_cache_unfinished_req, release_kv_cache
@@ -239,6 +238,7 @@ from sglang.srt.utils.network import get_zmq_socket
 from sglang.srt.utils.numa_utils import get_numa_node_if_available, numa_bind_to_node
 from sglang.srt.utils.tensor_bridge import use_mlx
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
+from sglang.srt.utils.watchdog import WatchdogRaw
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
 
 if is_mps():
@@ -321,6 +321,30 @@ def validate_dflash_request(req: Req) -> Optional[str]:
         )
 
     return None
+
+
+def create_scheduler_watchdog(
+    scheduler: "Scheduler", watchdog_timeout: float, soft: bool = False
+) -> WatchdogRaw:
+    def dump_info() -> str:
+        if scheduler.is_initializing:
+            return ""
+        _, messages = scheduler._check_all_pools(
+            scheduler.pool_stats_observer.get_pool_stats()
+        )
+        return (
+            f"{scheduler.cur_batch.batch_size()=}\n"
+            f"{scheduler.cur_batch.reqs=}\n" + "\n".join(messages)
+        )
+
+    return WatchdogRaw(
+        debug_name="Scheduler",
+        get_counter=lambda: scheduler.forward_ct,
+        is_active=lambda: scheduler.is_initializing or scheduler.cur_batch is not None,
+        watchdog_timeout=watchdog_timeout,
+        soft=soft,
+        dump_info=dump_info,
+    )
 
 
 class Scheduler(
