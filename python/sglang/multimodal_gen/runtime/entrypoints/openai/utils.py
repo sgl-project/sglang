@@ -22,7 +22,6 @@ from sglang.multimodal_gen.runtime.entrypoints.utils import (
     SetLoraReq,
     ShutdownReq,
     UnmergeLoraWeightsReq,
-    expand_request_outputs,
     format_lora_message,
     save_outputs,
 )
@@ -326,9 +325,8 @@ async def process_generation_batch(
     batch,
 ) -> tuple[list[str], OutputBatch]:
     total_start_time = time.perf_counter()
-    requests = expand_request_outputs(batch)
     with trace_req(batch.trace_ctx), log_generation_timer(logger, batch.prompt):
-        result = await scheduler_client.forward(requests)
+        result = await scheduler_client.forward([batch])
 
         if result.output is None and result.output_file_paths is None:
             error_msg = result.error or "Unknown error"
@@ -338,22 +336,14 @@ async def process_generation_batch(
 
         if result.output_file_paths:
             save_file_path_list = result.output_file_paths
-            if len(save_file_path_list) < len(requests):
-                raise RuntimeError(
-                    f"Expected at least {len(requests)} output paths, "
-                    f"got {len(save_file_path_list)}"
-                )
         else:
-            if len(result.output) != len(requests):
-                raise RuntimeError(
-                    f"Expected {len(requests)} outputs, got {len(result.output)}"
-                )
+            num_outputs = len(result.output)
             save_file_path_list = save_outputs(
                 result.output,
                 batch.data_type,
                 batch.fps,
                 batch.save_output,
-                lambda idx: str(requests[idx].output_file_path(1, 0)),
+                lambda idx: str(batch.output_file_path(num_outputs, idx)),
                 audio=result.audio,
                 audio_sample_rate=result.audio_sample_rate,
                 output_compression=batch.output_compression,
@@ -367,7 +357,12 @@ async def process_generation_batch(
             )
 
     total_time = time.perf_counter() - total_start_time
-    log_batch_completion(logger, len(save_file_path_list), total_time)
+    if get_global_server_args().batching_max_size > 1:
+        log_batch_completion(
+            logger,
+            len(save_file_path_list),
+            total_time,
+        )
 
     if result.peak_memory_mb and result.peak_memory_mb > 0:
         logger.info(f"Peak memory usage: {result.peak_memory_mb:.2f} MB")

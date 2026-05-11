@@ -179,6 +179,49 @@ def _group_norm_apply_kernel(
         tl.store(output_ptr + group_base + idx, y, mask=mask)
 
 
+@triton.jit
+def _group_norm_apply_scalar_affine_kernel(
+    input_ptr,
+    weight_ptr,
+    bias_ptr,
+    output_ptr,
+    stats_ptr,
+    channels,
+    spatial_size,
+    num_groups,
+    channels_per_group,
+    group_size,
+    chunks_per_row,
+    BLOCK_SIZE: tl.constexpr,
+    BLOCKS_PER_PROGRAM: tl.constexpr,
+):
+    row = tl.program_id(0).to(tl.int64)
+    chunk_id = tl.program_id(1).to(tl.int64)
+
+    batch_id = row // num_groups
+    group_id = row - batch_id * num_groups
+    chunk_start = chunk_id * BLOCK_SIZE * BLOCKS_PER_PROGRAM
+    group_base = batch_id * channels * spatial_size + group_id * group_size
+
+    channel_id = chunk_start // spatial_size
+    affine_offset = group_id * channels_per_group + channel_id
+    weight = tl.load(weight_ptr + affine_offset).to(tl.float32)
+    bias = tl.load(bias_ptr + affine_offset).to(tl.float32)
+
+    mean = tl.load(stats_ptr + row * 2)
+    rstd = tl.load(stats_ptr + row * 2 + 1)
+    offsets = tl.arange(0, BLOCK_SIZE)
+
+    for block_id in range(BLOCKS_PER_PROGRAM):
+        idx = chunk_start + block_id * BLOCK_SIZE + offsets
+        mask = idx < group_size
+        x = tl.load(input_ptr + group_base + idx, mask=mask, other=0.0).to(tl.float32)
+        y = (x - mean) * rstd
+        y = y * weight + bias
+        y = y * tl.sigmoid(y)
+        tl.store(output_ptr + group_base + idx, y, mask=mask)
+
+
 def _group_norm_silu_native(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -197,6 +240,7 @@ def _can_use_triton_group_norm_silu(
 ) -> bool:
     return (
         x.is_cuda
+        and not torch.is_grad_enabled()
         and not x.requires_grad
         and x.dtype in _SUPPORTED_DTYPES
         and x.ndim in (2, 3, 4, 5)
@@ -294,23 +338,42 @@ def _launch_chunked(
         num_stages=2,
     )
 
-    _group_norm_apply_kernel[(rows, chunks_per_row)](
-        x_flat,
-        weight,
-        bias,
-        y_flat,
-        stats,
-        channels,
-        spatial_size,
-        num_groups,
-        channels_per_group,
-        group_size,
-        chunks_per_row,
-        BLOCK_SIZE=_BLOCK_SIZE,
-        BLOCKS_PER_PROGRAM=_BLOCKS_PER_PROGRAM,
-        num_warps=8,
-        num_stages=3,
-    )
+    if spatial_size % _CHUNK_SIZE == 0 and chunks_per_row >= 64:
+        _group_norm_apply_scalar_affine_kernel[(rows, chunks_per_row)](
+            x_flat,
+            weight,
+            bias,
+            y_flat,
+            stats,
+            channels,
+            spatial_size,
+            num_groups,
+            channels_per_group,
+            group_size,
+            chunks_per_row,
+            BLOCK_SIZE=_BLOCK_SIZE,
+            BLOCKS_PER_PROGRAM=_BLOCKS_PER_PROGRAM,
+            num_warps=4,
+            num_stages=3,
+        )
+    else:
+        _group_norm_apply_kernel[(rows, chunks_per_row)](
+            x_flat,
+            weight,
+            bias,
+            y_flat,
+            stats,
+            channels,
+            spatial_size,
+            num_groups,
+            channels_per_group,
+            group_size,
+            chunks_per_row,
+            BLOCK_SIZE=_BLOCK_SIZE,
+            BLOCKS_PER_PROGRAM=_BLOCKS_PER_PROGRAM,
+            num_warps=8,
+            num_stages=3,
+        )
     return y
 
 
