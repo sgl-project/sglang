@@ -424,6 +424,17 @@ class Scheduler(
         # Init inter-process communication
         self.init_ipc_channels(port_args)
 
+        # Mode-conditional fields: pre-declare so they always exist on the
+        # instance. Subsequent init_disaggregation / init_mm / init_overlap
+        # overwrites when applicable. Eliminates getattr(self, "X", default)
+        # defenses downstream.
+        self.mm_receiver = None
+        self.disagg_prefill_bootstrap_queue = None
+        self.disagg_prefill_inflight_queue = None
+        self.disagg_decode_prealloc_queue = None
+        self.disagg_decode_transfer_queue = None
+        self.enable_overlap_mlx = False
+
         # Init PD-multiplexing context
         if self.enable_pdmux:
             self.init_pdmux()
