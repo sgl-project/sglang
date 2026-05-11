@@ -1363,6 +1363,9 @@ class Scheduler(
         self.batch_record_ct = 0
 
     def maybe_init_ngram_embedding(self):
+        self.ngram_embedding_manager = (
+            self.tp_worker.model_runner.ngram_embedding_manager
+        )
         self.use_ngram_embedding = self.tp_worker.model_config.use_ngram_embedding
         if self.use_ngram_embedding:
             self.token_table = self.tp_worker.model_runner.token_table
@@ -1370,13 +1373,14 @@ class Scheduler(
             self.ngram_embedding_n = hf_config.ngram_embedding_n
             self.ngram_embedding_k = hf_config.ngram_embedding_k
 
-    def _maybe_prepare_ngram_embedding(
-        self, batch: Optional[ScheduleBatch]
+    @staticmethod
+    def prepare_for_forward(
+        self: "NgramEmbeddingManager", batch: Optional[ScheduleBatch]
     ) -> Optional[ScheduleBatch]:
         """Fill the token table for ngram embedding before a forward pass."""
-        if batch is None or not self.use_ngram_embedding:
+        if batch is None or not self.enabled:
             return batch
-        batch.ne_token_table = self.token_table
+        batch.ne_token_table = self.table
         if batch.forward_mode == ForwardMode.EXTEND:
             all_tokens = []
             column_starts = []
@@ -1388,19 +1392,19 @@ class Scheduler(
                 if start == 0:
                     tokens = fill_ids[start:end]
                     column_starts.append(0)
-                elif start < self.ngram_embedding_n:
+                elif start < self.n:
                     tokens = fill_ids[0:end]
                     column_starts.append(0)
                 else:
                     # Prepend n-1 tokens before prefix_len for n-gram context
-                    tokens = fill_ids[start - self.ngram_embedding_n + 1 : end]
-                    column_starts.append(start - self.ngram_embedding_n + 1)
+                    tokens = fill_ids[start - self.n + 1 : end]
+                    column_starts.append(start - self.n + 1)
                 all_tokens.extend(tokens)
                 request_lengths.append(len(tokens))
-            dtype = self.token_table.dtype
-            device = self.token_table.device
+            dtype = self.table.dtype
+            device = self.table.device
             update_token_table(
-                ne_token_table=self.token_table,
+                ne_token_table=self.table,
                 tokens=torch.tensor(all_tokens, dtype=dtype, device=device),
                 row_indices=batch.req_pool_indices,
                 column_starts=torch.tensor(
@@ -2590,7 +2594,7 @@ class Scheduler(
         ret = self.maybe_prepare_mlp_sync_batch(ret, need_sync=need_mlp_sync)
 
         # Handle ngram embedding
-        ret = self._maybe_prepare_ngram_embedding(ret)
+        ret = Scheduler.prepare_for_forward(self.ngram_embedding_manager, ret)
 
         if ret:
             set_schedule_time_batch(ret)
