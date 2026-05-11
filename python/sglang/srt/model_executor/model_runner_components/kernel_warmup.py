@@ -199,3 +199,30 @@ def _run_flashinfer_autotune(
             dummy_run_callable(batch_size=req_to_token_pool_size)
     torch.cuda.current_stream().wait_stream(forward_stream)
     logger.info("FlashInfer autotune completed.")
+
+
+def _pre_initialize_flashinfer_allreduce_workspace(
+    *,
+    server_args: ServerArgs,
+    model_config: ModelConfig,
+    dtype: torch.dtype,
+):
+    """Pre-initialize flashinfer allreduce fusion workspaces.
+
+    Must run before CUDA graph capture to avoid collective operations
+    (broadcasts, barriers) inside the graph capture context, which can
+    deadlock with custom_all_reduce.register_graph_buffers.
+    """
+    if not server_args.enable_flashinfer_allreduce_fusion:
+        return
+
+    from sglang.srt.layers.communicator import FUSE_ALLREDUCE_MAX_BATCH_SIZE
+    from sglang.srt.layers.flashinfer_comm_fusion import (
+        pre_initialize_workspaces,
+    )
+
+    pre_initialize_workspaces(
+        max_token_num=FUSE_ALLREDUCE_MAX_BATCH_SIZE,
+        hidden_dim=model_config.hidden_size,
+        dtype=dtype,
+    )
