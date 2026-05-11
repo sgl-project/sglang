@@ -152,13 +152,10 @@ class MatchResult(NamedTuple):
 
 
 def zero_match_result(tree_cache, match_result: "MatchResult") -> "MatchResult":
-    root = getattr(tree_cache, "root_node", None)
-    if root is None:
-        raise RuntimeError(
-            f"SGLANG_RADIX_FORCE_MISS is not supported by {type(tree_cache).__name__} "
-            "(no `root_node` attribute). Disable the flag or use a cache backend "
-            "that exposes a tree root."
-        )
+    if tree_cache.is_chunk_cache():
+        # Chunk caches' match_prefix already returns a miss; no root_node to walk back to.
+        return match_result
+    root = tree_cache.root_node
     return match_result._replace(
         # [:0] keeps dtype and device of the original tensor (e.g. CUDA int64)
         # without allocating a fresh empty tensor.
