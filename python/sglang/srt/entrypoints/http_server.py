@@ -146,7 +146,6 @@ from sglang.srt.managers.multi_tokenizer_mixin import (
     MultiTokenizerRouter,
     TokenizerWorker,
     get_main_process_id,
-    monkey_patch_uvicorn_multiprocessing,
     read_from_shared_memory,
     write_data_for_multi_tokenizer,
 )
@@ -2282,7 +2281,6 @@ def _setup_and_run_http_server(
                 "level": "INFO",
                 "propagate": False,
             }
-            monkey_patch_uvicorn_multiprocessing()
 
             if server_args.enable_ssl_refresh:
                 logger.warning(
@@ -2298,6 +2296,8 @@ def _setup_and_run_http_server(
                 root_path=server_args.fastapi_root_path,
                 log_level=server_args.log_level_http or server_args.log_level,
                 timeout_keep_alive=envs.SGLANG_TIMEOUT_KEEP_ALIVE.get(),
+                # use configurable timeout_worker_healthcheck instead of monkey patch uvicorn
+                timeout_worker_healthcheck=envs.SGLANG_TIMEOUT_WORKER_HEALTHCHECK.get(),
                 loop="uvloop",
                 workers=server_args.tokenizer_worker_num,
                 ssl_keyfile=server_args.ssl_keyfile,
