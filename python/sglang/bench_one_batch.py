@@ -359,9 +359,11 @@ def prepare_inputs_for_correctness_test(bench_args, tokenizer, custom_prompts):
 
     reqs = []
     for i in range(len(prompts)):
-        assert len(input_ids[i]) > bench_args.cut_len
+        assert len(input_ids[i]) > bench_args.cut_len or bench_args.cut_len == 0
 
-        tmp_input_ids = input_ids[i][: bench_args.cut_len]
+        tmp_input_ids = (
+            input_ids[i] if bench_args.cut_len == 0 else input_ids[i][: bench_args.cut_len]
+        )
         req = Req(
             rid=i,
             origin_input_text=prompts[i],
