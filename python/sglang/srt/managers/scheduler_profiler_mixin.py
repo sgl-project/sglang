@@ -14,7 +14,6 @@ from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import is_npu
 from sglang.srt.utils.profile_merger import ProfileMerger
-from sglang.srt.utils.profile_utils import ProfileManager
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import ScheduleBatch
@@ -35,34 +34,6 @@ logger = logging.getLogger(__name__)
 
 
 class SchedulerProfilerMixin:
-    def init_profiler(self: Scheduler):
-        if envs.SGLANG_PROFILE_V2.get():
-            self._profile_manager = ProfileManager(
-                ps=self.ps,
-                cpu_group=self.dp_tp_cpu_group,
-            )
-            return
-
-        self.torch_profiler = None
-        self.torch_profiler_output_dir: Optional[Path] = None
-        self.profiler_activities: Optional[List[str]] = None
-        self.profile_id: Optional[str] = None
-
-        self.profiler_start_forward_ct: Optional[int] = None
-        self.profiler_target_forward_ct: Optional[int] = None
-
-        self.profiler_prefill_ct: Optional[int] = None
-        self.profiler_decode_ct: Optional[int] = None
-        self.profiler_target_prefill_ct: Optional[int] = None
-        self.profiler_target_decode_ct: Optional[int] = None
-
-        self.profile_by_stage: bool = False
-        self.profile_in_progress: bool = False
-        self.merge_profiles = False
-
-        # For ROCM
-        self.rpd_profiler = None
-
     def _init_profile(
         self: Scheduler,
         output_dir: Optional[str],
