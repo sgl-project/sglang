@@ -890,6 +890,12 @@ class ServerArgs:
         # Handle memory-related, chunked prefill, and CUDA graph batch size configurations.
         self._handle_gpu_memory_settings(gpu_mem)
 
+        # enforce_disable_flashinfer_allreduce_fusion must be set before
+        # _handle_model_specific_adjustments, which auto-enables the fusion
+        # for several SM90/SM100 MoE arches.
+        if self.enable_deterministic_inference:
+            self.enforce_disable_flashinfer_allreduce_fusion = True
+
         # Apply model-specific adjustments.
         self._handle_model_specific_adjustments()
 
@@ -2459,8 +2465,8 @@ class ServerArgs:
                 )
 
             assert (
-                is_cuda() or is_musa()
-            ), "Mamba extra_buffer is only supported on CUDA and MUSA devices with FLA backend"
+                is_cuda() or is_musa() or is_npu()
+            ), "Mamba extra_buffer is only supported on CUDA and MUSA and NPU devices with FLA backend"
             if self.speculative_num_draft_tokens is not None:
                 assert (
                     self.mamba_track_interval >= self.speculative_num_draft_tokens
@@ -4077,6 +4083,12 @@ class ServerArgs:
                     "Disable --enable-aiter-allreduce-fusion because deterministic inference is enabled."
                 )
                 self.enable_aiter_allreduce_fusion = False
+
+            if self.enable_flashinfer_allreduce_fusion:
+                logger.warning(
+                    "Disable --enable-flashinfer-allreduce-fusion because deterministic inference is enabled."
+                )
+                self.enable_flashinfer_allreduce_fusion = False
 
             # Check sampling backend
             self.sampling_backend = "pytorch"

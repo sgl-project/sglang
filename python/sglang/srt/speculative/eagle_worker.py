@@ -1130,16 +1130,17 @@ class EAGLEWorker(TpModelWorker):
             # All reqs finished this verify; swap to an idle ExtendInput.
             batch = batch.copy()
             batch.prepare_for_idle()
+            target_cfg = self.target_worker.model_runner.model_config
             hidden_size = (
-                self.model_config.hidden_size * 3
+                target_cfg.hidden_size * 3
                 if self.speculative_algorithm.is_eagle3()
                 and self.eagle_use_aux_hidden_state
-                else self.model_config.spec_hidden_size
+                else target_cfg.spec_hidden_size
             )
             draft_extend_input = EagleDraftExtendInput.create_idle_input(
                 device=self.device,
                 hidden_size=hidden_size,
-                dtype=self.model_config.dtype,
+                dtype=target_cfg.dtype,
                 capture_hidden_mode=CaptureHiddenMode.LAST,
             )
             batch.spec_info = draft_extend_input
