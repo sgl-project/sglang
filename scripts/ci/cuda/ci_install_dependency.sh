@@ -1,9 +1,8 @@
 #!/bin/bash
-# Install dependencies for CUDA CI jobs.
-#
-# CU_VERSION (default: cu130) controls PyTorch index URL, FlashInfer JIT cache
-# index, and nvrtc variant selection.
+# Install dependencies for CUDA CI jobs. All runners use CUDA 13.
 set -euxo pipefail
+
+CU_VERSION="cu130"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
@@ -28,12 +27,6 @@ mark_step_done() {
 # ---------------------------------------------------------------------------
 
 configure_environment() {
-    # CU_VERSION controls PyTorch index URL, FlashInfer JIT cache index, and
-    # nvrtc variant selection (cu12 vs cu13).
-    CU_VERSION="${CU_VERSION:-cu130}"
-    CU_STRIP="${CU_VERSION#cu}"
-    CU_MAJOR="${CU_STRIP:0:2}"
-
     OPTIONAL_DEPS="${1:-}"
 
     # Whether to create a uv venv (set USE_VENV=1). Default: 0.
@@ -273,33 +266,13 @@ install_sglang_kernel() {
         fi
     fi
 
-    # Reinstall torch with matching CUDA version if needed
-    # TODO: Remove after torch 2.11 where cu13 is enabled by default
-    TORCH_CUDA_VER=$(python3 -c "import torch; v=torch.version.cuda; parts=v.split('.'); print(f'cu{parts[0]}{parts[1]}')")
-    echo "Detected torch CUDA version: ${TORCH_CUDA_VER}"
-    if [ "${TORCH_CUDA_VER}" != "${CU_VERSION}" ]; then
-        TORCH_VER=$(pip show torch 2>/dev/null | grep "^Version:" | awk '{print $2}' | sed 's/+.*//')
-        TORCHAUDIO_VER=$(pip show torchaudio 2>/dev/null | grep "^Version:" | awk '{print $2}' | sed 's/+.*//')
-        TORCHVISION_VER=$(pip show torchvision 2>/dev/null | grep "^Version:" | awk '{print $2}' | sed 's/+.*//')
-        echo "Reinstalling torch==${TORCH_VER} torchaudio==${TORCHAUDIO_VER} torchvision==${TORCHVISION_VER} from ${CU_VERSION} index to match torch..."
-        $PIP_CMD install "torch==${TORCH_VER}" "torchaudio==${TORCHAUDIO_VER}" "torchvision==${TORCHVISION_VER}" --index-url "https://download.pytorch.org/whl/${CU_VERSION}" --force-reinstall --no-deps $PIP_INSTALL_SUFFIX
-    fi
-
     if [ "${CUSTOM_BUILD_SGL_KERNEL:-}" != "true" ]; then
-        # install_sglang above pulls sglang-kernel from PyPI, whose default wheel
-        # tracks one CUDA version (currently cu130). Force-reinstall from the
-        # CU_VERSION-matched sglang wheel index so runners on a different CUDA
-        # (e.g. h20 / cu129) get a wheel linked against the right libnvrtc.
         $PIP_CMD install "sglang-kernel==${SGL_KERNEL_VERSION_FROM_SRT}" --index-url "https://docs.sglang.ai/whl/${CU_VERSION}/" --force-reinstall --no-deps $PIP_INSTALL_SUFFIX
     else
         echo "CUSTOM_BUILD_SGL_KERNEL=true: keeping freshly built sgl-kernel wheel."
     fi
     SGL_DEEP_GEMM_VERSION=$(grep -Po -m1 '(?<=sgl-deep-gemm==)[0-9A-Za-z\.\-]+' python/pyproject.toml)
-    if [ "$CU_MAJOR" = "13" ]; then
-        $PIP_CMD install "sgl-deep-gemm==${SGL_DEEP_GEMM_VERSION}" --force-reinstall $PIP_INSTALL_SUFFIX
-    else
-        $PIP_CMD install "https://github.com/sgl-project/whl/releases/download/v${SGL_DEEP_GEMM_VERSION}/sgl_deep_gemm-${SGL_DEEP_GEMM_VERSION}+cu129-py3-none-manylinux2014_$(uname -m).whl" --force-reinstall $PIP_INSTALL_SUFFIX
-    fi
+    $PIP_CMD install "sgl-deep-gemm==${SGL_DEEP_GEMM_VERSION}" --force-reinstall $PIP_INSTALL_SUFFIX
 
     mark_step_done "${FUNCNAME[0]}"
 }
@@ -374,15 +347,9 @@ stabilize_flashinfer_jit_paths() {
 }
 
 install_extra_deps() {
-    if [ "$CU_MAJOR" = "13" ]; then
-        MOONCAKE_PKG="mooncake-transfer-engine-cuda13==0.3.10.post2"
-        MOONCAKE_STALE_PKG="mooncake-transfer-engine"
-        EXTRA_NVIDIA_SPECS="nvidia-cuda-nvrtc"
-    else
-        MOONCAKE_PKG="mooncake-transfer-engine==0.3.10.post2"
-        MOONCAKE_STALE_PKG="mooncake-transfer-engine-cuda13"
-        EXTRA_NVIDIA_SPECS="nvidia-cuda-nvrtc-cu12"
-    fi
+    MOONCAKE_PKG="mooncake-transfer-engine-cuda13==0.3.10.post2"
+    MOONCAKE_STALE_PKG="mooncake-transfer-engine"
+    EXTRA_NVIDIA_SPECS="nvidia-cuda-nvrtc"
     # Both variants own the same mooncake/ package files and bin/ scripts
     # (mooncake_master, etc.). Uninstalling the stale variant deletes shared
     # files that the live variant's RECORD still references, so we force a
