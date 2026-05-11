@@ -626,29 +626,10 @@ class TokenizerManager(TokenizerControlMixin):
                 self.rid_to_state[objs[i].rid].time_stats.set_finished_time()
                 del self.rid_to_state[objs[i].rid]
 
-        # Wait for all requests
-        is_stream = hasattr(obj, "stream") and obj.stream
-        if not is_stream:
-            outputs = await asyncio.gather(*(gen.__anext__() for gen in generators))
-            yield outputs
-        else:
-            rid_to_index = {rid: i for i, rid in enumerate(rids)}
-            task_map = {asyncio.create_task(gen.__anext__()): gen for gen in generators}
-            while task_map:
-                done, _ = await asyncio.wait(
-                    task_map.keys(), return_when=asyncio.FIRST_COMPLETED
-                )
-
-                for task in done:
-                    gen = task_map.pop(task)
-                    try:
-                        result = task.result()
-                        result["index"] = rid_to_index[result["meta_info"]["id"]]
-                        yield result
-                        new_task = asyncio.create_task(gen.__anext__())
-                        task_map[new_task] = gen
-                    except StopAsyncIteration:
-                        pass
+        async for x in self.response_emitter._handle_batch_request(
+            obj, rids=rids, generators=generators, request=request
+        ):
+            yield x
 
     def abort_request(self, rid: str = "", abort_all: bool = False):
         if not abort_all and rid not in self.rid_to_state:
