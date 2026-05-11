@@ -256,29 +256,15 @@ class SchedulerBatchResultProcessor:
                     self._maybe_collect_customized_info(i, req, logits_output)
 
                     if batch.return_logprob:
-                        assert extend_logprob_start_len_per_req is not None
-                        assert extend_input_len_per_req is not None
-                        extend_logprob_start_len = extend_logprob_start_len_per_req[i]
-                        extend_input_len = extend_input_len_per_req[i]
-
-                        num_input_logprobs = (
-                            self.logprob_result_processor.calculate_num_input_logprobs(
-                                req,
-                                extend_input_len,
-                                extend_logprob_start_len,
-                            )
+                        logprob_pt = self._apply_prefill_logprobs(
+                            req=req,
+                            i=i,
+                            logits_output=logits_output,
+                            extend_input_len_per_req=extend_input_len_per_req,
+                            extend_logprob_start_len_per_req=extend_logprob_start_len_per_req,
+                            next_token_ids=next_token_ids,
+                            logprob_pt=logprob_pt,
                         )
-
-                        if req.return_logprob:
-                            self.logprob_result_processor.add_logprob_return_values(
-                                i,
-                                req,
-                                logprob_pt,
-                                next_token_ids,
-                                num_input_logprobs,
-                                logits_output,
-                            )
-                        logprob_pt += num_input_logprobs
 
                     if (
                         req.return_hidden_states
@@ -319,25 +305,14 @@ class SchedulerBatchResultProcessor:
 
                     # Incrementally update input logprobs.
                     if batch.return_logprob:
-                        extend_logprob_start_len = extend_logprob_start_len_per_req[i]
-                        extend_input_len = extend_input_len_per_req[i]
-                        if extend_logprob_start_len < extend_input_len:
-                            # Update input logprobs.
-                            num_input_logprobs = self.logprob_result_processor.calculate_num_input_logprobs(
-                                req,
-                                extend_input_len,
-                                extend_logprob_start_len,
-                            )
-                            if req.return_logprob:
-                                self.logprob_result_processor.add_input_logprob_return_values(
-                                    i,
-                                    req,
-                                    logits_output,
-                                    logprob_pt,
-                                    num_input_logprobs,
-                                    last_prefill_chunk=False,
-                                )
-                            logprob_pt += num_input_logprobs
+                        logprob_pt = self._apply_chunked_prefill_logprobs(
+                            req=req,
+                            i=i,
+                            logits_output=logits_output,
+                            extend_input_len_per_req=extend_input_len_per_req,
+                            extend_logprob_start_len_per_req=extend_logprob_start_len_per_req,
+                            logprob_pt=logprob_pt,
+                        )
 
                     req.time_stats.set_last_chunked_prefill_finish_time()
 
@@ -406,6 +381,73 @@ class SchedulerBatchResultProcessor:
             can_run_cuda_graph=can_run_cuda_graph,
             dp_cooperation_info=batch.dp_cooperation_info,
         )
+
+    def _apply_prefill_logprobs(
+        self,
+        *,
+        req: Req,
+        i: int,
+        logits_output: LogitsProcessorOutput,
+        extend_input_len_per_req: Optional[List[int]],
+        extend_logprob_start_len_per_req: Optional[List[int]],
+        next_token_ids: List[int],
+        logprob_pt: int,
+    ) -> int:
+        assert extend_logprob_start_len_per_req is not None
+        assert extend_input_len_per_req is not None
+        extend_logprob_start_len = extend_logprob_start_len_per_req[i]
+        extend_input_len = extend_input_len_per_req[i]
+
+        num_input_logprobs = self.logprob_result_processor.calculate_num_input_logprobs(
+            req,
+            extend_input_len,
+            extend_logprob_start_len,
+        )
+
+        if req.return_logprob:
+            self.logprob_result_processor.add_logprob_return_values(
+                i,
+                req,
+                logprob_pt,
+                next_token_ids,
+                num_input_logprobs,
+                logits_output,
+            )
+        logprob_pt += num_input_logprobs
+        return logprob_pt
+
+    def _apply_chunked_prefill_logprobs(
+        self,
+        *,
+        req: Req,
+        i: int,
+        logits_output: LogitsProcessorOutput,
+        extend_input_len_per_req: Optional[List[int]],
+        extend_logprob_start_len_per_req: Optional[List[int]],
+        logprob_pt: int,
+    ) -> int:
+        extend_logprob_start_len = extend_logprob_start_len_per_req[i]
+        extend_input_len = extend_input_len_per_req[i]
+        if extend_logprob_start_len < extend_input_len:
+            # Update input logprobs.
+            num_input_logprobs = (
+                self.logprob_result_processor.calculate_num_input_logprobs(
+                    req,
+                    extend_input_len,
+                    extend_logprob_start_len,
+                )
+            )
+            if req.return_logprob:
+                self.logprob_result_processor.add_input_logprob_return_values(
+                    i,
+                    req,
+                    logits_output,
+                    logprob_pt,
+                    num_input_logprobs,
+                    last_prefill_chunk=False,
+                )
+            logprob_pt += num_input_logprobs
+        return logprob_pt
 
     def _resolve_spec_overlap_tokens(
         self,
