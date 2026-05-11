@@ -641,6 +641,14 @@ class SchedulerOutputProcessorMixin:
             self.decode_offload_manager.offload_kv_cache(req)
 
         if req.finished():
+            # In PP, a chunked req can appear in multiple microbatches' in-flight
+            # batches concurrently. When the mb that holds the LAST chunk runs
+            # OP first, it releases the row; later, another mb's lagging batch
+            # arrives at OP with req.finished()=True but req_pool_idx already
+            # None. Skip the duplicate release in that case.
+            if req.kv_committed_freed:
+                return
+
             # delete feature to save memory
             if req.multimodal_inputs is not None and req.session is None:
                 req.multimodal_inputs.release_features()
