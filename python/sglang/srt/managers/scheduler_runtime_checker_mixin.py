@@ -12,6 +12,9 @@ from sglang.srt.utils.common import ceil_align, raise_error_or_warn
 
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import Scheduler
+    from sglang.srt.managers.scheduler_components.invariant_checker import (
+        SchedulerInvariantChecker,
+    )
 
 logger = logging.getLogger(__name__)
 
@@ -36,8 +39,9 @@ class SchedulerRuntimeCheckerMixin:
         )
         return leak, msg
 
+    @staticmethod
     def _check_full_pool(
-        self: Scheduler, ps: PoolStats, uncached: int = 0
+        self: "SchedulerInvariantChecker", ps: PoolStats, uncached: int = 0
     ) -> Tuple[bool, str]:
         if self.is_hybrid_swa:
             protected = self.tree_cache.full_protected_size()
@@ -51,7 +55,7 @@ class SchedulerRuntimeCheckerMixin:
             protected = self.tree_cache.protected_size()
             session_held = self.pool_stats_observer.session_held_tokens()
             total = self.max_total_num_tokens
-        return self._check_pool_invariant(
+        return SchedulerRuntimeCheckerMixin._check_pool_invariant(
             "full",
             ps.full_available_size,
             ps.full_evictable_size,
@@ -61,10 +65,11 @@ class SchedulerRuntimeCheckerMixin:
             uncached,
         )
 
+    @staticmethod
     def _check_swa_pool(
-        self: Scheduler, ps: PoolStats, uncached: int = 0
+        self: "SchedulerInvariantChecker", ps: PoolStats, uncached: int = 0
     ) -> Tuple[bool, str]:
-        return self._check_pool_invariant(
+        return SchedulerRuntimeCheckerMixin._check_pool_invariant(
             "swa",
             ps.swa_available_size,
             ps.swa_evictable_size,
@@ -74,8 +79,11 @@ class SchedulerRuntimeCheckerMixin:
             uncached,
         )
 
-    def _check_mamba_pool(self: Scheduler, ps: PoolStats) -> Tuple[bool, str]:
-        leak, msg = self._check_pool_invariant(
+    @staticmethod
+    def _check_mamba_pool(
+        self: "SchedulerInvariantChecker", ps: PoolStats
+    ) -> Tuple[bool, str]:
+        leak, msg = SchedulerRuntimeCheckerMixin._check_pool_invariant(
             "mamba",
             ps.mamba_available_size,
             ps.mamba_evictable_size,
@@ -112,7 +120,10 @@ class SchedulerRuntimeCheckerMixin:
             )
         return leak, msg
 
-    def _get_total_uncached_sizes(self: Scheduler) -> Tuple[int, int]:
+    @staticmethod
+    def _get_total_uncached_sizes(
+        self: "SchedulerInvariantChecker",
+    ) -> Tuple[int, int]:
         """Sum uncached tokens for full and SWA pools across all active batches.
 
         Returns (full_uncached, swa_uncached). For non-SWA models, swa_uncached is 0.
@@ -122,12 +133,12 @@ class SchedulerRuntimeCheckerMixin:
         """
         # After decode: running_batch IS last_batch (same object), count once.
         # After prefill: they differ, both hold uncached tokens.
-        batches = [self.last_batch]
+        batches = [self.get_last_batch()]
         if (
-            self.running_batch not in (None, self.last_batch)
-            and not self.running_batch.is_empty()
+            self.get_running_batch() not in (None, self.get_last_batch())
+            and not self.get_running_batch().is_empty()
         ):
-            batches.append(self.running_batch)
+            batches.append(self.get_running_batch())
 
         full_uncached = 0
         swa_uncached = 0
@@ -150,8 +161,9 @@ class SchedulerRuntimeCheckerMixin:
 
         return full_uncached, swa_uncached
 
-    def self_check_during_busy(self: Scheduler):
-        if self.last_batch is None:
+    @staticmethod
+    def self_check_during_busy(self: "SchedulerInvariantChecker"):
+        if self.get_last_batch() is None:
             return
 
         spec_topk = self.server_args.speculative_eagle_topk or 1
@@ -162,13 +174,19 @@ class SchedulerRuntimeCheckerMixin:
             return
 
         ps = self.pool_stats_observer.get_pool_stats()
-        full_uncached, swa_uncached = self._get_total_uncached_sizes()
+        full_uncached, swa_uncached = (
+            SchedulerRuntimeCheckerMixin._get_total_uncached_sizes(self)
+        )
 
-        full_leak, full_msg = self._check_full_pool(ps, uncached=full_uncached)
+        full_leak, full_msg = SchedulerRuntimeCheckerMixin._check_full_pool(
+            self, ps, uncached=full_uncached
+        )
 
         swa_leak, swa_msg = False, ""
         if self.is_hybrid_swa:
-            swa_leak, swa_msg = self._check_swa_pool(ps, uncached=swa_uncached)
+            swa_leak, swa_msg = SchedulerRuntimeCheckerMixin._check_swa_pool(
+                self, ps, uncached=swa_uncached
+            )
 
         if envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get() > 1:
             logger.info(f"[Mem Check (BUSY)] {full_msg}")
@@ -177,7 +195,8 @@ class SchedulerRuntimeCheckerMixin:
         assert not full_leak, f"Full Pool Mem Leak Detected! {full_msg}"
         assert not swa_leak, f"SWA Pool Mem Leak Detected! {swa_msg}"
 
-    def _check_req_pool(self: Scheduler):
+    @staticmethod
+    def _check_req_pool(self: "SchedulerInvariantChecker"):
         if self.disaggregation_mode == DisaggregationMode.DECODE:
             req_total_size = (
                 self.req_to_token_pool.size + self.req_to_token_pool.pre_alloc_size
@@ -200,7 +219,8 @@ class SchedulerRuntimeCheckerMixin:
                 msg,
             )
 
-    def _report_leak(self: Scheduler, pool_name: str, token_msg: str):
+    @staticmethod
+    def _report_leak(self: "SchedulerInvariantChecker", pool_name: str, token_msg: str):
         msg = f"{pool_name} memory leak detected! {token_msg}"
         raise_error_or_warn(
             self,
@@ -209,24 +229,29 @@ class SchedulerRuntimeCheckerMixin:
             msg,
         )
 
+    @staticmethod
     def _check_all_pools(
-        self: Scheduler, ps: PoolStats, uncached: int = 0
+        self: "SchedulerInvariantChecker", ps: PoolStats, uncached: int = 0
     ) -> Tuple[bool, List[str]]:
         """Check memory invariant across all pools. Returns (has_leak, messages)."""
         has_leak = False
         messages = []
 
-        full_leak, full_msg = self._check_full_pool(ps, uncached=uncached)
+        full_leak, full_msg = SchedulerRuntimeCheckerMixin._check_full_pool(
+            self, ps, uncached=uncached
+        )
         has_leak |= full_leak
         messages.append(full_msg)
 
         if self.is_hybrid_swa:
-            swa_leak, swa_msg = self._check_swa_pool(ps)
+            swa_leak, swa_msg = SchedulerRuntimeCheckerMixin._check_swa_pool(self, ps)
             has_leak |= swa_leak
             messages.append(swa_msg)
 
         if self.is_hybrid_ssm and self.tree_cache.supports_mamba():
-            mamba_leak, mamba_msg = self._check_mamba_pool(ps)
+            mamba_leak, mamba_msg = SchedulerRuntimeCheckerMixin._check_mamba_pool(
+                self, ps
+            )
             has_leak |= mamba_leak
             messages.append(mamba_msg)
 
@@ -269,7 +294,8 @@ class SchedulerRuntimeCheckerMixin:
             )
         self.metrics_collector.log_stats(self.stats)
 
-    def _check_tree_cache(self: Scheduler):
+    @staticmethod
+    def _check_tree_cache(self: "SchedulerInvariantChecker"):
         if (
             self.tree_cache.is_tree_cache()
             and (self.is_hybrid_swa and self.tree_cache.supports_swa())
