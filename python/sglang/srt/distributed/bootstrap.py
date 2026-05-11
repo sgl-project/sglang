@@ -86,9 +86,7 @@ def init_torch_distributed(
     dist_init_method = _resolve_dist_init_method(
         server_args=server_args, dist_port=dist_port
     )
-    set_custom_all_reduce(not server_args.disable_custom_all_reduce)
-    set_mscclpp_all_reduce(server_args.enable_mscclpp)
-    set_torch_symm_mem_all_reduce(server_args.enable_torch_symm_mem)
+    _set_all_reduce_flags(server_args=server_args)
 
     if not is_draft_worker:
         if device == "cpu":
@@ -227,3 +225,9 @@ def _resolve_dist_init_method(*, server_args: ServerArgs, dist_port: int) -> str
             server_args.host or "127.0.0.1", dist_port
         ).to_tcp()
     return dist_init_method
+
+
+def _set_all_reduce_flags(*, server_args: ServerArgs) -> None:
+    set_custom_all_reduce(not server_args.disable_custom_all_reduce)
+    set_mscclpp_all_reduce(server_args.enable_mscclpp)
+    set_torch_symm_mem_all_reduce(server_args.enable_torch_symm_mem)
