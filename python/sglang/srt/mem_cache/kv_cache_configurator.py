@@ -228,11 +228,6 @@ class KVCacheConfigurator:
                 extra_max_context_len += self.server_args.speculative_num_draft_tokens
 
             if self.server_args.disaggregation_mode == "decode":
-                from sglang.srt.disaggregation.decode import (
-                    DecodeReqToTokenPool,
-                    HybridMambaDecodeReqToTokenPool,
-                )
-
                 # subscribe memory for pre-allocated requests
                 # if max_num_reqs <= 32, we pre-allocate 2x requests
 
@@ -240,66 +235,27 @@ class KVCacheConfigurator:
                 pre_alloc_size = (
                     max_num_reqs * 2 if max_num_reqs <= 32 else pre_alloc_size
                 )
-                if config := self.mambaish_config:
-                    req_to_token_pool = HybridMambaDecodeReqToTokenPool(
-                        size=max_num_reqs,
-                        max_context_len=self.model_config.context_len
-                        + extra_max_context_len,
-                        device=self.device,
-                        enable_memory_saver=self.server_args.enable_memory_saver,
-                        cache_params=config.mamba2_cache_params,
-                        mamba_layer_ids=(
-                            [
-                                i
-                                for i in config.mamba2_cache_params.layers
-                                if self.start_layer <= i < self.end_layer
-                            ]
-                        ),
-                        speculative_num_draft_tokens=self.server_args.speculative_num_draft_tokens,
-                        enable_mamba_extra_buffer=self.server_args.enable_mamba_extra_buffer(),
+                if self.mambaish_config:
+                    req_to_token_pool = self._hybrid_mamba_decode_req_pool(
+                        max_num_reqs=max_num_reqs,
+                        extra_max_context_len=extra_max_context_len,
                         pre_alloc_size=pre_alloc_size,
-                        enable_overlap_schedule=not self.server_args.disable_overlap_schedule,
-                        mamba_size=self.server_args.max_mamba_cache_size,
-                        start_layer=self.start_layer,
                     )
                 else:
-                    req_to_token_pool = DecodeReqToTokenPool(
-                        size=max_num_reqs,
-                        max_context_len=self.model_config.context_len
-                        + extra_max_context_len,
-                        device=self.device,
-                        enable_memory_saver=self.server_args.enable_memory_saver,
+                    req_to_token_pool = self._decode_req_pool(
+                        max_num_reqs=max_num_reqs,
+                        extra_max_context_len=extra_max_context_len,
                         pre_alloc_size=pre_alloc_size,
                     )
-            elif config := self.mambaish_config:
-                req_to_token_pool = HybridReqToTokenPool(
-                    size=max_num_reqs,
-                    mamba_size=self.server_args.max_mamba_cache_size,
-                    mamba_spec_state_size=max_num_reqs,
-                    max_context_len=self.model_config.context_len
-                    + extra_max_context_len,
-                    device=self.device,
-                    enable_memory_saver=self.server_args.enable_memory_saver,
-                    cache_params=config.mamba2_cache_params,
-                    mamba_layer_ids=(
-                        [
-                            i
-                            for i in config.mamba2_cache_params.layers
-                            if self.start_layer <= i < self.end_layer
-                        ]
-                    ),
-                    enable_mamba_extra_buffer=self.server_args.enable_mamba_extra_buffer(),
-                    speculative_num_draft_tokens=self.server_args.speculative_num_draft_tokens,
-                    enable_overlap_schedule=not self.server_args.disable_overlap_schedule,
-                    start_layer=self.start_layer,
+            elif self.mambaish_config:
+                req_to_token_pool = self._hybrid_req_pool(
+                    max_num_reqs=max_num_reqs,
+                    extra_max_context_len=extra_max_context_len,
                 )
             else:
-                req_to_token_pool = ReqToTokenPool(
-                    size=max_num_reqs,
-                    max_context_len=self.model_config.context_len
-                    + extra_max_context_len,
-                    device=self.device,
-                    enable_memory_saver=self.server_args.enable_memory_saver,
+                req_to_token_pool = self._default_req_pool(
+                    max_num_reqs=max_num_reqs,
+                    extra_max_context_len=extra_max_context_len,
                 )
         else:
             # Draft worker shares req_to_token_pool with the target worker.
@@ -743,6 +699,93 @@ class KVCacheConfigurator:
                     swa_allocator.full_to_swa_index_mapping
                 )
         return req_to_token_pool, token_to_kv_pool, token_to_kv_pool_allocator
+
+    def _hybrid_mamba_decode_req_pool(
+        self,
+        *,
+        max_num_reqs: int,
+        extra_max_context_len: int,
+        pre_alloc_size: int,
+    ) -> ReqToTokenPool:
+        from sglang.srt.disaggregation.decode import HybridMambaDecodeReqToTokenPool
+
+        return HybridMambaDecodeReqToTokenPool(
+            size=max_num_reqs,
+            max_context_len=self.model_config.context_len + extra_max_context_len,
+            device=self.device,
+            enable_memory_saver=self.server_args.enable_memory_saver,
+            cache_params=self.mambaish_config.mamba2_cache_params,
+            mamba_layer_ids=(
+                [
+                    i
+                    for i in self.mambaish_config.mamba2_cache_params.layers
+                    if self.start_layer <= i < self.end_layer
+                ]
+            ),
+            speculative_num_draft_tokens=self.server_args.speculative_num_draft_tokens,
+            enable_mamba_extra_buffer=self.server_args.enable_mamba_extra_buffer(),
+            pre_alloc_size=pre_alloc_size,
+            enable_overlap_schedule=not self.server_args.disable_overlap_schedule,
+            mamba_size=self.server_args.max_mamba_cache_size,
+            start_layer=self.start_layer,
+        )
+
+    def _decode_req_pool(
+        self,
+        *,
+        max_num_reqs: int,
+        extra_max_context_len: int,
+        pre_alloc_size: int,
+    ) -> ReqToTokenPool:
+        from sglang.srt.disaggregation.decode import DecodeReqToTokenPool
+
+        return DecodeReqToTokenPool(
+            size=max_num_reqs,
+            max_context_len=self.model_config.context_len + extra_max_context_len,
+            device=self.device,
+            enable_memory_saver=self.server_args.enable_memory_saver,
+            pre_alloc_size=pre_alloc_size,
+        )
+
+    def _hybrid_req_pool(
+        self,
+        *,
+        max_num_reqs: int,
+        extra_max_context_len: int,
+    ) -> ReqToTokenPool:
+        return HybridReqToTokenPool(
+            size=max_num_reqs,
+            mamba_size=self.server_args.max_mamba_cache_size,
+            mamba_spec_state_size=max_num_reqs,
+            max_context_len=self.model_config.context_len + extra_max_context_len,
+            device=self.device,
+            enable_memory_saver=self.server_args.enable_memory_saver,
+            cache_params=self.mambaish_config.mamba2_cache_params,
+            mamba_layer_ids=(
+                [
+                    i
+                    for i in self.mambaish_config.mamba2_cache_params.layers
+                    if self.start_layer <= i < self.end_layer
+                ]
+            ),
+            enable_mamba_extra_buffer=self.server_args.enable_mamba_extra_buffer(),
+            speculative_num_draft_tokens=self.server_args.speculative_num_draft_tokens,
+            enable_overlap_schedule=not self.server_args.disable_overlap_schedule,
+            start_layer=self.start_layer,
+        )
+
+    def _default_req_pool(
+        self,
+        *,
+        max_num_reqs: int,
+        extra_max_context_len: int,
+    ) -> ReqToTokenPool:
+        return ReqToTokenPool(
+            size=max_num_reqs,
+            max_context_len=self.model_config.context_len + extra_max_context_len,
+            device=self.device,
+            enable_memory_saver=self.server_args.enable_memory_saver,
+        )
 
     def _profile_available_bytes(self, pre_model_load_memory: int) -> int:
         post_model_load_memory = get_available_gpu_memory(
