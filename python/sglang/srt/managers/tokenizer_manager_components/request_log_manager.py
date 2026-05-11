@@ -1,7 +1,23 @@
 from __future__ import annotations
 
+import asyncio
+import logging
+import os
+import pickle
+import socket
+import sys
 from collections import deque
 from dataclasses import dataclass, field
+from datetime import datetime
+from typing import Dict
+
+from sglang.srt.managers.tokenizer_manager_components.request_state import ReqState
+from sglang.srt.observability.req_time_stats import (
+    convert_time_to_realtime,
+    real_time,
+)
+
+logger = logging.getLogger(__name__)
 from typing import List, Tuple
 
 from sglang.srt.observability.request_metrics_exporter import (
@@ -46,3 +62,165 @@ class RequestLogManager:
             request_metrics_exporter_manager=request_metrics_exporter_manager,
             crash_dump_folder=server_args.crash_dump_folder,
         )
+
+    def dump_requests(self, state: ReqState, out_dict: dict):
+        if self.dump_requests_exclude_meta_keys and isinstance(
+            out_dict.get("meta_info"), dict
+        ):
+            exclude = self.dump_requests_exclude_meta_keys
+            if any(k in out_dict["meta_info"] for k in exclude):
+                filtered_meta = {
+                    k: v for k, v in out_dict["meta_info"].items() if k not in exclude
+                }
+                out_dict = {**out_dict, "meta_info": filtered_meta}
+
+        self.dump_request_list.append(
+            (
+                state.obj,
+                out_dict,
+                convert_time_to_realtime(state.time_stats.created_time),
+                convert_time_to_realtime(state.time_stats.finished_time),
+            )
+        )
+
+        if len(self.dump_request_list) >= self.dump_requests_threshold:
+            filename = os.path.join(
+                self.dump_requests_folder,
+                datetime.now().strftime("%Y-%m-%d_%H-%M-%S") + ".pkl",
+            )
+            self._dump_data_to_file(
+                data_list=self.dump_request_list,
+                filename=filename,
+                log_message=f"Dump {len(self.dump_request_list)} requests to {filename}",
+            )
+            self.dump_request_list = []
+
+    def record_request_for_crash_dump(self, state: ReqState, out_dict: dict):
+        current_time = real_time()
+        self.crash_dump_request_list.append(
+            (
+                state.obj,
+                out_dict,
+                convert_time_to_realtime(state.time_stats.created_time),
+                current_time,
+            )
+        )
+        # Remove requests older than 5 minutes based on finish time
+        while (
+            self.crash_dump_request_list
+            and current_time - self.crash_dump_request_list[0][3] >= 300
+        ):
+            self.crash_dump_request_list.popleft()
+
+    def _dump_data_to_file(
+        self,
+        data_list: List[Tuple],
+        filename: str,
+        log_message: str,
+    ):
+        logger.info(log_message)
+        to_dump_with_server_args = {
+            "server_args": self.server_args,
+            "requests": data_list.copy(),
+        }
+
+        def background_task():
+            os.makedirs(os.path.dirname(filename), exist_ok=True)
+            with open(filename, "wb") as f:
+                try:
+                    pickle.dump(to_dump_with_server_args, f)
+                except Exception as e:
+                    # When the server is launched with --trust-remote-code,
+                    # server_args sometimes fails to pickle. Retry without
+                    # server_args so the request data still gets persisted.
+                    logger.error(
+                        f"Failed to pickle dump with server_args: {e!r}; "
+                        "retrying without server_args"
+                    )
+                    f.seek(0)
+                    f.truncate()
+                    to_dump_with_server_args["server_args"] = None
+                    pickle.dump(to_dump_with_server_args, f)
+
+        asyncio.create_task(asyncio.to_thread(background_task))
+
+    def dump_requests_before_crash(
+        self,
+        *,
+        rid_to_state: Dict[str, ReqState],
+        hostname: str = os.getenv("HOSTNAME", socket.gethostname()),
+    ):
+        if not self.crash_dump_folder:
+            return
+
+        if self.crash_dump_performed:
+            logger.info(
+                "SIGTERM/SIGQUIT/Exception triggered, but crash dump already performed, skipping."
+            )
+            return
+        else:
+            self.crash_dump_performed = True
+
+        logger.error(f"Dumping requests before crash. {self.crash_dump_folder=}")
+
+        # Add finished requests from crash_dump_request_list
+        data_to_dump = []
+        if self.crash_dump_request_list:
+            data_to_dump.extend(self.crash_dump_request_list)
+
+        # Add unfinished requests from rid_to_state
+        unfinished_requests = []
+        for rid, state in rid_to_state.items():
+            if not state.finished:
+                state.time_stats.set_finished_time()
+                unfinished_requests.append(
+                    (
+                        state.obj,
+                        (
+                            state.out_list[-1]
+                            if state.out_list
+                            else state.get_crash_dump_output()
+                        ),
+                        convert_time_to_realtime(state.time_stats.created_time),
+                        convert_time_to_realtime(state.time_stats.finished_time),
+                    )
+                )
+        if unfinished_requests:
+            data_to_dump.extend(unfinished_requests)
+
+        if not data_to_dump:
+            return
+
+        # Create a file
+        filename = os.path.join(
+            self.crash_dump_folder,
+            hostname,
+            f'crash_dump_{datetime.now().strftime("%Y-%m-%d_%H-%M-%S")}.pkl',
+        )
+        os.makedirs(os.path.dirname(filename), exist_ok=True)
+
+        # Write the data to the file
+        data_to_dump_with_server_args = {
+            "server_args": self.server_args,  # Include server_args in the dump
+            "requests": data_to_dump,
+            "launch_command": " ".join(sys.argv),
+        }
+        with open(filename, "wb") as f:
+            try:
+                pickle.dump(data_to_dump_with_server_args, f)
+            except Exception as e:
+                # When the server is launched with --trust-remote-code,
+                # server_args sometimes fails to pickle. Retry without
+                # server_args so the request data still gets persisted.
+                logger.error(
+                    f"Failed to pickle dump with server_args: {e!r}; "
+                    "retrying without server_args"
+                )
+                f.seek(0)
+                f.truncate()
+                data_to_dump_with_server_args["server_args"] = None
+                pickle.dump(data_to_dump_with_server_args, f)
+        logger.error(
+            f"Dumped {len(self.crash_dump_request_list)} finished and {len(unfinished_requests)} unfinished requests before crash to {filename}"
+        )
+        return filename
