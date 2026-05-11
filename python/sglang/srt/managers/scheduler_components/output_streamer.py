@@ -144,55 +144,15 @@ class SchedulerOutputStreamer:
             acc.accept(req=req)
             self._maybe_log_time_stats(req=req)
 
-        dp_ranks = [self.ps.dp_rank] * len(acc.rids) if acc.rids else None
-
         # Send to detokenizer
-        if reqs or is_idle_batch:
-            self.send_to_detokenizer.send_output(
-                BatchTokenIDOutput(
-                    rids=acc.rids,
-                    http_worker_ipcs=acc.http_worker_ipcs,
-                    spec_verify_ct=acc.spec_verify_ct,
-                    spec_num_correct_drafts=acc.spec_num_correct_drafts,
-                    spec_correct_drafts_histogram=acc.spec_correct_drafts_histogram,
-                    time_stats=acc.time_stats,
-                    finished_reasons=acc.finished_reasons,
-                    decoded_texts=acc.decoded_texts,
-                    decode_ids=acc.decode_ids_list,
-                    read_offsets=acc.read_offsets,
-                    output_ids=acc.output_ids,
-                    skip_special_tokens=acc.skip_special_tokens,
-                    spaces_between_special_tokens=acc.spaces_between_special_tokens,
-                    no_stop_trim=acc.no_stop_trim,
-                    prompt_tokens=acc.prompt_tokens,
-                    reasoning_tokens=acc.reasoning_tokens,
-                    completion_tokens=acc.completion_tokens,
-                    cached_tokens=acc.cached_tokens,
-                    cached_tokens_details=acc.cached_tokens_details,
-                    input_token_logprobs_val=acc.input_token_logprobs_val,
-                    input_token_logprobs_idx=acc.input_token_logprobs_idx,
-                    output_token_logprobs_val=acc.output_token_logprobs_val,
-                    output_token_logprobs_idx=acc.output_token_logprobs_idx,
-                    input_top_logprobs_val=acc.input_top_logprobs_val,
-                    input_top_logprobs_idx=acc.input_top_logprobs_idx,
-                    output_top_logprobs_val=acc.output_top_logprobs_val,
-                    output_top_logprobs_idx=acc.output_top_logprobs_idx,
-                    input_token_ids_logprobs_val=acc.input_token_ids_logprobs_val,
-                    input_token_ids_logprobs_idx=acc.input_token_ids_logprobs_idx,
-                    output_token_ids_logprobs_val=acc.output_token_ids_logprobs_val,
-                    output_token_ids_logprobs_idx=acc.output_token_ids_logprobs_idx,
-                    output_token_entropy_val=None,
-                    output_hidden_states=acc.output_hidden_states or None,
-                    routed_experts=acc.routed_experts or None,
-                    indexer_topk=acc.indexer_topk or None,
-                    customized_info=acc.customized_info,
-                    placeholder_tokens_idx=None,
-                    placeholder_tokens_val=None,
-                    retraction_counts=acc.retraction_counts,
-                    load=load,
-                    dp_ranks=dp_ranks,
-                )
-            )
+        payload = acc.to_payload(
+            load=load,
+            dp_rank=self.ps.dp_rank,
+            is_idle_batch=is_idle_batch,
+            has_reqs=bool(reqs),
+        )
+        if payload is not None:
+            self.send_to_detokenizer.send_output(payload)
 
     def _maybe_log_time_stats(self, *, req: Req) -> None:
         if (
@@ -488,4 +448,49 @@ class _GenerationStreamAccumulator:
     def to_payload(
         self, *, load, dp_rank: int, is_idle_batch: bool, has_reqs: bool
     ) -> Optional[BatchTokenIDOutput]:
-        raise NotImplementedError
+        if not (has_reqs or is_idle_batch):
+            return None
+        dp_ranks = [dp_rank] * len(self.rids) if self.rids else None
+        return BatchTokenIDOutput(
+            rids=self.rids,
+            http_worker_ipcs=self.http_worker_ipcs,
+            spec_verify_ct=self.spec_verify_ct,
+            spec_num_correct_drafts=self.spec_num_correct_drafts,
+            spec_correct_drafts_histogram=self.spec_correct_drafts_histogram,
+            time_stats=self.time_stats,
+            finished_reasons=self.finished_reasons,
+            decoded_texts=self.decoded_texts,
+            decode_ids=self.decode_ids_list,
+            read_offsets=self.read_offsets,
+            output_ids=self.output_ids,
+            skip_special_tokens=self.skip_special_tokens,
+            spaces_between_special_tokens=self.spaces_between_special_tokens,
+            no_stop_trim=self.no_stop_trim,
+            prompt_tokens=self.prompt_tokens,
+            reasoning_tokens=self.reasoning_tokens,
+            completion_tokens=self.completion_tokens,
+            cached_tokens=self.cached_tokens,
+            cached_tokens_details=self.cached_tokens_details,
+            input_token_logprobs_val=self.input_token_logprobs_val,
+            input_token_logprobs_idx=self.input_token_logprobs_idx,
+            output_token_logprobs_val=self.output_token_logprobs_val,
+            output_token_logprobs_idx=self.output_token_logprobs_idx,
+            input_top_logprobs_val=self.input_top_logprobs_val,
+            input_top_logprobs_idx=self.input_top_logprobs_idx,
+            output_top_logprobs_val=self.output_top_logprobs_val,
+            output_top_logprobs_idx=self.output_top_logprobs_idx,
+            input_token_ids_logprobs_val=self.input_token_ids_logprobs_val,
+            input_token_ids_logprobs_idx=self.input_token_ids_logprobs_idx,
+            output_token_ids_logprobs_val=self.output_token_ids_logprobs_val,
+            output_token_ids_logprobs_idx=self.output_token_ids_logprobs_idx,
+            output_token_entropy_val=None,
+            output_hidden_states=self.output_hidden_states or None,
+            routed_experts=self.routed_experts or None,
+            indexer_topk=self.indexer_topk or None,
+            customized_info=self.customized_info,
+            placeholder_tokens_idx=None,
+            placeholder_tokens_val=None,
+            retraction_counts=self.retraction_counts,
+            load=load,
+            dp_ranks=dp_ranks,
+        )
