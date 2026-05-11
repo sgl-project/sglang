@@ -42,6 +42,7 @@ class SWAKVPool(BaseSWAKVPool):
         enable_kvcache_transpose: bool,
         device: str,
         token_to_kv_pool_class: KVCache = MHATokenToKVPool,
+        enable_memory_saver: bool = False,
         **kwargs,
     ):
         self.size = size
@@ -59,7 +60,7 @@ class SWAKVPool(BaseSWAKVPool):
         self.layer_transfer_counter = None
 
         kwargs["page_size"] = page_size
-        kwargs["enable_memory_saver"] = False
+        kwargs["enable_memory_saver"] = enable_memory_saver
         kwargs["head_num"] = head_num
         kwargs["head_dim"] = head_dim
         kwargs["device"] = device
