@@ -25,10 +25,12 @@ from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import get_int_env_var
 
 try:
-    from flashinfer import fp4_quantize, nvfp4_block_scale_interleave
+    from flashinfer import nvfp4_block_scale_interleave
     from flashinfer.comm import MoeAlltoAll, moe_a2a_get_workspace_size_per_rank
     from flashinfer.comm.mapping import Mapping
     from flashinfer.comm.mnnvl import MnnvlConfig
+
+    from sglang.srt.layers.quantization.fp4_utils import fp4_quantize
 
     use_flashinfer = True
 except ImportError:
@@ -219,6 +221,7 @@ class FlashinferDispatcher(BaseDispatcher):
             self.dummy_topk_ids_current_rank if self.has_dummy_token else topk_ids,
             payloads,
             self.runtime_max_tokens_per_rank,
+            invalid_token_expert_id=-1,
             expert_id_payload_index=expert_id_payload_index,
         )
         if x_sf is not None:

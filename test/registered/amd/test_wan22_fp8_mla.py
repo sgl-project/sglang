@@ -28,7 +28,7 @@ logger = logging.getLogger(__name__)
 register_amd_ci(est_time=3600, suite="nightly-amd-fp8-mla-diffusion", nightly=True)
 
 MODEL = "Wan-AI/Wan2.2-T2V-A14B-Diffusers"
-FP8_ENV = {"SGLANG_AITER_FP8_ATTN": "1"}
+FP8_ENV = {"SGLANG_DIFFUSION_AITER_FP8_ATTN": "1"}
 
 FP8_MLA_CASES = [
     DiffusionTestCase(
