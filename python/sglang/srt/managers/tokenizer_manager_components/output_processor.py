@@ -146,13 +146,7 @@ class OutputProcessor:
                 meta_info["dp_rank"] = recv_obj.dp_ranks[i]
 
             state.finished = recv_obj.finished_reasons[i] is not None
-            if isinstance(recv_obj, BatchStrOutput):
-                out_dict = self._build_out_dict_str(recv_obj, state, i, meta_info)
-            elif isinstance(recv_obj, BatchTokenIDOutput):
-                out_dict = self._build_out_dict_token_id(recv_obj, state, i, meta_info)
-            else:
-                assert isinstance(recv_obj, BatchEmbeddingOutput)
-                out_dict = self._build_out_dict_embedding(recv_obj, state, i, meta_info)
+            out_dict = self._build_out_dict(recv_obj, state, i, meta_info)
 
             # Set first_token_time on the first output batch.
             # This is the single write point for first_token_time.
@@ -242,6 +236,20 @@ class OutputProcessor:
         ):
             load_update_req = WatchLoadUpdateReq(loads=[recv_obj.load])
             self.send_to_scheduler.send_pyobj(load_update_req)
+
+    def _build_out_dict(
+        self,
+        recv_obj,
+        state: ReqState,
+        i: int,
+        meta_info: dict,
+    ) -> Optional[dict]:
+        if isinstance(recv_obj, BatchStrOutput):
+            return self._build_out_dict_str(recv_obj, state, i, meta_info)
+        if isinstance(recv_obj, BatchTokenIDOutput):
+            return self._build_out_dict_token_id(recv_obj, state, i, meta_info)
+        assert isinstance(recv_obj, BatchEmbeddingOutput)
+        return self._build_out_dict_embedding(recv_obj, state, i, meta_info)
 
     def _build_out_dict_str(
         self,
