@@ -28,6 +28,7 @@ import torch
 
 from sglang.srt.mem_cache.fuzzy_match.config import FuzzyMatchConfig
 from sglang.srt.mem_cache.fuzzy_match.fuzzy_match_provider import (
+    FuzzyMatchBlock,
     FuzzyMatchProvider,
     FuzzyMatchResult,
     FuzzyMatchSegment,
@@ -46,7 +47,7 @@ class SemanticEmbeddingProvider(FuzzyMatchProvider):
     network or service dependency.
     """
 
-    _MIN_SEMBLEND_VERSION = "0.3.3"
+    _MIN_SEMBLEND_VERSION = "0.3.4"
 
     def __init__(self, config: FuzzyMatchConfig):
         super().__init__(config)
@@ -224,6 +225,16 @@ def _adapter_to_sglang_result(adapter_result) -> FuzzyMatchResult:
             rejection_reason=qs.rejection_reason,
         )
 
+    match_block = None
+    adapter_match_block = getattr(adapter_result, "match_block", None)
+    if adapter_match_block is not None:
+        match_block = FuzzyMatchBlock(
+            target_start_in_prompt=int(adapter_match_block.target_start_in_prompt),
+            length=int(adapter_match_block.length),
+            donor_start=int(adapter_match_block.donor_start),
+            donor_kv_indices=_as_tensor(adapter_match_block.donor_kv_indices),
+        )
+
     return FuzzyMatchResult(
         cached_token_count=adapter_result.cached_token_count,
         cached_token_ids=list(adapter_result.cached_token_ids),
@@ -235,6 +246,7 @@ def _adapter_to_sglang_result(adapter_result) -> FuzzyMatchResult:
         layer_recompute_mask=adapter_result.layer_recompute_mask,
         quality_signals=quality,
         donor_last_node_id=getattr(adapter_result, "donor_last_node_id", None),
+        match_block=match_block,
         _match_entry=adapter_result._match_entry,
     )
 
