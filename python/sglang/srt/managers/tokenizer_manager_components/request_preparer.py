@@ -90,44 +90,7 @@ class RequestPreparer:
             if contains_mm_input:
                 self.request_validator._validate_mm_limits(obj)
 
-            mm_inputs = None
-
-            if (
-                not self.config.language_only
-                or self.config.encoder_transfer_backend
-                in ["zmq_to_tokenizer", "mooncake"]
-            ):
-                if self.config.language_only:
-                    mm_inputs = (
-                        await self.multimodal_processor.mm_receiver.recv_mm_data(
-                            request_obj=obj,
-                            mm_processor=self.mm_processor,
-                            prompt=(input_text or input_ids),
-                            need_wait_for_mm_inputs=obj.need_wait_for_mm_inputs,
-                        )
-                    )
-                if mm_inputs is None:
-                    mm_inputs = await self.mm_processor.process_mm_data_async(
-                        image_data=obj.image_data,
-                        audio_data=obj.audio_data,
-                        input_text=(input_text or input_ids),
-                        request_obj=obj,
-                        max_req_input_len=self.config.max_req_input_len,
-                    )
-            elif (
-                self.config.language_only
-                and self.config.encoder_transfer_backend == "zmq_to_scheduler"
-                and not obj.need_wait_for_mm_inputs
-            ):
-                # In language_only mode with zmq_to_scheduler, if we didn't dispatch
-                # to encoder (e.g., only one image), process locally like non-language_only mode
-                mm_inputs = await self.mm_processor.process_mm_data_async(
-                    image_data=obj.image_data,
-                    audio_data=obj.audio_data,
-                    input_text=(input_text or input_ids),
-                    request_obj=obj,
-                    max_req_input_len=self.config.max_req_input_len,
-                )
+            mm_inputs = await self._dispatch_mm_processor(obj, input_text, input_ids)
 
             if mm_inputs and mm_inputs.input_ids is not None:
                 input_ids = mm_inputs.input_ids
@@ -205,6 +168,51 @@ class RequestPreparer:
             input_embeds=input_embeds,
             input_text=input_text,
         )
+
+    async def _dispatch_mm_processor(
+        self,
+        obj: Union[GenerateReqInput, EmbeddingReqInput],
+        input_text: Optional[str],
+        input_ids: Optional[List[int]],
+    ) -> Optional[Any]:
+        if not self.config.language_only or self.config.encoder_transfer_backend in [
+            "zmq_to_tokenizer",
+            "mooncake",
+        ]:
+            mm_inputs = None
+            if self.config.language_only:
+                mm_inputs = await self.multimodal_processor.mm_receiver.recv_mm_data(
+                    request_obj=obj,
+                    mm_processor=self.mm_processor,
+                    prompt=(input_text or input_ids),
+                    need_wait_for_mm_inputs=obj.need_wait_for_mm_inputs,
+                )
+            if mm_inputs is None:
+                mm_inputs = await self.mm_processor.process_mm_data_async(
+                    image_data=obj.image_data,
+                    audio_data=obj.audio_data,
+                    input_text=(input_text or input_ids),
+                    request_obj=obj,
+                    max_req_input_len=self.config.max_req_input_len,
+                )
+            return mm_inputs
+
+        if (
+            self.config.language_only
+            and self.config.encoder_transfer_backend == "zmq_to_scheduler"
+            and not obj.need_wait_for_mm_inputs
+        ):
+            # In language_only mode with zmq_to_scheduler, if we didn't dispatch
+            # to encoder (e.g., only one image), process locally like non-language_only mode
+            return await self.mm_processor.process_mm_data_async(
+                image_data=obj.image_data,
+                audio_data=obj.audio_data,
+                input_text=(input_text or input_ids),
+                request_obj=obj,
+                max_req_input_len=self.config.max_req_input_len,
+            )
+
+        return None
 
     async def _batch_tokenize_and_process(
         self,
