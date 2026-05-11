@@ -57,13 +57,12 @@ from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, EvictParams
 from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
-from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
-from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.mem_cache.common import (
     kv_to_page_indices,
     page_align_floor,
     release_kv_cache,
 )
+from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.mem_cache.memory_pool import (
     HybridLinearKVPool,
     HybridReqToTokenPool,
@@ -71,6 +70,7 @@ from sglang.srt.mem_cache.memory_pool import (
     NSATokenToKVPool,
     ReqToTokenPool,
 )
+from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.observability.req_time_stats import (
     set_schedule_time_batch,
     set_time_batch,
@@ -321,9 +321,7 @@ class DecodePreallocQueue:
             self.transfer_queue._init_staging_handler(self.kv_manager)
 
         self._swa_tail_prealloc = (
-            isinstance(
-                self.token_to_kv_pool, (SWAKVPool, DeepSeekV4TokenToKVPool)
-            )
+            isinstance(self.token_to_kv_pool, (SWAKVPool, DeepSeekV4TokenToKVPool))
             and self.token_to_kv_pool_allocator.page_size > 1
             and hasattr(self.token_to_kv_pool_allocator, "alloc_extend_swa_tail")
         )
@@ -743,8 +741,7 @@ class DecodePreallocQueue:
         swa_allocatable_tokens = 0
         if uses_swa_tail_prealloc:
             retractable_swa_tokens = sum(
-                self._swa_retractable_len(r)
-                for r in self.scheduler.running_batch.reqs
+                self._swa_retractable_len(r) for r in self.scheduler.running_batch.reqs
             )
             full_allocatable_tokens, swa_allocatable_tokens = (
                 self._swa_aware_allocatable_token_budgets(
@@ -1050,9 +1047,7 @@ class DecodePreallocQueue:
         extra_reserved_reqs: int = 0,
         reserved_tokens: Optional[int] = None,
     ) -> int:
-        need_space_for_single_req = self._need_space_for_single_req(
-            retractable_tokens
-        )
+        need_space_for_single_req = self._need_space_for_single_req(retractable_tokens)
         if reserved_tokens is None:
             reserved_tokens = self._active_reserved_tokens(
                 extra_reserved_reqs=extra_reserved_reqs
@@ -1265,13 +1260,9 @@ class DecodePreallocQueue:
                 # alloc_extend which allocates SWA at full page count; the
                 # SWA budget in that case may slightly under-estimate.
                 kv_loc = self.token_to_kv_pool_allocator.alloc_extend_swa_tail(
-                    prefix_lens=torch.tensor(
-                        [0], dtype=torch.int64, device=device
-                    ),
+                    prefix_lens=torch.tensor([0], dtype=torch.int64, device=device),
                     prefix_lens_cpu=torch.tensor([0], dtype=torch.int64),
-                    seq_lens=torch.tensor(
-                        [fill_len], dtype=torch.int64, device=device
-                    ),
+                    seq_lens=torch.tensor([fill_len], dtype=torch.int64, device=device),
                     seq_lens_cpu=torch.tensor([fill_len], dtype=torch.int64),
                     last_loc=last_loc,
                     extend_num_tokens=fill_len,
@@ -1283,9 +1274,7 @@ class DecodePreallocQueue:
                         [prefix_len], dtype=torch.int64, device=device
                     ),
                     prefix_lens_cpu=torch.tensor([prefix_len], dtype=torch.int64),
-                    seq_lens=torch.tensor(
-                        [fill_len], dtype=torch.int64, device=device
-                    ),
+                    seq_lens=torch.tensor([fill_len], dtype=torch.int64, device=device),
                     seq_lens_cpu=torch.tensor([fill_len], dtype=torch.int64),
                     last_loc=last_loc,
                     extend_num_tokens=delta_len,
