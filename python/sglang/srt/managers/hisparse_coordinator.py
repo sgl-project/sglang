@@ -93,12 +93,14 @@ class HiSparseCoordinator:
 
         max_num_req_slots = req_to_token_pool.req_to_token.shape[0]
         max_context_len = req_to_token_pool.max_context_len
-        max_host_context_len = (
+        max_compressed_context_len = (
             max_context_len + self.compress_ratio - 1
         ) // self.compress_ratio
 
         # to have an extra page for new tokens
-        self.padded_buffer_size = self.device_buffer_size + self.page_size
+        self.padded_buffer_size = (
+            self.device_buffer_size + self.mem_pool_device.page_size
+        )
 
         self.req_to_device_buffer = torch.zeros(
             (max_num_req_slots, self.padded_buffer_size),
@@ -109,7 +111,7 @@ class HiSparseCoordinator:
             max_num_req_slots, dtype=torch.int64, device="cpu"
         )
         self.req_to_host_pool = torch.full(
-            (max_num_req_slots, max_host_context_len + self.page_size),
+            (max_num_req_slots, max_compressed_context_len + self.page_size),
             -1,
             dtype=torch.int64,
             device=device,
