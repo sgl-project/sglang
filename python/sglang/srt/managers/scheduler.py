@@ -124,7 +124,6 @@ from sglang.srt.managers.io_struct import (
     LoadLoRAAdapterReqInput,
     LoadLoRAAdapterReqOutput,
     OmniGenerateReqInput,
-    OmniGenerateReqOutput,
     OpenSessionReqInput,
     PauseGenerationReqInput,
     ProfileReq,
@@ -1542,7 +1541,8 @@ class Scheduler(
                 self.process_batch_result(batch, result)
             else:
                 # When the server is idle, do self-check and re-init some states.
-                self.on_idle()
+                if not self._drain_omni_scheduler_side_work():
+                    self.on_idle()
 
             # Update last_batch
             self.last_batch = batch
@@ -1591,7 +1591,8 @@ class Scheduler(
                     pop_and_process()
             elif batch is None:
                 # When the server is idle, do self-check and re-init some states
-                self.on_idle()
+                if not self._drain_omni_scheduler_side_work():
+                    self.on_idle()
 
             # Run sample of the current batch
             # It depends on the result of the last batch (e.g., grammar), so we run it after the last batch is processed.
@@ -1829,6 +1830,9 @@ class Scheduler(
         return work_reqs, control_reqs
 
     def process_input_requests(self, recv_reqs: List):
+        self.omni_scheduler_state.bind_scheduler_thread()
+        self.omni_scheduler_state.drain_scheduler_thread_calls()
+        self._drain_omni_task_outputs()
         now = time.monotonic()
         self.session_controller.maybe_reap(now)
         for recv_req in recv_reqs:
@@ -1852,6 +1856,7 @@ class Scheduler(
         self._check_pending_flush()
         if self.external_corpus_manager is not None:
             self.external_corpus_manager.check_pending_load()
+        self._drain_omni_scheduler_side_work()
 
     def init_req_max_new_tokens(self, req):
         req.sampling_params.max_new_tokens = min(
@@ -3129,24 +3134,32 @@ class Scheduler(
         batch: ScheduleBatch,
         result: Union[GenerationBatchResult, EmbeddingBatchResult],
     ):
-        if batch.forward_mode.is_decode():
-            self.process_batch_result_decode(batch, result)
-        elif batch.forward_mode.is_extend():
-            if batch.is_dllm():
-                self.process_batch_result_dllm(batch, result)
-            elif self.disaggregation_mode == DisaggregationMode.PREFILL:
-                self.process_batch_result_disagg_prefill(batch, result)
-            else:
-                self.process_batch_result_prefill(batch, result)
-        elif batch.forward_mode.is_prebuilt():
-            self.process_batch_result_prebuilt(batch)
-        elif batch.forward_mode.is_idle():
-            self.process_batch_result_idle(batch, result)
+        omni_observation = self.omni_scheduler_state.observe_srt_batch_before_process(
+            batch
+        )
+        try:
+            if batch.forward_mode.is_decode():
+                self.process_batch_result_decode(batch, result)
+            elif batch.forward_mode.is_extend():
+                if batch.is_dllm():
+                    self.process_batch_result_dllm(batch, result)
+                elif self.disaggregation_mode == DisaggregationMode.PREFILL:
+                    self.process_batch_result_disagg_prefill(batch, result)
+                else:
+                    self.process_batch_result_prefill(batch, result)
+            elif batch.forward_mode.is_prebuilt():
+                self.process_batch_result_prebuilt(batch)
+            elif batch.forward_mode.is_idle():
+                self.process_batch_result_idle(batch, result)
+        finally:
+            self.omni_scheduler_state.finalize_srt_batch_after_process(omni_observation)
 
         self.log_batch_result_stats(batch, result)
         self._maybe_clear_mm_inputs(batch)
         self.maybe_send_health_check_signal()
         self.update_device_timer()
+        self.omni_scheduler_state.notify_scheduler_progress()
+        self._drain_omni_scheduler_side_work()
 
     def maybe_send_health_check_signal(self):
         if self.return_health_check_ipcs:
@@ -3507,43 +3520,31 @@ class Scheduler(
         return RpcReqOutput(success, "" if not exec else str(exec))
 
     def handle_omni_generate_request(self, recv_req: OmniGenerateReqInput):
-        """handle an omni generate req by dispatching it to the omni coordinator"""
-        try:
-            from sglang.omni.srt_transport import (
-                handle_omni_generate_with_omni_coordinator,
-            )
+        """start an async omni task and return its result from scheduler later"""
+        self.omni_scheduler_state.start_omni_generate_task(
+            scheduler=self,
+            recv_req=recv_req,
+        )
+        return None
 
-            payload = handle_omni_generate_with_omni_coordinator(
-                scheduler=self,
-                payload=recv_req.payload,
-            )
-            return OmniGenerateReqOutput(
-                rid=recv_req.rid,
-                success=True,
-                payload=payload,
-            )
-        except ValueError as exc:
-            return OmniGenerateReqOutput(
-                rid=recv_req.rid,
-                success=False,
-                message=str(exc),
-                status_code=400,
-            )
-        except RuntimeError as exc:
-            return OmniGenerateReqOutput(
-                rid=recv_req.rid,
-                success=False,
-                message=str(exc),
-                status_code=501,
-            )
-        except Exception as exc:
-            logger.exception("Failed to handle omni generate request")
-            return OmniGenerateReqOutput(
-                rid=recv_req.rid,
-                success=False,
-                message=str(exc),
-                status_code=500,
-            )
+    def _drain_omni_scheduler_side_work(self) -> bool:
+        """drain omni work that must complete before scheduler idle checks"""
+        # 1. run lifecycle calls owned by the scheduler thread
+        had_work = self.omni_scheduler_state.drain_scheduler_thread_calls()
+        # 2. wake omni tasks only after SRT has dropped finished req references
+        self.omni_scheduler_state.retire_finished_srt_requests(self)
+        # 3. submit pending omni AR segments as native SRT reqs
+        self.omni_scheduler_state.admit_srt_requests(self)
+        # 4. return completed omni HTTP responses through the normal tokenizer path
+        had_work = self._drain_omni_task_outputs() or had_work
+        return had_work or self.omni_scheduler_state.has_pending_scheduler_side_work()
+
+    def _drain_omni_task_outputs(self) -> bool:
+        drained = False
+        for output, recv_req in self.omni_scheduler_state.pop_completed_task_outputs():
+            drained = True
+            self.send_to_tokenizer.send_output(output, recv_req)
+        return drained
 
     def abort_request(self, recv_req: AbortReq):
         # todo hisparse, release resources for abort requests in hisparse coordinator

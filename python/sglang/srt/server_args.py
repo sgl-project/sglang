@@ -398,6 +398,7 @@ class ServerArgs:
     incremental_streaming_output: bool = False
     enable_streaming_session: bool = False
     diffusion_server_args: Optional[str] = None
+    omni_max_concurrent_generations: int = 1
     random_seed: Optional[int] = None
     constrained_json_whitespace_pattern: Optional[str] = None
     constrained_json_disable_any_whitespace: bool = False
@@ -4722,6 +4723,12 @@ class ServerArgs:
             default=ServerArgs.diffusion_server_args,
             help="Arguments passed to the diffusion source engine, as a "
             "JSON object, @JSON/YAML file, or quoted sglang-diffusion CLI args.",
+        )
+        parser.add_argument(
+            "--omni-max-concurrent-generations",
+            type=int,
+            default=ServerArgs.omni_max_concurrent_generations,
+            help="Maximum concurrent omni media-generation segments per SRT deployment.",
         )
         parser.add_argument(
             "--random-seed",

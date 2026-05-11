@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
+from types import SimpleNamespace
+
 from sglang.srt.omni_session.runtime import OmniSessionRuntime
 
 
@@ -21,7 +23,7 @@ def test_omni_session_runtime_opens_streaming_srt_session():
 def test_omni_session_runtime_drains_srt_executor_after_close():
     controller = _FakeSessionController()
     controller.sessions.add("session-a")
-    executor = _FakeSRTExecutor()
+    executor = _FakeSRTExecutor(controller)
     runtime = OmniSessionRuntime(
         model_policy=_FakeModelPolicy(),
         session_controller=controller,
@@ -64,8 +66,12 @@ class _FakeModelPolicy:
 
 
 class _FakeSRTExecutor:
-    def __init__(self):
+    def __init__(self, session_controller):
+        self.session_controller = session_controller
         self.idle_cleanup_count = 0
+
+    def close_session_on_scheduler_thread(self, session_id):
+        self.session_controller.close(SimpleNamespace(session_id=session_id))
 
     def run_idle_cleanup(self):
         self.idle_cleanup_count += 1

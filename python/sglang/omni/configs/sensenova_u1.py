@@ -95,6 +95,9 @@ def build_sensenova_u1_orchestrator(
         mm_generation_backend=generation_backend,
         request_adapter=plugin.normalize_request,
         metadata={"model": plugin.model_name},
+        max_concurrent_generations=_resolve_omni_max_concurrent_generations(
+            server_args
+        ),
     )
     return coordinator
 
@@ -219,6 +222,19 @@ def _build_default_generation_backend(srt_server_args: Any | None) -> Any:
         pipeline=pipeline,
         server_args=pipeline_server_args,
     )
+
+
+def _resolve_omni_max_concurrent_generations(srt_server_args: Any | None) -> int:
+    value = getattr(srt_server_args, "omni_max_concurrent_generations", 1)
+    if value is None:
+        value = 1
+    value = int(value)
+    if value <= 0:
+        raise ValueError(
+            "omni_max_concurrent_generations must be positive, got "
+            f"{value}"
+        )
+    return value
 
 
 def _build_diffusion_server_kwargs(srt_server_args: Any | None) -> dict[str, Any]:

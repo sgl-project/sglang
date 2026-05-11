@@ -112,11 +112,14 @@ def _get_sensenova_u1_orchestrator_by_model(
         raise ValueError(f"Unsupported omni model {model_name!r}")
 
     cache = scheduler.omni_scheduler_state.orchestrators
-    if _SENSENOVA_U1_CACHE_KEY not in cache:
-        cache[_SENSENOVA_U1_CACHE_KEY] = build_sensenova_u1_orchestrator_from_scheduler(
-            scheduler=scheduler,
-            server_args=scheduler.server_args,
-        )
+    with scheduler.omni_scheduler_state.orchestrator_lock:
+        if _SENSENOVA_U1_CACHE_KEY not in cache:
+            cache[_SENSENOVA_U1_CACHE_KEY] = (
+                build_sensenova_u1_orchestrator_from_scheduler(
+                    scheduler=scheduler,
+                    server_args=scheduler.server_args,
+                )
+            )
     return cache[_SENSENOVA_U1_CACHE_KEY]
 
 

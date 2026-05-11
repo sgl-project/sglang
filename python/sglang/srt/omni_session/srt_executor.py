@@ -7,7 +7,7 @@ read committed SRT KV cache without permanently appending generation query token
 """
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Callable
 
 import torch
 
@@ -35,6 +35,7 @@ class OmniSRTSchedulerExecutorError(RuntimeError):
 @dataclass(slots=True)
 class OmniSRTTemporaryReqSlot:
     """A conceptual temporary Req to help with memory allocation / release"""
+
     req_pool_idx: int | None = None
     kv_committed_len: int = 0
     is_chunked: int = 0
@@ -53,6 +54,7 @@ class OmniSRTTemporaryForwardBatch:
     temp_req: OmniSRTTemporaryReqSlot
     out_cache_loc: torch.Tensor
     owned_cache_loc: torch.Tensor | None = None
+    scheduler_exclusive_lease: Any | None = None
     released: bool = False
 
     def release(self) -> None:
@@ -75,14 +77,20 @@ class OmniSRTTemporaryForwardBatch:
                 ):
                     free_mamba_cache(self.temp_req)
             finally:
-                self.req_to_token_pool.free(self.temp_req)
+                try:
+                    self.req_to_token_pool.free(self.temp_req)
+                finally:
+                    if self.scheduler_exclusive_lease is not None:
+                        self.scheduler_exclusive_lease.release()
 
 
 class OmniSRTSchedulerExecutor:
     """Execute materialized omni session requests through the SRT scheduler.
 
     this executor enqueues the reqs created with runtime, runs them
-    synchronously when needed, and exposes committed KV bindings for generation.
+    through scheduler-native batching when called from an async omni task,
+    keeps the synchronous path for tests/control calls, and exposes committed
+    KV bindings for generation.
 
     """
 
@@ -115,9 +123,38 @@ class OmniSRTSchedulerExecutor:
     def session_controller(self):
         return self.scheduler.session_controller
 
+    def open_session_on_scheduler_thread(self, recv_req: Any) -> Any:
+        """open an SRT session on the scheduler thread when omni is async"""
+
+        def open_session() -> Any:
+            return self.session_controller.open(recv_req)
+
+        return self._run_scheduler_thread_call(
+            callback=open_session,
+            description=f"open omni SRT session {recv_req.session_id}",
+        )
+
+    def close_session_on_scheduler_thread(self, session_id: str) -> None:
+        """close an SRT session on the scheduler thread when omni is async"""
+
+        from sglang.srt.managers.io_struct import CloseSessionReqInput
+
+        def close_session() -> None:
+            if session_id in self.session_controller:
+                self.session_controller.close(
+                    CloseSessionReqInput(session_id=session_id)
+                )
+
+        self._run_scheduler_thread_call(
+            callback=close_session,
+            description=f"close omni SRT session {session_id}",
+        )
+
     def execute_omni_request(
         self, *, record: "OmniSessionRecord", req: "Req", state: object | None
     ) -> None:
+        if self._submit_native_omni_request(record=record, req=req, state=state):
+            return
         self._check_scheduler_idle(req)
         self.scheduler.init_req_max_new_tokens(req)
         self.scheduler._add_request_to_queue(req)
@@ -126,6 +163,13 @@ class OmniSRTSchedulerExecutor:
 
     def run_idle_cleanup(self) -> None:
         """drain finished scheduler state left by synchronous omni requests"""
+        scheduler_state = self.scheduler.omni_scheduler_state
+        if (
+            scheduler_state is not None
+            and scheduler_state.scheduler_thread_id is not None
+            and not scheduler_state.is_scheduler_thread()
+        ):
+            return
         self._run_idle_cleanup()
 
     def get_request_token_binding(
@@ -201,7 +245,6 @@ class OmniSRTSchedulerExecutor:
         This is required by cocolated omni model (like U1) which needs to access KV cache from srt seesion
         """
 
-        self._check_scheduler_idle_for_temporary_context()
         model_runner: ModelRunner = self._require_model_runner()
         req_to_token_pool = model_runner.req_to_token_pool
         if req_to_token_pool is None:
@@ -278,13 +321,21 @@ class OmniSRTSchedulerExecutor:
         )
         seq_len = prefix_len + extend_num_tokens
         self._check_context_capacity(req_to_token_pool, seq_len)
+        scheduler_exclusive_lease = self._enter_temporary_context_region()
+        try:
+            self._check_scheduler_idle_for_temporary_context()
+        except Exception:
+            if scheduler_exclusive_lease is not None:
+                scheduler_exclusive_lease.release()
+            raise
 
         # 3. allocate temporary query KV without committing it to the session
-        temp_req = self._alloc_temp_req_slot(req_to_token_pool)
+        temp_req = None
         out_cache_loc = None
         owned_cache_loc = None
         context = None
         try:
+            temp_req = self._alloc_temp_req_slot(req_to_token_pool)
             out_cache_loc, owned_cache_loc = self._alloc_temporary_context_cache(
                 token_to_kv_pool_allocator=token_to_kv_pool_allocator,
                 prefix_indices=prefix_indices,
@@ -323,7 +374,9 @@ class OmniSRTSchedulerExecutor:
                 temp_req=temp_req,
                 out_cache_loc=out_cache_loc,
                 owned_cache_loc=owned_cache_loc,
+                scheduler_exclusive_lease=scheduler_exclusive_lease,
             )
+            scheduler_exclusive_lease = None
             prepare_forward_batch = getattr(
                 model_runner.model, "prepare_forward_batch", None
             )
@@ -339,8 +392,84 @@ class OmniSRTSchedulerExecutor:
             else:
                 if owned_cache_loc is not None:
                     token_to_kv_pool_allocator.free(owned_cache_loc)
-                self._free_temp_req_slot(req_to_token_pool, temp_req)
+                if temp_req is not None:
+                    self._free_temp_req_slot(req_to_token_pool, temp_req)
+                if scheduler_exclusive_lease is not None:
+                    scheduler_exclusive_lease.release()
             raise
+
+    def capture_batch_token_bindings_before_process(
+        self, batch: "ScheduleBatch"
+    ) -> list[tuple[str, str, int | None]]:
+        """capture active request KV before SRT output processing may release it"""
+        self._capture_batch_token_bindings(batch)
+        return self._batch_sessions(batch)
+
+    def capture_session_token_bindings_after_process(
+        self, sessions: list[tuple[str, str, int | None]]
+    ) -> None:
+        """capture committed session KV after SRT has updated the streaming slot"""
+        self._capture_session_token_bindings(sessions)
+
+    def _submit_native_omni_request(
+        self,
+        *,
+        record: "OmniSessionRecord",
+        req: "Req",
+        state: object | None,
+    ) -> bool:
+        scheduler_state = self.scheduler.omni_scheduler_state
+        if (
+            scheduler_state is None
+            or scheduler_state.scheduler_thread_id is None
+            or scheduler_state.is_scheduler_thread()
+        ):
+            return False
+
+        # 1. hand the native req back to scheduler so AR can batch normally
+        pending = scheduler_state.submit_srt_request(
+            executor=self,
+            record=record,
+            req=req,
+            state=state,
+        )
+        # 2. wait until scheduler finalizes this segment's session/KV state
+        pending.wait()
+        return True
+
+    def _enter_temporary_context_region(self) -> Any | None:
+        scheduler_state = self.scheduler.omni_scheduler_state
+        if (
+            scheduler_state is None
+            or scheduler_state.scheduler_thread_id is None
+            or scheduler_state.is_scheduler_thread()
+        ):
+            return None
+
+        # temporary context forward borrows SRT KV/attention and must not race scheduler
+        return scheduler_state.enter_scheduler_exclusive_region(
+            scheduler=self.scheduler,
+            reason="temporary context forward",
+        )
+
+    def _run_scheduler_thread_call(
+        self,
+        *,
+        callback: Callable[[], Any],
+        description: str,
+    ) -> Any:
+        scheduler_state = self.scheduler.omni_scheduler_state
+        if (
+            scheduler_state is None
+            or scheduler_state.scheduler_thread_id is None
+            or scheduler_state.is_scheduler_thread()
+        ):
+            return callback()
+
+        return scheduler_state.run_on_scheduler_thread(
+            callback=callback,
+            description=description,
+        )
 
     def _run_until_request_complete(self, req: "Req") -> None:
         previous_last_batch = self.scheduler.last_batch

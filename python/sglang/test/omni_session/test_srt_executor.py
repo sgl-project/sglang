@@ -1,8 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 
+from sglang.omni.scheduler_state import OmniSchedulerState
 from sglang.srt.omni_session.srt_executor import OmniSRTSchedulerExecutor
 
 
@@ -64,6 +66,42 @@ def test_sync_execute_restores_outer_scheduler_batch_state():
     assert scheduler.cur_batch is None
 
 
+def test_async_execute_submits_native_req_to_scheduler_state():
+    scheduler = _FakeSyncScheduler(finish_after_steps=1)
+    scheduler.omni_scheduler_state = OmniSchedulerState()
+    scheduler.omni_scheduler_state.bind_scheduler_thread()
+    executor = OmniSRTSchedulerExecutor(scheduler)
+    req = _FakeReq(finished=False)
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(
+            executor.execute_omni_request,
+            record=SimpleNamespace(session_id="s0"),
+            req=req,
+            state=None,
+        )
+        _wait_until(
+            lambda: not scheduler.omni_scheduler_state.pending_srt_requests.empty()
+        )
+
+        scheduler.omni_scheduler_state.admit_srt_requests(scheduler)
+        assert scheduler.waiting_queue == [req]
+
+        batch = _FakeBatch([scheduler.waiting_queue.pop(0)])
+        observation = scheduler.omni_scheduler_state.observe_srt_batch_before_process(
+            batch
+        )
+        req._finished = True
+        scheduler.omni_scheduler_state.finalize_srt_batch_after_process(observation)
+        scheduler.omni_scheduler_state.retire_finished_srt_requests(scheduler)
+
+        future.result(timeout=1)
+
+    assert req.finished()
+    assert not scheduler.omni_scheduler_state.running_srt_requests
+    assert not scheduler.omni_scheduler_state.finished_srt_requests
+
+
 def test_temporary_context_idle_check_skips_cleanup_when_already_idle():
     scheduler = _FakeScheduler()
     scheduler.cur_batch = _FakeBatch([])
@@ -74,9 +112,21 @@ def test_temporary_context_idle_check_skips_cleanup_when_already_idle():
     assert scheduler.cleanup_steps == 0
 
 
+def _wait_until(predicate):
+    import time
+
+    deadline = time.time() + 1
+    while time.time() < deadline:
+        if predicate():
+            return
+        time.sleep(0.01)
+    raise AssertionError("condition was not met")
+
+
 class _FakeScheduler:
     def __init__(self):
         self.session_controller = object()
+        self.omni_scheduler_state = None
         self.last_batch = None
         self.running_batch = _FakeBatch([])
         self.cur_batch = _FakeBatch([_FakeReq(finished=False)])

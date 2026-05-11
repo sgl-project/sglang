@@ -9,10 +9,12 @@ commit generated media when the model/session requires it.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from threading import BoundedSemaphore
 from typing import Any, Callable
 
 from sglang.omni.protocol import (
     ARBackend,
+    GeneratedSegment,
     MultimodalGenerationBackend,
     OmniContextBundle,
     OmniOutputSegment,
@@ -29,6 +31,21 @@ class OmniCoordinator:
     mm_generation_backend: MultimodalGenerationBackend
     request_adapter: Callable[[OmniRequest], OmniRequest] | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
+    max_concurrent_generations: int | None = None
+    _generation_slots: BoundedSemaphore | None = field(
+        init=False, default=None, repr=False
+    )
+
+    def __post_init__(self) -> None:
+        if self.max_concurrent_generations is None:
+            return
+        max_concurrent_generations = int(self.max_concurrent_generations)
+        if max_concurrent_generations <= 0:
+            raise ValueError(
+                "max_concurrent_generations must be positive, got "
+                f"{max_concurrent_generations}"
+            )
+        self._generation_slots = BoundedSemaphore(max_concurrent_generations)
 
     def generate(self, request: OmniRequest) -> OmniResponse:
         response, _ = self.generate_with_context(request)
@@ -99,7 +116,7 @@ class OmniCoordinator:
                     break
 
                 # 2. image boundary: switch to multimodal gen and generate a image segment
-                generated_segment = self.mm_generation_backend.generate_segment(
+                generated_segment = self._generate_segment(
                     request,
                     self.ar_backend.get_context_ops(context),
                 )
@@ -142,3 +159,16 @@ class OmniCoordinator:
             metadata=dict(self.metadata),
         )
         return response, context
+
+    def _generate_segment(
+        self, request: OmniRequest, context_ops: Any
+    ) -> GeneratedSegment:
+        if self._generation_slots is None:
+            return self.mm_generation_backend.generate_segment(request, context_ops)
+
+        # media generation is the OOM-sensitive part; keep AR/session work outside this gate
+        self._generation_slots.acquire()
+        try:
+            return self.mm_generation_backend.generate_segment(request, context_ops)
+        finally:
+            self._generation_slots.release()

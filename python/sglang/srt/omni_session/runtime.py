@@ -424,11 +424,7 @@ class OmniSessionRuntime:
         for condition_path_session_id in sorted(condition_path_session_ids):
             self._close_srt_session(condition_path_session_id)
         if self.srt_request_executor is not None:
-            run_idle_cleanup = getattr(
-                self.srt_request_executor, "run_idle_cleanup", None
-            )
-            if callable(run_idle_cleanup):
-                run_idle_cleanup()
+            self.srt_request_executor.run_idle_cleanup()
 
     def get_condition_path_handle(
         self,
@@ -1094,20 +1090,29 @@ class OmniSessionRuntime:
             return
         from sglang.srt.managers.io_struct import OpenSessionReqInput
 
-        output = self.session_controller.open(
-            OpenSessionReqInput(
-                session_id=session_id,
-                capacity_of_str_len=self.capacity_of_str_len,
-                # ug contexts must retain KV across AR/generation phases for generation-side reads
-                streaming=True,
-            )
+        recv_req = OpenSessionReqInput(
+            session_id=session_id,
+            capacity_of_str_len=self.capacity_of_str_len,
+            # ug contexts must retain KV across AR/generation phases for generation-side reads
+            streaming=True,
         )
+        if self.srt_request_executor is None:
+            output = self.session_controller.open(recv_req)
+        else:
+            output = self.srt_request_executor.open_session_on_scheduler_thread(
+                recv_req
+            )
         if not getattr(output, "success", False):
             raise RuntimeError(f"Failed to open SRT session for omni: {session_id}")
 
     def _close_srt_session(self, session_id: str) -> None:
-        if self.session_controller is None or session_id not in self.session_controller:
+        if self.session_controller is None:
             return
         from sglang.srt.managers.io_struct import CloseSessionReqInput
 
-        self.session_controller.close(CloseSessionReqInput(session_id=session_id))
+        if self.srt_request_executor is None:
+            if session_id not in self.session_controller:
+                return
+            self.session_controller.close(CloseSessionReqInput(session_id=session_id))
+        else:
+            self.srt_request_executor.close_session_on_scheduler_thread(session_id)

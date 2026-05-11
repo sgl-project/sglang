@@ -1,8 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import itertools
+import time
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
+from threading import Lock
 from typing import Any
 
 from sglang.omni.coordinator import OmniCoordinator
@@ -92,6 +95,56 @@ class _ImageBackend:
         )
 
 
+class _AlwaysImageARBackend:
+    def __init__(self):
+        self.released_contexts: list[OmniContextBundle] = []
+
+    def begin_request_context(self, request: OmniRequest) -> OmniContextBundle:
+        return OmniContextBundle(
+            full=OmniContextRef(
+                context_id=f"concurrent-{id(request)}",
+                metadata={"decode_count": 0},
+            )
+        )
+
+    def append_input_segments(self, context, request):
+        return context
+
+    def decode_until_boundary(self, context, *, request):
+        decode_count = int(context.full.metadata.get("decode_count", 0))
+        context.full.metadata["decode_count"] = decode_count + 1
+        if decode_count == 0:
+            return OmniBoundary(type="image")
+        return OmniBoundary(type="done")
+
+    def append_generated_segment(self, context, segment, *, request):
+        return context
+
+    def get_context_ops(self, context):
+        return _InMemoryContextOps(metadata=dict(context.full.metadata))
+
+    def release(self, context):
+        self.released_contexts.append(context)
+
+
+class _SlowImageBackend:
+    def __init__(self):
+        self.active = 0
+        self.max_active = 0
+        self.lock = Lock()
+
+    def generate_segment(self, request, context_ops):
+        with self.lock:
+            self.active += 1
+            self.max_active = max(self.max_active, self.active)
+        try:
+            time.sleep(0.05)
+            return GeneratedSegment(type="image", image={"b64_json": "abc"})
+        finally:
+            with self.lock:
+                self.active -= 1
+
+
 class TestOmniCoordinator(unittest.TestCase):
     def test_commits_image_before_continuing_text(self):
         ar_backend = _ScriptedARBackend(
@@ -146,6 +199,22 @@ class TestOmniCoordinator(unittest.TestCase):
 
         self.assertEqual("again", ar_backend.appended_inputs[0].messages[0].text)
         self.assertEqual(["text"], [s.type for s in response.segments])
+
+    def test_generation_admission_limits_media_concurrency(self):
+        gen_backend = _SlowImageBackend()
+        coordinator = OmniCoordinator(
+            _AlwaysImageARBackend(),
+            gen_backend,
+            max_concurrent_generations=1,
+        )
+        request = OmniRequest(messages=(OmniInputSegment(type="text", text="draw"),))
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            futures = [executor.submit(coordinator.generate, request) for _ in range(2)]
+            for future in futures:
+                future.result()
+
+        self.assertEqual(1, gen_backend.max_active)
 
 
 if __name__ == "__main__":

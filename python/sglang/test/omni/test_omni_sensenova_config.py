@@ -7,6 +7,7 @@ from sglang.omni.configs.sensenova_u1 import (
     SenseNovaU1OmniPlugin,
     _build_diffusion_server_kwargs,
     _parse_diffusion_server_args,
+    _resolve_omni_max_concurrent_generations,
 )
 from sglang.omni.protocol import OmniInputSegment, OmniRequest
 
@@ -57,6 +58,19 @@ class TestSenseNovaU1OmniConfig(unittest.TestCase):
 
         self.assertEqual("sensenova-u1", kwargs["model_path"])
         self.assertEqual("SenseNovaU1Pipeline", kwargs["pipeline_class_name"])
+
+    def test_omni_generation_admission_limit_defaults_to_one(self):
+        self.assertEqual(1, _resolve_omni_max_concurrent_generations(None))
+        self.assertEqual(
+            2,
+            _resolve_omni_max_concurrent_generations(
+                SimpleNamespace(omni_max_concurrent_generations=2)
+            ),
+        )
+        with self.assertRaisesRegex(ValueError, "must be positive"):
+            _resolve_omni_max_concurrent_generations(
+                SimpleNamespace(omni_max_concurrent_generations=0)
+            )
 
 
 if __name__ == "__main__":
