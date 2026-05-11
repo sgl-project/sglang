@@ -15,7 +15,7 @@ from sglang.srt.utils import get_device_capability, get_device_name, is_hip
 logger = logging.getLogger(__name__)
 _is_hip = is_hip()
 # SM90+ (Hopper, Blackwell, ...) has >= 228KB shared memory; older GPUs have ~100KB
-_fp8_num_stages = 2 if _is_hip else (4 if get_device_capability()[0] >= 9 else 2)
+_fp8_num_stages = 4 if not _is_hip and get_device_capability()[0] >= 9 else 2
 
 
 def get_config_file_name(
