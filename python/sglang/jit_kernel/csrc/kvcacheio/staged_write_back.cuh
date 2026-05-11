@@ -2,7 +2,6 @@
 
 #include "hicache.cuh"
 #include "relayout.cuh"
-
 #include <dlfcn.h>
 #include <limits>
 #include <vector>
@@ -267,8 +266,7 @@ struct HiCacheStagedWriteBackKernel {
     };
     const auto device = device_.unwrap();
     const auto use_int32 = indices_dtype.unwrap().bits == 32;
-    launch_hicache_relayout_kernel<kElementSize, kIsMLA>(
-        params, P.unwrap(), N.unwrap(), page_size, use_int32, device);
+    launch_hicache_relayout_kernel<kElementSize, kIsMLA>(params, P.unwrap(), N.unwrap(), page_size, use_int32, device);
 
     auto stream = LaunchKernel::resolve_device(device);
     const int64_t* dst_indices_ptr = static_cast<const int64_t*>(dst_indices_cpu.data_ptr());

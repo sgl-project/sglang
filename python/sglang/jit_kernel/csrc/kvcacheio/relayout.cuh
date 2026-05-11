@@ -1,7 +1,6 @@
 #pragma once
 
 #include "hicache.cuh"
-
 #include <limits>
 
 namespace {
@@ -84,8 +83,7 @@ inline void launch_hicache_relayout_kernel(
 
   const auto grid = div_ceil(total_vecs, static_cast<uint64_t>(kRelayoutBlockSize));
   RuntimeCheck(
-      grid <= std::numeric_limits<uint32_t>::max(),
-      "HiCache staged relayout: CUDA grid size exceeds uint32 range");
+      grid <= std::numeric_limits<uint32_t>::max(), "HiCache staged relayout: CUDA grid size exceeds uint32 range");
   LaunchKernel(static_cast<uint32_t>(grid), kRelayoutBlockSize, device)(kernel, params);
 }
 
