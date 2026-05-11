@@ -4,6 +4,34 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+from dataclasses import dataclass  # noqa: F401
+from typing import Optional  # noqa: F401
+
+from sglang.srt.configs.model_config import ModelImpl  # noqa: F401
+from sglang.srt.environ import envs  # noqa: F401
+from sglang.srt.managers.mm_utils import init_mm_embedding_cache  # noqa: F401
+from sglang.srt.mem_cache.cache_init_params import CacheInitParams  # noqa: F401
+from sglang.srt.mem_cache.radix_cache import RadixCache  # noqa: F401
+from sglang.srt.model_loader.utils import get_resolved_model_impl  # noqa: F401
+from sglang.srt.session.streaming_session import StreamingSession  # noqa: F401
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class KVCacheBuildResult:
+    """Return type for ``build_kv_cache``: 9 fields the caller writes back to
+    ``Scheduler.self.X``. Field-cluster bundling (a single
+    ``self._kv_cache`` ref instead of 9) is a follow-up commit."""
+
+    is_hybrid_swa: bool
+    is_hybrid_ssm: bool
+    sliding_window_size: Optional[int]
+    full_tokens_per_layer: Optional[int]
+    swa_tokens_per_layer: Optional[int]
+    req_to_token_pool: object
+    token_to_kv_pool_allocator: object
+    disable_radix_cache: bool
+    tree_cache: object
+
 
 def get_draft_kv_pool(
     *,
