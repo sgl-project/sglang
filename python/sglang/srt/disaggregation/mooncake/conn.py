@@ -42,7 +42,17 @@ from sglang.srt.disaggregation.utils import (
 )
 from sglang.srt.distributed.parallel_state import get_mooncake_transfer_engine
 from sglang.srt.environ import envs
-from sglang.srt.server_args import ServerArgs
+from sglang.srt.observability.mooncake_trace import (
+    MooncakeRequestStage,
+    mooncake_trace_func,
+    mooncake_trace_slice,
+)
+from sglang.srt.observability.trace import (
+    TraceNullContext,
+    TraceReqContext,
+    trace_set_thread_info,
+)
+from sglang.srt.server_args import ServerArgs, get_global_server_args
 from sglang.srt.utils.network import NetworkAddress
 
 logger = logging.getLogger(__name__)
@@ -67,6 +77,9 @@ class TransferKVChunk:
     is_last_chunk: bool
     prefill_aux_index: Optional[int]
     state_indices: Optional[List]
+    trace_ctx: Optional[TraceReqContext, TraceNullContext] = dataclasses.field(
+        default_factory=TraceNullContext
+    )
 
 
 # decode
@@ -240,6 +253,7 @@ class MooncakeKVManager(CommonKVManager):
                             if self.enable_staging and self._staging_ctx.buffers
                             else None
                         ),
+                        i,
                     ),
                     daemon=True,
                 ).start()
@@ -1199,12 +1213,26 @@ class MooncakeKVManager(CommonKVManager):
         queue: FastQueue,
         executor: concurrent.futures.ThreadPoolExecutor,
         staging_buffer=None,
+        worker_index=0,
     ):
         staging_strategy = None
+        if get_global_server_args().enable_trace:
+            trace_set_thread_info(
+                f"mooncake transfer worker {worker_index}",
+                tp_rank=self.attn_tp_rank,
+                dp_rank=self.attn_dp_rank,
+            )
 
         while True:
             try:
                 kv_chunk: TransferKVChunk = queue.get()
+                if kv_chunk.trace_ctx:
+                    kv_chunk.trace_ctx.rebuild_thread_context()
+                    kv_chunk.trace_ctx.trace_slice_start(
+                        MooncakeRequestStage.MOONCAKE_WORKER_SEND.stage_name,
+                        MooncakeRequestStage.MOONCAKE_WORKER_SEND.level,
+                    )
+
                 if (
                     self.enable_staging
                     and staging_strategy is None
@@ -1228,6 +1256,7 @@ class MooncakeKVManager(CommonKVManager):
                 # the chunk is re-enqueued and we break out of the req loop to retry later.
                 staging_deferred = False
                 for req in reqs_to_be_processed:
+                    start_ts = time.perf_counter()
                     if not req.is_dummy:
                         # Early exit if the request has failed
                         with self.session_lock:
@@ -1377,6 +1406,20 @@ class MooncakeKVManager(CommonKVManager):
                         # Dummy request does not need to sync status to decode endpoint
                         if kv_chunk.is_last_chunk and req.room in self.request_status:
                             self.update_status(req.room, KVPoll.Success)
+
+                    if kv_chunk.trace_ctx:
+                        mooncake_trace_slice(
+                            kv_chunk.trace_ctx,
+                            MooncakeRequestStage.MOONCAKE_WORKER_SEND_SESSION,
+                            start_ts,
+                        )
+
+                if kv_chunk.trace_ctx:
+                    kv_chunk.trace_ctx.trace_slice_end(
+                        MooncakeRequestStage.MOONCAKE_WORKER_SEND.stage_name,
+                        MooncakeRequestStage.MOONCAKE_WORKER_SEND.level,
+                        thread_finish_flag=True,
+                    )
 
                 if staging_deferred:
                     continue
@@ -1582,6 +1625,7 @@ class MooncakeKVManager(CommonKVManager):
         is_last_chunk: bool,
         aux_index: Optional[int] = None,
         state_indices: Optional[List] = None,
+        trace_ctx: Optional[TraceReqContext, TraceNullContext] = None,
     ):
         assert self.disaggregation_mode == DisaggregationMode.PREFILL
         assert not is_last_chunk or (is_last_chunk and aux_index is not None)
@@ -1616,6 +1660,7 @@ class MooncakeKVManager(CommonKVManager):
                 is_last_chunk=is_last_chunk,
                 prefill_aux_index=aux_index,
                 state_indices=state_indices,
+                trace_ctx=trace_ctx,
             )
         )
 
@@ -1667,6 +1712,7 @@ class MooncakeKVSender(CommonKVSender):
         super().__init__(mgr, bootstrap_addr, bootstrap_room, dest_tp_ranks, pp_rank)
         self.conclude_state = None
         self.init_time = time.time()
+        self._init_trace_ctx()
 
     def pop_decode_prefix_len(self) -> int:
         return self.kv_mgr.req_to_decode_prefix_len.pop(self.bootstrap_room, 0)
@@ -1674,6 +1720,7 @@ class MooncakeKVSender(CommonKVSender):
     def should_send_kv_chunk(self, num_pages: int, last_chunk: bool) -> bool:
         return num_pages > 0 or last_chunk
 
+    @mooncake_trace_func(MooncakeRequestStage.MOONCAKE_SEND)
     def send(
         self,
         kv_indices: npt.NDArray[np.int32],
@@ -1703,6 +1750,7 @@ class MooncakeKVSender(CommonKVSender):
                 kv_indices,
                 index_slice,
                 False,
+                trace_ctx=self.trace_ctx.copy_for_thread(),
             )
         else:
             self.kv_mgr.add_transfer_request(
@@ -1712,6 +1760,7 @@ class MooncakeKVSender(CommonKVSender):
                 True,
                 aux_index=self.aux_index,
                 state_indices=state_indices,
+                trace_ctx=self.trace_ctx.copy_for_thread(),
             )
         self._record_transfer_indices(kv_indices, state_indices)
 
@@ -1720,6 +1769,7 @@ class MooncakeKVSender(CommonKVSender):
             status = self.kv_mgr.check_status(self.bootstrap_room)
             if status in (KVPoll.Success, KVPoll.Failed):
                 self.conclude_state = status
+                self.trace_ctx.trace_req_finish()
             elif status == KVPoll.Bootstrapping:
                 if self.init_time is not None:
                     now = time.time()
@@ -1753,6 +1803,21 @@ class MooncakeKVSender(CommonKVSender):
                 self.bootstrap_room, "Failed due to an unknown reason from another rank"
             )
         raise KVTransferError(self.bootstrap_room, failure_reason)
+
+    def _init_trace_ctx(self):
+        if get_global_server_args().enable_trace:
+            self.trace_ctx = TraceReqContext(
+                rid=str(hex(self.bootstrap_room)),
+                bootstrap_room=self.bootstrap_room,
+                role="Sender",
+                module_name="mooncake",
+            )
+            if not self.trace_ctx.tracing_enable:
+                self.trace_ctx = TraceNullContext()
+        else:
+            self.trace_ctx = TraceNullContext()
+
+        self.trace_ctx.trace_req_start()
 
 
 class MooncakeKVReceiver(CommonKVReceiver):

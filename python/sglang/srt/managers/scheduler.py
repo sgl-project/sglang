@@ -2001,6 +2001,7 @@ class Scheduler(
             req.init_next_round_input(self.tree_cache, cow_mamba=False)
             last_host_node = req.last_host_node
             if last_host_node.backuped or last_host_node is self.tree_cache.root_node:
+                req.time_stats.set_l3_cache_prefetch_start_time()
                 last_hash = last_host_node.get_last_hash_value()
                 matched_len = len(req.prefix_indices) + req.host_hit_length
                 new_input_tokens = req.fill_ids[matched_len:]
@@ -2527,6 +2528,7 @@ class Scheduler(
                 req.storage_hit_length = self.tree_cache.pop_prefetch_loaded_tokens(
                     req.rid
                 )
+                req.time_stats.set_l3_cache_prefetch_finish_time()
 
             req.init_next_round_input(self.tree_cache)
             res = adder.add_one_req(

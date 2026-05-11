@@ -15,6 +15,7 @@ from urllib.parse import urlparse
 
 import requests
 
+from sglang.srt.observability.mooncake_trace import MooncakeRequestStage
 from sglang.srt.observability.req_time_stats import RequestStage
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -101,6 +102,8 @@ class TestTraceDisaggregation(CustomTestCase):
             "--enable-trace",
             "--otlp-traces-endpoint",
             "localhost:4317",
+            "--trace-modules",
+            "request,mooncake",
         ]
         decode_args += cls.transfer_backend + cls.rdma_devices
         cls.process_decode = popen_launch_pd_server(
@@ -186,9 +189,7 @@ class TestTraceDisaggregation(CustomTestCase):
     def test_disaggregation_transfer_spans(self):
         """Test that disaggregation produces PREFILL_TRANSFER_KV_CACHE and DECODE_TRANSFERRED spans."""
         # Set trace level
-        response = requests.get(f"{self.prefill_url}/set_trace_level?level=1")
-        self.assertEqual(response.status_code, 200)
-        response = requests.get(f"{self.decode_url}/set_trace_level?level=1")
+        response = requests.get(f"{self.prefill_url}/set_trace_level?level=2")
         self.assertEqual(response.status_code, 200)
         self.collector.clear()
 
@@ -225,6 +226,7 @@ class TestTraceDisaggregation(CustomTestCase):
                 [
                     RequestStage.PREFILL_TRANSFER_KV_CACHE.stage_name,
                     RequestStage.DECODE_TRANSFERRED.stage_name,
+                    MooncakeRequestStage.MOONCAKE_WORKER_SEND.stage_name,
                 ]
             ),
             f"Expected disaggregation transfer spans, got {sorted(span_names)}",

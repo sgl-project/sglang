@@ -203,6 +203,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--enable-request-time-stats-logging` | Enable per request time stats logging | `False` | bool flag (set to enable) |
 | `--kv-events-config` | Config in json format for NVIDIA dynamo KV event publishing. Publishing will be enabled if this flag is used. | `None` | Type: str |
 | `--enable-trace` | Enable opentelemetry trace | `False` | bool flag (set to enable) |
+| `--trace-modules` | Select the components to trace. Available options are 'request' and 'mooncake'. Format: <module1 name>,<module2 name>,...... | `request` | Type: str |
 | `--otlp-traces-endpoint` | Config opentelemetry collector endpoint if --enable-trace is set. format: <ip>:<port> | `localhost:4317` | Type: str |
 
 ## RequestMetricsExporter configuration

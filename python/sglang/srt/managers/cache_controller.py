@@ -41,6 +41,14 @@ from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
 from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
+from sglang.srt.observability.hicache_trace import (
+    trace_backup,
+    trace_backup_enqueue,
+    trace_prefetch_enqueue,
+    trace_prefetch_query,
+    trace_prefetch_transfer,
+)
+from sglang.srt.observability.trace import trace_set_thread_info
 from sglang.srt.utils import get_device_module
 
 logger = logging.getLogger(__name__)
@@ -200,6 +208,7 @@ class StorageOperation:
         self.completed_tokens = 0
         self.hash_value = hash_value if hash_value is not None else []
         self.prefix_keys = prefix_keys
+        self.trace_parent_context = None  # set by hicache_trace_enqueue
 
         self.id = StorageOperation.counter
         StorageOperation.counter += 1
@@ -859,6 +868,7 @@ class HiCacheController:
         operation = PrefetchOperation(
             request_id, host_indices, new_input_tokens, last_hash, prefix_keys
         )
+        trace_prefetch_enqueue(self, operation)
         self.prefetch_queue.put(operation)
         return operation
 
@@ -912,6 +922,7 @@ class HiCacheController:
             if not operation.increment(self.page_size):
                 break  # Operation terminated by controller
 
+    @trace_prefetch_transfer
     def _page_transfer(self, operation):
         # Transfer batch by batch
         prefix_keys = operation.prefix_keys
@@ -946,6 +957,7 @@ class HiCacheController:
         """
         Auxiliary function conducting IO operations for prefetching.
         """
+        trace_set_thread_info("hicache_prefetch_io")
         while not self.storage_stop_event.is_set():
             try:
                 operation = self.prefetch_buffer.get(block=True, timeout=1)
@@ -969,6 +981,7 @@ class HiCacheController:
         # todo: more sophisticated rate limiting based on storage backend performance
         return False
 
+    @trace_prefetch_query
     def _storage_hit_query(self, operation) -> tuple[list[str], int]:
         last_hash = operation.last_hash
         tokens_to_fetch = operation.token_ids
@@ -1005,6 +1018,7 @@ class HiCacheController:
         """
         Manage prefetching operations from storage backend to host memory.
         """
+        trace_set_thread_info("hicache_prefetch")
         self.prefetch_buffer = Queue()
         self.prefetch_io_aux_thread = threading.Thread(
             target=self.prefetch_io_aux_func, daemon=True
@@ -1061,6 +1075,7 @@ class HiCacheController:
         operation = StorageOperation(
             host_indices, token_ids, hash_value=hash_value, prefix_keys=prefix_keys
         )
+        trace_backup_enqueue(self, operation)
         self.backup_queue.put(operation)
         return operation.id
 
@@ -1117,6 +1132,7 @@ class HiCacheController:
             logger.debug("Draft L3 read failed (best-effort), skipping.", exc_info=True)
 
     # Backup batch by batch
+    @trace_backup
     def _page_backup(self, operation):
         # Backup batch by batch
         prefix_keys = operation.prefix_keys
@@ -1147,6 +1163,7 @@ class HiCacheController:
         """
         Manage backup operations from host memory to storage backend.
         """
+        trace_set_thread_info("hicache_backup")
         while not self.storage_stop_event.is_set():
             try:
                 operation = self.backup_queue.get(block=True, timeout=1)
