@@ -535,6 +535,14 @@ class SchedulerOutputProcessorMixin:
                 # And all the over-allocated tokens will be freed in `release_kv_cache`.
                 continue
 
+            if req.kv_committed_freed:
+                # PP stale-batch: another microbatch already finalized this req
+                # (released its KV and set finished_reason). Skipping the whole
+                # per-req body here avoids appending a duplicate next_token to
+                # req.output_ids — which would corrupt GSM8K accuracy — and
+                # avoids a second release_kv_cache call.
+                continue
+
             if is_spec_v1:
                 self._mamba_prefix_cache_update(req, batch, result, i)
                 req.time_stats.set_last_decode_finish_time()
