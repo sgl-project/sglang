@@ -636,11 +636,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         )
         self.expert_location_updater = ExpertLocationUpdater()
 
-        (
+        if self.server_args.elastic_ep_backend:
             ElasticEPStateManager.init(self.server_args)
-            if self.server_args.elastic_ep_backend
-            else None
-        )
         # Load the model
         self.sampler = create_sampler()
         self.load_model()
