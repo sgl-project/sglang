@@ -181,19 +181,8 @@ class OutputProcessor:
             ):
                 self.request_log_manager.record_request_for_crash_dump(state, out_dict)
 
-        # handle_loop awaits next recv immediately
-        for s in pending_notify.values():
-            s.event.set()
-
-        # When skip_tokenizer_init is enabled, tokensizer_manager receives
-        # BatchTokenIDOutput.
-        if (
-            self.config.dp_size > 1
-            and isinstance(recv_obj, (BatchStrOutput, BatchTokenIDOutput))
-            and recv_obj.load is not None
-        ):
-            load_update_req = WatchLoadUpdateReq(loads=[recv_obj.load])
-            self.send_to_scheduler.send_pyobj(load_update_req)
+        self._drain_pending_notify(pending_notify)
+        self._maybe_emit_load_update(recv_obj)
 
     def _build_out_dict(
         self,
@@ -366,3 +355,22 @@ class OutputProcessor:
             asyncio.create_task(
                 self.lora_controller.lora_registry.release(state.obj.lora_id)
             )
+
+    def _drain_pending_notify(
+        self,
+        pending_notify: Dict[str, ReqState],
+    ) -> None:
+        # handle_loop awaits next recv immediately
+        for s in pending_notify.values():
+            s.event.set()
+
+    def _maybe_emit_load_update(self, recv_obj) -> None:
+        # When skip_tokenizer_init is enabled, tokensizer_manager receives
+        # BatchTokenIDOutput.
+        if (
+            self.config.dp_size > 1
+            and isinstance(recv_obj, (BatchStrOutput, BatchTokenIDOutput))
+            and recv_obj.load is not None
+        ):
+            load_update_req = WatchLoadUpdateReq(loads=[recv_obj.load])
+            self.send_to_scheduler.send_pyobj(load_update_req)
