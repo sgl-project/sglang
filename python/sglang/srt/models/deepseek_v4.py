@@ -76,6 +76,7 @@ from sglang.srt.utils import (
     add_prefix,
     log_info_on_rank0,
     make_layers,
+    use_intel_amx_backend,
 )
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
@@ -371,6 +372,13 @@ class MQALayer(nn.Module):
                 self.wo_a, "weight_scale_inv"
             ), "FP8 quant_config must create weight_scale_inv"
             self.wo_a.weight_scale_inv.format_ue8m0 = True
+        elif _is_cpu and _cpu_amx:
+            from sglang.srt.layers.amx_utils import PackWeightMethodBMM
+
+            self.wo_a.quant_method = PackWeightMethodBMM(
+                n_groups=self.n_local_groups,
+                group_size=self.o_lora_rank,
+            )
         self.wo_b = RowParallelLinear(
             self.n_groups * self.o_lora_rank,
             self.hidden_size,
@@ -660,6 +668,18 @@ class MQALayer(nn.Module):
                 (self.wo_a.weight.view(G, R, D), self.wo_a.weight_scale_inv.data),
                 output,
                 recipe=(1, 1, 128),
+            )
+            o = output
+        elif use_intel_amx_backend(self.wo_a):
+            T, G, D = o.shape
+            R = self.o_lora_rank
+            output = torch.empty([T, G, R], dtype=o.dtype, device=o.device)
+            torch.ops.sgl_kernel.bmm_cpu(
+                output.transpose(0, 1),  # [G, T, R]
+                o.transpose(0, 1),  # [G, T, D]
+                self.wo_a.weight,  # [G, R, D] packed in VNNI
+                True,  # is_vnni
+                None,  # scale
             )
             o = output
         else:
