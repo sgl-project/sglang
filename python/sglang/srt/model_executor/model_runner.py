@@ -1216,19 +1216,7 @@ class ModelRunner:
                 f"Online {self.server_args.quantization} quantization: quantized {quantized_layers_count} layers of types: {layer_types}"
             )
 
-        if self.server_args.debug_tensor_dump_output_folder is not None:
-            dump_folder = self.server_args.debug_tensor_dump_output_folder
-            if self.spec_algorithm.is_eagle():
-                role = "draft" if self.is_draft_worker else "target"
-                dump_folder = os.path.join(dump_folder, role)
-            register_forward_hook_for_model(
-                self.model,
-                dump_folder,
-                self.server_args.debug_tensor_dump_layers,
-                self.tp_size,
-                self.tp_rank,
-                self.pp_rank,
-            )
+        self._maybe_register_debug_tensor_dump_hook()
 
         if dumper.may_enable:
             dumper.apply_source_patches()
@@ -1468,6 +1456,21 @@ class ModelRunner:
             self.sliding_window_size = self.model_config.attention_chunk_size
             logger.info(
                 f"Setting sliding_window_size to be attention_chunk_size: {self.sliding_window_size}"
+            )
+
+    def _maybe_register_debug_tensor_dump_hook(self) -> None:
+        if self.server_args.debug_tensor_dump_output_folder is not None:
+            dump_folder = self.server_args.debug_tensor_dump_output_folder
+            if self.spec_algorithm.is_eagle():
+                role = "draft" if self.is_draft_worker else "target"
+                dump_folder = os.path.join(dump_folder, role)
+            register_forward_hook_for_model(
+                self.model,
+                dump_folder,
+                self.server_args.debug_tensor_dump_layers,
+                self.tp_size,
+                self.tp_rank,
+                self.pp_rank,
             )
 
     def maybe_recover_ep_ranks(self):
