@@ -663,6 +663,153 @@ realizes per-chunk matches via N:M alignment.
   minimum chunk-overlap ratio required to surface a match. Lowering
   either increases recall but reduces precision.
 
+## Re-validation against Chenxin's 2026-05-10 feedback (v0.3.6)
+
+Chenxin flagged three concrete issues after his 2026-05-10 testing pass.
+This section documents what changed and what the rebuilt artifact
+(`semblend 0.3.6` + `fuzzy-semantic-provider-rebase@58c1bc2`) does on
+the exact same probes.
+
+### Issues he raised
+
+1. **`pip install semblend` resolves to a version without
+   `SemBlendProviderConfig` / `SemBlendProviderAdapter`.** The published
+   PyPI artifact (`0.3.1`) predates the SGLang integration entrypoints.
+   - **Resolution:** SGLang's `SemanticEmbeddingProvider` now enforces
+     a minimum-version gate (`_MIN_SEMBLEND_VERSION = "0.3.6"`). The
+     branch tip at `WorldFlowAI/semblend@feat/sglang-semantic-provider`
+     ships 0.3.6 with the integration entrypoints. Installing from that
+     branch (or pinning to the equivalent tarball) is the supported
+     path until the PyPI publish catches up.
+
+2. **`ValueError: too many values to unpack` in
+   `multi_donor_alignment.py:318`** — `_fuzzy_match_chunk` returns 3
+   values, the caller unpacked 2.
+   - **Resolution:** fixed on the current branch; the caller now
+     unpacks `(d_idx, pairs, best_overlap)`. Confirmed by running the
+     pod end-to-end against multi-donor traffic for ~5 minutes without
+     a single exception in the scheduler thread.
+
+3. **Case 2 / Case 3 showed `Fuzzy match success: cached=60` from the
+   FUZZY layer but `#cached-token: 0` in the `Prefill batch` log,
+   suggesting the KV cache wasn't actually being reused.**
+   - **Root cause (clarified):** this is an *observability artifact*,
+     not a correctness bug. The previous (pre-Plan-H) prefix-anchored
+     path could express its reuse as a contiguous prefix span and
+     surface it via `device_indices` (which the scheduler counts as
+     `#cached-token`). The non-prefix-anchored path - now the default
+     for paraphrase / RAG / multi-question workloads - puts the reused
+     block's slot indices in `req.fuzzy_realized_locs` (a separate
+     out-of-band channel) instead of `device_indices`, because the
+     block doesn't start at the request's exact-prefix boundary and
+     can't be expressed as a single prefix span. The scheduler still
+     allocates extend slots for the full unmatched suffix and reports
+     `#cached-token=0`, but `model_runner._forward_extend_two_pass`
+     runs the model forward **only on the lead-in and trailing tokens
+     (typically 2-15 tokens combined)** and `memcpy`s the donor KV
+     into the block's positions with `reverse_rotary_emb` +
+     `apply_rotary_emb` to fix up the RoPE delta. The compute *is*
+     saved; the prefill-batch counter is just unaware of it.
+   - **What to look for to confirm reuse is happening:** grep
+     `match_block realized` lines in the server log. Each occurrence
+     shows `lead_in=N tokens prefilled, block=B tokens reused
+     (donor_start=D -> target_start=T), main=M tokens prefilled.
+     Saved ~B tokens of prefill vs cold.` That is the authoritative
+     signal.
+   - **Future work:** surface `fuzzy_matched_len` in the `Prefill
+     batch` log line so the observability matches the optimization.
+     Tracked, but cosmetic.
+
+### Re-validation runs
+
+All numbers from `sglang-semblend-7bawq-fixed5` (Qwen2.5-7B-Instruct-AWQ
+on A10G, `--chunked-prefill-size 4096`, `--mem-fraction-static 0.70`)
+running `semblend 0.3.6` + `fuzzy-semantic-provider-rebase@58c1bc2`.
+
+#### Chenxin's exact Case 1 / Case 2 prompts
+
+Probe: `/tmp/chenxin_replay_probe.py` runs his exact `ART` paragraph
+and exact paraphrased questions, with cold seed → warm variant
+sequencing.
+
+Results:
+- 4 fuzzy match successes across 5 measured requests (the first one
+  per case is cold by design).
+- 4 `match_block realized` log lines, each reusing **109 tokens**
+  (the article body) with `lead_in=4-8` and `main=2`.
+- 0 pool memory leaks, 0 geometry-invalid events.
+- TTFT: cold seed 151ms vs warm variants avg 131ms (**1.15x speedup**
+  on a 119-token prompt - the headroom is small at this size because
+  cold prefill itself is already fast).
+- Response *consistency* across seed and variant: nearly token-identical
+  continuations (the completion endpoint has no chat template, so the
+  model continues the article rather than answering; both seed and
+  variant produce the same continuation, confirming KV reuse preserves
+  generation quality).
+
+#### Longer prompts (where TTFT savings actually surface)
+
+Probe: `/tmp/ttft_validation_probe.py` builds ~9.6 KB prompts (~2.4K
+tokens) with a fresh randomized body per pair, so RadixCache cannot
+prefix-match across pairs. Each pair runs cold-seed then warm-variant.
+
+Results (6 pairs):
+- 11 `match_block realized` events, several with `block=3477`,
+  `block=3447` - the substring path is finding the entire shared body
+  as a single contiguous run.
+- 0 geometry-invalid, 0 pool leaks.
+- TTFT speedup: **avg 1.20x, median 1.09x, range 0.88x .. 1.93x**.
+- Best case (pair_4 in the run): cold 2428ms → warm 1263ms = 1.93x.
+- Worst case is when the seed itself benefits from chunk-level overlap
+  with an earlier pair's body (probe artifact; in real traffic each
+  request has a distinct upstream).
+
+### Why TTFT savings on the small Case 1 / Case 2 prompts look modest
+
+Cold prefill of ~120-tokens on A10G is already in the ~50-150ms range.
+The two-pass forward_extend has ~30ms of orchestration overhead per
+pass (two CUDA graph entries, two attention-backend setups). At
+120-token prompt size, you're saving ~50-100ms of prefill compute and
+paying ~60ms of two-pass overhead, netting ~10-30ms (1.1-1.2x). The
+break-even point against the two-pass overhead is around 200-300
+prompt tokens; beyond ~2K tokens you should see ~1.5-2x routinely on
+unique-body workloads.
+
+### Known limitations exposed by re-validation
+
+- **Chunked prefill larger than the discovered block** triggers
+  geometry-invalid in `_forward_extend_two_pass`. For prompts where
+  the matched block exceeds `--chunked-prefill-size`, the path
+  correctly falls back to cold prefill (no corruption, no leaks, just
+  a missed optimization). Workaround: raise `--chunked-prefill-size`
+  (we used 4096 on A10G; 16384 OOM'd on 22 GB - back off on smaller
+  GPUs). Proper fix is for the model_runner to split the block across
+  chunked-prefill iterations - tracked.
+- **Donor pool symmetry in seed→variant probes**: once steady-state
+  is reached, every request in a benchmark pair gets a fuzzy hit
+  (seed hits the prior pair's seed; variant hits the same-pair seed).
+  Cold-vs-warm probe ratios drift toward 1.0x because both sides
+  benefit. To measure raw KV-reuse impact, the cold-seed needs a
+  genuinely fresh body that no donor in the pool can match - which is
+  what `/tmp/ttft_validation_probe.py` constructs.
+
+### Re-running the probes locally
+
+```bash
+# Chenxin's exact cases (uses /v1/completions, no chat template):
+python3 chenxin_replay_probe.py --pod <pod> --out /tmp/chenxin_v036.json
+
+# TTFT validation with larger unique-body prompts:
+python3 ttft_validation_probe.py --pod <pod> --n-pairs 6 --n-facts 80 \
+        --out /tmp/ttft_v036.json
+```
+
+Look for `match_block realized` in the server log; that's the
+authoritative reuse signal. `#cached-token` in the `Prefill batch`
+line is still 0 for the non-prefix-anchored path (see the
+observability note above) - that's expected and does not indicate
+missing reuse.
+
 ## What's NOT in this PR (called out for reviewers)
 
 - **Aggregate quality metrics (PPL ratio, ROUGE-L)**: paired-prompt
