@@ -4,8 +4,12 @@
 # setuptools-rust. Minimum supported version is 1.85 (edition 2024).
 set -euxo pipefail
 
-# Pick up cargo if rustup was installed in a previous CI step.
+# Make cargo/rustc visible to the rest of this shell and to subsequent
+# GitHub Actions steps in the same job.
 export PATH="${CARGO_HOME:-$HOME/.cargo}/bin:${PATH}"
+if [ -n "${GITHUB_PATH:-}" ]; then
+    echo "${CARGO_HOME:-$HOME/.cargo}/bin" >> "${GITHUB_PATH}"
+fi
 
 if command -v cargo >/dev/null 2>&1 && command -v rustc >/dev/null 2>&1; then
     echo "rust already installed: $(rustc --version), $(cargo --version)"
@@ -42,7 +46,7 @@ if [ -n "${RUSTUP_CACHE_URL:-}" ]; then
         "${RUSTUP_UPDATE_ROOT}/dist/${RUSTUP_ARCH}/rustup-init" \
         -o "${RUSTUP_TMP}/rustup-init"
     chmod +x "${RUSTUP_TMP}/rustup-init"
-    "${RUSTUP_TMP}/rustup-init" -y --no-modify-path --default-toolchain stable
+    "${RUSTUP_TMP}/rustup-init" -y --no-modify-path
 else
     curl --proto '=https' --tlsv1.2 --retry 3 --retry-delay 2 -sSf https://sh.rustup.rs \
         | sh -s -- -y --no-modify-path
