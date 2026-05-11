@@ -115,6 +115,7 @@ from sglang.srt.model_executor.model_runner_components.kernel_warmup import (
     kernel_warmup,
 )
 from sglang.srt.model_executor.model_runner_components.layer_setup import (
+    adjust_hybrid_swa_layer_ids,
     resolve_layer_indices,
 )
 from sglang.srt.model_executor.model_runner_components.pool_configurator import (
@@ -699,7 +700,12 @@ class ModelRunner:
         self.end_layer = layer_info.end_layer
         self.num_effective_layers = layer_info.num_effective_layers
 
-        self.adjust_hybrid_swa_layers_for_pp()
+        adjust_hybrid_swa_layer_ids(
+            model_config=self.model_config,
+            start_layer=self.start_layer,
+            end_layer=self.end_layer,
+            is_hybrid_swa=self.is_hybrid_swa,
+        )
 
         # Apply torchao quantization
         torchao_applied = getattr(self.model, "torchao_applied", False)
@@ -870,28 +876,6 @@ class ModelRunner:
             device=self.device,
             forward_stream=self.forward_stream,
         )
-
-    def adjust_hybrid_swa_layers_for_pp(self):
-        if not self.is_hybrid_swa:
-            return
-
-        if self.model_config.is_deepseek_v4_arch:
-            return
-
-        full_attention_layer_ids = [
-            layer_idx
-            for layer_idx in range(self.start_layer, self.end_layer + 1)
-            if hasattr(self.model_config, "full_attention_layer_ids")
-            and layer_idx in self.model_config.full_attention_layer_ids
-        ]
-        swa_attention_layer_ids = [
-            layer_idx
-            for layer_idx in range(self.start_layer, self.end_layer + 1)
-            if hasattr(self.model_config, "swa_attention_layer_ids")
-            and layer_idx in self.model_config.swa_attention_layer_ids
-        ]
-        self.model_config.swa_attention_layer_ids = swa_attention_layer_ids
-        self.model_config.full_attention_layer_ids = full_attention_layer_ids
 
     def init_routed_experts_capturer(self):
         if not self.server_args.disable_shared_experts_fusion and hasattr(
