@@ -156,12 +156,30 @@ class MambaAttnBackendBase(AttentionBackend):
     ) -> torch.Tensor:
         """Get mamba pool indices for CUDA graph capture/replay.
 
-        Uses _replay_forward_batch (set by cuda_graph_runner) if available.
+        Uses _replay_forward_batch (set by HybridLinearAttnBackend during
+        CUDA graph replay) if available.
         """
         fb = getattr(self, "_replay_forward_batch", None)
         if fb is not None and fb.mamba_cache_indices is not None:
             return fb.mamba_cache_indices[:bs].clone()
         return torch.zeros(bs, dtype=torch.int32, device=self.device)
+
+    def _execute_deferred_mamba_ops(self, forward_batch: ForwardBatch):
+        """Run deferred clear/COW ops on the forward stream to avoid races."""
+        if (
+            forward_batch.mamba_clear_indices is not None
+            and len(forward_batch.mamba_clear_indices) > 0
+        ):
+            self.req_to_token_pool.mamba_pool.clear_slots(
+                forward_batch.mamba_clear_indices
+            )
+        if (
+            forward_batch.mamba_cow_src_indices is not None
+            and len(forward_batch.mamba_cow_src_indices) > 0
+        ):
+            self.req_to_token_pool.mamba_pool.copy_from(
+                forward_batch.mamba_cow_src_indices, forward_batch.mamba_cow_dst_indices
+            )
 
     def _forward_metadata(self, forward_batch: ForwardBatch):
         bs = forward_batch.batch_size
@@ -250,21 +268,7 @@ class MambaAttnBackendBase(AttentionBackend):
         )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
-        # Perform deferred mamba init ops on the forward stream to avoid races
-        if (
-            forward_batch.mamba_clear_indices is not None
-            and len(forward_batch.mamba_clear_indices) > 0
-        ):
-            self.req_to_token_pool.mamba_pool.clear_slots(
-                forward_batch.mamba_clear_indices
-            )
-        if (
-            forward_batch.mamba_cow_src_indices is not None
-            and len(forward_batch.mamba_cow_src_indices) > 0
-        ):
-            self.req_to_token_pool.mamba_pool.copy_from(
-                forward_batch.mamba_cow_src_indices, forward_batch.mamba_cow_dst_indices
-            )
+        self._execute_deferred_mamba_ops(forward_batch)
         self.forward_metadata = self._forward_metadata(forward_batch)
 
     def _init_track_conv_indices(
@@ -670,21 +674,7 @@ class Mamba2AttnBackend(MambaAttnBackendBase):
         self.mamba_chunk_size = config.mamba_chunk_size
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
-        # Perform deferred mamba init ops on the forward stream to avoid races
-        if (
-            forward_batch.mamba_clear_indices is not None
-            and len(forward_batch.mamba_clear_indices) > 0
-        ):
-            self.req_to_token_pool.mamba_pool.clear_slots(
-                forward_batch.mamba_clear_indices
-            )
-        if (
-            forward_batch.mamba_cow_src_indices is not None
-            and len(forward_batch.mamba_cow_src_indices) > 0
-        ):
-            self.req_to_token_pool.mamba_pool.copy_from(
-                forward_batch.mamba_cow_src_indices, forward_batch.mamba_cow_dst_indices
-            )
+        self._execute_deferred_mamba_ops(forward_batch)
         metadata = self._forward_metadata(forward_batch)
         self.forward_metadata = Mamba2Metadata.prepare_mixed(
             metadata,

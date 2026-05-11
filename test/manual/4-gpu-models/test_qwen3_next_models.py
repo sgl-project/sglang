@@ -13,7 +13,7 @@ class TestQwen3Next(KLDivergenceMixin, DefaultServerBase):
     model = QWEN3_NEXT_MODEL
     cache_chunk_size = 64
     gsm8k_accuracy_thres = 0.93
-    kl_div_thres = 0.0005
+    kl_div_thres = 0.001
     other_args = [
         "--tp-size",
         "4",

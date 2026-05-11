@@ -2081,19 +2081,22 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     def _collect_mamba_init_info(self, reqs):
         """Collect mamba cache indices and deferred COW/clear info from requests."""
         _pin = is_pin_memory_available(self.device)
-        mamba_indices = []
+
+        # Single GPU→CPU sync: stack all pool indices then convert to a Python list
+        all_pool_idx = torch.stack([req.mamba_pool_idx for req in reqs])
+        mamba_indices = all_pool_idx.tolist()
+
         cow_src = []
         cow_dst = []
         clear_indices = []
-        for req in reqs:
-            mamba_indices.append(req.mamba_pool_idx.item())
+        for i, req in enumerate(reqs):
             if req.mamba_cow_src_index is not None:
                 cow_src.append(req.mamba_cow_src_index.item())
-                cow_dst.append(req.mamba_pool_idx.item())
+                cow_dst.append(mamba_indices[i])
                 req.mamba_cow_src_index = None
                 req.mamba_needs_clear = False
             elif req.mamba_needs_clear:
-                clear_indices.append(req.mamba_pool_idx.item())
+                clear_indices.append(mamba_indices[i])
                 req.mamba_needs_clear = False
         self.mamba_cache_indices = torch.tensor(
             mamba_indices, dtype=torch.int32, pin_memory=_pin
@@ -2581,6 +2584,17 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             )
         elif other.mamba_cache_indices is not None:
             self.mamba_cache_indices = other.mamba_cache_indices
+        for field in (
+            "mamba_cow_src_indices",
+            "mamba_cow_dst_indices",
+            "mamba_clear_indices",
+        ):
+            self_val = getattr(self, field)
+            other_val = getattr(other, field)
+            if self_val is not None and other_val is not None:
+                setattr(self, field, torch.cat([self_val, other_val]))
+            elif other_val is not None:
+                setattr(self, field, other_val)
         self.mamba_track_indices = None
         self.mamba_track_mask = None
         self.mamba_track_seqlens = None

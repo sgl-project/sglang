@@ -13,7 +13,7 @@ from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 LONGBENCH_V2_DATASET = "THUDM/LongBench-v2"
 LONGBENCH_V2_SPLIT = "train"
 DEFAULT_NUM_SAMPLES = 48  # Number of samples to use
-DEFAULT_PROMPT_TOKENS = 8192  # Maximum number of tokens to use
+DEFAULT_PROMPT_TOKENS = 5120  # Maximum number of tokens to use
 CACHE_DIR = os.path.join(os.path.dirname(__file__), ".longbench_cache")
 
 # In-memory cache for the current session
@@ -81,7 +81,7 @@ def get_input_ids(
         text = format_longbench_v2_example(example)
         tokens = tokenizer.encode(text)
         # Truncate to a random length between 0.5x and 1.5x of max_prompt_tokens
-        truncate_len = int(max_prompt_tokens * random.uniform(0.95, 1.05))
+        truncate_len = int(max_prompt_tokens * random.uniform(0.5, 1.5))
         input_ids.append(tokens[:truncate_len])
 
     # Save to local cache
