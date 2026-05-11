@@ -45,6 +45,10 @@ jobs:
     if: github.repository == 'sgl-project/sglang'
     environment: ${{ inputs.use_environment || null }}
     runs-on: x64-docker-build-node
+    env:
+      TAG_CONFIG: ${{ inputs.tag_config }}
+      SGL_VERSION: ${{ inputs.sgl_version }}
+      IMAGE_REPO: ${{ inputs.image_repo }}
     outputs:
       digest-cu129: ${{ steps.build-cu129.outputs.digest }}
       digest-cu130: ${{ steps.build-cu130.outputs.digest }}
@@ -59,6 +63,22 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.checkout_ref || github.ref }}
+
+      - name: Compute Docker build metadata args
+        run: |
+          set -euo pipefail
+          BUILD_COMMIT="$(git rev-parse HEAD)"
+          BUILD_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          for CUDA_VARIANT in cu129 cu130; do
+            python3 scripts/ci/utils/docker_build_metadata_args.py \
+              --cuda "${CUDA_VARIANT}" \
+              --tag-config "${TAG_CONFIG}" \
+              --image-repo "${IMAGE_REPO}" \
+              --sgl-version "${SGL_VERSION}" \
+              --build-commit "${BUILD_COMMIT}" \
+              --build-url "${BUILD_URL}" \
+              > "/tmp/docker-metadata-${CUDA_VARIANT}.args"
+          done
 
       - name: Free disk space
         uses: jlumbroso/free-disk-space@main
@@ -90,9 +110,10 @@ jobs:
         id: build-cu129
         run: |
           VERSION_ARG=""
-          if [ -n "${{ inputs.sgl_version }}" ]; then
-            VERSION_ARG="--build-arg SGL_VERSION=${{ inputs.sgl_version }}"
+          if [ -n "${SGL_VERSION}" ]; then
+            VERSION_ARG="--build-arg SGL_VERSION=${SGL_VERSION}"
           fi
+          mapfile -t METADATA_ARGS < /tmp/docker-metadata-cu129.args
 
           docker buildx build \
             --target ${{ inputs.docker_target }} \
@@ -103,6 +124,7 @@ jobs:
             --build-arg BUILD_TYPE=all \
             --build-arg GRACE_BLACKWELL=0 \
             --build-arg INSTALL_FLASHINFER_JIT_CACHE=1 \
+            "${METADATA_ARGS[@]}" \
             ${VERSION_ARG} \
             ${{ inputs.extra_build_args }} \
             --metadata-file /tmp/metadata-cu129.json \
@@ -117,9 +139,10 @@ jobs:
         id: build-cu130
         run: |
           VERSION_ARG=""
-          if [ -n "${{ inputs.sgl_version }}" ]; then
-            VERSION_ARG="--build-arg SGL_VERSION=${{ inputs.sgl_version }}"
+          if [ -n "${SGL_VERSION}" ]; then
+            VERSION_ARG="--build-arg SGL_VERSION=${SGL_VERSION}"
           fi
+          mapfile -t METADATA_ARGS < /tmp/docker-metadata-cu130.args
 
           docker buildx build \
             --target ${{ inputs.docker_target }} \
@@ -130,6 +153,7 @@ jobs:
             --build-arg BUILD_TYPE=all \
             --build-arg GRACE_BLACKWELL=0 \
             --build-arg INSTALL_FLASHINFER_JIT_CACHE=1 \
+            "${METADATA_ARGS[@]}" \
             ${VERSION_ARG} \
             ${{ inputs.extra_build_args }} \
             --metadata-file /tmp/metadata-cu130.json \
@@ -144,6 +168,10 @@ jobs:
     if: github.repository == 'sgl-project/sglang'
     environment: ${{ inputs.use_environment || null }}
     runs-on: arm-docker-build-node
+    env:
+      TAG_CONFIG: ${{ inputs.tag_config }}
+      SGL_VERSION: ${{ inputs.sgl_version }}
+      IMAGE_REPO: ${{ inputs.image_repo }}
     outputs:
       digest-cu129: ${{ steps.build-cu129.outputs.digest }}
       digest-cu130: ${{ steps.build-cu130.outputs.digest }}
@@ -158,6 +186,22 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.checkout_ref || github.ref }}
+
+      - name: Compute Docker build metadata args
+        run: |
+          set -euo pipefail
+          BUILD_COMMIT="$(git rev-parse HEAD)"
+          BUILD_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          for CUDA_VARIANT in cu129 cu130; do
+            python3 scripts/ci/utils/docker_build_metadata_args.py \
+              --cuda "${CUDA_VARIANT}" \
+              --tag-config "${TAG_CONFIG}" \
+              --image-repo "${IMAGE_REPO}" \
+              --sgl-version "${SGL_VERSION}" \
+              --build-commit "${BUILD_COMMIT}" \
+              --build-url "${BUILD_URL}" \
+              > "/tmp/docker-metadata-${CUDA_VARIANT}.args"
+          done
 
       - name: Prune Docker to reclaim disk space
         run: |
@@ -178,9 +222,10 @@ jobs:
         id: build-cu129
         run: |
           VERSION_ARG=""
-          if [ -n "${{ inputs.sgl_version }}" ]; then
-            VERSION_ARG="--build-arg SGL_VERSION=${{ inputs.sgl_version }}"
+          if [ -n "${SGL_VERSION}" ]; then
+            VERSION_ARG="--build-arg SGL_VERSION=${SGL_VERSION}"
           fi
+          mapfile -t METADATA_ARGS < /tmp/docker-metadata-cu129.args
 
           docker buildx build \
             --target ${{ inputs.docker_target }} \
@@ -191,6 +236,7 @@ jobs:
             --build-arg BUILD_TYPE=all \
             --build-arg GRACE_BLACKWELL=1 \
             --build-arg INSTALL_FLASHINFER_JIT_CACHE=1 \
+            "${METADATA_ARGS[@]}" \
             ${VERSION_ARG} \
             ${{ inputs.extra_build_args }} \
             --metadata-file /tmp/metadata-cu129.json \
@@ -205,9 +251,10 @@ jobs:
         id: build-cu130
         run: |
           VERSION_ARG=""
-          if [ -n "${{ inputs.sgl_version }}" ]; then
-            VERSION_ARG="--build-arg SGL_VERSION=${{ inputs.sgl_version }}"
+          if [ -n "${SGL_VERSION}" ]; then
+            VERSION_ARG="--build-arg SGL_VERSION=${SGL_VERSION}"
           fi
+          mapfile -t METADATA_ARGS < /tmp/docker-metadata-cu130.args
 
           docker buildx build \
             --target ${{ inputs.docker_target }} \
@@ -218,6 +265,7 @@ jobs:
             --build-arg BUILD_TYPE=all \
             --build-arg GRACE_BLACKWELL=1 \
             --build-arg INSTALL_FLASHINFER_JIT_CACHE=1 \
+            "${METADATA_ARGS[@]}" \
             ${VERSION_ARG} \
             ${{ inputs.extra_build_args }} \
             --metadata-file /tmp/metadata-cu130.json \

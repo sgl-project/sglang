@@ -1,5 +1,13 @@
 from __future__ import annotations
 
+from sglang.multimodal_gen.test.server.accuracy_config import (
+    ComponentType,
+    should_skip_component,
+)
+from sglang.multimodal_gen.test.server.accuracy_utils import (
+    extract_component_path_overrides,
+)
+from sglang.multimodal_gen.test.server.component_accuracy import COMPONENT_SPECS
 from sglang.multimodal_gen.test.server.gpu_cases import (
     ONE_GPU_CASES,
     TWO_GPU_CASES,
@@ -7,71 +15,62 @@ from sglang.multimodal_gen.test.server.gpu_cases import (
 from sglang.multimodal_gen.test.server.testcase_configs import DiffusionTestCase
 
 
-def _select_accuracy_cases(
-    cases: list[DiffusionTestCase], enabled_ids: tuple[str, ...]
-) -> list[DiffusionTestCase]:
-    enabled = set(enabled_ids)
-    return [case for case in cases if case.id in enabled]
+def _component_accuracy_key(case: DiffusionTestCase, component: ComponentType) -> tuple:
+    server_args = case.server_args
+    component_paths = extract_component_path_overrides(server_args.extras)
+    override_path = None
+    for key in (component.value, *COMPONENT_SPECS[component].model_index_keys):
+        if key in component_paths:
+            override_path = component_paths[key]
+            break
+
+    return (
+        component.value,
+        server_args.model_path,
+        override_path,
+        server_args.num_gpus,
+        server_args.tp_size,
+        server_args.ulysses_degree,
+        server_args.ring_degree,
+        server_args.cfg_parallel,
+    )
 
 
-ACCURACY_ONE_GPU_CASE_IDS = (
-    "qwen_image_t2i",
-    "qwen_image_t2i_cache_dit_enabled",
-    "flux_image_t2i",
-    "flux_2_image_t2i",
-    "flux_2_klein_image_t2i",
-    "layerwise_offload",
-    "zimage_image_t2i",
-    "zimage_image_t2i_fp8",
-    "zimage_image_t2i_multi_lora",
-    "qwen_image_edit_ti2i",
-    "qwen_image_edit_2509_ti2i",
-    "qwen_image_edit_2511_ti2i",
-    "qwen_image_layered_i2i",
-    "flux_2_image_t2i_upscaling_4x",
-    "mova_360p_1gpu",
-    "wan2_1_t2v_1.3b",
-    "wan2_1_t2v_1.3b_teacache_enabled",
-    "wan2_1_t2v_1.3b_frame_interp_2x",
-    "wan2_1_t2v_1.3b_upscaling_4x",
-    "wan2_1_t2v_1.3b_frame_interp_2x_upscaling_4x",
-    "wan2_1_t2v_1_3b_lora_1gpu",
-    "flux_2_ti2i",
-    "flux_2_t2i_customized_vae_path",
-    "fast_hunyuan_video",
-    "wan2_2_ti2v_5b",
-    "fastwan2_2_ti2v_5b",
-    "hunyuan3d_shape_gen",
-    "turbo_wan2_1_t2v_1.3b",
-    "flux_2_ti2i_multi_image_cache_dit",
-)
+_COMPONENT_DUPLICATE_REASONS: dict[tuple[str, ComponentType], str] = {}
 
-ACCURACY_TWO_GPU_CASE_IDS = (
-    "wan2_2_i2v_a14b_2gpu",
-    "wan2_2_t2v_a14b_2gpu",
-    "wan2_2_t2v_a14b_teacache_2gpu",
-    "wan2_2_t2v_a14b_lora_2gpu",
-    "wan2_1_t2v_14b_2gpu",
-    "wan2_1_t2v_1.3b_cfg_parallel",
-    "fsdp-inference",
-    "mova_360p_tp2",
-    "mova_360p_ring1_uly2",
-    "mova_360p_ring2_uly1",
-    "ltx_2_two_stage_t2v",
-    "wan2_1_i2v_14b_480P_2gpu",
-    "wan2_1_i2v_14b_lora_2gpu",
-    "wan2_1_i2v_14b_720P_2gpu",
-    "qwen_image_t2i_2_gpus",
-    "zimage_image_t2i_2_gpus",
-    "zimage_image_t2i_2_gpus_non_square",
-    "flux_image_t2i_2_gpus",
-    "flux_2_image_t2i_2_gpus",
-    "flux_2_klein_ti2i_2_gpus",
-)
 
-ACCURACY_ONE_GPU_CASES = _select_accuracy_cases(
-    ONE_GPU_CASES, ACCURACY_ONE_GPU_CASE_IDS
-)
-ACCURACY_TWO_GPU_CASES = _select_accuracy_cases(
-    TWO_GPU_CASES, ACCURACY_TWO_GPU_CASE_IDS
-)
+def _select_accuracy_cases(cases: list[DiffusionTestCase]) -> list[DiffusionTestCase]:
+    selected: list[DiffusionTestCase] = []
+    seen: dict[tuple, str] = {}
+    for case in cases:
+        if not case.run_component_accuracy_check:
+            continue
+
+        has_component_to_run = False
+        for component in ComponentType:
+            if should_skip_component(case, component):
+                continue
+
+            key = _component_accuracy_key(case, component)
+            representative = seen.get(key)
+            if representative is None:
+                seen[key] = case.id
+                has_component_to_run = True
+            else:
+                _COMPONENT_DUPLICATE_REASONS[(case.id, component)] = (
+                    f"{component.value} component already covered by {representative}"
+                )
+
+        if has_component_to_run:
+            selected.append(case)
+    return selected
+
+
+def get_component_duplicate_skip_reason(
+    case: DiffusionTestCase, component: ComponentType
+) -> str | None:
+    return _COMPONENT_DUPLICATE_REASONS.get((case.id, component))
+
+
+ACCURACY_ONE_GPU_CASES = _select_accuracy_cases(ONE_GPU_CASES)
+ACCURACY_TWO_GPU_CASES = _select_accuracy_cases(TWO_GPU_CASES)
