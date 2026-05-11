@@ -202,6 +202,7 @@ def get_model_architecture(model_config: ModelConfig) -> Tuple[Type[nn.Module], 
         "gptq_marlin",
         "awq_marlin",
         "quark_int4fp8_moe",
+        "rtn",
     ]
 
     if (
