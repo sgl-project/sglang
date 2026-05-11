@@ -49,6 +49,7 @@ from sglang.srt.utils import (
     cpu_has_amx_support,
     is_cuda,
     is_hip,
+    is_mps,
     is_npu,
     mxfp_supported,
 )
@@ -85,13 +86,6 @@ BASE_QUANTIZATION_METHODS: Dict[str, Type[QuantizationConfig]] = {
     "auto-round": AutoRoundConfig,
     "modelslim": ModelSlimConfig,
     "quark_int4fp8_moe": QuarkInt4Fp8Config,
-    # MLX backend handles its own quantization at load time (see
-    # python/sglang/srt/hardware_backend/mlx/model_runner.py). These entries
-    # register the names so the standard registry lookups accept them;
-    # MlxQuantizationConfig.from_config raises if the PyTorch path ever
-    # tries to instantiate it without SGLANG_USE_MLX=1.
-    "mlx_q4": MlxQuantizationConfig,
-    "mlx_q8": MlxQuantizationConfig,
 }
 
 
@@ -99,6 +93,19 @@ if is_cuda() or (_is_mxfp_supported and is_hip()):
     BASE_QUANTIZATION_METHODS.update(
         {
             "mxfp4": Mxfp4Config,
+        }
+    )
+
+
+if is_mps():
+    # MLX backend handles its own quantization at load time (see
+    # python/sglang/srt/hardware_backend/mlx/model_runner.py). MlxQuantizationConfig
+    # is a marker class — from_config raises if anything on the PyTorch path tries
+    # to instantiate it.
+    BASE_QUANTIZATION_METHODS.update(
+        {
+            "mlx_q4": MlxQuantizationConfig,
+            "mlx_q8": MlxQuantizationConfig,
         }
     )
 

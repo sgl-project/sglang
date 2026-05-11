@@ -221,6 +221,10 @@ class MlxModelRunner:
                     f"ignoring --quantization={self._quantization}"
                 )
             else:
+                # MLX loads weights lazily — force an eval so mem_before reflects
+                # actual on-device usage (otherwise it can read near-zero and make
+                # the reduction percentage misleading).
+                mx.eval(self.model.parameters())
                 mem_before = mx.get_active_memory()
                 q_start = time.time()
                 logger.info(
