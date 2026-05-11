@@ -848,10 +848,23 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
 
         page_table = self._get_layer_page_table(layer, forward_batch)
 
-        if (
-            forward_batch.forward_mode.is_target_verify()
-            or forward_batch.forward_mode.is_draft_extend_v2()
-        ):
+        # NOTE: DRAFT_EXTEND_V2 cannot reuse the TARGET_VERIFY path here.
+        # `trtllm_batch_decode_with_kv_cache` reads `seq_lens` as the *total*
+        # per-request length (KV cache + draft query tokens).
+        # `init_forward_metadata` sets
+        # `cache_seqlens_int32 = seq_lens + speculative_num_draft_tokens` only
+        # on the `is_target_verify()` branch. DRAFT_EXTEND_V2 has no dedicated
+        # branch and falls into the generic `else`, where
+        # `cache_seqlens_int32 = forward_batch.seq_lens.to(int32)` — KV only,
+        # no query tokens. Routing DRAFT_EXTEND_V2 through the decode kernel
+        # with that metadata makes the kernel read past the populated KV cache
+        # and triggers a CUDA illegal-memory-access on Blackwell.
+        #
+        # If `init_forward_metadata` is later updated to align DRAFT_EXTEND_V2
+        # metadata with TARGET_VERIFY semantics (and matching branches are
+        # added to `init_forward_metadata_{capture,replay}_cuda_graph`),
+        # re-broaden this predicate to recover decode-kernel performance.
+        if forward_batch.forward_mode.is_target_verify():
             o = flashinfer.decode.trtllm_batch_decode_with_kv_cache(
                 query=q,
                 kv_cache=kv_cache,
