@@ -63,7 +63,7 @@ class SchedulerProfilerMixin:
         # For ROCM
         self.rpd_profiler = None
 
-    def init_profile(
+    def _init_profile(
         self: Scheduler,
         output_dir: Optional[str],
         start_step: Optional[int],
@@ -134,7 +134,7 @@ class SchedulerProfilerMixin:
 
         return ProfileReqOutput(success=True, message="Succeeded")
 
-    def start_profile(
+    def _start_profile(
         self: Scheduler, stage: Optional[ForwardMode] = None
     ) -> ProfileReqOutput | None:
         if envs.SGLANG_PROFILE_V2.get():
@@ -247,7 +247,7 @@ class SchedulerProfilerMixin:
         else:
             return merge_message
 
-    def stop_profile(
+    def _stop_profile(
         self: Scheduler, stage: Optional[ForwardMode] = None
     ) -> ProfileReqOutput | None:
         if envs.SGLANG_PROFILE_V2.get():
@@ -343,21 +343,21 @@ class SchedulerProfilerMixin:
         if self.profile_by_stage:
             if batch.forward_mode.is_prefill():
                 if self.profiler_prefill_ct == 0:
-                    self.start_profile(batch.forward_mode)
+                    self._start_profile(batch.forward_mode)
                 self.profiler_prefill_ct += 1
                 if self.profiler_prefill_ct > self.profiler_target_prefill_ct:
                     if self.profile_in_progress:
-                        self.stop_profile(stage=ForwardMode.EXTEND)
+                        self._stop_profile(stage=ForwardMode.EXTEND)
             elif batch.forward_mode.is_decode():
                 if self.profiler_decode_ct == 0:
                     if self.profile_in_progress:
                         # force trace flush
-                        self.stop_profile(stage=ForwardMode.EXTEND)
-                    self.start_profile(batch.forward_mode)
+                        self._stop_profile(stage=ForwardMode.EXTEND)
+                    self._start_profile(batch.forward_mode)
                 self.profiler_decode_ct += 1
                 if self.profiler_decode_ct > self.profiler_target_decode_ct:
                     if self.profile_in_progress:
-                        self.stop_profile(stage=ForwardMode.DECODE)
+                        self._stop_profile(stage=ForwardMode.DECODE)
             elif batch.forward_mode.is_idle():
                 pass
             else:
@@ -368,17 +368,17 @@ class SchedulerProfilerMixin:
                 self.profiler_target_forward_ct
                 and self.profiler_target_forward_ct <= self.forward_ct
             ):
-                self.stop_profile()
+                self._stop_profile()
             if (
                 self.profiler_start_forward_ct
                 and self.profiler_start_forward_ct == self.forward_ct
             ):
-                self.start_profile()
+                self._start_profile()
 
-    def profile(self: Scheduler, recv_req: ProfileReq):
+    def _profile(self: Scheduler, recv_req: ProfileReq):
         if recv_req.type == ProfileReqType.START_PROFILE:
             if recv_req.profile_by_stage or recv_req.start_step:
-                return self.init_profile(
+                return self._init_profile(
                     recv_req.output_dir,
                     recv_req.start_step,
                     recv_req.num_steps,
@@ -392,7 +392,7 @@ class SchedulerProfilerMixin:
                     recv_req.profile_stages,
                 )
             else:
-                self.init_profile(
+                self._init_profile(
                     recv_req.output_dir,
                     recv_req.start_step,
                     recv_req.num_steps,
@@ -404,6 +404,6 @@ class SchedulerProfilerMixin:
                     recv_req.merge_profiles,
                     recv_req.profile_prefix,
                 )
-                return self.start_profile()
+                return self._start_profile()
         else:
-            return self.stop_profile()
+            return self._stop_profile()
