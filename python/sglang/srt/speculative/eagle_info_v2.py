@@ -271,11 +271,21 @@ class EagleVerifyInputV2Mixin:
             # Reuse existing pending_radix_mamba_slot — the verify kernel will
             # overwrite it, so no free+alloc needed on this hot path.
             if get_global_server_args().enable_mamba_extra_buffer():
+                mamba_track_interval = get_global_server_args().mamba_track_interval
+                may_cross_boundary = (
+                    (
+                        batch.seq_lens_cpu // mamba_track_interval
+                        != (batch.seq_lens_cpu + self.draft_token_num)
+                        // mamba_track_interval
+                    ).tolist()
+                    if not get_global_server_args().disable_overlap_schedule
+                    else [False] * bs
+                )
                 track_indices = []
                 track_mask = []
                 _zero = torch.zeros(1, dtype=torch.int64, device=device)[0]
-                for req in batch.reqs:
-                    if req.pending_radix_mamba_slot is not None:
+                for req, may_cross in zip(batch.reqs, may_cross_boundary):
+                    if req.pending_radix_mamba_slot is not None and not may_cross:
                         track_indices.append(req.pending_radix_mamba_slot[0])
                         track_mask.append(True)
                     else:

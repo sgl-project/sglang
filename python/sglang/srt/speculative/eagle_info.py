@@ -121,6 +121,8 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                 len(batch.input_ids),
             )
             end_offset = batch.seq_lens + self.draft_token_num
+            prefix_lens_cpu = batch.seq_lens_cpu
+            end_offset_cpu = prefix_lens_cpu + self.draft_token_num
         else:
             prefix_lens = batch.seq_lens
             prefix_lens_cpu = batch.seq_lens_cpu
@@ -152,11 +154,20 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
         )
 
         if get_global_server_args().enable_mamba_extra_buffer():
+            mamba_track_interval = get_global_server_args().mamba_track_interval
+            may_cross_boundary = (
+                (
+                    prefix_lens_cpu // mamba_track_interval
+                    != end_offset_cpu // mamba_track_interval
+                ).tolist()
+                if batch.enable_overlap
+                else [False] * bs
+            )
             track_indices = []
             track_mask = []
             _zero = torch.zeros(1, dtype=torch.int64, device=batch.device)[0]
-            for req in batch.reqs:
-                if req.pending_radix_mamba_slot is not None:
+            for req, may_cross in zip(batch.reqs, may_cross_boundary):
+                if req.pending_radix_mamba_slot is not None and not may_cross:
                     track_indices.append(req.pending_radix_mamba_slot[0])
                     track_mask.append(True)
                 else:
