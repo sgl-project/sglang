@@ -304,12 +304,17 @@ if [[ "${NEED_REBUILD}" == "true" ]]; then
     fi
 
     # build AITER
-    # AITER_USE_SYSTEM_TRITON=1 prevents aiter's setup.py from uninstalling the
-    # ROCm-tuned triton shipped in the CI image and replacing it with a generic
-    # triton wheel from PyPI (introduced in ROCm/aiter#3086).
+    # Use `pip install -e .` instead of `python3 setup.py develop` so aiter's
+    # setup.py runs inside a PEP 517 isolated build environment. After
+    # ROCm/aiter#3086, aiter's setup.py unconditionally invokes
+    # .github/scripts/install_triton.sh, which `pip uninstall`s the host's
+    # triton and `pip install`s a replacement; build isolation contains those
+    # operations to the throwaway build venv so the ROCm-tuned triton shipped
+    # in the CI image is preserved. AITER_USE_SYSTEM_TRITON=1 is also set as
+    # a backstop in case build isolation is disabled (e.g. --no-build-isolation).
     docker exec ci_sglang bash -c "
         cd /sgl-workspace/aiter && \
-        AITER_USE_SYSTEM_TRITON=1 GPU_ARCHS=${GPU_ARCH_LIST} python3 setup.py develop
+        AITER_USE_SYSTEM_TRITON=1 GPU_ARCHS=${GPU_ARCH_LIST} pip install --config-settings editable_mode=compat -e .
     "
 
     echo "[CI-AITER-CHECK] === AITER REBUILD COMPLETE ==="
