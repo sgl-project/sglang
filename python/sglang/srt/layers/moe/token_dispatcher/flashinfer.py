@@ -219,6 +219,7 @@ class FlashinferDispatcher(BaseDispatcher):
             self.dummy_topk_ids_current_rank if self.has_dummy_token else topk_ids,
             payloads,
             self.runtime_max_tokens_per_rank,
+            invalid_token_expert_id=-1,
             expert_id_payload_index=expert_id_payload_index,
         )
         if x_sf is not None:
