@@ -300,8 +300,6 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
     # The indices of output tokens in the token_to_kv_pool_swa
     out_cache_loc_swa: Optional[torch.Tensor] = None
-    # The mamba pool indices for each request in the batch
-    mamba_cache_indices: Optional[torch.Tensor] = None  # shape: [b], int32
     # The indices to track mamba state with
     mamba_track_indices: Optional[torch.Tensor] = None  # shape: [b], int64
     # The mask to track mamba state if needed
@@ -459,7 +457,6 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             req_pool_indices=batch.req_pool_indices,
             seq_lens=batch.seq_lens,
             out_cache_loc=batch.out_cache_loc,
-            mamba_cache_indices=batch.mamba_cache_indices,
             mamba_track_indices=batch.mamba_track_indices,
             mamba_track_mask=batch.mamba_track_mask,
             mamba_track_seqlens=batch.mamba_track_seqlens,

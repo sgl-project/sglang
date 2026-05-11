@@ -1421,7 +1421,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     output_ids: torch.Tensor = None  # shape: [b], int64
 
     # For hybrid GDN prefix cache
-    mamba_cache_indices: torch.Tensor = None  # shape: [b], int32
     mamba_track_indices: torch.Tensor = None  # shape: [b], int64
     mamba_track_mask: torch.Tensor = None  # shape: [b], bool
     mamba_track_seqlens: torch.Tensor = None  # shape: [b], int64
@@ -2081,28 +2080,20 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         mamba_track_seqlens_cpu.append(mamba_track_seqlen)
 
     def _collect_mamba_init_info(self, reqs):
-        """Collect mamba cache indices and deferred COW/clear info from requests."""
+        """Collect deferred COW/clear info from requests."""
         _pin = is_pin_memory_available(self.device)
-
-        # Single GPU→CPU sync: stack all pool indices then convert to a Python list
-        all_pool_idx = torch.stack([req.mamba_pool_idx for req in reqs])
-        mamba_indices = all_pool_idx.tolist()
-
         cow_src = []
         cow_dst = []
         clear_indices = []
-        for i, req in enumerate(reqs):
+        for req in reqs:
             if req.mamba_cow_src_index is not None:
                 cow_src.append(req.mamba_cow_src_index.item())
-                cow_dst.append(mamba_indices[i])
+                cow_dst.append(req.mamba_pool_idx.item())
                 req.mamba_cow_src_index = None
                 req.mamba_needs_clear = False
             elif req.mamba_needs_clear:
-                clear_indices.append(mamba_indices[i])
+                clear_indices.append(req.mamba_pool_idx.item())
                 req.mamba_needs_clear = False
-        self.mamba_cache_indices = torch.tensor(
-            mamba_indices, dtype=torch.int32, pin_memory=_pin
-        ).to(self.device, non_blocking=True)
         self.mamba_cow_src_indices = (
             torch.tensor(cow_src, dtype=torch.int64, pin_memory=_pin).to(
                 self.device, non_blocking=True
@@ -2322,7 +2313,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.orig_seq_lens = torch.empty(0, dtype=torch.int32, device=self.device)
         self.out_cache_loc = torch.empty(0, dtype=torch.int64, device=self.device)
         self.req_pool_indices = torch.empty(0, dtype=torch.int64, device=self.device)
-        self.mamba_cache_indices = torch.empty(0, dtype=torch.int32, device=self.device)
         self.seq_lens_sum = 0
         self.extend_num_tokens = 0
         self.sampling_info = SamplingBatchInfo.from_schedule_batch(
@@ -2448,15 +2438,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 .to(device=self.device, non_blocking=True)
             )
 
-        # Collect mamba cache indices for decode (no COW/clear needed)
-        if any(req.mamba_pool_idx is not None for req in self.reqs):
-            self.mamba_cache_indices = torch.stack(
-                [req.mamba_pool_idx for req in self.reqs]
-            ).to(dtype=torch.int32, device=self.device)
-            self.mamba_cow_src_indices = None
-            self.mamba_cow_dst_indices = None
-            self.mamba_clear_indices = None
-
     def maybe_wait_verify_done(self):
         if self.is_spec_v2:
             draft_input: EagleDraftInput = self.spec_info
@@ -2518,7 +2499,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         if self.output_ids is not None:
             self.output_ids = self.output_ids[keep_indices_device]
 
-        self.mamba_cache_indices = None
         self.mamba_track_indices = None
         self.mamba_track_mask = None
         self.mamba_track_seqlens = None
@@ -2577,15 +2557,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.seq_lens_sum += other.seq_lens_sum
         if self.output_ids is not None:
             self.output_ids = torch.cat([self.output_ids, other.output_ids])
-        if (
-            self.mamba_cache_indices is not None
-            and other.mamba_cache_indices is not None
-        ):
-            self.mamba_cache_indices = torch.cat(
-                [self.mamba_cache_indices, other.mamba_cache_indices]
-            )
-        elif other.mamba_cache_indices is not None:
-            self.mamba_cache_indices = other.mamba_cache_indices
         for field in (
             "mamba_cow_src_indices",
             "mamba_cow_dst_indices",
@@ -2700,7 +2671,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             dllm_config=self.dllm_config,
             reqs=self.reqs,
             has_grammar=self.has_grammar,
-            mamba_cache_indices=self.mamba_cache_indices,
             mamba_track_indices=self.mamba_track_indices,
             mamba_track_mask=self.mamba_track_mask,
             mamba_track_seqlens=self.mamba_track_seqlens,
@@ -2731,7 +2701,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             is_prefill_only=self.is_prefill_only,
             seq_lens_cpu=self.seq_lens_cpu,
             enable_overlap=self.enable_overlap,
-            mamba_cache_indices=self.mamba_cache_indices,
             mamba_track_indices=self.mamba_track_indices,
             mamba_track_mask=self.mamba_track_mask,
             mamba_track_seqlens=self.mamba_track_seqlens,
@@ -2942,7 +2911,6 @@ class ModelWorkerBatch:
     return_hidden_states_before_norm: bool = False
 
     # For mamba state tracking
-    mamba_cache_indices: Optional[torch.Tensor] = None  # shape: [b], int32
     mamba_track_indices: Optional[torch.Tensor] = None  # shape: [b], int64
     mamba_track_mask: Optional[torch.Tensor] = None  # shape: [b], bool
     mamba_track_seqlens: Optional[torch.Tensor] = None  # shape: [b], int64

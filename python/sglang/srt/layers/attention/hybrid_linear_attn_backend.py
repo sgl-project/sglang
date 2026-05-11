@@ -180,7 +180,9 @@ class MambaAttnBackendBase(AttentionBackend):
         track_ssm_final_src = None
         track_ssm_final_dst = None
 
-        mamba_cache_indices = forward_batch.mamba_cache_indices
+        mamba_cache_indices = self.req_to_token_pool.get_mamba_indices(
+            forward_batch.req_pool_indices
+        )
 
         if forward_batch.forward_mode.is_decode_or_idle():
             query_start_loc = torch.arange(
