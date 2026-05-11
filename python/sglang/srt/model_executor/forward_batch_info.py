@@ -587,7 +587,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 ret.spec_info is not None
                 and getattr(ret.spec_info, "positions", None) is not None
             ):
-                ret._compute_spec_mrope_positions(model_runner, batch)
+                ret.compute_spec_mrope_positions(model_runner, batch)
             else:
                 ret._compute_mrope_positions(model_runner, batch)
 
@@ -696,7 +696,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             req_lens=req_lens,
         )
 
-    def _compute_spec_mrope_positions(
+    def compute_spec_mrope_positions(
         self, model_runner: ModelRunner, batch: ModelWorkerBatch
     ):
         # TODO support batched deltas
@@ -989,17 +989,18 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             self.extend_seq_lens = self._pad_tensor_to_size(self.extend_seq_lens, bs)
 
         if self.spec_info is not None and self.spec_info.is_draft_input():
-            # FIXME(lsyin): remove this isinstance logic
             spec_info = self.spec_info
             self.output_cache_loc_backup = self.out_cache_loc
             self.hidden_states_backup = spec_info.hidden_states
-            if spec_info.topk_p is not None:
+            # spec_info is EagleDraftInput | EagleDraftExtendInput; each carries
+            # a disjoint subset of the fields below, so getattr-guard each one.
+            if getattr(spec_info, "topk_p", None) is not None:
                 spec_info.topk_p = self._pad_tensor_to_size(spec_info.topk_p, bs)
-            if spec_info.topk_index is not None:
+            if getattr(spec_info, "topk_index", None) is not None:
                 spec_info.topk_index = self._pad_tensor_to_size(
                     spec_info.topk_index, bs
                 )
-            if spec_info.num_accepted_drafts is not None:
+            if getattr(spec_info, "num_accepted_drafts", None) is not None:
                 spec_info.num_accepted_drafts = self._pad_tensor_to_size(
                     spec_info.num_accepted_drafts, bs
                 )
