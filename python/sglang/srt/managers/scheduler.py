@@ -1986,7 +1986,7 @@ class Scheduler(
                         abort_info={"reason": error_msg}
                     )
                     prepare_abort(req, error_msg, status_code=HTTPStatus.BAD_REQUEST)
-                    self.stream_output(self.output_streamer, [req], req.return_logprob)
+                    self.output_streamer.stream_output([req], req.return_logprob)
                     return
 
         elif (

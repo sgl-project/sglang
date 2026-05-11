@@ -684,8 +684,7 @@ class SchedulerDisaggregationPrefillMixin:
                     self.kv_transfer_speed_gb_s = metrics["speed_gb_s"]
 
         # Stream requests which have finished transfer
-        self.stream_output(
-            self.output_streamer,
+        self.output_streamer.stream_output(
             done_reqs,
             any(req.return_logprob for req in done_reqs),
             None,
