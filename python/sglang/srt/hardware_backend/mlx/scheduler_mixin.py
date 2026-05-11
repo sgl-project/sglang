@@ -169,7 +169,13 @@ class SchedulerMlxOverlapMixin:
             )
 
         while True:
-            recv_reqs = self.recv_requests()
+            last_forward_mode = (
+                self.last_batch.forward_mode if self.last_batch is not None else None
+            )
+            recv_reqs = self.recv_requests(
+                self.request_receiver,
+                last_forward_mode=last_forward_mode,
+            )
             self.process_input_requests(recv_reqs)
             if self._engine_paused:
                 continue

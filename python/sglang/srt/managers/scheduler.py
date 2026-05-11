@@ -170,6 +170,9 @@ from sglang.srt.managers.schedule_policy import (
     SchedulePolicy,
 )
 from sglang.srt.managers.scheduler_components import kv_cache
+from sglang.srt.managers.scheduler_components.request_receiver import (
+    SchedulerRequestReceiver,
+)
 from sglang.srt.managers.scheduler_dp_attn_mixin import SchedulerDPAttnMixin
 from sglang.srt.managers.scheduler_input_blocker import SchedulerInputBlocker
 from sglang.srt.managers.scheduler_output_processor_mixin import (
@@ -565,6 +568,26 @@ class Scheduler(
 
         # Init the grammar backend for constrained generation
         self.grammar_manager = GrammarManager(self)
+
+        self.request_receiver = SchedulerRequestReceiver(
+            recv_from_tokenizer=self.recv_from_tokenizer,
+            recv_from_rpc=self.recv_from_rpc,
+            recv_skipper=self.recv_skipper,
+            input_blocker=self.input_blocker,
+            mm_receiver=self.mm_receiver,
+            ps=self.ps,
+            tp_group=self.tp_group,
+            tp_cpu_group=self.tp_cpu_group,
+            attn_tp_group=self.attn_tp_group,
+            attn_tp_cpu_group=self.attn_tp_cpu_group,
+            attn_cp_group=self.attn_cp_group,
+            attn_cp_cpu_group=self.attn_cp_cpu_group,
+            world_group=self.world_group,
+            server_args=self.server_args,
+            model_config=self.model_config,
+            max_recv_per_poll=self.max_recv_per_poll,
+            stream_output=self.stream_output,
+        )
 
         self.is_initializing = False
 
@@ -1358,7 +1381,13 @@ class Scheduler(
         """A normal scheduler loop."""
         while True:
             # Receive requests
-            recv_reqs = self.recv_requests()
+            last_forward_mode = (
+                self.last_batch.forward_mode if self.last_batch is not None else None
+            )
+            recv_reqs = self.recv_requests(
+                self.request_receiver,
+                last_forward_mode=last_forward_mode,
+            )
             self.process_input_requests(recv_reqs)
             if self._engine_paused:
                 continue
@@ -1394,7 +1423,13 @@ class Scheduler(
 
         while True:
             # Receive requests
-            recv_reqs = self.recv_requests()
+            last_forward_mode = (
+                self.last_batch.forward_mode if self.last_batch is not None else None
+            )
+            recv_reqs = self.recv_requests(
+                self.request_receiver,
+                last_forward_mode=last_forward_mode,
+            )
             self.process_input_requests(recv_reqs)
             if self._engine_paused:
                 continue
@@ -1468,20 +1503,23 @@ class Scheduler(
 
         return disable_overlap_for_batch or need_grammar_sync
 
-    def recv_limit_reached(self, num_recv_reqs: int) -> bool:
+    @staticmethod
+    def recv_limit_reached(
+        self: "SchedulerRequestReceiver", num_recv_reqs: int
+    ) -> bool:
         if self.max_recv_per_poll < 0:
             return False
         return num_recv_reqs >= self.max_recv_per_poll
 
+    @staticmethod
     def recv_requests(
-        self,
+        self: "SchedulerRequestReceiver",
+        *,
+        last_forward_mode,
     ) -> List[Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput, Any]]:
         """Receive results at tp_rank = 0 and broadcast it to all other TP ranks."""
 
         if self.recv_skipper is not None:
-            last_forward_mode = (
-                self.last_batch.forward_mode if self.last_batch is not None else None
-            )
             if not self.recv_skipper.handle(last_forward_mode):
                 return []
 
@@ -1630,7 +1668,8 @@ class Scheduler(
 
         return recv_reqs
 
-    def _split_work_and_control_reqs(self, recv_reqs: List):
+    @staticmethod
+    def _split_work_and_control_reqs(self: "SchedulerRequestReceiver", recv_reqs: List):
         work_reqs = [
             req
             for req in recv_reqs

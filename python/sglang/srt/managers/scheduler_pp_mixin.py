@@ -80,7 +80,15 @@ class SchedulerPPMixin:
                 next_first_rank_mb_id = (mb_id + self.ps.pp_size) % self.pp_loop_size
                 next_mb_id = (mb_id + 1) % self.pp_loop_size
                 with torch.profiler.record_function("recv_requests"):
-                    recv_reqs = self.recv_requests()
+                    last_forward_mode = (
+                        self.last_batch.forward_mode
+                        if self.last_batch is not None
+                        else None
+                    )
+                    recv_reqs = self.recv_requests(
+                        self.request_receiver,
+                        last_forward_mode=last_forward_mode,
+                    )
                     self.process_input_requests(recv_reqs)
                 if not self.pp_group.is_last_rank:
                     self._pp_commit_comm_work(self.send_req_work)
@@ -214,7 +222,15 @@ class SchedulerPPMixin:
                 d2h_event = None
                 next_batch_result = None
 
-                recv_reqs = self.recv_requests()
+                last_forward_mode = (
+                    self.last_batch.forward_mode
+                    if self.last_batch is not None
+                    else None
+                )
+                recv_reqs = self.recv_requests(
+                    self.request_receiver,
+                    last_forward_mode=last_forward_mode,
+                )
                 self.process_input_requests(recv_reqs)
 
                 if not self.pp_group.is_last_rank:
@@ -360,7 +376,15 @@ class SchedulerPPMixin:
                 d2h_event = None
                 next_batch_result = None
 
-                recv_reqs = self.recv_requests()
+                last_forward_mode = (
+                    self.last_batch.forward_mode
+                    if self.last_batch is not None
+                    else None
+                )
+                recv_reqs = self.recv_requests(
+                    self.request_receiver,
+                    last_forward_mode=last_forward_mode,
+                )
                 self.process_input_requests(recv_reqs)
 
                 if not self.pp_group.is_last_rank:

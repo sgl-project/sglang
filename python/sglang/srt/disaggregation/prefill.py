@@ -379,7 +379,13 @@ class SchedulerDisaggregationPrefillMixin:
 
         while True:
             # Receive requests
-            recv_reqs = self.recv_requests()
+            last_forward_mode = (
+                self.last_batch.forward_mode if self.last_batch is not None else None
+            )
+            recv_reqs = self.recv_requests(
+                self.request_receiver,
+                last_forward_mode=last_forward_mode,
+            )
             self.process_input_requests(recv_reqs)
             self.waiting_queue.extend(
                 self.disagg_prefill_bootstrap_queue.pop_bootstrapped()
@@ -412,7 +418,13 @@ class SchedulerDisaggregationPrefillMixin:
 
         while True:
             # Receive requests
-            recv_reqs = self.recv_requests()
+            last_forward_mode = (
+                self.last_batch.forward_mode if self.last_batch is not None else None
+            )
+            recv_reqs = self.recv_requests(
+                self.request_receiver,
+                last_forward_mode=last_forward_mode,
+            )
             self.process_input_requests(recv_reqs)
             self.waiting_queue.extend(
                 self.disagg_prefill_bootstrap_queue.pop_bootstrapped()
