@@ -186,6 +186,9 @@ from sglang.srt.managers.scheduler_components.metrics_reporter import (
     PrefillStats,
     SchedulerMetricsReporter,
 )
+from sglang.srt.managers.scheduler_components.output_streamer import (
+    SchedulerOutputStreamer,
+)
 from sglang.srt.managers.scheduler_components.pool_stats_observer import (
     SchedulerPoolStatsObserver,
 )
@@ -670,7 +673,7 @@ class Scheduler(
             server_args=self.server_args,
             model_config=self.model_config,
             max_recv_per_poll=self.max_recv_per_poll,
-            stream_output=self.stream_output,
+            stream_output=lambda *a, **kw: self.output_streamer.stream_output(*a, **kw),
         )
 
         self.dp_attn_adapter = SchedulerDPAttnAdapter(
@@ -812,6 +815,19 @@ class Scheduler(
         self.logprob_computer = SchedulerLogprobComputer(
             server_args=self.server_args,
             model_config=self.model_config,
+        )
+
+        self.output_streamer = SchedulerOutputStreamer(
+            send_to_detokenizer=self.send_to_detokenizer,
+            tree_cache=self.tree_cache,
+            ps=self.ps,
+            server_args=self.server_args,
+            is_generation=self.is_generation,
+            stream_interval=self.stream_interval,
+            spec_algorithm=self.spec_algorithm,
+            disaggregation_mode=self.disaggregation_mode,
+            enable_hicache_storage=lambda: self.enable_hicache_storage,
+            load_inquirer_get_loads=lambda req: self.load_inquirer.get_loads(req),
         )
 
         self.is_initializing = False
@@ -1970,7 +1986,7 @@ class Scheduler(
                         abort_info={"reason": error_msg}
                     )
                     prepare_abort(req, error_msg, status_code=HTTPStatus.BAD_REQUEST)
-                    self.stream_output([req], req.return_logprob)
+                    self.stream_output(self.output_streamer, [req], req.return_logprob)
                     return
 
         elif (

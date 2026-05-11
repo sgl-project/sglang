@@ -685,6 +685,7 @@ class SchedulerDisaggregationPrefillMixin:
 
         # Stream requests which have finished transfer
         self.stream_output(
+            self.output_streamer,
             done_reqs,
             any(req.return_logprob for req in done_reqs),
             None,
