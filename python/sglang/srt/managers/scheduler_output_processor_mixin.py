@@ -27,7 +27,9 @@ if TYPE_CHECKING:
         EmbeddingBatchResult,
         GenerationBatchResult,
         ScheduleBatch,
-        Scheduler,
+    )
+    from sglang.srt.managers.scheduler_components.batch_result_processor import (
+        SchedulerBatchResultProcessor,
     )
 
 logger = logging.getLogger(__name__)
@@ -43,7 +45,10 @@ class SchedulerOutputProcessorMixin:
     We put them into a separate file to make the `scheduler.py` shorter.
     """
 
-    def process_batch_result_prebuilt(self: Scheduler, batch: ScheduleBatch):
+    @staticmethod
+    def process_batch_result_prebuilt(
+        self: "SchedulerBatchResultProcessor", batch: ScheduleBatch
+    ):
         assert self.disaggregation_mode == DisaggregationMode.DECODE
         use_free_group = self.server_args.disaggregation_decode_enable_radix_cache
         if use_free_group:
@@ -62,7 +67,8 @@ class SchedulerOutputProcessorMixin:
         if use_free_group:
             self.token_to_kv_pool_allocator.free_group_end()
 
-    def maybe_collect_routed_experts(self: Scheduler, req: Req):
+    @staticmethod
+    def _maybe_collect_routed_experts(self: "SchedulerBatchResultProcessor", req: Req):
         """Collect routed experts for a finished request.
 
         Returns immediately if `return_routed_experts` was not set on the
@@ -105,7 +111,8 @@ class SchedulerOutputProcessorMixin:
                 req.routed_experts_start_len,
             )
 
-    def maybe_collect_indexer_topk(self: Scheduler, req: Req):
+    @staticmethod
+    def _maybe_collect_indexer_topk(self: "SchedulerBatchResultProcessor", req: Req):
         capturer = get_global_indexer_capturer()
         if capturer is None:
             return
@@ -115,8 +122,12 @@ class SchedulerOutputProcessorMixin:
             req_to_token_pool=self.req_to_token_pool,
         )
 
-    def maybe_collect_customized_info(
-        self: Scheduler, i: int, req: Req, logits_output: LogitsProcessorOutput
+    @staticmethod
+    def _maybe_collect_customized_info(
+        self: "SchedulerBatchResultProcessor",
+        i: int,
+        req: Req,
+        logits_output: LogitsProcessorOutput,
     ):
         if logits_output is not None and logits_output.customized_info is not None:
             if req.customized_info is None:
@@ -133,8 +144,9 @@ class SchedulerOutputProcessorMixin:
                     elem = elem.copy()
                 req.customized_info[k].append(elem)
 
+    @staticmethod
     def process_batch_result_prefill(
-        self: Scheduler,
+        self: "SchedulerBatchResultProcessor",
         batch: ScheduleBatch,
         result: Union[GenerationBatchResult, EmbeddingBatchResult],
     ):
@@ -206,8 +218,8 @@ class SchedulerOutputProcessorMixin:
 
                     req.check_finished()
                     if req.finished():
-                        self.maybe_collect_routed_experts(req)
-                        self.maybe_collect_indexer_topk(req)
+                        self._maybe_collect_routed_experts(req)
+                        self._maybe_collect_indexer_topk(req)
                         release_kv_cache(req, self.tree_cache)
                         req.time_stats.set_completion_time()
                     elif not batch.decoding_reqs or req not in batch.decoding_reqs:
@@ -215,7 +227,7 @@ class SchedulerOutputProcessorMixin:
                         if self.enable_hisparse:
                             self.hisparse_coordinator.admit_request_into_staging(req)
 
-                    self.maybe_collect_customized_info(i, req, logits_output)
+                    self._maybe_collect_customized_info(i, req, logits_output)
 
                     if batch.return_logprob:
                         assert extend_logprob_start_len_per_req is not None
@@ -364,15 +376,18 @@ class SchedulerOutputProcessorMixin:
         )
 
         can_run_cuda_graph = getattr(result, "can_run_cuda_graph", False)
-        self.metrics_reporter.report_prefill_stats(
+        self.report_prefill_stats(
             batch=batch,
             prefill_stats=batch.prefill_stats,
             can_run_cuda_graph=can_run_cuda_graph,
             dp_cooperation_info=batch.dp_cooperation_info,
         )
 
+    @staticmethod
     def _resolve_spec_overlap_token_ids(
-        self: Scheduler, result: GenerationBatchResult, batch: ScheduleBatch
+        self: "SchedulerBatchResultProcessor",
+        result: GenerationBatchResult,
+        batch: ScheduleBatch,
     ) -> List[List[int]]:
         """Resolve the padding next token ids for speculative decoding with overlap."""
         assert result.next_token_ids.is_cpu
@@ -418,8 +433,9 @@ class SchedulerOutputProcessorMixin:
 
         return predict_tokens
 
+    @staticmethod
     def process_batch_result_idle(
-        self: Scheduler,
+        self: "SchedulerBatchResultProcessor",
         batch: ScheduleBatch,
         result: GenerationBatchResult,
     ):
@@ -430,8 +446,9 @@ class SchedulerOutputProcessorMixin:
             batch.reqs, batch.return_logprob, is_idle_batch=True
         )
 
+    @staticmethod
     def process_batch_result_decode(
-        self: Scheduler,
+        self: "SchedulerBatchResultProcessor",
         batch: ScheduleBatch,
         result: GenerationBatchResult,
     ):
@@ -476,11 +493,9 @@ class SchedulerOutputProcessorMixin:
         # else: Spec V1 — output_ids, check_finished, grammar, and reasoning tokens
         # are already handled in the verify phase (eagle_info.py / ngram_info.py).
 
-        self.num_generated_tokens += len(batch.reqs)
+        self.increment_generated_tokens(len(batch.reqs))
         if not batch.spec_algorithm.is_none():
-            self.metrics_reporter.update_spec_metrics(
-                batch.batch_size(), result.num_accepted_drafts
-            )
+            self.update_spec_metrics(batch.batch_size(), result.num_accepted_drafts)
         if self.enable_metrics:
             self.metrics_collector.increment_decode_cuda_graph_pass(
                 value=can_run_cuda_graph
@@ -591,15 +606,19 @@ class SchedulerOutputProcessorMixin:
         self.output_streamer.stream_output(batch.reqs, batch.return_logprob)
         self.token_to_kv_pool_allocator.free_group_end()
 
-        self.forward_ct_decode = (self.forward_ct_decode + 1) % (1 << 30)
-        self.metrics_reporter.report_decode_stats(
+        self.advance_forward_ct_decode()
+        self.report_decode_stats(
             can_run_cuda_graph,
             running_batch=batch,
             num_accepted_drafts=result.num_accepted_drafts,
         )
 
+    @staticmethod
     def _handle_finished_req(
-        self: Scheduler, req: Req, i: int, logits_output: LogitsProcessorOutput
+        self: "SchedulerBatchResultProcessor",
+        req: Req,
+        i: int,
+        logits_output: LogitsProcessorOutput,
     ):
         if (
             self.server_args.disaggregation_decode_enable_offload_kvcache
@@ -611,8 +630,8 @@ class SchedulerOutputProcessorMixin:
             # delete feature to save memory
             if req.multimodal_inputs is not None and req.session is None:
                 req.multimodal_inputs.release_features()
-            self.maybe_collect_routed_experts(req)
-            self.maybe_collect_indexer_topk(req)
+            self._maybe_collect_routed_experts(req)
+            self._maybe_collect_indexer_topk(req)
 
             if self.server_args.disaggregation_decode_enable_offload_kvcache:
                 # Asynchronously offload KV cache; release_kv_cache will be called after Device->Host transfer completes
@@ -625,17 +644,21 @@ class SchedulerOutputProcessorMixin:
 
             req.time_stats.set_completion_time()
 
-        self.maybe_collect_customized_info(i, req, logits_output)
+        self._maybe_collect_customized_info(i, req, logits_output)
 
+    @staticmethod
     def _maybe_update_reasoning_tokens(
-        self: Scheduler, req: Req, next_token_id: Union[int, List[int]]
+        self: "SchedulerBatchResultProcessor",
+        req: Req,
+        next_token_id: Union[int, List[int]],
     ):
         think_end_id = self.model_config.think_end_id
         if req.require_reasoning and think_end_id is not None:
             req.update_reasoning_tokens(next_token_id, think_end_id)
 
+    @staticmethod
     def _mamba_prefix_cache_update(
-        self: Scheduler,
+        self: "SchedulerBatchResultProcessor",
         req: Req,
         batch: ScheduleBatch,
         result: GenerationBatchResult,
