@@ -33,6 +33,9 @@ if TYPE_CHECKING:
         ScheduleBatch,
         Scheduler,
     )
+    from sglang.srt.managers.scheduler_components.logprob_computer import (
+        SchedulerLogprobComputer,
+    )
 
 logger = logging.getLogger(__name__)
 
@@ -269,11 +272,15 @@ class SchedulerOutputProcessorMixin:
                         extend_input_len = extend_input_len_per_req[i]
 
                         num_input_logprobs = self.calculate_num_input_logprobs(
-                            req, extend_input_len, extend_logprob_start_len
+                            self.logprob_computer,
+                            req,
+                            extend_input_len,
+                            extend_logprob_start_len,
                         )
 
                         if req.return_logprob:
                             self.add_logprob_return_values(
+                                self.logprob_computer,
                                 i,
                                 req,
                                 logprob_pt,
@@ -327,10 +334,14 @@ class SchedulerOutputProcessorMixin:
                         if extend_logprob_start_len < extend_input_len:
                             # Update input logprobs.
                             num_input_logprobs = self.calculate_num_input_logprobs(
-                                req, extend_input_len, extend_logprob_start_len
+                                self.logprob_computer,
+                                req,
+                                extend_input_len,
+                                extend_logprob_start_len,
                             )
                             if req.return_logprob:
                                 self.add_input_logprob_return_values(
+                                    self.logprob_computer,
                                     i,
                                     req,
                                     logits_output,
@@ -707,8 +718,9 @@ class SchedulerOutputProcessorMixin:
                         actual_seq_len // mamba_track_interval * mamba_track_interval
                     )
 
+    @staticmethod
     def _process_input_token_logprobs(
-        self: Scheduler, req: Req, input_token_logprobs: List
+        self: "SchedulerLogprobComputer", req: Req, input_token_logprobs: List
     ) -> None:
         """Process input token logprobs values and indices."""
         is_multi_item_scoring = self._is_multi_item_scoring(req)
@@ -739,7 +751,8 @@ class SchedulerOutputProcessorMixin:
             for x in input_token_logprobs_idx
         ]
 
-    def _process_input_top_logprobs(self: Scheduler, req: Req) -> None:
+    @staticmethod
+    def _process_input_top_logprobs(self: "SchedulerLogprobComputer", req: Req) -> None:
         """Process input top logprobs."""
         if req.top_logprobs_num <= 0:
             return
@@ -768,7 +781,10 @@ class SchedulerOutputProcessorMixin:
         req.temp_input_top_logprobs_idx = None
         req.temp_input_top_logprobs_val = None
 
-    def _process_input_token_ids_logprobs(self: Scheduler, req: Req) -> None:
+    @staticmethod
+    def _process_input_token_ids_logprobs(
+        self: "SchedulerLogprobComputer", req: Req
+    ) -> None:
         """Process input token IDs logprobs."""
         if req.token_ids_logprob is None:
             return
@@ -800,7 +816,10 @@ class SchedulerOutputProcessorMixin:
         req.temp_input_token_ids_logprobs_idx = None
         req.temp_input_token_ids_logprobs_val = None
 
-    def _calculate_relevant_tokens_len(self: Scheduler, req: Req) -> int:
+    @staticmethod
+    def _calculate_relevant_tokens_len(
+        self: "SchedulerLogprobComputer", req: Req
+    ) -> int:
         """Calculate the expected length of logprob arrays based on whether multi-item scoring is enabled.
 
         For multi-item scoring, only delimiter positions have logprobs.
@@ -813,8 +832,12 @@ class SchedulerOutputProcessorMixin:
         else:
             return len(req.origin_input_ids[req.logprob_start_len :])
 
+    @staticmethod
     def calculate_num_input_logprobs(
-        self: Scheduler, req: Req, extend_input_len: int, extend_logprob_start_len: int
+        self: "SchedulerLogprobComputer",
+        req: Req,
+        extend_input_len: int,
+        extend_logprob_start_len: int,
     ) -> int:
         """Calculate the number of input logprobs based on whether multi-item scoring is enabled.
 
@@ -834,7 +857,8 @@ class SchedulerOutputProcessorMixin:
             # Regular request: all tokens in the range
             return extend_input_len - extend_logprob_start_len
 
-    def _is_multi_item_scoring(self: Scheduler, req: Req) -> bool:
+    @staticmethod
+    def _is_multi_item_scoring(self: "SchedulerLogprobComputer", req: Req) -> bool:
         """Check if request uses multi-item scoring.
 
         Multi-item scoring applies to prefill-only requests when a delimiter
@@ -847,8 +871,9 @@ class SchedulerOutputProcessorMixin:
             and req.multi_item_delimiter_indices is not None
         )
 
+    @staticmethod
     def add_input_logprob_return_values(
-        self: Scheduler,
+        self: "SchedulerLogprobComputer",
         i: int,
         req: Req,
         output: LogitsProcessorOutput,
@@ -932,8 +957,9 @@ class SchedulerOutputProcessorMixin:
                     assert len(req.input_token_ids_logprobs_val) == relevant_tokens_len
                     assert len(req.input_token_ids_logprobs_idx) == relevant_tokens_len
 
+    @staticmethod
     def add_logprob_return_values(
-        self: Scheduler,
+        self: "SchedulerLogprobComputer",
         i: int,
         req: Req,
         pt: int,
@@ -951,7 +977,13 @@ class SchedulerOutputProcessorMixin:
         # meaning we only compute output logprobs (which is the intended behavior)
         if num_input_logprobs > 0:
             self.add_input_logprob_return_values(
-                i, req, output, pt, num_input_logprobs, last_prefill_chunk=True
+                self.logprob_computer,
+                i,
+                req,
+                output,
+                pt,
+                num_input_logprobs,
+                last_prefill_chunk=True,
             )
         else:
             self._initialize_empty_logprob_containers(req)
@@ -975,7 +1007,10 @@ class SchedulerOutputProcessorMixin:
 
         return num_input_logprobs
 
-    def _initialize_empty_logprob_containers(self: Scheduler, req: Req) -> None:
+    @staticmethod
+    def _initialize_empty_logprob_containers(
+        self: "SchedulerLogprobComputer", req: Req
+    ) -> None:
         """
         Initialize logprob fields to empty lists if unset.
 
