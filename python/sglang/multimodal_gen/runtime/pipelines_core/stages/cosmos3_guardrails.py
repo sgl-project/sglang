@@ -213,9 +213,7 @@ def _build_video_guardrail(offload_to_cpu: bool) -> VideoGuardrailFn:
         )
         checkpoint = torch.load(ckpt_path, map_location="cpu", weights_only=True)
         # Checkpoint keys have "network." prefix from the VideoSafetyModel wrapper.
-        state = {
-            k.removeprefix("network."): v for k, v in checkpoint["model"].items()
-        }
+        state = {k.removeprefix("network."): v for k, v in checkpoint["model"].items()}
         classifier.load_state_dict(state)
         classifier = classifier.to(device, dtype=torch.float32).eval()
 
@@ -274,9 +272,7 @@ def _build_video_guardrail(offload_to_cpu: bool) -> VideoGuardrailFn:
             warnings.simplefilter("ignore")
             retinaface_net = RetinaFace(cfg=cfg, phase="test")
 
-        pretrained_dict = torch.load(
-            face_ckpt, map_location="cpu", weights_only=True
-        )
+        pretrained_dict = torch.load(face_ckpt, map_location="cpu", weights_only=True)
         if "state_dict" in pretrained_dict:
             pretrained_dict = pretrained_dict["state_dict"]
         pretrained_dict = {
@@ -285,9 +281,9 @@ def _build_video_guardrail(offload_to_cpu: bool) -> VideoGuardrailFn:
         }
         retinaface_net.load_state_dict(pretrained_dict, strict=False)
         retinaface_device = "cpu" if offload_to_cpu else "cuda"
-        retinaface_net = (
-            retinaface_net.to(retinaface_device, dtype=torch.float32).eval()
-        )
+        retinaface_net = retinaface_net.to(
+            retinaface_device, dtype=torch.float32
+        ).eval()
 
         CONF_THRESH = 0.7
         NMS_THRESH = 0.4
@@ -351,9 +347,7 @@ def _build_video_guardrail(offload_to_cpu: bool) -> VideoGuardrailFn:
                 scores_f = scores_f[order]
 
                 # NMS
-                dets = np.hstack((boxes_f, scores_f[:, np.newaxis])).astype(
-                    np.float32
-                )
+                dets = np.hstack((boxes_f, scores_f[:, np.newaxis])).astype(np.float32)
                 keep = py_cpu_nms(dets, NMS_THRESH)
                 dets = dets[keep][:KEEP_TOP_K]
 

@@ -68,6 +68,7 @@ class Cosmos3Pipeline(ComposedPipelineBase):
             from sglang.multimodal_gen.runtime.pipelines_core.stages.cosmos3_guardrails import (
                 Cosmos3TextGuardrailStage,
             )
+
             self.add_stage(Cosmos3TextGuardrailStage())
         self.add_stage(Cosmos3LatentPreparationStage(vae, transformer))
         self.add_stage(Cosmos3TimestepPreparationStage(scheduler))

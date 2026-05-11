@@ -42,9 +42,21 @@ def _build_cosmos3_param_names_mapping() -> dict:
         r"^time_embedder\.mlp\.2\.(.*)$": r"time_embedder.linear_2.\1",
         # GEN pathway: per-layer (must run before the UND catch-all below).
         # Q/K/V merge into MergedColumnParallelLinear to_qkv (concat order: Q, K, V).
-        r"^model\.layers\.(\d+)\.self_attn\.q_proj_moe_gen\.(.*)$": (r"gen_layers.\1.cross_attention.to_qkv.\2", 0, 3),
-        r"^model\.layers\.(\d+)\.self_attn\.k_proj_moe_gen\.(.*)$": (r"gen_layers.\1.cross_attention.to_qkv.\2", 1, 3),
-        r"^model\.layers\.(\d+)\.self_attn\.v_proj_moe_gen\.(.*)$": (r"gen_layers.\1.cross_attention.to_qkv.\2", 2, 3),
+        r"^model\.layers\.(\d+)\.self_attn\.q_proj_moe_gen\.(.*)$": (
+            r"gen_layers.\1.cross_attention.to_qkv.\2",
+            0,
+            3,
+        ),
+        r"^model\.layers\.(\d+)\.self_attn\.k_proj_moe_gen\.(.*)$": (
+            r"gen_layers.\1.cross_attention.to_qkv.\2",
+            1,
+            3,
+        ),
+        r"^model\.layers\.(\d+)\.self_attn\.v_proj_moe_gen\.(.*)$": (
+            r"gen_layers.\1.cross_attention.to_qkv.\2",
+            2,
+            3,
+        ),
         r"^model\.layers\.(\d+)\.self_attn\.o_proj_moe_gen\.(.*)$": r"gen_layers.\1.cross_attention.to_out.\2",
         r"^model\.layers\.(\d+)\.self_attn\.q_norm_moe_gen\.(.*)$": r"gen_layers.\1.cross_attention.norm_q.\2",
         r"^model\.layers\.(\d+)\.self_attn\.k_norm_moe_gen\.(.*)$": r"gen_layers.\1.cross_attention.norm_k.\2",
@@ -52,21 +64,49 @@ def _build_cosmos3_param_names_mapping() -> dict:
         r"^model\.layers\.(\d+)\.post_attention_layernorm_moe_gen\.(.*)$": r"gen_layers.\1.post_attention_layernorm.\2",
         # GEN MLP gate/up merge into MergedColumnParallelLinear gate_up_proj.
         # Must precede the mlp_moe_gen catch-all below.
-        r"^model\.layers\.(\d+)\.mlp_moe_gen\.gate_proj\.(.*)$": (r"gen_layers.\1.mlp.gate_up_proj.\2", 0, 2),
-        r"^model\.layers\.(\d+)\.mlp_moe_gen\.up_proj\.(.*)$": (r"gen_layers.\1.mlp.gate_up_proj.\2", 1, 2),
+        r"^model\.layers\.(\d+)\.mlp_moe_gen\.gate_proj\.(.*)$": (
+            r"gen_layers.\1.mlp.gate_up_proj.\2",
+            0,
+            2,
+        ),
+        r"^model\.layers\.(\d+)\.mlp_moe_gen\.up_proj\.(.*)$": (
+            r"gen_layers.\1.mlp.gate_up_proj.\2",
+            1,
+            2,
+        ),
         r"^model\.layers\.(\d+)\.mlp_moe_gen\.(.*)$": r"gen_layers.\1.mlp.\2",
         # UND pathway: per-layer attention rename (q/k/v_proj -> to_qkv merged,
         # q_norm/k_norm -> norm_q/k, o_proj -> to_out).
-        r"^model\.layers\.(\d+)\.self_attn\.q_proj\.(.*)$": (r"language_model.layers.\1.self_attn.to_qkv.\2", 0, 3),
-        r"^model\.layers\.(\d+)\.self_attn\.k_proj\.(.*)$": (r"language_model.layers.\1.self_attn.to_qkv.\2", 1, 3),
-        r"^model\.layers\.(\d+)\.self_attn\.v_proj\.(.*)$": (r"language_model.layers.\1.self_attn.to_qkv.\2", 2, 3),
+        r"^model\.layers\.(\d+)\.self_attn\.q_proj\.(.*)$": (
+            r"language_model.layers.\1.self_attn.to_qkv.\2",
+            0,
+            3,
+        ),
+        r"^model\.layers\.(\d+)\.self_attn\.k_proj\.(.*)$": (
+            r"language_model.layers.\1.self_attn.to_qkv.\2",
+            1,
+            3,
+        ),
+        r"^model\.layers\.(\d+)\.self_attn\.v_proj\.(.*)$": (
+            r"language_model.layers.\1.self_attn.to_qkv.\2",
+            2,
+            3,
+        ),
         r"^model\.layers\.(\d+)\.self_attn\.o_proj\.(.*)$": r"language_model.layers.\1.self_attn.to_out.\2",
         r"^model\.layers\.(\d+)\.self_attn\.q_norm\.(.*)$": r"language_model.layers.\1.self_attn.norm_q.\2",
         r"^model\.layers\.(\d+)\.self_attn\.k_norm\.(.*)$": r"language_model.layers.\1.self_attn.norm_k.\2",
         # UND MLP gate/up merge into MergedColumnParallelLinear gate_up_proj.
         # Must precede the layers catch-all below.
-        r"^model\.layers\.(\d+)\.mlp\.gate_proj\.(.*)$": (r"language_model.layers.\1.mlp.gate_up_proj.\2", 0, 2),
-        r"^model\.layers\.(\d+)\.mlp\.up_proj\.(.*)$": (r"language_model.layers.\1.mlp.gate_up_proj.\2", 1, 2),
+        r"^model\.layers\.(\d+)\.mlp\.gate_proj\.(.*)$": (
+            r"language_model.layers.\1.mlp.gate_up_proj.\2",
+            0,
+            2,
+        ),
+        r"^model\.layers\.(\d+)\.mlp\.up_proj\.(.*)$": (
+            r"language_model.layers.\1.mlp.gate_up_proj.\2",
+            1,
+            2,
+        ),
         # UND pathway: layernorms + remaining mlp keys pass through unchanged.
         r"^model\.layers\.(\d+)\.(.*)$": r"language_model.layers.\1.\2",
     }
@@ -122,7 +162,9 @@ class Cosmos3VideoArchConfig(DiTArchConfig):
     rms_norm_eps: float = 1e-6
 
     # Weight mapping from checkpoint to model
-    param_names_mapping: dict = field(default_factory=_build_cosmos3_param_names_mapping)
+    param_names_mapping: dict = field(
+        default_factory=_build_cosmos3_param_names_mapping
+    )
     reverse_param_names_mapping: dict = field(default_factory=dict)
     lora_param_names_mapping: dict = field(default_factory=dict)
 

@@ -26,7 +26,6 @@ from sglang.multimodal_gen.runtime.layers.linear import (
     RowParallelLinear,
     UnquantizedLinearMethod,
 )
-from sglang.multimodal_gen.runtime.layers.mlp import MLP
 from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config import (
     QuantizationConfig,
 )
@@ -39,7 +38,6 @@ from sglang.multimodal_gen.runtime.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
-from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.srt.utils import add_prefix
 
@@ -122,13 +120,9 @@ def compute_mrope_position_ids_vision(
             .flatten()
         )
     else:
-        t_index = (
-            torch.arange(grid_t, dtype=torch.long, device=device)
-            .view(-1, 1)
-            .expand(-1, grid_h * grid_w)
-            .flatten()
-            + int(temporal_offset)
-        )
+        t_index = torch.arange(grid_t, dtype=torch.long, device=device).view(
+            -1, 1
+        ).expand(-1, grid_h * grid_w).flatten() + int(temporal_offset)
 
     h_index = (
         torch.arange(grid_h, dtype=torch.long, device=device)
@@ -208,8 +202,7 @@ class Qwen3VLTextRotaryEmbedding(nn.Module):
         # Compute inverse frequencies
         dim = head_dim
         inv_freq = 1.0 / (
-            rope_theta
-            ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim)
+            rope_theta ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim)
         )
         self.register_buffer("inv_freq", inv_freq, persistent=False)
         self.attention_scaling = 1.0
@@ -459,12 +452,22 @@ class Cosmos3CausalAttention(nn.Module):
         # split returns strided views into qkv; .contiguous() before .view()
         # because the per-head reshape needs row-major memory.
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        q = q.contiguous().view(batch_size, seq_len, self.num_attention_heads, self.head_dim)
-        k = k.contiguous().view(batch_size, seq_len, self.num_key_value_heads, self.head_dim)
-        v = v.contiguous().view(batch_size, seq_len, self.num_key_value_heads, self.head_dim)
+        q = q.contiguous().view(
+            batch_size, seq_len, self.num_attention_heads, self.head_dim
+        )
+        k = k.contiguous().view(
+            batch_size, seq_len, self.num_key_value_heads, self.head_dim
+        )
+        v = v.contiguous().view(
+            batch_size, seq_len, self.num_key_value_heads, self.head_dim
+        )
 
-        q = F.rms_norm(q, (self.head_dim,), self.norm_q.weight, self.norm_q.variance_epsilon)
-        k = F.rms_norm(k, (self.head_dim,), self.norm_k.weight, self.norm_k.variance_epsilon)
+        q = F.rms_norm(
+            q, (self.head_dim,), self.norm_q.weight, self.norm_q.variance_epsilon
+        )
+        k = F.rms_norm(
+            k, (self.head_dim,), self.norm_k.weight, self.norm_k.variance_epsilon
+        )
         q, k = qwen3_apply_rotary_pos_emb(q, k, freqs_cos, freqs_sin)
 
         out = F.scaled_dot_product_attention(
@@ -556,12 +559,22 @@ class Cosmos3CrossAttention(nn.Module):
         # split returns strided views into qkv; .contiguous() before .view()
         # because the per-head reshape needs row-major memory.
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        q = q.contiguous().view(batch_size, seq_len_gen, self.num_attention_heads, self.head_dim)
-        k = k.contiguous().view(batch_size, seq_len_gen, self.num_key_value_heads, self.head_dim)
-        v = v.contiguous().view(batch_size, seq_len_gen, self.num_key_value_heads, self.head_dim)
+        q = q.contiguous().view(
+            batch_size, seq_len_gen, self.num_attention_heads, self.head_dim
+        )
+        k = k.contiguous().view(
+            batch_size, seq_len_gen, self.num_key_value_heads, self.head_dim
+        )
+        v = v.contiguous().view(
+            batch_size, seq_len_gen, self.num_key_value_heads, self.head_dim
+        )
 
-        q = F.rms_norm(q, (self.head_dim,), self.norm_q.weight, self.norm_q.variance_epsilon)
-        k = F.rms_norm(k, (self.head_dim,), self.norm_k.weight, self.norm_k.variance_epsilon)
+        q = F.rms_norm(
+            q, (self.head_dim,), self.norm_q.weight, self.norm_q.variance_epsilon
+        )
+        k = F.rms_norm(
+            k, (self.head_dim,), self.norm_k.weight, self.norm_k.variance_epsilon
+        )
         q, k = qwen3_apply_rotary_pos_emb(q, k, freqs_cos, freqs_sin)
 
         if sp_group is not None:
@@ -864,7 +877,9 @@ class Cosmos3OmniTransformer(CachableDiT):
     _compile_conditions = Cosmos3VideoConfig()._compile_conditions
     _supported_attention_backends = Cosmos3VideoConfig()._supported_attention_backends
     param_names_mapping = Cosmos3VideoConfig().arch_config.param_names_mapping
-    reverse_param_names_mapping = Cosmos3VideoConfig().arch_config.reverse_param_names_mapping
+    reverse_param_names_mapping = (
+        Cosmos3VideoConfig().arch_config.reverse_param_names_mapping
+    )
     lora_param_names_mapping = Cosmos3VideoConfig().arch_config.lora_param_names_mapping
 
     def __init__(
@@ -885,9 +900,7 @@ class Cosmos3OmniTransformer(CachableDiT):
         self.latent_patch_size = arch.latent_patch_size
         self.latent_channel = arch.latent_channel
         self.num_channels_latents = arch.out_channels
-        self.patch_latent_dim = (
-            self.latent_patch_size**2
-        ) * self.latent_channel
+        self.patch_latent_dim = (self.latent_patch_size**2) * self.latent_channel
         self.timestep_scale = arch.timestep_scale
         self.base_fps = arch.base_fps
         self.temporal_compression_factor = arch.temporal_compression_factor
@@ -992,26 +1005,24 @@ class Cosmos3OmniTransformer(CachableDiT):
             backends.append(SDPBackend.CUDNN_ATTENTION)
 
         # These are available in all PyTorch 2.x versions
-        backends.extend([
-            SDPBackend.FLASH_ATTENTION,
-            SDPBackend.EFFICIENT_ATTENTION,
-            SDPBackend.MATH,
-        ])
+        backends.extend(
+            [
+                SDPBackend.FLASH_ATTENTION,
+                SDPBackend.EFFICIENT_ATTENTION,
+                SDPBackend.MATH,
+            ]
+        )
 
         return backends
 
-    def _pad_to_patch_size(
-        self, H: int, W: int
-    ) -> tuple[int, int, int, int]:
+    def _pad_to_patch_size(self, H: int, W: int) -> tuple[int, int, int, int]:
         """Compute padded spatial dims aligned to patch_size."""
         p = self.latent_patch_size
         H_padded = ((H + p - 1) // p) * p
         W_padded = ((W + p - 1) // p) * p
         return H_padded // p, W_padded // p, H_padded, W_padded
 
-    def patchify(
-        self, latents: torch.Tensor, T: int, H: int, W: int
-    ) -> torch.Tensor:
+    def patchify(self, latents: torch.Tensor, T: int, H: int, W: int) -> torch.Tensor:
         """Convert latents to patches: [B, C, T, H, W] -> [B, T*Hp*Wp, p*p*C]."""
         B = latents.shape[0]
         p = self.latent_patch_size
@@ -1025,9 +1036,7 @@ class Cosmos3OmniTransformer(CachableDiT):
         x = x.permute(0, 2, 3, 5, 4, 6, 1)  # [B, T, Hp, Wp, p, p, C]
         return x.reshape(B, T * Hp * Wp, p * p * C)
 
-    def unpatchify(
-        self, tokens: torch.Tensor, T: int, H: int, W: int
-    ) -> torch.Tensor:
+    def unpatchify(self, tokens: torch.Tensor, T: int, H: int, W: int) -> torch.Tensor:
         """Convert patches back to latents: [B, T*Hp*Wp, p*p*C] -> [B, C, T, H, W]."""
         B = tokens.shape[0]
         p = self.latent_patch_size
@@ -1082,7 +1091,9 @@ class Cosmos3OmniTransformer(CachableDiT):
                 t_pos = torch.cat(
                     [
                         t_pos,
-                        torch.zeros(3, S_text - real_len, dtype=t_pos.dtype, device=device),
+                        torch.zeros(
+                            3, S_text - real_len, dtype=t_pos.dtype, device=device
+                        ),
                     ],
                     dim=1,
                 )
@@ -1161,9 +1172,7 @@ class Cosmos3OmniTransformer(CachableDiT):
             [B, C, T, H, W] velocity prediction
         """
         if text_ids is None or text_mask is None:
-            raise ValueError(
-                "Cosmos3 requires text_ids and text_mask to be passed"
-            )
+            raise ValueError("Cosmos3 requires text_ids and text_mask to be passed")
 
         batch_size, C, T, H, W = hidden_states.shape
         Hp, Wp, _, _ = self._pad_to_patch_size(H, W)
@@ -1218,7 +1227,9 @@ class Cosmos3OmniTransformer(CachableDiT):
 
         # Add timestep embedding (computed in float32 for numerical stability, then cast back)
         time_embed = self.time_embedder(timestep.float())
-        time_embed = time_embed.to(hidden_states.dtype)  # Cast to match hidden_gen dtype
+        time_embed = time_embed.to(
+            hidden_states.dtype
+        )  # Cast to match hidden_gen dtype
         if token_noisy_mask is not None:
             hidden_gen = hidden_gen + time_embed.unsqueeze(1) * token_noisy_mask
         else:
@@ -1275,7 +1286,11 @@ class Cosmos3OmniTransformer(CachableDiT):
                 k_und = k_und[:, :max_real_len]
                 v_und = v_und[:, :max_real_len]
                 hidden_gen, residual = layer(
-                    hidden_gen, k_und, v_und, cos_gen, sin_gen,
+                    hidden_gen,
+                    k_und,
+                    v_und,
+                    cos_gen,
+                    sin_gen,
                     residual=residual,
                     sp_group=self.sp_group if sequence_shard_enabled else None,
                 )
@@ -1369,5 +1384,6 @@ class Cosmos3OmniTransformer(CachableDiT):
         for module in self.modules():
             if isinstance(module, RMSNorm):
                 module.to(target_dtype)
+
 
 EntryClass = Cosmos3OmniTransformer
