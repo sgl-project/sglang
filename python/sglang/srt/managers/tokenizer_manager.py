@@ -44,6 +44,7 @@ from sglang.srt.disaggregation.encode_receiver import create_mm_receiver
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
 from sglang.srt.lora.lora_registry import LoRARef, LoRARegistry
+from sglang.srt.managers import logprob_ops
 from sglang.srt.managers.async_dynamic_batch_tokenizer import AsyncDynamicbatchTokenizer
 from sglang.srt.managers.disagg_service import start_disagg_service
 from sglang.srt.managers.embed_types import PositionalEmbeds
@@ -125,21 +126,6 @@ asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 _REQUEST_STATE_WAIT_TIMEOUT = envs.SGLANG_REQUEST_STATE_WAIT_TIMEOUT.get()
 
 logger = logging.getLogger(__name__)
-
-_INCREMENTAL_STREAMING_META_INFO_KEYS = (
-    "output_token_logprobs",
-    "output_top_logprobs",
-    "output_token_ids_logprobs",
-)
-
-
-def _slice_streaming_output_meta_info(
-    meta_info: Dict[Any, Any],
-    last_output_offset: int,
-) -> None:
-    """Align output-side metadata with the current incremental streaming chunk."""
-    for key in meta_info.keys() & set(_INCREMENTAL_STREAMING_META_INFO_KEYS):
-        meta_info[key] = meta_info[key][last_output_offset:]
 
 
 class InputFormat(Enum):
@@ -1165,7 +1151,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         if "meta_info" in out:
             meta_info_list = [chunk["meta_info"] for chunk in out_list]
             meta_info = dict(meta_info_list[-1])
-            for key in _INCREMENTAL_STREAMING_META_INFO_KEYS:
+            for key in logprob_ops.INCREMENTAL_STREAMING_META_INFO_KEYS:
                 if any(key in m for m in meta_info_list):
                     meta_info[key] = [
                         item for m in meta_info_list for item in m.get(key, [])
@@ -1638,7 +1624,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     meta_info.update(scheduler_time_stats.convert_to_output_meta_info())
 
             if getattr(state.obj, "return_logprob", False):
-                TokenizerManager.convert_logprob_style(
+                logprob_ops.absorb_recv(
                     meta_info,
                     state,
                     top_logprobs_num=state.obj.top_logprobs_num,
@@ -1705,7 +1691,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 if is_stream:
                     if incremental:
                         output_token_ids = delta_output_ids
-                        _slice_streaming_output_meta_info(meta_info, output_offset)
+                        logprob_ops.slice_streaming_output_meta_info(
+                            meta_info, output_offset
+                        )
                         state.last_output_offset = len(state.output_ids)
                         out_dict = {
                             "text": delta_text,
@@ -1747,7 +1735,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 if is_stream:
                     if incremental:
                         output_token_ids = delta_output_ids
-                        _slice_streaming_output_meta_info(meta_info, output_offset)
+                        logprob_ops.slice_streaming_output_meta_info(
+                            meta_info, output_offset
+                        )
                         state.last_output_offset = len(state.output_ids)
                         out_dict = {
                             "output_ids": output_token_ids,
@@ -1850,217 +1840,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         ):
             load_update_req = WatchLoadUpdateReq(loads=[recv_obj.load])
             self.send_to_scheduler.send_pyobj(load_update_req)
-
-    @staticmethod
-    def add_logprob_to_meta_info(
-        meta_info: dict,
-        state: ReqState,
-        *,
-        top_logprobs_num: int,
-        token_ids_logprob: Optional[List[int]],
-        return_text_in_logprobs: bool,
-        tokenizer: Optional[Any],
-    ) -> None:
-        # 1. Handle regular logprobs
-        if len(state.input_token_logprobs_val) > len(state.input_token_logprobs):
-            state.input_token_logprobs.extend(
-                TokenizerManager.detokenize_logprob_tokens(
-                    state.input_token_logprobs_val[len(state.input_token_logprobs) :],
-                    state.input_token_logprobs_idx[len(state.input_token_logprobs) :],
-                    decode_to_text=return_text_in_logprobs,
-                    tokenizer=tokenizer,
-                )
-            )
-
-        if len(state.output_token_logprobs_val) > len(state.output_token_logprobs):
-            state.output_token_logprobs.extend(
-                TokenizerManager.detokenize_logprob_tokens(
-                    state.output_token_logprobs_val[len(state.output_token_logprobs) :],
-                    state.output_token_logprobs_idx[len(state.output_token_logprobs) :],
-                    decode_to_text=return_text_in_logprobs,
-                    tokenizer=tokenizer,
-                )
-            )
-
-        meta_info["input_token_logprobs"] = state.input_token_logprobs
-        meta_info["output_token_logprobs"] = state.output_token_logprobs
-        meta_info["output_token_logprobs_length"] = len(state.output_token_logprobs)
-
-        # 2. Handle top logprobs
-        if top_logprobs_num > 0:
-            if len(state.input_top_logprobs_val) > len(state.input_top_logprobs):
-                state.input_top_logprobs.extend(
-                    TokenizerManager.detokenize_top_logprobs_tokens(
-                        state.input_top_logprobs_val[len(state.input_top_logprobs) :],
-                        state.input_top_logprobs_idx[len(state.input_top_logprobs) :],
-                        decode_to_text=return_text_in_logprobs,
-                        tokenizer=tokenizer,
-                    )
-                )
-            if len(state.output_top_logprobs_val) > len(state.output_top_logprobs):
-                state.output_top_logprobs.extend(
-                    TokenizerManager.detokenize_top_logprobs_tokens(
-                        state.output_top_logprobs_val[len(state.output_top_logprobs) :],
-                        state.output_top_logprobs_idx[len(state.output_top_logprobs) :],
-                        decode_to_text=return_text_in_logprobs,
-                        tokenizer=tokenizer,
-                    )
-                )
-
-            meta_info["input_top_logprobs"] = state.input_top_logprobs
-            meta_info["output_top_logprobs"] = state.output_top_logprobs
-
-        # 3. Handle token_ids_logprob
-        if token_ids_logprob is not None:
-            if len(state.input_token_ids_logprobs_val) > len(
-                state.input_token_ids_logprobs
-            ):
-                state.input_token_ids_logprobs.extend(
-                    TokenizerManager.detokenize_top_logprobs_tokens(
-                        state.input_token_ids_logprobs_val[
-                            len(state.input_token_ids_logprobs) :
-                        ],
-                        state.input_token_ids_logprobs_idx[
-                            len(state.input_token_ids_logprobs) :
-                        ],
-                        decode_to_text=return_text_in_logprobs,
-                        tokenizer=tokenizer,
-                    )
-                )
-            if len(state.output_token_ids_logprobs_val) > len(
-                state.output_token_ids_logprobs
-            ):
-                state.output_token_ids_logprobs.extend(
-                    TokenizerManager.detokenize_top_logprobs_tokens(
-                        state.output_token_ids_logprobs_val[
-                            len(state.output_token_ids_logprobs) :
-                        ],
-                        state.output_token_ids_logprobs_idx[
-                            len(state.output_token_ids_logprobs) :
-                        ],
-                        decode_to_text=return_text_in_logprobs,
-                        tokenizer=tokenizer,
-                    )
-                )
-
-            meta_info["input_token_ids_logprobs"] = state.input_token_ids_logprobs
-            meta_info["output_token_ids_logprobs"] = state.output_token_ids_logprobs
-
-    @staticmethod
-    def convert_logprob_style(
-        meta_info: dict,
-        state: ReqState,
-        *,
-        top_logprobs_num: int,
-        token_ids_logprob: Optional[List[int]],
-        return_text_in_logprobs: bool,
-        recv_obj: BatchStrOutput,
-        recv_obj_index: int,
-        tokenizer: Optional[Any],
-    ) -> None:
-        if recv_obj.input_token_logprobs_val is None:
-            return
-
-        if (
-            len(recv_obj.input_token_logprobs_val) > 0
-            and recv_obj.input_token_logprobs_val[recv_obj_index] is not None
-        ):
-            state.input_token_logprobs_val.extend(
-                recv_obj.input_token_logprobs_val[recv_obj_index]
-            )
-            state.input_token_logprobs_idx.extend(
-                recv_obj.input_token_logprobs_idx[recv_obj_index]
-            )
-        state.output_token_logprobs_val.extend(
-            recv_obj.output_token_logprobs_val[recv_obj_index]
-        )
-        state.output_token_logprobs_idx.extend(
-            recv_obj.output_token_logprobs_idx[recv_obj_index]
-        )
-
-        if top_logprobs_num > 0:
-            if len(recv_obj.input_top_logprobs_val) > 0:
-                state.input_top_logprobs_val.extend(
-                    recv_obj.input_top_logprobs_val[recv_obj_index]
-                )
-                state.input_top_logprobs_idx.extend(
-                    recv_obj.input_top_logprobs_idx[recv_obj_index]
-                )
-            state.output_top_logprobs_val.extend(
-                recv_obj.output_top_logprobs_val[recv_obj_index]
-            )
-            state.output_top_logprobs_idx.extend(
-                recv_obj.output_top_logprobs_idx[recv_obj_index]
-            )
-
-        if token_ids_logprob is not None:
-            if len(recv_obj.input_token_ids_logprobs_val) > 0:
-                state.input_token_ids_logprobs_val.extend(
-                    recv_obj.input_token_ids_logprobs_val[recv_obj_index]
-                )
-                state.input_token_ids_logprobs_idx.extend(
-                    recv_obj.input_token_ids_logprobs_idx[recv_obj_index]
-                )
-            state.output_token_ids_logprobs_val.extend(
-                recv_obj.output_token_ids_logprobs_val[recv_obj_index]
-            )
-            state.output_token_ids_logprobs_idx.extend(
-                recv_obj.output_token_ids_logprobs_idx[recv_obj_index]
-            )
-
-        TokenizerManager.add_logprob_to_meta_info(
-            meta_info,
-            state,
-            top_logprobs_num=state.obj.top_logprobs_num,
-            token_ids_logprob=state.obj.token_ids_logprob,
-            return_text_in_logprobs=return_text_in_logprobs,
-            tokenizer=tokenizer,
-        )
-
-    @staticmethod
-    def detokenize_logprob_tokens(
-        token_logprobs_val: List[float],
-        token_logprobs_idx: List[int],
-        *,
-        decode_to_text: bool,
-        tokenizer: Optional[Any],
-    ) -> List[Tuple[float, int, Optional[str]]]:
-        if not decode_to_text:
-            return [
-                (logprob, token_id, None)
-                for logprob, token_id in zip(token_logprobs_val, token_logprobs_idx)
-            ]
-        else:
-            assert tokenizer is not None
-            # In transformers v5, batch_decode([1, 2, 3]) concatenates all tokens
-            # into one string. Wrap each ID in its own list so they decode separately.
-            token_texts = tokenizer.batch_decode([[idx] for idx in token_logprobs_idx])
-            return list(zip(token_logprobs_val, token_logprobs_idx, token_texts))
-
-    @staticmethod
-    def detokenize_top_logprobs_tokens(
-        token_logprobs_val: List[List[float]],
-        token_logprobs_idx: List[List[int]],
-        *,
-        decode_to_text: bool,
-        tokenizer: Optional[Any],
-    ) -> List[Optional[List[Tuple[float, int, Optional[str]]]]]:
-        # TODO: The current implementation only batches the detokenization for top-k tokens per single position.
-        # We should batch all top-k tokens in all positions.
-        ret = []
-        for i in range(len(token_logprobs_val)):
-            if token_logprobs_val[i]:
-                ret.append(
-                    TokenizerManager.detokenize_logprob_tokens(
-                        token_logprobs_val[i],
-                        token_logprobs_idx[i],
-                        decode_to_text=decode_to_text,
-                        tokenizer=tokenizer,
-                    )
-                )
-            else:
-                ret.append(None)
-        return ret
 
     def _calculate_spec_decoding_metrics(
         self,
@@ -2390,7 +2169,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         }
         is_stream = getattr(state.obj, "stream", False)
         if getattr(state.obj, "return_logprob", False):
-            TokenizerManager.add_logprob_to_meta_info(
+            logprob_ops.fill_meta_info(
                 meta_info,
                 state,
                 top_logprobs_num=state.obj.top_logprobs_num,
