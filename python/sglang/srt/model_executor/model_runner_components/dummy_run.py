@@ -152,62 +152,13 @@ def dummy_run(
         require_mlp_tp_gather_=require_mlp_tp_gather_,
     )
 
-    def get_spec_info():
-        spec_info = None
-        if spec_algorithm.is_eagle() or spec_algorithm.is_standalone():
-            from sglang.srt.speculative.eagle_info import EagleVerifyInput
-
-            if is_draft_worker:
-                raise RuntimeError("This should not happen.")
-            else:
-                spec_info = EagleVerifyInput(
-                    draft_token=None,
-                    custom_mask=buffers.custom_mask,
-                    positions=None,
-                    retrieve_index=None,
-                    retrieve_next_token=None,
-                    retrieve_next_sibling=None,
-                    retrieve_cum_len=None,
-                    spec_steps=server_args.speculative_num_steps,
-                    topk=server_args.speculative_eagle_topk,
-                    draft_token_num=server_args.speculative_num_draft_tokens,
-                    capture_hidden_mode=CaptureHiddenMode.FULL,
-                    seq_lens_sum=None,
-                    seq_lens_cpu=None,
-                )
-        elif spec_algorithm.is_dflash():
-            from sglang.srt.speculative.dflash_info import DFlashVerifyInput
-
-            # Dummy warmup only needs shape metadata; avoid forcing custom-mask mode.
-            spec_info = DFlashVerifyInput(
-                draft_token=None,
-                positions=None,
-                draft_token_num=server_args.speculative_num_draft_tokens,
-                custom_mask=None,
-                capture_hidden_mode=(
-                    CaptureHiddenMode.NULL
-                    if is_draft_worker
-                    else CaptureHiddenMode.FULL
-                ),
-            )
-
-        elif spec_algorithm.is_ngram():
-            from sglang.srt.speculative.ngram_info import NgramVerifyInput
-
-            spec_info = NgramVerifyInput(
-                draft_token=None,
-                tree_mask=buffers.custom_mask,
-                positions=None,
-                retrieve_index=None,
-                retrieve_next_token=None,
-                retrieve_next_sibling=None,
-                draft_token_num=modes.num_tokens_per_bs,
-            )
-            spec_info.capture_hidden_mode = CaptureHiddenMode.NULL
-
-        return spec_info
-
-    spec_info = get_spec_info()
+    spec_info = _build_dummy_spec_info(
+        buffers=buffers,
+        num_tokens_per_bs=modes.num_tokens_per_bs,
+        spec_algorithm=spec_algorithm,
+        is_draft_worker=is_draft_worker,
+        server_args=server_args,
+    )
     capture_hidden_mode = modes.capture_hidden_mode
     if capture_hidden_mode != CaptureHiddenMode.FULL:
         capture_hidden_mode = (
@@ -417,3 +368,64 @@ def _handle_global_buffer(
     else:
         global_dp_buffer_len = None
     return global_dp_buffer_len
+
+
+def _build_dummy_spec_info(
+    *,
+    buffers: DecodeInputBuffers,
+    num_tokens_per_bs: int,
+    spec_algorithm: SpeculativeAlgorithm,
+    is_draft_worker: bool,
+    server_args: ServerArgs,
+):
+    spec_info = None
+    if spec_algorithm.is_eagle() or spec_algorithm.is_standalone():
+        from sglang.srt.speculative.eagle_info import EagleVerifyInput
+
+        if is_draft_worker:
+            raise RuntimeError("This should not happen.")
+        else:
+            spec_info = EagleVerifyInput(
+                draft_token=None,
+                custom_mask=buffers.custom_mask,
+                positions=None,
+                retrieve_index=None,
+                retrieve_next_token=None,
+                retrieve_next_sibling=None,
+                retrieve_cum_len=None,
+                spec_steps=server_args.speculative_num_steps,
+                topk=server_args.speculative_eagle_topk,
+                draft_token_num=server_args.speculative_num_draft_tokens,
+                capture_hidden_mode=CaptureHiddenMode.FULL,
+                seq_lens_sum=None,
+                seq_lens_cpu=None,
+            )
+    elif spec_algorithm.is_dflash():
+        from sglang.srt.speculative.dflash_info import DFlashVerifyInput
+
+        # Dummy warmup only needs shape metadata; avoid forcing custom-mask mode.
+        spec_info = DFlashVerifyInput(
+            draft_token=None,
+            positions=None,
+            draft_token_num=server_args.speculative_num_draft_tokens,
+            custom_mask=None,
+            capture_hidden_mode=(
+                CaptureHiddenMode.NULL if is_draft_worker else CaptureHiddenMode.FULL
+            ),
+        )
+
+    elif spec_algorithm.is_ngram():
+        from sglang.srt.speculative.ngram_info import NgramVerifyInput
+
+        spec_info = NgramVerifyInput(
+            draft_token=None,
+            tree_mask=buffers.custom_mask,
+            positions=None,
+            retrieve_index=None,
+            retrieve_next_token=None,
+            retrieve_next_sibling=None,
+            draft_token_num=num_tokens_per_bs,
+        )
+        spec_info.capture_hidden_mode = CaptureHiddenMode.NULL
+
+    return spec_info
