@@ -62,3 +62,43 @@ class SchedulerKvEventsPublisher:
             self.kv_event_publisher = EventPublisherFactory.create(
                 kv_events_config, attn_dp_rank
             )
+
+    def init_kv_events(self, kv_events_config: Optional[str]):
+        self.enable_kv_cache_events = bool(
+            kv_events_config and self.ps.attn_tp_rank == 0 and self.ps.attn_cp_rank == 0
+        )
+
+        if self.enable_kv_cache_events:
+            self.kv_event_publisher = EventPublisherFactory.create(
+                kv_events_config, self.ps.attn_dp_rank
+            )
+
+    def emit_kv_metrics(self):
+        if not self.enable_kv_cache_events:
+            return
+
+        kv_metrics = KvMetrics()
+        kv_metrics.request_active_slots = self.get_stats().num_running_reqs.total
+        kv_metrics.request_total_slots = self.max_running_requests
+        kv_metrics.kv_active_blocks = int(
+            self.get_stats().token_usage * self.max_total_num_tokens
+        )
+        kv_metrics.kv_total_blocks = self.max_total_num_tokens
+        kv_metrics.num_requests_waiting = self.get_stats().num_queue_reqs.total
+        kv_metrics.gpu_cache_usage_perc = self.get_stats().token_usage
+        kv_metrics.gpu_prefix_cache_hit_rate = self.get_stats().cache_hit_rate
+        kv_metrics.data_parallel_rank = (
+            self.ps.dp_rank if self.ps.dp_rank is not None else 0
+        )
+
+        if not self.send_metrics_from_scheduler.closed:
+            self.send_metrics_from_scheduler.send_pyobj(kv_metrics)
+
+    def publish_kv_events(self):
+        if not self.enable_kv_cache_events:
+            return
+
+        events = self.tree_cache.take_events()
+        if events:
+            batch = KVEventBatch(ts=time.time(), events=events)
+            self.kv_event_publisher.publish(batch)
