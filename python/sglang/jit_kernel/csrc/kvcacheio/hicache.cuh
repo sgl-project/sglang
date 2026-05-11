@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <type_traits>
 
 namespace device {
 
