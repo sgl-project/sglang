@@ -9,28 +9,19 @@ import torch
 from sglang.jit_kernel.deepseek_v4 import fused_store_cache
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.dsv4 import (
+    index_buf_accessor as dsv4_index_buf_accessor,
+)
+from sglang.srt.layers.attention.dsv4.index_buf_accessor import NopeFp8RopeBf16Pack
 from sglang.srt.layers.attention.nsa import index_buf_accessor
+from sglang.srt.mem_cache.deepseek_v4_compress_state import CompressStatePool
 from sglang.srt.utils import is_hip
 
 if is_hip():
     from sgl_kernel.kvcacheio import transfer_kv_all_layer_mla
-
-    from sglang.srt.layers.attention.nsa import index_buf_accessor_v4
-    from sglang.srt.layers.attention.nsa.index_buf_accessor_v4 import (
-        NopeFp8RopeBf16Pack,
-    )
-    from sglang.srt.mem_cache.compress_state import (
-        CompressStatePool,
+    from sglang.srt.mem_cache.deepseek_v4_compress_state import (
         DeepSeekV4CompressState,
     )
-else:
-    from sglang.srt.layers.attention.dsv4 import (
-        index_buf_accessor as dsv4_index_buf_accessor,
-    )
-    from sglang.srt.layers.attention.dsv4.index_buf_accessor import (
-        NopeFp8RopeBf16Pack,
-    )
-    from sglang.srt.mem_cache.deepseek_v4_compress_state import CompressStatePool
 
 from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.mem_cache.memory_pool import KVCache
@@ -182,7 +173,7 @@ class DeepSeekV4SingleKVPool(KVCache):
         loc: torch.Tensor,
         cache_nope_fp8_rope_bf16_pack: NopeFp8RopeBf16Pack,
     ):
-        _accessor = index_buf_accessor_v4 if is_hip() else dsv4_index_buf_accessor
+        _accessor = dsv4_index_buf_accessor
         _accessor.SetKAndS.execute(
             pool=self,
             buf=self.kv_buffer[layer_id],
@@ -633,58 +624,35 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             size = c4_state_pool_size if ratio == 4 else c128_state_pool_size
             ring_size = self.get_ring_size(ratio) if ratio != 0 else 0
 
-            # NOTE: c1 layer has no compress state
+            ONLINE_C128 = (
+                not _use_hip_pool and envs.SGLANG_OPT_USE_ONLINE_COMPRESS.get()
+            )
             if ratio != 0:
-                if _use_hip_pool:
-                    compress_state_pool = CompressStatePool(
-                        size=size,
-                        swa_page_size=self.swa_page_size,
-                        ring_size=ring_size,
-                        overlap=overlap,
-                        head_dim=self.qk_nope_head_dim + self.qk_rope_head_dim,
-                        dtype=self.state_dtype,
-                        device=self.device,
-                        enable_memory_saver=False,
-                        ratio=ratio,
-                    )
-                else:
-                    ONLINE_C128 = envs.SGLANG_OPT_USE_ONLINE_COMPRESS.get()
-                    compress_state_pool = CompressStatePool(
-                        size=size,
-                        ring_size=ring_size,
-                        overlap=overlap,
-                        head_dim=self.qk_nope_head_dim + self.qk_rope_head_dim,
-                        dtype=self.state_dtype,
-                        device=self.device,
-                        enable_memory_saver=False,
-                        ratio=ratio,
-                        online=(ratio == 128 and ONLINE_C128),
-                    )
+                compress_state_pool = CompressStatePool(
+                    size=size,
+                    ring_size=ring_size,
+                    overlap=overlap,
+                    head_dim=self.qk_nope_head_dim + self.qk_rope_head_dim,
+                    dtype=self.state_dtype,
+                    device=self.device,
+                    enable_memory_saver=False,
+                    ratio=ratio,
+                    online=(ratio == 128 and ONLINE_C128),
+                    swa_page_size=self.swa_page_size,
+                )
 
             if ratio == 4:
-                if _use_hip_pool:
-                    indexer_compress_state_pool = CompressStatePool(
-                        size=size,
-                        swa_page_size=self.swa_page_size,
-                        ring_size=ring_size,
-                        overlap=overlap,
-                        head_dim=self.indexer_head_dim,
-                        device=self.device,
-                        dtype=self.state_dtype,
-                        enable_memory_saver=False,
-                        ratio=ratio,
-                    )
-                else:
-                    indexer_compress_state_pool = CompressStatePool(
-                        size=size,
-                        ring_size=ring_size,
-                        overlap=overlap,
-                        head_dim=self.indexer_head_dim,
-                        device=self.device,
-                        dtype=self.state_dtype,
-                        enable_memory_saver=False,
-                        ratio=ratio,
-                    )
+                indexer_compress_state_pool = CompressStatePool(
+                    size=size,
+                    ring_size=ring_size,
+                    overlap=overlap,
+                    head_dim=self.indexer_head_dim,
+                    device=self.device,
+                    dtype=self.state_dtype,
+                    enable_memory_saver=False,
+                    ratio=ratio,
+                    swa_page_size=self.swa_page_size,
+                )
 
             self.compress_state_pools.append(compress_state_pool)
             self.indexer_compress_state_pools.append(indexer_compress_state_pool)

@@ -11,7 +11,7 @@ from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.debug_flash_mla_adapter import (
     flash_mla_with_kvcache_entrypoint,
 )
-from sglang.srt.layers.attention.nsa.quant_k_cache_v4 import (
+from sglang.srt.layers.attention.dsv4.quant_k_cache import (
     quant_to_nope_fp8_rope_bf16_pack_triton,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode

@@ -64,7 +64,7 @@ from sglang.srt.layers.quantization.fp8_kernel import sglang_per_token_group_qua
 from sglang.srt.layers.rotary_embedding import get_rope_wrapper
 from sglang.srt.layers.utils import get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
-from sglang.srt.mem_cache.compress_state import (
+from sglang.srt.mem_cache.deepseek_v4_compress_state import (
     CompressStatePool,
     KVAndScore,
     KVAndScoreOld,

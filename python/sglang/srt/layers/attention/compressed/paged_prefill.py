@@ -8,8 +8,8 @@ from sglang.jit_kernel.deepseek_v4 import (
     triton_make_swa_prefill_indices,
 )
 from sglang.srt.environ import envs
-from sglang.srt.layers.attention.nsa import index_buf_accessor_v4
-from sglang.srt.layers.attention.nsa.quant_k_cache_v4 import (
+from sglang.srt.layers.attention.dsv4 import index_buf_accessor as index_buf_accessor_v4
+from sglang.srt.layers.attention.dsv4.quant_k_cache import (
     quant_to_nope_fp8_rope_bf16_pack_triton,
 )
 from sglang.srt.utils import ceil_align
