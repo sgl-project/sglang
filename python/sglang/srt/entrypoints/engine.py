@@ -678,8 +678,9 @@ class Engine(EngineScoreMixin, EngineBase):
             scheduler_procs,
         )
 
-    @staticmethod
+    @classmethod
     def _launch_detokenizer_subprocesses(
+        cls,
         server_args: ServerArgs,
         port_args: PortArgs,
         run_detokenizer_process_func: Callable,

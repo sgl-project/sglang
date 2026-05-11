@@ -527,9 +527,8 @@ def run_multi_detokenizer_router_process(
         router = MultiDetokenizerRouter(ipc_name_list, port_args)
         router.event_loop()
     except Exception:
-        logger.error(
-            f"MultiDetokenizerRouter hit an exception: {get_exception_traceback()}"
-        )
+        traceback = get_exception_traceback()
+        logger.error(f"MultiDetokenizerRouter hit an exception: {traceback}")
         if router is not None:
             router.socket_mapping.clear_all_sockets()
         parent_process.send_signal(signal.SIGQUIT)
