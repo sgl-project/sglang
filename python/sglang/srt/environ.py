@@ -578,6 +578,8 @@ class Envs:
     SGLANG_OPT_USE_ONLINE_COMPRESS = EnvBool(False)
     SGLANG_FP8_PAGED_MQA_LOGITS_TORCH = EnvBool(False)
     SGLANG_TOPK_TRANSFORM_512_TORCH = EnvBool(False)
+    # CPU fallback for DS v4 compressed module.
+    SGLANG_CPU_COMPRESS_PATH = EnvBool(False)
 
     # SWA radix cache
     SGLANG_OPT_CACHE_SWA_TRANSLATION = EnvBool(True)

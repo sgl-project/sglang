@@ -62,7 +62,14 @@ from sglang.srt.model_executor.cuda_graph_runner import (
 from sglang.srt.model_loader.utils import maybe_executor_submit, should_async_load
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.dbrx import ReplicatedLinear
-from sglang.srt.models.deepseek_v2 import ParallelLMHead, _is_cuda, _is_hip, _is_npu
+from sglang.srt.models.deepseek_v2 import (
+    ParallelLMHead,
+    _is_cuda,
+    _is_hip,
+    _is_npu,
+    cpu_has_amx_support,
+    is_cpu,
+)
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     LazyValue,
@@ -72,6 +79,51 @@ from sglang.srt.utils import (
 )
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
+_is_cpu = is_cpu()
+_cpu_amx = cpu_has_amx_support()
+if _is_cpu and _cpu_amx:
+
+    def apply_rotary_emb_cpu(
+        x: torch.Tensor,
+        freqs_cis: torch.Tensor,
+        positions: Optional[torch.Tensor] = None,
+        inverse: bool = False,
+    ) -> torch.Tensor:
+        return torch.ops.sgl_kernel.apply_rotary_emb_interleaved_cpu(
+            x, freqs_cis, inverse, positions
+        )
+
+    apply_rotary_emb_triton = apply_rotary_emb_cpu
+
+    def rms_normalize_cpu(
+        x: torch.Tensor, eps: float, weight: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        if weight is None:
+            shape = x.shape
+            x_2d = x.reshape(-1, shape[-1])
+            if not x_2d.is_contiguous():
+                x_2d = x_2d.contiguous()
+            return torch.ops.sgl_kernel.l2norm_cpu(x_2d, eps).view(shape)
+        else:
+            shape = x.shape
+            x_2d = x.reshape(-1, shape[-1])
+            if x_2d.stride(-1) != 1:
+                x_2d = x_2d.contiguous()
+
+            w = weight.reshape(-1)
+            if w.dtype != x.dtype:
+                w = w.to(dtype=x.dtype)
+            if not w.is_contiguous():
+                w = w.contiguous()
+
+            out = torch.ops.sgl_kernel.rmsnorm_cpu(
+                x_2d,
+                w,
+                eps,
+            ).view(shape)
+            return out
+
+    rms_normalize_triton = rms_normalize_cpu
 logger = logging.getLogger(__name__)
 
 _FP8_WO_A_GEMM = envs.SGLANG_OPT_FP8_WO_A_GEMM.get()
@@ -739,7 +791,19 @@ class DeepseekV4DecoderLayer(nn.Module):
             rsqrt = torch.rsqrt(s_out / k + self.rms_norm_eps)
             mixes = (d_out * rsqrt.unsqueeze(1)).unsqueeze(1)
         else:
-            x_flat, mixes = hc_pre_torch_impl(x, hc_fn)
+            if _is_cpu and _cpu_amx:
+                return torch.ops.sgl_kernel.hc_pre_fused_cpu(
+                    x,
+                    hc_fn,
+                    hc_scale,
+                    hc_base,
+                    self.hc_mult,
+                    self.hc_sinkhorn_iters,
+                    self.rms_norm_eps,
+                    self.hc_eps,
+                )
+            else:
+                x_flat, mixes = hc_pre_torch_impl(x, hc_fn)
 
         from sglang.srt.layers.mhc import hc_split_sinkhorn
 
@@ -772,6 +836,13 @@ class DeepseekV4DecoderLayer(nn.Module):
 
             return mhc_post(x, residual, post, comb)
 
+        if _is_cpu and _cpu_amx:
+            return torch.ops.sgl_kernel.hc_post_fused_cpu(
+                x,
+                residual,
+                post,
+                comb,
+            )
         assert residual.shape == (x.shape[0], self.hc_mult, x.shape[-1])
         assert post.shape == (x.shape[0], self.hc_mult)
         assert comb.shape == (x.shape[0], self.hc_mult, self.hc_mult)

@@ -13,7 +13,10 @@ from sglang.jit_kernel.utils import (
     make_cpp_args,
 )
 from sglang.srt.environ import envs
+from sglang.srt.utils import cpu_has_amx_support, is_cpu
 
+_is_cpu = is_cpu()
+_cpu_amx = cpu_has_amx_support()
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
 
@@ -416,19 +419,30 @@ class CompressorPrefillPlan(NamedTuple):
             (2, num_q_tokens, 16),
             dtype=torch.uint8,
             device=seq_lens.device,
-            pin_memory=seq_lens.is_cpu,
+            pin_memory=seq_lens.is_cpu if not _is_cpu else False,
         )
         module = _jit_common_module()
         is_overlap = compress_ratio == 4
-        plan_lens = module.plan_compress_prefill(
-            extend_lens,
-            seq_lens,
-            plan_tensor[0],
-            plan_tensor[1],
-            compress_ratio,
-            is_overlap,
-            use_cuda_graph,
-        )
+        if _is_cpu:
+            plan_lens = _plan_compress_prefill_torch(
+                extend_lens,
+                seq_lens,
+                plan_tensor[0],
+                plan_tensor[1],
+                compress_ratio,
+                is_overlap,
+                use_cuda_graph,
+            )
+        else:
+            plan_lens = module.plan_compress_prefill(
+                extend_lens,
+                seq_lens,
+                plan_tensor[0],
+                plan_tensor[1],
+                compress_ratio,
+                is_overlap,
+                use_cuda_graph,
+            )
         return CompressorPrefillPlan(
             compress_ratio,
             plan_tensor[0, : plan_lens[0]].to(device, non_blocking=True),
@@ -451,7 +465,7 @@ class CompressorPrefillPlan(NamedTuple):
             (2, num_q_tokens, 16),
             dtype=torch.uint8,
             device="cpu",
-            pin_memory=True,
+            pin_memory=True if not _is_cpu else False,
         )
         module = _jit_compress_128_online_plan_module()
         plan_lens = module.plan_compress_online_prefill(
@@ -578,9 +592,14 @@ def fused_rope(
     positions: torch.Tensor,
     inverse: bool = False,
 ) -> None:
-    freqs_real = torch.view_as_real(freqs_cis).flatten(-2).contiguous()
-    module = _jit_fused_rope_module()
-    module.forward(q, k, freqs_real, positions, inverse)
+    if _is_cpu and _cpu_amx:
+        torch.ops.sgl_kernel.apply_rotary_emb_interleaved_cpu(
+            q, freqs_cis, inverse, positions, k
+        )
+    else:
+        freqs_real = torch.view_as_real(freqs_cis).flatten(-2).contiguous()
+        module = _jit_fused_rope_module()
+        module.forward(q, k, freqs_real, positions, inverse)
 
 
 @triton.jit
@@ -708,6 +727,56 @@ def triton_create_paged_compress_data(
 
     if not is_overlap:
         out_1.squeeze_(1)
+    return out_0, out_1
+
+
+def torch_create_paged_compress_data(
+    *,
+    compress_ratio: int,
+    is_overlap: bool,
+    swa_page_size: int,
+    ring_size: int,
+    req_pool_indices: torch.Tensor,
+    seq_lens: torch.Tensor,
+    extend_seq_lens: torch.Tensor,
+    req_to_token: torch.Tensor,
+    full_to_swa_index_mapping: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    batch_size = req_pool_indices.shape[0]
+    device = req_pool_indices.device
+
+    rid = req_pool_indices.to(torch.int32)
+    seq_len = seq_lens[:batch_size].to(torch.int32)
+    extend_len = extend_seq_lens[:batch_size].to(torch.int32)
+    prefix_len = seq_len - extend_len
+
+    cr = compress_ratio
+    write_pos = ((seq_len - 1) // cr) * cr
+    load_pos = ((prefix_len - 1) // cr) * cr
+    write_overlap_pos = write_pos - cr
+    load_overlap_pos = load_pos - cr
+
+    def compute_state_loc(pos: torch.Tensor) -> torch.Tensor:
+        pos = pos.clamp(min=0)
+        loc = req_to_token[rid, pos].to(torch.int32)
+        swa_loc = full_to_swa_index_mapping[loc].to(torch.int32)
+        swa_page = swa_loc // swa_page_size
+        state_loc = swa_page * ring_size + (swa_loc % ring_size)
+        state_loc = state_loc // cr
+        return state_loc
+
+    v0 = compute_state_loc(load_pos)  # i == 0
+    v1 = compute_state_loc(write_pos)  # i == 1
+    v2 = compute_state_loc(load_overlap_pos)  # i == 2
+    v3 = compute_state_loc(write_overlap_pos)  # i == 3
+
+    out_0 = v1.clone()
+
+    if is_overlap:
+        out_1 = torch.stack([v2, v0, v3, write_pos.to(torch.int32)], dim=1)
+    else:
+        out_1 = v0.clone()
+
     return out_0, out_1
 
 
@@ -906,3 +975,76 @@ def _dispatch_bf16_fp32_backend(
         return z
     else:
         return torch.nn.functional.linear(x.float(), y.float())
+
+
+def _plan_compress_prefill_torch(
+    extend_lens: torch.Tensor,
+    seq_lens: torch.Tensor,
+    compress_plan: torch.Tensor,
+    write_plan: torch.Tensor,
+    compress_ratio: int,
+    is_overlap: bool,
+    use_cuda_graph: bool,
+) -> Tuple[int, int]:
+    """Pure-torch fallback for ``plan_compress_prefill``."""
+    import struct
+
+    assert compress_plan.dtype == torch.uint8
+    assert write_plan.dtype == torch.uint8
+    num_tokens = compress_plan.shape[0]
+    assert write_plan.shape[0] == num_tokens
+    assert compress_plan.shape[1] == 16 and write_plan.shape[1] == 16
+
+    extend_lens_cpu = extend_lens.detach().to("cpu", dtype=torch.int64).tolist()
+    seq_lens_cpu = seq_lens.detach().to("cpu", dtype=torch.int64).tolist()
+    batch_size = len(extend_lens_cpu)
+    assert len(seq_lens_cpu) == batch_size
+
+    ratio = compress_ratio * (2 if is_overlap else 1)
+    counter = 0
+    compress_entries: list = []
+    write_entries: list = []
+
+    for i in range(batch_size):
+        seq_len = int(seq_lens_cpu[i])
+        extend_len = int(extend_lens_cpu[i])
+        assert 0 < extend_len <= seq_len
+        prefix_len = seq_len - extend_len
+        pos = (seq_len // compress_ratio) * compress_ratio
+        if is_overlap:
+            start_write_pos = pos - compress_ratio if pos >= compress_ratio else 0
+        else:
+            start_write_pos = pos
+        for j in range(extend_len):
+            position = prefix_len + j
+            window_len = ratio - min(j + 1, ratio)
+            plan = (counter + j, i, position, window_len)
+            if (position + 1) % compress_ratio == 0:
+                compress_entries.append(plan)
+            if position >= start_write_pos:
+                write_entries.append(plan)
+        counter += extend_len
+    assert counter == num_tokens, f"input size {counter} != num_q_tokens {num_tokens}"
+
+    kInvalid = 0xFFFFFFFF
+    invalid_row = struct.pack("<IIII", kInvalid, kInvalid, kInvalid, kInvalid)
+
+    def _fill(buf: torch.Tensor, entries: list) -> int:
+        n_entries = len(entries)
+        n_rows = num_tokens if use_cuda_graph else n_entries
+        if n_rows == 0:
+            return num_tokens if use_cuda_graph else 0
+        valid_bytes = b"".join(struct.pack("<IIII", *e) for e in entries)
+        if use_cuda_graph and n_entries < num_tokens:
+            payload = valid_bytes + invalid_row * (num_tokens - n_entries)
+        else:
+            payload = valid_bytes
+        cpu_view = torch.frombuffer(bytearray(payload), dtype=torch.uint8).view(
+            n_rows, 16
+        )
+        buf[:n_rows].copy_(cpu_view)
+        return num_tokens if use_cuda_graph else n_entries
+
+    compress_count = _fill(compress_plan, compress_entries)
+    write_count = _fill(write_plan, write_entries)
+    return compress_count, write_count
