@@ -766,7 +766,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.init_aux_hidden_state_capture()
 
         if self.device == "cuda" or self.device == "musa":
-            self.init_cublas()
+            ModelRunner.init_cublas()
             self.init_attention_backend()
             self.kernel_warmup()
             # Init hisparse coordinator (must happen before CUDA graph capture)
@@ -2330,7 +2330,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         log_info_on_rank0(logger, f"Using KV cache dtype: {self.kv_cache_dtype}")
 
-    def init_cublas(self):
+    @staticmethod
+    def init_cublas():
         """We need to run a small matmul to init cublas. Otherwise, it will raise some errors later."""
         dtype = torch.float16
         device = "cuda"
