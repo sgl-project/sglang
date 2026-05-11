@@ -445,6 +445,41 @@ def memcpy_triton_kernel(
         tl.store(dst_ptr + offset + start_index + offs, data, mask=mask)
 
 
+@triton.jit
+def memcpy_triton_with_zero_fill_kernel(
+    dst_ptr,
+    src_ptr,
+    offset_ptr,
+    sz_ptr,
+    dst_numel,
+    offset_src: tl.constexpr,
+    chunk_size,  # multiplied for offset and sz
+    BLOCK_SIZE: tl.constexpr,
+):
+    # Fused equivalent of `dst.fill_(0)` followed by `memcpy_triton(dst, ...)`.
+    # Each dst element is written exactly once: source data inside the copy
+    # range, zero outside. Halves HBM write traffic on dst for memory-bound
+    # DP-attn gather/scatter (see #24938).
+    pid = tl.program_id(axis=0).to(tl.int64)
+    offset = tl.load(offset_ptr).to(tl.int64) * chunk_size
+    sz = tl.load(sz_ptr).to(tl.int64) * chunk_size
+
+    start_index = pid * BLOCK_SIZE
+    offs = tl.arange(0, BLOCK_SIZE)
+    dst_idx = start_index + offs
+    dst_mask = dst_idx < dst_numel
+
+    if offset_src:
+        in_copy = dst_idx < sz
+        src_idx = tl.where(in_copy, offset + dst_idx, 0)
+    else:
+        in_copy = (dst_idx >= offset) & (dst_idx < offset + sz)
+        src_idx = tl.where(in_copy, dst_idx - offset, 0)
+
+    data = tl.load(src_ptr + src_idx, mask=in_copy & dst_mask, other=0)
+    tl.store(dst_ptr + dst_idx, data, mask=dst_mask)
+
+
 def prod(x):
     return functools.reduce(lambda a, b: a * b, x, 1)
 
@@ -460,6 +495,19 @@ def memcpy_triton(dst, src, dim, offset, sz, offset_src):
     memcpy_triton_kernel[grid](dst, src, offset, sz, offset_src, chunk_size, BLOCK_SIZE)
 
 
+def memcpy_triton_with_zero_fill(dst, src, dim, offset, sz, offset_src):
+    assert dim == 0, "dim != 0 unsupported"
+    assert src.shape[1:] == dst.shape[1:], "src and dst must have same shape"
+    dst_numel = dst.numel()
+    chunk_size = prod(src.shape[1:])
+    BLOCK_SIZE = 8192
+    grid = (triton.cdiv(dst_numel, BLOCK_SIZE),)
+
+    memcpy_triton_with_zero_fill_kernel[grid](
+        dst, src, offset, sz, dst_numel, offset_src, chunk_size, BLOCK_SIZE
+    )
+
+
 def _dp_gather_via_all_reduce(
     global_tokens: torch.Tensor,
     local_tokens: torch.Tensor,
@@ -468,7 +516,6 @@ def _dp_gather_via_all_reduce(
 ):
     local_start_pos, local_num_tokens = get_dp_local_info(forward_batch)
 
-    global_tokens.fill_(0)
     assert local_tokens.is_contiguous()
     assert global_tokens.is_contiguous()
 
@@ -477,9 +524,11 @@ def _dp_gather_via_all_reduce(
             local_tokens.untyped_storage() is not global_tokens.untyped_storage()
         ), "aliasing between global_tokens and local_tokens not allowed"
 
-        memcpy_triton(
+        memcpy_triton_with_zero_fill(
             global_tokens, local_tokens, 0, local_start_pos, local_num_tokens, False
         )
+    else:
+        global_tokens.fill_(0)
 
     # Input IDs are in int 32. We should use inplace_all_reduce for local case because of custom all reduce.
     NUM_GPUS_PER_NODE = 8
@@ -556,7 +605,6 @@ def dp_scatter(
     # since local_tokens may be padded for cuda graph
     local_start_pos, local_num_tokens = get_dp_local_info(forward_batch)
 
-    local_tokens.fill_(0)
     assert local_tokens.is_contiguous()
     assert global_tokens.is_contiguous()
     if local_tokens.shape[0] > 0:
@@ -564,9 +612,11 @@ def dp_scatter(
             local_tokens.untyped_storage() is not global_tokens.untyped_storage()
         ), "aliasing between local_tokens and global_tokens not allowed"
 
-        memcpy_triton(
+        memcpy_triton_with_zero_fill(
             local_tokens, global_tokens, 0, local_start_pos, local_num_tokens, True
         )
+    else:
+        local_tokens.fill_(0)
 
 
 def dp_reduce_scatter_tensor(output: torch.Tensor, input: torch.Tensor):
