@@ -1,10 +1,11 @@
+import platform
 import sys
 
 from sgl_kernel.version import __version__  # noqa: F401
 
 # On macOS only the Metal extension is shipped; skip CUDA op loading and
 # re-exports so those symbols are not exposed on Apple Silicon.
-if sys.platform == "darwin":
+if sys.platform == "darwin" and platform.machine() == "arm64":
     from sgl_kernel.metal import *
 else:
     import torch
@@ -133,7 +134,6 @@ else:
             musa_fused_mul_add,
             musa_rotary_embedding_contiguous,
         )
-
 
     _DEBUG_EXPORT_NAMES = [
         "apply_shuffle_mul_sum",
