@@ -45,7 +45,6 @@ from sglang.srt.environ import envs
 from sglang.srt.lora.lora_registry import LoRARef, LoRARegistry
 from sglang.srt.managers import logprob_ops, request_tracing, spec_decoding_meta
 from sglang.srt.managers.disagg_service import start_disagg_service
-from sglang.srt.managers.embed_types import PositionalEmbeds
 from sglang.srt.managers.io_struct import (
     AbortReq,
     ActiveRanksOutput,
@@ -63,7 +62,6 @@ from sglang.srt.managers.io_struct import (
     LoadLoRAAdapterReqInput,
     OpenSessionReqOutput,
     PauseGenerationReqInput,
-    SessionParams,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
     UpdateWeightFromDiskReqInput,
@@ -590,8 +588,7 @@ class TokenizerManager(TokenizerControlMixin):
             mm_inputs = None
 
         self.request_validator.validate_one(obj=obj, input_ids=input_ids)
-        tokenized_obj = TokenizerManager._create_tokenized_object(
-            self.tokenized_request_builder,
+        tokenized_obj = self.tokenized_request_builder.build(
             obj,
             input_text,
             input_ids,
@@ -602,130 +599,6 @@ class TokenizerManager(TokenizerControlMixin):
         tokenized_obj.time_stats = self.rid_to_state[obj.rid].time_stats
         self.rid_to_state[obj.rid].time_stats.set_tokenize_finish_time()
         return tokenized_obj
-
-    @staticmethod
-    def _create_tokenized_object(
-        self: "TokenizedRequestBuilder",
-        obj: Union[GenerateReqInput, EmbeddingReqInput],
-        input_text: str,
-        input_ids: List[int],
-        input_embeds: Optional[Union[List[float], None]] = None,
-        mm_inputs=None,
-        token_type_ids: Optional[List[int]] = None,
-    ) -> Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput]:
-        """Create a tokenized request object from common parameters."""
-        # Parse sampling parameters
-        # Note: if there are preferred sampling params, we use them if they are not
-        # explicitly passed in sampling_params
-        if self.config.preferred_sampling_params:
-            sampling_kwargs = {
-                **self.config.preferred_sampling_params,
-                **obj.sampling_params,
-            }
-        else:
-            sampling_kwargs = obj.sampling_params
-        sampling_params = self.config.sampling_params_class(**sampling_kwargs)
-        sampling_params.normalize(self.tokenizer)
-        sampling_params.verify(self.config.vocab_size)
-
-        # Build return object
-        if isinstance(obj, GenerateReqInput):
-            session_params = (
-                SessionParams(**obj.session_params) if obj.session_params else None
-            )
-
-            bootstrap_room = obj.bootstrap_room
-            if (
-                bootstrap_room is None
-                and self.config.disaggregation_transfer_backend == "fake"
-            ):
-                bootstrap_room = self.fake_bootstrap_room_counter
-                self.fake_bootstrap_room_counter += 1
-
-            tokenized_obj = TokenizedGenerateReqInput(
-                input_text,
-                input_ids,
-                mm_inputs,
-                sampling_params,
-                obj.return_logprob,
-                obj.logprob_start_len,
-                obj.top_logprobs_num,
-                obj.token_ids_logprob,
-                obj.stream,
-                rid=obj.rid,
-                http_worker_ipc=obj.http_worker_ipc,
-                bootstrap_host=obj.bootstrap_host,
-                bootstrap_port=obj.bootstrap_port,
-                bootstrap_room=bootstrap_room,
-                lora_id=obj.lora_id,
-                input_embeds=input_embeds,
-                positional_embed_overrides=obj.positional_embed_overrides,
-                session_params=session_params,
-                custom_logit_processor=obj.custom_logit_processor,
-                require_reasoning=obj.require_reasoning,
-                return_hidden_states=obj.return_hidden_states,
-                return_routed_experts=obj.return_routed_experts,
-                routed_experts_start_len=obj.routed_experts_start_len,
-                return_indexer_topk=obj.return_indexer_topk,
-                routed_dp_rank=obj.routed_dp_rank,
-                disagg_prefill_dp_rank=obj.disagg_prefill_dp_rank,
-                priority=obj.priority,
-                extra_key=obj.extra_key,
-                routing_key=obj.routing_key,
-                token_type_ids=token_type_ids,
-                need_wait_for_mm_inputs=obj.need_wait_for_mm_inputs,
-                num_items_assigned=obj.num_items_assigned,
-                multi_item_delimiter_indices=obj.multi_item_delimiter_indices,
-            )
-        elif isinstance(obj, EmbeddingReqInput):
-            # Resolve unresolved embed overrides now that input_ids are available
-            positional_embed_overrides = obj.positional_embed_overrides
-            if (
-                positional_embed_overrides is None
-                and obj.embed_overrides is not None
-                and obj.embed_override_token_id is not None
-            ):
-                positional_embed_overrides = self._resolve_embed_overrides(
-                    input_ids, obj.embed_override_token_id, obj.embed_overrides
-                )
-
-            tokenized_obj = TokenizedEmbeddingReqInput(
-                input_text,
-                input_ids,
-                mm_inputs,
-                token_type_ids,
-                sampling_params,
-                positional_embed_overrides=positional_embed_overrides,
-                rid=obj.rid,
-                priority=obj.priority,
-                dimensions=obj.dimensions,
-                lora_id=obj.lora_id,
-                http_worker_ipc=obj.http_worker_ipc,
-                return_pooled_hidden_states=obj.return_pooled_hidden_states,
-                multi_item_delimiter_indices=obj.multi_item_delimiter_indices,
-            )
-
-        return tokenized_obj
-
-    @staticmethod
-    def _resolve_embed_overrides(
-        input_ids: List[int],
-        token_id: int,
-        embeds: List[torch.Tensor],
-    ) -> PositionalEmbeds:
-        """Resolve placeholder positions in input_ids and create PositionalEmbeds.
-
-        Scans input_ids for occurrences of token_id and pairs them with the
-        provided embedding tensors.
-        """
-        positions = [idx for idx, tok in enumerate(input_ids) if tok == token_id]
-        if len(positions) != len(embeds):
-            raise ValueError(
-                f"input contains {len(positions)} occurrences of "
-                f"embed_override_token_id={token_id}, "
-                f"but embed_overrides has {len(embeds)} entries."
-            )
-        return PositionalEmbeds(embeds=embeds, positions=positions)
 
     async def _batch_tokenize_and_process(
         self, batch_size: int, obj: Union[GenerateReqInput, EmbeddingReqInput]
@@ -767,8 +640,7 @@ class TokenizerManager(TokenizerControlMixin):
             token_type_ids = (
                 token_type_ids_list[i] if token_type_ids_list is not None else None
             )
-            tokenized_obj = TokenizerManager._create_tokenized_object(
-                self.tokenized_request_builder,
+            tokenized_obj = self.tokenized_request_builder.build(
                 req,
                 req.text,
                 input_ids_list[i],
