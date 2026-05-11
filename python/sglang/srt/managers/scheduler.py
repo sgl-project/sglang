@@ -1293,9 +1293,18 @@ class Scheduler(
                 (AbortReq, self.abort_request),
                 (OpenSessionReqInput, self.open_session),
                 (CloseSessionReqInput, self.close_session),
-                (UpdateWeightFromDiskReqInput, self.update_weights_from_disk),
-                (InitWeightsUpdateGroupReqInput, self.init_weights_update_group),
-                (DestroyWeightsUpdateGroupReqInput, self.destroy_weights_update_group),
+                (
+                    UpdateWeightFromDiskReqInput,
+                    lambda req: self.update_weights_from_disk(req),
+                ),
+                (
+                    InitWeightsUpdateGroupReqInput,
+                    lambda req: self.init_weights_update_group(req),
+                ),
+                (
+                    DestroyWeightsUpdateGroupReqInput,
+                    lambda req: self.destroy_weights_update_group(req),
+                ),
                 (
                     InitWeightsSendGroupForRemoteInstanceReqInput,
                     self.init_weights_send_group_for_remote_instance,
@@ -1306,14 +1315,32 @@ class Scheduler(
                 ),
                 (
                     UpdateWeightsFromDistributedReqInput,
-                    self.update_weights_from_distributed,
+                    lambda req: self.update_weights_from_distributed(req),
                 ),
-                (UpdateWeightsFromTensorReqInput, self.update_weights_from_tensor),
-                (UpdateWeightsFromIPCReqInput, self.update_weights_from_ipc),
-                (GetWeightsByNameReqInput, self.get_weights_by_name),
-                (ReleaseMemoryOccupationReqInput, self.release_memory_occupation),
-                (ResumeMemoryOccupationReqInput, self.resume_memory_occupation),
-                (CheckWeightsReqInput, self.check_weights),
+                (
+                    UpdateWeightsFromTensorReqInput,
+                    lambda req: self.update_weights_from_tensor(req),
+                ),
+                (
+                    UpdateWeightsFromIPCReqInput,
+                    lambda req: self.update_weights_from_ipc(req),
+                ),
+                (
+                    GetWeightsByNameReqInput,
+                    lambda req: self.get_weights_by_name(req),
+                ),
+                (
+                    ReleaseMemoryOccupationReqInput,
+                    lambda req: self.release_memory_occupation(req),
+                ),
+                (
+                    ResumeMemoryOccupationReqInput,
+                    lambda req: self.resume_memory_occupation(req),
+                ),
+                (
+                    CheckWeightsReqInput,
+                    lambda req: self.check_weights(req),
+                ),
                 (SlowDownReqInput, self.slow_down),
                 (
                     ProfileReq,
