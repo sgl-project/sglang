@@ -543,7 +543,6 @@ def setup_state_kv_args(
     lives in one place.
     """
     from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
-    from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
     from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, NSATokenToKVPool
 
     if not hasattr(token_to_kv_pool, "get_state_buf_infos"):
@@ -560,12 +559,9 @@ def setup_state_kv_args(
     kv_args.state_data_lens = state_data_lens
     kv_args.state_item_lens = state_item_lens
 
-    # V4 must be checked before BaseSWAKVPool: V4's state pool is a flat
-    # heterogeneous list (SWA + compress + indexer), so the per-layer K/V
-    # transfer path used for "swa"/"nsa" does not apply.
-    if isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool):
-        kv_args.state_type = "dsv4"
-    elif isinstance(token_to_kv_pool, BaseSWAKVPool):
+    # DeepSeekV4TokenToKVPool inherits BaseSWAKVPool; its heterogeneous
+    # state list is described per-entry via get_state_buf_infos.
+    if isinstance(token_to_kv_pool, BaseSWAKVPool):
         kv_args.state_type = "swa"
     elif isinstance(token_to_kv_pool, HybridLinearKVPool):
         kv_args.state_type = "mamba"
