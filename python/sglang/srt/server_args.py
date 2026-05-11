@@ -305,6 +305,10 @@ def add_rl_on_policy_target_choices(choices):
     RL_ON_POLICY_TARGET_CHOICES.extend(choices)
 
 
+def add_linear_attn_kernel_backend_choices(choices):
+    LINEAR_ATTN_KERNEL_BACKEND_CHOICES.extend(choices)
+
+
 def _resolve_speculative_algorithm_alias(
     speculative_algorithm: Optional[str],
     speculative_draft_model_path: Optional[str],
