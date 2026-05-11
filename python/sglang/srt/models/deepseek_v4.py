@@ -812,7 +812,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             mixes = (d_out * rsqrt.unsqueeze(1)).unsqueeze(1)
         else:
             if _is_cpu and _cpu_amx:
-                return torch.ops.sgl_kernel.hc_pre_fused_cpu(
+                y, post, comb = torch.ops.sgl_kernel.hc_pre_fused_cpu(
                     x,
                     hc_fn,
                     hc_scale,
@@ -822,6 +822,7 @@ class DeepseekV4DecoderLayer(nn.Module):
                     self.rms_norm_eps,
                     self.hc_eps,
                 )
+                return y, post, comb, False
             else:
                 x_flat, mixes = hc_pre_torch_impl(x, hc_fn)
 
@@ -1021,6 +1022,10 @@ class DeepseekV4Model(nn.Module):
         hc_base: torch.Tensor,
     ):
         if x.numel() > 0:
+            if _is_cpu and _cpu_amx:
+                return torch.ops.sgl_kernel.hc_head_fused_cpu(
+                    x, hc_fn, hc_scale, hc_base, self.hc_eps, self.norm_eps
+                )
             from sglang.srt.layers.mhc_head import fused_hc_head
 
             return fused_hc_head(
