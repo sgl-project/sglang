@@ -172,6 +172,9 @@ from sglang.srt.managers.scheduler_components.dp_attn_adapter import (
 from sglang.srt.managers.scheduler_components.invariant_checker import (
     SchedulerInvariantChecker,
 )
+from sglang.srt.managers.scheduler_components.kv_events_publisher import (
+    SchedulerKvEventsPublisher,
+)
 from sglang.srt.managers.scheduler_components.pool_stats_observer import (
     SchedulerPoolStatsObserver,
 )
@@ -678,6 +681,19 @@ class Scheduler(
             ),
         )
 
+        self.kv_events_publisher = SchedulerKvEventsPublisher(
+            kv_events_config=self.server_args.kv_events_config,
+            attn_tp_rank=self.ps.attn_tp_rank,
+            attn_cp_rank=self.ps.attn_cp_rank,
+            attn_dp_rank=self.ps.attn_dp_rank,
+            dp_rank=self.ps.dp_rank,
+            tree_cache=self.tree_cache,
+            send_metrics_from_scheduler=self.send_metrics_from_scheduler,
+            max_running_requests=self.max_running_requests,
+            max_total_num_tokens=self.max_total_num_tokens,
+            get_stats=lambda: self.stats,
+        )
+
         self.is_initializing = False
 
     def init_model_config(self):
@@ -704,6 +720,7 @@ class Scheduler(
     def init_ipc_channels(self, port_args: PortArgs):
         context = zmq.Context(2)
         self.idle_sleeper = None
+        self.send_metrics_from_scheduler = None
 
         if (
             self.ps.pp_rank == 0
@@ -3067,7 +3084,7 @@ class Scheduler(
         self._maybe_log_idle_metrics()
 
         # kv event publishing
-        self.publish_kv_events()
+        self.publish_kv_events(self.kv_events_publisher)
 
         # reset token ratio
         self.new_token_ratio = self.init_new_token_ratio
