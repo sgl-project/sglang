@@ -703,18 +703,13 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
 
     @classmethod
     def hidden_size_for(cls, worker: "EAGLEWorker") -> int:
-        """Wire-format hidden_size for `hidden_states` in the decode phase.
-
-        Decode-phase canonical: draft self-chain output. Each draft step
-        writes its own last hidden back via `capture_for_decode`, so the
-        producer is the draft model itself. Use this for idle placeholders
-        and cuda graph static buffers in the decode path.
-        """
+        """Decode-phase `hidden_states` width: draft self-chain output
+        (draft model writes its own last hidden back via `capture_for_decode`
+        and the draft loop)."""
         return worker.draft_model_runner.model_config.spec_hidden_size
 
     @classmethod
     def dtype_for(cls, worker: "EAGLEWorker") -> torch.dtype:
-        """Wire-format dtype for `hidden_states` in the decode phase."""
         return worker.draft_model_runner.model_config.dtype
 
     @classmethod
@@ -841,14 +836,10 @@ class EagleDraftExtendInput(SpecInput):
 
     @classmethod
     def hidden_size_for(cls, worker: "EAGLEWorker") -> int:
-        """Wire-format hidden_size for `hidden_states` in the extend phase.
-
-        Extend-phase canonical: target verify output (EAGLE paper's "feature").
-        Widened to `target.hidden_size * 3` for EAGLE-3 aux mode, which fuses
-        low/mid/high-level target features into a 3k-dimensional vector
-        before the draft's FC reduces it back to k. Use this for idle
-        placeholders and cuda graph static buffers in the extend path.
-        """
+        """Extend-phase `hidden_states` width: target verify output (EAGLE
+        paper's "feature"). Widened to `target.hidden_size * 3` for EAGLE-3
+        aux mode (low/mid/high features fused into a 3k-dim vector, reduced
+        by draft's FC)."""
         target_cfg = worker.target_worker.model_runner.model_config
         if (
             worker.speculative_algorithm.is_eagle3()
@@ -859,7 +850,6 @@ class EagleDraftExtendInput(SpecInput):
 
     @classmethod
     def dtype_for(cls, worker: "EAGLEWorker") -> torch.dtype:
-        """Wire-format dtype for `hidden_states` in the extend phase."""
         return worker.target_worker.model_runner.model_config.dtype
 
     @classmethod
