@@ -6,8 +6,6 @@ with FP8 quantized Q and KV tensors.
 
 from __future__ import annotations
 
-import importlib.util
-import pathlib
 from typing import TYPE_CHECKING, Optional
 
 import torch
@@ -21,77 +19,15 @@ if TYPE_CHECKING:
 
 
 # ---------------------------------------------------------------------------
-# Helpers for CUTLASS include resolution (shared pattern with nvfp4.py)
+# Build flags
 # ---------------------------------------------------------------------------
 
 
-def _find_package_root(package: str) -> Optional[pathlib.Path]:
-    spec = importlib.util.find_spec(package)
-    if spec is None or spec.origin is None:
-        return None
-    return pathlib.Path(spec.origin).resolve().parent
-
-
-def _resolve_cutlass_include_paths() -> list[str]:
-    include_paths: list[str] = []
-
-    # Prefer FlashMLA's bundled CUTLASS (vendored inside sgl-kernel build deps)
-    # over flashinfer/deep_gemm's CUTLASS. The Q8KV8 kernel was developed
-    # against FlashMLA's CUTLASS version; mismatch between flashinfer's 2025
-    # CUTLASS and FlashMLA's 2026 CUTLASS produces correct LSE/max_logits but
-    # catastrophically wrong P*V output (~1e30 vs correct ~1e-3). Using the
-    # same CUTLASS as the upstream prebuilt kernel resolves this.
-    _here = pathlib.Path(__file__).resolve().parent.parent.parent.parent
-    flashmla_cutlass_candidates = [
-        # When sgl-kernel has been built (sibling dir)
-        _here.parent
-        / "sgl-kernel"
-        / "build"
-        / "_deps"
-        / "repo-flashmla-src"
-        / "csrc"
-        / "cutlass",
-    ]
-    for base in flashmla_cutlass_candidates:
-        inc = base / "include"
-        tu_inc = base / "tools" / "util" / "include"
-        if inc.exists():
-            include_paths.append(str(inc))
-            if tu_inc.exists():
-                include_paths.append(str(tu_inc))
-            break
-
-    flashinfer_root = _find_package_root("flashinfer")
-    if flashinfer_root is not None:
-        candidates = [
-            flashinfer_root / "data" / "cutlass" / "include",
-            flashinfer_root / "data" / "cutlass" / "tools" / "util" / "include",
-        ]
-        for path in candidates:
-            if path.exists():
-                include_paths.append(str(path))
-
-    deep_gemm_root = _find_package_root("deep_gemm")
-    if deep_gemm_root is not None:
-        candidate = deep_gemm_root / "include"
-        if candidate.exists():
-            include_paths.append(str(candidate))
-
-    # De-duplicate while preserving order.
-    seen: set[str] = set()
-    unique: list[str] = []
-    for p in include_paths:
-        if p not in seen:
-            seen.add(p)
-            unique.append(p)
-    return unique
-
-
 def _q8kv8_cuda_flags() -> list[str]:
-    # These flags must match the prebuilt FlashMLA setup.py nvcc flags.
-    # Missing `-U__CUDA_NO_BFLOAT16_CONVERSIONS__` (and the other -U flags)
-    # causes the kernel to miscompile: attention output (P*V writeback)
-    # becomes garbage while LSE/max_logits are still correct.
+    # The `-U` flags below are required: without them the kernel miscompiles,
+    # producing correct LSE/max_logits but garbage attention output (P*V
+    # writeback). Other flags mirror the prebuilt FlashMLA setup.py nvcc
+    # flags.
     return [
         "-O3",
         "-lineinfo",
@@ -116,13 +52,6 @@ def _q8kv8_cuda_flags() -> list[str]:
 
 @cache_once
 def _jit_sparse_mla_q8kv8_prefill_module() -> Module:
-    extra_include_paths = _resolve_cutlass_include_paths()
-    if not extra_include_paths:
-        raise RuntimeError(
-            "Cannot find CUTLASS headers required for Q8KV8 FlashMLA JIT kernel. "
-            "Please install flashinfer or deep_gemm with CUTLASS headers."
-        )
-
     with override_jit_cuda_arch(9, 0, "a"):
         return load_jit(
             "sparse_mla_q8kv8_prefill_sm90",
@@ -133,8 +62,8 @@ def _jit_sparse_mla_q8kv8_prefill_module() -> Module:
                 ("dispatch", "sparse_prefill_q8kv8_dispatch"),
                 ("dispatch_full", "sparse_prefill_q8kv8_dispatch_full"),
             ],
-            extra_include_paths=extra_include_paths,
             extra_cuda_cflags=_q8kv8_cuda_flags(),
+            extra_dependencies=["cutlass"],
         )
 
 
