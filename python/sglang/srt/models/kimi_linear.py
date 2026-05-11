@@ -13,6 +13,7 @@ from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
 )
+from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers.attention.fla.fused_norm_gate import FusedRMSNormGated
 from sglang.srt.layers.dp_attention import get_attention_tp_rank, get_attention_tp_size
@@ -532,6 +533,12 @@ class KimiLinearModel(nn.Module):
             self.embed_tokens = PPMissingLayer()
 
         self.alt_stream = torch.cuda.Stream() if _is_cuda else None
+        # ROCm dual-stream is opt-in via SGLANG_ROCM_USE_MULTI_STREAM
+        # (default off on AMD), matching the deepseek_v2.DeepseekV2Model
+        # gating from PR #24005. Skip when alt_stream was already created
+        # to preserve original behavior on other backends.
+        if self.alt_stream is None and envs.SGLANG_ROCM_USE_MULTI_STREAM.get():
+            self.alt_stream = torch.cuda.Stream()
 
         self.layers, self.start_layer, self.end_layer = make_layers(
             config.num_hidden_layers,
