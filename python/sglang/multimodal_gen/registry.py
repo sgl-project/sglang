@@ -104,9 +104,7 @@ from sglang.multimodal_gen.configs.sample.hunyuan import (
     HunyuanSamplingParams,
 )
 from sglang.multimodal_gen.configs.sample.hunyuan3d import Hunyuan3DSamplingParams
-from sglang.multimodal_gen.configs.sample.joy_image import (
-    JoyImageEditSamplingParams,
-)
+from sglang.multimodal_gen.configs.sample.joy_image import JoyImageEditSamplingParams
 from sglang.multimodal_gen.configs.sample.ltx_2 import (
     LTX2SamplingParams,
     LTX23HQSamplingParams,
@@ -959,9 +957,7 @@ def _register_configs():
     register_configs(
         sampling_param_cls=Cosmos3SamplingParams,
         pipeline_config_cls=Cosmos3Config,
-        model_detectors=[
-            lambda hf_id: "cosmos3omnidiffuserspipeline" in hf_id.lower()
-        ],
+        model_detectors=[lambda hf_id: "cosmos3omnidiffuserspipeline" in hf_id.lower()],
     )
 
     # SANA

@@ -46,7 +46,9 @@ from sglang.srt.utils.common import get_compiler_backend
 logger = init_logger(__name__)
 
 COSMOS3_DEFAULT_NEGATIVE_PROMPT = ""
-COSMOS3_DURATION_TEMPLATE = "The video is {duration:.1f} seconds long and is of {fps} FPS."
+COSMOS3_DURATION_TEMPLATE = (
+    "The video is {duration:.1f} seconds long and is of {fps} FPS."
+)
 COSMOS3_VIDEO_SYSTEM_PROMPT = (
     "You are a helpful assistant who will generate videos from a given prompt."
 )
@@ -130,10 +132,12 @@ class Cosmos3TokenizationStage(PipelineStage):
         """
         conversations = []
         if use_system_prompt:
-            conversations.append({
-                "role": "system",
-                "content": system_prompt or COSMOS3_VIDEO_SYSTEM_PROMPT,
-            })
+            conversations.append(
+                {
+                    "role": "system",
+                    "content": system_prompt or COSMOS3_VIDEO_SYSTEM_PROMPT,
+                }
+            )
         conversations.append({"role": "user", "content": text})
 
         result = self.tokenizer.apply_chat_template(
@@ -151,7 +155,9 @@ class Cosmos3TokenizationStage(PipelineStage):
             # Already a list from slow tokenizer
             token_ids = list(result)
         else:
-            raise TypeError(f"Unexpected return type from apply_chat_template: {type(result)}")
+            raise TypeError(
+                f"Unexpected return type from apply_chat_template: {type(result)}"
+            )
 
         # Reserve room for the two special tokens (EOS + vision_start) so the
         # final length cannot exceed ``max_sequence_length``.
@@ -294,8 +300,7 @@ class Cosmos3LatentPreparationStage(PipelineStage):
         noise = torch.randn(shape, generator=generator, device=device, dtype=dtype)
 
         is_i2v = (
-            batch.preprocessed_image is not None
-            and batch.data_type == DataType.VIDEO
+            batch.preprocessed_image is not None and batch.data_type == DataType.VIDEO
         )
 
         if is_i2v:
@@ -407,7 +412,9 @@ class Cosmos3DenoisingStage(PipelineStage):
         on that path. The headline 2-GPU CFG-parallel recipe (``sp_size == 1``)
         skips the SP branch entirely and compiles cleanly.
         """
-        if not server_args.enable_torch_compile or not isinstance(transformer, nn.Module):
+        if not server_args.enable_torch_compile or not isinstance(
+            transformer, nn.Module
+        ):
             return
 
         if current_platform.is_npu():
@@ -506,9 +513,7 @@ class Cosmos3DenoisingStage(PipelineStage):
             self.transformer.to(device)
 
     @staticmethod
-    def _cfg_active_at(
-        t: torch.Tensor, interval: tuple[float, float] | None
-    ) -> bool:
+    def _cfg_active_at(t: torch.Tensor, interval: tuple[float, float] | None) -> bool:
         """Return True iff CFG should be applied at timestep ``t``.
 
         T2I uses a CFG window (e.g. ``[400, 1000]``) to skip guidance at low
@@ -543,7 +548,9 @@ class Cosmos3DenoisingStage(PipelineStage):
 
         enable_cfg_parallel = server_args.enable_cfg_parallel and do_cfg
         cfg_rank = get_classifier_free_guidance_rank() if enable_cfg_parallel else 0
-        cfg_world_size = get_classifier_free_guidance_world_size() if enable_cfg_parallel else 1
+        cfg_world_size = (
+            get_classifier_free_guidance_world_size() if enable_cfg_parallel else 1
+        )
 
         sp_size = get_sp_world_size()
         sp_rank = get_sp_parallel_rank() if sp_size > 1 else 0
@@ -557,7 +564,9 @@ class Cosmos3DenoisingStage(PipelineStage):
                     f"sp_size={sp_size}, sp_rank={sp_rank}"
                 )
             elif enable_cfg_parallel:
-                self.log_info(f"CFG parallel enabled: cfg_size={cfg_world_size}, cfg_rank={cfg_rank}")
+                self.log_info(
+                    f"CFG parallel enabled: cfg_size={cfg_world_size}, cfg_rank={cfg_rank}"
+                )
             elif ulysses_enabled:
                 self.log_info(f"Ulysses enabled: sp_size={sp_size}, sp_rank={sp_rank}")
 
@@ -769,12 +778,14 @@ class Cosmos3DecodingStage(PipelineStage):
         self._guardrails = guardrails
         # Use VideoProcessor for postprocessing (same as other video pipelines)
         from diffusers.video_processor import VideoProcessor
+
         vae_scale_factor = getattr(vae.config, "scale_factor_spatial", 16)
         self.video_processor = VideoProcessor(vae_scale_factor=vae_scale_factor)
         if guardrails:
             from sglang.multimodal_gen.runtime.pipelines_core.stages.cosmos3_guardrails import (
                 _init_guardrails,
             )
+
             _init_guardrails()
 
     def verify_input(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
@@ -790,7 +801,9 @@ class Cosmos3DecodingStage(PipelineStage):
         latents = latents.to(vae_dtype)
 
         # Apply latent normalization if configured
-        if hasattr(self.vae.config, "latents_mean") and hasattr(self.vae.config, "latents_std"):
+        if hasattr(self.vae.config, "latents_mean") and hasattr(
+            self.vae.config, "latents_std"
+        ):
             if self._latents_mean is None:
                 self._latents_mean = (
                     torch.tensor(self.vae.config.latents_mean)
@@ -810,7 +823,7 @@ class Cosmos3DecodingStage(PipelineStage):
         # Decode - returns [B, C, T, H, W]
         video = self.vae.decode(latents)
         # Handle both dict return and direct tensor return
-        if hasattr(video, 'sample'):
+        if hasattr(video, "sample"):
             video = video.sample
         elif isinstance(video, tuple):
             video = video[0]
@@ -819,11 +832,15 @@ class Cosmos3DecodingStage(PipelineStage):
 
     def forward(self, batch: Req, server_args: ServerArgs):
         """Decode latents to video, or to a single image for T2I."""
-        from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
+        from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import (
+            OutputBatch,
+        )
 
         is_image_gen = batch.data_type == DataType.IMAGE
         self.log_info(
-            "Decoding latents to image..." if is_image_gen else "Decoding latents to video..."
+            "Decoding latents to image..."
+            if is_image_gen
+            else "Decoding latents to video..."
         )
 
         device = batch.latents.device
@@ -839,7 +856,9 @@ class Cosmos3DecodingStage(PipelineStage):
         self.log_info(f"Decoded tensor shape: {decoded.shape}")
 
         if is_image_gen:
-            output = self.video_processor.postprocess(decoded.squeeze(2), output_type="np")
+            output = self.video_processor.postprocess(
+                decoded.squeeze(2), output_type="np"
+            )
         else:
             output = self.video_processor.postprocess_video(decoded, output_type="np")
             self.log_info(f"Postprocessed video shape: {output.shape}")
@@ -848,6 +867,7 @@ class Cosmos3DecodingStage(PipelineStage):
             from sglang.multimodal_gen.runtime.pipelines_core.stages.cosmos3_guardrails import (
                 check_video_safety,
             )
+
             if is_image_gen:
                 # check_video_safety expects [B, T, H, W, C]; wrap then unwrap.
                 output = check_video_safety(output[:, np.newaxis, ...])[:, 0, ...]
