@@ -280,21 +280,27 @@ class NixlKVManager(CommonKVManager):
         self.kv_buffer_tensors = None
 
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
-            # NOTE(staging-async-merge): staging context is initialized
-            # before workers spawn so a future per-worker staging buffer
-            # layout can simply read from self._staging_ctx.buffers[i].
-            # Today _init_staging_prefill_ctx() still creates a single
-            # staging buffer; per-worker fan-out is the next step.
-            if self.enable_staging:
-                self._init_staging_prefill_ctx()
             transfer_queue_size = envs.SGLANG_DISAGGREGATION_QUEUE_SIZE.get()
             self.transfer_queues: List[FastQueue] = [
                 FastQueue() for _ in range(transfer_queue_size)
             ]
             self.exceptions: Dict[int, Exception] = {}
-            for queue in self.transfer_queues:
+            # Mirror mooncake: one staging buffer per worker queue, all
+            # built before workers spawn so each worker owns a private
+            # buffer (no cross-worker contention on the staging ring).
+            if self.enable_staging:
+                self._init_staging_prefill_ctx()
+                self._init_staging_buffers(len(self.transfer_queues))
+            for i, queue in enumerate(self.transfer_queues):
+                staging_buffer = (
+                    self._staging_ctx.buffers[i]
+                    if self.enable_staging and self._staging_ctx.buffers
+                    else None
+                )
                 threading.Thread(
-                    target=self.transfer_worker, args=(queue,), daemon=True
+                    target=self.transfer_worker,
+                    args=(queue, staging_buffer),
+                    daemon=True,
                 ).start()
             self._start_bootstrap_thread()
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
@@ -361,17 +367,15 @@ class NixlKVManager(CommonKVManager):
             )
 
     def set_kv_buffer_tensors(self, k_buffers: list, v_buffers: list, page_size: int):
+        # NOTE: matches mooncake behavior -- staging buffers are now
+        # created in __init__ (per-worker), independent of the kv
+        # tensors. This setter only stashes the tensor metadata used by
+        # send_kvcache_staged().
         self.kv_buffer_tensors = {
             "k_buffers": k_buffers,
             "v_buffers": v_buffers,
             "page_size": page_size,
         }
-        if (
-            self.enable_staging
-            and self.disaggregation_mode == DisaggregationMode.PREFILL
-            and not self._staging_ctx.buffers
-        ):
-            self._init_staging_buffers(1)
 
     def register_staging_room_bootstrap(self, room, bootstrap_infos, receiver):
         self._staging_ctx.room_bootstrap[room] = bootstrap_infos
@@ -565,7 +569,12 @@ class NixlKVManager(CommonKVManager):
     def check_status(self, bootstrap_room: int):
         return self.request_status.get(bootstrap_room, KVPoll.WaitingForInput)
 
-    def transfer_worker(self, queue: FastQueue):
+    def transfer_worker(self, queue: FastQueue, staging_buffer=None):
+        # Per-worker staging strategy: lazy-created on first chunk so we
+        # see kv_buffer_tensors (set by ModelRunner after engine init).
+        # Never cache on self -- multiple workers would race the ring.
+        staging_strategy = None
+
         while True:
             kv_chunk: TransferKVChunk = queue.get()
             room = kv_chunk.room
@@ -575,10 +584,27 @@ class NixlKVManager(CommonKVManager):
 
                 assert room in self.transfer_infos
 
+                # Lazily build a per-worker staging strategy bound to this
+                # worker's private staging buffer (matches mooncake).
+                if (
+                    self.enable_staging
+                    and staging_strategy is None
+                    and staging_buffer is not None
+                ):
+                    staging_strategy = self._try_create_staging_strategy(
+                        staging_buffer
+                    )
+
                 self.update_status(room, KVPoll.Transferring)
 
                 reqs_to_be_processed = list(self.transfer_infos[room].values())
                 handles: List = []
+
+                # Set when staging allocation/watermark is not yet ready and
+                # the chunk has been re-enqueued. We then break out of the
+                # per-req loop and `continue` the worker main loop without
+                # touching room status -- the next pop will retry.
+                staging_deferred = False
 
                 for req in reqs_to_be_processed:
                     assert room == req.room
@@ -586,9 +612,8 @@ class NixlKVManager(CommonKVManager):
                         continue
 
                     assert req.agent_name in self.decode_kv_args_table
-                    decode_tp_size = self.decode_kv_args_table[
-                        req.agent_name
-                    ].decode_tp_size
+                    dst_info = self.decode_kv_args_table[req.agent_name]
+                    decode_tp_size = dst_info.decode_tp_size
 
                     # Skip KV RDMA transfer when there are no pages to send
                     # (e.g., decode-side radix cache matched the entire prefix).
@@ -608,40 +633,74 @@ class NixlKVManager(CommonKVManager):
                                 : len(chunked_dst_kv_indice)
                             ]
 
-                        notif = f"{req.room}_kv_{kv_chunk.chunk_id}_{int(kv_chunk.is_last)}_{self.kv_args.engine_rank}"
+                        # Decide which kv send path to use:
+                        #   1. Staging (heterogeneous TP, both sides have
+                        #      registered staging, watermark/alloc ready)
+                        #   2. send_kvcache (MLA or homogeneous TP)
+                        #   3. send_kvcache_slice (heterogeneous TP fallback,
+                        #      or staging hard-failed for this chunk)
+                        use_staging = (
+                            self.enable_staging
+                            and staging_strategy is not None
+                            and not self.is_mla_backend
+                            and decode_tp_size != self.attn_tp_size
+                            and dst_info.staging is not None
+                        )
 
-                        if self.is_mla_backend or (decode_tp_size == self.attn_tp_size):
-                            kv_xfer_handle = self.send_kvcache(
-                                req.agent_name,
-                                kv_chunk.prefill_kv_indices,
-                                self.decode_kv_args_table[req.agent_name].dst_kv_ptrs,
-                                chunked_dst_kv_indice,
-                                self.decode_kv_args_table[req.agent_name].gpu_id,
-                                notif,
+                        kv_xfer_handle = None
+                        if use_staging:
+                            kv_xfer_handle, deferred = self._do_staging_transfer(
+                                staging_strategy,
+                                kv_chunk,
+                                req,
+                                dst_info,
+                                queue,
                             )
-                        else:
-                            kv_xfer_handle = self.send_kvcache_slice(
-                                req.agent_name,
-                                kv_chunk.prefill_kv_indices,
-                                self.decode_kv_args_table[req.agent_name].dst_kv_ptrs,
-                                chunked_dst_kv_indice,
-                                self.decode_kv_args_table[req.agent_name].gpu_id,
-                                notif,
-                                prefill_tp_size=self.attn_tp_size,
-                                decode_tp_size=decode_tp_size,
-                                decode_tp_rank=self.decode_kv_args_table[
-                                    req.agent_name
-                                ].decode_tp_rank,
-                                dst_kv_item_len=self.decode_kv_args_table[
-                                    req.agent_name
-                                ].dst_kv_item_len,
+                            if deferred:
+                                # Chunk re-enqueued; stop processing remaining
+                                # reqs for this chunk and let the worker loop
+                                # pick it up again on the next pop.
+                                staging_deferred = True
+                                break
+                            # kv_xfer_handle is None here means staging
+                            # send_kvcache_staged() returned None (e.g.
+                            # decode buffer too small) -- fall through to
+                            # the slice path below.
+
+                        if kv_xfer_handle is None:
+                            notif = (
+                                f"{req.room}_kv_{kv_chunk.chunk_id}"
+                                f"_{int(kv_chunk.is_last)}_{self.kv_args.engine_rank}"
                             )
+                            if self.is_mla_backend or (
+                                decode_tp_size == self.attn_tp_size
+                            ):
+                                kv_xfer_handle = self.send_kvcache(
+                                    req.agent_name,
+                                    kv_chunk.prefill_kv_indices,
+                                    dst_info.dst_kv_ptrs,
+                                    chunked_dst_kv_indice,
+                                    dst_info.gpu_id,
+                                    notif,
+                                )
+                            else:
+                                kv_xfer_handle = self.send_kvcache_slice(
+                                    req.agent_name,
+                                    kv_chunk.prefill_kv_indices,
+                                    dst_info.dst_kv_ptrs,
+                                    chunked_dst_kv_indice,
+                                    dst_info.gpu_id,
+                                    notif,
+                                    prefill_tp_size=self.attn_tp_size,
+                                    decode_tp_size=decode_tp_size,
+                                    decode_tp_rank=dst_info.decode_tp_rank,
+                                    dst_kv_item_len=dst_info.dst_kv_item_len,
+                                )
 
                         handles.append(kv_xfer_handle)
 
                     if kv_chunk.is_last:
                         if kv_chunk.state_indices is not None:
-                            dst_info = self.decode_kv_args_table[req.agent_name]
                             state_xfer_handle = self.maybe_send_extra(
                                 req.agent_name,
                                 kv_chunk.state_indices,
@@ -671,11 +730,15 @@ class NixlKVManager(CommonKVManager):
                         aux_xfer_handle = self.send_aux(
                             req.agent_name,
                             kv_chunk.prefill_aux_index,
-                            self.decode_kv_args_table[req.agent_name].dst_aux_ptrs,
+                            dst_info.dst_aux_ptrs,
                             req.dst_aux_index,
                             aux_notif,
                         )
                         handles.append(aux_xfer_handle)
+
+                if staging_deferred:
+                    # Chunk has been re-enqueued; do not advance status.
+                    continue
 
                 while handles:
                     states = [self.agent.check_xfer_state(h) for h in handles]
@@ -1131,45 +1194,75 @@ class NixlKVManager(CommonKVManager):
             raise RuntimeError("[Staging] NIXL bulk transfer failed to post")
         return xfer_handle
 
-    def _get_staging_strategy(self, staging_buffer):
-        """Lazily create or return cached PrefillStagingStrategy."""
-        if not hasattr(self, "_staging_strategy") or self._staging_strategy is None:
-            from sglang.srt.disaggregation.common.staging_handler import (
-                PrefillStagingStrategy,
-            )
+    def _try_create_staging_strategy(self, staging_buffer):
+        """Create a per-worker PrefillStagingStrategy bound to ``staging_buffer``.
 
-            self._staging_strategy = PrefillStagingStrategy(self, staging_buffer)
-        return self._staging_strategy
+        Returns ``None`` if staging is disabled or kv tensors not yet set.
+        Caller is expected to keep the returned strategy as a worker-local
+        variable; never cache on ``self`` (multiple workers would race on
+        the underlying staging ring buffer).
+        """
+        if not self.enable_staging or self.kv_buffer_tensors is None:
+            return None
+        from sglang.srt.disaggregation.common.staging_handler import (
+            PrefillStagingStrategy,
+        )
+
+        return PrefillStagingStrategy(self, staging_buffer)
 
     def _do_staging_transfer(
         self,
-        req,
-        kv_indices: npt.NDArray[np.int32],
-        index_slice: slice,
-        chunk_id: int,
-        is_last: bool,
-        dst_info: KVArgsRegisterInfo,
-        staging_buffer,
+        staging_strategy,
+        kv_chunk: "TransferKVChunk",
+        req: "TransferInfo",
+        dst_info: "KVArgsRegisterInfo",
+        queue: FastQueue,
     ):
-        """Attempt staging transfer for one request. Returns xfer_handle or None on fallback."""
-        strategy = self._get_staging_strategy(staging_buffer)
-        page_start = index_slice.start
-        num_pages = len(kv_indices)
+        """Attempt staging transfer for one chunk. Returns (xfer_handle, deferred).
 
-        ready, chunk_idx, c_offset, _, _ = strategy.check_ready(
+        Mirrors mooncake._do_staging_transfer semantics:
+          - staging not ready (watermark/alloc pending) -> ``queue.put(kv_chunk)``
+            re-enqueue the chunk and return ``(None, True)``. Caller should
+            ``break`` out of the per-req loop and ``continue`` the worker
+            main loop without updating room status -- the chunk will be
+            retried on the next pop.
+          - oversized chunk (will never fit) -> raise RuntimeError.
+          - staging successfully posted -> return ``(handle, False)``. The
+            caller appends the handle to the per-chunk handle list and
+            busy-polls it to DONE alongside other handles.
+          - send_kvcache_staged returned None (decode buffer too small,
+            kv_buffer_tensors missing, etc.) -> return ``(None, False)``,
+            signalling the caller to fall back to send_kvcache_slice.
+        """
+        page_start = kv_chunk.index_slice.start
+        num_pages = len(kv_chunk.prefill_kv_indices)
+
+        ready, chunk_idx, c_offset, _, _ = staging_strategy.check_ready(
             req, page_start, num_pages, session_id=req.agent_name
         )
         if not ready:
-            return None
+            from sglang.srt.disaggregation.common.staging_buffer import (
+                StagingAllocator,
+            )
+
+            if c_offset == StagingAllocator.ALLOC_OVERSIZED:
+                raise RuntimeError(
+                    f"[Staging] Chunk staging allocation permanently failed: "
+                    f"chunk exceeds ring buffer total size "
+                    f"(room={kv_chunk.room}). Increase "
+                    f"SGLANG_DISAGG_STAGING_POOL_SIZE_MB."
+                )
+            queue.put(kv_chunk)
+            return (None, True)
 
         notif_tag = (
-            f"{req.room}_stg_{chunk_id}_{int(is_last)}"
+            f"{req.room}_stg_{kv_chunk.chunk_id}_{int(kv_chunk.is_last)}"
             f"_{self.kv_args.engine_rank}_{chunk_idx}"
             f"_{page_start}_{num_pages}_{req.agent_name}"
         )
-        return self.send_kvcache_staged(
+        handle = self.send_kvcache_staged(
             req.agent_name,
-            kv_indices,
+            kv_chunk.prefill_kv_indices,
             dst_info.staging.base_ptr + c_offset,
             dst_info.staging.total_size - c_offset,
             dst_info.gpu_id,
@@ -1177,8 +1270,9 @@ class NixlKVManager(CommonKVManager):
             dst_info.decode_tp_size,
             dst_info.dst_kv_item_len,
             notif_tag,
-            staging_buffer=staging_buffer,
+            staging_buffer=staging_strategy.staging_buffer,
         )
+        return (handle, False)
 
     def send_aux(
         self,
@@ -1430,73 +1524,6 @@ class NixlKVManager(CommonKVManager):
                 )
             return None
 
-    def _dispatch_kv_transfer(
-        self,
-        req: "TransferInfo",
-        kv_indices: npt.NDArray[np.int32],
-        chunked_dst_kv_indice: npt.NDArray[np.int32],
-        index_slice: slice,
-        chunk_id: int,
-        is_last: bool,
-        notif: str,
-    ):
-        """Pick the right kv send path (staging | full | slice) and return its xfer_handle.
-
-        Order of preference:
-          1. Staging buffer (heterogeneous TP, requires registered staging on both sides).
-             Falls back to ``send_kvcache_slice`` if staging is not actually ready
-             (allocation pending, watermark not ready, buffer too small, etc.).
-          2. ``send_kvcache`` (full-pool copy) for MLA or homogeneous TP.
-          3. ``send_kvcache_slice`` (per-head slice) for heterogeneous TP without staging.
-        """
-        dst_info = self.decode_kv_args_table[req.agent_name]
-        decode_tp_size = dst_info.decode_tp_size
-
-        use_staging = (
-            self.enable_staging
-            and not self.is_mla_backend
-            and decode_tp_size != self.attn_tp_size
-            and dst_info.staging is not None
-            and self.kv_buffer_tensors is not None
-            and self._staging_ctx.buffers
-        )
-        if use_staging:
-            xfer_handle = self._do_staging_transfer(
-                req,
-                kv_indices,
-                index_slice,
-                chunk_id,
-                is_last,
-                dst_info,
-                self._staging_ctx.buffers[0],
-            )
-            if xfer_handle is not None:
-                return xfer_handle
-            # Staging not ready (e.g. watermark/alloc pending) — fall through to slice path.
-
-        if self.is_mla_backend or decode_tp_size == self.attn_tp_size:
-            return self.send_kvcache(
-                req.agent_name,
-                kv_indices,
-                dst_info.dst_kv_ptrs,
-                chunked_dst_kv_indice,
-                dst_info.gpu_id,
-                notif,
-            )
-
-        return self.send_kvcache_slice(
-            req.agent_name,
-            kv_indices,
-            dst_info.dst_kv_ptrs,
-            chunked_dst_kv_indice,
-            dst_info.gpu_id,
-            notif,
-            prefill_tp_size=self.attn_tp_size,
-            decode_tp_size=decode_tp_size,
-            decode_tp_rank=dst_info.decode_tp_rank,
-            dst_kv_item_len=dst_info.dst_kv_item_len,
-        )
-
     def add_transfer_request(
         self,
         bootstrap_room: int,
@@ -1517,15 +1544,12 @@ class NixlKVManager(CommonKVManager):
         if self.enable_staging:
             self._prefetch_staging_reqs(bootstrap_room)
 
-        # NOTE(staging-async-merge): #23967 made transfer asynchronous --
-        # add_transfer_request only enqueues now and returns None. The
-        # worker thread (transfer_worker) does the actual send.
-        # The staging dispatch (self._dispatch_kv_transfer / staging
-        # send_kvcache_staged path) currently lives only in this method
-        # in the pre-merge branch; it must be moved into transfer_worker
-        # in the next step. Until then, enabling SGLANG_DISAGG_STAGING_BUFFER
-        # has no effect on NIXL: workers will run the plain
-        # send_kvcache / send_kvcache_slice path inherited from main.
+        # Transfer is async: just enqueue the chunk; the per-queue worker
+        # (transfer_worker) does the actual gather + RDMA. Routing by
+        # ``room % N`` keeps every chunk of a given room on the same
+        # worker -- and therefore on the same private staging buffer --
+        # which is required for the staging ring's offset/watermark
+        # state machine to advance correctly.
         shard_idx = bootstrap_room % len(self.transfer_queues)
         self.transfer_queues[shard_idx].put(
             TransferKVChunk(
