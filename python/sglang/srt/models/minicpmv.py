@@ -61,8 +61,13 @@ from sglang.srt.model_loader.utils import set_default_torch_dtype
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.idefics2 import Idefics2VisionTransformer
 from sglang.srt.models.llama import LlamaConfig, LlamaForCausalLM
+from sglang.srt.models.minicpmv_vit import (
+    MiniCPMV_Merger,
+    MiniCPMV_VisionTransformer,
+)
 from sglang.srt.models.qwen2 import Qwen2Config, Qwen2ForCausalLM
 from sglang.srt.models.qwen3 import Qwen3Config, Qwen3ForCausalLM
+from sglang.srt.models.qwen3_5 import Qwen3_5ForCausalLM
 from sglang.srt.utils import add_prefix, flatten_nested_list
 
 RawImageType = Union[Image.Image, torch.Tensor]
@@ -576,6 +581,10 @@ class Resampler4_5(BaseResampler):
 
 
 def get_version_by_config(config: PretrainedConfig) -> Tuple[int, ...]:
+    # 4.6 ships its own ``model_type`` instead of a numeric ``version``.
+    if getattr(config, "model_type", None) == "minicpmv4_6":
+        return 4, 6
+
     version_float = getattr(config, "version", None)
 
     # The old configs do not include version number
@@ -1342,7 +1351,277 @@ class MiniCPMV4_5(MiniCPMBaseModel):
         return self
 
 
-_SUPPORT_VERSION = {(2, 6): MiniCPMV2_6, (4, 0): MiniCPMV4_0, (4, 5): MiniCPMV4_5}
+class MiniCPMV4_6(MiniCPMBaseModel):
+    """MiniCPM-V 4.6.
+
+    Differences vs 4.5:
+      * mid-ViT compression (``MiniCPMV_VisionTransformer`` fires a 2x2 window
+        attention + 2x2 fold at ``config.insert_layer_id``);
+      * post-encoder connector is a pure MLP chain (``MiniCPMV_Merger``),
+        not a Perceiver resampler;
+      * LLM backbone is Qwen3.5;
+      * ``config.downsample_mode`` toggles ``"16x"`` (mid-ViT + post merger)
+        vs ``"4x"`` (skip mid-ViT, keep 4x more visual tokens).
+    """
+
+    packed_modules_mapping = {
+        "qkv_proj": [
+            "q_proj",
+            "k_proj",
+            "v_proj",
+        ],
+        "gate_up_proj": [
+            "gate_proj",
+            "up_proj",
+        ],
+    }
+    supported_lora_modules = [
+        # vision encoder + mid-ViT merger
+        "fc1",
+        "fc2",
+        "out_proj",
+        "linear_1",
+        "linear_2",
+        # language model
+        "qkv_proj",
+        "o_proj",
+        "gate_up_proj",
+        "down_proj",
+    ]
+
+    bitsandbytes_stacked_params_mapping = {
+        "q_proj": ("qkv_proj", 0),
+        "k_proj": ("qkv_proj", 1),
+        "v_proj": ("qkv_proj", 2),
+        "gate_proj": ("gate_up_proj", 0),
+        "up_proj": ("gate_up_proj", 1),
+    }
+
+    embedding_modules = {}
+    embedding_padding_modules = []
+
+    def __init__(
+        self,
+        config: PretrainedConfig,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+    ):
+        super().__init__(config=config, quant_config=quant_config, prefix=prefix)
+        assert self.version == (4, 6)
+        # ``Qwen3_5ForCausalLM`` returns plain hidden states (body only, no LM
+        # head, no LogitsProcessor). Add them here so the downstream sampler
+        # sees a ``LogitsProcessorOutput``. With ``tie_word_embeddings=True``
+        # (4.6 default) the head shares weights with the embedding.
+        text_config = config.text_config
+        if getattr(text_config, "tie_word_embeddings", False):
+            self.lm_head = self.llm.embed_tokens
+        else:
+            from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
+
+            self.lm_head = ParallelLMHead(
+                text_config.vocab_size,
+                text_config.hidden_size,
+                quant_config=quant_config,
+                prefix=add_prefix("lm_head", prefix),
+            )
+
+    def init_llm(
+        self,
+        config: PretrainedConfig,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+    ) -> nn.Module:
+        # 4.6 nests the LLM config under ``text_config``.
+        return Qwen3_5ForCausalLM(
+            config=config.text_config, quant_config=quant_config, prefix=prefix
+        )
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        **kwargs: Any,
+    ) -> torch.Tensor:
+        # Apply our lm_head + LogitsProcessor on top of the base routine; the
+        # 4.6 LLM body (``Qwen3_5ForCausalLM``) returns plain hidden states,
+        # unlike the ``Qwen3ForCausalLM`` 4.5 used.
+        hidden_states = super().forward(
+            input_ids=input_ids,
+            positions=positions,
+            forward_batch=forward_batch,
+            **kwargs,
+        )
+        return self.logits_processor(
+            input_ids, hidden_states, self.lm_head, forward_batch
+        )
+
+    def init_vision_module(
+        self,
+        config: PretrainedConfig,
+        quant_config: Optional[QuantizationConfig],
+        prefix: str = "",
+    ) -> nn.Module:
+        model = MiniCPMV_VisionTransformer(
+            config=config.vision_config, quant_config=quant_config, prefix=prefix
+        )
+        if getattr(self.config, "drop_vision_last_layer", False):
+            # The mid-ViT merger sits on the transformer (not encoder.layers),
+            # so popping the last encoder layer leaves it untouched — same
+            # behaviour as 4.5.
+            model.encoder.layers = model.encoder.layers[:-1]
+
+        setattr(model, "embed_dim", model.embeddings.embed_dim)
+        setattr(model, "patch_size", model.embeddings.patch_size)
+        return model
+
+    def init_resampler(
+        self,
+        embed_dim: int,
+        vision_dim: int,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+    ) -> nn.Module:
+        # 4.6 replaces Resampler4_5 with a pure MLP. Method name kept so
+        # ``MiniCPMBaseModel.__init__`` doesn't need to branch.
+        with set_default_torch_dtype(torch.float16):
+            merger = MiniCPMV_Merger(
+                config=self.config,
+                quant_config=quant_config,
+                prefix=prefix,
+            )
+        return merger.to(device="cuda", dtype=torch.get_default_dtype())
+
+    def get_vision_embedding(
+        self,
+        pixel_values: List[torch.Tensor],
+        patch_attn_mask: Optional[torch.Tensor] = None,
+        tgt_sizes: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        hidden, _ = self.vpm(
+            pixel_values,
+            patch_attention_mask=patch_attn_mask,
+            target_sizes=tgt_sizes,
+        )
+        return hidden
+
+    def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
+        if items and items[0].format == MultimodalInputFormat.PRECOMPUTED_EMBEDDING:
+            result = torch.cat([item.feature for item in items])
+            return result.reshape(-1, result.shape[-1])
+
+        pixel_values = flatten_nested_list([item.feature for item in items])
+        tgt_sizes = torch.stack(
+            flatten_nested_list([item.tgt_size for item in items]), dim=0
+        )
+        assert len(pixel_values) == tgt_sizes.shape[0]
+
+        device = self.vpm.embeddings.position_embedding.weight.device
+        dtype = self.vpm.embeddings.position_embedding.weight.dtype
+        all_pixel_values_lst = [
+            i.flatten(end_dim=1).permute(1, 0) for i in pixel_values
+        ]
+
+        max_patches = (tgt_sizes[:, 0] * tgt_sizes[:, 1]).max().item()
+        assert isinstance(max_patches, int)
+        all_pixel_values = torch.nn.utils.rnn.pad_sequence(
+            all_pixel_values_lst, batch_first=True, padding_value=0.0
+        )
+
+        B, L, _ = all_pixel_values.shape
+        all_pixel_values = all_pixel_values.permute(0, 2, 1).reshape(B, 3, -1, L)
+        patch_attn_mask = torch.zeros(
+            (B, 1, max_patches), dtype=torch.bool, device=device
+        )
+
+        tgt_sizes_tensor = tgt_sizes.clone().to(device=patch_attn_mask.device)
+        mask_shapes = tgt_sizes_tensor[:, 0] * tgt_sizes_tensor[:, 1]
+        patch_attn_mask[:, 0, :] = torch.arange(
+            patch_attn_mask.size(2), device=patch_attn_mask.device
+        ).unsqueeze(0) < mask_shapes.unsqueeze(1)
+
+        use_vit_merger = getattr(self.config, "downsample_mode", "16x") != "4x"
+
+        vision_embedding, tgt_sizes_out = self.vpm(
+            all_pixel_values.type(dtype),
+            patch_attention_mask=patch_attn_mask,
+            target_sizes=tgt_sizes,
+            use_vit_merger=use_vit_merger,
+        )
+        return self.resampler(vision_embedding, tgt_sizes_out)
+
+    # Video frames take the same vision path as image patches; the mm
+    # processor emits one ``MultimodalDataItem`` per patch regardless of
+    # source. sglang's dispatcher routes by ``get_{modality}_feature``.
+    get_video_feature = get_image_feature
+
+    def pad_input_ids(self, input_ids: List[int], image_inputs: MultimodalInputs):
+        im_start_id: int = image_inputs.im_start_id
+        im_end_id: int = image_inputs.im_end_id
+        slice_start_id: int = image_inputs.slice_start_id
+        slice_end_id: int = image_inputs.slice_end_id
+
+        media_token_pairs = [(im_start_id, im_end_id), (slice_start_id, slice_end_id)]
+        pattern = MultiModalityDataPaddingPatternTokenPairs(
+            media_token_pairs, data_start_token_ids=[im_start_id]
+        )
+        return pattern.pad_input_tokens(input_ids, image_inputs)
+
+    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        """Remap 4.6 prefixes (``model.{vision_tower,merger,language_model}``)
+        to sglang's (``vpm`` / ``resampler`` / ``llm``) and delegate the LLM
+        portion to ``Qwen3_5ForCausalLM.load_weights`` — the Qwen3.5 hybrid
+        backbone has its own stacked-param logic (``in_proj_a/b -> in_proj_ba``,
+        ``in_proj_qkv/z -> in_proj_qkvz``) the legacy loader doesn't know.
+        Vision-side still needs QKV stacking + ``out_proj -> proj`` rename.
+        """
+
+        llm_weights: List[Tuple[str, torch.Tensor]] = []
+        vision_weights: List[Tuple[str, torch.Tensor]] = []
+        for name, w in weights:
+            if name.startswith("model.language_model."):
+                llm_weights.append((name[len("model.language_model.") :], w))
+                continue
+            if name.startswith("model.vision_tower."):
+                name = "vpm." + name[len("model.vision_tower.") :]
+            elif name.startswith("model.merger."):
+                name = "resampler." + name[len("model.merger.") :]
+            vision_weights.append((name, w))
+
+        self.llm.load_weights(iter(llm_weights))
+
+        stacked_params_mapping = [
+            ("self_attn.qkv_proj", "self_attn.q_proj", "q"),
+            ("self_attn.qkv_proj", "self_attn.k_proj", "k"),
+            ("self_attn.qkv_proj", "self_attn.v_proj", "v"),
+        ]
+        params_dict = dict(self.named_parameters())
+        for name, loaded_weight in vision_weights:
+            name = name.replace("self_attn.out_proj", "self_attn.proj")
+
+            for param_name, weight_name, shard_id in stacked_params_mapping:
+                if weight_name not in name:
+                    continue
+                target = name.replace(weight_name, param_name)
+                if target not in params_dict:
+                    continue
+                param = params_dict[target]
+                param.weight_loader(param, loaded_weight, shard_id)
+                break
+            else:
+                if name not in params_dict:
+                    continue
+                param = params_dict[name]
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                weight_loader(param, loaded_weight)
+
+
+_SUPPORT_VERSION = {
+    (2, 6): MiniCPMV2_6,
+    (4, 0): MiniCPMV4_0,
+    (4, 5): MiniCPMV4_5,
+    (4, 6): MiniCPMV4_6,
+}
 
 
 class MiniCPMV:
@@ -1369,7 +1648,12 @@ class MiniCPMV:
     ) -> None:
         super().__init__()
 
-        if not hasattr(config, "version"):
+        # 4.6 carries ``model_type == "minicpmv4_6"`` instead of a numeric
+        # ``config.version``; older versionless configs keep the legacy
+        # ``(2, 6)`` default.
+        if getattr(config, "model_type", None) == "minicpmv4_6":
+            version = (4, 6)
+        elif not hasattr(config, "version"):
             version = (2, 6)
         else:
             version = str(config.version).split(".")
@@ -1404,6 +1688,13 @@ class MiniCPMV:
         return self.minicpmv(*args, **kwargs)
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        # Defer to the version-specific subclass loader if it overrides the
+        # base (4.6 does — it needs prefix remap + Qwen3.5 LLM delegation).
+        sub_loader = getattr(type(self.minicpmv), "load_weights", None)
+        base_loader = getattr(MiniCPMBaseModel, "load_weights", None)
+        if sub_loader is not None and sub_loader is not base_loader:
+            return self.minicpmv.load_weights(weights)
+
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             ("qkv_proj", "q_proj", "q"),
@@ -1455,4 +1746,11 @@ class MiniCPMV:
                 weight_loader(param, loaded_weight)
 
 
-EntryClass = MiniCPMV
+# Real subclass (not an `=` alias) so the model registry — which keys by
+# ``__name__`` — resolves the canonical 4.6 architecture name through
+# ``MiniCPMV``'s version-dispatch factory.
+class MiniCPMV4_6ForConditionalGeneration(MiniCPMV):
+    pass
+
+
+EntryClass = [MiniCPMV, MiniCPMV4_6ForConditionalGeneration]

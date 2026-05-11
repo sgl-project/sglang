@@ -34,6 +34,7 @@ from sglang.srt.model_executor.forward_batch_info import (
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.draft_utils import DraftBackendFactory
 from sglang.srt.speculative.eagle_info import (
+    EagleDraftExtendInput,
     EagleDraftInput,
     EagleVerifyInput,
     EagleVerifyOutput,
@@ -271,32 +272,41 @@ class MultiLayerEagleWorker(TpModelWorker):
             with self.draft_tp_context(
                 self.mtp_model_runner(0).tp_group
             ), speculative_moe_backend_context():
-                spec_info = self.draft(batch)
-            logits_output, verify_output, model_worker_batch, can_run_cuda_graph = (
-                self.verify(batch, spec_info)
-            )
+                verify_input = self.draft(batch)
+            batch.spec_info = verify_input
+            logits_output, verify_output, can_run_cuda_graph = self.verify(batch)
 
             with self.draft_tp_context(
                 self.mtp_model_runner(0).tp_group
             ), speculative_moe_backend_context():
                 # NOTE: We should use `check_forward_draft_extend_after_decode`
                 # when DP attention is enabled, but it is slow. Skip it for now.
+                draft_extend_input = verify_output.draft_extend_input
                 if (
                     self.server_args.enable_dp_attention
-                    or batch.spec_info.verified_id.shape[0] > 0
+                    or draft_extend_input.input_ids.shape[0] > 0
                 ):
-                    # decode is not finished
-                    self.forward_draft_extend_after_decode(batch)
+                    # decode is not finished; stash for extend, then restash
+                    # the next-iter EagleDraftInput it returns.
+                    batch.spec_info = draft_extend_input
+                    next_draft_input = self.forward_draft_extend_after_decode(batch)
+                    batch.spec_info = next_draft_input
+                else:
+                    # All reqs finished and dp_attention isn't forcing extend.
+                    # Install an idle EagleDraftInput so next iter's scheduler
+                    # ops (merge_batch / filter_batch) see well-typed empty
+                    # tensors instead of None.
+                    self._draft_preprocess_idle(batch)
 
             return GenerationBatchResult(
                 logits_output=logits_output,
-                next_token_ids=verify_output.verified_id,
+                next_token_ids=verify_output.accept_tokens,
                 num_accepted_drafts=sum(verify_output.num_accepted_drafts_per_req_cpu),
                 can_run_cuda_graph=can_run_cuda_graph,
             )
 
-    def check_forward_draft_extend_after_decode(self, batch: ScheduleBatch):
-        local_need_forward = batch.spec_info.verified_id.shape[0] > 0
+    def check_forward_draft_extend_after_decode(self, verify_output: EagleVerifyOutput):
+        local_need_forward = verify_output.draft_extend_input.input_ids.shape[0] > 0
         if not self.server_args.enable_dp_attention:
             return local_need_forward
 
@@ -440,7 +450,7 @@ class MultiLayerEagleWorker(TpModelWorker):
             retrieve_next_sibling,
             draft_tokens,
         ) = build_tree_kernel_efficient(
-            spec_info.verified_id,
+            spec_info.bonus_tokens,
             parent_list,
             top_scores_index,
             draft_tokens,
@@ -471,7 +481,8 @@ class MultiLayerEagleWorker(TpModelWorker):
         # allocator and kv cache pool are shared with target worker
         pass
 
-    def verify(self, batch: ScheduleBatch, spec_info: EagleVerifyInput):
+    def verify(self, batch: ScheduleBatch):
+        spec_info: EagleVerifyInput = batch.spec_info
         spec_info.prepare_for_verify(batch, self.page_size)
         batch.return_hidden_states = False
         batch.forward_mode = (
@@ -479,7 +490,6 @@ class MultiLayerEagleWorker(TpModelWorker):
             if not batch.forward_mode.is_idle()
             else ForwardMode.IDLE
         )
-        batch.spec_info = spec_info
 
         model_worker_batch = batch.get_model_worker_batch(
             seq_lens_cpu_cache=spec_info.seq_lens_cpu
@@ -589,9 +599,8 @@ class MultiLayerEagleWorker(TpModelWorker):
         batch.forward_mode = (
             ForwardMode.DECODE if not batch.forward_mode.is_idle() else ForwardMode.IDLE
         )
-        batch.spec_info = res.draft_input
 
-        return logits_output, res, model_worker_batch, can_run_cuda_graph
+        return logits_output, res, can_run_cuda_graph
 
     def forward_draft_extend(
         self,
@@ -609,7 +618,7 @@ class MultiLayerEagleWorker(TpModelWorker):
         """
         batch.spec_info = EagleDraftInput(
             hidden_states=hidden_states,
-            verified_id=next_token_ids,
+            bonus_tokens=next_token_ids,
             num_tokens_per_req=1,
             num_tokens_for_logprob_per_req=1,
         )
@@ -652,19 +661,20 @@ class MultiLayerEagleWorker(TpModelWorker):
         forward_batch.spec_info.topk_p = torch.cat(topk_p_list, dim=1)
         forward_batch.spec_info.topk_index = torch.cat(topk_index_list, dim=1)
 
-    def forward_draft_extend_after_decode(self, batch: ScheduleBatch):
-        assert isinstance(batch.spec_info, EagleDraftInput)
+    def forward_draft_extend_after_decode(
+        self, batch: ScheduleBatch
+    ) -> EagleDraftInput:
+        draft_extend_input: EagleDraftExtendInput = batch.spec_info
+
         # Backup fields that will be modified in-place
         seq_lens_backup = batch.seq_lens.clone()
         seq_lens_cpu_backup = batch.seq_lens_cpu.clone()
         req_pool_indices_backup = batch.req_pool_indices
-        num_accepted_drafts_backup = batch.spec_info.num_accepted_drafts
-        num_accepted_tokens_backup = batch.spec_info.num_accepted_tokens
         return_logprob_backup = batch.return_logprob
 
         input_is_idle = batch.forward_mode.is_idle()
 
-        if not input_is_idle and batch.spec_info.verified_id.numel() == 0:
+        if not input_is_idle and draft_extend_input.input_ids.shape[0] == 0:
             batch = batch.copy()
             batch.prepare_for_idle()
             hidden_size = (
@@ -672,19 +682,20 @@ class MultiLayerEagleWorker(TpModelWorker):
                 if self.speculative_algorithm.is_eagle3()
                 else self.model_config.hidden_size
             )
-            batch.spec_info = EagleDraftInput.create_idle_input(
+            draft_extend_input = EagleDraftExtendInput.create_idle_input(
                 device=self.device,
                 hidden_size=hidden_size,
                 dtype=self.model_config.dtype,
-                topk=self.topk,
                 capture_hidden_mode=CaptureHiddenMode.LAST,
             )
+            batch.spec_info = draft_extend_input
 
-        batch.spec_info.num_tokens_per_req = self.speculative_num_steps + 1
-        batch.spec_info.num_tokens_for_logprob_per_req = 1
-        batch.spec_info.prepare_extend_after_decode(
+        # Phase 1: prepare extend (kernel writes draft_extend_input.{positions, bonus_tokens})
+        draft_extend_input.num_tokens_per_req = self.speculative_num_steps + 1
+        draft_extend_input.num_tokens_for_logprob_per_req = 1
+        draft_extend_input.prepare_extend_after_decode(
             batch,
-            self.speculative_num_steps,
+            speculative_num_steps=self.speculative_num_steps,
         )
         batch.forward_mode = (
             ForwardMode.DRAFT_EXTEND
@@ -745,17 +756,23 @@ class MultiLayerEagleWorker(TpModelWorker):
                     )
                     pt += extend_len
 
-        forward_batch.spec_info.topk_p = torch.cat(topk_p_list, dim=1)
-        forward_batch.spec_info.topk_index = torch.cat(topk_index_list, dim=1)
+        # Phase 3: assemble next-iter EagleDraftInput from extend output
+        next_draft_input = EagleDraftInput(
+            bonus_tokens=draft_extend_input.bonus_tokens,
+            hidden_states=logits_output.hidden_states,
+            topk_p=torch.cat(topk_p_list, dim=1),
+            topk_index=torch.cat(topk_index_list, dim=1),
+            capture_hidden_mode=CaptureHiddenMode.FULL,
+        )
 
-        # Restore backup.
-        # This is because `seq_lens` can be modified in `prepare_extend_after_decode`
+        # Restore batch fields. `seq_lens` etc. were modified by
+        # `prepare_extend_after_decode`. Caller installs `next_draft_input` as
+        # `batch.spec_info`.
         batch.forward_mode = (
             ForwardMode.DECODE if not input_is_idle else ForwardMode.IDLE
         )
         batch.seq_lens = seq_lens_backup
         batch.seq_lens_cpu = seq_lens_cpu_backup
         batch.req_pool_indices = req_pool_indices_backup
-        batch.spec_info.num_accepted_drafts = num_accepted_drafts_backup
-        batch.spec_info.num_accepted_tokens = num_accepted_tokens_backup
         batch.return_logprob = return_logprob_backup
+        return next_draft_input

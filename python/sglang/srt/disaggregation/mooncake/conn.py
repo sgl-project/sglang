@@ -996,7 +996,7 @@ class MooncakeKVManager(CommonKVManager):
                     dst_state_data_ptrs,
                 )
         elif state_type in ["swa", "nsa"]:
-            # SWA and NSA hybrid models do not support different TP sizes yet
+            # Non-MLA SWA / NSA hybrid models do not support different TP sizes yet.
             if (
                 target_rank_registration_info is not None
                 and not self.is_mla_backend
@@ -1736,10 +1736,6 @@ class MooncakeKVSender(CommonKVSender):
         else:
             return self.conclude_state
 
-    def clear(self) -> None:
-        if self.bootstrap_room in self.kv_mgr.request_status:
-            self.kv_mgr.request_status.pop(self.bootstrap_room)
-
     def failure_exception(self):
         # Explicitly set the status to failure since this request has failed in another rank
         if self.conclude_state is None:
@@ -1910,16 +1906,6 @@ class MooncakeKVReceiver(CommonKVReceiver):
 
         else:
             return self.conclude_state
-
-    def clear(self) -> None:
-        if self.bootstrap_room in self.kv_mgr.request_status:
-            self.kv_mgr.request_status.pop(self.bootstrap_room)
-
-        if self.bootstrap_room in self.kv_mgr.required_prefill_response_num_table:
-            self.kv_mgr.required_prefill_response_num_table.pop(self.bootstrap_room)
-
-        if self.bootstrap_room in self.kv_mgr.prefill_response_tracker:
-            self.kv_mgr.prefill_response_tracker.pop(self.bootstrap_room)
 
     def failure_exception(self):
         # Explicitly set the status to failure since this request has failed in another rank
