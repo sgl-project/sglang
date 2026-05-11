@@ -1581,23 +1581,23 @@ def _topk_length_sentinel(device: torch.device, batch: int) -> torch.Tensor:
 )
 def dpsk_v4_fp8_partial_kernel(
     num_heads: int,
-    topk1: int,
+    topk_1: int,
     block_size_kv_1: int,
-    topk2: int = 0,
+    topk_2: int = 0,
     block_size_kv_2: int = 0,
     *,
     dim: int = 448,
     tail_dim: int = 64,
     sm_scale: float = 0.0,
     block_I: int = 64,
-    inner_iter: int = 1,
+    inner_iter_1: int = 1,
     inner_iter_2: int = 0,
     num_stages: int = 0,
     threads: int = 512,
 ) -> Any:
     """
     Read FP8 K cache directly, dequantise to BF16 in-kernel, do flash-attn
-    online softmax with split-K. Supports a second cache (`topk2>0`) and
+    online softmax with split-K. Supports a second cache (`topk_2>0`) and
     `attn_sink` is folded later by the combine kernel.
     """
     log2e: float = 1.44269504
@@ -1606,22 +1606,22 @@ def dpsk_v4_fp8_partial_kernel(
     else:
         sm_scale = sm_scale * log2e
     assert dim == 448 and tail_dim == 64
-    assert topk1 % block_I == 0
+    assert topk_1 % block_I == 0
     assert (
-        topk1 // block_I
-    ) % inner_iter == 0, (
-        f"NI_1={topk1 // block_I} must be divisible by inner_iter={inner_iter}"
+        topk_1 // block_I
+    ) % inner_iter_1 == 0, (
+        f"NI_1={topk_1 // block_I} must be divisible by inner_iter_1={inner_iter_1}"
     )
     assert block_size_kv_1 > 0 and (block_size_kv_1 & (block_size_kv_1 - 1)) == 0
 
-    is_dual = topk2 > 0
+    is_dual = topk_2 > 0
     if is_dual:
         assert inner_iter_2 > 0, "dual-cache call requires inner_iter_2 > 0"
-        assert topk2 % block_I == 0
+        assert topk_2 % block_I == 0
         assert (
-            topk2 // block_I
+            topk_2 // block_I
         ) % inner_iter_2 == 0, (
-            f"NI_2={topk2 // block_I} must be divisible by inner_iter_2={inner_iter_2}"
+            f"NI_2={topk_2 // block_I} must be divisible by inner_iter_2={inner_iter_2}"
         )
         assert block_size_kv_2 > 0 and (block_size_kv_2 & (block_size_kv_2 - 1)) == 0
 
@@ -1651,9 +1651,9 @@ def dpsk_v4_fp8_partial_kernel(
     REPLICATE_H = (head_kv + 63) // 64 if head_kv > 64 else 1
     H_per_block = 64 if REPLICATE_H > 1 else padded_H
 
-    NI_1 = topk1 // BI
-    n_groups_1 = NI_1 // inner_iter
-    NI_2 = (topk2 // BI) if is_dual else 0
+    NI_1 = topk_1 // BI
+    n_groups_1 = NI_1 // inner_iter_1
+    NI_2 = (topk_2 // BI) if is_dual else 0
     n_groups_2 = (NI_2 // inner_iter_2) if is_dual else 0
     n_groups = n_groups_1 + n_groups_2
 
@@ -1665,13 +1665,13 @@ def dpsk_v4_fp8_partial_kernel(
 
     q_shape = [batch, seq_len, num_heads, D + D_tail]
     k1_shape = [num_blocks_kv_1, block_pad_u32_1]
-    indices1_shape = [batch, seq_len, topk1]
+    indices1_shape = [batch, seq_len, topk_1]
     topk_length_shape = [batch]
     partial_o_shape = [batch, seq_len, n_groups, num_heads, D + D_tail]
     partial_lse_shape = [batch, seq_len, n_groups, num_heads]
     if is_dual:
         k2_shape = [num_blocks_kv_2, block_pad_u32_2]
-        indices2_shape = [batch, seq_len, topk2]
+        indices2_shape = [batch, seq_len, topk_2]
 
     accum_dtype = "float"
     indices_dtype = INT32
@@ -1692,7 +1692,7 @@ def dpsk_v4_fp8_partial_kernel(
         ) -> None:
             """
             grid: (seq_len * REPLICATE_H * n_groups, batch, 1)
-            Each block processes `inner_iter` (or `inner_iter_2`) consecutive
+            Each block processes `inner_iter_1` (or `inner_iter_2`) consecutive
             KV tiles of one phase and writes one (partial_o, partial_lse) entry.
             """
             with T.Kernel(
@@ -1734,16 +1734,17 @@ def dpsk_v4_fp8_partial_kernel(
                 H0 = g_i * padded_H + (0 if REPLICATE_H == 1 else h_rep * 64)
                 H1 = H0 + H_per_block
 
-                T.copy(Q[b_i, s_i, H0:H1, :D], Q_shared)
-                T.copy(Q[b_i, s_i, H0:H1, D : D + D_tail], Q_tail_shared)
-
                 tk_len_1 = Topk_length_1[b_i]
                 tk_len_2 = Topk_length_2[b_i]
+                actual_n_groups_1 = T.ceildiv(tk_len_1, BI * inner_iter_1)
+                actual_n_groups_2 = T.ceildiv(tk_len_2, BI * inner_iter_2)
 
-                # Phase 1 (groups [0, n_groups_1)).
-                if group_i < n_groups_1:
-                    for k_i in T.Pipelined(inner_iter, num_stages=num_stages):
-                        iter_i = group_i * inner_iter + k_i
+                if (group_i < n_groups_1) & (group_i < actual_n_groups_1):
+                    # Phase 1 active: SWA cache work + Partial_O write.
+                    T.copy(Q[b_i, s_i, H0:H1, :D], Q_shared)
+                    T.copy(Q[b_i, s_i, H0:H1, D : D + D_tail], Q_tail_shared)
+                    for k_i in T.Pipelined(inner_iter_1, num_stages=num_stages):
+                        iter_i = group_i * inner_iter_1 + k_i
                         for bi_i in T.Parallel(BI):
                             pos = iter_i * BI + bi_i
                             idx = Indices_1[b_i, s_i, pos]
@@ -1846,7 +1847,10 @@ def dpsk_v4_fp8_partial_kernel(
                             acc_o_tail[h_i, d_i] *= alpha[h_i]
                         T.copy(acc_s, S_shared)
                         T.gemm(
-                            S_shared, KV_shared, acc_o, policy=T.GemmWarpPolicy.FullRow
+                            S_shared,
+                            KV_shared,
+                            acc_o,
+                            policy=T.GemmWarpPolicy.FullRow,
                         )
                         T.gemm(
                             S_shared,
@@ -1854,8 +1858,34 @@ def dpsk_v4_fp8_partial_kernel(
                             acc_o_tail,
                             policy=T.GemmWarpPolicy.FullRow,
                         )
-                else:
-                    # Phase 2 (groups [n_groups_1, n_groups)).
+                    # ---- finalize phase 1 (active) ----
+                    for h_i, d_i in T.Parallel(H_per_block, D):
+                        acc_o[h_i, d_i] = acc_o[h_i, d_i] / T.if_then_else(
+                            sumexp[h_i] == 0.0, 1.0, sumexp[h_i]
+                        )
+                    for h_i, d_i in T.Parallel(H_per_block, D_tail):
+                        acc_o_tail[h_i, d_i] = acc_o_tail[h_i, d_i] / T.if_then_else(
+                            sumexp[h_i] == 0.0, 1.0, sumexp[h_i]
+                        )
+                    for h_i in T.Parallel(H_per_block):
+                        m_i[h_i] = T.if_then_else(
+                            sumexp[h_i] == 0.0,
+                            -(2.0**30),
+                            T.log2(sumexp[h_i]) + m_i[h_i] * sm_scale,
+                        )
+                    T.copy(acc_o, Partial_O[b_i, s_i, group_i, H0:H1, :D])
+                    T.copy(
+                        acc_o_tail,
+                        Partial_O[b_i, s_i, group_i, H0:H1, D : D + D_tail],
+                    )
+                    T.copy(m_i, Partial_LSE[b_i, s_i, group_i, H0:H1])
+                elif group_i < n_groups_1:
+                    # Phase 1 skipped: m_i is still the -2^30
+                    T.copy(m_i, Partial_LSE[b_i, s_i, group_i, H0:H1])
+                elif (group_i - n_groups_1) < actual_n_groups_2:
+                    # Phase 2 active: c128 cache work + Partial_O write.
+                    T.copy(Q[b_i, s_i, H0:H1, :D], Q_shared)
+                    T.copy(Q[b_i, s_i, H0:H1, D : D + D_tail], Q_tail_shared)
                     for k_i in T.Pipelined(inner_iter_2, num_stages=num_stages):
                         iter_i = (group_i - n_groups_1) * inner_iter_2 + k_i
                         for bi_i in T.Parallel(BI):
@@ -1960,7 +1990,10 @@ def dpsk_v4_fp8_partial_kernel(
                             acc_o_tail[h_i, d_i] *= alpha[h_i]
                         T.copy(acc_s, S_shared)
                         T.gemm(
-                            S_shared, KV_shared, acc_o, policy=T.GemmWarpPolicy.FullRow
+                            S_shared,
+                            KV_shared,
+                            acc_o,
+                            policy=T.GemmWarpPolicy.FullRow,
                         )
                         T.gemm(
                             S_shared,
@@ -1968,25 +2001,30 @@ def dpsk_v4_fp8_partial_kernel(
                             acc_o_tail,
                             policy=T.GemmWarpPolicy.FullRow,
                         )
-
-                # Pre-normalise + write log2-LSE (combine handles attn_sink).
-                for h_i, d_i in T.Parallel(H_per_block, D):
-                    acc_o[h_i, d_i] = acc_o[h_i, d_i] / T.if_then_else(
-                        sumexp[h_i] == 0.0, 1.0, sumexp[h_i]
+                    # ---- finalize phase 2 (active) ----
+                    for h_i, d_i in T.Parallel(H_per_block, D):
+                        acc_o[h_i, d_i] = acc_o[h_i, d_i] / T.if_then_else(
+                            sumexp[h_i] == 0.0, 1.0, sumexp[h_i]
+                        )
+                    for h_i, d_i in T.Parallel(H_per_block, D_tail):
+                        acc_o_tail[h_i, d_i] = acc_o_tail[h_i, d_i] / T.if_then_else(
+                            sumexp[h_i] == 0.0, 1.0, sumexp[h_i]
+                        )
+                    for h_i in T.Parallel(H_per_block):
+                        m_i[h_i] = T.if_then_else(
+                            sumexp[h_i] == 0.0,
+                            -(2.0**30),
+                            T.log2(sumexp[h_i]) + m_i[h_i] * sm_scale,
+                        )
+                    T.copy(acc_o, Partial_O[b_i, s_i, group_i, H0:H1, :D])
+                    T.copy(
+                        acc_o_tail,
+                        Partial_O[b_i, s_i, group_i, H0:H1, D : D + D_tail],
                     )
-                for h_i, d_i in T.Parallel(H_per_block, D_tail):
-                    acc_o_tail[h_i, d_i] = acc_o_tail[h_i, d_i] / T.if_then_else(
-                        sumexp[h_i] == 0.0, 1.0, sumexp[h_i]
-                    )
-                for h_i in T.Parallel(H_per_block):
-                    m_i[h_i] = T.if_then_else(
-                        sumexp[h_i] == 0.0,
-                        -(2.0**30),
-                        T.log2(sumexp[h_i]) + m_i[h_i] * sm_scale,
-                    )
-                T.copy(acc_o, Partial_O[b_i, s_i, group_i, H0:H1, :D])
-                T.copy(acc_o_tail, Partial_O[b_i, s_i, group_i, H0:H1, D : D + D_tail])
-                T.copy(m_i, Partial_LSE[b_i, s_i, group_i, H0:H1])
+                    T.copy(m_i, Partial_LSE[b_i, s_i, group_i, H0:H1])
+                else:
+                    # Phase 2 skipped: m_i is still the -2^30
+                    T.copy(m_i, Partial_LSE[b_i, s_i, group_i, H0:H1])
 
         return main
 
@@ -2001,7 +2039,7 @@ def dpsk_v4_fp8_partial_kernel(
     ) -> None:
         """
         grid: (seq_len * REPLICATE_H * n_groups, batch, 1)
-        Each block processes `inner_iter` consecutive KV tiles and writes
+        Each block processes `inner_iter_1` consecutive KV tiles and writes
         one (partial_o, partial_lse) entry.
         """
         with T.Kernel(
@@ -2047,8 +2085,8 @@ def dpsk_v4_fp8_partial_kernel(
 
             tk_len_1 = Topk_length_1[b_i]
 
-            for k_i in T.Pipelined(inner_iter, num_stages=num_stages):
-                iter_i = group_i * inner_iter + k_i
+            for k_i in T.Pipelined(inner_iter_1, num_stages=num_stages):
+                iter_i = group_i * inner_iter_1 + k_i
                 for bi_i in T.Parallel(BI):
                     pos = iter_i * BI + bi_i
                     idx = Indices_1[b_i, s_i, pos]
@@ -2184,8 +2222,12 @@ def dpsk_v4_fp8_partial_kernel(
 )
 def dpsk_v4_combine_kernel(
     num_heads: int,
-    n_groups: int,
+    n_groups_1: int,
+    n_groups_2: int = 0,
     *,
+    block_I: int = 64,
+    inner_iter_1: int = 1,
+    inner_iter_2: int = 1,
     dim: int = 448,
     tail_dim: int = 64,
     head_per_block: int = 16,
@@ -2196,11 +2238,11 @@ def dpsk_v4_combine_kernel(
     Combine `n_groups` flash-attention partials into the final output.
 
     Inputs:
-      Partial_O   : (batch, seq_len, n_groups, num_heads, dim+tail_dim) bf16
-                    already pre-normalised (acc_o / partial_sumexp)
-      Partial_LSE : (batch, seq_len, n_groups, num_heads) fp32, log2 form
-      Attn_sink   : (num_heads,) fp32
-
+      Partial_O    : (batch, seq_len, n_groups, num_heads, dim+tail_dim) bf16
+      Partial_LSE  : (batch, seq_len, n_groups, num_heads) fp32, log2 form
+      Topk_length_1: (batch,) int32, actual phase-1 length
+      Topk_length_2: (batch,) int32, actual phase-2 length (dual only)
+      Attn_sink    : (num_heads,) fp32
     Outputs:
       Output : (batch, seq_len, num_heads, dim+tail_dim) bf16
       LSE    : (batch, seq_len, num_heads) fp32, natural log
@@ -2211,14 +2253,132 @@ def dpsk_v4_combine_kernel(
     ln2: float = 0.69314718
     assert num_heads % head_per_block == 0
 
-    Hpb = head_per_block
-    HEAD_BLOCKS = num_heads // Hpb
+    is_dual = n_groups_2 > 0
+    n_groups = n_groups_1 + n_groups_2
+
+    H_per_block = head_per_block
+    HEAD_BLOCKS = num_heads // H_per_block
     DT = dim + tail_dim
 
     batch = T.symbolic("batch")
     seq_len = T.symbolic("seq_len")
 
     accum_dtype = "float"
+
+    if is_dual:
+
+        @T.prim_func
+        def main(
+            Partial_O: T.Tensor(
+                [batch, seq_len, n_groups, num_heads, DT], BF16
+            ),  # type: ignore
+            Partial_LSE: T.Tensor(
+                [batch, seq_len, n_groups, num_heads], accum_dtype
+            ),  # type: ignore
+            Topk_length_1: T.Tensor([batch], INT32),  # type: ignore
+            Topk_length_2: T.Tensor([batch], INT32),  # type: ignore
+            Attn_sink: T.Tensor([num_heads], FP32),  # type: ignore
+            Output: T.Tensor([batch, seq_len, num_heads, DT], BF16),  # type: ignore
+            LSE: T.Tensor([batch, seq_len, num_heads], accum_dtype),  # type: ignore
+        ) -> None:
+            with T.Kernel(seq_len * HEAD_BLOCKS, batch, threads=threads) as (
+                bx,
+                by,
+            ):
+                shared_lse = T.alloc_shared([n_groups, H_per_block], accum_dtype)
+                lse_max = T.alloc_fragment([H_per_block], accum_dtype)
+                lse_sum = T.alloc_fragment([H_per_block], accum_dtype)
+                scale = T.alloc_fragment([H_per_block, n_groups], accum_dtype)
+                acc_o = T.alloc_fragment([H_per_block, DT], accum_dtype)
+                attn_sink_frag = T.alloc_fragment([H_per_block], accum_dtype)
+                o_scale_frag = T.alloc_fragment([H_per_block], accum_dtype)
+                final_lse = T.alloc_fragment([H_per_block], accum_dtype)
+
+                b_i = by
+                s_i = bx // HEAD_BLOCKS
+                head_block = bx % HEAD_BLOCKS
+                H0 = head_block * H_per_block
+                H1 = H0 + H_per_block
+
+                # Clamp to the captured-shape upper bounds so callers passing
+                # the INT32_MAX sentinel (= "all valid") still iterate exactly
+                # n_groups groups, not 33M.
+                actual_n_groups_1 = T.min(
+                    T.ceildiv(Topk_length_1[b_i], block_I * inner_iter_1),
+                    n_groups_1,
+                )
+                actual_n_groups_2 = T.min(
+                    T.ceildiv(Topk_length_2[b_i], block_I * inner_iter_2),
+                    n_groups - n_groups_1,
+                )
+                actual_n_groups = actual_n_groups_1 + actual_n_groups_2
+
+                # Pass 1: load only active groups' LSE into compact slots.
+                for k_c in T.serial(actual_n_groups):
+                    k = T.if_then_else(
+                        k_c < actual_n_groups_1,
+                        k_c,
+                        n_groups_1 + (k_c - actual_n_groups_1),
+                    )
+                    T.copy(Partial_LSE[b_i, s_i, k, H0:H1], shared_lse[k_c, :])
+
+                T.fill(lse_max, -(2**30))
+                for k_c in T.serial(actual_n_groups):
+                    for h_i in T.Parallel(H_per_block):
+                        lse_max[h_i] = T.max(lse_max[h_i], shared_lse[k_c, h_i])
+                T.fill(lse_sum, 0)
+                for k_c in T.serial(actual_n_groups):
+                    for h_i in T.Parallel(H_per_block):
+                        lse_sum[h_i] = lse_sum[h_i] + T.exp2(
+                            shared_lse[k_c, h_i] - lse_max[h_i]
+                        )
+                for k_c in T.serial(actual_n_groups):
+                    for h_i in T.Parallel(H_per_block):
+                        scale[h_i, k_c] = T.exp2(
+                            shared_lse[k_c, h_i] - lse_max[h_i] - T.log2(lse_sum[h_i])
+                        )
+
+                T.fill(acc_o, 0)
+                for k_c in T.serial(actual_n_groups):
+                    k = T.if_then_else(
+                        k_c < actual_n_groups_1,
+                        k_c,
+                        n_groups_1 + (k_c - actual_n_groups_1),
+                    )
+                    for h_i, d_i in T.Parallel(H_per_block, DT):
+                        acc_o[h_i, d_i] = acc_o[h_i, d_i] + scale[h_i, k_c] * Partial_O[
+                            b_i, s_i, k, H0 + h_i, d_i
+                        ].astype(accum_dtype)
+
+                for h_i in T.Parallel(H_per_block):
+                    empty = lse_max[h_i] <= -(2**29)
+                    final_lse[h_i] = T.if_then_else(
+                        empty,
+                        T.infinity(accum_dtype),
+                        (lse_max[h_i] + T.log2(lse_sum[h_i])) * ln2,
+                    )
+
+                if use_attn_sink:
+                    for h_i in T.Parallel(H_per_block):
+                        attn_sink_frag[h_i] = Attn_sink[H0 + h_i]
+                    for h_i in T.Parallel(H_per_block):
+                        empty = lse_max[h_i] <= -(2**29)
+                        o_scale_frag[h_i] = T.if_then_else(
+                            empty,
+                            0.0,
+                            1.0
+                            / (
+                                1.0
+                                + T.exp2((attn_sink_frag[h_i] - final_lse[h_i]) * log2e)
+                            ),
+                        )
+                    for h_i, d_i in T.Parallel(H_per_block, DT):
+                        acc_o[h_i, d_i] = acc_o[h_i, d_i] * o_scale_frag[h_i]
+
+                T.copy(acc_o, Output[b_i, s_i, H0:H1, :])
+                T.copy(final_lse, LSE[b_i, s_i, H0:H1])
+
+        return main
 
     @T.prim_func
     def main(
@@ -2233,51 +2393,49 @@ def dpsk_v4_combine_kernel(
         LSE: T.Tensor([batch, seq_len, num_heads], accum_dtype),  # type: ignore
     ) -> None:
         with T.Kernel(seq_len * HEAD_BLOCKS, batch, threads=threads) as (bx, by):
-            shared_lse = T.alloc_shared([n_groups, Hpb], accum_dtype)
+            shared_lse = T.alloc_shared([n_groups, H_per_block], accum_dtype)
 
-            lse_max = T.alloc_fragment([Hpb], accum_dtype)
-            lse_sum = T.alloc_fragment([Hpb], accum_dtype)
-            scale = T.alloc_fragment([Hpb, n_groups], accum_dtype)
-            acc_o = T.alloc_fragment([Hpb, DT], accum_dtype)
-            attn_sink_frag = T.alloc_fragment([Hpb], accum_dtype)
-            o_scale_frag = T.alloc_fragment([Hpb], accum_dtype)
-            final_lse = T.alloc_fragment([Hpb], accum_dtype)
+            lse_max = T.alloc_fragment([H_per_block], accum_dtype)
+            lse_sum = T.alloc_fragment([H_per_block], accum_dtype)
+            scale = T.alloc_fragment([H_per_block, n_groups], accum_dtype)
+            acc_o = T.alloc_fragment([H_per_block, DT], accum_dtype)
+            attn_sink_frag = T.alloc_fragment([H_per_block], accum_dtype)
+            o_scale_frag = T.alloc_fragment([H_per_block], accum_dtype)
+            final_lse = T.alloc_fragment([H_per_block], accum_dtype)
 
             b_i = by
             s_i = bx // HEAD_BLOCKS
             head_block = bx % HEAD_BLOCKS
-            H0 = head_block * Hpb
-            H1 = H0 + Hpb
+            H0 = head_block * H_per_block
+            H1 = H0 + H_per_block
 
             for k in T.serial(n_groups):
                 T.copy(Partial_LSE[b_i, s_i, k, H0:H1], shared_lse[k, :])
 
             T.fill(lse_max, -(2**30))
             for k in T.serial(n_groups):
-                for h_i in T.Parallel(Hpb):
+                for h_i in T.Parallel(H_per_block):
                     lse_max[h_i] = T.max(lse_max[h_i], shared_lse[k, h_i])
             T.fill(lse_sum, 0)
             for k in T.serial(n_groups):
-                for h_i in T.Parallel(Hpb):
+                for h_i in T.Parallel(H_per_block):
                     lse_sum[h_i] = lse_sum[h_i] + T.exp2(
                         shared_lse[k, h_i] - lse_max[h_i]
                     )
             for k in T.serial(n_groups):
-                for h_i in T.Parallel(Hpb):
+                for h_i in T.Parallel(H_per_block):
                     scale[h_i, k] = T.exp2(
                         shared_lse[k, h_i] - lse_max[h_i] - T.log2(lse_sum[h_i])
                     )
 
             T.fill(acc_o, 0)
             for k in T.serial(n_groups):
-                for h_i, d_i in T.Parallel(Hpb, DT):
+                for h_i, d_i in T.Parallel(H_per_block, DT):
                     acc_o[h_i, d_i] = acc_o[h_i, d_i] + scale[h_i, k] * Partial_O[
                         b_i, s_i, k, H0 + h_i, d_i
                     ].astype(accum_dtype)
 
-            # final_lse = log(sum_k exp(partial_lse_k)) (natural log)
-            for h_i in T.Parallel(Hpb):
-                # all partials zero -> +inf so callers can detect "no valid kv"
+            for h_i in T.Parallel(H_per_block):
                 empty = lse_max[h_i] <= -(2**29)
                 final_lse[h_i] = T.if_then_else(
                     empty,
@@ -2286,9 +2444,9 @@ def dpsk_v4_combine_kernel(
                 )
 
             if use_attn_sink:
-                for h_i in T.Parallel(Hpb):
+                for h_i in T.Parallel(H_per_block):
                     attn_sink_frag[h_i] = Attn_sink[H0 + h_i]
-                for h_i in T.Parallel(Hpb):
+                for h_i in T.Parallel(H_per_block):
                     empty = lse_max[h_i] <= -(2**29)
                     o_scale_frag[h_i] = T.if_then_else(
                         empty,
@@ -2298,7 +2456,7 @@ def dpsk_v4_combine_kernel(
                             1.0 + T.exp2((attn_sink_frag[h_i] - final_lse[h_i]) * log2e)
                         ),
                     )
-                for h_i, d_i in T.Parallel(Hpb, DT):
+                for h_i, d_i in T.Parallel(H_per_block, DT):
                     acc_o[h_i, d_i] = acc_o[h_i, d_i] * o_scale_frag[h_i]
 
             T.copy(acc_o, Output[b_i, s_i, H0:H1, :])
@@ -2347,8 +2505,8 @@ def dpsk_v4_fp8_attention_fwd(
     seq = batch * seq_len * replicate_h
 
     k1, _, bs_kv_1 = _build_fp8_combined_view(k_cache)
-    topk1 = indices.shape[-1]
-    ni_1 = topk1 // block_I
+    topk_1 = indices.shape[-1]
+    ni_1 = topk_1 // block_I
     tk_len_1 = (
         topk_length
         if topk_length is not None
@@ -2362,27 +2520,31 @@ def dpsk_v4_fp8_attention_fwd(
     has_extra = extra_k_cache is not None
     if not has_extra:
         inner_iter_1 = _pick_inner_iter(seq, ni_1, cu, block_per_cu)
+        inner_iter_2 = 1
+        n_groups_1 = ni_1 // inner_iter_1
+        n_groups_2 = 0
         partial = dpsk_v4_fp8_partial_kernel(
             num_heads,
-            topk1,
+            topk_1,
             bs_kv_1,
             sm_scale=softmax_scale,
             block_I=block_I,
-            inner_iter=inner_iter_1,
+            inner_iter_1=inner_iter_1,
             num_stages=num_stages,
             threads=threads,
         )
         partial_o, partial_lse = partial(q, k1, indices, tk_len_1)
-        n_groups = ni_1 // inner_iter_1
     else:
         k2, _, bs_kv_2 = _build_fp8_combined_view(extra_k_cache)
-        topk2 = extra_indices_in_kvcache.shape[-1]
-        ni_2 = topk2 // block_I
+        topk_2 = extra_indices_in_kvcache.shape[-1]
+        ni_2 = topk_2 // block_I
         # Each phase picks its own optimal split-K independently — kernel
         # body uses two T.Pipelined loops with separate compile-time iter
         # counts, no shared-divisor constraint.
         inner_iter_1 = _pick_inner_iter(seq, ni_1, cu, block_per_cu)
         inner_iter_2 = _pick_inner_iter(seq, ni_2, cu, block_per_cu)
+        n_groups_1 = ni_1 // inner_iter_1
+        n_groups_2 = ni_2 // inner_iter_2
         tk_len_2 = (
             extra_topk_length
             if extra_topk_length is not None
@@ -2390,13 +2552,13 @@ def dpsk_v4_fp8_attention_fwd(
         )
         partial = dpsk_v4_fp8_partial_kernel(
             num_heads,
-            topk1,
+            topk_1,
             bs_kv_1,
-            topk2,
+            topk_2,
             bs_kv_2,
             sm_scale=softmax_scale,
             block_I=block_I,
-            inner_iter=inner_iter_1,
+            inner_iter_1=inner_iter_1,
             inner_iter_2=inner_iter_2,
             num_stages=num_stages,
             threads=threads,
@@ -2410,13 +2572,18 @@ def dpsk_v4_fp8_attention_fwd(
             extra_indices_in_kvcache,
             tk_len_2,
         )
-        n_groups = ni_1 // inner_iter_1 + ni_2 // inner_iter_2
 
     combine = dpsk_v4_combine_kernel(
         num_heads,
-        n_groups,
+        n_groups_1,
+        n_groups_2,
+        block_I=block_I,
+        inner_iter_1=inner_iter_1,
+        inner_iter_2=inner_iter_2,
         head_per_block=4,
         threads=256,
         use_attn_sink=True,
     )
+    if has_extra:
+        return combine(partial_o, partial_lse, tk_len_1, tk_len_2, attn_sink)
     return combine(partial_o, partial_lse, attn_sink)

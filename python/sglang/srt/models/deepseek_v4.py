@@ -92,6 +92,30 @@ ATTN_BIT_WISE_EQUAL_MODE = False
 COMPRESSOR_BIT_WISE_EQUAL_MODE = False
 _FP8_WO_A_GEMM = envs.SGLANG_OPT_FP8_WO_A_GEMM.get()
 
+if _is_hip:
+    from aiter import rope_rotate_activation
+
+_FREQS_CIS_TO_COS_SIN: dict[
+    Tuple[int, torch.dtype, torch.device], Tuple[torch.Tensor, torch.Tensor]
+] = {}
+
+
+def _freqs_cis_to_cos_sin(
+    freqs_cis: torch.Tensor, dtype: torch.dtype, device: torch.device
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Derive (cos, sin) bf16 contiguous tables from a complex64 `freqs_cis`,
+    cached by `(id(freqs_cis), dtype, device)` so that all layers sharing the
+    same `freqs_cis` (via `precompute_freqs_cis`'s lru_cache) reuse one pair."""
+    key = (id(freqs_cis), dtype, device)
+    cached = _FREQS_CIS_TO_COS_SIN.get(key)
+    if cached is not None:
+        return cached
+    fr = torch.view_as_real(freqs_cis)
+    cos = fr[..., 0].to(device=device, dtype=dtype).contiguous()
+    sin = fr[..., 1].to(device=device, dtype=dtype).contiguous()
+    _FREQS_CIS_TO_COS_SIN[key] = (cos, sin)
+    return cos, sin
+
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.deepseek_v4_backend import DeepseekV4Backend
@@ -563,7 +587,8 @@ class Compressor(nn.Module):
         ).sum(dim=1)
         self.print_tensor(kv_compressed, "kv_before_norm")
         if self.use_hip_fused_compress:
-            freqs_cis = self.freqs_cis[(seq_lens - 1) // self.ratio * self.ratio]
+            # HIP-only: share the per-step freqs_cis gather across layers.
+            freqs_cis = self._init_freqs_cis_per_decode_step(forward_batch, seq_lens)
             fused_norm_rope_inplace_triton(
                 kv_compressed, self.norm.weight, self.norm.eps, freqs_cis
             )
@@ -789,7 +814,8 @@ class Compressor(nn.Module):
         ).sum(dim=1)
         self.print_tensor(kv_compressed, "kv_before_norm")
         if self.use_hip_fused_compress:
-            freqs_cis = self.freqs_cis[(seq_lens - 1) // self.ratio * self.ratio]
+            # HIP-only: share the per-step freqs_cis gather across layers.
+            freqs_cis = self._init_freqs_cis_per_decode_step(forward_batch, seq_lens)
             fused_norm_rope_inplace_triton(
                 kv_compressed, self.norm.weight, self.norm.eps, freqs_cis
             )
@@ -1030,6 +1056,19 @@ class Compressor(nn.Module):
 
         return compressed_kv_output
 
+    def _init_freqs_cis_per_decode_step(
+        self,
+        forward_batch: ForwardBatch,
+        seq_lens: torch.Tensor,
+    ) -> torch.Tensor:
+        attr = f"freqs_cis_c{self.ratio}"
+        cached = getattr(forward_batch, attr, None)
+        if cached is not None:
+            return cached
+        decoded = self.freqs_cis[(seq_lens - 1) // self.ratio * self.ratio]
+        setattr(forward_batch, attr, decoded)
+        return decoded
+
     def compress_decode_old(
         self,
         kv_and_scores: KVAndScore,
@@ -1052,8 +1091,8 @@ class Compressor(nn.Module):
                 pool_kv=kv_and_score_states_pool.kv,
                 kv_score_input_kv=kv_and_scores.kv,
                 ape=self.ape,
-                seq_lens=seq_lens.to(torch.int32),
-                req_pool_indices=req_pool_indices.to(torch.int32),
+                seq_lens=seq_lens,
+                req_pool_indices=req_pool_indices,
                 head_dim=self.head_dim,
             )
         elif self.use_hip_fused_compress and self.ratio == 128 and not self.overlap:
@@ -1065,8 +1104,8 @@ class Compressor(nn.Module):
                 pool_kv=kv_and_score_states_pool.kv,
                 kv_score_input_kv=kv_and_scores.kv,
                 ape=self.ape,
-                seq_lens=seq_lens.to(torch.int32),
-                req_pool_indices=req_pool_indices.to(torch.int32),
+                seq_lens=seq_lens,
+                req_pool_indices=req_pool_indices,
                 head_dim=self.head_dim,
             )
         else:
@@ -1127,7 +1166,8 @@ class Compressor(nn.Module):
             ).sum(dim=1)
         self.print_tensor(kv_compressed, "kv_before_norm")
         if self.use_hip_fused_compress:
-            freqs_cis = self.freqs_cis[(seq_lens - 1) // self.ratio * self.ratio]
+            # HIP-only: share the per-step freqs_cis gather across layers.
+            freqs_cis = self._init_freqs_cis_per_decode_step(forward_batch, seq_lens)
             fused_norm_rope_inplace_triton(
                 kv_compressed, self.norm.weight, self.norm.eps, freqs_cis
             )
@@ -1208,6 +1248,12 @@ class C4Indexer(nn.Module):
         # [bs, n_heads, head_dim]
         q, _ = self.wq_b(q_lora)
         q = q.view(-1, self.n_local_heads, self.head_dim)
+        if _is_hip:
+            cos, sin = _freqs_cis_to_cos_sin(self.freqs_cis, q.dtype, q.device)
+            if positions.dtype != torch.int64:
+                positions = positions.to(torch.int64)
+            rope_rotate_activation(q, q, cos, sin, positions, self.rope_head_dim)
+            return q
         fused_rope(
             q[..., -self.rope_head_dim :],
             None,
@@ -1889,6 +1935,23 @@ class DeepseekV4DecoderLayer(nn.Module):
             # returned post should be [n, hc_mult]
             return y, post.squeeze(-1), comb
 
+        if _is_hip and envs.SGLANG_OPT_USE_AITER_MHC_PRE.get():
+            from aiter.ops.mhc import mhc_pre
+
+            post, comb, y = mhc_pre(
+                residual=x,
+                fn=hc_fn,
+                hc_scale=hc_scale,
+                hc_base=hc_base,
+                rms_eps=self.rms_norm_eps,
+                hc_pre_eps=self.hc_eps,
+                hc_sinkhorn_eps=self.hc_eps,
+                hc_post_mult_value=2.0,
+                sinkhorn_repeat=self.hc_sinkhorn_iters,
+            )
+            # returned post should be [n, hc_mult]
+            return y, post.squeeze(-1), comb
+
         if envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.get():
             # DeepGEMM implementation
             import deep_gemm
@@ -1943,6 +2006,14 @@ class DeepseekV4DecoderLayer(nn.Module):
             from sglang.srt.layers.mhc import mhc_post
 
             result = mhc_post(x, residual, post, comb)
+            return result
+
+        elif _is_hip and envs.SGLANG_OPT_USE_AITER_MHC_POST.get():
+            from aiter.ops.mhc import mhc_post
+
+            result = torch.empty_like(residual)
+            mhc_post(result, x, residual, post, comb)
+
             return result
 
         assert residual.shape == (x.shape[0], self.hc_mult, x.shape[-1])
@@ -2179,6 +2250,11 @@ class DeepseekV4Model(nn.Module):
         if nsa_use_prefill_cp(forward_batch):
             hidden_states = cp_split_and_rebuild_data(forward_batch, hidden_states)
             positions = cp_split_and_rebuild_position(forward_batch, positions)
+
+        # Reset Compressor's per-step freqs_cis cache from any previous step.
+        for _attr in ("freqs_cis_c4", "freqs_cis_c128"):
+            if hasattr(forward_batch, _attr):
+                delattr(forward_batch, _attr)
 
         for i in range(self.start_layer, self.end_layer):
             # TODO: ctx?

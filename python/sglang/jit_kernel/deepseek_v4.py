@@ -16,6 +16,13 @@ from sglang.jit_kernel.utils import (
 from sglang.srt.debug_utils.deepseek_v4_debug_utils import (
     deepseek_v4_moe_code_path_checker,
 )
+from sglang.srt.utils import get_bool_env_var, is_hip
+
+_is_hip = is_hip()
+_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+
+if _use_aiter:
+    from aiter.tuned_gemm import tgemm
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
@@ -169,6 +176,19 @@ def hash_topk(
     routed_scaling_factor: float = 1.0,
     scoring_func: str = "sqrtsoftplus",
 ) -> Tuple[torch.Tensor, torch.Tensor]:
+
+    if is_hip_runtime():
+        from sglang.jit_kernel.hash_topk import hash_topk_triton
+
+        return hash_topk_triton(
+            router_logits,
+            input_ids,
+            tid2eid,
+            num_fused_shared_experts,
+            routed_scaling_factor,
+            scoring_func,
+        )
+
     assert scoring_func == "sqrtsoftplus"
     num_tokens = router_logits.size(0)
     topk_routed = tid2eid.size(1)
@@ -449,6 +469,85 @@ def _tilelang_make_swa_indices_kernel(swa_window_size: int, threads: int = 128) 
                 )
 
     return make_swa_prefill_indices
+
+
+@triton.jit
+def _triton_make_swa_prefill_indices_kernel(
+    seq_lens_k_ptr,
+    seq_lens_q_ptr,
+    cu_seqlens_q_ptr,
+    swa_indices_ptr,
+    batch_size,
+    num_q_tokens,
+    stride_swa_0,
+    SWA_WINDOW_SIZE: tl.constexpr,
+    BLOCK_W: tl.constexpr,
+):
+    token_id = tl.program_id(0)
+    if token_id >= num_q_tokens:
+        return
+
+    # Binary search: find largest seq_idx where cu_seqlens_q[seq_idx] <= token_id
+    lo = 0
+    hi = batch_size
+    for _ in tl.static_range(20):
+        mid = (lo + hi) // 2
+        mid_val = tl.load(cu_seqlens_q_ptr + mid)
+        if mid_val <= token_id:
+            lo = mid + 1
+        else:
+            hi = mid
+    seq_idx = lo - 1
+
+    kv_len = tl.load(seq_lens_k_ptr + seq_idx)
+    qo_len = tl.load(seq_lens_q_ptr + seq_idx)
+    cum_qo_len = tl.load(cu_seqlens_q_ptr + seq_idx)
+
+    prefix_len = kv_len - qo_len
+    curr_seq_qo_idx = token_id - cum_qo_len
+    end_abs_pos = prefix_len + curr_seq_qo_idx + 1
+    start_abs_pos = tl.maximum(end_abs_pos - SWA_WINDOW_SIZE, 0)
+    old_kv_start = seq_idx * SWA_WINDOW_SIZE
+    new_kv_start = batch_size * SWA_WINDOW_SIZE + cum_qo_len
+
+    base_ptr = swa_indices_ptr + token_id * stride_swa_0
+    for block_start in tl.static_range(0, SWA_WINDOW_SIZE, BLOCK_W):
+        j = block_start + tl.arange(0, BLOCK_W)
+        abs_pos = start_abs_pos + j
+        old_idx = old_kv_start + abs_pos % SWA_WINDOW_SIZE
+        new_idx = new_kv_start + (abs_pos - prefix_len)
+        idx = tl.where(abs_pos < prefix_len, old_idx, new_idx)
+        idx = tl.where(abs_pos < end_abs_pos, idx, -1)
+        tl.store(base_ptr + j, idx)
+
+
+def triton_make_swa_prefill_indices(
+    seq_lens_k: torch.Tensor,
+    seq_lens_q: torch.Tensor,
+    swa_indices: torch.Tensor,
+    cu_seqlens_q: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    if cu_seqlens_q is None:
+        cu_seqlens_q = torch.cumsum(seq_lens_q, dim=0, dtype=torch.int32)
+        cu_seqlens_q = torch.nn.functional.pad(cu_seqlens_q, (1, 0), value=0)
+    swa_window_size = swa_indices.shape[1]
+    num_q_tokens = swa_indices.shape[0]
+    batch_size = seq_lens_k.shape[0]
+    assert swa_window_size % 32 == 0
+    BLOCK_W = 32
+    grid = (num_q_tokens,)
+    _triton_make_swa_prefill_indices_kernel[grid](
+        seq_lens_k,
+        seq_lens_q,
+        cu_seqlens_q,
+        swa_indices,
+        batch_size,
+        num_q_tokens,
+        swa_indices.stride(0),
+        SWA_WINDOW_SIZE=swa_window_size,
+        BLOCK_W=BLOCK_W,
+    )
+    return swa_indices
 
 
 def tilelang_make_swa_prefill_indices(
@@ -750,6 +849,8 @@ def linear_bf16_fp32(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
         z = x.new_empty(x.size(0), y.size(0), dtype=torch.float32)
         deep_gemm.bf16_gemm_nt(x, y, z)
         return z
+    elif _use_aiter:
+        return tgemm.mm(x, y, otype=x.dtype).float()
     else:  # fall back to torch fp32 GEMM
         return torch.nn.functional.linear(x.float(), y.float())
 

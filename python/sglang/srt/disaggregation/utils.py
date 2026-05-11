@@ -243,16 +243,16 @@ class MetadataBuffers:
 
     def get_buf(self, idx: int):
         return (
-            self.output_ids[idx],
-            self.cached_tokens[idx],
-            self.output_token_logprobs_val[idx],
-            self.output_token_logprobs_idx[idx],
-            self.output_top_logprobs_val[idx],
-            self.output_top_logprobs_idx[idx],
-            self.output_topk_p[idx],
-            self.output_topk_index[idx],
-            self.output_hidden_states[idx],
-            self.bootstrap_room[idx],
+            self.output_ids[idx].clone(),
+            self.cached_tokens[idx].clone(),
+            self.output_token_logprobs_val[idx].clone(),
+            self.output_token_logprobs_idx[idx].clone(),
+            self.output_top_logprobs_val[idx].clone(),
+            self.output_top_logprobs_idx[idx].clone(),
+            self.output_topk_p[idx].clone(),
+            self.output_topk_index[idx].clone(),
+            self.output_hidden_states[idx].clone(),
+            self.bootstrap_room[idx].clone(),
         )
 
     def set_buf(self, req: Req):
@@ -529,6 +529,57 @@ def is_mla_backend(target_kv_pool) -> bool:
     from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
 
     return isinstance(target_kv_pool, MLATokenToKVPool)
+
+
+def setup_state_kv_args(
+    kv_args: KVArgs,
+    token_to_kv_pool,
+    draft_token_to_kv_pool=None,
+) -> None:
+    """Populate ``kv_args`` state-buffer fields from the given pool.
+
+    Shared by prefill and decode bootstrap paths so the state_type dispatch
+    lives in one place.
+    """
+    from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, NSATokenToKVPool
+    from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
+
+    if not hasattr(token_to_kv_pool, "get_state_buf_infos"):
+        kv_args.state_data_ptrs = []
+        kv_args.state_data_lens = []
+        kv_args.state_item_lens = []
+        kv_args.state_type = "none"
+        return
+
+    state_data_ptrs, state_data_lens, state_item_lens = (
+        token_to_kv_pool.get_state_buf_infos()
+    )
+    kv_args.state_data_ptrs = state_data_ptrs
+    kv_args.state_data_lens = state_data_lens
+    kv_args.state_item_lens = state_item_lens
+
+    if isinstance(token_to_kv_pool, SWAKVPool):
+        kv_args.state_type = "swa"
+    elif isinstance(token_to_kv_pool, HybridLinearKVPool):
+        kv_args.state_type = "mamba"
+        # Get state dimension info for cross-TP slice transfer
+        if hasattr(token_to_kv_pool, "get_state_dim_per_tensor"):
+            kv_args.state_dim_per_tensor = token_to_kv_pool.get_state_dim_per_tensor()
+    elif isinstance(token_to_kv_pool, NSATokenToKVPool):
+        kv_args.state_type = "nsa"
+        if draft_token_to_kv_pool is not None and isinstance(
+            draft_token_to_kv_pool, NSATokenToKVPool
+        ):
+            (
+                draft_state_data_ptrs,
+                draft_state_data_lens,
+                draft_state_item_lens,
+            ) = draft_token_to_kv_pool.get_state_buf_infos()
+            kv_args.state_data_ptrs += draft_state_data_ptrs
+            kv_args.state_data_lens += draft_state_data_lens
+            kv_args.state_item_lens += draft_state_item_lens
+    else:
+        kv_args.state_type = "none"
 
 
 def prepare_abort(req: Req, error_message: str, status_code=None):

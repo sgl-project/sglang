@@ -65,10 +65,7 @@ from sglang.srt.layers.quantization.fp8_utils import (
     requant_weight_ue8m0_inplace,
 )
 from sglang.srt.layers.quantization.kv_cache import BaseKVCacheMethod
-from sglang.srt.layers.quantization.marlin_utils_fp8 import (
-    apply_fp8_marlin_linear,
-    prepare_fp8_layer_for_marlin,
-)
+from sglang.srt.layers.quantization.marlin_utils_fp8 import prepare_fp8_layer_for_marlin
 from sglang.srt.layers.quantization.unquant import (
     UnquantizedFusedMoEMethod,
     UnquantizedLinearMethod,
@@ -732,7 +729,7 @@ class Fp8LinearMethod(LinearMethodBase):
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if self.use_marlin:
-            return apply_fp8_marlin_linear(
+            return torch.ops.sglang.apply_fp8_marlin_linear(
                 input=x,
                 weight=layer.weight,
                 weight_scale=layer.weight_scale,
@@ -1274,12 +1271,12 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 )
         elif _use_aiter_moe():
             # Pre-shuffle weights
-            t = shuffle_weight(layer.w13_weight, (16, 16))
-            layer.w13_weight.copy_(t)
-            del t
-            t = shuffle_weight(layer.w2_weight, (16, 16))
-            layer.w2_weight.copy_(t)
-            del t
+            layer.w13_weight.data = shuffle_weight(
+                layer.w13_weight.contiguous(), (16, 16)
+            )
+            layer.w2_weight.data = shuffle_weight(
+                layer.w2_weight.contiguous(), (16, 16)
+            )
         elif _is_cpu:
             assert (
                 _is_cpu_amx_available

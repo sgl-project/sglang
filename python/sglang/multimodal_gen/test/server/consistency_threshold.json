@@ -103,6 +103,12 @@
             "psnr_threshold": 25.0,
             "mean_abs_diff_threshold": 8.0
         },
+        "ltx_2_two_stage_t2v": {
+            "clip_threshold": 0.90,
+            "ssim_threshold": 0.89,
+            "psnr_threshold": 24.0,
+            "mean_abs_diff_threshold": 10.0
+        },
         "ltx_2.3_one_stage_ti2v": {
             "clip_threshold": 0.64,
             "ssim_threshold": 0.42,
@@ -244,8 +250,8 @@
         "ltx_2_3_hq_pipeline": {
             "clip_threshold": 0.78,
             "ssim_threshold": 0.48,
-            "psnr_threshold": 12.0,
-            "mean_abs_diff_threshold": 48.0
+            "psnr_threshold": 13.0,
+            "mean_abs_diff_threshold": 45.0
         },
         "ltx_2_3_two_stage_ti2v_2gpus": {
             "clip_threshold": 0.92,

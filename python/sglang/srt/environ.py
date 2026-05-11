@@ -325,6 +325,9 @@ class Envs:
     SGLANG_ROCM_FUSED_DECODE_MLA = EnvBool(False)
     SGLANG_ROCM_DISABLE_LINEARQUANT = EnvBool(False)
     SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(4096)
+    # Enable dual-stream MoE (shared experts vs routed experts) on the
+    # ROCm/AITER path. Requires GPU_MAX_HW_QUEUES>=5 to avoid HW-queue serialization.
+    SGLANG_ROCM_USE_MULTI_STREAM = EnvBool(False)
 
     # MPS (Apple Silicon)
     SGLANG_USE_MLX = EnvBool(False)
@@ -505,6 +508,9 @@ class Envs:
     # Tool-Call behavior
     SGLANG_TOOL_STRICT_LEVEL = EnvInt(ToolStrictLevel.OFF)
 
+    # Think tokens budget: negative means unlimited, >= 0 caps thinking tokens
+    SGLANG_MAX_THINK_TOKENS = EnvInt(-1)
+
     # Ngram
     SGLANG_NGRAM_FORCE_GREEDY_VERIFY = EnvBool(False)
 
@@ -559,15 +565,15 @@ class Envs:
     SGLANG_DSV4_MODE = EnvStr("2604")
     SGLANG_DSV4_2604_SUBMODE = EnvStr("2604B")
     SGLANG_OPT_DEEPGEMM_HC_PRENORM = EnvBool(True)
-    SGLANG_OPT_USE_TILELANG_MHC_PRE = EnvBool(True)
-    SGLANG_OPT_USE_TILELANG_MHC_POST = EnvBool(True)
+    SGLANG_OPT_USE_TILELANG_MHC_PRE = EnvBool(False)
+    SGLANG_OPT_USE_TILELANG_MHC_POST = EnvBool(False)
     SGLANG_OPT_USE_FUSED_COMPRESS = EnvBool(True)
     SGLANG_HACK_FLASHMLA_BACKEND = EnvStr("kernel")
     SGLANG_HACK_SKIP_FP4_FP8_GEMM = EnvBool(False)
     SGLANG_OPT_FP8_WO_A_GEMM = EnvBool(False)
     SGLANG_OPT_USE_FUSED_STORE_CACHE = EnvBool(True)
     SGLANG_OPT_USE_OVERLAP_STORE_CACHE = EnvBool(True)
-    SGLANG_OPT_USE_TILELANG_SWA_PREPARE = EnvBool(True)
+    SGLANG_OPT_USE_TILELANG_SWA_PREPARE = EnvBool(False)
     SGLANG_OPT_USE_JIT_KERNEL_FUSED_TOPK = EnvBool(True)
     SGLANG_OPT_USE_FUSED_HASH_TOPK = EnvBool(False)
     SGLANG_OPT_USE_JIT_INDEXER_METADATA = EnvBool(False)
@@ -589,6 +595,9 @@ class Envs:
     SGLANG_TOPK_TRANSFORM_512_TORCH = EnvBool(False)
     SGLANG_OPT_BF16_FP32_GEMM_ALGO = EnvBool(False)
     SGLANG_FORCE_TRITON_MOE_FP8 = EnvBool(False)
+    SGLANG_OPT_USE_AITER_MHC_PRE= EnvBool(True)
+    SGLANG_OPT_USE_AITER_MHC_POST= EnvBool(True)
+    SGLANG_OPT_USE_TRITON_SWA_PREPARE = EnvBool(True)
     # fmt: on
 
     # EPD

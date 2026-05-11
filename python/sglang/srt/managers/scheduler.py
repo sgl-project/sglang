@@ -431,6 +431,7 @@ class Scheduler(
 
         # Launch a model worker and draft model worker if using speculative decoding
         self.init_model_worker()
+        self.install_device_timer_on_runners()
 
         if (t := envs.SGLANG_TEST_STUCK_SCHEDULER_INIT.get()) > 0:
             time.sleep(t)
@@ -708,18 +709,6 @@ class Scheduler(
             self.model_worker = self.tp_worker
         else:
             self.model_worker = self.draft_worker
-
-        # Install device timer on model runners for fwd occupancy tracking
-        if hasattr(self, "forward_pass_device_timer"):
-            timer = self.forward_pass_device_timer
-            self.tp_worker.model_runner.device_timer = timer
-            if self.draft_worker is not None:
-                dw = getattr(self.draft_worker, "draft_worker", None)
-                if dw is not None:
-                    if hasattr(dw, "draft_runner"):
-                        dw.draft_runner.device_timer = timer
-                    for r in getattr(dw, "draft_runner_list", []):
-                        r.device_timer = timer
 
         # Get token and memory info from the model worker
         (
@@ -1083,6 +1072,15 @@ class Scheduler(
         elif self.chunked_prefill_size is not None and self.chunked_prefill_size <= 0:
             self.chunked_prefill_size = None
         self.chunked_req = None
+        # Tracks whether the current self.chunked_req was actually scheduled
+        # into last iteration's batch (i.e., in can_run_list -> got a fresh
+        # req_pool_idx from prepare_for_extend). Used to gate the
+        # stash_chunked_request call at the top of get_next_batch_to_run:
+        # if add_chunked_req early-returned under hybrid-SWA pressure,
+        # the req_pool_idx was already freed and fill_ids was reset by
+        # init_next_round_input, so running stash would double-free and
+        # corrupt prefix_indices.
+        self._chunked_req_scheduled_last_iter = False
         self.is_mixed_chunk = (
             self.chunked_prefill_size is not None
             and self.server_args.enable_mixed_chunk
@@ -2003,6 +2001,7 @@ class Scheduler(
                 require_reasoning=recv_req.require_reasoning,
                 return_hidden_states=recv_req.return_hidden_states,
                 return_routed_experts=recv_req.return_routed_experts,
+                return_indexer_topk=recv_req.return_indexer_topk,
                 eos_token_ids=self.model_config.hf_eos_token_id,
                 bootstrap_host=recv_req.bootstrap_host,
                 bootstrap_port=recv_req.bootstrap_port,
@@ -2458,7 +2457,9 @@ class Scheduler(
             # Move the chunked request out of the batch so that we can merge
             # only finished requests to running_batch.
             chunked_req_to_exclude.add(self.chunked_req)
-            self.stash_chunked_request(self.chunked_req)
+
+            if self._chunked_req_scheduled_last_iter:
+                self.stash_chunked_request(self.chunked_req)
 
         # HiSparse has its own prefill-to-decode transition; skip last_batch merge.
         if self.enable_hisparse:
@@ -2557,8 +2558,7 @@ class Scheduler(
 
     def get_num_allocatable_reqs(self, running_bs):
         res = get_global_server_args().pp_max_micro_batch_size - running_bs
-        if self.pp_size > 1:
-            res = min(res, self.req_to_token_pool.available_size())
+        res = min(res, self.req_to_token_pool.available_size())
         return res
 
     def get_new_batch_prefill(self) -> Optional[ScheduleBatch]:
@@ -2591,7 +2591,7 @@ class Scheduler(
         if self.enable_hierarchical_cache:
             self.tree_cache.check_hicache_events()
 
-        if self.enable_priority_preemption:
+        if self.enable_priority_preemption or self.is_hybrid_swa:
             # Reset batch_is_full to try preemption with a prefill adder.
             self.running_batch.batch_is_full = False
 
@@ -2653,6 +2653,11 @@ class Scheduler(
         if self.chunked_req is not None:
             self.chunked_req.init_next_round_input()
             self.chunked_req = adder.add_chunked_req(self.chunked_req)
+            self._chunked_req_scheduled_last_iter = (
+                self.chunked_req in adder.can_run_list
+            )
+        else:
+            self._chunked_req_scheduled_last_iter = False
 
         if self.enable_lora:
             running_loras = {req.lora_id for req in self.running_batch.reqs}
@@ -2744,6 +2749,9 @@ class Scheduler(
             # Update chunked prefill
             assert self.chunked_req is None
             self.chunked_req = adder.new_chunked_req
+            # new_chunked_req is added to can_run_list by add_one_req,
+            # so it will be scheduled this iter -> stash is needed next iter.
+            self._chunked_req_scheduled_last_iter = True
 
         if self.chunked_req is not None:
             self.chunked_req.is_chunked += 1
@@ -2944,16 +2952,13 @@ class Scheduler(
     ) -> Union[GenerationBatchResult, EmbeddingBatchResult]:
         """Run a batch."""
         self.forward_ct += 1
+        batch.forward_iter = self.forward_ct
 
         # Whether to run the profiler
         self._profile_batch_predicate(batch)
         if self.forward_sleep_time is not None:
             logger.info(f"Scheduler.run_batch sleep {self.forward_sleep_time}s")
             time.sleep(self.forward_sleep_time)
-
-        # Capture prefill start time for EXTEND mode
-        if batch.forward_mode == ForwardMode.EXTEND:
-            set_time_batch(batch.reqs, "set_prefill_run_batch_start_time")
 
         # Place holder handling for pd-disagg decode event loop
         if batch.forward_mode.is_prebuilt():
@@ -3067,10 +3072,6 @@ class Scheduler(
                     embeddings=pooler_output.embeddings,
                     pooled_hidden_states=pooler_output.pooled_hidden_states,
                 )
-
-        # Capture prefill end time for EXTEND mode
-        if batch.forward_mode == ForwardMode.EXTEND:
-            set_time_batch(batch.reqs, "set_prefill_run_batch_end_time")
 
         if (
             self.server_args.enable_dp_attention

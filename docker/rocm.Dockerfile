@@ -109,7 +109,30 @@ ARG MORI_COMMIT="v1.1.1"
 # AMD AINIC apt repo settings
 ARG AINIC_VERSION=1.117.5-a-38
 ARG UBUNTU_CODENAME=jammy
+
+# Optional Ubuntu mirror override + apt hardening.
+# - UBUNTU_MIRROR is empty by default (no behaviour change for local builds).
+#   When set (typically in CI), all http://*archive.ubuntu.com and
+#   http://*security.ubuntu.com entries in /etc/apt/sources.list are rewritten
+#   to point at the given base URL, e.g.
+#     --build-arg UBUNTU_MIRROR=https://archive.ubuntu.com
+#     --build-arg UBUNTU_MIRROR=https://tw.archive.ubuntu.com
+#     --build-arg UBUNTU_MIRROR=http://internal-cache.example.com
+#   This mirrors the pattern already used in docker/Dockerfile (NVIDIA) and
+#   docker/npu.Dockerfile, and lets CI runners that cannot reach Canonical's
+#   port-80 mirror IPs still complete `apt-get update`.
+# - The 80-net-hardening apt config adds retries + per-request timeout so that
+#   transient mirror flakes don't immediately fail a build (apt's default is 0
+#   retries).
+ARG UBUNTU_MIRROR=
 USER root
+
+RUN if [ -n "$UBUNTU_MIRROR" ]; then \
+        sed -i "s|http://[^[:space:]/]*archive.ubuntu.com|$UBUNTU_MIRROR|g" /etc/apt/sources.list && \
+        sed -i "s|http://[^[:space:]/]*security.ubuntu.com|$UBUNTU_MIRROR|g" /etc/apt/sources.list; \
+    fi && \
+    printf 'Acquire::Retries "5";\nAcquire::http::Timeout "30";\nAcquire::https::Timeout "30";\n' \
+        > /etc/apt/apt.conf.d/80-net-hardening
 
 # Fix hipDeviceGetName returning empty string in ROCm 7.0 docker images.
 # The ROCm 7.0 base image is missing libdrm-amdgpu-common which provides the
@@ -176,11 +199,17 @@ RUN if [ "$BUILD_LLVM" = "1" ]; then \
 # Unset setuptools_scm override so AITER gets its own version (AITER_COMMIT), not SGLang's
 # (SETUPTOOLS_SCM_PRETEND_VERSION is set later for SGLang nightly builds and would otherwise
 # leak into AITER's version when AITER uses setuptools_scm)
+
+# cherry pick:
+#   - b639cb6: aiter_mhc_pre fix
+#   - 0141c8c: dsv4 rope/rotate_activation fused kernel (PR #3035)
+# may be removed in next aiter upgrade
 ENV SETUPTOOLS_SCM_PRETEND_VERSION=
 RUN pip uninstall -y aiter
 RUN git clone ${AITER_REPO} \
  && cd aiter \
  && git checkout ${AITER_COMMIT} \
+ && git cherry-pick --no-commit b639cb63bcac4672dce33a731fad042a65cb3649 0141c8cf8eb894d194685d47a79ac3b4bb9ce406 \
  && git submodule update --init --recursive \
  && pip install -r requirements.txt
 
@@ -561,6 +590,10 @@ ENV SGLANG_TOPK_TRANSFORM_512_TORCH=0
 ENV SGLANG_OPT_USE_FUSED_COMPRESS=true
 ENV SGLANG_OPT_USE_TILELANG_INDEXER=true
 ENV SGLANG_HACK_FLASHMLA_BACKEND=tilelang
+ENV SGLANG_OPT_USE_AITER_MHC_PRE=true
+ENV SGLANG_OPT_USE_AITER_MHC_POST=true
+ENV SGLANG_OPT_USE_TILELANG_MHC_PRE=false
+ENV SGLANG_OPT_USE_TILELANG_MHC_POST=false
 
 ENV NCCL_MIN_NCHANNELS=112
 ENV ROCM_QUICK_REDUCE_QUANTIZATION=INT8
