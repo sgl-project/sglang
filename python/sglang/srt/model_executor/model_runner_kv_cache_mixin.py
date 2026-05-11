@@ -485,12 +485,12 @@ class ModelRunnerKVCacheMixin:
         mamba_layer_ids = [
             i
             for i in config.mamba2_cache_params.layers
-            if self.start_layer <= i < self.end_layer
+            if self.layer_info.start_layer <= i < self.layer_info.end_layer
         ]
         full_attention_layer_ids = [
             i
             for i in config.full_attention_layer_ids
-            if self.start_layer <= i < self.end_layer
+            if self.layer_info.start_layer <= i < self.layer_info.end_layer
         ]
 
         bundle = init_unified_mamba_pools(
@@ -499,8 +499,8 @@ class ModelRunnerKVCacheMixin:
             head_num=self.model_config.get_num_kv_heads(get_parallel().attn_tp_size),
             head_dim=self.model_config.head_dim,
             page_size=self.page_size,
-            start_layer=self.start_layer,
-            end_layer=self.end_layer,
+            start_layer=self.layer_info.start_layer,
+            end_layer=self.layer_info.end_layer,
             is_draft_worker=self.is_draft_worker,
             use_mla_backend=self.use_mla_backend,
             mamba_layer_ids=mamba_layer_ids,
@@ -576,12 +576,12 @@ class ModelRunnerKVCacheMixin:
         swa_attention_layer_ids = [
             i
             for i in self.model_config.swa_attention_layer_ids
-            if self.start_layer <= i < self.end_layer
+            if self.layer_info.start_layer <= i < self.layer_info.end_layer
         ]
         full_attention_layer_ids = [
             i
             for i in self.model_config.full_attention_layer_ids
-            if self.start_layer <= i < self.end_layer
+            if self.layer_info.start_layer <= i < self.layer_info.end_layer
         ]
 
         bundle = init_unified_swa_pools(
@@ -594,8 +594,8 @@ class ModelRunnerKVCacheMixin:
             swa_head_dim=swa_head_dim,
             swa_v_head_dim=swa_v_head_dim,
             page_size=self.page_size,
-            start_layer=self.start_layer,
-            end_layer=self.end_layer,
+            start_layer=self.layer_info.start_layer,
+            end_layer=self.layer_info.end_layer,
             swa_attention_layer_ids=swa_attention_layer_ids,
             full_attention_layer_ids=full_attention_layer_ids,
             full_max_total_num_tokens=self.full_max_total_num_tokens,
