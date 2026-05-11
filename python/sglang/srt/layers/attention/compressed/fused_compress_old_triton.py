@@ -23,42 +23,50 @@ def _compress_c4_decode_old_kernel(
     stride_ape_row,
     stride_out_row,
     HEAD_DIM: tl.constexpr,
-    HEAD_DIM_BLOCK: tl.constexpr,
+    BLOCK_D: tl.constexpr,  # tile size along head_dim; CTAs split HEAD_DIM
 ):
-    pid = tl.program_id(0)
-    seq_len = tl.load(seq_lens_ptr + pid).to(tl.int32)
-    req = tl.load(req_pool_indices_ptr + pid).to(tl.int64)
+    # 2D grid: (request, head_dim-stripe). Per-element of head_dim the softmax
+    # state (running_max/sum/weighted) is independent, so striping head_dim is
+    # correctness-free. Overlap-shift stores from different pid_d touch
+    # disjoint bytes within the same pool slot, so there is no race either.
+    # This raises CTA count from `bs` to `bs * ceil(HEAD_DIM/BLOCK_D)`, which
+    # matters at low decode bs where the original 1D grid leaves the GPU idle.
+    pid_bs = tl.program_id(0)
+    pid_d = tl.program_id(1)
+
+    seq_len = tl.load(seq_lens_ptr + pid_bs).to(tl.int32)
+    req = tl.load(req_pool_indices_ptr + pid_bs).to(tl.int64)
 
     write_pos = (seq_len - 1) % 4 + 4
     should_shift = (seq_len % 4) == 0
     is_first_compress = seq_len == 4
 
-    elem_offs = tl.arange(0, HEAD_DIM_BLOCK)
-    elem_mask = elem_offs < HEAD_DIM
+    d_offs = pid_d * BLOCK_D + tl.arange(0, BLOCK_D)
+    d_mask = d_offs < HEAD_DIM
 
-    in_base = pid.to(tl.int64) * stride_input_row
+    in_base = pid_bs.to(tl.int64) * stride_input_row
     pool_req_base = req * stride_pool_req
 
     # === 1. Write current token's 4 sections into pool slot `write_pos`. ===
     write_slot_base = pool_req_base + write_pos.to(tl.int64) * stride_pool_slot
     for sec in tl.static_range(4):
         x = tl.load(
-            kv_score_input_ptr + in_base + sec * HEAD_DIM + elem_offs,
-            mask=elem_mask,
+            kv_score_input_ptr + in_base + sec * HEAD_DIM + d_offs,
+            mask=d_mask,
             other=0.0,
         )
         tl.store(
-            pool_ptr + write_slot_base + sec * HEAD_DIM + elem_offs,
+            pool_ptr + write_slot_base + sec * HEAD_DIM + d_offs,
             x,
-            mask=elem_mask,
+            mask=d_mask,
         )
 
     # === 2. Online safe softmax + weighted sum across 8 slots, also doing
     #        overlap shift for slots 4..7 -> 0..3 when should_shift.
     NEG_BIG = -1.0e9
-    running_max = tl.full((HEAD_DIM_BLOCK,), NEG_BIG, tl.float32)
-    running_sum = tl.zeros((HEAD_DIM_BLOCK,), tl.float32)
-    weighted = tl.zeros((HEAD_DIM_BLOCK,), tl.float32)
+    running_max = tl.full((BLOCK_D,), NEG_BIG, tl.float32)
+    running_sum = tl.zeros((BLOCK_D,), tl.float32)
+    weighted = tl.zeros((BLOCK_D,), tl.float32)
 
     for slot in tl.static_range(8):
         slot_base = pool_req_base + slot * stride_pool_slot
@@ -73,19 +81,19 @@ def _compress_c4_decode_old_kernel(
             ape_off = HEAD_DIM
 
         kv_b = tl.load(
-            pool_ptr + slot_base + kv_off + elem_offs,
-            mask=elem_mask,
+            pool_ptr + slot_base + kv_off + d_offs,
+            mask=d_mask,
             other=0.0,
         )
         score_b = tl.load(
-            pool_ptr + slot_base + score_off + elem_offs,
-            mask=elem_mask,
+            pool_ptr + slot_base + score_off + d_offs,
+            mask=d_mask,
             other=0.0,
         )
         ratio_idx = slot % 4
         ape_b = tl.load(
-            ape_ptr + ratio_idx * stride_ape_row + ape_off + elem_offs,
-            mask=elem_mask,
+            ape_ptr + ratio_idx * stride_ape_row + ape_off + d_offs,
+            mask=d_mask,
             other=0.0,
         )
 
@@ -95,42 +103,42 @@ def _compress_c4_decode_old_kernel(
         if slot >= 4 and should_shift:
             target_base = pool_req_base + (slot - 4) * stride_pool_slot
             kv_other = tl.load(
-                pool_ptr + slot_base + 0 * HEAD_DIM + elem_offs,
-                mask=elem_mask,
+                pool_ptr + slot_base + 0 * HEAD_DIM + d_offs,
+                mask=d_mask,
                 other=0.0,
             )
             score_other = tl.load(
-                pool_ptr + slot_base + 2 * HEAD_DIM + elem_offs,
-                mask=elem_mask,
+                pool_ptr + slot_base + 2 * HEAD_DIM + d_offs,
+                mask=d_mask,
                 other=0.0,
             )
             tl.store(
-                pool_ptr + target_base + 0 * HEAD_DIM + elem_offs,
+                pool_ptr + target_base + 0 * HEAD_DIM + d_offs,
                 kv_other,
-                mask=elem_mask,
+                mask=d_mask,
             )
             tl.store(
-                pool_ptr + target_base + 1 * HEAD_DIM + elem_offs,
+                pool_ptr + target_base + 1 * HEAD_DIM + d_offs,
                 kv_b,
-                mask=elem_mask,
+                mask=d_mask,
             )
             tl.store(
-                pool_ptr + target_base + 2 * HEAD_DIM + elem_offs,
+                pool_ptr + target_base + 2 * HEAD_DIM + d_offs,
                 score_other,
-                mask=elem_mask,
+                mask=d_mask,
             )
             tl.store(
-                pool_ptr + target_base + 3 * HEAD_DIM + elem_offs,
+                pool_ptr + target_base + 3 * HEAD_DIM + d_offs,
                 score_b,
-                mask=elem_mask,
+                mask=d_mask,
             )
 
         # Edge case: very first compress (seq_len==4). Overlap slots 0..3 hold
         # uninitialized data; they should contribute nothing to the softmax.
         if is_first_compress and slot < 4:
-            kv_b = tl.zeros((HEAD_DIM_BLOCK,), tl.float32)
-            score_b = tl.full((HEAD_DIM_BLOCK,), NEG_BIG, tl.float32)
-            ape_b = tl.zeros((HEAD_DIM_BLOCK,), tl.float32)
+            kv_b = tl.zeros((BLOCK_D,), tl.float32)
+            score_b = tl.full((BLOCK_D,), NEG_BIG, tl.float32)
+            ape_b = tl.zeros((BLOCK_D,), tl.float32)
 
         s = score_b + ape_b
         new_max = tl.maximum(running_max, s)
@@ -144,10 +152,17 @@ def _compress_c4_decode_old_kernel(
 
     result = weighted / running_sum
     tl.store(
-        out_ptr + pid.to(tl.int64) * stride_out_row + elem_offs,
+        out_ptr + pid_bs.to(tl.int64) * stride_out_row + d_offs,
         result,
-        mask=elem_mask,
+        mask=d_mask,
     )
+
+
+# BLOCK_D=32 mirrors the c128 chunked kernel. With 8 statically-unrolled slots
+# the per-CTA work is small, so we want as many CTAs as possible (occupancy >
+# per-CTA ILP), which means a small BLOCK_D. Empirically best on MI355X across
+# bs=1..256, head_dim=128/256/512.
+_C4_BLOCK_D = 32
 
 
 def fused_compress_c4_decode_old_triton(
@@ -193,8 +208,12 @@ def fused_compress_c4_decode_old_triton(
     if bs == 0:
         return out
 
-    HEAD_DIM_BLOCK = triton.next_power_of_2(head_dim)
-    grid = (bs,)
+    # Clamp BLOCK_D to head_dim's next-power-of-2 so we never launch more
+    # head_dim-stripes than there is data to cover.
+    block_d = min(_C4_BLOCK_D, triton.next_power_of_2(head_dim))
+    num_d_chunks = triton.cdiv(head_dim, block_d)
+
+    grid = (bs, num_d_chunks)
     _compress_c4_decode_old_kernel[grid](
         pool_kv,
         kv_score_input_kv,
@@ -208,7 +227,7 @@ def fused_compress_c4_decode_old_triton(
         ape.stride(0),
         out.stride(0),
         HEAD_DIM=head_dim,
-        HEAD_DIM_BLOCK=HEAD_DIM_BLOCK,
+        BLOCK_D=block_d,
     )
     return out
 
@@ -216,105 +235,6 @@ def fused_compress_c4_decode_old_triton(
 # ---------------------------------------------------------------------------
 # c128 (ratio=128, overlap=False)
 # ---------------------------------------------------------------------------
-
-
-@triton.jit
-def _compress_c128_decode_old_kernel(
-    pool_kv_ptr,  # [N, 128, 2*head_dim] view: pool stride along slot = 2*head_dim
-    kv_score_input_kv_ptr,  # [bs, 2*head_dim]    view: row stride = 2*head_dim
-    ape_ptr,  # [128, head_dim]
-    out_ptr,  # [bs, head_dim]
-    seq_lens_ptr,
-    req_pool_indices_ptr,
-    stride_pool_req,
-    stride_pool_slot,
-    stride_input_row,
-    stride_ape_row,
-    stride_out_row,
-    HEAD_DIM: tl.constexpr,
-    BLOCK_D: tl.constexpr,  # tile size along head_dim; CTAs split HEAD_DIM
-    NUM_SLOTS: tl.constexpr,  # 128
-    NUM_STAGES: tl.constexpr,  # software pipelining stages for the slot loop
-):
-    # Each CTA owns (request pid_bs, head_dim-stripe pid_d). Splitting along
-    # HEAD_DIM is correctness-free since the online softmax state
-    # (running_max/sum/weighted) is per-element of head_dim, so stripes are
-    # independent. This raises CTA count from `bs` to `bs * ceil(HEAD_DIM/BLOCK_D)`,
-    # which is critical when bs is small at decode time.
-    pid_bs = tl.program_id(0)
-    pid_d = tl.program_id(1)
-
-    seq_len = tl.load(seq_lens_ptr + pid_bs).to(tl.int32)
-    req = tl.load(req_pool_indices_ptr + pid_bs).to(tl.int64)
-    write_pos = (seq_len - 1) % NUM_SLOTS
-
-    d_offs = pid_d * BLOCK_D + tl.arange(0, BLOCK_D)
-    d_mask = d_offs < HEAD_DIM
-
-    in_base = pid_bs.to(tl.int64) * stride_input_row
-    pool_req_base = req * stride_pool_req
-
-    # === 1. Write current token (kv, score) into pool slot `write_pos`. ===
-    # Each CTA writes only its own head_dim stripe; stripes are disjoint at the
-    # byte level, so no race across pid_d.
-    write_slot_base = pool_req_base + write_pos.to(tl.int64) * stride_pool_slot
-    for sec in tl.static_range(2):  # 0=kv, 1=score
-        x = tl.load(
-            kv_score_input_kv_ptr + in_base + sec * HEAD_DIM + d_offs,
-            mask=d_mask,
-            other=0.0,
-        )
-        tl.store(
-            pool_kv_ptr + write_slot_base + sec * HEAD_DIM + d_offs,
-            x,
-            mask=d_mask,
-        )
-
-    # === 2. Online safe softmax + weighted sum across NUM_SLOTS slots. ===
-    # Slots that haven't been filled yet still have score=-inf from clear(),
-    # so softmax naturally masks them out -- no special-case needed.
-    NEG_BIG = -1.0e9
-    running_max = tl.full((BLOCK_D,), NEG_BIG, tl.float32)
-    running_sum = tl.zeros((BLOCK_D,), tl.float32)
-    weighted = tl.zeros((BLOCK_D,), tl.float32)
-
-    # num_stages enables software pipelining: the compiler issues the next
-    # iteration's loads while the current iteration's compute is in flight.
-    # Hides HBM latency for the 128-iter sequential dependency chain.
-    for slot in tl.range(0, NUM_SLOTS, num_stages=NUM_STAGES):
-        slot_base = pool_req_base + slot * stride_pool_slot
-        kv_b = tl.load(
-            pool_kv_ptr + slot_base + 0 * HEAD_DIM + d_offs,
-            mask=d_mask,
-            other=0.0,
-        )
-        score_b = tl.load(
-            pool_kv_ptr + slot_base + 1 * HEAD_DIM + d_offs,
-            mask=d_mask,
-            other=NEG_BIG,
-        )
-        ape_b = tl.load(
-            ape_ptr + slot * stride_ape_row + d_offs,
-            mask=d_mask,
-            other=0.0,
-        )
-
-        s = score_b + ape_b
-        new_max = tl.maximum(running_max, s)
-        factor = tl.exp(running_max - new_max)
-        running_sum = running_sum * factor
-        weighted = weighted * factor
-        e = tl.exp(s - new_max)
-        running_sum = running_sum + e
-        weighted = weighted + kv_b * e
-        running_max = new_max
-
-    result = weighted / running_sum
-    tl.store(
-        out_ptr + pid_bs.to(tl.int64) * stride_out_row + d_offs,
-        result,
-        mask=d_mask,
-    )
 
 
 # BLOCK_D=32, BLOCK_S=64 was the empirically best config on MI355X (gfx950)
