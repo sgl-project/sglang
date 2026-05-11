@@ -1091,14 +1091,7 @@ class ModelRunner:
         if self.device != "cpu":
             torch.set_num_threads(1)
         if self.device == "cuda":
-            if torch.cuda.get_device_capability()[0] < 8:
-                logger.info(
-                    "Compute capability below sm80. Use float16 due to lack of bfloat16 support."
-                )
-                self.server_args.dtype = "float16"
-                self.model_config.dtype = torch.float16
-                if torch.cuda.get_device_capability()[1] < 5:
-                    raise RuntimeError("SGLang only supports sm75 and above.")
+            self._maybe_downgrade_dtype_for_legacy_gpu()
 
         set_cuda_arch()
 
@@ -1313,6 +1306,16 @@ class ModelRunner:
                 raise ValueError(
                     f"TP rank {self.tp_rank} could finish the model loading, but there are other ranks that didn't finish loading. It is likely due to unexpected failures (e.g., OOM) or a slow node."
                 ) from None
+
+    def _maybe_downgrade_dtype_for_legacy_gpu(self) -> None:
+        if torch.cuda.get_device_capability()[0] < 8:
+            logger.info(
+                "Compute capability below sm80. Use float16 due to lack of bfloat16 support."
+            )
+            self.server_args.dtype = "float16"
+            self.model_config.dtype = torch.float16
+            if torch.cuda.get_device_capability()[1] < 5:
+                raise RuntimeError("SGLang only supports sm75 and above.")
 
     def maybe_recover_ep_ranks(self):
         # TODO(perf): `active_ranks.all()` on a CUDA tensor triggers host-device
