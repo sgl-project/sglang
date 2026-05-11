@@ -270,9 +270,6 @@ def _matmul_persistent_deepgemm(
 def matmul_persistent(
     a: torch.Tensor, b: torch.Tensor, bias: torch.Tensor | None = None
 ):
-    if a.shape[0] == 0:
-        return torch.empty((0, b.shape[1]), device=a.device, dtype=a.dtype)
-
     K, N = b.shape
 
     # DeepGEMM has minimum dimension requirements for TMA descriptors
