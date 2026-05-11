@@ -2066,19 +2066,52 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         mamba_track_seqlens_cpu.append(mamba_track_seqlen)
 
     def _merge_mamba_tracking(self, other: "ScheduleBatch"):
-        """Merge mamba tracking tensors during batch merge."""
         if self.mamba_track_mask is None and other.mamba_track_mask is None:
             self.mamba_track_indices = None
             self.mamba_track_mask = None
             self.mamba_track_seqlens = None
             return
 
+        self_bs = len(self.reqs)
         other_bs = len(other.reqs)
-        if other_bs ==0:
+        if self_bs == 0 or other_bs == 0:
             return
         device = self.device
 
-        # Decode requests need placeholder entries (no tracking needed).
+        # Left-pad self with placeholders when it lacks tensors that other has.
+        # mask=False and seqlens=-1 indicate no tracking is needed for these
+        # requests. indices are built from the ping-pong buffer to provide valid
+        # values, though they won't be used since mask=False gates all access.
+        if self.mamba_track_mask is None and other.mamba_track_mask is not None:
+            self.mamba_track_mask = torch.zeros(
+                self_bs, dtype=torch.bool, device=device
+            )
+        if self.mamba_track_seqlens is None and other.mamba_track_seqlens is not None:
+            self.mamba_track_seqlens = torch.full(
+                (self_bs,), -1, dtype=torch.int64, device=device
+            )
+        if self.mamba_track_indices is None and other.mamba_track_indices is not None:
+            if self_bs > 0:
+                self.mamba_track_indices = (
+                    torch.stack(
+                        [
+                            r.mamba_ping_pong_track_buffer[r.mamba_next_track_idx]
+                            for r in self.reqs
+                        ]
+                    )
+                    .to(torch.int64)
+                    .to(device=device)
+                )
+            else:
+                self.mamba_track_indices = torch.empty(
+                    (0,), dtype=torch.int64, device=device
+                )
+
+        # Right-pad other with placeholders. In mix_with_running, the decode
+        # batch is treated as single-token extend (extend_input_len=1), which
+        # does not require mamba state tracking in the extend forward pass.
+        # Using mask=False ensures _init_track_conv_indices and
+        # _init_track_ssm_indices skip these requests entirely.
         if self.mamba_track_mask is not None:
             self.mamba_track_mask = torch.cat(
                 [
@@ -2094,6 +2127,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 ]
             )
         if self.mamba_track_indices is not None:
+            # other may have real indices (decode batch after prepare_for_decode)
+            # or None (after filter_batch). When None, build from ping-pong buffer.
             decode_indices = other.mamba_track_indices
             if decode_indices is None:
                 decode_indices = torch.stack(
