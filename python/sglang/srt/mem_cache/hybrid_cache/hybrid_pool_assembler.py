@@ -454,6 +454,7 @@ def attach_hybrid_nsa_pool_to_hiradix_cache(
             attn_tp_group=attn_tp_group,
             storage_backend=server_args.hicache_storage_backend,
             use_mla=True,
+            override_kv_cache_dim=kv.kv_cache_dim,
             prefetch_threshold=prefetch_threshold,
             shared_host_pool_factory=lambda kv_host_pool: NSAIndexerPoolHost(
                 kv,
