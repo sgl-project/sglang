@@ -8,6 +8,7 @@ import torch
 def register_cpu_ci(*_args, **_kwargs):
     return None
 
+
 register_cpu_ci(est_time=5, suite="stage-a-test-cpu")
 
 _MODULE_PATH = (
@@ -34,17 +35,15 @@ kivi_roundtrip_kv_chunk = _KIVI_UTILS.kivi_roundtrip_kv_chunk
 
 class TestKIVIUtils(unittest.TestCase):
     def test_unpack_and_dequant_kcache_uses_quant_param_dtype(self):
-        base = torch.arange(
-            1, 1 + 1 * 2 * 16 * 16, dtype=torch.float32
-        ).view(1, 2, 16, 16)
+        base = torch.arange(1, 1 + 1 * 2 * 16 * 16, dtype=torch.float32).view(
+            1, 2, 16, 16
+        )
 
         for dtype in (torch.float16, torch.bfloat16):
             with self.subTest(dtype=dtype):
                 k = base.to(dtype)
                 code, scale, mn = quant_and_pack_kcache(k, group_size=4, bits=2)
-                out = unpack_and_dequant_kcache(
-                    code, scale, mn, group_size=4, bits=2
-                )
+                out = unpack_and_dequant_kcache(code, scale, mn, group_size=4, bits=2)
 
                 self.assertEqual(scale.dtype, dtype)
                 self.assertEqual(mn.dtype, dtype)
@@ -52,17 +51,15 @@ class TestKIVIUtils(unittest.TestCase):
                 self.assertEqual(out.shape, k.shape)
 
     def test_unpack_and_dequant_vcache_uses_quant_param_dtype(self):
-        base = torch.arange(
-            1, 1 + 1 * 2 * 16 * 16, dtype=torch.float32
-        ).view(1, 2, 16, 16)
+        base = torch.arange(1, 1 + 1 * 2 * 16 * 16, dtype=torch.float32).view(
+            1, 2, 16, 16
+        )
 
         for dtype in (torch.float16, torch.bfloat16):
             with self.subTest(dtype=dtype):
                 v = base.to(dtype)
                 code, scale, mn = quant_and_pack_vcache(v, group_size=4, bits=2)
-                out = unpack_and_dequant_vcache(
-                    code, scale, mn, group_size=4, bits=2
-                )
+                out = unpack_and_dequant_vcache(code, scale, mn, group_size=4, bits=2)
 
                 self.assertEqual(scale.dtype, dtype)
                 self.assertEqual(mn.dtype, dtype)
