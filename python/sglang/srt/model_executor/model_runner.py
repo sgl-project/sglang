@@ -40,6 +40,7 @@ from sglang.srt.configs import (
     BailingHybridConfig,
     FalconH1Config,
     GraniteMoeHybridConfig,
+    InternS2PreviewConfig,
     JetNemotronConfig,
     JetVLMConfig,
     KimiLinearConfig,
@@ -1488,7 +1489,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 )
             self._publish_modelexpress_metadata()
 
-        get_offloader().post_init()
+        if not self.is_draft_worker:
+            get_offloader().post_init()
 
         # Register model for layerwise NVTX profiling if enabled
         if self.server_args.enable_layerwise_nvtx_marker:
@@ -2206,6 +2208,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             Qwen3NextConfig
             | Qwen3_5Config
             | Qwen3_5MoeConfig
+            | InternS2PreviewConfig
             | JetNemotronConfig
             | JetVLMConfig,
         ):

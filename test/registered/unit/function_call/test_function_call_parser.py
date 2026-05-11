@@ -31,7 +31,7 @@ from sglang.srt.function_call.pythonic_detector import PythonicDetector
 from sglang.srt.function_call.qwen3_coder_detector import Qwen3CoderDetector
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(15, "stage-a-test-cpu")
+register_cpu_ci(est_time=15, suite="stage-a-test-cpu")
 
 
 class TestPythonicDetector(unittest.TestCase):
@@ -1686,6 +1686,26 @@ class TestDeepSeekV32Detector(unittest.TestCase):
         grammar = xgr.Grammar.from_structural_tag(structural_tag)
         self.assertIsInstance(grammar, xgr.Grammar)
 
+    def test_self_closing_zero_arg_invoke(self):
+        """V32 inherits the same regex; verify self-closing parses to empty
+        params here too (V32 model rarely emits this shape, but the parser
+        must agree with V4 since V4 inherits from V32)."""
+        submit_tool = Tool(
+            type="function",
+            function=Function(
+                name="submit",
+                parameters={"type": "object", "properties": {}},
+            ),
+        )
+        text = (
+            '<｜DSML｜function_calls>\n<｜DSML｜invoke name="submit"/>\n'
+            "</｜DSML｜function_calls>"
+        )
+        result = self.detector.detect_and_parse(text, [submit_tool])
+        self.assertEqual(len(result.calls), 1)
+        self.assertEqual(result.calls[0].name, "submit")
+        self.assertEqual(json.loads(result.calls[0].parameters), {})
+
 
 class TestDeepSeekV4Detector(unittest.TestCase):
     def setUp(self):
@@ -2110,6 +2130,96 @@ class TestDeepSeekV4Detector(unittest.TestCase):
         self.assertIsInstance(structural_tag, xgr.StructuralTag)
         grammar = xgr.Grammar.from_structural_tag(structural_tag)
         self.assertIsInstance(grammar, xgr.Grammar)
+
+    def test_self_closing_zero_arg_invoke(self):
+        """V4 emits `<｜DSML｜invoke name="x"/>` for zero-arg tools; the
+        detector must parse it as a complete tool call with empty params
+        instead of leaking the raw markup back into normal_text."""
+        submit_tool = Tool(
+            type="function",
+            function=Function(
+                name="submit",
+                description="Submit the final answer.",
+                parameters={"type": "object", "properties": {}},
+            ),
+        )
+
+        text = (
+            "Final answer.\n"
+            '<｜DSML｜tool_calls>\n<｜DSML｜invoke name="submit"/>\n'
+            "</｜DSML｜tool_calls>"
+        )
+        result = self.detector.detect_and_parse(text, [submit_tool])
+        self.assertEqual(len(result.calls), 1)
+        self.assertEqual(result.calls[0].name, "submit")
+        self.assertEqual(json.loads(result.calls[0].parameters), {})
+        self.assertNotIn("DSML", result.normal_text)
+
+    def test_self_closing_mixed_with_long_form(self):
+        """Mix of long-form (with params) and self-closing tags in one block."""
+        submit_tool = Tool(
+            type="function",
+            function=Function(
+                name="submit",
+                parameters={"type": "object", "properties": {}},
+            ),
+        )
+        text = (
+            "<｜DSML｜tool_calls>\n"
+            '<｜DSML｜invoke name="get_favorite_tourist_spot">\n'
+            '<｜DSML｜parameter name="city" string="true">SF</｜DSML｜parameter>\n'
+            "</｜DSML｜invoke>\n"
+            '<｜DSML｜invoke name="submit"/>\n'
+            "</｜DSML｜tool_calls>"
+        )
+        result = self.detector.detect_and_parse(text, self.tools + [submit_tool])
+        self.assertEqual(len(result.calls), 2)
+        self.assertEqual(result.calls[0].name, "get_favorite_tourist_spot")
+        self.assertEqual(json.loads(result.calls[0].parameters), {"city": "SF"})
+        self.assertEqual(result.calls[1].name, "submit")
+        self.assertEqual(json.loads(result.calls[1].parameters), {})
+
+    def test_streaming_self_closing_invoke(self):
+        """Self-closing invoke must terminate cleanly even when `/>` arrives
+        after the `name=` attribute crosses chunk boundaries."""
+        submit_tool = Tool(
+            type="function",
+            function=Function(
+                name="submit",
+                parameters={"type": "object", "properties": {}},
+            ),
+        )
+        # Build the prompt and feed it through the tokenizer to exercise the
+        # same chunk shapes the runtime sees.
+        text = (
+            "<｜DSML｜tool_calls>\n"
+            '<｜DSML｜invoke name="submit"/>\n'
+            "</｜DSML｜tool_calls>"
+        )
+        self.detector = DeepSeekV4Detector()
+        input_ids = self.tokenizer.encode(text, add_special_tokens=False)
+        chunks = [
+            self.tokenizer.decode(input_ids[i : i + self.interval])
+            for i in range(0, len(input_ids), self.interval)
+        ]
+
+        tool_calls_by_index = {}
+        for chunk in chunks:
+            result = self.detector.parse_streaming_increment(chunk, [submit_tool])
+            for call in result.calls:
+                if call.tool_index is None:
+                    continue
+                slot = tool_calls_by_index.setdefault(
+                    call.tool_index, {"name": "", "parameters": ""}
+                )
+                if call.name:
+                    slot["name"] = call.name
+                if call.parameters:
+                    slot["parameters"] += call.parameters
+
+        self.assertEqual(len(tool_calls_by_index), 1)
+        self.assertEqual(tool_calls_by_index[0]["name"], "submit")
+        self.assertEqual(json.loads(tool_calls_by_index[0]["parameters"]), {})
 
 
 class TestQwen3CoderDetector(unittest.TestCase):
