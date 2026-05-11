@@ -656,23 +656,9 @@ class SchedulerBatchResultProcessor:
                 )
 
             if req.grammar is not None:
-                # FIXME: this try-except block is for handling unexpected xgrammar issue.
-                try:
-                    if batch.spec_algorithm.is_none():
-                        # Normal decode: single token
-                        req.grammar.accept_token(next_token_id)
-                    elif batch.is_spec_v2:
-                        # Speculative decode: next_token_id is a list of accepted tokens
-                        for token_id in next_token_id:
-                            req.grammar.accept_token(token_id)
-                except ValueError as e:
-                    # Grammar accept_token can raise ValueError if the token is not in the grammar.
-                    # This can happen if the grammar is not set correctly or the token is invalid.
-                    logger.error(
-                        f"Grammar accept_token failed for req {req.rid} with token {next_token_id}: {e}"
-                    )
-                    self.abort_request(AbortReq(rid=req.rid))
-                req.grammar.finished = req.finished()
+                self._apply_decode_grammar(
+                    req=req, next_token_id=next_token_id, batch=batch
+                )
 
         self.output_streamer.stream_output(batch.reqs, batch.return_logprob)
         self.token_to_kv_pool_allocator.free_group_end()
@@ -726,6 +712,31 @@ class SchedulerBatchResultProcessor:
                 req.output_token_ids_logprobs_idx.append(
                     logits_output.next_token_token_ids_logprobs_idx[flat_idx]
                 )
+
+    def _apply_decode_grammar(
+        self,
+        *,
+        req: Req,
+        next_token_id: Union[int, List[int]],
+        batch: ScheduleBatch,
+    ) -> None:
+        # FIXME: this try-except block is for handling unexpected xgrammar issue.
+        try:
+            if batch.spec_algorithm.is_none():
+                # Normal decode: single token
+                req.grammar.accept_token(next_token_id)
+            elif batch.is_spec_v2:
+                # Speculative decode: next_token_id is a list of accepted tokens
+                for token_id in next_token_id:
+                    req.grammar.accept_token(token_id)
+        except ValueError as e:
+            # Grammar accept_token can raise ValueError if the token is not in the grammar.
+            # This can happen if the grammar is not set correctly or the token is invalid.
+            logger.error(
+                f"Grammar accept_token failed for req {req.rid} with token {next_token_id}: {e}"
+            )
+            self.abort_request(AbortReq(rid=req.rid))
+        req.grammar.finished = req.finished()
 
     def _handle_finished_req(
         self,
