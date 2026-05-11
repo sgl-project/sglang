@@ -683,7 +683,8 @@ class SchedulerDisaggregationPrefillMixin:
 
         for req in done_reqs:
             req.time_stats.set_completion_time()
-            getattr(self, "_prefill_inflight_poll_warning_state", {}).pop(req.rid, None)
+            if hasattr(self, "_prefill_inflight_poll_warning_state"):
+                self._prefill_inflight_poll_warning_state.pop(req.rid, None)
 
         for req in done_reqs:
             if isinstance(req.finished_reason, FINISH_ABORT):
