@@ -1052,6 +1052,12 @@
                     ]
                   },
                   {
+                    "group": "OpenBMB",
+                    "pages": [
+                      "cookbook/autoregressive/OpenBMB/MiniCPM-V-4_6"
+                    ]
+                  },
+                  {
                     "group": "Jina AI",
                     "pages": [
                       "cookbook/autoregressive/Jina/Jina-reranker-m0"
