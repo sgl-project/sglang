@@ -268,7 +268,7 @@ class SchedulerOutputProcessorMixin:
                         extend_logprob_start_len = extend_logprob_start_len_per_req[i]
                         extend_input_len = extend_input_len_per_req[i]
 
-                        num_input_logprobs = self._calculate_num_input_logprobs(
+                        num_input_logprobs = self.calculate_num_input_logprobs(
                             req, extend_input_len, extend_logprob_start_len
                         )
 
@@ -326,7 +326,7 @@ class SchedulerOutputProcessorMixin:
                         extend_input_len = extend_input_len_per_req[i]
                         if extend_logprob_start_len < extend_input_len:
                             # Update input logprobs.
-                            num_input_logprobs = self._calculate_num_input_logprobs(
+                            num_input_logprobs = self.calculate_num_input_logprobs(
                                 req, extend_input_len, extend_logprob_start_len
                             )
                             if req.return_logprob:
@@ -813,7 +813,7 @@ class SchedulerOutputProcessorMixin:
         else:
             return len(req.origin_input_ids[req.logprob_start_len :])
 
-    def _calculate_num_input_logprobs(
+    def calculate_num_input_logprobs(
         self: Scheduler, req: Req, extend_input_len: int, extend_logprob_start_len: int
     ) -> int:
         """Calculate the number of input logprobs based on whether multi-item scoring is enabled.
