@@ -23,14 +23,11 @@ def _compress_c4_decode_old_kernel(
     stride_ape_row,
     stride_out_row,
     HEAD_DIM: tl.constexpr,
-    BLOCK_D: tl.constexpr,  # tile size along head_dim; CTAs split HEAD_DIM
+    BLOCK_D: tl.constexpr,
 ):
-    # 2D grid: (request, head_dim-stripe). Per-element of head_dim the softmax
-    # state (running_max/sum/weighted) is independent, so striping head_dim is
-    # correctness-free. Overlap-shift stores from different pid_d touch
-    # disjoint bytes within the same pool slot, so there is no race either.
-    # This raises CTA count from `bs` to `bs * ceil(HEAD_DIM/BLOCK_D)`, which
-    # matters at low decode bs where the original 1D grid leaves the GPU idle.
+    # 2D grid (request, head_dim-stripe): per-element softmax along head_dim is
+    # independent, and overlap-shift stores from different pid_d touch disjoint
+    # bytes within the same pool slot, so striping head_dim is race-free.
     pid_bs = tl.program_id(0)
     pid_d = tl.program_id(1)
 
@@ -47,7 +44,7 @@ def _compress_c4_decode_old_kernel(
     in_base = pid_bs.to(tl.int64) * stride_input_row
     pool_req_base = req * stride_pool_req
 
-    # === 1. Write current token's 4 sections into pool slot `write_pos`. ===
+    # Write current token's 4 sections into pool slot `write_pos`.
     write_slot_base = pool_req_base + write_pos.to(tl.int64) * stride_pool_slot
     for sec in tl.static_range(4):
         x = tl.load(
@@ -61,8 +58,6 @@ def _compress_c4_decode_old_kernel(
             mask=d_mask,
         )
 
-    # === 2. Online safe softmax + weighted sum across 8 slots, also doing
-    #        overlap shift for slots 4..7 -> 0..3 when should_shift.
     NEG_BIG = -1.0e9
     running_max = tl.full((BLOCK_D,), NEG_BIG, tl.float32)
     running_sum = tl.zeros((BLOCK_D,), tl.float32)
@@ -97,9 +92,8 @@ def _compress_c4_decode_old_kernel(
             other=0.0,
         )
 
-        # Overlap shift: copy slots 4..7 into 0..3 entirely. We already loaded
-        # half of kv and half of score for compression; load the OTHER halves
-        # only when shift is actually needed to avoid wasted reads.
+        # Overlap shift slots 4..7 -> 0..3. Load the OTHER halves only when
+        # shift is actually needed to avoid wasted reads.
         if slot >= 4 and should_shift:
             target_base = pool_req_base + (slot - 4) * stride_pool_slot
             kv_other = tl.load(
@@ -133,8 +127,8 @@ def _compress_c4_decode_old_kernel(
                 mask=d_mask,
             )
 
-        # Edge case: very first compress (seq_len==4). Overlap slots 0..3 hold
-        # uninitialized data; they should contribute nothing to the softmax.
+        # First compress (seq_len==4): overlap slots 0..3 are uninitialized,
+        # mask them out of the softmax.
         if is_first_compress and slot < 4:
             kv_b = tl.zeros((BLOCK_D,), tl.float32)
             score_b = tl.full((BLOCK_D,), NEG_BIG, tl.float32)
@@ -158,10 +152,6 @@ def _compress_c4_decode_old_kernel(
     )
 
 
-# BLOCK_D=32 mirrors the c128 chunked kernel. With 8 statically-unrolled slots
-# the per-CTA work is small, so we want as many CTAs as possible (occupancy >
-# per-CTA ILP), which means a small BLOCK_D. Empirically best on MI355X across
-# bs=1..256, head_dim=128/256/512.
 _C4_BLOCK_D = 32
 
 
@@ -176,8 +166,7 @@ def fused_compress_c4_decode_old_triton(
 ) -> torch.Tensor:
     """Fused c4 (ratio=4, overlap=True) compress for the OLD path."""
     bs = kv_score_input_kv.size(0)
-    # The "kv" tensors are 2*head_dim views of a 4*head_dim contiguous parent
-    # so per-row stride must equal 4*head_dim.
+    # `kv` tensors are 2*head_dim views of a 4*head_dim contiguous parent.
     assert pool_kv.dim() == 3 and pool_kv.dtype == torch.float32
     assert pool_kv.shape[1] == 8 and pool_kv.shape[2] == 2 * head_dim
     assert pool_kv.stride(2) == 1 and pool_kv.stride(1) == 4 * head_dim, (
@@ -208,8 +197,6 @@ def fused_compress_c4_decode_old_triton(
     if bs == 0:
         return out
 
-    # Clamp BLOCK_D to head_dim's next-power-of-2 so we never launch more
-    # head_dim-stripes than there is data to cover.
     block_d = min(_C4_BLOCK_D, triton.next_power_of_2(head_dim))
     num_d_chunks = triton.cdiv(head_dim, block_d)
 
@@ -232,16 +219,9 @@ def fused_compress_c4_decode_old_triton(
     return out
 
 
-# ---------------------------------------------------------------------------
 # c128 (ratio=128, overlap=False)
-# ---------------------------------------------------------------------------
-
-
-# BLOCK_D=32, BLOCK_S=64 was the empirically best config on MI355X (gfx950)
-# across bs=1..256 and head_dim=128/256/512. BLOCK_S=64 leaves only 2 outer
-# chunks for the 128 slots, killing the serial dependency that bottlenecked
-# the original kernel; BLOCK_D=32 sizes each CTA to half a 64-wide wavefront,
-# which maximizes CTA count (and therefore HBM pipelining) at low decode bs.
+# BLOCK_D=32, BLOCK_S=64 was empirically best on MI355X (gfx950) across
+# bs=1..256 and head_dim=128/256/512.
 _C128_BLOCK_D = 32
 _C128_BLOCK_S = 64
 
@@ -288,8 +268,6 @@ def fused_compress_c128_decode_old_triton(
     if bs == 0:
         return out
 
-    # Clamp BLOCK_D to head_dim's next-power-of-2 so we never launch more
-    # head_dim-stripes than there is data to cover.
     block_d = min(_C128_BLOCK_D, triton.next_power_of_2(head_dim))
     num_d_chunks = triton.cdiv(head_dim, block_d)
 
@@ -314,24 +292,9 @@ def fused_compress_c128_decode_old_triton(
     return out
 
 
-# ---------------------------------------------------------------------------
-# c128 chunked variant: parallel-within-chunk + online combine across chunks
-# ---------------------------------------------------------------------------
-#
-# The naive c128 kernel above has a 128-iteration serial dependency on
-# (running_max, running_sum, weighted) -- each iter must wait for HBM round-trip
-# of the previous one. On MI355X this dominates wall time (~40 us is mostly
-# load latency * 128).
-#
-# This variant tiles the slot dimension into BLOCK_S-sized chunks. Within a
-# chunk, we issue all BLOCK_S * 3 loads in parallel and do a single-pass
-# (BLOCK_S-way) reduction (no sequential dep inside the chunk). Across chunks
-# we still do online softmax combine, but only NUM_SLOTS/BLOCK_S = 4 sequential
-# iters (BLOCK_S=32) instead of 128.
-#
-# Per-CTA register footprint is the bottleneck:
-#   3 tiles of (BLOCK_S, BLOCK_D) floats in registers (kv, score+ape, exp_s).
-#   With BLOCK_S=32, BLOCK_D=64 -> 32 * 64 * 3 = 6 KB per tile-set per CTA.
+# Tile slot dimension into BLOCK_S chunks: parallel single-pass reduction inside
+# each chunk + online softmax combine across chunks. Replaces a 128-iter serial
+# dependency with NUM_SLOTS/BLOCK_S iterations.
 @triton.jit
 def _compress_c128_decode_chunked_kernel(
     pool_kv_ptr,
@@ -350,8 +313,7 @@ def _compress_c128_decode_chunked_kernel(
     BLOCK_S: tl.constexpr,
     NUM_SLOTS: tl.constexpr,
 ):
-    # 2D grid: (request, head_dim-stripe). Same correctness argument as the
-    # other kernel -- per-element of head_dim the softmax is independent.
+    # 2D grid (request, head_dim-stripe); per-element softmax is independent.
     pid_bs = tl.program_id(0)
     pid_d = tl.program_id(1)
 
@@ -365,79 +327,62 @@ def _compress_c128_decode_chunked_kernel(
     in_base = pid_bs.to(tl.int64) * stride_input_row
     pool_req_base = req * stride_pool_req
 
-    # === 1. Read current token's (kv, score) from input. ===
-    # NOTE: we deliberately do *not* store these to pool[write_pos] up front.
-    # In the chunked kernel below, tile loads pull multiple slots at once, and
-    # if write_pos falls inside a tile, the read can race with the store. We
-    # sidestep this by keeping the current token in registers and patching it
-    # into the tile via tl.where; the actual store to pool is deferred to the
-    # end of the kernel.
+    # Read current token's (kv, score) but defer the pool[write_pos] store
+    # until after the softmax pass; otherwise tile loads that span write_pos
+    # would race with the store. Patched into the tile via tl.where below.
     kv_input = tl.load(
         kv_score_input_kv_ptr + in_base + 0 * HEAD_DIM + d_offs,
         mask=d_mask,
         other=0.0,
-    )  # (BLOCK_D,)
+    )
     score_input = tl.load(
         kv_score_input_kv_ptr + in_base + 1 * HEAD_DIM + d_offs,
         mask=d_mask,
         other=0.0,
-    )  # (BLOCK_D,)
+    )
 
-    # === 2. Chunked softmax over NUM_SLOTS / BLOCK_S chunks. ===
     NEG_BIG = -1.0e9
     NUM_CHUNKS: tl.constexpr = NUM_SLOTS // BLOCK_S
     running_max = tl.full((BLOCK_D,), NEG_BIG, tl.float32)
     running_sum = tl.zeros((BLOCK_D,), tl.float32)
     weighted = tl.zeros((BLOCK_D,), tl.float32)
 
-    # Static-unroll the chunks (no need for software pipelining at this depth;
-    # the bulk of the work is the parallel intra-chunk reductions).
     for chunk_idx in tl.static_range(NUM_CHUNKS):
-        slot_offs = chunk_idx * BLOCK_S + tl.arange(0, BLOCK_S)  # (BLOCK_S,)
+        slot_offs = chunk_idx * BLOCK_S + tl.arange(0, BLOCK_S)
         slot_base = pool_req_base + slot_offs[:, None].to(tl.int64) * stride_pool_slot
 
-        # Tile load: all BLOCK_S slots' kv / score / ape in one go.
         kv_tile = tl.load(
             pool_kv_ptr + slot_base + 0 * HEAD_DIM + d_offs[None, :],
             mask=d_mask[None, :],
             other=0.0,
-        )  # (BLOCK_S, BLOCK_D)
+        )
         score_tile = tl.load(
             pool_kv_ptr + slot_base + 1 * HEAD_DIM + d_offs[None, :],
             mask=d_mask[None, :],
             other=NEG_BIG,
-        )  # (BLOCK_S, BLOCK_D)
+        )
         ape_tile = tl.load(
             ape_ptr + slot_offs[:, None] * stride_ape_row + d_offs[None, :],
             mask=d_mask[None, :],
             other=0.0,
-        )  # (BLOCK_S, BLOCK_D)
+        )
 
-        # Patch in the current token at write_pos. The mask is (BLOCK_S, 1)
-        # which broadcasts; kv_input / score_input are (BLOCK_D,) and broadcast
-        # along the slot axis.
-        is_writepos = slot_offs[:, None] == write_pos  # (BLOCK_S, 1)
+        # Patch current token at write_pos into the tile.
+        is_writepos = slot_offs[:, None] == write_pos
         kv_tile = tl.where(is_writepos, kv_input[None, :], kv_tile)
         score_tile = tl.where(is_writepos, score_input[None, :], score_tile)
 
-        s = score_tile + ape_tile  # (BLOCK_S, BLOCK_D)
-
-        # Single-pass softmax within the chunk, then online combine into running
-        # state. The choice of `new_max = max(running_max, max(s))` followed by
-        # `exp(s - new_max)` (instead of the textbook `exp(s - max(s))` then
-        # rescale) lets us avoid a redundant exp pass on the chunk data.
-        local_max = tl.max(s, axis=0)  # (BLOCK_D,)
+        s = score_tile + ape_tile
+        local_max = tl.max(s, axis=0)
         new_max = tl.maximum(running_max, local_max)
 
-        # exp_s already uses new_max as the reference, so chunk_{sum,weighted}
-        # are directly addable after rescaling the running state.
-        exp_s = tl.exp(s - new_max[None, :])  # (BLOCK_S, BLOCK_D)
-        chunk_sum = tl.sum(exp_s, axis=0)  # (BLOCK_D,)
-        chunk_weighted = tl.sum(kv_tile * exp_s, axis=0)  # (BLOCK_D,)
+        # exp_s uses new_max as reference so chunk_{sum,weighted} are addable
+        # after rescaling the running state.
+        exp_s = tl.exp(s - new_max[None, :])
+        chunk_sum = tl.sum(exp_s, axis=0)
+        chunk_weighted = tl.sum(kv_tile * exp_s, axis=0)
 
-        # Rescale running state to new_max basis; for chunk 0, running_max is
-        # -inf so factor is 0 and running state stays clean.
-        factor = tl.exp(running_max - new_max)  # (BLOCK_D,)
+        factor = tl.exp(running_max - new_max)
         running_sum = running_sum * factor + chunk_sum
         weighted = weighted * factor + chunk_weighted
         running_max = new_max
@@ -449,8 +394,7 @@ def _compress_c128_decode_chunked_kernel(
         mask=d_mask,
     )
 
-    # === 3. Now (and only now) store the current token to pool[write_pos]. ===
-    # Done after the softmax so the read pass never raced against the write.
+    # Deferred store of current token (see note at top of kernel).
     write_slot_base = pool_req_base + write_pos.to(tl.int64) * stride_pool_slot
     tl.store(
         pool_kv_ptr + write_slot_base + 0 * HEAD_DIM + d_offs,
