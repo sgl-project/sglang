@@ -112,7 +112,7 @@ def create_piecewise_cuda_graphs(model_runner: "ModelRunner"):
         return None
 
     # Collect attention layers and moe layers from the model
-    from sglang.srt.model_executor.model_runner import resolve_language_model
+    from sglang.srt.model_loader.utils import resolve_language_model
 
     model_runner.model.model = resolve_language_model(model_runner.model)
     language_model = getattr(model_runner.model, "language_model", model_runner.model)
