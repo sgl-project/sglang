@@ -3,7 +3,11 @@ from typing import Any
 
 from transformers.configuration_utils import PretrainedConfig
 
-from sglang.srt.configs.mamba_utils import Mamba2CacheParams, Mamba2StateShape
+from sglang.srt.configs.mamba_utils import (
+    Mamba2CacheParams,
+    Mamba2StateShape,
+    mamba2_state_dtype,
+)
 
 
 @dataclass
@@ -21,18 +25,18 @@ class JetBlockConfig:
 class JetNemotronConfig(PretrainedConfig):
     model_type: str = "jet_nemotron"
 
-    efficient_attention_config: dict[str, dict[str, Any]]
-    hidden_act: str
-    hidden_size: int
-    initializer_range: float
-    intermediate_size: int
-    layer_types: list[str]
-    max_position_embeddings: int
-    num_attention_heads: int
-    num_key_value_heads: int
-    rms_norm_eps: float
-    rope_scaling: None
-    rope_theta: float
+    efficient_attention_config: dict[str, dict[str, Any]] = None
+    hidden_act: str = None
+    hidden_size: int = None
+    initializer_range: float = None
+    intermediate_size: int = None
+    layer_types: list[str] = None
+    max_position_embeddings: int = None
+    num_attention_heads: int = None
+    num_key_value_heads: int = None
+    rms_norm_eps: float = None
+    rope_scaling: None = None
+    rope_theta: float = None
 
     @property
     def full_attention_layer_ids(self) -> list[int]:
@@ -71,4 +75,6 @@ class JetNemotronConfig(PretrainedConfig):
             conv_kernel=jet_block_config.conv_size,
         )
 
-        return Mamba2CacheParams(shape=shape, layers=self.linear_layer_ids)
+        return Mamba2CacheParams(
+            shape=shape, layers=self.linear_layer_ids, dtype=mamba2_state_dtype(self)
+        )

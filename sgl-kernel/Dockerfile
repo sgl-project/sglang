@@ -1,12 +1,12 @@
 ARG BASE_IMG=pytorch/manylinux2_28-builder
-ARG CUDA_VERSION=12.9
+ARG CUDA_VERSION=13.0
 
 # Dependency stage: install system deps, CMake, ccache, Python deps (including torch)
 FROM ${BASE_IMG}:cuda${CUDA_VERSION} AS deps
 
 # Overridable build arguments
 ARG ARCH=x86_64
-ARG CUDA_VERSION=12.9
+ARG CUDA_VERSION=13.0
 ARG PYTHON_VERSION=3.10
 # Manylinux python path tag, e.g. cp310-cp310 / cp312-cp312
 ARG PYTHON_TAG=cp310-cp310
@@ -79,10 +79,10 @@ RUN set -eux; \
 RUN --mount=type=cache,id=sgl-kernel-pip,target=/root/.cache/pip \
     set -eux; \
     case "${CUDA_VERSION}" in \
-      13.0) TORCH_VER=2.9.1; CU_TAG=cu130 ;; \
-      12.9) TORCH_VER=2.9.1; CU_TAG=cu128 ;; \
-      12.8) TORCH_VER=2.9.1; CU_TAG=cu128 ;; \
-      *)    TORCH_VER=2.9.1; CU_TAG=cu126 ;; \
+      13.0) TORCH_VER=2.11.0; CU_TAG=cu130 ;; \
+      12.9) TORCH_VER=2.11.0; CU_TAG=cu129 ;; \
+      12.8) TORCH_VER=2.11.0; CU_TAG=cu128 ;; \
+      *)    TORCH_VER=2.11.0; CU_TAG=cu126 ;; \
     esac; \
     ${PYTHON_ROOT_PATH}/bin/pip install torch==${TORCH_VER} --index-url https://${PYTORCH_MIRROR}/whl/${CU_TAG}; \
     ${PYTHON_ROOT_PATH}/bin/pip install ninja setuptools==75.0.0 wheel==0.41.0 numpy uv scikit-build-core --index-url ${PIP_DEFAULT_INDEX}
@@ -96,10 +96,13 @@ COPY . /sgl-kernel/
 # Optional: enable CMake/Ninja profiling (pass non-empty via --build-arg ENABLE_*)
 ARG ENABLE_CMAKE_PROFILE
 ARG ENABLE_BUILD_PROFILE
-# Optional: cmake extra args for aarch64 full kernel build (pass non-empty via --build-arg CMAKE_EXTRA_ARGS)
-ARG CMAKE_EXTRA_ARGS
 ARG ARCH=x86_64
 ARG USE_CCACHE=1
+# Parallelism knobs (override via --build-arg)
+#   BUILD_JOBS: number of parallel compilation units (ninja -j)
+#   NVCC_THREADS: per-compilation-unit NVCC --threads (multi-arch PTXAS)
+ARG BUILD_JOBS=0
+ARG NVCC_THREADS=32
 
 RUN --mount=type=cache,id=sgl-kernel-ccache,target=/ccache \
     --mount=type=cache,id=sgl-kernel-pip,target=/root/.cache/pip \
@@ -123,16 +126,18 @@ RUN --mount=type=cache,id=sgl-kernel-ccache,target=/ccache \
       export CMAKE_BUILD_PARALLEL_LEVEL=2; \
       export NINJAFLAGS="-j2"; \
       echo "ARM detected: Using extra conservative settings (2 parallel jobs)"; \
+    elif [ "${BUILD_JOBS}" -gt 0 ] 2>/dev/null; then \
+      export CMAKE_BUILD_PARALLEL_LEVEL=${BUILD_JOBS}; \
     else \
-      export CMAKE_BUILD_PARALLEL_LEVEL=$(echo "$(( $(nproc) / 3 )) 48" | awk '{print ($1 < $2) ? $1 : $2}'); \
+      export CMAKE_BUILD_PARALLEL_LEVEL=$(echo "$(( $(nproc) * 2 / 3 )) 64" | awk '{print ($1 < $2) ? $1 : $2}'); \
     fi; \
+    export CMAKE_ARGS="${CMAKE_ARGS:-} -DSGL_KERNEL_COMPILE_THREADS=${NVCC_THREADS}"; \
     if [ -n "${ENABLE_CMAKE_PROFILE:-}" ]; then \
       echo "CMake profiling enabled - will save to /sgl-kernel/cmake-profile.json"; \
-      export CMAKE_ARGS="--profiling-output=/sgl-kernel/cmake-profile.json --profiling-format=google-trace"; \
+      export CMAKE_ARGS="${CMAKE_ARGS} --profiling-output=/sgl-kernel/cmake-profile.json --profiling-format=google-trace"; \
     fi; \
-    # Merge Extra CMake options into CMAKE_ARGS \
-    export CMAKE_ARGS="${CMAKE_ARGS:+${CMAKE_ARGS} }${CMAKE_EXTRA_ARGS:-}"; \
-    echo "CMAKE_ARGS= [$CMAKE_ARGS]"; \
+    echo "Build parallelism: CMAKE_BUILD_PARALLEL_LEVEL=${CMAKE_BUILD_PARALLEL_LEVEL}, NVCC_THREADS=${NVCC_THREADS}"; \
+    echo "CMAKE_ARGS=${CMAKE_ARGS}"; \
     ${PYTHON_ROOT_PATH}/bin/python -m uv build --wheel -Cbuild-dir=build . --color=always --no-build-isolation; \
     ./rename_wheels.sh; \
     if [ -n "${ENABLE_BUILD_PROFILE:-}" ] && [ -f /sgl-kernel/build/.ninja_log ]; then \
