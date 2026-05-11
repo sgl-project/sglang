@@ -1071,15 +1071,6 @@ class Scheduler(
         elif self.chunked_prefill_size is not None and self.chunked_prefill_size <= 0:
             self.chunked_prefill_size = None
         self.chunked_req = None
-        # Tracks whether the current self.chunked_req was actually scheduled
-        # into last iteration's batch (i.e., in can_run_list -> got a fresh
-        # req_pool_idx from prepare_for_extend). Used to gate the
-        # stash_chunked_request call at the top of get_next_batch_to_run:
-        # if add_chunked_req early-returned under hybrid-SWA pressure,
-        # the req_pool_idx was already freed and fill_ids was reset by
-        # init_next_round_input, so running stash would double-free and
-        # corrupt prefix_indices.
-        self._chunked_req_scheduled_last_iter = False
         self.is_mixed_chunk = (
             self.chunked_prefill_size is not None
             and self.server_args.enable_mixed_chunk
@@ -2478,14 +2469,23 @@ class Scheduler(
             # only finished requests to running_batch.
             chunked_req_to_exclude.add(self.chunked_req)
 
-            if self._chunked_req_scheduled_last_iter:
-                self.stash_chunked_request(self.chunked_req)
-
             # The chunked request now lives at the head of waiting_queue so
             # the unified admission loop can pick it up. self.chunked_req is
             # still maintained as a mirror reference (removed in a later step).
             if self.chunked_req not in self.waiting_queue:
                 self.waiting_queue.insert(0, self.chunked_req)
+
+        # Per-req stash: any waiting-queue req carrying KV that has not yet
+        # been committed to the radix tree needs its prefix stashed before
+        # this iter's admission re-reads the row. The condition
+        # ``kv_committed_len > cache_protected_len`` is true exactly between
+        # a successful prepare_for_extend (committed advances to seq_len) and
+        # the next cache_unfinished_req (protected catches up). It correctly
+        # skips SWA early-return iters (neither advanced) and fresh / retracted
+        # reqs (both fields are 0).
+        for req in self.waiting_queue:
+            if req.kv_committed_len > req.cache_protected_len:
+                self.stash_chunked_request(req)
 
         # HiSparse has its own prefill-to-decode transition; skip last_batch merge.
         if self.enable_hisparse:
@@ -2687,8 +2687,7 @@ class Scheduler(
 
         # chunked-resume reqs are admitted through the unified waiting_queue
         # loop below (they sit at the head after the hoist sort). The mirror
-        # self.chunked_req and _chunked_req_scheduled_last_iter are updated
-        # after the loop based on can_run_list.
+        # self.chunked_req is refreshed after the loop based on can_run_list.
 
         if self.enable_lora:
             running_loras = {req.lora_id for req in self.running_batch.reqs}
@@ -2803,11 +2802,6 @@ class Scheduler(
         self.chunked_req = next(
             (r for r in self.waiting_queue if _is_unfinished_chunked(r)),
             None,
-        )
-        # Track whether the in-flight chunked req was actually admitted this
-        # iter so the next stash gate is correct (used for SWA early-return).
-        self._chunked_req_scheduled_last_iter = (
-            self.chunked_req is not None and self.chunked_req in can_run_set
         )
 
         # is_chunked counter feeds the output processor (skip stream + skip

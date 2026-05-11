@@ -1,4 +1,4 @@
-"""Regression tests for the SWA chunked-req stash gate (#24252)."""
+"""Regression tests for the per-req chunked stash gate (#24252)."""
 
 import unittest
 from types import SimpleNamespace
@@ -24,6 +24,8 @@ def _make_req(
     fill_ids: list,
     prefix_indices: torch.Tensor,
     extend_input_len: int,
+    kv_committed_len: int,
+    cache_protected_len: int,
 ) -> Req:
     req = Req.__new__(Req)
     req.rid = "test-req"
@@ -35,7 +37,8 @@ def _make_req(
     req.extend_input_len = extend_input_len
     req.is_chunked = 0
     req.host_hit_length = 0
-    req.cache_protected_len = 0
+    req.kv_committed_len = kv_committed_len
+    req.cache_protected_len = cache_protected_len
     req.skip_radix_cache_insert = False
     req.last_node = None
     req.swa_uuid_for_lock = None
@@ -107,7 +110,7 @@ class TestStashGatePreservesPrefixIndices(CustomTestCase):
     NUM_SLOTS = 8
     MAX_CONTEXT = 64
 
-    def _build(self, flag: bool):
+    def _build(self, *, kv_committed_len: int, cache_protected_len: int):
         pool = _make_req_to_token_pool(self.NUM_SLOTS, self.MAX_CONTEXT)
         cache = _make_chunk_cache(pool)
         initial_prefix = pool.req_to_token[self.POOL_IDX, : self.INITIAL_PREFIX_LEN].to(
@@ -118,15 +121,21 @@ class TestStashGatePreservesPrefixIndices(CustomTestCase):
             fill_ids=list(range(self.POST_RESET_FILL_LEN)),
             prefix_indices=initial_prefix,
             extend_input_len=0,
+            kv_committed_len=kv_committed_len,
+            cache_protected_len=cache_protected_len,
         )
         s = _scheduler_for_get_next_batch(tree_cache=cache, chunked_req=req)
-        s._chunked_req_scheduled_last_iter = flag
         return s, req, initial_prefix, pool
 
     def test_deferred_chunked_req_keeps_real_prefix_indices(self):
-        # The bug case: a spurious stash on a deferred chunked_req
-        # would extend prefix_indices to len(fill_ids).
-        s, req, initial_prefix, _ = self._build(flag=False)
+        # Bug case: a spurious stash on a deferred chunked_req would extend
+        # prefix_indices to len(fill_ids). After SWA early-return last iter,
+        # kv_committed_len did not advance, so it equals cache_protected_len
+        # and the per-req gate must skip stash.
+        s, req, initial_prefix, _ = self._build(
+            kv_committed_len=self.INITIAL_PREFIX_LEN,
+            cache_protected_len=self.INITIAL_PREFIX_LEN,
+        )
 
         Scheduler.get_next_batch_to_run(s)
 
@@ -134,9 +143,14 @@ class TestStashGatePreservesPrefixIndices(CustomTestCase):
         self.assertTrue(torch.equal(req.prefix_indices, initial_prefix))
 
     def test_scheduled_chunked_req_advances_prefix_indices_via_real_stash(self):
-        # Symmetric guard against over-gating: when the chunked_req was
-        # actually scheduled, stash must run and advance prefix_indices.
-        s, req, _, pool = self._build(flag=True)
+        # Symmetric guard against over-gating: last iter advanced
+        # kv_committed_len via prepare_for_extend but the new KV has not
+        # been written to the radix tree yet, so the per-req gate must
+        # trigger stash.
+        s, req, _, pool = self._build(
+            kv_committed_len=self.POST_RESET_FILL_LEN,
+            cache_protected_len=self.INITIAL_PREFIX_LEN,
+        )
 
         Scheduler.get_next_batch_to_run(s)
 
@@ -146,13 +160,11 @@ class TestStashGatePreservesPrefixIndices(CustomTestCase):
         self.assertEqual(req.prefix_indices.shape[0], self.POST_RESET_FILL_LEN)
         self.assertTrue(torch.equal(req.prefix_indices, expected))
 
-    def test_no_chunked_req_never_mutates_state_even_with_stale_flag(self):
-        # Retract path clears chunked_req without resetting the flag;
-        # the outer `if chunked_req is not None` guard must hold.
+    def test_no_chunked_req_never_mutates_state(self):
+        # No chunked_req and empty waiting_queue: nothing to stash.
         pool = _make_req_to_token_pool(self.NUM_SLOTS, self.MAX_CONTEXT)
         cache = _make_chunk_cache(pool)
         s = _scheduler_for_get_next_batch(tree_cache=cache, chunked_req=None)
-        s._chunked_req_scheduled_last_iter = True
 
         Scheduler.get_next_batch_to_run(s)
         self.assertIsNone(s.chunked_req)
