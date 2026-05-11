@@ -316,7 +316,7 @@ class LlamaForCausalLMEagle3(LlamaForCausalLM):
     def get_attention_sliding_window_size(self):
         server_args = get_global_server_args()
         draft_window_size: Optional[int] = (
-            int(server_args.speculative_draft_window_size) - 1
+            int(server_args.speculative_draft_window_size)
             if server_args.speculative_draft_window_size is not None
             else None
         )

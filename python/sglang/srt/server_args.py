@@ -3448,7 +3448,7 @@ class ServerArgs:
                 window_size = int(self.speculative_draft_window_size)
                 if window_size <= 0:
                     raise ValueError(
-                        "--speculative-draft-window-size must be positive, got {window_size}."
+                        f"--speculative-draft-window-size must be positive, got {window_size}."
                     )
                 self.speculative_draft_window_size = window_size
 
@@ -3490,7 +3490,7 @@ class ServerArgs:
                 draft_tokens = int(self.speculative_num_draft_tokens)
                 if window_size < draft_tokens:
                     raise ValueError(
-                        "DFLASH --speculative-dflash-draft-window-size must be >= "
+                        "--speculative-draft-window-size must be >= "
                         "--speculative-num-draft-tokens (block_size). "
                         f"window_size={window_size}, block_size={draft_tokens}."
                     )
@@ -5600,7 +5600,9 @@ class ServerArgs:
         )
         parser.add_argument(
             "--speculative-draft-window-size",
+            "--speculative-dflash-draft-window-size",
             type=int,
+            dest="speculative_draft_window_size",
             help="Sliding window size for the draft model (honored by EAGLE-3 and DFLASH). "
             "For EAGLE-3, the drafter only attends to the most recent N keys "
             "(verifier hidden states + its own outputs); the verifier is unaffected. "
