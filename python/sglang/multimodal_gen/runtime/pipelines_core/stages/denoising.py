@@ -618,7 +618,7 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         )
 
         # Setup precision and autocast settings
-        target_dtype = torch.bfloat16
+        target_dtype = PRECISION_TO_TYPE[server_args.pipeline_config.dit_precision]
         autocast_enabled = (
             target_dtype != torch.float32
         ) and not server_args.disable_autocast
