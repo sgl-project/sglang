@@ -95,7 +95,7 @@ export const MiniCPMV46Deployment = () => {
       cmd += ` \\\n  --reasoning-parser qwen3`;
     }
     if (toolcall === 'enabled') {
-      cmd += ` \\\n  --tool-call-parser qwen`;
+      cmd += ` \\\n  --tool-call-parser qwen3_coder`;
     }
     if (mambaCache === 'v2') {
       cmd += ` \\\n  --mamba-scheduler-strategy extra_buffer`;
