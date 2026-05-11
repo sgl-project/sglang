@@ -27,7 +27,7 @@ from contextlib import nullcontext
 from datetime import datetime
 from enum import Enum
 from http import HTTPStatus
-from typing import Any, Awaitable, Dict, List, Optional, Tuple, Union
+from typing import Awaitable, Dict, List, Optional, Tuple, Union
 
 import fastapi
 import pybase64
@@ -43,7 +43,7 @@ from sglang.srt.disaggregation.encode_receiver import create_mm_receiver
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
 from sglang.srt.lora.lora_registry import LoRARef, LoRARegistry
-from sglang.srt.managers import logprob_ops, request_tracing
+from sglang.srt.managers import logprob_ops, request_tracing, spec_decoding_meta
 from sglang.srt.managers.async_dynamic_batch_tokenizer import AsyncDynamicbatchTokenizer
 from sglang.srt.managers.disagg_service import start_disagg_service
 from sglang.srt.managers.embed_types import PositionalEmbeds
@@ -1789,7 +1789,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 meta_info["e2e_latency"] = state.time_stats.get_e2e_latency()
 
                 if self.server_args.speculative_algorithm:
-                    TokenizerManager._calculate_spec_decoding_metrics(
+                    spec_decoding_meta.fill_spec_decoding_meta(
                         meta_info,
                         recv_obj=recv_obj,
                         i=i,
@@ -1848,52 +1848,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         ):
             load_update_req = WatchLoadUpdateReq(loads=[recv_obj.load])
             self.send_to_scheduler.send_pyobj(load_update_req)
-
-    @staticmethod
-    def _calculate_spec_decoding_metrics(
-        meta_info: Dict[str, Any],
-        *,
-        recv_obj: Union[
-            BatchStrOutput,
-            BatchEmbeddingOutput,
-            BatchTokenIDOutput,
-        ],
-        i: int,
-        speculative_num_draft_tokens: int,
-    ) -> None:
-        """Calculate speculative decoding metrics, such as acceptance rate and acceptance length metrics."""
-        if (
-            hasattr(recv_obj, "spec_verify_ct")
-            and recv_obj.spec_verify_ct[i] > 0
-            and hasattr(recv_obj, "spec_accepted_drafts")
-            and len(recv_obj.spec_accepted_drafts) > i
-        ):
-            # Total number of proposed draft tokens per request.
-            all_drafts = recv_obj.spec_verify_ct[i] * (speculative_num_draft_tokens - 1)
-            accepted_drafts = recv_obj.spec_accepted_drafts[i]
-
-            # Calculate per-request acceptance rate and average acceptance length.
-            if all_drafts > 0:
-                # accept_rate: accepted_drafts / total_proposed_drafts (strict count, no bonus).
-                meta_info["spec_accept_rate"] = accepted_drafts / all_drafts
-                # accept_length: completion_tokens / verify_ct (includes bonus token).
-                meta_info["spec_accept_length"] = (
-                    recv_obj.completion_tokens[i] / recv_obj.spec_verify_ct[i]
-                )
-
-                meta_info["spec_accepted_drafts"] = accepted_drafts
-                meta_info["spec_proposed_drafts"] = all_drafts
-                meta_info["spec_verify_ct"] = recv_obj.spec_verify_ct[i]
-
-            # Acceptance histogram: tracks how many decoding steps accepted a certain number of draft tokens.
-            if (
-                recv_obj.spec_acceptance_histogram
-                and len(recv_obj.spec_acceptance_histogram) > i
-                and recv_obj.spec_acceptance_histogram[i]
-            ):
-                meta_info["spec_accept_histogram"] = recv_obj.spec_acceptance_histogram[
-                    i
-                ]
 
     def _request_has_grammar(self, obj: GenerateReqInput) -> bool:
         return (
