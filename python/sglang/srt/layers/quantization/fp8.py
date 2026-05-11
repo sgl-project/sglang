@@ -70,11 +70,6 @@ from sglang.srt.layers.quantization.unquant import (
     UnquantizedFusedMoEMethod,
     UnquantizedLinearMethod,
 )
-from sglang.srt.layers.quantization.mxfp8_utils import (
-    _copy_or_rebind,
-    _quantize_and_swizzle_with_cutlass_es_kernel,
-    _quantize_and_swizzle_with_triton_kernel,
-)
 from sglang.srt.layers.quantization.online_quantization import CopyNumelCounter
 from sglang.srt.layers.quantization.utils import (
     all_close_1d,
