@@ -304,9 +304,12 @@ if [[ "${NEED_REBUILD}" == "true" ]]; then
     fi
 
     # build AITER
+    # AITER_USE_SYSTEM_TRITON=1 prevents aiter's setup.py from uninstalling the
+    # ROCm-tuned triton shipped in the CI image and replacing it with a generic
+    # triton wheel from PyPI (introduced in ROCm/aiter#3086).
     docker exec ci_sglang bash -c "
         cd /sgl-workspace/aiter && \
-        GPU_ARCHS=${GPU_ARCH_LIST} python3 setup.py develop
+        AITER_USE_SYSTEM_TRITON=1 GPU_ARCHS=${GPU_ARCH_LIST} python3 setup.py develop
     "
 
     echo "[CI-AITER-CHECK] === AITER REBUILD COMPLETE ==="
