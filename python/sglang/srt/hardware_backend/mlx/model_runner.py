@@ -20,6 +20,7 @@ from dataclasses import dataclass
 
 import mlx.core as mx
 import psutil
+from mlx.utils import tree_flatten
 from mlx_lm import load as mlx_lm_load
 from mlx_lm.utils import quantize_model as mlx_lm_quantize_model
 
@@ -221,11 +222,14 @@ class MlxModelRunner:
                     f"ignoring --quantization={self._quantization}"
                 )
             else:
-                # MLX loads weights lazily — force an eval so mem_before reflects
-                # actual on-device usage (otherwise it can read near-zero and make
-                # the reduction percentage misleading).
-                mx.eval(self.model.parameters())
-                mem_before = mx.get_active_memory()
+                # Read weight-tensor totals from MLX array metadata (shape + dtype).
+                # This is zero-cost — neither materializes the lazy fp16 weights nor
+                # forces them to be peak-resident in memory at once (which on a 64 GB
+                # Mac running a 32 B model would put us within a few GB of OOM).
+                bytes_before = sum(
+                    p.size * p.itemsize
+                    for _, p in tree_flatten(self.model.parameters())
+                )
                 q_start = time.time()
                 logger.info(
                     f"Quantizing MLX model on-the-fly: bits={bits} "
@@ -237,14 +241,16 @@ class MlxModelRunner:
                     group_size=group_size,
                     bits=bits,
                 )
-                mx.eval(self.model.parameters())
-                mem_after = mx.get_active_memory()
+                bytes_after = sum(
+                    p.size * p.itemsize
+                    for _, p in tree_flatten(self.model.parameters())
+                )
                 q_time = time.time() - q_start
-                pct_reduction = (1 - mem_after / max(mem_before, 1)) * 100
+                pct_reduction = (1 - bytes_after / max(bytes_before, 1)) * 100
                 logger.info(
                     f"Quantization complete in {q_time:.2f}s — "
-                    f"active mem: {mem_before / 1024**3:.2f} GB -> "
-                    f"{mem_after / 1024**3:.2f} GB ({pct_reduction:.1f}% reduction)"
+                    f"weight bytes: {bytes_before / 1024**3:.2f} GB -> "
+                    f"{bytes_after / 1024**3:.2f} GB ({pct_reduction:.1f}% reduction)"
                 )
 
         # Force-evaluate weights so mx.get_active_memory() reflects
