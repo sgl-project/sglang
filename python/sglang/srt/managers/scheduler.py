@@ -38,6 +38,11 @@ from torch.cuda import Stream as CudaStream
 from torch.distributed import barrier
 
 from sglang.jit_kernel.ngram_embedding import update_token_table
+from sglang.srt.configs.hybrid_arch import (
+    hybrid_gdn_config,
+    linear_attn_model_spec,
+    mamba2_config,
+)
 from sglang.srt.configs.model_config import ModelConfig, ModelImpl
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.constrained.grammar_manager import GrammarManager
@@ -806,13 +811,13 @@ class Scheduler(
 
         # Hybrid memory pool
         self.is_hybrid_swa = self.tp_worker.is_hybrid_swa
-        _spec = self.tp_worker.model_runner.linear_attn_model_spec
+        _spec = linear_attn_model_spec(self.tp_worker.model_runner.model_config)
         _registry_needs_mamba = (
             _spec.uses_mamba_radix_cache if _spec is not None else False
         )
         self.is_hybrid_ssm = (
-            self.tp_worker.model_runner.hybrid_gdn_config is not None
-            or self.tp_worker.model_runner.mamba2_config is not None
+            hybrid_gdn_config(self.tp_worker.model_runner.model_config) is not None
+            or mamba2_config(self.tp_worker.model_runner.model_config) is not None
             or _registry_needs_mamba
         )
 
