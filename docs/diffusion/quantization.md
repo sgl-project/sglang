@@ -10,7 +10,8 @@ Use these paths:
 - `--model-path`: the base or original model
 - `--transformer-path`: a quantized transformers-style transformer component directory that already contains its own `config.json`
 - `--transformer-weights-path`: quantized transformer weights provided as a single safetensors file, a sharded safetensors directory, a local path, or a Hugging Face repo ID
-- `--quantization {fp8,mxfp4}`: apply online quantization to unquantized models at load time (activations are quantized dynamically)
+- `--quantization`: apply online quantization to unquantized models at load time (activations are quantized dynamically)
+- `--quantization-ignored-layers` layer name patterns to keep unquantized (e.g. `attention.to_`)
 
 Recommended example for pre-quantized checkpoints:
 
