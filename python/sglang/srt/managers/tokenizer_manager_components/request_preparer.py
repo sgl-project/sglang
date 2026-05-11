@@ -15,7 +15,7 @@ from sglang.srt.managers.io_struct import (
 from sglang.srt.managers.schedule_batch import MultimodalDataItem
 
 logger = logging.getLogger(__name__)
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 from sglang.srt.managers.tokenizer_manager_components.multimodal_processor_owner import (
     MultimodalProcessor,
@@ -47,6 +47,14 @@ class RequestPreparerConfig:
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
+class _ResolvedInput:
+    input_ids: Optional[List[int]]
+    token_type_ids: Optional[List[int]]
+    input_embeds: Optional[Any]
+    input_text: Optional[str]
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
 class RequestPreparer:
     raw_tokenizer_wrapper: RawTokenizerWrapper
     multimodal_processor: MultimodalProcessor
@@ -60,43 +68,11 @@ class RequestPreparer:
         obj: Union[GenerateReqInput, EmbeddingReqInput],
     ):
         """Tokenize one request."""
-        # Tokenize
-        input_embeds = None
-        input_text = obj.text
-        token_type_ids = None
-        is_cross_encoder_request = (
-            isinstance(obj, EmbeddingReqInput) and obj.is_cross_encoder_request
-        )
-        if obj.input_embeds is not None:
-            if not self.config.disable_radix_cache:
-                raise ValueError(
-                    "input_embeds is provided while disable_radix_cache is False. "
-                    "Please add `--disable-radix-cache` when you launch the server "
-                    "if you want to use input_embeds as inputs."
-                )
-            input_embeds = obj.input_embeds
-            input_ids = obj.input_ids
-        elif obj.input_ids is not None:
-            input_ids = obj.input_ids
-        else:
-            if self.tokenizer is None:
-                raise ValueError(
-                    "The engine initialized with skip_tokenizer_init=True cannot "
-                    "accept text prompts. Please provide input_ids or re-initialize "
-                    "the engine with skip_tokenizer_init=False."
-                )
-
-            # For audio-only requests (e.g., Whisper), text may be empty.
-            # The multimodal processor will provide input_ids later.
-            if not input_text and self.mm_processor and obj.contains_mm_input():
-                # Use empty placeholder - multimodal processor will override
-                input_ids = []
-            else:
-                input_ids, token_type_ids = (
-                    await self.raw_tokenizer_wrapper._tokenize_texts(
-                        input_text, is_cross_encoder_request
-                    )
-                )
+        resolved = await self._resolve_input_source(obj)
+        input_text = resolved.input_text
+        input_embeds = resolved.input_embeds
+        input_ids = resolved.input_ids
+        token_type_ids = resolved.token_type_ids
 
         contains_mm_input = obj.contains_mm_input()
         is_mossvl = "MossVLForConditionalGeneration" in self.config.architectures
@@ -182,6 +158,53 @@ class RequestPreparer:
         tokenized_obj.time_stats = self.rid_to_state[obj.rid].time_stats
         self.rid_to_state[obj.rid].time_stats.set_tokenize_finish_time()
         return tokenized_obj
+
+    async def _resolve_input_source(
+        self,
+        obj: Union[GenerateReqInput, EmbeddingReqInput],
+    ) -> _ResolvedInput:
+        input_embeds = None
+        input_text = obj.text
+        token_type_ids = None
+        is_cross_encoder_request = (
+            isinstance(obj, EmbeddingReqInput) and obj.is_cross_encoder_request
+        )
+        if obj.input_embeds is not None:
+            if not self.config.disable_radix_cache:
+                raise ValueError(
+                    "input_embeds is provided while disable_radix_cache is False. "
+                    "Please add `--disable-radix-cache` when you launch the server "
+                    "if you want to use input_embeds as inputs."
+                )
+            input_embeds = obj.input_embeds
+            input_ids = obj.input_ids
+        elif obj.input_ids is not None:
+            input_ids = obj.input_ids
+        else:
+            if self.tokenizer is None:
+                raise ValueError(
+                    "The engine initialized with skip_tokenizer_init=True cannot "
+                    "accept text prompts. Please provide input_ids or re-initialize "
+                    "the engine with skip_tokenizer_init=False."
+                )
+
+            # For audio-only requests (e.g., Whisper), text may be empty.
+            # The multimodal processor will provide input_ids later.
+            if not input_text and self.mm_processor and obj.contains_mm_input():
+                # Use empty placeholder - multimodal processor will override
+                input_ids = []
+            else:
+                input_ids, token_type_ids = (
+                    await self.raw_tokenizer_wrapper._tokenize_texts(
+                        input_text, is_cross_encoder_request
+                    )
+                )
+        return _ResolvedInput(
+            input_ids=input_ids,
+            token_type_ids=token_type_ids,
+            input_embeds=input_embeds,
+            input_text=input_text,
+        )
 
     async def _batch_tokenize_and_process(
         self,
