@@ -1780,7 +1780,12 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             if state.finished:
                 if state.time_stats.trace_ctx.tracing_enable:
                     state.time_stats.trace_ctx.trace_set_root_attrs(
-                        self.convert_to_span_attrs(state, recv_obj, i)
+                        TokenizerManager.convert_to_span_attrs(
+                            state=state,
+                            recv_obj=recv_obj,
+                            i=i,
+                            served_model_name=self.served_model_name,
+                        )
                     )
                 state.time_stats.set_finished_time()
                 meta_info["e2e_latency"] = state.time_stats.get_e2e_latency()
@@ -2344,8 +2349,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             else:
                 obj.need_wait_for_mm_inputs = False
 
+    @staticmethod
     def convert_to_span_attrs(
-        self,
+        *,
         state: ReqState,
         recv_obj: Union[
             BatchStrOutput,
@@ -2353,12 +2359,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             BatchTokenIDOutput,
         ],
         i: int,
+        served_model_name: str,
     ) -> Dict[str, Any]:
         """Convert attributes to span attributes."""
         span_attrs = {}
-
-        if not self.server_args.enable_trace:
-            return span_attrs
 
         # Token usage attributes
         if not isinstance(recv_obj, BatchEmbeddingOutput):
@@ -2396,7 +2400,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             span_attrs[SpanAttributes.GEN_AI_REQUEST_N] = n
 
         # Response attributes
-        span_attrs[SpanAttributes.GEN_AI_RESPONSE_MODEL] = self.served_model_name
+        span_attrs[SpanAttributes.GEN_AI_RESPONSE_MODEL] = served_model_name
 
         finish_reason = (
             recv_obj.finished_reasons[i].get("type")
