@@ -110,7 +110,7 @@ class GDNKernelDispatcher:
         # its MTP verify path is not, so keep Triton as the verify fallback.
         if (
             decode_backend.is_flashinfer() or prefill_backend.is_flashinfer()
-        ) and getattr(flashinfer_kernel, "supports_target_verify", False):
+        ) and flashinfer_kernel.supports_target_verify:
             self.verify_kernel = flashinfer_kernel
         else:
             self.verify_kernel = triton_kernel
