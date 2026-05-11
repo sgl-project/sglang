@@ -23,7 +23,7 @@ from sglang.srt.utils.scheduler_status_logger import SchedulerStatusLogger
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.managers.schedule_policy import PrefillAdder
-    from sglang.srt.managers.scheduler import EmbeddingBatchResult, Scheduler
+    from sglang.srt.managers.scheduler import EmbeddingBatchResult
 
 logger = logging.getLogger(__name__)
 
@@ -64,8 +64,12 @@ class PrefillStats:
 
 
 class SchedulerMetricsMixin:
+    @staticmethod
     def init_metrics(
-        self: Scheduler, tp_rank: int, pp_rank: int, dp_rank: Optional[int]
+        self: "SchedulerMetricsReporter",
+        tp_rank: int,
+        pp_rank: int,
+        dp_rank: Optional[int],
     ):
         # Basic stats
         self.forward_ct_decode = 0
@@ -130,7 +134,7 @@ class SchedulerMetricsMixin:
             )
             self.enable_mfu_metrics = self.server_args.enable_mfu_metrics
             if self.enable_mfu_metrics:
-                self._init_estimated_perf_constants()
+                SchedulerMetricsMixin._init_estimated_perf_constants(self)
                 self._mfu_log_flops = 0.0
                 self._mfu_log_read_bytes = 0.0
                 self._mfu_log_write_bytes = 0.0
@@ -159,7 +163,8 @@ class SchedulerMetricsMixin:
             enable_metrics=self.enable_metrics
         )
 
-    def install_device_timer_on_runners(self: Scheduler):
+    @staticmethod
+    def install_device_timer_on_runners(self: "SchedulerMetricsReporter"):
         if self.forward_pass_device_timer is None:
             return
         timer = self.forward_pass_device_timer
@@ -172,14 +177,18 @@ class SchedulerMetricsMixin:
                 for r in getattr(dw, "draft_runner_list", []):
                     r.device_timer = timer
 
-    def update_spec_metrics(self: Scheduler, bs: int, num_accepted_drafts: int):
+    @staticmethod
+    def update_spec_metrics(
+        self: "SchedulerMetricsReporter", bs: int, num_accepted_drafts: int
+    ):
         self.spec_num_accepted_tokens += num_accepted_drafts + bs
         self.spec_num_forward_ct += bs
 
         # Bonus tokens updated elsewhere
         self.num_generated_tokens += num_accepted_drafts
 
-    def _init_estimated_perf_constants(self: Scheduler) -> None:
+    @staticmethod
+    def _init_estimated_perf_constants(self: "SchedulerMetricsReporter") -> None:
         model_config = self.model_config
         hf_text_config = model_config.hf_text_config
 
@@ -261,8 +270,9 @@ class SchedulerMetricsMixin:
             num_attn_heads * head_dim * act_bytes * num_layers
         )
 
+    @staticmethod
     def _estimate_prefill_perf(
-        self: Scheduler, num_tokens: int
+        self: "SchedulerMetricsReporter", num_tokens: int
     ) -> Tuple[float, float, float]:
         tokens = max(0, int(num_tokens))
         if tokens == 0:
@@ -287,8 +297,9 @@ class SchedulerMetricsMixin:
         )
         return flops, read_bytes, write_bytes
 
+    @staticmethod
     def _estimate_decode_perf(
-        self: Scheduler, batch: ScheduleBatch, num_tokens: int
+        self: "SchedulerMetricsReporter", batch: ScheduleBatch, num_tokens: int
     ) -> Tuple[float, float, float]:
         tokens = max(0, int(num_tokens))
         if tokens == 0:
@@ -312,7 +323,8 @@ class SchedulerMetricsMixin:
         )
         return flops, read_bytes, write_bytes
 
-    def reset_metrics(self: Scheduler):
+    @staticmethod
+    def reset_metrics(self: "SchedulerMetricsReporter"):
         self.forward_ct_decode = 0
         self.num_generated_tokens = 0
         self.spec_num_accepted_tokens = 0
@@ -320,8 +332,9 @@ class SchedulerMetricsMixin:
         self.spec_total_num_accepted_tokens = 0
         self.spec_total_num_forward_ct = 0
 
+    @staticmethod
     def report_prefill_stats(
-        self: Scheduler,
+        self: "SchedulerMetricsReporter",
         batch: Optional[ScheduleBatch],
         prefill_stats: PrefillStats,
         can_run_cuda_graph: bool,
@@ -347,7 +360,7 @@ class SchedulerMetricsMixin:
         batch_iter = (
             batch.forward_iter
             if batch is not None and batch.forward_iter is not None
-            else self.forward_ct
+            else self.get_forward_ct()
         )
         iter_msg = f" [{batch_iter}]" if LOG_FORWARD_ITERS else ""
 
@@ -376,7 +389,9 @@ class SchedulerMetricsMixin:
         msg += f"input throughput (token/s): {self.last_input_throughput:.2f}"
 
         if self.enable_mfu_metrics and gap_latency > 0:
-            flops, _, _ = self._estimate_prefill_perf(prefill_stats.log_input_tokens)
+            flops, _, _ = SchedulerMetricsMixin._estimate_prefill_perf(
+                self, prefill_stats.log_input_tokens
+            )
             tflops_per_s = flops / gap_latency / 1e12
             msg += f", est. prefill TFLOPS/s (per GPU): {tflops_per_s:.2f}"
 
@@ -395,8 +410,10 @@ class SchedulerMetricsMixin:
                 dp_cooperation_info=dp_cooperation_info,
             )
             if self.enable_mfu_metrics:
-                flops, read_bytes, write_bytes = self._estimate_prefill_perf(
-                    prefill_stats.log_input_tokens
+                flops, read_bytes, write_bytes = (
+                    SchedulerMetricsMixin._estimate_prefill_perf(
+                        self, prefill_stats.log_input_tokens
+                    )
                 )
                 self.metrics_collector.increment_estimated_perf(
                     num_flops_per_gpu=flops,
@@ -445,21 +462,22 @@ class SchedulerMetricsMixin:
                 )
 
             # Utilization / LoRA / HiCache
-            self._calculate_utilization()
+            SchedulerMetricsMixin._calculate_utilization(self)
             self.stats.fwd_occupancy = self.fwd_occupancy
-            self._update_lora_metrics()
-            self._log_hicache_stats()
+            SchedulerMetricsMixin._update_lora_metrics(self)
+            SchedulerMetricsMixin._log_hicache_stats(self)
             self.metrics_collector.log_stats(self.stats)
             self.kv_events_publisher.emit_kv_metrics()
         self.kv_events_publisher.publish_kv_events()
 
+    @staticmethod
     def report_decode_stats(
-        self: Scheduler,
+        self: "SchedulerMetricsReporter",
         can_run_cuda_graph: bool,
         running_batch: ScheduleBatch = None,
         num_accepted_drafts: int = 0,
     ):
-        batch = running_batch or self.running_batch
+        batch = running_batch or self.get_running_batch()
 
         # Every-iteration work: realtime token counting + status logger
         if self.current_scheduler_metrics_enabled:
@@ -470,8 +488,10 @@ class SchedulerMetricsMixin:
                 dp_cooperation_info=batch.dp_cooperation_info,
             )
             if self.enable_mfu_metrics:
-                flops, read_bytes, write_bytes = self._estimate_decode_perf(
-                    batch, decode_tokens
+                flops, read_bytes, write_bytes = (
+                    SchedulerMetricsMixin._estimate_decode_perf(
+                        self, batch, decode_tokens
+                    )
                 )
                 self.metrics_collector.increment_estimated_perf(
                     num_flops_per_gpu=flops,
@@ -512,7 +532,7 @@ class SchedulerMetricsMixin:
         batch_iter = (
             batch.forward_iter
             if batch is not None and batch.forward_iter is not None
-            else self.forward_ct
+            else self.get_forward_ct()
         )
         iter_msg = f" [{batch_iter}]" if LOG_FORWARD_ITERS else ""
         msg = f"Decode batch{iter_msg}, #running-req: {num_running_reqs}, {token_usage_msg}"
@@ -647,16 +667,17 @@ class SchedulerMetricsMixin:
                 )
 
             # Utilization / LoRA / HiCache
-            self._calculate_utilization()
+            SchedulerMetricsMixin._calculate_utilization(self)
             self.stats.fwd_occupancy = self.fwd_occupancy
-            self._update_lora_metrics()
-            self._log_hicache_stats()
+            SchedulerMetricsMixin._update_lora_metrics(self)
+            SchedulerMetricsMixin._log_hicache_stats(self)
             self.metrics_collector.log_stats(self.stats)
             self.kv_events_publisher.emit_kv_metrics()
         self.kv_events_publisher.publish_kv_events()
 
+    @staticmethod
     def log_batch_result_stats(
-        self: Scheduler,
+        self: "SchedulerMetricsReporter",
         batch: ScheduleBatch,
         result: Union[GenerationBatchResult, EmbeddingBatchResult],
     ):
@@ -671,7 +692,8 @@ class SchedulerMetricsMixin:
                 balancedness=m.eplb_balancedness.item(),
             )
 
-    def _log_hicache_stats(self: Scheduler):
+    @staticmethod
+    def _log_hicache_stats(self: "SchedulerMetricsReporter"):
         """Populate HiCache host-tier stats on self.stats.
 
         These are pushed to Prometheus by SchedulerMetricsCollector.log_stats().
@@ -688,7 +710,8 @@ class SchedulerMetricsMixin:
         )
         self.stats.hicache_host_total_tokens = host_pool.size
 
-    def _update_lora_metrics(self: Scheduler):
+    @staticmethod
+    def _update_lora_metrics(self: "SchedulerMetricsReporter"):
         """Update LoRA pool metrics for monitoring and autoscaling."""
         if not self.enable_lora:
             return
@@ -708,15 +731,15 @@ class SchedulerMetricsMixin:
 
             # For PP mode, check all running micro batches
             if self.server_args.pp_size > 1:
-                for batch in self.running_mbs:
+                for batch in self.get_running_mbs():
                     if batch and hasattr(batch, "reqs"):
                         for req in batch.reqs:
                             if hasattr(req, "lora_id") and req.lora_id is not None:
                                 active_lora_ids.add(req.lora_id)
             # For normal mode, check running_batch
-            elif self.running_batch:
-                if hasattr(self.running_batch, "reqs"):
-                    for req in self.running_batch.reqs:
+            elif self.get_running_batch():
+                if hasattr(self.get_running_batch(), "reqs"):
+                    for req in self.get_running_batch().reqs:
                         if hasattr(req, "lora_id") and req.lora_id is not None:
                             active_lora_ids.add(req.lora_id)
 
@@ -732,7 +755,8 @@ class SchedulerMetricsMixin:
         except Exception as e:
             logger.warning(f"Failed to update LoRA metrics: {e}")
 
-    def _calculate_utilization(self: Scheduler):
+    @staticmethod
+    def _calculate_utilization(self: "SchedulerMetricsReporter"):
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             self.stats.utilization = -1
         else:
@@ -744,7 +768,8 @@ class SchedulerMetricsMixin:
                     self.stats.token_usage / 0.9,
                 )
 
-    def update_device_timer(self: Scheduler):
+    @staticmethod
+    def update_device_timer(self: "SchedulerMetricsReporter"):
         if not ENABLE_METRICS_DEVICE_TIMER:
             return
         self.forward_pass_device_timer._report()
@@ -768,7 +793,8 @@ class SchedulerMetricsMixin:
         ):
             self._device_timer_window_batch_count = 0
 
-    def reset_device_timer_window(self: Scheduler):
+    @staticmethod
+    def reset_device_timer_window(self: "SchedulerMetricsReporter"):
         if ENABLE_METRICS_DEVICE_TIMER:
             self._device_timer_window_batch_count = 0
             self.fwd_occupancy = float("nan")

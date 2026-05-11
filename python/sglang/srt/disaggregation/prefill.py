@@ -582,6 +582,7 @@ class SchedulerDisaggregationPrefillMixin:
 
         can_run_cuda_graph = getattr(result, "can_run_cuda_graph", False)
         self.report_prefill_stats(
+            self.metrics_reporter,
             batch=batch,
             prefill_stats=batch.prefill_stats,
             can_run_cuda_graph=can_run_cuda_graph,
