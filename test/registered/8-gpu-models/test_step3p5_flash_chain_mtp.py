@@ -17,7 +17,7 @@ from sglang.test.test_utils import (
     write_github_step_summary,
 )
 
-register_cuda_ci(est_time=663, suite="stage-c-test-8-gpu-h200")
+register_cuda_ci(est_time=701, suite="stage-c-test-8-gpu-h200")
 
 STEP3P5_FLASH_MODEL_PATH = "stepfun-ai/Step-3.5-Flash"
 

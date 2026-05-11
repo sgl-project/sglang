@@ -32,7 +32,7 @@ from sglang.srt.managers.template_detection import ReasoningToggleConfig
 from sglang.srt.utils import get_or_create_event_loop
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=11, suite="stage-a-test-cpu")
+register_cpu_ci(est_time=15, suite="stage-a-test-cpu")
 
 
 class _MockTokenizerManager:

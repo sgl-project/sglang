@@ -11,7 +11,7 @@ from sglang.srt.utils import get_cuda_driver_bindings, is_flashinfer_available
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=30, suite="stage-b-test-2-gpu-large")
+register_cuda_ci(est_time=28, suite="stage-b-test-2-gpu-large")
 
 WORLD_SIZE = 2
 

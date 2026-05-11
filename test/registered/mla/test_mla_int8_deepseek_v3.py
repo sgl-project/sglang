@@ -16,7 +16,7 @@ from sglang.test.test_utils import (
 )
 
 # DeepSeek-V3 INT8 quantization tests (channel and block INT8)
-register_cuda_ci(est_time=160, suite="stage-b-test-1-gpu-large")
+register_cuda_ci(est_time=297, suite="stage-b-test-1-gpu-large")
 
 
 class TestDeepseekV3MTPChannelInt8(CustomTestCase):

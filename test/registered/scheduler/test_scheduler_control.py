@@ -20,7 +20,7 @@ from sglang.test.test_utils import (
     run_and_check_memory_leak,
 )
 
-register_cuda_ci(est_time=367, suite="stage-b-test-1-gpu-small")
+register_cuda_ci(est_time=382, suite="stage-b-test-1-gpu-small")
 register_amd_ci(est_time=300, suite="stage-b-test-1-gpu-small-amd")
 
 

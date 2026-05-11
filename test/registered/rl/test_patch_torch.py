@@ -9,7 +9,7 @@ import torch.multiprocessing as mp
 from sglang.srt.utils.patch_torch import monkey_patch_torch_reductions
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=15, suite="stage-b-test-2-gpu-large")
+register_cuda_ci(est_time=38, suite="stage-b-test-2-gpu-large")
 
 
 class TestReleaseMemoryOccupation(unittest.TestCase):

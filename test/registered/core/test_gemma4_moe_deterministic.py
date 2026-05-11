@@ -23,7 +23,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=107, suite="stage-b-test-2-gpu-large")
+register_cuda_ci(est_time=129, suite="stage-b-test-2-gpu-large")
 
 
 PROMPT = (

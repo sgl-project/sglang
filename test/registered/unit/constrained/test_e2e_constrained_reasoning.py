@@ -22,7 +22,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=120, suite="stage-b-test-1-gpu-small")
+register_cuda_ci(est_time=83, suite="stage-b-test-1-gpu-small")
 
 MODEL = "Qwen/Qwen3-0.6B"
 BASE_URL = "http://127.0.0.1:39877"

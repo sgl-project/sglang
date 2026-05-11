@@ -38,7 +38,7 @@ from sglang.srt.server_args import ServerArgs, set_global_server_args_for_schedu
 from sglang.srt.utils import get_device
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=25, suite="stage-b-test-1-gpu-small")
+register_cuda_ci(est_time=24, suite="stage-b-test-1-gpu-small")
 
 # ---------------------------------------------------------------------------
 # Constants

@@ -12,7 +12,7 @@ from sglang.srt.weight_sync.utils import update_weights
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import DEFAULT_SMALL_MODEL_NAME_FOR_TEST
 
-register_cuda_ci(est_time=32, suite="stage-b-test-1-gpu-large")
+register_cuda_ci(est_time=44, suite="stage-b-test-1-gpu-large")
 
 
 class AsyncEngine(Engine):

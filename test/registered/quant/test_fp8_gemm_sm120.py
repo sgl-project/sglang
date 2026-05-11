@@ -12,7 +12,7 @@ from sglang.test.test_utils import (
     try_cached_model,
 )
 
-register_cuda_ci(est_time=146, suite="stage-b-test-1-gpu-small")
+register_cuda_ci(est_time=156, suite="stage-b-test-1-gpu-small")
 
 PERTENSOR_MODEL_PATH = "nvidia/Llama-3.1-8B-Instruct-FP8"
 BLOCKWISE_MODEL_PATH = "Qwen/Qwen3-4B-Instruct-2507-FP8"

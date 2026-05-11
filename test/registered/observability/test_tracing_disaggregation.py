@@ -33,7 +33,7 @@ from sglang.utils import wait_for_http_ready
 logger = logging.getLogger(__name__)
 
 # CI registration - PD disaggregation requires 2 GPUs
-register_cuda_ci(est_time=65, suite="stage-b-test-2-gpu-large")
+register_cuda_ci(est_time=61, suite="stage-b-test-2-gpu-large")
 
 
 class TestTraceDisaggregation(CustomTestCase):

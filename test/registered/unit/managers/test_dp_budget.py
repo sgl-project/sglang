@@ -17,7 +17,7 @@ maybe_stub_sgl_kernel()
 from sglang.srt.managers.data_parallel_controller import DPBudget
 from sglang.srt.managers.io_struct import GetLoadsReqOutput, WatchLoadUpdateReq
 
-register_cpu_ci(est_time=11, suite="stage-a-test-cpu")
+register_cpu_ci(est_time=10, suite="stage-a-test-cpu")
 
 
 _BASE_LOAD = GetLoadsReqOutput(

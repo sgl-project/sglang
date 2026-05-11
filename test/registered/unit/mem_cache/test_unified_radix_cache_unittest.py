@@ -48,7 +48,7 @@ from sglang.srt.utils import get_device
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=10, suite="stage-b-test-1-gpu-small")
+register_cuda_ci(est_time=18, suite="stage-b-test-1-gpu-small")
 
 
 @dataclass(frozen=True)

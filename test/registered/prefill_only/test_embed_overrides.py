@@ -24,7 +24,7 @@ from sglang.srt.server_args import MIS_DELIMITER_TOKEN_ID
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=9, suite="stage-b-test-1-gpu-small")
+register_cuda_ci(est_time=8, suite="stage-b-test-1-gpu-small")
 
 HIDDEN_DIM = 4
 

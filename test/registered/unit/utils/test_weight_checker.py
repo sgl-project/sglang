@@ -38,7 +38,7 @@ from sglang.srt.utils.weight_checker import (
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=30, suite="stage-b-test-1-gpu-small")
+register_cuda_ci(est_time=9, suite="stage-b-test-1-gpu-small")
 
 
 # ---------------------------------------------------------------------------

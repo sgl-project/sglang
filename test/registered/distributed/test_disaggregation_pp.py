@@ -14,7 +14,7 @@ from sglang.test.test_utils import (
     try_cached_model,
 )
 
-register_cuda_ci(est_time=216, suite="stage-c-test-8-gpu-h20")
+register_cuda_ci(est_time=232, suite="stage-c-test-8-gpu-h20")
 
 
 class TestDisaggregationPrefillPPAccuracy(PDDisaggregationServerBase):

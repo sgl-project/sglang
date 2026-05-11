@@ -20,7 +20,7 @@ from sglang.test.test_utils import (
     CustomTestCase,
 )
 
-register_cuda_ci(est_time=77, suite="stage-b-test-1-gpu-small")
+register_cuda_ci(est_time=103, suite="stage-b-test-1-gpu-small")
 
 
 class TestEngineChildPids(CustomTestCase):
