@@ -305,9 +305,14 @@ class TpModelWorker(BaseTpWorker):
         assert (
             self.max_queued_requests is None or self.max_queued_requests >= 1
         ), "If configured, max_queued_requests must be at least 1 for any work to be scheduled."
+        pool_tokens = (
+            self.model_runner.full_max_total_num_tokens
+            if self.model_runner.is_hybrid_swa
+            else self.model_runner.max_total_num_tokens
+        )
         self.max_req_len = min(
             self.model_config.context_len - 1,
-            self.model_runner.max_token_pool_size - 1,
+            pool_tokens - 1,
         )
         self.max_req_input_len = self.max_req_len - 5
         assert (
