@@ -180,7 +180,6 @@ from sglang.srt.managers.scheduler_output_processor_mixin import (
     SchedulerOutputProcessorMixin,
 )
 from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
-from sglang.srt.managers.scheduler_profiler_mixin import SchedulerProfilerMixin
 from sglang.srt.managers.scheduler_recv_skipper import SchedulerRecvSkipper
 from sglang.srt.managers.scheduler_runtime_checker_mixin import (
     SchedulerRuntimeCheckerMixin,
@@ -324,7 +323,6 @@ def validate_dflash_request(req: Req) -> Optional[str]:
 class Scheduler(
     SchedulerOutputProcessorMixin,
     SchedulerUpdateWeightsMixin,
-    SchedulerProfilerMixin,
     SchedulerMetricsMixin,
     SchedulerDisaggregationDecodeMixin,
     SchedulerDisaggregationPrefillMixin,
@@ -1318,7 +1316,7 @@ class Scheduler(
                 (SlowDownReqInput, self.slow_down),
                 (
                     ProfileReq,
-                    lambda req: self._profile(self.profiler_manager, req),
+                    lambda req: self.profiler_manager._profile(req),
                 ),
                 (FreezeGCReq, self.handle_freeze_gc),
                 (GetInternalStateReq, self.get_internal_state),
@@ -2666,7 +2664,7 @@ class Scheduler(
         batch.forward_iter = self.forward_ct
 
         # Whether to run the profiler
-        self._profile_batch_predicate(self.profiler_manager, batch)
+        self.profiler_manager._profile_batch_predicate(batch)
         if self.forward_sleep_time is not None:
             logger.info(f"Scheduler.run_batch sleep {self.forward_sleep_time}s")
             time.sleep(self.forward_sleep_time)
