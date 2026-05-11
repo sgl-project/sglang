@@ -50,9 +50,7 @@ class LlamaDecoderLayer(LlamaDecoderLayer):
     ) -> None:
         super().__init__(config, layer_id, quant_config, prefix)
 
-        # The input layer consumes concat(embeds, target_hidden_states); inner
-        # layers take only the previous layer's output. Adjust qkv input dim
-        # accordingly.
+        # Input layer concats embeds + target_hidden before qkv (input dim 2x).
         self.is_input_layer = layer_id == 0
         hidden_size = 2 * self.hidden_size if self.is_input_layer else self.hidden_size
 
@@ -146,17 +144,12 @@ class LlamaModel(nn.Module):
         else:
             self.hidden_size_in = config.hidden_size
 
-        # EAGLE-3 uses 3 auxiliary hidden states (low, mid, high) by default.
-        num_aux_hidden_states = 3
-        eagle_config = getattr(config, "eagle_config", None)
-        if eagle_config:
-            ids = eagle_config.get("eagle_aux_hidden_state_layer_ids", None)
-            if ids:
-                num_aux_hidden_states = len(ids)
-
-        self.num_aux_hidden_states = getattr(
-            config, "num_aux_hidden_states", num_aux_hidden_states
-        )
+        # num_aux resolution: explicit attr > eagle_config layer_ids > default 3.
+        self.num_aux_hidden_states = getattr(config, "num_aux_hidden_states", None)
+        if self.num_aux_hidden_states is None:
+            eagle_config = getattr(config, "eagle_config", None) or {}
+            layer_ids = eagle_config.get("eagle_aux_hidden_state_layer_ids")
+            self.num_aux_hidden_states = len(layer_ids) if layer_ids else 3
 
         self.fc = torch.nn.Linear(
             self.hidden_size_in * self.num_aux_hidden_states,
@@ -164,10 +157,11 @@ class LlamaModel(nn.Module):
             bias=getattr(config, "bias", False),
         )
 
-        self.use_fc_norm = getattr(config, "fc_norm", None) or getattr(
+        # Per-aux RMSNorm before fc; enabled via `fc_norm` or legacy `use_aux_norm` flag.
+        use_fc_norm = getattr(config, "fc_norm", None) or getattr(
             config, "use_aux_norm", False
         )
-        if self.use_fc_norm:
+        if use_fc_norm:
             self.fc_norm = nn.ModuleList(
                 [
                     RMSNorm(self.hidden_size_in, eps=config.rms_norm_eps)
@@ -242,13 +236,9 @@ class LlamaModel(nn.Module):
             hidden_states, residual
         )
 
-        # For draft decode, we capture the hidden state before norm, but some models might prefer normed hidden states
-        draft_decode = (
-            [hidden_states_to_aux]
-            if not self.norm_output
-            else [hidden_states_to_logits]
-        )
-        return hidden_states_to_logits, draft_decode
+        # Draft decode captures pre-norm hidden by default; `norm_output` opts for normed.
+        aux = hidden_states_to_logits if self.norm_output else hidden_states_to_aux
+        return hidden_states_to_logits, [aux]
 
 
 class LlamaForCausalLMEagle3(LlamaForCausalLM):
@@ -303,16 +293,18 @@ class LlamaForCausalLMEagle3(LlamaForCausalLM):
             (".gate_up_proj", ".up_proj", 1),
         ]
 
-        for name, loaded_weight in weights:
-            if "midlayer" in name:
-                name = name.replace("midlayer", "layers.0")
+        # Legacy weight names -> new module attribute names (backwards compat).
+        legacy_name_map = {
+            "midlayer": "layers.0",
+            "aux_norm_low": "fc_norm.0",
+            "aux_norm_mid": "fc_norm.1",
+            "aux_norm_high": "fc_norm.2",
+        }
 
-            if "aux_norm_low" in name:
-                name = name.replace("aux_norm_low", "fc_norm.0")
-            elif "aux_norm_mid" in name:
-                name = name.replace("aux_norm_mid", "fc_norm.1")
-            elif "aux_norm_high" in name:
-                name = name.replace("aux_norm_high", "fc_norm.2")
+        for name, loaded_weight in weights:
+            for legacy, new in legacy_name_map.items():
+                if legacy in name:
+                    name = name.replace(legacy, new)
 
             if "d2t" in name:
                 # d2t stores diffs between draft id and target id
