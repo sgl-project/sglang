@@ -2703,13 +2703,24 @@ class ServerArgs:
                 )
 
             # Check trtllm_mla backend support
+            # Only reject if user explicitly requests trtllm_mla for both prefill and decode,
+            # or for the unified attention backend. Decode automatically falls back to
+            # backend=xqa on unsupported GPUs, so prefill-only trtllm_mla is allowed.
+            decode_backend = self.decode_attention_backend
             if (
-                prefill_backend == "trtllm_mla"
-                or self.attention_backend == "trtllm_mla"
-            ) and not is_sm100_supported():
+                (
+                    self.attention_backend == "trtllm_mla"
+                    or (
+                        prefill_backend == "trtllm_mla"
+                        and decode_backend == "trtllm_mla"
+                    )
+                )
+                and not is_sm100_supported()
+            ):
                 raise ValueError(
                     "TRTLLM MLA backend is only supported on Blackwell GPUs (SM100). "
-                    "Please use a different attention backend."
+                    "Please use a different attention backend, or leave decode backend "
+                    "unset to allow automatic fallback to xqa."
                 )
 
             if self.page_size not in [16, 32, 64]:
