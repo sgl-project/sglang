@@ -300,6 +300,21 @@ class AiterAttnBackend(AttentionBackend):
 
             self.fix_max_split_per_batch = self.max_split_per_batch
 
+    def _get_aiter_paged_ragged_kv_cache_dtype(self) -> str:
+        """``kv_cache_dtype`` string for ``paged_attention_ragged`` (aiter ``pa/pa_ragged.py``).
+
+        **Behavior change:** we no longer upcast FP8 KV to the activations dtype for this decode path.
+        Paged K/V stay in native FP8 storage; we pass ``\"fp8_e4m3\"`` so the kernel dequants on read
+        (``k_scale`` / ``v_scale``) instead of widening the cache to bf16/fp16 for ``\"auto\"``.
+
+        **Context (short):** aiter accepts ``auto`` / ``fp8`` / ``fp8_e4m3`` only (not ``fp8_e5m2``).
+        On HIP, ``configure_kv_cache_dtype`` maps CLI ``fp8_e5m2`` and ``fp8_e4m3`` to ``fp8_dtype``;
+        return ``\"fp8_e4m3\"`` when ``self.kv_cache_dtype == fp8_dtype``, else ``\"auto\"``.
+        """
+        if self.kv_cache_dtype != fp8_dtype:
+            return "auto"
+        return "fp8_e4m3"
+
     def make_mla_decode_meta_data_buffer(self, max_seqlen_qo, batch_size):
         nhead = self.num_head_padded
         dtype = self.kv_cache_dtype
@@ -2914,9 +2929,10 @@ class AiterAttnBackend(AttentionBackend):
                     sinks=sinks,
                 )
             else:
-                if self.kv_cache_dtype == fp8_dtype:
-                    k_cache = k_cache.to(self.input_dtype)
-                    v_cache = v_cache.to(self.input_dtype)
+                # Drop FP8 KV upcast: keep paged cache in native FP8 and use ``fp8_e4m3`` for
+                # in-kernel dequant in ``paged_attention_ragged``. (HIP maps CLI e5m2/e4m3 to
+                # ``fp8_dtype``; aiter has no ``fp8_e5m2`` string.)
+                aiter_kv_str = self._get_aiter_paged_ragged_kv_cache_dtype()
 
                 paged_attention_ragged(
                     o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
@@ -2931,7 +2947,7 @@ class AiterAttnBackend(AttentionBackend):
                     1,
                     self.max_num_partitions,
                     None,
-                    "auto",
+                    aiter_kv_str,
                     "NHD",
                     self.logits_soft_cap,
                     self.k_scale,

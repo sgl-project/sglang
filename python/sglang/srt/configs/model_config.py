@@ -226,6 +226,16 @@ class ModelConfig:
                 logger.info(
                     f"Multimodal is disabled for {self.hf_config.model_type}. To enable it, set --enable-multimodal."
                 )
+            elif self.hf_config.architectures[0] in MIMO_V2_MULTIMODAL_ARCHS and not (
+                hasattr(self.hf_config, "vision_config")
+                and hasattr(self.hf_config, "audio_config")
+            ):
+                enable_multimodal = False
+                logger.info(
+                    "Multimodal is disabled for this MiMoV2 checkpoint: "
+                    "vision_config/audio_config not found in the model config "
+                    "(likely a text-only MiMoV2 variant)."
+                )
             else:
                 enable_multimodal = True
 
@@ -456,6 +466,7 @@ class ModelConfig:
         if is_draft_model and self.hf_config.architectures[0] in [
             "Qwen3_5ForConditionalGeneration",
             "Qwen3_5MoeForConditionalGeneration",
+            "InternS2PreviewForConditionalGeneration",
         ]:
             self.hf_config.architectures[0] = "Qwen3_5ForCausalLMMTP"
             self.hf_config.num_nextn_predict_layers = 1
@@ -598,6 +609,7 @@ class ModelConfig:
             )
             or "MistralLarge3ForCausalLMEagle" in self.hf_config.architectures
             or "KimiK25ForConditionalGeneration" in self.hf_config.architectures
+            or "Eagle3DeepseekV2ForCausalLM" in self.hf_config.architectures
         ):
             self.head_dim = 256
             self.attention_arch = AttentionArch.MLA
@@ -1511,6 +1523,7 @@ multimodal_model_archs = [
     "Qwen3VLMoeForConditionalGeneration",
     "Qwen3_5ForConditionalGeneration",
     "Qwen3_5MoeForConditionalGeneration",
+    "InternS2PreviewForConditionalGeneration",
     "Qwen3ASRForConditionalGeneration",
     "Qwen3OmniMoeForConditionalGeneration",
     "KimiVLForConditionalGeneration",
@@ -1650,6 +1663,7 @@ def is_hybrid_swa_model(model_architectures: List[str]):
         "Step3p5MTP",
         "Gemma4ForCausalLM",
         "Gemma4ForConditionalGeneration",
+        "LagunaForCausalLM",
     }
     return any(arch in hybrid_swa_archs for arch in model_architectures)
 
@@ -1704,6 +1718,14 @@ def get_hybrid_layer_ids(
         "Gemma4ForCausalLM" in model_architectures
         or "Gemma4ForConditionalGeneration" in model_architectures
     ):
+        layer_types = getattr(hf_text_config, "layer_types", [])
+        swa_attention_layer_ids = [
+            i for i, x in enumerate(layer_types) if x == "sliding_attention"
+        ]
+        full_attention_layer_ids = [
+            i for i, x in enumerate(layer_types) if x == "full_attention"
+        ]
+    elif "LagunaForCausalLM" in model_architectures:
         layer_types = getattr(hf_text_config, "layer_types", [])
         swa_attention_layer_ids = [
             i for i, x in enumerate(layer_types) if x == "sliding_attention"

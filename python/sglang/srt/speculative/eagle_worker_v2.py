@@ -54,7 +54,7 @@ from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
 from sglang.srt.speculative.eagle_info_v2 import (
     assign_extend_cache_locs,
     fill_accepted_out_cache_loc,
-    fill_new_verified_id,
+    fill_bonus_tokens,
 )
 from sglang.srt.speculative.eagle_utils import TreeMaskMode, build_tree_kernel_efficient
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -343,7 +343,7 @@ class EagleDraftWorker(BaseDraftWorker):
     @staticmethod
     def draft_wrapper(draft_func):
         def wrapper(self, model_worker_batch: ModelWorkerBatch):
-            parent_list, top_scores_index, draft_tokens, verified_id = draft_func(
+            parent_list, top_scores_index, draft_tokens, bonus_tokens = draft_func(
                 self, model_worker_batch
             )
 
@@ -368,7 +368,7 @@ class EagleDraftWorker(BaseDraftWorker):
                 retrieve_next_sibling,
                 draft_tokens,
             ) = build_tree_kernel_efficient(
-                verified_id,
+                bonus_tokens,
                 parent_list,
                 top_scores_index,
                 draft_tokens,
@@ -406,7 +406,7 @@ class EagleDraftWorker(BaseDraftWorker):
         parent_list, top_scores_index, draft_tokens = self.draft_forward_for_prepare(
             draft_input
         )
-        return parent_list, top_scores_index, draft_tokens, draft_input.verified_id
+        return parent_list, top_scores_index, draft_tokens, draft_input.bonus_tokens
 
     @draft_wrapper
     def draft(self, model_worker_batch):
@@ -437,7 +437,7 @@ class EagleDraftWorker(BaseDraftWorker):
                 forward_batch
             )
 
-        return parent_list, top_scores_index, draft_tokens, draft_input.verified_id
+        return parent_list, top_scores_index, draft_tokens, draft_input.bonus_tokens
 
     def draft_zero_bubble(
         self,
@@ -741,7 +741,7 @@ class EagleDraftWorker(BaseDraftWorker):
         # Construct spec_info
         next_draft_input = EagleDraftInput(
             hidden_states=target_hidden_states,
-            verified_id=next_token_ids,
+            bonus_tokens=next_token_ids,
             new_seq_lens=batch.seq_lens,
             # draft mode is same with decode mode, only 1 token per req
             num_tokens_per_req=1,
@@ -1190,6 +1190,18 @@ class EAGLEWorkerV2(BaseSpecWorker):
             torch.get_device_module(self.device).current_stream().wait_stream(
                 self.plan_stream
             )
+            if (
+                _is_npu
+                and self._target_worker.model_runner.model_is_mrope
+                and batch.spec_info is not None
+                and getattr(batch.spec_info, "positions", None) is not None
+                and not batch.forward_mode.is_idle()
+            ):
+                # mrope_position depends on draft output in default stream and is computed in plan stream,
+                # causing errors. Compute it here for correct values.
+                verify_forward_batch.compute_spec_mrope_positions(
+                    self._target_worker.model_runner, batch
+                )
 
             # Some values such as custom_mask and position depend on the output of draft,
             # so the previous plan step used the wrong values. Here, we need to run the related
@@ -1262,16 +1274,16 @@ class EAGLEWorkerV2(BaseSpecWorker):
         verify_done.record()
 
         if not batch.forward_mode.is_idle():
-            all_verified_id = predict[accept_index]
-            verified_id = torch.empty_like(accept_lens, dtype=torch.int32)
-            fill_new_verified_id[(bs,)](
-                all_verified_id,
+            accept_tokens = predict[accept_index]
+            bonus_tokens = torch.empty_like(accept_lens, dtype=torch.int32)
+            fill_bonus_tokens[(bs,)](
+                accept_tokens,
                 accept_lens,
-                verified_id,
+                bonus_tokens,
                 self.speculative_num_draft_tokens,
             )
         else:
-            verified_id = torch.empty((0,), device=self.device, dtype=torch.int32)
+            bonus_tokens = torch.empty((0,), device=self.device, dtype=torch.int32)
 
         if batch.return_logprob and not batch.forward_mode.is_idle():
             compute_spec_v2_logprobs(
@@ -1280,7 +1292,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
 
         # Construct the next draft input
         next_draft_input = EagleDraftInput(
-            verified_id=verified_id,
+            bonus_tokens=bonus_tokens,
             new_seq_lens=new_seq_lens,
             verify_done=verify_done,
         )

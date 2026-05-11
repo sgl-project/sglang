@@ -49,6 +49,7 @@ from sglang.srt.speculative.eagle_utils import (
 )
 from sglang.srt.speculative.frozen_kv_mtp_info import (
     FrozenKVMTPContext,
+    FrozenKVMTPDraftExtendInput,
     FrozenKVMTPDraftInput,
     FrozenKVMTPVerifyInput,
     FrozenKVMTPVerifyOutput,
@@ -334,7 +335,7 @@ class FrozenKVMTPWorker(TpModelWorker):
         return select_last_extend_hidden(batch, hidden_states)
 
     def _select_last_verified_seed(
-        self, draft_input: FrozenKVMTPDraftInput
+        self, draft_input: FrozenKVMTPDraftExtendInput
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         return select_last_verified_seed(draft_input)
 
@@ -366,7 +367,7 @@ class FrozenKVMTPWorker(TpModelWorker):
         if draft_input is None:
             draft_input = FrozenKVMTPDraftInput()
 
-        draft_input.verified_id = last_token_ids.to(torch.int64)
+        draft_input.bonus_tokens = last_token_ids.to(torch.int64)
         draft_input.hidden_states = last_hidden_states
         draft_input.capture_hidden_mode = CaptureHiddenMode.LAST
         draft_input.num_tokens_per_req = 1
@@ -380,7 +381,7 @@ class FrozenKVMTPWorker(TpModelWorker):
         spec_info_backup = batch.spec_info
 
         batch.forward_mode = ForwardMode.DECODE
-        batch.input_ids = draft_input.verified_id
+        batch.input_ids = draft_input.bonus_tokens
         batch.return_hidden_states = False
         batch.return_logprob = False
         batch.spec_info = draft_input
@@ -442,13 +443,12 @@ class FrozenKVMTPWorker(TpModelWorker):
         with self.draft_tp_context(
             self.draft_model_runner.tp_group
         ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
-            spec_info = self.draft(batch)
+            verify_input = self.draft(batch)
         set_time_batch(batch.reqs, "set_spec_draft_end_time", trace_only=True)
         set_time_batch(batch.reqs, "set_spec_verify_start_time", trace_only=True)
 
-        logits_output, verify_output, _, can_run_cuda_graph = self.verify(
-            batch, spec_info
-        )
+        batch.spec_info = verify_input
+        logits_output, verify_output, can_run_cuda_graph = self.verify(batch)
 
         if get_global_tracing_enabled():
             for idx, req in enumerate(batch.reqs):
@@ -459,16 +459,20 @@ class FrozenKVMTPWorker(TpModelWorker):
         with self.draft_tp_context(
             self.draft_model_runner.tp_group
         ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
+            draft_extend_input = verify_output.draft_extend_input
             if (
                 self.server_args.enable_dp_attention
-                or batch.spec_info.verified_id.numel()
+                or draft_extend_input.input_ids.shape[0] > 0
             ):
+                # Stash for the seed step; _run_assistant_seed_step swaps in
+                # a fresh FrozenKVMTPDraftInput for next iter.
+                batch.spec_info = draft_extend_input
                 self.forward_draft_extend_after_decode(batch)
         set_time_batch(batch.reqs, "set_spec_draft_extend_end_time", trace_only=True)
 
         return GenerationBatchResult(
             logits_output=logits_output,
-            next_token_ids=verify_output.verified_id,
+            next_token_ids=verify_output.accept_tokens,
             num_accepted_drafts=sum(verify_output.num_accepted_drafts_per_req_cpu),
             num_accepted_drafts_per_req_cpu=verify_output.num_accepted_drafts_per_req_cpu,
             can_run_cuda_graph=can_run_cuda_graph,
@@ -505,9 +509,12 @@ class FrozenKVMTPWorker(TpModelWorker):
         )
 
     def forward_draft_extend_after_decode(self, batch: ScheduleBatch) -> None:
-        assert isinstance(batch.spec_info, FrozenKVMTPDraftInput)
+        draft_extend_input: FrozenKVMTPDraftExtendInput = batch.spec_info
         input_is_idle = batch.forward_mode.is_idle()
-        if not input_is_idle and batch.spec_info.verified_id.numel() == 0:
+
+        if not input_is_idle and draft_extend_input.input_ids.shape[0] == 0:
+            # All reqs finished; stash an idle FrozenKVMTPDraftInput so the
+            # next-iter draft sees a valid spec_info.
             batch = batch.copy()
             batch.prepare_for_idle()
             batch.spec_info = FrozenKVMTPDraftInput.create_idle_input(
@@ -517,30 +524,32 @@ class FrozenKVMTPWorker(TpModelWorker):
                 topk=self.topk,
                 capture_hidden_mode=CaptureHiddenMode.LAST,
             )
+            return
 
         if batch.forward_mode.is_idle():
             return
 
-        draft_input = batch.spec_info
         seq_lens_backup = batch.seq_lens.clone()
         seq_lens_cpu_backup = batch.seq_lens_cpu.clone()
         req_pool_indices_backup = batch.req_pool_indices
 
         try:
-            if draft_input.seq_lens_for_draft_extend is not None:
-                # Verify may leave finished requests in ScheduleBatch; seed only
-                # the unfinished requests carried by draft_input.
-                batch.seq_lens = draft_input.seq_lens_for_draft_extend
-                batch.seq_lens_cpu = draft_input.seq_lens_for_draft_extend_cpu
-                batch.req_pool_indices = draft_input.req_pool_indices_for_draft_extend
+            # Verify may leave finished requests in ScheduleBatch; seed only
+            # the unfinished reqs carried by `draft_extend_input`.
+            batch.seq_lens = draft_extend_input.seq_lens
+            batch.seq_lens_cpu = draft_extend_input.seq_lens_cpu
+            batch.req_pool_indices = draft_extend_input.req_pool_indices
 
-            last_token_ids, last_hidden = self._select_last_verified_seed(draft_input)
+            last_token_ids, last_hidden = self._select_last_verified_seed(
+                draft_extend_input
+            )
+            # `_run_assistant_seed_step` constructs a fresh `FrozenKVMTPDraftInput`
+            # and installs it on `batch.spec_info` for next iter.
             self._run_assistant_seed_step(
                 batch,
                 last_token_ids,
                 last_hidden,
-                seq_lens_cpu=draft_input.seq_lens_for_draft_extend_cpu,
-                draft_input=draft_input,
+                seq_lens_cpu=draft_extend_input.seq_lens_cpu,
             )
         finally:
             batch.seq_lens = seq_lens_backup
@@ -564,7 +573,7 @@ class FrozenKVMTPWorker(TpModelWorker):
 
         if batch.sampling_info.penalizer_orchestrator.is_required:
             batch.sampling_info.penalizer_orchestrator.cumulate_output_tokens(
-                spec_info.verified_id.to(torch.int64)
+                spec_info.bonus_tokens.to(torch.int64)
             )
 
         spec_info.capture_hidden_mode = CaptureHiddenMode.LAST
@@ -603,7 +612,7 @@ class FrozenKVMTPWorker(TpModelWorker):
             retrieve_next_sibling,
             draft_tokens,
         ) = build_tree_kernel_efficient(
-            spec_info.verified_id,
+            spec_info.bonus_tokens,
             parent_list,
             top_scores_index,
             draft_tokens,
@@ -687,7 +696,8 @@ class FrozenKVMTPWorker(TpModelWorker):
             score_list, token_list, parents_list, self.speculative_num_draft_tokens
         )
 
-    def verify(self, batch: ScheduleBatch, spec_info: FrozenKVMTPVerifyInput):
+    def verify(self, batch: ScheduleBatch):
+        spec_info: FrozenKVMTPVerifyInput = batch.spec_info
         seq_lens_pre_verify = batch.seq_lens.clone()
         spec_info.prepare_for_verify(batch, self.page_size)
         spec_info.num_tokens_per_req = self.speculative_num_steps + 1
@@ -697,7 +707,6 @@ class FrozenKVMTPWorker(TpModelWorker):
             if not batch.forward_mode.is_idle()
             else ForwardMode.IDLE
         )
-        batch.spec_info = spec_info
 
         model_worker_batch = batch.get_model_worker_batch(
             seq_lens_cpu_cache=spec_info.seq_lens_cpu
@@ -766,7 +775,6 @@ class FrozenKVMTPWorker(TpModelWorker):
         batch.forward_mode = (
             ForwardMode.DECODE if not batch.forward_mode.is_idle() else ForwardMode.IDLE
         )
-        batch.spec_info = res.draft_input
 
         del seq_lens_pre_verify
-        return logits_output, res, model_worker_batch, can_run_cuda_graph
+        return logits_output, res, can_run_cuda_graph
