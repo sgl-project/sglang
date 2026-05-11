@@ -62,6 +62,17 @@ def create_trtllm_mla_backend(runner):
     return TRTLLMMLABackend(runner)
 
 
+@register_attention_backend("tokenspeed_mla")
+def create_tokenspeed_mla_backend(runner):
+    if not runner.use_mla_backend:
+        raise ValueError("tokenspeed_mla backend can only be used with MLA models.")
+    from sglang.srt.layers.attention.tokenspeed_mla_backend import (
+        TokenspeedMLABackend,
+    )
+
+    return TokenspeedMLABackend(runner)
+
+
 @register_attention_backend("aiter")
 def create_aiter_backend(runner):
     from sglang.srt.layers.attention.aiter_backend import AiterAttnBackend
