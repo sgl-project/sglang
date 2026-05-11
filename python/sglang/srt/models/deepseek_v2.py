@@ -123,6 +123,12 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
+from sglang.srt.lora.triton_ops import (
+    step_a_q_fwd,
+    step_a_v_fwd,
+    step_b_q_fwd,
+    step_b_v_fwd,
+)
 from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.models.deepseek_common.attention_backend_handler import (
@@ -1718,8 +1724,16 @@ class DeepseekV2AttentionMLA(
         k_pe = latent_cache_output[..., self.kv_lora_rank :].unsqueeze(1)
         return k_nope, k_pe
 
-    def _get_kv_b_lora_batch_info(self):
-        """Return kv_b_proj LoRA state when a kv_b adapter is active."""
+    def _get_kv_b_lora_state(self):
+        """Return ``(A_buffer, B_buffer, batch_info)`` when a ``kv_b_proj``
+        LoRA adapter is active, else ``None``.
+
+        The absorbed-MLA path bypasses ``kv_b_proj.forward()`` and folds
+        ``W_kc`` / ``W_vc`` as plain BMMs, so the LoRA delta has to be
+        applied manually.  This getter is the cheap precondition check
+        shared by ``_apply_kv_b_lora_q_correction`` and
+        ``_apply_kv_b_lora_v_correction``.
+        """
         if not getattr(self.kv_b_proj, "set_lora", False):
             return None
         if not hasattr(self.kv_b_proj, "A_buffer"):
@@ -1731,79 +1745,65 @@ class DeepseekV2AttentionMLA(
             return None
         return self.kv_b_proj.A_buffer, self.kv_b_proj.B_buffer, batch_info
 
-    def _expand_wi_to_per_token(self, batch_info, num_tokens):
-        """Expand per-request weight indices to per-token adapter slots."""
-        wi = batch_info.weight_indices
-        if wi.shape[0] == num_tokens:
-            return wi
-        if batch_info.use_cuda_graph:
-            return wi[:num_tokens]
-        seg_lens = batch_info.seg_indptr[1:] - batch_info.seg_indptr[:-1]
-        return torch.repeat_interleave(wi, seg_lens)
+    def _apply_kv_b_lora_q_correction(
+        self, q_nope: torch.Tensor, q_nope_out: torch.Tensor
+    ) -> torch.Tensor:
+        """LoRA correction for the absorbed ``q_nope @ w_kc`` path.
 
-    def _compute_slot_delta_kc(self, A, B, scaling, dtype):
-        delta_W = torch.nan_to_num(scaling * (B.float() @ A.float()))
-        delta_W = delta_W.view(
-            self.num_local_heads,
-            self.qk_nope_head_dim + self.v_head_dim,
-            self.kv_lora_rank,
-        )
-        return delta_W[:, : self.qk_nope_head_dim, :].to(dtype)
+        Computes ``q_nope_out += q_nope @ B_kc @ A * scaling`` per token,
+        per active LoRA slot.  Uses two SGMM-style Triton kernels with a
+        head-axis grid program-id, mirroring how ``sgemm_lora_a/b`` route
+        per-segment slots inside one launch:
 
-    def _compute_slot_delta_vc(self, A, B, scaling, dtype):
-        delta_W = torch.nan_to_num(scaling * (B.float() @ A.float()))
-        delta_W = delta_W.view(
-            self.num_local_heads,
-            self.qk_nope_head_dim + self.v_head_dim,
-            self.kv_lora_rank,
-        )
-        return (
-            delta_W[:, self.qk_nope_head_dim :, :]
-            .contiguous()
-            .transpose(1, 2)
-            .to(dtype)
-        )
+          * step A_q : ``q_nope (S,H,qk_nope)  @ B_kc[slot, h] (qk_nope, rank)
+                        -> (S,H,rank)``
+          * step B_q : ``q_lora_a (S,H,rank)   @ A[slot] (rank, kv_lora_rank)
+                        -> += into q_nope_out``
 
-    def _apply_kv_b_lora_q_correction(self, q_nope, q_nope_out):
-        info = self._get_kv_b_lora_batch_info()
+        The factored math avoids materialising ``B @ A`` (a ~268M-FMA fp32
+        matmul per layer per slot in the previous torch implementation).
+        """
+        info = self._get_kv_b_lora_state()
         if info is None:
             return q_nope_out
         A_buf, B_buf, batch_info = info
-        token_wi = self._expand_wi_to_per_token(batch_info, q_nope.shape[0])
-        q_nope_ht = q_nope.transpose(0, 1)
 
-        for slot in range(A_buf.shape[0]):
-            delta_kc = self._compute_slot_delta_kc(
-                A_buf[slot],
-                B_buf[slot],
-                batch_info.scalings[slot],
-                q_nope.dtype,
-            )
-            slot_mask = (token_wi == slot).to(q_nope.dtype).unsqueeze(0).unsqueeze(2)
-            correction = torch.bmm(q_nope_ht, delta_kc)
-            q_nope_out = q_nope_out + (correction * slot_mask).transpose(0, 1)
+        full_K_per_head = self.qk_nope_head_dim + self.v_head_dim
+        q_lora_a = step_a_q_fwd(q_nope, B_buf, batch_info, full_K_per_head)
+        return step_b_q_fwd(q_lora_a, A_buf, batch_info, q_nope_out)
 
-        return q_nope_out
+    def _apply_kv_b_lora_v_correction(
+        self, attn_output: torch.Tensor, attn_bmm_flat: torch.Tensor
+    ) -> torch.Tensor:
+        """LoRA correction for the absorbed ``attn_output @ w_vc`` path.
 
-    def _apply_kv_b_lora_v_correction(self, attn_output, attn_bmm_flat):
-        info = self._get_kv_b_lora_batch_info()
+        Computes ``attn_bmm_flat += attn_output @ A.T @ B_vc.T * scaling``
+        per token, per active LoRA slot.  Uses two SGMM-style Triton kernels:
+
+          * step A_v : ``attn_output (S,H,kv_lora_rank) @ A.T[slot] (kv_lora_rank, rank)
+                        -> (S,H,rank)``
+          * step B_v : ``attn_lora_a (S,H,rank)         @ B_vc.T[slot, h] (rank, v_head_dim)
+                        -> += into attn_bmm_flat (S, H*v_head_dim)``
+
+        ``attn_bmm_flat`` is the flat ``(S, H*v_head_dim)`` view of the
+        BMM result; we pass strides matching the implicit ``(S, H, v_head_dim)``
+        layout to the kernel.
+        """
+        info = self._get_kv_b_lora_state()
         if info is None:
             return attn_bmm_flat
         A_buf, B_buf, batch_info = info
-        token_wi = self._expand_wi_to_per_token(batch_info, attn_output.shape[0])
-        attn_ht = attn_output.transpose(0, 1)
 
-        for slot in range(A_buf.shape[0]):
-            delta_vc = self._compute_slot_delta_vc(
-                A_buf[slot],
-                B_buf[slot],
-                batch_info.scalings[slot],
-                attn_output.dtype,
-            )
-            slot_mask = (token_wi == slot).to(attn_output.dtype).unsqueeze(1)
-            v_delta = torch.bmm(attn_ht, delta_vc).transpose(0, 1).flatten(1, 2)
-            attn_bmm_flat = attn_bmm_flat + v_delta * slot_mask
-
+        attn_lora_a = step_a_v_fwd(attn_output, A_buf, batch_info)
+        base_view = attn_bmm_flat.view(-1, self.num_local_heads, self.v_head_dim)
+        step_b_v_fwd(
+            attn_lora_a,
+            B_buf,
+            batch_info,
+            base_view,
+            self.qk_nope_head_dim,
+            self.v_head_dim,
+        )
         return attn_bmm_flat
 
     @staticmethod

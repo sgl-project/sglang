@@ -224,9 +224,7 @@ class DeepseekMLARocmForwardMixin:
         else:
             attn_bmm_output = torch.bmm(attn_output.transpose(0, 1), self.w_vc)
         attn_bmm_flat = attn_bmm_output.transpose(0, 1).flatten(1, 2)
-        attn_bmm_flat = self._apply_kv_b_lora_v_correction(
-            attn_output, attn_bmm_flat
-        )
+        attn_bmm_flat = self._apply_kv_b_lora_v_correction(attn_output, attn_bmm_flat)
         output, _ = self.o_proj(attn_bmm_flat)
 
         return output
