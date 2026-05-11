@@ -95,6 +95,9 @@ from sglang.srt.managers.tokenizer_manager_components.score_request_handler impo
     ScoreRequestHandler,
     ScoreRequestHandlerConfig,
 )
+from sglang.srt.managers.tokenizer_manager_components.session_controller import (
+    SessionController,
+)
 from sglang.srt.managers.tokenizer_manager_components.tokenized_request_builder import (
     TokenizedRequestBuilder,
     TokenizedRequestBuilderConfig,
@@ -196,6 +199,13 @@ class TokenizerManager(TokenizerControlMixin):
             enable_metrics=self.enable_metrics,
             enable_priority_scheduling=self.enable_priority_scheduling,
             disaggregation_mode=self.disaggregation_mode,
+        )
+
+        # Session controller
+        self.session_controller = SessionController(
+            send_to_scheduler=self.send_to_scheduler,
+            auto_create_handle_loop=self.auto_create_handle_loop,
+            server_args=self.server_args,
         )
 
         # Request log manager
@@ -316,9 +326,6 @@ class TokenizerManager(TokenizerControlMixin):
         self.gracefully_exit = False
         self.last_receive_tstamp = real_time()
 
-        # Session
-        self.session_futures = {}  # session_id -> asyncio event
-
         # Subprocess liveness watchdog — set by Engine or http_server after construction
         self._subprocess_watchdog = None
 
@@ -379,7 +386,12 @@ class TokenizerManager(TokenizerControlMixin):
         self._result_dispatcher = TypeBasedDispatcher(
             [
                 (AbortReq, self._handle_abort_req),
-                (OpenSessionReqOutput, self._handle_open_session_req_output),
+                (
+                    OpenSessionReqOutput,
+                    lambda recv_obj: TokenizerManager.handle_open_session_req_output(
+                        self.session_controller, recv_obj
+                    ),
+                ),
                 (
                     UpdateWeightFromDiskReqOutput,
                     self._handle_update_weights_from_disk_req_output,
@@ -1309,7 +1321,8 @@ class TokenizerManager(TokenizerControlMixin):
     def update_active_ranks(self, ranks: ActiveRanksOutput):
         self.send_to_scheduler.send_pyobj(ranks)
 
-    def _handle_open_session_req_output(self, recv_obj):
+    @staticmethod
+    def handle_open_session_req_output(self: "SessionController", recv_obj):
         future = self.session_futures.get(recv_obj.session_id)
         if future is None:
             logger.warning(
