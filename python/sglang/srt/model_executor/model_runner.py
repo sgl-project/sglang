@@ -124,13 +124,13 @@ from sglang.srt.layers.dp_attention import (
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.model_parallel import apply_torch_tp
 from sglang.srt.layers.pooler import EmbeddingPoolerOutput
-from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype
 from sglang.srt.layers.sampler import create_sampler
 from sglang.srt.layers.torchao_utils import apply_torchao_config_to_model
 from sglang.srt.lora.lora_manager import LoRAManager
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.managers.schedule_batch import sanity_check_mm_pad_shift_value
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
+from sglang.srt.mem_cache.kv_cache_dtype import configure_kv_cache_dtype
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.model_executor.breakable_cuda_graph_runner import (
     BreakableCudaGraphRunner,
@@ -261,13 +261,6 @@ CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS = [
     "cutlass_mla",
     "trtllm_mla",
 ]
-
-TORCH_DTYPE_TO_KV_CACHE_STR = {
-    torch.float8_e4m3fn: "fp8_e4m3",
-    torch.float8_e4m3fnuz: "fp8_e4m3",
-    torch.float8_e5m2: "fp8_e5m2",
-    torch.bfloat16: "bf16",
-}
 
 
 def add_mla_attention_backend(backend_name):
@@ -751,12 +744,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             enable_batch_invariant_mode()
 
         # Deduce KV cache dtype
-        self.server_args.kv_cache_dtype, self.kv_cache_dtype = (
-            ModelRunner.configure_kv_cache_dtype(
-                server_args=self.server_args,
-                model=self.model,
-                model_dtype=self.dtype,
-            )
+        self.server_args.kv_cache_dtype, self.kv_cache_dtype = configure_kv_cache_dtype(
+            server_args=self.server_args,
+            model=self.model,
+            model_dtype=self.dtype,
         )
 
         # Init memory pool and attention backends
@@ -2288,62 +2279,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             return existing
         result = self._get_linear_attn_registry_result()
         return result[1] if result else None
-
-    @staticmethod
-    def configure_kv_cache_dtype(
-        *,
-        server_args: ServerArgs,
-        model: nn.Module,
-        model_dtype: torch.dtype,
-    ) -> tuple[str, torch.dtype]:
-        server_args_kv_cache_dtype = server_args.kv_cache_dtype
-        if server_args_kv_cache_dtype == "auto":
-            quant_config = getattr(model, "quant_config", None)
-            kv_cache_quant_algo = getattr(quant_config, "kv_cache_quant_algo", None)
-            if (
-                isinstance(kv_cache_quant_algo, str)
-                and kv_cache_quant_algo.upper() == "FP8"
-            ):
-                if _is_hip:
-                    kv_cache_dtype = fp8_dtype
-                    server_args_kv_cache_dtype = TORCH_DTYPE_TO_KV_CACHE_STR[
-                        kv_cache_dtype
-                    ]
-                else:
-                    kv_cache_dtype = torch.float8_e4m3fn
-                    server_args_kv_cache_dtype = TORCH_DTYPE_TO_KV_CACHE_STR[
-                        kv_cache_dtype
-                    ]
-            else:
-                kv_cache_dtype = model_dtype
-        elif server_args_kv_cache_dtype == "fp8_e5m2":
-            if _is_hip:  # Using natively supported format
-                kv_cache_dtype = fp8_dtype
-            else:
-                kv_cache_dtype = torch.float8_e5m2
-        elif server_args_kv_cache_dtype == "fp8_e4m3":
-            if _is_hip:  # Using natively supported format
-                kv_cache_dtype = fp8_dtype
-            else:
-                kv_cache_dtype = torch.float8_e4m3fn
-        elif server_args_kv_cache_dtype in ("bf16", "bfloat16"):
-            kv_cache_dtype = torch.bfloat16
-        elif server_args_kv_cache_dtype == "fp4_e2m1":
-            if hasattr(torch, "float4_e2m1fn_x2"):
-                kv_cache_dtype = torch.float4_e2m1fn_x2
-                logger.warning(f"FP4 (E2M1) KV Cache might lead to a accuracy drop!")
-            else:
-                logger.warning(
-                    f"--kv-cache-dtype falls back to 'auto' because this torch version does not support torch.float4_e2m1fn_x2"
-                )
-                kv_cache_dtype = model_dtype
-        else:
-            raise ValueError(
-                f"Unsupported kv_cache_dtype: {server_args_kv_cache_dtype}."
-            )
-
-        log_info_on_rank0(logger, f"Using KV cache dtype: {kv_cache_dtype}")
-        return server_args_kv_cache_dtype, kv_cache_dtype
 
     def init_attention_backend(self):
         """Init attention kernel backend."""
