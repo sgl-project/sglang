@@ -15,7 +15,7 @@ from sglang.srt.managers.io_struct import (
 from sglang.srt.managers.schedule_batch import MultimodalDataItem
 
 logger = logging.getLogger(__name__)
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from sglang.srt.managers.tokenizer_manager_components.multimodal_processor_owner import (
     MultimodalProcessor,
@@ -69,54 +69,16 @@ class RequestPreparer:
     ):
         """Tokenize one request."""
         resolved = await self._resolve_input_source(obj)
-        input_text = resolved.input_text
-        input_embeds = resolved.input_embeds
-        input_ids = resolved.input_ids
-        token_type_ids = resolved.token_type_ids
+        mm_inputs, resolved = await self._maybe_run_mm_processor(obj, resolved)
 
-        contains_mm_input = obj.contains_mm_input()
-        is_mossvl = "MossVLForConditionalGeneration" in self.config.architectures
-        should_run_mm_processor = self.mm_processor is not None and (
-            contains_mm_input or is_mossvl
-        )
-
-        if should_run_mm_processor:
-            if obj.image_data is not None and not isinstance(obj.image_data, list):
-                obj.image_data = [obj.image_data]
-            if obj.video_data is not None and not isinstance(obj.video_data, list):
-                obj.video_data = [obj.video_data]
-            if obj.audio_data is not None and not isinstance(obj.audio_data, list):
-                obj.audio_data = [obj.audio_data]
-            if contains_mm_input:
-                self.request_validator._validate_mm_limits(obj)
-
-            mm_inputs = await self._dispatch_mm_processor(obj, input_text, input_ids)
-
-            if mm_inputs and mm_inputs.input_ids is not None:
-                input_ids = mm_inputs.input_ids
-            if mm_inputs and mm_inputs.token_type_ids is not None:
-                token_type_ids = mm_inputs.token_type_ids
-                if not isinstance(token_type_ids, list):
-                    token_type_ids = token_type_ids.flatten().tolist()
-            if (
-                envs.SGLANG_MM_PRECOMPUTE_HASH.get()
-                and mm_inputs
-                and mm_inputs.mm_items
-            ):
-                for item in mm_inputs.mm_items:
-                    if isinstance(item, MultimodalDataItem):
-                        item.set_pad_value()
-        else:
-            mm_inputs = None
-
-        self.request_validator.validate_one(obj=obj, input_ids=input_ids)
+        self.request_validator.validate_one(obj=obj, input_ids=resolved.input_ids)
         tokenized_obj = self.tokenized_request_builder.build(
             obj,
-            input_text,
-            input_ids,
-            input_embeds,
+            resolved.input_text,
+            resolved.input_ids,
+            resolved.input_embeds,
             mm_inputs,
-            token_type_ids,
+            resolved.token_type_ids,
         )
         tokenized_obj.time_stats = self.rid_to_state[obj.rid].time_stats
         self.rid_to_state[obj.rid].time_stats.set_tokenize_finish_time()
@@ -167,6 +129,52 @@ class RequestPreparer:
             token_type_ids=token_type_ids,
             input_embeds=input_embeds,
             input_text=input_text,
+        )
+
+    async def _maybe_run_mm_processor(
+        self,
+        obj: Union[GenerateReqInput, EmbeddingReqInput],
+        resolved: _ResolvedInput,
+    ) -> Tuple[Optional[Any], _ResolvedInput]:
+        contains_mm_input = obj.contains_mm_input()
+        is_mossvl = "MossVLForConditionalGeneration" in self.config.architectures
+        should_run_mm_processor = self.mm_processor is not None and (
+            contains_mm_input or is_mossvl
+        )
+        if not should_run_mm_processor:
+            return None, resolved
+
+        if obj.image_data is not None and not isinstance(obj.image_data, list):
+            obj.image_data = [obj.image_data]
+        if obj.video_data is not None and not isinstance(obj.video_data, list):
+            obj.video_data = [obj.video_data]
+        if obj.audio_data is not None and not isinstance(obj.audio_data, list):
+            obj.audio_data = [obj.audio_data]
+        if contains_mm_input:
+            self.request_validator._validate_mm_limits(obj)
+
+        mm_inputs = await self._dispatch_mm_processor(
+            obj, resolved.input_text, resolved.input_ids
+        )
+
+        input_ids = resolved.input_ids
+        token_type_ids = resolved.token_type_ids
+        if mm_inputs and mm_inputs.input_ids is not None:
+            input_ids = mm_inputs.input_ids
+        if mm_inputs and mm_inputs.token_type_ids is not None:
+            token_type_ids = mm_inputs.token_type_ids
+            if not isinstance(token_type_ids, list):
+                token_type_ids = token_type_ids.flatten().tolist()
+        if envs.SGLANG_MM_PRECOMPUTE_HASH.get() and mm_inputs and mm_inputs.mm_items:
+            for item in mm_inputs.mm_items:
+                if isinstance(item, MultimodalDataItem):
+                    item.set_pad_value()
+
+        return mm_inputs, _ResolvedInput(
+            input_ids=input_ids,
+            token_type_ids=token_type_ids,
+            input_embeds=resolved.input_embeds,
+            input_text=resolved.input_text,
         )
 
     async def _dispatch_mm_processor(
