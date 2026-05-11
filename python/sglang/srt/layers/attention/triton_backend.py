@@ -20,12 +20,12 @@ from sglang.srt.utils import (
     get_device_core_count,
     get_int_env_var,
     is_cuda,
-    is_hip,
+    is_gfx942_supported,
     next_power_of_2,
 )
 
 _is_cuda = is_cuda()
-_is_hip = is_hip()
+_is_gfx942 = is_gfx942_supported()
 
 if _is_cuda:
     from sgl_kernel.utils import is_arch_support_pdl
@@ -155,13 +155,15 @@ class TritonAttnBackend(AttentionBackend):
                 self.device_core_count,
                 self.max_context_len,
             )
-            if _is_hip:
-                # Bound attn_logits float32 buffer to 512 MB on ROCm; #20479's sm_cap faults at ~2 GB on MI3xx + Kimi-K2.6 (https://github.com/sgl-project/sglang/actions/runs/25513282022/job/74877480809).
-                bs = model_runner.server_args.cuda_graph_max_bs or 1
-                self.max_kv_splits = min(
-                    self.max_kv_splits,
-                    max(1, (512 << 20) // (bs * self.num_head * self.v_head_dim * 4)),
-                )
+            if _is_gfx942:
+                # gfx942 (MI300X / MI325X) has 304 CUs, so #20479's next_power_of_2(sm_count)
+                # rounds up to 512 — twice MI355X's natural cap of 256 — and the persistent
+                # cuda_graph_attn_logits fp32 buffer hits ~4 GiB on Kimi-K2.6 (v_head_dim=512),
+                # faulting in ROCm CUDA graph replay
+                # (https://github.com/sgl-project/sglang/actions/runs/25513282022/job/74877480809).
+                # Pin the cap at 256 so gfx942 matches the gfx950 (MI355X) behavior that we
+                # already validated end-to-end.
+                self.max_kv_splits = min(self.max_kv_splits, 256)
         if _is_cuda:
             self.use_pdl = is_arch_support_pdl()
         else:
