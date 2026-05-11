@@ -128,7 +128,12 @@ if [[ -n "${SKIP_TT_DEPS}" ]]; then
   echo "Didn't build lmms_eval, human-eval, and others"
 else
   # For lmms_evals evaluating MMMU
-  docker exec -w / ci_sglang git clone --branch v0.4.1 --depth 1 https://github.com/EvolvingLMMs-Lab/lmms-eval.git
+  # Clone on host (with retry), then copy into the container. The checkout is
+  # owned by the runner (non-root); mark it safe so setuptools_scm /
+  # vcs_versioning can run `git` introspection during pip install.
+  git_clone_with_retry https://github.com/EvolvingLMMs-Lab/lmms-eval.git lmms-eval "--branch v0.4.1"
+  docker cp lmms-eval ci_sglang:/
+  docker exec ci_sglang git config --global --add safe.directory /lmms-eval
   install_with_retry docker exec -w /lmms-eval ci_sglang pip install --cache-dir=/sgl-data/pip-cache -e .
 
   git_clone_with_retry https://github.com/akao-amd/human-eval.git human-eval
