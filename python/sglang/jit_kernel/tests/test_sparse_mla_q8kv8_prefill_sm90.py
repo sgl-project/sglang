@@ -171,5 +171,77 @@ def test_sparse_mla_q8kv8_prefill_corner_cases(
     _run_and_check(d_qk, with_sink, s_q=s_q, topk=topk, s_kv=s_kv)
 
 
+# Precision / accuracy: report distributional error of Q8KV8 kernel output
+# against the fp32 reference computed from dequantized inputs, following
+# the same metric-reporting style as test_cutedsl_gdn_precision.
+@pytest.mark.skipif(
+    not _sm90_available(), reason="Q8KV8 sparse prefill requires SM90 CUDA"
+)
+@pytest.mark.parametrize(
+    "d_qk,with_sink,s_q,topk,s_kv",
+    [
+        (512, False, 4, 256, 512),
+        (576, True, 4, 256, 512),
+    ],
+)
+def test_sparse_mla_q8kv8_prefill_precision(
+    d_qk: int, with_sink: bool, s_q: int, topk: int, s_kv: int
+):
+    """Demonstrate that Q8KV8 kernel precision is near-lossless versus the
+    fp32 reference: max/mean/p99 absolute error are small and the fraction
+    of elements exceeding 0.1 absolute error is under 1%."""
+    from sglang.jit_kernel.sparse_mla_q8kv8_prefill_sm90 import (
+        sparse_mla_q8kv8_prefill_fwd,
+    )
+
+    q, kv, indices, sm_scale, q_scale, kv_scale, attn_sink, topk_length = _make_case(
+        d_qk, with_sink, s_q=s_q, topk=topk, s_kv=s_kv
+    )
+
+    out, _, _ = sparse_mla_q8kv8_prefill_fwd(
+        q=q,
+        kv=kv,
+        indices=indices,
+        sm_scale=sm_scale,
+        q_scale=q_scale,
+        kv_scale=kv_scale,
+        d_v=D_V,
+        attn_sink=attn_sink,
+        topk_length=topk_length,
+    )
+    torch.cuda.synchronize()
+
+    ref = _torch_sparse_attention_ref(
+        q=q,
+        kv=kv,
+        indices=indices,
+        sm_scale=sm_scale,
+        q_scale=q_scale,
+        kv_scale=kv_scale,
+        attn_sink=attn_sink,
+        topk_length=topk_length,
+    )
+
+    out_f32 = out.float()
+    abs_diff = (out_f32 - ref).abs()
+    max_diff = abs_diff.max().item()
+    mean_diff = abs_diff.mean().item()
+    p99_diff = torch.quantile(abs_diff.flatten(), 0.99).item()
+    fail_rate = (abs_diff > 0.1).float().mean().item() * 100
+    has_bad = bool(torch.isnan(out_f32).any() or torch.isinf(out_f32).any())
+
+    print(
+        f"\n  d_qk={d_qk} with_sink={with_sink} s_q={s_q} topk={topk} s_kv={s_kv}: "
+        f"max_diff={max_diff:.2e}, p99_diff={p99_diff:.2e}, "
+        f"mean_diff={mean_diff:.2e}, fail_rate(>0.1)={fail_rate:.3f}%"
+    )
+
+    assert not has_bad, "Q8KV8 output contains NaN/Inf"
+    assert fail_rate < 1.0, f"fail_rate {fail_rate:.3f}% exceeds 1% threshold"
+    # Tight bounds on aggregate error to lock in near-lossless behavior.
+    assert mean_diff < 5e-3, f"mean_diff {mean_diff:.2e} exceeds 5e-3"
+    assert p99_diff < 5e-2, f"p99_diff {p99_diff:.2e} exceeds 5e-2"
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v", "-s"]))
