@@ -187,7 +187,7 @@ from sglang.srt.managers.scheduler_components.metrics_reporter import (
     PrefillStats,
     SchedulerMetricsReporter,
 )
-from sglang.srt.managers.scheduler_components.output_sender import SenderWrapper
+from sglang.srt.managers.scheduler_components.output_sender import SchedulerOutputSender
 from sglang.srt.managers.scheduler_components.output_streamer import (
     SchedulerOutputStreamer,
 )
@@ -843,8 +843,8 @@ class Scheduler(
                     context, zmq.PUSH, port_args.detokenizer_ipc_name, False
                 )
 
-            self.send_to_tokenizer = SenderWrapper(send_to_tokenizer)
-            self.send_to_detokenizer = SenderWrapper(send_to_detokenizer)
+            self.send_to_tokenizer = SchedulerOutputSender(send_to_tokenizer)
+            self.send_to_detokenizer = SchedulerOutputSender(send_to_detokenizer)
 
             if self.server_args.sleep_on_idle:
                 self.idle_sleeper = IdleSleeper(
@@ -856,8 +856,8 @@ class Scheduler(
         else:
             self.recv_from_tokenizer = None
             self.recv_from_rpc = None
-            self.send_to_tokenizer = SenderWrapper(None)
-            self.send_to_detokenizer = SenderWrapper(None)
+            self.send_to_tokenizer = SchedulerOutputSender(None)
+            self.send_to_detokenizer = SchedulerOutputSender(None)
 
         if self.current_scheduler_metrics_enabled:
             self.send_metrics_from_scheduler = get_zmq_socket(
@@ -3732,18 +3732,6 @@ class Scheduler(
         self, schedule_batch: ScheduleBatch, batch_result: GenerationBatchResult
     ):
         pass
-
-
-def is_work_request(recv_req):
-    return isinstance(
-        recv_req,
-        (
-            TokenizedGenerateReqInput,
-            TokenizedEmbeddingReqInput,
-            BatchTokenizedGenerateReqInput,
-            BatchTokenizedEmbeddingReqInput,
-        ),
-    )
 
 
 def dispatch_event_loop(scheduler: Scheduler):

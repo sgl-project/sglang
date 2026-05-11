@@ -2,10 +2,10 @@
 detokenizer output channel. Copies ``http_worker_ipc`` from recv_obj
 to output when needed (multi-http-worker IPC handoff).
 
-Note: there is a separate ``SenderWrapper`` class in
-``multi_tokenizer_mixin`` with a different signature. The namesake
-collision is resolved by a follow-up commit which renames this one
-to ``SchedulerOutputSender``.
+Note: ``multi_tokenizer_mixin`` has a different class also formerly
+named ``SenderWrapper`` (different signature, used by
+``tokenizer_manager``); this class was renamed from ``SenderWrapper``
+to ``SchedulerOutputSender`` to disambiguate.
 """
 
 from typing import Optional, Union
@@ -15,7 +15,7 @@ import zmq
 from sglang.srt.managers.io_struct import BaseBatchReq, BaseReq
 
 
-class SenderWrapper:
+class SchedulerOutputSender:
     def __init__(self, socket: zmq.Socket):
         self.socket = socket
 
