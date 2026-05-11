@@ -258,8 +258,7 @@ RUN pip install IPython \
     && pip install orjson \
     && pip install python-multipart \
     && pip install torchao==0.9.0 \
-    && pip install pybind11 \
-    && pip install cache-dit==1.3.0
+    && pip install pybind11
 
 RUN pip uninstall -y sgl_kernel sglang
 RUN git clone ${SGL_REPO} \
