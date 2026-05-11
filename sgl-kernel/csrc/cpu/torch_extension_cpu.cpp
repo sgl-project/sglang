@@ -92,6 +92,14 @@ void topk_transform_512_cpu(
     int64_t page_size,
     const std::optional<at::Tensor>& out_raw_indices);
 
+at::Tensor fp8_paged_mqa_logits_cpu(
+    at::Tensor& q_fp8,
+    at::Tensor& kvcache_fp8,
+    at::Tensor& weight,
+    at::Tensor& seq_lens,
+    at::Tensor& page_table,
+    int64_t max_seq_len,
+    bool clean_logits);
 
 // attention
 void decode_attention_cpu(
@@ -475,6 +483,11 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "int page_size, Tensor(a!)? out_raw_indices) -> ()");
   m.impl("topk_transform_512_cpu", torch::kCPU, &topk_transform_512_cpu);
 
+  // DeepSeek V4 compressed attention FP8 paged MQA logits
+  m.def(
+      "fp8_paged_mqa_logits_cpu(Tensor q_fp8, Tensor kvcache_fp8, Tensor weight, Tensor seq_lens, "
+      "Tensor page_table, int max_seq_len, bool clean_logits) -> Tensor");
+  m.impl("fp8_paged_mqa_logits_cpu", torch::kCPU, &fp8_paged_mqa_logits_cpu);
 
   // decode
   m.def(
