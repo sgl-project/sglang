@@ -81,6 +81,7 @@ sources = [
     "csrc/common_extension_musa.cc",
     "csrc/elementwise/activation.cu",
     "csrc/elementwise/concat_mla.cu",
+    "csrc/elementwise/pos_enc.cu",
     "csrc/elementwise/fused_add_rms_norm_kernel.mu",
     "csrc/grammar/apply_token_bitmask_inplace_cuda.cu",
     "csrc/moe/moe_align_kernel.cu",
@@ -107,6 +108,11 @@ sources = [
     "csrc/memory/weak_ref_tensor.cpp",
     str(_FLASHINFER_REPO.source_dir / "csrc/norm.cu"),
     str(_FLASHINFER_REPO.source_dir / "csrc/renorm.cu"),
+    # XXX (MUSA): The following files contain MUSA-specific implementations.
+    "csrc/musa/pos_encoding_contiguous.mu",
+    "csrc/musa/moe_gemv_swiglu.mu",
+    "csrc/musa/ternary.mu",
+    "csrc/musa/top_k_top_p_sampling.mu",
 ]
 
 cxx_flags = ["force_mcc"]

@@ -352,6 +352,7 @@ class SchedulerMetricsMixin:
 
     def report_prefill_stats(
         self: Scheduler,
+        batch: Optional[ScheduleBatch],
         prefill_stats: PrefillStats,
         can_run_cuda_graph: bool,
         dp_cooperation_info: Optional[DPCooperationInfo] = None,
@@ -373,7 +374,12 @@ class SchedulerMetricsMixin:
         token_usage_msg = ", ".join(pool_stats.get_prefill_usage_msg_parts()) + ", "
 
         self.stats.new_token_ratio = prefill_stats.new_token_ratio
-        iter_msg = f" [{self.forward_ct + 1}]" if LOG_FORWARD_ITERS else ""
+        batch_iter = (
+            batch.forward_iter
+            if batch is not None and batch.forward_iter is not None
+            else self.forward_ct
+        )
+        iter_msg = f" [{batch_iter}]" if LOG_FORWARD_ITERS else ""
 
         msg = (
             f"Prefill batch{iter_msg}, "
@@ -533,7 +539,12 @@ class SchedulerMetricsMixin:
                 gap_latency / self.server_args.decode_log_interval
             )
 
-        iter_msg = f" [{self.forward_ct}]" if LOG_FORWARD_ITERS else ""
+        batch_iter = (
+            batch.forward_iter
+            if batch is not None and batch.forward_iter is not None
+            else self.forward_ct
+        )
+        iter_msg = f" [{batch_iter}]" if LOG_FORWARD_ITERS else ""
         msg = f"Decode batch{iter_msg}, #running-req: {num_running_reqs}, {token_usage_msg}"
 
         if self.spec_algorithm.is_none():
