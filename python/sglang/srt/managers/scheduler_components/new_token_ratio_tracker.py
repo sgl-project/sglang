@@ -1,7 +1,13 @@
+from __future__ import annotations
+
 from dataclasses import dataclass
+from typing import TYPE_CHECKING, Sequence
 
 from sglang.srt.environ import envs
 from sglang.srt.server_args import ServerArgs
+
+if TYPE_CHECKING:
+    from sglang.srt.managers.schedule_batch import Req
 
 
 @dataclass(slots=True, kw_only=True)
@@ -30,3 +36,16 @@ class NewTokenRatioTracker:
 
     def reset(self) -> None:
         self.current = self.init
+
+    @staticmethod
+    def estimate_new_token_ratio_after_retract(reqs: Sequence[Req]) -> float:
+        total_decoded_tokens = sum(len(r.output_ids) for r in reqs)
+        total_max_new_tokens = sum(r.sampling_params.max_new_tokens for r in reqs)
+
+        new_estimate_ratio = (
+            total_decoded_tokens + envs.SGLANG_RETRACT_DECODE_STEPS.get() * len(reqs)
+        ) / (
+            total_max_new_tokens + 1
+        )  # avoid zero division
+        new_estimate_ratio = min(1.0, new_estimate_ratio)
+        return new_estimate_ratio
