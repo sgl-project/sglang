@@ -339,117 +339,23 @@ class KVCacheConfigurator:
                 )
         else:
             if self.is_hybrid_swa:
-                kwargs = {}
-                if self.is_hybrid_swa_compress:
-                    kwargs = {
-                        "swa_head_num": max(
-                            1,
-                            self.model_config.hf_text_config.swa_num_key_value_heads
-                            // get_attention_tp_size(),
-                        ),
-                        "swa_head_dim": self.model_config.swa_head_dim,
-                        "swa_v_head_dim": self.model_config.swa_v_head_dim,
-                        "v_head_dim": self.model_config.v_head_dim,
-                    }
-                token_to_kv_pool = SWAKVPool(
-                    size=full_max_total_num_tokens,
-                    size_swa=swa_max_total_num_tokens,
-                    page_size=self.server_args.page_size,
-                    dtype=self.kv_cache_dtype,
-                    head_num=self.model_config.get_num_kv_heads(
-                        get_attention_tp_size()
-                    ),
-                    head_dim=self.model_config.head_dim,
-                    swa_attention_layer_ids=self.model_config.swa_attention_layer_ids,
-                    full_attention_layer_ids=self.model_config.full_attention_layer_ids,
-                    enable_kvcache_transpose=False,
-                    device=self.device,
-                    enable_kv_cache_copy=(
-                        self.server_args.speculative_algorithm is not None
-                    ),
-                    **kwargs,
+                token_to_kv_pool = self._hybrid_swa_kv_pool(
+                    full_max_total_num_tokens=full_max_total_num_tokens,
+                    swa_max_total_num_tokens=swa_max_total_num_tokens,
                 )
-            elif config := self.mambaish_config:
-                extra_args = {}
-                if self.use_mla_backend:
-                    extra_args = {
-                        "kv_lora_rank": self.model_config.kv_lora_rank,
-                        "qk_rope_head_dim": self.model_config.qk_rope_head_dim,
-                    }
-                token_to_kv_pool = HybridLinearKVPool(
-                    page_size=self.server_args.page_size,
-                    size=max_total_num_tokens,
-                    dtype=self.kv_cache_dtype,
-                    head_num=self.model_config.get_num_kv_heads(
-                        get_attention_tp_size()
-                    ),
-                    head_dim=self.model_config.head_dim,
-                    # if draft worker, we only need 1 attention layer's kv pool
-                    full_attention_layer_ids=(
-                        [0]
-                        if self.is_draft_worker
-                        else [
-                            i
-                            for i in config.full_attention_layer_ids
-                            if self.start_layer <= i < self.end_layer
-                        ]
-                    ),
-                    enable_kvcache_transpose=False,
-                    device=self.device,
-                    mamba_pool=req_to_token_pool.mamba_pool,
-                    enable_memory_saver=self.server_args.enable_memory_saver,
-                    enable_kv_cache_copy=(
-                        self.server_args.speculative_algorithm is not None
-                    ),
-                    use_mla=self.use_mla_backend,
-                    start_layer=self.start_layer,
-                    **extra_args,
+            elif self.mambaish_config:
+                token_to_kv_pool = self._hybrid_linear_kv_pool(
+                    max_total_num_tokens=max_total_num_tokens,
+                    req_to_token_pool=req_to_token_pool,
                 )
             else:
                 if is_float4_e2m1fn_x2(self.kv_cache_dtype):
-                    token_to_kv_pool = MHATokenToKVPoolFP4(
-                        max_total_num_tokens,
-                        page_size=self.server_args.page_size,
-                        dtype=self.kv_cache_dtype,
-                        head_num=self.model_config.get_num_kv_heads(
-                            get_attention_tp_size()
-                        ),
-                        head_dim=self.model_config.head_dim,
-                        v_head_dim=self.model_config.v_head_dim,
-                        layer_num=self.num_effective_layers,
-                        device=self.device,
-                        enable_memory_saver=self.server_args.enable_memory_saver,
-                        start_layer=self.start_layer,
-                        end_layer=self.end_layer,
-                        enable_alt_stream=not self.server_args.enable_pdmux,
-                        enable_kv_cache_copy=(
-                            self.server_args.speculative_algorithm is not None
-                        ),
+                    token_to_kv_pool = self._mha_fp4_kv_pool(
+                        max_total_num_tokens=max_total_num_tokens,
                     )
                 else:
-                    pool_cls = (
-                        NoOpMHATokenToKVPool
-                        if self.server_args.prefill_only_disable_kv_cache
-                        else MHATokenToKVPool
-                    )
-                    token_to_kv_pool = pool_cls(
-                        max_total_num_tokens,
-                        page_size=self.server_args.page_size,
-                        dtype=self.kv_cache_dtype,
-                        head_num=self.model_config.get_num_kv_heads(
-                            get_attention_tp_size()
-                        ),
-                        head_dim=self.model_config.head_dim,
-                        v_head_dim=self.model_config.v_head_dim,
-                        layer_num=self.num_effective_layers,
-                        device=self.device,
-                        enable_memory_saver=self.server_args.enable_memory_saver,
-                        start_layer=self.start_layer,
-                        end_layer=self.end_layer,
-                        enable_alt_stream=not self.server_args.enable_pdmux,
-                        enable_kv_cache_copy=(
-                            self.server_args.speculative_algorithm is not None
-                        ),
+                    token_to_kv_pool = self._mha_kv_pool(
+                        max_total_num_tokens=max_total_num_tokens,
                     )
 
         # Initialize token_to_kv_pool_allocator
@@ -1019,6 +925,113 @@ class KVCacheConfigurator:
             enable_memory_saver=self.server_args.enable_memory_saver,
             start_layer=self.start_layer,
             end_layer=self.end_layer,
+        )
+
+    def _hybrid_swa_kv_pool(
+        self,
+        *,
+        full_max_total_num_tokens: Optional[int],
+        swa_max_total_num_tokens: Optional[int],
+    ) -> KVCache:
+        kwargs = {}
+        if self.is_hybrid_swa_compress:
+            kwargs = {
+                "swa_head_num": max(
+                    1,
+                    self.model_config.hf_text_config.swa_num_key_value_heads
+                    // get_attention_tp_size(),
+                ),
+                "swa_head_dim": self.model_config.swa_head_dim,
+                "swa_v_head_dim": self.model_config.swa_v_head_dim,
+                "v_head_dim": self.model_config.v_head_dim,
+            }
+        return SWAKVPool(
+            size=full_max_total_num_tokens,
+            size_swa=swa_max_total_num_tokens,
+            page_size=self.server_args.page_size,
+            dtype=self.kv_cache_dtype,
+            head_num=self.model_config.get_num_kv_heads(get_attention_tp_size()),
+            head_dim=self.model_config.head_dim,
+            swa_attention_layer_ids=self.model_config.swa_attention_layer_ids,
+            full_attention_layer_ids=self.model_config.full_attention_layer_ids,
+            enable_kvcache_transpose=False,
+            device=self.device,
+            enable_kv_cache_copy=(self.server_args.speculative_algorithm is not None),
+            **kwargs,
+        )
+
+    def _hybrid_linear_kv_pool(
+        self, *, max_total_num_tokens: int, req_to_token_pool: ReqToTokenPool
+    ) -> KVCache:
+        extra_args = {}
+        if self.use_mla_backend:
+            extra_args = {
+                "kv_lora_rank": self.model_config.kv_lora_rank,
+                "qk_rope_head_dim": self.model_config.qk_rope_head_dim,
+            }
+        return HybridLinearKVPool(
+            page_size=self.server_args.page_size,
+            size=max_total_num_tokens,
+            dtype=self.kv_cache_dtype,
+            head_num=self.model_config.get_num_kv_heads(get_attention_tp_size()),
+            head_dim=self.model_config.head_dim,
+            # if draft worker, we only need 1 attention layer's kv pool
+            full_attention_layer_ids=(
+                [0]
+                if self.is_draft_worker
+                else [
+                    i
+                    for i in self.mambaish_config.full_attention_layer_ids
+                    if self.start_layer <= i < self.end_layer
+                ]
+            ),
+            enable_kvcache_transpose=False,
+            device=self.device,
+            mamba_pool=req_to_token_pool.mamba_pool,
+            enable_memory_saver=self.server_args.enable_memory_saver,
+            enable_kv_cache_copy=(self.server_args.speculative_algorithm is not None),
+            use_mla=self.use_mla_backend,
+            start_layer=self.start_layer,
+            **extra_args,
+        )
+
+    def _mha_fp4_kv_pool(self, *, max_total_num_tokens: int) -> KVCache:
+        return MHATokenToKVPoolFP4(
+            max_total_num_tokens,
+            page_size=self.server_args.page_size,
+            dtype=self.kv_cache_dtype,
+            head_num=self.model_config.get_num_kv_heads(get_attention_tp_size()),
+            head_dim=self.model_config.head_dim,
+            v_head_dim=self.model_config.v_head_dim,
+            layer_num=self.num_effective_layers,
+            device=self.device,
+            enable_memory_saver=self.server_args.enable_memory_saver,
+            start_layer=self.start_layer,
+            end_layer=self.end_layer,
+            enable_alt_stream=not self.server_args.enable_pdmux,
+            enable_kv_cache_copy=(self.server_args.speculative_algorithm is not None),
+        )
+
+    def _mha_kv_pool(self, *, max_total_num_tokens: int) -> KVCache:
+        pool_cls = (
+            NoOpMHATokenToKVPool
+            if self.server_args.prefill_only_disable_kv_cache
+            else MHATokenToKVPool
+        )
+        return pool_cls(
+            max_total_num_tokens,
+            page_size=self.server_args.page_size,
+            dtype=self.kv_cache_dtype,
+            head_num=self.model_config.get_num_kv_heads(get_attention_tp_size()),
+            head_dim=self.model_config.head_dim,
+            v_head_dim=self.model_config.v_head_dim,
+            layer_num=self.num_effective_layers,
+            device=self.device,
+            enable_memory_saver=self.server_args.enable_memory_saver,
+            start_layer=self.start_layer,
+            end_layer=self.end_layer,
+            enable_alt_stream=not self.server_args.enable_pdmux,
+            enable_kv_cache_copy=(self.server_args.speculative_algorithm is not None),
         )
 
     def _profile_available_bytes(self, pre_model_load_memory: int) -> int:
