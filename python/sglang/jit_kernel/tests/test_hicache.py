@@ -31,14 +31,7 @@ POOL_SIZE = PAGE_SIZE * 8
 MHA_ELEMENT_DIMS = [128, 256, 512, 1024]
 MLA_ELEMENT_DIMS = [576]
 LAYOUTS = ["layer_first", "page_first"]
-STAGED_WRITE_BACK_SINGLE_PAGE_COUNT = 1
-STAGED_WRITE_BACK_FULL_CHUNK_PAGE_COUNT = 64
-STAGED_WRITE_BACK_MULTI_CHUNK_PAGE_COUNT = 67
-STAGED_WRITE_BACK_PAGE_COUNTS = [
-    STAGED_WRITE_BACK_SINGLE_PAGE_COUNT,
-    STAGED_WRITE_BACK_FULL_CHUNK_PAGE_COUNT,
-    STAGED_WRITE_BACK_MULTI_CHUNK_PAGE_COUNT,
-]
+STAGED_WRITE_BACK_PAGE_COUNTS = [1, 63, 64, 65, 67, 128, 129]
 
 
 def _token_indices_for_pages(
@@ -269,7 +262,7 @@ def _run_page_first_staged_write_back_mha(
     )
     assert host_pool.can_use_jit
     assert host_pool.staging_page_capacity > 0
-    if page_count == STAGED_WRITE_BACK_MULTI_CHUNK_PAGE_COUNT:
+    if page_count > 64:
         assert host_pool.staging_page_capacity < page_count
 
     for layer_id in range(NUM_LAYERS):
@@ -293,7 +286,7 @@ def _run_page_first_staged_write_back_mha(
     )
     src_index_dtype = (
         torch.int32
-        if page_count == STAGED_WRITE_BACK_FULL_CHUNK_PAGE_COUNT
+        if page_count == 64
         else torch.int64
     )
     device_indices = _token_indices_for_pages(device_pages, dtype=src_index_dtype)
@@ -352,7 +345,7 @@ def _run_page_first_staged_write_back_mla(
     )
     assert host_pool.can_use_jit
     assert host_pool.staging_page_capacity > 0
-    if page_count == STAGED_WRITE_BACK_MULTI_CHUNK_PAGE_COUNT:
+    if page_count > 64:
         assert host_pool.staging_page_capacity < page_count
 
     for layer_id in range(NUM_LAYERS):
@@ -374,7 +367,7 @@ def _run_page_first_staged_write_back_mla(
     )
     src_index_dtype = (
         torch.int32
-        if page_count == STAGED_WRITE_BACK_FULL_CHUNK_PAGE_COUNT
+        if page_count == 64
         else torch.int64
     )
     device_indices = _token_indices_for_pages(device_pages, dtype=src_index_dtype)
