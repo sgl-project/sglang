@@ -45,7 +45,7 @@ def _reshape_kv_for_fia_nz(
 
 
 logger = logging.getLogger(__name__)
-
+SWA_INT_MAX = 2147483647
 
 @dataclass
 class ForwardMetadata:
@@ -1055,26 +1055,55 @@ class AscendAttnBackend(AttentionBackend):
             k_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
             v_cache = forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id)
 
-            if sinks is not None:
+            if sinks is not None or self.is_hybrid_swa:
                 # Use SWA block tables if hybrid SWA is enabled for this layer
                 if self.is_hybrid_swa and layer.sliding_window_size != -1:
                     block_tables = self.forward_metadata.block_tables_swa
                 else:
                     block_tables = self.forward_metadata.block_tables
-                attn_out = attention_sinks_prefill_triton(
-                    q,
-                    k_cache,
-                    v_cache,
-                    sinks,
-                    self.forward_metadata.extend_seq_lens,
-                    block_tables,
-                    self.forward_metadata.seq_lens,
-                    layer.scaling,
-                    layer.sliding_window_size,
-                    layer.tp_q_head_num,
-                    layer.tp_k_head_num,
-                )
-                return attn_out
+                if self.use_fia and sinks is None:
+                    q = q.reshape(-1, layer.tp_q_head_num, layer.qk_head_dim)
+                    block_size = 128
+                    attn_out, _ = torch_npu.npu_fused_infer_attention_score(
+                        query=q,
+                        key=k_cache.view(
+                            -1, self.page_size, layer.tp_k_head_num * layer.qk_head_dim
+                        ),
+                        value=v_cache.view(
+                            -1, self.page_size, layer.tp_v_head_num * layer.v_head_dim
+                        ),
+                        pre_tokens=layer.sliding_window_size if layer.sliding_window_size != -1 else SWA_INT_MAX,
+                        next_tokens=0 if layer.sliding_window_size != -1 else SWA_INT_MAX,
+                        atten_mask=self.fia_mask,
+                        block_table=block_tables,
+                        input_layout="TND",
+                        block_size=block_size,
+                        num_heads=layer.tp_q_head_num,
+                        num_key_value_heads=layer.tp_k_head_num,
+                        actual_seq_lengths=self.forward_metadata.seq_lens_list_cumsum,
+                        actual_seq_lengths_kv=self.forward_metadata.seq_lens_cpu_int,
+                        scale=layer.scaling,
+                        sparse_mode=4 if layer.sliding_window_size != -1 else 3,
+                    )
+                    attn_out = attn_out.view(
+                        -1, layer.tp_q_head_num * layer.v_head_dim
+                    )
+                    return attn_out
+                else:
+                    attn_out = attention_sinks_prefill_triton(
+                        q,
+                        k_cache,
+                        v_cache,
+                        sinks,
+                        self.forward_metadata.extend_seq_lens,
+                        block_tables,
+                        self.forward_metadata.seq_lens,
+                        layer.scaling,
+                        layer.sliding_window_size,
+                        layer.tp_q_head_num,
+                        layer.tp_k_head_num,
+                    )
+                    return attn_out
 
             if is_cp_mode:
                 if self.use_fia:
@@ -1967,25 +1996,59 @@ class AscendAttnBackend(AttentionBackend):
             k_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
             v_cache = forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id)
 
-            if sinks is not None:
+            if sinks is not None or self.is_hybrid_swa:
                 # Use SWA block tables if hybrid SWA is enabled for this layer
                 if self.is_hybrid_swa and layer.sliding_window_size != -1:
                     block_tables = self.forward_metadata.block_tables_swa
                 else:
                     block_tables = self.forward_metadata.block_tables
-                attn_out = attention_sinks_triton(
-                    q,
-                    k_cache,
-                    v_cache,
-                    sinks,
-                    block_tables,
-                    self.forward_metadata.seq_lens,
-                    layer.scaling,
-                    layer.sliding_window_size,
-                    layer.tp_q_head_num,
-                    layer.tp_k_head_num,
-                )
-                return attn_out
+                if self.use_fia and sinks is None and layer.sliding_window_size != -1:
+                    q = q.reshape(-1, layer.tp_q_head_num, layer.qk_head_dim)
+                    block_size = 128
+                    max_model_len = block_tables.shape[-1] * block_size
+                    swa_mask = self.ascend_attn_mask_builder.get_swa_mask(self.forward_metadata.seq_lens, max_model_len)
+                    attn_out, _ = torch_npu.npu_fused_infer_attention_score(
+                        q.view(
+                            forward_batch.batch_size,
+                            -1,
+                            layer.tp_q_head_num,
+                            layer.qk_head_dim,
+                        ),
+                        k_cache.view(
+                            -1, self.page_size, layer.tp_k_head_num * layer.qk_head_dim
+                        ),
+                        v_cache.view(
+                            -1, self.page_size, layer.tp_v_head_num * layer.qk_head_dim
+                        ),
+                        num_heads=layer.tp_q_head_num,
+                        num_key_value_heads=layer.tp_k_head_num,
+                        input_layout="BSND",
+                        block_size=128,
+                        atten_mask=swa_mask,
+                        sparse_mode=0,
+                        scale=layer.scaling,
+                        block_table=block_tables,
+                        actual_seq_lengths=[1] * len(self.forward_metadata.seq_lens),
+                        actual_seq_lengths_kv=self.forward_metadata.seq_lens,
+                    )
+                    attn_out = attn_out.view(
+                        -1, layer.tp_q_head_num * layer.v_head_dim
+                    )
+                    return attn_out
+                else:
+                    attn_out = attention_sinks_triton(
+                        q,
+                        k_cache,
+                        v_cache,
+                        sinks,
+                        block_tables,
+                        self.forward_metadata.seq_lens,
+                        layer.scaling,
+                        layer.sliding_window_size,
+                        layer.tp_q_head_num,
+                        layer.tp_k_head_num,
+                    )
+                    return attn_out
 
             if self.use_fia:
                 if self.forward_metadata.seq_lens_cpu_int is None:
