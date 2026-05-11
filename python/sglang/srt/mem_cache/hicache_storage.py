@@ -43,6 +43,7 @@ class PoolName(str, Enum):
     MAMBA = "mamba"
     SWA = "swa"
     INDEXER = "indexer"
+    DRAFT = "draft"
 
     def __str__(self) -> str:
         return self.value
