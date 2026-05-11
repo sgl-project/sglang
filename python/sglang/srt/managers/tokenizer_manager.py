@@ -2009,12 +2009,13 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 (logprob, token_id, None)
                 for logprob, token_id in zip(token_logprobs_val, token_logprobs_idx)
             ]
-        else:
-            assert self.tokenizer is not None
-            token_texts = self._batch_decode_token_ids(token_logprobs_idx)
-            return list(zip(token_logprobs_val, token_logprobs_idx, token_texts))
+
+        assert self.tokenizer is not None
+        token_texts = self._batch_decode_token_ids(token_logprobs_idx)
+        return list(zip(token_logprobs_val, token_logprobs_idx, token_texts))
 
     def _batch_decode_token_ids(self, token_ids: List[int]) -> List[str]:
+        assert self.tokenizer is not None
         # In transformers v5, batch_decode([1, 2, 3]) concatenates all tokens
         # into one string. Wrap each ID in its own list so they decode separately.
         token_id_seqs = [[idx] for idx in token_ids]
@@ -2027,8 +2028,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
     def detokenize_top_logprobs_tokens(
         self,
-        token_logprobs_val: List[float],
-        token_logprobs_idx: List[int],
+        token_logprobs_val: List[Optional[List[float]]],
+        token_logprobs_idx: List[Optional[List[int]]],
         decode_to_text: bool,
     ):
         ret: List[Optional[List]] = [None] * len(token_logprobs_val)
@@ -2036,9 +2037,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         if not decode_to_text:
             for i, vals in enumerate(token_logprobs_val):
                 if vals:
-                    ret[i] = self.detokenize_logprob_tokens(
-                        vals, token_logprobs_idx[i], decode_to_text
-                    )
+                    idxs = token_logprobs_idx[i]
+                    assert idxs is not None
+                    ret[i] = self.detokenize_logprob_tokens(vals, idxs, decode_to_text)
             return ret
 
         assert self.tokenizer is not None
@@ -2048,6 +2049,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         for i, vals in enumerate(token_logprobs_val):
             if vals:
                 idxs = token_logprobs_idx[i]
+                assert idxs is not None
                 flat_ids.extend(idxs)
                 lengths.append(len(idxs))
                 nonempty_positions.append(i)

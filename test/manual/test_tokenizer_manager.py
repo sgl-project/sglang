@@ -431,30 +431,29 @@ class TestDetokenizeTopLogprobsTokens(unittest.TestCase):
         self.stub.tokenizer.batch_decode = Mock(
             side_effect=lambda ids: [f"tok_{i[0]}" for i in ids]
         )
-        self.stub._batch_decode_token_ids = (
-            lambda token_ids: TokenizerManager._batch_decode_token_ids(
-                self.stub, token_ids
-            )
-        )
-        # Delegate to the real helper so we exercise the production path.
-        self.stub.detokenize_logprob_tokens = (
-            lambda vals, idxs, decode_to_text: TokenizerManager.detokenize_logprob_tokens(
+
+        def batch_decode_token_ids(token_ids):
+            return TokenizerManager._batch_decode_token_ids(self.stub, token_ids)
+
+        def detokenize_logprob_tokens(vals, idxs, decode_to_text):
+            return TokenizerManager.detokenize_logprob_tokens(
                 self.stub, vals, idxs, decode_to_text
             )
-        )
+
+        self.stub._batch_decode_token_ids = batch_decode_token_ids
+        # Delegate to the real helper so we exercise the production path.
+        self.stub.detokenize_logprob_tokens = detokenize_logprob_tokens
 
     def _call(self, vals, idxs, decode_to_text):
         return self.fn(self.stub, vals, idxs, decode_to_text)
 
     def _reference_impl(self, vals, idxs, decode_to_text):
-        """Per-position reference — what the old implementation produced."""
+        """Per-position reference for what the old implementation produced."""
         ret = []
         for i in range(len(vals)):
             if vals[i]:
                 if not decode_to_text:
-                    ret.append(
-                        [(lp, tid, None) for lp, tid in zip(vals[i], idxs[i])]
-                    )
+                    ret.append([(lp, tid, None) for lp, tid in zip(vals[i], idxs[i])])
                 else:
                     texts = [f"tok_{tid}" for tid in idxs[i]]
                     ret.append(list(zip(vals[i], idxs[i], texts)))
@@ -467,9 +466,7 @@ class TestDetokenizeTopLogprobsTokens(unittest.TestCase):
         vals = [[-0.1, -0.2], [-0.3]]
         idxs = [[10, 20], [30]]
 
-        result = self._call(
-            vals, idxs, decode_to_text=False
-        )
+        result = self._call(vals, idxs, decode_to_text=False)
 
         self.stub.tokenizer.batch_decode.assert_not_called()
         self.assertEqual(
@@ -482,18 +479,14 @@ class TestDetokenizeTopLogprobsTokens(unittest.TestCase):
         vals = [[], [], None]
         idxs = [[], [], None]
 
-        result = self._call(
-            vals, idxs, decode_to_text=True
-        )
+        result = self._call(vals, idxs, decode_to_text=True)
 
         self.assertEqual(result, [None, None, None])
         self.stub.tokenizer.batch_decode.assert_not_called()
 
     def test_empty_input_list(self):
         """Zero-length input returns an empty list."""
-        result = self._call(
-            [], [], decode_to_text=True
-        )
+        result = self._call([], [], decode_to_text=True)
         self.assertEqual(result, [])
         self.stub.tokenizer.batch_decode.assert_not_called()
 
@@ -502,9 +495,7 @@ class TestDetokenizeTopLogprobsTokens(unittest.TestCase):
         vals = [[-0.1, -0.2], [], [-0.5, -0.6, -0.7], None, [-0.9]]
         idxs = [[10, 20], [], [30, 40, 50], None, [60]]
 
-        result = self._call(
-            vals, idxs, decode_to_text=True
-        )
+        result = self._call(vals, idxs, decode_to_text=True)
 
         expected = [
             [(-0.1, 10, "tok_10"), (-0.2, 20, "tok_20")],
@@ -520,13 +511,9 @@ class TestDetokenizeTopLogprobsTokens(unittest.TestCase):
         vals = [[-0.1, -0.2], [], [-0.5, -0.6, -0.7], [-0.9]]
         idxs = [[10, 20], [], [30, 40, 50], [60]]
 
-        self._call(
-            vals, idxs, decode_to_text=True
-        )
+        self._call(vals, idxs, decode_to_text=True)
 
-        self.assertEqual(
-            self.stub.tokenizer.batch_decode.call_count, 1
-        )
+        self.assertEqual(self.stub.tokenizer.batch_decode.call_count, 1)
         (called_ids,), _ = self.stub.tokenizer.batch_decode.call_args
         self.assertEqual(list(called_ids), [[10], [20], [30], [40], [50], [60]])
 
@@ -558,9 +545,7 @@ class TestDetokenizeTopLogprobsTokens(unittest.TestCase):
 
         for decode_to_text in (True, False):
             self.stub.tokenizer.batch_decode.reset_mock()
-            batched = self._call(
-                vals, idxs, decode_to_text=decode_to_text
-            )
+            batched = self._call(vals, idxs, decode_to_text=decode_to_text)
             expected = self._reference_impl(vals, idxs, decode_to_text)
             self.assertEqual(batched, expected)
 
