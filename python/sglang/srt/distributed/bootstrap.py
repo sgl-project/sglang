@@ -83,20 +83,9 @@ def init_torch_distributed(
     if not server_args.enable_p2p_check:
         monkey_patch_p2p_access_check()
 
-    # Allow external orchestrators (e.g. trainpi) to override the distributed
-    # init method.  When set to "env://", torch uses MASTER_ADDR/MASTER_PORT
-    # env-vars and an externally-created TCPStore, completely avoiding port
-    # conflicts with intra-host collocation.
-    dist_init_method_override = envs.SGLANG_DISTRIBUTED_INIT_METHOD_OVERRIDE.get()
-    if dist_init_method_override:
-        dist_init_method = dist_init_method_override
-    elif server_args.dist_init_addr:
-        na = NetworkAddress.parse(server_args.dist_init_addr)
-        dist_init_method = na.to_tcp()
-    else:
-        dist_init_method = NetworkAddress(
-            server_args.host or "127.0.0.1", dist_port
-        ).to_tcp()
+    dist_init_method = _resolve_dist_init_method(
+        server_args=server_args, dist_port=dist_port
+    )
     set_custom_all_reduce(not server_args.disable_custom_all_reduce)
     set_mscclpp_all_reduce(server_args.enable_mscclpp)
     set_torch_symm_mem_all_reduce(server_args.enable_torch_symm_mem)
@@ -220,3 +209,21 @@ def _resolve_backend(*, device: str, server_args: ServerArgs, gpu_id: int) -> st
             except:
                 pass  # A warning will be raised in `init_distributed_environment`
     return backend
+
+
+def _resolve_dist_init_method(*, server_args: ServerArgs, dist_port: int) -> str:
+    # Allow external orchestrators (e.g. trainpi) to override the distributed
+    # init method.  When set to "env://", torch uses MASTER_ADDR/MASTER_PORT
+    # env-vars and an externally-created TCPStore, completely avoiding port
+    # conflicts with intra-host collocation.
+    dist_init_method_override = envs.SGLANG_DISTRIBUTED_INIT_METHOD_OVERRIDE.get()
+    if dist_init_method_override:
+        dist_init_method = dist_init_method_override
+    elif server_args.dist_init_addr:
+        na = NetworkAddress.parse(server_args.dist_init_addr)
+        dist_init_method = na.to_tcp()
+    else:
+        dist_init_method = NetworkAddress(
+            server_args.host or "127.0.0.1", dist_port
+        ).to_tcp()
+    return dist_init_method
