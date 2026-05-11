@@ -572,6 +572,8 @@ def setup_state_kv_args(
     if hasattr(token_to_kv_pool, "get_state_buf_infos"):
         data_ptrs, data_lens, item_lens = token_to_kv_pool.get_state_buf_infos()
 
+        # DeepSeekV4TokenToKVPool inherits BaseSWAKVPool; its heterogeneous
+        # state list is described per-entry via get_state_buf_infos.
         if isinstance(token_to_kv_pool, BaseSWAKVPool):
             append_state_component(
                 kv_args, StateType.SWA, data_ptrs, data_lens, item_lens
@@ -604,13 +606,13 @@ def setup_state_kv_args(
     if (
         StateType.MAMBA not in kv_args.state_types
         and req_to_token_pool is not None
-        and hasattr(req_to_token_pool, "get_mamba_state_buf_infos")
+        and hasattr(req_to_token_pool, "get_state_buf_infos")
     ):
-        data_ptrs, data_lens, item_lens = req_to_token_pool.get_mamba_state_buf_infos()
+        data_ptrs, data_lens, item_lens = req_to_token_pool.get_state_buf_infos()
         if data_ptrs:
             dim = (
-                req_to_token_pool.get_mamba_state_dim_per_tensor()
-                if hasattr(req_to_token_pool, "get_mamba_state_dim_per_tensor")
+                req_to_token_pool.get_state_dim_per_tensor()
+                if hasattr(req_to_token_pool, "get_state_dim_per_tensor")
                 else None
             )
             append_state_component(

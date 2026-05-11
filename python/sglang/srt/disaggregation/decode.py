@@ -850,7 +850,7 @@ class DecodePreallocQueue:
                 )
 
             state_types = self.kv_manager.kv_args.state_types
-            state_indices: Optional[list] = []
+            state_indices: Optional[List] = []
             for st in state_types:
                 if st == StateType.MAMBA:
                     state_indices.append(_mamba_payload())

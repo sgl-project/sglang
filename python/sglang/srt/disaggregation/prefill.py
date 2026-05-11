@@ -776,7 +776,7 @@ class SchedulerDisaggregationPrefillMixin:
             .cpu()
             .numpy()
         )
-        state_indices: Optional[list] = None
+        state_indices: Optional[List] = None
         if last_chunk:
             self.disagg_metadata_buffers.set_buf(req)
 

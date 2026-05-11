@@ -624,10 +624,10 @@ class HybridReqToTokenPool(ReqToTokenPool):
     def get_speculative_mamba2_params_all_layers(self) -> MambaPool.SpeculativeState:
         return self.mamba_pool.get_speculative_mamba2_params_all_layers()
 
-    def get_mamba_state_buf_infos(self):
+    def get_state_buf_infos(self):
         return self.mamba_pool.get_contiguous_buf_infos()
 
-    def get_mamba_state_dim_per_tensor(self):
+    def get_state_dim_per_tensor(self):
         return self.mamba_pool.get_state_dim_per_tensor()
 
     def get_mamba_ping_pong_other_idx(self, mamba_next_track_idx: int) -> int:
