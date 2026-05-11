@@ -154,7 +154,7 @@ class DeepEPMode(Enum):
         return self == DeepEPMode.AUTO
 
 
-class DeepOutputDtype(Enum):
+class DeepEPOutputDtype(Enum):
     """
     Describes the dispatch output data type for DeepEP.
 
