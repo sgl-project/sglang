@@ -386,22 +386,14 @@ class MambaPool:
             1, self.size + 1, dtype=torch.int64, device=self.device
         )
 
-    def copy_from(self, src_index: torch.Tensor, dst_index: torch.Tensor):
+    def copy_from(self, src_indices: torch.Tensor, dst_indices: torch.Tensor):
         for i in range(len(self.mamba_cache.conv)):
-            self.mamba_cache.conv[i][:, dst_index] = self.mamba_cache.conv[i][
-                :, src_index
+            self.mamba_cache.conv[i][:, dst_indices] = self.mamba_cache.conv[i][
+                :, src_indices
             ]
-        self.mamba_cache.temporal[:, dst_index] = self.mamba_cache.temporal[
-            :, src_index
+        self.mamba_cache.temporal[:, dst_indices] = self.mamba_cache.temporal[
+            :, src_indices
         ]
-        return
-
-    def fork_from(self, src_index: torch.Tensor) -> Optional[torch.Tensor]:
-        dst_index = self.alloc(1)
-        if dst_index is None:
-            return None
-        self.copy_from(src_index, dst_index)
-        return dst_index
 
     def get_cpu_copy(self, indices):
         torch.cuda.synchronize()
