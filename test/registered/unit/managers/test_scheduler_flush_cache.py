@@ -16,7 +16,7 @@ class TestSchedulerFlushCache(unittest.TestCase):
     def _new_scheduler(self) -> Scheduler:
         scheduler = Scheduler.__new__(Scheduler)
         scheduler._pending_flush = None
-        scheduler.send_to_tokenizer = MagicMock()
+        scheduler.ipc_channels = MagicMock()
         scheduler.flush_cache = MagicMock(return_value=True)
         scheduler.is_fully_idle = MagicMock(return_value=False)
         return scheduler
@@ -82,7 +82,7 @@ class TestSchedulerFlushCache(unittest.TestCase):
 
         self.assertIsNone(scheduler._pending_flush)
         scheduler.flush_cache.assert_called_once()
-        out = scheduler.send_to_tokenizer.send_output.call_args.args[0]
+        out = scheduler.ipc_channels.send_to_tokenizer.send_output.call_args.args[0]
         self.assertTrue(out.success)
 
     def test_pending_flush_expires_on_timeout(self):
@@ -95,7 +95,7 @@ class TestSchedulerFlushCache(unittest.TestCase):
 
         self.assertIsNone(scheduler._pending_flush)
         scheduler.flush_cache.assert_not_called()
-        out = scheduler.send_to_tokenizer.send_output.call_args.args[0]
+        out = scheduler.ipc_channels.send_to_tokenizer.send_output.call_args.args[0]
         self.assertFalse(out.success)
 
     def test_pending_flush_survives_before_deadline(self):
@@ -107,7 +107,7 @@ class TestSchedulerFlushCache(unittest.TestCase):
             Scheduler._check_pending_flush(scheduler)
 
         self.assertIsNotNone(scheduler._pending_flush)
-        scheduler.send_to_tokenizer.send_output.assert_not_called()
+        scheduler.ipc_channels.send_to_tokenizer.send_output.assert_not_called()
 
 
 if __name__ == "__main__":
