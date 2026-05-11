@@ -11,10 +11,10 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
-from sglang.omni import OmniContextBundle
 from sglang.omni.protocol import (
     ARBackend,
     MultimodalGenerationBackend,
+    OmniContextBundle,
     OmniOutputSegment,
     OmniRequest,
     OmniResponse,

@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """Middle bridge between generic omni orchestration and SRT session execution."""
 
-from abc import ABC, abstractmethod
 from typing import Any
 
 from sglang.srt.omni_session.runtime import (
@@ -19,61 +18,17 @@ from sglang.srt.omni_session.runtime_protocol import (
 DEFAULT_OMNI_TEXT_MAX_NEW_TOKENS = 128
 
 
-class OmniSessionBridge(ABC):
-    """bridge surface between generic omni orchestrator and SRT session runtime, translating ARBackend semantics into srt-session semantics
+class SRTBackedOmniSessionBridge:
+    """Concrete bridge from generic omni AR semantics to SRT session operations.
 
-    e.g., U1SRTBackedOmniSessionBridge breaks down the generation process into:
-     1. prefill
-     2. decode until an image marker is met
-     3. commit generated image into session
-
+    It keeps SRT as the session/KV owner and asks the runtime to
+    prefill/decode/commit AR-side chunks. For interleaved generation this path is:
+    prefill, decode until an image marker is met, then commit generated image
+    into the session. Generation-side context access is exposed by
+    `sglang.omni.backends.ar.srt`.
     """
 
     generation_kind: str = "generic"
-
-    @abstractmethod
-    def prefill_and_decode_to_image_boundary(
-        self,
-        *,
-        messages: list[OmniInterleavedMessage | dict[str, Any]],
-        think: bool = False,
-        think_max_new_tokens: int | None = None,
-        sampling_params: Any | None = None,
-        session_id: str | None = None,
-    ) -> OmniContextBundle:
-        """prefill and decode for a request, until the first image segment is reached"""
-        ...
-
-    @abstractmethod
-    def commit_generated_segment(
-        self, *, contexts: OmniContextBundle, segment: Any
-    ) -> None: ...
-
-    @abstractmethod
-    def release(self, contexts: OmniContextBundle) -> None: ...
-
-    @abstractmethod
-    def continue_ar_decode(
-        self, *, contexts: OmniContextBundle
-    ) -> OmniDecodeResult: ...
-
-    @abstractmethod
-    def generate_vlm_answer(
-        self,
-        *,
-        messages: list[OmniInterleavedMessage | dict[str, Any]],
-        max_new_tokens: int,
-    ) -> OmniVLMTextGenerationResult:
-        """prefill image/text inputs and return a plain VLM text answer"""
-        ...
-
-
-class SRTBackedOmniSessionBridge(OmniSessionBridge):
-    """omni middle bridge that keeps SRT as the session/KV owner.
-
-    It asks the runtime to prefill/decode/commit AR-side chunks. Generation-side
-    context access is exposed by `sglang.omni.backends.ar.srt`.
-    """
 
     def __init__(
         self,
@@ -123,7 +78,7 @@ class SRTBackedOmniSessionBridge(OmniSessionBridge):
                         }
                     )
 
-            # decode for the first segment
+            # decode until first segment
             for _ in range(self.max_pre_image_decode_steps):
                 segment = self.runtime.decode_next_segment(session)
                 if segment.type == "image_marker":

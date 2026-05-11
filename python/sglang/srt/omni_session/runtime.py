@@ -7,10 +7,9 @@ KV bindings, and owns the scheduler executor used by runtime-aware policy hooks.
 """
 
 import uuid
-from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 import torch
 
@@ -22,8 +21,15 @@ from sglang.srt.managers.schedule_batch import FINISH_LENGTH, MultimodalInputs, 
 from sglang.srt.omni_session.runtime_protocol import (
     OmniSessionHandle,
 )
+from sglang.srt.omni_session.srt_executor import OmniSRTSchedulerExecutor
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.session.session_controller import SessionController
+
+if TYPE_CHECKING:
+    from sglang.srt.omni_session.model_policy import (
+        OmniModelPolicy,
+        OmniModelSessionView,
+    )
 
 
 class OmniSegmentState(str, Enum):
@@ -141,72 +147,6 @@ class OmniSessionRecord:
         )
 
 
-class OmniModelPolicy(ABC):
-    """Model-facing execution hooks used by the SRT-owned omni runtime.
-
-    The runtime owns session state and SRT request materialization. Concrete
-    model policies own model-specific token/image formatting and generation
-    decisions. Optional hooks have no-op defaults so the runtime can call a
-    typed surface instead of probing for methods dynamically.
-    """
-
-    def prepare_srt_ar_message_inputs(
-        self,
-        *,
-        record: OmniSessionRecord,
-        message: OmniInterleavedMessage,
-        state: OmniSegmentState,
-    ) -> list[OmniSRTPreparedInput] | None:
-        return None
-
-    def prepare_srt_ar_interleaved_inputs(
-        self,
-        *,
-        record: OmniSessionRecord,
-        messages: list[OmniInterleavedMessage],
-        state: OmniSegmentState,
-    ) -> list[OmniSRTPreparedInput] | None:
-        return None
-
-    @abstractmethod
-    def on_prefill_finished(
-        self, *, record: OmniSessionRecord, messages: list[OmniInterleavedMessage]
-    ) -> int: ...
-
-    @abstractmethod
-    def decode_next_segment(self, *, record: OmniSessionRecord) -> OmniDecodeResult:
-        """decode exactly one interleaved segment boundary"""
-        ...
-
-    def decode_next_segment_with_runtime(
-        self, *, runtime: "OmniSessionRuntime", record: OmniSessionRecord
-    ) -> OmniDecodeResult:
-        """decode the next interleaved boundary after optional SRT AR decode"""
-        if runtime.srt_ar_decode_max_new_tokens > 0:
-            runtime._execute_srt_ar_decode_request(record, greedy=True)
-        return self.decode_next_segment(record=record)
-
-    def decode_vlm_text(
-        self,
-        *,
-        runtime: "OmniSessionRuntime",
-        session: OmniSessionHandle,
-        max_new_tokens: int,
-    ) -> OmniVLMTextGenerationResult:
-        """decode a plain VLM text answer from an already-prefilled SRT session"""
-        raise NotImplementedError(
-            f"{self.__class__.__name__} does not support VLM text decode"
-        )
-
-    @abstractmethod
-    def append_generated_image(
-        self, *, record: OmniSessionRecord, image: Any | None
-    ) -> int: ...
-
-    def close_session(self, *, session_id: str) -> None:
-        return None
-
-
 class OmniSessionRuntime:
     """Lightweight omni state machine layered on top of SRT sessions.
 
@@ -219,15 +159,15 @@ class OmniSessionRuntime:
     def __init__(
         self,
         *,
-        model_policy: OmniModelPolicy,
-        session_controller: Any | None = None,
-        srt_request_executor: Any | None = None,
+        model_policy: "OmniModelPolicy",
+        session_controller: SessionController | None = None,
+        srt_request_executor: OmniSRTSchedulerExecutor | None = None,
         capacity_of_str_len: int = 4096,
         tokenizer: Any | None = None,
         vocab_size: int = 32000,
         srt_ar_decode_max_new_tokens: int = 0,
     ) -> None:
-        self.model_policy: OmniModelPolicy = model_policy
+        self.model_policy: "OmniModelPolicy" = model_policy
         self.session_controller = session_controller
         self.srt_request_executor = srt_request_executor
         self.capacity_of_str_len = capacity_of_str_len
@@ -247,6 +187,34 @@ class OmniSessionRuntime:
             prompt_text = " ".join(prompt) if isinstance(prompt, list) else prompt
             messages.append(OmniInterleavedMessage(type="text", content=prompt_text))
         return messages
+
+    def _model_session_view(self, record: OmniSessionRecord) -> "OmniModelSessionView":
+        from sglang.srt.omni_session.model_policy import OmniModelSessionView
+
+        return OmniModelSessionView(
+            handle=record.handle(),
+            state=record.state,
+            srt_request_count=record.srt_request_count,
+            srt_last_request_id=record.srt_last_request_id,
+            srt_last_origin_input_len=record.srt_last_origin_input_len,
+            srt_mm_offsets=tuple(record.srt_mm_offsets),
+            metadata={
+                "srt_ar_decode_request_count": record.srt_ar_decode_request_count,
+                "srt_last_ar_decode_request_id": (
+                    record.srt_last_ar_decode_request_id
+                ),
+                "srt_last_ar_decode_origin_input_len": (
+                    record.srt_last_ar_decode_origin_input_len
+                ),
+                "srt_last_ar_decode_output_ids": tuple(
+                    record.srt_last_ar_decode_output_ids
+                ),
+                "srt_last_ar_decode_text": record.srt_last_ar_decode_text,
+                "omni_model_state": self._copy_omni_model_state(
+                    record.omni_model_state
+                ),
+            },
+        )
 
     def prefill_interleaved(
         self,
@@ -283,16 +251,17 @@ class OmniSessionRuntime:
             messages,
             request_id=next_anchor_request_id,
         )
-        added_tokens = self.model_policy.on_prefill_finished(
-            record=record, messages=messages
+        prefill_result = self.model_policy.on_prefill_finished(
+            session=self._model_session_view(record), messages=messages
         )
-        record.context_length += added_tokens
+        record.context_length += prefill_result.added_tokens
         record.context_version = next_context_version
         record.prefill_count += 1
         record.state = OmniSegmentState.AR_DECODE
         return record.handle()
 
     def decode_next_segment(self, handle: OmniSessionHandle) -> OmniDecodeResult:
+        """decode until next segment with model_policy"""
         record = self._record_for(handle)
         if record.state != OmniSegmentState.AR_DECODE:
             raise ValueError(
@@ -300,8 +269,15 @@ class OmniSessionRuntime:
                 f"for omni session {handle.session_id}"
             )
         result = self.model_policy.decode_next_segment_with_runtime(
-            runtime=self, record=record
+            runtime=self,
+            session=self._model_session_view(record),
         )
+        if result is None:
+            if self.srt_ar_decode_max_new_tokens > 0:
+                self._execute_srt_ar_decode_request(record, greedy=True)
+            result = self.model_policy.decode_next_segment(
+                session=self._model_session_view(record)
+            )
         record.decode_count += 1
         if result.type == "image_marker":
             record.state = OmniSegmentState.GENERATE
@@ -311,7 +287,7 @@ class OmniSessionRuntime:
             record.state = OmniSegmentState.AR_DECODE
         return result
 
-    def decode_text(
+    def decode_one_step(
         self,
         handle: OmniSessionHandle,
         *,
@@ -423,10 +399,10 @@ class OmniSessionRuntime:
             [OmniInterleavedMessage(type="image", content=image)],
             request_id=next_anchor_request_id,
         )
-        added_tokens = self.model_policy.append_generated_image(
-            record=record, image=image
+        append_result = self.model_policy.append_generated_image(
+            session=self._model_session_view(record), image=image
         )
-        record.context_length += added_tokens
+        record.context_length += append_result.added_tokens
         record.context_version = next_context_version
         record.append_image_count += 1
         record.state = OmniSegmentState.AR_DECODE
@@ -724,8 +700,9 @@ class OmniSessionRuntime:
         *,
         state: OmniSegmentState,
     ) -> list[OmniSRTPreparedInput]:
+        session_view = self._model_session_view(record)
         custom_inputs = self.model_policy.prepare_srt_ar_interleaved_inputs(
-            record=record, messages=messages, state=state
+            session=session_view, messages=messages, state=state
         )
         if custom_inputs is not None:
             return custom_inputs
@@ -733,7 +710,7 @@ class OmniSessionRuntime:
         prepared_inputs: list[OmniSRTPreparedInput] = []
         for message in messages:
             custom = self.model_policy.prepare_srt_ar_message_inputs(
-                record=record, message=message, state=state
+                session=session_view, message=message, state=state
             )
             if custom is None:
                 raise RuntimeError(

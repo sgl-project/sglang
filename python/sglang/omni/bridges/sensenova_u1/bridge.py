@@ -35,10 +35,9 @@ from sglang.omni.bridges.sensenova_u1.context import (
 from sglang.srt.omni_session.bridge import SRTBackedOmniSessionBridge
 from sglang.srt.omni_session.model_policy import (
     OmniModelAppendImageResult,
-    OmniModelPolicyRunner,
     OmniModelPrefillResult,
+    OmniModelPolicy,
     OmniModelSessionView,
-    OmniSessionModelPolicy,
 )
 from sglang.srt.omni_session.runtime import (
     OmniDecodeResult,
@@ -87,10 +86,8 @@ def build_sensenova_u1_srt_bridge(
     session_controller = srt_request_executor.session_controller
     model_config = getattr(scheduler, "model_config", None)
     runtime = OmniSessionRuntime(
-        model_policy=OmniModelPolicyRunner(
-            U1OmniSessionModelPolicy(
-                native_tokenizer=getattr(scheduler, "tokenizer", None)
-            )
+        model_policy=U1OmniSessionModelPolicy(
+            native_tokenizer=getattr(scheduler, "tokenizer", None)
         ),
         session_controller=session_controller,
         srt_request_executor=srt_request_executor,
@@ -101,7 +98,7 @@ def build_sensenova_u1_srt_bridge(
     return U1SRTBackedOmniSessionBridge(runtime)
 
 
-class U1OmniSessionModelPolicy(OmniSessionModelPolicy):
+class U1OmniSessionModelPolicy(OmniModelPolicy):
     """SenseNova U1 omni policy shell for the omni middle protocol.
 
     U1 uses pixel-flow generation mechanics; image-generation math stays in this backend
@@ -267,7 +264,7 @@ class U1OmniSessionModelPolicy(OmniSessionModelPolicy):
             1,
             int(runtime.srt_ar_decode_max_new_tokens or 0),
         )
-        decoded = runtime.decode_text(
+        decoded = runtime.decode_one_step(
             session.handle,
             max_new_tokens=max_new_tokens,
             greedy=True,
@@ -318,7 +315,7 @@ class U1OmniSessionModelPolicy(OmniSessionModelPolicy):
 
         # iteratively decode
         for _ in range(max_new_tokens):
-            decoded = runtime.decode_text(
+            decoded = runtime.decode_one_step(
                 session,
                 max_new_tokens=1,
                 decode_position_id=current_position,
@@ -466,7 +463,7 @@ class U1OmniSessionModelPolicy(OmniSessionModelPolicy):
         """use SRT text decode for U1 image-understanding answers"""
         if runtime is None:
             raise RuntimeError("SenseNova U1 VLM text generation requires SRT runtime")
-        decoded = runtime.decode_text(
+        decoded = runtime.decode_one_step(
             session,
             max_new_tokens=max_new_tokens,
             greedy=True,
@@ -535,11 +532,9 @@ class U1SRTBackedOmniSessionBridge(SRTBackedOmniSessionBridge):
         )
 
     def _u1_policy(self) -> U1OmniSessionModelPolicy | None:
-        policy_runner = self.runtime.model_policy
-        if isinstance(policy_runner, OmniModelPolicyRunner) and isinstance(
-            policy_runner.policy, U1OmniSessionModelPolicy
-        ):
-            return policy_runner.policy
+        policy = self.runtime.model_policy
+        if isinstance(policy, U1OmniSessionModelPolicy):
+            return policy
         return None
 
     def prefill_and_decode_to_image_boundary(
