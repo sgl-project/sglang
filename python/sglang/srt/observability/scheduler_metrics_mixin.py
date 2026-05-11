@@ -445,9 +445,9 @@ class SchedulerMetricsMixin:
                 )
 
             # Utilization / LoRA / HiCache
-            self.calculate_utilization()
+            self._calculate_utilization()
             self.stats.fwd_occupancy = self.fwd_occupancy
-            self.update_lora_metrics()
+            self._update_lora_metrics()
             self._log_hicache_stats()
             self.metrics_collector.log_stats(self.stats)
             self.kv_events_publisher.emit_kv_metrics()
@@ -647,9 +647,9 @@ class SchedulerMetricsMixin:
                 )
 
             # Utilization / LoRA / HiCache
-            self.calculate_utilization()
+            self._calculate_utilization()
             self.stats.fwd_occupancy = self.fwd_occupancy
-            self.update_lora_metrics()
+            self._update_lora_metrics()
             self._log_hicache_stats()
             self.metrics_collector.log_stats(self.stats)
             self.kv_events_publisher.emit_kv_metrics()
@@ -688,7 +688,7 @@ class SchedulerMetricsMixin:
         )
         self.stats.hicache_host_total_tokens = host_pool.size
 
-    def update_lora_metrics(self: Scheduler):
+    def _update_lora_metrics(self: Scheduler):
         """Update LoRA pool metrics for monitoring and autoscaling."""
         if not self.enable_lora:
             return
@@ -732,7 +732,7 @@ class SchedulerMetricsMixin:
         except Exception as e:
             logger.warning(f"Failed to update LoRA metrics: {e}")
 
-    def calculate_utilization(self: Scheduler):
+    def _calculate_utilization(self: Scheduler):
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             self.stats.utilization = -1
         else:
