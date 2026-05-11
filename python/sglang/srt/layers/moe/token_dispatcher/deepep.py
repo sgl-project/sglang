@@ -343,18 +343,18 @@ class _DeepEPDispatcherImplBase:
         self.meta_overlap_args: Optional[dict] = None
 
         self.deepep_output_dtype = get_deepep_output_dtype(self)
-        if self.deepep_output_dtype == DeepOutputDtype.BF16:
+        if self.deepep_output_dtype == DeepEPOutputDtype.BF16:
             self.params_bytes = 2
             self.use_nvfp4 = self.use_fp8 = False
             if _is_npu:
                 os.environ["DEEP_NORMAL_MODE_USE_INT8_QUANT"] = "0"
-        elif self.deepep_output_dtype == DeepOutputDtype.FP8:
+        elif self.deepep_output_dtype == DeepEPOutputDtype.FP8:
             self.params_bytes = 1
             self.use_nvfp4 = False
             self.use_fp8 = True
             if _is_npu:
                 os.environ["DEEP_NORMAL_MODE_USE_INT8_QUANT"] = "1"
-        elif self.deepep_output_dtype == DeepOutputDtype.NVFP4:
+        elif self.deepep_output_dtype == DeepEPOutputDtype.NVFP4:
             self.params_bytes = 1
             self.use_nvfp4 = True
             self.use_fp8 = False
@@ -389,16 +389,16 @@ class _DeepEPDispatcherImplBase:
         self.quant_config = quant_config
 
         self.deepep_output_dtype = get_deepep_output_dtype(self)
-        if self.deepep_output_dtype == DeepOutputDtype.BF16:
+        if self.deepep_output_dtype == DeepEPOutputDtype.BF16:
             self.params_bytes = 2
             self.use_nvfp4 = self.use_fp8 = False
-        elif self.deepep_output_dtype == DeepOutputDtype.FP8:
+        elif self.deepep_output_dtype == DeepEPOutputDtype.FP8:
             self.params_bytes = 1
             self.use_nvfp4 = False
             self.use_fp8 = True
             if _is_npu:
                 os.environ["DEEP_NORMAL_MODE_USE_INT8_QUANT"] = "1"
-        elif self.deepep_output_dtype == DeepOutputDtype.NVFP4:
+        elif self.deepep_output_dtype == DeepEPOutputDtype.NVFP4:
             self.params_bytes = 1
             self.use_nvfp4 = True
             self.use_fp8 = False
@@ -432,7 +432,7 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
         if (
             deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
             and not get_moe_runner_backend().is_cutlass()
-            and self.deepep_output_dtype != DeepOutputDtype.BF16
+            and self.deepep_output_dtype != DeepEPOutputDtype.BF16
         ):
             # TODO hard code 128 block quant,use fp8 communication
             hidden_states = sglang_per_token_group_quant_fp8(
