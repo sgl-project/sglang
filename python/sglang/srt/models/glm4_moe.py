@@ -314,6 +314,18 @@ class Glm4MoeAttention(nn.Module):
         else:
             if self.attn.layer_id == forward_batch.token_to_kv_pool.start_layer:
                 self.rotary_emb.get_cos_sin_with_position(positions)
+            if self.use_qk_norm:
+                eps = self.q_norm.variance_epsilon
+                q_weight = self.q_norm.weight
+                k_weight = self.k_norm.weight
+                q_bias = getattr(self.q_norm, "bias", None)
+                k_bias = getattr(self.k_norm, "bias", None)
+            else:
+                eps = None
+                q_weight = None
+                k_weight = None
+                q_bias = None
+                k_bias = None
             q, k, v = split_qkv_rmsnorm_rope(
                 qkv,
                 self.rotary_emb.position_sin,
@@ -321,11 +333,11 @@ class Glm4MoeAttention(nn.Module):
                 self.q_size,
                 self.kv_size,
                 self.head_dim,
-                eps=self.q_norm.variance_epsilon,
-                q_weight=self.q_norm.weight,
-                k_weight=self.k_norm.weight,
-                q_bias=getattr(self.q_norm, "bias", None),
-                k_bias=getattr(self.k_norm, "bias", None),
+                eps=eps,
+                q_weight=q_weight,
+                k_weight=k_weight,
+                q_bias=q_bias,
+                k_bias=k_bias,
             )
 
         inner_state = q, k, v, forward_batch
