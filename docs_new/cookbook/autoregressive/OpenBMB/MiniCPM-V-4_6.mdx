@@ -13,6 +13,11 @@ The public MiniCPM-V 4.6 release weights are not yet on HuggingFace; benchmark n
 
 MiniCPM-V 4.6 is the next-generation multimodal model from [OpenBMB](https://huggingface.co/openbmb), the team behind the MiniCPM-V series. The model combines a **Qwen3.5-style hybrid LLM backbone** (Gated Delta Net + full attention) with a **NaViT-packed vision encoder** that handles arbitrary aspect ratios and high-resolution slicing natively, plus end-to-end video support.
 
+OpenBMB ships two variants on HuggingFace:
+
+- [`openbmb/MiniCPM-V-4.6`](https://huggingface.co/openbmb/MiniCPM-V-4.6) — base instruct model. Use this for general multimodal serving; thinking mode is still available per-request via `chat_template_kwargs.enable_thinking=true`.
+- [`openbmb/MiniCPM-V-4.6-Thinking`](https://huggingface.co/openbmb/MiniCPM-V-4.6-Thinking) — thinking-tuned variant with stronger chain-of-thought behavior. Pair with the same `--reasoning-parser qwen3` flag.
+
 **Key Features:**
 
 - **Hybrid LLM backbone**: Qwen3.5-style mix of Gated Delta Net (linear-attention) layers and full-attention layers, providing long-context efficiency without giving up modeling power.
@@ -44,7 +49,7 @@ For the general SGLang installation guide (PyPI, source, Docker) see the [offici
 
 ### 3.1 Basic Configuration
 
-**Interactive Command Generator**: Use the configuration selector below to generate the appropriate deployment command. The `Reasoning Parser` and `Tool Call Parser` toggles add `--reasoning-parser qwen3` and `--tool-call-parser qwen` respectively; see §4.4 for usage details.
+**Interactive Command Generator**: Use the configuration selector below to generate the appropriate deployment command. The `Variant` toggle switches between `openbmb/MiniCPM-V-4.6` (base) and `openbmb/MiniCPM-V-4.6-Thinking`. The `Reasoning Parser` and `Tool Call Parser` toggles add `--reasoning-parser qwen3` and `--tool-call-parser qwen` respectively; see §4.4 for usage details.
 
 import { MiniCPMV46Deployment } from '/src/snippets/autoregressive/minicpm-v-4_6-deployment.jsx'
 
@@ -70,10 +75,12 @@ import { MiniCPMV46Deployment } from '/src/snippets/autoregressive/minicpm-v-4_6
 Deploy the model on an H200:
 
 ```bash Command
-sglang serve --model-path openbmb/MiniCPM-V-4_6 \
+sglang serve --model-path openbmb/MiniCPM-V-4.6 \
   --trust-remote-code \
   --dtype bfloat16 \
   --mem-fraction-static 0.15 \
+  --mamba-scheduler-strategy extra_buffer \
+  --page-size 64 \
   --host 0.0.0.0 --port 30000
 ```
 
@@ -88,7 +95,7 @@ client = OpenAI(
 )
 
 response = client.chat.completions.create(
-    model="openbmb/MiniCPM-V-4_6",
+    model="openbmb/MiniCPM-V-4.6",
     messages=[
         {
             "role": "user",
@@ -127,7 +134,7 @@ from openai import OpenAI
 client = OpenAI(base_url="http://localhost:30000/v1", api_key="EMPTY")
 
 response = client.chat.completions.create(
-    model="openbmb/MiniCPM-V-4_6",
+    model="openbmb/MiniCPM-V-4.6",
     messages=[
         {
             "role": "user",
@@ -163,7 +170,7 @@ from openai import OpenAI
 client = OpenAI(base_url="http://localhost:30000/v1", api_key="EMPTY")
 
 response = client.chat.completions.create(
-    model="openbmb/MiniCPM-V-4_6",
+    model="openbmb/MiniCPM-V-4.6",
     messages=[
         {
             "role": "user",
@@ -204,7 +211,7 @@ from openai import OpenAI
 client = OpenAI(base_url="http://localhost:30000/v1", api_key="EMPTY")
 
 response = client.chat.completions.create(
-    model="openbmb/MiniCPM-V-4_6",
+    model="openbmb/MiniCPM-V-4.6",
     messages=[{"role": "user", "content": "Reply with the single word 'hi'. No explanation."}],
     max_tokens=200,
 )
@@ -221,7 +228,7 @@ content          : hi
 
 ```python Example (instruct mode)
 response = client.chat.completions.create(
-    model="openbmb/MiniCPM-V-4_6",
+    model="openbmb/MiniCPM-V-4.6",
     messages=[{"role": "user", "content": "Reply with the single word 'hi'. No explanation."}],
     max_tokens=200,
     extra_body={"chat_template_kwargs": {"enable_thinking": False}},
@@ -270,7 +277,7 @@ tools = [
 ]
 
 response = client.chat.completions.create(
-    model="openbmb/MiniCPM-V-4_6",
+    model="openbmb/MiniCPM-V-4.6",
     messages=[{"role": "user", "content": "What is the weather in San Francisco? Use the tool."}],
     tools=tools,
     max_tokens=200,
@@ -306,7 +313,7 @@ To get the final natural-language answer, feed the tool's result back as a `tool
 
 ```bash Command
 CUDA_VISIBLE_DEVICES=0 python -m sglang.launch_server \
-  --model-path openbmb/MiniCPM-V-4_6 \
+  --model-path openbmb/MiniCPM-V-4.6 \
   --trust-remote-code \
   --dtype bfloat16 \
   --mem-fraction-static 0.5 \
@@ -339,7 +346,7 @@ We use SGLang's built-in `bench_serving` tool with random text prompts (1000 inp
 ```bash Command
 python3 -m sglang.bench_serving \
   --backend sglang \
-  --model openbmb/MiniCPM-V-4_6 \
+  --model openbmb/MiniCPM-V-4.6 \
   --dataset-name random \
   --random-input-len 1000 \
   --random-output-len 1000 \
@@ -393,7 +400,7 @@ Max ITL (ms):                            5.79
 ```bash Command
 python3 -m sglang.bench_serving \
   --backend sglang \
-  --model openbmb/MiniCPM-V-4_6 \
+  --model openbmb/MiniCPM-V-4.6 \
   --dataset-name random \
   --random-input-len 1000 \
   --random-output-len 1000 \
@@ -453,7 +460,7 @@ python3 -m sglang.bench_serving \
   --backend sglang-oai-chat \
   --host 127.0.0.1 \
   --port 30000 \
-  --model openbmb/MiniCPM-V-4_6 \
+  --model openbmb/MiniCPM-V-4.6 \
   --dataset-name image \
   --image-count 1 \
   --image-resolution 720p \
@@ -512,7 +519,7 @@ python3 -m sglang.bench_serving \
   --backend sglang-oai-chat \
   --host 127.0.0.1 \
   --port 30000 \
-  --model openbmb/MiniCPM-V-4_6 \
+  --model openbmb/MiniCPM-V-4.6 \
   --dataset-name image \
   --image-count 1 \
   --image-resolution 720p \
