@@ -71,6 +71,7 @@ warnings.filterwarnings("ignore", message=".*lru_cache.*", module="torch._dynamo
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
+    from sglang.srt.model_executor.device_graphs import PCGLayerProbes
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 
@@ -158,9 +159,10 @@ class PiecewiseCudaGraphRunner:
             and self.model_runner.spec_algorithm.is_none()
         )
 
-    def __init__(self, model_runner: ModelRunner):
+    def __init__(self, model_runner: ModelRunner, *, layer_probes: "PCGLayerProbes"):
         # Parse args
         self.model_runner = model_runner
+        self.layer_probes = layer_probes
         self.device = model_runner.device
         self.device_module = torch.get_device_module(self.device)
         self.graphs = {}
@@ -291,9 +293,9 @@ class PiecewiseCudaGraphRunner:
         )
         self.buffers.share_buffers()
 
-        self.attention_layers = self.model_runner.attention_layers
-        self.moe_layers = self.model_runner.moe_layers
-        self.moe_fusions = self.model_runner.moe_fusions
+        self.attention_layers = self.layer_probes.attention_layers
+        self.moe_layers = self.layer_probes.moe_layers
+        self.moe_fusions = self.layer_probes.moe_fusions
 
         if get_global_graph_memory_pool() is None:
             set_global_graph_memory_pool(self.device_module.graph_pool_handle())

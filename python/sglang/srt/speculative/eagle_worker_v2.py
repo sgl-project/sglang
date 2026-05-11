@@ -5,6 +5,10 @@ from typing import List, Optional, Tuple
 
 import torch
 
+from sglang.srt.configs.hybrid_arch import (
+    hybrid_gdn_config,
+    mamba2_config,
+)
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.graph_runner.eagle_draft_extend_npu_graph_runner import (
     EAGLEDraftExtendNpuGraphRunner,
@@ -238,7 +242,6 @@ class EagleDraftWorker(BaseDraftWorker):
     def init_attention_backend(self):
         # Create multi-step attn backends and cuda graph runners
 
-        self.has_prefill_wrapper_verify = False
         self.draft_extend_attn_backend = None
 
         draft_backend_factory = DraftBackendFactory(
@@ -1042,8 +1045,8 @@ class EAGLEWorkerV2(BaseSpecWorker):
 
         # Update mamba state for hybrid GDN models after verification
         if (
-            self.target_worker.model_runner.hybrid_gdn_config is not None
-            or self.target_worker.model_runner.mamba2_config is not None
+            hybrid_gdn_config(self.target_worker.model_runner.model_config) is not None
+            or mamba2_config(self.target_worker.model_runner.model_config) is not None
         ):
             self._mamba_verify_update(
                 batch, verify_input, accept_lens, accept_index, bs
@@ -1195,18 +1198,22 @@ class EAGLEWorkerV2(BaseSpecWorker):
         )
 
     def update_weights_from_disk(self, recv_req: UpdateWeightFromDiskReqInput):
-        success, message = self._draft_worker.draft_runner.update_weights_from_disk(
-            recv_req.model_path,
-            recv_req.load_format,
-            recapture_cuda_graph=recv_req.recapture_cuda_graph,
+        success, message = (
+            self._draft_worker.draft_runner.weight_updater.update_weights_from_disk(
+                recv_req.model_path,
+                recv_req.load_format,
+                recapture_cuda_graph=recv_req.recapture_cuda_graph,
+            )
         )
         if not success:
             return success, message
         return True, "Succeeded to update model weights."
 
     def update_weights_from_ipc(self, recv_req: UpdateWeightsFromIPCReqInput):
-        success, message = self._draft_worker.draft_runner.update_weights_from_ipc(
-            recv_req
+        success, message = (
+            self._draft_worker.draft_runner.weight_updater.update_weights_from_ipc(
+                recv_req
+            )
         )
         if not success:
             return success, message

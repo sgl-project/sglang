@@ -64,6 +64,7 @@ from sglang.srt.utils import get_available_gpu_memory, log_info_on_rank0
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
+    from sglang.srt.model_executor.device_graphs import PCGLayerProbes
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
     from sglang.srt.model_executor.model_runner import ModelRunner
 
@@ -82,7 +83,7 @@ class BreakableCudaGraphRunner:
     # diverge enough that inheritance would obscure more than it saves.
     replay_prepare = PiecewiseCudaGraphRunner.replay_prepare
 
-    def __init__(self, model_runner: ModelRunner):
+    def __init__(self, model_runner: ModelRunner, *, layer_probes: "PCGLayerProbes"):
         self.model_runner = model_runner
         self.device = model_runner.device
         self.device_module = torch.get_device_module(self.device)
@@ -110,9 +111,9 @@ class BreakableCudaGraphRunner:
 
         self._init_buffers(model_runner)
 
-        self.attention_layers = model_runner.attention_layers
-        self.moe_layers = model_runner.moe_layers
-        self.moe_fusions = model_runner.moe_fusions
+        self.attention_layers = layer_probes.attention_layers
+        self.moe_layers = layer_probes.moe_layers
+        self.moe_fusions = layer_probes.moe_fusions
 
         # Resolve the inner transformer-stack module (the same boundary PCG draws
         # via patch_model). At replay we monkey-patch this module's forward with
