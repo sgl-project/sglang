@@ -445,7 +445,7 @@ jobs:
         id: wait
         with:
           stage-name: stage-a
-          jobs: '["stage-a-test-1-gpu-small", {"prefix": "stage-a-test-cpu", "expected_count": 4}]'
+          jobs: '["stage-a-test-1-gpu-small", {"prefix": "stage-a-test-cpu", "expected_count": ${{ needs.check-changes.outputs.partitions_cpu_size }}}]'
           max-wait-minutes: '240'
 
 
