@@ -304,9 +304,14 @@ if [[ "${NEED_REBUILD}" == "true" ]]; then
     fi
 
     # build AITER
+    # Pass AITER_USE_SYSTEM_TRITON=1 so aiter's setup.py keeps the triton/pytorch-triton-rocm
+    # already shipped in the docker image (installed by aiter itself during image build).
+    # Without this, setup.py uninstalls the image's triton and tries to re-fetch from
+    # https://pypi.amd.com which is not reachable from these CI runners, causing pip to
+    # silently fall back to the upstream NVIDIA triton wheel from public PyPI.
     docker exec ci_sglang bash -c "
         cd /sgl-workspace/aiter && \
-        GPU_ARCHS=${GPU_ARCH_LIST} python3 setup.py develop
+        AITER_USE_SYSTEM_TRITON=1 GPU_ARCHS=${GPU_ARCH_LIST} python3 setup.py develop
     "
 
     echo "[CI-AITER-CHECK] === AITER REBUILD COMPLETE ==="
