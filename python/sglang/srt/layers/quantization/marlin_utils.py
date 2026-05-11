@@ -238,8 +238,14 @@ def check_moe_marlin_supports_layer(layer: FusedMoE, group_size: int) -> bool:
     intermediate_size_per_partition = layer.intermediate_size_per_partition
     # apply_router_weight_on_input is not supported for moe marlin
     supports_router_weight = not layer.moe_runner_config.apply_router_weight_on_input
-    # moe marlin requires the activation to be silu
-    supports_activation = layer.moe_runner_config.activation == "silu"
+    if layer.moe_runner_config.is_gated:
+        supports_activation = layer.moe_runner_config.activation == "silu"
+    else:
+        supports_activation = layer.moe_runner_config.activation in {
+            "silu",
+            "gelu",
+            "relu2",
+        }
 
     # gate-up: (n, k) = (intermediate_size_per_partition * 2, hidden_size)
     # down: (n, k) = (hidden_size, intermediate_size_per_partition)

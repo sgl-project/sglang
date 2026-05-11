@@ -332,6 +332,22 @@ def prepare_moe_nvfp4_layer_for_marlin(layer: torch.nn.Module) -> None:
     layer.workspace = marlin_make_workspace(device, 4)
     perm = torch.empty(0, dtype=torch.int, device=device)
 
+    if not layer.moe_runner_config.is_gated:
+        padded_intermediate_size = ((intermediate_size + 127) // 128) * 128
+        intermediate_size_pad = padded_intermediate_size - intermediate_size
+        if intermediate_size_pad:
+            w13 = torch.nn.functional.pad(w13, (0, 0, 0, intermediate_size_pad))
+            w13_scale = torch.nn.functional.pad(
+                w13_scale, (0, 0, 0, intermediate_size_pad)
+            )
+            w2 = torch.nn.functional.pad(w2, (0, intermediate_size_pad // 2, 0, 0))
+            w2_scale = torch.nn.functional.pad(
+                w2_scale, (0, intermediate_size_pad // 16)
+            )
+            if w13_bias is not None:
+                w13_bias = torch.nn.functional.pad(w13_bias, (0, intermediate_size_pad))
+            intermediate_size = padded_intermediate_size
+
     def _repack_weight(weight: torch.Tensor, is_w13: bool) -> torch.Tensor:
         if is_w13:
             size_n, size_k = intermediate_size * num_shards, hidden_size

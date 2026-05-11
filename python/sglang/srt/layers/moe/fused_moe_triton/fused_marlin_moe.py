@@ -79,6 +79,8 @@ def fused_marlin_moe(
     inplace: bool = False,
     routed_scaling_factor: Optional[float] = None,
     clamp_limit: Optional[float] = None,
+    activation: str = "silu",
+    is_gated: bool = True,
 ) -> torch.Tensor:
     """
     This function computes a Mixture of Experts (MoE) layer using two sets of
@@ -154,6 +156,7 @@ def fused_marlin_moe(
     E = w1.shape[0]
     N = w2.shape[1] * 16
     topk = topk_ids.shape[1]
+    gemm1_n = 2 * N if is_gated else N
 
     # M block size selection logic
     # TODO: tune this further for specific models
@@ -191,12 +194,12 @@ def fused_marlin_moe(
         dtype=hidden_states.dtype,
     )
     intermediate_cache13 = torch.empty(
-        (M * topk_ids.shape[1] * max(2 * N, K),),
+        (M * topk_ids.shape[1] * max(gemm1_n, K),),
         device=hidden_states.device,
         dtype=hidden_states.dtype,
     )
-    intermediate_cache1 = intermediate_cache13[: M * topk_ids.shape[1] * 2 * N]
-    intermediate_cache1 = intermediate_cache1.view(-1, 2 * N)
+    intermediate_cache1 = intermediate_cache13[: M * topk_ids.shape[1] * gemm1_n]
+    intermediate_cache1 = intermediate_cache1.view(-1, gemm1_n)
     intermediate_cache3 = intermediate_cache13[: M * topk_ids.shape[1] * K]
     intermediate_cache3 = intermediate_cache3.view(-1, K)
 
@@ -226,7 +229,7 @@ def fused_marlin_moe(
         is_ep=expert_map is not None,
         b_q_type=scalar_type1,
         size_m=M,
-        size_n=2 * N,
+        size_n=gemm1_n,
         size_k=K,
         is_k_full=is_k_full,
         use_atomic_add=use_atomic_add,
@@ -234,14 +237,22 @@ def fused_marlin_moe(
         is_zp_float=False,
     )
 
-    if clamp_limit is not None:
+    if activation == "silu" and is_gated and clamp_limit is not None:
         swiglu_limit_func(
             intermediate_cache2,
-            intermediate_cache1.view(-1, 2 * N),
+            intermediate_cache1.view(-1, gemm1_n),
             clamp_limit,
         )
+    elif activation == "silu" and is_gated:
+        silu_and_mul(intermediate_cache1.view(-1, gemm1_n), intermediate_cache2)
+    elif activation == "silu" and not is_gated:
+        intermediate_cache2 = F.silu(intermediate_cache1.view(-1, N))
+    elif activation == "gelu" and not is_gated:
+        intermediate_cache2 = F.gelu(intermediate_cache1.view(-1, N))
+    elif activation == "relu2" and not is_gated:
+        intermediate_cache2 = torch.square(F.relu(intermediate_cache1.view(-1, N)))
     else:
-        silu_and_mul(intermediate_cache1.view(-1, 2 * N), intermediate_cache2)
+        raise ValueError(f"Unsupported activation: {activation=}, with {is_gated=}")
 
     if expert_map is not None:
         intermediate_cache3.zero_()
