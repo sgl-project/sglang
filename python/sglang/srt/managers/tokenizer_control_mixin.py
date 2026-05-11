@@ -430,7 +430,9 @@ class TokenizerControlMixin:
 
         success, message = FanOutCommunicator.merge_results(results)
         if success and obj.weight_version is not None:
-            self._update_weight_version_if_provided(obj.weight_version)
+            TokenizerControlMixin._update_weight_version_if_provided(
+                self.weight_disk_update_controller, obj.weight_version
+            )
             message += f" Weight version updated to {obj.weight_version}."
 
         return success, message
@@ -487,7 +489,9 @@ class TokenizerControlMixin:
 
         success, message = FanOutCommunicator.merge_results(results)
         if success and obj.weight_version is not None:
-            self._update_weight_version_if_provided(obj.weight_version)
+            TokenizerControlMixin._update_weight_version_if_provided(
+                self.weight_disk_update_controller, obj.weight_version
+            )
             message += f" Weight version updated to {obj.weight_version}."
 
         return success, message
@@ -522,7 +526,9 @@ class TokenizerControlMixin:
             success, message = False, error_msg
 
         if success and obj.weight_version is not None:
-            self._update_weight_version_if_provided(obj.weight_version)
+            TokenizerControlMixin._update_weight_version_if_provided(
+                self.weight_disk_update_controller, obj.weight_version
+            )
             message += f" Weight version updated to {obj.weight_version}."
 
         return success, message
@@ -843,8 +849,9 @@ class TokenizerControlMixin:
 
         return results
 
+    @staticmethod
     def _update_weight_version_if_provided(
-        self: TokenizerManager, weight_version: Optional[str]
+        self: "WeightDiskUpdateController", weight_version: Optional[str]
     ) -> None:
         """Update weight version if provided."""
         if weight_version is not None:

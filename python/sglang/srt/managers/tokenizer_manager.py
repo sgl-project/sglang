@@ -23,7 +23,7 @@ import threading
 from contextlib import nullcontext
 from enum import Enum
 from http import HTTPStatus
-from typing import Awaitable, Dict, List, Optional, Tuple, Union
+from typing import Dict, List, Optional, Tuple, Union
 
 import fastapi
 import pybase64
@@ -101,6 +101,9 @@ from sglang.srt.managers.tokenizer_manager_components.session_controller import 
 from sglang.srt.managers.tokenizer_manager_components.tokenized_request_builder import (
     TokenizedRequestBuilder,
     TokenizedRequestBuilderConfig,
+)
+from sglang.srt.managers.tokenizer_manager_components.weight_disk_update_controller import (
+    WeightDiskUpdateController,
 )
 from sglang.srt.observability.req_time_stats import (
     real_time,
@@ -199,6 +202,17 @@ class TokenizerManager(TokenizerControlMixin):
             enable_metrics=self.enable_metrics,
             enable_priority_scheduling=self.enable_priority_scheduling,
             disaggregation_mode=self.disaggregation_mode,
+        )
+
+        # Weight disk update controller
+        self.weight_disk_update_controller = WeightDiskUpdateController(
+            send_to_scheduler=self.send_to_scheduler,
+            abort_request=self.abort_request,
+            is_pause_getter=lambda: self.is_pause,
+            is_pause_cond=self.is_pause_cond,
+            model_update_lock=self.model_update_lock,
+            server_args=self.server_args,
+            auto_create_handle_loop=self.auto_create_handle_loop,
         )
 
         # Session controller
@@ -330,17 +344,8 @@ class TokenizerManager(TokenizerControlMixin):
         self._subprocess_watchdog = None
 
     def init_weight_update(self):
-        # Initial weights status
-        self.initial_weights_loaded = True
-        if self.server_args.checkpoint_engine_wait_weights_before_ready:
-            self.initial_weights_loaded = False
-
-        # Weight updates
-        # The event to notify the weight sync is finished.
+        # Lock guarding weight-sync updates against in-flight requests.
         self.model_update_lock = RWLock()
-        self.model_update_result: Optional[Awaitable[UpdateWeightFromDiskReqOutput]] = (
-            None
-        )
         self.is_pause = False
         self.is_pause_cond = asyncio.Condition()
 
@@ -392,7 +397,9 @@ class TokenizerManager(TokenizerControlMixin):
                 ),
                 (
                     UpdateWeightFromDiskReqOutput,
-                    self._handle_update_weights_from_disk_req_output,
+                    lambda x: TokenizerManager.handle_update_weights_from_disk_req_output(
+                        self.weight_disk_update_controller, x
+                    ),
                 ),
                 (FreezeGCReq, lambda x: None),
                 # For handling case when scheduler skips detokenizer and forwards back to the tokenizer manager, we ignore it.
@@ -818,8 +825,9 @@ class TokenizerManager(TokenizerControlMixin):
             await self.send_to_scheduler.send_pyobj(obj)
             self.is_pause_cond.notify_all()
 
+    @staticmethod
     async def update_weights_from_disk(
-        self,
+        self: "WeightDiskUpdateController",
         obj: UpdateWeightFromDiskReqInput,
         request: Optional[fastapi.Request] = None,
     ) -> Tuple[bool, str]:
@@ -835,37 +843,45 @@ class TokenizerManager(TokenizerControlMixin):
 
         # Immediately update the weights if the engine is in paused state
         async with self.is_pause_cond:
-            is_paused = self.is_pause
+            is_paused = self.is_pause_getter()
 
         lock_context = (
             self.model_update_lock.writer_lock if not is_paused else nullcontext()
         )
         async with lock_context:
             success, message, num_paused_requests = (
-                await self._wait_for_model_update_from_disk(obj)
+                await TokenizerManager._wait_for_model_update_from_disk(self, obj)
             )
 
         if success and obj.weight_version is not None:
-            self._update_weight_version_if_provided(obj.weight_version)
+            TokenizerControlMixin._update_weight_version_if_provided(
+                self, obj.weight_version
+            )
             message += f" Weight version updated to {obj.weight_version}."
 
         return success, message, num_paused_requests
 
-    def _update_model_path_info(self, model_path: str, load_format: str):
-        self.served_model_name = model_path
+    @staticmethod
+    def _update_model_path_info(
+        self: "WeightDiskUpdateController", model_path: str, load_format: str
+    ):
+        self.server_args.served_model_name = model_path
         self.server_args.model_path = model_path
         self.server_args.load_format = load_format
-        self.model_path = model_path
+        self.server_args.model_path = model_path
 
+    @staticmethod
     async def _wait_for_model_update_from_disk(
-        self, obj: UpdateWeightFromDiskReqInput
+        self: "WeightDiskUpdateController", obj: UpdateWeightFromDiskReqInput
     ) -> Tuple[bool, str]:
         self.send_to_scheduler.send_pyobj(obj)
         self.model_update_result = asyncio.Future()
         if self.server_args.dp_size == 1:
             result = await self.model_update_result
             if result.success:
-                self._update_model_path_info(obj.model_path, obj.load_format)
+                TokenizerManager._update_model_path_info(
+                    self, obj.model_path, obj.load_format
+                )
             return result.success, result.message, result.num_paused_requests
         else:  # self.server_args.dp_size > 1
             self.model_update_tmp = []
@@ -873,7 +889,9 @@ class TokenizerManager(TokenizerControlMixin):
 
             all_success = all([r.success for r in result])
             if all_success is True:
-                self._update_model_path_info(obj.model_path, obj.load_format)
+                TokenizerManager._update_model_path_info(
+                    self, obj.model_path, obj.load_format
+                )
             all_message = [r.message for r in result]
             all_message = " | ".join(all_message)
             all_paused_requests = [r.num_paused_requests for r in result]
@@ -1319,7 +1337,10 @@ class TokenizerManager(TokenizerControlMixin):
     def update_active_ranks(self, ranks: ActiveRanksOutput):
         self.send_to_scheduler.send_pyobj(ranks)
 
-    def _handle_update_weights_from_disk_req_output(self, recv_obj):
+    @staticmethod
+    def handle_update_weights_from_disk_req_output(
+        self: "WeightDiskUpdateController", recv_obj
+    ):
         if self.server_args.dp_size == 1:
             self.model_update_result.set_result(recv_obj)
         else:  # self.server_args.dp_size > 1

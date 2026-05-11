@@ -1042,7 +1042,9 @@ async def dump_expert_distribution_record_async():
 async def update_weights_from_disk(obj: UpdateWeightFromDiskReqInput, request: Request):
     """Update the weights from disk inplace without re-launching the server."""
     success, message, num_paused_requests = (
-        await _global_state.tokenizer_manager.update_weights_from_disk(obj, request)
+        await TokenizerManager.update_weights_from_disk(
+            _global_state.tokenizer_manager.weight_disk_update_controller, obj, request
+        )
     )
 
     content = {
@@ -1216,8 +1218,13 @@ async def update_weights_from_ipc(obj: UpdateWeightsFromIPCReqInput, request: Re
 
     content = {"success": success, "message": message}
     if success:
-        if _global_state.tokenizer_manager.initial_weights_loaded is False:
-            _global_state.tokenizer_manager.initial_weights_loaded = True
+        if (
+            _global_state.tokenizer_manager.weight_disk_update_controller.initial_weights_loaded
+            is False
+        ):
+            _global_state.tokenizer_manager.weight_disk_update_controller.initial_weights_loaded = (
+                True
+            )
         return ORJSONResponse(content)
     else:
         return ORJSONResponse(content, status_code=HTTPStatus.BAD_REQUEST)
@@ -2055,7 +2062,9 @@ def _wait_weights_ready():
     start_time = time.time()
 
     for _ in range(timeout):
-        if _global_state.tokenizer_manager.initial_weights_loaded:
+        if (
+            _global_state.tokenizer_manager.weight_disk_update_controller.initial_weights_loaded
+        ):
             logger.info(
                 f"Weights are ready after {time.time() - start_time:.2f} seconds"
             )
@@ -2066,7 +2075,7 @@ def _wait_weights_ready():
     logger.error(
         f"Weights are not ready after waiting {timeout} seconds. "
         f"Consider increasing SGLANG_WAIT_WEIGHTS_READY_TIMEOUT environment variable. "
-        f"Current status: initial_weights_loaded={_global_state.tokenizer_manager.initial_weights_loaded}"
+        f"Current status: initial_weights_loaded={_global_state.tokenizer_manager.weight_disk_update_controller.initial_weights_loaded}"
     )
 
 
