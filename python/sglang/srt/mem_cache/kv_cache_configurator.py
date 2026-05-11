@@ -269,40 +269,14 @@ class KVCacheConfigurator:
         from sglang.srt.platforms import current_platform
 
         if is_dsv4_model:
-            swa_page_size = self.page_size
-            assert swa_page_size == 256, "In paged swa mode, page_size must be 256."
-
-            if self.is_draft_worker:
-                from sglang.srt.models.deepseek_v4_nextn import (
-                    COMPRESS_RATIO_NEXTN_LAYER,
-                )
-
-                compression_ratios = [
-                    COMPRESS_RATIO_NEXTN_LAYER
-                ] * self.num_effective_layers
-            else:
-                compression_ratios = self.model_config.compress_ratios
-            token_to_kv_pool = DeepSeekV4TokenToKVPool(
-                max_num_reqs=max_running_requests,
-                swa_size=swa_max_total_num_tokens,
-                c4_size=c4_max_total_num_tokens,
-                c128_size=c128_max_total_num_tokens,
+            token_to_kv_pool = self._dsv4_kv_pool(
+                max_running_requests=max_running_requests,
+                swa_max_total_num_tokens=swa_max_total_num_tokens,
+                c4_max_total_num_tokens=c4_max_total_num_tokens,
+                c128_max_total_num_tokens=c128_max_total_num_tokens,
                 c4_state_pool_size=c4_state_pool_size,
                 c128_state_pool_size=c128_state_pool_size,
-                page_size=self.page_size,
-                swa_page_size=swa_page_size,
-                dtype=self.kv_cache_dtype,
                 state_dtype=state_dtype,
-                qk_nope_head_dim=self.model_config.qk_nope_head_dim,
-                qk_rope_head_dim=self.model_config.qk_rope_head_dim,
-                indexer_head_dim=self.model_config.index_head_dim,
-                layer_num=self.num_effective_layers,
-                device=self.device,
-                enable_memory_saver=self.server_args.enable_memory_saver,
-                compression_ratios=compression_ratios,
-                start_layer=self.start_layer,
-                end_layer=self.end_layer,
-                enable_hisparse=self.enable_hisparse,
             )
         elif current_platform.is_out_of_tree() and not self.mambaish_config:
             if self.use_mla_backend and is_nsa_model:
@@ -785,6 +759,53 @@ class KVCacheConfigurator:
             max_context_len=self.model_config.context_len + extra_max_context_len,
             device=self.device,
             enable_memory_saver=self.server_args.enable_memory_saver,
+        )
+
+    def _dsv4_kv_pool(
+        self,
+        *,
+        max_running_requests: int,
+        swa_max_total_num_tokens: Optional[int],
+        c4_max_total_num_tokens: int,
+        c128_max_total_num_tokens: int,
+        c4_state_pool_size: int,
+        c128_state_pool_size: int,
+        state_dtype: Optional[torch.dtype],
+    ) -> KVCache:
+        swa_page_size = self.page_size
+        assert swa_page_size == 256, "In paged swa mode, page_size must be 256."
+
+        if self.is_draft_worker:
+            from sglang.srt.models.deepseek_v4_nextn import (
+                COMPRESS_RATIO_NEXTN_LAYER,
+            )
+
+            compression_ratios = [
+                COMPRESS_RATIO_NEXTN_LAYER
+            ] * self.num_effective_layers
+        else:
+            compression_ratios = self.model_config.compress_ratios
+        return DeepSeekV4TokenToKVPool(
+            max_num_reqs=max_running_requests,
+            swa_size=swa_max_total_num_tokens,
+            c4_size=c4_max_total_num_tokens,
+            c128_size=c128_max_total_num_tokens,
+            c4_state_pool_size=c4_state_pool_size,
+            c128_state_pool_size=c128_state_pool_size,
+            page_size=self.page_size,
+            swa_page_size=swa_page_size,
+            dtype=self.kv_cache_dtype,
+            state_dtype=state_dtype,
+            qk_nope_head_dim=self.model_config.qk_nope_head_dim,
+            qk_rope_head_dim=self.model_config.qk_rope_head_dim,
+            indexer_head_dim=self.model_config.index_head_dim,
+            layer_num=self.num_effective_layers,
+            device=self.device,
+            enable_memory_saver=self.server_args.enable_memory_saver,
+            compression_ratios=compression_ratios,
+            start_layer=self.start_layer,
+            end_layer=self.end_layer,
+            enable_hisparse=self.enable_hisparse,
         )
 
     def _profile_available_bytes(self, pre_model_load_memory: int) -> int:
