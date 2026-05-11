@@ -55,20 +55,18 @@ class TestZeroMatchResult(unittest.TestCase):
         self.assertEqual(zeroed.device_indices.dtype, match.device_indices.dtype)
         self.assertEqual(zeroed.device_indices.device, match.device_indices.device)
 
-    def test_no_root_node_raises(self):
-        # tree_cache without a root_node: must raise loudly rather than silently
-        # leak cache hits past the gate.
-        class _NoRoot:
-            pass
+    def test_chunk_cache_is_passthrough(self):
+        class _StubChunkCache:
+            def is_chunk_cache(self) -> bool:
+                return True
 
         original = MatchResult(
-            device_indices=torch.tensor([7, 8, 9], dtype=torch.int64),
-            last_device_node="sentinel-device",
-            last_host_node="sentinel-host",
-            host_hit_length=4,
+            device_indices=torch.empty((0,), dtype=torch.int64),
+            last_device_node=None,
+            last_host_node=None,
+            host_hit_length=0,
         )
-        with self.assertRaisesRegex(RuntimeError, "SGLANG_RADIX_FORCE_MISS"):
-            zero_match_result(_NoRoot(), original)
+        self.assertIs(zero_match_result(_StubChunkCache(), original), original)
 
 
 class TestMatchPrefixForReqForceMiss(unittest.TestCase):
