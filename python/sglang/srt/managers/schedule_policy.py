@@ -665,6 +665,24 @@ class PrefillAdder:
         )
 
     def add_chunked_req(self, req: Req):
+        """Compat wrapper for callers that still want the legacy
+        ``req | None`` return convention. New callers should pass
+        ``is_resume=True`` to ``add_one_req`` directly."""
+        full_len = len(req.origin_input_ids) + len(req.output_ids)
+        result = self._add_one_req_resume(req)
+        if result == AddReqResult.NO_TOKEN:
+            # SWA early-return: req is not in can_run_list, but stays the
+            # current in-flight chunked req for the next iter.
+            return req
+        # Successful admit. If fill_ids is shorter than the full sequence,
+        # more chunks remain.
+        return req if len(req.fill_ids) < full_len else None
+
+    def _add_one_req_resume(self, req: Req):
+        """Admit a chunked-resume req. The req already owns a row, holds the
+        radix lock, and was admitted as a chunked req in a previous iter — so
+        we skip the lock acquisition, host-cache load-back, and inc_lock_ref
+        steps that ``add_one_req`` runs for a fresh req."""
         if self.dllm_config is not None:
             _rem_tokens = self._get_dllm_remain_tokens()
         else:
@@ -679,7 +697,7 @@ class PrefillAdder:
             # Therefore, in certain cases where _rem_tokens <= 0, it should be replaced with rem_chunk_tokens.
             if _rem_tokens <= 0:
                 if self.is_hybrid_swa:
-                    return req
+                    return AddReqResult.NO_TOKEN
                 _rem_tokens = self.rem_chunk_tokens
 
         truncated = req.extend_input_len > _rem_tokens
@@ -696,8 +714,7 @@ class PrefillAdder:
             ),
         )
 
-        # Return if chunked prefill not finished
-        return req if truncated else None
+        return self.budget_state()
 
     @contextmanager
     def _lock_node(self, last_node: TreeNode):
@@ -810,8 +827,14 @@ class PrefillAdder:
         return self.budget_state()
 
     def add_one_req(
-        self, req: Req, has_chunked_req: bool, truncation_align_size: Optional[int]
+        self,
+        req: Req,
+        truncation_align_size: Optional[int],
+        is_resume: bool = False,
     ):
+        if is_resume:
+            return self._add_one_req_resume(req)
+
         if (self.prefill_delayer_single_pass is not None) and (
             not self.prefill_delayer_single_pass.negotiate_should_allow_prefill(
                 local_prefillable=True,
