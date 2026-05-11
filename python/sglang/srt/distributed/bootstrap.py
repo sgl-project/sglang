@@ -80,17 +80,7 @@ def init_torch_distributed(
         )
         raise
 
-    backend = get_default_distributed_backend(device)
-    if device == "cuda" and server_args.elastic_ep_backend == "mooncake":
-        backend = "mooncake"
-        if server_args.mooncake_ib_device:
-            mooncake_ib_device = server_args.mooncake_ib_device.split(",")
-            try:
-                from mooncake import ep as mooncake_ep
-
-                mooncake_ep.set_device_filter(mooncake_ib_device)
-            except:
-                pass  # A warning will be raised in `init_distributed_environment`
+    backend = _resolve_backend(device=device, server_args=server_args)
 
     before_avail_memory = get_available_gpu_memory(device, gpu_id)
     if not server_args.enable_p2p_check:
@@ -212,3 +202,18 @@ def init_torch_distributed(
         attention_tp_group=attention_tp_group,
         pre_model_load_memory=pre_model_load_memory,
     )
+
+
+def _resolve_backend(*, device: str, server_args: ServerArgs) -> str:
+    backend = get_default_distributed_backend(device)
+    if device == "cuda" and server_args.elastic_ep_backend == "mooncake":
+        backend = "mooncake"
+        if server_args.mooncake_ib_device:
+            mooncake_ib_device = server_args.mooncake_ib_device.split(",")
+            try:
+                from mooncake import ep as mooncake_ep
+
+                mooncake_ep.set_device_filter(mooncake_ib_device)
+            except:
+                pass  # A warning will be raised in `init_distributed_environment`
+    return backend
