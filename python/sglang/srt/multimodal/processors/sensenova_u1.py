@@ -2,13 +2,6 @@
 
 from typing import Any
 
-from sglang.srt.managers.schedule_batch import (
-    Modality,
-    MultimodalDataItem,
-    MultimodalProcessorOutput,
-)
-from sglang.srt.models.sensenova_u1 import NEOChatModel
-from sglang.srt.multimodal.processors.base_processor import BaseMultimodalProcessor
 from sglang.omni.bridges.sensenova_u1.context import (
     U1_IMAGE_PLACEHOLDER,
     U1_IMG_CONTEXT_TOKEN,
@@ -17,6 +10,13 @@ from sglang.omni.bridges.sensenova_u1.context import (
     build_u1_vlm_input_ids_and_offsets,
     load_u1_native_image,
 )
+from sglang.srt.managers.schedule_batch import (
+    Modality,
+    MultimodalDataItem,
+    MultimodalProcessorOutput,
+)
+from sglang.srt.models.sensenova_u1 import NEOChatModel
+from sglang.srt.multimodal.processors.base_processor import BaseMultimodalProcessor
 
 
 class SenseNovaU1MultimodalProcessor(BaseMultimodalProcessor):

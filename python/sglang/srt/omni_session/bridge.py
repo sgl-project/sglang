@@ -4,16 +4,16 @@
 from abc import ABC, abstractmethod
 from typing import Any
 
-from sglang.srt.omni_session.runtime_protocol import (
-    OmniContextBundle,
-    OmniContextHandle,
-    OmniSessionHandle,
-)
 from sglang.srt.omni_session.runtime import (
     OmniDecodeResult,
     OmniInterleavedMessage,
     OmniSessionRuntime,
     OmniVLMTextGenerationResult,
+)
+from sglang.srt.omni_session.runtime_protocol import (
+    OmniContextBundle,
+    OmniContextHandle,
+    OmniSessionHandle,
 )
 
 DEFAULT_OMNI_TEXT_MAX_NEW_TOKENS = 128
@@ -22,10 +22,10 @@ DEFAULT_OMNI_TEXT_MAX_NEW_TOKENS = 128
 class OmniSessionBridge(ABC):
     """bridge surface between generic omni orchestrator and SRT session runtime, translating ARBackend semantics into srt-session semantics
 
-      e.g., U1SRTBackedOmniSessionBridge breaks down the generation process into:
-       1. prefill
-       2. decode until an image marker is met
-       3. commit generated image into session
+    e.g., U1SRTBackedOmniSessionBridge breaks down the generation process into:
+     1. prefill
+     2. decode until an image marker is met
+     3. commit generated image into session
 
     """
 

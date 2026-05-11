@@ -10,26 +10,6 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
-from sglang.srt.omni_session.model_policy import (
-    OmniSessionModelPolicy,
-    OmniModelAppendImageResult,
-    OmniModelPrefillResult,
-    OmniModelPolicyRunner,
-    OmniModelSessionView,
-)
-from sglang.srt.omni_session.runtime_protocol import (
-    OmniContextBundle,
-    OmniSessionHandle,
-)
-from sglang.srt.omni_session.bridge import SRTBackedOmniSessionBridge
-from sglang.srt.omni_session.runtime import (
-    OmniDecodeResult,
-    OmniInterleavedMessage,
-    OmniSegmentState,
-    OmniSessionRuntime,
-    OmniSRTPreparedInput,
-    OmniVLMTextGenerationResult,
-)
 from sglang.omni.bridges.sensenova_u1.context import (
     U1_EDIT_IMG_CONDITION_ROLE,
     U1_EDIT_UNCONDITION_ROLE,
@@ -51,6 +31,26 @@ from sglang.omni.bridges.sensenova_u1.context import (
     build_u1_native_t2i_cfg_uncondition_prepared_input,
     build_u1_native_t2i_prepared_input,
     build_u1_native_vlm_prepared_input,
+)
+from sglang.srt.omni_session.bridge import SRTBackedOmniSessionBridge
+from sglang.srt.omni_session.model_policy import (
+    OmniModelAppendImageResult,
+    OmniModelPolicyRunner,
+    OmniModelPrefillResult,
+    OmniModelSessionView,
+    OmniSessionModelPolicy,
+)
+from sglang.srt.omni_session.runtime import (
+    OmniDecodeResult,
+    OmniInterleavedMessage,
+    OmniSegmentState,
+    OmniSessionRuntime,
+    OmniSRTPreparedInput,
+    OmniVLMTextGenerationResult,
+)
+from sglang.srt.omni_session.runtime_protocol import (
+    OmniContextBundle,
+    OmniSessionHandle,
 )
 from sglang.srt.omni_session.srt_executor import OmniSRTSchedulerExecutor
 
@@ -575,9 +575,7 @@ class U1SRTBackedOmniSessionBridge(SRTBackedOmniSessionBridge):
         mode = getattr(sampling_params, "omni_generation_mode", None)
         if policy is not None:
             old_cfg = policy.include_t2i_cfg_uncondition
-            old_interleave_text_uncondition = (
-                policy.include_interleave_text_uncondition
-            )
+            old_interleave_text_uncondition = policy.include_interleave_text_uncondition
             old_edit_img_condition = policy.include_edit_img_condition
             old_edit_uncondition = policy.include_edit_uncondition
             old_mode = policy.native_generation_mode

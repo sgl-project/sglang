@@ -1570,9 +1570,7 @@ def _append_response_item_segments(
         segments.append({"type": "image", "image": _responses_image_payload(item)})
         return
     if item_type == "image_generation_call" and item.get("result"):
-        segments.append(
-            {"type": "image", "image": {"b64_json": str(item["result"])}}
-        )
+        segments.append({"type": "image", "image": {"b64_json": str(item["result"])}})
         return
     if item_type != "message":
         return

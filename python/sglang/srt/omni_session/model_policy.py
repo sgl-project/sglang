@@ -5,7 +5,6 @@ from copy import deepcopy
 from dataclasses import dataclass, field
 from typing import Any
 
-from sglang.srt.omni_session.runtime_protocol import OmniSessionHandle
 from sglang.srt.omni_session.runtime import (
     OmniDecodeResult,
     OmniInterleavedMessage,
@@ -16,6 +15,7 @@ from sglang.srt.omni_session.runtime import (
     OmniSRTPreparedInput,
     OmniVLMTextGenerationResult,
 )
+from sglang.srt.omni_session.runtime_protocol import OmniSessionHandle
 
 
 @dataclass(frozen=True, slots=True)
@@ -81,9 +81,7 @@ class OmniSessionModelPolicy:
             )
         )
 
-    def decode_next_segment(
-        self, *, session: OmniModelSessionView
-    ) -> OmniDecodeResult:
+    def decode_next_segment(self, *, session: OmniModelSessionView) -> OmniDecodeResult:
         """decode the next interleaved boundary: text, image marker, or done"""
         raise NotImplementedError(
             f"{self.__class__.__name__} does not support segment decode"

@@ -5,7 +5,6 @@ This module is the execution boundary where omni_session borrows SRT internals:
 it can enqueue small session requests and build temporary query batches that
 read committed SRT KV cache without permanently appending generation query tokens.
 """
-from sglang.srt.mem_cache.common import evict_from_tree_cache
 
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
@@ -13,6 +12,7 @@ from typing import TYPE_CHECKING, Any
 import torch
 
 from sglang.omni.protocol import TemporaryForwardPrepared
+from sglang.srt.mem_cache.common import evict_from_tree_cache
 from sglang.srt.omni_session.runtime_protocol import OmniSRTKVTokenBinding
 
 if TYPE_CHECKING:
@@ -55,6 +55,9 @@ class OmniSRTTemporaryForwardBatch:
     released: bool = False
 
     def release(self) -> None:
+        """
+            release the temporary kv slots allocated for denoise
+        """
         if self.released:
             return
         self.released = True
@@ -420,9 +423,9 @@ class OmniSRTSchedulerExecutor:
 
     def _scheduler_has_active_batches(self) -> bool:
         for batch in (
-                self.scheduler.last_batch,
-                self.scheduler.running_batch,
-                self.scheduler.cur_batch,
+            self.scheduler.last_batch,
+            self.scheduler.running_batch,
+            self.scheduler.cur_batch,
         ):
             if batch is None:
                 continue
@@ -434,9 +437,9 @@ class OmniSRTSchedulerExecutor:
     def _scheduler_batches_all_finished(self) -> bool:
         saw_req = False
         for batch in (
-                self.scheduler.last_batch,
-                self.scheduler.running_batch,
-                self.scheduler.cur_batch,
+            self.scheduler.last_batch,
+            self.scheduler.running_batch,
+            self.scheduler.cur_batch,
         ):
             if batch is None:
                 continue
@@ -522,9 +525,9 @@ class OmniSRTSchedulerExecutor:
             f"grammar={len(self.scheduler.grammar_manager.grammar_queue)}",
         ]
         for attr_name, batch in (
-                ("last_batch", self.scheduler.last_batch),
-                ("running_batch", self.scheduler.running_batch),
-                ("cur_batch", self.scheduler.cur_batch),
+            ("last_batch", self.scheduler.last_batch),
+            ("running_batch", self.scheduler.running_batch),
+            ("cur_batch", self.scheduler.cur_batch),
         ):
             if batch is None:
                 parts.append(f"{attr_name}=None")
@@ -532,9 +535,7 @@ class OmniSRTSchedulerExecutor:
             req_states = []
             for req in batch.reqs[:4]:
                 req_states.append(f"{req.rid}:{req.finished()}")
-            parts.append(
-                f"{attr_name}(empty={batch.is_empty()}, reqs={req_states})"
-            )
+            parts.append(f"{attr_name}(empty={batch.is_empty()}, reqs={req_states})")
         return ", ".join(parts)
 
     def _require_model_runner(self) -> "ModelRunner":
@@ -607,7 +608,10 @@ class OmniSRTSchedulerExecutor:
         device: torch.device,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
+            Allocate the temporary kv tokens in the kv-cache
             extend_num_tokens: number of KV token required by the denoise query
+
+            Returns a tuple of: tokens actually needed, and tokens allocated
         """
         tree_cache = self.scheduler.tree_cache
         page_size = int(tree_cache.page_size)
@@ -882,9 +886,7 @@ class OmniSRTSchedulerExecutor:
             return None
         return req_to_token[pool_idx, :token_count].to(dtype=torch.int64).clone()
 
-    def _request_token_indices_for_active_req(
-        self, req: "Req"
-    ) -> torch.Tensor | None:
+    def _request_token_indices_for_active_req(self, req: "Req") -> torch.Tensor | None:
         tree_cache = self.scheduler.tree_cache
         req_to_token = tree_cache.req_to_token_pool.req_to_token
         pool_idx = req.req_pool_idx

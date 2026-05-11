@@ -10,10 +10,10 @@ import re
 from collections import defaultdict
 from collections.abc import Callable, Iterator
 from typing import Any, Dict, Type
-from transformers.initialization import no_init_weights
 
 import torch
 from torch import nn
+from transformers.initialization import no_init_weights
 
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 

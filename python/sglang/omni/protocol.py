@@ -173,8 +173,8 @@ class TemporaryForwardPrepared:
 
 @dataclass(frozen=True, slots=True)
 class OmniOutputSegment:
-    """OmniOutputSegment is the basic element of the result of an omni request
-    """
+    """OmniOutputSegment is the basic element of the result of an omni request"""
+
     type: OutputSegmentType
     text: str | None = None
     image: Any | None = None
@@ -266,7 +266,16 @@ class ContextOps(ABC):
         prepared: TemporaryForwardPrepared,
         generation_query_embeds: Any,
         timestep: Any,
-    ) -> Any: ...
+    ) -> Any:
+        """
+            Build a temporary forward batch for the forward-process using language model in image generation process
+
+            For some models (U1), the image generation process includes calling forward of the language (AR) model.
+
+            Since the kv tokens of the image tokens are useless once after denoising, it is temporary and should be released.
+        """
+
+        ...
 
 
 class ARBackend(ABC):

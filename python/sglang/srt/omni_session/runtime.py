@@ -5,11 +5,12 @@ The runtime is below the generic omni orchestrator. It materializes model-
 specific AR-side chunks as ordinary SRT session requests, tracks committed SRT
 KV bindings, and leaves generation-side execution to a bridge/executor pair.
 """
+
 import uuid
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Literal, Union
+from typing import Any, Literal
 
 import torch
 
@@ -17,7 +18,7 @@ from sglang.srt.managers.io_struct import (
     SessionParams,
     TokenizedGenerateReqInput,
 )
-from sglang.srt.managers.schedule_batch import MultimodalInputs, FINISH_LENGTH, Req
+from sglang.srt.managers.schedule_batch import FINISH_LENGTH, MultimodalInputs, Req
 from sglang.srt.omni_session.runtime_protocol import (
     OmniSessionHandle,
 )
@@ -26,10 +27,8 @@ from sglang.srt.session.session_controller import SessionController
 
 
 class OmniSegmentState(str, Enum):
-    """A segment marks a continuous region of tokens of text/image/audio
-    
+    """A segment marks a continuous region of tokens of text/image/audio"""
 
-    """
     AR_PREFILL = "ar_prefill"
     AR_DECODE = "ar_decode"
     GENERATE = "generate"
@@ -40,10 +39,11 @@ class OmniSegmentState(str, Enum):
 @dataclass(frozen=True, slots=True)
 class OmniInterleavedMessage:
     """
-        The deriviation of the message:
-           OmniRequest.messages -> OmniInterleavedMessage -> OmniSRTPreparedInput
+    The deriviation of the message:
+       OmniRequest.messages -> OmniInterleavedMessage -> OmniSRTPreparedInput
 
     """
+
     type: Literal["text", "image"]
     content: Any
 
@@ -394,9 +394,7 @@ class OmniSessionRuntime:
         policy_metadata["omni_model_state"] = self._copy_omni_model_state(
             record.omni_model_state
         )
-        self._attach_srt_request_overrides(
-            req, srt_request_metadata=policy_metadata
-        )
+        self._attach_srt_request_overrides(req, srt_request_metadata=policy_metadata)
         self._execute_srt_req(record, req, state=OmniSegmentState.AR_DECODE)
         record.srt_ar_decode_request_count += 1
         record.srt_last_ar_decode_request_id = request_id
@@ -516,7 +514,9 @@ class OmniSessionRuntime:
             "condition_path_request_count": record.condition_path_request_count,
             "condition_path_session_ids": sorted(record.condition_path_session_ids),
             "condition_path_omni_model_state": {
-                session_id: self._copy_omni_model_state(condition_path_record.omni_model_state)
+                session_id: self._copy_omni_model_state(
+                    condition_path_record.omni_model_state
+                )
                 for session_id, condition_path_record in sorted(
                     record.condition_path_records.items()
                 )
@@ -934,9 +934,7 @@ class OmniSessionRuntime:
         policy_metadata["omni_model_state"] = self._copy_omni_model_state(
             record.omni_model_state
         )
-        self._attach_srt_request_overrides(
-            req, srt_request_metadata=policy_metadata
-        )
+        self._attach_srt_request_overrides(req, srt_request_metadata=policy_metadata)
         self._execute_srt_req(record, req, state=OmniSegmentState.AR_DECODE)
         record.srt_ar_decode_request_count += 1
         record.srt_last_ar_decode_request_id = request_id
@@ -1043,9 +1041,8 @@ class OmniSessionRuntime:
             )
             record.srt_executed_request_count += 1
 
-        if (
-            self.srt_request_executor is None
-            or getattr(self.srt_request_executor, "finish_request_after_execute", True)
+        if self.srt_request_executor is None or getattr(
+            self.srt_request_executor, "finish_request_after_execute", True
         ):
             req.finished_reason = FINISH_LENGTH(len(req.output_ids))
 

@@ -13,9 +13,15 @@ from sglang.multimodal_gen.configs.sample.sensenova_u1 import (
     SenseNovaU1PixelFlowCFG,
     resolve_sensenova_u1_pixel_flow_cfg,
 )
-from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
+from sglang.multimodal_gen.runtime.managers.component_manager import ComponentUse
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
+from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import (
+    DenoisingStage,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
+    VerificationResult,
+)
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.omni.protocol import ContextOps, TemporaryForwardPrepared
 
@@ -70,15 +76,20 @@ class _SenseNovaU1GenerationContext:
     condition_path_role: str | None = None
 
 
-class SenseNovaU1PixelFlowStage(PipelineStage):
-    """Run U1 pixel-flow generation inside one stage-local execution boundary."""
+class SenseNovaU1PixelFlowStage(DenoisingStage):
+    """Run U1 pixel-flow denoising with SRT-owned transformer state."""
 
     def __init__(self) -> None:
-        super().__init__()
+        # u1 borrows transformer/session state from the colocated srt runtime
+        PipelineStage.__init__(self)
 
-    @property
-    def role_affinity(self):
-        return RoleType.DENOISER
+    def component_uses(
+        self, server_args: ServerArgs, stage_name: str | None = None
+    ) -> list[ComponentUse]:
+        return []
+
+    def verify_input(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
+        return PipelineStage.verify_input(self, batch, server_args)
 
     def forward(
         self,
@@ -86,7 +97,7 @@ class SenseNovaU1PixelFlowStage(PipelineStage):
         server_args: ServerArgs,
     ) -> Req:
         """
-            different from standard multimodal_gen pipeline, omni pipeline may return a Req, carrying some intermediate states
+        different from standard multimodal_gen pipeline, omni pipeline may return a Req, carrying some intermediate states
         """
         context_ops = _require_context_ops(batch)
         model = _require_model(context_ops)
@@ -247,7 +258,6 @@ class SenseNovaU1PixelFlowStage(PipelineStage):
         forward_batch_provider: Any,
         prepared: SenseNovaU1PixelFlowPrepared,
     ) -> Any:
-        import torch
 
         image_prediction = prepared.image_prediction
 
@@ -396,15 +406,17 @@ class SenseNovaU1PixelFlowStage(PipelineStage):
             forward_batch_context,
         )
         try:
+            # important: after each noise step, calls the forward of the **AR** model
             return _predict_pixel_flow_from_srt(
                 model,
                 image_embeds=image_embeds,
                 indexes_image=forward_context.indexes_image,
-                forward_batch=forward_batch,
+                temp_forward_batch=forward_batch,
                 timestep=timestep,
                 z=z,
             )
         finally:
+            # release the temporarilly allocated kv tokens from kv cache
             release = getattr(forward_batch_context, "release", None)
             if callable(release):
                 release()
@@ -602,24 +614,17 @@ def _build_forward_context(
     device: Any,
 ) -> SenseNovaU1PixelFlowForwardContext:
     position_count = int(context.position_count)
-    extend_num_tokens = token_h * token_w
     indexes_image = _build_t2i_image_indexes(
         token_h=token_h,
         token_w=token_w,
         text_len=position_count,
         device=device,
     )
-    # temporary-context attention shape is stable for all denoise steps in one branch
-    cross_attention_custom_mask = torch.ones(
-        extend_num_tokens * (position_count + extend_num_tokens),
-        dtype=torch.bool,
-        device=device,
-    )
+    # srt owns the true kv token count; u1 logical positions collapse image tokens
     prepared = TemporaryForwardPrepared(
         generation_input={
             "packed_seqlens": packed_seqlens,
             "packed_position_ids": indexes_image,
-            "cross_attention_custom_mask": cross_attention_custom_mask,
         },
         srt_session_id=context.session_id,
         condition_path_role=context.condition_path_role,
@@ -848,15 +853,16 @@ def _predict_pixel_flow_from_srt(
     *,
     image_embeds: Any,
     indexes_image: Any,
-    forward_batch: Any,
+    temp_forward_batch: Any,
     timestep: Any,
     z: Any,
 ) -> Any:
     batch_size, image_token_num = image_embeds.shape[:2]
+    # forward with temporary forward batch
     hidden_states = model.language_model.forward_u1_gen_embeds(
         input_embeds=image_embeds.reshape(-1, image_embeds.shape[-1]),
         positions=indexes_image,
-        forward_batch=forward_batch,
+        forward_batch=temp_forward_batch,
     ).view(batch_size, image_token_num, -1)
     x_pred = model.fm_modules["fm_head"](hidden_states).view(
         batch_size,

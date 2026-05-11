@@ -32,6 +32,8 @@ from sglang.srt.omni_session.runtime import (
 )
 from sglang.srt.omni_session.runtime_protocol import (
     OmniContextBundle as SRTOmniContextBundle,
+)
+from sglang.srt.omni_session.runtime_protocol import (
     OmniContextHandle as SRTOmniContextHandle,
 )
 

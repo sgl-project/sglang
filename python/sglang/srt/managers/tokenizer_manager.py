@@ -376,7 +376,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
         # Session
         self.session_futures = {}  # session_id -> asyncio event
-        self.omni_futures = {} # rid (of omni-request) -> asyncio event
+        self.omni_futures = {}  # rid (of omni-request) -> asyncio event
 
         # Subprocess liveness watchdog — set by Engine or http_server after construction
         self._subprocess_watchdog = None

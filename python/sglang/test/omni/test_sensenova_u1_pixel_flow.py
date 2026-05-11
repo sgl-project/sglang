@@ -9,6 +9,9 @@ from sglang.multimodal_gen.configs.sample.sensenova_u1 import (
     build_sensenova_u1_sampling_params,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
+from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import (
+    DenoisingStage,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.sensenova_u1.pixel_flow import (
     SenseNovaU1PixelFlowStage,
     _resolve_u1_contexts,
@@ -58,12 +61,13 @@ class TestSenseNovaU1PixelFlow(unittest.TestCase):
         self.assertEqual(7, prepared.seed)
         self.assertEqual((1, 3, 16, 16), tuple(prepared.image_prediction.shape))
         self.assertFalse(prepared.commit_generated_image)
-        mask = prepared.condition.prepared.generation_input[
-            "cross_attention_custom_mask"
-        ]
-        self.assertEqual(torch.bool, mask.dtype)
-        self.assertEqual(16 * (5 + 16), int(mask.numel()))
-        self.assertTrue(bool(mask.all()))
+        self.assertNotIn(
+            "cross_attention_custom_mask",
+            prepared.condition.prepared.generation_input,
+        )
+
+    def test_pixel_flow_stage_uses_denoising_stage_contract(self):
+        self.assertIsInstance(SenseNovaU1PixelFlowStage(), DenoisingStage)
 
     def test_edit_cfg_uses_image_condition_path(self):
         params = build_sensenova_u1_sampling_params(

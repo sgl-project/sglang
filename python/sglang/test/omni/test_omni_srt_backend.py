@@ -11,6 +11,8 @@ from sglang.omni.backends.ar.srt import SRTARBackend
 from sglang.omni.protocol import GeneratedSegment, OmniInputSegment, OmniRequest
 from sglang.srt.omni_session.runtime_protocol import (
     OmniContextBundle as SRTOmniContextBundle,
+)
+from sglang.srt.omni_session.runtime_protocol import (
     OmniContextHandle,
     OmniSessionHandle,
 )

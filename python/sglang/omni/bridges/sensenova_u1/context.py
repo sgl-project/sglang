@@ -138,22 +138,24 @@ def build_u1_native_vlm_prepared_input(
         input_text=prompt,
         messages=list(messages),
         mm_inputs=mm_inputs,
-        policy_metadata=_u1_policy_metadata({
-            "u1": {
-                "segment_type": "vlm",
-                "source": "native_vlm_input",
-                "image_grid_hw": _u1_grid_hw_metadata(grid_hw),
-                "image_offsets": list(image_offsets),
-            },
-            "omni_model_state_updates": {
+        policy_metadata=_u1_policy_metadata(
+            {
                 "u1": {
-                    "last_segment_type": "vlm",
-                    "last_source": "native_vlm_input",
-                    "native_vlm_prompt": True,
-                    "session_id": _u1_session_id(session),
-                }
-            },
-        }),
+                    "segment_type": "vlm",
+                    "source": "native_vlm_input",
+                    "image_grid_hw": _u1_grid_hw_metadata(grid_hw),
+                    "image_offsets": list(image_offsets),
+                },
+                "omni_model_state_updates": {
+                    "u1": {
+                        "last_segment_type": "vlm",
+                        "last_source": "native_vlm_input",
+                        "native_vlm_prompt": True,
+                        "session_id": _u1_session_id(session),
+                    }
+                },
+            }
+        ),
     )
 
 
@@ -238,23 +240,25 @@ def build_u1_native_interleave_text_uncondition_marker_prepared_input(
             session,
             U1_INTERLEAVE_TEXT_UNCONDITION_ROLE,
         ),
-        policy_metadata=_u1_policy_metadata({
-            "u1": {
-                "segment_type": "interleave_text_uncondition_image_marker",
-                "source": "native_interleave_text_uncondition_image_marker",
-                "generation_position_start": next_position,
-            },
-            "omni_model_state_updates": {
+        policy_metadata=_u1_policy_metadata(
+            {
                 "u1": {
-                    "last_segment_type": "interleave_text_uncondition",
-                    "last_source": "native_interleave_text_uncondition_image_marker",
-                    "native_interleave_text_uncondition_prompt": True,
-                    "open_image_marker": True,
+                    "segment_type": "interleave_text_uncondition_image_marker",
+                    "source": "native_interleave_text_uncondition_image_marker",
                     "generation_position_start": next_position,
-                    "session_id": _u1_session_id(session),
-                }
-            },
-        }),
+                },
+                "omni_model_state_updates": {
+                    "u1": {
+                        "last_segment_type": "interleave_text_uncondition",
+                        "last_source": "native_interleave_text_uncondition_image_marker",
+                        "native_interleave_text_uncondition_prompt": True,
+                        "open_image_marker": True,
+                        "generation_position_start": next_position,
+                        "session_id": _u1_session_id(session),
+                    }
+                },
+            }
+        ),
     )
 
 
@@ -373,22 +377,24 @@ def build_u1_native_t2i_prepared_input(
         input_ids=input_ids,
         input_text=prompt,
         messages=list(messages),
-        policy_metadata=_u1_policy_metadata({
-            "u1": {
-                "segment_type": "t2i",
-                "source": "native_t2i_prompt",
-                "prompt_ends_with_image_marker": input_ids[-1] == img_start_id,
-            },
-            "omni_model_state_updates": {
+        policy_metadata=_u1_policy_metadata(
+            {
                 "u1": {
-                    "last_segment_type": "t2i",
-                    "last_source": "native_t2i_prompt",
-                    "native_t2i_prompt": True,
-                    "open_image_marker": input_ids[-1] == img_start_id,
-                    "session_id": _u1_session_id(session),
-                }
-            },
-        }),
+                    "segment_type": "t2i",
+                    "source": "native_t2i_prompt",
+                    "prompt_ends_with_image_marker": input_ids[-1] == img_start_id,
+                },
+                "omni_model_state_updates": {
+                    "u1": {
+                        "last_segment_type": "t2i",
+                        "last_source": "native_t2i_prompt",
+                        "native_t2i_prompt": True,
+                        "open_image_marker": input_ids[-1] == img_start_id,
+                        "session_id": _u1_session_id(session),
+                    }
+                },
+            }
+        ),
     )
 
 
@@ -444,24 +450,26 @@ def build_u1_native_edit_prepared_input(
         input_text=prompt,
         messages=list(messages),
         mm_inputs=mm_inputs,
-        policy_metadata=_u1_policy_metadata({
-            "u1": {
-                "segment_type": "edit",
-                "source": "native_edit_prompt",
-                "image_grid_hw": _u1_grid_hw_metadata(grid_hw),
-                "image_offsets": image_offsets,
-                "generation_position_start": generation_position_start,
-            },
-            "omni_model_state_updates": {
+        policy_metadata=_u1_policy_metadata(
+            {
                 "u1": {
-                    "last_segment_type": "edit",
-                    "last_source": "native_edit_prompt",
-                    "native_edit_prompt": True,
+                    "segment_type": "edit",
+                    "source": "native_edit_prompt",
+                    "image_grid_hw": _u1_grid_hw_metadata(grid_hw),
+                    "image_offsets": image_offsets,
                     "generation_position_start": generation_position_start,
-                    "session_id": _u1_session_id(session),
-                }
-            },
-        }),
+                },
+                "omni_model_state_updates": {
+                    "u1": {
+                        "last_segment_type": "edit",
+                        "last_source": "native_edit_prompt",
+                        "native_edit_prompt": True,
+                        "generation_position_start": generation_position_start,
+                        "session_id": _u1_session_id(session),
+                    }
+                },
+            }
+        ),
     )
 
 
@@ -561,15 +569,17 @@ def _build_u1_native_image_condition_path_prepared_input(
         mm_inputs=mm_inputs,
         condition_path_role=role,
         condition_path_session_id=_u1_condition_path_session_id(session, role),
-        policy_metadata=_u1_policy_metadata({
-            "u1": {
-                "segment_type": segment_type,
-                "source": source,
-                "image_grid_hw": _u1_grid_hw_metadata(grid_hw),
-                "image_offsets": image_offsets,
-                "generation_position_start": generation_position_start,
+        policy_metadata=_u1_policy_metadata(
+            {
+                "u1": {
+                    "segment_type": segment_type,
+                    "source": source,
+                    "image_grid_hw": _u1_grid_hw_metadata(grid_hw),
+                    "image_offsets": image_offsets,
+                    "generation_position_start": generation_position_start,
+                }
             }
-        }),
+        ),
     )
 
 
@@ -726,13 +736,15 @@ def _build_u1_native_marker_condition_path_prepared_input(
         messages=[OmniInterleavedMessage(type="text", content="")],
         condition_path_role=role,
         condition_path_session_id=_u1_condition_path_session_id(session, role),
-        policy_metadata=_u1_policy_metadata({
-            "u1": {
-                "segment_type": segment_type,
-                "source": source,
-                "prompt_ends_with_image_marker": True,
+        policy_metadata=_u1_policy_metadata(
+            {
+                "u1": {
+                    "segment_type": segment_type,
+                    "source": source,
+                    "prompt_ends_with_image_marker": True,
+                }
             }
-        }),
+        ),
     )
 
 

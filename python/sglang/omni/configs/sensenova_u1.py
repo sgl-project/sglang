@@ -11,10 +11,10 @@ from dataclasses import replace
 from typing import TYPE_CHECKING, Any
 
 from sglang.omni.backends.ar.srt import SRTARBackend
-from sglang.omni.coordinator import OmniCoordinator
 from sglang.omni.backends.mm_gen.pipeline_forward_backend import (
     DirectPipelineForwardBackend,
 )
+from sglang.omni.coordinator import OmniCoordinator
 from sglang.omni.protocol import OmniRequest
 
 if TYPE_CHECKING:

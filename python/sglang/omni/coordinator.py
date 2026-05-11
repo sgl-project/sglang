@@ -22,9 +22,7 @@ from sglang.omni.protocol import (
 
 @dataclass(slots=True)
 class OmniCoordinator:
-    """Top-level coordinator for omni generation, coordinate AR and multimodal_generation backends without owning model internals.
-
-    """
+    """Top-level coordinator for omni generation, coordinate AR and multimodal_generation backends without owning model internals."""
 
     ar_backend: ARBackend
     mm_generation_backend: MultimodalGenerationBackend
@@ -59,7 +57,6 @@ class OmniCoordinator:
             context = self.ar_backend.prepare_context(request)
         else:
             context = self.ar_backend.append_input_segments(context, request)
-
 
         segments: list[OmniOutputSegment] = []
         num_text_segments = 0
