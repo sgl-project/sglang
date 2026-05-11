@@ -17,7 +17,7 @@ from sglang.test.test_utils import (
     send_concurrent_generate_requests_with_custom_params,
 )
 
-register_cuda_ci(est_time=130, suite="stage-b-test-1-gpu-small")
+register_cuda_ci(est_time=149, suite="stage-b-test-1-gpu-small")
 register_amd_ci(est_time=195, suite="stage-b-test-1-gpu-small-amd")
 
 
@@ -41,8 +41,6 @@ class TestPriorityScheduling(CustomTestCase):
                 "--max-queued-requests",  # Enforce max queued request number is 3
                 "3",
                 "--enable-priority-scheduling",  # Enable priority scheduling
-                # Disable PCG to avoid padding in flashinfer backend. Ref: https://github.com/sgl-project/sglang/pull/21452
-                "--disable-piecewise-cuda-graph",
             ),
             return_stdout_stderr=(cls.stdout, cls.stderr),
         )
@@ -249,7 +247,6 @@ class TestPrioritySchedulingMultipleRunningRequests(CustomTestCase):
                 "--max-queued-requests",  # Enforce max queued request number is 3
                 "3",
                 "--enable-priority-scheduling",  # Enable priority scheduling
-                "--disable-piecewise-cuda-graph",
             ),
             return_stdout_stderr=(cls.stdout, cls.stderr),
         )

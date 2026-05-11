@@ -253,7 +253,9 @@ SGL_DEVICE void _count_and_sort_expert_tokens(
 
   for (size_t i = tid; i < numel; i += stride) {
     int32_t expert_id = topk_ids[i];
-    if (expert_id >= num_experts) {
+    // Under EP, StandardDispatcher writes -1 for experts not owned by this
+    // rank; must filter the sentinel before indexing cumsum/sorted buffers.
+    if (expert_id < 0 || expert_id >= num_experts) {
       continue;
     }
 

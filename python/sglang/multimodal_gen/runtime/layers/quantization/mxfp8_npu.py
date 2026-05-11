@@ -11,8 +11,14 @@ from __future__ import annotations
 from typing import Any, Dict, List, Optional
 
 import torch
-import torch_npu
 from torch.nn.parameter import Parameter
+
+from sglang.multimodal_gen.runtime.platforms import current_platform
+
+_is_npu = current_platform.is_npu()
+
+if _is_npu:
+    import torch_npu
 
 from sglang.multimodal_gen.runtime.layers.linear import LinearBase, LinearMethodBase
 from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config import (

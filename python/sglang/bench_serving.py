@@ -44,6 +44,7 @@ from sglang.benchmark.utils import (
     remove_prefix,
     set_ulimit,
 )
+from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST
 from sglang.srt.utils.network import NetworkAddress
 
 _ROUTING_KEY_HEADER = "X-SMG-Routing-Key"
@@ -461,10 +462,22 @@ async def async_request_openai_chat_completions(
                                 pass
                             else:
                                 data = json.loads(chunk)
+                                # Check for usage info in final chunks. OpenAI-compatible
+                                # servers may emit usage-only chunks with choices=[].
+                                output_len = (data.get("usage") or {}).get(
+                                    "completion_tokens", output_len
+                                )
 
-                                # Check if this chunk contains content
-                                delta = data.get("choices", [{}])[0].get("delta", {})
-                                content = delta.get("content", "")
+                                choices = data.get("choices") or []
+                                if not choices:
+                                    continue
+
+                                # Reasoning models stream thoughts via
+                                # `reasoning_content`; count them like content.
+                                delta = choices[0].get("delta") or {}
+                                content = (delta.get("reasoning_content") or "") + (
+                                    delta.get("content") or ""
+                                )
 
                                 if content:
                                     timestamp = time.perf_counter()
@@ -482,11 +495,6 @@ async def async_request_openai_chat_completions(
 
                                     most_recent_timestamp = timestamp
                                     generated_text += content
-
-                                # Check for usage info in final chunk
-                                output_len = (data.get("usage") or {}).get(
-                                    "completion_tokens", output_len
-                                )
 
                         output.generated_text = generated_text
                         output.success = True
@@ -1402,7 +1410,7 @@ async def benchmark(
 
     if "sglang" in backend:
         server_info = requests.get(
-            base_url + "/get_server_info", headers=get_auth_headers()
+            base_url + "/server_info", headers=get_auth_headers()
         )
         if server_info.status_code == 200:
             server_info_json = server_info.json()
@@ -1538,7 +1546,7 @@ async def benchmark(
         print("{:<40} {:<10.2f}".format("Max ITL (ms):", metrics.max_itl_ms))
     print("=" * 50)
 
-    resp = requests.get(base_url + "/get_server_info", headers=get_auth_headers())
+    resp = requests.get(base_url + "/server_info", headers=get_auth_headers())
     server_info = resp.json() if resp.status_code == 200 else None
 
     if (
@@ -1708,6 +1716,11 @@ def run_benchmark(args_: argparse.Namespace):
     extra_request_body = {}
     if args.extra_request_body:
         extra_request_body = json.loads(args.extra_request_body)
+
+    # Inject bootstrap fields for fake decode benchmarking
+    if getattr(args, "fake_prefill", False):
+        extra_request_body["bootstrap_host"] = FAKE_BOOTSTRAP_HOST
+        extra_request_body["bootstrap_room"] = 0
 
     if args.tokenize_prompt:
         assert (
@@ -1931,6 +1944,7 @@ if __name__ == "__main__":
         type=str,
         default="sharegpt",
         choices=[
+            "autobench",
             "sharegpt",
             "custom",
             "openai",
@@ -2337,6 +2351,14 @@ if __name__ == "__main__":
             "toolagent",
         ],
         help="Underlying workload for the mooncake dataset.",
+    )
+    parser.add_argument(
+        "--fake-prefill",
+        action="store_true",
+        default=False,
+        help="Enable fake prefill mode for decode-only benchmarking. "
+        "Use with a decode server running --disaggregation-transfer-backend fake "
+        "to benchmark pure decode performance without a real prefill node.",
     )
     parser.add_argument(
         "--tag", type=str, default=None, help="The tag to be dumped to output."

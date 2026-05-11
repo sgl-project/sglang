@@ -10,7 +10,7 @@ import triton.language as tl
 from tqdm import tqdm
 from transformers import AutoConfig
 
-from sglang.srt.layers.moe.fused_moe_triton.fused_moe import (
+from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import (
     fused_moe,
     get_config_file_name,
 )
