@@ -124,7 +124,7 @@ class TestDummyWithSBO(CustomTestCase):
             "deepep",
             "--deepep-mode",
             "low_latency",
-            "--deepep-dispather-output-dtype",
+            "--deepep-dispatcher-output-dtype",
             "bf16",
             "--json-model-override-args",
             '{"num_hidden_layers": 1, "first_k_dense_replace": 0, "n_routed_experts": 24}',
