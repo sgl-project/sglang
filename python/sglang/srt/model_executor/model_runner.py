@@ -30,6 +30,10 @@ import torch
 import torch.distributed as dist
 
 from sglang.srt.configs.device_config import DeviceConfig
+from sglang.srt.configs.hybrid_arch import (
+    hybrid_gdn_config,
+    mambaish_config,
+)
 from sglang.srt.configs.load_config import LoadConfig, LoadFormat
 from sglang.srt.configs.model_config import (
     AttentionArch,
@@ -80,6 +84,7 @@ from sglang.srt.layers.attention.attention_registry import (
 )
 from sglang.srt.layers.attention.nsa.utils import is_nsa_enable_prefill_cp
 from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
+from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.model_parallel import apply_torch_tp
 from sglang.srt.layers.n_gram_embedding_manager import NgramEmbeddingManager
@@ -93,6 +98,9 @@ from sglang.srt.lora.lora_manager import (
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.managers.schedule_batch import sanity_check_mm_pad_shift_value
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
+from sglang.srt.mem_cache.kv_cache_configurator import (
+    KVCacheConfigurator,
+)
 from sglang.srt.mem_cache.kv_cache_dtype import configure_kv_cache_dtype
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.model_executor.forward_batch_info import (
@@ -528,6 +536,38 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             device=self.device,
         )
 
+    def init_kv_cache_configurator(self):
+        self.kv_cache_configurator = KVCacheConfigurator(
+            device=self.device,
+            gpu_id=self.gpu_id,
+            mem_fraction_static=self.mem_fraction_static,
+            page_size=self.page_size,
+            tp_rank=self.tp_rank,
+            tp_size=self.tp_size,
+            pp_size=self.pp_size,
+            dp_size=self.dp_size,
+            attention_tp_size=get_attention_tp_size(),
+            model_config=self.model_config,
+            server_args=self.server_args,
+            dtype=self.dtype,
+            kv_cache_dtype=self.kv_cache_dtype,
+            spec_algorithm=self.spec_algorithm,
+            is_draft_worker=self.is_draft_worker,
+            dflash_draft_num_layers=self.dflash_draft_num_layers,
+            is_hybrid_swa=self.is_hybrid_swa,
+            is_hybrid_swa_compress=self.is_hybrid_swa_compress,
+            use_mla_backend=self.use_mla_backend,
+            enable_hisparse=self.enable_hisparse,
+            mambaish_config=mambaish_config(self.model_config),
+            hybrid_gdn_config=hybrid_gdn_config(self.model_config),
+            start_layer=self.start_layer,
+            end_layer=self.end_layer,
+            num_effective_layers=self.num_effective_layers,
+            req_to_token_pool=self.req_to_token_pool,
+            token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+            memory_pool_config=self.memory_pool_config,
+        )
+
     def _build_model_config(
         self, server_args, model_path=None, model_revision=None, is_draft_model=False
     ):
@@ -715,6 +755,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         )
 
         # Init memory pool and attention backends
+        self.init_kv_cache_configurator()
         self.init_memory_pool(pre_model_load_memory)
 
         # Init ngram embedding token table
