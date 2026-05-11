@@ -641,36 +641,14 @@ class SchedulerBatchResultProcessor:
             self._handle_finished_req(req, i, logits_output)
 
             if req.return_logprob:
-                # Spec v1 handles logprobs inside its own worker.
-                # Normalize: non-spec has 1 token, spec v2 has multiple.
-                if batch.is_spec_v2:
-                    accepted_logprobs = next_token_logprobs[i]
-                    accepted_ids = next_token_id
-                    max_accept = len(accepted_logprobs)
-                else:
-                    accepted_logprobs = [next_token_logprobs[i]]
-                    accepted_ids = [next_token_id]
-                    max_accept = 1
-
-                for j, tok_id in enumerate(accepted_ids):
-                    req.output_token_logprobs_val.append(accepted_logprobs[j])
-                    req.output_token_logprobs_idx.append(tok_id)
-                    if req.top_logprobs_num > 0:
-                        flat_idx = i * max_accept + j
-                        req.output_top_logprobs_val.append(
-                            logits_output.next_token_top_logprobs_val[flat_idx]
-                        )
-                        req.output_top_logprobs_idx.append(
-                            logits_output.next_token_top_logprobs_idx[flat_idx]
-                        )
-                    if req.token_ids_logprob is not None:
-                        flat_idx = i * max_accept + j
-                        req.output_token_ids_logprobs_val.append(
-                            logits_output.next_token_token_ids_logprobs_val[flat_idx]
-                        )
-                        req.output_token_ids_logprobs_idx.append(
-                            logits_output.next_token_token_ids_logprobs_idx[flat_idx]
-                        )
+                self._apply_decode_logprobs(
+                    req=req,
+                    i=i,
+                    batch=batch,
+                    next_token_id=next_token_id,
+                    next_token_logprobs=next_token_logprobs,
+                    logits_output=logits_output,
+                )
 
             if req.return_hidden_states and logits_output.hidden_states is not None:
                 req.hidden_states.append(
@@ -707,6 +685,47 @@ class SchedulerBatchResultProcessor:
             running_batch=batch,
             num_correct_drafts=result.num_correct_drafts,
         )
+
+    def _apply_decode_logprobs(
+        self,
+        *,
+        req: Req,
+        i: int,
+        batch: ScheduleBatch,
+        next_token_id: Union[int, List[int]],
+        next_token_logprobs: list,
+        logits_output: LogitsProcessorOutput,
+    ) -> None:
+        # Spec v1 handles logprobs inside its own worker.
+        # Normalize: non-spec has 1 token, spec v2 has multiple.
+        if batch.is_spec_v2:
+            accepted_logprobs = next_token_logprobs[i]
+            accepted_ids = next_token_id
+            max_accept = len(accepted_logprobs)
+        else:
+            accepted_logprobs = [next_token_logprobs[i]]
+            accepted_ids = [next_token_id]
+            max_accept = 1
+
+        for j, tok_id in enumerate(accepted_ids):
+            req.output_token_logprobs_val.append(accepted_logprobs[j])
+            req.output_token_logprobs_idx.append(tok_id)
+            if req.top_logprobs_num > 0:
+                flat_idx = i * max_accept + j
+                req.output_top_logprobs_val.append(
+                    logits_output.next_token_top_logprobs_val[flat_idx]
+                )
+                req.output_top_logprobs_idx.append(
+                    logits_output.next_token_top_logprobs_idx[flat_idx]
+                )
+            if req.token_ids_logprob is not None:
+                flat_idx = i * max_accept + j
+                req.output_token_ids_logprobs_val.append(
+                    logits_output.next_token_token_ids_logprobs_val[flat_idx]
+                )
+                req.output_token_ids_logprobs_idx.append(
+                    logits_output.next_token_token_ids_logprobs_idx[flat_idx]
+                )
 
     def _handle_finished_req(
         self,
