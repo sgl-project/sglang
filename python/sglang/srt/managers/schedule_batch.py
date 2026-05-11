@@ -1988,7 +1988,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         # Collect mamba init info for deferred ops on forward stream
         if any(req.mamba_pool_idx is not None for req in reqs):
-            self._collect_mamba_init_info(reqs)
+            self._collect_deferred_mamba_cow_and_clear(reqs)
 
         if self.model_config.is_encoder_decoder:
             self.prepare_encoder_info_extend(input_ids, seq_lens)
@@ -2079,7 +2079,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             req.mamba_last_track_seqlen = mamba_track_seqlen_aligned
         mamba_track_seqlens_cpu.append(mamba_track_seqlen)
 
-    def _collect_mamba_init_info(self, reqs):
+    def _collect_deferred_mamba_cow_and_clear(self, reqs):
         """Collect deferred COW/clear info from requests."""
         cow_src_tensors = []
         cow_dst_tensors = []
