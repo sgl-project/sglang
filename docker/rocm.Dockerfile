@@ -31,7 +31,7 @@ ENV BUILD_TRITON="0"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
-ENV AITER_COMMIT_DEFAULT="a6bb499375849eec45d68c5ccaebc8865fd422c0"
+ENV AITER_COMMIT_DEFAULT="446260d19a95a26fcff5d2856b71c066f3b771f1"
 
 # ===============================
 # Base image 942 with rocm720 and args
@@ -41,7 +41,7 @@ ENV BUILD_TRITON="1"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
-ENV AITER_COMMIT_DEFAULT="a6bb499375849eec45d68c5ccaebc8865fd422c0"
+ENV AITER_COMMIT_DEFAULT="446260d19a95a26fcff5d2856b71c066f3b771f1"
 
 # ===============================
 # Base image 950 and args
@@ -51,7 +51,7 @@ ENV BUILD_TRITON="0"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
-ENV AITER_COMMIT_DEFAULT="a6bb499375849eec45d68c5ccaebc8865fd422c0"
+ENV AITER_COMMIT_DEFAULT="446260d19a95a26fcff5d2856b71c066f3b771f1"
 
 # ===============================
 # Base image 950 with rocm720 and args
@@ -61,7 +61,7 @@ ENV BUILD_TRITON="1"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
-ENV AITER_COMMIT_DEFAULT="a6bb499375849eec45d68c5ccaebc8865fd422c0"
+ENV AITER_COMMIT_DEFAULT="446260d19a95a26fcff5d2856b71c066f3b771f1"
 
 # ===============================
 # Chosen arch and args
@@ -200,16 +200,11 @@ RUN if [ "$BUILD_LLVM" = "1" ]; then \
 # (SETUPTOOLS_SCM_PRETEND_VERSION is set later for SGLang nightly builds and would otherwise
 # leak into AITER's version when AITER uses setuptools_scm)
 
-# cherry pick:
-#   - b639cb6: aiter_mhc_pre fix
-#   - 0141c8c: dsv4 rope/rotate_activation fused kernel (PR #3035)
-# may be removed in next aiter upgrade
 ENV SETUPTOOLS_SCM_PRETEND_VERSION=
 RUN pip uninstall -y aiter
 RUN git clone ${AITER_REPO} \
  && cd aiter \
  && git checkout ${AITER_COMMIT} \
- && git cherry-pick --no-commit b639cb63bcac4672dce33a731fad042a65cb3649 0141c8cf8eb894d194685d47a79ac3b4bb9ce406 \
  && git submodule update --init --recursive \
  && pip install -r requirements.txt
 
