@@ -13,6 +13,29 @@ from sglang.srt.observability.trace import extract_trace_headers
 
 
 @dataclasses.dataclass(slots=True)
+class ReqLogprobsState:
+    input_token_logprobs_val: List[float] = dataclasses.field(default_factory=list)
+    input_token_logprobs_idx: List[int] = dataclasses.field(default_factory=list)
+    output_token_logprobs_val: List[float] = dataclasses.field(default_factory=list)
+    output_token_logprobs_idx: List[int] = dataclasses.field(default_factory=list)
+    input_top_logprobs_val: List[List[float]] = dataclasses.field(default_factory=list)
+    input_top_logprobs_idx: List[List[int]] = dataclasses.field(default_factory=list)
+    output_top_logprobs_val: List[List[float]] = dataclasses.field(default_factory=list)
+    output_top_logprobs_idx: List[List[int]] = dataclasses.field(default_factory=list)
+    input_token_ids_logprobs_val: List = dataclasses.field(default_factory=list)
+    input_token_ids_logprobs_idx: List = dataclasses.field(default_factory=list)
+    output_token_ids_logprobs_val: List = dataclasses.field(default_factory=list)
+    output_token_ids_logprobs_idx: List = dataclasses.field(default_factory=list)
+
+    input_token_logprobs: List[Any] = dataclasses.field(default_factory=list)
+    output_token_logprobs: List[Any] = dataclasses.field(default_factory=list)
+    input_top_logprobs: List[Any] = dataclasses.field(default_factory=list)
+    output_top_logprobs: List[Any] = dataclasses.field(default_factory=list)
+    input_token_ids_logprobs: List[Any] = dataclasses.field(default_factory=list)
+    output_token_ids_logprobs: List[Any] = dataclasses.field(default_factory=list)
+
+
+@dataclasses.dataclass
 class ReqState:
     """Store the state a request."""
 
@@ -55,26 +78,8 @@ class ReqState:
     # For incremental state update.
     # TODO(lianmin): do not initialize some lists if not needed.
     output_ids: List[int] = dataclasses.field(default_factory=list)
-    input_token_logprobs_val: List[float] = dataclasses.field(default_factory=list)
-    input_token_logprobs_idx: List[int] = dataclasses.field(default_factory=list)
-    output_token_logprobs_val: List[float] = dataclasses.field(default_factory=list)
-    output_token_logprobs_idx: List[int] = dataclasses.field(default_factory=list)
-    input_top_logprobs_val: List[List[float]] = dataclasses.field(default_factory=list)
-    input_top_logprobs_idx: List[List[int]] = dataclasses.field(default_factory=list)
-    output_top_logprobs_val: List[List[float]] = dataclasses.field(default_factory=list)
-    output_top_logprobs_idx: List[List[int]] = dataclasses.field(default_factory=list)
-    input_token_ids_logprobs_val: List = dataclasses.field(default_factory=list)
-    input_token_ids_logprobs_idx: List = dataclasses.field(default_factory=list)
-    output_token_ids_logprobs_val: List = dataclasses.field(default_factory=list)
-    output_token_ids_logprobs_idx: List = dataclasses.field(default_factory=list)
 
-    # For detokenized logprobs
-    input_token_logprobs: List[Any] = dataclasses.field(default_factory=list)
-    output_token_logprobs: List[Any] = dataclasses.field(default_factory=list)
-    input_top_logprobs: List[Any] = dataclasses.field(default_factory=list)
-    output_top_logprobs: List[Any] = dataclasses.field(default_factory=list)
-    input_token_ids_logprobs: List[Any] = dataclasses.field(default_factory=list)
-    output_token_ids_logprobs: List[Any] = dataclasses.field(default_factory=list)
+    logprobs: ReqLogprobsState = dataclasses.field(default_factory=ReqLogprobsState)
 
 
 def init_req(

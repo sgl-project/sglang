@@ -31,89 +31,117 @@ def fill_meta_info(
     tokenizer: Optional[Any],
 ) -> None:
     # 1. Handle regular logprobs
-    if len(state.input_token_logprobs_val) > len(state.input_token_logprobs):
-        state.input_token_logprobs.extend(
+    if len(state.logprobs.input_token_logprobs_val) > len(
+        state.logprobs.input_token_logprobs
+    ):
+        state.logprobs.input_token_logprobs.extend(
             _detokenize_logprob_tokens(
-                state.input_token_logprobs_val[len(state.input_token_logprobs) :],
-                state.input_token_logprobs_idx[len(state.input_token_logprobs) :],
+                state.logprobs.input_token_logprobs_val[
+                    len(state.logprobs.input_token_logprobs) :
+                ],
+                state.logprobs.input_token_logprobs_idx[
+                    len(state.logprobs.input_token_logprobs) :
+                ],
                 decode_to_text=return_text_in_logprobs,
                 tokenizer=tokenizer,
             )
         )
 
-    if len(state.output_token_logprobs_val) > len(state.output_token_logprobs):
-        state.output_token_logprobs.extend(
+    if len(state.logprobs.output_token_logprobs_val) > len(
+        state.logprobs.output_token_logprobs
+    ):
+        state.logprobs.output_token_logprobs.extend(
             _detokenize_logprob_tokens(
-                state.output_token_logprobs_val[len(state.output_token_logprobs) :],
-                state.output_token_logprobs_idx[len(state.output_token_logprobs) :],
+                state.logprobs.output_token_logprobs_val[
+                    len(state.logprobs.output_token_logprobs) :
+                ],
+                state.logprobs.output_token_logprobs_idx[
+                    len(state.logprobs.output_token_logprobs) :
+                ],
                 decode_to_text=return_text_in_logprobs,
                 tokenizer=tokenizer,
             )
         )
 
-    meta_info["input_token_logprobs"] = state.input_token_logprobs
-    meta_info["output_token_logprobs"] = state.output_token_logprobs
-    meta_info["output_token_logprobs_length"] = len(state.output_token_logprobs)
+    meta_info["input_token_logprobs"] = state.logprobs.input_token_logprobs
+    meta_info["output_token_logprobs"] = state.logprobs.output_token_logprobs
+    meta_info["output_token_logprobs_length"] = len(
+        state.logprobs.output_token_logprobs
+    )
 
     # 2. Handle top logprobs
     if top_logprobs_num > 0:
-        if len(state.input_top_logprobs_val) > len(state.input_top_logprobs):
-            state.input_top_logprobs.extend(
+        if len(state.logprobs.input_top_logprobs_val) > len(
+            state.logprobs.input_top_logprobs
+        ):
+            state.logprobs.input_top_logprobs.extend(
                 _detokenize_top_logprobs_tokens(
-                    state.input_top_logprobs_val[len(state.input_top_logprobs) :],
-                    state.input_top_logprobs_idx[len(state.input_top_logprobs) :],
+                    state.logprobs.input_top_logprobs_val[
+                        len(state.logprobs.input_top_logprobs) :
+                    ],
+                    state.logprobs.input_top_logprobs_idx[
+                        len(state.logprobs.input_top_logprobs) :
+                    ],
                     decode_to_text=return_text_in_logprobs,
                     tokenizer=tokenizer,
                 )
             )
-        if len(state.output_top_logprobs_val) > len(state.output_top_logprobs):
-            state.output_top_logprobs.extend(
+        if len(state.logprobs.output_top_logprobs_val) > len(
+            state.logprobs.output_top_logprobs
+        ):
+            state.logprobs.output_top_logprobs.extend(
                 _detokenize_top_logprobs_tokens(
-                    state.output_top_logprobs_val[len(state.output_top_logprobs) :],
-                    state.output_top_logprobs_idx[len(state.output_top_logprobs) :],
+                    state.logprobs.output_top_logprobs_val[
+                        len(state.logprobs.output_top_logprobs) :
+                    ],
+                    state.logprobs.output_top_logprobs_idx[
+                        len(state.logprobs.output_top_logprobs) :
+                    ],
                     decode_to_text=return_text_in_logprobs,
                     tokenizer=tokenizer,
                 )
             )
 
-        meta_info["input_top_logprobs"] = state.input_top_logprobs
-        meta_info["output_top_logprobs"] = state.output_top_logprobs
+        meta_info["input_top_logprobs"] = state.logprobs.input_top_logprobs
+        meta_info["output_top_logprobs"] = state.logprobs.output_top_logprobs
 
     # 3. Handle token_ids_logprob
     if token_ids_logprob is not None:
-        if len(state.input_token_ids_logprobs_val) > len(
-            state.input_token_ids_logprobs
+        if len(state.logprobs.input_token_ids_logprobs_val) > len(
+            state.logprobs.input_token_ids_logprobs
         ):
-            state.input_token_ids_logprobs.extend(
+            state.logprobs.input_token_ids_logprobs.extend(
                 _detokenize_top_logprobs_tokens(
-                    state.input_token_ids_logprobs_val[
-                        len(state.input_token_ids_logprobs) :
+                    state.logprobs.input_token_ids_logprobs_val[
+                        len(state.logprobs.input_token_ids_logprobs) :
                     ],
-                    state.input_token_ids_logprobs_idx[
-                        len(state.input_token_ids_logprobs) :
+                    state.logprobs.input_token_ids_logprobs_idx[
+                        len(state.logprobs.input_token_ids_logprobs) :
                     ],
                     decode_to_text=return_text_in_logprobs,
                     tokenizer=tokenizer,
                 )
             )
-        if len(state.output_token_ids_logprobs_val) > len(
-            state.output_token_ids_logprobs
+        if len(state.logprobs.output_token_ids_logprobs_val) > len(
+            state.logprobs.output_token_ids_logprobs
         ):
-            state.output_token_ids_logprobs.extend(
+            state.logprobs.output_token_ids_logprobs.extend(
                 _detokenize_top_logprobs_tokens(
-                    state.output_token_ids_logprobs_val[
-                        len(state.output_token_ids_logprobs) :
+                    state.logprobs.output_token_ids_logprobs_val[
+                        len(state.logprobs.output_token_ids_logprobs) :
                     ],
-                    state.output_token_ids_logprobs_idx[
-                        len(state.output_token_ids_logprobs) :
+                    state.logprobs.output_token_ids_logprobs_idx[
+                        len(state.logprobs.output_token_ids_logprobs) :
                     ],
                     decode_to_text=return_text_in_logprobs,
                     tokenizer=tokenizer,
                 )
             )
 
-        meta_info["input_token_ids_logprobs"] = state.input_token_ids_logprobs
-        meta_info["output_token_ids_logprobs"] = state.output_token_ids_logprobs
+        meta_info["input_token_ids_logprobs"] = state.logprobs.input_token_ids_logprobs
+        meta_info["output_token_ids_logprobs"] = (
+            state.logprobs.output_token_ids_logprobs
+        )
 
 
 def absorb_recv(
@@ -134,46 +162,46 @@ def absorb_recv(
         len(recv_obj.input_token_logprobs_val) > 0
         and recv_obj.input_token_logprobs_val[recv_obj_index] is not None
     ):
-        state.input_token_logprobs_val.extend(
+        state.logprobs.input_token_logprobs_val.extend(
             recv_obj.input_token_logprobs_val[recv_obj_index]
         )
-        state.input_token_logprobs_idx.extend(
+        state.logprobs.input_token_logprobs_idx.extend(
             recv_obj.input_token_logprobs_idx[recv_obj_index]
         )
-    state.output_token_logprobs_val.extend(
+    state.logprobs.output_token_logprobs_val.extend(
         recv_obj.output_token_logprobs_val[recv_obj_index]
     )
-    state.output_token_logprobs_idx.extend(
+    state.logprobs.output_token_logprobs_idx.extend(
         recv_obj.output_token_logprobs_idx[recv_obj_index]
     )
 
     if top_logprobs_num > 0:
         if len(recv_obj.input_top_logprobs_val) > 0:
-            state.input_top_logprobs_val.extend(
+            state.logprobs.input_top_logprobs_val.extend(
                 recv_obj.input_top_logprobs_val[recv_obj_index]
             )
-            state.input_top_logprobs_idx.extend(
+            state.logprobs.input_top_logprobs_idx.extend(
                 recv_obj.input_top_logprobs_idx[recv_obj_index]
             )
-        state.output_top_logprobs_val.extend(
+        state.logprobs.output_top_logprobs_val.extend(
             recv_obj.output_top_logprobs_val[recv_obj_index]
         )
-        state.output_top_logprobs_idx.extend(
+        state.logprobs.output_top_logprobs_idx.extend(
             recv_obj.output_top_logprobs_idx[recv_obj_index]
         )
 
     if token_ids_logprob is not None:
         if len(recv_obj.input_token_ids_logprobs_val) > 0:
-            state.input_token_ids_logprobs_val.extend(
+            state.logprobs.input_token_ids_logprobs_val.extend(
                 recv_obj.input_token_ids_logprobs_val[recv_obj_index]
             )
-            state.input_token_ids_logprobs_idx.extend(
+            state.logprobs.input_token_ids_logprobs_idx.extend(
                 recv_obj.input_token_ids_logprobs_idx[recv_obj_index]
             )
-        state.output_token_ids_logprobs_val.extend(
+        state.logprobs.output_token_ids_logprobs_val.extend(
             recv_obj.output_token_ids_logprobs_val[recv_obj_index]
         )
-        state.output_token_ids_logprobs_idx.extend(
+        state.logprobs.output_token_ids_logprobs_idx.extend(
             recv_obj.output_token_ids_logprobs_idx[recv_obj_index]
         )
 
