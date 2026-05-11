@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from enum import IntEnum
 from typing import TYPE_CHECKING, List, Optional
@@ -15,6 +16,8 @@ from sglang.srt.layers.activation import get_cross_encoder_activation_function
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+
+logger = logging.getLogger(__name__)
 
 
 class PoolingType(IntEnum):
@@ -170,7 +173,23 @@ class Pooler(nn.Module):
     def __init__(self, pooling_type: PoolingType, normalize: bool):
         super().__init__()
         self.pooling_type = pooling_type
-        self.normalize = normalize
+        self.normalize = self._resolve_normalize(normalize)
+
+    @staticmethod
+    def _resolve_normalize(model_default: bool) -> bool:
+        from sglang.srt.server_args import get_global_server_args
+
+        try:
+            override = get_global_server_args().pooler_should_normalize
+        except ValueError:
+            return model_default
+        if override is None or override == model_default:
+            return model_default
+        logger.info(
+            f"Pooler normalize override active: model default={model_default}, "
+            f"using={override} (--pooler-should-normalize {str(override).lower()})"
+        )
+        return override
 
     def forward(
         self, hidden_states: torch.Tensor, forward_batch: ForwardBatch
