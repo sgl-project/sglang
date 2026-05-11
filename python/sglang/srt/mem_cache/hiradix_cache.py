@@ -74,11 +74,11 @@ def compute_model_identity_hash(server_args: ServerArgs) -> str:
     served_model_name.
     """
     identity_parts = [
-        server_args.model_path or "",
+        os.path.normpath(server_args.model_path) if server_args.model_path else "",
         server_args.revision or "",
-        server_args.dtype or "",
+        (server_args.dtype or "auto").lower(),
         server_args.quantization or "",
-        server_args.kv_cache_dtype or "",
+        (server_args.kv_cache_dtype or "auto").lower(),
     ]
     identity_str = "|".join(identity_parts)
     return hashlib.sha256(identity_str.encode()).hexdigest()[:16]

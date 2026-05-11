@@ -62,6 +62,7 @@ class HiCacheNixl(HiCacheStorage):
             storage_config.tp_size,
             storage_config.model_name,
         )
+        pp_rank, pp_size = storage_config.pp_rank, storage_config.pp_size
 
         self.is_mla_model = storage_config.is_mla_model
         identity_hash = storage_config.model_identity_hash or ""
@@ -74,6 +75,8 @@ class HiCacheNixl(HiCacheStorage):
             self.config_suffix = f"_{model_name}_{tp_rank}_{tp_size}"
         if identity_hash:
             self.config_suffix += f"_{identity_hash}"
+        if pp_size > 1:
+            self.config_suffix += f"_{pp_size}_{pp_rank}"
 
         agent_config = nixl_agent_config(backends=[])
         self.agent_name = f"hicache_nixl_{str(uuid.uuid4())}"
