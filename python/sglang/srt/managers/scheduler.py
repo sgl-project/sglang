@@ -451,6 +451,29 @@ class Scheduler(
         # Init cache and memory pool
         self.init_cache_with_memory_pool()
 
+        if self.enable_hisparse:
+            # Coordinator was created inside ModelRunner.initialize() before CUDA graph capture
+            self.hisparse_coordinator = self.tp_worker.model_runner.hisparse_coordinator
+            self.hisparse_coordinator.set_decode_producer_stream(self.forward_stream)
+
+        if (
+            self.server_args.disaggregation_mode == "decode"
+            and self.server_args.disaggregation_decode_enable_offload_kvcache
+        ):
+            self.decode_offload_manager = DecodeKVCacheOffloadManager(
+                req_to_token_pool=self.req_to_token_pool,
+                token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+                tp_group=(
+                    self.attn_tp_cpu_group
+                    if self.server_args.enable_dp_attention
+                    else self.tp_cpu_group
+                ),
+                tree_cache=self.tree_cache,
+                server_args=self.server_args,
+            )
+        else:
+            self.decode_offload_manager = None
+
         # Register draft KV pool (when spec + HiCache co-enabled).
         kv_cache.maybe_register_hicache_draft(
             tree_cache=self.tree_cache,
@@ -972,25 +995,6 @@ class Scheduler(
             and not self.tree_cache.supports_streaming_session()
         ):
             self.tree_cache = StreamingSession(self.tree_cache)
-
-        if self.enable_hisparse:
-            # Coordinator was created inside ModelRunner.initialize() before CUDA graph capture
-            self.hisparse_coordinator = self.tp_worker.model_runner.hisparse_coordinator
-            self.hisparse_coordinator.set_decode_producer_stream(self.forward_stream)
-
-        if (
-            server_args.disaggregation_mode == "decode"
-            and server_args.disaggregation_decode_enable_offload_kvcache
-        ):
-            self.decode_offload_manager = DecodeKVCacheOffloadManager(
-                req_to_token_pool=self.req_to_token_pool,
-                token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
-                tp_group=params.tp_cache_group,
-                tree_cache=self.tree_cache,
-                server_args=self.server_args,
-            )
-        else:
-            self.decode_offload_manager = None
 
         embedding_cache_size = envs.SGLANG_VLM_CACHE_SIZE_MB.get()
         init_mm_embedding_cache(embedding_cache_size * 1024 * 1024)
