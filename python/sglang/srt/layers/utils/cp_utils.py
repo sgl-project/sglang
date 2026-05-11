@@ -457,6 +457,14 @@ def prepare_context_parallel_metadata(
     assert extend_seqs_len is not None
     extend_seqs_len = [int(x) for x in extend_seqs_len]
 
+    # Update the extend_seqs_len to the padded length.
+    pad_len = int(kv_len) - sum(extend_seqs_len)
+    if pad_len > 0:
+        extend_seqs_len[-1] += pad_len
+        if seqs_len is not None and len(seqs_len) == len(extend_seqs_len):
+            seqs_len = list(seqs_len)
+            seqs_len[-1] += pad_len
+
     bs = len(extend_seqs_len)
     cp_segment_num = cp_size * 2
 
