@@ -24,7 +24,6 @@ from sglang.srt.state_capturer.indexer_topk import get_global_indexer_capturer
 from sglang.srt.utils import add_prefix, is_hip
 
 if TYPE_CHECKING:
-    from sglang.srt.layers.attention.deepseek_v4_backend import DeepseekV4AttnBackend
     from sglang.srt.layers.attention.dsv4.compressor import (
         CompressorBackendMixin,
     )
@@ -317,6 +316,7 @@ class C4IndexerBackendMixin:
         q_lora: torch.Tensor,
         c4_indexer: C4Indexer,
         forward_batch: ForwardBatch,
+        x_for_compressor: Optional[torch.Tensor] = None,
         alt_streams: Optional[List[torch.cuda.Stream]] = None,
         enable_multi_stream: bool = False,
         q_lora_ready: Optional[torch.cuda.Event] = None,
@@ -483,6 +483,8 @@ class C4Indexer(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
         alt_streams: Optional[List[torch.cuda.Stream]] = None,
+        rotary_emb=None,
+        compressor_cls=None,
     ):
         super().__init__()
         self.layer_id = layer_id
@@ -490,6 +492,7 @@ class C4Indexer(nn.Module):
         self.n_heads = config.index_n_heads
         self.head_dim = config.index_head_dim
         self.rope_head_dim = config.qk_rope_head_dim
+        self.index_topk = config.index_topk
         self.q_lora_rank = config.q_lora_rank
         self.softmax_scale = self.head_dim**-0.5
         self.n_local_heads = self.n_heads
@@ -509,16 +512,31 @@ class C4Indexer(nn.Module):
             params_dtype=torch.bfloat16,
             prefix=add_prefix("weights_proj", prefix),
         )
-        self.compressor = Compressor(
-            config,
-            self.layer_id,
-            True,
-            freqs_cis,
-            compress_ratio=4,
-            head_dim=self.head_dim,
-            rotate=True,
-            prefix=add_prefix("compressor", prefix),
-        )
+        _compressor_cls = compressor_cls if compressor_cls is not None else Compressor
+        if rotary_emb is not None and compressor_cls is not None:
+            self.compressor = _compressor_cls(
+                config,
+                self.layer_id,
+                True,
+                rotary_emb,
+                freqs_cis,
+                compress_ratio=4,
+                head_dim=self.head_dim,
+                rotate=True,
+                prefix=add_prefix("compressor", prefix),
+            )
+        else:
+            self.compressor = _compressor_cls(
+                config,
+                self.layer_id,
+                True,
+                freqs_cis,
+                compress_ratio=4,
+                head_dim=self.head_dim,
+                rotate=True,
+                prefix=add_prefix("compressor", prefix),
+            )
+        self.rotary_emb = rotary_emb
         self.freqs_cis = freqs_cis
         self.weight_scale: float = self.softmax_scale * self.n_heads**-0.5
         self.alt_streams = alt_streams
@@ -546,16 +564,16 @@ class C4Indexer(nn.Module):
         x: torch.Tensor,
         q_lora: torch.Tensor,
         forward_batch: ForwardBatch,
+        x_for_compressor: Optional[torch.Tensor] = None,
         enable_multi_stream: bool = False,
         q_lora_ready: Optional[torch.cuda.Event] = None,
     ) -> None:
-        if TYPE_CHECKING:
-            assert isinstance(forward_batch.attn_backend, DeepseekV4AttnBackend)
         return forward_batch.attn_backend.forward_c4_indexer(
             x=x,
             q_lora=q_lora,
             forward_batch=forward_batch,
             c4_indexer=self,
+            x_for_compressor=x_for_compressor if x_for_compressor is not None else x,
             alt_streams=self.alt_streams,
             enable_multi_stream=enable_multi_stream,
             q_lora_ready=q_lora_ready,

@@ -25,6 +25,7 @@ from sglang.srt.distributed import get_pp_group, get_tensor_model_parallel_world
 from sglang.srt.distributed.parallel_state import get_moe_expert_parallel_world_size
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
+from sglang.srt.layers.attention.dsv4.indexer import C4Indexer
 from sglang.srt.layers.attention.nsa.nsa_indexer import rotate_activation
 from sglang.srt.layers.attention.nsa.utils import (
     can_cp_split,
@@ -83,7 +84,6 @@ if not _is_hip:
     from sglang.srt.layers.attention.dsv4.compressor import (
         Compressor as _CudaCompressor,
     )
-    from sglang.srt.layers.attention.dsv4.indexer import C4Indexer as _CudaC4Indexer
     from sglang.srt.layers.utils.cp_utils import (
         prepare_context_parallel_metadata,
     )
@@ -1183,103 +1183,6 @@ class Compressor(nn.Module):
         return kv_compressed
 
 
-class C4Indexer(nn.Module):
-    def __init__(
-        self,
-        config: DeepSeekV4Config,
-        layer_id: int,
-        rotary_emb: RotaryEmbedding,
-        freqs_cis: torch.Tensor,  # TODO: remove it after using rotary embedding
-        quant_config: Optional[QuantizationConfig] = None,
-        prefix: str = "",
-        alt_streams: Optional[List[torch.cuda.Stream]] = None,
-    ):
-        super().__init__()
-        self.layer_id = layer_id
-        self.dim = config.hidden_size
-        self.n_heads = config.index_n_heads
-        self.head_dim = config.index_head_dim
-        self.rope_head_dim = config.qk_rope_head_dim
-        self.index_topk = config.index_topk
-        self.q_lora_rank = config.q_lora_rank
-        self.softmax_scale = self.head_dim**-0.5
-        # TODO: do we need to support TP indexer?
-        # currently, we duplicate indexer on all TP ranks
-        self.n_local_heads = self.n_heads
-        self.wq_b = ReplicatedLinear(
-            self.q_lora_rank,
-            self.n_heads * self.head_dim,
-            bias=False,
-            quant_config=quant_config,
-            params_dtype=torch.bfloat16,
-            prefix=add_prefix("wq_b", prefix),
-        )
-        self.weights_proj = ReplicatedLinear(
-            self.dim,
-            self.n_heads,
-            bias=False,
-            quant_config=None,
-            params_dtype=torch.bfloat16,
-            prefix=add_prefix("weights_proj", prefix),
-        )
-        self.compressor = Compressor(
-            config,
-            self.layer_id,
-            True,  # is_in_indexer
-            rotary_emb,
-            freqs_cis,
-            compress_ratio=4,
-            head_dim=self.head_dim,
-            rotate=True,
-            prefix=add_prefix("compressor", prefix),
-        )
-        self.rotary_emb = rotary_emb
-        self.freqs_cis = freqs_cis
-        self.weight_scale: float = self.softmax_scale * self.n_heads**-0.5
-        self.alt_streams = alt_streams
-
-    def compute_q(self, q_lora: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
-        # [bs, n_heads, head_dim]
-        q, _ = self.wq_b(q_lora)
-        q = q.view(-1, self.n_local_heads, self.head_dim)
-        fused_rope(
-            q[..., -self.rope_head_dim :],
-            None,
-            self.freqs_cis,
-            positions=positions,
-        )
-        q = rotate_activation(q)
-        return q
-
-    def compute_weights(self, x: torch.Tensor, skip_scale=False) -> torch.Tensor:
-        out, _ = self.weights_proj(x)
-        if not skip_scale:
-            out = out * self.weight_scale
-        return out
-
-    def forward(
-        self,
-        x: torch.Tensor,
-        q_lora: torch.Tensor,
-        forward_batch: ForwardBatch,
-        x_for_compressor: Optional[torch.Tensor] = None,
-        enable_multi_stream: bool = False,
-        q_lora_ready: Optional[torch.cuda.Event] = None,
-    ) -> None:
-        if TYPE_CHECKING:
-            assert isinstance(forward_batch.attn_backend, DeepseekV4Backend)
-        return forward_batch.attn_backend.forward_c4_indexer(
-            x=x,
-            q_lora=q_lora,
-            forward_batch=forward_batch,
-            c4_indexer=self,
-            x_for_compressor=x_for_compressor if x_for_compressor is not None else x,
-            alt_streams=self.alt_streams,
-            enable_multi_stream=enable_multi_stream,
-            q_lora_ready=q_lora_ready,
-        )
-
-
 def yarn_get_mscale(scale: float = 1, mscale: float = 1) -> float:
     import math
 
@@ -1440,16 +1343,6 @@ class MQALayer(nn.Module):
                     rotate=False,
                     prefix=add_prefix("compressor", prefix),
                 )
-                if self.compress_ratio == 4:
-                    self.indexer = C4Indexer(
-                        config,
-                        rotary_emb=self.rotary_emb,
-                        freqs_cis=freqs_cis,
-                        layer_id=layer_id,
-                        quant_config=quant_config,
-                        prefix=add_prefix("indexer", prefix),
-                        alt_streams=self.alt_streams_indexer,
-                    )
             else:
                 self.compressor = _CudaCompressor(
                     config,
@@ -1461,15 +1354,17 @@ class MQALayer(nn.Module):
                     rotate=False,
                     prefix=add_prefix("compressor", prefix),
                 )
-                if self.compress_ratio == 4:
-                    self.indexer = _CudaC4Indexer(
-                        config,
-                        freqs_cis=freqs_cis,
-                        layer_id=layer_id,
-                        quant_config=quant_config,
-                        prefix=add_prefix("indexer", prefix),
-                        alt_streams=self.alt_streams_indexer,
-                    )
+            if self.compress_ratio == 4:
+                self.indexer = C4Indexer(
+                    config,
+                    freqs_cis=freqs_cis,
+                    layer_id=layer_id,
+                    quant_config=quant_config,
+                    prefix=add_prefix("indexer", prefix),
+                    alt_streams=self.alt_streams_indexer,
+                    rotary_emb=getattr(self, "rotary_emb", None),
+                    compressor_cls=Compressor if _is_hip else None,
+                )
 
         # Note: attention sink should be replicated
         self.attn_sink = nn.Parameter(torch.empty(self.n_heads, dtype=torch.float32))
