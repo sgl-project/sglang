@@ -482,8 +482,8 @@ class SchedulerMetricsMixin:
             self.update_lora_metrics()
             self._log_hicache_stats()
             self.metrics_collector.log_stats(self.stats)
-            self._emit_kv_metrics()
-        self._publish_kv_events()
+            self.emit_kv_metrics()
+        self.publish_kv_events()
 
     def report_decode_stats(
         self: Scheduler,
@@ -684,8 +684,8 @@ class SchedulerMetricsMixin:
             self.update_lora_metrics()
             self._log_hicache_stats()
             self.metrics_collector.log_stats(self.stats)
-            self._emit_kv_metrics()
-        self._publish_kv_events()
+            self.emit_kv_metrics()
+        self.publish_kv_events()
 
     def log_batch_result_stats(
         self: Scheduler,
@@ -703,7 +703,7 @@ class SchedulerMetricsMixin:
                 balancedness=m.eplb_balancedness.item(),
             )
 
-    def _emit_kv_metrics(self: Scheduler):
+    def emit_kv_metrics(self: Scheduler):
         if not self.enable_kv_cache_events:
             return
 
@@ -724,7 +724,7 @@ class SchedulerMetricsMixin:
         if not self.send_metrics_from_scheduler.closed:
             self.send_metrics_from_scheduler.send_pyobj(kv_metrics)
 
-    def _publish_kv_events(self: Scheduler):
+    def publish_kv_events(self: Scheduler):
         if not self.enable_kv_cache_events:
             return
 
