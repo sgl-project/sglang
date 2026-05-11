@@ -47,6 +47,44 @@ class TestLoadBalanceMethod(unittest.TestCase):
         server_args = ServerArgs(model_path="dummy", disaggregation_mode="decode")
         self.assertEqual(server_args.load_balance_method, "round_robin")
 
+    def test_pd_decode_radix_cache_rejects_hisparse(self):
+        with self.assertRaises(ValueError) as context:
+            ServerArgs(
+                model_path="dummy",
+                disaggregation_mode="decode",
+                disaggregation_decode_enable_radix_cache=True,
+                disaggregation_transfer_backend="nixl",
+                enable_hisparse=True,
+            )
+
+        self.assertIn(
+            "--disaggregation-decode-enable-radix-cache is incompatible with "
+            "--enable-hisparse",
+            str(context.exception),
+        )
+
+    def test_pd_decode_radix_cache_allows_mooncake(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            disaggregation_mode="decode",
+            disaggregation_decode_enable_radix_cache=True,
+            disaggregation_transfer_backend="mooncake",
+        )
+
+        self.assertFalse(server_args.disable_radix_cache)
+
+    def test_pd_decode_radix_cache_rejects_unknown_backend(self):
+        with self.assertRaises(ValueError) as context:
+            ServerArgs(
+                model_path="dummy",
+                disaggregation_mode="decode",
+                disaggregation_decode_enable_radix_cache=True,
+                disaggregation_transfer_backend="fake",
+            )
+
+        self.assertIn("('nixl', 'mooncake')", str(context.exception))
+        self.assertIn("'fake'", str(context.exception))
+
 
 class TestPortArgs(unittest.TestCase):
     @patch("sglang.srt.server_args.get_free_port")
@@ -424,6 +462,57 @@ class TestHiCacheArgs(unittest.TestCase):
         args._handle_hicache()
 
         self.assertEqual(args.decode_attention_backend, "triton")
+
+
+class TestNgramExternalSamArgs(CustomTestCase):
+    def test_prepare_server_args_parses_external_sam_args(self):
+        server_args = prepare_server_args(
+            [
+                "--model-path",
+                "dummy",
+                "--speculative-algorithm",
+                "NGRAM",
+                "--speculative-ngram-external-corpus-path",
+                "/tmp/ngram-corpus.jsonl",
+                "--speculative-ngram-external-sam-budget",
+                "4",
+                "--speculative-ngram-external-corpus-max-tokens",
+                "128",
+            ]
+        )
+        self.assertEqual(
+            server_args.speculative_ngram_external_corpus_path,
+            "/tmp/ngram-corpus.jsonl",
+        )
+        self.assertEqual(server_args.speculative_ngram_external_sam_budget, 4)
+        self.assertEqual(server_args.speculative_ngram_external_corpus_max_tokens, 128)
+
+    def _make_dummy_ngram_args(self, **overrides):
+        args = ServerArgs(model_path="dummy")
+        args.speculative_algorithm = "NGRAM"
+        args.speculative_num_draft_tokens = 12
+        args.device = "cuda"
+        for key, value in overrides.items():
+            setattr(args, key, value)
+        return args
+
+    def test_external_sam_budget_must_fit_draft_budget(self):
+        with self.assertRaises(ValueError) as context:
+            self._make_dummy_ngram_args(
+                speculative_num_draft_tokens=4,
+                speculative_ngram_external_corpus_path="/tmp/ngram-corpus.jsonl",
+                speculative_ngram_external_sam_budget=4,
+            )._handle_speculative_decoding()
+        self.assertIn("speculative_num_draft_tokens - 1", str(context.exception))
+
+    def test_external_corpus_max_tokens_must_be_positive(self):
+        with self.assertRaises(ValueError) as context:
+            self._make_dummy_ngram_args(
+                speculative_ngram_external_corpus_path="/tmp/ngram-corpus.jsonl",
+                speculative_ngram_external_sam_budget=2,
+                speculative_ngram_external_corpus_max_tokens=0,
+            )._handle_speculative_decoding()
+        self.assertIn("external-corpus-max-tokens", str(context.exception))
 
 
 if __name__ == "__main__":

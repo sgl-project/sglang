@@ -2,7 +2,11 @@ from typing import Optional
 
 import torch
 
-from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
+from sglang.srt.managers.schedule_batch import (
+    Modality,
+    MultimodalDataItem,
+    MultimodalProcessorOutput,
+)
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor,
     MultimodalSpecialTokens,
@@ -166,10 +170,10 @@ class TransformersAutoMultimodalProcessor(BaseMultimodalProcessor):
         # Build mm_items from processor output
         mm_items = self._build_mm_items(processor_output, input_ids)
 
-        ret = {
-            "input_ids": input_ids.tolist(),
-            "mm_items": mm_items,
-        }
+        ret = MultimodalProcessorOutput(
+            input_ids=input_ids.tolist(),
+            mm_items=mm_items,
+        )
 
         # Propagate token_type_ids for models that need it (Gemma3, PaliGemma)
         token_type_key = (
@@ -178,14 +182,14 @@ class TransformersAutoMultimodalProcessor(BaseMultimodalProcessor):
             else "token_type_ids"
         )
         if token_type_key in processor_output:
-            ret["token_type_ids"] = processor_output[token_type_key].flatten().tolist()
+            ret.token_type_ids = processor_output[token_type_key].flatten().tolist()
 
         if self.mm_tokens.image_token_id is not None:
-            ret["im_token_id"] = self.mm_tokens.image_token_id
+            ret.im_token_id = self.mm_tokens.image_token_id
         if self.mm_tokens.video_token_id is not None:
-            ret["video_token_id"] = self.mm_tokens.video_token_id
+            ret.video_token_id = self.mm_tokens.video_token_id
         if self.mm_tokens.audio_token_id is not None:
-            ret["audio_token_id"] = self.mm_tokens.audio_token_id
+            ret.audio_token_id = self.mm_tokens.audio_token_id
 
         image_start_id = _first_attr(
             self.hf_config,
@@ -196,20 +200,20 @@ class TransformersAutoMultimodalProcessor(BaseMultimodalProcessor):
             ("image_end_token_id", "vision_end_token_id", "im_end_id"),
         )
         if image_start_id is not None:
-            ret["im_start_id"] = image_start_id
+            ret.im_start_id = image_start_id
         if image_end_id is not None:
-            ret["im_end_id"] = image_end_id
+            ret.im_end_id = image_end_id
 
         # M-RoPE positions (Qwen2.5-VL, Qwen3-VL)
         if self._is_mrope:
             image_grid_thw = processor_output.get("image_grid_thw")
             video_grid_thw = processor_output.get("video_grid_thw")
             mrope_positions, mrope_position_delta = self._compute_mrope_positions(
-                ret["input_ids"],
+                ret.input_ids,
                 image_grid_thw=image_grid_thw,
                 video_grid_thw=video_grid_thw,
             )
-            ret["mrope_positions"] = mrope_positions
-            ret["mrope_position_delta"] = mrope_position_delta
+            ret.mrope_positions = mrope_positions
+            ret.mrope_position_delta = mrope_position_delta
 
         return ret

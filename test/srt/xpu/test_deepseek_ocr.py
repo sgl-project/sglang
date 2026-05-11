@@ -5,11 +5,12 @@ python3 -m unittest test_deepseek_ocr.py
 import json
 import os
 import unittest
+from pathlib import Path
 
 import requests
-from transformers import AutoTokenizer
 
 from sglang.srt.utils import kill_process_tree
+from sglang.srt.utils.hf_transformers import get_tokenizer
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
@@ -22,8 +23,13 @@ class TestDeepSeekOCR(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         cls.model = "deepseek-ai/DeepSeek-OCR"
-        cls.tokenizer = AutoTokenizer.from_pretrained(cls.model, use_fast=False)
+        cls.tokenizer = get_tokenizer(cls.model)
         cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.image_path = str(
+            (Path(__file__).resolve().parents[3] / "examples/assets/example_image.png")
+        )
+        if not os.path.exists(cls.image_path):
+            raise FileNotFoundError(f"Image not found: {cls.image_path}")
         cls.common_args = [
             "--device",
             "xpu",
@@ -43,14 +49,20 @@ class TestDeepSeekOCR(CustomTestCase):
     @classmethod
     def tearDownClass(cls):
         """Fixture that is run once after all tests in the class."""
-        kill_process_tree(cls.process.pid)
+        if hasattr(cls, "process") and cls.process:
+            cls.process.terminate()
+            try:
+                cls.process.wait(timeout=30)
+            except Exception:
+                # Force kill if it didn't exit cleanly in time
+                kill_process_tree(cls.process.pid)
 
     def get_request_json(self, max_new_tokens=32, n=1):
         response = requests.post(
             self.base_url + "/generate",
             json={
                 "text": "<image>\n<|grounding|>Convert the document to pure text.",
-                "image_data": "../../examples/assets/example_image.png",
+                "image_data": self.image_path,
                 "sampling_params": {
                     "temperature": 0 if n == 1 else 0.5,
                     "max_new_tokens": max_new_tokens,
@@ -92,29 +104,6 @@ class TestDeepSeekOCR(CustomTestCase):
 
     def test_moe(self):
         self.run_decode()
-
-
-class TestDeepSeekOCRTriton(TestDeepSeekOCR):
-    @classmethod
-    def setUpClass(cls):
-        cls.model = "deepseek-ai/DeepSeek-OCR"
-        cls.tokenizer = AutoTokenizer.from_pretrained(cls.model, use_fast=False)
-        cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.common_args = [
-            "--device",
-            "xpu",
-            "--attention-backend",
-            "intel_xpu",
-        ]
-        os.environ["SGLANG_USE_SGL_XPU"] = "0"
-        cls.process = popen_launch_server(
-            cls.model,
-            cls.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=[
-                *cls.common_args,
-            ],
-        )
 
 
 if __name__ == "__main__":
