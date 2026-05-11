@@ -139,6 +139,7 @@ def dummy_run(
         device=device,
     )
 
+    pp_proxy_tensors = None
     if server_args.pp_size > 1:
         pp_proxy_tensors = PPProxyTensors(
             {k: v[: modes.num_tokens] for k, v in buffers.pp_proxy_tensors.items()}
@@ -211,38 +212,19 @@ def dummy_run(
 
     attn_backend.init_forward_metadata(forward_batch)
 
-    def run_once():
-        forward_batch.dp_local_start_pos = forward_batch.dp_local_num_tokens = None
-        set_dp_buffer_len(
-            global_dp_buffer_len,
-            modes.num_tokens,
-            forward_batch.dp_padding_mode.is_max_len(),
-        )
-        set_is_extend_in_batch(False)
-
-        kwargs = {}
-        if (
-            server_args.pp_size > 1
-            and "pp_proxy_tensors" in inspect.signature(model.forward).parameters
-        ):
-            kwargs["pp_proxy_tensors"] = PPProxyTensors(
-                {k: v.clone() for k, v in pp_proxy_tensors.tensors.items()}
-            )
-        if not is_generation:
-            kwargs["get_embedding"] = True
-
-        logits_output_or_pp_proxy_tensors = model.forward(
-            buffers.input_ids,
-            forward_batch.positions,
-            forward_batch,
-            **kwargs,
-        )
-        return logits_output_or_pp_proxy_tensors
-
     torch.get_device_module(device).synchronize()
     tp_group.barrier()
     with torch.inference_mode(), run_ctx or empty_context():
-        run_once()
+        _run_dummy_forward_once(
+            forward_batch=forward_batch,
+            buffers=buffers,
+            global_dp_buffer_len=global_dp_buffer_len,
+            num_tokens=modes.num_tokens,
+            pp_proxy_tensors=pp_proxy_tensors,
+            is_generation=is_generation,
+            server_args=server_args,
+            model=model,
+        )
 
 
 def _resolve_dummy_capture_modes(
@@ -429,3 +411,42 @@ def _build_dummy_spec_info(
         spec_info.capture_hidden_mode = CaptureHiddenMode.NULL
 
     return spec_info
+
+
+def _run_dummy_forward_once(
+    *,
+    forward_batch: ForwardBatch,
+    buffers: DecodeInputBuffers,
+    global_dp_buffer_len: Optional[int],
+    num_tokens: int,
+    pp_proxy_tensors: Optional[PPProxyTensors],
+    is_generation: bool,
+    server_args: ServerArgs,
+    model: torch.nn.Module,
+):
+    forward_batch.dp_local_start_pos = forward_batch.dp_local_num_tokens = None
+    set_dp_buffer_len(
+        global_dp_buffer_len,
+        num_tokens,
+        forward_batch.dp_padding_mode.is_max_len(),
+    )
+    set_is_extend_in_batch(False)
+
+    kwargs = {}
+    if (
+        server_args.pp_size > 1
+        and "pp_proxy_tensors" in inspect.signature(model.forward).parameters
+    ):
+        kwargs["pp_proxy_tensors"] = PPProxyTensors(
+            {k: v.clone() for k, v in pp_proxy_tensors.tensors.items()}
+        )
+    if not is_generation:
+        kwargs["get_embedding"] = True
+
+    logits_output_or_pp_proxy_tensors = model.forward(
+        buffers.input_ids,
+        forward_batch.positions,
+        forward_batch,
+        **kwargs,
+    )
+    return logits_output_or_pp_proxy_tensors
