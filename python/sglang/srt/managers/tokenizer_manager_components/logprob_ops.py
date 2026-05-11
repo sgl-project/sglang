@@ -196,6 +196,32 @@ def absorb_recv(
     if recv_obj.input_token_logprobs_val is None:
         return
 
+    _accumulate_logprobs_from_recv(
+        state,
+        recv_obj=recv_obj,
+        recv_obj_index=recv_obj_index,
+        top_logprobs_num=top_logprobs_num,
+        token_ids_logprob=token_ids_logprob,
+    )
+
+    fill_meta_info(
+        meta_info,
+        state,
+        top_logprobs_num=state.obj.top_logprobs_num,
+        token_ids_logprob=state.obj.token_ids_logprob,
+        return_text_in_logprobs=return_text_in_logprobs,
+        tokenizer=tokenizer,
+    )
+
+
+def _accumulate_logprobs_from_recv(
+    state: ReqState,
+    *,
+    recv_obj: BatchStrOutput,
+    recv_obj_index: int,
+    top_logprobs_num: int,
+    token_ids_logprob: Optional[List[int]],
+) -> None:
     if (
         len(recv_obj.input_token_logprobs_val) > 0
         and recv_obj.input_token_logprobs_val[recv_obj_index] is not None
@@ -242,15 +268,6 @@ def absorb_recv(
         state.logprobs.output_token_ids_logprobs_idx.extend(
             recv_obj.output_token_ids_logprobs_idx[recv_obj_index]
         )
-
-    fill_meta_info(
-        meta_info,
-        state,
-        top_logprobs_num=state.obj.top_logprobs_num,
-        token_ids_logprob=state.obj.token_ids_logprob,
-        return_text_in_logprobs=return_text_in_logprobs,
-        tokenizer=tokenizer,
-    )
 
 
 def _detokenize_logprob_tokens(
