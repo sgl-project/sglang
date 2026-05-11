@@ -84,6 +84,15 @@ std::tuple<at::Tensor, at::Tensor> biased_grouped_topk_cpu(
     std::optional<double> routed_scaling_factor,
     std::optional<at::Tensor> num_token_non_padded);
 
+void topk_transform_512_cpu(
+    at::Tensor& scores,
+    at::Tensor& seq_lens,
+    at::Tensor& page_tables,
+    at::Tensor& out_page_indices,
+    int64_t page_size,
+    const std::optional<at::Tensor>& out_raw_indices);
+
+
 // attention
 void decode_attention_cpu(
     at::Tensor& query,
@@ -459,6 +468,13 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "renormalize, int num_expert_group, int topk_group, int num_fused_shared_experts, float? routed_scaling_factor, "
       "Tensor? num_token_non_padded) -> (Tensor, Tensor)");
   m.impl("biased_grouped_topk_cpu", torch::kCPU, &biased_grouped_topk_cpu);
+
+  // DeepSeek V4 compressed attention top-k transform
+  m.def(
+      "topk_transform_512_cpu(Tensor scores, Tensor seq_lens, Tensor page_tables, Tensor(a!) out_page_indices, "
+      "int page_size, Tensor(a!)? out_raw_indices) -> ()");
+  m.impl("topk_transform_512_cpu", torch::kCPU, &topk_transform_512_cpu);
+
 
   // decode
   m.def(
