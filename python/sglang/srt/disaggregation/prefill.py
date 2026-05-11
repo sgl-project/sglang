@@ -529,8 +529,7 @@ class SchedulerDisaggregationPrefillMixin:
                     extend_logprob_start_len = extend_logprob_start_len_per_req[i]
                     extend_input_len = extend_input_len_per_req[i]
                     num_input_logprobs = extend_input_len - extend_logprob_start_len
-                    self.add_logprob_return_values(
-                        self.logprob_computer,
+                    self.logprob_computer.add_logprob_return_values(
                         i,
                         req,
                         logprob_pt,
@@ -567,8 +566,7 @@ class SchedulerDisaggregationPrefillMixin:
                     if extend_logprob_start_len < extend_input_len:
                         # Update input logprobs.
                         num_input_logprobs = extend_input_len - extend_logprob_start_len
-                        self.add_input_logprob_return_values(
-                            self.logprob_computer,
+                        self.logprob_computer.add_input_logprob_return_values(
                             i,
                             req,
                             logits_output,
