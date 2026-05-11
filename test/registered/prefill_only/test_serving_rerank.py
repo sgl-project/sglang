@@ -116,6 +116,31 @@ class TestOpenAIServingRerankUnit(unittest.TestCase):
         self.assertAlmostEqual(res[1].score, 0.2)
         self.assertAlmostEqual(res[2].score, 0.1)
 
+    def test_build_rerank_response_multimodal_return_documents_true(self):
+        query = [
+            {"type": "text", "text": "Find similar images to this:"},
+            {
+                "type": "image_url",
+                "image_url": {"url": "https://example.com/query.jpeg"},
+            },
+        ]
+        multimodal_doc = [
+            {
+                "type": "image_url",
+                "image_url": {"url": "https://example.com/similar.jpeg"},
+            }
+        ]
+        req = V1RerankReqInput(
+            query=query,
+            documents=["text-doc", multimodal_doc],
+            return_documents=True,
+        )
+        scores = [0.2, 0.9]
+        res = self.handler._build_rerank_response(scores, req)
+        self.assertEqual(res[0].index, 1)
+        self.assertEqual(res[0].document, multimodal_doc)
+        self.assertAlmostEqual(res[0].score, 0.9)
+
     def test_helper_is_qwen3_reranker_template(self):
         self.assertTrue(
             _is_qwen3_reranker_template(
