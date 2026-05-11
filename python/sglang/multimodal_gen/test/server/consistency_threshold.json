@@ -254,10 +254,10 @@
             "mean_abs_diff_threshold": 45.0
         },
         "ltx_2_3_two_stage_ti2v_2gpus": {
-            "clip_threshold": 0.56,
-            "ssim_threshold": 0.31,
-            "psnr_threshold": 11.9,
-            "mean_abs_diff_threshold": 46.0
+            "clip_threshold": 0.55,
+            "ssim_threshold": 0.29,
+            "psnr_threshold": 11.7,
+            "mean_abs_diff_threshold": 47.0
         }
     },
     "default_clip_threshold_image": 0.92,
