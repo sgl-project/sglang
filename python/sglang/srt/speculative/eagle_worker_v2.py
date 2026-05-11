@@ -445,7 +445,12 @@ class EagleDraftWorker(BaseDraftWorker):
         batch_result: GenerationBatchResult,
         draft_input: EagleDraftInput,
     ):
+        assert (
+            self.speculative_num_steps is not None
+        ), "speculative_num_steps should not be None"
         if self.speculative_num_steps <= 1:
+            return
+        if model_worker_batch.forward_mode.is_idle():
             return
 
         model_worker_batch.forward_mode = (
@@ -453,6 +458,9 @@ class EagleDraftWorker(BaseDraftWorker):
             if model_worker_batch.forward_mode.is_idle()
             else ForwardMode.DECODE
         )
+        assert (
+            batch_result.next_draft_input is not None
+        ), "next_draft_input should not be None"
         model_worker_batch.seq_lens = batch_result.next_draft_input.new_seq_lens
         # To ensure accurate acceptance length, seq_lens_cpu synchronization is needed here.
         # However, this synchronization contradicts the intent and benefit of spec_v2_zero_bubble.
@@ -490,6 +498,10 @@ class EagleDraftWorker(BaseDraftWorker):
             ret_topk_index, torch.Tensor
         )
         next_draft_input = batch_result.next_draft_input
+        ret_topk_p = ret_topk_p.reshape(next_draft_input.topk_p.shape[0], -1)
+        ret_topk_index = ret_topk_index.reshape(
+            next_draft_input.topk_index.shape[0], -1
+        )
         ret_topk_p_list = [next_draft_input.topk_p, ret_topk_p]
         ret_topk_index_list = [next_draft_input.topk_index, ret_topk_index]
         (
@@ -516,17 +528,37 @@ class EagleDraftWorker(BaseDraftWorker):
             0, topk_p, topk_index, hidden_states, None, self.topk
         )
 
-        score_list = [
-            tree_info[0][:, :, i].unsqueeze(-1)
-            for i in range(self.speculative_num_steps)
-        ]
-        token_list = [
-            tree_info[1][:, i].unsqueeze(-1) for i in range(self.speculative_num_steps)
-        ]
-        parents_list = [tree_info[2]] + [
-            torch.full((tree_info[2].size(0), 1), i, dtype=torch.long, device="cuda")
-            for i in range(1, self.speculative_num_steps)
-        ]
+        score_list = []
+        token_list = []
+        parents_list = []
+        offset = 0
+        for i in range(self.speculative_num_steps):
+            if i == 0:
+                group_size = 1
+            else:
+                group_size = self.topk
+            step_size = group_size * self.topk
+
+            scores = tree_info[0][:, :, offset : offset + step_size].reshape(
+                -1, group_size, self.topk
+            )
+            tokens = tree_info[1][:, offset : offset + step_size]
+
+            score_list.append(scores)
+            token_list.append(tokens)
+
+            if i == 0:
+                parents_list.append(tree_info[2])
+            else:
+                parents_list.append(
+                    torch.full(
+                        (tree_info[2].size(0), self.topk),
+                        i,
+                        dtype=torch.long,
+                        device="cuda",
+                    )
+                )
+            offset += step_size
 
         # Organize the results
         score_list = torch.cat(score_list, dim=1).flatten(
