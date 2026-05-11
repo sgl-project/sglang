@@ -169,6 +169,9 @@ from sglang.srt.managers.scheduler_components import kv_cache
 from sglang.srt.managers.scheduler_components.dp_attn_adapter import (
     SchedulerDPAttnAdapter,
 )
+from sglang.srt.managers.scheduler_components.profiler_manager import (
+    SchedulerProfilerManager,
+)
 from sglang.srt.managers.scheduler_components.request_receiver import (
     SchedulerRequestReceiver,
 )
@@ -529,31 +532,11 @@ class Scheduler(
         self.init_watch_dog_memory_saver_input_blocker()
 
         # Init profiler
-        if envs.SGLANG_PROFILE_V2.get():
-            self._profile_manager = ProfileManager(
-                ps=self.ps,
-                cpu_group=self.dp_tp_cpu_group,
-            )
-        else:
-            self.torch_profiler = None
-            self.torch_profiler_output_dir: Optional[Path] = None
-            self.profiler_activities: Optional[List[str]] = None
-            self.profile_id: Optional[str] = None
-
-            self.profiler_start_forward_ct: Optional[int] = None
-            self.profiler_target_forward_ct: Optional[int] = None
-
-            self.profiler_prefill_ct: Optional[int] = None
-            self.profiler_decode_ct: Optional[int] = None
-            self.profiler_target_prefill_ct: Optional[int] = None
-            self.profiler_target_decode_ct: Optional[int] = None
-
-            self.profile_by_stage: bool = False
-            self.profile_in_progress: bool = False
-            self.merge_profiles = False
-
-            # For ROCM
-            self.rpd_profiler = None
+        self.profiler_manager = SchedulerProfilerManager(
+            ps=self.ps,
+            dp_tp_cpu_group=self.dp_tp_cpu_group,
+            get_forward_ct=lambda: self.forward_ct,
+        )
 
         # Init prefill-decodedisaggregation
         self.init_disaggregation()
@@ -1333,7 +1316,10 @@ class Scheduler(
                 (ResumeMemoryOccupationReqInput, self.resume_memory_occupation),
                 (CheckWeightsReqInput, self.check_weights),
                 (SlowDownReqInput, self.slow_down),
-                (ProfileReq, self.profile),
+                (
+                    ProfileReq,
+                    lambda req: self._profile(self.profiler_manager, req),
+                ),
                 (FreezeGCReq, self.handle_freeze_gc),
                 (GetInternalStateReq, self.get_internal_state),
                 (SetInternalStateReq, self.set_internal_state),
@@ -2680,7 +2666,7 @@ class Scheduler(
         batch.forward_iter = self.forward_ct
 
         # Whether to run the profiler
-        self._profile_batch_predicate(batch)
+        self._profile_batch_predicate(self.profiler_manager, batch)
         if self.forward_sleep_time is not None:
             logger.info(f"Scheduler.run_batch sleep {self.forward_sleep_time}s")
             time.sleep(self.forward_sleep_time)
