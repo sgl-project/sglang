@@ -2694,24 +2694,39 @@ class Scheduler(
 
         # Get requests from the waiting queue to a new prefill batch
         for req in self.waiting_queue:
+            # Capture chunked-resume status BEFORE init_next_round_input so a
+            # streaming-session restore (which sets req_pool_idx inside
+            # match_prefix) doesn't get misidentified as chunked-resume.
+            is_resume = req.req_pool_idx is not None
+
             if self.enable_lora and not self._can_schedule_lora_req(req, running_loras):
                 continue
 
-            running_bs = len(self.running_batch.reqs)
-            if len(adder.can_run_list) >= self.get_num_allocatable_reqs(running_bs):
-                self.running_batch.batch_is_full = True
-            if self.disaggregation_mode == DisaggregationMode.PREFILL:
-                # In prefill mode, prealloc queue and transfer queue can also take memory,
-                # so we need to check if the available size for the actual available size.
-                if len(adder.can_run_list) >= self.req_to_token_pool.available_size():
+            # Chunked-resume reqs bypass the batch_is_full check: they already
+            # own a row from a previous iter, so they don't count against
+            # ``get_num_allocatable_reqs`` and must be admitted to make
+            # forward progress (otherwise the row leaks). The OLD admission
+            # path ran ``add_chunked_req`` BEFORE this loop for the same
+            # reason.
+            if not is_resume:
+                running_bs = len(self.running_batch.reqs)
+                if len(adder.can_run_list) >= self.get_num_allocatable_reqs(running_bs):
                     self.running_batch.batch_is_full = True
+                if self.disaggregation_mode == DisaggregationMode.PREFILL:
+                    # In prefill mode, prealloc queue and transfer queue can also take memory,
+                    # so we need to check if the available size for the actual available size.
+                    if (
+                        len(adder.can_run_list)
+                        >= self.req_to_token_pool.available_size()
+                    ):
+                        self.running_batch.batch_is_full = True
 
-            if self.running_batch.batch_is_full:
-                if (
-                    not self.enable_priority_preemption
-                    or not adder.preempt_to_schedule(req, self.server_args)
-                ):
-                    break
+                if self.running_batch.batch_is_full:
+                    if (
+                        not self.enable_priority_preemption
+                        or not adder.preempt_to_schedule(req, self.server_args)
+                    ):
+                        break
 
             if self.enable_hicache_storage:
                 prefetch_done = self.tree_cache.check_prefetch_progress(req.rid)
@@ -2722,11 +2737,6 @@ class Scheduler(
                 req.storage_hit_length = self.tree_cache.pop_prefetch_loaded_tokens(
                     req.rid
                 )
-
-            # Capture chunked-resume status BEFORE init_next_round_input so a
-            # streaming-session restore (which sets req_pool_idx inside
-            # match_prefix) doesn't get misidentified as chunked-resume.
-            is_resume = req.req_pool_idx is not None
             if is_resume:
                 # Skip re-matching prefix to preserve the lock_ref invariant
                 # (cache_unfinished_req maintains dec(old req.last_node) ->
