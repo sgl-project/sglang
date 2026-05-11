@@ -98,10 +98,6 @@ if is_cuda() or (_is_mxfp_supported and is_hip()):
 
 
 if is_mps():
-    # MLX backend handles its own quantization at load time (see
-    # python/sglang/srt/hardware_backend/mlx/model_runner.py). MlxQuantizationConfig
-    # is a marker class — from_config raises if anything on the PyTorch path tries
-    # to instantiate it.
     BASE_QUANTIZATION_METHODS.update(
         {
             "mlx_q4": MlxQuantizationConfig,
