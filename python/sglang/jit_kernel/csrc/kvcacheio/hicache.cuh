@@ -3,7 +3,6 @@
 #include <sgl_kernel/tensor.h>
 #include <sgl_kernel/utils.h>
 
-#include <sgl_kernel/runtime.cuh>
 #include <sgl_kernel/utils.cuh>
 #include <sgl_kernel/vec.cuh>
 
@@ -475,7 +474,6 @@ struct HiCacheKernel {
     const auto kernel = use_int32 ? kernel_all_mla<int32_t> : kernel_all_mla<int64_t>;
     LaunchKernel(num_blocks, kBlockSize, device)(kernel, params);
   }
-
 };
 
 #undef SGL_HICACHE_KERNEL
