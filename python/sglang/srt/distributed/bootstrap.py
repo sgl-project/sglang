@@ -94,18 +94,9 @@ def init_torch_distributed(
 
     if not is_draft_worker:
         if device == "cpu":
-            if _is_cpu_amx_available or _is_cpu_arm64:
-                # Bind OpenMP threads to CPU cores
-                torch.ops.sgl_kernel.init_cpu_threads_env(local_omp_cpuid)
-
-                # Set local size to hint SGLang to use shared memory based AllReduce
-                os.environ["LOCAL_SIZE"] = str(tp_size)
-                torch.ops.sgl_kernel.initialize(tp_size, tp_rank)
-
-            else:
-                logger.warning(
-                    "init_cpu_threads_env and shared memory based AllReduce is disabled, only intel amx backend and arm64 are supported"
-                )
+            _init_cpu_threads_env(
+                tp_size=tp_size, tp_rank=tp_rank, local_omp_cpuid=local_omp_cpuid
+            )
 
         # Only initialize the distributed environment on the target model worker.
         init_distributed_environment(
@@ -234,3 +225,20 @@ def _set_all_reduce_flags(*, server_args: ServerArgs) -> None:
     set_custom_all_reduce(not server_args.disable_custom_all_reduce)
     set_mscclpp_all_reduce(server_args.enable_mscclpp)
     set_torch_symm_mem_all_reduce(server_args.enable_torch_symm_mem)
+
+
+def _init_cpu_threads_env(
+    *, tp_size: int, tp_rank: int, local_omp_cpuid: Optional[List[int]]
+) -> None:
+    if _is_cpu_amx_available or _is_cpu_arm64:
+        # Bind OpenMP threads to CPU cores
+        torch.ops.sgl_kernel.init_cpu_threads_env(local_omp_cpuid)
+
+        # Set local size to hint SGLang to use shared memory based AllReduce
+        os.environ["LOCAL_SIZE"] = str(tp_size)
+        torch.ops.sgl_kernel.initialize(tp_size, tp_rank)
+
+    else:
+        logger.warning(
+            "init_cpu_threads_env and shared memory based AllReduce is disabled, only intel amx backend and arm64 are supported"
+        )
