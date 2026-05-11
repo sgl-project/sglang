@@ -1661,9 +1661,8 @@ class LTX2DenoisingStage(DenoisingStage):
         use_official_cfg_path = stage1_guider_params is None
         if use_official_cfg_path:
             do_two_branch_cfg = batch.do_classifier_free_guidance
-            if (
-                ctx.stage == "stage2"
-                and is_ltx2_two_stage_pipeline_name(server_args.pipeline_class_name)
+            if ctx.stage == "stage2" and is_ltx2_two_stage_pipeline_name(
+                server_args.pipeline_class_name
             ):
                 # official two-stage stage 2 is a distilled positive-only denoiser
                 do_two_branch_cfg = False
