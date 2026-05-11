@@ -47,7 +47,7 @@ class SemanticEmbeddingProvider(FuzzyMatchProvider):
     network or service dependency.
     """
 
-    _MIN_SEMBLEND_VERSION = "0.3.4"
+    _MIN_SEMBLEND_VERSION = "0.3.5"
 
     def __init__(self, config: FuzzyMatchConfig):
         super().__init__(config)
@@ -94,6 +94,11 @@ class SemanticEmbeddingProvider(FuzzyMatchProvider):
                 "top_k": config.fuzzy_top_k,
                 "quality_gate_ppl_threshold": config.quality_gate_ppl_threshold,
                 "discovery_only": config.discovery_only,
+                "match_block_min_length": config.fuzzy_match_block_min_length,
+                "match_block_max_anchor": config.fuzzy_match_block_max_anchor,
+                "match_block_max_candidates_per_anchor": (
+                    config.fuzzy_match_block_max_candidates_per_anchor
+                ),
             }
         )
         self._adapter = SemBlendProviderAdapter(config=adapter_config)
