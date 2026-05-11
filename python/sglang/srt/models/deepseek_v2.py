@@ -453,6 +453,8 @@ class DeepseekV2MoE(nn.Module):
             # with fused_shared_experts
             fused_shared_experts_scaling_factor = 1.0 / float(self.moe_ep_size)
 
+        swiglu_limit = getattr(config, "swiglu_limit", None) if is_deepseek_v4 else None
+
         self.experts = get_moe_impl_class(quant_config)(
             num_experts=num_experts_for_moe
             + get_global_server_args().ep_num_redundant_experts,
@@ -467,6 +469,7 @@ class DeepseekV2MoE(nn.Module):
                 config, "routing_method_type", RoutingMethodType.DeepSeekV3
             ),
             prefix=add_prefix("experts", prefix),
+            gemm1_clamp_limit=swiglu_limit,
         )
 
         if self.is_hash and not (is_nextn and is_deepseek_v4):

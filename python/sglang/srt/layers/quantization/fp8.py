@@ -2071,7 +2071,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             w13_scale=w13_scale,
             w2_scale=w2_scale,
             expert_mask=layer.dispatcher.expert_mask_gpu if _use_aiter else None,
-            swiglu_limit=10.0,
+            swiglu_limit=self.moe_runner_config.gemm1_clamp_limit or 0.0,
         )
 
 
