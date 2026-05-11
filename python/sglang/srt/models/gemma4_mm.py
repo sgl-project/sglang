@@ -49,7 +49,10 @@ from sglang.srt.model_loader.weight_utils import (
     maybe_remap_kv_scale_name,
 )
 from sglang.srt.models.gemma4_audio import Gemma4AudioEncoder
-from sglang.srt.models.gemma4_causal import Gemma4TextModel
+from sglang.srt.models.gemma4_causal import (
+    Gemma4TextModel,
+    _ensure_dflash_shard_indices,
+)
 from sglang.srt.models.gemma4_vision import Gemma4VisionEncoder
 from sglang.srt.utils import add_prefix
 from sglang.srt.utils.hf_transformers_utils import get_processor
@@ -218,6 +221,12 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
             quant_config,
             prefix=add_prefix("language_model", prefix),
         )
+        # Gemma 4 ties lm_head to the text embed_tokens; expose it so that
+        # speculative-decoding workers (e.g. DFLASH) can locate a vocab-parallel
+        # head. _ensure_dflash_shard_indices injects a tp=1 ShardIndices
+        # namespace onto the tied embedding for DFLASH's fast greedy path.
+        self.lm_head = self.language_model.embed_tokens
+        _ensure_dflash_shard_indices(self.lm_head, config.text_config.vocab_size)
 
         # Create logits processor for the multimodal model
         self.logits_processor = LogitsProcessor(config.text_config)
@@ -966,6 +975,16 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
             # we plus 1 here because in sglang, for the ith layer, it takes the output
             # of the (i-1)th layer as aux hidden state
             self.language_model.layers_to_capture = [val + 1 for val in layer_ids]
+
+    def set_dflash_layers_to_capture(self, layer_ids: List[int]):
+        if layer_ids is None:
+            raise ValueError(
+                "DFLASH requires explicit layer_ids for aux hidden capture."
+            )
+        self.capture_aux_hidden_states = True
+        # we plus 1 here because in sglang, for the ith layer, it takes the output
+        # of the (i-1)th layer as aux hidden state
+        self.language_model.layers_to_capture = [val + 1 for val in layer_ids]
 
 
 EntryClass = Gemma4ForConditionalGeneration

@@ -45,7 +45,10 @@ from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
-from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
+from sglang.srt.layers.vocab_parallel_embedding import (
+    ParallelLMHead,
+    VocabParallelEmbeddingShardIndices,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
@@ -66,6 +69,25 @@ def get_attention_sliding_window_size(config):
 
 Gemma4MLP = Gemma3MLP
 Gemma4TextScaledWordEmbedding = Gemma3TextScaledWordEmbedding
+
+
+def _ensure_dflash_shard_indices(lm_head, vocab_size: int) -> None:
+    """Inject a tp=1 ShardIndices namespace into a non-vocab-parallel lm_head
+    so the SGLang DFLASH worker passes its `hasattr(lm_head, 'shard_indices')`
+    gate. Gemma 4 uses a tied embed_tokens (nn.Embedding) for lm_head, which
+    has no shard_indices on its own."""
+    if getattr(lm_head, "shard_indices", None) is not None:
+        return
+    lm_head.shard_indices = VocabParallelEmbeddingShardIndices(
+        padded_org_vocab_start_index=0,
+        padded_org_vocab_end_index=vocab_size,
+        padded_added_vocab_start_index=vocab_size,
+        padded_added_vocab_end_index=vocab_size,
+        org_vocab_start_index=0,
+        org_vocab_end_index=vocab_size,
+        added_vocab_start_index=vocab_size,
+        added_vocab_end_index=vocab_size,
+    )
 
 
 class Gemma4Router(nn.Module):
@@ -934,6 +956,7 @@ class Gemma4ForCausalLM(PreTrainedModel):
                 quant_config=quant_config,
                 prefix=add_prefix("lm_head", prefix),
             )
+        _ensure_dflash_shard_indices(self.lm_head, config.vocab_size)
         self.capture_aux_hidden_states = False
         self.post_init()
 
@@ -1134,6 +1157,16 @@ class Gemma4ForCausalLM(PreTrainedModel):
             # we plus 1 here because in sglang, for the ith layer, it takes the output
             # of the (i-1)th layer as aux hidden state
             self.model.layers_to_capture = [val + 1 for val in layer_ids]
+
+    def set_dflash_layers_to_capture(self, layer_ids: List[int]):
+        if layer_ids is None:
+            raise ValueError(
+                "DFLASH requires explicit layer_ids for aux hidden capture."
+            )
+        self.capture_aux_hidden_states = True
+        # we plus 1 here because in sglang, for the ith layer, it takes the output
+        # of the (i-1)th layer as aux hidden state
+        self.model.layers_to_capture = [val + 1 for val in layer_ids]
 
 
 EntryClass = Gemma4ForCausalLM
