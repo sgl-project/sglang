@@ -153,7 +153,7 @@ class LMCRadixCache(RadixCache):
         )
 
         device_module = torch.get_device_module(self.device)
-        if hasattr(device_module, "Stream") or hasattr(device_module, "stream"):
+        if hasattr(device_module, "Stream") and hasattr(device_module, "stream"):
             self.load_stream = device_module.Stream()
             self.store_stream = device_module.Stream()
             self.load_stream_ctx = device_module.stream(self.load_stream)
