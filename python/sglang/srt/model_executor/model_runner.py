@@ -1962,3 +1962,9 @@ class ModelRunner:
         self.server_args.model_path = model_path
         self.server_args.load_format = load_format
         self.load_config = load_config
+
+    def recapture_cuda_graph(self) -> None:
+        """Re-capture device graphs after a model swap. Caller gates by device."""
+        self.graph_runner, self.graph_mem_usage = device_graphs.create_device_graphs(
+            self
+        )

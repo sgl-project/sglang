@@ -8,7 +8,6 @@ from typing import Any, Callable, List, Optional, Tuple, Union
 import torch
 
 from sglang.srt.configs.load_config import LoadConfig
-from sglang.srt.model_executor.model_runner_components import device_graphs
 from sglang.srt.model_loader.loader import DefaultModelLoader, get_model_loader
 from sglang.srt.model_loader.utils import set_default_torch_dtype
 from sglang.srt.model_loader.weight_utils import default_weight_loader
@@ -167,9 +166,7 @@ class WeightUpdater:
                 and current_platform.support_cuda_graph()
             )
         ):
-            self._mr.graph_runner, self._mr.graph_mem_usage = (
-                device_graphs.create_device_graphs(self._mr)
-            )
+            self._mr.recapture_cuda_graph()
 
         logger.info("Update weights end.")
         return True, "Succeeded to update model weights."
