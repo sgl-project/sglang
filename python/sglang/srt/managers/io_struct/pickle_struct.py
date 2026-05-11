@@ -1703,7 +1703,7 @@ class ProfileReqType(Enum):
 
 @dataclass
 class ProfileReq(BaseReq):
-    type: ProfileReqType
+    profile_type: ProfileReqType
     output_dir: Optional[str] = None
     start_step: Optional[int] = None
     num_steps: Optional[int] = None
@@ -1777,29 +1777,6 @@ class ExpertDistributionReq(BaseReq):
 class ExpertDistributionReqOutput(BaseReq):
     pass
 
-
-@dataclass
-class Function:
-    description: Optional[str] = None
-    name: Optional[str] = None
-    parameters: Optional[object] = None
-
-
-@dataclass
-class Tool:
-    function: Function
-    type: Optional[str] = "function"
-
-
-@dataclass
-class ParseFunctionCallReq(BaseReq):
-    text: str  # The text to parse.
-    tools: List[Tool] = field(
-        default_factory=list
-    )  # A list of available function tools (name, parameters, etc.).
-    tool_call_parser: Optional[str] = (
-        None  # Specify the parser type, e.g. 'llama3', 'qwen25', or 'mistral'. If not specified, tries all.
-    )
 
 
 @dataclass

@@ -377,7 +377,7 @@ class SchedulerProfilerMixin:
                 self.start_profile()
 
     def profile(self: Scheduler, recv_req: ProfileReq):
-        if recv_req.type == ProfileReqType.START_PROFILE:
+        if recv_req.profile_type == ProfileReqType.START_PROFILE:
             if recv_req.profile_by_stage or recv_req.start_step:
                 return self.init_profile(
                     recv_req.output_dir,

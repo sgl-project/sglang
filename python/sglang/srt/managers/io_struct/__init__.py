@@ -1,101 +1,32 @@
-import logging
-from typing import Union
 
+from dataclasses import dataclass, field
 import msgspec
+from typing import Union, Optional, List
+
 from zmq import Socket
 from zmq.asyncio import Socket as AsyncSocket
 
 from sglang.srt.environ import envs
 
 from .pickle_struct import (
-    AbortReq,
-    ActiveRanksOutput,
-    AddExternalCorpusReqInput,
-    AddExternalCorpusReqOutput,
-    AttachHiCacheStorageReqInput,
-    AttachHiCacheStorageReqOutput,
-    BackupDramReq,
+    # Below objects are not used for IPC
     BaseBatchReq,
     BaseReq,
-    BlockReqInput,
-    BlockReqType,
-    CheckWeightsReqInput,
-    CheckWeightsReqOutput,
-    ClearHiCacheReqInput,
-    ClearHiCacheReqOutput,
-    CloseSessionReqInput,
-    ConfigureLoggingReq,
-    ContinueGenerationReqInput,
-    DestroyWeightsUpdateGroupReqInput,
-    DestroyWeightsUpdateGroupReqOutput,
-    DetachHiCacheStorageReqInput,
-    DetachHiCacheStorageReqOutput,
-    DumperControlReqInput,
-    DumperControlReqOutput,
     EmbeddingReqInput,
-    ExpertDistributionReq,
-    ExpertDistributionReqOutput,
-    ExpertDistributionReqType,
-    Function,
     GenerateReqInput,
-    GetInternalStateReq,
-    GetInternalStateReqOutput,
-    GetLoadsReqInput,
-    GetWeightsByNameReqInput,
-    GetWeightsByNameReqOutput,
-    HealthCheckOutput,
-    InitWeightsSendGroupForRemoteInstanceReqInput,
-    InitWeightsSendGroupForRemoteInstanceReqOutput,
-    InitWeightsUpdateGroupReqInput,
-    InitWeightsUpdateGroupReqOutput,
-    LazyDumpTensorsReqInput,
-    LazyDumpTensorsReqOutput,
-    ListExternalCorporaReqInput,
-    ListExternalCorporaReqOutput,
-    LoadLoRAAdapterFromTensorsReqInput,
-    LoadLoRAAdapterReqInput,
-    LoRAUpdateOutput,
-    MultimodalDataInputFormat,
-    OpenSessionReqInput,
-    OpenSessionReqOutput,
-    ParseFunctionCallReq,
-    PauseGenerationReqInput,
-    ProfileReq,
+    ConfigureLoggingReq,
     ProfileReqInput,
-    ProfileReqOutput,
-    ProfileReqType,
-    ReleaseMemoryOccupationReqInput,
-    ReleaseMemoryOccupationReqOutput,
-    RemoveExternalCorpusReqInput,
-    RemoveExternalCorpusReqOutput,
-    ResumeMemoryOccupationReqInput,
-    ResumeMemoryOccupationReqOutput,
-    RpcReqInput,
-    RpcReqOutput,
-    SendWeightsToRemoteInstanceReqInput,
-    SendWeightsToRemoteInstanceReqOutput,
+    UpdateWeightVersionReqInput,
+    VertexGenerateReqInput,
+    MultimodalDataInputFormat,
+
+    # Below objects are not in used.
     SeparateReasoningReqInput,
     SetInjectDumpMetadataReqInput,
     SetInjectDumpMetadataReqOutput,
-    SetInternalStateReq,
-    SetInternalStateReqOutput,
-    SlowDownReqInput,
-    SlowDownReqOutput,
-    SpeculativeDecodingMetricsMixin,
-    Tool,
-    UnloadLoRAAdapterReqInput,
-    UpdateExpertBackupReq,
-    UpdateWeightFromDiskReqInput,
-    UpdateWeightFromDiskReqOutput,
-    UpdateWeightsFromDistributedReqInput,
-    UpdateWeightsFromDistributedReqOutput,
-    UpdateWeightsFromIPCReqInput,
-    UpdateWeightsFromIPCReqOutput,
-    UpdateWeightsFromTensorReqInput,
-    UpdateWeightsFromTensorReqOutput,
-    UpdateWeightVersionReqInput,
-    VertexGenerateReqInput,
-    WatchLoadUpdateReq,
+    LazyDumpTensorsReqInput,
+    LazyDumpTensorsReqOutput,
+    # SpeculativeDecodingMetricsMixin,
 )
 
 if envs.SGLANG_IPC_USE_MSGPACK.get():
@@ -107,6 +38,7 @@ if envs.SGLANG_IPC_USE_MSGPACK.get():
         FlushCacheReqInput,
         FlushCacheReqOutput,
         FreezeGCReq,
+        GetLoadsReqInput,
         GetLoadsReqOutput,
         LoRAMetrics,
         MemoryMetrics,
@@ -117,6 +49,75 @@ if envs.SGLANG_IPC_USE_MSGPACK.get():
         BatchTokenizedGenerateReqInput,
         TokenizedEmbeddingReqInput,
         BatchTokenizedEmbeddingReqInput,
+        AbortReq,
+        OpenSessionReqInput,
+        OpenSessionReqOutput,
+        CloseSessionReqInput,
+        UpdateWeightFromDiskReqInput,
+        UpdateWeightFromDiskReqOutput,
+        HealthCheckOutput,
+        ActiveRanksOutput,
+        InitWeightsUpdateGroupReqInput,
+        InitWeightsUpdateGroupReqOutput,
+        DestroyWeightsUpdateGroupReqInput,
+        DestroyWeightsUpdateGroupReqOutput,
+        UpdateWeightsFromDistributedReqInput,
+        UpdateWeightsFromDistributedReqOutput,
+        InitWeightsSendGroupForRemoteInstanceReqInput,
+        InitWeightsSendGroupForRemoteInstanceReqOutput,
+        SendWeightsToRemoteInstanceReqInput,
+        SendWeightsToRemoteInstanceReqOutput,
+        UpdateWeightsFromTensorReqInput,
+        UpdateWeightsFromTensorReqOutput,
+        UpdateWeightsFromIPCReqInput,
+        UpdateWeightsFromIPCReqOutput,
+        GetWeightsByNameReqInput,
+        GetWeightsByNameReqOutput,
+        ReleaseMemoryOccupationReqInput,
+        ReleaseMemoryOccupationReqOutput,
+        ResumeMemoryOccupationReqInput,
+        ResumeMemoryOccupationReqOutput,
+        CheckWeightsReqInput,
+        CheckWeightsReqOutput,
+        SlowDownReqInput,
+        SlowDownReqOutput,
+        AddExternalCorpusReqInput,
+        AddExternalCorpusReqOutput,
+        RemoveExternalCorpusReqInput,
+        RemoveExternalCorpusReqOutput,
+        ListExternalCorporaReqInput,
+        ListExternalCorporaReqOutput,
+        ClearHiCacheReqInput,
+        ClearHiCacheReqOutput,
+        AttachHiCacheStorageReqInput,
+        AttachHiCacheStorageReqOutput,
+        DetachHiCacheStorageReqInput,
+        DetachHiCacheStorageReqOutput,
+        ProfileReqType,
+        ProfileReq,
+        ProfileReqOutput,
+        GetInternalStateReq,
+        GetInternalStateReqOutput,
+        SetInternalStateReq,
+        SetInternalStateReqOutput,
+        ExpertDistributionReqType,
+        ExpertDistributionReq,
+        ExpertDistributionReqOutput,
+        LoadLoRAAdapterReqInput,
+        UnloadLoRAAdapterReqInput,
+        LoadLoRAAdapterFromTensorsReqInput,
+        LoRAUpdateOutput,
+        DumperControlReqInput,
+        DumperControlReqOutput,
+        WatchLoadUpdateReq,
+        ContinueGenerationReqInput,
+        PauseGenerationReqInput,
+        RpcReqInput,
+        RpcReqOutput,
+        BlockReqType,
+        BlockReqInput,
+        BackupDramReq,
+        UpdateExpertBackupReq,
     )
 else:
     from .pickle_struct import (
@@ -127,6 +128,7 @@ else:
         FlushCacheReqInput,
         FlushCacheReqOutput,
         FreezeGCReq,
+        GetLoadsReqInput,
         GetLoadsReqOutput,
         LoRAMetrics,
         MemoryMetrics,
@@ -137,8 +139,78 @@ else:
         BatchTokenizedGenerateReqInput,
         TokenizedEmbeddingReqInput,
         BatchTokenizedEmbeddingReqInput,
+        AbortReq,
+        OpenSessionReqInput,
+        OpenSessionReqOutput,
+        CloseSessionReqInput,
+        UpdateWeightFromDiskReqInput,
+        UpdateWeightFromDiskReqOutput,
+        HealthCheckOutput,
+        ActiveRanksOutput,
+        InitWeightsUpdateGroupReqInput,
+        InitWeightsUpdateGroupReqOutput,
+        DestroyWeightsUpdateGroupReqInput,
+        DestroyWeightsUpdateGroupReqOutput,
+        UpdateWeightsFromDistributedReqInput,
+        UpdateWeightsFromDistributedReqOutput,
+        InitWeightsSendGroupForRemoteInstanceReqInput,
+        InitWeightsSendGroupForRemoteInstanceReqOutput,
+        SendWeightsToRemoteInstanceReqInput,
+        SendWeightsToRemoteInstanceReqOutput,
+        UpdateWeightsFromTensorReqInput,
+        UpdateWeightsFromTensorReqOutput,
+        UpdateWeightsFromIPCReqInput,
+        UpdateWeightsFromIPCReqOutput,
+        GetWeightsByNameReqInput,
+        GetWeightsByNameReqOutput,
+        ReleaseMemoryOccupationReqInput,
+        ReleaseMemoryOccupationReqOutput,
+        ResumeMemoryOccupationReqInput,
+        ResumeMemoryOccupationReqOutput,
+        CheckWeightsReqInput,
+        CheckWeightsReqOutput,
+        SlowDownReqInput,
+        SlowDownReqOutput,
+        AddExternalCorpusReqInput,
+        AddExternalCorpusReqOutput,
+        RemoveExternalCorpusReqInput,
+        RemoveExternalCorpusReqOutput,
+        ListExternalCorporaReqInput,
+        ListExternalCorporaReqOutput,
+        ClearHiCacheReqInput,
+        ClearHiCacheReqOutput,
+        AttachHiCacheStorageReqInput,
+        AttachHiCacheStorageReqOutput,
+        DetachHiCacheStorageReqInput,
+        DetachHiCacheStorageReqOutput,
+        ProfileReqType,
+        ProfileReq,
+        ProfileReqOutput,
+        GetInternalStateReq,
+        GetInternalStateReqOutput,
+        SetInternalStateReq,
+        SetInternalStateReqOutput,
+        ExpertDistributionReqType,
+        ExpertDistributionReq,
+        ExpertDistributionReqOutput,
+        LoadLoRAAdapterReqInput,
+        UnloadLoRAAdapterReqInput,
+        LoadLoRAAdapterFromTensorsReqInput,
+        LoRAUpdateOutput,
+        DumperControlReqInput,
+        DumperControlReqOutput,
+        WatchLoadUpdateReq,
+        ContinueGenerationReqInput,
+        PauseGenerationReqInput,
+        RpcReqInput,
+        RpcReqOutput,
+        BlockReqType,
+        BlockReqInput,
+        BackupDramReq,
+        UpdateExpertBackupReq,
     )
 
+import logging
 
 logger = logging.getLogger(__name__)
 
@@ -148,6 +220,29 @@ LoadLoRAAdapterReqOutput = UnloadLoRAAdapterReqOutput = (
 
 PICKLE_MAGIC_NUMBER = b"0xSG01"
 MSGPACK_MAGIC_NUMBER = b"0xSG02"
+
+@dataclass
+class Function:
+    description: Optional[str] = None
+    name: Optional[str] = None
+    parameters: Optional[object] = None
+
+
+@dataclass
+class Tool:
+    function: Function
+    type: Optional[str] = "function"
+
+
+@dataclass
+class ParseFunctionCallReq(BaseReq):
+    text: str  # The text to parse.
+    tools: List[Tool] = field(
+        default_factory=list
+    )  # A list of available function tools (name, parameters, etc.).
+    tool_call_parser: Optional[str] = (
+        None  # Specify the parser type, e.g. 'llama3', 'qwen25', or 'mistral'. If not specified, tries all.
+    )
 
 
 def sock_send(
@@ -264,7 +359,6 @@ async def sock_recv_async(
 __all__ = [
     "BaseReq",
     "BaseBatchReq",
-    "SpeculativeDecodingMetricsMixin",
     "SessionParams",
     "GenerateReqInput",
     "TokenizedGenerateReqInput",

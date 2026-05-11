@@ -1,17 +1,17 @@
+from enum import Enum
+import msgspec
 from typing import Any, Dict, List, Optional, Type, Union
 
-import msgspec
 import torch
 
-from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.lora.lora_registry import LoRARef
+from sglang.srt.managers.schedule_batch import Modality
+from sglang.srt.managers.embed_types import PositionalEmbeds
+from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.observability.req_time_stats import (
     SchedulerReqTimeStats,
     ReqTimeStatsBase,
 )
-from sglang.srt.managers.schedule_batch import Modality
-from sglang.srt.managers.embed_types import PositionalEmbeds
-from sglang.srt.sampling.sampling_params import SamplingParams
-
 
 class LoRAMetrics(msgspec.Struct, tag=True):
     """LoRA adapter pool metrics."""
@@ -57,6 +57,28 @@ class QueueMetrics(msgspec.Struct, tag=True):
     grammar: int
     paused: int
     retracted: int
+
+
+class GetLoadsReqInput(msgspec.Struct, tag=True):
+    # From GetLoadsReqInput dataclass
+    """Request for /v1/loads endpoint."""
+
+    VALID_SECTIONS = frozenset(
+        {"core", "memory", "spec", "lora", "disagg", "queues", "all"}
+    )
+
+    include: List[str] = msgspec.field(default_factory=lambda: ["all"])
+    dp_rank: Optional[int] = None
+
+    def __post_init__(self):
+        """Validate include sections."""
+        if self.include:
+            invalid = set(self.include) - self.VALID_SECTIONS
+            if invalid:
+                raise ValueError(
+                    f"Invalid include sections: {invalid}. "
+                    f"Valid options: {sorted(self.VALID_SECTIONS)}"
+                )
 
 
 class GetLoadsReqOutput(msgspec.Struct, tag=True):
@@ -559,6 +581,568 @@ class BatchTokenizedEmbeddingReqInput(msgspec.Struct, tag=True):
     http_worker_ipcs: Optional[List[str]] = None
 
 
+class AbortReq(msgspec.Struct, tag=True):
+    # From AbortReq dataclass
+    abort_all: bool = False
+    finished_reason: Optional[Dict[str, Any]] = None
+    abort_message: Optional[str] = None
+
+    # From BaseReq dataclass
+    rid: Optional[str] = None
+    http_worker_ipc: Optional[str] = None
+
+
+class OpenSessionReqOutput(msgspec.Struct, tag=True):
+    # From OpenSessionReqOutput dataclass
+    session_id: Optional[str]
+    success: bool
+
+
+class OpenSessionReqInput(msgspec.Struct, tag=True):
+    # From OpenSessionReqInput dataclass
+    capacity_of_str_len: int
+    session_id: Optional[str] = None
+    streaming: Optional[bool] = None
+    timeout: Optional[float] = None
+
+class CloseSessionReqInput(msgspec.Struct, tag=True):
+    # From CloseSessionReqInput dataclass
+    session_id: str
+
+
+class UpdateWeightFromDiskReqInput(msgspec.Struct, tag=True):
+    # The model path with the new weights
+    model_path: str
+    # The format to load the weights
+    load_format: Optional[str] = None
+    # Whether to abort all requests before updating weights
+    abort_all_requests: bool = False
+    # Optional: Update weight version along with weights
+    weight_version: Optional[str] = None
+    # Whether to update weights asynchronously
+    is_async: bool = False
+    # Whether to empty torch cache
+    torch_empty_cache: bool = False
+    # Whether to keep the scheduler paused after weight update
+    keep_pause: bool = False
+    # Whether to recapture cuda graph after weight update
+    recapture_cuda_graph: bool = False
+    # The trainer step id. Used to know which step's weights are used for sampling.
+    token_step: int = 0
+    # Whether to flush the cache after updating weights
+    flush_cache: bool = True
+    # Tensor metadata
+    manifest: Optional[Dict[str, Any]] = None
+
+
+class UpdateWeightFromDiskReqOutput(msgspec.Struct, tag=True):
+    # From UpdateWeightFromDiskReqOutput dataclass
+    success: bool
+    message: str
+    # Number of paused requests during weight sync.
+    num_paused_requests: Optional[int] = 0
+
+
+class HealthCheckOutput(msgspec.Struct, tag=True):
+    # From HealthCheckOutput dataclass
+    pass
+
+
+class ActiveRanksOutput(msgspec.Struct, tag=True):
+    # From ActiveRanksOutput dataclass
+    status: List[bool]
+
+
+class InitWeightsUpdateGroupReqInput(msgspec.Struct, tag=True):
+    # From InitWeightsUpdateGroupReqInput dataclass
+    # The master address
+    master_address: str
+    # The master port
+    master_port: int
+    # The rank offset
+    rank_offset: int
+    # The world size
+    world_size: int
+    # The group name
+    group_name: str = "weight_update_group"
+    # The backend
+    backend: str = "nccl"
+
+
+class InitWeightsUpdateGroupReqOutput(msgspec.Struct, tag=True):
+    # From InitWeightsUpdateGroupReqOutput dataclass
+    success: bool
+    message: str
+
+
+class DestroyWeightsUpdateGroupReqInput(msgspec.Struct, tag=True):
+    # From DestroyWeightsUpdateGroupReqInput dataclass
+    group_name: str = "weight_update_group"
+
+
+class DestroyWeightsUpdateGroupReqOutput(msgspec.Struct, tag=True):
+    # From DestroyWeightsUpdateGroupReqOutput dataclass
+    success: bool
+    message: str
+
+
+class UpdateWeightsFromDistributedReqInput(msgspec.Struct, tag=True):
+    # From UpdateWeightsFromDistributedReqInput dataclass
+    names: List[str]
+    dtypes: List[str]
+    shapes: List[List[int]]
+    # The group name
+    group_name: str = "weight_update_group"
+    # Whether to flush the cache after updating weights
+    flush_cache: bool = True
+    # Whether to abort all requests before updating weights
+    abort_all_requests: bool = False
+    # Optional: Update weight version along with weights
+    weight_version: Optional[str] = None
+    # Optional format specification for loading
+    load_format: Optional[str] = None
+    # Whether to call torch.cuda.empty_cache() during flush
+    torch_empty_cache: bool = False
+
+
+class UpdateWeightsFromDistributedReqOutput(msgspec.Struct, tag=True):
+    # From UpdateWeightsFromDistributedReqOutput dataclass
+    success: bool
+    message: str
+
+
+class InitWeightsSendGroupForRemoteInstanceReqInput(msgspec.Struct, tag=True):
+    # From InitWeightsSendGroupForRemoteInstanceReqInput dataclass
+    # The master address
+    master_address: str
+    # The master port
+    master_port: int
+    # The rank offset
+    rank_offset: int
+    # The world size
+    world_size: int
+    # The group name
+    group_name: str = "weight_send_group"
+    # The backend
+    backend: str = "nccl"
+
+
+class InitWeightsSendGroupForRemoteInstanceReqOutput(msgspec.Struct, tag=True):
+    # From InitWeightsSendGroupForRemoteInstanceReqOutput dataclass
+    success: bool
+    message: str
+
+
+class SendWeightsToRemoteInstanceReqInput(msgspec.Struct, tag=True):
+    # From SendWeightsToRemoteInstanceReqInput dataclass
+    # The master address
+    master_address: str
+    # The ports for each rank's communication group
+    ports: str
+    # The group name
+    group_name: str = "weight_send_group"
+
+
+class SendWeightsToRemoteInstanceReqOutput(msgspec.Struct, tag=True):
+    # From SendWeightsToRemoteInstanceReqOutput dataclass
+    success: bool
+    message: str
+
+
+class UpdateWeightsFromTensorReqInput(msgspec.Struct, tag=True):
+    # From UpdateWeightsFromTensorReqInput dataclass
+    """Update model weights from tensor input.
+
+    - Tensors are serialized for transmission
+    - Data is structured in JSON for easy transmission over HTTP
+    """
+
+    serialized_named_tensors: List[bytes]
+    # Optional format specification for loading
+    load_format: Optional[str] = None
+    # Whether to flush the cache after updating weights
+    flush_cache: bool = True
+    # Whether to abort all requests before updating weights
+    abort_all_requests: bool = False
+    # Optional: Update weight version along with weights
+    weight_version: Optional[str] = None
+    # Optional: Determine whether to disable updating the draft model
+    disable_draft_model: Optional[bool] = None
+    # Whether to call torch.cuda.empty_cache() during flush
+    torch_empty_cache: bool = False
+
+
+class UpdateWeightsFromTensorReqOutput(msgspec.Struct, tag=True):
+    # From UpdateWeightsFromTensorReqOutput dataclass
+    success: bool
+    message: str
+
+
+class UpdateWeightsFromIPCReqInput(msgspec.Struct, tag=True):
+    # From UpdateWeightsFromIPCReqInput dataclass
+    # ZMQ socket paths for each device UUID
+    zmq_handles: Dict[str, str]
+    # Whether to flush cache after weight update
+    flush_cache: bool = True
+    # Optional: Update weight version along with weights
+    weight_version: Optional[str] = None
+    # Whether to call torch.cuda.empty_cache() during flush
+    torch_empty_cache: bool = False
+
+
+class UpdateWeightsFromIPCReqOutput(msgspec.Struct, tag=True):
+    # From UpdateWeightsFromIPCReqOutput dataclass
+    success: bool
+    message: str
+
+
+class GetWeightsByNameReqInput(msgspec.Struct, tag=True):
+    # From GetWeightsByNameReqInput dataclass
+    name: str
+    truncate_size: int = 100
+
+
+class GetWeightsByNameReqOutput(msgspec.Struct, tag=True):
+    # From GetWeightsByNameReqOutput dataclass
+    parameter: list
+
+
+class ReleaseMemoryOccupationReqInput(msgspec.Struct, tag=True):
+    # From ReleaseMemoryOccupationReqInput dataclass
+    # Optional tags to identify the memory region, which is primarily used for RL
+    # Currently we only support `weights` and `kv_cache`
+    tags: Optional[List[str]] = None
+
+
+class ReleaseMemoryOccupationReqOutput(msgspec.Struct, tag=True):
+    # From ReleaseMemoryOccupationReqOutput dataclass
+    pass
+
+
+class ResumeMemoryOccupationReqInput(msgspec.Struct, tag=True):
+    # From ResumeMemoryOccupationReqInput dataclass
+    # Optional tags to identify the memory region, which is primarily used for RL
+    # Currently we only support `weights` and `kv_cache`
+    tags: Optional[List[str]] = None
+
+
+class ResumeMemoryOccupationReqOutput(msgspec.Struct, tag=True):
+    # From ResumeMemoryOccupationReqOutput dataclass
+    pass
+
+
+class CheckWeightsReqInput(msgspec.Struct, tag=True):
+    # From CheckWeightsReqInput dataclass
+    action: str
+
+
+class CheckWeightsReqOutput(msgspec.Struct, tag=True):
+    # From CheckWeightsReqOutput dataclass
+    success: bool
+    message: str
+
+
+class SlowDownReqInput(msgspec.Struct, tag=True):
+    # From SlowDownReqInput dataclass
+    forward_sleep_time: Optional[float]
+
+
+class SlowDownReqOutput(msgspec.Struct, tag=True):
+    # From SlowDownReqOutput dataclass
+    pass
+
+
+class FlushCacheReqInput(msgspec.Struct, tag=True):
+    # From FlushCacheReqInput dataclass
+    timeout_s: Optional[float] = None
+
+
+class FlushCacheReqOutput(msgspec.Struct, tag=True):
+    # From FlushCacheReqOutput dataclass
+    success: bool
+    message: str
+
+
+class AddExternalCorpusReqInput(msgspec.Struct, tag=True):
+    # From AddExternalCorpusReqInput dataclass
+    corpus_id: Optional[str] = None
+    file_path: Optional[str] = None
+    documents: Optional[List[str]] = None
+    token_chunks: Optional[List[List[int]]] = None
+
+
+class AddExternalCorpusReqOutput(msgspec.Struct, tag=True):
+    # From AddExternalCorpusReqOutput dataclass
+    success: bool
+    corpus_id: str = ""
+    message: str = ""
+    loaded_token_count: int = 0
+
+
+class RemoveExternalCorpusReqInput(msgspec.Struct, tag=True):
+    # From RemoveExternalCorpusReqInput dataclass
+    corpus_id: str
+
+
+class RemoveExternalCorpusReqOutput(msgspec.Struct, tag=True):
+    # From RemoveExternalCorpusReqOutput dataclass
+    success: bool
+    message: str = ""
+
+
+class ListExternalCorporaReqInput(msgspec.Struct, tag=True):
+    pass
+
+
+class ListExternalCorporaReqOutput(msgspec.Struct, tag=True):
+    # From ListExternalCorporaReqOutput dataclass
+    success: bool
+    corpus_token_counts: Dict[str, int]
+    message: str = ""
+
+
+class ClearHiCacheReqInput(msgspec.Struct, tag=True):
+    pass
+
+
+class ClearHiCacheReqOutput(msgspec.Struct, tag=True):
+    # From ClearHiCacheReqOutput dataclass
+    success: bool
+
+
+class AttachHiCacheStorageReqInput(msgspec.Struct, tag=True):
+    # From AttachHiCacheStorageReqInput dataclass
+    """Dynamically attach (enable) HiCache storage backend at runtime.
+
+    Note: `hicache_storage_backend_extra_config_json` is a JSON string. It may contain both:
+    - backend-specific configs (e.g., mooncake master address)
+    - prefetch-related knobs (prefetch_threshold, prefetch_timeout_*, hicache_storage_pass_prefix_keys)
+    """
+
+    hicache_storage_backend: str
+    hicache_storage_backend_extra_config_json: Optional[str] = None
+    hicache_storage_prefetch_policy: Optional[str] = None
+    hicache_write_policy: Optional[str] = None
+
+    def __post_init__(self):
+        if self.hicache_storage_prefetch_policy is None:
+            pass
+        else:
+            allowed = ["best_effort", "wait_complete", "timeout"]
+            if self.hicache_storage_prefetch_policy not in allowed:
+                raise ValueError(
+                    f"Invalid hicache_storage_prefetch_policy: {self.hicache_storage_prefetch_policy!r}. "
+                    f"Expected one of {allowed}."
+                )
+
+        if self.hicache_write_policy is None:
+            return
+        allowed = ["write_back", "write_through", "write_through_selective"]
+        if self.hicache_write_policy not in allowed:
+            raise ValueError(
+                f"Invalid hicache_write_policy: {self.hicache_write_policy!r}. "
+                f"Expected one of {allowed}."
+            )
+
+
+class AttachHiCacheStorageReqOutput(msgspec.Struct, tag=True):
+    # From AttachHiCacheStorageReqOutput dataclass
+    success: bool
+    message: str = ""
+
+
+class DetachHiCacheStorageReqInput(msgspec.Struct, tag=True):
+    # From DetachHiCacheStorageReqInput dataclass
+    pass
+
+
+class DetachHiCacheStorageReqOutput(msgspec.Struct, tag=True):
+    # From DetachHiCacheStorageReqOutput dataclass
+    success: bool
+    message: str = ""
+
+
+class ProfileReqType(Enum):
+    START_PROFILE = 1
+    STOP_PROFILE = 2
+
+
+class ProfileReq(msgspec.Struct, tag=True):
+    # From ProfileReq dataclass
+    profile_type: ProfileReqType
+    output_dir: Optional[str] = None
+    start_step: Optional[int] = None
+    num_steps: Optional[int] = None
+    activities: Optional[List[str]] = None
+    profile_by_stage: bool = False
+    with_stack: Optional[bool] = None
+    record_shapes: Optional[bool] = None
+    profile_id: Optional[str] = None
+    merge_profiles: bool = False
+    profile_prefix: Optional[str] = None
+    profile_stages: Optional[List[str]] = None
+
+
+class ProfileReqOutput(msgspec.Struct, tag=True):
+    # From ProfileReqOutput dataclass
+    success: bool
+    message: str = ""
+
+
+class GetInternalStateReq(msgspec.Struct, tag=True):
+    pass
+
+
+class GetInternalStateReqOutput(msgspec.Struct, tag=True):
+    # From GetInternalStateReqOutput dataclass
+    internal_state: Dict[Any, Any]
+
+
+class SetInternalStateReq(msgspec.Struct, tag=True):
+    server_args: Dict[str, Any]
+
+
+class SetInternalStateReqOutput(msgspec.Struct, tag=True):
+    # From SetInternalStateReqOutput dataclass
+    updated: bool
+    server_args: Dict[str, Any]
+
+
+class ExpertDistributionReqType(Enum):
+    START_RECORD = 1
+    STOP_RECORD = 2
+    DUMP_RECORD = 3
+
+
+class ExpertDistributionReq(msgspec.Struct, tag=True):
+    # From ExpertDistributionReq dataclass
+    action: ExpertDistributionReqType
+
+
+class ExpertDistributionReqOutput(msgspec.Struct, tag=True):
+    # From ExpertDistributionReqOutput dataclass
+    pass
+
+
+class LoadLoRAAdapterReqInput(msgspec.Struct, tag=True):
+    # From LoadLoRAAdapterReqInput dataclass
+    # The name of the lora module to newly loaded.
+    lora_name: str
+    # The path of loading.
+    lora_path: str
+    # Whether to pin the LoRA adapter in memory.
+    pinned: bool = False
+    # The unique identifier for the LoRA adapter, which automatically generated in the `TokenizerManager`.
+    lora_id: Optional[str] = None
+
+    def to_ref(self) -> LoRARef:
+        return LoRARef(
+            lora_id=self.lora_id,
+            lora_name=self.lora_name,
+            lora_path=self.lora_path,
+            pinned=self.pinned,
+        )
+
+
+class UnloadLoRAAdapterReqInput(msgspec.Struct, tag=True):
+    # From UnloadLoRAAdapterReqInput dataclass
+    # The name of lora module to unload.
+    lora_name: str
+    # The unique identifier for the LoRA adapter, which automatically generated in the `TokenizerManager`.
+    lora_id: Optional[str] = None
+
+    def to_ref(self) -> LoRARef:
+        return LoRARef(
+            lora_id=self.lora_id,
+            lora_name=self.lora_name,
+        )
+
+
+class LoadLoRAAdapterFromTensorsReqInput(msgspec.Struct, tag=True):
+    # From LoadLoRAAdapterFromTensorsReqInput dataclass
+    lora_name: str
+    config_dict: Dict[str, Any]
+    serialized_tensors: str
+    pinned: bool = False
+    added_tokens_config: Optional[Dict[str, Any]] = None
+    lora_id: Optional[str] = None
+    load_format: Optional[str] = None
+
+    def to_ref(self) -> LoRARef:
+        return LoRARef(
+            lora_id=self.lora_id,
+            lora_name=self.lora_name,
+            lora_path="__tensor__",
+            pinned=self.pinned,
+        )
+
+
+class LoRAUpdateOutput(msgspec.Struct, tag=True):
+    # From LoRAUpdateOutput dataclass
+    success: bool
+    error_message: Optional[str] = None
+    loaded_adapters: Optional[Dict[str, LoRARef]] = None
+
+
+class DumperControlReqInput(msgspec.Struct, tag=True):
+    # From DumperControlReqInput dataclass
+    method: str
+    body: Dict[str, Any]
+
+
+class DumperControlReqOutput(msgspec.Struct, tag=True):
+    # From DumperControlReqOutput dataclass
+    success: bool
+    response: List[Dict[str, Any]]
+    error: str = ""
+
+class WatchLoadUpdateReq(msgspec.Struct, tag=True):
+    # From WatchLoadUpdateReq dataclass
+    loads: List[GetLoadsReqOutput]
+
+
+class ContinueGenerationReqInput(msgspec.Struct, tag=True):
+    # From ContinueGenerationReqInput dataclass
+    pass
+
+
+class PauseGenerationReqInput(msgspec.Struct, tag=True):
+    # From PauseGenerationReqInput dataclass
+    mode: str = "abort"
+
+class RpcReqInput(msgspec.Struct, tag=True):
+    # From RpcReqInput dataclass
+    method: str
+    parameters: Optional[Dict] = None
+
+class RpcReqOutput(msgspec.Struct, tag=True):
+    # From RpcReqOutput dataclass
+    success: bool
+    message: str
+
+class BlockReqType(Enum):
+    BLOCK = 1
+    UNBLOCK = 2
+
+class BlockReqInput(msgspec.Struct, tag=True):
+    # From BlockReqInput dataclass
+    block_type: BlockReqType
+
+
+class UpdateExpertBackupReq(msgspec.Struct, tag=True):
+    # From UpdateExpertBackupReq dataclass
+    pass
+
+
+
+class BackupDramReq(msgspec.Struct, tag=True):
+    # From BackupDramReq dataclass
+    rank: int
+    weight_pointer_map: Dict[str, Any]
+    session_id: str
+    buffer_size: int
+
+
 def enc_hook(obj: Any) -> Any:
     if isinstance(obj, torch.Tensor):
         # encode torch tensor as Tuple(shape, dtype, data)
@@ -599,6 +1183,7 @@ _unified_struct = Union[
     BatchTokenIDOutput,
     BatchStrOutput,
     BatchEmbeddingOutput,
+    GetLoadsReqInput,
     GetLoadsReqOutput,
     MemoryMetrics,
     SpeculativeMetrics,
@@ -610,6 +1195,72 @@ _unified_struct = Union[
     BatchTokenizedGenerateReqInput,
     TokenizedEmbeddingReqInput,
     BatchTokenizedEmbeddingReqInput,
+    AbortReq,
+    OpenSessionReqInput,
+    OpenSessionReqOutput,
+    CloseSessionReqInput,
+    UpdateWeightFromDiskReqInput,
+    UpdateWeightFromDiskReqOutput,
+    HealthCheckOutput,
+    ActiveRanksOutput,
+    InitWeightsUpdateGroupReqInput,
+    InitWeightsUpdateGroupReqOutput,
+    DestroyWeightsUpdateGroupReqInput,
+    DestroyWeightsUpdateGroupReqOutput,
+    UpdateWeightsFromDistributedReqInput,
+    UpdateWeightsFromDistributedReqOutput,
+    InitWeightsSendGroupForRemoteInstanceReqInput,
+    InitWeightsSendGroupForRemoteInstanceReqOutput,
+    SendWeightsToRemoteInstanceReqInput,
+    SendWeightsToRemoteInstanceReqOutput,
+    UpdateWeightsFromTensorReqInput,
+    UpdateWeightsFromTensorReqOutput,
+    UpdateWeightsFromIPCReqInput,
+    UpdateWeightsFromIPCReqOutput,
+    GetWeightsByNameReqInput,
+    GetWeightsByNameReqOutput,
+    ReleaseMemoryOccupationReqInput,
+    ReleaseMemoryOccupationReqOutput,
+    ResumeMemoryOccupationReqInput,
+    ResumeMemoryOccupationReqOutput,
+    CheckWeightsReqInput,
+    CheckWeightsReqOutput,
+    SlowDownReqInput,
+    SlowDownReqOutput,
+    AddExternalCorpusReqInput,
+    AddExternalCorpusReqOutput,
+    RemoveExternalCorpusReqInput,
+    RemoveExternalCorpusReqOutput,
+    ListExternalCorporaReqInput,
+    ListExternalCorporaReqOutput,
+    ClearHiCacheReqInput,
+    ClearHiCacheReqOutput,
+    AttachHiCacheStorageReqInput,
+    AttachHiCacheStorageReqOutput,
+    DetachHiCacheStorageReqInput,
+    DetachHiCacheStorageReqOutput,
+    ProfileReq,
+    ProfileReqOutput,
+    GetInternalStateReq,
+    GetInternalStateReqOutput,
+    SetInternalStateReq,
+    SetInternalStateReqOutput,
+    ExpertDistributionReq,
+    ExpertDistributionReqOutput,
+    LoadLoRAAdapterReqInput,
+    UnloadLoRAAdapterReqInput,
+    LoadLoRAAdapterFromTensorsReqInput,
+    LoRAUpdateOutput,
+    DumperControlReqInput,
+    DumperControlReqOutput,
+    WatchLoadUpdateReq,
+    ContinueGenerationReqInput,
+    PauseGenerationReqInput,
+    RpcReqInput,
+    RpcReqOutput,
+    BlockReqInput,
+    UpdateExpertBackupReq,
+    BackupDramReq,
 ]
 
 _msgpack_encoder = msgspec.msgpack.Encoder(enc_hook=enc_hook)

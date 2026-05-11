@@ -1382,7 +1382,7 @@ async def run_encoder(
         request = await sock_recv_async(encoder.schedule_socket)
 
         if isinstance(request, ProfileReq):
-            if request.type == ProfileReqType.START_PROFILE:
+            if request.profile_type == ProfileReqType.START_PROFILE:
                 if encoder.profiler is None:
                     encoder.profiler = EncoderProfiler(encoder.rank)
                 encoder.profiler.start(request)
@@ -1624,7 +1624,7 @@ async def health_generate():
 
         # Broadcast to other TP ranks so distributed ops stay in sync
         for socket in send_sockets:
-            socket.send_pyobj(dummy_request)
+            sock_send(socket, dummy_request)
 
         # Run encode on rank 0 with timeout
         _, _, _, error_msg, _ = await asyncio.wait_for(
@@ -1664,7 +1664,7 @@ async def start_profile_async(obj: Optional[ProfileReqInput] = None):
         req = ProfileReq(ProfileReqType.START_PROFILE)
     else:
         req = ProfileReq(
-            type=ProfileReqType.START_PROFILE,
+            profile_type=ProfileReqType.START_PROFILE,
             output_dir=obj.output_dir,
             start_step=obj.start_step,
             num_steps=obj.num_steps,

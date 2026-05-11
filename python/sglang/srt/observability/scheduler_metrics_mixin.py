@@ -17,6 +17,7 @@ from sglang.srt.managers.io_struct import (
     MemoryMetrics,
     QueueMetrics,
     SpeculativeMetrics,
+    sock_send,
 )
 from sglang.srt.managers.scheduler import ScheduleBatch
 from sglang.srt.managers.utils import GenerationBatchResult
@@ -700,7 +701,7 @@ class SchedulerMetricsMixin:
         kv_metrics.data_parallel_rank = self.dp_rank if self.dp_rank is not None else 0
 
         if not self.send_metrics_from_scheduler.closed:
-            self.send_metrics_from_scheduler.send_pyobj(kv_metrics)
+            sock_send(self.send_metrics_from_scheduler, kv_metrics)
 
     def _publish_kv_events(self: Scheduler):
         if not self.enable_kv_cache_events:
