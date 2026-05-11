@@ -178,16 +178,11 @@ class Gemma2Attention(nn.Module):
         key = k.transpose(1, 2)
         value = v.transpose(1, 2)
 
-        attn_mask = torch.ones(
-            (seq_len, seq_len), device=hidden_states.device, dtype=torch.bool
-        )
-        causal = torch.triu(
+        attn_mask = torch.tril(
             torch.ones(
                 (seq_len, seq_len), device=hidden_states.device, dtype=torch.bool
-            ),
-            diagonal=1,
+            )
         )
-        attn_mask = attn_mask.masked_fill(causal, False)
         if self.is_sliding and self.sliding_window is not None:
             idx = torch.arange(seq_len, device=hidden_states.device)
             dist = idx[None, :] - idx[:, None]
