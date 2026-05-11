@@ -284,11 +284,7 @@ def _run_page_first_staged_write_back_mha(
         device=DEVICE,
         dtype=torch.int64,
     )
-    src_index_dtype = (
-        torch.int32
-        if page_count == 64
-        else torch.int64
-    )
+    src_index_dtype = torch.int32 if page_count == 64 else torch.int64
     device_indices = _token_indices_for_pages(device_pages, dtype=src_index_dtype)
     host_indices = _token_indices_for_pages(host_pages)
 
@@ -365,11 +361,7 @@ def _run_page_first_staged_write_back_mla(
         device=DEVICE,
         dtype=torch.int64,
     )
-    src_index_dtype = (
-        torch.int32
-        if page_count == 64
-        else torch.int64
-    )
+    src_index_dtype = torch.int32 if page_count == 64 else torch.int64
     device_indices = _token_indices_for_pages(device_pages, dtype=src_index_dtype)
     host_indices = _token_indices_for_pages(host_pages)
 
