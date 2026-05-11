@@ -812,9 +812,16 @@ class SchedulerMetricsMixin:
                 0 is correct.
         """
         num_pending_tokens = sum(req.seqlen for req in self.waiting_queue)
-        if self.chunked_req is not None:
-            req = self.chunked_req
-            num_pending_tokens += req.seqlen - len(req.prefix_indices) - chunk_deduct
+        # The in-flight chunked req (at most one — chunk eats the budget)
+        # sits in waiting_queue with seqlen counted as if it were fresh; the
+        # already-prefilled prefix and this iter's planned chunk are not
+        # pending so subtract them.
+        chunked = next(
+            (r for r in self.waiting_queue if r.req_pool_idx is not None),
+            None,
+        )
+        if chunked is not None:
+            num_pending_tokens -= len(chunked.prefix_indices) + chunk_deduct
         return num_pending_tokens
 
     def get_loads(self: Scheduler, req: GetLoadsReqInput = None) -> GetLoadsReqOutput:

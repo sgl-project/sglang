@@ -442,7 +442,6 @@ class PrefillAdder:
         self.req_states = None
         self.can_run_list = []
         self.preempt_list = []
-        self.new_chunked_req = None
         self.log_hit_tokens = 0
         # TODO(lsyin): report the real input tokens excluding page alignment
         self.log_input_tokens = 0
@@ -664,20 +663,6 @@ class PrefillAdder:
             else AddReqResult.CONTINUE
         )
 
-    def add_chunked_req(self, req: Req):
-        """Compat wrapper for callers that still want the legacy
-        ``req | None`` return convention. New callers should pass
-        ``is_resume=True`` to ``add_one_req`` directly."""
-        full_len = len(req.origin_input_ids) + len(req.output_ids)
-        result = self._add_one_req_resume(req)
-        if result == AddReqResult.NO_TOKEN:
-            # SWA early-return: req is not in can_run_list, but stays the
-            # current in-flight chunked req for the next iter.
-            return req
-        # Successful admit. If fill_ids is shorter than the full sequence,
-        # more chunks remain.
-        return req if len(req.fill_ids) < full_len else None
-
     def _add_one_req_resume(self, req: Req):
         """Admit a chunked-resume req. The req already owns a row, holds the
         radix lock, and was admitted as a chunked req in a previous iter — so
@@ -821,7 +806,6 @@ class PrefillAdder:
             req.set_extend_input_len(trunc_len)
             req.fill_ids = req.fill_ids[:trunc_len]
             self.can_run_list.append(req)
-            self.new_chunked_req = req
             self._update_prefill_budget(0, trunc_len, 0)
 
         return self.budget_state()
@@ -967,7 +951,6 @@ class PrefillAdder:
                 req.fill_ids = req.fill_ids[: len(req.prefix_indices) + trunc_len]
 
                 self.can_run_list.append(req)
-                self.new_chunked_req = req
 
                 self._req_inc_lock_ref(req)
                 self._update_prefill_budget(prefix_len, trunc_len, 0)

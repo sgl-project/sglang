@@ -1405,7 +1405,9 @@ class SchedulerDisaggregationDecodeMixin:
         # Process pending prebuilt batch: output processing + filter + merge
         new_prebuilt_batch = self.get_new_prebuilt_batch()
         if new_prebuilt_batch:
-            assert self.chunked_req is None
+            assert not any(
+                r.req_pool_idx is not None for r in self.waiting_queue
+            ), "decode mode should not see an in-flight chunked prefill req"
             self.process_batch_result_prebuilt(new_prebuilt_batch)
             new_prebuilt_batch.filter_batch()
             if not new_prebuilt_batch.is_empty():

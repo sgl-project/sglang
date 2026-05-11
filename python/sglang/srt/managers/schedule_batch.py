@@ -1403,9 +1403,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # This is an optimization to reduce the overhead of the prefill check.
     batch_is_full: bool = False
 
-    # For chunked prefill in PP
-    chunked_req: Optional[Req] = None
-
     # Sampling info
     sampling_info: SamplingBatchInfo = None
 
@@ -1536,7 +1533,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         model_config: ModelConfig,
         enable_overlap: bool,
         spec_algorithm: SpeculativeAlgorithm,
-        chunked_req: Optional[Req] = None,
         dllm_config: Optional[DllmConfig] = None,
     ):
         return_logprob = any(req.return_logprob for req in reqs)
@@ -1562,7 +1558,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             return_routed_experts=any(req.return_routed_experts for req in reqs),
             return_indexer_topk=any(req.return_indexer_topk for req in reqs),
             is_prefill_only=all(req.is_prefill_only for req in reqs),
-            chunked_req=chunked_req,
             dllm_config=dllm_config,
         )
         return batch

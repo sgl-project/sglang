@@ -710,24 +710,32 @@ class SchedulerDisaggregationPrefillMixin:
 
     def process_prefill_chunk(self: Scheduler) -> None:
         chunked_req_to_exclude = set()
-        if self.chunked_req:
-            chunked_req_to_exclude.add(self.chunked_req)
-            maybe_cache_unfinished_req(self.chunked_req, self.tree_cache, chunked=True)
+        # Per-req stash + KV-chunk send for any in-flight chunked req carried
+        # over in waiting_queue. At most one such req exists (budget).
+        for req in self.waiting_queue:
+            if req.req_pool_idx is None:
+                continue
+            chunked_req_to_exclude.add(req)
+            if req.kv_committed_len > req.cache_protected_len:
+                maybe_cache_unfinished_req(req, self.tree_cache, chunked=True)
             if self.enable_overlap:
                 # Delay KV transfer to process_batch_result_disagg_prefill when overlap is enabled to ensure results are resolved
-                self.chunked_req.tmp_end_idx = min(
-                    len(self.chunked_req.fill_ids),
-                    len(self.chunked_req.origin_input_ids),
+                req.tmp_end_idx = min(
+                    len(req.fill_ids),
+                    len(req.origin_input_ids),
                 )
             else:
-                self.send_kv_chunk(self.chunked_req)
+                self.send_kv_chunk(req)
             self.running_batch.batch_is_full = False
 
         if self.last_batch and self.last_batch.forward_mode.is_extend():
-            if self.last_batch.chunked_req:
-                # In the context pipeline parallelism, after the last chunk, the current microbatch still track outdated chunked_req.
-                # We need to discard it.
-                chunked_req_to_exclude.add(self.last_batch.chunked_req)
+            # PP can hold an in-flight chunked req across multiple microbatches.
+            # Any req that appears in both last_batch and waiting_queue is an
+            # in-flight chunked req that must not be merged into running_batch.
+            waiting_set = set(self.waiting_queue)
+            chunked_req_to_exclude.update(
+                r for r in self.last_batch.reqs if r in waiting_set
+            )
 
             last_bs = self.last_batch.batch_size()
             self.last_batch.filter_batch(

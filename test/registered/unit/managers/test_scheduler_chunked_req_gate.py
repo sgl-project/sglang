@@ -94,8 +94,8 @@ def _scheduler_for_get_next_batch(*, tree_cache, chunked_req) -> Scheduler:
     s._maybe_prepare_ngram_embedding = MagicMock(side_effect=lambda batch: batch)
     s.update_running_batch = MagicMock(side_effect=lambda batch: batch)
     s.tree_cache = tree_cache
-    s.chunked_req = chunked_req
-    s.waiting_queue = []
+    # The in-flight chunked req lives at the head of waiting_queue.
+    s.waiting_queue = [chunked_req] if chunked_req is not None else []
     return s
 
 
@@ -167,7 +167,7 @@ class TestStashGatePreservesPrefixIndices(CustomTestCase):
         s = _scheduler_for_get_next_batch(tree_cache=cache, chunked_req=None)
 
         Scheduler.get_next_batch_to_run(s)
-        self.assertIsNone(s.chunked_req)
+        self.assertEqual(s.waiting_queue, [])
 
 
 if __name__ == "__main__":
