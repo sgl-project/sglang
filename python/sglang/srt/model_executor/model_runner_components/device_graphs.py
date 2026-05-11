@@ -3,7 +3,8 @@ from __future__ import annotations
 import logging
 import time
 from collections import defaultdict
-from typing import TYPE_CHECKING
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any, List, Optional
 
 from sglang.srt.configs.model_config import ModelImpl
 from sglang.srt.hardware_backend.npu.graph_runner.npu_graph_runner import (
@@ -24,6 +25,15 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class PCGLayerProbes:
+    """Per-layer probes for piecewise CUDA graph capture."""
+
+    attention_layers: List[Optional[Any]]
+    moe_layers: List[Optional[Any]]
+    moe_fusions: List[Optional[Any]]
 
 
 def create_device_graphs(model_runner: "ModelRunner") -> tuple[object, float]:
@@ -133,9 +143,42 @@ def create_piecewise_cuda_graphs(model_runner: "ModelRunner"):
         )
         return None
 
-    model_runner.attention_layers = []
-    model_runner.moe_layers = []
-    model_runner.moe_fusions = []
+    probes = _collect_pcg_layer_probes(layer_model)
+    model_runner.attention_layers = probes.attention_layers
+    model_runner.moe_layers = probes.moe_layers
+    model_runner.moe_fusions = probes.moe_fusions
+
+    if len(probes.attention_layers) < model_runner.model_config.num_hidden_layers:
+        # TODO(yuwei): support Non-Standard GQA
+        log_info_on_rank0(
+            logger,
+            "Disable piecewise CUDA graph because some layers do not apply Standard GQA",
+        )
+        return None
+
+    tic = time.perf_counter()
+    before_mem = get_available_gpu_memory(model_runner.device, model_runner.gpu_id)
+    logger.info(f"Capture piecewise CUDA graph begin. avail mem={before_mem:.2f} GB")
+
+    if model_runner.server_args.enable_breakable_cuda_graph:
+        # Experimental feature
+        piecewise_cuda_graph_runner = BreakableCudaGraphRunner(model_runner)
+    else:
+        piecewise_cuda_graph_runner = PiecewiseCudaGraphRunner(model_runner)
+
+    after_mem = get_available_gpu_memory(model_runner.device, model_runner.gpu_id)
+    mem_usage = before_mem - after_mem
+    logger.info(
+        f"Capture piecewise CUDA graph end. Time elapsed: {time.perf_counter() - tic:.2f} s. "
+        f"mem usage={mem_usage:.2f} GB. avail mem={after_mem:.2f} GB."
+    )
+    return piecewise_cuda_graph_runner
+
+
+def _collect_pcg_layer_probes(layer_model) -> PCGLayerProbes:
+    attention_layers: List[Optional[Any]] = []
+    moe_layers: List[Optional[Any]] = []
+    moe_fusions: List[Optional[Any]] = []
     for layer in layer_model.layers:
         attn_layer = None
         if hasattr(layer, "self_attn"):
@@ -165,9 +208,9 @@ def create_piecewise_cuda_graphs(model_runner: "ModelRunner"):
                 attn_layer = layer
 
         if attn_layer is not None:
-            model_runner.attention_layers.append(attn_layer)
+            attention_layers.append(attn_layer)
         elif hasattr(layer, "mixer"):
-            model_runner.attention_layers.append(None)
+            attention_layers.append(None)
 
         moe_block = None
         moe_fusion = None
@@ -186,31 +229,11 @@ def create_piecewise_cuda_graphs(model_runner: "ModelRunner"):
         if hasattr(layer, "mixer") and hasattr(layer.mixer, "experts"):
             moe_block = layer.mixer.experts
             moe_fusion = layer.mixer
-        model_runner.moe_layers.append(moe_block)
-        model_runner.moe_fusions.append(moe_fusion)
+        moe_layers.append(moe_block)
+        moe_fusions.append(moe_fusion)
 
-    if len(model_runner.attention_layers) < model_runner.model_config.num_hidden_layers:
-        # TODO(yuwei): support Non-Standard GQA
-        log_info_on_rank0(
-            logger,
-            "Disable piecewise CUDA graph because some layers do not apply Standard GQA",
-        )
-        return None
-
-    tic = time.perf_counter()
-    before_mem = get_available_gpu_memory(model_runner.device, model_runner.gpu_id)
-    logger.info(f"Capture piecewise CUDA graph begin. avail mem={before_mem:.2f} GB")
-
-    if model_runner.server_args.enable_breakable_cuda_graph:
-        # Experimental feature
-        piecewise_cuda_graph_runner = BreakableCudaGraphRunner(model_runner)
-    else:
-        piecewise_cuda_graph_runner = PiecewiseCudaGraphRunner(model_runner)
-
-    after_mem = get_available_gpu_memory(model_runner.device, model_runner.gpu_id)
-    mem_usage = before_mem - after_mem
-    logger.info(
-        f"Capture piecewise CUDA graph end. Time elapsed: {time.perf_counter() - tic:.2f} s. "
-        f"mem usage={mem_usage:.2f} GB. avail mem={after_mem:.2f} GB."
+    return PCGLayerProbes(
+        attention_layers=attention_layers,
+        moe_layers=moe_layers,
+        moe_fusions=moe_fusions,
     )
-    return piecewise_cuda_graph_runner
