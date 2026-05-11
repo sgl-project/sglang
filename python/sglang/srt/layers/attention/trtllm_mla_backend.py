@@ -756,14 +756,8 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         return output[:total_tokens, :, :]
 
     def _compute_decode_bmm1_scale(self, layer: RadixAttention) -> float:
-        """Per-layer scale fed into the kernel's QK softmax (BMM1).
-
-        The final BMM1 scale is ``q_scale * k_scale * softmax_scale``.
-        - ``q_scale`` is always 1.0 (Q is quantized at scale=1.0).
-        - ``k_scale`` is the model checkpoint's per-tensor scale, applied only
-          when the KV cache stores FP8 values.
-        - ``softmax_scale`` is ``layer.scaling`` (= 1/sqrt(head_dim)).
-        """
+        """BMM1 scale ``q_scale * k_scale * softmax_scale``. k_scale only
+        applies when the KV cache stores FP8."""
         q_scale = 1.0
         if self.data_type == torch.float8_e4m3fn:
             k_scale = (
@@ -791,12 +785,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         max_seq_len: int,
         layer: RadixAttention,
     ) -> torch.Tensor:
-        """Template method: run the MLA decode kernel.
-
-        Subclasses (e.g. tokenspeed_mla) override this to swap kernels without
-        re-implementing the surrounding FP8 quantize / KV save / query reshape
-        / pad-unpad logic in ``forward_decode`` and ``forward_extend``.
-        """
+        """Hook for subclasses to swap the decode/spec-verify kernel."""
         bmm1_scale = self._compute_decode_bmm1_scale(layer)
         seq_lens_i32 = (
             seq_lens if seq_lens.dtype == torch.int32 else seq_lens.to(torch.int32)
@@ -813,6 +802,51 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             max_seq_len=max_seq_len,
             bmm1_scale=bmm1_scale,
             skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_DECODE_THRESHOLD_SCALE_FACTOR.get(),
+        )
+
+    def _run_prefill_kernel(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        layer: RadixAttention,
+        batch_size: int,
+        cum_seq_lens_q: torch.Tensor,
+        max_q_len: int,
+        seq_lens_kv: torch.Tensor,
+        cum_seq_lens_kv: torch.Tensor,
+        max_kv_len: int,
+        is_causal: bool,
+        return_lse: bool,
+        out_buffer: torch.Tensor,
+        o_sf_scale: float = 1.0,
+    ):
+        """Hook for subclasses to swap the ragged prefill kernel. Q/K/V arrive
+        in model-native dtype; subclasses do any kernel-specific quantization.
+        Returns the output tensor or ``(output, lse)`` if ``return_lse``."""
+        q_scale = k_scale = v_scale = 1.0
+        if self.data_type == torch.float8_e4m3fn:
+            q, k, v, k_scale, v_scale = _quantize_fp8_qkv(q, k, v, layer)
+        return flashinfer.prefill.trtllm_ragged_attention_deepseek(
+            query=q,
+            key=k,
+            value=v,
+            workspace_buffer=self.workspace_buffer,
+            batch_size=batch_size,
+            window_left=-1,
+            enable_pdl=False,
+            max_q_len=max_q_len,
+            bmm1_scale=q_scale * k_scale * layer.scaling,
+            bmm2_scale=v_scale,
+            cum_seq_lens_q=cum_seq_lens_q,
+            cum_seq_lens_kv=cum_seq_lens_kv,
+            seq_lens=seq_lens_kv,
+            max_kv_len=max_kv_len,
+            is_causal=is_causal,
+            return_lse=return_lse,
+            o_sf_scale=o_sf_scale,
+            out=out_buffer,
+            skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_PREFILL_THRESHOLD_SCALE_FACTOR.get(),
         )
 
     def forward_decode(
@@ -1092,25 +1126,6 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         k = k.view(-1, layer.tp_k_head_num, layer.head_dim)
         v = v.view(-1, layer.tp_k_head_num, layer.v_head_dim)
 
-        q_scale = k_scale = v_scale = 1.0
-        if self.data_type == torch.float8_e4m3fn:
-            q, k, v, k_scale, v_scale = _quantize_fp8_qkv(q, k, v, layer)
-
-        common_trtllm_args = {
-            "query": q,
-            "key": k,
-            "value": v,
-            "workspace_buffer": self.workspace_buffer,
-            "batch_size": forward_batch.batch_size,
-            "window_left": -1,
-            "enable_pdl": False,
-            "max_q_len": self.forward_prefill_metadata.max_seq_len,
-            "bmm1_scale": q_scale * k_scale * layer.scaling,
-            "bmm2_scale": v_scale,
-            "cum_seq_lens_q": self.forward_prefill_metadata.cum_seq_lens,
-            "skip_softmax_threshold_scale_factor": envs.SGLANG_SKIP_SOFTMAX_PREFILL_THRESHOLD_SCALE_FACTOR.get(),
-        }
-
         # When chunked prefix cache is enabled, dispatch to different path for ragged attention.
         if forward_batch.attn_attend_prefix_cache:
             # MHA for chunked prefix kv cache when running model with MLA
@@ -1127,15 +1142,21 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 dtype=self.q_data_type,
                 device=q.device,
             )
-            result = flashinfer.prefill.trtllm_ragged_attention_deepseek(
-                **common_trtllm_args,
-                seq_lens=forward_batch.prefix_chunk_seq_lens[chunk_idx],
-                max_kv_len=forward_batch.prefix_chunk_max_seq_lens[chunk_idx],
-                o_sf_scale=-1.0,
+            result = self._run_prefill_kernel(
+                q=q,
+                k=k,
+                v=v,
+                layer=layer,
+                batch_size=forward_batch.batch_size,
+                cum_seq_lens_q=self.forward_prefill_metadata.cum_seq_lens,
+                max_q_len=self.forward_prefill_metadata.max_seq_len,
+                seq_lens_kv=forward_batch.prefix_chunk_seq_lens[chunk_idx],
                 cum_seq_lens_kv=forward_batch.prefix_chunk_cu_seq_lens[chunk_idx],
+                max_kv_len=forward_batch.prefix_chunk_max_seq_lens[chunk_idx],
                 is_causal=False,
                 return_lse=True,
-                out=out,
+                out_buffer=out,
+                o_sf_scale=-1.0,
             )
 
             # The TRT-LLM ragged attention cubin kernel does not correctly
@@ -1164,15 +1185,21 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 device=q.device,
                 dtype=self.q_data_type,
             )
-            return flashinfer.prefill.trtllm_ragged_attention_deepseek(
-                **common_trtllm_args,
-                seq_lens=self.forward_prefill_metadata.seq_lens,
-                max_kv_len=self.forward_prefill_metadata.max_seq_len,
-                o_sf_scale=1.0,
+            return self._run_prefill_kernel(
+                q=q,
+                k=k,
+                v=v,
+                layer=layer,
+                batch_size=forward_batch.batch_size,
+                cum_seq_lens_q=self.forward_prefill_metadata.cum_seq_lens,
+                max_q_len=self.forward_prefill_metadata.max_seq_len,
+                seq_lens_kv=self.forward_prefill_metadata.seq_lens,
                 cum_seq_lens_kv=self.forward_prefill_metadata.cum_seq_lens,
+                max_kv_len=self.forward_prefill_metadata.max_seq_len,
                 is_causal=True,
                 return_lse=forward_batch.mha_return_lse,
-                out=out,
+                out_buffer=out,
+                o_sf_scale=1.0,
             )
 
 

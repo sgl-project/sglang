@@ -1,14 +1,11 @@
 from __future__ import annotations
 
-"""
-Support attention backend for the tokenspeed-mla CuTe DSL kernel on Blackwell.
+"""Attention backend for the tokenspeed-mla CuTe DSL kernels on Blackwell.
 
 Subclasses :class:`TRTLLMMLABackend` and overrides only ``_run_decode_kernel``
-to dispatch decode / spec-verify / draft-extend through
-``tokenspeed_mla.tokenspeed_mla_decode``. All metadata, KV-cache layout,
-CUDA-graph plumbing, FP8 quantize/rope, and draft-extend padding logic are
-inherited unchanged. Pure prefill (extend without speculative) stays on the
-parent's TRT-LLM ragged path.
+and ``_run_prefill_kernel``. All metadata, KV-cache layout, CUDA-graph
+plumbing, FP8 quantize/rope, draft-extend padding, and chunked-prefix
+dispatch are inherited unchanged from the parent.
 """
 
 import logging
@@ -16,6 +13,7 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
+from sglang.jit_kernel.utils import is_arch_support_pdl
 from sglang.srt.layers.attention.trtllm_mla_backend import (
     TRTLLMMLABackend,
     TRTLLMMLAMultiStepDraftBackend,
@@ -27,13 +25,12 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# Upper bound for tokenspeed_mla_decode's workspace:
+
+# Workspace upper bound for tokenspeed_mla_decode:
 #   num_sms * num_heads * max_q_len * (kv_lora_rank + 1) * sizeof(float32)
-# MAX_Q_LEN=8 covers q_len up to 8 (e.g. EAGLE3 num_draft_tokens=4 + headroom).
+# MAX_Q_LEN=8 covers EAGLE3 num_draft_tokens=4 plus headroom.
 _TOKENSPEED_MAX_Q_LEN = 8
 
-# Shared across backend instances on the same device (multi-step draft
-# creates one TokenspeedMLABackend per draft step).
 _g_tokenspeed_workspace: dict[torch.device, torch.Tensor] = {}
 
 
@@ -83,6 +80,49 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
 
         self._tokenspeed_workspace: Optional[torch.Tensor] = None
 
+        # Pre-JIT the prefill kernel variants. Each cute.compile takes 1-2 min;
+        # without warm-up the first request trips the 300 s scheduler watchdog.
+        # The public ``warmup_compile_prefill`` skips ``return_lse=False``, so
+        # we drive the private compile helper for the (causal, no-LSE) variant.
+        try:
+            from tokenspeed_mla.mla_prefill import (
+                _compile_prefill_kernel,
+                _compiled_kernels,
+                _enable_ex2_emulation,
+            )
+
+            head_dim_qk = self.qk_nope_head_dim + self.qk_rope_head_dim
+            enable_ex2_emulation = _enable_ex2_emulation()
+            use_pdl = is_arch_support_pdl()
+            for is_causal in (True, False):
+                for return_lse in (True, False):
+                    # Non-causal is only entered from the chunked-prefix
+                    # branch, which always asks for the LSE.
+                    if is_causal is False and return_lse is False:
+                        continue
+                    config = (
+                        torch.bfloat16,
+                        head_dim_qk,
+                        self.v_head_dim,
+                        is_causal,
+                        return_lse,
+                        use_pdl,
+                        enable_ex2_emulation,
+                    )
+                    if config in _compiled_kernels:
+                        continue
+                    _compiled_kernels[config] = _compile_prefill_kernel(
+                        torch.bfloat16,
+                        head_dim_qk,
+                        self.v_head_dim,
+                        is_causal,
+                        return_lse,
+                        use_pdl=use_pdl,
+                        enable_ex2_emulation=enable_ex2_emulation,
+                    )
+        except ImportError:
+            pass
+
     def _ensure_workspace(self, device: torch.device) -> torch.Tensor:
         if (
             self._tokenspeed_workspace is None
@@ -104,11 +144,9 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
     ) -> torch.Tensor:
         from tokenspeed_mla import tokenspeed_mla_decode
 
-        # tokenspeed splits the trtllm-gen ``bmm1_scale`` into two:
-        # softmax_scale applied at QK^T, output_scale applied at attn @ V.
-        # Both pick up the model's k_scale because the FP8 KV is stored without
-        # explicit rescaling — K and V share the same per-tensor k_scale via
-        # the kv_lora_rank prefix.
+        # tokenspeed splits trtllm-gen's ``bmm1_scale`` into ``softmax_scale``
+        # (applied at QK^T) and ``output_scale`` (applied at attn @ V). K and V
+        # share the kv_lora_rank prefix, so both use the same k_scale.
         k_scale = getattr(layer, "k_scale_float", None) or 1.0
         softmax_scale = float(layer.scaling) * float(k_scale)
         output_scale = float(k_scale)
@@ -127,6 +165,53 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
             max_seq_len=int(max_seq_len),
             softmax_scale=softmax_scale,
             output_scale=output_scale,
+            enable_pdl=is_arch_support_pdl(),
+        )
+
+    def _run_prefill_kernel(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        layer: "RadixAttention",
+        batch_size: int,
+        cum_seq_lens_q: torch.Tensor,
+        max_q_len: int,
+        seq_lens_kv: torch.Tensor,
+        cum_seq_lens_kv: torch.Tensor,
+        max_kv_len: int,
+        is_causal: bool,
+        return_lse: bool,
+        out_buffer: torch.Tensor,
+        o_sf_scale: float = 1.0,
+    ):
+        from tokenspeed_mla import tokenspeed_mla_prefill
+
+        # tokenspeed's prefill kernel has no output-scale knob, so it assumes V
+        # is at scale=1.0 and we pass ``softmax_scale = layer.scaling`` (no
+        # k_scale baked in). K/V are cast to match Q's dtype.
+        if q.dtype == torch.float8_e4m3fn:
+            k = k.to(torch.float8_e4m3fn)
+            v = v.to(torch.float8_e4m3fn)
+
+        # V arrives as a non-contiguous split of kv_nope in forward_mha; force
+        # contig so the kernel's internal reshape doesn't silently copy.
+        v = v.contiguous()
+
+        return tokenspeed_mla_prefill(
+            query=q,
+            key=k,
+            value=v,
+            seq_lens=seq_lens_kv,
+            cum_seq_lens=cum_seq_lens_kv,
+            max_seq_len=int(max_kv_len),
+            batch_size=int(batch_size),
+            softmax_scale=float(layer.scaling),
+            is_causal=is_causal,
+            return_lse=return_lse,
+            cum_seq_lens_q=cum_seq_lens_q,
+            max_seq_len_q=int(max_q_len),
+            enable_pdl=is_arch_support_pdl(),
         )
 
 
@@ -137,9 +222,8 @@ class TokenspeedMLAMultiStepDraftBackend(TRTLLMMLAMultiStepDraftBackend):
         self, model_runner: "ModelRunner", topk: int, speculative_num_steps: int
     ):
         super().__init__(model_runner, topk, speculative_num_steps)
-        # The parent constructor populates self.attn_backends with TRT-LLM
-        # instances; replace them with tokenspeed instances sharing the
-        # parent's kv_indptr / q_indptr buffers.
+        # Parent populates self.attn_backends with TRT-LLM instances; replace
+        # them with tokenspeed instances sharing the parent's index buffers.
         for i in range(self.speculative_num_steps - 1):
             self.attn_backends[i] = TokenspeedMLABackend(
                 model_runner,

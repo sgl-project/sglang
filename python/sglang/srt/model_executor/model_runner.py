@@ -244,6 +244,7 @@ MLA_ATTENTION_BACKENDS = [
     "flashmla",
     "cutlass_mla",
     "trtllm_mla",
+    "tokenspeed_mla",
     "ascend",
     "nsa",
     "intel_xpu",
@@ -256,6 +257,7 @@ CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS = [
     "flashmla",
     "cutlass_mla",
     "trtllm_mla",
+    "tokenspeed_mla",
 ]
 
 TORCH_DTYPE_TO_KV_CACHE_STR = {
