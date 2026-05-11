@@ -144,40 +144,13 @@ def dummy_run(
             {k: v[: modes.num_tokens] for k, v in buffers.pp_proxy_tensors.items()}
         )
 
-    if require_mlp_tp_gather_:
-        buffers.global_num_tokens_gpu.copy_(
-            torch.tensor(
-                [modes.num_tokens] * server_args.dp_size,
-                dtype=torch.int32,
-                device=device,
-            )
-        )
-        buffers.global_num_tokens_for_logprob_gpu.copy_(
-            torch.tensor(
-                [modes.num_tokens] * server_args.dp_size,
-                dtype=torch.int32,
-                device=device,
-            )
-        )
-        global_dp_buffer_len = modes.num_tokens * server_args.dp_size
-    elif require_attn_tp_gather(server_args):
-        buffers.global_num_tokens_gpu.copy_(
-            torch.tensor(
-                [modes.num_tokens],
-                dtype=torch.int32,
-                device=device,
-            )
-        )
-        buffers.global_num_tokens_for_logprob_gpu.copy_(
-            torch.tensor(
-                [modes.num_tokens],
-                dtype=torch.int32,
-                device=device,
-            )
-        )
-        global_dp_buffer_len = modes.num_tokens
-    else:
-        global_dp_buffer_len = None
+    global_dp_buffer_len = _handle_global_buffer(
+        buffers=buffers,
+        num_tokens=modes.num_tokens,
+        server_args=server_args,
+        device=device,
+        require_mlp_tp_gather_=require_mlp_tp_gather_,
+    )
 
     def get_spec_info():
         spec_info = None
@@ -399,3 +372,48 @@ def _build_dummy_extend_tensors(
         extend_prefix_lens=extend_prefix_lens,
         extend_start_loc=extend_start_loc,
     )
+
+
+def _handle_global_buffer(
+    *,
+    buffers: DecodeInputBuffers,
+    num_tokens: int,
+    server_args: ServerArgs,
+    device: str,
+    require_mlp_tp_gather_: bool,
+) -> Optional[int]:
+    if require_mlp_tp_gather_:
+        buffers.global_num_tokens_gpu.copy_(
+            torch.tensor(
+                [num_tokens] * server_args.dp_size,
+                dtype=torch.int32,
+                device=device,
+            )
+        )
+        buffers.global_num_tokens_for_logprob_gpu.copy_(
+            torch.tensor(
+                [num_tokens] * server_args.dp_size,
+                dtype=torch.int32,
+                device=device,
+            )
+        )
+        global_dp_buffer_len = num_tokens * server_args.dp_size
+    elif require_attn_tp_gather(server_args):
+        buffers.global_num_tokens_gpu.copy_(
+            torch.tensor(
+                [num_tokens],
+                dtype=torch.int32,
+                device=device,
+            )
+        )
+        buffers.global_num_tokens_for_logprob_gpu.copy_(
+            torch.tensor(
+                [num_tokens],
+                dtype=torch.int32,
+                device=device,
+            )
+        )
+        global_dp_buffer_len = num_tokens
+    else:
+        global_dp_buffer_len = None
+    return global_dp_buffer_len
