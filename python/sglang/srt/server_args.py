@@ -891,6 +891,12 @@ class ServerArgs:
         # Handle memory-related, chunked prefill, and CUDA graph batch size configurations.
         self._handle_gpu_memory_settings(gpu_mem)
 
+        # enforce_disable_flashinfer_allreduce_fusion must be set before
+        # _handle_model_specific_adjustments, which auto-enables the fusion
+        # for several SM90/SM100 MoE arches.
+        if self.enable_deterministic_inference:
+            self.enforce_disable_flashinfer_allreduce_fusion = True
+
         # Apply model-specific adjustments.
         self._handle_model_specific_adjustments()
 
@@ -2232,6 +2238,7 @@ class ServerArgs:
             "Qwen3VLMoeForConditionalGeneration",
             "Qwen3NextForCausalLM",
             "Qwen3_5MoeForConditionalGeneration",
+            "InternS2PreviewForConditionalGeneration",
             "Qwen3_5ForConditionalGeneration",
         ]:
             if is_sm100_supported():
@@ -2259,6 +2266,7 @@ class ServerArgs:
             if model_arch in [
                 "Qwen3NextForCausalLM",
                 "Qwen3_5MoeForConditionalGeneration",
+                "InternS2PreviewForConditionalGeneration",
                 "Qwen3_5ForConditionalGeneration",
             ]:
                 sm100_default_attn_backend = "triton"
@@ -2285,6 +2293,16 @@ class ServerArgs:
                     support_mamba_cache_extra_buffer=True,
                     sm100_default_attention_backend=sm100_default_attn_backend,
                 )
+
+        elif model_arch == "MiniCPMV4_6ForConditionalGeneration":
+            # 4.6 wraps a Qwen3.5 hybrid GDN backbone, so it needs the same
+            # mamba radix cache handling as Qwen3_5ForConditionalGeneration.
+            self._handle_mamba_radix_cache(
+                model_arch=model_arch,
+                support_mamba_cache=True,
+                support_mamba_cache_extra_buffer=True,
+                sm100_default_attention_backend="triton",
+            )
 
         elif model_arch in ["Glm4MoeForCausalLM"]:
             if is_sm100_supported():
@@ -2387,6 +2405,7 @@ class ServerArgs:
                 "Qwen3NextForCausalLM",
                 "KimiK25ForConditionalGeneration",
                 "Qwen3_5MoeForConditionalGeneration",
+                "InternS2PreviewForConditionalGeneration",
                 "Qwen3_5ForConditionalGeneration",
             ]
             and (is_sm90_supported() or is_sm100_supported())
@@ -2447,8 +2466,8 @@ class ServerArgs:
                 )
 
             assert (
-                is_cuda() or is_musa()
-            ), "Mamba extra_buffer is only supported on CUDA and MUSA devices with FLA backend"
+                is_cuda() or is_musa() or is_npu()
+            ), "Mamba extra_buffer is only supported on CUDA and MUSA and NPU devices with FLA backend"
             if self.speculative_num_draft_tokens is not None:
                 assert (
                     self.mamba_track_interval >= self.speculative_num_draft_tokens
@@ -3902,6 +3921,7 @@ class ServerArgs:
             "Qwen3VLMoeForConditionalGeneration",
             "Qwen3_5ForConditionalGeneration",
             "Qwen3_5MoeForConditionalGeneration",
+            "InternS2PreviewForConditionalGeneration",
             "Qwen3OmniMoeForConditionalGeneration",
             "Qwen2AudioForConditionalGeneration",
             "Qwen2_5OmniForConditionalGeneration",
@@ -4064,6 +4084,12 @@ class ServerArgs:
                     "Disable --enable-aiter-allreduce-fusion because deterministic inference is enabled."
                 )
                 self.enable_aiter_allreduce_fusion = False
+
+            if self.enable_flashinfer_allreduce_fusion:
+                logger.warning(
+                    "Disable --enable-flashinfer-allreduce-fusion because deterministic inference is enabled."
+                )
+                self.enable_flashinfer_allreduce_fusion = False
 
             # Check sampling backend
             self.sampling_backend = "pytorch"

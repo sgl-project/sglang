@@ -174,7 +174,9 @@ class GenerateReqInput(BaseReq):
     # Whether to return captured routed experts
     return_routed_experts: bool = False
     return_indexer_topk: bool = False
-    # The start location in the prompt for returning routed experts.
+    # Absolute start position for returned routings; response covers
+    # `[routed_experts_start_len, seqlen - 1)`. Must be in [0, prompt_tokens].
+    # 0 = full sequence.
     routed_experts_start_len: int = 0
 
     # The modalities of the image data [image, multi-images, video]
@@ -654,6 +656,7 @@ class GenerateReqInput(BaseReq):
                 else self.return_hidden_states
             ),
             return_routed_experts=self.return_routed_experts,
+            routed_experts_start_len=self.routed_experts_start_len,
             return_indexer_topk=self.return_indexer_topk,
             modalities=self.modalities[i] if self.modalities else None,
             session_params=self.session_params,
@@ -730,7 +733,7 @@ class TokenizedGenerateReqInput(BaseReq):
 
     # Whether to return captured routed experts
     return_routed_experts: bool = False
-    # The start location in the prompt for returning routed experts.
+    # See GenerateReqInput.routed_experts_start_len.
     routed_experts_start_len: int = 0
 
     return_indexer_topk: bool = False
@@ -1378,7 +1381,12 @@ class PauseGenerationReqInput(BaseReq):
 
 @dataclass
 class ContinueGenerationReqInput(BaseReq):
-    pass
+    # Call torch.cuda.empty_cache() before un-pausing. Returns blocks
+    # cached by the PyTorch allocator (left over from transient allocs
+    # during post-weight-update processing) back to the driver before
+    # inference resumes, with no race against active streams. Set to
+    # False to skip the empty_cache call.
+    torch_empty_cache: bool = True
 
 
 @dataclass
@@ -1407,7 +1415,7 @@ class UpdateWeightFromDiskReqInput(BaseReq):
     weight_version: Optional[str] = None
     # Whether to update weights asynchronously
     is_async: bool = False
-    # Whether to empty torch cache
+    # Whether to call torch.cuda.empty_cache() during flush
     torch_empty_cache: bool = False
     # Whether to keep the scheduler paused after weight update
     keep_pause: bool = False
@@ -1758,6 +1766,7 @@ class ConfigureLoggingReq(BaseReq):
     dump_requests_folder: Optional[str] = None
     dump_requests_threshold: Optional[int] = None
     crash_dump_folder: Optional[str] = None
+    dump_requests_exclude_meta_keys: Optional[List[str]] = None
 
 
 @dataclass
