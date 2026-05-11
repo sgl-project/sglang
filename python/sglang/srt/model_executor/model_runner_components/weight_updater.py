@@ -3,7 +3,7 @@ from __future__ import annotations
 import gc
 import logging
 from dataclasses import dataclass, field
-from typing import Any, Callable, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, Callable, List, Optional, Tuple, Union
 
 import torch
 
@@ -25,15 +25,24 @@ from sglang.srt.weight_sync.tensor_bucket import (
     FlattenedTensorMetadata,
 )
 
+if TYPE_CHECKING:
+    from sglang.srt.configs.model_config import ModelConfig
+    from sglang.srt.model_executor.model_runner import ModelRunner
+
 logger = logging.getLogger(__name__)
 
 
-# Mutable ``_model_update_group`` dict prevents ``frozen=True``; explicit
-# Rule-5 exception per the dataclass-defaults sprint-wide rule.
-@dataclass(slots=True, kw_only=True)
+@dataclass(frozen=True, slots=True, kw_only=True)
 class WeightUpdater:
     tp_rank: int
-    _mr: Any  # ModelRunner — kept untyped to avoid TYPE_CHECKING import here
+    device: str
+    gpu_id: int
+    model_config: ModelConfig
+    custom_weight_loaders: dict
+    get_model: Callable[[], Any]
+    update_model_fields: Callable[..., None]
+    recapture_cuda_graph: Callable[[], None]
+    get_model_runner: Callable[[], ModelRunner]
     _model_update_group: dict = field(default_factory=dict)
 
     def init_weights_update_group(
@@ -105,22 +114,22 @@ class WeightUpdater:
         """Update engine weights in-place from the disk."""
         logger.info(
             f"Update engine weights online from disk begin. "
-            f"avail mem={get_available_gpu_memory(self._mr.device, self._mr.gpu_id, empty_cache=False):.2f} GB"
+            f"avail mem={get_available_gpu_memory(self.device, self.gpu_id, empty_cache=False):.2f} GB"
         )
 
-        target_device = torch.device(self._mr.device)
-        self._mr.model_config.model_path = model_path
+        target_device = torch.device(self.device)
+        self.model_config.model_path = model_path
         load_config = LoadConfig(load_format=load_format)
 
         # Only support DefaultModelLoader for now
-        loader = get_model_loader(load_config, self._mr.model_config)
+        loader = get_model_loader(load_config, self.model_config)
         if not isinstance(loader, DefaultModelLoader):
             message = f"Failed to get model loader: {loader}."
             return False, message
 
         def get_weight_iter(config):
             iter = loader._get_weights_iterator(
-                DefaultModelLoader.Source.init_new(config, self._mr.model)
+                DefaultModelLoader.Source.init_new(config, self.get_model())
             )
             if weight_name_filter is not None:
                 iter = (
@@ -133,25 +142,25 @@ class WeightUpdater:
             loader.load_weights_and_postprocess(model, iter, target_device)
             return model
 
-        with set_default_torch_dtype(self._mr.model_config.dtype):
+        with set_default_torch_dtype(self.model_config.dtype):
             try:
-                iter = get_weight_iter(self._mr.model_config)
+                iter = get_weight_iter(self.model_config)
             except Exception as e:
                 message = f"Failed to get weights iterator: {e}."
                 return False, message
             try:
-                model = model_load_weights(self._mr.model, iter)
+                model = model_load_weights(self.get_model(), iter)
             except Exception as e:
                 message = (
                     f"Failed to update weights: {e}.\nRolling back to original weights."
                 )
                 del iter
                 gc.collect()
-                iter = get_weight_iter(self._mr.model_config)
-                self._mr.model = model_load_weights(self._mr.model, iter)
+                iter = get_weight_iter(self.model_config)
+                model_load_weights(self.get_model(), iter)
                 return False, message
 
-        self._mr.update_model_fields(
+        self.update_model_fields(
             model,
             model_path=model_path,
             load_format=load_format,
@@ -159,14 +168,14 @@ class WeightUpdater:
         )
 
         if recapture_cuda_graph and (
-            self._mr.device == "cuda"
-            or self._mr.device == "musa"
+            self.device == "cuda"
+            or self.device == "musa"
             or (
                 current_platform.is_out_of_tree()
                 and current_platform.support_cuda_graph()
             )
         ):
-            self._mr.init_decode_cuda_graph()
+            self.recapture_cuda_graph()
 
         logger.info("Update weights end.")
         return True, "Succeeded to update model weights."
@@ -205,7 +214,7 @@ class WeightUpdater:
                 target_dtype = (
                     dtype if isinstance(dtype, torch.dtype) else getattr(torch, dtype)
                 )
-                weight = torch.empty(shape, dtype=target_dtype, device=self._mr.device)
+                weight = torch.empty(shape, dtype=target_dtype, device=self.device)
                 handles.append(
                     torch.distributed.broadcast(
                         weight,
@@ -218,7 +227,7 @@ class WeightUpdater:
             for handle in handles:
                 handle.wait()
 
-            self._mr.model.load_weights(weights)
+            self.get_model().load_weights(weights)
             return True, "Succeeded to update parameter online."
 
         except Exception as e:
@@ -242,7 +251,7 @@ class WeightUpdater:
                 named_tensors.append(
                     (
                         name,
-                        torch.empty(shape, dtype=target_dtype, device=self._mr.device),
+                        torch.empty(shape, dtype=target_dtype, device=self.device),
                     )
                 )
             bucket = FlattenedTensorBucket(named_tensors=named_tensors)
@@ -253,7 +262,7 @@ class WeightUpdater:
                 group=self._model_update_group[group_name],
             )
             reconstructed_tensors = bucket.reconstruct_tensors()
-            self._mr.model.load_weights(reconstructed_tensors)
+            self.get_model().load_weights(reconstructed_tensors)
             return True, f"Succeeded to update parameter online."
         except Exception as e:
             error_msg = (
@@ -277,7 +286,7 @@ class WeightUpdater:
             )
 
         # We need to get device after patch otherwise the device would be wrong
-        device_module = torch.get_device_module(self._mr.device)
+        device_module = torch.get_device_module(self.device)
         infered_device = device_module.current_device()
 
         named_tensors = [
@@ -285,12 +294,12 @@ class WeightUpdater:
             for name, tensor in named_tensors
         ]
         if load_format == "direct":
-            _model_load_weights_direct(self._mr.model, named_tensors)
-        elif load_format in self._mr.server_args.custom_weight_loader:
+            _model_load_weights_direct(self.get_model(), named_tensors)
+        elif load_format in self.custom_weight_loaders:
             custom_loader = dynamic_import(load_format)
-            custom_loader(self._mr.model, named_tensors)
+            custom_loader(self.get_model(), named_tensors)
         elif load_format is None:
-            self._mr.model.load_weights(named_tensors)
+            self.get_model().load_weights(named_tensors)
         else:
             raise NotImplementedError(f"Unknown load_format={load_format}")
         return True, "Success"
@@ -323,7 +332,7 @@ class WeightUpdater:
         reconstructed_tensors = bucket.reconstruct_tensors()
 
         # Load the reconstructed tensors using the standard method
-        self._mr.model.load_weights(reconstructed_tensors)
+        self.get_model().load_weights(reconstructed_tensors)
 
         return True, "Success"
 
@@ -335,7 +344,7 @@ class WeightUpdater:
             )
 
             # Create a worker extension that integrates with SGLang's model
-            worker = SGLangCheckpointEngineWorkerExtensionImpl(self._mr)
+            worker = SGLangCheckpointEngineWorkerExtensionImpl(self.get_model_runner())
             worker.update_weights_from_ipc(recv_req.zmq_handles)
             return True, "IPC weight update completed successfully"
         except ImportError as e:
