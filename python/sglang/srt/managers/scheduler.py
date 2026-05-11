@@ -163,6 +163,7 @@ from sglang.srt.managers.schedule_batch import (
     MultimodalInputs,
     Req,
     ScheduleBatch,
+    _is_unfinished_chunked,
 )
 from sglang.srt.managers.schedule_policy import (
     AddReqResult,
@@ -2480,6 +2481,12 @@ class Scheduler(
             if self._chunked_req_scheduled_last_iter:
                 self.stash_chunked_request(self.chunked_req)
 
+            # The chunked request now lives at the head of waiting_queue so
+            # the unified admission loop can pick it up. self.chunked_req is
+            # still maintained as a mirror reference (removed in a later step).
+            if self.chunked_req not in self.waiting_queue:
+                self.waiting_queue.insert(0, self.chunked_req)
+
         # HiSparse has its own prefill-to-decode transition; skip last_batch merge.
         if self.enable_hisparse:
             ready_reqs = self.hisparse_coordinator.collect_ready_reqs()
@@ -2637,6 +2644,14 @@ class Scheduler(
         # Get priority queue
         self.policy.calc_priority(self.waiting_queue, self.running_batch)
 
+        # Hoist chunked-resume reqs (those already owning a row) to the head so
+        # they get admitted before any fresh req competes for the row pool. The
+        # check is done BEFORE init_next_round_input, otherwise streaming-session
+        # reqs would be misidentified (their req_pool_idx is restored inside
+        # match_prefix). Stable sort preserves the prior policy ordering within
+        # each group.
+        self.waiting_queue.sort(key=lambda r: 0 if r.req_pool_idx is not None else 1)
+
         if TEST_RETRACT and running_bs > TEST_RETRACT_NO_PREFILL_BS:
             # If we are testing retraction and the running batch size exceeds
             # TEST_RETRACT_NO_PREFILL_BS, we skip the prefill to keep the requests
@@ -2670,14 +2685,10 @@ class Scheduler(
             waiting_queue_len=len(self.waiting_queue),
         )
 
-        if self.chunked_req is not None:
-            self.chunked_req.init_next_round_input()
-            self.chunked_req = adder.add_chunked_req(self.chunked_req)
-            self._chunked_req_scheduled_last_iter = (
-                self.chunked_req in adder.can_run_list
-            )
-        else:
-            self._chunked_req_scheduled_last_iter = False
+        # chunked-resume reqs are admitted through the unified waiting_queue
+        # loop below (they sit at the head after the hoist sort). The mirror
+        # self.chunked_req and _chunked_req_scheduled_last_iter are updated
+        # after the loop based on can_run_list.
 
         if self.enable_lora:
             running_loras = {req.lora_id for req in self.running_batch.reqs}
@@ -2719,10 +2730,22 @@ class Scheduler(
                     req.rid
                 )
 
-            req.init_next_round_input(self.tree_cache)
+            # Capture chunked-resume status BEFORE init_next_round_input so a
+            # streaming-session restore (which sets req_pool_idx inside
+            # match_prefix) doesn't get misidentified as chunked-resume.
+            is_resume = req.req_pool_idx is not None
+            if is_resume:
+                # Skip re-matching prefix to preserve the lock_ref invariant
+                # (cache_unfinished_req maintains dec(old req.last_node) ->
+                # inc(new last_node); a re-match here would silently overwrite
+                # req.last_node without touching lock_ref).
+                req.init_next_round_input()
+            else:
+                req.init_next_round_input(self.tree_cache)
             res = adder.add_one_req(
                 req,
                 truncation_align_size=self.truncation_align_size,
+                is_resume=is_resume,
             )
 
             if self.enable_lora:
@@ -2739,13 +2762,15 @@ class Scheduler(
                         self.running_batch.batch_is_full = True
                 # revert matched mamba idx to avoid memory leak, if req is not added.
                 # Only free if the slot was freshly allocated in this batch (not
-                # pre-existing from a session). Session-held slots have their own
-                # lifecycle and freeing them here causes double-free.
+                # pre-existing from a session). Session-held slots and chunked-
+                # resume slots have their own lifecycle and freeing them here
+                # causes double-free.
                 added = len(adder.can_run_list) > 0 and req is adder.can_run_list[-1]
                 if (
                     not added
                     and req.mamba_pool_idx is not None
                     and not getattr(req, "session", None)
+                    and not is_resume
                 ):
                     self.tree_cache.req_to_token_pool.mamba_pool.free(
                         req.mamba_pool_idx.unsqueeze(-1)
@@ -2759,21 +2784,38 @@ class Scheduler(
             return None
 
         can_run_set = set(can_run_list)
-        self.waiting_queue = [x for x in self.waiting_queue if x not in can_run_set]
+        # Keep chunked reqs in waiting_queue (they will be re-admitted as
+        # chunked-resume next iter). _is_unfinished_chunked is safe to call
+        # here because PrefillAdder truncated fill_ids for the admitted chunk.
+        self.waiting_queue = [
+            x
+            for x in self.waiting_queue
+            if x not in can_run_set or _is_unfinished_chunked(x)
+        ]
         if adder.preempt_list:
             for req in adder.preempt_list:
                 self._add_request_to_queue(req)
 
-        if adder.new_chunked_req is not None:
-            # Update chunked prefill
-            assert self.chunked_req is None
-            self.chunked_req = adder.new_chunked_req
-            # new_chunked_req is added to can_run_list by add_one_req,
-            # so it will be scheduled this iter -> stash is needed next iter.
-            self._chunked_req_scheduled_last_iter = True
+        # Refresh the chunked_req mirror from the post-admission waiting_queue.
+        # There is at most one in-flight chunked req (the chunk eats the budget,
+        # so add_one_req returns NO_TOKEN/OTHER for any subsequent chunked
+        # candidate in this iter).
+        self.chunked_req = next(
+            (r for r in self.waiting_queue if _is_unfinished_chunked(r)),
+            None,
+        )
+        # Track whether the in-flight chunked req was actually admitted this
+        # iter so the next stash gate is correct (used for SWA early-return).
+        self._chunked_req_scheduled_last_iter = (
+            self.chunked_req is not None and self.chunked_req in can_run_set
+        )
 
-        if self.chunked_req is not None:
-            self.chunked_req.is_chunked += 1
+        # is_chunked counter feeds the output processor (skip stream + skip
+        # output append while a chunk is mid-flight). PP allows is_chunked > 1
+        # when multiple microbatches concurrently hold the same chunked req.
+        for req in can_run_list:
+            if _is_unfinished_chunked(req):
+                req.is_chunked += 1
 
         # Record for logging prefill stats after forward
         self.adder = adder

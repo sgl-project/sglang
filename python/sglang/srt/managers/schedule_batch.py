@@ -575,6 +575,16 @@ class MultimodalInputs:
         # other args would be kept intact
 
 
+def _is_unfinished_chunked(req: "Req") -> bool:
+    """Whether ``req`` still has chunks to prefill.
+
+    Derived from fill_ids vs origin+output lengths. Only safe to call between
+    a successful admission (PrefillAdder truncated fill_ids) and the next
+    ``init_next_round_input`` (which rebuilds fill_ids to the full sequence).
+    """
+    return len(req.fill_ids) < len(req.origin_input_ids) + len(req.output_ids)
+
+
 class Req(ReqDllmMixin):
     """The input and output status of a request."""
 
