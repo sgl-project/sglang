@@ -152,12 +152,14 @@ class EAGLEDraftExtendCudaGraphRunner:
                     dtype=self.model_runner.dtype,
                 )
             else:
+                # Use target config: hidden_states carries target output.
+                target_cfg = self.eagle_worker.target_worker.model_runner.model_config
                 hidden_states = torch.zeros(
                     (
                         self.max_num_token,
-                        self.model_runner.model_config.spec_hidden_size,
+                        target_cfg.spec_hidden_size,
                     ),
-                    dtype=self.model_runner.dtype,
+                    dtype=target_cfg.dtype,
                 )
             self.seq_len_fill_value = (
                 self.model_runner.attn_backend.get_cuda_graph_seq_len_fill_value()
