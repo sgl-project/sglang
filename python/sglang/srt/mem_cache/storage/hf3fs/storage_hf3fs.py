@@ -291,6 +291,7 @@ class HiCacheHF3FS(HiCacheStorage):
                 storage_config.is_mla_model,
                 storage_config.is_page_first_layout,
             )
+            identity_hash = storage_config.model_identity_hash or ""
 
             if storage_config.extra_config is not None:
                 use_mock_client = storage_config.extra_config.get(
@@ -302,6 +303,9 @@ class HiCacheHF3FS(HiCacheStorage):
                 False,
                 False,
             )
+            identity_hash = ""
+
+        identity_segment = f".{identity_hash}" if identity_hash else ""
 
         mla_unsupported_msg = f"MLA model is not supported without global metadata server, please refer to https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/mem_cache/storage/hf3fs/docs/deploy_sglang_3fs_multinode.md"
 
@@ -312,7 +316,7 @@ class HiCacheHF3FS(HiCacheStorage):
 
             return HiCacheHF3FS(
                 rank=rank,
-                file_path=f"/data/hicache.{rank}.bin",
+                file_path=f"/data/hicache{identity_segment}.{rank}.bin",
                 file_size=1 << 40,
                 numjobs=16,
                 bytes_per_page=bytes_per_page,
@@ -362,7 +366,7 @@ class HiCacheHF3FS(HiCacheStorage):
         return HiCacheHF3FS(
             rank=rank,
             # Let all ranks use the same file path for MLA model
-            file_path=f"{config['file_path_prefix']}.{rank_for_path}.bin",
+            file_path=f"{config['file_path_prefix']}{identity_segment}.{rank_for_path}.bin",
             file_size=int(config["file_size"]),
             numjobs=int(config["numjobs"]),
             bytes_per_page=bytes_per_page,
