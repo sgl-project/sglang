@@ -168,7 +168,7 @@ class DeepEPOutputDtype(Enum):
     NVFP4 = "nvfp4"
 
 
-def get_deepep_output_dtype(self) -> DeepOutputDtype:
+def get_deepep_output_dtype(self) -> DeepEPOutputDtype:
     """
     Automatically choose the dispatch output dtype for DeepEP.
 
@@ -188,34 +188,34 @@ def get_deepep_output_dtype(self) -> DeepOutputDtype:
             "and will be removed in future releases. Please use a new "
             "`--deepep-dispatcher-output-dtype bf16` argument instead."
         )
-        return DeepOutputDtype.BF16
+        return DeepEPOutputDtype.BF16
 
     # 1. Parse server argument.
     server_args = get_global_server_args()
     if server_args and server_args.deepep_dispatcher_output_dtype != "auto":
-        return DeepOutputDtype(server_args.deepep_dispatcher_output_dtype)
+        return DeepEPOutputDtype(server_args.deepep_dispatcher_output_dtype)
 
     # 2. NVFP4 is detected inside dispatch_a / _dispatch_core via quant_config; no need to infer here.
     if self.quant_config is not None:
         input_global_scale = self.quant_config.get("input_global_scale", None)
         if input_global_scale is not None:
-            return DeepOutputDtype.NVFP4
+            return DeepEPOutputDtype.NVFP4
 
         # 3. Parse quant config to to determine the output dtype of dispatcher
-        dispather_output_dtype = self.quant_config.get("dispather_output_dtype", None)
-        if dispather_output_dtype is not None:
-            return DeepOutputDtype(dispather_output_dtype)
+        dispatcher_output_dtype = self.quant_config.get("dispatcher_output_dtype", None)
+        if dispatcher_output_dtype is not None:
+            return DeepEPOutputDtype(dispatcher_output_dtype)
 
     # 4. flashinfer_cutedsl expects BF16 dispatch
     if get_moe_runner_backend().is_flashinfer_cutedsl():
-        return DeepOutputDtype.BF16
+        return DeepEPOutputDtype.BF16
 
     # 5. Default on NPU → BF16
     if _is_npu:
-        return DeepOutputDtype.BF16
+        return DeepEPOutputDtype.BF16
 
     # 6. Default → FP8
-    return DeepOutputDtype.FP8
+    return DeepEPOutputDtype.FP8
 
 
 MOE_A2A_BACKEND: Optional[MoeA2ABackend] = None
