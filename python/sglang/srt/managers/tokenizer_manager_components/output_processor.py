@@ -147,96 +147,12 @@ class OutputProcessor:
 
             state.finished = recv_obj.finished_reasons[i] is not None
             if isinstance(recv_obj, BatchStrOutput):
-                # Not all request types have `stream` (e.g., EmbeddingReqInput). Default to non-streaming.
-                is_stream = getattr(state.obj, "stream", False)
-                incremental = self.config.incremental_streaming_output and is_stream
-                delta_text = recv_obj.output_strs[i]
-                delta_output_ids = recv_obj.output_ids[i]
-                output_offset = state.last_output_offset
-                state.append_text(delta_text)
-                state.output_ids.extend(delta_output_ids)
-
-                if is_stream:
-                    if incremental:
-                        output_token_ids = delta_output_ids
-                        logprob_ops.slice_streaming_output_meta_info(
-                            meta_info, output_offset
-                        )
-                        state.last_output_offset = len(state.output_ids)
-                        out_dict = {
-                            "text": delta_text,
-                            "output_ids": output_token_ids,
-                            "meta_info": meta_info,
-                        }
-                    elif state.finished:
-                        out_dict = {
-                            "text": state.get_text(),
-                            "output_ids": state.output_ids.copy(),
-                            "meta_info": meta_info,
-                        }
-                    else:
-                        # Non-incremental intermediate: pass reference (no
-                        # copy) and defer text to _wait_one_response to avoid
-                        # O(n) per-step cost that compounds to O(n^2).
-                        out_dict = {
-                            "text": None,
-                            "output_ids": state.output_ids,
-                            "meta_info": meta_info,
-                        }
-                elif state.finished:
-                    out_dict = {
-                        "text": state.get_text(),
-                        "output_ids": state.output_ids.copy(),
-                        "meta_info": meta_info,
-                    }
-                else:
-                    out_dict = None
+                out_dict = self._build_out_dict_str(recv_obj, state, i, meta_info)
             elif isinstance(recv_obj, BatchTokenIDOutput):
-                is_stream = getattr(state.obj, "stream", False)
-                incremental = self.config.incremental_streaming_output and is_stream
-                delta_output_ids = recv_obj.output_ids[i]
-                output_offset = state.last_output_offset
-                state.output_ids.extend(delta_output_ids)
-
-                if is_stream:
-                    if incremental:
-                        output_token_ids = delta_output_ids
-                        logprob_ops.slice_streaming_output_meta_info(
-                            meta_info, output_offset
-                        )
-                        state.last_output_offset = len(state.output_ids)
-                        out_dict = {
-                            "output_ids": output_token_ids,
-                            "meta_info": meta_info,
-                        }
-                    elif state.finished:
-                        out_dict = {
-                            "output_ids": state.output_ids.copy(),
-                            "meta_info": meta_info,
-                        }
-                    else:
-                        out_dict = {
-                            "output_ids": state.output_ids,
-                            "meta_info": meta_info,
-                        }
-                elif state.finished:
-                    out_dict = {
-                        "output_ids": state.output_ids.copy(),
-                        "meta_info": meta_info,
-                    }
-                else:
-                    out_dict = None
+                out_dict = self._build_out_dict_token_id(recv_obj, state, i, meta_info)
             else:
                 assert isinstance(recv_obj, BatchEmbeddingOutput)
-                out_dict = {
-                    "embedding": recv_obj.embeddings[i],
-                    "meta_info": meta_info,
-                }
-                if (
-                    recv_obj.pooled_hidden_states is not None
-                    and recv_obj.pooled_hidden_states[i] is not None
-                ):
-                    out_dict["pooled_hidden_state"] = recv_obj.pooled_hidden_states[i]
+                out_dict = self._build_out_dict_embedding(recv_obj, state, i, meta_info)
 
             # Set first_token_time on the first output batch.
             # This is the single write point for first_token_time.
@@ -326,3 +242,111 @@ class OutputProcessor:
         ):
             load_update_req = WatchLoadUpdateReq(loads=[recv_obj.load])
             self.send_to_scheduler.send_pyobj(load_update_req)
+
+    def _build_out_dict_str(
+        self,
+        recv_obj: BatchStrOutput,
+        state: ReqState,
+        i: int,
+        meta_info: dict,
+    ) -> Optional[dict]:
+        # Not all request types have `stream` (e.g., EmbeddingReqInput). Default to non-streaming.
+        is_stream = getattr(state.obj, "stream", False)
+        incremental = self.config.incremental_streaming_output and is_stream
+        delta_text = recv_obj.output_strs[i]
+        delta_output_ids = recv_obj.output_ids[i]
+        output_offset = state.last_output_offset
+        state.append_text(delta_text)
+        state.output_ids.extend(delta_output_ids)
+
+        if is_stream:
+            if incremental:
+                output_token_ids = delta_output_ids
+                logprob_ops.slice_streaming_output_meta_info(meta_info, output_offset)
+                state.last_output_offset = len(state.output_ids)
+                return {
+                    "text": delta_text,
+                    "output_ids": output_token_ids,
+                    "meta_info": meta_info,
+                }
+            elif state.finished:
+                return {
+                    "text": state.get_text(),
+                    "output_ids": state.output_ids.copy(),
+                    "meta_info": meta_info,
+                }
+            else:
+                # Non-incremental intermediate: pass reference (no
+                # copy) and defer text to _wait_one_response to avoid
+                # O(n) per-step cost that compounds to O(n^2).
+                return {
+                    "text": None,
+                    "output_ids": state.output_ids,
+                    "meta_info": meta_info,
+                }
+        elif state.finished:
+            return {
+                "text": state.get_text(),
+                "output_ids": state.output_ids.copy(),
+                "meta_info": meta_info,
+            }
+        else:
+            return None
+
+    def _build_out_dict_token_id(
+        self,
+        recv_obj: BatchTokenIDOutput,
+        state: ReqState,
+        i: int,
+        meta_info: dict,
+    ) -> Optional[dict]:
+        is_stream = getattr(state.obj, "stream", False)
+        incremental = self.config.incremental_streaming_output and is_stream
+        delta_output_ids = recv_obj.output_ids[i]
+        output_offset = state.last_output_offset
+        state.output_ids.extend(delta_output_ids)
+
+        if is_stream:
+            if incremental:
+                output_token_ids = delta_output_ids
+                logprob_ops.slice_streaming_output_meta_info(meta_info, output_offset)
+                state.last_output_offset = len(state.output_ids)
+                return {
+                    "output_ids": output_token_ids,
+                    "meta_info": meta_info,
+                }
+            elif state.finished:
+                return {
+                    "output_ids": state.output_ids.copy(),
+                    "meta_info": meta_info,
+                }
+            else:
+                return {
+                    "output_ids": state.output_ids,
+                    "meta_info": meta_info,
+                }
+        elif state.finished:
+            return {
+                "output_ids": state.output_ids.copy(),
+                "meta_info": meta_info,
+            }
+        else:
+            return None
+
+    def _build_out_dict_embedding(
+        self,
+        recv_obj: BatchEmbeddingOutput,
+        state: ReqState,
+        i: int,
+        meta_info: dict,
+    ) -> dict:
+        out_dict = {
+            "embedding": recv_obj.embeddings[i],
+            "meta_info": meta_info,
+        }
+        if (
+            recv_obj.pooled_hidden_states is not None
+            and recv_obj.pooled_hidden_states[i] is not None
+        ):
+            out_dict["pooled_hidden_state"] = recv_obj.pooled_hidden_states[i]
+        return out_dict
