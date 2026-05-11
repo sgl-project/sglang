@@ -442,6 +442,38 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             )
 
             self.draft_extend_metadata[bs] = metadata
+        elif forward_mode.is_draft_extend_v2():
+            # DRAFT_EXTEND_V2 routes through the decode kernel (uniform
+            # q_len_per_req = num_tokens_per_bs), so metadata mirrors
+            # TARGET_VERIFY: cache_seqlens_int32 includes the queries.
+            num_tokens_per_bs = num_tokens // bs
+            metadata.cache_seqlens_int32 = self.draft_extend_metadata["cache_seqlens"][
+                :bs
+            ]
+            metadata.cache_seqlens_int32.copy_(seq_lens + num_tokens_per_bs)
+
+            metadata.cu_seqlens_q = torch.arange(
+                0,
+                bs * num_tokens_per_bs + 1,
+                num_tokens_per_bs,
+                dtype=torch.int32,
+                device=device,
+            )
+            metadata.cu_seqlens_k = self.draft_extend_metadata["cu_seqlens_k"][
+                : (bs + 1)
+            ]
+            metadata.max_seq_len_q = num_tokens_per_bs
+            metadata.max_seq_len_k = seq_lens.max().item() + num_tokens_per_bs
+
+            metadata.page_table = self.draft_extend_metadata["page_table"][:bs, :]
+            self._bind_swa_page_table(
+                metadata,
+                self.draft_extend_metadata,
+                "swa_page_table",
+                bs,
+            )
+
+            self.draft_extend_metadata[bs] = metadata
         self.forward_metadata = metadata
 
     def init_forward_metadata_replay_cuda_graph(
@@ -547,6 +579,30 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             ]
             metadata.page_table[:, :max_seq_pages].copy_(page_indices // self.page_size)
             self._copy_swa_page_table(metadata, page_indices, max_seq_pages)
+        elif forward_mode.is_draft_extend_v2():
+            # See `init_forward_metadata_capture_cuda_graph` — DRAFT_EXTEND_V2
+            # uses TARGET_VERIFY-style metadata so it can share the decode
+            # kernel. `num_tokens_per_req` is set by the V2 worker on
+            # spec_info (always uniform = speculative_num_steps + 1).
+            num_tokens_per_bs = spec_info.num_tokens_per_req
+            metadata = self.draft_extend_metadata[bs]
+            metadata.cache_seqlens_int32.copy_(seq_lens + num_tokens_per_bs)
+
+            metadata.max_seq_len_q = num_tokens_per_bs
+            metadata.max_seq_len_k = seq_lens_cpu.max().item() + num_tokens_per_bs
+            metadata.cu_seqlens_k[1:].copy_(
+                torch.cumsum(metadata.cache_seqlens_int32, dim=0, dtype=torch.int32)
+            )
+
+            max_seq_pages = (
+                metadata.max_seq_len_k + self.page_size - 1
+            ) // self.page_size
+            page_indices = self.req_to_token[
+                req_pool_indices[:, None],
+                self.draft_extend_metadata["strided_indices"][:max_seq_pages],
+            ]
+            metadata.page_table[:, :max_seq_pages].copy_(page_indices // self.page_size)
+            self._copy_swa_page_table(metadata, page_indices, max_seq_pages)
         self.forward_metadata = metadata
 
     def get_cuda_graph_seq_len_fill_value(self) -> int:
@@ -640,6 +696,37 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 0,
                 batch_size * self.speculative_num_draft_tokens + 1,
                 self.speculative_num_draft_tokens,
+                dtype=torch.int32,
+                device=device,
+            )
+            metadata.cu_seqlens_k = torch.nn.functional.pad(
+                torch.cumsum(metadata.cache_seqlens_int32, dim=0, dtype=torch.int32),
+                (1, 0),
+            )
+            metadata.page_table = forward_batch.req_to_token_pool.req_to_token[
+                forward_batch.req_pool_indices, : metadata.max_seq_len_k
+            ]
+
+        elif forward_batch.forward_mode.is_draft_extend_v2():
+            # DRAFT_EXTEND_V2 uses the same decode kernel as TARGET_VERIFY.
+            # Every request extends by a uniform `num_tokens_per_req`
+            # (= `speculative_num_steps + 1`), set by the V2 worker on
+            # spec_info (`eagle_worker_v2.py` / `multi_layer_eagle_worker_v2.py`).
+            # Metadata mirrors the TARGET_VERIFY branch above, with
+            # `num_tokens_per_req` substituted for `speculative_num_draft_tokens`,
+            # so `cache_seqlens_int32` covers the just-written query K/V slots.
+            num_tokens_per_req = forward_batch.spec_info.num_tokens_per_req
+            metadata.cache_seqlens_int32 = (
+                forward_batch.seq_lens + num_tokens_per_req
+            ).to(torch.int32)
+            metadata.max_seq_len_q = num_tokens_per_req
+            metadata.max_seq_len_k = (
+                forward_batch.seq_lens_cpu.max().item() + num_tokens_per_req
+            )
+            metadata.cu_seqlens_q = torch.arange(
+                0,
+                batch_size * num_tokens_per_req + 1,
+                num_tokens_per_req,
                 dtype=torch.int32,
                 device=device,
             )
@@ -848,23 +935,16 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
 
         page_table = self._get_layer_page_table(layer, forward_batch)
 
-        # NOTE: DRAFT_EXTEND_V2 cannot reuse the TARGET_VERIFY path here.
-        # `trtllm_batch_decode_with_kv_cache` reads `seq_lens` as the *total*
-        # per-request length (KV cache + draft query tokens).
-        # `init_forward_metadata` sets
-        # `cache_seqlens_int32 = seq_lens + speculative_num_draft_tokens` only
-        # on the `is_target_verify()` branch. DRAFT_EXTEND_V2 has no dedicated
-        # branch and falls into the generic `else`, where
-        # `cache_seqlens_int32 = forward_batch.seq_lens.to(int32)` — KV only,
-        # no query tokens. Routing DRAFT_EXTEND_V2 through the decode kernel
-        # with that metadata makes the kernel read past the populated KV cache
-        # and triggers a CUDA illegal-memory-access on Blackwell.
-        #
-        # If `init_forward_metadata` is later updated to align DRAFT_EXTEND_V2
-        # metadata with TARGET_VERIFY semantics (and matching branches are
-        # added to `init_forward_metadata_{capture,replay}_cuda_graph`),
-        # re-broaden this predicate to recover decode-kernel performance.
-        if forward_batch.forward_mode.is_target_verify():
+        # Both TARGET_VERIFY and DRAFT_EXTEND_V2 have a uniform per-request
+        # query length, so they share the trtllm decode kernel. Their dedicated
+        # branches in `init_forward_metadata` (and the matching cuda-graph
+        # capture/replay branches) build `cache_seqlens_int32` to include the
+        # just-written query K/V slots — required by the decode kernel, which
+        # reads `seq_lens` as the *total* per-request length (KV + queries).
+        if (
+            forward_batch.forward_mode.is_target_verify()
+            or forward_batch.forward_mode.is_draft_extend_v2()
+        ):
             o = flashinfer.decode.trtllm_batch_decode_with_kv_cache(
                 query=q,
                 kv_cache=kv_cache,
