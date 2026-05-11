@@ -364,6 +364,13 @@ std::tuple<at::Tensor, at::Tensor> multimodal_rotary_embedding_cpu(
     bool mrope_interleaved,
     bool is_neox);
 
+at::Tensor apply_rotary_emb_interleaved_cpu(
+    at::Tensor& x,
+    at::Tensor& freqs,
+    bool inverse,
+    const std::optional<at::Tensor>& positions,
+    const std::optional<at::Tensor>& k);
+
 // CPU and memory binding
 std::string init_cpu_threads_env(const std::string& cpu_ids);
 
@@ -422,6 +429,22 @@ std::tuple<at::Tensor, at::Tensor> image_preprocess_cpu(
     int64_t merge_size,
     bool disable_grouping,
     at::ScalarType out_dtype);
+
+// mhc kernels
+std::tuple<at::Tensor, at::Tensor, at::Tensor> hc_pre_fused_cpu(
+    at::Tensor& x,
+    at::Tensor& hc_fn,
+    at::Tensor& hc_scale,
+    at::Tensor& hc_base,
+    int64_t hc_mult,
+    int64_t sinkhorn_iters,
+    double rms_eps,
+    double hc_eps);
+
+at::Tensor hc_post_fused_cpu(at::Tensor& x, at::Tensor& residual, at::Tensor& post, at::Tensor& comb);
+
+at::Tensor hc_head_fused_cpu(
+    at::Tensor& x, at::Tensor& hc_fn, at::Tensor& hc_scale, at::Tensor& hc_base, double hc_eps, double norm_eps);
 
 // [NOTE] When registering kernels, we should accurately describe the in-place information.
 // Taking fused_add_rmsnorm_cpu as an example, add `Tensor(a!)` modifier to all tensors that
@@ -643,6 +666,10 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.impl("rotary_embedding_cpu", torch::kCPU, &rotary_embedding_cpu);
   m.def("apply_rotary_pos_emb_cpu(Tensor query, Tensor key, Tensor cos, Tensor sin) -> (Tensor, Tensor)");
   m.impl("apply_rotary_pos_emb_cpu", torch::kCPU, &apply_rotary_pos_emb_cpu);
+  m.def(
+      "apply_rotary_emb_interleaved_cpu(Tensor(a!) x, Tensor freqs, bool inverse, Tensor? positions=None, Tensor(b!)? "
+      "k=None) -> Tensor(a!)");
+  m.impl("apply_rotary_emb_interleaved_cpu", torch::kCPU, &apply_rotary_emb_interleaved_cpu);
 
   // multimodal rope
   m.def(
@@ -681,6 +708,20 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "image_std, int patch_size, int temporal_patch_size, int merge_size, bool disable_grouping, ScalarType "
       "out_dtype) -> (Tensor, Tensor)");
   m.impl("image_preprocess_cpu", torch::kCPU, &image_preprocess_cpu);
+
+  // mhc
+  m.def(
+      "hc_pre_fused_cpu(Tensor x, Tensor hc_fn, Tensor hc_scale, Tensor hc_base, "
+      "int hc_mult, int sinkhorn_iters, float rms_eps, float hc_eps) -> (Tensor, Tensor, Tensor)");
+  m.impl("hc_pre_fused_cpu", torch::kCPU, &hc_pre_fused_cpu);
+
+  m.def("hc_post_fused_cpu(Tensor x, Tensor residual, Tensor post, Tensor comb) -> Tensor");
+  m.impl("hc_post_fused_cpu", torch::kCPU, &hc_post_fused_cpu);
+
+  m.def(
+      "hc_head_fused_cpu(Tensor x, Tensor hc_fn, Tensor hc_scale, Tensor hc_base, "
+      "float hc_eps, float norm_eps) -> Tensor");
+  m.impl("hc_head_fused_cpu", torch::kCPU, &hc_head_fused_cpu);
 }
 
 TORCH_LIBRARY_IMPL(sgl_kernel, CatchAll, m) {
