@@ -5,7 +5,9 @@ from http import HTTPStatus
 from typing import TYPE_CHECKING
 
 import torch
+import torch.nn.functional as F
 
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.common import maybe_cache_unfinished_req
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
@@ -162,6 +164,16 @@ class ScheduleBatchDisaggregationDecodeMixin:
 
             hidden_states_list = [req.hidden_states_tensor for req in self.reqs]
             hidden_states = torch.stack(hidden_states_list, dim=0).to(self.device)
+
+            enable_spec_v2_zero_bubble = envs.SGLANG_SPEC_V2_ZERO_BUBBLE.get()
+
+            if enable_spec_v2_zero_bubble and server_args.speculative_num_steps > 1:
+                topk_pad_size = (
+                    server_args.speculative_num_steps * num_states - topk_p.shape[-1]
+                )
+
+                topk_p = F.pad(topk_p, (0, topk_pad_size))
+                topk_index = F.pad(topk_index, (0, topk_pad_size))
 
             # local import to avoid circular import
             from sglang.srt.speculative.eagle_info import EagleDraftInput
