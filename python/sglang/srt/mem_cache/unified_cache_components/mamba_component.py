@@ -232,6 +232,15 @@ class MambaComponent(TreeComponent):
                 self.cache.component_protected_size_[ct] -= vlen
             cd.lock_ref -= 1
 
+    def _alloc_mamba_slot(self) -> torch.Tensor:
+        """Allocate one mamba pool slot, evicting if necessary."""
+        slot = self.cache.req_to_token_pool.mamba_pool.alloc(1)
+        if slot is None:
+            self.cache.evict(EvictParams(num_tokens=0, mamba_num=1))
+            slot = self.cache.req_to_token_pool.mamba_pool.alloc(1)
+            assert slot is not None, "Can not alloc mamba cache"
+        return slot
+
     def prepare_for_caching_req(
         self,
         req: Req,
@@ -269,20 +278,10 @@ class MambaComponent(TreeComponent):
                 mamba_value_donated = (
                     req.mamba_ping_pong_track_buffer[keep_idx].unsqueeze(-1).clone()
                 )
-                new_track_slot = self.cache.req_to_token_pool.mamba_pool.alloc(1)
-                if new_track_slot is None:
-                    self.cache.evict(EvictParams(num_tokens=0, mamba_num=1))
-                    new_track_slot = self.cache.req_to_token_pool.mamba_pool.alloc(1)
-                    assert new_track_slot is not None, "Can not alloc mamba cache"
-                req.mamba_ping_pong_track_buffer[keep_idx] = new_track_slot[0]
+                req.mamba_ping_pong_track_buffer[keep_idx] = self._alloc_mamba_slot()[0]
             else:
                 mamba_value_donated = req.mamba_pool_idx.unsqueeze(-1).clone()
-                new_idx = self.cache.req_to_token_pool.mamba_pool.alloc(1)
-                if new_idx is None:
-                    self.cache.evict(EvictParams(num_tokens=0, mamba_num=1))
-                    new_idx = self.cache.req_to_token_pool.mamba_pool.alloc(1)
-                    assert new_idx is not None, "Can not alloc mamba cache"
-                req.mamba_pool_idx = new_idx[0]
+                req.mamba_pool_idx = self._alloc_mamba_slot()[0]
             insert_params.mamba_value = mamba_value_donated
             return cache_len
 

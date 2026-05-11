@@ -2557,17 +2557,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.seq_lens_sum += other.seq_lens_sum
         if self.output_ids is not None:
             self.output_ids = torch.cat([self.output_ids, other.output_ids])
-        for field in (
-            "mamba_cow_src_indices",
-            "mamba_cow_dst_indices",
-            "mamba_clear_indices",
-        ):
-            self_val = getattr(self, field)
-            other_val = getattr(other, field)
-            if self_val is not None and other_val is not None:
-                setattr(self, field, torch.cat([self_val, other_val]))
-            elif other_val is not None:
-                setattr(self, field, other_val)
         self.mamba_track_indices = None
         self.mamba_track_mask = None
         self.mamba_track_seqlens = None

@@ -651,24 +651,13 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
                 .unsqueeze(-1)
                 .clone()
             )
-            # Allocate a replacement slot for the donated track buffer entry
-            new_track_slot = self.req_to_token_pool.mamba_pool.alloc(1)
-            if new_track_slot is None:
-                self.evict(EvictParams(num_tokens=0, mamba_num=1))
-                new_track_slot = self.req_to_token_pool.mamba_pool.alloc(1)
-                assert new_track_slot is not None, "Can not alloc mamba cache"
+            new_slot = self._alloc_mamba_slot()
             req.mamba_ping_pong_track_buffer[mamba_ping_pong_track_buffer_to_keep] = (
-                new_track_slot[0]
+                new_slot[0]
             )
         else:
             mamba_value_donated = req.mamba_pool_idx.unsqueeze(-1).clone()
-            # Allocate a new mamba pool slot for the request
-            new_idx = self.req_to_token_pool.mamba_pool.alloc(1)
-            if new_idx is None:
-                self.evict(EvictParams(num_tokens=0, mamba_num=1))
-                new_idx = self.req_to_token_pool.mamba_pool.alloc(1)
-                assert new_idx is not None, "Can not alloc mamba cache"
-            req.mamba_pool_idx = new_idx[0]
+            req.mamba_pool_idx = self._alloc_mamba_slot()[0]
 
         result = self.insert(
             InsertParams(
@@ -954,6 +943,15 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
         )
 
     ##### Internal Helper Functions #####
+
+    def _alloc_mamba_slot(self) -> torch.Tensor:
+        """Allocate one mamba pool slot, evicting if necessary."""
+        slot = self.req_to_token_pool.mamba_pool.alloc(1)
+        if slot is None:
+            self.evict(EvictParams(num_tokens=0, mamba_num=1))
+            slot = self.req_to_token_pool.mamba_pool.alloc(1)
+            assert slot is not None, "Can not alloc mamba cache"
+        return slot
 
     def _match_prefix_helper(
         self, key: RadixKey

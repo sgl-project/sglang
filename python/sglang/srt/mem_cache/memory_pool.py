@@ -593,6 +593,13 @@ class HybridReqToTokenPool(ReqToTokenPool):
                     ), "Not enough space for mamba ping pong idx, try to increase --mamba-full-memory-ratio."
                     req.mamba_next_track_idx = 0
                 mamba_ping_pong_track_buffers.append(req.mamba_ping_pong_track_buffer)
+        assert len(select_index) == len(
+            mamba_indices
+        ), f"Not enough space for mamba cache, try to increase --mamba-full-memory-ratio or --max-mamba-cache-size."
+        if self.enable_mamba_extra_buffer:
+            assert len(select_index) == len(
+                mamba_ping_pong_track_buffers
+            ), f"Not enough space for mamba ping pong idx, try to increase --mamba-full-memory-ratio."
         mamba_index_tensor = torch.stack(mamba_indices).to(dtype=torch.int32)
         self.req_index_to_mamba_index_mapping[select_index] = mamba_index_tensor
         if self.enable_mamba_extra_buffer:
@@ -639,6 +646,8 @@ class HybridReqToTokenPool(ReqToTokenPool):
                     0,
                     1,
                 ], f"mamba_ping_pong_track_buffer_to_keep must be 0 or 1, {mamba_ping_pong_track_buffer_to_keep=}"
+                # Avoid Python-list advanced indexing on a device tensor.
+                # The ping-pong buffer size is either 2 (normal) or 1 (spec decode).
                 if self.mamba_ping_pong_track_buffer_size == 2:
                     idx_to_free = 1 - mamba_ping_pong_track_buffer_to_keep
                     mamba_ping_pong_track_buffer_to_free = (
@@ -655,6 +664,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
                         "mamba_ping_pong_track_buffer_to_keep must be 0 when "
                         "mamba_ping_pong_track_buffer_size is 1"
                     )
+                    # Keep the only slot, so free nothing.
                     mamba_ping_pong_track_buffer_to_free = (
                         mamba_ping_pong_track_buffer_to_free[0:0]
                     )
