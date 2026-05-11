@@ -485,7 +485,7 @@ class SWARadixCache(BasePrefixCache):
                 req.req_pool_idx, : len(req.fill_ids)
             ]
 
-            # `req.prefix_indices` will be used in `PrefillAdder::add_chunked_req` later
+            # `req.prefix_indices` will be used in `_add_one_req_resume` next iter
             req.prefix_indices = kv_indices
             return
 
@@ -536,7 +536,7 @@ class SWARadixCache(BasePrefixCache):
         result = self.inc_lock_ref(new_last_node)
         swa_uuid_for_lock = result.swa_uuid_for_lock
 
-        # `req.prefix_indices` will be used in `PrefillAdder::add_chunked_req` later
+        # `req.prefix_indices` will be used in `_add_one_req_resume` next iter
         if len(new_indices) < len(kv_indices):
             req.prefix_indices = torch.cat(
                 [new_indices, kv_indices[len(new_indices) :]]

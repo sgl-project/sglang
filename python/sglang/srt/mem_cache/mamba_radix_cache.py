@@ -605,7 +605,7 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
                 req.req_pool_idx, : len(req.fill_ids)
             ]
 
-            # `req.prefix_indices` will be used in `PrefillAdder::add_chunked_req` later
+            # `req.prefix_indices` will be used in `_add_one_req_resume` next iter
             req.prefix_indices = kv_indices.to(dtype=torch.int64, copy=True)
             return
 
@@ -705,7 +705,7 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
         self.dec_lock_ref(req.last_node)
         self.inc_lock_ref(new_last_node)
 
-        # `req.prefix_indices` will be used in `PrefillAdder::add_chunked_req` later
+        # `req.prefix_indices` will be used in `_add_one_req_resume` next iter
         # NOTE: this is needed for both page_size == 1 and page_size > 1
         req.prefix_indices = torch.cat(
             [new_indices, kv_indices_orig[len(new_indices) :]]

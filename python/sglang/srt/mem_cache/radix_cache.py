@@ -536,7 +536,7 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
         self.dec_lock_ref(req.last_node)
         self.inc_lock_ref(new_last_node)
 
-        # `req.prefix_indices` will be used in `PrefillAdder::add_chunked_req` later
+        # `req.prefix_indices` will be used by `_add_one_req_resume` next iter
         # - page_size != 1: there is a partial page at the end, keep the full kv_indices
         # - eagle case: bigram keys will only cache len - 1 kv indices
         if len(new_indices) < len(kv_indices):
