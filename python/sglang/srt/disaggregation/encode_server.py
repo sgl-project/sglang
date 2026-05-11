@@ -298,6 +298,7 @@ class MMEncoder:
                             self.server_args.disaggregation_ib_device
                             or self.server_args.mooncake_ib_device
                         ),
+                        transport=self.server_args.disaggregation_transport,
                     )
 
             self.embedding_to_send = dict()

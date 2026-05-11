@@ -1346,6 +1346,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     self.server_args.disaggregation_ib_device
                     or self.server_args.mooncake_ib_device
                 ),
+                transport=self.server_args.disaggregation_transport,
             )
 
     def load_model(self):

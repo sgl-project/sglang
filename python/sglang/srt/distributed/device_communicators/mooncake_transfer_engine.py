@@ -91,13 +91,14 @@ def get_ib_devices_for_gpu(ib_device_str: Optional[str], gpu_id: int) -> Optiona
 
 
 class MooncakeTransferEngine:
-    """Shared Mooncake transfer engine for RDMA/transfer operations."""
+    """Shared Mooncake transfer engine for transport operations."""
 
     def __init__(
         self,
         hostname: str,
         gpu_id: Optional[int] = None,
         ib_device: Optional[str] = None,
+        transport: Optional[str] = None,
     ):
         try:
             from mooncake.engine import TransferEngine
@@ -112,10 +113,12 @@ class MooncakeTransferEngine:
         self.hostname = hostname
         self.gpu_id = gpu_id if gpu_id is not None else 0
         self.ib_device = get_ib_devices_for_gpu(ib_device, self.gpu_id)
+        self.transport = transport or "rdma"
 
         self.initialize(
             hostname=self.hostname,
             device_name=self.ib_device,
+            transport=self.transport,
         )
         self.session_id = NetworkAddress(
             self.hostname, self.engine.get_rpc_port()
@@ -174,6 +177,7 @@ class MooncakeTransferEngine:
         self,
         hostname: str,
         device_name: Optional[str],
+        transport: str,
     ) -> None:
         """Initialize the mooncake instance."""
         if envs.ENABLE_ASCEND_TRANSFER_WITH_MOONCAKE.get():
@@ -192,7 +196,7 @@ class MooncakeTransferEngine:
             ret_value = self.engine.initialize(
                 hostname,
                 "P2PHANDSHAKE",
-                "rdma",
+                transport,
                 device_name if device_name is not None else "",
             )
         if ret_value != 0:
@@ -265,6 +269,7 @@ def init_mooncake_transfer_engine(
     hostname: str,
     gpu_id: Optional[int] = None,
     ib_device: Optional[str] = None,
+    transport: Optional[str] = None,
 ) -> MooncakeTransferEngine:
     """
     Initialize the shared MooncakeTransferEngine. Note: if already
@@ -276,7 +281,10 @@ def init_mooncake_transfer_engine(
     if _mooncake_transfer_engine is not None:
         return _mooncake_transfer_engine
     _mooncake_transfer_engine = MooncakeTransferEngine(
-        hostname=hostname, gpu_id=gpu_id, ib_device=ib_device
+        hostname=hostname,
+        gpu_id=gpu_id,
+        ib_device=ib_device,
+        transport=transport,
     )
     return _mooncake_transfer_engine
 

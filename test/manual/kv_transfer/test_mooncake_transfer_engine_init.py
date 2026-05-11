@@ -39,6 +39,7 @@ class ServerArgs:
     elastic_ep_backend: Optional[str] = None
     disaggregation_ib_device: Optional[str] = None
     mooncake_ib_device: Optional[str] = None
+    disaggregation_transport: Optional[str] = None
 
 
 def test_mooncake_te_condition(server_args: ServerArgs) -> bool:
@@ -50,13 +51,14 @@ def test_mooncake_te_condition(server_args: ServerArgs) -> bool:
     dummy_runner = SimpleNamespace(server_args=server_args, gpu_id=0)
     init_called = False
 
-    def _fake_init_mooncake_transfer_engine(*, hostname, gpu_id, ib_device):
+    def _fake_init_mooncake_transfer_engine(*, hostname, gpu_id, ib_device, transport):
         nonlocal init_called
         init_called = True
         return SimpleNamespace(
             hostname=hostname,
             gpu_id=gpu_id,
             ib_device=ib_device,
+            transport=transport,
         )
 
     with patch(
@@ -134,6 +136,7 @@ def run_mooncake_init(
                 hostname=get_local_ip_auto(),
                 gpu_id=rank,
                 ib_device=ib_device,
+                transport=server_args.disaggregation_transport,
             )
             print(f"[Rank {rank}] Session ID: {engine.get_session_id()}")
             print(f"[Rank {rank}] MooncakeTransferEngine initialized successfully!")

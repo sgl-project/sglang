@@ -20,6 +20,8 @@ class TestDisaggregationMooncakeAARCH64Accuracy(PDDisaggregationServerBase):
     @classmethod
     def setUpClass(cls):
         super().setUpClass()
+        # Legacy env var approach (still supported for backward compatibility).
+        # New code should prefer --disaggregation-transport in prefill_args/decode_args.
         os.environ["SGLANG_MOONCAKE_CUSTOM_MEM_POOL"] = "true"
         os.environ["MC_FORCE_MNNVL"] = "true"
         cls.model = DEFAULT_MODEL_NAME_FOR_TEST

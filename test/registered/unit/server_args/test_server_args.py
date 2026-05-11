@@ -463,6 +463,159 @@ class TestHiCacheArgs(unittest.TestCase):
 
         self.assertEqual(args.decode_attention_backend, "triton")
 
+class TestDisaggregationTransport(CustomTestCase):
+    """Test the new --disaggregation-transport CLI argument and backward compatibility."""
+
+    def test_cli_parsing_nvlink(self):
+        """Test that CLI parsing accepts nvlink transport."""
+        server_args = prepare_server_args(
+            ["--model-path", "dummy", "--disaggregation-transport", "nvlink"]
+        )
+        self.assertEqual(server_args.disaggregation_transport, "nvlink")
+
+    def test_cli_parsing_barex(self):
+        """Test that CLI parsing accepts barex transport."""
+        server_args = prepare_server_args(
+            ["--model-path", "dummy", "--disaggregation-transport", "barex"]
+        )
+        self.assertEqual(server_args.disaggregation_transport, "barex")
+
+    def test_cli_parsing_rdma(self):
+        """Test that CLI parsing accepts rdma transport."""
+        server_args = prepare_server_args(
+            ["--model-path", "dummy", "--disaggregation-transport", "rdma"]
+        )
+        self.assertEqual(server_args.disaggregation_transport, "rdma")
+
+    def test_cli_parsing_efa(self):
+        """Test that CLI parsing accepts efa transport."""
+        server_args = prepare_server_args(
+            ["--model-path", "dummy", "--disaggregation-transport", "efa"]
+        )
+        self.assertEqual(server_args.disaggregation_transport, "efa")
+
+    def test_cli_parsing_intra_node_nvlink(self):
+        """Test that CLI parsing accepts intra_node_nvlink transport."""
+        server_args = prepare_server_args(
+            ["--model-path", "dummy", "--disaggregation-transport", "intra_node_nvlink"]
+        )
+        self.assertEqual(server_args.disaggregation_transport, "intra_node_nvlink")
+
+    def test_default_is_none(self):
+        """Test that default transport is None when not specified."""
+        server_args = ServerArgs(model_path="dummy")
+        self.assertIsNone(server_args.disaggregation_transport)
+
+    @patch.dict("os.environ", {"SGLANG_MOONCAKE_CUSTOM_MEM_POOL": "NVLINK"}, clear=False)
+    def test_legacy_env_nvlink(self):
+        """Test backward compatibility with SGLANG_MOONCAKE_CUSTOM_MEM_POOL=NVLINK."""
+        server_args = ServerArgs(model_path="dummy")
+        self.assertEqual(server_args.disaggregation_transport, "nvlink")
+
+    @patch.dict("os.environ", {"SGLANG_MOONCAKE_CUSTOM_MEM_POOL": "true"}, clear=False)
+    def test_legacy_env_true_maps_to_nvlink(self):
+        """Test backward compatibility with SGLANG_MOONCAKE_CUSTOM_MEM_POOL=true."""
+        server_args = ServerArgs(model_path="dummy")
+        self.assertEqual(server_args.disaggregation_transport, "nvlink")
+
+    @patch.dict("os.environ", {"SGLANG_MOONCAKE_CUSTOM_MEM_POOL": "BAREX"}, clear=False)
+    def test_legacy_env_barex(self):
+        """Test backward compatibility with SGLANG_MOONCAKE_CUSTOM_MEM_POOL=BAREX."""
+        server_args = ServerArgs(model_path="dummy")
+        self.assertEqual(server_args.disaggregation_transport, "barex")
+
+    @patch.dict(
+        "os.environ", {"SGLANG_MOONCAKE_CUSTOM_MEM_POOL": "INTRA_NODE_NVLINK"}, clear=False
+    )
+    def test_legacy_env_intra_node_nvlink(self):
+        """Test backward compatibility with SGLANG_MOONCAKE_CUSTOM_MEM_POOL=INTRA_NODE_NVLINK."""
+        server_args = ServerArgs(model_path="dummy")
+        self.assertEqual(server_args.disaggregation_transport, "intra_node_nvlink")
+
+    @patch.dict("os.environ", {"SGLANG_MOONCAKE_CUSTOM_MEM_POOL": "NVLINK"}, clear=False)
+    def test_cli_overrides_env_var(self):
+        """Test that CLI argument takes precedence over environment variable."""
+        server_args = prepare_server_args(
+            ["--model-path", "dummy", "--disaggregation-transport", "barex"]
+        )
+        self.assertEqual(server_args.disaggregation_transport, "barex")
+
+    @patch.dict("os.environ", {}, clear=False)
+    def test_env_propagation_nvlink(self):
+        """Test that nvlink transport sets both legacy env vars."""
+        import os
+
+        # Clear any existing env vars
+        os.environ.pop("SGLANG_MOONCAKE_CUSTOM_MEM_POOL", None)
+        os.environ.pop("MC_FORCE_MNNVL", None)
+
+        server_args = prepare_server_args(
+            ["--model-path", "dummy", "--disaggregation-transport", "nvlink"]
+        )
+        self.assertEqual(os.environ.get("SGLANG_MOONCAKE_CUSTOM_MEM_POOL"), "NVLINK")
+        self.assertEqual(os.environ.get("MC_FORCE_MNNVL"), "true")
+
+    @patch.dict("os.environ", {}, clear=False)
+    def test_env_propagation_barex(self):
+        """Test that barex transport sets only custom mem pool env var."""
+        import os
+
+        # Clear any existing env vars
+        os.environ.pop("SGLANG_MOONCAKE_CUSTOM_MEM_POOL", None)
+        os.environ.pop("MC_FORCE_MNNVL", None)
+
+        server_args = prepare_server_args(
+            ["--model-path", "dummy", "--disaggregation-transport", "barex"]
+        )
+        self.assertEqual(os.environ.get("SGLANG_MOONCAKE_CUSTOM_MEM_POOL"), "BAREX")
+        self.assertIsNone(os.environ.get("MC_FORCE_MNNVL"))
+
+    @patch.dict("os.environ", {}, clear=False)
+    def test_env_propagation_intra_node_nvlink(self):
+        """Test that intra_node_nvlink transport sets both legacy env vars."""
+        import os
+
+        # Clear any existing env vars
+        os.environ.pop("SGLANG_MOONCAKE_CUSTOM_MEM_POOL", None)
+        os.environ.pop("MC_FORCE_MNNVL", None)
+
+        server_args = prepare_server_args(
+            ["--model-path", "dummy", "--disaggregation-transport", "intra_node_nvlink"]
+        )
+        self.assertEqual(
+            os.environ.get("SGLANG_MOONCAKE_CUSTOM_MEM_POOL"), "INTRA_NODE_NVLINK"
+        )
+        self.assertEqual(os.environ.get("MC_FORCE_MNNVL"), "true")
+
+    @patch.dict("os.environ", {}, clear=False)
+    def test_env_propagation_rdma(self):
+        """Test that rdma transport clears custom mem pool env vars."""
+        import os
+
+        # Set env vars first
+        os.environ["SGLANG_MOONCAKE_CUSTOM_MEM_POOL"] = "NVLINK"
+        os.environ["MC_FORCE_MNNVL"] = "true"
+
+        server_args = prepare_server_args(
+            ["--model-path", "dummy", "--disaggregation-transport", "rdma"]
+        )
+        self.assertIsNone(os.environ.get("SGLANG_MOONCAKE_CUSTOM_MEM_POOL"))
+        self.assertIsNone(os.environ.get("MC_FORCE_MNNVL"))
+
+    @patch.dict("os.environ", {}, clear=False)
+    def test_env_propagation_efa(self):
+        """Test that efa transport clears custom mem pool env vars."""
+        import os
+
+        os.environ["SGLANG_MOONCAKE_CUSTOM_MEM_POOL"] = "NVLINK"
+        os.environ["MC_FORCE_MNNVL"] = "true"
+
+        server_args = prepare_server_args(
+            ["--model-path", "dummy", "--disaggregation-transport", "efa"]
+        )
+        self.assertIsNone(os.environ.get("SGLANG_MOONCAKE_CUSTOM_MEM_POOL"))
+        self.assertIsNone(os.environ.get("MC_FORCE_MNNVL"))
+
 
 class TestNgramExternalSamArgs(CustomTestCase):
     def test_prepare_server_args_parses_external_sam_args(self):

@@ -171,6 +171,14 @@ RADIX_SUPPORTED_DETERMINISTIC_ATTENTION_BACKEND = ["fa3", "triton"]
 
 DISAGG_TRANSFER_BACKEND_CHOICES = ["mooncake", "nixl", "ascend", "fake", "mori"]
 
+DISAGGREGATION_TRANSPORT_CHOICES = [
+    "rdma",
+    "efa",
+    "barex",
+    "nvlink",
+    "intra_node_nvlink",
+]
+
 GRAMMAR_BACKEND_CHOICES = ["xgrammar", "outlines", "llguidance", "none"]
 
 # Placeholder token inserted between items in Multi-Item Scoring sequences:
@@ -778,6 +786,7 @@ class ServerArgs:
     num_reserved_decode_tokens: int = 512  # used for decode kv cache offload in PD
     # FIXME: hack to reduce ITL when decode bs is small
     disaggregation_decode_polling_interval: int = 1
+    disaggregation_transport: Optional[str] = None  # Transport layer for PD disaggregation
 
     # Encode prefill disaggregation
     encoder_only: bool = False
@@ -843,8 +852,14 @@ class ServerArgs:
         # Validate SSL arguments early (before dummy-model short-circuit).
         self._handle_ssl_validation()
 
+        # Normalize disaggregation_transport from CLI or legacy env vars (before dummy-model short-circuit).
+        self._normalize_disaggregation_transport()
+
         # Validate PD disaggregation flags early (before dummy-model short-circuit).
         self._handle_pd_disaggregation()
+
+        # Propagate disaggregation_transport to legacy env vars (before dummy-model short-circuit).
+        self._propagate_disaggregation_transport_env()
 
         if self.model_path.lower() in ["none", "dummy"]:
             # Skip for dummy models
@@ -3824,6 +3839,27 @@ class ServerArgs:
         except Exception:
             return False
 
+    def _normalize_disaggregation_transport(self):
+        """Normalize disaggregation_transport from CLI or legacy env vars."""
+        if self.disaggregation_transport is None:
+            # CLI arg not provided, check legacy env var for backward compatibility
+            legacy_pool_type = envs.SGLANG_MOONCAKE_CUSTOM_MEM_POOL.get()
+            if legacy_pool_type is not None:
+                # Map legacy env var values to new transport names
+                legacy_pool_type_upper = legacy_pool_type.upper()
+                if legacy_pool_type_upper == "TRUE" or legacy_pool_type_upper == "NVLINK":
+                    self.disaggregation_transport = "nvlink"
+                elif legacy_pool_type_upper == "BAREX":
+                    self.disaggregation_transport = "barex"
+                elif legacy_pool_type_upper == "INTRA_NODE_NVLINK":
+                    self.disaggregation_transport = "intra_node_nvlink"
+                else:
+                    logger.warning(
+                        f"Unknown SGLANG_MOONCAKE_CUSTOM_MEM_POOL value: {legacy_pool_type}. "
+                        "Ignoring legacy env var."
+                    )
+        # else: CLI arg was explicitly provided, it takes precedence
+
     def _handle_pd_disaggregation(self):
         if self.disaggregation_mode == "decode":
             if self.disaggregation_decode_enable_radix_cache:
@@ -4010,6 +4046,24 @@ class ServerArgs:
                     "skip_tokenizer_init=True ignores --enable-dynamic-batch-tokenizer; disabling it."
                 )
                 self.enable_dynamic_batch_tokenizer = False
+
+    def _propagate_disaggregation_transport_env(self):
+        """Propagate disaggregation_transport to legacy env vars for backward compatibility."""
+        if self.disaggregation_transport is not None:
+            transport = self.disaggregation_transport.lower()
+            if transport == "nvlink":
+                os.environ["SGLANG_MOONCAKE_CUSTOM_MEM_POOL"] = "NVLINK"
+                os.environ["MC_FORCE_MNNVL"] = "true"
+            elif transport == "barex":
+                os.environ["SGLANG_MOONCAKE_CUSTOM_MEM_POOL"] = "BAREX"
+                os.environ.pop("MC_FORCE_MNNVL", None)
+            elif transport == "intra_node_nvlink":
+                os.environ["SGLANG_MOONCAKE_CUSTOM_MEM_POOL"] = "INTRA_NODE_NVLINK"
+                os.environ["MC_FORCE_MNNVL"] = "true"
+            elif transport in ("rdma", "efa"):
+                # RDMA/EFA don't use custom mem pool.
+                os.environ.pop("SGLANG_MOONCAKE_CUSTOM_MEM_POOL", None)
+                os.environ.pop("MC_FORCE_MNNVL", None)
 
     def _handle_environment_variables(self):
         envs.SGLANG_ENABLE_TORCH_COMPILE.set("1" if self.enable_torch_compile else "0")
@@ -6624,6 +6678,16 @@ class ServerArgs:
             type=int,
             default=ServerArgs.disaggregation_decode_polling_interval,
             help="The interval to poll requests in decode server. Can be set to >1 to reduce the overhead of this.",
+        )
+        parser.add_argument(
+            "--disaggregation-transport",
+            type=nullable_str,
+            default=ServerArgs.disaggregation_transport,
+            choices=DISAGGREGATION_TRANSPORT_CHOICES,
+            help="Transport layer for PD disaggregation with Mooncake backend: "
+                  "'rdma' (InfiniBand RDMA), 'efa' (AWS EFA), 'barex' (Barex-based), "
+                 "'nvlink' (NVLink with MNNVL), 'intra_node_nvlink' (Intra-node NVLink). "
+                 "If not specified, falls back to SGLANG_MOONCAKE_CUSTOM_MEM_POOL environment variable for backward compatibility.",
         )
 
         # Encode prefill disaggregation

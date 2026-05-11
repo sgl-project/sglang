@@ -473,7 +473,7 @@ SGLang supports various environment variables that can be used to configure its 
     </tr>
 <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_MOONCAKE_CUSTOM_MEM_POOL</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Configure the custom memory pool type for Mooncake. Supports <code>NVLINK</code>, <code>BAREX</code>, <code>INTRA_NODE_NVLINK</code>. If set to <code>true</code>, it defaults to <code>NVLINK</code>.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Configure the custom memory pool type for Mooncake. Supports <code>NVLINK</code>, <code>BAREX</code>, <code>INTRA_NODE_NVLINK</code>. If set to <code>true</code>, it defaults to <code>NVLINK</code>. This legacy variable only applies to those memory-pool-based transports; use <code>--disaggregation-transport efa</code> or <code>--disaggregation-transport rdma</code> for network transports.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>None</code></td>
     </tr>
 </tbody>
