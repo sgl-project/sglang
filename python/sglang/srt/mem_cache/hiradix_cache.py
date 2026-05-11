@@ -50,6 +50,8 @@ from sglang.srt.mem_cache.radix_cache import (
     RadixCache,
     RadixKey,
     TreeNode,
+)
+from sglang.srt.mem_cache.utils import (
     compute_node_hash_values,
     split_node_hash_value,
 )
@@ -1052,7 +1054,7 @@ class HiRadixCache(RadixCache):
                 last_node = last_node.parent
 
         return (
-            torch.empty((0,), dtype=torch.int64, device=self.device),
+            self._empty_match_result.device_indices,
             last_node,
         )
 
@@ -1218,30 +1220,20 @@ class HiRadixCache(RadixCache):
         return self.prefetch_loaded_tokens_by_reqid.pop(req_id, 0)
 
     def match_prefix(self, params: MatchPrefixParams):
-        empty_value = torch.empty((0,), dtype=torch.int64, device=self.device)
-
-        def empty_match_result():
-            return MatchResult(
-                device_indices=empty_value,
-                last_device_node=self.root_node,
-                last_host_node=self.root_node,
-                host_hit_length=0,
-            )
-
         if self.disable:
-            return empty_match_result()
+            return self._empty_match_result
 
         key = params.key
         key, _ = key.maybe_to_bigram_view(self.is_eagle)
         key = key.page_aligned(self.page_size)
         if len(key) == 0:
-            return empty_match_result()
+            return self._empty_match_result
 
         value, last_node = self._match_prefix_helper(self.root_node, key)
         if value:
             value = torch.cat(value)
         else:
-            value = empty_value
+            value = self._empty_match_result.device_indices
 
         host_hit_length = 0
         last_host_node = last_node

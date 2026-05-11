@@ -3,9 +3,14 @@
 import argparse
 import json
 import pathlib
-from typing import Any, Dict, Tuple
+import shutil
+from typing import Any, Dict, List
 
 from safetensors.torch import load_file, save_file
+
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+
+logger = init_logger(__name__)
 
 TRANSFORMER_KEYS_RENAME_DICT = {
     "time_embedding.0": "condition_embedder.time_embedder.linear_1",
@@ -49,67 +54,172 @@ TRANSFORMER_KEYS_RENAME_DICT = {
     "attn2.norm_k_img": "attn2.norm_added_k",
 }
 
+SUPPORTED_MODEL_TYPES = ["Wan2.2-T2V-A14B", "Wan2.2-I2V-A14B", "Wan2.2-TI2V-5B"]
 
-def get_transformer_config(model_type: str) -> Tuple[Dict[str, Any], ...]:
-    if model_type == "Wan-T2V-14B":
-        RENAME_DICT = TRANSFORMER_KEYS_RENAME_DICT
-    return RENAME_DICT
-
-
-def update_dict_(dict: Dict[str, Any], old_key: str, new_key: str) -> Dict[str, Any]:
-    dict[new_key] = dict.pop(old_key)
+# Cascade models have two transformers (high_noise + low_noise)
+CASCADE_MODEL_TYPES = {"Wan2.2-T2V-A14B", "Wan2.2-I2V-A14B"}
 
 
-def load_sharded_safetensors(path: pathlib.Path):
-    file_path = path
+def get_transformer_config(model_type: str) -> Dict[str, Any]:
+    if model_type in SUPPORTED_MODEL_TYPES:
+        return TRANSFORMER_KEYS_RENAME_DICT
+    else:
+        raise ValueError(
+            f"Unsupported model_type: {model_type}. Supported: {SUPPORTED_MODEL_TYPES}"
+        )
+
+
+def get_transformer_dirs(model_type: str) -> List[str]:
+    """Return the list of transformer directory names for a given model type."""
+    if model_type in CASCADE_MODEL_TYPES:
+        return ["transformer", "transformer_2"]
+    return ["transformer"]
+
+
+def get_quant_subpath(
+    model_type: str, quant_path: pathlib.Path, transformer_dir: str
+) -> pathlib.Path:
+    """Return the quant weights subdirectory for a given transformer."""
+    if model_type in CASCADE_MODEL_TYPES:
+        sub = (
+            "high_noise_model"
+            if transformer_dir == "transformer"
+            else "low_noise_model"
+        )
+        return quant_path / sub
+    return quant_path
+
+
+def update_dict_(d: Dict[str, Any], old_key: str, new_key: str) -> None:
+    d[new_key] = d.pop(old_key)
+
+
+def load_sharded_safetensors(directory: pathlib.Path, pattern: str) -> dict:
+    candidates = sorted(directory.glob(pattern))
+    if not candidates:
+        raise FileNotFoundError(f"No file matching '{pattern}' found in {directory}")
+    if len(candidates) > 1:
+        raise FileNotFoundError(
+            f"Multiple files matching '{pattern}' found in {directory}: {candidates}"
+        )
+
     state_dict = {}
-    state_dict.update(load_file(file_path))
+    state_dict.update(load_file(candidates[0]))
     return state_dict
 
 
-def convert_transformer(model_type: str, model_dir: str, output_dir: str):
-    pathlib.Path(output_dir).mkdir(parents=True, exist_ok=True)
+def convert_transformer(
+    model_type: str, model_dir: pathlib.Path, output_dir: pathlib.Path
+) -> None:
+    """Convert a single quantized transformer directory into Diffusers format."""
+    model_path = pathlib.Path(model_dir)
+    out_path = pathlib.Path(output_dir)
+    out_path.mkdir(parents=True, exist_ok=True)
     RENAME_DICT = get_transformer_config(model_type)
 
-    original_state_dict = load_sharded_safetensors(
-        pathlib.Path(model_dir, "*model*.safetensors")
-    )
-    with open(pathlib.Path(model_dir, "*quant_model_description*.json")) as f:
-        original_quant_config = json.load(f)
+    state_dict = load_sharded_safetensors(model_path, "quant_model_weight*.safetensors")
 
-    for key in list(original_state_dict.keys()):
+    json_candidates = sorted(model_path.glob("quant_model_description*.json"))
+    if not json_candidates:
+        raise FileNotFoundError(
+            f"No quant_model_description*.json found in {model_path}"
+        )
+    with open(json_candidates[0]) as f:
+        quant_config = json.load(f)
+
+    for key in list(state_dict.keys()):
         new_key = key[:]
         for replace_key, rename_key in RENAME_DICT.items():
             new_key = new_key.replace(replace_key, rename_key)
-        update_dict_(original_state_dict, key, new_key)
-        update_dict_(original_quant_config, key, new_key)
+        if new_key != key:
+            update_dict_(state_dict, key, new_key)
+            # The quant JSON only covers quantized layers, not all model keys
+            if key in quant_config:
+                update_dict_(quant_config, key, new_key)
 
-    save_file(
-        original_state_dict,
-        pathlib.Path(output_dir, "diffusion_pytorch_model.safetensors"),
+    save_file(state_dict, out_path / "diffusion_pytorch_model.safetensors")
+
+    with open(out_path / "quant_model_description.json", "w") as f:
+        json.dump(quant_config, f, indent=2)
+
+
+def repack(
+    model_type: str,
+    original_model_path: pathlib.Path,
+    quant_path: pathlib.Path,
+    output_path: pathlib.Path,
+) -> None:
+    """
+    Full one-step repack workflow:
+      1. Copy the original HF Diffusers model to output_path, excluding transformer dir(s).
+      2. For each transformer: convert quant weights and copy config.json from original.
+    """
+    transformer_dirs = get_transformer_dirs(model_type)
+
+    # Step 1: Copy original model, skipping transformer dirs (they will be replaced)
+    logger.debug(f"Step 1: Copying original model to {output_path}")
+    logger.debug(f"        (skipping: {transformer_dirs})")
+    shutil.copytree(
+        str(original_model_path),
+        str(output_path),
+        ignore=shutil.ignore_patterns(*transformer_dirs),
     )
 
-    with open(pathlib.Path(output_dir, "quant_model_description.json"), "w") as f:
-        json.dump(original_quant_config, f)
+    # Step 2+: Convert each transformer
+    for i, tdir in enumerate(transformer_dirs):
+        q_path = get_quant_subpath(model_type, quant_path, tdir)
+        out_tdir = output_path / tdir
+        logger.debug(
+            f"\nStep {i + 2}: Converting {tdir} (quant source: {q_path.name})..."
+        )
+        convert_transformer(model_type, q_path, out_tdir)
+
+        # Copy config.json from the original transformer dir
+        src_config = original_model_path / tdir / "config.json"
+        if src_config.is_file():
+            shutil.copy2(str(src_config), str(out_tdir / "config.json"))
+            logger.debug(f"  Copied config.json from original {tdir}/")
+
+    logger.info(f"\nDone! Repacked model saved to: {output_path}")
 
 
 def get_args():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--input-path", type=str, required=True)
-    parser.add_argument("--output-path", type=str, required=True)
+    parser = argparse.ArgumentParser(
+        description="Repack msmodelslim quantized Wan2.2 weights into HF Diffusers format"
+    )
+    parser.add_argument(
+        "--model-type",
+        type=str,
+        required=True,
+        choices=SUPPORTED_MODEL_TYPES,
+        help="Model type to convert",
+    )
+    parser.add_argument(
+        "--original-model-path",
+        type=str,
+        required=True,
+        help="Path to the original HF Diffusers model (e.g., /weights/Wan2.2-TI2V-5B-Diffusers)",
+    )
+    parser.add_argument(
+        "--quant-path",
+        type=str,
+        required=True,
+        help="Path to msmodelslim quantized weights directory",
+    )
+    parser.add_argument(
+        "--output-path",
+        type=str,
+        required=True,
+        help="Output path for the repacked model (e.g., /weights/Wan2.2-TI2V-5B-Diffusers-MXFP8)",
+    )
     return parser.parse_args()
 
 
 if __name__ == "__main__":
     args = get_args()
-
-    convert_transformer(
-        "Wan-T2V-14B",
-        model_dir=pathlib.Path(args.input_path, "high_noise_model"),
-        output_dir=pathlib.Path(args.output_path, "transformer"),
-    )
-    convert_transformer(
-        "Wan-T2V-14B",
-        model_dir=pathlib.Path(args.input_path, "low_noise_model"),
-        output_dir=pathlib.Path(args.output_path, "transformer_2"),
+    repack(
+        model_type=args.model_type,
+        original_model_path=pathlib.Path(args.original_model_path),
+        quant_path=pathlib.Path(args.quant_path),
+        output_path=pathlib.Path(args.output_path),
     )
