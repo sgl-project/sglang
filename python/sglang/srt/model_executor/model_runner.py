@@ -1192,23 +1192,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             logger,
         )
 
-        if self.server_args.elastic_ep_backend == "mooncake":
-            # Mooncake does not support `monitored_barrier`
-            dist.barrier(group=get_tp_group().cpu_group)
-        else:
-            # Handle the case where some ranks do not finish loading.
-            try:
-                dist.monitored_barrier(
-                    group=get_tp_group().cpu_group,
-                    timeout=datetime.timedelta(
-                        seconds=UNBALANCED_MODEL_LOADING_TIMEOUT_S
-                    ),
-                    wait_all_ranks=True,
-                )
-            except RuntimeError:
-                raise ValueError(
-                    f"TP rank {self.tp_rank} could finish the model loading, but there are other ranks that didn't finish loading. It is likely due to unexpected failures (e.g., OOM) or a slow node."
-                ) from None
+        self._dist_barrier_after_load()
 
     def _prepare_moe_topk(self):
         balancer_cls = None
@@ -1435,6 +1419,25 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 self.tp_rank,
                 self.pp_rank,
             )
+
+    def _dist_barrier_after_load(self) -> None:
+        if self.server_args.elastic_ep_backend == "mooncake":
+            # Mooncake does not support `monitored_barrier`
+            dist.barrier(group=get_tp_group().cpu_group)
+        else:
+            # Handle the case where some ranks do not finish loading.
+            try:
+                dist.monitored_barrier(
+                    group=get_tp_group().cpu_group,
+                    timeout=datetime.timedelta(
+                        seconds=UNBALANCED_MODEL_LOADING_TIMEOUT_S
+                    ),
+                    wait_all_ranks=True,
+                )
+            except RuntimeError:
+                raise ValueError(
+                    f"TP rank {self.tp_rank} could finish the model loading, but there are other ranks that didn't finish loading. It is likely due to unexpected failures (e.g., OOM) or a slow node."
+                ) from None
 
     def maybe_recover_ep_ranks(self):
         # TODO(perf): `active_ranks.all()` on a CUDA tensor triggers host-device
