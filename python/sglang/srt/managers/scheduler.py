@@ -384,6 +384,7 @@ class Scheduler(
 
         # Init inter-process communication
         self.init_ipc_channels(port_args)
+        self.init_idle_sleeper()
 
         self.mm_receiver = None
         self.disagg_prefill_bootstrap_queue = None
@@ -726,7 +727,6 @@ class Scheduler(
 
     def init_ipc_channels(self, port_args: PortArgs):
         context = zmq.Context(2)
-        self.idle_sleeper = None
         self.send_metrics_from_scheduler = None
 
         if (
@@ -757,14 +757,6 @@ class Scheduler(
 
             self.send_to_tokenizer = SenderWrapper(send_to_tokenizer)
             self.send_to_detokenizer = SenderWrapper(send_to_detokenizer)
-
-            if self.server_args.sleep_on_idle:
-                self.idle_sleeper = IdleSleeper(
-                    [
-                        self.recv_from_tokenizer,
-                        self.recv_from_rpc,
-                    ]
-                )
         else:
             self.recv_from_tokenizer = None
             self.recv_from_rpc = None
@@ -778,6 +770,22 @@ class Scheduler(
             self.send_metrics_from_scheduler = get_zmq_socket(
                 context, zmq.PUSH, port_args.metrics_ipc_name, False
             )
+
+    def init_idle_sleeper(self) -> None:
+        if (
+            self.ps.pp_rank == 0
+            and self.ps.attn_tp_rank == 0
+            and self.ps.attn_cp_rank == 0
+            and self.server_args.sleep_on_idle
+        ):
+            self.idle_sleeper = IdleSleeper(
+                sockets=[
+                    self.recv_from_tokenizer,
+                    self.recv_from_rpc,
+                ],
+            )
+        else:
+            self.idle_sleeper = None
 
     def init_tokenizer(self):
         server_args = self.server_args
