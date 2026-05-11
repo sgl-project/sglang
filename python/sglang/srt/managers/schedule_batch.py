@@ -2081,40 +2081,25 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     def _collect_mamba_init_info(self, reqs):
         """Collect deferred COW/clear info from requests."""
-        _pin = is_pin_memory_available(self.device)
-        cow_src = []
-        cow_dst = []
-        clear_indices = []
+        cow_src_tensors = []
+        cow_dst_tensors = []
+        clear_tensors = []
         for req in reqs:
             if req.mamba_cow_src_index is not None:
-                cow_src.append(req.mamba_cow_src_index.item())
-                cow_dst.append(req.mamba_pool_idx.item())
+                cow_src_tensors.append(req.mamba_cow_src_index)
+                cow_dst_tensors.append(req.mamba_pool_idx.unsqueeze(0))
                 req.mamba_cow_src_index = None
                 req.mamba_needs_clear = False
             elif req.mamba_needs_clear:
-                clear_indices.append(req.mamba_pool_idx.item())
+                clear_tensors.append(req.mamba_pool_idx.unsqueeze(0))
                 req.mamba_needs_clear = False
         self.mamba_cow_src_indices = (
-            torch.tensor(cow_src, dtype=torch.int64, pin_memory=_pin).to(
-                self.device, non_blocking=True
-            )
-            if cow_src
-            else None
+            torch.cat(cow_src_tensors) if cow_src_tensors else None
         )
         self.mamba_cow_dst_indices = (
-            torch.tensor(cow_dst, dtype=torch.int64, pin_memory=_pin).to(
-                self.device, non_blocking=True
-            )
-            if cow_dst
-            else None
+            torch.cat(cow_dst_tensors) if cow_dst_tensors else None
         )
-        self.mamba_clear_indices = (
-            torch.tensor(clear_indices, dtype=torch.int64, pin_memory=_pin).to(
-                self.device, non_blocking=True
-            )
-            if clear_indices
-            else None
-        )
+        self.mamba_clear_indices = torch.cat(clear_tensors) if clear_tensors else None
 
     def prepare_for_split_prefill(self):
         self.prepare_for_extend()
