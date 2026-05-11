@@ -310,76 +310,18 @@ class KVCacheConfigurator:
             self.server_args.attention_backend == "ascend" and not self.mambaish_config
         ):
             if self.is_hybrid_swa:
-                from sglang.srt.hardware_backend.npu.memory_pool_npu import (
-                    NPUMHATokenToKVPool,
-                )
-
-                kwargs = {}
-                if self.is_hybrid_swa_compress:
-                    kwargs = {
-                        "swa_head_num": max(
-                            1,
-                            self.model_config.hf_text_config.swa_num_key_value_heads
-                            // get_attention_tp_size(),
-                        ),
-                        "swa_head_dim": self.model_config.swa_head_dim,
-                        "swa_v_head_dim": self.model_config.swa_v_head_dim,
-                        "v_head_dim": self.model_config.v_head_dim,
-                    }
-                token_to_kv_pool = SWAKVPool(
-                    size=full_max_total_num_tokens,
-                    size_swa=swa_max_total_num_tokens,
-                    page_size=self.server_args.page_size,
-                    dtype=self.kv_cache_dtype,
-                    head_num=self.model_config.get_num_kv_heads(
-                        get_attention_tp_size()
-                    ),
-                    head_dim=self.model_config.head_dim,
-                    swa_attention_layer_ids=self.model_config.swa_attention_layer_ids,
-                    full_attention_layer_ids=self.model_config.full_attention_layer_ids,
-                    enable_kvcache_transpose=False,
-                    device=self.device,
-                    token_to_kv_pool_class=NPUMHATokenToKVPool,
-                    **kwargs,
+                token_to_kv_pool = self._ascend_swa_kv_pool(
+                    full_max_total_num_tokens=full_max_total_num_tokens,
+                    swa_max_total_num_tokens=swa_max_total_num_tokens,
                 )
             elif self.use_mla_backend:
-                from sglang.srt.hardware_backend.npu.memory_pool_npu import (
-                    NPUMLATokenToKVPool,
-                )
-
-                token_to_kv_pool = NPUMLATokenToKVPool(
-                    max_total_num_tokens,
-                    page_size=self.server_args.page_size,
-                    dtype=self.kv_cache_dtype,
-                    kv_lora_rank=self.model_config.kv_lora_rank,
-                    qk_rope_head_dim=self.model_config.qk_rope_head_dim,
-                    index_head_dim=(
-                        self.model_config.index_head_dim if is_dsa_model else None
-                    ),
-                    layer_num=self.num_effective_layers,
-                    device=self.device,
-                    enable_memory_saver=self.server_args.enable_memory_saver,
-                    start_layer=self.start_layer,
-                    end_layer=self.end_layer,
+                token_to_kv_pool = self._ascend_mla_kv_pool(
+                    max_total_num_tokens=max_total_num_tokens,
+                    is_dsa_model=is_dsa_model,
                 )
             else:
-                from sglang.srt.hardware_backend.npu.memory_pool_npu import (
-                    NPUMHATokenToKVPool,
-                )
-
-                token_to_kv_pool = NPUMHATokenToKVPool(
-                    max_total_num_tokens,
-                    page_size=self.server_args.page_size,
-                    dtype=self.kv_cache_dtype,
-                    head_num=self.model_config.get_num_kv_heads(
-                        get_attention_tp_size()
-                    ),
-                    head_dim=self.model_config.head_dim,
-                    layer_num=self.num_effective_layers,
-                    device=self.device,
-                    enable_memory_saver=self.server_args.enable_memory_saver,
-                    start_layer=self.start_layer,
-                    end_layer=self.end_layer,
+                token_to_kv_pool = self._ascend_mha_kv_pool(
+                    max_total_num_tokens=max_total_num_tokens,
                 )
         elif self.use_mla_backend and is_dsa_model:
             PoolCls = (
@@ -976,6 +918,82 @@ class KVCacheConfigurator:
 
         PoolCls = current_platform.get_mha_kv_pool_cls()
         return PoolCls(
+            max_total_num_tokens,
+            page_size=self.server_args.page_size,
+            dtype=self.kv_cache_dtype,
+            head_num=self.model_config.get_num_kv_heads(get_attention_tp_size()),
+            head_dim=self.model_config.head_dim,
+            layer_num=self.num_effective_layers,
+            device=self.device,
+            enable_memory_saver=self.server_args.enable_memory_saver,
+            start_layer=self.start_layer,
+            end_layer=self.end_layer,
+        )
+
+    def _ascend_swa_kv_pool(
+        self,
+        *,
+        full_max_total_num_tokens: Optional[int],
+        swa_max_total_num_tokens: Optional[int],
+    ) -> KVCache:
+        from sglang.srt.hardware_backend.npu.memory_pool_npu import (
+            NPUMHATokenToKVPool,
+        )
+
+        kwargs = {}
+        if self.is_hybrid_swa_compress:
+            kwargs = {
+                "swa_head_num": max(
+                    1,
+                    self.model_config.hf_text_config.swa_num_key_value_heads
+                    // get_attention_tp_size(),
+                ),
+                "swa_head_dim": self.model_config.swa_head_dim,
+                "swa_v_head_dim": self.model_config.swa_v_head_dim,
+                "v_head_dim": self.model_config.v_head_dim,
+            }
+        return SWAKVPool(
+            size=full_max_total_num_tokens,
+            size_swa=swa_max_total_num_tokens,
+            page_size=self.server_args.page_size,
+            dtype=self.kv_cache_dtype,
+            head_num=self.model_config.get_num_kv_heads(get_attention_tp_size()),
+            head_dim=self.model_config.head_dim,
+            swa_attention_layer_ids=self.model_config.swa_attention_layer_ids,
+            full_attention_layer_ids=self.model_config.full_attention_layer_ids,
+            enable_kvcache_transpose=False,
+            device=self.device,
+            token_to_kv_pool_class=NPUMHATokenToKVPool,
+            **kwargs,
+        )
+
+    def _ascend_mla_kv_pool(
+        self, *, max_total_num_tokens: int, is_dsa_model: bool
+    ) -> KVCache:
+        from sglang.srt.hardware_backend.npu.memory_pool_npu import (
+            NPUMLATokenToKVPool,
+        )
+
+        return NPUMLATokenToKVPool(
+            max_total_num_tokens,
+            page_size=self.server_args.page_size,
+            dtype=self.kv_cache_dtype,
+            kv_lora_rank=self.model_config.kv_lora_rank,
+            qk_rope_head_dim=self.model_config.qk_rope_head_dim,
+            index_head_dim=(self.model_config.index_head_dim if is_dsa_model else None),
+            layer_num=self.num_effective_layers,
+            device=self.device,
+            enable_memory_saver=self.server_args.enable_memory_saver,
+            start_layer=self.start_layer,
+            end_layer=self.end_layer,
+        )
+
+    def _ascend_mha_kv_pool(self, *, max_total_num_tokens: int) -> KVCache:
+        from sglang.srt.hardware_backend.npu.memory_pool_npu import (
+            NPUMHATokenToKVPool,
+        )
+
+        return NPUMHATokenToKVPool(
             max_total_num_tokens,
             page_size=self.server_args.page_size,
             dtype=self.kv_cache_dtype,
