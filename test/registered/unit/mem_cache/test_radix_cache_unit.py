@@ -460,15 +460,58 @@ class TestRadixCache(unittest.TestCase):
             MatchPrefixParams(key=RadixKey(prompt_ids + output_ids))
         )
         self.assertEqual(len(match.device_indices), DEFAULT_PAGE_SIZE)
-        torch.testing.assert_close(
-            match.device_indices, torch.tensor([10, 11, 12, 13])
-        )
+        torch.testing.assert_close(match.device_indices, torch.tensor([10, 11, 12, 13]))
         self.assertEqual(cache.total_size(), DEFAULT_PAGE_SIZE)
         self.assertEqual(cache.protected_size(), DEFAULT_PAGE_SIZE)
         self.assertEqual(cache.evictable_size(), 0)
+        self.assertEqual(sum(cache._rollout_kv_pin_counts.values()), 1)
 
         freed = torch.cat([x for x in allocator.freed if len(x) > 0])
         torch.testing.assert_close(freed, torch.tensor([14, 15, 16, 17]))
+
+    def test_rollout_kv_unprotect_releases_committed_pin(self):
+        cache, _allocator, req_to_token_pool = self._make_cache_finished_fixture(
+            disable_finished_insert=True
+        )
+        prompt_ids = [1, 2, 3, 4, 5]
+        req_to_token_pool.req_to_token[0, :8] = torch.arange(10, 18, dtype=torch.int64)
+        commit_req = _DummyReq(
+            cache,
+            req_pool_idx=0,
+            origin_input_ids=prompt_ids,
+            output_ids=[100, 101, 102],
+            custom_params={
+                "rollout_kv_commit": True,
+                "rollout_kv_commit_len": len(prompt_ids),
+            },
+        )
+        cache.cache_finished_req(commit_req, is_insert=True)
+
+        match = cache.match_prefix(MatchPrefixParams(key=RadixKey(prompt_ids)))
+        self.assertEqual(cache.protected_size(), DEFAULT_PAGE_SIZE)
+
+        unprotect_req = _DummyReq(
+            cache,
+            req_pool_idx=0,
+            origin_input_ids=prompt_ids,
+            output_ids=[],
+            custom_params={"rollout_kv_unprotect": True},
+        )
+        req_to_token_pool.req_to_token[0, : len(prompt_ids)] = torch.tensor(
+            [10, 11, 12, 13, 99], dtype=torch.int64
+        )
+        unprotect_req.cache_protected_len = DEFAULT_PAGE_SIZE
+        unprotect_req.last_node = match.last_device_node
+        cache.inc_lock_ref(unprotect_req.last_node)
+
+        cache.cache_finished_req(unprotect_req, is_insert=True)
+
+        self.assertEqual(cache.protected_size(), 0)
+        self.assertEqual(cache.evictable_size(), DEFAULT_PAGE_SIZE)
+        self.assertEqual(sum(cache._rollout_kv_pin_counts.values()), 0)
+
+        match = cache.match_prefix(MatchPrefixParams(key=RadixKey(prompt_ids)))
+        self.assertEqual(len(match.device_indices), DEFAULT_PAGE_SIZE)
 
     def test_rollout_kv_reuse_only_skips_finished_insert(self):
         cache, allocator, req_to_token_pool = self._make_cache_finished_fixture()
