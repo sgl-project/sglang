@@ -3,6 +3,7 @@ from __future__ import annotations
 import inspect
 import logging
 from dataclasses import dataclass
+from typing import List, Optional
 
 import torch
 
@@ -45,6 +46,18 @@ class _DummyCaptureModes:
     num_tokens_per_bs: int
     num_tokens: int
     batch_size: int  # may differ from input if tp-aligned
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class _DummyExtendTensors:
+    """Extend-mode dummy tensors; all fields None when is_generation."""
+
+    extend_prefix_lens_cpu: Optional[List[int]]
+    extend_seq_lens_cpu: Optional[List[int]]
+    extend_num_tokens: Optional[int]
+    extend_seq_lens: Optional[torch.Tensor]
+    extend_prefix_lens: Optional[torch.Tensor]
+    extend_start_loc: Optional[torch.Tensor]
 
 
 def dummy_run(
@@ -117,30 +130,14 @@ def dummy_run(
     buffers.num_token_non_padded[...] = modes.num_tokens
 
     # For extend mode
-    if not is_generation:
-        extend_prefix_lens_cpu = [0] * modes.batch_size
-        extend_seq_lens_cpu = [seq_len_fill_value] * modes.batch_size
-        extend_num_tokens = modes.num_tokens
-        extend_seq_lens = torch.full(
-            (modes.batch_size,), seq_len_fill_value, dtype=torch.int32, device=device
-        )
-        extend_prefix_lens = torch.zeros(
-            (modes.batch_size,), dtype=torch.int32, device=device
-        )
-        extend_start_loc = torch.arange(
-            0,
-            modes.num_tokens,
-            modes.num_tokens_per_bs,
-            dtype=torch.int32,
-            device=device,
-        )
-    else:
-        extend_prefix_lens_cpu = None
-        extend_seq_lens_cpu = None
-        extend_num_tokens = None
-        extend_seq_lens = None
-        extend_prefix_lens = None
-        extend_start_loc = None
+    extend_tensors = _build_dummy_extend_tensors(
+        is_generation=is_generation,
+        batch_size=modes.batch_size,
+        num_tokens=modes.num_tokens,
+        num_tokens_per_bs=modes.num_tokens_per_bs,
+        seq_len_fill_value=seq_len_fill_value,
+        device=device,
+    )
 
     if server_args.pp_size > 1:
         pp_proxy_tensors = PPProxyTensors(
@@ -266,12 +263,12 @@ def dummy_run(
         encoder_lens=buffers.encoder_lens,
         return_logprob=False,
         positions=buffers.positions,
-        extend_num_tokens=extend_num_tokens,
-        extend_seq_lens=extend_seq_lens,
-        extend_prefix_lens=extend_prefix_lens,
-        extend_start_loc=extend_start_loc,
-        extend_prefix_lens_cpu=extend_prefix_lens_cpu,
-        extend_seq_lens_cpu=extend_seq_lens_cpu,
+        extend_num_tokens=extend_tensors.extend_num_tokens,
+        extend_seq_lens=extend_tensors.extend_seq_lens,
+        extend_prefix_lens=extend_tensors.extend_prefix_lens,
+        extend_start_loc=extend_tensors.extend_start_loc,
+        extend_prefix_lens_cpu=extend_tensors.extend_prefix_lens_cpu,
+        extend_seq_lens_cpu=extend_tensors.extend_seq_lens_cpu,
         global_num_tokens_gpu=buffers.global_num_tokens_gpu,
         global_num_tokens_for_logprob_gpu=buffers.global_num_tokens_for_logprob_gpu,
         dp_padding_mode=DpPaddingMode.get_default_mode_in_cuda_graph(),
@@ -362,4 +359,43 @@ def _resolve_dummy_capture_modes(
         num_tokens_per_bs=num_tokens_per_bs,
         num_tokens=num_tokens,
         batch_size=batch_size,
+    )
+
+
+def _build_dummy_extend_tensors(
+    *,
+    is_generation: bool,
+    batch_size: int,
+    num_tokens: int,
+    num_tokens_per_bs: int,
+    seq_len_fill_value: int,
+    device: str,
+) -> _DummyExtendTensors:
+    if not is_generation:
+        extend_prefix_lens_cpu = [0] * batch_size
+        extend_seq_lens_cpu = [seq_len_fill_value] * batch_size
+        extend_num_tokens = num_tokens
+        extend_seq_lens = torch.full(
+            (batch_size,), seq_len_fill_value, dtype=torch.int32, device=device
+        )
+        extend_prefix_lens = torch.zeros(
+            (batch_size,), dtype=torch.int32, device=device
+        )
+        extend_start_loc = torch.arange(
+            0, num_tokens, num_tokens_per_bs, dtype=torch.int32, device=device
+        )
+    else:
+        extend_prefix_lens_cpu = None
+        extend_seq_lens_cpu = None
+        extend_num_tokens = None
+        extend_seq_lens = None
+        extend_prefix_lens = None
+        extend_start_loc = None
+    return _DummyExtendTensors(
+        extend_prefix_lens_cpu=extend_prefix_lens_cpu,
+        extend_seq_lens_cpu=extend_seq_lens_cpu,
+        extend_num_tokens=extend_num_tokens,
+        extend_seq_lens=extend_seq_lens,
+        extend_prefix_lens=extend_prefix_lens,
+        extend_start_loc=extend_start_loc,
     )
