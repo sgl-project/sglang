@@ -548,37 +548,6 @@ class SchedulerRuntimeCheckerMixin:
         ):
             self.tree_cache.sanity_check()
 
-    def on_idle(self: Scheduler):
-        """Idle housekeeping: guard, check, metrics, reset, sleep."""
-        if not self.is_fully_idle():
-            return
-
-        # memory leak check (skipped for hisparse — pool counters intentionally
-        # diverge during host-backup, see _get_swa_token_info clamp).
-        if not self.enable_hisparse:
-            has_leak, messages = self._check_all_pools(self.get_pool_stats())
-            if has_leak:
-                self._report_leak("pool", "\n".join(messages))
-            self._check_req_pool()
-
-        # tree cache sanity check
-        self._check_tree_cache()
-
-        # metrics every 30s
-        self._maybe_log_idle_metrics()
-
-        # kv event publishing
-        self._publish_kv_events()
-
-        # reset token ratio
-        self.new_token_ratio = self.init_new_token_ratio
-
-        # reset device timer window so idle time isn't counted
-        self.reset_device_timer_window()
-
-        # sleep until next event
-        self.maybe_sleep_on_idle()
-
 
 def create_scheduler_watchdog(
     scheduler: Scheduler, watchdog_timeout: float, soft: bool = False
