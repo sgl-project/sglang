@@ -14,10 +14,7 @@ import numpy as np
 import numpy.typing as npt
 
 if TYPE_CHECKING:
-    from sglang.srt.disaggregation.common.staging_handler import (
-        StagingRegisterInfo,
-        StagingTransferInfo,
-    )
+    from sglang.srt.disaggregation.common.staging_handler import StagingTransferInfo
 
 from sglang.srt.disaggregation.base.conn import KVArgs, KVPoll
 from sglang.srt.disaggregation.common.conn import (
@@ -26,6 +23,7 @@ from sglang.srt.disaggregation.common.conn import (
     CommonKVReceiver,
     CommonKVSender,
 )
+from sglang.srt.disaggregation.common.staging_handler import StagingRegisterInfo
 from sglang.srt.disaggregation.common.utils import (
     FastQueue,
     group_concurrent_contiguous,
@@ -135,14 +133,14 @@ class KVArgsRegisterInfo:
     dst_kv_item_len: int
     dst_state_item_lens: list[int] = dataclasses.field(default_factory=list)
     dst_state_dim_per_tensor: list[int] = dataclasses.field(default_factory=list)
+    # NOTE: ``staging`` is optional and parsed from a variable-length tail of
+    # the ZMQ frame (see from_zmq below). Keep it as the LAST field of this
+    # dataclass so positional construction in from_zmq() does not break when
+    # new required fields are added in the middle.
     staging: Optional["StagingRegisterInfo"] = None
 
     @classmethod
     def from_zmq(cls, msg: List[bytes]):
-        from sglang.srt.disaggregation.common.staging_handler import (
-            StagingRegisterInfo,
-        )
-
         # Parse state_data_ptrs from msg[7] if present
         if len(msg) > 7 and msg[7] != b"":
             dst_state_data_ptrs = list(struct.unpack(f"{len(msg[7]) // 8}Q", msg[7]))
@@ -591,9 +589,7 @@ class NixlKVManager(CommonKVManager):
                     and staging_strategy is None
                     and staging_buffer is not None
                 ):
-                    staging_strategy = self._try_create_staging_strategy(
-                        staging_buffer
-                    )
+                    staging_strategy = self._try_create_staging_strategy(staging_buffer)
 
                 self.update_status(room, KVPoll.Transferring)
 
@@ -750,6 +746,23 @@ class NixlKVManager(CommonKVManager):
 
                 if kv_chunk.is_last:
                     self.update_status(room, KVPoll.Success)
+                    # Drop per-room transfer + staging state to keep these
+                    # tables bounded in long-running services (mooncake does
+                    # the equivalent transfer_infos.pop on Success in its
+                    # transfer_worker). Without this prefetched_rooms /
+                    # prefetch_requested / transfer_infos all grow without
+                    # bound as new bootstrap rooms keep arriving.
+                    self.transfer_infos.pop(room, None)
+                    self.req_to_decode_prefix_len.pop(room, None)
+                    if self.enable_staging and self._staging_ctx is not None:
+                        self._staging_ctx.prefetched_rooms.discard(room)
+                        # prefetch_requested keys are (room, chunk_idx,
+                        # session_id) tuples; sweep entries for this room.
+                        self._staging_ctx.prefetch_requested = {
+                            k
+                            for k in self._staging_ctx.prefetch_requested
+                            if k[0] != room
+                        }
                 else:
                     self.update_status(room, KVPoll.Transferring)
             except Exception as e:
