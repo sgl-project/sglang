@@ -67,9 +67,8 @@ from sglang.srt.models.deepseek_v2 import (
     _is_cuda,
     _is_hip,
     _is_npu,
-    cpu_has_amx_support,
-    is_cpu,
 )
+from sglang.srt.utils import cpu_has_amx_support, is_cpu
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     LazyValue,

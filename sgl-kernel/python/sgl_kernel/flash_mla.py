@@ -162,3 +162,57 @@ def flash_mla_sparse_fwd(
         q, kv, indices, sm_scale, d_v
     )
     return results
+
+
+def flash_mla_with_kvcache_cpu(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    block_table: Optional[torch.Tensor],
+    cache_seqlens: Optional[torch.Tensor],
+    head_dim_v: int,
+    tile_scheduler_metadata=None,
+    num_splits=None,
+    softmax_scale: Optional[float] = None,
+    causal: bool = False,
+    is_fp8_kvcache: bool = False,
+    indices: Optional[torch.Tensor] = None,
+    attn_sink: Optional[torch.Tensor] = None,
+    extra_k_cache: Optional[torch.Tensor] = None,
+    extra_indices_in_kvcache: Optional[torch.Tensor] = None,
+    topk_length: Optional[torch.Tensor] = None,
+    extra_topk_length: Optional[torch.Tensor] = None,
+    fp8_layout: int = 2,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Intel CPU AMX implementation of FlashMLA's sparse decode.
+
+    Returns:
+        out: ``(B, S_q, H_q, head_dim_v)``, ``bfloat16``.
+        softmax_lse: ``(B, H_q, S_q)``, ``float32``.
+    """
+    assert indices is not None, (
+        "flash_mla_with_kvcache_cpu currently only supports the sparse path "
+        "(indices must be provided)"
+    )
+    assert not causal, "causal must be False for sparse attention"
+    assert (
+        block_table is None and cache_seqlens is None
+    ), "block_table and cache_seqlens must be None for the sparse path"
+
+    if softmax_scale is None:
+        softmax_scale = q.shape[-1] ** (-0.5)
+
+    out, lse = torch.ops.sgl_kernel.flash_mla_with_kvcache_cpu.default(
+        q,
+        k_cache,
+        head_dim_v,
+        float(softmax_scale),
+        indices,
+        topk_length,
+        attn_sink,
+        extra_k_cache,
+        extra_indices_in_kvcache,
+        extra_topk_length,
+        bool(is_fp8_kvcache),
+        int(fp8_layout),
+    )
+    return out, lse

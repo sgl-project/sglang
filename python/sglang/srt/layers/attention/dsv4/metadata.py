@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING, Any, List, Optional
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.utils import is_hip
+from sglang.srt.utils import cpu_has_amx_support, is_cpu, is_hip
 
 if TYPE_CHECKING:
     pass
@@ -103,7 +103,9 @@ class PagedIndexerMetadata:
     topk_metadata: torch.Tensor = field(init=False, repr=False)
 
     def __post_init__(self):
-        if envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get():
+        if envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get() or (
+            is_cpu() and cpu_has_amx_support()
+        ):
             self.deep_gemm_metadata = None
         else:
             import deep_gemm
