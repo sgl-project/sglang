@@ -527,6 +527,8 @@ class NixlKVManager(CommonKVManager):
             self.kv_args.state_data_lens or [],
         ):
             for state_data_ptr, state_data_len in zip(comp_ptrs, comp_lens):
+                if state_data_ptr == 0 or state_data_len == 0:
+                    continue
                 state_addrs.append(
                     (state_data_ptr, state_data_len, self.kv_args.gpu_id, "")
                 )
@@ -879,6 +881,8 @@ class NixlKVManager(CommonKVManager):
 
         for i, dst_state_ptr in enumerate(dst_state_data_ptrs):
             length = src_state_item_lens[i]
+            if length == 0 or src_state_data_ptrs[i] == 0 or dst_state_ptr == 0:
+                continue
             src_addr = src_state_data_ptrs[i] + length * int(prefill_state_indices[0])
             dst_addr = dst_state_ptr + length * int(dst_state_indices[0])
             src_addrs.append((src_addr, length, self.kv_args.gpu_id))
@@ -951,6 +955,8 @@ class NixlKVManager(CommonKVManager):
         for i, dst_state_ptr in enumerate(dst_state_data_ptrs):
             src_item_len = src_state_item_lens[i]
             dst_item_len = dst_state_item_lens[i]
+            if src_item_len == 0 or src_state_data_ptrs[i] == 0 or dst_state_ptr == 0:
+                continue
             src_dim = src_state_dim_per_tensor[i]
             dst_dim = dst_state_dim_per_tensor[i]
 
@@ -1030,7 +1036,7 @@ class NixlKVManager(CommonKVManager):
             src_indices = (
                 prefill_state_indices[i] if i < len(prefill_state_indices) else None
             )
-            if not src_indices:
+            if src_indices is None or len(src_indices) == 0:
                 continue
             src_ptrs = src_state_data_ptrs[i] if i < len(src_state_data_ptrs) else []
             src_lens = src_state_item_lens[i] if i < len(src_state_item_lens) else []
