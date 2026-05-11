@@ -1334,6 +1334,28 @@ def _try_simple_split(item, num_items, expanded_mm_items):
     if feature_count != num_items:
         return False
 
+    patch_slices = None
+    total_num_patches = None
+    num_patches = item.model_specific_data.get("num_patches")
+    if _get_length(num_patches) == num_items:
+        if isinstance(num_patches, torch.Tensor):
+            patch_counts = [int(x) for x in num_patches.flatten().cpu().tolist()]
+        elif isinstance(num_patches, np.ndarray):
+            patch_counts = [int(x) for x in num_patches.reshape(-1).tolist()]
+        else:
+            patch_counts = [
+                int(x.item()) if isinstance(x, torch.Tensor) else int(x)
+                for x in num_patches
+            ]
+        if all(count >= 0 for count in patch_counts):
+            patch_slices = []
+            patch_start = 0
+            for count in patch_counts:
+                patch_end = patch_start + count
+                patch_slices.append((patch_start, patch_end))
+                patch_start = patch_end
+            total_num_patches = patch_start
+
     for i in range(num_items):
         new_item = copy.copy(item)
         if item.feature is not None:
@@ -1349,7 +1371,14 @@ def _try_simple_split(item, num_items, expanded_mm_items):
         new_item.offsets = [item.offsets[i]]
         new_data = {}
         for k, v in item.model_specific_data.items():
-            if isinstance(v, (list, tuple)) and len(v) == num_items:
+            if (
+                k in ("patch_pixel_values", "patch_newline_mask")
+                and patch_slices is not None
+                and _get_length(v) == total_num_patches
+            ):
+                patch_start, patch_end = patch_slices[i]
+                new_data[k] = _slice_value(v, patch_start, patch_end)
+            elif isinstance(v, (list, tuple)) and len(v) == num_items:
                 new_data[k] = [v[i]]
             elif (
                 isinstance(v, (torch.Tensor, np.ndarray))
