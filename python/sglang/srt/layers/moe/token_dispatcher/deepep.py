@@ -23,7 +23,7 @@ from sglang.srt.layers.moe.token_dispatcher.base import (
 from sglang.srt.layers.moe.topk import TopKOutput
 from sglang.srt.layers.moe.utils import (
     DeepEPMode,
-    DeepOutputDtype,
+    DeepEPOutputDtype,
     get_deepep_config,
     get_deepep_output_dtype,
     get_moe_runner_backend,
