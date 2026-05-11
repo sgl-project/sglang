@@ -545,7 +545,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
         # when max_running_requests > max_mamba_cache_size, indexing OOBs silently
         # in CUDA (only the assertion message prints; subsequent corrupted reads
         # surface as 'unspecified launch failure' in unrelated kernels).
-        mapping_size = max(self.size, size)
+        mapping_size = self.size
         self.req_index_to_mamba_index_mapping: torch.Tensor = torch.zeros(
             mapping_size, dtype=torch.int32, device=self.device
         )
