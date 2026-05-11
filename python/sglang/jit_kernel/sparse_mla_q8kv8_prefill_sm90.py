@@ -14,6 +14,7 @@ import torch
 
 from sglang.jit_kernel.utils import cache_once, load_jit, override_jit_cuda_arch
 from sglang.kernel_api_logging import debug_kernel_api
+from sglang.srt.utils.custom_op import register_custom_op
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
@@ -181,6 +182,104 @@ def _q8kv8_get_outbufs(s_q: int, h_q: int, d_v: int, device: torch.device):
     return out[:s_q], max_logits[:s_q], lse[:s_q]
 
 
+# Internal custom-op wrappers so the JIT kernel calls participate in
+# torch.library / torch.compile tracing and kernel-API debug logging.
+# The dispatch_full variant carries the optional attn_sink / topk_length
+# tensors as required args; the public API chooses which op to call.
+@register_custom_op(
+    op_name="sparse_mla_q8kv8_prefill",
+    mutates_args=["out", "max_logits", "lse"],
+)
+def _sparse_mla_q8kv8_prefill_op(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    indices: torch.Tensor,
+    q_scale: torch.Tensor,
+    kv_scale: torch.Tensor,
+    out: torch.Tensor,
+    max_logits: torch.Tensor,
+    lse: torch.Tensor,
+    s_q: int,
+    s_kv: int,
+    h_q: int,
+    h_kv: int,
+    d_qk: int,
+    d_v: int,
+    topk: int,
+    sm_scale: float,
+    cuda_stream: int,
+) -> None:
+    dispatch_fn, _ = _get_entries()
+    dispatch_fn(
+        q,
+        kv,
+        indices,
+        q_scale,
+        kv_scale,
+        out,
+        max_logits,
+        lse,
+        s_q,
+        s_kv,
+        h_q,
+        h_kv,
+        d_qk,
+        d_v,
+        topk,
+        sm_scale,
+        cuda_stream,
+    )
+
+
+@register_custom_op(
+    op_name="sparse_mla_q8kv8_prefill_full",
+    mutates_args=["out", "max_logits", "lse"],
+)
+def _sparse_mla_q8kv8_prefill_full_op(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    indices: torch.Tensor,
+    q_scale: torch.Tensor,
+    kv_scale: torch.Tensor,
+    attn_sink: torch.Tensor,
+    topk_length: torch.Tensor,
+    out: torch.Tensor,
+    max_logits: torch.Tensor,
+    lse: torch.Tensor,
+    s_q: int,
+    s_kv: int,
+    h_q: int,
+    h_kv: int,
+    d_qk: int,
+    d_v: int,
+    topk: int,
+    sm_scale: float,
+    cuda_stream: int,
+) -> None:
+    _, dispatch_full_fn = _get_entries()
+    dispatch_full_fn(
+        q,
+        kv,
+        indices,
+        q_scale,
+        kv_scale,
+        attn_sink,
+        topk_length,
+        out,
+        max_logits,
+        lse,
+        s_q,
+        s_kv,
+        h_q,
+        h_kv,
+        d_qk,
+        d_v,
+        topk,
+        sm_scale,
+        cuda_stream,
+    )
+
+
 @debug_kernel_api
 def sparse_mla_q8kv8_prefill_fwd(
     q: torch.Tensor,  # [s_q, h_q, d_qk], float8_e4m3fn
@@ -210,11 +309,10 @@ def sparse_mla_q8kv8_prefill_fwd(
 
     out, max_logits, lse = _q8kv8_get_outbufs(s_q, h_q, d_v, q.device)
 
-    dispatch_fn, dispatch_full_fn = _get_entries()
     cuda_stream = _get_current_stream_raw(q.device.index)
 
     if attn_sink is not None and topk_length is not None:
-        dispatch_full_fn(
+        _sparse_mla_q8kv8_prefill_full_op(
             q,
             kv,
             indices,
@@ -236,7 +334,7 @@ def sparse_mla_q8kv8_prefill_fwd(
             cuda_stream,
         )
     else:
-        dispatch_fn(
+        _sparse_mla_q8kv8_prefill_op(
             q,
             kv,
             indices,
