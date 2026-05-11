@@ -49,12 +49,10 @@ from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA as KimiMLAAtten
 from sglang.srt.models.llama import LlamaMLP as KimiMLP
 from sglang.srt.models.transformers import maybe_prefix
 from sglang.srt.utils import (
-    is_cuda,
+    is_hip,
     make_layers,
 )
 from sglang.srt.utils.common import BumpAllocator, add_prefix, set_weight_attrs
-
-_is_cuda = is_cuda()
 
 
 class KimiMoE(nn.Module):
@@ -532,13 +530,13 @@ class KimiLinearModel(nn.Module):
         else:
             self.embed_tokens = PPMissingLayer()
 
-        self.alt_stream = torch.cuda.Stream() if _is_cuda else None
-        # ROCm dual-stream is opt-in via SGLANG_ROCM_USE_MULTI_STREAM
+        self.alt_stream = torch.cuda.Stream()
+        # AMD/ROCm: dual-stream MoE is opt-in via SGLANG_ROCM_USE_MULTI_STREAM
         # (default off on AMD), matching the deepseek_v2.DeepseekV2Model
-        # gating from PR #24005. Skip when alt_stream was already created
-        # to preserve original behavior on other backends.
-        if self.alt_stream is None and envs.SGLANG_ROCM_USE_MULTI_STREAM.get():
-            self.alt_stream = torch.cuda.Stream()
+        # gating from PR #24005. Non-AMD backends keep the original
+        # always-on behavior.
+        if is_hip() and not envs.SGLANG_ROCM_USE_MULTI_STREAM.get():
+            self.alt_stream = None
 
         self.layers, self.start_layer, self.end_layer = make_layers(
             config.num_hidden_layers,
