@@ -1,9 +1,6 @@
 """Unit tests for model identity hash computation and storage key isolation."""
 
-import hashlib
-import os
 import unittest
-from unittest.mock import MagicMock
 
 from sglang.srt.mem_cache.hicache_storage import HiCacheFile, HiCacheStorageConfig
 from sglang.srt.mem_cache.hiradix_cache import compute_model_identity_hash

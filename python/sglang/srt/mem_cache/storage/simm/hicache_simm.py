@@ -205,7 +205,9 @@ class HiCacheSiMM(HiCacheStorage):
                 self.model_identity_hash = ""
 
             self.enable_pp = self.pp_size > 1
-            identity_suffix = f"_{self.model_identity_hash}" if self.model_identity_hash else ""
+            identity_suffix = (
+                f"_{self.model_identity_hash}" if self.model_identity_hash else ""
+            )
             if self.enable_pp:
                 self.mha_suffix = f"{self.local_rank}_{self.pp_rank}{identity_suffix}"
                 self.mla_suffix = f"{self.pp_rank}{identity_suffix}"
