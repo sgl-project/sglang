@@ -5,10 +5,6 @@ metatags:
 tag: NEW
 ---
 
-<Note>
-The public MiniCPM-V 4.6 release weights are not yet on HuggingFace; benchmark numbers below were captured during SGLang port verification on an internal test checkpoint and will be re-run once the public weights drop. The License field is also pending verification against the public model card.
-</Note>
-
 ## 1. Model Introduction
 
 MiniCPM-V 4.6 is the next-generation multimodal model from [OpenBMB](https://huggingface.co/openbmb), the team behind the MiniCPM-V series. The model combines a **Qwen3.5-style hybrid LLM backbone** (Gated Delta Net + full attention) with a **NaViT-packed vision encoder** that handles arbitrary aspect ratios and high-resolution slicing natively, plus end-to-end video support.
@@ -27,7 +23,7 @@ OpenBMB ships two variants on HuggingFace:
 - **Reasoning Parser**: switchable thinking mode (Qwen3.5 lineage), exposed via `chat_template_kwargs.enable_thinking` per request and SGLang's `--reasoning-parser qwen3` on the server side.
 - **Tool Calling**: Qwen3.5-style `<tool_call><function=…><parameter=…>…</parameter></function></tool_call>` XML format, surfaced as OpenAI-compatible `message.tool_calls` via SGLang's `--tool-call-parser qwen3_coder`. Composes with thinking mode and with image / video inputs.
 
-**License:** TODO — verify on HuggingFace model card.
+**License:** [Apache 2.0](https://www.apache.org/licenses/LICENSE-2.0).
 
 ## 2. SGLang Installation
 
@@ -36,11 +32,9 @@ Pull the nightly Docker image (rolling tag, tracks `main`):
 ```bash
 # CUDA 13 (Hopper / Blackwell, default)
 docker pull lmsysorg/sglang:dev
-docker pull lmsysorg/sglang:dev-minicpm-v-4-6
 
 # CUDA 12 (Ampere or older drivers)
 docker pull lmsysorg/sglang:dev-cu12
-docker pull lmsysorg/sglang:dev-cu12-minicpm-v-4-6
 ```
 
 For the general SGLang installation guide (PyPI, source, Docker) see the [official SGLang installation guide](../../../docs/get-started/install).
@@ -299,10 +293,6 @@ To get the final natural-language answer, feed the tool's result back as a `tool
 
 ## 5. Benchmark
 
-<Note>
-**TODO — re-run all benchmarks once the official MiniCPM-V 4.6 release weights are public.** Numbers in this section were captured during SGLang port verification and should not be interpreted as representative of the public release.
-</Note>
-
 **Common Test Environment (all benchmarks below):**
 
 - Hardware: 1× NVIDIA H200 (141 GB), single GPU (no TP / DP)
@@ -329,13 +319,54 @@ CUDA_VISIBLE_DEVICES=0 python -m sglang.launch_server \
 #### 5.1.1 MMMU Benchmark
 
 - Benchmark Command
+
 ```bash Command
 python3 benchmark/mmmu/bench_sglang.py --port 30000 --concurrency 48 --max-new-tokens 2048
 ```
 
 - Test Result
 
-Numbers will be filled in once the official MiniCPM-V 4.6 release weights are public.
+```
+{'Accounting': {'acc': 0.767, 'num': 30},
+ 'Agriculture': {'acc': 0.533, 'num': 30},
+ 'Architecture_and_Engineering': {'acc': 0.4, 'num': 30},
+ 'Art': {'acc': 0.6, 'num': 30},
+ 'Art_Theory': {'acc': 0.667, 'num': 30},
+ 'Basic_Medical_Science': {'acc': 0.533, 'num': 30},
+ 'Biology': {'acc': 0.333, 'num': 30},
+ 'Chemistry': {'acc': 0.333, 'num': 30},
+ 'Clinical_Medicine': {'acc': 0.467, 'num': 30},
+ 'Computer_Science': {'acc': 0.333, 'num': 30},
+ 'Design': {'acc': 0.533, 'num': 30},
+ 'Diagnostics_and_Laboratory_Medicine': {'acc': 0.333, 'num': 30},
+ 'Economics': {'acc': 0.633, 'num': 30},
+ 'Electronics': {'acc': 0.5, 'num': 30},
+ 'Energy_and_Power': {'acc': 0.633, 'num': 30},
+ 'Finance': {'acc': 0.533, 'num': 30},
+ 'Geography': {'acc': 0.367, 'num': 30},
+ 'History': {'acc': 0.533, 'num': 30},
+ 'Literature': {'acc': 0.7, 'num': 30},
+ 'Manage': {'acc': 0.367, 'num': 30},
+ 'Marketing': {'acc': 0.733, 'num': 30},
+ 'Materials': {'acc': 0.367, 'num': 30},
+ 'Math': {'acc': 0.567, 'num': 30},
+ 'Mechanical_Engineering': {'acc': 0.333, 'num': 30},
+ 'Music': {'acc': 0.267, 'num': 30},
+ 'Overall': {'acc': 0.527, 'num': 900},
+ 'Overall-Art and Design': {'acc': 0.517, 'num': 120},
+ 'Overall-Business': {'acc': 0.607, 'num': 150},
+ 'Overall-Health and Medicine': {'acc': 0.553, 'num': 150},
+ 'Overall-Humanities and Social Science': {'acc': 0.617, 'num': 120},
+ 'Overall-Science': {'acc': 0.473, 'num': 150},
+ 'Overall-Tech and Engineering': {'acc': 0.443, 'num': 210},
+ 'Pharmacy': {'acc': 0.667, 'num': 30},
+ 'Physics': {'acc': 0.767, 'num': 30},
+ 'Psychology': {'acc': 0.567, 'num': 30},
+ 'Public_Health': {'acc': 0.767, 'num': 30},
+ 'Sociology': {'acc': 0.667, 'num': 30}}
+eval out saved to ./val_sglang.json
+Overall accuracy: 0.527
+```
 
 ### 5.2 Speed Benchmark
 
