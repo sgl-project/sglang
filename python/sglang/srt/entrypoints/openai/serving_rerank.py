@@ -241,6 +241,17 @@ class OpenAIServingRerank(OpenAIServingBase):
 
         return None
 
+    async def _generate_one(
+        self,
+        req: Union[GenerateReqInput, EmbeddingReqInput],
+        raw_request: Request,
+    ) -> Any:
+        generator = self.tokenizer_manager.generate_request(req, raw_request)
+        try:
+            return await generator.__anext__()
+        finally:
+            await generator.aclose()
+
     def _convert_to_internal_request(
         self,
         request: V1RerankReqInput,
@@ -303,9 +314,7 @@ class OpenAIServingRerank(OpenAIServingBase):
                     "If you are serving a decoder-only reranker (e.g., Qwen3-Reranker), "
                     "please provide the corresponding --chat-template and launch without --is-embedding."
                 )
-            ret = await self.tokenizer_manager.generate_request(
-                adapted_request, raw_request
-            ).__anext__()
+            ret = await self._generate_one(adapted_request, raw_request)
         except ValueError as e:
             return self.create_error_response(str(e))
 
@@ -443,9 +452,7 @@ class OpenAIServingRerank(OpenAIServingBase):
                 )
 
                 # Execute generation request
-                ret = await self.tokenizer_manager.generate_request(
-                    gen_request, raw_request
-                ).__anext__()
+                ret = await self._generate_one(gen_request, raw_request)
 
                 # Extract yes/no probabilities from logprobs
                 score = self._extract_score_from_logprobs(ret)
