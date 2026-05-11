@@ -117,19 +117,7 @@ def init_torch_distributed(
         if server_args.pre_warm_nccl and (
             tp_size > 1 or pp_size > 1 or moe_ep_size > 1
         ):
-            warmup_start = time.perf_counter()
-            tp_group_handle = get_tp_group().device_group
-
-            # Single warmup all_reduce to initialize NCCL/RCCL/HCCL communicator
-            warmup_tensor = torch.zeros(1, device=torch.cuda.current_device())
-            dist.all_reduce(warmup_tensor, group=tp_group_handle)
-            current_platform.synchronize()
-
-            warmup_elapsed = time.perf_counter() - warmup_start
-            logger.info(
-                f"NCCL/RCCL/HCCL warmup completed in {warmup_elapsed:.3f}s "
-                f"(tp_size={tp_size}, pp_size={pp_size}, ep_size={moe_ep_size})"
-            )
+            _prewarm_nccl(tp_size=tp_size, pp_size=pp_size, moe_ep_size=moe_ep_size)
 
     pre_model_load_memory = get_available_gpu_memory(
         device,
@@ -274,3 +262,19 @@ def _init_parallel_groups(
     )
     if is_npu():
         register_sgl_tp_rank(gpu_id)
+
+
+def _prewarm_nccl(*, tp_size: int, pp_size: int, moe_ep_size: int) -> None:
+    warmup_start = time.perf_counter()
+    tp_group_handle = get_tp_group().device_group
+
+    # Single warmup all_reduce to initialize NCCL/RCCL/HCCL communicator
+    warmup_tensor = torch.zeros(1, device=torch.cuda.current_device())
+    dist.all_reduce(warmup_tensor, group=tp_group_handle)
+    current_platform.synchronize()
+
+    warmup_elapsed = time.perf_counter() - warmup_start
+    logger.info(
+        f"NCCL/RCCL/HCCL warmup completed in {warmup_elapsed:.3f}s "
+        f"(tp_size={tp_size}, pp_size={pp_size}, ep_size={moe_ep_size})"
+    )
