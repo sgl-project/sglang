@@ -132,9 +132,7 @@ from sglang.srt.model_executor.forward_context import (
 )
 from sglang.srt.model_executor.hook_manager import register_forward_hooks
 from sglang.srt.model_executor.model_runner_components.layer_setup import (
-    assert_pp_mtp_compat,
-    compute_model_num_layers,
-    resolve_pp_layer_range,
+    resolve_layer_indices,
 )
 from sglang.srt.model_executor.model_runner_components.load_model_utils import (
     load_kv_cache_scales,
@@ -728,37 +726,15 @@ class ModelRunner:
 
         self.remote_instance_weight_transport.maybe_register_and_publish_weight_info()
 
-        # For MTP models like DeepSeek-V3 or GLM-4.5, the MTP layer(s) are used separately as draft
-        # models for speculative decoding. In those cases, `num_nextn_predict_layers` is used to
-        # determine the number of layers.
-        # Some EAGLE3 drafts (e.g. nvidia/Kimi-K2.5-Thinking-Eagle3) carry the full DeepSeek-V3
-        # config schema and explicitly set `num_nextn_predict_layers: 0`. Treat that the same as
-        # the field being absent — otherwise the draft worker takes the MTP branch below with
-        # model_num_layers=0, sizing the draft KV pool to zero and producing an IndexError on
-        # the first forward (`set_mla_kv_buffer` -> `self.kv_buffer[layer_id - self.start_layer]`).
-        _nnpl = self.model_config.num_nextn_predict_layers
-        model_has_mtp_layers = _nnpl is not None and _nnpl > 0
-        model_num_layers = compute_model_num_layers(
-            model_config=self.model_config, is_draft_worker=self.is_draft_worker
-        )
-        pp_range = resolve_pp_layer_range(
-            model=self.model, model_num_layers=model_num_layers
-        )
-        self.start_layer = pp_range.start_layer
-        self.end_layer = pp_range.end_layer
-        self.num_effective_layers = self.end_layer - self.start_layer
-
-        # For LoopCoder models, each loop has its own layer_id, so we need to multiply by loop_num
-        loop_num = getattr(self.model_config.hf_config, "loop_num", 1)
-        if loop_num > 1:
-            self.num_effective_layers = self.num_effective_layers * loop_num
-
-        assert_pp_mtp_compat(
-            model_has_mtp_layers=model_has_mtp_layers,
+        layer_info = resolve_layer_indices(
+            model=self.model,
+            model_config=self.model_config,
+            is_draft_worker=self.is_draft_worker,
             spec_algorithm=self.spec_algorithm,
-            num_effective_layers=self.num_effective_layers,
-            model_num_layers=model_num_layers,
         )
+        self.start_layer = layer_info.start_layer
+        self.end_layer = layer_info.end_layer
+        self.num_effective_layers = layer_info.num_effective_layers
 
         self.adjust_hybrid_swa_layers_for_pp()
 
