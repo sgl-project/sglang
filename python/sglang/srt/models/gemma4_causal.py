@@ -858,9 +858,6 @@ class Gemma4ForCausalLM(PreTrainedModel):
     def get_input_embeddings(self) -> nn.Embedding:
         return self.model.embed_tokens
 
-    def get_output_embeddings(self) -> nn.Module:
-        return self.lm_head
-
     def get_attention_sliding_window_size(self):
         return get_attention_sliding_window_size(self.config)
 
