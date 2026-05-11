@@ -72,7 +72,7 @@ class NPUW8A8Int8LinearMethod(_NPULinearMethodBase):
             layer.weight,
             layer.deq_scale,
             bias=quant_bias,
-            output_dtype=original_dtype,
+            output_dtype=layer.params_dtype,
         )
 
 
