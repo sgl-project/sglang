@@ -24,7 +24,16 @@ class TestKimiLinear(CustomTestCase):
         cls.base_url = DEFAULT_URL_FOR_TEST
         other_args = ["--tp-size", "2", "--trust-remote"]
         if _is_hip:
-            other_args += ["--attention-backend", "triton"]
+            # AMD/ROCm: the aiter absorbed-MLA decode kernel is
+            # numerically lossy for Kimi-Linear (skip-rope MLA + KDA hybrid),
+            # so route decode through triton while keeping aiter for prefill.
+            # Same pattern as `test/registered/amd/test_kimi_k2_instruct.py`.
+            other_args += [
+                "--decode-attention-backend",
+                "triton",
+                "--prefill-attention-backend",
+                "aiter",
+            ]
         cls.process = popen_launch_server(
             cls.model,
             cls.base_url,
