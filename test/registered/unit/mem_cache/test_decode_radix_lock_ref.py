@@ -319,6 +319,7 @@ class TestDecodeLockRefScenarios(unittest.TestCase):
         queue.req_to_token_pool.available_size.return_value = 1
         queue.req_to_metadata_buffer_idx_allocator = MagicMock()
         queue.req_to_metadata_buffer_idx_allocator.available_size.return_value = 1
+        queue.token_to_kv_pool = MagicMock()
         queue.token_to_kv_pool_allocator = MagicMock()
         queue.token_to_kv_pool_allocator.page_size = 4
 
