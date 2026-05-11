@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import inspect
 import logging
+from dataclasses import dataclass
 
 import torch
 
@@ -35,6 +36,17 @@ from sglang.srt.utils import (
 logger = logging.getLogger(__name__)
 
 
+@dataclass(frozen=True, slots=True, kw_only=True)
+class _DummyCaptureModes:
+    """Dummy-run capture-mode + token-count resolution result."""
+
+    capture_forward_mode: ForwardMode
+    capture_hidden_mode: CaptureHiddenMode  # initial value; caller may override
+    num_tokens_per_bs: int
+    num_tokens: int
+    batch_size: int  # may differ from input if tp-aligned
+
+
 def dummy_run(
     *,
     batch_size: int,
@@ -53,29 +65,13 @@ def dummy_run(
     run_ctx=None,
 ):
     """Run a dummy forward pass for warmup/profiling."""
-    if is_generation:
-        capture_forward_mode = ForwardMode.DECODE
-    else:
-        capture_forward_mode = ForwardMode.EXTEND
-    capture_hidden_mode = CaptureHiddenMode.NULL
-    num_tokens_per_bs = 1
-    if spec_algorithm.is_speculative():
-        if is_draft_worker:
-            if not spec_algorithm.is_dflash():
-                raise RuntimeError("This should not happen")
-        capture_forward_mode = ForwardMode.TARGET_VERIFY
-        num_tokens_per_bs = server_args.speculative_num_draft_tokens
-
-    if server_args.enable_return_hidden_states:
-        capture_hidden_mode = CaptureHiddenMode.FULL
-
-    num_tokens = batch_size * num_tokens_per_bs
-
-    if require_gathered_buffer(server_args):
-        attn_tp_size = get_attention_tp_size()
-        if attn_tp_size > 1 and num_tokens % attn_tp_size != 0:
-            num_tokens = num_tokens // attn_tp_size * attn_tp_size
-            batch_size = num_tokens // num_tokens_per_bs
+    modes = _resolve_dummy_capture_modes(
+        batch_size=batch_size,
+        is_generation=is_generation,
+        spec_algorithm=spec_algorithm,
+        is_draft_worker=is_draft_worker,
+        server_args=server_args,
+    )
 
     seq_len_fill_value = attn_backend.get_cuda_graph_seq_len_fill_value()
 
@@ -99,8 +95,8 @@ def dummy_run(
 
     buffers: DecodeInputBuffers = DecodeInputBuffers.create(
         device=device,
-        max_bs=batch_size,
-        max_num_token=num_tokens,
+        max_bs=modes.batch_size,
+        max_num_token=modes.num_tokens,
         hidden_size=model_config.hidden_size,
         vocab_size=model_config.vocab_size,
         dtype=model_config.dtype,
@@ -114,25 +110,29 @@ def dummy_run(
             if model_config.is_encoder_decoder
             else 0
         ),
-        num_tokens_per_bs=num_tokens_per_bs,
+        num_tokens_per_bs=modes.num_tokens_per_bs,
         cache_loc_dtype=torch.int64,
         enable_mamba_track=False,
     )
-    buffers.num_token_non_padded[...] = num_tokens
+    buffers.num_token_non_padded[...] = modes.num_tokens
 
     # For extend mode
     if not is_generation:
-        extend_prefix_lens_cpu = [0] * batch_size
-        extend_seq_lens_cpu = [seq_len_fill_value] * batch_size
-        extend_num_tokens = num_tokens
+        extend_prefix_lens_cpu = [0] * modes.batch_size
+        extend_seq_lens_cpu = [seq_len_fill_value] * modes.batch_size
+        extend_num_tokens = modes.num_tokens
         extend_seq_lens = torch.full(
-            (batch_size,), seq_len_fill_value, dtype=torch.int32, device=device
+            (modes.batch_size,), seq_len_fill_value, dtype=torch.int32, device=device
         )
         extend_prefix_lens = torch.zeros(
-            (batch_size,), dtype=torch.int32, device=device
+            (modes.batch_size,), dtype=torch.int32, device=device
         )
         extend_start_loc = torch.arange(
-            0, num_tokens, num_tokens_per_bs, dtype=torch.int32, device=device
+            0,
+            modes.num_tokens,
+            modes.num_tokens_per_bs,
+            dtype=torch.int32,
+            device=device,
         )
     else:
         extend_prefix_lens_cpu = None
@@ -144,41 +144,41 @@ def dummy_run(
 
     if server_args.pp_size > 1:
         pp_proxy_tensors = PPProxyTensors(
-            {k: v[:num_tokens] for k, v in buffers.pp_proxy_tensors.items()}
+            {k: v[: modes.num_tokens] for k, v in buffers.pp_proxy_tensors.items()}
         )
 
     if require_mlp_tp_gather_:
         buffers.global_num_tokens_gpu.copy_(
             torch.tensor(
-                [num_tokens] * server_args.dp_size,
+                [modes.num_tokens] * server_args.dp_size,
                 dtype=torch.int32,
                 device=device,
             )
         )
         buffers.global_num_tokens_for_logprob_gpu.copy_(
             torch.tensor(
-                [num_tokens] * server_args.dp_size,
+                [modes.num_tokens] * server_args.dp_size,
                 dtype=torch.int32,
                 device=device,
             )
         )
-        global_dp_buffer_len = num_tokens * server_args.dp_size
+        global_dp_buffer_len = modes.num_tokens * server_args.dp_size
     elif require_attn_tp_gather(server_args):
         buffers.global_num_tokens_gpu.copy_(
             torch.tensor(
-                [num_tokens],
+                [modes.num_tokens],
                 dtype=torch.int32,
                 device=device,
             )
         )
         buffers.global_num_tokens_for_logprob_gpu.copy_(
             torch.tensor(
-                [num_tokens],
+                [modes.num_tokens],
                 dtype=torch.int32,
                 device=device,
             )
         )
-        global_dp_buffer_len = num_tokens
+        global_dp_buffer_len = modes.num_tokens
     else:
         global_dp_buffer_len = None
 
@@ -231,26 +231,27 @@ def dummy_run(
                 retrieve_index=None,
                 retrieve_next_token=None,
                 retrieve_next_sibling=None,
-                draft_token_num=num_tokens_per_bs,
+                draft_token_num=modes.num_tokens_per_bs,
             )
             spec_info.capture_hidden_mode = CaptureHiddenMode.NULL
 
         return spec_info
 
     spec_info = get_spec_info()
+    capture_hidden_mode = modes.capture_hidden_mode
     if capture_hidden_mode != CaptureHiddenMode.FULL:
         capture_hidden_mode = (
             spec_info.capture_hidden_mode if spec_info else CaptureHiddenMode.NULL
         )
 
     if server_args.enable_lora:
-        lora_ids = [None] * batch_size
+        lora_ids = [None] * modes.batch_size
     else:
         lora_ids = None
 
     forward_batch = ForwardBatch(
-        forward_mode=capture_forward_mode,
-        batch_size=batch_size,
+        forward_mode=modes.capture_forward_mode,
+        batch_size=modes.batch_size,
         input_ids=buffers.input_ids,
         req_pool_indices=buffers.req_pool_indices,
         seq_lens=buffers.seq_lens,
@@ -280,7 +281,7 @@ def dummy_run(
         spec_info=spec_info,
         capture_hidden_mode=capture_hidden_mode,
         num_token_non_padded=buffers.num_token_non_padded,
-        global_forward_mode=capture_forward_mode,
+        global_forward_mode=modes.capture_forward_mode,
         lora_ids=lora_ids,
     )
 
@@ -293,7 +294,7 @@ def dummy_run(
         forward_batch.dp_local_start_pos = forward_batch.dp_local_num_tokens = None
         set_dp_buffer_len(
             global_dp_buffer_len,
-            num_tokens,
+            modes.num_tokens,
             forward_batch.dp_padding_mode.is_max_len(),
         )
         set_is_extend_in_batch(False)
@@ -321,3 +322,44 @@ def dummy_run(
     tp_group.barrier()
     with torch.inference_mode(), run_ctx or empty_context():
         run_once()
+
+
+def _resolve_dummy_capture_modes(
+    *,
+    batch_size: int,
+    is_generation: bool,
+    spec_algorithm: SpeculativeAlgorithm,
+    is_draft_worker: bool,
+    server_args: ServerArgs,
+) -> _DummyCaptureModes:
+    if is_generation:
+        capture_forward_mode = ForwardMode.DECODE
+    else:
+        capture_forward_mode = ForwardMode.EXTEND
+    capture_hidden_mode = CaptureHiddenMode.NULL
+    num_tokens_per_bs = 1
+    if spec_algorithm.is_speculative():
+        if is_draft_worker:
+            if not spec_algorithm.is_dflash():
+                raise RuntimeError("This should not happen")
+        capture_forward_mode = ForwardMode.TARGET_VERIFY
+        num_tokens_per_bs = server_args.speculative_num_draft_tokens
+
+    if server_args.enable_return_hidden_states:
+        capture_hidden_mode = CaptureHiddenMode.FULL
+
+    num_tokens = batch_size * num_tokens_per_bs
+
+    if require_gathered_buffer(server_args):
+        attn_tp_size = get_attention_tp_size()
+        if attn_tp_size > 1 and num_tokens % attn_tp_size != 0:
+            num_tokens = num_tokens // attn_tp_size * attn_tp_size
+            batch_size = num_tokens // num_tokens_per_bs
+
+    return _DummyCaptureModes(
+        capture_forward_mode=capture_forward_mode,
+        capture_hidden_mode=capture_hidden_mode,
+        num_tokens_per_bs=num_tokens_per_bs,
+        num_tokens=num_tokens,
+        batch_size=batch_size,
+    )
