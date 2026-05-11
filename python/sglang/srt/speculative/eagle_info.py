@@ -1,7 +1,7 @@
 import logging
 from copy import copy
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -52,6 +52,9 @@ if is_cuda() or is_musa():
         top_p_renorm_prob,
         tree_speculative_sampling_target_only,
     )
+
+if TYPE_CHECKING:
+    from sglang.srt.speculative.eagle_worker import EAGLEWorker
 
 logger = logging.getLogger(__name__)
 
@@ -699,6 +702,22 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
             pt += extend_len
 
     @classmethod
+    def hidden_size_for(cls, worker: "EAGLEWorker") -> int:
+        """Wire-format hidden_size for `hidden_states` in the decode phase.
+
+        Decode-phase canonical: draft self-chain output. Each draft step
+        writes its own last hidden back via `capture_for_decode`, so the
+        producer is the draft model itself. Use this for idle placeholders
+        and cuda graph static buffers in the decode path.
+        """
+        return worker.draft_model_runner.model_config.spec_hidden_size
+
+    @classmethod
+    def dtype_for(cls, worker: "EAGLEWorker") -> torch.dtype:
+        """Wire-format dtype for `hidden_states` in the decode phase."""
+        return worker.draft_model_runner.model_config.dtype
+
+    @classmethod
     def create_idle_input(
         cls,
         device: torch.device,
@@ -819,6 +838,29 @@ class EagleDraftExtendInput(SpecInput):
 
     def get_spec_adjust_token_coefficient(self) -> Tuple[int, int]:
         return self.num_tokens_per_req, self.num_tokens_for_logprob_per_req
+
+    @classmethod
+    def hidden_size_for(cls, worker: "EAGLEWorker") -> int:
+        """Wire-format hidden_size for `hidden_states` in the extend phase.
+
+        Extend-phase canonical: target verify output (EAGLE paper's "feature").
+        Widened to `target.hidden_size * 3` for EAGLE-3 aux mode, which fuses
+        low/mid/high-level target features into a 3k-dimensional vector
+        before the draft's FC reduces it back to k. Use this for idle
+        placeholders and cuda graph static buffers in the extend path.
+        """
+        target_cfg = worker.target_worker.model_runner.model_config
+        if (
+            worker.speculative_algorithm.is_eagle3()
+            and worker.eagle_use_aux_hidden_state
+        ):
+            return target_cfg.hidden_size * 3
+        return target_cfg.spec_hidden_size
+
+    @classmethod
+    def dtype_for(cls, worker: "EAGLEWorker") -> torch.dtype:
+        """Wire-format dtype for `hidden_states` in the extend phase."""
+        return worker.target_worker.model_runner.model_config.dtype
 
     @classmethod
     def create_idle_input(
