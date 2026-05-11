@@ -52,7 +52,7 @@ class TestDeepseekR1Nvfp4CuteDSLDeepEP(CustomTestCase):
             "deepep",
             "--deepep-mode",
             "low_latency",
-            "--deepep-dispather-output-dtype",
+            "--deepep-dispatcher-output-dtype",
             "bf16",
         ]
         cls.process = popen_launch_server(
