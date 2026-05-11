@@ -8,7 +8,6 @@ import torch
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-from sglang.srt.layers.moe.routed_experts_capturer import get_global_experts_capturer
 from sglang.srt.managers.io_struct import (
     AbortReq,
     BatchEmbeddingOutput,
@@ -22,6 +21,10 @@ from sglang.srt.managers.schedule_batch import (
 )
 from sglang.srt.mem_cache.common import maybe_cache_unfinished_req, release_kv_cache
 from sglang.srt.server_args import MIS_DELIMITER_TOKEN_ID, get_global_server_args
+from sglang.srt.state_capturer.indexer_topk import (
+    get_global_indexer_capturer,
+)
+from sglang.srt.state_capturer.routed_experts import get_global_experts_capturer
 
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import (
@@ -105,8 +108,53 @@ class SchedulerOutputProcessorMixin:
             self.token_to_kv_pool_allocator.free_group_end()
 
     def maybe_collect_routed_experts(self: Scheduler, req: Req):
-        """Collect routed experts for a finished request."""
-        req.routed_experts = get_global_experts_capturer().get_routed_experts(
+        """Collect routed experts for a finished request.
+
+        Returns immediately if `return_routed_experts` was not set on the
+        request, so non-opted-in reqs don't pay the host-gather cost.
+
+        Honors the caller's absolute start so the response covers
+        `[start_len, seqlen - 1)`. The default start_len is 0, which returns
+        the full sequence.
+
+        Logs a soft warning if the resulting tensor's row count differs from
+        the expected `seqlen - 1 - start_len`, to catch silent regressions.
+        """
+        if not req.return_routed_experts:
+            return
+        capturer = get_global_experts_capturer()
+        if capturer is None:
+            return
+        start_len = req.routed_experts_start_len
+        req.routed_experts = capturer.get_topk(
+            req_pool_idx=req.req_pool_idx,
+            seqlen=req.seqlen,
+            req_to_token_pool=self.req_to_token_pool,
+            start_len=start_len,
+        )
+
+        expected_rows = max(0, req.seqlen - 1 - start_len)
+        if (
+            req.routed_experts is not None
+            and req.routed_experts.shape[0] != expected_rows
+        ):
+            logger.warning(
+                "routed_experts row-count mismatch for req %s: got %d, "
+                "expected %d (seqlen=%d, cached_tokens=%d, start_len=%s). "
+                "This indicates a silent bug.",
+                req.rid,
+                req.routed_experts.shape[0],
+                expected_rows,
+                req.seqlen,
+                req.cached_tokens,
+                req.routed_experts_start_len,
+            )
+
+    def maybe_collect_indexer_topk(self: Scheduler, req: Req):
+        capturer = get_global_indexer_capturer()
+        if capturer is None:
+            return
+        req.indexer_topk = capturer.get_topk(
             req_pool_idx=req.req_pool_idx,
             seqlen=req.seqlen,
             req_to_token_pool=self.req_to_token_pool,
@@ -143,6 +191,9 @@ class SchedulerOutputProcessorMixin:
             if result.routed_experts_output is not None:
                 result.routed_experts_output.finalize()
                 result.routed_experts_output = None
+            if result.indexer_topk_output is not None:
+                result.indexer_topk_output.finalize()
+                result.indexer_topk_output = None
 
             (
                 logits_output,
@@ -201,6 +252,7 @@ class SchedulerOutputProcessorMixin:
                     req.check_finished()
                     if req.finished():
                         self.maybe_collect_routed_experts(req)
+                        self.maybe_collect_indexer_topk(req)
                         release_kv_cache(req, self.tree_cache)
                         req.time_stats.set_completion_time()
                     elif not batch.decoding_reqs or req not in batch.decoding_reqs:
@@ -348,6 +400,7 @@ class SchedulerOutputProcessorMixin:
 
         can_run_cuda_graph = getattr(result, "can_run_cuda_graph", False)
         self.report_prefill_stats(
+            batch=batch,
             prefill_stats=batch.prefill_stats,
             can_run_cuda_graph=can_run_cuda_graph,
             dp_cooperation_info=batch.dp_cooperation_info,
@@ -365,15 +418,33 @@ class SchedulerOutputProcessorMixin:
         result.num_accepted_drafts = sum(accept_lens) - len(batch.reqs)
         result.num_accepted_drafts_per_req_cpu = [x - 1 for x in accept_lens]
 
+        # Feed the adaptive controller now that accept_lens is on CPU,
+        # instead of doing a synchronous GPU→CPU copy in the worker hot path.
+        # BaseSpecWorker provides a no-op default for non-adaptive workers.
+        self.model_worker.on_verify_complete_cpu(result.num_accepted_drafts_per_req_cpu)
+
         predict_tokens = []
-        stride = self.draft_worker.speculative_num_draft_tokens
+        # In adaptive spec-v2, the worker state may already have switched when this
+        # delayed result is processed. Use the draft token count recorded on result.
+        stride = result.speculative_num_draft_tokens
+        assert stride is not None, "spec-v2 result missing speculative_num_draft_tokens"
 
         for i, req in enumerate(batch.reqs):
-            # -1 because prepare_for_decode pre-claimed the bonus slot.
-            req.kv_committed_len += accept_lens[i] - 1
             predict_tokens.append(
                 next_token_ids[i * stride : i * stride + accept_lens[i]]
             )
+
+            if req.is_retracted:
+                # reset_for_retract() already zeroes committed/allocated KV.
+                continue
+
+            if req.finished():
+                # -1 because prepare_for_decode pre-claimed the bonus slot.
+                req.kv_committed_len -= 1
+                continue
+
+            # -1 because prepare_for_decode pre-claimed the bonus slot.
+            req.kv_committed_len += accept_lens[i] - 1
             req.spec_verify_ct += 1
 
             accepted_draft_tokens = result.num_accepted_drafts_per_req_cpu[i]
@@ -404,6 +475,9 @@ class SchedulerOutputProcessorMixin:
         if result.routed_experts_output is not None:
             result.routed_experts_output.finalize()
             result.routed_experts_output = None
+        if result.indexer_topk_output is not None:
+            result.indexer_topk_output.finalize()
+            result.indexer_topk_output = None
 
         logits_output, next_token_ids, can_run_cuda_graph = (
             result.logits_output,
@@ -571,6 +645,7 @@ class SchedulerOutputProcessorMixin:
             if req.multimodal_inputs is not None and req.session is None:
                 req.multimodal_inputs.release_features()
             self.maybe_collect_routed_experts(req)
+            self.maybe_collect_indexer_topk(req)
 
             if self.server_args.disaggregation_decode_enable_offload_kvcache:
                 # Asynchronously offload KV cache; release_kv_cache will be called after Device->Host transfer completes
@@ -977,6 +1052,7 @@ class SchedulerOutputProcessorMixin:
         output_hidden_states = None
         load = self.get_loads(GetLoadsReqInput(include=["core"]))
         routed_experts = None
+        indexer_topk = None
         customized_info = {}
 
         time_stats = []
@@ -1160,6 +1236,10 @@ class SchedulerOutputProcessorMixin:
                     if routed_experts is None:
                         routed_experts = []
                     routed_experts.append(req.routed_experts)
+                if req.return_indexer_topk:
+                    if indexer_topk is None:
+                        indexer_topk = []
+                    indexer_topk.append(req.indexer_topk)
 
                 if req.customized_info is not None:
                     for k, v in req.customized_info.items():
@@ -1216,6 +1296,7 @@ class SchedulerOutputProcessorMixin:
                     output_token_entropy_val=None,
                     output_hidden_states=output_hidden_states,
                     routed_experts=routed_experts,
+                    indexer_topk=indexer_topk,
                     customized_info=customized_info,
                     placeholder_tokens_idx=None,
                     placeholder_tokens_val=None,

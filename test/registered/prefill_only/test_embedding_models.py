@@ -40,8 +40,14 @@ register_cuda_ci(est_time=136, suite="stage-b-test-1-gpu-small")
 MODEL_TO_CONFIG = {
     "Alibaba-NLP/gte-Qwen2-1.5B-instruct": (1, 1e-5),
     "intfloat/e5-mistral-7b-instruct": (1, 1e-5),
-    "marco/mcdse-2b-v1": (1, 1e-5),
     "Qwen/Qwen3-Embedding-8B": (1, 1e-5),
+    # Temporarily disable: HF reference path in runners.py runs this Qwen2-VL
+    # fine-tune with bidirectional attention (the non-sentence-transformers
+    # branch in _get_sentence_transformer_embedding_model does not pass
+    # is_causal=True), while SGLang's Qwen2-VL embedding is always causal —
+    # producing ~0.30 cosine diffs vs HF on short prompts.
+    # See https://github.com/sgl-project/sglang/actions/runs/25224929325/job/73966043206
+    # "marco/mcdse-2b-v1": (1, 1e-5),
     # Temporarily disable before this model is fixed
     # "jason9693/Qwen2.5-1.5B-apeach": (1, 1e-5),
 }
