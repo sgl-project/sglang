@@ -81,9 +81,17 @@ class EPLBManager:
         for chunk_index, update_layer_ids in enumerate(update_layer_ids_chunks):
             if len(update_layer_ids_chunks) > 1:
                 yield
-            self._model_runner.update_expert_location(
-                expert_location_metadata,
+            from sglang.srt.model_executor.model_runner import ModelRunner
+
+            ModelRunner.update_expert_location_with_recovery(
+                expert_location_updater=self._model_runner.expert_location_updater,
+                model=self._model_runner.model,
+                new_expert_location_metadata=expert_location_metadata,
                 update_layer_ids=update_layer_ids,
+                nnodes=self._model_runner.server_args.nnodes,
+                tp_rank=self._model_runner.tp_rank,
+                expert_backup_client=self._model_runner.expert_backup_client,
+                update_weights_from_disk_callable=self._model_runner.weight_updater.update_weights_from_disk,
             )
 
         msg = f"[EPLBManager] rebalance end"
