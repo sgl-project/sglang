@@ -244,7 +244,9 @@ class LlamaModel(nn.Module):
 
         # For draft decode, we capture the hidden state before norm, but some models might prefer normed hidden states
         draft_decode = (
-            [hidden_states] if not self.norm_output else [hidden_states_to_logits]
+            [hidden_states_to_aux]
+            if not self.norm_output
+            else [hidden_states_to_logits]
         )
         return hidden_states_to_logits, draft_decode
 

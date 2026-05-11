@@ -1135,12 +1135,8 @@ class EAGLEWorker(TpModelWorker):
                 self.speculative_algorithm.is_eagle3()
                 and self.eagle_use_aux_hidden_state
             ):
-                eagle_config = (
-                    getattr(target_cfg.hf_config, "eagle_config", None) or {}
-                )
-                num_aux = getattr(
-                    target_cfg.hf_config, "num_aux_hidden_states", None
-                )
+                eagle_config = getattr(target_cfg.hf_config, "eagle_config", None) or {}
+                num_aux = getattr(target_cfg.hf_config, "num_aux_hidden_states", None)
                 if num_aux is None:
                     num_aux = len(
                         eagle_config.get(
