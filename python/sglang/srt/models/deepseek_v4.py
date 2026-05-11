@@ -757,8 +757,12 @@ class DeepseekV4DecoderLayer(nn.Module):
         hc_fn: torch.Tensor,
         hc_scale: torch.Tensor,
         hc_base: torch.Tensor,
+        norm: Optional[nn.Module] = None,
     ):
-        @maybe_torch_compile
+        """If *norm* is given and the TileLang path is active, the returned
+        hidden_states are already post-norm (the norm is fused into the kernel)."""
+
+        @compile_in_capture_mode
         def hc_pre_torch_impl(x, hc_fn):
             x_flat = x.flatten(1).float()
             rsqrt = torch.rsqrt(
@@ -777,10 +781,15 @@ class DeepseekV4DecoderLayer(nn.Module):
             comb = torch.empty(
                 (0, self.hc_mult, self.hc_mult), dtype=dtype, device=x.device
             )
-            return y, post, comb
+            return y, post, comb, False
 
         if envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.get():
             from sglang.srt.layers.mhc import mhc_pre
+
+            norm_kwargs = {}
+            if norm is not None:
+                norm_kwargs["norm_weight"] = norm.weight.data
+                norm_kwargs["norm_eps"] = norm.variance_epsilon
 
             post, comb, y = mhc_pre(
                 residual=x,
@@ -792,9 +801,10 @@ class DeepseekV4DecoderLayer(nn.Module):
                 hc_sinkhorn_eps=self.hc_eps,
                 hc_post_mult_value=2.0,
                 sinkhorn_repeat=self.hc_sinkhorn_iters,
+                **norm_kwargs,
             )
             # returned post should be [n, hc_mult]
-            return y, post.squeeze(-1), comb
+            return y, post.squeeze(-1), comb, norm is not None
 
         if _is_hip and envs.SGLANG_OPT_USE_AITER_MHC_PRE.get():
             from aiter.ops.mhc import mhc_pre
@@ -811,7 +821,7 @@ class DeepseekV4DecoderLayer(nn.Module):
                 sinkhorn_repeat=self.hc_sinkhorn_iters,
             )
             # returned post should be [n, hc_mult]
-            return y, post.squeeze(-1), comb
+            return y, post.squeeze(-1), comb, False
 
         if envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.get():
             # DeepGEMM implementation
@@ -844,7 +854,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             self.hc_eps,
         )
         y = (pre.squeeze(1).unsqueeze(-1) * x_flat.view(shape)).sum(dim=1)
-        return y.to(dtype), post.squeeze(1), comb.squeeze(1)
+        return y.to(dtype), post.squeeze(1), comb.squeeze(1), False
 
     def hc_post(
         self,
@@ -903,10 +913,15 @@ class DeepseekV4DecoderLayer(nn.Module):
             pass
 
         residual = hidden_states
-        hidden_states, post, comb = self.hc_pre(
-            hidden_states, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base
-        )  # -> [n, d]
-        hidden_states = self.input_layernorm(hidden_states)
+        hidden_states, post, comb, norm_fused = self.hc_pre(
+            hidden_states,
+            self.hc_attn_fn,
+            self.hc_attn_scale,
+            self.hc_attn_base,
+            norm=self.input_layernorm,
+        )
+        if not norm_fused:
+            hidden_states = self.input_layernorm(hidden_states)
 
         hidden_states = self.self_attn(
             x=hidden_states,
@@ -915,11 +930,16 @@ class DeepseekV4DecoderLayer(nn.Module):
         )
 
         hidden_states = self.hc_post(hidden_states, residual, post, comb)
-        residual = hidden_states  # [n, hc, d]
-        hidden_states, post, comb = self.hc_pre(
-            hidden_states, self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base
-        )  # -> [n, d]
-        hidden_states = self.post_attention_layernorm(hidden_states)
+        residual = hidden_states
+        hidden_states, post, comb, norm_fused = self.hc_pre(
+            hidden_states,
+            self.hc_ffn_fn,
+            self.hc_ffn_scale,
+            self.hc_ffn_base,
+            norm=self.post_attention_layernorm,
+        )
+        if not norm_fused:
+            hidden_states = self.post_attention_layernorm(hidden_states)
 
         # Communication logic (equivalent to LayerCommunicator):
         #
@@ -1057,6 +1077,17 @@ class DeepseekV4Model(nn.Module):
         hc_scale: torch.Tensor,
         hc_base: torch.Tensor,
     ):
+        if x.numel() > 0:
+            from sglang.srt.layers.mhc_head import fused_hc_head
+
+            return fused_hc_head(
+                x.contiguous(),
+                hc_fn,
+                hc_scale,
+                hc_base,
+                norm_eps=self.norm_eps,
+                hc_eps=self.hc_eps,
+            )
         shape, dtype = x.size(), x.dtype
         x = x.flatten(1).float()
         rsqrt = torch.rsqrt(x.square().mean(-1, keepdim=True) + self.norm_eps)
