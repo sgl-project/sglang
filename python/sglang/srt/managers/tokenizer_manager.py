@@ -1638,15 +1638,16 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     meta_info.update(scheduler_time_stats.convert_to_output_meta_info())
 
             if getattr(state.obj, "return_logprob", False):
-                self.convert_logprob_style(
+                TokenizerManager.convert_logprob_style(
                     meta_info,
                     state,
-                    state.obj.top_logprobs_num,
-                    state.obj.token_ids_logprob,
-                    state.obj.return_text_in_logprobs
+                    top_logprobs_num=state.obj.top_logprobs_num,
+                    token_ids_logprob=state.obj.token_ids_logprob,
+                    return_text_in_logprobs=state.obj.return_text_in_logprobs
                     and not self.server_args.skip_tokenizer_init,
-                    recv_obj,
-                    i,
+                    recv_obj=recv_obj,
+                    recv_obj_index=i,
+                    tokenizer=self.tokenizer,
                 )
 
             if not isinstance(recv_obj, BatchEmbeddingOutput):
@@ -1850,30 +1851,34 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             load_update_req = WatchLoadUpdateReq(loads=[recv_obj.load])
             self.send_to_scheduler.send_pyobj(load_update_req)
 
+    @staticmethod
     def add_logprob_to_meta_info(
-        self,
         meta_info: dict,
         state: ReqState,
+        *,
         top_logprobs_num: int,
-        token_ids_logprob: List[int],
+        token_ids_logprob: Optional[List[int]],
         return_text_in_logprobs: bool,
-    ):
+        tokenizer: Optional[Any],
+    ) -> None:
         # 1. Handle regular logprobs
         if len(state.input_token_logprobs_val) > len(state.input_token_logprobs):
             state.input_token_logprobs.extend(
-                self.detokenize_logprob_tokens(
+                TokenizerManager.detokenize_logprob_tokens(
                     state.input_token_logprobs_val[len(state.input_token_logprobs) :],
                     state.input_token_logprobs_idx[len(state.input_token_logprobs) :],
-                    return_text_in_logprobs,
+                    decode_to_text=return_text_in_logprobs,
+                    tokenizer=tokenizer,
                 )
             )
 
         if len(state.output_token_logprobs_val) > len(state.output_token_logprobs):
             state.output_token_logprobs.extend(
-                self.detokenize_logprob_tokens(
+                TokenizerManager.detokenize_logprob_tokens(
                     state.output_token_logprobs_val[len(state.output_token_logprobs) :],
                     state.output_token_logprobs_idx[len(state.output_token_logprobs) :],
-                    return_text_in_logprobs,
+                    decode_to_text=return_text_in_logprobs,
+                    tokenizer=tokenizer,
                 )
             )
 
@@ -1885,18 +1890,20 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         if top_logprobs_num > 0:
             if len(state.input_top_logprobs_val) > len(state.input_top_logprobs):
                 state.input_top_logprobs.extend(
-                    self.detokenize_top_logprobs_tokens(
+                    TokenizerManager.detokenize_top_logprobs_tokens(
                         state.input_top_logprobs_val[len(state.input_top_logprobs) :],
                         state.input_top_logprobs_idx[len(state.input_top_logprobs) :],
-                        return_text_in_logprobs,
+                        decode_to_text=return_text_in_logprobs,
+                        tokenizer=tokenizer,
                     )
                 )
             if len(state.output_top_logprobs_val) > len(state.output_top_logprobs):
                 state.output_top_logprobs.extend(
-                    self.detokenize_top_logprobs_tokens(
+                    TokenizerManager.detokenize_top_logprobs_tokens(
                         state.output_top_logprobs_val[len(state.output_top_logprobs) :],
                         state.output_top_logprobs_idx[len(state.output_top_logprobs) :],
-                        return_text_in_logprobs,
+                        decode_to_text=return_text_in_logprobs,
+                        tokenizer=tokenizer,
                     )
                 )
 
@@ -1909,44 +1916,48 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 state.input_token_ids_logprobs
             ):
                 state.input_token_ids_logprobs.extend(
-                    self.detokenize_top_logprobs_tokens(
+                    TokenizerManager.detokenize_top_logprobs_tokens(
                         state.input_token_ids_logprobs_val[
                             len(state.input_token_ids_logprobs) :
                         ],
                         state.input_token_ids_logprobs_idx[
                             len(state.input_token_ids_logprobs) :
                         ],
-                        return_text_in_logprobs,
+                        decode_to_text=return_text_in_logprobs,
+                        tokenizer=tokenizer,
                     )
                 )
             if len(state.output_token_ids_logprobs_val) > len(
                 state.output_token_ids_logprobs
             ):
                 state.output_token_ids_logprobs.extend(
-                    self.detokenize_top_logprobs_tokens(
+                    TokenizerManager.detokenize_top_logprobs_tokens(
                         state.output_token_ids_logprobs_val[
                             len(state.output_token_ids_logprobs) :
                         ],
                         state.output_token_ids_logprobs_idx[
                             len(state.output_token_ids_logprobs) :
                         ],
-                        return_text_in_logprobs,
+                        decode_to_text=return_text_in_logprobs,
+                        tokenizer=tokenizer,
                     )
                 )
 
             meta_info["input_token_ids_logprobs"] = state.input_token_ids_logprobs
             meta_info["output_token_ids_logprobs"] = state.output_token_ids_logprobs
 
+    @staticmethod
     def convert_logprob_style(
-        self,
         meta_info: dict,
         state: ReqState,
+        *,
         top_logprobs_num: int,
-        token_ids_logprob: List[int],
+        token_ids_logprob: Optional[List[int]],
         return_text_in_logprobs: bool,
         recv_obj: BatchStrOutput,
         recv_obj_index: int,
-    ):
+        tokenizer: Optional[Any],
+    ) -> None:
         if recv_obj.input_token_logprobs_val is None:
             return
 
@@ -1997,48 +2008,54 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 recv_obj.output_token_ids_logprobs_idx[recv_obj_index]
             )
 
-        self.add_logprob_to_meta_info(
+        TokenizerManager.add_logprob_to_meta_info(
             meta_info,
             state,
-            state.obj.top_logprobs_num,
-            state.obj.token_ids_logprob,
-            return_text_in_logprobs,
+            top_logprobs_num=state.obj.top_logprobs_num,
+            token_ids_logprob=state.obj.token_ids_logprob,
+            return_text_in_logprobs=return_text_in_logprobs,
+            tokenizer=tokenizer,
         )
 
+    @staticmethod
     def detokenize_logprob_tokens(
-        self,
         token_logprobs_val: List[float],
         token_logprobs_idx: List[int],
+        *,
         decode_to_text: bool,
-    ):
+        tokenizer: Optional[Any],
+    ) -> List[Tuple[float, int, Optional[str]]]:
         if not decode_to_text:
             return [
                 (logprob, token_id, None)
                 for logprob, token_id in zip(token_logprobs_val, token_logprobs_idx)
             ]
         else:
-            assert self.tokenizer is not None
+            assert tokenizer is not None
             # In transformers v5, batch_decode([1, 2, 3]) concatenates all tokens
             # into one string. Wrap each ID in its own list so they decode separately.
-            token_texts = self.tokenizer.batch_decode(
-                [[idx] for idx in token_logprobs_idx]
-            )
+            token_texts = tokenizer.batch_decode([[idx] for idx in token_logprobs_idx])
             return list(zip(token_logprobs_val, token_logprobs_idx, token_texts))
 
+    @staticmethod
     def detokenize_top_logprobs_tokens(
-        self,
-        token_logprobs_val: List[float],
-        token_logprobs_idx: List[int],
+        token_logprobs_val: List[List[float]],
+        token_logprobs_idx: List[List[int]],
+        *,
         decode_to_text: bool,
-    ):
+        tokenizer: Optional[Any],
+    ) -> List[Optional[List[Tuple[float, int, Optional[str]]]]]:
         # TODO: The current implementation only batches the detokenization for top-k tokens per single position.
         # We should batch all top-k tokens in all positions.
         ret = []
         for i in range(len(token_logprobs_val)):
             if token_logprobs_val[i]:
                 ret.append(
-                    self.detokenize_logprob_tokens(
-                        token_logprobs_val[i], token_logprobs_idx[i], decode_to_text
+                    TokenizerManager.detokenize_logprob_tokens(
+                        token_logprobs_val[i],
+                        token_logprobs_idx[i],
+                        decode_to_text=decode_to_text,
+                        tokenizer=tokenizer,
                     )
                 )
             else:
@@ -2373,13 +2390,14 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         }
         is_stream = getattr(state.obj, "stream", False)
         if getattr(state.obj, "return_logprob", False):
-            self.add_logprob_to_meta_info(
+            TokenizerManager.add_logprob_to_meta_info(
                 meta_info,
                 state,
-                state.obj.top_logprobs_num,
-                state.obj.token_ids_logprob,
-                state.obj.return_text_in_logprobs
+                top_logprobs_num=state.obj.top_logprobs_num,
+                token_ids_logprob=state.obj.token_ids_logprob,
+                return_text_in_logprobs=state.obj.return_text_in_logprobs
                 and not self.server_args.skip_tokenizer_init,
+                tokenizer=self.tokenizer,
             )
 
         output_ids = state.output_ids
