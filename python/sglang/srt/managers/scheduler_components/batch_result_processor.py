@@ -712,22 +712,22 @@ class SchedulerBatchResultProcessor:
             max_accept = 1
 
         for j, tok_id in enumerate(accepted_ids):
-            req.output_token_logprobs_val.append(accepted_logprobs[j])
-            req.output_token_logprobs_idx.append(tok_id)
-            if req.top_logprobs_num > 0:
+            req.logprob.output_token_logprobs_val.append(accepted_logprobs[j])
+            req.logprob.output_token_logprobs_idx.append(tok_id)
+            if req.logprob.top_logprobs_num > 0:
                 flat_idx = i * max_accept + j
-                req.output_top_logprobs_val.append(
+                req.logprob.output_top_logprobs_val.append(
                     logits_output.next_token_top_logprobs_val[flat_idx]
                 )
-                req.output_top_logprobs_idx.append(
+                req.logprob.output_top_logprobs_idx.append(
                     logits_output.next_token_top_logprobs_idx[flat_idx]
                 )
-            if req.token_ids_logprob is not None:
+            if req.logprob.token_ids_logprob is not None:
                 flat_idx = i * max_accept + j
-                req.output_token_ids_logprobs_val.append(
+                req.logprob.output_token_ids_logprobs_val.append(
                     logits_output.next_token_token_ids_logprobs_val[flat_idx]
                 )
-                req.output_token_ids_logprobs_idx.append(
+                req.logprob.output_token_ids_logprobs_idx.append(
                     logits_output.next_token_token_ids_logprobs_idx[flat_idx]
                 )
 
