@@ -244,6 +244,14 @@ class MambaPool:
         self.size = size
         self.device = device
 
+        # Store conv shard groups for disagg heterogeneous TP transfer
+        shape = cache_params.shape
+        if hasattr(shape, "conv_shard_groups") and shape.conv_shard_groups:
+            self._conv_shard_groups = shape.conv_shard_groups
+        else:
+            self._conv_shard_groups = []
+        self._num_conv_types = len(cache_params.shape.conv)
+
         # for disagg with nvlink
         self.enable_custom_mem_pool, self.custom_mem_pool, _ = (
             maybe_init_custom_mem_pool(device=self.device)
@@ -478,6 +486,16 @@ class MambaPool:
             # Repeat for each layer since we have per-layer data_ptrs
             dim_per_tensor += [sliceable_dim] * self.num_mamba_layers
         return dim_per_tensor
+
+    def get_state_conv_shard_info(self):
+        """Get conv shard group info for heterogeneous TP disagg transfer.
+
+        Returns (conv_shard_groups, conv_tensor_count):
+        - conv_shard_groups: unsharded group sizes for conv state (e.g. [2048, 2048, 2048])
+        - conv_tensor_count: number of entries in state_dim_per_tensor that are conv type
+        """
+        conv_tensor_count = self._num_conv_types * self.num_mamba_layers
+        return self._conv_shard_groups, conv_tensor_count
 
 
 class HybridReqToTokenPool(ReqToTokenPool):
@@ -1370,6 +1388,10 @@ class HybridLinearKVPool(KVCache):
     def get_state_dim_per_tensor(self):
         """Get the sliceable dimension size for each mamba state tensor."""
         return self.mamba_pool.get_state_dim_per_tensor()
+
+    def get_state_conv_shard_info(self):
+        """Get conv shard group info for heterogeneous TP disagg transfer."""
+        return self.mamba_pool.get_state_conv_shard_info()
 
     def maybe_get_custom_mem_pool(self):
         return self.full_kv_pool.maybe_get_custom_mem_pool()
