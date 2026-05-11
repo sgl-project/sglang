@@ -727,8 +727,8 @@ class EAGLEWorker(TpModelWorker):
     def _draft_preprocess_idle(self, batch: ScheduleBatch):
         batch.spec_info = EagleDraftInput.create_idle_input(
             device=self.device,
-            hidden_size=self.model_config.spec_hidden_size,
-            dtype=self.model_config.dtype,
+            hidden_size=EagleDraftInput.hidden_size_for(self),
+            dtype=EagleDraftInput.dtype_for(self),
             topk=self.topk,
             capture_hidden_mode=CaptureHiddenMode.LAST,
         )
@@ -1130,31 +1130,10 @@ class EAGLEWorker(TpModelWorker):
             # All reqs finished this verify; swap to an idle ExtendInput.
             batch = batch.copy()
             batch.prepare_for_idle()
-            target_cfg = self.target_worker.model_runner.model_config
-            if (
-                self.speculative_algorithm.is_eagle3()
-                and self.eagle_use_aux_hidden_state
-            ):
-                eagle_config = getattr(target_cfg.hf_config, "eagle_config", None) or {}
-                num_aux = getattr(target_cfg.hf_config, "num_aux_hidden_states", None)
-                if num_aux is None:
-                    num_aux = len(
-                        eagle_config.get(
-                            "eagle_aux_hidden_state_layer_ids", [None, None, None]
-                        )
-                    )
-                target_hidden = getattr(
-                    target_cfg.hf_config,
-                    "target_hidden_size",
-                    target_cfg.hidden_size,
-                )
-                hidden_size = target_hidden * num_aux
-            else:
-                hidden_size = target_cfg.spec_hidden_size
-            draft_extend_input = EagleDraftInput.create_idle_input(
+            draft_extend_input = EagleDraftExtendInput.create_idle_input(
                 device=self.device,
-                hidden_size=hidden_size,
-                dtype=target_cfg.dtype,
+                hidden_size=EagleDraftExtendInput.hidden_size_for(self),
+                dtype=EagleDraftExtendInput.dtype_for(self),
                 capture_hidden_mode=CaptureHiddenMode.LAST,
             )
             batch.spec_info = draft_extend_input
