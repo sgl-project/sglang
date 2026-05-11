@@ -46,15 +46,37 @@ class SemanticEmbeddingProvider(FuzzyMatchProvider):
     network or service dependency.
     """
 
+    _MIN_SEMBLEND_VERSION = "0.3.3"
+
     def __init__(self, config: FuzzyMatchConfig):
         super().__init__(config)
+        try:
+            import semblend
+        except ImportError as e:
+            raise ImportError(
+                "fuzzy_match_provider='SemanticEmbedding' requires the "
+                "`semblend` package. Install with: "
+                f"pip install 'semblend>={self._MIN_SEMBLEND_VERSION}'"
+            ) from e
+
+        installed = getattr(semblend, "__version__", "0.0.0")
+        if _version_lt(installed, self._MIN_SEMBLEND_VERSION):
+            raise ImportError(
+                f"fuzzy_match_provider='SemanticEmbedding' requires "
+                f"semblend>={self._MIN_SEMBLEND_VERSION} (installed: "
+                f"{installed}). Upgrade with: "
+                f"pip install -U 'semblend>={self._MIN_SEMBLEND_VERSION}'"
+            )
         try:
             from semblend.integration.sglang.config import SemBlendProviderConfig
             from semblend.integration.sglang.provider import SemBlendProviderAdapter
         except ImportError as e:
             raise ImportError(
-                "fuzzy_match_provider='SemanticEmbedding' requires the "
-                "`semblend` package. Install with: pip install semblend"
+                f"semblend>={self._MIN_SEMBLEND_VERSION} is installed but the "
+                f"sglang integration entrypoints are missing ({e}). "
+                f"This usually means an editable install of a dev branch. "
+                f"Reinstall with: pip install -U "
+                f"'semblend>={self._MIN_SEMBLEND_VERSION}'"
             ) from e
 
         adapter_config = SemBlendProviderConfig.from_dict(
@@ -224,3 +246,30 @@ def _as_tensor(obj) -> torch.Tensor:
     if isinstance(obj, torch.Tensor):
         return obj
     return torch.as_tensor(list(obj), dtype=torch.int64)
+
+
+def _version_lt(installed: str, minimum: str) -> bool:
+    """Compare two semver-style strings without pulling in `packaging`.
+
+    Returns True iff ``installed`` is strictly less than ``minimum`` on a
+    component-by-component numeric comparison of the leading dotted prefix.
+    Non-numeric suffixes (e.g. ".dev0", "rc1") are treated as zero on each
+    side, which is conservative for a "must-be-at-least" gate.
+    """
+    def parts(v: str) -> list[int]:
+        out = []
+        for chunk in v.split("."):
+            digits = ""
+            for ch in chunk:
+                if ch.isdigit():
+                    digits += ch
+                else:
+                    break
+            out.append(int(digits) if digits else 0)
+        return out
+
+    a, b = parts(installed), parts(minimum)
+    n = max(len(a), len(b))
+    a += [0] * (n - len(a))
+    b += [0] * (n - len(b))
+    return a < b

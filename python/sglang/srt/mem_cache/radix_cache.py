@@ -553,6 +553,32 @@ class RadixCache(BasePrefixCache):
                     dtype=value.dtype,
                 )
 
+                # Provider contract: kv_cache_indices length must equal
+                # cached_token_count. If it is shorter (e.g. an empty
+                # tensor returned for a multi-segment match), the merged
+                # device_indices below would mis-report the cached prefix
+                # length to the scheduler, silently disabling KV reuse on
+                # the fuzzy region.
+                if len(fuzzy_kv_indices) != fuzzy_matched_len:
+                    logger.warning(
+                        f"[FUZZY RADIX] provider returned "
+                        f"kv_cache_indices of length {len(fuzzy_kv_indices)} "
+                        f"but cached_token_count={fuzzy_matched_len}; "
+                        f"falling back to exact-only to avoid silent "
+                        f"prefill of fuzzy region"
+                    )
+                    if realized_locs is not None:
+                        try:
+                            self.token_to_kv_pool_allocator.free(realized_locs)
+                        except Exception:
+                            pass
+                        params.req.fuzzy_realized_locs = None
+                    return MatchResult(
+                        device_indices=value,
+                        last_device_node=last_node,
+                        last_host_node=last_node,
+                    )
+
                 if params.req is not None:
                     params.req.fuzzy_match_result = fuzzy_result
 
