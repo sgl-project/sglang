@@ -187,6 +187,9 @@ from sglang.srt.managers.scheduler_components.metrics_reporter import (
     PrefillStats,
     SchedulerMetricsReporter,
 )
+from sglang.srt.managers.scheduler_components.new_token_ratio_tracker import (
+    NewTokenRatioTracker,
+)
 from sglang.srt.managers.scheduler_components.output_streamer import (
     SchedulerOutputStreamer,
 )
@@ -1080,19 +1083,9 @@ class Scheduler(
             and not self.server_args.disable_priority_preemption
         )
 
-        self.init_new_token_ratio = min(
-            envs.SGLANG_INIT_NEW_TOKEN_RATIO.get()
-            * self.server_args.schedule_conservativeness,
-            1.0,
+        self.new_token_ratio_tracker = NewTokenRatioTracker.from_server_args(
+            self.server_args
         )
-        self.min_new_token_ratio = min(
-            self.init_new_token_ratio * envs.SGLANG_MIN_NEW_TOKEN_RATIO_FACTOR.get(),
-            1.0,
-        )
-        self.new_token_ratio_decay = (
-            self.init_new_token_ratio - self.min_new_token_ratio
-        ) / envs.SGLANG_NEW_TOKEN_RATIO_DECAY_STEPS.get()
-        self.new_token_ratio = self.init_new_token_ratio
 
     def init_soft_watchdog(self, server_args: ServerArgs):
         if (x := server_args.soft_watchdog_timeout) is not None:
@@ -2467,7 +2460,7 @@ class Scheduler(
             self.tree_cache,
             self.token_to_kv_pool_allocator,
             self.running_batch,
-            self.new_token_ratio,
+            self.new_token_ratio_tracker.current,
             self.max_prefill_tokens,
             chunked_prefill_size,
             running_bs if self.is_mixed_chunk else 0,
@@ -2691,7 +2684,7 @@ class Scheduler(
             TEST_RETRACT and self.forward_ct % TEST_RETRACT_INTERVAL == 0
         ):
             old_available_tokens = self.token_to_kv_pool_allocator.available_size()
-            old_ratio = self.new_token_ratio
+            old_ratio = self.new_token_ratio_tracker.current
             mamba_pool = getattr(self.tree_cache.req_to_token_pool, "mamba_pool", None)
             old_mamba_available = (
                 mamba_pool.available_size() if mamba_pool is not None else None
@@ -2718,7 +2711,7 @@ class Scheduler(
                         len(r.output_ids) for r in retracted_reqs
                     ),
                 )
-            self.new_token_ratio = new_token_ratio
+            self.new_token_ratio_tracker.current = new_token_ratio
             for req in reqs_to_abort:
                 abort_reason: FINISH_ABORT = req.to_finish
                 self.ipc_channels.send_to_tokenizer.send_output(
@@ -2746,10 +2739,7 @@ class Scheduler(
             for req in retracted_reqs:
                 self._add_request_to_queue(req, is_retracted=True)
         else:
-            self.new_token_ratio = max(
-                self.new_token_ratio - self.new_token_ratio_decay,
-                self.min_new_token_ratio,
-            )
+            self.new_token_ratio_tracker.decay_step()
 
         if batch.batch_size() < initial_bs:
             batch.batch_is_full = False
@@ -3126,7 +3116,7 @@ class Scheduler(
         self.kv_events_publisher.publish_kv_events()
 
         # reset token ratio
-        self.new_token_ratio = self.init_new_token_ratio
+        self.new_token_ratio_tracker.reset()
 
         # reset device timer window so idle time isn't counted
         self.metrics_reporter.reset_device_timer_window()
