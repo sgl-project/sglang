@@ -224,8 +224,9 @@ class HiSparseCoordinator:
         return self.req_to_host_pool[req_pool_idx, start_pos : start_pos + num_tokens]
 
     def _allocated_host_indices(self, req: Req) -> torch.Tensor:
+        allocated_len = req.kv_allocated_len // self.compress_ratio
         host_len = min(
-            self._round_up_to_host_page(req.kv_allocated_len),
+            self._round_up_to_host_page(allocated_len),
             self.req_to_host_pool.shape[1],
         )
         host_indices = self.req_to_host_pool[req.req_pool_idx, :host_len]
