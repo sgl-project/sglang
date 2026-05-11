@@ -9,7 +9,6 @@ import zmq
 
 from sglang.srt.speculative.decoupled_spec_io import (
     DraftControlBatch,
-    DraftMeshIpcConfig,
     DraftMeshMessage,
     DraftMeshMessageType,
     DraftTailStreamOutputBatch,
@@ -32,8 +31,9 @@ class DraftProxyThread:
         self,
         *,
         context: zmq.Context,
-        ipc_config: DraftMeshIpcConfig,
         verifier_rank: int,
+        result_bind_endpoint: str,
+        drafter_control_endpoints: list[str] | tuple[str, ...],
         draft_tail_buffer: DraftTailBuffer,
         tracer: Any = None,
     ) -> None:
@@ -48,12 +48,12 @@ class DraftProxyThread:
                 endpoint,
                 False,
             )
-            for drafter_rank, endpoint in sorted(ipc_config.control_endpoints.items())
+            for drafter_rank, endpoint in enumerate(drafter_control_endpoints)
         }
         self.result_recv_socket = get_zmq_socket(
             context,
             zmq.PULL,
-            ipc_config.get_result_endpoint(self.verifier_rank),
+            result_bind_endpoint,
             True,
         )
         self._send_queue: queue.SimpleQueue[DraftControlBatch] = queue.SimpleQueue()

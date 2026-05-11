@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import tempfile
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Optional
@@ -149,80 +148,7 @@ class DraftMeshMessage:
 
 
 @dataclass(frozen=True)
-class DraftMeshDpIpcEndpoints:
-    verifier_to_drafter_control_ipc_name: str
-    drafter_to_verifier_result_ipc_name: str
-
-    @staticmethod
-    def init_new() -> "DraftMeshDpIpcEndpoints":
-        return DraftMeshDpIpcEndpoints(
-            verifier_to_drafter_control_ipc_name=(
-                f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}"
-            ),
-            drafter_to_verifier_result_ipc_name=(
-                f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}"
-            ),
-        )
-
-
-@dataclass(frozen=True)
-class DraftMeshIpcConfig:
-    control_endpoints: dict[int, str]
-    result_endpoints: dict[int, str]
-
-    @staticmethod
-    def init_new(dp_size: int = 1) -> "DraftMeshIpcConfig":
-        normalized_dp_size = max(1, int(dp_size))
-        endpoints = {
-            rank: DraftMeshDpIpcEndpoints.init_new()
-            for rank in range(normalized_dp_size)
-        }
-        return DraftMeshIpcConfig(
-            control_endpoints={
-                rank: endpoint.verifier_to_drafter_control_ipc_name
-                for rank, endpoint in endpoints.items()
-            },
-            result_endpoints={
-                rank: endpoint.drafter_to_verifier_result_ipc_name
-                for rank, endpoint in endpoints.items()
-            },
-        )
-
-    @staticmethod
-    def from_endpoint_lists(
-        control_endpoints: list[str],
-        result_endpoints: list[str],
-    ) -> "DraftMeshIpcConfig":
-        return DraftMeshIpcConfig(
-            control_endpoints=dict(enumerate(control_endpoints)),
-            result_endpoints=dict(enumerate(result_endpoints)),
-        )
-
-    def get_control_endpoint(self, drafter_rank: Optional[int]) -> str:
-        normalized_rank = 0 if drafter_rank is None else int(drafter_rank)
-        endpoint = self.control_endpoints.get(normalized_rank)
-        if endpoint is not None:
-            return endpoint
-        raise KeyError(
-            f"Draft mesh IPC config missing control endpoint for drafter_rank={normalized_rank}"
-        )
-
-    def get_result_endpoint(self, verifier_rank: Optional[int]) -> str:
-        normalized_rank = 0 if verifier_rank is None else int(verifier_rank)
-        endpoint = self.result_endpoints.get(normalized_rank)
-        if endpoint is not None:
-            return endpoint
-        raise KeyError(
-            f"Draft mesh IPC config missing result endpoint for verifier_rank={normalized_rank}"
-        )
-
-    def get_endpoints(self, dp_rank: Optional[int]) -> DraftMeshDpIpcEndpoints:
-        normalized_dp_rank = 0 if dp_rank is None else int(dp_rank)
-        return DraftMeshDpIpcEndpoints(
-            verifier_to_drafter_control_ipc_name=self.get_control_endpoint(
-                normalized_dp_rank
-            ),
-            drafter_to_verifier_result_ipc_name=self.get_result_endpoint(
-                normalized_dp_rank
-            ),
-        )
+class DecoupledSpecIpcConfig:
+    bind_endpoint: str
+    connect_endpoints: tuple[str, ...]
+    rank: int

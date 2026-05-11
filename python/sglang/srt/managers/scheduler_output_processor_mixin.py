@@ -1038,8 +1038,9 @@ class SchedulerOutputProcessorMixin:
         cached_tokens_details = []  # Detailed breakdown by cache source
         spec_verify_ct = []
         spec_accepted_drafts = []
-        spec_valid_draft_tokens = []
-        spec_valid_accepted_tokens = []
+        is_decoupled_verify = self.spec_algorithm.is_decoupled_verify()
+        spec_valid_draft_tokens = [] if is_decoupled_verify else None
+        spec_valid_accepted_tokens = [] if is_decoupled_verify else None
         spec_acceptance_histogram = []
         retraction_counts = []
         output_hidden_states = None
@@ -1154,7 +1155,9 @@ class SchedulerOutputProcessorMixin:
                     spec_verify_ct.append(req.spec_verify_ct)
                     spec_accepted_drafts.append(req.spec_accepted_drafts)
                     spec_acceptance_histogram.append(req.spec_acceptance_histogram)
-                    if self.spec_algorithm.is_decoupled_verify():
+                    if is_decoupled_verify:
+                        assert spec_valid_draft_tokens is not None
+                        assert spec_valid_accepted_tokens is not None
                         spec_valid_draft_tokens.append(req.spec_valid_draft_tokens)
                         spec_valid_accepted_tokens.append(
                             req.spec_valid_accepted_tokens

@@ -929,12 +929,12 @@ def _get_decoupled_spec_actor_env_vars(
 
 def launch_draft_actors(
     args: argparse.Namespace,
-    result_endpoint: str,
+    verifier_result_endpoints: list[str],
     control_port: int | None = None,
 ) -> tuple[list[Any], list[str]]:
     return common_launch_draft_actors(
         args,
-        result_endpoint,
+        verifier_result_endpoints,
         control_port=control_port,
     )
 
@@ -958,8 +958,9 @@ def launch_target_actors(
     target_nnodes: int,
     target_gpus_per_node: int,
     pg,
-    control_endpoints: list[str] | None = None,
-    result_endpoints: list[str] | None = None,
+    bind_endpoint: str | None = None,
+    connect_endpoints: list[str] | None = None,
+    rank: int | None = None,
 ) -> list[Any]:
     actor_env_vars = _get_decoupled_spec_actor_env_vars(args)
     actors = []
@@ -987,8 +988,9 @@ def launch_target_actors(
             dist_init_addr=dist_init_addr,
             batch_size=args.batch_size,
             speculative_num_steps=args.num_speculative_steps,
-            control_endpoints=control_endpoints,
-            result_endpoints=result_endpoints,
+            bind_endpoint=bind_endpoint,
+            connect_endpoints=connect_endpoints,
+            rank=rank,
             deterministic=args.deterministic,
             decoupled_spec_trace_dir=args.decoupled_spec_trace_dir,
         )
@@ -1165,8 +1167,7 @@ def run_mode(
     target_nnodes: int,
     target_gpus_per_node: int,
     pg=None,
-    control_endpoints: list[str] | None = None,
-    result_endpoints: list[str] | None = None,
+    endpoint_config: Any | None = None,
     include_output_text: bool = True,
 ) -> ModeMetrics:
     target_actors: list[Any] = []
@@ -1181,8 +1182,15 @@ def run_mode(
             target_nnodes=target_nnodes,
             target_gpus_per_node=target_gpus_per_node,
             pg=pg,
-            control_endpoints=control_endpoints,
-            result_endpoints=result_endpoints,
+            bind_endpoint=(
+                endpoint_config.bind_endpoint if endpoint_config is not None else None
+            ),
+            connect_endpoints=(
+                endpoint_config.connect_endpoints
+                if endpoint_config is not None
+                else None
+            ),
+            rank=endpoint_config.rank if endpoint_config is not None else None,
         )
         result = ray.get(
             target_actors[0].generate_batch.remote(
@@ -1523,8 +1531,7 @@ def main() -> None:
             target_nnodes=target_nnodes,
             target_gpus_per_node=target_gpus_per_node,
             pg=spec_pg,
-            control_endpoints=topology.control_endpoints,
-            result_endpoints=topology.result_endpoints,
+            endpoint_config=topology.verifier_configs[0],
             include_output_text=True,
         )
         shutdown_actors(draft_actors)

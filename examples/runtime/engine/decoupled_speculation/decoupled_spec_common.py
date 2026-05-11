@@ -17,7 +17,6 @@ import ray
 import sglang as sgl
 import torch
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
-from sglang.srt.speculative.decoupled_spec_io import DraftMeshIpcConfig
 from sglang.srt.utils.network import is_valid_ipv6_address
 
 ACTOR_NAME = "draft"
@@ -75,11 +74,20 @@ class DemoRayRuntime:
 
 
 @dataclass
+class DecoupledSpecEndpointConfig:
+    """Bind/connect endpoint config for one decoupled-spec instance."""
+
+    bind_endpoint: str
+    connect_endpoints: list[str]
+    rank: int
+
+
+@dataclass
 class DecoupledSpecTopology:
     """Endpoint topology and actor handles for a decoupled-spec run."""
 
-    control_endpoints: list[str]
-    result_endpoints: list[str]
+    drafter_configs: list[DecoupledSpecEndpointConfig]
+    verifier_configs: list[DecoupledSpecEndpointConfig]
     draft_actors: list[Any] | None = None
     cleanup_handles: list[Any] | None = None
 
@@ -159,53 +167,34 @@ def _new_local_ipc_endpoint() -> str:
     return f"ipc://{path}"
 
 
-def create_local_decoupled_spec_ipc_config(
-    num_drafters: int = 1,
-    num_verifiers: int = 1,
-) -> DraftMeshIpcConfig:
-    """Create local IPC endpoints for a decoupled-spec topology."""
-    if num_drafters <= 0:
-        raise ValueError("num_drafters must be positive")
-    if num_verifiers <= 0:
-        raise ValueError("num_verifiers must be positive")
-    return DraftMeshIpcConfig(
-        control_endpoints={
-            rank: _new_local_ipc_endpoint() for rank in range(num_drafters)
-        },
-        result_endpoints={
-            rank: _new_local_ipc_endpoint() for rank in range(num_verifiers)
-        },
-    )
-
-
-def endpoint_lists(ipc_config: DraftMeshIpcConfig) -> tuple[list[str], list[str]]:
-    """Convert a DraftMeshIpcConfig into sorted control and result endpoint lists."""
-    return (
-        [
-            ipc_config.control_endpoints[rank]
-            for rank in sorted(ipc_config.control_endpoints)
-        ],
-        [
-            ipc_config.result_endpoints[rank]
-            for rank in sorted(ipc_config.result_endpoints)
-        ],
-    )
-
-
 def create_local_decoupled_spec_topology(
     num_drafters: int = 1,
     num_verifiers: int = 1,
 ) -> DecoupledSpecTopology:
     """Create local IPC endpoints and return them as engine-ready lists."""
-    control_endpoints, result_endpoints = endpoint_lists(
-        create_local_decoupled_spec_ipc_config(
-            num_drafters=num_drafters,
-            num_verifiers=num_verifiers,
-        )
-    )
+    if num_drafters <= 0:
+        raise ValueError("num_drafters must be positive")
+    if num_verifiers <= 0:
+        raise ValueError("num_verifiers must be positive")
+    control_endpoints = [_new_local_ipc_endpoint() for _ in range(num_drafters)]
+    result_endpoints = [_new_local_ipc_endpoint() for _ in range(num_verifiers)]
     return DecoupledSpecTopology(
-        control_endpoints=control_endpoints,
-        result_endpoints=result_endpoints,
+        drafter_configs=[
+            DecoupledSpecEndpointConfig(
+                bind_endpoint=endpoint,
+                connect_endpoints=list(result_endpoints),
+                rank=rank,
+            )
+            for rank, endpoint in enumerate(control_endpoints)
+        ],
+        verifier_configs=[
+            DecoupledSpecEndpointConfig(
+                bind_endpoint=endpoint,
+                connect_endpoints=list(control_endpoints),
+                rank=rank,
+            )
+            for rank, endpoint in enumerate(result_endpoints)
+        ],
     )
 
 
@@ -220,8 +209,9 @@ class LocalDraftActor:
         gpu_ids: list[str],
         tp_size: int,
         speculative_num_steps: int,
-        control_endpoints: list[str],
-        result_endpoints: list[str],
+        bind_endpoint: str,
+        connect_endpoints: list[str],
+        rank: int,
     ):
         """Pin GPUs and construct the draft `sgl.Engine` for local demos."""
         os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(gpu_ids)
@@ -231,8 +221,9 @@ class LocalDraftActor:
             speculative_algorithm="DECOUPLED_DRAFT",
             speculative_num_steps=speculative_num_steps,
             speculative_num_draft_tokens=speculative_num_steps + 1,
-            decoupled_spec_control_endpoints=control_endpoints,
-            decoupled_spec_result_endpoints=result_endpoints,
+            decoupled_spec_bind_endpoint=bind_endpoint,
+            decoupled_spec_connect_endpoints=connect_endpoints,
+            decoupled_spec_rank=rank,
             disable_radix_cache=True,
             chunked_prefill_size=-1,
         )
@@ -302,24 +293,18 @@ def get_decoupled_spec_actor_env_vars(
     return env_vars
 
 
-_endpoint_lists = endpoint_lists
-
-
 def launch_drafter_actor(
     args: argparse.Namespace,
-    control_endpoints: list[str] | None = None,
-    result_endpoints: list[str] | None = None,
+    endpoint_config: DecoupledSpecEndpointConfig | None = None,
     *,
     topology: DecoupledSpecTopology | None = None,
 ) -> ray.actor.ActorHandle:
     """Launch the local draft actor and block until it reports readiness."""
     if topology is not None:
-        control_endpoints = topology.control_endpoints
-        result_endpoints = topology.result_endpoints
-    elif control_endpoints is None or result_endpoints is None:
+        endpoint_config = topology.drafter_configs[0]
+    elif endpoint_config is None:
         topology = create_local_decoupled_spec_topology()
-        control_endpoints = topology.control_endpoints
-        result_endpoints = topology.result_endpoints
+        endpoint_config = topology.drafter_configs[0]
 
     actor_options = dict(
         name=ACTOR_NAME,
@@ -334,8 +319,9 @@ def launch_drafter_actor(
         gpu_ids=args.draft_gpu_ids,
         tp_size=args.draft_tp_size,
         speculative_num_steps=args.num_speculative_steps,
-        control_endpoints=control_endpoints,
-        result_endpoints=result_endpoints,
+        bind_endpoint=endpoint_config.bind_endpoint,
+        connect_endpoints=endpoint_config.connect_endpoints,
+        rank=endpoint_config.rank,
     )
     ray.get(actor.ready.remote())
     return actor
@@ -346,20 +332,17 @@ def launch_verifier(
     target_tp_size: int,
     speculative_num_steps: int,
     speculative_num_draft_tokens: int,
-    control_endpoints: list[str] | None = None,
-    result_endpoints: list[str] | None = None,
+    endpoint_config: DecoupledSpecEndpointConfig | None = None,
     mamba_scheduler_strategy: str | None = None,
     *,
     topology: DecoupledSpecTopology | None = None,
 ) -> sgl.Engine:
     """Construct a local decoupled verify engine connected to the draft actor."""
     if topology is not None:
-        control_endpoints = topology.control_endpoints
-        result_endpoints = topology.result_endpoints
-    elif control_endpoints is None or result_endpoints is None:
+        endpoint_config = topology.verifier_configs[0]
+    elif endpoint_config is None:
         topology = create_local_decoupled_spec_topology()
-        control_endpoints = topology.control_endpoints
-        result_endpoints = topology.result_endpoints
+        endpoint_config = topology.verifier_configs[0]
 
     engine_kwargs: dict[str, Any] = dict(
         model_path=target_model_path,
@@ -367,8 +350,9 @@ def launch_verifier(
         speculative_algorithm="DECOUPLED_VERIFY",
         speculative_num_steps=speculative_num_steps,
         speculative_num_draft_tokens=speculative_num_draft_tokens,
-        decoupled_spec_control_endpoints=control_endpoints,
-        decoupled_spec_result_endpoints=result_endpoints,
+        decoupled_spec_bind_endpoint=endpoint_config.bind_endpoint,
+        decoupled_spec_connect_endpoints=endpoint_config.connect_endpoints,
+        decoupled_spec_rank=endpoint_config.rank,
         disable_radix_cache=True,
     )
     if mamba_scheduler_strategy is not None:
@@ -518,7 +502,8 @@ class DraftActor:
         model_path: str,
         tp_size: int,
         speculative_num_steps: int,
-        result_endpoint: str,
+        verifier_result_endpoints: list[str],
+        rank: int,
         control_port: int | None = None,
         deterministic: bool = False,
         decoupled_spec_trace_dir: str | None = None,
@@ -540,8 +525,9 @@ class DraftActor:
             speculative_algorithm="DECOUPLED_DRAFT",
             speculative_num_steps=speculative_num_steps,
             speculative_num_draft_tokens=speculative_num_steps + 1,
-            decoupled_spec_control_endpoints=[control_endpoint],
-            decoupled_spec_result_endpoints=[result_endpoint],
+            decoupled_spec_bind_endpoint=control_endpoint,
+            decoupled_spec_connect_endpoints=verifier_result_endpoints,
+            decoupled_spec_rank=rank,
             disable_radix_cache=True,
             chunked_prefill_size=-1,
             enable_deterministic_inference=deterministic,
@@ -564,7 +550,7 @@ class DraftActor:
 
 def launch_draft_actors(
     args: argparse.Namespace,
-    result_endpoint: str,
+    verifier_result_endpoints: list[str],
     control_port: int | None = None,
 ) -> tuple[list[Any], list[str]]:
     """Launch draft actors and collect their control bind endpoints."""
@@ -583,7 +569,8 @@ def launch_draft_actors(
             model_path=args.draft_model_path,
             tp_size=args.draft_tp_size,
             speculative_num_steps=args.num_speculative_steps,
-            result_endpoint=result_endpoint,
+            verifier_result_endpoints=verifier_result_endpoints,
+            rank=replica_index,
             control_port=control_port if replica_index == 0 else None,
             deterministic=args.deterministic,
             decoupled_spec_trace_dir=args.decoupled_spec_trace_dir,
@@ -610,12 +597,25 @@ def create_remote_decoupled_spec_topology(
     )
     draft_actors, control_endpoints = launch_draft_actors(
         args,
-        result_endpoint,
+        [result_endpoint],
         control_port=preferred_control_port,
     )
     return DecoupledSpecTopology(
-        control_endpoints=control_endpoints,
-        result_endpoints=[result_endpoint],
+        drafter_configs=[
+            DecoupledSpecEndpointConfig(
+                bind_endpoint=endpoint,
+                connect_endpoints=[result_endpoint],
+                rank=rank,
+            )
+            for rank, endpoint in enumerate(control_endpoints)
+        ],
+        verifier_configs=[
+            DecoupledSpecEndpointConfig(
+                bind_endpoint=result_endpoint,
+                connect_endpoints=control_endpoints,
+                rank=0,
+            )
+        ],
         draft_actors=draft_actors,
     )
 
@@ -638,8 +638,9 @@ class TargetActor:
         dist_init_addr: str | None,
         batch_size: int,
         speculative_num_steps: int | None = None,
-        control_endpoints: list[str] | None = None,
-        result_endpoints: list[str] | None = None,
+        bind_endpoint: str | None = None,
+        connect_endpoints: list[str] | None = None,
+        rank: int | None = None,
         deterministic: bool = False,
         decoupled_spec_trace_dir: str | None = None,
     ):
@@ -670,8 +671,9 @@ class TargetActor:
                 speculative_algorithm="DECOUPLED_VERIFY",
                 speculative_num_steps=speculative_num_steps,
                 speculative_num_draft_tokens=speculative_num_steps + 1,
-                decoupled_spec_control_endpoints=control_endpoints,
-                decoupled_spec_result_endpoints=result_endpoints,
+                decoupled_spec_bind_endpoint=bind_endpoint,
+                decoupled_spec_connect_endpoints=connect_endpoints,
+                decoupled_spec_rank=rank,
                 disable_radix_cache=True,
             )
         elif mode == "decode":

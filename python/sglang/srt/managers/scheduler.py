@@ -1185,12 +1185,6 @@ class Scheduler(
             * self.server_args.schedule_conservativeness,
             1.0,
         )
-        if (
-            self.spec_algorithm.is_decoupled_verify()
-            or self.spec_algorithm.is_decoupled_draft()
-        ):
-            # for performance, enqueue reqs as many as possible for decoupled spec
-            self.init_new_token_ratio = 0.0
         self.min_new_token_ratio = min(
             self.init_new_token_ratio * envs.SGLANG_MIN_NEW_TOKEN_RATIO_FACTOR.get(),
             1.0,
@@ -2682,15 +2676,12 @@ class Scheduler(
                 chunked_prefill_size = dynamic_size
 
         # Prefill policy
-        prefill_new_token_ratio = self.new_token_ratio
-        if self.spec_algorithm.is_decoupled_draft():
-            prefill_new_token_ratio = 0.0
         adder = PrefillAdder(
             self.page_size,
             self.tree_cache,
             self.token_to_kv_pool_allocator,
             self.running_batch,
-            prefill_new_token_ratio,
+            self.new_token_ratio,
             self.max_prefill_tokens,
             chunked_prefill_size,
             running_bs if self.is_mixed_chunk else 0,
@@ -2701,6 +2692,10 @@ class Scheduler(
             prefill_delayer_single_pass=prefill_delayer_single_pass,
             dllm_config=self.dllm_config,
             waiting_queue_len=len(self.waiting_queue),
+            ignore_decode_budget=(
+                self.spec_algorithm.is_decoupled_verify()
+                or self.spec_algorithm.is_decoupled_draft()
+            ),
         )
 
         if self.chunked_req is not None:
@@ -2947,8 +2942,6 @@ class Scheduler(
                     ),
                 )
             self.new_token_ratio = new_token_ratio
-            if self.spec_algorithm.is_decoupled_draft():
-                self.new_token_ratio = 0.0
             for req in reqs_to_abort:
                 abort_reason: FINISH_ABORT = req.to_finish
                 self.send_to_tokenizer.send_output(
@@ -2980,8 +2973,6 @@ class Scheduler(
                 self.new_token_ratio - self.new_token_ratio_decay,
                 self.min_new_token_ratio,
             )
-            if self.spec_algorithm.is_decoupled_draft():
-                self.new_token_ratio = 0.0
 
         if batch.batch_size() < initial_bs:
             batch.batch_is_full = False

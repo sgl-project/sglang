@@ -5,6 +5,11 @@ This directory has one CLI entrypoint for decoupled speculative decoding:
 - `run_decoupled_speculation.py`: run decoupled speculation from either `--prompt` or `--dataset-path`.
 - `decoupled_spec_common.py`: shared helpers for Ray, draft actor launch, GPU allocation, prompt normalization, and dataset parsing.
 
+Decoupled-spec engines use static bind/connect endpoint configuration. Each
+verifier or drafter instance receives one local bind endpoint, an ordered list
+of peer connect endpoints, and a role-local rank. The example helper generates
+these values automatically for the demo runs.
+
 Common modes:
 
 ```bash

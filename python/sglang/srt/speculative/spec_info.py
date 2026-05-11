@@ -196,6 +196,7 @@ class SpeculativeAlgorithm(Enum):
             from sglang.srt.speculative.ngram_worker import NGRAMWorker
 
             return NGRAMWorker
+
         raise ValueError("Unreachable code path in create_worker.")
 
 
@@ -212,6 +213,25 @@ class DecoupledVerifySpecAlgo(CustomSpecAlgo):
             raise ValueError(
                 "decoupled speculative decoding does not support dp attention."
             )
+        if server_args.dp_size != 1:
+            raise ValueError(
+                "decoupled verifier currently requires dp_size == 1."
+            )
+        if not server_args.decoupled_spec_bind_endpoint:
+            raise ValueError(
+                "decoupled speculative decoding requires --decoupled-spec-bind-endpoint."
+            )
+        if not server_args.decoupled_spec_connect_endpoints:
+            raise ValueError(
+                "decoupled speculative decoding requires a non-empty "
+                "--decoupled-spec-connect-endpoints list."
+            )
+        if server_args.decoupled_spec_rank is None:
+            raise ValueError(
+                "decoupled speculative decoding requires --decoupled-spec-rank."
+            )
+        if int(server_args.decoupled_spec_rank) < 0:
+            raise ValueError("--decoupled-spec-rank must be non-negative.")
 
         if server_args.max_running_requests is None:
             server_args.max_running_requests = 64
@@ -269,6 +289,25 @@ class DecoupledDraftSpecAlgo(CustomSpecAlgo):
             raise ValueError(
                 "decoupled speculative decoding does not support dp attention."
             )
+        if server_args.dp_size != 1:
+            raise ValueError(
+                "decoupled drafter currently requires dp_size == 1."
+            )
+        if not server_args.decoupled_spec_bind_endpoint:
+            raise ValueError(
+                "decoupled speculative decoding requires --decoupled-spec-bind-endpoint."
+            )
+        if not server_args.decoupled_spec_connect_endpoints:
+            raise ValueError(
+                "decoupled speculative decoding requires a non-empty "
+                "--decoupled-spec-connect-endpoints list."
+            )
+        if server_args.decoupled_spec_rank is None:
+            raise ValueError(
+                "decoupled speculative decoding requires --decoupled-spec-rank."
+            )
+        if int(server_args.decoupled_spec_rank) < 0:
+            raise ValueError("--decoupled-spec-rank must be non-negative.")
 
         if server_args.max_running_requests is None:
             server_args.max_running_requests = 64

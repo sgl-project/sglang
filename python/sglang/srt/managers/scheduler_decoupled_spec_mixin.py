@@ -52,6 +52,12 @@ class DraftCommitApplyResult:
 class SchedulerDecoupledSpecMixin:
     """Decoupled-spec scheduler hooks and request lifecycle helpers."""
 
+    def get_decoupled_spec_rank(self: Scheduler) -> int:
+        rank = self.server_args.decoupled_spec_rank
+        if rank is None:
+            raise RuntimeError("decoupled_spec_rank is required for decoupled spec")
+        return int(rank)
+
     def is_draft_worker_batch(self: Scheduler, batch: Optional[ScheduleBatch] = None) -> bool:
         spec_algorithm = batch.spec_algorithm if batch is not None else self.spec_algorithm
         return bool(spec_algorithm.is_decoupled_draft())
@@ -64,7 +70,7 @@ class SchedulerDecoupledSpecMixin:
         if not self.is_verify_entry_rank():
             return None
         return DraftTailBuffer(
-            verifier_rank=self.dp_rank or 0,
+            verifier_rank=self.get_decoupled_spec_rank(),
             required_tail_len=max(
                 0, int(self.server_args.speculative_num_draft_tokens) - 1
             ),
@@ -75,10 +81,10 @@ class SchedulerDecoupledSpecMixin:
         self.draft_proxy_thread = None
         if not self.is_verify_entry_rank():
             return
-        ipc_config = self.port_args.draft_mesh_ipc_config
+        ipc_config = self.port_args.decoupled_spec_ipc_config
         if ipc_config is None:
             raise RuntimeError(
-                "Draft mesh IPC config is required on decoupled_verify entry rank"
+                "Decoupled spec IPC config is required on decoupled_verify entry rank"
             )
         if self.draft_tail_buffer is None:
             raise RuntimeError(
@@ -86,8 +92,9 @@ class SchedulerDecoupledSpecMixin:
             )
         self.draft_proxy_thread = DraftProxyThread(
             context=context,
-            ipc_config=ipc_config,
-            verifier_rank=self.dp_rank or 0,
+            verifier_rank=ipc_config.rank,
+            result_bind_endpoint=ipc_config.bind_endpoint,
+            drafter_control_endpoints=ipc_config.connect_endpoints,
             draft_tail_buffer=self.draft_tail_buffer,
             tracer=self.decoupled_spec_tracer,
         )
@@ -97,15 +104,16 @@ class SchedulerDecoupledSpecMixin:
         self.token_sync_thread = None
         if not self.is_draft_entry_rank():
             return
-        ipc_config = self.port_args.draft_mesh_ipc_config
+        ipc_config = self.port_args.decoupled_spec_ipc_config
         if ipc_config is None:
             raise RuntimeError(
-                "Draft mesh IPC config is required on decoupled_draft entry rank"
+                "Decoupled spec IPC config is required on decoupled_draft entry rank"
             )
         self.token_sync_thread = TokenSyncThread(
             context=getattr(self, "zmq_context", None),
-            ipc_config=ipc_config,
-            drafter_rank=self.dp_rank or 0,
+            control_bind_endpoint=ipc_config.bind_endpoint,
+            verifier_result_endpoints=ipc_config.connect_endpoints,
+            drafter_rank=ipc_config.rank,
             tracer=self.decoupled_spec_tracer,
         )
         self.token_sync_thread.start()
@@ -117,13 +125,13 @@ class SchedulerDecoupledSpecMixin:
         self.decoupled_verify_drafter_loads: Dict[int, int] = {}
         if not self.is_verify_entry_rank():
             return
-        ipc_config = self.port_args.draft_mesh_ipc_config
+        ipc_config = self.port_args.decoupled_spec_ipc_config
         if ipc_config is None:
             raise RuntimeError(
-                "Draft mesh IPC config is required on decoupled_verify entry rank"
+                "Decoupled spec IPC config is required on decoupled_verify entry rank"
             )
-        self.decoupled_verify_drafter_ranks = sorted(
-            int(rank) for rank in ipc_config.control_endpoints.keys()
+        self.decoupled_verify_drafter_ranks = list(
+            range(len(ipc_config.connect_endpoints))
         )
         if not self.decoupled_verify_drafter_ranks:
             raise RuntimeError(
@@ -959,7 +967,7 @@ class SchedulerDecoupledSpecMixin:
 
         # apply VerifyCommit and send new draft token
         stream_output_batch = DraftTailStreamOutputBatch()
-        src_drafter_rank = int(getattr(self, "dp_rank", 0) or 0)
+        src_drafter_rank = self.get_decoupled_spec_rank()
         applied_commit_messages: list[VerifyCommit] = []
         for req_batch_idx, req in enumerate(batch.reqs):
             draft_key = self._get_draft_state_by_req(req).key
@@ -1152,7 +1160,11 @@ class SchedulerDecoupledSpecMixin:
             )
         drafter_rank = min(
             self.decoupled_verify_drafter_ranks,
-            key=lambda rank: (self.decoupled_verify_drafter_loads.get(rank, 0), rank),
+            key=lambda rank: (
+                self.decoupled_verify_drafter_loads.get(rank, 0),
+                (rank - self.get_decoupled_spec_rank())
+                % len(self.decoupled_verify_drafter_ranks),
+            ),
         )
         self.decoupled_verify_req_to_drafter_rank[request_id] = drafter_rank
         self.decoupled_verify_drafter_loads[drafter_rank] = (
@@ -1403,7 +1415,7 @@ class SchedulerDecoupledSpecMixin:
             sync_messages.append(
                 DraftSync(
                     request_id=req.rid,
-                    src_verifier_rank=self.dp_rank or 0,
+                    src_verifier_rank=self.get_decoupled_spec_rank(),
                     dst_drafter_rank=self.assign_drafter_rank(req.rid),
                     prompt_token_ids=list(req.origin_input_ids),
                     committed_output_ids=list(req.output_ids),
@@ -1550,7 +1562,7 @@ class SchedulerDecoupledSpecMixin:
                     close_messages.append(
                         DraftClose(
                             request_id=req.rid,
-                            src_verifier_rank=self.dp_rank or 0,
+                            src_verifier_rank=self.get_decoupled_spec_rank(),
                             dst_drafter_rank=dst_drafter_rank,
                             reason="abort" if req.is_retracted else "finished",
                         )
@@ -1613,7 +1625,7 @@ class SchedulerDecoupledSpecMixin:
             verify_commit_messages.append(
                 VerifyCommit(
                     request_id=req.rid,
-                    src_verifier_rank=self.dp_rank or 0,
+                    src_verifier_rank=self.get_decoupled_spec_rank(),
                     dst_drafter_rank=self.get_drafter_rank(req.rid),
                     pre_verify_committed_len=pre_verify_committed_len,
                     bonus_token_pos=bonus_token_pos,
@@ -1704,7 +1716,7 @@ class SchedulerDecoupledSpecMixin:
                 close_messages=[
                     DraftClose(
                         request_id=request_id,
-                        src_verifier_rank=self.dp_rank or 0,
+                        src_verifier_rank=self.get_decoupled_spec_rank(),
                         dst_drafter_rank=dst_drafter_rank,
                         reason="abort",
                     )

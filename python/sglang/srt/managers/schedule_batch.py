@@ -857,11 +857,11 @@ class Req(ReqDllmMixin):
         # Per-request count of accepted draft tokens (excludes the bonus token).
         self.spec_accepted_drafts = 0
 
-        # The number of valid draft tokens in the decoupled verify snapshots.
-        self.spec_valid_draft_tokens = 0
+        # Decoupled-speculation metric: Number of valid draft tokens in verifier snapshots.
+        self.spec_valid_draft_tokens: int = 0
 
-        # The number of accepted tokens among the valid decoupled verify draft tokens.
-        self.spec_valid_accepted_tokens = 0
+        # Decoupled-speculation metric: Number of accepted tokens among valid draft tokens (excludes the bonus token).
+        self.spec_valid_accepted_tokens: int = 0
 
         # Acceptance histogram for speculative decoding.
         # List index = number of accepted tokens in a step, List value = count of steps with that many accepted tokens.

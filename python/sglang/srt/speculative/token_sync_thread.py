@@ -12,7 +12,6 @@ import zmq
 from sglang.srt.speculative.decoupled_spec_io import (
     DraftClose,
     DraftControlBatch,
-    DraftMeshIpcConfig,
     DraftMeshMessage,
     DraftMeshMessageType,
     DraftSync,
@@ -33,7 +32,8 @@ class TokenSyncThread:
     """Drafter-side token sync thread for decoupled speculation IPC."""
 
     context: zmq.Context | None = None
-    ipc_config: DraftMeshIpcConfig | None = None
+    control_bind_endpoint: str | None = None
+    verifier_result_endpoints: list[str] | tuple[str, ...] | None = None
     drafter_rank: int = 0
     _pending_controls: deque[DraftControlMessage] = field(default_factory=deque)
     # verifier -> drafter controls
@@ -51,7 +51,11 @@ class TokenSyncThread:
     tracer: Any = None
 
     def __post_init__(self) -> None:
-        if self.context is None or self.ipc_config is None:
+        if (
+            self.context is None
+            or self.control_bind_endpoint is None
+            or self.verifier_result_endpoints is None
+        ):
             self._thread = threading.Thread(
                 target=self._run,
                 name="sglang-token-sync-thread",
@@ -61,7 +65,7 @@ class TokenSyncThread:
         self.control_recv_socket = get_zmq_socket(
             self.context,
             zmq.PULL,
-            self.ipc_config.get_control_endpoint(self.drafter_rank),
+            self.control_bind_endpoint,
             True,
         )
         self.result_send_sockets = {
@@ -71,9 +75,7 @@ class TokenSyncThread:
                 endpoint,
                 False,
             )
-            for verifier_rank, endpoint in sorted(
-                self.ipc_config.result_endpoints.items()
-            )
+            for verifier_rank, endpoint in enumerate(self.verifier_result_endpoints)
         }
         self._thread = threading.Thread(
             target=self._run,

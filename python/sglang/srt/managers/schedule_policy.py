@@ -421,12 +421,14 @@ class PrefillAdder:
         prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor] = None,
         dllm_config: Optional[DllmConfig] = None,
         waiting_queue_len: int = 0,
+        ignore_decode_budget: bool = False,
     ):
         self.page_size = page_size
         self.tree_cache = tree_cache
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
         self.running_batch = running_batch
         self.new_token_ratio = new_token_ratio
+        self.ignore_decode_budget = ignore_decode_budget
         self.rem_input_tokens = rem_input_tokens - num_mixed_decode_tokens
         self.rem_chunk_tokens = rem_chunk_tokens
         self.dllm_config = dllm_config
@@ -486,6 +488,8 @@ class PrefillAdder:
         self.rem_dllm_tokens = max_running_reqs * self.dllm_block_size
 
     def _get_running_request_total_token_offset(self, req: Req) -> int:
+        if self.ignore_decode_budget:
+            return 0
         return (
             min(
                 (req.sampling_params.max_new_tokens - len(req.output_ids)),
@@ -652,7 +656,7 @@ class PrefillAdder:
         # Update budget: reserve max_new_tokens only if not truncated
         max_new_tokens = (
             min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS)
-            if not truncated
+            if not truncated and not self.ignore_decode_budget
             else 0
         )
         self._update_prefill_budget(0, req.extend_input_len, max_new_tokens)
@@ -691,7 +695,7 @@ class PrefillAdder:
             req.extend_input_len,
             (
                 min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS)
-                if not truncated
+                if not truncated and not self.ignore_decode_budget
                 else 0
             ),
         )
@@ -723,8 +727,11 @@ class PrefillAdder:
                 return AddReqResult.NO_TOKEN
 
         def add_req_state(r, insert_sort=False):
-            # for decoupled-spec benchmark, enqueue requests as early as possible
-            new_token_ratio = self.new_token_ratio
+            if self.ignore_decode_budget:
+                return
+            new_token_ratio = (
+                1.0 if r.sampling_params.ignore_eos else self.new_token_ratio
+            )
             tokens_left = r.sampling_params.max_new_tokens * new_token_ratio - len(
                 r.output_ids
             )
@@ -754,7 +761,7 @@ class PrefillAdder:
         else:
             add_req_state(req, insert_sort=True)
 
-        if not self.is_hybrid_swa:
+        if not self.is_hybrid_swa and not self.ignore_decode_budget:
             # Skip this logic for swa. The SWA has different memory management, and
             # this mechanism is underestimating the memory usage.
             cur_rem_tokens = self.cur_rem_tokens - self.ceil_paged_tokens(
@@ -791,9 +798,10 @@ class PrefillAdder:
             self._update_prefill_budget(
                 0,
                 req.extend_input_len,
-                int(
+                (
                     min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS)
-                    * self.new_token_ratio
+                    if not self.ignore_decode_budget
+                    else 0
                 ),
             )
         else:
@@ -843,9 +851,13 @@ class PrefillAdder:
         # _update_prefill_budget already accounts for this in the deduction.
         # Without this, admission is more optimistic than the actual budget
         # deduction, allowing over-admission when the pool is nearly full.
-        max_new = min(
-            max(req.sampling_params.max_new_tokens - len(req.output_ids), 0),
-            CLIP_MAX_NEW_TOKENS,
+        max_new = (
+            min(
+                max(req.sampling_params.max_new_tokens - len(req.output_ids), 0),
+                CLIP_MAX_NEW_TOKENS,
+            )
+            if not self.ignore_decode_budget
+            else 0
         )
         total_tokens = req.extend_input_len + max_new + self.page_size
 
@@ -911,12 +923,13 @@ class PrefillAdder:
                 self._update_prefill_budget(
                     prefix_len,
                     input_tokens,
-                    int(
+                    (
                         min(
                             req.sampling_params.max_new_tokens,
                             CLIP_MAX_NEW_TOKENS,
                         )
-                        * self.new_token_ratio
+                        if not self.ignore_decode_budget
+                        else 0
                     ),
                 )
             else:
@@ -987,7 +1000,11 @@ class PrefillAdder:
         preemptible_reqs = []
         min_tokens_to_remove = (
             req.extend_input_len
-            + min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS)
+            + (
+                min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS)
+                if not self.ignore_decode_budget
+                else 0
+            )
             - self.rem_total_tokens
         )
         for running_req in sorted_valid_running_reqs:
