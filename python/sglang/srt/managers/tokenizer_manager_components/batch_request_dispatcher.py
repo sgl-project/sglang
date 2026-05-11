@@ -54,39 +54,15 @@ class BatchRequestDispatcher:
         request: Optional[fastapi.Request],
     ) -> Tuple[List[AsyncGenerator], List[str]]:
         batch_size = obj.batch_size
-
-        generators = []
-        rids = []
         if getattr(obj, "parallel_sample_num", 1) == 1:
             if self.request_preparer._should_use_batch_tokenization(batch_size, obj):
-                generators, rids = await self._dispatch_batch_tokenized(
-                    obj, batch_size, request
-                )
+                return await self._dispatch_batch_tokenized(obj, batch_size, request)
             else:
-                generators, rids = await self._dispatch_sequential_tokenized(
+                return await self._dispatch_sequential_tokenized(
                     obj, batch_size, request
                 )
         else:
-            # FIXME: When using batch and parallel_sample_num together, the perf is not optimal.
-            if batch_size > 128:
-                logger.warning(
-                    "Sending a single large batch with parallel sampling (n > 1) has not been well optimized. "
-                    "The performance might be better if you just duplicate the requests n times or use "
-                    "many threads to send them one by one with parallel sampling (n > 1)."
-                )
-
-            # Tokenize all requests
-            objs = [obj[i] for i in range(batch_size)]
-            tokenized_objs = await asyncio.gather(
-                *(self.request_preparer._tokenize_one_request(obj) for obj in objs)
-            )
-
-            await self._cache_parallel_sample_prefix(objs, tokenized_objs, request)
-            generators, rids = self._expand_parallel_sample_requests(
-                objs, tokenized_objs, obj.parallel_sample_num, request
-            )
-
-        return generators, rids
+            return await self._dispatch_parallel_sample(obj, batch_size, request)
 
     async def _dispatch_batch_tokenized(
         self,
@@ -135,6 +111,31 @@ class BatchRequestDispatcher:
                 )
                 rids.append(tmp_obj.rid)
         return generators, rids
+
+    async def _dispatch_parallel_sample(
+        self,
+        obj: Union[GenerateReqInput, EmbeddingReqInput],
+        batch_size: int,
+        request: Optional[fastapi.Request],
+    ) -> Tuple[List[AsyncGenerator], List[str]]:
+        # FIXME: When using batch and parallel_sample_num together, the perf is not optimal.
+        if batch_size > 128:
+            logger.warning(
+                "Sending a single large batch with parallel sampling (n > 1) has not been well optimized. "
+                "The performance might be better if you just duplicate the requests n times or use "
+                "many threads to send them one by one with parallel sampling (n > 1)."
+            )
+
+        # Tokenize all requests
+        objs = [obj[i] for i in range(batch_size)]
+        tokenized_objs = await asyncio.gather(
+            *(self.request_preparer._tokenize_one_request(o) for o in objs)
+        )
+
+        await self._cache_parallel_sample_prefix(objs, tokenized_objs, request)
+        return self._expand_parallel_sample_requests(
+            objs, tokenized_objs, obj.parallel_sample_num, request
+        )
 
     async def _cache_parallel_sample_prefix(
         self,
