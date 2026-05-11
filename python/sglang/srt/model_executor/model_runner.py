@@ -1170,34 +1170,7 @@ class ModelRunner:
 
         self._maybe_trigger_remote_instance_nccl_send_group()
 
-        # Load the model
-        # Remove monkey_patch when linear.py quant remove dependencies with vllm
-        monkey_patch_vllm_parallel_state()
-
-        enable_cpu_backup = self.server_args.enable_weights_cpu_backup or (
-            self.is_draft_worker and self.server_args.enable_draft_weights_cpu_backup
-        )
-        with self.memory_saver_adapter.region(
-            GPU_MEMORY_TYPE_WEIGHTS,
-            enable_cpu_backup=enable_cpu_backup,
-        ):
-            self.loader = get_model_loader(
-                load_config=self.load_config,
-                model_config=self.model_config,
-            )
-            self.model = self.loader.load_model(
-                model_config=self.model_config,
-                device_config=DeviceConfig(self.device, self.gpu_id),
-            )
-            if hasattr(self.loader, "remote_instance_transfer_engine_weight_info"):
-                self.remote_instance_weight_transport.weight_info = (
-                    self.loader.remote_instance_transfer_engine_weight_info
-                )
-        # Cache needs to be cleared after loading model weights (in the self.loader.load_model function).
-        # To avoid conflict with memory_saver_adapter.region, empty_cache operation is now moved here.
-        if _is_npu:
-            torch.npu.empty_cache()
-        monkey_patch_vllm_parallel_state(reverse=True)
+        self._load_model_with_memory_saver()
 
         if not self.is_draft_worker:
             get_offloader().post_init()
@@ -1460,6 +1433,36 @@ class ModelRunner:
                     ),
                 )
                 t.start()
+
+    def _load_model_with_memory_saver(self) -> None:
+        # Load the model
+        # Remove monkey_patch when linear.py quant remove dependencies with vllm
+        monkey_patch_vllm_parallel_state()
+
+        enable_cpu_backup = self.server_args.enable_weights_cpu_backup or (
+            self.is_draft_worker and self.server_args.enable_draft_weights_cpu_backup
+        )
+        with self.memory_saver_adapter.region(
+            GPU_MEMORY_TYPE_WEIGHTS,
+            enable_cpu_backup=enable_cpu_backup,
+        ):
+            self.loader = get_model_loader(
+                load_config=self.load_config,
+                model_config=self.model_config,
+            )
+            self.model = self.loader.load_model(
+                model_config=self.model_config,
+                device_config=DeviceConfig(self.device, self.gpu_id),
+            )
+            if hasattr(self.loader, "remote_instance_transfer_engine_weight_info"):
+                self.remote_instance_weight_transport.weight_info = (
+                    self.loader.remote_instance_transfer_engine_weight_info
+                )
+        # Cache needs to be cleared after loading model weights (in the self.loader.load_model function).
+        # To avoid conflict with memory_saver_adapter.region, empty_cache operation is now moved here.
+        if _is_npu:
+            torch.npu.empty_cache()
+        monkey_patch_vllm_parallel_state(reverse=True)
 
     def maybe_recover_ep_ranks(self):
         # TODO(perf): `active_ranks.all()` on a CUDA tensor triggers host-device
