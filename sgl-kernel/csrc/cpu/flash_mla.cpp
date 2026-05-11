@@ -81,8 +81,8 @@ FP8KVCacheInfo get_fp8_kvcache_info(at::Tensor k_cache, int64_t layout) {
   TORCH_CHECK(k_cache.dim() == 4, "k_cache must be 4D [num_blocks, block_size, 1, packed_bytes]");
   TORCH_CHECK(k_cache.size(2) == 1, "h_k must be 1 for FlashMLA sparse FP8 path");
   TORCH_CHECK(
-      k_cache.dtype() == at::kFloat8_e4m3fn,
-      "flash_mla_with_kvcache_cpu: expect FP8 k_cache to be float8_e4m3fn, got ",
+      k_cache.dtype() == at::kFloat8_e4m3fn || k_cache.scalar_type() == at::kByte,
+      "flash_mla_with_kvcache_cpu: expect FP8 k_cache to be float8_e4m3fn or uint8, got ",
       k_cache.dtype());
 
   return {

@@ -933,6 +933,9 @@ std::tuple<at::Tensor, at::Tensor> biased_topk_cpu(
         break;
       case 384:
         switch (routed_topk) {
+          case 6:
+            LAUNCH_BIASED_TOPK_KERNEL(384, 6);
+            break;
           case 8:
             LAUNCH_BIASED_TOPK_KERNEL(384, 8);
             break;
@@ -1032,6 +1035,21 @@ std::tuple<at::Tensor, at::Tensor> hash_topk_cpu(
             break;
           case 8:
             LAUNCH_HASH_TOPK_KERNEL(256, 8);
+            break;
+          default:
+            TORCH_CHECK(false, "Unexpected routed_topk: ", routed_topk, " for num_experts=256");
+        }
+        break;
+       case 384:
+        switch (routed_topk) {
+          case 6:
+            LAUNCH_HASH_TOPK_KERNEL(384, 6);
+            break;
+          case 7:
+            LAUNCH_HASH_TOPK_KERNEL(384, 7);
+            break;
+          case 8:
+            LAUNCH_HASH_TOPK_KERNEL(384, 8);
             break;
           default:
             TORCH_CHECK(false, "Unexpected routed_topk: ", routed_topk, " for num_experts=256");

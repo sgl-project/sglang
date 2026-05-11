@@ -29,7 +29,7 @@ from sglang.srt.layers.utils.cp_utils import cp_all_gather_rerange_output
 from sglang.srt.mem_cache.deepseek_v4_compress_state import (
     CompressStatePool,
     KVAndScore,
-    KVAndScoreOld,
+    KVAndScoreSeparate,
 )
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.utils import add_prefix, cpu_has_amx_support, is_cpu
@@ -350,6 +350,7 @@ class Compressor(nn.Module):
         self.overlap = self.ratio == 4
         self.rotate = rotate
         coff = 1 + self.overlap
+        self.coff = coff = 1 + self.overlap
 
         self.ape = nn.Parameter(
             torch.empty(self.ratio, coff * self.head_dim, dtype=torch.float32)
@@ -381,17 +382,17 @@ class Compressor(nn.Module):
 
     @cached_property
     def use_fused_compress(self) -> bool:
-        if envs.SGLANG_CPU_COMPRESS_PATH.get():
+        if envs.SGLANG_CPU_USE_COMPRESS_SEPARATE.get():
             return False
         return True
 
     def _get_states(
         self, forward_batch: ForwardBatch
-    ) -> "KVAndScore | KVAndScoreOld | CompressStatePool":
+    ) -> "KVAndScore | KVAndScoreSeparate | CompressStatePool":
         """Return the per-layer compress-state for this Compressor.
 
         When the radix path is on this is a paged ``CompressStatePool``;
-        otherwise it is a ``KVAndScore`` / ``KVAndScoreOld`` view of the
+        otherwise it is a ``KVAndScore`` / ``KVAndScoreSeparate`` view of the
         per-request non-paged buffer (used by the old-compressor fallback).
         """
         token_to_kv_pool = forward_batch.token_to_kv_pool
@@ -404,6 +405,26 @@ class Compressor(nn.Module):
         ret = self._get_states(forward_batch)
         assert isinstance(ret, CompressStatePool)
         return ret
+    def overlap_transform(self, tensor: torch.Tensor, fill_value: Any) -> torch.Tensor:
+        assert tensor.dim() == 3
+        assert tensor.shape[1:] == (self.ratio, 2 * self.head_dim)
+
+        s, r, d = tensor.size(0), self.ratio, self.head_dim
+        new_tensor = tensor.new_full((s, 2 * r, d), fill_value)
+        new_tensor[:, r:] = tensor[:, :, d:]
+        new_tensor[1:, :r] = tensor[:-1, :, :d]
+        return new_tensor
+
+    def overlap_transform_decode(self, tensor: torch.Tensor) -> torch.Tensor:
+        assert tensor.dim() == 3
+        assert tensor.shape[1:] == (2 * self.ratio, 2 * self.head_dim)
+        r, d = self.ratio, self.head_dim
+        ret = torch.cat((tensor[:, :r, :d], tensor[:, r:, d:]), dim=1)
+        return ret
+
+    @staticmethod
+    def compute_state_len(seq_len: int, ratio: int):
+        return seq_len % ratio + (ratio == 4) * ratio
 
     def forward(self, x: torch.Tensor, forward_batch: ForwardBatch) -> torch.Tensor:
         if forward_batch.forward_mode.is_idle():
@@ -443,9 +464,9 @@ class Compressor(nn.Module):
             is_paged=True,
         )
 
-    def compress_decode_old(
+    def compress_decode_separate(
         self,
-        kv_and_scores: "KVAndScoreOld",
+        kv_and_scores: "KVAndScoreSeparate",
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
         from sglang.srt.layers.attention.nsa.nsa_indexer import rotate_activation
@@ -457,7 +478,7 @@ class Compressor(nn.Module):
         assert self.ape_converted
         seq_lens = forward_batch.seq_lens
         pool = self._get_states(forward_batch)
-        assert isinstance(pool, KVAndScoreOld)
+        assert isinstance(pool, KVAndScoreSeparate)
         req_pool_indices = forward_batch.req_pool_indices
 
         bs = kv_and_scores.kv.size(0)
@@ -469,7 +490,7 @@ class Compressor(nn.Module):
 
         if self.overlap:
             should_shift = (seq_lens % self.ratio == 0)[:, None, None]
-            pool[req_pool_indices, : self.ratio] = KVAndScoreOld(
+            pool[req_pool_indices, : self.ratio] = KVAndScoreSeparate(
                 kv=torch.where(
                     should_shift,
                     kv_and_score_to_compress.kv[:, self.ratio :],
@@ -516,9 +537,9 @@ class Compressor(nn.Module):
             kv_compressed = rotate_activation(kv_compressed)
         return kv_compressed
 
-    def compress_extend_old(
+    def compress_extend_separate(
         self,
-        kv_and_scores: "KVAndScoreOld",
+        kv_and_scores: "KVAndScoreSeparate",
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
         from sglang.srt.layers.attention.nsa.nsa_indexer import rotate_activation
@@ -529,7 +550,7 @@ class Compressor(nn.Module):
         assert self.ape_converted
 
         kv_and_score_states = self._get_states(forward_batch)
-        assert isinstance(kv_and_score_states, KVAndScoreOld)
+        assert isinstance(kv_and_score_states, KVAndScoreSeparate)
         _, _, head_dim_times_coff = kv_and_score_states.kv.shape
 
         prefix_lens = forward_batch.extend_prefix_lens_cpu
@@ -539,7 +560,7 @@ class Compressor(nn.Module):
 
         max_buffer_size = 2 * kv_and_score_states.shape[1] + kv_and_scores.shape[0]
         temp_buffer_shape = [max_buffer_size, head_dim_times_coff]
-        temp_buffer = KVAndScoreOld.empty_like(temp_buffer_shape, old=kv_and_scores)
+        temp_buffer = KVAndScoreSeparate.empty_like(temp_buffer_shape, sep=kv_and_scores)
 
         assert kv_and_scores.kv.shape[-1] == self.head_dim * self.coff
         compressed_kv_output = torch.full(
@@ -632,27 +653,34 @@ class Compressor(nn.Module):
             pt += extend_lens[i]
 
         return compressed_kv_output
-
+    def _get_freqs_cis_real(self):
+        """Return freqs_cis as real float32 [N, rope_dim] for CPU kernel."""
+        if not hasattr(self, "_freqs_cis_real"):
+            fc = self.freqs_cis
+            if fc.is_complex():
+                self._freqs_cis_real = torch.view_as_real(fc).contiguous().reshape(
+                    fc.size(0), -1
+                )
+            else:
+                self._freqs_cis_real = fc.contiguous()
+        return self._freqs_cis_real
     def compress_dispatch(
         self,
         kv_score: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
-        # On first call rewire ``self.compress_decode`` / ``self.compress_extend``
-        # so subsequent dispatch is a single attribute lookup. Mirrors the
-        # pattern used in PR23608.
         if self.use_fused_compress:
             return self.compress_fused(kv_score, forward_batch)
-        self.compress_decode = self.compress_decode_old
-        self.compress_extend = self.compress_extend_old
+        self.compress_decode = self.compress_decode_separate
+        self.compress_extend = self.compress_extend_separate
         kv = kv_score[:, : self.coff * self.head_dim]
         score = kv_score[:, self.coff * self.head_dim :]
-        kv_and_scores = KVAndScoreOld(kv=kv, score=score)
+        kv_and_scores = KVAndScoreSeparate(kv=kv, score=score)
         forward_mode = forward_batch.forward_mode
         if forward_mode.is_decode() or forward_mode.is_target_verify():
             if _cpu_amx:
                 pool = self._get_states(forward_batch)
-                assert isinstance(pool, KVAndScoreOld)
+                assert isinstance(pool, KVAndScoreSeparate)
                 freqs_real = self._get_freqs_cis_real()
                 norm_weight = self.norm.weight.float()
 
@@ -672,11 +700,11 @@ class Compressor(nn.Module):
                         self.rope_head_dim,
                         self.overlap,
                         self.rotate,
-                        self.norm.eps,
+                        self.norm.variance_epsilon,
                     )
             return self.compress_decode(kv_and_scores, forward_batch)
         if forward_mode.is_extend():
             return self.compress_extend(kv_and_scores, forward_batch)
         raise NotImplementedError(
-            f"Forward mode {forward_mode} not supported in old compressor."
+            f"Forward mode {forward_mode} not supported in KVAndScoreSeparate compressor."
         )
