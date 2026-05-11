@@ -52,10 +52,6 @@ if TYPE_CHECKING:
         StandardDispatchOutput,
     )
 
-_FLOAT4_E2M1_MAX = 6.0
-_FLOAT8_E4M3_MAX = torch.finfo(torch.float8_e4m3fn).max
-_NVFP4_PER_TOKEN_GLOBAL_SCALE_INV = 1.0 / (_FLOAT8_E4M3_MAX * _FLOAT4_E2M1_MAX)
-
 if is_flashinfer_available():
     from sglang.srt.layers.quantization.fp4_utils import fp4_quantize
 elif is_cuda_alike():
@@ -834,6 +830,10 @@ def quantize_hidden_states_fp4(
     per_token_scale = None
     if use_per_token_nvfp4:
         from flashinfer import SfLayout, nvfp4_quantize
+
+        _NVFP4_PER_TOKEN_GLOBAL_SCALE_INV = 1.0 / (
+            (256.0 if envs.FLASHINFER_NVFP4_4OVER6.get() else 448.0) * 6.0
+        )
 
         hs_fp4_bytes, hs_sf_bytes, per_token_scale = nvfp4_quantize(
             hidden_states,
