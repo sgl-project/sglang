@@ -384,7 +384,116 @@ def _align_block_size_jit(
     return sorted_token_ids, expert_ids, num_tokens_post_padded
 
 
-_align_block_size_large = _align_block_size_jit
+@torch.compile(dynamic=True)
+def _align_block_size_torch(
+    topk_ids: torch.Tensor,
+    block_size: int,
+    num_experts: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Pure-PyTorch align_block_size for num_experts > 1024, compiled via torch.compile.
+
+    Fallback for platforms where the CUDA JIT kernel is unavailable (e.g. AMD/ROCm).
+
+    Out-of-range topk_ids (negative sentinels left by EP dispatch, or virtual-
+    expert IDs >= num_experts produced when those sentinels are combined with
+    a per-adapter offset) are routed into a dedicated sentinel bucket. Without
+    this, indexing ``padded_offsets[sorted_expert_ids]`` would wrap (-1) or
+    OOB-read, and the bad expert ids would propagate into the downstream LoRA
+    GEMM as real expert slots.
+    """
+    device = topk_ids.device
+    flat_topk_ids = topk_ids.reshape(-1).to(torch.int64)
+    num_total_tokens = flat_topk_ids.numel()
+
+    sentinel = num_experts
+    valid_mask = (flat_topk_ids >= 0) & (flat_topk_ids < num_experts)
+    safe_topk_ids = torch.where(
+        valid_mask,
+        flat_topk_ids,
+        torch.full_like(flat_topk_ids, sentinel),
+    )
+
+    bucket_count = num_experts + 1
+    max_total_padded_tokens = (
+        (num_total_tokens + bucket_count * (block_size - 1) + block_size - 1)
+        // block_size
+    ) * block_size
+    max_num_blocks = max_total_padded_tokens // block_size
+
+    sorted_token_ids = torch.full(
+        (max_total_padded_tokens,),
+        num_total_tokens,
+        dtype=torch.int32,
+        device=device,
+    )
+    expert_ids = torch.full(
+        (max_num_blocks,),
+        -1,
+        dtype=torch.int32,
+        device=device,
+    )
+
+    if num_total_tokens == 0:
+        num_tokens_post_padded = torch.zeros((1,), dtype=torch.int32, device=device)
+        return sorted_token_ids, expert_ids, num_tokens_post_padded
+
+    sorted_order = torch.argsort(safe_topk_ids)
+    sorted_expert_ids = safe_topk_ids[sorted_order]
+    expert_range = torch.arange(bucket_count, device=device, dtype=torch.int64)
+    counts_offsets = torch.searchsorted(sorted_expert_ids, expert_range, right=False)
+    counts_end = torch.searchsorted(sorted_expert_ids, expert_range, right=True)
+    counts = counts_end - counts_offsets
+    padded_counts = ((counts + block_size - 1) // block_size) * block_size
+    total_padded_tokens = padded_counts.sum().to(torch.int32).reshape(1)
+    padded_offsets = torch.cumsum(padded_counts, dim=0) - padded_counts
+
+    token_ranks = (
+        torch.arange(num_total_tokens, device=device, dtype=torch.int64)
+        - counts_offsets[sorted_expert_ids]
+    )
+    output_positions = padded_offsets[sorted_expert_ids] + token_ranks
+    sorted_token_ids.scatter_(
+        0,
+        output_positions.to(torch.int64),
+        sorted_order.to(torch.int32),
+    )
+
+    block_counts = padded_counts // block_size
+    real_block_counts = block_counts.clone()
+    real_block_counts[sentinel] = 0
+    actual_num_blocks = real_block_counts.sum()
+
+    if max_num_blocks <= 0:
+        return sorted_token_ids, expert_ids, total_padded_tokens
+
+    block_offsets = torch.cumsum(real_block_counts, dim=0)
+    all_block_positions = torch.arange(max_num_blocks, device=device, dtype=torch.int64)
+    assigned_experts = torch.searchsorted(
+        block_offsets, all_block_positions, right=True
+    ).to(torch.int32)
+    expert_ids.copy_(
+        torch.where(
+            all_block_positions < actual_num_blocks,
+            assigned_experts,
+            torch.full_like(assigned_experts, -1),
+        )
+    )
+
+    return sorted_token_ids, expert_ids, total_padded_tokens
+
+
+def _align_block_size_large(
+    topk_ids: torch.Tensor,
+    block_size: int,
+    num_experts: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Dispatch to the CUDA JIT kernel when available, otherwise fall back to
+    the pure-PyTorch torch.compile path (needed on AMD/ROCm or when the JIT
+    module fails to load)."""
+    try:
+        return _align_block_size_jit(topk_ids, block_size, num_experts)
+    except Exception:
+        return _align_block_size_torch(topk_ids, block_size, num_experts)
 
 
 def _merged_experts_fused_moe_lora_add_fake(
