@@ -286,25 +286,8 @@ class SchedulerBatchResultProcessor:
             if result.copy_done is not None:
                 result.copy_done.synchronize()
 
-            is_sparse = envs.SGLANG_EMBEDDINGS_SPARSE_HEAD.is_set()
-
-            embeddings = result.embeddings
+            embeddings = self._convert_embeddings(result=result)
             phs = result.pooled_hidden_states
-
-            if is_sparse:
-                batch_ids, token_ids = embeddings.indices()
-                values = embeddings.values()
-
-                embeddings = [{} for _ in range(embeddings.size(0))]
-                for i in range(batch_ids.shape[0]):
-                    embeddings[batch_ids[i].item()][token_ids[i].item()] = values[
-                        i
-                    ].item()
-            else:
-                if isinstance(embeddings, torch.Tensor):
-                    embeddings = embeddings.tolist()
-                else:
-                    embeddings = [tensor.tolist() for tensor in embeddings]
 
             if phs is not None:
                 if isinstance(phs, list):
@@ -347,6 +330,25 @@ class SchedulerBatchResultProcessor:
             can_run_cuda_graph=can_run_cuda_graph,
             dp_cooperation_info=batch.dp_cooperation_info,
         )
+
+    def _convert_embeddings(self, *, result: EmbeddingBatchResult) -> list:
+        is_sparse = envs.SGLANG_EMBEDDINGS_SPARSE_HEAD.is_set()
+
+        embeddings = result.embeddings
+
+        if is_sparse:
+            batch_ids, token_ids = embeddings.indices()
+            values = embeddings.values()
+
+            embeddings = [{} for _ in range(embeddings.size(0))]
+            for i in range(batch_ids.shape[0]):
+                embeddings[batch_ids[i].item()][token_ids[i].item()] = values[i].item()
+        else:
+            if isinstance(embeddings, torch.Tensor):
+                embeddings = embeddings.tolist()
+            else:
+                embeddings = [tensor.tolist() for tensor in embeddings]
+        return embeddings
 
     def _move_logprobs_to_cpu(
         self,
