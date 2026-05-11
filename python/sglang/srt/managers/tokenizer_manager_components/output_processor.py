@@ -66,84 +66,16 @@ class OutputProcessor:
             BatchTokenIDOutput,
         ],
     ):
-        pending_notify: dict[str, ReqState] = {}
+        pending_notify: Dict[str, ReqState] = {}
         batch_notify_size = self.config.batch_notify_size
         for i, rid in enumerate(recv_obj.rids):
-            state = self.rid_to_state.get(rid, None)
+            state = self._lookup_state(rid)
             if state is None:
-                # Known race: /health_generate pops its rid as soon as ANY message bumps last_receive_tstamp.
-                if rid.startswith(HEALTH_CHECK_RID_PREFIX):
-                    continue
-                logger.error(
-                    f"Received output for {rid=} but the state was deleted in TokenizerManager."
-                )
                 continue
 
-            # Build meta_info and return value
-            meta_info = {
-                "id": rid,
-                "finish_reason": recv_obj.finished_reasons[i],
-                "prompt_tokens": recv_obj.prompt_tokens[i],
-                "weight_version": self.config.weight_version,
-                "num_retractions": recv_obj.retraction_counts[i],
-            }
-
-            if self.config.enable_metrics:
-                if recv_obj.time_stats is not None:
-                    scheduler_time_stats = recv_obj.time_stats[i]
-                    meta_info.update(scheduler_time_stats.convert_to_output_meta_info())
-
-            if getattr(state.obj, "return_logprob", False):
-                logprob_ops.absorb_recv(
-                    meta_info,
-                    state,
-                    top_logprobs_num=state.obj.top_logprobs_num,
-                    token_ids_logprob=state.obj.token_ids_logprob,
-                    return_text_in_logprobs=state.obj.return_text_in_logprobs
-                    and not self.config.skip_tokenizer_init,
-                    recv_obj=recv_obj,
-                    recv_obj_index=i,
-                    tokenizer=self.tokenizer,
-                )
-
-            if not isinstance(recv_obj, BatchEmbeddingOutput):
-                meta_info.update(
-                    {
-                        "reasoning_tokens": recv_obj.reasoning_tokens[i],
-                        "completion_tokens": recv_obj.completion_tokens[i],
-                        "cached_tokens": recv_obj.cached_tokens[i],
-                    }
-                )
-                # Add detailed cache breakdown if available
-                if (
-                    hasattr(recv_obj, "cached_tokens_details")
-                    and recv_obj.cached_tokens_details
-                ):
-                    meta_info["cached_tokens_details"] = recv_obj.cached_tokens_details[
-                        i
-                    ]
-
-            if getattr(recv_obj, "output_hidden_states", None):
-                meta_info["hidden_states"] = recv_obj.output_hidden_states[i]
-            if getattr(recv_obj, "routed_experts", None):
-                val = recv_obj.routed_experts[i]
-                if val is not None:
-                    # BatchStrOutput is pre-encoded by the detokenizer;
-                    # BatchTokenIDOutput (skip_tokenizer_init) bypasses it.
-                    if isinstance(val, torch.Tensor):
-                        val = pybase64.b64encode(val.numpy().tobytes()).decode("utf-8")
-                    meta_info["routed_experts"] = val
-            if getattr(recv_obj, "indexer_topk", None):
-                val = recv_obj.indexer_topk[i]
-                if val is not None:
-                    if isinstance(val, torch.Tensor):
-                        val = pybase64.b64encode(val.numpy().tobytes()).decode("utf-8")
-                    meta_info["indexer_topk"] = val
-            if getattr(recv_obj, "customized_info", None):
-                for k, v in recv_obj.customized_info.items():
-                    meta_info[k] = v[i]
-            if getattr(recv_obj, "dp_ranks", None):
-                meta_info["dp_rank"] = recv_obj.dp_ranks[i]
+            meta_info = self._build_meta_info(recv_obj, rid, i)
+            self._maybe_absorb_logprobs(meta_info, state, recv_obj, i)
+            self._enrich_meta_info(meta_info, recv_obj, i)
 
             state.finished = recv_obj.finished_reasons[i] is not None
             out_dict = self._build_out_dict(recv_obj, state, i, meta_info)
@@ -166,23 +98,124 @@ class OutputProcessor:
                     pending_notify = {}
                     await asyncio.sleep(0)
 
-            if self.config.enable_metrics and state.obj.log_metrics:
-                self.request_metrics_recorder.collect_metrics(state, recv_obj, i)
-            if (
-                self.request_log_manager.dump_requests_folder
-                and state.finished
-                and state.obj.log_metrics
-            ):
-                self.request_log_manager.dump_requests(state, out_dict)
-            if (
-                self.request_log_manager.crash_dump_folder
-                and state.finished
-                and state.obj.log_metrics
-            ):
-                self.request_log_manager.record_request_for_crash_dump(state, out_dict)
+            self._maybe_emit_metrics_and_dumps(state, recv_obj, i, out_dict)
 
         self._drain_pending_notify(pending_notify)
         self._maybe_emit_load_update(recv_obj)
+
+    def _lookup_state(self, rid: str) -> Optional[ReqState]:
+        state = self.rid_to_state.get(rid, None)
+        if state is None:
+            # Known race: /health_generate pops its rid as soon as ANY message bumps last_receive_tstamp.
+            if rid.startswith(HEALTH_CHECK_RID_PREFIX):
+                return None
+            logger.error(
+                f"Received output for {rid=} but the state was deleted in TokenizerManager."
+            )
+            return None
+        return state
+
+    def _build_meta_info(self, recv_obj, rid: str, i: int) -> dict:
+        # Build meta_info and return value
+        meta_info = {
+            "id": rid,
+            "finish_reason": recv_obj.finished_reasons[i],
+            "prompt_tokens": recv_obj.prompt_tokens[i],
+            "weight_version": self.config.weight_version,
+            "num_retractions": recv_obj.retraction_counts[i],
+        }
+
+        if self.config.enable_metrics:
+            if recv_obj.time_stats is not None:
+                scheduler_time_stats = recv_obj.time_stats[i]
+                meta_info.update(scheduler_time_stats.convert_to_output_meta_info())
+        return meta_info
+
+    def _maybe_absorb_logprobs(
+        self,
+        meta_info: dict,
+        state: ReqState,
+        recv_obj,
+        i: int,
+    ) -> None:
+        if not getattr(state.obj, "return_logprob", False):
+            return
+        logprob_ops.absorb_recv(
+            meta_info,
+            state,
+            top_logprobs_num=state.obj.top_logprobs_num,
+            token_ids_logprob=state.obj.token_ids_logprob,
+            return_text_in_logprobs=state.obj.return_text_in_logprobs
+            and not self.config.skip_tokenizer_init,
+            recv_obj=recv_obj,
+            recv_obj_index=i,
+            tokenizer=self.tokenizer,
+        )
+
+    def _enrich_meta_info(
+        self,
+        meta_info: dict,
+        recv_obj,
+        i: int,
+    ) -> None:
+        if not isinstance(recv_obj, BatchEmbeddingOutput):
+            meta_info.update(
+                {
+                    "reasoning_tokens": recv_obj.reasoning_tokens[i],
+                    "completion_tokens": recv_obj.completion_tokens[i],
+                    "cached_tokens": recv_obj.cached_tokens[i],
+                }
+            )
+            # Add detailed cache breakdown if available
+            if (
+                hasattr(recv_obj, "cached_tokens_details")
+                and recv_obj.cached_tokens_details
+            ):
+                meta_info["cached_tokens_details"] = recv_obj.cached_tokens_details[i]
+
+        if getattr(recv_obj, "output_hidden_states", None):
+            meta_info["hidden_states"] = recv_obj.output_hidden_states[i]
+        if getattr(recv_obj, "routed_experts", None):
+            val = recv_obj.routed_experts[i]
+            if val is not None:
+                # BatchStrOutput is pre-encoded by the detokenizer;
+                # BatchTokenIDOutput (skip_tokenizer_init) bypasses it.
+                if isinstance(val, torch.Tensor):
+                    val = pybase64.b64encode(val.numpy().tobytes()).decode("utf-8")
+                meta_info["routed_experts"] = val
+        if getattr(recv_obj, "indexer_topk", None):
+            val = recv_obj.indexer_topk[i]
+            if val is not None:
+                if isinstance(val, torch.Tensor):
+                    val = pybase64.b64encode(val.numpy().tobytes()).decode("utf-8")
+                meta_info["indexer_topk"] = val
+        if getattr(recv_obj, "customized_info", None):
+            for k, v in recv_obj.customized_info.items():
+                meta_info[k] = v[i]
+        if getattr(recv_obj, "dp_ranks", None):
+            meta_info["dp_rank"] = recv_obj.dp_ranks[i]
+
+    def _maybe_emit_metrics_and_dumps(
+        self,
+        state: ReqState,
+        recv_obj,
+        i: int,
+        out_dict: Optional[dict],
+    ) -> None:
+        if self.config.enable_metrics and state.obj.log_metrics:
+            self.request_metrics_recorder.collect_metrics(state, recv_obj, i)
+        if (
+            self.request_log_manager.dump_requests_folder
+            and state.finished
+            and state.obj.log_metrics
+        ):
+            self.request_log_manager.dump_requests(state, out_dict)
+        if (
+            self.request_log_manager.crash_dump_folder
+            and state.finished
+            and state.obj.log_metrics
+        ):
+            self.request_log_manager.record_request_for_crash_dump(state, out_dict)
 
     def _build_out_dict(
         self,
