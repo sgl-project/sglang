@@ -23,7 +23,7 @@ from sglang.srt.state_capturer.routed_experts import (  # noqa: F401
 )
 
 if TYPE_CHECKING:
-    from sglang.srt.managers.scheduler import (  # noqa: F401
+    from sglang.srt.managers.utils import (  # noqa: F401
         EmbeddingBatchResult,
         GenerationBatchResult,
     )

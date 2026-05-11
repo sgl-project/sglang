@@ -23,9 +23,9 @@ from sglang.srt.utils.scheduler_status_logger import SchedulerStatusLogger
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.managers.schedule_policy import PrefillAdder
-    from sglang.srt.managers.scheduler import (  # noqa: F401
+    from sglang.srt.managers.scheduler import Scheduler  # noqa: F401
+    from sglang.srt.managers.utils import (  # noqa: F401
         EmbeddingBatchResult,
-        Scheduler,
     )
 
 
