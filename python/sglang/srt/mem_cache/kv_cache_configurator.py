@@ -136,6 +136,19 @@ class _InitializedPools(msgspec.Struct, frozen=True, kw_only=True):
     unified_memory_pool: Optional[UnifiedKVPool] = None
 
 
+class _PoolSizes(msgspec.Struct, frozen=True, kw_only=True):
+    max_total_num_tokens: int
+    max_running_requests: int
+    full_max_total_num_tokens: Optional[int]
+    swa_max_total_num_tokens: Optional[int]
+    c4_max_total_num_tokens: int
+    c128_max_total_num_tokens: int
+    c4_state_pool_size: int
+    c128_state_pool_size: int
+    c4_state_dtype: Optional[torch.dtype]
+    c128_state_dtype: Optional[torch.dtype]
+
+
 @dataclass(frozen=True, slots=True, kw_only=True)
 class KVCacheConfigurator:
     device: str
@@ -185,6 +198,32 @@ class KVCacheConfigurator:
         else:
             config = self._resolve_memory_pool_config(pre_model_load_memory)
 
+        sizes = self._derive_pool_sizes(config=config)
+
+        pools = self._init_pools(
+            sizes=sizes,
+            req_to_token_pool=self.req_to_token_pool,
+            token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+        )
+
+        logger.info(
+            f"Memory pool end. "
+            f"avail mem={get_available_gpu_memory(self.device, self.gpu_id):.2f} GB"
+        )
+
+        return KVCacheConfigResult(
+            max_total_num_tokens=sizes.max_total_num_tokens,
+            max_running_requests=sizes.max_running_requests,
+            full_max_total_num_tokens=sizes.full_max_total_num_tokens,
+            swa_max_total_num_tokens=sizes.swa_max_total_num_tokens,
+            req_to_token_pool=pools.req_to_token_pool,
+            token_to_kv_pool=pools.token_to_kv_pool,
+            token_to_kv_pool_allocator=pools.token_to_kv_pool_allocator,
+            memory_pool_config=config,
+            unified_memory_pool=pools.unified_memory_pool,
+        )
+
+    def _derive_pool_sizes(self, *, config: MemoryPoolConfig) -> _PoolSizes:
         max_total_num_tokens = config.max_total_num_tokens
         max_running_requests = config.max_running_requests
         full_max_total_num_tokens = None
@@ -214,7 +253,7 @@ class KVCacheConfigurator:
         if is_deepseek_v4(self.model_config.hf_config):
             c4_state_dtype, c128_state_dtype = _get_dsv4_compress_state_dtypes()
 
-        pools = self._init_pools(
+        return _PoolSizes(
             max_total_num_tokens=max_total_num_tokens,
             max_running_requests=max_running_requests,
             full_max_total_num_tokens=full_max_total_num_tokens,
@@ -225,40 +264,12 @@ class KVCacheConfigurator:
             c128_state_pool_size=c128_state_pool_size,
             c4_state_dtype=c4_state_dtype,
             c128_state_dtype=c128_state_dtype,
-            req_to_token_pool=self.req_to_token_pool,
-            token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
-        )
-
-        logger.info(
-            f"Memory pool end. "
-            f"avail mem={get_available_gpu_memory(self.device, self.gpu_id):.2f} GB"
-        )
-
-        return KVCacheConfigResult(
-            max_total_num_tokens=max_total_num_tokens,
-            max_running_requests=max_running_requests,
-            full_max_total_num_tokens=full_max_total_num_tokens,
-            swa_max_total_num_tokens=swa_max_total_num_tokens,
-            req_to_token_pool=pools.req_to_token_pool,
-            token_to_kv_pool=pools.token_to_kv_pool,
-            token_to_kv_pool_allocator=pools.token_to_kv_pool_allocator,
-            memory_pool_config=config,
-            unified_memory_pool=pools.unified_memory_pool,
         )
 
     def _init_pools(
         self,
         *,
-        max_total_num_tokens: int,
-        max_running_requests: int,
-        full_max_total_num_tokens: Optional[int],
-        swa_max_total_num_tokens: Optional[int],
-        c4_max_total_num_tokens: int,
-        c128_max_total_num_tokens: int,
-        c4_state_pool_size: int,
-        c128_state_pool_size: int,
-        c4_state_dtype: Optional[torch.dtype],
-        c128_state_dtype: Optional[torch.dtype],
+        sizes: _PoolSizes,
         req_to_token_pool: Optional[ReqToTokenPool],
         token_to_kv_pool_allocator: Optional[BaseTokenToKVPoolAllocator],
     ) -> _InitializedPools:
@@ -275,14 +286,14 @@ class KVCacheConfigurator:
         ):
             if self.mambaish_config is not None:
                 bundle = self._init_unified_mamba_pools(
-                    max_num_reqs=max_running_requests,
-                    max_total_num_tokens=max_total_num_tokens,
+                    max_num_reqs=sizes.max_running_requests,
+                    max_total_num_tokens=sizes.max_total_num_tokens,
                 )
             elif self.is_hybrid_swa and not is_deepseek_v4(self.model_config.hf_config):
                 bundle = self._init_unified_swa_pools(
-                    max_num_reqs=max_running_requests,
-                    full_max_total_num_tokens=full_max_total_num_tokens,
-                    swa_max_total_num_tokens=swa_max_total_num_tokens,
+                    max_num_reqs=sizes.max_running_requests,
+                    full_max_total_num_tokens=sizes.full_max_total_num_tokens,
+                    swa_max_total_num_tokens=sizes.swa_max_total_num_tokens,
                 )
             else:
                 # Fail loud, not silently fall through to the normal pools (which would
@@ -300,11 +311,12 @@ class KVCacheConfigurator:
                 token_to_kv_pool_allocator=bundle.token_to_kv_pool_allocator,
                 unified_memory_pool=bundle.unified_memory_pool,
             )
-        max_num_reqs = max_running_requests
 
         # Initialize req_to_token_pool
         if req_to_token_pool is None:
-            req_to_token_pool = self._build_req_to_token_pool(max_num_reqs=max_num_reqs)
+            req_to_token_pool = self._build_req_to_token_pool(
+                max_num_reqs=sizes.max_running_requests
+            )
         else:
             # Draft worker shares req_to_token_pool with the target worker.
             assert self.is_draft_worker
@@ -318,25 +330,14 @@ class KVCacheConfigurator:
         )
 
         token_to_kv_pool = self._build_token_to_kv_pool(
-            max_total_num_tokens=max_total_num_tokens,
-            max_running_requests=max_running_requests,
-            full_max_total_num_tokens=full_max_total_num_tokens,
-            swa_max_total_num_tokens=swa_max_total_num_tokens,
-            c4_max_total_num_tokens=c4_max_total_num_tokens,
-            c128_max_total_num_tokens=c128_max_total_num_tokens,
-            c4_state_pool_size=c4_state_pool_size,
-            c128_state_pool_size=c128_state_pool_size,
-            c4_state_dtype=c4_state_dtype,
-            c128_state_dtype=c128_state_dtype,
+            sizes=sizes,
             is_dsa_model=is_dsa_model,
             is_dsv4_model=is_dsv4_model,
             req_to_token_pool=req_to_token_pool,
         )
 
         token_to_kv_pool_allocator = self._build_token_to_kv_pool_allocator(
-            max_total_num_tokens=max_total_num_tokens,
-            full_max_total_num_tokens=full_max_total_num_tokens,
-            swa_max_total_num_tokens=swa_max_total_num_tokens,
+            sizes=sizes,
             token_to_kv_pool=token_to_kv_pool,
             is_dsv4_model=is_dsv4_model,
             req_to_token_pool=req_to_token_pool,
@@ -706,16 +707,7 @@ class KVCacheConfigurator:
     def _build_token_to_kv_pool(
         self,
         *,
-        max_total_num_tokens: int,
-        max_running_requests: int,
-        full_max_total_num_tokens: Optional[int],
-        swa_max_total_num_tokens: Optional[int],
-        c4_max_total_num_tokens: int,
-        c128_max_total_num_tokens: int,
-        c4_state_pool_size: int,
-        c128_state_pool_size: int,
-        c4_state_dtype: Optional[torch.dtype],
-        c128_state_dtype: Optional[torch.dtype],
+        sizes: _PoolSizes,
         is_dsa_model: bool,
         is_dsv4_model: bool,
         req_to_token_pool: ReqToTokenPool,
@@ -731,75 +723,75 @@ class KVCacheConfigurator:
 
         if is_dsv4_model:
             token_to_kv_pool = self._build_dsv4_kv_pool(
-                max_running_requests=max_running_requests,
-                swa_max_total_num_tokens=swa_max_total_num_tokens,
-                c4_max_total_num_tokens=c4_max_total_num_tokens,
-                c128_max_total_num_tokens=c128_max_total_num_tokens,
-                c4_state_pool_size=c4_state_pool_size,
-                c128_state_pool_size=c128_state_pool_size,
-                c4_state_dtype=c4_state_dtype,
-                c128_state_dtype=c128_state_dtype,
+                max_running_requests=sizes.max_running_requests,
+                swa_max_total_num_tokens=sizes.swa_max_total_num_tokens,
+                c4_max_total_num_tokens=sizes.c4_max_total_num_tokens,
+                c128_max_total_num_tokens=sizes.c128_max_total_num_tokens,
+                c4_state_pool_size=sizes.c4_state_pool_size,
+                c128_state_pool_size=sizes.c128_state_pool_size,
+                c4_state_dtype=sizes.c4_state_dtype,
+                c128_state_dtype=sizes.c128_state_dtype,
                 req_to_token_pool=req_to_token_pool,
             )
         elif current_platform.is_out_of_tree() and not self.mambaish_config:
             if self.use_mla_backend and is_dsa_model:
                 token_to_kv_pool = self._build_oot_dsa_kv_pool(
-                    max_total_num_tokens=max_total_num_tokens,
+                    max_total_num_tokens=sizes.max_total_num_tokens,
                 )
             elif self.use_mla_backend:
                 token_to_kv_pool = self._build_oot_mla_kv_pool(
-                    max_total_num_tokens=max_total_num_tokens,
+                    max_total_num_tokens=sizes.max_total_num_tokens,
                     is_dsa_model=is_dsa_model,
                 )
             else:
                 token_to_kv_pool = self._build_oot_mha_kv_pool(
-                    max_total_num_tokens=max_total_num_tokens,
+                    max_total_num_tokens=sizes.max_total_num_tokens,
                 )
         elif (
             self.server_args.attention_backend == "ascend" and not self.mambaish_config
         ):
             if self.is_hybrid_swa:
                 token_to_kv_pool = self._build_ascend_swa_kv_pool(
-                    full_max_total_num_tokens=full_max_total_num_tokens,
-                    swa_max_total_num_tokens=swa_max_total_num_tokens,
+                    full_max_total_num_tokens=sizes.full_max_total_num_tokens,
+                    swa_max_total_num_tokens=sizes.swa_max_total_num_tokens,
                 )
             elif self.use_mla_backend:
                 token_to_kv_pool = self._build_ascend_mla_kv_pool(
-                    max_total_num_tokens=max_total_num_tokens,
+                    max_total_num_tokens=sizes.max_total_num_tokens,
                     is_dsa_model=is_dsa_model,
                 )
             else:
                 token_to_kv_pool = self._build_ascend_mha_kv_pool(
-                    max_total_num_tokens=max_total_num_tokens,
+                    max_total_num_tokens=sizes.max_total_num_tokens,
                 )
         elif self.use_mla_backend and is_dsa_model:
             token_to_kv_pool = self._build_dsa_kv_pool(
-                max_total_num_tokens=max_total_num_tokens,
+                max_total_num_tokens=sizes.max_total_num_tokens,
             )
         elif self.use_mla_backend and not self.mambaish_config:
             assert not is_dsa_model
             if is_float4_e2m1fn_x2(self.kv_cache_dtype):
                 token_to_kv_pool = self._build_mla_fp4_kv_pool(
-                    max_total_num_tokens=max_total_num_tokens,
+                    max_total_num_tokens=sizes.max_total_num_tokens,
                 )
             else:
                 token_to_kv_pool = self._build_mla_kv_pool(
-                    max_total_num_tokens=max_total_num_tokens,
+                    max_total_num_tokens=sizes.max_total_num_tokens,
                 )
         else:
             if self.is_hybrid_swa:
                 token_to_kv_pool = self._build_hybrid_swa_kv_pool(
-                    full_max_total_num_tokens=full_max_total_num_tokens,
-                    swa_max_total_num_tokens=swa_max_total_num_tokens,
+                    full_max_total_num_tokens=sizes.full_max_total_num_tokens,
+                    swa_max_total_num_tokens=sizes.swa_max_total_num_tokens,
                     mha_pool_class=mha_pool_class,
                 )
             elif is_minimax_sparse(self.model_config.hf_config):
                 token_to_kv_pool = self._build_minimax_sparse_kv_pool(
-                    max_total_num_tokens=max_total_num_tokens,
+                    max_total_num_tokens=sizes.max_total_num_tokens,
                 )
             elif self.mambaish_config:
                 token_to_kv_pool = self._build_hybrid_linear_kv_pool(
-                    max_total_num_tokens=max_total_num_tokens,
+                    max_total_num_tokens=sizes.max_total_num_tokens,
                     req_to_token_pool=req_to_token_pool,
                     mha_pool_class=mha_pool_class,
                 )
@@ -809,11 +801,11 @@ class KVCacheConfigurator:
                         not enable_page_major
                     ), "page-major KV layout is not supported with fp4 KV cache"
                     token_to_kv_pool = self._build_mha_fp4_kv_pool(
-                        max_total_num_tokens=max_total_num_tokens,
+                        max_total_num_tokens=sizes.max_total_num_tokens,
                     )
                 else:
                     token_to_kv_pool = self._build_mha_kv_pool(
-                        max_total_num_tokens=max_total_num_tokens,
+                        max_total_num_tokens=sizes.max_total_num_tokens,
                         mha_pool_class=mha_pool_class,
                     )
         return token_to_kv_pool
@@ -1271,9 +1263,7 @@ class KVCacheConfigurator:
     def _build_token_to_kv_pool_allocator(
         self,
         *,
-        max_total_num_tokens: int,
-        full_max_total_num_tokens: Optional[int],
-        swa_max_total_num_tokens: Optional[int],
+        sizes: _PoolSizes,
         token_to_kv_pool: KVCache,
         is_dsv4_model: bool,
         req_to_token_pool: ReqToTokenPool,
@@ -1285,7 +1275,7 @@ class KVCacheConfigurator:
             if current_platform.is_out_of_tree():
                 AllocatorCls = current_platform.get_paged_allocator_cls()
                 token_to_kv_pool_allocator = AllocatorCls(
-                    max_total_num_tokens,
+                    sizes.max_total_num_tokens,
                     page_size=self.server_args.page_size,
                     dtype=self.kv_cache_dtype,
                     device=self.device,
@@ -1309,8 +1299,8 @@ class KVCacheConfigurator:
                     else:
                         swa_allocator_cls = SWATokenToKVPoolAllocator
                     token_to_kv_pool_allocator = swa_allocator_cls(
-                        full_max_total_num_tokens,
-                        swa_max_total_num_tokens,
+                        sizes.full_max_total_num_tokens,
+                        sizes.swa_max_total_num_tokens,
                         page_size=self.server_args.page_size,
                         dtype=self.kv_cache_dtype,
                         device=self.device,
@@ -1323,7 +1313,7 @@ class KVCacheConfigurator:
                     )
 
                     token_to_kv_pool_allocator = NPUPagedTokenToKVPoolAllocator(
-                        max_total_num_tokens,
+                        sizes.max_total_num_tokens,
                         page_size=self.server_args.page_size,
                         dtype=self.kv_cache_dtype,
                         device=self.device,
@@ -1331,9 +1321,9 @@ class KVCacheConfigurator:
                         need_sort=need_sort,
                     )
             else:
-                if self.is_hybrid_swa and full_max_total_num_tokens == 0:
+                if self.is_hybrid_swa and sizes.full_max_total_num_tokens == 0:
                     token_to_kv_pool_allocator = PureSWATokenToKVPoolAllocator(
-                        swa_max_total_num_tokens,
+                        sizes.swa_max_total_num_tokens,
                         page_size=self.server_args.page_size,
                         dtype=self.kv_cache_dtype,
                         device=self.device,
@@ -1342,8 +1332,8 @@ class KVCacheConfigurator:
                     )
                 elif self.is_hybrid_swa:
                     token_to_kv_pool_allocator = SWATokenToKVPoolAllocator(
-                        full_max_total_num_tokens,
-                        swa_max_total_num_tokens,
+                        sizes.full_max_total_num_tokens,
+                        sizes.swa_max_total_num_tokens,
                         page_size=self.server_args.page_size,
                         dtype=self.kv_cache_dtype,
                         device=self.device,
@@ -1358,7 +1348,7 @@ class KVCacheConfigurator:
 
                         hisparse_cfg = parse_hisparse_config(self.server_args)
                         token_to_kv_pool_allocator = HiSparseTokenToKVPoolAllocator(
-                            max_total_num_tokens,
+                            sizes.max_total_num_tokens,
                             page_size=self.server_args.page_size,
                             dtype=self.kv_cache_dtype,
                             device=self.device,
@@ -1371,7 +1361,7 @@ class KVCacheConfigurator:
                         and self.server_args.dcp_size == 1
                     ):
                         token_to_kv_pool_allocator = TokenToKVPoolAllocator(
-                            max_total_num_tokens,
+                            sizes.max_total_num_tokens,
                             dtype=self.kv_cache_dtype,
                             device=self.device,
                             kvcache=token_to_kv_pool,
@@ -1379,7 +1369,7 @@ class KVCacheConfigurator:
                         )
                     else:
                         token_to_kv_pool_allocator = PagedTokenToKVPoolAllocator(
-                            max_total_num_tokens * self.server_args.dcp_size,
+                            sizes.max_total_num_tokens * self.server_args.dcp_size,
                             page_size=self.server_args.page_size
                             * self.server_args.dcp_size,
                             dtype=self.kv_cache_dtype,
