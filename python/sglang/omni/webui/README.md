@@ -6,7 +6,9 @@ HTTP proxy: model serving still happens in `sglang serve --model-type omni`.
 
 The first target model is SenseNova U1. The UI supports a free-form chat loop
 for repeated refinements, and also keeps a two-turn preset for quickly checking
-that a later turn can edit a previously generated image.
+that a later turn can edit a previously generated image. Requests use
+`stream: true`, so text appears incrementally and image generation shows a
+placeholder until the final image event arrives.
 
 ## Start An Omni Server
 
@@ -83,6 +85,9 @@ The UI server proxies only the endpoints it needs:
 | `GET /api/health` | `GET /health` |
 | `POST /api/omni/generate` | `POST /v1/omni/generate` |
 | `POST /api/omni/close` | `POST /v1/omni/sessions/{session_id}/close` |
+
+`POST /api/omni/generate` passes through `text/event-stream` responses without
+buffering when the browser sends `stream: true`.
 
 This WebUI is for local development and demos. Do not expose it directly to an
 untrusted network.

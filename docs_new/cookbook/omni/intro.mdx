@@ -75,6 +75,7 @@ The request body is segment-based. `messages` contains ordered multimodal input 
     "height": 1024,
     "num_steps": 50
   },
+  "stream": false,
   "max_images": 1,
   "max_text_segments": 2
 }
@@ -109,6 +110,20 @@ The response contains ordered output segments. A model can return text, media, o
   "metadata": {}
 }
 ```
+
+Set `stream: true` to receive Server-Sent Events from `/v1/omni/generate`.
+Streaming uses the same ordered segment semantics as the JSON response, but the
+client can render text deltas immediately and show a media placeholder while the
+generation backend is running.
+
+| Event type | Meaning |
+| --- | --- |
+| `text_delta` | Incremental text for a segment |
+| `text_end` | End of the current text segment |
+| `image_start` | A generated image segment has started |
+| `image` | Final image payload for the segment |
+| `done` | Final session, stats, and metadata |
+| `error` | Request-level error |
 
 ### Persistent Sessions
 

@@ -26,6 +26,7 @@ from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.session.session_controller import SessionController
 
 if TYPE_CHECKING:
+    from sglang.omni.streaming import OmniStreamSink
     from sglang.srt.omni_session.model_policy import (
         OmniModelPolicy,
         OmniModelSessionView,
@@ -84,6 +85,7 @@ class OmniDecodeResult:
     type: Literal["text", "image_marker", "done"]
     text: str | None = None
     token_ids: tuple[int, ...] = ()
+    metadata: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)
@@ -258,7 +260,12 @@ class OmniSessionRuntime:
         record.state = OmniSegmentState.AR_DECODE
         return record.handle()
 
-    def decode_next_segment(self, handle: OmniSessionHandle) -> OmniDecodeResult:
+    def decode_next_segment(
+        self,
+        handle: OmniSessionHandle,
+        *,
+        stream_sink: "OmniStreamSink | None" = None,
+    ) -> OmniDecodeResult:
         """decode until next segment with model_policy"""
         record = self._record_for(handle)
         if record.state != OmniSegmentState.AR_DECODE:
@@ -269,6 +276,7 @@ class OmniSessionRuntime:
         result = self.model_policy.decode_next_segment_with_runtime(
             runtime=self,
             session=self._model_session_view(record),
+            stream_sink=stream_sink,
         )
         if result is None:
             if self.srt_ar_decode_max_new_tokens > 0:

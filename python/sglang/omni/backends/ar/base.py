@@ -8,18 +8,26 @@ from sglang.omni.protocol import (
     OmniContextBundle,
     OmniRequest,
 )
+from sglang.omni.streaming import OmniStreamSink
 
 
 class UnsupportedARBackend(ARBackend):
     """AR backend placeholder that fails at request time."""
 
-    def begin_request_context(self, request: OmniRequest) -> OmniContextBundle:
+    def begin_request_context(
+        self,
+        request: OmniRequest,
+        *,
+        stream_sink: OmniStreamSink | None = None,
+    ) -> OmniContextBundle:
         raise RuntimeError("No omni AR backend is configured")
 
     def append_input_segments(
         self,
         context: OmniContextBundle,
         request: OmniRequest,
+        *,
+        stream_sink: OmniStreamSink | None = None,
     ) -> OmniContextBundle:
         raise RuntimeError("No omni AR backend is configured")
 
@@ -28,6 +36,7 @@ class UnsupportedARBackend(ARBackend):
         context: OmniContextBundle,
         *,
         request: OmniRequest,
+        stream_sink: OmniStreamSink | None = None,
     ) -> OmniBoundary:
         raise RuntimeError("No omni AR backend is configured")
 

@@ -29,7 +29,7 @@ from contextlib import nullcontext
 from datetime import datetime
 from enum import Enum
 from http import HTTPStatus
-from typing import Any, Awaitable, Dict, List, Optional, Tuple, Union
+from typing import Any, AsyncIterator, Awaitable, Dict, List, Optional, Tuple, Union
 
 import fastapi
 import pybase64
@@ -65,6 +65,7 @@ from sglang.srt.managers.io_struct import (
     LoadLoRAAdapterReqInput,
     OmniGenerateReqInput,
     OmniGenerateReqOutput,
+    OmniGenerateStreamOutput,
     OpenSessionReqOutput,
     PauseGenerationReqInput,
     SessionParams,
@@ -377,6 +378,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # Session
         self.session_futures = {}  # session_id -> asyncio event
         self.omni_futures = {}  # rid (of omni-request) -> asyncio event
+        self.omni_stream_queues = {}  # rid (of omni-request) -> asyncio queue
 
         # Subprocess liveness watchdog — set by Engine or http_server after construction
         self._subprocess_watchdog = None
@@ -501,6 +503,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     UpdateWeightFromDiskReqOutput,
                     self._handle_update_weights_from_disk_req_output,
                 ),
+                (OmniGenerateStreamOutput, self._handle_omni_generate_stream_output),
                 (OmniGenerateReqOutput, self._handle_omni_generate_req_output),
                 (FreezeGCReq, lambda x: None),
                 # For handling case when scheduler skips detokenizer and forwards back to the tokenizer manager, we ignore it.
@@ -587,6 +590,41 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                         )
         finally:
             self.omni_futures.pop(obj.rid, None)
+
+    async def omni_generate_stream(
+        self,
+        obj: OmniGenerateReqInput,
+        request: Optional[fastapi.Request] = None,
+    ) -> AsyncIterator[dict[str, Any]]:
+        """forward a streaming omni request to scheduler and yield stream events"""
+        self.auto_create_handle_loop()
+        if obj.rid is None:
+            obj.regenerate_rid()
+        obj.stream = True
+        obj.payload["stream"] = True
+
+        queue: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue()
+        self.omni_stream_queues[obj.rid] = queue
+        self.send_to_scheduler.send_pyobj(obj)
+        try:
+            while True:
+                try:
+                    event = await asyncio.wait_for(
+                        queue.get(),
+                        timeout=_REQUEST_STATE_WAIT_TIMEOUT,
+                    )
+                except asyncio.TimeoutError:
+                    if request is not None and await request.is_disconnected():
+                        raise ValueError(
+                            "Request is disconnected from the client side. "
+                            f"Abort omni request {obj.rid=}"
+                        )
+                    continue
+                if event is None:
+                    return
+                yield event
+        finally:
+            self.omni_stream_queues.pop(obj.rid, None)
 
     def _detect_input_format(
         self, texts: Union[str, List[str]], is_cross_encoder: bool
@@ -2444,6 +2482,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             future.set_result(recv_obj.session_id if recv_obj.success else None)
 
     def _handle_omni_generate_req_output(self, recv_obj):
+        queue = self.omni_stream_queues.get(recv_obj.rid)
+        if queue is not None:
+            queue.put_nowait(None)
+            return
+
         future = self.omni_futures.get(recv_obj.rid)
         if future is None:
             logger.warning(
@@ -2453,6 +2496,16 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             return
         if not future.done():
             future.set_result(recv_obj)
+
+    def _handle_omni_generate_stream_output(self, recv_obj):
+        queue = self.omni_stream_queues.get(recv_obj.rid)
+        if queue is None:
+            logger.warning(
+                "Omni stream event arrived after waiter cleanup: %s",
+                recv_obj.rid,
+            )
+            return
+        queue.put_nowait(recv_obj.event)
 
     def _handle_update_weights_from_disk_req_output(self, recv_obj):
         if self.server_args.dp_size == 1:

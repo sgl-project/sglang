@@ -8,16 +8,18 @@ shell for tests and future backends that do not need SRT-owned sessions.
 from __future__ import annotations
 
 import argparse
+import json
 from contextlib import asynccontextmanager
 from typing import TYPE_CHECKING, Any, Callable
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import ORJSONResponse
+from fastapi.responses import ORJSONResponse, StreamingResponse
 
 from sglang.omni.backends import UnsupportedARBackend, UnsupportedGenerationBackend
 from sglang.omni.coordinator import OmniCoordinator
 from sglang.omni.protocol import OmniRequest
 from sglang.omni.serialization import serialize_response
+from sglang.omni.streaming import OmniStreamSink
 from sglang.version import __version__
 
 if TYPE_CHECKING:
@@ -60,6 +62,12 @@ def create_app(
         try:
             payload = await raw_request.json()
             request = OmniRequest.from_payload(payload)
+            if bool(payload.get("stream", False)):
+                return StreamingResponse(
+                    _stream_omni_generate(raw_request.app.state.orchestrator, request),
+                    media_type="text/event-stream",
+                    headers={"Cache-Control": "no-cache"},
+                )
             response = raw_request.app.state.orchestrator.generate(request)
             return ORJSONResponse(serialize_response(response))
         except ValueError as exc:
@@ -68,6 +76,26 @@ def create_app(
             raise HTTPException(status_code=501, detail=str(exc)) from exc
 
     return app
+
+
+async def _stream_omni_generate(orchestrator: OmniCoordinator, request: OmniRequest):
+    events: list[dict[str, Any]] = []
+    stream_sink = OmniStreamSink(events.append)
+    try:
+        response, _ = orchestrator.generate_with_context(
+            request,
+            stream_sink=stream_sink,
+        )
+        stream_sink.done(serialize_response(response))
+    except (ValueError, RuntimeError) as exc:
+        stream_sink.error(message=str(exc), status_code=400)
+    for event in events:
+        yield _encode_sse_event(event)
+    yield b"data: [DONE]\n\n"
+
+
+def _encode_sse_event(event: dict[str, Any]) -> bytes:
+    return b"data: " + json.dumps(event, ensure_ascii=False).encode("utf-8") + b"\n\n"
 
 
 def create_sensenova_u1_app(

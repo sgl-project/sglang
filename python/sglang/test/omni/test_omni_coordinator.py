@@ -48,7 +48,12 @@ class _ScriptedARBackend:
         self.appended_inputs: list[OmniRequest] = []
         self.released_contexts: list[OmniContextBundle] = []
 
-    def begin_request_context(self, request: OmniRequest) -> OmniContextBundle:
+    def begin_request_context(
+        self,
+        request: OmniRequest,
+        *,
+        stream_sink=None,
+    ) -> OmniContextBundle:
         context_id = f"scripted-{next(self._counter)}"
         return OmniContextBundle(
             full=OmniContextRef(
@@ -59,12 +64,12 @@ class _ScriptedARBackend:
             )
         )
 
-    def append_input_segments(self, context, request):
+    def append_input_segments(self, context, request, *, stream_sink=None):
         self.appended_inputs.append(request)
         context.full.version += 1
         return context
 
-    def decode_until_boundary(self, context, *, request):
+    def decode_until_boundary(self, context, *, request, stream_sink=None):
         if not self._boundaries:
             return OmniBoundary(type="done")
         return self._boundaries.pop(0)
@@ -99,7 +104,12 @@ class _AlwaysImageARBackend:
     def __init__(self):
         self.released_contexts: list[OmniContextBundle] = []
 
-    def begin_request_context(self, request: OmniRequest) -> OmniContextBundle:
+    def begin_request_context(
+        self,
+        request: OmniRequest,
+        *,
+        stream_sink=None,
+    ) -> OmniContextBundle:
         return OmniContextBundle(
             full=OmniContextRef(
                 context_id=f"concurrent-{id(request)}",
@@ -107,10 +117,10 @@ class _AlwaysImageARBackend:
             )
         )
 
-    def append_input_segments(self, context, request):
+    def append_input_segments(self, context, request, *, stream_sink=None):
         return context
 
-    def decode_until_boundary(self, context, *, request):
+    def decode_until_boundary(self, context, *, request, stream_sink=None):
         decode_count = int(context.full.metadata.get("decode_count", 0))
         context.full.metadata["decode_count"] = decode_count + 1
         if decode_count == 0:

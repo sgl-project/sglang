@@ -341,19 +341,41 @@ class OmniSchedulerState:
         from sglang.omni.srt_transport import (
             handle_omni_generate_with_omni_coordinator,
         )
-        from sglang.srt.managers.io_struct import OmniGenerateReqOutput
+        from sglang.omni.streaming import OmniStreamSink
+        from sglang.srt.managers.io_struct import (
+            OmniGenerateReqOutput,
+            OmniGenerateStreamOutput,
+        )
 
+        def emit_stream_event(event: dict[str, Any]) -> None:
+            self.completed_task_outputs.put(
+                (
+                    OmniGenerateStreamOutput(rid=recv_req.rid, event=event),
+                    recv_req,
+                )
+            )
+            self.notify_scheduler_progress()
+
+        stream_sink = OmniStreamSink(emit_stream_event) if recv_req.stream else None
         try:
             payload = handle_omni_generate_with_omni_coordinator(
                 scheduler=scheduler,
                 payload=recv_req.payload,
+                stream_sink=stream_sink,
             )
+            if stream_sink is not None:
+                stream_sink.done(payload)
             output = OmniGenerateReqOutput(
                 rid=recv_req.rid,
                 success=True,
                 payload=payload,
             )
         except ValueError as exc:
+            if stream_sink is not None:
+                stream_sink.error(
+                    message=str(exc),
+                    status_code=int(HTTPStatus.BAD_REQUEST),
+                )
             output = OmniGenerateReqOutput(
                 rid=recv_req.rid,
                 success=False,
@@ -361,6 +383,11 @@ class OmniSchedulerState:
                 status_code=int(HTTPStatus.BAD_REQUEST),
             )
         except RuntimeError as exc:
+            if stream_sink is not None:
+                stream_sink.error(
+                    message=str(exc),
+                    status_code=int(HTTPStatus.NOT_IMPLEMENTED),
+                )
             output = OmniGenerateReqOutput(
                 rid=recv_req.rid,
                 success=False,
@@ -369,6 +396,11 @@ class OmniSchedulerState:
             )
         except Exception as exc:
             logger.exception("Failed to handle omni generate request")
+            if stream_sink is not None:
+                stream_sink.error(
+                    message=str(exc),
+                    status_code=int(HTTPStatus.INTERNAL_SERVER_ERROR),
+                )
             output = OmniGenerateReqOutput(
                 rid=recv_req.rid,
                 success=False,
@@ -377,6 +409,7 @@ class OmniSchedulerState:
             )
 
         self.completed_task_outputs.put((output, recv_req))
+        self.notify_scheduler_progress()
         with self.scheduler_condition:
             self.active_task_count = max(0, self.active_task_count - 1)
             self.scheduler_condition.notify_all()

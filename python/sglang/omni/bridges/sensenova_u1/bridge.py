@@ -32,6 +32,7 @@ from sglang.omni.bridges.sensenova_u1.context import (
     build_u1_native_t2i_prepared_input,
     build_u1_native_vlm_prepared_input,
 )
+from sglang.omni.streaming import STREAMED_TEXT_METADATA_KEY, OmniStreamSink
 from sglang.srt.omni_session.bridge import SRTBackedOmniSessionBridge
 from sglang.srt.omni_session.model_policy import (
     OmniModelAppendImageResult,
@@ -245,7 +246,11 @@ class U1OmniSessionModelPolicy(OmniModelPolicy):
         raise RuntimeError("SenseNova U1 decode requires the SRT-backed runtime path")
 
     def decode_next_segment_with_runtime(
-        self, *, runtime: OmniSessionRuntime, session: OmniModelSessionView
+        self,
+        *,
+        runtime: OmniSessionRuntime,
+        session: OmniModelSessionView,
+        stream_sink: OmniStreamSink | None = None,
     ) -> OmniDecodeResult | None:
         u1_state = (session.metadata or {}).get("omni_model_state", {}).get("u1", {})
         if bool(u1_state.get("native_interleave_prompt")):
@@ -253,6 +258,7 @@ class U1OmniSessionModelPolicy(OmniModelPolicy):
                 runtime=runtime,
                 session=session.handle,
                 u1_state=u1_state,
+                stream_sink=stream_sink,
             )
         if not self._has_generated_image_commit(session):
             return OmniDecodeResult(type="image_marker")
@@ -281,6 +287,7 @@ class U1OmniSessionModelPolicy(OmniModelPolicy):
         runtime: OmniSessionRuntime,
         session: OmniSessionHandle,
         u1_state: dict[str, Any],
+        stream_sink: OmniStreamSink | None = None,
     ) -> OmniDecodeResult:
         """decode until a boundary / marker / eos is met"""
         if self.native_tokenizer is None or runtime is None:
@@ -305,6 +312,7 @@ class U1OmniSessionModelPolicy(OmniModelPolicy):
             int(runtime.srt_ar_decode_max_new_tokens or 0),
         )
         generated_text_ids: list[int] = []
+        streamed_text = ""
         current_position = int(
             u1_state.get(
                 "generation_position_start",
@@ -366,6 +374,11 @@ class U1OmniSessionModelPolicy(OmniModelPolicy):
                             generated_text_ids,
                         ),
                         token_ids=tuple(generated_text_ids),
+                        metadata=(
+                            {STREAMED_TEXT_METADATA_KEY: True}
+                            if stream_sink is not None
+                            else {}
+                        ),
                     )
                 return OmniDecodeResult(type="image_marker")
             if token_id in eos_token_ids:
@@ -387,9 +400,26 @@ class U1OmniSessionModelPolicy(OmniModelPolicy):
                             generated_text_ids,
                         ),
                         token_ids=tuple(generated_text_ids),
+                        metadata=(
+                            {STREAMED_TEXT_METADATA_KEY: True}
+                            if stream_sink is not None
+                            else {}
+                        ),
                     )
                 return OmniDecodeResult(type="done")
             generated_text_ids.append(token_id)
+            if stream_sink is not None:
+                current_text = _u1_decode_token_ids(
+                    self.native_tokenizer,
+                    generated_text_ids,
+                )
+                delta = (
+                    current_text[len(streamed_text) :]
+                    if current_text.startswith(streamed_text)
+                    else current_text
+                )
+                streamed_text = current_text
+                stream_sink.text_delta(delta, token_id=token_id)
 
         self._merge_runtime_u1_state(
             runtime,
@@ -406,6 +436,11 @@ class U1OmniSessionModelPolicy(OmniModelPolicy):
                 type="text",
                 text=_u1_decode_token_ids(self.native_tokenizer, generated_text_ids),
                 token_ids=tuple(generated_text_ids),
+                metadata=(
+                    {STREAMED_TEXT_METADATA_KEY: True}
+                    if stream_sink is not None
+                    else {}
+                ),
             )
         return OmniDecodeResult(type="done")
 
@@ -545,6 +580,7 @@ class U1SRTBackedOmniSessionBridge(SRTBackedOmniSessionBridge):
         think_max_new_tokens: int | None = None,
         sampling_params: Any | None = None,
         session_id: str | None = None,
+        stream_sink: Any | None = None,
     ) -> OmniContextBundle:
         with self._temporary_generation_settings(sampling_params, think=think):
             bridge_think = (
@@ -559,6 +595,7 @@ class U1SRTBackedOmniSessionBridge(SRTBackedOmniSessionBridge):
                 think_max_new_tokens=think_max_new_tokens,
                 sampling_params=sampling_params,
                 session_id=session_id,
+                stream_sink=stream_sink,
             )
         return contexts
 
@@ -626,8 +663,16 @@ class U1SRTBackedOmniSessionBridge(SRTBackedOmniSessionBridge):
     def release(self, contexts: OmniContextBundle) -> None:
         self._bridge.release(contexts)
 
-    def continue_ar_decode(self, *, contexts: OmniContextBundle) -> OmniDecodeResult:
-        return self._bridge.continue_ar_decode(contexts=contexts)
+    def continue_ar_decode(
+        self,
+        *,
+        contexts: OmniContextBundle,
+        stream_sink: Any | None = None,
+    ) -> OmniDecodeResult:
+        return self._bridge.continue_ar_decode(
+            contexts=contexts,
+            stream_sink=stream_sink,
+        )
 
     def _commit_interleave_text_uncondition_path(
         self,

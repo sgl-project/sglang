@@ -52,6 +52,7 @@ class SRTBackedOmniSessionBridge:
         think_max_new_tokens: int | None = None,
         sampling_params: Any | None = None,
         session_id: str | None = None,
+        stream_sink: Any | None = None,
     ) -> OmniContextBundle:
         messages = normalize_omni_interleaved_messages(messages)
         session = self.runtime.prefill_interleaved(messages, session_id=session_id)
@@ -80,19 +81,22 @@ class SRTBackedOmniSessionBridge:
 
             # decode until first segment
             for _ in range(self.max_pre_image_decode_steps):
-                segment = self.runtime.decode_next_segment(session)
+                segment = self.runtime.decode_next_segment(
+                    session,
+                    stream_sink=stream_sink,
+                )
                 if segment.type == "image_marker":
                     break
                 if segment.type == "text":
+                    metadata = dict(segment.metadata)
+                    metadata["token_ids"] = [
+                        int(token_id) for token_id in segment.token_ids
+                    ]
                     pre_image_segments.append(
                         {
                             "type": "text",
                             "text": segment.text or "",
-                            "metadata": {
-                                "token_ids": [
-                                    int(token_id) for token_id in segment.token_ids
-                                ]
-                            },
+                            "metadata": metadata,
                         }
                     )
                     continue
@@ -155,11 +159,19 @@ class SRTBackedOmniSessionBridge:
         if contexts.full.session is not None:
             self.runtime.close_session(contexts.full.session)
 
-    def continue_ar_decode(self, *, contexts: OmniContextBundle) -> OmniDecodeResult:
+    def continue_ar_decode(
+        self,
+        *,
+        contexts: OmniContextBundle,
+        stream_sink: Any | None = None,
+    ) -> OmniDecodeResult:
         """continue interleaved AR decode from an SRT-owned context bundle"""
         if contexts.full.session is None:
             raise ValueError("SRT-backed omni contexts require a session handle")
-        return self.runtime.decode_next_segment(contexts.full.session)
+        return self.runtime.decode_next_segment(
+            contexts.full.session,
+            stream_sink=stream_sink,
+        )
 
     def _decode_thinking_text(
         self,

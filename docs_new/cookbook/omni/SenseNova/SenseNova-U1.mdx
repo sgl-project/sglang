@@ -128,6 +128,27 @@ SenseNova U1 supports familiar SGLang text/VLM APIs, the native omni endpoint, a
 
 For single-turn text-to-image or image editing, only the `task` and `messages` fields change. For example, `task: "t2i"` uses a text segment as input, while `task: "edit"` uses an image segment plus a text instruction.
 
+`/v1/omni/generate` supports both JSON and streaming responses. Set `stream: true`
+to receive Server-Sent Events: text arrives as `text_delta` events, image
+generation emits `image_start` so clients can render a placeholder, and the final
+`image` event carries the generated payload.
+
+```bash Command
+curl -N http://localhost:30000/v1/omni/generate \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "sensenova-u1",
+    "task": "interleave",
+    "stream": true,
+    "messages": [
+      {"type": "text", "text": "Create one image, then describe it."}
+    ],
+    "sampling_params": {"width": 1024, "height": 1024, "num_steps": 50},
+    "max_images": 1,
+    "max_text_segments": 2
+  }'
+```
+
 The `/v1/responses` adapter is a non-streaming MVP. It supports text input, base64/data URL image input, `size`, `action`, metadata sampling overrides, and `previous_response_id` for multi-turn continuation. Streaming, background mode, file IDs, and remote image URLs are not covered by this first adapter. When the adapter stores an omni session, the response metadata includes `omni_session_id`; close it with `/v1/omni/sessions/{session_id}/close` when the workflow is complete.
 
 ```python Example
@@ -227,7 +248,7 @@ python -m sglang.omni.webui.server \
   --api-base http://127.0.0.1:30000
 ```
 
-Open `http://127.0.0.1:7860`, click `Load turn 1`, generate, then click `Load turn 2` and generate again. The UI keeps the returned `session.id` so turn 2 can refer to and edit the image generated in turn 1.
+Open `http://127.0.0.1:7860`, click `Preset: first image`, send the first turn, then click `Preset: edit previous` and send again. The UI streams text deltas, shows an image placeholder while generation is running, and keeps the returned `session.id` so turn 2 can refer to and edit the image generated in turn 1.
 
 The WebUI is a local development proxy for `/v1/omni/generate`; do not expose it directly to an untrusted network.
 
@@ -337,6 +358,7 @@ Omni control fields:
 | `task` | `interleave` | Request-level task selector; can also be passed inside `sampling_params`. `mode` is accepted as a legacy alias. |
 | `max_images` | `1` | Upper bound for generated image segments |
 | `max_text_segments` | `8` | Upper bound for generated text segments |
+| `stream` | `false` | Return `/v1/omni/generate` as SSE events instead of one JSON object |
 | `keep_session` | `false` | Keeps the SRT session/KV alive for later turns |
 | `session_id` | unset | Continue an existing session |
 | `think` | `false` | Enables model-specific thinking behavior when supported |

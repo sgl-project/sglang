@@ -91,6 +91,7 @@ class OmniModelPolicy:
         *,
         runtime: OmniSessionRuntime,
         session: OmniModelSessionView,
+        stream_sink: Any | None = None,
     ) -> OmniDecodeResult | None:
         """decode until a new segment is generated
         override boundary decode when the model needs live SRT runtime access"""

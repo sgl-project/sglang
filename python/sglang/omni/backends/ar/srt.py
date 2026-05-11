@@ -25,6 +25,7 @@ from sglang.omni.protocol import (
     OmniRequest,
     TemporaryForwardPrepared,
 )
+from sglang.omni.streaming import STREAMED_TEXT_METADATA_KEY, OmniStreamSink
 from sglang.srt.omni_session.bridge import SRTBackedOmniSessionBridge
 from sglang.srt.omni_session.runtime import (
     OmniDecodeResult,
@@ -102,11 +103,19 @@ class SRTARBackend(ARBackend):
     def __init__(self, bridge: SRTBackedOmniSessionBridge):
         self.bridge = bridge
 
-    def begin_request_context(self, request: OmniRequest) -> OmniContextBundle:
+    def begin_request_context(
+        self,
+        request: OmniRequest,
+        *,
+        stream_sink: OmniStreamSink | None = None,
+    ) -> OmniContextBundle:
         if request.mode == "vlm":
             return self._prefill_and_decode_vlm_answer(request)
 
-        context = self._prefill_and_decode_to_image_boundary(request)
+        context = self._prefill_and_decode_to_image_boundary(
+            request,
+            stream_sink=stream_sink,
+        )
         context.metadata["pending_boundaries"] = _initial_boundaries(
             context, mode=request.mode
         )
@@ -116,6 +125,8 @@ class SRTARBackend(ARBackend):
         self,
         context: OmniContextBundle,
         request: OmniRequest,
+        *,
+        stream_sink: OmniStreamSink | None = None,
     ) -> OmniContextBundle:
         if request.mode == "vlm":
             raise ValueError("Persistent omni sessions do not support vlm mode")
@@ -123,7 +134,9 @@ class SRTARBackend(ARBackend):
             raise ValueError("Cannot continue a vlm context as an omni session")
         session_id = _session_id_for_context(context)
         context = self._prefill_and_decode_to_image_boundary(
-            request, session_id=session_id
+            request,
+            session_id=session_id,
+            stream_sink=stream_sink,
         )
         context.metadata["pending_boundaries"] = _initial_boundaries(
             context, mode=request.mode
@@ -135,6 +148,7 @@ class SRTARBackend(ARBackend):
         request: OmniRequest,
         *,
         session_id: str | None = None,
+        stream_sink: OmniStreamSink | None = None,
     ) -> OmniContextBundle:
         context = _srt_context_bundle_to_omni(
             self.bridge.prefill_and_decode_to_image_boundary(
@@ -143,6 +157,7 @@ class SRTARBackend(ARBackend):
                 think_max_new_tokens=request.think_max_new_tokens,
                 sampling_params=request.sampling_params,
                 session_id=session_id,
+                stream_sink=stream_sink,
             )
         )
         return context
@@ -152,12 +167,16 @@ class SRTARBackend(ARBackend):
         context: OmniContextBundle,
         *,
         request: OmniRequest,
+        stream_sink: OmniStreamSink | None = None,
     ) -> OmniBoundary:
         pending_boundaries = context.metadata.get("pending_boundaries")
         if pending_boundaries:
             return pending_boundaries.pop(0)
         return _decode_result_to_boundary(
-            self.bridge.continue_ar_decode(contexts=_srt_backend_context(context))
+            self.bridge.continue_ar_decode(
+                contexts=_srt_backend_context(context),
+                stream_sink=stream_sink,
+            )
         )
 
     def append_generated_segment(
@@ -249,6 +268,7 @@ def _decode_result_to_boundary(boundary: OmniDecodeResult) -> OmniBoundary:
         type=boundary_type,
         text=boundary.text,
         token_ids=boundary.token_ids,
+        metadata=dict(boundary.metadata),
     )
 
 
@@ -372,6 +392,12 @@ def _pre_image_segments_to_boundaries(
             boundaries.append(_pre_image_segment_to_boundary(segment))
             continue
         boundary = _pre_image_segment_to_boundary(segment)
+        if (
+            text_parts
+            and text_metadata.get(STREAMED_TEXT_METADATA_KEY)
+            != boundary.metadata.get(STREAMED_TEXT_METADATA_KEY)
+        ):
+            flush_text()
         text_parts.append(boundary.text or "")
         text_token_ids.extend(int(token_id) for token_id in boundary.token_ids)
         if boundary.metadata:

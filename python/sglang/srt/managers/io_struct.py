@@ -1824,6 +1824,7 @@ class VertexGenerateReqInput(BaseReq):
 @dataclass
 class OmniGenerateReqInput(BaseReq):
     payload: Dict[str, Any]
+    stream: bool = False
 
 
 @dataclass
@@ -1832,6 +1833,11 @@ class OmniGenerateReqOutput(BaseReq):
     payload: Optional[Dict[str, Any]] = None
     message: str = ""
     status_code: int = 200
+
+
+@dataclass
+class OmniGenerateStreamOutput(BaseReq):
+    event: Dict[str, Any]
 
 
 @dataclass

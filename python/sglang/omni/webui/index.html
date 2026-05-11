@@ -365,6 +365,37 @@
       background: #eee6d8;
     }
 
+    .image-placeholder {
+      position: relative;
+      display: grid;
+      place-items: center;
+      overflow: hidden;
+      width: min(100%, 560px);
+      min-height: 220px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background:
+        linear-gradient(120deg, rgba(252, 255, 253, 0.96), rgba(229, 237, 233, 0.96)),
+        repeating-linear-gradient(45deg, rgba(178, 79, 53, 0.08) 0 8px, rgba(29, 107, 107, 0.07) 8px 16px);
+      color: var(--accent-2);
+      font-family: ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      font-size: 13px;
+      font-weight: 750;
+    }
+
+    .image-placeholder::after {
+      content: "";
+      position: absolute;
+      inset: 0;
+      transform: translateX(-100%);
+      background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.56), transparent);
+      animation: imageSweep 1.4s ease-in-out infinite;
+    }
+
+    @keyframes imageSweep {
+      100% { transform: translateX(100%); }
+    }
+
     .error {
       color: var(--danger);
       white-space: pre-wrap;
@@ -413,6 +444,10 @@
       .typing-dots span {
         animation: none;
         opacity: 0.65;
+      }
+
+      .image-placeholder::after {
+        animation: none;
       }
     }
 
@@ -640,7 +675,7 @@
       turn.append(meta, body);
       feed.append(turn);
       turn.scrollIntoView({block: "end", behavior: "smooth"});
-      return {turn, body};
+      return {turn, body, payload};
     }
 
     function renderTurnBody(body, prompt, data, error) {
@@ -669,7 +704,9 @@
     function appendPendingTurn(prompt, payload) {
       const pending = appendTurnShell(prompt, payload);
       pending.turn.classList.add("pending");
-      pending.body.appendChild(renderPendingStatus());
+      pending.segments = new Map();
+      pending.status = renderPendingStatus("Generating");
+      pending.body.appendChild(pending.status);
       return pending;
     }
 
@@ -679,14 +716,19 @@
       pending.turn.scrollIntoView({block: "end", behavior: "smooth"});
     }
 
-    function renderPendingStatus() {
+    function renderPendingStatus(text) {
       const status = makeEl("div", "pending-status");
       status.setAttribute("aria-live", "polite");
       const dots = makeEl("span", "typing-dots");
       dots.setAttribute("aria-hidden", "true");
       dots.append(makeEl("span"), makeEl("span"), makeEl("span"));
-      status.append(dots, makeEl("span", "", "Generating"));
+      status.append(dots, makeEl("span", "pending-text", text || "Generating"));
       return status;
+    }
+
+    function setPendingStatus(pending, text) {
+      const label = pending.status?.querySelector(".pending-text");
+      if (label) label.textContent = text;
     }
 
     function renderSegment(segment) {
@@ -695,17 +737,93 @@
       if (segment.type === "text") {
         wrap.appendChild(makeEl("div", "text", segment.text || ""));
       } else if (segment.type === "image") {
-        const img = document.createElement("img");
-        const image = segment.image || {};
-        img.className = "image";
-        img.alt = "generated image";
-        img.src = image.url ||
-          `data:${image.mime_type || "image/png"};base64,${image.b64_json || ""}`;
-        wrap.appendChild(img);
+        wrap.appendChild(renderImage(segment.image || {}));
       } else {
         wrap.appendChild(makeEl("pre", "raw", JSON.stringify(segment, null, 2)));
       }
       return wrap;
+    }
+
+    function renderImage(image) {
+      const img = document.createElement("img");
+      img.className = "image";
+      img.alt = "generated image";
+      img.src = image.url ||
+        `data:${image.mime_type || "image/png"};base64,${image.b64_json || ""}`;
+      return img;
+    }
+
+    function renderImagePlaceholder(payload) {
+      const placeholder = makeEl("div", "image-placeholder", "Generating image");
+      const params = payload.sampling_params || {};
+      const width = Number(params.width || 1);
+      const height = Number(params.height || 1);
+      placeholder.style.aspectRatio = `${width} / ${height}`;
+      return placeholder;
+    }
+
+    function getLiveSegment(pending, segmentId, type) {
+      if (pending.segments.has(segmentId)) {
+        return pending.segments.get(segmentId);
+      }
+      const wrap = makeEl("div", "segment");
+      wrap.appendChild(makeEl("span", "tag", type));
+      const entry = {wrap, type};
+      if (type === "text") {
+        entry.content = makeEl("div", "text", "");
+        wrap.appendChild(entry.content);
+      } else if (type === "image") {
+        entry.content = renderImagePlaceholder(pending.payload || {});
+        wrap.appendChild(entry.content);
+      }
+      pending.segments.set(segmentId, entry);
+      pending.body.insertBefore(wrap, pending.status || null);
+      return entry;
+    }
+
+    function appendRawSummary(pending, event) {
+      const raw = makeEl("pre", "raw", JSON.stringify({
+        session: event.session || null,
+        stats: event.stats || null,
+        metadata: event.metadata || null
+      }, null, 2));
+      pending.body.appendChild(raw);
+    }
+
+    function finishPendingStream(pending) {
+      pending.turn.classList.remove("pending");
+      pending.status?.remove();
+      pending.status = null;
+      pending.turn.scrollIntoView({block: "end", behavior: "smooth"});
+    }
+
+    function appendStreamError(pending, message) {
+      pending.body.insertBefore(makeEl("div", "error", message), pending.status || null);
+      finishPendingStream(pending);
+    }
+
+    function handleStreamEvent(pending, event) {
+      if (event.type === "text_delta") {
+        const entry = getLiveSegment(pending, event.segment_id || "seg-text", "text");
+        entry.content.textContent += event.delta || "";
+        setPendingStatus(pending, "Writing");
+      } else if (event.type === "text_end") {
+        setPendingStatus(pending, "Thinking");
+      } else if (event.type === "image_start") {
+        getLiveSegment(pending, event.segment_id || "seg-image", "image");
+        setPendingStatus(pending, "Generating image");
+      } else if (event.type === "image") {
+        const entry = getLiveSegment(pending, event.segment_id || "seg-image", "image");
+        entry.content.replaceWith(renderImage(event.image || {}));
+        entry.content = entry.wrap.querySelector(".image");
+        setPendingStatus(pending, "Finishing");
+      } else if (event.type === "done") {
+        if (event.session && event.session.id) setSession(event.session.id);
+        finishPendingStream(pending);
+        appendRawSummary(pending, event);
+      } else if (event.type === "error") {
+        appendStreamError(pending, event.error?.message || "Generation failed");
+      }
     }
 
     function fileAsImageSegment(file) {
@@ -744,6 +862,7 @@
       const payload = {
         model: requestModel,
         task: $("task").value,
+        stream: true,
         messages,
         sampling_params: {
           width: Number($("width").value),
@@ -766,6 +885,44 @@
       return {payload, prompt};
     }
 
+    async function consumeEventStream(response, pending) {
+      if (!response.body) {
+        throw new Error("Streaming response is not readable");
+      }
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+      let sawDone = false;
+      while (true) {
+        const {value, done} = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, {stream: true});
+        let boundary = buffer.indexOf("\n\n");
+        while (boundary >= 0) {
+          const frame = buffer.slice(0, boundary).replace(/\r/g, "");
+          buffer = buffer.slice(boundary + 2);
+          const data = frame
+            .split("\n")
+            .filter((line) => line.startsWith("data:"))
+            .map((line) => line.slice(5).trimStart())
+            .join("\n");
+          if (data === "[DONE]") {
+            sawDone = true;
+          } else if (data) {
+            const event = JSON.parse(data);
+            handleStreamEvent(pending, event);
+            if (event.type === "done" || event.type === "error") {
+              sawDone = true;
+            }
+          }
+          boundary = buffer.indexOf("\n\n");
+        }
+      }
+      if (!sawDone) {
+        finishPendingStream(pending);
+      }
+    }
+
     async function send() {
       setBusy(true);
       let payload;
@@ -779,6 +936,14 @@
           headers: {"content-type": "application/json"},
           body: JSON.stringify(payload)
         });
+        if (
+          response.ok &&
+          response.body &&
+          (response.headers.get("content-type") || "").includes("text/event-stream")
+        ) {
+          await consumeEventStream(response, pending);
+          return;
+        }
         const text = await response.text();
         let data;
         try {

@@ -21,6 +21,7 @@ from sglang.omni.protocol import (
     OmniRequest,
     OmniResponse,
 )
+from sglang.omni.streaming import STREAMED_TEXT_METADATA_KEY, OmniStreamSink
 
 
 @dataclass(slots=True)
@@ -58,6 +59,7 @@ class OmniCoordinator:
         context: Any | None = None,
         release_context: bool = True,
         stop_after_generation_limit: bool = False,
+        stream_sink: OmniStreamSink | None = None,
     ) -> tuple[OmniResponse, Any]:
         """Generate a response for an omni request"""
         if self.request_adapter is not None:
@@ -74,10 +76,15 @@ class OmniCoordinator:
 
         if context is None:
             # prepare for the decode loop, usually includes prefill and decode to the first segment
-            context: OmniContextBundle = self.ar_backend.begin_request_context(request)
+            context: OmniContextBundle = self.ar_backend.begin_request_context(
+                request,
+                stream_sink=stream_sink,
+            )
         else:
             context: OmniContextBundle = self.ar_backend.append_input_segments(
-                context, request
+                context,
+                request,
+                stream_sink=stream_sink,
             )
 
         segments: list[OmniOutputSegment] = []
@@ -92,6 +99,7 @@ class OmniCoordinator:
                 boundary = self.ar_backend.decode_until_boundary(
                     context,
                     request=request,
+                    stream_sink=stream_sink,
                 )
 
                 if boundary.type == "done":
@@ -101,8 +109,15 @@ class OmniCoordinator:
                 if boundary.type == "text":
                     if num_text_segments >= request.max_text_segments:
                         break
+                    if stream_sink is not None:
+                        if boundary.metadata.get(STREAMED_TEXT_METADATA_KEY):
+                            stream_sink.finish_text()
+                        else:
+                            stream_sink.text_segment(boundary.text or "")
                     # text boundary: append and continue text gen
-                    segments.append(OmniOutputSegment.from_boundary(boundary))
+                    output_segment = OmniOutputSegment.from_boundary(boundary)
+                    output_segment.metadata.pop(STREAMED_TEXT_METADATA_KEY, None)
+                    segments.append(output_segment)
                     num_text_segments += 1
                     continue
 
@@ -115,6 +130,9 @@ class OmniCoordinator:
                 ):
                     break
 
+                stream_segment_id = (
+                    None if stream_sink is None else stream_sink.begin_image()
+                )
                 # 2. image boundary: switch to multimodal gen and generate a image segment
                 generated_segment = self._generate_segment(
                     request,
@@ -129,6 +147,12 @@ class OmniCoordinator:
                 # 3. build and append the OmniOutputSegment to result list
                 segments.append(OmniOutputSegment.from_generated(generated_segment))
                 num_multimodal_generated_segments += 1
+                if stream_sink is not None and stream_segment_id is not None:
+                    stream_sink.image(
+                        segment_id=stream_segment_id,
+                        image=generated_segment.image,
+                        metadata=generated_segment.metadata,
+                    )
 
                 # 4. update the context with ar_backend, get prepared for the next round
                 context = self.ar_backend.append_generated_segment(

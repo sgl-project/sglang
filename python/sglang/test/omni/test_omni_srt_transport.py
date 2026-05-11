@@ -15,7 +15,11 @@ from sglang.omni.protocol import (
 )
 from sglang.omni.scheduler_state import OmniSchedulerState
 from sglang.omni.srt_transport import handle_omni_generate_with_omni_coordinator
-from sglang.srt.managers.io_struct import OmniGenerateReqInput, OmniGenerateReqOutput
+from sglang.srt.managers.io_struct import (
+    OmniGenerateReqInput,
+    OmniGenerateReqOutput,
+    OmniGenerateStreamOutput,
+)
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
 
 
@@ -33,6 +37,7 @@ class FakeOrchestrator:
         context=None,
         release_context=True,
         stop_after_generation_limit=False,
+        stream_sink=None,
     ):
         self.requests.append(request)
         if context is None:
@@ -138,6 +143,9 @@ class TestOmniSRTTransport(unittest.TestCase):
     def test_tokenizer_manager_omni_generate_waits_for_scheduler_response(self):
         asyncio.run(self._run_tokenizer_manager_omni_generate())
 
+    def test_tokenizer_manager_omni_generate_stream_yields_scheduler_events(self):
+        asyncio.run(self._run_tokenizer_manager_omni_generate_stream())
+
     def test_srt_http_route_forwards_payload_to_tokenizer_manager(self):
         asyncio.run(self._run_srt_http_route())
 
@@ -170,6 +178,49 @@ class TestOmniSRTTransport(unittest.TestCase):
         response = await task
         self.assertTrue(response.success)
         self.assertEqual({"segments": []}, response.payload)
+
+    async def _run_tokenizer_manager_omni_generate_stream(self):
+        sender = FakeSender()
+        tokenizer_manager = SimpleNamespace(
+            auto_create_handle_loop=lambda: None,
+            omni_stream_queues={},
+            send_to_scheduler=sender,
+        )
+
+        async def collect():
+            return [
+                event
+                async for event in TokenizerManager.omni_generate_stream(
+                    tokenizer_manager,
+                    OmniGenerateReqInput(payload={"messages": [{"type": "text"}]}),
+                )
+            ]
+
+        task = asyncio.create_task(collect())
+        await asyncio.sleep(0)
+
+        self.assertIsNotNone(sender.obj.rid)
+        self.assertTrue(sender.obj.stream)
+        TokenizerManager._handle_omni_generate_stream_output(
+            tokenizer_manager,
+            OmniGenerateStreamOutput(
+                rid=sender.obj.rid,
+                event={
+                    "type": "text_delta",
+                    "segment_id": "seg-0",
+                    "delta": "ok",
+                },
+            ),
+        )
+        TokenizerManager._handle_omni_generate_req_output(
+            tokenizer_manager,
+            OmniGenerateReqOutput(rid=sender.obj.rid, success=True, payload={}),
+        )
+
+        self.assertEqual(
+            [{"type": "text_delta", "segment_id": "seg-0", "delta": "ok"}],
+            await task,
+        )
 
     async def _run_srt_http_route(self):
         tokenizer_manager = FakeTokenizerManager()

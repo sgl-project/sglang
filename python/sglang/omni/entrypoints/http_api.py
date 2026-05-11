@@ -3,10 +3,11 @@
 
 from __future__ import annotations
 
+import json
 from typing import Any, Callable
 
 from fastapi import APIRouter, Depends, Request
-from fastapi.responses import ORJSONResponse
+from fastapi.responses import ORJSONResponse, StreamingResponse
 
 from sglang.srt.managers.io_struct import OmniGenerateReqInput
 
@@ -22,6 +23,18 @@ def create_srt_omni_router(
     @router.post("/v1/omni/generate", dependencies=[Depends(validate_json_request)])
     async def omni_generate_request(raw_request: Request):
         payload = await raw_request.json()
+        if bool(payload.get("stream", False)):
+            request = OmniGenerateReqInput(payload=payload, stream=True)
+            return StreamingResponse(
+                _stream_omni_generate_events(
+                    get_tokenizer_manager(),
+                    request,
+                    raw_request,
+                ),
+                media_type="text/event-stream",
+                headers={"Cache-Control": "no-cache"},
+            )
+
         result = await get_tokenizer_manager().omni_generate(
             OmniGenerateReqInput(payload=payload),
             raw_request,
@@ -53,3 +66,29 @@ def create_srt_omni_router(
         )
 
     return router
+
+
+async def _stream_omni_generate_events(
+    tokenizer_manager: Any,
+    request: OmniGenerateReqInput,
+    raw_request: Request,
+):
+    try:
+        async for event in tokenizer_manager.omni_generate_stream(
+            request,
+            raw_request,
+        ):
+            yield _encode_sse_event(event)
+    except ValueError as exc:
+        yield _encode_sse_event(
+            {
+                "type": "error",
+                "error": {"message": str(exc)},
+                "status_code": 499,
+            }
+        )
+    yield b"data: [DONE]\n\n"
+
+
+def _encode_sse_event(event: dict[str, Any]) -> bytes:
+    return b"data: " + json.dumps(event, ensure_ascii=False).encode("utf-8") + b"\n\n"

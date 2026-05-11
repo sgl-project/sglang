@@ -17,6 +17,7 @@ from sglang.omni.configs.sensenova_u1 import (
 from sglang.omni.protocol import OmniContextBundle, OmniRequest
 from sglang.omni.scheduler_state import OmniSessionRecord
 from sglang.omni.serialization import serialize_response
+from sglang.omni.streaming import OmniStreamSink
 
 if TYPE_CHECKING:
     from sglang.omni.coordinator import OmniCoordinator
@@ -29,6 +30,7 @@ def handle_omni_generate_with_omni_coordinator(
     *,
     scheduler: "Scheduler",
     payload: dict[str, Any],
+    stream_sink: OmniStreamSink | None = None,
 ) -> dict[str, Any]:
     action = str(payload.get("action", "")).lower()
     if action == "close_session":
@@ -55,6 +57,7 @@ def handle_omni_generate_with_omni_coordinator(
         context=None if session_record is None else session_record.context,
         release_context=not keep_session,
         stop_after_generation_limit=keep_session,
+        stream_sink=stream_sink,
     )
     response_payload = serialize_response(response)
 

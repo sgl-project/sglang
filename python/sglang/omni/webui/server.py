@@ -41,7 +41,10 @@ class U1OmniUIHandler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         body = self.rfile.read(int(self.headers.get("content-length", "0") or 0))
         if self.path == "/api/omni/generate":
-            self._proxy("POST", "/v1/omni/generate", body)
+            if _is_stream_request(body):
+                self._proxy_stream("POST", "/v1/omni/generate", body)
+            else:
+                self._proxy("POST", "/v1/omni/generate", body)
         elif self.path == "/api/omni/close":
             payload = json.loads(body.decode("utf-8") or "{}")
             session_id = str(payload.get("session_id", "")).strip()
@@ -100,6 +103,38 @@ class U1OmniUIHandler(BaseHTTPRequestHandler):
         except Exception as exc:
             self._json(502, {"error": f"{exc.__class__.__name__}: {exc}"})
 
+    def _proxy_stream(self, method: str, path: str, body: bytes | None) -> None:
+        url = f"{self.api_base.rstrip('/')}{path}"
+        headers = {"content-type": "application/json"} if body is not None else {}
+        request = urllib.request.Request(url, data=body, headers=headers, method=method)
+        try:
+            with self.opener.open(request, timeout=900) as response:
+                self.send_response(response.status)
+                self.send_header(
+                    "content-type",
+                    response.headers.get("content-type", "text/event-stream"),
+                )
+                self.send_header("cache-control", "no-cache")
+                self.end_headers()
+                while True:
+                    chunk = response.read(65536)
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+                    self.wfile.flush()
+        except urllib.error.HTTPError as exc:
+            data = exc.read()
+            self.send_response(exc.code)
+            self.send_header(
+                "content-type",
+                exc.headers.get("content-type", "application/json"),
+            )
+            self.send_header("content-length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+        except Exception as exc:
+            self._json(502, {"error": f"{exc.__class__.__name__}: {exc}"})
+
     def _json(self, status: int, payload: dict) -> None:
         data = json.dumps(payload).encode("utf-8")
         self.send_response(status)
@@ -107,6 +142,16 @@ class U1OmniUIHandler(BaseHTTPRequestHandler):
         self.send_header("content-length", str(len(data)))
         self.end_headers()
         self.wfile.write(data)
+
+
+def _is_stream_request(body: bytes) -> bool:
+    if not body:
+        return False
+    try:
+        payload = json.loads(body.decode("utf-8"))
+    except json.JSONDecodeError:
+        return False
+    return bool(payload.get("stream", False))
 
 
 def main() -> None:

@@ -11,7 +11,10 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import asdict, dataclass, field
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
+
+if TYPE_CHECKING:
+    from sglang.omni.streaming import OmniStreamSink
 
 InputSegmentType = Literal["text", "image", "audio", "video"]
 OutputSegmentType = Literal["text", "image", "audio", "video"]
@@ -282,13 +285,20 @@ class ARBackend(ABC):
     """Autoregressive text/session backend used by omni orchestrator"""
 
     @abstractmethod
-    def begin_request_context(self, request: OmniRequest) -> OmniContextBundle: ...
+    def begin_request_context(
+        self,
+        request: OmniRequest,
+        *,
+        stream_sink: OmniStreamSink | None = None,
+    ) -> OmniContextBundle: ...
 
     @abstractmethod
     def append_input_segments(
         self,
         context: OmniContextBundle,
         request: OmniRequest,
+        *,
+        stream_sink: OmniStreamSink | None = None,
     ) -> OmniContextBundle: ...
 
     @abstractmethod
@@ -297,6 +307,7 @@ class ARBackend(ABC):
         context: OmniContextBundle,
         *,
         request: OmniRequest,
+        stream_sink: OmniStreamSink | None = None,
     ) -> OmniBoundary: ...
 
     @abstractmethod
