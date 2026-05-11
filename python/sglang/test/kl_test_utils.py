@@ -13,7 +13,7 @@ from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 LONGBENCH_V2_DATASET = "THUDM/LongBench-v2"
 LONGBENCH_V2_SPLIT = "train"
 DEFAULT_NUM_SAMPLES = 48  # Number of samples to use
-DEFAULT_PROMPT_TOKENS = 5120  # Maximum number of tokens to use
+DEFAULT_PROMPT_TOKENS = 8192  # Maximum number of tokens to use
 CACHE_DIR = os.path.join(os.path.dirname(__file__), ".longbench_cache")
 
 # In-memory cache for the current session
@@ -136,7 +136,7 @@ def _generate(
         "sampling_params": {
             "temperature": 0.0,
             "max_new_tokens": max_new_tokens,
-            "ignore_eos": False,
+            "ignore_eos": True,
         },
     }
     if return_logprob:

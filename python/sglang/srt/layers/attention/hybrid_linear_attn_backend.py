@@ -843,7 +843,9 @@ class HybridLinearAttnBackend(AttentionBackend):
         spec_info: Optional[SpecInput],
         seq_lens_cpu: Optional[torch.Tensor],
     ):
+        fb = getattr(self, "_replay_forward_batch", None)
         for attn_backend in self.attn_backend_list:
+            attn_backend._replay_forward_batch = fb
             attn_backend.init_forward_metadata_replay_cuda_graph(
                 bs,
                 req_pool_indices,
@@ -854,6 +856,7 @@ class HybridLinearAttnBackend(AttentionBackend):
                 spec_info,
                 seq_lens_cpu,
             )
+            attn_backend._replay_forward_batch = None
 
     def get_cuda_graph_seq_len_fill_value(self):
         return self.full_attn_backend.get_cuda_graph_seq_len_fill_value()
