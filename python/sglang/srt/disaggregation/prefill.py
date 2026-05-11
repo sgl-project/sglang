@@ -146,7 +146,11 @@ class PrefillBootstrapQueue:
         kv_args.engine_rank = self.tp_rank
         kv_args.pp_rank = self.pp_rank
         kv_args.system_dp_rank = self.scheduler.dp_rank
+        kv_args.prefill_pp_size = self.pp_size
         kv_args.prefill_start_layer = self.token_to_kv_pool.start_layer
+        kv_args.prefill_end_layer = self.token_to_kv_pool.end_layer
+        kv_args.mla_compression_ratios = None
+        kv_args.decode_tp_size = self.scheduler.tp_size
         kv_data_ptrs, kv_data_lens, kv_item_lens = (
             self.token_to_kv_pool.get_contiguous_buf_infos()
         )
@@ -178,6 +182,12 @@ class PrefillBootstrapQueue:
         kv_args.gpu_id = self.scheduler.gpu_id
 
         setup_state_kv_args(kv_args, self.token_to_kv_pool, self.draft_token_to_kv_pool)
+
+        # V4's KVCache is organized by compression-ratio buckets rather than by layer.
+        if hasattr(self.token_to_kv_pool, "compression_ratios"):
+            kv_args.mla_compression_ratios = list(
+                self.token_to_kv_pool.compression_ratios
+            )
 
         kv_manager_class = get_kv_class(self.transfer_backend, KVClassType.MANAGER)
         kv_manager = kv_manager_class(

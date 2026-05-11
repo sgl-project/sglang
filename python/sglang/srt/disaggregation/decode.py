@@ -334,6 +334,11 @@ class DecodePreallocQueue:
 
         kv_args.pp_rank = self.pp_rank
         kv_args.system_dp_rank = self.scheduler.dp_rank
+        kv_args.prefill_pp_size = 1
+        kv_args.prefill_start_layer = self.token_to_kv_pool.start_layer
+        kv_args.prefill_end_layer = self.token_to_kv_pool.end_layer
+        kv_args.mla_compression_ratios = None
+        kv_args.decode_tp_size = self.scheduler.tp_size
         if self.scheduler.enable_hisparse:
             # Direct-to-host: register host pool pointers so P writes to D's host memory
             host_pool = self.scheduler.hisparse_coordinator.mem_pool_host
@@ -367,6 +372,11 @@ class DecodePreallocQueue:
         )
 
         setup_state_kv_args(kv_args, self.token_to_kv_pool, self.draft_token_to_kv_pool)
+
+        if hasattr(self.token_to_kv_pool, "compression_ratios"):
+            kv_args.mla_compression_ratios = list(
+                self.token_to_kv_pool.compression_ratios
+            )
 
         kv_args.ib_device = self.scheduler.server_args.disaggregation_ib_device
         kv_args.gpu_id = self.scheduler.gpu_id
