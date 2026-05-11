@@ -7,6 +7,7 @@ import tilelang.language as T
 import torch
 
 from sglang.jit_kernel.utils import is_arch_support_pdl
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.nsa.utils import is_nsa_prefill_cp_round_robin_split
 from sglang.srt.layers.utils.common import strict_contiguous
 
@@ -138,12 +139,15 @@ def mhc_pre_big_fuse_tilelang(
     sinkhorn_repeat: int,
     n_splits: int = 16,
     hc_mult: int = 4,
+    gemm_last_dim: int = -1,
 ):
     num_tokens = T.dynamic("num_tokens")
     hc_mult3 = hc_mult * (2 + hc_mult)
+    if gemm_last_dim < 0:
+        gemm_last_dim = hc_mult3
     hidden_block = math.gcd(512, hidden_size)
 
-    gemm_out_mul: T.Tensor[[n_splits, num_tokens, hc_mult3], T.float32]
+    gemm_out_mul: T.Tensor[[n_splits, num_tokens, gemm_last_dim], T.float32]
     gemm_out_sqrsum: T.Tensor[[n_splits, num_tokens], T.float32]
     hc_scale: T.Tensor[[3], T.float32]
     hc_base: T.Tensor[[hc_mult3], T.float32]
@@ -438,6 +442,186 @@ def mhc_pre_gemm_sqrsum_splitk_kernel(
     )
 
 
+def _compute_num_split_for_mhc_pre(num_tokens: int, hc_hidden_size: int) -> int:
+    block_m, block_k = 64, 64
+    grid_size = (num_tokens + block_m - 1) // block_m
+    num_block_k = (hc_hidden_size + block_k - 1) // block_k
+    n_sms = torch.cuda.get_device_properties(0).multi_processor_count
+    return max(1, min(n_sms // max(grid_size, 1), num_block_k // 4))
+
+
+@tilelang.jit(
+    pass_configs={
+        tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
+        tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
+        tilelang.PassConfigKey.TL_PTXAS_REGISTER_USAGE_LEVEL: 10,
+    },
+)
+def mhc_pre_big_fuse_with_norm_tilelang(
+    gemm_out_mul,
+    gemm_out_sqrsum,
+    hc_scale,
+    hc_base,
+    residual,
+    post_mix,
+    comb_mix,
+    layer_input,
+    norm_weight,
+    hidden_size: int,
+    rms_eps: float,
+    hc_pre_eps: float,
+    hc_sinkhorn_eps: float,
+    hc_post_mult_value: float,
+    sinkhorn_repeat: int,
+    norm_eps: float,
+    n_splits: int = 16,
+    hc_mult: int = 4,
+    gemm_last_dim: int = -1,
+):
+    """Fused mhc_pre big_fuse + RMSNorm of layer_input.
+
+    Identical to mhc_pre_big_fuse_tilelang for the (post_mix, comb_mix) path.
+    For the layer_input path, the weighted-sum result is stashed in shared
+    memory while accumulating sum_sq, then a second pipelined sweep applies
+    rsqrt(sum_sq/D + norm_eps) * norm_weight before writing to HBM.
+    """
+    num_tokens = T.dynamic("num_tokens")
+    hc_mult3 = hc_mult * (2 + hc_mult)
+    if gemm_last_dim < 0:
+        gemm_last_dim = hc_mult3
+    hidden_block = math.gcd(1024, hidden_size)
+
+    gemm_out_mul: T.Tensor[[n_splits, num_tokens, gemm_last_dim], T.float32]
+    gemm_out_sqrsum: T.Tensor[[n_splits, num_tokens], T.float32]
+    hc_scale: T.Tensor[[3], T.float32]
+    hc_base: T.Tensor[[hc_mult3], T.float32]
+    residual: T.Tensor[[num_tokens, hc_mult, hidden_size], T.bfloat16]
+    post_mix: T.Tensor[[num_tokens, hc_mult], T.float32]
+    comb_mix: T.Tensor[[num_tokens, hc_mult * hc_mult], T.float32]
+    layer_input: T.Tensor[[num_tokens, hidden_size], T.bfloat16]
+    norm_weight: T.Tensor[[hidden_size], T.bfloat16]
+
+    ENABLE_PDL = is_arch_support_pdl()
+    with T.Kernel(num_tokens, threads=96) as i:
+        rms = T.alloc_fragment(1, T.float32)
+        mixes = T.alloc_fragment(hc_mult3, T.float32)
+        T.clear(mixes)
+        rms[0] = 0
+
+        if ENABLE_PDL:
+            T.pdl_sync()
+
+        for i_split in T.serial(n_splits):
+            rms[0] += gemm_out_sqrsum[i_split, i]
+        rms[0] = T.rsqrt(rms[0] / (hc_mult * hidden_size) + rms_eps)
+        for j in T.Parallel(hc_mult3):
+            mixes[j] = 0
+            for i_split in T.serial(n_splits):
+                mixes[j] += gemm_out_mul[i_split, i, j]
+            mixes[j] *= rms[0]
+        mixes_shared = T.alloc_shared(hc_mult3, T.float32)
+        T.copy(mixes, mixes_shared)
+
+        if T.get_thread_binding() < 32:
+            cm = T.alloc_fragment((hc_mult, hc_mult), T.float32)
+            for j in T.Parallel(hc_mult):
+                post_mix[i, j] = (
+                    T.sigmoid(
+                        mixes_shared[j + hc_mult] * hc_scale[1] + hc_base[j + hc_mult]
+                    )
+                    * hc_post_mult_value
+                )
+            for j, k in T.Parallel(hc_mult, hc_mult):
+                cm[j, k] = (
+                    mixes_shared[j * hc_mult + k + hc_mult * 2] * hc_scale[2]
+                    + hc_base[j * hc_mult + k + hc_mult * 2]
+                )
+
+            row_sum = T.alloc_fragment(hc_mult, T.float32)
+            col_sum = T.alloc_fragment(hc_mult, T.float32)
+
+            row_max = T.alloc_fragment(hc_mult, T.float32)
+            T.reduce_max(cm, row_max, dim=1)
+            for j, k in T.Parallel(hc_mult, hc_mult):
+                cm[j, k] = T.exp(cm[j, k] - row_max[j])
+            T.reduce_sum(cm, row_sum, dim=1)
+            for j, k in T.Parallel(hc_mult, hc_mult):
+                cm[j, k] = cm[j, k] / row_sum[j] + hc_sinkhorn_eps
+
+            T.reduce_sum(cm, col_sum, dim=0)
+            for j, k in T.Parallel(hc_mult, hc_mult):
+                cm[j, k] = cm[j, k] / (col_sum[k] + hc_sinkhorn_eps)
+
+            for _ in T.serial(sinkhorn_repeat - 1):
+                T.reduce_sum(cm, row_sum, dim=1)
+                for j, k in T.Parallel(hc_mult, hc_mult):
+                    cm[j, k] = cm[j, k] / (row_sum[j] + hc_sinkhorn_eps)
+
+                T.reduce_sum(cm, col_sum, dim=0)
+                for j, k in T.Parallel(hc_mult, hc_mult):
+                    cm[j, k] = cm[j, k] / (col_sum[k] + hc_sinkhorn_eps)
+
+            for j, k in T.Parallel(hc_mult, hc_mult):
+                comb_mix[i, j * hc_mult + k] = cm[j, k]
+        else:
+            pre_mix_shared = T.alloc_shared(hc_mult, T.float32)
+            for j in T.Parallel(hc_mult):
+                pre_mix_shared[j] = (
+                    T.sigmoid(
+                        mixes_shared[j] * hc_scale[0] + hc_base[j],
+                    )
+                    + hc_pre_eps
+                )
+
+            # Stash unnormalized weighted-sum output in shared memory as bf16
+            # (matches the rounding the reference path does when RMSNorm reads bf16).
+            output_shared = T.alloc_shared(hidden_size, T.bfloat16)
+            sumsq_per_pos = T.alloc_fragment(hidden_block, T.float32)
+            T.clear(sumsq_per_pos)
+
+            for i0_h in T.Pipelined(hidden_size // hidden_block, num_stages=3):
+                xs = T.alloc_shared((hc_mult, hidden_block), T.bfloat16)
+                xl = T.alloc_fragment((hc_mult, hidden_block), T.float32)
+                T.copy(residual[i, 0, i0_h * hidden_block], xs)
+                T.copy(xs, xl)
+
+                ol = T.alloc_fragment(hidden_block, T.float32)
+                T.clear(ol)
+
+                for i_hc in T.serial(hc_mult):
+                    pre = pre_mix_shared[i_hc]
+                    for i1_h in T.Parallel(hidden_block):
+                        ol[i1_h] += pre * xl[i_hc, i1_h]
+
+                for i1_h in T.Parallel(hidden_block):
+                    sumsq_per_pos[i1_h] += ol[i1_h] * ol[i1_h]
+                    output_shared[i0_h * hidden_block + i1_h] = T.bfloat16(ol[i1_h])
+
+            sumsq = T.alloc_fragment(1, T.float32)
+            T.reduce_sum(sumsq_per_pos, sumsq, dim=0)
+            rsqrt_norm = T.alloc_fragment(1, T.float32)
+            rsqrt_norm[0] = T.rsqrt(sumsq[0] / hidden_size + norm_eps)
+
+            for i0_h in T.Pipelined(hidden_size // hidden_block, num_stages=2):
+                w_shared = T.alloc_shared(hidden_block, T.bfloat16)
+                w_local = T.alloc_fragment(hidden_block, T.float32)
+                T.copy(norm_weight[i0_h * hidden_block], w_shared)
+                T.copy(w_shared, w_local)
+
+                ol = T.alloc_fragment(hidden_block, T.float32)
+                for i1_h in T.Parallel(hidden_block):
+                    ol[i1_h] = (
+                        output_shared[i0_h * hidden_block + i1_h]
+                        * rsqrt_norm[0]
+                        * w_local[i1_h]
+                    )
+
+                T.copy(ol, layer_input[i, i0_h * hidden_block])
+
+        if ENABLE_PDL:
+            T.pdl_trigger()
+
+
 def mhc_pre(
     residual: torch.Tensor,
     fn: torch.Tensor,
@@ -450,6 +634,9 @@ def mhc_pre(
     sinkhorn_repeat: int,
     n_splits: int = 1,
     n_splits_pre: int = 32,
+    *,
+    norm_weight: torch.Tensor | None = None,
+    norm_eps: float | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
 
     assert residual.dtype == torch.bfloat16
@@ -484,77 +671,145 @@ def mhc_pre(
         num_tokens, hidden_size, dtype=torch.bfloat16, device=residual.device
     )
 
-    gemm_out_mul = torch.empty(
-        n_splits, num_tokens, hc_mult3, dtype=torch.float32, device=residual.device
-    )
-    gemm_out_sqrsum = torch.empty(
-        n_splits, num_tokens, dtype=torch.float32, device=residual.device
-    )
+    if envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.get():
+        import deep_gemm
 
-    if num_tokens <= 2048:
-        assert n_splits == 1
-        if hc_hidden_size == 16384:
-            hidden_block = 256
-        elif hc_hidden_size == 28672:
-            hidden_block = 128
-        else:
-            raise NotImplementedError(
-                f"mhc_pre splitk kernel only supports hc_hidden_size in {{16384, 28672}}, "
-                f"got {hc_hidden_size}"
-            )
-        kernel_0, kernel_1 = mhc_pre_gemm_sqrsum_splitk_kernel(
-            hc_mult3,
-            hc_hidden_size,
-            split_k=n_splits_pre,
-            token_block=32,
-            hidden_block=hidden_block,
+        n_splits = _compute_num_split_for_mhc_pre(num_tokens, hc_hidden_size)
+
+        gemm_out_mul = torch.empty(
+            n_splits, num_tokens, hc_mult3, dtype=torch.float32, device=residual.device
         )
-        partial_out = gemm_out_mul.new_empty(n_splits_pre, num_tokens, 32)
-        partial_sqrsum = gemm_out_sqrsum.new_empty(n_splits_pre, num_tokens)
-        kernel_0(
+        gemm_out_sqrsum = torch.empty(
+            n_splits, num_tokens, dtype=torch.float32, device=residual.device
+        )
+
+        deep_gemm.tf32_hc_prenorm_gemm(
             residual_flat.view(num_tokens, hc_hidden_size),
             fn_flat,
-            partial_out,
-            partial_sqrsum,
+            gemm_out_mul,
+            gemm_out_sqrsum,
+            num_splits=n_splits,
         )
-        kernel_1(
-            partial_out,
-            partial_sqrsum,
-            gemm_out_mul.squeeze(0),
-            gemm_out_sqrsum.squeeze(0),
-        )
-        del partial_out, partial_sqrsum
+        gemm_last_dim = hc_mult3
+        big_fuse_n_splits = n_splits
     else:
-        assert (
-            n_splits == 1
-        ), "The simple TileLang version gemm_sqrsum doesn't support split-k"
-        mhc_pre_gemm_sqrsum_tilelang(
-            residual_flat.view(num_tokens, hc_mult * hidden_size),
-            fn_flat,
-            gemm_out_mul.squeeze(0),
-            gemm_out_sqrsum.squeeze(0),
-            hc_mult3,
-            hc_mult * hidden_size,
-        )
+        if num_tokens <= 2048:
+            assert n_splits == 1
+            if hc_hidden_size == 16384:
+                hidden_block = 256
+            elif hc_hidden_size == 28672:
+                hidden_block = 128
+            else:
+                raise NotImplementedError(
+                    f"mhc_pre splitk kernel only supports hc_hidden_size in {{16384, 28672}}, "
+                    f"got {hc_hidden_size}"
+                )
+            kernel_0, _ = mhc_pre_gemm_sqrsum_splitk_kernel(
+                hc_mult3,
+                hc_hidden_size,
+                split_k=n_splits_pre,
+                token_block=32,
+                hidden_block=hidden_block,
+            )
+            partial_out = torch.empty(
+                n_splits_pre,
+                num_tokens,
+                32,
+                dtype=torch.float32,
+                device=residual.device,
+            )
+            partial_sqrsum = torch.empty(
+                n_splits_pre, num_tokens, dtype=torch.float32, device=residual.device
+            )
+            kernel_0(
+                residual_flat.view(num_tokens, hc_hidden_size),
+                fn_flat,
+                partial_out,
+                partial_sqrsum,
+            )
+            # Stage_1 reduction is folded into big_fuse below; skip launching it.
+            gemm_out_mul = partial_out
+            gemm_out_sqrsum = partial_sqrsum
+            gemm_last_dim = 32
+            big_fuse_n_splits = n_splits_pre
+        else:
+            gemm_out_mul = torch.empty(
+                n_splits,
+                num_tokens,
+                hc_mult3,
+                dtype=torch.float32,
+                device=residual.device,
+            )
+            gemm_out_sqrsum = torch.empty(
+                n_splits, num_tokens, dtype=torch.float32, device=residual.device
+            )
+            assert (
+                n_splits == 1
+            ), "The simple TileLang version gemm_sqrsum doesn't support split-k"
+            mhc_pre_gemm_sqrsum_tilelang(
+                residual_flat.view(num_tokens, hc_mult * hidden_size),
+                fn_flat,
+                gemm_out_mul.squeeze(0),
+                gemm_out_sqrsum.squeeze(0),
+                hc_mult3,
+                hc_mult * hidden_size,
+            )
+            gemm_last_dim = hc_mult3
+            big_fuse_n_splits = n_splits
 
-    mhc_pre_big_fuse_tilelang(
-        gemm_out_mul,
-        gemm_out_sqrsum,
-        hc_scale,
-        hc_base,
-        residual_flat,
-        post_mix,
-        comb_mix,
-        layer_input,
-        hidden_size,
-        rms_eps,
-        hc_pre_eps,
-        hc_sinkhorn_eps,
-        hc_post_mult_value,
-        sinkhorn_repeat,
-        n_splits,
-        hc_mult,
-    )
+    if norm_weight is not None:
+        assert norm_eps is not None, "norm_eps required when norm_weight is provided"
+        assert norm_weight.shape == (
+            hidden_size,
+        ), f"norm_weight shape {tuple(norm_weight.shape)} != (hidden_size={hidden_size},)"
+        norm_weight_bf = (
+            norm_weight.bfloat16()
+            if norm_weight.dtype != torch.bfloat16
+            else norm_weight
+        )
+        if not norm_weight_bf.is_contiguous():
+            norm_weight_bf = norm_weight_bf.contiguous()
+        mhc_pre_big_fuse_with_norm_tilelang(
+            gemm_out_mul,
+            gemm_out_sqrsum,
+            hc_scale,
+            hc_base,
+            residual_flat,
+            post_mix,
+            comb_mix,
+            layer_input,
+            norm_weight_bf,
+            hidden_size,
+            rms_eps,
+            hc_pre_eps,
+            hc_sinkhorn_eps,
+            hc_post_mult_value,
+            sinkhorn_repeat,
+            norm_eps,
+            big_fuse_n_splits,
+            hc_mult,
+            gemm_last_dim,
+        )
+    else:
+        mhc_pre_big_fuse_tilelang(
+            gemm_out_mul,
+            gemm_out_sqrsum,
+            hc_scale,
+            hc_base,
+            residual_flat,
+            post_mix,
+            comb_mix,
+            layer_input,
+            hidden_size,
+            rms_eps,
+            hc_pre_eps,
+            hc_sinkhorn_eps,
+            hc_post_mult_value,
+            sinkhorn_repeat,
+            big_fuse_n_splits,
+            hc_mult,
+            gemm_last_dim,
+        )
 
     post_mix = post_mix.view(*outer_shape, hc_mult, 1)
     comb_mix = comb_mix.view(*outer_shape, hc_mult, hc_mult)

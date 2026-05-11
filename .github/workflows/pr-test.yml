@@ -1212,7 +1212,6 @@ jobs:
     timeout-minutes: 240
     env:
       SGLANG_CI_RDMA_ALL_DEVICES: "mlx5_1,mlx5_2,mlx5_3,mlx5_4"
-      CU_VERSION: cu129
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -1488,7 +1487,7 @@ jobs:
       - name: Install dependencies
         timeout-minutes: 30
         run: |
-          CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/cuda/ci_install_flash_mla.sh
+          CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/cuda/ci_install_dsv4_dep.sh
 
       - name: Run test
         timeout-minutes: 30
@@ -1541,7 +1540,7 @@ jobs:
       - name: Install dependencies
         timeout-minutes: 30
         run: |
-          CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/cuda/ci_install_flash_mla.sh
+          CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/cuda/ci_install_dsv4_dep.sh
 
       - name: Run test
         timeout-minutes: 30
