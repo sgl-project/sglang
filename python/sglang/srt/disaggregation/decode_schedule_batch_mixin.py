@@ -182,3 +182,60 @@ class ScheduleBatchDisaggregationDecodeMixin:
                     spec_info.future_indices, spec_info
                 )
             self.spec_info = spec_info
+
+        elif self.spec_algorithm.is_dflash():
+            # Initialize DFLASH draft input for PD disaggregation.
+            # The draft KV cache is already transferred from the prefill side via
+            # RDMA, so no target_hidden materialization is needed on first decode.
+            bs = len(self.reqs)
+
+            if self.enable_overlap:
+                # Overlap (spec_v2) mode uses DFlashDraftInputV2.
+                from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
+
+                cur_allocated_seq_lens_cpu = torch.tensor(
+                    [int(req.kv_allocated_len) for req in self.reqs],
+                    dtype=torch.int32,
+                )
+                spec_info = DFlashDraftInputV2(
+                    topk_p=torch.empty(
+                        (bs, 0), device=self.device, dtype=torch.float32
+                    ),
+                    topk_index=torch.empty(
+                        (bs, 0), device=self.device, dtype=torch.int64
+                    ),
+                    verified_id=self.output_ids.to(dtype=torch.int32),
+                    new_seq_lens=self.seq_lens.to(dtype=torch.int32),
+                    hidden_states=torch.empty(
+                        (bs, 0), device=self.device, dtype=torch.float16
+                    ),
+                    verify_done=None,
+                    cur_allocated_seq_lens_cpu=cur_allocated_seq_lens_cpu,
+                )
+                spec_info.future_indices = future_map.alloc_future_indices(
+                    len(self.seq_lens)
+                )
+                future_map.store_to_map_for_new_batch(
+                    spec_info.future_indices, spec_info
+                )
+                self.spec_info = spec_info
+            else:
+                # Non-overlap (spec_v1) mode uses DFlashDraftInput.
+                # Draft KV cache was transferred from prefill via RDMA, so
+                # target_hidden is empty and ctx_lens is zero (nothing to append).
+                from sglang.srt.speculative.dflash_info import DFlashDraftInput
+
+                draft_seq_lens = self.seq_lens.to(dtype=torch.int32)
+                draft_window = server_args.speculative_dflash_draft_window_size
+                if draft_window is not None:
+                    draft_seq_lens = torch.clamp(draft_seq_lens, max=int(draft_window))
+
+                spec_info = DFlashDraftInput(
+                    verified_id=self.output_ids.to(dtype=torch.int64),
+                    target_hidden=torch.empty(
+                        0, device=self.device, dtype=torch.float16
+                    ),
+                    ctx_lens=torch.zeros(bs, dtype=torch.int32, device=self.device),
+                    draft_seq_lens=draft_seq_lens,
+                )
+                self.spec_info = spec_info
