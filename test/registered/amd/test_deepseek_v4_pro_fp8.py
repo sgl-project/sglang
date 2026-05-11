@@ -84,7 +84,7 @@ class TestDeepseekV4ProFp8(CustomTestCase):
             "8",
             "--disable-radix-cache",
             "--attention-backend",
-            "dsv4",
+            "compressed",
             "--max-running-requests",
             "256",
             "--page-size",
