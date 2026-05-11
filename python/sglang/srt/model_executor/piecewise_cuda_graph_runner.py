@@ -151,7 +151,9 @@ def set_torch_compile_config():
         torch._dynamo.config.cache_size_limit = 1024
 
     if _is_musa:
-        from sglang.srt.utils.patch_torch import patch_fx_custom_device
+        from sglang.srt.hardware_backend.musa.utils.patch_torch import (
+            patch_fx_custom_device,
+        )
 
         patch_fx_custom_device()
 
