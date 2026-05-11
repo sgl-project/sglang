@@ -73,6 +73,28 @@ namespace {
     }                                                            \
   }()
 
+// dispatch: float, bfloat16, float16
+#define CPU_DISPATCH_FLOATING_TYPES(TYPE, NAME, ...)              \
+  [&] {                                                          \
+    switch (TYPE) {                                              \
+      case at::ScalarType::Float: {                              \
+        using scalar_t = float;                                  \
+        return __VA_ARGS__();                                    \
+      }                                                          \
+      case at::ScalarType::BFloat16: {                           \
+        using scalar_t = at::BFloat16;                           \
+        return __VA_ARGS__();                                    \
+      }                                                          \
+      case at::ScalarType::Half: {                               \
+        using scalar_t = at::Half;                               \
+        return __VA_ARGS__();                                    \
+      }                                                          \
+      default:                                                   \
+        TORCH_CHECK(false, NAME, ": unsupported dtype ",         \
+                    toString(TYPE));                              \
+    }                                                            \
+  }()
+
 // Helper MICRO for CPU_DISPATCH_FLOATING_TYPES_EXT:
 //   TYPE1: the primary dtype (input, output, weight);
 //   TYPE2: defined as PARAM_T input
@@ -366,6 +388,13 @@ inline int get_cache_blocks(int chunk_size) {
 template <>
 inline int get_cache_blocks<at::Float8_e4m3fn>(int chunk_size) {
   // fp8 uses bf16 as accumulate type
+  int cache_block_size = get_cache_blocks<at::BFloat16>(chunk_size);
+  return std::min(MAX_CACHE_BLOCK_SIZE, cache_block_size);
+}
+
+template <>
+inline int get_cache_blocks<uint8_t>(int chunk_size) {
+  // mxfp4 uses bf16 as accumulate type
   int cache_block_size = get_cache_blocks<at::BFloat16>(chunk_size);
   return std::min(MAX_CACHE_BLOCK_SIZE, cache_block_size);
 }

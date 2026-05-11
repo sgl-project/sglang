@@ -973,6 +973,10 @@ def _dispatch_bf16_fp32_backend(
         z = x.new_empty(x.size(0), y.size(0), dtype=torch.float32)
         deep_gemm.bf16_gemm_nt(x, y, z)
         return z
+    elif algo == "cpu_amx":
+        return torch.ops.sgl_kernel.weight_packed_linear(
+            x, y, None, True, torch.float32
+        )
     else:
         return torch.nn.functional.linear(x.float(), y.float())
 
