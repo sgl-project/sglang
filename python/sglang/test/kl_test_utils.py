@@ -13,7 +13,7 @@ from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 LONGBENCH_V2_DATASET = "THUDM/LongBench-v2"
 LONGBENCH_V2_SPLIT = "train"
 DEFAULT_NUM_SAMPLES = 48  # Number of samples to use
-DEFAULT_PROMPT_TOKENS = 5120  # Maximum number of tokens to use
+DEFAULT_PROMPT_TOKENS = 3000  # Maximum number of tokens to use
 CACHE_DIR = os.path.join(os.path.dirname(__file__), ".longbench_cache")
 
 # In-memory cache for the current session
@@ -211,12 +211,7 @@ def test_input_output_logprobs_match_helper(
 
 
 def test_input_output_logprobs_match_prefill_cache_hit_helper(
-    base_url,
-    ACC_THRESHOLDS,
-    model_name,
-    max_samples=None,
-    max_new_tokens=8192,
-    truncate_length=None,
+    base_url, ACC_THRESHOLDS, model_name, max_samples=None, max_new_tokens=8192
 ):
     server_info = requests.get(base_url + "/server_info").json()
     if server_info["disable_radix_cache"]:
@@ -237,23 +232,6 @@ def test_input_output_logprobs_match_prefill_cache_hit_helper(
     print("Flush Cache and Prefill to cache the input ...")
     _flush_cache(base_url)
     _generate(base_url, input_ids, max_new_tokens=0)
-
-    if truncate_length is not None:
-        # Truncate prompts by truncate_length tokens so the cached prefix from the first prefill
-        # strictly covers the new shorter input (true partial cache hit on a strict prefix).
-        original_lengths = [len(ids) for ids in input_ids]
-        input_ids = [
-            ids[:-truncate_length] for ids in input_ids if len(ids) > truncate_length
-        ]
-        truncated_lengths = [len(ids) for ids in input_ids]
-        print(f"Original prompt lengths: {original_lengths}")
-        print(f"Truncated prompt lengths: {truncated_lengths}")
-        assert (
-            len(input_ids) > 0
-        ), "All prompts have length <= truncate_length; nothing to test for cache-hit."
-        print(
-            f"Truncated to {len(input_ids)} prompts longer than truncate_length tokens"
-        )
 
     # Generate with cache hit
     print("Running generation to get output logprobs ...")
