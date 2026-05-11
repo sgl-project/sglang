@@ -141,11 +141,17 @@ class ModelRunnerKVCacheMixin:
         )
         return total_rest_memory - mamba_state_memory
 
-    def calculate_mla_kv_cache_dim(self: ModelRunner) -> int:
-        is_nsa_model = is_deepseek_nsa(self.model_config.hf_config)
-        kv_cache_dtype = self.kv_cache_dtype
-        kv_lora_rank = self.model_config.kv_lora_rank
-        qk_rope_head_dim = self.model_config.qk_rope_head_dim
+    @staticmethod
+    def calculate_mla_kv_cache_dim(
+        *,
+        model_config: ModelConfig,
+        kv_cache_dtype: torch.dtype,
+        server_args: ServerArgs,
+    ) -> int:
+        is_nsa_model = is_deepseek_nsa(model_config.hf_config)
+        kv_cache_dtype = kv_cache_dtype
+        kv_lora_rank = model_config.kv_lora_rank
+        qk_rope_head_dim = model_config.qk_rope_head_dim
         kv_cache_dim = kv_lora_rank + qk_rope_head_dim  # default mla kv cache dim
 
         # For non-NSA models, MLA kv cache dim is simply kv_lora_rank + qk_rope_head_dim
@@ -157,16 +163,16 @@ class ModelRunnerKVCacheMixin:
         # since it is not compatible for trtllm and other mla attn backend due to the different
         # kv cache layout.
         if (
-            self.server_args.nsa_prefill_backend == "trtllm"
-            or self.server_args.nsa_decode_backend == "trtllm"
+            server_args.nsa_prefill_backend == "trtllm"
+            or server_args.nsa_decode_backend == "trtllm"
         ):
             return kv_cache_dim
 
         # On HIP with TileLang backend, keep the default MLA KV cache dimension.
         # FP8 attention uses the nope(512 fp8) + rope(64 fp8) layout, without extra per-block scales.
         if _is_hip and (
-            self.server_args.nsa_prefill_backend == "tilelang"
-            or self.server_args.nsa_decode_backend == "tilelang"
+            server_args.nsa_prefill_backend == "tilelang"
+            or server_args.nsa_decode_backend == "tilelang"
         ):
             return kv_cache_dim
 
@@ -347,7 +353,11 @@ class ModelRunnerKVCacheMixin:
                     qk_rope_head_dim=self.model_config.qk_rope_head_dim,
                     layer_num=self.num_effective_layers,
                     device=self.device,
-                    kv_cache_dim=self.calculate_mla_kv_cache_dim(),
+                    kv_cache_dim=ModelRunnerKVCacheMixin.calculate_mla_kv_cache_dim(
+                        model_config=self.model_config,
+                        kv_cache_dtype=self.kv_cache_dtype,
+                        server_args=self.server_args,
+                    ),
                     enable_memory_saver=self.server_args.enable_memory_saver,
                     start_layer=self.start_layer,
                     end_layer=self.end_layer,
@@ -480,7 +490,11 @@ class ModelRunnerKVCacheMixin:
                 qk_rope_head_dim=self.model_config.qk_rope_head_dim,
                 layer_num=self.num_effective_layers,
                 device=self.device,
-                kv_cache_dim=self.calculate_mla_kv_cache_dim(),
+                kv_cache_dim=ModelRunnerKVCacheMixin.calculate_mla_kv_cache_dim(
+                    model_config=self.model_config,
+                    kv_cache_dtype=self.kv_cache_dtype,
+                    server_args=self.server_args,
+                ),
                 enable_memory_saver=self.server_args.enable_memory_saver,
                 start_layer=self.start_layer,
                 end_layer=self.end_layer,
