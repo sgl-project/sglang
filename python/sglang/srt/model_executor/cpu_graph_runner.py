@@ -263,10 +263,11 @@ def register_fake_ops():
         return mat2.shape[0]
 
     @torch.library.register_fake("sgl_kernel::weight_packed_linear")
-    def _(mat1, mat2, bias, is_vnni):
+    def _(mat1, mat2, bias, is_vnni, out_dtype=None):
         M = mat1.shape[0]
         N = get_n_size(mat2, is_vnni)
-        return mat1.new_empty(M, N)
+        dtype = out_dtype if out_dtype is not None else mat1.dtype
+        return mat1.new_empty(M, N, dtype=dtype)
 
     @torch.library.register_fake("sgl_kernel::per_token_quant_int8_cpu")
     def _(input):

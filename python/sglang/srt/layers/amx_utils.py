@@ -14,6 +14,7 @@ class CPUQuantMethod(IntEnum):
     INT8_W8A8 = 1
     FP8_W8A16 = 2
     INT4_W4A8 = 3
+    MXFP4 = 4
 
 
 class CPUQuantAlgo(IntEnum):
@@ -170,4 +171,43 @@ class PackWeightMethod:
     def process_weights_after_loading(self, module) -> None:
         _amx_process_weight_after_loading(
             module, self.weight_names, self.transpose_dims
+        )
+
+
+class PackWeightMethodBMM:
+    """Pack weight for batched matrix multiplication (bmm_cpu).
+
+    Replaces the default UnquantizedLinearMethod on a linear layer so that
+    the 2D weight [G*R, D] is reshaped to 3D [G, R, D] and then VNNI-packed.
+    """
+
+    def __init__(self, n_groups, group_size):
+        self.n_groups = n_groups
+        self.group_size = group_size
+
+    def process_weights_after_loading(self, module) -> None:
+        weight = module.weight
+        device = weight.device
+
+        # Reshape [G*R, D] → [G, R, D] for batched GEMM
+        weight_3d = weight.data.view(
+            self.n_groups, self.group_size, -1
+        ).contiguous()
+
+        if not dim_is_supported(weight_3d):
+            logger.warning(
+                f"Unsupported dimension for prepacking for weight "
+                f"'weight' with shape {weight_3d.shape} in {module}. "
+                f"The derived (OC, IC) dimensions must be divisible by (16, 32). "
+            )
+            module.use_intel_amx_backend = False
+            return
+
+        packed_weight = torch.nn.Parameter(
+            amx_process_weight_after_loading(weight_3d),
+            requires_grad=False,
+        )
+        module.weight = packed_weight
+        module.use_intel_amx_backend = (
+            device == torch.device("cpu") and cpu_has_amx_support()
         )
