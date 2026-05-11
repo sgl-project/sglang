@@ -4,7 +4,7 @@
 #include <dlpack/dlpack.h>
 #include <tvm/ffi/container/tensor.h>
 
-#include "phase1_new.cuh"
+#include "kernel.cuh"
 #include <cmath>
 #include <cstdint>
 #include <cuda_runtime.h>
@@ -28,7 +28,7 @@ static inline int _get_num_sm_cached(int device_id) {
 }
 
 static inline void
-_set_device_stream_and_sm(SparseAttnFwdQ8SM90NewParams& params, tvm::ffi::TensorView q, int64_t cuda_stream) {
+_set_device_stream_and_sm(SparseMlaQ8Kv8PrefillParams& params, tvm::ffi::TensorView q, int64_t cuda_stream) {
   DLDevice dev = q.device();
   cudaSetDevice(dev.device_id);
   params.stream = reinterpret_cast<cudaStream_t>(cuda_stream);
@@ -37,23 +37,23 @@ _set_device_stream_and_sm(SparseAttnFwdQ8SM90NewParams& params, tvm::ffi::Tensor
 
 template <int D_QK>
 static inline void
-_run_q8kv8_for_head_dim(SparseAttnFwdQ8SM90NewParams& params, bool have_topk_length, bool have_attn_sink) {
+_run_q8kv8_for_head_dim(SparseMlaQ8Kv8PrefillParams& params, bool have_topk_length, bool have_attn_sink) {
   if (have_topk_length) {
     if (have_attn_sink) {
-      sm90::fwd::run_fwd_phase1_q8_sm90_new_kernel<D_QK, true, true>(params);
+      sm90::fwd::run_sparse_mla_q8kv8_prefill_kernel<D_QK, true, true>(params);
     } else {
-      sm90::fwd::run_fwd_phase1_q8_sm90_new_kernel<D_QK, true, false>(params);
+      sm90::fwd::run_sparse_mla_q8kv8_prefill_kernel<D_QK, true, false>(params);
     }
   } else {
     if (have_attn_sink) {
-      sm90::fwd::run_fwd_phase1_q8_sm90_new_kernel<D_QK, false, true>(params);
+      sm90::fwd::run_sparse_mla_q8kv8_prefill_kernel<D_QK, false, true>(params);
     } else {
-      sm90::fwd::run_fwd_phase1_q8_sm90_new_kernel<D_QK, false, false>(params);
+      sm90::fwd::run_sparse_mla_q8kv8_prefill_kernel<D_QK, false, false>(params);
     }
   }
 }
 
-static inline void _run_q8kv8(SparseAttnFwdQ8SM90NewParams& params, bool have_topk_length, bool have_attn_sink) {
+static inline void _run_q8kv8(SparseMlaQ8Kv8PrefillParams& params, bool have_topk_length, bool have_attn_sink) {
   switch (params.d_qk) {
     case 512:
       _run_q8kv8_for_head_dim<512>(params, have_topk_length, have_attn_sink);
@@ -67,7 +67,7 @@ static inline void _run_q8kv8(SparseAttnFwdQ8SM90NewParams& params, bool have_to
   }
 }
 
-static inline SparseAttnFwdQ8SM90NewParams _make_common_params(
+static inline SparseMlaQ8Kv8PrefillParams _make_common_params(
     tvm::ffi::TensorView q,
     tvm::ffi::TensorView kv,
     tvm::ffi::TensorView indices,
@@ -85,7 +85,7 @@ static inline SparseAttnFwdQ8SM90NewParams _make_common_params(
     int64_t topk_val,
     double sm_scale_val,
     int64_t cuda_stream) {
-  SparseAttnFwdQ8SM90NewParams params;
+  SparseMlaQ8Kv8PrefillParams params;
   params.s_q = (int)s_q_val;
   params.s_kv = (int)s_kv_val;
   params.h_q = (int)h_q_val;
@@ -137,7 +137,7 @@ void sparse_prefill_q8kv8_dispatch(
     int64_t topk_val,
     double sm_scale_val,
     int64_t cuda_stream) {
-  SparseAttnFwdQ8SM90NewParams params = _make_common_params(
+  SparseMlaQ8Kv8PrefillParams params = _make_common_params(
       q,
       kv,
       indices,
@@ -178,7 +178,7 @@ void sparse_prefill_q8kv8_dispatch_full(
     int64_t topk_val,
     double sm_scale_val,
     int64_t cuda_stream) {
-  SparseAttnFwdQ8SM90NewParams params = _make_common_params(
+  SparseMlaQ8Kv8PrefillParams params = _make_common_params(
       q,
       kv,
       indices,
