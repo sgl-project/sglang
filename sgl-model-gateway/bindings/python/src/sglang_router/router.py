@@ -164,8 +164,8 @@ class Router:
             automatically discover worker pods based on the selector. Default: False
         selector: Dictionary mapping of label keys to values for Kubernetes pod selection.
             Example: {"app": "sglang-worker"}. Default: {}
-        service_discovery_port: Port to use for service discovery. The router will generate
-            worker URLs using this port. Default: 80
+        service_discovery_ports: Ports to use for service discovery. The router will generate
+            worker URLs using these ports. Default: [80]
         service_discovery_namespace: Kubernetes namespace to watch for pods. If not provided,
             watches pods across all namespaces (requires cluster-wide permissions). Default: None
         prefill_selector: Dictionary mapping of label keys to values for Kubernetes pod selection

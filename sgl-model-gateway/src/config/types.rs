@@ -359,7 +359,19 @@ pub struct DiscoveryConfig {
     pub enabled: bool,
     /// None = all namespaces
     pub namespace: Option<String>,
+    /// Primary port (for backwards compatibility, first port in ports list)
     pub port: u16,
+    /// List of ports to use for discovered worker pods
+    #[serde(default = "default_ports")]
+    pub ports: Vec<u16>,
+    /// List of ports to use for discovered prefill pods in PD mode
+    /// If not specified, falls back to `ports`
+    #[serde(default = "default_empty_ports")]
+    pub prefill_ports: Vec<u16>,
+    /// List of ports to use for discovered decode pods in PD mode
+    /// If not specified, falls back to `ports`
+    #[serde(default = "default_empty_ports")]
+    pub decode_ports: Vec<u16>,
     pub check_interval_secs: u64,
     /// Regular mode
     pub selector: HashMap<String, String>,
@@ -376,6 +388,14 @@ pub struct DiscoveryConfig {
     pub router_mesh_port_annotation: String,
 }
 
+fn default_empty_ports() -> Vec<u16> {
+    vec![]
+}
+
+fn default_ports() -> Vec<u16> {
+    vec![80]
+}
+
 fn default_router_mesh_port_annotation() -> String {
     "sglang.ai/mesh-port".to_string()
 }
@@ -386,6 +406,9 @@ impl Default for DiscoveryConfig {
             enabled: false,
             namespace: None,
             port: 8000,
+            ports: default_ports(),
+            prefill_ports: default_empty_ports(),
+            decode_ports: default_empty_ports(),
             check_interval_secs: 120,
             selector: HashMap::new(),
             prefill_selector: HashMap::new(),
@@ -937,6 +960,9 @@ mod tests {
             enabled: true,
             namespace: Some("default".to_string()),
             port: 9000,
+            ports: vec![9000],
+            prefill_ports: vec![],
+            decode_ports: vec![],
             check_interval_secs: 30,
             selector: selector.clone(),
             prefill_selector: selector.clone(),
@@ -1215,6 +1241,9 @@ mod tests {
                 enabled: true,
                 namespace: Some("production".to_string()),
                 port: 8443,
+                ports: vec![8443],
+                prefill_ports: vec![],
+                decode_ports: vec![],
                 check_interval_secs: 120,
                 selector: selectors.clone(),
                 prefill_selector: selectors.clone(),

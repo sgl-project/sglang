@@ -232,13 +232,14 @@ struct CliArgs {
     #[arg(long, num_args = 0.., help_heading = "Service Discovery (Kubernetes)")]
     selector: Vec<String>,
 
-    /// Port to use for discovered worker pods
+    /// Ports to use for discovered worker pods (can specify multiple ports)
     #[arg(
         long,
-        default_value_t = 80,
+        num_args = 0..,
+        default_values_t = [80u16],
         help_heading = "Service Discovery (Kubernetes)"
     )]
-    service_discovery_port: u16,
+    service_discovery_ports: Vec<u16>,
 
     /// Kubernetes namespace to watch for pods
     #[arg(long, help_heading = "Service Discovery (Kubernetes)")]
@@ -251,6 +252,22 @@ struct CliArgs {
     /// Label selector for decode server pods in PD mode
     #[arg(long, num_args = 0.., help_heading = "Service Discovery (Kubernetes)")]
     decode_selector: Vec<String>,
+
+    /// Ports to use for discovered prefill pods in PD mode (can specify multiple ports)
+    #[arg(
+        long,
+        num_args = 0..,
+        help_heading = "Service Discovery (Kubernetes)"
+    )]
+    prefill_service_discovery_ports: Vec<u16>,
+
+    /// Ports to use for discovered decode pods in PD mode (can specify multiple ports)
+    #[arg(
+        long,
+        num_args = 0..,
+        help_heading = "Service Discovery (Kubernetes)"
+    )]
+    decode_service_discovery_ports: Vec<u16>,
 
     // ==================== Logging ====================
     /// Directory to store log files
@@ -931,7 +948,22 @@ impl CliArgs {
             Some(DiscoveryConfig {
                 enabled: true,
                 namespace: self.service_discovery_namespace.clone(),
-                port: self.service_discovery_port,
+                port: self.service_discovery_ports.first().copied().unwrap_or(80),
+                ports: if self.service_discovery_ports.is_empty() {
+                    vec![80]
+                } else {
+                    self.service_discovery_ports.clone()
+                },
+                prefill_ports: if self.prefill_service_discovery_ports.is_empty() {
+                    vec![]
+                } else {
+                    self.prefill_service_discovery_ports.clone()
+                },
+                decode_ports: if self.decode_service_discovery_ports.is_empty() {
+                    vec![]
+                } else {
+                    self.decode_service_discovery_ports.clone()
+                },
                 check_interval_secs: 60,
                 selector: Self::parse_selector(&self.selector),
                 prefill_selector: Self::parse_selector(&self.prefill_selector),
@@ -1093,7 +1125,22 @@ impl CliArgs {
                 enabled: true,
                 selector: Self::parse_selector(&self.selector),
                 check_interval: std::time::Duration::from_secs(60),
-                port: self.service_discovery_port,
+                port: self.service_discovery_ports.first().copied().unwrap_or(80),
+                ports: if self.service_discovery_ports.is_empty() {
+                    vec![80]
+                } else {
+                    self.service_discovery_ports.clone()
+                },
+                prefill_ports: if self.prefill_service_discovery_ports.is_empty() {
+                    vec![]
+                } else {
+                    self.prefill_service_discovery_ports.clone()
+                },
+                decode_ports: if self.decode_service_discovery_ports.is_empty() {
+                    vec![]
+                } else {
+                    self.decode_service_discovery_ports.clone()
+                },
                 namespace: self.service_discovery_namespace.clone(),
                 pd_mode: self.pd_disaggregation,
                 prefill_selector: Self::parse_selector(&self.prefill_selector),
