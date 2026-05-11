@@ -16,8 +16,8 @@ from sglang.srt.mem_cache.common import (
 )
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
 from sglang.srt.speculative.dflash_utils import (
-    compute_dflash_accept_len_and_bonus,
-    compute_dflash_sampling_accept_len_and_bonus,
+    compute_dflash_correct_drafts_and_bonus,
+    compute_dflash_sampling_correct_drafts_and_bonus,
     is_dflash_sampling_verify_available,
 )
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
@@ -323,7 +323,7 @@ class DFlashVerifyInput(SpecInput):
             new_bonus_tokens: int64 tensor [bs] (the new current token per request)
             commit_lens: int32 tensor [bs] (how many verify-input tokens are committed)
             next_target_hidden: tensor [sum(commit_lens), feature_dim]
-            num_accepted_drafts_per_req_cpu: list[int] (accepted draft tokens per request)
+            num_correct_drafts_per_req_cpu: list[int] (accepted draft tokens per request)
         """
         if batch.forward_mode.is_idle():
             empty = torch.empty((0,), dtype=torch.int64, device=batch.device)
@@ -368,7 +368,7 @@ class DFlashVerifyInput(SpecInput):
             and not sampling_info.is_all_greedy
             and is_dflash_sampling_verify_available()
         ):
-            accept_len, bonus = compute_dflash_sampling_accept_len_and_bonus(
+            accept_len, bonus = compute_dflash_sampling_correct_drafts_and_bonus(
                 candidates=candidates,
                 next_token_logits=logits_output.next_token_logits,
                 sampling_info=sampling_info,
@@ -377,7 +377,7 @@ class DFlashVerifyInput(SpecInput):
             target_predict = torch.argmax(logits_output.next_token_logits, dim=-1).view(
                 bs, self.draft_token_num
             )
-            accept_len, bonus = compute_dflash_accept_len_and_bonus(
+            accept_len, bonus = compute_dflash_correct_drafts_and_bonus(
                 candidates=candidates,
                 target_predict=target_predict,
             )
@@ -388,7 +388,7 @@ class DFlashVerifyInput(SpecInput):
         ).cpu()
 
         max_acc = self.draft_token_num - 1
-        num_accepted_drafts_per_req_cpu: List[int] = []
+        num_correct_drafts_per_req_cpu: List[int] = []
         commit_lens_cpu: List[int] = []
         new_bonus_tokens_list: List[int] = []
 
@@ -421,9 +421,9 @@ class DFlashVerifyInput(SpecInput):
 
             commit_lens_cpu.append(appended)
             new_bonus_tokens_list.append(new_bonus_token)
-            num_accepted_drafts_per_req_cpu.append(max(0, appended - 1))
+            num_correct_drafts_per_req_cpu.append(max(0, appended - 1))
             req.spec_verify_ct += 1
-            req.spec_accepted_drafts += num_accepted_drafts_per_req_cpu[-1]
+            req.spec_num_correct_drafts += num_correct_drafts_per_req_cpu[-1]
 
         commit_lens = torch.tensor(commit_lens_cpu, dtype=torch.int32, device=device)
         new_bonus_tokens = torch.tensor(
@@ -498,5 +498,5 @@ class DFlashVerifyInput(SpecInput):
             new_bonus_tokens,
             commit_lens,
             next_target_hidden,
-            num_accepted_drafts_per_req_cpu,
+            num_correct_drafts_per_req_cpu,
         )
