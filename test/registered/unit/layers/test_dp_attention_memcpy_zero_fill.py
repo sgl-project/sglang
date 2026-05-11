@@ -79,6 +79,13 @@ class TestMemcpyTritonWithZeroFill(unittest.TestCase):
         # Total elements not a multiple of BLOCK_SIZE (8192).
         self._run_case(999, 333, 131, offset=200, sz=333, offset_src=False, dtype=torch.bfloat16)
 
+    def test_dtype_matrix(self):
+        # Same shape across the float dtypes the gather/scatter paths see in practice.
+        for dtype in (torch.float16, torch.float32, torch.bfloat16):
+            with self.subTest(dtype=dtype):
+                self._run_case(2048, 512, 4096, offset=1024, sz=512, offset_src=False, dtype=dtype)
+                self._run_case(512, 2048, 4096, offset=1024, sz=512, offset_src=True, dtype=dtype)
+
 
 if __name__ == "__main__":
     unittest.main()
