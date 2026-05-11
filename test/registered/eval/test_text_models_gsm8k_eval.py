@@ -26,28 +26,29 @@ NIGHTLY_EVAL_SERVER_TIMEOUT = 1800
 register_cuda_ci(est_time=3600, suite="nightly-eval-text-2-gpu", nightly=True)
 
 MODEL_SCORE_THRESHOLDS = {
-    "meta-llama/Llama-3.1-8B-Instruct": 0.82,
-    "mistralai/Mistral-7B-Instruct-v0.3": 0.58,
-    "deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct": 0.85,
-    "google/gemma-2-27b-it": 0.91,
-    "meta-llama/Llama-3.1-70B-Instruct": 0.95,
-    "mistralai/Mixtral-8x7B-Instruct-v0.1": 0.616,
-    "Qwen/Qwen2-57B-A14B-Instruct": 0.86,
-    "neuralmagic/Meta-Llama-3.1-8B-Instruct-FP8": 0.83,
-    "neuralmagic/Mistral-7B-Instruct-v0.3-FP8": 0.54,
-    "neuralmagic/DeepSeek-Coder-V2-Lite-Instruct-FP8": 0.835,
-    "zai-org/GLM-4.5-Air-FP8": 0.75,
-    # The threshold of neuralmagic/gemma-2-2b-it-FP8 should be 0.6, but this model has some accuracy regression.
-    # The fix is tracked at https://github.com/sgl-project/sglang/issues/4324, we set it to 0.50, for now, to make CI green.
-    "neuralmagic/gemma-2-2b-it-FP8": 0.50,
-    "neuralmagic/Meta-Llama-3.1-70B-Instruct-FP8": 0.94,
-    "neuralmagic/Mixtral-8x7B-Instruct-v0.1-FP8": 0.65,
-    "neuralmagic/Qwen2-72B-Instruct-FP8": 0.94,
-    "neuralmagic/Qwen2-57B-A14B-Instruct-FP8": 0.82,
+    # Thresholds set at 5% below reported GSM8K (5-shot/CoT) scores
+    "meta-llama/Llama-3.1-8B-Instruct": 0.80,  # 84.5% - 5%
+    "mistralai/Mistral-7B-Instruct-v0.3": 0.47,  # 52.1% - 5%
+    "deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct": 0.81,  # 86.4% - 5%
+    "google/gemma-2-27b-it": 0.86,  # 90.7% - 5%
+    "meta-llama/Llama-3.1-70B-Instruct": 0.89,  # 94.1% - 5%
+    "mistralai/Mixtral-8x7B-Instruct-v0.1": 0.69,  # 74.4% - 5%
+    "Qwen/Qwen2-57B-A14B-Instruct": 0.76,  # 80.7% - 5% (official A14B score; 88.2% was the 72B)
+    "neuralmagic/Meta-Llama-3.1-8B-Instruct-FP8": 0.80,  # 84.5% - 5%
+    "neuralmagic/Mistral-7B-Instruct-v0.3-FP8": 0.47,  # 52.1% - 5%
+    "neuralmagic/DeepSeek-Coder-V2-Lite-Instruct-FP8": 0.81,  # 86.4% - 5%
+    "zai-org/GLM-4.5-Air-FP8": 0.80,  # ~85%  - 5%
+    # GSM8K baseline for gemma-2-2b is ~40-45%; threshold set at 5% below.
+    # (Previously 0.50 based on MGSM-EN; tracked regression: https://github.com/sgl-project/sglang/issues/4324)
+    "neuralmagic/gemma-2-2b-it-FP8": 0.38,  # ~43%  - 5%
+    "neuralmagic/Meta-Llama-3.1-70B-Instruct-FP8": 0.89,  # 94.1% - 5%
+    "neuralmagic/Mixtral-8x7B-Instruct-v0.1-FP8": 0.69,  # 74.4% - 5%
+    "neuralmagic/Qwen2-72B-Instruct-FP8": 0.86,  # 91.1% - 5%
+    "neuralmagic/Qwen2-57B-A14B-Instruct-FP8": 0.76,  # 80.7% - 5% (official A14B score)
 }
 
 
-# Do not use `CustomTestCase` since `test_mgsm_en_all_models` does not want retry
+# Do not use `CustomTestCase` since `test_gsm8k_all_models` does not want retry
 class TestNightlyGsm8KEval(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -66,7 +67,7 @@ class TestNightlyGsm8KEval(unittest.TestCase):
 
         cls.base_url = DEFAULT_URL_FOR_TEST
 
-    def test_mgsm_en_all_models(self):
+    def test_gsm8k_all_models(self):
         warnings.filterwarnings(
             "ignore", category=ResourceWarning, message="unclosed.*socket"
         )
@@ -91,7 +92,7 @@ class TestNightlyGsm8KEval(unittest.TestCase):
                     args = SimpleNamespace(
                         base_url=self.base_url,
                         model=model_setup.model_path,
-                        eval_name="mgsm_en",
+                        eval_name="gsm8k",
                         num_examples=None,
                         num_threads=1024,
                     )

@@ -146,23 +146,61 @@ class Gemma3Attention(nn.Module):
             prefix=f"{prefix}.o_proj",
         )
 
+        self.layer_type = (
+            config.text_config.layer_types[layer_id]
+            if hasattr(config.text_config, "layer_types")
+            else None
+        )
         self.is_sliding = (
             config.text_config.layer_types[layer_id] == "sliding_attention"
         )
 
+        rope_parameters = getattr(config.text_config, "rope_parameters", None) or {}
+        layer_rope_params = {}
+        if self.layer_type is not None and isinstance(rope_parameters, dict):
+            layer_rope_params = dict(rope_parameters.get(self.layer_type) or {})
+
         # Initialize the rotary embedding.
         if self.is_sliding:
             # Local attention.
-            self.rope_theta = config.text_config.rope_local_base_freq
-            rope_scaling = None  # Default
+            self.rope_theta = float(
+                layer_rope_params.get(
+                    "rope_theta",
+                    getattr(
+                        config.text_config,
+                        "rope_local_base_freq",
+                        getattr(
+                            getattr(config.text_config, "default_theta", {}),
+                            "get",
+                            lambda *_: 10_000.0,
+                        )("local", 10_000.0),
+                    ),
+                )
+            )
+            rope_scaling = layer_rope_params or None
             # sliding window
             self.sliding_window = get_attention_sliding_window_size(config.text_config)
             # (left, right) = (window, 0) effectively for causal
             self.window_size = (self.sliding_window, 0)
         else:
             # Global attention.
-            self.rope_theta = config.text_config.rope_theta
-            rope_scaling = config.text_config.rope_scaling
+            self.rope_theta = float(
+                layer_rope_params.get(
+                    "rope_theta",
+                    getattr(
+                        config.text_config,
+                        "rope_theta",
+                        getattr(
+                            getattr(config.text_config, "default_theta", {}),
+                            "get",
+                            lambda *_: 1_000_000.0,
+                        )("global", 1_000_000.0),
+                    ),
+                )
+            )
+            rope_scaling = layer_rope_params or getattr(
+                config.text_config, "rope_scaling", None
+            )
             self.sliding_window = None
             self.window_size = (-1, -1)
 
@@ -175,18 +213,11 @@ class Gemma3Attention(nn.Module):
             is_neox_style=True,
         )
 
-        # NOTE(gmixiaojin): The shared RotaryEmbedding above computes inv_freq on
-        # GPU and uses the x1*cos - x2*sin formula, which causes slight
-        # numerical differences vs HuggingFace (see the NOTE in
-        # rotary_embedding.py:_compute_inv_freq).  For HF-exact alignment we
-        # precompute inv_freq on CPU and use rotate_half in self.rotary_emb().
-        freq_indices = (
-            torch.arange(0, self.head_dim, 2, dtype=torch.int64).float() / self.head_dim
+        self.rope_scaling_factor = (
+            float(rope_scaling["factor"])
+            if rope_scaling and rope_scaling.get("factor")
+            else None
         )
-        inv_freq = 1.0 / (self.rope_theta**freq_indices)
-        if rope_scaling and rope_scaling.get("factor"):
-            inv_freq = inv_freq / float(rope_scaling["factor"])
-        self.register_buffer("_hf_inv_freq", inv_freq, persistent=False)
 
         # Local Attention not support attention mask, we use global attention instead.
         # self.attn = LocalAttention(
@@ -208,12 +239,21 @@ class Gemma3Attention(nn.Module):
         )
 
     def rotary_emb(self, positions, q, k):
-        """Apply RoPE using HF-exact formula with precomputed inv_freq."""
+        """Apply RoPE using the same device-side inv_freq materialization as LTX."""
         positions_flat = positions.flatten().float()
         num_tokens = positions_flat.shape[0]
 
         with torch.autocast(device_type=q.device.type, enabled=False):
-            freqs = torch.outer(positions_flat, self._hf_inv_freq.float())
+            freq_indices = (
+                torch.arange(
+                    0, self.head_dim, 2, dtype=torch.int64, device=q.device
+                ).float()
+                / self.head_dim
+            )
+            inv_freq = 1.0 / (self.rope_theta**freq_indices)
+            if self.rope_scaling_factor is not None:
+                inv_freq = inv_freq / self.rope_scaling_factor
+            freqs = torch.outer(positions_flat, inv_freq)
             emb = freqs.repeat(1, 2)
             cos = emb.cos().to(q.dtype).unsqueeze(1)
             sin = emb.sin().to(q.dtype).unsqueeze(1)
@@ -252,11 +292,10 @@ class Gemma3Attention(nn.Module):
         key = k.transpose(1, 2)
         value = v.transpose(1, 2)
 
-        min_val = torch.finfo(query.dtype).min
-        attn_mask = torch.zeros(
+        attn_mask = torch.ones(
             (seq_len, seq_len),
             device=hidden_states.device,
-            dtype=query.dtype,
+            dtype=torch.bool,
         )
         causal = torch.triu(
             torch.ones(
@@ -264,30 +303,39 @@ class Gemma3Attention(nn.Module):
             ),
             diagonal=1,
         )
-        attn_mask = attn_mask.masked_fill(causal, min_val)
+        attn_mask = attn_mask.masked_fill(causal, False)
         if self.is_sliding and self.sliding_window is not None:
             idx = torch.arange(seq_len, device=hidden_states.device)
             dist = idx[None, :] - idx[:, None]
             too_far = dist > self.sliding_window
-            attn_mask = attn_mask.masked_fill(too_far, min_val)
+            attn_mask = attn_mask.masked_fill(too_far, False)
 
-        key_pad = ~attention_mask.to(torch.bool)
         attn_mask = attn_mask[None, None, :, :].expand(batch_size, 1, seq_len, seq_len)
-        attn_mask = attn_mask.masked_fill(
-            key_pad[:, None, None, :].expand(batch_size, 1, seq_len, seq_len),
-            min_val,
-        )
+        attn_mask = attn_mask & attention_mask.to(torch.bool)[:, None, None, :]
 
-        attn_kwargs = {
-            "attn_mask": attn_mask,
-            "dropout_p": 0.0,
-            "is_causal": False,
-            "scale": self.scaling,
-        }
         if query.shape[1] != key.shape[1]:
-            attn_kwargs["enable_gqa"] = True
+            num_key_value_groups = query.shape[1] // key.shape[1]
+            key = key[:, :, None, :, :].expand(
+                batch_size, key.shape[1], num_key_value_groups, seq_len, self.head_dim
+            )
+            value = value[:, :, None, :, :].expand(
+                batch_size,
+                value.shape[1],
+                num_key_value_groups,
+                seq_len,
+                self.head_dim,
+            )
+            key = key.reshape(batch_size, query.shape[1], seq_len, self.head_dim)
+            value = value.reshape(batch_size, query.shape[1], seq_len, self.head_dim)
+
         attn_output = torch.nn.functional.scaled_dot_product_attention(
-            query, key, value, **attn_kwargs
+            query,
+            key,
+            value,
+            attn_mask=attn_mask,
+            dropout_p=0.0,
+            is_causal=False,
+            scale=self.scaling,
         )
         attn_output = attn_output.transpose(1, 2)
 
@@ -734,7 +782,9 @@ class Gemma3TextModel(nn.Module):
                     layer_id=i,
                     config=config,
                     quant_config=self.quant_config,
-                    prefix=f"{config.text_config.prefix}.layers.{i}",
+                    prefix=add_prefix(
+                        f"layers.{i}", getattr(config.text_config, "prefix", "")
+                    ),
                 )
                 for i in range(config.text_config.num_hidden_layers)
             ]
@@ -891,6 +941,16 @@ class Gemma3TextModel(nn.Module):
 
 
 class Gemma3ForConditionalGeneration(nn.Module):
+    # transformers 5.6.0 flattened SiglipVisionModel, dropping the
+    # `vision_model` intermediate wrapper. Our reimpl keeps it, so remap
+    # HF source keys back into our nested namespace when transferring weights.
+    param_names_mapping = {
+        r"^(vision_tower\.)(embeddings|encoder|post_layernorm|head)\.": r"\1vision_model.\2.",
+    }
+    reverse_param_names_mapping = {
+        r"^(vision_tower\.)vision_model\.(embeddings|encoder|post_layernorm|head)\.": r"\1\2.",
+    }
+
     def __init__(
         self,
         config: Gemma3Config,

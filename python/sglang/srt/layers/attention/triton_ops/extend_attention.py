@@ -72,6 +72,14 @@ def _get_block_sizes_for_extend_attention(Lq: int, Lv: int):
                 BLOCK_M, BLOCK_N = (64, 64)
             else:
                 BLOCK_M, BLOCK_N = (32, 32)
+        elif _is_cuda and CUDA_CAPABILITY[0] == 10:
+            # Blackwell data-center architecture (GB200, B200, sm_100a)
+            # sm_100a has different register constraints from Hopper; Hopper block sizes
+            # cause PTX register exhaustion (>255 regs) for large head dims (Lq=512).
+            if Lq <= 256:
+                BLOCK_M, BLOCK_N = (64, 64)
+            else:
+                BLOCK_M, BLOCK_N = (16, 64)
         elif _is_cuda and CUDA_CAPABILITY[0] >= 9:
             # Hopper architecture (H100, etc.)
             if Lq <= 256:
@@ -374,7 +382,6 @@ def _fwd_kernel(
                 mask=(mask_n[None, :]) & (mask_d[:, None]),
                 other=0.0,
             )
-
             qk = tl.dot(q.to(k.dtype), k)
             if BLOCK_DPE > 0:
                 offs_kpe = (
@@ -879,7 +886,6 @@ def _fwd_kernel_unified(
                 other=0.0,
             )
 
-            # Compute QK
             qk = tl.dot(q.to(k.dtype), k)
             if BLOCK_DPE > 0:
                 offs_kpe = (
