@@ -848,11 +848,3 @@ class TokenizerControlMixin:
                         setattr(r, attr, None)
 
         return results
-
-    @staticmethod
-    def _update_weight_version_if_provided(
-        self: "WeightDiskUpdateController", weight_version: Optional[str]
-    ) -> None:
-        """Update weight version if provided."""
-        if weight_version is not None:
-            self.server_args.weight_version = weight_version
