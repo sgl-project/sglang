@@ -568,6 +568,27 @@ class MultimodalInputs:
         # other args would be kept intact
 
 
+@dataclasses.dataclass(slots=True, kw_only=True)
+class ReqLogprob:
+    top_logprobs_num: int
+    token_ids_logprob: Optional[List[int]]
+    input_token_logprobs_val: Optional[List[float]] = None
+    input_token_logprobs_idx: Optional[List[int]] = None
+    input_top_logprobs_val: Optional[List[List[float]]] = None
+    input_top_logprobs_idx: Optional[List[List[int]]] = None
+    input_token_ids_logprobs_val: Optional[List[List[float]]] = None
+    input_token_ids_logprobs_idx: Optional[List[List[int]]] = None
+    output_token_logprobs_val: Optional[list] = None
+    output_token_logprobs_idx: Optional[list] = None
+    output_top_logprobs_val: Optional[list] = None
+    output_top_logprobs_idx: Optional[list] = None
+    # Can contain either lists or GPU tensors (delayed copy optimization for prefill-only scoring)
+    output_token_ids_logprobs_val: Optional[List[Union[List[float], torch.Tensor]]] = (
+        None
+    )
+    output_token_ids_logprobs_idx: Optional[list] = None
+
+
 class Req(ReqDllmMixin):
     """The input and output status of a request."""
 
@@ -767,18 +788,14 @@ class Req(ReqDllmMixin):
         self.return_logprob = return_logprob
         # Start index to compute logprob from.
         self.logprob_start_len = 0
-        self.top_logprobs_num = top_logprobs_num
-        self.token_ids_logprob = token_ids_logprob
+        self.logprob = ReqLogprob(
+            top_logprobs_num=top_logprobs_num,
+            token_ids_logprob=token_ids_logprob,
+        )
 
         # Logprobs (return values)
         # True means the input logprob has been already sent to detokenizer.
         self.input_logprob_sent: bool = False
-        self.input_token_logprobs_val: Optional[List[float]] = None
-        self.input_token_logprobs_idx: Optional[List[int]] = None
-        self.input_top_logprobs_val: Optional[List[float]] = None
-        self.input_top_logprobs_idx: Optional[List[int]] = None
-        self.input_token_ids_logprobs_val: Optional[List[float]] = None
-        self.input_token_ids_logprobs_idx: Optional[List[int]] = None
         # Temporary holder to store input_token_logprobs.
         self.input_token_logprobs: Optional[List[Tuple[int]]] = None
         self.temp_input_top_logprobs_val: Optional[List[torch.Tensor]] = None
@@ -788,22 +805,14 @@ class Req(ReqDllmMixin):
 
         if return_logprob:
             # shape: (bs, 1)
-            self.output_token_logprobs_val = []
-            self.output_token_logprobs_idx = []
+            self.logprob.output_token_logprobs_val = []
+            self.logprob.output_token_logprobs_idx = []
             # shape: (bs, k)
-            self.output_top_logprobs_val = []
-            self.output_top_logprobs_idx = []
+            self.logprob.output_top_logprobs_val = []
+            self.logprob.output_top_logprobs_idx = []
             # Can contain either lists or GPU tensors (delayed copy optimization for prefill-only scoring)
-            self.output_token_ids_logprobs_val: List[
-                Union[List[float], torch.Tensor]
-            ] = []
-            self.output_token_ids_logprobs_idx = []
-        else:
-            self.output_token_logprobs_val = self.output_token_logprobs_idx = (
-                self.output_top_logprobs_val
-            ) = self.output_top_logprobs_idx = self.output_token_ids_logprobs_val = (
-                self.output_token_ids_logprobs_idx
-            ) = None
+            self.logprob.output_token_ids_logprobs_val = []
+            self.logprob.output_token_ids_logprobs_idx = []
         self.hidden_states: List[List[float]] = []
         self.hidden_states_tensor = None  # Note: use tensor instead of list to transfer hidden_states when PD + MTP
         self.output_topk_p = None
@@ -1954,8 +1963,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.multi_item_delimiter_indices = None
 
         if self.return_logprob:
-            self.top_logprobs_nums = [r.top_logprobs_num for r in reqs]
-            self.token_ids_logprobs = [r.token_ids_logprob for r in reqs]
+            self.top_logprobs_nums = [r.logprob.top_logprobs_num for r in reqs]
+            self.token_ids_logprobs = [r.logprob.token_ids_logprob for r in reqs]
 
         self.extend_logprob_start_lens = [r.extend_logprob_start_len for r in reqs]
         self.extend_input_logprob_token_ids = extend_input_logprob_token_ids
