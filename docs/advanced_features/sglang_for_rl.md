@@ -35,6 +35,7 @@ integrations:
 | `rollout_kv_commit` | Commit only the prompt prefix from this request. | `False` |
 | `rollout_kv_commit_len` | Number of prompt tokens to commit. If omitted, commits `len(origin_input_ids)`. | `None` |
 | `rollout_kv_protect` | Pin the committed radix node with `inc_lock_ref`. | `True` |
+| `rollout_kv_unprotect` | Release one RolloutKV pin for the committed prompt prefix. | `False` |
 | `rollout_kv_reuse_only` | Do not insert the finished follower/scoring request into radix cache. | `False` |
 
 Typical flow:
@@ -43,6 +44,13 @@ Typical flow:
 2. Send rollout or logprob follower requests with the same `extra_key`.
 3. Set `rollout_kv_reuse_only=True` on followers that should only reuse the
    committed prefix.
+4. After the trainer finishes the rollout/logprob step, send a release request
+   with `rollout_kv_unprotect=True` and the same prompt prefix and `extra_key`.
+
+Each protected commit increments a RolloutKV pin count; each unprotect request
+decrements one pin. If `rollout_kv_unprotect` is called for a prefix that was
+not pinned by RolloutKV, it is a no-op for the persistent pin and only the
+request's normal transient cache lock is released.
 
 ## Fine-Grained Engine Sleep and Wake Up
 

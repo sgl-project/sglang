@@ -345,6 +345,7 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
         self.evictable_size_ = 0
         self.protected_size_ = 0
         self.evictable_leaves.clear()
+        self._rollout_kv_pin_counts = defaultdict(int)
         self._empty_match_result = MatchResult(
             device_indices=torch.empty(
                 (0,),
@@ -415,6 +416,9 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
             last_host_node=last_node,
         )
 
+    def _rollout_kv_pin_key(self, key: RadixKey):
+        return (key.extra_key, key.is_bigram, tuple(key.token_ids))
+
     def insert(self, params: InsertParams) -> InsertResult:
         if self.disable:
             return InsertResult(prefix_len=0)
@@ -440,14 +444,13 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
         custom_params = getattr(req.sampling_params, "custom_params", None)
         custom_params = custom_params if isinstance(custom_params, dict) else {}
         rollout_kv_commit = bool(custom_params.get("rollout_kv_commit", False))
-        rollout_kv_reuse_only = bool(
-            custom_params.get("rollout_kv_reuse_only", False)
-        )
+        rollout_kv_reuse_only = bool(custom_params.get("rollout_kv_reuse_only", False))
+        rollout_kv_unprotect = bool(custom_params.get("rollout_kv_unprotect", False))
 
         # In deterministic mode, disable finished request insertion to radix cache
         if self.disable_finished_insert and not rollout_kv_commit:
             is_insert = False
-        if rollout_kv_reuse_only:
+        if rollout_kv_reuse_only or rollout_kv_unprotect:
             is_insert = False
 
         kv_committed_len = req.pop_committed_kv_cache()
@@ -462,7 +465,7 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
             req.req_pool_idx, :kv_committed_len
         ]
 
-        if rollout_kv_commit:
+        if rollout_kv_commit or rollout_kv_unprotect:
             requested_commit_len = custom_params.get("rollout_kv_commit_len")
             if requested_commit_len is None:
                 requested_commit_len = len(req.origin_input_ids)
@@ -481,6 +484,9 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
         ).page_aligned(self.page_size)
         key_len = len(radix_key)
         values = kv_indices[:key_len].to(dtype=torch.int64, copy=True)
+        rollout_kv_pin_key = (
+            self._rollout_kv_pin_key(radix_key) if key_len > 0 else None
+        )
 
         # Radix Cache takes one ref in memory pool
         if is_insert:
@@ -499,6 +505,20 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
             ):
                 match_result = self.match_prefix(MatchPrefixParams(key=radix_key))
                 self.inc_lock_ref(match_result.last_device_node)
+                self._rollout_kv_pin_counts[rollout_kv_pin_key] += 1
+        elif rollout_kv_unprotect and rollout_kv_pin_key is not None:
+            pin_count = self._rollout_kv_pin_counts.get(rollout_kv_pin_key, 0)
+            if pin_count > 0:
+                match_result = self.match_prefix(MatchPrefixParams(key=radix_key))
+                if len(match_result.device_indices) == key_len:
+                    self.dec_lock_ref(match_result.last_device_node)
+                    if pin_count == 1:
+                        del self._rollout_kv_pin_counts[rollout_kv_pin_key]
+                    else:
+                        self._rollout_kv_pin_counts[rollout_kv_pin_key] -= 1
+            self.token_to_kv_pool_allocator.free(
+                kv_indices[req.cache_protected_len : key_len]
+            )
         else:
             self.token_to_kv_pool_allocator.free(
                 kv_indices[req.cache_protected_len : key_len]
