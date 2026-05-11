@@ -17,6 +17,8 @@ from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.moe.utils import RoutingMethodType
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
+    cpu_has_amx_support,
+    is_cpu,
     is_flashinfer_available,
     log_info_on_rank0,
     set_weight_attrs,
@@ -42,6 +44,9 @@ from sglang.srt.utils.common import get_bool_env_var
 _USE_OFFICIAL_SHUFFLE = get_bool_env_var(
     "SGLANG_MXFP4_USE_OFFICIAL_SHUFFLE", default="true"
 )
+
+_is_cpu = is_cpu()
+_is_cpu_amx_available = cpu_has_amx_support()
 
 
 class PackTopkIds:
@@ -213,6 +218,10 @@ class Mxfp4FlashinferTrtllmMoEMethod:
     def process_weights_after_loading(self, layer: Module) -> None:
         from sglang.srt.layers.quantization.utils import reorder_w1w3_to_w3w1
 
+        if _is_cpu and _is_cpu_amx_available:
+            self._process_weights_cpu(layer)
+            return
+
         self._fp8.process_weights_after_loading(layer)
 
         if getattr(layer, "_mega_moe_weights_built", False):
@@ -314,6 +323,75 @@ class Mxfp4FlashinferTrtllmMoEMethod:
         self._register_static_scale_ones(layer)
         torch.cuda.empty_cache()
 
+    def _apply_cpu(self, layer: Module, hidden_states, topk_output):
+        from sglang.srt.layers.amx_utils import CPUQuantMethod
+        from sglang.srt.layers.moe.topk import apply_topk_weights_cpu
+
+        topk_weights, topk_ids, _ = topk_output
+        x, topk_weights = apply_topk_weights_cpu(
+            self.moe_runner_config.apply_router_weight_on_input,
+            topk_weights,
+            hidden_states,
+        )
+
+        gemm1_clamp_limit = (
+            float(self.moe_runner_config.swiglu_limit)
+            if self.moe_runner_config.swiglu_limit is not None
+            else None
+        )
+
+        return torch.ops.sgl_kernel.fused_experts_cpu(
+            x,
+            layer.w13_weight,
+            layer.w2_weight,
+            topk_weights,
+            topk_ids.to(torch.int32),
+            False,  # inplace See [Note] inplace should be False in fused_experts.
+            CPUQuantMethod.MXFP4,
+            layer.w13_weight_scale_inv,
+            layer.w2_weight_scale_inv,
+            None,  # w1_zp
+            None,  # w2_zp
+            None,  # block_size
+            None,  # w1_bias
+            None,  # w2_bias
+            None,  # gemm1_alpha
+            gemm1_clamp_limit,
+            True,  # is_vnni
+        )
+
+    def _process_weights_cpu(self, layer: Module) -> None:
+        kernel = torch.ops.sgl_kernel
+
+        w13 = layer.w13_weight.data
+        w2 = layer.w2_weight.data
+        w13_scale = layer.w13_weight_scale_inv.data
+        w2_scale = layer.w2_weight_scale_inv.data
+
+        # Weights are int8-storage of packed FP4 (two values/byte). The CPU
+        # kernel checks w scalar_type == uint8, so we view as uint8 (bit-equivalent).
+        w13 = w13.view(torch.uint8)
+        w2 = w2.view(torch.uint8)
+
+        if w13_scale.dtype == torch.float32:
+            w13_scale = w13_scale.to(torch.float8_e8m0fnu)
+            w2_scale = w2_scale.to(torch.float8_e8m0fnu)
+        w13_scale = w13_scale.view(torch.uint8)
+        w2_scale = w2_scale.view(torch.uint8)
+
+        # pack weight
+        w13 = kernel.convert_weight_packed(w13)
+        w2 = kernel.convert_weight_packed(w2)
+        w13_scale = kernel.convert_scale_packed(w13_scale)
+        w2_scale = kernel.convert_scale_packed(w2_scale)
+
+        layer.w13_weight = Parameter(w13, requires_grad=False)
+        layer.w2_weight = Parameter(w2, requires_grad=False)
+        layer.w13_weight_scale_inv = Parameter(w13_scale, requires_grad=False)
+        layer.w2_weight_scale_inv = Parameter(w2_scale, requires_grad=False)
+
+        layer.use_intel_amx_backend = True
+
     def _register_static_scale_ones(self, layer: Module) -> None:
         device = layer.w13_weight.device
         for name in (
@@ -334,9 +412,15 @@ class Mxfp4FlashinferTrtllmMoEMethod:
     ) -> CombineInput:
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
         from sglang.srt.layers.moe.topk import TopKOutputChecker
+        from sglang.srt.utils import use_intel_amx_backend
 
         hidden_states = dispatch_output.hidden_states
         topk_output = dispatch_output.topk_output
+
+        if use_intel_amx_backend(layer):
+            return StandardCombineInput(
+                hidden_states=self._apply_cpu(layer, hidden_states, topk_output)
+            )
 
         w13 = layer.w13_weight
         w2 = layer.w2_weight

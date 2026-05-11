@@ -261,7 +261,10 @@ class Fp8Config(QuantizationConfig):
 
                 return Mxfp4MarlinMoEMethod(fp8_method, prefix=prefix)
 
-            if self.is_fp4_experts and get_moe_runner_backend().is_flashinfer_mxfp4():
+            if self.is_fp4_experts and (
+                get_moe_runner_backend().is_flashinfer_mxfp4()
+                or (_is_cpu and _is_cpu_amx_available)
+            ):
                 from sglang.srt.layers.quantization.mxfp4_flashinfer_trtllm_moe import (
                     Mxfp4FlashinferTrtllmMoEMethod,
                 )
