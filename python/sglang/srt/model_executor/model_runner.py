@@ -1137,44 +1137,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             pyt_hooks = PytHooks()
             pyt_hooks.register_hooks(self.model, module_prefix="model")
 
-        if self.server_args.kv_cache_dtype == "fp8_e4m3":
-            if self.server_args.quantization_param_path is not None:
-                if callable(getattr(self.model, "load_kv_cache_scales", None)):
-                    self.model.load_kv_cache_scales(
-                        self.server_args.quantization_param_path
-                    )
-                    logger.info(
-                        "Loaded KV cache scaling factors from %s",
-                        self.server_args.quantization_param_path,
-                    )
-                else:
-                    raise RuntimeError(
-                        "Using FP8 KV cache and scaling factors provided but "
-                        "model %s does not support loading scaling factors.",
-                        self.model.__class__,
-                    )
-            else:
-                logger.warning(
-                    "Using FP8 KV cache but no scaling factors "
-                    "provided. Defaulting to scaling factors of 1.0. "
-                    "This may lead to less accurate results!"
-                )
+        self._load_kv_cache_scales()
 
-        # Parse other args
-        self.sliding_window_size = None
-        if hasattr(self.model, "get_attention_sliding_window_size"):
-            self.sliding_window_size = self.model.get_attention_sliding_window_size()
-        elif (
-            self.model_config.is_hybrid_swa
-            and self.model_config.sliding_window_size is not None
-        ):
-            # sliding window field in model config may have different meaning for different kinds of models (e.g., dllm), here we only consider the sliding window in SWA model
-            self.sliding_window_size = self.model_config.sliding_window_size
-        elif self.model_config.attention_chunk_size is not None:
-            self.sliding_window_size = self.model_config.attention_chunk_size
-            logger.info(
-                f"Setting sliding_window_size to be attention_chunk_size: {self.sliding_window_size}"
-            )
+        self._resolve_sliding_window_size()
 
         self.prefill_aware_swa = (
             hasattr(self.model, "is_prefill_aware_swa")
@@ -1426,6 +1391,47 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if _is_npu:
             torch.npu.empty_cache()
         monkey_patch_vllm_parallel_state(reverse=True)
+
+    def _load_kv_cache_scales(self) -> None:
+        if self.server_args.kv_cache_dtype == "fp8_e4m3":
+            if self.server_args.quantization_param_path is not None:
+                if callable(getattr(self.model, "load_kv_cache_scales", None)):
+                    self.model.load_kv_cache_scales(
+                        self.server_args.quantization_param_path
+                    )
+                    logger.info(
+                        "Loaded KV cache scaling factors from %s",
+                        self.server_args.quantization_param_path,
+                    )
+                else:
+                    raise RuntimeError(
+                        "Using FP8 KV cache and scaling factors provided but "
+                        "model %s does not support loading scaling factors.",
+                        self.model.__class__,
+                    )
+            else:
+                logger.warning(
+                    "Using FP8 KV cache but no scaling factors "
+                    "provided. Defaulting to scaling factors of 1.0. "
+                    "This may lead to less accurate results!"
+                )
+
+    def _resolve_sliding_window_size(self) -> None:
+        # Parse other args
+        self.sliding_window_size = None
+        if hasattr(self.model, "get_attention_sliding_window_size"):
+            self.sliding_window_size = self.model.get_attention_sliding_window_size()
+        elif (
+            self.model_config.is_hybrid_swa
+            and self.model_config.sliding_window_size is not None
+        ):
+            # sliding window field in model config may have different meaning for different kinds of models (e.g., dllm), here we only consider the sliding window in SWA model
+            self.sliding_window_size = self.model_config.sliding_window_size
+        elif self.model_config.attention_chunk_size is not None:
+            self.sliding_window_size = self.model_config.attention_chunk_size
+            logger.info(
+                f"Setting sliding_window_size to be attention_chunk_size: {self.sliding_window_size}"
+            )
 
     def maybe_recover_ep_ranks(self):
         # TODO(perf): `active_ranks.all()` on a CUDA tensor triggers host-device
