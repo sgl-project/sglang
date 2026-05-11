@@ -151,19 +151,6 @@ class MambaAttnBackendBase(AttentionBackend):
         self.cached_cuda_graph_verify_query_start_loc: torch.Tensor = None
         self.conv_states_shape: tuple[int, int] = None
 
-    def _get_mamba_indices(
-        self, bs: int, req_pool_indices: torch.Tensor
-    ) -> torch.Tensor:
-        """Get mamba pool indices for CUDA graph capture/replay.
-
-        Uses _replay_forward_batch (set by HybridLinearAttnBackend during
-        CUDA graph replay) if available.
-        """
-        fb = getattr(self, "_replay_forward_batch", None)
-        if fb is not None and fb.mamba_cache_indices is not None:
-            return fb.mamba_cache_indices[:bs].clone()
-        return torch.zeros(bs, dtype=torch.int32, device=self.device)
-
     def _execute_deferred_mamba_ops(self, forward_batch: ForwardBatch):
         """Run deferred clear/COW ops on the forward stream to avoid races."""
         if (
@@ -510,7 +497,7 @@ class MambaAttnBackendBase(AttentionBackend):
             )
         else:
             raise ValueError(f"Invalid forward mode: {forward_mode=}")
-        mamba_indices = self._get_mamba_indices(bs, req_pool_indices)
+        mamba_indices = self.req_to_token_pool.get_mamba_indices(req_pool_indices)
         self.state_indices_list[bs - 1][: len(mamba_indices)].copy_(mamba_indices)
 
         # If topk > 1, we need to use retrieve_next_token and retrieve_next_sibling to handle the eagle tree custom attention mask
@@ -544,7 +531,7 @@ class MambaAttnBackendBase(AttentionBackend):
         )
         # Make sure forward metadata is correctly handled for padding reqs
         req_pool_indices[bs - num_padding :] = 0
-        mamba_indices = self._get_mamba_indices(bs, req_pool_indices)
+        mamba_indices = self.req_to_token_pool.get_mamba_indices(req_pool_indices)
         mamba_indices[bs - num_padding :] = -1
         self.state_indices_list[bs - 1][: len(mamba_indices)].copy_(mamba_indices)
         if forward_mode.is_decode_or_idle():
@@ -833,9 +820,7 @@ class HybridLinearAttnBackend(AttentionBackend):
         spec_info: Optional[SpecInput],
         seq_lens_cpu: Optional[torch.Tensor],
     ):
-        fb = getattr(self, "_replay_forward_batch", None)
         for attn_backend in self.attn_backend_list:
-            attn_backend._replay_forward_batch = fb
             attn_backend.init_forward_metadata_replay_cuda_graph(
                 bs,
                 req_pool_indices,
@@ -846,7 +831,6 @@ class HybridLinearAttnBackend(AttentionBackend):
                 spec_info,
                 seq_lens_cpu,
             )
-            attn_backend._replay_forward_batch = None
 
     def get_cuda_graph_seq_len_fill_value(self):
         return self.full_attn_backend.get_cuda_graph_seq_len_fill_value()

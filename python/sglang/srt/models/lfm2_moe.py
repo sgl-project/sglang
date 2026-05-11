@@ -328,7 +328,10 @@ class Lfm2MoeShortConv(nn.Module):
 
         layer_cache = forward_batch.req_to_token_pool.mamba2_layer_cache(self.layer_idx)
         conv_state = layer_cache.conv[0]
-        mamba_indices = forward_batch.mamba_cache_indices
+        req_pool_indices = forward_batch.req_pool_indices
+        mamba_indices = forward_batch.req_to_token_pool.get_mamba_indices(
+            req_pool_indices
+        )
 
         proj, _ = self.in_proj(hidden_states)
         B_gate, C_gate, x = proj.chunk(3, dim=-1)

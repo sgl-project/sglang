@@ -812,7 +812,13 @@ class DecodePreallocQueue:
             # Prepare extra pool indices for hybrid models
             if isinstance(self.token_to_kv_pool, HybridLinearKVPool):
                 # Mamba hybrid model: single mamba state index
-                state_indices = [decode_req.req.mamba_pool_idx.cpu().numpy()]
+                state_indices = [
+                    self.req_to_token_pool.req_index_to_mamba_index_mapping[
+                        decode_req.req.req_pool_idx
+                    ]
+                    .cpu()
+                    .numpy()
+                ]
             elif isinstance(self.token_to_kv_pool, BaseSWAKVPool):
                 seq_len = len(decode_req.req.origin_input_ids)
                 window_size = self.scheduler.sliding_window_size

@@ -83,7 +83,7 @@ class AscendMambaAttnBackendBase(MambaAttnBackendBase):
         forward_mode: ForwardMode,
         spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
     ):
-        mamba_indices = self._get_mamba_indices(bs, req_pool_indices)
+        mamba_indices = self.req_to_token_pool.get_mamba_indices(req_pool_indices)
         self.state_indices_list[bs - 1][: len(mamba_indices)].copy_(mamba_indices)
         if forward_mode.is_decode_or_idle():
             self.query_start_loc_list[bs - 1].copy_(
@@ -136,7 +136,7 @@ class AscendMambaAttnBackendBase(MambaAttnBackendBase):
         )
         # Make sure forward metadata is correctly handled for padding reqs
         req_pool_indices[bs - num_padding :] = 0
-        mamba_indices = self._get_mamba_indices(bs, req_pool_indices)
+        mamba_indices = self.req_to_token_pool.get_mamba_indices(req_pool_indices)
         mamba_indices[bs - num_padding :] = 0
         self.state_indices_list[bs - 1][: len(mamba_indices)].copy_(mamba_indices)
         if forward_mode.is_decode_or_idle():

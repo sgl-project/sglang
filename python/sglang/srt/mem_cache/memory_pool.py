@@ -545,6 +545,18 @@ class HybridReqToTokenPool(ReqToTokenPool):
         self.mamba_map = {layer_id: i for i, layer_id in enumerate(mamba_layer_ids)}
 
         self.device = device
+        req_pool_size = self.req_to_token.shape[0]
+        self.req_index_to_mamba_index_mapping: torch.Tensor = torch.zeros(
+            req_pool_size, dtype=torch.int32, device=self.device
+        )
+        if enable_mamba_extra_buffer:
+            self.req_index_to_mamba_ping_pong_track_buffer_mapping: torch.Tensor = (
+                torch.zeros(
+                    (req_pool_size, self.mamba_ping_pong_track_buffer_size),
+                    dtype=torch.int32,
+                    device=self.device,
+                )
+            )
 
     def register_layer_transfer_counter(
         self, layer_transfer_counter: "LayerDoneCounter"
@@ -558,6 +570,8 @@ class HybridReqToTokenPool(ReqToTokenPool):
         if select_index is None:
             return None
 
+        mamba_indices: list[torch.Tensor] = []
+        mamba_ping_pong_track_buffers: list[torch.Tensor] = []
         for req in reqs:
             if req.mamba_pool_idx is not None:  # for radix cache / continuing chunked
                 pass
@@ -568,6 +582,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
                 ), f"Not enough space for mamba cache, try to increase --mamba-full-memory-ratio or --max-mamba-cache-size. {mid=}, {self.mamba_pool.size=}, {self.mamba_pool.available_size()=}, {len(reqs)=}"
                 req.mamba_pool_idx = mid[0]
                 req.mamba_needs_clear = True
+            mamba_indices.append(req.mamba_pool_idx)
             if self.enable_mamba_extra_buffer:
                 if req.mamba_ping_pong_track_buffer is None:
                     req.mamba_ping_pong_track_buffer = self.mamba_pool.alloc(
@@ -577,7 +592,20 @@ class HybridReqToTokenPool(ReqToTokenPool):
                         req.mamba_ping_pong_track_buffer is not None
                     ), "Not enough space for mamba ping pong idx, try to increase --mamba-full-memory-ratio."
                     req.mamba_next_track_idx = 0
+                mamba_ping_pong_track_buffers.append(req.mamba_ping_pong_track_buffer)
+        mamba_index_tensor = torch.stack(mamba_indices).to(dtype=torch.int32)
+        self.req_index_to_mamba_index_mapping[select_index] = mamba_index_tensor
+        if self.enable_mamba_extra_buffer:
+            ping_pong_tensor = torch.stack(mamba_ping_pong_track_buffers).to(
+                dtype=torch.int32
+            )
+            self.req_index_to_mamba_ping_pong_track_buffer_mapping[select_index] = (
+                ping_pong_tensor
+            )
         return select_index
+
+    def get_mamba_indices(self, req_indices: torch.Tensor) -> torch.Tensor:
+        return self.req_index_to_mamba_index_mapping[req_indices]
 
     def mamba2_layer_cache(self, layer_id: int):
         assert layer_id in self.mamba_map
@@ -603,7 +631,9 @@ class HybridReqToTokenPool(ReqToTokenPool):
         req.mamba_pool_idx = None
 
         if self.enable_mamba_extra_buffer:
-            mamba_ping_pong_track_buffer_to_free = req.mamba_ping_pong_track_buffer
+            mamba_ping_pong_track_buffer_to_free = (
+                self.req_index_to_mamba_ping_pong_track_buffer_mapping[req.req_pool_idx]
+            )
             if mamba_ping_pong_track_buffer_to_keep is not None:
                 assert mamba_ping_pong_track_buffer_to_keep in [
                     0,
@@ -634,6 +664,9 @@ class HybridReqToTokenPool(ReqToTokenPool):
         logger.info("Reset HybridReqToTokenPool")
         super().clear()
         self.mamba_pool.clear()
+        self.req_index_to_mamba_index_mapping.zero_()
+        if self.enable_mamba_extra_buffer:
+            self.req_index_to_mamba_ping_pong_track_buffer_mapping.zero_()
 
 
 class KVCache(abc.ABC):
