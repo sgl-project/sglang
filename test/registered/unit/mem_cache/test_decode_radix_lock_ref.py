@@ -336,7 +336,7 @@ class TestDecodeLockRefScenarios(unittest.TestCase):
         queue.scheduler = scheduler
 
         # Initial budget says the request fits; post-lock budget says it does not.
-        queue._allocatable_tokens = MagicMock(side_effect=[8, 3])
+        queue._allocatable_token_budgets = MagicMock(side_effect=[8, 3])
 
         preallocated, failed = queue.pop_preallocated()
 
@@ -344,7 +344,7 @@ class TestDecodeLockRefScenarios(unittest.TestCase):
         self.assertEqual(failed, [])
         queue._pre_alloc.assert_not_called()
         queue.tree_cache.dec_lock_ref.assert_called_once_with(req.last_node)
-        self.assertEqual(queue._allocatable_tokens.call_count, 2)
+        self.assertEqual(queue._allocatable_token_budgets.call_count, 2)
 
     def test_repeated_incremental_no_leak(self):
         """Multiple incremental transfers shouldn't leak lock_refs."""

@@ -179,7 +179,6 @@ class DecodeReqToTokenPool:
 
 
 class HybridMambaDecodeReqToTokenPool(HybridReqToTokenPool):
-
     def __init__(
         self,
         size: int,
@@ -320,13 +319,10 @@ class DecodePreallocQueue:
         if self.enable_staging:
             self.transfer_queue._init_staging_handler(self.kv_manager)
 
-        self._swa_tail_prealloc = (
-            isinstance(self.token_to_kv_pool, (SWAKVPool, DeepSeekV4TokenToKVPool))
-            and self.token_to_kv_pool_allocator.page_size > 1
-            and hasattr(self.token_to_kv_pool_allocator, "alloc_extend_swa_tail")
-        )
-
-        if self.scheduler.tp_worker.is_hybrid_swa and not self._swa_tail_prealloc:
+        if (
+            self.scheduler.tp_worker.is_hybrid_swa
+            and not self._uses_swa_tail_prealloc()
+        ):
             # Fallback for SWA allocators that still allocate the SWA pool at
             # full prompt length.
             self.max_total_num_tokens = min(
@@ -335,7 +331,11 @@ class DecodePreallocQueue:
             )
 
     def _uses_swa_tail_prealloc(self) -> bool:
-        return self._swa_tail_prealloc
+        return (
+            isinstance(self.token_to_kv_pool, (SWAKVPool, DeepSeekV4TokenToKVPool))
+            and self.token_to_kv_pool_allocator.page_size > 1
+            and hasattr(self.token_to_kv_pool_allocator, "alloc_extend_swa_tail")
+        )
 
     def _swa_tail_len(self, seq_len: int) -> int:
         if not self._uses_swa_tail_prealloc() or seq_len <= 0:
@@ -1540,7 +1540,6 @@ class DecodeTransferQueue:
 
 
 class SchedulerDisaggregationDecodeMixin:
-
     @torch.no_grad()
     def event_loop_normal_disagg_decode(self: Scheduler):
         """A normal scheduler loop for decode worker in disaggregation mode."""
