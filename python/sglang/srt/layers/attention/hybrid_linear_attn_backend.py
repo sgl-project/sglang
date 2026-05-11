@@ -743,8 +743,13 @@ class HybridLinearAttnBackend(AttentionBackend):
         self, layer: Optional[RadixAttention], layer_id: Optional[int] = None
     ) -> bool:
         # Dispatch by the layer's runtime type
+        if isinstance(layer, RadixLinearAttention):
+            return False
+        if isinstance(layer, RadixAttention):
+            return True
+
         if layer is not None:
-            return not isinstance(layer, RadixLinearAttention)
+            layer_id = layer.layer_id
         assert layer_id is not None, "either layer or layer_id must be provided"
         return layer_id in self.full_attn_layers
 
