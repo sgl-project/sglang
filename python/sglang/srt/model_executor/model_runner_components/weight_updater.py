@@ -151,10 +151,12 @@ class WeightUpdater:
                 self._mr.model = model_load_weights(self._mr.model, iter)
                 return False, message
 
-        self._mr.model = model
-        self._mr.server_args.model_path = model_path
-        self._mr.server_args.load_format = load_format
-        self._mr.load_config = load_config
+        self._mr.update_model_fields(
+            model,
+            model_path=model_path,
+            load_format=load_format,
+            load_config=load_config,
+        )
 
         if recapture_cuda_graph and (
             self._mr.device == "cuda"
