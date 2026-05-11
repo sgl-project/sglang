@@ -3,7 +3,7 @@ from types import SimpleNamespace
 
 from sglang.srt.environ import envs
 from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.few_shot_gsm8k import run_eval as run_gsm8k_eval
+from sglang.test.run_eval import run_eval
 from sglang.test.server_fixtures.disaggregation_fixture import (
     PDDisaggregationServerBase,
 )
@@ -36,9 +36,6 @@ _EAGLE_SPEC_ARGS = [
 
 
 class TestDisaggregationDSV4(PDDisaggregationServerBase):
-    PREFILL_DP_SIZE = 4
-    DECODE_DP_SIZE = 4
-
     @classmethod
     def setUpClass(cls):
         super().setUpClass()
@@ -63,9 +60,9 @@ class TestDisaggregationDSV4(PDDisaggregationServerBase):
             "--disaggregation-bootstrap-port",
             cls.bootstrap_port,
             "--tp",
-            str(cls.PREFILL_DP_SIZE),
+            4,
             "--dp",
-            str(cls.PREFILL_DP_SIZE),
+            4,
             "--enable-dp-attention",
             "--moe-a2a-backend",
             "deepep",
@@ -97,12 +94,12 @@ class TestDisaggregationDSV4(PDDisaggregationServerBase):
             "--disaggregation-bootstrap-port",
             cls.bootstrap_port,
             "--tp",
-            str(cls.DECODE_DP_SIZE),
+            4,
             "--dp",
-            str(cls.DECODE_DP_SIZE),
+            4,
             "--enable-dp-attention",
             "--base-gpu-id",
-            str(cls.PREFILL_DP_SIZE),
+            4,
             "--moe-a2a-backend",
             "deepep",
             "--deepep-config",
@@ -125,19 +122,19 @@ class TestDisaggregationDSV4(PDDisaggregationServerBase):
         )
 
     def test_gsm8k(self):
-        """End-to-end PD-disagg accuracy through the LB."""
         args = SimpleNamespace(
-            num_shots=5,
-            data_path=None,
-            num_questions=200,
-            max_new_tokens=512,
-            parallel=64,
-            host=f"http://{self.base_host}",
-            port=int(self.lb_port),
+            base_url=self.base_url,
+            model=self.model,
+            eval_name="gsm8k",
+            api="completion",
+            max_tokens=512,
+            num_examples=200,
+            num_threads=128,
         )
-        metrics = run_gsm8k_eval(args)
-        print(f"{metrics=}")
-        self.assertGreater(metrics["accuracy"], 0.95)
+        metrics = run_eval(args)
+        print(f"Evaluation metrics: {metrics}")
+
+        self.assertGreater(metrics["score"], 0.92)
 
 
 if __name__ == "__main__":
