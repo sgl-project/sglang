@@ -238,7 +238,7 @@ class PiecewiseCudaGraphRunner:
                 (self.max_num_tokens,), dtype=self._cache_loc_dtype()
             )
             out_cache_loc_swa = (
-                torch.zeros((self.max_num_tokens,), dtype=torch.int64)
+                torch.zeros((self.max_num_tokens,), dtype=torch.int32)
                 if model_runner.is_hybrid_swa
                 else None
             )
@@ -304,8 +304,14 @@ class PiecewiseCudaGraphRunner:
             language_model = getattr(
                 self.model_runner.model, "language_model", self.model_runner.model
             )
+            layer_model = (
+                language_model.model
+                if hasattr(language_model, "model")
+                and hasattr(language_model.model, "layers")
+                else language_model
+            )
             with patch_model(
-                language_model.model, self.compile_config.compiler
+                layer_model, self.compile_config.compiler
             ) as patched_model:
 
                 # Dummy warmup for jit kernel

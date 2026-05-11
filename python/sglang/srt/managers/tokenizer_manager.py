@@ -40,6 +40,7 @@ import zmq.asyncio
 from fastapi import BackgroundTasks
 
 from sglang.srt.configs.model_config import ModelConfig
+from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.disaggregation.encode_receiver import create_mm_receiver
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
@@ -390,6 +391,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # Dumping
         self.dump_requests_folder = ""  # By default do not dump
         self.dump_requests_threshold = 1000
+        self.dump_requests_exclude_meta_keys: List[str] = [
+            "routed_experts",
+            "hidden_states",
+        ]
         self.dump_request_list: List[Tuple] = []
         self.crash_dump_request_list: deque[Tuple] = deque()
         self.crash_dump_performed = False  # Flag to ensure dump is only called once
@@ -1013,6 +1018,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 require_reasoning=obj.require_reasoning,
                 return_hidden_states=obj.return_hidden_states,
                 return_routed_experts=obj.return_routed_experts,
+                routed_experts_start_len=obj.routed_experts_start_len,
+                return_indexer_topk=obj.return_indexer_topk,
                 routed_dp_rank=obj.routed_dp_rank,
                 disagg_prefill_dp_rank=obj.disagg_prefill_dp_rank,
                 priority=obj.priority,
@@ -1575,6 +1582,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             self.dump_requests_folder = obj.dump_requests_folder
         if obj.dump_requests_threshold is not None:
             self.dump_requests_threshold = obj.dump_requests_threshold
+        if obj.dump_requests_exclude_meta_keys is not None:
+            self.dump_requests_exclude_meta_keys = list(
+                obj.dump_requests_exclude_meta_keys
+            )
         if obj.crash_dump_folder is not None:
             self.crash_dump_folder = obj.crash_dump_folder
         logging.info(f"Config logging: {obj=}")
@@ -1652,6 +1663,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         for i, rid in enumerate(recv_obj.rids):
             state = self.rid_to_state.get(rid, None)
             if state is None:
+                # Known race: /health_generate pops its rid as soon as ANY message bumps last_receive_tstamp.
+                if rid.startswith(HEALTH_CHECK_RID_PREFIX):
+                    continue
                 logger.error(
                     f"Received output for {rid=} but the state was deleted in TokenizerManager."
                 )
@@ -1663,7 +1677,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 "finish_reason": recv_obj.finished_reasons[i],
                 "prompt_tokens": recv_obj.prompt_tokens[i],
                 "weight_version": self.server_args.weight_version,
-                "total_retractions": recv_obj.retraction_counts[i],
+                "num_retractions": recv_obj.retraction_counts[i],
             }
 
             if self.enable_metrics:
@@ -1710,6 +1724,12 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     if isinstance(val, torch.Tensor):
                         val = pybase64.b64encode(val.numpy().tobytes()).decode("utf-8")
                     meta_info["routed_experts"] = val
+            if getattr(recv_obj, "indexer_topk", None):
+                val = recv_obj.indexer_topk[i]
+                if val is not None:
+                    if isinstance(val, torch.Tensor):
+                        val = pybase64.b64encode(val.numpy().tobytes()).decode("utf-8")
+                    meta_info["indexer_topk"] = val
             if getattr(recv_obj, "customized_info", None):
                 for k, v in recv_obj.customized_info.items():
                     meta_info[k] = v[i]
@@ -2182,6 +2202,16 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             )
 
     def dump_requests(self, state: ReqState, out_dict: dict):
+        if self.dump_requests_exclude_meta_keys and isinstance(
+            out_dict.get("meta_info"), dict
+        ):
+            exclude = self.dump_requests_exclude_meta_keys
+            if any(k in out_dict["meta_info"] for k in exclude):
+                filtered_meta = {
+                    k: v for k, v in out_dict["meta_info"].items() if k not in exclude
+                }
+                out_dict = {**out_dict, "meta_info": filtered_meta}
+
         self.dump_request_list.append(
             (
                 state.obj,
@@ -2232,7 +2262,20 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         def background_task():
             os.makedirs(os.path.dirname(filename), exist_ok=True)
             with open(filename, "wb") as f:
-                pickle.dump(to_dump_with_server_args, f)
+                try:
+                    pickle.dump(to_dump_with_server_args, f)
+                except Exception as e:
+                    # When the server is launched with --trust-remote-code,
+                    # server_args sometimes fails to pickle. Retry without
+                    # server_args so the request data still gets persisted.
+                    logger.error(
+                        f"Failed to pickle dump with server_args: {e!r}; "
+                        "retrying without server_args"
+                    )
+                    f.seek(0)
+                    f.truncate()
+                    to_dump_with_server_args["server_args"] = None
+                    pickle.dump(to_dump_with_server_args, f)
 
         asyncio.create_task(asyncio.to_thread(background_task))
 
@@ -2295,7 +2338,20 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             "launch_command": " ".join(sys.argv),
         }
         with open(filename, "wb") as f:
-            pickle.dump(data_to_dump_with_server_args, f)
+            try:
+                pickle.dump(data_to_dump_with_server_args, f)
+            except Exception as e:
+                # When the server is launched with --trust-remote-code,
+                # server_args sometimes fails to pickle. Retry without
+                # server_args so the request data still gets persisted.
+                logger.error(
+                    f"Failed to pickle dump with server_args: {e!r}; "
+                    "retrying without server_args"
+                )
+                f.seek(0)
+                f.truncate()
+                data_to_dump_with_server_args["server_args"] = None
+                pickle.dump(data_to_dump_with_server_args, f)
         logger.error(
             f"Dumped {len(self.crash_dump_request_list)} finished and {len(unfinished_requests)} unfinished requests before crash to {filename}"
         )
