@@ -64,9 +64,32 @@ if _is_cuda:
 
 
 if _use_aiter:
-    from aiter.ops.fused_qk_norm_rope_cache_quant import (
-        fused_qk_rmsnorm as fused_qk_rmsnorm_bf16,
+    # ROCm/aiter#2958 unified the fused_qk_rmsnorm entry point under
+    # aiter.ops.fused_qk_rmsnorm_group_quant with an in-place, kwarg-only,
+    # no-return signature. This branch targets post-#2958 aiter only; backward
+    # compatibility with the legacy aiter.ops.fused_qk_norm_rope_cache_quant
+    # symbol lives on sglang:main until the Dockerfile pin is bumped.
+    from aiter.ops.enum import QuantType as _AiterQuantType
+    from aiter.ops.fused_qk_rmsnorm_group_quant import (
+        fused_qk_rmsnorm as _aiter_fused_qk_rmsnorm,
     )
+
+    def fused_qk_rmsnorm_bf16(q, q_weight, q_eps, k, k_weight, k_eps):
+        q_out = torch.empty_like(q)
+        k_out = torch.empty_like(k)
+        _aiter_fused_qk_rmsnorm(
+            q_out_quantized=q_out,
+            k_out=k_out,
+            q=q,
+            q_weight=q_weight,
+            q_epsilon=q_eps,
+            k=k,
+            k_weight=k_weight,
+            k_epsilon=k_eps,
+            quant_type=_AiterQuantType.No,
+        )
+        return q_out, k_out
+
     from aiter.ops.triton.batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant import (
         batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant,
     )
