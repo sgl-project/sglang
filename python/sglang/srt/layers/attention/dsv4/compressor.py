@@ -453,6 +453,7 @@ class Compressor(nn.Module):
         """
         Reads from non-paged ``DeepSeekV4CompressState`` buffers.
         """
+        
         assert self.ape_converted
         seq_lens = forward_batch.seq_lens
         pool = self._get_states(forward_batch)
@@ -649,6 +650,30 @@ class Compressor(nn.Module):
         kv_and_scores = KVAndScoreOld(kv=kv, score=score)
         forward_mode = forward_batch.forward_mode
         if forward_mode.is_decode() or forward_mode.is_target_verify():
+            if _cpu_amx:
+                pool = self._get_states(forward_batch)
+                assert isinstance(pool, KVAndScoreOld)
+                freqs_real = self._get_freqs_cis_real()
+                norm_weight = self.norm.weight.float()
+
+                forward_mode = forward_batch.forward_mode
+                return torch.ops.sgl_kernel.compress_decode_cpu(
+                        pool.kv,
+                        pool.score,
+                        kv,
+                        score,
+                        forward_batch.seq_lens.to(torch.int64),
+                        forward_batch.req_pool_indices.to(torch.int64),
+                        self.ape,
+                        norm_weight,
+                        freqs_real,
+                        self.ratio,
+                        self.head_dim,
+                        self.rope_head_dim,
+                        self.overlap,
+                        self.rotate,
+                        self.norm.eps,
+                    )
             return self.compress_decode(kv_and_scores, forward_batch)
         if forward_mode.is_extend():
             return self.compress_extend(kv_and_scores, forward_batch)

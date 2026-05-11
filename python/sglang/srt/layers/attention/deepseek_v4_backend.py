@@ -80,9 +80,12 @@ def _pad_last_dim(x: T, multiples_of: int = PAGE_INDEX_ALIGNED_SIZE) -> T:
 
 
 def _create_flashmla_metadata():
-    import flash_mla
+    try:
+        import flash_mla
 
-    return flash_mla.get_mla_metadata()[0]
+        return flash_mla.get_mla_metadata()[0]
+    except:
+        return None
 
 
 def _create_dummy_paged_compress_data(compress_ratio: int):

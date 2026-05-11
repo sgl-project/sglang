@@ -421,7 +421,7 @@ class CompressorPrefillPlan(NamedTuple):
             device=seq_lens.device,
             pin_memory=seq_lens.is_cpu if not _is_cpu else False,
         )
-        module = _jit_common_module()
+
         is_overlap = compress_ratio == 4
         if _is_cpu:
             plan_lens = _plan_compress_prefill_torch(
@@ -434,6 +434,7 @@ class CompressorPrefillPlan(NamedTuple):
                 use_cuda_graph,
             )
         else:
+            module = _jit_common_module()
             plan_lens = module.plan_compress_prefill(
                 extend_lens,
                 seq_lens,
