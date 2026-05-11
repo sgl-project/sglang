@@ -566,8 +566,21 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             ), "Pipeline Parallel is not compatible with this model."
 
         # For weight updates
-        self.weight_updater = WeightUpdater(tp_rank=self.tp_rank, _mr=self)
+        self.init_weight_updater()
         self._weights_send_group = {}
+
+    def init_weight_updater(self):
+        self.weight_updater = WeightUpdater(
+            tp_rank=self.tp_rank,
+            device=self.device,
+            gpu_id=self.gpu_id,
+            model_config=self.model_config,
+            custom_weight_loaders=self.server_args.custom_weight_loader,
+            get_model=lambda: self.model,
+            update_model_fields=self.update_model_fields,
+            recapture_cuda_graph=self.init_decode_cuda_graph,
+            get_model_runner=lambda: self,
+        )
 
     def init_msprobe(self):
         # Init the msprobe
