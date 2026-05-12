@@ -491,8 +491,12 @@ class EAGLEWorker(TpModelWorker):
 
             if get_global_tracing_enabled():
                 for idx, req in enumerate(batch.reqs):
-                    accepted = verify_output.num_correct_drafts_per_req_cpu[idx]
-                    req.time_stats.set_spec_verify_end_time(accepted_tokens=accepted)
+                    num_correct_drafts = verify_output.num_correct_drafts_per_req_cpu[
+                        idx
+                    ]
+                    req.time_stats.set_spec_verify_end_time(
+                        num_correct_drafts=num_correct_drafts
+                    )
 
             set_time_batch(
                 batch.reqs, "set_spec_draft_extend_start_time", trace_only=True
