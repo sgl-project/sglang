@@ -56,6 +56,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     PPProxyTensors,
 )
 from sglang.srt.utils import get_available_gpu_memory, is_npu, log_info_on_rank0
+from sglang.srt.utils.common import require_attn_tp_gather, require_mlp_tp_gather
 
 logger = logging.getLogger(__name__)
 
@@ -147,6 +148,8 @@ class PiecewiseCudaGraphRunner:
 
         self.attn_tp_size = get_attention_tp_size()
         self.attn_tp_rank = get_attention_tp_rank()
+        self.require_mlp_tp_gather = require_mlp_tp_gather(model_runner.server_args)
+        self.require_attn_tp_gather = require_attn_tp_gather(model_runner.server_args)
 
         set_torch_compile_config()
 
@@ -284,6 +287,35 @@ class PiecewiseCudaGraphRunner:
         self.raw_num_tokens = 0
         self._logged_first_replay = False
 
+    def _make_global_num_tokens_for_capture(
+        self, num_tokens: int
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None, int | None]:
+        if self.require_mlp_tp_gather:
+            global_num_tokens_gpu = torch.full(
+                (self.dp_size,), num_tokens, dtype=torch.int32, device=self.device
+            )
+            global_num_tokens_for_logprob_gpu = torch.full(
+                (self.dp_size,), num_tokens, dtype=torch.int32, device=self.device
+            )
+            global_dp_buffer_len = num_tokens * self.dp_size
+        elif self.require_attn_tp_gather:
+            global_num_tokens_gpu = torch.tensor(
+                [num_tokens], dtype=torch.int32, device=self.device
+            )
+            global_num_tokens_for_logprob_gpu = torch.tensor(
+                [num_tokens], dtype=torch.int32, device=self.device
+            )
+            global_dp_buffer_len = num_tokens
+        else:
+            global_num_tokens_gpu = None
+            global_num_tokens_for_logprob_gpu = None
+            global_dp_buffer_len = None
+        return (
+            global_num_tokens_gpu,
+            global_num_tokens_for_logprob_gpu,
+            global_dp_buffer_len,
+        )
+
     def _prepare_piecewise_cuda_graph_modules(self):
         language_model = getattr(
             self.model_runner.model, "language_model", self.model_runner.model
@@ -328,6 +360,11 @@ class PiecewiseCudaGraphRunner:
             else None
         )
         with torch.device(self.device):
+            (
+                global_num_tokens_gpu,
+                global_num_tokens_for_logprob_gpu,
+                global_dp_buffer_len,
+            ) = self._make_global_num_tokens_for_capture(num_tokens)
             forward_batch = ForwardBatch(
                 forward_mode=ForwardMode.EXTEND,
                 batch_size=1,
@@ -357,10 +394,10 @@ class PiecewiseCudaGraphRunner:
                 extend_seq_lens_cpu=torch.tensor([num_tokens], device="cpu"),
                 extend_logprob_start_lens_cpu=torch.tensor([num_tokens], device="cpu"),
                 positions=positions,
-                global_num_tokens_gpu=None,
-                global_num_tokens_for_logprob_gpu=None,
+                global_num_tokens_gpu=global_num_tokens_gpu,
+                global_num_tokens_for_logprob_gpu=global_num_tokens_for_logprob_gpu,
                 dp_padding_mode=DpPaddingMode.get_default_mode_in_cuda_graph(),
-                global_dp_buffer_len=None,
+                global_dp_buffer_len=global_dp_buffer_len,
                 mrope_positions=mrope_positions,
                 spec_algorithm=None,
                 spec_info=None,
@@ -465,7 +502,11 @@ class PiecewiseCudaGraphRunner:
             self.mrope_positions[:, :num_tokens] if self.is_multimodal else None
         )
 
-        global_dp_buffer_len = None
+        (
+            global_num_tokens_gpu,
+            global_num_tokens_for_logprob_gpu,
+            global_dp_buffer_len,
+        ) = self._make_global_num_tokens_for_capture(num_tokens)
 
         if self.model_runner.server_args.enable_lora:
             # It is safe to capture CUDA graph using empty LoRA id, as the LoRA kernels will always be launched whenever
@@ -504,10 +545,10 @@ class PiecewiseCudaGraphRunner:
                 extend_seq_lens_cpu=torch.tensor([num_tokens], device="cpu"),
                 extend_logprob_start_lens_cpu=torch.tensor([num_tokens], device="cpu"),
                 positions=positions,
-                global_num_tokens_gpu=None,
-                global_num_tokens_for_logprob_gpu=None,
+                global_num_tokens_gpu=global_num_tokens_gpu,
+                global_num_tokens_for_logprob_gpu=global_num_tokens_for_logprob_gpu,
                 dp_padding_mode=DpPaddingMode.get_default_mode_in_cuda_graph(),
-                global_dp_buffer_len=None,
+                global_dp_buffer_len=global_dp_buffer_len,
                 mrope_positions=mrope_positions,
                 spec_algorithm=None,
                 spec_info=None,
