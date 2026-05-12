@@ -639,9 +639,10 @@ _is_npu = is_npu()
 def is_pin_memory_available(device=None) -> bool:
     if device is None:
         return _is_cuda or _is_npu
-    if str(device) == "cuda":
+    device_type = str(device).split(":")[0]
+    if device_type == "cuda":
         return _is_cuda
-    if str(device) == "npu":
+    if device_type == "npu":
         return _is_npu
     return False
 
