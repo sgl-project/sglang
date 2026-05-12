@@ -1452,6 +1452,9 @@ class SchedulerDisaggregationDecodeMixin:
         if len(self.waiting_queue) == 0:
             return None
 
+        if self.enable_priority_scheduling:
+            self.policy.calc_priority(self.waiting_queue, self.running_batch)
+
         curr_batch_size = self.running_batch.batch_size()
 
         batch_size = min(self.req_to_token_pool.size, self.max_running_requests)
