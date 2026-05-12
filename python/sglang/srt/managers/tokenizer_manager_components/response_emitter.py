@@ -243,3 +243,35 @@ class ResponseEmitter:
         background_tasks = BackgroundTasks()
         background_tasks.add_task(abort_request)
         return background_tasks
+
+    async def _handle_batch_request(
+        self,
+        obj,
+        *,
+        rids,
+        generators,
+        request=None,
+    ):
+        """Wait for all per-request generators and yield outputs (single or stream)."""
+        is_stream = hasattr(obj, "stream") and obj.stream
+        if not is_stream:
+            outputs = await asyncio.gather(*(gen.__anext__() for gen in generators))
+            yield outputs
+        else:
+            rid_to_index = {rid: i for i, rid in enumerate(rids)}
+            task_map = {asyncio.create_task(gen.__anext__()): gen for gen in generators}
+            while task_map:
+                done, _ = await asyncio.wait(
+                    task_map.keys(), return_when=asyncio.FIRST_COMPLETED
+                )
+
+                for task in done:
+                    gen = task_map.pop(task)
+                    try:
+                        result = task.result()
+                        result["index"] = rid_to_index[result["meta_info"]["id"]]
+                        yield result
+                        new_task = asyncio.create_task(gen.__anext__())
+                        task_map[new_task] = gen
+                    except StopAsyncIteration:
+                        pass
