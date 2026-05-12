@@ -395,7 +395,24 @@ def fp8_native_paged_mean_pooling_completed_blocks(
 
                 T.fill(acc, 0.0)
                 for b_i in T.serial(K // block_N):
-                    chunk_logical_start = logical_start + b_i * block_N
+                    chunk_logical_start_raw = logical_start + b_i * block_N
+                    # Clamp the ReqToToken index. The `if pblk_rel < n_new`
+                    # gate above mathematically bounds chunk_logical_start_raw
+                    # by new_len, but tilelang may speculatively issue the
+                    # load before the branch — for pow2-bucketed grids,
+                    # excluded pblk_rel can compute pblk_abs * K + b_i *
+                    # block_N >= max_ctx → OOB → illegal memory access
+                    # (Xid 13). Clamping keeps the speculative load
+                    # in-bounds; the gate still discards the result.
+                    #
+                    # Use ``max(new_len - 1, 0)`` because CUDA-graph padded
+                    # batches default unused-slot seq_lens to 0; ``new_len -
+                    # 1 = -1`` would index ReqToToken at -1, which under
+                    # int32 → uint64 widening becomes a huge offset → OOB.
+                    safe_upper = T.max(new_len - 1, 0)
+                    chunk_logical_start = T.min(
+                        chunk_logical_start_raw, safe_upper
+                    )
                     T.fill(index_k_shared, 0.0)
 
                     buf_pos = ReqToToken[req_idx, chunk_logical_start]
@@ -615,7 +632,12 @@ def fp8_native_paged_mean_pooling_completed_blocks_grouped(
                 # excluded pg_rel it gives a safe in-bounds load whose result
                 # is discarded anyway.
                 logical_start_token_raw = pg_abs * paged_block_size
-                logical_start_token = T.min(logical_start_token_raw, new_len - 1)
+                # See vanilla kernel for the speculative-load OOB rationale.
+                # ``max(new_len - 1, 0)`` guards against new_len==0 on
+                # CUDA-graph padded dummy slots: a -1 index would widen to
+                # a huge unsigned offset and segfault.
+                safe_upper = T.max(new_len - 1, 0)
+                logical_start_token = T.min(logical_start_token_raw, safe_upper)
                 buf_pos = ReqToToken[req_idx, logical_start_token]
                 phys_page = buf_pos // paged_block_size
 
