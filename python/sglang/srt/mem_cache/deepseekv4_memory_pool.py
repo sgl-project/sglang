@@ -17,6 +17,7 @@ from sglang.srt.mem_cache.compress_state import (
     DeepSeekV4CompressState,
     KVAndScore,
 )
+from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.mem_cache.memory_pool import KVCache
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import ceil_div
@@ -404,7 +405,7 @@ class DeepSeekV4LayerItem(NamedTuple):
     compress_kv_pool: Optional[DeepSeekV4SingleKVPool] = None
 
 
-class DeepSeekV4TokenToKVPool(KVCache):
+class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
 
     def __init__(
         self,
@@ -527,6 +528,11 @@ class DeepSeekV4TokenToKVPool(KVCache):
 
     def register_mapping(self, full_to_swa_index_mapping: torch.Tensor):
         self.full_to_swa_index_mapping = full_to_swa_index_mapping
+
+    def set_swa_loc(self, loc: torch.Tensor) -> None:
+        # No-op: DSv4 caches its own SWA loc via _should_cache_swa + cached_loc
+        # in set_swa_key_buffer_radix_fused; we ignore main's precomputed loc.
+        pass
 
     def get_ring_size(self, compress_ratio: int) -> int:
         server_args = get_global_server_args()

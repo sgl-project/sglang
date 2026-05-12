@@ -651,19 +651,10 @@ class ModelRunnerKVCacheMixin:
                         need_sort=need_sort,
                     )
             else:
-                if self.is_hybrid_swa and not is_v4_model:
+                if self.is_hybrid_swa:
                     self.token_to_kv_pool_allocator = SWATokenToKVPoolAllocator(
                         self.full_max_total_num_tokens,
                         self.swa_max_total_num_tokens,
-                        page_size=self.page_size,
-                        dtype=self.kv_cache_dtype,
-                        device=self.device,
-                        kvcache=self.token_to_kv_pool,
-                        need_sort=need_sort,
-                    )
-                elif is_v4_model:
-                    self.token_to_kv_pool_allocator = PagedTokenToKVPoolAllocator(
-                        self.max_total_num_tokens,
                         page_size=self.page_size,
                         dtype=self.kv_cache_dtype,
                         device=self.device,
