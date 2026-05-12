@@ -2495,12 +2495,22 @@ class Scheduler(
             and self.last_batch
             and self.last_batch.forward_mode.is_extend()
         ):
-            # PP can hold an in-flight chunked req across multiple microbatches.
-            # Any req that appears in both last_batch and waiting_queue is an
-            # in-flight chunked req that must not be merged into running_batch.
+            # Exclude any in-flight chunked req in last_batch from being
+            # merged into running_batch. Identify them by either:
+            #   (a) presence in waiting_queue — covers the "OP already
+            #       re-added the chunked req" case (PP non-overlap, where
+            #       OP for the same iter's batch runs before next iter's
+            #       get_next_batch_to_run);
+            #   (b) ``req.is_chunked > 0`` — covers overlap mode where OP
+            #       has not yet decremented is_chunked / re-added the req
+            #       to waiting_queue (OP delayed by one iter). Without
+            #       this, a mid-chunked retracted/resumed req leaks into
+            #       running_batch as if its prefill were complete, which
+            #       severely corrupts decode (random-chance MMLU score on
+            #       test_retract_decode + chunked-prefill).
             waiting_set = set(self.waiting_queue)
             chunked_req_to_exclude.update(
-                r for r in self.last_batch.reqs if r in waiting_set
+                r for r in self.last_batch.reqs if r in waiting_set or r.is_chunked > 0
             )
 
             if self.dllm_config is not None and self.last_batch.reqs:
@@ -2793,9 +2803,7 @@ class Scheduler(
         # chunk is mid-flight in one microbatch, the req is OUT of
         # waiting_queue, so the next microbatch in the same outer iter can't
         # also admit it and re-prefill the same KV range concurrently.
-        self.waiting_queue = [
-            x for x in self.waiting_queue if x not in can_run_set
-        ]
+        self.waiting_queue = [x for x in self.waiting_queue if x not in can_run_set]
         if adder.preempt_list:
             for req in adder.preempt_list:
                 self._add_request_to_queue(req)
