@@ -118,37 +118,3 @@ def quant_to_nope_fp8_rope_bf16_pack_triton(
         k_rope_bf16=k_rope_bf16,
         scale_k_nope_ue8m0=scale_k_nope_ue8m0,
     )
-
-
-def quant_to_nope_fp8_rope_bf16_pack(k_bf16: torch.Tensor) -> NopeFp8RopeBf16Pack:
-    """Torch reference implementation for accuracy baseline."""
-    assert k_bf16.dtype == torch.bfloat16
-    _num_tokens, hidden_dim = k_bf16.shape
-    assert hidden_dim == 512
-    dim_nope = 448
-    dim_rope = 64
-
-    k_nope_bf16, k_rope_bf16 = k_bf16.split([dim_nope, dim_rope], dim=-1)
-
-    tile_size = 64
-    num_tiles = dim_nope // tile_size
-
-    x = k_nope_bf16.contiguous().view(-1, num_tiles, tile_size)
-    scale = x.abs().amax(dim=-1).float() / 448.0
-    scale_pow2_fp32 = _cast_scale_inv_to_ue8m0(scale, out_dtype=torch.float32)
-    scale_k_nope_ue8m0 = scale_pow2_fp32.to(torch.float8_e8m0fnu)
-    k_nope_fp8 = (x.float() / scale_pow2_fp32.unsqueeze(-1)).to(fp8_dtype)
-    k_nope_fp8 = k_nope_fp8.view(-1, tile_size * num_tiles)
-    scale_k_nope_ue8m0 = scale_k_nope_ue8m0.view(torch.uint8)
-
-    return NopeFp8RopeBf16Pack(
-        k_nope_fp8=k_nope_fp8,
-        k_rope_bf16=k_rope_bf16.contiguous(),
-        scale_k_nope_ue8m0=scale_k_nope_ue8m0,
-    )
-
-
-def _cast_scale_inv_to_ue8m0(
-    scales_inv: torch.Tensor, out_dtype=torch.float32
-) -> torch.Tensor:
-    return torch.pow(2, torch.clamp_min(scales_inv, 1e-4).log2().ceil()).to(out_dtype)

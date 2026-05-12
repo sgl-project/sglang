@@ -336,15 +336,8 @@ class ModelRunnerKVCacheMixin:
         )
 
         if is_dsv4_model:
-
-            if envs.SGLANG_OPT_DPSK_V4_RADIX.get():
-                swa_page_size = self.page_size
-                assert swa_page_size == 256, "In paged swa mode, page_size must be 256."
-            else:
-                swa_page_size = self.model_config.window_size
-                assert (
-                    swa_page_size == 128
-                ), "In ring buffer swa mode, page_size must be 128."
+            swa_page_size = self.page_size
+            assert swa_page_size == 256, "In paged swa mode, page_size must be 256."
 
             if self.is_draft_worker:
                 from sglang.srt.models.deepseek_v4_nextn import (

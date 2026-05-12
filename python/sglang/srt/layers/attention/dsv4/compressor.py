@@ -36,7 +36,7 @@ from sglang.srt.mem_cache.deepseek_v4_compress_state import (
 )
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.models.deepseek_v2 import _is_hip
-from sglang.srt.utils import add_prefix, get_bool_env_var
+from sglang.srt.utils import add_prefix
 
 if _is_hip:
     from sglang.srt.layers.deepseek_v4_rope import (
@@ -408,19 +408,7 @@ class Compressor(nn.Module):
         assert not self.ape_converted
         self.ape_converted = True
 
-        is_model_2604 = envs.SGLANG_DSV4_MODE.get() == "2604"
-        if (
-            self.overlap
-            and not is_model_2604
-            and get_bool_env_var("SGLANG_ENABLE_APE_HOTFIX", "1")
-        ):
-            ape = torch.chunk(self.ape.data, 2, dim=-1)
-            if self.use_fused_compress:
-                ape = torch.cat([ape[1], ape[0]], dim=0)
-            else:
-                ape = torch.cat([ape[1], ape[0]], dim=-1)
-            self.ape.data.copy_(ape.view(self.ratio, -1))
-        elif self.overlap and is_model_2604:
+        if self.overlap:
             ape = torch.chunk(self.ape.data, 2, dim=-1)
             ape = torch.cat([ape[0], ape[1]], dim=0)
             self.ape.data.copy_(ape.view(self.ratio, -1))
@@ -454,28 +442,6 @@ class Compressor(nn.Module):
     @cached_property
     def use_hip_fused_compress(self) -> bool:
         return _is_hip and envs.SGLANG_OPT_USE_FUSED_COMPRESS.get()
-
-    def apply_ape_hotfix(self):
-        assert not self.ape_converted
-        self.ape_converted = True
-
-        # ========== copied from the hotfix in "260119-updated" of ref code ==========
-        is_model_2604 = envs.SGLANG_DSV4_MODE.get() == "2604"
-        if (
-            self.overlap
-            and not is_model_2604
-            and get_bool_env_var("SGLANG_ENABLE_APE_HOTFIX", "1")
-        ):
-            # NOTE: We reorder the parameters here to match the layout of the provided checkpoint.
-            # This is only required for compatibility with this checkpoint; the official version
-            # does not need this reordering.
-            ape = torch.chunk(self.ape.data, 2, dim=-1)
-            if self.use_fused_compress:
-                ape = torch.cat([ape[1], ape[0]], dim=0)
-            else:
-                ape = torch.cat([ape[1], ape[0]], dim=-1)
-            self.ape.data.copy_(ape.view(self.ratio, -1))
-            # ============================================================================
 
     def _get_states(self, forward_batch: ForwardBatch) -> KVAndScore:
         token_to_kv_pool = forward_batch.token_to_kv_pool
