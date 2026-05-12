@@ -31,6 +31,9 @@ from sglang.multimodal_gen.runtime.layers.quantization.configs.nunchaku_config i
     NunchakuConfig,
 )
 from sglang.multimodal_gen.runtime.loader.utils import BYTES_PER_GB
+from sglang.multimodal_gen.runtime.managers.continuous_batching import (
+    validate_continuous_batching_config,
+)
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload_components import (
     LAYERWISE_OFFLOAD_ALL_COMPONENTS,
     LAYERWISE_OFFLOAD_DIT_GROUP,
@@ -1727,8 +1730,12 @@ class ServerArgs(DisaggServerArgsMixin):
             "--batching-mode",
             type=str,
             default=ServerArgs.batching_mode,
-            choices=["dynamic"],
-            help="Request batching scheduler mode. Currently only 'dynamic' is implemented.",
+            choices=["dynamic", "continuous"],
+            help=(
+                "Request batching scheduler mode. 'dynamic' merges compatible "
+                "requests before denoising; 'continuous' batches compatible "
+                "denoising steps from active requests."
+            ),
         )
         parser.add_argument(
             "--batching-max-size",
@@ -2363,12 +2370,14 @@ class ServerArgs(DisaggServerArgsMixin):
             )
 
     def _validate_batching(self):
-        if self.batching_mode != "dynamic":
-            raise ValueError("batching_mode must be one of: dynamic")
+        if self.batching_mode not in ("dynamic", "continuous"):
+            raise ValueError("batching_mode must be one of: dynamic, continuous")
         if self.batching_max_size < 1:
             raise ValueError("batching_max_size must be >= 1")
         if self.batching_delay_ms < 0:
             raise ValueError("batching_delay_ms must be >= 0")
+        if self.batching_mode == "continuous":
+            validate_continuous_batching_config(self)
 
     def _set_default_attention_backend(self) -> None:
         """Configure ROCm defaults when users do not specify an attention backend."""

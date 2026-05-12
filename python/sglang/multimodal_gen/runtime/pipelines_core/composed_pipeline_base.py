@@ -997,6 +997,73 @@ class ComposedPipelineBase(ABC):
 
         return self.executor.execute_with_profiling(self.stages, batch, server_args)
 
+    def _partition_stages_around_denoising(
+        self,
+    ) -> tuple[list[PipelineStage], DenoisingStage, list[PipelineStage]]:
+        denoising_index = None
+        denoising_stage = None
+        for index, stage in enumerate(self.stages):
+            if isinstance(stage, DenoisingStage):
+                denoising_index = index
+                denoising_stage = stage
+                break
+
+        if denoising_index is None or denoising_stage is None:
+            raise RuntimeError(
+                f"{self.__class__.__name__} has no DenoisingStage for continuous batching"
+            )
+
+        return (
+            list(self.stages[:denoising_index]),
+            denoising_stage,
+            list(self.stages[denoising_index + 1 :]),
+        )
+
+    def get_denoising_stage(self) -> DenoisingStage:
+        return self._partition_stages_around_denoising()[1]
+
+    @torch.no_grad()
+    def run_stages_before_denoising(
+        self,
+        batch: Req,
+        server_args: ServerArgs,
+    ) -> Req:
+        pre_stages, _, _ = self._partition_stages_around_denoising()
+        if not pre_stages:
+            return batch
+
+        self.component_residency_manager = get_global_component_residency_manager(
+            self, server_args
+        )
+        self.executor.component_residency_manager = self.component_residency_manager
+        return self.executor.execute_with_profiling(pre_stages, batch, server_args)
+
+    @torch.no_grad()
+    def run_stages_after_denoising(
+        self,
+        batch: Req,
+        server_args: ServerArgs,
+    ) -> OutputBatch:
+        _, _, post_stages = self._partition_stages_around_denoising()
+        if not post_stages:
+            return OutputBatch(
+                output=batch.output,
+                audio=getattr(batch, "audio", None),
+                audio_sample_rate=getattr(batch, "audio_sample_rate", None),
+                metrics=batch.metrics,
+                trajectory_timesteps=getattr(batch, "trajectory_timesteps", None),
+                trajectory_latents=getattr(batch, "trajectory_latents", None),
+                rollout_trajectory_data=getattr(batch, "rollout_trajectory_data", None),
+                noise_pred=getattr(batch, "noise_pred", None),
+                trajectory_decoded=getattr(batch, "trajectory_decoded", None),
+            )
+
+        self.component_residency_manager = get_global_component_residency_manager(
+            self, server_args
+        )
+        self.executor.component_residency_manager = self.component_residency_manager
+        return self.executor.execute_with_profiling(post_stages, batch, server_args)
+
     @torch.no_grad()
     def forward_batch(
         self,

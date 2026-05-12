@@ -59,6 +59,10 @@ class BatchMetricsWindow:
     total_capacity: int = 0
     merged_dispatches: int = 0
     full_dispatches: int = 0
+    max_active_requests: int = 0
+    active_request_samples: list[int] = field(default_factory=list)
+    queue_depth_samples: list[int] = field(default_factory=list)
+    batch_size_counts: Counter[int] = field(default_factory=Counter)
     wait_times_ms: list[float] = field(default_factory=list)
     reject_reasons: Counter[str] = field(default_factory=Counter)
 
@@ -233,13 +237,13 @@ class Req:
 
     def __init__(self, **kwargs):
         # Initialize dataclass fields
-        for name, field in self.__class__.__dataclass_fields__.items():
+        for name, field_info in self.__class__.__dataclass_fields__.items():
             if name in kwargs:
                 object.__setattr__(self, name, kwargs.pop(name))
-            elif field.default is not MISSING:
-                object.__setattr__(self, name, field.default)
-            elif field.default_factory is not MISSING:
-                object.__setattr__(self, name, field.default_factory())
+            elif field_info.default is not MISSING:
+                object.__setattr__(self, name, field_info.default)
+            elif field_info.default_factory is not MISSING:
+                object.__setattr__(self, name, field_info.default_factory())
 
         for name, value in kwargs.items():
             setattr(self, name, value)

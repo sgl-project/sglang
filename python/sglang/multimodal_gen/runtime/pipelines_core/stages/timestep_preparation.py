@@ -87,10 +87,23 @@ class TimestepPreparationStage(PipelineStage):
         Returns:
             The batch with prepared timesteps.
         """
+        isolate_scheduler = (
+            getattr(server_args, "batching_mode", "dynamic") == "continuous"
+        )
         if batch.scheduler is not None and batch.timesteps is not None:
+            if isolate_scheduler:
+                batch.scheduler = get_or_create_request_scheduler(
+                    batch,
+                    self.scheduler,
+                    isolate=True,
+                )
             return batch
 
-        scheduler = get_or_create_request_scheduler(batch, self.scheduler)
+        scheduler = get_or_create_request_scheduler(
+            batch,
+            self.scheduler,
+            isolate=isolate_scheduler,
+        )
         device = get_local_torch_device()
         num_inference_steps = batch.num_inference_steps
         timesteps = batch.timesteps

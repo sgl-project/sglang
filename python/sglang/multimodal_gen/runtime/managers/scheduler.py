@@ -37,6 +37,12 @@ from sglang.multimodal_gen.runtime.ipc_array import (
     is_local_endpoint,
     spill_large_arrays_to_file_refs,
 )
+from sglang.multimodal_gen.runtime.managers.continuous_batching import (
+    ContinuousBatchingError,
+    ContinuousDenoisingScheduler,
+    ContinuousResponseGroup,
+    DenoisingRequestState,
+)
 from sglang.multimodal_gen.runtime.managers.cpu_worker import CPUWorker
 from sglang.multimodal_gen.runtime.managers.dynamic_batch_admission import (
     BatchAdmissionController,
@@ -152,6 +158,7 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
         self._batch_metrics_enabled = server_args.enable_batching_metrics
         self._batch_metrics_window = BatchMetricsWindow()
         self._batch_admission = BatchAdmissionController(server_args, gpu_id=local_rank)
+        self._response_group_counter = 0
         self._poller = zmq.Poller()
         if self.receiver is not None:
             self._poller.register(self.receiver, zmq.POLLIN)
@@ -171,7 +178,7 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
 
         if self._batch_metrics_enabled:
             logger.info(
-                "Dynamic batch metrics enabled; logging summary every %d dispatches.",
+                "Batch metrics enabled; logging summary every %d dispatches.",
                 _BATCH_METRICS_LOG_INTERVAL,
             )
 
@@ -386,19 +393,18 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
         )
         return ordered[index]
 
-    def _freeze_signature_value(self, value: Any):
-        """Convert a value into a hashable, order-stable form for signature comparison."""
+    def _make_batch_signature_value(self, value: Any):
         if isinstance(value, (str, int, float, bool, type(None))):
             return value
         if isinstance(value, Enum):
             return value.value
         if isinstance(value, dict):
-            return {
-                str(k): self._freeze_signature_value(v)
+            return tuple(
+                (str(k), self._make_batch_signature_value(v))
                 for k, v in sorted(value.items(), key=lambda kv: str(kv[0]))
-            }
+            )
         if isinstance(value, (list, tuple)):
-            return tuple(self._freeze_signature_value(v) for v in value)
+            return tuple(self._make_batch_signature_value(v) for v in value)
         return repr(value)
 
     def _sampling_param_signature_items(self, req: Req) -> list[tuple[str, Any]] | None:
@@ -413,13 +419,18 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
             return None
 
         return [
-            (f.name, self._freeze_signature_value(getattr(sp, f.name, None)))
+            (
+                f.name,
+                self._make_batch_signature_value(getattr(sp, f.name, None)),
+            )
             for f in sp_fields
             if not f.metadata.get("batch_sig_exclude", False)
         ]
 
     def _diffusers_kwargs_signature_value(self, req: Req) -> Any:
-        return self._freeze_signature_value((req.extra or {}).get("diffusers_kwargs"))
+        return self._make_batch_signature_value(
+            (req.extra or {}).get("diffusers_kwargs")
+        )
 
     def _build_dynamic_batch_signature(self, req: Req) -> tuple[Any, ...] | None:
         """Build the request compatibility signature for dynamic batching.
@@ -438,7 +449,7 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
                 signature_items.append(
                     (
                         "diffusers_kwargs",
-                        self._freeze_signature_value(diffusers_kwargs),
+                        self._make_batch_signature_value(diffusers_kwargs),
                     )
                 )
 
@@ -553,17 +564,21 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
         effective_max_batch_size: int,
         reject_reasons: list[str] | None = None,
         stop_reason: str | None = None,
+        active_requests: int | None = None,
+        queue_depth: int | None = None,
     ) -> None:
         if not self._batch_metrics_enabled:
             return
 
         effective_max_batch_size = max(1, effective_max_batch_size)
         logger.info(
-            "Dynamic batch dispatch: size=%d/%d, user_max=%d, queue_wait=%.2fms, stop_reason=%s",
+            "Batch dispatch: size=%d/%d, user_max=%d, queue_wait=%.2fms, active=%s, queue_depth=%s, stop_reason=%s",
             batch_size,
             effective_max_batch_size,
             self._batching_max_size,
             max(queue_wait_ms, 0.0),
+            active_requests if active_requests is not None else "-",
+            queue_depth if queue_depth is not None else "-",
             stop_reason or "unspecified",
         )
 
@@ -571,16 +586,31 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
         window.dispatches += 1
         window.total_requests += batch_size
         window.total_capacity += effective_max_batch_size
+        window.batch_size_counts.update([batch_size])
         if batch_size > 1:
             window.merged_dispatches += 1
-        if self._dynamic_batching_enabled() and batch_size >= effective_max_batch_size:
+        if batch_size >= effective_max_batch_size:
             window.full_dispatches += 1
         window.wait_times_ms.append(max(queue_wait_ms, 0.0))
+        if active_requests is not None:
+            active_requests = max(0, int(active_requests))
+            window.active_request_samples.append(active_requests)
+            window.max_active_requests = max(
+                window.max_active_requests, active_requests
+            )
+        if queue_depth is not None:
+            window.queue_depth_samples.append(max(0, int(queue_depth)))
         if reject_reasons:
             window.reject_reasons.update(reject_reasons)
 
         if window.dispatches >= _BATCH_METRICS_LOG_INTERVAL:
             self._log_batch_metrics_summary()
+
+    def _record_batch_reject_metrics(self, reason: str) -> None:
+        if not self._batch_metrics_enabled:
+            return
+        logger.info("Batch admission rejected: %s", reason)
+        self._batch_metrics_window.reject_reasons.update([reason])
 
     def _log_batch_metrics_summary(self) -> None:
         if not self._batch_metrics_enabled:
@@ -594,8 +624,24 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
         utilization = window.total_requests / max(1, window.total_capacity)
         avg_wait_ms = sum(window.wait_times_ms) / len(window.wait_times_ms)
         p95_wait_ms = self._percentile(window.wait_times_ms, 95.0)
+        avg_active = (
+            sum(window.active_request_samples) / len(window.active_request_samples)
+            if window.active_request_samples
+            else 0.0
+        )
+        avg_queue_depth = (
+            sum(window.queue_depth_samples) / len(window.queue_depth_samples)
+            if window.queue_depth_samples
+            else 0.0
+        )
         merged_rate = window.merged_dispatches / window.dispatches
         full_rate = window.full_dispatches / window.dispatches
+        batch_sizes = ", ".join(
+            f"{size}={count}"
+            for size, count in sorted(window.batch_size_counts.items())
+        )
+        if not batch_sizes:
+            batch_sizes = "none"
         top_rejects = ", ".join(
             f"{reason}={count}"
             for reason, count in window.reject_reasons.most_common(5)
@@ -604,7 +650,7 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
             top_rejects = "none"
 
         logger.info(
-            "Dynamic batch stats (last %d dispatches): avg_size=%.2f, merged_rate=%.1f%%, full_rate=%.1f%%, utilization=%.1f%%, wait_avg=%.2fms, wait_p95=%.2fms, top_rejects=%s",
+            "Batch stats (last %d dispatches): avg_size=%.2f, merged_rate=%.1f%%, full_rate=%.1f%%, utilization=%.1f%%, wait_avg=%.2fms, wait_p95=%.2fms, active_avg=%.2f, active_max=%d, queue_avg=%.2f, batch_sizes=%s, top_rejects=%s",
             window.dispatches,
             avg_size,
             merged_rate * 100.0,
@@ -612,6 +658,10 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
             utilization * 100.0,
             avg_wait_ms,
             p95_wait_ms,
+            avg_active,
+            window.max_active_requests,
+            avg_queue_depth,
+            batch_sizes,
             top_rejects,
         )
         self._batch_metrics_window = BatchMetricsWindow()
@@ -832,6 +882,14 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
             return self._batch_admission.enabled and supports_dynamic_batching()
         return self._batch_admission.enabled
 
+    def _continuous_batching_enabled_for_pipeline(self) -> bool:
+        if self.server_args.batching_mode != "continuous":
+            return False
+        supports = getattr(
+            self.server_args.pipeline_config, "supports_continuous_batching", None
+        )
+        return callable(supports) and supports()
+
     def get_next_batch_to_run(self) -> list[tuple[bytes | None, Any]] | None:
         """Return the next dispatchable queue item or dynamic batch.
 
@@ -1017,6 +1075,381 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
 
         return recv_reqs
 
+    def _get_continuous_admission_reject_reason(
+        self,
+        active_states: list[DenoisingRequestState],
+        candidate_reqs: list[Req],
+    ) -> str | None:
+        proposed = [state.req for state in active_states] + candidate_reqs
+        if not proposed:
+            return None
+
+        limits = [self._batch_admission.limit_for(req) for req in proposed]
+        max_batch_size = min(
+            self._batching_max_size,
+            *(limit.max_batch_size for limit in limits),
+        )
+        if len(proposed) > max_batch_size:
+            return f"config_cap:{max_batch_size}"
+
+        max_costs = [limit.max_cost for limit in limits if limit.max_cost is not None]
+        if max_costs:
+            max_cost = min(max_costs)
+            batch_cost = self._batch_admission.estimate_batch_cost(proposed)
+            if batch_cost > max_cost:
+                return f"cost_budget:{batch_cost:.0f}>{max_cost:.0f}"
+        return None
+
+    def _get_continuous_effective_batch_cap(
+        self,
+        states: list[DenoisingRequestState],
+    ) -> int:
+        if not states:
+            return self._batching_max_size
+        limits = [self._batch_admission.limit_for(state.req) for state in states]
+        return min(self._batching_max_size, *(limit.max_batch_size for limit in limits))
+
+    def _return_continuous_result(
+        self,
+        output_batch: OutputBatch,
+        identity: bytes | None,
+        *,
+        is_warmup: bool = False,
+    ) -> bool:
+        try:
+            self.return_result(output_batch, identity, is_warmup=is_warmup)
+            return True
+        except zmq.ZMQError as e:
+            logger.error("ZMQ error sending continuous batching reply: %s", e)
+            return False
+
+    def _admit_waiting_requests_to_continuous_loop(
+        self,
+        continuous_scheduler: ContinuousDenoisingScheduler,
+        active_states: list[DenoisingRequestState],
+        pending_groups: dict[str, ContinuousResponseGroup],
+    ) -> None:
+        while self.waiting_queue:
+            if any(state.req.is_warmup for state in active_states):
+                break
+
+            identity, req_or_group, enqueue_time = self.waiting_queue[0]
+
+            if (
+                isinstance(req_or_group, list)
+                and req_or_group
+                and all(isinstance(req, Req) for req in req_or_group)
+            ):
+                group_reqs = req_or_group
+                reject_reason = self._get_continuous_admission_reject_reason(
+                    active_states,
+                    group_reqs,
+                )
+                if reject_reason is not None:
+                    self._record_batch_reject_metrics(reject_reason)
+                    if active_states:
+                        break
+                    self.waiting_queue.popleft()
+                    self._return_continuous_result(
+                        OutputBatch(
+                            error=(
+                                "continuous batching admission rejected request group: "
+                                f"{reject_reason}"
+                            )
+                        ),
+                        identity,
+                        is_warmup=any(req.is_warmup for req in group_reqs),
+                    )
+                    continue
+
+                self.waiting_queue.popleft()
+                group_id = f"response_group::{self._response_group_counter}"
+                self._response_group_counter += 1
+                group = ContinuousResponseGroup(identity=identity, reqs=group_reqs)
+                pending_groups[group_id] = group
+                for index, req in enumerate(group_reqs):
+                    try:
+                        state = (
+                            continuous_scheduler.prepare_request_for_denoising_steps(
+                                identity=identity,
+                                req=req,
+                                response_group_id=group_id,
+                                response_index=index,
+                                response_group_size=len(group_reqs),
+                            )
+                        )
+                        state.queue_wait_ms = (time.monotonic() - enqueue_time) * 1000.0
+                        active_states.append(state)
+                    except ContinuousBatchingError as e:
+                        group.set_member_output(index, OutputBatch(error=str(e)))
+                    except Exception as e:
+                        logger.error(
+                            "Error admitting grouped request for continuous batching: %s",
+                            e,
+                            exc_info=True,
+                        )
+                        group.set_member_output(
+                            index,
+                            OutputBatch(
+                                error=f"continuous batching admission failed: {e}"
+                            ),
+                        )
+                self._return_response_group_if_complete(group_id, pending_groups)
+                if any(req.is_warmup for req in group_reqs):
+                    break
+                continue
+
+            if not isinstance(req_or_group, Req):
+                if active_states:
+                    break
+                self.waiting_queue.popleft()
+                result = self._dispatch_single_request(req_or_group)
+                self._return_continuous_result(result, identity)
+                if not self._running:
+                    break
+                continue
+
+            reject_reason = self._get_continuous_admission_reject_reason(
+                active_states,
+                [req_or_group],
+            )
+            if reject_reason is not None:
+                self._record_batch_reject_metrics(reject_reason)
+                if active_states:
+                    break
+                self.waiting_queue.popleft()
+                self._return_continuous_result(
+                    OutputBatch(
+                        error=f"continuous batching admission rejected request: {reject_reason}"
+                    ),
+                    identity,
+                    is_warmup=req_or_group.is_warmup,
+                )
+                continue
+
+            self.waiting_queue.popleft()
+            try:
+                state = continuous_scheduler.prepare_request_for_denoising_steps(
+                    identity=identity,
+                    req=req_or_group,
+                )
+                state.queue_wait_ms = (time.monotonic() - enqueue_time) * 1000.0
+                active_states.append(state)
+                if req_or_group.is_warmup:
+                    break
+            except ContinuousBatchingError as e:
+                self._return_continuous_result(
+                    OutputBatch(error=str(e)),
+                    identity,
+                    is_warmup=req_or_group.is_warmup,
+                )
+            except Exception as e:
+                logger.error(
+                    "Error admitting request for continuous batching: %s",
+                    e,
+                    exc_info=True,
+                )
+                self._return_continuous_result(
+                    OutputBatch(error=f"continuous batching admission failed: {e}"),
+                    identity,
+                    is_warmup=req_or_group.is_warmup,
+                )
+
+    def _return_response_group_if_complete(
+        self, group_id: str, pending_groups: dict[str, ContinuousResponseGroup]
+    ) -> bool:
+        group = pending_groups.get(group_id)
+        if group is None:
+            return False
+        if not group.has_all_outputs:
+            return False
+
+        merged = group.merge_outputs(self.worker)
+        self._log_warmup_result(merged, group.is_warmup)
+        self._return_continuous_result(
+            merged,
+            group.identity,
+            is_warmup=group.is_warmup,
+        )
+        del pending_groups[group_id]
+        return True
+
+    def _return_completed_request_state(
+        self,
+        state: DenoisingRequestState,
+        pending_groups: dict[str, ContinuousResponseGroup],
+    ) -> None:
+        output_batch = state.output_batch or OutputBatch(error=state.error)
+        if state.response_group_id is None or state.response_group_size <= 1:
+            is_warmup = state.req.is_warmup
+            self._log_warmup_result(output_batch, is_warmup)
+            self._return_continuous_result(
+                output_batch,
+                state.identity,
+                is_warmup=is_warmup,
+            )
+            return
+
+        group = pending_groups.get(state.response_group_id)
+        if group is None:
+            logger.error(
+                "Missing continuous response group %s for request %s",
+                state.response_group_id,
+                state.request_id,
+            )
+            return
+        group.set_member_output(state.response_index, output_batch)
+        self._return_response_group_if_complete(
+            state.response_group_id,
+            pending_groups,
+        )
+
+    def _should_wait_for_more_initial_requests(
+        self, active_states: list[DenoisingRequestState]
+    ) -> bool:
+        if active_states or not self.waiting_queue or self._batching_delay_s <= 0:
+            return False
+        _identity, req_or_group, enqueue_time = self.waiting_queue[0]
+        if isinstance(req_or_group, Req):
+            queued_count = sum(
+                1 for _, item, _ in self.waiting_queue if isinstance(item, Req)
+            )
+        elif (
+            isinstance(req_or_group, list)
+            and req_or_group
+            and all(isinstance(req, Req) for req in req_or_group)
+        ):
+            queued_count = len(req_or_group)
+        else:
+            return False
+        if queued_count >= self._batching_max_size:
+            return False
+        return (time.monotonic() - enqueue_time) < self._batching_delay_s
+
+    def _run_continuous_batching_loop(self) -> None:
+        logger.info(
+            "Continuous batching scheduler enabled (max_active=%d, max_delay=%.2fms)",
+            self._batching_max_size,
+            self._batching_delay_s * 1000.0,
+        )
+        continuous_scheduler = ContinuousDenoisingScheduler(
+            worker=self.worker,
+            server_args=self.server_args,
+            batching_max_size=self._batching_max_size,
+        )
+        active_states: list[DenoisingRequestState] = []
+        pending_groups: dict[str, ContinuousResponseGroup] = {}
+
+        while self._running:
+            try:
+                new_reqs = self.recv_reqs()
+                new_reqs = self.process_received_reqs_with_req_based_warmup(new_reqs)
+                now = time.monotonic()
+                self.waiting_queue.extend(
+                    [(identity, req, now) for identity, req in new_reqs]
+                )
+                self._consecutive_error_count = 0
+            except Exception as e:
+                self._consecutive_error_count += 1
+                logger.error(
+                    "Error receiving requests in continuous scheduler loop "
+                    "(attempt %d/%d): %s",
+                    self._consecutive_error_count,
+                    self._max_consecutive_errors,
+                    e,
+                    exc_info=True,
+                )
+                if self._consecutive_error_count >= self._max_consecutive_errors:
+                    raise RuntimeError(
+                        "Continuous scheduler terminated after "
+                        f"{self._max_consecutive_errors} consecutive errors. "
+                        f"Last error: {e}"
+                    ) from e
+
+            if self._should_wait_for_more_initial_requests(active_states):
+                oldest_ts = self.waiting_queue[0][2]
+                elapsed_ms = (time.monotonic() - oldest_ts) * 1000.0
+                remaining_ms = max(0, self._batching_delay_s * 1000.0 - elapsed_ms)
+                if remaining_ms > 0 and self.receiver is not None:
+                    self._poller.poll(timeout=remaining_ms)
+                elif remaining_ms > 0:
+                    time.sleep(remaining_ms / 1000.0)
+                continue
+
+            self._admit_waiting_requests_to_continuous_loop(
+                continuous_scheduler,
+                active_states,
+                pending_groups,
+            )
+
+            denoising_batch = (
+                continuous_scheduler.select_compatible_requests_for_next_step(
+                    active_states
+                )
+            )
+            if not denoising_batch:
+                if self.waiting_queue and self.receiver is not None:
+                    self._poller.poll(
+                        timeout=max(1, int(self._batching_delay_s * 1000))
+                    )
+                else:
+                    time.sleep(0.001)
+                continue
+
+            try:
+                completed = (
+                    continuous_scheduler.run_selected_steps_and_advance_requests(
+                        denoising_batch
+                    )
+                )
+                self._record_batch_dispatch_metrics(
+                    batch_size=len(denoising_batch),
+                    queue_wait_ms=sum(state.queue_wait_ms for state in denoising_batch)
+                    / max(1, len(denoising_batch)),
+                    effective_max_batch_size=self._get_continuous_effective_batch_cap(
+                        denoising_batch
+                    ),
+                    stop_reason="denoising_batch_run",
+                    active_requests=len(active_states),
+                    queue_depth=len(self.waiting_queue),
+                )
+                if self._batch_metrics_enabled:
+                    logger.info(
+                        "Continuous denoising step batch: size=%d/%d",
+                        len(denoising_batch),
+                        self._batching_max_size,
+                    )
+            except Exception as e:
+                logger.error(
+                    "Error executing continuous denoising step batch: %s",
+                    e,
+                    exc_info=True,
+                )
+                completed = []
+                for state in denoising_batch:
+                    continuous_scheduler.fail_request(
+                        state,
+                        f"Continuous denoising failed: {e}",
+                    )
+                    completed.append(state)
+
+            for state in completed:
+                self._return_completed_request_state(state, pending_groups)
+
+            active_states = [state for state in active_states if not state.is_complete]
+            self._admit_waiting_requests_to_continuous_loop(
+                continuous_scheduler,
+                active_states,
+                pending_groups,
+            )
+
+        self._log_batch_metrics_summary()
+
+        if self.receiver is not None:
+            self.receiver.close()
+        self._cleanup_disagg()
+        self.context.destroy(linger=0)
+
     def event_loop(self) -> None:
         """
         The main event loop that listens for ZMQ requests.
@@ -1025,6 +1458,14 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
         # Pool mode: all roles use the pool event loop
         if self._disagg_role != RoleType.MONOLITHIC:
             self._disagg_event_loop()
+            return
+
+        if self.server_args.batching_mode == "continuous":
+            if not self._continuous_batching_enabled_for_pipeline():
+                raise RuntimeError(
+                    "continuous batching is not enabled for this pipeline"
+                )
+            self._run_continuous_batching_loop()
             return
 
         logger.debug(
