@@ -570,11 +570,14 @@ class MQALayer(nn.Module):
         if _FP8_WO_A_GEMM:
             import deep_gemm
 
+            from sglang.srt.layers.fast_fp8_quant import (
+                fast_per_token_group_quant_fp8_128,
+            )
+
             T, G, D = o.shape
             R = self.o_lora_rank
-            o_fp8, o_s = sglang_per_token_group_quant_fp8(
+            o_fp8, o_s = fast_per_token_group_quant_fp8_128(
                 o.reshape(T * G, D).contiguous(),
-                group_size=128,
             )
             output = torch.empty(T, G, R, device=o.device, dtype=torch.bfloat16)
             deep_gemm.fp8_einsum(
