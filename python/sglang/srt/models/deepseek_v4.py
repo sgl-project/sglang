@@ -24,11 +24,11 @@ import triton.language as tl
 
 import sglang.srt.models.deepseek_v2 as deepseek_v2
 from sglang.jit_kernel.deepseek_v4 import (
-    fused_norm_rope_inplace,
-    fused_q_indexer_rope_hadamard_quant,
-    fused_q_norm_rope,
-    fused_rope_inplace,
-    linear_bf16_fp32,
+    fused_norm_rope_inplace_pcg_op as fused_norm_rope_inplace,
+    fused_q_indexer_rope_hadamard_quant_pcg_op as fused_q_indexer_rope_hadamard_quant,
+    fused_q_norm_rope_pcg_op as fused_q_norm_rope,
+    fused_rope_inplace_pcg_op as fused_rope_inplace,
+    linear_bf16_fp32_pcg_op as linear_bf16_fp32,
 )
 from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
 from sglang.srt.debug_utils.deepseek_v4_debug_utils import (

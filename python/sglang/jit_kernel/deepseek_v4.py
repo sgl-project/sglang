@@ -16,6 +16,7 @@ from sglang.srt.debug_utils.deepseek_v4_debug_utils import (
     deepseek_v4_moe_code_path_checker,
 )
 from sglang.srt.environ import envs
+from sglang.srt.utils.custom_op import register_custom_op
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
@@ -1105,6 +1106,76 @@ def linear_bf16_fp32(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
         algo = pick_backend(m=x.size(0), n=y.size(0), k=x.size(1))
 
     return _dispatch_bf16_fp32_backend(x, y, algo=algo)
+
+
+@register_custom_op(mutates_args=["kv"])
+def fused_norm_rope_inplace_pcg_op(
+    kv: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+    freq_cis: torch.Tensor,
+    positions: torch.Tensor,
+) -> None:
+    fused_norm_rope_inplace(kv, weight, eps, freq_cis, positions)
+
+
+@register_custom_op(mutates_args=["q"])
+def fused_rope_inplace_pcg_op(
+    q: torch.Tensor,
+    k: Optional[torch.Tensor],
+    freqs_cis: torch.Tensor,
+    positions: torch.Tensor,
+    inverse: bool = False,
+) -> None:
+    fused_rope_inplace(q, k, freqs_cis, positions, inverse)
+
+
+@register_custom_op(mutates_args=["q_output"])
+def fused_q_norm_rope_pcg_op(
+    q_input: torch.Tensor,
+    q_output: torch.Tensor,
+    eps: float,
+    freqs_cis: torch.Tensor,
+    positions: torch.Tensor,
+) -> None:
+    fused_q_norm_rope(q_input, q_output, eps, freqs_cis, positions)
+
+
+def _fused_q_indexer_rope_hadamard_quant_fake(
+    q_input: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: float,
+    freqs_cis: torch.Tensor,
+    positions: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    return (
+        torch.empty_like(q_input, dtype=torch.float8_e4m3fn),
+        torch.empty(
+            (*q_input.shape[:-1], 1), dtype=torch.float32, device=q_input.device
+        ),
+    )
+
+
+@register_custom_op(fake_impl=_fused_q_indexer_rope_hadamard_quant_fake)
+def fused_q_indexer_rope_hadamard_quant_pcg_op(
+    q_input: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: float,
+    freqs_cis: torch.Tensor,
+    positions: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    return fused_q_indexer_rope_hadamard_quant(
+        q_input, weight, weight_scale, freqs_cis, positions
+    )
+
+
+def _linear_bf16_fp32_fake(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    return torch.empty((x.shape[0], y.shape[0]), dtype=torch.float32, device=x.device)
+
+
+@register_custom_op(fake_impl=_linear_bf16_fp32_fake)
+def linear_bf16_fp32_pcg_op(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    return linear_bf16_fp32(x, y)
 
 
 def _dispatch_bf16_fp32_backend(
