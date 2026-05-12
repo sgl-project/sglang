@@ -261,15 +261,19 @@ class Fp8Config(QuantizationConfig):
 
                 return Mxfp4MarlinMoEMethod(fp8_method, prefix=prefix)
 
-            if self.is_fp4_experts and (
-                get_moe_runner_backend().is_flashinfer_mxfp4()
-                or (_is_cpu and _is_cpu_amx_available)
-            ):
+            if self.is_fp4_experts and get_moe_runner_backend().is_flashinfer_mxfp4():
                 from sglang.srt.layers.quantization.mxfp4_flashinfer_trtllm_moe import (
                     Mxfp4FlashinferTrtllmMoEMethod,
                 )
 
                 return Mxfp4FlashinferTrtllmMoEMethod(fp8_method, prefix=prefix)
+
+            if self.is_fp4_experts and _is_cpu and _is_cpu_amx_available:
+                from sglang.srt.layers.quantization.mxfp4_fp8config_cpu_moe import (
+                    Mxfp4Fp8ConfigCpuMoEMethod,
+                )
+
+                return Mxfp4Fp8ConfigCpuMoEMethod()
             return fp8_method
         elif isinstance(layer, RadixAttention):
             return Fp8KVCacheMethod(self)
