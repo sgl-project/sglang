@@ -343,23 +343,7 @@ class _DeepEPDispatcherImplBase:
         self.meta_overlap_args: Optional[dict] = None
 
         self.deepep_output_dtype = get_deepep_output_dtype(self)
-        if self.deepep_output_dtype == DeepEPOutputDtype.BF16:
-            self.params_bytes = 2
-            self.use_nvfp4 = self.use_fp8 = False
-            if _is_npu:
-                os.environ["DEEP_NORMAL_MODE_USE_INT8_QUANT"] = "0"
-        elif self.deepep_output_dtype == DeepEPOutputDtype.FP8:
-            self.params_bytes = 1
-            self.use_nvfp4 = False
-            self.use_fp8 = True
-            if _is_npu:
-                os.environ["DEEP_NORMAL_MODE_USE_INT8_QUANT"] = "1"
-        elif self.deepep_output_dtype == DeepEPOutputDtype.NVFP4:
-            self.params_bytes = 1
-            self.use_nvfp4 = True
-            self.use_fp8 = False
-            if _is_npu:
-                os.environ["DEEP_NORMAL_MODE_USE_INT8_QUANT"] = "0"
+        self.set_deepep_dispatcher_config(self)
 
     def dispatch_a(
         self,
@@ -387,11 +371,15 @@ class _DeepEPDispatcherImplBase:
 
     def set_quant_config(self, quant_config: dict) -> None:
         self.quant_config = quant_config
+        self.set_deepep_dispatcher_config(self)
 
+    def set_deepep_dispatcher_config(self) -> None:
         self.deepep_output_dtype = get_deepep_output_dtype(self)
         if self.deepep_output_dtype == DeepEPOutputDtype.BF16:
             self.params_bytes = 2
             self.use_nvfp4 = self.use_fp8 = False
+            if _is_npu:
+                os.environ["DEEP_NORMAL_MODE_USE_INT8_QUANT"] = "0"
         elif self.deepep_output_dtype == DeepEPOutputDtype.FP8:
             self.params_bytes = 1
             self.use_nvfp4 = False
@@ -402,6 +390,8 @@ class _DeepEPDispatcherImplBase:
             self.params_bytes = 1
             self.use_nvfp4 = True
             self.use_fp8 = False
+            if _is_npu:
+                os.environ["DEEP_NORMAL_MODE_USE_INT8_QUANT"] = "0"
 
     def set_overlap_args(
         self, combine_overlap_args: CombineOverlapArgs, meta_overlap_args: dict
