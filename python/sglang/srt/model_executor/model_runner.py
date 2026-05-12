@@ -1214,7 +1214,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 # Single warmup all_reduce to initialize NCCL/RCCL communicator
                 warmup_tensor = torch.zeros(1, device=torch.cuda.current_device())
                 dist.all_reduce(warmup_tensor, group=tp_group_handle)
-                current_platform.synchronize()
+                torch.cuda.synchronize()
 
                 warmup_elapsed = time.perf_counter() - warmup_start
                 logger.info(
@@ -1729,7 +1729,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             f"group_rank={group_rank}, world_size={world_size}, group_name={group_name}, backend={backend}"
         )
 
-        current_platform.empty_cache()
+        torch.cuda.empty_cache()
         success = False
         message = ""
         try:
@@ -1749,7 +1749,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             message = f"Failed to init group: {e}."
             logger.error(message)
 
-        current_platform.empty_cache()
+        torch.cuda.empty_cache()
         return success, message
 
     def send_weights_to_remote_instance(
@@ -1777,7 +1777,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             logger.error(message)
             return False, message
 
-        current_platform.empty_cache()
+        torch.cuda.empty_cache()
         success = False
         na = NetworkAddress(master_address, group_port)
         message = ""
@@ -1797,7 +1797,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # destroy the process group after sending weights
         del self._weights_send_group[group_name]
         torch.distributed.distributed_c10d.destroy_process_group(send_group)
-        current_platform.empty_cache()
+        torch.cuda.empty_cache()
         return success, message
 
     def init_weights_update_group(
