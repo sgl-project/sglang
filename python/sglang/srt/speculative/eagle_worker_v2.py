@@ -793,9 +793,13 @@ class EAGLEWorkerV2(BaseSpecWorker):
 
             return batch_output
 
-    def on_verify_complete_cpu(self, num_correct_drafts_per_req: list[int]) -> None:
+    def on_verify_complete_cpu(
+        self, num_correct_drafts_per_req: list[int], batch_size: int = 0
+    ) -> None:
         if self.adaptive_controller is not None:
-            self.adaptive_controller.on_verify_complete(num_correct_drafts_per_req)
+            self.adaptive_controller.on_verify_complete(
+                num_correct_drafts_per_req, batch_size=batch_size
+            )
 
     # -- Adaptive speculative decoding protocol --
 
