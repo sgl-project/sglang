@@ -342,7 +342,7 @@ class _DeepEPDispatcherImplBase:
         self.overlap_args: Optional[CombineOverlapArgs] = None
         self.meta_overlap_args: Optional[dict] = None
 
-        self.set_deepep_dispatcher_dtype(self)
+        self.set_deepep_dispatcher_dtype()
 
     def dispatch_a(
         self,
@@ -370,7 +370,7 @@ class _DeepEPDispatcherImplBase:
 
     def set_quant_config(self, quant_config: dict) -> None:
         self.quant_config = quant_config
-        self.set_deepep_dispatcher_config(self)
+        self.set_deepep_dispatcher_config()
 
     def set_deepep_dispatcher_dtype(self) -> None:
         self.deepep_output_dtype = get_deepep_output_dtype(self)
