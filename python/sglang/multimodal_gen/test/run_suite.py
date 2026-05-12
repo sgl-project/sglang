@@ -30,6 +30,7 @@ from sglang.multimodal_gen.test.server.testcase_configs import (
     DiffusionTestCase,
 )
 
+# TODO: remove duplicated code
 if current_platform.is_npu():
     from sglang.multimodal_gen.test.server.ascend.testcase_configs_npu import (
         COMPONENT_ACCURACY_SUITES,
