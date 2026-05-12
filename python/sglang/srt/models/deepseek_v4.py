@@ -22,13 +22,6 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 
-try:
-    import deep_gemm as _deep_gemm_for_dynamo
-
-    torch.compiler.allow_in_graph(_deep_gemm_for_dynamo.tf32_hc_prenorm_gemm)
-except Exception:
-    pass
-
 import sglang.srt.models.deepseek_v2 as deepseek_v2
 from sglang.jit_kernel.deepseek_v4 import (
     fused_norm_rope_inplace,
@@ -1074,7 +1067,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             return y, post.squeeze(-1), comb
 
         if envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.get():
-            import deep_gemm
+            from sglang.srt.layers.mhc import deep_gemm_tf32_hc_prenorm_gemm
 
             x_flat = x.flatten(1).bfloat16()
 
@@ -1082,7 +1075,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             mix_hc = hc_fn.size(0)
             d_out = torch.empty((m, mix_hc), dtype=torch.float, device=x.device)
             s_out = torch.empty((m,), dtype=torch.float, device=x.device)
-            deep_gemm.tf32_hc_prenorm_gemm(
+            deep_gemm_tf32_hc_prenorm_gemm(
                 x_flat, hc_fn.float().contiguous(), d_out, s_out, num_splits=None
             )
             rsqrt = torch.rsqrt(s_out / k + self.rms_norm_eps)

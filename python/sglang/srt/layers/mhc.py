@@ -1,6 +1,6 @@
 import functools
 import math
-from typing import Tuple
+from typing import Optional, Tuple
 
 import tilelang
 import tilelang.language as T
@@ -10,15 +10,9 @@ from sglang.jit_kernel.utils import is_arch_support_pdl
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.nsa.utils import is_nsa_prefill_cp_round_robin_split
 from sglang.srt.layers.utils.common import strict_contiguous
+from sglang.srt.utils.custom_op import register_custom_op
 
 tilelang.set_log_level("WARNING")
-
-try:
-    import deep_gemm as _deep_gemm_for_dynamo
-
-    torch.compiler.allow_in_graph(_deep_gemm_for_dynamo.tf32_hc_prenorm_gemm)
-except Exception:
-    pass
 
 pass_configs = {
     tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
@@ -29,6 +23,25 @@ FP8 = "float8_e4m3"
 BF16 = "bfloat16"
 FP32 = "float32"
 INT32 = "int32"
+
+
+@register_custom_op(mutates_args=["gemm_out_mul", "gemm_out_sqrsum"])
+def deep_gemm_tf32_hc_prenorm_gemm(
+    x: torch.Tensor,
+    fn: torch.Tensor,
+    gemm_out_mul: torch.Tensor,
+    gemm_out_sqrsum: torch.Tensor,
+    num_splits: Optional[int] = None,
+) -> None:
+    import deep_gemm
+
+    deep_gemm.tf32_hc_prenorm_gemm(
+        x,
+        fn,
+        gemm_out_mul,
+        gemm_out_sqrsum,
+        num_splits=num_splits,
+    )
 
 
 @tilelang.jit(pass_configs=pass_configs)
@@ -690,8 +703,6 @@ def mhc_pre(
         num_tokens, hidden_size, dtype=torch.bfloat16, device=residual.device
     )
     if envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.get():
-        import deep_gemm
-
         n_splits = _compute_num_split_for_mhc_pre(num_tokens, hc_hidden_size)
 
         gemm_out_mul = torch.empty(
@@ -701,7 +712,7 @@ def mhc_pre(
             n_splits, num_tokens, dtype=torch.float32, device=residual.device
         )
 
-        deep_gemm.tf32_hc_prenorm_gemm(
+        deep_gemm_tf32_hc_prenorm_gemm(
             residual_flat.view(num_tokens, hc_hidden_size),
             fn_flat,
             gemm_out_mul,
