@@ -177,6 +177,8 @@ RADIX_SUPPORTED_DETERMINISTIC_ATTENTION_BACKEND = ["fa3", "triton"]
 
 DISAGG_TRANSFER_BACKEND_CHOICES = ["mooncake", "nixl", "ascend", "fake", "mori"]
 
+DISAGG_MORI_IO_BACKEND_CHOICES = ["rdma", "xgmi"]
+
 GRAMMAR_BACKEND_CHOICES = ["xgrammar", "outlines", "llguidance", "none"]
 
 # Placeholder token inserted between items in Multi-Item Scoring sequences:
@@ -787,6 +789,7 @@ class ServerArgs:
     # PD disaggregation: can be "null" (not disaggregated), "prefill" (prefill-only), or "decode" (decode-only)
     disaggregation_mode: Literal["null", "prefill", "decode"] = "null"
     disaggregation_transfer_backend: str = "mooncake"
+    disaggregation_mori_io_backend: str = "rdma"
     disaggregation_bootstrap_port: int = 8998
     disaggregation_ib_device: Optional[str] = None
     disaggregation_decode_enable_radix_cache: bool = False
@@ -4061,6 +4064,15 @@ class ServerArgs:
                     "Cuda graph is disabled for prefill server when piecewise cuda graph is not enabled."
                 )
 
+        if (
+            self.disaggregation_mori_io_backend != "rdma"
+            and self.disaggregation_transfer_backend != "mori"
+        ):
+            raise ValueError(
+                "--disaggregation-mori-io-backend is only supported with "
+                "--disaggregation-transfer-backend mori"
+            )
+
         if self.disaggregation_mode in ("prefill", "decode"):
             if (
                 envs.SGLANG_DISAGG_STAGING_BUFFER.get()
@@ -6840,6 +6852,15 @@ class ServerArgs:
             choices=DISAGG_TRANSFER_BACKEND_CHOICES,
             help="The backend for disaggregation transfer. Default is mooncake.",
         )
+        parser.add_argument(
+            "--disaggregation-mori-io-backend",
+            type=str,
+            default=ServerArgs.disaggregation_mori_io_backend,
+            choices=DISAGG_MORI_IO_BACKEND_CHOICES,
+            help="Mori IO backend for PD disaggregation. 'rdma' preserves the existing behavior, "
+            "and 'xgmi' uses same-node GPU XGMI/P2P only.",
+        )
+        parser.add_argument(
         parser.add_argument(
             "--disaggregation-bootstrap-port",
             type=int,
