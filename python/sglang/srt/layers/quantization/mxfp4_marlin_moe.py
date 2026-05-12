@@ -8,7 +8,7 @@ from torch.nn import Module
 
 from sglang.srt.layers.moe.moe_runner.marlin import MarlinMoeQuantInfo
 from sglang.srt.layers.moe.utils import MoeRunnerBackend
-from sglang.srt.utils import log_info_on_rank0
+from sglang.srt.utils import log_info_on_rank0, set_weight_attrs
 from sglang.srt.utils.common import is_sm90_supported
 
 if TYPE_CHECKING:
@@ -41,7 +41,6 @@ class Mxfp4MarlinMoEMethod:
         from sglang.srt.layers.moe.fused_moe_triton import (
             FusedMoeWeightScaleSupported,
         )
-        from sglang.srt.model_loader.weight_utils import set_weight_attrs
 
         fp4_block_k = 32
 
