@@ -982,6 +982,27 @@ def mhc_post_tilelang(
             T.pdl_trigger()
 
 
+@register_custom_op(mutates_args=["out"])
+def mhc_post_tilelang_op(
+    comb_res_mix: torch.Tensor,
+    residual: torch.Tensor,
+    post_layer_mix: torch.Tensor,
+    x: torch.Tensor,
+    out: torch.Tensor,
+    hc: int,
+    hidden: int,
+) -> None:
+    mhc_post_tilelang(
+        comb_res_mix,
+        residual,
+        post_layer_mix,
+        x,
+        out,
+        hc,
+        hidden,
+    )
+
+
 def mhc_post(
     x: torch.Tensor,
     residual: torch.Tensor,
@@ -994,7 +1015,7 @@ def mhc_post(
         post_layer_mix = strict_contiguous(post_layer_mix)
         comb_res_mix = strict_contiguous(comb_res_mix)
     out = torch.empty_like(residual)
-    mhc_post_tilelang(
+    mhc_post_tilelang_op(
         comb_res_mix,
         residual,
         post_layer_mix.squeeze(-1),
