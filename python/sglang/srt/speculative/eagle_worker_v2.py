@@ -763,8 +763,8 @@ class EAGLEWorkerV2(BaseSpecWorker):
             if model_worker_batch.spec_info is None:
                 model_worker_batch.spec_info = EagleDraftInput.create_idle_input(
                     device=self.device,
-                    hidden_size=self.target_worker.model_config.spec_hidden_size,
-                    dtype=self.target_worker.model_config.dtype,
+                    hidden_size=EagleDraftInput.hidden_size_for(self.draft_worker),
+                    dtype=EagleDraftInput.dtype_for(self.draft_worker),
                     topk=self.topk,
                     capture_hidden_mode=CaptureHiddenMode.LAST,
                 )
