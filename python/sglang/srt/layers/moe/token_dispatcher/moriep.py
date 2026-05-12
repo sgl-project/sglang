@@ -276,7 +276,7 @@ def init_mori_op(
     logger.info(
         f"[MORI init] {world_size=} {rank=} {hidden_size=} {params_dtype=} "
         f"{num_max_dispatch_tokens_per_rank=} {num_local_experts=} "
-        f"{router_topk=} {mode=} {dispatch_dtype=} {combine_dtype=} {combine_quant_type=}"
+        f"{router_topk=} {mode=} {dispatch_dtype=} {combine_dtype=} "
     )
 
     def check_mori_compatibility(kwargs: dict) -> None:
