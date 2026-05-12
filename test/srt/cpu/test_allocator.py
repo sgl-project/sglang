@@ -1,5 +1,5 @@
 """
-Unit tests and benchmarks for alloc_extend_kernel_cpu and alloc_decode_kernel_cpu.
+Unit tests for alloc_extend_kernel_cpu and alloc_decode_kernel_cpu.
 """
 
 import time
@@ -442,103 +442,6 @@ class TestAllocExtendKernel(CustomTestCase):
     def test_int32_large_batch(self):
         self._run_test_int32(bs=256, page_size=16)
 
-    @staticmethod
-    def bench_alloc_extend(
-        bs, page_size, max_pre_len=512, max_extend_len=256, warmup=10, iters=100
-    ):
-        pre_lens, seq_lens, last_loc, free_pages, extend_num_tokens = (
-            _gen_extend_test_data(bs, page_size, max_pre_len, max_extend_len)
-        )
-
-        # Benchmark reference (PyTorch)
-        for _ in range(warmup):
-            out = torch.empty(extend_num_tokens, dtype=torch.int64)
-            alloc_extend_kernel_pytorch(
-                pre_lens, seq_lens, last_loc, free_pages, out, page_size
-            )
-        t0 = time.perf_counter()
-        for _ in range(iters):
-            out = torch.empty(extend_num_tokens, dtype=torch.int64)
-            alloc_extend_kernel_pytorch(
-                pre_lens, seq_lens, last_loc, free_pages, out, page_size
-            )
-        ref_time = (time.perf_counter() - t0) / iters * 1e6  # us
-
-        # Benchmark CPU kernel
-        for _ in range(warmup):
-            out = torch.empty(extend_num_tokens, dtype=torch.int64)
-            torch.ops.sgl_kernel.alloc_extend_kernel_cpu(
-                pre_lens, seq_lens, last_loc, free_pages, out, page_size
-            )
-        t0 = time.perf_counter()
-        for _ in range(iters):
-            out = torch.empty(extend_num_tokens, dtype=torch.int64)
-            torch.ops.sgl_kernel.alloc_extend_kernel_cpu(
-                pre_lens, seq_lens, last_loc, free_pages, out, page_size
-            )
-        cpu_time = (time.perf_counter() - t0) / iters * 1e6  # us
-
-        print(
-            f"alloc_extend | bs={bs:4d} page_size={page_size:3d} extend_tokens={extend_num_tokens:6d} | "
-            f"PyTorch: {ref_time:8.1f} us | C++: {cpu_time:8.1f} us | "
-            f"Speedup: {ref_time / cpu_time:5.2f}x"
-        )
-
-    @staticmethod
-    def bench_alloc_decode(bs, page_size, max_seq_len=256, warmup=10, iters=100):
-        seq_lens, last_loc, free_pages = _gen_decode_test_data(
-            bs, page_size, max_seq_len
-        )
-
-        # Benchmark reference (PyTorch)
-        for _ in range(warmup):
-            out = torch.empty(bs, dtype=torch.int64)
-            alloc_decode_kernel_pytorch(seq_lens, last_loc, free_pages, out, page_size)
-        t0 = time.perf_counter()
-        for _ in range(iters):
-            out = torch.empty(bs, dtype=torch.int64)
-            alloc_decode_kernel_pytorch(seq_lens, last_loc, free_pages, out, page_size)
-        ref_time = (time.perf_counter() - t0) / iters * 1e6  # us
-
-        # Benchmark CPU kernel
-        for _ in range(warmup):
-            out = torch.empty(bs, dtype=torch.int64)
-            torch.ops.sgl_kernel.alloc_decode_kernel_cpu(
-                seq_lens, last_loc, free_pages, out, page_size
-            )
-        t0 = time.perf_counter()
-        for _ in range(iters):
-            out = torch.empty(bs, dtype=torch.int64)
-            torch.ops.sgl_kernel.alloc_decode_kernel_cpu(
-                seq_lens, last_loc, free_pages, out, page_size
-            )
-        cpu_time = (time.perf_counter() - t0) / iters * 1e6  # us
-
-        print(
-            f"alloc_decode | bs={bs:4d} page_size={page_size:3d} | "
-            f"PyTorch: {ref_time:8.1f} us | C++: {cpu_time:8.1f} us | "
-            f"Speedup: {ref_time / cpu_time:5.2f}x"
-        )
-
 
 if __name__ == "__main__":
-    import sys
-
-    if "--bench" in sys.argv:
-        sys.argv.remove("--bench")
-        print("=" * 80)
-        print("Benchmark: alloc_extend_kernel")
-        print("=" * 80)
-        for bs in [1, 4, 16, 64, 256]:
-            for page_size in [1, 16, 128]:
-                BenchmarkScheduler.bench_alloc_extend(bs, page_size)
-
-        print()
-        print("=" * 80)
-        print("Benchmark: alloc_decode_kernel")
-        print("=" * 80)
-        for bs in [1, 4, 16, 64, 256, 1024]:
-            for page_size in [1, 16, 128]:
-                BenchmarkScheduler.bench_alloc_decode(bs, page_size)
-    else:
-        unittest.main()
+    unittest.main()
