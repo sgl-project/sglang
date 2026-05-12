@@ -166,6 +166,11 @@ def _forward_with_allreduce_fusion(
                 )
                 if fused_result[0] is not None:
                     return fused_result
+                # MNNVL bails out under CUDA graph capture (it's not capture-safe).
+                # Fall back to a capture-safe AR + RMSNorm: residual already has
+                # post_residual_addition folded in above, so pass None below.
+                x = tensor_model_parallel_all_reduce(x)
+                return norm_module.forward(x, residual, None)
 
             # For AITER route, preserve correctness when fused path is unavailable.
             if _use_aiter and get_global_server_args().enable_aiter_allreduce_fusion:
