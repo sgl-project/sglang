@@ -31,6 +31,7 @@ class TestSenseNovaU1PixelFlow(unittest.TestCase):
                 "height": 16,
                 "num_inference_steps": 2,
                 "seed": 7,
+                "cfg_text_scale": 1.0,
                 "timestep_shift": 1.0,
             }
         )
@@ -96,6 +97,7 @@ class TestSenseNovaU1PixelFlow(unittest.TestCase):
                 "width": 16,
                 "height": 16,
                 "num_inference_steps": 1,
+                "cfg_text_scale": 1.0,
             }
         )
         params.omni_generation_mode = "interleave"

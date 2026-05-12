@@ -34,6 +34,23 @@ class TestSenseNovaU1OmniConfig(unittest.TestCase):
         self.assertTrue(normalized.think)
         self.assertEqual(3, normalized.sampling_params.num_inference_steps)
 
+    def test_sampling_defaults_follow_u1_official_image_generation(self):
+        plugin = SenseNovaU1OmniPlugin()
+        request = OmniRequest(
+            messages=(OmniInputSegment(type="text", text="draw"),),
+            sampling_params={},
+        )
+
+        normalized = plugin.normalize_request(request)
+        params = normalized.sampling_params
+
+        self.assertEqual(50, params.num_inference_steps)
+        self.assertEqual(4.0, params.cfg_text_scale)
+        self.assertEqual(1.0, params.cfg_img_scale)
+        self.assertEqual([0.0, 1.0], params.cfg_interval)
+        self.assertEqual("none", params.cfg_renorm_type)
+        self.assertEqual(0.02, params.t_eps)
+
     def test_diffusion_source_engine_args_accept_json_and_cli_string(self):
         cases = [
             '{"num_gpus": 1, "tp_size": 1, "attention_backend": "fa"}',

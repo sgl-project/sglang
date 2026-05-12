@@ -18,12 +18,13 @@ class SenseNovaU1SamplingParams(SamplingParams):
     width: int | None = 1024
     num_inference_steps: int | None = 50
 
-    cfg_text_scale: float = 1.0
+    cfg_text_scale: float = 4.0
     cfg_img_scale: float = 1.0
-    cfg_interval: list[float] = field(default_factory=lambda: [0.4, 1.0])
+    cfg_interval: list[float] = field(default_factory=lambda: [0.0, 1.0])
     cfg_renorm_min: float = 0.0
-    cfg_renorm_type: str = "global"
+    cfg_renorm_type: str = "none"
     timestep_shift: float = 3.0
+    t_eps: float = 0.02
 
     def __post_init__(self) -> None:
         super().__post_init__()
@@ -55,6 +56,7 @@ class SenseNovaU1SamplingParams(SamplingParams):
             "cfg_img_scale",
             "cfg_renorm_min",
             "timestep_shift",
+            "t_eps",
         ):
             value: Any = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, (int, float)):
@@ -67,6 +69,8 @@ class SenseNovaU1SamplingParams(SamplingParams):
             raise ValueError(
                 f"timestep_shift must be positive, got {self.timestep_shift!r}"
             )
+        if float(self.t_eps) <= 0.0:
+            raise ValueError(f"t_eps must be positive, got {self.t_eps!r}")
 
 
 @dataclass(frozen=True)
@@ -85,7 +89,7 @@ class SenseNovaU1PixelFlowCFG:
 def resolve_sensenova_u1_pixel_flow_cfg(
     params: Any,
 ) -> SenseNovaU1PixelFlowCFG:
-    text_scale = float(getattr(params, "cfg_text_scale", 1.0))
+    text_scale = float(getattr(params, "cfg_text_scale", 4.0))
     img_scale = float(getattr(params, "cfg_img_scale", 1.0))
     needs_cfg = not (text_scale == 1.0 and img_scale == 1.0)
     cfg_interval = list(getattr(params, "cfg_interval", [0.0, 1.0]))

@@ -524,7 +524,7 @@
       <div class="row">
         <div class="control">
           <label for="steps">Steps</label>
-          <input id="steps" type="number" value="12" min="1" max="80">
+          <input id="steps" type="number" value="50" min="1" max="80">
         </div>
         <div class="control">
           <label for="seed">Seed</label>
@@ -871,7 +871,9 @@
           seed: Number($("seed").value),
           cfg_text_scale: Number($("cfgText").value),
           cfg_img_scale: Number($("cfgImage").value),
-          cfg_renorm_type: "global"
+          cfg_interval: [0.0, 1.0],
+          cfg_renorm_type: "none",
+          t_eps: 0.02
         },
         max_images: 1,
         max_text_segments: 3

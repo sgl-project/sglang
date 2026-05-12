@@ -35,8 +35,16 @@ class TestSenseNovaU1E2EPrecision(unittest.TestCase):
         sampling_params = {
             "width": _env_int("SGLANG_OMNI_U1_WIDTH", 1024),
             "height": _env_int("SGLANG_OMNI_U1_HEIGHT", 1024),
-            "num_steps": _env_int("SGLANG_OMNI_U1_STEPS", 20),
+            "num_steps": _env_int("SGLANG_OMNI_U1_STEPS", 50),
             "seed": _env_int("SGLANG_OMNI_U1_SEED", 7),
+            "cfg_text_scale": _env_float("SGLANG_OMNI_U1_CFG_TEXT_SCALE", 4.0),
+            "cfg_img_scale": _env_float("SGLANG_OMNI_U1_CFG_IMG_SCALE", 1.0),
+            "cfg_interval": [
+                _env_float("SGLANG_OMNI_U1_CFG_START", 0.0),
+                _env_float("SGLANG_OMNI_U1_CFG_END", 1.0),
+            ],
+            "cfg_renorm_type": os.getenv("SGLANG_OMNI_U1_CFG_RENORM_TYPE", "none"),
+            "t_eps": _env_float("SGLANG_OMNI_U1_T_EPS", 0.02),
         }
         session_id = None
         try:

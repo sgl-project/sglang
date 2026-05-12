@@ -180,7 +180,9 @@ turn1 = {
         "sampling_params": {
             "num_steps": 50,
             "cfg_text_scale": 4.0,
-            "cfg_renorm_type": "global",
+            "cfg_interval": [0.0, 1.0],
+            "cfg_renorm_type": "none",
+            "t_eps": 0.02,
         },
         "max_images": 1,
         "max_text_segments": 2,
@@ -216,7 +218,9 @@ turn2 = {
             "num_steps": 50,
             "cfg_text_scale": 4.0,
             "cfg_img_scale": 1.0,
-            "cfg_renorm_type": "global",
+            "cfg_interval": [0.0, 1.0],
+            "cfg_renorm_type": "none",
+            "t_eps": 0.02,
         },
         "max_images": 1,
         "max_text_segments": 2,
@@ -282,7 +286,9 @@ turn1 = {
         "num_steps": 50,
         "seed": 223,
         "cfg_text_scale": 4.0,
-        "cfg_renorm_type": "global",
+        "cfg_interval": [0.0, 1.0],
+        "cfg_renorm_type": "none",
+        "t_eps": 0.02,
     },
     "max_images": 1,
     "max_text_segments": 2,
@@ -314,7 +320,9 @@ turn2 = {
         "seed": 224,
         "cfg_text_scale": 4.0,
         "cfg_img_scale": 1.0,
-        "cfg_renorm_type": "global",
+        "cfg_interval": [0.0, 1.0],
+        "cfg_renorm_type": "none",
+        "t_eps": 0.02,
     },
     "max_images": 1,
     "max_text_segments": 2,
@@ -345,11 +353,12 @@ Common U1 image sampling parameters:
 | `width` | `1024` | Image width; must be divisible by 32 |
 | `height` | `1024` | Image height; must be divisible by 32 |
 | `num_inference_steps` | `50` | Also accepts `num_steps` or `steps` |
-| `cfg_text_scale` | `1.0` | Also accepts `guidance_scale` or `text_cfg_scale` |
+| `cfg_text_scale` | `4.0` | Also accepts `guidance_scale` or `text_cfg_scale` |
 | `cfg_img_scale` | `1.0` | Also accepts `img_cfg_scale` or `image_cfg_scale` |
-| `cfg_interval` | `[0.4, 1.0]` | CFG active interval |
-| `cfg_renorm_type` | `global` | One of `none`, `global`, `channel`, `text_channel` |
+| `cfg_interval` | `[0.0, 1.0]` | CFG active interval |
+| `cfg_renorm_type` | `none` | One of `none`, `global`, `channel`, `text_channel` |
 | `timestep_shift` | `3.0` | Pixel-flow timestep shift |
+| `t_eps` | `0.02` | Clamp epsilon for the final pixel-flow velocity step |
 
 Omni control fields:
 

@@ -51,6 +51,7 @@ class SenseNovaU1PixelFlowPrepared:
     steps: int
     seed: int
     noise_scale: float
+    t_eps: float
     image_prediction: Any
     gen_grid_hw: Any
     timesteps: Any
@@ -173,6 +174,7 @@ class SenseNovaU1PixelFlowStage(DenoisingStage):
         steps = int(getattr(sampling_params, "num_inference_steps", None) or 0)
         if steps <= 0:
             raise ValueError(f"num_inference_steps must be positive, got {steps}")
+        t_eps = float(sampling_params.t_eps)
         commit_generated_image = (
             getattr(sampling_params, "omni_generation_mode", None) == "interleave"
         )
@@ -241,6 +243,7 @@ class SenseNovaU1PixelFlowStage(DenoisingStage):
             steps=steps,
             seed=seed,
             noise_scale=noise_scale,
+            t_eps=t_eps,
             image_prediction=image_prediction,
             gen_grid_hw=gen_grid_hw,
             timesteps=timesteps,
@@ -299,6 +302,7 @@ class SenseNovaU1PixelFlowStage(DenoisingStage):
                 image_embeds=image_embeds,
                 timestep=timestep,
                 z=z,
+                t_eps=prepared.t_eps,
             )
             use_cfg = _should_apply_cfg(prepared.cfg, timestep)
             v_pred = self._combine_cfg_velocity(
@@ -350,6 +354,7 @@ class SenseNovaU1PixelFlowStage(DenoisingStage):
                 image_embeds=image_embeds,
                 timestep=timestep,
                 z=z,
+                t_eps=prepared.t_eps,
             )
             return v_img_condition + cfg.text_scale * (v_condition - v_img_condition)
         if cfg.text_scale == cfg.img_scale:
@@ -360,6 +365,7 @@ class SenseNovaU1PixelFlowStage(DenoisingStage):
                 image_embeds=image_embeds,
                 timestep=timestep,
                 z=z,
+                t_eps=prepared.t_eps,
             )
             return v_uncondition + cfg.text_scale * (v_condition - v_uncondition)
 
@@ -370,6 +376,7 @@ class SenseNovaU1PixelFlowStage(DenoisingStage):
             image_embeds=image_embeds,
             timestep=timestep,
             z=z,
+            t_eps=prepared.t_eps,
         )
         v_uncondition = self._predict_v(
             model=model,
@@ -378,6 +385,7 @@ class SenseNovaU1PixelFlowStage(DenoisingStage):
             image_embeds=image_embeds,
             timestep=timestep,
             z=z,
+            t_eps=prepared.t_eps,
         )
         return (
             v_uncondition
@@ -394,6 +402,7 @@ class SenseNovaU1PixelFlowStage(DenoisingStage):
         image_embeds: Any,
         timestep: Any,
         z: Any,
+        t_eps: float,
     ) -> Any:
         forward_batch_context = forward_batch_provider(
             prepared=forward_context.prepared,
@@ -414,6 +423,7 @@ class SenseNovaU1PixelFlowStage(DenoisingStage):
                 temp_forward_batch=forward_batch,
                 timestep=timestep,
                 z=z,
+                t_eps=t_eps,
             )
         finally:
             # release the temporarilly allocated kv tokens from kv cache
@@ -491,6 +501,7 @@ class SenseNovaU1PixelFlowStage(DenoisingStage):
                     prepared.uncondition
                 ),
                 "noise_scale": prepared.noise_scale,
+                "t_eps": prepared.t_eps,
                 "cfg_text_scale": cfg.text_scale,
                 "cfg_img_scale": cfg.img_scale,
                 "cfg_renorm_type": cfg.renorm_type if cfg.needs_cfg else "none",
@@ -856,6 +867,7 @@ def _predict_pixel_flow_from_srt(
     temp_forward_batch: Any,
     timestep: Any,
     z: Any,
+    t_eps: float,
 ) -> Any:
     batch_size, image_token_num = image_embeds.shape[:2]
     # forward with temporary forward batch
@@ -871,7 +883,7 @@ def _predict_pixel_flow_from_srt(
     )
 
     t = timestep.to(device=z.device, dtype=z.dtype)
-    return (x_pred - z) / (1 - t).clamp_min(float(getattr(model.config, "t_eps", 0.02)))
+    return (x_pred - z) / (1 - t).clamp_min(float(t_eps))
 
 
 def _forward_context_position(context: Any | None) -> int | None:
