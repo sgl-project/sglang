@@ -603,7 +603,7 @@ def setup_state_kv_args(
                 item_lens = item_lens + draft_item_lens
             if isinstance(token_to_kv_pool, NPUMLATokenToKVPool):
                 kv_args.kv_buf_groups = (
-                        len(kv_args.kv_data_ptrs) // token_to_kv_pool.layer_num
+                    len(kv_args.kv_data_ptrs) // token_to_kv_pool.layer_num
                 )
                 kv_args.total_kv_layers = total_kv_layers
             else:
