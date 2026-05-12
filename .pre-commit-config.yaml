@@ -92,7 +92,6 @@ repos:
         entry: python3 scripts/ci/check_registered_tests.py
         language: system
         files: ^test/registered/.*\.py$
-        exclude: ^test/registered/.*/utils\.py$
         pass_filenames: false
       - id: check-no-docs-changes
         name: reject changes under legacy docs/
