@@ -305,6 +305,10 @@ def add_rl_on_policy_target_choices(choices):
     RL_ON_POLICY_TARGET_CHOICES.extend(choices)
 
 
+def add_linear_attn_kernel_backend_choices(choices):
+    LINEAR_ATTN_KERNEL_BACKEND_CHOICES.extend(choices)
+
+
 def _resolve_speculative_algorithm_alias(
     speculative_algorithm: Optional[str],
     speculative_draft_model_path: Optional[str],
@@ -568,12 +572,12 @@ class ServerArgs:
     speculative_eagle_topk: Optional[int] = None
     speculative_num_draft_tokens: Optional[int] = None
     speculative_dflash_block_size: Optional[int] = None
-    speculative_dflash_draft_window_size: Optional[int] = None
     speculative_accept_threshold_single: float = 1.0
     speculative_accept_threshold_acc: float = 1.0
     speculative_token_map: Optional[str] = None
     speculative_attention_mode: str = "prefill"
     speculative_draft_attention_backend: Optional[str] = None
+    speculative_draft_window_size: Optional[int] = None
     speculative_moe_runner_backend: Optional[str] = None
     speculative_moe_a2a_backend: Optional[str] = None
     speculative_draft_model_quantization: Optional[str] = None
@@ -642,7 +646,7 @@ class ServerArgs:
     hicache_io_backend: str = "kernel"
     hicache_mem_layout: str = "layer_first"
     hicache_storage_backend: Optional[str] = None
-    hicache_storage_prefetch_policy: str = "best_effort"
+    hicache_storage_prefetch_policy: str = "timeout"
     hicache_storage_backend_extra_config: Optional[str] = None
 
     # Hierarchical sparse attention
@@ -3551,14 +3555,13 @@ class ServerArgs:
                 )
 
             window_size = None
-            if self.speculative_dflash_draft_window_size is not None:
-                window_size = int(self.speculative_dflash_draft_window_size)
+            if self.speculative_draft_window_size is not None:
+                window_size = int(self.speculative_draft_window_size)
                 if window_size <= 0:
                     raise ValueError(
-                        "DFLASH requires --speculative-dflash-draft-window-size "
-                        f"to be positive, got {window_size}."
+                        f"--speculative-draft-window-size must be positive, got {window_size}."
                     )
-                self.speculative_dflash_draft_window_size = window_size
+                self.speculative_draft_window_size = window_size
 
             if self.speculative_num_draft_tokens is None:
                 from sglang.srt.speculative.dflash_utils import (
@@ -3598,7 +3601,7 @@ class ServerArgs:
                 draft_tokens = int(self.speculative_num_draft_tokens)
                 if window_size < draft_tokens:
                     raise ValueError(
-                        "DFLASH --speculative-dflash-draft-window-size must be >= "
+                        "--speculative-draft-window-size must be >= "
                         "--speculative-num-draft-tokens (block_size). "
                         f"window_size={window_size}, block_size={draft_tokens}."
                     )
@@ -5681,15 +5684,6 @@ class ServerArgs:
             default=ServerArgs.speculative_dflash_block_size,
         )
         parser.add_argument(
-            "--speculative-dflash-draft-window-size",
-            type=int,
-            help="DFLASH only. Sliding window size for the draft-model KV cache. "
-            "When set, the draft worker keeps a recent target-token window in its "
-            "local cache (paged backends may retain up to one extra page on the left "
-            "for alignment). Default is full context.",
-            default=ServerArgs.speculative_dflash_draft_window_size,
-        )
-        parser.add_argument(
             "--speculative-accept-threshold-single",
             type=float,
             help="Accept a draft token if its probability in the target model is greater than this threshold.",
@@ -5719,6 +5713,19 @@ class ServerArgs:
             type=str,
             help="Attention backend for speculative decoding drafting.",
             default=ServerArgs.speculative_draft_attention_backend,
+        )
+        parser.add_argument(
+            "--speculative-draft-window-size",
+            "--speculative-dflash-draft-window-size",
+            type=int,
+            dest="speculative_draft_window_size",
+            help="Sliding window size for the draft model (honored by EAGLE-3 and DFLASH). "
+            "For EAGLE-3, the drafter only attends to the most recent N keys "
+            "(verifier hidden states + its own outputs); the verifier is unaffected. "
+            "For DFLASH, the draft worker keeps a recent target-token window in its "
+            "local KV cache (paged backends may retain up to one extra page on the "
+            "left for alignment). Default is full attention/context.",
+            default=ServerArgs.speculative_draft_window_size,
         )
         parser.add_argument(
             "--speculative-moe-runner-backend",
