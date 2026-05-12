@@ -1666,6 +1666,36 @@ class UnifiedRadixCacheSuite:
         self.assertFalse(tree.host_lru_lists[ComponentType.SWA].in_list(node))
         self.assertNotIn(node, tree.evictable_host_leaves)
 
+    def test_hicache_swa_load_back_rejects_full_backed_swa_gap(self):
+        """A FULL-backed node with no SWA state must not trigger SWA load-back."""
+        if not self.cfg.has_swa:
+            self.skipTest("requires SWA")
+        if self.cfg.has_mamba:
+            self.skipTest("SWA-only path keeps the gap construction simple")
+
+        tree, allocator, req_to_token_pool = build_fixture(self.cfg)
+        seq = self._make_seq(1, 2)
+        self._insert(tree, allocator, req_to_token_pool, seq)
+        m = tree.match_prefix(MatchPrefixParams(key=RadixKey(seq)))
+        node = m.last_device_node
+        self._simulate_backup(tree, node)
+
+        swa_cd = node.component_data[ComponentType.SWA]
+        if swa_cd.value is not None and tree.lru_lists[ComponentType.SWA].in_list(node):
+            tree.lru_lists[ComponentType.SWA].remove_node(node)
+        swa_cd.value = None
+        swa_cd.host_value = None
+
+        self.assertIsNotNone(node.component_data[ComponentType.FULL].value)
+        self.assertIsNotNone(node.component_data[ComponentType.FULL].host_value)
+        self.assertEqual(
+            tree.components[ComponentType.SWA].build_hicache_transfers(
+                node, CacheTransferPhase.LOAD_BACK
+            ),
+            [],
+        )
+        self.assertIsNone(tree.load_back(node))
+
     def _swa_finalize_setup(self):
         """Build a SWA chain long enough to fill at least the window
         plus one extra page, and host-back every node so we can flip

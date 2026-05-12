@@ -1240,6 +1240,10 @@ class UnifiedRadixCache(BasePrefixCache):
             t = comp.build_hicache_transfers(
                 last_hit_node, CacheTransferPhase.LOAD_BACK, req=req
             )
+            if t == []:
+                # Component found an invalid host/device gap; fall back to recompute.
+                self.dec_lock_ref(ancestor_node, ancestor_lock_params)
+                return None
             if t:
                 comp_xfers[comp.component_type] = t
         anchor_kv_shared_indices_xfers = [

@@ -445,7 +445,9 @@ class SWAComponent(TreeComponent):
             nodes: list = []
             while node is not self.cache.root_node and n_swa < self.sliding_window_size:
                 cd = node.component_data[ct]
-                assert cd.host_value is not None or cd.value is not None
+                if cd.host_value is None and cd.value is None:
+                    # Gap inside the trailing window: this prefix is not a valid SWA hit.
+                    return []
                 if cd.value is not None:
                     # device exists, skip it
                     n_swa += len(cd.value)
