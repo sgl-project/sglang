@@ -84,6 +84,7 @@ class TestTransformerQuantHelpers(unittest.TestCase):
                 ),
             ),
             nunchaku_config=None,
+            quantization=None,
             tp_size=1,
             dit_cpu_offload=False,
             text_encoder_cpu_offload=False,

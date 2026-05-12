@@ -37,6 +37,7 @@ from sglang.srt.observability.trace import (
 from sglang.srt.utils import get_bool_env_var
 
 if TYPE_CHECKING:
+    from sglang.srt.disaggregation.base.conn import KVTransferMetric
     from sglang.srt.managers.schedule_batch import ScheduleBatch
 
 SGLANG_TEST_REQUEST_TIME_STATS = get_bool_env_var("SGLANG_TEST_REQUEST_TIME_STATS")
@@ -437,18 +438,9 @@ class APIServerReqTimeStats(ReqTimeStatsBase):
                 self.finished_time
             )
 
-        if (
-            scheduler_time_stats
-            and hasattr(scheduler_time_stats, "forward_entry_time")
-            and self.finished_time > 0.0
-        ):
-            meta_info["inference_time"] = (
-                self.finished_time - scheduler_time_stats.forward_entry_time
-            )
-
         decode_latency = self.get_decode_latency()
-        if decode_latency > 0.0 and completion_tokens > 0:
-            meta_info["decode_throughput"] = completion_tokens / decode_latency
+        if decode_latency > 0.0 and completion_tokens > 1:
+            meta_info["decode_throughput"] = (completion_tokens - 1) / decode_latency
         return meta_info
 
     def convert_to_gen_ai_span_attrs(self):
@@ -546,8 +538,6 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
     # common, get by time.perf_counter()
     wait_queue_entry_time: float = 0.0
     forward_entry_time: float = 0.0
-    prefill_run_batch_start_time: float = 0.0
-    prefill_run_batch_end_time: float = 0.0
     prefill_finished_time: float = 0.0
     completion_time: float = 0.0
 
@@ -582,6 +572,7 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
     # other
     transfer_speed_gb_s: float = 0.0
     transfer_total_mb: float = 0.0
+
     # Number of prefill retries for this request
     prefill_retry_count: int = 0
 
@@ -593,8 +584,6 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
         state = {
             "wait_queue_entry_time": self.wait_queue_entry_time,
             "forward_entry_time": self.forward_entry_time,
-            "prefill_run_batch_start_time": self.prefill_run_batch_start_time,
-            "prefill_run_batch_end_time": self.prefill_run_batch_end_time,
             "prefill_finished_time": self.prefill_finished_time,
             "diff_realtime_monotonic": global_diff_realtime_monotonic,
         }
@@ -606,40 +595,42 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
         self.scheduler_recv_time = ts
 
     def set_spec_draft_start_time(self, ts=None):
-        if ts is None:
-            ts = time.perf_counter()
+        ts = ts or time.perf_counter()
         self.spec_draft_start_time = ts
 
     def set_spec_draft_end_time(self, ts=None):
-        if ts is None:
-            ts = time.perf_counter()
+        ts = ts or time.perf_counter()
 
-        stage = RequestStage.SPEC_DRAFT
-        self.trace_slice(stage, self.spec_draft_start_time, ts)
+        if self.trace_ctx.tracing_enable:
+            stage = RequestStage.SPEC_DRAFT
+            self.trace_slice(stage, self.spec_draft_start_time, ts)
 
     def set_spec_verify_start_time(self, ts=None):
-        if ts is None:
-            ts = time.perf_counter()
+        ts = ts or time.perf_counter()
         self.spec_verify_start_time = ts
 
     def set_spec_verify_end_time(self, ts=None, accepted_tokens: int = 0):
-        if ts is None:
-            ts = time.perf_counter()
-        stage = RequestStage.SPEC_VERIFY
-        self.trace_slice(
-            stage, self.spec_verify_start_time, ts, {"accepted_tokens": accepted_tokens}
-        )
+        ts = ts or time.perf_counter()
+
+        if self.trace_ctx.tracing_enable:
+            stage = RequestStage.SPEC_VERIFY
+            self.trace_slice(
+                stage,
+                self.spec_verify_start_time,
+                ts,
+                {"accepted_tokens": accepted_tokens},
+            )
 
     def set_spec_draft_extend_start_time(self, ts=None):
-        if ts is None:
-            ts = time.perf_counter()
+        ts = ts or time.perf_counter()
         self.spec_draft_extend_start_time = ts
 
     def set_spec_draft_extend_end_time(self, ts=None):
-        if ts is None:
-            ts = time.perf_counter()
-        stage = RequestStage.SPEC_DRAFT_EXTEND
-        self.trace_slice(stage, self.spec_draft_extend_start_time, ts)
+        ts = ts or time.perf_counter()
+
+        if self.trace_ctx.tracing_enable:
+            stage = RequestStage.SPEC_DRAFT_EXTEND
+            self.trace_slice(stage, self.spec_draft_extend_start_time, ts)
 
     def set_run_batch_cpu_start_time(self, ts=None, attrs=None):
         ts = ts or time.perf_counter()
@@ -719,14 +710,6 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
                     )
         elif self.last_forward_entry_time == 0.0:
             self.last_forward_entry_time = ts
-
-    def set_prefill_run_batch_start_time(self, ts=None):
-        ts = ts or time.perf_counter()
-        self.prefill_run_batch_start_time = ts
-
-    def set_prefill_run_batch_end_time(self, ts=None):
-        ts = ts or time.perf_counter()
-        self.prefill_run_batch_end_time = ts
 
     def set_last_chunked_prefill_finish_time(self, ts=None):
         ts = ts or time.perf_counter()
@@ -842,27 +825,31 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
 
     def compute_and_observe_kv_transfer_metrics(
         self,
-        num_tokens: int,
-        page_size: int,
-        bytes_per_page_all_layers: int,
+        transfer_metric: KVTransferMetric,
     ) -> Optional[dict]:
         """Compute KV transfer metrics and observe them via the metrics collector.
 
         Returns a dict with latency_ms, total_mb, speed_gb_s if computable, else None.
         """
-        from sglang.srt.mem_cache.common import kv_to_page_num
-
         result = {}
+        if transfer_metric.transfer_total_bytes is None:
+            return result if result else None
 
         # Transfer latency, size, and speed
-        if self.prefill_transfer_queue_entry_time > 0 and self.completion_time > 0:
+        if transfer_metric.transfer_latency_s is not None:
+            transfer_latency_s = transfer_metric.transfer_latency_s
+        else:
+            if self.prefill_transfer_queue_entry_time <= 0 or self.completion_time <= 0:
+                return result if result else None
+            # Note: This only capture the last chunk time
             transfer_latency_s = (
                 self.completion_time - self.prefill_transfer_queue_entry_time
             )
+
+        if transfer_latency_s > 0:
             latency_ms = transfer_latency_s * 1000
 
-            num_pages = kv_to_page_num(num_tokens, page_size)
-            total_bytes = bytes_per_page_all_layers * num_pages
+            total_bytes = transfer_metric.transfer_total_bytes
             total_mb = total_bytes / (1024 * 1024)
             self.transfer_total_mb = total_mb
 
@@ -949,6 +936,16 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
         )
         self.trace_slice(stage, self.decode_prealloc_queue_entry_time, ts)
 
+        if self.enable_metrics and self.bootstrap_done_time > 0:
+            bootstrap_ms = (
+                self.bootstrap_done_time - self.decode_prealloc_queue_entry_time
+            ) * 1000
+            alloc_ms = (ts - self.bootstrap_done_time) * 1000
+            self.metrics_collector.observe_kv_transfer_bootstrap(
+                bootstrap_ms=bootstrap_ms,
+                alloc_ms=alloc_ms,
+            )
+
     def set_bootstrap_done_time(self, ts=None):
         ts = ts or time.perf_counter()
         if self.bootstrap_done_time == 0.0:
@@ -965,36 +962,31 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
     def get_queueing_time(self) -> float:
         return self.forward_entry_time - self.wait_queue_entry_time
 
-    def get_prefill_waiting_latency(self) -> Optional[float]:
-        if self.prefill_run_batch_start_time > 0.0:
-            return self.prefill_run_batch_start_time - self.forward_entry_time
-        return None
-
-    def get_prefill_launch_latency(self) -> Optional[float]:
-        if (
-            self.prefill_run_batch_start_time > 0.0
-            and self.prefill_run_batch_end_time > 0.0
-        ):
-            return self.prefill_run_batch_end_time - self.prefill_run_batch_start_time
-        return None
-
     def convert_to_duration(self) -> str:
         if self.disagg_mode == DisaggregationMode.NULL:
-            queue_duration = self.forward_entry_time - self.wait_queue_entry_time
-            forward_duration = self.completion_time - self.forward_entry_time
+            queue_duration = self.duration_between(
+                self.wait_queue_entry_time, self.forward_entry_time
+            )
+            forward_duration = self.duration_between(
+                self.forward_entry_time, self.completion_time
+            )
 
             if SGLANG_TEST_REQUEST_TIME_STATS:
                 assert (
                     queue_duration >= 0 and forward_duration >= 0
                 ), f"queue_duration={queue_duration} < 0 or forward_duration={forward_duration} < 0"
 
-            return f"queue_duration={self.format_duration(queue_duration)}, forward_duration={self.format_duration(forward_duration)}, start_time={self.wait_queue_entry_time:.3f}"
+            return f"queue_duration={self.format_duration(queue_duration)}, forward_duration={self.format_duration(forward_duration)}, entry_time={self.format_wallclock(self.wait_queue_entry_time)}"
         elif self.disagg_mode == DisaggregationMode.PREFILL:
-            bootstrap_queue_duration = (
-                self.wait_queue_entry_time - self.prefill_bootstrap_queue_entry_time
+            bootstrap_queue_duration = self.duration_between(
+                self.prefill_bootstrap_queue_entry_time, self.wait_queue_entry_time
             )
-            queue_duration = self.forward_entry_time - self.wait_queue_entry_time
-            forward_duration = self.completion_time - self.forward_entry_time
+            queue_duration = self.duration_between(
+                self.wait_queue_entry_time, self.forward_entry_time
+            )
+            forward_duration = self.duration_between(
+                self.forward_entry_time, self.completion_time
+            )
 
             if SGLANG_TEST_REQUEST_TIME_STATS:
                 if self.wait_queue_entry_time > 0:
@@ -1006,43 +998,49 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
 
             # Break down bootstrap_queue_duration into sub-phases
             if self.bootstrap_done_time > 0:
-                bootstrap_duration = (
-                    self.bootstrap_done_time - self.prefill_bootstrap_queue_entry_time
+                bootstrap_duration = self.duration_between(
+                    self.prefill_bootstrap_queue_entry_time, self.bootstrap_done_time
                 )
-                alloc_wait_duration = (
-                    self.wait_queue_entry_time - self.bootstrap_done_time
+                alloc_wait_duration = self.duration_between(
+                    self.bootstrap_done_time, self.wait_queue_entry_time
                 )
                 if SGLANG_TEST_REQUEST_TIME_STATS:
                     assert (
                         bootstrap_duration >= 0 and alloc_wait_duration >= 0
                     ), f"bootstrap_duration={bootstrap_duration} < 0 or alloc_wait_duration={alloc_wait_duration} < 0"
-                bootstrap_breakdown = (
-                    f"= bootstrap({self.format_duration(bootstrap_duration)}) "
-                    f"+ alloc_wait({self.format_duration(alloc_wait_duration)}); "
+                bootstrap_fields = (
+                    f"bootstrap_duration={self.format_duration(bootstrap_duration)}, "
+                    f"alloc_wait_duration={self.format_duration(alloc_wait_duration)}, "
                 )
             else:
-                bootstrap_breakdown = ""
+                bootstrap_fields = f"bootstrap_queue_duration={self.format_duration(bootstrap_queue_duration)}, "
 
             return (
-                f"bootstrap_queue_duration({self.format_duration(bootstrap_queue_duration)}) "
-                f"{bootstrap_breakdown}"
+                f"{bootstrap_fields}"
                 f"queue_duration={self.format_duration(queue_duration)}, "
                 f"forward_duration={self.format_duration(forward_duration)}, "
-                f"start={self.prefill_bootstrap_queue_entry_time:.3f}, "
-                f"transfer_speed={self.transfer_speed_gb_s:.2f}GB/s, "
-                f"transfer_total={self.transfer_total_mb:.2f}MB, "
+                f"entry_time={self.format_wallclock(self.prefill_bootstrap_queue_entry_time)}, "
+                f"transfer_speed={self.transfer_speed_gb_s:.2f} GB/s, "
+                f"transfer_total={self.transfer_total_mb:.2f} MB, "
                 f"#retries={self.prefill_retry_count}"
             )
         elif self.disagg_mode == DisaggregationMode.DECODE:
-            prealloc_duration = (
-                self.decode_transfer_queue_entry_time
-                - self.decode_prealloc_queue_entry_time
+            prealloc_duration = self.duration_between(
+                self.decode_prealloc_queue_entry_time,
+                self.decode_transfer_queue_entry_time,
             )
-            transfer_duration = (
-                self.wait_queue_entry_time - self.decode_transfer_queue_entry_time
+            transfer_duration = self.duration_between(
+                self.decode_transfer_queue_entry_time,
+                self.wait_queue_entry_time,
             )
-            queue_duration = self.forward_entry_time - self.wait_queue_entry_time
-            forward_duration = self.completion_time - self.forward_entry_time
+            queue_duration = self.duration_between(
+                self.wait_queue_entry_time,
+                self.forward_entry_time,
+            )
+            forward_duration = self.duration_between(
+                self.forward_entry_time,
+                self.completion_time,
+            )
 
             if SGLANG_TEST_REQUEST_TIME_STATS:
                 if self.wait_queue_entry_time > 0:
@@ -1055,30 +1053,29 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
 
             # Break down prealloc_duration into sub-phases
             if self.bootstrap_done_time > 0:
-                bootstrap_duration = (
-                    self.bootstrap_done_time - self.decode_prealloc_queue_entry_time
+                bootstrap_duration = self.duration_between(
+                    self.decode_prealloc_queue_entry_time, self.bootstrap_done_time
                 )
-                alloc_wait_duration = (
-                    self.decode_transfer_queue_entry_time - self.bootstrap_done_time
+                alloc_wait_duration = self.duration_between(
+                    self.bootstrap_done_time, self.decode_transfer_queue_entry_time
                 )
                 if SGLANG_TEST_REQUEST_TIME_STATS:
                     assert (
                         bootstrap_duration >= 0 and alloc_wait_duration >= 0
                     ), f"bootstrap_duration={bootstrap_duration} < 0 or alloc_wait_duration={alloc_wait_duration} < 0"
-                prealloc_breakdown = (
-                    f"= bootstrap({self.format_duration(bootstrap_duration)}) "
-                    f"+ alloc_wait({self.format_duration(alloc_wait_duration)}); "
+                prealloc_fields = (
+                    f"bootstrap_duration={self.format_duration(bootstrap_duration)}, "
+                    f"alloc_wait_duration={self.format_duration(alloc_wait_duration)}, "
                 )
             else:
-                prealloc_breakdown = ""
+                prealloc_fields = f"prealloc_queue_duration={self.format_duration(prealloc_duration)}, "
 
             return (
-                f"prealloc_queue_duration({self.format_duration(prealloc_duration)}) "
-                f"{prealloc_breakdown}"
-                f"transfer_duration={self.format_duration(transfer_duration)}; "
+                f"{prealloc_fields}"
+                f"transfer_duration={self.format_duration(transfer_duration)}, "
                 f"queue_duration={self.format_duration(queue_duration)}, "
                 f"forward_duration={self.format_duration(forward_duration)}, "
-                f"start={self.decode_prealloc_queue_entry_time:.3f}"
+                f"entry_time={self.format_wallclock(self.decode_prealloc_queue_entry_time)}"
             )
         else:
             return "Unknown Time Stats"
@@ -1096,14 +1093,21 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
         meta_data.update(
             {
                 "queue_time": self.get_queueing_time(),
-                "prefill_waiting_latency": self.get_prefill_waiting_latency(),
-                "prefill_launch_latency": self.get_prefill_launch_latency(),
             }
         )
         return meta_data
 
     def format_duration(self, duration: float) -> str:
         return f"{duration * 1e3:.2f}ms"
+
+    def duration_between(self, start: float, end: float) -> float:
+        if start <= 0 or end <= 0:
+            return 0.0
+        return end - start
+
+    @staticmethod
+    def format_wallclock(perf_counter_time: float) -> str:
+        return f"{convert_time_to_realtime(perf_counter_time):.3f}"
 
 
 def set_schedule_time_batch(batch: ScheduleBatch):

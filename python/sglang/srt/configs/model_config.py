@@ -82,34 +82,47 @@ class ModelImpl(str, Enum):
     MINDSPORE = "mindspore"
 
 
-def is_deepseek_nsa(config) -> bool:
-    architectures = (
+def _hf_arch(config) -> Optional[str]:
+    """First architecture from a HF config dict or PretrainedConfig (or None)."""
+    archs = (
         config.get("architectures")
         if isinstance(config, dict)
         else getattr(config, "architectures", None)
     )
-    index_topk = (
-        config.get("index_topk")
-        if isinstance(config, dict)
-        else getattr(config, "index_topk", None)
-    )
+    return archs[0] if archs else None
+
+
+def _hf_attr(config, name):
+    """Read an arbitrary field from a HF config dict or PretrainedConfig."""
+    if isinstance(config, dict):
+        return config.get(name)
+    return getattr(config, name, None)
+
+
+def is_deepseek_nsa(config) -> bool:
     return (
-        architectures is not None
-        and architectures[0]
-        in [
+        _hf_arch(config)
+        in (
             "DeepseekV3ForCausalLM",
             "DeepseekV32ForCausalLM",
             "DeepseekV3ForCausalLMNextN",
             "MistralLarge3ForCausalLM",
             "PixtralForConditionalGeneration",
             "GlmMoeDsaForCausalLM",
-        ]
-        and index_topk is not None
+        )
+        and _hf_attr(config, "index_topk") is not None
+    )
+
+
+def is_deepseek_v4(config) -> bool:
+    return _hf_arch(config) in (
+        "DeepseekV4ForCausalLM",
+        "DeepseekV4ForCausalLMNextN",
     )
 
 
 def get_nsa_index_head_dim(config: PretrainedConfig) -> int:
-    assert is_deepseek_nsa(config)
+    assert is_deepseek_nsa(config) or is_deepseek_v4(config)
     return config.index_head_dim
 
 
@@ -121,6 +134,23 @@ def get_nsa_index_topk(config: PretrainedConfig) -> int:
 def get_nsa_index_n_heads(config: PretrainedConfig) -> int:
     assert is_deepseek_nsa(config)
     return config.index_n_heads
+
+
+def get_num_indexer_layers(config) -> int:
+    """Layer count for the global indexer-topk capturer's host buffer.
+
+    NSA models (V3.2) instantiate an Indexer on every transformer layer.
+    With index_topk_freq > 1 some layers reuse prev layer's topk; those still
+    get a slot (mirrored at the MLA call site). DSv4 has C4 indexers only on
+    layers whose compress_ratio == 4. Other architectures: set
+    num_indexer_layers on hf_text_config; 0 disables the capturer.
+    """
+    if is_deepseek_nsa(config):
+        return config.num_hidden_layers
+    if is_deepseek_v4(config):
+        compress_ratios = getattr(config, "compress_ratios", None) or []
+        return sum(1 for r in compress_ratios if r == 4)
+    return getattr(config, "num_indexer_layers", 0)
 
 
 class ModelConfig:
@@ -196,11 +226,49 @@ class ModelConfig:
                 logger.info(
                     f"Multimodal is disabled for {self.hf_config.model_type}. To enable it, set --enable-multimodal."
                 )
+            elif self.hf_config.architectures[0] in MIMO_V2_MULTIMODAL_ARCHS and not (
+                hasattr(self.hf_config, "vision_config")
+                and hasattr(self.hf_config, "audio_config")
+            ):
+                enable_multimodal = False
+                logger.info(
+                    "Multimodal is disabled for this MiMoV2 checkpoint: "
+                    "vision_config/audio_config not found in the model config "
+                    "(likely a text-only MiMoV2 variant)."
+                )
             else:
                 enable_multimodal = True
 
         # Config draft model
         self._config_draft_model()
+
+        # DSV4 expert layout: env (default True = mxfp4) applies only to V4.
+        # Other FP8 MoE models (for example DeepSeek V3.2) must keep the normal
+        # FP8 expert tensor layout.
+        self.is_fp4_experts: bool = False
+        if is_deepseek_v4(self.hf_config):
+            self.is_fp4_experts = envs.SGLANG_DSV4_FP4_EXPERTS.get()
+            if not envs.SGLANG_DSV4_FP4_EXPERTS.is_set():
+                from sglang.srt.configs.deepseek_v4 import try_detect_fp4_experts
+
+                detected = try_detect_fp4_experts(self.model_path)
+                if detected is not None:
+                    self.is_fp4_experts = detected
+                    logger.info(
+                        "Auto-detected DSV4 routed-expert layout: is_fp4_experts=%s",
+                        self.is_fp4_experts,
+                    )
+
+            # HF config.json inherits topk_group=4 from the V3 template, but
+            # DSV4 trains with no group limiting (sqrtsoftplus + full-expert
+            # top-k). Force topk_group == n_group so deepseek_v2.py:531's
+            # `n_group > topk_group` evaluates False and routes to the
+            # ungrouped sqrtsoftplus path. The grouped impl only supports
+            # sigmoid scoring (topk.py:722) and would silently corrupt expert
+            # weights if hit.
+            n_group = getattr(self.hf_config, "n_group", None)
+            if n_group is not None:
+                self.hf_config.topk_group = n_group
 
         # Check model type
         self.attention_chunk_size = getattr(
@@ -343,9 +411,17 @@ class ModelConfig:
 
         if is_draft_model and self.hf_config.architectures[0] in [
             "DeepseekV3ForCausalLM",
+            "DeepseekV32ForCausalLM",
             "GlmMoeDsaForCausalLM",
         ]:
             self.hf_config.architectures[0] = "DeepseekV3ForCausalLMNextN"
+
+        if (
+            is_draft_model
+            and self.hf_config.architectures[0] == "DeepseekV4ForCausalLM"
+        ):
+            self.hf_config.architectures[0] = "DeepseekV4ForCausalLMNextN"
+            self.hf_config.num_nextn_predict_layers = 1
 
         if is_draft_model and self.hf_config.architectures[0] in [
             "Glm4MoeForCausalLM",
@@ -390,6 +466,7 @@ class ModelConfig:
         if is_draft_model and self.hf_config.architectures[0] in [
             "Qwen3_5ForConditionalGeneration",
             "Qwen3_5MoeForConditionalGeneration",
+            "InternS2PreviewForConditionalGeneration",
         ]:
             self.hf_config.architectures[0] = "Qwen3_5ForCausalLMMTP"
             self.hf_config.num_nextn_predict_layers = 1
@@ -414,12 +491,20 @@ class ModelConfig:
         )
 
         if self.is_hybrid_swa:
-            self.swa_attention_layer_ids, self.full_attention_layer_ids = (
-                get_hybrid_layer_ids(
-                    self.hf_config.architectures,
-                    self.hf_text_config,
-                )
+            logger.info(f"Hybrid swa model: {self.hf_config.architectures=}")
+
+            self.is_deepseek_v4_arch = any(
+                arch in ["DeepseekV4ForCausalLM", "DeepseekV4ForCausalLMNextN"]
+                for arch in self.hf_config.architectures
             )
+
+            if not self.is_deepseek_v4_arch:
+                self.swa_attention_layer_ids, self.full_attention_layer_ids = (
+                    get_hybrid_layer_ids(
+                        self.hf_config.architectures,
+                        self.hf_text_config,
+                    )
+                )
 
         self.has_attention_sinks = self._detect_attention_sinks()
 
@@ -524,6 +609,7 @@ class ModelConfig:
             )
             or "MistralLarge3ForCausalLMEagle" in self.hf_config.architectures
             or "KimiK25ForConditionalGeneration" in self.hf_config.architectures
+            or "Eagle3DeepseekV2ForCausalLM" in self.hf_config.architectures
         ):
             self.head_dim = 256
             self.attention_arch = AttentionArch.MLA
@@ -551,6 +637,23 @@ class ModelConfig:
                     self.scaling = compute_mla_mscale_scaling(
                         rope_scaling, self.scaling
                     )
+        elif (
+            "DeepseekV4ForCausalLM" in self.hf_config.architectures
+            or "DeepseekV4ForCausalLMNextN" in self.hf_config.architectures
+        ):
+            self.qk_rope_head_dim = self.hf_config.qk_rope_head_dim
+            self.qk_nope_head_dim = self.hf_config.head_dim - self.qk_rope_head_dim
+            self.window_size = self.hf_config.sliding_window
+            self.head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
+            self.v_head_dim = self.head_dim
+            self.index_head_dim = self.hf_config.index_head_dim
+            self.compress_ratios = self.hf_config.compress_ratios
+            self.attention_arch = AttentionArch.MHA
+            self.scaling = 1 / math.sqrt(self.qk_nope_head_dim + self.qk_rope_head_dim)
+            if self.hf_config.rope_scaling:
+                self.scaling = compute_mla_mscale_scaling(
+                    self.hf_config.rope_scaling, self.scaling
+                )
         elif "MiniCPM3ForCausalLM" in self.hf_config.architectures:
             self.head_dim = 128
             self.attention_arch = AttentionArch.MLA
@@ -967,10 +1070,11 @@ class ModelConfig:
             return "fp8"  # Default fallback
 
     def _get_sliding_window_size(self) -> Optional[int]:
-        sliding_window_size = getattr(self.hf_text_config, "sliding_window_size", None)
-        if sliding_window_size is None:
-            sliding_window_size = getattr(self.hf_text_config, "sliding_window", None)
-        return sliding_window_size
+        for key in ("sliding_window_size", "sliding_window", "window_size"):
+            value = getattr(self.hf_text_config, key, None)
+            if value is not None:
+                return value
+        return None
 
     def _validate_quantize_and_serve_config(self):
         """Validate quantize_and_serve configuration."""
@@ -1419,6 +1523,7 @@ multimodal_model_archs = [
     "Qwen3VLMoeForConditionalGeneration",
     "Qwen3_5ForConditionalGeneration",
     "Qwen3_5MoeForConditionalGeneration",
+    "InternS2PreviewForConditionalGeneration",
     "Qwen3ASRForConditionalGeneration",
     "Qwen3OmniMoeForConditionalGeneration",
     "KimiVLForConditionalGeneration",
@@ -1445,6 +1550,8 @@ multimodal_model_archs = [
 
 piecewise_cuda_graph_disabled_model_archs = [
     "DeepseekV32ForCausalLM",
+    "DeepseekV4ForCausalLM",
+    "DeepseekV4ForCausalLMNextN",
     "Qwen3NextForCausalLM",
     "GlmMoeDsaForCausalLM",
     "BailingMoeV2_5ForCausalLM",
@@ -1547,6 +1654,8 @@ def is_hybrid_swa_model(model_architectures: List[str]):
 
     hybrid_swa_archs = {
         "Llama4ForConditionalGeneration",
+        "DeepseekV4ForCausalLM",
+        "DeepseekV4ForCausalLMNextN",
         "GptOssForCausalLM",
         *MIMO_V2_MODEL_ARCHS,
         "MiMoV2MTP",
@@ -1554,6 +1663,7 @@ def is_hybrid_swa_model(model_architectures: List[str]):
         "Step3p5MTP",
         "Gemma4ForCausalLM",
         "Gemma4ForConditionalGeneration",
+        "LagunaForCausalLM",
     }
     return any(arch in hybrid_swa_archs for arch in model_architectures)
 
@@ -1608,6 +1718,14 @@ def get_hybrid_layer_ids(
         "Gemma4ForCausalLM" in model_architectures
         or "Gemma4ForConditionalGeneration" in model_architectures
     ):
+        layer_types = getattr(hf_text_config, "layer_types", [])
+        swa_attention_layer_ids = [
+            i for i, x in enumerate(layer_types) if x == "sliding_attention"
+        ]
+        full_attention_layer_ids = [
+            i for i, x in enumerate(layer_types) if x == "full_attention"
+        ]
+    elif "LagunaForCausalLM" in model_architectures:
         layer_types = getattr(hf_text_config, "layer_types", [])
         swa_attention_layer_ids = [
             i for i, x in enumerate(layer_types) if x == "sliding_attention"
