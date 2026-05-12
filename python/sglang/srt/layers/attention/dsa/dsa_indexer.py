@@ -141,6 +141,82 @@ if _is_cuda:
             topk_result,
         )
 
+    @register_custom_op(mutates_args=["topk_result"])
+    @register_split_op()
+    def dsa_indexer_pcg_dispatch(
+        layer_id: int,
+        x: torch.Tensor,
+        q_lora: torch.Tensor,
+        positions: torch.Tensor,
+        topk_result: torch.Tensor,
+    ) -> None:
+        assert (
+            _is_cuda
+        ), "Internal error: piecewise CUDA graph is only supported on CUDA"
+        from sglang.srt.layers.attention.dsa.triton_kernel import act_quant
+
+        forward_batch = get_forward_context().forward_batch
+        indexer = get_forward_context().dsa_indexers[layer_id]
+        metadata = get_attn_backend().get_indexer_metadata(layer_id, forward_batch)
+
+        extend_num_tokens = forward_batch.extend_num_tokens
+        if topk_result.numel() == 0:
+            indexer._compute_and_store_k_only(
+                x,
+                positions,
+                forward_batch,
+                layer_id,
+                act_quant,
+                enable_dual_stream=False,
+                num_tokens=extend_num_tokens,
+            )
+            return
+
+        if (
+            indexer._should_skip_logits_computation(forward_batch)
+            and not indexer.dsa_enable_prefill_cp
+        ):
+            indexer._compute_and_store_k_only(
+                x,
+                positions,
+                forward_batch,
+                layer_id,
+                act_quant,
+                enable_dual_stream=False,
+                num_tokens=extend_num_tokens,
+            )
+            raw_topk_result = indexer._get_k_only_topk_result(metadata, x.device)
+            topk_result[: raw_topk_result.shape[0]] = raw_topk_result
+            return
+
+        query, key = indexer._get_q_k_bf16(
+            q_lora,
+            x,
+            positions,
+            enable_dual_stream=False,
+            forward_batch=forward_batch,
+        )
+        q_fp8, q_scale = act_quant(query, indexer.block_size, indexer.scale_fmt)
+        weights = indexer._weights_proj_bf16_in_fp32_out(x)
+        weights = weights * indexer.n_heads**-0.5
+        weights = weights.unsqueeze(-1) * q_scale * indexer.softmax_scale
+        indexer._store_index_k_cache(
+            forward_batch=forward_batch,
+            layer_id=layer_id,
+            key=key[:extend_num_tokens],
+            act_quant=act_quant,
+            out_cache_loc=forward_batch.out_cache_loc[:extend_num_tokens],
+        )
+        indexer._get_topk_ragged(
+            False,
+            forward_batch,
+            layer_id,
+            q_fp8[:extend_num_tokens],
+            weights,
+            metadata,
+            topk_result,
+        )
+
     def _logits_head_gate_pcg_fake_impl(
         x: torch.Tensor,
         weight: torch.Tensor,
@@ -404,6 +480,15 @@ class Indexer(MultiPlatformOp):
     ):
         return weights.unsqueeze(-1) * q_scale * self.softmax_scale
 
+    def _should_skip_logits_computation(self, forward_batch: ForwardBatch) -> bool:
+        if (
+            forward_batch.forward_mode.is_extend_without_speculative()
+            and forward_batch.seq_lens_cpu is not None
+        ):
+            max_kv_len = forward_batch.seq_lens_cpu.max().item()
+            return max_kv_len <= self.index_topk
+        return False
+
     def _get_q_k_bf16(
         self,
         q_lora: torch.Tensor,
@@ -514,6 +599,47 @@ class Indexer(MultiPlatformOp):
         key = rotate_activation(key)
 
         return key
+
+    def _compute_and_store_k_only(
+        self,
+        x: Union[torch.Tensor, Tuple[torch.Tensor, ...]],
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        layer_id: int,
+        act_quant,
+        enable_dual_stream: bool,
+        *,
+        num_tokens: Optional[int] = None,
+    ) -> None:
+        key = self._get_k_bf16(x, positions, enable_dual_stream)
+        out_cache_loc = None
+        if num_tokens is not None:
+            key = key[:num_tokens]
+            out_cache_loc = forward_batch.out_cache_loc[:num_tokens]
+        elif not forward_batch.out_cache_loc.is_contiguous():
+            forward_batch.out_cache_loc = forward_batch.out_cache_loc.contiguous()
+
+        self._store_index_k_cache(
+            forward_batch=forward_batch,
+            layer_id=layer_id,
+            key=key,
+            act_quant=act_quant,
+            out_cache_loc=out_cache_loc,
+        )
+
+    def _get_k_only_topk_result(
+        self,
+        metadata: BaseIndexerMetadata,
+        device: torch.device,
+    ) -> torch.Tensor:
+        seq_lens_expanded = metadata.get_seqlens_expanded()
+        dummy_logits = torch.zeros(
+            seq_lens_expanded.shape[0],
+            self.index_topk,
+            dtype=torch.float32,
+            device=device,
+        )
+        return metadata.topk_transform(dummy_logits, self.index_topk)
 
     @staticmethod
     def _update_rope_guarded(dst: torch.Tensor, src: torch.Tensor) -> None:
@@ -898,16 +1024,13 @@ class Indexer(MultiPlatformOp):
         x_meta = x[0] if isinstance(x, tuple) else x
 
         # Fast path: only compute and store k cache, skip all q and weights ops
-        key = self._get_k_bf16(x, positions, enable_dual_stream)
-
-        if not forward_batch.out_cache_loc.is_contiguous():
-            forward_batch.out_cache_loc = forward_batch.out_cache_loc.contiguous()
-
-        self._store_index_k_cache(
-            forward_batch=forward_batch,
-            layer_id=layer_id,
-            key=key,
-            act_quant=act_quant,
+        self._compute_and_store_k_only(
+            x,
+            positions,
+            forward_batch,
+            layer_id,
+            act_quant,
+            enable_dual_stream,
         )
 
         # MHA doesn't need topk_indices
@@ -916,14 +1039,7 @@ class Indexer(MultiPlatformOp):
 
         # MLA: use dummy logits with topk kernel's fast path to generate indices
         # When length <= 2048, naive_topk_cuda directly generates [0,1,...,length-1,-1,...]
-        seq_lens_expanded = metadata.get_seqlens_expanded()
-        dummy_logits = torch.zeros(
-            seq_lens_expanded.shape[0],
-            self.index_topk,
-            dtype=torch.float32,
-            device=x_meta.device,
-        )
-        return metadata.topk_transform(dummy_logits, self.index_topk)
+        return self._get_k_only_topk_result(metadata, x_meta.device)
 
     def _get_topk_ragged_with_cp(
         self,
@@ -1294,16 +1410,11 @@ class Indexer(MultiPlatformOp):
             and q_lora.shape[0] <= DUAL_STREAM_TOKEN_THRESHOLD
         )
 
-        # Determine if should skip topk based on sequence length
-        # We can only skip the logits computation if cuda graph is not involved
         skip_logits_computation = False
-        if (
-            not is_in_piecewise_cuda_graph()
-            and forward_batch.forward_mode.is_extend_without_speculative()
-        ):
-            if forward_batch.seq_lens_cpu is not None:
-                max_kv_len = forward_batch.seq_lens_cpu.max().item()
-                skip_logits_computation = max_kv_len <= self.index_topk
+        if not is_in_piecewise_cuda_graph():
+            skip_logits_computation = self._should_skip_logits_computation(
+                forward_batch
+            )
 
         # Optimization: fast path when skipping topk computation
         if skip_logits_computation and (not self.dsa_enable_prefill_cp):
@@ -1319,6 +1430,35 @@ class Indexer(MultiPlatformOp):
                     metadata,
                     return_indices,
                 ),
+            )
+
+        if (
+            is_in_piecewise_cuda_graph()
+            and forward_batch.forward_mode.is_extend_without_speculative()
+            and not self.dsa_enable_prefill_cp
+            and not isinstance(x, tuple)
+        ):
+            topk_result = (
+                torch.full(
+                    (x_meta.shape[0], self.index_topk),
+                    -1,
+                    device=x_meta.device,
+                    dtype=torch.int32,
+                )
+                if return_indices
+                else torch.empty(
+                    (0, self.index_topk), device=x_meta.device, dtype=torch.int32
+                )
+            )
+            dsa_indexer_pcg_dispatch(
+                layer_id=layer_id,
+                x=x,
+                q_lora=q_lora,
+                positions=positions,
+                topk_result=topk_result,
+            )
+            return maybe_capture_indexer_topk(
+                layer_id, topk_result if return_indices else None
             )
 
         if enable_dual_stream and forward_batch.forward_mode.is_decode_or_idle():
