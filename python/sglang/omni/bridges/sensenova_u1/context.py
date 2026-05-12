@@ -339,6 +339,7 @@ def _build_u1_native_interleave_like_prepared_input(
         u1_metadata["image_offsets"] = list(image_offsets)
         u1_metadata["image_count"] = len(images)
     policy_metadata = _u1_policy_metadata({"u1": u1_metadata})
+    policy_metadata["omni_srt_position_count"] = generation_position_start
     if model_state_updates is not None:
         state_updates = dict(model_state_updates)
         state_updates["generation_position_start"] = generation_position_start
@@ -452,6 +453,7 @@ def build_u1_native_edit_prepared_input(
         mm_inputs=mm_inputs,
         policy_metadata=_u1_policy_metadata(
             {
+                "omni_srt_position_count": generation_position_start,
                 "u1": {
                     "segment_type": "edit",
                     "source": "native_edit_prompt",
@@ -571,6 +573,7 @@ def _build_u1_native_image_condition_path_prepared_input(
         condition_path_session_id=_u1_condition_path_session_id(session, role),
         policy_metadata=_u1_policy_metadata(
             {
+                "omni_srt_position_count": generation_position_start,
                 "u1": {
                     "segment_type": segment_type,
                     "source": source,
