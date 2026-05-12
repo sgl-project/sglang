@@ -1041,12 +1041,13 @@ def _plan_compress_prefill_torch(
         n_rows = num_tokens if use_cuda_graph else n_entries
         if n_rows == 0:
             return num_tokens if use_cuda_graph else 0
-        valid_bytes = b"".join(struct.pack("<IIII", *e) for e in entries)
+        payload = bytearray()
+        for e in entries:
+            payload.extend(struct.pack("<IIII", *e))
         if use_cuda_graph and n_entries < num_tokens:
-            payload = valid_bytes + invalid_row * (num_tokens - n_entries)
-        else:
-            payload = valid_bytes
-        cpu_view = torch.frombuffer(bytearray(payload), dtype=torch.uint8).view(
+            for _ in range(num_tokens - n_entries):
+                payload.extend(invalid_row)
+        cpu_view = torch.frombuffer(payload, dtype=torch.uint8).view(
             n_rows, 16
         )
         buf[:n_rows].copy_(cpu_view)
