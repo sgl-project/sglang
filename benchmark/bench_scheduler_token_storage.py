@@ -1,6 +1,13 @@
 """Benchmark `list[int]` vs `array.array('q')` storage for
-`Req.origin_input_ids` / `Req.output_ids` over one
-prefill -> decode -> finish lifecycle.
+`Req.origin_input_ids` / `Req.output_ids` over one request lifecycle.
+
+Simulated steps (per batch):
+    1. ingest   -- tokenizer list[int] -> storage container.
+    2. prefill  -- (a) fill_ids = origin + output,
+                   (b) per-req slice fill_ids[prefix_len:],
+                   (c) cross-req flatten + pinned cuda tensor build.
+    3. decode   -- per-step output.append(next_token) for n_decode steps.
+    4. finish   -- (origin + output)[:kv_committed_len] for radix cache.
 
 Usage:
     python benchmark/bench_scheduler_token_storage.py
@@ -99,31 +106,33 @@ def simulate(
     origins: list[Any] = [None] * n_reqs
     outputs: list[Any] = [None] * n_reqs
 
+    # 1. ingest
     for i, seed in enumerate(seeds):
         with timed(timings, "ingest"):
             origins[i] = ingest_fn(seed)
         outputs[i] = empty_fn()
 
+    # 2. prefill
     per_req_slices: list[Any] = [None] * n_reqs
     for i in range(n_reqs):
-        # fill_ids = origin_input_ids + output_ids
+        # 2a. fill_ids = origin_input_ids + output_ids
         with timed(timings, "prefill_concat"):
             fill_ids = origins[i] + outputs[i]
-        # input_ids = fill_ids[len(prefix_indices):]; prefix_len=0 here.
+        # 2b. input_ids = fill_ids[len(prefix_indices):]; prefix_len=0 here.
         with timed(timings, "prefill_perreq_slice"):
             per_req_slices[i] = fill_ids[0:]
-
-    # prepare_for_extend tensor build: flatten per-req slices, then
-    # build the pinned GPU tensor (kit-specific path).
+    # 2c. prepare_for_extend tensor build: flatten per-req slices, then
+    #     build the pinned GPU tensor (kit-specific path).
     with timed(timings, "batch_torch_tensor"):
         _ = batch_torch_fn(per_req_slices)
 
+    # 3. decode
     for i in range(n_reqs):
         with timed(timings, "decode_append"):
             for j in range(n_decode):
                 outputs[i].append(j)
 
-    # cache_finished_req: (origin + output)[:kv_committed_len].
+    # 4. finish: cache_finished_req builds (origin + output)[:kv_committed_len].
     for i in range(n_reqs):
         with timed(timings, "finish_concat"):
             _ = (origins[i] + outputs[i])[: n_origins[i] + n_decode]
