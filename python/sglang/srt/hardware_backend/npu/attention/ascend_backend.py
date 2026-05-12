@@ -1064,7 +1064,7 @@ class AscendAttnBackend(AttentionBackend):
             k_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
             v_cache = forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id)
 
-            if sinks is not None or self.is_hybrid_swa:
+            if sinks is not None or (self.is_hybrid_swa and layer.sliding_window_size != -1):
                 # Use SWA block tables if hybrid SWA is enabled for this layer
                 if self.is_hybrid_swa and layer.sliding_window_size != -1:
                     block_tables = self.forward_metadata.block_tables_swa
@@ -2005,13 +2005,13 @@ class AscendAttnBackend(AttentionBackend):
             k_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
             v_cache = forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id)
 
-            if sinks is not None or self.is_hybrid_swa:
+            if sinks is not None or (self.is_hybrid_swa and layer.sliding_window_size != -1):
                 # Use SWA block tables if hybrid SWA is enabled for this layer
                 if self.is_hybrid_swa and layer.sliding_window_size != -1:
                     block_tables = self.forward_metadata.block_tables_swa
                 else:
                     block_tables = self.forward_metadata.block_tables
-                if self.use_fia and sinks is None and layer.sliding_window_size != -1:
+                if self.use_fia and sinks is None:
                     q = q.reshape(-1, layer.tp_q_head_num, layer.qk_head_dim)
                     block_size = 128
                     max_model_len = block_tables.shape[-1] * block_size
