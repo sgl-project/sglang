@@ -526,7 +526,6 @@ class MiniMaxM2MoE(nn.Module):
             routed_scaling_factor=1.0,
         )
 
-        # Note [minimax self.gate is fp32]
         self.gate = ReplicatedLinear(
             config.hidden_size,
             config.num_local_experts,
