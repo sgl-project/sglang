@@ -189,10 +189,21 @@ class MooncakeTransferEngine:
                 device_name if device_name is not None else "",
             )
         else:
+            # Honour MOONCAKE_PROTOCOL only when the user has set it
+            # explicitly (e.g. MOONCAKE_PROTOCOL=efa on AWS EFA).
+            # Otherwise default to "rdma" to preserve the historical
+            # behaviour for InfiniBand / RoCE deployments that have
+            # never set this variable — the env's own default ("tcp")
+            # is specific to Mooncake Store and is not appropriate here.
+            protocol = (
+                envs.MOONCAKE_PROTOCOL.get()
+                if envs.MOONCAKE_PROTOCOL.is_set()
+                else "rdma"
+            )
             ret_value = self.engine.initialize(
                 hostname,
                 "P2PHANDSHAKE",
-                "rdma",
+                protocol,
                 device_name if device_name is not None else "",
             )
         if ret_value != 0:
