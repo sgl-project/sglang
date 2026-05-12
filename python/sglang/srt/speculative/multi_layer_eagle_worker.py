@@ -574,24 +574,22 @@ class MultiLayerEagleWorker(TpModelWorker):
                 # first_token_indices_per_req=prepend(0, accepted_indices[cumulative_num_accept_tokens[:-1]]) = [0, 5, 10]
                 # last_token_indices_per_req=accepted_indices[cumulative_num_accept_tokens - 1] = [4, 9, 11] (last token ID of each req)
                 # accept_steps = [4,4,1]; those are the per-req spec-decoding step offsets that contain the correct mamba caches
+                # equivalent: accept_steps = last_token_indices_per_req - first_token_indices_per_req;
+                # `accepted_indices_offset` equals `first_token_indices_per_req` because the first accepted slot of each req is its "current token" at logical position i * draft_token_num.
                 cumulative_num_accept_tokens = torch.cumsum(
                     num_correct_drafts + 1, dim=0
                 )
-                req_start_positions = torch.cat(
-                    [
-                        torch.zeros(
-                            1,
-                            dtype=cumulative_num_accept_tokens.dtype,
-                            device=cumulative_num_accept_tokens.device,
-                        ),
-                        cumulative_num_accept_tokens[:-1],
-                    ]
+                accepted_indices_offset = torch.arange(
+                    0,
+                    len(batch.seq_lens) * self.speculative_num_draft_tokens,
+                    step=self.speculative_num_draft_tokens,
+                    dtype=num_correct_drafts.dtype,
+                    device=num_correct_drafts.device,
                 )
-                first_token_indices_per_req = res.accepted_indices[req_start_positions]
-                last_token_indices_per_req = res.accepted_indices[
-                    cumulative_num_accept_tokens - 1
-                ]
-                accept_steps = last_token_indices_per_req - first_token_indices_per_req
+                accept_steps = (
+                    res.accepted_indices[cumulative_num_accept_tokens - 1]
+                    - accepted_indices_offset
+                )
             else:
                 accept_steps = num_correct_drafts
             self.target_worker.model_runner.attn_backend.update_mamba_state_after_mtp_verify(
