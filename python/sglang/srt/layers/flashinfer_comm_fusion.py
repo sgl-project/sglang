@@ -778,14 +778,6 @@ def flashinfer_allreduce_residual_rmsnorm(
     Returns:
         Tuple[torch.Tensor, torch.Tensor]: (norm_output, residual_output)
     """
-    # For the regular (non-piecewise) CUDA graph, MNNVL is not capture-safe:
-    # bail out so the caller falls back to a capture-safe allreduce.
-    if (
-        torch.cuda.is_current_stream_capturing()
-        and flashinfer_ar_needs_piecewise_cuda_graph_split(get_global_server_args())
-    ):
-        return None, None
-
     if not is_flashinfer_available() or _flashinfer_comm is None:
         logger.debug(
             "FlashInfer not available, falling back to standard implementation"
