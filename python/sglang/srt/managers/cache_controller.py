@@ -293,11 +293,6 @@ class HiCacheController:
         self.has_draft = False
         self.mem_pool_device_draft = None
         self.mem_pool_host_draft = None
-        # I/O path for the draft pool when storage is enabled:
-        #   "off"     : draft offload disabled (no draft pool, or storage off,
-        #               or backend not yet supported)
-        #   "v2"      : v2 multi-pool zero-copy (currently only mooncake)
-        #   "generic" : legacy batch_set / batch_get on data pages (e.g., file)
         self.draft_io_mode = "off"
 
         # Default storage page IO functions (may be overridden by attach).
@@ -1186,6 +1181,7 @@ class HiCacheController:
             draft_pages = self.storage_backend.batch_get(draft_keys, draft_dummy)
             if draft_pages is None:
                 return
+
             for i, p in enumerate(draft_pages):
                 if p is not None:
                     self.mem_pool_host_draft.set_from_flat_data_page(
