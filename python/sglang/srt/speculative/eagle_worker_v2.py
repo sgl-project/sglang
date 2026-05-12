@@ -800,7 +800,11 @@ class EAGLEWorkerV2(BaseSpecWorker):
     # -- Adaptive speculative decoding protocol --
 
     def build_adaptive_runtime_state(
-        self, speculative_num_steps: int, speculative_num_draft_tokens: int
+        self,
+        speculative_num_steps: int,
+        speculative_num_draft_tokens: int,
+        cuda_graph_bs=None,
+        init_max_bs=None,
     ) -> SpecRuntimeState:
         """Build a SpecRuntimeState for the given step configuration."""
         tic = time.perf_counter()

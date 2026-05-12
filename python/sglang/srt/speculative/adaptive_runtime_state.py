@@ -64,6 +64,7 @@ class AdaptiveSpecWorker(Protocol):
         speculative_num_steps: int,
         speculative_num_draft_tokens: int,
         cuda_graph_bs: List[int] | None = None,
+        init_max_bs: int | None = None,
     ) -> SpecRuntimeState: ...
 
     def apply_runtime_state(self, state: SpecRuntimeState) -> None: ...
@@ -157,18 +158,17 @@ class AdaptiveController:
     def _cuda_graph_bs_for_step(
         self, step: int, all_cuda_graph_bs: List[int]
     ) -> List[int]:
-        """Return the cuda_graph_bs values needed to serve all batches that can use *step*.
+        """Return the cuda_graph_bs values that need to be *captured* for *step*.
 
         A cuda_graph_bs entry *v* covers actual batch sizes in (prev_v, v].  We
         include *v* for *step* when that coverage interval overlaps with at least
         one BS slot whose candidate_steps contains *step*.
 
-        The global maximum cuda_graph_bs value is always included so that every
-        step's draft runner initializes with the same max_bs.  Without this,
-        steps that are only used by low-BS slots get a smaller max_bs in
-        init_cuda_graph_state(), which has been observed to cause EMA oscillation
-        at those batch sizes even though the captured BS-8 graph itself is
-        identical.
+        Note: the global max is intentionally NOT appended here.  init_states()
+        passes global_max separately as init_max_bs so that every step's draft
+        attention backend is initialised with the same max_bs (fixing FA3
+        scheduler-metadata shape consistency) without capturing an extra
+        CUDA graph for the global-max batch size on every step.
         """
         relevant_ranges: List[tuple] = []
         for i, slot_key in enumerate(self._bs_list):
@@ -193,13 +193,6 @@ class AdaptiveController:
                     break
             prev = v
 
-        # Always include the global max so every step gets the same max_bs in
-        # its draft attention backend, regardless of which BS slots use it.
-        global_max = max(all_cuda_graph_bs)
-        if global_max not in result:
-            result.append(global_max)
-            result.sort()
-
         return result
 
     def init_states(self, cuda_graph_bs: List[int] | None = None) -> None:
@@ -212,6 +205,13 @@ class AdaptiveController:
                 When ``None``, all batch sizes are captured for every step
                 (original behaviour).
         """
+        # All steps share the same init_max_bs so that each draft attention
+        # backend allocates _sched_meta_buf with a consistent shape.  FA3 may
+        # use the metadata tensor's shape to determine CUDA block scheduling,
+        # so an inconsistent shape can cause subtle FP differences between
+        # steps at the same batch size, triggering spurious EMA oscillation.
+        init_max_bs = max(cuda_graph_bs) if cuda_graph_bs is not None else None
+
         for steps in self.candidate_steps:
             if steps in self._states:
                 pruned_bs = (
@@ -228,11 +228,15 @@ class AdaptiveController:
                 if cuda_graph_bs is not None
                 else None
             )
-            logger.info(f"init_states: step={steps}, cuda_graph_bs={pruned_bs}")
+            logger.info(
+                f"init_states: step={steps}, cuda_graph_bs={pruned_bs}, "
+                f"init_max_bs={init_max_bs}"
+            )
             state = self.worker.build_adaptive_runtime_state(
                 speculative_num_steps=steps,
                 speculative_num_draft_tokens=steps + 1,
                 cuda_graph_bs=pruned_bs,
+                init_max_bs=init_max_bs,
             )
             self._states[steps] = state
 
