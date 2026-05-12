@@ -29,6 +29,8 @@ _U1_T2I_CFG_UNCONDITION_ROLE = "u1_t2i_cfg_uncondition"
 _U1_INTERLEAVE_TEXT_UNCONDITION_ROLE = "u1_interleave_text_uncondition"
 _U1_EDIT_IMG_CONDITION_ROLE = "u1_edit_img_condition"
 _U1_EDIT_UNCONDITION_ROLE = "u1_edit_uncondition"
+_U1_IMAGENET_MEAN = (0.485, 0.456, 0.406)
+_U1_IMAGENET_STD = (0.229, 0.224, 0.225)
 
 
 @dataclass(frozen=True, slots=True)
@@ -61,6 +63,12 @@ class SenseNovaU1PixelFlowPrepared:
     condition: SenseNovaU1PixelFlowForwardContext
     img_condition: SenseNovaU1PixelFlowForwardContext | None
     uncondition: SenseNovaU1PixelFlowForwardContext | None
+
+
+@dataclass(frozen=True, slots=True)
+class SenseNovaU1PixelFlowDenoiseOutput:
+    prepared: SenseNovaU1PixelFlowPrepared
+    image_prediction: Any
 
 
 @dataclass(frozen=True, slots=True)
@@ -122,9 +130,10 @@ class SenseNovaU1PixelFlowStage(DenoisingStage):
             forward_batch_provider=forward_batch_provider,
             prepared=prepared,
         )
-        segment = self._decode(prepared, image_prediction)
-        batch.generated_segment = segment
-        batch.output = _image_to_numpy_batch(segment.image)
+        batch.sensenova_u1_pixel_flow = SenseNovaU1PixelFlowDenoiseOutput(
+            prepared=prepared,
+            image_prediction=image_prediction,
+        )
         return batch
 
     def _prepare(
@@ -468,12 +477,42 @@ class SenseNovaU1PixelFlowStage(DenoisingStage):
         )
         return v_pred * scale
 
-    def _decode(
+
+class SenseNovaU1PixelFlowDecodeStage(PipelineStage):
+    """Finalize U1 pixel-flow tensors into an omni image segment."""
+
+    def component_uses(
+        self, server_args: ServerArgs, stage_name: str | None = None
+    ) -> list[ComponentUse]:
+        return []
+
+    def verify_input(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
+        return PipelineStage.verify_input(self, batch, server_args)
+
+    def forward(
         self,
+        batch: Req,
+        server_args: ServerArgs,
+    ) -> Req:
+        context_ops = _require_context_ops(batch)
+        model = _require_model(context_ops)
+        denoise_output = _require_denoise_output(batch)
+        segment = self._finalize_image_segment(
+            model=model,
+            prepared=denoise_output.prepared,
+            image_prediction=denoise_output.image_prediction,
+        )
+        batch.generated_segment = segment
+        batch.output = _image_to_numpy_batch(segment.image)
+        return batch
+
+    def _finalize_image_segment(
+        self,
+        *,
+        model: Any,
         prepared: SenseNovaU1PixelFlowPrepared,
         image_prediction: Any,
     ) -> SenseNovaU1GeneratedSegment:
-
         array = (
             (image_prediction[0].float() * 0.5 + 0.5)
             .clamp(0, 1)
@@ -485,10 +524,15 @@ class SenseNovaU1PixelFlowStage(DenoisingStage):
         image = Image.fromarray((array * 255.0).round().astype(np.uint8), "RGB")
         commit_image = None
         if prepared.commit_generated_image:
+            # commit reuses final vision embeddings instead of re-encoding CPU pixels
             commit_image = {
-                "pixel_values": image_prediction.detach().to(torch.bfloat16).cpu(),
-                "value_range": "minus_one_to_one",
-                "grid_hw": prepared.gen_grid_hw[:1].detach().cpu(),
+                "precomputed_embeddings": _extract_final_image_embeddings(
+                    model=model,
+                    prepared=prepared,
+                    image_prediction=image_prediction,
+                ),
+                "grid_hw": prepared.gen_grid_hw[:1],
+                "pad_hash": id(image_prediction),
             }
         cfg = prepared.cfg
         return SenseNovaU1GeneratedSegment(
@@ -519,6 +563,10 @@ class SenseNovaU1PixelFlowStage(DenoisingStage):
             },
             commit_image=commit_image,
         )
+
+
+def _require_denoise_output(batch: Req) -> SenseNovaU1PixelFlowDenoiseOutput:
+    return batch.sensenova_u1_pixel_flow
 
 
 def _resolve_u1_contexts(
@@ -918,6 +966,28 @@ def _predict_pixel_flow_from_srt(
 
     t = timestep.to(device=z.device, dtype=z.dtype)
     return (x_pred - z) / (1 - t).clamp_min(float(t_eps))
+
+
+def _extract_final_image_embeddings(
+    *,
+    model: Any,
+    prepared: SenseNovaU1PixelFlowPrepared,
+    image_prediction: Any,
+) -> Any:
+    pixel_values = (image_prediction[0].float() * 0.5 + 0.5).clamp(0, 1)
+    mean = pixel_values.new_tensor(_U1_IMAGENET_MEAN).view(3, 1, 1)
+    std = pixel_values.new_tensor(_U1_IMAGENET_STD).view(3, 1, 1)
+    image_input = _patchify(
+        ((pixel_values - mean) / std).unsqueeze(0),
+        prepared.patch_size,
+        channel_first=True,
+    )
+    embeddings = model.extract_feature(
+        image_input.view(prepared.grid_h * prepared.grid_w, -1),
+        gen_model=False,
+        grid_hw=prepared.gen_grid_hw,
+    )
+    return embeddings.view(prepared.token_h * prepared.token_w, -1).detach()
 
 
 def _forward_context_position(context: Any | None) -> int | None:

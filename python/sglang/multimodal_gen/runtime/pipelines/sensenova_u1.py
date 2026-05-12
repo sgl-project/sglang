@@ -8,6 +8,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages import (
     InputValidationStage,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.sensenova_u1 import (
+    SenseNovaU1PixelFlowDecodeStage,
     SenseNovaU1PixelFlowStage,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
@@ -35,6 +36,7 @@ class SenseNovaU1Pipeline(ComposedPipelineBase):
         del server_args
         self.add_stage(InputValidationStage())
         self.add_stage(SenseNovaU1PixelFlowStage())
+        self.add_stage(SenseNovaU1PixelFlowDecodeStage())
 
 
 EntryClass = SenseNovaU1Pipeline

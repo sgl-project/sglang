@@ -1047,7 +1047,10 @@ class NEOChatModel(nn.Module):
             hidden_size = int(self.config.llm_config.hidden_size)
             return torch.empty(0, hidden_size, device=self.vision_model.device)
         if all(item.precomputed_embeddings is not None for item in items):
-            return torch.cat([item.precomputed_embeddings for item in items], dim=0)
+            return torch.cat([item.precomputed_embeddings for item in items], dim=0).to(
+                device=self.vision_model.device,
+                dtype=self.vision_model.dtype,
+            )
 
         pixel_values = torch.cat([item.feature for item in items], dim=0).to(
             device=self.vision_model.device,

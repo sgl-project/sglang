@@ -8,6 +8,7 @@ the returned prepared inputs remain SRT-owned runtime objects.
 """
 
 import math
+import uuid
 from typing import Any
 
 from sglang.srt.omni_session.runtime import (
@@ -87,8 +88,10 @@ def _u1_multimodal_inputs(
     offsets: list[tuple[int, int]],
     position_ids: list[list[int]] | None = None,
     precomputed_embeddings: Any | None = None,
+    precomputed_hash: int | None = None,
 ) -> Any:
     from sglang.srt.managers.schedule_batch import (
+        _compute_pad_value,
         Modality,
         MultimodalDataItem,
         MultimodalInputs,
@@ -101,7 +104,12 @@ def _u1_multimodal_inputs(
         model_specific_data={"image_grid_hws": grid_hw},
         offsets=offsets,
     )
-    item.set_pad_value()
+    if precomputed_embeddings is not None:
+        # generated-image embeddings are request-local; avoid hashing GPU tensors here
+        item.hash = int(precomputed_hash or uuid.uuid4().int)
+        item.pad_value = _compute_pad_value(item.hash)
+    else:
+        item.set_pad_value()
     mm_inputs = MultimodalInputs(mm_items=[item])
     if position_ids is not None:
         import torch
@@ -595,12 +603,14 @@ def build_u1_native_generated_image_commit_prepared_input(
     downsample_ratio: float = 0.5,
 ) -> OmniSRTPreparedInput:
     precomputed_embeddings = None
+    precomputed_hash = None
     if isinstance(image, dict) and image.get("precomputed_embeddings") is not None:
         import torch
 
-        precomputed_embeddings = (
-            torch.as_tensor(image["precomputed_embeddings"]).detach().cpu()
-        )
+        precomputed_embeddings = torch.as_tensor(
+            image["precomputed_embeddings"]
+        ).detach()
+        precomputed_hash = image.get("pad_hash")
         grid_hw_value = image.get("grid_hw", image.get("image_grid_hws"))
         pixel_values = None
         if grid_hw_value is None:
@@ -679,6 +689,7 @@ def build_u1_native_generated_image_commit_prepared_input(
         offsets=[(context_start, context_end)],
         position_ids=position_ids,
         precomputed_embeddings=precomputed_embeddings,
+        precomputed_hash=precomputed_hash,
     )
 
     message = OmniInterleavedMessage(type="image", content=image)
