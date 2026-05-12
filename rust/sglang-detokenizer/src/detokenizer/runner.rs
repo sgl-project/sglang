@@ -9,32 +9,22 @@
 //!   (tokio task,               • Phase 1: prepare               (tokio task,
 //!    AsyncFd on ZMQ fd)        • Phase 2: tokenize               AsyncFd on
 //!                              • Phase 3: finalize               ZMQ fd)
-//!
-//! Both ZMQ sockets are driven by tokio's epoll reactor via AsyncFd — no
-//! dedicated OS threads.  When the ZMQ notification fd becomes readable/
-//! writable, the async task wakes up and calls recv_multipart / send_multipart
-//! with DONTWAIT, keeping tokio worker threads unblocked.
 
 use crate::detokenizer::{
     build_batch_str_output, execute_decode, extract_batch_input, finalize_decode,
     msgpack_decode, msgpack_encode, prepare_decode_work, read_type_tag, Config,
     LimitedCapacityDict,
 };
+use crate::ipc::{validate_zmq_parts, zmq_recv_task, zmq_send_task};
 use crate::DetokenizerConfig;
 use log::{error, info, warn};
 use rmpv::Value;
-use std::os::unix::io::AsRawFd;
 use std::path::Path;
 use std::sync::Arc;
 use tokenizers::Tokenizer;
-use tokio::io::unix::AsyncFd;
 use tokio::sync::mpsc;
 
-pub const MSGPACK_MAGIC: &[u8] = b"0xSG02";
-pub const PICKLE_MAGIC: &[u8] = b"0xSG01";
-
 const DEFAULT_WORKER_THREADS: usize = 8;
-const DEFAULT_RAYON_THREADS: usize = 16;
 
 // ─────────────────────────────── CLI args ───────────────────────────────────
 
@@ -65,7 +55,7 @@ impl From<DetokenizerConfig> for Args {
 
 // ────────────────────────────── tokenizer ───────────────────────────────────
 
-fn load_tokenizer(path: &str) -> Option<Tokenizer> {
+pub fn load_tokenizer(path: &str) -> Option<Tokenizer> {
     if path.is_empty() {
         return None;
     }
@@ -98,115 +88,6 @@ fn load_tokenizer(path: &str) -> Option<Tokenizer> {
             None
         }
     }
-}
-
-// ──────────────────────── AsyncFd wrapper for ZMQ ───────────────────────────
-
-/// Newtype that lets us register ZMQ's notification fd with tokio's epoll reactor.
-///
-/// ZMQ exposes one fd per socket (`socket.get_fd()`).  It is NOT the raw data
-/// socket — it is a signalling fd that becomes readable when the ZMQ socket has
-/// pending POLLIN events, and writable when it can accept POLLOUT.  The actual
-/// data transfer still uses `recv_multipart(DONTWAIT)` / `send_multipart(DONTWAIT)`.
-struct ZmqNotifyFd(std::os::unix::io::RawFd);
-
-impl AsRawFd for ZmqNotifyFd {
-    fn as_raw_fd(&self) -> std::os::unix::io::RawFd {
-        self.0
-    }
-}
-
-// ──────────────────────── ZMQ async recv task ───────────────────────────────
-
-/// Receives multipart messages from a ZMQ PULL socket and forwards them to
-/// `tx` without ever blocking a tokio worker thread.
-///
-/// How it works:
-///   1. `AsyncFd::readable().await` suspends the task until ZMQ's notification
-///      fd signals that at least one message is ready (via epoll POLLIN).
-///   2. `guard.clear_ready()` re-arms the watch *before* draining, so any
-///      message that arrives during the drain loop will fire a new wakeup.
-///   3. We drain all buffered messages in a tight DONTWAIT loop; EAGAIN means
-///      the queue is empty and we go back to awaiting.
-///
-/// Drop order: `async_fd` is declared after `sock`, so it is dropped first —
-/// ensuring the fd is unregistered from epoll before the socket is closed.
-async fn zmq_recv_task(sock: zmq::Socket, tx: mpsc::Sender<Vec<Vec<u8>>>) {
-    let raw_fd = sock.get_fd().expect("zmq::Socket::get_fd failed");
-    let async_fd = AsyncFd::new(ZmqNotifyFd(raw_fd)).expect("AsyncFd::new failed");
-
-    'outer: loop {
-        let mut guard = match async_fd.readable().await {
-            Ok(g) => g,
-            Err(e) => {
-                error!("ZMQ recv poll error: {e}");
-                break;
-            }
-        };
-        // Clear before draining to avoid missing edge notifications.
-        guard.clear_ready();
-
-        loop {
-            match sock.recv_multipart(zmq::DONTWAIT) {
-                Ok(parts) => {
-                    if tx.send(parts).await.is_err() {
-                        break 'outer; // event loop shut down
-                    }
-                }
-                Err(zmq::Error::EAGAIN) => break, // queue empty, back to epoll
-                Err(e) => {
-                    error!("ZMQ recv error: {e}");
-                    break 'outer;
-                }
-            }
-        }
-    }
-}
-
-// ──────────────────────── ZMQ async send task ───────────────────────────────
-
-/// Sends msgpack frames to a ZMQ PUSH socket without blocking a tokio worker.
-///
-/// With `sndhwm(0)` (unlimited) `send_multipart(DONTWAIT)` almost never
-/// returns EAGAIN, but when it does (e.g. peer not yet connected) we wait on
-/// `async_fd.writable()` instead of spinning.
-async fn zmq_send_task(sock: zmq::Socket, mut rx: mpsc::Receiver<Vec<u8>>) {
-    let raw_fd = sock.get_fd().expect("zmq::Socket::get_fd failed");
-    let async_fd = AsyncFd::new(ZmqNotifyFd(raw_fd)).expect("AsyncFd::new failed");
-
-    while let Some(data) = rx.recv().await {
-        loop {
-            match sock.send_multipart(&[MSGPACK_MAGIC, data.as_slice()], zmq::DONTWAIT) {
-                Ok(()) => break,
-                Err(zmq::Error::EAGAIN) => {
-                    // Socket not ready to send; wait for POLLOUT.
-                    if let Ok(mut guard) = async_fd.writable().await {
-                        guard.clear_ready();
-                    }
-                }
-                Err(e) => {
-                    error!("ZMQ send error: {e}");
-                    return;
-                }
-            }
-        }
-    }
-}
-
-// ────────────────────── ZMQ multipart validation ────────────────────────────
-
-fn validate_zmq_parts(parts: Vec<Vec<u8>>) -> Result<Vec<u8>, String> {
-    if parts.len() == 1 {
-        return Err("Received single-frame (pickle) message. Set SGLANG_IPC_USE_MSGPACK=1.".into());
-    }
-    let magic = &parts[0];
-    if magic == PICKLE_MAGIC {
-        return Err("Received pickle message. Set SGLANG_IPC_USE_MSGPACK=1.".into());
-    }
-    if magic != MSGPACK_MAGIC {
-        return Err(format!("Unknown IPC magic: {magic:?}"));
-    }
-    Ok(parts[1].clone())
 }
 
 // ─────────────────────────── async event loop ───────────────────────────────
@@ -332,7 +213,6 @@ async fn process_batch(
         let tok = Arc::clone(tokenizer.unwrap());
         let cfg = config.clone();
 
-        // Phase 1: update state, collect token-ID slices (no .await)
         let work = prepare_decode_work(
             &fields.rids,
             fields.finished_reasons,
@@ -346,10 +226,7 @@ async fn process_batch(
             &cfg,
         );
 
-        // Phase 2: CPU-bound tokenizer decode (parallelized with rayon, no .await)
         let results = execute_decode(&work, &tok, &cfg);
-
-        // Phase 3: compute incremental strings, update state (no .await)
         finalize_decode(&work, &results, state)
     };
 
@@ -357,22 +234,88 @@ async fn process_batch(
     msgpack_encode(&out_val)
 }
 
+// ─────── in-process variant (no ZMQ PUSH; output goes to mpsc channel) ─────
+
+/// Run the detokenizer pipeline sending decoded output via an in-process channel.
+///
+/// Identical to the ZMQ-based `run()` except the outgoing side: instead of
+/// forwarding `BatchStrOutput` bytes over a ZMQ PUSH socket, they are sent
+/// directly to `out_tx`.  Used by the engine when all Rust components share a
+/// single tokio runtime so the inter-component ZMQ hop can be eliminated.
+pub async fn run_in_process(args: Args, out_tx: mpsc::UnboundedSender<Vec<u8>>) {
+    let tokenizer: Option<Arc<Tokenizer>> = if args.skip_tokenizer_init {
+        info!("skip_tokenizer_init=true; tokenizer not loaded.");
+        None
+    } else {
+        load_tokenizer(&args.tokenizer_path).map(Arc::new)
+    };
+
+    let config = Arc::new(Config {
+        disable_batch_decode: args.disable_tokenizer_batch_decode,
+        is_gpt_oss: args.tool_call_parser == "gpt-oss",
+        max_states: args.max_states,
+    });
+
+    let (raw_tx, mut raw_rx) = mpsc::channel::<Vec<Vec<u8>>>(256);
+
+    // ZMQ PULL ← scheduler (cross-process; ZMQ stays here)
+    let zmq_ctx_recv = zmq::Context::new();
+    let recv_sock = zmq_ctx_recv
+        .socket(zmq::PULL)
+        .expect("Failed to create PULL socket");
+    recv_sock.set_rcvhwm(0).ok();
+    recv_sock
+        .bind(&args.detokenizer_ipc_name)
+        .unwrap_or_else(|e| panic!("Failed to bind PULL to {}: {e}", args.detokenizer_ipc_name));
+    info!("Detokenizer PULL bound to: {}", args.detokenizer_ipc_name);
+
+    tokio::spawn(zmq_recv_task(recv_sock, raw_tx));
+
+    info!("Detokenizer in-process event loop started.");
+    let mut state = LimitedCapacityDict::new(config.max_states);
+
+    while let Some(parts) = raw_rx.recv().await {
+        let data = match validate_zmq_parts(parts) {
+            Ok(d) => d,
+            Err(e) => { error!("{e}"); continue; }
+        };
+        let val = match msgpack_decode(&data) {
+            Ok(v) => v,
+            Err(e) => { error!("Detokenizer: msgpack decode: {e}"); continue; }
+        };
+        let map = match val {
+            Value::Map(m) => m,
+            _ => { error!("Detokenizer: expected map"); continue; }
+        };
+        let msg_type = match read_type_tag(&map) {
+            Some(t) => t,
+            None => { error!("Detokenizer: missing 'type' field"); continue; }
+        };
+
+        let encoded = match msg_type.as_str() {
+            "BatchTokenIDOutput" => {
+                process_batch(map, &mut state, tokenizer.as_ref(), &config).await
+            }
+            "BatchEmbeddingOutput" => data,
+            "FreezeGCReq" => { info!("FreezeGCReq – no-op."); continue; }
+            other => { warn!("Detokenizer: unknown message type: {other}"); continue; }
+        };
+
+        if out_tx.send(encoded).is_err() {
+            break;
+        }
+    }
+}
+
 // ─────────────────────────────────── main ───────────────────────────────────
 
 pub fn start(args: Args) {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
-    // Configure rayon's global thread pool before any parallel work is done.
-    rayon::ThreadPoolBuilder::new()
-        .num_threads(DEFAULT_RAYON_THREADS)
-        .thread_name(|i| format!("sglang-detok-rayon-{i}"))
-        .build_global()
-        .ok();
-
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(DEFAULT_WORKER_THREADS)
         .enable_all()
-        .thread_name("sglang-detok-tokio")
+        .thread_name("sglang-detok")
         .build()
         .expect("Failed to build tokio runtime");
 

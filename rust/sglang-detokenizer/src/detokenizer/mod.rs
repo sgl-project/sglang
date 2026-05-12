@@ -3,6 +3,8 @@ use indexmap::IndexMap;
 use rmpv::Value;
 use tokenizers::Tokenizer;
 
+pub mod runner;
+
 // ─────────────────────────────── state ──────────────────────────────────────
 
 pub struct DecodeStatus {

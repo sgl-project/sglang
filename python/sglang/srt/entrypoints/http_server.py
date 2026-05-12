@@ -18,6 +18,7 @@ This file implements HTTP APIs for the inference engine via fastapi.
 """
 
 import asyncio
+import atexit
 import dataclasses
 import logging
 import os
@@ -2606,6 +2607,10 @@ def launch_server(
     1. The HTTP server, Engine, and TokenizerManager all run in the main process.
     2. Inter-process communication is done through IPC (each process uses a different port) via the ZMQ library.
     """
+
+    if envs.SGLANG_RUST_DETOKENIZER.get() and envs.SGLANG_IPC_USE_MSGPACK.get():
+        return launch_rust_server(server_args, run_scheduler_process_func)
+
     # Launch subprocesses
     (
         tokenizer_manager,
@@ -2630,3 +2635,87 @@ def launch_server(
         execute_warmup_func=execute_warmup_func,
         launch_callback=launch_callback,
     )
+
+
+def launch_rust_server(
+    server_args: ServerArgs,
+    run_scheduler_process_func: Callable = run_scheduler_process,
+) -> None:
+    """Launch the SRT server using the Rust engine for HTTP/TM/Detokenizer.
+
+    Startup order (solves ZMQ bind/connect sequencing):
+      1. Rust engine starts in a background thread — binds all ZMQ sockets
+         (scheduler_input_ipc_name, tokenizer_ipc_name, detokenizer_ipc_name)
+         within the first few milliseconds of the tokio runtime starting.
+      2. Scheduler subprocess starts — connects to already-bound sockets,
+         then loads model weights.
+      3. SIGINT/SIGTERM kills the scheduler subprocess tree and exits.
+
+    This function blocks until the Rust HTTP server shuts down.
+    """
+    import signal
+    import threading
+    import time
+    import sys
+
+    try:
+        from sglang_detokenizer import EngineConfig, start_engine
+    except ImportError as exc:
+        raise ImportError(
+            "sglang_detokenizer Rust extension is not installed. "
+            "Build it with `maturin develop` inside rust/sglang-detokenizer."
+        ) from exc
+
+    port_args = PortArgs.init_new(server_args)
+    logger.info(f"{server_args=}")
+
+    config = EngineConfig(
+        detokenizer_ipc_name=port_args.detokenizer_ipc_name,
+        tokenizer_ipc_name=port_args.tokenizer_ipc_name,
+        scheduler_ipc_name=port_args.scheduler_input_ipc_name,
+        tokenizer_path=server_args.tokenizer_path,
+        model_name=server_args.served_model_name,
+        host=server_args.host,
+        port=server_args.port,
+        skip_tokenizer_init=server_args.skip_tokenizer_init,
+        disable_tokenizer_batch_decode=server_args.disable_tokenizer_batch_decode,
+        tool_call_parser=server_args.tool_call_parser or "",
+    )
+
+    # 1. Start Rust engine in a background thread. start_engine releases the
+    #    GIL (py.allow_threads) so the main thread can continue immediately.
+    #    The tokio runtime binds all ZMQ sockets synchronously at startup.
+    engine_thread = threading.Thread(target=start_engine, args=(config,), daemon=True)
+    engine_thread.start()
+
+    # Wait for ZMQ sockets to bind. Binding happens in the first few ms of
+    # tokio startup; 500 ms is a generous upper bound.
+    time.sleep(0.5)
+
+    # 2. Start scheduler — sockets are already bound so connects succeed immediately.
+    port_args, _scheduler_init_result, _subprocess_watchdog = (
+        Engine._launch_scheduler_only(
+            server_args=server_args,
+            run_scheduler_process_func=run_scheduler_process_func,
+            port_args=port_args,
+        )
+    )
+
+    logger.info(
+        "Rust engine on %s:%s, scheduler at %s",
+        server_args.host,
+        server_args.port,
+        port_args.scheduler_input_ipc_name,
+    )
+
+    # 3. On Ctrl-C or SIGTERM kill the scheduler subprocess tree then exit.
+    atexit.register(kill_process_tree, os.getpid(), include_parent=False)
+
+    def _on_exit(signum, frame):
+        kill_process_tree(os.getpid(), include_parent=False)
+        sys.exit(0)
+
+    signal.signal(signal.SIGINT, _on_exit)
+    signal.signal(signal.SIGTERM, _on_exit)
+
+    engine_thread.join()

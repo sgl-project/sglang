@@ -787,6 +787,60 @@ class Engine(EngineScoreMixin, EngineBase):
             subprocess_watchdog,
         )
 
+    @classmethod
+    def _launch_scheduler_only(
+        cls,
+        server_args: ServerArgs,
+        run_scheduler_process_func: Optional[Callable] = None,
+        port_args: Optional[PortArgs] = None,
+    ) -> Tuple[PortArgs, SchedulerInitResult, "SubprocessWatchdog"]:
+        """Launch scheduler subprocesses and wait until the model is ready.
+
+        Used when the Rust engine (``sglang_detokenizer.start_engine``) handles
+        HTTP serving, TokenizerManager, and Detokenizer — the only pieces that
+        need Python/CUDA are the scheduler processes launched here.
+
+        The scheduler is the only component that requires CUDA/PyTorch and must
+        remain in Python.  All other components (HTTP server, TokenizerManager,
+        Detokenizer) are handled by the Rust engine.
+
+        Returns:
+            ``(port_args, scheduler_init_result, subprocess_watchdog)`` once all
+            scheduler ranks have finished loading weights.
+        """
+        import sys
+
+        if run_scheduler_process_func is None:
+            run_scheduler_process_func = cls.run_scheduler_process_func
+
+        configure_logger(server_args)
+        _set_envs_and_config(server_args)
+        load_plugins()
+        server_args.check_server_args()
+        _set_gc(server_args)
+
+        scheduler_init_result, scheduler_procs = cls._launch_scheduler_processes(
+            server_args, port_args, run_scheduler_process_func
+        )
+
+        if server_args.node_rank >= 1:
+            # Non-zero-rank nodes have no HTTP server / TM / detokenizer;
+            # block here until the scheduler processes finish.
+            scheduler_init_result.wait_for_ready()
+            scheduler_init_result.wait_for_completion()
+            sys.exit(0)
+
+        scheduler_init_result.wait_for_ready()
+
+        # Watch scheduler processes only; the Rust detokenizer thread is not a
+        # subprocess so it does not appear in the watchdog.
+        processes = list(scheduler_procs or [])
+        names = [f"scheduler_{i}" for i in range(len(processes))]
+        subprocess_watchdog = SubprocessWatchdog(processes=processes, process_names=names)
+        subprocess_watchdog.start()
+
+        return port_args, scheduler_init_result, subprocess_watchdog
+
     def shutdown(self):
         """Shutdown the engine; block until the scheduler subprocess releases
         its GPU context so the caller can immediately reallocate on the same
