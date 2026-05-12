@@ -7,7 +7,10 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 
-from sglang.jit_kernel.deepseek_v4 import topk_transform_512, topk_transform_512_v2
+from sglang.jit_kernel.deepseek_v4 import (
+    topk_transform_512,
+    topk_transform_512_v2 as _topk_transform_512_v2,
+)
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.compressed.metadata import (
     PagedCoreMetadata,
@@ -123,6 +126,25 @@ def fp8_paged_mqa_logits_pcg_op(
         deep_gemm_metadata,
         max_seq_len,
         clean_logits,
+    )
+
+
+@register_custom_op(mutates_args=["out_page_indices"])
+def topk_transform_512_v2(
+    scores: torch.Tensor,
+    seq_lens: torch.Tensor,
+    page_tables: torch.Tensor,
+    out_page_indices: torch.Tensor,
+    page_size: int,
+    metadata: torch.Tensor,
+) -> None:
+    _topk_transform_512_v2(
+        scores,
+        seq_lens,
+        page_tables,
+        out_page_indices,
+        page_size,
+        metadata,
     )
 
 
