@@ -1468,7 +1468,6 @@ class RefCountedGauge:
 
 def add_prometheus_track_response_middleware(app):
     from prometheus_client import Counter, Gauge
-    from starlette.middleware.base import BaseHTTPMiddleware
     from starlette.types import ASGIApp, Receive, Scope, Send
 
     http_request_counter = Counter(
