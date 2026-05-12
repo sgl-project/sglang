@@ -56,10 +56,7 @@ from sglang.srt.mem_cache.common import (
     release_kv_cache,
 )
 from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, NSATokenToKVPool
-from sglang.srt.observability.req_time_stats import (
-    monotonic_time,
-    set_schedule_time_batch,
-)
+from sglang.srt.observability.req_time_stats import set_schedule_time_batch
 
 if TYPE_CHECKING:
     from torch.distributed import ProcessGroup
@@ -68,28 +65,6 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import KVCache
 
 logger = logging.getLogger(__name__)
-
-
-def _log_prefill_inflight_poll_warning(
-    self: Scheduler,
-    req: Req,
-    message: str,
-) -> None:
-    now = monotonic_time()
-    warning_state = getattr(self, "_prefill_inflight_poll_warning_state", None)
-    if warning_state is None:
-        warning_state = {}
-        self._prefill_inflight_poll_warning_state = warning_state
-
-    warning_interval_s = 1.0
-    last_log_time, suppressed = warning_state.get(req.rid, (0.0, 0))
-    if last_log_time > 0 and now - last_log_time < warning_interval_s:
-        warning_state[req.rid] = (last_log_time, suppressed + 1)
-        return
-
-    suppressed_msg = f", suppressed_repeats={suppressed}" if suppressed else ""
-    logger.warning(f"{message}{suppressed_msg}")
-    warning_state[req.rid] = (now, 0)
 
 
 def release_req_to_metadata_buffer(
@@ -638,9 +613,7 @@ class SchedulerDisaggregationPrefillMixin:
                     KVPoll.Success,
                     KVPoll.Failed,
                 ):
-                    _log_prefill_inflight_poll_warning(
-                        self,
-                        req,
+                    logger.warning_once(
                         f"PP rank {self.pp_rank}: unexpected poll state {poll} for rid {req.rid} "
                         f"from consensus; treating as undone",
                     )
@@ -673,9 +646,7 @@ class SchedulerDisaggregationPrefillMixin:
                 if self.enable_metrics:
                     self.metrics_collector.increment_transfer_failed_reqs()
             else:
-                _log_prefill_inflight_poll_warning(
-                    self,
-                    req,
+                logger.warning_once(
                     f"Unexpected polling state {poll} for rid {req.rid} in inflight queue; "
                     f"treating as undone",
                 )
@@ -683,8 +654,6 @@ class SchedulerDisaggregationPrefillMixin:
 
         for req in done_reqs:
             req.time_stats.set_completion_time()
-            if hasattr(self, "_prefill_inflight_poll_warning_state"):
-                self._prefill_inflight_poll_warning_state.pop(req.rid, None)
 
         for req in done_reqs:
             if isinstance(req.finished_reason, FINISH_ABORT):
