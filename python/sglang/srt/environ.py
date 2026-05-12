@@ -587,7 +587,6 @@ class Envs:
     SGLANG_OPT_USE_DEEPGEMM_MEGA_MOE = EnvBool(False)
     SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK = EnvInt(1024)
 
-    SGLANG_OPT_MEGA_MOE_FUSED_PRE_DISPATCH = EnvBool(True)
     # When set, the mega-MoE x slot is packed E2M1 (FP4) instead of FP8 E4M3.
     # Halves symm-buffer footprint and unlocks the MXF4 mainloop downstream.
     # Setting this also exports DG_USE_FP4_ACTS=1 so DeepGEMM's symm-buffer
