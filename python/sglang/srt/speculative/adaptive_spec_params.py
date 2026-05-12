@@ -23,13 +23,13 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 DEFAULT_BS_HYSTERESIS: Dict[int, Dict[str, float]] = {
     1: {"up_hysteresis": 0.0, "down_hysteresis": -0.25},
-    64: {"up_hysteresis": 1.75, "down_hysteresis": -0.25},
+    64: {"up_hysteresis": 0.0, "down_hysteresis": 0.0},
     128: {"up_hysteresis": -0.1, "down_hysteresis": 0.25},
 }
 
 DEFAULT_BS_STEPS: Dict[int, list] = {
     1: [1, 3, 7],
-    64: [1, 3, 5],
+    64: [1, 2, 5],
     128: [1, 2, 6],
 }
 
